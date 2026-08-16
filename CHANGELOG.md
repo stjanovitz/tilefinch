@@ -8,6 +8,11 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.2 — 2026-08-16
+
+- Expanded the curated PSP TLS trust bundle for more widely used certificate
+  authorities and added a native-Mbed-TLS site audit to the release process.
+
 ## 0.1.1 — 2026-08-16
 
 - Fixed GitHub certificate verification and expanded device network-error
