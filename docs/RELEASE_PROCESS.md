@@ -47,8 +47,9 @@ signed release sequence.
   embeds only the public record). Building without a trust root is allowed
   but must be requested explicitly with `--no-update-root`.
 - **Dependency refresh sweep** per release: re-snapshot the Public
-  Suffix List and `certs/roots.pem`; check pinned curl, Mbed TLS,
-  nghttp2, FreeType, and lexbor for security releases; and diff the
+  Suffix List and `certs/roots.pem`; run the native-Mbed-TLS top-site and
+  resource-origin audit documented in `certs/README.md`; check pinned curl,
+  Mbed TLS, nghttp2, FreeType, and lexbor for security releases; and diff the
   pinned Bellard QuickJS commit against upstream master for memory-safety
   fixes — the shipping engine has no CVE feed, so this manual diff is
   its only advisory stream.

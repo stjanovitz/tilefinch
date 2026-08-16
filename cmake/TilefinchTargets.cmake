@@ -437,6 +437,10 @@ if(PSP)
                 "${CMAKE_CURRENT_SOURCE_DIR}/psp-assets/tilefinch-icon0-144x82.png")
         set_property(TARGET psp-browser-script APPEND PROPERTY LINK_DEPENDS
             "${CMAKE_CURRENT_SOURCE_DIR}/psp-assets/boot-live.cfg"
+            # The trust bundle is staged by a POST_BUILD command below. A
+            # certificate-only change must therefore retrigger that command
+            # instead of leaving a stale roots.pem beside a current EBOOT.
+            "${PSP_BROWSER_PSP_CA_BUNDLE}"
             # pack-pbp is a POST_BUILD step, so the packaged EBOOT keeps its
             # old ICON0 unless the link itself depends on the asset.
             "${CMAKE_CURRENT_SOURCE_DIR}/psp-assets/tilefinch-icon0-144x82.png")
