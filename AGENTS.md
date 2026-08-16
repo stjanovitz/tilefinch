@@ -17,7 +17,7 @@ cmake --build build-preset-release -j8
 ctest --test-dir build-preset-release -j8 --output-on-failure
 ```
 
-Release currently registers **126 tests: 125 enabled plus the opt-in
+Release currently registers **127 tests: 126 enabled plus the opt-in
 `tilefinch-device-cost-tests`, which is registered but disabled by default**.
 All enabled tests must pass. The localhost
 redirect test may report `Skipped` in a sandbox that forbids loopback sockets;

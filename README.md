@@ -60,7 +60,7 @@ agents are capable of. A web browser was a good test of all three.
 | **360p through a 480×272 display** | 640×360 frames stage through EDRAM as two guarded strips; the GE performs bilinear downscaling without a CPU per-pixel pass ([device envelope](docs/engineering/PSP_ENVELOPE.md)). |
 | **Explicit lifecycle ownership** | Media and networking use pure reducers, epoch-tokened services, consumer leases, pumped teardown, and quarantine instead of freeing memory beneath live firmware or worker activity ([architecture](docs/ARCHITECTURE.md)). |
 | **Security without pretending to sandbox** | HTTPS-first navigation, CORS/CSP/SRI, private-network protection, partition-aware resource authority, cookie controls, and signed A/B updates are enforced within a documented shared-process model ([security model](docs/SECURITY_MODEL.md)). |
-| **Hardware-aware gates** | Release registers 126 host tests (125 enabled by default), plus sanitizer, hostile-input, WPT, fidelity, PSP cross-build, `.text`, and hot-symbol ratchets ([engineering guide](AGENTS.md)). |
+| **Hardware-aware gates** | Release registers 127 host tests (126 enabled by default), plus sanitizer, hostile-input, WPT, fidelity, PSP cross-build, `.text`, and hot-symbol ratchets ([engineering guide](AGENTS.md)). |
 
 ## What you need
 
