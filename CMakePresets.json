@@ -1,0 +1,209 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "tilefinch-base",
+      "hidden": true,
+      "generator": "Unix Makefiles",
+      "cacheVariables": {
+        "PSP_BROWSER_BUILD_TESTS": "ON",
+        "PSP_BROWSER_BUILD_JSC_SPIKE": "OFF",
+        "PSP_BROWSER_USE_BELLARD_QUICKJS": "ON",
+        "PSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH": "OFF",
+        "PSP_BROWSER_USE_COMPILER_CACHE": "ON",
+        "PSP_BROWSER_ENABLE_GIF": "OFF"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Tilefinch development",
+      "inherits": "tilefinch-base",
+      "binaryDir": "${sourceDir}/build-preset-dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Tilefinch optimized host release",
+      "inherits": "tilefinch-base",
+      "binaryDir": "${sourceDir}/build-preset-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "psp",
+      "displayName": "PSP cross-compile with live networking (export PSPDEV first)",
+      "inherits": "tilefinch-base",
+      "binaryDir": "${sourceDir}/build-preset-psp",
+      "toolchainFile": "$env{PSPDEV}/psp/share/pspdev.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "MinSizeRel",
+        "CMAKE_C_FLAGS": "-G0 -D_DEFAULT_SOURCE",
+        "PSP_BROWSER_BUILD_TESTS": "OFF",
+        "PSP_BROWSER_DISABLE_TRACE": "ON",
+        "PSP_BROWSER_ENABLE_WEB_FONTS": "ON",
+        "PSP_BROWSER_ENABLE_GIF": "OFF",
+        "PSP_BROWSER_TRANSPORT_SOURCE": "${sourceDir}/src/fetch.c",
+        "PSP_BROWSER_CURL_STUB": "OFF",
+        "TILEFINCH_PSP_TRANSPORT_MODE": "OWNED",
+        "TILEFINCH_PSP_HTTP2": "ON",
+        "TILEFINCH_UPDATE_ROOT_V1": "${sourceDir}/trust/root-v1.tfur"
+      }
+    },
+    {
+      "name": "psp-http1",
+      "displayName": "PSP cross-compile with owned HTTP/1.1 transport",
+      "inherits": "psp",
+      "binaryDir": "${sourceDir}/build-preset-psp-http1",
+      "cacheVariables": {
+        "TILEFINCH_PSP_HTTP2": "OFF"
+      }
+    },
+    {
+      "name": "psp-hardened",
+      "displayName": "PSP compiler-hardening candidate (device qualification required)",
+      "inherits": "psp",
+      "binaryDir": "${sourceDir}/build-preset-psp-hardening",
+      "cacheVariables": {
+        "TILEFINCH_PSP_COMPILER_HARDENING": "ON"
+      }
+    },
+    {
+      "name": "psp-legacy-transport",
+      "displayName": "PSP cross-compile with legacy SDK transport",
+      "inherits": "psp",
+      "binaryDir": "${sourceDir}/build-preset-psp-legacy-transport",
+      "cacheVariables": {
+        "TILEFINCH_PSP_TRANSPORT_MODE": "LEGACY",
+        "TILEFINCH_PSP_HTTP2": "OFF"
+      }
+    },
+    {
+      "name": "psp-replay",
+      "displayName": "PSP hermetic replay cross-compile (export PSPDEV first)",
+      "inherits": "psp",
+      "binaryDir": "${sourceDir}/build-preset-psp-replay",
+      "cacheVariables": {
+        "PSP_BROWSER_CURL_STUB": "ON"
+      }
+    },
+    {
+      "name": "release-lto",
+      "displayName": "Tilefinch optimized host release with LTO",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build-preset-release-lto",
+      "cacheVariables": {
+        "PSP_BROWSER_ENABLE_LTO": "ON"
+      }
+    },
+    {
+      "name": "sanitize",
+      "displayName": "Tilefinch ASan and UBSan",
+      "inherits": "tilefinch-base",
+      "binaryDir": "${sourceDir}/build-preset-sanitize",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined",
+        "PSP_BROWSER_BUILD_HOST_MEDIA_LAB": "ON",
+        "PSP_BROWSER_ENABLE_HOST_MEDIA_AUDIO": "OFF"
+      }
+    },
+    {
+      "name": "hostile",
+      "displayName": "Tilefinch hostile-input sanitizer harness",
+      "inherits": "sanitize",
+      "binaryDir": "${sourceDir}/build-preset-hostile",
+      "cacheVariables": {
+        "PSP_BROWSER_BUILD_HOSTILE_PARSER_HARNESS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "jobs": 0
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "jobs": 0
+    },
+    {
+      "name": "release-lto",
+      "configurePreset": "release-lto",
+      "jobs": 0
+    },
+    {
+      "name": "sanitize",
+      "configurePreset": "sanitize",
+      "jobs": 0
+    },
+    {
+      "name": "hostile",
+      "configurePreset": "hostile",
+      "targets": ["tilefinch-hostile-parser-harness"],
+      "jobs": 0
+    },
+    {
+      "name": "psp",
+      "configurePreset": "psp",
+      "targets": ["psp-browser-script"],
+      "jobs": 0
+    },
+    {
+      "name": "psp-replay",
+      "configurePreset": "psp-replay",
+      "targets": ["psp-browser-script"],
+      "jobs": 0
+    },
+    {
+      "name": "psp-http1",
+      "configurePreset": "psp-http1",
+      "targets": ["psp-browser-script"],
+      "jobs": 0
+    },
+    {
+      "name": "psp-legacy-transport",
+      "configurePreset": "psp-legacy-transport",
+      "targets": ["psp-browser-script"],
+      "jobs": 0
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 8 }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 8 }
+    },
+    {
+      "name": "sanitize",
+      "configurePreset": "sanitize",
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 2 }
+    },
+    {
+      "name": "hostile",
+      "configurePreset": "hostile",
+      "filter": {
+        "include": { "name": "tilefinch-hostile-parser-tests" }
+      },
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

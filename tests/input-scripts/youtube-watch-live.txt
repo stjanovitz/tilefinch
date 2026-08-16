@@ -1,0 +1,36 @@
+# DEVICE-LOOP SCRIPT -- NOT A GOLDEN-GATED SCENARIO.
+#
+# There is deliberately no youtube-watch-live.device-golden.txt. This drives a
+# real PSP against real YouTube over the network, so its trace is a function
+# of the video, the CDN, and the wireless link rather than of the script; a
+# golden would fail for reasons that say nothing about the browser.
+# scripts/run-ppsspp-input-script.sh only ever runs the scenario it is handed
+# with --script, and tests/test_psp_input_script.c only replays menu-tour, so
+# nothing picks this file up on its own.
+#
+# Run it from the PSPLink live loop with boot.cfg carrying
+#   url=https://m.youtube.com/watch?v=<id>
+#   input_script=youtube-watch-live.txt
+# See docs/engineering/INPUT_SCRIPT_HARNESS.md, "PSPLink live loop".
+#
+# What it proves: sustained playback. The media open costs about 20-25 s on a
+# PSP-3000 (resolver, then the split video/audio fetch), so the first wait has
+# to be long enough for the watch page to reach a playable surface before the
+# play press lands. Every step up to `mark closed` is -live: the browser is
+# busy for essentially all of it, and a readiness-gated step would never
+# advance.
+wait-live 2400
+mark-live watch
+tap-live cross
+wait-live 1800
+mark-live played
+tap-live circle
+wait-live 180
+mark closed
+# Menu > screenshot: the frame that is worth carrying back to the host.
+tap select
+wait 4
+press 2 up
+tap cross
+wait 4
+end

@@ -1,0 +1,88 @@
+<!doctype html>
+<title>Async network scheduler</title>
+<body><p id="result">PENDING</p>
+<script>
+  document.cookie = 'mode=interactive; Path=/';
+  const xhrResult = new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const states = [];
+    const events = [];
+    xhr.onreadystatechange = () => states.push(xhr.readyState);
+    for (const type of ['loadstart', 'progress', 'load', 'loadend'])
+      xhr.addEventListener(type, () => events.push(type));
+    xhr.open('GET', '/api', true);
+    xhr.responseType = 'json';
+    xhr.addEventListener('loadend', () => resolve(
+      `${xhr.response.value}:${xhr.getResponseHeader('x-tilefinch-response')}:` +
+      `${xhr.getAllResponseHeaders().includes('x-tilefinch-response: visible')}:` +
+      `${states.join('.')}:${events.join('.')}`));
+    xhr.onerror = reject;
+    xhr.send();
+  });
+  const successfulRequests = Promise.all([
+    fetch('/api').then(async response =>
+      `${(await response.json()).value}:${response.headers.get('x-tilefinch-response')}`),
+    fetch('/api').then(response => response.json()),
+    fetch('/api').then(response => response.json()),
+    xhrResult,
+  ]);
+  successfulRequests.then(async values => {
+    const binary = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/binary', true);
+      xhr.responseType = 'arraybuffer';
+      xhr.onload = () => resolve(
+        `${Array.from(new Uint8Array(xhr.response)).join('-')}:` +
+        `${xhr.getResponseHeader('content-type')}`);
+      xhr.onerror = reject;
+      xhr.send();
+    });
+    values.push(binary);
+    const fetchBinary = await fetch('/binary');
+    const fetchedBytes = Array.from(
+      new Uint8Array(await fetchBinary.clone().arrayBuffer())).join('-');
+    const blobBytes = Array.from(
+      new Uint8Array(await (await fetchBinary.blob()).arrayBuffer())).join('-');
+    values.push(`fetch-${fetchedBytes}:blob-${blobBytes}`);
+    const reusedBody = await fetchBinary.text().then(
+      () => 'bad', error => error.name);
+    const invalidJson = await new Response('{').json().then(
+      () => 'bad', error => error.name);
+    values.push(`body-${reusedBody}:json-${invalidJson}`);
+    const streamResponse = new Response('xy');
+    const streamChunk = await streamResponse.body.getReader().read();
+    const streamReuse = await streamResponse.text().then(
+      () => 'bad', error => error.name);
+    values.push(`stream-${new TextDecoder().decode(streamChunk.value)}-${streamReuse}`);
+    const post = await fetch('/api', {method: 'POST', body: 'origin-check'})
+      .then(response => response.json());
+    values.push(`${post.origin}:${post.body}`);
+    const binaryPost = await fetch('/api', {
+      method: 'POST', body: new Uint8Array([0, 255, 128, 65])
+    }).then(response => response.json());
+    values.push(`postbytes-${binaryPost.bytes}`);
+    const result = values.map(value => value.value || value).join(',');
+    const controller = new AbortController();
+    const aborted = fetch('/slow-api', {signal: controller.signal})
+      .then(() => 'bad', error => error.name);
+    controller.abort();
+    const timedOut = new Promise(resolve => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/slow-api', true);
+      xhr.timeout = 30;
+      xhr.onload = () => resolve('bad');
+      xhr.onerror = () => resolve('error');
+      xhr.ontimeout = () => resolve('TimeoutError');
+      xhr.send();
+    });
+    return Promise.all([aborted, timedOut]).then(lifecycle => {
+      document.querySelector('#result').textContent =
+        `ASYNC ${result} ${lifecycle.join(',')}`;
+      globalThis.pocSummary =
+        `async:${result}:${lifecycle.join(',')}`;
+    });
+  }).catch(error => {
+    globalThis.pocSummary = `async-error:${error}`;
+  });
+</script>
+</body>

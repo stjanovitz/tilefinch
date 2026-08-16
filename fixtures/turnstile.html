@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Turnstile compatibility fixture</title>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit" defer></script>
+</head>
+<body>
+  <main>
+    <h1>Turnstile compatibility fixture</h1>
+    <p id="status">waiting</p>
+    <form method="post" action="/turnstile-submit">
+      <div id="turnstile-widget"></div>
+      <button type="submit">Submit verified form</button>
+    </form>
+  </main>
+  <script>
+    function recordTurnstileStatus(status, detail) {
+      const output = document.getElementById('status');
+      output.textContent = status;
+      output.setAttribute('data-detail', detail || '');
+      globalThis.pocSummary = status;
+    }
+
+    window.addEventListener('load', function () {
+      if (!globalThis.turnstile) {
+        recordTurnstileStatus('api-missing');
+        return;
+      }
+      turnstile.render('#turnstile-widget', {
+        sitekey: '1x00000000000000000000AA',
+        action: 'tilefinch-compatibility',
+        cData: 'psp-browser-lab',
+        callback: function (token) {
+          recordTurnstileStatus('token-ready', String(token).slice(0, 64));
+        },
+        'error-callback': function (code) {
+          recordTurnstileStatus('widget-error', String(code));
+        },
+        'expired-callback': function () {
+          recordTurnstileStatus('token-expired');
+        }
+      });
+    });
+  </script>
+</body>
+</html>

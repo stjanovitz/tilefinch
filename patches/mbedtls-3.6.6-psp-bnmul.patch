@@ -1,0 +1,76 @@
+diff --git a/library/bn_mul.h b/library/bn_mul.h
+--- a/library/bn_mul.h
++++ b/library/bn_mul.h
+@@ -884,8 +884,71 @@
+     );
+ #endif /* Alpha */
+ 
+-#if defined(__mips__) && !defined(__mips64)
++/*
++ * Allegrex (PSP-3000) multiply-accumulate core.
++ *
++ * The generic MIPS32 block below is correct on this CPU and is what the
++ * stock build uses.  It spends 14 instructions per limb because MIPS32
++ * has no add-with-carry: after multu it must re-derive both carries with
++ * sltu.  The Allegrex implements MIPS32 maddu, which accumulates a 32x32
++ * product into the full 64-bit HI:LO pair with the carry propagated in
++ * hardware, so the same limb costs 11 instructions and no carry chain.
++ *
++ * The accumulator identity is exact and cannot overflow:
++ *
++ *     HI:LO = c                       (mtlo c ; mthi $0)
++ *     HI:LO += s[i] * b               (maddu)
++ *     HI:LO += d[i] * 1               (maddu)
++ *     d[i] = LO ; c = HI
++ *
++ * with a maximum of (2^32-1)^2 + 2*(2^32-1) = 2^64 - 1.  That is exactly
++ * the portable MULADDC_X1_CORE semantics, limb for limb.
++ *
++ * Scheduling is deliberately conservative rather than minimal.  The two
++ * pointer bumps sit between "mthi" and the first "maddu", and the store
++ * sits between "mfhi" and the next unit's "mtlo", so every HI/LO write is
++ * separated from the next HI/LO reader by two instructions.  MIPS32
++ * interlocks those hazards, but the classic MIPS I/II rule requires the
++ * spacing and the spacing is free here.  mult-to-mflo is interlocked on
++ * every MIPS generation, so no padding is needed there.
++ *
++ * Off unless TILEFINCH_ALLEGREX_MULADDC is defined by the build; the
++ * stock MIPS32 block is the fallback and stays byte-for-byte upstream.
++ */
++#if defined(__mips__) && !defined(__mips64) && \
++    defined(__psp__) && defined(TILEFINCH_ALLEGREX_MULADDC)
+ 
++#define MULADDC_X1_INIT                                     \
++    {                                                       \
++        mbedtls_mpi_uint muladdc_t, muladdc_u;              \
++        const mbedtls_mpi_uint muladdc_one = 1;             \
++        asm volatile (
++
++#define MULADDC_X1_CORE                                     \
++        "lw     %3, 0(%2)       \n\t"                       \
++        "lw     %4, 0(%1)       \n\t"                       \
++        "mtlo   %0              \n\t"                       \
++        "mthi   $0              \n\t"                       \
++        "addiu  %2, %2, 4       \n\t"                       \
++        "addiu  %1, %1, 4       \n\t"                       \
++        "maddu  %3, %6          \n\t"                       \
++        "maddu  %4, %5          \n\t"                       \
++        "mflo   %3              \n\t"                       \
++        "mfhi   %0              \n\t"                       \
++        "sw     %3, -4(%1)      \n\t"
++
++#define MULADDC_X1_STOP                                     \
++        : "+&r" (c), "+&r" (d), "+&r" (s),                  \
++          "=&r" (muladdc_t), "=&r" (muladdc_u)              \
++        : "r" (muladdc_one), "r" (b)                        \
++        : "lo", "hi", "memory"                              \
++        );                                                  \
++    }
++
++#endif /* Allegrex maddu */
++
++#if defined(__mips__) && !defined(__mips64) && !defined(MULADDC_X1_CORE)
++
+ #define MULADDC_X1_INIT                 \
+     asm(                                \
+         "lw     $10, %3         \n\t"   \

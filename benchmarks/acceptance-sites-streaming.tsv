@@ -1,0 +1,7 @@
+name	url	limit_mb	max_download_kb	minimum_body_bytes	purpose
+whatwg-html	https://html.spec.whatwg.org/	96	32768	1000000	extremely large single-document streaming, parsing, anchors, code, and tables
+discourse-meta	https://meta.discourse.org/latest	40	8192	20000	hydrated application shell, modules, dynamic DOM, history, and JSON-backed navigation
+ebay-search	https://www.ebay.co.uk/sch/i.html?_nkw=playstation+portable	48	8192	20000	commerce forms, repeated cards, responsive images, lazy loading, and complex CSS
+craigslist-search	https://sfbay.craigslist.org/search/sss?query=playstation%20portable	24	4096	5000	server-rendered commerce, forms, listings, navigation, and images
+npm-react	https://www.npmjs.com/package/react	40	8192	20000	server-rendered application shell, hydration data, modules, metadata, and code blocks
+wordpress-news	https://wordpress.org/news/	32	8192	20000	common CMS structure, responsive assets, article navigation, and progressive enhancement

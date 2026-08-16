@@ -1,0 +1,49 @@
+--- a/src/ngram_search.h
++++ b/src/ngram_search.h
+@@ -73,6 +73,13 @@
+ 				   alternative right context channel */
+     struct chan_s *alt;		/**< sibling; i.e., next descendant of parent HMM */
+ 
++#ifdef TILEFINCH_COMPACT_FIXED_SEARCH
++    int16 ciphone;		/**< ciphone for this node */
++    union {
++	int16 penult_phn_wid;	/**< first word whose last phone follows this one */
++	int16 rc_id;		/**< right-context id for last phone of words */
++    } info;
++#else
+     int32    ciphone;		/**< ciphone for this node */
+     union {
+ 	int32 penult_phn_wid;	/**< list of words whose last phone follows this one;
+@@ -81,6 +88,7 @@
+ 				   only within HMM tree.  -1 if none */
+ 	int32 rc_id;		/**< right-context id for last phone of words */
+     } info;
++#endif
+ } chan_t;
+ 
+ /**
+--- a/src/ngram_search.c
++++ b/src/ngram_search.c
+@@ -40,6 +40,7 @@
+  */
+ 
+ #include <string.h>
++#include <limits.h>
+ #include <assert.h>
+ 
+ #include "util/ckd_alloc.h"
+@@ -166,6 +167,14 @@
+ {
+     ngram_search_t *ngs;
+     static char *lmname = "default";
++
++#ifdef TILEFINCH_COMPACT_FIXED_SEARCH
++    if (dict_size(dict) > INT16_MAX) {
++        E_ERROR("Compact fixed search supports at most %d dictionary words"
++                " (received %d)\n", INT16_MAX, dict_size(dict));
++        return NULL;
++    }
++#endif
+ 
+     /* Make the acmod's feature buffer growable if we are doing two-pass
+      * search. */

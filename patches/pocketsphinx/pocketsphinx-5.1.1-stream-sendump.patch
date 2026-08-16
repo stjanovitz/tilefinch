@@ -1,0 +1,251 @@
+--- a/src/config_macro.h
++++ b/src/config_macro.h
+@@ -379,6 +379,10 @@
+       ARG_BOOLEAN,                                                              \
+       "yes",                                                                    \
+       "Use memory-mapped I/O (if possible) for model files" },                  \
++{ "tilefinch_sendump_cache_rows",                                               \
++      ARG_INTEGER,                                                              \
++      "384",                                                                    \
++      "Fixed-model sendump rows retained in RAM" },                            \
+ { "ds",                                                                        \
+       ARG_INTEGER,                                                                \
+       "1",                                                                      \
+--- a/src/ptm_mgau.h
++++ b/src/ptm_mgau.h
+@@ -78,6 +78,23 @@
+     uint8 *sen2cb;     /**< Senone to codebook mapping. */
+     uint8 ***mixw;     /**< Mixture weight distributions by feature, codeword, senone */
+     mmio_file_t *sendump_mmap;/* Memory map for mixw (or NULL if not mmap) */
++#ifdef TILEFINCH_STREAM_SENDUMP
++    FILE *sendump_stream;
++    long sendump_data_offset;
++    int32 sendump_row_bytes;
++    int16 sendump_n_feat;
++    int16 sendump_n_density;
++    uint8 *sendump_cache_data;
++    uint16 *sendump_cache_slot;
++    uint16 *sendump_cache_feat;
++    uint16 *sendump_cache_density;
++    uint32 *sendump_cache_age;
++    size_t sendump_cache_rows;
++    uint32 sendump_cache_clock;
++    uint32 sendump_cache_hits;
++    uint32 sendump_cache_misses;
++    uint8 sendump_cache_failed;
++#endif
+     uint8 *mixw_cb;    /* Mixture weight codebook, if any (assume it contains 16 values) */
+     int16 max_topn;
+     int16 ds_ratio;
+--- a/src/ptm_mgau.c
++++ b/src/ptm_mgau.c
+@@ -60,6 +60,80 @@
+     ptm_mgau_mllr_transform,  /* transform */
+     ptm_mgau_free             /* free */
+ };
++
++#ifdef TILEFINCH_STREAM_SENDUMP
++static uint8 *
++tilefinch_ptm_mixw_row(ptm_mgau_t *s, int feat, int density)
++{
++    uint32 now;
++    size_t key;
++    uint16 slot;
++    int victim = 0;
++    uint8 *row;
++
++    if (s->sendump_stream == NULL)
++        return s->mixw[feat][density];
++    key = (size_t)feat * s->sendump_n_density + density;
++    slot = s->sendump_cache_slot[key];
++    now = ++s->sendump_cache_clock;
++    if (now == 0) {
++        int at;
++        for (at = 0; at < (int)s->sendump_cache_rows; ++at)
++            s->sendump_cache_age[at] =
++                (s->sendump_cache_age[at] >> 1)
++                | (s->sendump_cache_age[at] != 0);
++        now = s->sendump_cache_clock = UINT32_C(0x80000000);
++    }
++    if (slot != UINT16_MAX) {
++        s->sendump_cache_age[slot] = now;
++        ++s->sendump_cache_hits;
++        return s->mixw[feat][density];
++    }
++    for (slot = 0; slot < s->sendump_cache_rows; ++slot) {
++        if (s->sendump_cache_age[slot] == 0) {
++            victim = slot;
++            break;
++        }
++        if (s->sendump_cache_age[slot]
++            < s->sendump_cache_age[victim])
++            victim = slot;
++    }
++    if (s->sendump_cache_age[victim] != 0) {
++        size_t old_key =
++            (size_t)s->sendump_cache_feat[victim]
++                * s->sendump_n_density
++            + s->sendump_cache_density[victim];
++        s->sendump_cache_slot[old_key] = UINT16_MAX;
++        s->mixw[s->sendump_cache_feat[victim]]
++               [s->sendump_cache_density[victim]] = NULL;
++    }
++    row = s->sendump_cache_data
++        + (size_t)victim * s->sendump_row_bytes;
++    if (fseek(s->sendump_stream,
++              s->sendump_data_offset
++                  + (long)key * s->sendump_row_bytes,
++              SEEK_SET) != 0
++        || fread(row, 1, s->sendump_row_bytes, s->sendump_stream)
++           != (size_t)s->sendump_row_bytes) {
++        E_ERROR("Fixed sendump row read failed at feature %d density %d\n",
++                feat, density);
++        memset(row, 0xff, s->sendump_row_bytes);
++        s->sendump_cache_failed = TRUE;
++    }
++    s->sendump_cache_feat[victim] = feat;
++    s->sendump_cache_density[victim] = density;
++    s->sendump_cache_age[victim] = now;
++    s->sendump_cache_slot[key] = (uint16)victim;
++    s->mixw[feat][density] = row;
++    ++s->sendump_cache_misses;
++    return row;
++}
++#define TILEFINCH_PTM_MIXW_ROW(s, feat, density) \
++    tilefinch_ptm_mixw_row((s), (feat), (density))
++#else
++#define TILEFINCH_PTM_MIXW_ROW(s, feat, density) \
++    ((s)->mixw[(feat)][(density)])
++#endif
+ 
+ #define COMPUTE_GMM_MAP(_idx)                           \
+     diff[_idx] = obs[_idx] - mean[_idx];                \
+@@ -373,12 +447,14 @@
+                 int mixw;
+                 /* Find mixture weight for this codeword. */
+                 if (s->mixw_cb) {
+-                    int dcw = s->mixw[f][topn[j].cw][sen/2];
++                    int dcw = TILEFINCH_PTM_MIXW_ROW(
++                        s, f, topn[j].cw)[sen/2];
+                     dcw = (dcw & 1) ? dcw >> 4 : dcw & 0x0f;
+                     mixw = s->mixw_cb[dcw];
+                 }
+                 else {
+-                    mixw = s->mixw[f][topn[j].cw][sen];
++                    mixw = TILEFINCH_PTM_MIXW_ROW(
++                        s, f, topn[j].cw)[sen];
+                 }
+                 if (j == 0)
+                     fden = mixw + topn[j].score;
+@@ -450,6 +526,10 @@
+     ptm_mgau_senone_eval(s, senone_scores, senone_active,
+                          n_senone_active, compallsen);
+ 
++#ifdef TILEFINCH_STREAM_SENDUMP
++    if (s->sendump_cache_failed)
++        return -1;
++#endif
+     return 0;
+ }
+ 
+@@ -596,6 +676,80 @@
+     }
+     offset = ftell(fp);
+ 
++#ifdef TILEFINCH_STREAM_SENDUMP
++    {
++        int use_stream = FALSE;
++        long requested_rows =
++            ps_config_int(s->config, "tilefinch_sendump_cache_rows");
++#ifdef __PSP__
++        use_stream = requested_rows > 0;
++#else
++        char const *row_override =
++            getenv("TILEFINCH_SENDUMP_CACHE_ROWS");
++        if (row_override != NULL)
++            requested_rows = strtol(row_override, NULL, 10);
++        use_stream = getenv("TILEFINCH_DISABLE_STREAM_SENDUMP") == NULL
++            && requested_rows > 0;
++#endif
++        if (use_stream && requested_rows < (long)((size_t)n_feat * r)
++            && n_clust == 0 && n_bits == 8) {
++            long end;
++            size_t data_bytes = (size_t)n_feat * r * c;
++            size_t slot_count = (size_t)n_feat * r;
++            size_t cache_rows = (size_t)requested_rows;
++            if (fseek(fp, 0, SEEK_END) != 0
++                || (end = ftell(fp)) < 0
++                || (size_t)(end - (long)offset) < data_bytes
++                || fseek(fp, (long)offset, SEEK_SET) != 0) {
++                E_ERROR("Invalid fixed sendump extent in %s\n", file);
++                goto error_out;
++            }
++            s->mixw = ckd_calloc_2d(
++                n_feat, r, sizeof(*s->mixw));
++            s->sendump_cache_data = ckd_calloc(
++                cache_rows, (size_t)c);
++            s->sendump_cache_slot = ckd_malloc(
++                slot_count * sizeof(*s->sendump_cache_slot));
++            s->sendump_cache_feat = ckd_calloc(
++                cache_rows, sizeof(*s->sendump_cache_feat));
++            s->sendump_cache_density = ckd_calloc(
++                cache_rows, sizeof(*s->sendump_cache_density));
++            s->sendump_cache_age = ckd_calloc(
++                cache_rows, sizeof(*s->sendump_cache_age));
++            if (s->mixw == NULL || s->sendump_cache_data == NULL
++                || s->sendump_cache_slot == NULL
++                || s->sendump_cache_feat == NULL
++                || s->sendump_cache_density == NULL
++                || s->sendump_cache_age == NULL) {
++                ckd_free_2d(s->mixw);
++                s->mixw = NULL;
++                ckd_free(s->sendump_cache_data);
++                s->sendump_cache_data = NULL;
++                ckd_free(s->sendump_cache_slot);
++                s->sendump_cache_slot = NULL;
++                ckd_free(s->sendump_cache_feat);
++                s->sendump_cache_feat = NULL;
++                ckd_free(s->sendump_cache_density);
++                s->sendump_cache_density = NULL;
++                ckd_free(s->sendump_cache_age);
++                s->sendump_cache_age = NULL;
++                goto error_out;
++            }
++            memset(s->sendump_cache_slot, 0xff,
++                   slot_count * sizeof(*s->sendump_cache_slot));
++            s->sendump_stream = fp;
++            s->sendump_data_offset = (long)offset;
++            s->sendump_row_bytes = c;
++            s->sendump_n_feat = n_feat;
++            s->sendump_n_density = r;
++            s->sendump_cache_rows = cache_rows;
++            E_INFO("Streaming fixed sendump through %zu rows (%zu bytes)\n",
++                   cache_rows, cache_rows * (size_t)c);
++            return 0;
++        }
++    }
++#endif
++
+     /* Allocate memory for pdfs (or memory map them) */
+     if (do_mmap) {
+         s->sendump_mmap = mmio_file_read(file);
+@@ -911,6 +1065,19 @@
+ 
+     logmath_free(s->lmath);
+     logmath_free(s->lmath_8b);
++#ifdef TILEFINCH_STREAM_SENDUMP
++    if (s->sendump_stream) {
++        E_INFO("Fixed PTM sendump cache: %u hits, %u misses\n",
++               s->sendump_cache_hits, s->sendump_cache_misses);
++        fclose(s->sendump_stream);
++        ckd_free(s->sendump_cache_data);
++        ckd_free(s->sendump_cache_feat);
++        ckd_free(s->sendump_cache_density);
++        ckd_free(s->sendump_cache_age);
++        ckd_free_2d(s->mixw);
++    }
++    else
++#endif
+     if (s->sendump_mmap) {
+         ckd_free_2d(s->mixw); 
+         mmio_file_unmap(s->sendump_mmap);

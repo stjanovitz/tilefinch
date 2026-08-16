@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+<head><title>Section mutation state</title></head>
+<body>
+  <h1 id="alpha">Mutation section</h1>
+  <div id="mutation-target">Original</div>
+  <button id="mutation-button">Mutate</button>
+  <script>
+    document.getElementById('mutation-button').addEventListener('click', () => {
+      document.getElementById('mutation-target').textContent = 'Changed';
+    });
+  </script>
+  <h2 id="gamma">Other section</h2>
+  <p>Evict the mutation section.</p>
+</body>
+</html>

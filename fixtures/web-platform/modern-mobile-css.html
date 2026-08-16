@@ -1,0 +1,56 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width">
+<title>Modern mobile CSS interaction and presentation</title>
+<style>
+html,body{margin:0;padding:0}
+#policy{user-select:none;touch-action:pan-x;text-wrap:balance;
+  text-size-adjust:120%}
+#child{font-size:20px}
+#turn{display:block;width:40px;height:20px;translate:10px 5px;
+  rotate:90deg;scale:2;isolation:isolate;background:#123456;
+  border-start-start-radius:7px}
+textarea{display:block;width:100px;height:40px;resize:both}
+#function-list{display:block;width:20px;height:10px;
+  transform:translate(4px,3px) scale(2) rotate(.25turn)}
+#gradient{display:block;width:40px;height:20px;
+  background:radial-gradient(circle,lab(60% 30 20),
+    color-mix(in oklab,#2468ac 75%,transparent))}
+</style>
+<body><div id="policy"><span id="child">CHILD</span></div>
+<div id="turn"></div><textarea id="editor">EDIT</textarea>
+<div id="function-list"></div><div id="gradient"></div>
+<output id="result"></output>
+<script>
+globalThis.pocSummary='wp-modern-mobile-css:PENDING';
+setTimeout(()=>{
+  const policy=getComputedStyle(document.getElementById('policy'));
+  const child=getComputedStyle(document.getElementById('child'));
+  const turn=getComputedStyle(document.getElementById('turn'));
+  const editor=getComputedStyle(document.getElementById('editor'));
+  const rect=document.getElementById('turn').getBoundingClientRect();
+  const listRect=document.getElementById('function-list').getBoundingClientRect();
+  const pass=policy.getPropertyValue('user-select')==='none'
+    && policy.getPropertyValue('touch-action')==='pan-x'
+    && policy.getPropertyValue('text-wrap')==='balance'
+    && policy.getPropertyValue('text-size-adjust')==='120%'
+    && child.fontSize==='24px'
+    && turn.getPropertyValue('translate')==='10px 5px'
+    && turn.getPropertyValue('rotate')==='90deg'
+    && turn.getPropertyValue('scale')==='2'
+    && turn.getPropertyValue('isolation')==='isolate'
+    && turn.getPropertyValue('border-start-start-radius')==='7px'
+    && editor.getPropertyValue('resize')==='both'
+    && rect.width===40 && rect.height===80
+    && listRect.width===20 && listRect.height===40
+    && matchMedia('(max-device-width:480px) and (min-aspect-ratio:16/10)').matches
+    && CSS.supports('background','radial-gradient(circle,lab(60% 30 20),#fff)')
+    && CSS.supports('text-wrap','pretty')
+    && CSS.supports('isolation','isolate')
+    && !CSS.supports('rotate','45deg');
+  globalThis.pocSummary='wp-modern-mobile-css:'+(pass?'PASS':'FAIL')
+    +':user-select='+policy.getPropertyValue('user-select')
+    +':touch-action='+policy.getPropertyValue('touch-action')
+    +':font-size='+child.fontSize+':rect='+rect.width+'x'+rect.height;
+  document.getElementById('result').textContent=pocSummary;
+},0);
+</script></body>

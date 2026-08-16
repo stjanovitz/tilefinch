@@ -1,0 +1,7 @@
+name	url	limit_mb	profile	minimum_height	purpose
+example	https://example.com/	8	none	272	minimal HTML and TLS smoke test
+hacker-news	https://news.ycombinator.com/	12	none	400	dense semantic HTML, tables, links, forms, and long scrolling
+govuk	https://www.gov.uk/	18	none	1000	responsive accessible navigation, forms, cookie UI, and progressive enhancement
+wikipedia	https://en.wikipedia.org/wiki/PlayStation_Portable	24	none	1000	large document, images, tables, typography, sticky UI, and full traversal
+reddit-old	https://old.reddit.com/r/PSP/	12	none	500	compact listing, voting controls, comments, and server-rendered compatibility
+nytimes	https://www.nytimes.com/	28	none	1000	production news layout, responsive CSS, variables, and content density

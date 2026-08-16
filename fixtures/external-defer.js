@@ -1,0 +1,1 @@
+globalThis.scriptOrder.push('defer');

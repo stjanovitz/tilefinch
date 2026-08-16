@@ -1,0 +1,99 @@
+--- a/src/hmm.h
++++ b/src/hmm.h
+@@ -156,7 +156,11 @@
+ /**
+  * Hard-coded limit on the number of emitting states.
+  */
++#ifdef TILEFINCH_THREE_STATE_HMM
++#define HMM_MAX_NSTATE 3
++#else
+ #define HMM_MAX_NSTATE 5
++#endif
+ 
+ /**
+  * @struct hmm_t
+--- a/src/acmod.c
++++ b/src/acmod.c
+@@ -1186,10 +1186,12 @@
+         return;
+     if (hmm_is_mpx(hmm)) {
+         switch (hmm_n_emit_state(hmm)) {
++#ifndef TILEFINCH_THREE_STATE_HMM
+         case 5:
+             MPX_BITVEC_SET(acmod, hmm, 4);
+             MPX_BITVEC_SET(acmod, hmm, 3);
+             /* FALLTHRU */
++#endif
+         case 3:
+             MPX_BITVEC_SET(acmod, hmm, 2);
+             MPX_BITVEC_SET(acmod, hmm, 1);
+@@ -1203,10 +1205,12 @@
+     }
+     else {
+         switch (hmm_n_emit_state(hmm)) {
++#ifndef TILEFINCH_THREE_STATE_HMM
+         case 5:
+             NONMPX_BITVEC_SET(acmod, hmm, 4);
+             NONMPX_BITVEC_SET(acmod, hmm, 3);
+             /* FALLTHRU */
++#endif
+         case 3:
+             NONMPX_BITVEC_SET(acmod, hmm, 2);
+             NONMPX_BITVEC_SET(acmod, hmm, 1);
+--- a/src/hmm.c
++++ b/src/hmm.c
+@@ -218,7 +218,10 @@
+ 
+ #define hmm_tprob_5st(i, j) (-tp[(i)*6+(j)])
+ #define nonmpx_senscr(i) (-senscore[sseq[i]])
++#define mpx_senid(st) sseq[ssid[st]][st]
++#define mpx_senscr(st) (-senscore[mpx_senid(st)])
+ 
++#ifndef TILEFINCH_THREE_STATE_HMM
+ static int32
+ hmm_vit_eval_5st_lr(hmm_t * hmm)
+ {
+@@ -348,9 +351,6 @@
+     hmm_bestscore(hmm) = bestScore;
+     return bestScore;
+ }
+-
+-#define mpx_senid(st) sseq[ssid[st]][st]
+-#define mpx_senscr(st) (-senscore[mpx_senid(st)])
+ 
+ static int32
+ hmm_vit_eval_5st_lr_mpx(hmm_t * hmm)
+@@ -523,6 +523,7 @@
+     hmm_bestscore(hmm) = bestScore;
+     return bestScore;
+ }
++#endif
+ 
+ #define hmm_tprob_3st(i, j) (-tp[(i)*4+(j)])
+ 
+@@ -787,17 +788,23 @@
+ hmm_vit_eval(hmm_t * hmm)
+ {
+     if (hmm_is_mpx(hmm)) {
++#ifndef TILEFINCH_THREE_STATE_HMM
+         if (hmm_n_emit_state(hmm) == 5)
+             return hmm_vit_eval_5st_lr_mpx(hmm);
+-        else if (hmm_n_emit_state(hmm) == 3)
++        else
++#endif
++        if (hmm_n_emit_state(hmm) == 3)
+             return hmm_vit_eval_3st_lr_mpx(hmm);
+         else
+             return hmm_vit_eval_anytopo(hmm);
+     }
+     else {
++#ifndef TILEFINCH_THREE_STATE_HMM
+         if (hmm_n_emit_state(hmm) == 5)
+             return hmm_vit_eval_5st_lr(hmm);
+-        else if (hmm_n_emit_state(hmm) == 3)
++        else
++#endif
++        if (hmm_n_emit_state(hmm) == 3)
+             return hmm_vit_eval_3st_lr(hmm);
+         else
+             return hmm_vit_eval_anytopo(hmm);

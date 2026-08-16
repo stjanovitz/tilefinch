@@ -1,0 +1,65 @@
+diff --git a/quickjs.c b/quickjs.c
+index e16b491..b6afd48 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -339,6 +339,9 @@ struct JSRuntime {
+        binary string per character) with a catchable RangeError instead
+        of an engine-wide out-of-memory storm.  TILEFINCH_JS_ARRAY_CAP_KB. */
+     size_t fast_array_byte_limit;
++    /* Cap geometric over-allocation for already-large dense arrays.  Zero
++       keeps upstream 1.5x growth for controlled comparisons. */
++    size_t fast_array_growth_byte_limit;
+ 
+     int class_count;    /* size of class_array */
+     JSClass *class_array;
+@@ -2091,11 +2094,19 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
+     memset(rt, 0, sizeof(*rt));
+     {
+         const char *cap = getenv("TILEFINCH_JS_ARRAY_CAP_KB");
++        const char *growth = getenv("TILEFINCH_JS_ARRAY_GROWTH_KB");
++        rt->fast_array_growth_byte_limit = 512 * 1024;
+         if (cap != NULL) {
+             long cap_kb = atol(cap);
+             if (cap_kb > 0)
+                 rt->fast_array_byte_limit = (size_t) cap_kb * 1024;
+         }
++        if (growth != NULL) {
++            long growth_kb = atol(growth);
++            if (growth_kb >= 0 && growth_kb <= 16 * 1024)
++                rt->fast_array_growth_byte_limit =
++                    (size_t)growth_kb * 1024;
++        }
+     }
+     js_malloc_init(&rt->malloc_ctx);
+     rt->malloc_ctx.mf = *mf;
+@@ -9582,6 +9593,7 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
+ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
+ {
+     uint32_t new_size;
++    uint64_t current_bytes, growth_bytes, grown_size;
+     size_t slack;
+     JSValue *new_array_prop;
+     if (unlikely(ctx->rt->fast_array_byte_limit != 0)
+@@ -9590,8 +9602,20 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
+         JS_ThrowRangeError(ctx, "array exceeds the device profile size");
+         return -1;
+     }
+-    /* XXX: potential arithmetic overflow */
+-    new_size = max_int(new_len, p->u.array.u1.size * 3 / 2);
++    current_bytes = sizeof(JSValue) * (uint64_t)p->u.array.u1.size;
++    if (current_bytes >= 1024 * 1024
++        && ctx->rt->fast_array_growth_byte_limit != 0) {
++        growth_bytes = current_bytes / 4;
++        if (growth_bytes > ctx->rt->fast_array_growth_byte_limit)
++            growth_bytes = ctx->rt->fast_array_growth_byte_limit;
++        grown_size = (uint64_t)p->u.array.u1.size +
++            max_int(1, growth_bytes / sizeof(JSValue));
++    } else {
++        grown_size = (uint64_t)p->u.array.u1.size * 3 / 2;
++    }
++    if (grown_size > UINT32_MAX)
++        grown_size = UINT32_MAX;
++    new_size = new_len > grown_size ? new_len : (uint32_t)grown_size;
+     new_array_prop = js_realloc2(ctx, p->u.array.u.values, sizeof(JSValue) * new_size, &slack);
+     if (!new_array_prop)
+         return -1;

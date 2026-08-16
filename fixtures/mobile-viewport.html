@@ -1,0 +1,13 @@
+<!doctype html>
+<title>Neutral mobile viewport regression</title>
+<style>
+  body { margin: 0; }
+  main { min-width: 900px; }
+  .row { display: flex; gap: 12px; }
+  .row > div { flex: 0 0 210px; height: 40px; }
+</style>
+<main>
+  <div class="row">
+    <div>one</div><div>two</div><div>three</div><div>four</div>
+  </div>
+</main>

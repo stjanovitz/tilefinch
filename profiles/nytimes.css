@@ -1,0 +1,122 @@
+html, body {
+  background: #ffffff;
+  color: #121212;
+  margin: 0;
+  padding: 0;
+  font-family: serif;
+  font-size: 16px;
+  line-height: 21px;
+}
+
+header, footer, dialog, #site-content nav,
+[data-testid="inline-interactive"], .loading-row,
+#site-index-label, .g-screenreader {
+  display: none;
+}
+
+#site-content {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  padding: 12px;
+  background: #ffffff;
+}
+
+#site-content div, #site-content section, #site-content article {
+  display: block;
+  position: static;
+  visibility: visible;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  background: #ffffff;
+  color: #121212;
+}
+
+#site-content figure, #site-content picture {
+  display: none;
+}
+
+#site-content hr {
+  display: block;
+  height: 1px;
+  margin: 8px 0;
+  padding: 0;
+  background: #b8b8b8;
+  color: #b8b8b8;
+}
+
+#site-content h1 {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  margin: 0 0 12px 0;
+  padding: 0 0 8px 0;
+  font-family: serif;
+  font-size: 25px;
+  font-weight: bold;
+  line-height: 29px;
+  border-bottom: 3px solid #121212;
+  position: static;
+  visibility: visible;
+}
+
+.story-wrapper {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  margin: 0;
+  padding: 10px 0;
+  border-bottom: 1px solid #b8b8b8;
+  background: #ffffff;
+}
+
+.story-wrapper .css-1ep04sb,
+.story-wrapper .css-1jwi144,
+.story-wrapper .css-cfnhvx,
+.story-wrapper .css-xdandi,
+.story-wrapper .css-plkyuz {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.story-wrapper .indicate-hover {
+  display: block;
+  margin: 0 0 5px 0;
+  color: #121212;
+  font-family: serif;
+  font-size: 19px;
+  font-weight: bold;
+  line-height: 23px;
+}
+
+.story-wrapper .summary-class {
+  display: block;
+  margin: 0 0 5px 0;
+  color: #444444;
+  font-family: serif;
+  font-size: 14px;
+  line-height: 18px;
+}
+
+.story-wrapper .css-e6rebf {
+  display: block;
+  margin: 2px 0 0 0;
+  color: #666666;
+  font-family: sans-serif;
+  font-size: 11px;
+  line-height: 14px;
+}
+
+.media-container {
+  display: none;
+}

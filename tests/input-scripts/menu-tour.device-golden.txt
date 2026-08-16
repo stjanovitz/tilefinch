@@ -1,0 +1,75 @@
+tilefinch-input-script: armed script=input-script.txt steps=155 stall-limit=1800
+tilefinch-input-script: mark=boot step=1 screen=home
+tilefinch-input-script: mark=home-first step=6 screen=home
+tilefinch-input-script: mark=tabs-first step=12 screen=tabs
+tilefinch-input-script: step=13 action=new-tab setting=none screen=home list=0 tab=0
+tilefinch-input-script: mark=home-tab step=16 screen=home
+tilefinch-input-script: step=19 action=show-screenshots setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=page step=22 screen=page
+tilefinch-input-script: step=22 action=focus-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: step=24 action=focus-right setting=none screen=page list=0 tab=0
+tilefinch-input-script: step=26 action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: step=28 action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: step=30 action=page-up setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=scrolled step=33 screen=page
+tilefinch-input-script: step=33 action=reload setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=reloaded step=36 screen=page
+tilefinch-input-script: step=39 action=toggle-reader setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=reader step=42 screen=page
+tilefinch-input-script: step=44 action=toggle-reader setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=reader-off step=47 screen=page
+tilefinch-input-script: step=49 action=toggle-reader-site setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=reader-site step=52 screen=page
+tilefinch-input-script: mark=appearance step=60 screen=option-items
+tilefinch-input-script: step=60 action=none setting=browser-ui-scale screen=option-items list=0 tab=0
+tilefinch-input-script: step=63 action=none setting=page-font-percent screen=option-items list=0 tab=0
+tilefinch-input-script: step=66 action=none setting=reader-font screen=option-items list=0 tab=0
+tilefinch-input-script: step=69 action=none setting=remember-reader-site-scale screen=option-items list=0 tab=0
+tilefinch-input-script: step=72 action=none setting=color-mode screen=option-items list=0 tab=0
+tilefinch-input-script: step=75 action=none setting=chrome-theme screen=option-items list=0 tab=0
+tilefinch-input-script: step=78 action=none setting=video-scaling screen=option-items list=0 tab=0
+tilefinch-input-script: mark=appearance-done step=82 screen=option-items
+tilefinch-input-script: mark=tabs step=92 screen=tabs
+tilefinch-input-script: step=93 action=switch-tab setting=none screen=home list=0 tab=0
+tilefinch-input-script: mark=tabs-done step=96 screen=home
+tilefinch-input-script: step=99 action=show-bookmarks setting=none screen=collections list=0 tab=0
+tilefinch-input-script: mark=bookmarks step=102 screen=collections
+tilefinch-input-script: step=109 action=show-history setting=none screen=collections list=0 tab=0
+tilefinch-input-script: mark=history step=112 screen=collections
+tilefinch-input-script: step=117 action=show-offline setting=none screen=collections list=0 tab=0
+tilefinch-input-script: mark=library step=120 screen=collections
+tilefinch-input-script: step=125 action=show-screenshots setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=screenshots step=128 screen=page
+tilefinch-input-script: step=128 action=back setting=none screen=page list=0 tab=0
+tilefinch-input-script: step=133 action=toggle-bookmark setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=bookmarked step=136 screen=page
+tilefinch-input-script: step=139 action=home setting=none screen=home list=0 tab=0
+tilefinch-input-script: mark=home step=142 screen=home
+tilefinch-input-script: mark=home-moved step=147 screen=home
+tilefinch-input-script: mark=exiting step=148 screen=home
+tilefinch-input-script: step=151 action=exit setting=none screen=home list=0 tab=0
+tilefinch-input-script: covered action=focus-down count=1
+tilefinch-input-script: covered action=focus-right count=1
+tilefinch-input-script: covered action=back count=1
+tilefinch-input-script: covered action=reload count=1
+tilefinch-input-script: covered action=toggle-reader count=2
+tilefinch-input-script: covered action=toggle-reader-site count=1
+tilefinch-input-script: covered action=page-up count=1
+tilefinch-input-script: covered action=page-down count=2
+tilefinch-input-script: covered action=home count=1
+tilefinch-input-script: covered action=show-offline count=1
+tilefinch-input-script: covered action=show-screenshots count=2
+tilefinch-input-script: covered action=toggle-bookmark count=1
+tilefinch-input-script: covered action=switch-tab count=1
+tilefinch-input-script: covered action=new-tab count=1
+tilefinch-input-script: covered action=show-bookmarks count=1
+tilefinch-input-script: covered action=show-history count=1
+tilefinch-input-script: covered action=exit count=1
+tilefinch-input-script: covered setting=browser-ui-scale count=1
+tilefinch-input-script: covered setting=page-font-percent count=1
+tilefinch-input-script: covered setting=reader-font count=1
+tilefinch-input-script: covered setting=remember-reader-site-scale count=1
+tilefinch-input-script: covered setting=color-mode count=1
+tilefinch-input-script: covered setting=chrome-theme count=1
+tilefinch-input-script: covered setting=video-scaling count=1
+tilefinch-input-script: outcome=exit-action steps=152/155 frames=773 held-frames=108 actions=17 settings=7

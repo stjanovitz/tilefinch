@@ -1,0 +1,32 @@
+# Real-PSP media lifecycle probe. The boot configuration supplies a direct
+# watch URL plus validation_media_play=1 and stability_auto=1. Live waits are
+# required because an active media surface is deliberately never "idle" to
+# the ordinary script gate.
+wait-live 1800
+mark-live before-pause
+tap-live cross
+wait-live 240
+tap-live cross
+wait-live 120
+tap-live right
+wait-live 30
+tap-live cross
+wait-live 600
+mark-live before-close
+tap-live circle
+# The production close path restores focus to the watch-page thumbnail. Once
+# teardown is complete, one spatial step from the watch page's required
+# search-first focus reaches the play target and Cross must reopen it. This
+# proves that the old backend did not remain quarantined and that page focus
+# navigation still works after fullscreen teardown.
+wait 8
+tap down
+tap cross
+# A fresh provider navigation can spend several seconds resolving over PSP
+# Wi-Fi.  Give it a bounded 75-second window, not the accidental eight-minute
+# wait that made a failed reopen unnecessarily expensive to diagnose.
+wait-live 2400
+mark-live reopened
+tap-live circle
+wait 8
+end

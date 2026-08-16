@@ -1,0 +1,29 @@
+--- a/src/util/profile.c
++++ b/src/util/profile.c
+@@ -179,7 +179,11 @@
+ void
+ ptmr_start(ptmr_t * tm)
+ {
+-#if (! defined(_WIN32)) || defined(GNUWINCE) || defined(__SYMBIAN32__)
++#if defined(__PSP__)
++    struct timeval e_start;
++    gettimeofday(&e_start, 0);
++    tm->start_cpu = tm->start_elapsed = make_sec(&e_start);
++#elif (! defined(_WIN32)) || defined(GNUWINCE) || defined(__SYMBIAN32__)
+     struct timeval e_start;     /* Elapsed time */
+ 
+ #if (! defined(_HPUX_SOURCE))  && (! defined(__SYMBIAN32__))
+@@ -218,7 +222,12 @@
+ {
+     float64 dt_cpu, dt_elapsed;
+ 
+-#if (! defined(_WIN32)) || defined(GNUWINCE) || defined(__SYMBIAN32__)
++#if defined(__PSP__)
++    struct timeval e_stop;
++    gettimeofday(&e_stop, 0);
++    dt_elapsed = make_sec(&e_stop) - tm->start_elapsed;
++    dt_cpu = dt_elapsed;
++#elif (! defined(_WIN32)) || defined(GNUWINCE) || defined(__SYMBIAN32__)
+     struct timeval e_stop;      /* Elapsed time */
+ 
+ #if (! defined(_HPUX_SOURCE))  && (! defined(__SYMBIAN32__))

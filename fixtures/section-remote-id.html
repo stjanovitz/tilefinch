@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+  <title>Remote ID lookup</title>
+  <script>
+    globalThis.remoteHeld = document.getElementById('beta-target');
+    globalThis.remoteGamma = document.getElementById('gamma-target');
+    const remoteQuery = document.querySelector('#beta-target');
+    const remoteAll = document.querySelectorAll('#beta-target');
+    globalThis.remoteBefore = !!remoteHeld
+      && remoteQuery === remoteHeld
+      && remoteAll.length === 1
+      && remoteAll.item(0) === remoteHeld
+      && remoteGamma && remoteGamma.tagName === 'INPUT'
+      && remoteGamma.isConnected
+      && remoteHeld.id === 'beta-target'
+      && remoteHeld.tagName === 'BUTTON'
+      && remoteHeld.isConnected;
+  </script>
+</head>
+<body>
+  <h1 id="alpha">Alpha</h1>
+  <p>Initial materialization.</p>
+  <h2 id="beta">Beta</h2>
+  <button id="beta-target">Beta button</button>
+  <script>
+    const local = document.getElementById('beta-target');
+    globalThis.betaRemotePass = remoteBefore && remoteHeld === local
+      && remoteHeld.isConnected && remoteHeld.textContent === 'Beta button';
+  </script>
+  <h3 id="gamma">Gamma</h3>
+  <input id="gamma-target" value="gamma-value">
+  <div id="remote-result">WAIT</div>
+  <script>
+    const gammaLocal = document.getElementById('gamma-target');
+    document.getElementById('remote-result').textContent = betaRemotePass
+      && remoteGamma === gammaLocal && remoteGamma.isConnected
+      && remoteGamma.value === 'gamma-value' && remoteHeld.isConnected
+      ? 'REMOTE-PASS' : 'REMOTE-FAIL';
+  </script>
+</body>
+</html>

@@ -1,0 +1,69 @@
+diff --git a/src/nanosvgrast.h b/src/nanosvgrast.h
+index 04a2a22..9bd6905 100644
+--- a/src/nanosvgrast.h
++++ b/src/nanosvgrast.h
+@@ -77,5 +77,6 @@ void nsvgDeleteRasterizer(NSVGrasterizer*);
+ 
+ #include <math.h>
++#include <limits.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+@@ -857,6 +858,24 @@ static int nsvg__cmpEdge(const void *p, const void *q)
+ }
+ 
+ 
++static int nsvg__fixedLimit(const NSVGrasterizer* r)
++{
++	double viewport = ((double)r->width + 2.0) * (double)NSVG__FIX;
++	double ceiling = (double)INT_MAX / 4.0;
++	return (int)(viewport < ceiling ? viewport : ceiling);
++}
++
++static int nsvg__boundedFixed(float value, int limit)
++{
++	float rounded;
++	if (!isfinite(value)) return 0;
++	rounded = nsvg__roundf(value);
++	if (rounded > (float)limit) return limit;
++	if (rounded < (float)-limit) return -limit;
++	return (int)rounded;
++}
++
++
+ static NSVGactiveEdge* nsvg__addActive(NSVGrasterizer* r, NSVGedge* e, float startPoint)
+ {
+ 	 NSVGactiveEdge* z;
+@@ -872,13 +889,12 @@ static NSVGactiveEdge* nsvg__addActive(NSVGrasterizer* r, NSVGedge* e, float sta
+ 	}
+ 
+ 	float dxdy = (e->x1 - e->x0) / (e->y1 - e->y0);
++	int fixedLimit = nsvg__fixedLimit(r);
+ //	STBTT_assert(e->y0 <= start_point);
+ 	// round dx down to avoid going too far
+-	if (dxdy < 0)
+-		z->dx = (int)(-nsvg__roundf(NSVG__FIX * -dxdy));
+-	else
+-		z->dx = (int)nsvg__roundf(NSVG__FIX * dxdy);
+-	z->x = (int)nsvg__roundf(NSVG__FIX * (e->x0 + dxdy * (startPoint - e->y0)));
++	z->dx = nsvg__boundedFixed(NSVG__FIX * dxdy, fixedLimit);
++	z->x = nsvg__boundedFixed(NSVG__FIX * (e->x0 + dxdy *
++							(startPoint - e->y0)), fixedLimit);
+ //	z->x -= off_x * FIX;
+ 	z->ey = e->y1;
+ 	z->next = 0;
+@@ -1147,7 +1163,13 @@ static void nsvg__rasterizeSortedEdges(NSVGrasterizer *r, float tx, float ty, flo
+ //					NSVG__assert(z->valid);
+ 					nsvg__freeActive(r, z);
+ 				} else {
+-					z->x += z->dx; // advance to position for current scanline
++					int fixedLimit = nsvg__fixedLimit(r);
++					if (z->dx > 0 && z->x > fixedLimit - z->dx)
++						z->x = fixedLimit;
++					else if (z->dx < 0 && z->x < -fixedLimit - z->dx)
++						z->x = -fixedLimit;
++					else
++						z->x += z->dx; // advance to position for current scanline
+ 					step = &((*step)->next); // advance through list
+ 				}
+ 			}

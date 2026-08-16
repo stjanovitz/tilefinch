@@ -1,0 +1,9 @@
+: keepalive
+event: status
+data: first
+data: second
+id: 7
+retry: 250
+
+data: final bird
+

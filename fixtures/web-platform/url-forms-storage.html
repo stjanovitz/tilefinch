@@ -1,0 +1,20 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width">
+<title>URL, forms, and storage</title>
+<body><form id="form"><input name="query" value="psp"><input type="checkbox" name="ready" value="yes" checked></form><output id="result"></output>
+<script>
+const url=new URL('../search?one=1','https://example.test/a/page');
+url.searchParams.append('two','hello world');
+const data=new FormData(document.getElementById('form'));
+localStorage.setItem('neutral-key','neutral-value');
+sessionStorage.setItem('session-key','session-value');
+const encoded=new TextEncoder().encode('PSP');
+const pass=url.href==='https://example.test/search?one=1&two=hello+world'
+  && url.searchParams.get('one')==='1'
+  && data.get('query')==='psp' && data.get('ready')==='yes'
+  && localStorage.getItem('neutral-key')==='neutral-value'
+  && sessionStorage.getItem('session-key')==='session-value'
+  && encoded.length===3 && encoded[0]===80;
+globalThis.pocSummary='wp-url-forms-storage:'+(pass?'PASS':'FAIL');
+document.getElementById('result').textContent=pocSummary;
+</script></body>

@@ -1,0 +1,31 @@
+focus-id searchIcon
+activate
+tick 5 100
+focus-id ooui-php-1
+type PlayStation Vita
+activate
+tick 10 100
+status
+back
+tick 5 100
+status
+back
+tick 5 100
+status
+js document.querySelector('a[href*="/wiki/PlayStation_Vita"]').setAttribute('id','tilefinch-vita-link')
+focus-id tilefinch-vita-link
+js 'article-before:'+location.pathname+':'+scrollY+':'+document.activeElement.getAttribute('href')
+activate
+tick 5 100
+status
+back
+tick 20 100
+js 'article-restored:'+location.pathname+':'+scrollY+':'+document.activeElement.getAttribute('href')
+anchor History
+js 'section-before:'+document.querySelector('#History').textContent.trim()
+tap 100 10
+activate
+tick 2 100
+js 'section-open:'+document.querySelector('#History').textContent.trim()
+status
+quit

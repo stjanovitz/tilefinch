@@ -1,0 +1,19 @@
+tick 1 16
+media-status
+go https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=description#description
+node-text description
+back
+tick 1 16
+cross
+tick 2 67
+cross
+media-status
+go https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=comments#comments
+node-text comments
+back
+tick 1 16
+cross
+tick 2 67
+cross
+media-status
+render /tmp/tilefinch-youtube-provider-restored.ppm

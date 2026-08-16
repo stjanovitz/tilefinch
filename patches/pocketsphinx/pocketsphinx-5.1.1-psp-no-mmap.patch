@@ -1,0 +1,22 @@
+--- a/src/util/mmio.c
++++ b/src/util/mmio.c
+@@ -58,6 +58,10 @@
+ # include <fcntl.h>
+ # include <sys/stat.h>
+ # include <sys/mman.h>
++#elif defined(__PSP__)
++# include <unistd.h>
++# include <fcntl.h>
++# include <sys/stat.h>
+ #elif defined(_WIN32)
+ # include <windows.h>
+ #else
+@@ -172,7 +176,7 @@
+ }
+ 
+ #else /* !WIN32, !WINCE */
+-#if defined(__ADSPBLACKFIN__) || defined(_WIN32_WP) 
++#if defined(__ADSPBLACKFIN__) || defined(_WIN32_WP) || defined(__PSP__)
+ 				/* This is true for both uClinux and VisualDSP++,
+                                  but actually we need a better way to detect it. */
+ struct mmio_file_s {

@@ -1,0 +1,34 @@
+# DEVICE-LOOP SCRIPT -- NOT A GOLDEN-GATED SCENARIO.
+#
+# There is deliberately no youtube-results-live.device-golden.txt, for the
+# same reason as youtube-watch-live.txt: the trace depends on what the search
+# actually returned. scripts/run-ppsspp-input-script.sh only runs the scenario
+# named by --script, and tests/test_psp_input_script.c only replays menu-tour,
+# so nothing picks this file up on its own.
+#
+# Run it from the PSPLink live loop with boot.cfg carrying
+#   url=https://m.youtube.com/results?search_query=<terms>
+#   input_script=youtube-results-live.txt
+# See docs/engineering/INPUT_SCRIPT_HARNESS.md, "PSPLink live loop".
+#
+# What it proves: a results page commits, its first result activates, and the
+# back edge returns to the list. The counterpart to youtube-watch-live.txt --
+# same shape, one navigation instead of one media open, and the circle edge
+# lands on `back` rather than on the media close. Results pages usually commit
+# well inside the first wait, so this run reports few busy frames; that is
+# expected here and is exactly why it is not gated on the busy counters the
+# way a checked-in live scenario would be.
+wait-live 2400
+mark-live opened
+tap-live cross
+mark-live activated
+tap-live circle
+wait-live 180
+mark returned
+# Menu > screenshot, so the host gets a frame of the restored list.
+tap select
+wait 4
+press 2 up
+tap cross
+wait 4
+end

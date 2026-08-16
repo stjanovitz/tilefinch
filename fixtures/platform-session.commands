@@ -1,0 +1,44 @@
+# Accelerated single-session PSP-front-end exercise. The final tick advances
+# thirty minutes of logical event-loop time without wall-clock pacing.
+mark-steady
+dpad-down 60
+dpad-up 0
+dpad-right
+dpad-left
+focus-id editor
+type -PSP
+backspace
+cross
+tick 8 16
+go http://127.0.0.1:8765/mobile-viewport.html
+bottom
+top
+go http://127.0.0.1:8765/float-article.html
+page-down
+page-up
+go http://127.0.0.1:8765/grid-tracks.html
+ltrigger
+rtrigger
+reload
+go http://127.0.0.1:8765/table-layout.html
+bottom
+top
+go http://127.0.0.1:8765/unified-resources.html
+tick 8 16
+go http://127.0.0.1:8765/mobile-viewport.html
+go http://127.0.0.1:8765/float-article.html
+go http://127.0.0.1:8765/grid-tracks.html
+ltrigger
+rtrigger
+reload
+go http://127.0.0.1:8765/table-layout.html
+go http://127.0.0.1:8765/unified-resources.html
+go http://127.0.0.1:8765/mobile-viewport.html
+go http://127.0.0.1:8765/float-article.html
+go http://127.0.0.1:8765/grid-tracks.html
+ltrigger
+rtrigger
+reload
+tick 1800 1000
+status
+quit

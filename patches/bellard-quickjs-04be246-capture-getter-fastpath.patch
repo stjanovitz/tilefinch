@@ -1,0 +1,20 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -17913,6 +17913,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+     }
+     b = p->u.func.function_bytecode;
+ 
++    /* A capture-only getter has no argument, receiver, allocation, or
++       observable interpreter-frame work. Preserve constructor/copy semantics
++       by using the ordinary path whenever call flags are present. */
++    if (likely(flags == 0 && b->byte_code_len == 2 &&
++               b->closure_var_count >= 1 &&
++               b->byte_code_buf[0] == OP_get_var_ref0 &&
++               b->byte_code_buf[1] == OP_return)) {
++        return JS_DupValue(caller_ctx, *p->u.func.var_refs[0]->pvalue);
++    }
++
+     if (unlikely(argc < b->arg_count || (flags & JS_CALL_FLAG_COPY_ARGV))) {
+         arg_allocated_size = b->arg_count;
+     } else {

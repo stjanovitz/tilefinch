@@ -1,0 +1,8 @@
+# Project-owned PSP HTTPS transport sources.
+#
+# Format: name|version|archive|sha256|official_url
+# Keep this file deliberately parseable by POSIX sh and CMake. Archives are
+# cached locally and are never committed; every consumer verifies these hashes.
+curl|8.21.0|curl-8.21.0.tar.xz|aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6|https://curl.se/download/curl-8.21.0.tar.xz
+mbedtls|3.6.6|mbedtls-3.6.6.tar.bz2|8fb65fae8dcae5840f793c0a334860a411f884cc537ea290ce1c52bb64ca007a|https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.6/mbedtls-3.6.6.tar.bz2
+nghttp2|1.69.0|nghttp2-1.69.0.tar.xz|1fb324b6ec2c56f6bde0658f4139ffd8209fa9e77ce98fd7a5f63af8d0e508ad|https://github.com/nghttp2/nghttp2/releases/download/v1.69.0/nghttp2-1.69.0.tar.xz

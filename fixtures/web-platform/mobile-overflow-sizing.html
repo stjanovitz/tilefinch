@@ -1,0 +1,44 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width">
+<title>Mobile overflow and automatic minimum sizing</title>
+<style>
+html,body{margin:0;padding:0}
+.flex{display:flex;width:100px}.item{white-space:nowrap}.fixed{flex:0 0 40px}
+#flex-clip{overflow:clip}#flex-hidden{overflow:hidden}
+.grid{display:grid;width:100px;grid-template-columns:auto 40px}
+#grid-zero{min-width:0}#grid-hidden{overflow:hidden}#grid-clip{overflow:clip}
+#outer{display:block;width:100px;overflow:auto}
+#inner-clip{display:block;width:100px;overflow:hidden}
+#inner-wide{display:block;width:300px;height:8px}
+</style>
+<body>
+<div class="flex"><span id="flex-clip" class="item">UNBREAKABLETOKEN</span><i class="fixed"></i></div>
+<div class="flex"><span id="flex-hidden" class="item">UNBREAKABLETOKEN</span><i class="fixed"></i></div>
+<div class="grid"><span id="grid-zero" class="item">UNBREAKABLETOKEN</span><i></i></div>
+<div class="grid"><span id="grid-hidden" class="item">UNBREAKABLETOKEN</span><i></i></div>
+<div class="grid"><span id="grid-clip" class="item">UNBREAKABLETOKEN</span><i></i></div>
+<div id="outer"><div id="inner-clip"><div id="inner-wide"></div></div></div>
+<output id="result"></output>
+<script>
+globalThis.pocSummary='wp-mobile-overflow-sizing:PENDING';
+setTimeout(()=>{
+  const flexClip=document.getElementById('flex-clip');
+  const flexHidden=document.getElementById('flex-hidden');
+  const gridZero=document.getElementById('grid-zero');
+  const gridHidden=document.getElementById('grid-hidden');
+  const gridClip=document.getElementById('grid-clip');
+  const outer=document.getElementById('outer');
+  const inner=document.getElementById('inner-clip');
+  const pass=flexClip.offsetWidth>60 && flexHidden.offsetWidth<=60
+    && gridZero.offsetWidth<=60 && gridHidden.offsetWidth<=60
+    && gridClip.offsetWidth>60
+    && outer.scrollWidth===outer.clientWidth
+    && inner.scrollWidth>inner.clientWidth;
+  globalThis.pocSummary='wp-mobile-overflow-sizing:'+(pass?'PASS':'FAIL')
+    +':flex='+flexClip.offsetWidth+'/'+flexHidden.offsetWidth
+    +':grid='+gridZero.offsetWidth+'/'+gridHidden.offsetWidth+'/'+gridClip.offsetWidth
+    +':scroll='+outer.scrollWidth+'/'+outer.clientWidth;
+  document.getElementById('result').textContent=pocSummary;
+},0);
+</script>
+</body>

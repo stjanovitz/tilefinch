@@ -1,0 +1,49 @@
+diff --git a/quickjs.c b/quickjs.c
+index e3716a4..e5030b2 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7540,6 +7540,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
+                             int backtrace_flags)
+ {
+     JSStackFrame *sf;
++    JSValue rooted_error_obj;
+     JSValue str;
+     DynBuf dbuf;
+     const char *func_name_str;
+@@ -7549,2 +7550,3 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
+     if (!JS_IsObject(error_obj))
+         return; /* protection in the out of memory case */
++    rooted_error_obj = JS_DupValue(ctx, error_obj);
+@@ -7557,14 +7559,14 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
+         dbuf_putc(&dbuf, '\n');
+         str = JS_NewString(ctx, filename);
+         if (JS_IsException(str))
+-            return;
++            goto fail;
+         /* Note: SpiderMonkey does that, could update once there is a standard */
+-        if (JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_fileName, str,
++        if (JS_DefinePropertyValue(ctx, rooted_error_obj, JS_ATOM_fileName, str,
+                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0 ||
+-            JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_lineNumber, JS_NewInt32(ctx, line_num),
++            JS_DefinePropertyValue(ctx, rooted_error_obj, JS_ATOM_lineNumber, JS_NewInt32(ctx, line_num),
+                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0 ||
+-            JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_columnNumber, JS_NewInt32(ctx, col_num),
++            JS_DefinePropertyValue(ctx, rooted_error_obj, JS_ATOM_columnNumber, JS_NewInt32(ctx, col_num),
+                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0) {
+-            return;
++            goto fail;
+         }
+     }
+@@ -7612,6 +7614,11 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
+     else
+         str = JS_NewString(ctx, (char *)dbuf.buf);
+     dbuf_free(&dbuf);
+-    JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, str,
++    JS_DefinePropertyValue(ctx, rooted_error_obj, JS_ATOM_stack, str,
+                            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
++    JS_FreeValue(ctx, rooted_error_obj);
++    return;
++ fail:
++    dbuf_free(&dbuf);
++    JS_FreeValue(ctx, rooted_error_obj);
+ }

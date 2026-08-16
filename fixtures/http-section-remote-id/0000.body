@@ -1,0 +1,90 @@
+<!doctype html>
+<html>
+<head>
+  <title>Remote ID lookup</title>
+  <script type="module">
+    globalThis.remoteHeld = document.getElementById('beta-target');
+    globalThis.remoteGamma = document.getElementById('gamma-target');
+    const remoteQuery = document.querySelector('#beta-target');
+    const remoteAll = document.querySelectorAll('#beta-target');
+    globalThis.remoteCompound =
+      document.querySelector('button#beta-target');
+    const remoteCompoundAll =
+      document.querySelectorAll('button#beta-target');
+    globalThis.remoteAnonymous =
+      document.querySelector('button.remote-anonymous[data-mode=wide]');
+    globalThis.remoteAnonymousAll =
+      document.querySelectorAll('button.remote-anonymous[data-mode=wide]');
+    globalThis.remoteBefore = !!remoteHeld
+      && remoteQuery === remoteHeld
+      && remoteAll.length === 1
+      && remoteAll.item(0) === remoteHeld
+      && remoteCompound && remoteCompoundAll.length === 1
+      && remoteCompoundAll.item(0) === remoteCompound
+      && remoteCompound.tagName === 'BUTTON'
+      && remoteCompound.matches('button#beta-target')
+      && remoteCompound.isConnected
+      && remoteAnonymous && remoteAnonymousAll.length === 2
+      && remoteAnonymousAll.item(0) === remoteAnonymous
+      && remoteAnonymousAll.item(1).tagName === 'BUTTON'
+      && remoteAnonymousAll.item(1).isConnected
+      && remoteAnonymous.tagName === 'BUTTON'
+      && remoteAnonymous.matches('button.remote-anonymous[data-mode=wide]')
+      && remoteAnonymous.isConnected
+      && remoteGamma && remoteGamma.tagName === 'INPUT'
+      && remoteGamma.isConnected
+      && remoteHeld.id === 'beta-target'
+      && remoteHeld.tagName === 'BUTTON'
+      && remoteHeld.isConnected;
+  </script>
+</head>
+<body>
+  <h1 id="alpha">Alpha</h1>
+  <p>Initial materialization.</p>
+  <h2 id="beta">Beta</h2>
+  <button id="beta-target">Beta button</button>
+  <button class="remote-anonymous" data-mode="wide">Anonymous beta</button>
+  <script type="module">
+    const local = document.getElementById('beta-target');
+    const localAnonymous =
+      document.querySelector('button.remote-anonymous[data-mode=wide]');
+    globalThis.betaRemotePass = remoteBefore && remoteHeld === local
+      && remoteCompound === local && remoteCompound.isConnected
+      && remoteAnonymous === localAnonymous && remoteAnonymous.isConnected
+      && remoteAnonymous.textContent === 'Anonymous beta'
+      && remoteHeld.isConnected && remoteHeld.textContent === 'Beta button';
+    globalThis.betaRemoteReason = [remoteBefore, remoteHeld === local,
+      remoteCompound === local, remoteCompound.isConnected,
+      remoteAnonymous === localAnonymous, remoteAnonymous.isConnected,
+      remoteAnonymous.textContent === 'Anonymous beta',
+      remoteHeld.isConnected, remoteHeld.textContent === 'Beta button']
+      .map(Boolean).join(',');
+  </script>
+  <h3 id="gamma">Gamma</h3>
+  <input id="gamma-target" value="gamma-value">
+  <button class="remote-anonymous" data-mode="wide">Anonymous gamma</button>
+  <div id="remote-result">WAIT</div>
+  <script type="module">
+    const gammaLocal = document.getElementById('gamma-target');
+    const gammaCollection = document.querySelectorAll(
+      'button.remote-anonymous[data-mode=wide]');
+    const gammaAnonymous = gammaCollection[1];
+    document.getElementById('remote-result').textContent = betaRemotePass
+      && remoteGamma === gammaLocal && remoteGamma.isConnected
+      && remoteGamma.value === 'gamma-value' && remoteHeld.isConnected
+      && gammaCollection.length === 2
+      && gammaCollection[0] === remoteAnonymous
+      && remoteAnonymousAll.item(1) === gammaAnonymous
+      && gammaAnonymous.isConnected
+      && gammaAnonymous.textContent === 'Anonymous gamma'
+      && remoteHeld.tagName === 'BUTTON'
+      && remoteHeld.nodeType === Node.ELEMENT_NODE
+      && remoteHeld.matches('button#beta-target')
+      && remoteAnonymous.tagName === 'BUTTON'
+      && remoteAnonymous.matches('button.remote-anonymous[data-mode=wide]')
+      && remoteAnonymous.parentElement === document.body
+      && remoteAnonymous.isConnected
+      ? 'REMOTE-PASS' : 'REMOTE-FAIL:' + betaRemoteReason;
+  </script>
+</body>
+</html>

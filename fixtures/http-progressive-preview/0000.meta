@@ -1,0 +1,32 @@
+psp-http-trace=3
+method=GET
+url=https://progressive.test/document
+success=1
+async-delay-pumps=0
+external-cancel=0
+transport-timeout=0
+error=
+request-body-length=0
+request-body-hash=cbf29ce484222325
+request-cookie-bytes=0
+request-has-cf-clearance=0
+request-extra-header-bytes=0
+request-send-client-hints=0
+request-send-low-client-hints=1
+request-sec-fetch-user=1
+request-upgrade-insecure=1
+status=200
+length=154
+response-body-hash=a3b1c1b6ef3a3d04
+effective-url=https://progressive.test/document
+content-type=text/html; charset=utf-8
+etag=
+last-modified=
+cf-mitigated=
+accept-ch=
+critical-ch=
+server=fixture
+cf-ray=
+response-header-count=1
+set-cookie-count=0
+response-header-0=content-type: text/html; charset=utf-8

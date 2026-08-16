@@ -1,0 +1,228 @@
+# Tilefinch scripted-input scenario 1: the chrome tour.
+#
+# Starts exactly where a normal PSP boot does: native HOME. It moves between
+# both launch tiles, creates another native HOME tab through the real tab UI,
+# then opens the local screenshots document to drive page-only controls before
+# covering appearance settings, collections, and HOME return paths
+# before leaving through the menu's own EXIT row. See
+# docs/engineering/INPUT_SCRIPT_HARNESS.md for the format.
+#
+# Every step counts idle frames, not wall-clock frames: the stepper holds its
+# position while a navigation, render job, or media surface is in flight, so
+# the same file walks the same sequence under PPSSPP and on a PSP-3000.
+#
+# Order matters. Native HOME intentionally has no document to reload, scroll,
+# bookmark, or read, so page-only work follows the screenshots document.
+#
+# The running comment tracks `menu_selection`, which persists across menu
+# opens. Menu rows, in order:
+#   0 address  1 home   2 tabs      3 library   4 bookmarks  5 history
+#   6 reader   7 find   8 save      9 bookmark 10 screenshots
+#  11 options 12 screenshot        13 exit
+#
+# Deliberately skipped, because each opens a text-entry modal or reaches the
+# network: 0 address, 7 find, 8 save, 12 screenshot. Those belong to a second
+# script that owns the on-screen keyboard. TRIANGLE is skipped too: the
+# reader-mode long-press measures milliseconds rather than frames.
+
+wait 30
+mark boot
+
+# --- Native HOME, then another HOME tab through the shipping UI -----------
+tap down
+wait 4
+tap right
+wait 4
+mark home-first
+# menu_selection 0 -> 2 (Tabs), then the trailing row creates a HOME tab.
+tap select
+wait 4
+press 2 down
+tap cross
+wait 8
+mark tabs-first
+tap down
+tap cross
+wait 12
+mark home-tab
+
+# Native HOME is the only built-in start surface. Open a different internal
+# document for the page-only actions below: 2 -> 10 (Screenshots).
+tap select
+wait 4
+press 8 down
+tap cross
+wait 20
+mark page
+
+# --- A local document: focus, scroll, reload -----------------------------
+tap down
+wait 4
+tap right
+wait 4
+tap rtrigger
+wait 8
+tap rtrigger
+wait 8
+tap ltrigger
+wait 8
+mark scrolled
+tap square
+wait 40
+mark reloaded
+
+# --- Reader mode -----------------------------------------------------------
+# menu_selection 10 -> 6 (Reader)
+tap select
+wait 4
+press 4 up
+tap cross
+wait 30
+mark reader
+# The same row toggles it back off.
+tap select
+wait 4
+tap cross
+wait 30
+mark reader-off
+# SQUARE on the reader row is the per-site variant.
+tap select
+wait 4
+tap square
+wait 20
+mark reader-site
+
+# --- Appearance settings -------------------------------------------------
+# menu_selection 6 -> 11 (Options)
+tap select
+wait 4
+press 5 down
+tap cross
+wait 6
+# Options groups: 0 Appearance is already selected.
+tap cross
+wait 6
+mark appearance
+# Appearance rows, in group order: ui-scale, page-font, reader-font,
+# remember-reader-scale, color-mode, chrome-theme, language/emoji,
+# video-scaling.
+tap right
+wait 4
+tap down
+tap right
+wait 4
+tap down
+tap right
+wait 4
+tap down
+tap right
+wait 4
+tap down
+tap right
+wait 4
+tap down
+tap right
+wait 4
+tap down
+tap right
+wait 4
+tap right
+tap down
+tap right
+tap circle
+wait 4
+tap down
+tap right
+wait 4
+wait 6
+mark appearance-done
+tap circle
+wait 4
+tap circle
+wait 8
+
+# --- Tabs overlay --------------------------------------------------------
+# menu_selection 11 -> 2 (Tabs). The active row is tab 1; switch to tab 0.
+tap select
+wait 4
+press 5 down
+tap cross
+wait 8
+mark tabs
+tap up
+tap cross
+wait 20
+mark tabs-done
+
+# --- Collections: bookmarks, history, library, screenshots ---------------
+# menu_selection 2 -> 4 (Bookmarks)
+tap select
+wait 4
+press 2 down
+tap cross
+wait 12
+mark bookmarks
+tap down
+wait 4
+tap circle
+wait 8
+# 4 -> 5 (History)
+tap select
+wait 4
+tap down
+tap cross
+wait 12
+mark history
+tap circle
+wait 8
+# 5 -> 3 (Library)
+tap select
+wait 4
+press 2 up
+tap cross
+wait 12
+mark library
+tap circle
+wait 8
+# 3 -> 10 (Screenshots): a page rather than a surface, so CIRCLE goes back.
+tap select
+wait 4
+press 7 down
+tap cross
+wait 20
+mark screenshots
+tap circle
+wait 20
+
+# --- Bookmark the page ---------------------------------------------------
+# 10 -> 9 (Add or remove bookmark)
+tap select
+wait 4
+press 1 up
+tap cross
+wait 12
+mark bookmarked
+
+# --- The native HOME surface ---------------------------------------------
+# 9 -> 1 (Home)
+tap select
+wait 4
+press 6 down
+tap cross
+wait 40
+mark home
+tap down
+wait 4
+tap right
+wait 4
+mark home-moved
+
+# --- Leave through the menu's own EXIT row -------------------------------
+# 1 -> 13 (Exit to XMB)
+mark exiting
+tap select
+wait 4
+press 2 up
+tap cross
+wait 4
+end

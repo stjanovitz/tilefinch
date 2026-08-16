@@ -1,0 +1,202 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -342,6 +342,11 @@ struct JSRuntime {
+        keeps upstream 1.5x growth for controlled comparisons. */
+     size_t fast_array_growth_byte_limit;
+ 
++#ifdef CONFIG_PROPERTY_FAULT_TRACE
++    uint32_t property_fault_trace_count;
++    uint32_t property_fault_trace_limit;
++#endif
++
+     int class_count;    /* size of class_array */
+     JSClass *class_array;
+ 
+@@ -2247,6 +2252,16 @@ JSRuntime *JS_NewRuntime(void)
+     return JS_NewRuntime2(&def_malloc_funcs, NULL);
+ }
+ 
++#ifdef CONFIG_PROPERTY_FAULT_TRACE
++/* Diagnostic-only API kept out of quickjs.h so production embedders do not
++   acquire a non-upstream ABI surface. */
++void JS_SetPropertyFaultTraceLimit(JSRuntime *rt, uint32_t limit)
++{
++    rt->property_fault_trace_count = 0;
++    rt->property_fault_trace_limit = limit;
++}
++#endif
++
+ void JS_SetMemoryLimit(JSRuntime *rt, size_t limit)
+ {
+     rt->malloc_ctx.malloc_state.malloc_limit = limit;
+@@ -7560,6 +7576,116 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
+     return 0;
+ }
+ 
++#ifdef CONFIG_PROPERTY_FAULT_TRACE
++static const char *property_fault_tag_name(int tag)
++{
++    switch (tag) {
++    case JS_TAG_INT: return "int";
++    case JS_TAG_BOOL: return "bool";
++    case JS_TAG_NULL: return "null";
++    case JS_TAG_UNDEFINED: return "undefined";
++    case JS_TAG_FLOAT64: return "float64";
++    case JS_TAG_STRING: return "string";
++    case JS_TAG_STRING_ROPE: return "string-rope";
++    case JS_TAG_SYMBOL: return "symbol";
++    case JS_TAG_OBJECT: return "object";
++    case JS_TAG_BIG_INT: return "bigint";
++    case JS_TAG_EXCEPTION: return "exception";
++    case JS_TAG_UNINITIALIZED: return "uninitialized";
++    default: return "internal";
++    }
++}
++
++static void trace_property_fault(JSContext *ctx, JSFunctionBytecode *b,
++                                 const uint8_t *pc, int opcode,
++                                 JSValueConst base, JSValueConst key,
++                                 JSAtom atom, const JSValue *stack_base,
++                                 const JSValue *sp, const JSValue *arg_base,
++                                 int arg_count, const JSValue *var_base,
++                                 int var_count)
++{
++    JSRuntime *rt = ctx->rt;
++    char filename_buf[192], function_buf[96], atom_buf[96];
++    const char *filename = "<stripped>";
++    const char *function = "<anonymous>";
++    const char *property = "<computed>";
++    uint32_t pc_offset = (uint32_t)(pc - b->byte_code_buf);
++    int col = 0, line = find_line_num(ctx, b, pc_offset, &col);
++    int i, depth = (int)(sp - stack_base);
++
++    if (rt->property_fault_trace_limit == 0
++        || rt->property_fault_trace_count >= rt->property_fault_trace_limit)
++        return;
++    rt->property_fault_trace_count++;
++    if (b->has_debug && b->debug.filename != JS_ATOM_NULL)
++        filename = JS_AtomGetStr(ctx, filename_buf, sizeof(filename_buf),
++                                 b->debug.filename);
++    if (b->func_name != JS_ATOM_NULL)
++        function = JS_AtomGetStr(ctx, function_buf, sizeof(function_buf),
++                                 b->func_name);
++    if (atom != JS_ATOM_NULL) {
++        property = JS_AtomGetStr(ctx, atom_buf, sizeof(atom_buf), atom);
++    } else if (JS_VALUE_GET_TAG(key) == JS_TAG_INT) {
++        snprintf(atom_buf, sizeof(atom_buf), "%d", JS_VALUE_GET_INT(key));
++        property = atom_buf;
++    } else if (JS_VALUE_GET_TAG(key) == JS_TAG_STRING) {
++        JSString *string = JS_VALUE_GET_STRING(key);
++        size_t written = (size_t)snprintf(atom_buf, sizeof(atom_buf),
++                                          "<string:%u:", string->len);
++        uint32_t at;
++        for (at = 0; at < string->len && at < 40
++             && written + 2 < sizeof(atom_buf); at++) {
++            int ch = string_get(string, at);
++            atom_buf[written++] = ch >= 0x20 && ch < 0x7f ? (char)ch : '?';
++        }
++        atom_buf[written++] = '>';
++        atom_buf[written] = '\0';
++        property = atom_buf;
++    }
++    fprintf(stderr,
++            "quickjs-property-fault seq=%u source=\"%.*s\" line=%d col=%d "
++            "function=\"%.*s\" pc=%u opcode=%d base=%s key=%s property=\"%.*s\" depth=%d\n",
++            rt->property_fault_trace_count, 180, filename, line, col,
++            84, function, pc_offset, opcode,
++            property_fault_tag_name(JS_VALUE_GET_TAG(base)),
++            property_fault_tag_name(JS_VALUE_GET_TAG(key)), 84, property,
++            depth);
++    fprintf(stderr, "quickjs-property-stack top-tags=");
++    for (i = 0; i < 8 && i < depth; i++)
++        fprintf(stderr, "%s%s", i == 0 ? "" : ",",
++                property_fault_tag_name(JS_VALUE_GET_TAG(sp[-1 - i])));
++    fprintf(stderr, " arg-tags=");
++    for (i = 0; i < 8 && i < arg_count; i++)
++        fprintf(stderr, "%s%s", i == 0 ? "" : ",",
++                property_fault_tag_name(JS_VALUE_GET_TAG(arg_base[i])));
++    fprintf(stderr, " arg-values=");
++    for (i = 0; i < 16 && i < arg_count; i++) {
++        int tag = JS_VALUE_GET_TAG(arg_base[i]);
++        fprintf(stderr, "%s%s", i == 0 ? "" : ",",
++                property_fault_tag_name(tag));
++        if (tag == JS_TAG_INT || tag == JS_TAG_BOOL)
++            fprintf(stderr, ":%d", JS_VALUE_GET_INT(arg_base[i]));
++        else if (tag == JS_TAG_FLOAT64)
++            fprintf(stderr, ":%.17g", JS_VALUE_GET_FLOAT64(arg_base[i]));
++        else if (tag == JS_TAG_STRING)
++            fprintf(stderr, ":%u",
++                    JS_VALUE_GET_STRING(arg_base[i])->len);
++    }
++    fprintf(stderr, " var-tags=");
++    for (i = 0; i < 8 && i < var_count; i++)
++        fprintf(stderr, "%s%s", i == 0 ? "" : ",",
++                property_fault_tag_name(JS_VALUE_GET_TAG(var_base[i])));
++    fprintf(stderr, " code=");
++    for (i = -8; i < 8; i++) {
++        int offset = (int)pc_offset + i;
++        if (offset >= 0 && offset < b->byte_code_len)
++            fprintf(stderr, "%s%02x", i == -8 ? "" : ":",
++                    b->byte_code_buf[offset]);
++    }
++    fprintf(stderr, "\n");
++}
++#endif
++
+ /* return a string property without executing arbitrary JS code (used
+    when dumping the stack trace or in debug print). */
+ static const char *get_prop_string(JSContext *ctx, JSValueConst obj,
+@@ -19235,6 +19360,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 } else {                                                \
+                 name ## _slow_path:                                     \
+                     sf->cur_pc = pc;                                    \
++                    if (unlikely(JS_IsNull(obj) || JS_IsUndefined(obj))) { \
++                        trace_property_fault(ctx, b, pc, opcode, obj,    \
++                                             JS_UNDEFINED, atom,        \
++                                             stack_buf, sp, arg_buf,    \
++                                             sf->arg_count, var_buf,    \
++                                             b->var_count);             \
++                    }                                                   \
+                     val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], 0); \
+                     if (unlikely(JS_IsException(val)))                  \
+                         goto exception;                                 \
+@@ -19501,6 +19633,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 } else {                                                \
+                     name ## _slow_path:                                 \
+                     sf->cur_pc = pc;                                    \
++                    if (unlikely(JS_IsNull(obj) || JS_IsUndefined(obj))) { \
++                        trace_property_fault(ctx, b, pc, opcode, obj, prop, \
++                                             JS_ATOM_NULL, stack_buf, sp, \
++                                             arg_buf, sf->arg_count,     \
++                                             var_buf, b->var_count);    \
++                    }                                                   \
+                     val = JS_GetPropertyValue(ctx, obj, prop);          \
+                     if (unlikely(JS_IsException(val))) {                \
+                         if (keep)                                       \
+@@ -19549,6 +19687,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     default:
+                         /* must be tested before JS_ToPropertyKey */
+                         if (unlikely(JS_IsUndefined(sp[-2]) || JS_IsNull(sp[-2]))) {
++                            trace_property_fault(ctx, b, pc, opcode, sp[-2],
++                                                 sp[-1], JS_ATOM_NULL,
++                                                 stack_buf, sp, arg_buf,
++                                                 sf->arg_count, var_buf,
++                                                 b->var_count);
+                             JS_ThrowTypeError(ctx, "value has no property");
+                             goto exception;
+                         }
+@@ -19565,6 +19708,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                         sp[-1] = ret_val;
+                         break;
+                     }
++                    if (unlikely(JS_IsNull(sp[-2]) || JS_IsUndefined(sp[-2]))) {
++                        trace_property_fault(ctx, b, pc, opcode, sp[-2],
++                                             sp[-1], JS_ATOM_NULL,
++                                             stack_buf, sp, arg_buf,
++                                             sf->arg_count, var_buf,
++                                             b->var_count);
++                    }
+                     sf->cur_pc = pc;
+                     val = JS_GetPropertyValue(ctx, sp[-2], JS_DupValue(ctx, sp[-1]));
+                     if (unlikely(JS_IsException(val)))

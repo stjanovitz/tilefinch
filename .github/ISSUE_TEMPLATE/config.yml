@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security policy
+    url: https://github.com/stjanovitz/tilefinch/blob/main/SECURITY.md
+    about: What Tilefinch protects, what it does not, and how to report a vulnerability.
+  - name: Troubleshooting guide
+    url: https://github.com/stjanovitz/tilefinch/blob/main/TROUBLESHOOTING.md
+    about: Wi-Fi, memory, update recovery, and other known answers.

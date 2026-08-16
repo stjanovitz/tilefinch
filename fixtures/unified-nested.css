@@ -1,0 +1,6 @@
+@media (400px <= width < 600px) and (height >= 272px) {
+  #resource-card { color: #246813; background: #112233; }
+}
+@media (width >= 700px) {
+  #resource-card { display: none; }
+}

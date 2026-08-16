@@ -1,0 +1,5 @@
+focus-next
+activate
+focus-next
+activate
+status

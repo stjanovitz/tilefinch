@@ -1,0 +1,20 @@
+<!doctype html>
+<!-- RGB565 banding probe.  Every ramp here spans only a handful of 5/6/5
+     quantisation steps across the full viewport width, which is the shape
+     that makes truncation visible as hard vertical bands.  Render this with
+     `psp-browser-lab --fixture` to eyeball the ordered dithering in
+     src/render.c (rgb565_dither_source); with dithering removed the same
+     frame shows six to eight discrete steps per ramp. -->
+<meta charset="utf-8">
+<title>banding probe</title>
+<style>
+  html, body { margin: 0; padding: 0; }
+  div { display: block; width: 480px; height: 68px; }
+  /* Shallow ramps: the classic RGB565 banding case. Each spans only a few
+     quantisation steps over 480px, so truncation gives wide flat bands. */
+  #grey { background: linear-gradient(to right, #303030, #484848); }
+  #blue { background: linear-gradient(to right, #203040, #405870); }
+  #warm { background: linear-gradient(to right, #b09070, #d0b090); }
+  #dark { background: linear-gradient(to bottom, #101820, #283848); }
+</style>
+<div id="grey"></div><div id="blue"></div><div id="warm"></div><div id="dark"></div>

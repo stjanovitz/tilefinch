@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Hermetic Fixture</title>
+  <style>
+    html, body { margin: 0; background: #fff; color: #111; font: 16px sans-serif; }
+    main { box-sizing: border-box; min-height: 544px; padding: 24px; }
+    h1 { margin: 240px 0 0; }
+  </style>
+</head>
+<body>
+  <main><h1 id="middle">Ready marker</h1></main>
+  <script>
+    const bytes = crypto.getRandomValues(new Uint8Array(8));
+    document.body.dataset.initial = [Date.now(), performance.now(), Math.random(), ...bytes].join(",");
+    setTimeout(() => { document.body.dataset.timer = String(Date.now()); }, 10);
+    requestAnimationFrame((stamp) => { document.body.dataset.frame = String(stamp); });
+    const values = [];
+    const appendNext = () => fetch("/sequence", { cache: "no-store" })
+      .then((response) => response.text()).then((value) => values.push(value.trim()));
+    appendNext().then(appendNext).then(appendNext).then(() => {
+        const result = document.createElement("p");
+        result.id = "sequence";
+        result.textContent = `Sequence ${values.join("|")}`;
+        document.querySelector("main").append(result);
+      });
+  </script>
+</body>
+</html>

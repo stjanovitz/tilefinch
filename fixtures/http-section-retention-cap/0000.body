@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+  <title>Section retention caps</title>
+  <script type="module">
+    const controlsHost = document.createElement('div');
+    controlsHost.id = 'controls-host';
+    document.body.appendChild(controlsHost);
+    let markup = '';
+    for (let i = 0; i < 130; i++)
+      markup += '<input id="control-' + i + '" value="' + i + '">';
+    controlsHost.innerHTML = markup;
+    __tilefinchSaveSectionState(99);
+
+    const host = document.createElement('div');
+    host.id = 'cap-host';
+    document.body.appendChild(host);
+    markup = '';
+    for (let i = 0; i < 140; i++)
+      markup += '<div id="cap-' + i + '" class="cap-node cap-' +
+        (i < 100 ? 'a' : 'b') + '"></div>';
+    host.innerHTML = markup;
+    const nodes = [...document.querySelectorAll('.cap-a'),
+      ...document.querySelectorAll('.cap-b')];
+    const noop = () => {};
+    for (const node of nodes) {
+      node.addEventListener('probe', noop);
+      node.onclick = noop;
+    }
+    for (let i = 0; i < 66; i++)
+      new MutationObserver(noop).observe(nodes[0], {attributes:true});
+    for (let i = 0; i < 70; i++) nodes[0].setAttribute('data-n', i);
+    for (let i = 1; i < 20; i++) nodes[i].setAttribute('data-dirty', i);
+    for (let i = 0; i < 34; i++) __tilefinchSaveSectionState(i);
+    globalThis.pocSummary = 'CAPS-READY';
+  </script>
+</head>
+<body>
+  <h1>First section</h1><p>Cap setup.</p>
+  <h1>Second section</h1><p>Swap target.</p>
+</body>
+</html>

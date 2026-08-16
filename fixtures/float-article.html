@@ -1,0 +1,47 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Float article rendering fixture</title>
+  <style>
+    :root { --ink:#202124; --muted:#667085; --rule:#d7dce2; --accent:#315a8a; }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:0; background:#f4f6f8; color:var(--ink); font-size:14px; line-height:18px; }
+    header { height:42px; padding:11px 18px; background:#172b3f; color:#fff; font-weight:bold; }
+    main { width:100%; max-width:440px; margin:0 auto; padding:14px 18px 26px; background:#fff; }
+    .section { color:var(--accent); font-size:11px; font-weight:bold; letter-spacing:1px; }
+    h1 { margin:4px 0 5px; font-size:27px; line-height:30px; font-family:serif; }
+    .dek { margin:0 0 12px; color:var(--muted); font-size:15px; line-height:20px; }
+    .lead-art { float:left; width:122px; height:92px; margin:2px 14px 8px 0; padding:17px 10px; background:#dce8f2; color:#315a8a; border:1px solid #b8cad9; text-align:center; font-family:serif; font-size:18px; line-height:25px; }
+    p { margin:0 0 10px; }
+    .fact { float:right; width:142px; margin:3px 0 9px 14px; padding:9px; border-top:3px solid var(--accent); border-bottom:1px solid var(--rule); background:#f2f5f8; color:#39495a; font-size:12px; line-height:16px; }
+    .fact strong { display:block; margin-bottom:3px; color:#172b3f; font-size:14px; }
+    h2 { clear:both; margin:15px 0 7px; padding-top:8px; border-top:1px solid var(--rule); font-family:serif; font-size:20px; line-height:23px; }
+    .byline { clear:both; margin-top:13px; padding-top:8px; border-top:1px solid var(--rule); color:var(--muted); font-size:11px; }
+    @media (max-width:360px) {
+      main { padding-left:12px; padding-right:12px; }
+      h1 { font-size:24px; line-height:27px; }
+      .lead-art { width:104px; height:82px; margin-right:10px; padding-top:12px; }
+      .fact { width:120px; margin-left:10px; }
+    }
+  </style>
+</head>
+<body>
+  <header>THE DAILY FIELD NOTE</header>
+  <main>
+    <div class="section">TECHNOLOGY</div>
+    <h1>A small screen can still carry a full story</h1>
+    <p class="dek">A standards-oriented layout test for compact browsers, with ordinary article flow instead of a site-specific reader rewrite.</p>
+    <div class="lead-art">HANDHELD<br>WEB</div>
+    <p>The first paragraphs wrap beside a lead illustration. When the text reaches the illustration's lower edge, later lines recover the full measure of the article column.</p>
+    <p>That familiar print-like behavior remains common in encyclopedias, news archives, public information pages, and long-lived personal sites.</p>
+    <aside class="fact"><strong>Why it matters</strong>Float exclusions affect line width without removing the surrounding article from normal document flow.</aside>
+    <p>A second exclusion sits on the opposite edge. The renderer has to preserve readable text between it and any active left float, then release the space deterministically.</p>
+    <p>This fixture also checks percentage-safe sizing, margins, borders, custom properties, and a narrow mobile breakpoint.</p>
+    <h2>Back to the full column</h2>
+    <p>The heading clears both sides. It should begin below every active exclusion and span the full content width, with no overlap or unexplained horizontal offset.</p>
+    <p class="byline">Lab fixture · generic CSS float and clear acceptance case</p>
+  </main>
+</body>
+</html>

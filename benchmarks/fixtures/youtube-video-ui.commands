@@ -1,0 +1,16 @@
+tick 1 16
+media-status
+render /tmp/tilefinch-youtube-ui-ready.ppm
+cross
+tick 10 67
+render /tmp/tilefinch-youtube-ui-playing.ppm
+dpad-right
+render /tmp/tilefinch-youtube-ui-seek-preview.ppm
+cross
+render /tmp/tilefinch-youtube-ui-seeked.ppm
+cross
+render /tmp/tilefinch-youtube-ui-paused.ppm
+circle
+render /tmp/tilefinch-youtube-ui-closed.ppm
+media-open
+render /tmp/tilefinch-youtube-ui-reopened.ppm

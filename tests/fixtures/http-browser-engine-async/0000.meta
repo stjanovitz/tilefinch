@@ -1,0 +1,20 @@
+psp-http-trace=1
+method=GET
+url=https://async-engine.test/page
+success=1
+async-delay-pumps=3
+external-cancel=0
+transport-timeout=0
+error=
+status=200
+length=210
+effective-url=https://async-engine.test/page
+content-type=text/html; charset=utf-8
+etag=
+last-modified=
+cf-mitigated=
+accept-ch=
+critical-ch=
+server=fixture
+cf-ray=
+set-cookie-count=0

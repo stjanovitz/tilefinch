@@ -1,0 +1,20 @@
+psp-http-trace=1
+method=GET
+url=https://m.youtube.com/watch?v=TFTEST00001&bpctr=9999999999&has_verified=1
+success=1
+async-delay-pumps=0
+external-cancel=0
+transport-timeout=0
+error=
+status=200
+length=182
+effective-url=https://m.youtube.com/watch?v=TFTEST00001&bpctr=9999999999&has_verified=1
+content-type=text/html; charset=utf-8
+etag=
+last-modified=
+cf-mitigated=
+accept-ch=
+critical-ch=
+server=fixture-youtube
+cf-ray=
+set-cookie-count=0

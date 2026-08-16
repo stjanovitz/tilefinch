@@ -1,0 +1,17 @@
+name	url	limit_mb	profile	minimum_height	purpose
+example	https://example.com/	8	none	272	minimal HTML and TLS smoke test
+hacker-news	https://news.ycombinator.com/	12	none	400	dense semantic HTML, tables, links, forms, and long scrolling
+govuk	https://www.gov.uk/	18	none	1000	responsive accessible navigation, forms, cookie UI, and progressive enhancement
+wikipedia	https://en.wikipedia.org/wiki/PlayStation_Portable	24	none	1000	large document, images, tables, typography, sticky UI, and full traversal
+reddit-old	https://old.reddit.com/r/PSP/	12	none	500	compact listing, voting controls, comments, and server-rendered compatibility
+nytimes	https://www.nytimes.com/	28	none	1000	production news layout, responsive CSS, variables, and content density
+mdn	https://developer.mozilla.org/en-US/docs/Web/HTML	28	none	1000	modern documentation shell, code samples, navigation, grid, and responsive CSS
+w3c	https://www.w3.org/	18	none	1000	standards-oriented semantic HTML, international text, and accessible navigation
+arxiv	https://arxiv.org/	18	none	500	server-rendered search, forms, metadata, abstracts, and long text
+stackoverflow	https://stackoverflow.com/questions	28	none	1000	large community application shell, dense lists, code, and progressive enhancement
+github	https://github.com/	32	none	500	production application shell, responsive navigation, forms, SVG, and complex CSS
+bbc-news	https://www.bbc.com/news	32	none	1000	international production news, cards, responsive images, grid, and typography
+npr	https://www.npr.org/	32	none	1000	production news and audio-oriented content with responsive article cards
+weather-gov	https://www.weather.gov/	24	none	500	government forms, maps fallback, forecasts, tables, and degraded-mode usability
+duckduckgo-lite	https://lite.duckduckgo.com/lite/	16	none	272	search form and results in a deliberately server-rendered low-resource interface
+gutenberg	https://www.gutenberg.org/	20	none	500	catalog search, book metadata, typography, and long-document navigation

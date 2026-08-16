@@ -1,0 +1,42 @@
+psp-http-trace=3
+method=GET
+url=https://critical.test/start
+success=1
+async-delay-pumps=0
+external-cancel=0
+transport-timeout=0
+error=
+request-body-length=0
+request-body-hash=cbf29ce484222325
+request-cookie-bytes=0
+request-has-cf-clearance=0
+request-extra-header-bytes=0
+request-referer=https://critical.test/page
+request-sec-fetch-dest=document
+request-sec-fetch-mode=navigate
+request-sec-fetch-site=same-origin
+request-send-client-hints=0
+request-send-low-client-hints=1
+request-sec-fetch-user=0
+request-upgrade-insecure=1
+request-credentials=0
+request-credential-origin=https://critical.test/page
+request-initiator-url=https://critical.test/page
+request-referrer-source=https://critical.test/page
+request-referrer-policy=
+status=200
+length=172
+effective-url=https://hinted.test/challenge
+content-type=text/html; charset=utf-8
+etag=
+last-modified=
+cf-mitigated=
+accept-ch=Sec-CH-UA-Arch
+critical-ch=Sec-CH-UA-Arch
+server=fixture
+cf-ray=
+response-header-count=1
+set-cookie-count=1
+set-cookie-0=retry_path=seen; Path=/challenge
+set-cookie-url-0=https://hinted.test/challenge
+response-header-0=content-type: text/html; charset=utf-8

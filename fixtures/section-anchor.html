@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Section anchor fixture</title>
+  <style>body{font-family:sans-serif}section{min-height:320px}</style>
+</head>
+<body>
+  <h1 id="alpha">Alpha</h1>
+  <section><p>The first independently materialized section.</p>
+    <input id="section-input" value="A">
+    <a id="jump-gamma" href="#gamma">Jump to Gamma</a></section>
+  <h2 id="beta">Beta</h2>
+  <section><p>The middle independently materialized section.</p></section>
+  <h2 id="gamma">Gamma</h2>
+  <section><p id="encoded target">The final independently materialized section.</p>
+    <a href="#alpha">Return to Alpha</a></section>
+</body>
+</html>

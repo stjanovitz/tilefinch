@@ -1,0 +1,5 @@
+name	url	limit_mb	max_download_kb	minimum_body_bytes	purpose
+govuk	https://www.gov.uk/	24	4096	20000	responsive government layout
+hacker-news	https://news.ycombinator.com/	24	4096	20000	compact server-rendered document
+npr	https://www.npr.org/	24	8192	100000	medium production news document
+stackoverflow	https://stackoverflow.com/questions	24	8192	5000	interstitial and production application shell

@@ -1,0 +1,4 @@
+anchor gamma
+anchor alpha
+click #listener-button
+control-value listener-result

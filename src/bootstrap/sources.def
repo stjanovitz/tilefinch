@@ -1,0 +1,47 @@
+/*
+ * Single source of truth for embedded bootstrap programs.
+ *
+ * BOOTSTRAP_SOURCE(symbol, file, QuickJS source name, bytecode symbol)
+ * BOOTSTRAP_DIAGNOSTIC(symbol, file, QuickJS source name)
+ */
+BOOTSTRAP_SOURCE(browser_bootstrap_cssom, "cssom.js", "<browser-cssom>",
+                 browser_bootstrap_cssom_bytecode)
+BOOTSTRAP_SOURCE(browser_deterministic_clock_bootstrap,
+                 "deterministic-clock.js", "<browser-deterministic-clock>",
+                 browser_deterministic_clock_bootstrap_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap, "dom.js", "<browser-bootstrap>",
+                 browser_bootstrap_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_platform, "platform.js",
+                 "<browser-platform>", browser_bootstrap_platform_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_canvas, "canvas.js",
+                 "<browser-canvas>", browser_bootstrap_canvas_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_custom_elements, "custom-elements.js",
+                 "<browser-custom-elements>",
+                 browser_bootstrap_custom_elements_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_compat, "compat.js", "<browser-compat>",
+                 browser_bootstrap_compat_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_scheduler, "scheduler.js",
+                 "<browser-scheduler>", browser_bootstrap_scheduler_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_motion, "motion.js",
+                 "<browser-motion>", browser_bootstrap_motion_bytecode)
+BOOTSTRAP_SOURCE(browser_deterministic_scheduler_clock_bootstrap,
+                 "deterministic-scheduler-clock.js",
+                 "<browser-deterministic-scheduler-clock>",
+                 browser_deterministic_scheduler_clock_bootstrap_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_indexeddb, "indexeddb.js",
+                 "<browser-indexeddb>", browser_bootstrap_indexeddb_bytecode)
+BOOTSTRAP_SOURCE(browser_deterministic_replay_surface_bootstrap,
+                 "deterministic-replay-surface.js",
+                 "<browser-deterministic-replay-surface>",
+                 browser_deterministic_replay_surface_bootstrap_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_hardening, "hardening.js",
+                 "<browser-hardening>",
+                 browser_bootstrap_hardening_bytecode)
+/* Append new independent modules so the generator's shared QuickJS atom table
+   does not rewrite every established bytecode object after an insertion. */
+BOOTSTRAP_SOURCE(browser_bootstrap_streams, "streams.js",
+                 "<browser-streams>", browser_bootstrap_streams_bytecode)
+BOOTSTRAP_DIAGNOSTIC(browser_dpu_diagnostic, "dpu-diagnostic.js",
+                     "<dpu-diagnostic>")
+BOOTSTRAP_DIAGNOSTIC(browser_eval_source_diagnostic,
+                     "eval-source-diagnostic.js", "<eval-source-diagnostic>")

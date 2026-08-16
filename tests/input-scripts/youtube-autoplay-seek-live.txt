@@ -1,0 +1,23 @@
+# DEVICE-LOOP SCRIPT -- NOT A GOLDEN-GATED SCENARIO.
+#
+# This is the ordinary provider journey, deliberately without
+# validation_media_play: the watch page must autoplay under its shipping
+# policy.  Three Right edges arrive while the first preview transaction can
+# still be active; the target must continue to advance instead of ignoring
+# input until the preview picture returns.
+wait-live 600
+mark-live autoplay
+tap-live right
+wait-live 2
+tap-live right
+wait-live 2
+tap-live right
+mark-live coalesced-seek
+wait-live 600
+mark-live pre-commit
+tap-live cross
+wait-live 1800
+mark-live committed-seek
+tap-live circle
+wait-live 180
+end

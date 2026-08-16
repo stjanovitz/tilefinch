@@ -1,0 +1,12 @@
+js document.querySelector('a[href*="/comments/"]').setAttribute('id','tilefinch-post-link')
+focus-id tilefinch-post-link
+status
+activate
+tick 10 100
+status
+page-down
+status
+back
+tick 5 100
+status
+quit

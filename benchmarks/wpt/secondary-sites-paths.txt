@@ -1,0 +1,12 @@
+# Focused external-stylesheet coverage for the opt-in secondary-site lane.
+html/semantics/document-metadata/the-link-element/stylesheet-media.html
+html/semantics/document-metadata/the-link-element/stylesheet-media-ref.html
+html/semantics/document-metadata/the-link-element/stylesheet-with-base.html
+html/semantics/document-metadata/the-link-element/stylesheet-with-base-ref.html
+html/semantics/document-metadata/the-link-element/resources/stylesheet.css
+html/semantics/links/linktypes/link-type-stylesheet/process-stylesheet-linked-resource-ascii-case-insensitive.html
+html/semantics/links/linktypes/link-type-stylesheet/process-stylesheet-linked-resource-ascii-case-insensitive-ref.html
+html/semantics/links/linktypes/link-type-stylesheet/process-stylesheet-linked-resource-ascii-case-insensitive.css
+html/semantics/links/linktypes/link-type-stylesheet/process-stylesheet-linked-resource-ascii-case-insensitive-lower.css
+html/semantics/links/linktypes/link-type-stylesheet/process-stylesheet-linked-resource-ascii-case-insensitive-mixed.css
+html/semantics/links/linktypes/link-type-stylesheet/process-stylesheet-linked-resource-ascii-case-insensitive-other.css

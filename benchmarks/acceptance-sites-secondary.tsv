@@ -1,0 +1,7 @@
+# Opt-in only: do not add this manifest to CTest or routine benchmark scripts.
+name	url	limit_mb	profile	minimum_height	purpose	minimum_body_text	required_title	required_text
+amazon	https://www.amazon.com/	28	none	600	complex ecommerce navigation, product discovery, responsive controls, and dense mixed content	100	Amazon	Amazon
+youtube	https://www.youtube.com/	28	none	500	script-heavy streaming application shell, responsive navigation, and dynamic collections	20	YouTube	YouTube
+yahoo	https://www.yahoo.com/	28	none	700	news portal, search, responsive cards, and high-density link navigation	100	Yahoo	Yahoo
+github	https://github.com/	28	none	800	developer application, responsive menus, forms, SVG UI, and code-oriented content	150	GitHub	GitHub
+dropbox	https://www.dropbox.com/	28	none	800	file-sharing product UI, responsive marketing sections, controls, and long scrolling	150	Dropbox	Dropbox

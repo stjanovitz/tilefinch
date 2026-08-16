@@ -1,0 +1,51 @@
+html, body {
+  width: auto;
+  min-width: 0;
+  margin: 0;
+}
+body {
+  box-sizing: border-box;
+  color: #dbe5ef;
+  background: #0b1117;
+  padding: 8px;
+}
+.content, .sitetable {
+  box-sizing: border-box;
+  width: auto;
+  min-width: 0;
+  margin: 0;
+}
+main, article, section, div, ul, ol, li { color: #dbe5ef; background: #0b1117; }
+a { color: #b9d8ff; }
+h1 { color: #ffffff; background: #29476b; padding: 7px; margin: 4px; }
+p { margin: 2px; }
+#header { display: none; }
+#jumpToContent { display: none; }
+.side { display: none; }
+.footer-parent { display: none; }
+.rank { display: none; }
+.midcol { display: none; }
+.thumbnail { display: none; }
+.flat-list { display: none; }
+.expando { display: none; }
+.child { display: none; }
+.clearleft { display: none; }
+.promoted { display: none; }
+.listingsignupbar { display: none !important; }
+.thing {
+  box-sizing: border-box;
+  display: block;
+  width: auto;
+  min-width: 0;
+  max-width: 100%;
+  background: #172431;
+  padding: 7px;
+  margin: 6px;
+}
+.link { display: block; background: #172431; }
+.entry { display: block; color: #dbe5ef; background: #172431; }
+.top-matter { display: block; color: #dbe5ef; background: #172431; }
+.title { display: block; color: #f3f7fb; font-size: 14px; margin: 3px; }
+.tagline { display: block; color: #8fb3d9; margin: 2px; }
+.domain { color: #9aa7b2; }
+.nav-buttons { display: block; background: #29476b; padding: 6px; margin: 5px; }

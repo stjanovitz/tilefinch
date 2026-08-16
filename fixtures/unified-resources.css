@@ -1,0 +1,14 @@
+@import url("/unified-import.css") screen and (400px <= width < 600px);
+@import "/unified-print.css" print;
+@import url("/unified-never.css") supports(display: subgrid);
+:root { --resource-ink: #17365d; }
+body { margin: 0; background: #f4f7fb; color: var(--resource-ink); }
+#resource-card {
+  display: flex;
+  width: 300px;
+  min-height: 96px;
+  padding: 12px;
+  gap: 10px;
+  background: #dce9f7;
+}
+#resource-card img { width: 48px; height: 48px; }

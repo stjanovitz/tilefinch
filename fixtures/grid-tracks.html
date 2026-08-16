@@ -1,0 +1,38 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bounded grid tracks</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px; color: #18202a; background: #f4f7fa;
+         font: 14px/18px sans-serif; }
+  h1 { margin: 0 0 10px; font-size: 20px; line-height: 24px; }
+  .toolbar { display: grid; grid-template-columns: auto 1fr auto;
+             gap: 8px; align-items: center; padding: 8px;
+             color: #fff; background: #172b3f; border-radius: 8px; }
+  .toolbar strong, .toolbar span { display: block; }
+  .toolbar .query { padding: 6px 8px; color: #435467; background: #fff;
+                    border-radius: 12px; }
+  .cards { display: grid; grid-template-columns: 72px 1fr 2fr;
+           gap: 8px; margin-top: 10px; }
+  .cards > div { min-height: 64px; padding: 7px; background: #fff;
+                 border: 1px solid #cbd5df; border-radius: 7px; }
+  .cards .wide { grid-column: 1 / -1; min-height: 38px; }
+  .cards b { display: block; margin-bottom: 4px; }
+  .stats { display: grid; grid-template-columns: 25% 1fr 54px;
+           gap: 6px; margin-top: 10px; }
+  .stats > span { display: block; padding: 6px; color: #fff;
+                  background: #315d7d; border-radius: 5px; }
+</style>
+<body>
+  <h1>Responsive application geometry</h1>
+  <div class="toolbar">
+    <strong>Menu</strong><span class="query">Ask anything</span><span>Send</span>
+  </div>
+  <div class="cards">
+    <div><b>Fixed</b>72 pixel rail</div>
+    <div><b>Flexible</b>One fractional unit</div>
+    <div><b>Primary</b>Two fractional units for the main content card.</div>
+    <div class="wide"><b>Spanning status</b>One bounded item occupies the complete explicit grid row.</div>
+  </div>
+  <div class="stats"><span>25%</span><span>Flexible center</span><span>54px</span></div>
+</body>

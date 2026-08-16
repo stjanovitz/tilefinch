@@ -1,0 +1,1 @@
+<!doctype html><title>Dynamic style stream</title><body><p id="probe">STYLE</p><script>globalThis.pocSummary='stream-style:ready';const second=document.createElement('link');second.rel='stylesheet';second.href='/two.css';const first=document.createElement('link');first.rel='stylesheet';first.href='/one.css';document.head.append(first,second)</script></body>

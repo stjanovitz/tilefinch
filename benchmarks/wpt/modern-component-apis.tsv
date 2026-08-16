@@ -1,0 +1,10 @@
+# id	suite	panel	kind	test	reference
+element-internals-attach	html	element-internals	testharness	custom-elements/HTMLElement-attachInternals.html	-
+element-internals-not-supported	html	element-internals	testharness	custom-elements/form-associated/ElementInternals-NotSupportedError.html	-
+element-internals-form	html	element-internals	testharness	custom-elements/form-associated/ElementInternals-form.html	-
+element-internals-labels	html	element-internals	testharness	custom-elements/form-associated/ElementInternals-labels.html	-
+element-internals-validation	html	element-internals	testharness	custom-elements/form-associated/ElementInternals-validation.html	-
+element-internals-states	html	element-internals	testharness	custom-elements/state/ElementInternals-states.html	-
+form-reset-callback	html	form-associated-custom-elements	testharness	custom-elements/form-associated/form-reset-callback.html	-
+form-associated-callback	html	form-associated-custom-elements	testharness	custom-elements/form-associated/form-associated-callback.html	-
+form-disabled-callback	html	form-associated-custom-elements	testharness	custom-elements/form-associated/form-disabled-callback.html	-

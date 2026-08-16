@@ -1,0 +1,2 @@
+node-text root-result
+status

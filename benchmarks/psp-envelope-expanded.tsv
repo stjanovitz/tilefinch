@@ -1,0 +1,5 @@
+name	url	limit_mb	profile	minimum_height	purpose
+hacker-news	https://news.ycombinator.com/	24	none	400	dense semantic HTML, tables, links, forms, and long scrolling
+govuk	https://www.gov.uk/	24	none	1000	responsive accessible navigation, forms, cookie UI, and progressive enhancement
+npr	https://www.npr.org/	24	none	1000	production news and audio-oriented content with responsive article cards
+stackoverflow	https://stackoverflow.com/questions	24	none	1000	large community application shell, dense lists, code, and progressive enhancement

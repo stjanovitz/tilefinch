@@ -1,0 +1,28 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width">
+<title>Responsive CSS</title>
+<style>
+:root{--gap:9px;--ink:rgb(18,52,86)}
+#row{display:flex;gap:var(--gap);color:var(--ink);width:240px}
+#row>span{flex:1 1 0;min-width:0}
+@media (max-width:500px){#row{background:rgb(220,233,247)}}
+</style>
+<body><div id="row"><span>A</span><span>B</span></div><output id="result"></output>
+<script>
+const liveStyle=document.createElement('style');
+liveStyle.textContent='#row{display:flex;gap:var(--gap);color:var(--ink);padding-left:7px}';
+document.head.appendChild(liveStyle);
+globalThis.pocSummary='wp-css-responsive:PENDING';
+setTimeout(()=>{
+  const style=getComputedStyle(document.getElementById('row'));
+  const boxes=document.querySelectorAll('#row > span');
+  const pass=style.display==='flex' && style.gap==='9px'
+    && style.color==='rgb(18, 52, 86)'
+    && style.backgroundColor==='rgb(220, 233, 247)'
+    && matchMedia('(max-width: 500px)').matches && boxes.length===2;
+  globalThis.pocSummary='wp-css-responsive:'+(pass?'PASS':'FAIL')
+    +':display='+style.display+':gap='+style.gap+':color='+style.color
+    +':background='+style.backgroundColor;
+  document.getElementById('result').textContent=pocSummary;
+},0);
+</script></body>

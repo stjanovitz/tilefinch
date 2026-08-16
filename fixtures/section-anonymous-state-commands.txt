@@ -1,0 +1,10 @@
+click .anonymous-button
+control-value anonymous-result
+focus-next
+focus-next
+focus-next
+type Z
+anchor beta
+anchor alpha
+click .anonymous-button
+control-value anonymous-result

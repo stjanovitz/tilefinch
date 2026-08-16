@@ -1,0 +1,52 @@
+<!doctype html>
+<!-- Synthetic paint-feature coverage.  No page in the fidelity corpus
+     exercises linear-gradient() or box-shadow in a way the scoreboard can
+     witness, so the P-track features have no regression coverage there.
+     This fixture paints each of them at PSP viewport size, deterministically
+     and with no network resources, so `psp-browser-lab --fixture` frames can
+     be eyeballed and diffed. -->
+<meta charset="utf-8">
+<title>paint features</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #eef1f5; }
+  body { font: 13px sans-serif; color: #1b1f24; }
+  .row { display: flex; gap: 10px; padding: 12px; }
+  .card {
+    width: 100px; height: 56px; border-radius: 8px;
+    background: #ffffff;
+  }
+  /* Plain drop shadow, no spread. */
+  #soft { box-shadow: 0 4px 10px rgba(0, 0, 0, 0.45); }
+  /* Offset, blurred, spread, and composed with a large corner radius. */
+  #spread { border-radius: 24px; box-shadow: 6px 6px 8px 4px rgba(0, 0, 0, 0.5); }
+  /* Hard-edged shadow: zero blur must give a crisp rounded silhouette. */
+  #hard { box-shadow: 8px 8px 0 0 #ff7d4d; }
+  /* Two stacked layers; the first-declared one must land on top. */
+  #stacked { box-shadow: 0 0 6px #0a84ff, 0 10px 14px 2px rgba(0, 0, 0, 0.55); }
+  /* Negative spread pulls the shadow in under the box. */
+  #tight { box-shadow: 0 6px 6px -4px rgba(0, 0, 0, 0.7); }
+  /* currentColor default and a square (radius-free) box. */
+  #current { border-radius: 0; color: #2f6f3f; box-shadow: 4px 4px 6px; }
+  /* Gradient backgrounds (P2), including one under a shadow. */
+  #ramp { background: linear-gradient(to bottom, #ff9770, #ff7d4d); }
+  #diag { background: linear-gradient(45deg, #102030, #6f8fb0); }
+  #both {
+    background: linear-gradient(to right, #0a84ff, #7f5af0);
+    box-shadow: 0 6px 12px rgba(10, 20, 60, 0.55);
+  }
+  /* Hostile input: every component is far past the clamp limits, and the
+     layer list is at the cap.  This must render bounded, not hang. */
+  #hostile {
+    box-shadow: 99999px 99999px 99999px 99999px #f00,
+                -99999px -99999px 99999px 99999px #0f0,
+                0 0 99999px 99999px rgba(0, 0, 255, 0.25),
+                1px 1px 99999px 99999px #ff0;
+  }
+</style>
+<div class="row"><div class="card" id="soft"></div><div class="card" id="spread"></div><div class="card" id="hard"></div></div>
+<div class="row"><div class="card" id="stacked"></div><div class="card" id="tight"></div><div class="card" id="current"></div></div>
+<div class="row"><div class="card" id="ramp"></div><div class="card" id="diag"></div><div class="card" id="both"></div></div>
+<!-- Held clear of the rows above: the clamped skirt still reaches 64px in
+     every direction, and overlapping it with the gradient row would make the
+     frame unreadable as a regression reference. -->
+<div class="row" style="margin-top:90px"><div class="card" id="hostile"></div></div>

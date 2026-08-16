@@ -1,0 +1,20 @@
+# Deterministic PSP-style continuous-loop smoke test.
+status
+focus-id toggle
+cross
+focus-id editor
+type -LAB
+backspace
+down 0
+down 60
+page-down
+page-up
+bottom
+top
+anchor spacer
+top
+dpad-right
+dpad-right
+tick 2 16
+status
+quit

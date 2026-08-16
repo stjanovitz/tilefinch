@@ -1,0 +1,5 @@
+name	url	limit_mb	profile	minimum_height	purpose
+govuk	https://www.gov.uk/	18	none	1000	responsive government layout and mobile overflow
+wikipedia	https://en.wikipedia.org/wiki/PlayStation_Portable	24	none	1000	large document, tables, images, flex layout, and full traversal
+bbc-news	https://www.bbc.com/news	32	none	1000	production cards, responsive images, grid, and typography
+duckduckgo-lite	https://lite.duckduckgo.com/lite/	16	none	272	low-resource forms, results, and authored root margins

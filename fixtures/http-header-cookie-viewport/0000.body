@@ -1,0 +1,1 @@
+<!doctype html><title>Header boundary</title><body><script>globalThis.pocSummary=[innerWidth,innerHeight,document.cookie.includes('header_cookie=seen')].join(':')</script><p>ready</p>

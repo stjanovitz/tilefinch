@@ -1,0 +1,4 @@
+focus-next
+anchor gamma
+anchor alpha
+status

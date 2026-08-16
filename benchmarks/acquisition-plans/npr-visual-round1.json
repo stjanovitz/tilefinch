@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "name": "npr-visual-round-1",
+  "diagnostic_sha256": "9b8500a41fa8d9a3f5dac7efda4c94b32ab61a74493ac040cfc6026069e442d2",
+  "allowlist_sha256": "684032e1ed6757b1e51e147c034810a78a126bcc44d35a59087872905c59cd60",
+  "source_trace_sha256": "603a7ae12772986f068f874abaae29dbcfae41e5499771faecb9e55bb3e11cfc",
+  "source_record_count": 97,
+  "source_origin_ms": 1784342534779,
+  "request_count": 49,
+  "max_response_bytes": 4194304,
+  "timeout_ms": 15000,
+  "max_trace_bytes": 536870912,
+  "allowed_methods": [
+    "GET",
+    "HEAD"
+  ],
+  "allowed_schemes": [
+    "https"
+  ],
+  "allowed_origins": [
+    "https://6635101.fls.doubleclick.net",
+    "https://cpftuhdzdstc5rz8x.ay.delivery",
+    "https://js.stripe.com",
+    "https://media.npr.org",
+    "https://npr.brightspotcdn.com",
+    "https://placement-prd.jwpltx.com",
+    "https://prod-eks-static-assets.npr.org",
+    "https://script.crazyegg.com",
+    "https://secure-us.imrworldwide.com",
+    "https://securepubads.g.doubleclick.net",
+    "https://ssl.p.jwpcdn.com",
+    "https://station.api.npr.org",
+    "https://www.npr.org",
+    "https://www.recaptcha.net"
+  ]
+}

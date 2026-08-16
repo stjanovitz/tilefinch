@@ -1,0 +1,1 @@
+<!doctype html><title>Remote isolation</title><body><script>globalThis.pocSummary=document.querySelector('aside')===null?'candidate-isolated':'candidate-leaked'</script><p>streamed candidate</p></body>

@@ -1,0 +1,13 @@
+# ElementInternals and form-associated custom-element dependency closure.
+resources/testharness.js
+custom-elements/HTMLElement-attachInternals.html
+custom-elements/form-associated/ElementInternals-NotSupportedError.html
+custom-elements/form-associated/ElementInternals-form.html
+custom-elements/form-associated/ElementInternals-labels.html
+custom-elements/form-associated/ElementInternals-validation.html
+custom-elements/state/ElementInternals-states.html
+custom-elements/form-associated/form-reset-callback.html
+custom-elements/form-associated/form-associated-callback.html
+custom-elements/form-associated/form-disabled-callback.html
+html/semantics/forms/form-submission-0/resources/targetted-form.js
+common/blank.html

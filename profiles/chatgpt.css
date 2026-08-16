@@ -1,0 +1,779 @@
+html, body {
+  margin: 0;
+  padding: 0;
+  color: #0d0d0d;
+  background: #ffffff;
+  font-family: sans-serif;
+  font-size: 14px;
+  line-height: 20px;
+}
+
+script, style, noscript, svg, canvas,
+a[href="#main"],
+#stage-sidebar-tiny-bar,
+#stage-slideover-sidebar,
+#aria-notify-live-region-assertive,
+#aria-notify-live-region-polite,
+#blocking-initial-modals-done,
+#google-one-tap-anchor,
+[role="alert"], [role="status"], [role="tooltip"],
+[aria-label="Open sidebar"],
+[data-testid="open-sidebar-button"],
+input[type="file"], textarea,
+div:empty, span:empty {
+  display: none;
+}
+
+#page-header {
+  display: flex;
+  position: sticky;
+  top: 0;
+  height: 56px;
+  padding: 0 16px;
+  margin: 0;
+  align-items: center;
+  background: #ffffff;
+}
+#page-header::before {
+  content: "";
+  position: absolute;
+  left: 16px;
+  top: 22px;
+  width: 17px;
+  height: 1px;
+  background: #0d0d0d;
+}
+#page-header::after {
+  content: "";
+  position: absolute;
+  left: 16px;
+  top: 30px;
+  width: 12px;
+  height: 1px;
+  background: #0d0d0d;
+}
+#page-header > div:has([data-testid="model-switcher-dropdown-button"]) {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  width: 448px;
+  height: 56px;
+}
+#page-header > div:has([data-testid="model-switcher-dropdown-button"])
+  > div:first-child {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: row;
+  align-items: center;
+}
+#page-header > div:has([data-testid="model-switcher-dropdown-button"])
+  > div:has([data-testid="login-button"]) {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  position: relative;
+  left: -53px;
+}
+[data-testid="model-switcher-dropdown-button"] {
+  display: block;
+  position: relative;
+  left: 20px;
+  top: 4px;
+  width: 96px;
+  height: 40px;
+  margin: 0;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: #0d0d0d;
+  font-size: 18px;
+  font-weight: bold;
+  line-height: 24px;
+}
+[data-testid="model-switcher-dropdown-button"]::after {
+  content: "";
+  position: absolute;
+  right: 1px;
+  top: 17px;
+  width: 7px;
+  height: 7px;
+  border-right: 1px solid #676767;
+  border-bottom: 1px solid #676767;
+}
+[data-testid="thread-header-right-actions-container"],
+[data-testid="thread-header-right-actions"],
+#conversation-header-actions,
+#conversation-header-actions > div,
+#conversation-header-actions > div > div {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+}
+[data-testid="thread-header-right-actions-container"] {
+  position: relative;
+  left: -53px;
+  top: -3px;
+}
+[data-testid="login-button"], [data-testid="signup-button"] {
+  display: block;
+  height: 18px;
+  margin: 0;
+  padding: 8px 10px;
+  font-size: 14px;
+  line-height: 20px;
+  white-space: nowrap;
+}
+[data-testid="login-button"] {
+  width: 64px;
+  color: #ffffff;
+  background: #0d0d0d;
+  border: 1px solid #0d0d0d;
+  border-radius: 18px;
+  position: relative;
+  top: 4px;
+}
+[data-testid="signup-button"] {
+  width: 123px;
+  color: #0d0d0d;
+  background: #ffffff;
+  border: 1px solid #d9d9d9;
+  border-radius: 18px;
+  position: relative;
+  left: 72px;
+  top: -32px;
+}
+
+#main, #thread {
+  display: block;
+  width: 480px;
+  margin: 0;
+  padding: 0;
+  background: #ffffff;
+}
+[data-testid="mobile-splash-screen"] {
+  display: block;
+  width: 320px;
+  height: 69px;
+  margin: 0 auto;
+  padding: 0;
+  color: #0d0d0d;
+  background: #ffffff;
+}
+#thread *:has([data-testid="mobile-splash-screen"]),
+[data-testid="mobile-splash-screen"] * { display: block; }
+h1 {
+  display: block;
+  width: 256px;
+  margin: 4px auto 24px;
+  padding: 0;
+  color: #0d0d0d;
+  font-size: 24px;
+  font-family: sans-serif;
+  font-weight: normal;
+  line-height: 28px;
+}
+
+form[data-type="unified-composer"] * { display: none; }
+form[data-type="unified-composer"] *:has(#prompt-textarea),
+form[data-type="unified-composer"] *:has(#composer-plus-btn),
+form[data-type="unified-composer"] *:has([aria-label="Start dictation"]),
+form[data-type="unified-composer"] *:has([data-testid="composer-speech-button"]),
+form[data-type="unified-composer"] *:has([aria-label="Send prompt"]),
+#prompt-textarea, #prompt-textarea p,
+#composer-plus-btn,
+[aria-label="Start dictation"],
+[data-testid="composer-speech-button"],
+[aria-label="Send prompt"],
+[data-testid="composer-speech-button"] span {
+  display: block;
+}
+form[data-type="unified-composer"] [aria-label="Start dictation"],
+form[data-type="unified-composer"] [data-testid="composer-speech-button"],
+form[data-type="unified-composer"] [data-testid="composer-speech-button"] span {
+  display: block;
+}
+form[data-type="unified-composer"] {
+  display: block;
+  width: 456px;
+  height: 83px;
+  margin: 0 12px;
+  padding: 0;
+  color: #0d0d0d;
+  background: #ffffff;
+  border: 1px solid #d9d9d9;
+  border-radius: 26px;
+}
+#prompt-textarea {
+  position: relative;
+  left: 16px;
+  top: -13px;
+  width: 390px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  color: #777777;
+  font-size: 16px;
+  line-height: 24px;
+}
+#prompt-textarea p {
+  margin: 0;
+  padding: 0;
+}
+#prompt-textarea p[data-placeholder="Ask anything"]::before {
+  content: "Ask anything";
+}
+#composer-plus-btn {
+  position: relative;
+  left: 12px;
+  top: 48px;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+#composer-plus-btn::before,
+#composer-plus-btn::after {
+  content: "";
+  position: absolute;
+  left: 6px;
+  top: 13px;
+  width: 15px;
+  height: 1px;
+  background: #0d0d0d;
+}
+#composer-plus-btn::after {
+  left: 13px;
+  top: 6px;
+  width: 1px;
+  height: 15px;
+}
+[aria-label="Start dictation"] {
+  position: relative;
+  left: 370px;
+  top: -9px;
+  width: 30px;
+  height: 30px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+[aria-label="Start dictation"]::before {
+  content: "";
+  position: absolute;
+  left: 11px;
+  top: 5px;
+  width: 7px;
+  height: 13px;
+  border: 0;
+  background: #0d0d0d;
+  border-radius: 2px;
+  width: 3px;
+}
+[aria-label="Start dictation"]::after {
+  content: "";
+  position: absolute;
+  left: 9px;
+  top: 20px;
+  width: 11px;
+  height: 1px;
+  background: #0d0d0d;
+}
+[data-testid="composer-speech-button"] {
+  position: relative;
+  left: 404px;
+  top: -15px;
+  width: 40px;
+  height: 40px;
+  margin: 0;
+  padding: 9px;
+  border: 0;
+  color: #ffffff;
+  background: #a8a8a8;
+  border-radius: 20px;
+}
+[aria-label="Send prompt"] {
+  position: relative;
+  left: 410px;
+  top: -43px;
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: #ffffff;
+  background: #a8a8a8;
+  border-radius: 18px;
+}
+[aria-label="Send prompt"]::before {
+  content: "";
+  position: absolute;
+  left: 17px;
+  top: 10px;
+  width: 2px;
+  height: 17px;
+  background: #ffffff;
+}
+[data-testid="composer-speech-button"] span { display: none; }
+body:has([data-message-role="assistant"])
+  [data-testid="composer-speech-button"] {
+  width: 82px;
+  left: 360px;
+  color: #0d0d0d;
+  background: #f2f2f2;
+}
+body:has([data-message-role="assistant"])
+  [data-testid="composer-speech-button"] span {
+  display: block;
+  font-size: 14px;
+  line-height: 20px;
+}
+
+[data-testid="thread-disclaimer"] {
+  display: block;
+  width: 420px;
+  margin: 36px auto 0;
+  padding: 0;
+  color: #8a8a8a;
+  background: #ffffff;
+  font-size: 11px;
+  line-height: 15px;
+}
+[data-testid="thread-disclaimer"] p { margin: 0; padding: 0; }
+p:has(a[href="https://openai.com/terms"]) {
+  display: block;
+  position: relative;
+  top: 27px;
+  width: 380px;
+  margin: 0 auto;
+  padding: 0;
+  color: #8a8a8a;
+  font-size: 11px;
+  line-height: 15px;
+}
+
+/* Conversation state: retain only message, composer, disclaimer, and ad paths. */
+body:has([data-message-role="assistant"])
+  [data-testid="mobile-splash-screen"] {
+  display: none;
+}
+[data-message-role="user"] h4,
+[data-message-role="assistant"] h4,
+h4,
+[aria-label="Your message actions"],
+[aria-label="Response actions"] { display: none; }
+[data-message-role="user"] {
+  width: 448px;
+  margin: 5px 16px 20px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 24px;
+}
+[data-message-role="user"] > div {
+  width: 161px;
+  margin-left: auto;
+  padding: 10px 16px;
+  background: #f4f4f4;
+  border-radius: 18px;
+  font-size: 15px;
+}
+[data-message-role="assistant"] {
+  width: 448px;
+  margin: 16px 16px 24px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 24px;
+}
+[data-message-role="assistant"] p {
+  margin: 0 0 12px;
+  padding: 0;
+}
+[data-message-role="assistant"] ul {
+  margin: 0 0 14px 24px;
+  padding: 0;
+}
+[data-message-role="assistant"] li {
+  margin: 0 0 8px;
+  padding: 0;
+}
+[data-message-role="assistant"] li p { display: inline; margin: 0; }
+body:has([data-message-role="assistant"])
+  form[data-type="unified-composer"] {
+  position: fixed;
+  top: 150px;
+  background: #ffffff;
+}
+body:has([data-message-role="assistant"])
+  form[data-type="unified-composer"]::before {
+  content: "";
+  position: absolute;
+  left: 210px;
+  top: -42px;
+  width: 36px;
+  height: 36px;
+  background: #f7f7f7;
+  border-radius: 18px;
+}
+body:has([data-message-role="assistant"])
+  form[data-type="unified-composer"]::after {
+  content: "";
+  position: absolute;
+  left: 227px;
+  top: -32px;
+  width: 2px;
+  height: 14px;
+  background: #0d0d0d;
+}
+body:has([data-message-role="assistant"])
+  [data-testid="composer-speech-button"] {
+  left: 364px;
+  top: -44px;
+  padding-left: 38px;
+  padding-right: 4px;
+}
+body:has([data-message-role="assistant"])
+  [data-testid="composer-speech-button"]::before {
+  content: "";
+  position: absolute;
+  left: 13px;
+  top: 12px;
+  width: 2px;
+  height: 16px;
+  background: #0d0d0d;
+}
+body:has([data-message-role="assistant"])
+  [data-testid="composer-speech-button"]::after {
+  content: "";
+  position: absolute;
+  left: 19px;
+  top: 15px;
+  width: 2px;
+  height: 10px;
+  background: #0d0d0d;
+}
+body:has([data-message-role="assistant"])
+  [aria-label="Start dictation"] {
+  left: 327px;
+  top: -9px;
+}
+body:has([data-message-role="assistant"]) { padding-bottom: 65px; }
+body:has([data-message-role="assistant"])
+  [data-testid="thread-disclaimer"] {
+  position: fixed;
+  top: 244px;
+  width: 300px;
+  height: 18px;
+  margin: 0 auto;
+  font-size: 11px;
+  line-height: 15px;
+}
+body:has([data-message-role="assistant"])
+  [data-testid="thread-disclaimer"]::before {
+  content: "";
+  position: absolute;
+  left: -90px;
+  top: -8px;
+  width: 480px;
+  height: 36px;
+  background: #ffffff;
+}
+
+/* Current unauthenticated mobile shell. */
+body .wm-fallback-sidebar,
+body .wm-fallback-sidebarPopover,
+body .wm-fallback-backButton,
+body .wm-sidebar-sidebar,
+body .wm-sidebar-loginPanel,
+body .wm-sidebar-footer,
+body .wm-sidebar-navigationLink,
+body .wm-app-dialogLayer,
+body .wm-app-dialogBackdrop,
+body .wm-app-modal,
+body dialog,
+body .wm-app-recurringLoginBanner,
+body .wm-app-emptyComposerAction,
+body .wm-app-promptTypeaheadPortal,
+body .wm-app-privacyPositioner,
+body .wm-app-landingHeading,
+body .wm-composer-dictationButton,
+body .wm-app-scrollToBottomButton,
+body .wm-fallback-detailFooter [data-testid="thread-disclaimer"] {
+  display: none;
+}
+
+body:has([data-message-role="assistant"]) .wm-app-scrollToBottomButton {
+  display: block;
+  position: fixed;
+  left: 0;
+  top: 148px;
+  width: 36px;
+  height: 36px;
+  margin: 0 0 0 222px;
+  padding: 0;
+  border: 1px solid #d9d9d9;
+  border-radius: 18px;
+  background: #ffffff;
+  color: #0d0d0d;
+  transform: none;
+}
+body .wm-app-scrollToBottomButton::before {
+  content: "↓";
+  display: block;
+  width: 36px;
+  color: #0d0d0d;
+  font-size: 21px;
+  line-height: 34px;
+  text-align: center;
+}
+
+.wm-app-appShell,
+.wm-fallback-layout,
+.wm-fallback-detailPane {
+  display: block;
+  position: static;
+  width: 480px;
+  min-width: 0;
+  height: auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: #ffffff;
+}
+
+.wm-fallback-detailHeader {
+  display: flex;
+  position: sticky;
+  top: 0;
+  width: 456px;
+  height: 44px;
+  margin: 0;
+  padding: 0 12px;
+  border: 0;
+  border-bottom: 1px solid #ececec;
+  align-items: center;
+  background: #ffffff;
+}
+.wm-fallback-detailHeaderLabel {
+  display: block;
+  width: 86px;
+  margin: 0;
+  padding: 0;
+}
+.wm-app-headerWordmark {
+  display: block;
+  color: #0d0d0d;
+  font-size: 17px;
+  font-weight: bold;
+  line-height: 24px;
+}
+.wm-fallback-headerSpacer { display: block; flex: 1 1 auto; }
+.wm-fallback-headerActionGroup,
+.wm-app-authActions {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+}
+.wm-app-loginButton,
+.wm-app-signupButton {
+  display: block;
+  width: auto;
+  height: 34px;
+  margin: 0;
+  padding: 6px 13px;
+  border-radius: 17px;
+  font-size: 13px;
+  line-height: 20px;
+  white-space: nowrap;
+}
+.wm-app-loginButton {
+  width: 64px;
+  color: #ffffff;
+  background: #0d0d0d;
+  border: 1px solid #0d0d0d;
+}
+.wm-app-signupButton {
+  display: none;
+  color: #0d0d0d;
+  background: #ffffff;
+  border: 1px solid #d9d9d9;
+}
+
+.wm-fallback-detailBody,
+.wm-app-threadViewport,
+.wm-app-thread,
+.wm-app-threadContent,
+.wm-app-conversation {
+  display: block;
+  position: static;
+  width: auto;
+  min-width: 0;
+  height: auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  overflow: visible;
+  background: #ffffff;
+}
+.wm-app-threadContent { padding: 10px 16px 106px; }
+[data-conversation-transcript] {
+  display: block;
+  width: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+[data-message-role="user"],
+[data-message-role="assistant"] {
+  display: block;
+  width: auto;
+  margin: 0 0 14px;
+  padding: 0;
+  border: 0;
+  color: #0d0d0d;
+  font-size: 15px;
+  line-height: 21px;
+}
+[data-message-role="user"] > div:first-of-type {
+  width: auto;
+  max-width: 330px;
+  margin-left: 80px;
+  padding: 8px 12px;
+  border-radius: 16px;
+  background: #f4f4f4;
+}
+[data-message-role="assistant"] ul {
+  margin: 4px 0 12px 20px;
+  padding: 0;
+}
+[data-message-role="assistant"] li { margin: 0 0 6px; padding: 0; }
+[data-message-role="assistant"] li::before {
+  content: "• ";
+  color: #0d0d0d;
+}
+[data-message-role] h4,
+[data-message-role] [aria-label="Your message actions"],
+[data-message-role] [aria-label="Response actions"] { display: none; }
+
+.wm-fallback-detailFooter {
+  display: block;
+  position: fixed;
+  left: 0;
+  top: 194px;
+  bottom: auto;
+  width: 480px;
+  height: 78px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: #ffffff;
+}
+.wm-app-composerDock,
+.wm-app-composerPositioner {
+  display: block;
+  position: static;
+  width: 480px;
+  height: 78px;
+  margin: 0;
+  padding: 0;
+}
+form[data-mobile-composer],
+.wm-composer-composer {
+  display: block;
+  position: relative;
+  left: 0;
+  top: 0;
+  width: 454px;
+  height: 54px;
+  margin: 8px 12px;
+  padding: 0;
+  border: 1px solid #d9d9d9;
+  border-radius: 27px;
+  background: #ffffff;
+}
+body form[data-mobile-composer] {
+  border: 1px solid #d9d9d9;
+  outline: 0;
+  box-shadow: none;
+}
+form[data-mobile-composer]::before,
+.wm-composer-composer::before {
+  content: "";
+}
+form[data-mobile-composer] input,
+form[data-mobile-composer] .wm-composer-srOnly { display: none; }
+.wm-composer-actionField {
+  display: block;
+  position: absolute;
+  left: 9px;
+  top: 9px;
+  width: 34px;
+  height: 34px;
+}
+.wm-composer-actionButton {
+  display: block;
+  width: 34px;
+  height: 34px;
+  margin: 0;
+  padding: 7px;
+  border: 0;
+  background: transparent;
+}
+.wm-composer-actionButton::before,
+.wm-composer-actionButton::after {
+  content: "";
+  position: absolute;
+  left: 9px;
+  top: 16px;
+  width: 16px;
+  height: 1px;
+  background: #0d0d0d;
+}
+.wm-composer-actionButton::after {
+  left: 16px;
+  top: 9px;
+  width: 1px;
+  height: 16px;
+}
+.wm-composer-primary {
+  display: block;
+  position: absolute;
+  left: 49px;
+  top: 12px;
+  width: 380px;
+  height: 28px;
+}
+.wm-composer-primary::before {
+  content: "";
+}
+.wm-composer-textarea {
+  display: block;
+  position: static;
+  width: 344px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: #555555;
+  background: transparent;
+  font-size: 15px;
+  line-height: 22px;
+}
+.wm-composer-trailing {
+  display: none;
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  width: 38px;
+  height: 38px;
+}
+.wm-composer-submitButton { display: none; }

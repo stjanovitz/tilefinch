@@ -1,0 +1,35 @@
+/build*/
+/dist/
+/frames/
+/benchmark-frames/
+/benchmarks/downloads/
+/benchmarks/results-*.csv
+/benchmarks/visual-reference/
+/device-runs/
+.DS_Store
+*.ppm
+*.png
+!docs/wikipedia-on-psp.png
+!docs/big-buck-bunny-player.png
+!docs/psp-validation-frame.png
+!docs/engineering/frame-mid.png
+!docs/engineering/frame-top.png
+!psp-assets/tilefinch-icon-master.png
+!psp-assets/tilefinch-icon0-144x82.png
+*.o
+*.elf
+*.prx
+*.PBP
+PARAM.SFO
+/psp-validation/validation.txt
+fidelity/
+benchmarks/node_modules/
+async-network-results/
+async-network-results-current/
+benchmarks/npm-*.log
+
+# Public trust records may be committed under trust/. Private signing
+# material never belongs in this repository.
+/trust/*.pem
+/trust/*.key
+/trust/private/

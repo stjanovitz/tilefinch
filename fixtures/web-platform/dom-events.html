@@ -1,0 +1,24 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width">
+<title>DOM and events</title>
+<body><main id="host"><button id="target">Run</button></main><output id="result"></output>
+<script>
+const order=[];
+const host=document.getElementById('host');
+const target=document.getElementById('target');
+host.addEventListener('click',()=>order.push('capture'),true);
+target.addEventListener('click',event=>{
+  order.push('target');
+  event.currentTarget.setAttribute('data-ran','yes');
+});
+host.addEventListener('click',()=>order.push('bubble'));
+target.click();
+const clone=target.cloneNode(true);
+host.appendChild(clone);
+const pass=order.join(',')==='capture,target,bubble'
+  && target.matches('button[data-ran="yes"]')
+  && host.querySelectorAll('button').length===2
+  && clone.parentNode===host;
+globalThis.pocSummary='wp-dom-events:'+(pass?'PASS':'FAIL')+':'+order.join('>');
+document.getElementById('result').textContent=pocSummary;
+</script></body>

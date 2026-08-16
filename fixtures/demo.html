@@ -1,0 +1,62 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>PSP Pocket Web Laboratory</title>
+    <style>
+      body { color: #20242a; background-color: #f3efe5; padding: 12px; }
+      h1 { color: #f7f9ff; background-color: #253a67; padding: 8px; }
+      h2 { color: #253a67; margin: 8px; }
+      .card { background-color: #ffffff; padding: 8px; margin: 7px; }
+      .accent { color: #b43b2f; }
+      #verdict { background-color: #dcebd7; padding: 8px; }
+      code { color: #4b3278; background-color: #eee8f8; }
+    </style>
+  </head>
+  <body>
+    <h1>PSP Pocket Web</h1>
+    <p class="card">This desktop laboratory tests a memory-capped engine shaped for a 480 by 272 handheld screen. Parsing, scripting, layout and painting share one explicit allocation budget.</p>
+
+    <section class="card">
+      <h2>Deferred by design</h2>
+      <p>Only visible RGB565 tiles are rasterized. A retained display list lets the cache discard distant pixels and rebuild them when scrolling returns.</p>
+      <ul>
+        <li>HTML arrives in small chunks.</li>
+        <li>Text wraps inside the viewport.</li>
+        <li>JavaScript has a separate heap ceiling.</li>
+        <li>Tile eviction is expected, not exceptional.</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>Modern language core</h2>
+      <p>The embedded script uses optional chaining, const bindings, arrow functions, template strings and Array methods. Those features run in QuickJS rather than a legacy ES5 interpreter.</p>
+      <p><code>globalThis.pocSummary</code> is read back by the host after evaluation.</p>
+    </section>
+
+    <section class="card">
+      <h2>Long-page checkpoint A</h2>
+      <p>Browser tiling controls raster memory, but it does not make the DOM, computed styles, layout boxes or JavaScript heap disappear. Those structures need their own quotas and future fragmentation strategy.</p>
+      <p class="accent">The proof of concept measures that distinction directly.</p>
+    </section>
+
+    <section class="card">
+      <h2>Long-page checkpoint B</h2>
+      <p>A PSP implementation can prioritize input, visible painting, visible resource decode, parsing, scripts and finally near-viewport prefetch. Work outside the viewport must be cancellable.</p>
+      <p>Complex tables, floats, Grid and geometry queries will sometimes force a synchronous layout expansion. Those are explicit compatibility costs.</p>
+    </section>
+
+    <section class="card">
+      <h2>Long-page checkpoint C</h2>
+      <p>Stage two should port only the tile compositor and scheduler to real hardware. Networking, full CSS and a DOM bridge come after memory and scroll behavior are proven on the device.</p>
+    </section>
+
+    <p id="verdict">The architectural question is whether useful pages can remain controlled under the PSP memory ceiling, not whether a desktop engine can merely be cross-compiled.</p>
+
+    <script>
+      const words = document.bodyText?.trim().split(/\s+/) ?? [];
+      const sample = Array.from(new Set(words.map(word => word.toLowerCase()))).slice(0, 5);
+      globalThis.pocSummary = `${document.title}: ${words.length} words, ${document.nodeCount} DOM nodes, sample=${sample.join('|')}`;
+    </script>
+  </body>
+</html>

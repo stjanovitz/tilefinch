@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>property fault trace</title>
+<script>
+try {
+  let missing;
+  missing["computed-key"];
+} catch (error) {}
+try {
+  let absent = null;
+  absent.named;
+} catch (error) {}
+globalThis.pocSummary = "caught-property-faults";
+</script>

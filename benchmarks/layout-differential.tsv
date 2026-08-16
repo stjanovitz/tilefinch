@@ -1,0 +1,6 @@
+metric	contract	tolerance
+outer.clientWidth	248	0
+outer.clientHeight	98	2
+outer.scrollHeight	greater-than-clientHeight	0
+outer.scrollTop-after-999	scrollHeight-minus-clientHeight	0
+row-b.top-displacement	equals-scrollTop	0

@@ -1,0 +1,24 @@
+PSP Browser Hardware Validation v3 — one copy, one run
+
+1. Copy the PSP folder from this package to the root of the PSP Memory Stick.
+   The final path must be PSP/GAME/PSPBVAL/EBOOT.PBP.
+2. On the PSP-3000 with homebrew enabled, launch "PSP Browser Hardware Validation"
+   from Game > Memory Stick.
+3. Leave the PSP powered on while the diagnostics run. The final summary remains
+   visible for five seconds, then the application exits automatically.
+4. Reconnect the Memory Stick and retrieve:
+      PSP/GAME/PSPBVAL/validation.txt
+5. Attach validation.txt to the issue or development task that requested the
+   run. That one log contains every required memory, fragmentation, cache,
+   rounded/fixed overlay timing, and storage result. The selected operating
+   target is fixed at 333 MHz.
+
+Only also send validation.ppm if the PSP screen looked corrupted.
+
+A complete log must contain:
+  schema=psp-browser-validation-v3
+  run_complete=yes
+  run_end=1
+
+Do not edit the log. PASS or FAIL is useful; the individual measurements are the
+important part, so return it even if the screen reports FAIL.

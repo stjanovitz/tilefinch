@@ -1,0 +1,6 @@
+# Used with fixtures/server.py to exercise live navigation and restoration.
+focus-id next
+cross
+circle
+status
+quit

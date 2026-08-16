@@ -1,0 +1,21 @@
+js (()=>{const a=document.querySelectorAll('a[href="item?id=49010345"]').slice(-1)[0];if(!a)throw new Error('missing frozen comments link');a.id='tilefinch-comments-link';return 'home:'+document.querySelectorAll('tr.athing.submission').length+':'+scrollY})()
+focus-id tilefinch-comments-link
+activate
+tick 3 100
+js 'comments:'+location.pathname+location.search+':'+(document.querySelector('tr.athing.comtr')!==null)+':'+scrollY
+page-down
+page-down
+js 'comment-scroll:'+location.pathname+':'+scrollY
+back
+tick 2 100
+js 'comments-back:'+location.pathname+location.search+':'+document.querySelectorAll('tr.athing.submission').length+':'+scrollY
+js (()=>{const a=document.querySelector('a.morelink');if(!a)throw new Error('missing More link');a.id='tilefinch-more-link';return a.href})()
+focus-id tilefinch-more-link
+activate
+tick 2 100
+js 'page-two:'+location.pathname+location.search+':'+document.querySelectorAll('tr.athing.submission').length+':'+scrollY
+back
+tick 2 100
+js 'page-two-back:'+location.pathname+location.search+':'+document.querySelectorAll('tr.athing.submission').length+':'+scrollY
+status
+quit

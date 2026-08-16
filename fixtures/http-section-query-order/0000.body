@@ -1,0 +1,113 @@
+<!doctype html>
+<html>
+<head>
+  <title>Whole-document query order</title>
+</head>
+<body>
+  <h1>Alpha</h1>
+  <p>Initial source interval.</p>
+  <h2>Beta</h2>
+  <div class="ordered-match">first-match</div>
+  <div id="duplicate-target">first-id</div>
+  <section class="query-scope"><div class="complex-match">first-complex</div><span>tail</span></section>
+  <div id="query-order-result">WAIT</div>
+  <h3>Gamma</h3>
+  <div class="ordered-match">later-match</div>
+  <div id="duplicate-target">later-id</div>
+  <section class="query-scope"><div class="complex-match">later-complex</div><span>tail</span></section>
+  <script>
+    setTimeout(() => {
+    try {
+    const orderedHeld = document.querySelector('.ordered-match');
+    const duplicateHeld = document.getElementById('duplicate-target');
+    const complexSelector =
+      'section.query-scope > div.complex-match:first-child:not([data-skip])';
+    const complexHeld = document.querySelector(complexSelector);
+    const complexAll = document.querySelectorAll(complexSelector);
+    const complexParent = complexHeld.parentElement;
+    const checks = [
+      !!orderedHeld,
+      !!duplicateHeld,
+      !!complexHeld,
+      complexAll.length === 2,
+      complexAll[0] === complexHeld,
+      complexAll[1] !== complexHeld,
+      orderedHeld === document.querySelector('.ordered-match'),
+      duplicateHeld === document.getElementById('duplicate-target'),
+      complexHeld === document.querySelector(complexSelector),
+      orderedHeld.isConnected,
+      duplicateHeld.isConnected,
+      complexHeld.isConnected,
+      complexAll[1].isConnected,
+      orderedHeld.textContent === 'first-match',
+      orderedHeld.innerHTML === 'first-match',
+      orderedHeld.getAttribute('class') === 'ordered-match',
+      orderedHeld.attributes.some(attribute =>
+        attribute.name === 'class' && attribute.value === 'ordered-match'),
+      orderedHeld.getAttributeNames().includes('class'),
+      orderedHeld.matches('div.ordered-match'),
+      complexHeld.matches(complexSelector),
+      orderedHeld.parentElement === document.body,
+      complexParent.tagName === 'SECTION',
+      complexHeld.closest('section.query-scope') === complexParent,
+      complexParent.firstElementChild === complexHeld,
+      complexParent.children.length === 2,
+      complexParent.children[0] === complexHeld,
+      complexParent.children[1].tagName === 'SPAN',
+      complexHeld.nextElementSibling === complexParent.children[1],
+      complexParent.children[1].previousElementSibling === complexHeld,
+      duplicateHeld.textContent === 'first-id',
+      duplicateHeld.getAttribute('id') === 'duplicate-target',
+      complexHeld.textContent === 'first-complex',
+      complexAll[1].textContent === 'later-complex'
+    ];
+    const result = document.getElementById('query-order-result');
+    result.setAttribute('data-remote-write', 'preserved');
+    checks.push(result.getAttribute('data-remote-write') === 'preserved');
+    checks.push(result.getAttributeNames().includes('data-remote-write'));
+    orderedHeld.setAttribute('data-selector-write', 'yes');
+    checks.push(orderedHeld.matches('[data-selector-write="yes"]'));
+    checks.push(document.querySelector('[data-selector-write="yes"]') ===
+      orderedHeld);
+    checks.push(document.querySelectorAll('[data-selector-write="yes"]')
+      .item(0) === orderedHeld);
+    orderedHeld.removeAttribute('data-selector-write');
+    checks.push(!orderedHeld.matches('[data-selector-write]'));
+    checks.push(document.querySelector('[data-selector-write]') === null);
+    orderedHeld.className = 'ordered-updated';
+    checks.push(orderedHeld.matches('div.ordered-updated'));
+    checks.push(!orderedHeld.matches('div.ordered-match'));
+    checks.push(document.querySelector('.ordered-updated') === orderedHeld);
+    checks.push(document.querySelector('.ordered-match') !== orderedHeld);
+    checks.push(document.querySelector('.ordered-match').textContent ===
+      'later-match');
+    duplicateHeld.id = 'renamed-target';
+    checks.push(document.getElementById('renamed-target') === duplicateHeld);
+    checks.push(document.querySelector('#renamed-target') === duplicateHeld);
+    checks.push(document.getElementById('duplicate-target') !== duplicateHeld);
+    checks.push(document.getElementById('duplicate-target').textContent ===
+      'later-id');
+    orderedHeld.innerHTML = '<b class="inserted-child">new-text</b>';
+    const inserted = document.querySelector('.inserted-child');
+    checks.push(orderedHeld.innerHTML ===
+      '<b class="inserted-child">new-text</b>');
+    checks.push(orderedHeld.textContent === 'new-text');
+    checks.push(inserted && inserted.textContent === 'new-text');
+    checks.push(inserted.parentElement === orderedHeld);
+    checks.push(orderedHeld.firstElementChild === inserted);
+    checks.push(orderedHeld.children.length === 1);
+    checks.push(orderedHeld.children[0] === inserted);
+    result.textContent = checks.every(Boolean) ? 'ORDER-PASS'
+      : 'ORDER-FAIL:' + checks.map(Number).join('')
+        + ':parent=' + String(orderedHeld.parentElement?.tagName)
+        + ':' + String(orderedHeld.parentElement?.__handle)
+        + ':body=' + String(document.body?.tagName)
+        + ':' + String(document.body?.__handle);
+    } catch (error) {
+      document.getElementById('query-order-result').textContent =
+        'ORDER-EXCEPTION:' + String(error && error.stack || error);
+    }
+    }, 0);
+  </script>
+</body>
+</html>

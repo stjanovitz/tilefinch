@@ -1,0 +1,10 @@
+js document.querySelector('input[name="q"]').setAttribute('id','tilefinch-search')
+focus-id tilefinch-search
+type PlayStation Portable
+activate
+tick 20 100
+status
+back
+tick 10 100
+status
+quit

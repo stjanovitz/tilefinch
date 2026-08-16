@@ -1,0 +1,18 @@
+/* Generated at configure time. Validation builds retain the independent
+   media contract fixtures in .rodata so a single EBOOT can test firmware
+   decode without a Memory Stick sidecar or live network. */
+
+    .section .rodata
+    .balign 64
+    .global tilefinch_media_fixture_240_start
+    .global tilefinch_media_fixture_240_end
+tilefinch_media_fixture_240_start:
+    .incbin "@TILEFINCH_MEDIA_FIXTURE_240@"
+tilefinch_media_fixture_240_end:
+
+    .balign 64
+    .global tilefinch_media_fixture_360_start
+    .global tilefinch_media_fixture_360_end
+tilefinch_media_fixture_360_start:
+    .incbin "@TILEFINCH_MEDIA_FIXTURE_360@"
+tilefinch_media_fixture_360_end:

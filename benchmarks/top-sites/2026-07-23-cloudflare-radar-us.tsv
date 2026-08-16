@@ -1,0 +1,104 @@
+# Cloudflare Radar "Top 100 domains in the United States"
+# Public page: https://radar.cloudflare.com/domains/US
+# Date parameter exposed by the page: 2026-07-23
+rank	domain	categories
+1	google.com	Search Engines
+2	microsoft.com	Business;Information Technology
+3	googleapis.com	Content Servers;Information Technology
+4	apple.com	Information Technology;Technology
+5	gstatic.com	Content Servers
+6	facebook.com	Social Networks
+7	amazonaws.com	Technology
+8	akadns.net	Content Servers
+9	prodregistryv2.org	Content Servers
+10	office.com	Business
+11	instagram.com	Social Networks
+12	aaplimg.com	Content Servers;Information Technology;Technology
+13	apple-dns.net	Content Servers
+14	akamaiedge.net	Content Servers
+15	googlevideo.com	Search Engines;Video Streaming
+16	akamai.net	Content Servers
+17	cloudflare-dns.com	Content Servers
+18	doubleclick.net	Advertisements;Trackers/Analytics
+19	azure.com	Technology
+20	icloud.com	Content Servers;File Sharing
+21	amazon.com	Ecommerce
+22	youtube.com	Video Streaming
+23	cloudfront.net	Content Servers
+24	live.com	Technology;Webmail
+25	cloudflare.com	Technology
+26	cloud.microsoft	Business;Information Technology
+27	fbcdn.net	Social Networks
+28	fastly.net	Information Security;Information Technology;Technology
+29	ntp.org	Government/Legal;Technology
+30	googleusercontent.com	Content Servers
+31	googlesyndication.com	Advertisements;Search Engines;Trackers/Analytics
+32	chatgpt.com	Artificial Intelligence;Chat
+33	office.net	Content Servers
+34	ui.com	Technology
+35	yahoo.com	News & Media
+36	spotify.com	Audio Streaming
+37	bing.com	Search Engines
+38	trafficmanager.net	Content Servers;Information Technology
+39	tiktokcdn-us.com	Content Servers
+40	whatsapp.net	Instant Messengers;Internet Phone & VOIP
+41	snapchat.com	Photography;Social Networks
+42	gvt2.com	Content Servers
+43	microsoftonline.com	Technology
+44	amazon-adsystem.com	Advertisements;Trackers/Analytics
+45	msn.com	News & Media
+46	office365.com	Technology
+47	digicert.com	Information Security
+48	windows.net	Technology
+49	tiktokv.us	Content Servers
+50	sharepoint.com	File Sharing;Technology
+51	cdninstagram.com	Content Servers
+52	netflix.com	Movies;Video Streaming
+53	windowsupdate.com	Business;Information Technology
+54	msftconnecttest.com	Content Servers
+55	msftncsi.com	Content Servers
+56	ytimg.com	Content Servers
+57	app-measurement.com	APIs;Trackers/Analytics
+58	doubleverify.com	Business;Technology;Trackers/Analytics
+59	skype.com	Instant Messengers;Internet Phone & VOIP
+60	app-analytics-services.com	Content Servers;Trackers/Analytics
+61	adobe.com	Technology
+62	amazon.dev	Content Servers
+63	a2z.com	Content Servers
+64	lencr.org	Information Technology
+65	cdn-apple.com	Content Servers
+66	rubiconproject.com	Business;Technology;Trackers/Analytics
+67	criteo.com	Business;Trackers/Analytics
+68	appsflyersdk.com	APIs;Content Servers;Trackers/Analytics
+69	adtrafficquality.google	Search Engines
+70	adobe.io	Business;Technology
+71	outlook.com	Webmail
+72	sentry.io	Business;Trackers/Analytics
+73	googletagmanager.com	Content Servers;Trackers/Analytics
+74	tiktokv.com	Social Networks;Video Streaming
+75	windows.com	Information Technology
+76	avast.com	Technology
+77	launchdarkly.com	Business
+78	pubmatic.com	Business;Technology;Trackers/Analytics
+79	gmail.com	Webmail
+80	adsrvr.org	Advertisements;Trackers/Analytics
+81	zoom.us	Technology
+82	grammarly.com	Artificial Intelligence;Hobbies & Interests
+83	google-analytics.com	Business;Technology;Trackers/Analytics
+84	media-amazon.com	Content Servers
+85	adnxs.com	Content Servers;Trackers/Analytics
+86	nr-data.net	Content Servers;Trackers/Analytics
+87	grammarly.io	Content Servers;Information Technology
+88	adsafeprotected.com	Advertisements;Trackers/Analytics
+89	github.com	Technology
+90	static.microsoft	Content Servers
+91	fastly-edge.com	Content Servers;Information Technology
+92	linkedin.com	Professional Networking
+93	steamserver.net	Content Servers;Gaming
+94	media.net	Business;Trackers/Analytics
+95	browser-intake-datadoghq.com	Content Servers;Trackers/Analytics
+96	ubuntu.com	Technology
+97	reddit.com	Forums
+98	applovin.com	Business;Technology;Trackers/Analytics
+99	dropbox.com	File Sharing
+100	taboola.com	Advertisements;Business;Trackers/Analytics

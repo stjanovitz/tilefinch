@@ -1,0 +1,7 @@
+# Drive the shipping native HOME cursor through actual PSP presentation.
+wait 10
+stick 30 right
+wait 2
+stick 30 down
+wait 2
+end

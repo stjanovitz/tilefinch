@@ -1,0 +1,6 @@
+name	fixture	minimum_height
+wikipedia	site-benchmarks/wikipedia.html	1000
+reddit-old	site-benchmarks/reddit-old.html	500
+nytimes-mobile	nytimes-mobile.html	500
+chatgpt-home	chatgpt-parity/home-mobile.html	272
+chatgpt-result	chatgpt-parity/result.html	272

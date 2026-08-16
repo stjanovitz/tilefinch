@@ -1,0 +1,9 @@
+js 'homepage:'+location.pathname+':'+document.querySelectorAll('h2.mp-h2').length+':'+scrollY
+anchor mp-itn-h2
+js 'homepage-news:'+document.querySelector('#mp-itn-h2').textContent.trim()+':'+scrollY
+anchor mp-sister
+js 'homepage-sisters:'+document.querySelector('#mp-sister').textContent.trim()+':'+scrollY
+top
+js 'homepage-top:'+location.pathname+':'+scrollY
+status
+quit

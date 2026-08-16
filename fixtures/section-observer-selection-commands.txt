@@ -1,0 +1,4 @@
+anchor gamma
+anchor alpha
+click #observer-button
+control-value observer-result

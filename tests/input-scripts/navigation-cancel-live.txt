@@ -1,0 +1,18 @@
+# Exercise input and visible acknowledgement while a genuine navigation is
+# still busy. HOME starts focused on Wikipedia.
+# Let the homepage's eager Wi-Fi association finish first. Without this the
+# press exercises cancellation of association rather than the shared-worker
+# page navigation this scenario is named for.
+wait-live 360
+tap cross
+# Let transport publish real response chunks and the parser/resource stages
+# begin before cancelling. This exercises the supervisor while both worker
+# I/O and foreground browser work are active, not just request setup.
+wait-live 180
+mark-live loading
+tap-live circle
+# The supervisor captures the immediate cancel acknowledgement itself. Wait
+# for the browser loop to finish unwinding before taking the settled frame.
+wait 4
+mark-live stopped
+end

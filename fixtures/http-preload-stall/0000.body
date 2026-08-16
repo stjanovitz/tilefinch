@@ -1,0 +1,1 @@
+<!doctype html><title>Preload ownership</title><link rel="preload" as="script" href="/a.js"><link rel="preload" as="style" href="/b.css"><body><p>ready</p>

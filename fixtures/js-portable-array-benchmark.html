@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Portable array benchmark</title>
+<script>
+(() => {
+  function checksum(values, length, seed) {
+    let result = seed;
+    for (let index = 0; index < length; index++) {
+      result = ((result << 5) - result + values[index]) | 0;
+    }
+    return result;
+  }
+
+  function update(values, seed) {
+    for (let index = 0; index < 8; index++) {
+      values[index] = (values[index] + seed + index) & 255;
+    }
+    return values[0] + values[7];
+  }
+
+  const values = new Uint8Array(64);
+  for (let index = 0; index < values.length; index++) {
+    values[index] = (index * 29 + 17) & 255;
+  }
+
+  let result = 0;
+  for (let iteration = 0; iteration < 12000; iteration++) {
+    result ^= checksum(values, 64, iteration & 255);
+  }
+  for (let iteration = 0; iteration < 4000; iteration++) {
+    result ^= update(values, iteration & 31);
+  }
+  globalThis.pocSummary = `portable-array:${result}:${values[0]}:${values[7]}`;
+})();
+</script>

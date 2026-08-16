@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head><title>Section observer and selection state</title></head>
+<body>
+  <h1 id="alpha">Observer section</h1>
+  <input id="selection-input" value="ABCDE">
+  <div id="observer-target">Original</div>
+  <input id="observer-result" value="A">
+  <button id="observer-button">Mutate</button>
+  <script>
+    const selection = document.getElementById('selection-input');
+    const target = document.getElementById('observer-target');
+    const result = document.getElementById('observer-result');
+    selection.setSelectionRange(1, 3, 'forward');
+    new MutationObserver(() => { result.value += 'O'; })
+      .observe(target, { childList: true, subtree: true });
+    document.getElementById('observer-button').onclick = () => {
+      target.textContent = 'Changed';
+      result.value += ':' + selection.selectionStart + '-'
+        + selection.selectionEnd + '-' + selection.selectionDirection;
+    };
+  </script>
+  <h2 id="gamma">Other section</h2>
+  <p>Evict the observed section.</p>
+</body>
+</html>

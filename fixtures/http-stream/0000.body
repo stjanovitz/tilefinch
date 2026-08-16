@@ -1,0 +1,1 @@
+<!doctype html><title>Stream &amp; split</title><link rel="stylesheet" href="/theme.css"><body><p id="before" data-v="a&amp;b">café ☃</p><script src="/block.js"></script><script>globalThis.pocSummary=globalThis.externalBlockingOk&&document.getElementById('after')===null?'stream-blocking:ok':'stream-blocking:late'</script><p id="after">after</p><table>text<tr><td>A<td>B</table>

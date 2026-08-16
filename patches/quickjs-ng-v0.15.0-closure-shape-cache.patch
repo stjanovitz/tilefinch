@@ -1,0 +1,89 @@
+diff --git a/quickjs.c b/quickjs.c
+index 38a724f..23fd698 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -499,6 +499,8 @@ struct JSContext {
+     JSShape *mapped_arguments_shape;  /* shape for mapped arguments objects */
+     JSShape *regexp_shape;  /* shape for regexp objects */
+     JSShape *regexp_result_shape;  /* shape for regexp result objects */
++    /* Shared shape for ordinary bytecode closures with a lazy prototype. */
++    JSShape *ordinary_function_shape;
+ 
+     JSValue *class_proto;
+     JSValue function_proto;
+@@ -2671,6 +2673,9 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
+ 
+     if (ctx->regexp_result_shape)
+         mark_func(rt, &ctx->regexp_result_shape->header);
++
++    if (ctx->ordinary_function_shape)
++        mark_func(rt, &ctx->ordinary_function_shape->header);
+ }
+ 
+ void JS_FreeContext(JSContext *ctx)
+@@ -2745,6 +2750,7 @@ void JS_FreeContext(JSContext *ctx)
+     js_free_shape_null(ctx->rt, ctx->mapped_arguments_shape);
+     js_free_shape_null(ctx->rt, ctx->regexp_shape);
+     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
++    js_free_shape_null(ctx->rt, ctx->ordinary_function_shape);
+ 
+     list_del(&ctx->link);
+     remove_gc_object(&ctx->header);
+@@ -17170,6 +17176,35 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
+     JSAtom name_atom;
+ 
+     b = JS_VALUE_GET_PTR(bfunc);
++    name_atom = b->func_name;
++    if (name_atom == JS_ATOM_NULL)
++        name_atom = JS_ATOM_empty_string;
++
++    if (likely(b->func_kind == JS_FUNC_NORMAL && b->has_prototype &&
++               ctx->ordinary_function_shape != NULL)) {
++        JSProperty props[3];
++        JSValue name_value = JS_AtomToString(ctx, name_atom);
++        assert(ctx->ordinary_function_shape->prop_count == countof(props));
++        if (unlikely(JS_IsException(name_value))) {
++            JS_FreeValue(ctx, bfunc);
++            return JS_EXCEPTION;
++        }
++        props[0].u.value = js_int32(b->defined_arg_count);
++        props[1].u.value = name_value;
++        props[2].u.init.realm_and_id =
++            (uintptr_t)JS_DupContext(ctx) | JS_AUTOINIT_ID_PROTOTYPE;
++        props[2].u.init.opaque = NULL;
++        func_obj = JS_NewObjectFromShape(
++            ctx, js_dup_shape(ctx->ordinary_function_shape),
++            JS_CLASS_BYTECODE_FUNCTION, props);
++        if (unlikely(JS_IsException(func_obj))) {
++            JS_FreeValue(ctx, bfunc);
++            return JS_EXCEPTION;
++        }
++        JS_VALUE_GET_OBJ(func_obj)->is_constructor = true;
++        return js_closure2(ctx, func_obj, b, cur_var_refs, sf);
++    }
++
+     func_obj = JS_NewObjectClass(ctx, func_kind_to_class_id[b->func_kind]);
+     if (JS_IsException(func_obj)) {
+         JS_FreeValue(ctx, bfunc);
+@@ -17180,9 +17215,6 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
+         /* bfunc has been freed */
+         goto fail;
+     }
+-    name_atom = b->func_name;
+-    if (name_atom == JS_ATOM_NULL)
+-        name_atom = JS_ATOM_empty_string;
+     js_function_set_properties(ctx, func_obj, name_atom,
+                                b->defined_arg_count);
+ 
+@@ -17208,6 +17240,11 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
+         JS_DefineAutoInitProperty(ctx, func_obj, JS_ATOM_prototype,
+                                   JS_AUTOINIT_ID_PROTOTYPE, NULL,
+                                   JS_PROP_WRITABLE);
++        if (b->func_kind == JS_FUNC_NORMAL &&
++            ctx->ordinary_function_shape == NULL) {
++            ctx->ordinary_function_shape =
++                js_dup_shape(JS_VALUE_GET_OBJ(func_obj)->shape);
++        }
+     }
+     return func_obj;
+  fail:

@@ -1,0 +1,1 @@
+<!doctype html><title>Redirected Critical-CH retry</title><body><script>globalThis.pocSummary=document.cookie.indexOf('retry_path=seen')>=0&&document.cookie.indexOf('discarded_redirect_body=')<0?'redirect-retry-clean':'redirect-retry-dirty'</script><p>hinted redirected response</p>

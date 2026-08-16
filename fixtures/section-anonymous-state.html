@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+<head><title>Anonymous section state</title></head>
+<body>
+  <h1 id="alpha">Alpha</h1>
+  <button class="anonymous-button">Anonymous button</button>
+  <input id="anonymous-result" value="">
+  <input class="anonymous-field" value="">
+  <script>
+    const anonymousButton = document.querySelector('.anonymous-button');
+    const anonymousResult = document.getElementById('anonymous-result');
+    const anonymousField = document.querySelector('.anonymous-field');
+    globalThis.anonymousHeld = anonymousButton;
+    anonymousButton.onclick = () => {
+      const revisiting = anonymousResult.value !== '';
+      const reconnected = anonymousHeld ===
+        document.querySelector('.anonymous-button');
+      const mutationRestored = !revisiting ||
+        (anonymousHeld.getAttribute('data-clicked') === 'yes'
+         && anonymousHeld.textContent === 'Changed anonymous');
+      const controlRestored = !revisiting || anonymousField.value === 'Z';
+      anonymousResult.value += reconnected && mutationRestored
+        && controlRestored ? 'H' : 'X';
+    };
+    anonymousButton.addEventListener('click', () => {
+      anonymousResult.value += 'L';
+      anonymousButton.textContent = 'Changed anonymous';
+      anonymousButton.setAttribute('data-clicked', 'yes');
+    });
+    new MutationObserver(() => anonymousResult.value += 'O')
+      .observe(anonymousButton, {attributes: true});
+  </script>
+  <h2 id="beta">Beta</h2>
+  <p>Evict the anonymous button section.</p>
+</body>
+</html>

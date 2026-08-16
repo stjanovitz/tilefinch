@@ -1,0 +1,17 @@
+<!doctype html><title>Streaming preview</title><style>body{font-size:16px}p{margin:0}:root{--late-tone:#112233}@layer base{.layer-context{color:#123456}}.variable-context{color:var(--late-tone)}</style><body><h1>Ready prefix</h1><script>globalThis.prefixReady=true</script><link rel="stylesheet" href="/late.css"><style>.later{margin:0}:root{--late-tone:#abcdef}@layer enhanced{.layer-context{color:#fedcba}}</style>
+<p class="variable-context">late root variable</p><p class="layer-context">late cascade layer</p>
+<p>row 01</p><p>row 02</p><p>row 03</p><p>row 04</p><p>row 05</p>
+<p>row 06</p><p>row 07</p><p>row 08</p><p>row 09</p><p>row 10</p>
+<p>row 11</p><p>row 12</p><p>row 13</p><p>row 14</p><p>row 15</p>
+<p>row 16</p><p>row 17</p><p>row 18</p><p>row 19</p><p>row 20</p>
+<p>row 21</p><p>row 22</p><p>row 23</p><p>row 24</p><p>row 25</p>
+<p>row 26</p><p>row 27</p><p>row 28</p><p>row 29</p><p>row 30</p>
+<p>row 31</p><p>row 32</p><p>row 33</p><p>row 34</p><p>row 35</p>
+<p>row 36</p><p>row 37</p><p>row 38</p><p>row 39</p><p>row 40</p>
+<p>row 41</p><p>row 42</p><p>row 43</p><p>row 44</p><p>row 45</p>
+<p>row 46</p><p>row 47</p><p>row 48</p><p>row 49</p><p>row 50</p>
+<p>row 51</p><p>row 52</p><p>row 53</p><p>row 54</p><p>row 55</p>
+<p>row 56</p><p>row 57</p><p>row 58</p><p>row 59</p><p>row 60</p><script src="/blocking.js"></script>
+<div id="tail">authoritative tail</div></body>
+<!-- Transport trailer deliberately follows the parser's body-close
+     checkpoint so a safe provisional paint can precede network EOF. -->

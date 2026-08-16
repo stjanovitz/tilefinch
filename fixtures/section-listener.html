@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><title>Section listener state</title></head>
+<body>
+  <h1 id="alpha">Listener section</h1>
+  <input id="listener-result" value="A">
+  <button id="listener-button">Update</button>
+  <script>
+    document.getElementById('listener-button').addEventListener('click', () => {
+      const result = document.getElementById('listener-result');
+      result.value = result.value + 'B';
+    });
+  </script>
+  <h2 id="gamma">Other section</h2>
+  <p>Evict the listener section.</p>
+</body>
+</html>

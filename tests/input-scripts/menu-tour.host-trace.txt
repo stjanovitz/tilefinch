@@ -1,0 +1,53 @@
+script menu-tour.txt steps=163
+mark boot screen=home
+mark home-first screen=home
+mark tabs-first screen=tabs
+step=14 action=new-tab setting=none screen=home menu=2 option=0 group=0 tab=0
+mark home-tab screen=home
+step=20 action=show-screenshots setting=none screen=page menu=10 option=0 group=0 tab=0
+mark page screen=page
+step=23 action=focus-down setting=none screen=page menu=10 option=0 group=0 tab=0
+step=25 action=focus-right setting=none screen=page menu=10 option=0 group=0 tab=0
+step=27 action=page-down setting=none screen=page menu=10 option=0 group=0 tab=0
+step=29 action=page-down setting=none screen=page menu=10 option=0 group=0 tab=0
+step=31 action=page-up setting=none screen=page menu=10 option=0 group=0 tab=0
+mark scrolled screen=page
+step=34 action=reload setting=none screen=page menu=10 option=0 group=0 tab=0
+mark reloaded screen=page
+step=40 action=toggle-reader setting=none screen=page menu=6 option=0 group=0 tab=0
+mark reader screen=page
+step=45 action=toggle-reader setting=none screen=page menu=6 option=0 group=0 tab=0
+mark reader-off screen=page
+step=50 action=toggle-reader-site setting=none screen=page menu=6 option=0 group=0 tab=0
+mark reader-site screen=page
+mark appearance screen=option-items
+step=61 action=none setting=browser-ui-scale screen=option-items menu=11 option=0 group=0 tab=0
+step=64 action=none setting=page-font-percent screen=option-items menu=11 option=1 group=0 tab=0
+step=67 action=none setting=reader-font screen=option-items menu=11 option=2 group=0 tab=0
+step=70 action=none setting=remember-reader-site-scale screen=option-items menu=11 option=3 group=0 tab=0
+step=73 action=none setting=color-mode screen=option-items menu=11 option=14 group=0 tab=0
+step=76 action=none setting=chrome-theme screen=option-items menu=11 option=15 group=0 tab=0
+step=81 action=none setting=glyph-language screen=glyph-options menu=11 option=16 group=0 tab=0
+step=83 action=none setting=color-emoji screen=glyph-options menu=11 option=16 group=0 tab=0
+step=87 action=none setting=video-scaling screen=option-items menu=11 option=17 group=0 tab=0
+mark appearance-done screen=option-items
+mark tabs screen=tabs
+step=102 action=switch-tab setting=none screen=home menu=2 option=17 group=0 tab=0
+mark tabs-done screen=home
+step=108 action=show-bookmarks setting=none screen=collections menu=4 option=17 group=0 tab=0
+mark bookmarks screen=collections
+step=118 action=show-history setting=none screen=collections menu=5 option=17 group=0 tab=0
+mark history screen=collections
+step=126 action=show-offline setting=none screen=collections menu=3 option=17 group=0 tab=0
+mark library screen=collections
+step=134 action=show-screenshots setting=none screen=page menu=10 option=17 group=0 tab=0
+mark screenshots screen=page
+step=137 action=back setting=none screen=page menu=10 option=17 group=0 tab=0
+step=142 action=toggle-bookmark setting=none screen=page menu=9 option=17 group=0 tab=0
+mark bookmarked screen=page
+step=148 action=home setting=none screen=home menu=1 option=17 group=0 tab=0
+mark home screen=home
+mark home-moved screen=home
+mark exiting screen=home
+step=160 action=exit setting=none screen=home menu=13 option=17 group=0 tab=0
+outcome complete frames=798 steps=162/163

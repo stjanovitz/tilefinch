@@ -1,0 +1,6 @@
+name	url	limit_mb	profile	minimum_height	purpose	minimum_body_text	required_title	required_text
+google-search	https://www.google.com/search?q=PlayStation%20Portable&hl=en&gl=us&pws=0	24	none	272	mainstream search results, query forms, redirects, result links, and responsive navigation	1000	Google Search	PlayStation Portable
+imdb-top	https://www.imdb.com/chart/top/	40	none	272	long repeated media catalog, responsive images, controls, lazy resources, and bounded traversal	1000	IMDb	The Shawshank Redemption
+apple	https://www.apple.com/	32	none	1000	image-heavy product marketing, responsive art direction, SVG, flex/grid, and sticky navigation	5000	Apple	iPhone
+mastodon-explore	https://mastodon.social/explore	32	none	500	public social application shell, modules, asynchronous feed data, DOM mutation, avatars, and media	1000	Mastodon	Explore
+espn-scoreboard	https://www.espn.com/nba/scoreboard/_/date/20250622	32	none	1000	score cards, structured live data, horizontal overflow, date navigation, logos, and responsive layout	1500	NBA Scores	Thunder

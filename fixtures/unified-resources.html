@@ -1,0 +1,18 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width">
+<title>Unified resources</title>
+<link rel="stylesheet" href="/unified-resources.css">
+<body>
+  <main id="resource-card">
+    <img src="/unified-mark.svg" alt="Resource pipeline mark">
+    <p>EXTERNAL RESOURCE PIPELINE</p>
+  </main>
+  <script>
+    setTimeout(() => {
+      const card = document.querySelector('#resource-card');
+      card.setAttribute('data-ready', 'yes');
+      const style = getComputedStyle(card);
+      globalThis.pocSummary = `imports:${style.color}:${style.backgroundColor}:${card.getAttribute('data-ready')}`;
+    }, 0);
+  </script>
+</body>

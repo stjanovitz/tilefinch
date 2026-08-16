@@ -1,0 +1,70 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -532,4 +532,5 @@ struct JSContext {
+     JSRuntime *rt;
+     struct list_head link;
++    BOOL dynamic_code_enabled;
+ 
+     uint16_t binary_object_count;
+@@ -2636,4 +2637,5 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
+     ctx = js_mallocz_rt(rt, sizeof(JSContext));
+     if (!ctx)
+         return NULL;
++    ctx->dynamic_code_enabled = TRUE;
+     js_rc(ctx)->ref_count = 1;
+@@ -2695,5 +2697,10 @@ void JS_SetContextOpaque(JSContext *ctx, void *opaque)
+ {
+     ctx->user_opaque = opaque;
+ }
++
++void JS_SetDynamicCodeEnabled(JSContext *ctx, JS_BOOL enabled)
++{
++    ctx->dynamic_code_enabled = enabled != 0;
++}
+ 
+ /* set the new value and free the old value after (freeing the value
+@@ -18462,3 +18469,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 sf->cur_pc = pc;
+                 if (js_same_value(ctx, call_argv[-1], ctx->eval_obj)) {
++                    if (unlikely(!ctx->dynamic_code_enabled)) {
++                        JS_ThrowTypeError(ctx, "dynamic code compilation disabled by Content Security Policy");
++                        goto exception;
++                    }
+                     if (call_argc >= 1)
+@@ -18492,3 +18503,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     goto exception;
+                 if (js_same_value(ctx, sp[-2], ctx->eval_obj)) {
++                    if (unlikely(!ctx->dynamic_code_enabled)) {
++                        free_arg_list(ctx, tab, len);
++                        JS_ThrowTypeError(ctx, "dynamic code compilation disabled by Content Security Policy");
++                        goto exception;
++                    }
+                     if (len >= 1)
+@@ -39997,5 +40013,7 @@ static JSValue js_global_eval(JSContext *ctx, JSValueConst this_val,
+ static JSValue js_global_eval(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+ {
++    if (unlikely(!ctx->dynamic_code_enabled))
++        return JS_ThrowTypeError(ctx, "dynamic code compilation disabled by Content Security Policy");
+     return JS_EvalObject(ctx, ctx->global_obj, argv[0], JS_EVAL_TYPE_INDIRECT, -1);
+ }
+@@ -41172,6 +41190,9 @@ static JSValue js_function_constructor(JSContext *ctx, JSValueConst new_target,
+     int i, n, ret;
+     JSValue s, proto, obj = JS_UNDEFINED;
+     StringBuffer b_s, *b = &b_s;
+ 
++    if (unlikely(!ctx->dynamic_code_enabled))
++        return JS_ThrowTypeError(ctx, "dynamic code compilation disabled by Content Security Policy");
++
+     string_buffer_init(ctx, b, 0);
+     string_buffer_putc8(b, '(');
+diff --git a/quickjs.h b/quickjs.h
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -393,3 +393,5 @@ JSContext *JS_DupContext(JSContext *ctx);
+ void *JS_GetContextOpaque(JSContext *ctx);
+ void JS_SetContextOpaque(JSContext *ctx, void *opaque);
++/* Host policy gate for page-originated eval and Function constructors. */
++void JS_SetDynamicCodeEnabled(JSContext *ctx, JS_BOOL enabled);
+ JSRuntime *JS_GetRuntime(JSContext *ctx);

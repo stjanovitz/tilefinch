@@ -1,0 +1,15 @@
+# Exercise the same geometry-directed path as the PSP d-pad. The diagnostic
+# values let the qualification script ratchet destinations without depending
+# on layout-local focus indices.
+focus-id searchIcon
+js 'spatial-start:'+(document.activeElement.id||document.activeElement.tagName)
+focus-right
+js 'spatial-right:'+(document.activeElement.id||document.activeElement.tagName)
+focus-down
+js 'spatial-down:'+(document.activeElement.id||document.activeElement.tagName)
+focus-left
+js 'spatial-left:'+(document.activeElement.id||document.activeElement.tagName)
+focus-up
+js 'spatial-up:'+(document.activeElement.id||document.activeElement.tagName)
+status
+quit

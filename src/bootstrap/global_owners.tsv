@@ -1,0 +1,11 @@
+# Standards-visible global	authoritative source
+AbortController	compat.js
+Blob	platform.js
+EventSource	compat.js
+FormData	platform.js
+Headers	compat.js
+Request	compat.js
+Response	compat.js
+URLSearchParams	platform.js
+WebSocket	compat.js
+XMLHttpRequest	compat.js

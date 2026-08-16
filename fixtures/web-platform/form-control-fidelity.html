@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Form control fidelity</title>
+<style>
+html,body{margin:0;background:#f5f6f8;color:#202124;font:14px Arial,sans-serif}
+main{padding:12px;display:grid;grid-template-columns:220px 220px;gap:12px 16px}
+section{display:grid;gap:8px;align-content:start}
+label{display:flex;align-items:center;gap:7px}
+input,button,select,textarea{font:inherit}
+.field,.select{box-sizing:border-box;width:220px;height:34px;border:1px solid #9aa0a6;
+  border-radius:8px;background:#fff;padding:6px 10px;color:#202124}
+.primary{box-sizing:border-box;width:104px;height:34px;border:0;border-radius:17px;
+  background:#1a73e8;color:white;padding:0 14px}
+textarea{box-sizing:border-box;width:220px;height:58px;border:1px solid #9aa0a6;
+  border-radius:8px;padding:7px 9px;resize:none}
+input[type=range]{width:180px}
+.disabled{opacity:.45}
+</style>
+<main>
+  <section>
+    <input class="field" placeholder="Search articles">
+    <select class="select"><option>Newest first</option></select>
+    <button class="primary">Continue</button>
+    <textarea>Two lines of editable text</textarea>
+  </section>
+  <section>
+    <label><input type="checkbox" checked> Email updates</label>
+    <label><input type="checkbox"> Remember choice</label>
+    <label><input type="radio" name="size" checked> Compact</label>
+    <label><input type="radio" name="size"> Comfortable</label>
+    <input type="range" min="0" max="100" value="62">
+    <input class="field disabled" disabled value="Unavailable">
+  </section>
+</main>

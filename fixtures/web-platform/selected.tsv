@@ -1,0 +1,6 @@
+# name	fixture	expected-summary
+dom-events	fixtures/web-platform/dom-events.html	wp-dom-events:PASS
+url-forms-storage	fixtures/web-platform/url-forms-storage.html	wp-url-forms-storage:PASS
+css-responsive	fixtures/web-platform/css-responsive.html	wp-css-responsive:PASS
+modern-mobile-css	fixtures/web-platform/modern-mobile-css.html	wp-modern-mobile-css:PASS
+mobile-overflow-sizing	fixtures/web-platform/mobile-overflow-sizing.html	wp-mobile-overflow-sizing:PASS

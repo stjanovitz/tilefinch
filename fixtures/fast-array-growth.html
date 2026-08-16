@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fast array growth probe</title>
+<main id="result">running</main>
+<script>
+(() => {
+  const values = [];
+  let checksum = 0;
+  for (let index = 0; index < 300000; index++) {
+    const value = index & 15;
+    values.push(value);
+    checksum = (checksum + value + index) | 0;
+  }
+  globalThis.retainedFastArray = values;
+  globalThis.pocSummary = `FAST-ARRAY-OK:${values.length}:${checksum}`;
+  document.querySelector('#result').textContent = globalThis.pocSummary;
+})();
+</script>

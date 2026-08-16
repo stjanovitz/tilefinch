@@ -1,0 +1,10 @@
+tilefinch-input-script: armed script=input-script.txt steps=8 stall-limit=1800
+tilefinch-input-script: step=0 action=home-activate setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=loading step=3 screen=page
+tilefinch-input-script: mark=loading step=3 screen=page
+tilefinch-input-script: mark=stopped step=6 screen=page
+tilefinch-input-script: covered action=home-activate count=1
+tilefinch-input-script: outcome=complete steps=7/8 frames=550 held-frames=2 actions=1 settings=0
+tilefinch-input-script: capture=loading written=1 size=240x136
+tilefinch-input-script: capture=cancel-ack written=1 size=240x136
+tilefinch-input-script: capture=stopped written=1 size=240x136

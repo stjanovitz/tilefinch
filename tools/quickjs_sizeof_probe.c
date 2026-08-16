@@ -1,0 +1,10 @@
+#include "quickjs.c"
+char probe_JSObject[sizeof(JSObject)];
+char probe_JSShape[sizeof(JSShape)];
+char probe_JSString[sizeof(JSString)];
+char probe_JSValue[sizeof(JSValue)];
+char probe_JSVarRef[sizeof(JSVarRef)];
+char probe_JSFunctionBytecode[sizeof(JSFunctionBytecode)];
+char probe_JSAtomStruct[sizeof(JSAtomStruct)];
+char probe_shape_prop[sizeof(JSShapeProperty)];
+char probe_prop[sizeof(JSProperty)];

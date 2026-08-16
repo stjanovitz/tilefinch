@@ -1,0 +1,38 @@
+<!doctype html>
+<html><head><title>Interactive laboratory</title>
+<style>
+body { background:#f7f7f8; color:#202123; padding:14px; font-size:16px }
+#status { display:block; margin-bottom:12px }
+input { width:260px; height:32px; margin-bottom:10px }
+#spacer { display:block; height:900px }
+</style></head><body>
+<p id="status">BOOT</p>
+<button id="toggle" type="button">Toggle status</button>
+<form action="/submit" method="post"><input id="editor" name="q" value="PSP" placeholder="Type here"><button name="send" value="Go">Send</button></form>
+<div id="spacer"></div><a id="next" href="/next">Next page</a>
+<script>
+globalThis.scriptOrder = ['inline-head'];
+localStorage.setItem('lab', 'ready');
+document.cookie = 'mode=interactive';
+const status = document.getElementById('status');
+document.getElementById('toggle').addEventListener('click', () => {
+  status.textContent = 'ACTIVATED';
+  status.setAttribute('data-activated', 'yes');
+});
+document.getElementById('editor').addEventListener('input', () => {
+  status.textContent = document.getElementById('editor').value;
+});
+setTimeout(() => status.setAttribute('data-timer', 'yes'), 20);
+</script>
+<script id="external" src="/external.js"></script>
+<script defer src="/external-defer.js"></script>
+<script async src="/external-async.js"></script>
+<script type="module" src="/external-module.js"></script>
+<script>
+scriptOrder.push('inline-tail');
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('status').setAttribute('data-order', scriptOrder.join(','));
+  globalThis.pocSummary = scriptOrder.join(',') + '|cookie=' + (globalThis.cookieTransport || 'no') + '|fetch=' + (globalThis.fetchTransport || 'no');
+});
+</script>
+</body></html>

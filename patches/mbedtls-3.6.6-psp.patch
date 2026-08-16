@@ -1,0 +1,40 @@
+diff --git a/library/entropy_poll.c b/library/entropy_poll.c
+index b65d402e3..37122a646 100644
+--- a/library/entropy_poll.c
++++ b/library/entropy_poll.c
+@@ -34 +34,2 @@
+-    !defined(__HAIKU__) && !defined(__midipix__) && !defined(__MVS__)
++    !defined(__HAIKU__) && !defined(__midipix__) && !defined(__MVS__) && \
++    !defined(__PSP__)
+@@ -149,0 +151,4 @@
++#if defined(__PSP__)
++#include <unistd.h>
++#endif
++
+@@ -159,0 +165,10 @@
++#if defined(__PSP__)
++    ((void) file);
++    ((void) read_len);
++    ((void) ret);
++    if (getentropy(output, len) != 0)
++        return MBEDTLS_ERR_ENTROPY_SOURCE_FAILED;
++    *olen = len;
++    return 0;
++#endif
++
+diff --git a/library/platform_util.c b/library/platform_util.c
+index 35a7eb804..fa29c75a5 100644
+--- a/library/platform_util.c
++++ b/library/platform_util.c
+@@ -241,0 +242,11 @@
++#elif defined(__PSP__)
++#include <sys/time.h>
++mbedtls_ms_time_t mbedtls_ms_time(void)
++{
++    struct timeval tv;
++    if (gettimeofday(&tv, NULL) != 0) {
++        return time(NULL) * 1000;
++    }
++    return (mbedtls_ms_time_t) tv.tv_sec * 1000
++         + (mbedtls_ms_time_t) tv.tv_usec / 1000;
++}

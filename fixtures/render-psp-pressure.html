@@ -1,0 +1,47 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Generic PSP render pressure</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 8px; background: #e9edf2; color: #17202a; }
+  h1 { margin: 0 0 8px; font: bold 20px serif; }
+  .panel {
+    height: 112px;
+    margin: 0 0 8px;
+    padding: 5px;
+    overflow: auto;
+    border: 2px solid #60758a;
+    border-radius: 12px;
+    background: #fff;
+  }
+  .row { display: flex; gap: 6px; min-height: 25px; padding: 3px 4px; }
+  .row:nth-child(odd) { background: #e5eff8; }
+  .label { flex: 0 0 72px; font-family: serif; font-style: italic; }
+  .value { flex: 1 1 auto; }
+  .strong { font-weight: bold; }
+</style>
+<h1>Bounded renderer pressure fixture</h1>
+<main id="cards"></main>
+<script>
+  const samples = [
+    'A quick brown fox jumps over 0123456789',
+    'Typography: !@#$%^&*() [] {} /?.,;:',
+    'Café naïve façade — generic Unicode',
+    'Compact layout remains readable while scrolling'
+  ];
+  let markup = '';
+  for (let panelIndex = 0; panelIndex < 18; panelIndex++) {
+    markup += '<section class="panel">';
+    for (let rowIndex = 0; rowIndex < 14; rowIndex++) {
+      const valueClass = rowIndex % 3 === 0 ? 'value strong' : 'value';
+      markup += '<div class="row" style="font-size:'
+        + (11 + (rowIndex % 9)) + 'px"><span class="label">P'
+        + (panelIndex + 1) + ' row ' + (rowIndex + 1)
+        + '</span><span class="' + valueClass + '">'
+        + samples[(panelIndex + rowIndex) % samples.length]
+        + '</span></div>';
+    }
+    markup += '</section>';
+  }
+  document.querySelector('#cards').innerHTML = markup;
+</script>

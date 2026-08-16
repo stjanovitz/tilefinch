@@ -1,0 +1,1 @@
+<!doctype html><title>Background images</title><style>html,body{margin:0}#hero{display:block;width:24px;height:24px}#tail{display:block;margin-top:600px;width:24px;height:24px}</style><body><img id=hero src=/hero.svg><img id=tail src=/tail.svg></body>

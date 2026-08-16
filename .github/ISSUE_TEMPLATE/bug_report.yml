@@ -1,0 +1,47 @@
+name: Bug report
+description: Something misbehaved in Tilefinch
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check [TROUBLESHOOTING.md](https://github.com/stjanovitz/tilefinch/blob/main/TROUBLESHOOTING.md)
+        first — several common problems (Wi-Fi profiles, memory limits, update
+        recovery) have known answers there. For suspected security problems,
+        read [SECURITY.md](https://github.com/stjanovitz/tilefinch/blob/main/SECURITY.md)
+        for what the project protects and how to report.
+  - type: input
+    id: device
+    attributes:
+      label: Device and firmware
+      description: PSP model and custom firmware, or the emulator/host lab
+      placeholder: "PSP-3000, ARK-4 (or: PPSSPP 1.19 / desktop lab)"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tilefinch version
+      description: Shown in Options → Version / Update
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: Site or URL
+      description: Where it happened, if a page was involved
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you pressed, what you expected, and what occurred instead
+    validations:
+      required: true
+  - type: textarea
+    id: crash
+    attributes:
+      label: Crash record
+      description: >-
+        If the browser crashed, paste the contents of
+        PSP/GAME/TILEFINCH/data/tilefinch-crash.txt from the Memory Stick.
+        A 512-byte file of zeros means no crash was recorded.

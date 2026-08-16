@@ -1,0 +1,7 @@
+diff --git a/lib/http2.c b/lib/http2.c
+index 3e1f5866f..0d1b6c754 100644
+--- a/lib/http2.c
++++ b/lib/http2.c
+@@ -167 +167 @@
+-static void h2_stream_hash_free(unsigned int id, void *stream)
++static void h2_stream_hash_free(uint32_t id, void *stream)

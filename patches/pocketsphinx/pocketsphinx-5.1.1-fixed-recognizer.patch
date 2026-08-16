@@ -1,0 +1,956 @@
+--- a/src/bin_mdef.h
++++ b/src/bin_mdef.h
+@@ -142,6 +142,10 @@
+ 
+ 	/** Allocation mode for this object. */
+ 	enum { BIN_MDEF_FROM_TEXT, BIN_MDEF_IN_MEMORY, BIN_MDEF_ON_DISK } alloc_mode;
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++	/** Lookup-only CD data was streamed and discarded during load. */
++	int fixed_runtime;
++#endif
+ };
+ 
+ #define bin_mdef_is_fillerphone(m,p)	(((p) < (m)->n_ciphone) \
+@@ -170,6 +174,13 @@
+ POCKETSPHINX_EXPORT
+ bin_mdef_t *bin_mdef_read(ps_config_t *config, const char *filename);
+ 
++/*
++ * Discard lookup-only triphone data after a fixed dictionary and its search
++ * structures have been built. The remaining CI-phone records and senone
++ * sequences are sufficient for decoding, but no more words may be added.
++ */
++int bin_mdef_compact_runtime(bin_mdef_t *m);
++
+ /**
+  * Read a text mdef from a file (creating an in-memory binary mdef).
+  */
+--- a/src/bin_mdef.c
++++ b/src/bin_mdef.c
+@@ -47,6 +47,9 @@
+  *********************************************************************/
+ 
+ #include <stdio.h>
++#ifndef __PSP__
++#include <stdlib.h>
++#endif
+ #include <string.h>
+ #include <assert.h>
+ 
+@@ -266,6 +269,55 @@
+ {
+     ++m->refcnt;
+     return m;
++}
++
++int
++bin_mdef_compact_runtime(bin_mdef_t *m)
++{
++    char *base, *shrunk;
++    size_t names_bytes, phone_offset, phone_bytes;
++    size_t sseq_offset, sseq_count, total_bytes;
++    int i;
++
++    if (m == NULL)
++        return -1;
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    if (m->fixed_runtime)
++        return 0;
++#endif
++    if (m->alloc_mode != BIN_MDEF_IN_MEMORY
++        || m->n_emit_state <= 0 || m->ciname == NULL
++        || m->ciname[0] == NULL || m->phone == NULL
++        || m->sseq == NULL || m->sseq[0] == NULL)
++        return -1;
++
++    base = m->ciname[0];
++    names_bytes = (size_t)(m->ciname[m->n_ciphone - 1] - base)
++        + strlen(m->ciname[m->n_ciphone - 1]) + 1;
++    phone_offset = (names_bytes + sizeof(int32) - 1)
++        & ~(sizeof(int32) - 1);
++    phone_bytes = (size_t)m->n_ciphone * sizeof(*m->phone);
++    sseq_offset = phone_offset + phone_bytes;
++    sseq_count = (size_t)m->n_sseq * (size_t)m->n_emit_state;
++    total_bytes = sseq_offset + sseq_count * sizeof(**m->sseq);
++
++    memmove(base + phone_offset, m->phone, phone_bytes);
++    memmove(base + sseq_offset, m->sseq[0],
++            sseq_count * sizeof(**m->sseq));
++    shrunk = ckd_realloc(base, total_bytes);
++    if (shrunk == NULL)
++        return -1;
++
++    m->ciname[0] = shrunk;
++    for (i = 1; i < m->n_ciphone; ++i)
++        m->ciname[i] = m->ciname[i - 1] + strlen(m->ciname[i - 1]) + 1;
++    m->phone = (mdef_entry_t *)(shrunk + phone_offset);
++    m->cd_tree = NULL;
++    m->n_cd_tree = 0;
++    m->sseq[0] = (uint16 *)(shrunk + sseq_offset);
++    for (i = 1; i < m->n_sseq; ++i)
++        m->sseq[i] = m->sseq[0] + i * m->n_emit_state;
++    return 0;
+ }
+ 
+ int
+@@ -318,6 +370,144 @@
+     "int16 sseq[];       /**< Unique senone sequences */\n"
+     "int8 sseq_len[];    /**< Number of states in each sseq (none if homogeneous) */\n"
+     "END FILE FORMAT DESCRIPTION\n";
++
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++static bin_mdef_t *
++bin_mdef_read_fixed(FILE *fh, bin_mdef_t *m, const char *filename, int swap)
++{
++    long names_start, names_end, phone_start, sseq_start;
++    int32 original_n_phone, sseq_count;
++    size_t names_bytes;
++    int i;
++
++    if (m->n_emit_state != 3 || m->n_ciphone <= 0
++        || m->n_ciphone > 255 || m->n_phone < m->n_ciphone
++        || m->n_sseq <= 0 || m->n_sen <= 0) {
++        E_ERROR("Fixed recognizer requires a homogeneous three-state mdef\n");
++        return NULL;
++    }
++
++    names_start = ftell(fh);
++    for (i = 0; i < m->n_ciphone; ++i) {
++        int ch;
++        do {
++            ch = fgetc(fh);
++            if (ch == EOF) {
++                E_ERROR("Truncated CI-phone names in %s\n", filename);
++                return NULL;
++            }
++        } while (ch != '\0');
++    }
++    names_end = ftell(fh);
++    names_bytes = (size_t)(names_end - names_start);
++    phone_start = (names_end + 3L) & ~3L;
++    phone_start += (long)m->n_cd_tree * (long)sizeof(cd_tree_t);
++    original_n_phone = m->n_phone;
++    sseq_start = phone_start
++        + (long)original_n_phone * (long)sizeof(mdef_entry_t);
++
++    m->ciname = ckd_calloc(m->n_ciphone, sizeof(*m->ciname));
++    m->ciname[0] = ckd_malloc(names_bytes);
++    if (fseek(fh, names_start, SEEK_SET) != 0
++        || fread(m->ciname[0], 1, names_bytes, fh) != names_bytes) {
++        E_ERROR("Failed to read CI-phone names from %s\n", filename);
++        return NULL;
++    }
++    for (i = 1; i < m->n_ciphone; ++i)
++        m->ciname[i] = m->ciname[i - 1]
++            + strlen(m->ciname[i - 1]) + 1;
++
++    m->phone = ckd_calloc(m->n_ciphone, sizeof(*m->phone));
++    if (fseek(fh, phone_start, SEEK_SET) != 0
++        || fread(m->phone, sizeof(*m->phone), m->n_ciphone, fh)
++           != (size_t)m->n_ciphone) {
++        E_ERROR("Failed to read CI-phone records from %s\n", filename);
++        return NULL;
++    }
++    if (swap) {
++        for (i = 0; i < m->n_ciphone; ++i) {
++            SWAP_INT32(&m->phone[i].ssid);
++            SWAP_INT32(&m->phone[i].tmat);
++        }
++    }
++
++    if (fseek(fh, sseq_start, SEEK_SET) != 0
++        || fread(&sseq_count, sizeof(sseq_count), 1, fh) != 1) {
++        E_ERROR("Failed to locate senone sequences in %s\n", filename);
++        return NULL;
++    }
++    if (swap)
++        SWAP_INT32(&sseq_count);
++    if (sseq_count != m->n_sseq * m->n_emit_state) {
++        E_ERROR("Unexpected senone-sequence size %d in %s\n",
++                sseq_count, filename);
++        return NULL;
++    }
++    m->sseq = ckd_calloc(m->n_sseq, sizeof(*m->sseq));
++    m->sseq[0] = ckd_malloc((size_t)sseq_count * sizeof(**m->sseq));
++    if (fread(m->sseq[0], sizeof(**m->sseq), sseq_count, fh)
++        != (size_t)sseq_count) {
++        E_ERROR("Failed to read senone sequences from %s\n", filename);
++        return NULL;
++    }
++    if (swap) {
++        for (i = 0; i < sseq_count; ++i)
++            SWAP_INT16(m->sseq[0] + i);
++    }
++    for (i = 1; i < m->n_sseq; ++i)
++        m->sseq[i] = m->sseq[0] + i * m->n_emit_state;
++
++    m->cd2cisen = ckd_malloc((size_t)m->n_sen * sizeof(*m->cd2cisen));
++    m->sen2cimap = ckd_malloc((size_t)m->n_sen * sizeof(*m->sen2cimap));
++    for (i = 0; i < m->n_ci_sen; ++i)
++        m->cd2cisen[i] = i;
++    for (; i < m->n_sen; ++i)
++        m->cd2cisen[i] = -1;
++    for (i = 0; i < m->n_sen; ++i)
++        m->sen2cimap[i] = -1;
++
++    if (fseek(fh, phone_start, SEEK_SET) != 0)
++        return NULL;
++    for (i = 0; i < original_n_phone; ++i) {
++        mdef_entry_t phone;
++        int32 j, ssid, ci;
++        if (fread(&phone, sizeof(phone), 1, fh) != 1) {
++            E_ERROR("Truncated phone records in %s\n", filename);
++            return NULL;
++        }
++        if (swap) {
++            int32 swapped_ssid = phone.ssid;
++            int32 swapped_tmat = phone.tmat;
++            SWAP_INT32(&swapped_ssid);
++            SWAP_INT32(&swapped_tmat);
++            phone.ssid = swapped_ssid;
++            phone.tmat = swapped_tmat;
++        }
++        ssid = phone.ssid;
++        ci = i < m->n_ciphone ? i : phone.info.cd.ctx[0];
++        if (ssid < 0 || ssid >= m->n_sseq || ci < 0 || ci >= m->n_ciphone) {
++            E_ERROR("Invalid compact phone mapping in %s\n", filename);
++            return NULL;
++        }
++        for (j = 0; j < m->n_emit_state; ++j) {
++            int sen = m->sseq[ssid][j];
++            if (sen < 0 || sen >= m->n_sen)
++                return NULL;
++            if (m->sen2cimap[sen] == -1)
++                m->sen2cimap[sen] = ci;
++            m->cd2cisen[sen] = m->sseq[m->phone[ci].ssid][j];
++        }
++    }
++
++    m->n_phone = m->n_ciphone;
++    m->n_cd_tree = 0;
++    m->cd_tree = NULL;
++    m->sil = bin_mdef_ciphone_id(m, S3_SILENCE_CIPHONE);
++    m->alloc_mode = BIN_MDEF_FROM_TEXT;
++    m->fixed_runtime = 1;
++    return m;
++}
++#endif
+ 
+ bin_mdef_t *
+ bin_mdef_read(ps_config_t *config, const char *filename)
+@@ -395,6 +585,22 @@
+     FREAD_SWAP32_CHK(&m->n_ctx);
+     FREAD_SWAP32_CHK(&m->n_cd_tree);
+     FREAD_SWAP32_CHK(&m->sil);
++
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++#ifdef __PSP__
++    {
++#else
++    if (getenv("TILEFINCH_DISABLE_DIRECT_MODEL") == NULL) {
++#endif
++        if (bin_mdef_read_fixed(fh, m, filename, swap) == NULL) {
++            fclose(fh);
++            bin_mdef_free(m);
++            return NULL;
++        }
++        fclose(fh);
++        return m;
++    }
++#endif
+ 
+     /* CI names are first in the file. */
+     m->ciname = ckd_calloc(m->n_ciphone, sizeof(*m->ciname));
+--- a/src/dict.h
++++ b/src/dict.h
+@@ -100,7 +100,10 @@
+     s3cipid_t *phone_arena;
+     size_t phone_arena_count;
+     size_t phone_arena_used;
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    char *fixed_map_path;
+ #endif
++#endif
+ } dict_t;
+ 
+ 
+--- a/src/dict.c
++++ b/src/dict.c
+@@ -423,6 +423,13 @@
+      */
+     d = (dict_t *) ckd_calloc(1, sizeof(dict_t));       /* freed in dict_free() */
+     d->refcnt = 1;
++#if defined(TILEFINCH_PACKED_LEXICON) && defined(TILEFINCH_FIXED_RECOGNIZER)
++    if (dictfile) {
++        d->fixed_map_path = ckd_malloc(strlen(dictfile) + sizeof(".tilefinch"));
++        strcpy(d->fixed_map_path, dictfile);
++        strcat(d->fixed_map_path, ".tilefinch");
++    }
++#endif
+     if (n >= MAX_S3WID) {
+         E_ERROR("Number of words in dictionaries (%d) exceeds limit (%d)\n", n,
+                 MAX_S3WID);
+@@ -544,7 +551,7 @@
+     assert(d);
+     assert(word);
+ 
+-    if (hash_table_lookup_int32(d->ht, word, &w) < 0)
++    if (d->ht == NULL || hash_table_lookup_int32(d->ht, word, &w) < 0)
+         return (BAD_S3WID);
+     return w;
+ }
+@@ -639,7 +646,10 @@
+ #ifdef TILEFINCH_PACKED_LEXICON
+     ckd_free(d->phone_arena);
+     ckd_free(d->word_arena);
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    ckd_free(d->fixed_map_path);
+ #endif
++#endif
+     if (d->word)
+         ckd_free((void *) d->word);
+     if (d->ht)
+--- a/src/dict2pid.h
++++ b/src/dict2pid.h
+@@ -105,9 +105,14 @@
+                                    single-phone base x lc combinations in current vocabulary */
+ 
+     xwdssid_t **lrssid;          /**< Left-Right context state sequence id table 
+-                                    First dimension: base phone,
+-                                    Second dimension: left context. 
++                                   First dimension: base phone,
++                                   Second dimension: left context. 
+                                  */
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    s3ssid_t *internal_ssid;
++    int32 *internal_offset;
++    int32 internal_count;
++#endif
+ } dict2pid_t;
+ 
+ /** Access macros; not designed for arbitrary use */
+--- a/src/dict2pid.c
++++ b/src/dict2pid.c
+@@ -43,7 +43,38 @@
+ #include "dict2pid.h"
+ #include "hmm.h"
+ 
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++#define TILEFINCH_D2P_VERSION 1U
++static const char tilefinch_d2p_magic[8] = {
++    'T', 'F', 'D', '2', 'P', '\r', '\n', '\0'
++};
+ 
++static uint64
++dict2pid_fixed_fingerprint(dict_t *dict)
++{
++    uint64 hash = UINT64_C(1469598103934665603);
++    int32 w, p;
++    for (w = 0; w < dict_size(dict); ++w) {
++        const unsigned char *text =
++            (const unsigned char *)dict_wordstr(dict, w);
++        while (*text != '\0') {
++            hash ^= *text++;
++            hash *= UINT64_C(1099511628211);
++        }
++        hash ^= 0xffU;
++        hash *= UINT64_C(1099511628211);
++        hash ^= (uint32)dict_pronlen(dict, w);
++        hash *= UINT64_C(1099511628211);
++        for (p = 0; p < dict_pronlen(dict, w); ++p) {
++            hash ^= (uint32)dict_pron(dict, w, p);
++            hash *= UINT64_C(1099511628211);
++        }
++    }
++    return hash;
++}
++#endif
++
++
+ /**
+  * @file dict2pid.c - dictionary word to senone sequence mappings
+  */
+@@ -366,10 +397,8 @@
+     return 0;
+ }
+ 
+-s3ssid_t
+-dict2pid_internal(dict2pid_t *d2p,
+-                  int32 wid,
+-                  int pos)
++static s3ssid_t
++dict2pid_internal_lookup(dict2pid_t *d2p, int32 wid, int pos)
+ {
+     int b, l, r, p;
+     dict_t *dict = d2p->dict;
+@@ -385,8 +414,128 @@
+                                   (s3cipid_t) l, (s3cipid_t) r,
+                                   WORD_POSN_INTERNAL);
+     return bin_mdef_pid2ssid(mdef, p);
++}
++
++s3ssid_t
++dict2pid_internal(dict2pid_t *d2p,
++                  int32 wid,
++                  int pos)
++{
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    if (d2p->internal_ssid != NULL && d2p->internal_offset != NULL
++        && wid >= 0 && wid < dict_size(d2p->dict)
++        && pos >= 0 && pos < dict_pronlen(d2p->dict, wid))
++        return d2p->internal_ssid[d2p->internal_offset[wid] + pos];
++#endif
++    return dict2pid_internal_lookup(d2p, wid, pos);
+ }
+ 
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++static int
++dict2pid_read_fixed_array(FILE *fp, void *data, size_t count, size_t width)
++{
++    return count == 0 || fread(data, width, count, fp) == count;
++}
++
++static dict2pid_t *
++dict2pid_read_fixed(bin_mdef_t *mdef, dict_t *dict)
++{
++    char magic[sizeof(tilefinch_d2p_magic)];
++    uint32 version = 0, n_ci = 0, n_words = 0, internal_count = 0;
++    uint64 fingerprint = 0;
++    dict2pid_t *d2p = NULL;
++    FILE *fp = NULL;
++    int32 b, l;
++    size_t cube_count;
++
++    if (dict->fixed_map_path == NULL
++        || (fp = fopen(dict->fixed_map_path, "rb")) == NULL) {
++        E_ERROR_SYSTEM("Missing fixed recognizer map %s",
++                       dict->fixed_map_path ? dict->fixed_map_path : "(null)");
++        return NULL;
++    }
++#define TF_READ_ONE(value) \
++    (fread(&(value), sizeof(value), 1, fp) == 1)
++    if (fread(magic, 1, sizeof(magic), fp) != sizeof(magic)
++        || memcmp(magic, tilefinch_d2p_magic, sizeof(magic)) != 0
++        || !TF_READ_ONE(version) || !TF_READ_ONE(n_ci)
++        || !TF_READ_ONE(n_words) || !TF_READ_ONE(internal_count)
++        || !TF_READ_ONE(fingerprint)
++        || version != TILEFINCH_D2P_VERSION
++        || n_ci != (uint32)bin_mdef_n_ciphone(mdef)
++        || n_words != (uint32)dict_size(dict)
++        || fingerprint != dict2pid_fixed_fingerprint(dict)
++        || internal_count > (UINT32_C(1) << 24)) {
++        E_ERROR("Fixed recognizer map mismatch v=%u ci=%u/%d words=%u/%d "
++                "internal=%u fingerprint=%llu/%llu\n",
++                version, n_ci, bin_mdef_n_ciphone(mdef),
++                n_words, dict_size(dict), internal_count,
++                (unsigned long long)fingerprint,
++                (unsigned long long)dict2pid_fixed_fingerprint(dict));
++        fclose(fp);
++        return NULL;
++    }
++#undef TF_READ_ONE
++
++    d2p = ckd_calloc(1, sizeof(*d2p));
++    d2p->refcount = 1;
++    d2p->mdef = bin_mdef_retain(mdef);
++    d2p->dict = dict_retain(dict);
++    cube_count = (size_t)n_ci * n_ci * n_ci;
++    d2p->ldiph_lc = (s3ssid_t ***)ckd_calloc_3d(
++        n_ci, n_ci, n_ci, sizeof(s3ssid_t));
++    if (!dict2pid_read_fixed_array(
++            fp, d2p->ldiph_lc[0][0], cube_count, sizeof(s3ssid_t)))
++        goto error_out;
++
++    d2p->rssid = ckd_calloc(n_ci, sizeof(*d2p->rssid));
++    for (b = 0; b < (int32)n_ci; ++b) {
++        d2p->rssid[b] = ckd_calloc(n_ci, sizeof(*d2p->rssid[b]));
++        for (l = 0; l < (int32)n_ci; ++l) {
++            uint8 count;
++            xwdssid_t *entry = &d2p->rssid[b][l];
++            if (fread(&count, sizeof(count), 1, fp) != 1 || count > n_ci)
++                goto error_out;
++            entry->n_ssid = count;
++            if (count == 0)
++                continue;
++            entry->ssid = ckd_calloc(count, sizeof(*entry->ssid));
++            entry->cimap = ckd_calloc(n_ci, sizeof(*entry->cimap));
++            if (!dict2pid_read_fixed_array(
++                    fp, entry->ssid, count, sizeof(*entry->ssid))
++                || !dict2pid_read_fixed_array(
++                    fp, entry->cimap, n_ci, sizeof(*entry->cimap)))
++                goto error_out;
++        }
++    }
++
++    d2p->internal_count = (int32)internal_count;
++    d2p->internal_offset = ckd_calloc(
++        (size_t)n_words + 1, sizeof(*d2p->internal_offset));
++    d2p->internal_ssid = ckd_calloc(
++        internal_count, sizeof(*d2p->internal_ssid));
++    if (!dict2pid_read_fixed_array(
++            fp, d2p->internal_offset, (size_t)n_words + 1,
++            sizeof(*d2p->internal_offset))
++        || !dict2pid_read_fixed_array(
++            fp, d2p->internal_ssid, internal_count,
++            sizeof(*d2p->internal_ssid))
++        || fgetc(fp) != EOF
++        || d2p->internal_offset[n_words] != (int32)internal_count) {
++        goto error_out;
++    }
++    fclose(fp);
++    return d2p;
++
++error_out:
++    E_ERROR("Truncated or invalid fixed recognizer map %s\n",
++            dict->fixed_map_path);
++    fclose(fp);
++    dict2pid_free(d2p);
++    return NULL;
++}
++#endif
++
+ dict2pid_t *
+ dict2pid_build(bin_mdef_t * mdef, dict_t * dict)
+ {
+@@ -400,6 +549,11 @@
+     assert(mdef);
+     assert(dict);
+ 
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    if (mdef->fixed_runtime)
++        return dict2pid_read_fixed(mdef, dict);
++#endif
++
+     dict2pid = (dict2pid_t *) ckd_calloc(1, sizeof(dict2pid_t));
+     dict2pid->refcount = 1;
+     dict2pid->mdef = bin_mdef_retain(mdef);
+@@ -495,6 +649,29 @@
+ 
+     ckd_free_3d(rdiph_rc);
+ 
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    dict2pid->internal_offset = ckd_calloc(
++        (size_t)dict_size(dict) + 1, sizeof(*dict2pid->internal_offset));
++    for (w = 0; w < dict_size(dict); ++w) {
++        pronlen = dict_pronlen(dict, w);
++        dict2pid->internal_offset[w + 1]
++            = dict2pid->internal_offset[w] + pronlen;
++    }
++    dict2pid->internal_count = dict2pid->internal_offset[dict_size(dict)];
++    dict2pid->internal_ssid = ckd_calloc(
++        dict2pid->internal_count, sizeof(*dict2pid->internal_ssid));
++    for (w = 0; w < dict_size(dict); ++w) {
++        pronlen = dict_pronlen(dict, w);
++        for (p = 0; p < pronlen; ++p) {
++            s3ssid_t ssid = BAD_S3SSID;
++            if (p > 0 && p + 1 < pronlen)
++                ssid = dict2pid_internal_lookup(dict2pid, w, p);
++            dict2pid->internal_ssid[
++                dict2pid->internal_offset[w] + p] = ssid;
++        }
++    }
++#endif
++
+     return dict2pid;
+ }
+ 
+@@ -524,6 +701,10 @@
+ 
+     if (d2p->lrssid)
+         free_compress_map(d2p->lrssid, bin_mdef_n_ciphone(d2p->mdef));
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    ckd_free(d2p->internal_ssid);
++    ckd_free(d2p->internal_offset);
++#endif
+ 
+     bin_mdef_free(d2p->mdef);
+     dict_free(d2p->dict);
+--- a/src/lm/lm_trie_quant.c
++++ b/src/lm/lm_trie_quant.c
+@@ -36,6 +36,7 @@
+  */
+ 
+ #include <math.h>
++#include <stdlib.h>
+ 
+ #include <pocketsphinx/prim_type.h>
+ #include <pocketsphinx/err.h>
+@@ -52,6 +53,12 @@
+ typedef struct bins_s {
+     float32 *begin;
+     const float32 *end;
++#ifdef TILEFINCH_COMPACT_LM_QUANT
++    uint16 *run_starts;
++    float32 *run_values;
++    size_t run_count;
++    size_t count;
++#endif
+ } bins_t;
+ 
+ struct lm_trie_quant_s {
+@@ -70,6 +77,9 @@
+ {
+     bins->begin = begin;
+     bins->end = bins->begin + (1ULL << bits);
++#ifdef TILEFINCH_COMPACT_LM_QUANT
++    bins->count = (size_t)1U << bits;
++#endif
+ }
+ 
+ static float32 *
+@@ -97,6 +107,30 @@
+ static uint64
+ bins_encode(bins_t * bins, float32 value)
+ {
++#ifdef TILEFINCH_COMPACT_LM_QUANT
++    if (bins->run_count != 0) {
++        size_t first = 0, count = bins->run_count;
++        while (count > 0) {
++            size_t step = count / 2;
++            size_t at = first + step;
++            if (bins->run_values[at] < value) {
++                first = at + 1;
++                count -= step + 1;
++            }
++            else {
++                count = step;
++            }
++        }
++        if (first == 0)
++            return bins->run_starts[0];
++        if (first == bins->run_count)
++            return bins->run_starts[bins->run_count - 1];
++        if (value - bins->run_values[first - 1]
++            < bins->run_values[first] - value)
++            --first;
++        return bins->run_starts[first];
++    }
++#endif
+     float32 *above = lower_bound(bins->begin, bins->end, value);
+     if (above == bins->begin)
+         return 0;
+@@ -108,9 +142,78 @@
+ static float32
+ bins_decode(bins_t * bins, size_t off)
+ {
++#ifdef TILEFINCH_COMPACT_LM_QUANT
++    if (bins->run_count != 0) {
++        size_t first = 0;
++        size_t count = bins->run_count;
++        while (count > 1) {
++            size_t step = count / 2;
++            size_t at = first + step;
++            if (bins->run_starts[at] <= off) {
++                first = at;
++                count -= step;
++            }
++            else {
++                count = step;
++            }
++        }
++        return bins->run_values[first];
++    }
++#endif
+     return bins->begin[off];
+ }
+ 
++#ifdef TILEFINCH_COMPACT_LM_QUANT
++static int
++bins_read_compact(FILE *fp, bins_t *bins, uint8 bits)
++{
++    long start = ftell(fp);
++    size_t count = (size_t)1U << bits;
++    size_t runs = 0;
++    size_t i;
++    uint32 previous = 0;
++    float32 value;
++
++    for (i = 0; i < count; ++i) {
++        uint32 bits;
++        if (fread(&value, sizeof(value), 1, fp) != 1)
++            return -1;
++        if (SWAP_LM_TRIE)
++            SWAP_FLOAT32(&value);
++        memcpy(&bits, &value, sizeof(bits));
++        if (i == 0 || bits != previous)
++            ++runs;
++        previous = bits;
++    }
++    bins->run_starts = (uint16 *)ckd_calloc(
++        runs, sizeof(*bins->run_starts));
++    bins->run_values = (float32 *)ckd_calloc(
++        runs, sizeof(*bins->run_values));
++    if (bins->run_starts == NULL || bins->run_values == NULL)
++        return -1;
++    if (fseek(fp, start, SEEK_SET) != 0)
++        return -1;
++    runs = 0;
++    for (i = 0; i < count; ++i) {
++        uint32 bits;
++        if (fread(&value, sizeof(value), 1, fp) != 1)
++            return -1;
++        if (SWAP_LM_TRIE)
++            SWAP_FLOAT32(&value);
++        memcpy(&bits, &value, sizeof(bits));
++        if (i == 0 || bits != previous) {
++            bins->run_starts[runs] = (uint16)i;
++            bins->run_values[runs] = value;
++            ++runs;
++        }
++        previous = bits;
++    }
++    bins->run_count = runs;
++    bins->count = count;
++    return 0;
++}
++#endif
++
+ static size_t
+ quant_size(int order)
+ {
+@@ -158,6 +261,48 @@
+     lm_trie_quant_t *quant;
+ 
+     fread(&dummy, sizeof(dummy), 1, fp);
++#ifdef TILEFINCH_COMPACT_LM_QUANT
++    {
++        int i;
++#ifndef __PSP__
++        if (getenv("TILEFINCH_DISABLE_COMPACT_LM") != NULL) {
++            quant = lm_trie_quant_create(order);
++            if (fread(quant->values, sizeof(*quant->values),
++                      quant->nvalues, fp) != quant->nvalues) {
++                lm_trie_quant_free(quant);
++                return NULL;
++            }
++            if (SWAP_LM_TRIE) {
++                size_t at;
++                for (at = 0; at < quant->nvalues; ++at)
++                    SWAP_FLOAT32(&quant->values[at]);
++            }
++            return quant;
++        }
++#endif
++        quant = (lm_trie_quant_t *)ckd_calloc(1, sizeof(*quant));
++        quant->nvalues = quant_size(order);
++        quant->prob_bits = 16;
++        quant->bo_bits = 16;
++        quant->prob_mask = (1U << quant->prob_bits) - 1;
++        quant->bo_mask = (1U << quant->bo_bits) - 1;
++        for (i = 0; i < order - 2; ++i) {
++            if (bins_read_compact(
++                    fp, &quant->tables[i][0], quant->prob_bits) < 0
++                || bins_read_compact(
++                    fp, &quant->tables[i][1], quant->bo_bits) < 0) {
++                lm_trie_quant_free(quant);
++                return NULL;
++            }
++        }
++        quant->longest = &quant->tables[order - 2][0];
++        if (bins_read_compact(fp, quant->longest, quant->prob_bits) < 0) {
++            lm_trie_quant_free(quant);
++            return NULL;
++        }
++        return quant;
++    }
++#else
+     quant = lm_trie_quant_create(order);
+     if (fread(quant->values, sizeof(*quant->values),
+               quant->nvalues, fp) != quant->nvalues) {
+@@ -171,8 +316,8 @@
+         for (i = 0; i < quant->nvalues; ++i)
+             SWAP_FLOAT32(&quant->values[i]);
+     }
+-
+     return quant;
++#endif
+ }
+ 
+ void
+@@ -181,6 +326,28 @@
+     /* Before it was quantization type */
+     int dummy = 1;
+     fwrite(&dummy, sizeof(dummy), 1, fp);
++#ifdef TILEFINCH_COMPACT_LM_QUANT
++    if (quant->values == NULL) {
++        int i;
++        for (i = 0; i < NGRAM_MAX_ORDER - 1; ++i) {
++            int j;
++            for (j = 0; j < 2; ++j) {
++                bins_t *bins = &quant->tables[i][j];
++                size_t at;
++                if (bins->count == 0)
++                    continue;
++                for (at = 0; at < bins->count; ++at) {
++                    float32 value = bins_decode(bins, at);
++                    if (SWAP_LM_TRIE)
++                        SWAP_FLOAT32(&value);
++                    if (fwrite(&value, sizeof(value), 1, fp) != 1)
++                        return;
++                }
++            }
++        }
++        return;
++    }
++#endif
+     if (SWAP_LM_TRIE) {
+         size_t i;
+         for (i = 0; i < quant->nvalues; ++i) {
+@@ -204,6 +371,16 @@
+ void
+ lm_trie_quant_free(lm_trie_quant_t * quant)
+ {
++#ifdef TILEFINCH_COMPACT_LM_QUANT
++    int i;
++    int j;
++    for (i = 0; i < NGRAM_MAX_ORDER - 1; ++i) {
++        for (j = 0; j < 2; ++j) {
++            ckd_free(quant->tables[i][j].run_starts);
++            ckd_free(quant->tables[i][j].run_values);
++        }
++    }
++#endif
+     if (quant->values)
+         ckd_free(quant->values);
+     ckd_free(quant);
+--- a/src/lm/ngram_model_internal.h
++++ b/src/lm/ngram_model_internal.h
+@@ -70,6 +70,9 @@
+     int32 log_zero;     /**< Zero probability, cached here for quick lookup */
+     char **word_str;    /**< Unigram names */
+     hash_table_t *wid;  /**< Mapping of unigram names to word IDs. */
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    int32 fixed_unknown_wid;
++#endif
+     int32 *tmp_wids;    /**< Temporary array of word IDs for ngram_model_get_ngram() */
+     struct ngram_class_s **classes; /**< Word class definitions. */
+     struct ngram_funcs_s *funcs;   /**< Implementation-specific methods. */
+--- a/src/lm/ngram_model.c
++++ b/src/lm/ngram_model.c
+@@ -217,6 +217,9 @@
+     base->refcount = 1;
+     base->funcs = funcs;
+     base->n = n;
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    base->fixed_unknown_wid = NGRAM_INVALID_WID;
++#endif
+     /* If this was previously initialized... */
+     if (base->n_counts == NULL)
+         base->n_counts = (uint32 *) ckd_calloc(n, sizeof(*base->n_counts));
+@@ -564,6 +567,10 @@
+ {
+     int32 val;
+ 
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    if (model->wid == NULL)
++        return model->fixed_unknown_wid;
++#endif
+     /* FIXME: This could be memoized for speed if necessary. */
+     /* Look up <UNK>, if not found return NGRAM_INVALID_WID. */
+     if (hash_table_lookup_int32(model->wid, "<UNK>", &val) == -1)
+--- a/src/ngram_search.c
++++ b/src/ngram_search.c
+@@ -49,6 +49,7 @@
+ #include "ngram_search.h"
+ #include "ngram_search_fwdtree.h"
+ #include "ngram_search_fwdflat.h"
++#include "lm/ngram_model_internal.h"
+ 
+ static int ngram_search_start(ps_search_t *search);
+ static int ngram_search_step(ps_search_t *search, int frame_idx);
+@@ -71,6 +72,30 @@
+ };
+ 
+ static ngram_model_t *default_lm;
++
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++static void
++tilefinch_release_fixed_lm_lookup(ngram_model_t *model)
++{
++    int32 i;
++    int32 unknown = NGRAM_INVALID_WID;
++
++    if (model == NULL)
++        return;
++    if (model->wid != NULL)
++        (void)hash_table_lookup_int32(model->wid, "<UNK>", &unknown);
++    model->fixed_unknown_wid = unknown;
++    if (model->writable && model->word_str != NULL) {
++        for (i = 0; i < model->n_words; ++i)
++            ckd_free(model->word_str[i]);
++    }
++    ckd_free(model->word_str);
++    model->word_str = NULL;
++    hash_table_free(model->wid);
++    model->wid = NULL;
++    model->writable = FALSE;
++}
++#endif
+ 
+ static void
+ ngram_search_update_widmap(ngram_search_t *ngs)
+@@ -204,6 +229,10 @@
+ 
+     /* Create word mappings. */
+     ngram_search_update_widmap(ngs);
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    tilefinch_release_fixed_lm_lookup(ngs->lmset);
++    tilefinch_release_fixed_lm_lookup(lm);
++#endif
+ 
+     /* Initialize fwdtree, fwdflat, bestpath modules if necessary. */
+     if (ps_config_bool(config, "fwdtree")) {
+--- a/src/pocketsphinx.c
++++ b/src/pocketsphinx.c
+@@ -328,7 +328,16 @@
+     if ((ps->dict = dict_init(ps->config, ps->acmod->mdef)) == NULL)
+         return -1;
+     if ((ps->d2p = dict2pid_build(ps->acmod->mdef, ps->dict)) == NULL)
++        return -1;
++
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    /*
++     * The fixed mapping owns every vocabulary-dependent CD lookup. Later
++     * search initialization needs only CI-phone records and senone sequences.
++     */
++    if (bin_mdef_compact_runtime(ps->acmod->mdef) < 0)
+         return -1;
++#endif
+ 
+     lw = ps_config_float(ps->config, "lw");
+ 
+@@ -401,6 +410,11 @@
+             return -1;
+         }
+     }
++
++#ifdef TILEFINCH_FIXED_DICT
++    hash_table_free(ps->dict->ht);
++    ps->dict->ht = NULL;
++#endif
+ 
+     /* Initialize performance timer. */
+     ps->perf.name = "decode";
+@@ -942,6 +956,14 @@
+             char const *phones,
+             int update)
+ {
++#ifdef TILEFINCH_FIXED_RECOGNIZER
++    (void)ps;
++    (void)word;
++    (void)phones;
++    (void)update;
++    E_ERROR("Dynamic words are unavailable in the fixed recognizer\n");
++    return -1;
++#else
+     int32 wid;
+     s3cipid_t *pron;
+     hash_iter_t *search_it;
+@@ -1002,6 +1024,7 @@
+ 
+     /* Rebuild the widmap and search tree if requested. */
+     return wid;
++#endif
+ }
+ 
+ char *

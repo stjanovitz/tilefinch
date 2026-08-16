@@ -1,0 +1,2 @@
+# id	suite	panel	kind	test	reference
+customizable-select-value-selected-option	html	html-forms-focus	testharness	html/semantics/forms/the-select-element/customizable-select/select-value-selectedOption.html	-
