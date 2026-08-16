@@ -575,12 +575,14 @@ static void psp_network_lifecycle_drive_demand_recovery(
 void psp_report_network_result(PspNetwork *network)
 {
     if (network == NULL) return;
-    printf("tilefinch-network: status=%s failure-phase=%s profile=%d "
+    printf("tilefinch-network: status=%s failure-phase=%s profile=%d/%d "
+           "fallback=%d "
            "apctl=%d native=0x%08x pumps=%zu elapsed=%llums "
            "max-pump=%lluus/%s\n",
            psp_network_status_name(network->status),
            psp_network_status_name(network->failure_phase),
-           network->profile_index, network->apctl_state,
+           network->requested_profile_index, network->profile_index,
+           network->profile_fallback_used ? 1 : 0, network->apctl_state,
            (unsigned) network->native_result, network->pump_calls,
            (unsigned long long) (network->elapsed_us / 1000u),
            (unsigned long long) network->maximum_pump_us,
@@ -790,10 +792,8 @@ bool psp_connect_network(PspNetwork *network, int profile_index,
     bool ready = network->status == PSP_NETWORK_READY;
     if (!ready) {
         bool cancelled = network->status == PSP_NETWORK_CANCELLED;
-        bool saved = !cancelled && psp_write_failure_report(
-            "network-association",
-            psp_network_status_name(network->failure_phase), NULL, 0,
-            network->native_result);
+        bool saved = !cancelled
+            && psp_write_network_failure_report(network);
         psp_log_checkpoint(
             cancelled
                 ? "network-connect-cancelled"

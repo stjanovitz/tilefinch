@@ -69,8 +69,8 @@ agents are capable of. A web browser was a good test of all three.
   - **PSP-3000** — the tested model; everything claimed on this page ran here.
   - **PSP-2000 and PSP Go** — same 64 MB memory mode, expected to work,
     not yet qualified.
-  - **PSP-1000** — not supported: it has 32 MB of physical RAM and cannot
-    provide the expanded PSP-2000/3000 memory mode requested by the build.
+  - **PSP-1000** — not supported: it has 32 MB of physical RAM, and most
+    sites need more.
   - **PSP-E1000 (Street)** — has the memory but no Wi-Fi, so only the
     offline library would function; not a sensible target.
 - About 20 MB of free Memory Stick space for ordinary browsing and updates.
@@ -86,7 +86,7 @@ agents are capable of. A web browser was a good test of all three.
 
 ## Install
 
-1. Download `tilefinch-v0.1.0-psp.zip` from the
+1. Download `tilefinch-v0.1.1-psp.zip` from the
    [latest Tilefinch release](https://github.com/stjanovitz/tilefinch/releases/latest).
 2. Extract the archive and copy its entire `TILEFINCH` folder to
    `PSP/GAME/` on your Memory Stick. The launcher should end up at

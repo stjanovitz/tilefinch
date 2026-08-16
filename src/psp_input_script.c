@@ -127,6 +127,7 @@ const char *psp_input_script_setting_name(PspUiSettingId setting)
             return "third-party-cookies-site";
         case PSP_UI_SETTING_TLS_SESSION_PERSISTENCE:
             return "tls-session-persistence";
+        case PSP_UI_SETTING_NETWORK_PROFILE: return "network-profile";
         case PSP_UI_SETTING_UPDATE_CHANNEL: return "update-channel";
     }
     return "unknown";

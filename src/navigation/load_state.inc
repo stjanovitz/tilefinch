@@ -1104,6 +1104,15 @@ NavigationLoadStatus navigation_load_pump(
     load->request_id = 0;
     load->metrics.stream = stream_metrics;
     session->last_stream = stream_metrics;
+    session->last_http_status = load->response.status_code;
+    session->last_transport_code = load->response.transport_code;
+    session->last_tls_verify_result = load->response.tls_verify_result;
+    session->last_transport_timed_out = load->response.timed_out;
+    session->last_tls12_compatibility_retry =
+        load->response.tls12_compatibility_retry;
+    snprintf(session->last_tls_version,
+             sizeof(session->last_tls_version), "%s",
+             load->response.tls_version);
     if (!success) {
         const char *detail = load->response.error;
         if (strcmp(detail, "stream consumer rejected response") == 0
@@ -1116,7 +1125,6 @@ NavigationLoadStatus navigation_load_pump(
         navigation_load_release_staging(load, true);
         return load->status;
     }
-    session->last_http_status = load->response.status_code;
     snprintf(session->last_cf_mitigated,
              sizeof(session->last_cf_mitigated), "%s",
              load->response.cf_mitigated);

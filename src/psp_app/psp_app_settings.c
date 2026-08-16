@@ -247,6 +247,20 @@ static void psp_app_reload_for_site_security_setting(
  * kept in source order because the order in which two settings are
  * applied in one frame is observable.
  */
+void psp_app_refresh_network_profile_label(PspApp *app, int profile)
+{
+    if (app == NULL || app->process == NULL) return;
+    char ssid[33];
+    ssid[0] = '\0';
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+    (void) psp_network_profile_ssid(profile, ssid, sizeof(ssid));
+#endif
+    psp_ui_set_network_profile(
+        &app->process->presentation.ui,
+        profile >= 1 && profile <= 100 ? (unsigned) profile : 1u,
+        ssid);
+}
+
 void psp_app_apply_setting(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
 {
@@ -262,6 +276,78 @@ void psp_app_apply_setting(
     const char *content_blocker_path = app->process->storage.content_blocker;
     const char *local_storage_path = app->process->storage.local_storage;
     const char *persistent_cache_path = app->process->storage.persistent_cache;
+    if (intent->setting.id == PSP_UI_SETTING_NETWORK_PROFILE) {
+        unsigned operation = intent->setting.value.unsigned_value;
+        int saved = (int) app->process->config.network_profile;
+        int current = (int) app->process->presentation.ui.network_profile;
+        if (operation == 3u) {
+            psp_app_refresh_network_profile_label(app, saved);
+        } else if (operation < 2u) {
+            int direction = operation == 0u ? -1 : 1;
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+            int selected = psp_network_choose_saved_profile(current, direction);
+#else
+            int selected = current + direction;
+            if (selected < 1) selected = 100;
+            else if (selected > 100) selected = 1;
+#endif
+            if (selected == 0) {
+                psp_ui_show_status(
+                    &app->process->presentation.ui,
+                    "NO SAVED WI-FI PROFILE FOUND", 240);
+            } else if (selected == current) {
+                psp_ui_show_status(
+                    &app->process->presentation.ui,
+                    "ONLY ONE WI-FI PROFILE IS SAVED", 180);
+            } else {
+                char status[48];
+                psp_app_refresh_network_profile_label(app, selected);
+                snprintf(status, sizeof(status),
+                         "PROFILE %d - PRESS X TO SAVE", selected);
+                psp_ui_show_status(
+                    &app->process->presentation.ui, status, 180);
+            }
+        } else {
+            int selected = current;
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+            bool available = psp_network_profile_is_saved(selected);
+#else
+            bool available = selected >= 1 && selected <= 100;
+#endif
+            if (!available) {
+                psp_app_refresh_network_profile_label(app, saved);
+                psp_ui_show_status(
+                    &app->process->presentation.ui,
+                    "THAT WI-FI PROFILE IS NOT SAVED", 240);
+            } else if (selected == saved) {
+                psp_ui_show_status(
+                    &app->process->presentation.ui,
+                    "WI-FI PROFILE ALREADY SELECTED", 120);
+            } else {
+                char override_path[TILEFINCH_INSTALL_PATH_LIMIT];
+                bool have_path = psp_app_boot_override_path(
+                    &app->process->install_paths, override_path,
+                    sizeof(override_path));
+                app->process->config.network_profile = selected;
+                if (!have_path || !psp_boot_config_write_overrides(
+                                      &app->process->config, override_path)) {
+                    app->process->config.network_profile = saved;
+                    psp_app_refresh_network_profile_label(app, saved);
+                    psp_ui_show_status(
+                        &app->process->presentation.ui,
+                        "WI-FI PROFILE NOT SAVED", 240);
+                } else {
+                    char status[48];
+                    psp_app_refresh_network_profile_label(app, selected);
+                    snprintf(
+                        status, sizeof(status),
+                        "WI-FI PROFILE %d SAVED FOR NEXT CONNECT", selected);
+                    psp_ui_show_status(
+                        &app->process->presentation.ui, status, 240);
+                }
+            }
+        }
+    }
     if (intent->setting.id == PSP_UI_SETTING_PAGE_FONT_PERCENT) {
         unsigned page_font_percent =
             intent->setting.value.unsigned_value;

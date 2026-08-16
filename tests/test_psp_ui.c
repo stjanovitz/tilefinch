@@ -670,8 +670,28 @@ static bool test_input_mapping_and_menu(void)
     (void) psp_ui_update(&ui, &input);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
+    psp_ui_set_network_profile(&ui, 2u, "Cafe Wi-Fi");
+    CHECK(ui.network_profile == 2u
+          && ui.network_profile_label_valid
+          && strcmp(ui.network_profile_label, "Cafe Wi-Fi (P2)") == 0);
     ui.options_selection = 31;
     CHECK(ui.options_selection == 31);
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.setting.id == PSP_UI_SETTING_NETWORK_PROFILE
+          && intent.setting.value.unsigned_value == 1u
+          && ui.network_profile == 2u);
+    input.pressed = PSP_UI_BUTTON_LEFT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.setting.id == PSP_UI_SETTING_NETWORK_PROFILE
+          && intent.setting.value.unsigned_value == 0u);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.setting.id == PSP_UI_SETTING_NETWORK_PROFILE
+          && intent.setting.value.unsigned_value == 2u);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.options_selection == 32);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(!ui.update_check_enabled
@@ -684,14 +704,15 @@ static bool test_input_mapping_and_menu(void)
           && intent.setting.value.boolean);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 32);
+    CHECK(ui.options_selection == 33);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_UPDATE);
     psp_ui_set_update(
         &ui, "0.1.0", "UPDATE AVAILABLE", "Safer update.", -1,
         "DOWNLOAD", true, false);
-    CHECK(strcmp(ui.update_notes, "Safer update.") == 0);
+    CHECK(!ui.network_profile_label_valid
+          && strcmp(ui.update_notes, "Safer update.") == 0);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.update_primary_requested);
@@ -700,7 +721,7 @@ static bool test_input_mapping_and_menu(void)
     CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 33);
+    CHECK(ui.options_selection == 34);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_DATA_OPTIONS

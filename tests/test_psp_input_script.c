@@ -237,6 +237,9 @@ static bool test_names(void)
     CHECK(strcmp(psp_input_script_setting_name(
                      PSP_UI_SETTING_PAGE_FONT_PERCENT),
                  "page-font-percent") == 0);
+    CHECK(strcmp(psp_input_script_setting_name(
+                     PSP_UI_SETTING_NETWORK_PROFILE),
+                 "network-profile") == 0);
     CHECK(strcmp(psp_input_script_screen_name(PSP_UI_SCREEN_OPTION_ITEMS),
                  "option-items") == 0);
     CHECK(strcmp(psp_input_script_button_name(PSP_UI_BUTTON_MENU),

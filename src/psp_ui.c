@@ -20,9 +20,9 @@
 #define UI_TOAST_DEFAULT_FRAMES 180u
 #define UI_MEDIA_CONTROLS_MS 3000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 36u
+#define UI_OPTIONS_ITEM_COUNT 37u
 #else
-#define UI_OPTIONS_ITEM_COUNT 34u
+#define UI_OPTIONS_ITEM_COUNT 35u
 #endif
 #define UI_DATA_OPTIONS_ITEM_COUNT 7u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -165,6 +165,7 @@ typedef enum {
     UI_OPTION_TLS_SESSION_PERSISTENCE,
     UI_OPTION_MIXED_CONTENT_SITE,
     UI_OPTION_THIRD_PARTY_COOKIES_SITE,
+    UI_OPTION_NETWORK_PROFILE,
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
     UI_OPTION_POWER_TEST,
     UI_OPTION_MEDIA_TEST,
@@ -206,6 +207,7 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_TLS_SESSION_PERSISTENCE,
     UI_OPTION_MIXED_CONTENT_SITE,
     UI_OPTION_THIRD_PARTY_COOKIES_SITE,
+    UI_OPTION_NETWORK_PROFILE,
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
     UI_OPTION_POWER_TEST,
     UI_OPTION_MEDIA_TEST,
@@ -264,6 +266,7 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_POWER_TEST:
         case UI_OPTION_MEDIA_TEST:
 #endif
+        case UI_OPTION_NETWORK_PROFILE:
         case UI_OPTION_UPDATE_CHECK:
         case UI_OPTION_UPDATE:
         case UI_OPTION_SITE_DATA:
@@ -389,6 +392,8 @@ static const char *ui_option_description(UiOptionId option)
             return "Compatibility: allow HTTP resources here";
         case UI_OPTION_THIRD_PARTY_COOKIES_SITE:
             return "Compatibility: allow unpartitioned cookies here";
+        case UI_OPTION_NETWORK_PROFILE:
+            return "Left/right choose; X saves next connection";
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
         case UI_OPTION_POWER_TEST:
             return "Run the controlled clocking test";
@@ -1496,6 +1501,26 @@ void psp_ui_set_page(PspUiState *ui, const char *title, const char *url,
     ui->secure = secure;
 }
 
+void psp_ui_set_network_profile(
+    PspUiState *ui, unsigned profile, const char *ssid)
+{
+    if (ui == NULL) return;
+    if (profile < 1u || profile > 100u) profile = 1u;
+    ui->network_profile = profile;
+    if (ssid != NULL && ssid[0] != '\0') {
+        /* The value column is deliberately compact. Retain the profile
+           number for support reports even when a long SSID is clipped. */
+        snprintf(ui->network_profile_label,
+                 sizeof(ui->network_profile_label),
+                 "%.14s (P%u)", ssid, profile);
+    } else {
+        snprintf(ui->network_profile_label,
+                 sizeof(ui->network_profile_label),
+                 "Profile %u", profile);
+    }
+    ui->network_profile_label_valid = true;
+}
+
 void psp_ui_set_navigation_target(PspUiState *ui, const char *url)
 {
     if (ui == NULL || url == NULL || url[0] == '\0') return;
@@ -1584,6 +1609,7 @@ void psp_ui_set_update(
     bool primary_enabled, bool cancel_enabled)
 {
     if (ui == NULL) return;
+    ui->network_profile_label_valid = false;
     copy_string(ui->update_version, sizeof(ui->update_version), version);
     copy_string(ui->update_status, sizeof(ui->update_status), status);
     copy_string(ui->update_notes, sizeof(ui->update_notes), notes);
@@ -2635,6 +2661,12 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                 ui->options_selection, 1);
             intent.visual_changed = true;
         } else if (pressed & PSP_UI_BUTTON_CANCEL) {
+            if (ui_option_id(ui->options_selection)
+                    == UI_OPTION_NETWORK_PROFILE) {
+                intent.setting.id = PSP_UI_SETTING_NETWORK_PROFILE;
+                /* Discard an uncommitted Left/Right preview. */
+                intent.setting.value.unsigned_value = 3u;
+            }
             ui_open_parent_overlay(ui, PSP_UI_SCREEN_OPTIONS);
             intent.visual_changed = true;
         } else if (pressed & (PSP_UI_BUTTON_LEFT | PSP_UI_BUTTON_RIGHT
@@ -2878,6 +2910,15 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                         PSP_UI_SETTING_THIRD_PARTY_COOKIES_SITE;
                     intent.setting.value.boolean =
                         ui->third_party_cookie_site_allowed;
+                    break;
+                case UI_OPTION_NETWORK_PROFILE:
+                    intent.setting.id = PSP_UI_SETTING_NETWORK_PROFILE;
+                    /* Left/Right preview; X commits exactly one boot-config
+                       write. Circle emits operation 3 above and restores the
+                       saved value. */
+                    intent.setting.value.unsigned_value =
+                        (pressed & PSP_UI_BUTTON_CONFIRM)
+                            ? 2u : (direction < 0 ? 0u : 1u);
                     break;
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
                 case UI_OPTION_POWER_TEST:
@@ -3907,6 +3948,10 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
 #endif
     const char *labels[UI_OPTIONS_ITEM_COUNT];
     const char *values[UI_OPTIONS_ITEM_COUNT];
+    char network_profile[16];
+    snprintf(network_profile, sizeof(network_profile), "Profile %u",
+             ui->network_profile == 0u ? 1u
+                                       : (unsigned) ui->network_profile);
     for (size_t at = 0; at < UI_OPTIONS_ITEM_COUNT; at++) {
         values[at] = "";
         switch (ui_option_id(at)) {
@@ -4049,6 +4094,11 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
                 labels[at] = "3rd-party cookies";
                 values[at] = ui->third_party_cookie_site_allowed
                     ? "Allow" : "Block";
+                break;
+            case UI_OPTION_NETWORK_PROFILE:
+                labels[at] = "Wi-Fi profile";
+                values[at] = ui->network_profile_label_valid
+                    ? ui->network_profile_label : network_profile;
                 break;
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
             case UI_OPTION_POWER_TEST:

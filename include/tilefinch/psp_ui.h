@@ -226,6 +226,7 @@ typedef enum {
     PSP_UI_SETTING_MIXED_CONTENT_SITE,
     PSP_UI_SETTING_THIRD_PARTY_COOKIES_SITE,
     PSP_UI_SETTING_TLS_SESSION_PERSISTENCE,
+    PSP_UI_SETTING_NETWORK_PROFILE,
     PSP_UI_SETTING_UPDATE_CHANNEL
 } PspUiSettingId;
 
@@ -442,6 +443,11 @@ typedef struct {
     unsigned glyph_component_remove_confirmation : 1;
     /* Same -1..1000 encoding as the voice component above. */
     unsigned glyph_component_progress_plus_one : 10;
+    /* Selected PSP Settings > Network Settings slot (1..100). It is a boot
+       override rather than profile data, but lives here so Options can show
+       the value that the next connection will request. */
+    unsigned network_profile : 7;
+    unsigned network_profile_label_valid : 1;
     int update_progress_per_mille;
     BrowserSearchEngine search_engine;
     BrowserColorMode color_mode;
@@ -522,11 +528,20 @@ typedef struct {
     char url[PSP_UI_URL_CAPACITY];
     char title[PSP_UI_TITLE_CAPACITY];
     char status[PSP_UI_STATUS_CAPACITY];
-    char update_version[16];
-    char update_status[64];
-    /* The recovery screen deliberately shows only a compact verified note. */
-    char update_notes[24];
-    char update_primary_label[24];
+    /* Update and Options are mutually exclusive overlays. Sharing their
+       bounded label storage keeps the per-frame UI state at its 1 KiB
+       ratchet instead of charging every browsing frame for an SSID. */
+    union {
+        struct {
+            char update_version[16];
+            char update_status[64];
+            /* The recovery screen deliberately shows only a compact
+               verified note. */
+            char update_notes[24];
+            char update_primary_label[24];
+        };
+        char network_profile_label[128];
+    };
     /* Borrowed only while the synchronous native text-entry loop is active;
        psp_ui_clear_text_entry() runs before that stack frame can unwind. */
     union {
@@ -662,6 +677,8 @@ void psp_ui_set_device_status(
     bool twelve_hour, int wifi_bars);
 void psp_ui_set_page(PspUiState *ui, const char *title, const char *url,
                      bool secure);
+void psp_ui_set_network_profile(
+    PspUiState *ui, unsigned profile, const char *ssid);
 /* Adopt a user-accepted destination before association/fetch begins while
    the incumbent page pixels remain on screen. */
 void psp_ui_set_navigation_target(PspUiState *ui, const char *url);

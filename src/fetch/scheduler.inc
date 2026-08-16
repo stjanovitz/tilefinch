@@ -1363,6 +1363,8 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
                                        CURLcode transport_result)
 {
     item->transport_complete = false;
+    item->result.transport_code = (long) transport_result;
+    fetch_result_set_transport_info(item->easy, &item->result);
     bool redirect_callback_abort =
         tilefinch_fetch_redirect_callback_abort_expected(
             transport_result, item->writer.redirect_response,
@@ -1378,7 +1380,6 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
         (void) curl_easy_getinfo(item->easy, CURLINFO_EFFECTIVE_URL,
                                 &effective);
         (void) curl_easy_getinfo(item->easy, CURLINFO_CONTENT_TYPE, &type);
-        fetch_result_set_transport_info(item->easy, &item->result);
         /* One sample per completed transport hop, including each redirect
            hop this scheduler reschedules onto the same easy handle. */
         fetch_tls_counters_record(item->easy, &scheduler->tls_counters);

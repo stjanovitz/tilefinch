@@ -397,6 +397,12 @@ uint64_t navigation_begin(NavigationSession *session)
     if (session->generation == 0) session->generation++;
     session->cancelled = false;
     session->navigation_started_us = navigation_now_us();
+    session->last_http_status = 0;
+    session->last_transport_code = 0;
+    session->last_tls_verify_result = 0;
+    session->last_transport_timed_out = false;
+    session->last_tls12_compatibility_retry = false;
+    session->last_tls_version[0] = '\0';
     session->last_error[0] = '\0';
     /* Direct navigation_commit_html callers do not pass through the
        asynchronous load-state metric reset. A prior provisional paint must

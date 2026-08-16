@@ -527,6 +527,11 @@ struct NavigationSession {
        queued, so this is not a terminal outcome like preloads_deferred. */
     size_t preloads_headroom_skipped;
     long last_http_status;
+    long last_transport_code;
+    long last_tls_verify_result;
+    bool last_transport_timed_out;
+    bool last_tls12_compatibility_retry;
+    char last_tls_version[16];
     size_t client_hint_retries;
     char last_cf_mitigated[32];
     char last_server[64];

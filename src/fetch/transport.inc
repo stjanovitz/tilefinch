@@ -909,6 +909,8 @@ static bool fetch_request_internal(Budget *budget, const char *url,
     struct curl_slist *headers = NULL;
     FetchHopState *hop = NULL;
     CURLcode code = CURLE_FAILED_INIT;
+    long failed_transport_code = 0;
+    long failed_tls_verify_result = 0;
     bool timed_out = false;
     bool tls12_retry_attempted = false;
     bool redirect_origin_tainted = false;
@@ -1167,6 +1169,7 @@ static bool fetch_request_internal(Budget *budget, const char *url,
     (void) curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &result->status_code);
     (void) curl_easy_getinfo(easy, CURLINFO_EFFECTIVE_URL, &effective);
     (void) curl_easy_getinfo(easy, CURLINFO_CONTENT_TYPE, &content_type);
+    result->transport_code = (long) code;
     fetch_result_set_transport_info(easy, result);
     write_context_set_effective_url(&context, effective);
     if (content_type != NULL) {
@@ -1234,6 +1237,12 @@ static bool fetch_request_internal(Budget *budget, const char *url,
     return true;
 
 failed:
+    failed_transport_code = (long) code;
+    failed_tls_verify_result = 0;
+    if (easy != NULL) {
+        fetch_result_set_transport_info(easy, result);
+        failed_tls_verify_result = result->tls_verify_result;
+    }
     redirect_origin_tainted = result->redirect_origin_tainted
         || (hop != NULL && hop->origin_tainted);
     if (context.capture_body != NULL) {
@@ -1260,6 +1269,8 @@ failed:
         result->budget = budget;
     }
     result->timed_out = timed_out;
+    result->transport_code = failed_transport_code;
+    result->tls_verify_result = failed_tls_verify_result;
     result->redirect_origin_tainted = redirect_origin_tainted;
     (void) snprintf(result->error, sizeof(result->error), "%s", failure);
     if (fetch_trace.mode == FETCH_TRACE_CAPTURE && stream == NULL) {

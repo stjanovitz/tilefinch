@@ -25,6 +25,7 @@ typedef enum {
 typedef struct {
     PspNetworkStatus status;
     PspNetworkStatus failure_phase;
+    int requested_profile_index;
     int profile_index;
     int apctl_state;
     int native_result;
@@ -48,6 +49,7 @@ typedef struct {
     bool profile_static_ip;
     bool profile_manual_dns;
     bool profile_uses_proxy;
+    bool profile_fallback_used;
     int wlan_switch_state;
     int wlan_power_state;
     PspNetworkStatus maximum_pump_phase;
@@ -129,6 +131,14 @@ typedef struct {
 } PspNetworkRejoinOperation;
 
 bool psp_network_begin(PspNetwork *network, int profile_index);
+/* Return the next firmware-validated saved connection profile, wrapping at
+   the PSP's bounded profile limit. Zero means no saved profile was found. */
+int psp_network_choose_saved_profile(int current, int direction);
+bool psp_network_profile_is_saved(int profile);
+/* Read the configured access point name without starting the network stack.
+   The returned label is bounded printable ASCII; false leaves output empty. */
+bool psp_network_profile_ssid(
+    int profile, char *output, size_t output_size);
 PspNetworkStatus psp_network_pump(PspNetwork *network,
                                   uint64_t timeout_us);
 /* Stop advancing Starting. The outer supervisor owns APCTL leave/unwind. */

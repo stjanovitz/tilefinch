@@ -684,6 +684,8 @@ static void fetch_result_set_transport_info(CURL *easy, FetchResult *result)
 {
     if (easy == NULL || result == NULL) return;
     (void) curl_easy_getinfo(
+        easy, CURLINFO_SSL_VERIFYRESULT, &result->tls_verify_result);
+    (void) curl_easy_getinfo(
         easy, CURLINFO_HTTP_VERSION, &result->negotiated_http_version);
 #if LIBCURL_VERSION_NUM >= 0x073200 /* 7.50.0 */
     (void) curl_easy_getinfo(

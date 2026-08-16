@@ -20,6 +20,44 @@ typedef enum {
     PSP_NETWORK_INIT_APCTL
 } PspNetworkInitService;
 
+typedef int (*PspNetworkProfileCheck)(int profile, void *context);
+
+/* Returns the first valid saved profile other than the requested slot. A
+   zero result means none exists. The callback form keeps the bounded choice
+   policy host-testable while the PSP implementation supplies the firmware
+   query. */
+static inline int psp_network_first_fallback_profile(
+    int requested, int maximum, PspNetworkProfileCheck check, void *context)
+{
+    if (requested <= 0 || maximum <= 0 || check == NULL) return 0;
+    for (int candidate = 1; candidate <= maximum; candidate++) {
+        if (candidate == requested) continue;
+        if (check(candidate, context) == 0) return candidate;
+    }
+    return 0;
+}
+
+/* Walk saved profiles cyclically in the requested direction. Including the
+   starting slot only after every other slot has been considered means a
+   single-profile PSP remains stable while a PSP with several configurations
+   always advances to a different valid one. */
+static inline int psp_network_next_saved_profile(
+    int current, int maximum, int direction,
+    PspNetworkProfileCheck check, void *context)
+{
+    if (current <= 0 || current > maximum || maximum <= 0
+        || direction == 0 || check == NULL) return 0;
+    int step = direction < 0 ? -1 : 1;
+    int candidate = current;
+    for (int visited = 0; visited < maximum; visited++) {
+        candidate += step;
+        if (candidate < 1) candidate = maximum;
+        else if (candidate > maximum) candidate = 1;
+        if (check(candidate, context) == 0) return candidate;
+    }
+    return 0;
+}
+
 /* APCTL states 2, 3, 5, and 6 are an association already in progress on
    6.6x firmware.  This is deliberately expressed in terms of the public
    state values rather than accepting an arbitrary non-disconnected state:

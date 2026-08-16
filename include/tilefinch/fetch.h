@@ -86,6 +86,11 @@ typedef struct {
     /* Native transport diagnostics. Zero means replay/synthetic/unknown.
        CURLINFO_HTTP_VERSION's numeric value is intentionally not exposed as
        an ABI promise; fetch_http_version_name() is the stable presentation. */
+    long transport_code;
+    /* Backend certificate-verification result. The PSP mbedTLS transport
+       exposes its MBEDTLS_X509_BADCERT_* flag mask here; other TLS backends
+       retain their native CURLINFO_SSL_VERIFYRESULT value. */
+    long tls_verify_result;
     long negotiated_http_version;
     long new_connections;
     /* TLS handshake attribution for the final transport hop of this request,
@@ -483,6 +488,8 @@ typedef struct {
     size_t length;
     size_t received_body_bytes;
     long status_code;
+    long transport_code;
+    long tls_verify_result;
     long negotiated_http_version;
     long new_connections;
     bool success;

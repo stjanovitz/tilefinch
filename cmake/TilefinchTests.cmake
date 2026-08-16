@@ -34,6 +34,13 @@ if(PSP_BROWSER_BUILD_TESTS)
         set_tests_properties(tilefinch-psp-sdk-contract-tests PROPERTIES
             LABELS "tilefinch;unit;psp;architecture"
             TIMEOUT 10)
+        add_test(NAME tilefinch-ca-bundle-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ca_bundle.py
+                ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(tilefinch-ca-bundle-tests PROPERTIES
+            LABELS "tilefinch;unit;security;tls"
+            TIMEOUT 10)
     endif()
     add_executable(tilefinch-tests tests/test_tilefinch.c)
     target_link_libraries(tilefinch-tests PRIVATE tilefinch_core)

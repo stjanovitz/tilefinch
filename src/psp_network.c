@@ -34,6 +34,7 @@
 
 #define PSP_NETWORK_DISCONNECT_WAIT_US UINT64_C(250000)
 #define PSP_NETWORK_DISCONNECT_POLL_US 5000u
+#define PSP_NETWORK_PROFILE_LIMIT 100
 
 /*
  * Name resolution is the one network primitive the application cannot bound
@@ -196,6 +197,69 @@ static void psp_network_query_profile(PspNetwork *network)
     }
 }
 
+/* Saved PSP connection profiles are numbered from one, but deleting the
+   configured/default slot can leave Tilefinch pointing at no profile at all.
+   Firmware reports that case as PSP_NETPARAM_ERROR_BAD_NETCONF before the
+   WLAN stack starts. On that specific error only, fall back to the first
+   profile the firmware says is valid. This never changes a valid explicit
+   selection and remains bounded even on corrupt profile storage. */
+static int psp_network_check_profile(int profile, void *context)
+{
+    (void) context;
+    return sceUtilityCheckNetParam(profile);
+}
+
+static bool psp_network_select_fallback_profile(PspNetwork *network)
+{
+    if (network == NULL) return false;
+    int selected = psp_network_first_fallback_profile(
+        network->requested_profile_index, PSP_NETWORK_PROFILE_LIMIT,
+        psp_network_check_profile, NULL);
+    if (selected == 0) return false;
+    network->profile_index = selected;
+    network->profile_fallback_used = true;
+    return true;
+}
+
+int psp_network_choose_saved_profile(int current, int direction)
+{
+    return psp_network_next_saved_profile(
+        current, PSP_NETWORK_PROFILE_LIMIT, direction,
+        psp_network_check_profile, NULL);
+}
+
+bool psp_network_profile_is_saved(int profile)
+{
+    return profile >= 1 && profile <= PSP_NETWORK_PROFILE_LIMIT
+        && sceUtilityCheckNetParam(profile) == 0;
+}
+
+bool psp_network_profile_ssid(
+    int profile, char *output, size_t output_size)
+{
+    if (output == NULL || output_size == 0u) return false;
+    output[0] = '\0';
+    if (!psp_network_profile_is_saved(profile)) return false;
+
+    netData data;
+    memset(&data, 0, sizeof(data));
+    if (sceUtilityGetNetParam(profile, PSP_NETPARAM_SSID, &data) < 0)
+        return false;
+    data.asString[sizeof(data.asString) - 1u] = '\0';
+
+    size_t written = 0u;
+    for (size_t at = 0u; data.asString[at] != '\0'
+         && written + 1u < output_size; at++) {
+        unsigned char byte = (unsigned char) data.asString[at];
+        /* Saved SSIDs are byte strings. Keep the chrome renderer boring and
+           deterministic if firmware returns controls or non-UTF-8 bytes. */
+        output[written++] = byte >= 0x20u && byte <= 0x7eu
+            ? (char) byte : '?';
+    }
+    output[written] = '\0';
+    return written != 0u;
+}
+
 static PspNetworkStatus psp_network_fail(PspNetwork *network, int result)
 {
     network->failure_phase = network->status;
@@ -211,6 +275,7 @@ bool psp_network_begin(PspNetwork *network, int profile_index)
 {
     if (network == NULL || profile_index <= 0) return false;
     memset(network, 0, sizeof(*network));
+    network->requested_profile_index = profile_index;
     network->profile_index = profile_index;
     network->apctl_state = -1;
     network->native_result = 0;
@@ -253,6 +318,10 @@ PspNetworkStatus psp_network_pump(PspNetwork *network,
     switch (network->status) {
     case PSP_NETWORK_CHECKING_PROFILE:
         result = sceUtilityCheckNetParam(network->profile_index);
+        if ((uint32_t) result == (uint32_t) PSP_NETPARAM_ERROR_BAD_NETCONF
+            && psp_network_select_fallback_profile(network)) {
+            result = 0;
+        }
         if (result < 0) {
             (void) psp_network_fail(network, result);
             return psp_network_finish_pump(

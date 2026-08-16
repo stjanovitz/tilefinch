@@ -3,6 +3,12 @@ static bool test_cancellation_callback(void *opaque)
     return tilefinch_cancellation_requested(opaque);
 }
 
+static int test_psp_profile_check(int profile, void *context)
+{
+    const int *results = context;
+    return profile >= 1 && profile <= 5 ? results[profile - 1] : -1;
+}
+
 static bool test_psp_network_reinitialization_policy(void)
 {
     static const struct {
@@ -44,6 +50,31 @@ static bool test_psp_network_reinitialization_policy(void)
         || !psp_network_apctl_state_is_associating(5)
         || !psp_network_apctl_state_is_associating(6)
         || psp_network_apctl_state_is_associating(7)) return false;
+    const int profile_results[] = {-1, -1, 0, -1, 0};
+    if (psp_network_first_fallback_profile(
+            1, 5, test_psp_profile_check,
+            (void *) profile_results) != 3
+        || psp_network_first_fallback_profile(
+               3, 5, test_psp_profile_check,
+               (void *) profile_results) != 5
+        || psp_network_first_fallback_profile(
+               5, 2, test_psp_profile_check,
+               (void *) profile_results) != 0
+        || psp_network_first_fallback_profile(
+               0, 5, test_psp_profile_check,
+               (void *) profile_results) != 0
+        || psp_network_next_saved_profile(
+               3, 5, 1, test_psp_profile_check,
+               (void *) profile_results) != 5
+        || psp_network_next_saved_profile(
+               3, 5, -1, test_psp_profile_check,
+               (void *) profile_results) != 5
+        || psp_network_next_saved_profile(
+               5, 5, 1, test_psp_profile_check,
+               (void *) profile_results) != 3
+        || psp_network_next_saved_profile(
+               3, 5, 0, test_psp_profile_check,
+               (void *) profile_results) != 0) return false;
     return true;
 }
 

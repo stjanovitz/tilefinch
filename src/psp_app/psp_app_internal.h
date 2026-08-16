@@ -134,6 +134,12 @@ typedef enum {
 bool psp_write_failure_report(
     const char *stage, const char *detail, const char *url,
     long http_status, int native_result);
+bool psp_write_navigation_failure_report(
+    const char *stage, const char *detail, const char *url,
+    const NavigationSession *navigation);
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+bool psp_write_network_failure_report(const PspNetwork *network);
+#endif
 bool psp_offline_url(const char *url);
 bool psp_internal_action_url(const char *url, const char *name);
 bool psp_request_omnibox(
@@ -797,6 +803,7 @@ void psp_app_dispatch_action(
 /* src/psp_app/psp_app_settings.c */
 void psp_app_apply_setting(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent);
+void psp_app_refresh_network_profile_label(PspApp *app, int profile);
 bool psp_app_edit_developer_update_url(
     PspApp *app, PspAppFrameState *frame);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG

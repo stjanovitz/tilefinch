@@ -5,3 +5,48 @@ index 3e1f5866f..0d1b6c754 100644
 @@ -167 +167 @@
 -static void h2_stream_hash_free(unsigned int id, void *stream)
 +static void h2_stream_hash_free(uint32_t id, void *stream)
+diff --git a/lib/vtls/mbedtls.c b/lib/vtls/mbedtls.c
+index 0c830fbf2..fcbd183d4 100644
+--- a/lib/vtls/mbedtls.c
++++ b/lib/vtls/mbedtls.c
+@@ -443,21 +443,24 @@ static int mbed_verify_cb(void *ptr, mbedtls_x509_crt *crt,
+                           int depth, uint32_t *flags)
+ {
+   struct Curl_cfilter *cf = (struct Curl_cfilter *)ptr;
+   struct ssl_primary_config *conn_config = Curl_ssl_cf_get_primary_config(cf);
++  struct ssl_config_data *ssl_config =
++    Curl_ssl_cf_get_config(cf, CF_DATA_CURRENT(cf));
+   struct Curl_easy *data = CF_DATA_CURRENT(cf);
+-
++
+   if(depth == 0) {
+     if(data->set.verbose)
+       mbed_dump_cert_info(data, crt);
+     if(data->set.ssl.certinfo)
+       mbed_extract_certinfo(data, crt);
+   }
+-
++
+   if(!conn_config->verifypeer)
+     *flags = 0;
+   else if(!conn_config->verifyhost)
+     *flags &= ~MBEDTLS_X509_BADCERT_CN_MISMATCH;
+-
++  ssl_config->certverifyresult |= (long)*flags;
++
+   if(*flags) {
+ #ifndef MBEDTLS_X509_REMOVE_INFO
+     char buf[128];
+@@ -984,10 +987,12 @@ static CURLcode mbed_connect_step1(struct Curl_cfilter *cf,
+                                    struct Curl_easy *data)
+ {
+   struct ssl_connect_data *connssl = cf->ctx;
+   struct ssl_primary_config *conn_config = Curl_ssl_cf_get_primary_config(cf);
++  struct ssl_config_data *ssl_config = Curl_ssl_cf_get_config(cf, data);
+   CURLcode result;
+-
++
++  ssl_config->certverifyresult = 0;
+   if((conn_config->version == CURL_SSLVERSION_SSLv2) ||
+      (conn_config->version == CURL_SSLVERSION_SSLv3)) {
+     failf(data, "Not supported SSL version");

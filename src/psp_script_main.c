@@ -31,10 +31,42 @@
    path writes, but a network/page failure on hardware remains actionable. */
 static const TilefinchInstallPaths *psp_failure_report_paths;
 
-bool psp_write_failure_report(
+typedef struct {
+    bool transport_present;
+    long transport_code;
+    long tls_verify_result;
+    bool transport_timed_out;
+    bool tls12_compatibility_retry;
+    char tls_version[16];
+    bool network_present;
+    int network_status;
+    int network_failure_phase;
+    int requested_profile;
+    int selected_profile;
+    int apctl_state;
+    int wlan_switch_state;
+    int wlan_power_state;
+    uint32_t profile_query_success_mask;
+    uint32_t profile_query_failure_mask;
+    uint32_t initialization_adopted_mask;
+    unsigned profile_security_type;
+    bool profile_static_ip;
+    bool profile_manual_dns;
+    bool profile_uses_proxy;
+    bool profile_fallback_used;
+    size_t network_pump_calls;
+    uint64_t network_elapsed_us;
+    uint64_t network_maximum_pump_us;
+    int network_maximum_pump_phase;
+} PspFailureReportData;
+
+static bool psp_write_failure_report_data(
     const char *stage, const char *detail, const char *url,
-    long http_status, int native_result)
+    long http_status, int native_result,
+    const PspFailureReportData *diagnostics)
 {
+    PspFailureReportData absent = {0};
+    if (diagnostics == NULL) diagnostics = &absent;
     if (psp_failure_report_paths == NULL) return false;
     char path[TILEFINCH_INSTALL_PATH_LIMIT];
     char temporary[TILEFINCH_INSTALL_PATH_LIMIT];
@@ -47,14 +79,60 @@ bool psp_write_failure_report(
     FILE *file = fopen(temporary, "wb");
     if (file == NULL) return false;
     uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+    unsigned long long unix_time = (unsigned long long) time(NULL);
+#else
+    unsigned long long unix_time = 0;
+#endif
     bool okay = fprintf(
         file,
-        "tilefinch-device-error-v1\n"
-        "stage=%s\nhttp=%ld\nnative=0x%08x\nuptime-us=%llu\n"
-        "free=%d\nlargest=%d\nurl=%.2047s\ndetail=%.511s\n",
+        "tilefinch-device-error-v2\n"
+        "version=%s\nrelease-sequence=%llu\n"
+        "stage=%s\nhttp=%ld\nnative=0x%08x\n"
+        "uptime-us=%llu\nunix-time=%llu\nfree=%d\nlargest=%d\n"
+        "transport-present=%d\ncurl-code=%ld\ntimed-out=%d\n"
+        "tls-verify=0x%08lx\ntls-version=%s\ntls12-retry=%d\n"
+        "network-present=%d\nnetwork-status=%d\n"
+        "network-failure-phase=%d\nprofile-requested=%d\n"
+        "profile-selected=%d\nprofile-fallback=%d\napctl=%d\n"
+        "wlan-switch=%d\nwlan-power=%d\nprofile-query-ok=0x%08x\n"
+        "profile-query-failed=0x%08x\nprofile-adopted=0x%08x\n"
+        "profile-security=%u\nprofile-static-ip=%d\n"
+        "profile-manual-dns=%d\nprofile-proxy=%d\nnetwork-pumps=%zu\n"
+        "network-elapsed-us=%llu\nnetwork-max-pump-us=%llu\n"
+        "network-max-pump-phase=%d\nurl=%.2047s\ndetail=%.511s\n",
+        TILEFINCH_VERSION_STRING,
+        (unsigned long long) TILEFINCH_RELEASE_SEQUENCE,
         stage == NULL ? "unknown" : stage, http_status,
-        (unsigned) native_result, (unsigned long long) now_us,
+        (unsigned) native_result, (unsigned long long) now_us, unix_time,
         sceKernelTotalFreeMemSize(), sceKernelMaxFreeMemSize(),
+        diagnostics->transport_present ? 1 : 0,
+        diagnostics->transport_code,
+        diagnostics->transport_timed_out ? 1 : 0,
+        (unsigned long) diagnostics->tls_verify_result,
+        diagnostics->tls_version[0] == '\0'
+            ? "absent" : diagnostics->tls_version,
+        diagnostics->tls12_compatibility_retry ? 1 : 0,
+        diagnostics->network_present ? 1 : 0,
+        diagnostics->network_status,
+        diagnostics->network_failure_phase,
+        diagnostics->requested_profile,
+        diagnostics->selected_profile,
+        diagnostics->profile_fallback_used ? 1 : 0,
+        diagnostics->apctl_state,
+        diagnostics->wlan_switch_state,
+        diagnostics->wlan_power_state,
+        (unsigned) diagnostics->profile_query_success_mask,
+        (unsigned) diagnostics->profile_query_failure_mask,
+        (unsigned) diagnostics->initialization_adopted_mask,
+        diagnostics->profile_security_type,
+        diagnostics->profile_static_ip ? 1 : 0,
+        diagnostics->profile_manual_dns ? 1 : 0,
+        diagnostics->profile_uses_proxy ? 1 : 0,
+        diagnostics->network_pump_calls,
+        (unsigned long long) diagnostics->network_elapsed_us,
+        (unsigned long long) diagnostics->network_maximum_pump_us,
+        diagnostics->network_maximum_pump_phase,
         url == NULL ? "" : url, detail == NULL ? "" : detail) > 0;
     okay = fclose(file) == 0 && okay;
     if (!okay) {
@@ -74,6 +152,74 @@ bool psp_write_failure_report(
     }
     return true;
 }
+
+bool psp_write_failure_report(
+    const char *stage, const char *detail, const char *url,
+    long http_status, int native_result)
+{
+    return psp_write_failure_report_data(
+        stage, detail, url, http_status, native_result, NULL);
+}
+
+bool psp_write_navigation_failure_report(
+    const char *stage, const char *detail, const char *url,
+    const NavigationSession *navigation)
+{
+    if (navigation == NULL) {
+        return psp_write_failure_report(stage, detail, url, 0, 0);
+    }
+    PspFailureReportData diagnostics = {
+        .transport_present = true,
+        .transport_code = navigation->last_transport_code,
+        .tls_verify_result = navigation->last_tls_verify_result,
+        .transport_timed_out = navigation->last_transport_timed_out,
+        .tls12_compatibility_retry =
+            navigation->last_tls12_compatibility_retry
+    };
+    snprintf(diagnostics.tls_version, sizeof(diagnostics.tls_version),
+             "%s", navigation->last_tls_version);
+    return psp_write_failure_report_data(
+        stage, detail, url, navigation->last_http_status, 0,
+        &diagnostics);
+}
+
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+bool psp_write_network_failure_report(const PspNetwork *network)
+{
+    if (network == NULL) {
+        return psp_write_failure_report(
+            "network-association", "network state unavailable", NULL,
+            0, 0);
+    }
+    PspFailureReportData diagnostics = {
+        .network_present = true,
+        .network_status = network->status,
+        .network_failure_phase = network->failure_phase,
+        .requested_profile = network->requested_profile_index,
+        .selected_profile = network->profile_index,
+        .apctl_state = network->apctl_state,
+        .wlan_switch_state = network->wlan_switch_state,
+        .wlan_power_state = network->wlan_power_state,
+        .profile_query_success_mask = network->profile_query_success_mask,
+        .profile_query_failure_mask = network->profile_query_failure_mask,
+        .initialization_adopted_mask =
+            network->initialization_adopted_mask,
+        .profile_security_type = network->profile_security_type,
+        .profile_static_ip = network->profile_static_ip,
+        .profile_manual_dns = network->profile_manual_dns,
+        .profile_uses_proxy = network->profile_uses_proxy,
+        .profile_fallback_used = network->profile_fallback_used,
+        .network_pump_calls = network->pump_calls,
+        .network_elapsed_us = network->elapsed_us,
+        .network_maximum_pump_us = network->maximum_pump_us,
+        .network_maximum_pump_phase = network->maximum_pump_phase
+    };
+    return psp_write_failure_report_data(
+        "network-association",
+        psp_network_status_name(network->failure_phase), NULL, 0,
+        network->native_result, &diagnostics);
+}
+#endif
 
 bool psp_offline_url(const char *url)
 {
@@ -1050,6 +1196,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
 #endif
         .interactive = interactive
     };
+    psp_app_refresh_network_profile_label(
+        &app, (int) process->config.network_profile);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     bool input_script_loaded = psp_input_script_begin(
         &process->install_paths, argv0, process->config.input_script);
@@ -1067,6 +1215,13 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
 #endif
     while (!psp_exit_plan_requested(&interactive->exit)
            && !psp_home_exit_pending()) {
+        if ((process->presentation.ui.screen == PSP_UI_SCREEN_OPTIONS
+             || process->presentation.ui.screen
+                    == PSP_UI_SCREEN_OPTION_ITEMS)
+            && !process->presentation.ui.network_profile_label_valid) {
+            psp_app_refresh_network_profile_label(
+                &app, (int) process->config.network_profile);
+        }
         psp_log_set_phase(PSP_LOG_PHASE_INTERACTIVE);
         psp_log_heartbeat();
         /*
@@ -2634,10 +2789,10 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     }
                     if (navigation_status
                             != BROWSER_NAVIGATION_JOB_CANCELLED) {
-                        (void) psp_write_failure_report(
+                        (void) psp_write_navigation_failure_report(
                             "navigation",
                             browser_engine_last_error(browser->engine), process->presentation.ui.url,
-                            engine_views->navigation->last_http_status, 0);
+                            engine_views->navigation);
                     }
                     psp_ui_show_status(
                         &process->presentation.ui,
@@ -4520,6 +4675,8 @@ int main(int argc, char *argv[])
         browser_profile_persist_local_storage(browser.profile);
     process.presentation.ui.tls_session_persistence =
         tls_session_persistence;
+    process.presentation.ui.network_profile =
+        (uint8_t) process.config.network_profile;
     process.presentation.ui.javascript_enabled = javascript_enabled ? 1u : 0u;
     process.presentation.ui.site_data_allowed = site_data_allowed ? 1u : 0u;
     process.presentation.ui.mixed_content_site_allowed =
@@ -4759,9 +4916,9 @@ int main(int argc, char *argv[])
         loaded ? "initial-navigation-complete"
                : "initial-navigation-failed");
     if (!loaded && !initial_load_stopped) {
-        (void) psp_write_failure_report(
+        (void) psp_write_navigation_failure_report(
             "initial-navigation", engine_views.navigation->last_error, startup_url,
-            engine_views.navigation->last_http_status, 0);
+            engine_views.navigation);
     }
     psp_ui_set_loading(&process.presentation.ui, false, loaded ? 1000 : 0);
     if (loaded) {

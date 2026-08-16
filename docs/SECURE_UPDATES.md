@@ -1,22 +1,38 @@
 # Secure in-app updates
 
-Status: implemented. The official PSP preset embeds `trust/root-v1.tfur`, and
-Stable/Beta require signed metadata and packages rooted in that record. The
-bounded downloader and installer, redundant state journal, A/B slots, update
-screen, first-install tree, and stable trial/rollback launcher are part of the
-release build. The opt-in Developer channel may run in a root-empty contributor
-build without weakening Stable/Beta.
+Tilefinch can download and install a new browser release over Wi-Fi without
+requiring the user to remove the Memory Stick. Open **Options → System →
+Version and update** to check manually. Tilefinch shows the available version
+and release note before downloading, and it never installs or restarts without
+confirmation. Its optional background check only looks for signed release
+metadata while Wi-Fi is already connected; it never downloads the update
+package by itself.
 
-The host fault suite, real-root proof, package cut, and isolated HTTPS PPSSPP
-flow are the deterministic qualification path. Publishing a signed GitHub
-release additionally requires the manual signing and post-upload verification
-steps in [Release process](RELEASE_PROCESS.md).
+An update is installed into the inactive of two browser slots. The small
+launcher verifies the candidate before its first start, keeps the previous
+slot intact, and rolls back on the next launch if the new browser does not
+reach its health checkpoint. Holding L during startup selects the previous
+version. The user's profile, bookmarks, downloads, and other shared data live
+outside both browser slots.
 
-## What an ordinary user is protected by
+Stable is the default channel. Stable and Beta accept only releases authorized
+by Tilefinch's embedded public key; the private signing key is never shipped to
+the PSP or stored in this repository. The Developer channel is a separate,
+explicitly selected mode for testing a contributor's unsigned build from a URL
+entered on the device. It retains A/B installation and rollback, but it does
+not provide authenticity or a code sandbox.
 
-Read this first, because the rest of the document describes a deliberate
-unsigned mode and it is easy to mistake its existence for a weakening of the
-default.
+For contributors and release engineers, the implementation combines a fixed
+binary manifest, signed package size and SHA-256, per-file digests, a
+sequence-number anti-rollback floor, redundant state records, and a stable A/B
+launcher. The release preset embeds `trust/root-v1.tfur`; Stable and Beta chain
+to that record, while Developer remains unreachable until both its local URL
+and channel selection are configured. The host fault suite, production-root
+proof, package cut, and isolated HTTPS PPSSPP flow provide deterministic
+qualification. Publishing also requires the offline signing and post-upload
+checks in [Release process](RELEASE_PROCESS.md).
+
+## Security guarantees
 
 **Stable and Beta require a valid signature end to end and cannot be talked
 out of it.** Both fetch from fixed GitHub HTTPS endpoints compiled into the

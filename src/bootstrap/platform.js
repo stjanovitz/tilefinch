@@ -5985,9 +5985,9 @@
               model: "PSP-3000",
               platform: "PlayStation Portable",
               platformVersion: "6.61",
-              uaFullVersion: "0.1.0",
+              uaFullVersion: "0.1.1",
               fullVersionList: [
-                { brand: "Tilefinch", version: "0.1.0" },
+                { brand: "Tilefinch", version: "0.1.1" },
                 { brand: "Not.A/Brand", version: "99.0.0.0" },
               ],
             };

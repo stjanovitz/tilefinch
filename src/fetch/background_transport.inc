@@ -955,6 +955,12 @@ static void fetch_background_record_network_regression(CURLcode code)
 static void fetch_background_publish_complete(
     FetchBackgroundSlot *slot, bool success, CURLcode code)
 {
+    slot->result.transport_code = (long) code;
+    if (slot->easy != NULL) {
+        (void) curl_easy_getinfo(
+            slot->easy, CURLINFO_SSL_VERIFYRESULT,
+            &slot->result.tls_verify_result);
+    }
     slot->result.success = success;
     slot->result.length = slot->streaming
         ? slot->total_length : slot->length;
@@ -2272,6 +2278,8 @@ static void fetch_background_copy_response_metadata(
 {
     if (destination == NULL || source == NULL) return;
     destination->status_code = source->status_code;
+    destination->transport_code = source->transport_code;
+    destination->tls_verify_result = source->tls_verify_result;
     destination->negotiated_http_version = source->negotiated_http_version;
     destination->new_connections = source->new_connections;
     destination->tls_handshake_measured = source->tls_handshake_measured;
