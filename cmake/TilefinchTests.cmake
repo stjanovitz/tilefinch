@@ -786,6 +786,12 @@ if(PSP_BROWSER_BUILD_TESTS)
                     $<TARGET_FILE:psp-browser-trace-inventory>)
             set_tests_properties(tilefinch-trace-acquisition-tests PROPERTIES
                 LABELS "tilefinch;unit;acceptance;tooling;security"
+                # This adversarial test creates executable wrappers. On macOS,
+                # the first-execution scanner can stall them indefinitely when
+                # other process-heavy acceptance tests start concurrently.
+                # Serial execution keeps the security assertions intact and
+                # makes the release gate independent of that host scheduler.
+                RUN_SERIAL TRUE
                 TIMEOUT 150)
         endif()
     endif()
