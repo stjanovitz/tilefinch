@@ -118,16 +118,18 @@ int main(void)
         .now_unix = proof_now,
         .clock_valid = true,
         .launcher_protocol = TILEFINCH_UPDATE_LAUNCHER_PROTOCOL,
-        .installed_sequence = 1,
-        .installed_sequence_valid = true
+        .installed_sequence_valid = false
     };
     TilefinchUpdateVerifiedEnvelope verified = {0};
     CHECK(tilefinch_update_verify_envelope(
               envelope, envelope_length, &options, &verified)
           == TILEFINCH_UPDATE_OK);
     CHECK(verified.manifest.root_version == 1
-          && verified.manifest.release_sequence == 2
+          && verified.manifest.release_sequence > 0
           && verified.manifest.package_size == package_length);
+    const uint64_t release_sequence = verified.manifest.release_sequence;
+    const uint64_t previous_sequence = release_sequence - 1;
+    const uint64_t release_expiry = verified.manifest.expires_unix;
 
     /* The envelope binds the exact packed bytes. */
     uint8_t real_package_sha[32];
@@ -178,15 +180,16 @@ int main(void)
           || wrong_status == TILEFINCH_UPDATE_THRESHOLD
           || wrong_status == TILEFINCH_UPDATE_BAD_KEY);
 
-    /* Sequence 2 does not clear an installed floor of 3; re-offering the
-       installed sequence itself is allowed only for the identical package
-       (retry), and a different package at the same sequence is
-       equivocation. */
-    options.installed_sequence = 3;
+    /* The release does not clear a newer installed floor; re-offering its
+       own sequence is allowed only for the identical package (retry), and a
+       different package at the same sequence is equivocation. */
+    CHECK(release_sequence < UINT64_MAX);
+    options.installed_sequence_valid = true;
+    options.installed_sequence = release_sequence + 1;
     CHECK(tilefinch_update_verify_envelope(
               envelope, envelope_length, &options, &verified)
           == TILEFINCH_UPDATE_DOWNGRADE);
-    options.installed_sequence = 2;
+    options.installed_sequence = release_sequence;
     options.installed_pair_valid = true;
     memcpy(options.installed_package_sha256, real_package_sha, 32);
     CHECK(tilefinch_update_verify_envelope(
@@ -198,18 +201,19 @@ int main(void)
           == TILEFINCH_UPDATE_EQUIVOCATION);
     options.installed_pair_valid = false;
     memset(options.installed_package_sha256, 0, 32);
-    options.installed_sequence = 1;
+    options.installed_sequence = previous_sequence;
 
     /* Past the manifest expiry the envelope is dead. */
-    options.now_unix = UINT64_C(2100000000);
+    CHECK(release_expiry < UINT64_MAX);
+    options.now_unix = release_expiry + 1;
     CHECK(tilefinch_update_verify_envelope(
               envelope, envelope_length, &options, &verified)
           == TILEFINCH_UPDATE_EXPIRED);
     options.now_unix = proof_now;
 
     /* Re-verify cleanly, then walk the A/B transaction with the real
-       sequence pair: installed 1 in slot A, this package as the slot-B
-       candidate. */
+       sequence pair: the immediately previous sequence in slot A, this
+       package as the slot-B candidate. */
     CHECK(tilefinch_update_verify_envelope(
               envelope, envelope_length, &options, &verified)
           == TILEFINCH_UPDATE_OK);
@@ -218,7 +222,7 @@ int main(void)
         .active_slot = TILEFINCH_UPDATE_SLOT_A,
         .pending_slot = TILEFINCH_UPDATE_SLOT_B,
         .trial = TILEFINCH_UPDATE_TRIAL_PENDING,
-        .installed_sequence = 1,
+        .installed_sequence = previous_sequence,
         .candidate_sequence = verified.manifest.release_sequence
     };
     memcpy(state.candidate_sha256, verified.manifest.package_sha256, 32);
@@ -235,8 +239,8 @@ int main(void)
     CHECK(tilefinch_update_state_confirm_healthy(&state)
           && state.active_slot == TILEFINCH_UPDATE_SLOT_B
           && state.previous_slot == TILEFINCH_UPDATE_SLOT_A
-          && state.installed_sequence == 2
-          && state.previous_sequence == 1
+          && state.installed_sequence == release_sequence
+          && state.previous_sequence == previous_sequence
           && memcmp(state.installed_sha256,
                     verified.manifest.package_sha256, 32) == 0);
     /* The recovery button still reaches the previous healthy slot. */
