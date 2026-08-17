@@ -114,6 +114,8 @@ struct MediaHttpRange {
     bool wait_budget_armed;
     uint64_t last_read_offset;
     size_t last_read_length;
+    bool successor_prime_complete;
+    bool successor_prime_failed;
     MediaHttpRangeStats stats;
     char last_error[256];
 };
@@ -417,7 +419,7 @@ static bool range_stream_header_values(
     const char *admitted_url = effective_url == NULL
         || effective_url[0] == '\0' ? range->range_url : effective_url;
     /* Preserve the status even when the streaming header gate rejects before
-       terminal admission. The session's one-shot 403 re-resolution policy
+       terminal admission. The session's bounded 403 re-resolution policy
        depends on this classification; losing it turns an expired signed URL
        into a generic playback failure. */
     range->stats.last_http_status = status_code;
@@ -696,12 +698,13 @@ static TILEFINCH_OUT_OF_LINE void range_take_background_stream(
     taken->new_connections = result.new_connections;
     taken->handshake_measured = result.tls_handshake_measured;
     taken->handshake_us = result.tls_handshake_us;
+    bool values_admitted = range_admit_values(
+        range, aligned, aligned + wanted - 1u,
+        result.status_code, taken->received, result.content_range,
+        result.effective_url, result.error, success,
+        &taken->complete_length, taken->error, sizeof(taken->error));
     taken->admitted = success && range->fill_stream_headers_received
-        && range_admit_values(
-            range, aligned, aligned + wanted - 1u,
-            result.status_code, taken->received, result.content_range,
-            result.effective_url, result.error, success,
-            &taken->complete_length, taken->error, sizeof(taken->error));
+        && values_admitted;
 }
 
 static TILEFINCH_OUT_OF_LINE bool range_take_scheduler_stream(
@@ -722,12 +725,13 @@ static TILEFINCH_OUT_OF_LINE bool range_take_scheduler_stream(
     char content_range[128] = {0};
     (void) fetch_response_header_value(
         &result, "content-range", content_range, sizeof(content_range));
+    bool values_admitted = range_admit_values(
+        range, aligned, aligned + wanted - 1u,
+        result.status_code, taken->received, content_range,
+        result.effective_url, result.error, success,
+        &taken->complete_length, taken->error, sizeof(taken->error));
     taken->admitted = success && range->fill_stream_headers_received
-        && range_admit_values(
-            range, aligned, aligned + wanted - 1u,
-            result.status_code, taken->received, content_range,
-            result.effective_url, result.error, success,
-            &taken->complete_length, taken->error, sizeof(taken->error));
+        && values_admitted;
     fetch_result_destroy(&result);
     return true;
 }
@@ -1836,6 +1840,74 @@ bool media_http_range_pump(MediaHttpRange *range)
     range_prefetch(range);
     range_pump(range);
     return range->fill_request != 0;
+}
+
+MediaHttpRangePrimeStatus media_http_range_prime_successor(
+    MediaHttpRange *range)
+{
+    if (range == NULL || range->successor_prime_failed)
+        return MEDIA_HTTP_RANGE_PRIME_FAILED;
+    if (range->successor_prime_complete)
+        return MEDIA_HTTP_RANGE_PRIME_READY;
+    if (range->content_length <= range->cache_capacity) {
+        range->successor_prime_complete = true;
+        return MEDIA_HTTP_RANGE_PRIME_READY;
+    }
+
+    /* A metadata read beyond the prefix has already proved the property. */
+    if (range->cache_length != 0 && range->cache_offset != 0) {
+        range->successor_prime_complete = true;
+        return MEDIA_HTTP_RANGE_PRIME_READY;
+    }
+    for (unsigned at = 0; at < range->lookahead_count; at++) {
+        if (range->lookahead_length[at] != 0
+            && range->lookahead_offset[at] != 0) {
+            range->successor_prime_complete = true;
+            return MEDIA_HTTP_RANGE_PRIME_READY;
+        }
+    }
+    if (range->cache_length == 0) return MEDIA_HTTP_RANGE_PRIME_PENDING;
+
+    /* Substituted host transports are synchronous by contract. The shipping
+       PSP path below remains one bounded worker pump per call. */
+    uint64_t successor = range->cache_capacity;
+    if (!range_uses_async_transport(range)) {
+        unsigned char byte = 0;
+        MediaRangeReadStatus status = range_read_bounded(
+            range, successor, &byte, 1u, true);
+        range->successor_prime_complete =
+            status == MEDIA_RANGE_READ_COMPLETE;
+        range->successor_prime_failed =
+            status == MEDIA_RANGE_READ_FAILED;
+        return range->successor_prime_complete
+            ? MEDIA_HTTP_RANGE_PRIME_READY
+            : MEDIA_HTTP_RANGE_PRIME_FAILED;
+    }
+
+    size_t wanted = range_window_bytes(range, successor);
+    if (range->fill_request != 0 && range->fill_offset != successor) {
+        range_pump(range);
+        return MEDIA_HTTP_RANGE_PRIME_PENDING;
+    }
+    if (range->fill_request == 0) {
+        if (range->fill_attempts >= 2u
+            || !range_fill_issue(range, successor, wanted)) {
+            range->successor_prime_failed = true;
+            range->stats.failures++;
+            return MEDIA_HTTP_RANGE_PRIME_FAILED;
+        }
+    }
+    range_pump(range);
+    if (!range_fill_complete(range)) return MEDIA_HTTP_RANGE_PRIME_PENDING;
+    if (range_fill_install_lookahead(range, true)) {
+        range->successor_prime_complete = true;
+        return MEDIA_HTTP_RANGE_PRIME_READY;
+    }
+    if (range->fill_attempts < 2u)
+        return MEDIA_HTTP_RANGE_PRIME_PENDING;
+    range->successor_prime_failed = true;
+    range->stats.failures++;
+    return MEDIA_HTTP_RANGE_PRIME_FAILED;
 }
 
 void media_http_range_set_aggressive_readahead(

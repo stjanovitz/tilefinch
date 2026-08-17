@@ -100,7 +100,7 @@ static bool psp_write_failure_report_data(
         "profile-security=%u\nprofile-static-ip=%d\n"
         "profile-manual-dns=%d\nprofile-proxy=%d\nnetwork-pumps=%zu\n"
         "network-elapsed-us=%llu\nnetwork-max-pump-us=%llu\n"
-        "network-max-pump-phase=%d\nurl=%.2047s\ndetail=%.511s\n",
+        "network-max-pump-phase=%d\nurl=%.2047s\ndetail=%.1023s\n",
         TILEFINCH_VERSION_STRING,
         (unsigned long long) TILEFINCH_RELEASE_SEQUENCE,
         stage == NULL ? "unknown" : stage, http_status,
@@ -285,6 +285,15 @@ static void psp_media_platform_profile_changed(
     void *context, uint64_t now_us)
 {
     psp_profile_store_mark_dirty(context, now_us);
+}
+
+static bool psp_media_platform_write_failure_report(
+    void *context, const char *stage, const char *detail,
+    const char *url, long http_status, int native_result)
+{
+    (void) context;
+    return psp_write_failure_report(
+        stage, detail, url, http_status, native_result);
 }
 
 bool psp_request_omnibox(
@@ -4569,7 +4578,8 @@ int main(int argc, char *argv[])
         .free_memory = psp_media_platform_free_memory,
         .maximum_free_block = psp_media_platform_maximum_free_block,
         .resolve_offline = psp_offline_store_resolve_media,
-        .profile_changed = psp_media_platform_profile_changed
+        .profile_changed = psp_media_platform_profile_changed,
+        .write_failure_report = psp_media_platform_write_failure_report
     };
     psp_media_init(
         &browser.media, browser.budget, browser.session, browser.profile, process.storage.profile,

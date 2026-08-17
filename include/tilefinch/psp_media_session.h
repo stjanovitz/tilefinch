@@ -26,6 +26,7 @@ typedef enum {
     PSP_MEDIA_JOB_OPEN_RESOLVE,
     PSP_MEDIA_JOB_OPEN_VIDEO_RANGE,
     PSP_MEDIA_JOB_OPEN_VIDEO_DEMUX,
+    PSP_MEDIA_JOB_OPEN_VIDEO_PRIME,
     PSP_MEDIA_JOB_OPEN_AUDIO_RANGE,
     PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX,
     PSP_MEDIA_JOB_OPEN_DECODER_PREPARE,
@@ -52,6 +53,9 @@ typedef struct {
     bool (*resolve_offline)(
         void *context, const char *url, PspMediaOfflineSource *source);
     void (*profile_changed)(void *context, uint64_t now_us);
+    bool (*write_failure_report)(
+        void *context, const char *stage, const char *detail,
+        const char *url, long http_status, int native_result);
 } PspMediaSessionPlatform;
 
 typedef struct {
@@ -163,6 +167,11 @@ typedef struct {
     uint64_t network_buffer_total_us;
     size_t network_buffer_source_blocks_seen;
     unsigned network_buffer_events;
+    /* One prolonged-buffer snapshot and one terminal snapshot may be useful
+       for a route, but neither belongs on the hot path. The lifetime count
+       bounds Memory Stick writes even across many failing routes. */
+    unsigned failure_report_level;
+    unsigned failure_report_writes;
     bool range_pump_audio_first;
     BrowserYoutubeQuality requested_quality;
     bool quality_fallback_attempted;
@@ -188,7 +197,7 @@ typedef struct {
        outside PspMediaMachine prevents telemetry from becoming authority. */
     bool reopen_seek_completion_pending;
     bool resume_profile_dirty;
-    bool transport_reresolve_attempted;
+    unsigned transport_reresolve_attempts;
     uint64_t transport_refresh_rearm_us;
     uint64_t transport_next_expiry_check_us;
     bool offline_source;

@@ -1891,29 +1891,35 @@ static inline unsigned psp_media_admitted_quality(
 /*
  * A signed media URL may expire during a long pause or range reads may
  * start returning 403 after edge/IP rebinding. Re-resolution is deliberately
- * one-shot until the replacement stream proves stable; cancellation always
- * wins. Thirty seconds is enough to avoid opening a new demux over a URL
- * already at its boundary.
+ * bounded until the replacement stream proves stable; cancellation always
+ * wins. Two replacements cover an unusable first candidate plus one unlucky
+ * repeat without allowing a dead endpoint to create a resolve loop. Thirty
+ * seconds is enough to avoid opening a new demux over a URL already at its
+ * boundary.
  */
+#define PSP_MEDIA_TRANSPORT_REFRESH_MAXIMUM_ATTEMPTS 2u
+
 static inline bool psp_media_transport_refresh_policy(
-    bool already_attempted, bool cancelled,
+    unsigned attempts, bool cancelled,
     long video_http_status, long audio_http_status,
     uint64_t expires_unix, uint64_t now_unix)
 {
-    if (already_attempted || cancelled) return false;
+    if (attempts >= PSP_MEDIA_TRANSPORT_REFRESH_MAXIMUM_ATTEMPTS
+        || cancelled) return false;
     if (video_http_status == 403 || audio_http_status == 403) return true;
     return expires_unix != 0
         && expires_unix <= now_unix + UINT64_C(30);
 }
 
-/* Do not let a bad replacement URL create an immediate resolve loop. A
-   recovered stream earns another future refresh only after it has produced a
-   frame and advanced five seconds beyond the recovery point. */
+/* Do not let bad replacement URLs create an unbounded resolve loop. Once the
+   bounded candidate allowance has been used, a recovered stream earns a fresh
+   allowance only after it has produced a frame and advanced five seconds
+   beyond the recovery point. */
 static inline bool psp_media_transport_recovery_stable(
-    bool attempted, uint64_t rearm_at_us, uint64_t clock_us,
+    unsigned attempts, uint64_t rearm_at_us, uint64_t clock_us,
     bool received_frame)
 {
-    return attempted && received_frame && rearm_at_us != 0
+    return attempts != 0 && received_frame && rearm_at_us != 0
         && clock_us >= rearm_at_us;
 }
 

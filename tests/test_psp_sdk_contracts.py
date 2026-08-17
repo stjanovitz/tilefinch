@@ -608,6 +608,73 @@ class PspSdkContractTests(unittest.TestCase):
             close.index("psp_media_recovery_position_us(media)"),
             close.index("psp_media_cancel_decode(media)"))
 
+    def test_media_prime_rejection_refreshes_then_uses_bounded_240p(self):
+        open_source = without_comments(
+            (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+        retry = open_source[
+            open_source.index("bool psp_media_retry_transport("):
+            open_source.index("bool psp_media_retry_transport_expiry(")]
+        self.assertIn("delivery_candidate_rejected", retry)
+        self.assertIn(
+            "(!delivery_candidate_rejected && !refresh_needed)", retry)
+        self.assertIn('"pinned"', retry)
+        self.assertIn("quality-policy=%s", retry)
+
+        fallback = open_source[
+            open_source.index("bool psp_media_retry_240p("):
+            open_source.index("static bool psp_media_open_pump_step(")]
+        self.assertIn("if (delivery_candidate_rejected)", fallback)
+        self.assertIn("media->transport_reresolve_attempts++", fallback)
+        self.assertIn(
+            "PSP_MEDIA_TRANSPORT_REFRESH_MAXIMUM_ATTEMPTS", fallback)
+
+        failure = open_source[
+            open_source.index("bool delivery_candidate_rejected ="):
+            open_source.index("return true;", open_source.index(
+                "bool delivery_candidate_rejected ="))]
+        self.assertIn(
+            "phase_before == PSP_MEDIA_JOB_OPEN_VIDEO_PRIME", failure)
+        self.assertIn("video_stats.failures != 0", failure)
+        self.assertIn("psp_media_retry_delivery_failure(", failure)
+        policy = open_source[
+            open_source.index("bool psp_media_retry_delivery_failure("):
+            open_source.index("static bool psp_media_open_pump_step(")]
+        self.assertIn(
+            "media->transport_reresolve_attempts != 0", policy)
+        self.assertLess(
+            policy.index("psp_media_retry_240p("),
+            policy.index("psp_media_retry_transport("))
+        self.assertIn(
+            'psp_media_report_failure_snapshot( media, "media-open"',
+            " ".join(failure.split()))
+
+    def test_terminal_media_failure_writes_one_bounded_snapshot(self):
+        session = without_comments(
+            (ROOT / "src/psp_media_session.c").read_text(encoding="utf-8"))
+        report = session[
+            session.index("void psp_media_report_failure_snapshot("):
+            session.index("void psp_media_raise_error(")]
+        self.assertIn("failure_report_writes", report)
+        self.assertIn("PSP_MEDIA_FAILURE_REPORT_MAXIMUM_WRITES", report)
+        self.assertIn("video.last_read_offset", report)
+        self.assertIn("audio.last_read_offset", report)
+        self.assertIn("audio.bytes_in_flight", report)
+        self.assertIn("char detail[1024]", report)
+        self.assertIn("media->transport_reresolve_attempts", report)
+        raised = session[
+            session.index("void psp_media_raise_error("):
+            session.index("void psp_media_retire_first_frame(")]
+        self.assertIn("psp_media_report_failure_snapshot(", raised)
+        buffering = without_comments(
+            (ROOT / "src/psp_media_buffering.c").read_text(encoding="utf-8"))
+        self.assertIn('"media-buffering"', buffering)
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        self.assertIn(
+            ".write_failure_report = psp_media_platform_write_failure_report",
+            main)
+        self.assertIn('detail=%.1023s', main)
+
     def test_manual_media_retry_remembers_failure_position(self):
         source = without_comments(
             psp_media_session_sources())
@@ -3685,7 +3752,9 @@ class PspSdkContractTests(unittest.TestCase):
             session.index("void psp_media_raise_error("):
             session.index("void psp_media_retire_first_frame(")]
         self.assertIn("bool was_failed = media->ui.failed;", raised)
-        self.assertIn("if (!was_failed) (void) psp_log_flush(true);", raised)
+        self.assertIn("if (!was_failed) {", raised)
+        self.assertIn("psp_media_report_failure_snapshot(", raised)
+        self.assertIn("(void) psp_log_flush(true);", raised)
         # One sync as the panel becomes visible means one raise path: every
         # other failure surface in the session goes through the helper.
         self.assertEqual(session.count("psp_ui_media_set_error"), 2)

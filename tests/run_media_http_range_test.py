@@ -47,6 +47,8 @@ real completion detection, real admission checks.
             byte short, pinning bounded rejection without a stalled stream.
   expire403  admits the initial window and returns persistent 403s afterwards,
             matching a signed media URL which expires during playback.
+  prefix-short  admits the initial window and truncates every later 200 body.
+  prefix416  admits the initial window and rejects every later range with 416.
   bad206    returns a mismatched Content-Range and must never be admitted.
   ignore-range  ignores the range query and returns the full object.
   reset-always  closes every successor response after an admitted prefix.
@@ -303,10 +305,16 @@ class RangeHandler(BaseHTTPRequestHandler):
                 key = (mode, first, last)
                 attempt = CADENCE_ATTEMPTS.get(key, 0) + 1
                 CADENCE_ATTEMPTS[key] = attempt
-        if mode == "short" or (mode == "stream-short" and first != 0):
+        if (mode == "short"
+                or (mode in ("stream-short", "prefix-short") and first != 0)):
             payload = payload[:-1]
         if mode == "expire403" and first != 0:
             self.send_response(403)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if mode == "prefix416" and first != 0:
+            self.send_response(416)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return

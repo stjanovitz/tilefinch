@@ -247,6 +247,12 @@ static inline bool media_http_range_should_reconnect_starved(
 
 typedef struct MediaHttpRange MediaHttpRange;
 
+typedef enum {
+    MEDIA_HTTP_RANGE_PRIME_PENDING = 0,
+    MEDIA_HTTP_RANGE_PRIME_READY,
+    MEDIA_HTTP_RANGE_PRIME_FAILED
+} MediaHttpRangePrimeStatus;
+
 /*
  * Build the googlevideo-style range query without duplicating an existing
  * range parameter or appending after a URL fragment. Exposed so offline
@@ -284,6 +290,17 @@ bool media_http_range_resident(const MediaHttpRange *range,
  * where no sample was read. Returns true while a window is outstanding.
  */
 bool media_http_range_pump(MediaHttpRange *range);
+/*
+ * Prove that the source can serve bytes beyond its first cache window.
+ *
+ * Some signed media candidates return a valid prefix and reject every later
+ * query range.  A normal MP4 open can therefore succeed and fail only after
+ * seconds of visible playback.  This bounded, pumpable check reuses the
+ * ordinary successor window and retains it as lookahead, so default startup
+ * buffering validates delivery without issuing a throwaway request.
+ */
+MediaHttpRangePrimeStatus media_http_range_prime_successor(
+    MediaHttpRange *range);
 /* Ask for the sequential successor earlier while playback is intentionally
    buffering. This changes no allocation; metadata/seek reads retain the
    conservative quarter-window rule until callers opt in. */

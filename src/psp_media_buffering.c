@@ -137,6 +137,16 @@ void psp_media_buffering_update(
         printf("tilefinch-media-buffer: event=slow held=%lluus pending=%u\n",
                (unsigned long long) (now_us - media->network_buffer_started_us),
                fill_pending ? 1u : 0u);
+        /* One report for the route makes a player which remains on the
+           buffering surface diagnosable even if the transport never reaches
+           a terminal callback. The session-level writer cap keeps this far
+           below the Memory Stick write budget. */
+        psp_media_report_failure_snapshot(
+            media, "media-buffering", "BUFFERING EXCEEDED 20 SECONDS",
+            fill_pending
+                ? "range request still pending"
+                : "no range request pending",
+            false);
     }
 
     uint64_t remaining_us = psp_media_duration_us(media) > media->clock_us
@@ -170,4 +180,3 @@ void psp_media_buffering_update(
         }, "network-buffer-stable");
     }
 }
-

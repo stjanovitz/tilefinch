@@ -290,26 +290,32 @@ static bool psp_media_transport_refresh_needed(
     MediaHttpRangeStats audio = {0};
     (void) media_http_range_stats(media->range, &video);
     (void) media_http_range_stats(media->audio_range, &audio);
-    long failed_status = video.last_http_status == 403
-        ? video.last_http_status : audio.last_http_status;
-    if (failed_status == 403) {
-        if (status != NULL) *status = failed_status;
-    }
+    long failed_status = video.failures != 0
+        ? video.last_http_status
+        : audio.failures != 0
+            ? audio.last_http_status
+            : video.last_http_status != 0
+                ? video.last_http_status : audio.last_http_status;
+    if (status != NULL) *status = failed_status;
     uint64_t now = tilefinch_platform_wall_time_ns()
                  / UINT64_C(1000000000);
-    return psp_media_transport_refresh_policy(
+    return video.failures != 0 || audio.failures != 0
+        || psp_media_transport_refresh_policy(
         false, false, video.last_http_status, audio.last_http_status,
         media->stream.expires_unix, now);
 }
 
 bool psp_media_retry_transport(
-    PspMediaSession *media, const char *operation, const char *error)
+    PspMediaSession *media, const char *operation, const char *error,
+    bool delivery_candidate_rejected)
 {
     long status = 0;
+    bool refresh_needed = psp_media_transport_refresh_needed(media, &status);
     if (media == NULL || media->offline_source
-        || media->transport_reresolve_attempted
+        || media->transport_reresolve_attempts
+             >= PSP_MEDIA_TRANSPORT_REFRESH_MAXIMUM_ATTEMPTS
         || psp_media_cancel_requested(media)
-        || !psp_media_transport_refresh_needed(media, &status)) {
+        || (!delivery_candidate_rejected && !refresh_needed)) {
         return false;
     }
     uint64_t resume_us = psp_media_recovery_position_us(media);
@@ -343,7 +349,7 @@ bool psp_media_retry_transport(
             "VIDEO DECODER NEEDS APP RESTART");
         return true;
     }
-    media->transport_reresolve_attempted = true;
+    media->transport_reresolve_attempts++;
     media->transport_refresh_rearm_us =
         resume_us > UINT64_MAX - UINT64_C(5000000)
             ? UINT64_MAX : resume_us + UINT64_C(5000000);
@@ -366,11 +372,22 @@ bool psp_media_retry_transport(
     }
     char log_error[161];
     psp_youtube_log_text(error, log_error, sizeof(log_error));
+    const char *quality_policy =
+        media->requested_quality == BROWSER_YOUTUBE_QUALITY_240P
+        && !media->quality_fallback_attempted
+            ? "pinned"
+            : media->requested_quality == BROWSER_YOUTUBE_QUALITY_360P
+                ? "fallback-eligible" : "fallback-active";
     printf(
         "tilefinch-youtube: stage=transport-mid status=%ld "
-        "action=reresolve-once operation=%s resume=%lluus "
+        "action=reresolve operation=%s attempt=%u/%u candidate-rejected=%d "
+        "quality=%up quality-policy=%s resume=%lluus "
         "reason=\"%.160s\"\n",
         status, operation == NULL ? "unknown" : operation,
+        media->transport_reresolve_attempts,
+        PSP_MEDIA_TRANSPORT_REFRESH_MAXIMUM_ATTEMPTS,
+        delivery_candidate_rejected ? 1 : 0,
+        (unsigned) media->requested_quality, quality_policy,
         (unsigned long long) resume_us,
         log_error);
     return true;
@@ -386,15 +403,20 @@ bool psp_media_retry_transport_expiry(PspMediaSession *media)
         now_us > UINT64_MAX - UINT64_C(1000000)
             ? UINT64_MAX : now_us + UINT64_C(1000000);
     return psp_media_retry_transport(
-        media, "expiry", "media URL is near expiry");
+        media, "expiry", "media URL is near expiry", false);
 }
 
 bool psp_media_retry_240p(
-    PspMediaSession *media, const char *operation, const char *error)
+    PspMediaSession *media, const char *operation, const char *error,
+    bool delivery_candidate_rejected)
 {
     MediaBackendStats failure_stats = {0};
     if (media == NULL) return false;
-    if (psp_media_transport_refresh_needed(media, NULL)) return false;
+    if (!delivery_candidate_rejected
+        && psp_media_transport_refresh_needed(media, NULL)) return false;
+    if (delivery_candidate_rejected
+        && media->transport_reresolve_attempts
+             >= PSP_MEDIA_TRANSPORT_REFRESH_MAXIMUM_ATTEMPTS) return false;
     if (media_psp_backend_quarantined()) return false;
     if (media != NULL && media->playback != NULL
         && media_playback_backend_stats(
@@ -444,6 +466,15 @@ bool psp_media_retry_240p(
     }
     media->requested_quality = BROWSER_YOUTUBE_QUALITY_240P;
     media->quality_fallback_attempted = true;
+    if (delivery_candidate_rejected) {
+        /* This is the third delivery candidate, not an independent codec
+           fallback. Count it against the same per-incident replacement cap
+           so a CDN which rejects both qualities cannot form a resolve loop. */
+        media->transport_reresolve_attempts++;
+        media->transport_refresh_rearm_us =
+            resume_us > UINT64_MAX - UINT64_C(5000000)
+                ? UINT64_MAX : resume_us + UINT64_C(5000000);
+    }
     media->reopen_resume_us = resume_us;
     media->reopen_resume_playing = resume_playing;
     media->reopen_resume_pending = true;
@@ -470,13 +501,35 @@ bool psp_media_retry_240p(
     printf(
         "tilefinch-media-quality: fallback=360p-to-240p operation=%s "
         "resume=%lluus reason=\"%.160s\" system-free=%zu "
-        "system-largest=%zu\n",
+        "delivery-candidate=%d attempt=%u/%u system-largest=%zu\n",
         operation == NULL ? "unknown" : operation,
         (unsigned long long) resume_us,
         error == NULL ? "" : error,
         psp_media_free_memory(media),
+        delivery_candidate_rejected ? 1 : 0,
+        media->transport_reresolve_attempts,
+        PSP_MEDIA_TRANSPORT_REFRESH_MAXIMUM_ATTEMPTS,
         psp_media_maximum_free_block(media));
     return true;
+}
+
+bool psp_media_retry_delivery_failure(
+    PspMediaSession *media, const char *operation, const char *error,
+    bool delivery_candidate_rejected)
+{
+    if (media == NULL) return false;
+    bool failed = psp_media_transport_refresh_needed(media, NULL);
+    if (!delivery_candidate_rejected && !failed) return false;
+    /* Candidate one was the requested rendition. After one fresh URL at the
+       same quality fails, spend the final candidate on a separately resolved
+       240p rendition instead of asking the resolver for a third equivalent
+       360p URL. The quality retry increments the shared incident counter. */
+    if (media->requested_quality == BROWSER_YOUTUBE_QUALITY_360P
+        && media->transport_reresolve_attempts != 0
+        && psp_media_retry_240p(
+               media, operation, error, true)) return true;
+    return psp_media_retry_transport(
+        media, operation, error, delivery_candidate_rejected || failed);
 }
 
 static bool psp_media_open_pump_step(PspMediaSession *media);
@@ -567,6 +620,7 @@ static const char *psp_media_open_stage_name(PspMediaJobPhase phase)
         case PSP_MEDIA_JOB_OPEN_RESOLVE: return "resolve";
         case PSP_MEDIA_JOB_OPEN_VIDEO_RANGE: return "video-range";
         case PSP_MEDIA_JOB_OPEN_VIDEO_DEMUX: return "video-demux";
+        case PSP_MEDIA_JOB_OPEN_VIDEO_PRIME: return "video-prime";
         case PSP_MEDIA_JOB_OPEN_AUDIO_RANGE: return "audio-range";
         case PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX: return "audio-demux";
         case PSP_MEDIA_JOB_OPEN_DECODER_PREPARE: return "decoder-prepare";
@@ -740,6 +794,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         [PSP_MEDIA_JOB_OPEN_RESOLVE] = 80u,
         [PSP_MEDIA_JOB_OPEN_VIDEO_RANGE] = 360u,
         [PSP_MEDIA_JOB_OPEN_VIDEO_DEMUX] = 520u,
+        [PSP_MEDIA_JOB_OPEN_VIDEO_PRIME] = 600u,
         [PSP_MEDIA_JOB_OPEN_AUDIO_RANGE] = 650u,
         [PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX] = 760u,
         [PSP_MEDIA_JOB_OPEN_DECODER_PREPARE] = 220u,
@@ -936,10 +991,28 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         media->demux = media_mp4_open(
             media->budget, &reader, NULL, error, sizeof(error));
         ok = media->demux != NULL;
+        if (ok) media->job_phase = PSP_MEDIA_JOB_OPEN_VIDEO_PRIME;
+        break;
+    }
+    case PSP_MEDIA_JOB_OPEN_VIDEO_PRIME: {
+        MediaHttpRangePrimeStatus primed = media->offline_source
+                || !browser_profile_video_startup_buffering(media->profile)
+            ? MEDIA_HTTP_RANGE_PRIME_READY
+            : media_http_range_prime_successor(media->range);
+        if (primed == MEDIA_HTTP_RANGE_PRIME_PENDING) break;
+        ok = primed == MEDIA_HTTP_RANGE_PRIME_READY;
         if (ok) {
             media->job_phase = media->stream.split_streams
                 ? PSP_MEDIA_JOB_OPEN_AUDIO_RANGE
                 : PSP_MEDIA_JOB_OPEN_PLAYBACK;
+        } else {
+            MediaRangeReader reader = media_http_range_reader(media->range);
+            if (reader.describe_failure == NULL
+                || !reader.describe_failure(
+                       reader.opaque, error, sizeof(error))) {
+                snprintf(error, sizeof(error), "%s",
+                         "video delivery rejected a later range");
+            }
         }
         break;
     }
@@ -1181,8 +1254,16 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         }
         const char *failure =
             error[0] == '\0' ? "media open failed" : error;
-        bool fallback = psp_media_retry_transport(
-            media, "open", failure);
+        bool delivery_candidate_rejected =
+            phase_before == PSP_MEDIA_JOB_OPEN_VIDEO_PRIME
+            || video_stats.failures != 0 || audio_stats.failures != 0;
+        bool fallback = false;
+        /* Candidate one is the requested 360p stream, candidate two is a
+           fresh URL at the same quality, and candidate three is newly
+           resolved at 240p. Resolution is deliberately changed only after a
+           second candidate proves the problem is delivery, not one bad URL. */
+        fallback = psp_media_retry_delivery_failure(
+            media, "open", failure, delivery_candidate_rejected);
         /* Decoder-module preparation is independent of the selected video
            resolution.  Advertising a 240p retry here only repeats the same
            module failure and leaves the user waiting for a fallback which
@@ -1191,9 +1272,12 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         if (!fallback
             && phase_before != PSP_MEDIA_JOB_OPEN_DECODER_PREPARE) {
             fallback = psp_media_retry_240p(
-                media, "open", failure);
+                media, "open", failure, false);
         }
         if (!fallback) {
+            psp_media_report_failure_snapshot(
+                media, "media-open", "VIDEO COULD NOT OPEN", failure,
+                true);
             psp_media_pipeline_destroy(media);
             psp_media_job_failed(media, "open", failure);
         }

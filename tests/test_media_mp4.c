@@ -2930,23 +2930,26 @@ int main(void)
         }
     }
     CHECK(psp_media_transport_refresh_policy(
-              false, false, 403, 200, 0, 1000)
+              0u, false, 403, 200, 0, 1000)
           && psp_media_transport_refresh_policy(
-              false, false, 200, 200, 1029, 1000)
+              1u, false, 403, 200, 0, 1000)
+          && psp_media_transport_refresh_policy(
+              0u, false, 200, 200, 1029, 1000)
           && !psp_media_transport_refresh_policy(
-              false, false, 200, 200, 1031, 1000)
+              0u, false, 200, 200, 1031, 1000)
           && !psp_media_transport_refresh_policy(
-              true, false, 403, 200, 0, 1000)
+              PSP_MEDIA_TRANSPORT_REFRESH_MAXIMUM_ATTEMPTS,
+              false, 403, 200, 0, 1000)
           && !psp_media_transport_refresh_policy(
-              false, true, 403, 200, 0, 1000));
+              0u, true, 403, 200, 0, 1000));
     CHECK(!psp_media_transport_recovery_stable(
-              true, UINT64_C(5000000), UINT64_C(4999999), true)
+              1u, UINT64_C(5000000), UINT64_C(4999999), true)
           && !psp_media_transport_recovery_stable(
-              true, UINT64_C(5000000), UINT64_C(5000000), false)
+              1u, UINT64_C(5000000), UINT64_C(5000000), false)
           && !psp_media_transport_recovery_stable(
-              false, UINT64_C(5000000), UINT64_C(5000000), true)
+              0u, UINT64_C(5000000), UINT64_C(5000000), true)
           && psp_media_transport_recovery_stable(
-              true, UINT64_C(5000000), UINT64_C(5000000), true));
+              2u, UINT64_C(5000000), UINT64_C(5000000), true));
     uint32_t surface_canary[8] = {0};
     psp_media_surface_canary_fill(
         surface_canary,

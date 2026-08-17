@@ -828,6 +828,71 @@ static void test_expired_url_is_classified_and_replacement_resumes(
     CHECK(budget.current == 0);
 }
 
+static MediaHttpRangePrimeStatus pump_successor_prime(
+    MediaHttpRange *range)
+{
+    MediaHttpRangePrimeStatus status = MEDIA_HTTP_RANGE_PRIME_PENDING;
+    for (unsigned frame = 0; frame < 4000u; frame++) {
+        status = media_http_range_prime_successor(range);
+        if (status != MEDIA_HTTP_RANGE_PRIME_PENDING) break;
+        usleep(1000);
+    }
+    return status;
+}
+
+/* Playback must not commit a signed candidate merely because its prefix is
+   readable. The successful form retains the proven successor as ordinary
+   lookahead. Every refusal form remains a PRIME_FAILED result after one
+   bounded retry, including the non-403 shapes which require the session's
+   explicit candidate-rejection trigger rather than its expiry policy. */
+static void test_successor_prime_rejects_prefix_only_delivery(
+    int port, uint64_t length)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    const char *modes[] = {
+        "query200", "expire403", "prefix-short", "prefix416"
+    };
+    const MediaHttpRangePrimeStatus expected[] = {
+        MEDIA_HTTP_RANGE_PRIME_READY,
+        MEDIA_HTTP_RANGE_PRIME_FAILED,
+        MEDIA_HTTP_RANGE_PRIME_FAILED,
+        MEDIA_HTTP_RANGE_PRIME_FAILED
+    };
+    const long expected_http[] = {200, 403, 200, 416};
+    for (size_t mode = 0; mode < 4u; mode++) {
+        MediaHttpRange *range = open_range_with_lookahead(
+            &budget, modes[mode], port, length, 64u * 1024u);
+        CHECK(range != NULL);
+        if (range == NULL) continue;
+        MediaRangeReader reader = media_http_range_reader(range);
+        unsigned char header[8] = {0};
+        CHECK(reader.read(reader.opaque, 0, header, sizeof(header)));
+        MediaHttpRangePrimeStatus status = pump_successor_prime(range);
+        CHECK(status == expected[mode]);
+        MediaHttpRangeStats stats = {0};
+        CHECK(media_http_range_stats(range, &stats));
+        if (status == MEDIA_HTTP_RANGE_PRIME_READY) {
+            CHECK(media_http_range_resident(
+                      range, 64u * 1024u, 1u)
+                  && stats.requests == 2u
+                  && stats.retry_attempts == 0u
+                  && stats.failures == 0u);
+        } else {
+            char detail[256] = {0};
+            CHECK(stats.requests == 3u
+                  && stats.retry_attempts == 1u
+                  && stats.failures == 1u
+                  && stats.last_http_status == expected_http[mode]
+                  && reader.describe_failure(
+                         reader.opaque, detail, sizeof(detail))
+                  && detail[0] != '\0');
+        }
+        media_http_range_destroy(range);
+    }
+    CHECK(budget.current == 0);
+}
+
 static void test_repeated_connection_reset_is_bounded(
     int port, uint64_t length)
 {
@@ -1825,6 +1890,8 @@ int main(int argc, char **argv)
     test_rejected_stream_headers_fail_without_wedging(port, length);
     puts("test: an expired media URL is classified and can be replaced");
     test_expired_url_is_classified_and_replacement_resumes(port, length);
+    puts("test: startup proves delivery beyond the signed URL prefix");
+    test_successor_prime_rejects_prefix_only_delivery(port, length);
     puts("test: repeated connection resets stop after one retry");
     test_repeated_connection_reset_is_bounded(port, length);
     puts("test: corrupt range responses are never admitted");

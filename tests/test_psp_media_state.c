@@ -30,7 +30,7 @@ static bool open_to_priming(
         .autoplay = autoplay
     }));
     CHECK(machine->state == PSP_MEDIA_SESSION_OPENING);
-    unsigned completions = audio ? 7u : 5u;
+    unsigned completions = audio ? 8u : 6u;
     for (unsigned at = 0; at < completions; at++) {
         CHECK(apply(machine, (PspMediaEvent) {
             .type = PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE,
@@ -154,6 +154,10 @@ static bool test_video_only_skips_audio_open_phases(void)
         .type = PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE
     }));
     CHECK(machine.opening_phase == PSP_MEDIA_OPEN_VIDEO_DEMUX);
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE
+    }));
+    CHECK(machine.opening_phase == PSP_MEDIA_OPEN_VIDEO_PRIME);
     CHECK(apply(&machine, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE
     }));

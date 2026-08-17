@@ -140,6 +140,9 @@ static void psp_media_open_phase_complete(
         decision->next.pipeline = PSP_MEDIA_PIPELINE_PARTIAL;
         break;
     case PSP_MEDIA_OPEN_VIDEO_DEMUX:
+        decision->next.opening_phase = PSP_MEDIA_OPEN_VIDEO_PRIME;
+        break;
+    case PSP_MEDIA_OPEN_VIDEO_PRIME:
         decision->next.opening_phase = decision->next.has_separate_audio
             ? PSP_MEDIA_OPEN_AUDIO_RANGE
             : PSP_MEDIA_OPEN_PLAYBACK_CREATE;

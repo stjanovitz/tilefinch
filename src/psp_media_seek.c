@@ -285,10 +285,10 @@ bool psp_media_seek_decode_pump(
         if (!media_playback_seek(
                 media->playback, target_us, &actual_us,
                 error, sizeof(error))) {
-            if (psp_media_retry_transport(
-                    media, "seek-reset", error)) return true;
+            if (psp_media_retry_delivery_failure(
+                    media, "seek-reset", error, false)) return true;
             if (psp_media_retry_240p(
-                    media, "seek-reset", error)) return true;
+                    media, "seek-reset", error, false)) return true;
             psp_media_job_failed(
                 media, "seek",
                 error[0] == '\0' ? "media seek failed" : error);
@@ -438,10 +438,10 @@ bool psp_media_seek_decode_pump(
             return true;
         }
         if (result == MEDIA_PLAYBACK_ADVANCE_ERROR) {
-            if (psp_media_retry_transport(
-                    media, "seek-decode", error)) return true;
+            if (psp_media_retry_delivery_failure(
+                    media, "seek-decode", error, false)) return true;
             if (psp_media_retry_240p(
-                    media, "seek-decode", error)) return true;
+                    media, "seek-decode", error, false)) return true;
             psp_media_job_failed(media, "seek decode", error);
             return true;
         }
@@ -468,7 +468,7 @@ bool psp_media_seek_decode_pump(
                     PSP_MEDIA_SEEK_TIMEOUT_US)) {
                 if (psp_media_retry_240p(
                         media, "seek-timeout",
-                        "VIDEO SEEK TIMED OUT")) return true;
+                        "VIDEO SEEK TIMED OUT", false)) return true;
                 psp_media_job_failed(
                     media, "seek decode", "VIDEO SEEK TIMED OUT");
             }

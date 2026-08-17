@@ -63,6 +63,7 @@ static bool probe_remote_demux(
 {
     MediaHttpRangeOptions options = {
         .cache_bytes = 256u * 1024u,
+        .lookahead_windows = 1,
         .timeout_ms = 15000,
         .referer = referer,
         .url_validator = youtube_media_url_supported
@@ -98,7 +99,27 @@ static bool probe_remote_demux(
         stats.retry_attempts, stats.bytes_received,
         stats.failures, stats.last_http_status);
     bool traversed = true;
-    if (traverse) {
+    MediaHttpRangePrimeStatus primed = MEDIA_HTTP_RANGE_PRIME_PENDING;
+    for (unsigned step = 0; step < 20000u; step++) {
+        primed = media_http_range_prime_successor(range);
+        if (primed != MEDIA_HTTP_RANGE_PRIME_PENDING) break;
+        usleep(1000);
+    }
+    if (primed != MEDIA_HTTP_RANGE_PRIME_READY) {
+        char detail[256] = {0};
+        (void) reader.describe_failure(
+            reader.opaque, detail, sizeof(detail));
+        (void) media_http_range_stats(range, &stats);
+        fprintf(
+            stderr,
+            "%s delivery prime failed: %s "
+            "(requests=%zu retry=%zu fail=%zu http=%ld)\n",
+            label, detail[0] == '\0' ? "later range unavailable" : detail,
+            stats.requests, stats.retry_attempts,
+            stats.failures, stats.last_http_status);
+        traversed = false;
+    }
+    if (traverse && traversed) {
         size_t maximum_sample = media_mp4_default_limits().maximum_sample_bytes;
         for (size_t i = 0; i < media_mp4_track_count(demux); i++) {
             MediaMp4TrackInfo info = {0};

@@ -48,11 +48,19 @@ void psp_media_remember_retry_state(
     PspMediaSession *media, bool resume_playing);
 void psp_media_job_failed(
     PspMediaSession *media, const char *operation, const char *error);
+void psp_media_report_failure_snapshot(
+    PspMediaSession *media, const char *stage, const char *message,
+    const char *reason, bool terminal);
 bool psp_media_retry_transport_expiry(PspMediaSession *media);
 bool psp_media_retry_transport(
-    PspMediaSession *media, const char *operation, const char *error);
+    PspMediaSession *media, const char *operation, const char *error,
+    bool delivery_candidate_rejected);
+bool psp_media_retry_delivery_failure(
+    PspMediaSession *media, const char *operation, const char *error,
+    bool delivery_candidate_rejected);
 bool psp_media_retry_240p(
-    PspMediaSession *media, const char *operation, const char *error);
+    PspMediaSession *media, const char *operation, const char *error,
+    bool delivery_candidate_rejected);
 bool psp_media_open_pump(
     PspMediaSession *media,
     const TilefinchCancellation *cancellation);

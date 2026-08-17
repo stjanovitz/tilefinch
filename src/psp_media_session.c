@@ -71,12 +71,90 @@
 #define PSP_MEDIA_CONNECT_TIMEOUT_MS 3000
 #define PSP_OFFLINE_VIDEO_PREFIX \
     "https://tilefinch.local/offline/video?id="
+/* A failure snapshot is an exceptional Memory Stick write, never telemetry.
+   Leave two writes for non-media failures under the user's ten-write run
+   ceiling even if several distinct videos fail in one process. */
+#define PSP_MEDIA_FAILURE_REPORT_MAXIMUM_WRITES 8u
 
 uint64_t psp_media_recovery_position_us(
     const PspMediaSession *media);
+static uint64_t psp_media_now_us(const PspMediaSession *media);
 static void psp_media_apply_audio_hold(PspMediaSession *media);
 void psp_media_release_presentation_preroll(
     PspMediaSession *media, bool clear_floor);
+
+void psp_media_report_failure_snapshot(
+    PspMediaSession *media, const char *stage, const char *message,
+    const char *reason, bool terminal)
+{
+    if (media == NULL || media->platform.write_failure_report == NULL)
+        return;
+    unsigned level = terminal ? 2u : 1u;
+    if (media->failure_report_level >= level
+        || media->failure_report_writes
+             >= PSP_MEDIA_FAILURE_REPORT_MAXIMUM_WRITES) return;
+
+    MediaHttpRangeStats video = {0};
+    MediaHttpRangeStats audio = {0};
+    MediaBackendStats backend = {0};
+    (void) media_http_range_stats(media->range, &video);
+    (void) media_http_range_stats(media->audio_range, &audio);
+    if (media->playback != NULL)
+        (void) media_playback_backend_stats(media->playback, &backend);
+    long http_status = video.failures != 0
+        ? video.last_http_status
+        : audio.failures != 0
+            ? audio.last_http_status
+            : video.last_http_status != 0
+                ? video.last_http_status : audio.last_http_status;
+    uint64_t now_us = psp_media_now_us(media);
+    uint64_t buffering_us = media->buffering_service_active
+        && now_us >= media->network_buffer_started_us
+        ? now_us - media->network_buffer_started_us : 0;
+    /* Keep structured diagnostics first so even an unexpectedly long free-
+       text reason cannot hide the audio half of a split-stream failure. This
+       is failure-only stack storage; it never enlarges a frame-loop stack. */
+    char detail[1024];
+    snprintf(
+        detail, sizeof(detail),
+        "state=%d phase=%d quality=%u itag=%d attempts=%u/%u "
+        "fallback=%u clock-us=%llu "
+        "buffering=%d buffer-us=%llu "
+        "video-http=%ld video-fail=%zu video-req=%zu video-retry=%zu "
+        "video-bytes=%zu video-last=%llu+%zu video-pending=%d "
+        "video-inflight=%zu "
+        "audio-http=%ld audio-fail=%zu audio-req=%zu audio-retry=%zu "
+        "audio-bytes=%zu audio-last=%llu+%zu audio-pending=%d "
+        "audio-inflight=%zu message=%.96s reason=%.160s",
+        (int) media->machine.state, (int) media->job_phase,
+        (unsigned) media->requested_quality, media->stream.itag,
+        media->transport_reresolve_attempts,
+        PSP_MEDIA_TRANSPORT_REFRESH_MAXIMUM_ATTEMPTS,
+        media->quality_fallback_attempted ? 1u : 0u,
+        (unsigned long long) media->clock_us,
+        media->buffering_service_active ? 1 : 0,
+        (unsigned long long) buffering_us,
+        video.last_http_status, video.failures, video.requests,
+        video.retry_attempts, video.bytes_received,
+        (unsigned long long) video.last_read_offset,
+        video.last_read_length, video.window_pending ? 1 : 0,
+        video.bytes_in_flight,
+        audio.last_http_status, audio.failures, audio.requests,
+        audio.retry_attempts, audio.bytes_received,
+        (unsigned long long) audio.last_read_offset,
+        audio.last_read_length, audio.window_pending ? 1 : 0,
+        audio.bytes_in_flight,
+        message == NULL ? "media failure" : message,
+        reason == NULL ? "" : reason);
+    if (media->platform.write_failure_report(
+            media->platform.context,
+            stage == NULL ? "media-playback" : stage,
+            detail, media->source, http_status,
+            backend.last_native_error)) {
+        media->failure_report_level = level;
+        media->failure_report_writes++;
+    }
+}
 
 /*
  * Raise the failed player panel, and commit the validation log to the Memory
@@ -100,7 +178,11 @@ void psp_media_raise_error(
     } else {
         psp_ui_media_set_error(&media->ui, message);
     }
-    if (!was_failed) (void) psp_log_flush(true);
+    if (!was_failed) {
+        psp_media_report_failure_snapshot(
+            media, "media-playback", message, reason, true);
+        (void) psp_log_flush(true);
+    }
 }
 
 /*
@@ -1209,9 +1291,13 @@ void psp_media_prepare_route(
     media->preview_commit_resume_playing = false;
     media->reopen_reuse_resolved_stream = false;
     media->reopen_seek_completion_pending = false;
-    media->transport_reresolve_attempted = false;
+    /* A new route starts a new incident. The cap is not a process/session
+       lifetime allowance; it bounds candidate replacements until this route
+       proves stable playback. */
+    media->transport_reresolve_attempts = 0;
     media->transport_refresh_rearm_us = 0;
     media->transport_next_expiry_check_us = 0;
+    media->failure_report_level = 0;
     media->quality_fallbacks = 0;
     media->accumulated_decoded_video_frames = 0;
     media->accumulated_dropped_video_frames = 0;
@@ -1468,9 +1554,12 @@ void psp_media_execute_intent(PspMediaSession *media,
                     && media->playback != NULL) {
                     psp_media_remember_retry_state(media, false);
                 }
-                media->transport_reresolve_attempted = false;
+                /* An explicit Retry is a new incident initiated by the user,
+                   so it receives a fresh bounded candidate allowance. */
+                media->transport_reresolve_attempts = 0;
                 media->transport_refresh_rearm_us = 0;
                 media->transport_next_expiry_check_us = 0;
+                media->failure_report_level = 0;
                 media->open_service_pending = true;
                 psp_ui_media_set_resolving(&media->ui, "YouTube video");
                 psp_media_dispatch(media, (PspMediaEvent) {
@@ -1984,10 +2073,10 @@ bool psp_media_advance(
         return true;
     }
     if (advance == MEDIA_PLAYBACK_ADVANCE_ERROR) {
-        if (psp_media_retry_transport(
-                media, "decode", error)) return true;
+        if (psp_media_retry_delivery_failure(
+                media, "decode", error, false)) return true;
         if (psp_media_retry_240p(
-                media, "decode", error)) return true;
+                media, "decode", error, false)) return true;
         MediaHttpRangeStats video_http = {0};
         MediaHttpRangeStats audio_http = {0};
         (void) media_http_range_stats(media->range, &video_http);
@@ -2174,10 +2263,13 @@ bool psp_media_advance(
         }
         changed = true;
         if (psp_media_transport_recovery_stable(
-                media->transport_reresolve_attempted,
+                media->transport_reresolve_attempts,
                 media->transport_refresh_rearm_us,
                 media->clock_us, true)) {
-            media->transport_reresolve_attempted = false;
+            /* Reset only after a real frame and five seconds of playback.
+               The two-attempt cap therefore applies per transport incident,
+               not per media session; expiry hours later gets a fresh budget. */
+            media->transport_reresolve_attempts = 0;
             media->transport_refresh_rearm_us = 0;
             printf("tilefinch-youtube: stage=transport-mid "
                    "action=refresh-rearmed clock=%lluus\n",
@@ -2319,7 +2411,7 @@ bool psp_media_advance(
         >= psp_media_decode_no_progress_budget_ms(source_refilling)) {
         if (psp_media_retry_240p(
                 media, "no-progress",
-                "VIDEO DECODER MADE NO PROGRESS")) return true;
+                "VIDEO DECODER MADE NO PROGRESS", false)) return true;
         psp_media_remember_retry_state(media, media->ui.playing);
         media_playback_set_playing(media->playback, false);
         media->ui.playing = false;
@@ -2402,7 +2494,8 @@ bool psp_media_advance(
                Reserve that attempt for a decoder which genuinely stalled. */
             if (!network
                 && psp_media_retry_240p(
-                       media, "first-frame-timeout", reason)) return true;
+                       media, "first-frame-timeout", reason, false))
+                return true;
             psp_media_remember_retry_state(media, false);
             media_playback_set_playing(media->playback, false);
             media->ui.playing = false;
