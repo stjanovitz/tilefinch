@@ -846,7 +846,7 @@ static bool test_redirect_cors_trace_taint(
        replayed for CORS-mode requests: a same-origin final URL does not prove
        that the redirect chain stayed same-origin. */
     CHECK(trace_rewrite_record_version(
-              trace_directory, 0, "11", "7")
+              trace_directory, 0, "12", "7")
           && replace_trace_byte(
               meta_path, "redirect-origin-tainted", 'x')
           && trace_replay_rejects(
@@ -854,7 +854,7 @@ static bool test_redirect_cors_trace_taint(
           && replace_trace_byte(
               meta_path, "xedirect-origin-tainted", 'r')
           && trace_rewrite_record_version(
-              trace_directory, 0, "7", "11"));
+              trace_directory, 0, "7", "12"));
 
     /* Corpus startup now validates the complete finalized record inventory,
        including every body, before serving requests.  With that stronger

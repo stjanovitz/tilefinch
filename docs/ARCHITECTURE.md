@@ -282,6 +282,15 @@ the browser authorizes one hop, the worker executes it, and the next hop is not
 started until the browser accepts the result. Independent requests still run
 concurrently, and HTTP/2 multiplexing remains available.
 
+An authoritative navigation supersedes unfinished optional network work from
+its incumbent page before it queues the candidate document. The incumbent DOM
+and last frame remain intact for transactional rollback, but thumbnails,
+fonts, scripts, and page fetches cannot retain all six worker descriptors ahead
+of the link the user just activated. If the candidate is cancelled or fails,
+the incumbent remains usable but those superseded requests are not restarted;
+this is a deliberate responsiveness tradeoff until the transport grows a
+separate authoritative-priority lane.
+
 The release owns its curl, Mbed TLS, and nghttp2 chain. Archives are
 digest-pinned, runtime provenance is checked, HTTP/2 negotiates through ALPN
 with HTTP/1.1 fallback, and HTTP/3 is out of scope. By default, TLS sessions

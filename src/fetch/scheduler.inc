@@ -1508,6 +1508,16 @@ static bool scheduled_background_deliver_headers(
          || status == 307 || status == 308) && has_location;
     item->writer.has_response_location = has_location;
     item->writer.credentials_tainted = item->hop->credentials_tainted;
+    if (item->writer.redirect_response
+        && item->result.set_cookies_truncated) {
+        char message[112];
+        snprintf(
+            message, sizeof(message),
+            "redirect response exceeded the %u-cookie transport limit",
+            (unsigned) FETCH_RESPONSE_COOKIE_CAPACITY);
+        scheduled_background_abort(scheduler, item, message);
+        return false;
+    }
     if (!item->writer.redirect_response
         && status >= 400 && !item->request.allow_http_errors) {
         char message[96];

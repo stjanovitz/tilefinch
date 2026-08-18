@@ -45,8 +45,9 @@ stateDiagram-v2
         Resolving --> DecoderPrepare
         DecoderPrepare --> VideoRange
         VideoRange --> VideoDemux
-        VideoDemux --> AudioRange: separate audio track
-        VideoDemux --> PlaybackCreate: no separate audio track
+        VideoDemux --> VideoPrime
+        VideoPrime --> AudioRange: separate audio track
+        VideoPrime --> PlaybackCreate: no separate audio track
         AudioRange --> AudioDemux
         AudioDemux --> PlaybackCreate
     }
@@ -108,18 +109,15 @@ stateDiagram-v2
     state Quiescing {
         [*] --> StopAdmission
         StopAdmission --> CancelTransport
-        CancelTransport --> DrainCodec
-        DrainCodec --> JoinDMA: CODEC_DRAINED
-        DrainCodec --> QuarantineBackend: CODEC_TIMEOUT
-        JoinDMA --> ReleasePipeline: DMA_JOINED
-        JoinDMA --> QuarantineBackend: DMA_TIMEOUT
-        QuarantineBackend --> ReleasePipeline
+        CancelTransport --> QuiesceBackend
     }
 
-    Quiescing --> Idle: released and target=idle
-    Quiescing --> Opening: released and target=opening
-    Quiescing --> Suspended: released and target=suspended
-    Quiescing --> Failed: released and target=failed
+    Quiescing --> Idle: BACKEND_QUIESCED and target=idle
+    Quiescing --> Opening: BACKEND_QUIESCED and target=opening
+    Quiescing --> Suspended: BACKEND_QUIESCED and target=suspended
+    Quiescing --> Failed: BACKEND_QUIESCED and target=failed
+    Quiescing --> Suspended: BACKEND_QUARANTINED and target=suspended
+    Quiescing --> Failed: BACKEND_QUARANTINED
     Suspended --> Opening: RESUME with plan
     Suspended --> Idle: CLOSE
     Failed --> Opening: RETRY and backend healthy
@@ -152,6 +150,10 @@ no-ops, not absent cases. Important non-obvious cells include:
   safe recovery boundary;
 - `DECODER_REFUSED` during paused, priming, buffering, and seeking enters the
   same recovery discipline;
+- `PAUSE_AFTER_FRAME` records a one-shot boundary and `FRAME_DISPLAYED`
+  consumes it; ordinary frame presentation does not dispatch continuously;
+- preview start/end and playback end are explicit events, so seek chrome and
+  replay state are projections rather than parallel UI authority;
 - `CLOSE` and `SUSPEND` are accepted during opening and every active state;
 - repeated close/suspend events during quiescing cannot bypass its ownership
   ordering;
@@ -164,11 +166,14 @@ and check the resource invariant after every result.
 
 ## Effects and invoked services
 
-Transition commands only request work. They never wait for it. The quiescing
-service advances through bounded pumps and returns events such as
-`CODEC_DRAINED`, `CODEC_TIMEOUT`, `DMA_JOINED`, and `DMA_TIMEOUT`. Resource
-release is immediate only after the service established that no worker, DMA
-transfer, GE path, or borrowed surface can still reference the pipeline.
+Transition commands only request work. They never wait for it. The controller
+sees three truthful quiescing rungs: stop admission, cancel transport, and
+quiesce the backend. Codec drain, DMA join, timeout classification, and the
+quarantine decision remain inside backend ownership code because they are not
+independently pumpable controller services. That invoked backend service later
+returns `BACKEND_QUIESCED` or `BACKEND_QUARANTINED`. Resource release is
+immediate only after it established that no worker, DMA transfer, GE path, or
+borrowed surface can still reference the pipeline.
 
 Quiescing uses target-sensitive pump policy without changing its ordering:
 
@@ -184,6 +189,20 @@ Chrome is a pure projection of `(state, context)`, not a list of UI deltas.
 This prevents stale overlays and makes authoritative and shadow projections
 directly comparable. The projection describes visibility, progress overlay,
 control availability, playing state, and whether Retry is legal.
+
+Input handling and publication preserve that single authority. Revealing the
+controls, moving a seek preview, dismissing a preview, closing, and retrying
+already change useful UI state before their potentially slow service runs, so
+the frontend may publish those pixels before dispatch. Play/Pause is different:
+the input layer produces only a `PLAY` or `PAUSE` intent. The reducer consumes
+that event, commits the new state, and only then may the ordinary end-of-frame
+present publish the resulting glyph and legend. A pre-dispatch present for
+Play/Pause would expose the old projection for one vblank and the new one on
+the next, which appears as a flash across the bottom chrome.
+
+This is a presentation-order rule, not another lifecycle flag. The UI helper
+classifies whether an intent has meaningful pre-dispatch pixels; it never
+predicts the reducer's next state.
 
 ## Validation contract
 

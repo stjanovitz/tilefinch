@@ -1833,6 +1833,12 @@ static bool browser_engine_begin_navigation_request(
             TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "navigation-start",
             "browser navigation job cannot be started");
     }
+    /* Release incumbent-page transport lanes before the candidate scheduler
+       tries to enqueue its authoritative document request. On PSP the six
+       shared descriptors can otherwise all belong to thumbnails, fonts or
+       script fetches from the page whose link was just activated. */
+    (void) navigation_cancel_network_work(
+        &engine->navigation, "superseded by a new navigation");
     /* A candidate navigation keeps the incumbent page alive. End any gesture
        against that page before input is suppressed, so a release after a
        cancelled navigation cannot turn into a stale click. */
@@ -2303,6 +2309,13 @@ static bool browser_engine_run_load(BrowserEngine *engine,
             TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "navigation-start",
             "a responsive navigation job is already active");
     }
+    /* The incumbent remains the visual/DOM rollback candidate, but its
+       optional resource and script fetches must not occupy every shared PSP
+       transport descriptor ahead of the authoritative replacement. A
+       failed candidate can still restore the incumbent pixels and document;
+       only unfinished network embellishment is superseded. */
+    (void) navigation_cancel_network_work(
+        &engine->navigation, "superseded by a new navigation");
     browser_engine_cancel_idle_work(engine);
     (void) emit_diagnostic(
         engine, TILEFINCH_DIAGNOSTIC_INFO,

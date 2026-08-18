@@ -88,7 +88,7 @@ static int test_cooperative_site_adapter_navigation(void)
     CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
           && metrics.pump_calls > 6
           && metrics.load.pump_calls > 4
-          && metrics.load.body_bytes == 1017
+          && metrics.load.body_bytes == 1190
           && metrics.maximum_transform_slice_us < UINT64_C(50000)
           && metrics.transform_slices > 6
           && metrics.maximum_irreducible_unit_us < UINT64_C(100000)
@@ -537,6 +537,97 @@ static int test_reader_presentation_adapter(void)
     return 0;
 }
 
+static const char *test_youtube_preferred_language(void *opaque)
+{
+    (void) opaque;
+    return "fr";
+}
+
+static TilefinchDateFormat test_youtube_date_format_value;
+
+static TilefinchDateFormat test_youtube_preferred_date_format(void *opaque)
+{
+    (void) opaque;
+    return test_youtube_date_format_value;
+}
+
+static bool test_youtube_watch_metadata_case(
+    Budget *budget, const char *initial_data, const char *machine_date,
+    const char *expected_date, const char *expected_views,
+    const char *forbidden)
+{
+    char source[4096];
+    int length = snprintf(
+        source, sizeof(source),
+        "<script>var ytInitialData = '%s';</script>"
+        "<script>var ytInitialPlayerResponse={"
+        "\"videoDetails\":{\"videoId\":\"TFTEST00001\","
+        "\"title\":\"Fixture video\",\"author\":\"Fixture channel\","
+        "\"lengthSeconds\":\"19\",\"viewCount\":\"23\"},"
+        "\"microformat\":{\"playerMicroformatRenderer\":{"
+        "\"publishDate\":\"%s\"}}};</script>",
+        initial_data, machine_date);
+    if (length <= 0 || (size_t) length >= sizeof(source)) return false;
+    YoutubeLiteDocument document = {0};
+    char error[256] = {0};
+    bool built = youtube_lite_build_document(
+        budget, "https://www.youtube.com/watch?v=TFTEST00001",
+        source, (size_t) length, &document, error, sizeof(error));
+    bool matched = built
+        && strstr(document.html, expected_date) != NULL
+        && (expected_views == NULL
+            || strstr(document.html, expected_views) != NULL)
+        && (forbidden == NULL || strstr(document.html, forbidden) == NULL);
+    youtube_lite_document_destroy(&document);
+    return matched;
+}
+
+static int test_youtube_localized_watch_metadata(void)
+{
+    static const char english[] =
+        "{\"videoDescriptionHeaderRenderer\":{"
+        "\"views\":{\"runs\":[{\"text\":\"23 views\"}]},"
+        "\"publishDate\":{\"runs\":[{\"text\":\"Nov 10, \"},"
+        "{\"text\":\"2014\"}]}}}";
+    static const char japanese[] =
+        "{\"videoDescriptionHeaderRenderer\":{"
+        "\"views\":{\"runs\":[{\"text\":\"23\xe5\x9b\x9e\xe8\xa6\x96\xe8\x81\xb4\"}]},"
+        "\"publishDate\":{\"runs\":[{\"text\":\"2014/11/10\"}]}}}";
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    TilefinchPlatformServices services = {
+        .preferred_date_format = test_youtube_preferred_date_format
+    };
+    tilefinch_platform_set_services(&services);
+    test_youtube_date_format_value = TILEFINCH_DATE_FORMAT_YEAR_MONTH_DAY;
+    CHECK(test_youtube_watch_metadata_case(
+              &budget, english, "2014-11-10T06:05:55-08:00",
+              "Published Nov 10, 2014", "23 views", "23 views views")
+          && test_youtube_watch_metadata_case(
+              &budget, japanese, "2014-11-10T06:05:55-08:00",
+              "Published 2014/11/10", "23\xe5\x9b\x9e\xe8\xa6\x96\xe8\x81\xb4", "23 views"));
+    static const struct {
+        TilefinchDateFormat format;
+        const char *expected;
+    } numeric[] = {
+        {TILEFINCH_DATE_FORMAT_YEAR_MONTH_DAY, "Published 2005/04/23"},
+        {TILEFINCH_DATE_FORMAT_MONTH_DAY_YEAR, "Published 04/23/2005"},
+        {TILEFINCH_DATE_FORMAT_DAY_MONTH_YEAR, "Published 23/04/2005"}
+    };
+    for (size_t i = 0; i < sizeof(numeric) / sizeof(numeric[0]); i++) {
+        test_youtube_date_format_value = numeric[i].format;
+        CHECK(test_youtube_watch_metadata_case(
+            &budget, "{}", "2005-04-23", numeric[i].expected,
+            "23 views", "23 views views"));
+    }
+    CHECK(test_youtube_watch_metadata_case(
+        &budget, "{}", "not-a-date", "Published not-a-date",
+        "23 views", "23 views views"));
+    tilefinch_platform_set_services(NULL);
+    CHECK(budget.current == 0 && budget.external_reserved == 0);
+    return 0;
+}
+
 static int test_youtube_cooperative_build_convergence(void)
 {
     static const char url[] =
@@ -563,6 +654,14 @@ static int test_youtube_cooperative_build_convergence(void)
     char error[256] = {0};
     YoutubeLiteDocument expected = {0}, actual = {0};
     YoutubeLiteResolverIdentity resolver_identity = {0};
+    char cookie_header[256] = {0};
+    TilefinchPlatformServices services = {
+        .preferred_language = test_youtube_preferred_language,
+        .preferred_date_format = test_youtube_preferred_date_format
+    };
+    test_youtube_date_format_value =
+        TILEFINCH_DATE_FORMAT_YEAR_MONTH_DAY;
+    tilefinch_platform_set_services(&services);
     CHECK(browser_session_init(&session, &budget, 512u * 1024u)
           && youtube_lite_build_document_with_comments(
               &budget, url, primary, primary_length,
@@ -576,12 +675,20 @@ static int test_youtube_cooperative_build_convergence(void)
               &session, &resolver_identity)
           && resolver_identity.api_key[0] != '\0'
           && resolver_identity.visitor[0] != '\0'
+          && browser_session_cookie_header(
+              &session, "https://m.youtube.com/", cookie_header,
+              sizeof(cookie_header))
+          && strstr(cookie_header, "PREF=hl=fr&tz=UTC") != NULL
           && actual.html_length == expected.html_length
           && actual.result_count == expected.result_count
           && actual.route == expected.route
+          && strstr(actual.html, "Published 23 avr. 2005") != NULL
+          && strstr(actual.html, "1 234 vues") != NULL
+          && strstr(actual.html, "1 234 vues views") == NULL
           && memcmp(
               actual.html, expected.html, expected.html_length) == 0);
     fetch_trace_end();
+    tilefinch_platform_set_services(NULL);
     youtube_lite_document_destroy(&actual);
     youtube_lite_document_destroy(&expected);
     browser_session_destroy(&session);

@@ -424,11 +424,20 @@ class RedirectHandler(BaseHTTPRequestHandler):
         elif path == "/response-cookie-capacity":
             self.reply(200, b"response-cookie-capacity", tuple(
                 ("Set-Cookie", f"cookie{i}=value; Path=/")
-                for i in range(16)))
+                for i in range(32)))
+        elif path == "/response-cookie-twenty":
+            self.reply(200, b"response-cookie-twenty", tuple(
+                ("Set-Cookie", f"cookie{i}=value; Path=/")
+                for i in range(20)))
         elif path == "/response-cookie-overflow":
             self.reply(200, b"response-cookie-overflow", tuple(
                 ("Set-Cookie", f"cookie{i}=value; Path=/")
-                for i in range(17)))
+                for i in range(33)))
+        elif path == "/redirect-cookie-overflow":
+            self.reply(302, b"redirect-cookie-overflow", (
+                (("Location", "/final"),)
+                + tuple(("Set-Cookie", f"cookie{i}=value; Path=/")
+                        for i in range(33))))
         elif path == "/duplicate-client-hints":
             self.reply(200, b"duplicate-client-hints", (
                 ("Accept-CH", "Sec-CH-UA-Arch"),

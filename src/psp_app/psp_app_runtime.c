@@ -7,6 +7,7 @@
  * writers. Ordinary browser resources remain in the canonical owner records.
  */
 #include "psp_app_internal.h"
+#include <psputility_sysparam.h>
 #include "tilefinch/psp_threads.h"
 
 PspMediaSession *psp_active_media;
@@ -228,6 +229,64 @@ uint64_t psp_wall_time_ns(void *context)
     time_t seconds = time(NULL);
     return seconds <= 0 ? 0
         : (uint64_t) seconds * UINT64_C(1000000000);
+}
+
+const char *psp_preferred_language(void *context)
+{
+    (void) context;
+    /* HOME is presented before platform services are installed, and this
+       callback is not invoked until the YouTube provider starts its first
+       request. Cache that one firmware query for the process lifetime. */
+    static const char *cached;
+    if (cached != NULL) return cached;
+    int language = PSP_SYSTEMPARAM_LANGUAGE_ENGLISH;
+    if (sceUtilityGetSystemParamInt(
+            PSP_SYSTEMPARAM_ID_INT_LANGUAGE, &language) < 0) {
+        cached = "en";
+        return cached;
+    }
+    switch (language) {
+    case PSP_SYSTEMPARAM_LANGUAGE_JAPANESE: cached = "ja"; break;
+    case PSP_SYSTEMPARAM_LANGUAGE_FRENCH: cached = "fr"; break;
+    case PSP_SYSTEMPARAM_LANGUAGE_SPANISH: cached = "es"; break;
+    case PSP_SYSTEMPARAM_LANGUAGE_GERMAN: cached = "de"; break;
+    case PSP_SYSTEMPARAM_LANGUAGE_ITALIAN: cached = "it"; break;
+    case PSP_SYSTEMPARAM_LANGUAGE_DUTCH: cached = "nl"; break;
+    case PSP_SYSTEMPARAM_LANGUAGE_PORTUGUESE: cached = "pt"; break;
+    case PSP_SYSTEMPARAM_LANGUAGE_RUSSIAN: cached = "ru"; break;
+    case PSP_SYSTEMPARAM_LANGUAGE_KOREAN: cached = "ko"; break;
+    case PSP_SYSTEMPARAM_LANGUAGE_CHINESE_TRADITIONAL:
+        cached = "zh-TW";
+        break;
+    case PSP_SYSTEMPARAM_LANGUAGE_CHINESE_SIMPLIFIED:
+        cached = "zh-CN";
+        break;
+    case PSP_SYSTEMPARAM_LANGUAGE_ENGLISH:
+    default:
+        cached = "en";
+        break;
+    }
+    return cached;
+}
+
+TilefinchDateFormat psp_preferred_date_format(void *context)
+{
+    (void) context;
+    /* Like the language query, this is first reached while a provider builds
+       an already-fetched watch page, never during native HOME startup. */
+    static bool cached;
+    static TilefinchDateFormat value;
+    if (cached) return value;
+    int format = PSP_SYSTEMPARAM_DATE_FORMAT_YYYYMMDD;
+    if (sceUtilityGetSystemParamInt(
+            PSP_SYSTEMPARAM_ID_INT_DATE_FORMAT, &format) >= 0) {
+        if (format == PSP_SYSTEMPARAM_DATE_FORMAT_MMDDYYYY)
+            value = TILEFINCH_DATE_FORMAT_MONTH_DAY_YEAR;
+        else if (format == PSP_SYSTEMPARAM_DATE_FORMAT_DDMMYYYY)
+            value = TILEFINCH_DATE_FORMAT_DAY_MONTH_YEAR;
+    }
+    cached = true;
+    return value;
 }
 
 void psp_log_message(void *context, const char *message)
@@ -1599,6 +1658,28 @@ static void psp_present_supervisor_media(const PspUiMediaState *media)
 {
     if (media == NULL
         || !psp_lifecycle_presentation_allowed(&psp_lifecycle)) return;
+    if (psp_display_video_active(&psp_display)) {
+        /* A cooperative preview seek must not switch the panel from the
+           32-bit video surface to a separately-cleared 16-bit surface merely
+           to acknowledge input. That format/latch round trip was visible on
+           hardware as a flash across the lower player chrome. Freeze the
+           last complete front frame into the free buffer and overwrite only
+           the scrubber's opaque rows; the decoder surface is neither sampled
+           nor retained here. Copying the already-composited title/badge is
+           safe because this path deliberately does not redraw them. */
+        uint32_t *front = psp_display_video_front_buffer(&psp_display);
+        uint32_t *back = psp_display_video_back_buffer(&psp_display);
+        uint16_t *scratch =
+            psp_display_video_overlay_scratch(&psp_display);
+        if (front != NULL && back != NULL && scratch != NULL) {
+            memcpy(back, front, PSP_DISPLAY_VIDEO_BUFFER_BYTES);
+            psp_ui_media_composite_controls_8888(
+                media, back, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT,
+                PSP_VRAM_STRIDE, scratch);
+            (void) psp_display_publish(&psp_display);
+            return;
+        }
+    }
     /* This composes 16-bit rows. Every such site asserts the surface it is
        about to write rather than assuming the last present left it there --
        the supervisor runs on the callback thread and cannot know. */

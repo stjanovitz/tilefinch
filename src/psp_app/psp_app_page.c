@@ -623,12 +623,17 @@ void psp_report_background_transport_metrics(void)
     if (!fetch_background_transport_metrics(&metrics)) return;
     printf("tilefinch-background-transport: stream-starts=%zu "
            "fixed-starts=%zu peak-stream=%zu peak-fixed=%zu "
+           "slots=%zu queued=%zu running=%zu complete=%zu "
            "performs=%zu polls=%zu headers=%zu bodies=%zu "
            "completions=%zu multi=%d running=%d\n",
            metrics.streaming_started,
            metrics.fixed_started,
            metrics.peak_streaming_active,
            metrics.peak_fixed_active,
+           metrics.occupied_slots,
+           metrics.queued_slots,
+           metrics.running_slots,
+           metrics.complete_slots,
            metrics.worker_performs,
            metrics.worker_polls,
            metrics.header_callbacks,

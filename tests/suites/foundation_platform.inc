@@ -879,7 +879,7 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
         && strstr(document.html, "Fixture video &amp; friends") != NULL
         && strstr(document.html, "Fixture channel") != NULL
         && strstr(document.html, "0:19") != NULL
-        && strstr(document.html, "Published 2005-04-23") != NULL
+        && strstr(document.html, "Published 2005/04/23") != NULL
         && strstr(document.html, "Category: People &amp; Blogs") != NULL
         && strstr(document.html,
                   "The first line.<br>Second &lt;line&gt;.") != NULL

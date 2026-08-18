@@ -59,10 +59,10 @@ static uint32_t ui_media_widen(uint16_t pixel)
         | ((uint32_t) blue << 16) | UINT32_C(0xff000000);
 }
 
-void psp_ui_media_composite_8888(
+static void ui_media_composite_8888(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     uint32_t *pixels, int width, int height, int stride,
-    uint16_t *scratch)
+    uint16_t *scratch, bool controls_only)
 {
     if (media == NULL || pixels == NULL || scratch == NULL
         || width <= 0 || height <= 0 || stride < width) return;
@@ -70,6 +70,16 @@ void psp_ui_media_composite_8888(
     size_t count = psp_ui_media_overlay_bands(
         media, width, height, bands, PSP_UI_MEDIA_OVERLAY_BAND_LIMIT);
     if (count == 0) return;
+    if (controls_only) {
+        size_t bottom = count;
+        while (bottom != 0u) {
+            bottom--;
+            if (bands[bottom].bottom == height) break;
+        }
+        if (bands[bottom].bottom != height) return;
+        bands[0] = bands[bottom];
+        count = 1u;
+    }
     for (size_t band = 0; band < count; band++) {
         for (int y = bands[band].top; y < bands[band].bottom; y++) {
             const uint32_t *source = pixels + (size_t) y * (size_t) stride;
@@ -81,8 +91,13 @@ void psp_ui_media_composite_8888(
     /* The scratch is stride-wide and full-height, so every coordinate the
        composite computes -- centres, panel rectangles, the bottom edge -- is
        the coordinate it would have used on the real surface. */
-    psp_ui_media_composite_with_preview(
-        media, preview, scratch, width, height, stride);
+    if (controls_only) {
+        psp_ui_media_composite_controls(
+            media, scratch, width, height, stride);
+    } else {
+        psp_ui_media_composite_with_preview(
+            media, preview, scratch, width, height, stride);
+    }
     for (size_t band = 0; band < count; band++) {
         for (int y = bands[band].top; y < bands[band].bottom; y++) {
             const uint16_t *source = scratch + (size_t) y * (size_t) stride;
@@ -91,4 +106,21 @@ void psp_ui_media_composite_8888(
                 destination[x] = ui_media_widen(source[x]);
         }
     }
+}
+
+void psp_ui_media_composite_8888(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    uint32_t *pixels, int width, int height, int stride,
+    uint16_t *scratch)
+{
+    ui_media_composite_8888(
+        media, preview, pixels, width, height, stride, scratch, false);
+}
+
+void psp_ui_media_composite_controls_8888(
+    const PspUiMediaState *media, uint32_t *pixels,
+    int width, int height, int stride, uint16_t *scratch)
+{
+    ui_media_composite_8888(
+        media, NULL, pixels, width, height, stride, scratch, true);
 }

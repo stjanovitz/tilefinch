@@ -13,6 +13,12 @@ typedef struct {
     int16_t analog_y;
 } TilefinchPlatformInput;
 
+typedef enum {
+    TILEFINCH_DATE_FORMAT_YEAR_MONTH_DAY = 0,
+    TILEFINCH_DATE_FORMAT_MONTH_DAY_YEAR,
+    TILEFINCH_DATE_FORMAT_DAY_MONTH_YEAR
+} TilefinchDateFormat;
+
 enum {
     TILEFINCH_PLATFORM_BUTTON_UP = 1u << 0,
     TILEFINCH_PLATFORM_BUTTON_DOWN = 1u << 1,
@@ -32,6 +38,14 @@ typedef struct {
        exposes this unit. Hot scheduling checkpoints should use this rather
        than manufacturing nanoseconds and dividing them back down. */
     uint64_t (*monotonic_time_us)(void *context);
+    /* Optional stable BCP-47 language tag. Implementations may query the
+       device lazily on first use; the returned storage must remain valid for
+       the installed service lifetime. */
+    const char *(*preferred_language)(void *context);
+    /* Optional numeric date order. It is consulted only when a provider did
+       not supply localized display text, so implementations may query the
+       device lazily without adding work to startup. */
+    TilefinchDateFormat (*preferred_date_format)(void *context);
     bool (*secure_random)(void *context, void *data, size_t length);
     bool (*read_asset)(void *context, Budget *budget, const char *path,
                        size_t maximum_bytes, unsigned char **data,
@@ -51,6 +65,8 @@ void tilefinch_platform_set_services(const TilefinchPlatformServices *services);
 uint64_t tilefinch_platform_wall_time_ns(void);
 uint64_t tilefinch_platform_monotonic_time_ns(void);
 uint64_t tilefinch_platform_monotonic_time_us(void);
+const char *tilefinch_platform_preferred_language(void);
+TilefinchDateFormat tilefinch_platform_preferred_date_format(void);
 bool tilefinch_platform_secure_random(void *data, size_t length);
 bool tilefinch_platform_read_asset(Budget *budget, const char *path,
                                 size_t maximum_bytes, unsigned char **data,

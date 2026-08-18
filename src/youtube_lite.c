@@ -31,6 +31,7 @@
 #define YOUTUBE_LITE_DESCRIPTION_SUMMARY_LIMIT 512
 #define YOUTUBE_LITE_COMMENT_TEXT_LIMIT 384
 #define YOUTUBE_LITE_CONTINUATION_LIMIT 1024
+#define YOUTUBE_LITE_LANGUAGE_LIMIT 8
 #define YOUTUBE_LITE_IDENTITY_CACHE_KEY "youtube-mweb-identity-v1"
 #define YOUTUBE_LITE_IDENTITY_CACHE_VERSION 1u
 #define YOUTUBE_LITE_IDENTITY_CACHE_MAX_AGE_NS \
@@ -56,6 +57,7 @@ typedef struct {
     char description[YOUTUBE_LITE_DESCRIPTION_LIMIT];
     char published[YOUTUBE_LITE_METADATA_LIMIT];
     char category[YOUTUBE_LITE_METADATA_LIMIT];
+    bool localized_views;
 } YoutubeLiteWatch;
 
 static bool lite_header_value_safe(const char *value)
@@ -77,6 +79,19 @@ static bool lite_api_token_safe(const char *value, bool allow_dot)
             && (!allow_dot || *at != '.')) return false;
     }
     return true;
+}
+
+static const char *lite_preferred_language(void)
+{
+    static const char *const supported[] = {
+        "ja", "en", "fr", "es", "de", "it", "nl", "pt", "ru", "ko",
+        "zh-TW", "zh-CN"
+    };
+    const char *language = tilefinch_platform_preferred_language();
+    for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
+        if (strcmp(language, supported[i]) == 0) return supported[i];
+    }
+    return "en";
 }
 
 typedef struct {
@@ -704,13 +719,32 @@ static bool lite_parse_video(const YoutubeLiteSpan *renderer,
     return true;
 }
 
+enum {
+    YOUTUBE_LITE_RENDERER_VIDEO_WITH_CONTEXT = 0,
+    YOUTUBE_LITE_RENDERER_VIDEO,
+    YOUTUBE_LITE_RENDERER_GRID_VIDEO,
+    YOUTUBE_LITE_RENDERER_COMPACT_VIDEO,
+    YOUTUBE_LITE_RENDERER_DESCRIPTION_HEADER
+};
+
+typedef struct {
+    const char *name;
+    unsigned char length;
+} YoutubeLiteRendererKey;
+
 static bool lite_next_video_renderer(
     const YoutubeLiteSpan *scope, const char *after,
+    bool include_description_header,
     YoutubeLiteSpan *renderer, size_t *kind)
 {
-    static const char *keys[] = {
-        "videoWithContextRenderer", "videoRenderer",
-        "gridVideoRenderer", "compactVideoRenderer"
+    static const YoutubeLiteRendererKey keys[] = {
+        {"videoWithContextRenderer",
+         sizeof("videoWithContextRenderer") - 1u},
+        {"videoRenderer", sizeof("videoRenderer") - 1u},
+        {"gridVideoRenderer", sizeof("gridVideoRenderer") - 1u},
+        {"compactVideoRenderer", sizeof("compactVideoRenderer") - 1u},
+        {"videoDescriptionHeaderRenderer",
+         sizeof("videoDescriptionHeaderRenderer") - 1u}
     };
     if (scope == NULL || renderer == NULL || kind == NULL) return false;
     const char *at = after == NULL || after < scope->start
@@ -722,13 +756,22 @@ static bool lite_next_video_renderer(
         for (const char *back = quote;
              back > scope->start && back[-1] == '\\'; back--) slashes++;
         if ((slashes & 1u) == 0) {
-            for (size_t candidate = 0;
-                 candidate < sizeof(keys) / sizeof(keys[0]); candidate++) {
-                size_t key_length = strlen(keys[candidate]);
+            size_t key_count = include_description_header
+                ? sizeof(keys) / sizeof(keys[0])
+                : YOUTUBE_LITE_RENDERER_DESCRIPTION_HEADER;
+            for (size_t candidate = 0; candidate < key_count; candidate++) {
+                size_t key_length = keys[candidate].length;
                 const char *key_start = quote + 1;
+                size_t remaining = (size_t) (scope->end - key_start);
+                if (remaining <= key_length
+                    || *key_start != keys[candidate].name[0]) {
+                    continue;
+                }
                 const char *key_end = key_start + key_length;
-                if (key_end >= scope->end || *key_end != '"'
-                    || memcmp(key_start, keys[candidate], key_length) != 0) {
+                if (*key_end != '"'
+                    || memcmp(
+                           key_start, keys[candidate].name,
+                           key_length) != 0) {
                     continue;
                 }
                 const char *colon = key_end + 1;
@@ -756,10 +799,13 @@ static size_t lite_parse_videos(const char *json, size_t length,
         YoutubeLiteSpan renderer = {0};
         size_t selected_kind = 0;
         if (!lite_next_video_renderer(
-                &all, after, &renderer, &selected_kind)) break;
+                &all, after, false, &renderer, &selected_kind)) break;
         after = renderer.end;
         YoutubeLiteVideo candidate;
-        if (lite_parse_video(&renderer, selected_kind == 0, &candidate)
+        if (lite_parse_video(
+                &renderer,
+                selected_kind == YOUTUBE_LITE_RENDERER_VIDEO_WITH_CONTEXT,
+                &candidate)
             && !lite_video_duplicate(videos, count, candidate.id)) {
             videos[count++] = candidate;
         }
@@ -1135,9 +1181,11 @@ static void lite_watch_details(
     (void) lite_json_key_string(
         details, "author", watch->video.channel,
         sizeof(watch->video.channel));
-    (void) lite_json_key_string(
-        details, "viewCount", watch->video.views,
-        sizeof(watch->video.views));
+    if (!watch->localized_views) {
+        (void) lite_json_key_string(
+            details, "viewCount", watch->video.views,
+            sizeof(watch->video.views));
+    }
     (void) lite_json_key_string_truncated(
         details, "shortDescription", watch->description,
         sizeof(watch->description));
@@ -1150,22 +1198,110 @@ static void lite_watch_details(
     }
 }
 
+static bool lite_watch_numeric_date(
+    const char *source, char *output, size_t output_size)
+{
+    if (source == NULL || output == NULL || output_size == 0
+        || strlen(source) < 10u
+        || source[4] != '-' || source[7] != '-') return false;
+    for (size_t i = 0; i < 10u; i++) {
+        if (i != 4u && i != 7u
+            && !isdigit((unsigned char) source[i])) return false;
+    }
+    if (source[10] != '\0' && source[10] != 'T' && source[10] != 't')
+        return false;
+    unsigned year = (unsigned) (source[0] - '0') * 1000u
+                  + (unsigned) (source[1] - '0') * 100u
+                  + (unsigned) (source[2] - '0') * 10u
+                  + (unsigned) (source[3] - '0');
+    unsigned month = (unsigned) (source[5] - '0') * 10u
+                   + (unsigned) (source[6] - '0');
+    unsigned day = (unsigned) (source[8] - '0') * 10u
+                 + (unsigned) (source[9] - '0');
+    static const unsigned char days_per_month[] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+    if (year == 0 || month == 0 || month > 12u) return false;
+    unsigned maximum_day = days_per_month[month - 1u];
+    if (month == 2u
+        && (year % 400u == 0u
+            || (year % 4u == 0u && year % 100u != 0u))) maximum_day = 29u;
+    if (day == 0 || day > maximum_day) return false;
+    int written = 0;
+    switch (tilefinch_platform_preferred_date_format()) {
+    case TILEFINCH_DATE_FORMAT_MONTH_DAY_YEAR:
+        written = snprintf(
+            output, output_size, "%02u/%02u/%04u", month, day, year);
+        break;
+    case TILEFINCH_DATE_FORMAT_DAY_MONTH_YEAR:
+        written = snprintf(
+            output, output_size, "%02u/%02u/%04u", day, month, year);
+        break;
+    case TILEFINCH_DATE_FORMAT_YEAR_MONTH_DAY:
+    default:
+        written = snprintf(
+            output, output_size, "%04u/%02u/%02u", year, month, day);
+        break;
+    }
+    return written > 0 && (size_t) written < output_size;
+}
+
 static void lite_watch_microformat(
     const YoutubeLiteSpan *microformat, YoutubeLiteWatch *watch)
 {
+    char machine_date[YOUTUBE_LITE_METADATA_LIMIT] = {0};
     (void) lite_json_key_string(
-        microformat, "publishDate", watch->published,
-        sizeof(watch->published));
-    if (watch->published[0] == '\0')
+        microformat, "publishDate", machine_date, sizeof(machine_date));
+    if (machine_date[0] == '\0')
         (void) lite_json_key_string(
-            microformat, "uploadDate", watch->published,
-            sizeof(watch->published));
+            microformat, "uploadDate", machine_date, sizeof(machine_date));
+    if (machine_date[0] != '\0' && watch->published[0] == '\0') {
+        if (!lite_watch_numeric_date(
+                machine_date, watch->published,
+                sizeof(watch->published))) {
+            snprintf(
+                watch->published, sizeof(watch->published), "%s",
+                machine_date);
+        }
+    }
     (void) lite_json_key_string(
         microformat, "category", watch->category,
         sizeof(watch->category));
 }
 
+static void lite_watch_description_header(
+    const YoutubeLiteSpan *renderer, YoutubeLiteWatch *watch)
+{
+    char display[YOUTUBE_LITE_METADATA_LIMIT] = {0};
+    if (lite_text_runs(
+            renderer, "publishDate", display, sizeof(display))) {
+        snprintf(
+            watch->published, sizeof(watch->published), "%s", display);
+    }
+    display[0] = '\0';
+    if (lite_text_runs(renderer, "views", display, sizeof(display))) {
+        snprintf(
+            watch->video.views, sizeof(watch->video.views), "%s", display);
+        watch->localized_views = true;
+    }
+}
+
+static bool lite_watch_description_header_from(
+    const char *source, size_t source_length, YoutubeLiteWatch *watch)
+{
+    if (source == NULL || source_length == 0) return false;
+    YoutubeLiteSpan scope = {source, source + source_length};
+    YoutubeLiteSpan renderer = {0};
+    if (!lite_json_key(
+            &scope, "videoDescriptionHeaderRenderer", NULL, &renderer)) {
+        return false;
+    }
+    lite_watch_description_header(&renderer, watch);
+    return true;
+}
+
 static bool lite_watch_metadata(const char *source, size_t source_length,
+                                const char *decoded, size_t decoded_length,
                                 YoutubeLiteWatch *watch)
 {
     YoutubeLiteSpan source_span = {source, source + source_length};
@@ -1208,6 +1344,15 @@ static bool lite_watch_metadata(const char *source, size_t source_length,
     if (lite_json_key(&player, "playerMicroformatRenderer", NULL,
                       &microformat)) {
         lite_watch_microformat(&microformat, watch);
+    }
+    /* The machine-readable microformat is intentionally locale-neutral.
+       Prefer the renderer YouTube already localized for the request's `hl`;
+       decoded initial data is the normal carrier, with raw source as a
+       shape-churn fallback. */
+    if (!lite_watch_description_header_from(
+            decoded, decoded_length, watch)) {
+        (void) lite_watch_description_header_from(
+            source, source_length, watch);
     }
     return watch->video.title[0] != '\0';
 }
@@ -1407,7 +1552,8 @@ static bool lite_html_watch_intro(
         if (watch->video.channel[0] != '\0')
             ok = lite_html_text(html, "<br>");
         ok = ok && lite_html_escape(html, watch->video.views)
-            && lite_html_text(html, " views");
+            && (watch->localized_views
+                || lite_html_text(html, " views"));
     }
     if (ok && watch->video.duration[0] != '\0')
         ok = lite_html_text(html, " &middot; ")
@@ -1503,7 +1649,8 @@ static bool lite_build_document_with_comments_decoded(
             return false;
         }
         (void) youtube_watch_url_video_id(url, watch->video.id);
-        (void) lite_watch_metadata(source, source_length, watch);
+        (void) lite_watch_metadata(
+            source, source_length, decoded, decoded_length, watch);
         if (watch->video.id[0] == '\0')
             (void) youtube_watch_url_video_id(url, watch->video.id);
         if (watch->video.title[0] == '\0')
@@ -1746,6 +1893,7 @@ typedef struct {
     bool compact_results;
     bool watch_details_found;
     bool watch_microformat_found;
+    bool watch_description_header_found;
     char query[YOUTUBE_LITE_QUERY_LIMIT];
     char comments_count[YOUTUBE_LITE_METADATA_LIMIT];
     char next_continuation[YOUTUBE_LITE_CONTINUATION_LIMIT];
@@ -1929,12 +2077,28 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
     }
     YoutubeLiteSpan renderer = {0};
     size_t kind = 0;
+    /* Discover the localized watch header in the renderer walk already
+       needed for result cards. A separate key scan doubled the overlapping
+       JSON-window work on PSP until the header happened to be found. */
     bool found = work->video_count < YOUTUBE_LITE_MAXIMUM_RESULTS
         && lite_next_video_renderer(
-            &scope, scope.start, &renderer, &kind);
+            &scope, scope.start,
+            work->route == YOUTUBE_LITE_ROUTE_WATCH
+                && !work->watch_description_header_found,
+            &renderer, &kind);
     if (found) {
+        if (kind == YOUTUBE_LITE_RENDERER_DESCRIPTION_HEADER) {
+            lite_watch_description_header(&renderer, &work->watch);
+            work->watch_description_header_found = true;
+            work->scan_offset =
+                (size_t) (renderer.end - work->decoded);
+            return;
+        }
         YoutubeLiteVideo parsed;
-        if (lite_parse_video(&renderer, kind == 0, &parsed)
+        if (lite_parse_video(
+                &renderer,
+                kind == YOUTUBE_LITE_RENDERER_VIDEO_WITH_CONTEXT,
+                &parsed)
             && !lite_video_duplicate(
                 work->videos, work->video_count, parsed.id)) {
             work->videos[work->video_count++] = parsed;
@@ -2522,6 +2686,7 @@ struct YoutubeLiteLoadJob {
     bool compact_results;
     char url[TILEFINCH_URL_SERIALIZED_LIMIT];
     char fetch_url[1024];
+    char language[YOUTUBE_LITE_LANGUAGE_LIMIT];
     char supplemental_url[512];
     char error[256];
     FetchResult source;
@@ -2575,10 +2740,11 @@ static TilefinchRequestContext lite_supplemental_context(
 static bool lite_prepare_supplemental_request(
     BrowserSession *session, const char *page_url,
     const YoutubeLiteIdentity *cached_identity,
-    bool comments, const char *prepared_token,
+    const char *language, bool comments, const char *prepared_token,
     YoutubeLiteSupplementalRequest *prepared)
 {
-    if (prepared == NULL) return false;
+    if (prepared == NULL || language == NULL || language[0] == '\0')
+        return false;
     memset(prepared, 0, sizeof(*prepared));
     const YoutubeLiteIdentity *identity = cached_identity;
     if (!lite_identity_valid(identity)) return false;
@@ -2612,9 +2778,9 @@ static bool lite_prepare_supplemental_request(
     int body_length = snprintf(
         prepared->body, sizeof(prepared->body),
         "{\"context\":{\"client\":{\"clientName\":\"MWEB\","
-        "\"clientVersion\":\"%s\",\"hl\":\"en\",\"gl\":\"US\","
+        "\"clientVersion\":\"%s\",\"hl\":\"%s\",\"gl\":\"US\","
         "\"visitorData\":%s}},\"continuation\":%s}",
-        identity->client_version, visitor_json, token_json);
+        identity->client_version, language, visitor_json, token_json);
     int extra_length = snprintf(
         prepared->extra_headers, sizeof(prepared->extra_headers),
         "X-YouTube-Client-Name: 2\n"
@@ -2986,14 +3152,22 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
     job->started_us = tilefinch_platform_monotonic_time_us();
     job->source.budget = budget;
     snprintf(job->url, sizeof(job->url), "%s", url);
+    snprintf(job->language, sizeof(job->language), "%s",
+             lite_preferred_language());
     if (!lite_fetch_url(url, route, job->fetch_url)) {
         lite_error(error, error_size, "invalid YouTube search query");
         youtube_lite_load_destroy(job);
         return NULL;
     }
-    (void) browser_session_cookie_set(
-        session, job->fetch_url,
-        "PREF=hl=en&tz=UTC; Domain=.youtube.com; Path=/");
+    char preference_cookie[64];
+    int preference_length = snprintf(
+        preference_cookie, sizeof(preference_cookie),
+        "PREF=hl=%s&tz=UTC; Domain=.youtube.com; Path=/", job->language);
+    if (preference_length > 0
+        && (size_t) preference_length < sizeof(preference_cookie)) {
+        (void) browser_session_cookie_set(
+            session, job->fetch_url, preference_cookie);
+    }
     (void) browser_session_cookie_set(
         session, job->fetch_url,
         "SOCS=CAI; Domain=.youtube.com; Path=/; Secure");
@@ -3086,7 +3260,7 @@ static bool lite_load_enqueue_supplemental(YoutubeLiteLoadJob *job)
     if (!lite_prepare_supplemental_request(
             job->session, job->url,
             job->identity_available ? &job->identity : NULL,
-            comments, job->continuation_token, prepared)) {
+            job->language, comments, job->continuation_token, prepared)) {
         budget_free(job->budget, prepared);
         return false;
     }

@@ -230,6 +230,7 @@ int main(void)
     CHECK(test_engine_lifecycle() == 0);
     CHECK(test_responsive_navigation_convergence() == 0);
     CHECK(test_scrollable_provisional_navigation() == 0);
+    CHECK(test_youtube_localized_watch_metadata() == 0);
     CHECK(test_youtube_cooperative_build_convergence() == 0);
     CHECK(test_youtube_missing_initial_data_terminates() == 0);
     CHECK(test_reader_presentation_adapter() == 0);

@@ -5993,6 +5993,8 @@ void psp_ui_media_apply_projection(
     PspUiMediaState *media, const PspMediaUiProjection *projection)
 {
     if (media == NULL || projection == NULL) return;
+    bool local_analog_preview = media->analog_seek_direction != 0
+        && media->seek_preview_active && projection->seek_enabled;
     media->visible = projection->visible;
     media->playing = projection->playing;
     media->failed = projection->mode == PSP_MEDIA_UI_FAILED;
@@ -6004,7 +6006,14 @@ void psp_ui_media_apply_projection(
         || projection->mode == PSP_MEDIA_UI_RECOVERING
         || projection->mode == PSP_MEDIA_UI_STOPPING;
     media->buffering = projection->mode == PSP_MEDIA_UI_BUFFERING;
-    media->seek_preview_active = projection->preview_active;
+    /* The controller owns decoder-preview transactions, but the nub's target
+       is deliberately UI-local until release coalesces it into one request.
+       Preserve that target across unrelated controller projections (notably
+       source-starved/stable edges); otherwise the timeline alternates between
+       the current and preview positions while the nub remains held. A state
+       which disables seeking still clears it immediately. */
+    media->seek_preview_active = projection->preview_active
+        || local_analog_preview;
     media->ended = projection->ended;
     media->controls_enabled = projection->controls_enabled;
     media->play_pause_enabled = projection->play_pause_enabled;
@@ -6178,6 +6187,23 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
     return intent;
 }
 
+bool psp_ui_media_intent_has_predispatch_visual(
+    const PspUiMediaIntent *intent)
+{
+    if (intent == NULL || !intent->visual_changed) return false;
+    /* Play/Pause has not changed presentation state yet: the session reducer
+       does that when it consumes the intent. An ACTION_NONE update is the
+       analog seek preview moving while the nub remains held; it performs no
+       slow backend work and belongs in the ordinary end-of-frame present.
+       Publishing either here would rotate scanout once now and once again at
+       frame end. The old/new pair flashes on resume, while repeating it at
+       nub cadence makes the whole control surface flicker. Actual actions
+       keep the early present because seek, retry, and close can block while
+       the already-mutated preview or controls should remain responsive. */
+    return intent->action != PSP_UI_MEDIA_ACTION_NONE
+        && intent->action != PSP_UI_MEDIA_ACTION_PLAY_PAUSE;
+}
+
 /*
  * The failed panel and its two chips have one definition so compositing and
  * hit testing cannot drift apart. A quarantined decoder replaces the Retry
@@ -6291,10 +6317,9 @@ static __attribute__((noinline)) void fill_round_rect_aa_resolved(
     /*
      * Player chrome sits over a different decoded picture every frame. The
      * authored surface therefore resolves against one fixed matte and is
-     * written opaquely. Most sampled fringes use that matte too, preventing
-     * shimmer on the physical LCD. The light play/pause rim is the exception:
-     * its outer fringe resolves against the destination so black cannot peek
-     * through between the rim and a light frame.
+     * written opaquely. Most sampled fringes use that matte too. The light
+     * play/pause rim is the exception: its outer fringe resolves against the
+     * destination so a dark matte cannot leave an aliased halo around it.
      */
     uint16_t surface = parts >= UI_BLEND_PARTS
         ? color : blend565(color, matte, parts);
@@ -6424,8 +6449,8 @@ static void draw_media_play_pause(uint16_t *pixels, int width, int height,
         center_y - UI_MEDIA_BADGE_HEIGHT / 2,
         UI_MEDIA_BADGE_WIDTH, UI_MEDIA_BADGE_HEIGHT
     };
-    /* Resolve the rim's outer fringe against the actual picture. A black
-       matte leaves a visible dark seam outside the light outline. */
+    /* Resolve the rim's outer fringe against the actual picture. A dark
+       matte leaves a visible aliased seam outside the light outline. */
     fill_round_rect_aa_resolved(
         pixels, width, height, stride, badge_bounds,
         UI_MEDIA_BADGE_RADIUS, color, 4, rgb565(0, 0, 0), true);
@@ -6567,6 +6592,80 @@ size_t psp_ui_media_overlay_bands(
         bands, capacity, &count,
         height - UI_MEDIA_CONTROL_BAR_HEIGHT, height, height);
     return count;
+}
+
+static void draw_media_control_bar(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride)
+{
+    uint16_t bar = PSP_THEME_CHROME_BAR;
+    uint16_t text = PSP_THEME_TEXT;
+    uint16_t muted = PSP_THEME_TEXT_MUTED;
+    uint16_t accent = PSP_THEME_ACCENT_EMBER;
+    int bar_top = height - UI_MEDIA_CONTROL_BAR_HEIGHT;
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {0, bar_top, width, height - bar_top}, bar, 4);
+    /* Control legend sits on the darker hint ground, like the page chrome. */
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {0, height - 38, width, 38}, PSP_THEME_HINT_BAR, 3);
+    int left = 24, right = width - 24, track_y = height - 69;
+    fill_round_rect(pixels, width, height, stride,
+                    (UiRect) {left, track_y, right - left, 4}, 2,
+                    PSP_THEME_TEXT_FAINT, 4);
+    if (media->duration_us != 0 && media->buffered_until_us != 0) {
+        uint64_t buffered = media->buffered_until_us < media->duration_us
+            ? media->buffered_until_us : media->duration_us;
+        int buffered_width = (int) psp_ui_ratio_extent_u64(
+            buffered, media->duration_us, (unsigned) (right - left));
+        if (buffered_width > 0)
+            fill_round_rect(
+                pixels, width, height, stride,
+                (UiRect) {left, track_y, buffered_width, 4},
+                2, muted, 4);
+    }
+    int filled = 0;
+    uint64_t display_time = media->seek_preview_active
+        ? media->seek_preview_time_us : media->current_time_us;
+    if (media->duration_us != 0) {
+        uint64_t bounded = display_time < media->duration_us
+            ? display_time : media->duration_us;
+        filled = (int) psp_ui_ratio_extent_u64(
+            bounded, media->duration_us, (unsigned) (right - left));
+    }
+    if (filled > 0) {
+        fill_round_rect(pixels, width, height, stride,
+                        (UiRect) {left, track_y, filled, 4},
+                        2, accent, 4);
+    }
+    fill_round_rect(pixels, width, height, stride,
+                    (UiRect) {left + filled - 4, track_y - 3, 10, 10},
+                    5, PSP_THEME_ACCENT_EMBER_HI, 4);
+    char current[24], duration[24], legend[64];
+    media_format_time(display_time, current, sizeof(current));
+    media_format_time(media->duration_us, duration, sizeof(duration));
+    snprintf(legend, sizeof(legend), "%s%s / %s",
+             media->seek_preview_active ? "SEEK " : "",
+             current, duration);
+    draw_text(pixels, width, height, stride, left, height - 53,
+              legend, 30, text, 2);
+    draw_text(pixels, width, height, stride, left, height - 29,
+              media->seek_preview_active
+                  ? "X GO   O CANCEL"
+                  : (media->playing
+                      ? "STICK/L/R SEEK   X PAUSE"
+                      : "STICK/L/R SEEK   X PLAY"),
+              32, muted, 2);
+}
+
+void psp_ui_media_composite_controls(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride)
+{
+    if (media == NULL || !media->visible || !media->controls_visible
+        || media->resolving || media->failed || pixels == NULL
+        || width <= 0 || height < UI_MEDIA_CONTROL_BAR_HEIGHT
+        || stride < width) return;
+    draw_media_control_bar(media, pixels, width, height, stride);
 }
 
 void psp_ui_media_composite_with_preview(
@@ -6733,61 +6832,7 @@ void psp_ui_media_composite_with_preview(
                               width / 2, height / 2,
                               media->playing && !media->ended);
 
-    int bar_top = height - UI_MEDIA_CONTROL_BAR_HEIGHT;
-    fill_rect(pixels, width, height, stride,
-              (UiRect) {0, bar_top, width, height - bar_top}, bar, 4);
-    /* Control legend sits on the darker hint ground, like the page chrome. */
-    fill_rect(pixels, width, height, stride,
-              (UiRect) {0, height - 38, width, 38}, PSP_THEME_HINT_BAR, 3);
-    int left = 24, right = width - 24, track_y = height - 69;
-    fill_round_rect(pixels, width, height, stride,
-                    (UiRect) {left, track_y, right - left, 4}, 2,
-                    PSP_THEME_TEXT_FAINT, 4);
-    if (media->duration_us != 0 && media->buffered_until_us != 0) {
-        uint64_t buffered = media->buffered_until_us < media->duration_us
-            ? media->buffered_until_us : media->duration_us;
-        int buffered_width = (int) psp_ui_ratio_extent_u64(
-            buffered, media->duration_us, (unsigned) (right - left));
-        if (buffered_width > 0)
-            fill_round_rect(
-                pixels, width, height, stride,
-                (UiRect) {left, track_y, buffered_width, 4},
-                2, muted, 4);
-    }
-    int filled = 0;
-    uint64_t display_time = media->seek_preview_active
-        ? media->seek_preview_time_us : media->current_time_us;
-    if (media->duration_us != 0) {
-        uint64_t bounded = display_time < media->duration_us
-            ? display_time : media->duration_us;
-        filled = (int) psp_ui_ratio_extent_u64(
-            bounded, media->duration_us, (unsigned) (right - left));
-    }
-    if (filled > 0) {
-        fill_round_rect(pixels, width, height, stride,
-                        (UiRect) {left, track_y, filled, 4},
-                        2, accent, 4);
-    }
-    fill_round_rect(pixels, width, height, stride,
-                    (UiRect) {left + filled - 4, track_y - 3, 10, 10},
-                    5, PSP_THEME_ACCENT_EMBER_HI, 4);
-    char current[24], duration[24], legend[64];
-    media_format_time(display_time, current, sizeof(current));
-    media_format_time(media->duration_us, duration, sizeof(duration));
-    snprintf(legend, sizeof(legend), "%s%s / %s",
-             media->seek_preview_active ? "SEEK " : "",
-             current, duration);
-    draw_text(pixels, width, height, stride, left, height - 53,
-              legend, 30, text, 2);
-    draw_text(pixels, width, height, stride, left, height - 29,
-              media->buffering
-                  ? "BUFFERING   X PAUSE   O BACK"
-                  : (media->seek_preview_active
-                      ? "X GO   O CANCEL"
-                      : (media->playing
-                          ? "STICK/L/R SEEK   X PAUSE"
-                          : "STICK/L/R SEEK   X PLAY")),
-              32, muted, 2);
+    draw_media_control_bar(media, pixels, width, height, stride);
 }
 
 void psp_ui_media_composite(const PspUiMediaState *media, uint16_t *pixels,

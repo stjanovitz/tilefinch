@@ -2120,7 +2120,19 @@ static bool test_media_controls_and_composite(void)
     psp_ui_media_cancel_seek_preview(&media);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_media_update(&media, &input);
-    CHECK(intent.action == PSP_UI_MEDIA_ACTION_PLAY_PAUSE);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_PLAY_PAUSE
+          && !psp_ui_media_intent_has_predispatch_visual(&intent));
+
+    /* The same rule applies in the other direction. The UI update only makes
+       controls visible; Playing becomes Paused when the session consumes the
+       intent, so presenting here would expose the stale pause legend. */
+    psp_ui_media_set(&media, true, true, false,
+                     UINT64_C(5000000), UINT64_C(20000000),
+                     "Example video");
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_PLAY_PAUSE
+          && !psp_ui_media_intent_has_predispatch_visual(&intent));
 
     psp_ui_media_set(&media, true, false, false,
                      UINT64_C(5000000), UINT64_C(20000000),
@@ -2169,11 +2181,26 @@ static bool test_media_controls_and_composite(void)
     for (unsigned elapsed = 0; elapsed < 1000; elapsed += 20) {
         intent = psp_ui_media_update(&media, &input);
         CHECK(intent.action == PSP_UI_MEDIA_ACTION_NONE
-              && intent.visual_changed);
+              && intent.visual_changed
+              && !psp_ui_media_intent_has_predispatch_visual(&intent));
     }
     CHECK(media.seek_preview_active
           && media.seek_preview_time_us > UINT64_C(89500000)
           && media.seek_preview_time_us < UINT64_C(90500000));
+    /* The nub owns its local preview until it is released. An unrelated
+       controller projection (for example a refill edge) must not erase it
+       for one frame and make the timeline alternate between two positions. */
+    PspMediaUiProjection playing_projection = {
+        .mode = PSP_MEDIA_UI_PLAYING,
+        .visible = true,
+        .controls_enabled = true,
+        .play_pause_enabled = true,
+        .seek_enabled = true,
+        .playing = true
+    };
+    psp_ui_media_apply_projection(&media, &playing_projection);
+    CHECK(media.seek_preview_active
+          && media.analog_seek_direction == 1);
     PspUiMediaState faster_cadence;
     psp_ui_media_init(&faster_cadence);
     psp_ui_media_set(
@@ -2195,6 +2222,26 @@ static bool test_media_controls_and_composite(void)
     intent = psp_ui_media_update(&media, &input);
     CHECK(intent.action == PSP_UI_MEDIA_ACTION_SEEK
           && !media.seek_preview_active);
+
+    /* A short refill is reported by the centre pill. It must not replace the
+       bottom legend as well: toggling that whole text row after resume made
+       an otherwise-stable timeline band appear to flash. */
+    enum { CONTROL_HEIGHT = 78 };
+    static uint16_t stable_controls[WIDTH * CONTROL_HEIGHT];
+    memset(frame, 0, sizeof(frame));
+    psp_ui_media_set(&media, true, true, false,
+                     UINT64_C(5000000), UINT64_C(20000000), NULL);
+    psp_ui_media_set_buffering(&media, false, UINT64_C(9000000));
+    psp_ui_media_composite(&media, frame, WIDTH, HEIGHT, WIDTH);
+    memcpy(stable_controls, frame + (HEIGHT - CONTROL_HEIGHT) * WIDTH,
+           sizeof(stable_controls));
+    memset(frame, 0, sizeof(frame));
+    psp_ui_media_set_buffering(&media, true, UINT64_C(9000000));
+    psp_ui_media_composite(&media, frame, WIDTH, HEIGHT, WIDTH);
+    CHECK(memcmp(stable_controls,
+                 frame + (HEIGHT - CONTROL_HEIGHT) * WIDTH,
+                 sizeof(stable_controls)) == 0);
+    CHECK(frame[(HEIGHT - 10) * WIDTH] == PSP_THEME_HINT_BAR);
 
     psp_ui_media_set(&media, true, true, false,
                      UINT64_C(5000000), UINT64_C(20000000), NULL);
@@ -3303,7 +3350,7 @@ static bool test_media_overlay_bands_and_the_32_bit_wrapper(void)
        authored interior stays byte-identical over radically different
        decoded pictures. Only the partially covered pixels in the four outer
        corner arcs may follow the picture; resolving those samples against a
-       fixed black matte produced a visible dark seam around the light rim. */
+       fixed dark matte produces the aliased halo visible on hardware. */
     size_t destination_edge_pixels = 0;
     for (int y = 0; y < BADGE_HEIGHT; y++) {
         const uint32_t *saved = stable_badge + (size_t) y * BADGE_WIDTH;
@@ -3328,6 +3375,23 @@ static bool test_media_overlay_bands_and_the_32_bit_wrapper(void)
         }
     }
     CHECK(destination_edge_pixels != 0u);
+    for (int y = HEIGHT - CONTROL_HEIGHT; y < HEIGHT; y++) {
+        CHECK(memcmp(
+                  stable_bottom
+                      + (size_t) (y - (HEIGHT - CONTROL_HEIGHT)) * WIDTH,
+                  video + (size_t) y * WIDTH,
+                  WIDTH * sizeof(*video)) == 0);
+    }
+    /* The cooperative seek supervisor freezes the accepted video frame and
+       repaints only this opaque band. That acknowledgement must neither
+       touch the picture above it nor produce a different control surface. */
+    for (int at = 0; at < WIDTH * HEIGHT; at++) video[at] = picture;
+    psp_ui_media_composite_controls_8888(
+        &media, video, WIDTH, HEIGHT, WIDTH, scratch);
+    for (int y = 0; y < HEIGHT - CONTROL_HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++)
+            CHECK(video[(size_t) y * WIDTH + x] == picture);
+    }
     for (int y = HEIGHT - CONTROL_HEIGHT; y < HEIGHT; y++) {
         CHECK(memcmp(
                   stable_bottom

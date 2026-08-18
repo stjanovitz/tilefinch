@@ -191,14 +191,18 @@ licenses, and deterministic refresh command are recorded in
 not an acceptance-site compatibility tweak.
 
 The host transport exposes at most `FETCH_RESPONSE_COOKIE_CAPACITY` (currently
-16) `Set-Cookie` fields in one bounded redirect transaction, and each
+32) `Set-Cookie` fields in one bounded redirect transaction, and each
 serialized field must fit its 4,095-byte storage ceiling. Cookie values and
 their response-URL attributions are allocated from the shared budget only when
 received; `FetchResult` retains only the fixed pointer inventory, avoiding a
-large worst-case payload in every result and scheduler/stack frame. A 17th,
-oversized, or allocation-failed field fails the response atomically rather than
-truncating security attributes or allowing an earlier hop to crowd out a later
-deletion. This remains deliberately stricter than a desktop browser.
+large worst-case payload in every result and scheduler/stack frame. If a final
+response carries more than 32 individually valid fields, Tilefinch accepts the
+page, retains the first 32, and marks the cookie set as truncated so capture and
+replay preserve the same outcome. The same overflow on a redirect hop fails
+closed: a partial intermediate set could otherwise hide a deletion before the
+next request. An oversized field or a cookie-allocation failure remains fatal
+on every hop rather than exposing partially interpreted security attributes.
+This remains deliberately stricter than a desktop browser.
 
 ## Content blocking
 

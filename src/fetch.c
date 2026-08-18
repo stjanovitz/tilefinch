@@ -251,6 +251,7 @@ typedef struct {
     bool has_capture_sequence;
     bool capture_failed;
     bool cookie_header_rejected;
+    bool response_cookies_truncated;
     bool client_hint_header_rejected;
     bool redirect_callback_aborted;
     size_t response_cookie_start;

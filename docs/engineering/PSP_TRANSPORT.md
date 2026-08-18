@@ -61,6 +61,16 @@ concurrently, and same-origin requests may multiplex over HTTP/2. This keeps
 redirect, cookie, CORS, CSP, mixed-content, Private Network Access, and content
 blocking decisions on the browser thread without serializing the whole page.
 
+Starting a replacement navigation cancels unfinished resource and script
+requests owned by the incumbent page before the candidate document is queued.
+Only optional network progress is retired: the incumbent document and scanout
+remain the rollback surface until the candidate commits. This prevents a page
+of thumbnails or fonts from consuming every response descriptor ahead of the
+user's next navigation. A failed or cancelled candidate does not reissue those
+retired requests; the intact page remains interactive, but optional images or
+author fetches which had not completed stay failed. A future priority lane can
+preempt this work without cancelling it.
+
 Cancellation closes admission and marks slots atomically. Network teardown
 waits for every lease to retire before unloading PSP networking. A timeout
 retains the stack rather than calling `sceNetInetTerm` beneath a live curl

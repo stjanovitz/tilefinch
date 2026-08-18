@@ -264,7 +264,7 @@ static bool trace_rewrite_record_version(
     return ok;
 }
 
-static bool trace_downgrade_record_v11_to_v8(
+static bool trace_downgrade_record_v12_to_v8(
     const char *trace_directory, size_t sequence)
 {
     char path[4096], temporary[4096], line[9000];
@@ -281,7 +281,7 @@ static bool trace_downgrade_record_v11_to_v8(
     bool ok = output != NULL;
     bool version_seen = false;
     while (ok && fgets(line, sizeof(line), input) != NULL) {
-        if (strcmp(line, "psp-http-trace=11\n") == 0) {
+        if (strcmp(line, "psp-http-trace=12\n") == 0) {
             version_seen = true;
             ok = fputs("psp-http-trace=8\n", output) >= 0;
         } else if (strncmp(line, "logical-request-url=", 20) == 0
@@ -303,6 +303,9 @@ static bool trace_downgrade_record_v11_to_v8(
                           == 0
                    || strncmp(line, "response-security-allow-origin=",
                               sizeof("response-security-allow-origin=") - 1)
+                          == 0
+                   || strncmp(line, "set-cookies-truncated=",
+                              sizeof("set-cookies-truncated=") - 1)
                           == 0) {
             continue;
         } else {
@@ -371,7 +374,7 @@ static bool test_trace_logical_url_and_referrer_metadata(
     fetch_trace_end();
     snprintf(logical_line, sizeof(logical_line),
              "logical-request-url=%s\n", normalized_sync_url);
-    CHECK(trace_meta_contains(trace_directory, "psp-http-trace=11\n")
+    CHECK(trace_meta_contains(trace_directory, "psp-http-trace=12\n")
           && trace_meta_contains(trace_directory, logical_line)
           && trace_meta_contains(
                  trace_directory,
@@ -465,10 +468,11 @@ static bool test_trace_logical_url_and_referrer_metadata(
           && fetch_redirect(budget, legacy_url, &request, &result));
     fetch_result_destroy(&result);
     fetch_trace_end();
-    CHECK(trace_downgrade_record_v11_to_v8(trace_directory, 0));
+    CHECK(trace_downgrade_record_v12_to_v8(trace_directory, 0));
     result = (FetchResult) {.budget = budget};
     CHECK(fetch_trace_replay_begin(trace_directory, error, sizeof(error))
-          && fetch_redirect(budget, legacy_url, &request, &result));
+          && fetch_redirect(budget, legacy_url, &request, &result)
+          && !result.set_cookies_truncated);
     fetch_result_destroy(&result);
     fetch_trace_end();
 
@@ -502,7 +506,7 @@ static bool test_trace_logical_url_and_referrer_metadata(
     fetch_result_destroy(&result);
     fetch_trace_end();
     CHECK(trace_rewrite_record_version(
-        trace_directory, 0, "11", "9"));
+        trace_directory, 0, "12", "9"));
     result = (FetchResult) {.budget = budget};
     CHECK(fetch_trace_replay_begin(trace_directory, error, sizeof(error))
           && fetch_redirect(budget, legacy_url, typed_request, &result)
@@ -959,7 +963,10 @@ static bool test_response_cookie_trace_capacity(
               trace_directory, error, sizeof(error))
           && !trace_info_contains(trace_directory, "cookie-seed-")
           && fetch_redirect(budget, url, &request, &captured)
-          && captured.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY);
+          && captured.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY
+          && !captured.set_cookies_truncated
+          && trace_meta_contains(
+                 trace_directory, "set-cookies-truncated=0\n"));
     fetch_trace_end();
     fetch_result_destroy(&captured);
 
@@ -967,7 +974,8 @@ static bool test_response_cookie_trace_capacity(
     CHECK(fetch_trace_replay_begin(
               trace_directory, error, sizeof(error))
           && fetch_redirect(budget, url, &request, &replayed)
-          && replayed.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY);
+          && replayed.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY
+          && !replayed.set_cookies_truncated);
     for (size_t i = 0; i < FETCH_RESPONSE_COOKIE_CAPACITY; i++) {
         char expected[64];
         int written = snprintf(expected, sizeof(expected),
@@ -984,22 +992,22 @@ static bool test_response_cookie_trace_capacity(
     char meta_path[4096];
     int meta_written = snprintf(
         meta_path, sizeof(meta_path), "%s/0000.meta", trace_directory);
-    static const char count_line[] = "set-cookie-count=16";
+    static const char count_line[] = "set-cookie-count=32";
     CHECK(meta_written > 0 && (size_t) meta_written < sizeof(meta_path)
           && replace_trace_byte_at_offset(
-                 meta_path, count_line, sizeof(count_line) - 2, '7')
+                 meta_path, count_line, sizeof(count_line) - 2, '3')
           && trace_replay_rejects(
                  budget, trace_directory, url, &request)
           && replace_trace_byte_at_offset(
-                 meta_path, "set-cookie-count=17",
-                 sizeof(count_line) - 2, '6'));
+                 meta_path, "set-cookie-count=33",
+                 sizeof(count_line) - 2, '2'));
 
     /* Legacy formats do not require response-URL attribution, but every
        declared value index must still exist. First prove the otherwise-valid
        v3 compatibility path, then create a duplicate index and missing slot
        which the old v6-only completeness check allowed through. */
     CHECK(trace_rewrite_record_version(
-        trace_directory, 0, "11", "3"));
+        trace_directory, 0, "12", "3"));
     FetchResult legacy = {.budget = budget};
     CHECK(fetch_trace_replay_begin(
         trace_directory, error, sizeof(error)));
@@ -1028,7 +1036,28 @@ static bool test_response_cookie_trace_capacity(
           && legacy.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY);
     fetch_result_destroy(&legacy);
     CHECK(trace_rewrite_record_version(
-        trace_directory, 0, "3", "11"));
+        trace_directory, 0, "3", "12"));
+
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%u/response-cookie-overflow", port);
+    FetchResult truncated = {.budget = budget};
+    CHECK(fetch_trace_capture_begin(
+              trace_directory, error, sizeof(error))
+          && fetch_redirect(budget, url, &request, &truncated)
+          && truncated.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY
+          && truncated.set_cookies_truncated
+          && trace_meta_contains(
+                 trace_directory, "set-cookies-truncated=1\n"));
+    fetch_trace_end();
+    fetch_result_destroy(&truncated);
+    truncated = (FetchResult) {.budget = budget};
+    CHECK(fetch_trace_replay_begin(
+              trace_directory, error, sizeof(error))
+          && fetch_redirect(budget, url, &request, &truncated)
+          && truncated.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY
+          && truncated.set_cookies_truncated);
+    fetch_trace_end();
+    fetch_result_destroy(&truncated);
     return budget->current == baseline;
 }
 

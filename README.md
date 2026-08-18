@@ -181,7 +181,8 @@ boot always starts the previous version on demand. Details in
 ## Privacy
 
 - No telemetry, no analytics, no accounts. Tilefinch sends nothing about
-  you or your browsing anywhere.
+  you or your browsing anywhere; requests to YouTube carry your PSP's
+  language setting so YouTube can localize results.
 - Everything the browser stores — history (off by default), cookies, cache,
   saved pages and videos, screenshots, settings — lives on your Memory
   Stick and nowhere else. **Options → Site data** clears HTTP caches,

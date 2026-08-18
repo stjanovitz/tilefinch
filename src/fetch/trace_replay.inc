@@ -99,6 +99,7 @@ static bool trace_replay_response_with_scratch(
     int recorded_referrer_policy_metadata_valid = -1;
     int recorded_referrer_policy_present = -1;
     int recorded_security_headers_truncated = -1;
+    int recorded_set_cookies_truncated = -1;
     bool recorded_security_metadata_seen = false;
     bool recorded_security_allow_origin_seen = false;
     FetchResponseSecurityMetadata recorded_security_metadata = {0};
@@ -153,7 +154,7 @@ static bool trace_replay_response_with_scratch(
             TRACE_SEE(TRACE_V6_VERSION);
             size_t parsed = 0;
             if (trace_parse_size_value(equals, &parsed)
-                && parsed >= 1 && parsed <= 11) {
+                && parsed >= 1 && parsed <= 12) {
                 trace_version = (unsigned) parsed;
             } else {
                 trace_fields_valid = false;
@@ -661,6 +662,13 @@ static bool trace_replay_response_with_scratch(
                 trace_fields_valid = false;
             }
         }
+        else if (strcmp(scratch->line, "set-cookies-truncated") == 0) {
+            TRACE_SEE(TRACE_V12_SET_COOKIES_TRUNCATED);
+            if (!trace_parse_bool_value(
+                    equals, &recorded_set_cookies_truncated)) {
+                trace_fields_valid = false;
+            }
+        }
         else if (strncmp(scratch->line, "set-cookie-url-", 15) == 0) {
             size_t index = 0;
             bool index_ok = trace_parse_size_value(
@@ -818,6 +826,13 @@ static bool trace_replay_response_with_scratch(
             && ((recorded_security_metadata.allow_origin_state
                        == FETCH_SECURITY_FIELD_VALID)
                 == (recorded_security_metadata.allow_origin[0] != '\0')));
+    uint64_t v12_required_fields = trace_required_field_mask(
+        (unsigned) TRACE_V12_FIELD_COUNT);
+    bool v12_complete = trace_version < 12
+        || (trace_fields_valid
+            && (v6_fields_seen & v12_required_fields)
+                   == v12_required_fields
+            && recorded_set_cookies_truncated >= 0);
     /* A delayed capture starts after an earlier navigation has established
        session state.  Replaying that boundary necessarily begins as a fresh
        navigation, so only browser-derived source/user-activation context
@@ -906,6 +921,7 @@ static bool trace_replay_response_with_scratch(
         && v6_complete && v7_complete && v8_complete && v9_complete
         && v10_complete
         && v11_complete
+        && v12_complete
         && !(recorded_success
              && (result->status_code == 0
                  || result->trace_external_cancel
@@ -928,6 +944,8 @@ static bool trace_replay_response_with_scratch(
                  "HTTP replay record %zu metadata is corrupt", sequence);
         return false;
     }
+    result->set_cookies_truncated = trace_version >= 12
+        && recorded_set_cookies_truncated != 0;
     if (trace_version < 10 && request != NULL
         && request->page_context != NULL) {
         TilefinchRequestDestination destination =

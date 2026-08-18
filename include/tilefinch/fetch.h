@@ -15,7 +15,7 @@ struct ContentBlocker;
 struct TilefinchContentSecurityPolicy;
 
 #define FETCH_SET_COOKIE_LIMIT 4096
-#define FETCH_RESPONSE_COOKIE_CAPACITY 16
+#define FETCH_RESPONSE_COOKIE_CAPACITY 32
 /* Current large-site CSP fields exceed 4 KiB by themselves (4,527 bytes was
    measured in the acceptance corpus on 2026-08-01). Keep this fixed and
    modest: it is part of every FetchResult, but must hold one complete security
@@ -142,6 +142,11 @@ typedef struct {
        incorrect and unsafe. These strings are budget-owned. */
     char *set_cookie_urls[FETCH_RESPONSE_COOKIE_CAPACITY];
     size_t set_cookie_count;
+    /* The final response carried more individually valid Set-Cookie fields
+       than the bounded transport inventory could retain.  The represented
+       prefix remains usable, but consumers and replay must not mistake it for
+       a complete cookie set.  Redirect-hop truncation still fails closed. */
+    bool set_cookies_truncated;
     char error[256];
     bool timed_out;
     /* True when any redirect crossed an origin boundary. The taint is sticky
@@ -458,6 +463,10 @@ typedef struct {
 } FetchBackgroundProgress;
 
 typedef struct {
+    size_t occupied_slots;
+    size_t queued_slots;
+    size_t running_slots;
+    size_t complete_slots;
     size_t streaming_started;
     size_t fixed_started;
     size_t peak_streaming_active;
@@ -516,6 +525,7 @@ typedef struct {
     bool response_referrer_policy_header_present;
     bool response_referrer_policy_metadata_valid;
     bool response_security_headers_truncated;
+    bool set_cookies_truncated;
     char error[256];
 } FetchBackgroundResult;
 

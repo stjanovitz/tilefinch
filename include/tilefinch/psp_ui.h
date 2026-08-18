@@ -825,6 +825,10 @@ void psp_ui_media_show_controls(PspUiMediaState *media);
 void psp_ui_media_tick(PspUiMediaState *media, unsigned elapsed_ms);
 PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
                                      const PspUiInput *input);
+/* True only when psp_ui_media_update() has already changed pixels worth
+ * publishing before the session consumes the intent. */
+bool psp_ui_media_intent_has_predispatch_visual(
+    const PspUiMediaIntent *intent);
 PspUiMediaIntent psp_ui_media_activate_at(PspUiMediaState *media,
                                           int x, int y,
                                           int width, int height);
@@ -861,6 +865,13 @@ size_t psp_ui_media_overlay_bands(
     const PspUiMediaState *media, int width, int height,
     PspUiRowBand *bands, size_t capacity);
 
+/* Repaint only the opaque scrubber/legend band. This is used by the
+ * cooperative seek supervisor while the last complete video frame remains
+ * frozen on the 32-bit scanout surface. */
+void psp_ui_media_composite_controls(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride);
+
 /*
  * Composite the same overlay over a 32-bit video buffer, using `scratch` --
  * a 16-bit surface of the same stride and height -- as the working surface.
@@ -872,6 +883,10 @@ void psp_ui_media_composite_8888(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     uint32_t *pixels, int width, int height, int stride,
     uint16_t *scratch);
+
+void psp_ui_media_composite_controls_8888(
+    const PspUiMediaState *media, uint32_t *pixels,
+    int width, int height, int stride, uint16_t *scratch);
 
 size_t psp_ui_media_state_bytes(void);
 

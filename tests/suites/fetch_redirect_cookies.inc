@@ -256,7 +256,8 @@ static bool test_redirect_short_circuit_and_cookie_bounds(
              "http://127.0.0.1:%u/response-cookie-capacity", port);
     result = (FetchResult) {.budget = budget};
     CHECK(fetch_redirect(budget, url, &request, &result)
-          && result.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY);
+          && result.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY
+          && !result.set_cookies_truncated);
     for (size_t i = 0; i < FETCH_RESPONSE_COOKIE_CAPACITY; i++) {
         char expected[64];
         int written = snprintf(expected, sizeof(expected),
@@ -269,8 +270,24 @@ static bool test_redirect_short_circuit_and_cookie_bounds(
     }
     fetch_result_destroy(&result);
 
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%u/response-cookie-twenty", port);
+    result = (FetchResult) {.budget = budget};
+    CHECK(fetch_redirect(budget, url, &request, &result)
+          && result.set_cookie_count == 20
+          && !result.set_cookies_truncated);
+    fetch_result_destroy(&result);
+
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%u/response-cookie-overflow", port);
+    result = (FetchResult) {.budget = budget};
+    CHECK(fetch_redirect(budget, url, &request, &result)
+          && result.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY
+          && result.set_cookies_truncated);
+    fetch_result_destroy(&result);
+
     static const char *rejected_paths[] = {
-        "oversized-cookie", "response-cookie-overflow"
+        "oversized-cookie", "redirect-cookie-overflow"
     };
     for (size_t i = 0;
          i < sizeof(rejected_paths) / sizeof(rejected_paths[0]); i++) {
@@ -300,7 +317,17 @@ static bool test_redirect_short_circuit_and_cookie_bounds(
     result = (FetchResult) {.budget = budget};
     CHECK(fetch_scheduler_request(
               scheduler, url, &request, 64 * 1024, 1000, &result)
-          && result.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY);
+          && result.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY
+          && !result.set_cookies_truncated);
+    fetch_result_destroy(&result);
+
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%u/response-cookie-overflow", port);
+    result = (FetchResult) {.budget = budget};
+    CHECK(fetch_scheduler_request(
+              scheduler, url, &request, 64 * 1024, 1000, &result)
+          && result.set_cookie_count == FETCH_RESPONSE_COOKIE_CAPACITY
+          && result.set_cookies_truncated);
     fetch_result_destroy(&result);
 
     for (size_t i = 0;
@@ -504,4 +531,3 @@ static bool test_proxy_connect_headers_suppressed(Budget *budget)
     fetch_scheduler_destroy(scheduler);
     return true;
 }
-

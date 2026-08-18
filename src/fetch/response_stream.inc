@@ -641,6 +641,7 @@ static void reset_response_metadata(FetchResult *result)
     result->response_referrer_policy_header_present = false;
     result->response_referrer_policy_metadata_valid = true;
     result->response_security_headers_truncated = false;
+    result->set_cookies_truncated = false;
     result->response_headers_length = 0;
     result->response_headers[0] = '\0';
 }
@@ -1237,6 +1238,7 @@ static size_t receive_header(char *data, size_t size, size_t count,
             }
             context->response_cookie_start =
                 context->result->set_cookie_count;
+            context->response_cookies_truncated = false;
             context->has_response_location = false;
             context->redirect_response = false;
             context->redirect_callback_aborted = false;
@@ -1277,6 +1279,7 @@ static size_t receive_header(char *data, size_t size, size_t count,
                 reset_response_metadata(context->result);
                 context->has_response_location = false;
                 context->redirect_response = false;
+                context->response_cookies_truncated = false;
                 context->headers_delivered = false;
                 return length;
             }
@@ -1291,6 +1294,18 @@ static size_t receive_header(char *data, size_t size, size_t count,
                 && (status == 301 || status == 302 || status == 303
                     || status == 307 || status == 308)
                 && context->has_response_location;
+            if (context->response_cookies_truncated) {
+                if (context->redirect_response) {
+                    context->cookie_header_rejected = true;
+                    snprintf(
+                        context->result->error,
+                        sizeof(context->result->error),
+                        "redirect response exceeded the %u-cookie transport limit",
+                        (unsigned) FETCH_RESPONSE_COOKIE_CAPACITY);
+                    return 0;
+                }
+                context->result->set_cookies_truncated = true;
+            }
             if (!enforce_response_cors_policy(context)) return 0;
             if (!enforce_response_credential_policy(context)) return 0;
             if (context->redirect_response) {
@@ -1375,19 +1390,18 @@ static size_t receive_header(char *data, size_t size, size_t count,
         context->has_response_location = true;
     } else if (name_length == 10
                && strncasecmp(data, "set-cookie", 10) == 0) {
-        if (trimmed_length >= FETCH_SET_COOKIE_LIMIT
-            || result->set_cookie_count >= FETCH_RESPONSE_COOKIE_CAPACITY) {
+        if (trimmed_length >= FETCH_SET_COOKIE_LIMIT) {
             context->cookie_header_rejected = true;
-            if (trimmed_length >= FETCH_SET_COOKIE_LIMIT) {
-                snprintf(result->error, sizeof(result->error), "%s",
-                         "response Set-Cookie exceeded 4095 bytes");
-            } else {
-                snprintf(
-                    result->error, sizeof(result->error),
-                    "response exceeded the %u-cookie transport limit",
-                    (unsigned) FETCH_RESPONSE_COOKIE_CAPACITY);
-            }
+            snprintf(result->error, sizeof(result->error), "%s",
+                     "response Set-Cookie exceeded 4095 bytes");
             return 0;
+        }
+        if (result->set_cookie_count >= FETCH_RESPONSE_COOKIE_CAPACITY) {
+            /* Keep parsing so a later malformed or oversized field still
+               fails.  Header completion decides whether this bounded loss is
+               safe to expose (final response) or must reject (redirect). */
+            context->response_cookies_truncated = true;
+            return length;
         }
         char *copy = budget_malloc(result->budget, trimmed_length + 1);
         if (copy == NULL) {

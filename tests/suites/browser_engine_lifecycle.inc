@@ -208,18 +208,47 @@ static int test_engine_lifecycle(void)
         browser_engine_navigation(engine)->history_count;
     BrowserController *incumbent_controller =
         browser_engine_controller(engine);
+    FetchScheduler *incumbent_scheduler =
+        pointer_navigation->page.resource_scheduler;
+    if (incumbent_scheduler == NULL) {
+        incumbent_scheduler = fetch_scheduler_create(
+            browser_engine_budget(engine), 1, 4096);
+        pointer_navigation->page.resource_scheduler = incumbent_scheduler;
+    }
+    FetchRequest incumbent_request = {.method = "GET"};
+    CHECK(incumbent_scheduler != NULL);
+    uint64_t incumbent_request_id = fetch_scheduler_enqueue(
+        incumbent_scheduler, "https://incumbent.test/optional-thumbnail",
+        &incumbent_request, 4096, 1000);
+    if (incumbent_request_id == 0) {
+        fprintf(stderr, "incumbent enqueue failed: %s\n",
+                fetch_scheduler_last_error(incumbent_scheduler));
+    }
     CHECK(browser_engine_pointer_event(
               engine, CONTROLLER_POINTER_DOWN,
               pointer_device_x, pointer_device_y,
               &pointer_activate, &pointer_page_changed)
           && incumbent_controller->pointer_down_active);
-    CHECK(browser_engine_begin_navigation_url(
+    CHECK(incumbent_request_id != 0
+          && fetch_scheduler_pending(incumbent_scheduler) == 1
+          && browser_engine_begin_navigation_url(
               engine, "https://cancel.test/candidate",
               64u * 1024u, 1000, true)
+          && fetch_scheduler_pending(incumbent_scheduler) == 0
           && browser_engine_navigation_pending(engine)
           && browser_engine_controller(engine) == incumbent_controller
           && !incumbent_controller->pointer_down_active
           && browser_engine_navigation(engine)->page.loaded);
+    bool incumbent_request_succeeded = true;
+    FetchResult incumbent_result = {.budget = browser_engine_budget(engine)};
+    CHECK(fetch_scheduler_take(
+              incumbent_scheduler, incumbent_request_id,
+              &incumbent_request_succeeded, &incumbent_result)
+          && !incumbent_request_succeeded
+          && strstr(
+                 incumbent_result.error,
+                 "superseded by a new navigation") != NULL);
+    fetch_result_destroy(&incumbent_result);
     BrowserViewSnapshot pending_view = {0};
     CHECK(browser_engine_view_snapshot(engine, &pending_view)
           && pending_view.loading

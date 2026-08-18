@@ -141,9 +141,13 @@ typedef enum {
 typedef struct {
     uint16_t value_offset;
     uint16_t value_length;
-    uint16_t url_offset;
-    uint16_t url_length;
 } FetchBackgroundCookie;
+
+typedef enum {
+    FETCH_BACKGROUND_COOKIE_CAPTURED = 0,
+    FETCH_BACKGROUND_COOKIE_TRUNCATED,
+    FETCH_BACKGROUND_COOKIE_REJECTED
+} FetchBackgroundCookieCapture;
 
 typedef struct {
     atomic_int state;
@@ -336,38 +340,29 @@ static unsigned char *fetch_background_slot_buffer(
         : fetch_background.fixed_buffers[slot->buffer_index];
 }
 
-static bool fetch_background_capture_cookie(
+static FetchBackgroundCookieCapture fetch_background_capture_cookie(
     FetchBackgroundSlot *slot, const char *value, size_t value_length)
 {
     if (slot == NULL || value == NULL
-        || value_length == 0 || value_length >= FETCH_SET_COOKIE_LIMIT
-        || slot->response_cookie_count >= FETCH_RESPONSE_COOKIE_CAPACITY) {
-        return false;
-    }
-    size_t url_length = strlen(slot->url);
-    if (url_length > UINT16_MAX || value_length > UINT16_MAX
+        || value_length == 0 || value_length >= FETCH_SET_COOKIE_LIMIT)
+        return FETCH_BACKGROUND_COOKIE_REJECTED;
+    if (slot->response_cookie_count >= FETCH_RESPONSE_COOKIE_CAPACITY)
+        return FETCH_BACKGROUND_COOKIE_TRUNCATED;
+    if (value_length > UINT16_MAX
         || value_length + 1u > FETCH_BACKGROUND_RESPONSE_COOKIE_BYTES
-                               - slot->response_cookie_bytes
-        || url_length + 1u > FETCH_BACKGROUND_RESPONSE_COOKIE_BYTES
-                             - slot->response_cookie_bytes
-                             - value_length - 1u) {
-        return false;
+                               - slot->response_cookie_bytes) {
+        return FETCH_BACKGROUND_COOKIE_REJECTED;
     }
     size_t value_offset = slot->response_cookie_bytes;
     memcpy(slot->response_cookie_storage + value_offset, value, value_length);
     slot->response_cookie_storage[value_offset + value_length] = '\0';
-    size_t url_offset = value_offset + value_length + 1u;
-    memcpy(slot->response_cookie_storage + url_offset, slot->url,
-           url_length + 1u);
-    slot->response_cookie_bytes = url_offset + url_length + 1u;
+    slot->response_cookie_bytes = value_offset + value_length + 1u;
     slot->response_cookies[slot->response_cookie_count++] =
         (FetchBackgroundCookie) {
             .value_offset = (uint16_t) value_offset,
-            .value_length = (uint16_t) value_length,
-            .url_offset = (uint16_t) url_offset,
-            .url_length = (uint16_t) url_length
+            .value_length = (uint16_t) value_length
         };
-    return true;
+    return FETCH_BACKGROUND_COOKIE_CAPTURED;
 }
 
 static void fetch_background_reset_response_headers(
@@ -397,6 +392,7 @@ static void fetch_background_reset_response_headers(
     slot->result.response_referrer_policy_header_present = false;
     slot->result.response_referrer_policy_metadata_valid = true;
     slot->result.response_security_headers_truncated = false;
+    slot->result.set_cookies_truncated = false;
     atomic_store_explicit(
         &slot->headers_state, FETCH_BACKGROUND_HEADERS_EMPTY,
         memory_order_release);
@@ -467,7 +463,11 @@ static bool fetch_background_store_header(
         copy_header_value(slot->location, sizeof(slot->location),
                           value, value_length);
     } else if (set_cookie) {
-        if (!fetch_background_capture_cookie(slot, value, value_length)) {
+        FetchBackgroundCookieCapture capture =
+            fetch_background_capture_cookie(slot, value, value_length);
+        if (capture == FETCH_BACKGROUND_COOKIE_TRUNCATED) {
+            slot->result.set_cookies_truncated = true;
+        } else if (capture == FETCH_BACKGROUND_COOKIE_REJECTED) {
             snprintf(slot->result.error, sizeof(slot->result.error), "%s",
                      "background response cookies exceeded bound");
             return false;
@@ -537,6 +537,17 @@ static size_t fetch_background_receive_header(
         if (slot->header_status >= 100 && slot->header_status < 200) {
             fetch_background_reset_response_headers(slot);
         } else {
+            if (!slot->single_hop
+                && slot->result.set_cookies_truncated
+                && slot->header_status >= 300
+                && slot->header_status < 400
+                && slot->location[0] != '\0') {
+                snprintf(
+                    slot->result.error, sizeof(slot->result.error),
+                    "redirect response exceeded the %u-cookie transport limit",
+                    (unsigned) FETCH_RESPONSE_COOKIE_CAPACITY);
+                return 0;
+            }
             slot->result.status_code = slot->header_status;
             snprintf(slot->result.effective_url,
                      sizeof(slot->result.effective_url), "%s", slot->url);
@@ -2203,6 +2214,18 @@ bool fetch_background_transport_metrics(
     FetchBackgroundTransportMetrics *metrics)
 {
     if (!fetch_background.initialized || metrics == NULL) return false;
+    size_t occupied_slots = 0;
+    size_t queued_slots = 0;
+    size_t running_slots = 0;
+    size_t complete_slots = 0;
+    for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++) {
+        int state = atomic_load_explicit(
+            &fetch_background.slots[i].state, memory_order_acquire);
+        if (state != FETCH_BACKGROUND_SLOT_FREE) occupied_slots++;
+        if (state == FETCH_BACKGROUND_SLOT_QUEUED) queued_slots++;
+        if (state == FETCH_BACKGROUND_SLOT_RUNNING) running_slots++;
+        if (state == FETCH_BACKGROUND_SLOT_COMPLETE) complete_slots++;
+    }
     uint64_t worker_run_clocks = 0;
     unsigned worker_thread_preemptions = 0;
     int worker_priority = -1;
@@ -2219,6 +2242,10 @@ bool fetch_background_transport_metrics(
     }
 #endif
     *metrics = (FetchBackgroundTransportMetrics) {
+        .occupied_slots = occupied_slots,
+        .queued_slots = queued_slots,
+        .running_slots = running_slots,
+        .complete_slots = complete_slots,
         .streaming_started = atomic_load_explicit(
             &fetch_background.streaming_started, memory_order_relaxed),
         .fixed_started = atomic_load_explicit(
@@ -2329,6 +2356,7 @@ static void fetch_background_copy_response_metadata(
         source->response_referrer_policy_metadata_valid;
     destination->response_security_headers_truncated =
         source->response_security_headers_truncated;
+    destination->set_cookies_truncated = source->set_cookies_truncated;
 }
 
 static void fetch_background_copy_media_headers(
@@ -2506,18 +2534,32 @@ bool fetch_background_transport_take_fetch_result_consumed(
              assembled ? slot->result.error
                        : "background streamed response was incomplete");
     bool cookies_ok = true;
+    bool cookie_capacity_rejected = false;
+    bool redirect_response =
+        (slot->result.status_code == 301
+         || slot->result.status_code == 302
+         || slot->result.status_code == 303
+         || slot->result.status_code == 307
+         || slot->result.status_code == 308)
+        && slot->location[0] != '\0';
     for (size_t i = 0; i < slot->response_cookie_count; i++) {
         if (result->set_cookie_count >= FETCH_RESPONSE_COOKIE_CAPACITY) {
-            cookies_ok = false;
+            if (redirect_response) {
+                cookies_ok = false;
+                cookie_capacity_rejected = true;
+            } else {
+                result->set_cookies_truncated = true;
+            }
             break;
         }
         const FetchBackgroundCookie *cookie = &slot->response_cookies[i];
+        size_t url_length = strlen(slot->url);
         char *value = budget_malloc_category(
             budget, BUDGET_CATEGORY_RESOURCE,
             (size_t) cookie->value_length + 1u);
         char *url = budget_malloc_category(
             budget, BUDGET_CATEGORY_RESOURCE,
-            (size_t) cookie->url_length + 1u);
+            url_length + 1u);
         if (value == NULL || url == NULL) {
             budget_free(budget, value);
             budget_free(budget, url);
@@ -2527,8 +2569,7 @@ bool fetch_background_transport_take_fetch_result_consumed(
         memcpy(value,
                slot->response_cookie_storage + cookie->value_offset,
                (size_t) cookie->value_length + 1u);
-        memcpy(url, slot->response_cookie_storage + cookie->url_offset,
-               (size_t) cookie->url_length + 1u);
+        memcpy(url, slot->url, url_length + 1u);
         result->set_cookies[result->set_cookie_count] = value;
         result->set_cookie_urls[result->set_cookie_count] = url;
         result->set_cookie_count++;
@@ -2541,8 +2582,15 @@ bool fetch_background_transport_take_fetch_result_consumed(
             result->set_cookies[at] = NULL;
             result->set_cookie_urls[at] = NULL;
         }
-        snprintf(result->error, sizeof(result->error), "%s",
-                 "background response cookies exceeded shared memory budget");
+        if (cookie_capacity_rejected) {
+            snprintf(
+                result->error, sizeof(result->error),
+                "redirect response exceeded the %u-cookie transport limit",
+                (unsigned) FETCH_RESPONSE_COOKIE_CAPACITY);
+        } else {
+            snprintf(result->error, sizeof(result->error), "%s",
+                     "background response cookies exceeded shared memory budget");
+        }
     }
     FetchHandshakeSample handshake = {
         .classified = result->tls_connection_reuse_known,

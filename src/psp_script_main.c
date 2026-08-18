@@ -38,6 +38,11 @@ typedef struct {
     bool transport_timed_out;
     bool tls12_compatibility_retry;
     char tls_version[16];
+    bool worker_present;
+    size_t worker_occupied_slots;
+    size_t worker_queued_slots;
+    size_t worker_running_slots;
+    size_t worker_complete_slots;
     bool network_present;
     int network_status;
     int network_failure_phase;
@@ -92,6 +97,8 @@ static bool psp_write_failure_report_data(
         "uptime-us=%llu\nunix-time=%llu\nfree=%d\nlargest=%d\n"
         "transport-present=%d\ncurl-code=%ld\ntimed-out=%d\n"
         "tls-verify=0x%08lx\ntls-version=%s\ntls12-retry=%d\n"
+        "worker-present=%d\nworker-slots=%zu\nworker-queued=%zu\n"
+        "worker-running=%zu\nworker-complete=%zu\n"
         "network-present=%d\nnetwork-status=%d\n"
         "network-failure-phase=%d\nprofile-requested=%d\n"
         "profile-selected=%d\nprofile-fallback=%d\napctl=%d\n"
@@ -113,6 +120,11 @@ static bool psp_write_failure_report_data(
         diagnostics->tls_version[0] == '\0'
             ? "absent" : diagnostics->tls_version,
         diagnostics->tls12_compatibility_retry ? 1 : 0,
+        diagnostics->worker_present ? 1 : 0,
+        diagnostics->worker_occupied_slots,
+        diagnostics->worker_queued_slots,
+        diagnostics->worker_running_slots,
+        diagnostics->worker_complete_slots,
         diagnostics->network_present ? 1 : 0,
         diagnostics->network_status,
         diagnostics->network_failure_phase,
@@ -176,6 +188,14 @@ bool psp_write_navigation_failure_report(
         .tls12_compatibility_retry =
             navigation->last_tls12_compatibility_retry
     };
+    FetchBackgroundTransportMetrics worker = {0};
+    if (fetch_background_transport_metrics(&worker)) {
+        diagnostics.worker_present = true;
+        diagnostics.worker_occupied_slots = worker.occupied_slots;
+        diagnostics.worker_queued_slots = worker.queued_slots;
+        diagnostics.worker_running_slots = worker.running_slots;
+        diagnostics.worker_complete_slots = worker.complete_slots;
+    }
     snprintf(diagnostics.tls_version, sizeof(diagnostics.tls_version),
              "%s", navigation->last_tls_version);
     return psp_write_failure_report_data(
@@ -2067,10 +2087,13 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 media_operation =
                     psp_log_operation_begin(media_action);
             }
-            if (media_intent.visual_changed
+            if (psp_ui_media_intent_has_predispatch_visual(&media_intent)
                 && !psp_navigation_cooperate_supervised()) {
-                /* Publish the controls' pressed state before a close,
-                   seek, or retry can enter a slower backend operation. */
+                /* Publish UI state which already changed before a close,
+                   seek, or retry can enter a slower backend operation.
+                   Play/Pause is deliberately excluded: its visible state is
+                   committed by execute_intent below, so this would publish a
+                   stale legend and then its replacement one vblank later. */
                 psp_present(engine_views->frame, &process->presentation.ui);
             }
             psp_media_execute_intent(&browser->media, media_intent);
@@ -3875,6 +3898,8 @@ int main(int argc, char *argv[])
         .wall_time_ns = psp_wall_time_ns,
         .monotonic_time_ns = psp_time_ns,
         .monotonic_time_us = psp_time_us,
+        .preferred_language = psp_preferred_language,
+        .preferred_date_format = psp_preferred_date_format,
         .cooperate = psp_platform_cooperate,
         .present_rgb565 = psp_platform_present,
         .log_message = psp_log_message,

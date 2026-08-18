@@ -8,6 +8,17 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.4 — 2026-08-17
+
+- Improved player-control redraw stability during interactive seeking.
+- Localized YouTube result and watch metadata from the PSP language and date
+  settings without delaying native startup.
+- Improved navigation responsiveness by promptly retiring abandoned page
+  requests before the next page starts.
+- Accepted larger real-world response cookie sets while preserving bounded,
+  fail-closed redirect handling.
+- Reduced cooperative YouTube parsing work on PSP.
+
 ## 0.1.3 — 2026-08-17
 
 - Improved YouTube playback recovery when a delivery URL serves only an

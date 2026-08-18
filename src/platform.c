@@ -68,6 +68,30 @@ uint64_t tilefinch_platform_monotonic_time_us(void)
     return tilefinch_platform_monotonic_time_ns() / UINT64_C(1000);
 }
 
+const char *tilefinch_platform_preferred_language(void)
+{
+    if (installed_services.preferred_language != NULL) {
+        const char *language = installed_services.preferred_language(
+            installed_services.context);
+        if (language != NULL && language[0] != '\0') return language;
+    }
+    return "en";
+}
+
+TilefinchDateFormat tilefinch_platform_preferred_date_format(void)
+{
+    if (installed_services.preferred_date_format != NULL) {
+        TilefinchDateFormat format =
+            installed_services.preferred_date_format(
+                installed_services.context);
+        if (format >= TILEFINCH_DATE_FORMAT_YEAR_MONTH_DAY
+            && format <= TILEFINCH_DATE_FORMAT_DAY_MONTH_YEAR) {
+            return format;
+        }
+    }
+    return TILEFINCH_DATE_FORMAT_YEAR_MONTH_DAY;
+}
+
 bool tilefinch_platform_secure_random(void *data, size_t length)
 {
     if (data == NULL && length != 0) return false;

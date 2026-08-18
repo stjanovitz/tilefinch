@@ -1112,39 +1112,22 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         else if (media->reopen_preview_pending)
             psp_ui_media_set_seek_preview(
                 &media->ui, media->reopen_preview_target_us);
-        char video_id[YOUTUBE_VIDEO_ID_CAPACITY] = {0};
-        BrowserProfileResume resume = {0};
         uint64_t duration_us = psp_media_duration_us(media);
-        /* A retry or system resume is an explicit transaction continuation,
-           not a saved-profile suggestion. Preserve even a 1-second position;
-           the five-second policy below remains appropriate only for durable
-           history. A zero/paused recovery already has the desired initial
-           state and avoids an unnecessary decoder reset. */
-        bool fallback_resume_available = media->reopen_resume_pending
+        /* Only an in-process retry, quality fallback, or system resume may
+           continue an existing playback transaction. A fresh watch-page open
+           always starts at zero: durable profile positions made a later app
+           launch pay an immediate random-access seek over a new CDN route,
+           which is both surprising and less reliable than a clean start. A
+           zero/paused recovery already has the desired initial state and
+           avoids an unnecessary decoder reset. */
+        bool reopen_resume_available = media->reopen_resume_pending
             && (media->reopen_resume_us != 0
                 || media->reopen_resume_playing)
             && duration_us != 0;
-        bool resume_available = !fallback_resume_available
-            && media->profile != NULL
-            && youtube_watch_url_video_id(media->source, video_id)
-            && browser_profile_resume(media->profile, video_id, &resume)
-            && resume.position_us >= UINT64_C(5000000)
-            && duration_us > UINT64_C(5000000)
-            && resume.position_us
-                 < duration_us - UINT64_C(5000000);
-        if (fallback_resume_available || resume_available) {
-            media->job_target_us = fallback_resume_available
-                ? (media->reopen_resume_us > duration_us
-                    ? duration_us : media->reopen_resume_us)
-                : resume.position_us;
-            /* A durable profile position supplies only a position, not a
-               second play/pause authority.  Preserve the OPEN event's state-
-               machine intent for that case.  Explicit reopen transactions
-               (retry, suspend, quality fallback) still carry their recorded
-               physical play state. */
-            media->job_resume_playing = fallback_resume_available
-                ? media->reopen_resume_playing
-                : psp_media_machine_wants_playing(media);
+        if (reopen_resume_available) {
+            media->job_target_us = media->reopen_resume_us > duration_us
+                ? duration_us : media->reopen_resume_us;
+            media->job_resume_playing = media->reopen_resume_playing;
             media->job_preview = false;
             media->job_resume_open = true;
             media->job_phase = PSP_MEDIA_JOB_SEEK_PREPARE;
@@ -1165,7 +1148,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             media->job_maximum_unit_us = 0;
         }
         if (media->reopen_seek_completion_pending
-            && !(fallback_resume_available || resume_available)) {
+            && !reopen_resume_available) {
             /* A zero-position paused reopen needs no follow-up seek. The
                replacement backend is already at its target, so this is the
                completion boundary for that special case. */

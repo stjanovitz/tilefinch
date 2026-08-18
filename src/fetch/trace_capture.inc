@@ -305,7 +305,7 @@ static bool trace_capture_response_at(size_t sequence, const char *method,
         budget_free(budget, scratch);
         return false;
     }
-    bool ok = fprintf(meta, "psp-http-trace=11\n") >= 0
+    bool ok = fprintf(meta, "psp-http-trace=12\n") >= 0
         && fprintf(meta, "cookie-values=%s\n",
                    fetch_trace.capture_raw_cookie_values
                        ? "raw" : "redacted") >= 0
@@ -454,7 +454,9 @@ static bool trace_capture_response_at(size_t sequence, const char *method,
         && fprintf(meta, "response-header-count=%zu\n",
                    response_header_count(result)) >= 0
         && fprintf(meta, "set-cookie-count=%zu\n",
-                   result->set_cookie_count) >= 0;
+                   result->set_cookie_count) >= 0
+        && fprintf(meta, "set-cookies-truncated=%d\n",
+                   result->set_cookies_truncated ? 1 : 0) >= 0;
     for (size_t i = 0; ok && i < result->set_cookie_count; i++) {
         char name[32];
         (void) snprintf(name, sizeof(name), "set-cookie-%zu", i);
@@ -616,6 +618,7 @@ static void fetch_result_discard_all_cookie_storage(FetchResult *result)
         result->set_cookie_urls[i] = NULL;
     }
     result->set_cookie_count = 0;
+    result->set_cookies_truncated = false;
 }
 
 static bool trace_parse_size_value(const char *value, size_t *parsed)
@@ -734,10 +737,12 @@ typedef enum {
     TRACE_V10_FIELD_COUNT,
     TRACE_V11_RESPONSE_SECURITY_METADATA = TRACE_V10_FIELD_COUNT,
     TRACE_V11_RESPONSE_SECURITY_ALLOW_ORIGIN,
-    TRACE_V11_FIELD_COUNT
+    TRACE_V11_FIELD_COUNT,
+    TRACE_V12_SET_COOKIES_TRUNCATED = TRACE_V11_FIELD_COUNT,
+    TRACE_V12_FIELD_COUNT
 } TraceV6Field;
 
-_Static_assert(TRACE_V11_FIELD_COUNT <= 64,
+_Static_assert(TRACE_V12_FIELD_COUNT <= 64,
                "HTTP trace field mask must fit in uint64_t");
 
 static bool trace_mark_field(uint64_t *seen, TraceV6Field field)

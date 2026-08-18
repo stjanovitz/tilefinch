@@ -572,6 +572,24 @@ class PspSdkContractTests(unittest.TestCase):
             main.index("bool psp_request_omnibox(")]
         self.assertIn("psp_profile_store_mark_dirty(context, now_us)", callback)
 
+    def test_fresh_media_open_does_not_apply_durable_resume(self):
+        source = without_comments(
+            (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+        self.assertNotIn("browser_profile_resume(", source)
+        definition = source.index(
+            "static bool psp_media_open_pump_step(",
+            source.index("static bool psp_media_open_pump_step(") + 1)
+        opening = source[
+            definition:
+            source.index("bool psp_media_open_work_pending(", definition)]
+        self.assertIn(
+            "bool reopen_resume_available = media->reopen_resume_pending",
+            opening)
+        self.assertIn(
+            "media->job_target_us = media->reopen_resume_us > duration_us",
+            opening)
+        self.assertNotIn("BrowserProfileResume", opening)
+
     def test_media_retry_preserves_seek_target_and_short_resume(self):
         source = without_comments(
             psp_media_session_sources())
@@ -769,12 +787,13 @@ class PspSdkContractTests(unittest.TestCase):
             ".autoplay = media->reopen_resume_playing", route)
         open_source = without_comments(
             (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+        self.assertNotIn("browser_profile_resume(", open_source)
         resume = open_source[
-            open_source.index("bool fallback_resume_available"):
+            open_source.index("bool reopen_resume_available"):
             open_source.index("media->reopen_resume_us = 0",
-                              open_source.index("bool fallback_resume_available"))]
-        self.assertIn("psp_media_machine_wants_playing(media)", resume)
-        self.assertIn("? media->reopen_resume_playing", resume)
+                              open_source.index("bool reopen_resume_available"))]
+        self.assertIn("media->job_resume_playing = media->reopen_resume_playing",
+                      resume)
         wants = source[
             source.index("bool psp_media_machine_wants_playing("):
             source.index("static void psp_media_apply_active_projection(")]
@@ -954,6 +973,19 @@ class PspSdkContractTests(unittest.TestCase):
             self.assertLess(
                 body.index("psp_display_video_end(&psp_display)"),
                 body.index("psp_display_back_buffer(&psp_display)"))
+        supervisor = runtime[
+            runtime.index("static void psp_present_supervisor_media("):
+            runtime.index("void psp_present_boot_surface(")]
+        self.assertLess(
+            supervisor.index("psp_display_video_active(&psp_display)"),
+            supervisor.index("psp_display_video_end(&psp_display)"))
+        self.assertIn("psp_display_video_front_buffer(&psp_display)",
+                      supervisor)
+        self.assertIn("psp_display_video_back_buffer(&psp_display)",
+                      supervisor)
+        self.assertIn("memcpy(back, front, PSP_DISPLAY_VIDEO_BUFFER_BYTES)",
+                      supervisor)
+        self.assertIn("psp_ui_media_composite_controls_8888(", supervisor)
         # The ownership window is derived per present, never latched at open,
         # so every way a session ends is an exit path without enumerating
         # them: close, the failed panel, a quarantine, a navigation and a

@@ -300,6 +300,8 @@ bool psp_home_exit_pending(void);
 uint64_t psp_time_ns(void *context);
 uint64_t psp_time_us(void *context);
 uint64_t psp_wall_time_ns(void *context);
+const char *psp_preferred_language(void *context);
+TilefinchDateFormat psp_preferred_date_format(void *context);
 void psp_log_message(void *context, const char *message);
 bool psp_present_internal(
     const uint16_t *frame, const PspUiState *ui, bool include_media);
