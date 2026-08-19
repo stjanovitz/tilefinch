@@ -426,6 +426,24 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;psp;ui"
         TIMEOUT 10)
 
+    add_executable(tilefinch-diagnostic-qr-tests
+        tests/test_diagnostic_qr.c)
+    target_link_libraries(tilefinch-diagnostic-qr-tests PRIVATE
+        tilefinch_diagnostic_qr)
+    add_test(NAME tilefinch-diagnostic-qr-tests
+        COMMAND tilefinch-diagnostic-qr-tests)
+    set_tests_properties(tilefinch-diagnostic-qr-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;diagnostics"
+        TIMEOUT 10)
+    if(NOT PSP)
+        add_test(NAME tilefinch-diagnostic-qr-decoder-tests
+            COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_diagnostic_qr_decoder.py")
+        set_tests_properties(tilefinch-diagnostic-qr-decoder-tests PROPERTIES
+            LABELS "tilefinch;unit;psp;diagnostics"
+            TIMEOUT 10)
+    endif()
+
     add_executable(tilefinch-psp-boot-config-tests
         tests/test_psp_boot_config.c)
     target_link_libraries(tilefinch-psp-boot-config-tests
@@ -629,6 +647,17 @@ if(PSP_BROWSER_BUILD_TESTS)
         COMMAND tilefinch-budget-concurrent-tests)
     set_tests_properties(tilefinch-budget-concurrent-tests PROPERTIES
         LABELS "tilefinch;unit;allocator;concurrency;sanitizer"
+        TIMEOUT 30)
+
+    add_executable(tilefinch-fetch-background-ownership-tests
+        tests/test_fetch_background_ownership.c)
+    target_include_directories(tilefinch-fetch-background-ownership-tests
+        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+                ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME tilefinch-fetch-background-ownership-tests
+        COMMAND tilefinch-fetch-background-ownership-tests)
+    set_tests_properties(tilefinch-fetch-background-ownership-tests PROPERTIES
+        LABELS "tilefinch;unit;network;media;psp;concurrency;sanitizer"
         TIMEOUT 30)
 
     add_executable(tilefinch-psp-media-ownership-tests

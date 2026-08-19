@@ -794,9 +794,9 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         [PSP_MEDIA_JOB_OPEN_RESOLVE] = 80u,
         [PSP_MEDIA_JOB_OPEN_VIDEO_RANGE] = 360u,
         [PSP_MEDIA_JOB_OPEN_VIDEO_DEMUX] = 520u,
-        [PSP_MEDIA_JOB_OPEN_VIDEO_PRIME] = 600u,
-        [PSP_MEDIA_JOB_OPEN_AUDIO_RANGE] = 650u,
-        [PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX] = 760u,
+        [PSP_MEDIA_JOB_OPEN_VIDEO_PRIME] = 820u,
+        [PSP_MEDIA_JOB_OPEN_AUDIO_RANGE] = 600u,
+        [PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX] = 720u,
         [PSP_MEDIA_JOB_OPEN_DECODER_PREPARE] = 220u,
         [PSP_MEDIA_JOB_OPEN_PLAYBACK] = 900u
     };
@@ -991,7 +991,15 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         media->demux = media_mp4_open(
             media->budget, &reader, NULL, error, sizeof(error));
         ok = media->demux != NULL;
-        if (ok) media->job_phase = PSP_MEDIA_JOB_OPEN_VIDEO_PRIME;
+        if (ok) {
+            /* Give the small audio metadata reads first access to the link.
+               A full video successor is useful read-ahead, but issuing it
+               before audio open can monopolize a slow PSP connection and
+               merely move the visible startup stall to the next phase. */
+            media->job_phase = media->stream.split_streams
+                ? PSP_MEDIA_JOB_OPEN_AUDIO_RANGE
+                : PSP_MEDIA_JOB_OPEN_VIDEO_PRIME;
+        }
         break;
     }
     case PSP_MEDIA_JOB_OPEN_VIDEO_PRIME: {
@@ -999,12 +1007,14 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                 || !browser_profile_video_startup_buffering(media->profile)
             ? MEDIA_HTTP_RANGE_PRIME_READY
             : media_http_range_prime_successor(media->range);
-        if (primed == MEDIA_HTTP_RANGE_PRIME_PENDING) break;
-        ok = primed == MEDIA_HTTP_RANGE_PRIME_READY;
+        /* Prime starts the ordinary successor-window read-ahead, but a full
+           256 KiB response is not a prerequisite for opening audio or the
+           decoder. On PSP Wi-Fi that mandatory gate could spend the entire
+           phase deadline at a truthful 60%. The worker retains the request
+           and playback pumps it from the same bounded range source. */
+        ok = primed != MEDIA_HTTP_RANGE_PRIME_FAILED;
         if (ok) {
-            media->job_phase = media->stream.split_streams
-                ? PSP_MEDIA_JOB_OPEN_AUDIO_RANGE
-                : PSP_MEDIA_JOB_OPEN_PLAYBACK;
+            media->job_phase = PSP_MEDIA_JOB_OPEN_PLAYBACK;
         } else {
             MediaRangeReader reader = media_http_range_reader(media->range);
             if (reader.describe_failure == NULL
@@ -1059,7 +1069,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         media->audio_demux = media_mp4_open(
             media->budget, &reader, NULL, error, sizeof(error));
         ok = media->audio_demux != NULL;
-        if (ok) media->job_phase = PSP_MEDIA_JOB_OPEN_PLAYBACK;
+        if (ok) media->job_phase = PSP_MEDIA_JOB_OPEN_VIDEO_PRIME;
         break;
     }
     case PSP_MEDIA_JOB_OPEN_DECODER_PREPARE: {

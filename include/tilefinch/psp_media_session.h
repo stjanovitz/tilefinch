@@ -172,6 +172,10 @@ typedef struct {
        bounds Memory Stick writes even across many failing routes. */
     unsigned failure_report_level;
     unsigned failure_report_writes;
+    /* Physical admission reservation for an online media route. It survives
+       pipeline rebuilds; route exit/shutdown releases it. Lifecycle authority
+       remains in the session machine. */
+    bool transport_priority_held;
     bool range_pump_audio_first;
     BrowserYoutubeQuality requested_quality;
     bool quality_fallback_attempted;

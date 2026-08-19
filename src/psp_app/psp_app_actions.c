@@ -7,6 +7,145 @@ __attribute__((noinline))
 static void psp_app_dispatch_heavy_action(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent);
 
+typedef struct {
+    TilefinchDiagnosticSource sources[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT];
+    char paths[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT]
+              [TILEFINCH_INSTALL_PATH_LIMIT];
+} PspDiagnosticPathSet;
+
+/* Keep the five long install paths and zlib/QR setup out of the already-large
+   heavy action receiver's stack frame. The path set exists only for this
+   explicit menu action and is released before the QR screen is presented. */
+__attribute__((noinline))
+static void psp_app_build_diagnostic_qr(
+    PspApp *app, PspAppFrameState *frame)
+{
+    if (app == NULL || frame == NULL) return;
+    static const char *const names[TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT] = {
+        "tilefinch-last-error.txt",
+        "tilefinch-validation.txt",
+        "tilefinch-crash.txt",
+        "tilefinch-validation.previous.txt",
+        "tilefinch-crash.previous.txt"
+    };
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Validation logging is fully buffered to protect frame cadence. This
+       user-triggered export is the one place where paying a flush is useful:
+       it makes the current file in the bundle match the latest completed
+       diagnostic line. Shipping builds have no full validation stream. */
+    (void) psp_log_flush(false);
+#endif
+    PspDiagnosticPathSet *paths = calloc(1u, sizeof(*paths));
+    if (paths == NULL) {
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            "NOT ENOUGH MEMORY FOR DIAGNOSTICS", 240);
+        frame->page_dirty = true;
+        return;
+    }
+    bool paths_valid = true;
+    for (size_t at = 0; at < TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT; at++) {
+        paths_valid = paths_valid && tilefinch_install_data_path(
+            &app->process->install_paths, names[at],
+            paths->paths[at], sizeof(paths->paths[at]));
+        paths->sources[at].name = names[at];
+        paths->sources[at].path = paths->paths[at];
+    }
+    if (!paths_valid) {
+        free(paths);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            "DIAGNOSTIC LOG PATH UNAVAILABLE", 240);
+        frame->page_dirty = true;
+        return;
+    }
+    psp_ui_set_diagnostic_qr(&app->process->presentation.ui, NULL);
+    tilefinch_diagnostic_qr_destroy(app->process->diagnostic_qr);
+    app->process->diagnostic_qr = NULL;
+    TilefinchDiagnosticMetadata metadata = {
+        .app_version = TILEFINCH_VERSION_STRING,
+        .release_sequence = TILEFINCH_RELEASE_SEQUENCE,
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+        .created_unix_time = (uint64_t) time(NULL),
+#else
+        .created_unix_time = 0u,
+#endif
+        /* The public user-mode SDK has no portable model query. The kernel
+           export used by some CFW utilities is not safe to make a release
+           dependency merely for display metadata. */
+        .psp_model = UINT32_MAX,
+        .psp_firmware = (uint32_t) sceKernelDevkitVersion()
+    };
+    char error[PSP_UI_STATUS_CAPACITY];
+    app->process->diagnostic_qr = tilefinch_diagnostic_qr_build(
+        &metadata, paths->sources, TILEFINCH_DIAGNOSTIC_QR_SOURCE_LIMIT,
+        error, sizeof(error));
+    free(paths);
+    if (app->process->diagnostic_qr == NULL) {
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            error[0] == '\0' ? "DIAGNOSTIC QR COULD NOT BE BUILT" : error,
+            240);
+    } else {
+        app->process->presentation.ui.status[0] = '\0';
+        app->process->presentation.ui.toast_frames = 0u;
+        psp_ui_set_diagnostic_qr(
+            &app->process->presentation.ui,
+            tilefinch_diagnostic_qr_view(app->process->diagnostic_qr));
+    }
+    frame->page_dirty = true;
+}
+
+static void psp_app_step_diagnostic_qr(
+    PspApp *app, PspAppFrameState *frame, int direction)
+{
+    if (app == NULL || frame == NULL || app->process->diagnostic_qr == NULL)
+        return;
+    const TilefinchDiagnosticQrView *view = tilefinch_diagnostic_qr_view(
+        app->process->diagnostic_qr);
+    if (view == NULL || view->page_count == 0u) return;
+    unsigned page = view->page_index;
+    page = direction < 0
+        ? (page == 0u ? view->page_count - 1u : page - 1u)
+        : (page + 1u) % view->page_count;
+    if (tilefinch_diagnostic_qr_select_page(
+            app->process->diagnostic_qr, page)) {
+        psp_ui_set_diagnostic_qr(
+            &app->process->presentation.ui,
+            tilefinch_diagnostic_qr_view(app->process->diagnostic_qr));
+        frame->page_dirty = true;
+    }
+}
+
+static void psp_app_step_diagnostic_part(
+    PspApp *app, PspAppFrameState *frame, int direction)
+{
+    if (app == NULL || frame == NULL || app->process->diagnostic_qr == NULL)
+        return;
+    const TilefinchDiagnosticQrView *view = tilefinch_diagnostic_qr_view(
+        app->process->diagnostic_qr);
+    if (view == NULL || view->part_count == 0u) return;
+    unsigned part = view->part_index;
+    part = direction < 0
+        ? (part == 0u ? view->part_count - 1u : part - 1u)
+        : (part + 1u) % view->part_count;
+    char error[PSP_UI_STATUS_CAPACITY];
+    if (!tilefinch_diagnostic_qr_select_part(
+            app->process->diagnostic_qr, part, error, sizeof(error))) {
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            error[0] == '\0' ? "DIAGNOSTIC PART COULD NOT BE BUILT" : error,
+            240);
+    } else {
+        app->process->presentation.ui.status[0] = '\0';
+        app->process->presentation.ui.toast_frames = 0u;
+    }
+    psp_ui_set_diagnostic_qr(
+        &app->process->presentation.ui,
+        tilefinch_diagnostic_qr_view(app->process->diagnostic_qr));
+    frame->page_dirty = true;
+}
+
 static bool psp_history_move(
     BrowserEngine *engine, bool forward, const NavigationEntry **entry)
 {
@@ -1351,6 +1490,27 @@ static void psp_app_dispatch_heavy_action(
                     * sizeof(*app->interactive->screenshot.pixels));
             break;
         }
+        case PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR:
+            psp_app_build_diagnostic_qr(app, frame);
+            break;
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_PREVIOUS:
+            psp_app_step_diagnostic_qr(app, frame, -1);
+            break;
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_NEXT:
+            psp_app_step_diagnostic_qr(app, frame, 1);
+            break;
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_PART_PREVIOUS:
+            psp_app_step_diagnostic_part(app, frame, -1);
+            break;
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_PART_NEXT:
+            psp_app_step_diagnostic_part(app, frame, 1);
+            break;
+        case PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR:
+            psp_ui_set_diagnostic_qr(&app->process->presentation.ui, NULL);
+            tilefinch_diagnostic_qr_destroy(app->process->diagnostic_qr);
+            app->process->diagnostic_qr = NULL;
+            frame->page_dirty = true;
+            break;
         case PSP_UI_ACTION_POWER_TEST:
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         {

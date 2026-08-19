@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "tilefinch/diagnostic_qr.h"
 #include "tilefinch/psp_media_state.h"
 
 #include "tilefinch/browser_profile.h"
@@ -148,6 +149,12 @@ typedef enum {
     PSP_UI_ACTION_SHOW_HOMEPAGE,
     PSP_UI_ACTION_SHOW_HISTORY,
     PSP_UI_ACTION_SCREENSHOT,
+    PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR,
+    PSP_UI_ACTION_DIAGNOSTIC_QR_PREVIOUS,
+    PSP_UI_ACTION_DIAGNOSTIC_QR_NEXT,
+    PSP_UI_ACTION_DIAGNOSTIC_QR_PART_PREVIOUS,
+    PSP_UI_ACTION_DIAGNOSTIC_QR_PART_NEXT,
+    PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR,
     PSP_UI_ACTION_POWER_TEST,
     PSP_UI_ACTION_MEDIA_TEST,
     /* Opens the native text-entry service for the local, explicitly
@@ -322,6 +329,7 @@ typedef enum {
     PSP_UI_SCREEN_GLYPH_OPTIONS,
     PSP_UI_SCREEN_UPDATE,
     PSP_UI_SCREEN_DATA_OPTIONS,
+    PSP_UI_SCREEN_DIAGNOSTIC_QR,
     PSP_UI_SCREEN_TABS,
     PSP_UI_SCREEN_TEXT_ENTRY,
     PSP_UI_SCREEN_FIND,
@@ -547,6 +555,7 @@ typedef struct {
     union {
         const PspUiTextEntryView *text_entry;
         const PspUiFindView *find_view;
+        const TilefinchDiagnosticQrView *diagnostic_qr;
     };
 } PspUiState;
 
@@ -760,6 +769,8 @@ void psp_ui_set_text_entry(
 void psp_ui_clear_text_entry(PspUiState *ui);
 void psp_ui_set_find(PspUiState *ui, const PspUiFindView *view);
 void psp_ui_clear_find(PspUiState *ui);
+void psp_ui_set_diagnostic_qr(
+    PspUiState *ui, const TilefinchDiagnosticQrView *view);
 /* Abandon page-directed held/analog input while a candidate navigation owns
    the foreground. The cursor position is retained for the next analog move. */
 void psp_ui_suspend_page_input(PspUiState *ui);

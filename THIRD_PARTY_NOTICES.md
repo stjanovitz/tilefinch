@@ -73,6 +73,12 @@ runtime assets or immutable engine data.
   TLS-negotiated HTTP/2 with HTTP/1.1 fallback. It can be excluded with
   `TILEFINCH_PSP_HTTP2=OFF` for comparison or emergency fallback.
 - **zlib**: linked from the PSPDEV SDK under the zlib license.
+- **Project Nayuki QR Code generator**, commit
+  `2c9044de6b049ca25cb3cd1649ed7e27aa055138`: MIT License. Tilefinch
+  vendors the allocation-free C encoder under `third_party/qrcodegen/` for
+  the user-triggered diagnostic export screen; the complete license is
+  reproduced in the source headers and at
+  `third_party/notices/qrcodegen/LICENSE`.
 - **OpenSSL** (host builds only): `OpenSSL::Crypto` is linked into host
   laboratory and test binaries. Apache License 2.0. Not part of the PSP
   EBOOT.
@@ -176,7 +182,7 @@ notice in this file.
 A browser release archive must bundle, at minimum: the Lexbor `LICENSE` and
 `NOTICE`;
 the FreeType FTL text and credit line (plus its embedded zlib/HarfBuzz
-notices); the MIT texts for QuickJS and stb; the NanoSVG zlib text; the
+notices); the MIT texts for QuickJS, stb, and the QR encoder; the NanoSVG zlib text; the
 libwebp copyright license and patent grant;
 Public Suffix List MPL-2.0 and Chromium BSD-3-Clause texts with the source
 pointer; the complete PocketSphinx compound license; the DejaVu and both OFL

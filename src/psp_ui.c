@@ -20,9 +20,9 @@
 #define UI_TOAST_DEFAULT_FRAMES 180u
 #define UI_MEDIA_CONTROLS_MS 3000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 37u
+#define UI_OPTIONS_ITEM_COUNT 38u
 #else
-#define UI_OPTIONS_ITEM_COUNT 35u
+#define UI_OPTIONS_ITEM_COUNT 36u
 #endif
 #define UI_DATA_OPTIONS_ITEM_COUNT 7u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -166,6 +166,7 @@ typedef enum {
     UI_OPTION_MIXED_CONTENT_SITE,
     UI_OPTION_THIRD_PARTY_COOKIES_SITE,
     UI_OPTION_NETWORK_PROFILE,
+    UI_OPTION_DIAGNOSTIC_QR,
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
     UI_OPTION_POWER_TEST,
     UI_OPTION_MEDIA_TEST,
@@ -208,6 +209,7 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_MIXED_CONTENT_SITE,
     UI_OPTION_THIRD_PARTY_COOKIES_SITE,
     UI_OPTION_NETWORK_PROFILE,
+    UI_OPTION_DIAGNOSTIC_QR,
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
     UI_OPTION_POWER_TEST,
     UI_OPTION_MEDIA_TEST,
@@ -267,6 +269,7 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_MEDIA_TEST:
 #endif
         case UI_OPTION_NETWORK_PROFILE:
+        case UI_OPTION_DIAGNOSTIC_QR:
         case UI_OPTION_UPDATE_CHECK:
         case UI_OPTION_UPDATE:
         case UI_OPTION_SITE_DATA:
@@ -394,6 +397,8 @@ static const char *ui_option_description(UiOptionId option)
             return "Compatibility: allow unpartitioned cookies here";
         case UI_OPTION_NETWORK_PROFILE:
             return "Left/right choose; X saves next connection";
+        case UI_OPTION_DIAGNOSTIC_QR:
+            return "Photograph logs without removing the stick";
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
         case UI_OPTION_POWER_TEST:
             return "Run the controlled clocking test";
@@ -1841,6 +1846,12 @@ void psp_ui_clear_find(PspUiState *ui)
         ui->screen = PSP_UI_SCREEN_PAGE;
 }
 
+void psp_ui_set_diagnostic_qr(
+    PspUiState *ui, const TilefinchDiagnosticQrView *view)
+{
+    if (ui != NULL) ui->diagnostic_qr = view;
+}
+
 static PspUiAction menu_action(size_t selection)
 {
     static const PspUiAction actions[PSP_UI_MENU_ITEM_COUNT] = {
@@ -2354,6 +2365,38 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
             } else {
                 ui_open_parent_overlay(ui, PSP_UI_SCREEN_OPTION_ITEMS);
             }
+            intent.visual_changed = true;
+        }
+        return intent;
+    }
+
+    if (ui->screen == PSP_UI_SCREEN_DIAGNOSTIC_QR) {
+        if (pressed & PSP_UI_BUTTON_CANCEL) {
+            ui_open_parent_overlay(ui, PSP_UI_SCREEN_OPTION_ITEMS);
+            intent.action = PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR;
+            intent.visual_changed = true;
+        } else if (pressed & (PSP_UI_BUTTON_LEFT | PSP_UI_BUTTON_PAGE_UP)) {
+            if (ui->diagnostic_qr != NULL
+                && ui->diagnostic_qr->page_count > 1u)
+                intent.action = PSP_UI_ACTION_DIAGNOSTIC_QR_PREVIOUS;
+            intent.visual_changed = true;
+        } else if (pressed & (PSP_UI_BUTTON_RIGHT | PSP_UI_BUTTON_PAGE_DOWN)) {
+            if (ui->diagnostic_qr != NULL
+                && ui->diagnostic_qr->page_count > 1u)
+                intent.action = PSP_UI_ACTION_DIAGNOSTIC_QR_NEXT;
+            intent.visual_changed = true;
+        } else if (pressed & PSP_UI_BUTTON_UP) {
+            if (ui->diagnostic_qr != NULL
+                && ui->diagnostic_qr->part_count > 1u)
+                intent.action = PSP_UI_ACTION_DIAGNOSTIC_QR_PART_PREVIOUS;
+            intent.visual_changed = true;
+        } else if (pressed & PSP_UI_BUTTON_DOWN) {
+            if (ui->diagnostic_qr != NULL
+                && ui->diagnostic_qr->part_count > 1u)
+                intent.action = PSP_UI_ACTION_DIAGNOSTIC_QR_PART_NEXT;
+            intent.visual_changed = true;
+        } else if (pressed & (PSP_UI_BUTTON_CONFIRM | PSP_UI_BUTTON_RELOAD)) {
+            intent.action = PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR;
             intent.visual_changed = true;
         }
         return intent;
@@ -2919,6 +2962,14 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                     intent.setting.value.unsigned_value =
                         (pressed & PSP_UI_BUTTON_CONFIRM)
                             ? 2u : (direction < 0 ? 0u : 1u);
+                    break;
+                case UI_OPTION_DIAGNOSTIC_QR:
+                    if (pressed & PSP_UI_BUTTON_CONFIRM) {
+                        ui->status[0] = '\0';
+                        ui->toast_frames = 0u;
+                        ui_open_child_overlay(
+                            ui, PSP_UI_SCREEN_DIAGNOSTIC_QR);
+                    }
                     break;
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
                 case UI_OPTION_POWER_TEST:
@@ -4100,6 +4151,10 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
                 values[at] = ui->network_profile_label_valid
                     ? ui->network_profile_label : network_profile;
                 break;
+            case UI_OPTION_DIAGNOSTIC_QR:
+                labels[at] = "Diagnostic QR";
+                values[at] = "Open";
+                break;
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
             case UI_OPTION_POWER_TEST:
                 labels[at] = "Power test";
@@ -4573,6 +4628,128 @@ static TILEFINCH_OUT_OF_LINE void draw_data_options(
                   ? "X Confirm clear   O Cancel" : "X Select   O Back",
               28,
               muted, 2);
+}
+
+/* Full-screen diagnostic transport. Version 27 at two pixels per module plus
+   the four-module quiet zone is exactly 266 pixels square, so the PSP's
+   272-pixel height preserves three untouched rows above and below it. Every
+   dark run is an integer rectangle; no filtered texture or fractional scale
+   can soften module edges. */
+static TILEFINCH_OUT_OF_LINE void draw_diagnostic_qr(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t accent)
+{
+    const uint16_t black = rgb565(0, 0, 0);
+    const uint16_t white = rgb565(255, 255, 255);
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {0, 0, width, height}, PSP_THEME_GROUND, 4);
+    const TilefinchDiagnosticQrView *view = ui->diagnostic_qr;
+    if (view == NULL || view->modules == NULL
+        || view->module_count != TILEFINCH_DIAGNOSTIC_QR_MODULES) {
+        UiRect box = {54, 31, width - 108, 210};
+        draw_panel_shell(pixels, width, height, stride, box);
+        fill_round_edge_bar(pixels, width, height, stride, box,
+                            PSP_THEME_RADIUS_PANEL, 4, accent);
+        draw_text_bold(pixels, width, height, stride,
+                       box.x + 18, box.y + 18,
+                       "Diagnostic QR", 24, PSP_THEME_TEXT, 2);
+        draw_text(pixels, width, height, stride,
+                  box.x + 18, box.y + 54,
+                  "Build a QR report from Tilefinch's", 42,
+                  PSP_THEME_TEXT_BODY, 2);
+        draw_text(pixels, width, height, stride,
+                  box.x + 18, box.y + 76,
+                  "existing diagnostic logs.", 42,
+                  PSP_THEME_TEXT_BODY, 2);
+        draw_text_with_font(
+            pixels, width, height, stride,
+            box.x + 18, box.y + 112,
+            ui->status[0] == '\0'
+                ? "The log files stay unchanged." : ui->status,
+            46, box.x + box.width - 18,
+            ui->status[0] == '\0' ? PSP_THEME_TEXT_MUTED : PSP_THEME_WARN,
+            2, NULL, false);
+        draw_text(pixels, width, height, stride,
+                  box.x + 18, box.y + box.height - 34,
+                  "X Build report     O Back", 38,
+                  accent, 2);
+        return;
+    }
+
+    const int qr_x = 3;
+    const int qr_y = 3;
+    const int module_pixels = (int) TILEFINCH_DIAGNOSTIC_QR_MODULE_PIXELS;
+    const int quiet_pixels =
+        (int) (TILEFINCH_DIAGNOSTIC_QR_QUIET_MODULES
+               * TILEFINCH_DIAGNOSTIC_QR_MODULE_PIXELS);
+    fill_rect(
+        pixels, width, height, stride,
+        (UiRect) {qr_x, qr_y, (int) TILEFINCH_DIAGNOSTIC_QR_RENDER_PIXELS,
+                  (int) TILEFINCH_DIAGNOSTIC_QR_RENDER_PIXELS}, white, 4);
+    int modules = (int) view->module_count;
+    for (int y = 0; y < modules; y++) {
+        int x = 0;
+        while (x < modules) {
+            while (x < modules && !tilefinch_diagnostic_qr_module(
+                       view, (unsigned) x, (unsigned) y)) x++;
+            int first = x;
+            while (x < modules && tilefinch_diagnostic_qr_module(
+                       view, (unsigned) x, (unsigned) y)) x++;
+            if (first < x) {
+                fill_rect(
+                    pixels, width, height, stride,
+                    (UiRect) {
+                        qr_x + quiet_pixels + first * module_pixels,
+                        qr_y + quiet_pixels + y * module_pixels,
+                        (x - first) * module_pixels, module_pixels
+                    }, black, 4);
+            }
+        }
+    }
+
+    const int text_x = qr_x + (int) TILEFINCH_DIAGNOSTIC_QR_RENDER_PIXELS + 10;
+    char page[24];
+    char part[24];
+    char version[32];
+    char firmware[32];
+    snprintf(page, sizeof(page), "Page %u of %u",
+             view->page_index + 1u, view->page_count);
+    snprintf(part, sizeof(part), "Part %u of %u",
+             view->part_index + 1u, view->part_count);
+    snprintf(version, sizeof(version), "Tilefinch %s", view->app_version);
+    snprintf(firmware, sizeof(firmware), "Firmware %s", view->firmware);
+    draw_text_bold(pixels, width, height, stride, text_x, 10,
+                   "Diagnostic", 22, PSP_THEME_TEXT, 2);
+    draw_text_bold(pixels, width, height, stride, text_x, 29,
+                   "report", 22, PSP_THEME_TEXT, 2);
+    draw_text(pixels, width, height, stride, text_x, 58,
+              version, 30, PSP_THEME_TEXT_BODY, 1);
+    draw_text(pixels, width, height, stride, text_x, 71,
+              view->device, 24, PSP_THEME_TEXT_BODY, 1);
+    draw_text(pixels, width, height, stride, text_x, 84,
+              firmware, 26, PSP_THEME_TEXT_BODY, 1);
+    draw_text(pixels, width, height, stride, text_x, 103,
+              part, 22, accent, 2);
+    draw_text(pixels, width, height, stride, text_x, 120,
+              page, 22, accent, 1);
+    draw_text(pixels, width, height, stride, text_x, 136,
+              "Error", 12, PSP_THEME_TEXT_MUTED, 1);
+    draw_text_with_font(
+        pixels, width, height, stride, text_x, 149,
+        view->error_summary, 34, width - 6,
+        PSP_THEME_TEXT_BODY, 1, NULL, false);
+    draw_text(pixels, width, height, stride, text_x, 174,
+              "Take a clear photo", 30, PSP_THEME_TEXT, 1);
+    draw_text(pixels, width, height, stride, text_x, 187,
+              "of every QR page.", 30, PSP_THEME_TEXT, 1);
+    draw_text(pixels, width, height, stride, text_x, 207,
+              "Report ID", 20, PSP_THEME_TEXT_MUTED, 1);
+    draw_text(pixels, width, height, stride, text_x, 220,
+              view->report_id, 12, PSP_THEME_TEXT_BODY, 1);
+    draw_text(pixels, width, height, stride, text_x, 243,
+              "L/R Page", 20, accent, 1);
+    draw_text(pixels, width, height, stride, text_x, 256,
+              "Up/Down Part  O Back", 28, PSP_THEME_TEXT_BODY, 1);
 }
 
 /*
@@ -5440,6 +5617,11 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
     uint16_t accent = context->palette.accent;
     uint16_t text = context->palette.text;
     uint16_t muted = context->palette.muted;
+
+    if (ui->screen == PSP_UI_SCREEN_DIAGNOSTIC_QR) {
+        draw_diagnostic_qr(ui, pixels, width, height, stride, accent);
+        return;
+    }
 
     if (ui->screen != PSP_UI_SCREEN_FIND)
         draw_focus(ui, pixels, width, height, stride, accent);

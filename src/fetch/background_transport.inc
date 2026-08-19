@@ -25,6 +25,8 @@
 #define FETCH_BACKGROUND_METHOD_CAPACITY 16u
 #define FETCH_BACKGROUND_FETCH_TOKEN_CAPACITY 64u
 
+#include "background_slot_policy.h"
+
 bool fetch_background_transport_stream_shape_supported(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms, bool single_hop)
@@ -267,6 +269,7 @@ typedef struct {
 
 static FetchBackgroundTransport fetch_background;
 static atomic_int fetch_background_admission_open;
+static atomic_int fetch_background_media_priority_active;
 
 static uint64_t fetch_background_now_us(void)
 {
@@ -290,18 +293,17 @@ static void fetch_background_atomic_max(
 
 static unsigned fetch_background_id_slot(uint64_t request_id)
 {
-    unsigned encoded = (unsigned) (request_id & UINT64_C(0xff));
-    return encoded == 0 ? FETCH_BACKGROUND_REQUEST_LIMIT : encoded - 1u;
+    return fetch_background_request_id_slot(request_id);
 }
 
 static uint32_t fetch_background_id_generation(uint64_t request_id)
 {
-    return (uint32_t) (request_id >> 8);
+    return fetch_background_request_id_generation(request_id);
 }
 
 static uint64_t fetch_background_make_id(unsigned slot, uint32_t generation)
 {
-    return ((uint64_t) generation << 8) | (uint64_t) (slot + 1u);
+    return fetch_background_request_id_make(slot, generation);
 }
 
 static bool fetch_background_slot_matches(
@@ -888,7 +890,8 @@ static int fetch_background_find_buffer(bool streaming)
    boot footprint. Grow streaming storage on the browser thread only when a
    real response is admitted. The count includes queued descriptors so the
    worker can never observe more runnable streams than allocated buffers. */
-static bool fetch_background_ensure_stream_capacity(void)
+static FetchBackgroundEnqueueStatus
+fetch_background_ensure_stream_capacity(void)
 {
     size_t required = 1u;
     for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++) {
@@ -897,12 +900,13 @@ static bool fetch_background_ensure_stream_capacity(void)
         if (state != FETCH_BACKGROUND_SLOT_FREE && slot->streaming)
             required++;
     }
-    if (required > FETCH_BACKGROUND_STREAM_ACTIVE_LIMIT) return false;
+    if (required > FETCH_BACKGROUND_STREAM_ACTIVE_LIMIT)
+        return FETCH_BACKGROUND_ENQUEUE_SATURATED;
 
     size_t allocated = 0;
     for (unsigned i = 0; i < FETCH_BACKGROUND_STREAM_ACTIVE_LIMIT; i++)
         if (fetch_background.stream_buffers[i] != NULL) allocated++;
-    if (allocated >= required) return true;
+    if (allocated >= required) return FETCH_BACKGROUND_ENQUEUE_ADMITTED;
 
     bool allocated_now[FETCH_BACKGROUND_STREAM_ACTIVE_LIMIT] = {false};
     for (unsigned i = 0;
@@ -920,12 +924,14 @@ static bool fetch_background_ensure_stream_capacity(void)
                             fetch_background.stream_buffers[j]);
                 fetch_background.stream_buffers[j] = NULL;
             }
-            return false;
+            return FETCH_BACKGROUND_ENQUEUE_MEMORY;
         }
         allocated_now[i] = true;
         allocated++;
     }
-    return allocated >= required;
+    return allocated >= required
+        ? FETCH_BACKGROUND_ENQUEUE_ADMITTED
+        : FETCH_BACKGROUND_ENQUEUE_MEMORY;
 }
 
 static void fetch_background_record_start(bool streaming)
@@ -1860,20 +1866,41 @@ static bool fetch_background_stream_request_supported(
 static uint64_t fetch_background_transport_enqueue_stream_internal(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms, bool single_hop,
-    size_t publication_bytes)
+    size_t publication_bytes, bool foreground_media,
+    FetchBackgroundEnqueueStatus *status)
 {
-    if (!fetch_background.initialized
-        || atomic_load_explicit(
-               &fetch_background_admission_open,
-               memory_order_acquire) == 0
-        || !fetch_background_stream_request_supported(
-               url, request, maximum_bytes, timeout_ms,
-               single_hop)
-        || !fetch_background_ensure_stream_capacity()) return 0;
+    if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
+    if (!fetch_background.initialized) return 0;
+    if (atomic_load_explicit(
+            &fetch_background_admission_open,
+            memory_order_acquire) == 0) {
+        if (status != NULL)
+            *status = FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED;
+        return 0;
+    }
+    if (!fetch_background_stream_request_supported(
+            url, request, maximum_bytes, timeout_ms, single_hop)) {
+        if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED;
+        return 0;
+    }
+    FetchBackgroundEnqueueStatus capacity =
+        fetch_background_ensure_stream_capacity();
+    if (capacity != FETCH_BACKGROUND_ENQUEUE_ADMITTED) {
+        if (status != NULL) *status = capacity;
+        return 0;
+    }
     const char *method = request->method == NULL ? "GET" : request->method;
     size_t url_length = strlen(url);
-    if (url_length >= FETCH_BACKGROUND_URL_CAPACITY) return 0;
-    for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++) {
+    if (url_length >= FETCH_BACKGROUND_URL_CAPACITY) {
+        if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED;
+        return 0;
+    }
+    unsigned slot_limit = fetch_background_admission_slot_limit(
+        foreground_media,
+        atomic_load_explicit(
+            &fetch_background_media_priority_active,
+            memory_order_acquire) != 0);
+    for (unsigned i = 0; i < slot_limit; i++) {
         FetchBackgroundSlot *slot = &fetch_background.slots[i];
         int expected = FETCH_BACKGROUND_SLOT_FREE;
         if (!atomic_compare_exchange_strong_explicit(
@@ -1936,11 +1963,13 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
             atomic_store_explicit(
                 &slot->state, FETCH_BACKGROUND_SLOT_FREE,
                 memory_order_release);
+            if (status != NULL)
+                *status = FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED;
             return 0;
         }
-        uint32_t generation = atomic_load_explicit(
-            &slot->generation, memory_order_relaxed) + 1u;
-        if (generation == 0) generation = 1u;
+        uint32_t generation = fetch_background_generation_next(
+            atomic_load_explicit(
+                &slot->generation, memory_order_relaxed));
         atomic_store_explicit(
             &slot->generation, generation, memory_order_release);
         slot->buffer_index = -1;
@@ -2007,8 +2036,10 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
 #if LIBCURL_VERSION_NUM >= 0x074400
         (void) curl_multi_wakeup(fetch_background.multi);
 #endif
+        if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_ADMITTED;
         return fetch_background_make_id(i, generation);
     }
+    if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_SATURATED;
     return 0;
 }
 
@@ -2018,7 +2049,27 @@ uint64_t fetch_background_transport_enqueue_stream(
 {
     return fetch_background_transport_enqueue_stream_internal(
         url, request, maximum_bytes, timeout_ms, false,
-        FETCH_BACKGROUND_STREAM_CHUNK_TARGET);
+        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, false, NULL);
+}
+
+uint64_t fetch_background_transport_enqueue_stream_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status)
+{
+    return fetch_background_transport_enqueue_stream_internal(
+        url, request, maximum_bytes, timeout_ms, false,
+        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, false, status);
+}
+
+uint64_t fetch_background_transport_enqueue_media_stream_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status)
+{
+    return fetch_background_transport_enqueue_stream_internal(
+        url, request, maximum_bytes, timeout_ms, false,
+        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, true, status);
 }
 
 uint64_t fetch_background_transport_enqueue_stream_sized(
@@ -2026,7 +2077,18 @@ uint64_t fetch_background_transport_enqueue_stream_sized(
     size_t maximum_bytes, long timeout_ms, size_t publication_bytes)
 {
     return fetch_background_transport_enqueue_stream_internal(
-        url, request, maximum_bytes, timeout_ms, false, publication_bytes);
+        url, request, maximum_bytes, timeout_ms, false,
+        publication_bytes, false, NULL);
+}
+
+uint64_t fetch_background_transport_enqueue_media_stream_sized_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms, size_t publication_bytes,
+    FetchBackgroundEnqueueStatus *status)
+{
+    return fetch_background_transport_enqueue_stream_internal(
+        url, request, maximum_bytes, timeout_ms, false,
+        publication_bytes, true, status);
 }
 
 uint64_t fetch_background_transport_enqueue_hop_stream(
@@ -2035,7 +2097,7 @@ uint64_t fetch_background_transport_enqueue_hop_stream(
 {
     return fetch_background_transport_enqueue_stream_internal(
         url, request, maximum_bytes, timeout_ms, true,
-        FETCH_BACKGROUND_STREAM_CHUNK_TARGET);
+        FETCH_BACKGROUND_STREAM_CHUNK_TARGET, false, NULL);
 }
 
 bool fetch_background_transport_hop_supported(
@@ -2047,15 +2109,22 @@ bool fetch_background_transport_hop_supported(
                url, request, maximum_bytes, timeout_ms, true);
 }
 
-uint64_t fetch_background_transport_enqueue(
+static uint64_t fetch_background_transport_enqueue_fixed_internal(
     const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms)
+    size_t maximum_bytes, long timeout_ms,
+    bool foreground_media,
+    FetchBackgroundEnqueueStatus *status)
 {
-    if (!fetch_background.initialized
-        || atomic_load_explicit(
-               &fetch_background_admission_open,
-               memory_order_acquire) == 0
-        || url == NULL || request == NULL
+    if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
+    if (!fetch_background.initialized) return 0;
+    if (atomic_load_explicit(
+            &fetch_background_admission_open,
+            memory_order_acquire) == 0) {
+        if (status != NULL)
+            *status = FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED;
+        return 0;
+    }
+    if (url == NULL || request == NULL
         || maximum_bytes == 0
         || maximum_bytes > FETCH_BACKGROUND_MAXIMUM_RESPONSE_BYTES
         || timeout_ms <= 0 || !fetch_request_validate(request, NULL)
@@ -2066,7 +2135,10 @@ uint64_t fetch_background_transport_enqueue(
         || request->cookie_session != NULL
         || request->credentials != FETCH_CREDENTIALS_OMIT
         || request->redirect_url_validator == NULL
-        || !request->redirect_url_validator(url)) return 0;
+        || !request->redirect_url_validator(url)) {
+        if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED;
+        return 0;
+    }
     /* Fixed-size media fetches need the larger buffers. Keep them out of the
        normal browsing footprint and allocate them only on the browser thread,
        before publishing any descriptor that can reference them. */
@@ -2083,6 +2155,7 @@ uint64_t fetch_background_transport_enqueue(
                             fetch_background.fixed_buffers[j]);
                 fetch_background.fixed_buffers[j] = NULL;
             }
+            if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_MEMORY;
             return 0;
         }
         allocated_now[i] = true;
@@ -2091,16 +2164,24 @@ uint64_t fetch_background_transport_enqueue(
     const char *referer = request->referer == NULL ? "" : request->referer;
     size_t referer_length = strlen(referer);
     if (url_length >= FETCH_BACKGROUND_URL_CAPACITY
-        || referer_length >= FETCH_BACKGROUND_REFERER_CAPACITY) return 0;
-    for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++) {
+        || referer_length >= FETCH_BACKGROUND_REFERER_CAPACITY) {
+        if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED;
+        return 0;
+    }
+    unsigned slot_limit = fetch_background_admission_slot_limit(
+        foreground_media,
+        atomic_load_explicit(
+            &fetch_background_media_priority_active,
+            memory_order_acquire) != 0);
+    for (unsigned i = 0; i < slot_limit; i++) {
         FetchBackgroundSlot *slot = &fetch_background.slots[i];
         int expected = FETCH_BACKGROUND_SLOT_FREE;
         if (!atomic_compare_exchange_strong_explicit(
                 &slot->state, &expected, FETCH_BACKGROUND_SLOT_PREPARING,
                 memory_order_acq_rel, memory_order_acquire)) continue;
-        uint32_t generation = atomic_load_explicit(
-            &slot->generation, memory_order_relaxed) + 1u;
-        if (generation == 0) generation = 1u;
+        uint32_t generation = fetch_background_generation_next(
+            atomic_load_explicit(
+                &slot->generation, memory_order_relaxed));
         atomic_store_explicit(
             &slot->generation, generation, memory_order_release);
         slot->buffer_index = -1;
@@ -2176,9 +2257,28 @@ uint64_t fetch_background_transport_enqueue(
 #if LIBCURL_VERSION_NUM >= 0x074400
         (void) curl_multi_wakeup(fetch_background.multi);
 #endif
+        if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_ADMITTED;
         return fetch_background_make_id(i, generation);
     }
+    if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_SATURATED;
     return 0;
+}
+
+uint64_t fetch_background_transport_enqueue(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms)
+{
+    return fetch_background_transport_enqueue_fixed_internal(
+        url, request, maximum_bytes, timeout_ms, false, NULL);
+}
+
+uint64_t fetch_background_transport_enqueue_media_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status)
+{
+    return fetch_background_transport_enqueue_fixed_internal(
+        url, request, maximum_bytes, timeout_ms, true, status);
 }
 
 bool fetch_background_transport_progress(
@@ -2950,6 +3050,13 @@ void fetch_background_transport_set_admission(bool open)
         memory_order_release);
 }
 
+void fetch_background_transport_set_media_priority(bool active)
+{
+    atomic_store_explicit(
+        &fetch_background_media_priority_active, active ? 1 : 0,
+        memory_order_release);
+}
+
 bool fetch_background_transport_quiesce(unsigned timeout_ms)
 {
     if (!fetch_background.initialized) return true;
@@ -3061,12 +3168,49 @@ uint64_t fetch_background_transport_enqueue_stream(
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     return 0;
 }
+uint64_t fetch_background_transport_enqueue_stream_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status)
+{
+    (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
+    if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
+    return 0;
+}
+uint64_t fetch_background_transport_enqueue_media_stream_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status)
+{
+    (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
+    if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
+    return 0;
+}
 uint64_t fetch_background_transport_enqueue_stream_sized(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms, size_t publication_bytes)
 {
     (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
     (void) publication_bytes;
+    return 0;
+}
+uint64_t fetch_background_transport_enqueue_media_stream_sized_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms, size_t publication_bytes,
+    FetchBackgroundEnqueueStatus *status)
+{
+    (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
+    (void) publication_bytes;
+    if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
+    return 0;
+}
+uint64_t fetch_background_transport_enqueue_media_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status)
+{
+    (void) url; (void) request; (void) maximum_bytes; (void) timeout_ms;
+    if (status != NULL) *status = FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     return 0;
 }
 uint64_t fetch_background_transport_enqueue_hop_stream(
@@ -3154,6 +3298,10 @@ bool fetch_background_transport_take_network_regression_hint(void)
     return false;
 }
 void fetch_background_transport_set_admission(bool open) { (void) open; }
+void fetch_background_transport_set_media_priority(bool active)
+{
+    (void) active;
+}
 bool fetch_background_transport_quiesce(unsigned timeout_ms)
 {
     (void) timeout_ms;

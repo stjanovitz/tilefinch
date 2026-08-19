@@ -694,6 +694,20 @@ static bool test_input_mapping_and_menu(void)
     CHECK(ui.options_selection == 32);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_DIAGNOSTIC_QR
+          && intent.action == PSP_UI_ACTION_NONE);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS
+          && intent.action == PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.options_selection == 33);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
     CHECK(!ui.update_check_enabled
           && intent.setting.id == PSP_UI_SETTING_UPDATE_CHECK
           && !intent.setting.value.boolean);
@@ -704,7 +718,7 @@ static bool test_input_mapping_and_menu(void)
           && intent.setting.value.boolean);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 33);
+    CHECK(ui.options_selection == 34);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_UPDATE);
@@ -721,7 +735,7 @@ static bool test_input_mapping_and_menu(void)
     CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 34);
+    CHECK(ui.options_selection == 35);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_DATA_OPTIONS
@@ -1790,6 +1804,45 @@ static bool test_composite_keeps_guards(void)
     psp_ui_set_find(&ui, &find_view);
     psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
     psp_ui_clear_find(&ui);
+    uint8_t qr_modules[(TILEFINCH_DIAGNOSTIC_QR_MODULES
+                        * TILEFINCH_DIAGNOSTIC_QR_MODULES + 7u) / 8u] = {0};
+    qr_modules[0] = 1u;
+    size_t last_qr_bit = TILEFINCH_DIAGNOSTIC_QR_MODULES
+        * TILEFINCH_DIAGNOSTIC_QR_MODULES - 1u;
+    qr_modules[last_qr_bit >> 3] |= (uint8_t) (1u << (last_qr_bit & 7u));
+    TilefinchDiagnosticQrView diagnostic = {
+        .modules = qr_modules,
+        .module_count = TILEFINCH_DIAGNOSTIC_QR_MODULES,
+        .part_index = 1u,
+        .part_count = 4u,
+        .page_index = 0u,
+        .page_count = 3u,
+        .app_version = "0.1.4",
+        .device = "PSP-3000",
+        .firmware = "6.61",
+        .error_summary = "navigation / 0x80110601"
+    };
+    psp_ui_set_diagnostic_qr(&ui, &diagnostic);
+    ui.screen = PSP_UI_SCREEN_DIAGNOSTIC_QR;
+    PspUiInput qr_part = {
+        .pressed = PSP_UI_BUTTON_DOWN, .analog_x = 128, .analog_y = 128
+    };
+    PspUiIntent qr_intent = psp_ui_update(&ui, &qr_part);
+    CHECK(qr_intent.action == PSP_UI_ACTION_DIAGNOSTIC_QR_PART_NEXT);
+    qr_part.pressed = PSP_UI_BUTTON_UP;
+    qr_intent = psp_ui_update(&ui, &qr_part);
+    CHECK(qr_intent.action == PSP_UI_ACTION_DIAGNOSTIC_QR_PART_PREVIOUS);
+    psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+    /* Four white quiet modules, then exact 2-by-2 black modules. */
+    CHECK(frame[(size_t) 3 * WIDTH + 3u] == 0xffffu);
+    CHECK(frame[(size_t) 11 * WIDTH + 11u] == 0u);
+    CHECK(frame[(size_t) 11 * WIDTH + 12u] == 0u);
+    CHECK(frame[(size_t) 12 * WIDTH + 11u] == 0u);
+    CHECK(frame[(size_t) 12 * WIDTH + 12u] == 0u);
+    CHECK(frame[(size_t) 11 * WIDTH + 13u] == 0xffffu);
+    CHECK(frame[(size_t) 260 * WIDTH + 260u] == 0u);
+    CHECK(frame[(size_t) 268 * WIDTH + 268u] == 0xffffu);
+    psp_ui_set_diagnostic_qr(&ui, NULL);
     ui.screen = PSP_UI_SCREEN_PAGE;
     ui.cursor_visible = true;
     ui.cursor_x_milli = 240000;

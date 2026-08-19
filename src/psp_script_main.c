@@ -3034,9 +3034,20 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         }
         const NavigationEntry *current_entry =
             navigation_current(engine_views->navigation);
+        bool media_open_was_pending =
+            psp_media_open_work_pending(&browser->media);
         psp_media_prepare_route(
             &browser->media, current_entry == NULL ? NULL : current_entry->url,
             engine_views->navigation->generation);
+        if (!media_open_was_pending
+            && psp_media_open_work_pending(&browser->media)) {
+            /* A selected video replaces the page as the visible surface.
+               Retire optional page-owned requests before its resolver asks
+               for a bounded worker descriptor; the committed DOM and pixels
+               remain available if media open fails. */
+            (void) browser_engine_cancel_network_work(
+                browser->engine, "video selected");
+        }
         psp_log_set_phase(PSP_LOG_PHASE_MEDIA);
         psp_log_heartbeat();
         bool media_open_before = psp_media_open_work_pending(&browser->media);
@@ -3626,6 +3637,9 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
     screenshot_png_cancel(&interactive->screenshot.writer);
     budget_free(browser->budget, interactive->screenshot.pixels);
     interactive->screenshot.pixels = NULL;
+    psp_ui_set_diagnostic_qr(&process->presentation.ui, NULL);
+    tilefinch_diagnostic_qr_destroy(process->diagnostic_qr);
+    process->diagnostic_qr = NULL;
 
     uint32_t cleanup_operation =
         psp_log_operation_begin("safe-memory-report");

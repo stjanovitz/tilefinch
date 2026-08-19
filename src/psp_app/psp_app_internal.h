@@ -643,6 +643,7 @@ typedef struct {
     PspStoragePaths storage;
     PspTextInputService text_input;
     PspClockWorker clock_worker;
+    TilefinchDiagnosticQrReport *diagnostic_qr;
     bool clock_live;
     bool persistent_site_data_available;
 } PspProcessResources;

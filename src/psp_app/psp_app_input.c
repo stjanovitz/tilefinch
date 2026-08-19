@@ -208,6 +208,18 @@ const char *psp_ui_action_name(PspUiAction action)
         case PSP_UI_ACTION_SHOW_HOMEPAGE: return "show-homepage";
         case PSP_UI_ACTION_SHOW_HISTORY: return "show-history";
         case PSP_UI_ACTION_SCREENSHOT: return "screenshot";
+        case PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR:
+            return "build-diagnostic-qr";
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_PREVIOUS:
+            return "diagnostic-qr-previous";
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_NEXT:
+            return "diagnostic-qr-next";
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_PART_PREVIOUS:
+            return "diagnostic-qr-part-previous";
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_PART_NEXT:
+            return "diagnostic-qr-part-next";
+        case PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR:
+            return "close-diagnostic-qr";
         case PSP_UI_ACTION_POWER_TEST: return "power-test";
         case PSP_UI_ACTION_MEDIA_TEST: return "media-test";
         case PSP_UI_ACTION_EDIT_DEVELOPER_URL:
@@ -255,6 +267,14 @@ const char *psp_ui_action_acknowledgement(PspUiAction action)
             return "OPENING MY HOMEPAGE...";
         case PSP_UI_ACTION_SHOW_HISTORY: return "OPENING HISTORY...";
         case PSP_UI_ACTION_SCREENSHOT: return NULL;
+        case PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR:
+            return "BUILDING DIAGNOSTIC QR...";
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_PREVIOUS:
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_NEXT:
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_PART_PREVIOUS:
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_PART_NEXT:
+        case PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR:
+            return NULL;
         case PSP_UI_ACTION_POWER_TEST: return "POWER TEST CHANGING...";
         case PSP_UI_ACTION_MEDIA_TEST: return "VIDEO TEST STARTING...";
         case PSP_UI_ACTION_EDIT_DEVELOPER_URL:

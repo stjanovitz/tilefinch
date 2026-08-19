@@ -48,6 +48,20 @@ If the decoder has to be shut down mid-playback, the player says
 relaunching Tilefinch can bring the decoder back, so the button would only
 fail again.
 
+## Send a diagnostic report without removing the Memory Stick
+
+After an error, open **Options → System → Diagnostic QR** and press **X**.
+Tilefinch compresses the diagnostic log it already wrote and displays it as
+one or more QR pages. Take a clear, straight-on photo of every page and share
+the photos when reporting the problem. Use D-pad Left/Right or L/R to change pages;
+Circle returns to Options. Keep the page count and report ID visible in each
+photo.
+
+Building the report does not change the log files and does not write a QR file
+to the Memory Stick. If no diagnostic log exists yet, the screen says so. The
+wire format and optional computer-side extraction tool are documented in
+[Diagnostic QR reports](docs/DIAGNOSTIC_QR.md).
+
 ## A site looks broken, or images and media are missing
 
 Tilefinch loads pages HTTPS-first and never silently falls back to HTTP.

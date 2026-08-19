@@ -15,9 +15,10 @@ set(TILEFINCH_NOTICES_MANIFEST
     NOTICES/freetype/FTL.TXT
     NOTICES/freetype/LICENSE.TXT
     NOTICES/freetype/NOTICE-embedded.txt
-    # MIT texts for QuickJS and stb.
+    # MIT texts for QuickJS, stb, and the diagnostic QR encoder.
     NOTICES/quickjs/LICENSE
     NOTICES/stb/LICENSE
+    NOTICES/qrcodegen/LICENSE
     # NanoSVG zlib text.
     NOTICES/nanosvg/LICENSE.txt
     # libwebp copyright license and additional patent grant.

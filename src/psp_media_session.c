@@ -733,6 +733,17 @@ static bool psp_media_source_refilling(const PspMediaSession *media)
         || video.bytes_in_flight != 0 || audio.bytes_in_flight != 0;
 }
 
+static bool psp_media_delivery_candidate_stalled(
+    const PspMediaSession *media)
+{
+    MediaHttpRangeStats video = {0};
+    MediaHttpRangeStats audio = {0};
+    if (media == NULL) return false;
+    (void) media_http_range_stats(media->range, &video);
+    (void) media_http_range_stats(media->audio_range, &audio);
+    return video.delivery_stalled || audio.delivery_stalled;
+}
+
 size_t psp_media_range_bytes(const PspMediaSession *media)
 {
     MediaHttpRangeStats video = {0};
@@ -992,6 +1003,10 @@ void psp_media_shutdown(PspMediaSession *media)
         .retain_pipeline = false
     }, "shutdown-close");
     psp_media_pipeline_destroy(media);
+    if (media->transport_priority_held) {
+        fetch_background_transport_set_media_priority(false);
+        media->transport_priority_held = false;
+    }
     psp_media_finish_synchronous_quiesce(
         media, "shutdown-released");
     psp_media_session_checkpoint(media, "shutdown-complete");
@@ -1161,6 +1176,11 @@ void psp_media_prepare_route(
     if (media == NULL) return;
     if (media->system_suspended) return;
     bool offline_route = psp_media_offline_route(media, url);
+    bool online_route = youtube_watch_url_supported(url) && !offline_route;
+    if (online_route && !media->transport_priority_held) {
+        fetch_background_transport_set_media_priority(true);
+        media->transport_priority_held = true;
+    }
     if (!youtube_watch_url_supported(url) && !offline_route) {
         char current_id[YOUTUBE_VIDEO_ID_CAPACITY] = {0};
         char next_id[YOUTUBE_VIDEO_ID_CAPACITY] = {0};
@@ -1195,6 +1215,10 @@ void psp_media_prepare_route(
                 .retain_pipeline = false
             }, "leave-video-route");
             psp_media_pipeline_destroy(media);
+            if (media->transport_priority_held) {
+                fetch_background_transport_set_media_priority(false);
+                media->transport_priority_held = false;
+            }
             psp_media_finish_synchronous_quiesce(
                 media, "leave-video-released");
             media->source[0] = '\0';
@@ -1269,6 +1293,10 @@ void psp_media_prepare_route(
         .retain_pipeline = false
     }, "replace-video-route");
     psp_media_pipeline_destroy(media);
+    if (media->transport_priority_held && !online_route) {
+        fetch_background_transport_set_media_priority(false);
+        media->transport_priority_held = false;
+    }
     psp_media_finish_synchronous_quiesce(
         media, "replace-video-released");
     media->clock_us = 0;
@@ -2496,6 +2524,15 @@ bool psp_media_advance(
                 && psp_media_retry_240p(
                        media, "first-frame-timeout", reason, false))
                 return true;
+            /* Some CDN candidates serve their prefix and then leave every
+               fresh successor connection making no useful progress. That is
+               not ordinary weak Wi-Fi: the range source has exhausted three
+               bounded reconnects at the same delivery boundary. Replace the
+               signed candidate before presenting a terminal network error. */
+            if (network && psp_media_delivery_candidate_stalled(media)
+                && psp_media_retry_delivery_failure(
+                       media, "first-frame-stalled-candidate", reason,
+                       true)) return true;
             psp_media_remember_retry_state(media, false);
             media_playback_set_playing(media->playback, false);
             media->ui.playing = false;

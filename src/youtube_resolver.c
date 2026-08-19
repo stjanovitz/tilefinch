@@ -1400,6 +1400,8 @@ struct YoutubeResolveJob {
     uint64_t request_started_ns;
     size_t request_pumps;
     size_t request_chunks;
+    size_t admission_deferrals;
+    FetchBackgroundEnqueueStatus last_admission_status;
     YoutubePlayability last_playability;
     YoutubePreparedPlayerRequest prepared;
     FetchResult response;
@@ -1415,6 +1417,26 @@ struct YoutubeResolveJob {
     char actionable_error[256];
     char error[256];
 };
+
+typedef enum {
+    YOUTUBE_REQUEST_START_FAILED = 0,
+    YOUTUBE_REQUEST_START_DEFERRED,
+    YOUTUBE_REQUEST_START_ADMITTED
+} YoutubeRequestStartStatus;
+
+static const char *youtube_admission_status_name(
+    FetchBackgroundEnqueueStatus status)
+{
+    switch (status) {
+    case FETCH_BACKGROUND_ENQUEUE_ADMITTED: return "admitted";
+    case FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE: return "unavailable";
+    case FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED: return "network-rejoin";
+    case FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED: return "unsupported";
+    case FETCH_BACKGROUND_ENQUEUE_SATURATED: return "slots-full";
+    case FETCH_BACKGROUND_ENQUEUE_MEMORY: return "memory-pressure";
+    default: return "unknown";
+    }
+}
 
 static void youtube_resolve_job_fail(
     YoutubeResolveJob *job, const char *format, ...)
@@ -1460,15 +1482,10 @@ static bool youtube_resolve_job_reserve(
     return true;
 }
 
-static bool youtube_resolve_job_start_request(
+static YoutubeRequestStartStatus youtube_resolve_job_start_request(
     YoutubeResolveJob *job, const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms, YoutubeResolvePhase wait_phase)
 {
-    fetch_result_destroy(&job->response);
-    job->response = (FetchResult) {.budget = job->budget};
-    job->request_started_ns = tilefinch_platform_monotonic_time_ns();
-    job->request_pumps = 0;
-    job->request_chunks = 0;
     /* The cookie header was materialized on the browser thread when the
        prepared request was built. The transport worker captures response
        Set-Cookie fields and this job applies them after take, so neither of
@@ -1478,15 +1495,32 @@ static bool youtube_resolve_job_start_request(
     FetchRequest transport_request = *request;
     transport_request.cookie_session = NULL;
     transport_request.cookie_context = NULL;
-    job->request_id = fetch_background_transport_enqueue_stream(
-        url, &transport_request, maximum_bytes, timeout_ms);
+    FetchBackgroundEnqueueStatus admission =
+        FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
+    job->request_id =
+        fetch_background_transport_enqueue_media_stream_diagnosed(
+            url, &transport_request, maximum_bytes, timeout_ms, &admission);
+    job->last_admission_status = admission;
     if (job->request_id == 0) {
+        if (admission == FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED
+            || admission == FETCH_BACKGROUND_ENQUEUE_SATURATED
+            || admission == FETCH_BACKGROUND_ENQUEUE_MEMORY) {
+            if (job->admission_deferrals != SIZE_MAX)
+                job->admission_deferrals++;
+            return YOUTUBE_REQUEST_START_DEFERRED;
+        }
         youtube_resolve_job_fail(
-            job, "player: background transport queue unavailable");
-        return false;
+            job, "player: background transport admission failed (%s)",
+            youtube_admission_status_name(admission));
+        return YOUTUBE_REQUEST_START_FAILED;
     }
+    fetch_result_destroy(&job->response);
+    job->response = (FetchResult) {.budget = job->budget};
+    job->request_started_ns = tilefinch_platform_monotonic_time_ns();
+    job->request_pumps = 0;
+    job->request_chunks = 0;
     job->phase = wait_phase;
-    return true;
+    return YOUTUBE_REQUEST_START_ADMITTED;
 }
 
 static bool youtube_resolve_job_poll_response(
@@ -1541,13 +1575,14 @@ static void youtube_resolve_job_log_response(
         ? (now - job->request_started_ns) / UINT64_C(1000) : 0;
     printf("tilefinch-youtube-resolver: phase=%s client=%s ok=%d "
            "status=%ld bytes=%zu received=%zu chunks=%zu pumps=%zu "
-           "elapsed=%lluus cached=%d\n",
+           "elapsed=%lluus cached=%d admission-waits=%zu\n",
            phase, client == NULL ? "none" : client,
            job->response_ok ? 1 : 0, job->response.status_code,
            job->response.length, job->response.received_body_bytes,
            job->request_chunks, job->request_pumps,
            (unsigned long long) elapsed_us,
-           job->enriched_from_cached_identity ? 1 : 0);
+           job->enriched_from_cached_identity ? 1 : 0,
+           job->admission_deferrals);
 }
 
 static bool youtube_resolve_job_take_watch_prefix(YoutubeResolveJob *job)
@@ -1634,7 +1669,8 @@ static bool youtube_resolve_job_prepare_watch(YoutubeResolveJob *job)
     return youtube_resolve_job_start_request(
         job, job->canonical_watch, &request,
         YOUTUBE_WATCH_MAXIMUM_BYTES, remaining_ms,
-        YOUTUBE_RESOLVE_PHASE_WATCH_WAIT);
+        YOUTUBE_RESOLVE_PHASE_WATCH_WAIT)
+        != YOUTUBE_REQUEST_START_FAILED;
 }
 
 YoutubeResolveJob *youtube_resolve_job_begin(
@@ -1703,7 +1739,16 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
         return YOUTUBE_RESOLVE_JOB_FAILED;
     }
     if (youtube_remaining_timeout_ms(job->deadline_ns) <= 0) {
-        youtube_resolve_job_fail(job, "player: resolution timed out");
+        if (job->admission_deferrals != 0
+            && job->last_admission_status
+                   != FETCH_BACKGROUND_ENQUEUE_ADMITTED) {
+            youtube_resolve_job_fail(
+                job, "player: transport admission timed out (%s, waits=%zu)",
+                youtube_admission_status_name(job->last_admission_status),
+                job->admission_deferrals);
+        } else {
+            youtube_resolve_job_fail(job, "player: resolution timed out");
+        }
         return YOUTUBE_RESOLVE_JOB_FAILED;
     }
     switch (job->phase) {
@@ -1725,11 +1770,11 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
         }
         long remaining_ms = youtube_attempt_timeout_ms(
             youtube_remaining_timeout_ms(job->deadline_ns));
-        job->attempts++;
-        (void) youtube_resolve_job_start_request(
+        YoutubeRequestStartStatus started = youtube_resolve_job_start_request(
             job, job->prepared.url, &job->prepared.request,
             YOUTUBE_PLAYER_MAXIMUM_BYTES, remaining_ms,
             YOUTUBE_RESOLVE_PHASE_DIRECT_WAIT);
+        if (started == YOUTUBE_REQUEST_START_ADMITTED) job->attempts++;
         break;
     }
     case YOUTUBE_RESOLVE_PHASE_DIRECT_WAIT:
@@ -1865,11 +1910,11 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
         }
         long remaining_ms = youtube_attempt_timeout_ms(
             youtube_remaining_timeout_ms(job->deadline_ns));
-        job->attempts++;
-        (void) youtube_resolve_job_start_request(
+        YoutubeRequestStartStatus started = youtube_resolve_job_start_request(
             job, job->prepared.url, &job->prepared.request,
             YOUTUBE_PLAYER_MAXIMUM_BYTES, remaining_ms,
             YOUTUBE_RESOLVE_PHASE_ENRICHED_WAIT);
+        if (started == YOUTUBE_REQUEST_START_ADMITTED) job->attempts++;
         break;
     }
     case YOUTUBE_RESOLVE_PHASE_ENRICHED_WAIT:

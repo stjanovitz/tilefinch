@@ -30,6 +30,12 @@
    blocking (open-time) range read cannot see a cancellation request. */
 #define MEDIA_HTTP_WAIT_STEP_MS 10u
 
+typedef enum {
+    RANGE_FILL_ISSUED = 0,
+    RANGE_FILL_DEFERRED,
+    RANGE_FILL_FAILED
+} RangeFillIssueStatus;
+
 struct MediaHttpRange {
     Budget *budget;
     BrowserSession *session;
@@ -78,6 +84,7 @@ struct MediaHttpRange {
     uint64_t fill_request;
     uint64_t fill_offset;
     size_t fill_length;
+    bool fill_admission_deferred;
     /* Sequential video refills stream into the optional owned successor.
        Header admission happens before the first byte is exposed; the browser
        thread alone copies published chunks, so the decoder never aliases the
@@ -96,6 +103,7 @@ struct MediaHttpRange {
     uint64_t fill_last_progress_us;
     size_t fill_last_progress_bytes;
     unsigned fill_reconnects;
+    bool fill_stall_exhausted;
     size_t minimum_sustained_bytes_per_second;
     /* When this window was issued, and when a read first had to answer
        would-block against it. Zero for "not armed"; the second is re-armed
@@ -365,18 +373,21 @@ static bool range_scheduler_ready(MediaHttpRange *range)
 
 static void range_fill_abandon(MediaHttpRange *range, const char *reason)
 {
-    if (range->fill_request == 0) return;
-    if (range_uses_background(range)) {
-        (void) fetch_background_transport_cancel(
-            range->fill_request, reason);
-    } else {
-        (void) fetch_scheduler_cancel(
-            range->scheduler, range->fill_request, reason);
-        (void) fetch_scheduler_discard(
-            range->scheduler, range->fill_request);
+    if (range == NULL) return;
+    if (range->fill_request != 0) {
+        if (range_uses_background(range)) {
+            (void) fetch_background_transport_cancel(
+                range->fill_request, reason);
+        } else {
+            (void) fetch_scheduler_cancel(
+                range->scheduler, range->fill_request, reason);
+            (void) fetch_scheduler_discard(
+                range->scheduler, range->fill_request);
+        }
     }
     range->fill_request = 0;
     range->fill_length = 0;
+    range->fill_admission_deferred = false;
     range->fill_streaming = false;
     range->fill_stream_headers_received = false;
     range->fill_stream_headers_admitted = false;
@@ -580,13 +591,13 @@ static bool range_has_immediate_predecessor(const MediaHttpRange *range)
     return false;
 }
 
-static bool range_fill_issue(
+static RangeFillIssueStatus range_fill_issue(
     MediaHttpRange *range, uint64_t aligned, size_t wanted)
 {
     if (wanted == 0 || !range_scheduler_ready(range)) {
         snprintf(range->last_error, sizeof(range->last_error),
                  "media range transport unavailable");
-        return false;
+        return RANGE_FILL_FAILED;
     }
     FetchRequest request;
     char error[256] = {0};
@@ -595,7 +606,7 @@ static bool range_fill_issue(
             error, sizeof(error))) {
         snprintf(range->last_error, sizeof(range->last_error),
                  "%.200s", error);
-        return false;
+        return RANGE_FILL_FAILED;
     }
     uint64_t cache_end = range->cache_offset + range->cache_length;
     bool stream = range->lookahead_slots != 0
@@ -630,15 +641,18 @@ static bool range_fill_issue(
         || fetch_background_transport_stream_shape_supported(
                range->range_url, &request, range->cache_capacity,
                range->timeout_ms, false);
+    FetchBackgroundEnqueueStatus background_status =
+        FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE;
     uint64_t id = range_uses_background(range)
         ? (!stream_shape_supported ? 0 : stream
-            ? fetch_background_transport_enqueue_stream_sized(
+            ? fetch_background_transport_enqueue_media_stream_sized_diagnosed(
                   range->range_url, &request,
                   range->cache_capacity, range->timeout_ms,
-                  range->stream_publication_bytes)
-            : fetch_background_transport_enqueue(
+                  range->stream_publication_bytes, &background_status)
+            : fetch_background_transport_enqueue_media_diagnosed(
                   range->range_url, &request,
-                  range->cache_capacity, range->timeout_ms))
+                  range->cache_capacity, range->timeout_ms,
+                  &background_status))
         : (!stream_shape_supported ? 0 : stream
             ? fetch_scheduler_enqueue_stream(
                   range->scheduler, range->range_url, &request,
@@ -650,6 +664,22 @@ static bool range_fill_issue(
     if (id == 0) {
         range->fill_streaming = false;
         range->fill_stream_headers_received = false;
+        bool deferred = range_uses_background(range)
+            ? background_status == FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED
+                || background_status == FETCH_BACKGROUND_ENQUEUE_SATURATED
+                || background_status == FETCH_BACKGROUND_ENQUEUE_MEMORY
+            : stream_shape_supported
+                && fetch_scheduler_enqueue_would_block(
+                       range->scheduler, range->cache_capacity);
+        if (deferred) {
+            range->fill_admission_deferred = true;
+            range->fill_offset = aligned;
+            range->fill_length = wanted;
+            if (range->stats.admission_deferrals != SIZE_MAX)
+                range->stats.admission_deferrals++;
+            return RANGE_FILL_DEFERRED;
+        }
+        range->fill_admission_deferred = false;
         snprintf(range->last_error, sizeof(range->last_error),
                  "range %llu-%llu was not admitted: %.140s",
                  (unsigned long long) aligned,
@@ -657,8 +687,9 @@ static bool range_fill_issue(
                  range_uses_background(range)
                      ? "background transport queue full or unavailable"
                      : fetch_scheduler_last_error(range->scheduler));
-        return false;
+        return RANGE_FILL_FAILED;
     }
+    range->fill_admission_deferred = false;
     range->fill_request = id;
     range->fill_offset = aligned;
     range->fill_length = wanted;
@@ -674,7 +705,7 @@ static bool range_fill_issue(
        transport performed inside one call, counted the same way. */
     if (range->fill_attempts != 0) range->stats.retry_attempts++;
     range->fill_attempts++;
-    return true;
+    return RANGE_FILL_ISSUED;
 }
 
 typedef struct {
@@ -883,6 +914,7 @@ static bool range_fill_install_into(
        window, so a session that trickles once does not spend the rest of its
        transfers unable to recover. */
     range->fill_reconnects = 0;
+    range->fill_stall_exhausted = false;
     range->stats.bytes_received += taken.received;
     range->stats.window_installs++;
     uint64_t install_us =
@@ -1106,7 +1138,9 @@ static void range_prefetch(MediaHttpRange *range)
     if (range->fill_attempts != 0 && range->fill_offset != next)
         range->fill_attempts = 0;
     if (range->fill_attempts >= 2u) return;
-    if (range_fill_issue(range, next, range_window_bytes(range, next)))
+    if (range_fill_issue(
+            range, next, range_window_bytes(range, next))
+            == RANGE_FILL_ISSUED)
         range->stats.readahead_requests++;
     else
         range->stats.readahead_issue_refusals++;
@@ -1131,8 +1165,15 @@ static void range_prefetch(MediaHttpRange *range)
 static bool range_restart_slow_fill(
     MediaHttpRange *range, const char *reason, bool starved)
 {
-    if (range == NULL || range->fill_request == 0
-        || range->fill_reconnects >= MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS) {
+    if (range == NULL || range->fill_request == 0) {
+        return false;
+    }
+    if (range->fill_reconnects >= MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS) {
+        if (!range->fill_stall_exhausted) {
+            range->fill_stall_exhausted = true;
+            if (range->stats.stalled_reconnect_exhaustions != SIZE_MAX)
+                range->stats.stalled_reconnect_exhaustions++;
+        }
         return false;
     }
     uint64_t offset = range->fill_offset;
@@ -1316,7 +1357,9 @@ static MediaRangeReadStatus range_fill_window(
                 range->stats.failures++;
                 return MEDIA_RANGE_READ_FAILED;
             }
-            if (!range_fill_issue(range, aligned, wanted)) {
+            RangeFillIssueStatus issue =
+                range_fill_issue(range, aligned, wanted);
+            if (issue == RANGE_FILL_FAILED) {
                 range->fill_attempts = 0;
                 range->stats.failures++;
                 return MEDIA_RANGE_READ_FAILED;
@@ -1550,9 +1593,11 @@ static MediaRangeReadStatus range_read_bounded(
                     || retry_length != failed_length) {
                     range->fill_attempts = 0;
                 }
-                if (range->fill_attempts >= 2u
-                    || !range_fill_issue(
-                           range, retry_offset, retry_length)) {
+                RangeFillIssueStatus issue = range->fill_attempts >= 2u
+                    ? RANGE_FILL_FAILED
+                    : range_fill_issue(
+                          range, retry_offset, retry_length);
+                if (issue == RANGE_FILL_FAILED) {
                     range->fill_attempts = 0;
                     range->stats.failures++;
                     return MEDIA_RANGE_READ_FAILED;
@@ -1839,7 +1884,7 @@ bool media_http_range_pump(MediaHttpRange *range)
        working through buffered content is exactly when the refill should run. */
     range_prefetch(range);
     range_pump(range);
-    return range->fill_request != 0;
+    return range->fill_request != 0 || range->fill_admission_deferred;
 }
 
 MediaHttpRangePrimeStatus media_http_range_prime_successor(
@@ -1890,8 +1935,17 @@ MediaHttpRangePrimeStatus media_http_range_prime_successor(
         return MEDIA_HTTP_RANGE_PRIME_PENDING;
     }
     if (range->fill_request == 0) {
-        if (range->fill_attempts >= 2u
-            || !range_fill_issue(range, successor, wanted)) {
+        /* Descriptor pressure and a network-supervisor rejoin are local,
+           transient admission conditions, not evidence that the signed media
+           candidate rejected a later range. Leave the ordinary playback
+           refill/recovery path armed instead of poisoning the candidate. */
+        if (range->fill_attempts >= 2u)
+            return MEDIA_HTTP_RANGE_PRIME_PENDING;
+        RangeFillIssueStatus issue =
+            range_fill_issue(range, successor, wanted);
+        if (issue == RANGE_FILL_DEFERRED)
+            return MEDIA_HTTP_RANGE_PRIME_PENDING;
+        if (issue == RANGE_FILL_FAILED) {
             range->successor_prime_failed = true;
             range->stats.failures++;
             return MEDIA_HTTP_RANGE_PRIME_FAILED;
@@ -1940,7 +1994,10 @@ bool media_http_range_stats(const MediaHttpRange *range,
     if (range == NULL || stats == NULL) return false;
     *stats = range->stats;
     stats->bytes_in_flight = range_fill_progress(range);
-    stats->window_pending = range->fill_request != 0;
+    stats->window_pending = range->fill_request != 0
+        || range->fill_admission_deferred;
+    stats->admission_deferred = range->fill_admission_deferred;
+    stats->delivery_stalled = range->fill_stall_exhausted;
     stats->cache_offset = range->cache_offset;
     stats->cache_length = range->cache_length;
     stats->cache_consumed = range->cache_consumed;

@@ -33,7 +33,7 @@ agents are capable of. A web browser was a good test of all three.
 | **Reader and offline modes** | Reflow articles for the PSP screen, choose sans/serif text, remember optional per-site sizing, and save articles for later. |
 | **Text entry** | PSP system keyboard or the faster Danzeff radial keyboard, with local bookmark/history completion. |
 | **Appearance** | Automatic or forced dark mode, page text scaling, three chrome themes, and installable CJK/color-emoji packs. |
-| **Native PSP UI** | First-frame home screen, Collections, clock, battery/Wi-Fi status, contextual controls, and PNG screenshots. |
+| **Native PSP UI** | First-frame home screen, Collections, clock, battery/Wi-Fi status, contextual controls, PNG screenshots, and photographed QR diagnostics. |
 | **Updates** | Signed in-app updates use A/B slots, a trial boot, automatic rollback, and explicit user approval. |
 | **Experimental voice search** | Optional separate download; off by default and currently slow and inaccurate. |
 
@@ -60,7 +60,7 @@ agents are capable of. A web browser was a good test of all three.
 | **360p through a 480×272 display** | 640×360 frames stage through EDRAM as two guarded strips; the GE performs bilinear downscaling without a CPU per-pixel pass ([device envelope](docs/engineering/PSP_ENVELOPE.md)). |
 | **Explicit lifecycle ownership** | Media and networking use pure reducers, epoch-tokened services, consumer leases, pumped teardown, and quarantine instead of freeing memory beneath live firmware or worker activity ([architecture](docs/ARCHITECTURE.md)). |
 | **Security without pretending to sandbox** | HTTPS-first navigation, CORS/CSP/SRI, private-network protection, partition-aware resource authority, cookie controls, and signed A/B updates are enforced within a documented shared-process model ([security model](docs/SECURITY_MODEL.md)). |
-| **Hardware-aware gates** | Release registers 127 host tests (126 enabled by default), plus sanitizer, hostile-input, WPT, fidelity, PSP cross-build, `.text`, and hot-symbol ratchets ([engineering guide](AGENTS.md)). |
+| **Hardware-aware gates** | Release registers 130 host tests (129 enabled by default), plus sanitizer, hostile-input, WPT, fidelity, PSP cross-build, `.text`, and hot-symbol ratchets ([engineering guide](AGENTS.md)). |
 
 ## What you need
 

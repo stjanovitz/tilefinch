@@ -8,6 +8,13 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.5 — 2026-08-18
+
+- Improved YouTube startup and recovery when the shared transport worker is
+  busy or a delivery candidate stalls.
+- Added photographed diagnostic reports with exact, bounded QR rendering and
+  complete multipart recovery for large logs.
+
 ## 0.1.4 — 2026-08-17
 
 - Improved player-control redraw stability during interactive seeking.

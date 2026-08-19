@@ -40,19 +40,26 @@ int main(void)
     ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
     ui.options_selection = 32;
     intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_DIAGNOSTIC_QR
+          && intent.action == PSP_UI_ACTION_NONE);
+
+    psp_ui_init(&ui);
+    ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
+    ui.options_selection = 33;
+    intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_POWER_TEST
           && ui.screen == PSP_UI_SCREEN_PAGE);
 
     psp_ui_init(&ui);
     ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
-    ui.options_selection = 33;
+    ui.options_selection = 34;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_MEDIA_TEST
           && ui.screen == PSP_UI_SCREEN_PAGE);
 
     psp_ui_init(&ui);
     ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
-    ui.options_selection = 34;
+    ui.options_selection = 35;
     intent = psp_ui_update(&ui, &input);
     CHECK(!ui.update_check_enabled
           && intent.setting.id == PSP_UI_SETTING_UPDATE_CHECK
@@ -61,14 +68,14 @@ int main(void)
 
     psp_ui_init(&ui);
     ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
-    ui.options_selection = 35;
+    ui.options_selection = 36;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_UPDATE
           && intent.action == PSP_UI_ACTION_NONE);
 
     psp_ui_init(&ui);
     ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
-    ui.options_selection = 36;
+    ui.options_selection = 37;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_DATA_OPTIONS
           && intent.action == PSP_UI_ACTION_NONE);

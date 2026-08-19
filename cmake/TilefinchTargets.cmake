@@ -80,6 +80,26 @@ if(PSP)
         PROPERTIES EXCLUDE_FROM_ALL TRUE)
 endif()
 
+# User-triggered diagnostic export. It is deliberately separate from the
+# engine library: normal browsing never needs the QR encoder or zlib entry
+# points, while the PSP browser and the focused host tests do.
+add_library(tilefinch_diagnostic_qr STATIC
+    src/diagnostic_qr.c
+    third_party/qrcodegen/qrcodegen.c)
+target_include_directories(tilefinch_diagnostic_qr
+    PUBLIC include
+    PRIVATE third_party/qrcodegen)
+if(PSP)
+    target_link_libraries(tilefinch_diagnostic_qr PUBLIC z)
+else()
+    find_package(ZLIB REQUIRED)
+    target_link_libraries(tilefinch_diagnostic_qr PUBLIC ZLIB::ZLIB)
+endif()
+if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(tilefinch_diagnostic_qr PRIVATE
+        -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
+endif()
+
 add_library(tilefinch_psp_ui STATIC
     src/psp_ui.c
     src/psp_ui_media_8888.c
@@ -170,7 +190,8 @@ endif()
 
 if(NOT PSP)
     add_executable(psp-browser-ui-preview src/psp_ui_preview.c)
-    target_link_libraries(psp-browser-ui-preview PRIVATE tilefinch_psp_ui)
+    target_link_libraries(psp-browser-ui-preview PRIVATE
+        tilefinch_psp_ui tilefinch_diagnostic_qr)
 endif()
 
 if(PSP)
@@ -325,7 +346,7 @@ if(PSP)
             tilefinch_psp_ui tilefinch_psp_display
             tilefinch_psp_media_scale
             tilefinch_psp_media_present
-            tilefinch_psp_app_support)
+            tilefinch_psp_app_support tilefinch_diagnostic_qr)
         # src/psp_app/ holds this EBOOT's private seams. They include
         # src/media_backend_psp_policy.h and src/psp_media_pixels.h, which
         # tilefinch_core keeps PRIVATE, so the executable needs src itself.

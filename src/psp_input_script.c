@@ -60,6 +60,18 @@ const char *psp_input_script_action_name(PspUiAction action)
         case PSP_UI_ACTION_SHOW_HOMEPAGE: return "show-homepage";
         case PSP_UI_ACTION_SHOW_HISTORY: return "show-history";
         case PSP_UI_ACTION_SCREENSHOT: return "screenshot";
+        case PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR:
+            return "build-diagnostic-qr";
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_PREVIOUS:
+            return "diagnostic-qr-previous";
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_NEXT:
+            return "diagnostic-qr-next";
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_PART_PREVIOUS:
+            return "diagnostic-qr-part-previous";
+        case PSP_UI_ACTION_DIAGNOSTIC_QR_PART_NEXT:
+            return "diagnostic-qr-part-next";
+        case PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR:
+            return "close-diagnostic-qr";
         case PSP_UI_ACTION_POWER_TEST: return "power-test";
         case PSP_UI_ACTION_MEDIA_TEST: return "media-test";
         case PSP_UI_ACTION_EDIT_DEVELOPER_URL: return "edit-developer-url";
@@ -149,6 +161,7 @@ const char *psp_input_script_screen_name(PspUiScreen screen)
         case PSP_UI_SCREEN_FIND: return "find";
         case PSP_UI_SCREEN_HOME: return "home";
         case PSP_UI_SCREEN_COLLECTIONS: return "collections";
+        case PSP_UI_SCREEN_DIAGNOSTIC_QR: return "diagnostic-qr";
     }
     return "unknown";
 }

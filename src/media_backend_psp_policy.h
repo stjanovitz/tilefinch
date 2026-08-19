@@ -125,7 +125,11 @@ static inline PspMediaBufferPolicyDecision psp_media_buffer_policy(
                 decision.starved_since_us = 0;
                 decision.ready_since_us = 0;
             }
-        } else if (!input.fill_pending) {
+        } else {
+            /* Debounce one continuous starvation interval. A refill commonly
+               remains outstanding after bytes become useful again; retaining
+               the old timestamp in that state made several independent short
+               radio gaps add up to a false BUFFERING transition. */
             decision.starved_since_us = 0;
         }
         return decision;

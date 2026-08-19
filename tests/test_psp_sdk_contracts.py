@@ -1580,9 +1580,17 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("MediaRangeReader media_http_range_reader(")]
         self.assertIn("fetch_background_transport_available()", create)
         issue = source[
-            source.index("static bool range_fill_issue("):
+            source.index("static RangeFillIssueStatus range_fill_issue("):
             source.index("static bool range_fill_install(")]
-        self.assertIn("fetch_background_transport_enqueue(", issue)
+        self.assertIn(
+            "fetch_background_transport_enqueue_media_diagnosed(", issue)
+        self.assertIn("RANGE_FILL_DEFERRED", issue)
+        self.assertIn("range->fill_admission_deferred = true", issue)
+        fill = source[
+            source.index("static MediaRangeReadStatus range_fill_window("):
+            source.index("static MediaRangeReadStatus range_read_bounded(")]
+        self.assertIn("issue == RANGE_FILL_FAILED", fill)
+        self.assertNotIn("!range_fill_issue(", fill)
         pump = source[
             source.index("static void range_pump("):
             source.index("static bool range_cancelled(")]
@@ -4435,7 +4443,9 @@ class PspSdkContractTests(unittest.TestCase):
         pump = resolver[
             resolver.index("YoutubeResolveJobStatus youtube_resolve_job_pump("):
             resolver.index("bool youtube_resolve_job_take(")]
-        self.assertIn("fetch_background_transport_enqueue_stream(", resolver)
+        self.assertIn(
+            "fetch_background_transport_enqueue_media_stream_diagnosed(",
+            resolver)
         self.assertIn("fetch_background_transport_take_chunk(", resolver)
         self.assertIn("YOUTUBE_RESOLVE_PHASE_DIRECT_WAIT", pump)
         self.assertIn("YOUTUBE_RESOLVE_PHASE_WATCH_WAIT", pump)
@@ -4456,12 +4466,47 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("youtube_resolve_job_take_watch_prefix(", resolver)
         self.assertIn("watch configuration prefix complete", resolver)
         start = resolver[
-            resolver.index("static bool youtube_resolve_job_start_request("):
+            resolver.index(
+                "static YoutubeRequestStartStatus "
+                "youtube_resolve_job_start_request("):
             resolver.index("static bool youtube_resolve_job_poll_response(")]
         self.assertIn("FetchRequest transport_request = *request", start)
         self.assertIn("transport_request.cookie_session = NULL", start)
         self.assertIn("transport_request.cookie_context = NULL", start)
         self.assertIn("url, &transport_request", start)
+        self.assertIn("YOUTUBE_REQUEST_START_DEFERRED", start)
+        self.assertIn("FETCH_BACKGROUND_ENQUEUE_SATURATED", start)
+        self.assertIn("FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED", start)
+        self.assertNotIn("queue unavailable", start)
+
+    def test_video_open_prioritizes_media_and_does_not_wait_for_readahead(self):
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        route_start = main.index("bool media_open_was_pending =")
+        route = main[
+            route_start:
+            main.index("psp_log_set_phase(PSP_LOG_PHASE_MEDIA)", route_start)]
+        self.assertLess(
+            route.index("psp_media_prepare_route("),
+            route.index("browser_engine_cancel_network_work("))
+        self.assertIn('"video selected"', route)
+
+        open_source = without_comments(
+            (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+        pump_declaration = open_source.index(
+            "static bool psp_media_open_pump_step(")
+        pump_start = open_source.index(
+            "static bool psp_media_open_pump_step(", pump_declaration + 1)
+        prime_start = open_source.index(
+            "case PSP_MEDIA_JOB_OPEN_VIDEO_PRIME:", pump_start)
+        prime = open_source[
+            prime_start:
+            open_source.index(
+                "case PSP_MEDIA_JOB_OPEN_AUDIO_RANGE:", prime_start)]
+        self.assertIn(
+            "ok = primed != MEDIA_HTTP_RANGE_PRIME_FAILED", prime)
+        self.assertNotIn(
+            "primed == MEDIA_HTTP_RANGE_PRIME_PENDING) break", prime)
 
     def test_codec_watchdog_never_forges_a_worker_completion(self):
         backend = without_comments(
@@ -4543,10 +4588,67 @@ class PspSdkContractTests(unittest.TestCase):
         media_http = without_comments(
             (ROOT / "src/media_http.c").read_text(encoding="utf-8"))
         self.assertIn(
-            "fetch_background_transport_enqueue_stream_sized(", media_http)
+            "fetch_background_transport_enqueue_media_stream_sized_diagnosed(",
+            media_http)
         session = without_comments(
             psp_media_session_sources())
         self.assertIn(".stream_publication_bytes = 16u * KIB", session)
+
+    def test_media_transport_reserves_foreground_admission(self):
+        background = without_comments(
+            (ROOT / "src/fetch/background_transport.inc").read_text(
+                encoding="utf-8"))
+        policy = without_comments(
+            (ROOT / "src/fetch/background_slot_policy.h").read_text(
+                encoding="utf-8"))
+        resolver = without_comments(
+            (ROOT / "src/youtube_resolver.c").read_text(encoding="utf-8"))
+        media_http = without_comments(
+            (ROOT / "src/media_http.c").read_text(encoding="utf-8"))
+        session = without_comments(psp_media_session_sources())
+        self.assertIn("FETCH_BACKGROUND_MEDIA_RESERVED_SLOTS 2u", policy)
+        self.assertIn("fetch_background_admission_slot_limit(", background)
+        self.assertIn(
+            "fetch_background_transport_enqueue_media_stream_diagnosed(",
+            resolver)
+        self.assertIn(
+            "fetch_background_transport_enqueue_media_stream_sized_diagnosed(",
+            media_http)
+        self.assertIn(
+            "fetch_background_transport_enqueue_media_diagnosed(", media_http)
+        self.assertIn(
+            "fetch_background_transport_set_media_priority(true)", session)
+        self.assertIn(
+            "fetch_background_transport_set_media_priority(false)", session)
+
+    def test_audio_open_precedes_aggressive_video_successor(self):
+        opening = without_comments(
+            (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+        open_step = opening.rindex("static bool psp_media_open_pump_step(")
+        video_demux = opening[
+            opening.index("case PSP_MEDIA_JOB_OPEN_VIDEO_DEMUX:", open_step):
+            opening.index("case PSP_MEDIA_JOB_OPEN_VIDEO_PRIME:", open_step)]
+        audio_demux = opening[
+            opening.index("case PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX:", open_step):
+            opening.index("case PSP_MEDIA_JOB_OPEN_DECODER_PREPARE:", open_step)]
+        self.assertIn("? PSP_MEDIA_JOB_OPEN_AUDIO_RANGE", video_demux)
+        self.assertIn("PSP_MEDIA_JOB_OPEN_VIDEO_PRIME", audio_demux)
+
+    def test_exhausted_successor_stall_replaces_the_candidate(self):
+        http = without_comments(
+            (ROOT / "src/media_http.c").read_text(encoding="utf-8"))
+        restart = http[
+            http.index("static bool range_restart_slow_fill("):
+            http.index("static void range_watch_fill_rate(")]
+        self.assertIn("range->fill_stall_exhausted = true", restart)
+        self.assertIn("stalled_reconnect_exhaustions++", restart)
+        session = without_comments(psp_media_session_sources())
+        first_frame = session[
+            session.index("PspMediaFirstFrameVerdict verdict"):
+            session.index("if (was_pending != media->decode_job_pending)")]
+        self.assertIn("psp_media_delivery_candidate_stalled(media)", first_frame)
+        self.assertIn("psp_media_retry_delivery_failure(", first_frame)
+        self.assertIn('"first-frame-stalled-candidate"', first_frame)
 
     def test_open_side_media_cancellation_uses_the_callers_token(self):
         session = without_comments(

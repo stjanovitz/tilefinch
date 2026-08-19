@@ -206,6 +206,18 @@ within one session. The diagnostic build identifies the directory on its
 boot surface and in a startup status message. `dump_frame` boot options write
 fixed-name `.ppm` frames beside the EBOOT.
 
+### On-screen diagnostic QR
+
+**Options → System → Diagnostic QR** is a read-only transport for the existing
+logs. A release build reads `tilefinch-last-error.txt` if present. A validation
+build can additionally read the current and previous validation/crash logs;
+because the current validation log is normally buffered, the explicit
+**Build report** action flushes it once before reading. There are no reads on
+boot or any frame path, and report paging performs no further Memory Stick
+I/O. Closing the screen frees the in-memory compressed bundle. No QR image,
+copy, index, or cache is written to storage. See [Diagnostic QR
+reports](DIAGNOSTIC_QR.md) for the format and bounds.
+
 ## Free-space requirements
 
 Hard-bound figures; the browser refuses (with the quoted message) rather than

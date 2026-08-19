@@ -73,6 +73,11 @@ typedef struct {
     size_t readahead_checks;
     size_t readahead_waiting_for_consumption;
     size_t readahead_issue_refusals;
+    /* Local worker pressure is not a failed HTTP transaction. These count
+       bounded issue deferrals and expose whether the current read is waiting
+       for a descriptor so buffering policy can remain truthful. */
+    size_t admission_deferrals;
+    bool admission_deferred;
     size_t window_installs;
     size_t would_block_reads;
     /*
@@ -116,6 +121,11 @@ typedef struct {
     /* Subset taken only after the decoder was already waiting and the
        transfer made no byte progress for the short starvation bound. */
     size_t starved_reconnects;
+    /* A candidate which made no useful progress across every bounded fresh
+       connection allowance. The session may replace its signed URL once;
+       ordinary slow-but-progressing Wi-Fi never sets this field. */
+    size_t stalled_reconnect_exhaustions;
+    bool delivery_stalled;
     size_t minimum_sustained_bytes_per_second;
     /*
      * How long a window spends outstanding, and how much of that the decoder
@@ -291,13 +301,16 @@ bool media_http_range_resident(const MediaHttpRange *range,
  */
 bool media_http_range_pump(MediaHttpRange *range);
 /*
- * Prove that the source can serve bytes beyond its first cache window.
+ * Start proving that the source can serve bytes beyond its first cache
+ * window.
  *
  * Some signed media candidates return a valid prefix and reject every later
  * query range.  A normal MP4 open can therefore succeed and fail only after
- * seconds of visible playback.  This bounded, pumpable check reuses the
- * ordinary successor window and retains it as lookahead, so default startup
- * buffering validates delivery without issuing a throwaway request.
+ * seconds of visible playback. This bounded check reuses the ordinary
+ * successor window and retains it as lookahead. A PSP open may continue while
+ * it reports PENDING: the same request remains owned by the range source and
+ * is completed by ordinary playback pumps rather than becoming a startup
+ * latency gate.
  */
 MediaHttpRangePrimeStatus media_http_range_prime_successor(
     MediaHttpRange *range);

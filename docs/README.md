@@ -33,6 +33,8 @@ Tilefinch's documentation has three layers:
 - [Memory Stick storage](STORAGE.md): the complete on-stick layout map,
   per-file size bounds and eviction, crash-safety disciplines, and
   free-space requirements.
+- [Diagnostic QR reports](DIAGNOSTIC_QR.md): on-screen log transport,
+  exact QR geometry, chunk and bundle formats, and desktop recovery.
 - [Secure in-app updates](SECURE_UPDATES.md): signed Stable/Beta records,
   the explicit unsigned Developer path, producer workflows, A/B installation,
   stable launcher, rollback, and remaining production-enablement gates.

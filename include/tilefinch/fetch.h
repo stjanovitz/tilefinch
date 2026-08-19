@@ -562,6 +562,14 @@ _Static_assert(sizeof(FetchBackgroundMediaResponse) < 3u * 1024u,
 
 bool fetch_background_transport_available(void);
 bool fetch_background_transport_initialize(Budget *budget);
+typedef enum {
+    FETCH_BACKGROUND_ENQUEUE_ADMITTED = 0,
+    FETCH_BACKGROUND_ENQUEUE_UNAVAILABLE,
+    FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED,
+    FETCH_BACKGROUND_ENQUEUE_UNSUPPORTED,
+    FETCH_BACKGROUND_ENQUEUE_SATURATED,
+    FETCH_BACKGROUND_ENQUEUE_MEMORY
+} FetchBackgroundEnqueueStatus;
 /* Pure admission predicate shared by the PSP worker and host media replay.
    It deliberately does not require an initialized worker: host tests use it
    to ensure a request accepted by their scheduler would also be representable
@@ -575,11 +583,34 @@ uint64_t fetch_background_transport_enqueue(
 uint64_t fetch_background_transport_enqueue_stream(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms);
+/* Diagnosed form for latency-sensitive callers. A zero request id is not
+   necessarily terminal: admission can close briefly during network rejoin,
+   and page work can occupy all bounded descriptors. */
+uint64_t fetch_background_transport_enqueue_stream_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status);
+/* Foreground-media forms may use the descriptors reserved while a player
+   route is active. Ordinary page/update work cannot consume those last two
+   descriptors, so a busy incumbent page cannot prevent its selected video
+   from resolving or refilling. */
+uint64_t fetch_background_transport_enqueue_media_stream_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status);
 /* Media can request a smaller publication quantum without imposing its
    latency/throughput tradeoff on navigation and update streams. */
 uint64_t fetch_background_transport_enqueue_stream_sized(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms, size_t publication_bytes);
+uint64_t fetch_background_transport_enqueue_media_stream_sized_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms, size_t publication_bytes,
+    FetchBackgroundEnqueueStatus *status);
+uint64_t fetch_background_transport_enqueue_media_diagnosed(
+    const char *url, const FetchRequest *request,
+    size_t maximum_bytes, long timeout_ms,
+    FetchBackgroundEnqueueStatus *status);
 /*
  * Browser scheduler form: execute exactly one already-authorized HTTP hop.
  * Redirect responses are returned to the browser thread without following
@@ -655,6 +686,9 @@ bool fetch_background_transport_take_network_regression_hint(void);
 /* Supervisor-owned admission gate. Existing operations may drain after it
    closes; new transport leases are refused. */
 void fetch_background_transport_set_admission(bool open);
+/* Browser-thread lifecycle gate. Calls are idempotent; the route owner keeps
+   it asserted across pipeline rebuilds and releases it only on route exit. */
+void fetch_background_transport_set_media_priority(bool active);
 /* Compatibility wrapper: request cancellation and wait for bounded time. */
 bool fetch_background_transport_quiesce(unsigned timeout_ms);
 /* Controlled-exit teardown. Must run before the owning Budget is destroyed. */

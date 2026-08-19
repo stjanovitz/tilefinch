@@ -1,5 +1,6 @@
 #include "tilefinch/psp_ui.h"
 #include "tilefinch/budget.h"
+#include "tilefinch/build_version.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -221,6 +222,7 @@ int main(int argc, char **argv)
 
     PspUiState ui;
     psp_ui_init(&ui);
+    TilefinchDiagnosticQrReport *diagnostic_report = NULL;
     psp_ui_set_page(&ui, "PlayStation Portable - Wikipedia",
                     "https://en.wikipedia.org/wiki/PlayStation_Portable",
                     true);
@@ -435,6 +437,60 @@ int main(int argc, char **argv)
             "Faster page loads, fewer stalls", 620, "Install and restart",
             true, true);
         ui.toast_frames = 0;
+    } else if (strcmp(mode, "diagnostic-qr") == 0) {
+        char source_path[1024];
+        int path_length = snprintf(
+            source_path, sizeof(source_path), "%s.diagnostic-input", output);
+        static const char log[] =
+            "tilefinch-device-error-v2\n"
+            "version=" TILEFINCH_VERSION_STRING "\n"
+            "stage=navigation\n"
+            "http=0\n"
+            "native=0x80110601\n"
+            "detail=network-profile\n";
+        FILE *source = path_length > 0
+                && (size_t) path_length < sizeof(source_path)
+            ? fopen(source_path, "wb") : NULL;
+        bool source_ready = false;
+        if (source != NULL) {
+            bool wrote = fwrite(log, 1u, sizeof(log) - 1u, source)
+                == sizeof(log) - 1u;
+            source_ready = fclose(source) == 0 && wrote;
+        }
+        if (!source_ready) {
+            fprintf(stderr, "could not stage diagnostic preview input\n");
+            psp_ui_clear_chrome_font();
+            if (fonts_ready) font_set_destroy(&fonts);
+            free(frame);
+            return 1;
+        }
+        TilefinchDiagnosticSource diagnostic_source = {
+            "tilefinch-last-error.txt", source_path
+        };
+        TilefinchDiagnosticMetadata diagnostic_metadata = {
+            .app_version = TILEFINCH_VERSION_STRING,
+            .release_sequence = 1u,
+            .created_unix_time = 1787006559u,
+            .psp_model = 2u,
+            .psp_firmware = UINT32_C(0x06060110)
+        };
+        char diagnostic_error[96];
+        diagnostic_report = tilefinch_diagnostic_qr_build(
+            &diagnostic_metadata, &diagnostic_source, 1u,
+            diagnostic_error, sizeof(diagnostic_error));
+        (void) remove(source_path);
+        if (diagnostic_report == NULL) {
+            fprintf(stderr, "could not build diagnostic preview: %s\n",
+                    diagnostic_error);
+            psp_ui_clear_chrome_font();
+            if (fonts_ready) font_set_destroy(&fonts);
+            free(frame);
+            return 1;
+        }
+        ui.screen = PSP_UI_SCREEN_DIAGNOSTIC_QR;
+        psp_ui_set_diagnostic_qr(
+            &ui, tilefinch_diagnostic_qr_view(diagnostic_report));
+        ui.toast_frames = 0;
     } else if (strcmp(mode, "loading") == 0) {
         /* The chrome bar's edge and its progress band, over the light page
            skeleton -- the case the user actually stares at. */
@@ -502,6 +558,7 @@ int main(int argc, char **argv)
     printf("psp-ui-preview: output=%s state-bytes=%zu\n",
            output, psp_ui_state_bytes());
     psp_ui_clear_chrome_font();
+    tilefinch_diagnostic_qr_destroy(diagnostic_report);
     if (fonts_ready) font_set_destroy(&fonts);
     free(frame);
     return written ? 0 : 1;

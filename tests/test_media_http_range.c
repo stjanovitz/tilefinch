@@ -155,6 +155,76 @@ static void test_buffering_policy_hysteresis(void)
           && decision.starved_since_us == 0);
 }
 
+static void test_buffering_burst_and_slow_recovery_scenario(void)
+{
+    const uint64_t tick_us = UINT64_C(50000);
+    PspMediaBufferPolicyInput input = {
+        .playing = true,
+        .fill_pending = true,
+        .remaining_us = UINT64_C(60000000),
+        .decoded_ahead_us = PSP_MEDIA_BUFFER_DECODE_READY_US,
+        .now_us = UINT64_C(1000000)
+    };
+    unsigned begins = 0;
+    unsigned ends = 0;
+
+#define APPLY_BUFFER_TICK(blocked, ahead) do { \
+    input.source_blocked = (blocked); \
+    input.network_ahead_us = (ahead); \
+    PspMediaBufferPolicyDecision next = psp_media_buffer_policy(input); \
+    input.starved_since_us = next.starved_since_us; \
+    input.ready_since_us = next.ready_since_us; \
+    if (next.action == PSP_MEDIA_BUFFER_BEGIN) { \
+        CHECK(!input.buffering); \
+        input.buffering = true; \
+        input.buffer_events++; \
+        begins++; \
+    } else if (next.action == PSP_MEDIA_BUFFER_END) { \
+        CHECK(input.buffering); \
+        input.buffering = false; \
+        ends++; \
+    } \
+    input.now_us += tick_us; \
+} while (0)
+
+    /* Repeated 250 ms radio gaps are below the 350 ms visibility debounce. */
+    for (unsigned burst = 0; burst < 3u; burst++) {
+        for (unsigned tick = 0; tick < 5u; tick++)
+            APPLY_BUFFER_TICK(true, 0);
+        for (unsigned tick = 0; tick < 10u; tick++)
+            APPLY_BUFFER_TICK(false, PSP_MEDIA_BUFFER_TARGET_US);
+    }
+    CHECK(begins == 0 && ends == 0 && !input.buffering);
+
+    /* A real outage opens exactly one surface. Remaining starved samples do
+       not repeatedly dispatch BEGIN while it is already visible. */
+    for (unsigned tick = 0; tick < 20u; tick++)
+        APPLY_BUFFER_TICK(true, 0);
+    CHECK(begins == 1 && ends == 0 && input.buffering);
+
+    /* Slow recovery does not close early. A one-tick regression after the
+       target is first reached resets the stable interval, preventing the
+       black player chrome from oscillating at a burst boundary. */
+    for (unsigned tick = 0; tick < 20u; tick++) {
+        uint64_t ahead = (uint64_t) tick
+            * PSP_MEDIA_BUFFER_TARGET_US / 19u;
+        APPLY_BUFFER_TICK(false, ahead);
+    }
+    CHECK(input.buffering && ends == 0);
+    APPLY_BUFFER_TICK(true, PSP_MEDIA_BUFFER_TARGET_US);
+    CHECK(input.buffering && input.ready_since_us == 0);
+    for (unsigned tick = 0;
+         tick < PSP_MEDIA_BUFFER_STABLE_US / tick_us + 2u; tick++)
+        APPLY_BUFFER_TICK(false, PSP_MEDIA_BUFFER_TARGET_US);
+    CHECK(begins == 1 && ends == 1 && !input.buffering);
+
+    for (unsigned tick = 0; tick < 5u; tick++)
+        APPLY_BUFFER_TICK(true, 0);
+    APPLY_BUFFER_TICK(false, PSP_MEDIA_BUFFER_TARGET_US);
+    CHECK(begins == 1 && ends == 1 && !input.buffering);
+#undef APPLY_BUFFER_TICK
+}
+
 static bool cadence_url_allowed(const char *url)
 {
     return url != NULL && strncmp(url, "http://127.0.0.1:", 17u) == 0;
@@ -1840,6 +1910,7 @@ static void test_deterministic_cadence(
 int main(int argc, char **argv)
 {
     test_buffering_policy_hysteresis();
+    test_buffering_burst_and_slow_recovery_scenario();
     if (argc != 6 && argc != 9) {
         printf("usage: %s PORT LENGTH FRAGMENTED-LENGTH FRAGMENTS "
                "SAMPLES-PER-FRAGMENT [--cadence LENGTH PROFILE]\n",
