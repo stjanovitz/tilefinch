@@ -908,7 +908,9 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
         && strstr(document.html, "value=\"PSP &amp; homebrew\"") != NULL
         && strstr(document.html, "<section class=watch-hero>") != NULL
         && strstr(
-               document.html, "<a class=watch-target autofocus") != NULL
+               document.html,
+               "<a class=watch-target autofocus "
+               "data-tilefinch-provider-media") != NULL
         /*
          * The overlay badge is painted by the block decoration path, not
          * decoded as an image.  Pin the whole recipe -- 50x38 at radius 12 in

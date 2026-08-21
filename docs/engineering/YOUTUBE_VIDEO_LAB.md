@@ -43,6 +43,12 @@ HTML through the normal navigation transaction. The resulting page uses the
 same forms, links, CSS, images, focus model, history, and scrolling as every
 other document.
 
+Playback always requires an explicit native-player activation. The primary
+result card opens media directly; its adjacent info control opens the watch
+document without playing. The watch document's thumbnail is the corresponding
+explicit play control. Entering, restoring, or traversing history to a watch
+URL never starts media merely because of the URL shape.
+
 | Resource | Bound |
 | --- | ---: |
 | Source response | 2 MiB |

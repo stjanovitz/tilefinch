@@ -1,10 +1,12 @@
 # DEVICE-LOOP SCRIPT -- NOT A GOLDEN-GATED SCENARIO.
 #
-# Exercise the two PSP-specific seek controls after natural autoplay is
-# established.  A shoulder press creates a coarse preview; Cross commits it.
+# Exercise the two PSP-specific seek controls after explicitly opening the
+# native player. A shoulder press creates a coarse preview; Cross commits it.
 # The analog nub then creates a second preview; Cross commits that one too.
 # Long post-commit windows distinguish slow re-prime from a stuck session.
-wait-live 2400
+wait-live 600
+tap-live cross
+wait-live 1800
 mark-live autoplay
 tap-live rtrigger
 wait-live 2

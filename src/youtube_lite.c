@@ -1574,6 +1574,7 @@ static bool lite_html_watch_intro(
 {
     bool ok = lite_html_format(
         html, "<section class=watch-hero><a class=watch-target%s "
+              "data-tilefinch-provider-media "
               "href=\"https://www.youtube.com/watch?v=%s\" "
               "aria-label=\"Play video\">"
               "<span class=play-icon aria-hidden=true></span>"

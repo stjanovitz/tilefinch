@@ -775,7 +775,7 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("bool psp_media_advance(")]
         self.assertIn("media->seek_preview_cancel_pending = true", intents)
 
-    def test_provider_routes_autoplay_without_validation_input(self):
+    def test_provider_routes_require_an_explicit_play_activation(self):
         source = without_comments(psp_media_session_sources())
         route = source[
             source.index("static void psp_media_prepare_route_kind("):
@@ -790,7 +790,10 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("void psp_media_prepare_route("):
             source.index("bool psp_media_open_page_source(")]
         self.assertIn(
-            "psp_media_prepare_route_kind(media, url, generation, false, false, true)",
+            "psp_media_prepare_route_kind( media, url, generation, PSP_MEDIA_ROUTE_DOCUMENT, offline_autoplay)",
+            " ".join(facade.split()))
+        self.assertIn(
+            "media, url, backing_generation, PSP_MEDIA_ROUTE_PROVIDER_VIDEO, true",
             " ".join(facade.split()))
         self.assertNotIn(
             ".autoplay = media->reopen_resume_playing", route)

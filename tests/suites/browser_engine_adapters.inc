@@ -183,6 +183,11 @@ static int test_cooperative_site_adapter_navigation(void)
           && strstr(body_text, "View full description") != NULL
           && strstr(body_text, "View comments") != NULL
           && strstr(body_text, "Cooperative comment") == NULL);
+    ControllerAction watch_play = {0};
+    CHECK(browser_engine_activate(engine, &watch_play)
+          && watch_play.type == CONTROLLER_ACTION_NAVIGATE
+          && watch_play.prefer_native_media
+          && strcmp(watch_play.url, watch_url) == 0);
     fetch_trace_end();
 
     /* Same-site repeat navigation should reach the same result with bounded

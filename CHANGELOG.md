@@ -8,6 +8,12 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.9 — 2026-08-21
+
+- Fixed the YouTube info control so it opens the watch page without starting
+  playback; the result card and watch-page thumbnail remain explicit play
+  controls.
+
 ## 0.1.8 — 2026-08-21
 
 - Made in-app updates faster while retaining complete package and file

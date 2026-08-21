@@ -13,12 +13,12 @@
 #   input_script=youtube-watch-live.txt
 # See docs/engineering/INPUT_SCRIPT_HARNESS.md, "PSPLink live loop".
 #
-# What it proves: sustained playback. The media open costs about 20-25 s on a
-# PSP-3000 (resolver, then the split video/audio fetch), so the first wait has
-# to be long enough for the watch page to reach a playable surface before the
-# play press lands. Every step up to `mark closed` is -live: the browser is
-# busy for essentially all of it, and a readiness-gated step would never
-# advance.
+# What it proves: sustained playback. The first wait lets the watch document
+# commit; Cross explicitly activates its player thumbnail. Media open then
+# costs about 20-25 s on a PSP-3000 (resolver, then split video/audio fetch),
+# which is why the following wait is long. Every step up to `mark closed` is
+# -live: the browser is busy for essentially all of it, and a readiness-gated
+# step would never advance.
 wait-live 2400
 mark-live watch
 tap-live cross

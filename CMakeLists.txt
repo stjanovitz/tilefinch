@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(psp_browser_tilefinch VERSION 0.1.8 LANGUAGES C)
+project(psp_browser_tilefinch VERSION 0.1.9 LANGUAGES C)
 
 set(TILEFINCH_RELEASE_SEQUENCE "10" CACHE STRING
     "Monotonic signed release sequence compiled into this build")

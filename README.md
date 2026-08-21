@@ -89,7 +89,7 @@ agents are capable of. A web browser was a good test of all three.
 
 ## Install
 
-1. Download `tilefinch-v0.1.3-psp.zip` from the
+1. Download the PSP install `.zip` from the
    [latest Tilefinch release](https://github.com/stjanovitz/tilefinch/releases/latest).
 2. Extract the archive and copy its entire `TILEFINCH` folder to
    `PSP/GAME/` on your Memory Stick. The launcher should end up at

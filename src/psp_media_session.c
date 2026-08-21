@@ -1269,12 +1269,24 @@ bool psp_media_system_suspended(const PspMediaSession *media)
     return media != NULL && media->system_suspended;
 }
 
+typedef enum {
+    PSP_MEDIA_ROUTE_DOCUMENT = 0,
+    PSP_MEDIA_ROUTE_PROVIDER_VIDEO,
+    PSP_MEDIA_ROUTE_PAGE_VIDEO,
+    PSP_MEDIA_ROUTE_PAGE_AUDIO
+} PspMediaRouteKind;
+
 static void psp_media_prepare_route_kind(
     PspMediaSession *media, const char *url, uint64_t generation,
-    bool direct_page_route, bool direct_page_audio, bool autoplay)
+    PspMediaRouteKind route_kind, bool autoplay)
 {
     if (media == NULL) return;
     if (media->system_suspended) return;
+    bool direct_page_route = route_kind == PSP_MEDIA_ROUTE_PAGE_VIDEO
+        || route_kind == PSP_MEDIA_ROUTE_PAGE_AUDIO;
+    bool direct_page_audio = route_kind == PSP_MEDIA_ROUTE_PAGE_AUDIO;
+    bool provider_video_route =
+        route_kind == PSP_MEDIA_ROUTE_PROVIDER_VIDEO;
     if (media->page_source && !direct_page_route
         && media->generation == generation
         && url != NULL
@@ -1282,7 +1294,8 @@ static void psp_media_prepare_route_kind(
     bool offline_route = !direct_page_route
         && psp_media_offline_route(media, url);
     bool online_route = direct_page_route
-        || (youtube_watch_url_supported(url) && !offline_route);
+        || (provider_video_route
+            && youtube_watch_url_supported(url) && !offline_route);
     if (!online_route && !offline_route) {
         char current_id[YOUTUBE_VIDEO_ID_CAPACITY] = {0};
         char next_id[YOUTUBE_VIDEO_ID_CAPACITY] = {0};
@@ -1527,7 +1540,12 @@ void psp_media_prepare_route(
         if (media->generation == generation) return;
         media->provider_direct_route = false;
     }
-    psp_media_prepare_route_kind(media, url, generation, false, false, true);
+    /* A committed watch document is not itself a play activation. Results
+       and watch pages mark their explicit native-player links; only that
+       controller action may enter the provider video route. */
+    bool offline_autoplay = psp_media_offline_route(media, url);
+    psp_media_prepare_route_kind(
+        media, url, generation, PSP_MEDIA_ROUTE_DOCUMENT, offline_autoplay);
 }
 
 bool psp_media_open_provider_route(
@@ -1537,7 +1555,7 @@ bool psp_media_open_provider_route(
         || backing_generation == 0 || media->system_suspended) return false;
     media->provider_direct_route = true;
     psp_media_prepare_route_kind(
-        media, url, backing_generation, false, false, true);
+        media, url, backing_generation, PSP_MEDIA_ROUTE_PROVIDER_VIDEO, true);
     bool accepted = media->generation == backing_generation
         && strcmp(media->source, url) == 0
         && (media->open_service_pending || media->playback != NULL
@@ -1598,7 +1616,9 @@ static bool psp_media_open_page_source_kind(
         return media->open_service_pending;
     }
     psp_media_prepare_route_kind(
-        media, source_url, generation, true, audio_only, autoplay);
+        media, source_url, generation,
+        audio_only ? PSP_MEDIA_ROUTE_PAGE_AUDIO : PSP_MEDIA_ROUTE_PAGE_VIDEO,
+        autoplay);
     return media->page_source && media->page_audio == audio_only
         && strcmp(media->source, source_url) == 0;
 }

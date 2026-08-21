@@ -256,16 +256,17 @@ static bool test_live_media_scenario(const char *directory)
     warning_count = 0;
     CHECK(psp_input_script_load(
         &script, path, record_warning, NULL));
-    CHECK(script.step_count == 16u);
+    CHECK(script.step_count == 18u);
     CHECK(script.steps[0].kind == PSP_INPUT_SCRIPT_STEP_WAIT
           && script.steps[0].advance_while_busy);
-    CHECK(script.steps[2].buttons == PSP_UI_BUTTON_RIGHT
+    CHECK(script.steps[1].buttons == PSP_UI_BUTTON_CONFIRM
           && script.steps[4].buttons == PSP_UI_BUTTON_RIGHT
-          && script.steps[6].buttons == PSP_UI_BUTTON_RIGHT);
-    CHECK(strcmp(script.steps[1].mark, "autoplay") == 0
-          && strcmp(script.steps[7].mark, "coalesced-seek") == 0
-          && strcmp(script.steps[9].mark, "pre-commit") == 0
-          && strcmp(script.steps[12].mark, "committed-seek") == 0);
+          && script.steps[6].buttons == PSP_UI_BUTTON_RIGHT
+          && script.steps[8].buttons == PSP_UI_BUTTON_RIGHT);
+    CHECK(strcmp(script.steps[3].mark, "autoplay") == 0
+          && strcmp(script.steps[9].mark, "coalesced-seek") == 0
+          && strcmp(script.steps[11].mark, "pre-commit") == 0
+          && strcmp(script.steps[14].mark, "committed-seek") == 0);
     return true;
 }
 
