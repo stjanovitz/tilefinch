@@ -13,7 +13,8 @@ int main(void)
     RUN_TEST(test_markup_priority_survives_preview_pressure);
     RUN_TEST(test_background_images_continue_after_useful_paint);
     RUN_TEST(test_background_image_failure_retains_visible_prefix);
-    RUN_TEST(test_static_offscreen_images_are_pumped);
+    RUN_TEST(test_static_images_retry_after_transient_idle_failure);
+    RUN_TEST(test_failed_visible_image_retries_after_first_paint);
     RUN_TEST(test_web_fonts_begin_after_fallback_layout);
     RUN_TEST(test_streaming_preview_precedes_eof);
     RUN_TEST(test_streaming_preview_skips_inert_prefix_layout);

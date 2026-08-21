@@ -131,6 +131,19 @@ static void model_cancel_all(
     }
 }
 
+static size_t model_retire_cancelled(
+    ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT])
+{
+    size_t retired = 0;
+    for (unsigned at = 0; at < FETCH_BACKGROUND_REQUEST_LIMIT; at++) {
+        if (slots[at].state != MODEL_RUNNING
+            || !slots[at].cancel_requested) continue;
+        slots[at].state = MODEL_FREE;
+        retired++;
+    }
+    return retired;
+}
+
 static uint64_t model_claim_eventually(
     ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT], bool foreground,
     bool priority_active, ModelOwner owner, uint32_t route_generation)
@@ -144,12 +157,26 @@ static uint64_t model_claim_eventually(
         for (unsigned at = 0; at < FETCH_BACKGROUND_REQUEST_LIMIT; at++) {
             if (slots[at].state != MODEL_RUNNING
                 || !slots[at].cancel_requested) continue;
-            model_complete(slots, fetch_background_request_id_make(
-                at, slots[at].generation));
+            (void) model_retire_cancelled(slots);
             break;
         }
     }
     return 0;
+}
+
+static void test_running_cancellation_releases_admission_on_worker_turn(void)
+{
+    ModelSlot slots[FETCH_BACKGROUND_REQUEST_LIMIT] = {{0}};
+    uint64_t ids[FETCH_BACKGROUND_REQUEST_LIMIT] = {0};
+    for (unsigned at = 0; at < FETCH_BACKGROUND_REQUEST_LIMIT; at++) {
+        ids[at] = model_claim(slots, true, false);
+        CHECK(ids[at] != 0);
+        slots[at].state = MODEL_RUNNING;
+    }
+    model_cancel_all(slots);
+    CHECK(model_claim(slots, true, false) == 0);
+    CHECK(model_retire_cancelled(slots) == FETCH_BACKGROUND_REQUEST_LIMIT);
+    CHECK(model_claim(slots, true, false) != 0);
 }
 
 static uint32_t random_next(uint32_t *state)
@@ -421,6 +448,7 @@ int main(void)
 {
     test_redirect_cookie_overflow_policy();
     test_reserved_eventual_admission();
+    test_running_cancellation_releases_admission_on_worker_turn();
     test_priority_release_restores_page_capacity();
     test_generation_wrap_and_late_completion();
     test_randomized_interleavings();

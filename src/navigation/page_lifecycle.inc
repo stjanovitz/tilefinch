@@ -897,6 +897,10 @@ static void page_destroy_value(NavigationSession *session,
     page->deferred_image_job = NULL;
     budget_free(session->budget, page->deferred_image_targets);
     page->deferred_image_targets = NULL;
+    page->deferred_image_count = 0;
+    page->deferred_image_cursor = 0;
+    page->deferred_image_rank_scroll_y = 0;
+    page->deferred_image_rank_valid = false;
     layout_destroy(&page->layout);
     layout_reuse_cache_destroy(page->layout_reuse);
     page->layout_reuse = NULL;

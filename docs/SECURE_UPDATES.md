@@ -551,10 +551,15 @@ than ZIP or TAR:
 - an allowlist of EBOOT, fonts, TLS roots, and signed boot
   defaults.
 
-The whole-package size and digest are signed. Per-file digests make extraction
-fail closed and give the launcher a bounded way to revalidate a pending slot.
-Compression can be considered later only with independent compressed and
-expanded limits.
+The whole-package size and digest are signed. The download pass verifies both
+while retaining the bounded package table in RAM. The installer can therefore
+avoid rereading and rehashing the whole package; it still hashes every payload
+against the retained table while extracting, so same-size corruption after the
+download fails before promotion. A standalone installer without that retained
+proof—or a download that could not retain a well-formed table under its RAM
+bound—falls back to the complete package verification pass. Per-file digests
+also give the launcher a bounded way to revalidate a pending slot. Compression
+can be considered later only with independent compressed and expanded limits.
 
 Voice recognition is a separate signed component, not a second browser
 bundle. Its `TFVMv1` envelope uses the
@@ -672,10 +677,11 @@ https://github.com/stjanovitz/tilefinch/releases/download/{tag}/{asset}
 ```
 
 This closes a race in which “latest” changes between metadata and package
-requests. The package streams through a 4–16 KiB buffer into the inactive
-staging slot while SHA-256 advances. A response length is useful
-defense-in-depth, but only the signed exact size and digest authorize the
-package.
+requests. The package streams through 16 KiB callbacks into the inactive
+staging slot while SHA-256 advances. The browser may consume up to four ready
+callbacks per frame, but keeps the existing 2 ms pump budget. A response length
+is useful defense-in-depth, but only the signed exact size and digest authorize
+the package.
 
 An interrupted first implementation simply restarts the download. A future
 Range resume must re-hash the existing prefix and require an exact `206
@@ -694,7 +700,9 @@ While slot A is active:
 2. Clear only stale `slot-b.tmp`; never modify A or shared user data.
 3. Stream to `data/update/package.part`, then close and synchronize it.
 4. Verify signed metadata (Stable/Beta) or the explicit unsigned Developer
-   envelope, then verify the exact package size/hash.
+   envelope. The completed download supplies its exact size/hash proof and
+   retained package table to the installer; a standalone install re-verifies
+   the complete package here.
 5. Extract into `slot-b.tmp`, verifying every allowed file.
 6. Write `slot.tfum`, the package table, an unsigned `DEVELOPER` marker when
    applicable, and a manifest-hash `READY` marker last.
@@ -710,12 +718,13 @@ zero-block `statvfs()` result fails closed as `NOT ENOUGH FREE SPACE`; PPSSPP
 and physical-device release qualification must therefore show an `ok` probe
 with a nonzero byte count.
 
-Package verification and extraction advance in 16 KiB irreducible units. The
-dedicated install page may run up to four units in one frame, but stops after a
-2 ms advisory batch budget. This raises the fast-card ceiling from roughly
-0.94 MiB/s to 3.75 MiB/s at 60 Hz without forcing four slow Memory Stick
-operations into one input gap. Validation records the number of units and the
-longest unit on completion.
+Download delivery, fallback package verification, and extraction advance in
+16 KiB irreducible units. Download delivery and the dedicated install page may
+run up to four ready units in one frame, but each stops after a 2 ms advisory
+batch budget. This removes the one-callback-per-frame network ceiling without
+forcing four slow Memory Stick operations into one input gap. Validation
+records the number of install units and the longest unit on completion; the UI
+also reports progress during the fallback verification phase.
 
 The two updater-state records contain a generation, active slot, pending slot,
 trial state, and checksum. Each state transition writes the older copy first

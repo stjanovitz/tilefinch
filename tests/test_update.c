@@ -954,6 +954,8 @@ static int test_installer(void)
     printf(
         "installer-faults: %zu interrupted operations retained slot A\n",
         exercised_faults);
+    options.fault = NULL;
+    options.fault_opaque = NULL;
 
     cleanup_test_slot(root, "slot-b");
     cleanup_test_slot(root, "slot-b.tmp");
@@ -978,14 +980,67 @@ static int test_installer(void)
     CHECK(file != NULL
           && fwrite(package.bytes, 1, package.length, file) == package.length
           && fclose(file) == 0);
-    options.fault = NULL;
-    options.fault_opaque = NULL;
+    TilefinchUpdateDownloadedPackageProof download_proof = {
+        .table = package.bytes,
+        .table_length = (size_t) payload_start,
+        .package_size = package.length
+    };
+    memcpy(download_proof.package_sha256, package_hash, 32);
+    options.download_proof = &download_proof;
+
+    /* The handoff is accepted only for the package named by the manifest. */
+    TilefinchUpdateDownloadedPackageProof wrong_proof = download_proof;
+    wrong_proof.package_sha256[0] ^= 0x80u;
+    options.download_proof = &wrong_proof;
+    Budget rejected_budget;
+    budget_init(&rejected_budget, 1024 * 1024);
+    CHECK(tilefinch_update_install_create(&rejected_budget, &options) == NULL
+          && rejected_budget.current == 0);
+    options.download_proof = &download_proof;
+
+    /* The retained table avoids a second whole-package pass, but every
+       extracted payload remains authenticated. A same-size mutation made
+       after download therefore fails before promotion. */
+    package.bytes[payload_start] ^= 0x40u;
+    file = fopen(package_path, "wb");
+    CHECK(file != NULL
+          && fwrite(package.bytes, 1, package.length, file) == package.length
+          && fclose(file) == 0);
+    Budget corrupt_budget;
+    budget_init(&corrupt_budget, 1024 * 1024);
+    TilefinchUpdateInstallJob *corrupt_job =
+        tilefinch_update_install_create(&corrupt_budget, &options);
+    CHECK(corrupt_job != NULL);
+    TilefinchUpdateInstallSnapshot corrupt_snapshot = {0};
+    CHECK(tilefinch_update_install_snapshot(
+              corrupt_job, &corrupt_snapshot)
+          && corrupt_snapshot.phase == TILEFINCH_UPDATE_INSTALL_PREPARING);
+    for (size_t pump = 0; pump < 100; pump++) {
+        CHECK(tilefinch_update_install_pump(corrupt_job, 4));
+        CHECK(tilefinch_update_install_snapshot(
+            corrupt_job, &corrupt_snapshot));
+        if (corrupt_snapshot.phase >= TILEFINCH_UPDATE_INSTALL_COMPLETE)
+            break;
+    }
+    CHECK(corrupt_snapshot.phase == TILEFINCH_UPDATE_INSTALL_ERROR
+          && corrupt_snapshot.status == TILEFINCH_UPDATE_PACKAGE_MISMATCH
+          && file_matches(
+                 active_eboot, old_eboot, sizeof(old_eboot) - 1u));
+    tilefinch_update_install_destroy(corrupt_job);
+    CHECK(corrupt_budget.current == 0);
+    package.bytes[payload_start] ^= 0x40u;
+    file = fopen(package_path, "wb");
+    CHECK(file != NULL
+          && fwrite(package.bytes, 1, package.length, file) == package.length
+          && fclose(file) == 0);
     Budget budget;
     budget_init(&budget, 1024 * 1024);
     TilefinchUpdateInstallJob *job =
         tilefinch_update_install_create(&budget, &options);
     CHECK(job != NULL);
     TilefinchUpdateInstallSnapshot snapshot;
+    CHECK(tilefinch_update_install_snapshot(job, &snapshot)
+          && snapshot.phase == TILEFINCH_UPDATE_INSTALL_PREPARING);
     for (size_t pump = 0; pump < 100; pump++) {
         CHECK(tilefinch_update_install_pump(job, 4));
         CHECK(tilefinch_update_install_snapshot(job, &snapshot));

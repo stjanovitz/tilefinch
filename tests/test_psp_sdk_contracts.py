@@ -1892,6 +1892,70 @@ class PspSdkContractTests(unittest.TestCase):
                 "fwrite(", "rename(", "sceIo"):
             self.assertNotIn(forbidden, worker)
 
+    def test_updater_download_is_batched_but_time_bounded(self):
+        source = without_comments(
+            (ROOT / "src/update_client.c").read_text(encoding="utf-8"))
+        self.assertIn("#define UPDATE_DOWNLOAD_PUMP_CALLBACKS 4u", source)
+        self.assertIn(
+            "UPDATE_DOWNLOAD_PUMP_CALLBACKS * UPDATE_PUMP_BYTES", source)
+        pump = source[
+            source.index("bool tilefinch_update_client_pump("):
+            source.index("bool tilefinch_update_client_snapshot(")]
+        self.assertIn("client->request_is_download", pump)
+        self.assertIn("UPDATE_DOWNLOAD_PUMP_CALLBACKS", pump)
+        self.assertIn("UPDATE_DOWNLOAD_PUMP_BYTES", pump)
+        self.assertIn("maximum_time_us == 0 ? 2000u : maximum_time_us", pump)
+
+    def test_updater_retains_download_authority_without_skipping_files(self):
+        client = without_comments(
+            (ROOT / "src/update_client.c").read_text(encoding="utf-8"))
+        self.assertIn("update_capture_package_table", client)
+        self.assertIn("package_table_verified", client)
+        self.assertIn("tilefinch_update_client_download_proof", client)
+
+        installer = without_comments(
+            (ROOT / "src/update_installer.c").read_text(encoding="utf-8"))
+        create = installer[
+            installer.index("TilefinchUpdateInstallJob *tilefinch_update_install_create("):
+            installer.index("void tilefinch_update_install_destroy(")]
+        self.assertIn("options->download_proof", create)
+        self.assertIn("TILEFINCH_UPDATE_INSTALL_PREPARING", create)
+        extraction = installer[
+            installer.index("static bool install_open_entry("):
+            installer.index("bool tilefinch_update_install_snapshot(")]
+        self.assertIn("tilefinch_sha256_update", extraction)
+        self.assertIn("memcmp(digest, entry->sha256, 32)", extraction)
+
+        session = without_comments(
+            (ROOT / "src/psp_update_session.c").read_text(encoding="utf-8"))
+        self.assertIn("tilefinch_update_client_download_proof", session)
+        self.assertIn(".download_proof = have_download_proof", session)
+        self.assertIn("TILEFINCH_UPDATE_INSTALL_VERIFYING", session)
+
+    def test_updater_table_capture_is_an_optional_fast_path(self):
+        client = without_comments(
+            (ROOT / "src/update_client.c").read_text(encoding="utf-8"))
+        capture = client[
+            client.index("static bool update_capture_package_table("):
+            client.index("static bool update_package_body(")]
+        self.assertIn("package_table_capture_disabled", capture)
+        self.assertIn(
+            "client->package_table_capture_disabled = true", capture)
+        # A rejected or unallocatable retained table must not abort the
+        # authenticated download; the installer owns the fallback reread.
+        self.assertNotIn("return false", capture)
+        finish = client[
+            client.index("static void update_finish_download("):
+            client.index("bool tilefinch_update_client_pump(")]
+        self.assertNotIn(
+            "client->artifact == TILEFINCH_UPDATE_ARTIFACT_BROWSER && (",
+            finish)
+
+        session = without_comments(
+            (ROOT / "src/psp_update_session.c").read_text(encoding="utf-8"))
+        self.assertIn(
+            "have_download_proof ? &download_proof : NULL", session)
+
     def test_the_worker_is_given_work_before_the_thread_stops(self):
         """The codec worker completion is collected through a bounded wait, so
         work offered before a hardware wait can finish inside that wait rather
@@ -3851,17 +3915,22 @@ class PspSdkContractTests(unittest.TestCase):
         # The validation log is only synchronized to the Memory Stick at
         # checkpoints and at exit, and the media pipeline reaches neither. A
         # freeze or a power-off therefore lost the whole media section of the
-        # device log. Commit it where the diagnosis is produced.
+        # device log. Schedule the commit where the diagnosis is produced,
+        # but perform card I/O only after the browser thread collects it.
         backend = without_comments(
             (ROOT / "src/media_backend_psp.c").read_text(encoding="utf-8"))
         commit = backend[
-            backend.index("static void psp_media_commit_failure_log("):
+            backend.index(
+                "static void psp_media_schedule_failure_log_commit("):
             backend.index("static void psp_media_log_failure(")]
         # Failures repeat per packet and per retry; a card sync each time
         # would turn a diagnosable failure into a hang.
         self.assertIn("PSP_MEDIA_FAILURE_SYNC_INTERVAL_US", commit)
         self.assertIn("sceKernelGetSystemTimeWide()", commit)
         self.assertIn("psp_media_commit_log();", commit)
+        self.assertLess(
+            commit.index("static void psp_media_commit_pending_failure_log("),
+            commit.index("psp_media_commit_log();"))
         decode = backend[
             backend.index(
                 "static MediaBackendResult psp_media_decode_staged_video("):
@@ -4265,6 +4334,42 @@ class PspSdkContractTests(unittest.TestCase):
             r"psp_media_cache_extent\(PSP_MEDIA_AUDIO_CODEC_BYTES\)\);")
         self.assertLess(decode.index("sceAudiocodecDecode("),
                         decode.index("backend->audio_codec"))
+
+    def test_aac_busy_retry_is_bounded_and_retains_the_staged_unit(self):
+        source = without_comments(
+            (ROOT / "src/media_backend_psp.c").read_text(encoding="utf-8"))
+        decode = source[
+            source.index("static MediaBackendResult psp_media_decode_one_audio_au("):
+            source.index("static MediaBackendResult psp_media_decode_staged_audio(")]
+        self.assertIn("status == PSP_MEDIA_ERROR_BUSY", decode)
+        self.assertIn("audio_decode_busy_retries < 2u", decode)
+        self.assertIn("return MEDIA_BACKEND_WOULD_BLOCK", decode)
+        self.assertNotIn("audio_staged_index++", decode)
+        self.assertIn("audio_decode_busy_retries = 0u", decode)
+        batch = source[
+            source.index("static MediaBackendResult psp_media_decode_staged_audio("):
+            source.index("static MediaBackendResult psp_media_drain_staged_video(")]
+        self.assertLess(
+            batch.index("if (result != MEDIA_BACKEND_ACCEPTED) return result"),
+            batch.index("backend->audio_staged_index++"))
+        reset = source[
+            source.index("static bool psp_media_reset("):
+            source.index("static void psp_media_destroy(")]
+        self.assertIn("audio_decode_busy_retries = 0u", reset)
+
+    def test_codec_worker_never_synchronizes_the_memory_stick(self):
+        source = without_comments(
+            (ROOT / "src/media_backend_psp.c").read_text(encoding="utf-8"))
+        failure = source[
+            source.index(
+                "static void psp_media_schedule_failure_log_commit("):
+            source.index("static void psp_media_commit_pending_failure_log(")]
+        self.assertNotIn("psp_media_commit_log()", failure)
+        self.assertIn("psp_media_failure_sync_pending", failure)
+        collector = source[
+            source.index("static int psp_media_collect_codec_job("):
+            source.index("static bool psp_media_prepared_pair_allowed(")]
+        self.assertIn("psp_media_commit_pending_failure_log()", collector)
 
     def test_firmware_written_control_blocks_are_never_purely_invalidated(
             self):
@@ -4754,6 +4859,45 @@ class PspSdkContractTests(unittest.TestCase):
             opening.rindex("static bool psp_media_open_pump_step("):
             opening.index("bool psp_media_open_work_pending(")]
         self.assertIn("psp_media_set_transport_priority(", open_pump)
+
+    def test_provider_handoff_retires_page_work_before_resolver_progress(self):
+        background = without_comments(
+            (ROOT / "src/fetch/background_transport.inc").read_text(
+                encoding="utf-8"))
+        retire = background[
+            background.index("static void fetch_background_retire_cancelled("):
+            background.index("static void fetch_background_resume_streams(")]
+        self.assertIn("FETCH_BACKGROUND_SLOT_RUNNING", retire)
+        self.assertIn("fetch_background_slot_release_curl(slot)", retire)
+        self.assertIn("CURLE_ABORTED_BY_CALLBACK", retire)
+        self.assertIn("claimed_ready", retire)
+        self.assertLess(
+            retire.index("atomic_compare_exchange_strong_explicit("),
+            retire.index("slot->length = 0"),
+            "Cancellation must atomically claim a READY stream chunk before "
+            "clearing the browser thread's memcpy source.")
+        worker = background[
+            background.index("static int fetch_background_worker_main("):
+            background.index("bool fetch_background_transport_available(")]
+        self.assertLess(
+            worker.index("fetch_background_retire_cancelled()"),
+            worker.index("curl_multi_perform("),
+            "A cancelled thumbnail in DNS/TCP/TLS setup must be removed "
+            "before the next potentially blocking curl call.")
+
+        actions = without_comments(
+            (ROOT / "src/psp_app/psp_app_actions.c").read_text(
+                encoding="utf-8"))
+        handoff = actions[
+            actions.index("bool opened = entry != NULL"):
+            actions.index("action.prefer_native_media = false;")]
+        opened = handoff[handoff.index("if (opened) {"):]
+        self.assertLess(
+            opened.index("browser_engine_cancel_network_work("),
+            opened.index("browser_engine_reclaim_optional_memory("))
+        self.assertLess(
+            opened.index("browser_engine_reclaim_optional_memory("),
+            opened.index("break;"))
 
     def test_audio_open_precedes_aggressive_video_successor(self):
         opening = without_comments(

@@ -476,6 +476,7 @@ typedef struct {
     size_t header_callbacks;
     size_t body_callbacks;
     size_t completions;
+    size_t cancelled_retired;
     unsigned worker_perform_max_us;
     unsigned worker_perform_over_33ms;
     unsigned worker_perform_over_100ms;

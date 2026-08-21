@@ -1398,6 +1398,24 @@ typedef enum {
     YOUTUBE_RESOLVE_PHASE_FAILED
 } YoutubeResolvePhase;
 
+static const char *youtube_resolve_phase_name(YoutubeResolvePhase phase)
+{
+    switch (phase) {
+    case YOUTUBE_RESOLVE_PHASE_DIRECT_START: return "direct-start";
+    case YOUTUBE_RESOLVE_PHASE_DIRECT_WAIT: return "direct-wait";
+    case YOUTUBE_RESOLVE_PHASE_DIRECT_PARSE: return "direct-parse";
+    case YOUTUBE_RESOLVE_PHASE_WATCH_START: return "watch-start";
+    case YOUTUBE_RESOLVE_PHASE_WATCH_WAIT: return "watch-wait";
+    case YOUTUBE_RESOLVE_PHASE_WATCH_PARSE: return "watch-parse";
+    case YOUTUBE_RESOLVE_PHASE_ENRICHED_START: return "enriched-start";
+    case YOUTUBE_RESOLVE_PHASE_ENRICHED_WAIT: return "enriched-wait";
+    case YOUTUBE_RESOLVE_PHASE_ENRICHED_PARSE: return "enriched-parse";
+    case YOUTUBE_RESOLVE_PHASE_COMPLETE: return "complete";
+    case YOUTUBE_RESOLVE_PHASE_FAILED: return "failed";
+    default: return "unknown";
+    }
+}
+
 struct YoutubeResolveJob {
     Budget *budget;
     BrowserSession *session;
@@ -2029,6 +2047,26 @@ const char *youtube_resolve_job_error(const YoutubeResolveJob *job)
 {
     return job == NULL || job->error[0] == '\0'
         ? "YouTube resolution failed" : job->error;
+}
+
+bool youtube_resolve_job_metrics(
+    const YoutubeResolveJob *job, YoutubeResolveJobMetrics *metrics)
+{
+    if (job == NULL || metrics == NULL) return false;
+    *metrics = (YoutubeResolveJobMetrics) {
+        .phase = youtube_resolve_phase_name(job->phase),
+        .client_index = job->client_index,
+        .attempts = job->attempts,
+        .request_pumps = job->request_pumps,
+        .request_chunks = job->request_chunks,
+        .admission_deferrals = job->admission_deferrals,
+        .last_admission_status = job->last_admission_status,
+        .response_bytes = job->response.length,
+        .response_status = job->response.status_code,
+        .request_active = job->request_id != 0,
+        .cached_identity = job->enriched_from_cached_identity
+    };
+    return true;
 }
 
 void youtube_resolve_job_cancel(YoutubeResolveJob *job, const char *reason)

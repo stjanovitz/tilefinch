@@ -325,6 +325,17 @@ typedef struct {
     char message[96];
 } TilefinchUpdateClientSnapshot;
 
+/* Download-time authority retained across the installer handoff. The table
+   bytes were part of the package SHA-256 verified by UpdateClient; payloads
+   remain independently checked against their per-file digests while being
+   extracted. Pointers remain owned by the client. */
+typedef struct {
+    const uint8_t *table;
+    size_t table_length;
+    uint64_t package_size;
+    uint8_t package_sha256[32];
+} TilefinchUpdateDownloadedPackageProof;
+
 TilefinchUpdateClient *tilefinch_update_client_create(
     Budget *budget, const TilefinchUpdateClientOptions *options);
 void tilefinch_update_client_destroy(TilefinchUpdateClient *client);
@@ -339,6 +350,9 @@ bool tilefinch_update_client_snapshot(
     TilefinchUpdateClientSnapshot *snapshot);
 const uint8_t *tilefinch_update_client_envelope(
     const TilefinchUpdateClient *client, size_t *length);
+bool tilefinch_update_client_download_proof(
+    const TilefinchUpdateClient *client,
+    TilefinchUpdateDownloadedPackageProof *proof);
 
 /* Bounded updater URL policy shared by boot configuration and the client. */
 bool tilefinch_update_url_is_valid(const char *url, size_t capacity);
@@ -373,6 +387,9 @@ typedef struct {
     TilefinchUpdateState current_state;
     TilefinchUpdateTrust trust;
     bool allow_downgrade;
+    /* Optional verified download proof. Supplying it skips the redundant
+       whole-package reread; omitting it retains the standalone verifier. */
+    const TilefinchUpdateDownloadedPackageProof *download_proof;
     TilefinchUpdateFaultHook fault;
     void *fault_opaque;
 } TilefinchUpdateInstallOptions;

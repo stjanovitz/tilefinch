@@ -498,15 +498,20 @@ static bool navigation_plan_static_image_geometry(
     bool collected = built && navigation_collect_layout_image_geometry(
         &probe, targets, capacity, session->viewport.css_height,
         count, &total_count);
-    if (collected && total_count > *count) {
-        size_t deferred_count = total_count - *count;
+    if (collected && total_count != 0) {
+        /* Retain the complete bounded plan, including the visible prefix.
+           Successfully loaded prefix entries are cheap no-ops when the idle
+           queue revisits them. A prefix response that failed transiently,
+           however, now receives the same background retry opportunity as an
+           offscreen image instead of remaining blank for the page lifetime. */
+        size_t deferred_count = total_count;
         ImagePriorityTarget *deferred = budget_malloc_category(
             session->budget, BUDGET_CATEGORY_RESOURCE,
             deferred_count * sizeof(*deferred));
         if (deferred == NULL) {
             collected = false;
         } else {
-            memcpy(deferred, targets + *count,
+            memcpy(deferred, targets,
                    deferred_count * sizeof(*deferred));
             session->page.deferred_image_targets = deferred;
             session->page.deferred_image_count = deferred_count;

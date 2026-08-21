@@ -500,6 +500,17 @@ static void psp_app_dispatch_heavy_action(
                     if (opened) {
                         (void) browser_engine_cancel_network_work(
                             engine, "provider video selected");
+                        BrowserOptionalMemoryReclaim reclaimed = {0};
+                        (void) browser_engine_reclaim_optional_memory(
+                            engine, &reclaimed);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+                        printf("tilefinch-provider-handoff: "
+                               "reclaimed=%zu js=%zu session=%zu render=%zu\n",
+                               reclaimed.total_bytes,
+                               reclaimed.javascript_bytes,
+                               reclaimed.session_cache_bytes,
+                               reclaimed.render_cache_bytes);
+#endif
                         psp_ui_set_loading(
                             &app->process->presentation.ui, false, 0);
                         frame->page_dirty = true;

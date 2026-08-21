@@ -506,7 +506,7 @@ static bool test_background_image_failure_retains_visible_prefix(void)
     return ok && clean;
 }
 
-static bool test_static_offscreen_images_are_pumped(void)
+static bool test_static_images_retry_after_transient_idle_failure(void)
 {
     static const char html[] =
         "<!doctype html><title>Deferred images</title>"
@@ -533,41 +533,55 @@ static bool test_static_offscreen_images_are_pumped(void)
         + navigation.performance.full_relayouts;
     bool first_frame = committed && navigation.page.loaded
         && navigation.page.images.stats.loaded == 1
-        && navigation.page.deferred_image_count == 1
+        && navigation.page.deferred_image_count == 2
         && navigation.page.deferred_image_job == NULL
         && navigation_background_resources_pending(&navigation);
+    if (first_frame) budget_inject_failure_after(&budget, 0);
     bool admitted = first_frame
         && navigation_run_background_resources(&navigation);
-    bool yielded_to_owner = admitted
+    budget_clear_failure_injection(&budget);
+    bool retry_parked = admitted
         && navigation.page.images.stats.loaded == 1
-        && navigation.page.deferred_image_job != NULL
-        && fetch_scheduler_pending(navigation.page.resource_scheduler) == 1
-        && navigation.performance.background_image_batches == 1
+        && navigation.page.deferred_image_job == NULL
+        && navigation.page.deferred_image_cursor == 0
+        && navigation.page.deferred_image_targets[0].retry_count == 1
+        && navigation.performance.background_image_rank_scans == 1
+        && navigation.performance.background_image_failures == 1
         && navigation.performance.fast_relayouts
                + navigation.performance.full_relayouts == relayouts_before;
+    lxb_dom_node_t *retry_node = retry_parked
+        ? navigation.page.deferred_image_targets[0].node : NULL;
+    bool scroll_kept_retry = retry_parked
+        && navigation_set_scroll(&navigation, 600)
+        && navigation_run_background_resources(&navigation)
+        && navigation.page.deferred_image_cursor == 0
+        && navigation.page.deferred_image_targets[0].node == retry_node
+        && navigation.page.deferred_image_targets[0].retry_count == 1
+        && navigation.performance.background_image_rank_scans == 1;
     size_t pumps = 0;
-    while (yielded_to_owner
+    while (scroll_kept_retry
            && navigation_background_resources_pending(&navigation)
-           && pumps++ < 12u) {
+           && pumps++ < 32u) {
         if (!navigation_run_background_resources(&navigation)) break;
     }
     size_t relayouts_after = navigation.performance.fast_relayouts
         + navigation.performance.full_relayouts;
-    bool ok = yielded_to_owner && navigation.page.loaded
+    bool ok = scroll_kept_retry && navigation.page.loaded
         && !navigation_background_resources_pending(&navigation)
         && navigation.page.images.stats.loaded == 2
         && navigation.performance.background_images_loaded == 1
         && navigation.performance.background_image_relayouts == 1
-        && navigation.performance.background_image_failures == 0
+        && navigation.performance.background_image_failures == 1
+        && navigation.performance.background_image_rank_scans == 2
         && relayouts_after == relayouts_before + 1
-        && pumps >= 3u;
+        && pumps >= 10u;
     if (!ok) {
         fprintf(stderr,
                 "deferred-images ready=%d committed=%d first=%d "
-                "admitted=%d yielded=%d page=%d pending=%d images=%zu "
+                "admitted=%d retry=%d page=%d pending=%d images=%zu "
                 "queue=%zu/%zu job=%d fetch=%zu pumps=%zu batches=%zu "
                 "loaded=%zu relayout=%zu failures=%zu error=\"%s\"\n",
-                ready, committed, first_frame, admitted, yielded_to_owner,
+                ready, committed, first_frame, admitted, retry_parked,
                 navigation.page.loaded,
                 navigation_background_resources_pending(&navigation),
                 navigation.page.images.stats.loaded,
@@ -582,6 +596,57 @@ static bool test_static_offscreen_images_are_pumped(void)
                 navigation.performance.background_image_failures,
                 navigation.last_error);
     }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_failed_visible_image_retries_after_first_paint(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Retry visible image</title>"
+        "<style>html,body{margin:0}img{display:block;width:24px;height:24px}"
+        "#tail{margin-top:600px}</style>"
+        "<body><img id=hero src=/hero.svg>"
+        "<img id=tail src=/tail.svg></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && deferred_document_images_replay_begin();
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        fetch_inject_failure_once(FETCH_INJECT_TLS);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_static_html(
+        &navigation, generation, "https://deferred-images.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    fetch_inject_failure_once(FETCH_INJECT_NONE);
+    bool first_frame = committed && navigation.page.loaded
+        && navigation.page.images.stats.loaded == 0
+        && navigation.page.images.stats.failed == 1
+        && navigation.page.deferred_image_count == 2
+        && navigation_background_resources_pending(&navigation);
+    size_t pumps = 0;
+    while (first_frame
+           && navigation_background_resources_pending(&navigation)
+           && pumps++ < 40u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+    }
+    bool ok = first_frame && navigation.page.loaded
+        && !navigation_background_resources_pending(&navigation)
+        && navigation.page.images.stats.loaded == 2
+        && navigation.performance.background_images_loaded == 2
+        && navigation.performance.background_image_relayouts == 2
+        && navigation.performance.background_image_failures == 0;
     if (ready) fetch_trace_end();
     if (installed) navigation_destroy(&navigation);
     bool clean = budget.current == 0

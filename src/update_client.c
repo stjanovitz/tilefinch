@@ -15,6 +15,9 @@
    32 MiB format limit does not allocate or retain a 32 MiB response buffer. */
 #define UPDATE_SCHEDULER_RESERVE TILEFINCH_UPDATE_MAX_PACKAGE_BYTES
 #define UPDATE_PUMP_BYTES (16u * 1024u)
+#define UPDATE_DOWNLOAD_PUMP_CALLBACKS 4u
+#define UPDATE_DOWNLOAD_PUMP_BYTES \
+    (UPDATE_DOWNLOAD_PUMP_CALLBACKS * UPDATE_PUMP_BYTES)
 #define UPDATE_FREE_SPACE_MARGIN (4u * 1024u * 1024u)
 
 struct TilefinchUpdateClient {
@@ -52,6 +55,12 @@ struct TilefinchUpdateClient {
     FILE *part;
     TilefinchSha256 package_sha;
     uint64_t package_bytes;
+    uint8_t package_table_header[16];
+    uint8_t *package_table;
+    size_t package_table_expected;
+    size_t package_table_captured;
+    bool package_table_capture_disabled;
+    bool package_table_verified;
     char message[96];
 };
 
@@ -381,6 +390,19 @@ static void update_close_part(TilefinchUpdateClient *client)
     }
 }
 
+static void update_reset_package_proof(TilefinchUpdateClient *client)
+{
+    if (client == NULL) return;
+    budget_free(client->budget, client->package_table);
+    client->package_table = NULL;
+    client->package_table_expected = 0;
+    client->package_table_captured = 0;
+    client->package_table_capture_disabled = false;
+    client->package_table_verified = false;
+    memset(client->package_table_header, 0,
+           sizeof(client->package_table_header));
+}
+
 void tilefinch_update_client_destroy(TilefinchUpdateClient *client)
 {
     if (client == NULL) return;
@@ -388,6 +410,7 @@ void tilefinch_update_client_destroy(TilefinchUpdateClient *client)
     if (client->request_id != 0)
         (void) fetch_scheduler_discard(client->scheduler, client->request_id);
     fetch_scheduler_destroy(client->scheduler);
+    budget_free(client->budget, client->package_table);
     budget_free(client->budget, client->envelope);
     Budget *budget = client->budget;
     memset(client, 0, sizeof(*client));
@@ -407,6 +430,7 @@ bool tilefinch_update_client_begin_check(
     budget_free(client->budget, client->envelope);
     client->envelope = NULL;
     client->envelope_length = 0;
+    update_reset_package_proof(client);
     client->now_unix = now_unix;
     client->clock_valid = clock_valid;
     client->status = TILEFINCH_UPDATE_OK;
@@ -428,6 +452,64 @@ bool tilefinch_update_client_begin_check(
     return true;
 }
 
+static bool update_capture_package_table(
+    TilefinchUpdateClient *client, const unsigned char *data, size_t length)
+{
+    if (client->artifact != TILEFINCH_UPDATE_ARTIFACT_BROWSER) return true;
+    if (client->package_table_capture_disabled) return true;
+    if (client->package_table_expected != 0
+        && client->package_table_captured == client->package_table_expected)
+        return true;
+    uint64_t offset64 = client->package_bytes;
+    if (offset64 >= TILEFINCH_UPDATE_MAX_PACKAGE_TABLE_BYTES) return true;
+    size_t offset = (size_t) offset64;
+    if (offset < sizeof(client->package_table_header)) {
+        size_t header_bytes = sizeof(client->package_table_header) - offset;
+        if (header_bytes > length) header_bytes = length;
+        memcpy(client->package_table_header + offset, data, header_bytes);
+        if (offset + header_bytes == sizeof(client->package_table_header)
+            && client->package_table_expected == 0) {
+            const uint8_t *header = client->package_table_header;
+            uint32_t table_length = (uint32_t) header[12] << 24
+                | (uint32_t) header[13] << 16
+                | (uint32_t) header[14] << 8 | header[15];
+            if (table_length > TILEFINCH_UPDATE_MAX_PACKAGE_TABLE_BYTES
+                                   - sizeof(client->package_table_header)) {
+                /* The table copy is only an optimization which avoids a
+                   standalone installer reread. Keep downloading under the
+                   signed whole-package digest; the installer will parse and
+                   reject a malformed package through its ordinary path. */
+                client->package_table_capture_disabled = true;
+                return true;
+            }
+            client->package_table_expected =
+                sizeof(client->package_table_header) + table_length;
+            client->package_table = budget_malloc_category(
+                client->budget, BUDGET_CATEGORY_SESSION,
+                client->package_table_expected);
+            if (client->package_table == NULL) {
+                client->package_table_expected = 0;
+                client->package_table_capture_disabled = true;
+                return true;
+            }
+            memcpy(client->package_table, client->package_table_header,
+                   sizeof(client->package_table_header));
+            client->package_table_captured =
+                sizeof(client->package_table_header);
+        }
+    }
+    if (client->package_table != NULL
+        && offset < client->package_table_expected) {
+        size_t copy = client->package_table_expected - offset;
+        if (copy > length) copy = length;
+        memcpy(client->package_table + offset, data, copy);
+        size_t captured = offset + copy;
+        if (captured > client->package_table_captured)
+            client->package_table_captured = captured;
+    }
+    return true;
+}
+
 static bool update_package_body(
     void *opaque, const unsigned char *data, size_t length)
 {
@@ -437,6 +519,7 @@ static bool update_package_body(
                > client->verified.manifest.package_size
         || length > client->verified.manifest.package_size
                          - client->package_bytes
+        || !update_capture_package_table(client, data, length)
         || fwrite(data, 1, length, client->part) != length
         || !tilefinch_sha256_update(&client->package_sha, data, length)) {
         return false;
@@ -503,6 +586,7 @@ bool tilefinch_update_client_begin_download(TilefinchUpdateClient *client)
     }
     tilefinch_sha256_init(&client->package_sha);
     client->package_bytes = 0;
+    update_reset_package_proof(client);
     FetchRequest request = update_request(client, client->package_url);
     FetchStreamOptions stream = {
         .on_body = update_package_body,
@@ -625,6 +709,7 @@ static void update_finish_download(
         || memcmp(
                digest, client->verified.manifest.package_sha256, 32) != 0) {
         remove(client->part_path);
+        update_reset_package_proof(client);
         update_client_error(
             client,
             success ? TILEFINCH_UPDATE_PACKAGE_MISMATCH
@@ -634,6 +719,12 @@ static void update_finish_download(
                            ? "DOWNLOAD FAILED" : result->error));
         return;
     }
+    client->package_table_verified =
+        client->artifact == TILEFINCH_UPDATE_ARTIFACT_BROWSER
+        && client->package_table != NULL
+        && client->package_table_expected != 0
+        && client->package_table_captured
+               == client->package_table_expected;
     client->phase = TILEFINCH_UPDATE_CLIENT_DOWNLOADED;
     snprintf(
         client->message, sizeof(client->message),
@@ -647,8 +738,10 @@ bool tilefinch_update_client_pump(
 {
     if (client == NULL || client->request_id == 0) return false;
     FetchPumpQuota quota = {
-        .maximum_body_callbacks = 1,
-        .maximum_body_bytes = UPDATE_PUMP_BYTES,
+        .maximum_body_callbacks = client->request_is_download
+            ? UPDATE_DOWNLOAD_PUMP_CALLBACKS : 1u,
+        .maximum_body_bytes = client->request_is_download
+            ? UPDATE_DOWNLOAD_PUMP_BYTES : UPDATE_PUMP_BYTES,
         .maximum_time_us = maximum_time_us == 0 ? 2000u : maximum_time_us
     };
     FetchPumpMetrics metrics;
@@ -674,6 +767,7 @@ bool tilefinch_update_client_pump(
     if (completed_phase == TILEFINCH_UPDATE_CLIENT_CANCELLING) {
         update_close_part(client);
         remove(client->part_path);
+        update_reset_package_proof(client);
         client->phase = TILEFINCH_UPDATE_CLIENT_IDLE;
         client->status = TILEFINCH_UPDATE_CANCELLED;
         snprintf(client->message, sizeof(client->message), "CANCELLED");
@@ -712,4 +806,25 @@ const uint8_t *tilefinch_update_client_envelope(
     if (length != NULL)
         *length = client == NULL ? 0 : client->envelope_length;
     return client == NULL ? NULL : client->envelope;
+}
+
+bool tilefinch_update_client_download_proof(
+    const TilefinchUpdateClient *client,
+    TilefinchUpdateDownloadedPackageProof *proof)
+{
+    if (client == NULL || proof == NULL
+        || client->phase != TILEFINCH_UPDATE_CLIENT_DOWNLOADED
+        || !client->package_table_verified
+        || client->package_table == NULL
+        || client->package_table_expected == 0
+        || client->package_table_captured != client->package_table_expected)
+        return false;
+    *proof = (TilefinchUpdateDownloadedPackageProof) {
+        .table = client->package_table,
+        .table_length = client->package_table_expected,
+        .package_size = client->verified.manifest.package_size
+    };
+    memcpy(proof->package_sha256,
+           client->verified.manifest.package_sha256, 32);
+    return true;
 }

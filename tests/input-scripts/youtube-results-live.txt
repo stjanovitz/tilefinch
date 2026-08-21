@@ -20,10 +20,9 @@
 # way a checked-in live scenario would be.
 wait-live 2400
 mark-live opened
-# The provider starts with its search field focused. Move to the first result
-# before activating it; Cross on the field is deliberately a no-op.
-tap down
-wait 2
+# The provider autofocuses the first result's primary media card. Activate it
+# directly: a directional move would make this live scenario depend on row
+# geometry and the independently focusable Details rail.
 tap cross
 mark-live activated
 wait-live 1800

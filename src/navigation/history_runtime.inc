@@ -986,17 +986,39 @@ static void navigation_deferred_images_finish(NavigationSession *session)
     session->page.deferred_image_targets = NULL;
     session->page.deferred_image_count = 0;
     session->page.deferred_image_cursor = 0;
+    session->page.deferred_image_rank_scroll_y = 0;
+    session->page.deferred_image_rank_valid = false;
     session->page.image_continuation_pending = false;
+}
+
+static void navigation_deferred_image_failed(
+    NavigationSession *session, ImagePriorityTarget *target)
+{
+    NavigationPage *page = &session->page;
+    session->performance.background_image_failures++;
+    if (target != NULL && target->retry_count == 0) {
+        /* Eight owner-idle slices are long enough for a just-retired worker
+           descriptor or short CDN hiccup to clear, yet do not hold input,
+           layout, or the rest of the browser loop. The target stays current
+           and is retried exactly once. */
+        target->retry_count = 1;
+        target->retry_delay = 8;
+        return;
+    }
+    if (target != NULL) {
+        target->retry_count = 0;
+        target->retry_delay = 0;
+    }
+    page->deferred_image_cursor++;
 }
 
 static uint64_t navigation_deferred_image_distance(
     const NavigationSession *session, const ImagePriorityTarget *target,
-    uint16_t *display_width, uint16_t *display_height)
+    int scroll_y, uint16_t *display_width, uint16_t *display_height)
 {
     if (display_width != NULL) *display_width = target->display_width;
     if (display_height != NULL) *display_height = target->display_height;
-    const NavigationEntry *entry = navigation_current(session);
-    int64_t top = entry == NULL ? 0 : entry->scroll_y;
+    int64_t top = scroll_y;
     int64_t bottom = top + session->viewport.css_height;
     for (size_t i = 0; i < session->page.layout.node_box_count; i++) {
         const LayoutNodeBox *box = &session->page.layout.node_boxes[i];
@@ -1028,49 +1050,80 @@ static bool navigation_run_deferred_image(NavigationSession *session)
         return true;
     }
     if (page->deferred_image_job == NULL) {
-        /* Re-rank only between requests. A scroll can therefore bring a
-           later thumbnail to the front without cancelling useful bytes
-           already in flight. */
-        size_t best = page->deferred_image_cursor;
-        uint16_t best_width = 0, best_height = 0;
-        uint64_t best_distance = navigation_deferred_image_distance(
-            session, &page->deferred_image_targets[best],
-            &best_width, &best_height);
-        for (size_t i = best + 1; i < page->deferred_image_count; i++) {
-            uint64_t distance = navigation_deferred_image_distance(
-                session, &page->deferred_image_targets[i], NULL, NULL);
-            if (distance < best_distance) {
-                best = i;
-                best_distance = distance;
-            }
-        }
-        if (best != page->deferred_image_cursor) {
-            ImagePriorityTarget swap =
-                page->deferred_image_targets[page->deferred_image_cursor];
-            page->deferred_image_targets[page->deferred_image_cursor] =
-                page->deferred_image_targets[best];
-            page->deferred_image_targets[best] = swap;
-            (void) navigation_deferred_image_distance(
-                session,
-                &page->deferred_image_targets[page->deferred_image_cursor],
-                &best_width, &best_height);
-        }
-        ImagePriorityTarget *target =
+        ImagePriorityTarget *current =
             &page->deferred_image_targets[page->deferred_image_cursor];
+        if (current->retry_delay != 0) {
+            current->retry_delay--;
+            return true;
+        }
+        const NavigationEntry *entry = navigation_current(session);
+        int scroll_y = entry == NULL ? 0 : entry->scroll_y;
+        uint16_t best_width = current->display_width;
+        uint16_t best_height = current->display_height;
+        /* The committed plan is already viewport ordered. Scan the remaining
+           layout boxes only when scrolling changes that order; doing this at
+           every request start made a long thumbnail queue O(targets*boxes)
+           once per image. A failed target is pinned until its retry resolves
+           so a scroll cannot transfer or bypass that target's retry. */
+        if (current->retry_count == 0
+            && (!page->deferred_image_rank_valid
+                || page->deferred_image_rank_scroll_y != scroll_y)) {
+            session->performance.background_image_rank_scans++;
+            size_t best = page->deferred_image_cursor;
+            uint64_t best_distance = navigation_deferred_image_distance(
+                session, &page->deferred_image_targets[best], scroll_y,
+                &best_width, &best_height);
+            for (size_t i = best + 1; i < page->deferred_image_count; i++) {
+                uint64_t distance = navigation_deferred_image_distance(
+                    session, &page->deferred_image_targets[i], scroll_y,
+                    NULL, NULL);
+                if (distance < best_distance) {
+                    best = i;
+                    best_distance = distance;
+                }
+            }
+            if (best != page->deferred_image_cursor) {
+                ImagePriorityTarget swap =
+                    page->deferred_image_targets[page->deferred_image_cursor];
+                page->deferred_image_targets[page->deferred_image_cursor] =
+                    page->deferred_image_targets[best];
+                page->deferred_image_targets[best] = swap;
+                (void) navigation_deferred_image_distance(
+                    session,
+                    &page->deferred_image_targets[
+                        page->deferred_image_cursor],
+                    scroll_y, &best_width, &best_height);
+            }
+            page->deferred_image_rank_scroll_y = scroll_y;
+            page->deferred_image_rank_valid = true;
+            current = &page->deferred_image_targets[
+                page->deferred_image_cursor];
+        }
+        ImagePriorityTarget *target = current;
         target->display_width = best_width;
         target->display_height = best_height;
+        /* The ordinary image count remains the successful-page budget. Add
+           back only attempts already lost to failure, so a failed visible
+           prefix does not crowd an offscreen thumbnail out while a large
+           document still cannot turn the retry rule into extra successes.
+           The image loader also clamps this value to its 128-node hard cap. */
+        size_t maximum_attempts = session->maximum_images;
+        if (page->images.stats.failed <= SIZE_MAX - maximum_attempts) {
+            maximum_attempts += page->images.stats.failed;
+        } else {
+            maximum_attempts = SIZE_MAX;
+        }
         page->deferred_image_job = images_priority_load_begin(
             &page->document, &page->stylesheet, &page->images, target,
             session->budget, page->resource_base_url, page->document_url,
-            page->referrer_policy, session->maximum_images,
+            page->referrer_policy, maximum_attempts,
             session->maximum_image_bytes,
             session->maximum_image_file_bytes,
             session->maximum_decoded_image_bytes,
             session->resource_timeout_ms, page->resource_scheduler,
             session->browser_session);
         if (page->deferred_image_job == NULL) {
-            session->performance.background_image_failures++;
-            navigation_deferred_images_finish(session);
+            navigation_deferred_image_failed(session, target);
             return true;
         }
     }
@@ -1082,9 +1135,14 @@ static bool navigation_run_deferred_image(NavigationSession *session)
     if (status == IMAGE_PRIORITY_LOAD_PENDING) return true;
     images_priority_load_destroy(page->deferred_image_job);
     page->deferred_image_job = NULL;
-    page->deferred_image_cursor++;
+    ImagePriorityTarget *target =
+        &page->deferred_image_targets[page->deferred_image_cursor];
     if (status == IMAGE_PRIORITY_LOAD_FAILED) {
-        session->performance.background_image_failures++;
+        navigation_deferred_image_failed(session, target);
+    } else {
+        target->retry_count = 0;
+        target->retry_delay = 0;
+        page->deferred_image_cursor++;
     }
     size_t added = page->images.stats.loaded >= loaded_before
         ? page->images.stats.loaded - loaded_before : 0;

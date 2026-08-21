@@ -1064,6 +1064,24 @@ static void psp_media_open_report(PspMediaSession *media, const char *event)
            video.bytes_received + audio.bytes_received,
            video.window_pending ? 1 : 0, audio.window_pending ? 1 : 0,
            video.bytes_in_flight, audio.bytes_in_flight);
+    YoutubeResolveJobMetrics resolver = {0};
+    if (youtube_resolve_job_metrics(media->resolver_job, &resolver)) {
+        FetchBackgroundTransportMetrics worker = {0};
+        (void) fetch_background_transport_metrics(&worker);
+        printf("tilefinch-media-resolver: phase=%s client=%zu attempts=%u "
+               "request=%d pumps=%zu chunks=%zu response=%zu/%ld "
+               "admission=%d waits=%zu slots=%zu/%zu/%zu "
+               "cancel-retired=%zu cached-identity=%d\n",
+               resolver.phase, resolver.client_index, resolver.attempts,
+               resolver.request_active ? 1 : 0,
+               resolver.request_pumps, resolver.request_chunks,
+               resolver.response_bytes, resolver.response_status,
+               (int) resolver.last_admission_status,
+               resolver.admission_deferrals,
+               worker.occupied_slots, worker.queued_slots,
+               worker.running_slots, worker.cancelled_retired,
+               resolver.cached_identity ? 1 : 0);
+    }
 }
 
 /*

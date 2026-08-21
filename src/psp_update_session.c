@@ -142,7 +142,8 @@ void psp_update_session_refresh_ui(
         TilefinchUpdateInstallSnapshot *snapshot =
             &update->install_snapshot;
         int progress = -1;
-        if (snapshot->phase == TILEFINCH_UPDATE_INSTALL_EXTRACTING
+        if ((snapshot->phase == TILEFINCH_UPDATE_INSTALL_VERIFYING
+             || snapshot->phase == TILEFINCH_UPDATE_INSTALL_EXTRACTING)
             && snapshot->bytes_total != 0) {
             progress = (int) (snapshot->bytes_processed * 1000u
                               / snapshot->bytes_total);
@@ -474,6 +475,13 @@ static bool psp_update_session_begin_install(
     size_t envelope_length = 0;
     const uint8_t *envelope = tilefinch_update_client_envelope(
         update->client, &envelope_length);
+    TilefinchUpdateDownloadedPackageProof download_proof;
+    bool have_download_proof = tilefinch_update_client_download_proof(
+        update->client, &download_proof);
+    psp_update_session_log(
+        "tilefinch-update-install: verification=%s table-bytes=%zu\n",
+        have_download_proof ? "download-proof" : "standalone-reread",
+        have_download_proof ? download_proof.table_length : 0u);
     TilefinchUpdateSlot inactive =
         update->state.active_slot == TILEFINCH_UPDATE_SLOT_A
         ? TILEFINCH_UPDATE_SLOT_B : TILEFINCH_UPDATE_SLOT_A;
@@ -490,7 +498,8 @@ static bool psp_update_session_begin_install(
         .trust = update->channel == BROWSER_UPDATE_CHANNEL_DEVELOPER
             ? TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED
             : TILEFINCH_UPDATE_TRUST_SIGNED,
-        .allow_downgrade = update->allow_downgrade
+        .allow_downgrade = update->allow_downgrade,
+        .download_proof = have_download_proof ? &download_proof : NULL
     };
     update->install_maximum_unit_us = 0;
     update->install_units = 0;

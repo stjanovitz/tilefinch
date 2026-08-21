@@ -179,6 +179,17 @@ TilefinchUpdateInstallJob *tilefinch_update_install_create(
         || strlen(options->package_path) >= 768
         || strlen(options->install_root) >= 768
         || strlen(options->data_dir) >= 768) return NULL;
+    bool have_download_proof = options->download_proof != NULL;
+    if (have_download_proof
+        && (options->download_proof->table == NULL
+            || options->download_proof->table_length < 16u
+            || options->download_proof->table_length
+                   > TILEFINCH_UPDATE_MAX_PACKAGE_TABLE_BYTES
+            || options->download_proof->package_size
+                   != options->manifest->package_size
+            || memcmp(options->download_proof->package_sha256,
+                      options->manifest->package_sha256, 32) != 0))
+        return NULL;
     TilefinchUpdateInstallJob *job = budget_calloc_category(
         budget, BUDGET_CATEGORY_SESSION, 1, sizeof(*job));
     if (job == NULL) return NULL;
@@ -187,7 +198,13 @@ TilefinchUpdateInstallJob *tilefinch_update_install_create(
         budget, BUDGET_CATEGORY_SESSION, INSTALL_IO_CHUNK);
     job->envelope = budget_malloc_category(
         budget, BUDGET_CATEGORY_SESSION, options->envelope_length);
-    if (job->buffer == NULL || job->envelope == NULL) {
+    if (have_download_proof) {
+        job->table_bytes = options->download_proof->table_length;
+        job->table = budget_malloc_category(
+            budget, BUDGET_CATEGORY_SESSION, job->table_bytes);
+    }
+    if (job->buffer == NULL || job->envelope == NULL
+        || (have_download_proof && job->table == NULL)) {
         tilefinch_update_install_destroy(job);
         return NULL;
     }
@@ -201,6 +218,16 @@ TilefinchUpdateInstallJob *tilefinch_update_install_create(
     job->state = options->current_state;
     job->fault = options->fault;
     job->fault_opaque = options->fault_opaque;
+    if (have_download_proof) {
+        memcpy(job->table, options->download_proof->table, job->table_bytes);
+        if (tilefinch_update_parse_package_table(
+                job->table, job->table_bytes,
+                options->manifest->package_size,
+                &job->package) != TILEFINCH_UPDATE_OK) {
+            tilefinch_update_install_destroy(job);
+            return NULL;
+        }
+    }
     snprintf(job->package_path, sizeof(job->package_path), "%s",
              options->package_path);
     snprintf(job->install_root, sizeof(job->install_root), "%s",
@@ -230,9 +257,23 @@ TilefinchUpdateInstallJob *tilefinch_update_install_create(
         tilefinch_update_install_destroy(job);
         return NULL;
     }
-    tilefinch_sha256_init(&job->package_sha);
-    job->phase = TILEFINCH_UPDATE_INSTALL_VERIFYING;
-    snprintf(job->message, sizeof(job->message), "VERIFYING DOWNLOAD...");
+    if (have_download_proof) {
+        struct stat package_info;
+        if (stat(job->package_path, &package_info) != 0
+            || !S_ISREG(package_info.st_mode)
+            || package_info.st_size < 0
+            || (uint64_t) package_info.st_size
+                   != options->manifest->package_size) {
+            tilefinch_update_install_destroy(job);
+            return NULL;
+        }
+        job->phase = TILEFINCH_UPDATE_INSTALL_PREPARING;
+        snprintf(job->message, sizeof(job->message), "PREPARING UPDATE...");
+    } else {
+        tilefinch_sha256_init(&job->package_sha);
+        job->phase = TILEFINCH_UPDATE_INSTALL_VERIFYING;
+        snprintf(job->message, sizeof(job->message), "VERIFYING DOWNLOAD...");
+    }
     return job;
 }
 

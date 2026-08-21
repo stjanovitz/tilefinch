@@ -627,7 +627,7 @@ void psp_report_background_transport_metrics(void)
            "fixed-starts=%zu peak-stream=%zu peak-fixed=%zu "
            "slots=%zu queued=%zu running=%zu complete=%zu "
            "performs=%zu polls=%zu headers=%zu bodies=%zu "
-           "completions=%zu multi=%d running=%d\n",
+           "completions=%zu cancel-retired=%zu multi=%d running=%d\n",
            metrics.streaming_started,
            metrics.fixed_started,
            metrics.peak_streaming_active,
@@ -641,6 +641,7 @@ void psp_report_background_transport_metrics(void)
            metrics.header_callbacks,
            metrics.body_callbacks,
            metrics.completions,
+           metrics.cancelled_retired,
            metrics.last_multi_code,
            metrics.last_running);
     printf("tilefinch-background-transport-worker: perform-max=%uus "

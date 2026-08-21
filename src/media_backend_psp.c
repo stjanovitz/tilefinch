@@ -396,6 +396,7 @@ typedef struct {
     atomic_int audio_worker_error;
     atomic_int audio_worker_stage;
     uint32_t audio_worker_next_health_us;
+    unsigned audio_decode_busy_retries;
     SceInt32 video_status;
     PspAvcDetail2 *video_detail;
     unsigned video_picture_count;
@@ -1242,18 +1243,23 @@ static void psp_media_commit_log(void)
 }
 
 /*
- * The failing stage and the moment it was last committed. Failures can repeat
- * per packet and per retry, and paying a card sync for each would turn a
- * diagnosable failure into a hang. Sync when the stage changes, and otherwise
- * at most once every few seconds. Both are atomics only so that a race
- * between the codec worker and the browser thread costs at most one extra
- * sync rather than a torn read; neither needs ordering.
+ * The failing stage and the moment a commit was last requested. Failures can
+ * repeat per packet and per retry, and paying a card sync for each would turn
+ * a diagnosable failure into a hang. Request one when the stage changes, and
+ * otherwise at most once every few seconds. The browser thread performs the
+ * actual sync after collecting the worker's result. Both are atomics only so
+ * a race costs at most one extra sync rather than a torn read.
  */
 #define PSP_MEDIA_FAILURE_SYNC_INTERVAL_US UINT32_C(3000000)
 static const char *_Atomic psp_media_failure_sync_stage;
 static _Atomic uint32_t psp_media_failure_sync_us;
+/* The physical validation log and its Memory Stick sync are process-global,
+   so simultaneous audio/video failures deliberately coalesce into one
+   pending commit. Both diagnostic lines are already in the RAM log buffer;
+   a second card sync would add wear and latency without preserving more. */
+static _Atomic bool psp_media_failure_sync_pending;
 
-static void psp_media_commit_failure_log(const char *stage)
+static void psp_media_schedule_failure_log_commit(const char *stage)
 {
     /* Every stage argument in this file is a string literal or a pointer
        into a static name table, so retaining it is safe and comparing the
@@ -1270,7 +1276,22 @@ static void psp_media_commit_failure_log(const char *stage)
     atomic_store_explicit(
         &psp_media_failure_sync_us, now_us == 0 ? 1u : now_us,
         memory_order_relaxed);
-    psp_media_commit_log();
+    /* A codec failure is normally reported by the codec worker. Never make
+       that worker wait for Memory Stick I/O before it can publish DONE: a
+       slow device sync can otherwise outlast the codec watchdog and turn a
+       returned firmware error into a false process-wide quarantine. The
+       browser-thread collector (or destroy as a final fallback) commits the
+       already-buffered line after ownership has crossed back. */
+    atomic_store_explicit(
+        &psp_media_failure_sync_pending, true, memory_order_release);
+}
+
+static void psp_media_commit_pending_failure_log(void)
+{
+    if (atomic_exchange_explicit(
+            &psp_media_failure_sync_pending, false,
+            memory_order_acq_rel))
+        psp_media_commit_log();
 }
 
 /*
@@ -1362,12 +1383,13 @@ static void psp_media_log_failure(
         psp_media_slot_free_count(backend->slots, PSP_MEDIA_SURFACE_SLOTS),
         backend->reading_slot,
         (unsigned long long) backend->session_epoch);
-    psp_media_commit_failure_log(stage);
+    psp_media_schedule_failure_log_commit(stage);
 }
 #else
 #define psp_media_log(...) ((void) 0)
 #define psp_media_log_failure(...) ((void) 0)
 #define psp_media_commit_log() ((void) 0)
+#define psp_media_commit_pending_failure_log() ((void) 0)
 #endif
 
 /*
@@ -4041,6 +4063,23 @@ static MediaBackendResult psp_media_decode_one_audio_au(
     sceKernelDcacheInvalidateRange(
         backend->audio_pcm, PSP_MEDIA_AUDIO_PCM_BYTES);
     if (status < 0) {
+        /* The firmware can transiently report BUSY even though all Tilefinch
+           calls are serialized through one worker. The current AU remains
+           staged until audio_staged_index advances, so yielding it back to
+           the ordinary end-of-visit flush retries exactly that AU without a
+           second allocation or a new ownership state. Bound the incident: a
+           persistent refusal remains a real decoder failure. */
+        if ((uint32_t) status == PSP_MEDIA_ERROR_BUSY
+            && backend->audio_decode_busy_retries < 2u) {
+            backend->audio_decode_busy_retries++;
+            psp_media_log(
+                "tilefinch-media-decoder: event=aac-busy-retry "
+                "attempt=%u/2 staged=%u/%u",
+                backend->audio_decode_busy_retries,
+                backend->audio_staged_index,
+                backend->audio_staged_count);
+            return MEDIA_BACKEND_WOULD_BLOCK;
+        }
         backend->stats.last_native_error = status;
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
         /*
@@ -4072,6 +4111,12 @@ static MediaBackendResult psp_media_decode_one_audio_au(
             error, error_size, "AAC decode: 0x%08X",
             (unsigned) status);
         return MEDIA_BACKEND_ERROR;
+    }
+    if (backend->audio_decode_busy_retries != 0u) {
+        psp_media_log(
+            "tilefinch-media-decoder: event=aac-busy-recovered attempts=%u",
+            backend->audio_decode_busy_retries);
+        backend->audio_decode_busy_retries = 0u;
     }
     backend->stats.submitted_audio_packets++;
     backend->stats.decoded_audio_samples += PSP_MEDIA_AUDIO_SAMPLES;
@@ -4649,7 +4694,10 @@ static int psp_media_collect_codec_job(
         atomic_store_explicit(
             &backend->codec_completion_state,
             PSP_MEDIA_CODEC_COMPLETION_EMPTY, memory_order_release);
-        if (completion_result < 0) return -1;
+        if (completion_result < 0) {
+            psp_media_commit_pending_failure_log();
+            return -1;
+        }
     }
     int state = atomic_load_explicit(
         &backend->codec_job_state, memory_order_acquire);
@@ -4757,6 +4805,7 @@ static int psp_media_collect_codec_job(
                    caller stops the session; destroy then either observes its
                    genuine completion or quarantines the still-running
                    firmware owner. */
+                psp_media_commit_pending_failure_log();
                 return -1;
             }
         }
@@ -4776,8 +4825,11 @@ static int psp_media_collect_codec_job(
         memory_order_release);
     (void) psp_media_prepared_reopen_closed(
         &backend->codec_prepared_state);
-    return psp_media_account_codec_completion(
+    int completion_result = psp_media_account_codec_completion(
         backend, &completion, error, error_size);
+    if (completion_result < 0)
+        psp_media_commit_pending_failure_log();
+    return completion_result;
 }
 
 static bool psp_media_prepared_pair_allowed(
@@ -5986,6 +6038,10 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
        decoded it, and a post-seek job must never carry a pre-seek unit. */
     backend->audio_staged_count = 0u;
     backend->audio_staged_index = 0u;
+    /* A hard BUSY verdict ends the current retry incident. Reset/recovery
+       discards that staged AU, so a later, unrelated firmware BUSY must get
+       its own bounded allowance rather than inheriting the exhausted count. */
+    backend->audio_decode_busy_retries = 0u;
     backend->audio_pending_read = 0u;
     backend->audio_pending_write = 0u;
     backend->audio_pending_since_us = 0u;
@@ -7019,6 +7075,9 @@ static void psp_media_destroy(void *opaque)
     backend->admissions_closed = true;
     psp_media_cancel_prepared_job(backend);
     atomic_store(&backend->playing, false);
+    /* Covers failures raised by main-thread setup paths as well as the codec
+       collector. The codec worker never performs card I/O itself. */
+    psp_media_commit_pending_failure_log();
     /* Before the teardown ladder, which can quarantine and never return the
        memory: the recording is worth more than the buffer it sits in. */
     psp_media_au_dump_flush();

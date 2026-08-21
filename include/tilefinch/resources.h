@@ -278,7 +278,16 @@ typedef struct {
     uint16_t display_height;
     uint8_t kind;
     uint8_t pseudo;
+    /* Continuation-local failure state travels with the target when the
+       remaining queue is re-ranked after a scroll. These bytes occupy the
+       structure's existing alignment tail on both PSP and host builds. */
+    uint8_t retry_count;
+    uint8_t retry_delay;
 } ImagePriorityTarget;
+
+_Static_assert(
+    sizeof(ImagePriorityTarget) == 2u * sizeof(void *) + 8u,
+    "deferred image retry state must not grow priority targets");
 
 typedef enum {
     IMAGE_PRIORITY_LOAD_PENDING = 0,

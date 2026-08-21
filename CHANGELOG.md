@@ -8,6 +8,16 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.8 — 2026-08-21
+
+- Made in-app updates faster while retaining complete package and file
+  verification.
+- Improved YouTube startup when thumbnails or abandoned page requests are
+  still using the shared network worker.
+- Improved deferred image loading and recovery after transient failures,
+  with less browser-thread work while a page is open.
+- Improved playback recovery from transient PSP audio-decoder refusals.
+
 ## 0.1.7 — 2026-08-21
 
 - Improved mobile page fidelity across responsive headers, forms, flex and

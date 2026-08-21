@@ -144,6 +144,8 @@ typedef struct {
     size_t deferred_image_count;
     size_t deferred_image_cursor;
     ImagePriorityLoadJob *deferred_image_job;
+    int deferred_image_rank_scroll_y;
+    bool deferred_image_rank_valid;
     bool loaded;
     NavigationFrame frames[NAVIGATION_FRAME_LIMIT];
     size_t frame_count;
@@ -361,6 +363,7 @@ typedef struct {
     size_t stylesheet_pressure_fallbacks;
     size_t image_pressure_fallbacks;
     size_t background_image_batches;
+    size_t background_image_rank_scans;
     size_t background_images_loaded;
     size_t background_image_relayouts;
     size_t background_image_failures;

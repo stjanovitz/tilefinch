@@ -16,6 +16,7 @@ def render(lab: Path, metadata_path: Path, output: Path, timeout: int) -> str:
     command = [
         str(lab), "--url", metadata["url"], "--fetch-scripts",
         "--ticks", "100", "--tick-ms", "33", "--limit-mb", "28",
+        "--pace-real-time",
         "--script-timeout-ms", "10000", "--script-heap-mb", "8",
         "--script-total-mb", "24", "--script-file-kb", "512",
         "--script-count", "48", "--max-download-kb", "4096",

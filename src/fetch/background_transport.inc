@@ -245,6 +245,7 @@ typedef struct {
     atomic_uint header_callbacks;
     atomic_uint body_callbacks;
     atomic_uint completions;
+    atomic_uint cancelled_retired;
     atomic_uint worker_perform_max_us;
     atomic_uint worker_perform_over_33ms;
     atomic_uint worker_perform_over_100ms;
@@ -1349,6 +1350,69 @@ static void fetch_background_collect_messages(void)
     }
 }
 
+static void fetch_background_retire_cancelled(void)
+{
+    /* Cancellation is requested from the browser thread, but curl ownership
+       belongs exclusively to this worker. Do not wait for a progress
+       callback: libcurl may be inside DNS/TCP/TLS setup, where PSP builds do
+       not call that callback at all. Removing the handle here promptly frees
+       the descriptor and buffer for the foreground media resolver. */
+    for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++) {
+        FetchBackgroundSlot *slot = &fetch_background.slots[i];
+        if (atomic_load_explicit(
+                &slot->state, memory_order_acquire)
+                != FETCH_BACKGROUND_SLOT_RUNNING
+            || atomic_load_explicit(
+                   &slot->cancel_requested, memory_order_acquire) == 0) {
+            continue;
+        }
+        /* A browser-thread chunk copy is the only reader outside curl. Claim
+           a published chunk with the same READY -> TAKING transition as that
+           reader before clearing it. Merely observing "not TAKING" is not
+           sufficient: the browser could win READY between that observation
+           and the clear, leaving cancellation to overwrite its memcpy source.
+           A failed claim that reports TAKING is therefore deferred one worker
+           turn; EMPTY is already exclusively worker-owned. */
+        if (slot->streaming) {
+            int chunk = atomic_load_explicit(
+                &slot->chunk_state, memory_order_acquire);
+            bool claimed_ready = false;
+            if (chunk == FETCH_BACKGROUND_CHUNK_READY) {
+                int expected = FETCH_BACKGROUND_CHUNK_READY;
+                claimed_ready = atomic_compare_exchange_strong_explicit(
+                        &slot->chunk_state, &expected,
+                        FETCH_BACKGROUND_CHUNK_TAKING,
+                        memory_order_acq_rel, memory_order_acquire);
+                chunk = claimed_ready
+                    ? FETCH_BACKGROUND_CHUNK_TAKING : expected;
+            }
+            if (chunk == FETCH_BACKGROUND_CHUNK_TAKING && !claimed_ready)
+                continue;
+            if (claimed_ready) {
+                slot->length = 0;
+                atomic_store_explicit(
+                    &slot->chunk_bytes, 0u, memory_order_release);
+                atomic_store_explicit(
+                    &slot->chunk_state, FETCH_BACKGROUND_CHUNK_EMPTY,
+                    memory_order_release);
+            }
+        }
+        fetch_background_slot_release_curl(slot);
+        slot->length = 0;
+        slot->transfer_done = true;
+        atomic_store_explicit(
+            &slot->chunk_bytes, 0u, memory_order_release);
+        atomic_store_explicit(
+            &slot->chunk_state, FETCH_BACKGROUND_CHUNK_EMPTY,
+            memory_order_release);
+        fetch_background_publish_complete(
+            slot, false, CURLE_ABORTED_BY_CALLBACK);
+        (void) atomic_fetch_add_explicit(
+            &fetch_background.cancelled_retired, 1u,
+            memory_order_relaxed);
+    }
+}
+
 static void fetch_background_resume_streams(void)
 {
     for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++) {
@@ -1478,6 +1542,7 @@ static int fetch_background_worker_main(SceSize args, void *argp)
         uint64_t service_started_us = loop_started_us;
 #endif
         fetch_background_service_preconnect();
+        fetch_background_retire_cancelled();
         fetch_background_resume_streams();
         fetch_background_start_queued();
         fetch_background_expire_active_deadlines();
@@ -1554,6 +1619,7 @@ static int fetch_background_worker_main(SceSize args, void *argp)
 #endif
         fetch_background_collect_messages();
         fetch_background_service_preconnect();
+        fetch_background_retire_cancelled();
         fetch_background_resume_streams();
         fetch_background_start_queued();
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -1677,6 +1743,7 @@ bool fetch_background_transport_initialize(Budget *budget)
     atomic_init(&fetch_background.header_callbacks, 0u);
     atomic_init(&fetch_background.body_callbacks, 0u);
     atomic_init(&fetch_background.completions, 0u);
+    atomic_init(&fetch_background.cancelled_retired, 0u);
     atomic_init(&fetch_background.worker_perform_max_us, 0u);
     atomic_init(&fetch_background.worker_perform_over_33ms, 0u);
     atomic_init(&fetch_background.worker_perform_over_100ms, 0u);
@@ -2375,6 +2442,8 @@ bool fetch_background_transport_metrics(
             &fetch_background.body_callbacks, memory_order_relaxed),
         .completions = atomic_load_explicit(
             &fetch_background.completions, memory_order_relaxed),
+        .cancelled_retired = atomic_load_explicit(
+            &fetch_background.cancelled_retired, memory_order_relaxed),
         .worker_perform_max_us = atomic_load_explicit(
             &fetch_background.worker_perform_max_us, memory_order_relaxed),
         .worker_perform_over_33ms = atomic_load_explicit(

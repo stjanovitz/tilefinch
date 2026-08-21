@@ -107,6 +107,20 @@ typedef enum {
     YOUTUBE_RESOLVE_JOB_FAILED
 } YoutubeResolveJobStatus;
 
+typedef struct {
+    const char *phase;
+    size_t client_index;
+    unsigned attempts;
+    size_t request_pumps;
+    size_t request_chunks;
+    size_t admission_deferrals;
+    int last_admission_status;
+    size_t response_bytes;
+    long response_status;
+    bool request_active;
+    bool cached_identity;
+} YoutubeResolveJobMetrics;
+
 /*
  * PSP-native pumpable resolver. Network production occurs on the bounded
  * transport worker; each pump consumes at most one response chunk or one
@@ -121,6 +135,8 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job);
 bool youtube_resolve_job_take(
     YoutubeResolveJob *job, YoutubeStream *stream);
 const char *youtube_resolve_job_error(const YoutubeResolveJob *job);
+bool youtube_resolve_job_metrics(
+    const YoutubeResolveJob *job, YoutubeResolveJobMetrics *metrics);
 void youtube_resolve_job_cancel(YoutubeResolveJob *job, const char *reason);
 void youtube_resolve_job_destroy(YoutubeResolveJob *job);
 
