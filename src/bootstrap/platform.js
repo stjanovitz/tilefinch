@@ -4597,8 +4597,10 @@
           type.includes("mp4a"))
       )
         return "probably";
-      if (type.startsWith("audio/mp4") && type.includes("mp4a"))
-        return "probably";
+      if (type.startsWith("audio/mp4")) {
+        if (!type.includes("codecs=")) return "maybe";
+        if (type.includes("mp4a")) return "probably";
+      }
       return "";
     };
     HTMLMediaElement.prototype.load = function () {
@@ -4934,20 +4936,23 @@
       if (item.capture !== capture) continue;
       event.__passive = item.passive;
       try {
-        if (typeof item.callback === "function")
+        if (typeof item.callback === "function") {
+          globalThis.__tilefinchRecordEventHandler();
           globalThis.__tilefinchRunTask(
             "event:" + String(event.type),
             item.callback,
             target,
             [event],
           );
-        else if (typeof item.callback.handleEvent === "function")
+        } else if (typeof item.callback.handleEvent === "function") {
+          globalThis.__tilefinchRecordEventHandler();
           globalThis.__tilefinchRunTask(
             "event-object:" + String(event.type),
             item.callback.handleEvent,
             item.callback,
             [event],
           );
+        }
       } catch (error) {
         __tilefinchReportUncaught(error, "event " + event.type);
       } finally {
@@ -5019,6 +5024,7 @@
       const handler = document["on" + event.type];
       if (typeof handler === "function")
         try {
+          globalThis.__tilefinchRecordEventHandler();
           globalThis.__tilefinchRunTask(
             "document-handler:" + String(event.type),
             handler,
@@ -5965,6 +5971,7 @@
       const handler = globalThis["on" + event.type];
       if (typeof handler === "function")
         try {
+          globalThis.__tilefinchRecordEventHandler();
           globalThis.__tilefinchRunTask(
             "window-handler:" + String(event.type),
             handler,
@@ -6524,8 +6531,7 @@
         if (name === "pointer" || name === "any-pointer")
           return value === "coarse" || value === "";
         if (name === "prefers-color-scheme") return value === "light";
-        if (name === "prefers-reduced-motion")
-          return value === "no-preference";
+        if (name === "prefers-reduced-motion") return value === "reduce";
         if (name === "prefers-contrast") return value === "no-preference";
         if (name === "color") return value === "" || Number(value) <= 8;
         if (name === "monochrome") return value === "0";

@@ -2200,7 +2200,7 @@ StylePaintStack style_paint_stack_copy(
 }
 
 static StylePaintBox style_parse_paint_box_keyword(
-    const char *text, size_t length, bool *valid)
+    const char *text, size_t length, bool allow_text, bool *valid)
 {
     while (length != 0 && isspace((unsigned char) *text)) {
         text++;
@@ -2218,6 +2218,9 @@ static StylePaintBox style_parse_paint_box_keyword(
     }
     if (length == 11 && memcmp(text, "content-box", 11) == 0) {
         return STYLE_PAINT_BOX_CONTENT;
+    }
+    if (allow_text && length == 4 && memcmp(text, "text", 4) == 0) {
+        return STYLE_PAINT_BOX_TEXT;
     }
     *valid = false;
     return STYLE_PAINT_BOX_BORDER;
@@ -2246,7 +2249,7 @@ bool style_parse_background_box(Stylesheet *sheet, const char *text,
                                    &cursor, &start, &end)) {
         bool valid = false;
         StylePaintBox box = style_parse_paint_box_keyword(
-            resolved + start, end - start, &valid);
+            resolved + start, end - start, set_clip && !set_origin, &valid);
         if (!valid) return false;
         if (layer >= stack.background_count) {
             /* A longhand list may introduce geometry for layers not yet
@@ -2476,7 +2479,7 @@ bool style_parse_mask_shorthand(Stylesheet *sheet, const char *text,
             const char *token = resolved + token_start;
             bool valid_box = false;
             StylePaintBox box = style_parse_paint_box_keyword(
-                token, token_length, &valid_box);
+                token, token_length, false, &valid_box);
             if (valid_box) {
                 /* The renderer's bounded mask path currently uses the
                    border box. Accept only that initial shorthand value;
@@ -2954,7 +2957,8 @@ static void style_parse_background_layer_shorthand_geometry(
 
 bool style_parse_background_shorthand_image(Stylesheet *sheet,
                                             const char *text, size_t length,
-                                            ComputedStyle *style)
+                                            ComputedStyle *style,
+                                            bool reset_geometry)
 {
     if (style == NULL) return false;
     char resolved[512];
@@ -2969,7 +2973,8 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
     size_t chosen_layer = SIZE_MAX;
     bool chosen_found = false;
     size_t gradient_count = 0;
-    StylePaintStack stack = style_paint_stack_copy(sheet, style);
+    StylePaintStack previous = style_paint_stack_copy(sheet, style);
+    StylePaintStack stack = previous;
     memset(stack.backgrounds, 0, sizeof(stack.backgrounds));
     stack.background_count = 0;
     stack.components |= STYLE_PAINT_COMPONENT_BACKGROUND_IMAGE;
@@ -2978,6 +2983,20 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
                                 &seg_start, &seg_end)) {
         size_t layer_index = layer_count;
         layer_count++;
+        if (layer_index < STYLE_PAINT_LAYER_LIMIT) {
+            StylePaintLayer retained = {0};
+            if (!reset_geometry && previous.background_count != 0) {
+                retained = previous.backgrounds[
+                    layer_index % previous.background_count];
+            } else {
+                retained.origin = STYLE_PAINT_BOX_PADDING;
+                retained.clip = STYLE_PAINT_BOX_BORDER;
+            }
+            retained.kind = STYLE_PAINT_IMAGE_NONE;
+            retained.image = NULL;
+            retained.gradient = (StyleGradient) {0};
+            stack.backgrounds[layer_index] = retained;
+        }
         StyleGradient candidate = {0};
         if (style_parse_gradient(sheet, resolved + seg_start,
                                  seg_end - seg_start, &candidate)) {
@@ -2986,8 +3005,6 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
                 StylePaintLayer *paint = &stack.backgrounds[layer_index];
                 paint->kind = STYLE_PAINT_IMAGE_GRADIENT;
                 paint->gradient = candidate;
-                paint->origin = STYLE_PAINT_BOX_PADDING;
-                paint->clip = STYLE_PAINT_BOX_BORDER;
                 stack.background_count = (uint8_t) (layer_index + 1u);
             }
         }
@@ -3008,8 +3025,6 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
                             ? STYLE_PAINT_IMAGE_NONE
                             : STYLE_PAINT_IMAGE_URL;
                         paint->image = url;
-                        paint->origin = STYLE_PAINT_BOX_PADDING;
-                        paint->clip = STYLE_PAINT_BOX_BORDER;
                         stack.background_count =
                             (uint8_t) (layer_index + 1u);
                     }
@@ -4499,7 +4514,10 @@ bool style_parse_grid_track(const Stylesheet *sheet, const char *text,
     double number = strtod(token, &end);
     while (end != NULL && isspace((unsigned char) *end)) end++;
     if (end != NULL && end != token && strcmp(end, "fr") == 0) {
-        if (number < 0.001) number = 0.001;
+        if (number < 0.0) return false;
+        /* Zero is meaningful: accordions and carousels commonly animate
+           grid rows between 0fr and 1fr to collapse overflow exactly. */
+        if (number > 0.0 && number < 0.001) number = 0.001;
         if (number > 65.535) number = 65.535;
         *type = GRID_TRACK_FLEX;
         *value = (unsigned) (number * 1000.0 + 0.5);

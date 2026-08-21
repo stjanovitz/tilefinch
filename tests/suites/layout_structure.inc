@@ -1424,6 +1424,50 @@ static int test_bounded_large_layout_values(Budget *budget)
     CHECK(budget->current == 0);
     return 0;
 }
+
+static int test_flex_basis_accumulation_saturates(Budget *budget)
+{
+    enum { CHILD_COUNT = 2060, EXTENT_LIMIT = 1048575 };
+    static const char prefix[] =
+        "<!doctype html><style>body{margin:0}#wide{display:flex;width:480px}"
+        "#wide i{display:block;flex:0 0 1048575px;height:1px}"
+        "</style><body><div id=wide>";
+    static const char child[] = "<i></i>";
+    static const char suffix[] = "</div></body>";
+    size_t length = sizeof(prefix) - 1u
+        + CHILD_COUNT * (sizeof(child) - 1u) + sizeof(suffix) - 1u;
+    char *page = malloc(length + 1u);
+    CHECK(page != NULL);
+    size_t at = 0;
+    memcpy(page + at, prefix, sizeof(prefix) - 1u);
+    at += sizeof(prefix) - 1u;
+    for (size_t i = 0; i < CHILD_COUNT; i++) {
+        memcpy(page + at, child, sizeof(child) - 1u);
+        at += sizeof(child) - 1u;
+    }
+    memcpy(page + at, suffix, sizeof(suffix));
+    at += sizeof(suffix) - 1u;
+    CHECK(at == length);
+
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, length, 263)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    for (size_t i = 0; i < layout.node_box_count; i++) {
+        const LayoutNodeBox *box = &layout.node_boxes[i];
+        CHECK(box->x >= -EXTENT_LIMIT && box->x <= EXTENT_LIMIT
+              && box->width >= 0 && box->width <= EXTENT_LIMIT);
+    }
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    free(page);
+    CHECK(budget->current == 0);
+    return 0;
+}
 static int test_table_and_control_ua_box_models(Budget *budget)
 {
     static const char page[] =
@@ -1433,6 +1477,8 @@ static int test_table_and_control_ua_box_models(Budget *budget)
         "#wide-input{width:90%}</style><body>"
         "<table id=full-table><tr><td>TABLE</td></tr></table>"
         "<div id=control-line>Long label: <input id=wide-input></div>"
+        "<div><input id=size-input size=35>"
+        "<input id=search-submit type=submit value=Search></div>"
         "</body>";
     PocDocument document = {0};
     Stylesheet sheet = {0};
@@ -1444,13 +1490,20 @@ static int test_table_and_control_ua_box_models(Budget *budget)
     lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
     lxb_dom_node_t *table = find_id(root, "full-table");
     lxb_dom_node_t *input = find_id(root, "wide-input");
+    lxb_dom_node_t *size_input = find_id(root, "size-input");
+    lxb_dom_node_t *search_submit = find_id(root, "search-submit");
     const LayoutNodeBox *table_box = layout_box_for_node(&layout, table);
     const DrawCommand *label = text_command(&layout, "label:");
     const ControlRegion *input_control = NULL;
+    const ControlRegion *size_control = NULL;
+    const ControlRegion *submit_control = NULL;
     for (size_t i = 0; i < layout.control_count; i++) {
         if (layout.controls[i].node == input) {
             input_control = &layout.controls[i];
-            break;
+        } else if (layout.controls[i].node == size_input) {
+            size_control = &layout.controls[i];
+        } else if (layout.controls[i].node == search_submit) {
+            submit_control = &layout.controls[i];
         }
     }
     ComputedStyle table_style = style_for_node(&sheet, table, NULL);
@@ -1464,7 +1517,69 @@ static int test_table_and_control_ua_box_models(Budget *budget)
           && label != NULL && input_control != NULL
           && input_control->y > label->y
           && input_control->x == 24 && input_control->width == 432
-          && input_control->height == 22);
+          && input_control->height == 22
+          && size_control != NULL && size_control->width == 257
+          && submit_control != NULL && submit_control->width == 58);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_all_inherit_and_static_action_shell(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>"
+        ".parent{display:flex;flex-direction:column;align-items:center;"
+        "color:#123456}.child{all:inherit;color:#654321}"
+        ".module-loading{display:none;position:fixed;top:0}"
+        ".column{display:flex;flex-direction:column;align-items:center;"
+        "position:relative;width:200px;height:100px}"
+        ".absolute{position:absolute;bottom:0;width:40px;height:10px}"
+        ".fixed-outer{position:fixed;top:20px;width:80px;height:20px}"
+        ".fixed-inner{position:fixed;top:20px;width:30px;height:10px}"
+        "</style><body><div id=parent class=parent>"
+        "<div id=child class=child>child</div></div>"
+        "<div id=action class=module-loading><button>Menu</button></div>"
+        "<div id=spinner class=module-loading>Loading</div>"
+        "<div id=column class=column><div id=absolute class=absolute>A</div>"
+        "</div><div class=fixed-outer>outer"
+        "<span class=fixed-inner>inner</span></div></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1u, 19)
+          && stylesheet_build(&sheet, budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *parent = find_id(root, "parent");
+    lxb_dom_node_t *child = find_id(root, "child");
+    lxb_dom_node_t *action = find_id(root, "action");
+    lxb_dom_node_t *spinner = find_id(root, "spinner");
+    ComputedStyle parent_style = style_for_node(&sheet, parent, NULL);
+    ComputedStyle child_style = style_for_node(
+        &sheet, child, &parent_style);
+    ComputedStyle action_before = style_for_node(&sheet, action, NULL);
+    CHECK(parent != NULL && child != NULL && action != NULL && spinner != NULL
+          && child_style.display == DISPLAY_FLEX
+          && child_style.flex_direction == FLEX_COLUMN
+          && child_style.align_items == ALIGN_CENTER
+          && child_style.color == 0x654321
+          && action_before.display == DISPLAY_NONE);
+    stylesheet_enable_static_custom_element_fallback(&sheet);
+    ComputedStyle action_after = style_for_node(&sheet, action, NULL);
+    ComputedStyle spinner_after = style_for_node(&sheet, spinner, NULL);
+    CHECK(action_after.display == DISPLAY_BLOCK
+          && spinner_after.display == DISPLAY_NONE
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    const LayoutNodeBox *column_box = layout_box_for_node(
+        &layout, find_id(root, "column"));
+    const LayoutNodeBox *absolute_box = layout_box_for_node(
+        &layout, find_id(root, "absolute"));
+    CHECK(column_box != NULL && absolute_box != NULL);
+    CHECK(absolute_box->x
+          == column_box->x + (column_box->width - absolute_box->width) / 2);
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -1951,6 +2066,7 @@ static int test_overflow_wrap_correctness(Budget *budget)
         "#break-line{width:140px;word-wrap:BrEaK-WoRd}"
         "#overlong,#nowrap{width:40px;word-wrap:break-word}"
         "#nowrap{white-space:nowrap}"
+        "#nowrap-group-line{width:80px}#nowrap-group{white-space:nowrap}"
         ".minimum{display:flex;width:80px}"
         ".minimum>.target{display:block;flex:1 1 0}"
         ".minimum>.fixed{display:block;flex:0 0 40px;width:40px;min-width:0}"
@@ -1964,6 +2080,8 @@ static int test_overflow_wrap_correctness(Budget *budget)
         "BBBBBBBBBB</span></div>"
         "<div id=overlong class=wrap>CCCCCCCCCCCC</div>"
         "<div id=nowrap class=wrap>DDDDDDDDDDDD</div>"
+        "<div id=nowrap-group-line class=wrap>AAAA "
+        "<span id=nowrap-group>BBBB GGGG</span></div>"
         "<div class=minimum><span id=any-item class=target>EEEEE</span>"
         "<span class=fixed></span></div>"
         "<div class=minimum><span id=break-item class=target>FFFFF</span>"
@@ -1984,13 +2102,16 @@ static int test_overflow_wrap_correctness(Budget *budget)
     lxb_dom_node_t *inherited = find_id(root, "inherited");
     lxb_dom_node_t *overlong = find_id(root, "overlong");
     lxb_dom_node_t *nowrap = find_id(root, "nowrap");
+    lxb_dom_node_t *nowrap_group_line = find_id(
+        root, "nowrap-group-line");
     lxb_dom_node_t *any_item = find_id(root, "any-item");
     lxb_dom_node_t *break_item = find_id(root, "break-item");
     lxb_dom_node_t *invalid = find_id(root, "invalid");
     lxb_dom_node_t *invalid_only = find_id(root, "invalid-only");
     lxb_dom_node_t *normal = find_id(root, "normal");
     CHECK(break_line != NULL && inherited != NULL && overlong != NULL
-          && nowrap != NULL && any_item != NULL && break_item != NULL
+          && nowrap != NULL && nowrap_group_line != NULL
+          && any_item != NULL && break_item != NULL
           && invalid != NULL && invalid_only != NULL && normal != NULL);
 
     ComputedStyle break_line_style = style_for_node(
@@ -2017,6 +2138,8 @@ static int test_overflow_wrap_correctness(Budget *budget)
     const LayoutNodeBox *overlong_box = layout_box_for_node(
         &layout, overlong);
     const LayoutNodeBox *nowrap_box = layout_box_for_node(&layout, nowrap);
+    const LayoutNodeBox *nowrap_group_line_box = layout_box_for_node(
+        &layout, nowrap_group_line);
     const LayoutNodeBox *any_item_box = layout_box_for_node(
         &layout, any_item);
     const LayoutNodeBox *break_item_box = layout_box_for_node(
@@ -2025,8 +2148,11 @@ static int test_overflow_wrap_correctness(Budget *budget)
     const DrawCommand *next_word = text_command(&layout, "BBBBBBBBBB");
     const DrawCommand *nowrap_word = text_command(
         &layout, "DDDDDDDDDDDD");
+    const DrawCommand *group_prefix = text_command(&layout, "AAAA");
+    const DrawCommand *group_first = text_command(&layout, "BBBB");
     CHECK(break_line_box != NULL && overlong_box != NULL
-          && nowrap_box != NULL && any_item_box != NULL
+          && nowrap_box != NULL && nowrap_group_line_box != NULL
+          && any_item_box != NULL
           && break_item_box != NULL && prefix != NULL && next_word != NULL
           && next_word->x == break_line_box->x
           && next_word->y > prefix->y
@@ -2034,7 +2160,10 @@ static int test_overflow_wrap_correctness(Budget *budget)
              <= break_line_box->x + break_line_box->width
           && nowrap_word != NULL
           && nowrap_word->x + nowrap_word->width
-             > nowrap_box->x + nowrap_box->width);
+             > nowrap_box->x + nowrap_box->width
+          && group_prefix != NULL && group_first != NULL
+          && group_first->x == nowrap_group_line_box->x
+          && group_first->y > group_prefix->y);
 
     size_t overlong_pieces = 0;
     bool overlong_contained = true;

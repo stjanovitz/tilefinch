@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(psp_browser_tilefinch VERSION 0.1.6 LANGUAGES C)
+project(psp_browser_tilefinch VERSION 0.1.7 LANGUAGES C)
 
-set(TILEFINCH_RELEASE_SEQUENCE "8" CACHE STRING
+set(TILEFINCH_RELEASE_SEQUENCE "9" CACHE STRING
     "Monotonic signed release sequence compiled into this build")
 set(TILEFINCH_UPDATE_ROOT_V1 "" CACHE FILEPATH
     "Public binary Tilefinch root-v1 metadata embedded into updater builds")

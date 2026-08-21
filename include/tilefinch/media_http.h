@@ -45,6 +45,9 @@ typedef struct {
     /* Ordinary HTML media uses the HTTP Range header. Provider streams keep
        the historical query-range form because that is the URL they sign. */
     bool standard_range_header;
+    /* Select the request representation for an audio-only source. This does
+       not change the common range/cache machinery or its bounds. */
+    bool audio_only;
     /* When non-NULL, build every range through the page request-authority
        boundary. The prepared envelope is retained by the range object, not
        rebuilt on the playback hot path. */
@@ -337,6 +340,10 @@ MediaHttpRange *media_http_range_create(
     Budget *budget, BrowserSession *session, const char *url,
     uint64_t content_length, const MediaHttpRangeOptions *options,
     char *error, size_t error_size);
+/* Admit the first metadata window without waiting for it. This is a hint, not
+   a new failure boundary: a deferred worker descriptor is retried by the
+   ordinary blocking metadata read. */
+bool media_http_range_prefetch_metadata(MediaHttpRange *range);
 MediaRangeReader media_http_range_reader(MediaHttpRange *range);
 /*
  * Whether the whole of [offset, offset + length) sits in the window loaded

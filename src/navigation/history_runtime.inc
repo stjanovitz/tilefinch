@@ -1248,6 +1248,7 @@ static void navigation_accumulate_script_metrics(
     session->script_failed += metrics->failed;
     session->script_skipped_cross_origin += metrics->skipped_cross_origin;
     session->script_skipped_module += metrics->skipped_module;
+    session->script_skipped_nomodule += metrics->skipped_nomodule;
     session->script_skipped_quota += metrics->skipped_quota;
     session->script_skipped_pressure += metrics->skipped_pressure;
     session->script_pressure_collections += metrics->pressure_collections;
@@ -1499,7 +1500,18 @@ bool navigation_execute_document_scripts_streaming_from(
         return false;
     }
     navigation_accumulate_script_metrics(session, &metrics);
-    bool relayout = script_runtime_consume_relayout(session->page.runtime);
+    bool static_shell_changed = false;
+    if (metrics.failed != 0 || metrics.skipped_quota != 0
+        || metrics.skipped_pressure != 0
+        || metrics.cost_class_rejections != 0) {
+        stylesheet_enable_static_custom_element_fallback(
+            &session->page.stylesheet);
+        static_shell_changed = document_install_static_shell_fallback(
+            &session->page.document);
+    }
+    bool runtime_relayout = script_runtime_consume_relayout(
+        session->page.runtime);
+    bool relayout = static_shell_changed || runtime_relayout;
     return (!relayout || navigation_relayout(session))
         && navigation_load_frames(session, entry->url);
 }
@@ -1546,7 +1558,18 @@ bool navigation_execute_document_scripts_from(
         return false;
     }
     navigation_accumulate_script_metrics(session, &metrics);
-    bool relayout = script_runtime_consume_relayout(session->page.runtime);
+    bool static_shell_changed = false;
+    if (metrics.failed != 0 || metrics.skipped_quota != 0
+        || metrics.skipped_pressure != 0
+        || metrics.cost_class_rejections != 0) {
+        stylesheet_enable_static_custom_element_fallback(
+            &session->page.stylesheet);
+        static_shell_changed = document_install_static_shell_fallback(
+            &session->page.document);
+    }
+    bool runtime_relayout = script_runtime_consume_relayout(
+        session->page.runtime);
+    bool relayout = static_shell_changed || runtime_relayout;
     if ((relayout && !navigation_relayout(session))
         || !navigation_load_frames(session, entry->url)) return false;
     return true;
@@ -1752,6 +1775,10 @@ bool navigation_advance_runtime(NavigationSession *session,
         }
     }
     if (!navigation_deliver_frame_messages(session)) {
+        if (navigation_retire_exhausted_script_realms(session)) {
+            session->performance.frame_message_soft_failures++;
+            return true;
+        }
         snprintf(session->last_error, sizeof(session->last_error),
                  "cross-frame message delivery failed: %.450s",
                  session->page.script_result.error);

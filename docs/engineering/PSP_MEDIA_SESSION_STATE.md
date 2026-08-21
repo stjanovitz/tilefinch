@@ -11,15 +11,18 @@ plus non-blocking commands. Blocking or fallible work is an invoked service
 which later supplies a completion, timeout, or failure event.
 
 The state machine is source-independent. Provider video, offline files, and
-compatible page `<video>` elements enter the same opening and playback states.
-For page media, activation resolves the element's selected MP4 or VOD HLS
-source, applies
+compatible page `<video>`/`<audio>` elements enter the same opening and
+playback states. A high-confidence structured `AudioObject` preview uses the
+same page-audio route with no synthetic DOM element or node handle. For page
+media, activation resolves the selected
+MP4/M4A or VOD HLS source, applies
 `media-src`, mixed-content, private-network, CORS, cookie, redirect, and content-
 blocking policy, and launches the native player. MP4 uses a one-byte Range
-probe before the progressive demux; HLS uses bounded master/media playlists,
-two segment requests, and the MPEG-TS packet source. Both then use the same
-backend, clock, state transitions, and compositor. No page-media bytes are
-written to the Memory Stick.
+probe before the progressive demux; page audio selects its AAC track and the
+existing audio-only backend without allocating a video surface. HLS uses
+bounded master/media playlists, two segment requests, and the MPEG-TS packet
+source. All routes then use the same clock and state transitions. No page-media
+bytes are written to the Memory Stick.
 
 ## Resource invariants
 
@@ -66,7 +69,7 @@ stateDiagram-v2
         Resolving --> DecoderPrepare: provider / offline source
         Resolving --> VideoRange: page MP4 source
         DecoderPrepare --> VideoRange: normal playback
-        DecoderPrepare --> AudioRange: YouTube audio-only
+        DecoderPrepare --> AudioRange: audio-only route
         VideoRange --> VideoDemux
         VideoDemux --> VideoPrime
         VideoPrime --> AudioRange: separate audio track

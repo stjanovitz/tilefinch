@@ -13,6 +13,7 @@ typedef struct {
     size_t failed;
     size_t skipped_cross_origin;
     size_t skipped_module;
+    size_t skipped_nomodule;
     size_t skipped_quota;
     size_t skipped_pressure;
     size_t pressure_collections;

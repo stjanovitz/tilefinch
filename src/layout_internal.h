@@ -364,6 +364,7 @@ typedef struct {
        across recursive child layout. */
     lxb_dom_node_t *assigned_grid_node;
     int assigned_grid_height;
+    bool assigned_grid_height_valid;
     LayoutAssignedGridTracks assigned_grid_tracks;
     lxb_dom_node_t *assigned_flex_node;
     int assigned_flex_height;
@@ -407,9 +408,27 @@ typedef struct {
     int y;
     int width;
     int height;
+    /* CSS transforms, filters, perspective, containment, and an authored
+       will-change establish a separate containing block for fixed
+       descendants. Keep it alongside the ordinary positioned ancestor: a
+       nearer position:relative ancestor must not erase an earlier transform. */
+    lxb_dom_node_t *fixed_node;
+    int fixed_x;
+    int fixed_y;
+    int fixed_width;
+    int fixed_height;
     const FloatExclusion *float_exclusions;
     size_t float_count;
 } PositionedBox;
+
+static inline bool layout_style_establishes_fixed_containing_block(
+    const ComputedStyle *style)
+{
+    return style != NULL
+        && (style->has_transform || style->has_perspective
+            || style->has_filter || style->has_layout_containment
+            || style->will_change_transform);
+}
 
 /* During line construction, the high URL-length bit tags z_index as a
    one-based negative draw-command mapping. Line flush clears both before the
@@ -745,6 +764,9 @@ bool layout_paint_special_input(
 bool layout_paint_select_indicator(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, int x, int y, int width, int height);
+bool layout_paint_audio_control(
+    LayoutContext *context, const ComputedStyle *style,
+    int x, int y, int width, int height);
 bool layout_add_link(LayoutDocument *layout, const DrawCommand *command,
                      size_t command_index, const char *url,
                      size_t url_length, lxb_dom_node_t *node);

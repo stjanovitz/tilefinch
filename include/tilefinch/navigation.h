@@ -375,6 +375,9 @@ typedef struct {
     size_t staged_body_slide_bytes_avoided;
     size_t staged_body_compactions;
     size_t staged_body_compaction_bytes;
+    size_t optional_work_sheds;
+    size_t zero_body_navigation_retries;
+    size_t frame_message_soft_failures;
     uint64_t max_slice_us;
     size_t max_slice_work_units;
     NavigationSlicePhase max_slice_phase;
@@ -508,6 +511,7 @@ struct NavigationSession {
     size_t script_failed;
     size_t script_skipped_cross_origin;
     size_t script_skipped_module;
+    size_t script_skipped_nomodule;
     size_t script_skipped_quota;
     size_t script_skipped_pressure;
     size_t script_pressure_collections;

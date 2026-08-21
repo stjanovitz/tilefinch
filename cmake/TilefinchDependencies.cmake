@@ -39,7 +39,26 @@ if(PSP)
     # the augmenting script because psp-fixup-imports discovers it after link.
     set(PSP_BROWSER_GC_KEEP_SCRIPT
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PspGcKeep.ld")
-    add_compile_options(-ffunction-sections -fdata-sections)
+    # Keep compiler-expanded source locations deterministic and free of the
+    # builder's home-directory layout. This covers Tilefinch plus dependencies
+    # added through this CMake tree; the separately configured owned transport
+    # repeats the same mapping in PspOwnedTransport.cmake.
+    set(TILEFINCH_PSP_PREFIX_MAP_FLAGS
+        "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=/tilefinch/source"
+        "-fdebug-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=/tilefinch/source"
+        "-fmacro-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=/tilefinch/source"
+        "-ffile-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=/tilefinch/build"
+        "-fdebug-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=/tilefinch/build"
+        "-fmacro-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=/tilefinch/build")
+    if(DEFINED ENV{PSPDEV} AND NOT "$ENV{PSPDEV}" STREQUAL "")
+        list(APPEND TILEFINCH_PSP_PREFIX_MAP_FLAGS
+            "-ffile-prefix-map=$ENV{PSPDEV}=/pspdev"
+            "-fdebug-prefix-map=$ENV{PSPDEV}=/pspdev"
+            "-fmacro-prefix-map=$ENV{PSPDEV}=/pspdev")
+    endif()
+    add_compile_options(
+        -ffunction-sections -fdata-sections
+        ${TILEFINCH_PSP_PREFIX_MAP_FLAGS})
     add_link_options(
         "LINKER:--gc-sections"
         "LINKER:-T,${PSP_BROWSER_GC_KEEP_SCRIPT}")
@@ -67,7 +86,7 @@ option(PSP_BROWSER_EMBED_BOOTSTRAP_SOURCE_FALLBACK
 option(PSP_BROWSER_ENABLE_LTO
     "Build the engine and frontends with link-time optimization" OFF)
 option(PSP_BROWSER_ENABLE_GIF
-       "Enable stb_image GIF decoding (disable for the PSP stack profile)" ON)
+       "Enable bounded first-frame GIF decoding" ON)
 option(PSP_BROWSER_ENABLE_WEB_FONTS
        "Enable bounded page-provided WOFF1 fonts through FreeType" ON)
 option(PSP_BROWSER_ENABLE_PSP_VOICE

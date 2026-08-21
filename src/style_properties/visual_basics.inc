@@ -51,7 +51,10 @@ static bool style_property_display(const StylePropertyParse *parse)
                 style->display = DISPLAY_INLINE_BLOCK;
             }
             else if (strcmp(resolved, "inline-flex") == 0
-                     || strcmp(resolved, "-webkit-inline-box") == 0) {
+                     || strcmp(resolved, "-webkit-inline-box") == 0
+                     || strcmp(resolved, "-webkit-inline-flex") == 0
+                     || strcmp(resolved, "-ms-inline-flexbox") == 0
+                     || strcmp(resolved, "-moz-inline-box") == 0) {
                 style->display = DISPLAY_INLINE_FLEX;
             }
             else if (strcmp(resolved, "inline-grid") == 0) {
@@ -66,7 +69,10 @@ static bool style_property_display(const StylePropertyParse *parse)
                 style->display = DISPLAY_BLOCK;
             }
             else if (strcmp(resolved, "flex") == 0
-                     || strcmp(resolved, "-webkit-box") == 0) {
+                     || strcmp(resolved, "-webkit-box") == 0
+                     || strcmp(resolved, "-webkit-flex") == 0
+                     || strcmp(resolved, "-ms-flexbox") == 0
+                     || strcmp(resolved, "-moz-box") == 0) {
                 style->display = DISPLAY_FLEX;
             }
             else if (strcmp(resolved, "grid") == 0) style->display = DISPLAY_GRID;
@@ -150,9 +156,13 @@ static bool style_property_webkit_text_fill_color(
 {
     /* Tilefinch has one inherited glyph-paint colour.  Treat WebKit's text
        fill as that colour so transparent and gradient-backed headings do not
-       disappear.  This deliberately omits the uncommon distinction between
-       glyph fill and `currentColor`, avoiding another word in every PSP
-       ComputedStyle while preserving the visible text result. */
+       disappear. A transparent fill is normally paired with
+       `background-clip:text`; until gradient glyph masks are available,
+       preserve the previously cascaded text colour instead of hiding the
+       glyphs. This avoids another word in every PSP ComputedStyle. */
+    if (span_case_equal(parse->value, parse->value_length, "transparent")) {
+        return true;
+    }
     return style_property_color(parse);
 }
 
@@ -363,7 +373,7 @@ static bool style_property_background(const StylePropertyParse *parse)
                    scalar path below only runs for one-layer values. */
                 multilayer = !gradient
                     && style_parse_background_shorthand_image(
-                           sheet, resolved, strlen(resolved), target);
+                           sheet, resolved, strlen(resolved), target, true);
                 if (multilayer) {
                     target->background_image_kind =
                         target->background_image != NULL
@@ -408,7 +418,7 @@ static bool style_property_background(const StylePropertyParse *parse)
         }
         if (image_property && !shorthand
             && style_parse_background_shorthand_image(
-                   sheet, value, value_length, target)) {
+                   sheet, value, value_length, target, false)) {
             multilayer = true;
             target->background_image_kind = target->background_image != NULL
                 ? STYLE_BACKGROUND_IMAGE_URL

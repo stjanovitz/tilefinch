@@ -24,8 +24,91 @@
 #define STYLESHEET_LAYOUT_RESERVE (2u * 1024u * 1024u)
 #define STYLESHEET_LARGE_SOURCE_BYTES (512u * 1024u)
 #define STYLESHEET_LARGE_SOURCE_RULE_LIMIT 1572u
-#define STYLESHEET_LARGE_SOURCE_HEAD_RULES 1536u
+#define STYLESHEET_LARGE_SOURCE_HEAD_RULES 512u
+#define STYLESHEET_LARGE_SOURCE_RELEVANT_RULES 768u
+#define STYLESHEET_LARGE_SOURCE_SECONDARY_RULES 256u
 #define STYLESHEET_LARGE_SOURCE_TAIL_PERCENT 95u
+#define STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS 64u
+#define STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS 128u
+#define STYLESHEET_SELECTOR_PRIORITY_NODE_LIMIT 512u
+#define STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT 8192u
+
+static uint32_t stylesheet_selector_token_hash(
+    unsigned char kind, const char *text, size_t length)
+{
+    uint32_t hash = UINT32_C(2166136261) ^ kind;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char value = (unsigned char) text[i];
+        if (kind == 't') value = (unsigned char) tolower(value);
+        hash ^= value;
+        hash *= UINT32_C(16777619);
+    }
+    return hash;
+}
+
+static void stylesheet_selector_token_add_words(
+    uint32_t *bloom, size_t bloom_words, unsigned char kind,
+    const char *text, size_t length)
+{
+    if (bloom == NULL || bloom_words == 0 || text == NULL || length == 0) {
+        return;
+    }
+    uint32_t hash = stylesheet_selector_token_hash(kind, text, length);
+    uint32_t rotated = (hash << 13) | (hash >> 19);
+    size_t bits = bloom_words * 32u;
+    size_t first = (size_t) hash & (bits - 1u);
+    size_t second = (size_t) (rotated ^ UINT32_C(0x9e3779b9))
+        & (bits - 1u);
+    bloom[first / 32u] |= UINT32_C(1) << (first & 31u);
+    bloom[second / 32u] |= UINT32_C(1) << (second & 31u);
+}
+
+static void stylesheet_collect_selector_tokens(
+    lxb_dom_node_t *root, uint32_t *bloom, size_t bloom_words,
+    size_t node_limit, bool saturate_on_overflow)
+{
+    memset(bloom, 0, bloom_words * sizeof(*bloom));
+    lxb_dom_node_t *node = root;
+    size_t visited = 0;
+    while (node != NULL && visited++ < node_limit) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            size_t name_length = 0;
+            const char *name = document_element_name(node, &name_length);
+            stylesheet_selector_token_add_words(
+                bloom, bloom_words, 't', name, name_length);
+            size_t id_length = 0;
+            const char *id = document_attribute(node, "id", &id_length);
+            stylesheet_selector_token_add_words(
+                bloom, bloom_words, '#', id, id_length);
+            size_t class_length = 0;
+            const char *classes = document_attribute(
+                node, "class", &class_length);
+            for (size_t at = 0; classes != NULL && at < class_length;) {
+                while (at < class_length
+                       && isspace((unsigned char) classes[at])) at++;
+                size_t begin = at;
+                while (at < class_length
+                       && !isspace((unsigned char) classes[at])) at++;
+                stylesheet_selector_token_add_words(
+                    bloom, bloom_words, '.', classes + begin, at - begin);
+            }
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != NULL && node != root && node->next == NULL) {
+            node = node->parent;
+        }
+        node = node == NULL || node == root ? NULL : node->next;
+    }
+    if (node != NULL && saturate_on_overflow) {
+        /* An incomplete census must not create false negatives. Saturating
+           the fixed index converts the overflow case to ordinary bounded
+           source order rather than pretending unseen tokens are absent. */
+        memset(bloom, 0xff, bloom_words * sizeof(*bloom));
+    }
+}
 
 _Static_assert(STYLESHEET_REFERRER_POLICY_LIMIT
                    == FETCH_REFERRER_POLICY_LIMIT,
@@ -78,6 +161,8 @@ typedef struct {
     bool alternate_theme_active[STYLESHEET_ALTERNATE_THEME_LIMIT];
     size_t alternate_theme_count;
     bool alternate_theme_selection_valid;
+    uint32_t selector_token_bloom[STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS];
+    uint32_t priority_token_bloom[STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS];
     ExternalStylesheetStats *stats;
     PendingStylesheet pending[STYLESHEET_FETCH_CONCURRENCY];
     size_t pending_count;
@@ -281,7 +366,7 @@ static bool stylesheet_failure_is_terminal(const FetchResult *result)
         || strstr(result->error, "unsupported") != NULL
         || strstr(result->error, "requested URL returned error:") != NULL
         || strstr(result->error, "redirect target is invalid") != NULL
-        || strstr(result->error, "five-hop redirect limit") != NULL;
+        || strstr(result->error, "redirect limit") != NULL;
 }
 
 static bool stylesheet_http_status_is_error(const FetchResult *result)
@@ -992,9 +1077,26 @@ static bool apply_stylesheet_data(ResourceContext *context,
     size_t previous_rule_limit = context->sheet->source_rule_limit_end;
     size_t previous_head_limit =
         context->sheet->source_rule_head_limit_end;
+    size_t previous_secondary_limit =
+        context->sheet->source_rule_secondary_limit_end;
+    size_t previous_relevant_limit =
+        context->sheet->source_rule_relevant_limit_end;
+    const uint32_t *previous_priority_token_bloom =
+        context->sheet->source_rule_priority_token_bloom;
+    size_t previous_priority_token_bloom_words =
+        context->sheet->source_rule_priority_token_bloom_words;
+    const uint32_t *previous_token_bloom =
+        context->sheet->source_rule_token_bloom;
+    size_t previous_token_bloom_words =
+        context->sheet->source_rule_token_bloom_words;
     const char *previous_tail_begin =
         context->sheet->source_rule_tail_begin;
     if (parsed && css_length >= STYLESHEET_LARGE_SOURCE_BYTES) {
+        if (context->document_resources != NULL
+            && !context->document_resources->selector_census_complete
+            && !context->document_resources->final_resample_completed) {
+            context->document_resources->final_resample_required = true;
+        }
         context->sheet->source_rule_limit_end =
             rules_before > SIZE_MAX - STYLESHEET_LARGE_SOURCE_RULE_LIMIT
                 ? SIZE_MAX
@@ -1003,6 +1105,26 @@ static bool apply_stylesheet_data(ResourceContext *context,
             rules_before > SIZE_MAX - STYLESHEET_LARGE_SOURCE_HEAD_RULES
                 ? SIZE_MAX
                 : rules_before + STYLESHEET_LARGE_SOURCE_HEAD_RULES;
+        context->sheet->source_rule_relevant_limit_end =
+            context->sheet->source_rule_head_limit_end
+                > SIZE_MAX - STYLESHEET_LARGE_SOURCE_RELEVANT_RULES
+                ? SIZE_MAX
+                : context->sheet->source_rule_head_limit_end
+                    + STYLESHEET_LARGE_SOURCE_RELEVANT_RULES;
+        context->sheet->source_rule_secondary_limit_end =
+            context->sheet->source_rule_head_limit_end
+                > SIZE_MAX - STYLESHEET_LARGE_SOURCE_SECONDARY_RULES
+                ? SIZE_MAX
+                : context->sheet->source_rule_head_limit_end
+                    + STYLESHEET_LARGE_SOURCE_SECONDARY_RULES;
+        context->sheet->source_rule_priority_token_bloom =
+            context->priority_token_bloom;
+        context->sheet->source_rule_priority_token_bloom_words =
+            STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS;
+        context->sheet->source_rule_token_bloom =
+            context->selector_token_bloom;
+        context->sheet->source_rule_token_bloom_words =
+            STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS;
         context->sheet->source_rule_tail_begin =
             (const char *) css_data
             + (css_length / 100u) * STYLESHEET_LARGE_SOURCE_TAIL_PERCENT;
@@ -1015,9 +1137,9 @@ static bool apply_stylesheet_data(ResourceContext *context,
     fragment_eligible = fragment_eligible
         && getenv("TILEFINCH_DISABLE_STYLESHEET_FRAGMENT_CACHE") == NULL;
 #endif
-    /* Large sources deliberately retain only bounded head/tail rule windows.
-       Their structural IR would otherwise replay every captured rule and
-       silently bypass that degradation policy. */
+    /* Large sources deliberately retain bounded source-order bookends plus
+       a DOM-relevant selector allowance. Their structural IR would otherwise
+       replay every captured rule and silently bypass that degradation policy. */
     bool ir_eligible = fragment_eligible
         && css_length < STYLESHEET_LARGE_SOURCE_BYTES;
 #ifndef TILEFINCH_NO_TRACE
@@ -1113,6 +1235,16 @@ static bool apply_stylesheet_data(ResourceContext *context,
     }
     context->sheet->source_rule_limit_end = previous_rule_limit;
     context->sheet->source_rule_head_limit_end = previous_head_limit;
+    context->sheet->source_rule_secondary_limit_end =
+        previous_secondary_limit;
+    context->sheet->source_rule_relevant_limit_end = previous_relevant_limit;
+    context->sheet->source_rule_priority_token_bloom =
+        previous_priority_token_bloom;
+    context->sheet->source_rule_priority_token_bloom_words =
+        previous_priority_token_bloom_words;
+    context->sheet->source_rule_token_bloom = previous_token_bloom;
+    context->sheet->source_rule_token_bloom_words =
+        previous_token_bloom_words;
     context->sheet->source_rule_tail_begin = previous_tail_begin;
     if (parsed) {
         context->stats->loaded++;
@@ -2244,6 +2376,18 @@ bool stylesheets_append_ordered_suffix_with_context(
         .started_ms = resource_now_ms(),
         .slice_started_us = tilefinch_platform_monotonic_time_us()
     };
+    lxb_dom_node_t *selector_root = nodes[0];
+    while (selector_root != NULL && selector_root->parent != NULL) {
+        selector_root = selector_root->parent;
+    }
+    stylesheet_collect_selector_tokens(
+        selector_root, context.priority_token_bloom,
+        STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS,
+        STYLESHEET_SELECTOR_PRIORITY_NODE_LIMIT, false);
+    stylesheet_collect_selector_tokens(
+        selector_root, context.selector_token_bloom,
+        STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS,
+        STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT, true);
     context.deadline_ms = context.started_ms + (double) timeout_ms;
     stylesheet_restore_alternate_themes(&context);
     /* The full ordered loader suppresses URLs already encountered earlier
@@ -2360,6 +2504,14 @@ bool stylesheets_load_external_tracked_with_context(
         .started_ms = resource_now_ms(),
         .slice_started_us = tilefinch_platform_monotonic_time_us()
     };
+    stylesheet_collect_selector_tokens(
+        lxb_dom_interface_node(document->html), context.priority_token_bloom,
+        STYLESHEET_PRIORITY_TOKEN_BLOOM_WORDS,
+        STYLESHEET_SELECTOR_PRIORITY_NODE_LIMIT, false);
+    stylesheet_collect_selector_tokens(
+        lxb_dom_interface_node(document->html), context.selector_token_bloom,
+        STYLESHEET_SELECTOR_TOKEN_BLOOM_WORDS,
+        STYLESHEET_SELECTOR_TOKEN_NODE_LIMIT, true);
     size_t parallel_working = maximum_single_bytes;
     if (parallel_working <= SIZE_MAX / STYLESHEET_FETCH_BATCH) {
         parallel_working *= STYLESHEET_FETCH_BATCH;
@@ -2976,6 +3128,25 @@ void stylesheet_document_resources_open_final_retry(
         entry->final_retry_granted = true;
         resources->final_retry_grants++;
     }
+}
+
+bool stylesheet_document_resources_prepare_complete_census(
+    StylesheetDocumentResources *resources)
+{
+    if (resources == NULL) return false;
+    resources->selector_census_complete = true;
+    if (!resources->final_resample_required
+        || resources->final_resample_completed) return false;
+    for (size_t i = 0; i < resources->count; i++) {
+        StylesheetDocumentResource *entry = &resources->items[i];
+        if (entry->state == STYLESHEET_DOCUMENT_RESOURCE_LOADED
+            && entry->body != NULL && entry->response_provenance_known) {
+            entry->rules_applied = false;
+        }
+    }
+    resources->final_resample_required = false;
+    resources->final_resample_completed = true;
+    return true;
 }
 
 StylesheetDocumentResourceState stylesheet_document_resources_link_state(

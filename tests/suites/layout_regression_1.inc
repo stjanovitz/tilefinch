@@ -37,6 +37,9 @@
     puts("test: native form-control geometry and retained painting");
     CHECK(test_native_form_control_fidelity(&budget) == 0);
 
+    puts("test: all:inherit and shed-script action-shell fallback");
+    CHECK(test_all_inherit_and_static_action_shell(&budget) == 0);
+
     puts("test: direction-aware logical dimensions, edges, and insets");
     CHECK(test_directional_logical_properties(&budget) == 0);
 
@@ -70,6 +73,8 @@
 
     puts("test: percentage images do not inflate flex auto minimums");
     CHECK(test_flex_percentage_image_minimum(&budget) == 0);
+    puts("test: definite replaced flex items keep their authored minimum");
+    CHECK(test_flex_definite_replaced_auto_minimum(&budget) == 0);
 
     puts("test: percentage widths remain indefinite in flex intrinsic sizing");
     CHECK(test_flex_percentage_width_intrinsic(&budget) == 0);
@@ -255,6 +260,7 @@
 
     puts("test: bounded large layout values and aspect products");
     CHECK(test_bounded_large_layout_values(&budget) == 0);
+    CHECK(test_flex_basis_accumulation_saturates(&budget) == 0);
 
     puts("test: UA table and form-control box models");
     CHECK(test_table_and_control_ua_box_models(&budget) == 0);
@@ -452,6 +458,8 @@
         lxb_dom_interface_node(responsive.html), "generated");
     lxb_dom_node_t *attr_generated = find_id(
         lxb_dom_interface_node(responsive.html), "attr-generated");
+    lxb_dom_node_t *reduced_motion = find_id(
+        lxb_dom_interface_node(responsive.html), "reduced-motion");
     CHECK(cards != NULL && left != NULL && right != NULL && pixel != NULL
           && icon != NULL && nobullet != NULL && slant != NULL
           && sticky != NULL && fixed != NULL && rounded != NULL
@@ -491,6 +499,7 @@
           && modern_oklch != NULL && alpha_zero != NULL
           && hex_alpha != NULL && partial_alpha != NULL
           && generated != NULL && attr_generated != NULL);
+    CHECK(reduced_motion != NULL);
     Stylesheet mobile_sheet;
     CHECK(stylesheet_build(&mobile_sheet, &budget, &responsive, 480));
     static const char responsive_user_css[] =
@@ -633,6 +642,8 @@
         &mobile_sheet, attr_generated, NULL);
     ComputedStyle attr_generated_after = style_for_pseudo(
         &mobile_sheet, attr_generated, PSEUDO_AFTER, &attr_generated_style);
+    ComputedStyle reduced_motion_style = style_for_node(
+        &mobile_sheet, reduced_motion, NULL);
     CHECK(centered_style.text_align == TEXT_ALIGN_CENTER
           && nowrap_style.white_space_mode == WHITE_SPACE_NOWRAP
           && grid_style.display == DISPLAY_GRID
@@ -645,6 +656,8 @@
                  &mobile_sheet, &grid_style,
                  STYLE_BORDER_LEFT, NULL) == 0x334455
           && grid_style.opacity >= 127 && grid_style.opacity <= 128);
+    CHECK(reduced_motion_style.display != DISPLAY_NONE
+          && reduced_motion_style.opacity == 255);
     CHECK(spaced_style.display == DISPLAY_FLEX
           && spaced_style.justify_content == JUSTIFY_SPACE_BETWEEN);
     CHECK(ratio_style.aspect_width == 16 && ratio_style.aspect_height == 9

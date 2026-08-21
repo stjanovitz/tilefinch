@@ -104,6 +104,7 @@ typedef struct {
     size_t geometry_ancestor_visits;
     size_t geometry_synchronous_layouts;
     size_t events_dispatched;
+    size_t event_handlers_invoked;
     bool last_event_cancelled;
     size_t timer_callbacks_run;
     size_t runtime_ticks;
@@ -133,6 +134,7 @@ typedef struct {
     size_t dynamic_scripts_cache_hits;
     size_t dynamic_scripts_ordered_waits;
     size_t dynamic_scripts_peak_pending;
+    size_t dynamic_scripts_nomodule_skipped;
     size_t dynamic_script_bytes;
     size_t dynamic_scripts_quota_rejected;
     size_t indexed_db_opens;
@@ -344,6 +346,7 @@ typedef struct {
     ScriptMediaCommand command;
     int64_t node_handle;
     double value;
+    bool audio_only;
     TilefinchRequestMode mode;
     TilefinchCredentialsMode credentials;
     char source[SCRIPT_MEDIA_SOURCE_CAPACITY];
@@ -1011,8 +1014,10 @@ bool script_runtime_consume_mutations(ScriptRuntime *runtime,
                                       ScriptMutationJournal *result);
 bool script_runtime_consume_navigation(ScriptRuntime *runtime, char *url,
                                        size_t url_size, bool *replace);
+bool script_runtime_has_pending_navigation(const ScriptRuntime *runtime);
 bool script_runtime_consume_media_request(ScriptRuntime *runtime,
                                           ScriptMediaRequest *request);
+bool script_runtime_has_pending_media_request(const ScriptRuntime *runtime);
 bool script_runtime_update_media_state(
     ScriptRuntime *runtime, int64_t node_handle, ScriptMediaState state,
     double current_time, double duration);

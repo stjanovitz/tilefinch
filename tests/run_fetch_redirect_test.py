@@ -403,6 +403,18 @@ class RedirectHandler(BaseHTTPRequestHandler):
             self.redirect(302, "/final", "hop=early-redirect; Path=/")
         elif path == "/loop":
             self.reply(302, b"loop-body", (("Location", "/loop"),))
+        elif path.startswith("/redirect-chain/"):
+            try:
+                remaining = int(path.rsplit("/", 1)[1])
+            except ValueError:
+                remaining = -1
+            if remaining > 0:
+                target = f"/redirect-chain/{remaining - 1}"
+                self.reply(302, b"chain-hop", (("Location", target),))
+            elif remaining == 0:
+                self.reply(200, b"redirect-chain-final", ())
+            else:
+                self.reply(400, b"bad-chain", ())
         elif path == "/slow-redirect":
             self.send_response(302)
             self.send_header("Location", "/final")

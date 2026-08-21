@@ -485,7 +485,7 @@ bool layout_block_grid_section(LayoutContext *context,
                 track_floors[column] = track_widths[column];
             } else if (type == GRID_TRACK_FLEX) {
                 track_widths[column] = 0;
-                flex_weight += value != 0 ? value : 1000u;
+                flex_weight += value;
             }
             if (type != GRID_TRACK_FLEX
                 && track_widths[column] < track_floors[column]) {
@@ -728,8 +728,8 @@ bool layout_block_grid_section(LayoutContext *context,
                     if (track_types[column] != GRID_TRACK_FLEX
                         || locked[column]) continue;
                     unsigned weight = adaptive_columns ? 1000u
-                                      : (track_values[column] != 0
-                                         ? track_values[column] : 1000u);
+                                      : track_values[column];
+                    if (weight == 0) continue;
                     int share = flex_space > 0
                         ? tilefinch_mul_div_int(
                               flex_space, (int) weight,
@@ -751,8 +751,8 @@ bool layout_block_grid_section(LayoutContext *context,
                     if (track_types[column] != GRID_TRACK_FLEX
                         || locked[column]) continue;
                     unsigned weight = adaptive_columns ? 1000u
-                                      : (track_values[column] != 0
-                                         ? track_values[column] : 1000u);
+                                      : track_values[column];
+                    if (weight == 0) continue;
                     int addition = tilefinch_mul_div_int(
                         flex_space, (int) weight, (int) active_weight);
                     track_widths[column] = addition;
@@ -761,6 +761,7 @@ bool layout_block_grid_section(LayoutContext *context,
                 for (int column = 0; distributed < flex_space
                                      && column < columns; column++) {
                     if (track_types[column] == GRID_TRACK_FLEX
+                        && track_values[column] != 0
                         && !locked[column]) {
                         track_widths[column]++;
                         distributed++;
@@ -823,7 +824,11 @@ bool layout_block_grid_section(LayoutContext *context,
         }
         int track_cursor = content_x + leading_space;
         for (int column = 0; column < columns; column++) {
-            if (track_widths[column] < 1) track_widths[column] = 1;
+            if (track_widths[column] < 1
+                && !(track_types[column] == GRID_TRACK_FLEX
+                     && track_values[column] == 0)) {
+                track_widths[column] = 1;
+            }
             track_starts[column] = track_cursor;
             track_cursor += track_widths[column] + distributed_gap;
         }
@@ -908,7 +913,7 @@ bool layout_block_grid_section(LayoutContext *context,
                         declared_content_height, (int) value, 100);
                     if (minimum == 0) fixed_space += row_track_heights[row];
                 } else if (type == GRID_TRACK_FLEX) {
-                    flex_rows += value != 0 ? value : 1000u;
+                    flex_rows += value;
                 }
             }
             if (flex_track_space_definite && flex_rows != 0) {
@@ -933,7 +938,8 @@ bool layout_block_grid_section(LayoutContext *context,
                         (unsigned) declared_grid_rows,
                         second_implicit_row, &type, &value);
                     if (type != GRID_TRACK_FLEX) continue;
-                    unsigned weight = value != 0 ? value : 1000u;
+                    unsigned weight = value;
+                    if (weight == 0) continue;
                     row_track_heights[row] = tilefinch_mul_div_int(
                         flex_space, (int) weight, (int) flex_rows);
                     distributed += row_track_heights[row];
@@ -946,7 +952,7 @@ bool layout_block_grid_section(LayoutContext *context,
                         context->sheet, style, row,
                         (unsigned) declared_grid_rows,
                         second_implicit_row, &type, &value);
-                    if (type == GRID_TRACK_FLEX) {
+                    if (type == GRID_TRACK_FLEX && value != 0) {
                         row_track_heights[row]++;
                         distributed++;
                     }
@@ -1095,10 +1101,12 @@ bool layout_block_grid_section(LayoutContext *context,
                     }
                 }
                 if (area_height < 0) area_height = 0;
-                PositionedBox grid_area = {
-                    .node = node, .x = area_x, .y = area_y,
-                    .width = area_width, .height = area_height
-                };
+                PositionedBox grid_area = *descendant_positioned_box;
+                grid_area.node = node;
+                grid_area.x = area_x;
+                grid_area.y = area_y;
+                grid_area.width = area_width;
+                grid_area.height = area_height;
                 int positioned_bottom = area_y;
                 if (!layout_block(
                         context, positioned_item->node,
@@ -1161,6 +1169,8 @@ bool layout_block_grid_section(LayoutContext *context,
                 lxb_dom_node_t *saved_assigned_node =
                     context->assigned_grid_node;
                 int saved_assigned_height = context->assigned_grid_height;
+                bool saved_assigned_height_valid =
+                    context->assigned_grid_height_valid;
                 LayoutAssignedGridTracks saved_assigned_tracks =
                     context->assigned_grid_tracks;
                 int assigned_cell_height = 0;
@@ -1206,8 +1216,38 @@ bool layout_block_grid_section(LayoutContext *context,
                 for (int offset = 0;
                      offset < item_placement.row_span; offset++) {
                     int row = grid_row + offset;
+                    bool collapsed_flex_track = false;
+                    if (row < GRID_PLACEMENT_ROW_LIMIT
+                        && row_track_heights[row] == 0) {
+                        int explicit_row = row - grid_row_origin;
+                        uint8_t row_type = GRID_TRACK_AUTO;
+                        unsigned row_value = 0;
+                        if (explicit_row >= 0
+                            && explicit_row < explicit_grid_rows) {
+                            grid_defined_row_track(
+                                context->sheet, style,
+                                (unsigned) explicit_row,
+                                (unsigned) declared_grid_rows,
+                                second_implicit_row, &row_type, &row_value);
+                        } else {
+                            int implicit = explicit_row < 0
+                                ? explicit_row
+                                : explicit_row - explicit_grid_rows;
+                            bool second = second_implicit_row != 0
+                                && (implicit & 1) != 0;
+                            row_type = second
+                                ? (uint8_t) (second_implicit_row >> 14)
+                                : style->grid_auto_row_type;
+                            row_value = second
+                                ? second_implicit_row & 0x3fffu
+                                : style->grid_auto_row_value;
+                        }
+                        collapsed_flex_track = row_type == GRID_TRACK_FLEX
+                                               && row_value == 0;
+                    }
                     if (row >= GRID_PLACEMENT_ROW_LIMIT
-                        || row_track_heights[row] <= 0) {
+                        || (row_track_heights[row] <= 0
+                            && !collapsed_flex_track)) {
                         definite_cell_height = false;
                         break;
                     }
@@ -1377,6 +1417,7 @@ bool layout_block_grid_section(LayoutContext *context,
                     && item_alignment == ALIGN_STRETCH) {
                     context->assigned_grid_node = item->node;
                     context->assigned_grid_height = assigned_cell_height;
+                    context->assigned_grid_height_valid = true;
                 }
                 bool child_ok = layout_block(
                     context, item->node, &item->parent_style,
@@ -1386,6 +1427,8 @@ bool layout_block_grid_section(LayoutContext *context,
                     descendant_positioned_box, &child_bottom);
                 context->assigned_grid_node = saved_assigned_node;
                 context->assigned_grid_height = saved_assigned_height;
+                context->assigned_grid_height_valid =
+                    saved_assigned_height_valid;
                 context->assigned_grid_tracks = saved_assigned_tracks;
                 if (!child_ok) {
                     flex_order_plan_destroy(grid_order);
@@ -1431,7 +1474,19 @@ bool layout_block_grid_section(LayoutContext *context,
                     }
                 }
             }
+            int explicit_row = grid_row - grid_row_origin;
+            uint8_t row_type = GRID_TRACK_AUTO;
+            unsigned row_value = 0;
+            if (explicit_row >= 0 && explicit_row < explicit_grid_rows) {
+                grid_defined_row_track(
+                    context->sheet, style, (unsigned) explicit_row,
+                    (unsigned) declared_grid_rows, second_implicit_row,
+                    &row_type, &row_value);
+            }
+            bool collapsed_flex_track = row_type == GRID_TRACK_FLEX
+                                        && row_value == 0;
             if (row_track_heights[grid_row] <= 0
+                && !collapsed_flex_track
                 && child_bottom > row_extents[grid_row]) {
                 row_extents[grid_row] = child_bottom;
             }

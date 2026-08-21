@@ -5737,6 +5737,7 @@
               : inlineEventHandler(this, value.type, propertyName);
           if (typeof handler === "function")
             try {
+              globalThis.__tilefinchRecordEventHandler();
               const returned = globalThis.__tilefinchRunTask(
                 "element-handler:" + String(value.type),
                 handler,

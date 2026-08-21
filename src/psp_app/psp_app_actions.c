@@ -417,6 +417,13 @@ static void psp_app_dispatch_heavy_action(
                             "VIDEO FORMAT COMING SOON", 180);
                         break;
                     }
+                    if (action.media_audio_only
+                        && action.media_kind == MEDIA_DISCOVERY_HLS) {
+                        psp_ui_show_status(
+                            &app->process->presentation.ui,
+                            "AUDIO HLS FORMAT COMING SOON", 180);
+                        break;
+                    }
                     const NavigationEntry *entry =
                         navigation_current(app->views->navigation);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
@@ -433,7 +440,13 @@ static void psp_app_dispatch_heavy_action(
                     }
 #endif
                     bool opened = entry != NULL
-                        && (action.media_kind == MEDIA_DISCOVERY_HLS
+                        && (action.media_audio_only
+                            ? psp_media_open_page_audio(
+                                  &app->browser->media, action.url, entry->url,
+                                  app->views->navigation->generation,
+                                  action.media_node_handle, action.media_mode,
+                                  action.media_credentials, true, false)
+                            : action.media_kind == MEDIA_DISCOVERY_HLS
                             ? psp_media_open_page_hls(
                                   &app->browser->media, action.url, entry->url,
                                   app->views->navigation->generation,
@@ -452,10 +465,50 @@ static void psp_app_dispatch_heavy_action(
                     if (!opened) {
                         psp_ui_show_status(
                             &app->process->presentation.ui,
-                            "VIDEO SOURCE COULD NOT OPEN", 180);
+                            action.media_audio_only
+                                ? "AUDIO SOURCE COULD NOT OPEN"
+                                : "VIDEO SOURCE COULD NOT OPEN", 180);
                     }
                     frame->page_dirty = true;
                     break;
+                }
+                if (navigates && action.prefer_native_media
+                    && youtube_watch_url_supported(action.url)) {
+                    const NavigationEntry *entry =
+                        navigation_current(app->views->navigation);
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+                    if (strcmp(app->process->config.trace, "none") == 0
+                        && !psp_ensure_network_for_navigation(
+                               app->network, app->network_lifecycle,
+                               (int) app->process->config.network_profile,
+                               "GET", action.url, true, engine_frame,
+                               &app->process->presentation.ui)) {
+                        app->interactive->previous_buttons = psp_ui_buttons(
+                            psp_navigation_observed_buttons());
+                        break;
+                    }
+#endif
+                    /* The result document remains the rollback surface. Its
+                       optional thumbnails and script requests are no longer
+                       useful while the player owns the screen, and retiring
+                       them makes the resolver's first worker descriptor
+                       available immediately. */
+                    bool opened = entry != NULL
+                        && psp_media_open_provider_route(
+                            &app->browser->media, action.url,
+                            app->views->navigation->generation);
+                    if (opened) {
+                        (void) browser_engine_cancel_network_work(
+                            engine, "provider video selected");
+                        psp_ui_set_loading(
+                            &app->process->presentation.ui, false, 0);
+                        frame->page_dirty = true;
+                        break;
+                    }
+                    /* A synchronous admission refusal falls through to the
+                       ordinary watch-page navigation. The visible Details
+                       action always takes that path directly. */
+                    action.prefer_native_media = false;
                 }
                 if (navigates
                     && psp_internal_action_url(

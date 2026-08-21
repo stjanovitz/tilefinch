@@ -851,7 +851,7 @@
                     "MOTION-NEGATIVE-CACHED") == 0);
     script_runtime_destroy(motion_free_runtime);
 
-    puts("test: bounded stylesheet keyframe animation");
+    puts("test: reduced-motion mode skips stylesheet animation scans");
     ScriptResult stylesheet_animation_result;
     ScriptRuntimeOptions stylesheet_animation_options =
         deterministic_tick_options;
@@ -868,49 +868,35 @@
         "box=document.createElement('div');"
         "style.textContent='@keyframes pulse{from{opacity:0}'"
         "+'to{opacity:1}}.motion-probe{animation:pulse 32ms linear}';"
-        "box.className='motion-probe';let started=false;"
-        "box.addEventListener('animationstart',event=>{started="
-        "event instanceof AnimationEvent&&event.animationName==='pulse'});"
-        "box.addEventListener('animationend',event=>{"
-        "globalThis.pocSummary=started&&event.animationName==='pulse'"
-        "&&box.style.opacity==='1'?'STYLESHEET-ANIMATION-OK':"
-        "'STYLESHEET-ANIMATION-FAILED:'+"
-        "[started,event.animationName,box.style.opacity].join(',')});"
+        "box.className='motion-probe';"
         "document.head.appendChild(style);document.body.appendChild(box);"
-        "globalThis.pocSummary='STYLESHEET-ANIMATION-PENDING';})()";
+        "queueMicrotask(()=>{globalThis.pocSummary="
+        "matchMedia('(prefers-reduced-motion:reduce)').matches"
+        "&&__tilefinchRootCensus.motionScans===0"
+        "?'STYLESHEET-MOTION-REDUCED':'STYLESHEET-MOTION-SCANNED:'+"
+        "__tilefinchRootCensus.motionScans});"
+        "globalThis.pocSummary='STYLESHEET-MOTION-PENDING';})()";
     CHECK(stylesheet_animation_runtime != NULL
           && script_runtime_evaluate_diagnostic(
               stylesheet_animation_runtime, stylesheet_animation_source,
               "<stylesheet-animation>", &stylesheet_animation_result));
-    for (size_t tick = 0; tick < 6
+    for (size_t tick = 0; tick < 2
                           && strcmp(stylesheet_animation_result.summary,
-                                    "STYLESHEET-ANIMATION-OK") != 0;
+                                    "STYLESHEET-MOTION-REDUCED") != 0;
          tick++) {
         CHECK(script_runtime_advance(
             stylesheet_animation_runtime, 16, 16,
             &stylesheet_animation_result));
     }
     if (strcmp(stylesheet_animation_result.summary,
-               "STYLESHEET-ANIMATION-OK") != 0) {
-        static const char stylesheet_animation_diagnostic[] =
-            "globalThis.pocSummary='STYLESHEET-ANIMATION-PENDING:'"
-            "+JSON.stringify({scans:__tilefinchRootCensus.motionScans,"
-            "keyframes:__tilefinchRootCensus.motionKeyframes,"
-            "rules:__tilefinchRootCensus.motionRules,"
-            "elements:__tilefinchRootCensus.motionElements,"
-            "timers:__tilefinchRootCensus.timers,"
-            "opacity:document.querySelector('.motion-probe')?.style.opacity})";
-        (void) script_runtime_evaluate_diagnostic(
-            stylesheet_animation_runtime, stylesheet_animation_diagnostic,
-            "<stylesheet-animation-diagnostic>",
-            &stylesheet_animation_result);
+               "STYLESHEET-MOTION-REDUCED") != 0) {
         fprintf(stderr, "stylesheet animation summary=%s error=%s\n",
                 stylesheet_animation_result.summary,
                 stylesheet_animation_result.error);
     }
     CHECK(stylesheet_animation_result.success
           && strcmp(stylesheet_animation_result.summary,
-                    "STYLESHEET-ANIMATION-OK") == 0
+                    "STYLESHEET-MOTION-REDUCED") == 0
           && stylesheet_animation_result.bootstrap_lazy_module_loads == 1
           && stylesheet_animation_result.bootstrap_lazy_module_failures == 0);
 

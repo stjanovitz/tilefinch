@@ -17,7 +17,7 @@ static void usage(const char *program)
             "[--max-download-kb N] "
             "[--no-external-resources] "
             "[--no-progressive-first-paint] "
-            "[--wpt-test-rendered] "
+            "[--wpt-test-rendered] [--hide-cookie-banners] "
             "[--script-timeout-ms N] [--probe-script FILE] "
             "[--script-heap-mb N] [--script-total-mb N] "
             "[--script-file-kb N] [--script-count N] "

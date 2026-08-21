@@ -641,7 +641,7 @@ static bool test_section_store_transport_fault(size_t cancel_after,
                                                size_t truncate_after)
 {
     Budget budget;
-    budget_init(&budget, 4 * MIB);
+    budget_init(&budget, 5 * MIB);
     CompressedSectionStore store = {0};
     SectionStoreStreamBuilder builder = {0};
     char error[256] = {0};
@@ -1427,8 +1427,9 @@ static bool test_streaming_navigation_allocation_sweep(Budget *main_budget)
                     && (strcmp(navigation.page.document.title, "Prior") == 0
                         || strcmp(navigation.page.document.title,
                                   "Stream & split") == 0)));
-        if (loaded) completed_loads++;
-        else failed_loads++;
+        if (loaded) {
+            completed_loads++;
+        } else failed_loads++;
         navigation_destroy(&navigation);
         fetch_trace_end();
         if (!valid || budget.current != 0) {
@@ -1442,6 +1443,60 @@ static bool test_streaming_navigation_allocation_sweep(Budget *main_budget)
     }
     budget_install_lexbor(main_budget);
     return failed_loads != 0 && completed_loads != 0;
+}
+
+static bool test_streaming_navigation_optional_work_shed(Budget *main_budget)
+{
+    Budget budget;
+    budget_init(&budget, 4 * MIB);
+    budget_install_lexbor(&budget);
+    BrowserSession browser;
+    NavigationSession navigation;
+    bool browser_ready = browser_session_init(&browser, &budget, 64 * 1024);
+    bool navigation_ready = browser_ready
+        && navigation_init(&navigation, &budget, 2);
+    if (navigation_ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        /* The document and parser fit, while this deliberately impossible
+           optional realm reserve exercises static-page degradation without
+           relying on an allocation ordinal. */
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    char error[256] = {0};
+    bool replay_ready = navigation_ready && fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-stream",
+        error, sizeof(error));
+    uint64_t generation = replay_ready ? navigation_begin(&navigation) : 0;
+    bool loaded = replay_ready && navigation_load_url(
+        &navigation, generation, "https://stream.test/document", 4096,
+        1000, 480, NULL, NULL, true);
+    bool ok = loaded && navigation.page.loaded
+        && strcmp(navigation.page.document.title, "Stream & split") == 0
+        && navigation.page.runtime == NULL
+        && navigation.page.resource_scheduler != NULL
+        && navigation.performance.optional_work_sheds == 1;
+    if (!ok) {
+        fprintf(stderr,
+                "optional shed loaded=%d page=%d title=\"%s\" runtime=%p "
+                "sheds=%zu error=\"%s\"\n",
+                loaded ? 1 : 0,
+                navigation_ready && navigation.page.loaded ? 1 : 0,
+                navigation_ready ? navigation.page.document.title : "",
+                navigation_ready ? (void *) navigation.page.runtime : NULL,
+                navigation_ready
+                    ? navigation.performance.optional_work_sheds : 0,
+                navigation_ready ? navigation.last_error : error);
+    }
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (replay_ready) fetch_trace_end();
+    budget_install_lexbor(main_budget);
+    return ok && budget.current == 0;
 }
 
 static bool test_image_node_cap_ownership(Budget *budget)
@@ -1948,10 +2003,25 @@ static bool test_inline_svg_resource(Budget *budget)
 {
     static const char html[] =
         "<!doctype html><style>body{margin:0;padding:0}"
-        "#icon{color:#ff0000}</style><body>"
+        "#icon{color:#ff0000}#fallback-icon{color:#0000ff;"
+        "fill:var(--missing,currentColor)}"
+        ".app-bar{display:flex;position:fixed;bottom:0;color:#fff;"
+        "background:#333}.app-icon{width:24px;height:24px;"
+        "fill:var(--icon-fill,currentColor)}</style><body>"
         "<svg id=icon width=16 height=16 viewBox='0 0 16 16' "
         "color='#ff0000' xmlns='http://www.w3.org/2000/svg'>"
-        "<path fill='currentColor' d='M0 0h16v16H0z'/></svg></body>";
+        "<path fill='currentColor' d='M0 0h16v16H0z'/></svg>"
+        "<svg id=wide width=100 viewBox='0 0 1709 768' "
+        "xmlns='http://www.w3.org/2000/svg'>"
+        "<path fill='#000' d='M0 0h1709v768H0z'/></svg>"
+        "<svg id=fallback-icon width=16 height=16 viewBox='0 0 16 16' "
+        "xmlns='http://www.w3.org/2000/svg'>"
+        "<path d='M0 0h16v16H0z'/></svg>"
+        "<div class=app-bar><a href=/><svg id=app-icon class=app-icon "
+        "viewBox='0 0 24 24'><path d='M13.5 1.515a3 3 0 0 0-3 0L3 "
+        "5.845a2 2 0 0 0-1 1.732V21a1 1 0 0 0 1 1h6a1 1 0 0 0 "
+        "1-1v-6h4v6a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V7.577a2 2 0 "
+        "0 0-1-1.732z'/></svg></a></div></body>";
     PocDocument document = {0};
     Stylesheet stylesheet = {0};
     ImageResources images = {0};
@@ -1964,17 +2034,54 @@ static bool test_inline_svg_resource(Budget *budget)
             8, 64 * 1024, 32 * 1024, 64 * 1024, 1000, NULL, NULL);
     lxb_dom_node_t *icon = ok ? find_id(
         lxb_dom_interface_node(document.html), "icon") : NULL;
+    lxb_dom_node_t *wide = ok ? find_id(
+        lxb_dom_interface_node(document.html), "wide") : NULL;
+    lxb_dom_node_t *fallback = ok ? find_id(
+        lxb_dom_interface_node(document.html), "fallback-icon") : NULL;
+    lxb_dom_node_t *app_icon = ok ? find_id(
+        lxb_dom_interface_node(document.html), "app-icon") : NULL;
     const ImageResource *resource = ok ? images_find_node(&images, icon) : NULL;
-    ok = ok && icon != NULL && resource != NULL
+    const ImageResource *wide_resource = ok
+        ? images_find_node(&images, wide) : NULL;
+    const ImageResource *fallback_resource = ok
+        ? images_find_node(&images, fallback) : NULL;
+    const ImageResource *app_resource = ok
+        ? images_find_node(&images, app_icon) : NULL;
+    ok = ok && icon != NULL && resource != NULL && wide != NULL
+        && wide_resource != NULL
         && image_resource_available(resource)
         && resource->width == 16 && resource->height == 16
-        && resource->pixels != NULL && images.stats.loaded == 1
-        && images.stats.decoded_bytes == 16u * 16u * 4u
+        && image_resource_available(wide_resource)
+        && wide_resource->width == 100 && wide_resource->height == 45
+        && fallback_resource != NULL
+        && image_resource_available(fallback_resource)
+        && fallback_resource->width == 16 && fallback_resource->height == 16
+        && app_resource != NULL && image_resource_available(app_resource)
+        && app_resource->width == 24 && app_resource->height == 24
+        && resource->pixels != NULL && images.stats.loaded == 4
+        && images.stats.decoded_bytes
+               == (16u * 16u + 100u * 45u + 16u * 16u + 24u * 24u) * 4u
         && resource->pixels[0] > 240 && resource->pixels[1] < 16
         && resource->pixels[2] < 16 && resource->pixels[3] > 240
+        && fallback_resource->pixels[0] < 16
+        && fallback_resource->pixels[1] < 16
+        && fallback_resource->pixels[2] > 240
         && layout_build(&layout, budget, &document, &stylesheet,
                         NULL, &images, 480);
     bool draw_seen = false;
+    bool wide_draw_seen = false;
+    bool app_draw_seen = false;
+    bool app_white_seen = false;
+    if (app_resource != NULL && app_resource->pixels != NULL) {
+        for (size_t i = 0; i < 24u * 24u; i++) {
+            const unsigned char *pixel = app_resource->pixels + i * 4u;
+            if (pixel[3] > 240 && pixel[0] > 240
+                && pixel[1] > 240 && pixel[2] > 240) {
+                app_white_seen = true;
+                break;
+            }
+        }
+    }
     if (ok) {
         for (size_t i = 0; i < layout.count; i++) {
             if (layout.commands[i].type == DRAW_IMAGE
@@ -1982,7 +2089,18 @@ static bool test_inline_svg_resource(Budget *budget)
                 && layout.commands[i].width == 16
                 && layout.commands[i].height == 16) {
                 draw_seen = true;
-                break;
+            }
+            if (layout.commands[i].type == DRAW_IMAGE
+                && layout.commands[i].image == wide_resource
+                && layout.commands[i].width == 100
+                && layout.commands[i].height == 45) {
+                wide_draw_seen = true;
+            }
+            if (layout.commands[i].type == DRAW_IMAGE
+                && layout.commands[i].image == app_resource
+                && layout.commands[i].width == 24
+                && layout.commands[i].height == 24) {
+                app_draw_seen = true;
             }
         }
     }
@@ -1990,7 +2108,8 @@ static bool test_inline_svg_resource(Budget *budget)
     images_destroy(&images);
     stylesheet_destroy(&stylesheet);
     document_destroy(&document);
-    return ok && draw_seen && budget->current == 0;
+    return ok && draw_seen && wide_draw_seen && app_draw_seen
+        && app_white_seen && budget->current == 0;
 }
 
 static bool test_visible_inline_svg_priority_resource(Budget *budget)

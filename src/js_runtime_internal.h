@@ -286,6 +286,7 @@ typedef struct DomBridge {
     bool navigation_replace;
     char navigation_url[2048];
     bool media_requested;
+    bool media_audio_only;
     ScriptMediaCommand media_command;
     TilefinchRequestMode media_mode;
     TilefinchCredentialsMode media_credentials;
@@ -809,6 +810,9 @@ JSValue js_dom_query_selector_method(JSContext *context,
 JSValue js_dom_record_event(JSContext *context,
                             JSValueConst this_value,
                             int argc, JSValueConst *argv);
+JSValue js_dom_record_event_handler(JSContext *context,
+                                    JSValueConst this_value,
+                                    int argc, JSValueConst *argv);
 JSValue js_dom_relation(JSContext *context,
                         JSValueConst this_value,
                         int argc, JSValueConst *argv);

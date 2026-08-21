@@ -227,6 +227,11 @@ bool script_runtime_consume_navigation(ScriptRuntime *runtime, char *url,
     return true;
 }
 
+bool script_runtime_has_pending_navigation(const ScriptRuntime *runtime)
+{
+    return runtime != NULL && runtime->bridge.navigation_requested;
+}
+
 bool script_runtime_consume_media_request(ScriptRuntime *runtime,
                                           ScriptMediaRequest *request)
 {
@@ -236,6 +241,7 @@ bool script_runtime_consume_media_request(ScriptRuntime *runtime,
     request->command = runtime->bridge.media_command;
     request->node_handle = runtime->bridge.media_node_handle;
     request->value = runtime->bridge.media_value;
+    request->audio_only = runtime->bridge.media_audio_only;
     request->mode = runtime->bridge.media_mode;
     request->credentials = runtime->bridge.media_credentials;
     if (runtime->bridge.media_source != NULL) {
@@ -245,9 +251,15 @@ bool script_runtime_consume_media_request(ScriptRuntime *runtime,
     budget_free(runtime->bridge.budget, runtime->bridge.media_source);
     runtime->bridge.media_source = NULL;
     runtime->bridge.media_requested = false;
+    runtime->bridge.media_audio_only = false;
     runtime->bridge.media_node_handle = 0;
     runtime->bridge.media_value = 0;
     return true;
+}
+
+bool script_runtime_has_pending_media_request(const ScriptRuntime *runtime)
+{
+    return runtime != NULL && runtime->bridge.media_requested;
 }
 
 static const char media_update_bootstrap[] =

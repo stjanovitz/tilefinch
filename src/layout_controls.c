@@ -4,6 +4,7 @@
 #include "layout_internal.h"
 
 #include <math.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -24,6 +25,41 @@ ControlType layout_input_control_type(lxb_dom_node_t *node)
     return CONTROL_INPUT;
 }
 
+static int control_ascii_attribute_integer(lxb_dom_node_t *node,
+                                           const char *name)
+{
+    size_t length = 0;
+    const char *text = document_attribute(node, name, &length);
+    if (text == NULL || length == 0 || length > 5u) return 0;
+    int value = 0;
+    for (size_t i = 0; i < length; i++) {
+        if (text[i] < '0' || text[i] > '9') return 0;
+        unsigned digit = (unsigned) (text[i] - '0');
+        if (value > (INT_MAX - (int) digit) / 10) return 0;
+        value = value * 10 + (int) digit;
+    }
+    return value;
+}
+
+static int control_button_label_width(lxb_dom_node_t *node)
+{
+    size_t length = 0;
+    const char *value = document_attribute(node, "value", &length);
+    if (value == NULL || length == 0 || length > 64u) return 96;
+    /* Native HTML controls size their anonymous label, not an arbitrary
+       fixed box. This bounded approximation tracks the PSP's 13px control
+       face closely and avoids stretching short submit labels. */
+    size_t characters = 0;
+    for (size_t at = 0; at < length && characters < 64u; characters++) {
+        unsigned char lead = (unsigned char) value[at++];
+        if ((lead & 0xe0u) == 0xc0u && at < length) at++;
+        else if ((lead & 0xf0u) == 0xe0u && at + 1u < length) at += 2u;
+        else if ((lead & 0xf8u) == 0xf0u && at + 2u < length) at += 3u;
+    }
+    int width = 16 + (int) characters * 7;
+    return width < 32 ? 32 : (width > 480 ? 480 : width);
+}
+
 int layout_control_default_width(lxb_dom_node_t *node)
 {
     if (layout_node_name_is(node, "textarea")) return 220;
@@ -31,8 +67,16 @@ int layout_control_default_width(lxb_dom_node_t *node)
     switch (layout_input_control_type(node)) {
     case CONTROL_TOGGLE: return 18;
     case CONTROL_RANGE: return 160;
-    case CONTROL_BUTTON: return 96;
-    default: return 220;
+    case CONTROL_BUTTON: return control_button_label_width(node);
+    default: {
+        int characters = control_ascii_attribute_integer(node, "size");
+        if (characters <= 0) return 220;
+        if (characters > 64) characters = 64;
+        /* HTML size= is a character-cell hint. Keep it bounded and use the
+           native control face's measured average advance plus chrome. */
+        int width = characters * 7 + 12;
+        return width < 32 ? 32 : (width > 480 ? 480 : width);
+    }
     }
 }
 
@@ -237,6 +281,55 @@ bool layout_paint_select_indicator(
         if (layout_add_command(context->layout, triangle) == NULL) {
             return false;
         }
+    }
+    return true;
+}
+
+bool layout_paint_audio_control(
+    LayoutContext *context, const ComputedStyle *style,
+    int x, int y, int width, int height)
+{
+    if (context == NULL || style == NULL) return false;
+    if (width < 44 || height < 24) return true;
+    int button = height - 16;
+    if (button > 30) button = 30;
+    if (button < 16) button = 16;
+    int button_x = x + 8;
+    int button_y = y + (height - button) / 2;
+    DrawCommand face = {
+        .type = DRAW_FILL_RECT, .x = button_x, .y = button_y,
+        .width = button, .height = button,
+        .color = 0x343a40, .radius = button / 2, .opacity_scale = 256
+    };
+    if (layout_add_command(context->layout, face) == NULL) return false;
+    int triangle_height = button / 2;
+    if (triangle_height < 8) triangle_height = 8;
+    int triangle_x = button_x + button / 2 - 2;
+    int triangle_y = button_y + (button - triangle_height) / 2;
+    for (int row = 0; row < triangle_height; row++) {
+        int half = row < triangle_height / 2
+            ? row : triangle_height - row - 1;
+        DrawCommand mark = {
+            .type = DRAW_FILL_RECT,
+            .x = triangle_x,
+            .y = triangle_y + row,
+            .width = 2 + half,
+            .height = 1,
+            .color = 0xffffff,
+            .opacity_scale = 256
+        };
+        if (layout_add_command(context->layout, mark) == NULL) return false;
+    }
+    int track_x = button_x + button + 10;
+    int track_width = x + width - track_x - 10;
+    if (track_width > 0) {
+        DrawCommand track = {
+            .type = DRAW_FILL_RECT,
+            .x = track_x, .y = y + height / 2 - 1,
+            .width = track_width, .height = 3,
+            .color = 0xa3a8af, .radius = 1, .opacity_scale = 256
+        };
+        if (layout_add_command(context->layout, track) == NULL) return false;
     }
     return true;
 }

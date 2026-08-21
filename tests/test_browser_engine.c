@@ -66,6 +66,8 @@ static bool write_large_youtube_replay(
         "<!doctype html><script>var ytInitialData = '"
         "{\"contents\":[{\"videoRenderer\":{\"title\":{\"runs\":[{\"text\":"
         "\"Ratchet Video\"}]},\"videoId\":\"abc_DEF-123\"}},"
+        "{\"videoRenderer\":{\"title\":{\"runs\":[{\"text\":"
+        "\"Second Ratchet Video\"}]},\"videoId\":\"def_GHI-456\"}},"
         "{\"padding\":\"";
     static const char suffix[] = "\"}]}'</script>";
     snprintf(directory, 128, "/tmp/tilefinch-youtube-large-XXXXXX");
@@ -230,6 +232,9 @@ int main(void)
     CHECK(test_engine_lifecycle() == 0);
     CHECK(test_page_video_activation() == 0);
     CHECK(test_page_video_data_candidate_activation() == 0);
+    CHECK(test_page_audio_activation() == 0);
+    CHECK(test_structured_audio_preview_activation() == 0);
+    CHECK(test_nomodule_capability_suppression() == 0);
     CHECK(test_committed_document_glyph_script_hints() == 0);
     CHECK(test_responsive_navigation_convergence() == 0);
     CHECK(test_scrollable_provisional_navigation() == 0);

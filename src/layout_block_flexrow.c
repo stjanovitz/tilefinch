@@ -65,10 +65,12 @@ bool layout_block_flexrow_section(LayoutContext *context,
             if (css_table_row && child_basis < child_minimum) {
                 child_basis = child_minimum;
             }
-            total_basis += child_basis;
-            total_hypothetical_basis += child_basis < child_minimum
-                                        ? child_minimum : child_basis;
-            total_grow += item->style.flex_grow;
+            total_basis = layout_add_coordinate(total_basis, child_basis);
+            total_hypothetical_basis = layout_add_coordinate(
+                total_hypothetical_basis,
+                child_basis < child_minimum ? child_minimum : child_basis);
+            total_grow = layout_add_coordinate(
+                total_grow, item->style.flex_grow);
             if (!table_row) {
                 if (item->style.margin_left_auto) {
                     total_main_auto_margins++;
@@ -95,11 +97,14 @@ bool layout_block_flexrow_section(LayoutContext *context,
         const TableTracks *table_tracks = table_row
             ? table_tracks_for_row(context, node, content_width)
             : NULL;
-        int gaps = table_row ? 0 : style->gap * (int) (flex_children - 1);
-        if (!table_row && total_basis + gaps > content_width) {
+        int gaps = table_row ? 0 : layout_clamp_coordinate(
+            (int64_t) style->gap * (int64_t) (flex_children - 1u));
+        if (!table_row
+            && layout_add_coordinate(total_basis, gaps) > content_width) {
             total_basis = total_hypothetical_basis;
         }
-        int remaining = content_width - total_basis - gaps;
+        int remaining = layout_subtract_coordinate(
+            layout_subtract_coordinate(content_width, total_basis), gaps);
         if (anonymous_cell_row && remaining > 0) {
             /* The anonymous table wrapper around an otherwise complete run
                of table-cell children shrink-wraps its row. The containing
@@ -108,9 +113,11 @@ bool layout_block_flexrow_section(LayoutContext *context,
         }
         int cursor_x = content_x;
         if (table_tracks != NULL && table_tracks->border_collapse) {
-            cursor_x += table_tracks->collapsed_left_gutter;
+            cursor_x = layout_add_coordinate(
+                cursor_x, table_tracks->collapsed_left_gutter);
         } else if (table_tracks != NULL) {
-            cursor_x += table_tracks->spacing_x;
+            cursor_x = layout_add_coordinate(
+                cursor_x, table_tracks->spacing_x);
         }
         int flex_gap = table_row ? 0 : style->gap;
         size_t css_table_auto_seen = 0;
@@ -120,20 +127,22 @@ bool layout_block_flexrow_section(LayoutContext *context,
         if (remaining > 0 && total_grow == 0
             && total_main_auto_margins == 0) {
             if (style->justify_content == JUSTIFY_CENTER) {
-                cursor_x += remaining / 2;
+                cursor_x = layout_add_coordinate(cursor_x, remaining / 2);
             } else if (style->justify_content == JUSTIFY_END) {
-                cursor_x += remaining;
+                cursor_x = layout_add_coordinate(cursor_x, remaining);
             } else if (style->justify_content == JUSTIFY_SPACE_BETWEEN
                        && flex_children > 1) {
-                flex_gap += remaining / (int) (flex_children - 1);
+                flex_gap = layout_add_coordinate(
+                    flex_gap, remaining / (int) (flex_children - 1));
             } else if (style->justify_content == JUSTIFY_SPACE_AROUND) {
                 int distributed = remaining / (int) flex_children;
-                cursor_x += distributed / 2;
-                flex_gap += distributed;
+                cursor_x = layout_add_coordinate(
+                    cursor_x, distributed / 2);
+                flex_gap = layout_add_coordinate(flex_gap, distributed);
             } else if (style->justify_content == JUSTIFY_SPACE_EVENLY) {
                 int distributed = remaining / ((int) flex_children + 1);
-                cursor_x += distributed;
-                flex_gap += distributed;
+                cursor_x = layout_add_coordinate(cursor_x, distributed);
+                flex_gap = layout_add_coordinate(flex_gap, distributed);
             }
         }
         int cursor_y = line->y;
@@ -175,8 +184,12 @@ bool layout_block_flexrow_section(LayoutContext *context,
                     &scratch->traversal.flex.lookahead_item,
                     content_width, style->gap);
                 line_items_remaining = metrics.count;
-                line_remaining = content_width - metrics.basis
-                                 - style->gap * (int) (metrics.count - 1);
+                int line_gaps = layout_clamp_coordinate(
+                    (int64_t) style->gap
+                    * (int64_t) (metrics.count - 1u));
+                line_remaining = layout_subtract_coordinate(
+                    layout_subtract_coordinate(
+                        content_width, metrics.basis), line_gaps);
                 line_total_grow = metrics.grow;
                 line_auto_margins = metrics.auto_main_margins;
                 auto_margin_seen = 0;
@@ -194,26 +207,33 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 if (line_remaining > 0 && line_total_grow == 0
                     && line_auto_margins == 0) {
                     if (style->justify_content == JUSTIFY_CENTER) {
-                        cursor_x += line_remaining / 2;
+                        cursor_x = layout_add_coordinate(
+                            cursor_x, line_remaining / 2);
                     } else if (style->justify_content == JUSTIFY_END) {
-                        cursor_x += line_remaining;
+                        cursor_x = layout_add_coordinate(
+                            cursor_x, line_remaining);
                     } else if (style->justify_content
                                == JUSTIFY_SPACE_BETWEEN
                                && metrics.count > 1) {
-                        flex_gap += line_remaining
-                                    / (int) (metrics.count - 1);
+                        flex_gap = layout_add_coordinate(
+                            flex_gap,
+                            line_remaining / (int) (metrics.count - 1));
                     } else if (style->justify_content
                                == JUSTIFY_SPACE_AROUND) {
                         int distributed = line_remaining
                                           / (int) metrics.count;
-                        cursor_x += distributed / 2;
-                        flex_gap += distributed;
+                        cursor_x = layout_add_coordinate(
+                            cursor_x, distributed / 2);
+                        flex_gap = layout_add_coordinate(
+                            flex_gap, distributed);
                     } else if (style->justify_content
                                == JUSTIFY_SPACE_EVENLY) {
                         int distributed = line_remaining
                                           / ((int) metrics.count + 1);
-                        cursor_x += distributed;
-                        flex_gap += distributed;
+                        cursor_x = layout_add_coordinate(
+                            cursor_x, distributed);
+                        flex_gap = layout_add_coordinate(
+                            flex_gap, distributed);
                     }
                 }
             }
@@ -229,7 +249,8 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 auto_margin_seen++;
                 int after = tilefinch_mul_div_int(
                     auto_margin_space, auto_margin_seen, line_auto_margins);
-                cursor_x += after - before;
+                cursor_x = layout_add_coordinate(
+                    cursor_x, after - before);
             }
             size_t table_span = table_row && !item->anonymous_text
                                 ? table_cell_span(item->node) : 1;
@@ -240,14 +261,18 @@ bool layout_block_flexrow_section(LayoutContext *context,
                     table_tracks, item->node, &placed_column,
                     &table_span, NULL);
                 table_child_index = placed_column;
-                cursor_x = content_x
-                    + (table_tracks->border_collapse
-                       ? table_tracks->collapsed_left_gutter
-                       : table_tracks->spacing_x);
+                cursor_x = layout_add_coordinate(
+                    content_x,
+                    table_tracks->border_collapse
+                        ? table_tracks->collapsed_left_gutter
+                        : table_tracks->spacing_x);
                 for (size_t i = 0;
                      i < placed_column && i < table_tracks->count; i++) {
-                    cursor_x += table_tracks->widths[i]
-                                + table_tracks->spacing_x;
+                    cursor_x = layout_add_coordinate(
+                        cursor_x,
+                        layout_add_coordinate(
+                            table_tracks->widths[i],
+                            table_tracks->spacing_x));
                 }
             }
             int child_width = 0;
@@ -257,11 +282,16 @@ bool layout_block_flexrow_section(LayoutContext *context,
                     table_span = table_tracks->count - table_child_index;
                 }
                 for (size_t i = 0; i < table_span; i++) {
-                    child_width += table_tracks->widths[table_child_index + i];
+                    child_width = layout_add_coordinate(
+                        child_width,
+                        table_tracks->widths[table_child_index + i]);
                 }
                 if (!table_tracks->border_collapse && table_span > 1) {
-                    child_width += table_tracks->spacing_x
-                                   * ((int) table_span - 1);
+                    child_width = layout_add_coordinate(
+                        child_width,
+                        layout_clamp_coordinate(
+                            (int64_t) table_tracks->spacing_x
+                            * (int64_t) (table_span - 1u)));
                 }
                 /* A spanning cell's authored width covers the complete grid
                    area, including the internal border-spacing gutters. The
@@ -309,7 +339,8 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 css_table_auto_seen++;
                 int after = tilefinch_mul_div_int(
                     remaining, css_table_auto_seen, css_table_auto_children);
-                child_width += after - before;
+                child_width = layout_add_coordinate(
+                    child_width, after - before);
             }
             int child_basis = child_width;
             int available = style->flex_wrap ? line_remaining : remaining;
@@ -317,8 +348,11 @@ bool layout_block_flexrow_section(LayoutContext *context,
                                                  : total_grow;
             if (available > 0 && available_grow > 0
                 && child_style->flex_grow > 0) {
-                child_width += available * child_style->flex_grow
-                               / available_grow;
+                child_width = layout_add_coordinate(
+                    child_width,
+                    tilefinch_mul_div_int(
+                        available, child_style->flex_grow,
+                        available_grow));
             } else if (remaining < 0 && !style->flex_wrap
                        && child_style->flex_shrink > 0
                        && total_shrink_weight > 0) {
@@ -338,7 +372,8 @@ bool layout_block_flexrow_section(LayoutContext *context,
                                     / total_shrink_weight);
                 int after = (int) ((long long) remaining * next_weight
                                    / total_shrink_weight);
-                child_width += after - before;
+                child_width = layout_add_coordinate(
+                    child_width, after - before);
                 if (child_width < child_minimum) child_width = child_minimum;
                 shrink_weight_seen = next_weight;
             }
@@ -372,12 +407,14 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 return false;
             }
             if (child_bottom > row_bottom) row_bottom = child_bottom;
-            int painted_right = cursor_x + child_width;
+            int painted_right = layout_add_coordinate(
+                cursor_x, child_width);
             for (size_t command_index = command_start;
                  command_index < context->layout->count; command_index++) {
                 const DrawCommand *painted =
                     &context->layout->commands[command_index];
-                int right = painted->x + painted->width;
+                int right = layout_add_coordinate(
+                    painted->x, painted->width);
                 if (right > painted_right) painted_right = right;
             }
             trace_flex_sizing(context, "painted", node, item->node,
@@ -391,7 +428,7 @@ bool layout_block_flexrow_section(LayoutContext *context,
                         context, item->node, child_style, child_width));
                 cursor_x = layout_fixed_floor(anonymous_cursor_fixed);
             } else {
-                cursor_x += child_width;
+                cursor_x = layout_add_coordinate(cursor_x, child_width);
             }
             if (auto_margin_space > 0 && auto_after) {
                 int before = tilefinch_mul_div_int(
@@ -399,9 +436,10 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 auto_margin_seen++;
                 int after = tilefinch_mul_div_int(
                     auto_margin_space, auto_margin_seen, line_auto_margins);
-                cursor_x += after - before;
+                cursor_x = layout_add_coordinate(
+                    cursor_x, after - before);
             }
-            cursor_x += flex_gap;
+            cursor_x = layout_add_coordinate(cursor_x, flex_gap);
             if (table_row) {
                 size_t next_column = placed_column + table_span;
                 if (next_column > table_child_index) {
@@ -437,8 +475,10 @@ bool layout_block_flexrow_section(LayoutContext *context,
                 aligned_item->style.margin.bottom);
             if (aligned_bottom > row_bottom) row_bottom = aligned_bottom;
         }
-        if (cross_height > 0 && row_bottom < flex_flow_top + cross_height) {
-            row_bottom = flex_flow_top + cross_height;
+        int cross_bottom = layout_add_coordinate(
+            flex_flow_top, cross_height);
+        if (cross_height > 0 && row_bottom < cross_bottom) {
+            row_bottom = cross_bottom;
         }
         reverse_flex_cross_items(
             context, node, style, row_order, flex_flow_top,

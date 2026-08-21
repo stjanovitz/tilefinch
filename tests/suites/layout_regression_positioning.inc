@@ -660,6 +660,38 @@
     document_destroy(&grid_rows_document);
     CHECK(budget.current == 0);
 
+    puts("test: zero-flex grid rows collapse bounded accordion content");
+    static const char collapsed_grid_page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0}"
+        "#closed{display:grid;grid-template-rows:0fr;width:120px}"
+        "#clip{min-height:0;overflow:hidden;background:#123456}"
+        "#content{display:block;height:60px;background:#abcdef}"
+        "</style><body><div id=closed><div id=clip>"
+        "<span id=content>HIDDEN</span></div></div></body>";
+    PocDocument collapsed_grid_document;
+    Stylesheet collapsed_grid_sheet;
+    LayoutDocument collapsed_grid_layout;
+    CHECK(document_parse(&collapsed_grid_document, &budget,
+                         collapsed_grid_page,
+                         strlen(collapsed_grid_page), 41)
+          && stylesheet_build(&collapsed_grid_sheet, &budget,
+                              &collapsed_grid_document, 480)
+          && layout_build(&collapsed_grid_layout, &budget,
+                          &collapsed_grid_document,
+                          &collapsed_grid_sheet, NULL, NULL, 480));
+    lxb_dom_node_t *collapsed_grid_root = lxb_dom_interface_node(
+        collapsed_grid_document.html);
+    const LayoutNodeBox *closed_box = layout_box_for_node(
+        &collapsed_grid_layout, find_id(collapsed_grid_root, "closed"));
+    const LayoutNodeBox *clip_box = layout_box_for_node(
+        &collapsed_grid_layout, find_id(collapsed_grid_root, "clip"));
+    CHECK(closed_box != NULL && closed_box->height == 0
+          && clip_box != NULL && clip_box->height == 0);
+    layout_destroy(&collapsed_grid_layout);
+    stylesheet_destroy(&collapsed_grid_sheet);
+    document_destroy(&collapsed_grid_document);
+    CHECK(budget.current == 0);
+
     puts("test: grid flex rows consume a definite minimum block size");
     static const char grid_minimum_page[] =
         "<!doctype html><style>html,body{margin:0;padding:0}"
@@ -727,6 +759,12 @@
     lxb_dom_node_t *staged_backdrop = find_id(
         lxb_dom_interface_node(staged_backdrop_document.html), "staged");
     ComputedStyle staged_backdrop_style = style_for_node(
+        &staged_backdrop_sheet, staged_backdrop, NULL);
+    CHECK(staged_backdrop_style.display == DISPLAY_NONE
+          && staged_backdrop_style.opacity == 0);
+    stylesheet_enable_static_custom_element_fallback(
+        &staged_backdrop_sheet);
+    staged_backdrop_style = style_for_node(
         &staged_backdrop_sheet, staged_backdrop, NULL);
     CHECK(staged_backdrop_style.display == DISPLAY_BLOCK
           && staged_backdrop_style.opacity == 255
@@ -1732,6 +1770,50 @@
     layout_destroy(&transformed_pseudo_layout);
     stylesheet_destroy(&transformed_pseudo_sheet);
     document_destroy(&transformed_pseudo_document);
+    CHECK(budget.current == 0);
+
+    puts("test: transforms establish absolute and fixed containing blocks");
+    static const char transformed_containing_page[] =
+        "<!doctype html><style>body{margin:0}"
+        "#host{width:160px;height:100px;margin-left:20px;margin-top:30px;"
+        "transform:translate(10px,5px)}"
+        "#abs,#fixed{width:20px;height:20px;right:0;bottom:0}"
+        "#abs{position:absolute}#rel{position:relative}#fixed{position:fixed}"
+        "</style><body><div id=host><div id=abs></div>"
+        "<div id=rel><div id=fixed></div></div></div></body>";
+    PocDocument transformed_containing_document;
+    Stylesheet transformed_containing_sheet;
+    LayoutDocument transformed_containing_layout;
+    CHECK(document_parse(
+              &transformed_containing_document, &budget,
+              transformed_containing_page,
+              strlen(transformed_containing_page), 44)
+          && stylesheet_build(
+              &transformed_containing_sheet, &budget,
+              &transformed_containing_document, 300)
+          && layout_build(
+              &transformed_containing_layout, &budget,
+              &transformed_containing_document,
+              &transformed_containing_sheet, NULL, NULL, 300));
+    lxb_dom_node_t *transformed_containing_root =
+        lxb_dom_interface_node(transformed_containing_document.html);
+    lxb_dom_node_t *transformed_abs = find_id(
+        transformed_containing_root, "abs");
+    lxb_dom_node_t *transformed_fixed = find_id(
+        transformed_containing_root, "fixed");
+    const LayoutNodeBox *transformed_abs_box = layout_box_for_node(
+        &transformed_containing_layout, transformed_abs);
+    const LayoutNodeBox *transformed_fixed_box = layout_box_for_node(
+        &transformed_containing_layout, transformed_fixed);
+    CHECK(transformed_abs_box != NULL && transformed_fixed_box != NULL
+          && transformed_abs_box->x == 170
+          && transformed_abs_box->y == 115
+          && transformed_fixed_box->x == 170
+          && transformed_fixed_box->y == 115
+          && transformed_containing_layout.fixed_count == 0);
+    layout_destroy(&transformed_containing_layout);
+    stylesheet_destroy(&transformed_containing_sheet);
+    document_destroy(&transformed_containing_document);
     CHECK(budget.current == 0);
 
     puts("test: bounded scroll interaction metadata and snap settling");

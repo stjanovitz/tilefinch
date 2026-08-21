@@ -648,6 +648,16 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
         && document.html != NULL && document.html_length != 0
         && strstr(document.html, "name=search_query") != NULL
         && strstr(document.html, "<a class=card autofocus") != NULL
+        && strstr(document.html, "data-tilefinch-provider-media") != NULL
+        && strstr(document.html,
+                  "class=details href=\"https://www.youtube.com/watch?v=")
+               != NULL
+        && strstr(document.html,
+                  "<span class=details-icon aria-hidden=true>"
+                  "<span class=details-i-dot></span>") != NULL
+        && strstr(document.html,
+                  "<span class=details-i-stem></span></span></a></div>")
+               != NULL
         && strstr(document.html, "class=compact-results") == NULL
         && strstr(document.html, "view-switch") == NULL
         && strstr(document.html, "tilefinch_layout") == NULL
@@ -698,8 +708,10 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
         strstr(document.html, "view-switch") == NULL
         && strstr(document.html, "tilefinch_layout") == NULL;
     bool compact_card_css = strstr(document.html,
-                  ".compact-results .card{min-height:60px;"
-                  "margin-bottom:6px;gap:8px}") != NULL;
+                  ".compact-results .result-row{min-height:60px;"
+                  "margin-bottom:6px;gap:6px}"
+                  ".compact-results .card{min-height:60px;gap:8px}")
+               != NULL;
     bool compact_thumb_css = strstr(document.html,
                   ".compact-results .thumb-wrap{width:106px;height:60px}")
                != NULL;
@@ -715,7 +727,10 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
         && document.result_count == 2 && compact_body
         && compact_has_no_page_switch && compact_card_css && compact_thumb_css
         && compact_hide_css && compact_duration_overlay
-        && strstr(document.html, "<a class=card autofocus") != NULL;
+        && strstr(document.html, "<a class=card autofocus") != NULL
+        && strstr(document.html,
+                  ".compact-results .details{width:46px}")
+               != NULL;
     if (!compact_search_ok) {
         fprintf(stderr, "youtube compact markup: body=%d no-switch=%d "
                 "card=%d thumb=%d hide=%d duration=%d\n",
@@ -1044,6 +1059,8 @@ static int test_foundation(void)
 
     puts("test: streaming allocation-phase recovery sweep");
     CHECK(test_streaming_navigation_allocation_sweep(&budget));
+    puts("test: streaming optional work sheds to a static page");
+    CHECK(test_streaming_navigation_optional_work_shed(&budget));
     CHECK(budget.current == 0);
 
     puts("test: bounded image-node cap retains allocation ownership");
@@ -1786,9 +1803,14 @@ static int test_foundation(void)
     static const char legacy_viewport_page[] =
         "<!doctype html><style>body{margin:0}#wide{min-width:900px;height:10px}"
         "</style><body><div id=wide></div></body>";
+    static const char mobile_doctype_page[] =
+        "<!DOCTYPE html PUBLIC '-//WAPFORUM//DTD XHTML Mobile 1.0//EN' "
+        "'http://www.wapforum.org/DTD/xhtml-mobile10.dtd'>"
+        "<html xmlns='http://www.w3.org/1999/xhtml'><body></body></html>";
     PocDocument declared_viewport_document;
     PocDocument numeric_viewport_document;
     PocDocument legacy_viewport_document;
+    PocDocument mobile_doctype_document;
     MobileViewport viewport;
     CHECK(document_parse(&declared_viewport_document, &budget,
                          declared_viewport_page,
@@ -1816,6 +1838,15 @@ static int test_foundation(void)
           && !viewport.declared && viewport.layout_width == 980
           && viewport.scale_numerator == 480
           && viewport.scale_denominator == 980);
+    CHECK(document_parse(&mobile_doctype_document, &budget,
+                         mobile_doctype_page,
+                         strlen(mobile_doctype_page), 17)
+          && document_mobile_viewport(&mobile_doctype_document, 480, 980,
+                                      &viewport)
+          && !viewport.declared && viewport.device_width
+          && viewport.layout_width == 480
+          && viewport.scale_numerator == 1
+          && viewport.scale_denominator == 1);
     Stylesheet legacy_viewport_sheet;
     LayoutDocument legacy_viewport_layout;
     CHECK(stylesheet_build(&legacy_viewport_sheet, &budget,
@@ -1828,6 +1859,7 @@ static int test_foundation(void)
     layout_destroy(&legacy_viewport_layout);
     stylesheet_destroy(&legacy_viewport_sheet);
     document_destroy(&legacy_viewport_document);
+    document_destroy(&mobile_doctype_document);
     document_destroy(&numeric_viewport_document);
     document_destroy(&declared_viewport_document);
 
@@ -2048,6 +2080,182 @@ static int test_foundation(void)
           && stale_document.text_bytes > stale_text_bytes
           && stale_document.body_text_length == strlen(recovered_body));
     document_destroy(&stale_document);
+
+    puts("test: loading-only client shells degrade to metadata summaries");
+    static const char shell_page[] =
+        "<!doctype html><title>Account</title>"
+        "<meta name=description content='Connect with friends and share "
+        "updates from this service.'><body><main>Account Loading...</main>"
+        "<script>window.applicationBootstrap={large:true}</script></body>";
+    PocDocument shell_document = {0};
+    CHECK(document_parse(&shell_document, &budget, shell_page,
+                         sizeof(shell_page) - 1u, 17)
+          && document_install_static_shell_fallback(&shell_document));
+    const char *shell_body = document_body_text(&shell_document);
+    CHECK(shell_body != NULL
+          && strstr(shell_body, "Connect with friends") != NULL
+          && strstr(shell_body, "published summary") != NULL
+          && !document_install_static_shell_fallback(&shell_document));
+    document_destroy(&shell_document);
+
+    puts("test: failed script shells expose bounded authored noscript fallback");
+    static const char noscript_shell_page[] =
+        "<!doctype html><body><div id=challenge></div><script>start()</script>"
+        "<noscript><h1>JavaScript is unavailable</h1>"
+        "<p>Reload after checking the connection.</p></noscript></body>";
+    DocumentParser noscript_parser = {0};
+    PocDocument noscript_shell_document = {0};
+    CHECK(document_parser_begin(&noscript_parser, &budget));
+    CHECK(document_parser_set_scripting(&noscript_parser, true));
+    CHECK(document_parser_feed(&noscript_parser, noscript_shell_page,
+                               sizeof(noscript_shell_page) - 1u));
+    CHECK(document_parser_finish(&noscript_parser,
+                                 &noscript_shell_document));
+    const char *noscript_raw = document_body_text(&noscript_shell_document);
+    CHECK(noscript_raw != NULL && strstr(noscript_raw, "<h1>") != NULL
+          && document_install_static_shell_fallback(
+                 &noscript_shell_document));
+    const char *noscript_fallback = document_body_text(
+        &noscript_shell_document);
+    CHECK(noscript_fallback != NULL
+          && strstr(noscript_fallback, "JavaScript is unavailable") != NULL
+          && strstr(noscript_fallback, "<h1>") == NULL);
+    document_destroy(&noscript_shell_document);
+
+    puts("test: empty hydration roots retain chrome and gain metadata");
+    static const char empty_shell_page[] =
+        "<!doctype html><title>Cloud tools</title>"
+        "<meta name=description content='Use your files and tools from the web.'>"
+        "<meta property='og:image' content='https://assets.test/preview.png'>"
+        "<body><header>Cloud</header><div id=root><div class=viewport>"
+        "<div class=root-component></div></div></div>"
+        "<script src='/large-client.js'></script></body>";
+    PocDocument empty_shell_document = {0};
+    CHECK(document_parse(&empty_shell_document, &budget, empty_shell_page,
+                         sizeof(empty_shell_page) - 1u, 17)
+          && document_install_static_shell_fallback(&empty_shell_document));
+    const char *empty_shell_body = document_body_text(&empty_shell_document);
+    lxb_dom_node_t *empty_shell_root = lxb_dom_interface_node(
+        empty_shell_document.html);
+    lxb_dom_node_t *empty_shell_preview = find_id(
+        empty_shell_root, "tilefinch-static-preview");
+    size_t empty_shell_src_length = 0;
+    const char *empty_shell_src = empty_shell_preview == NULL ? NULL
+        : document_attribute(empty_shell_preview, "src",
+                             &empty_shell_src_length);
+    CHECK(empty_shell_body != NULL
+          && strstr(empty_shell_body, "Cloud") != NULL
+          && strstr(empty_shell_body, "Use your files") != NULL
+          && empty_shell_preview != NULL && empty_shell_src != NULL
+          && empty_shell_src_length == strlen("https://assets.test/preview.png")
+          && memcmp(empty_shell_src, "https://assets.test/preview.png",
+                    empty_shell_src_length) == 0
+          && !document_install_static_shell_fallback(&empty_shell_document));
+    document_destroy(&empty_shell_document);
+
+    static const char short_content_page[] =
+        "<!doctype html><title>Ready</title>"
+        "<meta name=description content='A complete, useful static page "
+        "description.'><body><main>Welcome to the useful page.</main></body>";
+    PocDocument short_content_document = {0};
+    CHECK(document_parse(&short_content_document, &budget,
+                         short_content_page,
+                         sizeof(short_content_page) - 1u, 17)
+          && !document_install_static_shell_fallback(
+                 &short_content_document));
+    document_destroy(&short_content_document);
+
+    puts("test: empty mobile hydration slots retain authored navigation");
+    static const char static_navigation_page[] =
+        "<!doctype html><body><header><div><noscript></noscript></div>"
+        "<nav style='display:none'><a href='/features'><span>Features</span>"
+        "</a><a href='/privacy'>Privacy</a><a href='/help'>Help</a>"
+        "<a href='/download'>Download</a></nav></header><main>Ready</main>"
+        "</body>";
+    PocDocument static_navigation_document = {0};
+    CHECK(document_parse(&static_navigation_document, &budget,
+                         static_navigation_page,
+                         sizeof(static_navigation_page) - 1u, 19)
+          && document_install_static_shell_fallback(
+                 &static_navigation_document));
+    const char *static_navigation_body =
+        document_body_text(&static_navigation_document);
+    CHECK(static_navigation_body != NULL
+          && strstr(static_navigation_body, "Features") != NULL
+          && strstr(static_navigation_body, "Privacy") != NULL
+          && strstr(static_navigation_body, "Download") != NULL
+          && !document_install_static_shell_fallback(
+                 &static_navigation_document));
+    document_destroy(&static_navigation_document);
+
+    puts("test: shed app shells recover a bounded authored top bar");
+    static const char recovered_header_page[] =
+        "<!doctype html><title>Audio service</title>"
+        "<link rel=manifest href=/manifest.webmanifest>"
+        "<meta property=og:site_name content='Audio Service'>"
+        "<body><main><h1>Recent releases</h1></main>"
+        "<nav aria-label='Primary'><a href=/home aria-label=Home>"
+        "<svg></svg></a><a href=/search title=Search><svg></svg></a>"
+        "<a href=/library><img alt=Library></a></nav></body>";
+    PocDocument recovered_header_document = {0};
+    CHECK(document_parse(&recovered_header_document, &budget,
+                         recovered_header_page,
+                         sizeof(recovered_header_page) - 1u, 19)
+          && document_install_static_shell_fallback(
+                 &recovered_header_document));
+    const char *recovered_header_body = document_body_text(
+        &recovered_header_document);
+    lxb_dom_node_t *recovered_header_body_node = document_body_node(
+        &recovered_header_document);
+    CHECK(recovered_header_body != NULL
+          && recovered_header_body_node != NULL
+          && recovered_header_body_node->first_child != NULL
+          && strcmp(document_element_name(
+                        recovered_header_body_node->first_child, NULL),
+                    "header") == 0
+          && strstr(recovered_header_body, "Audio Service") != NULL
+          && strstr(recovered_header_body, "Home") != NULL
+          && strstr(recovered_header_body, "Search") != NULL
+          && strstr(recovered_header_body, "Library") != NULL
+          && !document_install_static_shell_fallback(
+                 &recovered_header_document));
+    document_destroy(&recovered_header_document);
+
+    static const char recovered_tab_bar_page[] =
+        "<!doctype html><title>Media Player</title>"
+        "<meta property=og:site_name content='Media Player'>"
+        "<body><main><h1>Recent releases</h1></main>"
+        "<div data-testid=bottom-tab-navigation><div>"
+        "<a href=/'><svg></svg><span>Home</span></a>"
+        "<a href=/search><svg></svg><span>Search</span></a>"
+        "<a href=/'><svg></svg><span>Your Library</span></a>"
+        "</div></div></body>";
+    PocDocument recovered_tab_bar_document = {0};
+    CHECK(document_parse(&recovered_tab_bar_document, &budget,
+                         recovered_tab_bar_page,
+                         sizeof(recovered_tab_bar_page) - 1u, 19)
+          && document_install_static_shell_fallback(
+                 &recovered_tab_bar_document));
+    const char *recovered_tab_bar_body = document_body_text(
+        &recovered_tab_bar_document);
+    CHECK(recovered_tab_bar_body != NULL
+          && strstr(recovered_tab_bar_body, "Media Player") != NULL
+          && strstr(recovered_tab_bar_body, "Home") != NULL
+          && strstr(recovered_tab_bar_body, "Search") != NULL);
+    document_destroy(&recovered_tab_bar_document);
+
+    static const char ordinary_navigation_page[] =
+        "<!doctype html><title>Article</title><body><main><h1>Article</h1>"
+        "<p>Useful authored content stays unchanged.</p></main>"
+        "<nav><a href=/one>One</a><a href=/two>Two</a>"
+        "<a href=/three>Three</a></nav></body>";
+    PocDocument ordinary_navigation_document = {0};
+    CHECK(document_parse(&ordinary_navigation_document, &budget,
+                         ordinary_navigation_page,
+                         sizeof(ordinary_navigation_page) - 1u, 19)
+          && !document_install_static_shell_fallback(
+                 &ordinary_navigation_document));
+    document_destroy(&ordinary_navigation_document);
 
     puts("test: cooperative layout work boundaries and cancellation");
     char cooperative_page[16384] =

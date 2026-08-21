@@ -3151,6 +3151,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             const NavigationEntry *dom_entry =
                 navigation_current(engine_views->navigation);
             bool same_page_media = browser->media.page_source
+                && browser->media.page_audio
+                       == dom_media_request.audio_only
                 && browser->media.page_media_node_handle
                        == dom_media_request.node_handle
                 && strcmp(browser->media.source,
@@ -3163,7 +3165,20 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     dom_media_request.source,
                     strlen(dom_media_request.source));
                 same_page_media = dom_entry != NULL
-                    && (kind == MEDIA_DISCOVERY_HLS
+                    && (dom_media_request.audio_only
+                        ? kind != MEDIA_DISCOVERY_HLS
+                          && psp_media_open_page_audio(
+                              &browser->media, dom_media_request.source,
+                              dom_entry->url,
+                              engine_views->navigation->generation,
+                              dom_media_request.node_handle,
+                              dom_media_request.mode,
+                              dom_media_request.credentials,
+                              dom_media_request.command
+                                  == SCRIPT_MEDIA_COMMAND_PLAY,
+                              dom_media_request.command
+                                  == SCRIPT_MEDIA_COMMAND_LOAD)
+                        : kind == MEDIA_DISCOVERY_HLS
                         ? psp_media_open_page_hls(
                             &browser->media, dom_media_request.source,
                             dom_entry->url,
@@ -4538,7 +4553,13 @@ int main(int argc, char *argv[])
     engine_config->resources.maximum_stylesheet_file_bytes = 768 * KIB;
     engine_config->resources.maximum_images = 24;
     engine_config->resources.maximum_image_bytes = 1536 * KIB;
-    engine_config->resources.maximum_image_file_bytes = 384 * KIB;
+    /* Keep the aggregate image ceiling unchanged, but let one visible mobile
+       hero consume up to a third of it. Current CDNs commonly produce
+       display-sized PNG fallbacks just above 384 KiB; rejecting the complete
+       response wastes the transfer and leaves translucent foreground panels
+       composited over white. At most three such responses can be admitted by
+       the existing 1536 KiB aggregate bound. */
+    engine_config->resources.maximum_image_file_bytes = 512 * KIB;
     engine_config->resources.maximum_decoded_image_bytes = 3 * MIB;
     engine_config->resources.timeout_ms = 15000;
 

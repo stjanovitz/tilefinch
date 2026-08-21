@@ -759,6 +759,33 @@ static bool navigation_finish_authoritative_layout(
     bool progressive_preview_candidate,
     const FontSet *fonts, const ImageResources *images)
 {
+    /* A completed client shell can contain substantial authored text yet
+       yield no meaningful paint commands. Retry that exceptional case once
+       with the bounded static-content policy. The old layout remains owned
+       until the replacement proves it exposes more content, so recovery is
+       both off the normal path and transactional. */
+    const char *body_text = session->page.layout.count <= 1u
+        ? document_body_text(&session->page.document) : NULL;
+    if (body_text != NULL && session->page.document.body_text_length >= 64u
+        && !session->page.stylesheet.static_custom_element_fallback) {
+        stylesheet_enable_static_custom_element_fallback(
+            &session->page.stylesheet);
+        (void) document_install_static_shell_fallback(
+            &session->page.document);
+        LayoutDocument recovered = {0};
+        uint64_t recovery_started = navigation_now_us();
+        if (navigation_build_layout(session, &recovered, fonts, images)
+            && recovered.count > session->page.layout.count) {
+            layout_destroy(&session->page.layout);
+            session->page.layout = recovered;
+            uint64_t elapsed = navigation_record_layout_slices(
+                session, recovery_started, &session->page.layout);
+            session->performance.layout_us += elapsed;
+            session->performance.final_layout_us += elapsed;
+        } else {
+            layout_destroy(&recovered);
+        }
+    }
     if (!navigation_commit_checkpoint(
             session, "navigation-layout",
             session->page.layout.layout_work_units)) return false;
@@ -1007,9 +1034,11 @@ static bool navigation_commit_document(
             streaming->preview_layout_reuse = NULL;
         }
     }
-    if (session->document_scripts_enabled
+    bool optional_work_shed = streaming != NULL
+        && streaming->optional_work_shed;
+    if (!optional_work_shed && (session->document_scripts_enabled
         || session->external_resources_enabled
-        || session->web_fonts_enabled) {
+        || session->web_fonts_enabled)) {
         size_t maximum_file = session->document_scripts_enabled
             ? session->maximum_script_file_bytes : 0;
         if (session->external_resources_enabled
@@ -1145,6 +1174,12 @@ static bool navigation_commit_document(
             session, "navigation-style",
             session->page.document.node_count)) goto fail;
     if (session->external_resources_enabled) {
+        if (stylesheet_document_resources_prepare_complete_census(
+                &session->page.stylesheet_resources)) {
+            stylesheet_external_current = false;
+            user_stylesheet_current = false;
+            session->page.compiled_stylesheet_cacheable = false;
+        }
         phase_started = navigation_now_us();
         /* Parser-time author code may leave temporary QuickJS objects alive
            immediately before the authoritative stylesheet pass. A normal GC
@@ -1306,6 +1341,7 @@ static bool navigation_commit_document(
             session->script_skipped_cross_origin =
                 metrics.skipped_cross_origin;
             session->script_skipped_module = metrics.skipped_module;
+            session->script_skipped_nomodule = metrics.skipped_nomodule;
             session->script_skipped_quota = metrics.skipped_quota;
             session->script_skipped_pressure = metrics.skipped_pressure;
             session->script_pressure_collections =
@@ -1468,12 +1504,17 @@ static bool navigation_commit_document(
        satisfied reliably; reveal readable light DOM while retaining compact
        author fallbacks for navigation chrome. Successful script pipelines
        keep ordinary custom-element semantics. */
-    if (session->script_failed != 0
+    bool static_script_fallback =
+        (streaming != NULL && streaming->script_disabled_after_failure)
+        || session->script_failed != 0
         || session->script_skipped_quota != 0
         || session->script_skipped_pressure != 0
-        || session->script_cost_class_rejections != 0) {
+        || session->script_cost_class_rejections != 0;
+    if (static_script_fallback) {
         stylesheet_enable_static_custom_element_fallback(
             &session->page.stylesheet);
+        (void) document_install_static_shell_fallback(
+            &session->page.document);
     }
     if (!navigation_commit_checkpoint(
             session, "navigation-final-style",

@@ -960,6 +960,27 @@
               && glyph.advance == 16 && fallback_ink > 8);
         font_glyph_destroy(sans, &glyph);
     }
+    /* Missing private-use webfont glyphs for critical mobile navigation
+       controls retain a small procedural shape instead of tofu. */
+    const unsigned navigation_icon_probes[] = {
+        0xe700u, /* menu */
+        0xe721u, /* search */
+        0xe70du, /* disclosure */
+        0xe0d5u  /* forward */
+    };
+    for (size_t probe = 0;
+         probe < sizeof(navigation_icon_probes)
+                     / sizeof(navigation_icon_probes[0]); probe++) {
+        CHECK(font_glyph_load(
+            sans, navigation_icon_probes[probe], 16, false, &glyph));
+        size_t icon_ink = 0;
+        for (int pixel = 0; pixel < glyph.width * glyph.height; pixel++) {
+            if (glyph.pixels[pixel] != 0) icon_ink++;
+        }
+        CHECK(glyph.width == 16 && glyph.height == 16
+              && glyph.advance == 16 && icon_ink > 8);
+        font_glyph_destroy(sans, &glyph);
+    }
     /* Keep emoji presentation selectors and joiners from becoming visible
        tofu or consuming an extra em. Complex sequences remain monochrome. */
     CHECK(font_glyph_load(sans, 0xfe0fu, 16, false, &glyph)

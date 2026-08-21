@@ -47,6 +47,7 @@ static bool navigation_stream_retire_failed_script_runtime(
     script_runtime_destroy(stream->runtime);
     stream->runtime = NULL;
     stream->script_disabled_after_failure = true;
+    stream->session->performance.optional_work_sheds++;
     stream->script_result.success = false;
     snprintf(stream->script_result.summary,
              sizeof(stream->script_result.summary),
@@ -226,6 +227,13 @@ static bool navigation_stream_element_closed(void *opaque,
     stream->session->performance.parser_runtime_startup_us +=
         runtime_finished >= runtime_started
             ? runtime_finished - runtime_started : 0;
+    if (stream->script_disabled_after_failure || stream->runtime == NULL) {
+        uint64_t callback_finished = navigation_now_us();
+        stream->session->performance.parser_callback_us +=
+            callback_finished >= callback_started
+                ? callback_finished - callback_started : 0;
+        return true;
+    }
     uint64_t stylesheet_started = runtime_finished;
     /* Snapshot parser-owned links before the first author callback.  Any
        stylesheet link inserted by that callback remains absent from this

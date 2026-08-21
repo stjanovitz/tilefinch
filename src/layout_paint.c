@@ -651,18 +651,20 @@ void translate_node_subtree(LayoutDocument *layout,
     size_t command_end = root->command_end;
     if (command_end > layout->count) command_end = layout->count;
     for (size_t i = command_start; i < command_end; i++) {
+        bool viewport_fixed = false;
+        for (size_t fixed = 0; fixed < layout->fixed_count; fixed++) {
+            const FixedRange *range = &layout->fixed_ranges[fixed];
+            if (i >= range->command_start && i < range->command_end) {
+                viewport_fixed = true;
+                break;
+            }
+        }
+        if (viewport_fixed) continue;
         layout->commands[i].x += dx;
         layout->commands[i].y += dy;
     }
     for (size_t i = 0; i < layout->sticky_count; i++) {
         StickyRange *range = &layout->sticky_ranges[i];
-        if (range->command_start >= command_start
-            && range->command_end <= command_end) {
-            range->origin_y += dy;
-        }
-    }
-    for (size_t i = 0; i < layout->fixed_count; i++) {
-        FixedRange *range = &layout->fixed_ranges[i];
         if (range->command_start >= command_start
             && range->command_end <= command_end) {
             range->origin_y += dy;
@@ -678,6 +680,15 @@ void translate_node_subtree(LayoutDocument *layout,
         interactions[LAYOUT_NODE_LINK_END] < layout->link_count
         ? interactions[LAYOUT_NODE_LINK_END] : layout->link_count;
     for (size_t i = link_start; i < link_end; i++) {
+        bool viewport_fixed = false;
+        for (size_t fixed = 0; fixed < layout->fixed_count; fixed++) {
+            const FixedRange *range = &layout->fixed_ranges[fixed];
+            if (i >= range->link_start && i < range->link_end) {
+                viewport_fixed = true;
+                break;
+            }
+        }
+        if (viewport_fixed) continue;
         layout->links[i].x += dx;
         layout->links[i].y += dy;
     }
@@ -688,6 +699,15 @@ void translate_node_subtree(LayoutDocument *layout,
         interactions[LAYOUT_NODE_CONTROL_END] < layout->control_count
         ? interactions[LAYOUT_NODE_CONTROL_END] : layout->control_count;
     for (size_t i = control_start; i < control_end; i++) {
+        bool viewport_fixed = false;
+        for (size_t fixed = 0; fixed < layout->fixed_count; fixed++) {
+            const FixedRange *range = &layout->fixed_ranges[fixed];
+            if (i >= range->control_start && i < range->control_end) {
+                viewport_fixed = true;
+                break;
+            }
+        }
+        if (viewport_fixed) continue;
         layout->controls[i].x += dx;
         layout->controls[i].y += dy;
     }
@@ -701,7 +721,8 @@ void translate_node_subtree(LayoutDocument *layout,
     while (at != NULL) {
         LayoutNodeBox *box = layout_box_for_node_mutable(layout, at);
         if (box != NULL && box->command_start >= command_start
-            && box->command_end <= command_end) {
+            && box->command_end <= command_end
+            && box->positioned_ancestor_distance != UINT8_MAX) {
             box->x += dx;
             box->y += dy;
         }

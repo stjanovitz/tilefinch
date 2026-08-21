@@ -1271,7 +1271,7 @@ bool psp_media_system_suspended(const PspMediaSession *media)
 
 static void psp_media_prepare_route_kind(
     PspMediaSession *media, const char *url, uint64_t generation,
-    bool direct_page_route, bool autoplay)
+    bool direct_page_route, bool direct_page_audio, bool autoplay)
 {
     if (media == NULL) return;
     if (media->system_suspended) return;
@@ -1327,6 +1327,7 @@ static void psp_media_prepare_route_kind(
                 media, "leave-video-released");
             media->source[0] = '\0';
             media->page_source = false;
+            media->page_audio = false;
             media->page_hls = false;
             media->page_document_url[0] = '\0';
             media->page_media_node_handle = 0;
@@ -1381,8 +1382,9 @@ static void psp_media_prepare_route_kind(
                    A fresh navigation generation is an explicit retry. */
                 media->requested_quality =
                     psp_media_open_quality(media);
-                media->audio_only = !direct_page_route && !offline_route
-                    && browser_profile_youtube_audio_only(media->profile);
+                media->audio_only = direct_page_audio
+                    || (!direct_page_route && !offline_route
+                        && browser_profile_youtube_audio_only(media->profile));
                 media->quality_fallback_attempted = false;
                 media->open_service_pending = true;
                 psp_media_dispatch(media, (PspMediaEvent) {
@@ -1415,9 +1417,11 @@ static void psp_media_prepare_route_kind(
     media->clock_us = 0;
     media->offline_source = false;
     media->page_source = direct_page_route;
+    media->page_audio = direct_page_route && direct_page_audio;
     media->page_hls = false;
-    media->audio_only = !direct_page_route && !offline_route
-        && browser_profile_youtube_audio_only(media->profile);
+    media->audio_only = media->page_audio
+        || (!direct_page_route && !offline_route
+            && browser_profile_youtube_audio_only(media->profile));
     media->page_media_report_us = 0;
     if (!direct_page_route) {
         media->page_document_url[0] = '\0';
@@ -1509,21 +1513,45 @@ static void psp_media_prepare_route_kind(
     }, "route-open");
     psp_ui_media_set_resolving(
         &media->ui, offline_route ? "Saved video"
+            : media->page_audio ? "Page audio"
             : direct_page_route ? "Page video" : "YouTube video");
 }
 
 void psp_media_prepare_route(
     PspMediaSession *media, const char *url, uint64_t generation)
 {
-    psp_media_prepare_route_kind(media, url, generation, false, true);
+    if (media != NULL && media->provider_direct_route) {
+        /* Direct result activation deliberately keeps the results DOM as the
+           rollback surface. Reconcile against its generation, not its URL;
+           a real navigation still tears the route down normally. */
+        if (media->generation == generation) return;
+        media->provider_direct_route = false;
+    }
+    psp_media_prepare_route_kind(media, url, generation, false, false, true);
 }
 
-bool psp_media_open_page_source(
+bool psp_media_open_provider_route(
+    PspMediaSession *media, const char *url, uint64_t backing_generation)
+{
+    if (media == NULL || !youtube_watch_url_supported(url)
+        || backing_generation == 0 || media->system_suspended) return false;
+    media->provider_direct_route = true;
+    psp_media_prepare_route_kind(
+        media, url, backing_generation, false, false, true);
+    bool accepted = media->generation == backing_generation
+        && strcmp(media->source, url) == 0
+        && (media->open_service_pending || media->playback != NULL
+            || media->ui.failed);
+    if (!accepted) media->provider_direct_route = false;
+    return accepted;
+}
+
+static bool psp_media_open_page_source_kind(
     PspMediaSession *media, const char *source_url,
     const char *document_url, uint64_t generation,
     int64_t node_handle, TilefinchRequestMode mode,
-    TilefinchCredentialsMode credentials, bool autoplay,
-    bool reload_source)
+    TilefinchCredentialsMode credentials, bool audio_only,
+    bool autoplay, bool reload_source)
 {
     if (media == NULL || source_url == NULL || document_url == NULL
         || node_handle < 0
@@ -1533,6 +1561,7 @@ bool psp_media_open_page_source(
        not change. Play on the same source retains the cheap pipeline reuse. */
     bool same_route = !reload_source && media->page_source
         && !media->page_hls
+        && media->page_audio == audio_only
         && media->generation == generation
         && strcmp(media->source, source_url) == 0
         && strcmp(media->page_document_url, document_url) == 0;
@@ -1550,7 +1579,7 @@ bool psp_media_open_page_source(
                 .reuse_pipeline = true,
                 .has_separate_audio = false,
                 .audio_only = media->audio_only
-            }, "page-video-return");
+            }, audio_only ? "page-audio-return" : "page-video-return");
             media->ui.visible = true;
             psp_ui_media_show_controls(&media->ui);
             return true;
@@ -1562,14 +1591,40 @@ bool psp_media_open_page_source(
                 .type = PSP_MEDIA_EVENT_RETRY,
                 .autoplay = autoplay,
                 .has_separate_audio = false
-            }, "page-video-retry");
-            psp_ui_media_set_resolving(&media->ui, "Page video");
+            }, audio_only ? "page-audio-retry" : "page-video-retry");
+            psp_ui_media_set_resolving(
+                &media->ui, audio_only ? "Page audio" : "Page video");
         }
         return media->open_service_pending;
     }
     psp_media_prepare_route_kind(
-        media, source_url, generation, true, autoplay);
-    return media->page_source && strcmp(media->source, source_url) == 0;
+        media, source_url, generation, true, audio_only, autoplay);
+    return media->page_source && media->page_audio == audio_only
+        && strcmp(media->source, source_url) == 0;
+}
+
+bool psp_media_open_page_source(
+    PspMediaSession *media, const char *source_url,
+    const char *document_url, uint64_t generation,
+    int64_t node_handle, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, bool autoplay,
+    bool reload_source)
+{
+    return psp_media_open_page_source_kind(
+        media, source_url, document_url, generation, node_handle,
+        mode, credentials, false, autoplay, reload_source);
+}
+
+bool psp_media_open_page_audio(
+    PspMediaSession *media, const char *source_url,
+    const char *document_url, uint64_t generation,
+    int64_t node_handle, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, bool autoplay,
+    bool reload_source)
+{
+    return psp_media_open_page_source_kind(
+        media, source_url, document_url, generation, node_handle,
+        mode, credentials, true, autoplay, reload_source);
 }
 
 bool psp_media_open_page_hls(
@@ -1608,6 +1663,8 @@ void psp_media_close(PspMediaSession *media)
 {
     if (media == NULL) return;
     psp_media_session_checkpoint(media, "close-begin");
+    bool provider_direct_route = media->provider_direct_route;
+    media->provider_direct_route = false;
     uint64_t recovery_us = psp_media_recovery_position_us(media);
     bool recovery_in_flight = media->job_phase == PSP_MEDIA_JOB_SEEK_PREPARE
         || media->job_phase == PSP_MEDIA_JOB_SEEK_PRIME
@@ -1620,7 +1677,11 @@ void psp_media_close(PspMediaSession *media)
         || media->pause_boundary_pending
         || media->recovery_service_active
         || media->ui.failed
-        || (media->playback != NULL && !media->have_frame);
+        || (media->playback != NULL && !media->have_frame)
+        /* The backing results document, not a watch document, owns this
+           route. Back returns to it immediately; retaining the decoder would
+           reserve transport and ME memory for no same-page return path. */
+        || provider_direct_route;
     bool retain_pipeline = !discard_incomplete_pipeline
         && media->playback != NULL;
     psp_media_dispatch(media, (PspMediaEvent) {
@@ -1646,6 +1707,7 @@ void psp_media_close(PspMediaSession *media)
         psp_media_pipeline_destroy(media);
     if (discard_incomplete_pipeline)
         psp_media_finish_synchronous_quiesce(media, "close-released");
+    if (provider_direct_route) media->source[0] = '\0';
     psp_media_session_checkpoint(media, "close-end");
 }
 

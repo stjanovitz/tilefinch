@@ -4,8 +4,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include <lexbor/dom/interface.h>
+#include <lexbor/dom/interfaces/document_type.h>
 #include <lexbor/dom/interfaces/text.h>
 #include <lexbor/html/interfaces/template_element.h>
 #include <lexbor/html/parser.h>
@@ -684,6 +686,809 @@ bool document_refresh(PocDocument *document)
     return true;
 }
 
+static bool document_name_is(lxb_dom_node_t *node, const char *wanted)
+{
+    size_t length = 0;
+    const char *name = document_element_name(node, &length);
+    size_t wanted_length = wanted == NULL ? 0 : strlen(wanted);
+    return name != NULL && length == wanted_length
+        && strncasecmp(name, wanted, length) == 0;
+}
+
+static lxb_dom_node_t *document_bounded_next(lxb_dom_node_t *node,
+                                             lxb_dom_node_t *root,
+                                             bool skip_children)
+{
+    if (node == NULL || root == NULL) return NULL;
+    if (!skip_children && node->first_child != NULL) return node->first_child;
+    while (node != root && node->next == NULL) node = node->parent;
+    return node == root ? NULL : node->next;
+}
+
+static bool document_loading_only_body(lxb_dom_node_t *body)
+{
+    if (body == NULL) return false;
+    char visible[80] = {0};
+    size_t used = 0;
+    lxb_dom_node_t *node = body;
+    for (size_t visited = 0; node != NULL && visited < 512u; visited++) {
+        bool skip = node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && (document_name_is(node, "script")
+                || document_name_is(node, "style")
+                || document_name_is(node, "template")
+                || document_name_is(node, "svg"));
+        if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t length = 0;
+            const char *text = document_text_data(node, &length);
+            for (size_t at = 0; text != NULL && at < length; at++) {
+                unsigned char character = (unsigned char) text[at];
+                if (isspace(character)) character = ' ';
+                if (character == ' ' && (used == 0 || visible[used - 1] == ' '))
+                    continue;
+                if (used + 1u >= sizeof(visible)) return false;
+                visible[used++] = (char) tolower(character);
+            }
+        }
+        node = document_bounded_next(node, body, skip);
+    }
+    while (used > 0 && visible[used - 1] == ' ') used--;
+    visible[used] = '\0';
+    return used > 0 && strstr(visible, "loading") != NULL;
+}
+
+static bool document_subtree_has_little_visible_text(lxb_dom_node_t *root,
+                                                     size_t limit)
+{
+    if (root == NULL) return false;
+    size_t visible = 0;
+    bool previous_space = true;
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 512u; visited++) {
+        bool skip = node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && (document_name_is(node, "script")
+                || document_name_is(node, "style")
+                || document_name_is(node, "template")
+                || document_name_is(node, "svg"));
+        if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t length = 0;
+            const char *text = document_text_data(node, &length);
+            for (size_t at = 0; text != NULL && at < length; at++) {
+                bool space = isspace((unsigned char) text[at]) != 0;
+                if (!space || !previous_space) visible++;
+                previous_space = space;
+                if (visible > limit) return false;
+            }
+        }
+        node = document_bounded_next(node, root, skip);
+    }
+    return true;
+}
+
+static bool document_subtree_has_little_active_text(lxb_dom_node_t *root,
+                                                    size_t limit)
+{
+    if (root == NULL) return false;
+    size_t visible = 0;
+    bool previous_space = true;
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 512u; visited++) {
+        bool skip = node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && (document_name_is(node, "script")
+                || document_name_is(node, "style")
+                || document_name_is(node, "template")
+                || document_name_is(node, "svg")
+                || document_name_is(node, "noscript"));
+        if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t length = 0;
+            const char *text = document_text_data(node, &length);
+            for (size_t at = 0; text != NULL && at < length; at++) {
+                bool space = isspace((unsigned char) text[at]) != 0;
+                if (!space || !previous_space) visible++;
+                previous_space = space;
+                if (visible > limit) return false;
+            }
+        }
+        node = document_bounded_next(node, root, skip);
+    }
+    return true;
+}
+
+static bool document_static_shell_id(const char *id, size_t length)
+{
+    static const char *const ids[] = {"root", "app", "__next", "__nuxt"};
+    for (size_t at = 0; at < sizeof(ids) / sizeof(ids[0]); at++) {
+        size_t wanted = strlen(ids[at]);
+        if (length == wanted && strncasecmp(id, ids[at], wanted) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* A failed or deliberately shed client bundle can leave a branded header and
+   an otherwise empty hydration root. Fill a conventional empty root when one
+   exists; a body with effectively no authored text is itself a safe fallback
+   target for shells that mount without an id. Useful server-rendered content
+   is never replaced by this compatibility path. */
+static lxb_dom_node_t *document_static_shell_target(lxb_dom_node_t *body)
+{
+    if (body == NULL) return NULL;
+    if (document_loading_only_body(body)) return body;
+    if (!document_subtree_has_little_visible_text(body, 48u)) return NULL;
+    lxb_dom_node_t *node = body;
+    for (size_t visited = 0; node != NULL && visited < 512u; visited++) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            size_t id_length = 0;
+            const char *id = document_attribute(node, "id", &id_length);
+            if (id != NULL && document_static_shell_id(id, id_length)
+                && document_subtree_has_little_visible_text(node, 12u)) {
+                return node;
+            }
+        }
+        node = document_bounded_next(node, body, false);
+    }
+    return document_subtree_has_little_visible_text(body, 12u) ? body : NULL;
+}
+
+static const char *document_meta_description(PocDocument *document,
+                                             size_t *length)
+{
+    if (length != NULL) *length = 0;
+    if (document == NULL || document->html == NULL) return NULL;
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 512u; visited++) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && document_name_is(node, "meta")) {
+            size_t key_length = 0;
+            const char *key = document_attribute(node, "name", &key_length);
+            if (key == NULL) {
+                key = document_attribute(node, "property", &key_length);
+            }
+            bool description = key != NULL
+                && ((key_length == 11u
+                     && strncasecmp(key, "description", key_length) == 0)
+                    || (key_length == 14u
+                        && strncasecmp(key, "og:description", key_length) == 0));
+            if (description) {
+                const char *content = document_attribute(
+                    node, "content", length);
+                if (content != NULL && length != NULL && *length >= 24u)
+                    return content;
+            }
+        }
+        node = document_bounded_next(node, root, false);
+    }
+    return NULL;
+}
+
+static const char *document_meta_preview_image(PocDocument *document,
+                                               size_t *length)
+{
+    if (length != NULL) *length = 0;
+    if (document == NULL || document->html == NULL) return NULL;
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 512u; visited++) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && document_name_is(node, "meta")) {
+            size_t key_length = 0;
+            const char *key = document_attribute(node, "property", &key_length);
+            if (key == NULL) key = document_attribute(node, "name", &key_length);
+            bool image = key != NULL
+                && ((key_length == 8u
+                     && strncasecmp(key, "og:image", key_length) == 0)
+                    || (key_length == 13u
+                        && strncasecmp(key, "twitter:image", key_length) == 0));
+            if (image) {
+                const char *content = document_attribute(node, "content", length);
+                size_t content_length = length == NULL ? 0u : *length;
+                if (content != NULL && content_length >= 9u
+                    && content_length <= 512u
+                    && ((content_length >= 8u
+                         && strncasecmp(content, "https://", 8u) == 0)
+                        || (content_length >= 7u
+                            && strncasecmp(content, "http://", 7u) == 0))) {
+                    return content;
+                }
+            }
+        }
+        node = document_bounded_next(node, root, false);
+    }
+    if (length != NULL) *length = 0;
+    return NULL;
+}
+
+static bool document_markup_append(char *output, size_t capacity,
+                                   size_t *used, const char *text,
+                                   size_t length, bool escape)
+{
+    if (output == NULL || used == NULL || text == NULL) return false;
+    for (size_t at = 0; at < length; at++) {
+        const char *piece = text + at;
+        size_t piece_length = 1;
+        if (escape) {
+            if (text[at] == '&') { piece = "&amp;"; piece_length = 5; }
+            else if (text[at] == '<') { piece = "&lt;"; piece_length = 4; }
+            else if (text[at] == '>') { piece = "&gt;"; piece_length = 4; }
+            else if (text[at] == '"') { piece = "&quot;"; piece_length = 6; }
+        }
+        if (piece_length > capacity - *used - 1u) return false;
+        memcpy(output + *used, piece, piece_length);
+        *used += piece_length;
+    }
+    output[*used] = '\0';
+    return true;
+}
+
+typedef struct {
+    const char *href;
+    size_t href_length;
+    char label[48];
+    size_t label_length;
+} DocumentStaticNavigationLink;
+
+static bool document_node_is_within_named(lxb_dom_node_t *node,
+                                          const char *name,
+                                          lxb_dom_node_t **ancestor)
+{
+    for (size_t depth = 0; node != NULL && depth < 12u;
+         depth++, node = node->parent) {
+        if (!document_name_is(node, name)) continue;
+        if (ancestor != NULL) *ancestor = node;
+        return true;
+    }
+    return false;
+}
+
+static size_t document_static_link_label(lxb_dom_node_t *anchor,
+                                         char *output, size_t capacity)
+{
+    if (anchor == NULL || output == NULL || capacity < 2u) return 0;
+    size_t used = 0;
+    lxb_dom_node_t *node = anchor;
+    for (size_t visited = 0; node != NULL && visited < 96u; visited++) {
+        bool skip = node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && (document_name_is(node, "script")
+                || document_name_is(node, "style")
+                || document_name_is(node, "svg"));
+        if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t length = 0;
+            const char *text = document_text_data(node, &length);
+            for (size_t at = 0; text != NULL && at < length; at++) {
+                unsigned char character = (unsigned char) text[at];
+                if (isspace(character)) character = ' ';
+                if (character == ' '
+                    && (used == 0 || output[used - 1] == ' ')) continue;
+                if (used + 1u >= capacity) break;
+                output[used++] = (char) character;
+            }
+        }
+        node = document_bounded_next(node, anchor, skip);
+    }
+    while (used > 0 && output[used - 1] == ' ') used--;
+    if (used == 0) {
+        static const char *const label_attributes[] = {
+            "aria-label", "title"
+        };
+        for (size_t at = 0;
+             at < sizeof(label_attributes) / sizeof(label_attributes[0]);
+             at++) {
+            size_t length = 0;
+            const char *label = document_attribute(
+                anchor, label_attributes[at], &length);
+            if (label == NULL || length == 0) continue;
+            if (length >= capacity) length = capacity - 1u;
+            memcpy(output, label, length);
+            used = length;
+            break;
+        }
+    }
+    if (used == 0) {
+        lxb_dom_node_t *descendant = anchor->first_child;
+        for (size_t visited = 0;
+             descendant != NULL && visited < 32u; visited++) {
+            if (descendant->type == LXB_DOM_NODE_TYPE_ELEMENT
+                && document_name_is(descendant, "img")) {
+                size_t length = 0;
+                const char *alt = document_attribute(
+                    descendant, "alt", &length);
+                if (alt != NULL && length != 0) {
+                    if (length >= capacity) length = capacity - 1u;
+                    memcpy(output, alt, length);
+                    used = length;
+                    break;
+                }
+            }
+            descendant = document_bounded_next(descendant, anchor, false);
+        }
+    }
+    output[used] = '\0';
+    return used;
+}
+
+static bool document_static_navigation_duplicate(
+    const DocumentStaticNavigationLink *links, size_t count,
+    const char *href, size_t href_length)
+{
+    for (size_t at = 0; at < count; at++) {
+        if (links[at].href_length == href_length
+            && memcmp(links[at].href, href, href_length) == 0) return true;
+    }
+    return false;
+}
+
+/* Some server-rendered mobile headers leave an empty hydration placeholder
+   while retaining a complete desktop navigation in the same header.  When
+   page script was deliberately shed, turn that authored navigation into a
+   small disclosure rather than inventing destinations or leaving a dead
+   blank.  The scan, output, and number of copied links are all fixed-size. */
+static bool document_install_static_navigation_fallback(
+    PocDocument *document)
+{
+    if (document == NULL || document->html == NULL) return false;
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    lxb_dom_node_t *placeholder = NULL;
+    lxb_dom_node_t *header = NULL;
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 512u; visited++) {
+        lxb_dom_node_t *candidate_header = NULL;
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && document_name_is(node, "noscript")
+            && node->first_child == NULL
+            && document_node_is_within_named(node, "header",
+                                             &candidate_header)) {
+            placeholder = node;
+            header = candidate_header;
+            break;
+        }
+        node = document_bounded_next(node, root, false);
+    }
+    if (placeholder == NULL || header == NULL) return false;
+
+    DocumentStaticNavigationLink links[6] = {0};
+    size_t link_count = 0;
+    node = header;
+    for (size_t visited = 0; node != NULL && visited < 384u
+         && link_count < sizeof(links) / sizeof(links[0]); visited++) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && document_name_is(node, "a")) {
+            size_t href_length = 0;
+            const char *href = document_attribute(node, "href", &href_length);
+            size_t label_length = document_static_link_label(
+                node, links[link_count].label,
+                sizeof(links[link_count].label));
+            if (href != NULL && href_length != 0u && label_length > 1u
+                && href[0] != '#'
+                && !document_static_navigation_duplicate(
+                    links, link_count, href, href_length)) {
+                links[link_count].href = href;
+                links[link_count].href_length = href_length;
+                links[link_count].label_length = label_length;
+                link_count++;
+            }
+        }
+        node = document_bounded_next(node, header, false);
+    }
+    if (link_count < 3u) return false;
+
+    const size_t capacity = 1536u;
+    char *markup = budget_malloc(document->budget, capacity);
+    if (markup == NULL) return false;
+    size_t used = 0;
+#define APPEND_NAV_LITERAL(value) \
+    document_markup_append(markup, capacity, &used, \
+                           (value), sizeof(value) - 1u, false)
+    bool valid = APPEND_NAV_LITERAL(
+        "<details style=\"position:relative;font:16px sans-serif\">"
+        "<summary aria-label=\"Menu\" style=\"font-size:26px;line-height:32px;"
+        "width:36px\">&#59136;</summary><nav style=\"position:absolute;"
+        "left:0;top:36px;width:190px;padding:8px;background:#fff;"
+        "border:1px solid #c8ced5;border-radius:10px;z-index:20\">");
+    for (size_t at = 0; valid && at < link_count; at++) {
+        valid = APPEND_NAV_LITERAL(
+                    "<a style=\"display:block;padding:7px;color:#111;\" href=\"")
+            && document_markup_append(markup, capacity, &used,
+                                      links[at].href,
+                                      links[at].href_length, true)
+            && APPEND_NAV_LITERAL("\">")
+            && document_markup_append(markup, capacity, &used,
+                                      links[at].label,
+                                      links[at].label_length, true)
+            && APPEND_NAV_LITERAL("</a>");
+    }
+    valid = valid && APPEND_NAV_LITERAL("</nav></details>");
+#undef APPEND_NAV_LITERAL
+    /* A scripting-aware UA hides <noscript> itself. Replace its immediate
+       wrapper when one exists so the fallback remains visible even though
+       the document did attempt scripts. */
+    lxb_dom_node_t *target = placeholder;
+    if (placeholder->parent != NULL
+        && placeholder->parent->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+        target = placeholder->parent;
+    }
+    bool changed = valid
+        && document_set_element_inner_html(document, target, markup, used);
+    budget_free(document->budget, markup);
+    return changed;
+}
+
+static bool document_attribute_has_token(lxb_dom_node_t *node,
+                                         const char *name,
+                                         const char *wanted)
+{
+    size_t length = 0;
+    const char *value = document_attribute(node, name, &length);
+    size_t wanted_length = wanted == NULL ? 0u : strlen(wanted);
+    if (value == NULL || wanted_length == 0u) return false;
+    for (size_t at = 0; at < length;) {
+        while (at < length && isspace((unsigned char) value[at])) at++;
+        size_t start = at;
+        while (at < length && !isspace((unsigned char) value[at])) at++;
+        if (at - start == wanted_length
+            && strncasecmp(value + start, wanted, wanted_length) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool document_attribute_contains(lxb_dom_node_t *node,
+                                        const char *name,
+                                        const char *wanted)
+{
+    size_t length = 0;
+    const char *value = document_attribute(node, name, &length);
+    size_t wanted_length = wanted == NULL ? 0u : strlen(wanted);
+    if (value == NULL || wanted_length == 0u || wanted_length > length) {
+        return false;
+    }
+    for (size_t at = 0; at <= length - wanted_length; at++) {
+        if (strncasecmp(value + at, wanted, wanted_length) == 0) return true;
+    }
+    return false;
+}
+
+static bool document_has_authored_banner(lxb_dom_node_t *body)
+{
+    if (body == NULL) return false;
+    lxb_dom_node_t *node = body;
+    for (size_t visited = 0; node != NULL && visited < 512u; visited++) {
+        bool banner = node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && (document_name_is(node, "header")
+                || document_attribute_has_token(node, "role", "banner"));
+        if (banner
+            && !document_subtree_has_little_active_text(node, 3u)) {
+            return true;
+        }
+        if (banner) {
+            lxb_dom_node_t *child = node;
+            for (size_t nested = 0;
+                 child != NULL && nested < 96u; nested++) {
+                if (child->type == LXB_DOM_NODE_TYPE_ELEMENT
+                    && document_name_is(child, "a")) return true;
+                child = document_bounded_next(child, node, false);
+            }
+        }
+        node = document_bounded_next(node, body, false);
+    }
+    return false;
+}
+
+static const char *document_app_name(PocDocument *document, size_t *length,
+                                     bool *app_shell)
+{
+    if (length != NULL) *length = 0;
+    if (app_shell != NULL) *app_shell = false;
+    if (document == NULL || document->html == NULL) return NULL;
+    const char *name = NULL;
+    size_t name_length = 0;
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 768u; visited++) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && document_name_is(node, "link")
+            && document_attribute_has_token(node, "rel", "manifest")) {
+            if (app_shell != NULL) *app_shell = true;
+        } else if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+                   && document_name_is(node, "meta")) {
+            size_t key_length = 0;
+            const char *key = document_attribute(node, "name", &key_length);
+            if (key == NULL) {
+                key = document_attribute(node, "property", &key_length);
+            }
+            bool application_name = key != NULL
+                && ((key_length == 16u
+                     && strncasecmp(key, "application-name", key_length) == 0)
+                    || (key_length == 25u
+                        && strncasecmp(key, "apple-mobile-web-app-title",
+                                       key_length) == 0)
+                    || (key_length == 12u
+                        && strncasecmp(key, "og:site_name", key_length) == 0));
+            if (application_name) {
+                size_t content_length = 0;
+                const char *content = document_attribute(
+                    node, "content", &content_length);
+                if (content != NULL && content_length != 0u
+                    && name == NULL) {
+                    name = content;
+                    name_length = content_length;
+                }
+                if (app_shell != NULL) *app_shell = true;
+            }
+        }
+        node = document_bounded_next(node, root, false);
+    }
+    if (name == NULL && document->title != NULL
+        && app_shell != NULL && *app_shell) {
+        name = document->title;
+        name_length = strlen(name);
+    }
+    if (name_length > 48u) name_length = 48u;
+    if (length != NULL) *length = name_length;
+    return name;
+}
+
+/* A client-rendered application can retain useful navigation and identity
+   metadata while leaving its top bar entirely to a shed external bundle.
+   Recover one compact, ordinary-flow header from that authored information.
+   The evidence gates avoid adding browser-invented chrome to content pages;
+   no destination is guessed and no new resource is fetched. */
+static bool document_install_recovered_app_header(PocDocument *document)
+{
+    lxb_dom_node_t *body = document_body_node(document);
+    bool authored_banner = document_has_authored_banner(body);
+    if (body == NULL || authored_banner) return false;
+
+    size_t name_length = 0;
+    bool app_shell = false;
+    const char *name = document_app_name(document, &name_length, &app_shell);
+    if (!app_shell || name == NULL || name_length < 2u) return false;
+
+    DocumentStaticNavigationLink links[6] = {0};
+    size_t link_count = 0;
+    lxb_dom_node_t *node = body;
+    for (size_t visited = 0; node != NULL && visited < 1024u
+         && link_count < sizeof(links) / sizeof(links[0]); visited++) {
+        bool navigation = node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && (document_name_is(node, "nav")
+                || document_attribute_has_token(node, "role", "navigation")
+                || document_attribute_contains(
+                    node, "aria-label", "navigation")
+                || document_attribute_contains(
+                    node, "data-testid", "navigation"));
+        if (navigation) {
+            lxb_dom_node_t *candidate = node;
+            for (size_t nested = 0; candidate != NULL && nested < 384u
+                 && link_count < sizeof(links) / sizeof(links[0]); nested++) {
+                if (candidate->type == LXB_DOM_NODE_TYPE_ELEMENT
+                    && document_name_is(candidate, "a")) {
+                    size_t href_length = 0;
+                    const char *href = document_attribute(
+                        candidate, "href", &href_length);
+                    size_t label_length = document_static_link_label(
+                        candidate, links[link_count].label,
+                        sizeof(links[link_count].label));
+                    if (href != NULL && href_length != 0u
+                        && href[0] != '#' && label_length > 1u
+                        && !document_static_navigation_duplicate(
+                            links, link_count, href, href_length)) {
+                        links[link_count].href = href;
+                        links[link_count].href_length = href_length;
+                        links[link_count].label_length = label_length;
+                        link_count++;
+                    }
+                }
+                candidate = document_bounded_next(candidate, node, false);
+            }
+            if (link_count >= 2u) break;
+            link_count = 0;
+        }
+        node = document_bounded_next(node, body, false);
+    }
+    if (link_count < 2u) return false;
+
+    const size_t capacity = 1792u;
+    char *markup = budget_malloc(document->budget, capacity);
+    if (markup == NULL) return false;
+    size_t used = 0;
+#define APPEND_APP_LITERAL(value) \
+    document_markup_append(markup, capacity, &used, \
+                           (value), sizeof(value) - 1u, false)
+    bool valid = APPEND_APP_LITERAL(
+        "<span style=\"display:block;flex:1 1 auto;min-width:0;"
+        "max-width:320px;color:#111;font-weight:700;white-space:nowrap;"
+        "overflow:hidden;text-overflow:ellipsis\">");
+    valid = valid && document_markup_append(
+        markup, capacity, &used, name, name_length, true);
+    valid = valid && APPEND_APP_LITERAL(
+        "</span><details style=\"position:relative;margin-left:12px\">");
+    valid = valid && APPEND_APP_LITERAL(
+            "<summary style=\"padding:7px 10px;border:1px solid #aeb6c2;"
+            "border-radius:8px;color:#111\">Menu</summary>"
+            "<nav style=\"position:absolute;right:0;top:38px;width:190px;"
+            "padding:8px;background:#fff;border:1px solid #c8ced5;"
+            "border-radius:10px;z-index:20\">");
+    for (size_t at = 0; valid && at < link_count; at++) {
+        valid = APPEND_APP_LITERAL(
+                    "<a style=\"display:block;padding:7px;color:#111\" href=\"")
+            && document_markup_append(markup, capacity, &used,
+                                      links[at].href,
+                                      links[at].href_length, true)
+            && APPEND_APP_LITERAL("\">")
+            && document_markup_append(markup, capacity, &used,
+                                      links[at].label,
+                                      links[at].label_length, true)
+            && APPEND_APP_LITERAL("</a>");
+    }
+    valid = valid && APPEND_APP_LITERAL("</nav></details>");
+#undef APPEND_APP_LITERAL
+
+    BudgetAllocationOwner previous = document_allocation_owner_enter(document);
+    static const lxb_char_t header_name[] = "header";
+    lxb_dom_element_t *element = valid
+        ? lxb_dom_document_create_element(
+              &document->html->dom_document, header_name,
+              sizeof(header_name) - 1u, NULL)
+        : NULL;
+    lxb_dom_node_t *header = element == NULL
+        ? NULL : lxb_dom_interface_node(element);
+    size_t body_style_length = 0;
+    const char *body_style = document_attribute(
+        body, "style", &body_style_length);
+    char recovered_body_style[640];
+    size_t recovered_body_style_length = 0;
+    bool body_style_fits = body_style == NULL || body_style_length == 0u
+        || body_style_length < sizeof(recovered_body_style) - 24u;
+    if (body_style_fits && body_style != NULL && body_style_length != 0u) {
+        memcpy(recovered_body_style, body_style, body_style_length);
+        recovered_body_style_length = body_style_length;
+        if (recovered_body_style[recovered_body_style_length - 1u] != ';') {
+            recovered_body_style[recovered_body_style_length++] = ';';
+        }
+    }
+    static const char reserved_top[] = "padding-top:48px";
+    memcpy(recovered_body_style + recovered_body_style_length,
+           reserved_top, sizeof(reserved_top) - 1u);
+    recovered_body_style_length += sizeof(reserved_top) - 1u;
+    recovered_body_style[recovered_body_style_length] = '\0';
+    bool changed = body_style_fits && header != NULL
+        && lxb_dom_element_set_attribute(
+               element, (const lxb_char_t *) "style", 5u,
+               (const lxb_char_t *)
+                   "position:fixed;left:0;top:0;width:100%;height:48px;"
+                   "display:flex;align-items:center;"
+                   "justify-content:space-between;padding:0 16px;"
+                   "border-bottom:1px solid #d8dee8;background:#fff;"
+                   "font:15px sans-serif;box-sizing:border-box;z-index:30",
+               sizeof("position:fixed;left:0;top:0;width:100%;height:48px;"
+                      "display:flex;align-items:center;"
+                      "justify-content:space-between;padding:0 16px;"
+                      "border-bottom:1px solid #d8dee8;background:#fff;"
+                      "font:15px sans-serif;box-sizing:border-box;z-index:30")
+                   - 1u)
+               != NULL
+        && document_set_element_inner_html(document, header, markup, used)
+        && (body->first_child == NULL
+            ? lxb_dom_node_append_child(body, header) == LXB_DOM_EXCEPTION_OK
+            : lxb_dom_node_insert_before_spec(
+                  body, header, body->first_child) == LXB_DOM_EXCEPTION_OK)
+        && lxb_dom_element_set_attribute(
+               lxb_dom_interface_element(body),
+               (const lxb_char_t *) "style", 5u,
+               (const lxb_char_t *) recovered_body_style,
+               recovered_body_style_length) != NULL;
+    if (!changed && header != NULL) {
+        if (header->parent != NULL) lxb_dom_node_remove(header);
+        lxb_dom_node_destroy_deep(header);
+    }
+    document_allocation_owner_leave(document, previous);
+    budget_free(document->budget, markup);
+    return changed;
+}
+
+/* If the bounded script pipeline could not start, a scripting parse can
+   leave the page's authored <noscript> fallback as one raw-text node. On an
+   otherwise empty shell, parse that bounded fragment exactly as a no-script
+   user agent would. This is content-shaped recovery: useful active body text
+   always wins, and script-bearing fallback markup is rejected. */
+static bool document_install_static_noscript_fallback(PocDocument *document)
+{
+    lxb_dom_node_t *body = document_body_node(document);
+    if (body == NULL
+        || !document_subtree_has_little_active_text(body, 16u)) return false;
+    lxb_dom_node_t *node = body;
+    for (size_t visited = 0; node != NULL && visited < 512u; visited++) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && document_name_is(node, "noscript")
+            && node->first_child != NULL
+            && node->first_child->type == LXB_DOM_NODE_TYPE_TEXT
+            && node->first_child->next == NULL) {
+            size_t length = 0;
+            const char *markup = document_text_data(node->first_child, &length);
+            if (markup == NULL || length < 24u || length > 4096u) return false;
+            size_t visible = 0;
+            bool contains_script = false;
+            for (size_t at = 0; at < length; at++) {
+                if (!isspace((unsigned char) markup[at])) visible++;
+                static const char script_open[] = "<script";
+                if (at + sizeof(script_open) - 1u <= length
+                    && strncasecmp(markup + at, script_open,
+                                   sizeof(script_open) - 1u) == 0) {
+                    contains_script = true;
+                    break;
+                }
+            }
+            return visible >= 24u && !contains_script
+                && document_set_element_inner_html(document, body,
+                                                   markup, length)
+                && document_refresh(document);
+        }
+        node = document_bounded_next(node, body, false);
+    }
+    return false;
+}
+
+bool document_install_static_shell_fallback(PocDocument *document)
+{
+    if (document_install_static_noscript_fallback(document)) return true;
+    lxb_dom_node_t *body = document_body_node(document);
+    lxb_dom_node_t *target = document_static_shell_target(body);
+    size_t description_length = 0;
+    const char *description = document_meta_description(
+        document, &description_length);
+    if (body == NULL || target == NULL || description == NULL) {
+        bool navigation_changed =
+            document_install_static_navigation_fallback(document);
+        bool app_header_changed = navigation_changed ? false
+            : document_install_recovered_app_header(document);
+        return (navigation_changed || app_header_changed)
+            && document_refresh(document);
+    }
+    if (description_length > 320u) description_length = 320u;
+    size_t title_length = document->title == NULL
+        ? 0 : strlen(document->title);
+    if (title_length > 96u) title_length = 96u;
+    size_t image_length = 0;
+    const char *image = document_meta_preview_image(document, &image_length);
+
+    const size_t capacity = 2048u;
+    char *markup = budget_malloc(document->budget, capacity);
+    if (markup == NULL) return false;
+    size_t used = 0;
+#define APPEND_LITERAL(value) \
+    document_markup_append(markup, capacity, &used, \
+                           (value), sizeof(value) - 1u, false)
+    bool valid = APPEND_LITERAL(
+        "<main style=\"max-width:420px;margin:28px auto;padding:22px;"
+        "font:16px sans-serif;line-height:1.45;background:#fff;"
+        "color:#1f2937;border:1px solid #d8dee8;border-radius:14px\">")
+        && (image == NULL
+            || (APPEND_LITERAL(
+                    "<img id=\"tilefinch-static-preview\" alt=\"\" "
+                    "style=\"display:block;max-width:160px;"
+                    "max-height:96px;margin:0 auto 14px\" src=\"")
+                && document_markup_append(markup, capacity, &used,
+                                          image, image_length, true)
+                && APPEND_LITERAL("\">")))
+        && (title_length == 0
+            || (APPEND_LITERAL("<h1 style=\"font-size:24px;margin:0 0 14px\">")
+                && document_markup_append(markup, capacity, &used,
+                                          document->title, title_length, true)
+                && APPEND_LITERAL("</h1>")))
+        && APPEND_LITERAL("<p>")
+        && document_markup_append(markup, capacity, &used,
+                                  description, description_length, true)
+        && APPEND_LITERAL("</p><p style=\"color:#5f6875;font-size:13px\">"
+                          "The interactive page could not start, so its "
+                          "published summary is shown instead.</p></main>");
+#undef APPEND_LITERAL
+    bool changed = valid
+        && document_set_element_inner_html(document, target, markup, used)
+        && document_refresh(document);
+    budget_free(document->budget, markup);
+    return changed;
+}
+
 void document_note_connected_mutation(PocDocument *document)
 {
     if (document == NULL) return;
@@ -1144,6 +1949,19 @@ static bool ascii_span_equal(const char *text, size_t length,
     return true;
 }
 
+static bool ascii_span_contains_folded(const char *text, size_t length,
+                                       const char *wanted)
+{
+    size_t wanted_length = strlen(wanted);
+    if (text == NULL || wanted_length == 0 || wanted_length > length) {
+        return false;
+    }
+    for (size_t at = 0; at <= length - wanted_length; at++) {
+        if (ascii_span_equal(text + at, wanted_length, wanted)) return true;
+    }
+    return false;
+}
+
 static const char *normalized_referrer_policy(const char *value,
                                               size_t length)
 {
@@ -1240,6 +2058,27 @@ static bool find_viewport_meta(lxb_dom_node_t *node,
     return true;
 }
 
+static bool document_doctype_is_mobile(const PocDocument *document)
+{
+    if (document == NULL || document->html == NULL) return false;
+    lxb_dom_document_type_t *doctype =
+        document->html->dom_document.doctype;
+    if (doctype == NULL) return false;
+    size_t public_id_length = 0;
+    const char *public_id = (const char *) lxb_dom_document_type_public_id(
+        doctype, &public_id_length);
+    /* XHTML Mobile Profile and XHTML Basic were explicit mobile-document
+       contracts before meta viewport became ubiquitous. Treating them as a
+       legacy 980px desktop page makes the server's deliberately compact
+       markup microscopic. The public identifiers are immutable parser input,
+       so this check adds no DOM walk or per-frame state. */
+    return public_id != NULL
+        && (ascii_span_contains_folded(public_id, public_id_length,
+                                       "XHTML Mobile")
+            || ascii_span_contains_folded(public_id, public_id_length,
+                                          "XHTML Basic"));
+}
+
 bool document_mobile_viewport(const PocDocument *document, int device_width,
                               int legacy_width, MobileViewport *viewport)
 {
@@ -1253,7 +2092,15 @@ bool document_mobile_viewport(const PocDocument *document, int device_width,
     lxb_dom_node_t *meta = NULL;
     if (!find_viewport_meta(lxb_dom_interface_node(document->html),
                             &meta)) return false;
-    if (meta == NULL) return true;
+    if (meta == NULL) {
+        if (document_doctype_is_mobile(document)) {
+            viewport->device_width = true;
+            viewport->layout_width = device_width;
+            viewport->scale_numerator = 1;
+            viewport->scale_denominator = 1;
+        }
+        return true;
+    }
     viewport->declared = true;
     size_t content_length = 0;
     const char *content = document_attribute(meta, "content", &content_length);

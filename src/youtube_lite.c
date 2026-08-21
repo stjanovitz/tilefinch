@@ -996,9 +996,24 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         "line-height:32px;text-align:center;font-family:inherit;font-size:14px}"
         "main{padding:10px;max-width:720px;margin:0 auto}"
         "h1{font-size:18px;margin:4px 0 12px}h2{font-size:16px}"
-        ".hint,.meta,.empty{color:#aaa}.empty{padding:20px 0;line-height:1.5}"
-        ".card{display:flex;color:#fff;text-decoration:none;margin:0 0 12px;"
-        "gap:10px;min-height:90px}.thumb-wrap{position:relative;width:160px;"
+        ".hint,.meta,.empty{color:#aaa}.empty{padding:20px 0;line-height:1.5}";
+    static const char content_style[] =
+        ".result-row{display:flex;gap:7px;margin:0 0 12px;min-height:90px}"
+        ".card{display:flex;flex:1;min-width:0;color:#fff;text-decoration:none;"
+        "gap:10px;min-height:90px}.details{display:block;position:relative;"
+        "flex:none;width:54px;color:#ddd;text-decoration:none;"
+        "border:1px solid #606060;border-radius:8px;background:#202020}"
+        ".details-icon{display:block;position:absolute;left:50%;top:29px;"
+        "margin-left:-15px;width:30px;height:30px;border:1px solid #999;"
+        "border-radius:15px;background:#303030}.details-i-dot,.details-i-stem{"
+        "display:block;position:absolute;left:13px;width:3px;background:#eee}"
+        ".details-i-dot{top:6px;height:3px;border-radius:2px}"
+        ".details-i-stem{top:12px;height:11px;border-radius:2px}"
+        ".card:focus,.details:focus{outline:3px solid #fff;outline-offset:1px}"
+        ".details:focus{background:#303030}.details:focus .details-icon{"
+        "background:#eee;border-color:#fff}.details:focus .details-i-dot,"
+        ".details:focus .details-i-stem{background:#111}"
+        ".thumb-wrap{position:relative;width:160px;"
         "height:90px;flex:none}.thumb{display:block;width:100%;height:100%;"
         "background:#292929;border-radius:7px;object-fit:cover}"
         ".info{min-width:0}.title{display:block;font-size:15px;line-height:1.25;"
@@ -1059,7 +1074,14 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
     static const char compact_style[] =
         ".compact-results main{padding-top:7px}"
         ".compact-results h1{font-size:15px;margin:3px 0 7px}"
-        ".compact-results .card{min-height:60px;margin-bottom:6px;gap:8px}"
+        ".compact-results .result-row{min-height:60px;margin-bottom:6px;gap:6px}"
+        ".compact-results .card{min-height:60px;gap:8px}"
+        ".compact-results .details{width:46px}"
+        ".compact-results .details-icon{top:17px;width:24px;height:24px;"
+        "margin-left:-12px;border-radius:12px}"
+        ".compact-results .details-i-dot,.compact-results .details-i-stem{"
+        "left:10px;width:3px}.compact-results .details-i-dot{top:5px}"
+        ".compact-results .details-i-stem{top:10px;height:9px}"
         ".compact-results .thumb-wrap{width:106px;height:60px}"
         ".compact-results .thumb{border-radius:5px}"
         ".compact-results .title{font-size:13px;line-height:1.2;"
@@ -1078,6 +1100,7 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
     return lite_html_text(html, prefix)
         && lite_html_escape(html, page_title)
         && lite_html_text(html, style)
+        && lite_html_text(html, content_style)
         && (!compact_results || lite_html_text(html, compact_style))
         && lite_html_text(html, style_end)
         && (!compact_results
@@ -1106,7 +1129,9 @@ static bool lite_html_video(YoutubeLiteHtml *html,
         return false;
     }
     if (!lite_html_format(
-            html, "<a class=card%s href=\"https://www.youtube.com/watch?v=%s",
+            html, "<div class=result-row><a class=card%s "
+                  "data-tilefinch-provider-media href=\""
+                  "https://www.youtube.com/watch?v=%s",
             autofocus ? " autofocus" : "", video->id)
         || (retain_query
             && (!lite_html_text(html, "&amp;search_query=")
@@ -1149,7 +1174,21 @@ static bool lite_html_video(YoutubeLiteHtml *html,
         && (!lite_html_text(html, "<span class=snippet>")
             || !lite_html_escape(html, video->snippet)
             || !lite_html_text(html, "</span>"))) return false;
-    return lite_html_text(html, "</span></a>");
+    if (!lite_html_text(
+            html, "</span></a><a class=details href=\""
+                  "https://www.youtube.com/watch?v=")
+        || !lite_html_escape(html, video->id)
+        || (retain_query
+            && (!lite_html_text(html, "&amp;search_query=")
+                || !lite_html_text(html, encoded_query)))
+        || !lite_html_text(
+            html, "\" aria-label=\"Open video details\">"
+                  "<span class=details-icon aria-hidden=true>"
+                  "<span class=details-i-dot></span>"
+                  "<span class=details-i-stem></span></span></a></div>")) {
+        return false;
+    }
+    return true;
 }
 
 static bool lite_html_multiline(YoutubeLiteHtml *html, const char *text)

@@ -2207,6 +2207,7 @@ typedef struct {
     bool dynamic[2];
     bool ch_relative[2];
     bool container_relative[2];
+    bool all_inherit[2];
 } StyleDeferredDeclarationAnalysis;
 
 static void declarations_analyze_deferred_resolution(
@@ -2234,7 +2235,17 @@ static void declarations_analyze_deferred_resolution(
             trim(&value, &value_length);
             bool important = declaration_is_important(value, value_length);
             size_t slot = important ? 1u : 0u;
+            if (important) {
+                value_length = declaration_value_length(value, value_length);
+                trim(&value, &value_length);
+            }
             if (!(name_length > 2 && name[0] == '-' && name[1] == '-')) {
+                if (span_case_equal(name, name_length, "all")) {
+                    /* Last declaration at this importance wins. Unsupported
+                       CSS-wide values remain an ordinary ignored declaration. */
+                    analysis->all_inherit[slot] = span_case_equal(
+                        value, value_length, "inherit");
+                }
                 if (span_case_equal(name, name_length, "font")
                     || span_case_equal(name, name_length, "font-family")) {
                     analysis->font_family[slot] = true;

@@ -226,9 +226,28 @@ static bool test_redirect_limit(Budget *budget, unsigned port)
     FetchResult result = {.budget = budget};
     bool fetched = fetch_redirect(budget, url, &request, &result);
     bool ok = !fetched
-        && strstr(result.error, "five-hop redirect limit") != NULL;
+        && strstr(result.error, "redirect loop detected") != NULL;
     fetch_result_destroy(&result);
-    return ok;
+    CHECK(ok);
+
+    /* Six redirects exceeded the old compatibility bound.  Eight remain
+       bounded and useful for federated sign-in/front-door chains; a ninth
+       must still fail closed. */
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%u/redirect-chain/8", port);
+    result = (FetchResult) {.budget = budget};
+    CHECK(fetch_redirect(budget, url, &request, &result)
+          && result.status_code == 200
+          && strcmp(result.data, "redirect-chain-final") == 0);
+    fetch_result_destroy(&result);
+
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%u/redirect-chain/9", port);
+    result = (FetchResult) {.budget = budget};
+    CHECK(!fetch_redirect(budget, url, &request, &result)
+          && strstr(result.error, "eight-hop redirect limit") != NULL);
+    fetch_result_destroy(&result);
+    return true;
 }
 
 static bool test_client_hint_redirect_scope(Budget *budget,

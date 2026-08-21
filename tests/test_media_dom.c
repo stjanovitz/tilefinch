@@ -1,9 +1,11 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "tilefinch/budget.h"
 #include "tilefinch/document.h"
 #include "tilefinch/js_runtime.h"
+#include "tilefinch/media_discovery.h"
 
 #define MIB (1024u * 1024u)
 #define CHECK(condition) do {                                                \
@@ -133,6 +135,45 @@ int main(void)
     script_runtime_destroy(runtime);
     document_destroy(&document);
 
+    static const char audio_html[] =
+        "<!doctype html><html><body>"
+        "<audio id=audio><source src='/episode.m4a' type='audio/mp4'>"
+        "</audio></body></html>";
+    PocDocument audio_document;
+    CHECK(document_parse(
+        &audio_document, &budget,
+        audio_html, sizeof(audio_html) - 1u, 19));
+    ScriptRuntime *audio_runtime = script_runtime_create(
+        &audio_document, &budget, 12u * MIB, 4000,
+        "https://example.test/listen", &result);
+    CHECK(audio_runtime != NULL && result.success);
+    CHECK(script_runtime_evaluate_diagnostic(
+              audio_runtime,
+              "const a=document.querySelector('#audio');a.play();"
+              "globalThis.pocSummary=a.canPlayType('audio/mp4')==='maybe'"
+              "&&a.currentSrc==='https://example.test/episode.m4a'"
+              "?'AUDIO-DOM-OK':'AUDIO-DOM-FAILED'",
+              "<audio-dom-start>", &result)
+          && strcmp(result.summary, "AUDIO-DOM-OK") == 0);
+    CHECK(script_runtime_consume_media_request(audio_runtime, &request)
+          && request.command == SCRIPT_MEDIA_COMMAND_PLAY
+          && request.audio_only
+          && strcmp(request.source,
+                    "https://example.test/episode.m4a") == 0);
+    CHECK(script_runtime_update_media_state(
+        audio_runtime, request.node_handle,
+        SCRIPT_MEDIA_STATE_PLAYING, 1.5, 30.0));
+    CHECK(script_runtime_evaluate_diagnostic(
+              audio_runtime,
+              "globalThis.pocSummary=!document.querySelector('#audio').paused"
+              "&&document.querySelector('#audio').currentTime===1.5"
+              "&&document.querySelector('#audio').duration===30"
+              "?'AUDIO-PLAYING-OK':'AUDIO-PLAYING-FAILED'",
+              "<audio-dom-playing>", &result)
+          && strcmp(result.summary, "AUDIO-PLAYING-OK") == 0);
+    script_runtime_destroy(audio_runtime);
+    document_destroy(&audio_document);
+
     /* Native control activation does not call HTMLMediaElement.play(). Its
        first state report must nevertheless attach to the same private media
        state record, and the temporary bootstrap bridge must not be exposed
@@ -170,6 +211,66 @@ int main(void)
         native_runtime, native_handle, SCRIPT_MEDIA_STATE_ENDED, 9, 9));
     script_runtime_destroy(native_runtime);
     document_destroy(&native_document);
+
+    char bounded_html[8192];
+    size_t used = (size_t) snprintf(
+        bounded_html, sizeof(bounded_html),
+        "<!doctype html><script type=application/ld+json>[");
+    for (size_t i = 0; i < 13u; i++) {
+        int written = snprintf(
+            bounded_html + used, sizeof(bounded_html) - used,
+            "%s{\"@type\":\"AudioObject\",\"name\":\"Track %zu\","
+            "\"contentUrl\":\"/audio/%zu.m4a\"}",
+            i == 0 ? "" : ",", i, i);
+        CHECK(written > 0 && (size_t) written < sizeof(bounded_html) - used);
+        used += (size_t) written;
+    }
+    int tail = snprintf(
+        bounded_html + used, sizeof(bounded_html) - used,
+        "]</script><script type=application/ld+json>"
+        "{\"@type\":\"AudioObject\",broken</script>");
+    CHECK(tail > 0 && (size_t) tail < sizeof(bounded_html) - used);
+    used += (size_t) tail;
+    PocDocument bounded_document;
+    CHECK(document_parse(
+        &bounded_document, &budget, bounded_html, used, 29));
+    MediaStructuredAudioIndex structured = {0};
+    CHECK(media_discover_structured_audio(&bounded_document, &structured)
+          && structured.candidate_count
+                 == MEDIA_STRUCTURED_AUDIO_CANDIDATE_LIMIT
+          && structured.candidate_overflow == 1u
+          && structured.malformed_scripts == 1u);
+    char copied[128];
+    CHECK(media_structured_audio_copy_url(
+              &structured.candidates[0], copied, sizeof(copied))
+          && strcmp(copied, "/audio/0.m4a") == 0);
+    document_destroy(&bounded_document);
+
+    static const char large_prefix[] =
+        "<!doctype html><script type=application/ld+json>";
+    static const char large_suffix[] =
+        "{\"@type\":\"AudioObject\","
+        "\"contentUrl\":\"/past-limit.m4a\"}</script>";
+    size_t large_padding = 256u * 1024u;
+    size_t large_length = sizeof(large_prefix) - 1u + large_padding
+        + sizeof(large_suffix) - 1u;
+    char *large_html = malloc(large_length);
+    CHECK(large_html != NULL);
+    memcpy(large_html, large_prefix, sizeof(large_prefix) - 1u);
+    memset(large_html + sizeof(large_prefix) - 1u, ' ', large_padding);
+    memcpy(large_html + sizeof(large_prefix) - 1u + large_padding,
+           large_suffix, sizeof(large_suffix) - 1u);
+    PocDocument large_document;
+    CHECK(document_parse(
+        &large_document, &budget, large_html, large_length, 31));
+    memset(&structured, 0, sizeof(structured));
+    CHECK(!media_discover_structured_audio(&large_document, &structured)
+          && structured.inspected_bytes == 256u * 1024u
+          && structured.truncated_scripts == 1u
+          && structured.malformed_scripts == 0u
+          && structured.candidate_count == 0u);
+    document_destroy(&large_document);
+    free(large_html);
     CHECK(budget.current == 0);
     puts("media-dom-tests: all checks passed");
     return 0;

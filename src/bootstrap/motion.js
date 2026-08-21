@@ -15,6 +15,7 @@
     FRAME_LIMIT = 16,
     DURATION_LIMIT = 4000,
     ITERATION_LIMIT = 8,
+    reducedMotion = matchMedia("(prefers-reduced-motion: reduce)").matches,
     active = new Set(),
     applied = new WeakMap();
   let pending = false,
@@ -498,7 +499,12 @@
     };
 
   globalThis.__tilefinchMotionRecheck = () => {
-    if (pending || (active.size === 0 && !documentHasMotionHint())) return;
+    if (
+      reducedMotion ||
+      pending ||
+      (active.size === 0 && !documentHasMotionHint())
+    )
+      return;
     pending = true;
     const schedule =
       globalThis.__tilefinchScheduleRenderFixup || queueMicrotask;
@@ -506,6 +512,7 @@
   };
   const beginObserving = () => {
     if (
+      reducedMotion ||
       observer ||
       !document.documentElement ||
       !documentHasMotionHint()

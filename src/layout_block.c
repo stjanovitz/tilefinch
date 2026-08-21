@@ -296,7 +296,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         }
     }
     if (context->assigned_grid_node == node
-        && context->assigned_grid_height > 0
+        && context->assigned_grid_height_valid
         && !style->has_height
         && style->align_self != ALIGN_SELF_START
         && style->align_self != ALIGN_SELF_CENTER
@@ -393,12 +393,17 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         *bottom = y;
         return true;
     }
+    bool fixed_captured = style->fixed_position
+        && positioned_box->fixed_node != NULL;
     int positioning_width = style->fixed_position
-                            ? context->layout->width
-                            : positioned_box->width;
+        ? (fixed_captured ? positioned_box->fixed_width
+                          : context->layout->width)
+        : positioned_box->width;
     int viewport_height = context->layout->viewport.css_height > 0
                           ? context->layout->viewport.css_height : 272;
-    int positioning_height = style->fixed_position ? viewport_height
+    int positioning_height = style->fixed_position
+        ? (fixed_captured && positioned_box->fixed_height > 0
+               ? positioned_box->fixed_height : viewport_height)
         : (positioned_box->height > 0 ? positioned_box->height
                                       : viewport_height);
     int resolved_left = layout_block_resolve_positioned_inset(
@@ -430,7 +435,10 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     int outer_y = layout_add_coordinate(y, exposed_top_margin);
     int margin_left = style->margin.left;
     int margin_right = style->margin.right;
-    int outer_width = width - margin_left - margin_right;
+    /* Out-of-flow percentages use the positioned containing block. A fixed
+       child of a shrink-wrapped flex item is still viewport-wide at 100%. */
+    int sizing_width = positioned ? positioning_width : width;
+    int outer_width = sizing_width - margin_left - margin_right;
     if (opposing_width) {
         outer_width = opposing_outer_width;
     } else if (positioned && !assigned_width && !style->has_width) {
@@ -439,13 +447,13 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
            ignores out-of-flow roots, so use the bounded root-inclusive
            variant while keeping positioned descendants excluded. */
         int intrinsic = intrinsic_positioned_width(
-            context, node, parent, width);
+            context, node, parent, sizing_width);
         intrinsic -= margin_left + margin_right;
         if (intrinsic > 0 && intrinsic < outer_width) outer_width = intrinsic;
     } else if (!assigned_width && style->width_max_content) {
         bool minimum = computed_style_width_min_content(style);
         bool maximum = computed_style_width_max_content(style);
-        int measure_limit = maximum ? LAYOUT_COORDINATE_LIMIT : width;
+        int measure_limit = maximum ? LAYOUT_COORDINATE_LIMIT : sizing_width;
         int intrinsic = minimum
             ? intrinsic_min_text_width_ignoring_own_width(
                   context, node, parent, measure_limit)
@@ -460,12 +468,14 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
            not an ordinary block that fills its containing block. Captions,
            cell widths, padding, and borders all contribute through the
            shared max-content measurement. */
-        int intrinsic = table_intrinsic_width(context, node, style, width);
+        int intrinsic = table_intrinsic_width(
+            context, node, style, sizing_width);
         intrinsic -= margin_left + margin_right;
         if (intrinsic > 0 && intrinsic < outer_width) outer_width = intrinsic;
     } else if (!assigned_width && style->has_width) {
         int requested = resolve_declared_length(
-            context->sheet, style->width, style->width_percent, width);
+            context->sheet, style->width, style->width_percent,
+            sizing_width);
         int edges = style->padding.left + style->padding.right
                     + style->border.left + style->border.right;
         outer_width = style->box_sizing_border_box
@@ -473,9 +483,10 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     }
     bool has_maximum_width = false;
     outer_width = constrain_border_box_width(
-        context, node, parent, style, width, outer_width,
+        context, node, parent, style, sizing_width, outer_width,
         &has_maximum_width);
-    int free_margin = width - outer_width - margin_left - margin_right;
+    int free_margin = sizing_width - outer_width
+                      - margin_left - margin_right;
     if (free_margin < 0) free_margin = 0;
     if (style->margin_left_auto && style->margin_right_auto) {
         margin_left += free_margin / 2;
@@ -632,7 +643,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         &scratch->descendant_positioned_box;
     *descendant_positioned_box = *positioned_box;
     if (style->relative_position || style->sticky_position
-        || style->out_of_flow || style->fixed_position) {
+        || style->out_of_flow || style->fixed_position
+        || layout_style_establishes_fixed_containing_block(style)) {
         descendant_positioned_box->node = node;
         descendant_positioned_box->x = outer_x + style->border.left;
         descendant_positioned_box->y = layout_add_coordinate(
@@ -651,6 +663,22 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                 : 0;
         if (descendant_positioned_box->width < 0) {
             descendant_positioned_box->width = 0;
+        }
+    }
+    if (layout_style_establishes_fixed_containing_block(style)) {
+        descendant_positioned_box->fixed_node = node;
+        descendant_positioned_box->fixed_x = outer_x + style->border.left;
+        descendant_positioned_box->fixed_y = layout_add_coordinate(
+            outer_y, content_border_top);
+        descendant_positioned_box->fixed_width =
+            outer_width - style->border.left - style->border.right;
+        descendant_positioned_box->fixed_height =
+            definite_height || declared_content_height > 0
+                ? declared_content_height + style->padding.top
+                  + style->padding.bottom
+                : 0;
+        if (descendant_positioned_box->fixed_width < 0) {
+            descendant_positioned_box->fixed_width = 0;
         }
     }
     LineState *line = &scratch->line;
@@ -785,9 +813,15 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     }
     if (before_pseudo_flowed_inline) first_flow_content = false;
 
+    bool audio_element = layout_node_name_is(node, "audio");
+    bool audio_controls = audio_element
+        && lxb_dom_element_has_attribute(
+            lxb_dom_interface_element(node),
+            (const lxb_char_t *) "controls", 8);
     bool image_element = layout_node_name_is(node, "img")
                          || layout_node_name_is(node, "svg")
                          || layout_node_name_is(node, "video")
+                         || audio_element
                          || layout_node_name_is(node, "iframe");
     const ImageResource *block_image = image_element
                                        ? images_find_node(
@@ -814,15 +848,18 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     int image_height = image_available
         ? image_resource_intrinsic_height(block_image) : 0;
     if ((layout_node_name_is(node, "video")
+         || audio_controls
          || layout_node_name_is(node, "iframe"))
         && (image_width <= 0 || image_height <= 0)) {
         image_width = 300;
-        image_height = 150;
+        image_height = audio_controls ? 54 : 150;
     }
     int intrinsic_image_height = image_height;
     bool replaced_image = image_available
                           || (image_element
-                              && style->has_width && style->has_height);
+                              && (audio_controls
+                                  || (style->has_width
+                                      && style->has_height)));
     if (replaced_image) {
         if (style->has_width && !style->width_max_content) {
             int styled_width = resolve_declared_length(
@@ -867,7 +904,9 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             style->has_width && !style->width_max_content,
             style->has_height,
             &image_width, &image_height);
-        if (image_width > content_width) {
+        bool definite_replaced_width = style->has_width
+            && !style->width_max_content && !style->width_percent;
+        if (image_width > content_width && !definite_replaced_width) {
             image_height = layout_scale_dimension(
                 image_height, content_width, image_width);
             image_width = content_width;
@@ -878,7 +917,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             DrawCommand command = {
                 .type = DRAW_IMAGE, .x = content_x, .y = line->y,
                 .width = image_width, .height = image_height,
-                .image = block_image, .image_fit = style->object_fit
+                .image = block_image, .image_fit = style->object_fit,
+                .scale = paint_plan.border_radius_code
             };
             draw_command_set_object_position(
                 &command, style->object_position_x,
@@ -1311,6 +1351,27 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                               &positioned_bottom)) {
                 flex_order_plan_destroy(column_order);
                 return false;
+            }
+            /* The static inline position of an absolutely positioned child
+               still participates in a column flex container's cross-axis
+               alignment when both horizontal insets are auto. */
+            if (column_flex && flow_item->style.out_of_flow
+                && !flow_item->style.has_left
+                && !flow_item->style.has_right) {
+                const LayoutNodeBox *child_box = layout_box_for_node(
+                    context->layout, flow_item->node);
+                AlignItems alignment = flex_item_alignment(
+                    style, &flow_item->style);
+                if (child_box != NULL
+                    && (alignment == ALIGN_CENTER
+                        || alignment == ALIGN_END)) {
+                    int target_x = alignment == ALIGN_CENTER
+                        ? content_x + (content_width - child_box->width) / 2
+                        : content_x + content_width - child_box->width;
+                    translate_node_subtree(
+                        context->layout, flow_item->node,
+                        target_x - child_box->x, 0);
+                }
             }
             continue;
         }
@@ -1988,6 +2049,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     bool block_label = layout_node_name_is(node, "label");
     bool block_summary = layout_node_name_is(node, "summary");
     bool block_video = layout_node_name_is(node, "video");
+    bool block_audio = audio_controls;
     ControlType block_input_type = block_input
         ? layout_input_control_type(node) : CONTROL_INPUT;
     if ((block_input || block_textarea)
@@ -2071,15 +2133,19 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             outer_width, border_height)) {
         return false;
     }
+    if (block_audio
+        && !layout_paint_audio_control(
+            context, style, outer_x, outer_y,
+            outer_width, border_height)) return false;
     if (block_input || block_textarea || block_button || block_select
-        || block_label || block_summary || block_video) {
+        || block_label || block_summary || block_video || block_audio) {
         ControlType type = block_input ? block_input_type
                            : (block_textarea ? CONTROL_TEXTAREA
                               : (block_button || block_label || block_summary
-                                 || block_video ? CONTROL_BUTTON
+                                 || block_video || block_audio ? CONTROL_BUTTON
                                               : CONTROL_SELECT));
         int minimum_control_height = block_summary ? 24
-            : block_video ? border_height : 30;
+            : (block_video || block_audio) ? border_height : 30;
         int control_height = border_height < minimum_control_height
                              ? minimum_control_height : border_height;
         if (!layout_add_control(context->layout, outer_x, outer_y, outer_width,
@@ -2177,12 +2243,14 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     uint8_t positioned_ancestor_distance = 0;
     if (style->out_of_flow || style->fixed_position) {
         positioned_ancestor_distance = UINT8_MAX;
-        if (!style->fixed_position && positioned_box->node != NULL) {
+        lxb_dom_node_t *containing_node = style->fixed_position
+            ? positioned_box->fixed_node : positioned_box->node;
+        if (containing_node != NULL) {
             unsigned distance = 1;
             for (lxb_dom_node_t *ancestor = node->parent;
                  ancestor != NULL && distance < UINT8_MAX;
                  ancestor = ancestor->parent, distance++) {
-                if (ancestor == positioned_box->node) {
+                if (ancestor == containing_node) {
                     positioned_ancestor_distance = (uint8_t) distance;
                     break;
                 }
@@ -2349,6 +2417,32 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                               sticky_top)) return false;
     }
     if (style->fixed_position) {
+        if (fixed_captured) {
+            int target_x = outer_x;
+            int target_y = outer_y;
+            if (style->has_left) {
+                target_x = positioned_box->fixed_x + resolved_left
+                           + style->margin.left;
+            } else if (style->has_right) {
+                target_x = positioned_box->fixed_x
+                    + positioned_box->fixed_width - outer_width
+                    - resolved_right - style->margin.right;
+            }
+            if (style->has_top) {
+                target_y = positioned_box->fixed_y + resolved_top
+                           + style->margin.top;
+            } else if (style->has_bottom) {
+                target_y = positioned_box->fixed_y + positioning_height
+                    - border_height - resolved_bottom - style->margin.bottom;
+            }
+            layout_translate_range(
+                context->layout, node_command_start, node_link_start,
+                node_control_start, node_box_start,
+                target_x - outer_x, target_y - outer_y,
+                "fixed-containing-block", node);
+            *bottom = y;
+            return true;
+        }
         int target_x = outer_x;
         if (style->has_left) target_x = resolved_left;
         else if (style->has_right) {

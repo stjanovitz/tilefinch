@@ -123,6 +123,38 @@
                          + background_sample_x] == test_rgb565(0x00ff00));
     tile_cache_destroy(&fixed_cache);
     budget_free(&budget, fixed_frame);
+
+    puts("test: fixed percentage width uses viewport containing block");
+    static const char fixed_percent_page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0}"
+        "#host{display:flex;align-items:center;justify-content:center;"
+        "width:480px}"
+        "#narrow{width:8px}#bar{position:fixed;left:0;bottom:0;"
+        "width:100%;height:20px;background:#2468ac}"
+        "</style><body><div id=host><div id=narrow>"
+        "<div id=bar></div></div></div></body>";
+    PocDocument fixed_percent_document;
+    Stylesheet fixed_percent_sheet;
+    LayoutDocument fixed_percent_layout;
+    CHECK(document_parse(&fixed_percent_document, &budget,
+                         fixed_percent_page,
+                         strlen(fixed_percent_page), 43)
+          && stylesheet_build(&fixed_percent_sheet, &budget,
+                              &fixed_percent_document, 480)
+          && layout_build(&fixed_percent_layout, &budget,
+                          &fixed_percent_document,
+                          &fixed_percent_sheet, NULL, NULL, 480));
+    const LayoutNodeBox *fixed_percent_box = layout_box_for_node(
+        &fixed_percent_layout,
+        find_id(lxb_dom_interface_node(fixed_percent_document.html),
+                "bar"));
+    CHECK(fixed_percent_box != NULL && fixed_percent_box->x == 0
+          && fixed_percent_box->width == 480
+          && fixed_percent_layout.fixed_count == 1);
+    layout_destroy(&fixed_percent_layout);
+    stylesheet_destroy(&fixed_percent_sheet);
+    document_destroy(&fixed_percent_document);
+
     bool found_image = false, found_mask = false, found_pseudo = false;
     bool found_pseudo_mask = false;
     for (size_t i = 0; i < responsive_layout.count; i++) {

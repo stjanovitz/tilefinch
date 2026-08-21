@@ -156,6 +156,7 @@ static FetchHopState *fetch_hop_create(Budget *budget, const char *url,
     uint64_t duration = (uint64_t) timeout_ms * UINT64_C(1000000);
     hop->deadline_ns = duration > UINT64_MAX - now ? UINT64_MAX
                                                    : now + duration;
+    hop->redirect_transition_count = 0u;
     return hop;
 }
 
@@ -298,7 +299,8 @@ static bool fetch_github_release_url_allowed(const char *value)
 static bool fetch_hop_advance(FetchHopState *hop,
                               const FetchResult *response)
 {
-    if (hop == NULL || response == NULL || hop->redirects >= 5) return false;
+    if (hop == NULL || response == NULL
+        || hop->redirects >= FETCH_REDIRECT_LIMIT) return false;
     char location[TILEFINCH_URL_SERIALIZED_LIMIT];
     char next_logical[TILEFINCH_URL_SERIALIZED_LIMIT];
     if (!fetch_response_header_value(
@@ -330,6 +332,14 @@ static bool fetch_hop_advance(FetchHopState *hop,
                secured, location, sizeof(location))) return false;
     snprintf(next_logical, sizeof(next_logical), "%s", secured);
     const char *next = location;
+    uint32_t transition_hash =
+        fetch_redirect_transition_hash(hop->url, next);
+    for (uint8_t i = 0; i < hop->redirect_transition_count; i++) {
+        if (hop->redirect_transition_hashes[i] == transition_hash) {
+            hop->redirect_loop_detected = true;
+            return false;
+        }
+    }
     const FetchRequest *base = hop->base;
     if (tilefinch_url_is_downgrade(hop->url, next)
         && !fetch_request_mixed_override(base)) return false;
@@ -399,6 +409,10 @@ static bool fetch_hop_advance(FetchHopState *hop,
         || !hop_replace(
                hop->budget, &hop->logical_url, next_logical, 4095)
         || !hop_replace(hop->budget, &hop->url, next, 4095)) return false;
+    if (hop->redirect_transition_count < FETCH_REDIRECT_LIMIT) {
+        hop->redirect_transition_hashes[
+            hop->redirect_transition_count++] = transition_hash;
+    }
     hop->redirects++;
     return true;
 }
@@ -1137,16 +1151,18 @@ static bool fetch_request_internal(Budget *budget, const char *url,
                 hop->url, &result->security);
         }
         if (!context.redirect_response) break;
-        if (hop->redirects >= 5) {
+        if (hop->redirects >= FETCH_REDIRECT_LIMIT) {
             snprintf(failure, sizeof(failure),
-                     "response exceeded the five-hop redirect limit");
+                     FETCH_REDIRECT_LIMIT_ERROR);
             goto failed;
         }
         fetch_hop_stage_response_cookies(
             hop, result, context.response_cookie_start);
         if (!fetch_hop_advance(hop, result)) {
             snprintf(failure, sizeof(failure),
-                     "response redirect target is invalid");
+                     "%s", hop->redirect_loop_detected
+                         ? "response redirect loop detected"
+                         : "response redirect target is invalid");
             goto failed;
         }
         if (!fetch_configure_redirect_hop(

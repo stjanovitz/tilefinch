@@ -167,6 +167,9 @@ typedef struct {
     uint64_t pause_started_us;
     uint64_t last_progress_us;
     unsigned redirects;
+    uint32_t redirect_transition_hashes[FETCH_REDIRECT_LIMIT];
+    uint8_t redirect_transition_count;
+    bool redirect_loop_detected;
     bool streaming;
     bool single_hop;
     bool transfer_done;
@@ -1023,7 +1026,8 @@ static void fetch_background_finish_stream_if_drained(
 static bool fetch_background_follow_redirect(FetchBackgroundSlot *slot)
 {
     if (slot->header_status < 300 || slot->header_status >= 400
-        || slot->location[0] == '\0' || slot->redirects >= 5u) return false;
+        || slot->location[0] == '\0'
+        || slot->redirects >= FETCH_REDIRECT_LIMIT) return false;
     char resolved[FETCH_BACKGROUND_URL_CAPACITY];
     if (!tilefinch_url_resolve(
             slot->url, slot->location, resolved, sizeof(resolved))
@@ -1034,9 +1038,23 @@ static bool fetch_background_follow_redirect(FetchBackgroundSlot *slot)
                  "background redirect left the admitted media hosts");
         return false;
     }
+    uint32_t transition_hash =
+        fetch_redirect_transition_hash(slot->url, resolved);
+    for (uint8_t i = 0; i < slot->redirect_transition_count; i++) {
+        if (slot->redirect_transition_hashes[i] == transition_hash) {
+            slot->redirect_loop_detected = true;
+            snprintf(slot->result.error, sizeof(slot->result.error), "%s",
+                     "response redirect loop detected");
+            return false;
+        }
+    }
     size_t length = strlen(resolved);
     if (length >= sizeof(slot->url)) return false;
     memcpy(slot->url, resolved, length + 1u);
+    if (slot->redirect_transition_count < FETCH_REDIRECT_LIMIT) {
+        slot->redirect_transition_hashes[
+            slot->redirect_transition_count++] = transition_hash;
+    }
     if (slot->streaming
         && (slot->header_status == 301 || slot->header_status == 302
             || slot->header_status == 303)
@@ -1120,6 +1138,7 @@ static void fetch_background_finish_easy(
     slot->result.tls_handshake_measured = handshake.measured;
     slot->result.tls_handshake_us = handshake.handshake_us;
     bool admitted = !slot->private_network.blocked && code == CURLE_OK
+        && slot->result.error[0] == '\0'
         && ((status >= 200 && status < 300)
             /* The browser thread decides whether a 3xx is a redirect, a
                cache-validation response (304), or a terminal response. The
@@ -1132,7 +1151,7 @@ static void fetch_background_finish_easy(
     if (code == CURLE_OK && !admitted && slot->result.error[0] == '\0') {
         snprintf(slot->result.error, sizeof(slot->result.error), "%s",
                  status >= 300 && status < 400
-                    ? "background redirect was invalid or exceeded five hops"
+                    ? "background redirect was invalid or exceeded eight hops"
                     : (slot->single_hop
                            ? "background HTTP hop failed transport policy"
                            : "background response failed media URL policy"));
@@ -1993,6 +2012,8 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
         slot->deadline_us = duration > UINT64_MAX - slot->started_us
             ? UINT64_MAX : slot->started_us + duration;
         slot->redirects = 0;
+        slot->redirect_transition_count = 0u;
+        slot->redirect_loop_detected = false;
         slot->tls12_retry_attempted = false;
         slot->header_status = 0;
         slot->length = 0;
@@ -2200,6 +2221,8 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
         slot->deadline_us = duration > UINT64_MAX - slot->started_us
             ? UINT64_MAX : slot->started_us + duration;
         slot->redirects = 0;
+        slot->redirect_transition_count = 0u;
+        slot->redirect_loop_detected = false;
         slot->tls12_retry_attempted = false;
         slot->header_status = 0;
         slot->length = 0;

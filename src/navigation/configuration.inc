@@ -593,6 +593,7 @@ typedef struct {
     bool isolates_remote_document;
     bool runtime_document_replacement;
     bool script_disabled_after_failure;
+    bool optional_work_shed;
     bool pre_eof_preview_attempted;
     bool pre_eof_preview_painted;
     bool pre_eof_preview_style_refresh_attempted;

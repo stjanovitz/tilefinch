@@ -530,6 +530,32 @@ static void test_blocking_open_read(int port, uint64_t length,
     CHECK(budget.current == 0);
 }
 
+static void test_metadata_prefetch_is_reused(int port, uint64_t length)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    MediaHttpRange *range = open_range(
+        &budget, "query200", port, length, 256u * 1024u);
+    CHECK(range != NULL);
+    if (range == NULL) return;
+    CHECK(media_http_range_prefetch_metadata(range));
+    MediaHttpRangeStats before = {0};
+    CHECK(media_http_range_stats(range, &before)
+          && before.requests == 1u);
+    MediaRangeReader reader = media_http_range_reader(range);
+    unsigned char header[8] = {0};
+    CHECK(reader.read(reader.opaque, 0, header, sizeof(header)));
+    MediaHttpRangeStats after = {0};
+    CHECK(media_http_range_stats(range, &after)
+          && after.requests == 1u
+          && after.window_installs == 1u
+          && after.failures == 0u);
+    for (size_t at = 0; at < sizeof(header); at++)
+        CHECK(header[at] == expected_byte(at));
+    media_http_range_destroy(range);
+    CHECK(budget.current == 0);
+}
+
 static void test_standard_range_header(int port, uint64_t length)
 {
     Budget budget;
@@ -563,6 +589,43 @@ static void test_standard_range_header(int port, uint64_t length)
         CHECK(reader.read(reader.opaque, 0, bytes, sizeof(bytes)));
         for (size_t at = 0; at < sizeof(bytes); at++)
             CHECK(bytes[at] == expected_byte(at));
+        media_http_range_destroy(range);
+    }
+    CHECK(budget.current == 0);
+}
+
+static void test_audio_range_representation(int port, uint64_t length)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    char url[256];
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%d/audio206/media.m4a", port);
+    TilefinchRequestContext context = {
+        .target_url = url,
+        .initiator_url = url,
+        .top_level_url = url,
+        .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_MEDIA
+    };
+    MediaHttpRangeOptions options = {
+        .cache_bytes = 64u * 1024u,
+        .timeout_ms = 15000,
+        .connect_timeout_ms = 3000,
+        .standard_range_header = true,
+        .audio_only = true,
+        .page_request_context = &context
+    };
+    char error[256] = {0};
+    MediaHttpRange *range = media_http_range_create(
+        &budget, NULL, url, length, &options, error, sizeof(error));
+    CHECK(range != NULL);
+    if (range != NULL) {
+        MediaRangeReader reader = media_http_range_reader(range);
+        unsigned char bytes[8] = {0};
+        CHECK(reader.read(reader.opaque, 0, bytes, sizeof(bytes)));
         media_http_range_destroy(range);
     }
     CHECK(budget.current == 0);
@@ -2398,10 +2461,14 @@ int main(int argc, char **argv)
 
     puts("test: a blocking open read installs the window it just fetched");
     test_blocking_open_read(port, length, "query200", 200);
+    puts("test: an admitted metadata window is reused by open");
+    test_metadata_prefetch_is_reused(port, length);
     puts("test: a bounded partial response installs the same way");
     test_blocking_open_read(port, length, "partial206", 206);
     puts("test: an HTML media source uses a standard Range header");
     test_standard_range_header(port, length);
+    puts("test: an audio-only source advertises an audio representation");
+    test_audio_range_representation(port, length);
     puts("test: a read across a window boundary fetches both");
     test_window_crossing(port, length);
     puts("test: a poll never waits and completes on a later pump");

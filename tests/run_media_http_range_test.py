@@ -16,6 +16,7 @@ real completion detection, real admission checks.
   query200  `?range=A-B` answers 200 with exactly the requested slice, which is
             what the CDN does for the query form the media source uses.
   partial206  a Range: request answered 206 with Content-Range.
+  audio206  the same response, but rejects a video-shaped Accept header.
   short     a 200 whose body is one byte short of the request, which must be
             retried once and then reported rather than admitted.
   slow      the body dribbles out in small writes with pauses, so completion is
@@ -324,6 +325,12 @@ class RangeHandler(BaseHTTPRequestHandler):
         first = int(first)
         last = min(int(last), total - 1)
         payload = body[first:last + 1]
+        if (mode == "audio206"
+                and not self.headers.get("Accept", "").startswith("audio/mp4")):
+            self.send_response(406)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         attempt = 1
         if mode.startswith("cadence") or mode == "drop-each-once":
             with CADENCE_ATTEMPTS_LOCK:
@@ -356,7 +363,7 @@ class RangeHandler(BaseHTTPRequestHandler):
             # it proves readahead overlaps request setup rather than assuming
             # keep-alive always works.
             time.sleep(0.5)
-        if mode == "partial206" or mode == "bad206":
+        if mode in ("partial206", "audio206", "bad206"):
             self.send_response(206)
             self.send_header(
                 "Content-Range", "bytes %d-%d/%d" % (

@@ -236,6 +236,17 @@ static int dynamic_prepare_node(JSContext *context, lxb_dom_node_t *node)
 
     bool module = false;
     if (!dynamic_script_type(node, &module)) return 0;
+    if (!module && dynamic_attribute_present(node, "nomodule")) {
+        /* Mark the element started before returning so reinsertion cannot
+           turn a capability fallback into executable work. No quota, task,
+           allocation, or fetch has been admitted at this point. */
+        element->already_started = true;
+        if (bridge->result != NULL) {
+            js_rt_saturating_add_size(
+                &bridge->result->dynamic_scripts_nomodule_skipped, 1);
+        }
+        return 1;
+    }
     size_t source_length = 0;
     if (!script_node_source_length(node, &source_length)) return -1;
     size_t reference_length = 0;

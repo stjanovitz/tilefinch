@@ -224,9 +224,17 @@ typedef struct {
     uint64_t transport_refresh_rearm_us;
     uint64_t transport_next_expiry_check_us;
     bool offline_source;
+    /* A provider result may open the native player without replacing the
+       document underneath it. While this is set, the route is bound to the
+       navigation generation which launched it rather than to the current
+       document URL. */
+    bool provider_direct_route;
     /* A document-owned <video> route uses the same decoder/presenter as the
        provider, but its source is an ordinary authorized HTTP subresource. */
     bool page_source;
+    /* A document-owned <audio> uses the page-source request authority but
+       selects the existing audio-only demux/backend path. */
+    bool page_audio;
     bool page_hls;
     TilefinchRequestMode page_media_mode;
     TilefinchCredentialsMode page_media_credentials;
@@ -473,7 +481,15 @@ bool psp_media_open_watchdog(PspMediaSession *media);
 bool psp_media_decode_work_pending(const PspMediaSession *media);
 void psp_media_prepare_route(
     PspMediaSession *media, const char *url, uint64_t generation);
+bool psp_media_open_provider_route(
+    PspMediaSession *media, const char *url, uint64_t backing_generation);
 bool psp_media_open_page_source(
+    PspMediaSession *media, const char *source_url,
+    const char *document_url, uint64_t generation,
+    int64_t node_handle, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, bool autoplay,
+    bool reload_source);
+bool psp_media_open_page_audio(
     PspMediaSession *media, const char *source_url,
     const char *document_url, uint64_t generation,
     int64_t node_handle, TilefinchRequestMode mode,

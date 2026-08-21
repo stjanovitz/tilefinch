@@ -309,6 +309,7 @@ static JSValue js_request_media(JSContext *context,
     ScriptMediaRequest request = {
         .command = (ScriptMediaCommand) command,
         .node_handle = handle,
+        .audio_only = node->local_name == LXB_TAG_AUDIO,
         .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
         .credentials = TILEFINCH_CREDENTIALS_INCLUDE
     };
@@ -358,6 +359,7 @@ static JSValue js_request_media(JSContext *context,
     }
     budget_free(bridge->budget, bridge->media_source);
     bridge->media_command = request.command;
+    bridge->media_audio_only = request.audio_only;
     bridge->media_node_handle = request.node_handle;
     bridge->media_value = request.value;
     bridge->media_mode = request.mode;

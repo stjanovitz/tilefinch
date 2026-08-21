@@ -33,7 +33,8 @@ typedef enum {
 typedef enum {
     STYLE_PAINT_BOX_BORDER,
     STYLE_PAINT_BOX_PADDING,
-    STYLE_PAINT_BOX_CONTENT
+    STYLE_PAINT_BOX_CONTENT,
+    STYLE_PAINT_BOX_TEXT
 } StylePaintBox;
 
 typedef struct {

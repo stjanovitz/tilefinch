@@ -1218,6 +1218,9 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchRecordEvent",
                                        js_dom_record_event, 0)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchRecordEventHandler",
+                                       js_dom_record_event_handler, 0)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchStorageGet",
                                        js_storage_get, 2)
                    && js_rt_install_function(host->context, global,

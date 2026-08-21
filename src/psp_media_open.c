@@ -50,7 +50,8 @@ static PspPageMediaProbeStatus psp_media_page_probe_finish(
                true, false, &grant, &denied);
     if (!admitted) {
         snprintf(error, error_size,
-                 "page video range probe failed (HTTP %ld): %.150s",
+                 "page %s range probe failed (HTTP %ld): %.150s",
+                 media->page_audio ? "audio" : "video",
                  result->status_code,
                  result->error[0] == '\0'
                      ? "server did not authorize byte ranges"
@@ -65,13 +66,22 @@ static PspPageMediaProbeStatus psp_media_page_probe_finish(
     }
     memset(&media->stream, 0, sizeof(media->stream));
     snprintf(media->stream.title, sizeof(media->stream.title), "%s",
-             "Page video");
-    snprintf(media->stream.media_url, sizeof(media->stream.media_url), "%s",
-             result->effective_url[0] == '\0'
-                 ? media->source : result->effective_url);
-    snprintf(media->stream.mime_type, sizeof(media->stream.mime_type), "%s",
-             "video/mp4");
-    media->stream.content_length = complete_length;
+             media->page_audio ? "Page audio" : "Page video");
+    const char *effective_url = result->effective_url[0] == '\0'
+        ? media->source : result->effective_url;
+    if (media->page_audio) {
+        snprintf(media->stream.audio_url,
+                 sizeof(media->stream.audio_url), "%s", effective_url);
+        snprintf(media->stream.audio_mime_type,
+                 sizeof(media->stream.audio_mime_type), "%s", "audio/mp4");
+        media->stream.audio_content_length = complete_length;
+    } else {
+        snprintf(media->stream.media_url,
+                 sizeof(media->stream.media_url), "%s", effective_url);
+        snprintf(media->stream.mime_type,
+                 sizeof(media->stream.mime_type), "%s", "video/mp4");
+        media->stream.content_length = complete_length;
+    }
     media->stream.expires_unix = UINT64_MAX;
     return PSP_PAGE_MEDIA_PROBE_READY;
 }
@@ -85,14 +95,15 @@ static PspPageMediaProbeStatus psp_media_page_probe(
         if (!fetch_background_transport_progress(
                 media->page_media_probe_request, &progress)) {
             media->page_media_probe_request = 0;
-            snprintf(error, error_size, "%s",
-                     "page video probe disappeared");
+            snprintf(error, error_size, "page %s probe disappeared",
+                     media->page_audio ? "audio" : "video");
             return PSP_PAGE_MEDIA_PROBE_FAILED;
         }
         if (!progress.complete) return PSP_PAGE_MEDIA_PROBE_PENDING;
         FetchResult *result = fetch_result_create(media->budget);
         if (result == NULL) {
-            snprintf(error, error_size, "%s", "page video probe budget");
+            snprintf(error, error_size, "page %s probe budget",
+                     media->page_audio ? "audio" : "video");
             return PSP_PAGE_MEDIA_PROBE_FAILED;
         }
         uint64_t request = media->page_media_probe_request;
@@ -108,7 +119,8 @@ static PspPageMediaProbeStatus psp_media_page_probe(
     FetchPreparedPageRequest *prepared = budget_malloc_category(
         media->budget, BUDGET_CATEGORY_NAVIGATION, sizeof(*prepared));
     if (prepared == NULL) {
-        snprintf(error, error_size, "%s", "page video request budget");
+        snprintf(error, error_size, "page %s request budget",
+                 media->page_audio ? "audio" : "video");
         return PSP_PAGE_MEDIA_PROBE_FAILED;
     }
     char range_header[64];
@@ -123,7 +135,9 @@ static PspPageMediaProbeStatus psp_media_page_probe(
     };
     FetchRequest transport = {
         .allow_http_errors = true,
-        .accept = "video/mp4,video/*;q=0.9,*/*;q=0.5",
+        .accept = media->page_audio
+            ? "audio/mp4,audio/*;q=0.9,*/*;q=0.5"
+            : "video/mp4,video/*;q=0.9,*/*;q=0.5",
         .user_agent = TILEFINCH_BROWSER_USER_AGENT,
         .connect_timeout_ms = PSP_MEDIA_CONNECT_TIMEOUT_MS,
         .redirect_same_origin_only = true
@@ -140,7 +154,8 @@ static PspPageMediaProbeStatus psp_media_page_probe(
         ? fetch_prepared_page_request(prepared) : NULL;
     if (!ready || request == NULL) {
         budget_free(media->budget, prepared);
-        snprintf(error, error_size, "%s", "page video request refused");
+        snprintf(error, error_size, "page %s request refused",
+                 media->page_audio ? "audio" : "video");
         return PSP_PAGE_MEDIA_PROBE_FAILED;
     }
     if (fetch_background_transport_available()) {
@@ -153,8 +168,8 @@ static PspPageMediaProbeStatus psp_media_page_probe(
             if (enqueue_status == FETCH_BACKGROUND_ENQUEUE_SATURATED
                 || enqueue_status == FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED)
                 return PSP_PAGE_MEDIA_PROBE_PENDING;
-            snprintf(error, error_size, "%s",
-                     "page video transport unavailable");
+            snprintf(error, error_size, "page %s transport unavailable",
+                     media->page_audio ? "audio" : "video");
             return PSP_PAGE_MEDIA_PROBE_FAILED;
         }
         return PSP_PAGE_MEDIA_PROBE_PENDING;
@@ -165,7 +180,8 @@ static PspPageMediaProbeStatus psp_media_page_probe(
         psp_media_cancel_callback, media, result);
     budget_free(media->budget, prepared);
     if (result == NULL) {
-        snprintf(error, error_size, "%s", "page video probe budget");
+        snprintf(error, error_size, "page %s probe budget",
+                 media->page_audio ? "audio" : "video");
         return PSP_PAGE_MEDIA_PROBE_FAILED;
     }
     PspPageMediaProbeStatus status = psp_media_page_probe_finish(
@@ -174,13 +190,14 @@ static PspPageMediaProbeStatus psp_media_page_probe(
     return status;
 }
 
-static void psp_media_page_track_metadata(PspMediaSession *media)
+static void psp_media_page_track_metadata(
+    PspMediaSession *media, MediaMp4Demux *demux)
 {
-    if (media == NULL || !media->page_source || media->demux == NULL) return;
+    if (media == NULL || !media->page_source || demux == NULL) return;
     uint64_t duration_ms = 0;
-    for (size_t at = 0; at < media_mp4_track_count(media->demux); at++) {
+    for (size_t at = 0; at < media_mp4_track_count(demux); at++) {
         MediaMp4TrackInfo info;
-        if (!media_mp4_track_info(media->demux, at, &info)
+        if (!media_mp4_track_info(demux, at, &info)
             || info.timescale == 0) continue;
         uint64_t track_ms = info.duration <= UINT64_MAX / UINT64_C(1000)
             ? info.duration * UINT64_C(1000) / info.timescale
@@ -192,6 +209,30 @@ static void psp_media_page_track_metadata(PspMediaSession *media)
         }
     }
     media->stream.duration_ms = duration_ms;
+}
+
+static bool psp_media_page_validate_audio_track(
+    PspMediaSession *media, char *error, size_t error_size)
+{
+    if (media == NULL || media->audio_demux == NULL || !media->page_audio)
+        return true;
+    bool found = false;
+    for (size_t at = 0;
+         at < media_mp4_track_count(media->audio_demux); at++) {
+        MediaMp4TrackInfo info;
+        if (media_mp4_track_info(media->audio_demux, at, &info)
+            && info.kind == MEDIA_MP4_TRACK_AUDIO
+            && info.codec == MEDIA_MP4_FOURCC('m','p','4','a')) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        snprintf(error, error_size, "%s",
+                 "page audio has no supported AAC track");
+        return false;
+    }
+    return true;
 }
 
 static void psp_media_apply_decoder_hint(PspMediaSession *media)
@@ -260,7 +301,10 @@ static bool psp_media_apply_demux_decoder_route(
 bool psp_media_resolved_stream_reusable(const PspMediaSession *media)
 {
     if (media == NULL) return false;
-    if (media->audio_only) {
+    if (media->page_audio) {
+        if (media->stream.audio_content_length == 0
+            || media->stream.audio_url[0] == '\0') return false;
+    } else if (media->audio_only) {
         if (media->stream.audio_content_length == 0
             || media->stream.audio_url[0] == '\0') return false;
     } else if (media->stream.content_length == 0
@@ -343,6 +387,48 @@ static bool psp_media_create_playback(PspMediaSession *media,
         backend.destroy(backend.opaque);
         return false;
     }
+    return true;
+}
+
+static bool psp_media_create_audio_http_range(
+    PspMediaSession *media, char *error, size_t error_size)
+{
+    if (media == NULL) return false;
+    if (media->audio_range != NULL) return true;
+    MediaHttpRangeOptions range_options = {
+        .cache_bytes = 256u * KIB,
+        .minimum_sustained_bytes_per_second =
+            psp_media_transport_rate_floor(
+                media->stream.audio_content_length,
+                media->stream.duration_ms),
+        .timeout_ms = 15000,
+        .connect_timeout_ms = PSP_MEDIA_CONNECT_TIMEOUT_MS,
+        .referer = media->page_audio
+            ? media->page_document_url : media->source,
+        .standard_range_header = media->page_audio,
+        .audio_only = true,
+        .page_request_context = media->page_audio
+            ? &(TilefinchRequestContext) {
+                .target_url = media->stream.audio_url,
+                .initiator_url = media->page_document_url,
+                .top_level_url = media->page_document_url,
+                .method = "GET",
+                .mode = media->page_media_mode,
+                .credentials = media->page_media_credentials,
+                .destination = TILEFINCH_DESTINATION_MEDIA
+              } : NULL,
+        .url_validator = media->page_audio
+            ? NULL : youtube_media_url_supported,
+        .cancel = psp_media_cancel_callback,
+        .cancel_opaque = media
+    };
+    media->audio_range = media_http_range_create(
+        media->budget, media->session, media->stream.audio_url,
+        media->stream.audio_content_length, &range_options,
+        error, error_size);
+    if (media->audio_range == NULL) return false;
+    if (browser_profile_video_startup_buffering(media->profile))
+        media_http_range_set_aggressive_readahead(media->audio_range, true);
     return true;
 }
 
@@ -1227,7 +1313,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                 psp_media_cancel_callback, media,
                 &media->stream, error, sizeof(error));
         }
-        if (ok && media->audio_only
+        if (ok && media->audio_only && !media->page_audio
             && (!media->stream.split_streams
                 || media->stream.audio_url[0] == '\0'
                 || media->stream.audio_content_length == 0)) {
@@ -1277,6 +1363,8 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                defer its decoder choice until VIDEO_DEMUX rather than loading
                firmware first and the larger software component afterward. */
             media->job_phase = media->page_hls
+                ? PSP_MEDIA_JOB_OPEN_DECODER_PREPARE
+                : media->page_audio
                 ? PSP_MEDIA_JOB_OPEN_DECODER_PREPARE
                 : media->page_source
                 ? PSP_MEDIA_JOB_OPEN_VIDEO_RANGE
@@ -1363,6 +1451,22 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             if (browser_profile_video_startup_buffering(media->profile))
                 media_http_range_set_aggressive_readahead(
                     media->range, true);
+            /* The module worker has already finished, so both required range
+               caches are now safe to admit. Put the video metadata window on
+               the single transport worker first, then its audio companion;
+               this removes frame-boundary idle gaps without concurrent curl
+               work or a larger peak allocation. A deferred hint remains an
+               ordinary metadata read, not an open failure. */
+            (void) media_http_range_prefetch_metadata(media->range);
+            if (media->stream.split_streams && !media->page_source) {
+                ok = psp_media_create_audio_http_range(
+                    media, error, sizeof(error));
+                if (ok)
+                    (void) media_http_range_prefetch_metadata(
+                        media->audio_range);
+            }
+        }
+        if (ok) {
             media->job_phase = PSP_MEDIA_JOB_OPEN_VIDEO_DEMUX;
         }
         break;
@@ -1375,7 +1479,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             media->budget, &reader, NULL, error, sizeof(error));
         ok = media->demux != NULL;
         if (ok) {
-            psp_media_page_track_metadata(media);
+            psp_media_page_track_metadata(media, media->demux);
             ok = psp_media_apply_demux_decoder_route(
                 media, error, sizeof(error));
         }
@@ -1426,28 +1530,10 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             if (ok) media->job_phase = PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX;
             break;
         }
-        MediaHttpRangeOptions range_options = {
-            .cache_bytes = 256u * KIB,
-            .minimum_sustained_bytes_per_second =
-                psp_media_transport_rate_floor(
-                    media->stream.audio_content_length,
-                    media->stream.duration_ms),
-            .timeout_ms = 15000,
-            .connect_timeout_ms = PSP_MEDIA_CONNECT_TIMEOUT_MS,
-            .referer = media->source,
-            .url_validator = youtube_media_url_supported,
-            .cancel = psp_media_cancel_callback,
-            .cancel_opaque = media
-        };
-        media->audio_range = media_http_range_create(
-            media->budget, media->session, media->stream.audio_url,
-            media->stream.audio_content_length, &range_options,
-            error, sizeof(error));
-        ok = media->audio_range != NULL;
+        ok = psp_media_create_audio_http_range(
+            media, error, sizeof(error));
         if (ok) {
-            if (browser_profile_video_startup_buffering(media->profile))
-                media_http_range_set_aggressive_readahead(
-                    media->audio_range, true);
+            (void) media_http_range_prefetch_metadata(media->audio_range);
             media->job_phase = PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX;
         }
         break;
@@ -1459,6 +1545,11 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         media->audio_demux = media_mp4_open(
             media->budget, &reader, NULL, error, sizeof(error));
         ok = media->audio_demux != NULL;
+        if (ok && media->page_audio) {
+            psp_media_page_track_metadata(media, media->audio_demux);
+            ok = psp_media_page_validate_audio_track(
+                media, error, sizeof(error));
+        }
         if (ok) media->job_phase = media->audio_only
             ? PSP_MEDIA_JOB_OPEN_PLAYBACK
             : PSP_MEDIA_JOB_OPEN_VIDEO_PRIME;
@@ -1485,6 +1576,8 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             ok = prepared == MEDIA_PSP_PREPARE_READY;
         }
         if (ok) media->job_phase = media->hls != NULL
+            ? PSP_MEDIA_JOB_OPEN_PLAYBACK
+            : media->page_audio && media->audio_demux != NULL
             ? PSP_MEDIA_JOB_OPEN_PLAYBACK
             : media->demux != NULL
             ? media->stream.split_streams

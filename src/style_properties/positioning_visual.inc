@@ -633,7 +633,15 @@ static bool style_radius_tokens(const Stylesheet *sheet,
         bool percent = false;
         int radius = style_parse_length(
             sheet, resolved + at, end - at, -1, &percent);
-        if (radius < 0 || percent) return false;
+        if (radius < 0) return false;
+        /* The compact radius code has no per-box percentage payload. The
+           overwhelmingly common circular/pill spelling is losslessly
+           represented by an intentionally oversized uniform radius; used
+           value resolution already caps that to half the smaller side. */
+        if (percent) {
+            if (radius < 50) return false;
+            radius = 32767;
+        }
         radii[(*count)++] = radius;
         at = end;
     }

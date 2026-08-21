@@ -526,6 +526,29 @@ static bool fixed_screen_command(const TileCache *cache,
     return true;
 }
 
+static bool fixed_range_owns_command(const LayoutDocument *layout,
+                                     size_t range_index,
+                                     size_t command_index)
+{
+    if (layout == NULL || range_index >= layout->fixed_count) return false;
+    const FixedRange *candidate = &layout->fixed_ranges[range_index];
+    if (command_index < candidate->command_start
+        || command_index >= candidate->command_end) return false;
+    size_t candidate_span = candidate->command_end - candidate->command_start;
+    for (size_t i = 0; i < layout->fixed_count; i++) {
+        if (i == range_index) continue;
+        const FixedRange *other = &layout->fixed_ranges[i];
+        if (command_index < other->command_start
+            || command_index >= other->command_end) continue;
+        size_t other_span = other->command_end - other->command_start;
+        if (other_span < candidate_span
+            || (other_span == candidate_span && i < range_index)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 typedef struct {
     DrawCommand command;
     int clip_left;
@@ -658,7 +681,8 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
         for (size_t order = 0; order < cache->layout->count; order++) {
             size_t i = cache->layout->paint_order_count == cache->layout->count
                        ? cache->layout->paint_order[order] : order;
-            if (i < range->command_start || i >= range->command_end) continue;
+            if (!fixed_range_owns_command(
+                    cache->layout, range_index, i)) continue;
             FixedScreenCommand fixed;
             if (!fixed_screen_command_geometry(
                     cache, range, i, viewport_width, viewport_height,
@@ -740,7 +764,8 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
         for (size_t order = 0; order < cache->layout->count; order++) {
             size_t i = cache->layout->paint_order_count == cache->layout->count
                        ? cache->layout->paint_order[order] : order;
-            if (i < range->command_start || i >= range->command_end) continue;
+            if (!fixed_range_owns_command(
+                    cache->layout, range_index, i)) continue;
             FixedScreenCommand fixed;
             if (!fixed_screen_command_geometry(
                     cache, range, i, viewport_width, viewport_height,
@@ -973,7 +998,8 @@ static void paint_fixed_overlays(TileCache *cache, uint16_t *frame,
         for (size_t order = 0; order < cache->layout->count; order++) {
             size_t i = cache->layout->paint_order_count == cache->layout->count
                        ? cache->layout->paint_order[order] : order;
-            if (i < range->command_start || i >= range->command_end) continue;
+            if (!fixed_range_owns_command(
+                    cache->layout, range_index, i)) continue;
             FixedScreenCommand fixed;
             if (!fixed_screen_command_geometry(
                     cache, range, i, viewport_width, viewport_height,

@@ -116,6 +116,23 @@ if(TILEFINCH_PSP_EVEREST_X25519)
     set(_mbedtls_everest_flags " -DMBEDTLS_ECDH_VARIANT_EVEREST_ENABLED=1")
 endif()
 
+# ExternalProject dependencies do not inherit the parent directory's compile
+# options. Give them the same stable virtual source roots so __FILE__, debug
+# data, and macro-expanded paths cannot disclose the release builder's home.
+string(CONCAT _transport_prefix_map_flags
+    " -ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=/tilefinch/source"
+    " -fdebug-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=/tilefinch/source"
+    " -fmacro-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=/tilefinch/source"
+    " -ffile-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=/tilefinch/build"
+    " -fdebug-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=/tilefinch/build"
+    " -fmacro-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=/tilefinch/build")
+if(DEFINED ENV{PSPDEV} AND NOT "$ENV{PSPDEV}" STREQUAL "")
+    string(APPEND _transport_prefix_map_flags
+        " -ffile-prefix-map=$ENV{PSPDEV}=/pspdev"
+        " -fdebug-prefix-map=$ENV{PSPDEV}=/pspdev"
+        " -fmacro-prefix-map=$ENV{PSPDEV}=/pspdev")
+endif()
+
 ExternalProject_Add(tilefinch_psp_mbedtls
     URL "${_mbedtls_archive}"
     URL_HASH
@@ -138,7 +155,7 @@ ExternalProject_Add(tilefinch_psp_mbedtls
         "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
         "-DCMAKE_INSTALL_PREFIX=${_transport_prefix}"
         "-DCMAKE_BUILD_TYPE=MinSizeRel"
-        "-DCMAKE_C_FLAGS=-G0 -D_DEFAULT_SOURCE -ffunction-sections -fdata-sections${_mbedtls_bignum_flags}${_mbedtls_everest_flags}"
+        "-DCMAKE_C_FLAGS=-G0 -D_DEFAULT_SOURCE -ffunction-sections -fdata-sections${_transport_prefix_map_flags}${_mbedtls_bignum_flags}${_mbedtls_everest_flags}"
         "-DENABLE_PROGRAMS=OFF"
         "-DENABLE_TESTING=OFF"
         "-DMBEDTLS_USER_CONFIG_FILE=${CMAKE_CURRENT_SOURCE_DIR}/cmake/psp_transport/mbedtls_user_config.h"
@@ -162,7 +179,7 @@ if(TILEFINCH_PSP_HTTP2)
             "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
             "-DCMAKE_INSTALL_PREFIX=${_transport_prefix}"
             "-DCMAKE_BUILD_TYPE=MinSizeRel"
-            "-DCMAKE_C_FLAGS=-G0 -ffunction-sections -fdata-sections"
+            "-DCMAKE_C_FLAGS=-G0 -ffunction-sections -fdata-sections${_transport_prefix_map_flags}"
             "-DBUILD_SHARED_LIBS=OFF"
             "-DBUILD_STATIC_LIBS=ON"
             "-DENABLE_LIB_ONLY=ON"
@@ -202,7 +219,7 @@ ExternalProject_Add(tilefinch_psp_curl
         "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
         "-DCMAKE_INSTALL_PREFIX=${_transport_prefix}"
         "-DCMAKE_BUILD_TYPE=MinSizeRel"
-        "-DCMAKE_C_FLAGS=-G0 -D_DEFAULT_SOURCE -ffunction-sections -fdata-sections"
+        "-DCMAKE_C_FLAGS=-G0 -D_DEFAULT_SOURCE -ffunction-sections -fdata-sections${_transport_prefix_map_flags}"
         "-DCMAKE_PREFIX_PATH=${_transport_prefix}"
         "-DCURL_USE_CMAKECONFIG=OFF"
         "-DCURL_USE_PKGCONFIG=OFF"

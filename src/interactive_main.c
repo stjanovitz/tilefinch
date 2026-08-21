@@ -19,6 +19,7 @@
 
 #include "tilefinch/browser_engine.h"
 #include "tilefinch/budget.h"
+#include "tilefinch/content_blocker.h"
 #include "tilefinch/controller.h"
 #include "tilefinch/document_backing.h"
 #include "tilefinch/fetch.h"
@@ -273,6 +274,7 @@ int main(int argc, char **argv)
     bool external_resources = true;
     bool forced_dark = false;
     bool progressive_first_paint = true;
+    bool hide_cookie_banners = false;
     bool wpt_test_rendered = false;
     bool low_memory_navigation = false;
     bool experimental_compressed_sections = false;
@@ -318,6 +320,9 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--wpt-test-rendered") == 0) {
             wpt_test_rendered = true;
+        }
+        else if (strcmp(argv[i], "--hide-cookie-banners") == 0) {
+            hide_cookie_banners = true;
         }
         else if (strcmp(argv[i], "--adaptive-resources") == 0) {
             adaptive_resources = true;
@@ -544,7 +549,7 @@ int main(int argc, char **argv)
     size_t stylesheet_count = 6, stylesheet_bytes = 768 * KIB;
     size_t stylesheet_file_bytes = 256 * KIB;
     size_t image_count = 24, image_bytes = 1536 * KIB;
-    size_t image_file_bytes = 384 * KIB;
+    size_t image_file_bytes = 512 * KIB;
     size_t decoded_image_bytes = 3 * MIB;
     /* A larger page budget should buy broader, still-bounded web-app
        coverage without requiring per-site launch flags. Modern bundles can
@@ -1271,6 +1276,8 @@ int main(int argc, char **argv)
                 navigation.script_skipped_cross_origin;
             script_metrics.skipped_module +=
                 navigation.script_skipped_module;
+            script_metrics.skipped_nomodule +=
+                navigation.script_skipped_nomodule;
             script_metrics.skipped_quota +=
                 navigation.script_skipped_quota;
             script_metrics.skipped_pressure +=
@@ -1605,7 +1612,22 @@ int main(int argc, char **argv)
         &navigation.viewport, navigation.page.layout.height);
     bool pre_style_at_bottom = pre_style_entry != NULL
         && pre_style_entry->scroll_y >= pre_style_maximum;
-    if (!apply_user_css(&navigation, user_css)) {
+    if (hide_cookie_banners && user_css != NULL) {
+        fprintf(stderr, "cookie-banner and file user CSS cannot be combined\n");
+        goto cleanup;
+    }
+    if (hide_cookie_banners) {
+        char cookie_css[8192];
+        size_t cookie_css_length = 0;
+        if (!content_blocker_cookie_banner_css(
+                cookie_css, sizeof(cookie_css), &cookie_css_length)
+            || !navigation_set_user_css(
+                &navigation, cookie_css, cookie_css_length)
+            || !navigation_relayout(&navigation)) {
+            fprintf(stderr, "interactive cookie-banner CSS failed\n");
+            goto cleanup;
+        }
+    } else if (!apply_user_css(&navigation, user_css)) {
         fprintf(stderr, "interactive user stylesheet failed: %s\n",
                 user_css == NULL ? "" : user_css);
         goto cleanup;
@@ -2534,7 +2556,7 @@ int main(int argc, char **argv)
            navigation.page.script_result.async_network_peak_inflight);
     printf("javascript-dynamic-scripts queued=%zu started=%zu completed=%zu "
            "failed=%zu cancelled=%zu cache-hits=%zu quota=%zu "
-           "ordered-waits=%zu peak-pending=%zu bytes=%zu\n",
+           "ordered-waits=%zu peak-pending=%zu nomodule=%zu bytes=%zu\n",
            navigation.page.script_result.dynamic_scripts_queued,
            navigation.page.script_result.dynamic_scripts_started,
            navigation.page.script_result.dynamic_scripts_completed,
@@ -2544,6 +2566,7 @@ int main(int argc, char **argv)
            navigation.page.script_result.dynamic_scripts_quota_rejected,
            navigation.page.script_result.dynamic_scripts_ordered_waits,
            navigation.page.script_result.dynamic_scripts_peak_pending,
+           navigation.page.script_result.dynamic_scripts_nomodule_skipped,
            navigation.page.script_result.dynamic_script_bytes);
     printf("javascript-network-logical admitted=%zu completed=%zu "
            "rejected=%zu cancelled=%zu timed-out=%zu peak=%zu "
@@ -2765,13 +2788,15 @@ int main(int argc, char **argv)
         }
     }
     printf("scripts discovered=%zu attempted=%zu loaded=%zu failed=%zu "
-           "cross-origin=%zu skipped-modules=%zu quota=%zu pressure=%zu "
+           "cross-origin=%zu skipped-modules=%zu skipped-nomodule=%zu "
+           "quota=%zu pressure=%zu "
            "pressure-gc=%zu pressure-reclaimed=%zu pressure-caps=%zu "
            "bytes=%zu cache-hits=%zu\n",
            script_metrics.discovered, script_metrics.attempted,
            script_metrics.loaded, script_metrics.failed,
            script_metrics.skipped_cross_origin,
-           script_metrics.skipped_module, script_metrics.skipped_quota,
+           script_metrics.skipped_module, script_metrics.skipped_nomodule,
+           script_metrics.skipped_quota,
            script_metrics.skipped_pressure,
            script_metrics.pressure_collections,
            script_metrics.pressure_reclaimed_bytes,
@@ -2809,6 +2834,11 @@ int main(int argc, char **argv)
            (unsigned long long) navigation.last_frame_message_sequence,
            navigation.last_frame_message_source,
            navigation.last_frame_message_target);
+    printf("navigation-degradation optional-work-sheds=%zu "
+           "zero-body-retries=%zu frame-message-soft-failures=%zu\n",
+           navigation.performance.optional_work_sheds,
+           navigation.performance.zero_body_navigation_retries,
+           navigation.performance.frame_message_soft_failures);
     printf("frame-last-reject=\"%s\"\n",
            navigation.last_frame_reject_reason);
     if (trace_frames && navigation.last_frame_trace[0] != '\0') {
@@ -2905,8 +2935,19 @@ int main(int argc, char **argv)
            action.type == CONTROLLER_ACTION_NAVIGATE ? "navigate"
            : (action.type == CONTROLLER_ACTION_CONTROL ? "control"
               : (action.type == CONTROLLER_ACTION_FORM_SUBMIT
-                 ? "form" : "none")),
+                 ? "form" : action.type == CONTROLLER_ACTION_MEDIA
+                 ? "media" : "none")),
            action.url);
+    printf("structured-audio inspected=%zu/%zu candidates=%zu overflow=%zu "
+           "malformed=%zu truncated=%zu matched=%zu ambiguous=%zu\n",
+           controller.structured_audio.inspected_bytes,
+           controller.structured_audio.inspected_nodes,
+           controller.structured_audio.candidate_count,
+           controller.structured_audio.candidate_overflow,
+           controller.structured_audio.malformed_scripts,
+           controller.structured_audio.truncated_scripts,
+           controller.structured_audio_matched_activations,
+           controller.structured_audio_ambiguous_rejections);
     if (experimental_compressed_sections) {
         printf("experimental-initial-load transfer-us=%llu "
                "first-section-index-us=%llu provisional-commit-us=%llu "

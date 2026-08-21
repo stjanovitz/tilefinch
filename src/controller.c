@@ -309,26 +309,28 @@ static bool node_is_submit_button(lxb_dom_node_t *node)
                    || attribute_is(node, "type", "image")));
 }
 
-static bool media_type_supported(lxb_dom_node_t *node)
+static bool media_type_supported(lxb_dom_node_t *node, bool audio_only)
 {
     size_t length = 0;
     const char *type = document_attribute(node, "type", &length);
     if (type == NULL || length == 0) return true;
-    static const char mp4[] = "video/mp4";
-    if (length < sizeof(mp4) - 1u
-        || strncasecmp(type, mp4, sizeof(mp4) - 1u) != 0) return false;
-    if (length == sizeof(mp4) - 1u) return true;
-    unsigned char next = (unsigned char) type[sizeof(mp4) - 1u];
+    const char *mp4 = audio_only ? "audio/mp4" : "video/mp4";
+    size_t mp4_length = strlen(mp4);
+    if (length < mp4_length
+        || strncasecmp(type, mp4, mp4_length) != 0) return false;
+    if (length == mp4_length) return true;
+    unsigned char next = (unsigned char) type[mp4_length];
     return next == ';' || isspace(next);
 }
 
 static const char *media_source_reference(
-    BrowserController *controller, lxb_dom_node_t *video, size_t *length)
+    BrowserController *controller, lxb_dom_node_t *media, size_t *length,
+    bool audio_only)
 {
-    const char *source = document_attribute(video, "src", length);
+    const char *source = document_attribute(media, "src", length);
     if (source != NULL && *length != 0) return source;
     unsigned child_elements = 0;
-    for (lxb_dom_node_t *child = video == NULL ? NULL : video->first_child;
+    for (lxb_dom_node_t *child = media == NULL ? NULL : media->first_child;
          child != NULL; child = child->next) {
         if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
         if (child_elements++ >= 16u) break;
@@ -336,7 +338,7 @@ static const char *media_source_reference(
         /* Match the bootstrap's limit. A hostile element may contain the
            document's full node allowance; activation must remain a small,
            deterministic input operation rather than a second DOM walk. */
-        if (!media_type_supported(child)) {
+        if (!media_type_supported(child, audio_only)) {
             continue;
         }
         size_t media_length = 0;
@@ -353,14 +355,14 @@ static const char *media_source_reference(
 }
 
 static void media_credentials_policy(
-    lxb_dom_node_t *video, TilefinchRequestMode *mode,
+    lxb_dom_node_t *media, TilefinchRequestMode *mode,
     TilefinchCredentialsMode *credentials)
 {
     *mode = TILEFINCH_REQUEST_MODE_NO_CORS;
     *credentials = TILEFINCH_CREDENTIALS_INCLUDE;
     size_t length = 0;
     const char *crossorigin = document_attribute(
-        video, "crossorigin", &length);
+        media, "crossorigin", &length);
     if (crossorigin == NULL) return;
     *mode = TILEFINCH_REQUEST_MODE_CORS;
     *credentials = length == sizeof("use-credentials") - 1u
@@ -372,17 +374,18 @@ static void media_credentials_policy(
 }
 
 static bool controller_build_media_action(
-    BrowserController *controller, lxb_dom_node_t *video,
+    BrowserController *controller, lxb_dom_node_t *media,
     ControllerAction *action)
 {
-    if (controller == NULL || video == NULL || action == NULL
-        || !node_name_is(video, "video")) return false;
+    if (controller == NULL || media == NULL || action == NULL) return false;
+    bool audio_only = node_name_is(media, "audio");
+    if (!audio_only && !node_name_is(media, "video")) return false;
     size_t source_length = 0;
     const char *source = media_source_reference(
-        controller, video, &source_length);
+        controller, media, &source_length, audio_only);
     bool discovered = false;
     MediaDiscoveryKind discovered_kind = MEDIA_DISCOVERY_NONE;
-    if (source == NULL || source_length == 0) {
+    if (!audio_only && (source == NULL || source_length == 0)) {
         MediaDiscoveryResult discovery = {0};
         if (!media_discover_document_candidate(
                 &controller->navigation->page.document,
@@ -410,23 +413,343 @@ static bool controller_build_media_action(
     const char *base = current == NULL ? NULL : current->url;
     if (base == NULL || !fetch_resolve_url(
             base, action->body, action->url, sizeof(action->url))) return false;
+    if (!discovered) {
+        discovered_kind = media_discovery_reference_kind(
+            action->url, strlen(action->url));
+    }
     if (!tilefinch_csp_allows_request(
             &controller->navigation->page.document.content_security_policy,
             TILEFINCH_DESTINATION_MEDIA, action->url)) return false;
     media_credentials_policy(
-        video, &action->media_mode, &action->media_credentials);
+        media, &action->media_mode, &action->media_credentials);
     ScriptRuntime *runtime = controller->navigation->page.runtime;
     /* Playback and its asynchronous DOM state reports may outlive a page
        wrapper. Pin the handle just as HTMLMediaElement.play() does; terminal
        state delivery releases it, while document teardown remains the bound
        if the user closes the native player first. */
     action->media_node_handle = runtime == NULL ? 0
-        : script_runtime_node_handle(runtime, video);
+        : script_runtime_node_handle(runtime, media);
+    action->media_audio_only = audio_only;
     action->media_kind = discovered_kind;
     action->body[0] = '\0';
     action->body_length = 0;
     action->type = CONTROLLER_ACTION_MEDIA;
     return true;
+}
+
+static size_t controller_normalize_label(
+    const char *source, size_t length, char *output, size_t capacity)
+{
+    if (output == NULL || capacity == 0) return 0;
+    size_t begin = 0, end = length;
+    while (begin < end && isspace((unsigned char) source[begin])) begin++;
+    while (end > begin && isspace((unsigned char) source[end - 1u])) end--;
+    size_t written = 0;
+    bool space = false;
+    for (size_t i = begin; i < end && written + 1u < capacity; i++) {
+        unsigned char value = (unsigned char) source[i];
+        if (isspace(value)) {
+            space = written != 0;
+            continue;
+        }
+        if (space && written + 1u < capacity) output[written++] = ' ';
+        space = false;
+        output[written++] = value < 0x80u
+            ? (char) tolower(value) : (char) value;
+    }
+    output[written] = '\0';
+    return written;
+}
+
+static size_t controller_bounded_text(
+    lxb_dom_node_t *root, char *output, size_t capacity)
+{
+    if (root == NULL || output == NULL || capacity == 0) return 0;
+    size_t written = 0;
+    lxb_dom_node_t *node = root->first_child;
+    for (size_t visited = 0; node != NULL && visited < 64u; visited++) {
+        size_t length = 0;
+        const char *text = document_text_data(node, &length);
+        if (text != NULL && length != 0) {
+            size_t available = capacity - 1u - written;
+            size_t admitted = length < available ? length : available;
+            memcpy(output + written, text, admitted);
+            written += admitted;
+            if (written + 1u == capacity) break;
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        node = node == root ? NULL : node->next;
+    }
+    output[written] = '\0';
+    return written;
+}
+
+static bool controller_activation_label(
+    lxb_dom_node_t *node, char *normalized, size_t capacity,
+    const char **association)
+{
+    if (association != NULL) *association = NULL;
+    if (node == NULL || normalized == NULL || capacity < 2u) return false;
+    size_t length = 0;
+    const char *label = document_attribute(node, "aria-label", &length);
+    if (label == NULL || length == 0)
+        label = document_attribute(node, "title", &length);
+    if ((label == NULL || length == 0) && node_name_is(node, "input"))
+        label = document_attribute(node, "value", &length);
+    char bounded_text[192];
+    if (label == NULL || length == 0) {
+        length = controller_bounded_text(
+            node, bounded_text, sizeof(bounded_text));
+        label = bounded_text;
+    }
+    size_t normalized_length = label == NULL ? 0
+        : controller_normalize_label(label, length, normalized, capacity);
+    /* Exact visible-control verbs only. This remains deliberately smaller
+       than a natural-language keyword matcher: the fallback may start media,
+       so ambiguous words such as French `lire` (read/play) are excluded. */
+    static const char *const verbs[] = {
+        "play", "preview", "listen",
+        "reproducir", "reproduzir", "riproduci", "abspielen",
+        "écouter", "слушать", "слухати", "nghe",
+        "再生", "播放", "재생"
+    };
+    for (size_t i = 0; i < sizeof(verbs) / sizeof(verbs[0]); i++) {
+        size_t verb_length = strlen(verbs[i]);
+        if (normalized_length < verb_length
+            || memcmp(normalized, verbs[i], verb_length) != 0) continue;
+        char boundary = normalized[verb_length];
+        if (boundary != '\0' && boundary != ' ' && boundary != ':'
+            && boundary != '-') continue;
+        const char *suffix = normalized + verb_length;
+        while (*suffix == ' ' || *suffix == ':' || *suffix == '-') suffix++;
+        if (association != NULL && *suffix != '\0') *association = suffix;
+        return true;
+    }
+    return false;
+}
+
+static bool controller_node_has_authored_media(lxb_dom_node_t *root)
+{
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 64u; visited++) {
+        if (node_name_is(node, "audio") || node_name_is(node, "video")) {
+            return true;
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        node = node == root ? NULL : node->next;
+    }
+    return false;
+}
+
+static bool controller_attribute_matches_name(
+    lxb_dom_node_t *node, const char *name)
+{
+    static const char *const attributes[] = {
+        "aria-label", "title", "alt"
+    };
+    char normalized[192];
+    for (size_t i = 0; i < sizeof(attributes) / sizeof(attributes[0]); i++) {
+        size_t length = 0;
+        const char *value = document_attribute(
+            node, attributes[i], &length);
+        if (value != NULL
+            && controller_normalize_label(
+                   value, length, normalized, sizeof(normalized)) != 0
+            && strcmp(normalized, name) == 0) return true;
+    }
+    return false;
+}
+
+static bool controller_nearby_matches_name(
+    lxb_dom_node_t *button, const char *name)
+{
+    lxb_dom_node_t *root = button;
+    for (size_t level = 0; root != NULL && level < 4u;
+         level++, root = root->parent) {
+        if (root != button
+            && (node_name_is(root, "body") || node_name_is(root, "html"))) {
+            break;
+        }
+        lxb_dom_node_t *node = root;
+        for (size_t visited = 0; node != NULL && visited < 64u; visited++) {
+            if (node != button && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+                && controller_attribute_matches_name(node, name)) return true;
+            if (node->first_child != NULL) {
+                node = node->first_child;
+                continue;
+            }
+            while (node != root && node->next == NULL) node = node->parent;
+            node = node == root ? NULL : node->next;
+        }
+    }
+    return false;
+}
+
+static bool controller_nearby_matches_page_url(
+    BrowserController *controller, lxb_dom_node_t *button,
+    const MediaStructuredAudioCandidate *candidate, ControllerAction *action)
+{
+    if (controller == NULL || button == NULL || candidate == NULL
+        || action == NULL) return false;
+    enum { URL_SCRATCH = 1024 };
+    char *candidate_raw = action->body;
+    char *candidate_resolved = action->body + URL_SCRATCH;
+    char *href_raw = action->body + URL_SCRATCH * 2u;
+    char *href_resolved = action->body + URL_SCRATCH * 3u;
+    if (!media_structured_audio_copy_page_url(
+            candidate, candidate_raw, URL_SCRATCH)) return false;
+    const NavigationEntry *current = navigation_current(
+        controller->navigation);
+    if (current == NULL || !fetch_resolve_url(
+            current->url, candidate_raw, candidate_resolved,
+            URL_SCRATCH)) return false;
+    lxb_dom_node_t *root = button;
+    for (size_t level = 0; root != NULL && level < 4u;
+         level++, root = root->parent) {
+        if (root != button
+            && (node_name_is(root, "body") || node_name_is(root, "html"))) {
+            break;
+        }
+        lxb_dom_node_t *node = root;
+        for (size_t visited = 0; node != NULL && visited < 64u; visited++) {
+            size_t href_length = 0;
+            const char *href = node->type == LXB_DOM_NODE_TYPE_ELEMENT
+                ? document_attribute(node, "href", &href_length) : NULL;
+            if (href != NULL && href_length != 0
+                && href_length < URL_SCRATCH) {
+                memcpy(href_raw, href, href_length);
+                href_raw[href_length] = '\0';
+                if (fetch_resolve_url(
+                        current->url, href_raw, href_resolved, URL_SCRATCH)
+                    && strcmp(candidate_resolved, href_resolved) == 0) {
+                    return true;
+                }
+            }
+            if (node->first_child != NULL) {
+                node = node->first_child;
+                continue;
+            }
+            while (node != root && node->next == NULL) node = node->parent;
+            node = node == root ? NULL : node->next;
+        }
+    }
+    return false;
+}
+
+static bool controller_structured_audio_index(
+    BrowserController *controller)
+{
+    if (controller == NULL || controller->navigation == NULL) return false;
+    /* Lexbor reclaims an unretained detached script subtree immediately.
+       Rebuild this bounded index at the rare activation boundary so none of
+       its compact source spans can outlive author mutation. Keeping the
+       scratch in the controller avoids adding about 1 KiB to the PSP input
+       stack while still making each use lifetime-local. */
+    memset(&controller->structured_audio, 0,
+           sizeof(controller->structured_audio));
+    (void) media_discover_structured_audio(
+        &controller->navigation->page.document,
+        &controller->structured_audio);
+    return controller->structured_audio.candidate_count != 0;
+}
+
+static bool controller_build_structured_audio_action(
+    BrowserController *controller, lxb_dom_node_t *node,
+    const char *label_association, ControllerAction *action)
+{
+    if (controller == NULL || node == NULL || action == NULL
+        || !controller_structured_audio_index(controller)) return false;
+    MediaStructuredAudioIndex *index = &controller->structured_audio;
+    size_t selected = SIZE_MAX, matches = 0;
+    char candidate_name[192];
+    if (index->candidate_count == 1u) {
+        selected = 0;
+        matches = 1;
+    } else {
+        for (size_t i = 0; i < index->candidate_count; i++) {
+            candidate_name[0] = '\0';
+            char normalized[192];
+            bool have_name = media_structured_audio_copy_name(
+                    &index->candidates[i], candidate_name,
+                    sizeof(candidate_name))
+                && controller_normalize_label(
+                       candidate_name, strlen(candidate_name), normalized,
+                       sizeof(normalized)) != 0;
+            bool matched = have_name && label_association != NULL
+                && strcmp(label_association, normalized) == 0;
+            if (!matched && have_name) {
+                matched = controller_nearby_matches_name(node, normalized);
+            }
+            if (!matched) {
+                matched = controller_nearby_matches_page_url(
+                    controller, node, &index->candidates[i], action);
+            }
+            if (!matched) continue;
+            selected = i;
+            matches++;
+        }
+    }
+    if (matches != 1u || selected == SIZE_MAX) {
+        controller->structured_audio_ambiguous_rejections++;
+        return false;
+    }
+    if (!media_structured_audio_copy_url(
+            &index->candidates[selected], action->body,
+            sizeof(action->body))) return false;
+    const NavigationEntry *current = navigation_current(
+        controller->navigation);
+    if (current == NULL || !fetch_resolve_url(
+            current->url, action->body, action->url,
+            sizeof(action->url))) return false;
+    if (!tilefinch_csp_allows_request(
+            &controller->navigation->page.document.content_security_policy,
+            TILEFINCH_DESTINATION_MEDIA, action->url)) return false;
+    action->type = CONTROLLER_ACTION_MEDIA;
+    action->media_audio_only = true;
+    action->media_node_handle = 0;
+    action->media_mode = TILEFINCH_REQUEST_MODE_NO_CORS;
+    action->media_credentials = TILEFINCH_CREDENTIALS_INCLUDE;
+    action->media_kind = MEDIA_DISCOVERY_AUDIO_MP4;
+    action->body[0] = '\0';
+    action->body_length = 0;
+    controller->structured_audio_matched_activations++;
+    return true;
+}
+
+static bool controller_try_structured_audio_fallback(
+    BrowserController *controller, lxb_dom_node_t *node,
+    size_t handlers_before, ControllerAction *action)
+{
+    if (controller == NULL || node == NULL || action == NULL
+        || (!node_name_is(node, "button")
+            && !(node_name_is(node, "input")
+                 && attribute_is(node, "type", "button")))
+        || node_effectively_disabled(node)
+        || (node_is_submit_button(node) && form_ancestor(node) != NULL)
+        || has_attribute(node, "onclick")
+        || controller_node_has_authored_media(node)) return false;
+    ScriptRuntime *runtime = controller->navigation->page.runtime;
+    if (runtime != NULL
+        && (controller->navigation->page.script_result.event_handlers_invoked
+                != handlers_before
+            || script_runtime_has_pending_navigation(runtime)
+            || script_runtime_has_pending_media_request(runtime)
+            || controller->navigation->page.script_result
+                   .form_submission_requested)) return false;
+    char label[192];
+    const char *association = NULL;
+    if (!controller_activation_label(
+            node, label, sizeof(label), &association)) return false;
+    return controller_build_structured_audio_action(
+        controller, node, association, action);
 }
 
 static void form_implicit_controls(lxb_dom_node_t *node,
@@ -1561,6 +1884,8 @@ bool controller_activate(BrowserController *controller,
         }
         lxb_dom_node_t *node = link->node;
         action->type = CONTROLLER_ACTION_NAVIGATE;
+        action->prefer_native_media = has_attribute(
+            node, "data-tilefinch-provider-media");
         controller->activations++;
         if (!controller_dispatch_activation(controller, node)) {
             return false;
@@ -1575,6 +1900,8 @@ bool controller_activate(BrowserController *controller,
     if (controller->focus_kind == CONTROLLER_FOCUS_CONTROL
         && controller->focus_index < layout->control_count) {
         lxb_dom_node_t *node = layout->controls[controller->focus_index].node;
+        size_t handlers_before = navigation->page.script_result
+            .event_handlers_invoked;
         action->type = CONTROLLER_ACTION_CONTROL;
         controller->activations++;
         if (!controller_dispatch_activation(controller, node)) {
@@ -1585,7 +1912,7 @@ bool controller_activate(BrowserController *controller,
             action->type = CONTROLLER_ACTION_NONE;
             return true;
         }
-        if (node_name_is(node, "video")) {
+        if (node_name_is(node, "video") || node_name_is(node, "audio")) {
             return controller_build_media_action(
                 controller, node, action);
         }
@@ -1599,20 +1926,28 @@ bool controller_activate(BrowserController *controller,
             return controller_build_implicit_form_action(controller, node,
                                                          action);
         }
+        (void) controller_try_structured_audio_fallback(
+            controller, node, handlers_before, action);
         return true;
     }
     if (controller->focus_kind == CONTROLLER_FOCUS_POINTER
         && retained_focus_node(controller) != NULL) {
         lxb_dom_node_t *node = retained_focus_node(controller);
+        size_t handlers_before = navigation->page.script_result
+            .event_handlers_invoked;
         action->type = CONTROLLER_ACTION_CONTROL;
         controller->activations++;
         if (!controller_dispatch_activation(controller, node)) return false;
         if (navigation->page.runtime != NULL
             && navigation->page.script_result.last_event_cancelled) {
             action->type = CONTROLLER_ACTION_NONE;
-        } else if (node_name_is(node, "video")) {
+        } else if (node_name_is(node, "video")
+                   || node_name_is(node, "audio")) {
             return controller_build_media_action(
                 controller, node, action);
+        } else {
+            (void) controller_try_structured_audio_fallback(
+                controller, node, handlers_before, action);
         }
         return true;
     }

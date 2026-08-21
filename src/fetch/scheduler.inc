@@ -1395,9 +1395,9 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
         }
         if (item->writer.redirect_response) {
             bool redirected = false;
-            if (item->hop->redirects >= 5) {
+            if (item->hop->redirects >= FETCH_REDIRECT_LIMIT) {
                 snprintf(item->result.error, sizeof(item->result.error),
-                         "response exceeded the five-hop redirect limit");
+                         FETCH_REDIRECT_LIMIT_ERROR);
             } else {
                 fetch_hop_stage_response_cookies(
                     item->hop, &item->result,
@@ -1407,7 +1407,9 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
                 /* Preserve an earlier explicit redirect error. */
             } else if (!fetch_hop_advance(item->hop, &item->result)) {
                 snprintf(item->result.error, sizeof(item->result.error),
-                         "response redirect target is invalid");
+                         "%s", item->hop->redirect_loop_detected
+                             ? "response redirect loop detected"
+                             : "response redirect target is invalid");
             } else if (curl_multi_remove_handle(
                            scheduler->multi, item->easy) != CURLM_OK) {
                 snprintf(item->result.error, sizeof(item->result.error),
@@ -1631,9 +1633,9 @@ static bool scheduled_background_finish_hop(
     }
     if (item->writer.redirect_response) {
         bool redirected = false;
-        if (item->hop->redirects >= 5) {
+        if (item->hop->redirects >= FETCH_REDIRECT_LIMIT) {
             snprintf(item->result.error, sizeof(item->result.error), "%s",
-                     "response exceeded the five-hop redirect limit");
+                     FETCH_REDIRECT_LIMIT_ERROR);
         } else {
             fetch_hop_stage_response_cookies(
                 item->hop, &item->result,
@@ -1641,7 +1643,9 @@ static bool scheduled_background_finish_hop(
             redirected = fetch_hop_advance(item->hop, &item->result);
             if (!redirected && item->result.error[0] == '\0') {
                 snprintf(item->result.error, sizeof(item->result.error), "%s",
-                         "response redirect target is invalid");
+                         item->hop->redirect_loop_detected
+                             ? "response redirect loop detected"
+                             : "response redirect target is invalid");
             }
         }
         if (redirected) {

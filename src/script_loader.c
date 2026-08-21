@@ -466,7 +466,7 @@ typedef enum {
     SCRIPT_KIND_MODULE
 } ScriptKind;
 
-static ScriptKind script_kind(lxb_dom_node_t *node)
+static ScriptKind script_declared_kind(lxb_dom_node_t *node)
 {
     if (!node_name_is(node, "script")) return SCRIPT_KIND_INERT;
     size_t length = 0;
@@ -481,6 +481,23 @@ static ScriptKind script_kind(lxb_dom_node_t *node)
         return SCRIPT_KIND_CLASSIC;
     }
     return SCRIPT_KIND_INERT;
+}
+
+static bool script_has_nomodule(lxb_dom_node_t *node)
+{
+    return node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && lxb_dom_element_has_attribute(
+               lxb_dom_interface_element(node),
+               (const lxb_char_t *) "nomodule", 8u);
+}
+
+static ScriptKind script_kind(lxb_dom_node_t *node)
+{
+    ScriptKind kind = script_declared_kind(node);
+    /* Module support is a browser capability. A nomodule fallback remains
+       inert even if the paired module later fails to fetch or execute. */
+    return kind == SCRIPT_KIND_CLASSIC && script_has_nomodule(node)
+        ? SCRIPT_KIND_INERT : kind;
 }
 
 /* SVG 2 uses `href` for an external script, while HTMLScriptElement uses
@@ -509,13 +526,20 @@ static lxb_dom_node_t *script_discovery_next(lxb_dom_node_t *root,
 static void collect_scripts(ScriptRuntime *runtime, lxb_dom_node_t *node,
                             long *scripts, size_t capacity,
                             size_t *count, size_t *discovered,
-                            size_t *skipped_modules)
+                            size_t *skipped_modules,
+                            size_t *skipped_nomodule)
 {
     lxb_dom_node_t *root = node;
     for (size_t visited = 0;
          node != NULL && visited < SCRIPT_DISCOVERY_VISIT_LIMIT;
          visited++, node = script_discovery_next(root, node)) {
-        ScriptKind kind = script_kind(node);
+        ScriptKind declared = script_declared_kind(node);
+        if (declared == SCRIPT_KIND_CLASSIC
+            && script_has_nomodule(node)) {
+            if (skipped_nomodule != NULL) (*skipped_nomodule)++;
+            continue;
+        }
+        ScriptKind kind = declared;
         if (kind == SCRIPT_KIND_CLASSIC) {
             size_t source_length = 0;
             const char *source = script_source_attribute(
@@ -694,7 +718,8 @@ bool external_scripts_load(NavigationSession *navigation,
         navigation->page.runtime,
         lxb_dom_interface_node(navigation->page.document.html),
         scripts, collection_limit, &script_count,
-        &metrics->discovered, &metrics->skipped_module);
+        &metrics->discovered, &metrics->skipped_module,
+        &metrics->skipped_nomodule);
     if (metrics->discovered > script_count) {
         metrics->skipped_quota += metrics->discovered - script_count;
     }
@@ -980,13 +1005,19 @@ static void collect_executable_scripts(ScriptRuntime *runtime,
                                        long *scripts,
                                        size_t capacity, size_t *count,
                                        size_t *discovered,
-                                       const StreamingScriptState *streaming)
+                                       const StreamingScriptState *streaming,
+                                       size_t *skipped_nomodule)
 {
     lxb_dom_node_t *root = node;
     for (size_t visited = 0;
          node != NULL && visited < SCRIPT_DISCOVERY_VISIT_LIMIT;
         visited++, node = script_discovery_next(root, node)) {
-        if (script_kind(node) != SCRIPT_KIND_INERT) {
+        ScriptKind declared = script_declared_kind(node);
+        if (declared == SCRIPT_KIND_CLASSIC && script_has_nomodule(node)) {
+            if (skipped_nomodule != NULL) (*skipped_nomodule)++;
+            continue;
+        }
+        if (declared != SCRIPT_KIND_INERT) {
             long handle = script_runtime_node_weak_handle(runtime, node);
             bool parser_executed = false;
             if (handle != 0 && streaming != NULL) {
@@ -3070,7 +3101,8 @@ static bool document_scripts_execute_internal(
     size_t discovered_before_scan = metrics->discovered;
     collect_executable_scripts(runtime, script_root, plan->scripts,
                                collection_limit, &script_count,
-                               &metrics->discovered, streaming);
+                               &metrics->discovered, streaming,
+                               &metrics->skipped_nomodule);
     for (size_t i = 0; i < script_count; i++) {
         (void) script_plan_record_handle(plan, plan->scripts[i], i);
     }
@@ -3171,7 +3203,7 @@ static bool document_scripts_execute_internal(
         collect_executable_scripts(runtime, script_root, current,
                                    collection_limit,
                                    &current_count, &current_discovered,
-                                   streaming);
+                                   streaming, NULL);
         for (size_t i = 0;
              i < current_count
              && script_count < collection_limit; i++) {

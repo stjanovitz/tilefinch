@@ -159,6 +159,48 @@ static void image_free(void *pointer)
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
+#if !defined(TILEFINCH_DISABLE_GIF)
+static bool image_is_gif(const unsigned char *encoded, size_t length)
+{
+    return encoded != NULL && length >= 6u
+        && (memcmp(encoded, "GIF87a", 6u) == 0
+            || memcmp(encoded, "GIF89a", 6u) == 0);
+}
+
+/* stb's public GIF entry point places stbi__gif (whose LZW table is roughly
+   35 KiB) on the caller's stack. That exceeds the PSP thread-frame policy.
+   The same internal decoder is safe when its state is charged to the bounded
+   image Budget instead; Tilefinch needs only the first composited frame. */
+static unsigned char *image_decode_gif_first_frame(
+    const unsigned char *encoded, int encoded_length,
+    int *width, int *height, int *components)
+{
+    if (encoded == NULL || encoded_length <= 0 || width == NULL
+        || height == NULL || components == NULL) return NULL;
+    stbi__context stream;
+    stbi__start_mem(&stream, encoded, encoded_length);
+    if (!stbi__gif_test(&stream)) return NULL;
+    stbi__rewind(&stream);
+    stbi__gif *gif = (stbi__gif *) stbi__malloc(sizeof(*gif));
+    if (gif == NULL) return NULL;
+    memset(gif, 0, sizeof(*gif));
+    stbi_uc *pixels = stbi__gif_load_next(
+        &stream, gif, components, 4, NULL);
+    if (pixels == (stbi_uc *) &stream) pixels = NULL;
+    if (pixels != NULL) {
+        *width = gif->w;
+        *height = gif->h;
+        *components = 4;
+    } else if (gif->out != NULL) {
+        STBI_FREE(gif->out);
+    }
+    STBI_FREE(gif->history);
+    STBI_FREE(gif->background);
+    STBI_FREE(gif);
+    return pixels;
+}
+#endif
+
 /* stb_image's ordinary JPEG path materializes a full RGBA source after its
    component planes.  That transient peak is unnecessary when the retained
    resource is already bounded to the physical viewport.  Reuse stb's JPEG
@@ -1535,25 +1577,104 @@ static bool inline_svg_apply_default_viewport(
 {
     if (root == NULL || root->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
     lxb_dom_element_t *element = lxb_dom_interface_element(root);
-    size_t length = 0;
+    size_t width_length = 0;
+    size_t height_length = 0;
+    const char *width_attribute = document_attribute(
+        root, "width", &width_length);
+    const char *height_attribute = document_attribute(
+        root, "height", &height_length);
+    bool width_missing = width_attribute == NULL;
+    bool height_missing = height_attribute == NULL;
     char width[16] = "300";
     char height[16] = "150";
+    float numeric_width = 0.0f;
+    float numeric_height = 0.0f;
     if (style != NULL && style->has_width && !style->width_percent
         && style->width_offset == 0 && style->width > 0
         && style->width <= 32767) {
         snprintf(width, sizeof(width), "%d", style->width);
+        numeric_width = (float) style->width;
     }
     if (style != NULL && style->has_height && !style->height_percent
         && style->height > 0 && style->height <= 32767) {
         snprintf(height, sizeof(height), "%d", style->height);
+        numeric_height = (float) style->height;
     }
-    if (document_attribute(root, "width", &length) == NULL
+    if (numeric_width <= 0.0f && width_attribute != NULL
+        && width_length > 0u && width_length < 32u) {
+        char value[32];
+        memcpy(value, width_attribute, width_length);
+        value[width_length] = '\0';
+        char *end = NULL;
+        float parsed = strtof(value, &end);
+        while (end != NULL && isspace((unsigned char) *end)) end++;
+        if (end != value && (*end == '\0' || strcasecmp(end, "px") == 0)
+            && isfinite(parsed) && parsed > 0.0f && parsed <= 32767.0f) {
+            numeric_width = parsed;
+        }
+    }
+    if (numeric_height <= 0.0f && height_attribute != NULL
+        && height_length > 0u && height_length < 32u) {
+        char value[32];
+        memcpy(value, height_attribute, height_length);
+        value[height_length] = '\0';
+        char *end = NULL;
+        float parsed = strtof(value, &end);
+        while (end != NULL && isspace((unsigned char) *end)) end++;
+        if (end != value && (*end == '\0' || strcasecmp(end, "px") == 0)
+            && isfinite(parsed) && parsed > 0.0f && parsed <= 32767.0f) {
+            numeric_height = parsed;
+        }
+    }
+    /* HTML's 300x150 default applies when neither dimension is supplied.
+       If exactly one dimension is authored, preserve the SVG viewBox ratio
+       instead of stretching the image through the missing legacy default. */
+    if (width_missing != height_missing) {
+        size_t viewbox_length = 0;
+        const char *viewbox = document_attribute(
+            root, "viewBox", &viewbox_length);
+        if (viewbox != NULL && viewbox_length > 0u && viewbox_length < 96u) {
+            char value[96];
+            memcpy(value, viewbox, viewbox_length);
+            value[viewbox_length] = '\0';
+            for (size_t at = 0; at < viewbox_length; at++) {
+                if (value[at] == ',') value[at] = ' ';
+            }
+            float min_x = 0.0f, min_y = 0.0f;
+            float viewbox_width = 0.0f, viewbox_height = 0.0f;
+            if (sscanf(value, "%f %f %f %f", &min_x, &min_y,
+                       &viewbox_width, &viewbox_height) == 4
+                && isfinite(viewbox_width) && isfinite(viewbox_height)
+                && viewbox_width > 0.0f && viewbox_height > 0.0f) {
+                if (height_missing && numeric_width > 0.0f) {
+                    float derived = numeric_width * viewbox_height
+                                    / viewbox_width;
+                    if (isfinite(derived) && derived > 0.0f
+                        && derived <= 32767.0f) {
+                        numeric_height = ceilf(derived);
+                        snprintf(height, sizeof(height), "%d",
+                                 (int) numeric_height);
+                    }
+                } else if (width_missing && numeric_height > 0.0f) {
+                    float derived = numeric_height * viewbox_width
+                                    / viewbox_height;
+                    if (isfinite(derived) && derived > 0.0f
+                        && derived <= 32767.0f) {
+                        numeric_width = ceilf(derived);
+                        snprintf(width, sizeof(width), "%d",
+                                 (int) numeric_width);
+                    }
+                }
+            }
+        }
+    }
+    if (width_missing
         && lxb_dom_element_set_attribute(
                element, (const lxb_char_t *) "width", 5,
                (const lxb_char_t *) width, strlen(width)) == NULL) {
         return false;
     }
-    if (document_attribute(root, "height", &length) == NULL
+    if (height_missing
         && lxb_dom_element_set_attribute(
                element, (const lxb_char_t *) "height", 6,
                (const lxb_char_t *) height, strlen(height)) == NULL) {
@@ -3367,8 +3488,7 @@ static bool load_image_node_with_provenance_impl(
         /* Advertise only formats the decoders actually handle. */
 #if defined(TILEFINCH_DISABLE_GIF)
         .accept = "image/png,image/jpeg,image/webp,image/svg+xml,"
-                  "image/*;q=0.8,"
-                  "*/*;q=0.5",
+                  "image/*;q=0.8,*/*;q=0.5",
 #else
         .accept = "image/png,image/jpeg,image/gif,image/webp,image/svg+xml,"
                   "image/*;q=0.8,*/*;q=0.5",
@@ -4532,6 +4652,12 @@ ImageDecodeStatus image_resource_decode_checked(
               image->encoded, image->encoded_length,
               image->width, image->height,
               &width, &height, &components, &webp_interrupted)
+#if !defined(TILEFINCH_DISABLE_GIF)
+        : image_is_gif(image->encoded, image->encoded_length)
+        ? image_decode_gif_first_frame(
+              image->encoded, (int) image->encoded_length,
+              &width, &height, &components)
+#endif
         : scaled_jpeg
         ? image_decode_jpeg_scaled(
               image->encoded, (int) image->encoded_length,

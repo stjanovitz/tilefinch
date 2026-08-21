@@ -3649,7 +3649,9 @@ JSValue js_computed_style_get(JSContext *context,
         snprintf(value, sizeof(value), "%s",
                  box == STYLE_PAINT_BOX_CONTENT ? "content-box"
                  : (box == STYLE_PAINT_BOX_PADDING
-                    ? "padding-box" : "border-box"));
+                    ? "padding-box"
+                    : (box == STYLE_PAINT_BOX_TEXT
+                       ? "text" : "border-box")));
     } else if (property_equal(name, name_length, "border-spacing", 14)) {
         const StylePaintStack *paint = stylesheet_paint_stack(
             bridge->stylesheet, computed_style_paint_stack_id(&style));
@@ -4624,5 +4626,17 @@ JSValue js_dom_record_event(JSContext *context,
     (void) this_value; (void) argc; (void) argv;
     DomBridge *bridge = JS_GetContextOpaque(context);
     bridge->result->events_dispatched++;
+    return JS_UNDEFINED;
+}
+
+JSValue js_dom_record_event_handler(JSContext *context,
+                                    JSValueConst this_value,
+                                    int argc, JSValueConst *argv)
+{
+    (void) this_value; (void) argc; (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge != NULL && bridge->result != NULL) {
+        bridge->result->event_handlers_invoked++;
+    }
     return JS_UNDEFINED;
 }

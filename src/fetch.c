@@ -78,6 +78,8 @@ extern CURLcode curl_easy_impersonate(CURL *handle, const char *target,
 #define FETCH_EXTRA_HEADER_LINE_MAX 4096
 #define FETCH_REQUEST_BODY_MAX (64u * 1024u)
 #define FETCH_TRACE_PATH_CAPACITY 4096
+#define FETCH_REDIRECT_LIMIT 8u
+#define FETCH_REDIRECT_LIMIT_ERROR "response exceeded the eight-hop redirect limit"
 /* The pool is process-global because libcurl's allocator hooks are global.
    A streaming navigation and the document resource scheduler deliberately
    overlap, so sizing this for only one four-request scheduler causes valid
@@ -85,6 +87,33 @@ extern CURLcode curl_easy_impersonate(CURL *handle, const char *target,
    One MiB covers the bounded navigation + resource overlap while remaining
    a fixed, fully accounted reservation on the 32 MiB target. */
 #define FETCH_CURL_CONCURRENT_POOL_BYTES (1024u * 1024u)
+
+static uint32_t fetch_url_identity_hash(const char *url)
+{
+    uint32_t hash = UINT32_C(2166136261);
+    for (const unsigned char *at = (const unsigned char *) url;
+         at != NULL && *at != '\0'; at++) {
+        hash ^= *at;
+        hash *= UINT32_C(16777619);
+    }
+    return hash;
+}
+
+static uint32_t fetch_redirect_transition_hash(const char *from,
+                                               const char *to)
+{
+    uint32_t hash = fetch_url_identity_hash(from);
+    hash ^= UINT8_C(0xff);
+    hash *= UINT32_C(16777619);
+    if (to != NULL) {
+        for (const unsigned char *at = (const unsigned char *) to;
+             *at != '\0'; at++) {
+            hash ^= *at;
+            hash *= UINT32_C(16777619);
+        }
+    }
+    return hash;
+}
 
 typedef struct {
     bool required;

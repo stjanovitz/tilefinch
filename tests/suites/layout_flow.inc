@@ -907,6 +907,35 @@ static int test_flex_percentage_image_minimum(Budget *budget)
     CHECK(budget->current == 0);
     return 0;
 }
+
+static int test_flex_definite_replaced_auto_minimum(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}button{display:flex;"
+        "box-sizing:border-box;width:42px;height:42px;padding:8px 16px;"
+        "border:0}svg{display:block;width:24px;height:24px}</style>"
+        "<button id=button><svg id=icon viewBox='0 0 24 24'>"
+        "<path d='M2 12h20'/></svg></button>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 19)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const LayoutNodeBox *button = layout_box_for_node(
+        &layout, find_id(root, "button"));
+    const LayoutNodeBox *icon = layout_box_for_node(
+        &layout, find_id(root, "icon"));
+    CHECK(button != NULL && button->width == 42
+          && icon != NULL && icon->width == 24 && icon->height == 24);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
 static int test_flex_percentage_width_intrinsic(Budget *budget)
 {
     static const char page[] =
@@ -1133,6 +1162,9 @@ static int test_intrinsic_keywords_line_clamp_and_content_visibility(
         "-webkit-box-pack:justify;-webkit-box-align:center;"
         "-webkit-box-lines:multiple}"
         "#legacy-a{-webkit-box-flex:1;-webkit-box-ordinal-group:2}"
+        "#prefixed{display:-ms-flexbox;-webkit-flex-direction:column;"
+        "-webkit-justify-content:center;-webkit-align-items:flex-end;"
+        "-webkit-box-sizing:border-box;-webkit-transform:translateX(2px)}"
         "#text-fill{color:#112233;-webkit-text-fill-color:#abcdef}"
         "#hidden{content-visibility:hidden;width:40px;height:20px;"
         "background:#123456}#intrinsic{content-visibility:hidden;"
@@ -1147,6 +1179,7 @@ static int test_intrinsic_keywords_line_clamp_and_content_visibility(
         "<span id=basis-max>alpha beta</span></div>"
         "<div id=clamp class=probe>one two three four five six seven</div>"
         "<div id=legacy><span id=legacy-a>A</span><span>B</span></div>"
+        "<div id=prefixed><span>PREFIXED</span></div>"
         "<span id=text-fill>FILL</span>"
         "<div id=hidden><span>HIDDEN-CONTENT</span></div>"
         "<div id=intrinsic><span>INTRINSIC-CONTENT</span></div>"
@@ -1171,6 +1204,7 @@ static int test_intrinsic_keywords_line_clamp_and_content_visibility(
     lxb_dom_node_t *intrinsic = find_id(root, "intrinsic");
     lxb_dom_node_t *legacy = find_id(root, "legacy");
     lxb_dom_node_t *legacy_a = find_id(root, "legacy-a");
+    lxb_dom_node_t *prefixed = find_id(root, "prefixed");
     lxb_dom_node_t *text_fill = find_id(root, "text-fill");
     lxb_dom_node_t *auto_node = find_id(root, "auto");
     const LayoutNodeBox *min_box = layout_box_for_node(&layout, min);
@@ -1194,6 +1228,7 @@ static int test_intrinsic_keywords_line_clamp_and_content_visibility(
     ComputedStyle hidden_style = style_for_node(&sheet, hidden, NULL);
     ComputedStyle legacy_style = style_for_node(&sheet, legacy, NULL);
     ComputedStyle legacy_a_style = style_for_node(&sheet, legacy_a, NULL);
+    ComputedStyle prefixed_style = style_for_node(&sheet, prefixed, NULL);
     ComputedStyle text_fill_style = style_for_node(&sheet, text_fill, NULL);
     ComputedStyle auto_style = style_for_node(&sheet, auto_node, NULL);
     bool hidden_text = false, auto_text = false, ellipsis = false;
@@ -1251,6 +1286,12 @@ static int test_intrinsic_keywords_line_clamp_and_content_visibility(
           && legacy_style.flex_wrap
           && legacy_a_style.flex_grow == 1000
           && legacy_a_style.order == 1
+          && prefixed_style.display == DISPLAY_FLEX
+          && prefixed_style.flex_direction == FLEX_COLUMN
+          && prefixed_style.justify_content == JUSTIFY_CENTER
+          && prefixed_style.align_items == ALIGN_END
+          && prefixed_style.box_sizing_border_box
+          && prefixed_style.transform_x == 2
           && text_fill_style.color == 0xabcdef
           && hidden_style.content_visibility
                  == STYLE_CONTENT_VISIBILITY_HIDDEN
@@ -1555,6 +1596,10 @@ static int test_mobile_overflow_intrinsic_minimums(Budget *budget)
         "#compact-wrapper{display:inline-flex;min-width:0}"
         "#compact-select{box-sizing:border-box;width:1px;"
         "padding-left:34px;padding-right:28px;border:1px solid}"
+        ".wrapped-wide{display:flex;flex-wrap:wrap;width:100px}"
+        ".wrapped-wide>span{display:block;box-sizing:content-box;"
+        "width:100%;padding:0 12px;height:8px}"
+        ".audio-row{display:flex;width:100px}.audio-row audio{display:block}"
         "</style><body>"
         "<div class=flex><span id=flex-clip class=item>UNBREAKABLETOKEN</span><i class=fixed></i></div>"
         "<div class=flex><span id=flex-hidden class=item>UNBREAKABLETOKEN</span><i class=fixed></i></div>"
@@ -1565,6 +1610,9 @@ static int test_mobile_overflow_intrinsic_minimums(Budget *budget)
         "<div class=compact-row><div id=compact-wrapper>"
         "<select id=compact-select><option>English</option></select>"
         "</div></div>"
+        "<div class=wrapped-wide><span id=wrapped-wide></span></div>"
+        "<div class=audio-row><audio id=audio-without-controls></audio>"
+        "<i style='display:block;width:20px'></i></div>"
         "</body>";
     PocDocument document = {0};
     Stylesheet sheet = {0};
@@ -1592,25 +1640,33 @@ static int test_mobile_overflow_intrinsic_minimums(Budget *budget)
         &layout, find_id(root, "compact-wrapper"));
     const LayoutNodeBox *compact_select = layout_box_for_node(
         &layout, find_id(root, "compact-select"));
+    const LayoutNodeBox *wrapped_wide = layout_box_for_node(
+        &layout, find_id(root, "wrapped-wide"));
+    const LayoutNodeBox *audio_without_controls = layout_box_for_node(
+        &layout, find_id(root, "audio-without-controls"));
     CHECK(flex_clip != NULL && flex_hidden != NULL
           && grid_zero != NULL && grid_hidden != NULL && grid_clip != NULL
           && outer != NULL && inner_clip != NULL
-          && compact_wrapper != NULL && compact_select != NULL);
+          && compact_wrapper != NULL && compact_select != NULL
+          && wrapped_wide != NULL && audio_without_controls != NULL);
     if (!(flex_clip->width > 60 && flex_hidden->width <= 60
           && grid_zero->width <= 60 && grid_hidden->width <= 60
           && grid_clip->width > 60
           && outer->content_width == outer->client_width
           && inner_clip->content_width > inner_clip->client_width
           && compact_select->width >= 64
-          && compact_wrapper->width >= compact_select->width)) {
+          && compact_wrapper->width >= compact_select->width
+          && wrapped_wide->width <= 100
+          && audio_without_controls->width <= 8)) {
         fprintf(stderr,
                 "mobile minima flex=%d/%d grid=%d/%d/%d "
-                "overflow=%d/%d inner=%d/%d compact=%d/%d\n",
+                "overflow=%d/%d inner=%d/%d compact=%d/%d wrap=%d audio=%d\n",
                 flex_clip->width, flex_hidden->width,
                 grid_zero->width, grid_hidden->width, grid_clip->width,
                 outer->content_width, outer->client_width,
                 inner_clip->content_width, inner_clip->client_width,
-                compact_wrapper->width, compact_select->width);
+                compact_wrapper->width, compact_select->width,
+                wrapped_wide->width, audio_without_controls->width);
     }
     CHECK(flex_clip->width > 60 && flex_hidden->width <= 60
           && grid_zero->width <= 60 && grid_hidden->width <= 60
@@ -1618,7 +1674,9 @@ static int test_mobile_overflow_intrinsic_minimums(Budget *budget)
           && outer->content_width == outer->client_width
           && inner_clip->content_width > inner_clip->client_width
           && compact_select->width >= 64
-          && compact_wrapper->width >= compact_select->width);
+          && compact_wrapper->width >= compact_select->width
+          && wrapped_wide->width <= 100
+          && audio_without_controls->width <= 8);
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);

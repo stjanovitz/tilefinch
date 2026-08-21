@@ -75,6 +75,12 @@ typedef struct {
     bool alternate_theme_active[STYLESHEET_ALTERNATE_THEME_LIMIT];
     size_t alternate_theme_count;
     bool alternate_theme_selection_valid;
+    /* Parser checkpoints may have to sample a large utility sheet before
+       the body exists. The authoritative pass flips this fact, then rebuilds
+       once from retained bodies if an early sample was taken. */
+    bool selector_census_complete;
+    bool final_resample_required;
+    bool final_resample_completed;
 } StylesheetDocumentResources;
 
 typedef struct {
@@ -360,6 +366,11 @@ bool stylesheet_document_resources_retain(
 /* Once the top-level response has left the transport, allow a URL which
    exhausted its transient parser-time attempts one last bounded retry. */
 void stylesheet_document_resources_open_final_retry(
+    StylesheetDocumentResources *resources);
+/* Marks the current DOM as complete. Returns true only when an early large-
+   sheet sample requires one ordered rebuild; all successfully retained
+   sources are made eligible so that rebuild preserves cascade order. */
+bool stylesheet_document_resources_prepare_complete_census(
     StylesheetDocumentResources *resources);
 /* Resolve a link's bounded href against its document base and return the
    transport ledger state. Present-but-invalid href values are deterministic

@@ -247,6 +247,9 @@ Interrupt checks cover QuickJS execution and native callback boundaries.
 Inert JSON script types remain DOM data, while a narrow classic-script subset
 (`window`, `globalThis`, `var`, or bare global assignments of strict JSON)
 installs its data without compiling bytecode or consuming executable quota.
+Because the engine supports modules, classic `nomodule` fallbacks are rejected
+before preload, quota admission, or dynamic-script scheduling; module fetch or
+execution failure never enables the legacy alternative.
 Large cross-origin classic bundles pass an allocation-free lexical cost scan;
 only high-cost bodies are shed, with source size and watchdog-miss signals
 retained as tuning telemetry. Rejection is page-local and server-rendered
@@ -388,8 +391,9 @@ incompatible backend.
 
 The player has one source-independent packet pipeline. The built-in provider supplies
 resolved split or progressive streams, offline downloads supply bounded local
-files, and compatible page `<video>` elements supply an authorized progressive
-MP4 or VOD HLS URL. MP4 performs a one-byte standard HTTP Range probe. HLS
+files, and compatible page `<video>`/`<audio>` elements supply authorized
+progressive MP4/M4A or VOD HLS URLs. MP4 performs a one-byte standard HTTP
+Range probe. HLS
 parses bounded master/media playlists and streams at most the current and next
 MPEG-TS segment through the shared worker. Both retain response authority and
 feed the same decoder, buffering, seek, clock, and presentation services. HLS
@@ -400,18 +404,25 @@ untouched in-flight request across repeated cooperative readiness probes;
 video-only variants may prime as soon as their PMT and first video sample are
 known rather than filling the entire first segment.
 
-YouTube audio-only mode is a route-time pipeline choice, not a hidden video
-surface. It admits only the resolver's adaptive AAC representation, creates no
-video range or demuxer, and allocates no MPEG decoder or decoded-picture
-surfaces. The ordinary media state machine, range recovery, clock, buffering,
-pause, and seek contracts remain authoritative. Page `<video>` and saved media
-are deliberately unaffected by this global YouTube preference.
+Audio-only playback is a route-time pipeline choice, not a hidden video
+surface. YouTube admits its adaptive AAC representation; a page `<audio>`
+element admits an authorized AAC-in-MP4/M4A source. Both create no video range
+or demuxer and allocate no MPEG decoder or decoded-picture surfaces. The
+ordinary media state machine, range recovery, clock, buffering, pause, and
+seek contracts remain authoritative. Page `<video>` and saved media are
+deliberately unaffected by the global YouTube audio-only preference.
 
 When a server-rendered `<video>` omits `src`, activation may perform one
 bounded, allocation-free scan of retained data scripts and generic media
 attributes for direct MP4, HLS, or WebM references. Candidate selection is
 hostname-independent, prefers the lowest direct MP4 quality at or above 240p,
 and still crosses URL resolution, CSP, request authority, and media probing.
+The same retained-data seam recognizes schema-scoped `AudioObject` and
+`MusicRecording.audio` sources. It indexes at most twelve compact spans rather
+than copying a JSON object graph. An otherwise inert Play or Preview button may
+open the audio-only player only when one candidate exists or nearby title/URL
+metadata identifies exactly one; authored media elements, JavaScript handlers,
+navigation, cancellation, and ambiguous matches always take precedence.
 The media layer classifies SPS profile before decoder construction: Baseline
 and Main use firmware until software takeover, while compatible High streams
 select the software path. WebM and unsupported HLS forms fail as formats,

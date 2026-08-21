@@ -124,6 +124,8 @@ bool layout_block_emit_decoration(
             & STYLE_PAINT_COMPONENT_BACKGROUND_BOX) != 0
         ? (StylePaintBox) background_geometry->clip
         : STYLE_PAINT_BOX_BORDER;
+    bool background_clips_to_text =
+        background_clip == STYLE_PAINT_BOX_TEXT;
     int background_inset_left = 0, background_inset_top = 0;
     int background_inset_right = 0, background_inset_bottom = 0;
     layout_block_style_paint_box_insets(
@@ -154,11 +156,10 @@ bool layout_block_emit_decoration(
        witness whether it helped (see the probe note below).  Block boxes are
        where the shadowed cards and panels live.
 
-       DESCOPED: `inset` shadows parse and are retained, but do not paint.
-       They need a clip-to-inside-the-border-box pass the span rasteriser has
-       no path for, and painting one as an outer shadow would be worse than
-       painting nothing.  The parse is kept so an inset layer does not make
-       the whole declaration invalid and resurrect an older shadow.
+       A zero-blur, zero-offset inset with positive spread is emitted later
+       as a rounded inner stroke.  This common hairline form needs neither a
+       blur buffer nor a second clip test; more general inset shadows remain
+       retained but unpainted.
 
        PROBE NOTE: no fidelity scenario moves under this feature.  That was
        verified, not assumed: forcing every parsed shadow to opaque magenta
@@ -278,7 +279,8 @@ bool layout_block_emit_decoration(
        that would otherwise flash during a streaming first paint. */
     if (!element_mask_declared)
         backdrop_blur = layout_admit_backdrop_blur(context, backdrop_blur);
-    if ((style->has_background || backdrop_blur != 0u)
+    if (!background_clips_to_text
+        && (style->has_background || backdrop_blur != 0u)
         && !element_mask_declared) {
         DrawCommand background = {.type = DRAW_FILL_RECT,
                                   .x = outer_x + background_inset_left,
@@ -324,6 +326,7 @@ bool layout_block_emit_decoration(
             StylePaintBox clip = (paint_stack->components
                                   & STYLE_PAINT_COMPONENT_BACKGROUND_BOX) != 0
                 ? (StylePaintBox) layer->clip : STYLE_PAINT_BOX_BORDER;
+            if (clip == STYLE_PAINT_BOX_TEXT) continue;
             int left = 0, top = 0, right = 0, bottom = 0;
             layout_block_style_paint_box_insets(
                 style, clip, &left, &top, &right, &bottom);
@@ -376,6 +379,7 @@ bool layout_block_emit_decoration(
     const StyleGradient *primary_gradient =
         stylesheet_background_gradient(context->sheet, style);
     if (!layered_background
+        && !background_clips_to_text
         && style->background_image_kind == STYLE_BACKGROUND_IMAGE_GRADIENT
         && primary_gradient != NULL
         && !element_mask_declared) {
@@ -403,6 +407,7 @@ bool layout_block_emit_decoration(
         }
     }
     if (!layered_background
+        && !background_clips_to_text
         && image_resource_available(element_background)
         && !element_mask_declared) {
         DrawCommand background_image = {
@@ -423,7 +428,8 @@ bool layout_block_emit_decoration(
         stylesheet_background_overlay_gradient(
             context->sheet,
             computed_style_background_overlay_gradient(style));
-    if (!layered_background && overlay != NULL && !element_mask_declared) {
+    if (!layered_background && !background_clips_to_text
+        && overlay != NULL && !element_mask_declared) {
         size_t gradient_slot = 0;
         if (layout_intern_gradient(context->layout, overlay,
                                    &gradient_slot)) {
@@ -793,8 +799,33 @@ bool layout_block_patch_decoration(
         context->layout->commands[rounded_border_index].height =
             content_bottom - outer_y;
     }
-    DrawCommand square_borders[4];
-    size_t square_border_count = 0;
+    DrawCommand decoration_strokes[STYLE_BOX_SHADOW_LIMIT + 4u];
+    size_t decoration_stroke_count = 0;
+    size_t box_shadow_count = stylesheet_box_shadow_count(
+        context->sheet, style);
+    for (size_t i = box_shadow_count; i-- > 0;) {
+        const StyleBoxShadow *shadow = stylesheet_box_shadow(
+            context->sheet, style, i);
+        if (shadow == NULL || !style_box_shadow_is_inset(shadow)
+            || style_box_shadow_blur(shadow) != 0
+            || shadow->offset_x != 0 || shadow->offset_y != 0
+            || shadow->spread <= 0) continue;
+        uint32_t color = shadow->argb & 0x00ffffffu;
+        uint8_t alpha = (uint8_t) ((shadow->argb >> 24) & 0xffu);
+        if (style_box_shadow_uses_current_color(shadow)) {
+            color = style->color;
+            alpha = style->color_alpha;
+        }
+        if (alpha == 0) continue;
+        decoration_strokes[decoration_stroke_count++] = (DrawCommand) {
+            .type = DRAW_STROKE_RECT,
+            .x = outer_x, .y = outer_y,
+            .width = outer_width, .height = content_bottom - outer_y,
+            .color = color, .scale = shadow->spread,
+            .radius = plan->border_radius_code,
+            .opacity_scale = alpha_opacity_scale(alpha)
+        };
+    }
     if (!rounded_border && style->border.top > 0
         && computed_style_border_line(
                style, STYLE_BORDER_TOP) != STYLE_BORDER_NONE) {
@@ -803,7 +834,7 @@ bool layout_block_patch_decoration(
         int collapsed_right_outset =
             collapsed_table_cell
                 ? style->border.right - style->border.right / 2 : 0;
-        square_borders[square_border_count++] = (DrawCommand) {
+        decoration_strokes[decoration_stroke_count++] = (DrawCommand) {
             .type = DRAW_FILL_RECT,
             .x = outer_x - collapsed_left_outset,
             .y = outer_y - (collapsed_table_cell
@@ -824,7 +855,7 @@ bool layout_block_patch_decoration(
         int collapsed_right_outset =
             collapsed_table_cell
                 ? style->border.right - style->border.right / 2 : 0;
-        square_borders[square_border_count++] = (DrawCommand) {
+        decoration_strokes[decoration_stroke_count++] = (DrawCommand) {
             .type = DRAW_FILL_RECT,
             .x = outer_x - collapsed_left_outset,
             .y = content_bottom
@@ -842,7 +873,7 @@ bool layout_block_patch_decoration(
     if (!rounded_border && style->border.left > 0 && border_height > 0
         && computed_style_border_line(
                style, STYLE_BORDER_LEFT) != STYLE_BORDER_NONE) {
-        square_borders[square_border_count++] = (DrawCommand) {
+        decoration_strokes[decoration_stroke_count++] = (DrawCommand) {
             .type = DRAW_FILL_RECT,
             .x = outer_x - (collapsed_table_cell
                             ? style->border.left / 2 : 0),
@@ -857,7 +888,7 @@ bool layout_block_patch_decoration(
     if (!rounded_border && style->border.right > 0 && border_height > 0
         && computed_style_border_line(
                style, STYLE_BORDER_RIGHT) != STYLE_BORDER_NONE) {
-        square_borders[square_border_count++] = (DrawCommand) {
+        decoration_strokes[decoration_stroke_count++] = (DrawCommand) {
             .type = DRAW_FILL_RECT,
             .x = outer_x + outer_width
                  - (collapsed_table_cell
@@ -872,11 +903,12 @@ bool layout_block_patch_decoration(
         };
     }
     if (!layout_insert_commands(context, before_insertion_index,
-                                square_borders, square_border_count)) {
+                                decoration_strokes,
+                                decoration_stroke_count)) {
         return false;
     }
-    before_insertion_index += square_border_count;
-    scroll_command_start += square_border_count;
+    before_insertion_index += decoration_stroke_count;
+    scroll_command_start += decoration_stroke_count;
     *insertion_index_io = before_insertion_index;
     *scroll_command_start_io = scroll_command_start;
     return true;

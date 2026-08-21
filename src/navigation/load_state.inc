@@ -172,6 +172,7 @@ struct NavigationLoad {
     bool response_cookies_accepted;
     bool client_hint_retried;
     bool client_hint_retry_pending;
+    bool zero_body_retry_attempted;
     bool staging_released;
     unsigned char *staged_body;
     size_t staged_body_offset;
@@ -199,6 +200,9 @@ struct NavigationLoad {
     int incumbent_relayout_damage_right;
     int incumbent_relayout_damage_bottom;
 };
+
+static bool navigation_load_reset_for_retry(NavigationLoad *load);
+static uint64_t navigation_load_enqueue_fetch_request(NavigationLoad *load);
 
 static void navigation_load_saturating_add(size_t *value, size_t amount)
 {
@@ -398,6 +402,27 @@ static bool navigation_load_process_staged_body(
         load->metrics.parser_quota_yields++;
     }
     return ok;
+}
+
+static bool navigation_load_retry_zero_body_deadline(NavigationLoad *load)
+{
+    if (load == NULL || load->session == NULL
+        || load->zero_body_retry_attempted
+        || strcasecmp(load->method, "GET") != 0
+        || load->metrics.stream.bytes_received != 0
+        || strcmp(load->response.error,
+                  "request deadline expired before background hop") != 0) {
+        return false;
+    }
+    load->zero_body_retry_attempted = true;
+    load->session->performance.zero_body_navigation_retries++;
+    if (!navigation_load_reset_for_retry(load)) return false;
+    fetch_result_destroy(&load->response);
+    load->request_id = navigation_load_enqueue_fetch_request(load);
+    if (load->request_id == 0) return false;
+    memset(&load->session->last_stream, 0,
+           sizeof(load->session->last_stream));
+    return true;
 }
 
 static void navigation_load_reset_preload_metrics(NavigationLoad *load)
@@ -1114,6 +1139,9 @@ NavigationLoadStatus navigation_load_pump(
              sizeof(session->last_tls_version), "%s",
              load->response.tls_version);
     if (!success) {
+        if (navigation_load_retry_zero_body_deadline(load)) {
+            return load->status;
+        }
         const char *detail = load->response.error;
         if (strcmp(detail, "stream consumer rejected response") == 0
             && session->last_error[0] != '\0') {

@@ -2119,7 +2119,9 @@ int main(void)
         "notPrint=matchMedia('not print and (min-width: 100px)'),"
         "print=matchMedia('print and (min-width: 100px)'),"
         "monochrome=matchMedia('(monochrome)'),"
-        "zeroMonochrome=matchMedia('(monochrome: 0)');"
+        "zeroMonochrome=matchMedia('(monochrome: 0)'),"
+        "reducedMotion=matchMedia('(prefers-reduced-motion: reduce)'),"
+        "ordinaryMotion=matchMedia('(prefers-reduced-motion: no-preference)');"
         "let events=0,eventShape=false;"
         "const listener={handleEvent(event){events++;eventShape="
         "event instanceof MediaQueryListEvent&&event instanceof Event"
@@ -2131,12 +2133,15 @@ int main(void)
         "globalThis.pocSummary=range instanceof EventTarget"
         "&&minimum.matches&&orientation.matches"
         "&&notPrint.matches&&!print.matches&&!monochrome.matches"
-        "&&zeroMonochrome.matches&&events===1&&eventShape"
+        "&&zeroMonochrome.matches&&reducedMotion.matches"
+        "&&!ordinaryMotion.matches&&events===1&&eventShape"
         "?'MATCH-MEDIA-OK':'MATCH-MEDIA-FAILED:'+JSON.stringify({"
         "range:range.matches,minimum:minimum.matches,"
         "orientation:orientation.matches,notPrint:notPrint.matches,"
         "print:print.matches,monochrome:monochrome.matches,"
-        "zeroMonochrome:zeroMonochrome.matches,events,eventShape});})()";
+        "zeroMonochrome:zeroMonochrome.matches,"
+        "reducedMotion:reducedMotion.matches,"
+        "ordinaryMotion:ordinaryMotion.matches,events,eventShape});})()";
     bool match_media_ok = script_runtime_evaluate_diagnostic(
         runtime, match_media_probe, "<match-media-probe>", &result);
     if (!match_media_ok || strcmp(result.summary, "MATCH-MEDIA-OK") != 0) {

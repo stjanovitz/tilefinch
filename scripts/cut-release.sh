@@ -262,6 +262,21 @@ done
 printf 'Notices manifest verified: %s required files present.\n' \
     "$notice_count"
 
+# Compiler-expanded __FILE__ strings are useful diagnostics, but release
+# binaries must contain the stable virtual prefixes configured by CMake, not
+# the release builder's source tree or home directory. Check the staged PBPs
+# before either the first-install zip or update package can be assembled.
+step "Checking staged binaries for local build paths"
+for binary in "$tree/EBOOT.PBP" "$tree/slot-a/EBOOT.PBP"; do
+    if LC_ALL=C grep -aFq "$root/" "$binary"; then
+        fail "$binary contains the local source/build path $root"
+    fi
+    if [ -n "${HOME:-}" ] && LC_ALL=C grep -aFq "$HOME/" "$binary"; then
+        fail "$binary contains the release builder's home path $HOME"
+    fi
+done
+printf '%s\n' "Staged binaries contain no local source or home paths."
+
 # --- Assemble the release artifacts ---------------------------------------
 
 step "Assembling release artifacts in $dist"

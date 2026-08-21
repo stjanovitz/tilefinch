@@ -145,7 +145,7 @@ bool tilefinch_update_prepare_download_url(
 
     /* Public OneDrive links default to a viewer. Download mode is a query
        parameter, and the resulting Microsoft/CDN redirects remain subject
-       to the transport's global five-hop bound and no-credentials policy. */
+       to the transport's global eight-hop bound and no-credentials policy. */
     const char *query = strchr(url, '?');
     const char *scan = query == NULL ? url + length : query + 1u;
     while (*scan != '\0') {

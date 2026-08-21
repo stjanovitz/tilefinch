@@ -790,7 +790,7 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("void psp_media_prepare_route("):
             source.index("bool psp_media_open_page_source(")]
         self.assertIn(
-            "psp_media_prepare_route_kind(media, url, generation, false, true)",
+            "psp_media_prepare_route_kind(media, url, generation, false, false, true)",
             " ".join(facade.split()))
         self.assertNotIn(
             ".autoplay = media->reopen_resume_playing", route)
@@ -1543,9 +1543,9 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("range->stats.starved_reconnects++", restart)
 
     def test_audio_only_open_and_seek_have_no_video_dependency(self):
-        """The low-bandwidth route owns only adaptive AAC. Opening and
-        seeking therefore cannot admit a video range or assume AAC is source
-        one in a two-source playback object."""
+        """An audio-only route owns only AAC. Opening and seeking therefore
+        cannot admit a video range or assume AAC is source one in a
+        two-source playback object."""
         opening = without_comments(
             (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
         pump = opening[opening.rindex("static bool psp_media_open_pump_step(") :]
@@ -1555,6 +1555,12 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn(
             "media->audio_only ? PSP_MEDIA_JOB_OPEN_AUDIO_RANGE",
             " ".join(decoder.split()))
+        self.assertIn(
+            "media->page_audio ? PSP_MEDIA_JOB_OPEN_DECODER_PREPARE",
+            " ".join(pump.split()))
+        self.assertIn(
+            "media->audio_only && !media->page_audio",
+            " ".join(pump.split()))
         audio_demux = pump[
             pump.index("case PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX:"):
             pump.index("case PSP_MEDIA_JOB_OPEN_DECODER_PREPARE:")]
@@ -1570,6 +1576,16 @@ class PspSdkContractTests(unittest.TestCase):
         prime_flat = " ".join(prime.split())
         self.assertIn("playback->source_count == 1u", prime_flat)
         self.assertIn("? 0u : 1u", prime_flat)
+
+        session = without_comments(psp_media_session_sources())
+        page_open = session[
+            session.index("static bool psp_media_open_page_source_kind("):
+            session.index("bool psp_media_open_page_source(")]
+        # A structured AudioObject preview intentionally has no synthetic
+        # DOM media node. Handle zero is therefore valid; only negative input
+        # is rejected, and state feedback becomes an ordinary no-op.
+        self.assertIn("node_handle < 0", page_open)
+        self.assertNotIn("node_handle <= 0", page_open)
 
     def test_swdec_shared_memory_and_reordered_pts_contracts(self):
         """ME-owned ranges must not share allocator cache lines, and a

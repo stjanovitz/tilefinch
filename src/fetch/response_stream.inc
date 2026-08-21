@@ -1540,6 +1540,9 @@ struct FetchHopState {
     bool cookie_initiator_opaque;
     char cookie_header[4096];
     size_t redirects;
+    uint32_t redirect_transition_hashes[FETCH_REDIRECT_LIMIT];
+    uint8_t redirect_transition_count;
+    bool redirect_loop_detected;
     uint64_t deadline_ns;
     bool body_enabled;
     bool fetch_site_none;

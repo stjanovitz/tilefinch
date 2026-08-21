@@ -81,7 +81,7 @@ Redirect detection distinguishes an absent `Location` field from a present
 field with an empty value. The latter is a valid relative reference and is
 resolved against the current logical URL; as with any `Location` lacking a
 fragment delimiter, redirect processing inherits the current fragment. It is
-therefore followed under the ordinary five-hop bound rather than being treated
+therefore followed under the ordinary eight-hop bound rather than being treated
 as a response without a redirect target.
 
 Response `Referrer-Policy` is security metadata, not merely a page-visible

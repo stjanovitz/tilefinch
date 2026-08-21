@@ -2899,11 +2899,17 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
     if (style.display == DISPLAY_NONE
         || style.display == DISPLAY_TABLE_COLUMN || style.hidden) return true;
     if (style.out_of_flow || style.fixed_position) {
+        bool fixed_captured = style.fixed_position
+            && line->positioned_box.fixed_node != NULL;
         int containing_width = style.fixed_position
-            ? context->layout->width : line->positioned_box.width;
+            ? (fixed_captured ? line->positioned_box.fixed_width
+                              : context->layout->width)
+            : line->positioned_box.width;
         int containing_height = style.fixed_position
-            ? (context->layout->viewport.css_height > 0
-               ? context->layout->viewport.css_height : 272)
+            ? (fixed_captured && line->positioned_box.fixed_height > 0
+                   ? line->positioned_box.fixed_height
+                   : (context->layout->viewport.css_height > 0
+                      ? context->layout->viewport.css_height : 272))
             : line->positioned_box.height;
         if (containing_width <= 0) {
             containing_width = line->base_right - line->base_left;
@@ -3009,6 +3015,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
     bool replaced_element = layout_node_name_is(node, "img")
         || layout_node_name_is(node, "svg")
         || layout_node_name_is(node, "video")
+        || layout_node_name_is(node, "audio")
         || layout_node_name_is(node, "iframe");
     if (is_atomic_inline(style.display) && !input_control
         && !textarea_control && !editable_control && !replaced_element) {
@@ -3413,7 +3420,13 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
     }
     if (layout_node_name_is(node, "img") || layout_node_name_is(node, "svg")
         || layout_node_name_is(node, "video")
+        || layout_node_name_is(node, "audio")
         || layout_node_name_is(node, "iframe")) {
+        bool audio_element = layout_node_name_is(node, "audio");
+        bool audio_controls = audio_element
+            && lxb_dom_element_has_attribute(
+                lxb_dom_interface_element(node),
+                (const lxb_char_t *) "controls", 8);
         size_t replaced_link_start = context->layout->link_count;
         size_t replaced_control_start = context->layout->control_count;
         const ImageResource *image = images_find_node(context->images, node);
@@ -3438,10 +3451,11 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         int height = image_available
             ? image_resource_intrinsic_height(image) : 0;
         if ((layout_node_name_is(node, "video")
+             || audio_controls
              || layout_node_name_is(node, "iframe"))
             && (width <= 0 || height <= 0)) {
             width = 300;
-            height = 150;
+            height = audio_controls ? 54 : 150;
         }
         int horizontal_edges = style.padding.left + style.padding.right
                                + style.border.left + style.border.right;
@@ -3468,6 +3482,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         if (!image_available && !declared_box && !zero_width_spacer
             && !layout_node_name_is(node, "svg")
             && !layout_node_name_is(node, "video")
+            && !layout_node_name_is(node, "audio")
             && !layout_node_name_is(node, "iframe")) {
             size_t alt_length = 0;
             const char *alt = layout_node_name_is(node, "img")
@@ -3584,10 +3599,13 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         }
         size_t image_command = context->layout->count;
         if (image_available) {
+            int border_radius_code = stylesheet_border_radius_code(
+                context->sheet, &style);
             DrawCommand command = {
                 .type = DRAW_IMAGE, .x = content_x, .y = content_y,
                 .width = width, .height = height, .image = image,
-                .image_fit = style.object_fit
+                .image_fit = style.object_fit,
+                .scale = border_radius_code
             };
             draw_command_set_object_position(
                 &command, style.object_position_x, style.object_position_y);
@@ -3606,10 +3624,14 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                        width, height)) {
             return false;
         }
-        /* A page video is a single native-player activation target. It uses
+        if (audio_controls
+            && !layout_paint_audio_control(
+                context, &style, outer_x, outer_y,
+                outer_width, outer_height)) return false;
+        /* Page media is a single native-player activation target. It uses
            the existing retained control map so d-pad focus and pointer taps
            share the same DOM activation/cancellation path as buttons. */
-        if (layout_node_name_is(node, "video")
+        if ((layout_node_name_is(node, "video") || audio_controls)
             && !layout_add_control(
                    context->layout, outer_x, outer_y,
                    outer_width, outer_height, CONTROL_BUTTON, node)) {
@@ -3785,6 +3807,28 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                             + style.padding.left;
     int inline_right_edges = style.padding.right + style.border.right
                              + style.margin.right;
+    /* An inline nowrap box establishes one unbreakable group.  Measuring
+       only each descendant text node lets the first word enter the current
+       line and strands the rest beyond its right edge.  Preflight the
+       bounded intrinsic width while the group can still move as a unit. */
+    if ((style.white_space_mode == WHITE_SPACE_NOWRAP
+         || style.white_space_mode == WHITE_SPACE_PRE)
+        && parent->white_space_mode != WHITE_SPACE_NOWRAP
+        && parent->white_space_mode != WHITE_SPACE_PRE
+        && line_cursor_fixed(line)
+               != layout_fixed_from_integer(line->start_x)) {
+        int line_width = line->right - line->start_x;
+        int group_width = intrinsic_text_width(
+            context, node, parent, line_width);
+        int spacing_fixed = atomic_inline_spacing_fixed(
+            context, parent, line);
+        if (group_width > 0
+            && (int64_t) line_cursor_fixed(line) + spacing_fixed
+                       + (int64_t) group_width * 64
+                   > (int64_t) line->right * 64) {
+            layout_flush_line(line);
+        }
+    }
     if (inline_left_edges > 0) {
         line_cursor_set(line, line->x + inline_left_edges);
     }

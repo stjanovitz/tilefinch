@@ -613,6 +613,10 @@ static int test_bounded_shared_paint_stack(Budget *budget)
         "mask-position:right 20% bottom 70%,5px 6px;"
         "mask-repeat:no-repeat,repeat-x}"
         "#box-defaults{background-clip:content-box,padding-box}"
+        "#text-clip{color:#17253d;-webkit-text-fill-color:transparent;"
+        "background-image:linear-gradient(#000,#fff),"
+        "linear-gradient(#123,#456);background-clip:text,text}"
+        "#text-clip{background-image:linear-gradient(#000,#000)}"
         "#mask-replacement{mask-image:url(a.svg),url(b.svg);"
         "mask-image:none}"
         "#mask-shorthand{--icon:url(icon.svg);"
@@ -634,6 +638,7 @@ static int test_bounded_shared_paint_stack(Budget *budget)
         "background-position-y:75%}"
         "table{border-spacing:12px 7px}</style>"
         "<body><div id=probe></div><div id=box-defaults></div>"
+        "<div id=text-clip>Readable heading</div>"
         "<div id=mask-replacement></div>"
         "<div id=mask-shorthand></div><div id=pseudo-mask "
         "style='--icon:url(https://cdn.example/"
@@ -711,6 +716,16 @@ static int test_bounded_shared_paint_stack(Budget *budget)
           && box_paint->backgrounds[0].clip
              == STYLE_PAINT_BOX_CONTENT
           && box_paint->backgrounds[1].clip
+             == STYLE_PAINT_BOX_PADDING);
+    ComputedStyle text_clip = style_for_node(
+        &sheet, find_id(root, "text-clip"), NULL);
+    const StylePaintStack *text_clip_paint = stylesheet_paint_stack(
+        &sheet, computed_style_paint_stack_id(&text_clip));
+    CHECK(text_clip.color == 0x17253d && text_clip.color_alpha == 255
+          && text_clip_paint != NULL
+          && text_clip_paint->background_count == 1
+          && text_clip_paint->backgrounds[0].clip == STYLE_PAINT_BOX_TEXT
+          && text_clip_paint->backgrounds[0].origin
              == STYLE_PAINT_BOX_PADDING);
     ComputedStyle mask_replacement = style_for_node(
         &sheet, find_id(root, "mask-replacement"), NULL);
@@ -1437,9 +1452,11 @@ static int test_per_corner_border_radius(Budget *budget)
         "#reset{border-top-left-radius:8px;border-radius:3px}"
         ".cross{border-radius:2px}#cross{border-top-left-radius:9px}"
         "#invalid{border-radius:4px;border-radius:1px 2px 3px 4px 5px}"
+        "#percent{display:block;width:30px;height:18px;border-radius:50%;"
+        "background:#fff}"
         "</style><body><div id=paint></div><div id=clip></div><i id=merge></i>"
         "<i id=reset></i><i id=cross class=cross></i>"
-        "<i id=invalid></i></body>";
+        "<i id=invalid></i><div id=percent></div></body>";
     PocDocument document = {0};
     Stylesheet sheet = {0};
     LayoutDocument layout = {0};
@@ -1459,15 +1476,20 @@ static int test_per_corner_border_radius(Budget *budget)
         lxb_dom_interface_node(document.html), "cross");
     lxb_dom_node_t *invalid_node = find_id(
         lxb_dom_interface_node(document.html), "invalid");
+    lxb_dom_node_t *percent_node = find_id(
+        lxb_dom_interface_node(document.html), "percent");
     ComputedStyle paint_style = style_for_node(&sheet, paint_node, NULL);
     ComputedStyle merge_style = style_for_node(&sheet, merge_node, NULL);
     ComputedStyle reset_style = style_for_node(&sheet, reset_node, NULL);
     ComputedStyle cross_style = style_for_node(&sheet, cross_node, NULL);
     ComputedStyle invalid_style = style_for_node(&sheet, invalid_node, NULL);
+    ComputedStyle percent_style = style_for_node(&sheet, percent_node, NULL);
     int paint_radius = stylesheet_border_radius_code(&sheet, &paint_style);
     int merge_radius = stylesheet_border_radius_code(&sheet, &merge_style);
     int reset_radius = stylesheet_border_radius_code(&sheet, &reset_style);
     int cross_radius = stylesheet_border_radius_code(&sheet, &cross_style);
+    int percent_radius = stylesheet_border_radius_code(
+        &sheet, &percent_style);
     CHECK(style_border_radius_is_packed(paint_radius)
           && style_border_radius_corner(paint_radius, 0) == 10
           && style_border_radius_corner(paint_radius, 1) == 0
@@ -1483,6 +1505,7 @@ static int test_per_corner_border_radius(Budget *budget)
           && style_border_radius_corner(cross_radius, 2) == 2
           && style_border_radius_corner(cross_radius, 3) == 2
           && stylesheet_border_radius_code(&sheet, &invalid_style) == 4
+          && percent_radius == 32767
           && layout_build(&layout, budget, &document, &sheet,
                           NULL, NULL, FRAME_WIDTH));
     const LayoutNodeBox *clip_box = layout_box_for_node(&layout, clip_node);
@@ -1537,7 +1560,10 @@ static int test_box_shadow_raster(Budget *budget)
         "#card{display:block;width:32px;height:24px;margin:16px;"
         "border-radius:6px;background:#fff;"
         "box-shadow:0 0 8px 0 #000000}"
-        "</style><body><div id=card></div></body>";
+        "#inset{position:absolute;left:1px;top:48px;width:12px;height:12px;"
+        "border-radius:4px;background:#fff;"
+        "box-shadow:inset 0 0 0 2px #ff0000}"
+        "</style><body><div id=card></div><div id=inset></div></body>";
     PocDocument document = {0};
     Stylesheet sheet = {0};
     LayoutDocument layout = {0};
@@ -1548,10 +1574,13 @@ static int test_box_shadow_raster(Budget *budget)
           && layout_build(&layout, budget, &document, &sheet,
                           NULL, NULL, FRAME_WIDTH));
     const DrawCommand *shadow = NULL;
+    const DrawCommand *inset = NULL;
     for (size_t i = 0; i < layout.count; i++) {
         if (layout.commands[i].type == DRAW_SHADOW_RECT) {
             shadow = &layout.commands[i];
-            break;
+        } else if (layout.commands[i].type == DRAW_STROKE_RECT
+                   && layout.commands[i].color == UINT32_C(0xff0000)) {
+            inset = &layout.commands[i];
         }
     }
     /* The command box is the border box inflated by the blur on every side,
@@ -1559,7 +1588,10 @@ static int test_box_shadow_raster(Budget *budget)
     CHECK(shadow != NULL && shadow->scale == 8
           && shadow->x == 16 - 8 && shadow->y == 16 - 8
           && shadow->width == 32 + 16 && shadow->height == 24 + 16
-          && shadow->radius == 6);
+          && shadow->radius == 6
+          && inset != NULL && inset->x == 1 && inset->y == 48
+          && inset->width == 12 && inset->height == 12
+          && inset->scale == 2 && inset->radius == 4);
 
     frame = budget_malloc(
         budget, FRAME_WIDTH * FRAME_HEIGHT * sizeof(*frame));
@@ -1580,6 +1612,9 @@ static int test_box_shadow_raster(Budget *budget)
           && edge < 24u)) {
         fprintf(stderr, "shadow ramp %u/%u/%u/%u\n", edge, mid, far, clear);
     }
+    /* The retained inset form paints only its inner two-pixel ring. */
+    CHECK(frame[54u * FRAME_WIDTH + 1u] != UINT16_C(0xffff)
+          && frame[54u * FRAME_WIDTH + 7u] == UINT16_C(0xffff));
     CHECK(edge < mid && mid < far && far <= clear && clear == 31u
           && edge < 24u);
     /* The card itself paints over its own shadow and stays white. */

@@ -365,7 +365,7 @@
         || check_region->height < 18 || check_region->height > 32
         || slider_region->width != 160
         || slider_region->height < 20 || slider_region->height > 32
-        || send_region->width != 96) {
+        || send_region->width != 44) {
         fprintf(
             stderr,
             "native regions check=%p:%d:%dx%d slider=%p:%d:%dx%d "
@@ -398,7 +398,7 @@
           && count_region != NULL && count_region->type == CONTROL_INPUT
           && choice_region != NULL && choice_region->type == CONTROL_SELECT
           && send_region != NULL && send_region->type == CONTROL_BUTTON
-          && send_region->width == 96
+          && send_region->width == 44
           && reset_region != NULL && reset_region->type == CONTROL_BUTTON);
     bool toggle_stroke = false;
     for (size_t i = 0;
@@ -989,35 +989,83 @@
     document_destroy(&utility_document);
     CHECK(budget.current == 0);
 
-    puts("test: large generated stylesheets retain bounded tail rules");
+    puts("test: large generated stylesheets retain bounded sampled rules");
     static const char split_css[] =
-        ".head{padding-top:1px}.middle{padding-right:2px}"
+        ".head{padding-top:1px}.unused{padding-left:4px}"
+        ":where(.absent-helper){margin-top:9px}"
+        ".middle\\:wide{padding-right:2px}"
+        ":root{--late-pad:6px}h1{padding-left:var(--late-pad)}"
         ".tail{padding-bottom:3px}";
     PocDocument split_document;
     Stylesheet split_sheet;
     CHECK(document_parse(
               &split_document, &budget,
-              "<!doctype html><div id=split class='head middle tail'></div>",
-              strlen("<!doctype html><div id=split "
-                     "class='head middle tail'></div>"), 17)
+              "<!doctype html><h1 id=heading>Heading</h1>"
+              "<div id=split class='head middle:wide tail'></div>",
+              strlen("<!doctype html><h1 id=heading>Heading</h1>"
+                     "<div id=split class='head middle:wide tail'></div>"), 17)
           && stylesheet_build(&split_sheet, &budget, &split_document, 480));
     size_t split_start = split_sheet.count;
+    uint32_t split_bloom[64] = {0};
+    static const unsigned char middle_token[] = "middle:wide";
+    uint32_t middle_hash = UINT32_C(2166136261) ^ '.';
+    for (size_t i = 0; i < sizeof(middle_token) - 1u; i++) {
+        middle_hash ^= middle_token[i];
+        middle_hash *= UINT32_C(16777619);
+    }
+    uint32_t middle_rotated = (middle_hash << 13) | (middle_hash >> 19);
+    size_t middle_first = (size_t) middle_hash & (64u * 32u - 1u);
+    size_t middle_second = (size_t) (
+        middle_rotated ^ UINT32_C(0x9e3779b9))
+        & (64u * 32u - 1u);
+    split_bloom[middle_first / 32u] |=
+        UINT32_C(1) << (middle_first & 31u);
+    split_bloom[middle_second / 32u] |=
+        UINT32_C(1) << (middle_second & 31u);
+    static const unsigned char heading_token[] = "h1";
+    uint32_t heading_hash = UINT32_C(2166136261) ^ 't';
+    for (size_t i = 0; i < sizeof(heading_token) - 1u; i++) {
+        heading_hash ^= heading_token[i];
+        heading_hash *= UINT32_C(16777619);
+    }
+    uint32_t heading_rotated = (heading_hash << 13) | (heading_hash >> 19);
+    size_t heading_first = (size_t) heading_hash & (64u * 32u - 1u);
+    size_t heading_second = (size_t) (
+        heading_rotated ^ UINT32_C(0x9e3779b9))
+        & (64u * 32u - 1u);
+    split_bloom[heading_first / 32u] |=
+        UINT32_C(1) << (heading_first & 31u);
+    split_bloom[heading_second / 32u] |=
+        UINT32_C(1) << (heading_second & 31u);
     split_sheet.source_rule_head_limit_end = split_start + 1u;
-    split_sheet.source_rule_limit_end = split_start + 2u;
+    split_sheet.source_rule_relevant_limit_end = split_start + 4u;
+    split_sheet.source_rule_limit_end = split_start + 5u;
+    split_sheet.source_rule_token_bloom = split_bloom;
+    split_sheet.source_rule_token_bloom_words = 64u;
     split_sheet.source_rule_tail_begin = strstr(split_css, ".tail");
     CHECK(split_sheet.source_rule_tail_begin != NULL
           && stylesheet_add_css(&split_sheet, split_css,
                                 sizeof(split_css) - 1u));
     split_sheet.source_rule_limit_end = 0;
     split_sheet.source_rule_head_limit_end = 0;
+    split_sheet.source_rule_relevant_limit_end = 0;
+    split_sheet.source_rule_token_bloom = NULL;
+    split_sheet.source_rule_token_bloom_words = 0;
     split_sheet.source_rule_tail_begin = NULL;
     lxb_dom_node_t *split = find_id(
         lxb_dom_interface_node(split_document.html), "split");
+    lxb_dom_node_t *heading = find_id(
+        lxb_dom_interface_node(split_document.html), "heading");
     ComputedStyle split_style = style_for_node(&split_sheet, split, NULL);
-    CHECK(split != NULL && split_style.padding.top == 1
-          && split_style.padding.right == 0
-          && split_style.padding.bottom == 3
-          && split_sheet.count == split_start + 2u
+    ComputedStyle heading_style = style_for_node(
+        &split_sheet, heading, NULL);
+    CHECK(split != NULL && heading != NULL);
+    CHECK(split_style.padding.top == 1
+          && split_style.padding.left == 0
+          && split_style.padding.right == 2
+          && split_style.padding.bottom == 3);
+    CHECK(heading_style.padding.left == 6);
+    CHECK(split_sheet.count == split_start + 4u
           && split_sheet.diagnostic_selector_drops >= 1u);
     stylesheet_destroy(&split_sheet);
     document_destroy(&split_document);
@@ -1076,6 +1124,64 @@
     document_destroy(&component_document);
     CHECK(budget.current == 0);
 
+    puts("test: exhausted author realm reveals only the staged first frame");
+    static const char staged_content_page[] =
+        "<!doctype html><style>.opacity-0{opacity:0}.slide{position:absolute;"
+        "opacity:0}img{opacity:0}#modal{position:fixed;z-index:4}</style>"
+        "<body><h1 id=heading class=opacity-0>Server title</h1>"
+        "<div id=intro style='position:absolute;opacity:0'>"
+        "<h2 class=opacity-0>Intro title</h2></div>"
+        "<div id=deck><section id=first class=slide><img id=poster></section>"
+        "<section id=later class=slide>Later</section></div>"
+        "<div id=modal class=opacity-0>Dialog</div>"
+        "<p id=hidden class=opacity-0 aria-hidden=true>Hidden</p></body>";
+    PocDocument staged_content_document;
+    Stylesheet staged_content_sheet;
+    CHECK(document_parse(&staged_content_document, &budget,
+                         staged_content_page,
+                         strlen(staged_content_page), 18)
+          && stylesheet_build(&staged_content_sheet, &budget,
+                              &staged_content_document, 480));
+    lxb_dom_node_t *staged_heading = find_id(
+        lxb_dom_interface_node(staged_content_document.html), "heading");
+    lxb_dom_node_t *staged_first = find_id(
+        lxb_dom_interface_node(staged_content_document.html), "first");
+    lxb_dom_node_t *staged_intro = find_id(
+        lxb_dom_interface_node(staged_content_document.html), "intro");
+    lxb_dom_node_t *staged_later = find_id(
+        lxb_dom_interface_node(staged_content_document.html), "later");
+    lxb_dom_node_t *staged_poster = find_id(
+        lxb_dom_interface_node(staged_content_document.html), "poster");
+    lxb_dom_node_t *staged_modal = find_id(
+        lxb_dom_interface_node(staged_content_document.html), "modal");
+    lxb_dom_node_t *staged_hidden = find_id(
+        lxb_dom_interface_node(staged_content_document.html), "hidden");
+    stylesheet_enable_static_custom_element_fallback(&staged_content_sheet);
+    ComputedStyle revealed_heading = style_for_node(
+        &staged_content_sheet, staged_heading, NULL);
+    ComputedStyle revealed_first = style_for_node(
+        &staged_content_sheet, staged_first, NULL);
+    ComputedStyle revealed_intro = style_for_node(
+        &staged_content_sheet, staged_intro, NULL);
+    ComputedStyle retained_later = style_for_node(
+        &staged_content_sheet, staged_later, NULL);
+    ComputedStyle revealed_poster = style_for_node(
+        &staged_content_sheet, staged_poster, &revealed_first);
+    ComputedStyle retained_modal = style_for_node(
+        &staged_content_sheet, staged_modal, NULL);
+    ComputedStyle retained_hidden = style_for_node(
+        &staged_content_sheet, staged_hidden, NULL);
+    CHECK(revealed_heading.opacity == 255
+          && revealed_intro.opacity == 255
+          && revealed_first.opacity == 0
+          && revealed_poster.opacity == 0
+          && retained_later.opacity == 0
+          && retained_modal.opacity == 0
+          && retained_hidden.opacity == 0);
+    stylesheet_destroy(&staged_content_sheet);
+    document_destroy(&staged_content_document);
+    CHECK(budget.current == 0);
+
     puts("test: escaped CSS identifiers match literal DOM tokens");
     static const char escaped_identifier_page[] =
         "<!doctype html><style>div{padding-top:19px}"
@@ -1088,10 +1194,18 @@
         ".outline{outline-style:solid}"
         ".outline-2{outline-width:2px}"
         ".outline-\\[rgb\\(70_31_140\\/60\\%\\)\\]"
-        "{outline-color:rgb(70 31 140/60%)}</style><body>"
+        "{outline-color:rgb(70 31 140/60%)}"
+        ".w-\\[clamp\\(min\\(250px\\,100\\%\\)\\,62svw\\,440px\\)\\]"
+        "{width:clamp(min(250px,100%),62svw,440px)}"
+        ".escaped-content:before{--tw-content:\\\"\\\";"
+        "content:var(--tw-content)}"
+        ".suffix-survives{height:19px}</style><body>"
         "<div id='escaped!id' class='govuk-!-padding-top-0'>ESCAPED</div>"
         "<div id='utility-pill' class='py-1.5 rounded-[100px] outline "
         "outline-2 outline-[rgb(70_31_140/60%)]'>SEARCH</div>"
+        "<div id='escaped-comma' "
+        "class='w-[clamp(min(250px,100%),62svw,440px)]'></div>"
+        "<div id='escaped-suffix' class='suffix-survives'></div>"
         "</body>";
     PocDocument escaped_identifier_document;
     Stylesheet escaped_identifier_sheet;
@@ -1106,10 +1220,21 @@
     lxb_dom_node_t *utility_pill = find_id(
         lxb_dom_interface_node(escaped_identifier_document.html),
         "utility-pill");
+    lxb_dom_node_t *escaped_comma = find_id(
+        lxb_dom_interface_node(escaped_identifier_document.html),
+        "escaped-comma");
+    lxb_dom_node_t *escaped_suffix = find_id(
+        lxb_dom_interface_node(escaped_identifier_document.html),
+        "escaped-suffix");
     ComputedStyle escaped_identifier_style = style_for_node(
         &escaped_identifier_sheet, escaped_identifier, NULL);
     ComputedStyle utility_pill_style = style_for_node(
         &escaped_identifier_sheet, utility_pill, NULL);
+    ComputedStyle escaped_comma_style = style_for_node(
+        &escaped_identifier_sheet, escaped_comma, NULL);
+    ComputedStyle escaped_suffix_style = style_for_node(
+        &escaped_identifier_sheet, escaped_suffix, NULL);
+    int escaped_comma_width = 0;
     CHECK(escaped_identifier != NULL
           && escaped_identifier_style.padding.top == 0
           && escaped_identifier_style.margin.left == 7);
@@ -1124,6 +1249,13 @@
           == STYLE_OUTLINE_SOLID);
     CHECK(utility_pill_style.outline_color == 0x461f8c);
     CHECK(utility_pill_style.outline_alpha == 153);
+    CHECK(escaped_comma != NULL && escaped_comma_style.has_width
+          && style_length_resolve(&escaped_identifier_sheet,
+                                  escaped_comma_style.width, 480,
+                                  &escaped_comma_width)
+          && escaped_comma_width == 298);
+    CHECK(escaped_suffix != NULL && escaped_suffix_style.has_height
+          && escaped_suffix_style.height == 19);
     stylesheet_destroy(&escaped_identifier_sheet);
     document_destroy(&escaped_identifier_document);
     CHECK(budget.current == 0);

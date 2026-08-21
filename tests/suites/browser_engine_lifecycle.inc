@@ -677,3 +677,212 @@ static int test_page_video_data_candidate_activation(void)
     browser_engine_destroy(engine);
     return 0;
 }
+
+static int test_page_audio_activation(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    static const char page[] =
+        "<!doctype html><title>Audio</title><body>"
+        "<audio controls crossorigin=anonymous>"
+        "<source src=skip.mp4 type=video/mp4>"
+        "<source src=episode.m4a type=audio/mp4></audio>"
+        "<audio src=background.m4a></audio>";
+    ControllerAction action = {0};
+    CHECK(engine != NULL
+          && browser_engine_commit_html(
+                 engine, "https://media.test/path/page.html", page,
+                 sizeof(page) - 1u, true)
+          && browser_engine_navigation(engine)->page.layout.control_count == 1
+          && browser_engine_focus_move(engine, true)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_MEDIA
+          && action.media_audio_only
+          && action.media_kind == MEDIA_DISCOVERY_AUDIO_MP4
+          && strcmp(action.url,
+                    "https://media.test/path/episode.m4a") == 0
+          && action.media_node_handle > 0
+          && action.media_mode == TILEFINCH_REQUEST_MODE_CORS
+          && action.media_credentials == TILEFINCH_CREDENTIALS_SAME_ORIGIN
+          && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_structured_audio_preview_activation(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    static const char page[] =
+        "<!doctype html><title>Structured audio</title><body>"
+        "<button aria-label='Reproducir First'>Preview</button>"
+        "<div href=/items/second><button>Play</button></div>"
+        "<button>Play</button>"
+        "<button id=after-mutation aria-label='Play First'>Preview</button>"
+        "<button id=handled type=button>Play</button>"
+        "<script id=catalog type=application/ld+json>["
+        "{\"@type\":[\"Thing\",\"AudioObject\"],\"name\":\"First\","
+        "\"url\":\"/items/first\",\"contentUrl\":\"/audio/first.m4a\"},"
+        "{\"audio\":[{\"@type\":\"AudioObject\",\"name\":\"Second\","
+        "\"contentUrl\":\"/audio/second.mp4\"}],"
+        "\"name\":\"Album row\",\"url\":\"/items/second\","
+        "\"@type\":[\"CreativeWork\",\"MusicRecording\"]},"
+        "{\"contentUrl\":\"/not-a-media-context.m4a\"}]</script>"
+        "<script>document.getElementById('handled').addEventListener("
+        "'click',()=>{globalThis.pocSummary='handled'})</script></body>";
+    CHECK(engine != NULL
+          && browser_engine_commit_html(
+                 engine, "https://audio.test/album", page,
+                 sizeof(page) - 1u, true));
+    MediaStructuredAudioIndex index = {0};
+    CHECK(media_discover_structured_audio(
+              &browser_engine_navigation(engine)->page.document, &index)
+          && index.candidate_count == 2u
+          && index.inspected_bytes != 0u
+          && index.inspected_nodes != 0u);
+    ControllerAction first = {0}, second = {0}, ambiguous = {0};
+    ControllerAction after_mutation = {0}, handled = {0};
+    CHECK(browser_engine_focus_move(engine, true)
+          && browser_engine_activate(engine, &first)
+          && first.type == CONTROLLER_ACTION_MEDIA
+          && first.media_audio_only && first.media_node_handle == 0
+          && first.media_kind == MEDIA_DISCOVERY_AUDIO_MP4
+          && strcmp(first.url, "https://audio.test/audio/first.m4a") == 0);
+    CHECK(browser_engine_focus_move(engine, true)
+          && browser_engine_activate(engine, &second)
+          && second.type == CONTROLLER_ACTION_MEDIA
+          && second.media_audio_only && second.media_node_handle == 0
+          && strcmp(second.url, "https://audio.test/audio/second.mp4") == 0);
+    CHECK(browser_engine_focus_move(engine, true)
+          && browser_engine_activate(engine, &ambiguous)
+          && ambiguous.type == CONTROLLER_ACTION_CONTROL);
+    ScriptResult mutation = {0};
+    CHECK(script_runtime_evaluate_diagnostic(
+              browser_engine_navigation(engine)->page.runtime,
+              "document.getElementById('catalog').remove();"
+              "globalThis.pocSummary='catalog-removed'",
+              "<structured-audio-mutation>", &mutation)
+          && mutation.success
+          && browser_engine_focus_move(engine, true)
+          && browser_engine_activate(engine, &after_mutation)
+          && after_mutation.type == CONTROLLER_ACTION_CONTROL);
+    CHECK(browser_engine_focus_move(engine, true)
+          && browser_engine_activate(engine, &handled)
+          && handled.type == CONTROLLER_ACTION_CONTROL
+          && strcmp(browser_engine_navigation(engine)->page.script_result.summary,
+                    "handled") == 0
+          && browser_engine_navigation(engine)->page.script_result
+                 .event_handlers_invoked != 0u
+          && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+
+    engine = browser_engine_create(&config, error, sizeof(error));
+    static const char blocked[] =
+        "<!doctype html><body><button>Play</button>"
+        "<script type=application/ld+json>"
+        "{\"@type\":\"AudioObject\","
+        "\"contentUrl\":\"https://cdn.test/blocked.m4a\"}</script>";
+    ControllerAction blocked_action = {0};
+    bool blocked_committed = engine != NULL && browser_engine_commit_html(
+        engine, "https://audio.test/blocked", blocked,
+        sizeof(blocked) - 1u, true);
+    static const char blocked_csp[] =
+        "content-security-policy: media-src 'none'\n";
+    blocked_committed = blocked_committed
+        && tilefinch_csp_parse_response_headers(
+            &browser_engine_navigation(engine)->page.document
+                 .content_security_policy,
+            "https://audio.test/blocked", blocked_csp,
+            sizeof(blocked_csp) - 1u, false);
+    bool blocked_focused = blocked_committed
+        && browser_engine_focus_move(engine, true);
+    bool blocked_activated = blocked_focused
+        && browser_engine_activate(engine, &blocked_action);
+    CHECK(blocked_committed && blocked_focused && blocked_activated
+          && blocked_action.type == CONTROLLER_ACTION_CONTROL
+          && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_nomodule_capability_suppression(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    static const char page[] =
+        "<!doctype html><body><script type=module>"
+        "globalThis.modulePath='module'</script>"
+        "<script nomodule>globalThis.modulePath='legacy'</script>"
+        "<script nomodule src=https://never-fetched.invalid/legacy.js>"
+        "</script><script>const dynamic=document.createElement('script');"
+        "dynamic.noModule=true;dynamic.src='https://never-fetched.invalid/"
+        "dynamic.js';document.body.appendChild(dynamic);"
+        "document.addEventListener('DOMContentLoaded',()=>{"
+        "globalThis.pocSummary=modulePath+':' +"
+        "String(globalThis.dynamicLegacy||false)})</script></body>";
+    CHECK(engine != NULL
+          && browser_engine_commit_html(
+                 engine, "https://modules.test/", page,
+                 sizeof(page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(strcmp(navigation->page.script_result.summary,
+                 "module:false") == 0
+          && navigation->script_skipped_nomodule == 2u
+          && navigation->page.script_result.dynamic_scripts_nomodule_skipped
+                 == 1u
+          && navigation->script_attempted == 0u
+          && navigation->preloads_discovered == 0u
+          && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+
+    engine = browser_engine_create(&config, error, sizeof(error));
+    static const char lone[] =
+        "<!doctype html><body><script nomodule>"
+        "globalThis.legacyRan=true</script><script>"
+        "globalThis.pocSummary=String(globalThis.legacyRan||false)"
+        "</script></body>";
+    CHECK(engine != NULL
+          && browser_engine_commit_html(
+                 engine, "https://modules.test/lone", lone,
+                 sizeof(lone) - 1u, true));
+    navigation = browser_engine_navigation(engine);
+    CHECK(strcmp(navigation->page.script_result.summary, "false") == 0
+          && navigation->script_skipped_nomodule == 1u
+          && navigation->script_attempted == 0u
+          && navigation->preloads_discovered == 0u
+          && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}

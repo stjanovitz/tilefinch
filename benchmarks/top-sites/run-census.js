@@ -15,6 +15,10 @@ const {
 const { scanCss } = require("./census-features");
 
 const ROOT = path.resolve(__dirname, "../..");
+const TILEFINCH_MOBILE_USER_AGENT =
+  "Mozilla/5.0 (iPhone; PlayStation Portable; Tilefinch/0.1) "
+  + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 "
+  + "Mobile/15E148 Safari/604.1";
 
 function parseArguments(argv) {
   const options = {
@@ -89,6 +93,7 @@ async function inspectSite(browser, entry, options, onContext) {
     deviceScaleFactor: 1,
     isMobile: true,
     hasTouch: true,
+    userAgent: TILEFINCH_MOBILE_USER_AGENT,
     locale: "en-US",
     colorScheme: "light",
     serviceWorkers: "block",

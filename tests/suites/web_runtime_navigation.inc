@@ -1534,11 +1534,11 @@
                  .focus_outline_relayout_skips == 2);
     CHECK(controller_focus_node(&focus_invalidation_controller, paint)
           && focus_invalidation_navigation.incremental_relayouts
-                 == focus_invalidation_relayouts
+                 == ++focus_invalidation_relayouts
           && focus_invalidation_navigation.performance
-                 .focus_paint_relayout_skips == 1
-          && focus_invalidation_navigation.focus_paint_generation == 1
-          && focus_invalidation_navigation.focus_paint_damage_valid);
+                 .focus_paint_relayout_skips == 0
+          && focus_invalidation_navigation.focus_paint_generation == 0
+          && !focus_invalidation_navigation.focus_paint_damage_valid);
 
     enum { FOCUS_FRAME_WIDTH = 480, FOCUS_FRAME_HEIGHT = 272 };
     size_t focus_frame_pixels =
@@ -2085,7 +2085,7 @@
     navigation_destroy(&label_navigation);
     CHECK(budget.current == 0);
 
-    puts("test: stylesheet motion has a bounded relayout lifetime");
+    puts("test: reduced motion freezes stylesheet animation without relayouts");
     static const char motion_page[] =
         "<!doctype html><style>@keyframes spin{from{transform:rotate(0deg)}"
         "to{transform:rotate(360deg)}}#spinner{width:16px;height:16px;"
@@ -2103,8 +2103,7 @@
     for (size_t frame = 0; frame < 260; frame++) {
         CHECK(navigation_advance_runtime(&motion_navigation, 16, 8));
     }
-    CHECK(motion_navigation.incremental_relayouts >= 100
-          && motion_navigation.incremental_relayouts <= 121
+    CHECK(motion_navigation.incremental_relayouts == 0
           && motion_navigation.performance.full_relayouts == 0
           && motion_navigation.page.script_result.pending_tasks == 0);
     navigation_destroy(&motion_navigation);

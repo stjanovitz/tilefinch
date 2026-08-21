@@ -51,6 +51,7 @@ struct MediaHttpRange {
     char *referer;
     char range_header[64];
     bool standard_range_header;
+    bool audio_only;
     FetchPreparedPageRequest *prepared_request;
     unsigned char *cache;
     size_t cache_capacity;
@@ -290,8 +291,10 @@ static bool range_prepare_request(
         .method = "GET",
         .allow_http_errors = true,
         .referer = range->referer[0] == '\0' ? NULL : range->referer,
-        .accept = "video/mp4,video/*;q=0.9,*/*;q=0.5",
-        .sec_fetch_dest = "video",
+        .accept = range->audio_only
+            ? "audio/mp4,audio/aac;q=0.9,audio/*;q=0.8,*/*;q=0.5"
+            : "video/mp4,video/*;q=0.9,*/*;q=0.5",
+        .sec_fetch_dest = range->audio_only ? "audio" : "video",
         .sec_fetch_mode = "no-cors",
         .sec_fetch_site = "cross-site",
         .user_agent = MEDIA_HTTP_USER_AGENT,
@@ -1908,13 +1911,16 @@ MediaHttpRange *media_http_range_create(
     memcpy(range->referer, referer, referer_length);
     range->standard_range_header = options != NULL
         && options->standard_range_header;
+    range->audio_only = options != NULL && options->audio_only;
     if (options != NULL && options->page_request_context != NULL) {
         range->prepared_request = budget_malloc_category(
             budget, BUDGET_CATEGORY_NAVIGATION,
             sizeof(*range->prepared_request));
         FetchRequest transport = {
             .allow_http_errors = true,
-            .accept = "video/mp4,video/*;q=0.9,*/*;q=0.5",
+            .accept = range->audio_only
+                ? "audio/mp4,audio/aac;q=0.9,audio/*;q=0.8,*/*;q=0.5"
+                : "video/mp4,video/*;q=0.9,*/*;q=0.5",
             .user_agent = MEDIA_HTTP_USER_AGENT,
             .connect_timeout_ms = range->connect_timeout_ms,
             .redirect_same_origin_only = true
@@ -2007,6 +2013,15 @@ MediaRangeReader media_http_range_reader(MediaHttpRange *range)
         .resident = range_resident,
         .describe_failure = range_describe_failure
     };
+}
+
+bool media_http_range_prefetch_metadata(MediaHttpRange *range)
+{
+    if (range == NULL) return false;
+    unsigned char ignored = 0;
+    MediaRangeReadStatus status = range_read_bounded(
+        range, 0, &ignored, 1u, false);
+    return status != MEDIA_RANGE_READ_FAILED;
 }
 
 /*

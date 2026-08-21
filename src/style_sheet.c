@@ -1070,6 +1070,13 @@ StyleParsedIrApplyResult stylesheet_add_parsed_ir_from_context(
     if (sheet == NULL || sheet->budget == NULL
         || sheet->source_rule_limit_end != 0
         || sheet->source_rule_head_limit_end != 0
+        || sheet->source_rule_secondary_limit_end != 0
+        || sheet->source_rule_relevant_limit_end != 0
+        || sheet->source_rule_priority_token_bloom != NULL
+        || sheet->source_rule_priority_token_bloom_words != 0
+        || sheet->source_rule_token_bloom != NULL
+        || sheet->source_rule_token_bloom_words != 0
+        || sheet->source_rule_tail_begin != NULL
         || !stylesheet_parsed_ir_validate(
                sheet, ir_data, ir_length, &header)) {
         return STYLE_PARSED_IR_REJECTED;

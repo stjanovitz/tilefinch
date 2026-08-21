@@ -502,8 +502,124 @@ static int test_cooperative_site_adapter_navigation(void)
           && strstr(
               browser_engine_navigation(engine)->page.document.title,
               "ratchet") != NULL);
+    ControllerAction compact_play = {0};
+    CHECK(browser_engine_activate(engine, &compact_play)
+          && compact_play.prefer_native_media
+          && browser_engine_focus_direction(
+                 engine, CONTROLLER_FOCUS_RIGHT));
+    ControllerAction compact_details = {0};
+    CHECK(browser_engine_activate(engine, &compact_details)
+          && !compact_details.prefer_native_media
+          && strcmp(compact_details.url, compact_play.url) == 0
+          && browser_engine_focus_direction(
+                 engine, CONTROLLER_FOCUS_LEFT));
+    ControllerAction compact_play_again = {0};
+    CHECK(browser_engine_activate(engine, &compact_play_again)
+          && compact_play_again.prefer_native_media
+          && strcmp(compact_play_again.url, compact_play.url) == 0
+          && browser_engine_focus_direction(
+                 engine, CONTROLLER_FOCUS_DOWN));
+    ControllerAction compact_next_play = {0};
+    bool compact_next_activated = browser_engine_activate(
+        engine, &compact_next_play);
+    CHECK(compact_next_activated
+          && compact_next_play.prefer_native_media
+          && strcmp(compact_next_play.url, compact_play.url) != 0);
     fetch_trace_end();
     remove_large_youtube_replay(large_fixture);
+
+    /* The provider's primary result action remains a canonical navigation URL
+       with an explicit native-media preference. A frontend without the native
+       route can ignore the hint and navigate; the adjacent Details action is
+       deliberately unmarked. */
+    static const char provider_actions[] =
+        "<!doctype html><title>Provider results</title>"
+        "<a autofocus data-tilefinch-provider-media "
+        "href='https://www.youtube.com/watch?v=TFTEST00001'>Play</a>"
+        "<a href='https://www.youtube.com/watch?v=TFTEST00001'>Details</a>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://www.youtube.com/results?search_query=fixture",
+        provider_actions, sizeof(provider_actions) - 1u, true));
+    const LayoutDocument *provider_layout =
+        &browser_engine_navigation(engine)->page.layout;
+    lxb_dom_node_t *provider_node = NULL;
+    for (size_t at = 0; at < provider_layout->link_count; at++) {
+        lxb_dom_node_t *node = provider_layout->links[at].node;
+        if (lxb_dom_element_has_attribute(
+                lxb_dom_interface_element(node),
+                (const lxb_char_t *) "data-tilefinch-provider-media",
+                sizeof("data-tilefinch-provider-media") - 1u)) {
+            provider_node = node;
+            break;
+        }
+    }
+    CHECK(provider_node != NULL
+          && browser_engine_focus_node(engine, provider_node));
+    ControllerAction provider_action = {0};
+    bool provider_activated = browser_engine_activate(engine, &provider_action);
+    if (!provider_activated
+        || provider_action.type != CONTROLLER_ACTION_NAVIGATE
+        || !provider_action.prefer_native_media
+        || strcmp(
+               provider_action.url,
+               "https://www.youtube.com/watch?v=TFTEST00001") != 0) {
+        fprintf(stderr,
+                "provider action: activated=%d type=%d native=%d url=%s\n",
+                provider_activated ? 1 : 0, (int) provider_action.type,
+                provider_action.prefer_native_media ? 1 : 0,
+                provider_action.url);
+    }
+    CHECK(provider_activated
+          && provider_action.type == CONTROLLER_ACTION_NAVIGATE
+          && provider_action.prefer_native_media
+          && strcmp(
+                 provider_action.url,
+                 "https://www.youtube.com/watch?v=TFTEST00001") == 0);
+    CHECK(browser_engine_focus_move(engine, true));
+    ControllerAction details_action = {0};
+    CHECK(browser_engine_activate(engine, &details_action)
+          && details_action.type == CONTROLLER_ACTION_NAVIGATE
+          && !details_action.prefer_native_media
+          && strcmp(details_action.url, provider_action.url) == 0);
+
+    /* Rapid Play/Details alternation must never turn the primary action into
+       a document navigation, and cancelling a Details navigation must leave
+       the result document and its controls immediately usable. Vary the
+       cancellation point across transport and adapter transformation. */
+    for (size_t cycle = 0; cycle < 16u; cycle++) {
+        CHECK(browser_engine_focus_node(engine, provider_node));
+        ControllerAction rapid_play = {0};
+        CHECK(browser_engine_activate(engine, &rapid_play)
+              && rapid_play.prefer_native_media
+              && strcmp(rapid_play.url, provider_action.url) == 0
+              && strcmp(browser_engine_navigation(engine)->page.document.title,
+                        "Provider results") == 0
+              && browser_engine_focus_move(engine, true));
+        ControllerAction rapid_details = {0};
+        CHECK(browser_engine_activate(engine, &rapid_details)
+              && !rapid_details.prefer_native_media
+              && strcmp(rapid_details.url, rapid_play.url) == 0
+              && fetch_trace_replay_begin(fixture, error, sizeof(error))
+              && browser_engine_begin_navigation_url(
+                     engine, rapid_details.url, 1u * MIB, 1000, false));
+        BrowserNavigationJobStatus rapid_status =
+            BROWSER_NAVIGATION_JOB_PENDING;
+        size_t slices = 1u + cycle % 6u;
+        for (size_t at = 0;
+             at < slices
+             && rapid_status == BROWSER_NAVIGATION_JOB_PENDING; at++) {
+            rapid_status = browser_engine_pump_navigation(engine, &quota);
+        }
+        CHECK(rapid_status == BROWSER_NAVIGATION_JOB_PENDING);
+        browser_engine_cancel_navigation(
+            engine, "rapid provider Details cancellation test");
+        CHECK(browser_engine_navigation_status(engine)
+                  == BROWSER_NAVIGATION_JOB_CANCELLED
+              && strcmp(browser_engine_navigation(engine)->page.document.title,
+                        "Provider results") == 0
+              && browser_engine_focus_node(engine, provider_node));
+        fetch_trace_end();
+    }
 
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);

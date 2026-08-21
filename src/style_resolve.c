@@ -68,6 +68,176 @@ static bool style_input_has_special_appearance(lxb_dom_node_t *node)
                || (length == 5 && strncasecmp(value, "range", 5) == 0));
 }
 
+static bool style_attribute_token_is(lxb_dom_node_t *node,
+                                     const char *name,
+                                     const char *wanted)
+{
+    size_t length = 0;
+    const char *value = document_attribute(node, name, &length);
+    size_t wanted_length = strlen(wanted);
+    if (value == NULL || wanted_length == 0) return false;
+    for (size_t at = 0; at < length;) {
+        while (at < length && isspace((unsigned char) value[at])) at++;
+        size_t start = at;
+        while (at < length && !isspace((unsigned char) value[at])) at++;
+        if (at - start == wanted_length
+            && memcmp(value + start, wanted, wanted_length) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool style_subtree_has_staged_text(lxb_dom_node_t *root)
+{
+    if (root == NULL) return false;
+    bool staged = false;
+    bool text = false;
+    lxb_dom_node_t *node = root->first_child;
+    for (size_t visited = 0; node != NULL && visited < 128u; visited++) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            /* A media carousel commonly has staged text in badges or chips,
+               but revealing the whole pane stacks its black/video surface
+               over the useful server-rendered introduction. */
+            if (style_tag_is(node, "video") || style_tag_is(node, "canvas")) {
+                return false;
+            }
+            if (style_attribute_token_is(node, "class", "opacity-0")) {
+                staged = true;
+            }
+            /* Script-built heroes also commonly stage their primary heading
+               by placing opacity:0 on an anonymous generated wrapper.  A
+               heading is stronger final-content evidence than a hashed class
+               name and avoids retaining a site-specific token table. */
+            if (style_tag_is(node, "h1")) staged = true;
+        } else if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t length = 0;
+            const char *value = document_text_data(node, &length);
+            for (size_t at = 0; value != NULL && at < length; at++) {
+                if (!isspace((unsigned char) value[at])) {
+                    text = true;
+                    break;
+                }
+            }
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        node = node == root ? NULL : node->next;
+    }
+    return staged && text;
+}
+
+static bool style_attribute_token_contains(lxb_dom_node_t *node,
+                                           const char *name,
+                                           const char *wanted)
+{
+    size_t length = 0;
+    const char *value = document_attribute(node, name, &length);
+    size_t wanted_length = wanted == NULL ? 0 : strlen(wanted);
+    if (value == NULL || wanted_length == 0) return false;
+    for (size_t at = 0; at < length;) {
+        while (at < length && isspace((unsigned char) value[at])) at++;
+        size_t end = at;
+        while (end < length && !isspace((unsigned char) value[end])) end++;
+        for (size_t i = at; i + wanted_length <= end; i++) {
+            if (strncasecmp(value + i, wanted, wanted_length) == 0) {
+                return true;
+            }
+        }
+        at = end;
+    }
+    return false;
+}
+
+static bool style_subtree_has_actionable_control(lxb_dom_node_t *root)
+{
+    if (root == NULL) return false;
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 128u; visited++) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            size_t ignored = 0;
+            if (style_tag_is(node, "button") || style_tag_is(node, "input")
+                || style_tag_is(node, "select")
+                || (style_tag_is(node, "a")
+                    && document_attribute(node, "href", &ignored) != NULL)) {
+                return true;
+            }
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        node = node == root ? NULL : node->next;
+    }
+    return false;
+}
+
+static bool style_subtree_has_primary_heading(lxb_dom_node_t *root)
+{
+    if (root == NULL) return false;
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 128u; visited++) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            if (style_tag_is(node, "video") || style_tag_is(node, "canvas")) {
+                return false;
+            }
+            if (style_tag_is(node, "h1")) return true;
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        node = node == root ? NULL : node->next;
+    }
+    return false;
+}
+
+static bool style_is_direct_main_child(lxb_dom_node_t *node)
+{
+    return node != NULL && node->parent != NULL
+        && style_tag_is(node->parent, "main");
+}
+
+/* When the bounded script realm is retired, server-rendered pages can retain
+   content staged behind the conventional opacity-0 utility while waiting for
+   JavaScript. Reveal that explicit utility and already-visible-parent images.
+   Selector-driven carousel panes, dialogs, and elevated fixed surfaces remain
+   hidden, so degradation exposes authored content without stacking slides. */
+static bool style_static_staged_content_reveals(
+    const Stylesheet *sheet, lxb_dom_node_t *node,
+    const ComputedStyle *parent, const ComputedStyle *style)
+{
+    if (sheet == NULL || node == NULL || style == NULL || style->opacity != 0
+        || style->display == DISPLAY_NONE || style->visibility_hidden
+        || style->hidden || (parent != NULL && parent->opacity == 0)) {
+        return false;
+    }
+    bool primary_heading = style_subtree_has_primary_heading(node);
+    if (!sheet->static_custom_element_fallback && !primary_heading) {
+        return false;
+    }
+    size_t ignored = 0;
+    if (document_attribute(node, "hidden", &ignored) != NULL
+        || style_attribute_token_is(node, "aria-hidden", "true")
+        || document_attribute(node, "aria-expanded", &ignored) != NULL
+        || style_tag_is(node, "dialog")) {
+        return false;
+    }
+    if (style->fixed_position && style->has_z_index && style->z_index > 0) {
+        return false;
+    }
+    if (style_tag_is(node, "img") || style_tag_is(node, "picture")) {
+        return true;
+    }
+    return style_attribute_token_is(node, "class", "opacity-0")
+        || style_subtree_has_staged_text(node);
+}
+
 static bool retained_modern_value(const Stylesheet *sheet,
                                   lxb_dom_node_t *node,
                                   const char *name,
@@ -935,11 +1105,29 @@ static ComputedStyle default_style(const Stylesheet *sheet,
            line layout. */
         style.display = DISPLAY_INLINE_BLOCK;
     }
-    if (NODE_TAG_IS("video") || NODE_TAG_IS("iframe")) {
+    if (NODE_TAG_IS("video") || NODE_TAG_IS("audio")
+        || NODE_TAG_IS("iframe")) {
         /* Both are replaced inline-level elements.  Hiding video in the
            historical UA defaults also hid its poster and made intrinsic
            media sizing impossible before playback began. */
         style.display = DISPLAY_INLINE_BLOCK;
+    }
+    if (NODE_TAG_IS("audio")) {
+        bool controls = lxb_dom_element_has_attribute(
+            lxb_dom_interface_element(node),
+            (const lxb_char_t *) "controls", 8);
+        style.display = controls ? DISPLAY_INLINE_BLOCK : DISPLAY_NONE;
+        if (controls) {
+            style.box_sizing_border_box = true;
+            style.has_background = true;
+            style.background = 0xe8eaed;
+            style.border = (StyleEdges) {1, 1, 1, 1};
+            style.border_color = 0x8a9099;
+            for (unsigned side = 0; side < STYLE_BORDER_SIDE_COUNT; side++) {
+                computed_style_set_border_line(
+                    &style, (StyleBorderSide) side, STYLE_BORDER_SOLID);
+            }
+        }
     }
     if (NODE_TAG_IS("input") || NODE_TAG_IS("textarea")
         || NODE_TAG_IS("select") || NODE_TAG_IS("button")) {
@@ -1439,9 +1627,29 @@ static void apply_paint_values(Stylesheet *sheet, ComputedStyle *style,
         if (incoming != NULL
             && (incoming->components
                 & STYLE_PAINT_COMPONENT_BACKGROUND_IMAGE) != 0) {
-            memcpy(merged.backgrounds, incoming->backgrounds,
-                   sizeof(merged.backgrounds));
-            merged.background_count = incoming->background_count;
+            /* background-image is an independent longhand.  Replacing its
+               comma-separated list must not replace background-clip,
+               origin, position, size, or repeat values won by other rules.
+               Repeat the existing geometry list to the new image count as
+               CSS list matching requires, then copy only image payloads.
+               When no earlier layer exists, the parser's layer supplies the
+               initial padding-box/border-box defaults. */
+            size_t old_count = merged.background_count;
+            size_t new_count = incoming->background_count;
+            for (size_t i = 0; i < new_count
+                               && i < STYLE_PAINT_LAYER_LIMIT; i++) {
+                StylePaintLayer layer = old_count != 0
+                    ? merged.backgrounds[i % old_count]
+                    : incoming->backgrounds[i];
+                layer.image = incoming->backgrounds[i].image;
+                layer.gradient = incoming->backgrounds[i].gradient;
+                layer.kind = incoming->backgrounds[i].kind;
+                merged.backgrounds[i] = layer;
+            }
+            for (size_t i = new_count; i < STYLE_PAINT_LAYER_LIMIT; i++) {
+                merged.backgrounds[i] = (StylePaintLayer) {0};
+            }
+            merged.background_count = (uint8_t) new_count;
             merged.components |= STYLE_PAINT_COMPONENT_BACKGROUND_IMAGE;
         } else {
             for (size_t i = 0; i < STYLE_PAINT_LAYER_LIMIT; i++) {
@@ -2255,6 +2463,16 @@ static void apply_style_rule(const Stylesheet *sheet, const StyleRule *rule,
          & STYLE_DEFERRED_LOGICAL) != 0) {
         style_record_logical_axes(sheet, style);
     }
+    if ((declaration->deferred_program_reserved
+         & STYLE_DECLARATION_ALL_INHERIT) != 0
+        && parent != NULL) {
+        /* CSS `all` excludes direction and unicode-bidi. Direction is the
+           only excluded value retained by this compact ComputedStyle. */
+        uint8_t direction = style->filter_code & STYLE_DIRECTION_RTL;
+        *style = *parent;
+        style->filter_code = (uint8_t) (
+            (style->filter_code & ~STYLE_DIRECTION_RTL) | direction);
+    }
     apply_values((Stylesheet *) sheet, style,
                  &declaration->values,
                  declaration->mask & ~revert_rule_mask,
@@ -2832,6 +3050,39 @@ ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
     if (style.has_transform && style.transform_scale_q6 == 0) {
         style.hidden = true;
     }
+    /* Script-built mobile headers often ship their complete, accessible
+       light DOM but hide it with a CSS-module `loading` token until the
+       optional application bundle mounts. If that bundle was shed, reveal
+       only a fixed actionable shell; ordinary spinners and modal content do
+       not satisfy this narrow fallback. */
+    if (sheet != NULL && sheet->static_custom_element_fallback
+        && style.display == DISPLAY_NONE && style.fixed_position
+        && style_attribute_token_contains(node, "class", "loading")
+        && style_subtree_has_actionable_control(node)) {
+        size_t ignored = 0;
+        if (document_attribute(node, "aria-hidden", &ignored) == NULL) {
+            style.display = DISPLAY_BLOCK;
+            if (style.opacity == 0) style.opacity = 255;
+        }
+    }
+    /* When script degradation is active, a primary server-rendered hero may
+       remain behind a script-controlled wrapper.  Reveal only a non-modal
+       wrapper containing an h1; successful pipelines preserve ordinary
+       responsive and dialog hiding semantics. */
+    if (sheet != NULL && style.display == DISPLAY_NONE && !style.fixed_position
+        && style_subtree_has_primary_heading(node)
+        && (sheet->static_custom_element_fallback
+            || style_is_direct_main_child(node))) {
+        size_t ignored = 0;
+        if (document_attribute(node, "hidden", &ignored) == NULL
+            && !style_attribute_token_is(node, "aria-hidden", "true")
+            && !style_tag_is(node, "dialog")) {
+            style.display = DISPLAY_BLOCK;
+            style.hidden = false;
+            style.visibility_hidden = false;
+            if (style.opacity == 0) style.opacity = 255;
+        }
+    }
     /* A common no-script/mobile bootstrap pattern stages a non-interactive
        full-viewport hero at display:none and opacity:0, then reveals it only
        after a script-side image preload. On a bounded runtime where that
@@ -2840,7 +3091,8 @@ ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
        backdrop as final-state content; modal/dialog surfaces normally carry a
        positive stacking level and do not match this narrow compatibility
        fallback. */
-    if (style.display == DISPLAY_NONE && style.opacity == 0
+    if (sheet != NULL && sheet->static_custom_element_fallback
+        && style.display == DISPLAY_NONE && style.opacity == 0
         && style.fixed_position && style.background_image_kind
                == STYLE_BACKGROUND_IMAGE_URL
         && style.background_image != NULL
@@ -2856,6 +3108,9 @@ ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
            their DOM-order tile content. */
         style.has_z_index = true;
         style.z_index = -1;
+    }
+    if (style_static_staged_content_reveals(sheet, node, parent, &style)) {
+        style.opacity = 255;
     }
     if (text_decoration_propagation_boundary(node, &style)) {
         style_set_ancestor_text_decoration(&style, false, 0);
@@ -3153,29 +3408,12 @@ static bool computed_style_equal_without_outline(
     return memcmp(&a, &b, sizeof(a)) == 0;
 }
 
-static bool focus_style_shadows_are_inset(
-    const Stylesheet *sheet, const ComputedStyle *style)
-{
-    if (style == NULL) return false;
-    size_t count = stylesheet_box_shadow_count(sheet, style);
-    for (size_t i = 0; i < count; i++) {
-        if (!style_box_shadow_is_inset(
-                stylesheet_box_shadow(sheet, style, i))) return false;
-    }
-    return true;
-}
-
-static bool focus_paint_equal_without_box_shadow(
+static bool focus_paint_equal(
     const Stylesheet *sheet, const ComputedStyle *left,
     const ComputedStyle *right)
 {
     StylePaintStack a = style_paint_stack_copy(sheet, left);
     StylePaintStack b = style_paint_stack_copy(sheet, right);
-    a.components &= (uint8_t) ~STYLE_PAINT_COMPONENT_BOX_SHADOW;
-    b.components &= (uint8_t) ~STYLE_PAINT_COMPONENT_BOX_SHADOW;
-    a.box_shadow_count = b.box_shadow_count = 0;
-    memset(a.box_shadows, 0, sizeof(a.box_shadows));
-    memset(b.box_shadows, 0, sizeof(b.box_shadows));
     return memcmp(&a, &b, sizeof(a)) == 0;
 }
 
@@ -3269,14 +3507,11 @@ StyleFocusChange style_focus_change_classify(
      * The retained display list can recolour a rounded border without
      * changing command geometry. Keep this list intentionally narrower than
      * the set of CSS paint properties: background, foreground, opacity,
-     * filters, transforms, outer shadows and every inherited field still
-     * force authoritative layout. Inset shadows are normalized only because
-     * layout_block.c explicitly retains-but-does-not-paint them; therefore
-     * enabled and disabled builds emit the same pixels for that part.
+     * filters, transforms, shadows and every inherited field still force
+     * authoritative layout. A changed shadow can add or remove a display-list
+     * command and therefore cannot use the in-place border recolour path.
      */
-    if (!focus_style_shadows_are_inset(sheet, normal)
-        || !focus_style_shadows_are_inset(sheet, focused)
-        || !focus_paint_equal_without_box_shadow(sheet, normal, focused)) {
+    if (!focus_paint_equal(sheet, normal, focused)) {
         return STYLE_FOCUS_CHANGE_UNSAFE;
     }
     ComputedStyle a = *normal, b = *focused;

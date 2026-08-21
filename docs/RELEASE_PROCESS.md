@@ -122,11 +122,16 @@ The script stops at the first failure. In order it:
    `.text` ratchets, staged fonts/TLS roots, and the staged
    notices tree. `cmake/StagePspInstall.cmake` fails this build if any
    file in `cmake/PspNoticesManifest.cmake` is missing.
-8. Independently re-checks every notices-manifest entry against the staged
+8. Scans both staged EBOOTs and fails if compiler-expanded strings disclose
+   the release builder's source tree or home directory. PSP builds map project,
+   dependency-build, and toolchain paths to stable virtual prefixes before
+   compilation; this check prevents a dependency or build-path change from
+   silently undoing that privacy boundary.
+9. Independently re-checks every notices-manifest entry against the staged
    tree, then packages `dist/tilefinch-v<version>/`: the install zip, the
    unsigned TFUP built from the staged `slot-a` (so first-install and
    update bytes are identical), `SHA256SUMS.txt`, and `RELEASE-INFO.txt`.
-9. Prints the remaining manual steps and exits. It never signs, tags,
+10. Prints the remaining manual steps and exits. It never signs, tags,
    or publishes.
 
 The normal release deliberately contains no voice model. The independent

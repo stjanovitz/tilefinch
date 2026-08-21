@@ -2339,6 +2339,31 @@ static bool test_parsed_ir_is_viewport_bound_and_fails_closed(void)
     return ok && clean;
 }
 
+static bool test_complete_selector_census_reopens_retained_sources_once(void)
+{
+    BrowserSharedBody retained = {0};
+    StylesheetDocumentResources resources = {0};
+    resources.count = 2;
+    resources.final_resample_required = true;
+    resources.items[0].state = STYLESHEET_DOCUMENT_RESOURCE_LOADED;
+    resources.items[0].body = &retained;
+    resources.items[0].response_provenance_known = true;
+    resources.items[0].rules_applied = true;
+    resources.items[1].state = STYLESHEET_DOCUMENT_RESOURCE_LOADED;
+    resources.items[1].body = &retained;
+    resources.items[1].response_provenance_known = false;
+    resources.items[1].rules_applied = true;
+    bool rebuild = stylesheet_document_resources_prepare_complete_census(
+        &resources);
+    bool second = stylesheet_document_resources_prepare_complete_census(
+        &resources);
+    return rebuild && !second && resources.selector_census_complete
+        && resources.final_resample_completed
+        && !resources.final_resample_required
+        && !resources.items[0].rules_applied
+        && resources.items[1].rules_applied;
+}
+
 int main(void)
 {
 #define RUN_TEST(test) do {                                                  \
@@ -2373,6 +2398,7 @@ int main(void)
     RUN_TEST(test_pressure_skipped_sheet_preserves_later_byte_quota);
     RUN_TEST(test_compiled_fragment_reuses_external_css_with_new_inline_css);
     RUN_TEST(test_parsed_ir_is_viewport_bound_and_fails_closed);
+    RUN_TEST(test_complete_selector_census_reopens_retained_sources_once);
 #undef RUN_TEST
     puts("stylesheet resource tests passed");
     return 0;

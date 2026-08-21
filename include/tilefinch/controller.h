@@ -42,6 +42,15 @@ typedef enum {
 
 typedef struct {
     ControllerActionType type;
+    /* An engine-authored adapter may mark a normal navigation link as a
+       request for the platform's native provider player. The URL remains the
+       canonical web URL; frontends which do not implement the native route
+       can execute the action as an ordinary navigation. */
+    bool prefer_native_media;
+    /* True for authored page audio or a high-confidence structured audio
+       preview. The platform route uses the same player lifecycle, controls,
+       clock, and seek machinery as video, but opens only the AAC/MP4 track. */
+    bool media_audio_only;
     char url[NAVIGATION_URL_LIMIT];
     char method[8];
     char content_type[64];
@@ -101,6 +110,12 @@ typedef struct {
     size_t authored_focus_relayout_generation;
     int viewport_height;
     int focus_margin;
+    /* Activation scratch, rebuilt immediately before every structured-media
+       fallback. Candidate spans point into live DOM text and are never reused
+       across activations because author script may destroy that storage. */
+    MediaStructuredAudioIndex structured_audio;
+    size_t structured_audio_matched_activations;
+    size_t structured_audio_ambiguous_rejections;
 } BrowserController;
 
 typedef struct {

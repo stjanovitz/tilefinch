@@ -8,6 +8,21 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.7 — 2026-08-21
+
+- Improved mobile page fidelity across responsive headers, forms, flex and
+  grid layouts, inline SVG, layered backgrounds, and script-staged static
+  content.
+- Added generic structured-audio discovery and native playback for authored
+  page audio without requiring full application hydration.
+- Improved script compatibility with inline event handlers, cursor hover
+  events, correct `nomodule` handling, and soft degradation when optional
+  scripts cannot run.
+- Hardened flex arithmetic, media-candidate lifetimes, audio-only range
+  requests, and media lifecycle transitions under PSP memory limits.
+- Added reproducible mobile-viewport capture tools and release checks that
+  prevent local build paths from leaking into PSP artifacts.
+
 ## 0.1.6 — 2026-08-20
 
 - Improved YouTube playback, seeking, navigation, buffering recovery, and

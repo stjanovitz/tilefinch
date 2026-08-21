@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_RESOURCE, (s))
@@ -1077,7 +1078,18 @@ static bool builtin_fallback_supported(unsigned codepoint)
 {
     return font_codepoint_default_ignorable(codepoint)
         || builtin_hangul_syllable(codepoint)
+        /* A tiny procedural fallback for the navigation/search subset used
+           by common web icon fonts. It keeps critical mobile controls
+           legible while their optional WOFF is still loading. */
+        || codepoint == 0xe0d5u || codepoint == 0xe700u
+        || codepoint == 0xe70du || codepoint == 0xe721u
         || builtin_bitmap_lookup(codepoint, NULL);
+}
+
+static bool builtin_navigation_icon(unsigned codepoint)
+{
+    return codepoint == 0xe0d5u || codepoint == 0xe700u
+        || codepoint == 0xe70du || codepoint == 0xe721u;
 }
 
 static bool optional_fallback_advance_fixed(unsigned codepoint,
@@ -1147,6 +1159,10 @@ static bool builtin_fallback_advance_fixed(unsigned codepoint,
         return true;
     }
     if (builtin_hangul_syllable(codepoint)) {
+        *advance = pixel_height_fixed + (bold ? 22 : 0);
+        return true;
+    }
+    if (builtin_navigation_icon(codepoint)) {
         *advance = pixel_height_fixed + (bold ? 22 : 0);
         return true;
     }
@@ -1292,12 +1308,68 @@ static bool builtin_bitmap_glyph(const FontFace *face, unsigned codepoint,
     return true;
 }
 
+static bool builtin_navigation_icon_glyph(
+    const FontFace *face, unsigned codepoint, int pixel_height_fixed,
+    bool bold, FontGlyph *glyph)
+{
+    if (face == NULL || glyph == NULL
+        || !builtin_navigation_icon(codepoint)) return false;
+    int side = (pixel_height_fixed + 63) / 64;
+    if (side < 8) side = 8;
+    if (side > TILEFINCH_FONT_RASTER_PIXEL_LIMIT)
+        side = TILEFINCH_FONT_RASTER_PIXEL_LIMIT;
+    size_t bytes = (size_t) side * (size_t) side;
+    unsigned char *pixels = budget_calloc(face->budget, bytes, 1);
+    if (pixels == NULL) return false;
+    int thickness = bold ? 2 : 1;
+    for (int y = 0; y < side; y++) {
+        int sy = y * 16 / side;
+        for (int x = 0; x < side; x++) {
+            int sx = x * 16 / side;
+            bool mark = false;
+            if (codepoint == 0xe700u) {
+                mark = sx >= 2 && sx <= 13
+                    && (abs(sy - 4) <= thickness - 1
+                        || abs(sy - 8) <= thickness - 1
+                        || abs(sy - 12) <= thickness - 1);
+            } else if (codepoint == 0xe721u) {
+                int dx = sx - 6;
+                int dy = sy - 6;
+                int distance = dx * dx + dy * dy;
+                mark = (distance >= 12 && distance <= 25)
+                    || (sx >= 9 && sy >= 9 && abs(sx - sy) <= thickness);
+            } else if (codepoint == 0xe70du) {
+                mark = sy >= 5 && sy <= 10
+                    && (abs((sx - 3) - (sy - 5)) <= thickness
+                        || abs((13 - sx) - (sy - 5)) <= thickness);
+            } else {
+                mark = sx >= 4 && sx <= 11
+                    && (abs((sy - 8) - (sx - 7)) <= thickness
+                        || abs((8 - sy) - (sx - 7)) <= thickness);
+            }
+            if (mark) pixels[(size_t) y * (size_t) side + (size_t) x] = 255;
+        }
+    }
+    glyph->pixels = pixels;
+    glyph->budget = face->budget;
+    glyph->width = side;
+    glyph->height = side;
+    glyph->x_offset = 0;
+    glyph->y_offset = -(side * 7) / 8;
+    glyph->advance_fixed = pixel_height_fixed + (bold ? 22 : 0);
+    glyph->advance = (glyph->advance_fixed + 32) / 64;
+    return true;
+}
+
 static bool builtin_fallback_glyph(const FontFace *face, unsigned codepoint,
                                    int pixel_height_fixed, bool bold,
                                    FontGlyph *glyph)
 {
     if (builtin_hangul_syllable(codepoint))
         return builtin_hangul_glyph(
+            face, codepoint, pixel_height_fixed, bold, glyph);
+    if (builtin_navigation_icon(codepoint))
+        return builtin_navigation_icon_glyph(
             face, codepoint, pixel_height_fixed, bold, glyph);
     return builtin_bitmap_glyph(
         face, codepoint, pixel_height_fixed, bold, glyph);

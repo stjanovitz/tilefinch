@@ -245,6 +245,50 @@ static const StylePropertyEntry *style_property_lookup(const char *name,
     while (written > 0 && normalized[written - 1] == ' ') written--;
     name = normalized;
     name_length = written;
+    /* Older mobile stylesheets commonly emit three flexbox generations in
+       declaration order. Map the 2012 vendor spellings onto the canonical
+       compact flex implementation so the last supported declaration wins,
+       without retaining a second layout model. Canonical properties stay on
+       the binary-search hot path; only vendor-prefixed names pay this small
+       bounded scan. */
+    if (name_length != 0 && name[0] == '-') {
+        static const StylePropertyEntry legacy_aliases[] = {
+            { "-webkit-flex", 12, style_property_flex },
+            { "-ms-flex", 8, style_property_flex },
+            { "-webkit-flex-direction", 22,
+              style_property_flex_direction },
+            { "-ms-flex-direction", 18, style_property_flex_direction },
+            { "-webkit-flex-wrap", 17, style_property_flex_wrap },
+            { "-ms-flex-wrap", 13, style_property_flex_wrap },
+            { "-webkit-flex-grow", 17, style_property_flex_grow },
+            { "-ms-flex-positive", 17, style_property_flex_grow },
+            { "-webkit-flex-shrink", 19, style_property_flex_shrink },
+            { "-ms-flex-negative", 17, style_property_flex_shrink },
+            { "-webkit-flex-basis", 18, style_property_flex_basis },
+            { "-ms-flex-preferred-size", 23, style_property_flex_basis },
+            { "-webkit-justify-content", 23,
+              style_property_justify_content },
+            { "-ms-flex-pack", 13, style_property_webkit_box_pack },
+            { "-webkit-align-items", 19, style_property_align_items },
+            { "-ms-flex-align", 14, style_property_webkit_box_align },
+            { "-webkit-align-self", 18, style_property_align_self },
+            { "-ms-flex-item-align", 19, style_property_align_self },
+            { "-webkit-align-content", 21, style_property_align_content },
+            { "-webkit-order", 13, style_property_order },
+            { "-ms-flex-order", 14, style_property_order },
+            { "-webkit-transform", 17, style_property_transform },
+            { "-webkit-transform-origin", 24,
+              style_property_transform_origin },
+            { "-webkit-box-shadow", 18, style_property_box_shadow },
+            { "-webkit-box-sizing", 18, style_property_box_sizing }
+        };
+        for (size_t at = 0;
+             at < sizeof(legacy_aliases) / sizeof(legacy_aliases[0]); at++) {
+            const StylePropertyEntry *entry = &legacy_aliases[at];
+            if (name_length == entry->name_length
+                && memcmp(name, entry->name, name_length) == 0) return entry;
+        }
+    }
     size_t low = 0;
     size_t high = sizeof(style_property_table)
                   / sizeof(style_property_table[0]);

@@ -401,11 +401,16 @@ static int intrinsic_replaced_width(
         ? image_resource_intrinsic_width(image) : 0;
     int natural_height = image_resource_available(image)
         ? image_resource_intrinsic_height(image) : 0;
+    bool audio_controls = layout_node_name_is(node, "audio")
+        && lxb_dom_element_has_attribute(
+               lxb_dom_interface_element(node),
+               (const lxb_char_t *) "controls", 8u);
     if (natural_width <= 0
         && (layout_node_name_is(node, "video")
+            || audio_controls
             || layout_node_name_is(node, "iframe"))) {
         natural_width = 300;
-        natural_height = 150;
+        natural_height = audio_controls ? 54 : 150;
     }
     if (natural_width <= 0) {
         size_t length = 0;
@@ -548,7 +553,8 @@ static bool intrinsic_wraps_single_atomic(
                 || style.display == DISPLAY_INLINE_GRID
                 || layout_node_name_is(child, "img")
                 || layout_node_name_is(child, "svg")
-                || layout_node_name_is(child, "video");
+                || layout_node_name_is(child, "video")
+                || layout_node_name_is(child, "audio");
         if (!found) return false;
     }
     return found;
@@ -718,6 +724,7 @@ static int intrinsic_text_width_impl(LayoutContext *context,
     }
     if (layout_node_name_is(node, "img") || layout_node_name_is(node, "svg")
         || layout_node_name_is(node, "video")
+        || layout_node_name_is(node, "audio")
         || layout_node_name_is(node, "iframe")) {
         int replaced_width = intrinsic_replaced_width(
             context, node, &style);
@@ -853,7 +860,8 @@ static int intrinsic_text_width_impl(LayoutContext *context,
                 || child_style.display == DISPLAY_INLINE_GRID
                 || layout_node_name_is(child, "img")
                 || layout_node_name_is(child, "svg")
-                || layout_node_name_is(child, "video");
+                || layout_node_name_is(child, "video")
+                || layout_node_name_is(child, "audio");
         }
         bool leading_space = false, trailing_space = false;
         bool child_has_text = false;
@@ -1097,6 +1105,7 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
     }
     if (layout_node_name_is(node, "img") || layout_node_name_is(node, "svg")
         || layout_node_name_is(node, "video")
+        || layout_node_name_is(node, "audio")
         || layout_node_name_is(node, "iframe")) {
         int replaced_width = intrinsic_replaced_width(
             context, node, &style);
@@ -1870,7 +1879,13 @@ int flex_child_basis(LayoutContext *context, const FlatItem *item,
         context, item->node, &item->parent_style, child_style,
         content_width, basis - margins, NULL) + margins;
     if (basis < 8) basis = 8;
-    if (basis > content_width) basis = content_width;
+    /* A definite flex base can legitimately overflow a smaller nowrap
+       container; flex shrink and the automatic minimum decide whether it may
+       contract. Wrapped lines do not run that container-wide shrink pass,
+       however, so retain the historical per-line bound there. Without it a
+       content-box `width:100%` item plus padding can overflow the viewport. */
+    if ((!explicit_size || item->parent_style.flex_wrap)
+        && basis > content_width) basis = content_width;
     return basis;
 }
 
@@ -1888,16 +1903,52 @@ static int flex_child_minimum(LayoutContext *context, const FlatItem *item,
            minimum for clip, while hidden/auto/scroll suppress it. */
         if (style->overflow_x_scroll
             && !style->overflow_x_clip_only) return 0;
-        int minimum = intrinsic_min_text_width_internal(
-            context, item->node, &item->parent_style, content_width, true);
-        if (style->has_width && !style->width_max_content) {
-            int margins = style->margin.left + style->margin.right;
-            int edges = style->padding.left + style->padding.right
-                        + style->border.left + style->border.right;
-            int specified = resolve_declared_length(
-                context->sheet, style->width, style->width_percent,
-                content_width) + margins;
+        int margins = style->margin.left + style->margin.right;
+        int edges = style->padding.left + style->padding.right
+                    + style->border.left + style->border.right;
+        int specified = 0;
+        bool definite_width = style->has_width && !style->width_percent
+            && !style->width_max_content;
+        if (definite_width) {
+            specified = resolve_declared_length(
+                context->sheet, style->width, false, content_width)
+                + margins;
             if (!style->box_sizing_border_box) specified += edges;
+        }
+        /* A flex item's definite width remains its automatic minimum even
+           when padding on the parent leaves a smaller nominal content box.
+           Measure through that width so fixed-size replaced controls (for
+           example SVG icons) can overflow the content box instead of being
+           silently squeezed below their authored size. */
+        int measurement_limit = content_width;
+        if (definite_width && specified > measurement_limit) {
+            measurement_limit = specified;
+        }
+        int minimum = intrinsic_min_text_width_internal(
+            context, item->node, &item->parent_style,
+            measurement_limit, true);
+        bool replaced = layout_node_name_is(item->node, "img")
+            || layout_node_name_is(item->node, "svg")
+            || layout_node_name_is(item->node, "video")
+            || layout_node_name_is(item->node, "iframe");
+        /* An unloaded image or inline SVG can have no independently known
+           intrinsic width even though its authored definite width reserves
+           real geometry. In that one replaced-element case, the specified
+           size is the only automatic-minimum suggestion; permitting a zero
+           content suggestion squeezes fixed icons into the parent's leftover
+           content width. Replaced content with a known natural width keeps
+           the usual min(content suggestion, specified suggestion) rule. */
+        if (definite_width && replaced
+            && intrinsic_replaced_width(context, item->node, style) <= 0) {
+            minimum = specified;
+        }
+        if (style->has_width && !style->width_max_content) {
+            if (!definite_width) {
+                specified = resolve_declared_length(
+                    context->sheet, style->width, style->width_percent,
+                    content_width) + margins;
+                if (!style->box_sizing_border_box) specified += edges;
+            }
             if (minimum > specified) minimum = specified;
         }
         return minimum;
@@ -1941,11 +1992,17 @@ FlexLineMetrics flex_line_metrics(LayoutContext *context,
         }
         int basis = flex_child_basis(context, item, content_width);
         int occupied = metrics.basis;
-        if (metrics.count != 0) occupied += gap * (int) metrics.count;
-        if (metrics.count != 0 && occupied + basis > content_width) break;
+        if (metrics.count != 0) {
+            int gaps = layout_clamp_coordinate(
+                (int64_t) gap * (int64_t) metrics.count);
+            occupied = layout_add_coordinate(occupied, gaps);
+        }
+        if (metrics.count != 0
+            && layout_add_coordinate(occupied, basis) > content_width) break;
         metrics.count++;
-        metrics.basis += basis;
-        metrics.grow += item->style.flex_grow;
+        metrics.basis = layout_add_coordinate(metrics.basis, basis);
+        metrics.grow = layout_add_coordinate(
+            metrics.grow, item->style.flex_grow);
         if (item->style.margin_left_auto) metrics.auto_main_margins++;
         if (item->style.margin_right_auto) metrics.auto_main_margins++;
     }

@@ -63,6 +63,8 @@ int main(void)
           && cookie_length == strlen(cookie_css)
           && strstr(cookie_css, "#onetrust-banner-sdk") != NULL
           && strstr(cookie_css, "sp_message_container_") != NULL
+          && strstr(cookie_css, "dialog.cookie-policy") != NULL
+          && strstr(cookie_css, "[data-cookie-policy]") != NULL
           && strstr(cookie_css, ":is([data-testid=") != NULL
           && strstr(cookie_css, "overflow:auto!important") != NULL
           && strstr(cookie_css, "accept") == NULL);

@@ -112,6 +112,28 @@ static int test_web_runtime(void)
     image_resource_free_decoded(&budget, webp_pixel);
     CHECK(budget.current == 0);
 
+#if !defined(TILEFINCH_DISABLE_GIF)
+    puts("test: bounded heap-backed GIF first-frame decode");
+    static const unsigned char tiny_gif[] = {
+        0x47,0x49,0x46,0x38,0x39,0x61,0x01,0x00,0x01,0x00,0x80,0x00,
+        0x00,0x00,0x00,0x00,0xff,0xff,0xff,0x2c,0x00,0x00,0x00,0x00,
+        0x01,0x00,0x01,0x00,0x00,0x02,0x01,0x4c,0x00,0x3b
+    };
+    ImageResource gif_image = {
+        .encoded = (unsigned char *) tiny_gif,
+        .encoded_length = sizeof(tiny_gif),
+        .source_width = 1,
+        .source_height = 1,
+        .width = 1,
+        .height = 1
+    };
+    unsigned char *gif_pixel = image_resource_decode(&gif_image, &budget);
+    CHECK(gif_pixel != NULL && budget_usable_size(gif_pixel) == 4
+          && gif_pixel[3] == 255);
+    image_resource_free_decoded(&budget, gif_pixel);
+    CHECK(budget.current == 0);
+#endif
+
     puts("test: layout-sized priority raster decode");
     static const char layout_sized_page[] =
         "<!doctype html><body><img id=thumb width=1 height=1 "

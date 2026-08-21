@@ -400,6 +400,12 @@ static size_t css_selector_item_end(const char *text, size_t length,
         if (quote != 0) {
             if (character == '\\' && at + 1 < length) at++;
             else if (character == quote) quote = 0;
+        } else if (character == '\\' && at + 1 < length) {
+            /* Utility-class selectors escape commas inside their literal
+               class token (for example clamp(...\,...)). They are not
+               selector-list separators. Keep the escape pair intact for the
+               matcher and skip its punctuation here. */
+            at++;
         } else if (character == '\'' || character == '"') {
             quote = character;
         } else if (character == '(') {

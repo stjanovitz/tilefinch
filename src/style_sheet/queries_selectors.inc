@@ -159,7 +159,7 @@ static bool media_clause_matches(const Stylesheet *sheet,
     if (strstr(query, "print") != NULL && strstr(query, "screen") == NULL
         && strstr(query, "notprint") == NULL) return false;
     if (strstr(query, "prefers-color-scheme:dark") != NULL
-        || strstr(query, "prefers-reduced-motion:reduce") != NULL
+        || strstr(query, "prefers-reduced-motion:no-preference") != NULL
         || (strstr(query, "prefers-contrast:") != NULL
             && strstr(query, "prefers-contrast:no-preference") == NULL)
         || strstr(query, "forced-colors:active") != NULL
@@ -737,7 +737,8 @@ static bool prepare_rule_declarations(
             sheet->has_container_relative_units = true;
         }
         if (masks[slot] == 0 && masks_high[slot] == 0
-            && !deferred.deferred[slot]) continue;
+            && !deferred.deferred[slot]
+            && !deferred.all_inherit[slot]) continue;
         uint8_t image_source_slot =
             sheet->resolve_scratch->current_image_source_slot;
         if (deferred.deferred[slot]
@@ -778,6 +779,10 @@ static bool prepare_rule_declarations(
         if (deferred.ch_relative[slot]) {
             stored->deferred_program_reserved |= STYLE_DEFERRED_CH;
         }
+        if (deferred.all_inherit[slot]) {
+            stored->deferred_program_reserved |=
+                STYLE_DECLARATION_ALL_INHERIT;
+        }
         parsed->declaration_indices[important] = declaration_index;
         parsed->image_source_slots[important] = image_source_slot;
         parsed->has_rules[important] = true;
@@ -789,6 +794,252 @@ static bool prepare_rule_declarations(
            & ~important_concrete_mask_high);
     parsed->prepared = true;
     return true;
+}
+
+static bool style_selector_admission_contains(
+    const char *selector, size_t length, const char *needle)
+{
+    size_t needle_length = strlen(needle);
+    if (needle_length == 0 || needle_length > length) return false;
+    for (size_t at = 0; at <= length - needle_length; at++) {
+        size_t matched = 0;
+        while (matched < needle_length
+               && tolower((unsigned char) selector[at + matched])
+                   == tolower((unsigned char) needle[matched])) matched++;
+        if (matched == needle_length) return true;
+    }
+    return false;
+}
+
+static bool style_selector_admission_has_root_pseudo(
+    const char *selector, size_t length)
+{
+    if (selector == NULL) return false;
+    unsigned bracket_depth = 0;
+    unsigned char quote = 0;
+    bool escaped = false;
+    for (size_t at = 0; at < length; at++) {
+        unsigned char value = (unsigned char) selector[at];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (value == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (quote != 0) {
+            if (value == quote) quote = 0;
+            continue;
+        }
+        if (value == '\'' || value == '"') {
+            quote = value;
+            continue;
+        }
+        if (value == '[') {
+            bracket_depth++;
+            continue;
+        }
+        if (value == ']' && bracket_depth != 0) {
+            bracket_depth--;
+            continue;
+        }
+        if (bracket_depth != 0 || value != ':' || length - at < 5u) {
+            continue;
+        }
+        static const char root[] = "root";
+        size_t matched = 0;
+        while (matched < sizeof(root) - 1u
+               && tolower((unsigned char) selector[at + 1u + matched])
+                    == root[matched]) matched++;
+        if (matched != sizeof(root) - 1u) continue;
+        size_t after = at + sizeof(root);
+        if (after == length) return true;
+        unsigned char next = (unsigned char) selector[after];
+        if (!(next >= 0x80u || isalnum(next) || next == '_'
+              || next == '-')) return true;
+    }
+    return false;
+}
+
+static size_t style_selector_admission_decode_token(
+    const char *selector, size_t length, size_t *at,
+    unsigned char *decoded, size_t capacity)
+{
+    size_t written = 0;
+    while (*at < length && written < capacity) {
+        unsigned char value = (unsigned char) selector[*at];
+        if (value == '\\') {
+            (*at)++;
+            if (*at == length || selector[*at] == '\n'
+                || selector[*at] == '\r') break;
+            unsigned codepoint = 0;
+            size_t digits = 0;
+            while (*at < length && digits < 6
+                   && isxdigit((unsigned char) selector[*at])) {
+                unsigned char digit = (unsigned char) selector[(*at)++];
+                codepoint = codepoint * 16u
+                    + (isdigit(digit)
+                        ? (unsigned) (digit - '0')
+                        : (unsigned) (tolower(digit) - 'a' + 10));
+                digits++;
+            }
+            if (digits == 0) {
+                decoded[written++] = (unsigned char) selector[(*at)++];
+                continue;
+            }
+            if (*at < length && isspace((unsigned char) selector[*at])) {
+                (*at)++;
+            }
+            if (codepoint <= 0x7f && written < capacity) {
+                decoded[written++] = (unsigned char) codepoint;
+            } else if (codepoint <= 0x7ff && capacity - written >= 2u) {
+                decoded[written++] = (unsigned char) (0xc0 | (codepoint >> 6));
+                decoded[written++] = (unsigned char) (0x80 | (codepoint & 63));
+            } else if (codepoint <= 0xffff && capacity - written >= 3u) {
+                decoded[written++] = (unsigned char) (0xe0 | (codepoint >> 12));
+                decoded[written++] = (unsigned char) (
+                    0x80 | ((codepoint >> 6) & 63));
+                decoded[written++] = (unsigned char) (0x80 | (codepoint & 63));
+            } else if (codepoint <= 0x10ffff
+                       && capacity - written >= 4u) {
+                decoded[written++] = (unsigned char) (0xf0 | (codepoint >> 18));
+                decoded[written++] = (unsigned char) (
+                    0x80 | ((codepoint >> 12) & 63));
+                decoded[written++] = (unsigned char) (
+                    0x80 | ((codepoint >> 6) & 63));
+                decoded[written++] = (unsigned char) (0x80 | (codepoint & 63));
+            } else {
+                return 0;
+            }
+            continue;
+        }
+        if (!(value >= 0x80 || isalnum(value)
+              || value == '_' || value == '-')) break;
+        decoded[written++] = value;
+        (*at)++;
+    }
+    return written;
+}
+
+static uint32_t style_selector_admission_token_hash(
+    unsigned char kind, const unsigned char *text, size_t length)
+{
+    uint32_t hash = UINT32_C(2166136261) ^ kind;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char value = text[i];
+        if (kind == 't') value = (unsigned char) tolower(value);
+        hash ^= value;
+        hash *= UINT32_C(16777619);
+    }
+    return hash;
+}
+
+static bool style_selector_admission_token_present(
+    const uint32_t *bloom, size_t bloom_words, unsigned char kind,
+    const unsigned char *text, size_t length)
+{
+    if (bloom == NULL || bloom_words == 0
+        || text == NULL || length == 0) return false;
+    size_t bits = bloom_words * 32u;
+    uint32_t hash = style_selector_admission_token_hash(kind, text, length);
+    uint32_t rotated = (hash << 13) | (hash >> 19);
+    size_t first = (size_t) hash & (bits - 1u);
+    size_t second = (size_t) (rotated ^ UINT32_C(0x9e3779b9))
+        & (bits - 1u);
+    return (bloom[first / 32u]
+                & (UINT32_C(1) << (first & 31u))) != 0
+        && (bloom[second / 32u]
+                & (UINT32_C(1) << (second & 31u))) != 0;
+}
+
+static bool style_selector_admission_matches_document_tokens(
+    const uint32_t *bloom, size_t bloom_words,
+    const char *selector, size_t length)
+{
+    if (selector == NULL || bloom == NULL || bloom_words == 0) return false;
+    /* Root custom properties and document-wide defaults are dependencies of
+       later retained rules, even though :root carries no class or ID token.
+       Keep that small foundational selector rather than admitting universal
+       reset lists wholesale. */
+    if (style_selector_admission_has_root_pseudo(selector, length)) {
+        return true;
+    }
+    /* Functional selector lists cannot use the ordinary all-tokens test:
+       only one :is() arm need match, and a missing :not() token can still
+       make the selector true. They can still be rejected safely when none
+       of their class/ID tokens exists in the document. Any actual match of
+       such a selector necessarily contributes at least one present token;
+       tokenless functional selectors stay conservative below. This avoids
+       modern utility bundles spending the entire relevant-rule allowance on
+       absent :where() helpers near the start of a large sheet. */
+    bool functional =
+        style_selector_admission_contains(selector, length, ":not(")
+        || style_selector_admission_contains(selector, length, ":is(")
+        || style_selector_admission_contains(selector, length, ":where(")
+        || style_selector_admission_contains(selector, length, ":has(");
+    unsigned char decoded[STYLE_SELECTOR_CAPACITY];
+    size_t checked = 0;
+    size_t square = 0;
+    char quote = 0;
+    bool compound_start = true;
+    for (size_t at = 0; at < length;) {
+        unsigned char value = (unsigned char) selector[at];
+        if (quote != 0) {
+            if (value == '\\' && at + 1u < length) at += 2u;
+            else {
+                if (value == (unsigned char) quote) quote = 0;
+                at++;
+            }
+            continue;
+        }
+        if (value == '\'' || value == '"') {
+            quote = (char) value;
+            at++;
+            continue;
+        }
+        if (value == '[') { square++; compound_start = false; at++; continue; }
+        if (value == ']' && square != 0) { square--; at++; continue; }
+        if (square != 0) {
+            at++;
+            continue;
+        }
+        if (isspace(value) || value == '>' || value == '+' || value == '~') {
+            compound_start = true;
+            at++;
+            continue;
+        }
+        unsigned char kind = 0;
+        if (value == '.' || value == '#') {
+            kind = value;
+            compound_start = false;
+            at++;
+        } else if (compound_start
+                   && (value == '\\' || value == '_' || value == '-'
+                       || value >= 0x80 || isalpha(value))) {
+            kind = 't';
+            compound_start = false;
+        } else {
+            /* A pseudo, attribute, or universal selector consumes the type
+               position in this compound. Pseudo-function internals remain
+               under the conservative functional-selector rule above. */
+            if (value == ':' || value == '*') compound_start = false;
+            at++;
+            continue;
+        }
+        size_t token_length = style_selector_admission_decode_token(
+            selector, length, &at, decoded, sizeof(decoded));
+        if (token_length == 0) continue;
+        checked++;
+        bool present = style_selector_admission_token_present(
+            bloom, bloom_words, kind, decoded, token_length);
+        if (functional) {
+            if (present) return true;
+        } else if (!present) {
+            return false;
+        }
+    }
+    return functional ? checked == 0 : checked != 0;
 }
 
 static bool selector_to_rule(
@@ -804,10 +1055,25 @@ static bool selector_to_rule(
         size_t head_limit = sheet->source_rule_head_limit_end != 0
                             ? sheet->source_rule_head_limit_end
                             : sheet->source_rule_limit_end;
-        if (sheet->count >= head_limit
-            && (sheet->source_rule_tail_begin == NULL
-                || selector < sheet->source_rule_tail_begin
-                || sheet->count >= sheet->source_rule_limit_end)) {
+        bool priority =
+            sheet->count < sheet->source_rule_relevant_limit_end
+            && style_selector_admission_matches_document_tokens(
+                sheet->source_rule_priority_token_bloom,
+                sheet->source_rule_priority_token_bloom_words,
+                selector, length);
+        size_t secondary_limit =
+            sheet->source_rule_secondary_limit_end != 0
+            ? sheet->source_rule_secondary_limit_end
+            : sheet->source_rule_relevant_limit_end;
+        bool secondary = sheet->count < secondary_limit
+            && style_selector_admission_matches_document_tokens(
+                sheet->source_rule_token_bloom,
+                sheet->source_rule_token_bloom_words, selector, length);
+        bool relevant = priority || secondary;
+        bool in_tail = sheet->source_rule_tail_begin != NULL
+            && selector >= sheet->source_rule_tail_begin
+            && sheet->count < sheet->source_rule_limit_end;
+        if (sheet->count >= head_limit && !relevant && !in_tail) {
             diagnostic_saturating_add(&sheet->diagnostic_selector_drops, 1);
             return true;
         }
@@ -900,6 +1166,10 @@ static size_t find_matching_brace(const char *css, size_t open, size_t length)
             else if (css[i] == quote) quote = 0;
             continue;
         }
+        /* Escaped punctuation in generated selectors and declaration values
+           is syntax-neutral.  Without this, content:\"\" opens a phantom
+           quote and the matching-brace scan consumes the stylesheet suffix. */
+        if (css[i] == '\\' && i + 1 < length) { i++; continue; }
         if (css[i] == '\'' || css[i] == '"') { quote = css[i]; continue; }
         if (css[i] == '/' && i + 1 < length && css[i + 1] == '*') {
             i += 2;

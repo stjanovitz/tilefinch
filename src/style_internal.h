@@ -714,6 +714,9 @@ static inline void style_rule_set_container_query(StyleRule *rule,
 #define STYLE_DEFERRED_LOGICAL UINT16_C(4)
 #define STYLE_DEFERRED_DYNAMIC UINT16_C(8)
 #define STYLE_DEFERRED_CH UINT16_C(16)
+/* `all:inherit` changes the cascade baseline rather than one property bit.
+   Retain it on the compiled declaration without growing StyleDeclaration. */
+#define STYLE_DECLARATION_ALL_INHERIT UINT16_C(32)
 
 struct StyleDeferredInstruction {
     uint32_t value_offset;
@@ -947,7 +950,10 @@ uint64_t style_parse_box(const Stylesheet *sheet, const char *text, size_t lengt
 bool style_parse_background_size(const Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style);
 bool style_parse_background_shorthand_color(const Stylesheet *sheet, const char *text, size_t length, uint32_t *color, uint8_t *alpha, bool *transparent);
 bool style_parse_background_position(const Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style);
-bool style_parse_background_shorthand_image(Stylesheet *sheet, const char *text, size_t length, ComputedStyle *style);
+bool style_parse_background_shorthand_image(Stylesheet *sheet,
+                                            const char *text, size_t length,
+                                            ComputedStyle *style,
+                                            bool reset_geometry);
 bool style_parse_background_shorthand_position(
     const Stylesheet *sheet, const char *text, size_t length,
     ComputedStyle *style);

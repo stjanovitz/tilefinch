@@ -1625,7 +1625,10 @@ static bool layout_job_flow(LayoutBuildJob *job)
     LayoutContext *context = job->context;
     PositionedBox initial_positioned_box = {
         .node = NULL, .x = 0, .y = 0,
-        .width = job->viewport_width, .height = job->html_height
+        .width = job->viewport_width, .height = job->html_height,
+        .fixed_node = NULL, .fixed_x = 0, .fixed_y = 0,
+        .fixed_width = job->viewport_width,
+        .fixed_height = job->html_height
     };
     if (!layout_block(context, job->body, &job->html_style,
                       0, 0, job->viewport_width, job->html_height, false,
@@ -2101,7 +2104,9 @@ static bool layout_build_context_internal(
     int bottom = 0;
     PositionedBox initial_positioned_box = {
         .node = NULL,
-        .x = 0, .y = 0, .width = viewport_width, .height = html_height
+        .x = 0, .y = 0, .width = viewport_width, .height = html_height,
+        .fixed_node = NULL, .fixed_x = 0, .fixed_y = 0,
+        .fixed_width = viewport_width, .fixed_height = html_height
     };
     layout->performance.root_style_us =
         layout_performance_now_us() - phase_started_us;

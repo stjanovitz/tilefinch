@@ -83,7 +83,7 @@ cmake --build --preset sanitize
 
 The presets create `build-preset-dev`, `build-preset-release`, and
 `build-preset-sanitize`. `dev` uses `RelWithDebInfo`; `release` is an optimized
-host build and disables optional GIF support; `sanitize` enables
+host build; `sanitize` enables
 AddressSanitizer and UndefinedBehaviorSanitizer with frame pointers. It keeps
 the FFmpeg media backend in the gate but disables SDL audio output, avoiding
 SDL's Cocoa/LaunchServices bootstrap in dozens of parallel command-line tests.

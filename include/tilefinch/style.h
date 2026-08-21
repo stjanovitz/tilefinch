@@ -1772,13 +1772,18 @@ typedef struct {
     StyleRule *rules;
     size_t count;
     size_t capacity;
-    /* Zero normally. Resource ingestion gives very large individual sheets
-       a split head/tail rule ceiling so one generated utility bundle cannot
-       consume the layout reserve without discarding all late responsive and
-       component rules. Parsing continues between the retained windows; the
-       next source gets fresh bounds. */
+    /* Zero normally. Resource ingestion keeps a bounded head and tail from
+       very large sheets, then spends the middle allowance on selectors whose
+       simple class/ID tokens occur in the current DOM. The Bloom index can
+       only admit false positives; it never drops a present token. */
     size_t source_rule_limit_end;
     size_t source_rule_head_limit_end;
+    size_t source_rule_secondary_limit_end;
+    size_t source_rule_relevant_limit_end;
+    const uint32_t *source_rule_priority_token_bloom;
+    size_t source_rule_priority_token_bloom_words;
+    const uint32_t *source_rule_token_bloom;
+    size_t source_rule_token_bloom_words;
     const char *source_rule_tail_begin;
     /* When an author realm cannot finish within its bounded resources,
        unresolved custom-element light DOM remains useful static content.
@@ -2191,8 +2196,7 @@ typedef enum {
     /*
      * Geometry and every inherited/descendant-visible computed field are
      * unchanged. Only outline and a uniformly painted rounded border differ;
-     * inset shadows may also differ because Tilefinch deliberately does not
-     * emit them into the display list.
+     * all other paint commands, including inset shadows, are identical.
      */
     STYLE_FOCUS_CHANGE_BORDER_PAINT_ONLY
 } StyleFocusChange;

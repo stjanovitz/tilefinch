@@ -125,6 +125,11 @@ void document_allocation_owner_leave(const PocDocument *document,
 bool document_parse(PocDocument *document, Budget *budget,
                     const char *html, size_t html_length, size_t chunk_size);
 bool document_refresh(PocDocument *document);
+/* When a bounded script pass cannot start authored client-side UI, preserve
+   useful static content: materialize a server-authored header navigation or
+   replace a loading-only metadata-rich body with a small summary. Returns
+   true only when it changed the connected document. */
+bool document_install_static_shell_fallback(PocDocument *document);
 void document_note_connected_mutation(PocDocument *document);
 /* Lexbor's document-owned fragment parser is not reentrant with an active
    streaming parse.  This wrapper preserves the streaming parser while

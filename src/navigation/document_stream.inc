@@ -396,7 +396,11 @@ static void navigation_stream_preload_scan_tag(
             || navigation_span_equal(type, type_length, "text/javascript")
             || navigation_span_equal(
                 type, type_length, "application/javascript");
-        if (has_src && (classic || module)) {
+        const char *nomodule_value = NULL;
+        size_t nomodule_length = 0;
+        bool nomodule = navigation_preload_scan_attribute(
+            tag, length, "nomodule", &nomodule_value, &nomodule_length);
+        if (has_src && (module || (classic && !nomodule))) {
             char reference[2048];
             if (navigation_preload_decode_reference(
                     src, src_length, reference)) {
@@ -1452,6 +1456,40 @@ static void navigation_stream_release(NavigationDocumentStream *stream)
     budget_free(budget, stream);
 }
 
+static void navigation_stream_shed_optional_work(
+    NavigationDocumentStream *stream, const char *reason,
+    bool shed_resources)
+{
+    if (stream == NULL || stream->optional_work_shed) return;
+    NavigationSession *session = stream->session;
+    if (stream->runtime != NULL) {
+        script_runtime_set_synchronous_layout_callback(
+            stream->runtime, NULL, NULL);
+        script_runtime_destroy(stream->runtime);
+        stream->runtime = NULL;
+    }
+    if (shed_resources) {
+        fetch_scheduler_destroy(stream->scheduler);
+        stream->scheduler = NULL;
+        for (size_t i = 0; i < stream->preload_count; i++) {
+            NavigationPreload *preload = &stream->preloads[i];
+            if (!preload->complete) {
+                preload->request_id = 0;
+                preload->complete = true;
+                if (session != NULL) session->preloads_deferred++;
+            }
+        }
+    }
+    stream->script_disabled_after_failure = true;
+    stream->optional_work_shed = true;
+    stream->script_result.success = false;
+    snprintf(stream->script_result.summary,
+             sizeof(stream->script_result.summary), "%s",
+             reason == NULL ? "Optional page work stopped at its memory limit"
+                            : reason);
+    if (session != NULL) session->performance.optional_work_sheds++;
+}
+
 static bool navigation_stream_prepare_runtime(NavigationDocumentStream *stream,
                                               bool create_runtime)
 {
@@ -1461,6 +1499,7 @@ static bool navigation_stream_prepare_runtime(NavigationDocumentStream *stream,
     bool needs_scheduler = needs_runtime
                            || session->external_resources_enabled
                            || session->web_fonts_enabled;
+    if (stream->optional_work_shed) return true;
     if (stream->scheduler == NULL && needs_scheduler) {
         size_t maximum_file = navigation_stream_maximum_file_bytes(session);
         /* Every request reserves its whole declared file limit from enqueue
@@ -1489,7 +1528,12 @@ static bool navigation_stream_prepare_runtime(NavigationDocumentStream *stream,
            cover the async bridge's native limit plus that headroom. */
         stream->scheduler = fetch_scheduler_create_in_domain(
             stream->fetch_domain, 12, reserved);
-        if (stream->scheduler == NULL) return false;
+        if (stream->scheduler == NULL) {
+            navigation_stream_shed_optional_work(
+                stream, "Optional resources stopped at the page memory limit",
+                true);
+            return true;
+        }
         /* Six streaming worker lanes match the scheduler's documented two
            speculative plus four authoritative reservations. On PSP this
            moves transport production off the browser thread without reducing
@@ -1512,7 +1556,12 @@ static bool navigation_stream_prepare_runtime(NavigationDocumentStream *stream,
         script_runtime_set_synchronous_layout_callback(
             stream->runtime, navigation_stream_flush_cssom_layout, stream);
     }
-    return stream->runtime != NULL;
+    if (stream->runtime == NULL) {
+        navigation_stream_shed_optional_work(
+            stream, "JavaScript stopped at the page memory limit", false);
+        return true;
+    }
+    return true;
 }
 
 #include "parser_script_checkpoint.inc"

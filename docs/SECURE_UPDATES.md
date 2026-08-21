@@ -218,7 +218,7 @@ Tilefinch sends no cookies or authorization and rejects URL credentials,
 fragments, control bytes, root rotations, and signature-like records. Generic
 endpoints retain same-origin redirects. Recognized OneDrive and SharePoint
 links may cross origins along Microsoft/CDN redirects, still under the browser
-transport's five-hop ceiling. Every Developer request accepts only HTTPS
+transport's eight-hop ceiling. Every Developer request accepts only HTTPS
 redirect targets, so no hop can downgrade to cleartext. The bounded TFUM still
 authorizes an exact TFUP size and SHA-256, and the TFUP authorizes every
 allowed file's exact path, size, offset, and SHA-256.
