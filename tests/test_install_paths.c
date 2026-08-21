@@ -1,5 +1,6 @@
 #include "tilefinch/install_paths.h"
 #include "tilefinch/voice_component.h"
+#include "tilefinch/swdec_component_store.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -43,6 +44,30 @@ int main(void)
           && strcmp(path,
                     "ms0:/PSP/GAME/TILEFINCH/components/voice-en-us/"
                     "active/model") == 0);
+    CHECK(tilefinch_swdec_component_path(
+              &paths, "tilefinch-swdec.prx", path, sizeof(path))
+          && strcmp(path,
+                    "ms0:/PSP/GAME/TILEFINCH/components/swdec/"
+                    "tilefinch-swdec.prx") == 0);
+
+    puts("test: optional-decoder compatibility record is bounded");
+    uint16_t abi = 0;
+    static const char compatible[] =
+        "tilefinch-swdec-component-v1\nabi=4\n";
+    CHECK(tilefinch_swdec_component_info_parse(
+              compatible, sizeof(compatible) - 1u, &abi)
+              == TILEFINCH_SWDEC_COMPONENT_INFO_VALID
+          && abi == 4u);
+    static const char zero_abi[] =
+        "tilefinch-swdec-component-v1\nabi=0\n";
+    static const char trailing_info[] =
+        "tilefinch-swdec-component-v1\nabi=4\ntrailing";
+    CHECK(tilefinch_swdec_component_info_parse(
+              zero_abi, strlen(zero_abi), &abi)
+              == TILEFINCH_SWDEC_COMPONENT_INFO_INVALID);
+    CHECK(tilefinch_swdec_component_info_parse(
+              trailing_info, strlen(trailing_info), &abi)
+              == TILEFINCH_SWDEC_COMPONENT_INFO_INVALID);
 
     puts("test: legacy single-EBOOT layout remains compatible");
     CHECK(tilefinch_install_paths_derive(

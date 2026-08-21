@@ -306,6 +306,8 @@ void psp_log_message(void *context, const char *message);
 bool psp_present_internal(
     const uint16_t *frame, const PspUiState *ui, bool include_media);
 void psp_present(const uint16_t *frame, const PspUiState *ui);
+bool psp_present_cursor_feedback(
+    const uint16_t *frame, const PspUiState *ui);
 void psp_present_supervisor_ui(const uint16_t *frame, const PspUiState *ui);
 void psp_present_boot_surface(
     PspUiStartupView view, const char *status, int progress_per_mille);

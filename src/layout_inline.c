@@ -1013,7 +1013,9 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
             .font_italic = style.font_italic,
             .letter_spacing = style.letter_spacing,
             .radius = (int) style.font_size_fraction
-                      << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT,
+                      << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT
+                      | (computed_style_kerning_none(&style)
+                         ? LAYOUT_TEXT_KERNING_NONE : 0),
             .image_fit = text_decoration_bits(&style),
             .opacity_scale = alpha_opacity_scale(style.color_alpha)
         };
@@ -1216,7 +1218,7 @@ static int measured_flow_text_width_fixed(
     const FontFace *face, FontFamily metric_family,
     const char *text, size_t length, int font_size_fixed,
     bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
-    TextTransformMode transform);
+    TextTransformMode transform, bool kerning);
 
 static size_t fitting_text_prefix(const FontFace *face,
                                   FontFamily metric_family,
@@ -1225,7 +1227,8 @@ static size_t fitting_text_prefix(const FontFace *face,
                                   bool synthetic_bold, bool metric_bold,
                                   int scale, int letter_spacing,
                                   int available_fixed,
-                                  TextTransformMode transform);
+                                  TextTransformMode transform,
+                                  bool kerning);
 
 static int line_clamp_measure_text(const LayoutDocument *layout,
                                    const DrawCommand *command,
@@ -1250,7 +1253,8 @@ static int line_clamp_measure_text(const LayoutDocument *layout,
         face, family, text, length,
         draw_command_text_font_size_fixed(command),
         synthetic_bold, bold_face, command->scale,
-        command->letter_spacing, transform);
+        command->letter_spacing, transform,
+        !draw_command_text_kerning_none(command));
 }
 
 bool layout_line_clamp_overflow(LineState *line)
@@ -1299,7 +1303,8 @@ bool layout_line_clamp_overflow(LineState *line)
         draw_command_text_font_size_fixed(last), synthetic_bold, bold_face,
         last->scale, last->letter_spacing,
         layout_fixed_from_integer(available),
-        draw_command_text_transform(last));
+        draw_command_text_transform(last),
+        !draw_command_text_kerning_none(last));
     if (prefix > last->text_length) prefix = last->text_length;
     int prefix_fixed = prefix == 0 ? 0 : line_clamp_measure_text(
         line->layout, last, last->text, prefix,
@@ -1655,7 +1660,7 @@ static int measured_flow_text_width_fixed(
     const FontFace *face, FontFamily metric_family,
     const char *text, size_t length, int font_size_fixed,
     bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
-    TextTransformMode transform);
+    TextTransformMode transform, bool kerning);
 
 int layout_single_text_advance_fixed(
     LayoutContext *context, lxb_dom_node_t *node,
@@ -1681,7 +1686,8 @@ int layout_single_text_advance_fixed(
         style_uses_synthetic_weight(
             context->fonts, context->web_fonts, style, face),
         style_uses_bold_face(style), style->font_scale,
-        style->letter_spacing, style->text_transform);
+        style->letter_spacing, style->text_transform,
+        !computed_style_kerning_none(style));
     int edges = style->margin.left + style->margin.right
                 + style->border.left + style->border.right
                 + style->padding.left + style->padding.right;
@@ -1799,7 +1805,8 @@ static bool unicode_line_break_opening(unsigned codepoint)
 }
 
 size_t utf8_line_segment_length(const char *text, size_t available,
-                                bool keep_cjk_together, bool *discard)
+                                bool keep_cjk_together, bool hyphens_none,
+                                bool *discard)
 {
     if (discard != NULL) *discard = false;
     if (text == NULL || available == 0) return 0;
@@ -1809,7 +1816,7 @@ size_t utf8_line_segment_length(const char *text, size_t available,
     /* U+200B creates an ordinary opportunity without ink. Soft hyphen is
        likewise invisible in the unbroken case; visible discretionary-hyphen
        insertion remains outside this bounded breaker. */
-    if (first == 0x200bu || first == 0x00adu) {
+    if (first == 0x200bu || (first == 0x00adu && !hyphens_none)) {
         if (discard != NULL) *discard = true;
         return first_length;
     }
@@ -1822,7 +1829,8 @@ size_t utf8_line_segment_length(const char *text, size_t available,
             text + used, available - used, &next);
         if (next_length == 0
             || (next < 0x80u && isspace((unsigned char) next))
-            || next == 0x200bu || next == 0x00adu) break;
+            || next == 0x200bu
+            || (next == 0x00adu && !hyphens_none)) break;
         if (unicode_line_break_extender(next)
             || (ideographic && unicode_line_break_closing(next))) {
             used += next_length;
@@ -1869,16 +1877,17 @@ static size_t text_spacing_units(const char *text, size_t length)
     return units;
 }
 
-int measured_text_width_fixed(const FontFace *face,
+int measured_text_width_fixed_mode(const FontFace *face,
                                      FontFamily metric_family,
                                      const char *text, size_t length,
                                      int font_size_fixed,
                                      bool synthetic_bold, bool metric_bold,
-                                     int scale, int letter_spacing)
+                                     int scale, int letter_spacing,
+                                     bool kerning)
 {
-    int width = font_text_width_for_family_at_size_fixed(
+    int width = font_text_width_for_family_at_size_fixed_mode(
         face, metric_family, text, length, font_size_fixed,
-        synthetic_bold, metric_bold);
+        synthetic_bold, metric_bold, kerning);
     /* CSS letter-spacing is inserted between typographic character units,
        not around default-ignorable formatting controls such as bidi marks,
        joiners, or a zero-width break opportunity. The font path already
@@ -1900,6 +1909,18 @@ int measured_text_width_fixed(const FontFace *face,
     return width;
 }
 
+int measured_text_width_fixed(const FontFace *face,
+                              FontFamily metric_family,
+                              const char *text, size_t length,
+                              int font_size_fixed,
+                              bool synthetic_bold, bool metric_bold,
+                              int scale, int letter_spacing)
+{
+    return measured_text_width_fixed_mode(
+        face, metric_family, text, length, font_size_fixed,
+        synthetic_bold, metric_bold, scale, letter_spacing, true);
+}
+
 int measured_text_width(const FontFace *face,
                                FontFamily metric_family,
                                const char *text, size_t length,
@@ -1917,12 +1938,12 @@ static int measured_flow_text_width_fixed(
     const FontFace *face, FontFamily metric_family,
     const char *text, size_t length, int font_size_fixed,
     bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
-    TextTransformMode transform)
+    TextTransformMode transform, bool kerning)
 {
     if (transform == TEXT_TRANSFORM_NONE || length > 511) {
-        return measured_text_width_fixed(
+        return measured_text_width_fixed_mode(
             face, metric_family, text, length, font_size_fixed,
-            synthetic_bold, metric_bold, scale, letter_spacing);
+            synthetic_bold, metric_bold, scale, letter_spacing, kerning);
     }
     char transformed[512];
     memcpy(transformed, text, length);
@@ -1937,9 +1958,9 @@ static int measured_flow_text_width_fixed(
             transformed[i] = (char) (value - 'A' + 'a');
         }
     }
-    return measured_text_width_fixed(
+    return measured_text_width_fixed_mode(
         face, metric_family, transformed, length, font_size_fixed,
-        synthetic_bold, metric_bold, scale, letter_spacing);
+        synthetic_bold, metric_bold, scale, letter_spacing, kerning);
 }
 
 static size_t fitting_text_prefix(const FontFace *face,
@@ -1949,7 +1970,8 @@ static size_t fitting_text_prefix(const FontFace *face,
                                   bool synthetic_bold, bool metric_bold,
                                   int scale, int letter_spacing,
                                   int available_fixed,
-                                  TextTransformMode transform)
+                                  TextTransformMode transform,
+                                  bool kerning)
 {
     size_t used = 0;
     int width = 0;
@@ -1961,7 +1983,8 @@ static size_t fitting_text_prefix(const FontFace *face,
             face, metric_family, text + used, character, font_size_fixed,
             synthetic_bold, metric_bold, scale, 0,
             transform == TEXT_TRANSFORM_CAPITALIZE && used != 0
-                ? TEXT_TRANSFORM_NONE : transform);
+                ? TEXT_TRANSFORM_NONE : transform,
+            kerning);
         if (used != 0) {
             int64_t spaced = (int64_t) character_width
                              + (int64_t) letter_spacing * 64;
@@ -2005,7 +2028,7 @@ bool layout_add_replaced_alt_text(
         face, metric_family, alt, length, font_size_fixed,
         synthetic_bold, metric_bold, style->font_scale,
         style->letter_spacing, layout_fixed_from_integer(available),
-        TEXT_TRANSFORM_NONE);
+        TEXT_TRANSFORM_NONE, !computed_style_kerning_none(style));
     if (prefix > length) prefix = length;
     int line_height = style->line_height > 0 ? style->line_height
         : font_line_height_at_size(face, font_size_fixed);
@@ -2027,7 +2050,9 @@ bool layout_add_replaced_alt_text(
         .font_italic = style->font_italic,
         .letter_spacing = style->letter_spacing,
         .radius = (int) style->font_size_fraction
-                  << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT,
+                  << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT
+                  | (computed_style_kerning_none(style)
+                     ? LAYOUT_TEXT_KERNING_NONE : 0),
         .opacity_scale = alpha_opacity_scale(style->color_alpha)
     };
     return layout_add_command(context->layout, fallback) != NULL;
@@ -2092,7 +2117,7 @@ bool flow_text(LayoutContext *context, LineState *line,
         int total_fixed = measured_flow_text_width_fixed(
             face, metric_family, text, length, font_size_fixed,
             synthetic_bold, metric_bold, scale, style->letter_spacing,
-            style->text_transform);
+            style->text_transform, !computed_style_kerning_none(style));
         int available_fixed = layout_fixed_from_integer(available_pixels);
         int lines = total_fixed <= 0 ? 1
             : (total_fixed + available_fixed - 1) / available_fixed;
@@ -2206,7 +2231,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                 /* CSS's initial tab-size is eight. This compact renderer
                    preserves that advance without retaining a second text
                    buffer merely to paint blank glyphs. */
-                preserved_space_count += text[at] == '\t' ? 8u : 1u;
+                preserved_space_count += text[at] == '\t'
+                    ? computed_style_tab_size(style) : 1u;
             } else {
                 separated = true;
             }
@@ -2283,7 +2309,8 @@ bool flow_text(LayoutContext *context, LineState *line,
         bool discard = false;
         size_t segment = utf8_line_segment_length(
             text + at, length - at,
-            style->word_break_mode == WORD_BREAK_KEEP_ALL, &discard);
+            computed_style_word_break(style) == WORD_BREAK_KEEP_ALL,
+            computed_style_hyphens_none(style), &discard);
         if (segment == 0) break;
         if (discard) {
             at += segment;
@@ -2297,7 +2324,7 @@ bool flow_text(LayoutContext *context, LineState *line,
         int word_width_fixed = measured_flow_text_width_fixed(
             face, metric_family, text + at, end - at, font_size_fixed,
             synthetic_bold, metric_bold, scale, style->letter_spacing,
-            style->text_transform);
+            style->text_transform, !computed_style_kerning_none(style));
         int boundary_fixed = line->has_text_character
             ? layout_fixed_from_integer(line->letter_boundary_spacing) : 0;
         if (wrap_preserved_spaces && rollback.valid
@@ -2341,13 +2368,14 @@ bool flow_text(LayoutContext *context, LineState *line,
                 || style->overflow_x_clip_only);
         bool emergency_break = !no_wrap
             && (computed_style_overflow_wrap(style) != OVERFLOW_WRAP_NORMAL
-                || style->word_break_mode == WORD_BREAK_LEGACY)
+                || computed_style_word_break(style) == WORD_BREAK_LEGACY)
             && word_width_fixed > empty_line_width_fixed;
 
         /* overflow-wrap is an emergency opportunity, not break-all: first
            take the ordinary whitespace opportunity before the word.  Only a
            word that still cannot fit an empty line may be split. */
-        if (emergency_break && style->word_break_mode != WORD_BREAK_ALL
+        if (emergency_break
+            && computed_style_word_break(style) != WORD_BREAK_ALL
             && line_cursor_fixed(line)
                    != layout_fixed_from_integer(line->start_x)) {
             layout_flush_line(line);
@@ -2356,7 +2384,8 @@ bool flow_text(LayoutContext *context, LineState *line,
             }
         }
         bool break_inside = !no_wrap
-                            && (style->word_break_mode == WORD_BREAK_ALL
+                            && (computed_style_word_break(style)
+                                    == WORD_BREAK_ALL
                                 || emergency_break);
         size_t piece_at = at;
         bool first_piece = true;
@@ -2398,14 +2427,16 @@ bool flow_text(LayoutContext *context, LineState *line,
                     face, metric_family, text + piece_at, end - piece_at,
                     font_size_fixed, synthetic_bold, metric_bold, scale,
                     style->letter_spacing, available_fixed,
-                    style->text_transform);
+                    style->text_transform,
+                    !computed_style_kerning_none(style));
                 piece_end = piece_at + prefix;
                 if (piece_end > end) piece_end = end;
                 width_fixed = measured_flow_text_width_fixed(
                     face, metric_family, text + piece_at,
                     piece_end - piece_at, font_size_fixed,
                     synthetic_bold, metric_bold, scale,
-                    style->letter_spacing, style->text_transform);
+                    style->letter_spacing, style->text_transform,
+                    !computed_style_kerning_none(style));
                 if (width_fixed > available_fixed
                     && cursor_fixed != start_fixed) {
                     layout_flush_line(line);
@@ -2422,14 +2453,16 @@ bool flow_text(LayoutContext *context, LineState *line,
                         end - piece_at, font_size_fixed,
                         synthetic_bold, metric_bold, scale,
                         style->letter_spacing, available_fixed,
-                        style->text_transform);
+                        style->text_transform,
+                        !computed_style_kerning_none(style));
                     piece_end = piece_at + prefix;
                     if (piece_end > end) piece_end = end;
                     width_fixed = measured_flow_text_width_fixed(
                         face, metric_family, text + piece_at,
                         piece_end - piece_at, font_size_fixed,
                         synthetic_bold, metric_bold, scale,
-                        style->letter_spacing, style->text_transform);
+                        style->letter_spacing, style->text_transform,
+                        !computed_style_kerning_none(style));
                 }
             } else {
                 width_fixed = word_width_fixed;
@@ -2441,7 +2474,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                         face, metric_family, marker, sizeof(marker) - 1,
                         font_size_fixed, synthetic_bold, metric_bold,
                         scale, style->letter_spacing,
-                        TEXT_TRANSFORM_NONE);
+                        TEXT_TRANSFORM_NONE,
+                        !computed_style_kerning_none(style));
                     int available = layout_fixed_subtract(
                         layout_fixed_subtract(
                             layout_fixed_subtract(
@@ -2455,7 +2489,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                               end - piece_at, font_size_fixed,
                               synthetic_bold, metric_bold, scale,
                               style->letter_spacing, available,
-                              style->text_transform);
+                              style->text_transform,
+                              !computed_style_kerning_none(style));
                     if (prefix > end - piece_at) prefix = end - piece_at;
                     piece_end = piece_at + prefix;
                     width_fixed = prefix == 0 ? 0
@@ -2463,7 +2498,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                               face, metric_family, text + piece_at,
                               prefix, font_size_fixed, synthetic_bold,
                               metric_bold, scale, style->letter_spacing,
-                              style->text_transform);
+                              style->text_transform,
+                              !computed_style_kerning_none(style));
                     truncated_for_ellipsis = true;
                 }
                 if (!no_wrap
@@ -2525,6 +2561,9 @@ bool flow_text(LayoutContext *context, LineState *line,
                 .image_fit = text_decoration_bits(style),
                 .opacity_scale = alpha_opacity_scale(style->color_alpha)
             };
+            if (computed_style_kerning_none(style)) {
+                command.radius |= LAYOUT_TEXT_KERNING_NONE;
+            }
             if (first_piece && authored_space_before)
                 command.radius |= LAYOUT_TEXT_FIND_SPACE_BEFORE;
             if (line->find_block_start)
@@ -3293,7 +3332,9 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                 .font_italic = style.font_italic,
                 .letter_spacing = style.letter_spacing,
                 .radius = (int) style.font_size_fraction
-                          << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT,
+                          << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT
+                          | (computed_style_kerning_none(&style)
+                             ? LAYOUT_TEXT_KERNING_NONE : 0),
                 .image_fit = text_decoration_bits(&style),
                 .opacity_scale = alpha_opacity_scale(style.color_alpha)
             };
@@ -3563,6 +3604,15 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         } else if (!layout_add_replaced_alt_text(
                        context, node, &style, content_x, content_y,
                        width, height)) {
+            return false;
+        }
+        /* A page video is a single native-player activation target. It uses
+           the existing retained control map so d-pad focus and pointer taps
+           share the same DOM activation/cancellation path as buttons. */
+        if (layout_node_name_is(node, "video")
+            && !layout_add_control(
+                   context->layout, outer_x, outer_y,
+                   outer_width, outer_height, CONTROL_BUTTON, node)) {
             return false;
         }
         /* Inline replaced elements need a queryable box: page scripts

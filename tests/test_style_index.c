@@ -46,6 +46,19 @@ static const StyleRule *find_rule(const Stylesheet *sheet,
     return NULL;
 }
 
+static const StyleCustomRule *find_custom_rule(
+    const Stylesheet *sheet, const char *selector, const char *name)
+{
+    if (sheet == NULL || selector == NULL || name == NULL) return NULL;
+    for (size_t i = 0; i < sheet->custom_rule_count; i++) {
+        if (strcmp(sheet->custom_rules[i].selector, selector) == 0
+            && strcmp(sheet->custom_rules[i].name, name) == 0) {
+            return &sheet->custom_rules[i];
+        }
+    }
+    return NULL;
+}
+
 static bool equivalent(const Stylesheet *left_sheet,
                        const ComputedStyle *left,
                        const Stylesheet *right_sheet,
@@ -104,6 +117,7 @@ int main(void)
         "*{letter-spacing:1px}"
         "section div{word-spacing:2px}"
         ".card{color:#010203}"
+        ".card{hyphens:none}.never:hover{hyphens:none}"
         "#target{color:#112233}"
         "section>.card.hot{display:flex}"
         "#primary+#secondary{word-spacing:5px}"
@@ -162,11 +176,19 @@ int main(void)
     const StyleRule *attribute_rule = find_rule(&indexed, "[data-x]");
     const StyleRule *functional_rule = find_rule(
         &indexed, ".card:not(.cold)");
+    const StyleCustomRule *hyphens_rule = find_custom_rule(
+        &indexed, ".card", "hyphens");
     CHECK(same_a != NULL && same_b != NULL && deferred_a != NULL
           && deferred_b != NULL && secondary_rule != NULL
           && combinator_rule != NULL && adjacent_rule != NULL
           && sibling_rule != NULL && attribute_rule != NULL
-          && functional_rule != NULL
+          && functional_rule != NULL && hyphens_rule != NULL
+          && hyphens_rule->fast_key_offset != UINT8_MAX
+          && strcmp(hyphens_rule->selector
+                        + hyphens_rule->fast_key_offset,
+                    "card") == 0
+          && find_custom_rule(
+                 &indexed, ".never:hover", "hyphens") == NULL
           && same_a->declaration_index == same_b->declaration_index
           && deferred_a->declaration_index == deferred_b->declaration_index
           && indexed.declaration_count < indexed.count
@@ -208,7 +230,9 @@ int main(void)
                                                      NULL);
     ComputedStyle indexed_before = style_for_pseudo(
         &indexed, target, PSEUDO_BEFORE, &indexed_target);
-    CHECK(indexed.rule_index_ready && indexed.rule_index_bytes != 0
+    CHECK(computed_style_hyphens_none(&indexed_target)
+          && !computed_style_hyphens_none(&indexed_other)
+          && indexed.rule_index_ready && indexed.rule_index_bytes != 0
           && indexed.selector_program_ready
           && indexed.selector_program_rule_count == indexed.count
           && indexed.selector_program_bytes <= 256u * 1024u

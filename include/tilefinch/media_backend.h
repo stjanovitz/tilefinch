@@ -8,6 +8,7 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/cancellation.h"
 #include "tilefinch/media_mp4.h"
+#include "tilefinch/media_source.h"
 
 typedef enum {
     MEDIA_BACKEND_ACCEPTED = 0,
@@ -523,6 +524,27 @@ typedef struct {
 } MediaBackendStats;
 
 /*
+ * Presentation-side ownership is backend state, not PSP-firmware global
+ * state.  Keeping these callbacks behind one pointer leaves MediaBackend
+ * compact while allowing the firmware pair and the software decoder's frame
+ * ring to enforce their different reader/writer protocols.
+ */
+typedef struct {
+    bool (*borrow)(void *opaque, unsigned slot, uint32_t generation);
+    void (*release)(void *opaque, unsigned slot);
+    void (*end_auxiliary_read)(void *opaque, unsigned slot);
+    void (*quarantine)(void *opaque, unsigned slot);
+    void (*release_quarantine)(void *opaque, unsigned slot);
+    bool (*is_quarantined)(const void *opaque, unsigned slot);
+    void (*note_staged)(void *opaque, const MediaVideoFrame *frame);
+    void (*note_displayed)(
+        void *opaque, const MediaVideoFrame *frame, int present_path);
+    void (*note_quiesced)(void *opaque, const MediaVideoFrame *frame);
+    void (*note_stage_signature)(
+        void *opaque, const MediaVideoFrame *frame, uint32_t signature);
+} MediaBackendPresentationOps;
+
+/*
  * A compatibility environment may expose the private raw-NAL entry point as
  * a successful no-op. Keep a bounded packet-copy probe distinct from a real
  * firmware decoder error when it never produces a complete authored surface.
@@ -531,6 +553,11 @@ typedef struct {
 
 typedef struct {
     void *opaque;
+    const MediaBackendPresentationOps *presentation;
+    /* Decoder-specific startup fill and scheduling horizon. Zero asks the
+       frontend to use its established default. */
+    unsigned startup_ready_frames;
+    uint64_t preferred_decode_lead_us;
     MediaBackendResult (*submit)(
         void *opaque, const MediaMp4Sample *sample,
         const unsigned char *payload, size_t length,
@@ -792,6 +819,12 @@ MediaPlayback *media_playback_create_split(
     Budget *budget, MediaMp4Demux *video_demux,
     MediaMp4Demux *audio_demux, const MediaBackend *backend,
     const MediaPlaybackOptions *options, char *error, size_t error_size);
+/* Generic source form used by bounded streaming containers.  It owns neither
+   source and preserves the video-then-audio ordering of the MP4 split form. */
+MediaPlayback *media_playback_create_sources(
+    Budget *budget, const MediaSampleSource *video_source,
+    const MediaSampleSource *audio_source, const MediaBackend *backend,
+    const MediaPlaybackOptions *options, char *error, size_t error_size);
 bool media_playback_advance(MediaPlayback *playback, uint64_t clock_us,
                             char *error, size_t error_size);
 MediaPlaybackAdvanceResult media_playback_advance_bounded(
@@ -813,6 +846,7 @@ bool media_playback_backend_stats(const MediaPlayback *playback,
 bool media_playback_audio_cursor_us(const MediaPlayback *playback,
                                     uint64_t *cursor_us);
 unsigned media_playback_ready_video_frames(const MediaPlayback *playback);
+unsigned media_playback_startup_ready_frames(const MediaPlayback *playback);
 bool media_playback_ready_video_start_us(
     const MediaPlayback *playback, uint64_t *start_us);
 size_t media_playback_displayed_video_frames(const MediaPlayback *playback);
@@ -830,6 +864,27 @@ bool media_playback_set_audio_submission_blocked(
     MediaPlayback *playback, bool blocked);
 bool media_playback_take_video_frame(MediaPlayback *playback,
                                      MediaVideoFrame *frame);
+bool media_playback_borrow_video_slot(
+    MediaPlayback *playback, unsigned slot, uint32_t generation);
+void media_playback_release_video_read(
+    MediaPlayback *playback, unsigned slot);
+void media_playback_end_auxiliary_video_read(
+    MediaPlayback *playback, unsigned slot);
+void media_playback_quarantine_video_slot(
+    MediaPlayback *playback, unsigned slot);
+void media_playback_release_video_slot_quarantine(
+    MediaPlayback *playback, unsigned slot);
+bool media_playback_video_slot_quarantined(
+    const MediaPlayback *playback, unsigned slot);
+void media_playback_note_frame_staged(
+    MediaPlayback *playback, const MediaVideoFrame *frame);
+void media_playback_note_frame_displayed(
+    MediaPlayback *playback, const MediaVideoFrame *frame, int present_path);
+void media_playback_note_frame_quiesced(
+    MediaPlayback *playback, const MediaVideoFrame *frame);
+void media_playback_note_stage_signature(
+    MediaPlayback *playback, const MediaVideoFrame *frame,
+    uint32_t signature);
 size_t media_playback_discard_video_before(
     MediaPlayback *playback, uint64_t floor_us);
 /*
@@ -876,6 +931,22 @@ bool media_playback_warm_video(MediaPlayback *playback, uint64_t target_us,
  */
 bool media_playback_warm_audio(MediaPlayback *playback, uint64_t target_us,
                                char *error, size_t error_size);
+typedef enum {
+    MEDIA_PLAYBACK_SOURCE_PRIME_PENDING = 0,
+    MEDIA_PLAYBACK_SOURCE_PRIME_READY,
+    MEDIA_PLAYBACK_SOURCE_PRIME_FAILED
+} MediaPlaybackSourcePrimeStatus;
+/* Non-blocking source preparation for a committed seek. Each call either
+   proves that the first needed sample is resident, starts its bounded range
+   request and returns PENDING, or reports a terminal source error. Audio is
+   selected at or after target_us; video retains its preceding keyframe. A
+   progressive source has no separate audio range and reports audio READY. */
+MediaPlaybackSourcePrimeStatus media_playback_prime_video_source(
+    MediaPlayback *playback, uint64_t target_us, uint64_t *sample_us,
+    char *error, size_t error_size);
+MediaPlaybackSourcePrimeStatus media_playback_prime_audio_source(
+    MediaPlayback *playback, uint64_t target_us, uint64_t *sample_us,
+    char *error, size_t error_size);
 bool media_playback_seek(MediaPlayback *playback, uint64_t target_us,
                          uint64_t *actual_us, char *error,
                          size_t error_size);
@@ -891,6 +962,7 @@ void media_playback_set_buffering(MediaPlayback *playback, bool buffering);
 void media_playback_destroy(MediaPlayback *playback);
 
 #ifdef __PSP__
+#include "tilefinch/swdec_component.h"
 typedef enum {
     MEDIA_PSP_PREPARE_PENDING = 0,
     MEDIA_PSP_PREPARE_READY,
@@ -926,10 +998,37 @@ MediaPspPrepareResult media_psp_backend_prepare_pump(
 bool media_psp_backend_create(
     Budget *budget, const MediaMp4Demux *demux,
     MediaBackend *backend, char *error, size_t error_size);
+/* AAC-only form. It never creates an MPEG decoder or decoded-picture
+   surfaces; the supplied demux must contain an admitted AAC track. */
+bool media_psp_backend_create_audio(
+    Budget *budget, const MediaMp4Demux *audio_demux,
+    MediaBackend *backend, char *error, size_t error_size);
 bool media_psp_backend_create_split(
     Budget *budget, const MediaMp4Demux *video_demux,
     const MediaMp4Demux *audio_demux,
     MediaBackend *backend, char *error, size_t error_size);
+/* Optional 240p software H.264 backend. The caller owns the loaded component
+   and must keep its API table alive until backend destruction. */
+bool media_psp_swdec_backend_create_split(
+    Budget *budget, const MediaMp4Demux *video_demux,
+    const MediaMp4Demux *audio_demux,
+    const TilefinchSwdecComponentApi *component,
+    MediaBackend *backend, char *error, size_t error_size);
+/* Streaming-container form. It feeds decoder-ready packets through the same
+   backend, playback clock, and presenter as MP4 rather than growing a second
+   player. */
+bool media_psp_swdec_backend_create_sources(
+    Budget *budget, const MediaSampleSource *video_source,
+    const MediaSampleSource *audio_source,
+    const TilefinchSwdecComponentApi *component,
+    MediaBackend *backend, char *error, size_t error_size);
+/* AAC-only form used after software decode has taken ownership of the Media
+   Engine. It deliberately allocates no H.264 state or RGB surfaces. */
+bool media_psp_swdec_backend_create_audio(
+    Budget *budget, const MediaMp4Demux *audio_demux,
+    const TilefinchSwdecComponentApi *component,
+    MediaBackend *backend, char *error, size_t error_size);
+bool media_psp_swdec_backend_quarantined(void);
 /*
  * A backend whose worker or firmware audio channel could not prove that it
  * released borrowed queue memory is intentionally leaked rather than freed.

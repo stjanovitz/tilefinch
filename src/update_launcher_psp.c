@@ -419,6 +419,7 @@ static bool launcher_verify_pending(
         .installed_package_sha256 = state->installed_sha256,
         .installed_sequence_valid = state->installed_sequence != 0,
         .installed_pair_valid = installed_pair_valid,
+        .allow_downgrade = state->candidate_downgrade,
         .trust = developer_unsigned
             ? TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED
             : TILEFINCH_UPDATE_TRUST_SIGNED

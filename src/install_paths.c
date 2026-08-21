@@ -106,6 +106,21 @@ bool tilefinch_install_data_path(
         paths->data_dir, relative, output, output_size);
 }
 
+bool tilefinch_install_component_path(
+    const TilefinchInstallPaths *paths, const char *relative,
+    char *output, size_t output_size)
+{
+    if (paths == NULL || relative == NULL || relative[0] == '\0')
+        return false;
+    char component_relative[TILEFINCH_INSTALL_PATH_LIMIT];
+    int written = snprintf(
+        component_relative, sizeof(component_relative),
+        "components/%s", relative);
+    return written > 0 && (size_t) written < sizeof(component_relative)
+        && path_join(
+            paths->install_root, component_relative, output, output_size);
+}
+
 bool tilefinch_install_advisory_matches(
     const TilefinchInstallPaths *paths,
     const char *slot_name, const char *data_dir)

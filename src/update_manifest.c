@@ -278,6 +278,37 @@ static TilefinchUpdateStatus parse_manifest(
     if (!inert_utf8(value, notes_length)) return TILEFINCH_UPDATE_BAD_STRING;
     memcpy(parsed.notes, value, notes_length);
     parsed.notes_length = notes_length;
+    static const char decoder_prefix[] = "Decoder ABI ";
+    if (notes_length > sizeof(decoder_prefix)
+        && memcmp(parsed.notes, decoder_prefix,
+                  sizeof(decoder_prefix) - 1u) == 0) {
+        size_t at = sizeof(decoder_prefix) - 1u;
+        unsigned decoder_abi = 0;
+        size_t digits = 0;
+        while (at < notes_length
+               && parsed.notes[at] >= '0' && parsed.notes[at] <= '9') {
+            unsigned digit = (unsigned) (parsed.notes[at] - '0');
+            if (decoder_abi > (UINT16_MAX - digit) / 10u) {
+                digits = 0;
+                break;
+            }
+            decoder_abi = decoder_abi * 10u + digit;
+            at++;
+            digits++;
+        }
+        static const char suffix[] = "; rebuild if different. ";
+        if (digits != 0 && decoder_abi != 0
+            && notes_length - at >= sizeof(suffix) - 1u
+            && memcmp(parsed.notes + at, suffix,
+                      sizeof(suffix) - 1u) == 0) {
+            at += sizeof(suffix) - 1u;
+            parsed.optional_decoder_abi = (uint16_t) decoder_abi;
+            parsed.optional_decoder_abi_valid = true;
+            memmove(parsed.notes, parsed.notes + at, notes_length - at);
+            parsed.notes_length = notes_length - at;
+            parsed.notes[parsed.notes_length] = '\0';
+        }
+    }
     if (cursor.at != cursor.length) return TILEFINCH_UPDATE_TRAILING_BYTES;
     *manifest = parsed;
     return TILEFINCH_UPDATE_OK;
@@ -425,6 +456,9 @@ static TilefinchUpdateStatus verify_envelope_kind(
        unsigned Developer candidate without changing the on-disk schema. */
     if (manifest.release_sequence == TILEFINCH_UPDATE_DEVELOPER_SEQUENCE)
         return TILEFINCH_UPDATE_LIMIT;
+    if (options->expected_tag != NULL
+        && strcmp(manifest.tag, options->expected_tag) != 0)
+        return TILEFINCH_UPDATE_BAD_STRING;
     if (manifest.root_version != current.version)
         return TILEFINCH_UPDATE_ROOT_CHAIN;
     if (manifest.minimum_launcher_protocol > options->launcher_protocol)
@@ -435,7 +469,9 @@ static TilefinchUpdateStatus verify_envelope_kind(
         return TILEFINCH_UPDATE_EXPIRED;
     if (options->installed_sequence_valid
         || options->installed_pair_valid) {
-        if (manifest.release_sequence < options->installed_sequence)
+        if ((!options->allow_downgrade
+             || package_format != TILEFINCH_UPDATE_PACKAGE_TFUP)
+            && manifest.release_sequence < options->installed_sequence)
             return TILEFINCH_UPDATE_DOWNGRADE;
         if (options->installed_pair_valid
             && manifest.release_sequence == options->installed_sequence

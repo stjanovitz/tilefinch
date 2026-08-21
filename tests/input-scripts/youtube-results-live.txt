@@ -20,10 +20,16 @@
 # way a checked-in live scenario would be.
 wait-live 2400
 mark-live opened
-tap-live cross
+# The provider starts with its search field focused. Move to the first result
+# before activating it; Cross on the field is deliberately a no-op.
+tap down
+wait 2
+tap cross
 mark-live activated
+wait-live 1800
+mark-live watch
 tap-live circle
-wait-live 180
+wait-live 1200
 mark returned
 # Menu > screenshot, so the host gets a frame of the restored list.
 tap select

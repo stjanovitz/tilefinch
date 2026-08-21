@@ -218,6 +218,105 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
         || sheet->modern_property_mask == 0) return;
     uint16_t mask = sheet->modern_property_mask;
     char value[96];
+    bool paint_dirty = false;
+    StylePaintStack paint = {0};
+    if ((mask & (STYLE_MODERN_MIX_BLEND
+                 | STYLE_MODERN_BACKDROP_FILTER)) != 0) {
+        paint = style_paint_stack_copy(sheet, style);
+    }
+
+    if ((mask & STYLE_MODERN_TYPOGRAPHY) != 0) {
+        uint8_t typography = sheet->modern_typography_mask;
+        if ((typography & STYLE_MODERN_TYPOGRAPHY_HYPHENS) != 0
+            && retained_modern_value(sheet, node, "hyphens", value)) {
+            if (modern_keyword(value, "none")) {
+                style->word_break_mode |= STYLE_HYPHENS_NONE;
+            } else if (modern_keyword(value, "manual")
+                       || modern_keyword(value, "auto")
+                       || modern_keyword(value, "initial")) {
+                style->word_break_mode &= (uint8_t) ~STYLE_HYPHENS_NONE;
+            }
+        }
+        if ((typography & STYLE_MODERN_TYPOGRAPHY_KERNING) != 0
+            && retained_modern_value(sheet, node, "font-kerning", value)) {
+            if (modern_keyword(value, "none")
+                || modern_keyword(value, "optimizeSpeed")) {
+                style->word_break_mode |= STYLE_FONT_KERNING_NONE;
+            } else if (modern_keyword(value, "normal")
+                       || modern_keyword(value, "auto")
+                       || modern_keyword(value, "initial")) {
+                style->word_break_mode &= (uint8_t) ~STYLE_FONT_KERNING_NONE;
+            }
+        }
+        if ((typography & STYLE_MODERN_TYPOGRAPHY_TEXT_RENDERING) != 0
+            && retained_modern_value(sheet, node, "text-rendering", value)) {
+            if (modern_keyword(value, "optimizeSpeed")) {
+                style->word_break_mode |= STYLE_FONT_KERNING_NONE;
+            } else if (modern_keyword(value, "optimizeLegibility")
+                       || modern_keyword(value, "geometricPrecision")) {
+                style->word_break_mode &= (uint8_t) ~STYLE_FONT_KERNING_NONE;
+            }
+        }
+        unsigned tab_size = parent == NULL
+            ? 8u : computed_style_tab_size(parent);
+        if ((typography & STYLE_MODERN_TYPOGRAPHY_TAB_SIZE) != 0
+            && retained_modern_value(sheet, node, "tab-size", value)) {
+            char *end = NULL;
+            unsigned long parsed = strtoul(value, &end, 10);
+            if (end != value && *end == '\0') {
+                if (parsed < 1u) parsed = 1u;
+                if (parsed > 8u) parsed = 8u;
+                tab_size = (unsigned) parsed;
+            } else if (modern_keyword(value, "initial")) {
+                tab_size = 8u;
+            }
+        }
+        unsigned tab_code = tab_size == 8u ? 0u : tab_size;
+        style->line_clamp = (uint8_t) (
+            (style->line_clamp & STYLE_LINE_CLAMP_MASK)
+            | (tab_code << STYLE_TAB_SIZE_SHIFT));
+    }
+
+    if ((mask & STYLE_MODERN_MIX_BLEND) != 0) {
+        unsigned mode = STYLE_MIX_BLEND_NORMAL;
+        if (retained_modern_value(sheet, node, "mix-blend-mode", value)) {
+            if (modern_keyword(value, "multiply")) {
+                mode = STYLE_MIX_BLEND_MULTIPLY;
+            } else if (modern_keyword(value, "screen")) {
+                mode = STYLE_MIX_BLEND_SCREEN;
+            } else if (modern_keyword(value, "darken")) {
+                mode = STYLE_MIX_BLEND_DARKEN;
+            }
+        }
+        paint.reserved = (uint8_t) (
+            (paint.reserved & ~STYLE_PAINT_MIX_BLEND_MASK) | mode);
+        paint_dirty |= mode != STYLE_MIX_BLEND_NORMAL;
+    }
+    if ((mask & STYLE_MODERN_BACKDROP_FILTER) != 0) {
+        bool found = retained_modern_value(
+            sheet, node, "backdrop-filter", value);
+        if (!found) found = retained_modern_value(
+            sheet, node, "-webkit-backdrop-filter", value);
+        unsigned radius = 0;
+        if (found) {
+            const char *blur = strstr(value, "blur(");
+            if (blur != NULL) {
+                char *end = NULL;
+                double parsed = strtod(blur + 5, &end);
+                if (end != blur + 5 && isfinite(parsed) && parsed > 0.0) {
+                    radius = parsed >= 3.0 ? 3u
+                        : (parsed >= 2.0 ? 2u : 1u);
+                }
+            }
+        }
+        paint.reserved = (uint8_t) (
+            (paint.reserved & ~STYLE_PAINT_BACKDROP_BLUR_MASK)
+            | (radius << STYLE_PAINT_BACKDROP_BLUR_SHIFT));
+        if (radius != 0u) {
+            style->has_filter = true;
+            paint_dirty = true;
+        }
+    }
 
     if ((mask & STYLE_MODERN_USER_SELECT) != 0) {
         /* `user-select` is not inherited. Its `auto` used value may be
@@ -403,6 +502,10 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
         }
         style->font_size_unit = active
             ? (uint8_t) (1u + (percent > 250u ? 250u : percent)) : 0u;
+    }
+    if (paint_dirty) {
+        (void) style_apply_paint_stack(
+            (Stylesheet *) sheet, style, &paint, NULL);
     }
 }
 
@@ -1309,7 +1412,7 @@ static void apply_paint_values(Stylesheet *sheet, ComputedStyle *style,
     uint64_t paint_high = S2_BACKGROUND_LAYERS | S2_BACKGROUND_BOX
         | S2_BACKGROUND_POSITION
         | S2_MASK_POSITION | S2_MASK_REPEAT | S2_MASK_SIZE
-        | S2_BOX_SHADOW;
+        | S2_BOX_SHADOW | S2_FILTER;
     if ((mask & (S_BACKGROUND_IMAGE | S_MASK_IMAGE | S_BACKGROUND_SIZE)) == 0
         && (mask_high & paint_high) == 0) {
         return;
@@ -1321,10 +1424,16 @@ static void apply_paint_values(Stylesheet *sheet, ComputedStyle *style,
     if (incoming == NULL) {
         if ((mask & S_MASK_IMAGE) != 0) style->mask_image = NULL;
         if ((mask & S_BACKGROUND_IMAGE) == 0
-            && (mask_high & S2_BOX_SHADOW) == 0) return;
+            && (mask_high & (S2_BOX_SHADOW | S2_FILTER)) == 0) return;
     }
     StylePaintStack merged = current == NULL
         ? (StylePaintStack) {0} : *current;
+    if ((mask_high & S2_FILTER) != 0) {
+        merged.reserved = (uint8_t) (
+            (merged.reserved & ~STYLE_PAINT_FILTER_LOW_AMOUNT)
+            | (incoming == NULL ? 0
+               : incoming->reserved & STYLE_PAINT_FILTER_LOW_AMOUNT));
+    }
     if ((mask_high & S2_BACKGROUND_LAYERS) != 0
         || (mask & S_BACKGROUND_IMAGE) != 0) {
         if (incoming != NULL
@@ -1569,7 +1678,9 @@ static void apply_values(Stylesheet *sheet, ComputedStyle *style,
             | computed_style_overflow_wrap(values));
     }
     if (mask & S_WORD_BREAK) {
-        style->word_break_mode = values->word_break_mode;
+        style->word_break_mode = (uint8_t) (
+            (style->word_break_mode & ~STYLE_WORD_BREAK_MASK)
+            | (values->word_break_mode & STYLE_WORD_BREAK_MASK));
     }
     if (mask & S_MARGIN_TOP) {
         style->margin.top = values->margin.top;
@@ -1707,7 +1818,11 @@ static void apply_values(Stylesheet *sheet, ComputedStyle *style,
                 (style->overflow_wrap & ~STYLE_TEXT_OVERFLOW_ELLIPSIS)
                 | (values->overflow_wrap & STYLE_TEXT_OVERFLOW_ELLIPSIS));
         }
-        if (clamp_authored) style->line_clamp = values->line_clamp;
+        if (clamp_authored) {
+            style->line_clamp = (uint8_t) (
+                (style->line_clamp & STYLE_TAB_SIZE_MASK)
+                | (values->line_clamp & STYLE_LINE_CLAMP_MASK));
+        }
     }
     if (mask_high & S2_OUTLINE_COLOR) {
         style->outline_color = values->outline_color;

@@ -152,6 +152,7 @@ typedef struct {
     PspMediaEventType type;
     bool autoplay;
     bool has_separate_audio;
+    bool audio_only;
     bool retain_pipeline;
     bool reuse_pipeline;
     PspMediaPresentationReadiness readiness;
@@ -175,6 +176,7 @@ typedef struct {
     uint64_t seek_generation;
     bool has_plan;
     bool has_separate_audio;
+    bool audio_only;
     bool pending_seek;
     bool pause_after_frame;
     bool preview_active;

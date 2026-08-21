@@ -10,11 +10,12 @@
 
 #include "tilefinch/browser_profile.h"
 #include "tilefinch/font.h"
+#include "tilefinch/update_history.h"
 
 #define PSP_UI_URL_CAPACITY 512
 #define PSP_UI_TITLE_CAPACITY 128
 #define PSP_UI_STATUS_CAPACITY 80
-#define PSP_UI_MENU_ITEM_COUNT 14
+#define PSP_UI_MENU_ITEM_COUNT 7
 #define PSP_UI_MEDIA_TITLE_CAPACITY 128
 #define PSP_UI_TAB_LIMIT 5
 #define PSP_UI_TAB_TITLE_CAPACITY 40
@@ -70,12 +71,16 @@ typedef struct {
 } PspUiHomeView;
 
 typedef enum {
-    PSP_UI_COLLECTION_OFFLINE = 0,
+    PSP_UI_COLLECTION_SAVED = 0,
     PSP_UI_COLLECTION_BOOKMARKS,
-    PSP_UI_COLLECTION_HISTORY
+    PSP_UI_COLLECTION_HISTORY,
+    PSP_UI_COLLECTION_DOWNLOADS,
+    PSP_UI_COLLECTION_SCREENSHOTS,
+    /* Compatibility spelling for callers predating the Saved label. */
+    PSP_UI_COLLECTION_OFFLINE = PSP_UI_COLLECTION_SAVED
 } PspUiCollectionSection;
 
-#define PSP_UI_COLLECTION_SECTION_COUNT 3u
+#define PSP_UI_COLLECTION_SECTION_COUNT 5u
 
 typedef struct {
     const char *title;
@@ -140,6 +145,7 @@ typedef enum {
     PSP_UI_ACTION_HOME,
     PSP_UI_ACTION_SAVE_FOR_LATER,
     PSP_UI_ACTION_SHOW_OFFLINE,
+    PSP_UI_ACTION_SHOW_DOWNLOADS,
     PSP_UI_ACTION_SHOW_SCREENSHOTS,
     PSP_UI_ACTION_TOGGLE_BOOKMARK,
     PSP_UI_ACTION_SWITCH_TAB,
@@ -200,6 +206,7 @@ typedef enum {
     PSP_UI_SETTING_PAGE_FONT_PERCENT,
     PSP_UI_SETTING_READER_FONT,
     PSP_UI_SETTING_REMEMBER_READER_SITE_SCALE,
+    PSP_UI_SETTING_READER_AUTO_MODE,
     PSP_UI_SETTING_CUSTOM_HOMEPAGE,
     PSP_UI_SETTING_HISTORY,
     PSP_UI_SETTING_RESTORE_LAST_PAGE,
@@ -218,6 +225,7 @@ typedef enum {
     PSP_UI_SETTING_COLOR_EMOJI,
     PSP_UI_SETTING_YOUTUBE_QUALITY,
     PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS,
+    PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY,
     PSP_UI_SETTING_VIDEO_SCALING,
     PSP_UI_SETTING_VIDEO_STARTUP_BUFFERING,
     PSP_UI_SETTING_RESUME_OFFLINE_DOWNLOADS,
@@ -308,6 +316,9 @@ typedef struct {
     bool clear_session_storage_requested;
     bool update_primary_requested;
     bool update_cancel_requested;
+    bool update_versions_requested;
+    bool update_versions_closed;
+    bool update_version_selected;
     bool load_content_blocker_allowlist_requested;
     bool voice_component_probe_requested;
     bool voice_component_primary_requested;
@@ -323,11 +334,17 @@ typedef struct {
 typedef enum {
     PSP_UI_SCREEN_PAGE = 0,
     PSP_UI_SCREEN_MENU,
+    PSP_UI_SCREEN_PAGE_TOOLS,
+    PSP_UI_SCREEN_SITE_CONTROLS,
+    PSP_UI_SCREEN_PAGE_INFORMATION,
+    PSP_UI_SCREEN_HELP,
+    PSP_UI_SCREEN_HELP_DETAIL,
     PSP_UI_SCREEN_OPTIONS,
     PSP_UI_SCREEN_OPTION_ITEMS,
     PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS,
     PSP_UI_SCREEN_GLYPH_OPTIONS,
     PSP_UI_SCREEN_UPDATE,
+    PSP_UI_SCREEN_UPDATE_VERSIONS,
     PSP_UI_SCREEN_DATA_OPTIONS,
     PSP_UI_SCREEN_DIAGNOSTIC_QR,
     PSP_UI_SCREEN_TABS,
@@ -392,6 +409,7 @@ typedef struct {
     uint8_t validation_media_test_phase;
     unsigned youtube_240p : 1;
     unsigned youtube_compact_results : 1;
+    unsigned youtube_audio_only : 1;
     /* Nearest neighbour drawn by the CPU rather than the graphics chip's
        bilinear. Clear is Smooth, which is the default. */
     unsigned video_scaling_sharp : 1;
@@ -401,6 +419,7 @@ typedef struct {
     unsigned reader_mode : 1;
     unsigned reader_font_serif : 1;
     unsigned remember_reader_site_scale : 1;
+    unsigned reader_auto_mode : 1;
     unsigned content_blocker_cosmetic_hiding : 1;
     unsigned cookie_banner_hidden : 1;
     unsigned chrome_theme : 2;
@@ -420,7 +439,8 @@ typedef struct {
     unsigned tls_session_persistence : 1;
     unsigned mixed_content_site_allowed : 1;
     unsigned third_party_cookie_site_allowed : 1;
-    unsigned collections_section : 2;
+    unsigned reader_site_always : 1;
+    unsigned collections_section : 3;
     /* The experimental decoder-program knob the Experimental screen shows, as
        an index into psp_media_wide_program_choice, and whether a saved
        selection is currently asking to restart. Seeded from the parsed boot
@@ -456,6 +476,8 @@ typedef struct {
        the value that the next connection will request. */
     unsigned network_profile : 7;
     unsigned network_profile_label_valid : 1;
+    unsigned update_history_phase : 2;
+    unsigned update_history_count : 4;
     int update_progress_per_mille;
     BrowserSearchEngine search_engine;
     BrowserColorMode color_mode;
@@ -480,6 +502,7 @@ typedef struct {
     uint8_t menu_selection;
     uint8_t options_selection;
     uint8_t options_group_selection;
+    /* Data options and Previous versions cannot be visible together. */
     uint8_t data_options_selection;
     /* Zero, or the destructive Site Data row plus one awaiting confirmation. */
     uint8_t data_clear_confirmation;
@@ -548,6 +571,8 @@ typedef struct {
             char update_notes[24];
             char update_primary_label[24];
         };
+        char update_history_versions[TILEFINCH_UPDATE_HISTORY_LIMIT]
+                                    [TILEFINCH_UPDATE_HISTORY_VERSION_CAPACITY];
         char network_profile_label[128];
     };
     /* Borrowed only while the synchronous native text-entry loop is active;
@@ -712,6 +737,10 @@ void psp_ui_set_update(
     PspUiState *ui, const char *version, const char *status,
     const char *notes, int progress_per_mille, const char *primary_label,
     bool primary_enabled, bool cancel_enabled);
+void psp_ui_set_update_history(
+    PspUiState *ui, const TilefinchUpdateHistorySnapshot *snapshot);
+bool psp_ui_update_history_tag(
+    const PspUiState *ui, size_t index, char *output, size_t capacity);
 void psp_ui_set_voice_component(
     PspUiState *ui, PspUiVoiceComponentPhase phase,
     int progress_per_mille);

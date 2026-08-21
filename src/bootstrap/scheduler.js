@@ -554,9 +554,17 @@
   const trusted = globalThis.__tilefinchTrustedEvent;
   const tilefinchEvent = (name, overrides = null) => {
     name = String(name);
-    const bubbles = !["focus", "blur", "load", "error", "scroll"].includes(
-        name,
-      ),
+    const bubbles = ![
+        "focus",
+        "blur",
+        "load",
+        "error",
+        "scroll",
+        "mouseenter",
+        "mouseleave",
+        "pointerenter",
+        "pointerleave",
+      ].includes(name),
       options = {
         bubbles,
         cancelable: [
@@ -660,6 +668,49 @@
     globalThis.__tilefinchFinishControlDefault?.(state, accepted);
     return true;
   };
+  let pointerHoverTarget = null,
+    pointerMoveProbeTarget = null,
+    pointerMarkupPossible =
+      !!globalThis.__tilefinchPointerMarkupInitiallyPresent;
+  globalThis.__tilefinchPointerMarkupChanged = () => {
+    pointerMarkupPossible = true;
+    pointerMoveProbeTarget = null;
+  };
+  const dispatchHoverTransition = (next, point) => {
+    const previous = pointerHoverTarget;
+    if (previous === next) return true;
+    const eventPath = globalThis.__tilefinchShadowEventPath,
+      previousPath = previous ? eventPath(previous, true) : [],
+      nextPath = next ? eventPath(next, true) : [];
+    let shared = 0;
+    while (
+      shared < previousPath.length &&
+      shared < nextPath.length &&
+      previousPath[previousPath.length - 1 - shared] ===
+        nextPath[nextPath.length - 1 - shared]
+    )
+      shared++;
+    const fire = (target, name, relatedTarget) =>
+      target.dispatchEvent(
+        tilefinchEvent(name, { ...point, relatedTarget }),
+      );
+    let accepted = true;
+    if (previous) accepted = fire(previous, "pointerout", next) && accepted;
+    for (let at = 0; at < previousPath.length - shared; at++)
+      accepted =
+        fire(previousPath[at], "pointerleave", next) && accepted;
+    if (next) accepted = fire(next, "pointerover", previous) && accepted;
+    for (let at = nextPath.length - shared - 1; at >= 0; at--)
+      accepted = fire(nextPath[at], "pointerenter", previous) && accepted;
+    if (previous) accepted = fire(previous, "mouseout", next) && accepted;
+    for (let at = 0; at < previousPath.length - shared; at++)
+      accepted = fire(previousPath[at], "mouseleave", next) && accepted;
+    if (next) accepted = fire(next, "mouseover", previous) && accepted;
+    for (let at = nextPath.length - shared - 1; at >= 0; at--)
+      accepted = fire(nextPath[at], "mouseenter", previous) && accepted;
+    pointerHoverTarget = next;
+    return accepted;
+  };
   globalThis.__tilefinchDispatchActivationHandle = (
     handle,
     phase = 0,
@@ -669,9 +720,28 @@
     offsetY = 0,
     buttons = 0,
   ) => {
-    const target = trustedWrap(Number(handle));
-    if (!target || target.disabled) return false;
     phase = Number(phase) | 0;
+    const target = trustedWrap(Number(handle));
+    if ((!target && phase !== 1) || (target?.disabled && phase !== 1))
+      return false;
+    if (phase === 1) {
+      const sameTarget = target === pointerHoverTarget,
+        moveObserved =
+          !!globalThis.__tilefinchPointerMoveEventsObserved?.(),
+        hoverObserved =
+          !!globalThis.__tilefinchPointerHoverEventsObserved?.();
+      if (
+        sameTarget &&
+        pointerMoveProbeTarget === target &&
+        !moveObserved
+      )
+        return true;
+      if (!sameTarget && !hoverObserved && !pointerMarkupPossible) {
+        pointerHoverTarget = target;
+        pointerMoveProbeTarget = null;
+        if (!moveObserved) return true;
+      }
+    }
     let point = null;
     if (phase) {
       clientX = Number(clientX) || 0;
@@ -691,9 +761,28 @@
     }
     const fire = (name) => target.dispatchEvent(tilefinchEvent(name, point));
     if (phase === 1) {
-      const pointerAccepted = fire("pointermove"),
+      const hoverAccepted =
+        target === pointerHoverTarget ||
+        (!globalThis.__tilefinchPointerHoverEventsObserved?.() &&
+          !pointerMarkupPossible)
+          ? true
+          : dispatchHoverTransition(target, point);
+      if (target !== pointerHoverTarget) pointerHoverTarget = target;
+      if (!target) {
+        pointerMoveProbeTarget = null;
+        return hoverAccepted;
+      }
+      let pointerAccepted = true,
+        mouseAccepted = true;
+      if (
+        globalThis.__tilefinchPointerMoveEventsObserved?.() ||
+        pointerMarkupPossible
+      ) {
+        pointerAccepted = fire("pointermove");
         mouseAccepted = fire("mousemove");
-      return pointerAccepted && mouseAccepted;
+      }
+      pointerMoveProbeTarget = target;
+      return hoverAccepted && pointerAccepted && mouseAccepted;
     }
     if (phase === 2) {
       const pointerAccepted = fire("pointerdown"),

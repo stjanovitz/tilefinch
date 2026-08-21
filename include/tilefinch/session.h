@@ -142,6 +142,15 @@ typedef struct {
        ceiling; declaration values are still parsed into each destination
        stylesheet's own intern tables. */
     BrowserSharedBody *stylesheet_parsed_ir;
+    /* Optional immutable RGBA target decoded from this exact authorized
+       image response. It shares both the response entry's partition and its
+       byte/LRU ceiling, so repeat navigations can lease pixels without a
+       second decode or a separate unbounded image cache. */
+    BrowserSharedBody *decoded_image_pixels;
+    int decoded_image_source_width;
+    int decoded_image_source_height;
+    int decoded_image_width;
+    int decoded_image_height;
     uint64_t response_body_hash;
     /* Optional final response URL when it differs from the request/cache key.
        Stylesheets use this as the base for imports and relative resources. */
@@ -460,6 +469,29 @@ bool browser_session_stylesheet_ir_put_take(
     const TilefinchRequestContext *request_context,
     const unsigned char *source, size_t source_length,
     unsigned char *ir, size_t ir_length);
+typedef struct {
+    BrowserSharedBody *pixels;
+    int source_width;
+    int source_height;
+    int width;
+    int height;
+} BrowserDecodedImage;
+/* Acquires a decoded target only from the exact partition-authorized image
+   response supplied by source/source_length. The returned lease must be
+   released with browser_shared_body_release(). */
+bool browser_session_decoded_image_acquire(
+    BrowserSession *session, const char *request_url,
+    const TilefinchRequestContext *request_context,
+    const unsigned char *source, size_t source_length,
+    BrowserDecodedImage *decoded);
+/* Retains one immutable RGBA surface under the response cache's existing
+   byte and LRU bounds. The caller keeps its lease on every return path. */
+bool browser_session_decoded_image_put(
+    BrowserSession *session, const char *request_url,
+    const TilefinchRequestContext *request_context,
+    const unsigned char *source, size_t source_length,
+    BrowserSharedBody *pixels, int source_width, int source_height,
+    int width, int height);
 bool browser_session_cache_put_http_shared(
     BrowserSession *session, const char *url, BrowserSharedBody *body,
     const char *etag, const char *last_modified, const char *content_type,

@@ -2,7 +2,7 @@
 
 *An experimental browser that runs the modern web entirely on a Sony PSP
 (333 MHz, 64 MB) with a from-scratch layout engine, JavaScript, and
-hardware-decoded video.*
+hardware-assisted video.*
 
 | Wikipedia at PSP resolution | 360p video playback |
 |---|---|
@@ -26,15 +26,15 @@ agents are capable of. A web browser was a good test of all three.
 | Feature | Support |
 |---|---|
 | **Web browsing** | Real HTTPS pages with JavaScript, cookies, images, mobile layout, and TrueType text; no proxy or companion computer. |
-| **YouTube** | Built-in lightweight provider with 240p/360p playback, seeking, buffering UI, and resumable offline downloads. |
+| **Native video** | YouTube's lightweight provider and compatible HTML `<video>` elements open one native player. Official builds use PSP firmware for 240p/360p Baseline/Main MP4. A separately built optional decoder adds 240p H.264 High and VOD HLS; seeking, buffering UI, resumable YouTube downloads, and audio-only YouTube playback are built in. |
 | **Tabs and navigation** | Five tabs, bookmarks, history, address/search suggestions, in-page find, optional session restore, and optional one-tab hibernation. |
 | **Ad blocking** | Conservative request blocking and cosmetic hiding are on by default; custom uBlock/EasyList-style rules and per-site exceptions are supported. |
 | **Cookie notices** | Common consent banners are hidden by default without clicking Accept or creating consent cookies; sites can be exempted individually. |
 | **Reader and offline modes** | Reflow articles for the PSP screen, choose sans/serif text, remember optional per-site sizing, and save articles for later. |
 | **Text entry** | PSP system keyboard or the faster Danzeff radial keyboard, with local bookmark/history completion. |
-| **Appearance** | Automatic or forced dark mode, page text scaling, three chrome themes, and installable CJK/color-emoji packs. |
+| **Appearance** | Automatic or forced dark mode, page text scaling, three chrome themes, and optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, and color-emoji glyph packs. |
 | **Native PSP UI** | First-frame home screen, Collections, clock, battery/Wi-Fi status, contextual controls, PNG screenshots, and photographed QR diagnostics. |
-| **Updates** | Signed in-app updates use A/B slots, a trial boot, automatic rollback, and explicit user approval. |
+| **Updates** | Signed in-app updates use A/B slots, a trial boot, automatic rollback, explicit approval, and an optional signed previous-version picker. |
 | **Experimental voice search** | Optional separate download; off by default and currently slow and inaccurate. |
 
 ### At a glance
@@ -57,6 +57,7 @@ agents are capable of. A web browser was a good test of all three.
 | **Useful pixels before EOF** | Streaming HTML/CSS, preload discovery, resumable layout, visible-resource priority, lazy bootstrap modules, and bounded compiled-style/script caches target first paint on a 333 MHz in-order core. |
 | **Deterministic rendering** | Host and PSP use the same layout and rasterizer, including ordered RGB565 dithering. Chrome-reference fidelity floors may only move upward ([fidelity workflow](docs/FIDELITY.md)). |
 | **Firmware video acceleration** | A raw-NAL bridge and bounded H.264 recovery-point rewriter feed the PSP Media Engine. Two guarded decode surfaces overlap conversion and presentation ([media state machine](docs/engineering/PSP_MEDIA_SESSION_STATE.md)). |
+| **Optional two-core video** | A user-built add-on can decode H.264 High at 240p by splitting CABAC/deblock/audio/color conversion onto the Media Engine while the CPU reconstructs rows. It is deliberately absent from official binaries. |
 | **360p through a 480×272 display** | 640×360 frames stage through EDRAM as two guarded strips; the GE performs bilinear downscaling without a CPU per-pixel pass ([device envelope](docs/engineering/PSP_ENVELOPE.md)). |
 | **Explicit lifecycle ownership** | Media and networking use pure reducers, epoch-tokened services, consumer leases, pumped teardown, and quarantine instead of freeing memory beneath live firmware or worker activity ([architecture](docs/ARCHITECTURE.md)). |
 | **Security without pretending to sandbox** | HTTPS-first navigation, CORS/CSP/SRI, private-network protection, partition-aware resource authority, cookie controls, and signed A/B updates are enforced within a documented shared-process model ([security model](docs/SECURITY_MODEL.md)). |
@@ -74,8 +75,10 @@ agents are capable of. A web browser was a good test of all three.
   - **PSP-E1000 (Street)** — has the memory but no Wi-Fi, so only the
     offline library would function; not a sensible target.
 - About 20 MB of free Memory Stick space for ordinary browsing and updates.
-  Optional language packs are roughly 1 MB each and the color-emoji pack is
+  Optional glyph packs are roughly 1 MB each and the color-emoji pack is
   roughly 5 MB; Tilefinch shows the signed download size before installation.
+  It keeps the selected language pack attached and can add up to two other
+  installed language packs when a page actually uses those scripts.
   Installing the optional voice model temporarily needs about 19 MB more
   (the verified download and transactional candidate coexist); 40 MB free is
   the comfortable choice if you want voice recognition.
@@ -96,29 +99,46 @@ agents are capable of. A web browser was a good test of all three.
    **Game → Memory Stick**.
 4. If you have not already done so, save a Wi-Fi connection in the PSP's own
    Network Settings. Tilefinch uses connection profile 1 by default; a
-   different saved profile can be selected in Options.
+   different saved profile can be selected in **Settings → Device & storage**.
 
 The `.tfum` and `.tfup` files on the release page are for Tilefinch's signed
 in-app updater, not manual installation. Optional language, emoji, and voice
-components are installed from their corresponding Options screens.
+components are installed from their corresponding Settings screens.
+
+### Optional H.264 High / HLS decoder
+
+Official Tilefinch releases do not redistribute the custom H.264 or AAC
+decoder. Compatible Baseline/Main MP4 continues to use the PSP firmware.
+People who want the additional 240p High-profile and VOD HLS path can build
+the add-on from the pinned upstream source by following
+[Optional PSP software decoder](docs/DEVELOPMENT.md#optional-psp-software-decoder),
+then copy its three files to
+`PSP/GAME/TILEFINCH/components/swdec/`.
+
+That directory is outside both A/B app slots. Normal signed Tilefinch updates
+therefore preserve the add-on. Update metadata carries the decoder ABI; if a
+future app update changes it, the update screen says **Decoder rebuild
+needed**. When a page needs the add-on and it is absent or incompatible,
+the player points back to these build instructions instead of reporting a
+generic video failure.
 
 ## Controls
 
 | Button | Action |
 |---|---|
 | D-pad | Move focus between links and controls (hold to repeat) |
-| Analog stick | Page cursor; hold against top/bottom edge to scroll (Options can switch to direct scrolling) |
+| Analog stick | Page cursor; hold against top/bottom edge to scroll (Settings can switch to direct scrolling) |
 | X | Activate the focused item / click under the cursor |
 | Circle | Back, or cancel the current load |
 | Square | Reload (starts voice input on a text field when Experimental Voice is on) |
 | Triangle | Show or hide the browser chrome |
 | Start | Address and search bar |
-| Select | Menu: Home, Reader mode, Tabs, Library, Options, Find, Screenshot, Exit |
+| Select | Menu: Home, Tabs, Page tools, Library, Settings, Help & diagnostics, Exit |
 | L / R | Page up / page down |
 | L held at boot | Safe start: boot the previous version (after a first update exists) |
 
 Pressing Start or activating a text field opens the selected keyboard. The PSP
-system keyboard remains the default; **Options → Browsing & input → Keyboard**
+system keyboard remains the default; **Settings → Browsing & input → Keyboard**
 enables the faster Danzeff layout. In Danzeff, move the analog stick among nine
 character groups, press Triangle/Square/X/Circle for the character in that
 direction, hold R for uppercase/symbols, and press L to switch letters/numbers.
@@ -129,32 +149,36 @@ and URL history contributes only when its existing opt-in setting is enabled.
 Type a URL to go there, or anything else to search.
 Screenshots are written incrementally to `data/screenshots/` so Memory Stick
 I/O does not freeze navigation. The completion message names the new file;
-**Library → View screenshots** lists the newest 32 captures and their sizes
+**Library → Screenshots** lists the newest 32 captures and their sizes
 without scanning the directory during boot.
 
-For long pages, choose **Menu → Find in page**. Enter a term with the selected
+For long pages, choose **Menu → Page tools → Find in page**. Enter a term with the selected
 keyboard, then use D-pad Up/Down or L/R to move between highlighted matches.
 Hold a direction to repeat. Press X or Start to edit the term and Circle to
 close Find. Results are capped at 256 so an unusually repetitive page cannot
 consume unbounded memory.
 
-Choose **Menu → Reader mode** on an article to hide surrounding navigation and
+Choose **Menu → Page tools → Reader mode** on an article to hide surrounding navigation and
 sidebars, use the full viewport width, and increase line spacing. It is a
 reversible presentation change: turning it off restores the existing page
-without refetching it. **Options → Reader font** selects Sans or Serif. The
+without refetching it. **Settings → Appearance → Reader font** selects Sans or Serif. The
 ordinary Web pages size control changes Reader text while Reader mode is open.
 **Remember size** can retain that scale for at most 16 sites; it is off by
 default, so reading and resizing articles causes no extra Memory Stick writes.
+**Auto Reader** is also off by default; when enabled, a bounded content-shape
+classifier can recognize article, media-listing, and watch pages without a
+hostname rule.
 See [docs/READER_MODE.md](docs/READER_MODE.md) for the exact boundary.
-Use **Library → Save article for later** to create a self-contained text
-snapshot, or **View offline library** to open and delete saved articles and to
+Use **Page tools → Save article** to create a self-contained text snapshot.
+The Library's Saved and Downloads sections open and delete saved articles and
 pause, resume, play, or delete YouTube downloads. The combined library is
 capped at 12 items and is not read during boot. See
 [docs/OFFLINE_LIBRARY.md](docs/OFFLINE_LIBRARY.md) for formats and limits.
 
 Basic ad blocking and conservative cosmetic hiding are on by default.
-**Options → Ad blocking** selects Off, Basic, or Custom; **Hide page ads**
-controls only cosmetic hiding, and **Allow site** bypasses both for the page's
+**Settings → Privacy & security → Content blocker** selects Off, Basic, or Custom;
+**Hide page ads** controls only cosmetic hiding, and **Page tools → Site
+controls → Content blocking** bypasses both for the page's
 registrable site. Basic performs no Memory Stick list read. Custom reads
 `data/adblock.txt`; **Load allowlist** explicitly imports extra site
 exceptions from `data/adblock-allow.txt` into the bounded 32-site resident
@@ -162,14 +186,15 @@ set. See [docs/CONTENT_BLOCKING.md](docs/CONTENT_BLOCKING.md) for the exact
 built-in hosts/selectors, accepted custom syntax, and limits.
 
 Common cookie-consent overlays are also hidden by default without clicking
-Accept or writing consent cookies. **Options → Cookie notices** can show them
-again for the current site; this preference is independent of ad blocking.
+Accept or writing consent cookies. **Page tools → Site controls → Cookie
+notices** can show them again for the current site; this preference is
+independent of ad blocking.
 
 ## Updating
 
-Updates are checked from **Options → Version / Update**. An optional
+Updates are checked from **Settings → Updates**. An optional
 background check looks for new release metadata at most twice a week and can
-be turned off in Options; Tilefinch never downloads or installs an update
+be turned off in Settings; Tilefinch never downloads or installs an update
 without you asking. Stable and Beta releases are cryptographically signed and
 verified before installation. The explicitly selected Developer channel is
 unsigned and trusts its configured endpoint. New versions install into a
@@ -177,6 +202,8 @@ second slot and boot as a trial: if the new version fails to start properly,
 the launcher automatically returns to the one that worked, and holding L at
 boot always starts the previous version on demand. Details in
 [docs/SECURE_UPDATES.md](docs/SECURE_UPDATES.md) and [SECURITY.md](SECURITY.md).
+On Stable, press Square on the update page to choose an older signed release;
+it is installed into the inactive slot and must pass the same trial boot.
 
 ## Privacy
 
@@ -185,18 +212,19 @@ boot always starts the previous version on demand. Details in
   language setting so YouTube can localize results.
 - Everything the browser stores — history (off by default), cookies, cache,
   saved pages and videos, screenshots, settings — lives on your Memory
-  Stick and nowhere else. **Options → Site data** clears HTTP caches,
+  Stick and nowhere else. **Settings → Device & storage → Manage site data** clears HTTP caches,
   cookies, local storage, and session storage individually.
 - To connect faster on a return visit, Tilefinch normally keeps the short-lived
   TLS resumption tickets that servers hand out (in `data/tls-sessions.bin`).
   These are sensitive bearer material, so they live only on your Memory
   Stick, are never sent anywhere except back to the same site, and are
-  erased along with the caches by **Options → Site data → Clear HTTP
-  caches**. **Options → Privacy → TLS ticket saving** can disable this
+  erased along with the caches by **Settings → Device & storage → Manage site
+  data → Clear HTTP caches**. **Settings → Privacy & security → TLS ticket
+  saving** can disable this
   cross-boot storage without disabling live connection reuse.
 - The device contacts only the sites you visit, plus — if the update check
   is enabled — the GitHub releases API at most twice a week to compare
-  version numbers. That check can be turned off in Options and sends no
+  version numbers. That check can be turned off in Settings and sends no
   identifying information beyond an ordinary HTTPS request.
 - On the start page, when you rest on one of your own tiles (a bookmark or a
   built-in card) for about a third of a second, Tilefinch quietly opens the
@@ -222,7 +250,9 @@ known isolation limits are documented in
   Pages that exceed the memory budget degrade or stop loading instead of
   crashing.
 - YouTube support depends on YouTube not changing things; it breaks
-  occasionally and updates fix it.
+  occasionally and updates fix it. Tilefinch does not generate YouTube
+  Proof-of-Origin (PO) tokens, so videos for which YouTube requires one may
+  remain unavailable even when browsing and search work.
 - Voice search is experimental: slow, often wrong, English only.
 - Tabs retain bounded history, URL, focus, and scroll facts rather than five
   complete page graphs, so switching tabs reloads through the shared cache.
@@ -244,12 +274,15 @@ known isolation limits are documented in
 
 If something misbehaves, start with [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 When filing a bug, include the PSP model and custom firmware (for example
-"PSP-3000, ARK-4"), the Tilefinch version from **Options → Version / Update**,
+"PSP-3000, ARK-4"), the Tilefinch version from **Help & diagnostics → Version
+& system**,
 the site or URL involved, and what you pressed. If the browser crashed, attach
 `PSP/GAME/TILEFINCH/data/tilefinch-crash.txt` from the Memory Stick — a
 512-byte file of zeros just means no crash was recorded. For suspected
-security problems, [SECURITY.md](SECURITY.md) states what the project
-protects and how to report.
+problems without convenient Memory Stick access, **Help & diagnostics →
+Diagnostic QR** displays the same bounded logs as photographable QR pages.
+For suspected security problems, [SECURITY.md](SECURITY.md) states what the
+project protects and how to report.
 
 ## Building from source (development)
 
@@ -308,10 +341,11 @@ package carries the Alpha Cephei and CMUdict license files alongside the model;
 the base browser bundle retains the PocketSphinx license required by the
 linked decoder.
 
-Optional language and color-emoji packs are likewise not part of the browser
-download. They are generated from regional Noto fonts, carry their complete
-SIL Open Font License notice and source-font digest, and are fetched only after
-the user requests one. Tilefinch does not read proprietary PSP firmware fonts.
+Optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, and color-emoji
+packs are likewise not part of the browser download. They are generated from
+Noto fonts, carry their complete SIL Open Font License notice and source-font
+digest, and are fetched only after the user requests one. Tilefinch does not
+read proprietary PSP firmware fonts.
 
 Tilefinch is an independent, unofficial homebrew project. It is not
 affiliated with, sponsored by, or endorsed by Sony Interactive

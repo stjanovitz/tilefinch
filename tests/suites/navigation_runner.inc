@@ -13,6 +13,7 @@ int main(void)
     RUN_TEST(test_markup_priority_survives_preview_pressure);
     RUN_TEST(test_background_images_continue_after_useful_paint);
     RUN_TEST(test_background_image_failure_retains_visible_prefix);
+    RUN_TEST(test_static_offscreen_images_are_pumped);
     RUN_TEST(test_web_fonts_begin_after_fallback_layout);
     RUN_TEST(test_streaming_preview_precedes_eof);
     RUN_TEST(test_streaming_preview_skips_inert_prefix_layout);
@@ -54,6 +55,7 @@ int main(void)
     RUN_TEST(test_safe_section_before_eof);
     RUN_TEST(test_mismatched_close_is_not_sealed);
     RUN_TEST(test_script_frontier_snapshot_survives_author_mutation);
+    RUN_TEST(test_navigation_keeps_server_dom_after_author_script_error);
     RUN_TEST(test_script_frontier_skips_destroyed_snapshot_nodes);
     RUN_TEST(test_script_frontier_snapshot_capacity_is_explicit);
     RUN_TEST(test_preserved_runtime_retires_replaced_document);

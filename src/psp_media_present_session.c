@@ -12,12 +12,11 @@ static void psp_media_note_stage_signature(
     PspMediaSession *media, const MediaVideoFrame *frame,
     const void *staging, int texture_width, int rows)
 {
-    (void) media;
-    if (frame == NULL || staging == NULL || frame->width <= 0
+    if (media == NULL || frame == NULL || staging == NULL || frame->width <= 0
         || frame->height <= 0 || texture_width < frame->width
         || rows < frame->height) return;
-    media_psp_backend_note_stage_signature(
-        frame,
+    media_playback_note_stage_signature(
+        media->playback, frame,
         psp_media_surface_signature(
             (const uint32_t *) staging, (unsigned) frame->width,
             (unsigned) frame->height, (unsigned) texture_width));
@@ -42,7 +41,8 @@ static int psp_media_claimed_slot(const PspMediaSession *media)
 void psp_media_present_release_claimed_surface(PspMediaSession *media)
 {
     int slot = psp_media_claimed_slot(media);
-    if (slot >= 0) media_psp_backend_release_surface((unsigned) slot);
+    if (slot >= 0)
+        media_playback_release_video_read(media->playback, (unsigned) slot);
 }
 
 /*
@@ -65,7 +65,7 @@ static void psp_media_finish_staged_surface(PspMediaSession *media)
 {
     int slot = psp_media_claimed_slot(media);
     if (slot < 0) return;
-    media_psp_backend_release_surface((unsigned) slot);
+    media_playback_release_video_read(media->playback, (unsigned) slot);
     (void) media_playback_release_video_slot(
         media->playback, (unsigned) slot, media->frame.generation);
 }
@@ -124,8 +124,9 @@ void psp_media_present_texture_for(
            finished with the rows. */
         if (media != NULL && frame != NULL && frame->pixels != NULL
             && frame->slot >= 0) {
-            (void) media_psp_backend_borrow_surface(
-                (unsigned) frame->slot, frame->generation);
+            (void) media_playback_borrow_video_slot(
+                media->playback, (unsigned) frame->slot,
+                frame->generation);
         }
         return;
     }
@@ -153,8 +154,9 @@ void psp_media_present_texture_for(
            asynchronous one hands it to psp_media_present_texture_finish,
            which drops it with the join. */
         if (frame->slot < 0
-            || !media_psp_backend_borrow_surface(
-                   (unsigned) frame->slot, frame->generation)) {
+            || !media_playback_borrow_video_slot(
+                   media->playback, (unsigned) frame->slot,
+                   frame->generation)) {
             /* The picture this present named is no longer in that slot, so
                there is nothing here to stage. Leave the texture pointing at
                the surface and let the caller draw the layout that always
@@ -185,7 +187,7 @@ void psp_media_present_texture_for(
             }
             psp_media_note_stage_signature(media, frame, staging,
                                            texture_width, rows);
-            media_psp_backend_note_frame_staged(frame);
+            media_playback_note_frame_staged(media->playback, frame);
             psp_media_finish_staged_surface(media);
             psp_media_present_emit_after_release(media);
             uint64_t elapsed_us = psp_media_internal_now_us(media) - started_us;
@@ -331,8 +333,8 @@ void psp_media_present_texture_finish(PspMediaSession *media)
          */
         media->present_stage_identity = 0;
         if (media->frame.slot >= 0) {
-            media_psp_backend_quarantine_surface(
-                (unsigned) media->frame.slot);
+            media_playback_quarantine_video_slot(
+                media->playback, (unsigned) media->frame.slot);
             media->dma_quarantine_slot = media->frame.slot;
             media->dma_quarantine_generation = media->frame.generation;
         }
@@ -358,7 +360,7 @@ void psp_media_present_texture_finish(PspMediaSession *media)
         psp_media_note_stage_signature(
             media, &media->frame, media->present_stage_pixels,
             media->present_stage_width, media->present_stage_rows);
-        media_psp_backend_note_frame_staged(&media->frame);
+        media_playback_note_frame_staged(media->playback, &media->frame);
     }
     if (joined) {
         /* The copy is the last reader of the surface on this path: every later
@@ -464,4 +466,3 @@ void psp_media_present_texture_release(PspMediaSession *media)
  *
  * Returns true when it ended the session, which ends the caller's frame.
  */
-

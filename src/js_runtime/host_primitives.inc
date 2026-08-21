@@ -308,8 +308,23 @@ static JSValue js_request_media(JSContext *context,
     }
     ScriptMediaRequest request = {
         .command = (ScriptMediaCommand) command,
-        .node_handle = handle
+        .node_handle = handle,
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE
     };
+    size_t crossorigin_length = 0;
+    const char *crossorigin = document_attribute(
+        node, "crossorigin", &crossorigin_length);
+    if (crossorigin != NULL) {
+        request.mode = TILEFINCH_REQUEST_MODE_CORS;
+        request.credentials =
+            crossorigin_length == sizeof("use-credentials") - 1u
+            && strncasecmp(
+                   crossorigin, "use-credentials",
+                   sizeof("use-credentials") - 1u) == 0
+                ? TILEFINCH_CREDENTIALS_INCLUDE
+                : TILEFINCH_CREDENTIALS_SAME_ORIGIN;
+    }
     if (argc >= 3) {
         size_t length = 0;
         const char *source = JS_ToCStringLen(context, &length, argv[2]);
@@ -345,6 +360,8 @@ static JSValue js_request_media(JSContext *context,
     bridge->media_command = request.command;
     bridge->media_node_handle = request.node_handle;
     bridge->media_value = request.value;
+    bridge->media_mode = request.mode;
+    bridge->media_credentials = request.credentials;
     bridge->media_source = source_copy;
     bridge->media_requested = true;
     bridge->node_retention_flags[slot] |= BRIDGE_NODE_NATIVE_PIN;
@@ -1206,6 +1223,65 @@ static JSValue js_callback_checkpoint(JSContext *context,
         context, "callback interrupted at task boundary");
     JS_SetUncatchableException(context, true);
     return exception;
+}
+
+/* Event-handler attributes are script, but they are not eval().  Compile the
+   exact attribute body through this host-only path so CSP's unsafe-eval gate
+   can remain closed while script-src's unsafe-inline decision is still
+   honoured.  The bootstrap calls this lazily on first dispatch and retains a
+   bounded number of compiled handlers. */
+static JSValue js_compile_inline_event_handler(JSContext *context,
+                                               JSValueConst this_value,
+                                               int argc,
+                                               JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->host == NULL || bridge->document == NULL
+        || argc < 1) {
+        return JS_ThrowInternalError(context,
+                                     "inline handler runtime unavailable");
+    }
+    if (!tilefinch_csp_allows_script_attribute(
+            &bridge->document->content_security_policy)) {
+        return JS_NULL;
+    }
+
+    size_t source_length = 0;
+    const char *source = JS_ToCStringLen(context, &source_length, argv[0]);
+    if (source == NULL) return JS_EXCEPTION;
+    enum { INLINE_HANDLER_SOURCE_LIMIT = 64 * 1024 };
+    if (source_length > INLINE_HANDLER_SOURCE_LIMIT) {
+        JS_FreeCString(context, source);
+        return JS_ThrowRangeError(context,
+                                  "inline event handler exceeds bounded size");
+    }
+
+    static const char prefix[] = "(function(event){\n";
+    static const char suffix[] = "\n})";
+    if (source_length > SIZE_MAX - sizeof(prefix) - sizeof(suffix)) {
+        JS_FreeCString(context, source);
+        return JS_ThrowRangeError(context, "inline event handler is too large");
+    }
+    size_t length = sizeof(prefix) - 1u + source_length
+        + sizeof(suffix) - 1u;
+    char *program = budget_malloc(bridge->host->budget, length + 1u);
+    if (program == NULL) {
+        JS_FreeCString(context, source);
+        return JS_ThrowOutOfMemory(context);
+    }
+    size_t used = 0;
+    memcpy(program + used, prefix, sizeof(prefix) - 1u);
+    used += sizeof(prefix) - 1u;
+    memcpy(program + used, source, source_length);
+    used += source_length;
+    memcpy(program + used, suffix, sizeof(suffix));
+    JS_FreeCString(context, source);
+    JSValue function = JS_Eval(context, program, length,
+                               "<inline-event-handler>",
+                               JS_EVAL_TYPE_GLOBAL);
+    budget_free(bridge->host->budget, program);
+    return function;
 }
 
 bool js_rt_install_function(JSContext *context, JSValue global,

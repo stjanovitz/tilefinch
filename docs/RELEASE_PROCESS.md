@@ -18,7 +18,9 @@ A release is one commit, one version, and one monotonic release sequence:
   integer the updater compares for downgrade protection. It increases by
   one for every signed release and never repeats or goes backward, even
   across version branches. Sequence order, not version order, is what the
-  device trusts.
+  device trusts during ordinary checks. The native Previous versions picker
+  may explicitly authorize one older signed sequence for one A/B trial; it
+  does not change release numbering or permit a remote downgrade.
 
 The shipped artifacts are:
 
@@ -33,6 +35,11 @@ signed release sequence.
 | `tilefinch-psp-v<version>.tfup` | Update package built from the staged slot, unsigned until the offline ceremony |
 | `tilefinch-update-v1.tfum` | Signed release metadata (fixed name; produced offline, never by the script) |
 | `SHA256SUMS.txt` | Digests of the zip and TFUP for independent verification before signing |
+
+The official zip and TFUP never contain `tilefinch-swdec.prx` or
+`swdec-meload.prx`. The cut script forces the decoder build option off and
+fails if either file appears in the staged tree. The separately buildable
+decoder add-on is user-managed and is not a release asset.
 
 ## Prerequisites
 
@@ -108,8 +115,9 @@ The script stops at the first failure. In order it:
    the marker is the only honest signal. Nothing about the gate's dev-lane
    behaviour changes: it is still Release-only and still skippable there.
 6. Deletes `build-preset-psp` and configures the PSP release from scratch
-   with the given release sequence (and trust root, when provided), so no
-   stale object or cache variable can leak into a release.
+   with the given release sequence (and trust root, when provided), explicitly
+   forcing the optional decoder component off so no stale object or cache
+   variable can leak into a release.
 7. Builds `tilefinch-psp-install-tree`: launcher and browser EBOOTs, both
    `.text` ratchets, staged fonts/TLS roots, and the staged
    notices tree. `cmake/StagePspInstall.cmake` fails this build if any
@@ -217,15 +225,16 @@ python3 tools/tilefinch_update_tool.py envelope --glyph-component \
   --output tilefinch-glyph-ja-v1.tfgm
 ```
 
-Repeat with the fixed names for `zh-hans`, `zh-hant`, `ko`, and
-`emoji-color`. The newest models release must contain every current voice and
-glyph asset pair because the device deliberately fetches fixed names from
-`releases/latest/download`. Before publishing, require a byte-identical
-producer rebuild; verify the embedded source-font SHA-256 and complete OFL;
-verify every final envelope with the embedded public root; and qualify
-install, restart, representative rendering, removal, and interrupted
-install/removal on a PSP. The default embedded fallback must remain readable
-through every failure case.
+Repeat with the fixed names for `zh-hans`, `zh-hant`, `ko`, `emoji-color`,
+`cyrillic`, and `latin-extended`. The newest models release must contain every
+current voice and glyph asset pair because the device deliberately fetches
+fixed names from `releases/latest/download`. Before publishing, require a
+byte-identical producer rebuild; verify the embedded source-font SHA-256 and
+complete OFL; verify every final envelope with the embedded public root; and
+qualify install, restart, representative rendering, removal, and interrupted
+install/removal in the isolated PPSSPP harness. A physical-PSP soak is needed
+only when shared storage, power, or raster machinery changes. The default
+embedded fallback must remain readable through every failure case.
 
 ## Rehearsing the signing ceremony
 

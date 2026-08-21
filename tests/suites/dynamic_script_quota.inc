@@ -44,13 +44,15 @@ static bool test_inline_json_assignments_avoid_compiler(Budget *budget)
         "</script>"
         "<script id='data-script'>window.bootstrapData={\"label\":\"ready\","
         "\"items\":[1,2,3]};globalThis.flags=[true,false];"
-        "window.setterData={\"label\":\"set\"};</script>"
+        "window.setterData={\"label\":\"set\"};"
+        "var mediaDefinition=[{\"quality\":240}];</script>"
         /* Unquoted keys are valid JavaScript but not strict JSON. This must
            retain the compiler fallback rather than broadening the shortcut. */
         "<script>window.javascriptLiteral={fallback:true};</script>"
         "<script>globalThis.pocSummary=bootstrapData.label+':' +"
         "bootstrapData.items.length+':'+flags.length+':' +"
-        "javascriptLiteral.fallback+':'+setterSeen;</script>"
+        "javascriptLiteral.fallback+':'+setterSeen+':' +"
+        "mediaDefinition[0].quality;</script>"
         "</head><body></body>";
     BrowserSession browser = {0};
     NavigationSession navigation = {0};
@@ -63,7 +65,7 @@ static bool test_inline_json_assignments_avoid_compiler(Budget *budget)
         8, 64u * 1024u, 32u * 1024u));
     navigation_ready = true;
     REQUIRE(strcmp(navigation.page.script_result.summary,
-                   "ready:3:2:true:set:data-script") == 0);
+                   "ready:3:2:true:set:data-script:240") == 0);
     REQUIRE(navigation.script_inline_data_fast_paths == 1u);
     REQUIRE(navigation.script_inline_data_fast_path_bytes > 32u);
     REQUIRE(navigation.script_parser_blocking == 4u);
@@ -77,6 +79,71 @@ cleanup:
                 budget->current);
         ok = false;
     }
+    return ok;
+}
+
+static bool test_inline_data_does_not_displace_logic_quota(Budget *budget)
+{
+    const char *test_name = "inline data does not displace logic quota";
+    static const char page[] =
+        "<!doctype html><head>"
+        "<script>window.pagePayload={\"items\":[1,2,3]};</script>"
+        "<script>globalThis.pocSummary='quota-data:'+pagePayload.items.length;"
+        "</script></head><body></body>";
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = false, navigation_ready = false, ok = true;
+
+    REQUIRE(browser_session_init(&browser, budget, 256u * 1024u));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(
+        &navigation, budget, &browser, "https://data-quota.test/", page,
+        1, 64u * 1024u, 32u * 1024u));
+    navigation_ready = true;
+    REQUIRE(strcmp(navigation.page.script_result.summary,
+                   "quota-data:3") == 0);
+    REQUIRE(navigation.script_inline_data_fast_paths == 1u);
+    REQUIRE(navigation.script_inline_data_quota_exemptions == 1u);
+    REQUIRE(navigation.script_skipped_quota == 0u);
+
+cleanup:
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (budget->current != 0) {
+        fprintf(stderr, "%s leaked %zu owned bytes\n", test_name,
+                budget->current);
+        ok = false;
+    }
+    return ok;
+}
+
+static bool test_static_script_cost_admission(Budget *budget)
+{
+    (void) budget;
+    const char *test_name = "static script cost admission";
+    bool ok = true;
+    char *heavy = NULL;
+    static const char small[] =
+        "const label='for while eval document.write';"
+        "for(let i=0;i<2;i++){work(i)}";
+    ScriptStaticCostProfile profile = {0};
+    script_static_cost_profile(small, sizeof(small) - 1u, &profile);
+    REQUIRE(profile.loops == 1u && profile.flags == 0u);
+    REQUIRE(!script_static_cost_rejects(&profile, true, false));
+
+    heavy = make_padded_script_source(
+        "while(ready){document.write(value);}", 400u * 1024u);
+    REQUIRE(heavy != NULL);
+    script_static_cost_profile(heavy, 400u * 1024u, &profile);
+    REQUIRE(profile.loops == 1u);
+    REQUIRE((profile.flags & SCRIPT_COST_SIGNAL_DOCUMENT_WRITE) != 0u);
+    REQUIRE(script_static_cost_rejects(&profile, true, false));
+    REQUIRE(!script_static_cost_rejects(&profile, false, false));
+    REQUIRE(!script_static_cost_rejects(&profile, true, true));
+
+cleanup:
+    free(heavy);
+    if (!ok) fprintf(stderr, "%s failed\n", test_name);
     return ok;
 }
 

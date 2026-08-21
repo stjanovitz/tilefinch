@@ -1367,9 +1367,9 @@ static int font_width_round_ratio(int64_t numerator, int64_t denominator)
     return (int) quotient;
 }
 
-int font_text_width_at_size_fixed(const FontFace *face, const char *text,
-                                  size_t length, int pixel_height_fixed,
-                                  bool bold)
+int font_text_width_at_size_fixed_mode(
+    const FontFace *face, const char *text, size_t length,
+    int pixel_height_fixed, bool bold, bool kerning)
 {
     const stbtt_fontinfo *info = font_info(face);
     if (text == NULL || pixel_height_fixed <= 0) return -1;
@@ -1416,7 +1416,7 @@ int font_text_width_at_size_fixed(const FontFace *face, const char *text,
                 at += used;
                 continue;
             }
-            if (previous != 0 && glyph != 0
+            if (kerning && previous != 0 && glyph != 0
                 && FT_HAS_KERNING(freetype->face)) {
                 FT_Vector delta = {0};
                 if (FT_Get_Kerning(freetype->face, previous, glyph,
@@ -1483,7 +1483,7 @@ int font_text_width_at_size_fixed(const FontFace *face, const char *text,
             at += used;
             continue;
         }
-        if (previous != 0) {
+        if (kerning && previous != 0) {
             int kerning = stbtt_GetCodepointKernAdvance(
                 info, (int) previous, (int) codepoint);
             if (!font_width_accumulate(
@@ -1503,6 +1503,14 @@ int font_text_width_at_size_fixed(const FontFace *face, const char *text,
         at += used;
     }
     return font_width_round_ratio(numerator, denominator);
+}
+
+int font_text_width_at_size_fixed(const FontFace *face, const char *text,
+                                  size_t length, int pixel_height_fixed,
+                                  bool bold)
+{
+    return font_text_width_at_size_fixed_mode(
+        face, text, length, pixel_height_fixed, bold, true);
 }
 
 /* Advance widths in 2048-unit em space for printable ASCII.  These are a
@@ -1547,19 +1555,19 @@ static bool family_compatible_advance(FontFamily family, unsigned codepoint,
     return true;
 }
 
-int font_text_width_for_family_at_size_fixed(
+int font_text_width_for_family_at_size_fixed_mode(
     const FontFace *face, FontFamily metric_family,
     const char *text, size_t length, int pixel_height_fixed,
-    bool synthetic_bold, bool metric_bold)
+    bool synthetic_bold, bool metric_bold, bool kerning)
 {
     if (metric_family != FONT_HUMANIST_SANS) {
-        return font_text_width_at_size_fixed(
-            face, text, length, pixel_height_fixed, synthetic_bold);
+        return font_text_width_at_size_fixed_mode(
+            face, text, length, pixel_height_fixed, synthetic_bold, kerning);
     }
     const stbtt_fontinfo *info = font_info(face);
     if (info == NULL) {
-        return font_text_width_at_size_fixed(
-            face, text, length, pixel_height_fixed, synthetic_bold);
+        return font_text_width_at_size_fixed_mode(
+            face, text, length, pixel_height_fixed, synthetic_bold, kerning);
     }
     if (text == NULL || pixel_height_fixed <= 0) return -1;
     pixel_height_fixed = bounded_pixel_height_fixed(pixel_height_fixed);
@@ -1593,7 +1601,7 @@ int font_text_width_for_family_at_size_fixed(
             at += used;
             continue;
         }
-        if (previous != 0) {
+        if (kerning && previous != 0) {
             int kerning = stbtt_GetCodepointKernAdvance(
                 info, (int) previous, (int) codepoint);
             if (!font_width_accumulate(
@@ -1632,6 +1640,16 @@ int font_text_width_for_family_at_size_fixed(
         at += used;
     }
     return font_width_round_ratio(numerator, denominator);
+}
+
+int font_text_width_for_family_at_size_fixed(
+    const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int pixel_height_fixed,
+    bool synthetic_bold, bool metric_bold)
+{
+    return font_text_width_for_family_at_size_fixed_mode(
+        face, metric_family, text, length, pixel_height_fixed,
+        synthetic_bold, metric_bold, true);
 }
 
 int font_glyph_advance_for_family_at_size_fixed(

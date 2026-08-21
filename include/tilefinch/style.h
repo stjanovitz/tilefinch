@@ -209,6 +209,10 @@ enum {
     WORD_BREAK_LEGACY
 };
 
+#define STYLE_WORD_BREAK_MASK UINT8_C(0x03)
+#define STYLE_HYPHENS_NONE UINT8_C(0x04)
+#define STYLE_FONT_KERNING_NONE UINT8_C(0x08)
+
 typedef uint8_t FloatMode;
 enum {
     FLOAT_NONE,
@@ -1149,8 +1153,46 @@ enum {
     STYLE_FILTER_INVERT,
     STYLE_FILTER_SEPIA,
     STYLE_FILTER_BRIGHTEN,
-    STYLE_FILTER_DARKEN
+    STYLE_FILTER_DARKEN,
+    STYLE_FILTER_CONTRAST,
+    STYLE_FILTER_SATURATE
 };
+
+#define STYLE_LINE_CLAMP_MASK UINT8_C(0x1f)
+#define STYLE_TAB_SIZE_SHIFT 5
+#define STYLE_TAB_SIZE_MASK UINT8_C(0xe0)
+
+static inline unsigned computed_style_line_clamp(const ComputedStyle *style)
+{
+    return style == NULL ? 0u : style->line_clamp & STYLE_LINE_CLAMP_MASK;
+}
+
+static inline unsigned computed_style_tab_size(const ComputedStyle *style)
+{
+    if (style == NULL) return 8u;
+    unsigned code = (style->line_clamp & STYLE_TAB_SIZE_MASK)
+                    >> STYLE_TAB_SIZE_SHIFT;
+    return code == 0u ? 8u : code;
+}
+
+static inline WordBreakMode computed_style_word_break(
+    const ComputedStyle *style)
+{
+    return style == NULL ? WORD_BREAK_NORMAL
+        : (WordBreakMode) (style->word_break_mode & STYLE_WORD_BREAK_MASK);
+}
+
+static inline bool computed_style_hyphens_none(const ComputedStyle *style)
+{
+    return style != NULL
+        && (style->word_break_mode & STYLE_HYPHENS_NONE) != 0;
+}
+
+static inline bool computed_style_kerning_none(const ComputedStyle *style)
+{
+    return style != NULL
+        && (style->word_break_mode & STYLE_FONT_KERNING_NONE) != 0;
+}
 
 enum {
     STYLE_WRITING_HORIZONTAL_TB,
@@ -1670,6 +1712,9 @@ typedef struct {
     /* One-based @container definition. This occupies existing alignment
        padding before origin on both host and PSP builds. */
     uint8_t container_query;
+    /* Offset of an allocation-free rightmost tag/class/id rejection key.
+       UINT8_MAX means no safe key. This consumes the final padding byte. */
+    uint8_t fast_key_offset;
     unsigned origin;
     unsigned layer;
     unsigned specificity;
@@ -1946,6 +1991,10 @@ typedef struct {
     /* Bitset of sparse modern mobile declarations present in this sheet.
        Nodes on ordinary pages skip the retained-property pass entirely. */
     uint16_t modern_property_mask;
+    /* Per-property typography presence consumes the alignment byte that
+       preceded relative_selector_cache_epoch.  It prevents one authored
+       sparse property from making every node query the other three. */
+    uint8_t modern_typography_mask;
     uint8_t relative_selector_cache_depth;
     uint32_t relative_selector_cache_epoch;
     StyleRelativeSelectorCacheEntry relative_selector_cache[

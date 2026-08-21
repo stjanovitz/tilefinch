@@ -11,6 +11,7 @@
 #include "psp_app/psp_app_internal.h"
 #include "tilefinch/psp_threads.h"
 #include "tilefinch/psp_voice_component_session.h"
+#include "tilefinch/update_history.h"
 #include "tilefinch/voice_component.h"
 #include "tilefinch_compiler.h"
 #if defined(TILEFINCH_PSP_VALIDATION_LOG) \
@@ -633,14 +634,25 @@ static TILEFINCH_COLD_PATH int psp_run_raster_qualification(
     bool emoji_requested = false;
     if (passed && glyph_component != NULL
         && glyph_component->provider != NULL) {
+        static const unsigned regional_probes[] = {
+            0x6f22u, /* CJK */
+            0x0416u, /* Cyrillic */
+            0x1ed9u  /* Extended Latin */
+        };
         uint32_t regional_key = 0, emoji_key = 0;
         unsigned width = 0;
-        regional_requested =
-            tilefinch_glyph_provider_has_codepoint(
-                glyph_component->provider, 0x6f22u,
-                &regional_key, &width)
-            && tilefinch_glyph_provider_key_pending(
-                glyph_component->provider, regional_key);
+        for (size_t probe = 0;
+             probe < sizeof(regional_probes) / sizeof(regional_probes[0]);
+             probe++) {
+            if (tilefinch_glyph_provider_has_codepoint(
+                    glyph_component->provider, regional_probes[probe],
+                    &regional_key, &width)
+                && tilefinch_glyph_provider_key_pending(
+                    glyph_component->provider, regional_key)) {
+                regional_requested = true;
+                break;
+            }
+        }
         emoji_requested =
             tilefinch_glyph_provider_has_codepoint(
                 glyph_component->provider, 0x1f600u,
@@ -659,8 +671,12 @@ static TILEFINCH_COLD_PATH int psp_run_raster_qualification(
                 engine, &report, error, sizeof(error));
             if (!passed) break;
         }
+        const unsigned attached_pack_mask =
+            (1u << TILEFINCH_GLYPH_PACK_COUNT) - 1u;
+        const unsigned language_pack_mask = attached_pack_mask
+            & ~(1u << TILEFINCH_GLYPH_PACK_COLOR_EMOJI);
         bool regional_attached =
-            (glyph_component->attached_mask & 0x0fu) != 0;
+            (glyph_component->attached_mask & language_pack_mask) != 0;
         bool emoji_attached =
             (glyph_component->attached_mask
              & (1u << TILEFINCH_GLYPH_PACK_COLOR_EMOJI)) != 0;
@@ -1037,6 +1053,111 @@ typedef struct {
     uint64_t power_transition_ms;
 } PspInteractiveResult;
 
+/* Release discovery is an explicit, rare Settings action. Keep its network
+   preparation and session replacement out of the resident frame-loop symbol;
+   the loop retains only the event gate. */
+static TILEFINCH_COLD_PATH bool psp_handle_update_version_intent(
+    PspProcessResources *process, PspBrowserResources *browser,
+    PspEngineViews *engine_views, const PspUiIntent *intent
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+    , PspNetwork *network, PspNetworkLifecycle *network_lifecycle
+#endif
+)
+{
+    if (process == NULL || browser == NULL || engine_views == NULL
+        || intent == NULL) return false;
+    if (intent->update_versions_requested) {
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+        char history_url[256];
+        bool have_history_url = tilefinch_update_history_url(
+            TILEFINCH_UPDATE_REPOSITORY_OWNER,
+            TILEFINCH_UPDATE_REPOSITORY_NAME,
+            history_url, sizeof(history_url));
+        bool network_ready = have_history_url
+            && psp_ensure_network_for_navigation(
+                   network, network_lifecycle,
+                   (int) process->config.network_profile,
+                   "GET", history_url, false,
+                   engine_views->frame, &process->presentation.ui);
+        psp_ui_set_loading(&process->presentation.ui, false, 0);
+        bool started = network_ready
+            && psp_update_session_begin_history(
+                   &browser->update_session,
+                   &process->presentation.ui);
+        if (!started) {
+            TilefinchUpdateHistorySnapshot failed = {
+                .phase = TILEFINCH_UPDATE_HISTORY_ERROR
+            };
+            psp_ui_set_update_history(&process->presentation.ui, &failed);
+        }
+#else
+        TilefinchUpdateHistorySnapshot failed = {
+            .phase = TILEFINCH_UPDATE_HISTORY_ERROR
+        };
+        psp_ui_set_update_history(&process->presentation.ui, &failed);
+#endif
+    }
+    if (intent->update_versions_closed) {
+        psp_update_session_cancel_history(
+            &browser->update_session, &process->presentation.ui);
+    }
+    if (intent->update_version_selected) {
+        char release_tag[16];
+        if (psp_ui_update_history_tag(
+                &process->presentation.ui, intent->list_index,
+                release_tag, sizeof(release_tag))) {
+            psp_update_session_destroy(&browser->update_session);
+            (void) psp_update_session_initialize(
+                &browser->update_session, browser->budget,
+                &process->install_paths,
+                &(PspUpdateSessionOptions) {
+                    .channel = BROWSER_UPDATE_CHANNEL_STABLE,
+                    .release_tag = release_tag,
+                    .allow_downgrade = true
+                }, &process->presentation.ui);
+        } else {
+            psp_ui_show_status(
+                &process->presentation.ui,
+                "OLDER VERSION IS NOT AVAILABLE", 180);
+        }
+    }
+    return true;
+}
+
+static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation(
+    PspApp *app, PspAppFrameState *frame)
+{
+    BrowserEngine *engine = app->browser->engine;
+    BrowserProfile *profile = app->browser->profile;
+    PspUiState *ui = &app->process->presentation.ui;
+    const NavigationEntry *loaded_entry =
+        navigation_current(app->views->navigation);
+    const char *loaded_url = loaded_entry == NULL
+        ? ui->url : loaded_entry->url;
+    bool site_requested = browser_profile_reader_site_always(
+        profile, loaded_url);
+    bool explicit_request = ui->reader_mode || site_requested;
+    bool automatic = browser_profile_reader_auto_mode(profile);
+    bool requested = explicit_request;
+    if (explicit_request || automatic) {
+        ReaderDocumentAnalysis analysis = {0};
+        bool prepared = browser_engine_prepare_reader(engine, &analysis);
+        if (!explicit_request)
+            requested = prepared && analysis.high_confidence;
+    }
+    if (!requested) return;
+    unsigned percent = browser_profile_page_font_percent(profile);
+    if (ui->remember_reader_site_scale)
+        (void) browser_profile_reader_site_font_percent(
+            profile, loaded_url, &percent);
+    if (!psp_set_presentation_css(
+            engine, ui, profile, true, loaded_url, percent, true)) return;
+    ui->reader_mode = true;
+    ui->page_font_percent = percent;
+    (void) psp_engine_views_refresh(app->views, engine);
+    frame->page_dirty = true;
+}
+
 /* The resident frame loop. It borrows physical owners and returns only
    cleanup telemetry; lifecycle authority remains in the media and network
    machines reached through PspApp. */
@@ -1191,6 +1312,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
     bool media_stability_lifecycle_injected = false;
     uint64_t previous_ui_sample_us =
         (uint64_t) sceKernelGetSystemTimeWide();
+    bool cursor_feedback_published_last_loop = false;
     uint64_t next_color_mode_check_us =
         previous_ui_sample_us + UINT64_C(60000000);
     unsigned power_worker_completions = 0;
@@ -1574,14 +1696,18 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             && browser->media.job_phase == PSP_MEDIA_JOB_NONE
             && !browser->media.pause_boundary_pending;
         /* A normal page frame waits here and again when the completed back
-           buffer is published. Do not give UI motion the media shortcut:
-           NEXTFRAME does not latch until vblank, so returning after a 2ms
-           poll can rotate back to and overwrite a buffer the panel is still
-           scanning. Fullscreen media owns a separately fenced presentation
-           path; menus retain the established vblank discipline. */
+           buffer is published. Continuous cursor motion is the exception:
+           its previous frame used one of three page buffers, leaving one
+           neither scanned nor queued for NEXTFRAME. A short yield samples
+           input again without the otherwise mandatory extra vblank. Video
+           remains double buffered and uses its separately fenced path. */
+        bool cursor_followup = cursor_feedback_published_last_loop;
+        cursor_feedback_published_last_loop = false;
         if (fullscreen_media_poll) {
             (void) sceKernelDelayThread(
                 PSP_MEDIA_FULLSCREEN_POLL_YIELD_US);
+        } else if (cursor_followup) {
+            (void) sceKernelDelayThread(1000);
         } else {
             sceDisplayWaitVblankStart();
         }
@@ -2137,11 +2263,14 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 && !psp_navigation_cooperate_supervised()) {
                 /* Cursor position is chrome state, so publish it before
                    hover dispatch, update work, navigation pumping, JS,
-                   or a raster slice. The prior path waited behind all of
-                   those because analog movement has no button edge. */
+                   or a raster slice. The third page scanout buffer also lets
+                   the next loop sample the nub without another full-vblank
+                   safety wait. */
                 psp_cursor_latency_sample(frame.ui_sample_us);
-                psp_present(engine_views->frame, &process->presentation.ui);
-                cursor_feedback_presented = true;
+                cursor_feedback_presented = psp_present_cursor_feedback(
+                    engine_views->frame, &process->presentation.ui);
+                cursor_feedback_published_last_loop =
+                    cursor_feedback_presented;
             }
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
             /*
@@ -2218,6 +2347,15 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 &process->presentation.ui);
             update_visual_changed = true;
         }
+        if (intent.update_versions_requested
+            || intent.update_versions_closed
+            || intent.update_version_selected)
+            update_visual_changed = psp_handle_update_version_intent(
+                process, browser, engine_views, &intent
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+                , network, network_lifecycle
+#endif
+            );
         if (intent.update_cancel_requested) {
             bool cancelled =
                 psp_update_session_cancel(&browser->update_session);
@@ -2251,9 +2389,13 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 };
                 char selected_update_url[768];
                 bool have_selected_update_url =
-                    psp_update_session_metadata_url(
-                        &selected_update, selected_update_url,
-                        sizeof(selected_update_url));
+                    browser->update_session.allow_downgrade
+                    ? psp_update_session_selected_metadata_url(
+                          &browser->update_session, selected_update_url,
+                          sizeof(selected_update_url))
+                    : psp_update_session_metadata_url(
+                          &selected_update, selected_update_url,
+                          sizeof(selected_update_url));
                 bool network_ready =
                     strcmp(process->config.trace, "none") == 0
                     && have_selected_update_url
@@ -2280,6 +2422,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             update_visual_changed = true;
         }
         if (update_visual_changed
+            && process->presentation.ui.screen
+                   != PSP_UI_SCREEN_UPDATE_VERSIONS
             && psp_update_session_initialized(&browser->update_session))
             psp_update_session_refresh_ui(&browser->update_session, &process->presentation.ui);
         if (psp_update_session_active(&browser->update_session)) {
@@ -2740,28 +2884,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     if (page_blocked != 0)
                         psp_profile_store_mark_dirty(
                             &browser->profile_store, frame.ui_sample_us);
-                    const NavigationEntry *loaded_entry =
-                        navigation_current(engine_views->navigation);
-                    const char *loaded_url = loaded_entry == NULL
-                        ? process->presentation.ui.url : loaded_entry->url;
-                    if (!process->presentation.ui.reader_mode
-                        && browser_profile_reader_site_always(
-                               browser->profile, loaded_url)) {
-                        unsigned reader_percent =
-                            browser_profile_page_font_percent(browser->profile);
-                        if (process->presentation.ui.remember_reader_site_scale)
-                            (void) browser_profile_reader_site_font_percent(
-                                browser->profile, loaded_url, &reader_percent);
-                        if (psp_set_presentation_css(
-                                browser->engine, &process->presentation.ui, browser->profile, true, loaded_url,
-                                reader_percent, true)) {
-                            process->presentation.ui.reader_mode = true;
-                            process->presentation.ui.page_font_percent = reader_percent;
-                            (void) psp_engine_views_refresh(
-                                engine_views, browser->engine);
-                            frame.page_dirty = true;
-                        }
-                    }
+                    psp_apply_reader_after_navigation(&app, &frame);
                     bool tab_restored = true;
                     if (interactive->tab_transition.pending) {
                         tab_restored = psp_tabs_finish(
@@ -3022,6 +3145,74 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             &runtime_layout_changed);
         (void) runtime_ok;
         frame.page_dirty = runtime_layout_changed || frame.page_dirty;
+        ScriptMediaRequest dom_media_request;
+        if (browser_engine_consume_media_request(
+                browser->engine, &dom_media_request)) {
+            const NavigationEntry *dom_entry =
+                navigation_current(engine_views->navigation);
+            bool same_page_media = browser->media.page_source
+                && browser->media.page_media_node_handle
+                       == dom_media_request.node_handle
+                && strcmp(browser->media.source,
+                          dom_media_request.source) == 0;
+            if (!same_page_media
+                && (dom_media_request.command == SCRIPT_MEDIA_COMMAND_PLAY
+                    || dom_media_request.command
+                           == SCRIPT_MEDIA_COMMAND_LOAD)) {
+                MediaDiscoveryKind kind = media_discovery_reference_kind(
+                    dom_media_request.source,
+                    strlen(dom_media_request.source));
+                same_page_media = dom_entry != NULL
+                    && (kind == MEDIA_DISCOVERY_HLS
+                        ? psp_media_open_page_hls(
+                            &browser->media, dom_media_request.source,
+                            dom_entry->url,
+                            engine_views->navigation->generation,
+                            dom_media_request.node_handle,
+                            dom_media_request.mode,
+                            dom_media_request.credentials,
+                            dom_media_request.command
+                                == SCRIPT_MEDIA_COMMAND_PLAY,
+                            dom_media_request.command
+                                == SCRIPT_MEDIA_COMMAND_LOAD)
+                        : psp_media_open_page_source(
+                            &browser->media, dom_media_request.source,
+                            dom_entry->url,
+                            engine_views->navigation->generation,
+                            dom_media_request.node_handle,
+                            dom_media_request.mode,
+                            dom_media_request.credentials,
+                            dom_media_request.command
+                                == SCRIPT_MEDIA_COMMAND_PLAY,
+                            dom_media_request.command
+                                == SCRIPT_MEDIA_COMMAND_LOAD));
+            }
+            if (same_page_media) {
+                if (dom_media_request.command == SCRIPT_MEDIA_COMMAND_SEEK) {
+                    double seconds = dom_media_request.value;
+                    if (seconds >= 0.0
+                        && seconds <= (double) UINT64_MAX / 1000000.0) {
+                        (void) psp_media_request_seek(
+                            &browser->media,
+                            (uint64_t) (seconds * 1000000.0), false);
+                    }
+                } else if ((dom_media_request.command
+                                == SCRIPT_MEDIA_COMMAND_PLAY
+                            && !browser->media.ui.playing)
+                           || (dom_media_request.command
+                                   == SCRIPT_MEDIA_COMMAND_PAUSE
+                               && browser->media.ui.playing)) {
+                    psp_media_execute_intent(
+                        &browser->media, (PspUiMediaIntent) {
+                            .action = PSP_UI_MEDIA_ACTION_PLAY_PAUSE
+                        });
+                }
+            } else {
+                (void) browser_engine_update_media_state(
+                    browser->engine, dom_media_request.node_handle,
+                    SCRIPT_MEDIA_STATE_ERROR, 0.0, 0.0);
+            }
+        }
         if (frame.page_dirty) {
             if (!render_job_pending) {
                 render_job_last_progress_us =
@@ -3083,6 +3274,29 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                and the cancel law run on. Without this an open that nothing
                was pumping had neither. */
             media_visual_changed = true;
+        }
+        if (browser->media.page_source
+            && browser->media.page_media_node_handle > 0) {
+            uint64_t now_us = frame.ui_sample_us;
+            if (browser->media.page_media_report_us == 0
+                || now_us - browser->media.page_media_report_us
+                       >= UINT64_C(250000)) {
+                ScriptMediaState state = browser->media.ui.failed
+                    ? SCRIPT_MEDIA_STATE_ERROR
+                    : browser->media.ui.ended
+                        ? SCRIPT_MEDIA_STATE_ENDED
+                        : browser->media.playback == NULL
+                            ? SCRIPT_MEDIA_STATE_LOADING
+                            : browser->media.ui.playing
+                                ? SCRIPT_MEDIA_STATE_PLAYING
+                                : SCRIPT_MEDIA_STATE_PAUSED;
+                (void) browser_engine_update_media_state(
+                    browser->engine, browser->media.page_media_node_handle,
+                    state, (double) browser->media.clock_us / 1000000.0,
+                    (double) psp_media_duration_us(&browser->media)
+                        / 1000000.0);
+                browser->media.page_media_report_us = now_us;
+            }
         }
         if (media_open_before && psp_navigation_cooperate_active())
             psp_work_cooperate_refresh_media(&browser->media.ui);
@@ -4618,7 +4832,8 @@ int main(int argc, char *argv[])
         .maximum_free_block = psp_media_platform_maximum_free_block,
         .resolve_offline = psp_offline_store_resolve_media,
         .profile_changed = psp_media_platform_profile_changed,
-        .write_failure_report = psp_media_platform_write_failure_report
+        .write_failure_report = psp_media_platform_write_failure_report,
+        .install_paths = &process.install_paths
     };
     psp_media_init(
         &browser.media, browser.budget, browser.session, browser.profile, process.storage.profile,
@@ -4701,6 +4916,8 @@ int main(int argc, char *argv[])
         browser_profile_reader_font(browser.profile) == BROWSER_READER_FONT_SERIF;
     process.presentation.ui.remember_reader_site_scale =
         browser_profile_remember_reader_site_scale(browser.profile);
+    process.presentation.ui.reader_auto_mode =
+        browser_profile_reader_auto_mode(browser.profile);
     process.presentation.ui.custom_homepage_enabled =
         browser_profile_custom_homepage_enabled(browser.profile);
     process.presentation.ui.history_enabled = browser_profile_history_enabled(browser.profile);
@@ -4748,6 +4965,8 @@ int main(int argc, char *argv[])
             == BROWSER_YOUTUBE_QUALITY_240P;
     process.presentation.ui.youtube_compact_results =
         browser_profile_youtube_compact_results(browser.profile);
+    process.presentation.ui.youtube_audio_only =
+        browser_profile_youtube_audio_only(browser.profile);
     process.presentation.ui.video_scaling_sharp =
         browser_profile_video_scaling(browser.profile)
             == BROWSER_VIDEO_SCALING_SHARP;
@@ -5088,11 +5307,12 @@ int main(int argc, char *argv[])
 report:
     psp_log_set_phase(PSP_LOG_PHASE_REPORT);
     printf("tilefinch-psp-script: total-elapsed=%llums height=%d links=%zu "
-           "budget=%zu peak=%zu\n",
+           "glyph-scripts=0x%02x budget=%zu peak=%zu\n",
            (unsigned long long) (((uint64_t) sceKernelGetSystemTimeWide()
                                   - load_started_us) / 1000u),
            engine_views.navigation->page.layout.height,
            engine_views.navigation->page.layout.link_count,
+           (unsigned) browser_engine_glyph_script_mask(browser.engine),
            browser.budget->current, browser.budget->peak);
     /* The four diagnostic counters are uint64_t, not size_t. Printing them
        with %zu read four bytes of an eight-byte vararg slot, and the o32 ABI's

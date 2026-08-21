@@ -1,3 +1,29 @@
+static int test_committed_document_glyph_script_hints(void)
+{
+    BrowserConfig config;
+    browser_config_init(&config, NULL);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    char error[128] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    static const char html[] =
+        "<!doctype html><title>Scripts</title><body>"
+        "&#x0416; &#x1ED9; &#x6F22; &#x3042; &#xD55C;";
+    const uint8_t expected = DOCUMENT_GLYPH_SCRIPT_CYRILLIC
+        | DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED
+        | DOCUMENT_GLYPH_SCRIPT_HAN
+        | DOCUMENT_GLYPH_SCRIPT_JAPANESE
+        | DOCUMENT_GLYPH_SCRIPT_KOREAN;
+    CHECK(engine != NULL
+          && browser_engine_commit_html(
+                 engine, "https://scripts.test/", html,
+                 sizeof(html) - 1u, true)
+          && browser_engine_glyph_script_mask(engine) == expected);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static int test_responsive_navigation_convergence(void)
 {
     BrowserDeviceProfile profile;

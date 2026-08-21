@@ -227,14 +227,42 @@ run_once() {
     emulator_stderr="$run_dir/ppsspp-stderr.log"
     mkdir -p "$app_dir" "$home_dir/.config/ppsspp/PSP/SYSTEM"
     : >"$home_dir/.config/ppsspp/PSP/SYSTEM/controls.ini"
-    cp "$build_dir/EBOOT.PBP" "$build_dir/roots.pem" "$app_dir/"
-    for asset_dir in fonts voice-model; do
-        if [ -d "$build_dir/$asset_dir" ]; then
-            cp -R "$build_dir/$asset_dir" "$app_dir/$asset_dir"
-        fi
-    done
-    cp "$script_source" "$app_dir/input-script.txt"
-    validation_log="$app_dir/tilefinch-validation.txt"
+    # Release qualification can seed signed optional components into this
+    # run's isolated Memory Stick. Components require the real slotted layout,
+    # so only this opt-in path launches the staged A/B install tree. Normal
+    # scripted-input runs preserve the faster legacy single-EBOOT fixture.
+    component_stage=${TILEFINCH_PPSSPP_COMPONENT_STAGE:-}
+    if [ -n "$component_stage" ]; then
+        [ -d "$component_stage/components" ] \
+            && [ -f "$component_stage/profile.cfg" ] || {
+            printf 'invalid optional-component stage: %s\n' \
+                "$component_stage" >&2
+            return 1
+        }
+        install_tree="$build_dir/tilefinch-install/Tilefinch"
+        [ -f "$install_tree/EBOOT.PBP" ] \
+            && [ -f "$install_tree/slot-a/EBOOT.PBP" ] || {
+            printf 'missing launcher install tree: %s\n' "$install_tree" >&2
+            return 1
+        }
+        cp -R "$install_tree/." "$app_dir/"
+        mkdir -p "$app_dir/components"
+        cp -R "$component_stage/components/." "$app_dir/components/"
+        cp "$component_stage/profile.cfg" "$app_dir/data/profile.cfg"
+        cp "$script_source" "$app_dir/slot-a/input-script.txt"
+        config_path="$app_dir/data/boot-overrides.cfg"
+        validation_log="$app_dir/data/tilefinch-validation.txt"
+    else
+        cp "$build_dir/EBOOT.PBP" "$build_dir/roots.pem" "$app_dir/"
+        for asset_dir in fonts voice-model; do
+            if [ -d "$build_dir/$asset_dir" ]; then
+                cp -R "$build_dir/$asset_dir" "$app_dir/$asset_dir"
+            fi
+        done
+        cp "$script_source" "$app_dir/input-script.txt"
+        config_path="$app_dir/boot.cfg"
+        validation_log="$app_dir/tilefinch-validation.txt"
+    fi
 
     {
         printf '%s\n' \
@@ -253,7 +281,7 @@ run_once() {
             "validation_media_play=0" \
             "validation_media_stability_auto=0" \
             "validation_power_test_auto=0"
-    } >"$app_dir/boot.cfg"
+    } >"$config_path"
 
     {
         printf '%s\n' \
@@ -440,18 +468,33 @@ fi
 if [ "$scenario" = cursor-latency ]; then
     cursor_line=$(grep 'tilefinch-ui-cadence: phase=controlled-exit' \
         "$telemetry_log" | tail -1 || true)
+    cursor_cadence_line=$(grep \
+        'tilefinch-cursor-cadence: phase=controlled-exit' \
+        "$telemetry_log" | tail -1 || true)
     cursor_samples=$(printf '%s\n' "$cursor_line" \
         | sed -n 's/.*cursor-samples=\([0-9][0-9]*\).*/\1/p')
     cursor_presents=$(printf '%s\n' "$cursor_line" \
         | sed -n 's/.*cursor-presents=\([0-9][0-9]*\).*/\1/p')
     cursor_coalesced=$(printf '%s\n' "$cursor_line" \
         | sed -n 's/.*cursor-coalesced=\([0-9][0-9]*\).*/\1/p')
+    cursor_intervals=$(printf '%s\n' "$cursor_cadence_line" \
+        | sed -n 's/.*intervals=\([0-9][0-9]*\).*/\1/p')
+    cursor_cadence_average=$(printf '%s\n' "$cursor_cadence_line" \
+        | sed -n 's/.*average=\([0-9][0-9]*\)us.*/\1/p')
     [ -n "$cursor_samples" ] && [ "$cursor_samples" -gt 0 ] \
         && [ "$cursor_samples" = "$cursor_presents" ] \
         && [ "$cursor_coalesced" = 0 ] || {
         printf '%s\n' \
             'FAIL: cursor samples did not receive one immediate accepted presentation.' \
             "$cursor_line" >&2
+        exit 1
+    }
+    [ -n "$cursor_intervals" ] && [ "$cursor_intervals" -gt 0 ] \
+        && [ -n "$cursor_cadence_average" ] \
+        && [ "$cursor_cadence_average" -le 20000 ] || {
+        printf '%s\n' \
+            'FAIL: cursor sampling did not sustain near-display cadence.' \
+            "$cursor_cadence_line" >&2
         exit 1
     }
 fi
@@ -494,7 +537,8 @@ grep 'outcome=' "$trace" || true
 # that raced the work from one that merely followed it.
 grep 'tilefinch-input-telemetry: ' "$telemetry_log" || true
 [ "$scenario" != cursor-latency ] \
-    || grep 'tilefinch-ui-cadence: phase=controlled-exit' "$telemetry_log"
+    || grep -E \
+        'tilefinch-(ui|cursor)-cadence: phase=controlled-exit' "$telemetry_log"
 printf 'artifacts: %s\n' "$result_dir"
 rm -rf "$session_dir"
 printf '\nscripted input: PASS (%s, %s run(s))\n' "$scenario" "$runs"

@@ -48,10 +48,17 @@ static bool script_inline_data_scan(
         }
         if (at == length) break;
         if (count >= SCRIPT_INLINE_DATA_ASSIGNMENT_LIMIT) return false;
+        static const char var_prefix[] = "var";
         static const char window_prefix[] = "window.";
         static const char global_prefix[] = "globalThis.";
         size_t prefix_length = 0;
-        if (sizeof(window_prefix) - 1u <= length - at
+        if (sizeof(var_prefix) - 1u < length - at
+            && memcmp(source + at, var_prefix,
+                      sizeof(var_prefix) - 1u) == 0
+            && isspace((unsigned char) source[at + sizeof(var_prefix) - 1u])) {
+            at = script_inline_data_skip_space(
+                source, length, at + sizeof(var_prefix) - 1u);
+        } else if (sizeof(window_prefix) - 1u <= length - at
             && memcmp(source + at, window_prefix,
                       sizeof(window_prefix) - 1u) == 0) {
             prefix_length = sizeof(window_prefix) - 1u;
@@ -59,8 +66,6 @@ static bool script_inline_data_scan(
                    && memcmp(source + at, global_prefix,
                              sizeof(global_prefix) - 1u) == 0) {
             prefix_length = sizeof(global_prefix) - 1u;
-        } else {
-            return false;
         }
         at += prefix_length;
         if (at == length || !script_inline_data_identifier_start(source[at])) {
@@ -132,6 +137,45 @@ static void script_inline_data_clear_exception(JSContext *context)
     JS_FreeValue(context, exception);
 }
 
+static bool script_inline_data_source(
+    lxb_dom_node_t *script_node, const char **source, size_t *source_length)
+{
+    if (source != NULL) *source = NULL;
+    if (source_length != NULL) *source_length = 0;
+    if (script_node == NULL || source == NULL || source_length == NULL) {
+        return false;
+    }
+    for (lxb_dom_node_t *child = script_node->first_child;
+         child != NULL; child = child->next) {
+        size_t length = 0;
+        const char *text = document_text_data(child, &length);
+        if (text == NULL || length == 0) continue;
+        /* Requiring one raw-text span keeps classification allocation-free. */
+        if (*source != NULL) return false;
+        *source = text;
+        *source_length = length;
+    }
+    return *source != NULL;
+}
+
+bool script_runtime_inline_data_candidate(
+    lxb_dom_node_t *script_node, size_t *source_bytes)
+{
+    if (source_bytes != NULL) *source_bytes = 0;
+    const char *source = NULL;
+    size_t source_length = 0;
+    if (!script_inline_data_source(script_node, &source, &source_length)) {
+        return false;
+    }
+    ScriptInlineDataAssignment items[SCRIPT_INLINE_DATA_ASSIGNMENT_LIMIT];
+    memset(items, 0, sizeof(items));
+    size_t item_count = 0;
+    bool candidate = script_inline_data_scan(
+        source, source_length, items, &item_count);
+    if (candidate && source_bytes != NULL) *source_bytes = source_length;
+    return candidate;
+}
+
 ScriptInlineDataEvaluation script_runtime_evaluate_inline_data(
     ScriptRuntime *runtime, lxb_dom_node_t *script_node,
     size_t *source_bytes)
@@ -142,15 +186,8 @@ ScriptInlineDataEvaluation script_runtime_evaluate_inline_data(
     }
     const char *source = NULL;
     size_t source_length = 0;
-    for (lxb_dom_node_t *child = script_node->first_child;
-         child != NULL; child = child->next) {
-        size_t length = 0;
-        const char *text = document_text_data(child, &length);
-        if (text == NULL || length == 0) continue;
-        /* Requiring one raw-text span keeps rejection allocation-free. */
-        if (source != NULL) return SCRIPT_INLINE_DATA_FALLBACK;
-        source = text;
-        source_length = length;
+    if (!script_inline_data_source(script_node, &source, &source_length)) {
+        return SCRIPT_INLINE_DATA_FALLBACK;
     }
     ScriptInlineDataAssignment items[SCRIPT_INLINE_DATA_ASSIGNMENT_LIMIT];
     memset(items, 0, sizeof(items));

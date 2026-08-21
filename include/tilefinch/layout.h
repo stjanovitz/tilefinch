@@ -69,6 +69,9 @@
    authored whitespace before a run and the start of a block flow. */
 #define LAYOUT_TEXT_FIND_SPACE_BEFORE (1 << 23)
 #define LAYOUT_TEXT_FIND_BLOCK_START (1 << 24)
+/* font-kerning:none is a text-only paint/measurement flag in the remaining
+   radius bits; it does not consume the compositing bits in font_italic. */
+#define LAYOUT_TEXT_KERNING_NONE (1 << 25)
 /* Authored font-weight is retained divided by ten and is bounded at 100.
    Its spare high bit carries the positioned paint phase without growing the
    PSP display list. */
@@ -145,6 +148,20 @@ typedef struct {
 #define LAYOUT_COMMAND_FONT_ITALIC UINT8_C(1)
 #define LAYOUT_COMMAND_ROTATION_SHIFT 1
 #define LAYOUT_COMMAND_ROTATION_MASK UINT8_C(6)
+/* Bits 3..7 are paint metadata for all commands.  Text italic/rotation stay
+   in bits 0..2, so these additions do not grow the display list. */
+#define LAYOUT_COMMAND_BLEND_SHIFT 3
+#define LAYOUT_COMMAND_BLEND_MASK UINT8_C(0x18)
+#define LAYOUT_COMMAND_FILTER_LOW_AMOUNT UINT8_C(0x20)
+#define LAYOUT_COMMAND_BACKDROP_BLUR_SHIFT 6
+#define LAYOUT_COMMAND_BACKDROP_BLUR_MASK UINT8_C(0xc0)
+
+enum {
+    LAYOUT_MIX_BLEND_NORMAL,
+    LAYOUT_MIX_BLEND_MULTIPLY,
+    LAYOUT_MIX_BLEND_SCREEN,
+    LAYOUT_MIX_BLEND_DARKEN
+};
 
 static inline bool draw_command_font_italic(const DrawCommand *command)
 {
@@ -168,6 +185,41 @@ static inline void draw_command_set_rotation_quadrants(
         (command->font_italic & ~LAYOUT_COMMAND_ROTATION_MASK)
         | ((quadrants << LAYOUT_COMMAND_ROTATION_SHIFT)
            & LAYOUT_COMMAND_ROTATION_MASK));
+}
+
+static inline unsigned draw_command_blend_mode(const DrawCommand *command)
+{
+    return command == NULL ? 0u
+        : (command->font_italic & LAYOUT_COMMAND_BLEND_MASK)
+          >> LAYOUT_COMMAND_BLEND_SHIFT;
+}
+
+static inline void draw_command_set_blend_mode(
+    DrawCommand *command, unsigned mode)
+{
+    if (command == NULL) return;
+    command->font_italic = (uint8_t) (
+        (command->font_italic & ~LAYOUT_COMMAND_BLEND_MASK)
+        | ((mode << LAYOUT_COMMAND_BLEND_SHIFT)
+           & LAYOUT_COMMAND_BLEND_MASK));
+}
+
+static inline unsigned draw_command_backdrop_blur(
+    const DrawCommand *command)
+{
+    return command == NULL || command->type != DRAW_FILL_RECT ? 0u
+        : (command->font_italic & LAYOUT_COMMAND_BACKDROP_BLUR_MASK)
+          >> LAYOUT_COMMAND_BACKDROP_BLUR_SHIFT;
+}
+
+static inline void draw_command_set_backdrop_blur(
+    DrawCommand *command, unsigned radius)
+{
+    if (command == NULL || command->type != DRAW_FILL_RECT) return;
+    command->font_italic = (uint8_t) (
+        (command->font_italic & ~LAYOUT_COMMAND_BACKDROP_BLUR_MASK)
+        | ((radius << LAYOUT_COMMAND_BACKDROP_BLUR_SHIFT)
+           & LAYOUT_COMMAND_BACKDROP_BLUR_MASK));
 }
 
 static inline FontFamily draw_command_font_family(
@@ -376,6 +428,13 @@ static inline bool draw_command_text_find_space_before(
 {
     return command != NULL && command->type == DRAW_TEXT
         && (command->radius & LAYOUT_TEXT_FIND_SPACE_BEFORE) != 0;
+}
+
+static inline bool draw_command_text_kerning_none(
+    const DrawCommand *command)
+{
+    return command != NULL && command->type == DRAW_TEXT
+        && (command->radius & LAYOUT_TEXT_KERNING_NONE) != 0;
 }
 
 static inline bool draw_command_text_find_block_start(

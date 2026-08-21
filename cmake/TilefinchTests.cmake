@@ -74,6 +74,30 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-media-mp4-tests COMMAND tilefinch-media-mp4-tests)
     set_tests_properties(tilefinch-media-mp4-tests PROPERTIES
         LABELS "tilefinch;unit;media" TIMEOUT 30)
+    add_executable(tilefinch-swdec-ts-tests
+        tests/test_swdec_ts.c src/swdec/swdec_ts.c)
+    target_include_directories(tilefinch-swdec-ts-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/swdec)
+    add_test(NAME tilefinch-swdec-ts-tests COMMAND tilefinch-swdec-ts-tests)
+    set_tests_properties(tilefinch-swdec-ts-tests PROPERTIES
+        LABELS "tilefinch;unit;media;parser" TIMEOUT 30)
+    add_executable(tilefinch-swdec-bounds-tests tests/test_swdec_bounds.c)
+    target_include_directories(tilefinch-swdec-bounds-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/swdec)
+    add_test(NAME tilefinch-swdec-bounds-tests
+        COMMAND tilefinch-swdec-bounds-tests)
+    set_tests_properties(tilefinch-swdec-bounds-tests PROPERTIES
+        LABELS "tilefinch;unit;media;security" TIMEOUT 10)
+    add_executable(tilefinch-media-hls-tests tests/test_media_hls.c)
+    target_link_libraries(tilefinch-media-hls-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-media-hls-tests COMMAND tilefinch-media-hls-tests)
+    set_tests_properties(tilefinch-media-hls-tests PROPERTIES
+        LABELS "tilefinch;unit;media;network;parser" TIMEOUT 30)
+    add_executable(tilefinch-reader-mode-tests tests/test_reader_mode.c)
+    target_link_libraries(tilefinch-reader-mode-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-reader-mode-tests COMMAND tilefinch-reader-mode-tests)
+    set_tests_properties(tilefinch-reader-mode-tests PROPERTIES
+        LABELS "tilefinch;unit;reader;performance" TIMEOUT 30)
     add_executable(tilefinch-host-media-timing-tests
         tests/test_host_media_timing.c)
     add_test(NAME tilefinch-host-media-timing-tests
@@ -426,6 +450,16 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;psp;ui"
         TIMEOUT 10)
 
+    add_executable(tilefinch-psp-media-presentation-tests
+        tests/test_psp_media_presentation.c)
+    target_link_libraries(tilefinch-psp-media-presentation-tests PRIVATE
+        tilefinch_psp_ui)
+    add_test(NAME tilefinch-psp-media-presentation-tests
+        COMMAND tilefinch-psp-media-presentation-tests)
+    set_tests_properties(tilefinch-psp-media-presentation-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;media;ui;state"
+        TIMEOUT 10)
+
     add_executable(tilefinch-diagnostic-qr-tests
         tests/test_diagnostic_qr.c)
     target_link_libraries(tilefinch-diagnostic-qr-tests PRIVATE
@@ -514,6 +548,7 @@ if(PSP_BROWSER_BUILD_TESTS)
 
     add_library(tilefinch_psp_power_test_ui STATIC
         src/psp_ui.c
+        src/psp_ui_menu.c
         src/psp_power_policy.c)
     target_include_directories(tilefinch_psp_power_test_ui PUBLIC include)
     target_link_libraries(

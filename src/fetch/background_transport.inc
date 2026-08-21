@@ -92,7 +92,6 @@ bool fetch_background_transport_stream_shape_supported(
 #if defined(TILEFINCH_PSP_OWNED_TRANSPORT)
 
 #define FETCH_BACKGROUND_EVENT_WAKE 0x1u
-#define FETCH_BACKGROUND_RESPONSE_COOKIE_BYTES (16u * 1024u)
 /* libcurl may deliver another CURL_MAX_WRITE_SIZE (normally 16 KiB) body
    callback before observing the published pause state. Hand the current
    chunk to the browser with one such callback of spare capacity. */
@@ -144,12 +143,6 @@ typedef struct {
     uint16_t value_offset;
     uint16_t value_length;
 } FetchBackgroundCookie;
-
-typedef enum {
-    FETCH_BACKGROUND_COOKIE_CAPTURED = 0,
-    FETCH_BACKGROUND_COOKIE_TRUNCATED,
-    FETCH_BACKGROUND_COOKIE_REJECTED
-} FetchBackgroundCookieCapture;
 
 typedef struct {
     atomic_int state;
@@ -345,16 +338,13 @@ static unsigned char *fetch_background_slot_buffer(
 static FetchBackgroundCookieCapture fetch_background_capture_cookie(
     FetchBackgroundSlot *slot, const char *value, size_t value_length)
 {
-    if (slot == NULL || value == NULL
-        || value_length == 0 || value_length >= FETCH_SET_COOKIE_LIMIT)
+    if (slot == NULL || value == NULL)
         return FETCH_BACKGROUND_COOKIE_REJECTED;
-    if (slot->response_cookie_count >= FETCH_RESPONSE_COOKIE_CAPACITY)
-        return FETCH_BACKGROUND_COOKIE_TRUNCATED;
-    if (value_length > UINT16_MAX
-        || value_length + 1u > FETCH_BACKGROUND_RESPONSE_COOKIE_BYTES
-                               - slot->response_cookie_bytes) {
-        return FETCH_BACKGROUND_COOKIE_REJECTED;
-    }
+    FetchBackgroundCookieCapture policy =
+        fetch_background_cookie_capture_policy(
+            value_length, slot->response_cookie_count,
+            slot->response_cookie_bytes);
+    if (policy != FETCH_BACKGROUND_COOKIE_CAPTURED) return policy;
     size_t value_offset = slot->response_cookie_bytes;
     memcpy(slot->response_cookie_storage + value_offset, value, value_length);
     slot->response_cookie_storage[value_offset + value_length] = '\0';
@@ -539,15 +529,13 @@ static size_t fetch_background_receive_header(
         if (slot->header_status >= 100 && slot->header_status < 200) {
             fetch_background_reset_response_headers(slot);
         } else {
-            if (!slot->single_hop
-                && slot->result.set_cookies_truncated
-                && slot->header_status >= 300
-                && slot->header_status < 400
-                && slot->location[0] != '\0') {
+            if (slot->result.set_cookies_truncated
+                && fetch_background_redirect_cookie_overflow_fatal(
+                       slot->single_hop, slot->header_status,
+                       slot->location[0] != '\0')) {
                 snprintf(
                     slot->result.error, sizeof(slot->result.error),
-                    "redirect response exceeded the %u-cookie transport limit",
-                    (unsigned) FETCH_RESPONSE_COOKIE_CAPACITY);
+                    "%s", "redirect response cookies exceeded transport bounds");
                 return 0;
             }
             slot->result.status_code = slot->header_status;
@@ -2636,12 +2624,9 @@ bool fetch_background_transport_take_fetch_result_consumed(
     bool cookies_ok = true;
     bool cookie_capacity_rejected = false;
     bool redirect_response =
-        (slot->result.status_code == 301
-         || slot->result.status_code == 302
-         || slot->result.status_code == 303
-         || slot->result.status_code == 307
-         || slot->result.status_code == 308)
-        && slot->location[0] != '\0';
+        fetch_background_redirect_cookie_overflow_fatal(
+            slot->single_hop, slot->result.status_code,
+            slot->location[0] != '\0');
     for (size_t i = 0; i < slot->response_cookie_count; i++) {
         if (result->set_cookie_count >= FETCH_RESPONSE_COOKIE_CAPACITY) {
             if (redirect_response) {
@@ -2685,8 +2670,7 @@ bool fetch_background_transport_take_fetch_result_consumed(
         if (cookie_capacity_rejected) {
             snprintf(
                 result->error, sizeof(result->error),
-                "redirect response exceeded the %u-cookie transport limit",
-                (unsigned) FETCH_RESPONSE_COOKIE_CAPACITY);
+                "%s", "redirect response cookies exceeded transport bounds");
         } else {
             snprintf(result->error, sizeof(result->error), "%s",
                      "background response cookies exceeded shared memory budget");

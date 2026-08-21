@@ -84,6 +84,7 @@ void psp_leave_reader_for_navigation(
     BrowserEngine *engine, PspUiState *ui, const BrowserProfile *profile,
     const char *url)
 {
+    browser_engine_set_reader_candidate_mode(engine, false);
     unsigned global_percent = browser_profile_page_font_percent(profile);
     ui->reader_mode = false;
     ui->page_font_percent = global_percent;
@@ -124,6 +125,7 @@ bool psp_reader_navigation_prepare(
             destination_percent, false)) {
         return false;
     }
+    browser_engine_set_reader_candidate_mode(engine, true);
     *navigation = prepared;
     ui->page_font_percent = destination_percent;
     return true;

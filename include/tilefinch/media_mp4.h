@@ -103,7 +103,16 @@ typedef struct {
     const unsigned char *codec_config;
     size_t codec_config_length;
     uint8_t nal_length_size;
+    /* Container representation delivered by read_sample. Zero preserves the
+       MP4 contract; streaming containers may deliver decoder-ready units. */
+    uint8_t packet_format;
 } MediaMp4TrackInfo;
+
+typedef enum {
+    MEDIA_PACKET_FORMAT_CONTAINER_NATIVE = 0,
+    MEDIA_PACKET_FORMAT_H264_ANNEX_B,
+    MEDIA_PACKET_FORMAT_AAC_ADTS
+} MediaPacketFormat;
 
 typedef struct {
     size_t track_index;
@@ -115,6 +124,7 @@ typedef struct {
     uint32_t duration;
     uint32_t timescale;
     bool keyframe;
+    uint8_t packet_format;
 } MediaMp4Sample;
 
 typedef struct MediaMp4Demux MediaMp4Demux;
@@ -136,6 +146,18 @@ bool media_h264_sps_dimensions(
 bool media_h264_avcc_dimensions(
     const unsigned char *config, size_t length,
     uint16_t *width, uint16_t *height, uint8_t *nal_length_size);
+typedef enum {
+    MEDIA_H264_DECODER_ROUTE_UNSUPPORTED = 0,
+    MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE,
+    /* Extension seam for an Annex-B High-profile decoder. The current
+       firmware backend reports this route distinctly instead of pretending
+       the Baseline/Main program can accept it. */
+    MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION
+} MediaH264DecoderRoute;
+MediaH264DecoderRoute media_h264_avcc_decoder_route(
+    const unsigned char *config, size_t length, uint8_t *profile_idc);
+MediaH264DecoderRoute media_h264_codec_string_decoder_route(
+    const char *mime, uint8_t *profile_idc);
 /*
  * Validates one length-prefixed AVC access unit using the same bounded
  * contract as the PSP firmware bridge. Every NAL must fit exactly. The
@@ -146,6 +168,12 @@ bool media_h264_avcc_sample_is_admitted(
     const unsigned char *payload, size_t length,
     uint8_t nal_length_size, uint16_t width, uint16_t height,
     const unsigned char *config, size_t config_length);
+/* Decoder-ready Annex-B companion to the avcC admission rule. Every in-band
+   SPS must preserve the geometry used to size downstream decoder and RGB
+   surfaces. Access units without an SPS retain the previously admitted one. */
+bool media_h264_annexb_sample_is_admitted(
+    const unsigned char *payload, size_t length,
+    uint16_t width, uint16_t height);
 typedef struct {
     uint32_t sample_rate;
     uint16_t channels;

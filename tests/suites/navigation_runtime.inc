@@ -15,6 +15,59 @@ static void script_frontier_probe(void *opaque, size_t script_index,
     probe->active_calls++;
 }
 
+static bool test_navigation_keeps_server_dom_after_author_script_error(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Usable result</title><body>"
+        "<main id=server-content><h1>Server-rendered page</h1>"
+        "<a href='/next'>Continue reading</a></main>"
+        "<script>throw new Error('missing optional dependency')</script>"
+        "<script>globalThis.pocSummary='later-script-ran'</script>"
+        "</body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 8, 64 * 1024, 32 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://soft-script.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    lxb_dom_node_t *content = committed ? test_find_id(
+        lxb_dom_interface_node(navigation.page.document.html),
+        "server-content") : NULL;
+    bool ok = committed && navigation.page.loaded && content != NULL
+        && navigation.script_failed == 1u
+        && navigation.page.script_result.scripts_evaluated == 1u
+        && strcmp(navigation.page.script_result.summary,
+                  "later-script-ran") == 0
+        && strstr(navigation.page.script_result.error,
+                  "missing optional dependency") != NULL;
+    if (!ok) {
+        fprintf(stderr,
+                "soft script ready=%d committed=%d loaded=%d failed=%zu "
+                "evaluated=%zu summary=\"%s\" error=\"%s\" nav=\"%s\"\n",
+                ready, committed, navigation.page.loaded,
+                navigation.script_failed,
+                navigation.page.script_result.scripts_evaluated,
+                navigation.page.script_result.summary,
+                navigation.page.script_result.error,
+                navigation.last_error);
+    }
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_script_frontier_snapshot_survives_author_mutation(void)
 {
     static const char html[] =

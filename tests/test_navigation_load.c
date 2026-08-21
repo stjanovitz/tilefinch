@@ -82,6 +82,15 @@ static bool background_image_continuation_replay_begin(void)
         error, sizeof(error));
 }
 
+static bool deferred_document_images_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-deferred-document-images",
+        error, sizeof(error));
+}
+
 static bool streaming_preview_replay_begin(void)
 {
     char error[256] = {0};
@@ -494,6 +503,91 @@ static bool test_background_image_failure_retains_visible_prefix(void)
         && budget_active_allocations(&budget, NULL) == 0
         && budget_categories_reconcile(&budget);
     if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_static_offscreen_images_are_pumped(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Deferred images</title>"
+        "<style>html,body{margin:0}img{display:block;width:24px;height:24px}"
+        "#tail{margin-top:600px}</style>"
+        "<body><img id=hero src=/hero.svg>"
+        "<img id=tail src=/tail.svg></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && deferred_document_images_replay_begin();
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_static_html(
+        &navigation, generation, "https://deferred-images.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    size_t relayouts_before = navigation.performance.fast_relayouts
+        + navigation.performance.full_relayouts;
+    bool first_frame = committed && navigation.page.loaded
+        && navigation.page.images.stats.loaded == 1
+        && navigation.page.deferred_image_count == 1
+        && navigation.page.deferred_image_job == NULL
+        && navigation_background_resources_pending(&navigation);
+    bool admitted = first_frame
+        && navigation_run_background_resources(&navigation);
+    bool yielded_to_owner = admitted
+        && navigation.page.images.stats.loaded == 1
+        && navigation.page.deferred_image_job != NULL
+        && fetch_scheduler_pending(navigation.page.resource_scheduler) == 1
+        && navigation.performance.background_image_batches == 1
+        && navigation.performance.fast_relayouts
+               + navigation.performance.full_relayouts == relayouts_before;
+    size_t pumps = 0;
+    while (yielded_to_owner
+           && navigation_background_resources_pending(&navigation)
+           && pumps++ < 12u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+    }
+    size_t relayouts_after = navigation.performance.fast_relayouts
+        + navigation.performance.full_relayouts;
+    bool ok = yielded_to_owner && navigation.page.loaded
+        && !navigation_background_resources_pending(&navigation)
+        && navigation.page.images.stats.loaded == 2
+        && navigation.performance.background_images_loaded == 1
+        && navigation.performance.background_image_relayouts == 1
+        && navigation.performance.background_image_failures == 0
+        && relayouts_after == relayouts_before + 1
+        && pumps >= 3u;
+    if (!ok) {
+        fprintf(stderr,
+                "deferred-images ready=%d committed=%d first=%d "
+                "admitted=%d yielded=%d page=%d pending=%d images=%zu "
+                "queue=%zu/%zu job=%d fetch=%zu pumps=%zu batches=%zu "
+                "loaded=%zu relayout=%zu failures=%zu error=\"%s\"\n",
+                ready, committed, first_frame, admitted, yielded_to_owner,
+                navigation.page.loaded,
+                navigation_background_resources_pending(&navigation),
+                navigation.page.images.stats.loaded,
+                navigation.page.deferred_image_cursor,
+                navigation.page.deferred_image_count,
+                navigation.page.deferred_image_job != NULL,
+                fetch_scheduler_pending(
+                    navigation.page.resource_scheduler),
+                pumps, navigation.performance.background_image_batches,
+                navigation.performance.background_images_loaded,
+                navigation.performance.background_image_relayouts,
+                navigation.performance.background_image_failures,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
 }
 

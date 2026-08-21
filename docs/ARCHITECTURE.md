@@ -9,7 +9,8 @@ system reserves (PPSSPP reports 47 MiB). That process heap is not page
 authority: page and voice work share a 32 MiB envelope, and the ordinary page
 profile admits at most 24 MiB. Within those bounds Tilefinch fetches HTTPS
 pages, parses HTML and CSS, runs JavaScript, lays out modern mobile sites,
-rasterizes them, and presents video through PSP firmware.
+rasterizes them, and presents video through PSP firmware or the bounded
+two-core software decoder.
 
 The constrained target is not a reduced-quality build of a desktop design.
 It shapes the architecture:
@@ -139,9 +140,15 @@ authoritative layout. Before the old graph is destroyed, the candidate also
 prepares the controller and tile shell. The final adoption moves already-owned
 state and cannot allocate.
 
-This transaction is also used by reader mode and site adapters. A failure may
-leave the user on the old page or on a bounded error surface, but it does not
-publish half a DOM with stale controller or render state.
+The same candidate-shell transaction carries Reader presentation across page
+navigations. After a page is active, its first Reader request runs one bounded,
+budget-charged content-shape pass and caches the resulting article, listing,
+watch, or raw classification beside the page. When Reader is already active,
+the candidate DOM is classified and journaled before its first authoritative
+layout, avoiding an author-layout/Reader-layout pair. User CSS and marker
+installation are both transactional. A navigation failure may leave the user
+on the old page or on a bounded error surface, but it does not publish half a
+candidate with stale controller or render state.
 
 The experimental compressed-section mode is the named exception: replacing a
 resident section may retire its old DOM before materializing its neighbor in
@@ -171,6 +178,10 @@ The engine uses several PSP-specific fast paths without changing results:
 - compiled stylesheet fragments are reused within bounded RAM caches, never
   written to the Memory Stick;
 - preview layout limits work to geometry capable of affecting the viewport;
+- simple script-free pages load visible images before publication, then pump
+  offscreen images one viewport-ranked request and one decode at a time from
+  idle work; input and navigation therefore never wait on thumbnail network
+  I/O, and decoded repeat-navigation hits remain in the bounded RAM cache;
 - image discovery carries computed parent style instead of rebuilding the
   cascade per image;
 - repeated gradients, glyphs, and tiles use bounded caches with measured
@@ -233,6 +244,13 @@ sources and committed bytecode agree.
 
 Page scripts have source, count, heap, time, and callback-work admission.
 Interrupt checks cover QuickJS execution and native callback boundaries.
+Inert JSON script types remain DOM data, while a narrow classic-script subset
+(`window`, `globalThis`, `var`, or bare global assignments of strict JSON)
+installs its data without compiling bytecode or consuming executable quota.
+Large cross-origin classic bundles pass an allocation-free lexical cost scan;
+only high-cost bodies are shed, with source size and watchdog-miss signals
+retained as tuning telemetry. Rejection is page-local and server-rendered
+content remains usable.
 Compiled external scripts and parsed stylesheet fragments may be reused from
 bounded in-memory caches during a process lifetime; neither cache writes
 compiled code to storage.
@@ -330,13 +348,74 @@ Transitions produce commands; codec drain, DMA join, transport cancellation,
 and pipeline release return completion events. No state which owns a pipeline
 can jump directly to a resource-free terminal state.
 
-The PSP video path demuxes fragmented or progressive MP4, submits AVC through
-the firmware bridge, and color-converts into two generation-tagged surfaces.
+The ordinary PSP video path demuxes fragmented or progressive MP4, submits AVC
+through the firmware bridge, and color-converts into two generation-tagged surfaces.
 Each surface moves through `FREE → ME_WRITING → READY → DMA_READING → FREE`.
 DMA and codec completions carry slot identity and generation, stale
 completions are discarded, and a timed-out reader quarantines rather than
 returning memory to a writer. Video is staged in EDRAM and scaled by the GE;
 240p and 360p use the same ownership protocol.
+
+H.264 High at up to 432×240 can use a replaceable, user-built
+software-decoder PRX instead. Official browser releases contain the loader
+but no custom H.264/AAC decoder binary. The component lives outside the A/B
+slots, carries a small ABI record, and survives ordinary app updates; a
+missing or incompatible component fails this route with an actionable player
+message while firmware-compatible video remains available.
+It keeps FFmpeg's decoder allocations inside one admitted arena, runs CABAC,
+deblock, AAC, and most RGB565 conversion on the Media Engine, reconstructs
+rows on the CPU, and publishes into a 25-slot generation-tagged ring. The
+display clock slips forward instead of racing when a frame is more than 8 ms
+late; quality rungs depend only on ring occupancy; and audio may not advance
+more than 80 ms past the displayed picture. Once this path takes ownership of
+the Media Engine, every later AVC/AAC route stays on it until suspend or
+process exit. Suspend detaches and restores firmware ME state before the
+power transition; resume reattaches before another software decode.
+
+Every buffer shared with the Media Engine is allocated on an isolated 64-byte
+cache line with tail padding, so range cache maintenance cannot touch Budget
+metadata or a neighboring object. CPU-authored AAC packets are written back
+before submission, completed RGB surfaces are invalidated before the browser
+reads them, and reordered pictures recover presentation timestamps from the
+source-AU mapping rather than the decoder's completion order. Each Annex-B
+access unit revalidates any in-band SPS against the admitted geometry; the
+decoder independently bounds returned pictures, and CSC receives the exact
+byte capacity of its destination slot. AAC output is admitted only when its
+channel count fits the component's fixed two-plane ABI. After software
+takeover, later Baseline/Main streams must also fit the software route's
+432×240 bound; larger streams fail admission instead of being sent to an
+incompatible backend.
+
+The player has one source-independent packet pipeline. The built-in provider supplies
+resolved split or progressive streams, offline downloads supply bounded local
+files, and compatible page `<video>` elements supply an authorized progressive
+MP4 or VOD HLS URL. MP4 performs a one-byte standard HTTP Range probe. HLS
+parses bounded master/media playlists and streams at most the current and next
+MPEG-TS segment through the shared worker. Both retain response authority and
+feed the same decoder, buffering, seek, clock, and presentation services. HLS
+queues at most 64 samples and 576 KiB of payload; it rejects encrypted, live,
+fragmented-MP4, and byte-range playlists. Neither route writes media bytes to
+the Memory Stick. HLS seek resets only the selected segment and preserves an
+untouched in-flight request across repeated cooperative readiness probes;
+video-only variants may prime as soon as their PMT and first video sample are
+known rather than filling the entire first segment.
+
+YouTube audio-only mode is a route-time pipeline choice, not a hidden video
+surface. It admits only the resolver's adaptive AAC representation, creates no
+video range or demuxer, and allocates no MPEG decoder or decoded-picture
+surfaces. The ordinary media state machine, range recovery, clock, buffering,
+pause, and seek contracts remain authoritative. Page `<video>` and saved media
+are deliberately unaffected by this global YouTube preference.
+
+When a server-rendered `<video>` omits `src`, activation may perform one
+bounded, allocation-free scan of retained data scripts and generic media
+attributes for direct MP4, HLS, or WebM references. Candidate selection is
+hostname-independent, prefers the lowest direct MP4 quality at or above 240p,
+and still crosses URL resolution, CSP, request authority, and media probing.
+The media layer classifies SPS profile before decoder construction: Baseline
+and Main use firmware until software takeover, while compatible High streams
+select the software path. WebM and unsupported HLS forms fail as formats,
+rather than being misreported as firmware failures.
 
 Audio and video share one prepared codec-job queue. Presentation follows media
 timestamps, uses bounded startup preroll and adaptive rebuffering, and records

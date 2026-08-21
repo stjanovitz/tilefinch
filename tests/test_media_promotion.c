@@ -41,6 +41,111 @@ static uint64_t magnitude_i64(int64_t value)
         ? (uint64_t) INT64_MAX + 1u : (uint64_t) -value;
 }
 
+static uint64_t advance_available_video(
+    uint64_t numerator, uint64_t denominator, uint64_t audio_us,
+    uint64_t available_until_us, uint64_t *presented_us,
+    uint64_t *next_frame)
+{
+    uint64_t frame_duration_us =
+        (denominator * UINT64_C(1000000) + numerator - 1u) / numerator;
+    /* The PSP has two decoded surfaces. One visit may retire both stale
+       pictures; subsequent visits refill them. This bound models that
+       ownership limit instead of granting an unrealistic unbounded catch-up
+       loop to the host. */
+    unsigned inspected = 0;
+    while (inspected++ < 2u) {
+        uint64_t candidate = frame_time_us(
+            *next_frame, numerator, denominator);
+        if (candidate > available_until_us) break;
+        if (host_media_timing_frame_is_stale(
+                candidate, audio_us, frame_duration_us)) {
+            (*next_frame)++;
+            continue;
+        }
+        if (!host_media_timing_should_present(
+                *presented_us, audio_us, candidate)) break;
+        *presented_us = candidate;
+        (*next_frame)++;
+    }
+    return magnitude_i64(host_media_timing_delta(audio_us, *presented_us));
+}
+
+static void check_skew_recovery_deadlines(
+    uint64_t numerator, uint64_t denominator)
+{
+    const uint64_t skew_target_us = UINT64_C(75000);
+    const uint64_t tick_us = UINT64_C(31000);
+    uint64_t presented_us = 0;
+    uint64_t next_frame = 1u;
+
+    /* Startup may have decoded behind the newly audible cursor. Two-surface
+       retirement must return under 75 ms within five PSP loop visits. */
+    uint64_t audio_us = UINT64_C(240000);
+    uint64_t elapsed_us = 0;
+    uint64_t skew_us = UINT64_MAX;
+    while (elapsed_us <= 5u * tick_us && skew_us > skew_target_us) {
+        skew_us = advance_available_video(
+            numerator, denominator, audio_us, audio_us,
+            &presented_us, &next_frame);
+        if (skew_us <= skew_target_us) break;
+        elapsed_us += tick_us;
+    }
+    CHECK(skew_us <= skew_target_us && elapsed_us <= 5u * tick_us);
+
+    /* A burst loss can leave audio ahead before buffering takes effect. Once
+       delivery returns, the bounded decoded queue converges promptly. */
+    audio_us += UINT64_C(420000);
+    elapsed_us = 0;
+    skew_us = magnitude_i64(host_media_timing_delta(
+        audio_us, presented_us));
+    while (elapsed_us <= UINT64_C(250000) && skew_us > skew_target_us) {
+        skew_us = advance_available_video(
+            numerator, denominator, audio_us, audio_us,
+            &presented_us, &next_frame);
+        elapsed_us += tick_us;
+    }
+    CHECK(skew_us <= skew_target_us && elapsed_us <= UINT64_C(250000));
+
+    /* Slow recovery freezes the audible cursor while one authored frame
+       arrives every 60 ms. It may take wall time, but skew must decrease
+       monotonically and cross the target within the calculable queue drain. */
+    audio_us += UINT64_C(250000);
+    uint64_t available_us = presented_us;
+    uint64_t previous_skew = magnitude_i64(host_media_timing_delta(
+        audio_us, presented_us));
+    elapsed_us = 0;
+    while (elapsed_us <= UINT64_C(600000)
+           && previous_skew > skew_target_us) {
+        available_us += UINT64_C(60000);
+        uint64_t next_skew = advance_available_video(
+            numerator, denominator, audio_us, available_us,
+            &presented_us, &next_frame);
+        CHECK(next_skew <= previous_skew);
+        previous_skew = next_skew;
+        elapsed_us += UINT64_C(60000);
+    }
+    CHECK(previous_skew <= skew_target_us
+          && elapsed_us <= UINT64_C(600000));
+
+    /* If a seek candidate is ahead, nearest-frame admission holds it until
+       audio catches up instead of increasing the lead. */
+    uint64_t ahead_frame = next_frame;
+    uint64_t ahead_us = frame_time_us(
+        ahead_frame, numerator, denominator) + UINT64_C(150000);
+    audio_us = ahead_us - UINT64_C(150000);
+    presented_us = ahead_us;
+    elapsed_us = 0;
+    while (elapsed_us <= UINT64_C(160000)
+           && magnitude_i64(host_media_timing_delta(
+                  audio_us, presented_us)) > skew_target_us) {
+        audio_us += tick_us;
+        elapsed_us += tick_us;
+    }
+    CHECK(magnitude_i64(host_media_timing_delta(
+              audio_us, presented_us)) <= skew_target_us
+          && elapsed_us <= UINT64_C(160000));
+}
+
 /*
  * Exercise the production nearest-frame and audible-clock helpers against an
  * irregular PSP-shaped polling cadence.  Three refills and one user pause
@@ -204,6 +309,10 @@ int main(void)
     check_rate(25u, 1u);
     check_rate(30000u, 1001u);
     check_rate(30u, 1u);
+
+    puts("test: startup, loss and slow recovery converge below 75 ms");
+    check_skew_recovery_deadlines(24000u, 1001u);
+    check_skew_recovery_deadlines(30u, 1u);
 
     puts("test: seek adoption returns to nearest-frame presentation");
     check_seek_alignment(24000u, 1001u);

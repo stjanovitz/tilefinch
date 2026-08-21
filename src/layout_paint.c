@@ -4,6 +4,16 @@
 
 #include "layout_internal.h"
 
+_Static_assert((int) STYLE_MIX_BLEND_NORMAL == (int) LAYOUT_MIX_BLEND_NORMAL,
+               "style/layout blend encodings must match");
+_Static_assert((int) STYLE_MIX_BLEND_MULTIPLY
+                   == (int) LAYOUT_MIX_BLEND_MULTIPLY,
+               "style/layout blend encodings must match");
+_Static_assert((int) STYLE_MIX_BLEND_SCREEN == (int) LAYOUT_MIX_BLEND_SCREEN,
+               "style/layout blend encodings must match");
+_Static_assert((int) STYLE_MIX_BLEND_DARKEN == (int) LAYOUT_MIX_BLEND_DARKEN,
+               "style/layout blend encodings must match");
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1633,6 +1643,10 @@ bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,
                         bool flex_or_grid_item)
 {
     LayoutDocument *layout = context->layout;
+    const StylePaintStack *paint = stylesheet_paint_stack(
+        context->sheet, computed_style_paint_stack_id(style));
+    unsigned blend_mode = paint == NULL ? STYLE_MIX_BLEND_NORMAL
+        : paint->reserved & STYLE_PAINT_MIX_BLEND_MASK;
     bool effective_z_index = style->has_z_index
         && (style->out_of_flow || style->relative_position
             || style->fixed_position || style->sticky_position
@@ -1648,6 +1662,16 @@ bool apply_visual_range(LayoutContext *context, lxb_dom_node_t *node,
         for (size_t i = command_start; i < layout->count; i++) {
             draw_command_set_filter_code(
                 &layout->commands[i], computed_style_filter_code(style));
+            if (paint != NULL
+                && (paint->reserved & STYLE_PAINT_FILTER_LOW_AMOUNT) != 0) {
+                layout->commands[i].font_italic |=
+                    LAYOUT_COMMAND_FILTER_LOW_AMOUNT;
+            }
+        }
+    }
+    if (blend_mode != STYLE_MIX_BLEND_NORMAL) {
+        for (size_t i = command_start; i < layout->count; i++) {
+            draw_command_set_blend_mode(&layout->commands[i], blend_mode);
         }
     }
     if (effective_z_index) {

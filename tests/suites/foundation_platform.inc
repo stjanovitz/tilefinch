@@ -108,15 +108,16 @@ static bool test_youtube_player_response_parser(void)
         .split_streams = true
     };
     if (!youtube_direct_delivery_admitted("IOS", &direct)
-        || !youtube_direct_delivery_admitted("ANDROID_VR", &direct)
+        || !youtube_direct_delivery_admitted("VISIONOS", &direct)
         || !youtube_direct_delivery_admitted(
                "WEB_EMBEDDED_PLAYER", &direct)
+        || youtube_direct_delivery_admitted("ANDROID_VR", &direct)
         || youtube_direct_delivery_admitted("UNKNOWN", &direct)) {
         return false;
     }
     direct.content_length++;
     if (youtube_direct_delivery_admitted("IOS", &direct)
-        || youtube_direct_delivery_admitted("ANDROID_VR", &direct)
+        || !youtube_direct_delivery_admitted("VISIONOS", &direct)
         || !youtube_direct_delivery_admitted(
                "WEB_EMBEDDED_PLAYER", &direct)) {
         return false;
@@ -124,7 +125,7 @@ static bool test_youtube_player_response_parser(void)
     direct.content_length--;
     direct.audio_content_length++;
     if (youtube_direct_delivery_admitted("IOS", &direct)
-        || youtube_direct_delivery_admitted("ANDROID_VR", &direct)) {
+        || !youtube_direct_delivery_admitted("VISIONOS", &direct)) {
         return false;
     }
     if (youtube_playability_is_globally_terminal(
@@ -1005,6 +1006,10 @@ static int test_foundation(void)
     CHECK(test_parser_scripting_noscript_model(&budget));
     CHECK(budget.current == 0);
 
+    puts("test: visible text emits bounded glyph-script hints");
+    CHECK(test_visible_text_glyph_script_hints(&budget));
+    CHECK(budget.current == 0);
+
     puts("test: parser lifecycle close-element checkpoints");
     CHECK(test_parser_lifecycle_hook(&budget));
     CHECK(budget.current == 0);
@@ -1066,6 +1071,7 @@ static int test_foundation(void)
     CHECK(test_image_virtual_cancel_bound(&budget));
     CHECK(test_image_request_no_progress_bound(&budget));
     CHECK(test_image_request_policy_and_cookies(&budget));
+    CHECK(test_decoded_image_cache_partition_and_lifetime(&budget));
     CHECK(budget.current == 0);
 
     puts("test: installable platform services");
@@ -1178,6 +1184,24 @@ static int test_foundation(void)
     CHECK(zero_calloc != NULL && budget_usable_size(zero_calloc) == 1
           && zero_calloc[0] == 0);
     budget_free(&budget, zero_calloc);
+
+    puts("test: cache-line Budget allocations isolate shared payloads");
+    size_t cacheline_before = budget.current;
+    unsigned char *cacheline_probe = budget_malloc_cacheline_category(
+        &budget, BUDGET_CATEGORY_RESOURCE, 65u);
+    CHECK(cacheline_probe != NULL
+          && ((uintptr_t) cacheline_probe & 63u) == 0u
+          && budget_usable_size(cacheline_probe) == 65u
+          && budget_owns(&budget, cacheline_probe)
+          && budget.current > cacheline_before + 65u);
+    if (cacheline_probe != NULL) {
+        memset(cacheline_probe, 0x6d, 65u);
+        CHECK(cacheline_probe[0] == 0x6d && cacheline_probe[64] == 0x6d);
+        CHECK(budget_realloc(&budget, cacheline_probe, 128u) == NULL
+              && budget_owns(&budget, cacheline_probe));
+        budget_free(&budget, cacheline_probe);
+    }
+    CHECK(budget.current == cacheline_before);
 
     puts("test: empty-ledger recovery remains diagnosable");
     Budget repair_budget;

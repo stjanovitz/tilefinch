@@ -199,6 +199,7 @@ const char *psp_ui_action_name(PspUiAction action)
         case PSP_UI_ACTION_HOME: return "home";
         case PSP_UI_ACTION_SAVE_FOR_LATER: return "save-for-later";
         case PSP_UI_ACTION_SHOW_OFFLINE: return "show-offline";
+        case PSP_UI_ACTION_SHOW_DOWNLOADS: return "show-downloads";
         case PSP_UI_ACTION_SHOW_SCREENSHOTS: return "show-screenshots";
         case PSP_UI_ACTION_TOGGLE_BOOKMARK: return "toggle-bookmark";
         case PSP_UI_ACTION_SWITCH_TAB: return "switch-tab";
@@ -255,6 +256,7 @@ const char *psp_ui_action_acknowledgement(PspUiAction action)
         case PSP_UI_ACTION_HOME: return "OPENING HOME...";
         case PSP_UI_ACTION_SAVE_FOR_LATER: return "SAVING ARTICLE...";
         case PSP_UI_ACTION_SHOW_OFFLINE: return "OPENING OFFLINE LIBRARY...";
+        case PSP_UI_ACTION_SHOW_DOWNLOADS: return "OPENING DOWNLOADS...";
         case PSP_UI_ACTION_SHOW_SCREENSHOTS: return "OPENING SCREENSHOTS...";
         case PSP_UI_ACTION_TOGGLE_BOOKMARK:
             return "UPDATING BOOKMARKS...";
@@ -725,6 +727,8 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
         ui->third_party_cookie_site_allowed =
             browser_profile_third_party_cookie_site_allowed(
                 profile, view.url);
+        ui->reader_site_always =
+            browser_profile_reader_site_always(profile, view.url);
         ContentBlockerMetrics blocker_metrics = {0};
         bool have_blocker_metrics = browser_engine_content_blocker_metrics(
             engine, &blocker_metrics);

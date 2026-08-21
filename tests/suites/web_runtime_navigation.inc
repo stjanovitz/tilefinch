@@ -119,8 +119,11 @@
         "<title>Runtime</title><style>"
         "#status{display:block;color:#123456}"
         "#draw,#remove-on-down{display:block;width:120px;height:40px}"
-        "[data-unrelated]{color:#654321}</style><body>"
-        "<p id=status>WAITING</p><div id=draw tabindex=0></div>"
+        "[data-unrelated]{color:#654321}</style>"
+        "<body onload=\"document.body.setAttribute('data-body-load',event.type)\">"
+        "<p id=status>WAITING</p><div id=inline "
+        "onclick=\"this.setAttribute('data-first',event.type);return false\"></div>"
+        "<div id=draw tabindex=0></div>"
         "<div id=remove-on-down></div><a href='/next'>NEXT PAGE</a>"
         "<form action='/submit' method='post'><input id=edit name=q value='A'>"
         "<button id=go name=send value=Go>GO</button></form>"
@@ -135,8 +138,13 @@
         "status.addEventListener('load',()=>status.setAttribute('data-load','yes'));"
         "const edit=document.getElementById('edit');"
         "status.addEventListener('click',()=>status.setAttribute('data-pointer','yes'));"
+        "const inline=document.getElementById('inline');"
+        "status.setAttribute('data-inline-accepted',String(inline.dispatchEvent(new MouseEvent('click',{cancelable:true}))));"
+        "inline.setAttribute('onclick',\"this.setAttribute('data-second',event.type)\");inline.dispatchEvent(new MouseEvent('click'));"
+        "inline.onclick=function(event){this.setAttribute('data-third',event.type)};inline.dispatchEvent(new MouseEvent('click'));"
         "const draw=document.getElementById('draw'),drawEvents=[];"
         "for(const type of ['pointermove','mousemove','pointerdown','mousedown','focus','pointerup','mouseup','click'])draw.addEventListener(type,event=>{drawEvents.push(type==='focus'?'focus':type+':'+event.clientX+','+event.clientY+':'+event.buttons+':'+event.offsetX+','+event.offsetY);status.setAttribute('data-draw',drawEvents.join('|'))});"
+        "const hoverEvents=[];for(const type of ['pointerover','pointerenter','pointerout','pointerleave','mouseover','mouseenter','mouseout','mouseleave'])draw.addEventListener(type,event=>{hoverEvents.push(type+':'+(event.relatedTarget?.id||'null'));status.setAttribute('data-hover',hoverEvents.join('|'))});"
         "document.getElementById('remove-on-down').addEventListener('pointerdown',event=>event.currentTarget.remove());"
         "const editActivation=[];for(const type of ['pointerdown','mousedown','focus','pointerup','mouseup','click'])edit.addEventListener(type,()=>{editActivation.push(type);status.setAttribute('data-edit-activation',editActivation.join('|'))});"
         "edit.addEventListener('beforeinput',event=>{status.setAttribute('data-before',event.constructor.name+':'+event.inputType+':'+event.data+':'+edit.getAttribute('value')+':'+event.isTrusted);if(event.data==='X')event.preventDefault();});"
@@ -249,6 +257,16 @@
         runtime_status, "data-load", &runtime_load_length);
     CHECK(runtime_load != NULL && runtime_load_length == 3
           && memcmp(runtime_load, "yes", 3) == 0);
+    lxb_dom_node_t *inline_node = find_id(
+        lxb_dom_interface_node(interactive.page.document.html), "inline");
+    CHECK(inline_node != NULL
+          && attribute_equals(runtime_status, "data-inline-accepted", "false")
+          && attribute_equals(
+              document_body_node(&interactive.page.document),
+              "data-body-load", "load")
+          && attribute_equals(inline_node, "data-first", "click")
+          && attribute_equals(inline_node, "data-second", "click")
+          && attribute_equals(inline_node, "data-third", "click"));
     CHECK(script_runtime_evaluate_diagnostic(
               interactive.page.runtime,
               "document.getElementById('status').setAttribute("
@@ -542,11 +560,26 @@
         &interactive.page.layout, remove_node);
     CHECK(remove_box != NULL);
     int remove_x = remove_box->x + 2, remove_y = remove_box->y + 2;
-    size_t no_op_move_relayouts = interactive.incremental_relayouts;
-    CHECK(controller_pointer_event(
-              &controller, CONTROLLER_POINTER_MOVE,
-              remove_x, remove_y, &pointer_activate)
-          && interactive.incremental_relayouts == no_op_move_relayouts);
+    bool hover_moved = controller_pointer_event(
+        &controller, CONTROLLER_POINTER_MOVE,
+        remove_x, remove_y, &pointer_activate);
+    size_t hover_length = 0;
+    const char *hover_value = document_attribute(
+        runtime_status, "data-hover", &hover_length);
+    static const char expected_hover[] =
+        "pointerover:null|pointerenter:null|mouseover:null|mouseenter:null|"
+        "pointerout:remove-on-down|pointerleave:remove-on-down|"
+        "mouseout:remove-on-down|mouseleave:remove-on-down";
+    if (!hover_moved || hover_value == NULL
+        || hover_length != sizeof(expected_hover) - 1u
+        || memcmp(hover_value, expected_hover, hover_length) != 0)
+        fprintf(stderr, "hover move=%d value=%.*s relayout=%zu error=%s\n",
+                hover_moved, (int) hover_length,
+                hover_value == NULL ? "" : hover_value,
+                interactive.incremental_relayouts,
+                interactive.page.script_result.error);
+    CHECK(hover_moved
+          && attribute_equals(runtime_status, "data-hover", expected_hover));
     CHECK(controller_pointer_event(
               &controller, CONTROLLER_POINTER_DOWN,
               remove_x, remove_y, &pointer_activate)
@@ -927,6 +960,33 @@
     }
     CHECK(attribute_equals(
         scaled_result, "data-point", scaled_expected));
+
+    puts("test: dynamically installed inline pointer handlers reopen dispatch");
+    static const char dynamic_pointer_page[] =
+        "<!doctype html><style>#dynamic-pointer{width:80px;height:30px}"
+        "</style><body><div id=dynamic-pointer></div><script>"
+        "document.getElementById('dynamic-pointer').setAttribute("
+        "'onmousemove',\"this.setAttribute('data-move',event.type)\")"
+        "</script></body>";
+    uint64_t dynamic_pointer_generation = navigation_begin(&interactive);
+    CHECK(navigation_commit_html(
+              &interactive, dynamic_pointer_generation,
+              "https://example.test/dynamic-pointer", dynamic_pointer_page,
+              strlen(dynamic_pointer_page), 480, NULL, NULL, true)
+          && interactive.page.document.pointer_event_attributes_present
+          && controller_init(&controller, &interactive));
+    lxb_dom_node_t *dynamic_pointer_node = find_id(
+        lxb_dom_interface_node(interactive.page.document.html),
+        "dynamic-pointer");
+    const LayoutNodeBox *dynamic_pointer_box = layout_box_for_node(
+        &interactive.page.layout, dynamic_pointer_node);
+    CHECK(dynamic_pointer_box != NULL
+          && controller_pointer_event(
+              &controller, CONTROLLER_POINTER_MOVE,
+              dynamic_pointer_box->x + 3, dynamic_pointer_box->y + 4,
+              &pointer_activate)
+          && attribute_equals(
+              dynamic_pointer_node, "data-move", "mousemove"));
 
     puts("test: bounded session persistence and cache");
     static const unsigned char cached_script[] = "cached-resource";

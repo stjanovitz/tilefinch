@@ -24,7 +24,7 @@ static const char raster_fixture_html[] =
     "#baseline small{font-size:13px}"
     "</style><span id=italic>|</span><div id=round></div>"
     "<div id=alpha></div><div id=stroke></div>"
-    "<div id=fallback>한 漢 あ 😀</div>"
+    "<div id=fallback>한 漢 あ Ж ộ 😀</div>"
     "<div id=baseline>Ag <small>small</small> Égj</div>";
 
 static void raster_error(

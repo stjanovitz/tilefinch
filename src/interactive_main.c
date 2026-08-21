@@ -1294,6 +1294,18 @@ int main(int argc, char **argv)
                 navigation.script_inline_data_fast_paths;
             script_metrics.inline_data_fast_path_bytes +=
                 navigation.script_inline_data_fast_path_bytes;
+            script_metrics.inline_data_quota_exemptions +=
+                navigation.script_inline_data_quota_exemptions;
+            script_metrics.cost_class_rejections +=
+                navigation.script_cost_class_rejections;
+            script_metrics.watchdog_classification_misses +=
+                navigation.script_watchdog_classification_misses;
+            script_metrics.watchdog_classification_miss_bytes +=
+                navigation.script_watchdog_classification_miss_bytes;
+            script_metrics.watchdog_classification_miss_loops +=
+                navigation.script_watchdog_classification_miss_loops;
+            script_metrics.watchdog_classification_miss_flags |=
+                navigation.script_watchdog_classification_miss_flags;
         }
     }
     size_t engine_shell_relayouts = navigation.incremental_relayouts;
@@ -1812,6 +1824,7 @@ int main(int argc, char **argv)
            "css-pressure-serializations=%zu "
            "css-batches=%zu css-first-batch=%zu css-deadline=%s/%zu css-elapsed-ms=%llu "
            "images=%zu/%zu image-cache-hits=%zu "
+           "image-decoded-cache-hits=%zu "
            "image-backgrounds=%zu image-rewrites=%zu image-encoded=%zu "
            "image-decoded=%zu image-downsampled=%zu "
            "image-source-peak=%zu image-target-peak=%zu\n",
@@ -1855,6 +1868,7 @@ int main(int argc, char **argv)
            navigation.page.images.stats.loaded,
            navigation.page.images.stats.discovered,
            navigation.page.images.stats.cache_hits,
+           navigation.page.images.stats.decoded_cache_hits,
            navigation.page.images.stats.backgrounds_loaded,
            navigation.page.images.stats.compatible_format_rewrites,
            navigation.page.images.stats.encoded_bytes,
@@ -2764,12 +2778,20 @@ int main(int argc, char **argv)
            script_metrics.pressure_capped_requests,
            script_metrics.bytes, script_metrics.cache_hits);
     printf("script-order blocking=%zu defer=%zu async=%zu modules=%zu "
-           "module-map-hits=%zu inline-data=%zu/%zu\n",
+           "module-map-hits=%zu inline-data=%zu/%zu exemptions=%zu "
+           "cost-rejected=%zu watchdog-misses=%zu/%zu loops=%zu "
+           "flags=0x%x\n",
            script_metrics.parser_blocking, script_metrics.deferred,
            script_metrics.asynchronous, script_metrics.modules,
            script_metrics.module_map_hits,
            script_metrics.inline_data_fast_paths,
-           script_metrics.inline_data_fast_path_bytes);
+           script_metrics.inline_data_fast_path_bytes,
+           script_metrics.inline_data_quota_exemptions,
+           script_metrics.cost_class_rejections,
+           script_metrics.watchdog_classification_misses,
+           script_metrics.watchdog_classification_miss_bytes,
+           script_metrics.watchdog_classification_miss_loops,
+           script_metrics.watchdog_classification_miss_flags);
     printf("frames discovered=%zu loaded=%zu failed=%zu detached=%zu "
            "messages-posted=%zu messages-delivered=%zu dropped=%zu "
            "to-parent=%zu to-child=%zu last-event=\"%s\"\n",

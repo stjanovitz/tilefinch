@@ -49,6 +49,19 @@
 #define PSP_MEDIA_BUFFER_REPEAT_STABLE_US 600000u
 #define PSP_MEDIA_BUFFER_DECODE_READY_US 400000u
 #define PSP_MEDIA_BUFFER_SLOW_NOTICE_US 20000000u
+/* The optional third 256 KiB video window is useful only after the audio path
+   has the same three-second reserve that makes startup safe. Recheck at a low
+   cadence: buffered-ahead estimation contains a duration division and does
+   not belong in every media pump on Allegrex. */
+#define PSP_MEDIA_LOOKAHEAD_POLICY_SAMPLE_US 250000u
+
+static inline unsigned psp_media_video_lookahead_limit(
+    bool separate_audio, uint64_t audio_ahead_us)
+{
+    return (!separate_audio
+            || audio_ahead_us >= PSP_MEDIA_BUFFER_STARTUP_TARGET_US)
+        ? 2u : 1u;
+}
 
 /*
  * The buffering decision is deliberately pure. The PSP session owns the
@@ -489,6 +502,20 @@ static inline unsigned psp_media_decode_no_progress_budget_ms(
         ? PSP_MEDIA_DECODE_NO_PROGRESS_REFILL_MS
         : PSP_MEDIA_DECODE_NO_PROGRESS_MS;
 }
+
+/*
+ * The no-progress clock describes a pipeline which is expected to advance.
+ * Buffering has its own demanded-window liveness policy. A seek preview is a
+ * UI transaction: it intentionally freezes presentation while the user moves
+ * a target marker and performs no decoder work until the target is committed.
+ * Charging either state to the decoder watchdog turns ordinary waiting into a
+ * false codec failure and can destroy the pending seek target.
+ */
+static inline bool psp_media_decode_no_progress_watchdog_active(
+    bool buffering_service_active, bool preview_active)
+{
+    return !buffering_service_active && !preview_active;
+}
 /*
  * And what the ordinary per-frame pump may spend while a video owns the whole
  * screen. There is no page behind it to owe the rest of the frame to, and the
@@ -706,6 +733,11 @@ static inline bool psp_media_audio_pending_should_wait(
 #define PSP_MEDIA_360P_EXTERNAL_RESERVE                                      \
     ((size_t) (4u * 1024u * 1024u)                                           \
      + PSP_MEDIA_360P_SURFACE_BYTES * (PSP_MEDIA_SURFACE_SLOTS - 1u))
+/* AAC-only playback retains the shared packet staging, codec/PCM queues and
+   the firmware-owned audio work buffer, but no DDR arena, MPEG workspace or
+   decoded-picture surfaces. Keep a conservative bounded charge rather than
+   inheriting the multi-megabyte video reserve. */
+#define PSP_MEDIA_AUDIO_ONLY_EXTERNAL_RESERVE ((size_t) (768u * 1024u))
 #define PSP_MEDIA_SURFACE_CANARY_A UINT32_C(0x5aa5f00d)
 #define PSP_MEDIA_SURFACE_CANARY_B UINT32_C(0xa55a0ff0)
 

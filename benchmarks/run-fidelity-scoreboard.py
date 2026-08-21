@@ -119,6 +119,13 @@ def checkpoint_commands(kind: str, target: str | None,
             + drain + "status\nquit\n")
 
 
+def positioned_checkpoint_found(output: str) -> bool:
+    """A successful evaluation is not enough: the bounded finder reports
+    the literal value `missing` when the requested DOM target is absent."""
+    value = re.search(r'loop-js ok=yes value="([^"]*)"', output)
+    return value is not None and value.group(1) != "missing"
+
+
 def script_render_command(interactive: Path, row: dict, trace: Path,
                           commands: Path, frame_dir: Path) -> list[str]:
     """Build a script-enabled fidelity command with the reference clock.
@@ -191,9 +198,10 @@ def render_with_scripts(lab: str, row: dict, trace: Path,
             raise RuntimeError(
                 f"{row['scenario']}/{checkpoint}: drain did not settle: "
                 + truncated[0])
-        if kind in ("selector", "text") and "loop-js ok=yes" not in completed.stdout:
-            raise RuntimeError(
-                f"{row['scenario']}/{checkpoint}: scroll target not found")
+        if kind in ("selector", "text"):
+            if not positioned_checkpoint_found(completed.stdout):
+                raise RuntimeError(
+                    f"{row['scenario']}/{checkpoint}: scroll target not found")
         if kind == "top" and hydration is not None:
             match = re.search(r'loop-js ok=yes value="(\d+)"',
                               completed.stdout)

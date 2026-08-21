@@ -46,11 +46,6 @@ static bool test_input_mapping_and_menu(void)
     input.pressed = PSP_UI_BUTTON_MENU;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_MENU && ui.chrome_visible);
-    CHECK(psp_ui_intent_has_predispatch_visual(&intent));
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(intent.action == PSP_UI_ACTION_NONE && ui.menu_selection == 1);
-    CHECK(psp_ui_intent_predispatch_is_complete(&intent));
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_HOME
@@ -66,7 +61,11 @@ static bool test_input_mapping_and_menu(void)
     psp_ui_set_tabs(&ui, &tabs);
     input.pressed = PSP_UI_BUTTON_MENU;
     intent = psp_ui_update(&ui, &input);
-    ui.menu_selection = 6;
+    ui.menu_selection = 2;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    (void) psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE_TOOLS);
+    ui.menu_selection = 1;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_TOGGLE_READER
@@ -74,15 +73,37 @@ static bool test_input_mapping_and_menu(void)
 
     input.pressed = PSP_UI_BUTTON_MENU;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 6;
-    input.pressed = PSP_UI_BUTTON_RELOAD;
+    ui.menu_selection = 2;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    (void) psp_ui_update(&ui, &input);
+    ui.menu_selection = 5;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    (void) psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_SITE_CONTROLS);
+    psp_ui_set_page(&ui, "Publisher", "https://publisher.example/", true);
+    ui.menu_selection = 0;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(!ui.site_javascript_enabled
+          && intent.setting.id == PSP_UI_SETTING_SITE_JAVASCRIPT
+          && !intent.setting.value.boolean);
+    ui.menu_selection = 1;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.content_blocker_site_allowed
+          && intent.setting.id
+                 == PSP_UI_SETTING_CONTENT_BLOCKER_SITE_ALLOWED);
+    ui.menu_selection = 3;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_TOGGLE_READER_SITE
-          && ui.screen == PSP_UI_SCREEN_PAGE);
+          && ui.screen == PSP_UI_SCREEN_SITE_CONTROLS);
 
     input.pressed = PSP_UI_BUTTON_MENU;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 2;
+    input.pressed = PSP_UI_BUTTON_MENU;
+    (void) psp_ui_update(&ui, &input);
+    ui.menu_selection = 1;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_TABS
@@ -98,7 +119,7 @@ static bool test_input_mapping_and_menu(void)
           && ui.screen == PSP_UI_SCREEN_PAGE);
     input.pressed = PSP_UI_BUTTON_MENU;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 2;
+    ui.menu_selection = 1;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     (void) psp_ui_update(&ui, &input);
     ui.tab_selection = 2;
@@ -107,7 +128,7 @@ static bool test_input_mapping_and_menu(void)
     CHECK(intent.action == PSP_UI_ACTION_NEW_TAB);
     input.pressed = PSP_UI_BUTTON_MENU;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 2;
+    ui.menu_selection = 1;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     (void) psp_ui_update(&ui, &input);
     ui.tab_selection = 1;
@@ -116,8 +137,7 @@ static bool test_input_mapping_and_menu(void)
     CHECK(intent.action == PSP_UI_ACTION_CLOSE_TAB
           && intent.tab_index == 1);
 
-    /* The library verb menu is retired: its three list entries are top-level
-       menu rows that open the one native surface on their section. */
+    /* Library is one native destination; L/R owns its five sections. */
     input.pressed = PSP_UI_BUTTON_MENU;
     intent = psp_ui_update(&ui, &input);
     ui.menu_selection = 3;
@@ -128,42 +148,40 @@ static bool test_input_mapping_and_menu(void)
 
     input.pressed = PSP_UI_BUTTON_MENU;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 4;
+    ui.menu_selection = 2;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(intent.action == PSP_UI_ACTION_SHOW_BOOKMARKS);
-
-    input.pressed = PSP_UI_BUTTON_MENU;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 5;
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(intent.action == PSP_UI_ACTION_SHOW_HISTORY);
-
-    input.pressed = PSP_UI_BUTTON_MENU;
-    (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 8;
+    ui.menu_selection = 3;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_SAVE_FOR_LATER);
 
     input.pressed = PSP_UI_BUTTON_MENU;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 9;
+    ui.menu_selection = 2;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    (void) psp_ui_update(&ui, &input);
+    ui.menu_selection = 2;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_TOGGLE_BOOKMARK);
 
     input.pressed = PSP_UI_BUTTON_MENU;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 10;
+    ui.menu_selection = 2;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    (void) psp_ui_update(&ui, &input);
+    ui.menu_selection = 4;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
-    CHECK(intent.action == PSP_UI_ACTION_SHOW_SCREENSHOTS);
+    CHECK(intent.action == PSP_UI_ACTION_SCREENSHOT);
 
     input.pressed = PSP_UI_BUTTON_MENU;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 7;
+    ui.menu_selection = 2;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    (void) psp_ui_update(&ui, &input);
+    ui.menu_selection = 0;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_OPEN_FIND
@@ -208,16 +226,7 @@ static bool test_input_mapping_and_menu(void)
 
     input.pressed = PSP_UI_BUTTON_MENU;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 12;
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(intent.action == PSP_UI_ACTION_SCREENSHOT
-          && ui.screen == PSP_UI_SCREEN_PAGE
-          && psp_ui_intent_has_predispatch_visual(&intent));
-
-    input.pressed = PSP_UI_BUTTON_MENU;
-    (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 11;
+    ui.menu_selection = 4;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_OPTIONS);
@@ -255,6 +264,12 @@ static bool test_input_mapping_and_menu(void)
     CHECK(ui.remember_reader_site_scale
           && intent.setting.id
                  == PSP_UI_SETTING_REMEMBER_READER_SITE_SCALE
+          && intent.setting.value.boolean);
+    ui.options_selection = 37;
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.reader_auto_mode
+          && intent.setting.id == PSP_UI_SETTING_READER_AUTO_MODE
           && intent.setting.value.boolean);
     input.pressed = PSP_UI_BUTTON_CANCEL;
     (void) psp_ui_update(&ui, &input);
@@ -312,13 +327,7 @@ static bool test_input_mapping_and_menu(void)
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_OPTIONS
           && ui.options_group_selection == 1);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    (void) psp_ui_update(&ui, &input);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    (void) psp_ui_update(&ui, &input);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    (void) psp_ui_update(&ui, &input);
-    CHECK(ui.options_group_selection == 4);
+    ui.options_group_selection = 6;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS
@@ -397,14 +406,9 @@ static bool test_input_mapping_and_menu(void)
     input.pressed = PSP_UI_BUTTON_CANCEL;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_OPTIONS
-          && ui.options_group_selection == 4
+          && ui.options_group_selection == 6
           && ui.overlay_motion == 2u);
-    input.pressed = PSP_UI_BUTTON_UP;
-    (void) psp_ui_update(&ui, &input);
-    input.pressed = PSP_UI_BUTTON_UP;
-    (void) psp_ui_update(&ui, &input);
-    input.pressed = PSP_UI_BUTTON_UP;
-    (void) psp_ui_update(&ui, &input);
+    ui.options_group_selection = 1;
     CHECK(ui.options_group_selection == 1);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
@@ -431,14 +435,6 @@ static bool test_input_mapping_and_menu(void)
     intent = psp_ui_update(&ui, &input);
     CHECK(!ui.javascript_enabled
           && intent.setting.id == PSP_UI_SETTING_JAVASCRIPT
-          && !intent.setting.value.boolean);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 12);
-    input.pressed = PSP_UI_BUTTON_LEFT;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(!ui.site_javascript_enabled
-          && intent.setting.id == PSP_UI_SETTING_SITE_JAVASCRIPT
           && !intent.setting.value.boolean);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
@@ -502,6 +498,30 @@ static bool test_input_mapping_and_menu(void)
           && intent.setting.id == PSP_UI_SETTING_GLYPH_LANGUAGE
           && intent.setting.value.glyph_language
                  == BROWSER_GLYPH_LANGUAGE_JAPANESE);
+    static const BrowserGlyphLanguage glyph_cycle[] = {
+        BROWSER_GLYPH_LANGUAGE_CHINESE_SIMPLIFIED,
+        BROWSER_GLYPH_LANGUAGE_CHINESE_TRADITIONAL,
+        BROWSER_GLYPH_LANGUAGE_KOREAN,
+        BROWSER_GLYPH_LANGUAGE_CYRILLIC,
+        BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED,
+        BROWSER_GLYPH_LANGUAGE_EMBEDDED
+    };
+    for (size_t glyph = 0;
+         glyph < sizeof(glyph_cycle) / sizeof(glyph_cycle[0]); glyph++) {
+        input.pressed = PSP_UI_BUTTON_RIGHT;
+        intent = psp_ui_update(&ui, &input);
+        CHECK(ui.glyph_language == (unsigned) glyph_cycle[glyph]
+              && intent.setting.id == PSP_UI_SETTING_GLYPH_LANGUAGE
+              && intent.setting.value.glyph_language == glyph_cycle[glyph]);
+    }
+    input.pressed = PSP_UI_BUTTON_LEFT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.glyph_language == BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED
+          && intent.setting.value.glyph_language
+                 == BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED);
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.glyph_language == BROWSER_GLYPH_LANGUAGE_EMBEDDED);
     input.pressed = PSP_UI_BUTTON_DOWN;
     (void) psp_ui_update(&ui, &input);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
@@ -534,13 +554,21 @@ static bool test_input_mapping_and_menu(void)
     CHECK(ui.options_selection == 19);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
+    CHECK(ui.youtube_audio_only
+          && intent.setting.id == PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY
+          && intent.setting.value.boolean);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.options_selection == 20);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
     CHECK(ui.youtube_compact_results
           && intent.setting.id
                  == PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS
           && intent.setting.value.boolean);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 20);
+    CHECK(ui.options_selection == 21);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.video_startup_buffering
@@ -549,7 +577,7 @@ static bool test_input_mapping_and_menu(void)
           && intent.setting.value.boolean);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 21);
+    CHECK(ui.options_selection == 22);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.resume_offline_downloads
@@ -575,18 +603,12 @@ static bool test_input_mapping_and_menu(void)
           && intent.setting.id == PSP_UI_SETTING_VIDEO_SCALING
           && intent.setting.value.video_scaling
                  == BROWSER_VIDEO_SCALING_SMOOTH);
-    ui.options_selection = 21;
-    input.pressed = PSP_UI_BUTTON_CANCEL;
-    (void) psp_ui_update(&ui, &input);
-    CHECK(ui.screen == PSP_UI_SCREEN_OPTIONS
-          && ui.options_group_selection == 1);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    (void) psp_ui_update(&ui, &input);
-    CHECK(ui.options_group_selection == 2);
+    ui.screen = PSP_UI_SCREEN_OPTIONS;
+    ui.options_group_selection = 3;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS
-          && ui.options_selection == 22);
+          && ui.options_selection == 23);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.content_blocker_mode == CONTENT_BLOCKER_CUSTOM
@@ -597,7 +619,7 @@ static bool test_input_mapping_and_menu(void)
     ui.content_blocker_cosmetic_hiding = true;
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 23);
+    CHECK(ui.options_selection == 24);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(!ui.content_blocker_cosmetic_hiding
@@ -606,30 +628,13 @@ static bool test_input_mapping_and_menu(void)
           && !intent.setting.value.boolean);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 24);
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(!ui.cookie_banner_hidden
-          && intent.setting.id == PSP_UI_SETTING_COOKIE_BANNER_HIDDEN
-          && !intent.setting.value.boolean);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 25);
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.content_blocker_site_allowed
-          && intent.setting.id
-                 == PSP_UI_SETTING_CONTENT_BLOCKER_SITE_ALLOWED
-          && intent.setting.value.boolean);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 26);
+    CHECK(ui.options_selection == 27);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.load_content_blocker_allowlist_requested);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 27);
+    CHECK(ui.options_selection == 28);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(!ui.site_data_allowed
@@ -638,44 +643,26 @@ static bool test_input_mapping_and_menu(void)
     ui.tls_session_persistence = true;
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 28);
+    CHECK(ui.options_selection == 29);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(!ui.tls_session_persistence
           && intent.setting.id
                  == PSP_UI_SETTING_TLS_SESSION_PERSISTENCE
           && !intent.setting.value.boolean);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 29);
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.mixed_content_site_allowed
-          && intent.setting.id == PSP_UI_SETTING_MIXED_CONTENT_SITE
-          && intent.setting.value.boolean);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 30);
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.third_party_cookie_site_allowed
-          && intent.setting.id
-                 == PSP_UI_SETTING_THIRD_PARTY_COOKIES_SITE
-          && intent.setting.value.boolean);
     input.pressed = PSP_UI_BUTTON_CANCEL;
     (void) psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_OPTIONS
-          && ui.options_group_selection == 2);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    (void) psp_ui_update(&ui, &input);
+          && ui.options_group_selection == 3);
+    ui.options_group_selection = 4;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     psp_ui_set_network_profile(&ui, 2u, "Cafe Wi-Fi");
     CHECK(ui.network_profile == 2u
           && ui.network_profile_label_valid
           && strcmp(ui.network_profile_label, "Cafe Wi-Fi (P2)") == 0);
-    ui.options_selection = 31;
-    CHECK(ui.options_selection == 31);
+    ui.options_selection = 32;
+    CHECK(ui.options_selection == 32);
     input.pressed = PSP_UI_BUTTON_RIGHT;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.setting.id == PSP_UI_SETTING_NETWORK_PROFILE
@@ -689,23 +676,12 @@ static bool test_input_mapping_and_menu(void)
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.setting.id == PSP_UI_SETTING_NETWORK_PROFILE
           && intent.setting.value.unsigned_value == 2u);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 32);
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.screen == PSP_UI_SCREEN_DIAGNOSTIC_QR
-          && intent.action == PSP_UI_ACTION_NONE);
-    input.pressed = PSP_UI_BUTTON_CONFIRM;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(intent.action == PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR);
     input.pressed = PSP_UI_BUTTON_CANCEL;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS
-          && intent.action == PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 33);
+    (void) psp_ui_update(&ui, &input);
+    ui.options_group_selection = 5;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    (void) psp_ui_update(&ui, &input);
+    CHECK(ui.options_selection == 34);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(!ui.update_check_enabled
@@ -718,24 +694,69 @@ static bool test_input_mapping_and_menu(void)
           && intent.setting.value.boolean);
     input.pressed = PSP_UI_BUTTON_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 34);
+    CHECK(ui.options_selection == 35);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_UPDATE);
     psp_ui_set_update(
         &ui, "0.1.0", "UPDATE AVAILABLE", "Safer update.", -1,
         "DOWNLOAD", true, false);
+    ui.update_channel = BROWSER_UPDATE_CHANNEL_STABLE;
     CHECK(!ui.network_profile_label_valid
           && strcmp(ui.update_notes, "Safer update.") == 0);
+    input.pressed = PSP_UI_BUTTON_RELOAD;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_UPDATE_VERSIONS
+          && ui.data_options_selection == 0
+          && intent.update_versions_requested);
+    TilefinchUpdateHistorySnapshot history = {
+        .phase = TILEFINCH_UPDATE_HISTORY_READY,
+        .count = 3u,
+        .versions = {"0.1.4", "0.1.3", "0.1.2"}
+    };
+    psp_ui_set_update_history(&ui, &history);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.data_options_selection == 1);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_UPDATE
+          && intent.update_version_selected
+          && intent.list_index == 1);
+    char selected_tag[16];
+    CHECK(psp_ui_update_history_tag(
+              &ui, intent.list_index, selected_tag, sizeof(selected_tag))
+          && strcmp(selected_tag, "v0.1.3") == 0);
+    PspUiState history_ui = ui;
+    history.count = TILEFINCH_UPDATE_HISTORY_LIMIT;
+    for (size_t index = 0; index < history.count; index++)
+        snprintf(history.versions[index],
+                 sizeof(history.versions[index]), "0.1.%u",
+                 (unsigned) index);
+    psp_ui_set_update_history(&history_ui, &history);
+    history_ui.screen = PSP_UI_SCREEN_UPDATE_VERSIONS;
+    history_ui.data_options_selection = 0u;
+    for (size_t index = 0; index < 7u; index++) {
+        input.pressed = PSP_UI_BUTTON_DOWN;
+        intent = psp_ui_update(&history_ui, &input);
+    }
+    CHECK(history_ui.data_options_selection == 7u);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&history_ui, &input);
+    CHECK(intent.update_version_selected && intent.list_index == 7u);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.update_primary_requested);
     input.pressed = PSP_UI_BUTTON_CANCEL;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS);
-    input.pressed = PSP_UI_BUTTON_DOWN;
-    intent = psp_ui_update(&ui, &input);
-    CHECK(ui.options_selection == 35);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    (void) psp_ui_update(&ui, &input);
+    ui.options_group_selection = 4;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    (void) psp_ui_update(&ui, &input);
+    ui.options_selection = 36;
+    CHECK(ui.options_selection == 36);
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_DATA_OPTIONS
@@ -797,6 +818,9 @@ static bool test_input_mapping_and_menu(void)
     input.pressed = PSP_UI_BUTTON_CANCEL;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_OPTIONS);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_MENU);
     input.pressed = PSP_UI_BUTTON_CANCEL;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_PAGE);
@@ -1484,11 +1508,14 @@ static bool test_panels_draw_the_token_ground(void)
     enum { WIDTH = 480, HEIGHT = 272 };
     static uint16_t frame[WIDTH * HEIGHT];
     static const PspUiScreen panels[] = {
-        PSP_UI_SCREEN_MENU, PSP_UI_SCREEN_OPTIONS,
+        PSP_UI_SCREEN_MENU, PSP_UI_SCREEN_PAGE_TOOLS,
+        PSP_UI_SCREEN_SITE_CONTROLS, PSP_UI_SCREEN_PAGE_INFORMATION,
+        PSP_UI_SCREEN_HELP, PSP_UI_SCREEN_HELP_DETAIL,
+        PSP_UI_SCREEN_OPTIONS,
         PSP_UI_SCREEN_OPTION_ITEMS, PSP_UI_SCREEN_DATA_OPTIONS,
         PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS, PSP_UI_SCREEN_GLYPH_OPTIONS,
         PSP_UI_SCREEN_TABS,
-        PSP_UI_SCREEN_UPDATE
+        PSP_UI_SCREEN_UPDATE, PSP_UI_SCREEN_UPDATE_VERSIONS
     };
     static const unsigned themes[] = {
         BROWSER_CHROME_THEME_FINCH, BROWSER_CHROME_THEME_OCEAN,
@@ -3073,11 +3100,19 @@ static bool test_collections_sections_and_deletes(void)
           && intent.action == PSP_UI_ACTION_SHOW_HISTORY);
     input.pressed = PSP_UI_BUTTON_PAGE_DOWN;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.collections_section == PSP_UI_COLLECTION_OFFLINE
+    CHECK(ui.collections_section == PSP_UI_COLLECTION_DOWNLOADS
+          && intent.action == PSP_UI_ACTION_SHOW_DOWNLOADS);
+    input.pressed = PSP_UI_BUTTON_PAGE_DOWN;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.collections_section == PSP_UI_COLLECTION_SCREENSHOTS
+          && intent.action == PSP_UI_ACTION_SHOW_SCREENSHOTS);
+    input.pressed = PSP_UI_BUTTON_PAGE_DOWN;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.collections_section == PSP_UI_COLLECTION_SAVED
           && intent.action == PSP_UI_ACTION_SHOW_OFFLINE);
     input.pressed = PSP_UI_BUTTON_PAGE_UP;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.collections_section == PSP_UI_COLLECTION_HISTORY);
+    CHECK(ui.collections_section == PSP_UI_COLLECTION_SCREENSHOTS);
 
     psp_ui_set_collections(&ui, &view);
     ui.collections_selection = 2;
@@ -3583,6 +3618,95 @@ static bool test_media_chrome_is_stable_across_motion_sequence(void)
     return true;
 }
 
+/*
+ * Priming may already own a decoded frame while the first displayed picture
+ * is crossing the startup boundary.  The UI is still in its resolving mode
+ * for that frame, then becomes Playing on the next one.  If resolving leaves
+ * the control rows transparent, motion is visible across the bottom for one
+ * frame before the opaque bar replaces it -- the startup-only shimmer seen on
+ * the physical panel.  Keep the ground independent of both decoded pictures,
+ * and require the quiet margins to survive the transition into Playing.
+ */
+static bool test_media_first_frame_transition_keeps_bottom_ground_stable(void)
+{
+    enum {
+        WIDTH = 480,
+        HEIGHT = 272,
+        CONTROL_HEIGHT = 78,
+        QUIET_MARGIN = 16
+    };
+    static uint32_t video[WIDTH * HEIGHT];
+    static uint16_t scratch[WIDTH * HEIGHT];
+    static uint32_t resolving_bottom[WIDTH * CONTROL_HEIGHT];
+    PspUiMediaState media;
+    psp_ui_media_init(&media);
+    psp_ui_media_set_resolving(&media, "Startup transition");
+    psp_ui_media_set_resolving_progress(&media, "Loading...", 920u);
+    PspMediaUiProjection priming = {
+        .mode = PSP_MEDIA_UI_PRIMING,
+        .visible = true,
+        .controls_enabled = true,
+        .play_pause_enabled = true,
+        .show_progress = true,
+        .playing = true
+    };
+    psp_ui_media_apply_projection(&media, &priming);
+    psp_ui_media_tick(&media, 10000u);
+    CHECK(media.resolving && media.controls_visible);
+
+    const uint32_t pictures[] = {
+        UINT32_C(0xff1010f0), UINT32_C(0xff20e020),
+        UINT32_C(0xffe03030)
+    };
+    for (unsigned frame = 0; frame < 2u; frame++) {
+        for (size_t at = 0; at < sizeof(video) / sizeof(video[0]); at++)
+            video[at] = pictures[frame];
+        psp_ui_media_composite_8888(
+            &media, NULL, video, WIDTH, HEIGHT, WIDTH, scratch);
+        const uint32_t *bottom =
+            video + (size_t) (HEIGHT - CONTROL_HEIGHT) * WIDTH;
+        if (frame == 0)
+            memcpy(resolving_bottom, bottom, sizeof(resolving_bottom));
+        else
+            CHECK(memcmp(resolving_bottom, bottom,
+                         sizeof(resolving_bottom)) == 0);
+    }
+
+    /* The cooperative presenter can acknowledge input by repainting only
+       the footer rows of the frozen 32-bit front frame.  It must preserve
+       the same startup ground rather than narrowing exposed video. */
+    for (size_t at = 0; at < sizeof(video) / sizeof(video[0]); at++)
+        video[at] = pictures[2];
+    psp_ui_media_composite_controls_8888(
+        &media, video, WIDTH, HEIGHT, WIDTH, scratch);
+    CHECK(memcmp(
+              resolving_bottom,
+              video + (size_t) (HEIGHT - CONTROL_HEIGHT) * WIDTH,
+              sizeof(resolving_bottom)) == 0);
+
+    psp_ui_media_set(&media, true, true, false,
+                     UINT64_C(0), UINT64_C(120000000),
+                     "Startup transition");
+    for (size_t at = 0; at < sizeof(video) / sizeof(video[0]); at++)
+        video[at] = pictures[2];
+    psp_ui_media_composite_8888(
+        &media, NULL, video, WIDTH, HEIGHT, WIDTH, scratch);
+    const uint32_t *playing_bottom =
+        video + (size_t) (HEIGHT - CONTROL_HEIGHT) * WIDTH;
+    for (int y = 0; y < CONTROL_HEIGHT; y++) {
+        CHECK(memcmp(resolving_bottom + (size_t) y * WIDTH,
+                     playing_bottom + (size_t) y * WIDTH,
+                     QUIET_MARGIN * sizeof(*playing_bottom)) == 0);
+        CHECK(memcmp(
+                  resolving_bottom + (size_t) y * WIDTH
+                      + WIDTH - QUIET_MARGIN,
+                  playing_bottom + (size_t) y * WIDTH
+                      + WIDTH - QUIET_MARGIN,
+                  QUIET_MARGIN * sizeof(*playing_bottom)) == 0);
+    }
+    return true;
+}
+
 int main(void)
 {
     if (!test_input_mapping_and_menu()
@@ -3618,6 +3742,7 @@ int main(void)
         || !test_media_overlay_bands_and_the_32_bit_wrapper()
         || !test_media_buffering_transition_frames_are_stable()
         || !test_media_chrome_is_stable_across_motion_sequence()
+        || !test_media_first_frame_transition_keeps_bottom_ground_stable()
         || !test_native_surfaces_own_the_panel()
         || !test_home_traversal_and_activation()
         || !test_implicit_cursor_handoff()

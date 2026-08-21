@@ -178,6 +178,10 @@ void psp_media_raise_error(
     } else {
         psp_ui_media_set_error(&media->ui, message);
     }
+    /* A visible terminal panel owns no range delivery. Return the reserved
+       media descriptors immediately; the singular open-service boundary
+       re-acquires them for Retry, resume, or a fresh route. */
+    psp_media_set_transport_priority(media, false);
     if (!was_failed) {
         psp_media_report_failure_snapshot(
             media, "media-playback", message, reason, true);
@@ -264,6 +268,7 @@ bool psp_media_open_phase(PspMediaJobPhase phase)
 bool psp_media_seek_phase(PspMediaJobPhase phase)
 {
     return phase == PSP_MEDIA_JOB_SEEK_PREPARE
+        || phase == PSP_MEDIA_JOB_SEEK_PRIME
         || phase == PSP_MEDIA_JOB_SEEK_DECODE
         || phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE
         || phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE;
@@ -290,6 +295,14 @@ static PspMediaPresentationReadiness psp_media_sample_readiness(
 {
     if (media == NULL || media->buffering_service_active)
         return PSP_MEDIA_PRESENTATION_NEEDS_SOURCE;
+    if (media->audio_only) {
+        uint64_t audio_cursor_us = 0;
+        return !media->pause_boundary_pending
+                && media_playback_audio_cursor_us(
+                    media->playback, &audio_cursor_us)
+            ? PSP_MEDIA_PRESENTATION_READY
+            : PSP_MEDIA_PRESENTATION_NEEDS_PRIME;
+    }
     if (!media->have_frame || media->presentation_preroll_audio_held
         || media->pause_boundary_pending)
         return PSP_MEDIA_PRESENTATION_NEEDS_PRIME;
@@ -329,10 +342,11 @@ static void psp_media_apply_active_projection(PspMediaSession *media)
         psp_media_machine_project_ui(&media->machine);
     psp_ui_media_apply_projection(&media->ui, &projection);
     media->controller_audio_hold =
-        media->machine.state == PSP_MEDIA_SESSION_PRIMING
+        !media->audio_only
+        && (media->machine.state == PSP_MEDIA_SESSION_PRIMING
         || media->machine.state == PSP_MEDIA_SESSION_SEEKING
         || media->machine.state == PSP_MEDIA_SESSION_RECOVERING
-        || media->machine.preview_active;
+        || media->machine.preview_active);
     psp_media_apply_audio_hold(media);
 }
 
@@ -484,9 +498,19 @@ static void psp_media_complete_priming_if_ready(
 {
     if (media == NULL
         || media->machine.state != PSP_MEDIA_SESSION_PRIMING
-        || !media->have_frame
         || media->pause_boundary_pending)
         return;
+    if (media->audio_only) {
+        uint64_t audio_cursor_us = 0;
+        if (!media_playback_audio_cursor_us(
+                media->playback, &audio_cursor_us)) return;
+        psp_media_dispatch(media, psp_media_service_completion(
+            media, PSP_MEDIA_EVENT_PRIME_READY), checkpoint);
+        if (media->machine.state != PSP_MEDIA_SESSION_PRIMING)
+            psp_media_release_presentation_preroll(media, true);
+        return;
+    }
+    if (!media->have_frame) return;
     if (media->presentation_preroll_startup) {
         size_t displayed =
             media_playback_displayed_video_frames(media->playback);
@@ -553,9 +577,19 @@ static void psp_media_complete_priming_if_ready(
 {
     if (media == NULL
         || media->machine.state != PSP_MEDIA_SESSION_PRIMING
-        || !media->have_frame
         || media->pause_boundary_pending)
         return;
+    if (media->audio_only) {
+        uint64_t audio_cursor_us = 0;
+        if (!media_playback_audio_cursor_us(
+                media->playback, &audio_cursor_us)) return;
+        psp_media_dispatch(media, psp_media_service_completion(
+            media, PSP_MEDIA_EVENT_PRIME_READY), checkpoint);
+        if (media->machine.state != PSP_MEDIA_SESSION_PRIMING)
+            psp_media_release_presentation_preroll(media, true);
+        return;
+    }
+    if (!media->have_frame) return;
     if (media->presentation_preroll_startup) {
         size_t displayed =
             media_playback_displayed_video_frames(media->playback);
@@ -651,6 +685,10 @@ bool psp_media_begin_startup_preroll(PspMediaSession *media)
     if (media == NULL || media->playback == NULL
         || media->clock_us != 0)
         return false;
+    /* AAC-only playback has no picture boundary to wait for. The first
+       accepted audio output block is its presentation boundary and completes
+       Priming in the ordinary advance pump. */
+    if (media->audio_only) return true;
     /* Priming is committed before its service runs, so the projection may
        already have applied this hold. That does not mean the startup
        presentation boundary has been armed yet. */
@@ -727,6 +765,9 @@ static bool psp_media_source_refilling(const PspMediaSession *media)
     MediaHttpRangeStats video = {0};
     MediaHttpRangeStats audio = {0};
     if (media == NULL) return false;
+    MediaHlsStats hls = {0};
+    if (psp_media_hls_stats(media->hls, &hls))
+        return hls.active_requests != 0;
     (void) media_http_range_stats(media->range, &video);
     (void) media_http_range_stats(media->audio_range, &audio);
     return video.window_pending || audio.window_pending
@@ -749,6 +790,9 @@ size_t psp_media_range_bytes(const PspMediaSession *media)
     MediaHttpRangeStats video = {0};
     MediaHttpRangeStats audio = {0};
     if (media == NULL) return 0;
+    MediaHlsStats hls = {0};
+    if (psp_media_hls_stats(media->hls, &hls))
+        return hls.bytes_received;
     (void) media_http_range_stats(media->range, &video);
     (void) media_http_range_stats(media->audio_range, &audio);
     return video.bytes_received + video.bytes_in_flight
@@ -763,6 +807,26 @@ size_t psp_media_range_bytes(const PspMediaSession *media)
 void psp_media_pump_ranges(PspMediaSession *media)
 {
     if (media == NULL) return;
+    uint64_t now_us = psp_media_internal_now_us(media);
+    if (media->range != NULL
+        && (media->video_lookahead_next_sample_us == 0
+            || now_us >= media->video_lookahead_next_sample_us)) {
+        bool separate_audio = media->audio_range != NULL;
+        uint64_t audio_ahead_us = separate_audio
+            ? media_http_range_buffered_ahead_us(
+                  media->audio_range, psp_media_duration_us(media))
+            : UINT64_MAX;
+        unsigned limit = psp_media_video_lookahead_limit(
+            separate_audio, audio_ahead_us);
+        if (limit != media->video_lookahead_limit) {
+            media->video_lookahead_limit = limit;
+            media_http_range_set_lookahead_limit(media->range, limit);
+        }
+        media->video_lookahead_next_sample_us = now_us
+            > UINT64_MAX - PSP_MEDIA_LOOKAHEAD_POLICY_SAMPLE_US
+            ? UINT64_MAX
+            : now_us + PSP_MEDIA_LOOKAHEAD_POLICY_SAMPLE_US;
+    }
     /* Both ranges ultimately feed the same one-hop transport worker. If both
        reach a refill boundary on one browser visit, a fixed video-first order
        makes audio lose every tie. Alternate the issue order; each range still
@@ -843,10 +907,15 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     psp_media_buffering_end(media, psp_media_now_us(media));
     youtube_resolve_job_destroy(media->resolver_job);
     media->resolver_job = NULL;
+    if (media->page_media_probe_request != 0) {
+        (void) fetch_background_transport_cancel(
+            media->page_media_probe_request, "page media closed");
+        media->page_media_probe_request = 0;
+    }
     media->controller_audio_hold = false;
     psp_media_release_presentation_preroll(media, true);
     if (media->have_frame)
-        media_psp_backend_note_frame_quiesced(&media->frame);
+        media_playback_note_frame_quiesced(media->playback, &media->frame);
     psp_media_telemetry_report_feed(media, "teardown");
     if (media->playback != NULL) {
         MediaPlaybackJobStats stats = {0};
@@ -937,6 +1006,7 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
        rather than trust what a previous one left. */
     media->present_stage_identity = 0;
     media_playback_destroy(media->playback);
+    psp_media_hls_destroy(media->hls);
     media_mp4_close(media->demux);
     media_mp4_close(media->audio_demux);
     media_http_range_destroy(media->range);
@@ -944,10 +1014,14 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     media_file_range_close(media->file_range);
     media_file_range_close(media->audio_file_range);
     media->playback = NULL;
+    media->hls = NULL;
+    media->hls_source = (MediaSampleSource) {0};
     media->demux = NULL;
     media->audio_demux = NULL;
     media->range = NULL;
     media->audio_range = NULL;
+    media->video_lookahead_limit = 0;
+    media->video_lookahead_next_sample_us = 0;
     media->file_range = NULL;
     media->audio_file_range = NULL;
     media->backend_stats_snapshot = (MediaBackendStats) {0};
@@ -1003,13 +1077,20 @@ void psp_media_shutdown(PspMediaSession *media)
         .retain_pipeline = false
     }, "shutdown-close");
     psp_media_pipeline_destroy(media);
-    if (media->transport_priority_held) {
-        fetch_background_transport_set_media_priority(false);
-        media->transport_priority_held = false;
-    }
+    psp_media_set_transport_priority(media, false);
     psp_media_finish_synchronous_quiesce(
         media, "shutdown-released");
+    if (!media_psp_swdec_backend_quarantined())
+        psp_swdec_component_shutdown(&media->swdec);
     psp_media_session_checkpoint(media, "shutdown-complete");
+}
+
+void psp_media_set_transport_priority(
+    PspMediaSession *media, bool active)
+{
+    if (media == NULL || media->transport_priority_held == active) return;
+    fetch_background_transport_set_media_priority(active);
+    media->transport_priority_held = active;
 }
 
 void psp_media_init(
@@ -1025,8 +1106,11 @@ void psp_media_init(
     media->profile = profile;
     media->profile_path = profile_path;
     if (platform != NULL) media->platform = *platform;
+    psp_swdec_component_init(
+        &media->swdec, budget, media->platform.install_paths);
     media->requested_quality =
         browser_profile_youtube_quality(profile);
+    media->audio_only = false;
     psp_ui_media_init(&media->ui);
     psp_ui_media_set_title_font(&media->ui, title_font);
     media->machine = psp_media_machine_initial();
@@ -1124,6 +1208,15 @@ void psp_media_suspend(PspMediaSession *media)
     psp_media_record_resume(media, true);
     media->open_service_pending = false;
     psp_media_pipeline_destroy(media);
+    char swdec_error[160] = {0};
+    if (media_psp_swdec_backend_quarantined()) {
+        printf("tilefinch-swdec: event=suspend-restore-refused "
+               "reason=backend-quarantined\n");
+    } else if (!psp_swdec_component_suspend(
+                   &media->swdec, swdec_error, sizeof(swdec_error))) {
+        printf("tilefinch-swdec: event=suspend-restore-failed error=%s\n",
+               swdec_error);
+    }
     media_psp_backend_system_suspend();
     media->ui.playing = false;
     media->ui.analog_seek_direction = 0;
@@ -1145,6 +1238,12 @@ void psp_media_resume(PspMediaSession *media)
     if (media == NULL || !media->system_suspended) return;
     psp_media_session_checkpoint(media, "resume-begin");
     media->system_suspended = false;
+    char swdec_error[160] = {0};
+    if (!psp_swdec_component_resume(
+            &media->swdec, swdec_error, sizeof(swdec_error))) {
+        printf("tilefinch-swdec: event=resume-attach-failed error=%s\n",
+               swdec_error);
+    }
     /* Resume deliberately revalidates the source through the ordinary open
        path. URL reuse is reserved for the single controlled backward-seek
        transaction and must never survive an unrelated lifecycle edge. */
@@ -1170,18 +1269,21 @@ bool psp_media_system_suspended(const PspMediaSession *media)
     return media != NULL && media->system_suspended;
 }
 
-void psp_media_prepare_route(
-    PspMediaSession *media, const char *url, uint64_t generation)
+static void psp_media_prepare_route_kind(
+    PspMediaSession *media, const char *url, uint64_t generation,
+    bool direct_page_route, bool autoplay)
 {
     if (media == NULL) return;
     if (media->system_suspended) return;
-    bool offline_route = psp_media_offline_route(media, url);
-    bool online_route = youtube_watch_url_supported(url) && !offline_route;
-    if (online_route && !media->transport_priority_held) {
-        fetch_background_transport_set_media_priority(true);
-        media->transport_priority_held = true;
-    }
-    if (!youtube_watch_url_supported(url) && !offline_route) {
+    if (media->page_source && !direct_page_route
+        && media->generation == generation
+        && url != NULL
+        && strcmp(media->page_document_url, url) == 0) return;
+    bool offline_route = !direct_page_route
+        && psp_media_offline_route(media, url);
+    bool online_route = direct_page_route
+        || (youtube_watch_url_supported(url) && !offline_route);
+    if (!online_route && !offline_route) {
         char current_id[YOUTUBE_VIDEO_ID_CAPACITY] = {0};
         char next_id[YOUTUBE_VIDEO_ID_CAPACITY] = {0};
         bool same_internal_video =
@@ -1197,6 +1299,11 @@ void psp_media_prepare_route(
             media->ui.visible = false;
             media->ui.playing = false;
             media_playback_set_playing(media->playback, false);
+            /* A retained decoder is dormant: psp_media_advance() will not
+               feed it while the player is hidden. Return the reserved worker
+               descriptors to page/search navigation; returning to the video
+               route reacquires them before any media work is admitted. */
+            psp_media_set_transport_priority(media, false);
             psp_media_session_checkpoint(media, "internal-view-hidden");
             return;
         }
@@ -1215,13 +1322,14 @@ void psp_media_prepare_route(
                 .retain_pipeline = false
             }, "leave-video-route");
             psp_media_pipeline_destroy(media);
-            if (media->transport_priority_held) {
-                fetch_background_transport_set_media_priority(false);
-                media->transport_priority_held = false;
-            }
+            psp_media_set_transport_priority(media, false);
             psp_media_finish_synchronous_quiesce(
                 media, "leave-video-released");
             media->source[0] = '\0';
+            media->page_source = false;
+            media->page_hls = false;
+            media->page_document_url[0] = '\0';
+            media->page_media_node_handle = 0;
             media->suspended_for_internal_view = false;
             psp_ui_media_init(&media->ui);
             psp_media_session_checkpoint(media, "leave-video-complete");
@@ -1234,12 +1342,14 @@ void psp_media_prepare_route(
         if (youtube_watch_url_video_id(media->source, current_id)
             && youtube_watch_url_video_id(url, next_id)
             && strcmp(current_id, next_id) == 0) {
+            psp_media_set_transport_priority(media, true);
             psp_media_dispatch(media, (PspMediaEvent) {
                 .type = PSP_MEDIA_EVENT_OPEN,
                 .autoplay = media->machine.resume_target
                     == PSP_MEDIA_RESUME_PLAYING,
                 .reuse_pipeline = true,
-                .has_separate_audio = media->stream.split_streams
+                .has_separate_audio = media->stream.split_streams,
+                .audio_only = media->audio_only
             }, "internal-view-return");
             media->suspended_for_internal_view = false;
             media->generation = generation;
@@ -1252,13 +1362,15 @@ void psp_media_prepare_route(
     if (strcmp(media->source, url) == 0) {
         if (media->generation != generation) {
             media->generation = generation;
+            psp_media_set_transport_priority(media, true);
             if (media->playback != NULL) {
                 psp_media_dispatch(media, (PspMediaEvent) {
                     .type = PSP_MEDIA_EVENT_OPEN,
                     .autoplay = media->machine.resume_target
                         == PSP_MEDIA_RESUME_PLAYING,
                     .reuse_pipeline = true,
-                    .has_separate_audio = media->stream.split_streams
+                    .has_separate_audio = media->stream.split_streams,
+                    .audio_only = media->audio_only
                 }, "same-video-return");
                 media->ui.visible = true;
                 psp_ui_media_show_controls(&media->ui);
@@ -1269,6 +1381,8 @@ void psp_media_prepare_route(
                    A fresh navigation generation is an explicit retry. */
                 media->requested_quality =
                     psp_media_open_quality(media);
+                media->audio_only = !direct_page_route && !offline_route
+                    && browser_profile_youtube_audio_only(media->profile);
                 media->quality_fallback_attempted = false;
                 media->open_service_pending = true;
                 psp_media_dispatch(media, (PspMediaEvent) {
@@ -1278,7 +1392,8 @@ void psp_media_prepare_route(
                        restore.  Resume/reopen paths preserve their recorded
                        play state separately; a user-selected video starts. */
                     .autoplay = true,
-                    .has_separate_audio = false
+                    .has_separate_audio = false,
+                    .audio_only = media->audio_only
                 }, "same-video-open");
                 psp_ui_media_set_resolving(
                     &media->ui,
@@ -1287,20 +1402,27 @@ void psp_media_prepare_route(
         }
         return;
     }
+    if (online_route) psp_media_set_transport_priority(media, true);
     psp_media_record_resume(media, true);
     psp_media_dispatch(media, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_CLOSE,
         .retain_pipeline = false
     }, "replace-video-route");
     psp_media_pipeline_destroy(media);
-    if (media->transport_priority_held && !online_route) {
-        fetch_background_transport_set_media_priority(false);
-        media->transport_priority_held = false;
-    }
+    if (!online_route) psp_media_set_transport_priority(media, false);
     psp_media_finish_synchronous_quiesce(
         media, "replace-video-released");
     media->clock_us = 0;
     media->offline_source = false;
+    media->page_source = direct_page_route;
+    media->page_hls = false;
+    media->audio_only = !direct_page_route && !offline_route
+        && browser_profile_youtube_audio_only(media->profile);
+    media->page_media_report_us = 0;
+    if (!direct_page_route) {
+        media->page_document_url[0] = '\0';
+        media->page_media_node_handle = 0;
+    }
     media->offline_video_path[0] = '\0';
     media->offline_audio_path[0] = '\0';
     media->suspended_for_internal_view = false;
@@ -1381,11 +1503,105 @@ void psp_media_prepare_route(
         /* Entering a provider video route is the user's play activation.
            Passing the just-cleared resume flag here opened every fresh video
            paused and let validation's synthetic Play press hide the defect. */
-        .autoplay = true,
-        .has_separate_audio = false
+        .autoplay = autoplay,
+        .has_separate_audio = false,
+        .audio_only = media->audio_only
     }, "route-open");
     psp_ui_media_set_resolving(
-        &media->ui, offline_route ? "Saved video" : "YouTube video");
+        &media->ui, offline_route ? "Saved video"
+            : direct_page_route ? "Page video" : "YouTube video");
+}
+
+void psp_media_prepare_route(
+    PspMediaSession *media, const char *url, uint64_t generation)
+{
+    psp_media_prepare_route_kind(media, url, generation, false, true);
+}
+
+bool psp_media_open_page_source(
+    PspMediaSession *media, const char *source_url,
+    const char *document_url, uint64_t generation,
+    int64_t node_handle, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, bool autoplay,
+    bool reload_source)
+{
+    if (media == NULL || source_url == NULL || document_url == NULL
+        || node_handle < 0
+        || (strncmp(source_url, "https://", 8u) != 0
+            && strncmp(source_url, "http://", 7u) != 0)) return false;
+    /* load() is an explicit resource-selection restart even when the URL did
+       not change. Play on the same source retains the cheap pipeline reuse. */
+    bool same_route = !reload_source && media->page_source
+        && !media->page_hls
+        && media->generation == generation
+        && strcmp(media->source, source_url) == 0
+        && strcmp(media->page_document_url, document_url) == 0;
+    snprintf(media->page_document_url,
+             sizeof(media->page_document_url), "%s", document_url);
+    media->page_media_node_handle = node_handle;
+    media->page_media_mode = mode;
+    media->page_media_credentials = credentials;
+    if (same_route) {
+        if (media->playback != NULL) {
+            psp_media_set_transport_priority(media, true);
+            psp_media_dispatch(media, (PspMediaEvent) {
+                .type = PSP_MEDIA_EVENT_OPEN,
+                .autoplay = autoplay,
+                .reuse_pipeline = true,
+                .has_separate_audio = false,
+                .audio_only = media->audio_only
+            }, "page-video-return");
+            media->ui.visible = true;
+            psp_ui_media_show_controls(&media->ui);
+            return true;
+        }
+        if (media->ui.failed && !media->open_service_pending) {
+            psp_media_set_transport_priority(media, true);
+            media->open_service_pending = true;
+            psp_media_dispatch(media, (PspMediaEvent) {
+                .type = PSP_MEDIA_EVENT_RETRY,
+                .autoplay = autoplay,
+                .has_separate_audio = false
+            }, "page-video-retry");
+            psp_ui_media_set_resolving(&media->ui, "Page video");
+        }
+        return media->open_service_pending;
+    }
+    psp_media_prepare_route_kind(
+        media, source_url, generation, true, autoplay);
+    return media->page_source && strcmp(media->source, source_url) == 0;
+}
+
+bool psp_media_open_page_hls(
+    PspMediaSession *media, const char *source_url,
+    const char *document_url, uint64_t generation,
+    int64_t node_handle, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, bool autoplay,
+    bool reload_source)
+{
+    if (media == NULL) return false;
+    bool same_route = !reload_source && media->page_source && media->page_hls
+        && media->generation == generation
+        && strcmp(media->source, source_url) == 0
+        && strcmp(media->page_document_url, document_url) == 0;
+    if (same_route && media->playback != NULL) {
+        psp_media_set_transport_priority(media, true);
+        psp_media_dispatch(media, (PspMediaEvent) {
+            .type = PSP_MEDIA_EVENT_OPEN,
+            .autoplay = autoplay,
+            .reuse_pipeline = true,
+            .has_separate_audio = false,
+            .audio_only = false
+        }, "page-hls-return");
+        media->ui.visible = true;
+        psp_ui_media_show_controls(&media->ui);
+        return true;
+    }
+    bool opened = psp_media_open_page_source(
+        media, source_url, document_url, generation, node_handle,
+        mode, credentials, autoplay, reload_source || !same_route);
+    if (opened) media->page_hls = true;
+    return opened;
 }
 
 void psp_media_close(PspMediaSession *media)
@@ -1394,6 +1610,7 @@ void psp_media_close(PspMediaSession *media)
     psp_media_session_checkpoint(media, "close-begin");
     uint64_t recovery_us = psp_media_recovery_position_us(media);
     bool recovery_in_flight = media->job_phase == PSP_MEDIA_JOB_SEEK_PREPARE
+        || media->job_phase == PSP_MEDIA_JOB_SEEK_PRIME
         || media->job_phase == PSP_MEDIA_JOB_SEEK_DECODE
         || media->job_phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE
         || media->job_phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE;
@@ -1419,6 +1636,11 @@ void psp_media_close(PspMediaSession *media)
     psp_media_cancel_decode(media);
     if (recovery_in_flight) media->clock_us = recovery_us;
     media->ui.visible = false;
+    /* Hidden retained pipelines consume no transport work. Keeping media
+       priority here would permanently reserve two of the six shared worker
+       descriptors after Back, including when the next navigation fails and
+       rolls back to the incumbent page. */
+    psp_media_set_transport_priority(media, false);
     psp_media_record_resume(media, true);
     if (discard_incomplete_pipeline)
         psp_media_pipeline_destroy(media);
@@ -1434,6 +1656,7 @@ bool psp_media_reclaim_hidden_pipeline(PspMediaSession *media)
     psp_media_dispatch(media, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_RECLAIM
     }, "dormant-reclaim");
+    psp_media_set_transport_priority(media, false);
     psp_media_pipeline_destroy(media);
     psp_media_finish_synchronous_quiesce(media, "dormant-released");
     psp_media_session_checkpoint(media, "dormant-reclaimed");
@@ -1763,7 +1986,8 @@ static bool psp_media_pump_dma_quarantine(PspMediaSession *media)
         if (slot >= 0) {
             /* The refusal is withdrawn first, because the release below is
                one of the paths it refuses. */
-            media_psp_backend_release_surface_quarantine((unsigned) slot);
+            media_playback_release_video_slot_quarantine(
+                media->playback, (unsigned) slot);
             (void) media_playback_release_video_slot(
                 media->playback, (unsigned) slot,
                 media->dma_quarantine_generation);
@@ -1871,6 +2095,7 @@ bool psp_media_advance(
         if (psp_media_request_seek(media, target_us, true)) return true;
     }
     if (media->job_phase == PSP_MEDIA_JOB_SEEK_PREPARE
+        || media->job_phase == PSP_MEDIA_JOB_SEEK_PRIME
         || media->job_phase == PSP_MEDIA_JOB_SEEK_DECODE
         || media->job_phase
              == PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE
@@ -1947,7 +2172,7 @@ bool psp_media_advance(
     media->advance_previous_us = advance_now_us;
     media->advance_previous_playing =
         media->machine.state == PSP_MEDIA_SESSION_PLAYING
-        && media->have_frame;
+        && (media->have_frame || media->audio_only);
     psp_media_pump_ranges(media);
     /* The frame's own transport step, outside any pump unit -- if the stall
        lives here rather than inside a unit, this is what names it. */
@@ -2008,11 +2233,14 @@ bool psp_media_advance(
      * and left nothing pending is the caught-up case, and that is where the
      * browser owes the rest of the frame to the page.
      */
-    /* A video that owns the whole screen has no page behind it to owe the
+    /* Media that owns the whole screen has no page behind it to owe the
        rest of the frame to, and the device measured this pump unit-capped on
        374 of 405 frames while spending 1.2ms of its 12ms slice. Give it the
-       units; the slice is still the bound that matters. */
-    unsigned unit_ceiling = media->ui.visible && media->have_frame
+       units; the slice is still the bound that matters. Audio-only has less
+       work per unit but still needs enough AAC offers to keep its output
+       queue fed without a video-present pump. */
+    unsigned unit_ceiling = media->ui.visible
+            && (media->have_frame || media->audio_only)
         ? PSP_MEDIA_PUMP_FULLSCREEN_MAXIMUM_UNITS
         : PSP_MEDIA_PUMP_MAXIMUM_UNITS;
     unsigned units = 1;
@@ -2140,6 +2368,9 @@ bool psp_media_advance(
                stats.packets_submitted, stats.would_block_calls);
         return true;
     }
+    if (media->audio_only)
+        psp_media_complete_priming_if_ready(
+            media, "audio-prime-ready");
     /* A refusal the advance above collected, recovered by resetting rather than
        by skipping. It moves the source and drops the surface, so the frame ends
        where the recovery does. */
@@ -2198,12 +2429,14 @@ bool psp_media_advance(
     if (media->presentation_preroll_startup) {
         unsigned ready =
             media_playback_ready_video_frames(media->playback);
-        /* Two surfaces are the PSP backend's complete bounded queue. Do not
-           claim the head while filling it: that would free one slot and turn
-           priming back into an ever-moving one-frame target. Once full, lend
-           exactly the first picture while sound remains held. Audio starts at
-           time zero only after the final display funnel confirms that picture
-           reached the LCD, so player setup cannot make sound start ahead. */
+        unsigned ready_target =
+            media_playback_startup_ready_frames(media->playback);
+        if (ready_target == 0) ready_target = PSP_MEDIA_STARTUP_READY_FRAMES;
+        /* Fill the active decoder's complete startup target before claiming
+           its head. Firmware uses both of its surfaces; the software decoder
+           uses a deeper bounded ring so hard I/P frames cannot immediately
+           drain its lead. Audio starts only after the final display funnel
+           confirms the first picture reached the LCD. */
         size_t displayed =
             media_playback_displayed_video_frames(media->playback);
         if (media->presentation_preroll_startup_claimed
@@ -2214,7 +2447,7 @@ bool psp_media_advance(
             psp_media_complete_priming_if_ready(
                 media, "startup-prime-ready");
         } else if (!media->presentation_preroll_startup_claimed
-                   && psp_media_startup_preroll_ready(ready)) {
+                   && ready >= ready_target) {
             startup_claim_allowed = true;
         }
     }
@@ -2303,6 +2536,22 @@ bool psp_media_advance(
                    "action=refresh-rearmed clock=%lluus\n",
                    (unsigned long long) media->clock_us);
         }
+    } else if (media->audio_only) {
+        uint64_t audio_cursor_us = 0;
+        bool audio_presented = media_playback_audio_cursor_us(
+            media->playback, &audio_cursor_us);
+        if (psp_media_transport_recovery_stable(
+                media->transport_reresolve_attempts,
+                media->transport_refresh_rearm_us,
+                media->clock_us, audio_presented)) {
+        /* AAC output is the proof of recovery when no picture exists. Keep
+           the same five-second per-incident rearm contract as A/V playback. */
+            media->transport_reresolve_attempts = 0;
+            media->transport_refresh_rearm_us = 0;
+            printf("tilefinch-youtube: stage=transport-mid "
+                   "action=refresh-rearmed-audio clock=%lluus\n",
+                   (unsigned long long) media->clock_us);
+        }
     } else if (media->ui.playing) {
         media->no_frame_ms =
             elapsed_ms > UINT_MAX - media->no_frame_ms
@@ -2312,6 +2561,18 @@ bool psp_media_advance(
     }
     MediaPlaybackJobStats job_stats = {0};
     media_playback_job_stats(media->playback, &job_stats);
+    /* A range which exhausted its bounded demanded-window recovery is a
+       terminal source result, not another buffering sample. Consume it at
+       this single session seam even if the demux has not yet retried the
+       exact payload read. This prevents BUFFERING + pending from masking the
+       failure indefinitely and gives open, playing and seek the same
+       candidate-replacement policy. */
+    if (psp_media_delivery_candidate_stalled(media)
+        && psp_media_retry_delivery_failure(
+               media, "delivery-window", "MEDIA WINDOW MADE NO PROGRESS",
+               true)) {
+        return true;
+    }
     psp_media_buffering_update(
         media, &job_stats, psp_media_now_us(media));
     bool packets_advanced =
@@ -2421,7 +2682,11 @@ bool psp_media_advance(
         }
     }
 #endif
-    if (decode_progress) {
+    bool decode_watchdog_active =
+        psp_media_decode_no_progress_watchdog_active(
+            media->buffering_service_active,
+            media->machine.preview_active);
+    if (decode_progress || !decode_watchdog_active) {
         media->decode_no_progress_ms = 0;
     } else {
         media->decode_no_progress_ms =
@@ -2435,8 +2700,12 @@ bool psp_media_advance(
     bool source_refilling = psp_media_source_refilling(media);
     if (media->buffering_service_active && source_refilling)
         media->decode_no_progress_ms = 0;
-    if (!media->buffering_service_active && media->decode_no_progress_ms
+    if (decode_watchdog_active && media->decode_no_progress_ms
         >= psp_media_decode_no_progress_budget_ms(source_refilling)) {
+        if (psp_media_delivery_candidate_stalled(media)
+            && psp_media_retry_delivery_failure(
+                   media, "no-progress", "MEDIA SOURCE MADE NO PROGRESS",
+                   true)) return true;
         if (psp_media_retry_240p(
                 media, "no-progress",
                 "VIDEO DECODER MADE NO PROGRESS", false)) return true;

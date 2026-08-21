@@ -88,6 +88,10 @@ typedef struct {
     char asset[96];
     char notes[TILEFINCH_UPDATE_MAX_NOTES_BYTES + 1u];
     size_t notes_length;
+    /* Optional, signed compatibility epoch carried in the existing notes
+       field. Zero/false is valid for older manifests. */
+    uint16_t optional_decoder_abi;
+    bool optional_decoder_abi_valid;
 } TilefinchUpdateManifest;
 
 typedef bool (*TilefinchUpdateP256Verify)(
@@ -109,6 +113,13 @@ typedef struct {
     uint8_t installed_package_sha256[32];
     bool installed_sequence_valid;
     bool installed_pair_valid;
+    /* Optional distribution tag selected locally by the user. A valid
+       signature is still rejected when its manifest names another tag. */
+    const char *expected_tag;
+    /* Explicit local selection of a historical signed release. This relaxes
+       only the monotonic sequence comparison; all other verification stays
+       authoritative. */
+    bool allow_downgrade;
 } TilefinchUpdateVerifyOptions;
 
 typedef struct {
@@ -196,6 +207,7 @@ typedef struct {
     uint8_t previous_sha256[32];
     uint64_t candidate_sequence;
     uint8_t candidate_sha256[32];
+    bool candidate_downgrade;
 } TilefinchUpdateState;
 
 #define TILEFINCH_UPDATE_STATE_BYTES 174u
@@ -247,6 +259,7 @@ typedef struct {
     const uint8_t *installed_package_sha256;
     bool installed_sequence_valid;
     bool installed_pair_valid;
+    bool allow_downgrade;
     TilefinchUpdateTrust trust;
 } TilefinchUpdateSlotVerifyOptions;
 
@@ -283,6 +296,8 @@ typedef struct {
     uint16_t launcher_protocol;
     const char *repository_owner;
     const char *repository_name;
+    /* Optional fixed GitHub tag, such as v0.1.4. Signed browser updates only. */
+    const char *release_tag;
     /* NULL keeps the fixed Stable GitHub endpoint. Developer requires a
        non-NULL metadata override and the explicit DEVELOPER_UNSIGNED trust
        value; no failure path may infer that mode. A separate package URL is
@@ -290,6 +305,7 @@ typedef struct {
     const char *metadata_url_override;
     const char *package_url_override;
     bool package_relative_to_metadata;
+    bool allow_downgrade;
     TilefinchUpdateTrust trust;
     const char *package_part_path;
     /* Required for glyph components; for example
@@ -356,6 +372,7 @@ typedef struct {
     TilefinchUpdateSlot inactive_slot;
     TilefinchUpdateState current_state;
     TilefinchUpdateTrust trust;
+    bool allow_downgrade;
     TilefinchUpdateFaultHook fault;
     void *fault_opaque;
 } TilefinchUpdateInstallOptions;

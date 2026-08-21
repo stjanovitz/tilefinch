@@ -64,7 +64,12 @@ class UpdateToolTests(unittest.TestCase):
                 "--sequence", 2, "--expires", 2_000_000_000,
                 "--version", "0.1.1", "--tag", "v0.1.1",
                 "--asset", "tilefinch.tfup", "--notes", notes,
+                "--decoder-abi", 3,
                 "--output", manifest,
+            )
+            self.assertIn(
+                b"Decoder ABI 3; rebuild if different. ",
+                manifest.read_bytes(),
             )
             envelope = work / "tilefinch-update-v1.tfum"
             self.command(

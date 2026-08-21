@@ -166,19 +166,25 @@ static bool test_buffers_rotate_and_stay_distinct(void)
     uint16_t *first_front = psp_display_front_buffer(&display);
     CHECK(first_back != NULL && first_front != NULL);
     CHECK(first_back != first_front);
-    /* Both buffers must lie inside the allocation, one stride-page apart. */
-    CHECK(first_front == first_back + PSP_DISPLAY_BUFFER_PIXELS
-          || first_back == first_front + PSP_DISPLAY_BUFFER_PIXELS);
+    /* Page mode owns three stride-pages inside the EDRAM allocation. */
+    CHECK(first_front == first_back
+              + 2u * PSP_DISPLAY_BUFFER_PIXELS);
 
     CHECK(psp_display_publish(&display));
     CHECK(fake.last_address == first_back);
-    CHECK(psp_display_back_buffer(&display) == first_front);
+    uint16_t *second_back = psp_display_back_buffer(&display);
+    CHECK(second_back == first_back + PSP_DISPLAY_BUFFER_PIXELS);
     CHECK(psp_display_front_buffer(&display) == first_back);
 
     CHECK(psp_display_publish(&display));
+    CHECK(fake.last_address == second_back);
+    CHECK(psp_display_back_buffer(&display) == first_front);
+    CHECK(psp_display_front_buffer(&display) == second_back);
+    CHECK(psp_display_publish(&display));
     CHECK(fake.last_address == first_front);
     CHECK(psp_display_back_buffer(&display) == first_back);
-    CHECK(display.presents == 2 && display.rejections == 0);
+    CHECK(psp_display_front_buffer(&display) == first_front);
+    CHECK(display.presents == 3 && display.rejections == 0);
     return true;
 }
 
@@ -306,7 +312,7 @@ static bool test_video_surface_switches_format_and_buffers(void)
     CHECK(psp_display_video_back_buffer(&display) == NULL);
     CHECK(psp_display_video_overlay_scratch(&display) == NULL);
     CHECK(psp_display_publish(&display));
-    uint16_t *page_front = psp_display_front_buffer(&display);
+    CHECK(psp_display_front_buffer(&display) != NULL);
     int presents_before = fake.present_calls;
 
     /* Entering performs no syscall: the panel keeps showing the last complete
@@ -391,13 +397,17 @@ static bool test_video_surface_switches_format_and_buffers(void)
           == PSP_DISPLAY_BUFFER_PIXELS * sizeof(uint16_t));
     CHECK(display.surface_exits == 1);
     /* Both surfaces share one rotation, so which 16-bit buffer is reasserted
-       follows the parity the video presents left behind. Either is a complete
-       page frame from before the video, and what matters is that the address
-       handed to scanout is the one the accessors now describe. */
+       follows the video presents left behind. It must be one of the three
+       page slots, and the address handed to scanout must be the one the
+       accessors now describe. */
     uint16_t *restored = psp_display_front_buffer(&display);
     CHECK(restored != NULL && fake.last_address == restored);
-    CHECK(restored == page_front
-          || restored == page_front + PSP_DISPLAY_BUFFER_PIXELS);
+    CHECK(restored >= fake.memory
+          && restored < fake.memory
+              + PSP_DISPLAY_PAGE_BUFFER_COUNT
+                    * PSP_DISPLAY_BUFFER_PIXELS);
+    CHECK(((size_t) (restored - fake.memory)
+              % PSP_DISPLAY_BUFFER_PIXELS) == 0u);
     CHECK(restored != psp_display_back_buffer(&display));
     /*
      * The video layout was written over the page buffers, so what is being

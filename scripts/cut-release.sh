@@ -121,6 +121,11 @@ command -v ctest >/dev/null 2>&1 || fail "ctest not found"
 command -v git >/dev/null 2>&1 || fail "git not found"
 command -v python3 >/dev/null 2>&1 \
     || fail "python3 not found (needed for the TFUP packer)"
+decoder_abi=$(sed -n \
+    's/^#define TILEFINCH_SWDEC_COMPONENT_ABI_VERSION \([0-9][0-9]*\)u$/\1/p' \
+    "$root/include/tilefinch/swdec_component.h")
+printf '%s\n' "$decoder_abi" | grep -Eq '^[1-9][0-9]*$' \
+    || fail "could not derive the optional decoder ABI"
 
 step "Checking the source tree"
 git -C "$root" rev-parse --verify HEAD >/dev/null 2>&1 \
@@ -197,6 +202,7 @@ printf '%s\n' "Fidelity floor ratchet ran and passed."
 step "Clean PSP release configure (release sequence $sequence)"
 rm -rf "$root/build-preset-psp"
 set -- "-DTILEFINCH_RELEASE_SEQUENCE=$sequence"
+set -- "$@" "-DTILEFINCH_PSP_ENABLE_SWDEC_COMPONENT=OFF"
 if [ "$update_root_choice" = root ]; then
     set -- "$@" "-DTILEFINCH_UPDATE_ROOT_V1=$update_root"
 else
@@ -228,6 +234,15 @@ for required in \
     "$tree/slot-a/boot-defaults.cfg"
 do
     [ -f "$required" ] || fail "staged tree is missing $required"
+done
+for forbidden in \
+    "$tree/slot-a/tilefinch-swdec.prx" \
+    "$tree/slot-a/swdec-meload.prx" \
+    "$tree/components/swdec/tilefinch-swdec.prx" \
+    "$tree/components/swdec/swdec-meload.prx"
+do
+    [ ! -e "$forbidden" ] \
+        || fail "official release unexpectedly contains optional decoder: $forbidden"
 done
 # StagePspInstall.cmake already fails the build when the manifest is not
 # satisfied; re-check every entry here independently so packaging cannot
@@ -299,6 +314,7 @@ cat <<EOF
        --package $tfup_name --root-version <N> \\
        --sequence $sequence --expires <unix-expiry> --version $version \\
        --tag v$version --asset $tfup_name \\
+       --decoder-abi $decoder_abi \\
        --notes "<signed release notes>" --output manifest.tfum-body
      python3 tools/tilefinch_update_tool.py envelope \\
        --manifest manifest.tfum-body --release-key <offline-release-key> \\

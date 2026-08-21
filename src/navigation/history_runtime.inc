@@ -977,6 +977,143 @@ size_t navigation_cancel_network_work(
     return cancelled;
 }
 
+static void navigation_deferred_images_finish(NavigationSession *session)
+{
+    if (session == NULL) return;
+    images_priority_load_destroy(session->page.deferred_image_job);
+    session->page.deferred_image_job = NULL;
+    budget_free(session->budget, session->page.deferred_image_targets);
+    session->page.deferred_image_targets = NULL;
+    session->page.deferred_image_count = 0;
+    session->page.deferred_image_cursor = 0;
+    session->page.image_continuation_pending = false;
+}
+
+static uint64_t navigation_deferred_image_distance(
+    const NavigationSession *session, const ImagePriorityTarget *target,
+    uint16_t *display_width, uint16_t *display_height)
+{
+    if (display_width != NULL) *display_width = target->display_width;
+    if (display_height != NULL) *display_height = target->display_height;
+    const NavigationEntry *entry = navigation_current(session);
+    int64_t top = entry == NULL ? 0 : entry->scroll_y;
+    int64_t bottom = top + session->viewport.css_height;
+    for (size_t i = 0; i < session->page.layout.node_box_count; i++) {
+        const LayoutNodeBox *box = &session->page.layout.node_boxes[i];
+        if (box->node != target->node || box->width <= 0
+            || box->height <= 0) continue;
+        int width = layout_css_to_visual(&session->page.layout, box->width);
+        int height = layout_css_to_visual(&session->page.layout, box->height);
+        if (display_width != NULL && width > 0 && width <= UINT16_MAX) {
+            *display_width = (uint16_t) width;
+        }
+        if (display_height != NULL && height > 0 && height <= UINT16_MAX) {
+            *display_height = (uint16_t) height;
+        }
+        int64_t box_top = box->y;
+        int64_t box_bottom = box_top + box->height;
+        if (box_bottom < top) return (uint64_t) (top - box_bottom);
+        if (box_top > bottom) return (uint64_t) (box_top - bottom);
+        return 0;
+    }
+    return UINT64_MAX;
+}
+
+static bool navigation_run_deferred_image(NavigationSession *session)
+{
+    NavigationPage *page = &session->page;
+    if (page->deferred_image_targets == NULL
+        || page->deferred_image_cursor >= page->deferred_image_count) {
+        navigation_deferred_images_finish(session);
+        return true;
+    }
+    if (page->deferred_image_job == NULL) {
+        /* Re-rank only between requests. A scroll can therefore bring a
+           later thumbnail to the front without cancelling useful bytes
+           already in flight. */
+        size_t best = page->deferred_image_cursor;
+        uint16_t best_width = 0, best_height = 0;
+        uint64_t best_distance = navigation_deferred_image_distance(
+            session, &page->deferred_image_targets[best],
+            &best_width, &best_height);
+        for (size_t i = best + 1; i < page->deferred_image_count; i++) {
+            uint64_t distance = navigation_deferred_image_distance(
+                session, &page->deferred_image_targets[i], NULL, NULL);
+            if (distance < best_distance) {
+                best = i;
+                best_distance = distance;
+            }
+        }
+        if (best != page->deferred_image_cursor) {
+            ImagePriorityTarget swap =
+                page->deferred_image_targets[page->deferred_image_cursor];
+            page->deferred_image_targets[page->deferred_image_cursor] =
+                page->deferred_image_targets[best];
+            page->deferred_image_targets[best] = swap;
+            (void) navigation_deferred_image_distance(
+                session,
+                &page->deferred_image_targets[page->deferred_image_cursor],
+                &best_width, &best_height);
+        }
+        ImagePriorityTarget *target =
+            &page->deferred_image_targets[page->deferred_image_cursor];
+        target->display_width = best_width;
+        target->display_height = best_height;
+        page->deferred_image_job = images_priority_load_begin(
+            &page->document, &page->stylesheet, &page->images, target,
+            session->budget, page->resource_base_url, page->document_url,
+            page->referrer_policy, session->maximum_images,
+            session->maximum_image_bytes,
+            session->maximum_image_file_bytes,
+            session->maximum_decoded_image_bytes,
+            session->resource_timeout_ms, page->resource_scheduler,
+            session->browser_session);
+        if (page->deferred_image_job == NULL) {
+            session->performance.background_image_failures++;
+            navigation_deferred_images_finish(session);
+            return true;
+        }
+    }
+
+    size_t loaded_before = page->images.stats.loaded;
+    session->performance.background_image_batches++;
+    ImagePriorityLoadStatus status = images_priority_load_pump(
+        page->deferred_image_job);
+    if (status == IMAGE_PRIORITY_LOAD_PENDING) return true;
+    images_priority_load_destroy(page->deferred_image_job);
+    page->deferred_image_job = NULL;
+    page->deferred_image_cursor++;
+    if (status == IMAGE_PRIORITY_LOAD_FAILED) {
+        session->performance.background_image_failures++;
+    }
+    size_t added = page->images.stats.loaded >= loaded_before
+        ? page->images.stats.loaded - loaded_before : 0;
+    if (added <= SIZE_MAX
+                 - session->performance.background_images_loaded) {
+        session->performance.background_images_loaded += added;
+    } else {
+        session->performance.background_images_loaded = SIZE_MAX;
+    }
+    session->images = &page->images;
+    navigation_ensure_layout_reuse(session);
+    layout_reuse_cache_update_images(page->layout_reuse, &page->images);
+    if (added != 0) {
+        if (!navigation_relayout(session)) {
+            /* Optional pixels must never retire an already usable display
+               list under pressure. The transactional relayout left it
+               intact; stop the queue and keep browsing. */
+            session->performance.background_image_failures++;
+            navigation_deferred_images_finish(session);
+            return true;
+        }
+        session->performance.background_image_relayouts++;
+    }
+    if (page->deferred_image_cursor >= page->deferred_image_count) {
+        navigation_deferred_images_finish(session);
+    }
+    return true;
+}
+
 bool navigation_run_background_resources(NavigationSession *session)
 {
     if (session == NULL || !session->page.loaded) return false;
@@ -1047,6 +1184,9 @@ bool navigation_run_background_resources(NavigationSession *session)
         }
     }
     if (!session->page.image_continuation_pending) return true;
+    if (session->page.deferred_image_targets != NULL) {
+        return navigation_run_deferred_image(session);
+    }
     ImageResources *images = &session->page.images;
     size_t loaded_before = images->stats.loaded;
     session->performance.background_image_batches++;
@@ -1126,6 +1266,18 @@ static void navigation_accumulate_script_metrics(
         metrics->inline_data_fast_paths;
     session->script_inline_data_fast_path_bytes +=
         metrics->inline_data_fast_path_bytes;
+    session->script_inline_data_quota_exemptions +=
+        metrics->inline_data_quota_exemptions;
+    session->script_cost_class_rejections += metrics->cost_class_rejections;
+    session->script_watchdog_classification_misses +=
+        metrics->watchdog_classification_misses;
+    session->script_watchdog_classification_miss_bytes +=
+        metrics->watchdog_classification_miss_bytes;
+    session->script_watchdog_classification_miss_loops +=
+        metrics->watchdog_classification_miss_loops;
+    session->script_watchdog_classification_miss_flags |=
+        metrics->watchdog_classification_miss_flags;
+    navigation_record_soft_script_error(session, metrics);
 }
 
 typedef struct {
@@ -1710,7 +1862,7 @@ bool navigation_dispatch_node_pointer(
     unsigned buttons)
 {
     if (session == NULL || session->page.runtime == NULL
-        || !session->page.loaded || node == NULL) return false;
+        || !session->page.loaded || (node == NULL && phase != 1u)) return false;
     if (!script_runtime_dispatch_pointer_node(
         session->page.runtime, node, phase, client_x, client_y,
             offset_x, offset_y, buttons, &session->page.script_result)) {

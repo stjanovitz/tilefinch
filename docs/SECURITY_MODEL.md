@@ -195,14 +195,17 @@ The host transport exposes at most `FETCH_RESPONSE_COOKIE_CAPACITY` (currently
 serialized field must fit its 4,095-byte storage ceiling. Cookie values and
 their response-URL attributions are allocated from the shared budget only when
 received; `FetchResult` retains only the fixed pointer inventory, avoiding a
-large worst-case payload in every result and scheduler/stack frame. If a final
-response carries more than 32 individually valid fields, Tilefinch accepts the
-page, retains the first 32, and marks the cookie set as truncated so capture and
-replay preserve the same outcome. The same overflow on a redirect hop fails
-closed: a partial intermediate set could otherwise hide a deletion before the
-next request. An oversized field or a cookie-allocation failure remains fatal
-on every hop rather than exposing partially interpreted security attributes.
-This remains deliberately stricter than a desktop browser.
+large worst-case payload in every result and scheduler/stack frame. The PSP
+worker also bounds captured cookie text to a fixed 16 KiB pool. If a final
+response exceeds either the 32-field inventory or that aggregate pool,
+Tilefinch accepts the page, retains the bounded prefix, and marks the cookie set
+as truncated so capture and replay preserve the same outcome. The same
+overflow on a followed redirect hop fails closed: a partial intermediate set
+could otherwise hide a deletion before the next request. A deliberately
+single-hop 3xx is a final response and uses the final-response rule. An
+oversized individual field or a cookie-allocation failure remains fatal on
+every hop rather than exposing partially interpreted security attributes. This
+remains deliberately stricter than a desktop browser.
 
 ## Content blocking
 
@@ -299,15 +302,19 @@ lower-level transport helper directly. Browser-owned update and provider
 requests use separate privileged paths and never inherit page authority.
 
 The bounded response-header CSP subset intersects up to four policies and
-supports `default-src`, `script-src`, `style-src`, `img-src`, `font-src`,
-`connect-src`, `frame-src`, `object-src`, `base-uri`, `form-action`, and
+supports `default-src`, `script-src`, `style-src`, `img-src`, `media-src`,
+`font-src`, `connect-src`, `frame-src`, `object-src`, `base-uri`, `form-action`, and
 `frame-ancestors`, plus `worker-src` with the standard fallback to `script-src`
 and then `default-src`. It recognizes `'none'`, `'self'`, wildcard, scheme, bounded
 host/port/path sources, `data:` and `blob:` where the selected directive permits
 them, plus script/style nonces and SHA-256 hashes. A nonce or hash source makes
 `'unsafe-inline'` ineffective for that directive. Authored inline style
-attributes are gated; CSSOM `element.style` mutation remains allowed, matching
-the browser distinction between inline content and a style API operation.
+attributes and `on*` event-handler attributes are gated; CSSOM `element.style`
+mutation and programmatic event listeners remain allowed, matching the browser
+distinction between inline content and an API operation. Permitted event-
+handler attributes are compiled lazily through a bounded host path that accepts
+only the attribute body. It does not reopen page access to `eval` or the
+Function constructor.
 Security-header truncation, policy overflow, or an invalid bounded policy fails
 the affected navigation closed rather than applying a partial policy.
 
@@ -438,14 +445,26 @@ lowercased names and value byte lengths; raw values such as bearer tokens are
 not retained. Consequently a trace proves matching request shape, not exact
 authentication-secret equality.
 
+## Native media and visual work bounds
+
+Native media and visual effects retain explicit work and destination bounds.
+The optional decoder validates in-band H.264 geometry before worker dispatch,
+again at decoded-picture publication, and at the RGB565 CSC destination; AAC
+output may expose only mono or stereo planes. Fixed and sticky backdrop blur
+keeps its small per-command radius/area limits and is additionally limited to
+four commands per layout. Exceeding that aggregate limit removes the cosmetic
+blur from the layout so it cannot disable the retained fixed-layer cache and
+repeat unbounded raster work every frame.
+
 ## Explicitly incomplete areas
 
 Reader mode is not a sanitizer or a content-security boundary. It hides page
 regions with user-origin CSS only; hidden nodes remain in the DOM, their
 scripts retain the same authority, and toggling the mode off reveals them
-again. Site-specific rules are therefore presentation hints, never evidence
-that advertising, tracking, or hostile content was removed. Network blocking
-is a separate pre-transport policy described in `CONTENT_BLOCKING.md`.
+again. Its bounded content-shape classification and DOM markers are
+presentation hints, never evidence that advertising, tracking, or hostile
+content was removed. Network blocking is a separate pre-transport policy
+described in `CONTENT_BLOCKING.md`.
 
 Offline Reader snapshots cross a separate persistence boundary: only escaped
 body text, a bounded title, and the source URL are serialized. Live DOM

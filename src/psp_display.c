@@ -45,8 +45,14 @@ static uint16_t *buffer_at(const PspDisplay *display, unsigned index)
 {
     if (display == NULL || display->base == NULL) return NULL;
     return display->base
-        + (size_t) (index % PSP_DISPLAY_BUFFER_COUNT)
+        + (size_t) (index % PSP_DISPLAY_PAGE_BUFFER_COUNT)
             * PSP_DISPLAY_BUFFER_PIXELS;
+}
+
+static unsigned page_previous_buffer(unsigned index)
+{
+    return (index + PSP_DISPLAY_PAGE_BUFFER_COUNT - 1u)
+        % PSP_DISPLAY_PAGE_BUFFER_COUNT;
 }
 
 /* The video layout starts at the base, over the page buffers it replaces; see
@@ -64,7 +70,7 @@ static uint32_t *video_buffer_at(const PspDisplay *display, unsigned index)
     return (uint32_t *) edram_at(
         display,
         PSP_DISPLAY_VIDEO_BASE_BYTES
-            + (size_t) (index % PSP_DISPLAY_BUFFER_COUNT)
+            + (size_t) (index % PSP_DISPLAY_VIDEO_BUFFER_COUNT)
                 * PSP_DISPLAY_VIDEO_BUFFER_BYTES);
 }
 
@@ -83,7 +89,7 @@ uint16_t *psp_display_back_buffer(const PspDisplay *display)
 uint16_t *psp_display_front_buffer(const PspDisplay *display)
 {
     if (display == NULL || psp_display_video_active(display)) return NULL;
-    return buffer_at(display, display->back_buffer ^ 1u);
+    return buffer_at(display, page_previous_buffer(display->back_buffer));
 }
 
 uint32_t *psp_display_video_back_buffer(const PspDisplay *display)
@@ -201,10 +207,11 @@ bool psp_display_video_end(PspDisplay *display)
      * cost is one memset of a quarter megabyte, once, on the way out of a
      * video session.
      */
-    uint16_t *front = buffer_at(display, display->back_buffer ^ 1u);
+    unsigned front_index = page_previous_buffer(display->back_buffer);
+    uint16_t *front = buffer_at(display, front_index);
     if (front != NULL)
         memset(front, 0, PSP_DISPLAY_BUFFER_PIXELS * sizeof(*front));
-    int result = latch_buffer(display, display->back_buffer ^ 1u);
+    int result = latch_buffer(display, front_index);
     if (result < 0) {
         display->surface_failures++;
         display->last_surface_error = result;
@@ -234,7 +241,11 @@ bool psp_display_publish(PspDisplay *display)
            the next compose must not treat it as the free one. */
         return false;
     }
-    display->back_buffer ^= 1u;
+    if (psp_display_video_active(display))
+        display->back_buffer ^= 1u;
+    else
+        display->back_buffer =
+            (display->back_buffer + 1u) % PSP_DISPLAY_PAGE_BUFFER_COUNT;
     return true;
 }
 
@@ -247,7 +258,10 @@ bool psp_display_rearm(PspDisplay *display)
 
     int result = display->backend->set_mode(
         0, PSP_DISPLAY_SCREEN_WIDTH, PSP_DISPLAY_SCREEN_HEIGHT);
-    if (result >= 0) result = latch_buffer(display, display->back_buffer ^ 1u);
+    unsigned front_index = psp_display_video_active(display)
+        ? display->back_buffer ^ 1u
+        : page_previous_buffer(display->back_buffer);
+    if (result >= 0) result = latch_buffer(display, front_index);
     if (result < 0) {
         display->rearm_failures++;
         display->last_rearm_error = result;
@@ -290,7 +304,8 @@ _Static_assert(
         <= PSP_DISPLAY_EDRAM_BYTES,
     "the video layout must fit the PSP's 2 MiB of EDRAM");
 _Static_assert(
-    PSP_DISPLAY_BUFFER_PIXELS * sizeof(uint16_t) * PSP_DISPLAY_BUFFER_COUNT
+    PSP_DISPLAY_BUFFER_PIXELS * sizeof(uint16_t)
+        * PSP_DISPLAY_PAGE_BUFFER_COUNT
         <= PSP_DISPLAY_EDRAM_BYTES,
     "the page layout must fit the PSP's 2 MiB of EDRAM");
 /* The texture is only worth moving here if it holds the whole shipping

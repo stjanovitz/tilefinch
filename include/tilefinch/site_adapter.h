@@ -100,9 +100,9 @@ bool site_adapter_load_sync(
 void site_adapter_document_destroy(SiteAdapterDocument *document);
 
 /*
- * Reader mode is a presentation adapter, not a document rewrite. It emits a
- * bounded user stylesheet for an ordinary HTTP(S) document so the caller can
- * toggle the transform off without reparsing or losing page state.
+ * Reader mode is a content-shaped presentation, not a hostname adapter. It
+ * emits one bounded stylesheet for the markers produced by reader_mode.h so
+ * the caller can toggle the transform without reparsing or losing page state.
  */
 bool site_adapter_reader_css(
     const char *url, SiteAdapterReaderFont font, unsigned font_percent,

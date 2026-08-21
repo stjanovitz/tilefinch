@@ -6,6 +6,7 @@ set(TILEFINCH_CORE_SOURCES
     src/content_blocker.c
     src/content_security_policy.c
     src/controller.c
+    src/media_discovery.c
     src/danzeff_input.c
     src/data_url.c
     src/diagnostics.c
@@ -29,6 +30,9 @@ set(TILEFINCH_CORE_SOURCES
     src/js_runtime.c
     src/layout.c
     src/media_backend.c
+    src/media_hls.c
+    src/swdec/swdec_ts.c
+    src/media_source.c
     src/media_http.c
     src/layout_block.c
     src/layout_block_decoration.c
@@ -56,6 +60,7 @@ set(TILEFINCH_CORE_SOURCES
     src/psp_network_supervisor.c
     src/public_suffix.c
     src/render.c
+    src/reader_mode.c
     src/request_context.c
     src/resource_integrity.c
     src/resources.c
@@ -77,11 +82,13 @@ set(TILEFINCH_CORE_SOURCES
     src/style_selector_program.c
     src/style_sheet.c
     src/style_values.c
+    src/swdec_component_store.c
     src/tls_session_store.c
     src/url.c
     src/update_manifest.c
     src/update_root_embedded.c
     src/update_client.c
+    src/update_history.c
     src/update_journal.c
     src/update_installer.c
     src/update_package.c
@@ -100,6 +107,7 @@ set(TILEFINCH_PSP_FRONTEND_SOURCES
     src/failure_recovery_main.c
     src/psp_text_input.c
     src/psp_ui.c
+    src/psp_ui_menu.c
     src/psp_voice_input.c
     src/psp_network.c
     src/psp_time.c
@@ -122,7 +130,9 @@ target_include_directories(tilefinch_core PUBLIC
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
 if(PSP)
     enable_language(ASM)
-    target_sources(tilefinch_core PRIVATE src/media_backend_psp.c)
+    target_sources(tilefinch_core PRIVATE
+        src/media_backend_psp.c
+        src/media_backend_psp_swdec.c)
     add_library(tilefinch_psp_media_imports STATIC
         src/media_backend_psp_imports.S)
     # Project-authored SystemCtrlForUser stubs replace the GPL-3.0

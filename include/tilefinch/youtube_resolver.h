@@ -65,10 +65,11 @@ bool youtube_playability_is_globally_terminal(
     YoutubePlayability playability);
 
 /*
- * Current unattested mobile identities can expose direct URLs whose first
+ * Some unattested mobile identities can expose direct URLs whose first
  * bounded prefix is readable while later ranges are refused. This policy is
  * kept beside the client table so a resolver never hands a known-incomplete
- * source to the MP4 demuxer.
+ * source to the MP4 demuxer. Profiles known to impose a per-URL serving cap
+ * are excluded from the table entirely.
  */
 bool youtube_direct_delivery_admitted(
     const char *client_name, const YoutubeStream *stream);

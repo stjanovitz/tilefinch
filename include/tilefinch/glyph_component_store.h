@@ -15,8 +15,13 @@ typedef enum {
     TILEFINCH_GLYPH_PACK_CHINESE_TRADITIONAL,
     TILEFINCH_GLYPH_PACK_KOREAN,
     TILEFINCH_GLYPH_PACK_COLOR_EMOJI,
+    TILEFINCH_GLYPH_PACK_CYRILLIC,
+    TILEFINCH_GLYPH_PACK_LATIN_EXTENDED,
     TILEFINCH_GLYPH_PACK_COUNT
 } TilefinchGlyphPack;
+
+_Static_assert(TILEFINCH_GLYPH_PACK_COUNT <= 8,
+               "glyph pack mask must fit in uint8_t");
 
 typedef struct {
     const char *id;

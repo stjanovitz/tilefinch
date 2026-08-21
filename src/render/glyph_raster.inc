@@ -358,7 +358,7 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
         if (previous != 0) {
             pen_x_fixed += command->letter_spacing * 64;
         }
-        if (!provider_sequence)
+        if (!provider_sequence && !draw_command_text_kerning_none(command))
             pen_x_fixed += font_kerning_at_size_fixed(
                 face, previous, codepoint, pixel_height_fixed);
         FontGlyph temporary;

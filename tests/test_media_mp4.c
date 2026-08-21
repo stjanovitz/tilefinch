@@ -79,9 +79,51 @@ typedef struct {
     bool drain_emit_once;
     bool drain_tail_pending;
     bool queue_once;
+    size_t presentation_borrows;
+    size_t presentation_releases;
+    size_t presentation_staged;
+    size_t presentation_displayed;
     TilefinchCancellation *cancel_on_submit;
     TilefinchCancellation *cancel_on_drain;
 } BackendFixture;
+
+static bool backend_presentation_borrow(
+    void *opaque, unsigned slot, uint32_t generation)
+{
+    BackendFixture *fixture = opaque;
+    if (fixture == NULL || slot != 7u || generation != 9u) return false;
+    fixture->presentation_borrows++;
+    return true;
+}
+
+static void backend_presentation_release(void *opaque, unsigned slot)
+{
+    BackendFixture *fixture = opaque;
+    if (fixture != NULL && slot == 7u) fixture->presentation_releases++;
+}
+
+static void backend_presentation_note_staged(
+    void *opaque, const MediaVideoFrame *frame)
+{
+    BackendFixture *fixture = opaque;
+    if (fixture != NULL && frame != NULL && frame->slot == 7)
+        fixture->presentation_staged++;
+}
+
+static void backend_presentation_note_displayed(
+    void *opaque, const MediaVideoFrame *frame, int present_path)
+{
+    BackendFixture *fixture = opaque;
+    if (fixture != NULL && frame != NULL && frame->slot == 7
+        && present_path == 3) fixture->presentation_displayed++;
+}
+
+static const MediaBackendPresentationOps backend_presentation_ops = {
+    .borrow = backend_presentation_borrow,
+    .release = backend_presentation_release,
+    .note_staged = backend_presentation_note_staged,
+    .note_displayed = backend_presentation_note_displayed
+};
 
 static MediaBackendResult backend_submit(
     void *opaque, const MediaMp4Sample *sample,
@@ -1054,6 +1096,33 @@ int main(void)
               &nal_length_size)
           && coded_width == 480 && coded_height == 272
           && nal_length_size == 4);
+    uint8_t profile_idc = 0;
+    CHECK(media_h264_avcc_decoder_route(
+              avcc, avcc_length, &profile_idc)
+              == MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE
+          && profile_idc == 66u);
+    unsigned char high_avcc[sizeof(avcc)];
+    memcpy(high_avcc, avcc, avcc_length);
+    high_avcc[1] = 100u;
+    high_avcc[9] = 100u;
+    CHECK(media_h264_avcc_decoder_route(
+              high_avcc, avcc_length, &profile_idc)
+              == MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION
+          && profile_idc == 100u);
+    CHECK(media_h264_avcc_decoder_route(
+              high_avcc, 9u, &profile_idc)
+              == MEDIA_H264_DECODER_ROUTE_UNSUPPORTED);
+    CHECK(media_h264_codec_string_decoder_route(
+              "video/mp4; codecs=\"avc1.64000d\"", &profile_idc)
+              == MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION
+          && profile_idc == 100u);
+    CHECK(media_h264_codec_string_decoder_route(
+              "video/mp4; codecs=\"avc1.4d401e\"", &profile_idc)
+              == MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE
+          && profile_idc == 77u);
+    CHECK(media_h264_codec_string_decoder_route(
+              "video/mp4; codecs=\"vp09.00.10.08\"", &profile_idc)
+              == MEDIA_H264_DECODER_ROUTE_UNSUPPORTED);
     unsigned char mismatched_avcc[sizeof(avcc)];
     memcpy(mismatched_avcc, avcc, avcc_length);
     mismatched_avcc[1] = 77u;
@@ -1087,6 +1156,22 @@ int main(void)
     CHECK(!media_h264_avcc_sample_is_admitted(
         admitted_access_unit, oversized_length + 4u,
         4, 480, 272, avcc, avcc_length));
+    unsigned char annexb_access_unit[96] = {0, 0, 0, 1};
+    memcpy(annexb_access_unit + 4u, admitted_sps, admitted_length);
+    CHECK(media_h264_annexb_sample_is_admitted(
+              annexb_access_unit, admitted_length + 4u, 480, 272)
+          && !media_h264_annexb_sample_is_admitted(
+              annexb_access_unit, admitted_length + 4u, 432, 240));
+    memcpy(annexb_access_unit + 4u, oversized_sps, oversized_length);
+    CHECK(!media_h264_annexb_sample_is_admitted(
+              annexb_access_unit, oversized_length + 4u, 480, 272)
+          && !media_h264_annexb_sample_is_admitted(
+              annexb_access_unit + 4u, oversized_length, 480, 272));
+    static const unsigned char annexb_slice[] = {
+        0, 0, 1, 0x65, 0x88, 0x84
+    };
+    CHECK(media_h264_annexb_sample_is_admitted(
+              annexb_slice, sizeof(annexb_slice), 432, 240));
     unsigned char changed_sps[sizeof(admitted_sps)];
     memcpy(changed_sps, admitted_sps, admitted_length);
     changed_sps[2] ^= 0x40u;
@@ -1931,6 +2016,7 @@ int main(void)
     BackendFixture backend_fixture = {.queue_once = true};
     MediaBackend backend = {
         .opaque = &backend_fixture,
+        .presentation = &backend_presentation_ops,
         .submit = backend_submit,
         .drain = backend_drain,
         .advance = backend_advance,
@@ -1957,6 +2043,19 @@ int main(void)
                == MEDIA_PLAYBACK_ADVANCE_PENDING
           && backend_fixture.submitted == 1
           && backend_fixture.advanced == 1);
+    MediaVideoFrame presentation_frame = {
+        .slot = 7,
+        .generation = 9
+    };
+    CHECK(media_playback_borrow_video_slot(playback, 7u, 9u));
+    media_playback_note_frame_staged(playback, &presentation_frame);
+    media_playback_note_frame_displayed(
+        playback, &presentation_frame, 3);
+    media_playback_release_video_read(playback, 7u);
+    CHECK(backend_fixture.presentation_borrows == 1
+          && backend_fixture.presentation_releases == 1
+          && backend_fixture.presentation_staged == 1
+          && backend_fixture.presentation_displayed == 1);
     backend_fixture.discarded_before = 2;
     CHECK(media_playback_discard_video_before(
               playback, UINT64_C(1500000)) == 2
@@ -2075,12 +2174,16 @@ int main(void)
     MediaRangeReader split_video_source = {
         .opaque = &split_video_reader,
         .length = fixture.length,
-        .read = fixture_read
+        .read = fixture_read,
+        .poll = fixture_poll,
+        .resident = fixture_resident
     };
     MediaRangeReader split_audio_source = {
         .opaque = &split_audio_reader,
         .length = fixture.length,
-        .read = fixture_read
+        .read = fixture_read,
+        .poll = fixture_poll,
+        .resident = fixture_resident
     };
     MediaMp4Demux *split_video = media_mp4_open(
         &budget, &split_video_source, NULL, error, sizeof(error));
@@ -3149,6 +3252,29 @@ int main(void)
                  playback, UINT64_C(1500000), &split_seek_actual,
                  error, sizeof(error))
           && split_seek_actual == 0);
+    uint64_t primed_video_us = UINT64_MAX;
+    uint64_t primed_audio_us = UINT64_MAX;
+    split_video_reader.block_polls = 1;
+    split_audio_reader.block_polls = 1;
+    CHECK(media_playback_prime_video_source(
+              playback, UINT64_C(1500000), &primed_video_us,
+              error, sizeof(error)) == MEDIA_PLAYBACK_SOURCE_PRIME_PENDING);
+    /* This compact synthetic second source ends before the target; known EOF
+       is ready because it cannot produce a later transport stall. */
+    CHECK(media_playback_prime_audio_source(
+              playback, UINT64_C(1500000), &primed_audio_us,
+              error, sizeof(error)) == MEDIA_PLAYBACK_SOURCE_PRIME_READY);
+    split_audio_reader.block_polls = 0;
+    CHECK(media_playback_prime_video_source(
+              playback, UINT64_C(1500000), &primed_video_us,
+              error, sizeof(error)) == MEDIA_PLAYBACK_SOURCE_PRIME_READY
+          && media_playback_prime_audio_source(
+              playback, UINT64_C(1500000), &primed_audio_us,
+              error, sizeof(error)) == MEDIA_PLAYBACK_SOURCE_PRIME_READY
+          && primed_video_us <= UINT64_C(1500000)
+          && primed_audio_us >= UINT64_C(1500000));
+    /* Priming is a readiness proof, not consumption: the decode sequence
+       below remains byte-for-byte the same as a plain committed seek. */
     CHECK(media_playback_advance_bounded(
               playback, UINT64_C(2000000), 1,
               error, sizeof(error))
@@ -3212,6 +3338,22 @@ int main(void)
               == MEDIA_PLAYBACK_ADVANCE_PENDING
           && backend_fixture.submitted == 2);
     media_playback_destroy(playback);
+
+    puts("test: a sole AAC source primes and seeks as source zero");
+    media_mp4_rewind(split_audio);
+    backend_fixture = (BackendFixture) {0};
+    playback = media_playback_create(
+        &budget, split_audio, &backend, &playback_options,
+        error, sizeof(error));
+    CHECK(playback != NULL
+          && media_playback_seek(
+              playback, UINT64_C(1500000), NULL, error, sizeof(error))
+          && media_playback_prime_audio_source(
+              playback, UINT64_C(1500000), &primed_audio_us,
+              error, sizeof(error)) == MEDIA_PLAYBACK_SOURCE_PRIME_READY
+          && primed_audio_us >= UINT64_C(1500000));
+    media_playback_destroy(playback);
+
     media_mp4_close(split_audio);
     media_mp4_close(split_video);
 
@@ -3388,6 +3530,12 @@ int main(void)
              well inside the seek budget's scale. */
           && PSP_MEDIA_DECODE_NO_PROGRESS_REFILL_MS * 1000u
               >= PSP_MEDIA_SEEK_TIMEOUT_US);
+
+    puts("test: intentional media holds do not trip the decoder watchdog");
+    CHECK(psp_media_decode_no_progress_watchdog_active(false, false)
+          && !psp_media_decode_no_progress_watchdog_active(true, false)
+          && !psp_media_decode_no_progress_watchdog_active(false, true)
+          && !psp_media_decode_no_progress_watchdog_active(true, true));
 
     puts("test: what an advance may afford depends on where it runs");
     /*

@@ -368,6 +368,12 @@ typedef struct {
     lxb_dom_node_t *assigned_flex_node;
     int assigned_flex_height;
     bool assigned_flex_minimum;
+    /* Per-command blur is separately bounded by radius and raster area.
+       This counter bounds their aggregate per-frame work; overflow disables
+       the cosmetic effect for the whole layout so fixed chrome can return to
+       the retained cache instead of repeatedly traversing and blurring it. */
+    uint8_t backdrop_filter_count;
+    bool backdrop_filter_disabled;
     bool cancelled;
     LayoutReuseCache *reuse;
 } LayoutContext;
@@ -808,6 +814,7 @@ int intrinsic_positioned_width(LayoutContext *context, lxb_dom_node_t *node,
                                const ComputedStyle *parent, int limit);
 int layout_fixed_scale_floor(int value, int numerator, int denominator);
 int measured_text_width_fixed(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing);
+int measured_text_width_fixed_mode(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing, bool kerning);
 int measured_text_width(const FontFace *face, FontFamily metric_family, const char *text, size_t length, int font_size_fixed, bool synthetic_bold, bool metric_bold, int scale, int letter_spacing);
 bool layout_add_replaced_alt_text(
     LayoutContext *context, lxb_dom_node_t *node,
@@ -830,7 +837,8 @@ bool table_cell_placement(const TableTracks *tracks, lxb_dom_node_t *cell,
 size_t utf8_character_length(const char *text, size_t available);
 size_t utf8_codepoints(const char *text, size_t length);
 size_t utf8_line_segment_length(const char *text, size_t available,
-                                bool keep_cjk_together, bool *discard);
+                                bool keep_cjk_together, bool hyphens_none,
+                                bool *discard);
 uint16_t alpha_opacity_scale(uint8_t alpha);
 uint32_t blend_color_over(uint32_t foreground, uint8_t alpha, uint32_t background);
 uint8_t draw_font_weight(const ComputedStyle *style);

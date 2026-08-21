@@ -42,6 +42,8 @@ set(TILEFINCH_NOTICES_MANIFEST
     NOTICES/nghttp2/COPYING
     NOTICES/mbedtls/LICENSE
     NOTICES/zlib/README
+    # Narrow LGPL FFmpeg build used by the replaceable swdec component.
+    NOTICES/ffmpeg/COPYING.LGPLv2.1
     # Danzeff keyboard layout/control convention.
     NOTICES/danzeff/LICENSE
     # PSPDEV component notices.

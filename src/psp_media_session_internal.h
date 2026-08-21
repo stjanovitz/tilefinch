@@ -31,6 +31,8 @@ void psp_media_session_checkpoint(
     PspMediaSession *media, const char *checkpoint);
 void psp_media_finish_synchronous_quiesce(
     PspMediaSession *media, const char *checkpoint);
+void psp_media_set_transport_priority(
+    PspMediaSession *media, bool active);
 void psp_media_release_presentation_preroll(
     PspMediaSession *media, bool clear_floor);
 bool psp_media_begin_startup_preroll(PspMediaSession *media);

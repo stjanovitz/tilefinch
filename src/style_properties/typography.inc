@@ -460,7 +460,8 @@ static bool style_property_webkit_line_clamp(const StylePropertyParse *parse)
         }
         clamp = parsed > 31 ? 31u : (unsigned) parsed;
     }
-    parse->style->line_clamp = (uint8_t) clamp;
+    parse->style->line_clamp = (uint8_t) (
+        (parse->style->line_clamp & STYLE_TAB_SIZE_MASK) | clamp);
     parse->style->overflow_wrap = (OverflowWrap) (
         parse->style->overflow_wrap | STYLE_LINE_CLAMP_SPECIFIED);
     /* Clamp and ellipsis are applied by the same inline-overflow stage. */
@@ -479,13 +480,20 @@ static bool style_property_word_break(const StylePropertyParse *parse)
     if (style_resolve_value(sheet, value, value_length, resolved,
                             sizeof(resolved), 0)) {
         if (strstr(resolved, "break-all") != NULL) {
-            style->word_break_mode = WORD_BREAK_ALL;
+            style->word_break_mode = (uint8_t) (
+                (style->word_break_mode & ~STYLE_WORD_BREAK_MASK)
+                | WORD_BREAK_ALL);
         } else if (strstr(resolved, "keep-all") != NULL) {
-            style->word_break_mode = WORD_BREAK_KEEP_ALL;
+            style->word_break_mode = (uint8_t) (
+                (style->word_break_mode & ~STYLE_WORD_BREAK_MASK)
+                | WORD_BREAK_KEEP_ALL);
         } else if (strstr(resolved, "break-word") != NULL) {
-            style->word_break_mode = WORD_BREAK_LEGACY;
+            style->word_break_mode = (uint8_t) (
+                (style->word_break_mode & ~STYLE_WORD_BREAK_MASK)
+                | WORD_BREAK_LEGACY);
         } else {
-            style->word_break_mode = WORD_BREAK_NORMAL;
+            style->word_break_mode = (uint8_t) (
+                style->word_break_mode & ~STYLE_WORD_BREAK_MASK);
         }
         *mask |= S_WORD_BREAK;
     }

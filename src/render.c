@@ -604,6 +604,23 @@ static bool layout_has_fixed_backdrop(const LayoutDocument *layout,
                                       int viewport_width,
                                       int viewport_height);
 
+static bool layout_has_css_backdrop_filter(const LayoutDocument *layout)
+{
+    if (layout == NULL) return false;
+    for (size_t range_index = 0; range_index < layout->fixed_count;
+         range_index++) {
+        const FixedRange *range = &layout->fixed_ranges[range_index];
+        size_t end = range->command_end < layout->count
+            ? range->command_end : layout->count;
+        for (size_t i = range->command_start; i < end; i++) {
+            if (draw_command_backdrop_blur(&layout->commands[i]) != 0u) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool build_fixed_cache(TileCache *cache, int viewport_width,
                               int viewport_height)
 {
@@ -611,6 +628,10 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
     if (getenv("TILEFINCH_DISABLE_FIXED_CACHE") != NULL) return false;
 #endif
     if (cache->layout->fixed_count == 0) return true;
+    /* A backdrop filter samples the already-composited page.  The ordinary
+       fixed cache is deliberately page-independent, so route only these rare
+       bounded commands through the direct framebuffer path. */
+    if (layout_has_css_backdrop_filter(cache->layout)) return false;
     if (cache->layout->command_flags != NULL) {
         (void) overflow_cache_prepare(cache);
     }

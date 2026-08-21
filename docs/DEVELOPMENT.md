@@ -130,6 +130,44 @@ PSP-only builds consume.
 The PSP cross-build consumes those checked-in artifacts and does not run a
 host QuickJS generator through the PSP toolchain.
 
+### Optional PSP software decoder
+
+H.264 High-profile playback is a replaceable, user-built PRX so the official
+EBOOT and release archives remain independent of FFmpeg decoder binaries.
+Prepare the narrow LGPL n8.1.2 build once, then point an opt-in PSP configure
+at that ignored workspace:
+
+```sh
+PSPDEV=/path/to/pspdev \
+  ./scripts/prepare-swdec-ffmpeg.sh build-swdec
+PSPDEV=/path/to/pspdev cmake --preset psp \
+  -DTILEFINCH_PSP_ENABLE_SWDEC_COMPONENT=ON \
+  -DTILEFINCH_SWDEC_SOURCE_DIR="$PWD/build-swdec"
+cmake --build build-preset-psp --target tilefinch-swdec-bundle
+```
+
+The preparation script checks out the exact upstream tag, applies the
+committed patch, enables only H.264, `aac_fixed`, and the H.264 parser, and
+can optionally consume device-trained profiles by passing their directory as
+the second argument. Without them the component is compatible but may be
+materially slower near the PSP's real-time limit.
+
+The target writes a three-file add-on directory at
+`build-preset-psp/tilefinch-swdec-addon/`: `tilefinch-swdec.prx`, the resident
+`swdec-meload.prx` helper, and `component-info.txt`. Copy all three into
+`PSP/GAME/TILEFINCH/components/swdec/`; do not put them in `slot-a` or
+`slot-b`. The ordinary browser EBOOT always contains the bounded loader, so
+it does not need to be replaced with a custom EBOOT. Signed app updates leave
+the shared component directory untouched.
+
+`component-info.txt` records the loader ABI. Every browser update manifest
+also carries the ABI it expects. The update UI warns **Decoder rebuild
+needed** when an installed add-on differs; rebuild the bundle with the new
+source and replace all three files together. No rebuild is needed merely
+because the Tilefinch version changes.
+The player reserves the component's resident memory before loading it and
+keeps all stream buffering in RAM.
+
 The live-network PSP build also consumes project-owned, hash-pinned curl,
 Mbed TLS, and optional nghttp2 archives. Populate the ignored offline cache
 once before configuring a fresh PSP tree:
@@ -225,6 +263,23 @@ It is neither registered with CTest nor included in a default build target:
 cmake --build build-preset-release \
   --target tilefinch-occasional-media-timing
 ```
+
+Media delivery also has an explicit real-time resilience gate. It generates a
+temporary, video-only fragmented MP4 and serves it through deterministic local
+fault profiles; no third-party media or network service is required. The
+profiles cover healthy burst delivery, per-request setup delay, truncated
+responses, slow trickles, asymmetric audio/video supply, a persistent
+30-second path outage followed by recovery, buffering hysteresis, and the
+PSP's publication quantum:
+
+```sh
+./scripts/run-media-resilience-gate.sh build-preset-release
+```
+
+This is intentionally outside CTest because it preserves wall-clock delivery
+cadence and the longest profile takes tens of seconds. It complements rather
+than replaces a hardware playback soak: host curl cannot reproduce PSP WLAN,
+firmware decoder, DMA, or thread-priority timing.
 
 ## Source and target boundaries
 

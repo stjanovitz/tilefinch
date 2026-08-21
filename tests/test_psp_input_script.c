@@ -299,8 +299,23 @@ static void apply_surface_transition(
                 psp_ui_show_home(ui);
             break;
         case PSP_UI_ACTION_SHOW_SCREENSHOTS:
-            *document_tabs |= (uint8_t) (1u << tabs->active_index);
-            psp_ui_leave_native_surface(ui);
+            if (ui->screen == PSP_UI_SCREEN_COLLECTIONS) {
+                static const PspUiCollectionsView screenshot_view = {
+                    .section = PSP_UI_COLLECTION_SCREENSHOTS,
+                    .count = 1,
+                    .empty_message = "empty"
+                };
+                psp_ui_set_collections(ui, &screenshot_view);
+            } else {
+                *document_tabs |= (uint8_t) (1u << tabs->active_index);
+                psp_ui_leave_native_surface(ui);
+            }
+            break;
+        case PSP_UI_ACTION_COLLECTION_ACTIVATE:
+            if (ui->collections_section == PSP_UI_COLLECTION_SCREENSHOTS) {
+                *document_tabs |= (uint8_t) (1u << tabs->active_index);
+                psp_ui_leave_native_surface(ui);
+            }
             break;
         case PSP_UI_ACTION_SHOW_BOOKMARKS:
             psp_ui_show_collections(ui, PSP_UI_COLLECTION_BOOKMARKS);
@@ -310,6 +325,9 @@ static void apply_surface_transition(
             break;
         case PSP_UI_ACTION_SHOW_OFFLINE:
             psp_ui_show_collections(ui, PSP_UI_COLLECTION_OFFLINE);
+            break;
+        case PSP_UI_ACTION_SHOW_DOWNLOADS:
+            psp_ui_show_collections(ui, PSP_UI_COLLECTION_DOWNLOADS);
             break;
         default:
             break;

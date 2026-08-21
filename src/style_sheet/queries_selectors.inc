@@ -993,7 +993,9 @@ static bool supports_implemented_property(Stylesheet *sheet,
         "user-select", "-webkit-user-select", "touch-action",
         "text-size-adjust", "-webkit-text-size-adjust", "resize",
         "text-wrap", "text-wrap-style", "translate", "rotate", "scale",
-        "isolation", "border-start-start-radius",
+        "isolation", "hyphens", "tab-size", "font-kerning",
+        "text-rendering", "mix-blend-mode", "backdrop-filter",
+        "-webkit-backdrop-filter", "border-start-start-radius",
         "border-start-end-radius", "border-end-start-radius",
         "border-end-end-radius"
     };
@@ -1121,6 +1123,21 @@ static bool supports_retained_layout_value(
             || span_case_equal(value, value_length, "auto")
             || span_case_equal(value, value_length, "balance")
             || span_case_equal(value, value_length, "pretty");
+    }
+    if (span_case_equal(name, name_length, "contain-intrinsic-size")) {
+        size_t cursor = 0, start = 0, end = 0, lengths = 0;
+        while (style_next_top_level(
+                   value, value_length, ' ', &cursor, &start, &end)) {
+            if (span_case_equal(value + start, end - start, "auto")) {
+                continue;
+            }
+            if (++lengths > 2
+                || !retained_presentation_length(
+                    sheet, value + start, end - start, false)) {
+                return false;
+            }
+        }
+        return lengths == 1 || lengths == 2;
     }
     if (span_case_equal(name, name_length, "isolation")) {
         return span_case_equal(value, value_length, "auto")

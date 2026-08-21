@@ -8,6 +8,7 @@
 
 #include "tilefinch/build_version.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/swdec_component_store.h"
 
 #define PSP_UPDATE_INSTALL_PUMP_BUDGET_US UINT64_C(2000)
 #define PSP_UPDATE_INSTALL_MAXIMUM_UNITS 4u
@@ -48,6 +49,20 @@ static bool psp_update_hash_is_nonzero(const uint8_t digest[32])
     return aggregate != 0;
 }
 
+static bool psp_update_release_tag_is_valid(const char *tag)
+{
+    if (tag == NULL || tag[0] != 'v') return false;
+    size_t length = strlen(tag);
+    if (length < 2u || length >= sizeof(((PspUpdateSession *) 0)->release_tag))
+        return false;
+    for (size_t index = 1; index < length; index++) {
+        unsigned character = (unsigned char) tag[index];
+        if (!((character >= '0' && character <= '9') || character == '.'))
+            return false;
+    }
+    return true;
+}
+
 bool psp_update_session_metadata_url(
     const PspUpdateSessionOptions *options, char *output, size_t capacity)
 {
@@ -61,6 +76,16 @@ bool psp_update_session_metadata_url(
         && options->signed_metadata_url_override[0] != '\0') {
         return tilefinch_update_prepare_download_url(
             options->signed_metadata_url_override, output, capacity);
+    } else if (channel == BROWSER_UPDATE_CHANNEL_STABLE
+               && options != NULL && options->release_tag != NULL) {
+        if (!psp_update_release_tag_is_valid(options->release_tag))
+            return false;
+        written = snprintf(
+            output, capacity,
+            "https://github.com/%s/%s/releases/download/%s/"
+            "tilefinch-update-v1.tfum",
+            TILEFINCH_UPDATE_REPOSITORY_OWNER,
+            TILEFINCH_UPDATE_REPOSITORY_NAME, options->release_tag);
     } else if (channel == BROWSER_UPDATE_CHANNEL_DEVELOPER) {
         const char *url = options == NULL
             ? NULL : options->developer_metadata_url;
@@ -84,6 +109,18 @@ bool psp_update_session_metadata_url(
         return false;
     }
     return written > 0 && (size_t) written < capacity;
+}
+
+bool psp_update_session_selected_metadata_url(
+    const PspUpdateSession *session, char *output, size_t capacity)
+{
+    if (session == NULL) return false;
+    return psp_update_session_metadata_url(
+        &(PspUpdateSessionOptions) {
+            .channel = session->channel,
+            .release_tag = session->release_tag[0] == '\0'
+                ? NULL : session->release_tag
+        }, output, capacity);
 }
 
 void psp_update_session_refresh_ui(
@@ -136,7 +173,10 @@ void psp_update_session_refresh_ui(
     char status[64];
     snprintf(status, sizeof(status), "%s", snapshot->message);
     if (snapshot->phase == TILEFINCH_UPDATE_CLIENT_IDLE) {
-        if (update->channel == BROWSER_UPDATE_CHANNEL_DEVELOPER) {
+        if (update->allow_downgrade && update->release_tag[0] != '\0') {
+            snprintf(status, sizeof(status), "OLDER %s - SIGNED",
+                     update->release_tag + 1u);
+        } else if (update->channel == BROWSER_UPDATE_CHANNEL_DEVELOPER) {
             snprintf(status, sizeof(status),
                      "DEVELOPER URL - UNSIGNED TRIAL");
         } else {
@@ -187,11 +227,18 @@ void psp_update_session_refresh_ui(
                 snapshot->phase != TILEFINCH_UPDATE_CLIENT_CANCELLING;
             break;
     }
-    psp_ui_set_update(
-        ui, TILEFINCH_VERSION_STRING, status,
+    const char *notes =
         snapshot->phase == TILEFINCH_UPDATE_CLIENT_AVAILABLE
             || snapshot->phase == TILEFINCH_UPDATE_CLIENT_DOWNLOADED
-            ? snapshot->manifest.notes : "",
+        ? snapshot->manifest.notes : "";
+    if (update->installed_decoder_abi_valid
+        && snapshot->manifest.optional_decoder_abi_valid
+        && update->installed_decoder_abi
+               != snapshot->manifest.optional_decoder_abi)
+        notes = "Decoder rebuild needed";
+    psp_ui_set_update(
+        ui, TILEFINCH_VERSION_STRING, status,
+        notes,
         progress,
         label, enabled, cancellable);
 }
@@ -204,10 +251,29 @@ bool psp_update_session_initialize(
     if (update == NULL || budget == NULL || paths == NULL || ui == NULL)
         return false;
     if (update->initialized) return update->available;
+    update->installed_decoder_abi_valid =
+        tilefinch_swdec_component_info_read(
+            paths, &update->installed_decoder_abi)
+        == TILEFINCH_SWDEC_COMPONENT_INFO_VALID;
     update->initialized = true;
     update->budget = budget;
     update->channel = session_options == NULL
         ? BROWSER_UPDATE_CHANNEL_STABLE : session_options->channel;
+    if (session_options != NULL && session_options->release_tag != NULL) {
+        if (update->channel != BROWSER_UPDATE_CHANNEL_STABLE
+            || !session_options->allow_downgrade
+            || !psp_update_release_tag_is_valid(
+                   session_options->release_tag)) {
+            snprintf(update->unavailable_message,
+                     sizeof(update->unavailable_message),
+                     "OLDER VERSION SELECTION IS INVALID");
+            psp_update_session_refresh_ui(update, ui);
+            return false;
+        }
+        snprintf(update->release_tag, sizeof(update->release_tag), "%s",
+                 session_options->release_tag);
+        update->allow_downgrade = true;
+    }
     if (!paths->slotted) {
         psp_update_session_refresh_ui(update, ui);
         return false;
@@ -308,9 +374,12 @@ bool psp_update_session_initialize(
         .launcher_protocol = TILEFINCH_UPDATE_LAUNCHER_PROTOCOL,
         .repository_owner = TILEFINCH_UPDATE_REPOSITORY_OWNER,
         .repository_name = TILEFINCH_UPDATE_REPOSITORY_NAME,
+        .release_tag = update->release_tag[0] == '\0'
+            ? NULL : update->release_tag,
         .metadata_url_override = metadata_url,
         .package_url_override = package_url,
         .package_relative_to_metadata = package_relative,
+        .allow_downgrade = update->allow_downgrade,
         .trust = developer_unsigned
             ? TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED
             : TILEFINCH_UPDATE_TRUST_SIGNED,
@@ -325,6 +394,7 @@ bool psp_update_session_initialize(
 void psp_update_session_destroy(PspUpdateSession *update)
 {
     if (update == NULL) return;
+    tilefinch_update_history_destroy(update->history);
     tilefinch_update_install_destroy(update->installer);
     tilefinch_update_client_destroy(update->client);
     memset(update, 0, sizeof(*update));
@@ -334,6 +404,19 @@ void psp_update_session_pump(
     PspUpdateSession *update, PspUiState *ui)
 {
     if (update == NULL || !update->available) return;
+    if (update->history != NULL) {
+        (void) tilefinch_update_history_pump(update->history, 2000u);
+        TilefinchUpdateHistorySnapshot history_snapshot;
+        if (tilefinch_update_history_snapshot(
+                update->history, &history_snapshot)) {
+            psp_ui_set_update_history(ui, &history_snapshot);
+            if (history_snapshot.phase != TILEFINCH_UPDATE_HISTORY_LOADING) {
+                tilefinch_update_history_destroy(update->history);
+                update->history = NULL;
+            }
+        }
+        return;
+    }
     if (update->installer != NULL) {
         uint64_t batch_started_us =
             tilefinch_platform_monotonic_time_us();
@@ -406,7 +489,8 @@ static bool psp_update_session_begin_install(
         .current_state = update->state,
         .trust = update->channel == BROWSER_UPDATE_CHANNEL_DEVELOPER
             ? TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED
-            : TILEFINCH_UPDATE_TRUST_SIGNED
+            : TILEFINCH_UPDATE_TRUST_SIGNED,
+        .allow_downgrade = update->allow_downgrade
     };
     update->install_maximum_unit_us = 0;
     update->install_units = 0;
@@ -427,7 +511,7 @@ bool psp_update_session_cancel(PspUpdateSession *session)
 bool psp_update_session_active(const PspUpdateSession *session)
 {
     if (session == NULL || !session->available) return false;
-    return session->installer != NULL
+    return session->history != NULL || session->installer != NULL
         || session->client_snapshot.phase
                == TILEFINCH_UPDATE_CLIENT_CHECKING
         || session->client_snapshot.phase
@@ -494,4 +578,43 @@ bool psp_update_session_begin_check(
     return session != NULL && session->client != NULL
         && tilefinch_update_client_begin_check(
             session->client, wall_time_seconds, wall_time_valid);
+}
+
+bool psp_update_session_begin_history(
+    PspUpdateSession *session, PspUiState *ui)
+{
+    if (session == NULL || ui == NULL || !session->available
+        || session->channel != BROWSER_UPDATE_CHANNEL_STABLE
+        || psp_update_session_active(session)) return false;
+    session->history = tilefinch_update_history_create(
+        session->budget, TILEFINCH_UPDATE_REPOSITORY_OWNER,
+        TILEFINCH_UPDATE_REPOSITORY_NAME, TILEFINCH_VERSION_STRING);
+    if (session->history == NULL) {
+        TilefinchUpdateHistorySnapshot failed = {
+            .phase = TILEFINCH_UPDATE_HISTORY_ERROR
+        };
+        psp_ui_set_update_history(ui, &failed);
+        return false;
+    }
+    bool started = tilefinch_update_history_begin(session->history);
+    TilefinchUpdateHistorySnapshot snapshot;
+    if (tilefinch_update_history_snapshot(session->history, &snapshot))
+        psp_ui_set_update_history(ui, &snapshot);
+    if (!started) {
+        tilefinch_update_history_destroy(session->history);
+        session->history = NULL;
+    }
+    return started;
+}
+
+void psp_update_session_cancel_history(
+    PspUpdateSession *session, PspUiState *ui)
+{
+    if (session == NULL) return;
+    if (session->history != NULL) {
+        (void) tilefinch_update_history_cancel(session->history);
+        tilefinch_update_history_destroy(session->history);
+        session->history = NULL;
+    }
+    if (ui != NULL) psp_update_session_refresh_ui(session, ui);
 }

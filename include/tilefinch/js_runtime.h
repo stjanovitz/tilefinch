@@ -328,7 +328,10 @@ typedef struct {
 
 typedef struct ScriptRuntime ScriptRuntime;
 
-#define SCRIPT_MEDIA_SOURCE_CAPACITY 4096
+/* The navigation/fetch layers serialize URLs into 2 KiB buffers. Keeping the
+   media bridge at the same bound avoids carrying an extra 2 KiB in every
+   ScriptMediaRequest stack object for a URL no downstream player can use. */
+#define SCRIPT_MEDIA_SOURCE_CAPACITY 2048
 
 typedef enum {
     SCRIPT_MEDIA_COMMAND_LOAD = 0,
@@ -341,6 +344,8 @@ typedef struct {
     ScriptMediaCommand command;
     int64_t node_handle;
     double value;
+    TilefinchRequestMode mode;
+    TilefinchCredentialsMode credentials;
     char source[SCRIPT_MEDIA_SOURCE_CAPACITY];
 } ScriptMediaRequest;
 
@@ -712,6 +717,9 @@ size_t script_runtime_collect_and_trim(ScriptRuntime *runtime);
 /* Remaining active QuickJS heap allowance. Unlike the browser Budget this
    excludes allocator cache capacity and reflects JS_SetMemoryLimit(). */
 size_t script_runtime_heap_remaining(const ScriptRuntime *runtime);
+/* Result of the most recently completed top-level evaluation slice. This is
+   an O(1), allocation-free telemetry read used by admission tuning. */
+bool script_runtime_last_slice_interrupted(const ScriptRuntime *runtime);
 /* Inline bootstraps can expand DOM-embedded state independently of source
    length. This returns the bounded reserve selected from the configured heap
    ceiling; it never changes that ceiling. */
@@ -778,10 +786,16 @@ typedef enum {
     SCRIPT_INLINE_DATA_APPLIED,
     SCRIPT_INLINE_DATA_FAILED
 } ScriptInlineDataEvaluation;
+/* Allocation-free shape check for the inline-data evaluator below. It is
+   intentionally only a candidate test: callers must still handle FALLBACK
+   because the strict JSON parser remains authoritative. */
+bool script_runtime_inline_data_candidate(
+    lxb_dom_node_t *script_node, size_t *source_bytes);
 /* Applies a deliberately narrow classic-script subset without invoking the
-   JavaScript compiler: up to eight window/globalThis property assignments
-   whose values are strict JSON objects or arrays. Ambiguous syntax returns
-   FALLBACK without author-visible effects; APPLIED and FAILED are terminal. */
+   JavaScript compiler: up to eight window/globalThis, `var`, or bare global
+   property assignments whose values are strict JSON objects or arrays.
+   Ambiguous syntax returns FALLBACK without author-visible effects; APPLIED
+   and FAILED are terminal. */
 ScriptInlineDataEvaluation script_runtime_evaluate_inline_data(
     ScriptRuntime *runtime, lxb_dom_node_t *script_node,
     size_t *source_bytes);

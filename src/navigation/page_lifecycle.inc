@@ -839,6 +839,20 @@ static void capture_cached_script_error(NavigationSession *session,
     session->last_script_error_context[written] = '\0';
 }
 
+static void navigation_record_soft_script_error(
+    NavigationSession *session, const ExternalScriptMetrics *metrics)
+{
+    if (session == NULL || metrics == NULL || metrics->failed == 0
+        || session->page.script_result.error[0] == '\0') return;
+    snprintf(session->last_script_error_context,
+             sizeof(session->last_script_error_context), "%s",
+             session->page.script_result.error_source_context);
+    if (session->last_script_error_context[0] == '\0') {
+        capture_cached_script_error(
+            session, session->page.script_result.error);
+    }
+}
+
 static void entry_destroy(Budget *budget, NavigationEntry *entry)
 {
     budget_free(budget, entry->title);
@@ -879,6 +893,10 @@ static void page_destroy_value(NavigationSession *session,
     fonts_external_loader_cancel(
         &page->external_font_loader, page->resource_scheduler,
         &page->external_fonts);
+    images_priority_load_destroy(page->deferred_image_job);
+    page->deferred_image_job = NULL;
+    budget_free(session->budget, page->deferred_image_targets);
+    page->deferred_image_targets = NULL;
     layout_destroy(&page->layout);
     layout_reuse_cache_destroy(page->layout_reuse);
     page->layout_reuse = NULL;

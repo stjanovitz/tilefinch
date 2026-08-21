@@ -109,8 +109,14 @@ typedef enum {
     BROWSER_GLYPH_LANGUAGE_JAPANESE,
     BROWSER_GLYPH_LANGUAGE_CHINESE_SIMPLIFIED,
     BROWSER_GLYPH_LANGUAGE_CHINESE_TRADITIONAL,
-    BROWSER_GLYPH_LANGUAGE_KOREAN
+    BROWSER_GLYPH_LANGUAGE_KOREAN,
+    BROWSER_GLYPH_LANGUAGE_CYRILLIC,
+    BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED,
+    BROWSER_GLYPH_LANGUAGE_COUNT
 } BrowserGlyphLanguage;
+
+_Static_assert(BROWSER_GLYPH_LANGUAGE_COUNT <= 8,
+               "glyph language selection must fit in three bits");
 
 /* Pointers remain owned by the profile and are valid until it is mutated. */
 typedef struct {
@@ -173,6 +179,11 @@ BrowserYoutubeQuality browser_profile_youtube_quality(
     const BrowserProfile *profile);
 bool browser_profile_youtube_compact_results(
     const BrowserProfile *profile);
+/* YouTube-only transport preference. When enabled, the resolver's adaptive
+   AAC representation is opened without admitting or fetching its video
+   companion. Disabled by default. */
+bool browser_profile_youtube_audio_only(
+    const BrowserProfile *profile);
 BrowserVideoScaling browser_profile_video_scaling(
     const BrowserProfile *profile);
 /* Hold the presentation clock briefly at playback start until the existing
@@ -192,6 +203,9 @@ uint64_t browser_profile_content_blocker_total_blocked(
 BrowserReaderFont browser_profile_reader_font(const BrowserProfile *profile);
 bool browser_profile_remember_reader_site_scale(
     const BrowserProfile *profile);
+/* Opt-in content-shape Reader detection. Disabled by default so ordinary
+   navigations neither scan nor transform the page unless the user asks. */
+bool browser_profile_reader_auto_mode(const BrowserProfile *profile);
 bool browser_profile_update_check_enabled(const BrowserProfile *profile);
 BrowserUpdateChannel browser_profile_update_channel(
     const BrowserProfile *profile);
@@ -260,6 +274,8 @@ void browser_profile_set_youtube_quality(
     BrowserProfile *profile, BrowserYoutubeQuality quality);
 void browser_profile_set_youtube_compact_results(
     BrowserProfile *profile, bool compact);
+void browser_profile_set_youtube_audio_only(
+    BrowserProfile *profile, bool enabled);
 void browser_profile_set_video_startup_buffering(
     BrowserProfile *profile, bool enabled);
 void browser_profile_set_resume_offline_downloads(
@@ -275,6 +291,8 @@ void browser_profile_record_content_blocked(
 void browser_profile_set_reader_font(
     BrowserProfile *profile, BrowserReaderFont font);
 void browser_profile_set_remember_reader_site_scale(
+    BrowserProfile *profile, bool enabled);
+void browser_profile_set_reader_auto_mode(
     BrowserProfile *profile, bool enabled);
 void browser_profile_set_wave_background(
     BrowserProfile *profile, bool enabled);

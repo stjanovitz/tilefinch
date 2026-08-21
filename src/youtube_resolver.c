@@ -10,6 +10,7 @@
 #include <strings.h>
 
 #include "tilefinch/fetch.h"
+#include "tilefinch/media_mp4.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/request_context.h"
 #include "tilefinch/url.h"
@@ -85,10 +86,12 @@ typedef struct {
 /*
  * Ordered data, deliberately separate from the request machinery. The iOS
  * profile remains a cheap first attempt for clips whose complete selected
- * resources fit inside its current unattested delivery allowance. Larger
- * iOS and Android VR resources are admitted only after the bounded watch-page
- * fallback supplies the current visitor/key/STS context. Profile changes ship
- * as part of a signed Tilefinch release; mutable page data cannot rewrite
+ * resources fit inside its current unattested delivery allowance. VisionOS
+ * is the final direct and enriched profile because its ordinary media URLs
+ * remain usable across the whole resource. Android VR is deliberately absent:
+ * its URLs can serve a small prefix and then refuse every later range, which
+ * no bounded retry strategy can turn into a complete stream. Profile changes
+ * ship as part of a signed Tilefinch release; mutable page data cannot rewrite
  * native request identities.
  */
 static const YoutubeClientProfile youtube_client_profiles[] = {
@@ -109,14 +112,15 @@ static const YoutubeClientProfile youtube_client_profiles[] = {
         false
     },
     {
-        "ANDROID_VR", "1.65.10", "28",
-        "com.google.android.apps.youtube.vr.oculus/1.65.10 "
-        "(Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-        "\"deviceMake\":\"Oculus\",\"deviceModel\":\"Quest 3\","
-        "\"androidSdkVersion\":32,\"osName\":\"Android\","
-        "\"osVersion\":\"12L\"",
+        "VISIONOS", "1.02", "101",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+        "Version/26.0 Safari/605.1.15",
+        "\"deviceMake\":\"Apple\","
+        "\"deviceModel\":\"RealityDevice17,1\","
+        "\"osName\":\"visionOS\",\"osVersion\":\"26.5.23O471\"",
         "",
-        true
+        false
     }
 };
 _Static_assert(
@@ -505,21 +509,11 @@ static bool youtube_mime_has_exact_codec(
     return false;
 }
 
-static int youtube_ascii_hex(unsigned char value)
-{
-    if (value >= '0' && value <= '9') return (int) (value - '0');
-    value = (unsigned char) tolower(value);
-    if (value >= 'a' && value <= 'f') return (int) (value - 'a') + 10;
-    return -1;
-}
-
 /*
- * The PSP Media Engine path is intentionally narrower than generic AVC:
+ * The firmware path is intentionally narrower than generic AVC:
  * Baseline is admitted only at PSP-screen geometry, Main is admitted through
- * 640x360, and both stop at level 3.0.  YouTube can advertise High-profile or
- * wide Baseline renditions at the same requested height. Selecting one here
- * merely defers a deterministic rejection until after range/demux work and
- * can hide a compatible Main rendition later in the inventory.
+ * 640x360, and both stop at level 3.0. The optional software path adds High
+ * profile only through its device-proven 432x240 ceiling.
  */
 static bool youtube_psp_avc_codec_supported(
     const char *mime, int width, int height)
@@ -533,7 +527,12 @@ static bool youtube_psp_avc_codec_supported(
         unsigned value = 0;
         bool valid = true;
         for (size_t i = 0; i < 6u; i++) {
-            int digit = youtube_ascii_hex((unsigned char) at[5u + i]);
+            int digit = at[5u + i] >= '0' && at[5u + i] <= '9'
+                ? at[5u + i] - '0'
+                : at[5u + i] >= 'A' && at[5u + i] <= 'F'
+                ? at[5u + i] - 'A' + 10
+                : at[5u + i] >= 'a' && at[5u + i] <= 'f'
+                ? at[5u + i] - 'a' + 10 : -1;
             if (digit < 0) {
                 valid = false;
                 break;
@@ -548,10 +547,34 @@ static bool youtube_psp_avc_codec_supported(
         unsigned profile = value >> 16u;
         unsigned level = value & 0xffu;
         bool wide = width > 480 || height > 272;
-        return level != 0 && level <= 30u
-            && (profile == 77u || (profile == 66u && !wide));
+        bool firmware = profile == 77u || (profile == 66u && !wide);
+        bool software = profile == 100u
+            && width <= 432 && height <= 240;
+        return level != 0 && level <= 30u && (firmware || software);
     }
     return false;
+}
+
+static unsigned youtube_video_route_rank(const YoutubeFormat *format)
+{
+    uint8_t profile = 0;
+    MediaH264DecoderRoute route = media_h264_codec_string_decoder_route(
+        format == NULL ? NULL : format->mime, &profile);
+    (void) profile;
+    return route == MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE ? 2u
+        : route == MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION ? 1u : 0u;
+}
+
+static bool youtube_video_format_better(
+    const YoutubeFormat *candidate, const YoutubeFormat *selected)
+{
+    if (selected->url[0] == '\0') return true;
+    if (candidate->height != selected->height)
+        return candidate->height > selected->height;
+    unsigned candidate_rank = youtube_video_route_rank(candidate);
+    unsigned selected_rank = youtube_video_route_rank(selected);
+    if (candidate_rank != selected_rank) return candidate_rank > selected_rank;
+    return candidate->bitrate > selected->bitrate;
 }
 
 static bool youtube_format_supported(const YoutubeFormat *format,
@@ -608,18 +631,12 @@ static bool youtube_parse_formats(
         if (!youtube_parse_format(json, &candidate)) return false;
         if (!adaptive
             && youtube_format_supported(&candidate, maximum_height)
-            && (selected->url[0] == '\0'
-                || candidate.height > selected->height
-                || (candidate.height == selected->height
-                    && candidate.bitrate > selected->bitrate))) {
+            && youtube_video_format_better(&candidate, selected)) {
             *selected = candidate;
         } else if (adaptive
                    && youtube_video_format_supported(
                        &candidate, maximum_height)
-                   && (selected->url[0] == '\0'
-                       || candidate.height > selected->height
-                       || (candidate.height == selected->height
-                           && candidate.bitrate > selected->bitrate))) {
+                   && youtube_video_format_better(&candidate, selected)) {
             *selected = candidate;
         } else if (adaptive && selected_audio != NULL
                    && youtube_audio_format_supported(&candidate)

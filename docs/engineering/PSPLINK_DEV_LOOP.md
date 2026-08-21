@@ -77,7 +77,10 @@ Mac while the program runs:
 | captured frames | `frame-*.ppm`, `frame-mark-*.ppm` |
 | on-demand screenshots | `screenshots/` |
 
-Fonts, roots, and optional components are staged beside the PRX by the build.
+Fonts, roots, and development voice assets are staged beside the PRX by the
+build. The optional software decoder is a separate
+`tilefinch-swdec-addon/` bundle installed under `components/swdec/`, matching
+the release EBOOT's runtime path.
 The PSP still supplies the real network stack and codec firmware, but the run
 performs **zero Memory Stick writes** unless the scenario explicitly invokes
 an offline save, screenshot, download, cache, or update action. Logging also

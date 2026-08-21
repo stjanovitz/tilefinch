@@ -2975,7 +2975,9 @@ static bool sparse_modern_property(const char *name, size_t length)
         "user-select", "-webkit-user-select", "touch-action",
         "text-size-adjust", "-webkit-text-size-adjust", "resize",
         "text-wrap", "text-wrap-style", "translate", "rotate", "scale",
-        "isolation", "border-start-start-radius",
+        "isolation", "hyphens", "tab-size", "font-kerning",
+        "text-rendering", "mix-blend-mode", "backdrop-filter",
+        "-webkit-backdrop-filter", "border-start-start-radius",
         "border-start-end-radius", "border-end-start-radius",
         "border-end-end-radius"
     };
@@ -3005,12 +3007,34 @@ static uint16_t sparse_modern_property_mask(const char *name, size_t length)
     MODERN_PROPERTY("rotate", STYLE_MODERN_ROTATE);
     MODERN_PROPERTY("scale", STYLE_MODERN_SCALE);
     MODERN_PROPERTY("isolation", STYLE_MODERN_ISOLATION);
+    MODERN_PROPERTY("hyphens", STYLE_MODERN_TYPOGRAPHY);
+    MODERN_PROPERTY("tab-size", STYLE_MODERN_TYPOGRAPHY);
+    MODERN_PROPERTY("font-kerning", STYLE_MODERN_TYPOGRAPHY);
+    MODERN_PROPERTY("text-rendering", STYLE_MODERN_TYPOGRAPHY);
+    MODERN_PROPERTY("mix-blend-mode", STYLE_MODERN_MIX_BLEND);
+    MODERN_PROPERTY("backdrop-filter", STYLE_MODERN_BACKDROP_FILTER);
+    MODERN_PROPERTY("-webkit-backdrop-filter", STYLE_MODERN_BACKDROP_FILTER);
     if (length >= 18u
         && strncasecmp(name, "border-", 7u) == 0
         && strncasecmp(name + length - 7u, "-radius", 7u) == 0) {
         return STYLE_MODERN_LOGICAL_RADIUS;
     }
 #undef MODERN_PROPERTY
+    return 0;
+}
+
+static uint8_t sparse_modern_typography_mask(
+    const char *name, size_t length)
+{
+#define TYPOGRAPHY_PROPERTY(wanted, bit) \
+    if (length == sizeof(wanted) - 1u \
+        && strncasecmp(name, wanted, sizeof(wanted) - 1u) == 0) return bit
+    TYPOGRAPHY_PROPERTY("hyphens", STYLE_MODERN_TYPOGRAPHY_HYPHENS);
+    TYPOGRAPHY_PROPERTY("tab-size", STYLE_MODERN_TYPOGRAPHY_TAB_SIZE);
+    TYPOGRAPHY_PROPERTY("font-kerning", STYLE_MODERN_TYPOGRAPHY_KERNING);
+    TYPOGRAPHY_PROPERTY(
+        "text-rendering", STYLE_MODERN_TYPOGRAPHY_TEXT_RENDERING);
+#undef TYPOGRAPHY_PROPERTY
     return 0;
 }
 
@@ -4292,14 +4316,25 @@ JSValue js_computed_style_get(JSContext *context,
     } else if (property_equal(name, name_length, "filter", 6)) {
         static const char *const filter_names[] = {
             "none", "grayscale(1)", "invert(1)", "sepia(1)",
-            "brightness(1.25)", "brightness(0.75)"
+            "brightness(1.25)", "brightness(0.75)",
+            "contrast(1.25)", "saturate(1.25)"
         };
         unsigned filter = computed_style_filter_code(&style);
         if (!style.has_filter
             || filter >= sizeof(filter_names) / sizeof(filter_names[0])) {
             filter = STYLE_FILTER_NONE;
         }
-        snprintf(value, sizeof(value), "%s", filter_names[filter]);
+        const StylePaintStack *paint = stylesheet_paint_stack(
+            bridge->stylesheet, computed_style_paint_stack_id(&style));
+        bool low = paint != NULL
+            && (paint->reserved & STYLE_PAINT_FILTER_LOW_AMOUNT) != 0;
+        if (low && filter == STYLE_FILTER_CONTRAST) {
+            snprintf(value, sizeof(value), "contrast(0.75)");
+        } else if (low && filter == STYLE_FILTER_SATURATE) {
+            snprintf(value, sizeof(value), "saturate(0.75)");
+        } else {
+            snprintf(value, sizeof(value), "%s", filter_names[filter]);
+        }
     } else if (property_equal(name, name_length, "contain", 7)) {
         snprintf(value, sizeof(value), "%s",
                  style.has_layout_containment ? "paint" : "none");
@@ -4313,9 +4348,10 @@ JSValue js_computed_style_get(JSContext *context,
                        ? "auto" : "visible"));
     } else if (property_equal(
                    name, name_length, "-webkit-line-clamp", 18)) {
-        if (style.line_clamp == 0) snprintf(value, sizeof(value), "none");
+        unsigned clamp = computed_style_line_clamp(&style);
+        if (clamp == 0) snprintf(value, sizeof(value), "none");
         else snprintf(value, sizeof(value), "%u",
-                      (unsigned) style.line_clamp);
+                      clamp);
     } else if (property_equal(name, name_length, "will-change", 11)) {
         snprintf(value, sizeof(value), "%s",
                  style.will_change_transform ? "transform" : "auto");
@@ -4428,6 +4464,8 @@ JSValue js_style_set(JSContext *context, JSValueConst this_value,
                before the mutation-triggered relayout resolves the node. */
             ((Stylesheet *) bridge->stylesheet)->modern_property_mask
                 |= modern;
+            ((Stylesheet *) bridge->stylesheet)->modern_typography_mask
+                |= sparse_modern_typography_mask(wanted, wanted_length);
         }
         document_style_attribute_set_cssom_authorized(node, true);
         bridge_mutated(bridge, SCRIPT_MUTATION_INLINE_STYLE, node,

@@ -5,8 +5,11 @@
 #include <string.h>
 
 #include "tilefinch/danzeff_input.h"
+#include "tilefinch/build_version.h"
 #include "tilefinch/glyph_component_store.h"
+#include "tilefinch/update_history.h"
 #include "psp_boot_mark.h"
+#include "psp_ui_menu.h"
 #include "psp_ui_theme.h"
 #include "tilefinch_compiler.h"
 /* The decoder-program picker offers exactly the spellings the boot config
@@ -20,9 +23,9 @@
 #define UI_TOAST_DEFAULT_FRAMES 180u
 #define UI_MEDIA_CONTROLS_MS 3000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 38u
+#define UI_OPTIONS_ITEM_COUNT 40u
 #else
-#define UI_OPTIONS_ITEM_COUNT 36u
+#define UI_OPTIONS_ITEM_COUNT 38u
 #endif
 #define UI_DATA_OPTIONS_ITEM_COUNT 7u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -35,14 +38,6 @@
 #define UI_EXPERIMENTAL_OPTIONS_ITEM_COUNT 6u
 #endif
 #define UI_OPTIONS_VISIBLE_ROWS 7u
-/* Seven rows, not eight: at 15px chrome an eighth row's descenders reach
-   the hint band and the scroll chevron lands on top of it. */
-#define UI_MENU_VISIBLE_ROWS 7u
-/* Rows the menu treats specially: two open their own screen, and the reader
-   row also answers Square with the per-site preference. */
-#define UI_MENU_ROW_TABS 2u
-#define UI_MENU_ROW_READER 6u
-#define UI_MENU_ROW_OPTIONS 11u
 #define UI_ANALOG_DEAD_ZONE 24
 #define UI_ANALOG_MAX_ELAPSED_MS 64u
 #define UI_ANALOG_MAX_HOLD_MS 1500u
@@ -153,6 +148,7 @@ typedef enum {
     UI_OPTION_LANGUAGE_AND_EMOJI,
     UI_OPTION_VIDEO_SCALING,
     UI_OPTION_YOUTUBE_QUALITY,
+    UI_OPTION_YOUTUBE_AUDIO_ONLY,
     UI_OPTION_YOUTUBE_RESULTS,
     UI_OPTION_VIDEO_STARTUP_BUFFERING,
     UI_OPTION_RESUME_DOWNLOADS,
@@ -173,7 +169,8 @@ typedef enum {
 #endif
     UI_OPTION_UPDATE_CHECK,
     UI_OPTION_UPDATE,
-    UI_OPTION_SITE_DATA
+    UI_OPTION_SITE_DATA,
+    UI_OPTION_READER_AUTO_MODE
 } UiOptionId;
 
 static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
@@ -196,6 +193,7 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_LANGUAGE_AND_EMOJI,
     UI_OPTION_VIDEO_SCALING,
     UI_OPTION_YOUTUBE_QUALITY,
+    UI_OPTION_YOUTUBE_AUDIO_ONLY,
     UI_OPTION_YOUTUBE_RESULTS,
     UI_OPTION_VIDEO_STARTUP_BUFFERING,
     UI_OPTION_RESUME_DOWNLOADS,
@@ -216,7 +214,11 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
 #endif
     UI_OPTION_UPDATE_CHECK,
     UI_OPTION_UPDATE,
-    UI_OPTION_SITE_DATA
+    UI_OPTION_SITE_DATA,
+    /* Appended so existing option indices remain stable for input scripts
+       and deterministic previews. Group navigation still presents it under
+       Appearance. */
+    UI_OPTION_READER_AUTO_MODE
 };
 
 static UiOptionId ui_option_id(size_t selection)
@@ -235,9 +237,9 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_PAGE_FONT_PERCENT:
         case UI_OPTION_READER_FONT:
         case UI_OPTION_REMEMBER_READER_SCALE:
+        case UI_OPTION_READER_AUTO_MODE:
         case UI_OPTION_COLOR_MODE:
         case UI_OPTION_CHROME_THEME:
-        case UI_OPTION_VIDEO_SCALING:
         case UI_OPTION_LANGUAGE_AND_EMOJI:
             return "APPEARANCE";
         case UI_OPTION_CUSTOM_HOMEPAGE:
@@ -247,35 +249,41 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_TEXT_ENTRY:
         case UI_OPTION_ANALOG_CURSOR:
         case UI_OPTION_JAVASCRIPT:
-        case UI_OPTION_SITE_JAVASCRIPT:
         case UI_OPTION_SEARCH_ENGINE:
+            return "BROWSING & INPUT";
+        case UI_OPTION_VIDEO_SCALING:
         case UI_OPTION_YOUTUBE_QUALITY:
+        case UI_OPTION_YOUTUBE_AUDIO_ONLY:
         case UI_OPTION_YOUTUBE_RESULTS:
         case UI_OPTION_VIDEO_STARTUP_BUFFERING:
         case UI_OPTION_RESUME_DOWNLOADS:
-            return "BROWSING";
+            return "VIDEO";
         case UI_OPTION_CONTENT_BLOCKER:
         case UI_OPTION_COSMETIC_HIDING:
-        case UI_OPTION_COOKIE_BANNERS:
-        case UI_OPTION_ALLOW_SITE:
         case UI_OPTION_LOAD_ALLOWLIST:
         case UI_OPTION_SITE_DATA_ALLOWED:
         case UI_OPTION_TLS_SESSION_PERSISTENCE:
+            return "PRIVACY & SECURITY";
+        case UI_OPTION_SITE_JAVASCRIPT:
+        case UI_OPTION_COOKIE_BANNERS:
+        case UI_OPTION_ALLOW_SITE:
         case UI_OPTION_MIXED_CONTENT_SITE:
         case UI_OPTION_THIRD_PARTY_COOKIES_SITE:
-            return "PRIVACY";
+            return "SITE";
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
         case UI_OPTION_POWER_TEST:
         case UI_OPTION_MEDIA_TEST:
 #endif
         case UI_OPTION_NETWORK_PROFILE:
-        case UI_OPTION_DIAGNOSTIC_QR:
+        case UI_OPTION_SITE_DATA:
+            return "DEVICE & STORAGE";
         case UI_OPTION_UPDATE_CHECK:
         case UI_OPTION_UPDATE:
-        case UI_OPTION_SITE_DATA:
-            return "SYSTEM";
+            return "UPDATES";
+        case UI_OPTION_DIAGNOSTIC_QR:
+            return "HELP";
         case UI_OPTION_EXPERIMENTAL:
-            return "EXPERIMENTAL";
+            return "ADVANCED & EXPERIMENTAL";
     }
     return "";
 }
@@ -283,23 +291,29 @@ static const char *ui_option_group(UiOptionId option)
 static const char *ui_option_group_at(size_t group)
 {
     static const char *groups[] = {
-        "Appearance", "Browsing & input", "Privacy", "System",
-        "Experimental"
+        "Appearance", "Browsing & input", "Video",
+        "Privacy & security", "Device & storage", "Updates",
+        "Advanced & experimental"
     };
-    return groups[group < 5u ? group : 0u];
+    return groups[group < UI_SETTINGS_GROUP_COUNT ? group : 0u];
 }
 
 static size_t ui_option_group_index(UiOptionId option)
 {
     const char *group = ui_option_group(option);
-    if (strcmp(group, "BROWSING") == 0) return 1u;
-    if (strcmp(group, "PRIVACY") == 0) return 2u;
-    if (strcmp(group, "SYSTEM") == 0) return 3u;
-    if (strcmp(group, "EXPERIMENTAL") == 0) return 4u;
+    if (strcmp(group, "BROWSING & INPUT") == 0) return 1u;
+    if (strcmp(group, "VIDEO") == 0) return 2u;
+    if (strcmp(group, "PRIVACY & SECURITY") == 0) return 3u;
+    if (strcmp(group, "DEVICE & STORAGE") == 0) return 4u;
+    if (strcmp(group, "UPDATES") == 0) return 5u;
+    if (strcmp(group, "ADVANCED & EXPERIMENTAL") == 0) return 6u;
+    /* SITE and HELP are routed through dedicated surfaces. */
+    if (strcmp(group, "SITE") == 0 || strcmp(group, "HELP") == 0)
+        return UI_SETTINGS_GROUP_COUNT;
     return 0u;
 }
 
-static size_t ui_option_first_in_group(size_t group)
+size_t psp_ui_menu_option_first_in_group(size_t group)
 {
     /* Keyboard choice is the entry point to the browsing group. It used to
        sit behind four unrelated rows even though Start/text-field activation
@@ -341,6 +355,8 @@ static const char *ui_option_description(UiOptionId option)
             return "Typeface used by Reader mode";
         case UI_OPTION_REMEMBER_READER_SCALE:
             return "Remember Reader size for this site";
+        case UI_OPTION_READER_AUTO_MODE:
+            return "Use Reader automatically on clear matches";
         case UI_OPTION_CUSTOM_HOMEPAGE:
             return "Use your bookmark launch page";
         case UI_OPTION_HISTORY:
@@ -371,6 +387,8 @@ static const char *ui_option_description(UiOptionId option)
             return "Optional signed packs; embedded fallback remains";
         case UI_OPTION_YOUTUBE_QUALITY:
             return "360p is sharper; 240p uses less memory";
+        case UI_OPTION_YOUTUBE_AUDIO_ONLY:
+            return "Skip video downloads and decoding on YouTube";
         case UI_OPTION_YOUTUBE_RESULTS:
             return "Choose detailed cards or denser rows";
         case UI_OPTION_VIDEO_STARTUP_BUFFERING:
@@ -1628,6 +1646,36 @@ void psp_ui_set_update(
     ui->update_cancel_enabled = cancel_enabled;
 }
 
+void psp_ui_set_update_history(
+    PspUiState *ui, const TilefinchUpdateHistorySnapshot *snapshot)
+{
+    if (ui == NULL || snapshot == NULL) return;
+    memset(ui->update_history_versions, 0,
+           sizeof(ui->update_history_versions));
+    size_t count = snapshot->count;
+    if (count > TILEFINCH_UPDATE_HISTORY_LIMIT)
+        count = TILEFINCH_UPDATE_HISTORY_LIMIT;
+    for (size_t index = 0; index < count; index++) {
+        copy_string(ui->update_history_versions[index],
+                    sizeof(ui->update_history_versions[index]),
+                    snapshot->versions[index]);
+    }
+    ui->update_history_count = (unsigned) count;
+    ui->update_history_phase = (unsigned) snapshot->phase;
+    if (ui->data_options_selection >= count)
+        ui->data_options_selection = 0u;
+}
+
+bool psp_ui_update_history_tag(
+    const PspUiState *ui, size_t index, char *output, size_t capacity)
+{
+    if (ui == NULL || index >= ui->update_history_count
+        || output == NULL || capacity == 0) return false;
+    int written = snprintf(
+        output, capacity, "v%s", ui->update_history_versions[index]);
+    return written > 0 && (size_t) written < capacity;
+}
+
 void psp_ui_set_voice_component(
     PspUiState *ui, PspUiVoiceComponentPhase phase,
     int progress_per_mille)
@@ -1850,28 +1898,6 @@ void psp_ui_set_diagnostic_qr(
     PspUiState *ui, const TilefinchDiagnosticQrView *view)
 {
     if (ui != NULL) ui->diagnostic_qr = view;
-}
-
-static PspUiAction menu_action(size_t selection)
-{
-    static const PspUiAction actions[PSP_UI_MENU_ITEM_COUNT] = {
-        PSP_UI_ACTION_OPEN_ADDRESS,
-        PSP_UI_ACTION_HOME,
-        PSP_UI_ACTION_NONE,              /* Tabs opens its own screen. */
-        PSP_UI_ACTION_SHOW_OFFLINE,
-        PSP_UI_ACTION_SHOW_BOOKMARKS,
-        PSP_UI_ACTION_SHOW_HISTORY,
-        PSP_UI_ACTION_TOGGLE_READER,
-        PSP_UI_ACTION_OPEN_FIND,
-        PSP_UI_ACTION_SAVE_FOR_LATER,
-        PSP_UI_ACTION_TOGGLE_BOOKMARK,
-        PSP_UI_ACTION_SHOW_SCREENSHOTS,
-        PSP_UI_ACTION_NONE,              /* Options opens its own screen. */
-        PSP_UI_ACTION_SCREENSHOT,
-        PSP_UI_ACTION_EXIT
-    };
-    return selection < PSP_UI_MENU_ITEM_COUNT
-        ? actions[selection] : PSP_UI_ACTION_NONE;
 }
 
 static int analog_scroll_delta(PspUiState *ui, const PspUiInput *input)
@@ -2134,7 +2160,7 @@ static void ui_collections_reveal(PspUiState *ui)
 }
 
 /*
- * The three sections switch with L/R, matching the options overlay. The
+ * The five sections switch with L/R, matching the settings overlay. The
  * surface changes section itself and reports it, because the row data behind
  * a section belongs to the frontend and has to be refreshed with it.
  */
@@ -2145,7 +2171,11 @@ static PspUiAction ui_collections_section_action(unsigned section)
             return PSP_UI_ACTION_SHOW_BOOKMARKS;
         case PSP_UI_COLLECTION_HISTORY:
             return PSP_UI_ACTION_SHOW_HISTORY;
-        case PSP_UI_COLLECTION_OFFLINE:
+        case PSP_UI_COLLECTION_DOWNLOADS:
+            return PSP_UI_ACTION_SHOW_DOWNLOADS;
+        case PSP_UI_COLLECTION_SCREENSHOTS:
+            return PSP_UI_ACTION_SHOW_SCREENSHOTS;
+        case PSP_UI_COLLECTION_SAVED:
         default:
             return PSP_UI_ACTION_SHOW_OFFLINE;
     }
@@ -2354,10 +2384,27 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
             ui->cursor_visible = false;
     }
 
+    /* Menu-owned screens and the global Menu-button escape are routed through
+       one controller. Ordinary page frames do not cross the function
+       boundary, keeping this refactor out of the steady browsing hot path. */
+    if ((pressed & PSP_UI_BUTTON_MENU) != 0u
+        || psp_ui_menu_owns_screen(ui->screen)) {
+        if (psp_ui_menu_update(ui, pressed, &intent)) return intent;
+    }
+
     if (ui->screen == PSP_UI_SCREEN_UPDATE) {
         if (pressed & PSP_UI_BUTTON_CONFIRM) {
             if (ui->update_primary_enabled)
                 intent.update_primary_requested = true;
+            intent.visual_changed = true;
+        } else if ((pressed & PSP_UI_BUTTON_RELOAD)
+                   && !ui->update_cancel_enabled
+                   && ui->update_channel == BROWSER_UPDATE_CHANNEL_STABLE) {
+            ui->data_options_selection = 0u;
+            ui->update_history_count = 0u;
+            ui->update_history_phase = TILEFINCH_UPDATE_HISTORY_LOADING;
+            ui_open_child_overlay(ui, PSP_UI_SCREEN_UPDATE_VERSIONS);
+            intent.update_versions_requested = true;
             intent.visual_changed = true;
         } else if (pressed & PSP_UI_BUTTON_CANCEL) {
             if (ui->update_cancel_enabled) {
@@ -2370,9 +2417,41 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
         return intent;
     }
 
+    if (ui->screen == PSP_UI_SCREEN_UPDATE_VERSIONS) {
+        size_t count = ui->update_history_count;
+        bool ready = ui->update_history_phase
+            == TILEFINCH_UPDATE_HISTORY_READY;
+        if (ready && count != 0 && (pressed & PSP_UI_BUTTON_UP)) {
+            ui->data_options_selection = (uint8_t) (
+                (ui->data_options_selection + count - 1u) % count);
+            intent.visual_changed = true;
+        } else if (ready && count != 0 && (pressed & PSP_UI_BUTTON_DOWN)) {
+            ui->data_options_selection = (uint8_t) (
+                (ui->data_options_selection + 1u) % count);
+            intent.visual_changed = true;
+        } else if (ready && count != 0
+                   && (pressed & PSP_UI_BUTTON_CONFIRM)) {
+            intent.update_version_selected = true;
+            intent.list_index = ui->data_options_selection;
+            ui_open_parent_overlay(ui, PSP_UI_SCREEN_UPDATE);
+            intent.visual_changed = true;
+        } else if (ui->update_history_phase
+                       == TILEFINCH_UPDATE_HISTORY_ERROR
+                   && (pressed & PSP_UI_BUTTON_CONFIRM)) {
+            ui->update_history_phase = TILEFINCH_UPDATE_HISTORY_LOADING;
+            intent.update_versions_requested = true;
+            intent.visual_changed = true;
+        } else if (pressed & PSP_UI_BUTTON_CANCEL) {
+            ui_open_parent_overlay(ui, PSP_UI_SCREEN_UPDATE);
+            intent.update_versions_closed = true;
+            intent.visual_changed = true;
+        }
+        return intent;
+    }
+
     if (ui->screen == PSP_UI_SCREEN_DIAGNOSTIC_QR) {
         if (pressed & PSP_UI_BUTTON_CANCEL) {
-            ui_open_parent_overlay(ui, PSP_UI_SCREEN_OPTION_ITEMS);
+            ui_open_parent_overlay(ui, PSP_UI_SCREEN_HELP);
             intent.action = PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR;
             intent.visual_changed = true;
         } else if (pressed & (PSP_UI_BUTTON_LEFT | PSP_UI_BUTTON_PAGE_UP)) {
@@ -2427,7 +2506,9 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                                   | PSP_UI_BUTTON_CONFIRM))) {
             int direction = (pressed & PSP_UI_BUTTON_LEFT) ? -1 : 1;
             int language = (int) ui->glyph_language;
-            language = (language + 5 + direction) % 5;
+            language = (language + (int) BROWSER_GLYPH_LANGUAGE_COUNT
+                        + direction)
+                % (int) BROWSER_GLYPH_LANGUAGE_COUNT;
             ui->glyph_language = (unsigned) language;
             intent.setting.id = PSP_UI_SETTING_GLYPH_LANGUAGE;
             intent.setting.value.glyph_language =
@@ -2514,7 +2595,7 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                 return intent;
             }
             ui_open_parent_overlay(ui, PSP_UI_SCREEN_OPTIONS);
-            ui->options_group_selection = 4u;
+            ui->options_group_selection = 6u;
             intent.visual_changed = true;
         } else if (pressed & (PSP_UI_BUTTON_LEFT | PSP_UI_BUTTON_RIGHT
                               | PSP_UI_BUTTON_CONFIRM)) {
@@ -2694,12 +2775,29 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
     }
 
     if (ui->screen == PSP_UI_SCREEN_OPTION_ITEMS) {
-        if (pressed & (PSP_UI_BUTTON_UP | PSP_UI_BUTTON_PAGE_UP)) {
+        if (pressed & (PSP_UI_BUTTON_PAGE_UP | PSP_UI_BUTTON_PAGE_DOWN)) {
+            size_t group = ui_option_group_index(
+                ui_option_id(ui->options_selection));
+            group = (pressed & PSP_UI_BUTTON_PAGE_UP)
+                ? (group + UI_SETTINGS_GROUP_COUNT - 1u)
+                    % UI_SETTINGS_GROUP_COUNT
+                : (group + 1u) % UI_SETTINGS_GROUP_COUNT;
+            ui->options_group_selection = (uint8_t) group;
+            if (group == 6u) {
+                ui_open_child_overlay(
+                    ui, PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS);
+                ui->experimental_options_selection = 0u;
+                intent.voice_component_probe_requested = true;
+            } else {
+                ui->options_selection =
+                    psp_ui_menu_option_first_in_group(group);
+            }
+            intent.visual_changed = true;
+        } else if (pressed & PSP_UI_BUTTON_UP) {
             ui->options_selection = ui_option_step_in_group(
                 ui->options_selection, -1);
             intent.visual_changed = true;
-        } else if (pressed & (PSP_UI_BUTTON_DOWN
-                              | PSP_UI_BUTTON_PAGE_DOWN)) {
+        } else if (pressed & PSP_UI_BUTTON_DOWN) {
             ui->options_selection = ui_option_step_in_group(
                 ui->options_selection, 1);
             intent.visual_changed = true;
@@ -2753,6 +2851,11 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                         PSP_UI_SETTING_REMEMBER_READER_SITE_SCALE;
                     intent.setting.value.boolean =
                         ui->remember_reader_site_scale;
+                    break;
+                case UI_OPTION_READER_AUTO_MODE:
+                    ui->reader_auto_mode = !ui->reader_auto_mode;
+                    intent.setting.id = PSP_UI_SETTING_READER_AUTO_MODE;
+                    intent.setting.value.boolean = ui->reader_auto_mode;
                     break;
                 case UI_OPTION_CUSTOM_HOMEPAGE:
                     ui->custom_homepage_enabled =
@@ -2857,6 +2960,11 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                         ui->youtube_240p
                             ? BROWSER_YOUTUBE_QUALITY_240P
                             : BROWSER_YOUTUBE_QUALITY_360P;
+                    break;
+                case UI_OPTION_YOUTUBE_AUDIO_ONLY:
+                    ui->youtube_audio_only = !ui->youtube_audio_only;
+                    intent.setting.id = PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY;
+                    intent.setting.value.boolean = ui->youtube_audio_only;
                     break;
                 case UI_OPTION_YOUTUBE_RESULTS:
                     ui->youtube_compact_results =
@@ -3004,35 +3112,6 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
         return intent;
     }
 
-    if (ui->screen == PSP_UI_SCREEN_OPTIONS) {
-        if (pressed & (PSP_UI_BUTTON_UP | PSP_UI_BUTTON_PAGE_UP)) {
-            ui->options_group_selection =
-                (ui->options_group_selection + 4u) % 5u;
-            intent.visual_changed = true;
-        } else if (pressed & (PSP_UI_BUTTON_DOWN
-                              | PSP_UI_BUTTON_PAGE_DOWN)) {
-            ui->options_group_selection =
-                (ui->options_group_selection + 1u) % 5u;
-            intent.visual_changed = true;
-        } else if (pressed & PSP_UI_BUTTON_CONFIRM) {
-            if (ui->options_group_selection == 4u) {
-                ui_open_child_overlay(
-                    ui, PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS);
-                ui->experimental_options_selection = 0u;
-                intent.voice_component_probe_requested = true;
-            } else {
-                ui->options_selection = ui_option_first_in_group(
-                    ui->options_group_selection);
-                ui_open_child_overlay(ui, PSP_UI_SCREEN_OPTION_ITEMS);
-            }
-            intent.visual_changed = true;
-        } else if (pressed & PSP_UI_BUTTON_CANCEL) {
-            ui_close_overlay(ui);
-            intent.visual_changed = true;
-        }
-        return intent;
-    }
-
     if (ui->screen == PSP_UI_SCREEN_FIND) {
         const uint32_t find_direction_mask =
             PSP_UI_BUTTON_UP | PSP_UI_BUTTON_DOWN
@@ -3078,53 +3157,6 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
         intent.visual_changed = true;
         return intent;
     }
-    if (ui->screen == PSP_UI_SCREEN_TABS) {
-        size_t tab_count = ui->tabs == NULL ? 1u : ui->tabs->count;
-        if (tab_count == 0 || tab_count > PSP_UI_TAB_LIMIT) tab_count = 1u;
-        bool can_create = ui->tabs != NULL && ui->tabs->can_create
-            && tab_count < PSP_UI_TAB_LIMIT;
-        size_t row_count = tab_count + (can_create ? 1u : 0u);
-        if (pressed & (PSP_UI_BUTTON_UP | PSP_UI_BUTTON_LEFT)) {
-            ui->tab_selection =
-                (uint8_t) ((ui->tab_selection + row_count - 1u)
-                           % row_count);
-            intent.visual_changed = true;
-        } else if (pressed
-                   & (PSP_UI_BUTTON_DOWN | PSP_UI_BUTTON_RIGHT)) {
-            ui->tab_selection =
-                (uint8_t) ((ui->tab_selection + 1u) % row_count);
-            intent.visual_changed = true;
-        } else if (pressed & PSP_UI_BUTTON_CONFIRM) {
-            ui_close_overlay(ui);
-            if (ui->tab_selection < tab_count) {
-                intent.action = PSP_UI_ACTION_SWITCH_TAB;
-                intent.tab_index = ui->tab_selection;
-            } else {
-                intent.action = PSP_UI_ACTION_NEW_TAB;
-            }
-            intent.visual_changed = true;
-        } else if (pressed & PSP_UI_BUTTON_RELOAD) {
-            if (ui->tab_selection < tab_count && tab_count > 1u) {
-                intent.action = PSP_UI_ACTION_CLOSE_TAB;
-                intent.tab_index = ui->tab_selection;
-                ui_close_overlay(ui);
-            }
-            intent.visual_changed = true;
-        } else if (pressed & PSP_UI_BUTTON_CANCEL) {
-            ui_close_overlay(ui);
-            intent.visual_changed = true;
-        }
-        return intent;
-    }
-    if (pressed & PSP_UI_BUTTON_MENU) {
-        ui->cursor_visible = false;
-        if (ui->screen == PSP_UI_SCREEN_MENU)
-            ui_close_overlay(ui);
-        else
-            ui_open_overlay(ui, PSP_UI_SCREEN_MENU);
-        intent.visual_changed = true;
-        return intent;
-    }
     if (pressed & PSP_UI_BUTTON_ADDRESS) {
         bool submit_focused = ui->screen == PSP_UI_SCREEN_PAGE
             && ui->focus_editable;
@@ -3135,41 +3167,6 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
             ? PSP_UI_ACTION_SUBMIT_FOCUSED_TEXT
             : PSP_UI_ACTION_OPEN_ADDRESS;
         intent.visual_changed = true;
-        return intent;
-    }
-
-    if (ui->screen == PSP_UI_SCREEN_MENU) {
-        if (pressed & (PSP_UI_BUTTON_UP | PSP_UI_BUTTON_LEFT)) {
-            ui->menu_selection =
-                (ui->menu_selection + PSP_UI_MENU_ITEM_COUNT - 1)
-                % PSP_UI_MENU_ITEM_COUNT;
-            intent.visual_changed = true;
-        } else if (pressed & (PSP_UI_BUTTON_DOWN | PSP_UI_BUTTON_RIGHT)) {
-            ui->menu_selection =
-                (ui->menu_selection + 1) % PSP_UI_MENU_ITEM_COUNT;
-            intent.visual_changed = true;
-        } else if ((pressed & PSP_UI_BUTTON_RELOAD)
-                   && ui->menu_selection == UI_MENU_ROW_READER) {
-            ui_close_overlay(ui);
-            intent.action = PSP_UI_ACTION_TOGGLE_READER_SITE;
-            intent.visual_changed = true;
-        } else if (pressed & PSP_UI_BUTTON_CONFIRM) {
-            ui_close_overlay(ui);
-            if (ui->menu_selection == UI_MENU_ROW_TABS) {
-                ui_open_child_overlay(ui, PSP_UI_SCREEN_TABS);
-                ui->tab_selection = ui->tabs == NULL
-                    ? 0 : ui->tabs->active_index;
-            } else if (ui->menu_selection == UI_MENU_ROW_OPTIONS) {
-                ui_open_child_overlay(ui, PSP_UI_SCREEN_OPTIONS);
-                ui->options_group_selection = 0;
-            } else {
-                intent.action = menu_action(ui->menu_selection);
-            }
-            intent.visual_changed = true;
-        } else if (pressed & PSP_UI_BUTTON_CANCEL) {
-            ui_close_overlay(ui);
-            intent.visual_changed = true;
-        }
         return intent;
     }
 
@@ -3368,6 +3365,7 @@ bool psp_ui_intent_has_predispatch_visual(const PspUiIntent *intent)
         case PSP_UI_ACTION_HOME:
         case PSP_UI_ACTION_SAVE_FOR_LATER:
         case PSP_UI_ACTION_SHOW_OFFLINE:
+        case PSP_UI_ACTION_SHOW_DOWNLOADS:
         case PSP_UI_ACTION_SHOW_SCREENSHOTS:
         case PSP_UI_ACTION_TOGGLE_BOOKMARK:
         case PSP_UI_ACTION_SWITCH_TAB:
@@ -3700,10 +3698,8 @@ static TILEFINCH_OUT_OF_LINE void draw_menu(
                       uint16_t accent, uint16_t text, uint16_t muted)
 {
     static const char *items[PSP_UI_MENU_ITEM_COUNT] = {
-        "Search or address", "Home", "Tabs", "Library", "Bookmarks",
-        "History", NULL, "Find in page", "Save this article",
-        "Toggle bookmark", "Screenshots", "Options",
-        "Save screenshot", "Exit to XMB"
+        "Home", "Tabs", "Page tools", "Library", "Settings",
+        "Help & diagnostics", "Exit to XMB"
     };
     /* Chrome menu text is always 15px (scale 2): it names browser controls,
        not page content, so it must not shrink with the page-zoom setting.
@@ -3713,7 +3709,7 @@ static TILEFINCH_OUT_OF_LINE void draw_menu(
     const int scale = 2;
     const int row_spacing = 23;
     const int row_height = 21;
-    UiRect shadow = { 96, 10, 288, 252 };
+    UiRect shadow = { 58, 10, width - 116, 252 };
     ui_apply_overlay_motion(ui, &shadow);
     (void) panel;
     draw_panel_shell(pixels, width, height, stride, shadow);
@@ -3724,11 +3720,6 @@ static TILEFINCH_OUT_OF_LINE void draw_menu(
                    shadow.x + 16, shadow.y + 14,
                    "Tilefinch", 24, text, scale);
     size_t first = 0;
-    if (ui->menu_selection >= UI_MENU_VISIBLE_ROWS)
-        first = ui->menu_selection - UI_MENU_VISIBLE_ROWS + 1u;
-    size_t maximum_first = PSP_UI_MENU_ITEM_COUNT > UI_MENU_VISIBLE_ROWS
-        ? PSP_UI_MENU_ITEM_COUNT - UI_MENU_VISIBLE_ROWS : 0u;
-    if (first > maximum_first) first = maximum_first;
     size_t end = first + UI_MENU_VISIBLE_ROWS;
     if (end > PSP_UI_MENU_ITEM_COUNT) end = PSP_UI_MENU_ITEM_COUNT;
     for (size_t at = first; at < end; at++) {
@@ -3741,33 +3732,216 @@ static TILEFINCH_OUT_OF_LINE void draw_menu(
         }
         draw_text_with_font(
                   pixels, width, height, stride, shadow.x + 18, row_y,
-                  at == UI_MENU_ROW_READER
-                      ? (ui->reader_mode ? "Reader mode  On"
-                                         : "Reader mode  Off")
-                      : items[at], 20,
+                  items[at], 24,
                   shadow.x + shadow.width - 18,
                   at == ui->menu_selection
                       ? PSP_THEME_ON_ACCENT
                       : (at == PSP_UI_MENU_ITEM_COUNT - 1
                              ? PSP_THEME_TEXT_MUTED : PSP_THEME_TEXT_BODY),
                   scale, NULL, false);
+        if (at >= UI_MENU_ROW_TABS && at <= UI_MENU_ROW_HELP)
+            draw_chevron(
+                pixels, width, height, stride,
+                shadow.x + shadow.width - 20, row_y + 4, 1,
+                at == ui->menu_selection ? PSP_THEME_ON_ACCENT : accent);
     }
-    if (first != 0)
-        draw_vertical_chevron(
-            pixels, width, height, stride,
-            shadow.x + shadow.width - 17, shadow.y + 54, -1, muted, 3);
-    if (end < PSP_UI_MENU_ITEM_COUNT)
-        draw_vertical_chevron(
-            pixels, width, height, stride,
-            shadow.x + shadow.width - 17,
-            shadow.y + shadow.height - 32, 1, muted, 3);
     draw_text_with_font(pixels, width, height, stride, shadow.x + 16,
               shadow.y + shadow.height - 18,
-              ui->menu_selection == UI_MENU_ROW_READER
-                  ? "X Toggle   Square Per-site   O Back"
-                  : "X Open   O Back",
-              28, shadow.x + shadow.width - 12,
+              "X Open   O Back   Start Address",
+              36, shadow.x + shadow.width - 12,
               muted, scale, NULL, false);
+}
+
+static void draw_routed_list(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, const char *title, const char *context,
+    const char *const *labels, const char *const *values,
+    size_t count, size_t selection, uint16_t accent, uint16_t text,
+    uint16_t muted)
+{
+    UiRect box = {58, 10, width - 116, 252};
+    ui_apply_overlay_motion(ui, &box);
+    draw_panel_shell(pixels, width, height, stride, box);
+    draw_panel_rule(pixels, width, height, stride, box, box.y + 45);
+    draw_panel_hint_bar(pixels, width, height, stride, box,
+                        box.y + box.height - 20);
+    draw_text_bold(pixels, width, height, stride,
+                   box.x + 16, box.y + 14, title, 25, text, 2);
+    if (context != NULL && context[0] != '\0')
+        draw_text_right_aligned(
+            pixels, width, height, stride, box.x + box.width - 16,
+            box.y + 15, context, 25, accent, 1, true);
+    for (size_t at = 0; at < count; at++) {
+        int row_y = box.y + 57 + (int) at * 24;
+        bool selected = at == selection;
+        if (selected)
+            fill_round_rect(
+                pixels, width, height, stride,
+                (UiRect) {box.x + 10, row_y - 5, box.width - 20, 22},
+                PSP_THEME_RADIUS_ROW, accent, 4);
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 18, row_y,
+            labels[at], 31, box.x + box.width - 105,
+            selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
+            2, NULL, false);
+        if (values != NULL && values[at] != NULL)
+            draw_text_right_aligned(
+                pixels, width, height, stride, box.x + box.width - 18,
+                row_y, values[at], 18,
+                selected ? PSP_THEME_ON_ACCENT : accent, 2, true);
+    }
+    draw_text_with_font(
+        pixels, width, height, stride, box.x + 16,
+        box.y + box.height - 20, "X Open or toggle   O Back", 28,
+        box.x + box.width - 14, muted, 2, NULL, false);
+}
+
+static TILEFINCH_OUT_OF_LINE void draw_page_tools(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t accent, uint16_t text, uint16_t muted)
+{
+    static const char *const labels[UI_PAGE_TOOLS_ITEM_COUNT] = {
+        "Find in page", "Reader mode", "Add/remove bookmark",
+        "Save article", "Save screenshot", "Site controls",
+        "Page information"
+    };
+    const char *values[UI_PAGE_TOOLS_ITEM_COUNT] = {
+        ">", ui->reader_mode ? "On" : "Off", NULL, NULL, NULL, ">", ">"
+    };
+    draw_routed_list(
+        ui, pixels, width, height, stride, "Page tools", NULL,
+        labels, values, UI_PAGE_TOOLS_ITEM_COUNT, ui->menu_selection,
+        accent, text, muted);
+}
+
+static TILEFINCH_OUT_OF_LINE void draw_site_controls(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t accent, uint16_t text, uint16_t muted)
+{
+    static const char *const labels[UI_SITE_CONTROLS_ITEM_COUNT] = {
+        "JavaScript", "Content blocking", "Cookie notices",
+        "Always Reader", "Third-party cookies", "Mixed HTTP (session)"
+    };
+    char domain[64], detail[64];
+    ui_url_presentation(ui, domain, sizeof(domain), detail, sizeof(detail));
+    bool blocker_available = ui->content_blocker_mode != CONTENT_BLOCKER_OFF
+        && ui_content_blocker_site_available(ui);
+    const char *values[UI_SITE_CONTROLS_ITEM_COUNT] = {
+        !ui->javascript_enabled ? "Global off"
+            : (ui->site_javascript_enabled ? "On" : "Off"),
+        !blocker_available ? "N/A"
+            : (ui->content_blocker_site_allowed ? "Off" : "On"),
+        !ui_content_blocker_site_available(ui) ? "N/A"
+            : (ui->cookie_banner_hidden ? "On" : "Off"),
+        ui->reader_site_always ? "On" : "Off",
+        ui->third_party_cookie_site_allowed ? "On" : "Off",
+        ui->mixed_content_site_allowed ? "On" : "Off"
+    };
+    draw_routed_list(
+        ui, pixels, width, height, stride, "Site controls", domain,
+        labels, values, UI_SITE_CONTROLS_ITEM_COUNT,
+        ui->menu_selection, accent, text, muted);
+}
+
+static TILEFINCH_OUT_OF_LINE void draw_help(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t accent, uint16_t text, uint16_t muted)
+{
+    static const char *const labels[UI_HELP_ITEM_COUNT] = {
+        "Diagnostic QR", "Last error summary", "Controls guide",
+        "Version & system", "Licences"
+    };
+    static const char *const values[UI_HELP_ITEM_COUNT] = {
+        ">", ">", ">", ">", ">"
+    };
+    draw_routed_list(
+        ui, pixels, width, height, stride, "Help & diagnostics", NULL,
+        labels, values, UI_HELP_ITEM_COUNT, ui->menu_selection,
+        accent, text, muted);
+}
+
+static TILEFINCH_OUT_OF_LINE void draw_page_information(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t accent, uint16_t text, uint16_t muted)
+{
+    UiRect box = {52, 24, width - 104, 224};
+    ui_apply_overlay_motion(ui, &box);
+    draw_panel_shell(pixels, width, height, stride, box);
+    draw_panel_rule(pixels, width, height, stride, box, box.y + 43);
+    draw_panel_hint_bar(pixels, width, height, stride, box,
+                        box.y + box.height - 20);
+    draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 14,
+                   "Page tools  >  Page information", 38, text, 2);
+    char domain[64], detail[128], blocked[48];
+    ui_url_presentation(ui, domain, sizeof(domain), detail, sizeof(detail));
+    snprintf(blocked, sizeof(blocked), "%u requests blocked",
+             (unsigned) ui->page_requests_blocked);
+    draw_text_bold(pixels, width, height, stride,
+                   box.x + 18, box.y + 58, domain, 38, accent, 2);
+    draw_text_with_font(pixels, width, height, stride,
+        box.x + 18, box.y + 83, ui->title, 48, box.x + box.width - 18,
+        PSP_THEME_TEXT_BODY, 2, NULL, false);
+    draw_text_with_font(pixels, width, height, stride,
+        box.x + 18, box.y + 108, detail, 56, box.x + box.width - 18,
+        muted, 1, NULL, false);
+    draw_text(pixels, width, height, stride,
+        box.x + 18, box.y + 136, ui->secure ? "Secure HTTPS page"
+                                             : "Connection is not secure",
+        34, ui->secure ? PSP_THEME_TEXT_BODY : PSP_THEME_WARN, 2);
+    draw_text(pixels, width, height, stride,
+        box.x + 18, box.y + 161, blocked, 34, muted, 2);
+    draw_text(pixels, width, height, stride,
+        box.x + 16, box.y + box.height - 20, "O Back", 12, muted, 2);
+}
+
+static TILEFINCH_OUT_OF_LINE void draw_help_detail(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t accent, uint16_t text, uint16_t muted)
+{
+    UiRect box = {52, 24, width - 104, 224};
+    ui_apply_overlay_motion(ui, &box);
+    draw_panel_shell(pixels, width, height, stride, box);
+    draw_panel_rule(pixels, width, height, stride, box, box.y + 43);
+    draw_panel_hint_bar(pixels, width, height, stride, box,
+                        box.y + box.height - 20);
+    const char *title = "Help";
+    const char *lines[5] = {NULL, NULL, NULL, NULL, NULL};
+    if (ui->menu_selection == 1u) {
+        title = "Last error summary";
+        lines[0] = "The last saved error is included first";
+        lines[1] = "in Diagnostic QR. Photograph every";
+        lines[2] = "part to preserve the complete report.";
+    } else if (ui->menu_selection == 2u) {
+        title = "Controls guide";
+        lines[0] = "X opens or toggles.  O goes back.";
+        lines[1] = "Start opens Address.  Square reloads.";
+        lines[2] = "Select opens or closes the menu.";
+        lines[3] = "L/R changes tabs or categories.";
+        lines[4] = "Analog moves the pointer or scrolls.";
+    } else if (ui->menu_selection == 3u) {
+        title = "Version & system";
+        lines[0] = "Tilefinch " TILEFINCH_VERSION_STRING;
+        lines[1] = "Sony PSP release build";
+        lines[2] = "480 x 272  |  333 MHz target";
+    } else {
+        title = "Licences";
+        lines[0] = "Tilefinch is MIT licensed.";
+        lines[1] = "Third-party notices and font licences";
+        lines[2] = "are included in the distribution.";
+    }
+    draw_text_bold(pixels, width, height, stride,
+                   box.x + 16, box.y + 14, title, 32, text, 2);
+    for (size_t at = 0; at < 5u; at++) {
+        if (lines[at] == NULL) continue;
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 18,
+            box.y + 61 + (int) at * 24, lines[at], 50,
+            box.x + box.width - 18,
+            at == 0u ? accent : PSP_THEME_TEXT_BODY,
+            at == 0u ? 2 : 1, NULL, false);
+    }
+    draw_text(pixels, width, height, stride,
+        box.x + 16, box.y + box.height - 20, "O Back", 12, muted, 2);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_tabs(
@@ -3907,7 +4081,7 @@ static TILEFINCH_OUT_OF_LINE void draw_options(
                          int height, int stride, uint16_t panel,
                          uint16_t accent, uint16_t text, uint16_t muted)
 {
-    UiRect box = {58, 17, width - 116, 238};
+    UiRect box = {42, 17, width - 84, 238};
     ui_apply_overlay_motion(ui, &box);
     (void) panel;
     draw_panel_shell(pixels, width, height, stride, box);
@@ -3915,9 +4089,9 @@ static TILEFINCH_OUT_OF_LINE void draw_options(
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 20);
     draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 14,
-                   "OPTIONS", 20, text, 2);
-    for (size_t at = 0; at < 5u; at++) {
-        int row_y = box.y + 58 + (int) at * 30;
+                   "Settings", 20, text, 2);
+    for (size_t at = 0; at < UI_SETTINGS_GROUP_COUNT; at++) {
+        int row_y = box.y + 55 + (int) at * 24;
         bool selected = at == ui->options_group_selection;
         if (selected) {
             fill_round_rect(
@@ -3927,7 +4101,7 @@ static TILEFINCH_OUT_OF_LINE void draw_options(
         }
         draw_text_with_font(
             pixels, width, height, stride, box.x + 20, row_y,
-            ui_option_group_at(at), 18, box.x + box.width - 42,
+            ui_option_group_at(at), 28, box.x + box.width - 42,
             selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
             2, NULL, false);
         draw_text_right_aligned(
@@ -3955,15 +4129,18 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 18);
     draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 14,
-                   "OPTIONS", 20, text, 2);
+                   "Settings", 20, text, 2);
+    draw_text_with_font(
+        pixels, width, height, stride, box.x + 96, box.y + 14,
+        ">", 1, box.x + 112, accent, 2, NULL, true);
+    draw_text_with_font(
+        pixels, width, height, stride, box.x + 116, box.y + 14,
+        ui_option_group_at(ui_option_group_index(
+            ui_option_id(ui->options_selection))), 24,
+        box.x + box.width - 16, accent, 2, NULL, true);
     draw_text_right_aligned(
         pixels, width, height, stride, box.x + box.width - 16,
-        box.y + 14,
-        ui_option_group(ui_option_id(ui->options_selection)), 16,
-        accent, 2, true);
-    draw_text_right_aligned(
-        pixels, width, height, stride, box.x + box.width - 16,
-        box.y + 31, "L/R   O Back", 16, muted, 2, false);
+        box.y + 31, "L/R category   O Back", 22, muted, 1, false);
     char page_size[12], blocked_value[24], youtube_quality[8];
     snprintf(page_size, sizeof(page_size), "%u%%", ui->page_font_percent);
     snprintf(youtube_quality, sizeof(youtube_quality), "%up",
@@ -4024,6 +4201,10 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
                 values[at] = ui->remember_reader_site_scale
                     ? "Per site" : "Off";
                 break;
+            case UI_OPTION_READER_AUTO_MODE:
+                labels[at] = "Auto Reader";
+                values[at] = ui->reader_auto_mode ? "On" : "Off";
+                break;
             case UI_OPTION_CUSTOM_HOMEPAGE:
                 labels[at] = "Home page";
                 values[at] = ui->custom_homepage_enabled
@@ -4043,7 +4224,7 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
                 break;
             case UI_OPTION_EXPERIMENTAL:
                 labels[at] = "Experimental";
-                values[at] = "Open";
+                values[at] = ">";
                 break;
             case UI_OPTION_ANALOG_CURSOR:
                 labels[at] = "Analog cursor";
@@ -4079,7 +4260,7 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
                 break;
             case UI_OPTION_LANGUAGE_AND_EMOJI:
                 labels[at] = "Language & emoji";
-                values[at] = "Open";
+                values[at] = ">";
                 break;
             case UI_OPTION_VIDEO_SCALING:
                 labels[at] = "Video scaling";
@@ -4088,6 +4269,10 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
             case UI_OPTION_YOUTUBE_QUALITY:
                 labels[at] = "YouTube";
                 values[at] = youtube_quality;
+                break;
+            case UI_OPTION_YOUTUBE_AUDIO_ONLY:
+                labels[at] = "Audio-only";
+                values[at] = ui->youtube_audio_only ? "On" : "Off";
                 break;
             case UI_OPTION_YOUTUBE_RESULTS:
                 labels[at] = "YouTube results";
@@ -4104,7 +4289,7 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
                 values[at] = ui->resume_offline_downloads ? "On" : "Off";
                 break;
             case UI_OPTION_CONTENT_BLOCKER:
-                labels[at] = "Ad blocking";
+                labels[at] = "Content blocker";
                 values[at] = blocked_value;
                 break;
             case UI_OPTION_COSMETIC_HIDING:
@@ -4126,7 +4311,7 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
                 break;
             case UI_OPTION_LOAD_ALLOWLIST:
                 labels[at] = "Load allowlist";
-                values[at] = "Open";
+                values[at] = ">";
                 break;
             case UI_OPTION_SITE_DATA_ALLOWED:
                 labels[at] = "Site data";
@@ -4153,7 +4338,7 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
                 break;
             case UI_OPTION_DIAGNOSTIC_QR:
                 labels[at] = "Diagnostic QR";
-                values[at] = "Open";
+                values[at] = ">";
                 break;
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
             case UI_OPTION_POWER_TEST:
@@ -4172,11 +4357,11 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
             case UI_OPTION_UPDATE:
                 labels[at] = "Version and update";
                 values[at] =
-                    ui->update_release_available ? "New" : "Open";
+                    ui->update_release_available ? "New" : ">";
                 break;
             case UI_OPTION_SITE_DATA:
                 labels[at] = "Manage site data";
-                values[at] = "Open";
+                values[at] = ">";
                 break;
         }
     }
@@ -4376,6 +4561,10 @@ static const char *ui_glyph_language_name(unsigned language)
         case BROWSER_GLYPH_LANGUAGE_CHINESE_TRADITIONAL:
             return "Chinese (Traditional)";
         case BROWSER_GLYPH_LANGUAGE_KOREAN: return "Korean";
+        case BROWSER_GLYPH_LANGUAGE_CYRILLIC: return "Cyrillic";
+        case BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED:
+            return "Extended Latin";
+        case BROWSER_GLYPH_LANGUAGE_COUNT:
         case BROWSER_GLYPH_LANGUAGE_EMBEDDED:
         default: return "Embedded";
     }
@@ -4398,6 +4587,13 @@ static bool ui_glyph_language_pack(
         case BROWSER_GLYPH_LANGUAGE_KOREAN:
             *pack = TILEFINCH_GLYPH_PACK_KOREAN;
             return true;
+        case BROWSER_GLYPH_LANGUAGE_CYRILLIC:
+            *pack = TILEFINCH_GLYPH_PACK_CYRILLIC;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED:
+            *pack = TILEFINCH_GLYPH_PACK_LATIN_EXTENDED;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_COUNT:
         case BROWSER_GLYPH_LANGUAGE_EMBEDDED:
         default:
             return false;
@@ -4449,7 +4645,7 @@ static TILEFINCH_OUT_OF_LINE void draw_glyph_options(
         ui->glyph_language, &language_pack);
     char language_state[32], emoji_state[32];
     char rows[4][64];
-    snprintf(rows[0], sizeof(rows[0]), "CJK glyphs  %s",
+    snprintf(rows[0], sizeof(rows[0]), "Language  %s",
              ui_glyph_language_name(ui->glyph_language));
     snprintf(rows[1], sizeof(rows[1]), "Emoji  %s",
              ui->color_emoji ? "Color pack" : "Embedded");
@@ -4560,11 +4756,109 @@ static TILEFINCH_OUT_OF_LINE void draw_update(
             ui->update_primary_enabled
                 ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_FAINT, 2);
     }
-    draw_text(
+    if (!ui->update_cancel_enabled
+        && ui->update_channel == BROWSER_UPDATE_CHANNEL_STABLE) {
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 16,
+            box.y + box.height - 15,
+            "Square Versions   O Back", 28,
+            box.x + box.width - 14, muted, 1, NULL, false);
+    } else {
+        draw_text(
+            pixels, width, height, stride, box.x + 16,
+            box.y + box.height - 18,
+            ui->update_cancel_enabled ? "O Stop" : "O Back",
+            20, muted, 2);
+    }
+}
+
+static TILEFINCH_OUT_OF_LINE void draw_update_versions(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t accent, uint16_t text, uint16_t muted)
+{
+    UiRect box = {70, 14, width - 140, 244};
+    ui_apply_overlay_motion(ui, &box);
+    draw_panel_shell(pixels, width, height, stride, box);
+    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
+    draw_panel_hint_bar(pixels, width, height, stride, box,
+                        box.y + box.height - 22);
+    draw_text_bold(pixels, width, height, stride,
+                   box.x + 16, box.y + 14,
+                   "Previous versions", 24, text, 2);
+    draw_text_with_font(
+        pixels, width, height, stride, box.x + 16, box.y + 49,
+        "Signed and installed as an A/B trial", 42,
+        box.x + box.width - 14, muted, 1, NULL, false);
+    size_t count = ui->update_history_count;
+    if (ui->update_history_phase == TILEFINCH_UPDATE_HISTORY_LOADING) {
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 20, box.y + 92,
+            "Loading releases...", 24, box.x + box.width - 14,
+            text, 1, NULL, false);
+    } else if (ui->update_history_phase == TILEFINCH_UPDATE_HISTORY_ERROR) {
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 20, box.y + 92,
+            "Could not load releases", 28, box.x + box.width - 14,
+            text, 1, NULL, false);
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 20, box.y + 115,
+            "Check Wi-Fi, then press X to retry", 38,
+            box.x + box.width - 14, muted, 1, NULL, false);
+    } else if (count == 0) {
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 20, box.y + 92,
+            "No earlier releases found", 30,
+            box.x + box.width - 14, text, 1, NULL, false);
+    } else {
+        const size_t visible_capacity = 6u;
+        size_t visible = count < visible_capacity
+            ? count : visible_capacity;
+        size_t start = 0;
+        if (ui->data_options_selection >= visible)
+            start = ui->data_options_selection - visible + 1u;
+        if (start + visible > count) start = count - visible;
+        if (count > visible) {
+            char range[16];
+            snprintf(range, sizeof(range), "%u-%u of %u",
+                     (unsigned) start + 1u,
+                     (unsigned) (start + visible), (unsigned) count);
+            draw_text_with_font(
+                pixels, width, height, stride,
+                box.x + box.width - 82, box.y + 16,
+                range, 14, box.x + box.width - 14,
+                muted, 1, NULL, false);
+        }
+        for (size_t row = 0; row < visible; row++) {
+            size_t index = start + row;
+            int y = box.y + 68 + (int) row * 27;
+            bool selected = index == ui->data_options_selection;
+            if (selected) {
+                fill_round_rect(
+                    pixels, width, height, stride,
+                    (UiRect) {box.x + 10, y - 3, box.width - 20, 24},
+                    PSP_THEME_RADIUS_CHIP, PSP_THEME_SURFACE, 4);
+                fill_rect(
+                    pixels, width, height, stride,
+                    (UiRect) {box.x + 10, y - 3, 3, 24}, accent, 4);
+            }
+            char label[24];
+            snprintf(label, sizeof(label), "Tilefinch %s",
+                     ui->update_history_versions[index]);
+            draw_text_with_font(
+                pixels, width, height, stride, box.x + 20, y,
+                label, 22, box.x + box.width - 14,
+                selected ? text : PSP_THEME_TEXT_BODY,
+                1, NULL, false);
+        }
+    }
+    const char *hint = ui->update_history_phase
+            == TILEFINCH_UPDATE_HISTORY_ERROR
+        ? "X Retry   O Back"
+        : count != 0 ? "X Select   O Back" : "O Back";
+    draw_text_with_font(
         pixels, width, height, stride, box.x + 16,
-        box.y + box.height - 18,
-        ui->update_cancel_enabled ? "O Stop" : "O Back",
-        20, muted, 2);
+        box.y + box.height - 18, hint, 22,
+        box.x + box.width - 14, muted, 1, NULL, false);
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_data_options(
@@ -5030,10 +5324,12 @@ static TILEFINCH_OUT_OF_LINE void draw_home(
 static const char *ui_collection_section_name(unsigned section)
 {
     switch (section % PSP_UI_COLLECTION_SECTION_COUNT) {
+        case PSP_UI_COLLECTION_SAVED: return "SAVED";
         case PSP_UI_COLLECTION_BOOKMARKS: return "BOOKMARKS";
         case PSP_UI_COLLECTION_HISTORY: return "HISTORY";
-        case PSP_UI_COLLECTION_OFFLINE:
-        default: return "OFFLINE";
+        case PSP_UI_COLLECTION_DOWNLOADS: return "DOWNLOADS";
+        case PSP_UI_COLLECTION_SCREENSHOTS: return "SHOTS";
+        default: return "SAVED";
     }
 }
 
@@ -5642,6 +5938,9 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
     if (ui->screen == PSP_UI_SCREEN_UPDATE) {
         draw_update(
             ui, pixels, width, height, stride, panel, accent, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_UPDATE_VERSIONS) {
+        draw_update_versions(
+            ui, pixels, width, height, stride, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS) {
         draw_experimental_options(
             ui, pixels, width, height, stride, panel, accent, text, muted);
@@ -5657,6 +5956,20 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
     } else if (ui->screen == PSP_UI_SCREEN_OPTION_ITEMS) {
         draw_option_items(ui, pixels, width, height, stride, panel, accent,
                           text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_PAGE_TOOLS) {
+        draw_page_tools(
+            ui, pixels, width, height, stride, accent, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_SITE_CONTROLS) {
+        draw_site_controls(
+            ui, pixels, width, height, stride, accent, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_PAGE_INFORMATION) {
+        draw_page_information(
+            ui, pixels, width, height, stride, accent, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_HELP) {
+        draw_help(ui, pixels, width, height, stride, accent, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_HELP_DETAIL) {
+        draw_help_detail(
+            ui, pixels, width, height, stride, accent, text, muted);
     }
     if (ui->screen == PSP_UI_SCREEN_TABS) {
         draw_tabs(ui, pixels, width, height, stride, panel, accent, text,
@@ -6230,7 +6543,7 @@ void psp_ui_media_show_controls(PspUiMediaState *media)
 void psp_ui_media_tick(PspUiMediaState *media, unsigned elapsed_ms)
 {
     if (media == NULL || !media->visible || !media->controls_visible
-        || !media->playing || media->ended
+        || !media->playing || media->ended || media->resolving
         || media->seek_preview_active) return;
     if (elapsed_ms >= media->controls_remaining_ms) {
         media->controls_remaining_ms = 0;
@@ -6754,6 +7067,15 @@ size_t psp_ui_media_overlay_bands(
         ui_media_add_band(
             bands, capacity, &count, message.y,
             message.y + message.height + 5, height);
+        if (media->resolving) {
+            /* Priming can already have a decoded picture behind this
+               overlay. Keep the same opaque footer ground that Playing will
+               inherit, rather than exposing motion there for one frame and
+               replacing it at the first-frame boundary. */
+            ui_media_add_band(
+                bands, capacity, &count,
+                height - UI_MEDIA_CONTROL_BAR_HEIGHT, height, height);
+        }
         return count;
     }
     if (media->seek_preview_active) {
@@ -6776,20 +7098,26 @@ size_t psp_ui_media_overlay_bands(
     return count;
 }
 
+static void draw_media_control_bar_ground(
+    uint16_t *pixels, int width, int height, int stride)
+{
+    int bar_top = height - UI_MEDIA_CONTROL_BAR_HEIGHT;
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {0, bar_top, width, height - bar_top},
+              PSP_THEME_CHROME_BAR, 4);
+    /* Control legend sits on the darker hint ground, like the page chrome. */
+    fill_rect(pixels, width, height, stride,
+              (UiRect) {0, height - 38, width, 38}, PSP_THEME_HINT_BAR, 3);
+}
+
 static void draw_media_control_bar(
     const PspUiMediaState *media, uint16_t *pixels,
     int width, int height, int stride)
 {
-    uint16_t bar = PSP_THEME_CHROME_BAR;
     uint16_t text = PSP_THEME_TEXT;
     uint16_t muted = PSP_THEME_TEXT_MUTED;
     uint16_t accent = PSP_THEME_ACCENT_EMBER;
-    int bar_top = height - UI_MEDIA_CONTROL_BAR_HEIGHT;
-    fill_rect(pixels, width, height, stride,
-              (UiRect) {0, bar_top, width, height - bar_top}, bar, 4);
-    /* Control legend sits on the darker hint ground, like the page chrome. */
-    fill_rect(pixels, width, height, stride,
-              (UiRect) {0, height - 38, width, 38}, PSP_THEME_HINT_BAR, 3);
+    draw_media_control_bar_ground(pixels, width, height, stride);
     int left = 24, right = width - 24, track_y = height - 69;
     fill_round_rect(pixels, width, height, stride,
                     (UiRect) {left, track_y, right - left, 4}, 2,
@@ -6844,9 +7172,13 @@ void psp_ui_media_composite_controls(
     int width, int height, int stride)
 {
     if (media == NULL || !media->visible || !media->controls_visible
-        || media->resolving || media->failed || pixels == NULL
+        || media->failed || pixels == NULL
         || width <= 0 || height < UI_MEDIA_CONTROL_BAR_HEIGHT
         || stride < width) return;
+    if (media->resolving) {
+        draw_media_control_bar_ground(pixels, width, height, stride);
+        return;
+    }
     draw_media_control_bar(media, pixels, width, height, stride);
 }
 
@@ -6878,6 +7210,14 @@ void psp_ui_media_composite_with_preview(
         width - 46, text, 2, media->title_font, false);
 
     if (media->resolving || media->failed) {
+        if (media->resolving) {
+            /* A decoded frame may already own the 32-bit scanout during
+               Priming. Paint the eventual bar's stable ground now so the
+               loading-to-playing handoff changes controls, not 78 rows of
+               moving picture. */
+            draw_media_control_bar_ground(
+                pixels, width, height, stride);
+        }
         UiRect message = media->failed
             ? media_failed_panel_rect(width, height)
             : (UiRect) {width / 2 - 152, height / 2 - 41, 304, 82};
@@ -6968,7 +7308,9 @@ void psp_ui_media_composite_with_preview(
         return;
     }
 
-    if (media->seek_preview_active) {
+    if (media->seek_preview_active && preview != NULL
+        && preview->pixels != NULL && preview->width > 0
+        && preview->height > 0 && preview->stride >= preview->width) {
         int preview_width = 128;
         int preview_height = UI_MEDIA_PREVIEW_HEIGHT;
         int preview_left = 18;
@@ -6984,19 +7326,15 @@ void psp_ui_media_composite_with_preview(
             pixels, width, height, stride,
             (UiRect) {preview_left, preview_top,
                       preview_width, preview_height}, bar, 6);
-        if (preview != NULL && preview->pixels != NULL
-            && preview->width > 0 && preview->height > 0
-            && preview->stride >= preview->width) {
-            for (int y = 0; y < preview_height; y++) {
-                int source_y = y * preview->height / preview_height;
-                uint16_t *destination = pixels
-                    + (size_t) (preview_top + y) * stride + preview_left;
-                const uint16_t *source = preview->pixels
-                    + (size_t) source_y * preview->stride;
-                for (int x = 0; x < preview_width; x++)
-                    destination[x] =
-                        source[x * preview->width / preview_width];
-            }
+        for (int y = 0; y < preview_height; y++) {
+            int source_y = y * preview->height / preview_height;
+            uint16_t *destination = pixels
+                + (size_t) (preview_top + y) * stride + preview_left;
+            const uint16_t *source = preview->pixels
+                + (size_t) source_y * preview->stride;
+            for (int x = 0; x < preview_width; x++)
+                destination[x] =
+                    source[x * preview->width / preview_width];
         }
         char target[24];
         media_format_time(

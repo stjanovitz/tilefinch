@@ -11,6 +11,10 @@
 #define printf psp_log_printf
 #define PSP_MEDIA_PREVIEW_WIDTH 128
 #define PSP_MEDIA_PREVIEW_HEIGHT 72
+#define PSP_MEDIA_SEEK_PRIME_VIDEO 0x01u
+#define PSP_MEDIA_SEEK_PRIME_AUDIO 0x02u
+#define PSP_MEDIA_SEEK_PRIME_ALL \
+    (PSP_MEDIA_SEEK_PRIME_VIDEO | PSP_MEDIA_SEEK_PRIME_AUDIO)
 
 static bool psp_media_reopen_backward_seek(
     PspMediaSession *media, uint64_t target_us)
@@ -65,8 +69,34 @@ static bool psp_media_reopen_backward_seek(
 bool psp_media_request_seek(PspMediaSession *media,
                                    uint64_t target_us, bool preview)
 {
-    if (media == NULL || media->demux == NULL) return false;
-    if (psp_media_seek_reopens_backend(
+    if (media == NULL
+        || (media->hls == NULL
+            && (media->audio_only
+                ? media->audio_demux == NULL : media->demux == NULL)))
+        return false;
+    /* Scrubbing is a UI transaction, not a decoder transaction. The old path
+       reset both demuxers, fetched a remote thumbnail, then reset them again
+       to restore playback for every settled nub movement. Besides making the
+       nub wait on firmware and Wi-Fi, that churn superseded the same bounded
+       range windows ordinary playback needed. Keep the current picture and
+       move only the target marker; Cross below performs one committed seek. */
+    if (preview) {
+        if (!media->seek_preview_started) {
+            media->seek_preview_started = true;
+            media->seek_preview_was_playing =
+                psp_media_machine_wants_playing(media);
+            media->seek_preview_cancel_pending = false;
+            media->job_restore_us = media->clock_us;
+        }
+        if (!media->machine.preview_active) {
+            psp_media_session_dispatch_event(media, (PspMediaEvent) {
+                .type = PSP_MEDIA_EVENT_PREVIEW_STARTED
+            }, "preview-started");
+        }
+        psp_ui_media_set_seek_preview(&media->ui, target_us);
+        return true;
+    }
+    if (!media->audio_only && psp_media_seek_reopens_backend(
             media->clock_us, target_us, preview)) {
         if (media->last_resume_saved_us == UINT64_MAX)
             media->last_resume_saved_us = 0;
@@ -75,11 +105,7 @@ bool psp_media_request_seek(PspMediaSession *media,
     psp_media_session_dispatch_event(media, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_SEEK
     }, preview ? "preview-seek-request" : "seek-request");
-    if (preview) {
-        psp_media_session_dispatch_event(media, (PspMediaEvent) {
-            .type = PSP_MEDIA_EVENT_PREVIEW_STARTED
-        }, "preview-started");
-    } else if (media->machine.preview_active) {
+    if (media->machine.preview_active) {
         psp_media_session_dispatch_event(media, (PspMediaEvent) {
             .type = PSP_MEDIA_EVENT_PREVIEW_ENDED
         }, "preview-committed");
@@ -91,19 +117,14 @@ bool psp_media_request_seek(PspMediaSession *media,
            decoder's entire lifetime. */
         media->last_resume_saved_us = 0;
     }
-    if (preview && !media->seek_preview_started) {
-        media->seek_preview_started = true;
-        media->seek_preview_was_playing = media->ui.playing;
-        media->seek_preview_cancel_pending = false;
-        media->job_restore_us = media->clock_us;
-    }
     media->job_target_us = target_us;
+    media->job_actual_us = target_us;
+    media->job_prime_audio_us = target_us;
+    media->job_prime_ready_mask = 0;
     psp_media_release_presentation_preroll(media, true);
-    media->job_preview = preview;
-    media->job_resume_playing = preview
-        ? false
-        : (media->seek_preview_started
-            ? media->seek_preview_was_playing : media->ui.playing);
+    media->job_preview = false;
+    media->job_resume_playing = media->seek_preview_started
+        ? media->seek_preview_was_playing : media->ui.playing;
     media->ui.playing = false;
     if (media->playback != NULL)
         media_playback_set_playing(media->playback, false);
@@ -114,7 +135,7 @@ bool psp_media_request_seek(PspMediaSession *media,
     media->job_maximum_unit_us = 0;
     printf("tilefinch-media-job: seek-request preview=%d target=%lluus "
            "resume=%d preview-started=%d phase=%d\n",
-           preview ? 1 : 0, (unsigned long long) target_us,
+           0, (unsigned long long) target_us,
            media->job_resume_playing ? 1 : 0,
            media->seek_preview_started ? 1 : 0,
            (int) media->job_phase);
@@ -136,8 +157,9 @@ static bool psp_media_copy_preview(PspMediaSession *media)
      * picture, kept and shown for the whole of the scrub.
      */
     if (media->frame.slot < 0
-        || !media_psp_backend_borrow_surface(
-               (unsigned) media->frame.slot, media->frame.generation)) {
+        || !media_playback_borrow_video_slot(
+               media->playback, (unsigned) media->frame.slot,
+               media->frame.generation)) {
         /*
          * The picture this session is holding is no longer in that slot.
          *
@@ -158,8 +180,8 @@ static bool psp_media_copy_preview(PspMediaSession *media)
             PSP_MEDIA_PREVIEW_WIDTH * PSP_MEDIA_PREVIEW_HEIGHT,
             sizeof(*media->seek_preview_pixels));
         if (media->seek_preview_pixels == NULL) {
-            media_psp_backend_end_surface_read(
-                (unsigned) media->frame.slot);
+            media_playback_end_auxiliary_video_read(
+                media->playback, (unsigned) media->frame.slot);
             return false;
         }
     }
@@ -185,7 +207,8 @@ static bool psp_media_copy_preview(PspMediaSession *media)
             }
         }
     }
-    media_psp_backend_end_surface_read((unsigned) media->frame.slot);
+    media_playback_end_auxiliary_video_read(
+        media->playback, (unsigned) media->frame.slot);
     return true;
 }
 
@@ -203,6 +226,9 @@ void psp_media_cancel_decode(PspMediaSession *media)
     media->first_frame_opened_us = 0;
     media->first_frame_pump_us = 0;
     media->job_phase = PSP_MEDIA_JOB_NONE;
+    media->job_actual_us = 0;
+    media->job_prime_audio_us = 0;
+    media->job_prime_ready_mask = 0;
     media->job_preview = false;
     media->job_resume_playing = false;
     media->job_resume_open = false;
@@ -239,6 +265,7 @@ bool psp_media_seek_decode_pump(
 {
     if (media == NULL
         || (media->job_phase != PSP_MEDIA_JOB_SEEK_PREPARE
+            && media->job_phase != PSP_MEDIA_JOB_SEEK_PRIME
             && media->job_phase != PSP_MEDIA_JOB_SEEK_DECODE
             && media->job_phase
                  != PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE
@@ -276,6 +303,87 @@ bool psp_media_seek_decode_pump(
         && media->seek_preview_cancel_pending;
     uint64_t target_us =
         restore ? media->job_restore_us : media->job_target_us;
+    if (media->job_phase == PSP_MEDIA_JOB_SEEK_PRIME) {
+        MediaPlaybackSourcePrimeStatus video_status =
+            MEDIA_PLAYBACK_SOURCE_PRIME_READY;
+        MediaPlaybackSourcePrimeStatus audio_status =
+            MEDIA_PLAYBACK_SOURCE_PRIME_READY;
+        if (!media->audio_only && (media->job_prime_ready_mask
+                & PSP_MEDIA_SEEK_PRIME_VIDEO) == 0) {
+            video_status = media_playback_prime_video_source(
+                media->playback, target_us, NULL, error, sizeof(error));
+            if (video_status == MEDIA_PLAYBACK_SOURCE_PRIME_READY)
+                media->job_prime_ready_mask |= PSP_MEDIA_SEEK_PRIME_VIDEO;
+        }
+        if ((media->job_prime_ready_mask
+                & PSP_MEDIA_SEEK_PRIME_AUDIO) == 0) {
+            audio_status = media_playback_prime_audio_source(
+                media->playback, target_us,
+                &media->job_prime_audio_us, error, sizeof(error));
+            if (audio_status == MEDIA_PLAYBACK_SOURCE_PRIME_READY)
+                media->job_prime_ready_mask |= PSP_MEDIA_SEEK_PRIME_AUDIO;
+        }
+        if (video_status == MEDIA_PLAYBACK_SOURCE_PRIME_FAILED
+            || audio_status == MEDIA_PLAYBACK_SOURCE_PRIME_FAILED) {
+            if (psp_media_retry_delivery_failure(
+                    media, "seek-prime", error, false)) return true;
+            if (psp_media_retry_240p(
+                    media, "seek-prime", error, false)) return true;
+            psp_media_job_failed(
+                media, "seek prime",
+                error[0] == '\0' ? "SEEK SOURCE COULD NOT PRIME" : error);
+            return true;
+        }
+        uint8_t required_ready = media->audio_only
+            ? PSP_MEDIA_SEEK_PRIME_AUDIO : PSP_MEDIA_SEEK_PRIME_ALL;
+        if ((media->job_prime_ready_mask & required_ready)
+                != required_ready) {
+            return true;
+        }
+
+        bool resume_open = media->job_resume_open;
+        media->job_resume_open = false;
+        /* AAC frames are independent and the first retained frame is at or
+           just after the requested time. Adopt it when it is close enough so
+           the later DAC cursor cannot introduce a visible clock step. */
+        uint64_t release_clock_us = target_us;
+        if (media_playback_has_audio(media->playback)
+            && media->job_prime_audio_us >= target_us
+            && media->job_prime_audio_us - target_us <= UINT64_C(50000)) {
+            release_clock_us = media->job_prime_audio_us;
+        }
+        media->clock_us = release_clock_us;
+        media->presentation_floor_us = target_us;
+        media->presentation_preroll_startup = false;
+        media->job_phase = PSP_MEDIA_JOB_NONE;
+        media->job_preview = false;
+        media->seek_preview_started = false;
+        bool playing = media->job_resume_playing;
+        media->ui.playing = playing;
+        media_playback_set_playing(media->playback, playing);
+        psp_ui_media_set(
+            &media->ui, true, playing, false, release_clock_us,
+            psp_media_duration_us(media), media->stream.title);
+        if (!resume_open || media->reopen_seek_completion_pending) {
+            media->seek_completions++;
+            media->reopen_seek_completion_pending = false;
+        }
+        printf("tilefinch-media-job: %s at=%lluus actual=%lluus "
+               "clock=%lluus playing=%d sources-ready=%u audio-held=%d "
+               "elapsed=%lluus\n",
+               resume_open ? "resume-open" : "seek-complete",
+               (unsigned long long) target_us,
+               (unsigned long long) media->job_actual_us,
+               (unsigned long long) release_clock_us, playing ? 1 : 0,
+               (unsigned) media->job_prime_ready_mask,
+               media->presentation_preroll_audio_held ? 1 : 0,
+               (unsigned long long) (
+                   psp_media_internal_now_us(media) - media->job_started_us));
+        media->job_started_us = 0;
+        media->job_units = 0;
+        media->job_maximum_unit_us = 0;
+        return true;
+    }
     if (media->job_phase == PSP_MEDIA_JOB_SEEK_PREPARE
         || media->job_phase
              == PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE) {
@@ -330,64 +438,18 @@ bool psp_media_seek_decode_pump(
                (unsigned long long) actual_us,
                media->job_resume_playing ? 1 : 0);
         if (!decodes_to_the_target) {
-            bool resume_open = media->job_resume_open;
-            media->job_resume_open = false;
-            /*
-             * Pay the video connection's handshake here, not on the first
-             * playing frame. A long think-time between open and the play press
-             * closes the connection the open warmed, so the first video window
-             * fetch re-handshakes -- a device cycle measured that at 497ms,
-             * landing as one 484ms playing hitch, while audio (whose window was
-             * already in flight) stayed at zero. Warm video the same way,
-             * under this job's wait budget and its loading UI, so the fetch the
-             * first playing frame makes hits a warm connection and a cached
-             * window. Best effort: if it would block or the sample is too
-             * large, playback makes the connection as it did before -- which
-             * is also what makes this safe on a seek, where the budget is the
-             * five seconds the decode leg used to spend failing.
-             */
-            if (resume_open) psp_media_open_arm_wait_budget(media);
-            else psp_media_seek_arm_wait_budget(media);
-            bool video_warmed = media_playback_warm_video(
-                media->playback, target_us, error, sizeof(error));
-            /* And audio, at the position the reset left it -- the keyframe,
-               not the request. Warming only video left the audio window to be
-               fetched at a far offset on a connection with nothing left to
-               burst with: 16 KiB in six seconds, video held back to keep the
-               interleave, and the session gone. Audio is a tenth of the
-               bitrate and the first thing playback runs out of. */
-            bool audio_warmed = media_playback_warm_audio(
-                media->playback, actual_us, error, sizeof(error));
-            psp_media_open_clear_wait_budget(media);
+            /* A committed seek is complete only after both source windows it
+               will actually consume are resident. This is a cooperative job:
+               each subsequent frame pumps the ranges and polls these two
+               facts, rather than blocking the browser thread or declaring
+               success after warming the preceding audio keyframe. */
             media->clock_us = target_us;
             media->presentation_floor_us = target_us;
             media->presentation_preroll_startup = false;
-            media->job_phase = PSP_MEDIA_JOB_NONE;
-            media->job_preview = false;
-            media->seek_preview_started = false;
-            bool playing = media->job_resume_playing;
-            media->ui.playing = playing;
-            media_playback_set_playing(media->playback, playing);
-            psp_ui_media_set(
-                &media->ui, true, playing, false, target_us,
-                psp_media_duration_us(media), media->stream.title);
-            if (!resume_open || media->reopen_seek_completion_pending) {
-                media->seek_completions++;
-                media->reopen_seek_completion_pending = false;
-            }
-            printf("tilefinch-media-job: %s at=%lluus actual=%lluus "
-                   "playing=%d decode-leg=skipped video-warmed=%d "
-                   "audio-warmed=%d audio-held=%d elapsed=%lluus\n",
-                   resume_open ? "resume-open" : "seek-complete",
-                   (unsigned long long) target_us,
-                   (unsigned long long) actual_us, playing ? 1 : 0,
-                   video_warmed ? 1 : 0, audio_warmed ? 1 : 0,
-                   media->presentation_preroll_audio_held ? 1 : 0,
-                   (unsigned long long) (
-                       psp_media_internal_now_us(media) - media->job_started_us));
-            media->job_started_us = 0;
-            media->job_units = 0;
-            media->job_maximum_unit_us = 0;
+            media->job_actual_us = actual_us;
+            media->job_prime_audio_us = target_us;
+            media->job_prime_ready_mask = 0;
+            media->job_phase = PSP_MEDIA_JOB_SEEK_PRIME;
             return true;
         }
         /*

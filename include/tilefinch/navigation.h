@@ -7,6 +7,7 @@
 
 #include "tilefinch/budget.h"
 #include "tilefinch/document.h"
+#include "tilefinch/reader_mode.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/font.h"
 #include "tilefinch/layout.h"
@@ -115,6 +116,7 @@ typedef struct {
 
 typedef struct {
     PocDocument document;
+    ReaderDocumentAnalysis reader_analysis;
     Stylesheet stylesheet;
     StylesheetDocumentResources stylesheet_resources;
     ExternalStylesheetStats external_stylesheets;
@@ -133,11 +135,15 @@ typedef struct {
     ScriptResult script_result;
     FetchSchedulerDomain *fetch_domain;
     FetchScheduler *resource_scheduler;
-    /* Lab experiment: the useful first frame is committed with its
-       above-the-fold images, then one quota-bounded stateless continuation
-       resumes from the current document during an owner idle tick. No
-       candidate-page pointers are retained across commit relocation. */
+    /* Optional visual resources continue only from owner idle ticks. The
+       legacy full-document continuation is stateless; simple static pages
+       additionally retain a bounded viewport-ordered document-image queue
+       whose one active request is externally pumped. */
     bool image_continuation_pending;
+    ImagePriorityTarget *deferred_image_targets;
+    size_t deferred_image_count;
+    size_t deferred_image_cursor;
+    ImagePriorityLoadJob *deferred_image_job;
     bool loaded;
     NavigationFrame frames[NAVIGATION_FRAME_LIMIT];
     size_t frame_count;
@@ -516,6 +522,12 @@ struct NavigationSession {
     size_t script_module_map_hits;
     size_t script_inline_data_fast_paths;
     size_t script_inline_data_fast_path_bytes;
+    size_t script_inline_data_quota_exemptions;
+    size_t script_cost_class_rejections;
+    size_t script_watchdog_classification_misses;
+    size_t script_watchdog_classification_miss_bytes;
+    size_t script_watchdog_classification_miss_loops;
+    unsigned script_watchdog_classification_miss_flags;
     size_t preloads_discovered;
     size_t preloads_launched;
     size_t preloads_completed;
@@ -573,6 +585,9 @@ struct NavigationSession {
     NavigationProgressivePaintCallback progressive_paint;
     void *progressive_paint_opaque;
     bool progressive_paint_preserves_incumbent;
+    /* Prepare content-shape Reader markers on a completed candidate DOM
+       before its first authoritative stylesheet/layout pass. */
+    bool prepare_reader_candidates;
     uint64_t navigation_started_us;
     NavigationReplacementMode replacement_mode;
     NavigationReplacementFreezeCallback replacement_freeze;
@@ -727,6 +742,8 @@ void navigation_enable_web_fonts(
     size_t maximum_face_backend_bytes, long timeout_ms);
 bool navigation_set_user_css(NavigationSession *session, const char *css,
                              size_t length);
+void navigation_set_reader_candidate_mode(NavigationSession *session,
+                                          bool enabled);
 /* Rebuilds user presentation CSS into staged stylesheet/layout values and
    adopts them only after every fallible step succeeds. */
 bool navigation_apply_user_css(NavigationSession *session, const char *css,
@@ -835,13 +852,12 @@ bool navigation_set_scroll(NavigationSession *session, int scroll_y);
 bool navigation_advance_runtime(NavigationSession *session,
                                 unsigned elapsed_ms,
                                 size_t callback_budget);
-/* Runs the quota-bounded stateless image continuation. The experimental
-   continuation is enabled only by the lab environment and never retains
-   candidate-session addresses. It preserves the synchronous loader's exact
-   discovery semantics, but is not yet an idle-latency slice: a slow stage is
-   bounded by the image progress and page-resource deadlines. A successful
-   continuation may replace the current layout; owners should refresh their
-   render shell when relayout counters change. */
+/* Runs one bounded background-resource unit. Simple static pages admit one
+   viewport-ranked document image, pump transport without waiting, or consume
+   one completed decode; the legacy full-document continuation remains a
+   lab-only compatibility experiment. A completed resource may replace the
+   current layout, so owners refresh their render shell when relayout counters
+   change. */
 bool navigation_run_background_resources(NavigationSession *session);
 bool navigation_background_resources_pending(
     const NavigationSession *session);

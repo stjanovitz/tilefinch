@@ -137,7 +137,11 @@ top of the installed `2 × P` footprint.
 Optional components are siblings of the browser slots so A/B browser updates
 neither duplicate nor delete them. Voice uses `components/voice-en-us/`;
 glyph packs use `components/glyph-ja/`, `glyph-zh-hans/`, `glyph-zh-hant/`,
-`glyph-ko/`, and `glyph-emoji-color/`.
+`glyph-ko/`, `glyph-emoji-color/`, `glyph-cyrillic/`, and
+`glyph-latin-extended/`. A user-built video decoder uses `components/swdec/`
+and contains exactly `tilefinch-swdec.prx`, `swdec-meload.prx`, and the small
+`component-info.txt` ABI record. Tilefinch never writes or updates those
+three files; the user replaces them together after a decoder-ABI change.
 
 Each glyph directory has bounded `candidate.tmp`, `active`, and `previous`
 generations. A completed generation contains `pack.tfgf`, the verified signed
@@ -150,9 +154,13 @@ is the only operation that clears it.
 TFGF files are capped at 32 MB, although the published regional packs are
 expected around 1 MB and color emoji around 5 MB. With Embedded selected,
 Tilefinch performs no glyph-component storage I/O at boot. A selected pack's
-signed identity and bounded index are read once; page rendering queues cache
-misses and the app pump reads at most one 16 KiB block per call. This runtime
-path never writes. Install/update uses the shared
+signed identity and bounded index are read once. The existing parser text pass
+records script-range hints; if a page needs another installed language pack,
+the app verifies and attaches at most one candidate per frame, with no more
+than two lazy additions and four attached packs total (selected language,
+emoji, and the additions). Page rendering queues cache misses and the app pump
+reads at most one 16 KiB block per call. This runtime path never writes.
+Install/update uses the shared
 `data/update/glyph-component.part`, removes it after completion/cancel/failure,
 and preflights the signed download and candidate space through the PSP-safe
 free-space helper.

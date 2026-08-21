@@ -304,7 +304,7 @@ static PspMediaScaleMap psp_media_scale_map;
    decoder has not replaced is not re-presented into a buffer that already
    shows it. See psp_media_present_skip_allowed for the three conditions. */
 static PspMediaPresentRecord
-    psp_media_present_records[PSP_DISPLAY_BUFFER_COUNT];
+    psp_media_present_records[PSP_DISPLAY_VIDEO_BUFFER_COUNT];
 /* Only so the mode line is printed once rather than once a frame. */
 static int psp_media_present_reported_mode = -1;
 static uint64_t psp_media_present_reported_generation;
@@ -314,7 +314,7 @@ static int psp_media_present_reported_height;
 void psp_media_present_forget_buffers(void)
 {
     psp_media_present_records_reset(
-        psp_media_present_records, PSP_DISPLAY_BUFFER_COUNT);
+        psp_media_present_records, PSP_DISPLAY_VIDEO_BUFFER_COUNT);
 }
 
 /*
@@ -350,9 +350,13 @@ typedef struct {
     uint32_t compose_over_16ms;
     uint32_t compose_over_33ms;
     uint64_t cursor_sample_pending_us;
+    uint64_t cursor_sample_previous_us;
+    uint64_t cursor_sample_interval_total_us;
+    uint64_t cursor_sample_interval_max_us;
     uint64_t cursor_latency_total_us;
     uint64_t cursor_latency_max_us;
     uint32_t cursor_samples;
+    uint32_t cursor_sample_intervals;
     uint32_t cursor_presentations;
     uint32_t cursor_coalesced_samples;
     uint32_t cursor_over_33ms;
@@ -403,6 +407,15 @@ void psp_report_presentation_cadence(const char *phase)
         (unsigned long long) metrics->cursor_latency_max_us,
         metrics->cursor_over_33ms);
     printf(
+        "tilefinch-cursor-cadence: phase=%s intervals=%lu "
+        "average=%lluus max=%lluus\n",
+        phase == NULL ? "unknown" : phase,
+        (unsigned long) metrics->cursor_sample_intervals,
+        (unsigned long long) (metrics->cursor_sample_intervals == 0 ? 0
+            : metrics->cursor_sample_interval_total_us
+                / metrics->cursor_sample_intervals),
+        (unsigned long long) metrics->cursor_sample_interval_max_us);
+    printf(
         "tilefinch-video-scanout: phase=%s intervals=%lu "
         "average=%lluus max=%lluus "
         "buckets-le20-le28-le36-le45-le67-le100-le250-gt250="
@@ -426,6 +439,14 @@ void psp_report_presentation_cadence(const char *phase)
 void psp_cursor_latency_sample(uint64_t sampled_us)
 {
     PspPresentationCadence *metrics = &psp_presentation_cadence;
+    if (metrics->cursor_sample_previous_us != 0) {
+        uint64_t interval_us = sampled_us - metrics->cursor_sample_previous_us;
+        metrics->cursor_sample_intervals++;
+        metrics->cursor_sample_interval_total_us += interval_us;
+        if (interval_us > metrics->cursor_sample_interval_max_us)
+            metrics->cursor_sample_interval_max_us = interval_us;
+    }
+    metrics->cursor_sample_previous_us = sampled_us;
     metrics->cursor_samples++;
     if (metrics->cursor_sample_pending_us == 0) {
         metrics->cursor_sample_pending_us = sampled_us;
@@ -752,11 +773,14 @@ static bool psp_present_media_frame(
      * left to draw.
      */
     if (frame->slot >= 0
-        && !media_psp_backend_borrow_surface(
-               (unsigned) frame->slot, frame->generation)) return false;
+        && (psp_active_media == NULL
+            || !media_playback_borrow_video_slot(
+                psp_active_media->playback, (unsigned) frame->slot,
+                frame->generation))) return false;
     bool scaled = psp_media_present_software(&plan, frame, vram);
     if (frame->slot >= 0)
-        media_psp_backend_release_surface((unsigned) frame->slot);
+        media_playback_release_video_read(
+            psp_active_media->playback, (unsigned) frame->slot);
     if (!scaled) return false;
     psp_media_fill_bands(vram, &plan);
     psp_media_present_report(mode, reason, frame, &plan, NULL);
@@ -764,8 +788,9 @@ static bool psp_present_media_frame(
     psp_media_present_account(
         record, frame, &plan, generation, started_us, &cost, false,
         chrome_paints);
-    media_psp_backend_note_frame_displayed(
-        frame, MEDIA_PSP_PRESENT_PATH_SOFTWARE);
+    media_playback_note_frame_displayed(
+        psp_active_media->playback, frame,
+        MEDIA_PSP_PRESENT_PATH_SOFTWARE);
     return true;
 }
 
@@ -801,8 +826,9 @@ static bool psp_present_media_frame_video_strips(
     uint32_t *staging = psp_display_video_texture(&psp_display);
     if (staging == NULL
         || psp_media_present_ge_stage_dma_quarantine_holds_staging(staging)
-        || !media_psp_backend_borrow_surface(
-               (unsigned) frame->slot, frame->generation))
+        || !media_playback_borrow_video_slot(
+               psp_active_media->playback, (unsigned) frame->slot,
+               frame->generation))
         return false;
 
     bool succeeded = false;
@@ -846,7 +872,8 @@ static bool psp_present_media_frame_video_strips(
 
 finished:
     psp_active_media->present_texture_staged = false;
-    media_psp_backend_release_surface((unsigned) frame->slot);
+    media_playback_release_video_read(
+        psp_active_media->playback, (unsigned) frame->slot);
     if (!succeeded) return false;
 
     psp_active_media->present_stage_frames++;
@@ -866,8 +893,9 @@ finished:
     psp_media_present_account(
         record, frame, full, generation, started_us, cost, true,
         chrome_paints);
-    media_psp_backend_note_frame_displayed(
-        frame, MEDIA_PSP_PRESENT_PATH_GE_STRIPS);
+    media_playback_note_frame_displayed(
+        psp_active_media->playback, frame,
+        MEDIA_PSP_PRESENT_PATH_GE_STRIPS);
     return true;
 }
 
@@ -952,8 +980,9 @@ static bool psp_present_media_frame_video(
         chrome_paints);
     /* The picture is on the screen. This is the only milestone that says so:
        everything upstream reports ownership changing hands. */
-    media_psp_backend_note_frame_displayed(
-        frame,
+    if (psp_active_media != NULL)
+        media_playback_note_frame_displayed(
+        psp_active_media->playback, frame,
         texture.staged ? MEDIA_PSP_PRESENT_PATH_GE_STAGED
                        : MEDIA_PSP_PRESENT_PATH_GE_DIRECT);
     return true;
@@ -1064,6 +1093,7 @@ static bool psp_media_seek_holds_scanout(const PspMediaSession *media)
     if (media == NULL || media->job_resume_open) return false;
     switch (media->job_phase) {
     case PSP_MEDIA_JOB_SEEK_PREPARE:
+    case PSP_MEDIA_JOB_SEEK_PRIME:
     case PSP_MEDIA_JOB_SEEK_DECODE:
     case PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE:
     case PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE:
@@ -1638,6 +1668,12 @@ bool psp_power_auto_start(
 void psp_present(const uint16_t *frame, const PspUiState *ui)
 {
     (void) psp_present_internal(frame, ui, true);
+}
+
+bool psp_present_cursor_feedback(
+    const uint16_t *frame, const PspUiState *ui)
+{
+    return psp_present_internal(frame, ui, true);
 }
 
 void psp_present_supervisor_ui(const uint16_t *frame,

@@ -19,14 +19,12 @@ typedef bool (*MediaHttpUrlValidator)(const char *url);
 
 typedef struct {
     size_t cache_bytes;
-    /*
-     * Optional second owned window. Once a sequential readahead lands it is
-     * moved here, allowing the transport to start the following window while
-     * playback is still consuming the active one. Zero keeps the historical
-     * active+in-flight shape. Allocation failure is non-fatal and degrades to
-     * that shape; callers use this only for the lower-bitrate video track.
-     */
+    /* Optional owned successor windows. Allocation stops at the first budget
+       refusal and the admitted prefix remains fully functional. Windows above
+       the initial depth are admitted lazily when the runtime limit is raised. */
     unsigned lookahead_windows;
+    /* Initial speculative successor depth. Zero means every admitted slot. */
+    unsigned initial_lookahead_windows;
     /* Scheduler-side publication quantum for streamed successors. Zero uses
        16 KiB. Native media chooses that latency-oriented value explicitly;
        deterministic replay can raise it to the transport's ordinary 48 KiB
@@ -44,6 +42,15 @@ typedef struct {
      */
     long connect_timeout_ms;
     const char *referer;
+    /* Ordinary HTML media uses the HTTP Range header. Provider streams keep
+       the historical query-range form because that is the URL they sign. */
+    bool standard_range_header;
+    /* When non-NULL, build every range through the page request-authority
+       boundary. The prepared envelope is retained by the range object, not
+       rebuilt on the playback hot path. */
+    const TilefinchRequestContext *page_request_context;
+    const char *referrer_policy;
+    const struct TilefinchContentSecurityPolicy *content_security_policy;
     /*
      * Optional trust-boundary check applied both to the requested URL and
      * the final effective URL after redirects. A rejected response never
@@ -115,15 +122,15 @@ typedef struct {
     long last_http_status;
     uint64_t last_first_byte;
     uint64_t last_last_byte;
-    /* Windows abandoned and re-issued because the transfer had slowed to a
-       rate no stream can play at. Appended. */
+    /* Windows abandoned and re-issued because a demanded transfer stopped
+       making byte progress. Appended. */
     size_t reconnects;
     /* Subset taken only after the decoder was already waiting and the
        transfer made no byte progress for the short starvation bound. */
     size_t starved_reconnects;
     /* A candidate which made no useful progress across every bounded fresh
-       connection allowance. The session may replace its signed URL once;
-       ordinary slow-but-progressing Wi-Fi never sets this field. */
+       connection allowance. This is terminal for the demanded window: it is
+       never reported while that same request remains pending. */
     size_t stalled_reconnect_exhaustions;
     bool delivery_stalled;
     size_t minimum_sustained_bytes_per_second;
@@ -172,6 +179,7 @@ typedef struct {
     size_t cache_length;
     size_t cache_consumed;
     unsigned lookahead_slots;
+    unsigned lookahead_fetch_limit;
     bool aggressive_readahead;
     uint64_t fill_offset;
     size_t fill_length;
@@ -179,80 +187,122 @@ typedef struct {
     size_t last_read_length;
 } MediaHttpRangeStats;
 
-/*
- * When a window still on the wire has stopped being worth waiting for.
- *
- * A far-offset window on a connection whose CDN burst allowance is spent does
- * not fail -- it trickles. A device soak measured an audio window moving about
- * 16 KiB in six seconds at 168s into a stream, which is a 256 KiB window
- * sixteen seconds away while the media clock needs it in four; playback held
- * video back to keep the interleave and the whole session died on a watchdog
- * that was, for once, correct. The remedy is a new connection, which gets a
- * new burst -- but only for a transfer that has actually stopped delivering.
- *
- * Device evidence also showed that a two-second/24 KiB/s verdict was too
- * aggressive for the PSP's bursty Wi-Fi: it replaced 17 otherwise progressing
- * windows in one 120-second run, paying a handshake each time, before the
- * replacement sockets failed. Four seconds still caused seven replacements
- * per source on a run that otherwise finished; an eight-second observation
- * spans the PSP Wi-Fi burst cycle and amortizes a one-second TLS handshake.
- * The floor remains below either admitted stream's average rate. The measured
- * dead connection (16 KiB in six seconds, about 2.7 KiB/s) still fails this
- * test decisively.
- */
+/* The throughput floor/window remain diagnostic values reported with the
+   selected track. They never discard useful bytes: liveness below is based
+   only on no byte progress and an absolute demanded-window deadline. */
 #define MEDIA_HTTP_TRICKLE_FLOOR_BYTES_PER_SECOND 8192u
 #define MEDIA_HTTP_TRICKLE_WINDOW_US 8000000u
-/* Playback is already visibly blocked in this case, so waiting for the
-   conservative background-rate verdict only extends the outage. */
+/* Playback is already visibly blocked in this case, so the first fresh
+   connection should be tried promptly. Later attempts back off: repeatedly
+   tearing down a radio path during a longer association or CDN outage can
+   prevent the very recovery playback is waiting for. */
 #define MEDIA_HTTP_STARVED_NO_PROGRESS_US 2000000u
 /* Enough to survive a CDN that paces the first replacement too, and few
    enough that a dead link still reaches the caller's watchdog on schedule. */
 #define MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS 3u
+/* One byte cannot keep an incident alive forever. This deadline begins when
+   playback first demands the window and spans every fresh-connection retry.
+   Slow but useful Wi-Fi keeps its bytes and may complete within the bound. */
+#define MEDIA_HTTP_DEMANDED_WINDOW_DEADLINE_US 30000000u
 
-static inline bool media_http_range_trickling(
-    size_t gained_bytes, uint64_t elapsed_us)
+static inline uint64_t media_http_window_reconnect_delay_us(
+    unsigned reconnects)
 {
-    if (elapsed_us < MEDIA_HTTP_TRICKLE_WINDOW_US) return false;
-    uint64_t floor_bytes =
-        (uint64_t) MEDIA_HTTP_TRICKLE_FLOOR_BYTES_PER_SECOND
-        * elapsed_us / UINT64_C(1000000);
-    return (uint64_t) gained_bytes < floor_bytes;
+    /* Three attempts at 2, 4 and 8 seconds without progress. Once they are
+       spent, retain the last request until the incident's absolute deadline;
+       useful bytes can still recover it, while one-byte trickles cannot keep
+       it alive forever. */
+    if (reconnects >= MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS)
+        return UINT64_MAX;
+    return (uint64_t) MEDIA_HTTP_STARVED_NO_PROGRESS_US << reconnects;
 }
 
-static inline bool media_http_range_trickling_at_rate(
-    size_t gained_bytes, uint64_t elapsed_us, size_t floor_bytes_per_second)
+typedef enum {
+    MEDIA_HTTP_WINDOW_WAIT = 0,
+    MEDIA_HTTP_WINDOW_RECONNECT,
+    MEDIA_HTTP_WINDOW_FAIL
+} MediaHttpWindowLivenessAction;
+
+/* Transport-independent state for one logical demanded range window. Tests
+   feed this tracker synthetic clocks and byte counts; the HTTP implementation
+   feeds it the same observations from curl. It deliberately owns no request
+   handle and performs no I/O. */
+typedef struct {
+    uint64_t demanded_started_us;
+    uint64_t last_progress_us;
+    size_t last_progress_bytes;
+    unsigned reconnects;
+    bool demanded;
+} MediaHttpWindowTracker;
+
+/* Pure form of the demanded-window liveness policy used by the range source
+   and its deterministic fault tests. The incident deadline is deliberately
+   independent of byte progress so a one-byte trickle cannot evade the bound. */
+static inline MediaHttpWindowLivenessAction media_http_window_liveness(
+    bool complete, bool demanded, uint64_t no_progress_us,
+    uint64_t demanded_us, unsigned reconnects)
 {
-    if (elapsed_us < MEDIA_HTTP_TRICKLE_WINDOW_US) return false;
-    if (floor_bytes_per_second < MEDIA_HTTP_TRICKLE_FLOOR_BYTES_PER_SECOND)
-        floor_bytes_per_second = MEDIA_HTTP_TRICKLE_FLOOR_BYTES_PER_SECOND;
-    uint64_t floor_bytes = (uint64_t) floor_bytes_per_second
-        * elapsed_us / UINT64_C(1000000);
-    return (uint64_t) gained_bytes < floor_bytes;
+    if (complete || !demanded) return MEDIA_HTTP_WINDOW_WAIT;
+    if (demanded_us >= MEDIA_HTTP_DEMANDED_WINDOW_DEADLINE_US) {
+        return MEDIA_HTTP_WINDOW_FAIL;
+    }
+    if (no_progress_us
+        >= media_http_window_reconnect_delay_us(reconnects))
+        return MEDIA_HTTP_WINDOW_RECONNECT;
+    return MEDIA_HTTP_WINDOW_WAIT;
 }
 
-/* A completed response is retained data, not a connection which has stopped
-   making progress. Keeping this decision pure makes the eight-second device
-   policy testable without an eight-second host test. */
-static inline bool media_http_range_should_reconnect(
-    bool complete, size_t gained_bytes, uint64_t elapsed_us)
+static inline void media_http_window_tracker_reset(
+    MediaHttpWindowTracker *tracker)
 {
-    return !complete
-        && media_http_range_trickling(gained_bytes, elapsed_us);
+    if (tracker == NULL) return;
+    *tracker = (MediaHttpWindowTracker) {0};
 }
 
-static inline bool media_http_range_should_reconnect_at_rate(
-    bool complete, size_t gained_bytes, uint64_t elapsed_us,
-    size_t floor_bytes_per_second)
+static inline void media_http_window_tracker_request_started(
+    MediaHttpWindowTracker *tracker, uint64_t now_us)
 {
-    return !complete && media_http_range_trickling_at_rate(
-        gained_bytes, elapsed_us, floor_bytes_per_second);
+    if (tracker == NULL) return;
+    tracker->last_progress_us = now_us;
+    tracker->last_progress_bytes = 0;
 }
 
-static inline bool media_http_range_should_reconnect_starved(
-    bool complete, bool starved, uint64_t no_progress_us)
+static inline void media_http_window_tracker_demand(
+    MediaHttpWindowTracker *tracker, uint64_t now_us)
 {
-    return !complete && starved
-        && no_progress_us >= MEDIA_HTTP_STARVED_NO_PROGRESS_US;
+    if (tracker == NULL || tracker->demanded) return;
+    tracker->demanded = true;
+    tracker->demanded_started_us = now_us;
+}
+
+static inline void media_http_window_tracker_reconnected(
+    MediaHttpWindowTracker *tracker)
+{
+    if (tracker != NULL && tracker->reconnects != UINT32_MAX)
+        tracker->reconnects++;
+}
+
+static inline MediaHttpWindowLivenessAction
+media_http_window_tracker_observe(
+    MediaHttpWindowTracker *tracker, uint64_t now_us,
+    size_t received_bytes, bool complete, bool request_active)
+{
+    if (tracker == NULL) return MEDIA_HTTP_WINDOW_FAIL;
+    if (request_active
+        && received_bytes > tracker->last_progress_bytes) {
+        tracker->last_progress_bytes = received_bytes;
+        tracker->last_progress_us = now_us;
+    }
+    uint64_t no_progress_us = request_active
+        && now_us > tracker->last_progress_us
+        ? now_us - tracker->last_progress_us : 0;
+    uint64_t demanded_us = tracker->demanded
+        && now_us > tracker->demanded_started_us
+        ? now_us - tracker->demanded_started_us : 0;
+    return media_http_window_liveness(
+        complete, tracker->demanded,
+        request_active ? no_progress_us : 0,
+        demanded_us, tracker->reconnects);
 }
 
 typedef struct MediaHttpRange MediaHttpRange;
@@ -271,6 +321,12 @@ typedef enum {
 bool media_http_build_range_url(
     const char *url, uint64_t first_byte, uint64_t last_byte,
     char *output, size_t output_size);
+bool media_http_build_range_header(
+    uint64_t first_byte, uint64_t last_byte,
+    char *output, size_t output_size);
+bool media_http_parse_content_range(
+    const char *value, uint64_t expected_first, uint64_t expected_last,
+    size_t body_length, uint64_t *complete_length);
 
 /*
  * A single-window, bounded HTTP range source. The cache is deliberately
@@ -319,6 +375,12 @@ MediaHttpRangePrimeStatus media_http_range_prime_successor(
    conservative quarter-window rule until callers opt in. */
 void media_http_range_set_aggressive_readahead(
     MediaHttpRange *range, bool enabled);
+/* Bound speculative successor requests independently of buffers already
+   admitted. Reducing the limit retains completed bytes. Increasing it first
+   tries any optional lazy allocation, then may start the next sequential
+   window; allocation refusal leaves the lower depth operational. */
+void media_http_range_set_lookahead_limit(
+    MediaHttpRange *range, unsigned windows);
 /*
  * Bound every blocking read this source performs from now on to `budget_us`
  * of wall clock, shared across all of them.
@@ -344,10 +406,10 @@ void media_http_range_set_wait_budget_us(
 void media_http_range_clear_wait_budget(MediaHttpRange *range);
 bool media_http_range_stats(const MediaHttpRange *range,
                             MediaHttpRangeStats *stats);
-/* Conservative duration represented by unread bytes in the installed
-   bounded cache window plus a complete contiguous readahead window waiting
-   in the scheduler. This average-bitrate estimate is for buffering UI
-   hysteresis only; demux and presentation never depend on it. */
+/* Conservative duration represented by unread bytes in the installed cache,
+   its bounded contiguous successor windows, and a complete sequential result
+   waiting in the scheduler. This average-bitrate estimate is for buffering
+   UI hysteresis only; demux and presentation never depend on it. */
 uint64_t media_http_range_buffered_ahead_us(
     const MediaHttpRange *range, uint64_t duration_us);
 void media_http_range_destroy(MediaHttpRange *range);

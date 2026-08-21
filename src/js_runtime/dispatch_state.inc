@@ -94,9 +94,10 @@ bool script_runtime_dispatch_pointer_node(
     int client_x, int client_y, int offset_x, int offset_y,
     unsigned buttons, ScriptResult *result)
 {
-    if (runtime == NULL || node == NULL) return false;
-    int64_t handle = js_rt_bridge_register_node(&runtime->bridge, node);
-    if (handle == 0) return false;
+    if (runtime == NULL || (node == NULL && phase != 1u)) return false;
+    int64_t handle = node == NULL
+        ? 0 : js_rt_bridge_register_node(&runtime->bridge, node);
+    if (node != NULL && handle == 0) return false;
     js_rt_runtime_arm_watchdog(runtime);
     JSValue arguments[7] = {
         JS_NewInt64(runtime->context, handle),
@@ -235,6 +236,8 @@ bool script_runtime_consume_media_request(ScriptRuntime *runtime,
     request->command = runtime->bridge.media_command;
     request->node_handle = runtime->bridge.media_node_handle;
     request->value = runtime->bridge.media_value;
+    request->mode = runtime->bridge.media_mode;
+    request->credentials = runtime->bridge.media_credentials;
     if (runtime->bridge.media_source != NULL) {
         snprintf(request->source, sizeof(request->source), "%s",
                  runtime->bridge.media_source);
@@ -248,18 +251,24 @@ bool script_runtime_consume_media_request(ScriptRuntime *runtime,
 }
 
 static const char media_update_bootstrap[] =
-    "(function(handle,nativeState,currentTime,"
-    "duration){const node=globalThis.__tilefinchActiveMediaNode,state="
-    "globalThis.__tilefinchActiveMediaState;"
-    "if(!(node instanceof HTMLMediaElement)||node.__handle!==handle||!state)"
+    "(function(stateFor,wrap){return function(handle,nativeState,currentTime,"
+    "duration){const node=wrap(handle),state=stateFor(node);"
+    "if(!(node instanceof HTMLMediaElement)||!state)"
     "return false;const previousPaused=state.paused,"
-    "previousReady=state.readyState;state.currentTime=Number(currentTime)||0;"
+    "previousReady=state.readyState,previousSeeking=state.seeking,"
+    "previousEnded=state.ended,previousNative=state.nativeState,"
+    "previousNetwork=state.networkState;"
+    "state.nativeState=nativeState;"
+    "state.currentTime=Number(currentTime)||0;"
     "state.duration=Number.isFinite(Number(duration))?Number(duration):NaN;"
-    "state.seeking=false;if(nativeState===0){state.networkState="
-    "HTMLMediaElement.NETWORK_LOADING}else if(nativeState===4){"
+    "if(nativeState===0){state.networkState=HTMLMediaElement.NETWORK_LOADING;"
+    "if(!previousPaused&&previousNetwork!==HTMLMediaElement.NETWORK_LOADING)"
+    "node.dispatchEvent(new Event("
+    "'waiting'));return true}state.seeking=false;if(nativeState===4){"
     "state.networkState=HTMLMediaElement.NETWORK_NO_SOURCE;state.readyState="
     "HTMLMediaElement.HAVE_NOTHING;state.paused=true;"
-    "node.dispatchEvent(new Event('error'));delete globalThis."
+    "if(previousNative!==4)node.dispatchEvent(new Event('error'));"
+    "delete globalThis."
     "__tilefinchActiveMediaNode;delete globalThis.__tilefinchActiveMediaState;"
     "return true}else{"
     "state.networkState=HTMLMediaElement.NETWORK_IDLE;state.readyState="
@@ -269,15 +278,18 @@ static const char media_update_bootstrap[] =
     "'loadedmetadata'));node.dispatchEvent(new Event('loadeddata'));"
     "node.dispatchEvent(new Event('canplay'))}if(nativeState===2){"
     "state.paused=false;state.ended=false;if(previousPaused)"
-    "node.dispatchEvent(new Event('play'));node.dispatchEvent(new Event("
-    "'playing'));node.dispatchEvent(new Event('timeupdate'))}else if("
+    "node.dispatchEvent(new Event('play'));if(previousPaused||previousReady==="
+    "HTMLMediaElement.HAVE_NOTHING||previousNative===0)"
+    "node.dispatchEvent(new Event('playing'));"
+    "node.dispatchEvent(new Event('timeupdate'))}else if("
     "nativeState===3){state.paused=true;state.ended=true;"
-    "node.dispatchEvent(new Event('timeupdate'));node.dispatchEvent(new Event("
-    "'ended'))}else{state.paused=true;state.ended=false;if(!previousPaused)"
-    "node.dispatchEvent(new Event('pause'))}node.dispatchEvent(new Event("
-    "'seeked'));if(nativeState===3){delete globalThis."
+    "if(!previousEnded){node.dispatchEvent(new Event('timeupdate'));"
+    "node.dispatchEvent(new Event('ended'))}}else{state.paused=true;"
+    "state.ended=false;if(!previousPaused)"
+    "node.dispatchEvent(new Event('pause'))}if(previousSeeking)"
+    "node.dispatchEvent(new Event('seeked'));if(nativeState===3){delete globalThis."
     "__tilefinchActiveMediaNode;delete globalThis.__tilefinchActiveMediaState;}"
-    "return true})";
+    "return true}})";
 
 bool script_runtime_update_media_state(
     ScriptRuntime *runtime, int64_t node_handle, ScriptMediaState state,
@@ -291,17 +303,28 @@ bool script_runtime_update_media_state(
     js_rt_runtime_arm_watchdog(runtime);
     JSContext *context = runtime->context;
     if (!JS_IsFunction(context, runtime->media_update)) {
-        JSValue installed = JS_Eval(
+        JSValue factory = JS_Eval(
             context, media_update_bootstrap,
             sizeof(media_update_bootstrap) - 1u,
             "<browser-media-update>", JS_EVAL_TYPE_GLOBAL);
-        if (JS_IsException(installed)) {
+        if (JS_IsException(factory)) {
             JSValue exception = JS_GetException(context);
             JS_FreeValue(context, exception);
-            JS_FreeValue(context, installed);
+            JS_FreeValue(context, factory);
             return false;
         }
-        if (!JS_IsFunction(context, installed)) {
+        JSValue factory_arguments[2] = {
+            JS_DupValue(context, runtime->media_state_for),
+            JS_DupValue(context, runtime->bridge.trusted_node_wrap)
+        };
+        JSValue installed = JS_UNDEFINED;
+        bool installed_ok = runtime_call_captured(
+            runtime, factory, "media state installer", 2,
+            factory_arguments, &installed);
+        JS_FreeValue(context, factory_arguments[1]);
+        JS_FreeValue(context, factory_arguments[0]);
+        JS_FreeValue(context, factory);
+        if (!installed_ok || !JS_IsFunction(context, installed)) {
             JS_FreeValue(context, installed);
             return false;
         }

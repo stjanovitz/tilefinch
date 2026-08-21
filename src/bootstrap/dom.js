@@ -281,7 +281,8 @@
     wrapper.__tilefinchStableKey = key;
     if (key) rememberStableWrapper(key, wrapper);
   };
-  const stableNodeListeners = new Map(),
+  const inlineHandlerRecordToken = {},
+    stableNodeListeners = new Map(),
     stableNodeHandlers = new Map(),
     nativeNodeListeners = new Map(),
     nativeNodeHandlers = new Map(),
@@ -358,7 +359,52 @@
       volatileNodeHandlers.set(node, map);
     }
     return map || null;
-  };
+  },
+    inlineEventHandler = (node, type, name) => {
+      const retained = eventHandlerMap(node, false);
+      if (retained?.has(type)) {
+        const value = retained.get(type);
+        return value?.token === inlineHandlerRecordToken
+          ? value.callback : value;
+      }
+      if (
+        globalThis.__tilefinchCspAllowsInlineEventHandlers === false ||
+        typeof node?.getAttribute !== "function"
+      )
+        return null;
+      const source = node.getAttribute(name);
+      if (source === null) return null;
+      let callable = null;
+      try {
+        callable = globalThis.__tilefinchCompileInlineEventHandler(source);
+      } catch (error) {
+        __tilefinchReportUncaught(error, "inline " + name);
+      }
+      const map = eventHandlerMap(node, true);
+      if (!map) return null;
+      map.set(type, {
+        token: inlineHandlerRecordToken,
+        callback: typeof callable === "function" ? callable : null,
+      });
+      if (typeof callable === "function")
+        globalThis.__tilefinchEventObserverDelta?.(type, 1);
+      return typeof callable === "function" ? callable : null;
+    },
+    invalidateInlineEventHandler = (node, attributeName) => {
+      const name = String(attributeName || "").toLowerCase();
+      if (name.length <= 2 || !name.startsWith("on")) return;
+      const type = name.slice(2),
+        map = eventHandlerMap(node, false),
+        value = map?.get(type);
+      if (
+        value?.token === inlineHandlerRecordToken &&
+        typeof value.callback === "function"
+      )
+        globalThis.__tilefinchEventObserverDelta?.(type, -1);
+      map?.delete(type);
+      if (type.startsWith("mouse") || type.startsWith("pointer"))
+        globalThis.__tilefinchPointerMarkupChanged?.();
+    };
   const remoteNodeMutations = new Map(),
     remoteMutationLimit = 32;
   const remoteMutationState = (node, create = false) => {
@@ -1623,6 +1669,11 @@
   }
   for (const type of [
     "abort",
+    "animationcancel",
+    "animationend",
+    "animationiteration",
+    "animationstart",
+    "auxclick",
     "beforeinput",
     "beforetoggle",
     "blur",
@@ -1631,9 +1682,20 @@
     "change",
     "click",
     "close",
+    "contextmenu",
     "compositionend",
     "compositionstart",
     "compositionupdate",
+    "copy",
+    "cut",
+    "dblclick",
+    "drag",
+    "dragend",
+    "dragenter",
+    "dragleave",
+    "dragover",
+    "dragstart",
+    "drop",
     "durationchange",
     "emptied",
     "ended",
@@ -1650,25 +1712,47 @@
     "loadedmetadata",
     "loadstart",
     "load",
+    "mousedown",
+    "mouseenter",
+    "mouseleave",
+    "mousemove",
+    "mouseout",
+    "mouseover",
+    "mouseup",
     "paste",
     "pause",
     "play",
     "playing",
     "pointerdown",
+    "pointerenter",
+    "pointerleave",
     "pointermove",
+    "pointerout",
+    "pointerover",
     "pointerup",
     "ratechange",
+    "reset",
     "scroll",
+    "select",
     "selectionchange",
     "seeking",
     "seeked",
     "stalled",
     "submit",
     "suspend",
+    "touchcancel",
+    "touchend",
+    "touchmove",
+    "touchstart",
     "timeupdate",
     "toggle",
+    "transitioncancel",
+    "transitionend",
+    "transitionrun",
+    "transitionstart",
     "volumechange",
     "waiting",
+    "wheel",
   ]) {
     const name = "on" + type;
     if (!(name in EventTarget.prototype))
@@ -1676,17 +1760,24 @@
         configurable: true,
         enumerable: true,
         get() {
-          return eventHandlerMap(this, false)?.get(type) || null;
+          return inlineEventHandler(this, type, name);
         },
         set(value) {
           const callable = typeof value === "function" ? value : null,
-            existing = eventHandlerMap(this, false)?.get(type) || null,
-            map = eventHandlerMap(this, callable !== null);
+            retained = eventHandlerMap(this, false),
+            retainedValue = retained?.get(type),
+            existing = retainedValue?.token === inlineHandlerRecordToken
+              ? retainedValue.callback
+              : retainedValue || null,
+            hasMarkup = this?.getAttribute?.(name) !== null,
+            map = eventHandlerMap(
+              this,
+              callable !== null || hasMarkup || !!retained,
+            );
           if (!map) return;
-          if (callable === null) map.delete(type);
-          else map.set(type, callable);
+          map.set(type, callable);
           if ((existing === null) !== (callable === null))
-            globalThis.__tilefinchFocusObserverDelta?.(
+            globalThis.__tilefinchEventObserverDelta?.(
               type,
               callable === null ? -1 : 1,
             );
@@ -2950,6 +3041,16 @@
             previous !== nextHandle ? uncacheNode(previous, this) : 0;
         if (previousLease) __tilefinchReleaseNodeWrapper(previous, previousLease);
         handle = nextHandle;
+        if (previous !== nextHandle) {
+          const handlers = eventHandlerMap(this, false);
+          if (handlers)
+            for (const [type, value] of handlers)
+              if (value?.token === inlineHandlerRecordToken) {
+                if (typeof value.callback === "function")
+                  globalThis.__tilefinchEventObserverDelta?.(type, -1);
+                handlers.delete(type);
+              }
+        }
         if (!globalThis.__tilefinchHasRemoteNodeWriter)
           globalThis.__tilefinchApplyRemoteMutation?.(this, handle);
         this.__tilefinchRemote = false;
@@ -4007,6 +4108,7 @@
           rekeyStableWrapper(this, idKey || sourceKey);
         }
         if (lowerName === "id") globalThis.__tilefinchExposeNamedProperty(value);
+        invalidateInlineEventHandler(this, lowerName);
         globalThis.__tilefinchCustomElementAttributeChanged?.(
           this,
           lowerName,
@@ -4261,6 +4363,7 @@
                  && lowerName === "id")
           rekeyStableWrapper(this, String(__tilefinchStableNodeKey(handle) || ""));
         if (oldValue !== null) {
+          invalidateInlineEventHandler(this, lowerName);
           globalThis.__tilefinchCanvasAttributeChanged?.(this, lowerName);
           if (
             this instanceof HTMLIFrameElement &&
@@ -5628,15 +5731,19 @@
         value.currentTarget = this;
         value.eventPhase = this === value.target ? 2 : capture ? 1 : 3;
         if (!capture) {
-          const handler = this["on" + value.type];
+          const propertyName = "on" + value.type,
+            handler = propertyName in this
+              ? this[propertyName]
+              : inlineEventHandler(this, value.type, propertyName);
           if (typeof handler === "function")
             try {
-              globalThis.__tilefinchRunTask(
+              const returned = globalThis.__tilefinchRunTask(
                 "element-handler:" + String(value.type),
                 handler,
                 this,
                 [value],
               );
+              if (returned === false) value.preventDefault();
             } catch (error) {
               __tilefinchReportUncaught(error, "event " + value.type);
             }
@@ -5727,8 +5834,6 @@
       writable: false,
       value: node.__tilefinchRebindHandle,
     });
-    node.onload = null;
-    node.onerror = null;
     Object.setPrototypeOf(
       node,
       elementPrototype(node.tagName, node.nodeType, node.namespaceURI),

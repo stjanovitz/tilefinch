@@ -1,0 +1,6 @@
+tilefinch-input-script: armed script=input-script.txt steps=20 stall-limit=1800
+tilefinch-input-script: mark=glyph-options step=8 screen=glyph-options
+tilefinch-input-script: mark=removed step=14 screen=glyph-options
+tilefinch-input-script: step=16 action=home-activate setting=none screen=page list=0 tab=0
+tilefinch-input-script: covered action=home-activate count=1
+tilefinch-input-script: outcome=complete steps=19/20 frames=110 held-frames=26 actions=1 settings=0

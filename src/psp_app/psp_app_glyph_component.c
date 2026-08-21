@@ -59,7 +59,11 @@ static bool profile_language_uses_pack(
         || (language == BROWSER_GLYPH_LANGUAGE_CHINESE_TRADITIONAL
             && pack == TILEFINCH_GLYPH_PACK_CHINESE_TRADITIONAL)
         || (language == BROWSER_GLYPH_LANGUAGE_KOREAN
-            && pack == TILEFINCH_GLYPH_PACK_KOREAN);
+            && pack == TILEFINCH_GLYPH_PACK_KOREAN)
+        || (language == BROWSER_GLYPH_LANGUAGE_CYRILLIC
+            && pack == TILEFINCH_GLYPH_PACK_CYRILLIC)
+        || (language == BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED
+            && pack == TILEFINCH_GLYPH_PACK_LATIN_EXTENDED);
 }
 
 bool psp_glyph_component_handle_frame(
@@ -71,8 +75,24 @@ bool psp_glyph_component_handle_frame(
     PspGlyphComponentSession *session =
         app->browser->glyph_component_session;
     PspUiState *ui = &app->process->presentation.ui;
-    bool visual_changed = psp_glyph_component_session_pump_runtime(
-        session, app->browser->engine);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint8_t attached_before_hint = session->attached_mask;
+#endif
+    bool visual_changed = psp_glyph_component_session_attach_hinted(
+        session, &app->process->install_paths,
+        browser_engine_glyph_script_mask(app->browser->engine),
+        app->browser->engine);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (session->attached_mask != attached_before_hint) {
+        printf("tilefinch-glyph-component: lazy-attached=0x%02x "
+               "total=0x%02x\n",
+               (unsigned) (session->attached_mask &
+                           (uint8_t) ~attached_before_hint),
+               (unsigned) session->attached_mask);
+    }
+#endif
+    visual_changed = psp_glyph_component_session_pump_runtime(
+        session, app->browser->engine) || visual_changed;
 
     if (intent->glyph_component_probe_requested) {
         psp_glyph_component_session_probe(
@@ -86,6 +106,8 @@ bool psp_glyph_component_handle_frame(
         ? (TilefinchGlyphPack) intent->glyph_component_pack
         : TILEFINCH_GLYPH_PACK_JAPANESE;
     if (intent->glyph_component_remove_requested) {
+        bool requested_attached =
+            (session->attached_mask & (1u << (unsigned) requested)) != 0;
         bool selection_changed = false;
         BrowserGlyphLanguage previous_language =
             browser_profile_glyph_language(app->browser->profile);
@@ -123,6 +145,20 @@ bool psp_glyph_component_handle_frame(
             && psp_glyph_component_session_remove(
                 session, &app->process->install_paths, requested,
                 app->browser->engine);
+        if (removed && requested_attached) {
+            (void) psp_glyph_component_session_attach_selected(
+                session, app->browser->budget,
+                &app->process->install_paths,
+                browser_profile_glyph_language(app->browser->profile),
+                browser_profile_color_emoji(app->browser->profile));
+        }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        printf("tilefinch-glyph-component: remove pack=%u result=%s "
+               "selection=%u\n",
+               (unsigned) requested, removed ? "ok" : "failed",
+               (unsigned) browser_profile_glyph_language(
+                   app->browser->profile));
+#endif
         psp_ui_show_status(
             ui, removed ? "PACK REMOVED - EMBEDDED FALLBACK ACTIVE"
                         : "FONT PACK COULD NOT BE REMOVED",

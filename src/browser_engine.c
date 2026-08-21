@@ -1535,6 +1535,12 @@ bool browser_engine_optional_glyph_payloads_ready(BrowserEngine *engine)
     return true;
 }
 
+uint8_t browser_engine_glyph_script_mask(const BrowserEngine *engine)
+{
+    return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        ? 0 : engine->navigation.page.document.glyph_script_mask;
+}
+
 bool browser_engine_set_youtube_compact_results(
     BrowserEngine *engine, bool compact)
 {
@@ -3058,6 +3064,37 @@ bool browser_engine_activate(BrowserEngine *engine,
         engine, controller_activate(&engine->controller, action));
 }
 
+bool browser_engine_consume_media_request(
+    BrowserEngine *engine, ScriptMediaRequest *request)
+{
+    if (!browser_engine_input_ready(engine) || request == NULL
+        || engine->navigation.page.runtime == NULL
+        || !script_runtime_consume_media_request(
+               engine->navigation.page.runtime, request)) return false;
+    bool allowed = request->source[0] != '\0'
+        && tilefinch_csp_allows_request(
+            &engine->navigation.page.document.content_security_policy,
+            TILEFINCH_DESTINATION_MEDIA, request->source);
+    if (!allowed) {
+        (void) script_runtime_update_media_state(
+            engine->navigation.page.runtime, request->node_handle,
+            SCRIPT_MEDIA_STATE_ERROR, 0, 0);
+        request->source[0] = '\0';
+    }
+    return true;
+}
+
+bool browser_engine_update_media_state(
+    BrowserEngine *engine, int64_t node_handle, ScriptMediaState state,
+    double current_time, double duration)
+{
+    return browser_engine_input_ready(engine) && node_handle != 0
+        && engine->navigation.page.runtime != NULL
+        && script_runtime_update_media_state(
+               engine->navigation.page.runtime, node_handle, state,
+               current_time, duration);
+}
+
 bool browser_engine_advance_runtime(BrowserEngine *engine,
                                     unsigned elapsed_ms,
                                     size_t maximum_callbacks,
@@ -3101,7 +3138,8 @@ bool browser_engine_execute_action(BrowserEngine *engine,
     /* Activation has already dispatched ordinary control behavior. Only
        navigation and form submission require a second execution phase. */
     if (action->type == CONTROLLER_ACTION_NONE
-        || action->type == CONTROLLER_ACTION_CONTROL) {
+        || action->type == CONTROLLER_ACTION_CONTROL
+        || action->type == CONTROLLER_ACTION_MEDIA) {
         clear_error(engine);
         return true;
     }
@@ -3556,6 +3594,36 @@ bool browser_engine_apply_user_css(
         && engine->navigation_ready
         && navigation_apply_user_css(&engine->navigation, css, length)
         && browser_engine_refresh_shell(engine);
+}
+
+bool browser_engine_prepare_reader(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
+{
+    if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {0};
+    if (engine == NULL || !engine->navigation.page.loaded) return false;
+    ReaderDocumentAnalysis *stored =
+        &engine->navigation.page.reader_analysis;
+    if (!stored->prepared
+        && !reader_document_prepare(
+               &engine->navigation.page.document, stored)) return false;
+    if (analysis != NULL) *analysis = *stored;
+    return true;
+}
+
+void browser_engine_set_reader_candidate_mode(BrowserEngine *engine,
+                                              bool enabled)
+{
+    if (engine != NULL && engine->navigation_ready)
+        navigation_set_reader_candidate_mode(&engine->navigation, enabled);
+}
+
+bool browser_engine_reader_analysis(
+    const BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
+{
+    if (engine == NULL || analysis == NULL
+        || !engine->navigation.page.reader_analysis.prepared) return false;
+    *analysis = engine->navigation.page.reader_analysis;
+    return true;
 }
 
 const NavigationSession *browser_engine_navigation_view(

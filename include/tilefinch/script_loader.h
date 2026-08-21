@@ -32,7 +32,33 @@ typedef struct {
     size_t lazy_webpack_source_bytes;
     size_t inline_data_fast_paths;
     size_t inline_data_fast_path_bytes;
+    size_t inline_data_quota_exemptions;
+    size_t cost_class_rejections;
+    size_t watchdog_classification_misses;
+    size_t watchdog_classification_miss_bytes;
+    size_t watchdog_classification_miss_loops;
+    unsigned watchdog_classification_miss_flags;
 } ExternalScriptMetrics;
+
+enum {
+    SCRIPT_COST_SIGNAL_EVAL = 1u << 0,
+    SCRIPT_COST_SIGNAL_FUNCTION_CTOR = 1u << 1,
+    SCRIPT_COST_SIGNAL_DOCUMENT_WRITE = 1u << 2,
+    SCRIPT_COST_SIGNAL_FUNCTION_DECL = 1u << 3
+};
+
+typedef struct {
+    size_t bytes;
+    size_t loops;
+    unsigned flags;
+} ScriptStaticCostProfile;
+
+/* Allocation-free lexical telemetry used by the bounded admission policy.
+   This is a content-shape scan, not a JavaScript parser. */
+void script_static_cost_profile(
+    const char *source, size_t length, ScriptStaticCostProfile *profile);
+bool script_static_cost_rejects(
+    const ScriptStaticCostProfile *profile, bool third_party, bool module);
 
 typedef struct {
     long parser_executed[256];

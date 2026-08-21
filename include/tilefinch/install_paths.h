@@ -27,6 +27,12 @@ bool tilefinch_install_program_path(
 bool tilefinch_install_data_path(
     const TilefinchInstallPaths *paths, const char *relative,
     char *output, size_t output_size);
+/* Optional components are installation-wide siblings of the A/B slots.
+   Browser updates replace only a program slot and therefore never overwrite
+   or remove a component the user built or installed separately. */
+bool tilefinch_install_component_path(
+    const TilefinchInstallPaths *paths, const char *relative,
+    char *output, size_t output_size);
 bool tilefinch_install_advisory_matches(
     const TilefinchInstallPaths *paths,
     const char *slot_name, const char *data_dir);

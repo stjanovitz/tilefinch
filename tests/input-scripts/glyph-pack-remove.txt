@@ -1,0 +1,24 @@
+# Remove the selected signed language pack through the shipping UI. The
+# isolated PPSSPP harness seeds the pack and profile; two Square presses are
+# the explicit confirmation gesture.
+
+wait 30
+tap select
+press 4 down
+tap cross
+tap cross
+press 6 down
+tap cross
+wait 8
+mark glyph-options
+press 2 down
+tap square
+wait 2
+tap square
+wait 12
+mark removed
+tap select
+press 6 down
+tap cross
+wait 4
+end

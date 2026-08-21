@@ -379,46 +379,87 @@ static size_t navigation_progressive_preview_estimate(
 
 static bool navigation_collect_layout_image_geometry(
     const LayoutDocument *layout, ImagePriorityTarget *targets,
-    size_t capacity, size_t *count)
+    size_t capacity, int viewport_height, size_t *visible_count,
+    size_t *count)
 {
-    if (count == NULL) return false;
+    if (count == NULL || visible_count == NULL) return false;
     *count = 0;
+    *visible_count = 0;
     if (layout == NULL || targets == NULL || capacity == 0) return false;
-    for (size_t i = 0; i < layout->node_box_count; i++) {
-        const LayoutNodeBox *box = &layout->node_boxes[i];
-        if (box->node == NULL || !node_name_is(box->node, "img")
-            || box->width <= 0 || box->height <= 0) continue;
-        int width = layout_css_to_visual(layout, box->width);
-        int height = layout_css_to_visual(layout, box->height);
-        if (width <= 0 || height <= 0
-            || width > UINT16_MAX || height > UINT16_MAX) return false;
-        size_t existing = *count;
-        for (size_t j = 0; j < *count; j++) {
-            if (targets[j].node == box->node
-                && targets[j].kind == IMAGE_PRIORITY_KIND_DOCUMENT) {
-                existing = j;
-                break;
+    /* Keep visible boxes first, followed by below-fold boxes in layout order.
+       This preserves the first-render priority set while making the suffix a
+       directly copyable deferred queue. */
+    for (unsigned pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < layout->node_box_count; i++) {
+            const LayoutNodeBox *box = &layout->node_boxes[i];
+            if (box->node == NULL || !node_name_is(box->node, "img")
+                || box->width <= 0 || box->height <= 0) continue;
+            bool visible = box->y < viewport_height
+                && (int64_t) box->y + box->height > 0;
+            if (visible != (pass == 0)) continue;
+            int width = layout_css_to_visual(layout, box->width);
+            int height = layout_css_to_visual(layout, box->height);
+            if (width <= 0 || height <= 0
+                || width > UINT16_MAX || height > UINT16_MAX) return false;
+            size_t existing = *count;
+            for (size_t j = 0; j < *count; j++) {
+                if (targets[j].node == box->node
+                    && targets[j].kind == IMAGE_PRIORITY_KIND_DOCUMENT) {
+                    existing = j;
+                    break;
+                }
+            }
+            if (existing != *count) {
+                if (width > targets[existing].display_width) {
+                    targets[existing].display_width = (uint16_t) width;
+                }
+                if (height > targets[existing].display_height) {
+                    targets[existing].display_height = (uint16_t) height;
+                }
+                continue;
+            }
+            if (*count == capacity) return false;
+            targets[(*count)++] = (ImagePriorityTarget) {
+                .node = box->node,
+                .display_width = (uint16_t) width,
+                .display_height = (uint16_t) height,
+                .kind = IMAGE_PRIORITY_KIND_DOCUMENT,
+                .pseudo = (uint8_t) PSEUDO_NONE
+            };
+            if (pass == 0) {
+                *visible_count = *count;
             }
         }
-        if (existing != *count) {
-            if (width > targets[existing].display_width) {
-                targets[existing].display_width = (uint16_t) width;
-            }
-            if (height > targets[existing].display_height) {
-                targets[existing].display_height = (uint16_t) height;
-            }
-            continue;
-        }
-        if (*count == capacity) return false;
-        targets[(*count)++] = (ImagePriorityTarget) {
-            .node = box->node,
-            .display_width = (uint16_t) width,
-            .display_height = (uint16_t) height,
-            .kind = IMAGE_PRIORITY_KIND_DOCUMENT,
-            .pseudo = (uint8_t) PSEUDO_NONE
-        };
     }
     return *count != 0;
+}
+
+static bool navigation_document_images_are_defer_safe(
+    const PocDocument *document, const Stylesheet *stylesheet)
+{
+    if (document == NULL || document->html == NULL || stylesheet == NULL
+        || stylesheet->image_url_count != 0) return false;
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    size_t visited = 0;
+    for (lxb_dom_node_t *node = root; node != NULL
+         && visited++ < NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT;) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            if (node_name_is(node, "svg")) return false;
+            if (node_name_is(node, "video")) {
+                size_t poster_length = 0;
+                if (document_attribute(node, "poster", &poster_length)
+                    != NULL && poster_length != 0) return false;
+            }
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        if (node == root) break;
+        node = node->next;
+    }
+    return visited < NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT;
 }
 
 static bool navigation_plan_static_image_geometry(
@@ -453,8 +494,24 @@ static bool navigation_plan_static_image_geometry(
     session->performance.layout_us += elapsed;
     layout_reuse_cache_stats(session->page.layout_reuse, &reuse_after);
     navigation_record_layout_reuse(session, &reuse_before, &reuse_after);
+    size_t total_count = 0;
     bool collected = built && navigation_collect_layout_image_geometry(
-        &probe, targets, capacity, count);
+        &probe, targets, capacity, session->viewport.css_height,
+        count, &total_count);
+    if (collected && total_count > *count) {
+        size_t deferred_count = total_count - *count;
+        ImagePriorityTarget *deferred = budget_malloc_category(
+            session->budget, BUDGET_CATEGORY_RESOURCE,
+            deferred_count * sizeof(*deferred));
+        if (deferred == NULL) {
+            collected = false;
+        } else {
+            memcpy(deferred, targets + *count,
+                   deferred_count * sizeof(*deferred));
+            session->page.deferred_image_targets = deferred;
+            session->page.deferred_image_count = deferred_count;
+        }
+    }
     layout_destroy(&probe);
     if (!collected) *count = 0;
     return collected;
@@ -766,6 +823,13 @@ static bool navigation_commit_document(
         || generation != session->generation || session->cancelled
         || url == NULL || document == NULL || document->html == NULL
         || viewport_width <= 0) return false;
+    ReaderDocumentAnalysis reader_analysis = {0};
+    if (session->prepare_reader_candidates
+        && !reader_document_prepare(document, &reader_analysis)) {
+        snprintf(session->last_error, sizeof(session->last_error),
+                 "reader candidate analysis failed within the page budget");
+        return false;
+    }
     NavigationCandidatePrepareCallback candidate_prepare =
         session->candidate_prepare;
     NavigationCandidateFinalizeCallback candidate_abort =
@@ -838,6 +902,8 @@ static bool navigation_commit_document(
              sizeof(session->page.referrer_policy), "%s",
              response_referrer_policy);
     session->page.document = *document;
+    if (session->prepare_reader_candidates)
+        session->page.reader_analysis = reader_analysis;
     memset(document, 0, sizeof(*document));
     snprintf(session->page.resource_base_url,
              sizeof(session->page.resource_base_url), "%s",
@@ -902,6 +968,18 @@ static bool navigation_commit_document(
             streaming->scripts.early.skipped_quota;
         session->script_skipped_pressure =
             streaming->scripts.early.skipped_pressure;
+        session->script_inline_data_quota_exemptions =
+            streaming->scripts.early.inline_data_quota_exemptions;
+        session->script_cost_class_rejections =
+            streaming->scripts.early.cost_class_rejections;
+        session->script_watchdog_classification_misses =
+            streaming->scripts.early.watchdog_classification_misses;
+        session->script_watchdog_classification_miss_bytes =
+            streaming->scripts.early.watchdog_classification_miss_bytes;
+        session->script_watchdog_classification_miss_loops =
+            streaming->scripts.early.watchdog_classification_miss_loops;
+        session->script_watchdog_classification_miss_flags =
+            streaming->scripts.early.watchdog_classification_miss_flags;
     }
     if (streaming != NULL && streaming->scheduler != NULL) {
         session->page.resource_scheduler = streaming->scheduler;
@@ -1247,6 +1325,21 @@ static bool navigation_commit_document(
                 metrics.inline_data_fast_paths;
             session->script_inline_data_fast_path_bytes =
                 metrics.inline_data_fast_path_bytes;
+            session->script_inline_data_quota_exemptions =
+                metrics.inline_data_quota_exemptions;
+            session->script_cost_class_rejections =
+                metrics.cost_class_rejections;
+            session->script_watchdog_classification_misses =
+                metrics.watchdog_classification_misses;
+            session->script_watchdog_classification_miss_bytes =
+                metrics.watchdog_classification_miss_bytes;
+            session->script_watchdog_classification_miss_loops =
+                metrics.watchdog_classification_miss_loops;
+            session->script_watchdog_classification_miss_flags =
+                metrics.watchdog_classification_miss_flags;
+            /* A rejected/throwing author script is diagnostic evidence, not
+               a reason to discard the already parsed server-rendered page. */
+            navigation_record_soft_script_error(session, &metrics);
         }
     }
     session->performance.script_us += navigation_record_script_slices(
@@ -1377,7 +1470,8 @@ static bool navigation_commit_document(
        keep ordinary custom-element semantics. */
     if (session->script_failed != 0
         || session->script_skipped_quota != 0
-        || session->script_skipped_pressure != 0) {
+        || session->script_skipped_pressure != 0
+        || session->script_cost_class_rejections != 0) {
         stylesheet_enable_static_custom_element_fallback(
             &session->page.stylesheet);
     }
@@ -1433,6 +1527,7 @@ static bool navigation_commit_document(
     ImagePriorityTarget image_priority_targets[
         NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
     size_t image_priority_count = 0;
+    bool static_image_plan = false;
     bool pre_image_preview_candidate =
         session->external_resources_enabled
         && navigation_document_may_have_images(
@@ -1451,7 +1546,7 @@ static bool navigation_commit_document(
            retain the streaming-preview/markup policy above. */
         if (image_priority_count == 0 && !allow_runtime
             && streaming == NULL) {
-            (void) navigation_plan_static_image_geometry(
+            static_image_plan = navigation_plan_static_image_geometry(
                 session, fonts, images, image_priority_targets,
                 NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT,
                 &image_priority_count);
@@ -1480,7 +1575,8 @@ static bool navigation_commit_document(
               svg_priority_capacity, image_priority_count)
         : 0;
     image_priority_count += markup_priority_added;
-    if (pre_image_preview_candidate && layout_priority_count == 0) {
+    if (pre_image_preview_candidate && layout_priority_count == 0
+        && !static_image_plan) {
         size_t raster_added = navigation_collect_markup_image_priority(
             &session->page.document, image_priority_targets,
             markup_priority_capacity, image_priority_count);
@@ -1529,9 +1625,18 @@ static bool navigation_commit_document(
         bool continue_images_after_paint =
             session->performance.partial_paints != 0
             && navigation_background_images_enabled();
-        if (continue_images_after_paint) {
+        bool defer_static_document_images = static_image_plan
+            && session->page.deferred_image_count != 0
+            && !allow_runtime && streaming == NULL
+            && navigation_document_images_are_defer_safe(
+                   &session->page.document, &session->page.stylesheet);
+        if (continue_images_after_paint || defer_static_document_images) {
             session->page.image_continuation_pending = true;
         } else {
+            budget_free(session->budget,
+                        session->page.deferred_image_targets);
+            session->page.deferred_image_targets = NULL;
+            session->page.deferred_image_count = 0;
             navigation_ensure_layout_reuse(session);
             size_t retained_before = session->page.images.stats
                 .priority_retained_on_failure;

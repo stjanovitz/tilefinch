@@ -560,12 +560,16 @@ void psp_collections_sync_ui(
     memset(surface, 0, sizeof(*surface));
     surface->view.section = (uint8_t) section;
     size_t rows = 0;
-    if (section == PSP_UI_COLLECTION_OFFLINE) {
-        surface->view.empty_message = "NOTHING SAVED FOR OFFLINE YET";
+    if (section == PSP_UI_COLLECTION_SAVED
+        || section == PSP_UI_COLLECTION_DOWNLOADS) {
+        bool downloads = section == PSP_UI_COLLECTION_DOWNLOADS;
+        surface->view.empty_message = downloads
+            ? "NO VIDEO DOWNLOADS YET" : "NO SAVED ARTICLES YET";
         size_t count = library == NULL ? 0u : library->count;
         for (size_t at = 0;
              at < count && rows < PSP_UI_COLLECTIONS_ROW_LIMIT; at++) {
             const OfflineLibraryItem *item = &library->items[at];
+            if (downloads != (item->type == OFFLINE_ITEM_YOUTUBE)) continue;
             surface->view.rows[rows].title = item->title;
             surface->view.rows[rows].detail = item->source_url;
             surface->view.rows[rows].deletable = true;
@@ -601,7 +605,7 @@ void psp_collections_sync_ui(
             surface->id[rows] = (uint32_t) at;
             rows++;
         }
-    } else {
+    } else if (section == PSP_UI_COLLECTION_HISTORY) {
         surface->view.empty_message = "NO HISTORY YET";
         size_t count = profile == NULL
             ? 0u : browser_profile_history_count(profile);
@@ -621,6 +625,16 @@ void psp_collections_sync_ui(
             surface->id[rows] = (uint32_t) at;
             rows++;
         }
+    } else {
+        /* Screenshot enumeration remains in the existing lazy local page,
+           avoiding a directory scan whenever the Library strip is opened.
+           The native section is a stable one-row route into that page. */
+        surface->view.empty_message = "NO SCREENSHOT LIST AVAILABLE";
+        surface->view.rows[0].title = "Open screenshot list";
+        surface->view.rows[0].detail =
+            "https://tilefinch.local/screenshots";
+        surface->view.rows[0].deletable = false;
+        rows = 1u;
     }
     surface->view.count = (uint16_t) rows;
     psp_ui_set_collections(ui, &surface->view);
@@ -640,6 +654,10 @@ PspUiCollectionSection psp_collections_action_section(
     switch (action) {
         case PSP_UI_ACTION_SHOW_BOOKMARKS: return PSP_UI_COLLECTION_BOOKMARKS;
         case PSP_UI_ACTION_SHOW_HISTORY: return PSP_UI_COLLECTION_HISTORY;
+        case PSP_UI_ACTION_SHOW_DOWNLOADS:
+            return PSP_UI_COLLECTION_DOWNLOADS;
+        case PSP_UI_ACTION_SHOW_SCREENSHOTS:
+            return PSP_UI_COLLECTION_SCREENSHOTS;
         case PSP_UI_ACTION_SHOW_OFFLINE: return PSP_UI_COLLECTION_OFFLINE;
         default: return current;
     }

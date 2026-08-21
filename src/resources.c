@@ -1123,6 +1123,13 @@ static bool apply_stylesheet_data(ResourceContext *context,
             (void) cache_store_fetch(
                 context->session, resolved, fetched, &stable_provenance,
                 request_context, resource_grant);
+            /* Sharing trims the fetch buffer before transferring ownership,
+               so it may move the bytes.  The artifact cache below must hash
+               the post-transfer address, never the append buffer it replaced. */
+            if (fetched->shared_body != NULL
+                && fetched->shared_body->length == css_length) {
+                css_data = fetched->shared_body->data;
+            }
         }
         bool ir_stored = new_ir != NULL
             && browser_session_stylesheet_ir_put_take(

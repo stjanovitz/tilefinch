@@ -129,6 +129,14 @@ bool budget_uninstall_lexbor(Budget *budget);
 bool budget_lexbor_is_installed(const Budget *budget);
 void *budget_malloc_category(Budget *budget, BudgetCategory category,
                              size_t size);
+/* Allocate a payload on a 64-byte boundary with no allocator metadata in
+   either adjacent payload cache line. This is the only Budget allocation
+   form suitable for buffers shared with the PSP Media Engine or DMAC. The
+   usable size remains the requested size; the ledger also charges alignment
+   and end padding so cache maintenance may safely round the range to 64. */
+void *budget_malloc_cacheline_category(Budget *budget,
+                                       BudgetCategory category,
+                                       size_t size);
 void *budget_calloc_category(Budget *budget, BudgetCategory category,
                              size_t count, size_t size);
 void *budget_realloc_category(Budget *budget, BudgetCategory category,

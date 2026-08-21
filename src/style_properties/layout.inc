@@ -1528,6 +1528,11 @@ static bool style_property_fixed_containing_block(
     } else if (span_equal(parse->name, parse->name_length, "filter")) {
         parse->style->has_filter = active;
         parse->style->filter_code &= ~STYLE_FILTER_CODE_MASK;
+        StylePaintStack paint = style_paint_stack_copy(
+            parse->sheet, parse->style);
+        bool paint_changed =
+            (paint.reserved & STYLE_PAINT_FILTER_LOW_AMOUNT) != 0;
+        paint.reserved &= (uint8_t) ~STYLE_PAINT_FILTER_LOW_AMOUNT;
         if (active) {
             if (strstr(resolved, "grayscale(") != NULL) {
                 parse->style->filter_code |= STYLE_FILTER_GRAYSCALE;
@@ -1541,7 +1546,30 @@ static bool style_property_fixed_containing_block(
                     : strtod(argument + 1, NULL);
                 parse->style->filter_code |= amount < 1.0
                     ? STYLE_FILTER_DARKEN : STYLE_FILTER_BRIGHTEN;
+            } else if (strstr(resolved, "contrast(") != NULL
+                       || strstr(resolved, "saturate(") != NULL) {
+                bool contrast = strstr(resolved, "contrast(") != NULL;
+                const char *argument = strchr(resolved, '(');
+                char *end = NULL;
+                double amount = argument == NULL ? 1.0
+                    : strtod(argument + 1, &end);
+                if (end != NULL && *end == '%') amount /= 100.0;
+                if (!isfinite(amount) || amount < 0.0) amount = 1.0;
+                if (amount != 1.0) {
+                    parse->style->filter_code |= contrast
+                        ? STYLE_FILTER_CONTRAST : STYLE_FILTER_SATURATE;
+                    if (amount < 1.0) {
+                        paint.reserved |= STYLE_PAINT_FILTER_LOW_AMOUNT;
+                    }
+                    paint_changed = true;
+                } else {
+                    parse->style->has_filter = false;
+                }
             }
+        }
+        if (paint_changed) {
+            (void) style_apply_paint_stack(
+                parse->sheet, parse->style, &paint, NULL);
         }
         *parse->mask_high |= S2_FILTER;
     } else if (span_equal(parse->name, parse->name_length, "contain")) {
@@ -1906,6 +1934,111 @@ static bool style_property_justify_content(const StylePropertyParse *parse)
         parse->style->justify_content = (JustifyContent) value;
         *parse->mask |= S_JUSTIFY_CONTENT;
     }
+    return true;
+}
+
+/* The 2009 WebKit box syntax remains common in mobile stylesheets, chiefly
+   as the layout half of multiline line-clamp.  Map its bounded one-axis
+   model onto the existing flex implementation instead of carrying a second
+   layout algorithm.  The aliases intentionally share the canonical masks:
+   a later modern declaration therefore wins in the ordinary cascade. */
+static bool style_property_webkit_box_align(const StylePropertyParse *parse)
+{
+    char resolved[24];
+    if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
+                             resolved, sizeof(resolved), 0)) return true;
+    const char *mapped = strcmp(resolved, "start") == 0 ? "flex-start"
+        : (strcmp(resolved, "end") == 0 ? "flex-end" : resolved);
+    StylePropertyParse alias = *parse;
+    alias.value = mapped;
+    alias.value_length = strlen(mapped);
+    return style_property_align_items(&alias);
+}
+
+static bool style_property_webkit_box_pack(const StylePropertyParse *parse)
+{
+    char resolved[24];
+    if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
+                             resolved, sizeof(resolved), 0)) return true;
+    const char *mapped = strcmp(resolved, "start") == 0 ? "flex-start"
+        : (strcmp(resolved, "end") == 0 ? "flex-end"
+           : (strcmp(resolved, "justify") == 0 ? "space-between" : resolved));
+    StylePropertyParse alias = *parse;
+    alias.value = mapped;
+    alias.value_length = strlen(mapped);
+    return style_property_justify_content(&alias);
+}
+
+static bool style_property_webkit_box_flex(const StylePropertyParse *parse)
+{
+    return style_property_flex_grow(parse);
+}
+
+static bool style_property_webkit_box_lines(const StylePropertyParse *parse)
+{
+    char resolved[16];
+    if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
+                             resolved, sizeof(resolved), 0)) return true;
+    const char *mapped = strcmp(resolved, "multiple") == 0 ? "wrap"
+        : (strcmp(resolved, "single") == 0 ? "nowrap" : resolved);
+    StylePropertyParse alias = *parse;
+    alias.value = mapped;
+    alias.value_length = strlen(mapped);
+    return style_property_flex_wrap(&alias);
+}
+
+static bool style_property_webkit_box_orient(const StylePropertyParse *parse)
+{
+    char resolved[24];
+    if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
+                             resolved, sizeof(resolved), 0)) return true;
+    bool vertical = strcmp(resolved, "vertical") == 0
+        || strcmp(resolved, "block-axis") == 0;
+    bool horizontal = strcmp(resolved, "horizontal") == 0
+        || strcmp(resolved, "inline-axis") == 0;
+    if (!vertical && !horizontal) return true;
+    bool reverse = parse->style->flex_direction == FLEX_ROW_REVERSE
+        || parse->style->flex_direction == FLEX_COLUMN_REVERSE;
+    parse->style->flex_direction = vertical
+        ? (reverse ? FLEX_COLUMN_REVERSE : FLEX_COLUMN)
+        : (reverse ? FLEX_ROW_REVERSE : FLEX_ROW);
+    *parse->mask |= S_FLEX_DIRECTION;
+    return true;
+}
+
+static bool style_property_webkit_box_direction(const StylePropertyParse *parse)
+{
+    char resolved[16];
+    if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
+                             resolved, sizeof(resolved), 0)) return true;
+    if (strcmp(resolved, "normal") != 0 && strcmp(resolved, "reverse") != 0) {
+        return true;
+    }
+    bool column = parse->style->flex_direction == FLEX_COLUMN
+        || parse->style->flex_direction == FLEX_COLUMN_REVERSE;
+    bool reverse = strcmp(resolved, "reverse") == 0;
+    parse->style->flex_direction = column
+        ? (reverse ? FLEX_COLUMN_REVERSE : FLEX_COLUMN)
+        : (reverse ? FLEX_ROW_REVERSE : FLEX_ROW);
+    *parse->mask |= S_FLEX_DIRECTION;
+    return true;
+}
+
+static bool style_property_webkit_box_ordinal_group(
+    const StylePropertyParse *parse)
+{
+    char resolved[24];
+    if (!style_resolve_value(parse->sheet, parse->value, parse->value_length,
+                             resolved, sizeof(resolved), 0)) return true;
+    char *end = NULL;
+    unsigned long group = strtoul(resolved, &end, 10);
+    while (end != NULL && isspace((unsigned char) *end)) end++;
+    if (end == resolved || end == NULL || *end != '\0' || group == 0) {
+        return true;
+    }
+    if (group - 1u > (unsigned long) INT_MAX) group = (unsigned long) INT_MAX + 1u;
+    parse->style->order = (int) (group - 1u);
+    *parse->mask_high |= S2_ORDER;
     return true;
 }
 

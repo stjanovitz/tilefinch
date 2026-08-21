@@ -10,6 +10,17 @@ function is pure: it receives one pre-sampled event and returns the next state
 plus non-blocking commands. Blocking or fallible work is an invoked service
 which later supplies a completion, timeout, or failure event.
 
+The state machine is source-independent. Provider video, offline files, and
+compatible page `<video>` elements enter the same opening and playback states.
+For page media, activation resolves the element's selected MP4 or VOD HLS
+source, applies
+`media-src`, mixed-content, private-network, CORS, cookie, redirect, and content-
+blocking policy, and launches the native player. MP4 uses a one-byte Range
+probe before the progressive demux; HLS uses bounded master/media playlists,
+two segment requests, and the MPEG-TS packet source. Both then use the same
+backend, clock, state transitions, and compositor. No page-media bytes are
+written to the Memory Stick.
+
 ## Resource invariants
 
 Control state and resource ownership must agree at every transition:
@@ -29,6 +40,14 @@ is unsafe to free, but no session pipeline may reach it. Retry is disabled
 until process restart. This keeps `Failed`'s pipeline invariant truthful
 without pretending quarantine reclaimed firmware-owned state.
 
+Transport priority follows admitted media work, not the URL in the omnibar.
+`Opening` and a visible online player reserve two of the six background-worker
+descriptors. `Dormant`, hidden internal views, `Failed`, and closed players do
+not: a retained decoder receives no feed while hidden, and reopening it
+reacquires the reservation before the next media request. This prevents Back,
+a cancelled candidate navigation, or a failed video open from permanently
+reducing later page and search capacity from six descriptors to four.
+
 No resource-bearing state transitions directly to `Failed` or `Suspended`.
 It first enters `Quiescing`, even when an early open failed before allocation;
 the service then completes its irrelevant phases immediately.
@@ -42,14 +61,18 @@ stateDiagram-v2
 
     state Opening {
         [*] --> Resolving
-        Resolving --> DecoderPrepare
-        DecoderPrepare --> VideoRange
+        Resolving --> StreamPrime: HLS source
+        StreamPrime --> DecoderPrepare: source ready
+        Resolving --> DecoderPrepare: provider / offline source
+        Resolving --> VideoRange: page MP4 source
+        DecoderPrepare --> VideoRange: normal playback
+        DecoderPrepare --> AudioRange: YouTube audio-only
         VideoRange --> VideoDemux
         VideoDemux --> VideoPrime
         VideoPrime --> AudioRange: separate audio track
         VideoPrime --> PlaybackCreate: no separate audio track
         AudioRange --> AudioDemux
-        AudioDemux --> PlaybackCreate
+        AudioDemux --> PlaybackCreate: audio-only or after video prime
     }
 
     Opening --> Priming: OPENED
@@ -204,6 +227,40 @@ This is a presentation-order rule, not another lifecycle flag. The UI helper
 classifies whether an intent has meaningful pre-dispatch pixels; it never
 predicts the reducer's next state.
 
+## Network impairment contract
+
+Transport recovery is policy beneath the lifecycle machine; it does not add
+parallel session states. `Playing` enters `Buffering` only after 350 ms of
+continuous source starvation. Presentation then stops while source and decode
+work continue. A normal refill requires two seconds of network runway and a
+continuous 250 ms stable interval before presentation resumes. Startup and a
+page with repeated stalls require three seconds; after repeated trouble the
+stable interval rises to 600 ms. This prevents brief radio gaps from flashing
+the chrome and prevents a marginal refill from oscillating between Playing and
+Buffering.
+
+A demanded range window treats useful bytes as progress regardless of their
+rate. With no progress, fresh connections are attempted after 2, 4, and 8
+seconds. After the third attempt, the last request remains eligible to recover
+until the logical incident reaches an absolute 30-second deadline. The
+deadline survives replacement connections, so a one-byte trickle cannot keep
+the player pending forever. A seek or a newly selected logical window starts a
+fresh incident and immediately supersedes the old request.
+
+Malformed, short, or range-rejecting responses are never admitted. Provider
+routes can spend a bounded candidate-refresh allowance, and a user who selected
+360p may then try the 240p route; a pinned 240p preference is not silently
+changed. Terminal delivery failure enters the ordinary failure/quiesce path and
+produces the bounded diagnostic snapshot rather than leaving Buffering active
+forever.
+
+The host resilience gate uses the real range source, MP4 demux, scheduler, and
+buffer policy against deterministic delivery faults. Its coupled scenario
+continues feeding while the presentation clock is held, distinguishes fetched
+samples from displayed samples, bounds A/V skew, and requires every buffering
+episode to close after stable recovery. The PSP background transport worker
+and firmware presentation path remain hardware-qualified boundaries.
+
 ## Validation contract
 
 The reducer is authoritative and host-compilable. Tests enumerate the complete
@@ -231,10 +288,13 @@ The following rules keep telemetry from certifying the wrong pixels:
 - release builds compile the transition trace and validation formatter out.
 
 A rewind of at least 30 seconds replaces the codec backend through the normal
-quiesce/open services. Smaller seeks and preview scrubbing use the bounded reset
-path. Startup may leave `Priming` only after a claimed picture crosses the
-displayed baseline; the physical DAC hold is an actuator fact, not proof that
-this control boundary occurred.
+quiesce/open services. Scrub movement is UI-only: it changes the highlighted
+target without resetting firmware or superseding HTTP ranges. Committing a
+smaller seek performs one bounded reset, then cooperatively proves that both
+the video and audio source heads are resident before entering `Priming`.
+Startup or a committed seek may leave `Priming` only after a claimed picture
+crosses the displayed baseline; the physical DAC hold is an actuator fact, not
+proof that this control boundary occurred.
 
 `reopen_seek_completion_pending` is validation accounting only. It
 distinguishes a user-requested rewind which uses the reopen service from an

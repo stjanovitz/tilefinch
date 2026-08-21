@@ -47,6 +47,58 @@ static unsigned char expected_byte(uint64_t at)
     return (unsigned char) ((at * 31u + 7u) & 0xFFu);
 }
 
+static void test_video_lookahead_policy(void)
+{
+    CHECK(psp_media_video_lookahead_limit(true, 0) == 1u);
+    CHECK(psp_media_video_lookahead_limit(
+              true, PSP_MEDIA_BUFFER_STARTUP_TARGET_US - 1u) == 1u);
+    CHECK(psp_media_video_lookahead_limit(
+              true, PSP_MEDIA_BUFFER_STARTUP_TARGET_US) == 2u);
+    CHECK(psp_media_video_lookahead_limit(false, 0) == 2u);
+}
+
+static void test_optional_second_lookahead_budget_fallback(void)
+{
+    const char *url = "https://media.invalid/video.mp4";
+    MediaHttpRangeOptions options = {
+        .cache_bytes = 64u * 1024u,
+        .lookahead_windows = 2u,
+        .initial_lookahead_windows = 1u
+    };
+    char error[256] = {0};
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    /* State, URL, range URL, referrer, active cache, first successor: the
+       next allocation is exactly the optional second successor. */
+    budget_inject_failure_after(&budget, 6u);
+    MediaHttpRange *range = media_http_range_create(
+        &budget, NULL, url, 512u * 1024u, &options,
+        error, sizeof(error));
+    CHECK(range != NULL);
+    media_http_range_set_lookahead_limit(range, 2u);
+    MediaHttpRangeStats stats = {0};
+    CHECK(media_http_range_stats(range, &stats)
+          && stats.lookahead_slots == 1u
+          && stats.lookahead_fetch_limit == 1u);
+    media_http_range_destroy(range);
+    CHECK(budget.current == 0);
+
+    budget_init(&budget, 8u * 1024u * 1024u);
+    range = media_http_range_create(
+        &budget, NULL, url, 512u * 1024u, &options,
+        error, sizeof(error));
+    CHECK(range != NULL);
+    CHECK(media_http_range_stats(range, &stats)
+          && stats.lookahead_slots == 1u
+          && stats.lookahead_fetch_limit == 1u);
+    media_http_range_set_lookahead_limit(range, 2u);
+    CHECK(media_http_range_stats(range, &stats)
+          && stats.lookahead_slots == 2u
+          && stats.lookahead_fetch_limit == 2u);
+    media_http_range_destroy(range);
+    CHECK(budget.current == 0);
+}
+
 static void test_buffering_policy_hysteresis(void)
 {
     const uint64_t origin = UINT64_C(1000000);
@@ -225,6 +277,112 @@ static void test_buffering_burst_and_slow_recovery_scenario(void)
 #undef APPLY_BUFFER_TICK
 }
 
+static void test_range_window_liveness_policy(void)
+{
+    /* A healthy-but-slow link keeps every useful byte. Throughput alone is
+       not evidence that reconnecting will improve the route. */
+    CHECK(media_http_window_liveness(
+              false, true, 0, UINT64_C(12000000), 0)
+          == MEDIA_HTTP_WINDOW_WAIT);
+    /* A demanded window with no byte progress receives bounded fresh
+       connections. The first is prompt, while later attempts back off so a
+       longer radio outage is not made worse by connection churn. */
+    CHECK(media_http_window_liveness(
+              false, true, MEDIA_HTTP_STARVED_NO_PROGRESS_US,
+              MEDIA_HTTP_STARVED_NO_PROGRESS_US, 0)
+          == MEDIA_HTTP_WINDOW_RECONNECT);
+    CHECK(media_http_window_liveness(
+              false, true, MEDIA_HTTP_STARVED_NO_PROGRESS_US,
+              MEDIA_HTTP_STARVED_NO_PROGRESS_US,
+              1u) == MEDIA_HTTP_WINDOW_WAIT);
+    CHECK(media_http_window_liveness(
+              false, true, 2u * MEDIA_HTTP_STARVED_NO_PROGRESS_US,
+              3u * MEDIA_HTTP_STARVED_NO_PROGRESS_US,
+              1u) == MEDIA_HTTP_WINDOW_RECONNECT);
+    CHECK(media_http_window_liveness(
+              false, true, UINT64_C(20000000), UINT64_C(20000000),
+              MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS)
+          == MEDIA_HTTP_WINDOW_WAIT);
+    /* One-byte trickles cannot keep an incident alive forever. */
+    CHECK(media_http_window_liveness(
+              false, true, 0,
+              MEDIA_HTTP_DEMANDED_WINDOW_DEADLINE_US,
+              0)
+          == MEDIA_HTTP_WINDOW_FAIL);
+    CHECK(media_http_window_liveness(
+              true, true, UINT64_MAX, UINT64_MAX,
+              MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS)
+          == MEDIA_HTTP_WINDOW_WAIT);
+    CHECK(media_http_window_liveness(
+              false, false, UINT64_MAX, UINT64_MAX,
+              MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS)
+          == MEDIA_HTTP_WINDOW_WAIT);
+
+    /* The production tracker accepts the same observations without a socket
+       or wall-clock sleep. This deliberately runs far below the historical
+       throughput floor while bytes keep arriving: useful progress wins. */
+    MediaHttpWindowTracker tracker = {0};
+    uint64_t now_us = UINT64_C(1000000);
+    media_http_window_tracker_request_started(&tracker, now_us);
+    media_http_window_tracker_demand(&tracker, now_us);
+    for (size_t step = 1; step <= 10u; step++) {
+        now_us += UINT64_C(1500000);
+        CHECK(media_http_window_tracker_observe(
+                  &tracker, now_us, step * 1024u, false, true)
+              == MEDIA_HTTP_WINDOW_WAIT);
+    }
+    CHECK(media_http_window_tracker_observe(
+              &tracker, now_us, 10u * 1024u, true, true)
+          == MEDIA_HTTP_WINDOW_WAIT);
+
+    /* A dead physical request is replaced three times with bounded backoff,
+       but the logical demand's original deadline and retry count survive each
+       replacement. After the third replacement it remains recoverable until
+       that absolute deadline rather than failing at roughly eight seconds. */
+    media_http_window_tracker_reset(&tracker);
+    now_us = UINT64_C(1000000);
+    media_http_window_tracker_request_started(&tracker, now_us);
+    media_http_window_tracker_demand(&tracker, now_us);
+    for (unsigned reconnect = 0;
+         reconnect < MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS; reconnect++) {
+        now_us += media_http_window_reconnect_delay_us(reconnect);
+        CHECK(media_http_window_tracker_observe(
+                  &tracker, now_us, 0, false, true)
+              == MEDIA_HTTP_WINDOW_RECONNECT);
+        media_http_window_tracker_reconnected(&tracker);
+        media_http_window_tracker_request_started(&tracker, now_us);
+    }
+    now_us += UINT64_C(10000000);
+    CHECK(media_http_window_tracker_observe(
+              &tracker, now_us, 0, false, true)
+          == MEDIA_HTTP_WINDOW_WAIT
+          && tracker.reconnects
+               == MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS);
+    now_us = tracker.demanded_started_us
+        + MEDIA_HTTP_DEMANDED_WINDOW_DEADLINE_US;
+    CHECK(media_http_window_tracker_observe(
+              &tracker, now_us, 0, false, true)
+          == MEDIA_HTTP_WINDOW_FAIL);
+
+    /* Descriptor starvation has no connection to replace. It still reaches
+       the absolute logical-window deadline, and a newly selected window gets
+       a clean incident scope. */
+    media_http_window_tracker_reset(&tracker);
+    now_us = UINT64_C(5000000);
+    media_http_window_tracker_demand(&tracker, now_us);
+    CHECK(media_http_window_tracker_observe(
+              &tracker,
+              now_us + MEDIA_HTTP_DEMANDED_WINDOW_DEADLINE_US - 1u,
+              0, false, false) == MEDIA_HTTP_WINDOW_WAIT);
+    CHECK(media_http_window_tracker_observe(
+              &tracker,
+              now_us + MEDIA_HTTP_DEMANDED_WINDOW_DEADLINE_US,
+              0, false, false) == MEDIA_HTTP_WINDOW_FAIL);
+    media_http_window_tracker_reset(&tracker);
+    CHECK(!tracker.demanded && tracker.reconnects == 0
+          && tracker.last_progress_bytes == 0);
+}
+
 static bool cadence_url_allowed(const char *url)
 {
     return url != NULL && strncmp(url, "http://127.0.0.1:", 17u) == 0;
@@ -281,6 +439,28 @@ static MediaHttpRange *open_range_with_lookahead(
     return range;
 }
 
+static MediaHttpRange *open_range_with_two_lookaheads(
+    Budget *budget, int port, uint64_t length, size_t cache_bytes)
+{
+    char url[256];
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%d/query200/media.mp4", port);
+    MediaHttpRangeOptions options = {
+        .cache_bytes = cache_bytes,
+        .lookahead_windows = 2u,
+        .initial_lookahead_windows = 1u,
+        .stream_publication_bytes = 16u * 1024u,
+        .timeout_ms = 15000,
+        .connect_timeout_ms = 3000,
+        .url_validator = cadence_url_allowed
+    };
+    char error[256] = {0};
+    MediaHttpRange *range = media_http_range_create(
+        budget, NULL, url, length, &options, error, sizeof(error));
+    if (range == NULL) printf("open two-lookahead failed: %s\n", error);
+    return range;
+}
+
 static MediaHttpRange *open_cadence_source(
     Budget *budget, const char *mode, int port, uint64_t length,
     bool lookahead, size_t publication_bytes)
@@ -290,7 +470,8 @@ static MediaHttpRange *open_cadence_source(
              "http://127.0.0.1:%d/%s/media.mp4", port, mode);
     MediaHttpRangeOptions options = {
         .cache_bytes = 256u * 1024u,
-        .lookahead_windows = lookahead ? 1u : 0u,
+        .lookahead_windows = lookahead ? 2u : 0u,
+        .initial_lookahead_windows = lookahead ? 1u : 0u,
         .stream_publication_bytes = publication_bytes,
         .timeout_ms = 15000,
         .connect_timeout_ms = 3000,
@@ -346,6 +527,44 @@ static void test_blocking_open_read(int port, uint64_t length,
     CHECK(media_http_range_stats(range, &stats) && stats.requests == 1
           && stats.cache_hits != 0);
     media_http_range_destroy(range);
+    CHECK(budget.current == 0);
+}
+
+static void test_standard_range_header(int port, uint64_t length)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    char url[256];
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%d/partial206/media.mp4", port);
+    TilefinchRequestContext context = {
+        .target_url = url,
+        .initiator_url = url,
+        .top_level_url = url,
+        .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_MEDIA
+    };
+    MediaHttpRangeOptions options = {
+        .cache_bytes = 64u * 1024u,
+        .timeout_ms = 15000,
+        .connect_timeout_ms = 3000,
+        .standard_range_header = true,
+        .page_request_context = &context
+    };
+    char error[256] = {0};
+    MediaHttpRange *range = media_http_range_create(
+        &budget, NULL, url, length, &options, error, sizeof(error));
+    CHECK(range != NULL);
+    if (range != NULL) {
+        MediaRangeReader reader = media_http_range_reader(range);
+        unsigned char bytes[8] = {0};
+        CHECK(reader.read(reader.opaque, 0, bytes, sizeof(bytes)));
+        for (size_t at = 0; at < sizeof(bytes); at++)
+            CHECK(bytes[at] == expected_byte(at));
+        media_http_range_destroy(range);
+    }
     CHECK(budget.current == 0);
 }
 
@@ -646,11 +865,11 @@ static void test_completed_readahead_bridges_a_logical_read(
 }
 
 /*
- * A low-bitrate video may retain one completed successor and put the next
- * successor on the wire. Once promoted, that same auxiliary allocation is
- * the immediately previous window: keep it until demand rotates the completed
- * transport response into place. Lazy MP4 parsing legitimately revisits a
- * moof a few bytes behind the arbitrary cache boundary.
+ * The 512 KiB fallback retains one completed successor and does not fetch a
+ * second until promotion makes that successor active. Its auxiliary then
+ * becomes the immediate predecessor: keep it until demand rotates the next
+ * response into place. Lazy MP4 parsing legitimately revisits a moof a few
+ * bytes behind the arbitrary cache boundary.
  */
 static void test_owned_lookahead_pipelines_three_windows(
     int port, uint64_t length)
@@ -672,10 +891,10 @@ static void test_owned_lookahead_pipelines_three_windows(
     for (unsigned frame = 0; frame < 4000u; frame++) {
         (void) media_http_range_pump(range);
         CHECK(media_http_range_stats(range, &stats));
-        if (stats.lookahead_installs >= 1 && stats.requests >= 3) break;
+        if (stats.lookahead_installs >= 1) break;
         usleep(1000);
     }
-    CHECK(stats.lookahead_installs == 1 && stats.requests == 3
+    CHECK(stats.lookahead_installs == 1 && stats.requests == 2
           && stats.lookahead_retained_bytes == 64u * 1024u);
     unsigned char spanning[64] = {0};
     uint64_t boundary = 64u * 1024u - 32u;
@@ -735,6 +954,81 @@ static void test_owned_lookahead_pipelines_three_windows(
           && stats.lookahead_promotions >= 4
           && stats.requests == 5
           && stats.failures == 0);
+    media_http_range_destroy(range);
+    CHECK(budget.current == 0);
+}
+
+static void test_second_lookahead_waits_for_audio_reserve(
+    int port, uint64_t length)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    MediaHttpRange *range = open_range_with_two_lookaheads(
+        &budget, port, length, 64u * 1024u);
+    CHECK(range != NULL);
+    if (range == NULL) return;
+    MediaRangeReader reader = media_http_range_reader(range);
+    unsigned char sample[16] = {0};
+    CHECK(reader.read(reader.opaque, 0, sample, sizeof(sample)));
+    CHECK(reader.read(
+        reader.opaque, 20u * 1024u, sample, sizeof(sample)));
+    media_http_range_set_aggressive_readahead(range, true);
+
+    MediaHttpRangeStats stats = {0};
+    for (unsigned frame = 0; frame < 4000u; frame++) {
+        (void) media_http_range_pump(range);
+        CHECK(media_http_range_stats(range, &stats));
+        if (stats.lookahead_installs == 1u) break;
+        usleep(1000);
+    }
+    CHECK(stats.lookahead_slots == 1u
+          && stats.lookahead_fetch_limit == 1u
+          && stats.lookahead_installs == 1u
+          && stats.requests == 2u);
+    for (unsigned frame = 0; frame < 50u; frame++) {
+        (void) media_http_range_pump(range);
+        usleep(1000);
+    }
+    CHECK(media_http_range_stats(range, &stats)
+          && stats.requests == 2u
+          && stats.lookahead_installs == 1u);
+
+    /* This is the audio-reserve edge in production. Raising the limit starts
+       exactly one additional successor; startup itself waited only for the
+       first window above. */
+    media_http_range_set_lookahead_limit(range, 2u);
+    for (unsigned frame = 0; frame < 4000u; frame++) {
+        (void) media_http_range_pump(range);
+        CHECK(media_http_range_stats(range, &stats));
+        if (stats.lookahead_installs == 2u) break;
+        usleep(1000);
+    }
+    CHECK(stats.lookahead_fetch_limit == 2u
+          && stats.lookahead_installs == 2u
+          && stats.requests == 3u
+          && stats.lookahead_retained_bytes == 128u * 1024u);
+    media_http_range_set_lookahead_limit(range, 1u);
+    CHECK(reader.poll(
+              reader.opaque, 64u * 1024u, sample, sizeof(sample))
+          == MEDIA_RANGE_READ_COMPLETE);
+    for (unsigned frame = 0; frame < 50u; frame++) {
+        (void) media_http_range_pump(range);
+        usleep(1000);
+    }
+    CHECK(media_http_range_stats(range, &stats)
+          && stats.lookahead_fetch_limit == 1u
+          && stats.requests == 3u);
+    media_http_range_set_lookahead_limit(range, 2u);
+    CHECK(media_http_range_resident(
+        range, 128u * 1024u, sizeof(sample)));
+    CHECK(reader.poll(
+              reader.opaque, 128u * 1024u, sample, sizeof(sample))
+          == MEDIA_RANGE_READ_COMPLETE);
+    for (size_t at = 0; at < sizeof(sample); at++)
+        CHECK(sample[at] == expected_byte(128u * 1024u + at));
+    CHECK(media_http_range_stats(range, &stats)
+          && stats.lookahead_fetch_limit == 2u
+          && stats.requests == 4u);
     media_http_range_destroy(range);
     CHECK(budget.current == 0);
 }
@@ -1243,6 +1537,88 @@ static void test_a_pending_window_needs_someone_to_pump(
     CHECK(budget.current == 0);
 }
 
+static void test_slow_progress_is_retained(int port, uint64_t length)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    MediaHttpRange *range = open_range(
+        &budget, "slow-progress", port, length, 64u * 1024u);
+    CHECK(range != NULL);
+    if (range == NULL) return;
+    MediaRangeReader reader = media_http_range_reader(range);
+    unsigned char probe[8] = {0};
+    MediaRangeReadStatus status = MEDIA_RANGE_READ_WOULD_BLOCK;
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    while (status == MEDIA_RANGE_READ_WOULD_BLOCK
+           && tilefinch_platform_monotonic_time_us() - started_us
+                  < UINT64_C(12000000)) {
+        status = reader.poll(reader.opaque, 0, probe, sizeof(probe));
+        (void) media_http_range_pump(range);
+        usleep(10000);
+    }
+    MediaHttpRangeStats stats = {0};
+    CHECK(status == MEDIA_RANGE_READ_COMPLETE);
+    CHECK(media_http_range_stats(range, &stats)
+          && stats.reconnects == 0
+          && stats.stalled_reconnect_exhaustions == 0
+          && stats.failures == 0);
+    media_http_range_destroy(range);
+    CHECK(budget.current == 0);
+}
+
+static void test_prolonged_window_can_be_superseded(
+    int port, uint64_t length)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    MediaHttpRange *range = open_range(
+        &budget, "stall-window", port, length, 64u * 1024u);
+    CHECK(range != NULL);
+    if (range == NULL) return;
+    MediaRangeReader reader = media_http_range_reader(range);
+    unsigned char probe[8] = {0};
+    CHECK(reader.read(reader.opaque, 0, probe, sizeof(probe)));
+
+    const uint64_t failed_offset = 256u * 1024u;
+    MediaRangeReadStatus status = MEDIA_RANGE_READ_WOULD_BLOCK;
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    while (status == MEDIA_RANGE_READ_WOULD_BLOCK
+           && tilefinch_platform_monotonic_time_us() - started_us
+                  < UINT64_C(16000000)) {
+        status = reader.poll(
+            reader.opaque, failed_offset, probe, sizeof(probe));
+        (void) media_http_range_pump(range);
+        usleep(10000);
+    }
+    MediaHttpRangeStats stats = {0};
+    CHECK(status == MEDIA_RANGE_READ_WOULD_BLOCK);
+    CHECK(media_http_range_stats(range, &stats)
+          && stats.window_pending && !stats.delivery_stalled
+          && stats.reconnects == MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS
+          && stats.stalled_reconnect_exhaustions == 0u
+          && stats.failures == 0u);
+
+    /* A seek or later sample selecting a different logical window starts a
+       fresh incident immediately. It must neither wait for the old incident's
+       absolute deadline nor inherit its reconnect cap. */
+    const uint64_t healthy_offset = 512u * 1024u;
+    status = MEDIA_RANGE_READ_WOULD_BLOCK;
+    started_us = tilefinch_platform_monotonic_time_us();
+    while (status == MEDIA_RANGE_READ_WOULD_BLOCK
+           && tilefinch_platform_monotonic_time_us() - started_us
+                  < UINT64_C(5000000)) {
+        status = reader.poll(
+            reader.opaque, healthy_offset, probe, sizeof(probe));
+        (void) media_http_range_pump(range);
+        usleep(10000);
+    }
+    CHECK(status == MEDIA_RANGE_READ_COMPLETE);
+    CHECK(media_http_range_stats(range, &stats)
+          && !stats.delivery_stalled && !stats.window_pending);
+    media_http_range_destroy(range);
+    CHECK(budget.current == 0);
+}
+
 /*
  * The open hang, reduced to its mechanism.
  *
@@ -1395,6 +1771,8 @@ static bool run_cadence_case(
     MediaHttpRange *range = open_cadence_source(
         &budget, "cadence", port, length, true, publication_bytes);
     if (range == NULL) return false;
+    /* This fixture is video-only, so there is no audio range to protect. */
+    media_http_range_set_lookahead_limit(range, 2u);
     MediaRangeReader reader = media_http_range_reader(range);
     char error[256] = {0};
     MediaMp4Demux *demux = media_mp4_open(
@@ -1581,9 +1959,10 @@ static bool run_coupled_cadence(
     const uint64_t run_media_us = UINT64_C(30000000);
     const uint64_t wall_limit_us = profile != NULL
             && strcmp(profile, "chaos-recovery") == 0
-        ? UINT64_C(65000000) : UINT64_C(50000000);
+        ? UINT64_C(80000000) : UINT64_C(50000000);
     const uint64_t audio_period_us = UINT64_C(23220);
-    const uint64_t maximum_track_lead_us = UINT64_C(250000);
+    const uint64_t maximum_track_lead_us = UINT64_C(75000);
+    const uint64_t skew_recovery_limit_us = UINT64_C(500000);
     const size_t audio_block_bytes = 384u;
     Budget budget;
     budget_init(&budget, 24u * 1024u * 1024u);
@@ -1634,6 +2013,8 @@ static bool run_coupled_cadence(
     uint64_t video_media_us = 0;
     uint64_t audio_media_us = 0;
     uint64_t maximum_skew_us = 0;
+    uint64_t skew_excursion_started_us = 0;
+    uint64_t maximum_skew_recovery_us = 0;
     uint64_t video_hold_started_us = 0;
     uint64_t audio_hold_started_us = 0;
     uint64_t video_held_us = 0;
@@ -1653,6 +2034,7 @@ static bool run_coupled_cadence(
     unsigned buffer_begins = 0;
     unsigned buffer_ends = 0;
     bool have_video_sample = false;
+    bool have_video_payload = false;
     MediaMp4Sample sample = {0};
     bool complete = false;
     while (tilefinch_platform_monotonic_time_us() - wall_started_us
@@ -1661,7 +2043,7 @@ static bool run_coupled_cadence(
         bool source_blocked = false;
         (void) media_http_range_pump(video);
         (void) media_http_range_pump(audio);
-        if (!buffering && !have_video_sample) {
+        if (!have_video_sample) {
             if (media_mp4_next_sample(demux, &sample)) {
                 if (sample.kind == MEDIA_MP4_TRACK_VIDEO) {
                     have_video_sample = true;
@@ -1700,7 +2082,7 @@ static bool run_coupled_cadence(
                 break;
             }
         }
-        if (!buffering && have_video_sample) {
+        if (have_video_sample) {
             uint64_t dts_us = sample.timescale == 0 ? 0
                 : sample.dts * UINT64_C(1000000) / sample.timescale;
             uint64_t next_video_us = dts_us - first_video_dts_us;
@@ -1709,31 +2091,42 @@ static bool run_coupled_cadence(
                 complete = true;
                 break;
             }
-            if (now_us >= wall_started_us + timeline_paused_us
-                              + next_video_us) {
-                if (audio_blocks != 0
-                    && next_video_us
-                           > audio_media_us + maximum_track_lead_us) {
-                    sync_holds++;
-                } else {
-                    if (media_mp4_read_sample(
-                            demux, &sample, payload, payload_capacity)) {
-                        if (video_hold_started_us != 0) {
-                            video_held_us += now_us - video_hold_started_us;
-                            video_hold_started_us = 0;
-                        }
-                        video_presented++;
-                        video_media_us = next_video_us;
-                        have_video_sample = false;
-                    } else if (media_mp4_would_block(demux)) {
-                        source_blocked = true;
-                        if (video_hold_started_us == 0) {
-                            video_hold_started_us = now_us;
-                            video_holds++;
-                        }
-                    } else {
-                        break;
+            bool due = now_us >= wall_started_us + timeline_paused_us
+                + next_video_us;
+            bool sync_ready = audio_blocks == 0
+                || next_video_us <= audio_media_us + maximum_track_lead_us;
+            /* Buffering holds presentation, not source/decode work. Preserve
+               one fetched sample while the clock is stopped so a shifted
+               recovery window can be installed and contribute to readiness.
+               The old harness stopped calling read_sample here and could
+               deadlock its own refill even though the server had delivered
+               the complete response. */
+            if (!have_video_payload && (buffering || (due && sync_ready))) {
+                if (media_mp4_read_sample(
+                        demux, &sample, payload, payload_capacity)) {
+                    if (video_hold_started_us != 0) {
+                        video_held_us += now_us - video_hold_started_us;
+                        video_hold_started_us = 0;
                     }
+                    have_video_payload = true;
+                } else if (media_mp4_would_block(demux)) {
+                    source_blocked = true;
+                    if (video_hold_started_us == 0) {
+                        video_hold_started_us = now_us;
+                        video_holds++;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if (!buffering && due) {
+                if (!sync_ready) {
+                    sync_holds++;
+                } else if (have_video_payload) {
+                    video_presented++;
+                    video_media_us = next_video_us;
+                    have_video_payload = false;
+                    have_video_sample = false;
                 }
             }
         }
@@ -1749,6 +2142,8 @@ static bool run_coupled_cadence(
             media_http_range_buffered_ahead_us(video, duration_us);
         uint64_t audio_ahead_us =
             media_http_range_buffered_ahead_us(audio, duration_us);
+        media_http_range_set_lookahead_limit(
+            video, psp_media_video_lookahead_limit(true, audio_ahead_us));
         uint64_t network_ahead_us = video_ahead_us < audio_ahead_us
             ? video_ahead_us : audio_ahead_us;
         uint64_t media_clock_us = video_media_us < audio_media_us
@@ -1803,6 +2198,22 @@ static bool run_coupled_cadence(
                 ? video_media_us - audio_media_us
                 : audio_media_us - video_media_us;
             if (skew > maximum_skew_us) maximum_skew_us = skew;
+            if (skew > maximum_track_lead_us) {
+                /* Time correction only while correction is possible. A CDN
+                   outage and the intentional buffering hold are availability
+                   time, not a skew-controller response; restart the clock at
+                   the first unblocked presentation opportunity. */
+                if (buffering || source_blocked) {
+                    skew_excursion_started_us = 0;
+                } else if (skew_excursion_started_us == 0) {
+                    skew_excursion_started_us = now_us;
+                }
+            } else if (skew_excursion_started_us != 0) {
+                uint64_t recovery_us = now_us - skew_excursion_started_us;
+                if (recovery_us > maximum_skew_recovery_us)
+                    maximum_skew_recovery_us = recovery_us;
+                skew_excursion_started_us = 0;
+            }
         }
         usleep(1000);
     }
@@ -1818,15 +2229,18 @@ static bool run_coupled_cadence(
     CHECK(media_http_range_stats(audio, &audio_stats));
     printf(
         "coupled(%s): video=%u holds=%u/%llums audio=%u holds=%u/%llums "
-        "max-skew=%llums sync-holds=%u requests=%zu/%zu "
+        "max-skew=%llums skew-recovery=%llums sync-holds=%u requests=%zu/%zu "
         "reconnects=%zu/%zu starved=%zu/%zu retries=%zu/%zu failures=%zu/%zu "
-        "buffer-ui=%u/%u shortest=%llums clear=%llums\n",
+        "buffer-ui=%u/%u shortest=%llums clear=%llums "
+        "video-window=pending:%u stalled:%u bytes:%zu "
+        "fill:%llu+%zu cache:%llu+%zu read:%llu+%zu http:%ld\n",
         profile == NULL ? "unknown" : profile,
         video_presented, video_holds,
         (unsigned long long) (video_held_us / 1000u),
         audio_blocks, audio_holds,
         (unsigned long long) (audio_held_us / 1000u),
-        (unsigned long long) (maximum_skew_us / 1000u), sync_holds,
+        (unsigned long long) (maximum_skew_us / 1000u),
+        (unsigned long long) (maximum_skew_recovery_us / 1000u), sync_holds,
         video_stats.requests, audio_stats.requests,
         video_stats.reconnects, audio_stats.reconnects,
         video_stats.starved_reconnects, audio_stats.starved_reconnects,
@@ -1836,14 +2250,38 @@ static bool run_coupled_cadence(
         (unsigned long long) (shortest_buffer_us == UINT64_MAX
             ? 0 : shortest_buffer_us / 1000u),
         (unsigned long long) (shortest_clear_us == UINT64_MAX
-            ? 0 : shortest_clear_us / 1000u));
-    CHECK(maximum_skew_us <= maximum_track_lead_us + UINT64_C(50000));
+            ? 0 : shortest_clear_us / 1000u),
+        video_stats.window_pending ? 1u : 0u,
+        video_stats.delivery_stalled ? 1u : 0u,
+        video_stats.bytes_in_flight,
+        (unsigned long long) video_stats.fill_offset,
+        video_stats.fill_length,
+        (unsigned long long) video_stats.cache_offset,
+        video_stats.cache_length,
+        (unsigned long long) video_stats.last_read_offset,
+        video_stats.last_read_length,
+        video_stats.last_http_status);
+    /* Whole 41.7 ms video frames and 23.2 ms AAC blocks can cross the 75 ms
+       hold edge in one scheduling visit. Bound that discrete overshoot to a
+       second 75 ms, then independently require prompt convergence below. */
+    uint64_t skew_ceiling_us = profile != NULL
+            && strcmp(profile, "chaos-recovery") == 0
+        /* Before the deliberate buffering hold begins, the 350 ms anti-
+           flutter debounce may let the audible cursor advance while video
+           has no bytes. Bound that designed interval plus the 75 ms track
+           lead; post-refill convergence is still gated separately below. */
+        ? PSP_MEDIA_BUFFER_DEBOUNCE_US + maximum_track_lead_us
+        : maximum_track_lead_us + UINT64_C(75000);
+    CHECK(maximum_skew_us <= skew_ceiling_us);
+    CHECK(skew_excursion_started_us == 0
+          && maximum_skew_recovery_us <= skew_recovery_limit_us);
     CHECK(video_stats.failures == 0 && audio_stats.failures == 0);
     if (profile != NULL && strcmp(profile, "chaos-recovery") == 0) {
         /* The composite schedule must actually exercise both recovery laws
-           and present one stable buffering surface rather than fluttering at
-           burst boundaries. One long outage may create one UI episode; the
-           later response loss is recovered under the existing reserve. */
+           and present stable buffering surfaces rather than fluttering at
+           burst boundaries. The long outage and later response loss may each
+           create one episode, but every episode must close after a stable
+           refill. */
         CHECK(video_stats.reconnects >= 2u
               && video_stats.requests >= 5u);
         CHECK(buffer_begins >= 1u && buffer_begins == buffer_ends);
@@ -1889,7 +2327,6 @@ static void test_deterministic_cadence(
               && large.transport.starved_reconnects >= 1
               && large.transport.starved_reconnects
                      <= large.transport.reconnects
-              && large.longest_hold_us >= MEDIA_HTTP_STARVED_NO_PROGRESS_US
               && large.longest_hold_us
                      < MEDIA_HTTP_TRICKLE_WINDOW_US / 2u);
     }
@@ -1909,8 +2346,32 @@ static void test_deterministic_cadence(
 
 int main(int argc, char **argv)
 {
+    char range_header[64];
+    uint64_t complete_length = 0;
+    CHECK(media_http_build_range_header(
+              17, 39, range_header, sizeof(range_header))
+          && strcmp(range_header, "Range: bytes=17-39") == 0
+          && media_http_parse_content_range(
+                 "bytes 17-39/4096", 17, 39, 23,
+                 &complete_length)
+          && complete_length == 4096
+          && !media_http_parse_content_range(
+                 "bytes 17-38/4096", 17, 39, 23,
+                 &complete_length));
     test_buffering_policy_hysteresis();
     test_buffering_burst_and_slow_recovery_scenario();
+    test_range_window_liveness_policy();
+    test_video_lookahead_policy();
+    test_optional_second_lookahead_budget_fallback();
+    if (argc == 2 && strcmp(argv[1], "--policy-only") == 0) {
+        if (failures != 0) {
+            printf("media-window-policy-tests: %d check(s) failed\n",
+                   failures);
+            return 1;
+        }
+        puts("media-window-policy-tests: all checks passed");
+        return 0;
+    }
     if (argc != 6 && argc != 9) {
         printf("usage: %s PORT LENGTH FRAGMENTED-LENGTH FRAGMENTS "
                "SAMPLES-PER-FRAGMENT [--cadence LENGTH PROFILE]\n",
@@ -1939,6 +2400,8 @@ int main(int argc, char **argv)
     test_blocking_open_read(port, length, "query200", 200);
     puts("test: a bounded partial response installs the same way");
     test_blocking_open_read(port, length, "partial206", 206);
+    puts("test: an HTML media source uses a standard Range header");
+    test_standard_range_header(port, length);
     puts("test: a read across a window boundary fetches both");
     test_window_crossing(port, length);
     puts("test: a poll never waits and completes on a later pump");
@@ -1953,6 +2416,8 @@ int main(int argc, char **argv)
     test_completed_readahead_bridges_a_logical_read(port, length);
     puts("test: owned lookahead pipelines three sequential windows");
     test_owned_lookahead_pipelines_three_windows(port, length);
+    puts("test: second lookahead waits for healthy audio reserve");
+    test_second_lookahead_waits_for_audio_reserve(port, length);
     puts("test: a streamed successor prefix is visible before EOF");
     test_streamed_successor_is_visible_before_eof(port, length);
     puts("test: a stream without Content-Length waits for EOF admission");
@@ -1978,59 +2443,14 @@ int main(int argc, char **argv)
         "fragment-slow", true);
     puts("test: a pending window advances only across a wait that pumps");
     test_a_pending_window_needs_someone_to_pump(port, fragmented_length);
+    puts("test: slow useful bytes are retained without reconnect churn");
+    test_slow_progress_is_retained(port, length);
+    puts("test: a prolonged demanded window remains supersedable");
+    test_prolonged_window_can_be_superseded(port, length);
     puts("test: one transaction budget bounds every blocking read in it");
     test_a_transaction_budget_bounds_every_read_in_it(port, length);
     puts("test: a stalled read answers a stop request inside the law");
     test_a_stalled_read_answers_cancellation_inside_the_law(port, length);
-
-    puts("test: a trickling window is told apart from a slow one");
-    /*
-     * The verdict that decides whether a transfer is torn down and re-issued
-     * onto a new connection, so it has to be wrong in only one direction. A
-     * device soak measured an audio window moving 16 KiB in six seconds --
-     * about 2.7 KB/s, a 256 KiB window sixteen seconds away -- while the same
-     * link delivers 150-250 KB/s when it is behaving.
-    */
-    CHECK(media_http_range_trickling(
-              21845u, UINT64_C(8000000)));
-    /* Never on a short look: jitter, a pump that did not get scheduled, or a
-       burst boundary must not be able to tear down a healthy transfer. */
-    CHECK(!media_http_range_trickling(0u, UINT64_C(7999999)));
-    /* And never on a rate that could still carry either admitted stream. The
-       variable-rate AAC validation source averages about 16 KiB/s; the floor
-       sits below that
-       and far above the measured connection that had stopped. */
-    CHECK(!media_http_range_trickling(
-              MEDIA_HTTP_TRICKLE_FLOOR_BYTES_PER_SECOND * 8u,
-              UINT64_C(8000000))
-          && !media_http_range_trickling(
-              150u * 1024u * 8u, UINT64_C(8000000))
-          && media_http_range_trickling(0u, UINT64_C(8000000)));
-    /* A response which has already reached COMPLETE can sit in the bounded
-       response buffer until playback reaches the boundary. Zero growth there
-       is retained data, never a dead connection to tear down. */
-    CHECK(!media_http_range_should_reconnect(
-              true, 0u, UINT64_C(8000000))
-          && media_http_range_should_reconnect(
-              false, 0u, UINT64_C(8000000)));
-    /* A stream-specific floor catches a transfer which clears the generic
-       liveness floor but still cannot replenish that track in real time. */
-    CHECK(!media_http_range_should_reconnect_at_rate(
-              false, 160u * 1024u, UINT64_C(8000000), 20u * 1024u)
-          && media_http_range_should_reconnect_at_rate(
-              false, 128u * 1024u, UINT64_C(8000000), 20u * 1024u)
-          && !media_http_range_should_reconnect_at_rate(
-              true, 0u, UINT64_C(8000000), 20u * 1024u));
-    /* The shorter decision is legal only after a read has actually blocked,
-       and only after a complete no-progress interval. */
-    CHECK(!media_http_range_should_reconnect_starved(
-              false, false, MEDIA_HTTP_STARVED_NO_PROGRESS_US * 2u)
-          && !media_http_range_should_reconnect_starved(
-              false, true, MEDIA_HTTP_STARVED_NO_PROGRESS_US - 1u)
-          && media_http_range_should_reconnect_starved(
-              false, true, MEDIA_HTTP_STARVED_NO_PROGRESS_US)
-          && !media_http_range_should_reconnect_starved(
-              true, true, MEDIA_HTTP_STARVED_NO_PROGRESS_US * 2u));
 
     if (failures != 0) {
         printf("media-range-tests: %d check(s) failed\n", failures);

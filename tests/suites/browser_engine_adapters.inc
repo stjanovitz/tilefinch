@@ -47,6 +47,38 @@ static int test_cooperative_site_adapter_navigation(void)
                  "Stable incumbent") == 0);
     fetch_trace_end();
 
+    /* Rapid route changes must retire the candidate adapter completely and
+       leave the incumbent usable. Vary the cancellation point across the
+       transport and transform phases; this is the host equivalent of Back or
+       a new search arriving while a watch page is still being assembled. */
+    for (size_t cycle = 0; cycle < 24u; cycle++) {
+        CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error))
+              && browser_engine_begin_navigation_url(
+                     engine, url, 1u * MIB, 1000, false));
+        BrowserNavigationJobStatus cancelled_status =
+            BROWSER_NAVIGATION_JOB_PENDING;
+        size_t slices = 1u + cycle % 6u;
+        for (size_t at = 0;
+             at < slices
+             && cancelled_status == BROWSER_NAVIGATION_JOB_PENDING;
+             at++) {
+            cancelled_status = browser_engine_pump_navigation(
+                engine, &quota);
+        }
+        CHECK(cancelled_status == BROWSER_NAVIGATION_JOB_PENDING);
+        browser_engine_cancel_navigation(
+            engine, "rapid YouTube route cancellation test");
+        BrowserEngineMetrics cancelled_metrics = {0};
+        CHECK(browser_engine_navigation_status(engine)
+                  == BROWSER_NAVIGATION_JOB_CANCELLED
+              && browser_engine_metrics(engine, &cancelled_metrics)
+              && cancelled_metrics.allocation_failures == 0
+              && strcmp(
+                     browser_engine_navigation(engine)->page.document.title,
+                     "Stable incumbent") == 0);
+        fetch_trace_end();
+    }
+
     /* Optional continuation failure degrades to the watch page rather than
        discarding a valid primary response. Inject after begin so the already
        enqueued primary request is unaffected and the second enqueue consumes
@@ -152,6 +184,45 @@ static int test_cooperative_site_adapter_navigation(void)
           && strstr(body_text, "View comments") != NULL
           && strstr(body_text, "Cooperative comment") == NULL);
     fetch_trace_end();
+
+    /* Same-site repeat navigation should reach the same result with bounded
+       logical work and no accumulating page allocations. Wall-clock timing is
+       deliberately not asserted: pump counts and transform slices are stable
+       across noisy host runners and correspond to work on the PSP. */
+    BrowserEngineMetrics repeat_baseline = {0};
+    CHECK(browser_engine_metrics(engine, &repeat_baseline));
+    size_t repeat_pump_ceiling = 0;
+    size_t repeat_transform_ceiling = 0;
+    for (size_t cycle = 0; cycle < 16u; cycle++) {
+        CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error))
+              && browser_engine_begin_navigation_url(
+                     engine, watch_url, 1u * MIB, 1000, false));
+        status = BROWSER_NAVIGATION_JOB_PENDING;
+        for (size_t pumps = 0;
+             pumps < 128 && status == BROWSER_NAVIGATION_JOB_PENDING;
+             pumps++) {
+            status = browser_engine_pump_navigation(engine, &quota);
+        }
+        BrowserNavigationJobMetrics repeat_job = {0};
+        BrowserEngineMetrics repeat_engine = {0};
+        CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+              && browser_engine_navigation_job_metrics(engine, &repeat_job)
+              && browser_engine_metrics(engine, &repeat_engine)
+              && repeat_engine.allocation_failures == 0
+              && repeat_engine.budget_current
+                     <= repeat_baseline.budget_current + 8u * 1024u
+              && repeat_engine.budget_active_allocations
+                     <= repeat_baseline.budget_active_allocations + 8u);
+        if (cycle == 0) {
+            repeat_pump_ceiling = repeat_job.pump_calls + 2u;
+            repeat_transform_ceiling = repeat_job.transform_slices + 2u;
+        } else {
+            CHECK(repeat_job.pump_calls <= repeat_pump_ceiling
+                  && repeat_job.transform_slices
+                         <= repeat_transform_ceiling);
+        }
+        fetch_trace_end();
+    }
 
     /* Provider cards contain several LinkRegions per semantic anchor. Focus
        traversal and history store the anchor ordinal, not a text fragment. */
@@ -452,16 +523,16 @@ static int test_reader_presentation_adapter(void)
               "https://en.m.wikipedia.org/wiki/PSP",
               SITE_ADAPTER_READER_FONT_SERIF, 125,
               css, sizeof(css), adapter, sizeof(adapter))
-          && strcmp(adapter, "reader-wikipedia") == 0
+          && strcmp(adapter, "reader-content-shape") == 0
           && strstr(css, "font-size:125%") != NULL
           && strstr(css, "font-family:serif") != NULL
-          && strstr(css, ".header-container") != NULL
+          && strstr(css, "data-tilefinch-reader-entry") != NULL
           && strlen(css) < SITE_ADAPTER_READER_CSS_LIMIT
           && site_adapter_reader_css(
               "https://news.example.test/article",
               SITE_ADAPTER_READER_FONT_SANS, 100,
               css, sizeof(css), adapter, sizeof(adapter))
-          && strcmp(adapter, "reader-generic") == 0);
+          && strcmp(adapter, "reader-content-shape") == 0);
 
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
@@ -502,6 +573,7 @@ static int test_reader_presentation_adapter(void)
         "<!doctype html><title>Next reader page</title>"
         "<header><a href='/hidden'>Hidden chrome</a></header>"
         "<article><p>Next story.</p><a href='/third'>Third</a></article>";
+    browser_engine_set_reader_candidate_mode(engine, true);
     CHECK(browser_engine_set_user_css(engine, css, strlen(css))
           && browser_engine_commit_html(
                  engine, "https://news.example.test/next",
@@ -510,6 +582,9 @@ static int test_reader_presentation_adapter(void)
           && strstr(
                  browser_engine_navigation(engine)->page.layout.links[0].url,
                  "/third") != NULL);
+    ReaderDocumentAnalysis candidate_reader = {0};
+    CHECK(browser_engine_reader_analysis(engine, &candidate_reader)
+          && candidate_reader.prepared);
     DrawCommand *reader_commands =
         browser_engine_navigation(engine)->page.layout.commands;
     budget_inject_failure_after(browser_engine_budget(engine), 0);

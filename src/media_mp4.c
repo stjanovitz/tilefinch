@@ -2840,6 +2840,77 @@ void media_mp4_close(MediaMp4Demux *demux)
 }
 #define MEDIA_H264_MAXIMUM_SPS_BYTES 512u
 
+MediaH264DecoderRoute media_h264_avcc_decoder_route(
+    const unsigned char *config, size_t length, uint8_t *profile_idc)
+{
+    if (profile_idc != NULL) *profile_idc = 0;
+    if (config == NULL || length < 10u || config[0] != 1u
+        || (config[5] & 31u) == 0u) {
+        return MEDIA_H264_DECODER_ROUTE_UNSUPPORTED;
+    }
+    size_t sps_length = ((size_t) config[6] << 8u) | config[7];
+    if (sps_length < 2u || sps_length > length - 8u
+        || (config[8] & 0x1fu) != 7u || config[1] != config[9]) {
+        return MEDIA_H264_DECODER_ROUTE_UNSUPPORTED;
+    }
+    uint8_t profile = config[9];
+    if (profile_idc != NULL) *profile_idc = profile;
+    if (profile == 66u || profile == 77u) {
+        return MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE;
+    }
+    if (profile == 100u || profile == 110u || profile == 122u
+        || profile == 244u || profile == 44u || profile == 83u
+        || profile == 86u || profile == 118u || profile == 128u
+        || profile == 138u || profile == 139u || profile == 134u
+        || profile == 135u) {
+        return MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION;
+    }
+    return MEDIA_H264_DECODER_ROUTE_UNSUPPORTED;
+}
+
+static int media_h264_hex(unsigned char value)
+{
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    return -1;
+}
+
+MediaH264DecoderRoute media_h264_codec_string_decoder_route(
+    const char *mime, uint8_t *profile_idc)
+{
+    if (profile_idc != NULL) *profile_idc = 0;
+    if (mime == NULL) return MEDIA_H264_DECODER_ROUTE_UNSUPPORTED;
+    for (const char *at = mime; (at = strstr(at, "avc1.")) != NULL; at++) {
+        unsigned char before = at == mime ? '\0' : (unsigned char) at[-1];
+        if (!(at == mime || before == '"' || before == ',' || before == ';'
+              || before == ' ' || before == '\t')) continue;
+        unsigned value = 0;
+        bool valid = true;
+        for (size_t i = 0; i < 6u; i++) {
+            int digit = media_h264_hex((unsigned char) at[5u + i]);
+            if (digit < 0) { valid = false; break; }
+            value = (value << 4u) | (unsigned) digit;
+        }
+        if (!valid) continue;
+        unsigned char after = (unsigned char) at[11];
+        if (!(after == '\0' || after == '"' || after == ',' || after == ';'
+              || after == ' ' || after == '\t')) continue;
+        uint8_t profile = (uint8_t) (value >> 16u);
+        if (profile_idc != NULL) *profile_idc = profile;
+        if (profile == 66u || profile == 77u)
+            return MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE;
+        if (profile == 100u || profile == 110u || profile == 122u
+            || profile == 244u || profile == 44u || profile == 83u
+            || profile == 86u || profile == 118u || profile == 128u
+            || profile == 138u || profile == 139u || profile == 134u
+            || profile == 135u)
+            return MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION;
+        return MEDIA_H264_DECODER_ROUTE_UNSUPPORTED;
+    }
+    return MEDIA_H264_DECODER_ROUTE_UNSUPPORTED;
+}
+
 typedef struct {
     unsigned char data[MEDIA_H264_MAXIMUM_SPS_BYTES];
     size_t length;
@@ -3141,4 +3212,62 @@ bool media_h264_avcc_sample_is_admitted(
         cursor += nal_length;
     }
     return cursor == length;
+}
+
+static size_t media_h264_annexb_start(
+    const unsigned char *payload, size_t length, size_t cursor,
+    size_t *prefix_bytes)
+{
+    if (prefix_bytes != NULL) *prefix_bytes = 0;
+    if (payload == NULL || prefix_bytes == NULL || cursor > length)
+        return SIZE_MAX;
+    if (length - cursor < 3u) return SIZE_MAX;
+    for (size_t i = cursor; i <= length - 3u; i++) {
+        if (length - i >= 4u && payload[i] == 0 && payload[i + 1u] == 0
+            && payload[i + 2u] == 0 && payload[i + 3u] == 1u) {
+            *prefix_bytes = 4u;
+            return i;
+        }
+        if (payload[i] == 0 && payload[i + 1u] == 0
+            && payload[i + 2u] == 1u) {
+            *prefix_bytes = 3u;
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
+bool media_h264_annexb_sample_is_admitted(
+    const unsigned char *payload, size_t length,
+    uint16_t width, uint16_t height)
+{
+    if (payload == NULL || length == 0 || width == 0 || height == 0)
+        return false;
+    size_t prefix = 0;
+    size_t start = media_h264_annexb_start(
+        payload, length, 0, &prefix);
+    if (start == SIZE_MAX) return false;
+    bool saw_nal = false;
+    while (start != SIZE_MAX) {
+        size_t nal = start + prefix;
+        if (nal >= length) return false;
+        size_t next_prefix = 0;
+        size_t next = media_h264_annexb_start(
+            payload, length, nal + 1u, &next_prefix);
+        size_t nal_end = next == SIZE_MAX ? length : next;
+        if (nal_end <= nal || (payload[nal] & 0x80u) != 0
+            || (payload[nal] & 0x1fu) == 0u) return false;
+        if ((payload[nal] & 0x1fu) == 7u) {
+            uint16_t sample_width = 0, sample_height = 0;
+            if (!media_h264_sps_dimensions(
+                    payload + nal, nal_end - nal,
+                    &sample_width, &sample_height)
+                || sample_width != width || sample_height != height)
+                return false;
+        }
+        saw_nal = true;
+        start = next;
+        prefix = next_prefix;
+    }
+    return saw_nal;
 }

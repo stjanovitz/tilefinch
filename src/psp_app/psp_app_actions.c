@@ -410,6 +410,53 @@ static void psp_app_dispatch_heavy_action(
                     action.type == CONTROLLER_ACTION_NAVIGATE
                     || action.type
                          == CONTROLLER_ACTION_FORM_SUBMIT;
+                if (action.type == CONTROLLER_ACTION_MEDIA) {
+                    if (action.media_kind == MEDIA_DISCOVERY_WEBM) {
+                        psp_ui_show_status(
+                            &app->process->presentation.ui,
+                            "VIDEO FORMAT COMING SOON", 180);
+                        break;
+                    }
+                    const NavigationEntry *entry =
+                        navigation_current(app->views->navigation);
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+                    if (strcmp(app->process->config.trace, "none") == 0
+                        && !psp_ensure_network_for_navigation(
+                               app->network, app->network_lifecycle,
+                               (int) app->process->config.network_profile,
+                               "GET", action.url, true,
+                               engine_frame,
+                               &app->process->presentation.ui)) {
+                        app->interactive->previous_buttons = psp_ui_buttons(
+                            psp_navigation_observed_buttons());
+                        break;
+                    }
+#endif
+                    bool opened = entry != NULL
+                        && (action.media_kind == MEDIA_DISCOVERY_HLS
+                            ? psp_media_open_page_hls(
+                                  &app->browser->media, action.url, entry->url,
+                                  app->views->navigation->generation,
+                                  action.media_node_handle, action.media_mode,
+                                  action.media_credentials, true, false)
+                            : psp_media_open_page_source(
+                                  &app->browser->media, action.url, entry->url,
+                                  app->views->navigation->generation,
+                                  action.media_node_handle, action.media_mode,
+                                  action.media_credentials, true, false));
+                    (void) browser_engine_update_media_state(
+                        engine, action.media_node_handle,
+                        opened ? SCRIPT_MEDIA_STATE_LOADING
+                               : SCRIPT_MEDIA_STATE_ERROR,
+                        0.0, 0.0);
+                    if (!opened) {
+                        psp_ui_show_status(
+                            &app->process->presentation.ui,
+                            "VIDEO SOURCE COULD NOT OPEN", 180);
+                    }
+                    frame->page_dirty = true;
+                    break;
+                }
                 if (navigates
                     && psp_internal_action_url(
                            action.url, "address")) {
@@ -732,6 +779,15 @@ static void psp_app_dispatch_heavy_action(
             break;
         }
         case PSP_UI_ACTION_SHOW_SCREENSHOTS: {
+            if (app->process->presentation.ui.screen
+                    == PSP_UI_SCREEN_COLLECTIONS) {
+                psp_collections_sync_ui(
+                    &app->process->presentation.ui,
+                    &app->process->presentation.collections_surface,
+                    profile, &app->browser->offline_store.library,
+                    PSP_UI_COLLECTION_SCREENSHOTS);
+                break;
+            }
             psp_text_input_before_navigation(&app->process->text_input);
             psp_leave_reader_for_navigation(
                 engine, &app->process->presentation.ui, profile,
@@ -867,6 +923,14 @@ static void psp_app_dispatch_heavy_action(
             bool have_reader_anchor =
                 browser_engine_capture_text_anchor(
                     engine, reader_anchor, &reader_anchor_y);
+            ReaderDocumentAnalysis reader_analysis = {0};
+            if (enable && !browser_engine_prepare_reader(
+                    engine, &reader_analysis)) {
+                psp_ui_show_status(
+                    &app->process->presentation.ui,
+                    "READER MODE UNAVAILABLE", 180);
+                break;
+            }
             if (enable && app->process->presentation.ui.remember_reader_site_scale) {
                 (void) browser_profile_reader_site_font_percent(
                     profile, reader_url, &target_percent);
@@ -875,6 +939,7 @@ static void psp_app_dispatch_heavy_action(
                     engine, &app->process->presentation.ui, profile, enable, reader_url,
                     target_percent, true)) {
                 app->process->presentation.ui.reader_mode = enable;
+                browser_engine_set_reader_candidate_mode(engine, enable);
                 app->process->presentation.ui.page_font_percent = target_percent;
                 (void) psp_engine_views_refresh(app->views, engine);
                 if (have_reader_anchor)
@@ -906,6 +971,8 @@ static void psp_app_dispatch_heavy_action(
                 profile, url);
             bool changed = browser_profile_set_reader_site_always(
                 profile, url, enable);
+            app->process->presentation.ui.reader_site_always = changed
+                ? enable : browser_profile_reader_site_always(profile, url);
             if (changed)
                 psp_profile_store_mark_dirty(
                     &app->browser->profile_store, frame->ui_sample_us);
@@ -1280,6 +1347,7 @@ static void psp_app_dispatch_heavy_action(
             break;
         }
         case PSP_UI_ACTION_SHOW_OFFLINE:
+        case PSP_UI_ACTION_SHOW_DOWNLOADS:
         case PSP_UI_ACTION_SHOW_BOOKMARKS:
         case PSP_UI_ACTION_SHOW_HISTORY: {
             /*
@@ -1294,7 +1362,8 @@ static void psp_app_dispatch_heavy_action(
                     intent->action,
                     (PspUiCollectionSection)
                         app->process->presentation.ui.collections_section);
-            if (section == PSP_UI_COLLECTION_OFFLINE)
+            if (section == PSP_UI_COLLECTION_SAVED
+                || section == PSP_UI_COLLECTION_DOWNLOADS)
                 (void) offline_library_load(&app->browser->offline_store.library);
             if (app->process->presentation.ui.screen != PSP_UI_SCREEN_COLLECTIONS)
                 psp_ui_show_collections(&app->process->presentation.ui, section);
@@ -1304,6 +1373,33 @@ static void psp_app_dispatch_heavy_action(
             break;
         }
         case PSP_UI_ACTION_COLLECTION_ACTIVATE: {
+            if (app->process->presentation.ui.collections_section
+                    == PSP_UI_COLLECTION_SCREENSHOTS) {
+                psp_text_input_before_navigation(&app->process->text_input);
+                psp_leave_reader_for_navigation(
+                    engine, &app->process->presentation.ui, profile,
+                    "https://tilefinch.local/screenshots");
+                bool opened = psp_open_screenshot_list(
+                    engine, app->process->install_paths.data_dir, true);
+                if (opened)
+                    psp_ui_leave_native_surface(
+                        &app->process->presentation.ui);
+                (void) psp_engine_views_refresh(app->views, engine);
+                psp_sync_ui(
+                    &app->process->presentation.ui, engine, profile);
+                if (opened && tabs != NULL)
+                    (void) browser_tabs_capture_active(
+                        tabs, app->views->navigation);
+                psp_tabs_sync_ui(
+                    &app->process->presentation.ui, tabs,
+                    &app->process->presentation.tab_view);
+                frame->page_dirty = opened || frame->page_dirty;
+                psp_ui_show_status(
+                    &app->process->presentation.ui,
+                    opened ? "SCREENSHOTS" : "SCREENSHOTS UNAVAILABLE",
+                    180);
+                break;
+            }
             const char *destination = psp_collections_row_url(
                 &app->process->presentation.collections_surface, intent->list_index);
             if (destination == NULL) {
@@ -1311,7 +1407,9 @@ static void psp_app_dispatch_heavy_action(
                 break;
             }
             if (app->process->presentation.ui.collections_section
-                    == PSP_UI_COLLECTION_OFFLINE) {
+                    == PSP_UI_COLLECTION_SAVED
+                || app->process->presentation.ui.collections_section
+                    == PSP_UI_COLLECTION_DOWNLOADS) {
                 char offline_url[NAVIGATION_URL_LIMIT];
                 const OfflineLibraryItem *item =
                     offline_library_find(
@@ -1388,7 +1486,8 @@ static void psp_app_dispatch_heavy_action(
             PspUiCollectionSection section =
                 (PspUiCollectionSection) app->process->presentation.ui.collections_section;
             bool removed = false;
-            if (section == PSP_UI_COLLECTION_OFFLINE) {
+            if (section == PSP_UI_COLLECTION_SAVED
+                || section == PSP_UI_COLLECTION_DOWNLOADS) {
                 removed = offline_library_remove(
                     &app->browser->offline_store.library,
                     app->process->presentation.collections_surface.id[intent->list_index]);

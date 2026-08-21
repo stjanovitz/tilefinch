@@ -172,6 +172,45 @@ static bool test_video_only_skips_audio_open_phases(void)
     return true;
 }
 
+static bool test_audio_only_skips_video_open_phases(void)
+{
+    PspMediaMachine machine = psp_media_machine_initial();
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_OPEN,
+        .autoplay = true,
+        .has_separate_audio = true,
+        .audio_only = true
+    }));
+    CHECK(machine.audio_only);
+    CHECK(machine.opening_phase == PSP_MEDIA_OPEN_RESOLVING);
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE,
+        .has_separate_audio = true,
+        .audio_only = true
+    }));
+    CHECK(machine.opening_phase == PSP_MEDIA_OPEN_DECODER_PREPARE);
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE
+    }));
+    CHECK(machine.opening_phase == PSP_MEDIA_OPEN_AUDIO_RANGE);
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE
+    }));
+    CHECK(machine.opening_phase == PSP_MEDIA_OPEN_AUDIO_DEMUX);
+    CHECK(machine.pipeline == PSP_MEDIA_PIPELINE_PARTIAL);
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE
+    }));
+    CHECK(machine.opening_phase == PSP_MEDIA_OPEN_PLAYBACK_CREATE);
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE
+    }));
+    CHECK(machine.state == PSP_MEDIA_SESSION_PRIMING);
+    CHECK(machine.pipeline == PSP_MEDIA_PIPELINE_FULL);
+    CHECK(machine.audio_only);
+    return true;
+}
+
 static bool test_buffering_readiness_dispatch(void)
 {
     PspMediaMachine machine = psp_media_machine_initial();
@@ -674,6 +713,7 @@ int main(void)
     if (!test_open_priming_and_play()
         || !test_one_shot_presentation_boundaries()
         || !test_video_only_skips_audio_open_phases()
+        || !test_audio_only_skips_video_open_phases()
         || !test_buffering_readiness_dispatch()
         || !test_prime_ready_while_source_starved_enters_buffering()
         || !test_source_stabilizes_before_prime_ready()

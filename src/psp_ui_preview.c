@@ -1,6 +1,7 @@
 #include "tilefinch/psp_ui.h"
 #include "tilefinch/budget.h"
 #include "tilefinch/build_version.h"
+#include "tilefinch/glyph_component_store.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -343,6 +344,21 @@ int main(int argc, char **argv)
         ui.screen = PSP_UI_SCREEN_MENU;
         ui.menu_selection = 3;
         ui.toast_frames = 0;
+    } else if (strcmp(mode, "page-tools") == 0) {
+        ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+        ui.menu_selection = 5;
+        ui.reader_mode = true;
+        ui.toast_frames = 0;
+    } else if (strcmp(mode, "site-controls") == 0) {
+        ui.screen = PSP_UI_SCREEN_SITE_CONTROLS;
+        ui.menu_selection = 1;
+        ui.site_javascript_enabled = true;
+        ui.reader_site_always = true;
+        ui.toast_frames = 0;
+    } else if (strcmp(mode, "help") == 0) {
+        ui.screen = PSP_UI_SCREEN_HELP;
+        ui.menu_selection = 0;
+        ui.toast_frames = 0;
     } else if (strcmp(mode, "options") == 0) {
         ui.screen = PSP_UI_SCREEN_OPTIONS;
         ui.options_group_selection = 0;
@@ -356,7 +372,7 @@ int main(int argc, char **argv)
                || strcmp(mode, "options-plum") == 0
                || strcmp(mode, "options-ember") == 0) {
         ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
-        ui.options_selection = strcmp(mode, "appearance") == 0 ? 0 : 13;
+        ui.options_selection = strcmp(mode, "appearance") == 0 ? 0 : 15;
         if (strcmp(mode, "options-ocean") == 0)
             ui.chrome_theme = BROWSER_CHROME_THEME_OCEAN;
         else if (strcmp(mode, "options-plum") == 0)
@@ -364,9 +380,16 @@ int main(int argc, char **argv)
         else if (strcmp(mode, "options-ember") == 0)
             ui.chrome_theme = BROWSER_CHROME_THEME_EMBER;
         ui.toast_frames = 0;
+    } else if (strcmp(mode, "glyph-options") == 0) {
+        ui.screen = PSP_UI_SCREEN_GLYPH_OPTIONS;
+        ui.glyph_language = BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED;
+        ui.glyph_options_selection = 0;
+        ui.glyph_installed_mask =
+            (uint8_t) (1u << TILEFINCH_GLYPH_PACK_LATIN_EXTENDED);
+        ui.toast_frames = 0;
     } else if (strcmp(mode, "adblock") == 0) {
         ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
-        ui.options_selection = 15;
+        ui.options_selection = 22;
         ui.content_blocker_mode = CONTENT_BLOCKER_BASIC;
         ui.toast_frames = 0;
     } else if (strcmp(mode, "data") == 0) {
@@ -436,6 +459,19 @@ int main(int argc, char **argv)
             &ui, "1.4.2", "A new version is ready",
             "Faster page loads, fewer stalls", 620, "Install and restart",
             true, true);
+        ui.toast_frames = 0;
+    } else if (strcmp(mode, "update-versions") == 0) {
+        ui.screen = PSP_UI_SCREEN_UPDATE_VERSIONS;
+        TilefinchUpdateHistorySnapshot history = {
+            .phase = TILEFINCH_UPDATE_HISTORY_READY,
+            .count = 8u,
+            .versions = {
+                "0.1.7", "0.1.6", "0.1.5", "0.1.4",
+                "0.1.3", "0.1.2", "0.1.1", "0.1.0"
+            }
+        };
+        psp_ui_set_update_history(&ui, &history);
+        ui.data_options_selection = 7u;
         ui.toast_frames = 0;
     } else if (strcmp(mode, "diagnostic-qr") == 0) {
         char source_path[1024];

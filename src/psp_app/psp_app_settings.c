@@ -450,6 +450,15 @@ void psp_app_apply_setting(
                     : "READER SIZE MEMORY OFF",
             180);
     }
+    if (intent->setting.id == PSP_UI_SETTING_READER_AUTO_MODE) {
+        bool enabled = intent->setting.value.boolean;
+        browser_profile_set_reader_auto_mode(profile, enabled);
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            enabled ? "AUTO READER ON" : "AUTO READER OFF", 180);
+    }
     if (intent->setting.id == PSP_UI_SETTING_BROWSER_UI_SCALE) {
         browser_profile_set_ui_scale(
             profile, intent->setting.value.unsigned_value);
@@ -765,7 +774,7 @@ void psp_app_apply_setting(
         psp_ui_show_status(
             &app->process->presentation.ui,
             language == BROWSER_GLYPH_LANGUAGE_EMBEDDED
-                ? "EMBEDDED CJK FALLBACK SELECTED"
+                ? "EMBEDDED GLYPHS SELECTED"
                 : "LANGUAGE PACK APPLIES AFTER RESTART",
             180);
     }
@@ -822,6 +831,17 @@ void psp_app_apply_setting(
                 ? "YOUTUBE RESULTS COMPACT - RELOAD TO APPLY"
                 : "YOUTUBE RESULTS DETAILED - RELOAD TO APPLY",
             240);
+    }
+    if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY) {
+        bool enabled = intent->setting.value.boolean;
+        browser_profile_set_youtube_audio_only(profile, enabled);
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            enabled ? "AUDIO-ONLY ON - NEXT VIDEO"
+                    : "AUDIO-ONLY OFF - NEXT VIDEO",
+            180);
     }
     if (intent->setting.id
         == PSP_UI_SETTING_VIDEO_STARTUP_BUFFERING) {

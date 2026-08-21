@@ -2,6 +2,7 @@
 #include "tilefinch/fetch.h"
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/navigation.h"
+#include "tilefinch/script_loader.h"
 #include "tilefinch/script_lazy.h"
 #include "tilefinch/session.h"
 #include "tilefinch/url.h"

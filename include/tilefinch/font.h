@@ -160,6 +160,9 @@ int font_text_width_fixed(const FontFace *face, const char *text,
 int font_text_width_at_size_fixed(const FontFace *face, const char *text,
                                   size_t length, int pixel_height_fixed,
                                   bool bold);
+int font_text_width_at_size_fixed_mode(
+    const FontFace *face, const char *text, size_t length,
+    int pixel_height_fixed, bool bold, bool kerning);
 /* Measure a platform family with any bounded metric-compatibility profile.
    `metric_bold` chooses the real bold face's advances independently of the
    synthetic emboldening flag used by the raster backend. */
@@ -167,6 +170,10 @@ int font_text_width_for_family_at_size_fixed(
     const FontFace *face, FontFamily metric_family,
     const char *text, size_t length, int pixel_height_fixed,
     bool synthetic_bold, bool metric_bold);
+int font_text_width_for_family_at_size_fixed_mode(
+    const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int pixel_height_fixed,
+    bool synthetic_bold, bool metric_bold, bool kerning);
 int font_glyph_advance_for_family_at_size_fixed(
     FontFamily metric_family, unsigned codepoint, int pixel_height_fixed,
     bool synthetic_bold, bool metric_bold, int native_advance_fixed);

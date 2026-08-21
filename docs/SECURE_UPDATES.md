@@ -8,6 +8,12 @@ confirmation. Its optional background check only looks for signed release
 metadata while Wi-Fi is already connected; it never downloads the update
 package by itself.
 
+Stable also offers **Square → Previous versions** on this page. The bounded
+list is queried from GitHub only when this screen is opened, retained in RAM,
+and never written to the Memory Stick. Choosing a version only selects its
+fixed tagged metadata URL; the user must still check, download, install, and
+restart explicitly.
+
 An update is installed into the inactive of two browser slots. The small
 launcher verifies the candidate before its first start, keeps the previous
 slot intact, and rolls back on the next launch if the new browser does not
@@ -43,6 +49,18 @@ exact size and SHA-256, then every extracted file's exact path, size, offset
 and digest. A failure on the selected channel stays a failure: there is no
 fallback to another channel, and none to an unsigned path.
 
+**An older release requires an explicit local selection.** Ordinary update
+checks retain the monotonic sequence floor and reject downgrades. Selecting a
+row under Previous versions records a one-trial downgrade intent in the
+integrity-checked A/B journal. The in-app verifier and launcher then relax only
+the sequence comparison for that exact pending signed candidate. Root-chain,
+signature, expiry, platform, launcher-protocol, package-size, package-hash,
+and per-file verification remain unchanged. The pending marker is consumed
+before historical code starts, keeping the schema-1 trial record readable by
+older releases; an explicit launcher retry reconstructs it from the pinned
+candidate/floor pair. The candidate is cleared when the trial is accepted or
+discarded. A remote response cannot select a row or set the journal bit.
+
 **Nothing remote can turn the unsigned mode on.** The Developer channel needs
 two independent local acts by the person holding the device: a URL entered in
 the native **Developer URL** option (or hand-written into
@@ -63,11 +81,11 @@ not by anything inside the signed metadata. Stable and Beta therefore differ
 only in the fixed URL each fetches, and a signed manifest is not itself bound
 to a channel. An actor able to publish a correctly signed release to the Beta
 endpoint could publish the same bytes at the Stable one, and the device could
-not tell the two apart from the metadata. This does not admit unsigned or
-downgraded code -- the signature, sequence floor and equivocation checks are
-unchanged either way -- and it does not touch Developer, whose payload is
-unsigned by construction and reachable only through the two local opt-ins
-above. Closing it means adding a channel field to the signed manifest, which
+not tell the two apart from the metadata. This does not admit unsigned code
+or remotely selected downgrades -- signatures and the ordinary sequence and
+equivocation checks are unchanged -- and it does not touch Developer, whose
+payload is unsigned by construction and reachable only through the two local
+opt-ins above. Closing it means adding a channel field to the signed manifest, which
 is a release-cut format change and needs its own design pass; it is
 deliberately not attempted here.
 
@@ -83,7 +101,8 @@ downloads it, and explicitly restarts into it.
 
 On Stable and Beta, an attacker who controls a network path, CDN response,
 GitHub account, or release asset must not be able to make the PSP execute an
-unsigned or downgraded browser. Developer is an explicit local exception,
+unsigned browser or choose a downgrade. A historical signed release is a
+separate explicit local choice. Developer is an explicit local exception,
 described below, that the same attacker cannot reach: it requires physical
 access to the Memory Stick and a deliberate selection in Options. On every
 channel, interruption, cancellation, a full Memory Stick, or a bad new build
@@ -133,6 +152,22 @@ cooperative boundary. A successfully staged update offers
 Errors remain distinct. In particular, an invalid signature, expired
 metadata, an older release, insufficient space, and an ordinary network
 failure must not be collapsed into “up to date.”
+
+### Previous signed versions
+
+On Stable, Square queries GitHub's public Releases API and shows up to eight
+earlier stable releases which advertise Tilefinch's signed metadata asset.
+The bounded response and list live only in RAM for this explicit operation;
+no release catalog is persisted. X returns to the ordinary update page with
+the chosen version named; checking it fetches
+`releases/download/v<version>/tilefinch-update-v1.tfum`. Old metadata must
+still be within its signed expiry window. An expired historical release is
+reported as expired rather than silently weakening freshness checks.
+
+Installation remains an A/B trial. Shared profile data is not rolled back,
+and the newer slot remains the previous slot until the older build proves
+healthy. After a deliberate downgrade, Stable's normal Latest check can offer
+the newer signed sequence again.
 
 ### Stable, beta, and developer channels
 
@@ -256,6 +291,8 @@ PSP/GAME/TILEFINCH/
     glyph-zh-hant/
     glyph-ko/
     glyph-emoji-color/
+    glyph-cyrillic/
+    glyph-latin-extended/
       active/
       previous/
   slot-a/
@@ -543,23 +580,36 @@ trust but an independent monotonic component sequence. Browser updates never
 copy, delete, or verify the shared component and therefore neither duplicate
 its roughly 9 MB payload nor add it to the trial-boot hashing cost.
 
+The user-built software video decoder follows the same A/B separation but is
+not a downloadable signed component: its three files live in
+`components/swdec/`, outside both browser slots, and are never included in an
+official TFUP. Browser manifests prefix their already-signed release notes
+with the decoder ABI expected by that version. The parser removes that marker
+from ordinary display text and warns **Decoder rebuild needed** only when an
+installed component advertises a different ABI. This extends the existing
+manifest record without a schema change, so older clients still verify it.
+
 Optional glyph packs use the same component repository and public root but a
 third, non-interchangeable authority: `TFGMv1` envelopes sign the
 `tilefinch:glyph-component-manifest:v1` domain and authorize only raw bounded
 `TFGFv1` packages (format 3). Fixed asset names identify Japanese, Simplified
-Chinese, Traditional Chinese, Korean, and color emoji. Each pack has its own
-monotonic sequence and component ID; the installer verifies the signed size
-and digest, parses the complete bounded index, writes `READY` last, and then
-promotes `candidate.tmp → active` while retaining one `previous` generation.
-An `UNINSTALLED` marker suppresses both generations after interrupted removal.
+Chinese, Traditional Chinese, Korean, Cyrillic, Extended Latin, and color
+emoji. Each pack has its own monotonic sequence and component ID; the installer
+verifies the signed size and digest, parses the complete bounded index, writes
+`READY` last, and then promotes `candidate.tmp → active` while retaining one
+`previous` generation. An `UNINSTALLED` marker suppresses both generations
+after interrupted removal.
 
 Embedded monochrome CJK/emoji fallback remains part of every browser slot and
 does not depend on these assets. With the default Embedded setting, boot does
-not probe or open optional component storage. When selected, only the regional
-pack and/or color-emoji pack is signature-verified and indexed at boot. Glyph
-payloads stay on the Memory Stick and enter RAM through bounded 16 KiB pump
-reads after a cache miss; measurement and rasterization themselves perform no
-file I/O, and the runtime path never writes. Optional packs are built from
+not probe or open optional component storage. When selected, only the chosen
+language pack and/or color-emoji pack is signature-verified and indexed at
+boot. Visible-text script hints can later attach up to two additional installed
+language packs, one signature/index probe per frame and never more than four
+packs total. This does not enumerate packs or read glyph payloads during page
+parsing. Payloads stay on the Memory Stick and enter RAM through bounded 16 KiB
+pump reads after a cache miss; measurement and rasterization themselves perform
+no file I/O, and the runtime path never writes. Optional packs are built from
 redistributable Noto inputs and do not read PSP firmware fonts.
 
 `slot.tfum` is not a TFUP payload: putting the envelope inside the package
@@ -740,7 +790,8 @@ python3 tools/tilefinch_update_tool.py pack \
 python3 tools/tilefinch_update_tool.py manifest \
   --package tilefinch-psp.tfup --root-version 1 --sequence 43 \
   --expires 2000000000 --version 0.4.1 --tag v0.4.1 \
-  --asset tilefinch-psp.tfup --notes release-notes.txt \
+  --asset tilefinch-psp.tfup --decoder-abi 3 \
+  --notes release-notes.txt \
   --output manifest.tfum-body
 python3 tools/tilefinch_update_tool.py envelope \
   --manifest manifest.tfum-body --release-key /offline/release-key.pem \

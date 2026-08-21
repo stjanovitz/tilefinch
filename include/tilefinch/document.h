@@ -13,6 +13,14 @@
 
 typedef struct DocumentControlState DocumentControlState;
 
+typedef enum {
+    DOCUMENT_GLYPH_SCRIPT_HAN = 1u << 0,
+    DOCUMENT_GLYPH_SCRIPT_JAPANESE = 1u << 1,
+    DOCUMENT_GLYPH_SCRIPT_KOREAN = 1u << 2,
+    DOCUMENT_GLYPH_SCRIPT_CYRILLIC = 1u << 3,
+    DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED = 1u << 4
+} DocumentGlyphScript;
+
 typedef struct {
     Budget *budget;
     BudgetAllocationOwner allocation_owner;
@@ -28,6 +36,10 @@ typedef struct {
     size_t text_bytes;
     size_t body_text_node_count;
     size_t body_text_length;
+    /* Visible-text ranges observed by the existing parser statistics pass.
+       The PSP frontend uses this compact hint to attach installed fallback
+       packs lazily; it is not serialized and causes no storage I/O here. */
+    uint8_t glyph_script_mask;
     /* Monotonic connected-content identity. Layout-owned document caches use
        this instead of rescanning the complete DOM on every relayout. */
     uint64_t content_generation;
@@ -47,6 +59,11 @@ typedef struct {
     DocumentControlState *control_states;
     size_t control_state_count;
     size_t parser_form_owner_count;
+    /* Aggregate parser/refresh fact used to keep ordinary pointer motion out
+       of the JavaScript realm when no authored mouse/pointer attribute can
+       observe it. Dynamic attribute mutations conservatively reopen the JS
+       probe from the bootstrap side. */
+    bool pointer_event_attributes_present;
 } PocDocument;
 
 typedef struct {

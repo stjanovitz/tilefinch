@@ -667,6 +667,7 @@ static ScriptRuntime *script_runtime_create_internal(
     host->dispatch_input_handle = JS_UNDEFINED;
     host->dispatch_submit_handle = JS_UNDEFINED;
     host->dom_content_loaded_dispatch = JS_UNDEFINED;
+    host->media_state_for = JS_UNDEFINED;
     host->media_update = JS_UNDEFINED;
     host->function_to_string = JS_UNDEFINED;
     host->host_global = JS_UNDEFINED;
@@ -1057,9 +1058,22 @@ static ScriptRuntime *script_runtime_create_internal(
                 getenv("TILEFINCH_TRACE_TASKS") != NULL)) >= 0;
     }
     if (setup_ok) {
+        setup_ok = JS_SetPropertyStr(
+            host->context, global,
+            "__tilefinchPointerMarkupInitiallyPresent",
+            JS_NewBool(
+                host->context,
+                host->document != NULL
+                    && host->document->pointer_event_attributes_present)) >= 0;
+    }
+    if (setup_ok) {
         setup_ok = js_rt_install_function(
                        host->context, global, "__tilefinchCssSupports",
                        js_css_supports, 2)
+                   && js_rt_install_function(
+                       host->context, global,
+                       "__tilefinchCompileInlineEventHandler",
+                       js_compile_inline_event_handler, 1)
                    && js_rt_install_function(
                        host->context, global,
                        "__tilefinchStylesheetHasMotionKeyframes",
@@ -1530,6 +1544,8 @@ static ScriptRuntime *script_runtime_create_internal(
             host->dom_content_loaded_dispatch = JS_GetPropertyStr(
                 host->context, global,
                 "__tilefinchDispatchDOMContentLoaded");
+            host->media_state_for = JS_GetPropertyStr(
+                host->context, global, "__tilefinchMediaStateFor");
             host->bridge.trusted_node_wrap = JS_GetPropertyStr(
                 host->context, global, "__tilefinchWrap");
             host->bridge.trusted_stable_script_wrap = JS_GetPropertyStr(
@@ -1557,6 +1573,8 @@ static ScriptRuntime *script_runtime_create_internal(
                             host->context,
                             host->dom_content_loaded_dispatch)
                      && JS_IsFunction(host->context,
+                                      host->media_state_for)
+                     && JS_IsFunction(host->context,
                                       host->bridge.trusted_node_wrap)
                      && JS_IsFunction(
                             host->context,
@@ -1573,18 +1591,24 @@ static ScriptRuntime *script_runtime_create_internal(
                 "<eval-source-diagnostic>");
         }
 #endif
-        /* platform.js retained the worker compiler in a private bootstrap
-           closure. Remove the temporary bridge before author code so it
-           cannot be called with forged source/scope arguments. */
+        /* platform.js retained private worker and media-state helpers in
+           bootstrap closures. Remove the temporary bridges before author
+           code; native code has already captured their callable values. */
         if (evaluated) {
             JSAtom run_worker_atom = JS_NewAtom(
                 host->context, "__tilefinchRunWorker");
+            JSAtom media_state_atom = JS_NewAtom(
+                host->context, "__tilefinchMediaStateFor");
             if (run_worker_atom == JS_ATOM_NULL
+                || media_state_atom == JS_ATOM_NULL
                 || JS_DeleteProperty(
-                       host->context, global, run_worker_atom, 0) < 0) {
+                       host->context, global, run_worker_atom, 0) < 0
+                || JS_DeleteProperty(
+                       host->context, global, media_state_atom, 0) < 0) {
                 evaluated = false;
             }
             JS_FreeAtom(host->context, run_worker_atom);
+            JS_FreeAtom(host->context, media_state_atom);
         }
         /* Trusted bootstrap may use dynamic compilation to construct bounded
            browser shims. Author code begins only after the native QuickJS

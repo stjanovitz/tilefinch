@@ -234,6 +234,7 @@ static bool test_document_equivalent(PocDocument *left,
     bool ok = left->node_count == right->node_count
         && left->element_count == right->element_count
         && left->text_bytes == right->text_bytes
+        && left->glyph_script_mask == right->glyph_script_mask
         && strcmp(left->title, right->title) == 0
         && left_body != NULL && right_body != NULL
         && strcmp(left_body, right_body) == 0
@@ -374,6 +375,37 @@ static bool test_parser_scripting_noscript_model(Budget *budget)
     document_parser_abort(&enabled_parser);
     document_destroy(&disabled);
     document_destroy(&enabled);
+    return ok;
+}
+
+static bool test_visible_text_glyph_script_hints(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><body><p>Привет Tiếng Việt 日本語 かな 한국어 漢</p>"
+        "<script>const hidden='Ґ';</script><style>.x{content:'ộ'}</style>";
+    PocDocument document = {0};
+    const uint8_t expected = DOCUMENT_GLYPH_SCRIPT_HAN
+        | DOCUMENT_GLYPH_SCRIPT_JAPANESE | DOCUMENT_GLYPH_SCRIPT_KOREAN
+        | DOCUMENT_GLYPH_SCRIPT_CYRILLIC
+        | DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED;
+    bool ok = document_parse(
+            &document, budget, html, sizeof(html) - 1u, 7u)
+        && document.glyph_script_mask == expected;
+    if (!ok) fprintf(stderr, "glyph script mask=%02x expected=%02x\n",
+                     document.glyph_script_mask, expected);
+    document_destroy(&document);
+
+    static const char hidden_only[] =
+        "<!doctype html><body><script>Привет Tiếng Việt</script>"
+        "<style>.x{content:'日本語'}</style><p>ASCII only</p>";
+    ok = ok && document_parse(
+                   &document, budget, hidden_only,
+                   sizeof(hidden_only) - 1u, 5u)
+        && document.glyph_script_mask == 0;
+    if (document.glyph_script_mask != 0)
+        fprintf(stderr, "hidden glyph script mask=%02x\n",
+                document.glyph_script_mask);
+    document_destroy(&document);
     return ok;
 }
 
@@ -1694,6 +1726,21 @@ static bool test_picture_source_media_selection(Budget *budget)
     static const char implicit_density_html[] =
         "<!doctype html><body><img id=picture src='/a.svg' "
         "srcset='/b.svg 2x' width=25 height=25></body>";
+    static const char lazy_placeholder_html[] =
+        "<!doctype html><body><img id=picture "
+        "src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==' "
+        "data-original='/b.svg' width=25 height=25></body>";
+    static const char lazy_missing_html[] =
+        "<!doctype html><body><img id=picture "
+        "data-thumb='/a.svg' width=25 height=25></body>";
+    static const char lazy_trimmed_html[] =
+        "<!doctype html><body><img id=picture "
+        "src='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==' "
+        "data-lazy-src='  /b.svg  ' width=25 height=25></body>";
+    static const char lazy_unsafe_html[] =
+        "<!doctype html><body><img id=picture "
+        "src='data:image/gif;base64,AAAA' "
+        "data-src='javascript:alert(1)' width=25 height=25></body>";
     static const struct {
         const char *html;
         size_t length;
@@ -1707,7 +1754,15 @@ static bool test_picture_source_media_selection(Budget *budget)
         {sizes_html, sizeof(sizes_html) - 1, 640, 0x65, "/b.svg"},
         {density_html, sizeof(density_html) - 1, 480, 0x12, "/a.svg"},
         {implicit_density_html, sizeof(implicit_density_html) - 1, 480,
-         0x12, "/a.svg"}
+         0x12, "/a.svg"},
+        {lazy_placeholder_html, sizeof(lazy_placeholder_html) - 1, 480,
+         0x65, "/b.svg"},
+        {lazy_missing_html, sizeof(lazy_missing_html) - 1, 480,
+         0x12, "/a.svg"},
+        {lazy_trimmed_html, sizeof(lazy_trimmed_html) - 1, 480,
+         0x65, "/b.svg"},
+        {lazy_unsafe_html, sizeof(lazy_unsafe_html) - 1, 480,
+         0x00, "data:image/gif;base64,AAAA"}
     };
     char error[256] = {0};
     bool ok = true;
@@ -1733,14 +1788,17 @@ static bool test_picture_source_media_selection(Budget *budget)
         size_t selected_length = 0;
         const char *selected = ok ? image_select_source(
             &stylesheet, picture, &selected_length) : NULL;
-        bool case_ok = ok && resource != NULL
-            && image_resource_available(resource)
-            && resource->pixels != NULL
-            && resource->pixels[0] == cases[i].red
-            && resource->width == 1 && resource->height == 1
-            && images.stats.loaded == 1 && selected != NULL
+        bool expects_network = cases[i].red != 0;
+        bool case_ok = ok && selected != NULL
             && selected_length == strlen(cases[i].selected)
-            && memcmp(selected, cases[i].selected, selected_length) == 0;
+            && memcmp(selected, cases[i].selected, selected_length) == 0
+            && (expects_network
+                ? resource != NULL && image_resource_available(resource)
+                    && resource->pixels != NULL
+                    && resource->pixels[0] == cases[i].red
+                    && resource->width == 1 && resource->height == 1
+                    && images.stats.loaded == 1
+                : images.stats.loaded == 0);
         if (!case_ok) {
             fprintf(stderr,
                     "responsive image case %zu width=%d selected=%.*s "
@@ -2073,12 +2131,15 @@ static bool test_inline_svg_presentation_resource(Budget *budget)
     static const char html[] =
         "<!doctype html><style>"
         "#container{color:#008000}.class>#use-rect{fill:#008000}"
+        "#clip-rule{clip-rule:evenodd}"
         "@supports(fill:green){#supports{color:#008000}}"
         "</style><body>"
         "<div id=container><svg id=paint-svg "
         "xmlns='http://www.w3.org/2000/svg'>"
         "<rect id=paint-rect x=25 y=25 width=50 height=50 "
         "fill=currentColor stroke=currentColor stroke-width=50></rect>"
+        "<defs><clipPath><path id=clip-rule d='M0 0h10v10z'></path>"
+        "</clipPath></defs>"
         "</svg></div>"
         "<svg id=use-svg width=100 height=100 "
         "xmlns='http://www.w3.org/2000/svg'>"
@@ -2102,6 +2163,7 @@ static bool test_inline_svg_presentation_resource(Budget *budget)
         ? lxb_dom_interface_node(document.html) : NULL;
     lxb_dom_node_t *paint_svg = ok ? find_id(root, "paint-svg") : NULL;
     lxb_dom_node_t *paint_rect = ok ? find_id(root, "paint-rect") : NULL;
+    lxb_dom_node_t *clip_rule = ok ? find_id(root, "clip-rule") : NULL;
     lxb_dom_node_t *use_svg = ok ? find_id(root, "use-svg") : NULL;
     lxb_dom_node_t *use_rect = ok ? find_id(root, "use-rect") : NULL;
     lxb_dom_node_t *supports = ok ? find_id(root, "supports") : NULL;
@@ -2110,6 +2172,7 @@ static bool test_inline_svg_presentation_resource(Budget *budget)
     const ImageResource *use = ok
         ? images_find_node(&images, use_svg) : NULL;
     char fill[32] = {0};
+    char winding[32] = {0};
     char label[32] = {0};
     StyleRetainedPresentationValues retained = {0};
     bool retained_batch = ok && style_retained_presentation_values(
@@ -2144,6 +2207,10 @@ static bool test_inline_svg_presentation_resource(Budget *budget)
         && style_retained_presentation_value(
             &stylesheet, use_rect, "fill", 4, fill, sizeof(fill))
         && strcmp(fill, "#008000") == 0
+        && style_retained_presentation_value(
+            &stylesheet, clip_rule, "fill-rule", 9,
+            winding, sizeof(winding))
+        && strcmp(winding, "evenodd") == 0
         && style_custom_property_value(
             &stylesheet, use_rect, PSEUDO_NONE,
             "--label", 7, label, sizeof(label))
@@ -2703,6 +2770,86 @@ static bool test_image_request_policy_and_cookies(Budget *budget)
     browser_session_destroy(&session);
     stylesheet_destroy(&stylesheet);
     document_destroy(&document);
+    return ok && budget->current == 0;
+}
+
+static bool test_decoded_image_cache_partition_and_lifetime(Budget *budget)
+{
+    static const char page_url[] = "https://page-image.test/document";
+    static const char image_url[] = "https://assets-image.test/thumb.jpg";
+    static const unsigned char encoded[] = {0xff, 0xd8, 1, 2, 3, 0xff, 0xd9};
+    BrowserSession session = {0};
+    TilefinchRequestContext context = {
+        .target_url = image_url,
+        .initiator_url = page_url,
+        .top_level_url = page_url,
+        .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_IMAGE
+    };
+    TilefinchResourceGrant grant = {
+        .destination = TILEFINCH_DESTINATION_IMAGE,
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .final_same_origin = false,
+        .final_same_site = false,
+        .cors_validated = false
+    };
+    bool ok = browser_session_init(&session, budget, 64u * 1024u);
+    unsigned char *source_copy = ok
+        ? budget_malloc(budget, sizeof(encoded)) : NULL;
+    if (source_copy != NULL) memcpy(source_copy, encoded, sizeof(encoded));
+    BrowserSharedBody *source = source_copy == NULL ? NULL
+        : browser_shared_body_take(budget, source_copy, sizeof(encoded));
+    ok = ok && source != NULL
+        && browser_session_cache_put_http_shared_resource(
+            &session, image_url, source, NULL, NULL, "image/jpeg",
+            "immutable", NULL, 0, &context, &grant);
+    if (source != NULL) browser_shared_body_release(source);
+
+    unsigned char *rgba = ok ? budget_malloc(budget, 2u * 2u * 4u) : NULL;
+    if (rgba != NULL) memset(rgba, 0x5a, 2u * 2u * 4u);
+    BrowserSharedBody *pixels = rgba == NULL ? NULL
+        : browser_shared_body_take(budget, rgba, 2u * 2u * 4u);
+    const BrowserCacheEntry *cached = NULL;
+    ok = ok && pixels != NULL
+        && browser_session_cache_match_resource(
+            &session, image_url, &context,
+            tilefinch_platform_monotonic_time_ns(), &cached)
+               == BROWSER_CACHE_FRESH
+        && cached != NULL
+        && browser_session_decoded_image_put(
+            &session, image_url, &context, cached->data, cached->length,
+            pixels, 8, 8, 2, 2);
+    if (pixels != NULL) browser_shared_body_release(pixels);
+
+    BrowserDecodedImage decoded = {0};
+    cached = NULL;
+    ok = ok && browser_session_cache_match_resource(
+            &session, image_url, &context,
+            tilefinch_platform_monotonic_time_ns(), &cached)
+               == BROWSER_CACHE_FRESH
+        && cached != NULL
+        && browser_session_decoded_image_acquire(
+            &session, image_url, &context, cached->data, cached->length,
+            &decoded)
+        && decoded.pixels != NULL && decoded.pixels->length == 16u
+        && decoded.source_width == 8 && decoded.source_height == 8
+        && decoded.width == 2 && decoded.height == 2
+        && decoded.pixels->data[0] == 0x5a;
+    if (decoded.pixels != NULL) browser_shared_body_release(decoded.pixels);
+
+    TilefinchRequestContext other_partition = context;
+    other_partition.top_level_url = "https://other-page.test/";
+    other_partition.initiator_url = other_partition.top_level_url;
+    decoded = (BrowserDecodedImage) {0};
+    ok = ok && !browser_session_decoded_image_acquire(
+        &session, image_url, &other_partition,
+        cached == NULL ? encoded : cached->data,
+        cached == NULL ? sizeof(encoded) : cached->length, &decoded);
+
+    browser_session_destroy(&session);
     return ok && budget->current == 0;
 }
 

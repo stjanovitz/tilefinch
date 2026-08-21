@@ -494,7 +494,7 @@ void psp_media_telemetry_report_feed(
     printf(
         "tilefinch-media-stream: phase=%s partial=%zu/%zuB "
         "video-cache=%llu+%zu/%zu fill=%llu+%zu pending=%u "
-        "prefetch=%zu/%zu/%zu slots=%u aggressive=%u\n",
+        "prefetch=%zu/%zu/%zu slots=%u/%u aggressive=%u\n",
         phase == NULL ? "unknown" : phase,
         video_range.streaming_partial_reads,
         video_range.streaming_partial_bytes,
@@ -510,6 +510,7 @@ void psp_media_telemetry_report_feed(
         video_range.readahead_waiting_for_consumption,
         video_range.readahead_issue_refusals,
         video_range.lookahead_slots,
+        video_range.lookahead_fetch_limit,
         video_range.aggressive_readahead ? 1u : 0u);
     printf(
         "tilefinch-media-present: phase=%s "

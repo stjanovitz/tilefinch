@@ -8,6 +8,21 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.6 — 2026-08-20
+
+- Improved YouTube playback, seeking, navigation, buffering recovery, and
+  thumbnail performance; added audio-only playback and compact results.
+- Added generic page-video and bounded HLS support, plus an optional build-time
+  software-decoder add-on that remains separate from official releases.
+- Replaced site-specific Reader profiles with bounded content analysis and
+  added lazy-image sourcing for server-rendered pages.
+- Reorganized menus around page tools, library, settings, and diagnostics;
+  added signed installation of up to eight recent releases.
+- Expanded mobile CSS, typography, compositing, Cyrillic, and Extended Latin
+  support while preserving Wikipedia performance and fidelity.
+- Hardened native media geometry, AAC channel bounds, script degradation, and
+  aggregate backdrop-filter work.
+
 ## 0.1.5 — 2026-08-18
 
 - Improved YouTube startup and recovery when the shared transport worker is

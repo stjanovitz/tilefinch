@@ -57,6 +57,17 @@ class FidelityScoreboardTests(unittest.TestCase):
             scoreboard.checkpoint_commands("selector", "article"),
         )
 
+    def test_positioned_checkpoint_rejects_missing_target_value(self) -> None:
+        self.assertTrue(scoreboard.positioned_checkpoint_found(
+            'loop-js ok=yes value="42" error=""\n'
+        ))
+        self.assertFalse(scoreboard.positioned_checkpoint_found(
+            'loop-js ok=yes value="missing" error=""\n'
+        ))
+        self.assertFalse(scoreboard.positioned_checkpoint_found(
+            'loop-js ok=no value="" error="boom"\n'
+        ))
+
     def test_script_command_uses_trace_clock_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

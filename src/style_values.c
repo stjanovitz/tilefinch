@@ -2807,6 +2807,70 @@ bool style_parse_background_layer_position(
     return style_apply_paint_stack(sheet, style, &stack, NULL);
 }
 
+bool style_parse_background_layer_position_axis(
+    Stylesheet *sheet, const char *text, size_t length,
+    ComputedStyle *style, bool horizontal)
+{
+    char resolved[384];
+    if (sheet == NULL || style == NULL
+        || !style_resolve_value(sheet, text, length, resolved,
+                                sizeof(resolved), 0)) {
+        return false;
+    }
+    StylePaintStack stack = style_paint_stack_copy(sheet, style);
+    if (stack.background_count == 0) stack.background_count = 1;
+    size_t cursor = 0, start = 0, end = 0, index = 0;
+    while (index < STYLE_PAINT_LAYER_LIMIT
+           && style_next_top_level(resolved, strlen(resolved), ',',
+                                   &cursor, &start, &end)) {
+        char pair[192];
+        bool compound = memchr(resolved + start, ' ', end - start) != NULL;
+        int written;
+        if (horizontal) {
+            written = compound
+                ? snprintf(pair, sizeof(pair), "%.*s top 0",
+                           (int) (end - start), resolved + start)
+                : snprintf(pair, sizeof(pair), "%.*s top",
+                           (int) (end - start), resolved + start);
+        } else {
+            written = compound
+                ? snprintf(pair, sizeof(pair), "left 0 %.*s",
+                           (int) (end - start), resolved + start)
+                : snprintf(pair, sizeof(pair), "left %.*s",
+                           (int) (end - start), resolved + start);
+        }
+        if (written < 0 || (size_t) written >= sizeof(pair)) return false;
+        StylePaintLayer parsed = {0};
+        if (!style_parse_paint_position_value(
+                sheet, pair, (size_t) written, &parsed)) {
+            return false;
+        }
+        StylePaintLayer *layer = &stack.backgrounds[index];
+        if (horizontal) {
+            layer->position_x = parsed.position_x;
+            layer->position_edges = (uint8_t) (
+                (layer->position_edges
+                 & ~(STYLE_PAINT_POSITION_FROM_RIGHT
+                     | STYLE_PAINT_POSITION_X_PIXELS))
+                | (parsed.position_edges
+                   & (STYLE_PAINT_POSITION_FROM_RIGHT
+                      | STYLE_PAINT_POSITION_X_PIXELS)));
+        } else {
+            layer->position_y = parsed.position_y;
+            layer->position_edges = (uint8_t) (
+                (layer->position_edges
+                 & ~(STYLE_PAINT_POSITION_FROM_BOTTOM
+                     | STYLE_PAINT_POSITION_Y_PIXELS))
+                | (parsed.position_edges
+                   & (STYLE_PAINT_POSITION_FROM_BOTTOM
+                      | STYLE_PAINT_POSITION_Y_PIXELS)));
+        }
+        index++;
+    }
+    if (index == 0) return false;
+    return style_apply_paint_stack(sheet, style, &stack, NULL);
+}
+
 bool style_parse_background_layer_size(
     Stylesheet *sheet, const char *text, size_t length,
     ComputedStyle *style)

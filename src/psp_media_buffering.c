@@ -58,6 +58,9 @@ static uint64_t psp_media_network_ahead_us(const PspMediaSession *media)
 {
     if (media == NULL || media->offline_source) return UINT64_MAX;
     uint64_t duration_us = psp_media_duration_us(media);
+    if (media->audio_only)
+        return media_http_range_buffered_ahead_us(
+            media->audio_range, duration_us);
     uint64_t video_us = media_http_range_buffered_ahead_us(
         media->range, duration_us);
     if (media->audio_range == NULL) return video_us;
@@ -76,7 +79,11 @@ static bool psp_media_network_fill_pending(const PspMediaSession *media)
     bool audio_pending = media != NULL && media->audio_range != NULL
         && media_http_range_stats(media->audio_range, &audio)
         && audio.window_pending;
-    return video_pending || audio_pending;
+    MediaHlsStats hls = {0};
+    bool hls_pending = media != NULL
+        && psp_media_hls_stats(media->hls, &hls)
+        && hls.active_requests != 0;
+    return video_pending || audio_pending || hls_pending;
 }
 
 void psp_media_buffering_update(

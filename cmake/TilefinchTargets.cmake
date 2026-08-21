@@ -102,6 +102,7 @@ endif()
 
 add_library(tilefinch_psp_ui STATIC
     src/psp_ui.c
+    src/psp_ui_menu.c
     src/psp_ui_media_8888.c
     src/psp_power_policy.c)
 target_include_directories(tilefinch_psp_ui PUBLIC include)
@@ -331,10 +332,12 @@ if(PSP)
             src/psp_log.c
             src/psp_media_buffering.c
             src/psp_media_open.c
+            src/psp_media_hls.c
             src/psp_media_present_session.c
             src/psp_media_seek.c
             src/psp_media_session.c
             src/psp_media_telemetry.c
+            src/psp_swdec_component.c
             src/psp_offline_store.c
             src/screenshot_png.c
             src/psp_text_input.c
@@ -354,6 +357,17 @@ if(PSP)
         target_compile_definitions(psp-browser-script PRIVATE
             TILEFINCH_UPDATE_REPOSITORY_OWNER="${TILEFINCH_UPDATE_REPOSITORY_OWNER}"
             TILEFINCH_UPDATE_REPOSITORY_NAME="${TILEFINCH_UPDATE_REPOSITORY_NAME}")
+        if(TILEFINCH_PSP_ENABLE_SWDEC_COMPONENT)
+            add_dependencies(psp-browser-script tilefinch-swdec-bundle)
+        endif()
+        # Older build trees staged the optional PRXs beside EBOOT.PBP. Remove
+        # those stale outputs on every browser link: current builds emit only
+        # the separate components/swdec add-on bundle.
+        add_custom_command(TARGET psp-browser-script POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E rm -f
+                $<TARGET_FILE_DIR:psp-browser-script>/tilefinch-swdec.prx
+                $<TARGET_FILE_DIR:psp-browser-script>/swdec-meload.prx
+            COMMENT "Removing legacy slot-local decoder components")
         if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
             target_compile_options(psp-browser-script PRIVATE
                 -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)
@@ -662,7 +676,7 @@ if(PSP)
                 tilefinch_core tilefinch_psp_ui tilefinch_psp_display
                 tilefinch_psp_media_scale
                 tilefinch_psp_media_present
-                tilefinch_psp_app_support)
+                tilefinch_psp_app_support tilefinch_diagnostic_qr)
             if(PSP_BROWSER_ENABLE_PSP_VOICE)
                 target_link_libraries(psp-browser-script-dev-prx PRIVATE
                     tilefinch_voice_frontend tilefinch_pocketsphinx pspaudio)

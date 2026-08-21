@@ -1873,6 +1873,7 @@ typedef struct {
     const char *url;
     const char *source;
     size_t source_length;
+    size_t source_bytes;
     const char *decoded;
     size_t decoded_length;
     const char *supplemental;
@@ -1964,7 +1965,7 @@ static void lite_build_after_watch(YoutubeLiteBuildWork *work)
 
 static YoutubeLiteBuildWork *lite_build_work_create(
     Budget *budget, const char *url, const char *source,
-    size_t source_length, const char *supplemental,
+    size_t source_length, size_t source_bytes, const char *supplemental,
     size_t supplemental_length, const char *decoded,
     size_t decoded_length, bool compact_results,
     char *error, size_t error_size)
@@ -1974,10 +1975,11 @@ static YoutubeLiteBuildWork *lite_build_work_create(
     bool direct_search_continuation =
         route == YOUTUBE_LITE_ROUTE_SEARCH
         && supplemental != NULL && supplemental_length != 0;
+    bool raw_source_required = route == YOUTUBE_LITE_ROUTE_WATCH;
     if (budget == NULL || url == NULL || route == YOUTUBE_LITE_ROUTE_NONE
-        || (!direct_search_continuation
-            && (source == NULL || source_length == 0))
+        || (raw_source_required && (source == NULL || source_length == 0))
         || source_length > YOUTUBE_LITE_MAXIMUM_SOURCE_BYTES
+        || source_bytes > YOUTUBE_LITE_MAXIMUM_SOURCE_BYTES
         || supplemental_length > YOUTUBE_LITE_MAXIMUM_COMMENTS_BYTES
         || (supplemental_length != 0 && supplemental == NULL)) {
         lite_error(error, error_size, "invalid bounded YouTube build data");
@@ -1994,6 +1996,7 @@ static YoutubeLiteBuildWork *lite_build_work_create(
     work->url = url;
     work->source = source;
     work->source_length = source_length;
+    work->source_bytes = source_bytes;
     work->supplemental = supplemental;
     work->supplemental_length = supplemental_length;
     work->route = route;
@@ -2476,8 +2479,7 @@ static bool lite_build_work_take_document(
         .budget = work->budget,
         .html = work->html.data,
         .html_length = work->html.length,
-        .source_bytes =
-            work->source_length + work->supplemental_length,
+        .source_bytes = work->source_bytes + work->supplemental_length,
         .result_count = display,
         .route = work->route
     };
@@ -2690,6 +2692,10 @@ struct YoutubeLiteLoadJob {
     char supplemental_url[512];
     char error[256];
     FetchResult source;
+    size_t primary_source_bytes;
+    long primary_status_code;
+    char primary_server[64];
+    char primary_cf_mitigated[32];
     FetchResult *supplemental;
     char *decoded;
     size_t decoded_length;
@@ -2708,6 +2714,17 @@ struct YoutubeLiteLoadJob {
     YoutubeLiteDocument document;
     YoutubeLiteLoadMetrics metrics;
 };
+
+static void lite_load_release_unused_primary(YoutubeLiteLoadJob *job)
+{
+    if (job == NULL || job->route == YOUTUBE_LITE_ROUTE_WATCH
+        || job->source.data == NULL) return;
+    /* Home, search and channel builds consume only the bounded decoded
+       initial-data buffer by this point. Keep response diagnostics and the
+       logical source-byte metric in the job, but return the often-large raw
+       HTML before cooperative HTML emission and DOM construction overlap. */
+    fetch_result_destroy(&job->source);
+}
 
 static TilefinchRequestContext lite_primary_context(
     const char *page_url, const char *fetch_url)
@@ -3365,6 +3382,7 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
             job->build = lite_build_work_create(
                 job->budget, job->url,
                 job->source.data, job->source.length,
+                job->primary_source_bytes,
                 job->supplemental_fetched
                     ? job->supplemental->data : NULL,
                 job->supplemental_fetched
@@ -3396,13 +3414,17 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
         if (built) {
             const FetchResult *metadata =
                 job->direct_continuation && job->supplemental_fetched
-                    ? job->supplemental : &job->source;
-            job->document.status_code = metadata->status_code;
-            snprintf(job->document.server, sizeof(job->document.server),
-                     "%s", metadata->server);
-            snprintf(job->document.cf_mitigated,
-                     sizeof(job->document.cf_mitigated), "%s",
-                     metadata->cf_mitigated);
+                    ? job->supplemental : NULL;
+            job->document.status_code = metadata != NULL
+                ? metadata->status_code : job->primary_status_code;
+            snprintf(
+                job->document.server, sizeof(job->document.server), "%s",
+                metadata != NULL ? metadata->server : job->primary_server);
+            snprintf(
+                job->document.cf_mitigated,
+                sizeof(job->document.cf_mitigated), "%s",
+                metadata != NULL
+                    ? metadata->cf_mitigated : job->primary_cf_mitigated);
             job->status = YOUTUBE_LITE_LOAD_SUCCEEDED;
         } else if (job->direct_continuation
                    && lite_load_fallback_to_primary(job)) {
@@ -3464,6 +3486,8 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
                 && !job->decode_attempted
                     ? YOUTUBE_LITE_JOB_DECODE
                     : YOUTUBE_LITE_JOB_BUILD;
+            if (job->phase == YOUTUBE_LITE_JOB_BUILD)
+                lite_load_release_unused_primary(job);
         }
         return YOUTUBE_LITE_LOAD_PENDING;
     }
@@ -3496,6 +3520,7 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
             budget_free(job->budget, job->supplemental);
             job->supplemental = NULL;
             job->phase = YOUTUBE_LITE_JOB_BUILD;
+            lite_load_release_unused_primary(job);
             return YOUTUBE_LITE_LOAD_PENDING;
         }
         lite_load_job_fail(
@@ -3511,6 +3536,15 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
             lite_primary_context(job->url, job->fetch_url);
         lite_accept_cookies(
             job->session, &context, &job->source, job->fetch_url);
+        job->primary_source_bytes = job->source.length;
+        job->primary_status_code = job->source.status_code;
+        snprintf(
+            job->primary_server, sizeof(job->primary_server), "%s",
+            job->source.server);
+        snprintf(
+            job->primary_cf_mitigated,
+            sizeof(job->primary_cf_mitigated), "%s",
+            job->source.cf_mitigated);
         job->identity = (YoutubeLiteIdentity) {
             .version = YOUTUBE_LITE_IDENTITY_CACHE_VERSION
         };
@@ -3538,6 +3572,7 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
     if (job->identity_available)
         (void) lite_identity_cache_put(job->session, &job->identity);
     job->phase = YOUTUBE_LITE_JOB_BUILD;
+    lite_load_release_unused_primary(job);
     return YOUTUBE_LITE_LOAD_PENDING;
 }
 
@@ -3619,8 +3654,9 @@ bool youtube_lite_load_metrics(
         metrics->completion_per_mille = 620;
         break;
     case YOUTUBE_LITE_JOB_SUPPLEMENTAL: {
-        size_t supplemental = job->metrics.body_bytes > job->source.length
-            ? job->metrics.body_bytes - job->source.length : 0;
+        size_t supplemental =
+            job->metrics.body_bytes > job->primary_source_bytes
+            ? job->metrics.body_bytes - job->primary_source_bytes : 0;
         const size_t horizon = 64u * 1024u;
         size_t denominator = supplemental > SIZE_MAX - horizon
             ? SIZE_MAX : supplemental + horizon;

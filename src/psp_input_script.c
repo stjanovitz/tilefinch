@@ -51,6 +51,7 @@ const char *psp_input_script_action_name(PspUiAction action)
         case PSP_UI_ACTION_HOME: return "home";
         case PSP_UI_ACTION_SAVE_FOR_LATER: return "save-for-later";
         case PSP_UI_ACTION_SHOW_OFFLINE: return "show-offline";
+        case PSP_UI_ACTION_SHOW_DOWNLOADS: return "show-downloads";
         case PSP_UI_ACTION_SHOW_SCREENSHOTS: return "show-screenshots";
         case PSP_UI_ACTION_TOGGLE_BOOKMARK: return "toggle-bookmark";
         case PSP_UI_ACTION_SWITCH_TAB: return "switch-tab";
@@ -94,6 +95,7 @@ const char *psp_input_script_setting_name(PspUiSettingId setting)
         case PSP_UI_SETTING_READER_FONT: return "reader-font";
         case PSP_UI_SETTING_REMEMBER_READER_SITE_SCALE:
             return "remember-reader-site-scale";
+        case PSP_UI_SETTING_READER_AUTO_MODE: return "reader-auto-mode";
         case PSP_UI_SETTING_CUSTOM_HOMEPAGE: return "custom-homepage";
         case PSP_UI_SETTING_HISTORY: return "history";
         case PSP_UI_SETTING_RESTORE_LAST_PAGE: return "restore-last-page";
@@ -115,6 +117,8 @@ const char *psp_input_script_setting_name(PspUiSettingId setting)
         case PSP_UI_SETTING_YOUTUBE_QUALITY: return "youtube-quality";
         case PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS:
             return "youtube-compact-results";
+        case PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY:
+            return "youtube-audio-only";
         case PSP_UI_SETTING_VIDEO_SCALING: return "video-scaling";
         case PSP_UI_SETTING_VIDEO_STARTUP_BUFFERING:
             return "video-startup-buffering";
@@ -150,11 +154,17 @@ const char *psp_input_script_screen_name(PspUiScreen screen)
     switch (screen) {
         case PSP_UI_SCREEN_PAGE: return "page";
         case PSP_UI_SCREEN_MENU: return "menu";
+        case PSP_UI_SCREEN_PAGE_TOOLS: return "page-tools";
+        case PSP_UI_SCREEN_SITE_CONTROLS: return "site-controls";
+        case PSP_UI_SCREEN_PAGE_INFORMATION: return "page-information";
+        case PSP_UI_SCREEN_HELP: return "help";
+        case PSP_UI_SCREEN_HELP_DETAIL: return "help-detail";
         case PSP_UI_SCREEN_OPTIONS: return "options";
         case PSP_UI_SCREEN_OPTION_ITEMS: return "option-items";
         case PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS: return "experimental";
         case PSP_UI_SCREEN_GLYPH_OPTIONS: return "glyph-options";
         case PSP_UI_SCREEN_UPDATE: return "update";
+        case PSP_UI_SCREEN_UPDATE_VERSIONS: return "update-versions";
         case PSP_UI_SCREEN_DATA_OPTIONS: return "data-options";
         case PSP_UI_SCREEN_TABS: return "tabs";
         case PSP_UI_SCREEN_TEXT_ENTRY: return "text-entry";

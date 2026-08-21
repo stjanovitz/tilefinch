@@ -14,7 +14,7 @@ mobile URL
   -> ordinary Tilefinch HTML page
   -> watch activation
   -> bounded player-response resolver
-  -> progressive MP4 or separate AVC/AAC MP4 sources
+  -> progressive MP4, separate AVC/AAC MP4 sources, or AAC alone
   -> HTTP range reader
   -> portable MP4 demuxer
   -> host or PSP codec backend
@@ -24,6 +24,12 @@ mobile URL
 The browser engine never contains YouTube selectors or layout exceptions.
 The provider boundary is also where a future provider can be replaced without
 changing navigation, rendering, media ownership, or player controls.
+
+The optional audio-only setting selects the adaptive AAC representation at
+route open. It does not request video bytes and does not construct the video
+range, H.264 demux/decoder, or picture surfaces; it reuses the same bounded
+audio transport, buffering, pause, and seek machinery. The setting is sampled
+once per new YouTube route so changing Options cannot mutate a live pipeline.
 
 ## Provider document
 
@@ -60,6 +66,15 @@ The resolver calls a fixed, signed table of client profiles. It parses
 premiere restrictions produce useful errors rather than a generic malformed
 inventory message.
 
+The final direct/enriched profile is VisionOS. The resolver does not use the
+Android VR identity because its media URLs may stop serving after a small
+prefix; smaller windows and reconnects cannot recover a URL-wide serving cap.
+Tilefinch's production range windows are already below 1 MiB and can be
+reissued after ordinary request failures. It does not generate YouTube
+Proof-of-Origin (PO) tokens. If YouTube requires a player or media PO token for
+a particular video or client policy, that route remains unsupported rather
+than fabricating attestation state.
+
 Only unciphered HTTPS media URLs are admitted. The resolver prefers a
 progressive AVC/AAC MP4 within the configured height, then separate AVC MP4
 and AAC MP4 streams. The shipping preference is 360p; users can select the
@@ -88,8 +103,12 @@ to the Memory Stick.
   already-authorized complete length match exactly.
 - Each source owns one active window and one look-ahead window, each at most
   256 KiB in the PSP player.
-- A missed window gets one retry; malformed, short, oversized, or ambiguous
-  responses fail closed.
+- A demanded window which stops making byte progress is re-issued on at most
+  three fresh connections. Slow but progressing bytes are retained. The
+  logical window has one absolute deadline, after which it becomes terminal
+  rather than remaining simultaneously failed and pending; selecting a new
+  window starts a fresh incident.
+- Malformed, short, oversized, or ambiguous responses fail closed.
 - The shared transport worker performs network progress without blocking the
   browser thread. Request ownership remains singular and cancellation retires
   the slot by generation.
@@ -158,8 +177,9 @@ The native player is provider-neutral:
 
 - Cross toggles play and pause.
 - Left and Right seek ten seconds; pointer input can seek on the progress bar.
-- A bounded 128x72 preview is allocated lazily and uses the active decoder
-  serially.
+- Scrubbing moves a target marker over the last displayed frame without
+  touching the decoder or network. Cross commits one seek; playback resumes
+  only after both split source heads have been prepared.
 - Circle closes the native surface immediately from the user's perspective;
   bounded teardown continues through the session machine.
 - Controls auto-hide during playback and are composited without sampling a

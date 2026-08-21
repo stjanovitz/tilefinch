@@ -324,9 +324,9 @@ class PspSdkContractTests(unittest.TestCase):
         source = without_comments(
             psp_media_session_sources())
         route = source[
-            source.index("void psp_media_prepare_route("):
+            source.index("static void psp_media_prepare_route_kind("):
             source.index("if (media->suspended_for_internal_view", source.index(
-                "void psp_media_prepare_route("))]
+                "static void psp_media_prepare_route_kind("))]
         clear = route.index("media->open_service_pending = false;")
         close = route.index('"leave-video-route"')
         destroy = route.index("psp_media_pipeline_destroy(media);")
@@ -711,7 +711,7 @@ class PspSdkContractTests(unittest.TestCase):
         facade = without_comments(
             (ROOT / "src/psp_media_session.c").read_text(encoding="utf-8"))
         route = facade[
-            facade.index("void psp_media_prepare_route("):
+            facade.index("static void psp_media_prepare_route_kind("):
             facade.index("void psp_media_close(")]
         self.assertIn("media->clock_us = 0;", route)
 
@@ -746,6 +746,7 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("void psp_media_job_failed(")]
         for phase in (
                 "PSP_MEDIA_JOB_SEEK_PREPARE",
+                "PSP_MEDIA_JOB_SEEK_PRIME",
                 "PSP_MEDIA_JOB_SEEK_DECODE",
                 "PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE",
                 "PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE"):
@@ -777,12 +778,20 @@ class PspSdkContractTests(unittest.TestCase):
     def test_provider_routes_autoplay_without_validation_input(self):
         source = without_comments(psp_media_session_sources())
         route = source[
-            source.index("void psp_media_prepare_route("):
+            source.index("static void psp_media_prepare_route_kind("):
             source.index("void psp_media_close(")]
-        for checkpoint in ('"same-video-open"', '"route-open"'):
-            dispatch = route[:route.index(checkpoint)]
-            dispatch = dispatch[dispatch.rfind("psp_media_dispatch("):]
-            self.assertIn(".autoplay = true", dispatch)
+        dispatch = route[:route.index('"same-video-open"')]
+        dispatch = dispatch[dispatch.rfind("psp_media_dispatch("):]
+        self.assertIn(".autoplay = true", dispatch)
+        dispatch = route[:route.index('"route-open"')]
+        dispatch = dispatch[dispatch.rfind("psp_media_dispatch("):]
+        self.assertIn(".autoplay = autoplay", dispatch)
+        facade = source[
+            source.index("void psp_media_prepare_route("):
+            source.index("bool psp_media_open_page_source(")]
+        self.assertIn(
+            "psp_media_prepare_route_kind(media, url, generation, false, true)",
+            " ".join(facade.split()))
         self.assertNotIn(
             ".autoplay = media->reopen_resume_playing", route)
         open_source = without_comments(
@@ -798,9 +807,12 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("bool psp_media_machine_wants_playing("):
             source.index("static void psp_media_apply_active_projection(")]
         self.assertIn("PSP_MEDIA_SESSION_OPENING", wants)
+        first_frame_start = open_source.index("bool wants_playing =")
         first_frame = open_source[
-            open_source.index("open-first-frame-boundary") - 500:
-            open_source.index("open-first-frame-boundary") + 250]
+            first_frame_start:
+            open_source.index(
+                "media_playback_set_playing(media->playback, wants_playing)",
+                first_frame_start) + 64]
         self.assertIn("psp_media_machine_wants_playing(media)", first_frame)
         self.assertIn("if (!wants_playing)", first_frame)
         self.assertIn(
@@ -925,6 +937,7 @@ class PspSdkContractTests(unittest.TestCase):
             runtime.index("bool psp_present_internal(")]
         for phase in (
                 "PSP_MEDIA_JOB_SEEK_PREPARE",
+                "PSP_MEDIA_JOB_SEEK_PRIME",
                 "PSP_MEDIA_JOB_SEEK_DECODE",
                 "PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE",
                 "PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE"):
@@ -1233,83 +1246,44 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("psp_media_present_ge_stage_dma_submit(", helper)
         self.assertIn("psp_media_present_ge_stage_dma_join(", helper)
 
-    def test_only_a_scrub_preview_decodes_forward_to_its_target(self):
-        """A scrub preview owes the viewer the still it is showing, so it
-        decodes forward from the keyframe until it has one. Nothing else does:
-        an open's resume owes playback from where they left off, a confirmed
-        seek owes playback from where they scrubbed to, and the demuxer reset
-        has already put both there. Decoding to an exact frame first cost the
-        device a five-second timeout on every resume, and killed the
-        two-minute stability soak on the far forward seek it makes at fifteen
-        seconds -- SEEK FRAME UNAVAILABLE, the leg calling the pipeline caught
-        up before one picture existed."""
+    def test_scrubbing_is_ui_only_and_commit_primes_both_sources(self):
+        """Moving the nub must not churn the decoder or HTTP windows. A
+        committed seek performs one reset, then cooperatively proves that the
+        first video and audio payload windows are readable before returning to
+        the existing presentation priming state."""
         source = without_comments(
             psp_media_session_sources())
+        request = source[
+            source.index("bool psp_media_request_seek("):
+            source.index("static bool psp_media_copy_preview(")]
+        preview = request[
+            request.index("if (preview) {"):
+            request.index("if (!media->audio_only && psp_media_seek_reopens_backend(")]
+        self.assertIn("PSP_MEDIA_EVENT_PREVIEW_STARTED", preview)
+        self.assertIn("psp_ui_media_set_seek_preview", preview)
+        self.assertIn("return true", preview)
+        self.assertNotIn("media_playback_seek(", preview)
+        self.assertNotIn("media_playback_warm_", preview)
+        self.assertNotIn("PSP_MEDIA_JOB_SEEK_PREPARE", preview)
+
         pump = source[
             source.index("bool psp_media_seek_decode_pump("):
             source.index("void psp_media_close(")]
         skipped = pump[pump.index("bool decodes_to_the_target ="):]
         skipped = skipped[:skipped.index("media->job_phase = restore")]
-        # A preview, and the restore that puts playback back after one, are
-        # the only legs that reach the decode phase.
-        self.assertIn("media->job_preview || restore", skipped)
-        # It ends the job in the prepare leg, with a clock the demuxer agrees
-        # with, and never enters the decode phase.
-        self.assertIn("media->job_phase = PSP_MEDIA_JOB_NONE", skipped)
+        self.assertIn("media->job_phase = PSP_MEDIA_JOB_SEEK_PRIME", skipped)
         self.assertIn("media->clock_us = target_us", skipped)
         self.assertNotIn("PSP_MEDIA_JOB_SEEK_DECODE", skipped)
-        self.assertIn("decode-leg=skipped", skipped)
-        # Preview/restore is visually paused but must still run the decoder;
-        # otherwise the generic playback pump returns COMPLETE without
-        # reading a sample. Audio remains held throughout the hidden decode.
-        controller = source[
-            source.index("static void psp_media_apply_active_projection("):
-            source.index("static void psp_media_controller_trace(")]
-        self.assertIn("PSP_MEDIA_SESSION_SEEKING", controller)
-        self.assertIn("psp_media_apply_audio_hold(media)", controller)
-        self.assertIn(
-            "media_playback_set_playing(media->playback, true)", pump)
-        self.assertIn(
-            "media_playback_set_presentation_clock_us(\n"
-            "            media->playback, target_us)", pump)
-        self.assertIn("!media_playback_ended(media->playback)", pump)
-
-        advance = source[source.index("bool psp_media_advance("):]
-        self.assertIn("psp_media_seek_take_clock_us(", advance)
+        prime = pump[
+            pump.index("if (media->job_phase == PSP_MEDIA_JOB_SEEK_PRIME)"):
+            pump.index("if (media->job_phase == PSP_MEDIA_JOB_SEEK_PREPARE")]
+        self.assertIn("media_playback_prime_video_source(", prime)
+        self.assertIn("media_playback_prime_audio_source(", prime)
+        self.assertIn("PSP_MEDIA_SEEK_PRIME_ALL", prime)
+        self.assertIn("psp_media_retry_delivery_failure(", prime)
         self.assertLess(
-            advance.index("media_playback_discard_video_before("),
-            advance.index("media_playback_set_presentation_clock_us("))
-        # A seek that skipped its decode leg is still a completed seek to the
-        # soak that counts them; an open's resume never was one.
-        self.assertIn("media->seek_completions++", skipped)
-
-        # And it warms the video connection under this job's wait budget,
-        # before playing is declared, so the 497ms handshake a long think-time
-        # forces is paid here with its loading UI rather than on the first
-        # playing frame. Audio was already warm; this is the asymmetry the
-        # counter (new-conn=1/0, handshake-max=497ms) named. A seek gets the
-        # five seconds its decode leg used to spend failing, not the open's
-        # forty-five: a viewer waiting on a scrub is not a loading screen.
-        self.assertIn("media_playback_warm_video(", skipped)
-        self.assertIn("psp_media_open_arm_wait_budget(media)", skipped)
-        self.assertIn("psp_media_seek_arm_wait_budget(media)", skipped)
-        self.assertLess(
-            skipped.index("media_playback_warm_video("),
-            skipped.index("media->ui.playing = playing"))
-        # Armed only by an open, and cleared by every path that retires a job.
-        open_pump = source[
-            source.index(
-                "static bool psp_media_open_pump_step(PspMediaSession *media)"
-                "\n{"):
-            source.index("bool psp_media_open_work_pending(")]
-        self.assertIn("media->job_resume_open = true", open_pump)
-        for function, following in (
-                ("void psp_media_job_failed(",
-                 "static void psp_youtube_log_text("),
-                ("void psp_media_cancel_decode(",
-                 "void psp_media_interrupt_decode(")):
-            body = source[source.index(function):source.index(following)]
-            self.assertIn("media->job_resume_open = false", body)
+            prime.index("media->job_prime_ready_mask & required_ready"),
+            prime.index("media_playback_set_playing(media->playback, playing)"))
 
     def test_backward_reopen_completion_is_telemetry_not_state(self):
         session_header = without_comments(
@@ -1410,7 +1384,8 @@ class PspSdkContractTests(unittest.TestCase):
             advance.index("if (media->presentation_preroll_startup) {"):
             advance.index("if (received_frame) {")]
         self.assertIn("media_playback_ready_video_frames", prime)
-        self.assertIn("psp_media_startup_preroll_ready(ready)", prime)
+        self.assertIn("media_playback_startup_ready_frames", prime)
+        self.assertIn("ready >= ready_target", prime)
         self.assertIn("media_playback_displayed_video_frames", prime)
         self.assertIn("presentation_preroll_startup_claimed", prime)
         self.assertIn("startup_claim_allowed = true", prime)
@@ -1521,52 +1496,143 @@ class PspSdkContractTests(unittest.TestCase):
             r"PSP_MEDIA_DECODE_NO_PROGRESS_MS\s+(\d+)u", policy).group(1))
         self.assertLess(watchdog_us, no_progress_ms * 1000)
 
-    def test_a_seek_warms_both_sources_and_a_trickle_is_replaced(self):
-        """The retired-leg seek warmed video only. A device soak then spent
-        its audio window at a far offset on the original connection, whose CDN
-        burst allowance was spent -- 16 KiB in six seconds against a clock
-        that needed it in four. Video was fine; the interleave correctly held
-        it back; the session died. Audio is a tenth of the bitrate and the
-        first thing playback runs out of."""
+    def test_a_seek_primes_both_sources_and_a_dead_window_terminates(self):
+        """Both post-seek source heads must be present before playback can
+        resume. A demanded window which stops making progress has a bounded
+        reconnect/deadline outcome rather than remaining pending forever."""
         source = without_comments(
             psp_media_session_sources())
         pump = source[
             source.index("bool psp_media_seek_decode_pump("):
             source.index("void psp_media_close(")]
-        skipped = pump[pump.index("bool decodes_to_the_target ="):]
-        skipped = skipped[:skipped.index("media->job_phase = restore")]
-        # Both, under the one wait budget, and audio at the position the reset
-        # left it rather than the position that was asked for.
-        self.assertIn("media_playback_warm_video(", skipped)
-        self.assertIn(
-            "media_playback_warm_audio(\n"
-            "                media->playback, actual_us", skipped)
+        prime = pump[
+            pump.index("if (media->job_phase == PSP_MEDIA_JOB_SEEK_PRIME)"):
+            pump.index("if (media->job_phase == PSP_MEDIA_JOB_SEEK_PREPARE")]
+        self.assertIn("media_playback_prime_video_source(", prime)
+        self.assertIn("media_playback_prime_audio_source(", prime)
+        self.assertIn("media->job_prime_audio_us", prime)
+        self.assertIn("required_ready = media->audio_only", prime)
+        self.assertIn("PSP_MEDIA_SEEK_PRIME_AUDIO : PSP_MEDIA_SEEK_PRIME_ALL",
+                      prime)
+        self.assertIn("media->job_prime_ready_mask & required_ready", prime)
         self.assertLess(
-            skipped.index("media_playback_warm_audio("),
-            skipped.index("psp_media_open_clear_wait_budget(media)"))
-        # And a window that has stopped arriving is replaced rather than
-        # waited on: after the conservative sustained-rate verdict in the
-        # background, or the shorter no-progress verdict once playback has
-        # actually starved. Both share one bounded replacement primitive.
+            prime.index("media->job_prime_ready_mask & required_ready"),
+            prime.index("media_playback_set_playing(media->playback, playing)"))
+
         http = without_comments(
             (ROOT / "src/media_http.c").read_text(encoding="utf-8"))
         restart = http[
-            http.index("static bool range_restart_slow_fill("):
-            http.index("static void range_watch_fill_rate(")]
+            http.index("static bool range_restart_stalled_fill("):
+            http.index("static void range_watch_window_liveness(")]
         watch = http[
-            http.index("static void range_watch_fill_rate("):
+            http.index("static void range_watch_window_liveness("):
             http.index("static void range_pump(")]
-        self.assertIn("media_http_range_should_reconnect_at_rate(", watch)
-        self.assertIn("media_http_range_should_reconnect_starved(", watch)
-        self.assertIn("range->minimum_sustained_bytes_per_second", watch)
-        self.assertIn("range_fill_complete(range), gained, elapsed_us", watch)
+        self.assertIn("media_http_window_tracker_observe(", watch)
+        self.assertIn("MEDIA_HTTP_WINDOW_FAIL", watch)
+        self.assertIn("MEDIA_HTTP_WINDOW_RECONNECT", watch)
+        self.assertIn("range_window_fail(", watch)
+        self.assertNotIn("media_http_range_should_reconnect_at_rate(", watch)
+        pump_range = http[
+            http.index("static void range_pump("):
+            http.index("static bool range_cancelled(")]
+        self.assertIn("if (range->fill_request == 0) {", pump_range)
+        self.assertIn("range_watch_window_liveness(range)", pump_range)
         self.assertIn("MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS", restart)
         self.assertIn("range_fill_abandon(", restart)
-        self.assertLess(
-            watch.index("media_http_range_should_reconnect_at_rate("),
-            watch.rindex("range_restart_slow_fill("))
         self.assertIn("range->stats.reconnects++", restart)
         self.assertIn("range->stats.starved_reconnects++", restart)
+
+    def test_audio_only_open_and_seek_have_no_video_dependency(self):
+        """The low-bandwidth route owns only adaptive AAC. Opening and
+        seeking therefore cannot admit a video range or assume AAC is source
+        one in a two-source playback object."""
+        opening = without_comments(
+            (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+        pump = opening[opening.rindex("static bool psp_media_open_pump_step(") :]
+        decoder = pump[
+            pump.index("case PSP_MEDIA_JOB_OPEN_DECODER_PREPARE:"):
+            pump.index("case PSP_MEDIA_JOB_OPEN_PLAYBACK:")]
+        self.assertIn(
+            "media->audio_only ? PSP_MEDIA_JOB_OPEN_AUDIO_RANGE",
+            " ".join(decoder.split()))
+        audio_demux = pump[
+            pump.index("case PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX:"):
+            pump.index("case PSP_MEDIA_JOB_OPEN_DECODER_PREPARE:")]
+        self.assertIn(
+            "media->audio_only ? PSP_MEDIA_JOB_OPEN_PLAYBACK",
+            " ".join(audio_demux.split()))
+
+        playback = without_comments(
+            (ROOT / "src/media_backend.c").read_text(encoding="utf-8"))
+        prime = playback[
+            playback.index("media_playback_prime_audio_source("):
+            playback.index("static bool media_playback_seek_internal(")]
+        prime_flat = " ".join(prime.split())
+        self.assertIn("playback->source_count == 1u", prime_flat)
+        self.assertIn("? 0u : 1u", prime_flat)
+
+    def test_swdec_shared_memory_and_reordered_pts_contracts(self):
+        """ME-owned ranges must not share allocator cache lines, and a
+        reordered picture must publish the source AU's timing rather than the
+        most recently submitted job's timing."""
+        source = without_comments(
+            (ROOT / "src/media_backend_psp_swdec.c").read_text(
+                encoding="utf-8"))
+        create = source[source.index(
+            "bool media_psp_swdec_backend_create_sources("):]
+        for field in ("decoder_arena", "aux_arena", "rgb_ring",
+                      "audio_packets"):
+            self.assertRegex(
+                create,
+                rf"{field}\s*=\s*budget_malloc_cacheline_category\(")
+        submit = source[
+            source.index("static MediaBackendResult swdec_submit("):
+            source.index("static MediaBackendResult swdec_drain(")]
+        self.assertIn("sceKernelDcacheWritebackRange(", submit)
+        publish = source[
+            source.index("static void swdec_publish_picture("):
+            source.index("static void swdec_select_speed(")]
+        self.assertIn("uint64_t pts_us = mapping->pts_us", publish)
+        self.assertIn("uint64_t duration_us = mapping->duration_us", publish)
+        self.assertIn("state->pts_us = pts_us", publish)
+        self.assertNotIn("state->pts_us = backend->job_pts_us", publish)
+        self.assertIn("sceKernelDcacheInvalidateRange(", publish)
+        self.assertIn("backend->rgb_slot_bytes", publish)
+        self.assertIn(
+            "backend->rgb_slot_bytes = swdec_cache_extent(", create)
+        self.assertIn(
+            "backend->rgb_slot_bytes);", source[source.index(
+                "static void swdec_decode_job("):
+                source.index("static int swdec_worker_main(")])
+        self.assertIn(
+            "media_h264_annexb_sample_is_admitted(", submit)
+        component = without_comments(
+            (ROOT / "src/swdec/swdec.c").read_text(encoding="utf-8"))
+        self.assertIn("d->max_width = max_width", component)
+        self.assertIn("swdec_dimensions_admitted(", component)
+        self.assertIn("swdec_audio_channels_admitted(channels)", component)
+        me = without_comments(
+            (ROOT / "src/swdec/swdec_me.c").read_text(encoding="utf-8"))
+        self.assertGreaterEqual(
+            me.count("swdec_rgb565_destination_fits("), 3)
+        self.assertGreaterEqual(
+            me.count("swdec_audio_channels_admitted(out.channels)"), 2)
+
+    def test_hls_seek_enters_the_hls_source_and_preserves_probe_progress(self):
+        seek = without_comments(
+            (ROOT / "src/psp_media_seek.c").read_text(encoding="utf-8"))
+        request = seek[
+            seek.index("bool psp_media_request_seek("):
+            seek.index("bool psp_media_seek_decode_pump(")]
+        self.assertIn("media->hls == NULL", request)
+        hls = without_comments(
+            (ROOT / "src/media_hls.c").read_text(encoding="utf-8"))
+        common = hls[
+            hls.index("static bool hls_seek_common("):
+            hls.index("static bool hls_seek_us(")]
+        self.assertLess(common.index("source->seek_pristine"),
+                        common.index("hls_cancel_requests(source)"))
+        self.assertIn("source->seek_pristine = false", hls)
 
     def test_media_ranges_leave_curl_progress_on_the_transport_worker(self):
         """A curl_multi pump can spend seconds in PSP DNS/TCP/TLS despite a
@@ -1586,6 +1652,13 @@ class PspSdkContractTests(unittest.TestCase):
             "fetch_background_transport_enqueue_media_diagnosed(", issue)
         self.assertIn("RANGE_FILL_DEFERRED", issue)
         self.assertIn("range->fill_admission_deferred = true", issue)
+        prime = source[
+            source.index("MediaHttpRangePrimeStatus "
+                         "media_http_range_prime_successor("):
+            source.index("void media_http_range_set_aggressive_readahead(")]
+        self.assertIn("range_window_mark_demanded(range)", prime)
+        self.assertIn("range->fill_attempts >= 2u", prime)
+        self.assertIn("MEDIA_HTTP_RANGE_PRIME_FAILED", prime)
         fill = source[
             source.index("static MediaRangeReadStatus range_fill_window("):
             source.index("static MediaRangeReadStatus range_read_bounded(")]
@@ -1874,6 +1947,9 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn(
             "psp_media_decode_no_progress_budget_ms(source_refilling)",
             source)
+        self.assertIn(
+            "psp_media_decode_no_progress_watchdog_active(", source)
+        self.assertIn("media->machine.preview_active", source)
         self.assertNotIn("media->decode_no_progress_ms >= 2000u", source)
         self.assertIn("refilling=%d", source)
 
@@ -1909,7 +1985,8 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("static bool psp_media_take_frame(")]
         self.assertIn("backend->raw_nal_probe_pending = true", reset)
         self.assertLess(
-            reset.index("if (!psp_media_surface_proven(backend))"),
+            reset.index(
+                "if (backend->have_video && !psp_media_surface_proven(backend))"),
             reset.index("backend->raw_nal_probe_pending = true"))
 
     def test_the_frame_is_claimed_after_the_pump_not_before(self):
@@ -2179,15 +2256,14 @@ class PspSdkContractTests(unittest.TestCase):
             session.index("void psp_media_present_texture_for("):
             session.index("bool psp_media_advance(")]
         self.assertEqual(
-            2, stage.count("media_psp_backend_borrow_surface(\n"))
+            2, stage.count("media_playback_borrow_video_slot(\n"))
         self.assertLess(
-            stage.index("media_psp_backend_borrow_surface(\n"),
+            stage.index("media_playback_borrow_video_slot(\n"),
             stage.index("psp_media_present_ge_stage_dma_submit("))
         # A claim the backend refused means the picture is gone, so the staged
         # path must not copy anyway.
         self.assertIn(
-            "|| !media_psp_backend_borrow_surface(\n"
-            + " " * 19 + "(unsigned) frame->slot, frame->generation)) {",
+            "|| !media_playback_borrow_video_slot(\n",
             stage)
         # The synchronous stage copy completes before it returns, so the slot
         # is finished with and handed back rather than merely unleased.
@@ -2255,10 +2331,10 @@ class PspSdkContractTests(unittest.TestCase):
         staged = session[
             session.index("static void psp_media_finish_staged_surface("):
             session.index("void psp_media_present_texture_for(")]
-        self.assertIn("media_psp_backend_release_surface(", staged)
+        self.assertIn("media_playback_release_video_read(", staged)
         self.assertIn("media_playback_release_video_slot(", staged)
         self.assertLess(
-            staged.index("media_psp_backend_release_surface("),
+            staged.index("media_playback_release_video_read("),
             staged.index("media_playback_release_video_slot("))
         # The paths that read the slot per draw keep their claim: they use the
         # lease-only release, which leaves the slot READING.
@@ -2318,8 +2394,8 @@ class PspSdkContractTests(unittest.TestCase):
             session.index("static bool psp_media_seek_preview_ready(")
             if "static bool psp_media_seek_preview_ready(" in session
             else session.index("static bool psp_media_copy_preview(") + 4000]
-        self.assertIn("media_psp_backend_borrow_surface(", preview)
-        self.assertIn("media_psp_backend_end_surface_read(", preview)
+        self.assertIn("media_playback_borrow_video_slot(", preview)
+        self.assertIn("media_playback_end_auxiliary_video_read(", preview)
         # A present that failed with the rows in hand keeps its claim, because
         # the software scaler the caller falls back to reads the same surface.
         # No claim survives into the next frame's advance.
@@ -2344,11 +2420,11 @@ class PspSdkContractTests(unittest.TestCase):
             runtime.index("static bool psp_present_media_frame("):
             runtime.index("static bool psp_present_media_frame_video(")]
         self.assertLess(
-            software.index("media_psp_backend_borrow_surface("),
+            software.index("media_playback_borrow_video_slot("),
             software.index("psp_media_present_software(&plan, frame, vram)"))
         self.assertLess(
             software.index("psp_media_present_software(&plan, frame, vram)"),
-            software.index("media_psp_backend_release_surface("))
+            software.index("media_playback_release_video_read("))
 
     def test_the_stage_copy_cannot_wedge_the_browser(self):
         """The copy runs on a worker above the interactive thread and the
@@ -2715,7 +2791,7 @@ class PspSdkContractTests(unittest.TestCase):
         # The still-live arm does none of what the completed arm does. Each of
         # these three would be a use of an address the transfer still owns.
         self.assertIn("PSP_MEDIA_DMA_JOIN_TIMED_OUT_STILL_LIVE", finish)
-        self.assertIn("media_psp_backend_quarantine_surface(", finish)
+        self.assertIn("media_playback_quarantine_video_slot(", finish)
         self.assertLess(
             finish.index("bool still_live ="),
             finish.index("psp_media_present_ge_stage_dma_recover("),
@@ -2768,7 +2844,7 @@ class PspSdkContractTests(unittest.TestCase):
             session.index("static bool psp_media_pump_dma_quarantine("):
             session.index("bool psp_media_advance(\n    PspMediaSession")]
         self.assertLess(
-            pump.index("media_psp_backend_release_surface_quarantine("),
+            pump.index("media_playback_release_video_slot_quarantine("),
             pump.index("media_playback_release_video_slot("))
         # A transfer never observed to finish ends the session rather than
         # being assumed complete.
@@ -2976,8 +3052,11 @@ class PspSdkContractTests(unittest.TestCase):
             backend.index("static bool psp_media_take_frame(")]
         self.assertIn("&backend->video_refusal_dirty, false", reset)
         self.assertIn("refusal_rebuild = atomic_load_explicit", reset)
-        self.assertIn("rebuild_requested = refusal_rebuild", reset)
-        self.assertIn("no_touch = !refusal_rebuild", reset)
+        self.assertIn(
+            "rebuild_requested = backend->have_video && (refusal_rebuild",
+            reset)
+        self.assertIn(
+            "no_touch = backend->have_video && !refusal_rebuild", reset)
 
         session = without_comments(
             (ROOT / "src/psp_media_session.c").read_text(encoding="utf-8"))
@@ -3134,7 +3213,7 @@ class PspSdkContractTests(unittest.TestCase):
             session.index("void psp_media_pipeline_destroy("):
             session.index("void psp_media_prepare_route(")]
         self.assertLess(
-            destroy.index("media_psp_backend_note_frame_quiesced"),
+            destroy.index("media_playback_note_frame_quiesced"),
             destroy.index('psp_media_telemetry_report_feed(media, "teardown")'))
 
         backend = without_comments(
@@ -3523,7 +3602,8 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("psp_media_admitted_quality(", chooser)
         self.assertIn("media_psp_backend_wide_program_rejected()", chooser)
         self.assertIn("wide-program-rejected", chooser)
-        route = session[session.index("void psp_media_prepare_route("):]
+        route = session[
+            session.index("static void psp_media_prepare_route_kind("):]
         self.assertIn("psp_media_open_quality(media)", route)
         self.assertNotIn(
             "browser_profile_youtube_quality(media->profile)", route)
@@ -4379,9 +4459,9 @@ class PspSdkContractTests(unittest.TestCase):
             psp_media_session_sources())
         self.assertIn("#define PSP_MEDIA_CONNECT_TIMEOUT_MS 3000", session)
         self.assertEqual(
-            2, session.count(
+            3, session.count(
                 ".connect_timeout_ms = PSP_MEDIA_CONNECT_TIMEOUT_MS"),
-            "Both the video and the audio range window must bound connect; "
+            "The page-video probe and both range windows must bound connect; "
             "libcurl reaches the cancellation callback only from its "
             "progress callback, which does not run during connect.")
         resolver = without_comments(
@@ -4532,7 +4612,7 @@ class PspSdkContractTests(unittest.TestCase):
             media_http.index("static bool range_prepare_request("):
             media_http.index("static bool range_admit_values(")]
         self.assertIn(
-            ".force_fresh_connection = range->fill_reconnects != 0u",
+            ".force_fresh_connection = range->window_tracker.reconnects != 0u",
             prepare)
         transport = without_comments(
             (ROOT / "src/fetch/background_transport.inc").read_text(
@@ -4617,9 +4697,47 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn(
             "fetch_background_transport_enqueue_media_diagnosed(", media_http)
         self.assertIn(
-            "fetch_background_transport_set_media_priority(true)", session)
+            "fetch_background_transport_set_media_priority(active)", session)
         self.assertIn(
-            "fetch_background_transport_set_media_priority(false)", session)
+            "psp_media_set_transport_priority(media, true)", session)
+        self.assertIn(
+            "psp_media_set_transport_priority(media, false)", session)
+        failure = session[
+            session.index("void psp_media_raise_error("):
+            session.index("void psp_media_retire_first_frame(")]
+        self.assertIn(
+            "psp_media_set_transport_priority(media, false)", failure)
+        route = session[
+            session.index("static void psp_media_prepare_route_kind("):
+            session.index("void psp_media_prepare_route(")]
+        route_prefix = route[:route.index("if (!online_route")]
+        self.assertNotIn(
+            "psp_media_set_transport_priority(media, true)", route_prefix,
+            "Recognizing the incumbent watch URL runs every frame and must "
+            "not reacquire media slots after Close or a failed open.")
+        internal_hide = route[
+            route.index('"internal-view-hide"'):
+            route.index('"internal-view-hidden"')]
+        self.assertIn(
+            "psp_media_set_transport_priority(media, false)",
+            internal_hide)
+        close = session[
+            session.index("void psp_media_close("):
+            session.index("bool psp_media_reclaim_hidden_pipeline(")]
+        self.assertIn(
+            "psp_media_set_transport_priority(media, false)", close)
+        reclaim = session[
+            session.index("bool psp_media_reclaim_hidden_pipeline("):
+            session.index(
+                "bool psp_media_reclaim_hidden_pipeline_for_navigation(")]
+        self.assertIn(
+            "psp_media_set_transport_priority(media, false)", reclaim)
+        opening = without_comments(
+            (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+        open_pump = opening[
+            opening.rindex("static bool psp_media_open_pump_step("):
+            opening.index("bool psp_media_open_work_pending(")]
+        self.assertIn("psp_media_set_transport_priority(", open_pump)
 
     def test_audio_open_precedes_aggressive_video_successor(self):
         opening = without_comments(
@@ -4638,10 +4756,15 @@ class PspSdkContractTests(unittest.TestCase):
         http = without_comments(
             (ROOT / "src/media_http.c").read_text(encoding="utf-8"))
         restart = http[
-            http.index("static bool range_restart_slow_fill("):
-            http.index("static void range_watch_fill_rate(")]
-        self.assertIn("range->fill_stall_exhausted = true", restart)
-        self.assertIn("stalled_reconnect_exhaustions++", restart)
+            http.index("static bool range_restart_stalled_fill("):
+            http.index("static void range_watch_window_liveness(")]
+        self.assertIn("range_window_fail(range, reason)", restart)
+        terminal = http[
+            http.index("static void range_window_fail("):
+            http.index("static size_t range_fill_progress(")]
+        self.assertIn("range->window_state = RANGE_WINDOW_FAILED", terminal)
+        self.assertIn("range->fill_stall_exhausted = true", terminal)
+        self.assertIn("stalled_reconnect_exhaustions++", terminal)
         session = without_comments(psp_media_session_sources())
         first_frame = session[
             session.index("PspMediaFirstFrameVerdict verdict"):

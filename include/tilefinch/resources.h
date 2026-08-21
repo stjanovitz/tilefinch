@@ -11,6 +11,7 @@
 #include "tilefinch/style.h"
 
 typedef struct FetchScheduler FetchScheduler;
+typedef struct ImagePriorityLoadJob ImagePriorityLoadJob;
 struct LayoutReuseCache;
 
 #define STYLESHEET_DOCUMENT_RESOURCE_LIMIT 32
@@ -166,6 +167,9 @@ typedef struct ImageResource {
        the retained resource fixed-size. */
     uint64_t source_hash;
     unsigned char *pixels;
+    /* Non-NULL when pixels are an immutable session-cache lease. The one
+       resource with owns_pixels releases this body; aliases merely borrow. */
+    BrowserSharedBody *pixel_body;
     unsigned char *encoded;
     BrowserSharedBody *encoded_body;
     size_t encoded_length;
@@ -196,6 +200,7 @@ typedef struct {
     size_t priority_retained_on_failure;
     size_t duplicate;
     size_t cache_hits;
+    size_t decoded_cache_hits;
     size_t encoded_bytes;
     size_t decoded_bytes;
     size_t downsampled;
@@ -268,6 +273,12 @@ typedef struct {
     uint8_t kind;
     uint8_t pseudo;
 } ImagePriorityTarget;
+
+typedef enum {
+    IMAGE_PRIORITY_LOAD_PENDING = 0,
+    IMAGE_PRIORITY_LOAD_COMPLETE,
+    IMAGE_PRIORITY_LOAD_FAILED
+} ImagePriorityLoadStatus;
 
 static inline int image_resource_intrinsic_width(const ImageResource *image)
 {
@@ -457,6 +468,21 @@ bool images_load_external_priority_targets(
     size_t maximum_count, size_t maximum_total_encoded_bytes,
     size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session);
+/* One externally pumped document-image load. Admission, transport, and one
+   decode completion are separate bounded calls, so an idle-work owner never
+   waits for the network on the browser thread. The target and all URL/context
+   pointers are borrowed from the page and must outlive the job. */
+ImagePriorityLoadJob *images_priority_load_begin(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, const ImagePriorityTarget *target,
+    Budget *budget, const char *base_url, const char *document_url,
+    const char *referrer_policy, size_t maximum_count,
+    size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session);
+ImagePriorityLoadStatus images_priority_load_pump(
+    ImagePriorityLoadJob *job);
+void images_priority_load_destroy(ImagePriorityLoadJob *job);
 const ImageResource *images_find_node(const ImageResources *images,
                                       const lxb_dom_node_t *node);
 const ImageResource *images_find_mask_node(const ImageResources *images,

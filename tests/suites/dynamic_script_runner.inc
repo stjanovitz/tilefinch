@@ -29,6 +29,8 @@ int main(void)
     if (!test_parser_time_dynamic_insertion(&budget)) failures++;
     if (!test_inert_script_types_do_not_consume_quota(&budget)) failures++;
     if (!test_inline_json_assignments_avoid_compiler(&budget)) failures++;
+    if (!test_inline_data_does_not_displace_logic_quota(&budget)) failures++;
+    if (!test_static_script_cost_admission(&budget)) failures++;
     if (!test_script_realm_quota_caps_and_defaults(&budget)) failures++;
     if (!test_dynamic_byte_reservation_waits_for_actual_length(&budget)) {
         failures++;

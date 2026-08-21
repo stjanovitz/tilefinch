@@ -74,6 +74,11 @@ typedef struct {
     bool discover_font_faces;
 } StyleCssParseContext;
 
+/* Defined by queries_selectors.inc. Declaration retention is included first,
+   so keep this local forward declaration beside the include boundary. */
+static void selector_assign_fast_key(StyleRule *rule, const char *text,
+                                     size_t length);
+
 static void style_parsed_ir_builder_disqualify(StyleCssParseContext *context)
 {
     if (context != NULL && context->parsed_ir != NULL) {

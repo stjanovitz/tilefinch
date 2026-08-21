@@ -6,16 +6,265 @@
 #include "media_backend_psp_policy.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_log.h"
+#include "tilefinch/user_agent.h"
 
 #define printf psp_log_printf
 #define KIB 1024u
 #define PSP_MEDIA_CONNECT_TIMEOUT_MS 3000
 #define PSP_MEDIA_REUSED_URL_MINIMUM_LIFETIME_SECONDS 60u
 
+typedef enum {
+    PSP_PAGE_MEDIA_PROBE_PENDING = 0,
+    PSP_PAGE_MEDIA_PROBE_READY,
+    PSP_PAGE_MEDIA_PROBE_FAILED
+} PspPageMediaProbeStatus;
+
+static PspPageMediaProbeStatus psp_media_page_probe_finish(
+    PspMediaSession *media, FetchResult *result,
+    bool fetched, char *error, size_t error_size)
+{
+    if (media == NULL || result == NULL) return PSP_PAGE_MEDIA_PROBE_FAILED;
+    char content_range[128] = {0};
+    uint64_t complete_length = 0;
+    TilefinchRequestContext context = {
+        .target_url = media->source,
+        .initiator_url = media->page_document_url,
+        .top_level_url = media->page_document_url,
+        .method = "GET",
+        .mode = media->page_media_mode,
+        .credentials = media->page_media_credentials,
+        .destination = TILEFINCH_DESTINATION_MEDIA
+    };
+    TilefinchResourceGrant grant;
+    TilefinchResourceDeniedReason denied;
+    bool admitted = fetched && result->status_code == 206
+        && result->length == 1u
+        && fetch_response_header_value(
+               result, "content-range", content_range,
+               sizeof(content_range))
+        && media_http_parse_content_range(
+               content_range, 0, 0, result->length, &complete_length)
+        && fetch_resource_grant_create(
+               result, &context,
+               media->page_media_mode == TILEFINCH_REQUEST_MODE_CORS,
+               true, false, &grant, &denied);
+    if (!admitted) {
+        snprintf(error, error_size,
+                 "page video range probe failed (HTTP %ld): %.150s",
+                 result->status_code,
+                 result->error[0] == '\0'
+                     ? "server did not authorize byte ranges"
+                     : result->error);
+        return PSP_PAGE_MEDIA_PROBE_FAILED;
+    }
+    for (size_t at = 0; at < result->set_cookie_count; at++) {
+        context.target_url = fetch_set_cookie_url(
+            result, at, result->effective_url);
+        (void) browser_session_cookie_set_http_context(
+            media->session, &context, result->set_cookies[at]);
+    }
+    memset(&media->stream, 0, sizeof(media->stream));
+    snprintf(media->stream.title, sizeof(media->stream.title), "%s",
+             "Page video");
+    snprintf(media->stream.media_url, sizeof(media->stream.media_url), "%s",
+             result->effective_url[0] == '\0'
+                 ? media->source : result->effective_url);
+    snprintf(media->stream.mime_type, sizeof(media->stream.mime_type), "%s",
+             "video/mp4");
+    media->stream.content_length = complete_length;
+    media->stream.expires_unix = UINT64_MAX;
+    return PSP_PAGE_MEDIA_PROBE_READY;
+}
+
+static PspPageMediaProbeStatus psp_media_page_probe(
+    PspMediaSession *media, char *error, size_t error_size)
+{
+    if (media == NULL) return PSP_PAGE_MEDIA_PROBE_FAILED;
+    if (media->page_media_probe_request != 0) {
+        FetchBackgroundProgress progress = {0};
+        if (!fetch_background_transport_progress(
+                media->page_media_probe_request, &progress)) {
+            media->page_media_probe_request = 0;
+            snprintf(error, error_size, "%s",
+                     "page video probe disappeared");
+            return PSP_PAGE_MEDIA_PROBE_FAILED;
+        }
+        if (!progress.complete) return PSP_PAGE_MEDIA_PROBE_PENDING;
+        FetchResult *result = fetch_result_create(media->budget);
+        if (result == NULL) {
+            snprintf(error, error_size, "%s", "page video probe budget");
+            return PSP_PAGE_MEDIA_PROBE_FAILED;
+        }
+        uint64_t request = media->page_media_probe_request;
+        media->page_media_probe_request = 0;
+        bool fetched = fetch_background_transport_take_fetch_result(
+            request, media->budget, result);
+        PspPageMediaProbeStatus status = psp_media_page_probe_finish(
+            media, result, fetched, error, error_size);
+        fetch_result_free(result);
+        return status;
+    }
+
+    FetchPreparedPageRequest *prepared = budget_malloc_category(
+        media->budget, BUDGET_CATEGORY_NAVIGATION, sizeof(*prepared));
+    if (prepared == NULL) {
+        snprintf(error, error_size, "%s", "page video request budget");
+        return PSP_PAGE_MEDIA_PROBE_FAILED;
+    }
+    char range_header[64];
+    TilefinchRequestContext context = {
+        .target_url = media->source,
+        .initiator_url = media->page_document_url,
+        .top_level_url = media->page_document_url,
+        .method = "GET",
+        .mode = media->page_media_mode,
+        .credentials = media->page_media_credentials,
+        .destination = TILEFINCH_DESTINATION_MEDIA
+    };
+    FetchRequest transport = {
+        .allow_http_errors = true,
+        .accept = "video/mp4,video/*;q=0.9,*/*;q=0.5",
+        .user_agent = TILEFINCH_BROWSER_USER_AGENT,
+        .connect_timeout_ms = PSP_MEDIA_CONNECT_TIMEOUT_MS,
+        .redirect_same_origin_only = true
+    };
+    FetchRequestValidationError validation_error;
+    bool ready = media_http_build_range_header(
+            0, 0, range_header, sizeof(range_header));
+    transport.extra_headers = range_header;
+    ready = ready && fetch_prepare_page_request_context(
+        &context, media->page_document_url, NULL, media->session, NULL,
+        media->session == NULL ? NULL : media->session->content_blocker,
+        &transport, prepared, &validation_error);
+    const FetchRequest *request = ready
+        ? fetch_prepared_page_request(prepared) : NULL;
+    if (!ready || request == NULL) {
+        budget_free(media->budget, prepared);
+        snprintf(error, error_size, "%s", "page video request refused");
+        return PSP_PAGE_MEDIA_PROBE_FAILED;
+    }
+    if (fetch_background_transport_available()) {
+        FetchBackgroundEnqueueStatus enqueue_status;
+        media->page_media_probe_request =
+            fetch_background_transport_enqueue_media_diagnosed(
+                media->source, request, 1u, 15000, &enqueue_status);
+        budget_free(media->budget, prepared);
+        if (media->page_media_probe_request == 0) {
+            if (enqueue_status == FETCH_BACKGROUND_ENQUEUE_SATURATED
+                || enqueue_status == FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED)
+                return PSP_PAGE_MEDIA_PROBE_PENDING;
+            snprintf(error, error_size, "%s",
+                     "page video transport unavailable");
+            return PSP_PAGE_MEDIA_PROBE_FAILED;
+        }
+        return PSP_PAGE_MEDIA_PROBE_PENDING;
+    }
+    FetchResult *result = fetch_result_create(media->budget);
+    bool fetched = result != NULL && fetch_request_cancelable(
+        media->budget, media->source, request, 1u, 15000,
+        psp_media_cancel_callback, media, result);
+    budget_free(media->budget, prepared);
+    if (result == NULL) {
+        snprintf(error, error_size, "%s", "page video probe budget");
+        return PSP_PAGE_MEDIA_PROBE_FAILED;
+    }
+    PspPageMediaProbeStatus status = psp_media_page_probe_finish(
+        media, result, fetched, error, error_size);
+    fetch_result_free(result);
+    return status;
+}
+
+static void psp_media_page_track_metadata(PspMediaSession *media)
+{
+    if (media == NULL || !media->page_source || media->demux == NULL) return;
+    uint64_t duration_ms = 0;
+    for (size_t at = 0; at < media_mp4_track_count(media->demux); at++) {
+        MediaMp4TrackInfo info;
+        if (!media_mp4_track_info(media->demux, at, &info)
+            || info.timescale == 0) continue;
+        uint64_t track_ms = info.duration <= UINT64_MAX / UINT64_C(1000)
+            ? info.duration * UINT64_C(1000) / info.timescale
+            : info.duration / info.timescale * UINT64_C(1000);
+        if (track_ms > duration_ms) duration_ms = track_ms;
+        if (info.kind == MEDIA_MP4_TRACK_VIDEO) {
+            media->stream.width = info.width;
+            media->stream.height = info.height;
+        }
+    }
+    media->stream.duration_ms = duration_ms;
+}
+
+static void psp_media_apply_decoder_hint(PspMediaSession *media)
+{
+    if (media == NULL) return;
+    media->use_swdec = psp_swdec_component_owns_me(&media->swdec);
+    media->decoder_profile_idc = 0;
+    uint8_t profile = 0;
+    MediaH264DecoderRoute route = media_h264_codec_string_decoder_route(
+        media->stream.mime_type, &profile);
+    if (route == MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION)
+        media->use_swdec = true;
+    if (route != MEDIA_H264_DECODER_ROUTE_UNSUPPORTED)
+        media->decoder_profile_idc = profile;
+}
+
+static bool psp_media_apply_demux_decoder_route(
+    PspMediaSession *media, char *error, size_t error_size)
+{
+    if (media == NULL || media->demux == NULL || media->audio_only)
+        return true;
+    MediaMp4TrackInfo video = {0};
+    bool found = false;
+    for (size_t i = 0; i < media_mp4_track_count(media->demux); i++) {
+        if (media_mp4_track_info(media->demux, i, &video)
+            && video.kind == MEDIA_MP4_TRACK_VIDEO
+            && video.codec == MEDIA_MP4_FOURCC('a','v','c','1')) {
+            found = true;
+            break;
+        }
+    }
+    uint8_t profile = 0;
+    MediaH264DecoderRoute route = found
+        ? media_h264_avcc_decoder_route(
+              video.codec_config, video.codec_config_length, &profile)
+        : MEDIA_H264_DECODER_ROUTE_UNSUPPORTED;
+    if (route == MEDIA_H264_DECODER_ROUTE_UNSUPPORTED) {
+        snprintf(error, error_size, "%s", "unsupported AVC profile");
+        return false;
+    }
+    media->decoder_profile_idc = profile;
+    bool swdec_required = route == MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION
+        || psp_swdec_component_owns_me(&media->swdec);
+    if (swdec_required) {
+        uint16_t width = 0, height = 0;
+        uint8_t nal_length = 0;
+        if (!media_h264_avcc_dimensions(
+                video.codec_config, video.codec_config_length,
+                &width, &height, &nal_length)
+            || width == 0 || height == 0 || width > 432u || height > 240u) {
+            snprintf(error, error_size,
+                     "software H.264 is limited to 432x240");
+            return false;
+        }
+        (void) nal_length;
+        media->use_swdec = true;
+    } else {
+        media->use_swdec = false;
+    }
+    if (media->use_swdec
+        && !psp_swdec_component_prepare(
+            &media->swdec, error, error_size)) return false;
+    return true;
+}
+
 bool psp_media_resolved_stream_reusable(const PspMediaSession *media)
 {
-    if (media == NULL || media->stream.content_length == 0
-        || media->stream.media_url[0] == '\0') return false;
+    if (media == NULL) return false;
+    if (media->audio_only) {
+        if (media->stream.audio_content_length == 0
+            || media->stream.audio_url[0] == '\0') return false;
+    } else if (media->stream.content_length == 0
+               || media->stream.media_url[0] == '\0') return false;
     if (media->offline_source) {
         return media->offline_video_path[0] != '\0'
             && (!media->stream.split_streams
@@ -37,9 +286,29 @@ static bool psp_media_create_playback(PspMediaSession *media,
                                       char *error, size_t error_size)
 {
     MediaBackend backend = {0};
-    if (!media_psp_backend_create_split(
+    bool backend_ready = media->hls != NULL
+        ? media_psp_swdec_backend_create_sources(
+            media->budget, &media->hls_source, NULL,
+            psp_swdec_component_api(&media->swdec),
+            &backend, error, error_size)
+        : media->use_swdec && !media->audio_only
+        ? media_psp_swdec_backend_create_split(
             media->budget, media->demux, media->audio_demux,
-            &backend, error, error_size)) {
+            psp_swdec_component_api(&media->swdec),
+            &backend, error, error_size)
+        : media->use_swdec && media->audio_only
+        ? media_psp_swdec_backend_create_audio(
+            media->budget, media->audio_demux,
+            psp_swdec_component_api(&media->swdec),
+            &backend, error, error_size)
+        : media->audio_only
+        ? media_psp_backend_create_audio(
+            media->budget, media->audio_demux,
+            &backend, error, error_size)
+        : media_psp_backend_create_split(
+            media->budget, media->demux, media->audio_demux,
+            &backend, error, error_size);
+    if (!backend_ready) {
         return false;
     }
     /*
@@ -49,12 +318,21 @@ static bool psp_media_create_playback(PspMediaSession *media,
      */
     backend.set_playing(backend.opaque, false);
     MediaPlaybackOptions options = {
-        .decode_lead_us = PSP_MEDIA_DECODE_LEAD_US,
+        .decode_lead_us = backend.preferred_decode_lead_us != 0
+            ? backend.preferred_decode_lead_us : PSP_MEDIA_DECODE_LEAD_US,
         .audio_start_us = audio_start_us,
         .maximum_packet_bytes = PSP_MEDIA_MAXIMUM_PACKET_BYTES,
         .preallocate_maximum_packet_bytes = true
     };
-    media->playback = media->audio_demux == NULL
+    media->playback = media->hls != NULL
+        ? media_playback_create_sources(
+            media->budget, &media->hls_source, NULL,
+            &backend, &options, error, error_size)
+        : media->audio_only
+        ? media_playback_create(
+            media->budget, media->audio_demux, &backend, &options,
+            error, error_size)
+        : media->audio_demux == NULL
         ? media_playback_create(
             media->budget, media->demux, &backend, &options,
             error, error_size)
@@ -73,6 +351,7 @@ uint64_t psp_media_recovery_position_us(
 {
     if (media == NULL) return 0;
     if (media->job_phase == PSP_MEDIA_JOB_SEEK_PREPARE
+        || media->job_phase == PSP_MEDIA_JOB_SEEK_PRIME
         || media->job_phase == PSP_MEDIA_JOB_SEEK_DECODE) {
         /* Preview movement is tentative until the user confirms it. A retry,
            suspend, or close during its decode must restore the position from
@@ -102,6 +381,7 @@ static bool psp_media_job_moved_the_source(const PspMediaSession *media)
 {
     return media != NULL
         && (media->job_phase == PSP_MEDIA_JOB_SEEK_PREPARE
+            || media->job_phase == PSP_MEDIA_JOB_SEEK_PRIME
             || media->job_phase == PSP_MEDIA_JOB_SEEK_DECODE
             || media->job_phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE
             || media->job_phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE);
@@ -363,7 +643,8 @@ bool psp_media_retry_transport(
     psp_media_session_dispatch_event(media, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_OPEN,
         .autoplay = resume_playing,
-        .has_separate_audio = false
+        .has_separate_audio = false,
+        .audio_only = media->audio_only
     }, "transport-refresh-open");
     psp_ui_media_set_resolving(&media->ui, "Refreshing video link");
     if (preview_pending || commit_pending) {
@@ -425,7 +706,7 @@ bool psp_media_retry_240p(
              == MEDIA_BACKEND_RAW_NAL_BRIDGE_UNAVAILABLE) {
         return false;
     }
-    if (media->offline_source
+    if (media->audio_only || media->offline_source || media->page_source
         || media->requested_quality != BROWSER_YOUTUBE_QUALITY_360P
         || media->stream.height <= 240
         || media->quality_fallback_attempted
@@ -486,7 +767,8 @@ bool psp_media_retry_240p(
     psp_media_session_dispatch_event(media, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_OPEN,
         .autoplay = resume_playing,
-        .has_separate_audio = false
+        .has_separate_audio = false,
+        .audio_only = media->audio_only
     }, "quality-fallback-open");
     psp_ui_media_set_resolving(
         &media->ui,
@@ -556,7 +838,8 @@ bool psp_media_open_pump(
             psp_media_session_dispatch_event(media, (PspMediaEvent) {
                 .type = PSP_MEDIA_EVENT_OPEN,
                 .autoplay = media->reopen_resume_playing,
-                .has_separate_audio = false
+                .has_separate_audio = false,
+                .audio_only = media->audio_only
             }, "open-begin");
         }
         /* open_pump_step installs OPEN_RESOLVE and may also complete it in
@@ -578,6 +861,7 @@ bool psp_media_open_pump(
             PspMediaEvent completed = psp_media_service_completion(
                 media, PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE);
             completed.has_separate_audio = media->stream.split_streams;
+            completed.audio_only = media->audio_only;
             psp_media_session_dispatch_event(media, completed, "open-phase");
             if (phase_before == PSP_MEDIA_JOB_OPEN_PLAYBACK
                 && psp_media_seek_phase(media->job_phase)) {
@@ -596,6 +880,11 @@ bool psp_media_open_pump(
                     psp_media_session_dispatch_event(media, (PspMediaEvent) {
                         .type = PSP_MEDIA_EVENT_PAUSE_AFTER_FRAME
                     }, "open-first-frame-boundary");
+                    if (media->audio_only)
+                        psp_media_session_dispatch_event(
+                            media, (PspMediaEvent) {
+                                .type = PSP_MEDIA_EVENT_FRAME_DISPLAYED
+                            }, "open-audio-boundary");
                 }
                 media_playback_set_playing(media->playback, wants_playing);
             }
@@ -746,6 +1035,10 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
     if (media == NULL) return false;
     if (media->open_service_pending) {
         media->open_service_pending = false;
+        psp_media_set_transport_priority(
+            media, media->page_source
+                || (youtube_watch_url_supported(media->source)
+                    && !psp_media_offline_route(media, media->source)));
         /* A quarantined firmware worker or audio channel still owns the
            intentionally leaked backend. Retrying network and MP4 preparation
            cannot repair that process-wide ownership boundary, so fail before
@@ -824,6 +1117,58 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                 (unsigned long long) (media->offline_source
                     || media->stream.expires_unix <= now
                         ? 0 : media->stream.expires_unix - now));
+        } else if (media->page_hls) {
+            if (media->hls == NULL) {
+                media->hls = psp_media_hls_create(
+                    media->budget, media->session,
+                    media->source, media->page_document_url,
+                    media->page_media_mode, media->page_media_credentials,
+                    error, sizeof(error));
+            }
+            if (media->hls == NULL) {
+                ok = false;
+            } else {
+                PspMediaHlsOpenStatus status = psp_media_hls_pump(
+                    media->hls, error, sizeof(error));
+                if (status == PSP_MEDIA_HLS_OPEN_PENDING) {
+                    ok = true;
+                    break;
+                }
+                ok = status == PSP_MEDIA_HLS_OPEN_READY
+                    && psp_media_hls_sample_source(
+                        media->hls, &media->hls_source);
+                if (ok) {
+                    MediaMp4TrackInfo video = {0}, audio = {0};
+                    ok = psp_media_hls_stream_info(
+                        media->hls, &video, &audio);
+                    if (ok) {
+                        memset(&media->stream, 0, sizeof(media->stream));
+                        snprintf(media->stream.title,
+                                 sizeof(media->stream.title), "%s",
+                                 "Page video");
+                        snprintf(media->stream.mime_type,
+                                 sizeof(media->stream.mime_type), "%s",
+                                 "video/mp2t; codecs=avc1.64001e,mp4a.40.2");
+                        media->stream.width = video.width;
+                        media->stream.height = video.height;
+                        media->stream.duration_ms =
+                            video.timescale == 0 ? 0
+                            : video.duration * UINT64_C(1000)
+                                / video.timescale;
+                        media->stream.expires_unix = UINT64_MAX;
+                        media->use_swdec = true;
+                        media->decoder_profile_idc = 100u;
+                    }
+                }
+            }
+        } else if (media->page_source) {
+            PspPageMediaProbeStatus status = psp_media_page_probe(
+                media, error, sizeof(error));
+            if (status == PSP_PAGE_MEDIA_PROBE_PENDING) {
+                ok = true;
+                break;
+            }
+            ok = status == PSP_PAGE_MEDIA_PROBE_READY;
         } else if (offline_route) {
             memset(&media->stream, 0, sizeof(media->stream));
             PspMediaOfflineSource source = {0};
@@ -882,7 +1227,16 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                 psp_media_cancel_callback, media,
                 &media->stream, error, sizeof(error));
         }
+        if (ok && media->audio_only
+            && (!media->stream.split_streams
+                || media->stream.audio_url[0] == '\0'
+                || media->stream.audio_content_length == 0)) {
+            ok = false;
+            snprintf(error, sizeof(error), "%s",
+                     "format: adaptive AAC unavailable for audio-only");
+        }
         if (ok) {
+            psp_media_apply_decoder_hint(media);
             uint64_t now = tilefinch_platform_wall_time_ns()
                          / UINT64_C(1000000000);
             uint64_t expiry_remaining =
@@ -917,7 +1271,16 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                the old post-demux checkpoint made otherwise valid playback
                depend on allocation order and defeated the lower-memory 240p
                retry. */
-            media->job_phase = PSP_MEDIA_JOB_OPEN_DECODER_PREPARE;
+            /* Provider metadata names its codec before any range allocation,
+               so it can preserve the early low-memory module admission.
+               Generic page media says only video/mp4 until avcC is parsed;
+               defer its decoder choice until VIDEO_DEMUX rather than loading
+               firmware first and the larger software component afterward. */
+            media->job_phase = media->page_hls
+                ? PSP_MEDIA_JOB_OPEN_DECODER_PREPARE
+                : media->page_source
+                ? PSP_MEDIA_JOB_OPEN_VIDEO_RANGE
+                : PSP_MEDIA_JOB_OPEN_DECODER_PREPARE;
         } else {
             const char *stage = "format";
             if (strncmp(error, "watch:", 6) == 0) stage = "watch";
@@ -952,7 +1315,12 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                The extra 256 KiB is bounded and the allocation still degrades
                safely to active+in-flight if pressure refuses the successor. */
             .cache_bytes = 256u * KIB,
-            .lookahead_windows = 1,
+            /* Active + one successor is the guaranteed 512 KiB path. A
+               second successor is attempted through the same Budget and is
+               optional; request admission remains at one until audio has its
+               three-second reserve. */
+            .lookahead_windows = 2,
+            .initial_lookahead_windows = 1,
             /* Deterministic 48 KiB publication replay tripled the longest
                captured-CDN hold (0.56 -> 1.62 s). A media-only 16 KiB quantum
                preserves navigation's coarser worker throughput policy. */
@@ -963,8 +1331,21 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                     media->stream.duration_ms),
             .timeout_ms = 15000,
             .connect_timeout_ms = PSP_MEDIA_CONNECT_TIMEOUT_MS,
-            .referer = media->source,
-            .url_validator = youtube_media_url_supported,
+            .referer = media->page_source
+                ? media->page_document_url : media->source,
+            .standard_range_header = media->page_source,
+            .page_request_context = media->page_source
+                ? &(TilefinchRequestContext) {
+                    .target_url = media->stream.media_url,
+                    .initiator_url = media->page_document_url,
+                    .top_level_url = media->page_document_url,
+                    .method = "GET",
+                    .mode = media->page_media_mode,
+                    .credentials = media->page_media_credentials,
+                    .destination = TILEFINCH_DESTINATION_MEDIA
+                  } : NULL,
+            .url_validator = media->page_source
+                ? NULL : youtube_media_url_supported,
             .cancel = psp_media_cancel_callback,
             .cancel_opaque = media
         };
@@ -974,9 +1355,11 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             error, sizeof(error));
         ok = media->range != NULL;
         if (ok) {
+            media->video_lookahead_limit = 1u;
+            media->video_lookahead_next_sample_us = 0;
             /* Buffered startup is useful only if it overlaps work before the
-               play press. Arm the existing bounded successor window now;
-               allocation and transport limits are unchanged. */
+               play press. Arm the first bounded successor now; the optional
+               second remains gated by audio reserve. */
             if (browser_profile_video_startup_buffering(media->profile))
                 media_http_range_set_aggressive_readahead(
                     media->range, true);
@@ -992,11 +1375,18 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             media->budget, &reader, NULL, error, sizeof(error));
         ok = media->demux != NULL;
         if (ok) {
+            psp_media_page_track_metadata(media);
+            ok = psp_media_apply_demux_decoder_route(
+                media, error, sizeof(error));
+        }
+        if (ok) {
             /* Give the small audio metadata reads first access to the link.
                A full video successor is useful read-ahead, but issuing it
                before audio open can monopolize a slow PSP connection and
                merely move the visible startup stall to the next phase. */
-            media->job_phase = media->stream.split_streams
+            media->job_phase = media->page_source
+                ? PSP_MEDIA_JOB_OPEN_DECODER_PREPARE
+                : media->stream.split_streams
                 ? PSP_MEDIA_JOB_OPEN_AUDIO_RANGE
                 : PSP_MEDIA_JOB_OPEN_VIDEO_PRIME;
         }
@@ -1069,7 +1459,9 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         media->audio_demux = media_mp4_open(
             media->budget, &reader, NULL, error, sizeof(error));
         ok = media->audio_demux != NULL;
-        if (ok) media->job_phase = PSP_MEDIA_JOB_OPEN_VIDEO_PRIME;
+        if (ok) media->job_phase = media->audio_only
+            ? PSP_MEDIA_JOB_OPEN_PLAYBACK
+            : PSP_MEDIA_JOB_OPEN_VIDEO_PRIME;
         break;
     }
     case PSP_MEDIA_JOB_OPEN_DECODER_PREPARE: {
@@ -1083,11 +1475,24 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             ok = false;
             break;
         }
-        MediaPspPrepareResult prepared =
-            media_psp_backend_prepare_pump(error, sizeof(error));
-        if (prepared == MEDIA_PSP_PREPARE_PENDING) break;
-        ok = prepared == MEDIA_PSP_PREPARE_READY;
-        if (ok) media->job_phase = PSP_MEDIA_JOB_OPEN_VIDEO_RANGE;
+        if (media->use_swdec) {
+            ok = psp_swdec_component_prepare(
+                &media->swdec, error, sizeof(error));
+        } else {
+            MediaPspPrepareResult prepared =
+                media_psp_backend_prepare_pump(error, sizeof(error));
+            if (prepared == MEDIA_PSP_PREPARE_PENDING) break;
+            ok = prepared == MEDIA_PSP_PREPARE_READY;
+        }
+        if (ok) media->job_phase = media->hls != NULL
+            ? PSP_MEDIA_JOB_OPEN_PLAYBACK
+            : media->demux != NULL
+            ? media->stream.split_streams
+                ? PSP_MEDIA_JOB_OPEN_AUDIO_RANGE
+                : PSP_MEDIA_JOB_OPEN_VIDEO_PRIME
+            : media->audio_only
+            ? PSP_MEDIA_JOB_OPEN_AUDIO_RANGE
+            : PSP_MEDIA_JOB_OPEN_VIDEO_RANGE;
         break;
     }
     case PSP_MEDIA_JOB_OPEN_PLAYBACK: {
@@ -1289,6 +1694,7 @@ bool psp_media_decode_work_pending(const PspMediaSession *media)
     if (media == NULL || !media->ui.visible
         || psp_media_open_work_pending(media)) return false;
     if (media->job_phase == PSP_MEDIA_JOB_SEEK_PREPARE
+        || media->job_phase == PSP_MEDIA_JOB_SEEK_PRIME
         || media->job_phase == PSP_MEDIA_JOB_SEEK_DECODE
         || media->job_phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE
         || media->job_phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE) {

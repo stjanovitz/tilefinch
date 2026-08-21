@@ -12,7 +12,7 @@
 static const char *const csp_directive_names[TILEFINCH_CSP_DIRECTIVE_COUNT] = {
     "default-src", "script-src", "style-src", "img-src", "font-src",
     "connect-src", "frame-src", "object-src", "base-uri", "form-action",
-    "frame-ancestors", "worker-src"
+    "frame-ancestors", "worker-src", "media-src"
 };
 
 void tilefinch_csp_init(TilefinchContentSecurityPolicy *policy)
@@ -348,6 +348,8 @@ bool tilefinch_csp_allows_request(
             directive = TILEFINCH_CSP_CONNECT_SRC; break;
         case TILEFINCH_DESTINATION_FRAME:
             directive = TILEFINCH_CSP_FRAME_SRC; break;
+        case TILEFINCH_DESTINATION_MEDIA:
+            directive = TILEFINCH_CSP_MEDIA_SRC; break;
         case TILEFINCH_DESTINATION_OTHER:
             directive = TILEFINCH_CSP_OBJECT_SRC; break;
         case TILEFINCH_DESTINATION_DOCUMENT:

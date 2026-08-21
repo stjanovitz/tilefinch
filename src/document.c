@@ -13,6 +13,7 @@
 #include <lexbor/ns/const.h>
 
 #include "tilefinch/platform.h"
+#include "tilefinch/font.h"
 #include "tilefinch/url.h"
 
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_DOM, (s))
@@ -222,7 +223,82 @@ typedef struct {
     size_t attribute_value_bytes;
     size_t body_bytes;
     size_t body_text_nodes;
+    uint8_t glyph_script_mask;
+    bool pointer_event_attributes_present;
 } DocumentStats;
+
+static uint8_t document_codepoint_glyph_script(unsigned codepoint)
+{
+    if ((codepoint >= 0x3400u && codepoint <= 0x4dbfu)
+        || (codepoint >= 0x4e00u && codepoint <= 0x9fffu)
+        || (codepoint >= 0xf900u && codepoint <= 0xfaffu)
+        || (codepoint >= 0x20000u && codepoint <= 0x323afu)) {
+        return DOCUMENT_GLYPH_SCRIPT_HAN;
+    }
+    if ((codepoint >= 0x3040u && codepoint <= 0x30ffu)
+        || (codepoint >= 0x31f0u && codepoint <= 0x31ffu)
+        || (codepoint >= 0xff66u && codepoint <= 0xff9du)) {
+        return DOCUMENT_GLYPH_SCRIPT_JAPANESE;
+    }
+    if ((codepoint >= 0x1100u && codepoint <= 0x11ffu)
+        || (codepoint >= 0x3130u && codepoint <= 0x318fu)
+        || (codepoint >= 0xa960u && codepoint <= 0xa97fu)
+        || (codepoint >= 0xac00u && codepoint <= 0xd7afu)
+        || (codepoint >= 0xd7b0u && codepoint <= 0xd7ffu)) {
+        return DOCUMENT_GLYPH_SCRIPT_KOREAN;
+    }
+    if ((codepoint >= 0x0400u && codepoint <= 0x052fu)
+        || (codepoint >= 0x1c80u && codepoint <= 0x1c8fu)
+        || (codepoint >= 0x2de0u && codepoint <= 0x2dffu)
+        || (codepoint >= 0xa640u && codepoint <= 0xa69fu)) {
+        return DOCUMENT_GLYPH_SCRIPT_CYRILLIC;
+    }
+    if ((codepoint >= 0x0100u && codepoint <= 0x024fu)
+        || (codepoint >= 0x0300u && codepoint <= 0x036fu)
+        || (codepoint >= 0x1e00u && codepoint <= 0x1effu)
+        || (codepoint >= 0x2c60u && codepoint <= 0x2c7fu)
+        || (codepoint >= 0xa720u && codepoint <= 0xa7ffu)
+        || (codepoint >= 0xab30u && codepoint <= 0xab6fu)) {
+        return DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED;
+    }
+    return 0;
+}
+
+static void document_note_glyph_scripts(DocumentStats *stats,
+                                        const char *text, size_t length)
+{
+    if (stats == NULL || text == NULL || length == 0) return;
+    const uint8_t all = DOCUMENT_GLYPH_SCRIPT_HAN
+        | DOCUMENT_GLYPH_SCRIPT_JAPANESE | DOCUMENT_GLYPH_SCRIPT_KOREAN
+        | DOCUMENT_GLYPH_SCRIPT_CYRILLIC
+        | DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED;
+    size_t at = 0;
+    while (at < length && stats->glyph_script_mask != all) {
+        /* Most top-site text is ASCII. Skip it without calling the UTF-8
+           decoder; this pass runs only once in the parser's existing visible
+           text/statistics walk. */
+        while (at < length && (unsigned char) text[at] < 0x80u) at++;
+        if (at >= length) break;
+        unsigned codepoint = 0;
+        size_t used = font_utf8_next(text + at, length - at, &codepoint);
+        if (used == 0) {
+            at++;
+            continue;
+        }
+        stats->glyph_script_mask |=
+            document_codepoint_glyph_script(codepoint);
+        at += used;
+    }
+}
+
+static bool pointer_event_attribute_name(
+    const lxb_char_t *name, size_t length)
+{
+    return name != NULL
+        && ((length >= 7u && memcmp(name, "onmouse", 7u) == 0)
+            || (length >= 9u
+                && memcmp(name, "onpointer", 9u) == 0));
+}
 
 static bool name_is(lxb_dom_node_t *node, const char *wanted)
 {
@@ -259,6 +335,13 @@ static bool gather_stats(lxb_dom_node_t *node, bool in_body, bool hidden,
             lxb_dom_element_t *element = lxb_dom_interface_element(node);
             for (lxb_dom_attr_t *attr = element->first_attr;
                  attr != NULL; attr = attr->next) {
+                size_t name_length = 0;
+                const lxb_char_t *attribute_name =
+                    lxb_dom_attr_qualified_name(attr, &name_length);
+                if (pointer_event_attribute_name(
+                        attribute_name, name_length)) {
+                    stats->pointer_event_attributes_present = true;
+                }
                 if (!document_stats_add(&stats->attributes, 1)
                     || (attr->value != NULL
                         && !document_stats_add(
@@ -274,7 +357,8 @@ static bool gather_stats(lxb_dom_node_t *node, bool in_body, bool hidden,
         if (node->type == LXB_DOM_NODE_TYPE_TEXT
             && body_depth != 0 && hidden_depth == 0) {
             size_t length = 0;
-            (void) document_text_data(node, &length);
+            const char *text = document_text_data(node, &length);
+            document_note_glyph_scripts(stats, text, length);
             if (!document_stats_add(&stats->body_bytes, length)
                 || !document_stats_add(&stats->body_text_nodes, 1)) {
                 return false;
@@ -592,6 +676,9 @@ bool document_refresh(PocDocument *document)
     document->text_bytes = stats.body_bytes;
     document->body_text_node_count = stats.body_text_nodes;
     document->body_text_length = 0;
+    document->glyph_script_mask = stats.glyph_script_mask;
+    document->pointer_event_attributes_present =
+        stats.pointer_event_attributes_present;
     document_note_connected_mutation(document);
     document_allocation_owner_leave(document, previous);
     return true;

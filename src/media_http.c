@@ -13,7 +13,7 @@
 #define MEDIA_HTTP_DEFAULT_CACHE_BYTES (64u * 1024u)
 #define MEDIA_HTTP_MINIMUM_CACHE_BYTES (4u * 1024u)
 #define MEDIA_HTTP_MAXIMUM_CACHE_BYTES (256u * 1024u)
-#define MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS 1u
+#define MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS 2u
 #define MEDIA_HTTP_USER_AGENT TILEFINCH_BROWSER_USER_AGENT
 /*
  * Start the next window after one quarter of the current one has been
@@ -36,6 +36,12 @@ typedef enum {
     RANGE_FILL_FAILED
 } RangeFillIssueStatus;
 
+typedef enum {
+    RANGE_WINDOW_IDLE = 0,
+    RANGE_WINDOW_PENDING,
+    RANGE_WINDOW_FAILED
+} RangeWindowState;
+
 struct MediaHttpRange {
     Budget *budget;
     BrowserSession *session;
@@ -43,6 +49,9 @@ struct MediaHttpRange {
     char *range_url;
     size_t range_url_capacity;
     char *referer;
+    char range_header[64];
+    bool standard_range_header;
+    FetchPreparedPageRequest *prepared_request;
     unsigned char *cache;
     size_t cache_capacity;
     uint64_t cache_offset;
@@ -56,8 +65,10 @@ struct MediaHttpRange {
     unsigned char *lookahead[MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS];
     uint64_t lookahead_offset[MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS];
     size_t lookahead_length[MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS];
+    unsigned lookahead_capacity;
     unsigned lookahead_slots;
     unsigned lookahead_count;
+    unsigned lookahead_fetch_limit;
     size_t stream_publication_bytes;
     uint64_t content_length;
     long timeout_ms;
@@ -90,20 +101,23 @@ struct MediaHttpRange {
        thread alone copies published chunks, so the decoder never aliases the
        transport worker's buffer. */
     bool fill_streaming;
+    unsigned fill_stream_slot;
     bool fill_stream_headers_received;
     bool fill_stream_headers_admitted;
     size_t fill_stream_received_bytes;
     size_t fill_streamed_bytes;
     unsigned fill_attempts;
-    /* The rate watch on the window in flight: when it was last sampled, what
-       it had received then, and how many times this window has already been
-       re-issued onto a new connection. */
-    uint64_t trickle_sample_us;
-    size_t trickle_sample_bytes;
-    uint64_t fill_last_progress_us;
-    size_t fill_last_progress_bytes;
-    unsigned fill_reconnects;
+    /* Byte-progress watch and the number of fresh physical requests already
+       spent on this logical window. */
+    MediaHttpWindowTracker window_tracker;
     bool fill_stall_exhausted;
+    /* One logical demanded window, distinct from the physical request which
+       may be replaced onto a fresh connection. A terminal window is never
+       also pending; selecting another offset receives a fresh bounded retry
+       scope. */
+    RangeWindowState window_state;
+    uint64_t window_offset;
+    size_t window_length;
     size_t minimum_sustained_bytes_per_second;
     /* When this window was issued, and when a read first had to answer
        would-block against it. Zero for "not armed"; the second is re-armed
@@ -138,9 +152,10 @@ static void media_http_error(char *error, size_t error_size,
     va_end(arguments);
 }
 
-static bool parse_content_range(const char *value, uint64_t expected_first,
-                                uint64_t expected_last, size_t body_length,
-                                uint64_t *complete_length)
+bool media_http_parse_content_range(
+    const char *value, uint64_t expected_first,
+    uint64_t expected_last, size_t body_length,
+    uint64_t *complete_length)
 {
     if (value == NULL || strncmp(value, "bytes ", 6) != 0) return false;
     unsigned long long first = 0, last = 0, complete = 0;
@@ -228,19 +243,50 @@ bool media_http_build_range_url(
     return true;
 }
 
+bool media_http_build_range_header(
+    uint64_t first_byte, uint64_t last_byte,
+    char *output, size_t output_size)
+{
+    if (output == NULL || output_size == 0 || last_byte < first_byte)
+        return false;
+    int written = snprintf(
+        output, output_size, "Range: bytes=%llu-%llu",
+        (unsigned long long) first_byte,
+        (unsigned long long) last_byte);
+    return written >= 0 && (size_t) written < output_size;
+}
+
 /* One request shape for both the blocking and the issue/poll paths, so a
    header, a timeout or the redirect validator can only be set in one place. */
 static bool range_prepare_request(
     MediaHttpRange *range, uint64_t first_byte, uint64_t last_byte,
     FetchRequest *request, char *error, size_t error_size)
 {
-    if (!media_http_build_range_url(
+    bool url_ready = false;
+    if (range->standard_range_header) {
+        int written = snprintf(
+            range->range_url, range->range_url_capacity, "%s", range->url);
+        url_ready = written >= 0
+            && (size_t) written < range->range_url_capacity;
+    } else {
+        url_ready = media_http_build_range_url(
             range->url, first_byte, last_byte,
-            range->range_url, range->range_url_capacity)) {
+            range->range_url, range->range_url_capacity);
+    }
+    if (!url_ready) {
         media_http_error(error, error_size, "media range URL full");
         return false;
     }
-    *request = (FetchRequest) {
+    if (range->standard_range_header
+        && !media_http_build_range_header(
+               first_byte, last_byte, range->range_header,
+               sizeof(range->range_header))) {
+        media_http_error(error, error_size, "media Range header full");
+        return false;
+    }
+    const FetchRequest *authorized = range->prepared_request == NULL
+        ? NULL : fetch_prepared_page_request(range->prepared_request);
+    *request = authorized == NULL ? (FetchRequest) {
         .method = "GET",
         .allow_http_errors = true,
         .referer = range->referer[0] == '\0' ? NULL : range->referer,
@@ -256,7 +302,7 @@ static bool range_prepare_request(
         /* A trickle reconnect must not multiplex back onto the HTTP/2
            connection whose measured rate caused the reconnect. Device
            evidence showed cancellation alone retained that connection. */
-        .force_fresh_connection = range->fill_reconnects != 0u,
+        .force_fresh_connection = range->window_tracker.reconnects != 0u,
         .redirect_url_validator = range->url_validator,
         /* The native streaming worker can follow redirects only when their
            origin remains fixed; the final media-host validator still checks
@@ -265,7 +311,14 @@ static bool range_prepare_request(
            explicit also lets host replay enforce the native admission
            contract instead of accepting a stream the PSP will refuse. */
         .redirect_same_origin_only = true
-    };
+    } : *authorized;
+    request->extra_headers = range->standard_range_header
+        ? range->range_header : request->extra_headers;
+    request->connect_timeout_ms = range->connect_timeout_ms;
+    request->force_fresh_connection =
+        range->window_tracker.reconnects != 0u;
+    request->redirect_url_validator = range->url_validator;
+    request->redirect_same_origin_only = true;
     return true;
 }
 
@@ -285,12 +338,13 @@ static bool range_admit_values(
     range->stats.last_first_byte = first_byte;
     range->stats.last_last_byte = last_byte;
     size_t expected_length = (size_t) (last_byte - first_byte + 1u);
-    bool exact_query_body = fetched && status_code == 200
+    bool exact_query_body = !range->standard_range_header
+        && fetched && status_code == 200
         && body_length == expected_length;
     bool valid_partial = fetched && status_code == 206
         && body_length == expected_length && content_range != NULL
         && content_range[0] != '\0'
-        && parse_content_range(
+        && media_http_parse_content_range(
                content_range, first_byte, last_byte, body_length,
                complete_length);
     const char *admitted_url = effective_url == NULL || effective_url[0] == '\0'
@@ -389,15 +443,64 @@ static void range_fill_abandon(MediaHttpRange *range, const char *reason)
     range->fill_length = 0;
     range->fill_admission_deferred = false;
     range->fill_streaming = false;
+    range->fill_stream_slot = 0;
     range->fill_stream_headers_received = false;
     range->fill_stream_headers_admitted = false;
     range->fill_stream_received_bytes = 0;
     range->fill_streamed_bytes = 0;
     range->fill_attempts = 0;
-    range->trickle_sample_us = 0;
-    range->trickle_sample_bytes = 0;
-    range->fill_last_progress_us = 0;
-    range->fill_last_progress_bytes = 0;
+    if (range->window_state == RANGE_WINDOW_PENDING)
+        range->window_state = RANGE_WINDOW_IDLE;
+}
+
+static bool range_window_same(
+    const MediaHttpRange *range, uint64_t offset, size_t length)
+{
+    return range != NULL && range->window_offset == offset
+        && range->window_length == length;
+}
+
+static void range_window_select(
+    MediaHttpRange *range, uint64_t offset, size_t length)
+{
+    if (range == NULL || range_window_same(range, offset, length)) return;
+    if (range->fill_request != 0 || range->fill_admission_deferred)
+        range_fill_abandon(range, "media range window superseded");
+    range->window_offset = offset;
+    range->window_length = length;
+    range->window_state = RANGE_WINDOW_IDLE;
+    media_http_window_tracker_reset(&range->window_tracker);
+    range->fill_attempts = 0;
+    range->fill_stall_exhausted = false;
+    range->fill_starved_us = 0;
+}
+
+static void range_window_mark_demanded(MediaHttpRange *range)
+{
+    if (range == NULL) return;
+    uint64_t now_us = tilefinch_platform_monotonic_time_us();
+    if (range->fill_starved_us == 0) range->fill_starved_us = now_us;
+    media_http_window_tracker_demand(&range->window_tracker, now_us);
+}
+
+static void range_window_fail(MediaHttpRange *range, const char *reason)
+{
+    if (range == NULL || range->window_state == RANGE_WINDOW_FAILED) return;
+    uint64_t offset = range->window_offset;
+    size_t length = range->window_length;
+    range_fill_abandon(range, reason);
+    range->window_state = RANGE_WINDOW_FAILED;
+    range->fill_stall_exhausted = true;
+    if (range->stats.stalled_reconnect_exhaustions != SIZE_MAX)
+        range->stats.stalled_reconnect_exhaustions++;
+    if (range->stats.failures != SIZE_MAX) range->stats.failures++;
+    uint64_t last = length == 0 || length - 1u > UINT64_MAX - offset
+        ? offset : offset + length - 1u;
+    snprintf(range->last_error, sizeof(range->last_error),
+             "range %llu-%llu delivery failed: %s",
+             (unsigned long long) offset,
+             (unsigned long long) last,
+             reason == NULL ? "no progress" : reason);
 }
 
 /* Bytes of the outstanding window the transport has accepted so far. This is
@@ -501,7 +604,8 @@ static bool range_stream_body(
         || length > range->fill_length - range->fill_stream_received_bytes) {
         return false;
     }
-    memcpy(range->lookahead[0] + range->fill_stream_received_bytes,
+    memcpy(range->lookahead[range->fill_stream_slot]
+               + range->fill_stream_received_bytes,
            data, length);
     range->fill_stream_received_bytes += length;
     /* The native worker publishes bounded chunks rather than every curl
@@ -542,7 +646,8 @@ static void range_stream_drain_background(MediaHttpRange *range)
     size_t length = 0;
     (void) fetch_background_transport_take_chunk(
         range->fill_request,
-        range->lookahead[0] + range->fill_streamed_bytes,
+        range->lookahead[range->fill_stream_slot]
+            + range->fill_streamed_bytes,
         available, &length);
     range->fill_streamed_bytes += length;
 }
@@ -591,9 +696,52 @@ static bool range_has_immediate_predecessor(const MediaHttpRange *range)
     return false;
 }
 
+static int range_lookahead_at_offset(
+    const MediaHttpRange *range, uint64_t offset)
+{
+    if (range == NULL) return -1;
+    for (unsigned at = 0; at < range->lookahead_count; at++) {
+        if (range->lookahead_length[at] != 0
+            && range->lookahead_offset[at] == offset) return (int) at;
+    }
+    return -1;
+}
+
+/* Slot allocations exchange roles with the active cache on promotion, so
+   array order is not media order. Follow the bounded offset chain instead. */
+static uint64_t range_contiguous_lookahead_tail(
+    const MediaHttpRange *range, unsigned *windows,
+    bool members[MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS])
+{
+    if (windows != NULL) *windows = 0;
+    if (members != NULL) {
+        for (unsigned at = 0; at < MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS; at++)
+            members[at] = false;
+    }
+    if (range == NULL || range->cache_length == 0
+        || range->cache_length > UINT64_MAX - range->cache_offset) return 0;
+    uint64_t cursor = range->cache_offset + range->cache_length;
+    unsigned count = 0;
+    while (count < range->lookahead_count) {
+        int slot = range_lookahead_at_offset(range, cursor);
+        if (slot < 0 || (members != NULL && members[(unsigned) slot])) break;
+        size_t length = range->lookahead_length[(unsigned) slot];
+        if (length > UINT64_MAX - cursor) break;
+        if (members != NULL) members[(unsigned) slot] = true;
+        cursor += length;
+        count++;
+    }
+    if (windows != NULL) *windows = count;
+    return cursor;
+}
+
 static RangeFillIssueStatus range_fill_issue(
     MediaHttpRange *range, uint64_t aligned, size_t wanted)
 {
+    range_window_select(range, aligned, wanted);
+    if (range->window_state == RANGE_WINDOW_FAILED) {
+        return RANGE_FILL_FAILED;
+    }
     if (wanted == 0 || !range_scheduler_ready(range)) {
         snprintf(range->last_error, sizeof(range->last_error),
                  "media range transport unavailable");
@@ -608,29 +756,20 @@ static RangeFillIssueStatus range_fill_issue(
                  "%.200s", error);
         return RANGE_FILL_FAILED;
     }
-    uint64_t cache_end = range->cache_offset + range->cache_length;
+    uint64_t sequential_tail = range_contiguous_lookahead_tail(
+        range, NULL, NULL);
+    /* Streaming is safe because this is an unused admitted slot; retained
+       successors and a lazy-demux predecessor are not overwritten. */
     bool stream = range->lookahead_slots != 0
-        && range->cache_length != 0 && aligned == cache_end
-        && wanted <= range->cache_capacity
-        /* Once a window has been promoted, its allocation is the only
-           bounded look-behind we own. Do not stream the next response over
-           it: lazy MP4 parsing legitimately revisits a moof a few bytes
-           behind an arbitrary cache boundary. The fixed response still runs
-           concurrently in the transport's existing bounded result buffer. */
-        && !range_has_immediate_predecessor(range);
+        && range->lookahead_count < range->lookahead_slots
+        && range->cache_length != 0 && aligned == sequential_tail
+        && wanted <= range->cache_capacity;
     range->fill_streaming = stream;
+    range->fill_stream_slot = stream ? range->lookahead_count : 0u;
     range->fill_stream_headers_received = false;
     range->fill_stream_headers_admitted = false;
     range->fill_stream_received_bytes = 0;
     range->fill_streamed_bytes = 0;
-    if (stream) {
-        /* The auxiliary allocation is the incoming successor now. Retaining
-           the previous active window here would force the new bytes to wait
-           in a second response allocation until EOF -- the freeze this path
-           exists to remove. */
-        range->lookahead_count = 0;
-        range->stats.lookahead_retained_bytes = 0;
-    }
     FetchStreamOptions stream_options = {
         .on_headers = range_stream_headers,
         .on_body = range_stream_body,
@@ -675,6 +814,7 @@ static RangeFillIssueStatus range_fill_issue(
             range->fill_admission_deferred = true;
             range->fill_offset = aligned;
             range->fill_length = wanted;
+            range->window_state = RANGE_WINDOW_PENDING;
             if (range->stats.admission_deferrals != SIZE_MAX)
                 range->stats.admission_deferrals++;
             return RANGE_FILL_DEFERRED;
@@ -693,13 +833,11 @@ static RangeFillIssueStatus range_fill_issue(
     range->fill_request = id;
     range->fill_offset = aligned;
     range->fill_length = wanted;
+    range->window_state = RANGE_WINDOW_PENDING;
     range->fill_issued_us = tilefinch_platform_monotonic_time_us();
     range->fill_starved_us = 0;
-    /* The rate watch belongs to this transfer, not to the last one. */
-    range->trickle_sample_us = 0;
-    range->trickle_sample_bytes = 0;
-    range->fill_last_progress_us = range->fill_issued_us;
-    range->fill_last_progress_bytes = 0;
+    media_http_window_tracker_request_started(
+        &range->window_tracker, range->fill_issued_us);
     range->stats.requests++;
     /* The second attempt at the same window is the retry the synchronous
        transport performed inside one call, counted the same way. */
@@ -838,6 +976,7 @@ static bool range_fill_install_into(
         range->fill_request = 0;
         range->fill_length = 0;
         range->fill_streaming = false;
+        range->fill_stream_slot = 0;
         range->fill_stream_headers_received = false;
         range->fill_stream_headers_admitted = false;
         range->fill_stream_received_bytes = 0;
@@ -853,6 +992,8 @@ static bool range_fill_install_into(
     if (!result_ready) return false;
     range->fill_request = 0;
     range->fill_length = 0;
+    if (range->window_state == RANGE_WINDOW_PENDING)
+        range->window_state = RANGE_WINDOW_IDLE;
     /* A zero-length window would make the last-byte arithmetic below wrap and
        admit a zero-byte body as if it were the whole window. range_fill_issue()
        refuses to ask for one; refuse to install one too, so the wrap cannot be
@@ -913,8 +1054,8 @@ static bool range_fill_install_into(
     /* A window that landed clears the reconnect budget: the allowance is per
        window, so a session that trickles once does not spend the rest of its
        transfers unable to recover. */
-    range->fill_reconnects = 0;
     range->fill_stall_exhausted = false;
+    media_http_window_tracker_reset(&range->window_tracker);
     range->stats.bytes_received += taken.received;
     range->stats.window_installs++;
     uint64_t install_us =
@@ -955,15 +1096,16 @@ static bool range_fill_install_lookahead(
         || range->fill_length > range->cache_capacity) return false;
     unsigned slot = range->lookahead_count;
     if (slot >= range->lookahead_slots) {
-        uint64_t cache_end = range->cache_offset + range->cache_length;
+        bool successor[MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS] = {false};
+        (void) range_contiguous_lookahead_tail(
+            range, NULL, successor);
         for (slot = 0; slot < range->lookahead_count; slot++) {
             uint64_t offset = range->lookahead_offset[slot];
             size_t length = range->lookahead_length[slot];
-            bool successor = offset == cache_end;
             bool predecessor = preserve_predecessor
                 && length <= UINT64_MAX - offset
                 && offset + length == range->cache_offset;
-            if (!successor && !predecessor) break;
+            if (!successor[slot] && !predecessor) break;
         }
         if (slot >= range->lookahead_count) return false;
     }
@@ -1026,12 +1168,12 @@ static bool range_fill_install_active(
     /* A low-bitrate stream can have current + completed successor while the
        following response is already complete. Advance through that owned
        successor first, so the following response can rotate into its slot. */
-    if (range->fill_offset != cache_end
-        && range->lookahead_count != 0
-        && range->lookahead_offset[0] == cache_end
-        && range->lookahead_length[0] <= UINT64_MAX - cache_end
-        && range->fill_offset
-             == cache_end + range->lookahead_length[0]) {
+    int successor_slot = range_lookahead_at_offset(range, cache_end);
+    if (range->fill_offset != cache_end && successor_slot >= 0
+        && range->lookahead_length[(unsigned) successor_slot]
+               <= UINT64_MAX - cache_end
+        && range->fill_offset == cache_end
+             + range->lookahead_length[(unsigned) successor_slot]) {
         if (!range_promote_lookahead(range, cache_end)) return false;
         cache_end = range->cache_offset + range->cache_length;
     }
@@ -1091,27 +1233,27 @@ static void range_prefetch(MediaHttpRange *range)
 {
     if (!range_uses_async_transport(range) || range->cache_length == 0) return;
     range->stats.readahead_checks++;
-    uint64_t cache_end = range->cache_offset + range->cache_length;
     /* Retire a completed sequential response into the optional owned
        lookahead, then immediately give the worker the following window. */
-    bool have_contiguous_lookahead = range->lookahead_count != 0
-        && range->lookahead_offset[0] == cache_end;
+    unsigned contiguous_windows = 0;
+    uint64_t tail_end = range_contiguous_lookahead_tail(
+        range, &contiguous_windows, NULL);
+    bool have_contiguous_lookahead = contiguous_windows != 0;
     bool have_contiguous_predecessor =
         range_has_immediate_predecessor(range);
-    uint64_t tail_end = have_contiguous_lookahead
-        ? range->lookahead_offset[0] + range->lookahead_length[0]
-        : cache_end;
     if (range->fill_request != 0 && range->fill_offset == tail_end
         && range_fill_complete(range)) {
-        if (!range_fill_install_lookahead(range, true)) return;
-        have_contiguous_lookahead = range->lookahead_count != 0
-            && range->lookahead_offset[0] == cache_end;
-        tail_end = have_contiguous_lookahead
-            ? range->lookahead_offset[0] + range->lookahead_length[0]
-            : cache_end;
+        bool preserve_predecessor = range->lookahead_fetch_limit <= 1u;
+        if (!range_fill_install_lookahead(
+                range, preserve_predecessor)) return;
+        tail_end = range_contiguous_lookahead_tail(
+            range, &contiguous_windows, NULL);
+        have_contiguous_lookahead = contiguous_windows != 0;
     }
     if (range->fill_request != 0) return;
     if (range->cache_consumed > range->cache_length) return;
+    if (range->lookahead_slots != 0
+        && contiguous_windows >= range->lookahead_fetch_limit) return;
     unsigned divisor = range->aggressive_readahead
         ? MEDIA_HTTP_AGGRESSIVE_READAHEAD_CONSUMED_DIVISOR
         : MEDIA_HTTP_READAHEAD_CONSUMED_DIVISOR;
@@ -1158,87 +1300,86 @@ static void range_prefetch(MediaHttpRange *range)
  * The bytes already received are lost -- at these rates that is a few
  * kilobytes against a window that was sixteen seconds away.
  *
- * Only ever on the sustained-floor verdict, and only a bounded number of
- * times per window; a link that is genuinely dead trickles the same way on
- * its replacement and reaches the caller's watchdog on the usual schedule.
+ * Only ever after demanded bytes stop moving, and only a bounded number of
+ * times per logical window. Useful slow bytes are never discarded.
  */
-static bool range_restart_slow_fill(
+static bool range_restart_stalled_fill(
     MediaHttpRange *range, const char *reason, bool starved)
 {
     if (range == NULL || range->fill_request == 0) {
         return false;
     }
-    if (range->fill_reconnects >= MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS) {
-        if (!range->fill_stall_exhausted) {
-            range->fill_stall_exhausted = true;
-            if (range->stats.stalled_reconnect_exhaustions != SIZE_MAX)
-                range->stats.stalled_reconnect_exhaustions++;
-        }
+    if (range->window_tracker.reconnects
+        >= MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS) {
+        range_window_fail(range, reason);
         return false;
     }
     uint64_t offset = range->fill_offset;
     size_t length = range->fill_length;
-    unsigned reconnects = range->fill_reconnects + 1u;
     range_fill_abandon(range, reason);
-    range->fill_reconnects = reconnects;
+    media_http_window_tracker_reconnected(&range->window_tracker);
     range->stats.reconnects++;
     if (starved) range->stats.starved_reconnects++;
     /* Re-issue immediately: the window is still the one the reader needs, and
        waiting adds to a delay that is already the problem. A refused issue
        leaves the fill unstarted and the ordinary paths ask again. */
-    if (length != 0) (void) range_fill_issue(range, offset, length);
+    if (length == 0) {
+        range_window_fail(range, "replacement range was empty");
+        return false;
+    }
+    RangeFillIssueStatus issue = range_fill_issue(range, offset, length);
+    if (issue == RANGE_FILL_FAILED) {
+        char issue_error[192] = {0};
+        snprintf(issue_error, sizeof(issue_error), "%.180s",
+                 range->last_error[0] == '\0'
+                     ? "replacement range was not admitted"
+                     : range->last_error);
+        range_window_fail(range, issue_error);
+        return false;
+    }
     return true;
 }
 
-static void range_watch_fill_rate(MediaHttpRange *range)
+static void range_watch_window_liveness(MediaHttpRange *range)
 {
-    if (range->fill_request == 0
+    if (range == NULL || range->window_state != RANGE_WINDOW_PENDING
         || (!range_uses_background(range) && range->scheduler == NULL)) return;
     uint64_t now_us = tilefinch_platform_monotonic_time_us();
     size_t received = range_fill_progress(range);
-    if (received > range->fill_last_progress_bytes) {
-        range->fill_last_progress_bytes = received;
-        range->fill_last_progress_us = now_us;
+    bool have_request = range->fill_request != 0;
+    MediaHttpWindowLivenessAction action =
+        media_http_window_tracker_observe(
+            &range->window_tracker, now_us, received,
+            have_request && range_fill_complete(range), have_request);
+    if (action == MEDIA_HTTP_WINDOW_FAIL) {
+        uint64_t demanded_us = range->window_tracker.demanded
+            && now_us > range->window_tracker.demanded_started_us
+            ? now_us - range->window_tracker.demanded_started_us : 0;
+        range_window_fail(
+            range, demanded_us >= MEDIA_HTTP_DEMANDED_WINDOW_DEADLINE_US
+                ? "demanded window deadline expired"
+                : "fresh connections made no progress");
+        return;
     }
-    uint64_t no_progress_since_us = range->fill_last_progress_us;
-    if (range->fill_starved_us > no_progress_since_us)
-        no_progress_since_us = range->fill_starved_us;
-    uint64_t no_progress_us = now_us > no_progress_since_us
-        ? now_us - no_progress_since_us : 0;
-    if (media_http_range_should_reconnect_starved(
-            range_fill_complete(range), range->fill_starved_us != 0,
-            no_progress_us)) {
-        (void) range_restart_slow_fill(
+    if (action == MEDIA_HTTP_WINDOW_RECONNECT) {
+        (void) range_restart_stalled_fill(
             range, "starved media range stopped making progress", true);
         return;
     }
-    if (range->trickle_sample_us == 0) {
-        range->trickle_sample_us = now_us;
-        range->trickle_sample_bytes = received;
-        return;
-    }
-    uint64_t elapsed_us = now_us > range->trickle_sample_us
-        ? now_us - range->trickle_sample_us : 0;
-    if (elapsed_us < MEDIA_HTTP_TRICKLE_WINDOW_US) return;
-    size_t gained = received > range->trickle_sample_bytes
-        ? received - range->trickle_sample_bytes : 0;
-    range->trickle_sample_us = now_us;
-    range->trickle_sample_bytes = received;
-    if (!media_http_range_should_reconnect_at_rate(
-            range_fill_complete(range), gained, elapsed_us,
-            range->minimum_sustained_bytes_per_second)) return;
-    (void) range_restart_slow_fill(
-        range, "media range transfer stalled below floor", false);
 }
 
 /* One bounded, non-blocking step of transport progress -- measured, because
    the layer underneath it can block in ways this layer cannot see. */
 static void range_pump(MediaHttpRange *range)
 {
-    if (range->fill_request == 0
+    if (range == NULL
         || (!range_uses_background(range) && range->scheduler == NULL)) return;
+    if (range->fill_request == 0) {
+        range_watch_window_liveness(range);
+        return;
+    }
     range_stream_drain_background(range);
-    range_watch_fill_rate(range);
+    range_watch_window_liveness(range);
     if (range->fill_request == 0) return;
     uint64_t started_us = tilefinch_platform_monotonic_time_us();
     if (!range_uses_background(range))
@@ -1287,6 +1428,9 @@ static MediaRangeReadStatus range_fill_window(
             return MEDIA_RANGE_READ_COMPLETE;
         }
     }
+    range_window_select(range, aligned, wanted);
+    if (range->window_state == RANGE_WINDOW_FAILED)
+        return MEDIA_RANGE_READ_FAILED;
     /* Preserve an auxiliary playback window across an out-of-order metadata
        read. It swaps back into active service when the demux returns. */
     if (!range_uses_async_transport(range)) {
@@ -1382,9 +1526,7 @@ static MediaRangeReadStatus range_fill_window(
             range->stats.would_block_reads++;
             /* The first refusal against this window opens the starved
                interval; later ones are inside it and must not restart it. */
-            if (range->fill_starved_us == 0)
-                range->fill_starved_us =
-                    tilefinch_platform_monotonic_time_us();
+            range_window_mark_demanded(range);
             return MEDIA_RANGE_READ_WOULD_BLOCK;
         }
         if (tilefinch_platform_monotonic_time_us() >= deadline_us) {
@@ -1461,7 +1603,8 @@ static MediaRangeReadStatus range_read_bounded(
             && stream_at <= range->fill_streamed_bytes
             ? range->fill_streamed_bytes - stream_at : 0;
         if (streamed && length <= stream_available) {
-            memcpy(output, range->lookahead[0] + stream_at, length);
+            memcpy(output, range->lookahead[range->fill_stream_slot]
+                       + stream_at, length);
             range->stats.cache_hits++;
             if (range->stats.streaming_partial_reads != SIZE_MAX)
                 range->stats.streaming_partial_reads++;
@@ -1491,7 +1634,9 @@ static MediaRangeReadStatus range_read_bounded(
         if (split_streaming) {
             size_t prefix = available;
             memcpy(output, range->cache + cache_at, prefix);
-            memcpy(output + prefix, range->lookahead[0], length - prefix);
+            memcpy(output + prefix,
+                   range->lookahead[range->fill_stream_slot],
+                   length - prefix);
             range->stats.cache_hits++;
             if (range->stats.streaming_partial_reads != SIZE_MAX)
                 range->stats.streaming_partial_reads++;
@@ -1510,17 +1655,21 @@ static MediaRangeReadStatus range_read_bounded(
            boundary-spanning logical sample before considering the on-wire
            successor. This preserves the poll contract: one call either
            copies the complete sample or no bytes at all. */
+        uint64_t successor_offset = range->cache_offset
+               <= UINT64_MAX - range->cache_length
+            ? range->cache_offset + range->cache_length : 0;
+        int successor_slot = range_lookahead_at_offset(
+            range, successor_offset);
         bool split_lookahead = !may_wait && cached
             && length > available && range->lookahead_count != 0
             && range->cache_offset <= UINT64_MAX - range->cache_length
-            && range->lookahead_offset[0]
-                 == range->cache_offset + range->cache_length
-            && length - available <= range->lookahead_length[0];
+            && successor_slot >= 0
+            && length - available
+                 <= range->lookahead_length[(unsigned) successor_slot];
         if (split_lookahead) {
             size_t prefix = available;
             memcpy(output, range->cache + cache_at, prefix);
-            uint64_t successor = range->lookahead_offset[0];
-            if (!range_promote_lookahead(range, successor)) {
+            if (!range_promote_lookahead(range, successor_offset)) {
                 snprintf(range->last_error, sizeof(range->last_error),
                          "owned sequential window could not be promoted");
                 range->stats.failures++;
@@ -1560,9 +1709,7 @@ static MediaRangeReadStatus range_read_bounded(
             range_pump(range);
             if (!range_fill_complete(range)) {
                 range->stats.would_block_reads++;
-                if (range->fill_starved_us == 0)
-                    range->fill_starved_us =
-                        tilefinch_platform_monotonic_time_us();
+                range_window_mark_demanded(range);
                 return MEDIA_RANGE_READ_WOULD_BLOCK;
             }
             size_t prefix = available;
@@ -1603,8 +1750,7 @@ static MediaRangeReadStatus range_read_bounded(
                     return MEDIA_RANGE_READ_FAILED;
                 }
                 range->stats.would_block_reads++;
-                range->fill_starved_us =
-                    tilefinch_platform_monotonic_time_us();
+                range_window_mark_demanded(range);
                 return MEDIA_RANGE_READ_WOULD_BLOCK;
             }
             size_t suffix = length - prefix;
@@ -1760,6 +1906,35 @@ MediaHttpRange *media_http_range_create(
     memcpy(range->url, url, url_length);
     range->range_url_capacity = range_url_capacity;
     memcpy(range->referer, referer, referer_length);
+    range->standard_range_header = options != NULL
+        && options->standard_range_header;
+    if (options != NULL && options->page_request_context != NULL) {
+        range->prepared_request = budget_malloc_category(
+            budget, BUDGET_CATEGORY_NAVIGATION,
+            sizeof(*range->prepared_request));
+        FetchRequest transport = {
+            .allow_http_errors = true,
+            .accept = "video/mp4,video/*;q=0.9,*/*;q=0.5",
+            .user_agent = MEDIA_HTTP_USER_AGENT,
+            .connect_timeout_ms = range->connect_timeout_ms,
+            .redirect_same_origin_only = true
+        };
+        FetchRequestValidationError request_error;
+        const char *referrer_source = referer[0] == '\0'
+            ? options->page_request_context->initiator_url : referer;
+        if (range->prepared_request == NULL
+            || !fetch_prepare_page_request_context(
+                   options->page_request_context, referrer_source,
+                   options->referrer_policy, session,
+                   options->content_security_policy,
+                   session == NULL ? NULL : session->content_blocker,
+                   &transport, range->prepared_request, &request_error)) {
+            media_http_range_destroy(range);
+            media_http_error(error, error_size,
+                             "media request authority refused");
+            return NULL;
+        }
+    }
     range->session = session;
     range->cache_capacity = cache_bytes;
     range->stream_publication_bytes = options == NULL
@@ -1771,14 +1946,25 @@ MediaHttpRange *media_http_range_create(
         ? 0 : options->lookahead_windows;
     if (lookahead_windows > MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS)
         lookahead_windows = MEDIA_HTTP_MAXIMUM_LOOKAHEAD_WINDOWS;
+    range->lookahead_capacity = lookahead_windows;
+    unsigned initial_lookahead = options == NULL
+        ? 0 : options->initial_lookahead_windows;
+    unsigned initial_allocations = initial_lookahead == 0
+        ? lookahead_windows : initial_lookahead;
+    if (initial_allocations > lookahead_windows)
+        initial_allocations = lookahead_windows;
     /* Optional by design: stop at the first refused buffer and retain the
        functional active+in-flight path with however many were admitted. */
-    for (unsigned at = 0; at < lookahead_windows; at++) {
+    for (unsigned at = 0; at < initial_allocations; at++) {
         range->lookahead[at] = budget_malloc_category(
             budget, BUDGET_CATEGORY_RESOURCE, cache_bytes);
         if (range->lookahead[at] == NULL) break;
         range->lookahead_slots++;
     }
+    range->lookahead_fetch_limit = initial_lookahead == 0
+        ? range->lookahead_slots : initial_lookahead;
+    if (range->lookahead_fetch_limit > range->lookahead_slots)
+        range->lookahead_fetch_limit = range->lookahead_slots;
     range->content_length = content_length;
     range->timeout_ms = options == NULL || options->timeout_ms <= 0
         ? 15000 : options->timeout_ms;
@@ -1804,6 +1990,8 @@ MediaHttpRange *media_http_range_create(
     range->stats.retained_bytes =
         sizeof(*range) + url_length + range_url_capacity
         + referer_length + cache_bytes;
+    if (range->prepared_request != NULL)
+        range->stats.retained_bytes += sizeof(*range->prepared_request);
     range->stats.retained_bytes +=
         (size_t) range->lookahead_slots * cache_bytes;
     return range;
@@ -1852,8 +2040,9 @@ bool media_http_range_resident(const MediaHttpRange *range,
                 ? length : range->cache_length - (size_t) into);
             for (unsigned at = 0; remaining != 0
                  && at < range->lookahead_count; at++) {
-                if (range->lookahead_offset[at] != cursor) break;
-                size_t held = range->lookahead_length[at];
+                int slot = range_lookahead_at_offset(range, cursor);
+                if (slot < 0) break;
+                size_t held = range->lookahead_length[(unsigned) slot];
                 if (remaining <= held) return true;
                 remaining -= held;
                 cursor += held;
@@ -1884,7 +2073,7 @@ bool media_http_range_pump(MediaHttpRange *range)
        working through buffered content is exactly when the refill should run. */
     range_prefetch(range);
     range_pump(range);
-    return range->fill_request != 0 || range->fill_admission_deferred;
+    return range->window_state == RANGE_WINDOW_PENDING;
 }
 
 MediaHttpRangePrimeStatus media_http_range_prime_successor(
@@ -1935,23 +2124,33 @@ MediaHttpRangePrimeStatus media_http_range_prime_successor(
         return MEDIA_HTTP_RANGE_PRIME_PENDING;
     }
     if (range->fill_request == 0) {
-        /* Descriptor pressure and a network-supervisor rejoin are local,
-           transient admission conditions, not evidence that the signed media
-           candidate rejected a later range. Leave the ordinary playback
-           refill/recovery path armed instead of poisoning the candidate. */
-        if (range->fill_attempts >= 2u)
-            return MEDIA_HTTP_RANGE_PRIME_PENDING;
+        /* Two completed but rejected responses prove that this candidate
+           cannot deliver its successor. Admission deferral is different: it
+           increments no attempt count and receives the demanded-window
+           deadline below. */
+        if (range->fill_attempts >= 2u) {
+            range->successor_prime_failed = true;
+            range->stats.failures++;
+            return MEDIA_HTTP_RANGE_PRIME_FAILED;
+        }
         RangeFillIssueStatus issue =
             range_fill_issue(range, successor, wanted);
-        if (issue == RANGE_FILL_DEFERRED)
-            return MEDIA_HTTP_RANGE_PRIME_PENDING;
         if (issue == RANGE_FILL_FAILED) {
             range->successor_prime_failed = true;
             range->stats.failures++;
             return MEDIA_HTTP_RANGE_PRIME_FAILED;
         }
     }
+    /* Unlike speculative read-ahead, startup prime is an explicit dependency
+       of the open transaction. Arm the logical-window deadline even when no
+       descriptor could be admitted, so a saturated/leaked transport cannot
+       leave the player at a permanent loading spinner. */
+    range_window_mark_demanded(range);
     range_pump(range);
+    if (range->window_state == RANGE_WINDOW_FAILED) {
+        range->successor_prime_failed = true;
+        return MEDIA_HTTP_RANGE_PRIME_FAILED;
+    }
     if (!range_fill_complete(range)) return MEDIA_HTTP_RANGE_PRIME_PENDING;
     if (range_fill_install_lookahead(range, true)) {
         range->successor_prime_complete = true;
@@ -1970,6 +2169,29 @@ void media_http_range_set_aggressive_readahead(
     if (range == NULL) return;
     range->aggressive_readahead = enabled;
     if (enabled) range_prefetch(range);
+}
+
+void media_http_range_set_lookahead_limit(
+    MediaHttpRange *range, unsigned windows)
+{
+    if (range == NULL || range->lookahead_capacity == 0) return;
+    if (windows == 0) windows = 1;
+    if (windows > range->lookahead_capacity)
+        windows = range->lookahead_capacity;
+    while (range->lookahead_slots < windows) {
+        unsigned slot = range->lookahead_slots;
+        unsigned char *buffer = budget_malloc_category(
+            range->budget, BUDGET_CATEGORY_RESOURCE,
+            range->cache_capacity);
+        if (buffer == NULL) break;
+        range->lookahead[slot] = buffer;
+        range->lookahead_slots++;
+        range->stats.retained_bytes += range->cache_capacity;
+    }
+    if (windows > range->lookahead_slots) windows = range->lookahead_slots;
+    bool increased = windows > range->lookahead_fetch_limit;
+    range->lookahead_fetch_limit = windows;
+    if (increased) range_prefetch(range);
 }
 
 void media_http_range_set_wait_budget_us(
@@ -1994,17 +2216,20 @@ bool media_http_range_stats(const MediaHttpRange *range,
     if (range == NULL || stats == NULL) return false;
     *stats = range->stats;
     stats->bytes_in_flight = range_fill_progress(range);
-    stats->window_pending = range->fill_request != 0
-        || range->fill_admission_deferred;
+    stats->window_pending =
+        range->window_state == RANGE_WINDOW_PENDING;
     stats->admission_deferred = range->fill_admission_deferred;
     stats->delivery_stalled = range->fill_stall_exhausted;
     stats->cache_offset = range->cache_offset;
     stats->cache_length = range->cache_length;
     stats->cache_consumed = range->cache_consumed;
     stats->lookahead_slots = range->lookahead_slots;
+    stats->lookahead_fetch_limit = range->lookahead_fetch_limit;
     stats->aggressive_readahead = range->aggressive_readahead;
-    stats->fill_offset = range->fill_offset;
-    stats->fill_length = range->fill_length;
+    stats->fill_offset = range->window_state == RANGE_WINDOW_FAILED
+        ? range->window_offset : range->fill_offset;
+    stats->fill_length = range->window_state == RANGE_WINDOW_FAILED
+        ? range->window_length : range->fill_length;
     stats->last_read_offset = range->last_read_offset;
     stats->last_read_length = range->last_read_length;
     return true;
@@ -2025,10 +2250,12 @@ uint64_t media_http_range_buffered_ahead_us(
     if (read_end < range->cache_offset) read_end = range->cache_offset;
     uint64_t unread = read_end < cache_end ? cache_end - read_end : 0;
     for (unsigned at = 0; at < range->lookahead_count; at++) {
-        if (range->lookahead_offset[at] != cache_end
-            || range->lookahead_length[at] > UINT64_MAX - unread) break;
-        unread += range->lookahead_length[at];
-        cache_end += range->lookahead_length[at];
+        int slot = range_lookahead_at_offset(range, cache_end);
+        if (slot < 0) break;
+        size_t held = range->lookahead_length[(unsigned) slot];
+        if (held > UINT64_MAX - unread) break;
+        unread += held;
+        cache_end += held;
     }
     if (range->fill_streaming && range->fill_stream_headers_admitted
         && range->fill_offset == cache_end
@@ -2091,6 +2318,7 @@ void media_http_range_destroy(MediaHttpRange *range)
     budget_free(budget, range->cache);
     for (unsigned at = 0; at < range->lookahead_slots; at++)
         budget_free(budget, range->lookahead[at]);
+    budget_free(budget, range->prepared_request);
     budget_free(budget, range->referer);
     budget_free(budget, range->range_url);
     budget_free(budget, range->url);

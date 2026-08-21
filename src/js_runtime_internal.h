@@ -287,6 +287,8 @@ typedef struct DomBridge {
     char navigation_url[2048];
     bool media_requested;
     ScriptMediaCommand media_command;
+    TilefinchRequestMode media_mode;
+    TilefinchCredentialsMode media_credentials;
     int64_t media_node_handle;
     double media_value;
     char *media_source;
@@ -449,6 +451,10 @@ struct ScriptRuntime {
     JSValue dispatch_input_handle;
     JSValue dispatch_submit_handle;
     JSValue dom_content_loaded_dispatch;
+    /* Captured and removed before author code. Native <video> activation
+       needs the bootstrap's private WeakMap record even when play() was not
+       the entry point. */
+    JSValue media_state_for;
     /* Created lazily as a private callable, never published to page script. */
     JSValue media_update;
     JSValue function_to_string;

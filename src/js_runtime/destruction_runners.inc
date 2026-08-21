@@ -54,6 +54,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         JS_FreeValue(runtime->context, runtime->dispatch_submit_handle);
         JS_FreeValue(
             runtime->context, runtime->dom_content_loaded_dispatch);
+        JS_FreeValue(runtime->context, runtime->media_state_for);
         JS_FreeValue(runtime->context, runtime->media_update);
         JS_FreeValue(runtime->context, runtime->dispatch_input_handle);
         JS_FreeValue(runtime->context,
@@ -67,6 +68,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         runtime->function_to_string = JS_UNDEFINED;
         runtime->dispatch_submit_handle = JS_UNDEFINED;
         runtime->dom_content_loaded_dispatch = JS_UNDEFINED;
+        runtime->media_state_for = JS_UNDEFINED;
         runtime->media_update = JS_UNDEFINED;
         runtime->dispatch_input_handle = JS_UNDEFINED;
         runtime->dispatch_activation_handle = JS_UNDEFINED;

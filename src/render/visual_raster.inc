@@ -219,8 +219,43 @@ static const unsigned char *image_pixels_for_command(
 {
     const void *identity = image_resource_backing_identity(image);
     if (identity == NULL) identity = image;
+    int scaled_width = command->width;
+    int scaled_height = command->height;
     bool wants_scaled = command->image_fit == LAYOUT_IMAGE_FIT_STRETCH
-        && (command->width != image->width || command->height != image->height);
+        && (scaled_width != image->width || scaled_height != image->height);
+    bool direct_scaled_jpeg = false;
+    if (command->image_fit == LAYOUT_IMAGE_FIT_COVER
+        && image->pixels == NULL && image->encoded != NULL
+        && image->encoded_length >= 2u
+        && image->encoded[0] == 0xffu && image->encoded[1] == 0xd8u
+        && image->width > 0 && image->height > 0
+        && command->width > 0 && command->height > 0
+        && (size_t) command->width
+               <= SIZE_MAX / (size_t) image->height
+        && (size_t) command->height
+               <= SIZE_MAX / (size_t) image->width) {
+        size_t width_scale = (size_t) command->width
+                             * (size_t) image->height;
+        size_t height_scale = (size_t) command->height
+                              * (size_t) image->width;
+        if (width_scale >= height_scale) {
+            size_t product = (size_t) image->height
+                             * (size_t) command->width;
+            scaled_width = command->width;
+            scaled_height = (int) (product / (size_t) image->width
+                + (product % (size_t) image->width != 0));
+        } else {
+            size_t product = (size_t) image->width
+                             * (size_t) command->height;
+            scaled_width = (int) (product / (size_t) image->height
+                + (product % (size_t) image->height != 0));
+            scaled_height = command->height;
+        }
+        direct_scaled_jpeg = scaled_width > 0 && scaled_height > 0
+            && scaled_width < image->width
+            && scaled_height < image->height;
+        wants_scaled = direct_scaled_jpeg;
+    }
     bool scaled_failed = false;
     if (wants_scaled) {
         for (size_t i = 0; i < TILEFINCH_IMAGE_CACHE_ENTRIES; i++) {
@@ -228,8 +263,8 @@ static const unsigned char *image_pixels_for_command(
             if (!entry->valid || entry->identity != identity
                 || entry->source_width != image->width
                 || entry->source_height != image->height
-                || entry->width != command->width
-                || entry->height != command->height) continue;
+                || entry->width != scaled_width
+                || entry->height != scaled_height) continue;
             entry->last_used = ++cache->clock;
             if (entry->failed) {
                 scaled_failed = true;
@@ -242,13 +277,49 @@ static const unsigned char *image_pixels_for_command(
         }
     }
 
+    if (direct_scaled_jpeg && !scaled_failed) {
+        ImageResource decode_target = *image;
+        decode_target.width = scaled_width;
+        decode_target.height = scaled_height;
+        unsigned char *pixels = NULL;
+        uint64_t decode_started = render_now_us();
+        ImageDecodeStatus decode_status = image_resource_decode_checked(
+            &decode_target, cache->budget, &pixels);
+        uint64_t decode_elapsed = render_now_us() - decode_started;
+        cache->decoded_image_us += decode_elapsed;
+        if (decode_elapsed > cache->max_decoded_image_us)
+            cache->max_decoded_image_us = decode_elapsed;
+        if (decode_status == IMAGE_DECODE_SUCCEEDED) {
+            ScaledImageCacheEntry *entry = scaled_image_insert(
+                cache, identity, image->width, image->height,
+                scaled_width, scaled_height, pixels, false);
+            if (entry != NULL) {
+                cache->decoded_image_builds++;
+                cache->scaled_image_builds++;
+                *pixel_width = entry->width;
+                *pixel_height = entry->height;
+                return entry->pixels;
+            }
+            *temporary_decoded = pixels;
+            *pixel_width = scaled_width;
+            *pixel_height = scaled_height;
+            return pixels;
+        }
+        cache->decoded_image_failures++;
+        if (decode_status == IMAGE_DECODE_DETERMINISTIC_FAILURE) {
+            (void) scaled_image_insert(
+                cache, identity, image->width, image->height,
+                scaled_width, scaled_height, NULL, true);
+        }
+    }
+
     const unsigned char *source = decoded_image_pixels(
         cache, image, temporary_decoded);
     if (source == NULL) return NULL;
-    if (wants_scaled && !scaled_failed && command->width > 0
-        && command->height > 0) {
-        size_t width = (size_t) command->width;
-        size_t height = (size_t) command->height;
+    if (wants_scaled && !direct_scaled_jpeg && !scaled_failed
+        && command->width > 0 && command->height > 0) {
+        size_t width = (size_t) scaled_width;
+        size_t height = (size_t) scaled_height;
         if (height <= SIZE_MAX / width
             && width * height <= TILEFINCH_SCALED_IMAGE_CACHE_BYTES / 4u) {
             size_t bytes = width * height * 4u;
@@ -256,12 +327,12 @@ static const unsigned char *image_pixels_for_command(
             if (scaled != NULL) {
                 uint64_t scale_started = render_now_us();
                 ScaleStepper source_y = scale_stepper(
-                    0, image->height, command->height);
-                for (int y = 0; y < command->height; y++) {
+                    0, image->height, scaled_height);
+                for (int y = 0; y < scaled_height; y++) {
                     ScaleStepper source_x = scale_stepper(
-                        0, image->width, command->width);
-                    for (int x = 0; x < command->width; x++) {
-                        memcpy(scaled + ((size_t) y * command->width + x) * 4u,
+                        0, image->width, scaled_width);
+                    for (int x = 0; x < scaled_width; x++) {
+                        memcpy(scaled + ((size_t) y * scaled_width + x) * 4u,
                                source + ((size_t) source_y.value * image->width
                                          + source_x.value) * 4u, 4u);
                         scale_stepper_advance(&source_x);
@@ -275,7 +346,7 @@ static const unsigned char *image_pixels_for_command(
                 }
                 ScaledImageCacheEntry *entry = scaled_image_insert(
                     cache, identity, image->width, image->height,
-                    command->width, command->height, scaled, false);
+                    scaled_width, scaled_height, scaled, false);
                 if (entry != NULL) {
                     cache->scaled_image_builds++;
                     image_resource_free_decoded(cache->budget,
@@ -1168,10 +1239,99 @@ static void rasterize_stroke_rect(RasterTarget *target,
     return;
 }
 
+/* Tile-local separable box blur for translucent fixed/sticky chrome.  The
+   command admission below caps the full region, while this helper processes
+   at most one 128-pixel strip at a time with seven RGB565 rows (1.75 KiB).
+   Ordinary commands never enter it and pay only the radius test. */
+__attribute__((noinline))
+static void rasterize_small_backdrop_blur(
+    RasterTarget *target, const DrawCommand *command,
+    int x0, int y0, int x1, int y1, unsigned radius)
+{
+    if (target == NULL || command == NULL || radius == 0u || radius > 3u
+        || x0 >= x1 || y0 >= y1 || command->width <= 0
+        || command->height <= 0 || command->height > 96
+        || command->width > 24576 / command->height) return;
+    uint16_t rows[7][TILEFINCH_TILE_SIZE];
+    int corner_radii[4];
+    style_border_radius_resolve_corners(
+        command->radius, command->width, command->height, corner_radii);
+    bool rounded = style_border_radius_maximum(command->radius) > 0;
+    for (int chunk_x = x0; chunk_x < x1;
+         chunk_x += TILEFINCH_TILE_SIZE) {
+        int chunk_right = chunk_x + TILEFINCH_TILE_SIZE;
+        if (chunk_right > x1) chunk_right = x1;
+        int chunk_width = chunk_right - chunk_x;
+        int prepared_through = y0 - 1;
+        for (int y = y0; y < y1; y++) {
+            int need = y + (int) radius;
+            if (need >= y1) need = y1 - 1;
+            while (prepared_through < need) {
+                prepared_through++;
+                uint16_t *output = rows[prepared_through % 7];
+                for (int local_x = 0; local_x < chunk_width; local_x++) {
+                    int world_x = chunk_x + local_x;
+                    unsigned red = 0, green = 0, blue = 0, samples = 0;
+                    for (int dx = -(int) radius;
+                         dx <= (int) radius; dx++) {
+                        int sample_x = world_x + dx;
+                        if (sample_x < chunk_x) sample_x = chunk_x;
+                        if (sample_x >= chunk_right) sample_x = chunk_right - 1;
+                        size_t index = 0;
+                        if (!raster_target_index(
+                                target, sample_x, prepared_through,
+                                &index)) continue;
+                        uint16_t pixel = target->pixels[index];
+                        red += tilefinch_rgb565_red_code(pixel);
+                        green += tilefinch_rgb565_green_code(pixel);
+                        blue += tilefinch_rgb565_blue_code(pixel);
+                        samples++;
+                    }
+                    output[local_x] = samples == 0 ? 0
+                        : tilefinch_rgb565_pack_codes(
+                              (red + samples / 2u) / samples,
+                              (green + samples / 2u) / samples,
+                              (blue + samples / 2u) / samples);
+                }
+            }
+            for (int local_x = 0; local_x < chunk_width; local_x++) {
+                int world_x = chunk_x + local_x;
+                if (rounded
+                    && rounded_rect_coverage_quarters(
+                           world_x, y, command->x, command->y,
+                           command->width, command->height,
+                           corner_radii) == 0) continue;
+                unsigned red = 0, green = 0, blue = 0, samples = 0;
+                for (int dy = -(int) radius; dy <= (int) radius; dy++) {
+                    int sample_y = y + dy;
+                    if (sample_y < y0) sample_y = y0;
+                    if (sample_y >= y1) sample_y = y1 - 1;
+                    uint16_t pixel = rows[sample_y % 7][local_x];
+                    red += tilefinch_rgb565_red_code(pixel);
+                    green += tilefinch_rgb565_green_code(pixel);
+                    blue += tilefinch_rgb565_blue_code(pixel);
+                    samples++;
+                }
+                size_t index = 0;
+                if (samples != 0
+                    && raster_target_index(target, world_x, y, &index)) {
+                    target->pixels[index] = tilefinch_rgb565_pack_codes(
+                        (red + samples / 2u) / samples,
+                        (green + samples / 2u) / samples,
+                        (blue + samples / 2u) / samples);
+                }
+            }
+        }
+    }
+}
+
 static void rasterize_command(TileCache *cache, RasterTarget *target,
                               const DrawCommand *command)
 {
     target->filter_code = (uint8_t) draw_command_filter_code(command);
+    target->blend_mode = (uint8_t) draw_command_blend_mode(command);
+    target->filter_low_amount =
+        (command->font_italic & LAYOUT_COMMAND_FILTER_LOW_AMOUNT) != 0;
     target->forced_dark = cache->forced_dark;
     target->forced_dark_role = command->type == DRAW_IMAGE
         ? FORCED_DARK_NONE
@@ -1182,7 +1342,8 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
                     ? FORCED_DARK_BORDER : FORCED_DARK_INK));
     target->resolved_color_source = command->color;
     target->resolved_color_value = raster_filter_color(
-        command->color, target->filter_code, target->forced_dark,
+        command->color, target->filter_code, target->filter_low_amount,
+        target->forced_dark,
         (ForcedDarkRole) target->forced_dark_role);
     target->resolved_color_valid = true;
     if (!intersects(command, target->left, target->top,
@@ -1227,6 +1388,11 @@ static void rasterize_command(TileCache *cache, RasterTarget *target,
             radius, command->width, command->height, corner_radii);
         bool has_radius = style_border_radius_maximum(radius) > 0;
         unsigned alpha = 255u * command->opacity_scale / 256u;
+        unsigned backdrop_blur = draw_command_backdrop_blur(command);
+        if (backdrop_blur != 0u) {
+            rasterize_small_backdrop_blur(
+                target, command, x0, y0, x1, y1, backdrop_blur);
+        }
         size_t gradient_slot = 0;
         if (draw_command_fill_gradient(command, &gradient_slot)
             && cache->layout != NULL

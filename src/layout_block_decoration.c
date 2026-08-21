@@ -7,6 +7,29 @@
 
 #include <stdio.h>
 
+#define LAYOUT_BACKDROP_FILTER_COMMAND_LIMIT 4u
+
+static unsigned layout_admit_backdrop_blur(
+    LayoutContext *context, unsigned radius)
+{
+    if (context == NULL || radius == 0u
+        || context->backdrop_filter_disabled) return 0u;
+    if (context->backdrop_filter_count
+          < LAYOUT_BACKDROP_FILTER_COMMAND_LIMIT) {
+        context->backdrop_filter_count++;
+        return radius;
+    }
+    /* All-or-nothing degradation avoids retaining one filtered fixed range
+       that would still disable the fixed-layer cache while an attacker adds
+       arbitrarily many unfiltered siblings. This scan happens once during
+       layout, never in the frame loop. */
+    for (size_t i = 0; i < context->layout->count; i++)
+        draw_command_set_backdrop_blur(&context->layout->commands[i], 0u);
+    context->backdrop_filter_count = 0;
+    context->backdrop_filter_disabled = true;
+    return 0u;
+}
+
 /* Emit the decoration commands for one block: outer box shadows, the rounded
    border stroke, the background fill, the background gradient, the background
    image, the overlay gradient, and a gradient mask.  Their heights are not
@@ -19,6 +42,16 @@ bool layout_block_emit_decoration(
 {
     const StylePaintStack *paint_stack = stylesheet_paint_stack(
         context->sheet, computed_style_paint_stack_id(style));
+    unsigned backdrop_blur = paint_stack == NULL ? 0u
+        : (paint_stack->reserved & STYLE_PAINT_BACKDROP_BLUR_MASK)
+          >> STYLE_PAINT_BACKDROP_BLUR_SHIFT;
+    /* Keep backdrop filtering out of ordinary scrolling content.  Fixed and
+       sticky page chrome is the high-value mobile use, and bounding it here
+       prevents long articles from turning a cosmetic declaration into
+       repeated full-page pixel work on the PSP. */
+    if (!style->fixed_position && !style->sticky_position) {
+        backdrop_blur = 0u;
+    }
     int border_radius_code = stylesheet_border_radius_code(
         context->sheet, style);
     const StylePaintLayer *mask_layer =
@@ -243,7 +276,10 @@ bool layout_block_emit_decoration(
        black, not an unmasked fallback. Keeping the box in layout prevents
        geometry shifts while suppressing the solid icon-colored rectangles
        that would otherwise flash during a streaming first paint. */
-    if (style->has_background && !element_mask_declared) {
+    if (!element_mask_declared)
+        backdrop_blur = layout_admit_backdrop_blur(context, backdrop_blur);
+    if ((style->has_background || backdrop_blur != 0u)
+        && !element_mask_declared) {
         DrawCommand background = {.type = DRAW_FILL_RECT,
                                   .x = outer_x + background_inset_left,
                                   .y = outer_y + background_inset_top,
@@ -252,8 +288,11 @@ bool layout_block_emit_decoration(
                                       - background_inset_right,
                                   .height = 0, .color = style->background,
                                   .scale = 1, .radius = background_radius,
-                                  .opacity_scale = alpha_opacity_scale(
-                                      style->background_alpha)};
+                                  .opacity_scale = style->has_background
+                                      ? alpha_opacity_scale(
+                                            style->background_alpha)
+                                      : 0};
+        draw_command_set_backdrop_blur(&background, backdrop_blur);
         if (LAYOUT_TRACE(context->layout, PAINT)) {
             size_t class_length = 0;
             const char *class_name = document_attribute(

@@ -31,7 +31,13 @@ static const TilefinchGlyphPackSpec glyph_specs[TILEFINCH_GLYPH_PACK_COUNT] = {
      "tilefinch-glyph-ko-v1.tfgf"},
     {"glyph-emoji-color", "Color Emoji",
      "tilefinch-glyph-emoji-color-v1.tfgm",
-     "tilefinch-glyph-emoji-color-v1.tfgf"}
+     "tilefinch-glyph-emoji-color-v1.tfgf"},
+    {"glyph-cyrillic", "Cyrillic",
+     "tilefinch-glyph-cyrillic-v1.tfgm",
+     "tilefinch-glyph-cyrillic-v1.tfgf"},
+    {"glyph-latin-extended", "Extended Latin",
+     "tilefinch-glyph-latin-extended-v1.tfgm",
+     "tilefinch-glyph-latin-extended-v1.tfgf"}
 };
 
 const TilefinchGlyphPackSpec *tilefinch_glyph_pack_spec(

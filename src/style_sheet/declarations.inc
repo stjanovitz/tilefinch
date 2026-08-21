@@ -439,12 +439,17 @@ static void variable_cache_store(Stylesheet *sheet, lxb_dom_node_t *node,
     }
 }
 
+static bool retained_rule_fast_matches(const StyleCustomRule *rule,
+                                        const StyleMatchSubject *subject);
+
 static bool local_variable_value(
     Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement wanted_pseudo,
     const char *name, size_t name_length, uint32_t hash,
     char *output, size_t output_size)
 {
     const StyleCustomRule *winner = NULL;
+    StyleMatchSubject subject = {0};
+    style_match_subject_prepare(node, &subject);
     size_t first = sheet->custom_rule_index_ready
         ? custom_rule_index_lower_bound(
               sheet->custom_rule_index,
@@ -465,6 +470,7 @@ static bool local_variable_value(
                 sheet, rule->container_query, node)
             || strlen(rule->name) != name_length
             || memcmp(rule->name, name, name_length) != 0
+            || !retained_rule_fast_matches(rule, &subject)
             || !style_selector_matches_profiled(
                 sheet, node, rule->selector,
                 strlen(rule->selector))) continue;
@@ -646,6 +652,8 @@ bool style_retained_property_value(
     }
     stylesheet_prepare_rule_index((Stylesheet *) sheet);
     style_relative_selector_cache_begin((Stylesheet *) sheet);
+    StyleMatchSubject subject = {0};
+    style_match_subject_prepare(node, &subject);
     uint32_t hash = custom_rule_name_hash(name, name_length);
     const StyleCustomRule *winner = NULL;
     size_t first = sheet->custom_rule_index_ready
@@ -666,6 +674,7 @@ bool style_retained_property_value(
                 sheet, rule->container_query, node)
             || strlen(rule->name) != name_length
             || memcmp(rule->name, name, name_length) != 0
+            || !retained_rule_fast_matches(rule, &subject)
             || !style_selector_matches_profiled(
                 sheet, node, rule->selector, strlen(rule->selector))) {
             continue;
@@ -714,11 +723,40 @@ typedef struct {
     char inline_value[sizeof(((StyleCustomRule *) 0)->value)];
 } RetainedRuleWinner;
 
+static bool retained_rule_fast_matches(const StyleCustomRule *rule,
+                                        const StyleMatchSubject *subject)
+{
+    if (rule == NULL || subject == NULL
+        || rule->fast_key_offset == UINT8_MAX) return true;
+    size_t selector_length = strlen(rule->selector);
+    size_t offset = rule->fast_key_offset;
+    if (offset >= selector_length) return true;
+    size_t end = skip_selector_identifier(
+        rule->selector, selector_length, offset);
+    if (end <= offset) return true;
+    const char *key = rule->selector + offset;
+    size_t key_length = end - offset;
+    char marker = offset == 0 ? '\0' : rule->selector[offset - 1u];
+    if (marker == '#') {
+        return subject->id != NULL && subject->id_length == key_length
+            && memcmp(subject->id, key, key_length) == 0;
+    }
+    if (marker == '.') {
+        return subject->classes != NULL
+            && class_contains_length(
+                subject->classes, subject->classes_length, key, key_length);
+    }
+    return subject->tag != NULL && subject->tag_length == key_length
+        && memcmp(subject->tag, key, key_length) == 0;
+}
+
 static void retained_rule_winner(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const char *name, size_t name_length, RetainedRuleWinner *output)
 {
     memset(output, 0, sizeof(*output));
+    StyleMatchSubject subject = {0};
+    style_match_subject_prepare(node, &subject);
     uint32_t hash = custom_rule_name_hash(name, name_length);
     size_t first = sheet->custom_rule_index_ready
         ? custom_rule_index_lower_bound(
@@ -738,6 +776,7 @@ static void retained_rule_winner(
                 sheet, rule->container_query, node)
             || strlen(rule->name) != name_length
             || memcmp(rule->name, name, name_length) != 0
+            || !retained_rule_fast_matches(rule, &subject)
             || !style_selector_matches_profiled(
                 sheet, node, rule->selector, strlen(rule->selector))) {
             continue;
@@ -978,6 +1017,8 @@ bool style_retained_presentation_values(
     memset(output, 0, sizeof(*output));
     stylesheet_prepare_rule_index((Stylesheet *) sheet);
     style_relative_selector_cache_begin((Stylesheet *) sheet);
+    StyleMatchSubject subject = {0};
+    style_match_subject_prepare(node, &subject);
 
     const StyleCustomRule *winners[STYLE_RETAINED_PRESENTATION_COUNT] = {0};
     bool inline_important[STYLE_RETAINED_PRESENTATION_COUNT] = {false};
@@ -1053,7 +1094,8 @@ bool style_retained_presentation_values(
                 || !style_container_query_matches(
                     sheet, rule->container_query, node)
                 || strlen(rule->name) != name_length
-                || memcmp(rule->name, name, name_length) != 0) continue;
+                || memcmp(rule->name, name, name_length) != 0
+                || !retained_rule_fast_matches(rule, &subject)) continue;
             size_t selector_length = strlen(rule->selector);
             uint32_t selector_hash = custom_rule_name_hash(
                 rule->selector, selector_length);
@@ -1697,6 +1739,17 @@ static bool add_custom_rule(Stylesheet *sheet, const char *selector,
     rule->important = important;
     rule->pseudo = (uint8_t) pseudo;
     rule->container_query = sheet->current_container_query;
+    rule->fast_key_offset = UINT8_MAX;
+    StyleRule selector_metadata = {
+        .selector = rule->selector,
+        .selector_length = (uint16_t) selector_length
+    };
+    selector_assign_fast_key(
+        &selector_metadata, rule->selector, selector_length);
+    if (selector_metadata.has_fast_key
+        && selector_metadata.fast_key_offset < UINT8_MAX) {
+        rule->fast_key_offset = (uint8_t) selector_metadata.fast_key_offset;
+    }
     rule->origin = sheet->current_origin;
     rule->layer = sheet->current_layer;
     rule->specificity = specificity;
@@ -1707,6 +1760,13 @@ static bool add_custom_rule(Stylesheet *sheet, const char *selector,
 static const char *retained_presentation_property(
     const char *name, size_t name_length)
 {
+    /* NanoSVG applies the winding rule stored as fill-rule when a path is
+       used by a clipping path. Canonicalizing CSS clip-rule here preserves
+       the authored clipping result without adding a thirteenth retained
+       presentation field to every bounded batch. */
+    if (span_case_equal(name, name_length, "clip-rule")) {
+        return "fill-rule";
+    }
     int index = retained_presentation_index(name, name_length);
     return index < 0 ? NULL : retained_presentation_names[index];
 }
@@ -1780,7 +1840,8 @@ static bool retained_presentation_value_supported(
         return retained_presentation_number(
             value, value_length, 0.0, 1.0, true);
     }
-    if (span_equal(name, name_length, "fill-rule")) {
+    if (span_equal(name, name_length, "fill-rule")
+        || span_equal(name, name_length, "clip-rule")) {
         return span_case_equal(value, value_length, "nonzero")
             || span_case_equal(value, value_length, "evenodd");
     }
@@ -1829,12 +1890,60 @@ static bool retained_presentation_value_supported(
     return false;
 }
 
+static bool selector_has_direct_never_match_pseudo(
+    const char *selector, size_t length)
+{
+    unsigned round = 0;
+    unsigned square = 0;
+    char quote = '\0';
+    for (size_t at = 0; at < length; at++) {
+        char value = selector[at];
+        if (quote != '\0') {
+            if (value == '\\' && at + 1u < length) at++;
+            else if (value == quote) quote = '\0';
+            continue;
+        }
+        if (square != 0 && (value == '\'' || value == '"')) {
+            quote = value;
+        } else if (value == '[') {
+            square++;
+        } else if (value == ']' && square != 0) {
+            square--;
+        } else if (square == 0 && value == '(') {
+            round++;
+        } else if (square == 0 && value == ')' && round != 0) {
+            round--;
+        } else if (square == 0 && round == 0 && value == ':'
+                   && at + 1u < length && selector[at + 1u] != ':') {
+            size_t name = at + 1u;
+            size_t end = skip_selector_identifier(selector, length, name);
+            size_t name_length = end - name;
+            if (span_case_equal(selector + name, name_length, "hover")
+                || span_case_equal(
+                    selector + name, name_length, "active")
+                || span_case_equal(
+                    selector + name, name_length, "visited")
+                || span_case_equal(
+                    selector + name, name_length, "lang")) {
+                return true;
+            }
+            if (end > at) at = end - 1u;
+        }
+    }
+    return false;
+}
+
 static bool collect_custom_rules(Stylesheet *sheet, const char *selector,
                                  size_t selector_length,
                                  const char *declarations, size_t length,
                                  unsigned specificity, unsigned order,
                                  PseudoElement pseudo)
 {
+    /* These interaction states and :lang() are currently unsatisfied by the
+       static matcher. Do not retain a second sparse copy of a rule that can
+       never win; functional uses such as :not(:hover) remain eligible. */
+    if (selector_has_direct_never_match_pseudo(
+            selector, selector_length)) return true;
     static const char *const retained_layout_properties[] = {
         "container", "container-name", "container-type",
         "columns", "column-count", "column-width", "column-gap",
@@ -1853,7 +1962,10 @@ static bool collect_custom_rules(Stylesheet *sheet, const char *selector,
         "user-select", "-webkit-user-select", "touch-action",
         "text-size-adjust", "-webkit-text-size-adjust", "resize",
         "text-wrap", "text-wrap-style",
-        "translate", "rotate", "scale", "isolation",
+        "hyphens", "tab-size", "font-kerning", "text-rendering",
+        "contain-intrinsic-size",
+        "translate", "rotate", "scale", "isolation", "mix-blend-mode",
+        "backdrop-filter", "-webkit-backdrop-filter",
         "border-start-start-radius", "border-start-end-radius",
         "border-end-start-radius", "border-end-end-radius"
     };
@@ -1994,6 +2106,41 @@ static bool collect_custom_rules(Stylesheet *sheet, const char *selector,
                 } else if (span_case_equal(stored_name, stored_name_length,
                                            "isolation")) {
                     modern = STYLE_MODERN_ISOLATION;
+                } else if (span_case_equal(stored_name, stored_name_length,
+                                           "hyphens")
+                           || span_case_equal(stored_name, stored_name_length,
+                                              "tab-size")
+                           || span_case_equal(stored_name, stored_name_length,
+                                              "font-kerning")
+                           || span_case_equal(stored_name, stored_name_length,
+                                              "text-rendering")) {
+                    modern = STYLE_MODERN_TYPOGRAPHY;
+                    if (span_case_equal(stored_name, stored_name_length,
+                                        "hyphens")) {
+                        sheet->modern_typography_mask
+                            |= STYLE_MODERN_TYPOGRAPHY_HYPHENS;
+                    } else if (span_case_equal(
+                                   stored_name, stored_name_length,
+                                   "tab-size")) {
+                        sheet->modern_typography_mask
+                            |= STYLE_MODERN_TYPOGRAPHY_TAB_SIZE;
+                    } else if (span_case_equal(
+                                   stored_name, stored_name_length,
+                                   "font-kerning")) {
+                        sheet->modern_typography_mask
+                            |= STYLE_MODERN_TYPOGRAPHY_KERNING;
+                    } else {
+                        sheet->modern_typography_mask
+                            |= STYLE_MODERN_TYPOGRAPHY_TEXT_RENDERING;
+                    }
+                } else if (span_case_equal(stored_name, stored_name_length,
+                                           "mix-blend-mode")) {
+                    modern = STYLE_MODERN_MIX_BLEND;
+                } else if (span_case_equal(stored_name, stored_name_length,
+                                           "backdrop-filter")
+                           || span_case_equal(stored_name, stored_name_length,
+                                              "-webkit-backdrop-filter")) {
+                    modern = STYLE_MODERN_BACKDROP_FILTER;
                 } else if (stored_name_length >= 18
                            && strncasecmp(stored_name, "border-", 7) == 0
                            && strncasecmp(

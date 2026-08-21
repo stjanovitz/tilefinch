@@ -659,6 +659,8 @@ typedef struct {
     const RoundedClip *rounded_clips;
     size_t rounded_clip_count;
     uint8_t filter_code;
+    uint8_t blend_mode;
+    bool filter_low_amount;
     uint8_t forced_dark_role;
     bool forced_dark;
     bool resolved_color_valid;
@@ -1114,9 +1116,15 @@ static inline uint32_t forced_dark_color(
 }
 
 static inline uint32_t raster_filter_color(
-    uint32_t color, unsigned filter, bool forced_dark,
+    uint32_t color, unsigned filter, bool low_amount, bool forced_dark,
     ForcedDarkRole forced_dark_role)
 {
+    /* Keep the overwhelmingly common unfiltered path ahead of channel
+       extraction and the authored-filter dispatch below. */
+    if (filter == STYLE_FILTER_NONE) {
+        return forced_dark
+            ? forced_dark_color(color, forced_dark_role) : color;
+    }
     unsigned red = (color >> 16) & 255u;
     unsigned green = (color >> 8) & 255u;
     unsigned blue = color & 255u;
@@ -1145,6 +1153,28 @@ static inline uint32_t raster_filter_color(
         if (blue > 255u) blue = 255u;
     } else if (filter == STYLE_FILTER_DARKEN) {
         red -= red >> 2; green -= green >> 2; blue -= blue >> 2;
+    } else if (filter == STYLE_FILTER_CONTRAST) {
+        int numerator = low_amount ? 3 : 5;
+        int denominator = 4;
+        int channels[3] = {(int) red, (int) green, (int) blue};
+        for (unsigned i = 0; i < 3; i++) {
+            int adjusted = 128 + (channels[i] - 128) * numerator / denominator;
+            channels[i] = adjusted < 0 ? 0 : (adjusted > 255 ? 255 : adjusted);
+        }
+        red = (unsigned) channels[0];
+        green = (unsigned) channels[1];
+        blue = (unsigned) channels[2];
+    } else if (filter == STYLE_FILTER_SATURATE) {
+        int gray = (int) ((red * 77u + green * 150u + blue * 29u) >> 8);
+        int numerator = low_amount ? 3 : 5;
+        int channels[3] = {(int) red, (int) green, (int) blue};
+        for (unsigned i = 0; i < 3; i++) {
+            int adjusted = gray + (channels[i] - gray) * numerator / 4;
+            channels[i] = adjusted < 0 ? 0 : (adjusted > 255 ? 255 : adjusted);
+        }
+        red = (unsigned) channels[0];
+        green = (unsigned) channels[1];
+        blue = (unsigned) channels[2];
     }
     color = (red << 16) | (green << 8) | blue;
     return forced_dark
@@ -1159,8 +1189,38 @@ static inline uint32_t raster_target_color(
         return target->resolved_color_value;
     }
     return raster_filter_color(
-        color, target->filter_code, target->forced_dark,
+        color, target->filter_code, target->filter_low_amount,
+        target->forced_dark,
         (ForcedDarkRole) target->forced_dark_role);
+}
+
+static inline uint32_t raster_mix_color(
+    uint16_t destination, uint32_t foreground, unsigned mode)
+{
+    if (mode == LAYOUT_MIX_BLEND_NORMAL) return foreground;
+    unsigned dr = tilefinch_rgb5_to_u8(
+        tilefinch_rgb565_red_code(destination));
+    unsigned dg = tilefinch_rgb6_to_u8(
+        tilefinch_rgb565_green_code(destination));
+    unsigned db = tilefinch_rgb5_to_u8(
+        tilefinch_rgb565_blue_code(destination));
+    unsigned fr = (foreground >> 16) & 255u;
+    unsigned fg = (foreground >> 8) & 255u;
+    unsigned fb = foreground & 255u;
+    if (mode == LAYOUT_MIX_BLEND_MULTIPLY) {
+        fr = (fr * dr + 127u) / 255u;
+        fg = (fg * dg + 127u) / 255u;
+        fb = (fb * db + 127u) / 255u;
+    } else if (mode == LAYOUT_MIX_BLEND_SCREEN) {
+        fr = 255u - ((255u - fr) * (255u - dr) + 127u) / 255u;
+        fg = 255u - ((255u - fg) * (255u - dg) + 127u) / 255u;
+        fb = 255u - ((255u - fb) * (255u - db) + 127u) / 255u;
+    } else if (mode == LAYOUT_MIX_BLEND_DARKEN) {
+        if (dr < fr) fr = dr;
+        if (dg < fg) fg = dg;
+        if (db < fb) fb = db;
+    }
+    return (fr << 16) | (fg << 8) | fb;
 }
 
 /* Blend one already-resolved pixel.  Shared by the per-pixel path and the
@@ -1169,6 +1229,8 @@ static inline void blend_at_index(RasterTarget *target, size_t index,
                                   uint32_t foreground, unsigned alpha)
 {
     foreground = raster_target_color(target, foreground);
+    foreground = raster_mix_color(
+        target->pixels[index], foreground, target->blend_mode);
     if (target->alpha != NULL) {
         if (alpha == 255u) {
             target->pixels[index] = rgb565(foreground);
@@ -1202,7 +1264,7 @@ static inline void blend_at_index(RasterTarget *target, size_t index,
 static inline void blend_surface_at_index(
     RasterTarget *target, size_t index, uint32_t foreground, unsigned alpha)
 {
-    if (alpha != 255u) {
+    if (alpha != 255u || target->blend_mode != LAYOUT_MIX_BLEND_NORMAL) {
         blend_at_index(target, index, foreground, alpha);
         return;
     }

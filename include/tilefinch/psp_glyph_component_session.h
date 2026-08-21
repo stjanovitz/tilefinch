@@ -23,6 +23,9 @@ typedef struct {
     TilefinchGlyphPack operation_pack;
     uint8_t installed_mask;
     uint8_t attached_mask;
+    uint8_t lazy_attempted_mask;
+    uint8_t lazy_processed_script_mask;
+    uint8_t lazy_attached_count;
     bool root_ready;
     bool operation_initialized;
     bool auto_install;
@@ -41,6 +44,13 @@ void psp_glyph_component_session_destroy(PspGlyphComponentSession *session);
    bounded Memory Stick read, per call. There are no writes here. */
 bool psp_glyph_component_session_pump_runtime(
     PspGlyphComponentSession *session, BrowserEngine *engine);
+/* At most one signature/index probe and one attachment per call. The selected
+   language and emoji keep provider priority; visible page-script hints may
+   add no more than two other installed language packs. */
+bool psp_glyph_component_session_attach_hinted(
+    PspGlyphComponentSession *session,
+    const TilefinchInstallPaths *paths, uint8_t script_mask,
+    BrowserEngine *engine);
 
 void psp_glyph_component_session_probe(
     PspGlyphComponentSession *session, const TilefinchInstallPaths *paths);

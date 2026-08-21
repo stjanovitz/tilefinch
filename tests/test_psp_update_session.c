@@ -1,4 +1,5 @@
 #include "tilefinch/psp_update_session.h"
+#include "tilefinch/update_history.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,26 @@ int main(void)
     char metadata[256];
     CHECK(psp_update_session_metadata_url(NULL, metadata, sizeof(metadata))
           && strstr(metadata, "/releases/latest/download/") != NULL);
+    char history_url[256];
+    CHECK(tilefinch_update_history_url(
+              "stjanovitz", "tilefinch", history_url,
+              sizeof(history_url))
+          && strstr(history_url, "api.github.com/repos/") != NULL
+          && strstr(history_url, "/releases?per_page=9") != NULL);
+    char previous_tag[16];
+    snprintf(previous_tag, sizeof(previous_tag), "%s", "v0.1.4");
+    PspUpdateSessionOptions previous = {
+        .channel = BROWSER_UPDATE_CHANNEL_STABLE,
+        .release_tag = previous_tag,
+        .allow_downgrade = true
+    };
+    CHECK(psp_update_session_metadata_url(
+              &previous, metadata, sizeof(metadata))
+          && strstr(metadata, "/releases/download/v") != NULL
+          && strstr(metadata, "/tilefinch-update-v1.tfum") != NULL);
+    previous.release_tag = "../bad";
+    CHECK(!psp_update_session_metadata_url(
+        &previous, metadata, sizeof(metadata)));
     PspUpdateSessionOptions signed_test = {
         .channel = BROWSER_UPDATE_CHANNEL_STABLE,
         .signed_metadata_url_override =

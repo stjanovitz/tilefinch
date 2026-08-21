@@ -197,6 +197,11 @@ size_t script_runtime_heap_remaining(const ScriptRuntime *runtime)
     return current < limit ? limit - current : 0;
 }
 
+bool script_runtime_last_slice_interrupted(const ScriptRuntime *runtime)
+{
+    return runtime != NULL && runtime->result.interrupted;
+}
+
 size_t script_runtime_inline_execution_reserve(
     const ScriptRuntime *runtime, size_t source_length)
 {

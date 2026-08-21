@@ -1,6 +1,7 @@
 #include "tilefinch/controller.h"
 
 #include "tilefinch/fetch.h"
+#include "tilefinch/media_discovery.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -306,6 +307,126 @@ static bool node_is_submit_button(lxb_dom_node_t *node)
            || (node_name_is(node, "input")
                && (attribute_is(node, "type", "submit")
                    || attribute_is(node, "type", "image")));
+}
+
+static bool media_type_supported(lxb_dom_node_t *node)
+{
+    size_t length = 0;
+    const char *type = document_attribute(node, "type", &length);
+    if (type == NULL || length == 0) return true;
+    static const char mp4[] = "video/mp4";
+    if (length < sizeof(mp4) - 1u
+        || strncasecmp(type, mp4, sizeof(mp4) - 1u) != 0) return false;
+    if (length == sizeof(mp4) - 1u) return true;
+    unsigned char next = (unsigned char) type[sizeof(mp4) - 1u];
+    return next == ';' || isspace(next);
+}
+
+static const char *media_source_reference(
+    BrowserController *controller, lxb_dom_node_t *video, size_t *length)
+{
+    const char *source = document_attribute(video, "src", length);
+    if (source != NULL && *length != 0) return source;
+    unsigned child_elements = 0;
+    for (lxb_dom_node_t *child = video == NULL ? NULL : video->first_child;
+         child != NULL; child = child->next) {
+        if (child->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        if (child_elements++ >= 16u) break;
+        if (!node_name_is(child, "source")) continue;
+        /* Match the bootstrap's limit. A hostile element may contain the
+           document's full node allowance; activation must remain a small,
+           deterministic input operation rather than a second DOM walk. */
+        if (!media_type_supported(child)) {
+            continue;
+        }
+        size_t media_length = 0;
+        const char *media = document_attribute(
+            child, "media", &media_length);
+        if (media != NULL && media_length != 0
+            && !stylesheet_media_matches(
+                   &controller->navigation->page.stylesheet,
+                   media, media_length)) continue;
+        source = document_attribute(child, "src", length);
+        if (source != NULL && *length != 0) return source;
+    }
+    return NULL;
+}
+
+static void media_credentials_policy(
+    lxb_dom_node_t *video, TilefinchRequestMode *mode,
+    TilefinchCredentialsMode *credentials)
+{
+    *mode = TILEFINCH_REQUEST_MODE_NO_CORS;
+    *credentials = TILEFINCH_CREDENTIALS_INCLUDE;
+    size_t length = 0;
+    const char *crossorigin = document_attribute(
+        video, "crossorigin", &length);
+    if (crossorigin == NULL) return;
+    *mode = TILEFINCH_REQUEST_MODE_CORS;
+    *credentials = length == sizeof("use-credentials") - 1u
+            && strncasecmp(
+                   crossorigin, "use-credentials",
+                   sizeof("use-credentials") - 1u) == 0
+        ? TILEFINCH_CREDENTIALS_INCLUDE
+        : TILEFINCH_CREDENTIALS_SAME_ORIGIN;
+}
+
+static bool controller_build_media_action(
+    BrowserController *controller, lxb_dom_node_t *video,
+    ControllerAction *action)
+{
+    if (controller == NULL || video == NULL || action == NULL
+        || !node_name_is(video, "video")) return false;
+    size_t source_length = 0;
+    const char *source = media_source_reference(
+        controller, video, &source_length);
+    bool discovered = false;
+    MediaDiscoveryKind discovered_kind = MEDIA_DISCOVERY_NONE;
+    if (source == NULL || source_length == 0) {
+        MediaDiscoveryResult discovery = {0};
+        if (!media_discover_document_candidate(
+                &controller->navigation->page.document,
+                action->body, sizeof(action->body), &discovery)) {
+            return false;
+        }
+        source = action->body;
+        source_length = strlen(action->body);
+        discovered = true;
+        discovered_kind = discovery.kind;
+    }
+    if (source_length == 0 || source_length >= NAVIGATION_URL_LIMIT) {
+        return false;
+    }
+    /* ControllerAction already owns a bounded body scratch area. Reuse its
+       first half while resolving instead of adding a 2 KiB frame to the
+       activation hot path on Allegrex. Media actions never carry a form
+       body, and the scratch is cleared before returning. */
+    if (!discovered) {
+        memcpy(action->body, source, source_length);
+        action->body[source_length] = '\0';
+    }
+    const NavigationEntry *current = navigation_current(
+        controller->navigation);
+    const char *base = current == NULL ? NULL : current->url;
+    if (base == NULL || !fetch_resolve_url(
+            base, action->body, action->url, sizeof(action->url))) return false;
+    if (!tilefinch_csp_allows_request(
+            &controller->navigation->page.document.content_security_policy,
+            TILEFINCH_DESTINATION_MEDIA, action->url)) return false;
+    media_credentials_policy(
+        video, &action->media_mode, &action->media_credentials);
+    ScriptRuntime *runtime = controller->navigation->page.runtime;
+    /* Playback and its asynchronous DOM state reports may outlive a page
+       wrapper. Pin the handle just as HTMLMediaElement.play() does; terminal
+       state delivery releases it, while document teardown remains the bound
+       if the user closes the native player first. */
+    action->media_node_handle = runtime == NULL ? 0
+        : script_runtime_node_handle(runtime, video);
+    action->media_kind = discovered_kind;
+    action->body[0] = '\0';
+    action->body_length = 0;
+    action->type = CONTROLLER_ACTION_MEDIA;
+    return true;
 }
 
 static void form_implicit_controls(lxb_dom_node_t *node,
@@ -1152,9 +1273,11 @@ bool controller_pointer_event(BrowserController *controller,
     if (phase == CONTROLLER_POINTER_MOVE) {
         if (controller->pointer_resize_active) return true;
         retain_pointer_hover_node(controller, have_hit ? hit.node : NULL);
-        if (!have_hit || navigation->page.runtime == NULL) return true;
+        if (navigation->page.runtime == NULL) return true;
         return navigation_dispatch_node_pointer(
-            navigation, hit.node, 1, hit.client_x, hit.client_y,
+            navigation, have_hit ? hit.node : NULL, 1,
+            have_hit ? hit.client_x : client_x,
+            have_hit ? hit.client_y : client_y,
             offset_x, offset_y,
             controller->pointer_down_active ? 1u : 0u);
     }
@@ -1462,6 +1585,10 @@ bool controller_activate(BrowserController *controller,
             action->type = CONTROLLER_ACTION_NONE;
             return true;
         }
+        if (node_name_is(node, "video")) {
+            return controller_build_media_action(
+                controller, node, action);
+        }
         bool submit = node_is_submit_button(node);
         if (submit && form_ancestor(node) != NULL) {
             return controller_build_form_action(
@@ -1483,6 +1610,9 @@ bool controller_activate(BrowserController *controller,
         if (navigation->page.runtime != NULL
             && navigation->page.script_result.last_event_cancelled) {
             action->type = CONTROLLER_ACTION_NONE;
+        } else if (node_name_is(node, "video")) {
+            return controller_build_media_action(
+                controller, node, action);
         }
         return true;
     }

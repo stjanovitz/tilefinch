@@ -39,6 +39,34 @@ bool is_block_display(DisplayMode display)
            || display == DISPLAY_TABLE_ROW || display == DISPLAY_TABLE_CELL;
 }
 
+static int content_visibility_intrinsic_height(
+    const Stylesheet *sheet, lxb_dom_node_t *node)
+{
+    char value[96];
+    if (!style_retained_property_value(
+            sheet, node, "contain-intrinsic-size", 22,
+            value, sizeof(value))) return 0;
+    const char *parts[3] = {0};
+    size_t lengths[3] = {0};
+    size_t count = 0;
+    for (size_t at = 0, total = strlen(value); at < total && count < 3;) {
+        while (at < total && isspace((unsigned char) value[at])) at++;
+        if (at == total) break;
+        size_t start = at;
+        while (at < total && !isspace((unsigned char) value[at])) at++;
+        if (at - start == 4
+            && strncasecmp(value + start, "auto", 4) == 0) continue;
+        parts[count] = value + start;
+        lengths[count++] = at - start;
+    }
+    if (count == 0 || count > 2) return 0;
+    bool percent = false;
+    int height = style_parse_length(
+        sheet, parts[count == 1 ? 0 : 1],
+        lengths[count == 1 ? 0 : 1], 0, &percent);
+    return !percent && height > 0 ? height : 0;
+}
+
 /* The CollapsedMargin accessors and the block margin-collapsing predicates
    are `static inline` in layout_block_internal.h. */
 
@@ -567,6 +595,15 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         : style_content_height(context->sheet, style, content_width,
                                containing_height);
     if (declared_content_height < 0) declared_content_height = 0;
+    bool content_visibility_hidden = style->content_visibility
+        == STYLE_CONTENT_VISIBILITY_HIDDEN;
+    if (content_visibility_hidden && !style->has_height) {
+        int intrinsic = content_visibility_intrinsic_height(
+            context->sheet, node);
+        if (intrinsic > declared_content_height) {
+            declared_content_height = intrinsic;
+        }
+    }
     int native_control_height = layout_control_default_height(node);
     if (!style->has_height && native_control_height > 0
         && (style->appearance & STYLE_APPEARANCE_MASK) != APPEARANCE_NONE) {
@@ -634,7 +671,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         .node_box_start = context->layout->node_box_count,
         .text_align = computed_style_used_text_align(style),
         .direction_rtl = computed_style_direction_rtl(style),
-        .clamp_limit = style->line_clamp,
+        .clamp_limit = computed_style_line_clamp(style),
         .positioned_box = *descendant_positioned_box,
         .floats_enabled = true,
         .first_inline_block_collapses_top =
@@ -676,8 +713,6 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     int flow_bottom_margin = style->margin.bottom;
     GeneratedPseudoFlow before_pseudo_flow = {0};
     GeneratedPseudoFlow after_pseudo_flow = {0};
-    bool content_visibility_hidden = style->content_visibility
-        == STYLE_CONTENT_VISIBILITY_HIDDEN;
     /* Generated content flows with the box's inline content in every
        block container, not only display:block -- an inline-block li's
        ::after separator belongs after its last line, not at the box
@@ -1020,8 +1055,18 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     }
 
     bool table_row = style->display == DISPLAY_TABLE_ROW;
-    bool flex_container = style->display == DISPLAY_FLEX
-                          || style->display == DISPLAY_INLINE_FLEX;
+    /* WebKit's multiline clamp convention uses a vertical legacy box, but
+       its contents still form ordinary inline lines.  The compatibility
+       parser maps that box to flex for CSSOM and non-clamped layouts; select
+       block flow here so the existing bounded ellipsis stage owns the text. */
+    bool clamped_vertical_box = computed_style_line_clamp(style) != 0
+        && (style->display == DISPLAY_FLEX
+            || style->display == DISPLAY_INLINE_FLEX)
+        && (style->flex_direction == FLEX_COLUMN
+            || style->flex_direction == FLEX_COLUMN_REVERSE);
+    bool flex_container = !clamped_vertical_box
+        && (style->display == DISPLAY_FLEX
+            || style->display == DISPLAY_INLINE_FLEX);
     bool grid = style->display == DISPLAY_GRID
                 || style->display == DISPLAY_INLINE_GRID;
     bool css_table_row = false;
@@ -1191,7 +1236,8 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             }
         }
     }
-    bool column_flex = (style->display == DISPLAY_FLEX
+    bool column_flex = !clamped_vertical_box
+                       && (style->display == DISPLAY_FLEX
                         || style->display == DISPLAY_INLINE_FLEX)
                        && (style->flex_direction == FLEX_COLUMN
                            || style->flex_direction == FLEX_COLUMN_REVERSE);
@@ -1941,6 +1987,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     bool block_select = layout_node_name_is(node, "select");
     bool block_label = layout_node_name_is(node, "label");
     bool block_summary = layout_node_name_is(node, "summary");
+    bool block_video = layout_node_name_is(node, "video");
     ControlType block_input_type = block_input
         ? layout_input_control_type(node) : CONTROL_INPUT;
     if ((block_input || block_textarea)
@@ -1993,7 +2040,9 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                 .font_italic = style->font_italic,
                 .letter_spacing = style->letter_spacing,
                 .radius = (int) style->font_size_fraction
-                          << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT,
+                          << LAYOUT_TEXT_FONT_SIZE_FRACTION_SHIFT
+                          | (computed_style_kerning_none(style)
+                             ? LAYOUT_TEXT_KERNING_NONE : 0),
                 .image_fit = text_decoration_bits(style),
                 .opacity_scale = alpha_opacity_scale(style->color_alpha)
             };
@@ -2023,12 +2072,14 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         return false;
     }
     if (block_input || block_textarea || block_button || block_select
-        || block_label || block_summary) {
+        || block_label || block_summary || block_video) {
         ControlType type = block_input ? block_input_type
                            : (block_textarea ? CONTROL_TEXTAREA
-                              : (block_button || block_label || block_summary ? CONTROL_BUTTON
+                              : (block_button || block_label || block_summary
+                                 || block_video ? CONTROL_BUTTON
                                               : CONTROL_SELECT));
-        int minimum_control_height = block_summary ? 24 : 30;
+        int minimum_control_height = block_summary ? 24
+            : block_video ? border_height : 30;
         int control_height = border_height < minimum_control_height
                              ? minimum_control_height : border_height;
         if (!layout_add_control(context->layout, outer_x, outer_y, outer_width,

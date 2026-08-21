@@ -61,8 +61,45 @@ static bool seal_profile(const char *path)
     return ok;
 }
 
+static bool glyph_language_roundtrips(BrowserGlyphLanguage language)
+{
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    BrowserProfile *written = browser_profile_create(&budget);
+    BrowserProfile *loaded = NULL;
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/tilefinch-glyph-language-%ld-%u.cfg",
+             (long) getpid(), (unsigned) language);
+    bool ok = written != NULL;
+    if (ok) {
+        browser_profile_set_glyph_language(written, language);
+        ok = browser_profile_glyph_language(written) == language
+            && browser_profile_save(written, path);
+    }
+    if (ok) {
+        loaded = browser_profile_create(&budget);
+        ok = loaded != NULL && browser_profile_load(loaded, path)
+            && browser_profile_glyph_language(loaded) == language;
+    }
+    browser_profile_destroy(loaded);
+    browser_profile_destroy(written);
+    (void) remove(path);
+    return ok && budget.current == 0;
+}
+
 int main(void)
 {
+    CHECK(BROWSER_GLYPH_LANGUAGE_EMBEDDED == 0
+          && BROWSER_GLYPH_LANGUAGE_JAPANESE == 1
+          && BROWSER_GLYPH_LANGUAGE_CHINESE_SIMPLIFIED == 2
+          && BROWSER_GLYPH_LANGUAGE_CHINESE_TRADITIONAL == 3
+          && BROWSER_GLYPH_LANGUAGE_KOREAN == 4
+          && BROWSER_GLYPH_LANGUAGE_CYRILLIC == 5
+          && BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED == 6
+          && BROWSER_GLYPH_LANGUAGE_COUNT == 7);
+    CHECK(glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_CYRILLIC)
+          && glyph_language_roundtrips(
+                 BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED));
     Budget budget;
     budget_init(&budget, 2u * 1024u * 1024u);
     BrowserProfile *profile = browser_profile_create(&budget);
@@ -99,6 +136,7 @@ int main(void)
           && browser_profile_youtube_quality(profile)
                  == BROWSER_YOUTUBE_QUALITY_360P
           && !browser_profile_youtube_compact_results(profile)
+          && !browser_profile_youtube_audio_only(profile)
           && browser_profile_video_scaling(profile)
                  == BROWSER_VIDEO_SCALING_SMOOTH
           && browser_profile_video_startup_buffering(profile)
@@ -112,6 +150,7 @@ int main(void)
           && browser_profile_reader_font(profile)
                  == BROWSER_READER_FONT_SANS
           && !browser_profile_remember_reader_site_scale(profile)
+          && !browser_profile_reader_auto_mode(profile)
           && browser_profile_reader_site_count(profile) == 0
           && browser_profile_update_check_enabled(profile)
           && browser_profile_update_channel(profile)
@@ -165,6 +204,7 @@ int main(void)
     browser_profile_set_youtube_quality(
         profile, BROWSER_YOUTUBE_QUALITY_240P);
     browser_profile_set_youtube_compact_results(profile, true);
+    browser_profile_set_youtube_audio_only(profile, true);
     browser_profile_set_video_scaling(profile, BROWSER_VIDEO_SCALING_SHARP);
     browser_profile_set_video_startup_buffering(profile, false);
     browser_profile_set_resume_offline_downloads(profile, true);
@@ -187,6 +227,7 @@ int main(void)
     CHECK(!browser_profile_record_reader_site_font_percent(
         profile, "https://en.wikipedia.org/", 125));
     browser_profile_set_remember_reader_site_scale(profile, true);
+    browser_profile_set_reader_auto_mode(profile, true);
     for (unsigned i = 0; i < BROWSER_PROFILE_READER_SITE_LIMIT + 1u; i++) {
         char reader_url[96];
         snprintf(reader_url, sizeof(reader_url),
@@ -343,6 +384,7 @@ int main(void)
           && browser_profile_youtube_quality(loaded)
                  == BROWSER_YOUTUBE_QUALITY_240P
           && browser_profile_youtube_compact_results(loaded)
+          && browser_profile_youtube_audio_only(loaded)
           && browser_profile_video_scaling(loaded)
                  == BROWSER_VIDEO_SCALING_SHARP
           && !browser_profile_video_startup_buffering(loaded)
@@ -365,6 +407,7 @@ int main(void)
                  == UINT64_C(1750000000)
           && browser_profile_update_check_available_sequence(loaded) == 43
           && browser_profile_remember_reader_site_scale(loaded)
+          && browser_profile_reader_auto_mode(loaded)
           && browser_profile_reader_site_count(loaded)
                  == BROWSER_PROFILE_READER_SITE_LIMIT
           && browser_profile_reader_site_font_percent(
@@ -455,6 +498,7 @@ int main(void)
           && browser_profile_youtube_quality(legacy_loaded)
                  == BROWSER_YOUTUBE_QUALITY_360P
           && !browser_profile_youtube_compact_results(legacy_loaded)
+          && !browser_profile_youtube_audio_only(legacy_loaded)
           && browser_profile_video_scaling(legacy_loaded)
                  == BROWSER_VIDEO_SCALING_SMOOTH
           && browser_profile_video_startup_buffering(legacy_loaded)
@@ -468,6 +512,7 @@ int main(void)
           && browser_profile_reader_font(legacy_loaded)
                  == BROWSER_READER_FONT_SANS
           && !browser_profile_remember_reader_site_scale(legacy_loaded)
+          && !browser_profile_reader_auto_mode(legacy_loaded)
           && browser_profile_update_check_enabled(legacy_loaded)
           && browser_profile_update_channel(legacy_loaded)
                  == BROWSER_UPDATE_CHANNEL_STABLE
@@ -510,6 +555,7 @@ int main(void)
           && browser_profile_youtube_quality(two_field_loaded)
                  == BROWSER_YOUTUBE_QUALITY_240P
           && !browser_profile_youtube_compact_results(two_field_loaded)
+          && !browser_profile_youtube_audio_only(two_field_loaded)
           && browser_profile_resume_offline_downloads(two_field_loaded)
           && browser_profile_video_scaling(two_field_loaded)
                  == BROWSER_VIDEO_SCALING_SMOOTH

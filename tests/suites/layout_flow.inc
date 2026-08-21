@@ -1125,10 +1125,19 @@ static int test_intrinsic_keywords_line_clamp_and_content_visibility(
         "#fit{width:fit-content}#guard{width:8px;min-width:min-content}"
         "#flex{display:flex;width:120px}#basis-min{flex:0 0 min-content}"
         "#basis-max{flex-grow:0;flex-shrink:0;flex-basis:max-content}"
-        "#clamp{width:44px;line-height:10px;overflow:hidden;"
-        "-webkit-line-clamp:2}#clamp{text-overflow:ellipsis}"
+        "#clamp{display:-webkit-box;-webkit-box-orient:vertical;width:44px;"
+        "line-height:10px;overflow:hidden;-webkit-line-clamp:2}"
+        "#clamp{text-overflow:ellipsis}"
+        "#legacy{display:-webkit-box;width:100px;height:40px;"
+        "-webkit-box-orient:horizontal;-webkit-box-direction:reverse;"
+        "-webkit-box-pack:justify;-webkit-box-align:center;"
+        "-webkit-box-lines:multiple}"
+        "#legacy-a{-webkit-box-flex:1;-webkit-box-ordinal-group:2}"
+        "#text-fill{color:#112233;-webkit-text-fill-color:#abcdef}"
         "#hidden{content-visibility:hidden;width:40px;height:20px;"
-        "background:#123456}#auto{content-visibility:auto}"
+        "background:#123456}#intrinsic{content-visibility:hidden;"
+        "contain-intrinsic-size:auto 33px;width:30px}"
+        "#auto{content-visibility:auto}"
         "</style><body>"
         "<div id=min class=probe>alpha beta</div>"
         "<div id=max class=probe>alpha beta gamma delta</div>"
@@ -1137,7 +1146,10 @@ static int test_intrinsic_keywords_line_clamp_and_content_visibility(
         "<div id=flex><span id=basis-min>alpha beta</span>"
         "<span id=basis-max>alpha beta</span></div>"
         "<div id=clamp class=probe>one two three four five six seven</div>"
+        "<div id=legacy><span id=legacy-a>A</span><span>B</span></div>"
+        "<span id=text-fill>FILL</span>"
         "<div id=hidden><span>HIDDEN-CONTENT</span></div>"
+        "<div id=intrinsic><span>INTRINSIC-CONTENT</span></div>"
         "<div id=auto><span>AUTO-CONTENT</span></div>"
         "</body>";
     PocDocument document = {0};
@@ -1156,6 +1168,10 @@ static int test_intrinsic_keywords_line_clamp_and_content_visibility(
     lxb_dom_node_t *basis_max = find_id(root, "basis-max");
     lxb_dom_node_t *clamp = find_id(root, "clamp");
     lxb_dom_node_t *hidden = find_id(root, "hidden");
+    lxb_dom_node_t *intrinsic = find_id(root, "intrinsic");
+    lxb_dom_node_t *legacy = find_id(root, "legacy");
+    lxb_dom_node_t *legacy_a = find_id(root, "legacy-a");
+    lxb_dom_node_t *text_fill = find_id(root, "text-fill");
     lxb_dom_node_t *auto_node = find_id(root, "auto");
     const LayoutNodeBox *min_box = layout_box_for_node(&layout, min);
     const LayoutNodeBox *max_box = layout_box_for_node(&layout, max);
@@ -1167,6 +1183,8 @@ static int test_intrinsic_keywords_line_clamp_and_content_visibility(
         &layout, basis_max);
     const LayoutNodeBox *clamp_box = layout_box_for_node(&layout, clamp);
     const LayoutNodeBox *hidden_box = layout_box_for_node(&layout, hidden);
+    const LayoutNodeBox *intrinsic_box = layout_box_for_node(
+        &layout, intrinsic);
     ComputedStyle min_style = style_for_node(&sheet, min, NULL);
     ComputedStyle max_style = style_for_node(&sheet, max, NULL);
     ComputedStyle fit_style = style_for_node(&sheet, fit, NULL);
@@ -1174,6 +1192,9 @@ static int test_intrinsic_keywords_line_clamp_and_content_visibility(
     ComputedStyle basis_min_style = style_for_node(&sheet, basis_min, NULL);
     ComputedStyle basis_max_style = style_for_node(&sheet, basis_max, NULL);
     ComputedStyle hidden_style = style_for_node(&sheet, hidden, NULL);
+    ComputedStyle legacy_style = style_for_node(&sheet, legacy, NULL);
+    ComputedStyle legacy_a_style = style_for_node(&sheet, legacy_a, NULL);
+    ComputedStyle text_fill_style = style_for_node(&sheet, text_fill, NULL);
     ComputedStyle auto_style = style_for_node(&sheet, auto_node, NULL);
     bool hidden_text = false, auto_text = false, ellipsis = false;
     int clamp_first_y = INT_MIN, clamp_second_y = INT_MIN;
@@ -1221,6 +1242,16 @@ static int test_intrinsic_keywords_line_clamp_and_content_visibility(
           && basis_max_style.flex_basis == STYLE_LENGTH_MAX_CONTENT
           && clamp_style.line_clamp == 2
           && computed_style_text_overflow_ellipsis(&clamp_style)
+          && clamp_style.display == DISPLAY_FLEX
+          && clamp_style.flex_direction == FLEX_COLUMN
+          && legacy_style.display == DISPLAY_FLEX
+          && legacy_style.flex_direction == FLEX_ROW_REVERSE
+          && legacy_style.justify_content == JUSTIFY_SPACE_BETWEEN
+          && legacy_style.align_items == ALIGN_CENTER
+          && legacy_style.flex_wrap
+          && legacy_a_style.flex_grow == 1000
+          && legacy_a_style.order == 1
+          && text_fill_style.color == 0xabcdef
           && hidden_style.content_visibility
                  == STYLE_CONTENT_VISIBILITY_HIDDEN
           && auto_style.content_visibility == STYLE_CONTENT_VISIBILITY_AUTO
@@ -1234,7 +1265,9 @@ static int test_intrinsic_keywords_line_clamp_and_content_visibility(
           && basis_min_box->width < basis_max_box->width
           && clamp_first_y != INT_MIN && clamp_second_y != INT_MIN
           && ellipsis && !hidden_text && auto_text
-          && hidden_box->width == 40 && hidden_box->height == 20);
+          && hidden_box->width == 40 && hidden_box->height == 20
+          && intrinsic_box != NULL && intrinsic_box->width == 30
+          && intrinsic_box->height == 33);
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);

@@ -280,6 +280,17 @@ static int test_native_dynamic_code_policy(void)
           && script_runtime_evaluate_diagnostic(
               runtime, blocked, "<dynamic-code-blocked>", &result)
           && strcmp(result.summary, "DYNAMIC-CODE-BLOCKED:6") == 0);
+    static const char inline_allowed[] =
+        "(()=>{const node=document.createElement('button');"
+        "node.setAttribute('onclick',\"this.setAttribute('data-fired',"
+        "event.type);return false\");document.body.appendChild(node);"
+        "const accepted=node.dispatchEvent(new MouseEvent('click',"
+        "{cancelable:true}));globalThis.pocSummary=!accepted&&"
+        "node.getAttribute('data-fired')==='click'?"
+        "'INLINE-HANDLER-ALLOWED':'INLINE-HANDLER-FAILED'})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, inline_allowed, "<inline-handler-allowed>", &result)
+          && strcmp(result.summary, "INLINE-HANDLER-ALLOWED") == 0);
     script_runtime_destroy(runtime);
 
     options.dynamic_code_disabled = false;
@@ -293,6 +304,29 @@ static int test_native_dynamic_code_policy(void)
           && script_runtime_evaluate_diagnostic(
               runtime, allowed, "<dynamic-code-allowed>", &result)
           && strcmp(result.summary, "DYNAMIC-CODE-ALLOWED") == 0);
+    script_runtime_destroy(runtime);
+
+    static const char csp_blocked[] =
+        "content-security-policy: script-src 'none'\n";
+    CHECK(tilefinch_csp_parse_response_headers(
+        &document.content_security_policy, "https://policy.test/",
+        csp_blocked, sizeof(csp_blocked) - 1u, false));
+    options.dynamic_code_disabled = true;
+    runtime = script_runtime_create_configured(
+        &document, &budget, 6u * MIB, 4000,
+        "https://policy.test/", &options, &result);
+    static const char inline_blocked[] =
+        "(()=>{const node=document.createElement('button');"
+        "node.setAttribute('onclick',\"this.setAttribute('data-fired',"
+        "'yes')\");document.body.appendChild(node);"
+        "const accepted=node.dispatchEvent(new MouseEvent('click',"
+        "{cancelable:true}));globalThis.pocSummary=accepted&&"
+        "node.getAttribute('data-fired')===null?"
+        "'INLINE-HANDLER-BLOCKED':'INLINE-HANDLER-ESCAPED'})()";
+    CHECK(runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              runtime, inline_blocked, "<inline-handler-blocked>", &result)
+          && strcmp(result.summary, "INLINE-HANDLER-BLOCKED") == 0);
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0);
@@ -996,6 +1030,14 @@ int main(void)
         "called=Audio(),video=document.createElement('video'),"
         "source=document.createElement('source');"
         "source.src='sounds/fallback.ogg';called.appendChild(source);"
+        "const skipped=document.createElement('source'),"
+        "selected=document.createElement('source');"
+        "skipped.src='movie.webm';skipped.type='video/webm';"
+        "const hidden=document.createElement('source');"
+        "hidden.src='hidden.mp4';hidden.type='video/mp4';"
+        "hidden.media='not all';video.appendChild(hidden);"
+        "selected.src='movie.mp4';selected.type='video/mp4';"
+        "video.appendChild(skipped);video.appendChild(selected);"
         "const events=[];for(const name of ['seeking','seeked'])"
         "audio.addEventListener(name,()=>events.push(name));"
         "const promise=audio.play();promise.catch(()=>{});"
@@ -1006,6 +1048,7 @@ int main(void)
         "&&called instanceof HTMLAudioElement&&audio.preload==='auto'"
         "&&sourced.currentSrc==='https://example.test/sounds/tone.mp3'"
         "&&called.currentSrc==='https://example.test/sounds/fallback.ogg'"
+        "&&video.currentSrc==='https://example.test/movie.mp4'"
         "&&audio.canPlayType('audio/mpeg')===''&&promise instanceof Promise"
         "&&audio.paused&&audio.currentTime===1.5&&audio.volume===.25"
         "&&events.join(',')==='seeking,seeked'"

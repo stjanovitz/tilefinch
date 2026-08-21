@@ -9,6 +9,7 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/cancellation.h"
 #include "tilefinch/font.h"
+#include "tilefinch/install_paths.h"
 #include "tilefinch/media_backend.h"
 #include "tilefinch/media_file.h"
 #include "tilefinch/media_http.h"
@@ -16,7 +17,9 @@
 #include "tilefinch/navigation.h"
 #include "tilefinch/offline_library.h"
 #include "tilefinch/psp_media_present.h"
+#include "tilefinch/psp_media_hls.h"
 #include "tilefinch/psp_media_state.h"
+#include "tilefinch/psp_swdec_component.h"
 #include "tilefinch/psp_ui.h"
 #include "tilefinch/session.h"
 #include "tilefinch/youtube_resolver.h"
@@ -32,6 +35,7 @@ typedef enum {
     PSP_MEDIA_JOB_OPEN_DECODER_PREPARE,
     PSP_MEDIA_JOB_OPEN_PLAYBACK,
     PSP_MEDIA_JOB_SEEK_PREPARE,
+    PSP_MEDIA_JOB_SEEK_PRIME,
     PSP_MEDIA_JOB_SEEK_DECODE,
     PSP_MEDIA_JOB_PREVIEW_RESTORE_PREPARE,
     PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE
@@ -56,6 +60,7 @@ typedef struct {
     bool (*write_failure_report)(
         void *context, const char *stage, const char *detail,
         const char *url, long http_status, int native_result);
+    const TilefinchInstallPaths *install_paths;
 } PspMediaSessionPlatform;
 
 typedef struct {
@@ -69,12 +74,20 @@ typedef struct {
     MediaFileRange *audio_file_range;
     MediaMp4Demux *demux;
     MediaMp4Demux *audio_demux;
+    PspMediaHlsContext *hls;
+    MediaSampleSource hls_source;
     MediaPlayback *playback;
     MediaVideoFrame frame;
     PspUiMediaState ui;
     YoutubeStream stream;
     YoutubeResolveJob *resolver_job;
     PspMediaSessionPlatform platform;
+    PspSwdecComponent swdec;
+    /* Physical decoder selection for this pipeline. Lifecycle authority
+       remains in the media machine; once swdec has taken the ME this fact is
+       sticky until process shutdown. */
+    bool use_swdec;
+    uint8_t decoder_profile_idc;
     /*
      * The cooperate scope's token for the open transaction currently being
      * pumped, or NULL outside one. The platform cancel_requested callback
@@ -172,12 +185,18 @@ typedef struct {
        bounds Memory Stick writes even across many failing routes. */
     unsigned failure_report_level;
     unsigned failure_report_writes;
-    /* Physical admission reservation for an online media route. It survives
-       pipeline rebuilds; route exit/shutdown releases it. Lifecycle authority
-       remains in the session machine. */
+    /* Physical admission reservation for active online media delivery. It
+       survives bounded pipeline rebuilds; a terminal panel, route exit, or
+       shutdown releases it. Lifecycle authority remains in the machine. */
     bool transport_priority_held;
     bool range_pump_audio_first;
+    unsigned video_lookahead_limit;
+    uint64_t video_lookahead_next_sample_us;
     BrowserYoutubeQuality requested_quality;
+    /* Snapshot of the global YouTube transport preference for this route.
+       It is sampled once at open so a settings write cannot mutate a live
+       pipeline underneath its range/demux ownership. */
+    bool audio_only;
     bool quality_fallback_attempted;
     uint64_t reopen_resume_us;
     bool reopen_resume_playing;
@@ -205,6 +224,16 @@ typedef struct {
     uint64_t transport_refresh_rearm_us;
     uint64_t transport_next_expiry_check_us;
     bool offline_source;
+    /* A document-owned <video> route uses the same decoder/presenter as the
+       provider, but its source is an ordinary authorized HTTP subresource. */
+    bool page_source;
+    bool page_hls;
+    TilefinchRequestMode page_media_mode;
+    TilefinchCredentialsMode page_media_credentials;
+    int64_t page_media_node_handle;
+    uint64_t page_media_probe_request;
+    uint64_t page_media_report_us;
+    char page_document_url[NAVIGATION_URL_LIMIT];
     /* One line per opened stream: the clock re-anchors on every later frame
        once a decoder is behind, and a per-frame line would be the log. */
     bool clock_resync_logged;
@@ -350,6 +379,8 @@ typedef struct {
     char offline_audio_path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
     PspMediaJobPhase job_phase;
     uint64_t job_target_us;
+    uint64_t job_actual_us;
+    uint64_t job_prime_audio_us;
     uint64_t job_restore_us;
     uint64_t job_started_us;
     uint64_t job_phase_started_us;
@@ -361,6 +392,7 @@ typedef struct {
     size_t job_units;
     bool job_preview;
     bool job_resume_playing;
+    uint8_t job_prime_ready_mask;
     /*
      * True while the seek in flight is the one an open performs to reach a
      * saved or recovered position, rather than one a viewer asked for. Its
@@ -441,6 +473,18 @@ bool psp_media_open_watchdog(PspMediaSession *media);
 bool psp_media_decode_work_pending(const PspMediaSession *media);
 void psp_media_prepare_route(
     PspMediaSession *media, const char *url, uint64_t generation);
+bool psp_media_open_page_source(
+    PspMediaSession *media, const char *source_url,
+    const char *document_url, uint64_t generation,
+    int64_t node_handle, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, bool autoplay,
+    bool reload_source);
+bool psp_media_open_page_hls(
+    PspMediaSession *media, const char *source_url,
+    const char *document_url, uint64_t generation,
+    int64_t node_handle, TilefinchRequestMode mode,
+    TilefinchCredentialsMode credentials, bool autoplay,
+    bool reload_source);
 bool psp_media_request_seek(
     PspMediaSession *media, uint64_t target_us, bool preview);
 void psp_media_cancel_decode(PspMediaSession *media);

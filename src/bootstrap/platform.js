@@ -21,7 +21,6 @@
     });
   const trustedJSONParse = JSON.parse;
   const trustedJSONStringify = JSON.stringify;
-  const TrustedFunction = Function;
   const trustedStringLower = Function.call.bind(String.prototype.toLowerCase);
   const trustedStringSlice = Function.call.bind(String.prototype.slice);
   const trustedCharCodeAt = Function.call.bind(String.prototype.charCodeAt);
@@ -4328,6 +4327,24 @@
   }
   {
     const states = new WeakMap(),
+      selectedSource = (node) => {
+        const own = node.getAttribute("src");
+        if (own) return own;
+        const children = node.children || [],
+          limit = Math.min(Number(children.length) || 0, 16);
+        for (let index = 0; index < limit; index++) {
+          const source = children[index];
+          if (!(source instanceof HTMLSourceElement)) continue;
+          const value = source.getAttribute("src");
+          if (!value) continue;
+          const media = source.getAttribute("media");
+          if (media && !matchMedia(media).matches) continue;
+          const type = source.getAttribute("type");
+          if (type && !node.canPlayType(type)) continue;
+          return value;
+        }
+        return "";
+      },
       stateFor = (node) => {
         let state = states.get(node);
         if (!state) {
@@ -4344,6 +4361,7 @@
             defaultMuted: false,
             playbackRate: 1,
             defaultPlaybackRate: 1,
+            nativeState: -1,
           };
           states.set(node, state);
         }
@@ -4369,16 +4387,21 @@
           this.toggleAttribute(name, !!value);
         },
       });
+    /* Native controls can activate a video without calling the page-visible
+       play() method. The runtime captures and removes this bootstrap bridge
+       before author code runs, so native state delivery can still obtain the
+       same WeakMap record without trusting a mutable Window property. */
+    globalThis.__tilefinchMediaStateFor = (node) => {
+      if (!(node instanceof HTMLMediaElement)) return null;
+      return stateFor(node);
+    };
     Object.defineProperties(HTMLMediaElement.prototype, {
       src: reflectString("src"),
       currentSrc: {
         configurable: true,
         enumerable: true,
         get() {
-          const own = this.getAttribute("src");
-          if (own) return new URL(own, location.href).href;
-          const source = this.querySelector("source[src]"),
-            value = source?.getAttribute("src") || "";
+          const value = selectedSource(this);
           try {
             return value ? new URL(value, location.href).href : "";
           } catch {
@@ -4817,13 +4840,44 @@
     options !== null && typeof options === "object"
       ? !!options.capture
       : !!options;
-  const focusEventTypes = new Set(["blur", "focus", "focusin", "focusout"]);
-  let focusObserverCount = 0;
-  globalThis.__tilefinchFocusObserverDelta = (type, delta) => {
-    if (!focusEventTypes.has(String(type))) return;
-    focusObserverCount = Math.max(0, focusObserverCount + Number(delta || 0));
+  const focusEventTypes = new Set(["blur", "focus", "focusin", "focusout"]),
+    pointerMoveEventTypes = new Set(["mousemove", "pointermove"]),
+    pointerHoverEventTypes = new Set([
+      "mouseenter",
+      "mouseleave",
+      "mouseover",
+      "mouseout",
+      "pointerenter",
+      "pointerleave",
+      "pointerover",
+      "pointerout",
+    ]);
+  let focusObserverCount = 0,
+    pointerMoveObserverCount = 0,
+    pointerHoverObserverCount = 0;
+  globalThis.__tilefinchEventObserverDelta = (type, delta) => {
+    const key = String(type),
+      amount = Number(delta || 0);
+    if (focusEventTypes.has(key))
+      focusObserverCount = Math.max(0, focusObserverCount + amount);
+    if (pointerMoveEventTypes.has(key))
+      pointerMoveObserverCount = Math.max(
+        0,
+        pointerMoveObserverCount + amount,
+      );
+    if (pointerHoverEventTypes.has(key))
+      pointerHoverObserverCount = Math.max(
+        0,
+        pointerHoverObserverCount + amount,
+      );
   };
+  globalThis.__tilefinchFocusObserverDelta = (type, delta) =>
+    globalThis.__tilefinchEventObserverDelta(type, delta);
   globalThis.__tilefinchFocusEventsObserved = () => focusObserverCount !== 0;
+  globalThis.__tilefinchPointerMoveEventsObserved = () =>
+    pointerMoveObserverCount !== 0;
+  globalThis.__tilefinchPointerHoverEventsObserved = () =>
+    pointerHoverObserverCount !== 0;
   globalThis.__tilefinchAddEventListener = (
     map,
     type,
@@ -4852,7 +4906,7 @@
       signal.addEventListener("abort", item.abort, { once: true });
     }
     list.push(item);
-    globalThis.__tilefinchFocusObserverDelta(key, 1);
+    globalThis.__tilefinchEventObserverDelta(key, 1);
   };
   globalThis.__tilefinchRemoveEventListener = (
     map,
@@ -4868,7 +4922,7 @@
       );
     if (at < 0) return;
     const [item] = list.splice(at, 1);
-    globalThis.__tilefinchFocusObserverDelta(type, -1);
+    globalThis.__tilefinchEventObserverDelta(type, -1);
     if (item.signal && item.abort)
       try {
         item.signal.removeEventListener("abort", item.abort);
@@ -6879,22 +6933,12 @@
     globalThis.__tilefinchMaybeStartMotion?.();
     document.readyState = "complete";
     const loadEvent = new Event("load");
-    const bodyLoad = document.body?.getAttribute?.("onload");
-    if (
-      globalThis.__tilefinchCspAllowsInlineEventHandlers !== false &&
-      typeof bodyLoad === "string" &&
-      bodyLoad.length <= 65536
-    )
-      try {
-        TrustedFunction("event", bodyLoad).call(globalThis, loadEvent);
-      } catch (error) {
-        __tilefinchReportUncaught(error, "body onload");
-      }
     /*
      * HTMLBodyElement's onload handler reflects the Window load handler
      * surface.  Programmatic `document.body.onload = ...` assignments are
      * stored on the wrapped body, so invoke that property before dispatching
-     * the Window event.  Markup handlers are evaluated by the branch above.
+     * the Window event. Markup and programmatic handlers share the same lazy,
+     * CSP-gated event-handler property path.
      */
     const bodyOnload = document.body?.onload;
     if (typeof bodyOnload === "function")

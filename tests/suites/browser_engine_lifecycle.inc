@@ -597,3 +597,83 @@ static int test_engine_lifecycle(void)
     browser_engine_destroy(engine);
     return 0;
 }
+
+static int test_page_video_activation(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    static const char page[] =
+        "<!doctype html><title>Media</title><body>"
+        "<video controls crossorigin=use-credentials width=320 height=180>"
+        "<source src=hidden.mp4 type=video/mp4 media='not all'>"
+        "<source src=skip.webm type=video/webm>"
+        "<source src=movie.mp4 type='video/mp4; codecs=avc1'></video>";
+    ControllerAction action = {0};
+    CHECK(engine != NULL
+          && browser_engine_commit_html(
+                 engine, "https://media.test/path/page.html", page,
+                 sizeof(page) - 1u, true)
+          && browser_engine_focus_move(engine, true)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_MEDIA
+          && strcmp(action.url,
+                    "https://media.test/path/movie.mp4") == 0
+          && action.media_node_handle > 0
+          && action.media_mode == TILEFINCH_REQUEST_MODE_CORS
+          && action.media_credentials == TILEFINCH_CREDENTIALS_INCLUDE
+          /* Execution belongs to the platform player; the engine must never
+             accidentally reinterpret a media action as navigation. */
+          && browser_engine_execute_action(engine, &action, 1024, 1000)
+          && strcmp(navigation_current(browser_engine_navigation(engine))->url,
+                    "https://media.test/path/page.html") == 0
+          && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_page_video_data_candidate_activation(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    static const char page[] =
+        "<!doctype html><title>Media data</title><body>"
+        "<video controls width=320 height=180></video>"
+        "<script>var mediaDefinition=["
+        "{\"quality\":720,\"videoUrl\":\"/movie-720.mp4\"},"
+        "{\"quality\":240,\"videoUrl\":\"/movie-240.mp4\"},"
+        "{\"quality\":144,\"videoUrl\":\"/movie-144.mp4\"}];"
+        "</script></body>";
+    ControllerAction action = {0};
+    CHECK(engine != NULL
+          && browser_engine_commit_html(
+                 engine, "https://media-data.test/path/page.html", page,
+                 sizeof(page) - 1u, true)
+          && browser_engine_focus_move(engine, true)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_MEDIA
+          && strcmp(action.url,
+                    "https://media-data.test/movie-240.mp4") == 0
+          && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}

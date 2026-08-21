@@ -1804,6 +1804,21 @@ static bool run_command_loop(FILE *commands, bool interactive,
                    || host_platform_button(TILEFINCH_PLATFORM_BUTTON_CROSS))
                   && browser_engine_activate(engine, &scratch->action);
             if (!media_activation && ok
+                && scratch->action.type == CONTROLLER_ACTION_MEDIA) {
+                char media_error[256] = {0};
+                interactive_media_destroy(media);
+                ok = media != NULL && interactive_media_open(
+                    media, budget, navigation, scratch->action.url, false,
+                    media_error, sizeof(media_error));
+#ifdef TILEFINCH_HAVE_HOST_MEDIA
+                if (ok && media->player != NULL)
+                    host_media_set_playing(media->player, true);
+#endif
+                if (!ok && media_error[0] != '\0')
+                    fprintf(stderr, "page video open failed: %s\n",
+                            media_error);
+                reset_cache = ok;
+            } else if (!media_activation && ok
                 && (scratch->action.type == CONTROLLER_ACTION_NAVIGATE
                        || scratch->action.type
                               == CONTROLLER_ACTION_FORM_SUBMIT)) {

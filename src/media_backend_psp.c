@@ -215,6 +215,16 @@ _Static_assert(PSP_MEDIA_AU_DUMP_BYTES <= PSP_MEDIA_VIDEO_AU_BYTES,
                "AU dump reads past the access-unit descriptor");
 _Static_assert(PSP_MEDIA_CODEC_DUMP_WORDS <= PSP_MEDIA_AUDIO_CODEC_WORDS,
                "codec dump reads past the audiocodec control block");
+_Static_assert(
+    PSP_MEDIA_AUDIO_ONLY_EXTERNAL_RESERVE
+        >= (size_t) PSP_MEDIA_PACKET_STAGING_BYTES
+           + (size_t) PSP_MEDIA_AUDIO_CODEC_BYTES
+           + (size_t) PSP_MEDIA_AUDIO_PCM_BYTES
+           + (size_t) PSP_MEDIA_AUDIO_QUEUE_BYTES
+           + (size_t) PSP_MEDIA_AUDIO_STAGING_BYTES
+           + (size_t) PSP_MEDIA_AUDIO_PENDING_BYTES
+           + PSP_MEDIA_POOL_AUDIO_EDRAM_BYTES,
+    "audio-only reservation must cover every admitted firmware buffer");
 _Static_assert(offsetof(PspAvcDetail2, info_buffer) == 16,
                "PspAvcDetail2 info pointer ABI drift");
 /* The reported per-slot arrays have to be able to hold every slot. Raising the
@@ -2749,7 +2759,8 @@ static int psp_media_audio_worker_health(PspMediaBackend *backend)
 
 bool media_psp_backend_quarantined(void)
 {
-    return psp_media_backend_is_quarantined;
+    return psp_media_backend_is_quarantined
+        || media_psp_swdec_backend_quarantined();
 }
 
 bool media_psp_backend_wide_program_rejected(void)
@@ -5567,6 +5578,10 @@ static MediaBackendResult psp_media_drain(
         return MEDIA_BACKEND_WOULD_BLOCK;
     }
     if (collected < 0) return MEDIA_BACKEND_ERROR;
+    /* AAC has no delayed decoded pictures to flush. Once its last submitted
+       job has been collected, end immediately instead of consulting video
+       surface/refusal gates that do not belong to this backend. */
+    if (!backend->have_video) return MEDIA_BACKEND_END;
     /* A drain publishes pictures into the same surface a video submission
        does, on this thread or on the worker. It waits for the same window --
        and for the refusal window, for the same reason: it is another way to
@@ -5756,7 +5771,8 @@ static bool psp_media_advance(void *opaque, uint64_t clock_us,
 static bool psp_media_reset(void *opaque, char *error, size_t error_size)
 {
     PspMediaBackend *backend = opaque;
-    if (backend == NULL || !backend->mpeg_created) {
+    if (backend == NULL
+        || (!backend->mpeg_created && !backend->have_audio)) {
         psp_media_error(error, error_size,
                         "PSP media decoder cannot reset");
         return false;
@@ -5862,7 +5878,8 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
        path. Bounded, and a failure here is the same class as the one above:
        something is still reading a slot, so nothing may be freed. */
     uint32_t reader_wait_us = 0;
-    if (!psp_media_surface_quiesce_readers(&reader_wait_us)) {
+    if (backend->have_video
+        && !psp_media_surface_quiesce_readers(&reader_wait_us)) {
         backend->stats.last_native_error = (int) PSP_MEDIA_ERROR_BUSY;
         psp_media_log_failure(
             backend, "surface-quiesce-reset", (int) PSP_MEDIA_ERROR_BUSY);
@@ -5936,7 +5953,8 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
      * property of the surface and the decoder's geometry, which a reposition
      * does not change.
      */
-    for (unsigned slot = 0; slot < PSP_MEDIA_SURFACE_SLOTS; slot++) {
+    for (unsigned slot = 0;
+         backend->have_video && slot < PSP_MEDIA_SURFACE_SLOTS; slot++) {
         psp_media_surface_lease_publish(slot, 0, false);
         atomic_store(&psp_media_surface_borrowed[slot], 0);
         atomic_store(&psp_media_surface_writing[slot], 0);
@@ -6014,7 +6032,7 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
      * forward seek having decoded 245 of 248 access units -- a working
      * decoder, declared unavailable. Ask only while unanswered.
      */
-    if (!psp_media_surface_proven(backend)) {
+    if (backend->have_video && !psp_media_surface_proven(backend)) {
         backend->raw_nal_probe_pending = true;
         backend->raw_nal_probe_packets = 0;
     }
@@ -6038,13 +6056,16 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
     /* A flush or a rebuild leaves firmware holding nothing, so only the
        no-touch branch below re-opens this window. */
     backend->video_reposition_drain_units = 0u;
-    bool no_touch = !refusal_rebuild
+    bool no_touch = backend->have_video && !refusal_rebuild
         && psp_media_reset_mode == PSP_MEDIA_RESET_MODE_NO_TOUCH;
-    bool rebuild_requested = refusal_rebuild
-        || psp_media_reset_mode == PSP_MEDIA_RESET_MODE_RECREATE;
+    bool rebuild_requested = backend->have_video && (refusal_rebuild
+        || psp_media_reset_mode == PSP_MEDIA_RESET_MODE_RECREATE);
     bool rebuild = rebuild_requested
         && psp_media_codec_worker_dispatchable(backend);
-    if (rebuild_requested && !rebuild) {
+    if (!backend->have_video) {
+        native_stage = "audio-only-reset";
+        status = 0;
+    } else if (rebuild_requested && !rebuild) {
         native_stage = refusal_rebuild
             ? "codec-recreate-refusal-worker"
             : "codec-recreate-worker";
@@ -6205,7 +6226,8 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
 static bool psp_media_take_frame(void *opaque, MediaVideoFrame *frame)
 {
     PspMediaBackend *backend = opaque;
-    if (backend == NULL || frame == NULL) return false;
+    if (backend == NULL || frame == NULL || !backend->have_video)
+        return false;
     /*
      * There is no global job gate here any more, and its removal is the whole
      * point of this function's current shape.
@@ -7365,6 +7387,87 @@ static void psp_media_destroy(void *opaque)
     budget_free(budget, backend);
 }
 
+static bool psp_media_presentation_borrow(
+    void *opaque, unsigned slot, uint32_t generation)
+{
+    (void) opaque;
+    return media_psp_backend_borrow_surface(slot, generation);
+}
+
+static void psp_media_presentation_release(void *opaque, unsigned slot)
+{
+    (void) opaque;
+    media_psp_backend_release_surface(slot);
+}
+
+static void psp_media_presentation_end_auxiliary_read(
+    void *opaque, unsigned slot)
+{
+    (void) opaque;
+    media_psp_backend_end_surface_read(slot);
+}
+
+static void psp_media_presentation_quarantine(void *opaque, unsigned slot)
+{
+    (void) opaque;
+    media_psp_backend_quarantine_surface(slot);
+}
+
+static void psp_media_presentation_release_quarantine(
+    void *opaque, unsigned slot)
+{
+    (void) opaque;
+    media_psp_backend_release_surface_quarantine(slot);
+}
+
+static bool psp_media_presentation_is_quarantined(
+    const void *opaque, unsigned slot)
+{
+    (void) opaque;
+    return media_psp_backend_surface_quarantined(slot);
+}
+
+static void psp_media_presentation_note_staged(
+    void *opaque, const MediaVideoFrame *frame)
+{
+    (void) opaque;
+    media_psp_backend_note_frame_staged(frame);
+}
+
+static void psp_media_presentation_note_displayed(
+    void *opaque, const MediaVideoFrame *frame, int present_path)
+{
+    (void) opaque;
+    media_psp_backend_note_frame_displayed(frame, present_path);
+}
+
+static void psp_media_presentation_note_quiesced(
+    void *opaque, const MediaVideoFrame *frame)
+{
+    (void) opaque;
+    media_psp_backend_note_frame_quiesced(frame);
+}
+
+static void psp_media_presentation_note_stage_signature(
+    void *opaque, const MediaVideoFrame *frame, uint32_t signature)
+{
+    (void) opaque;
+    media_psp_backend_note_stage_signature(frame, signature);
+}
+
+static const MediaBackendPresentationOps psp_media_presentation_ops = {
+    .borrow = psp_media_presentation_borrow,
+    .release = psp_media_presentation_release,
+    .end_auxiliary_read = psp_media_presentation_end_auxiliary_read,
+    .quarantine = psp_media_presentation_quarantine,
+    .release_quarantine = psp_media_presentation_release_quarantine,
+    .is_quarantined = psp_media_presentation_is_quarantined,
+    .note_staged = psp_media_presentation_note_staged,
+    .note_displayed = psp_media_presentation_note_displayed,
+    .note_quiesced = psp_media_presentation_note_quiesced,
+    .note_stage_signature = psp_media_presentation_note_stage_signature
+};
+
 bool media_psp_backend_create_split(
     Budget *budget, const MediaMp4Demux *video_demux,
     const MediaMp4Demux *audio_demux,
@@ -7451,16 +7554,21 @@ bool media_psp_backend_create_split(
             }
         }
     }
-    if (!backend->have_video || backend->video.width > 640
-        || backend->video.height > 360) {
+    if ((!backend->have_video && !backend->have_audio)
+        || (backend->have_video
+            && (backend->video.width > 640
+                || backend->video.height > 360))) {
         psp_media_error(error, error_size,
-                        "PSP AVC exceeds 640x360");
+                        backend->have_video
+                            ? "PSP AVC exceeds 640x360"
+                            : "PSP media has no supported track");
         psp_media_destroy(backend);
         return false;
     }
-    if (backend->video.largest_sample == 0
-        || backend->video.largest_sample
-             > PSP_MEDIA_MAXIMUM_PACKET_BYTES
+    if ((backend->have_video
+         && (backend->video.largest_sample == 0
+             || backend->video.largest_sample
+                  > PSP_MEDIA_MAXIMUM_PACKET_BYTES))
         || (backend->have_audio
             && (backend->audio.largest_sample == 0
                 || backend->audio.largest_sample
@@ -7516,7 +7624,23 @@ bool media_psp_backend_create_split(
         psp_media_destroy(backend);
         return false;
     }
-    if (!media_h264_avcc_dimensions(
+    PspMediaSurfacePolicy surface_policy = {0};
+    PspMediaDecoderPolicy decoder_policy = {0};
+    if (backend->have_video) {
+    uint8_t routed_profile = 0;
+    MediaH264DecoderRoute decoder_route = media_h264_avcc_decoder_route(
+        backend->video.codec_config, backend->video.codec_config_length,
+        &routed_profile);
+    if (decoder_route == MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION) {
+        psp_media_error(
+            error, error_size,
+            "H.264 High profile format coming soon (%u)",
+            (unsigned) routed_profile);
+        psp_media_destroy(backend);
+        return false;
+    }
+    if (decoder_route != MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE
+        || !media_h264_avcc_dimensions(
             backend->video.codec_config,
             backend->video.codec_config_length,
             &backend->decoded_width, &backend->decoded_height,
@@ -7551,7 +7675,6 @@ bool media_psp_backend_create_split(
         psp_media_destroy(backend);
         return false;
     }
-    PspMediaSurfacePolicy surface_policy = {0};
     if (!psp_media_surface_policy(
             backend->decoded_width, backend->decoded_height,
             &surface_policy)) {
@@ -7560,7 +7683,6 @@ bool media_psp_backend_create_split(
         psp_media_destroy(backend);
         return false;
     }
-    PspMediaDecoderPolicy decoder_policy = {0};
     unsigned avc_profile = backend->video.codec_config_length > 1u
         ? backend->video.codec_config[1] : 0u;
     unsigned avc_level = backend->video.codec_config_length > 3u
@@ -7621,18 +7743,27 @@ bool media_psp_backend_create_split(
         psp_media_destroy(backend);
         return false;
     }
+    }
+    size_t external_reserve = backend->have_video
+        ? surface_policy.external_reserve_bytes
+        : PSP_MEDIA_AUDIO_ONLY_EXTERNAL_RESERVE;
     if (!budget_reservation_acquire(
             &backend->external, budget, BUDGET_CATEGORY_RESOURCE,
-            surface_policy.external_reserve_bytes)) {
-        psp_media_error(
-            error, error_size,
-            "PSP %up codec working set exceeded page budget",
-            backend->decoded_height > 272 ? 360u : 240u);
+            external_reserve)) {
+        if (backend->have_video) {
+            psp_media_error(
+                error, error_size,
+                "PSP %up codec working set exceeded page budget",
+                backend->decoded_height > 272 ? 360u : 240u);
+        } else {
+            psp_media_error(
+                error, error_size,
+                "PSP audio working set exceeded page budget");
+        }
         psp_media_destroy(backend);
         return false;
     }
-    backend->stats.external_bytes =
-        surface_policy.external_reserve_bytes;
+    backend->stats.external_bytes = external_reserve;
     if (!psp_media_modules_ready) {
         psp_media_error(
             error, error_size,
@@ -7643,6 +7774,7 @@ bool media_psp_backend_create_split(
     int status = 0;
     const char *native_stage = "media-engine-boot";
     uint32_t me_boot_nid = 0;
+    if (backend->have_video) {
     /*
      * The Media Engine program is part of the process-wide MPEG runtime.
      * Mature raw-MP4 players finish and reinitialize MPEG when changing
@@ -7763,12 +7895,14 @@ bool media_psp_backend_create_split(
     backend->slot_no_free = false;
     backend->slot_free_idle = true;
     backend->reading_slot = -1;
+    backend->mpeg_memory = psp_media_alloc64(backend->mpeg_memory_bytes);
+    }
     /* The session's first epoch. Never zero: zero is the reserved value a
        never-stamped job reads as, and it must stay distinguishable from a
-       stream that is genuinely running. */
+       stream that is genuinely running. Audio-only jobs share the same stale
+       completion contract even though they own no decoded surface. */
     backend->session_epoch = PSP_MEDIA_EPOCH_FIRST;
     backend->codec_job_epoch = PSP_MEDIA_EPOCH_INVALID;
-    backend->mpeg_memory = psp_media_alloc64(backend->mpeg_memory_bytes);
     /* Lazy fragmented streams reveal future sample sizes only when their
        sidx window is opened. Reserve the admitted ceiling before firmware
        heaps and playback churn fragment user memory. */
@@ -7791,10 +7925,12 @@ bool media_psp_backend_create_split(
         backend->audio_pending =
             psp_media_alloc64(PSP_MEDIA_AUDIO_PENDING_BYTES);
     }
-    /* PMPlayer's proven raw decoder allocates a 64-byte AU object rather than
-       embedding the 24-byte public struct in ordinary heap storage. */
-    backend->video_au = psp_media_alloc64(PSP_MEDIA_VIDEO_AU_BYTES);
-    (void) psp_media_copy_parameter_sets(backend);
+    if (backend->have_video) {
+        /* PMPlayer's proven raw decoder allocates a 64-byte AU object rather
+           than embedding the 24-byte public struct in ordinary heap storage. */
+        backend->video_au = psp_media_alloc64(PSP_MEDIA_VIDEO_AU_BYTES);
+        (void) psp_media_copy_parameter_sets(backend);
+    }
     /*
      * Say where every Media Engine buffer actually landed, before anything
      * can reach sceMpegCreate or the raw-NAL bridge.
@@ -7846,8 +7982,12 @@ bool media_psp_backend_create_split(
         psp_media_commit_log();
         (void) shared;
     }
-    if (backend->mpeg_memory == NULL || backend->video_au == NULL
-        || backend->video_parameter_sets == NULL
+    if ((backend->have_video
+         && (backend->mpeg_memory == NULL || backend->video_au == NULL
+             || backend->video_parameter_sets == NULL
+             || backend->ddr_memory == NULL
+             || backend->surfaces[0] == NULL
+             || backend->surfaces[1] == NULL))
         || backend->packet_staging == NULL
         || (backend->have_audio
             && (backend->audio_codec == NULL
@@ -7855,9 +7995,7 @@ bool media_psp_backend_create_split(
                 || backend->audio_queue == NULL
                 || backend->audio_staging == NULL
                 || backend->audio_pending == NULL))
-        || backend->ddr_memory == NULL
-        || backend->surfaces[0] == NULL
-        || backend->surfaces[1] == NULL) {
+        ) {
         psp_media_log(
             "tilefinch-media-decoder: event=allocation-failure "
             "mpeg=%d/%dB au=%d/64B sets=%d/%zuB packet=%d/%zuB "
@@ -7892,6 +8030,7 @@ bool media_psp_backend_create_split(
         psp_media_destroy(backend);
         return false;
     }
+    if (backend->have_video) {
     memset(&backend->ringbuffer, 0, sizeof(backend->ringbuffer));
     native_stage = "sceMpegCreate";
     status = sceMpegCreate(
@@ -7916,6 +8055,7 @@ bool media_psp_backend_create_split(
     sceKernelDcacheWritebackInvalidateRange(
         backend->video_au, PSP_MEDIA_VIDEO_AU_BYTES);
     backend->raw_nal_probe_pending = true;
+    }
 
     if (backend->have_audio) {
         memset(backend->audio_codec, 0, PSP_MEDIA_AUDIO_CODEC_BYTES);
@@ -8141,6 +8281,8 @@ bool media_psp_backend_create_split(
         backend->video_sps_bytes, backend->video_pps_bytes);
     *backend_out = (MediaBackend) {
         .opaque = backend,
+        .presentation = &psp_media_presentation_ops,
+        .startup_ready_frames = PSP_MEDIA_STARTUP_READY_FRAMES,
         .submit = psp_media_submit,
         .drain = psp_media_drain,
         .advance = psp_media_advance,
@@ -8180,6 +8322,17 @@ bool media_psp_backend_create(
 {
     return media_psp_backend_create_split(
         budget, demux, NULL, backend, error, error_size);
+}
+
+bool media_psp_backend_create_audio(
+    Budget *budget, const MediaMp4Demux *audio_demux,
+    MediaBackend *backend, char *error, size_t error_size)
+{
+    /* Track discovery is kind-based. Supplying the AAC demux as the sole
+       source leaves have_video clear and selects the audio-only allocation
+       path without inventing a placeholder video track. */
+    return media_psp_backend_create_split(
+        budget, audio_demux, NULL, backend, error, error_size);
 }
 
 #ifdef TILEFINCH_PSP_VALIDATION_LOG

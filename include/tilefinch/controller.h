@@ -5,6 +5,8 @@
 #include <stddef.h>
 
 #include "tilefinch/navigation.h"
+#include "tilefinch/media_discovery.h"
+#include "tilefinch/request_context.h"
 
 typedef enum {
     CONTROLLER_FOCUS_NONE,
@@ -34,7 +36,8 @@ typedef enum {
     CONTROLLER_ACTION_NONE,
     CONTROLLER_ACTION_NAVIGATE,
     CONTROLLER_ACTION_CONTROL,
-    CONTROLLER_ACTION_FORM_SUBMIT
+    CONTROLLER_ACTION_FORM_SUBMIT,
+    CONTROLLER_ACTION_MEDIA
 } ControllerActionType;
 
 typedef struct {
@@ -44,6 +47,10 @@ typedef struct {
     char content_type[64];
     char body[4096];
     size_t body_length;
+    int64_t media_node_handle;
+    TilefinchRequestMode media_mode;
+    TilefinchCredentialsMode media_credentials;
+    MediaDiscoveryKind media_kind;
 } ControllerAction;
 
 typedef struct {

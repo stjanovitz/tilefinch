@@ -104,7 +104,8 @@ TilefinchUpdateStatus tilefinch_update_verify_slot(
             .launcher_protocol = options->launcher_protocol,
             .installed_sequence = options->installed_sequence,
             .installed_sequence_valid = options->installed_sequence_valid,
-            .installed_pair_valid = options->installed_pair_valid
+            .installed_pair_valid = options->installed_pair_valid,
+            .allow_downgrade = options->allow_downgrade
         };
         if (options->installed_package_sha256 != NULL) {
             memcpy(

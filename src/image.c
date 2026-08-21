@@ -499,7 +499,24 @@ typedef struct {
     size_t slice_work_units;
     bool eager_decode_rasters;
     bool deadline_cancelled;
+    /* The owner supplies the scheduling boundary. A decoded response is one
+       complete idle unit, so do not call the global cooperation hook from
+       inside that unit and accidentally turn benign input into image failure. */
+    bool externally_pumped;
 } ImageLoadContext;
+
+struct ImagePriorityLoadJob {
+    ImageLoadContext context;
+    ImagePriorityTarget target;
+    ExternalImageStats retained_stats;
+    size_t retained_count;
+    double started_ms;
+    bool retained_priority_staged;
+    bool admitted;
+    bool terminal;
+    bool failed;
+    bool rolled_back;
+};
 
 static unsigned char *decode_svg(const void *data, size_t length,
                                  Budget *budget, size_t maximum_decoded_bytes,
@@ -758,6 +775,7 @@ static bool image_cooperate(ImageLoadContext *context, const char *phase)
 {
     image_finish_slice(context);
     context->images->stats.cooperative_yields++;
+    if (context->externally_pumped) return true;
     return tilefinch_platform_cooperate(
         phase, context->images->stats.work_units);
 }
@@ -859,6 +877,20 @@ static bool image_add(ImageResources *images, ImageResource resource)
     return true;
 }
 
+static void image_resource_release_owned_pixels(
+    Budget *budget, ImageResource *resource)
+{
+    if (budget == NULL || resource == NULL || !resource->owns_pixels) return;
+    if (resource->pixel_body != NULL) {
+        browser_shared_body_release(resource->pixel_body);
+    } else {
+        budget_free(budget, resource->pixels);
+    }
+    resource->pixels = NULL;
+    resource->pixel_body = NULL;
+    resource->owns_pixels = false;
+}
+
 static bool image_node_already_tracked(const ImageResources *images,
                                        const lxb_dom_node_t *node,
                                        uint64_t source_hash,
@@ -944,6 +976,7 @@ bool images_replace_with_decoded_surface(ImageResources *images,
         ImageResource *alias = &images->items[i];
         if (i == index) continue;
         if (retired->owns_pixels && alias->pixels == retired->pixels) {
+            alias->pixel_body = retired->pixel_body;
             alias->owns_pixels = true;
             pixels_retained = true;
         }
@@ -963,7 +996,7 @@ bool images_replace_with_decoded_surface(ImageResources *images,
             retired_bytes =
                 (size_t) retired->width * (size_t) retired->height * 4u;
         }
-        budget_free(budget, retired->pixels);
+        image_resource_release_owned_pixels(budget, retired);
         images->stats.decoded_bytes =
             retired_bytes <= images->stats.decoded_bytes
             ? images->stats.decoded_bytes - retired_bytes : 0;
@@ -2058,6 +2091,86 @@ static bool supported_picture_type(lxb_dom_node_t *node)
         || (length == 13 && memcmp(type, "image/svg+xml", 13) == 0);
 }
 
+static bool image_source_is_placeholder(const char *source, size_t length)
+{
+    if (source == NULL || length == 0) return true;
+    while (length != 0 && isspace((unsigned char) *source)) {
+        source++;
+        length--;
+    }
+    while (length != 0
+           && isspace((unsigned char) source[length - 1u])) length--;
+    if (length == 0) return true;
+    if ((length == 11u && strncasecmp(source, "about:blank", 11u) == 0)
+        || (length == 1u && source[0] == '#')) return true;
+    /* Recognize the conventional one-pixel GIF/PNG sentinels by their encoded
+       dimensions. A byte-size threshold also catches small authored icons,
+       which must remain the image source even when data-* metadata is present. */
+    static const char gif_1x1[] =
+        "data:image/gif;base64,R0lGODlhAQABA";
+    static const char png_1x1[] =
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB";
+    return (length >= sizeof(gif_1x1) - 1u
+            && strncasecmp(source, gif_1x1, 22u) == 0
+            && memcmp(source + 22u, gif_1x1 + 22u,
+                      sizeof(gif_1x1) - 1u - 22u) == 0)
+        || (length >= sizeof(png_1x1) - 1u
+            && strncasecmp(source, png_1x1, 22u) == 0
+            && memcmp(source + 22u, png_1x1 + 22u,
+                      sizeof(png_1x1) - 1u - 22u) == 0);
+}
+
+static bool image_lazy_source_is_url(const char *source, size_t length)
+{
+    if (source == NULL || length == 0) return false;
+    while (length != 0 && isspace((unsigned char) *source)) {
+        source++;
+        length--;
+    }
+    while (length != 0
+           && isspace((unsigned char) source[length - 1u])) length--;
+    if (length == 0 || source[0] == '#') return false;
+    static const char *const rejected[] = {
+        "data:", "javascript:", "vbscript:", "about:"
+    };
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        size_t prefix = strlen(rejected[i]);
+        if (length >= prefix
+            && strncasecmp(source, rejected[i], prefix) == 0) return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        unsigned char byte = (unsigned char) source[i];
+        if (byte < 0x20u || byte == 0x7fu || byte == '<' || byte == '>')
+            return false;
+    }
+    return true;
+}
+
+static const char *image_lazy_source(lxb_dom_node_t *node, size_t *length)
+{
+    static const char *const names[] = {
+        "data-src", "data-original", "data-thumb", "data-lazy-src"
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        size_t candidate_length = 0;
+        const char *candidate = document_attribute(
+            node, names[i], &candidate_length);
+        while (candidate_length != 0
+               && isspace((unsigned char) *candidate)) {
+            candidate++;
+            candidate_length--;
+        }
+        while (candidate_length != 0
+               && isspace((unsigned char) candidate[candidate_length - 1u]))
+            candidate_length--;
+        if (image_lazy_source_is_url(candidate, candidate_length)) {
+            *length = candidate_length;
+            return candidate;
+        }
+    }
+    return NULL;
+}
+
 static const char *image_select_source_for_width(
     const Stylesheet *stylesheet, lxb_dom_node_t *node, int layout_width,
     size_t *length)
@@ -2098,13 +2211,18 @@ static const char *image_select_source_for_width(
     }
     size_t source_length = 0;
     const char *source = document_attribute(node, "src", &source_length);
-    if (source == NULL || source_length == 0) {
-        source = document_attribute(node, "data-src", &source_length);
-    }
     const char *selected = select_srcset(
         srcset, srcset == NULL ? 0 : srcset_length,
         image_source_size(stylesheet, node, node, layout_width),
         source, source_length, length);
+    if (selected != NULL
+        && !image_source_is_placeholder(selected, *length)) return selected;
+    size_t lazy_length = 0;
+    const char *lazy = image_lazy_source(node, &lazy_length);
+    if (lazy != NULL) {
+        *length = lazy_length;
+        return lazy;
+    }
     if (selected != NULL) return selected;
     *length = source_length;
     return source;
@@ -2285,6 +2403,118 @@ static bool image_layout_decode_target(
     *target_width = width;
     *target_height = height;
     return true;
+}
+
+typedef enum {
+    IMAGE_DECODED_CACHE_MISS = 0,
+    IMAGE_DECODED_CACHE_USED,
+    IMAGE_DECODED_CACHE_FAILED
+} ImageDecodedCacheResult;
+
+static ImageDecodedCacheResult image_adopt_decoded_cache(
+    ImageLoadContext *context, PendingImageFetch *pending,
+    const BrowserCacheEntry *cached,
+    const TilefinchRequestContext *request_context)
+{
+    if (context == NULL || pending == NULL || cached == NULL
+        || request_context == NULL || context->session == NULL
+        || pending->url == NULL || pending->target_count == 0
+        || cached->decoded_image_source_width <= 0
+        || cached->decoded_image_source_height <= 0) {
+        return IMAGE_DECODED_CACHE_MISS;
+    }
+    int target_width = 0, target_height = 0;
+    if (!image_layout_decode_target(
+            pending, cached->decoded_image_source_width,
+            cached->decoded_image_source_height,
+            &target_width, &target_height)
+        || target_width != cached->decoded_image_width
+        || target_height != cached->decoded_image_height) {
+        return IMAGE_DECODED_CACHE_MISS;
+    }
+    BrowserDecodedImage decoded = {0};
+    if (!browser_session_decoded_image_acquire(
+            context->session, pending->url, request_context,
+            cached->data, cached->length, &decoded)) {
+        return IMAGE_DECODED_CACHE_MISS;
+    }
+    if (decoded.width != target_width || decoded.height != target_height
+        || decoded.source_width != cached->decoded_image_source_width
+        || decoded.source_height != cached->decoded_image_source_height
+        || decoded.pixels == NULL
+        || context->images->stats.decoded_bytes
+               > context->maximum_decoded_bytes
+        || decoded.pixels->length
+               > context->maximum_decoded_bytes
+                    - context->images->stats.decoded_bytes) {
+        browser_shared_body_release(decoded.pixels);
+        return IMAGE_DECODED_CACHE_MISS;
+    }
+    PendingImageTarget primary = pending->targets[0];
+    ImageResource resource = {
+        .node = primary.node,
+        .url_hash = pending->url_hash,
+        .source_hash = primary.source_hash,
+        .pixels = decoded.pixels->data,
+        .pixel_body = decoded.pixels,
+        .source_width = decoded.source_width,
+        .source_height = decoded.source_height,
+        .width = decoded.width,
+        .height = decoded.height,
+        .is_mask = primary.is_mask,
+        .is_background = primary.is_background,
+        .pseudo = primary.pseudo,
+        .owns_pixels = true
+    };
+    size_t before = context->images->count;
+    if (!image_add(context->images, resource)
+        || context->images->count == before) {
+        image_resource_release_owned_pixels(context->budget, &resource);
+        return IMAGE_DECODED_CACHE_FAILED;
+    }
+    context->images->stats.loaded++;
+    context->images->stats.cache_hits++;
+    context->images->stats.decoded_cache_hits++;
+    context->images->stats.encoded_bytes += cached->length;
+    context->images->stats.decoded_bytes += decoded.pixels->length;
+    if (primary.is_mask) context->images->stats.masks_loaded++;
+    if (primary.is_background) context->images->stats.backgrounds_loaded++;
+    if (decoded.width != decoded.source_width
+        || decoded.height != decoded.source_height) {
+        context->images->stats.downsampled++;
+    }
+    size_t source_bytes = 0;
+    if ((size_t) decoded.source_width
+            <= SIZE_MAX / (size_t) decoded.source_height
+        && (size_t) decoded.source_width * (size_t) decoded.source_height
+               <= SIZE_MAX / 4u) {
+        source_bytes = (size_t) decoded.source_width
+                       * (size_t) decoded.source_height * 4u;
+    }
+    if (source_bytes
+            > context->images->stats.largest_source_decode_bytes) {
+        context->images->stats.largest_source_decode_bytes = source_bytes;
+    }
+    if (decoded.pixels->length
+            > context->images->stats.largest_target_decode_bytes) {
+        context->images->stats.largest_target_decode_bytes =
+            decoded.pixels->length;
+    }
+    for (size_t i = 1; i < pending->target_count; i++) {
+        PendingImageTarget target = pending->targets[i];
+        ImageResource alias = resource;
+        alias.node = target.node;
+        alias.source_hash = target.source_hash;
+        alias.is_mask = target.is_mask;
+        alias.is_background = target.is_background;
+        alias.pseudo = target.pseudo;
+        alias.owns_pixels = false;
+        context->images->stats.duplicate++;
+        if (!image_add(context->images, alias)) {
+            return IMAGE_DECODED_CACHE_FAILED;
+        }
+    }
+    return IMAGE_DECODED_CACHE_USED;
 }
 
 static PendingImageFetch *pending_find_hash(ImageLoadContext *context,
@@ -2543,6 +2773,18 @@ static bool finish_image_fetch(ImageLoadContext *context,
             if (decode_status == IMAGE_DECODE_SUCCEEDED) {
                 resource.pixels = decoded_pixels;
                 resource.owns_pixels = true;
+                BrowserSharedBody *pixel_body = browser_shared_body_take(
+                    context->budget, decoded_pixels, decoded);
+                if (pixel_body != NULL) {
+                    resource.pixel_body = pixel_body;
+                    if (context->session != NULL && pending->url != NULL) {
+                        (void) browser_session_decoded_image_put(
+                            context->session, pending->url,
+                            &request_context, resource.encoded,
+                            resource.encoded_length, pixel_body,
+                            source_width, source_height, width, height);
+                    }
+                }
                 if (resource.encoded_body != NULL) {
                     browser_shared_body_release(resource.encoded_body);
                 } else {
@@ -2572,7 +2814,7 @@ static bool finish_image_fetch(ImageLoadContext *context,
         }
     }
     if (!image_add(images, resource)) {
-        budget_free(context->budget, pixels);
+        image_resource_release_owned_pixels(context->budget, &resource);
         if (resource.encoded_body != NULL) {
             browser_shared_body_release(resource.encoded_body);
         } else {
@@ -2826,6 +3068,7 @@ static bool load_image_node_with_provenance_impl(
                 .url_hash = hash,
                 .source_hash = source_hash,
                 .pixels = duplicate->pixels,
+                .pixel_body = duplicate->pixel_body,
                 .encoded = duplicate->encoded,
                 .encoded_body = duplicate->encoded_body,
                 .encoded_length = duplicate->encoded_length,
@@ -2933,6 +3176,7 @@ static bool load_image_node_with_provenance_impl(
         ImageResource alias = {.node = node, .url_hash = hash,
                                .source_hash = source_hash,
                                .pixels = duplicate->pixels,
+                               .pixel_body = duplicate->pixel_body,
                                .encoded = duplicate->encoded,
                                .encoded_body = duplicate->encoded_body,
                                .encoded_length = duplicate->encoded_length,
@@ -3055,6 +3299,14 @@ static bool load_image_node_with_provenance_impl(
             image_profile_now_us() - cache_started;
     }
     if (cache_usable && cached->length <= maximum) {
+        ImageDecodedCacheResult decoded_cache = image_adopt_decoded_cache(
+            context, pending, cached, &request_context);
+        if (decoded_cache != IMAGE_DECODED_CACHE_MISS) {
+            budget_free(context->budget, pending->targets);
+            budget_free(context->budget, pending->url);
+            memset(pending, 0, sizeof(*pending));
+            return decoded_cache == IMAGE_DECODED_CACHE_USED;
+        }
         pending->from_resource_cache = true;
         pending->resource_grant_valid = cached->resource_grant_valid;
         pending->resource_grant = cached->resource_grant;
@@ -3607,7 +3859,7 @@ static void images_rollback_optional_suffix(
         || retained_count > images->count) return;
     for (size_t i = retained_count; i < images->count; i++) {
         ImageResource *item = &images->items[i];
-        if (item->owns_pixels) budget_free(images->budget, item->pixels);
+        image_resource_release_owned_pixels(images->budget, item);
         if (item->owns_encoded) {
             if (item->encoded_body != NULL) {
                 browser_shared_body_release(item->encoded_body);
@@ -4036,7 +4288,7 @@ bool images_refresh_external_nodes(
     for (size_t i = 0; i < images->count; i++) {
         ImageResource item = images->items[i];
         if (image_node_in_refresh_set(item.node, nodes, node_count)) {
-            if (item.owns_pixels) budget_free(budget, item.pixels);
+            image_resource_release_owned_pixels(budget, &item);
             if (item.owns_encoded) {
                 if (item.encoded_body != NULL) {
                     browser_shared_body_release(item.encoded_body);
@@ -4082,6 +4334,162 @@ bool images_load_external_priority_targets(
         NULL, NULL, 0);
     if (loaded && images != NULL) images->priority_staged = true;
     return loaded;
+}
+
+static ImagePriorityLoadStatus image_priority_load_fail(
+    ImagePriorityLoadJob *job)
+{
+    if (job == NULL) return IMAGE_PRIORITY_LOAD_FAILED;
+    cancel_pending(&job->context);
+    if (!job->rolled_back) {
+        images_rollback_optional_suffix(
+            job->context.images, job->retained_count,
+            &job->retained_stats, job->retained_priority_staged);
+        job->rolled_back = true;
+    }
+    job->terminal = true;
+    job->failed = true;
+    return IMAGE_PRIORITY_LOAD_FAILED;
+}
+
+ImagePriorityLoadJob *images_priority_load_begin(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, const ImagePriorityTarget *target,
+    Budget *budget, const char *base_url, const char *document_url,
+    const char *referrer_policy, size_t maximum_count,
+    size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session)
+{
+    if (document == NULL || document->html == NULL || stylesheet == NULL
+        || images == NULL || target == NULL || target->node == NULL
+        || target->kind != IMAGE_PRIORITY_KIND_DOCUMENT
+        || budget == NULL || base_url == NULL || document_url == NULL
+        || maximum_count == 0 || maximum_total_encoded_bytes == 0
+        || maximum_single_encoded_bytes == 0 || maximum_decoded_bytes == 0
+        || timeout_ms <= 0 || scheduler == NULL || decode_budget != NULL) {
+        return NULL;
+    }
+    if (maximum_count > MAX_TRACKED_IMAGE_NODES) {
+        maximum_count = MAX_TRACKED_IMAGE_NODES;
+    }
+    if (images->budget == NULL) {
+        memset(images, 0, sizeof(*images));
+        images->budget = budget;
+    } else if (images->budget != budget) {
+        return NULL;
+    }
+    ImagePriorityLoadJob *job = budget_calloc(budget, 1, sizeof(*job));
+    if (job == NULL) return NULL;
+    job->target = *target;
+    job->retained_count = images->count;
+    job->retained_stats = images->stats;
+    job->retained_priority_staged = images->priority_staged;
+    job->started_ms = image_now_ms();
+    job->context = (ImageLoadContext) {
+        .document = document,
+        .images = images,
+        .stylesheet = stylesheet,
+        .budget = budget,
+        .base_url = base_url,
+        .document_url = document_url,
+        .referrer_policy = referrer_policy,
+        .maximum_count = maximum_count,
+        .maximum_total_encoded_bytes = maximum_total_encoded_bytes,
+        .maximum_single_encoded_bytes = maximum_single_encoded_bytes,
+        .maximum_decoded_bytes = maximum_decoded_bytes,
+        .timeout_ms = timeout_ms,
+        .scheduler = scheduler,
+        .session = session,
+        .viewport_width = stylesheet->viewport_width,
+        .priority_targets = &job->target,
+        .priority_target_count = 1,
+        .deadline_ms = 0.0,
+        .slice_started_us = tilefinch_platform_monotonic_time_us(),
+        .eager_decode_rasters = true,
+        .externally_pumped = true
+    };
+    return job;
+}
+
+ImagePriorityLoadStatus images_priority_load_pump(
+    ImagePriorityLoadJob *job)
+{
+    if (job == NULL || job->failed) return IMAGE_PRIORITY_LOAD_FAILED;
+    if (job->terminal) return IMAGE_PRIORITY_LOAD_COMPLETE;
+    ImageLoadContext *context = &job->context;
+    if (!job->admitted) {
+        if (fetch_scheduler_enqueue_would_block(
+                context->scheduler,
+                context->maximum_single_encoded_bytes)) {
+            if (image_now_ms() - job->started_ms
+                >= (double) context->timeout_ms) {
+                return image_priority_load_fail(job);
+            }
+            image_finish_slice(context);
+            return IMAGE_PRIORITY_LOAD_PENDING;
+        }
+        job->admitted = true;
+        job->started_ms = image_now_ms();
+        context->deadline_ms =
+            job->started_ms + (double) context->timeout_ms;
+        if (!image_work(context, 1, false, "deferred-image-admission")
+            || !image_process_priority_target(context, &job->target)) {
+            return image_priority_load_fail(job);
+        }
+        if (context->pending_count == 0) {
+            image_finish_slice(context);
+            context->images->priority_staged = true;
+            job->terminal = true;
+            return IMAGE_PRIORITY_LOAD_COMPLETE;
+        }
+        /* Admission is one idle unit. Even an immediately available replay
+           or cache-backed transport result is consumed on the next call. */
+        image_finish_slice(context);
+        return IMAGE_PRIORITY_LOAD_PENDING;
+    }
+
+    cancel_expired_pending(context);
+    const FetchPumpQuota quota = {
+        .maximum_body_callbacks = IMAGE_FETCH_PUMP_CALLBACKS,
+        .maximum_body_bytes = IMAGE_FETCH_PUMP_BYTES,
+        .maximum_time_us = IMAGE_FETCH_PUMP_TIME_US
+    };
+    size_t completed = fetch_scheduler_pump_bounded(
+        context->scheduler, IMAGE_FETCH_PUMP_COMPLETIONS, 0,
+        &quota, NULL);
+    image_note_pending_progress(context);
+    image_cancel_no_progress_pending(context);
+    if (completed == 0) {
+        image_finish_slice(context);
+        return IMAGE_PRIORITY_LOAD_PENDING;
+    }
+    if (!finish_one_pending(context, false)) {
+        return image_priority_load_fail(job);
+    }
+    if (context->pending_count != 0) {
+        image_finish_slice(context);
+        return IMAGE_PRIORITY_LOAD_PENDING;
+    }
+    context->images->stats.deadline_cancelled =
+        context->deadline_cancelled ? 1u : 0u;
+    context->images->stats.deadline_exceeded =
+        image_now_ms() >= context->deadline_ms;
+    double elapsed = image_now_ms() - job->started_ms;
+    if (elapsed > 0.0) {
+        context->images->stats.elapsed_ms += (uint64_t) elapsed;
+    }
+    context->images->priority_staged = true;
+    job->terminal = true;
+    return IMAGE_PRIORITY_LOAD_COMPLETE;
+}
+
+void images_priority_load_destroy(ImagePriorityLoadJob *job)
+{
+    if (job == NULL) return;
+    if (!job->terminal) (void) image_priority_load_fail(job);
+    budget_free(job->context.budget, job->context.request_scratch);
+    budget_free(job->context.budget, job);
 }
 
 bool image_resource_available(const ImageResource *image)
@@ -4300,9 +4708,8 @@ void images_destroy(ImageResources *images)
     if (images == NULL) return;
     if (images->budget != NULL) {
         for (size_t i = 0; i < images->count; i++) {
-            if (images->items[i].owns_pixels) {
-                budget_free(images->budget, images->items[i].pixels);
-            }
+            image_resource_release_owned_pixels(
+                images->budget, &images->items[i]);
             if (images->items[i].owns_encoded) {
                 if (images->items[i].encoded_body != NULL) {
                     browser_shared_body_release(

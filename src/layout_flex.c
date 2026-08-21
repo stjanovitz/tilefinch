@@ -584,7 +584,7 @@ static int intrinsic_text_width_impl(LayoutContext *context,
         int minimum_width = 0;
         bool pair_intrinsics = context->intrinsic_pair_mode;
         bool break_for_minimum = pair_intrinsics
-            && (parent->word_break_mode == WORD_BREAK_ALL
+            && (computed_style_word_break(parent) == WORD_BREAK_ALL
                 || computed_style_overflow_wrap(parent)
                        == OVERFLOW_WRAP_ANYWHERE);
         int limit_fixed = limit > INT_MAX / 64 ? INT_MAX
@@ -605,7 +605,9 @@ static int intrinsic_text_width_impl(LayoutContext *context,
                     bool discard = false;
                     size_t segment_length = utf8_line_segment_length(
                         text + segment_at, end - segment_at,
-                        parent->word_break_mode == WORD_BREAK_KEEP_ALL,
+                        computed_style_word_break(parent)
+                            == WORD_BREAK_KEEP_ALL,
+                        computed_style_hyphens_none(parent),
                         &discard);
                     if (segment_length == 0) break;
                     int segment_width = discard ? 0 : measured_text_width(
@@ -1005,7 +1007,8 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
             context->web_fonts, parent->font_family, face);
         bool synthetic_bold = style_uses_synthetic_weight(
             context->fonts, context->web_fonts, parent, face);
-        bool break_for_minimum = parent->word_break_mode == WORD_BREAK_ALL
+        bool break_for_minimum = computed_style_word_break(parent)
+                                     == WORD_BREAK_ALL
             || computed_style_overflow_wrap(parent)
                    == OVERFLOW_WRAP_ANYWHERE;
         int widest = 0;
@@ -1019,7 +1022,9 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
                 bool discard = false;
                 size_t segment_length = utf8_line_segment_length(
                     text + segment_at, end - segment_at,
-                    parent->word_break_mode == WORD_BREAK_KEEP_ALL,
+                    computed_style_word_break(parent)
+                        == WORD_BREAK_KEEP_ALL,
+                    computed_style_hyphens_none(parent),
                     &discard);
                 if (segment_length == 0) break;
                 int segment_width = discard ? 0 : measured_text_width(

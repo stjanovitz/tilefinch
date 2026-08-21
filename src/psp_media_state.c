@@ -127,13 +127,15 @@ static void psp_media_open_phase_complete(
     switch (decision->next.opening_phase) {
     case PSP_MEDIA_OPEN_RESOLVING:
         decision->next.has_separate_audio = event->has_separate_audio;
+        decision->next.audio_only = event->audio_only;
         /* Modules are prepared before range and demux allocations so their
            contiguous-memory admission is independent of page allocation
            order on a real PSP. */
         decision->next.opening_phase = PSP_MEDIA_OPEN_DECODER_PREPARE;
         break;
     case PSP_MEDIA_OPEN_DECODER_PREPARE:
-        decision->next.opening_phase = PSP_MEDIA_OPEN_VIDEO_RANGE;
+        decision->next.opening_phase = decision->next.audio_only
+            ? PSP_MEDIA_OPEN_AUDIO_RANGE : PSP_MEDIA_OPEN_VIDEO_RANGE;
         break;
     case PSP_MEDIA_OPEN_VIDEO_RANGE:
         decision->next.opening_phase = PSP_MEDIA_OPEN_VIDEO_DEMUX;
@@ -149,6 +151,7 @@ static void psp_media_open_phase_complete(
         break;
     case PSP_MEDIA_OPEN_AUDIO_RANGE:
         decision->next.opening_phase = PSP_MEDIA_OPEN_AUDIO_DEMUX;
+        decision->next.pipeline = PSP_MEDIA_PIPELINE_PARTIAL;
         break;
     case PSP_MEDIA_OPEN_AUDIO_DEMUX:
         decision->next.opening_phase = PSP_MEDIA_OPEN_PLAYBACK_CREATE;
@@ -172,6 +175,7 @@ static void psp_media_transition_idle(
     case PSP_MEDIA_EVENT_OPEN:
         decision->next.has_plan = true;
         decision->next.has_separate_audio = event->has_separate_audio;
+        decision->next.audio_only = event->audio_only;
         decision->next.resume_target = event->autoplay
             ? PSP_MEDIA_RESUME_PLAYING : PSP_MEDIA_RESUME_PAUSED;
         if (decision->next.backend_health
@@ -208,6 +212,7 @@ static void psp_media_transition_opening(
     case PSP_MEDIA_EVENT_OPEN:
         decision->next.has_plan = true;
         decision->next.has_separate_audio = event->has_separate_audio;
+        decision->next.audio_only = event->audio_only;
         decision->next.resume_target = event->autoplay
             ? PSP_MEDIA_RESUME_PLAYING : PSP_MEDIA_RESUME_PAUSED;
         psp_media_enter_opening(decision);
@@ -564,6 +569,7 @@ static void psp_media_finish_quiescing(PspMediaDecision *decision)
         decision->next.state = PSP_MEDIA_SESSION_IDLE;
         decision->next.has_plan = false;
         decision->next.has_separate_audio = false;
+        decision->next.audio_only = false;
         decision->next.failure = PSP_MEDIA_FAILURE_NONE;
         decision->next.pause_after_frame = false;
         decision->next.preview_active = false;
@@ -595,6 +601,7 @@ static void psp_media_transition_dormant(
     switch (event->type) {
     case PSP_MEDIA_EVENT_OPEN:
         decision->next.has_separate_audio = event->has_separate_audio;
+        decision->next.audio_only = event->audio_only;
         decision->next.resume_target = event->autoplay
             ? PSP_MEDIA_RESUME_PLAYING : PSP_MEDIA_RESUME_PAUSED;
         if (event->reuse_pipeline) {
@@ -709,6 +716,7 @@ static void psp_media_transition_suspended(
         decision->next.state = PSP_MEDIA_SESSION_IDLE;
         decision->next.has_plan = false;
         decision->next.has_separate_audio = false;
+        decision->next.audio_only = false;
         break;
     case PSP_MEDIA_EVENT_SUSPEND:
         decision->deliberate_noop = true;
@@ -735,6 +743,7 @@ static void psp_media_transition_failed(
         decision->next.state = PSP_MEDIA_SESSION_IDLE;
         decision->next.has_plan = false;
         decision->next.has_separate_audio = false;
+        decision->next.audio_only = false;
         decision->next.failure = PSP_MEDIA_FAILURE_NONE;
         decision->next.pause_after_frame = false;
         decision->next.preview_active = false;

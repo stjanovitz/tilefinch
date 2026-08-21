@@ -181,6 +181,16 @@ def command_manifest(args: argparse.Namespace) -> None:
     asset = safe_name(args.asset, 95)
     notes = Path(args.notes).read_bytes() if args.notes else b""
     notes.decode("utf-8")
+    if not args.component and not args.glyph_component:
+        if args.decoder_abi is None or not (1 <= args.decoder_abi <= 65535):
+            raise ValueError("browser manifests require --decoder-abi 1..65535")
+        notes = (
+            f"Decoder ABI {args.decoder_abi}; rebuild if different. ".encode(
+                "ascii"
+            ) + notes
+        )
+    elif args.decoder_abi is not None:
+        raise ValueError("component manifests do not carry a decoder ABI")
     if len(notes) > 512 or any(byte < 0x20 or byte == 0x7F for byte in notes):
         raise ValueError("notes must be at most 512 inert UTF-8 bytes")
     output = bytearray()
@@ -301,6 +311,7 @@ def parser() -> argparse.ArgumentParser:
     manifest.add_argument("--tag", required=True)
     manifest.add_argument("--asset", required=True)
     manifest.add_argument("--notes")
+    manifest.add_argument("--decoder-abi", type=int)
     manifest.add_argument("--output", required=True)
     manifest_kind = manifest.add_mutually_exclusive_group()
     manifest_kind.add_argument("--component", action="store_true")

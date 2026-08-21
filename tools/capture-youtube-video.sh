@@ -40,7 +40,7 @@ run_ytdlp()
 }
 
 run_ytdlp --no-playlist \
-  --extractor-args 'youtube:player_client=android_vr,web_safari' \
+  --extractor-args 'youtube:player_client=visionos,web_safari' \
   --format 'best[ext=mp4][vcodec^=avc1][acodec^=mp4a][height<=360]' \
   --write-info-json \
   --output "$output" \

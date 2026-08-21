@@ -69,6 +69,22 @@ struct StylePaintStack {
     StyleBoxShadow box_shadows[STYLE_BOX_SHADOW_LIMIT];
 };
 
+/* Rare compositing state shares the optional paint stack instead of growing
+   every ComputedStyle.  The backdrop radius is deliberately capped at three
+   pixels: it is a compatibility effect for small fixed/sticky chrome, not an
+   unbounded full-page post-processing pass. */
+#define STYLE_PAINT_MIX_BLEND_MASK UINT8_C(0x03)
+#define STYLE_PAINT_BACKDROP_BLUR_SHIFT 2
+#define STYLE_PAINT_BACKDROP_BLUR_MASK UINT8_C(0x0c)
+#define STYLE_PAINT_FILTER_LOW_AMOUNT UINT8_C(0x10)
+
+enum {
+    STYLE_MIX_BLEND_NORMAL,
+    STYLE_MIX_BLEND_MULTIPLY,
+    STYLE_MIX_BLEND_SCREEN,
+    STYLE_MIX_BLEND_DARKEN
+};
+
 struct StylePaintStorage {
     /* Layout can retain a resolved stack pointer while lazy pseudo-style
        resolution interns more paint. Small fixed blocks keep those addresses

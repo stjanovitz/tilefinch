@@ -40,7 +40,13 @@ TilefinchUpdateStatus tilefinch_update_state_encode(
         || state->pending_slot > TILEFINCH_UPDATE_SLOT_B
         || state->trial > TILEFINCH_UPDATE_TRIAL_STARTED
         || ((state->pending_slot == TILEFINCH_UPDATE_SLOT_NONE)
-            != (state->trial == TILEFINCH_UPDATE_TRIAL_NONE))) {
+            != (state->trial == TILEFINCH_UPDATE_TRIAL_NONE))
+        || (state->candidate_downgrade
+            && (state->pending_slot == TILEFINCH_UPDATE_SLOT_NONE
+                || state->candidate_sequence
+                       == TILEFINCH_UPDATE_DEVELOPER_SEQUENCE
+                || state->candidate_sequence
+                       >= state->installed_sequence))) {
         return TILEFINCH_UPDATE_INVALID_ARGUMENT;
     }
     memset(output, 0, TILEFINCH_UPDATE_STATE_BYTES);
@@ -50,7 +56,8 @@ TilefinchUpdateStatus tilefinch_update_state_encode(
     output[18] = (uint8_t) state->active_slot;
     output[19] = (uint8_t) state->previous_slot;
     output[20] = (uint8_t) state->pending_slot;
-    output[21] = (uint8_t) state->trial;
+    output[21] = (uint8_t) state->trial
+        | (state->candidate_downgrade ? 0x80u : 0u);
     state_put_u64(output + 22, state->installed_sequence);
     memcpy(output + 30, state->installed_sha256, 32);
     state_put_u64(output + 62, state->previous_sequence);
@@ -76,6 +83,8 @@ TilefinchUpdateStatus tilefinch_update_state_decode(
         return TILEFINCH_UPDATE_BAD_MAGIC;
     if (((uint16_t) bytes[8] << 8 | bytes[9]) != 1)
         return TILEFINCH_UPDATE_UNSUPPORTED_SCHEMA;
+    if ((bytes[21] & 0x7cu) != 0)
+        return TILEFINCH_UPDATE_BAD_STRING;
     uint8_t digest[32];
     if (!tilefinch_sha256_digest(bytes, 142, digest)
         || memcmp(digest, bytes + 142, 32) != 0)
@@ -85,10 +94,11 @@ TilefinchUpdateStatus tilefinch_update_state_decode(
         .active_slot = (TilefinchUpdateSlot) bytes[18],
         .previous_slot = (TilefinchUpdateSlot) bytes[19],
         .pending_slot = (TilefinchUpdateSlot) bytes[20],
-        .trial = (TilefinchUpdateTrialState) bytes[21],
+        .trial = (TilefinchUpdateTrialState) (bytes[21] & 0x7fu),
         .installed_sequence = state_u64(bytes + 22),
         .previous_sequence = state_u64(bytes + 62),
-        .candidate_sequence = state_u64(bytes + 102)
+        .candidate_sequence = state_u64(bytes + 102),
+        .candidate_downgrade = (bytes[21] & 0x80u) != 0
     };
     memcpy(parsed.installed_sha256, bytes + 30, 32);
     memcpy(parsed.previous_sha256, bytes + 70, 32);
@@ -99,7 +109,13 @@ TilefinchUpdateStatus tilefinch_update_state_decode(
         || parsed.pending_slot > TILEFINCH_UPDATE_SLOT_B
         || parsed.trial > TILEFINCH_UPDATE_TRIAL_STARTED
         || ((parsed.pending_slot == TILEFINCH_UPDATE_SLOT_NONE)
-            != (parsed.trial == TILEFINCH_UPDATE_TRIAL_NONE))) {
+            != (parsed.trial == TILEFINCH_UPDATE_TRIAL_NONE))
+        || (parsed.candidate_downgrade
+            && (parsed.pending_slot == TILEFINCH_UPDATE_SLOT_NONE
+                || parsed.candidate_sequence
+                       == TILEFINCH_UPDATE_DEVELOPER_SEQUENCE
+                || parsed.candidate_sequence
+                       >= parsed.installed_sequence))) {
         return TILEFINCH_UPDATE_BAD_STRING;
     }
     *state = parsed;
@@ -160,6 +176,12 @@ bool tilefinch_update_state_start_trial(TilefinchUpdateState *state)
         || state->generation == UINT64_MAX) return false;
     state->generation++;
     state->trial = TILEFINCH_UPDATE_TRIAL_STARTED;
+    /* The current launcher has already verified and consumed the explicit
+       downgrade authorization. Clear its encoding before the historical
+       browser starts: older schema-1 readers treat bit 7 of the trial byte
+       as part of the enum and would otherwise reject both journal copies,
+       preventing the trial from ever confirming healthy. */
+    state->candidate_downgrade = false;
     return true;
 }
 
@@ -170,6 +192,13 @@ bool tilefinch_update_state_retry_trial(TilefinchUpdateState *state)
         || state->generation == UINT64_MAX) return false;
     state->generation++;
     state->trial = TILEFINCH_UPDATE_TRIAL_PENDING;
+    /* START_TRIAL clears the compatibility-breaking journal marker before
+       entering historical code. A user-requested retry returns to the
+       current launcher, which can reconstruct the authorization from the
+       pinned candidate/floor pair before verifying that slot again. */
+    state->candidate_downgrade =
+        state->candidate_sequence != TILEFINCH_UPDATE_DEVELOPER_SEQUENCE
+        && state->candidate_sequence < state->installed_sequence;
     return true;
 }
 
@@ -182,6 +211,7 @@ bool tilefinch_update_state_discard_trial(TilefinchUpdateState *state)
     state->trial = TILEFINCH_UPDATE_TRIAL_NONE;
     state->candidate_sequence = 0;
     memset(state->candidate_sha256, 0, 32);
+    state->candidate_downgrade = false;
     return true;
 }
 
@@ -209,6 +239,7 @@ bool tilefinch_update_state_confirm_healthy(TilefinchUpdateState *state)
     state->trial = TILEFINCH_UPDATE_TRIAL_NONE;
     state->candidate_sequence = 0;
     memset(state->candidate_sha256, 0, 32);
+    state->candidate_downgrade = false;
     return true;
 }
 

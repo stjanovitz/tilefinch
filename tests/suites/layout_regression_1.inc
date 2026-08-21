@@ -193,6 +193,8 @@
     CHECK(test_retained_paint_stack_addresses_are_stable(&budget) == 0);
     CHECK(test_bounded_shared_paint_stack(&budget) == 0);
     CHECK(test_compact_visual_css_extensions(&budget) == 0);
+    CHECK(test_bounded_typography_and_compositing(&budget) == 0);
+    CHECK(test_backdrop_filter_aggregate_budget(&budget) == 0);
 
     puts("test: unresolved CSS masks stay transparent without layout shifts");
     CHECK(test_unresolved_mask_keeps_transparent_geometry(&budget) == 0);

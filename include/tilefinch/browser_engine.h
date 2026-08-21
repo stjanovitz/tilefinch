@@ -13,6 +13,7 @@
 #include "tilefinch/font.h"
 #include "tilefinch/navigation.h"
 #include "tilefinch/render.h"
+#include "tilefinch/reader_mode.h"
 #include "tilefinch/session.h"
 
 #define BROWSER_ENGINE_PROFILE_NAME_LIMIT 32
@@ -396,6 +397,14 @@ bool browser_engine_insert_text(BrowserEngine *engine, const char *utf8,
 bool browser_engine_backspace(BrowserEngine *engine);
 bool browser_engine_activate(BrowserEngine *engine,
                              ControllerAction *action);
+/* Page media is consumed by a platform player rather than by navigation.
+   The facade keeps DOM/CSP ownership on the engine side and exposes only an
+   already-resolved, bounded request plus state feedback. */
+bool browser_engine_consume_media_request(
+    BrowserEngine *engine, ScriptMediaRequest *request);
+bool browser_engine_update_media_state(
+    BrowserEngine *engine, int64_t node_handle, ScriptMediaState state,
+    double current_time, double duration);
 /*
  * Advances page callbacks and commits any resulting layout. The optional
  * output reports whether the committed display list has visible damage, not
@@ -442,6 +451,9 @@ bool browser_engine_optional_glyphs_updated(BrowserEngine *engine);
 /* Repaint after one deferred block read without evicting glyphs that are
    already independent of the provider's small block cache. */
 bool browser_engine_optional_glyph_payloads_ready(BrowserEngine *engine);
+/* Visible Unicode-script hints gathered without a second DOM walk. The
+   frontend may use these to attach installed optional glyph packs lazily. */
+uint8_t browser_engine_glyph_script_mask(const BrowserEngine *engine);
 /* Choose the generated YouTube search-result density. This is an engine
    preference, not a query parameter exposed by the provider page. */
 bool browser_engine_set_youtube_compact_results(
@@ -534,6 +546,12 @@ bool browser_engine_set_user_css(
     BrowserEngine *engine, const char *css, size_t length);
 bool browser_engine_apply_user_css(
     BrowserEngine *engine, const char *css, size_t length);
+bool browser_engine_prepare_reader(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis);
+void browser_engine_set_reader_candidate_mode(BrowserEngine *engine,
+                                              bool enabled);
+bool browser_engine_reader_analysis(
+    const BrowserEngine *engine, ReaderDocumentAnalysis *analysis);
 
 /*
  * Read-only transitional views. They expire at the next engine mutation and

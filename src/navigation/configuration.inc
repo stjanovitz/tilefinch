@@ -372,6 +372,12 @@ bool navigation_set_user_css(NavigationSession *session, const char *css,
     return true;
 }
 
+void navigation_set_reader_candidate_mode(NavigationSession *session,
+                                          bool enabled)
+{
+    if (session != NULL) session->prepare_reader_candidates = enabled;
+}
+
 void navigation_enable_frame_capability_trace(NavigationSession *session,
                                               bool enabled)
 {

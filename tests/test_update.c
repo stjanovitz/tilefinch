@@ -1,4 +1,5 @@
 #include "tilefinch/update.h"
+#include "tilefinch/update_history.h"
 
 #include <openssl/bn.h>
 #include <openssl/ec.h>
@@ -148,7 +149,8 @@ static void build_manifest_for_package(
     static const char version[] = "0.4.1";
     static const char tag[] = "v0.4.1";
     static const char asset[] = "tilefinch-psp.tfup";
-    static const char notes[] = "Safer, faster updates.";
+    static const char notes[] =
+        "Decoder ABI 3; rebuild if different. Safer, faster updates.";
     append_u8(manifest, sizeof(version) - 1u);
     append(manifest, version, sizeof(version) - 1u);
     append_u8(manifest, sizeof(tag) - 1u);
@@ -284,7 +286,19 @@ static int test_envelope(void)
               envelope.bytes, envelope.length, &options, &verified)
           == TILEFINCH_UPDATE_OK
           && verified.manifest.release_sequence == 43
-          && strcmp(verified.manifest.version, "0.4.1") == 0);
+          && strcmp(verified.manifest.version, "0.4.1") == 0
+          && verified.manifest.optional_decoder_abi_valid
+          && verified.manifest.optional_decoder_abi == 3u
+          && strcmp(verified.manifest.notes, "Safer, faster updates.") == 0);
+    options.expected_tag = "v0.4.0";
+    CHECK(tilefinch_update_verify_envelope(
+              envelope.bytes, envelope.length, &options, &verified)
+          == TILEFINCH_UPDATE_BAD_STRING);
+    options.expected_tag = "v0.4.1";
+    CHECK(tilefinch_update_verify_envelope(
+              envelope.bytes, envelope.length, &options, &verified)
+          == TILEFINCH_UPDATE_OK);
+    options.expected_tag = NULL;
     Bytes voice_manifest = manifest;
     voice_manifest.bytes[26] = 0;
     voice_manifest.bytes[27] = TILEFINCH_UPDATE_PACKAGE_VOICE;
@@ -348,6 +362,14 @@ static int test_envelope(void)
     CHECK(tilefinch_update_verify_envelope(
               envelope.bytes, envelope.length, &options, &verified)
           == TILEFINCH_UPDATE_DOWNGRADE);
+    options.allow_downgrade = true;
+    CHECK(tilefinch_update_verify_envelope(
+              envelope.bytes, envelope.length, &options, &verified)
+          == TILEFINCH_UPDATE_OK);
+    CHECK(tilefinch_update_verify_voice_envelope(
+              voice_envelope.bytes, voice_envelope.length,
+              &options, &verified) == TILEFINCH_UPDATE_DOWNGRADE);
+    options.allow_downgrade = false;
     options.installed_sequence = 42;
     options.installed_pair_valid = true;
 
@@ -465,9 +487,14 @@ static int test_state_and_streaming_hash(void)
         .pending_slot = TILEFINCH_UPDATE_SLOT_B,
         .trial = TILEFINCH_UPDATE_TRIAL_PENDING,
         .installed_sequence = 42,
-        .candidate_sequence = 43
+        .candidate_sequence = 41,
+        .candidate_downgrade = true
     };
     uint8_t encoded[2][TILEFINCH_UPDATE_STATE_BYTES];
+    TilefinchUpdateState invalid_downgrade = first;
+    invalid_downgrade.candidate_downgrade = true;
+    CHECK(tilefinch_update_state_encode(&invalid_downgrade, encoded[0])
+          == TILEFINCH_UPDATE_INVALID_ARGUMENT);
     CHECK(tilefinch_update_state_encode(&first, encoded[0])
           == TILEFINCH_UPDATE_OK
           && tilefinch_update_state_encode(&second, encoded[1])
@@ -478,6 +505,7 @@ static int test_state_and_streaming_hash(void)
               encoded[0], sizeof(encoded[0]), encoded[1],
               sizeof(encoded[1]), &selected, &copy)
           && copy == 1 && selected.generation == 8);
+    CHECK(selected.candidate_downgrade);
     encoded[1][142] ^= 1;
     CHECK(tilefinch_update_state_select(
               encoded[0], sizeof(encoded[0]), encoded[1],
@@ -498,17 +526,27 @@ static int test_state_and_streaming_hash(void)
               == TILEFINCH_UPDATE_BOOT_START_TRIAL
           && boot_slot == TILEFINCH_UPDATE_SLOT_B
           && tilefinch_update_state_start_trial(&second)
-          && second.trial == TILEFINCH_UPDATE_TRIAL_STARTED);
+          && second.trial == TILEFINCH_UPDATE_TRIAL_STARTED
+          && !second.candidate_downgrade
+          && tilefinch_update_state_encode(&second, encoded[1])
+                 == TILEFINCH_UPDATE_OK
+          /* Schema-1 readers predating downgrade support consume the raw
+             trial byte. The started record must remain valid for them. */
+          && encoded[1][21]
+                 == (uint8_t) TILEFINCH_UPDATE_TRIAL_STARTED);
     CHECK(tilefinch_update_boot_decide(
               &second, false, true, &boot_slot)
               == TILEFINCH_UPDATE_BOOT_RECOVERY
           && tilefinch_update_state_retry_trial(&second)
+          && second.candidate_downgrade
           && tilefinch_update_state_start_trial(&second)
+          && !second.candidate_downgrade
           && tilefinch_update_state_confirm_healthy(&second)
           && second.active_slot == TILEFINCH_UPDATE_SLOT_B
           && second.previous_slot == TILEFINCH_UPDATE_SLOT_A
           && second.pending_slot == TILEFINCH_UPDATE_SLOT_NONE
-          && second.installed_sequence == 43
+          && !second.candidate_downgrade
+          && second.installed_sequence == 41
           && second.previous_sequence == 42);
     CHECK(tilefinch_update_boot_decide(
               &second, true, true, &boot_slot)
@@ -631,7 +669,7 @@ static int test_journal_faults(void)
     TilefinchUpdateState state = {
         .generation = 1,
         .active_slot = TILEFINCH_UPDATE_SLOT_A,
-        .installed_sequence = 42
+        .installed_sequence = 44
     };
     CHECK(tilefinch_update_journal_store(directory, &state, NULL, NULL));
     state.generation = 2;
@@ -841,7 +879,7 @@ static int test_installer(void)
     TilefinchUpdateState state = {
         .generation = 1,
         .active_slot = TILEFINCH_UPDATE_SLOT_A,
-        .installed_sequence = 42
+        .installed_sequence = 44
     };
     TilefinchUpdateInstallOptions options = {
         .package_path = package_path,
@@ -852,7 +890,8 @@ static int test_installer(void)
         .install_root = root,
         .data_dir = data,
         .inactive_slot = TILEFINCH_UPDATE_SLOT_B,
-        .current_state = state
+        .current_state = state,
+        .allow_downgrade = true
     };
 
     size_t exercised_faults = 0;
@@ -972,13 +1011,14 @@ static int test_installer(void)
           && pending.generation == 2
           && pending.active_slot == TILEFINCH_UPDATE_SLOT_A
           && pending.pending_slot == TILEFINCH_UPDATE_SLOT_B
-          && pending.trial == TILEFINCH_UPDATE_TRIAL_PENDING);
+          && pending.trial == TILEFINCH_UPDATE_TRIAL_PENDING
+          && pending.candidate_downgrade);
     TilefinchUpdateSlotVerifyOptions slot_options = {
         .embedded_root = &root_metadata,
         .now_unix = UINT64_C(1900000000),
         .clock_valid = true,
         .launcher_protocol = TILEFINCH_UPDATE_LAUNCHER_PROTOCOL,
-        .installed_sequence = 42,
+        .installed_sequence = 44,
         .installed_sequence_valid = true,
         .installed_pair_valid = false
     };
@@ -986,9 +1026,15 @@ static int test_installer(void)
     snprintf(slot_dir, sizeof(slot_dir), "%s/slot-b", root);
     TilefinchUpdateVerifiedEnvelope slot_verified;
     CHECK(tilefinch_update_verify_slot(
+              slot_dir, &slot_options, NULL)
+          == TILEFINCH_UPDATE_DOWNGRADE);
+    slot_options.allow_downgrade = true;
+    CHECK(tilefinch_update_verify_slot(
               slot_dir, &slot_options, &slot_verified)
-              == TILEFINCH_UPDATE_OK
+          == TILEFINCH_UPDATE_OK
           && slot_verified.manifest.release_sequence == 43);
+    slot_options.installed_sequence = 42;
+    slot_options.allow_downgrade = false;
     file = fopen(installed, "ab");
     CHECK(file != NULL && fputc(0, file) != EOF && fclose(file) == 0);
     CHECK(tilefinch_update_verify_slot(
@@ -1030,6 +1076,7 @@ static int test_installer(void)
     options.manifest = &developer_verified.manifest;
     options.manifest_digest = developer_verified.manifest_digest;
     options.trust = TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED;
+    options.allow_downgrade = false;
     budget_init(&budget, 1024 * 1024);
     job = tilefinch_update_install_create(&budget, &options);
     CHECK(job != NULL);
@@ -1079,6 +1126,49 @@ static int test_installer(void)
     rmdir(active_slot);
     rmdir(data);
     CHECK(rmdir(root) == 0);
+    return 0;
+}
+
+static int test_release_history(void)
+{
+    static const unsigned char response[] =
+        "["
+        "{\"tag_name\":\"v0.1.5\",\"draft\":false,"
+          "\"prerelease\":false,\"assets\":["
+            "{\"name\":\"tilefinch-update-v1.tfum\"}]},"
+        "{\"assets\":[{\"name\":\"tilefinch-update-v1.tfum\"}],"
+          "\"prerelease\":false,\"tag_name\":\"v0.1.4\","
+          "\"draft\":false},"
+        "{\"tag_name\":\"v0.1.3\",\"draft\":false,"
+          "\"prerelease\":true,\"assets\":["
+            "{\"name\":\"tilefinch-update-v1.tfum\"}]},"
+        "{\"tag_name\":\"v0.1.2\",\"body\":\"bounded fixture\","
+          "\"draft\":false,\"prerelease\":false,\"assets\":["
+            "{\"name\":\"notes.txt\"},"
+            "{\"name\":\"tilefinch-update-v1.tfum\"}]},"
+        "{\"tag_name\":\"v0.1.1\",\"draft\":false,"
+          "\"prerelease\":false,\"assets\":["
+            "{\"name\":\"tilefinch-update-v1.zip\"}]},"
+        "{\"tag_name\":\"unexpected\",\"draft\":false,"
+          "\"prerelease\":false,\"assets\":[]}"
+        "]";
+    TilefinchUpdateHistorySnapshot history;
+    CHECK(tilefinch_update_history_parse(
+              response, sizeof(response) - 1u, "0.1.5", &history)
+          && history.phase == TILEFINCH_UPDATE_HISTORY_READY
+          && history.count == 2u
+          && strcmp(history.versions[0], "0.1.4") == 0
+          && strcmp(history.versions[1], "0.1.2") == 0);
+    char tag[16];
+    CHECK(tilefinch_update_history_tag(
+              &history, 1u, tag, sizeof(tag))
+          && strcmp(tag, "v0.1.2") == 0
+          && !tilefinch_update_history_tag(
+                 &history, history.count, tag, sizeof(tag)));
+    static const unsigned char malformed[] =
+        "[{\"tag_name\":\"v0.1.4\",\"assets\":[}]";
+    CHECK(!tilefinch_update_history_parse(
+        malformed, sizeof(malformed) - 1u, "0.1.5", &history));
     return 0;
 }
 
@@ -1144,6 +1234,8 @@ int main(void)
     CHECK(test_journal_faults() == 0);
     puts("test: bounded installer stages and promotes the inactive slot");
     CHECK(test_installer() == 0);
+    puts("test: bounded GitHub release history parser");
+    CHECK(test_release_history() == 0);
     puts("update-tests: all checks passed");
     return 0;
 }

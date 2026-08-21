@@ -50,7 +50,8 @@ static bool style_property_display(const StylePropertyParse *parse)
                  */
                 style->display = DISPLAY_INLINE_BLOCK;
             }
-            else if (strcmp(resolved, "inline-flex") == 0) {
+            else if (strcmp(resolved, "inline-flex") == 0
+                     || strcmp(resolved, "-webkit-inline-box") == 0) {
                 style->display = DISPLAY_INLINE_FLEX;
             }
             else if (strcmp(resolved, "inline-grid") == 0) {
@@ -64,7 +65,10 @@ static bool style_property_display(const StylePropertyParse *parse)
                      || strcmp(resolved, "table-caption") == 0) {
                 style->display = DISPLAY_BLOCK;
             }
-            else if (strcmp(resolved, "flex") == 0) style->display = DISPLAY_FLEX;
+            else if (strcmp(resolved, "flex") == 0
+                     || strcmp(resolved, "-webkit-box") == 0) {
+                style->display = DISPLAY_FLEX;
+            }
             else if (strcmp(resolved, "grid") == 0) style->display = DISPLAY_GRID;
             else if (strcmp(resolved, "inline") == 0) {
                 style->display = DISPLAY_INLINE;
@@ -139,6 +143,17 @@ static bool style_property_color(const StylePropertyParse *parse)
         }
     
     return true;
+}
+
+static bool style_property_webkit_text_fill_color(
+    const StylePropertyParse *parse)
+{
+    /* Tilefinch has one inherited glyph-paint colour.  Treat WebKit's text
+       fill as that colour so transparent and gradient-backed headings do not
+       disappear.  This deliberately omits the uncommon distinction between
+       glyph fill and `currentColor`, avoiding another word in every PSP
+       ComputedStyle while preserving the visible text result. */
+    return style_property_color(parse);
 }
 
 /* True when a top-level `background` shorthand token names a component this
@@ -506,6 +521,41 @@ static bool style_property_background_position(const StylePropertyParse *parse)
         *mask_high |= S2_BACKGROUND_POSITION;
     }
 
+    return true;
+}
+
+static bool style_property_background_position_axis(
+    const StylePropertyParse *parse)
+{
+    bool horizontal = parse->name_length != 0
+        && parse->name[parse->name_length - 1u] == 'x';
+    if (!style_parse_background_layer_position_axis(
+            parse->sheet, parse->value, parse->value_length,
+            parse->style, horizontal)) {
+        return true;
+    }
+
+    /* Keep the allocation-free first-layer fields in step with the retained
+       paint layer.  The retained layer carries independent per-axis pixel
+       flags; the compact legacy fields conservatively use pixel mode when
+       either authored axis is a length. */
+    const StylePaintStack *paint = stylesheet_paint_stack(
+        parse->sheet, computed_style_paint_stack_id(parse->style));
+    if (paint != NULL && paint->background_count != 0) {
+        const StylePaintLayer *layer = &paint->backgrounds[0];
+        parse->style->background_position_x = layer->position_x;
+        parse->style->background_position_y = layer->position_y;
+        if ((layer->position_edges
+             & (STYLE_PAINT_POSITION_X_PIXELS
+                | STYLE_PAINT_POSITION_Y_PIXELS)) != 0) {
+            parse->style->background_size_flags |=
+                STYLE_BACKGROUND_POSITION_PIXELS;
+        } else {
+            parse->style->background_size_flags &=
+                (uint8_t) ~STYLE_BACKGROUND_POSITION_PIXELS;
+        }
+    }
+    *parse->mask_high |= S2_BACKGROUND_POSITION;
     return true;
 }
 

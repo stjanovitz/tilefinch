@@ -50,7 +50,8 @@ static int test_directives(void)
         "img-src https://img.test data:; font-src https://fonts.test; "
         "connect-src https:; frame-src https://frames.test; "
         "object-src 'none'; base-uri 'self'; "
-        "form-action https://submit.test; frame-ancestors 'self'\n";
+        "form-action https://submit.test; frame-ancestors 'self'; "
+        "media-src https://media.test\n";
     TilefinchContentSecurityPolicy csp;
     CHECK(tilefinch_csp_parse_response_headers(
         &csp, "https://page.test/article", headers, sizeof(headers) - 1,
@@ -88,6 +89,12 @@ static int test_directives(void)
     CHECK(!tilefinch_csp_allows_request(
         &csp, TILEFINCH_DESTINATION_OTHER,
         "https://page.test/plugin"));
+    CHECK(tilefinch_csp_allows_request(
+        &csp, TILEFINCH_DESTINATION_MEDIA,
+        "https://media.test/movie.mp4"));
+    CHECK(!tilefinch_csp_allows_request(
+        &csp, TILEFINCH_DESTINATION_MEDIA,
+        "https://page.test/movie.mp4"));
     CHECK(tilefinch_csp_allows_base_uri(
         &csp, "https://page.test/base/"));
     CHECK(!tilefinch_csp_allows_base_uri(

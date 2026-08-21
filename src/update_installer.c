@@ -32,6 +32,7 @@ struct TilefinchUpdateInstallJob {
     uint8_t manifest_digest[32];
     TilefinchUpdateSlot inactive_slot;
     TilefinchUpdateTrust trust;
+    bool allow_downgrade;
     TilefinchUpdateState state;
     TilefinchUpdateFaultHook fault;
     void *fault_opaque;
@@ -171,6 +172,10 @@ TilefinchUpdateInstallJob *tilefinch_update_install_create(
             && options->inactive_slot != TILEFINCH_UPDATE_SLOT_B)
         || options->inactive_slot == options->current_state.active_slot
         || options->trust > TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED
+        || (options->allow_downgrade
+            && (options->trust != TILEFINCH_UPDATE_TRUST_SIGNED
+                || options->manifest->release_sequence
+                       >= options->current_state.installed_sequence))
         || strlen(options->package_path) >= 768
         || strlen(options->install_root) >= 768
         || strlen(options->data_dir) >= 768) return NULL;
@@ -192,6 +197,7 @@ TilefinchUpdateInstallJob *tilefinch_update_install_create(
     memcpy(job->manifest_digest, options->manifest_digest, 32);
     job->inactive_slot = options->inactive_slot;
     job->trust = options->trust;
+    job->allow_downgrade = options->allow_downgrade;
     job->state = options->current_state;
     job->fault = options->fault;
     job->fault_opaque = options->fault_opaque;
@@ -413,6 +419,7 @@ static bool install_promote(TilefinchUpdateInstallJob *job)
         job->trust == TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED
         ? TILEFINCH_UPDATE_DEVELOPER_SEQUENCE
         : job->manifest.release_sequence;
+    pending.candidate_downgrade = job->allow_downgrade;
     memcpy(
         pending.candidate_sha256, job->manifest.package_sha256, 32);
     if (install_fault(job, "before-write-pending-journal")

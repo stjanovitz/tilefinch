@@ -166,15 +166,20 @@ notice in this file.
 - **PPSSPP** 1.20.4 was used only to execute the EBOOT during validation and
   is not redistributed.
 
-## Optional components not in release builds
+## Optional components
 
 - **GNU lightning** (LGPL-3.0-or-later): linked only when the experimental
   `PSP_BROWSER_QUICKJS_NATIVE_TRACE=ON` diagnostic is enabled; OFF by default
   and in every preset. Enabling it in a distributed binary would add LGPL
   relinking obligations.
-- **FFmpeg** (LGPL-2.1+/GPL by configuration): used by the host media
-  laboratory (`PSP_BROWSER_BUILD_HOST_MEDIA_LAB`) for desktop media
-  validation; not part of the PSP EBOOT.
+- **FFmpeg** n8.1.2 (LGPL-2.1-or-later in Tilefinch's configuration): used by
+  the host media laboratory and by the replaceable PSP software-decoder PRX.
+  The PSP build enables only H.264, `aac_fixed`, and the H.264 parser; it does
+  not enable GPL components. The exact PSP changes are in
+  `third_party/patches/ffmpeg-n8.1.2-swdec.patch`, and
+  `scripts/prepare-swdec-ffmpeg.sh` reconstructs the linkable component input
+  from the upstream tag. The license is checked in at
+  `third_party/notices/ffmpeg/COPYING.LGPLv2.1`.
 - **Apple JavaScriptCore**: macOS-only diagnostic spike, disabled in presets.
 
 ## Distributing binaries
@@ -188,7 +193,8 @@ Public Suffix List MPL-2.0 and Chromium BSD-3-Clause texts with the source
 pointer; the complete PocketSphinx compound license; the DejaVu and both OFL
 font licenses alongside the font files; the
 curl, nghttp2, mbed TLS, and zlib texts for the PSP stack; the PSPDEV
-component notices; and the Danzeff BSD-3-Clause notice. Retain all applicable
+component notices; the FFmpeg LGPL-2.1 text when the software-decoder PRX is
+included; and the Danzeff BSD-3-Clause notice. Retain all applicable
 upstream notices whenever binaries are redistributed.
 
 The optional voice component is distributed independently and must contain

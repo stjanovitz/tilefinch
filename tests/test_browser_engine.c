@@ -228,6 +228,9 @@ static bool backing_node_write(
 int main(void)
 {
     CHECK(test_engine_lifecycle() == 0);
+    CHECK(test_page_video_activation() == 0);
+    CHECK(test_page_video_data_candidate_activation() == 0);
+    CHECK(test_committed_document_glyph_script_hints() == 0);
     CHECK(test_responsive_navigation_convergence() == 0);
     CHECK(test_scrollable_provisional_navigation() == 0);
     CHECK(test_youtube_localized_watch_metadata() == 0);

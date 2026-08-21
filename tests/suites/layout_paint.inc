@@ -351,6 +351,143 @@ static int test_compact_visual_css_extensions(Budget *budget)
     return 0;
 }
 
+static int test_bounded_typography_and_compositing(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0;background:#808080}"
+        "#type{display:block;white-space:pre;tab-size:4;hyphens:none;"
+        "font-kerning:none}"
+        "#contrast{width:12px;height:8px;background:#c06020;filter:contrast(.5)}"
+        "#saturate{width:12px;height:8px;background:#5080a0;filter:saturate(2)}"
+        "#blend{width:12px;height:8px;background:#ff8040;mix-blend-mode:multiply}"
+        "#blur{position:fixed;top:0;left:40px;width:40px;height:16px;"
+        "background:rgba(255,255,255,.5);backdrop-filter:blur(2px)}"
+        "</style><body><div id=type>A\tV soft&#173;hyphen</div>"
+        "<div id=contrast></div><div id=saturate></div>"
+        "<div id=blend></div><div id=blur></div></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 17)
+          && stylesheet_build(&sheet, budget, &document, 120)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 120));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *type = find_id(root, "type");
+    lxb_dom_node_t *contrast = find_id(root, "contrast");
+    lxb_dom_node_t *saturate = find_id(root, "saturate");
+    lxb_dom_node_t *blend = find_id(root, "blend");
+    lxb_dom_node_t *blur = find_id(root, "blur");
+    ComputedStyle type_style = style_for_node(&sheet, type, NULL);
+    ComputedStyle contrast_style = style_for_node(&sheet, contrast, NULL);
+    ComputedStyle saturate_style = style_for_node(&sheet, saturate, NULL);
+    CHECK(computed_style_tab_size(&type_style) == 4
+          && computed_style_hyphens_none(&type_style)
+          && computed_style_kerning_none(&type_style)
+          && computed_style_filter_code(&contrast_style)
+                 == STYLE_FILTER_CONTRAST
+          && computed_style_filter_code(&saturate_style)
+                 == STYLE_FILTER_SATURATE);
+    bool text_no_kerning = false, contrast_low = false;
+    bool saturate_high = false, multiply = false, blur_two = false;
+    const LayoutNodeBox *boxes[5] = {
+        layout_box_for_node(&layout, type),
+        layout_box_for_node(&layout, contrast),
+        layout_box_for_node(&layout, saturate),
+        layout_box_for_node(&layout, blend),
+        layout_box_for_node(&layout, blur)
+    };
+    for (unsigned box = 0; box < 5; box++) {
+        CHECK(boxes[box] != NULL);
+        for (size_t i = boxes[box]->command_start;
+             i < boxes[box]->command_end; i++) {
+            const DrawCommand *command = &layout.commands[i];
+            if (box == 0 && command->type == DRAW_TEXT) {
+                text_no_kerning |= draw_command_text_kerning_none(command);
+            } else if (box == 1 && command->type == DRAW_FILL_RECT) {
+                contrast_low |= draw_command_filter_code(command)
+                                    == STYLE_FILTER_CONTRAST
+                    && (command->font_italic
+                        & LAYOUT_COMMAND_FILTER_LOW_AMOUNT) != 0;
+            } else if (box == 2 && command->type == DRAW_FILL_RECT) {
+                saturate_high |= draw_command_filter_code(command)
+                                     == STYLE_FILTER_SATURATE
+                    && (command->font_italic
+                        & LAYOUT_COMMAND_FILTER_LOW_AMOUNT) == 0;
+            } else if (box == 3 && command->type == DRAW_FILL_RECT) {
+                multiply |= draw_command_blend_mode(command)
+                            == LAYOUT_MIX_BLEND_MULTIPLY;
+            } else if (box == 4 && command->type == DRAW_FILL_RECT) {
+                blur_two |= draw_command_backdrop_blur(command) == 2;
+            }
+        }
+    }
+    CHECK(text_no_kerning && contrast_low && saturate_high
+          && multiply && blur_two && sizeof(ComputedStyle) == 376);
+    TileCache cache = {0};
+    uint16_t *frame = budget_malloc(
+        budget, 120u * 80u * sizeof(*frame));
+    CHECK(frame != NULL && tile_cache_init(&cache, budget, &layout, 4)
+          && tile_cache_set_frame(&cache, frame, 120u * 80u)
+          && tile_cache_render_frame(&cache, 0, 120, 80, NULL)
+          && cache.fixed_cache_builds == 0);
+    tile_cache_destroy(&cache);
+    budget_free(budget, frame);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static size_t backdrop_blur_command_count(const LayoutDocument *layout)
+{
+    size_t count = 0;
+    for (size_t i = 0; layout != NULL && i < layout->count; i++)
+        count += draw_command_backdrop_blur(&layout->commands[i]) != 0u;
+    return count;
+}
+
+static int test_backdrop_filter_aggregate_budget(Budget *budget)
+{
+    static const char accepted[] =
+        "<!doctype html><style>html,body{margin:0}.b{position:fixed;"
+        "width:16px;height:16px;background:#ffffff80;"
+        "backdrop-filter:blur(2px)}</style><body>"
+        "<i class=b></i><i class=b></i><i class=b></i><i class=b></i>";
+    static const char rejected[] =
+        "<!doctype html><style>html,body{margin:0}.b{position:fixed;"
+        "width:16px;height:16px;background:#ffffff80;"
+        "backdrop-filter:blur(2px)}</style><body>"
+        "<i class=b></i><i class=b></i><i class=b></i><i class=b></i>"
+        "<i class=b></i>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(
+              &document, budget, accepted, strlen(accepted), 17)
+          && stylesheet_build(&sheet, budget, &document, 120)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 120)
+          && backdrop_blur_command_count(&layout) == 4u);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+
+    CHECK(document_parse(
+              &document, budget, rejected, strlen(rejected), 17)
+          && stylesheet_build(&sheet, budget, &document, 120)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 120)
+          && backdrop_blur_command_count(&layout) == 0u);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 static int test_unresolved_mask_keeps_transparent_geometry(Budget *budget)
 {
     static const char page[] =
@@ -492,6 +629,9 @@ static int test_bounded_shared_paint_stack(Budget *budget)
         "#layered-sprite-position{background-image:linear-gradient(#555,#666),"
         "linear-gradient(#777,#888);background-position:-4px -8px,"
         "-12px -16px}"
+        "#axis-position{background-image:linear-gradient(#111,#222);"
+        "background-position:10% 20%;background-position-x:right 3px;"
+        "background-position-y:75%}"
         "table{border-spacing:12px 7px}</style>"
         "<body><div id=probe></div><div id=box-defaults></div>"
         "<div id=mask-replacement></div>"
@@ -506,6 +646,7 @@ static int test_bounded_shared_paint_stack(Budget *budget)
         "<div id=background-position></div>"
         "<div id=sprite-position></div>"
         "<div id=layered-sprite-position></div>"
+        "<div id=axis-position></div>"
         "<table id=table><tr><td>x</td></tr>"
         "</table></body>";
     PocDocument document = {0};
@@ -664,6 +805,20 @@ static int test_bounded_shared_paint_stack(Budget *budget)
                  | STYLE_PAINT_POSITION_Y_PIXELS))
              == (STYLE_PAINT_POSITION_X_PIXELS
                  | STYLE_PAINT_POSITION_Y_PIXELS));
+    ComputedStyle axis_positioned = style_for_node(
+        &sheet, find_id(root, "axis-position"), NULL);
+    const StylePaintStack *axis_paint = stylesheet_paint_stack(
+        &sheet, computed_style_paint_stack_id(&axis_positioned));
+    CHECK(axis_paint != NULL && axis_paint->background_count == 1
+          && axis_paint->backgrounds[0].position_x == 3
+          && axis_paint->backgrounds[0].position_y == 75
+          && (axis_paint->backgrounds[0].position_edges
+              & (STYLE_PAINT_POSITION_FROM_RIGHT
+                 | STYLE_PAINT_POSITION_X_PIXELS
+                 | STYLE_PAINT_POSITION_FROM_BOTTOM
+                 | STYLE_PAINT_POSITION_Y_PIXELS))
+             == (STYLE_PAINT_POSITION_FROM_RIGHT
+                 | STYLE_PAINT_POSITION_X_PIXELS));
     ComputedStyle table = style_for_node(
         &sheet, find_id(root, "table"), NULL);
     const StylePaintStack *table_paint = stylesheet_paint_stack(

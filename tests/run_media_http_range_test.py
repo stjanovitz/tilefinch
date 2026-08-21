@@ -52,6 +52,10 @@ real completion detection, real admission checks.
   bad206    returns a mismatched Content-Range and must never be admitted.
   ignore-range  ignores the range query and returns the full object.
   reset-always  closes every successor response after an admitted prefix.
+  slow-progress  continuously delivers useful bytes below the historical
+            throughput floor; it must complete without a reconnect.
+  stall-window  permanently stalls one demanded logical window while other
+            offsets remain healthy, proving terminal failure and fresh scope.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from subprocess import run
@@ -180,6 +184,18 @@ CADENCE_PROFILE = "device-gaps"
 CADENCE_ATTEMPTS = {}
 CADENCE_ATTEMPTS_LOCK = Lock()
 CADENCE_SERIAL_LOCK = Lock()
+CADENCE_CHAOS_FAULTS = set()
+CADENCE_CHAOS_OUTAGE_OFFSET = None
+CADENCE_CHAOS_OUTAGE_UNTIL = 0.0
+
+
+def _take_chaos_fault(name):
+    """Claim one process-wide fault in the composite recovery profile."""
+    with CADENCE_ATTEMPTS_LOCK:
+        if name in CADENCE_CHAOS_FAULTS:
+            return False
+        CADENCE_CHAOS_FAULTS.add(name)
+        return True
 
 
 class RangeHandler(BaseHTTPRequestHandler):
@@ -189,6 +205,17 @@ class RangeHandler(BaseHTTPRequestHandler):
         pass
 
     def _write_cadence(self, mode, first, payload, attempt):
+        global CADENCE_CHAOS_OUTAGE_OFFSET, CADENCE_CHAOS_OUTAGE_UNTIL
+        prolonged_outage = False
+        if (CADENCE_PROFILE == "chaos-recovery"
+                and mode == "cadence-video" and first >= 256 * 1024):
+            with CADENCE_ATTEMPTS_LOCK:
+                if CADENCE_CHAOS_OUTAGE_OFFSET is None:
+                    CADENCE_CHAOS_OUTAGE_OFFSET = first
+                    CADENCE_CHAOS_OUTAGE_UNTIL = time.monotonic() + 30.0
+                prolonged_outage = (
+                    first == CADENCE_CHAOS_OUTAGE_OFFSET
+                    and time.monotonic() < CADENCE_CHAOS_OUTAGE_UNTIL)
         if (CADENCE_PROFILE == "drop-once" and first >= 256 * 1024
                 and attempt == 1):
             # Headers promise the full bounded window, then the socket
@@ -205,7 +232,9 @@ class RangeHandler(BaseHTTPRequestHandler):
             return
         if (CADENCE_PROFILE == "chaos-recovery"
                 and mode == "cadence-video"
-                and first >= 512 * 1024 and attempt == 1):
+                and CADENCE_CHAOS_OUTAGE_OFFSET is not None
+                and first > CADENCE_CHAOS_OUTAGE_OFFSET and attempt == 1
+                and _take_chaos_fault("late-truncation")):
             # After the sustained stall/reconnect, lose one later response
             # after publishing a prefix. This is a distinct failure shape:
             # ordinary bounded retry, not the no-progress replacement path.
@@ -257,16 +286,13 @@ class RangeHandler(BaseHTTPRequestHandler):
                 # buffers should absorb it without skew escaping the session's
                 # 250 ms presentation-lead discipline.
                 time.sleep(6.0)
-            elif (CADENCE_PROFILE == "chaos-recovery"
-                  and mode == "cadence-video"
-                  and 256 * 1024 <= first < 512 * 1024
-                  and attempt == 1 and at == 0):
-                # A successor which was issued well ahead of demand stops
-                # completely for longer than that runway and the bounded
-                # request lifetime. Keeping the original handler asleep also
-                # verifies that the replacement is independent of the
-                # abandoned socket rather than sharing its state.
-                time.sleep(16.0)
+            elif prolonged_outage and at == 0:
+                # Keep every fresh request for this logical window offline
+                # until the same wall-clock recovery point. This distinguishes
+                # a genuinely long Wi-Fi/CDN outage from one bad socket: rapid
+                # reconnect churn cannot make the path recover sooner.
+                time.sleep(max(
+                    0.0, CADENCE_CHAOS_OUTAGE_UNTIL - time.monotonic()))
             elif CADENCE_PROFILE == "chaos-recovery":
                 # Deterministic throughput shifts around the same healthy
                 # average: fast bursts, a constrained region, then recovery.
@@ -291,6 +317,9 @@ class RangeHandler(BaseHTTPRequestHandler):
             body = FRAGMENTED if mode.startswith("fragment") else BODY
         total = len(body)
         span = query.get("range", ["0-%d" % (total - 1)])[0]
+        range_header = self.headers.get("Range", "")
+        if range_header.startswith("bytes="):
+            span = range_header[len("bytes="):]
         first, _, last = span.partition("-")
         first = int(first)
         last = min(int(last), total - 1)
@@ -341,7 +370,8 @@ class RangeHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.close_connection = True
         self.end_headers()
-        if mode == "stall":
+        if mode == "stall" or (mode == "stall-window"
+                               and first == 256 * 1024):
             # Promised and never delivered. Long enough that the C side's own
             # bounds are what end every wait, short enough that a suite which
             # forgets to close one still finishes.
@@ -371,14 +401,21 @@ class RangeHandler(BaseHTTPRequestHandler):
             self.connection.close()
             return
         if mode.startswith("cadence"):
-            # Coupled mode models the PSP transport worker's one authored HTTP
-            # hop at a time: video and audio have independent curl clients in
-            # this host test, while the server-side lock serializes bodies.
-            if CADENCE_PROFILE in ("coupled-asymmetric", "chaos-recovery"):
+            # Coupled-asymmetric models the PSP transport worker's one
+            # authored HTTP hop at a time. Chaos-recovery deliberately does
+            # not hold this server-side lock: a replacement connection must
+            # be independent of the abandoned handler which is still asleep.
+            if CADENCE_PROFILE == "coupled-asymmetric":
                 with CADENCE_SERIAL_LOCK:
                     self._write_cadence(mode, first, payload, attempt)
             else:
                 self._write_cadence(mode, first, payload, attempt)
+        elif mode == "slow-progress":
+            step = 4 * 1024
+            for at in range(0, len(payload), step):
+                self.wfile.write(payload[at:at + step])
+                self.wfile.flush()
+                time.sleep(0.20)
         elif mode == "slow" or mode == "fragment-slow":
             step = 16 * 1024
             for at in range(0, len(payload), step):
@@ -423,6 +460,12 @@ def main():
         raise SystemExit(
             "the fragmented fixture must span several 64 KiB windows; "
             f"it is {len(FRAGMENTED)}B")
+    # The range-window controller itself needs no socket. Run its synthetic
+    # timing, progress, deadline, retry-scope, and buffering scenarios even in
+    # sandboxes where the HTTP integration portion must return Skip.
+    policy = run((sys.argv[1], "--policy-only"), check=False)
+    if policy.returncode != 0:
+        return policy.returncode
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         probe.bind(("127.0.0.1", 0))

@@ -16,16 +16,21 @@ typedef struct {
     TilefinchUpdateState state;
     TilefinchUpdateClient *client;
     TilefinchUpdateInstallJob *installer;
+    TilefinchUpdateHistory *history;
     TilefinchUpdateClientSnapshot client_snapshot;
     TilefinchUpdateInstallSnapshot install_snapshot;
     char package_path[TILEFINCH_INSTALL_PATH_LIMIT];
+    char release_tag[16];
     uint64_t install_maximum_unit_us;
     uint64_t install_units;
     BrowserUpdateChannel channel;
+    uint16_t installed_decoder_abi;
     char unavailable_message[64];
     bool initialized;
     bool available;
     bool install_terminal_reported;
+    bool allow_downgrade;
+    bool installed_decoder_abi_valid;
 } PspUpdateSession;
 
 typedef struct {
@@ -42,6 +47,9 @@ typedef struct {
      * compiled under TILEFINCH_PSP_VALIDATION_LOG.
      */
     const char *signed_metadata_url_override;
+    /* Fixed, signed GitHub release selected from the native history list. */
+    const char *release_tag;
+    bool allow_downgrade;
 } PspUpdateSessionOptions;
 
 typedef enum {
@@ -54,6 +62,8 @@ TilefinchUpdateSlot psp_update_session_current_slot(
     const TilefinchInstallPaths *paths);
 bool psp_update_session_metadata_url(
     const PspUpdateSessionOptions *options, char *output, size_t capacity);
+bool psp_update_session_selected_metadata_url(
+    const PspUpdateSession *session, char *output, size_t capacity);
 
 bool psp_update_session_initialize(
     PspUpdateSession *session, Budget *budget,
@@ -75,5 +85,9 @@ PspUpdatePrimaryResult psp_update_session_primary(
 bool psp_update_session_begin_check(
     PspUpdateSession *session, uint64_t wall_time_seconds,
     bool wall_time_valid);
+bool psp_update_session_begin_history(
+    PspUpdateSession *session, PspUiState *ui);
+void psp_update_session_cancel_history(
+    PspUpdateSession *session, PspUiState *ui);
 
 #endif

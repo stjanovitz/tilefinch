@@ -6,8 +6,8 @@
 
 struct MediaPlayback {
     Budget *budget;
-    MediaMp4Demux *demux[2];
-    size_t demux_count;
+    MediaSampleSource source[2];
+    size_t source_count;
     MediaBackend backend;
     unsigned char *packet;
     size_t packet_capacity;
@@ -26,6 +26,21 @@ struct MediaPlayback {
     MediaPlaybackJobStats job_stats;
 };
 
+static bool source_valid(const MediaSampleSource *source)
+{
+    return source != NULL && source->opaque != NULL && source->ops != NULL
+        && source->ops->track_count != NULL
+        && source->ops->track_info != NULL
+        && source->ops->next_sample != NULL
+        && source->ops->last_error != NULL
+        && source->ops->would_block != NULL
+        && source->ops->sample_resident != NULL
+        && source->ops->read_sample_waiting != NULL
+        && source->ops->read_sample != NULL
+        && source->ops->seek_us != NULL
+        && source->ops->seek_after_us != NULL;
+}
+
 static void playback_error(char *error, size_t error_size,
                            const char *format, ...)
 {
@@ -34,6 +49,29 @@ static void playback_error(char *error, size_t error_size,
     va_start(arguments, format);
     vsnprintf(error, error_size, format, arguments);
     va_end(arguments);
+}
+
+static bool playback_ensure_packet_capacity(
+    MediaPlayback *playback, size_t needed, char *error, size_t error_size)
+{
+    if (needed <= playback->packet_capacity) return true;
+    if (needed > playback->maximum_packet_bytes) {
+        playback_error(error, error_size,
+                       "MP4 sample %zu > %zu-byte limit",
+                       needed, playback->maximum_packet_bytes);
+        return false;
+    }
+    unsigned char *grown = budget_realloc_category(
+        playback->budget, BUDGET_CATEGORY_RESOURCE,
+        playback->packet, needed);
+    if (grown == NULL) {
+        playback_error(error, error_size,
+                       "media packet growth exceeds budget");
+        return false;
+    }
+    playback->packet = grown;
+    playback->packet_capacity = needed;
+    return true;
 }
 
 static uint64_t sample_time_us(const MediaMp4Sample *sample)
@@ -87,7 +125,7 @@ static bool playback_note_head_block(
         playback->job_stats.head_block_video++;
     else playback->job_stats.head_block_audio++;
     /* One source carrying both tracks has no alternate to have offered. */
-    if (playback->demux_count < 2) return false;
+    if (playback->source_count < 2) return false;
     size_t other = selected == 0 ? 1u : 0u;
     if (!playback->have_pending[other]) return false;
     playback->job_stats.head_alt_pending++;
@@ -105,8 +143,9 @@ static bool playback_note_head_block(
     } else {
         playback->job_stats.head_alt_behind++;
     }
-    if (!media_mp4_sample_resident(
-            playback->demux[other], &playback->pending[other])) return false;
+    const MediaSampleSource *other_source = &playback->source[other];
+    if (!other_source->ops->sample_resident(
+            other_source->opaque, &playback->pending[other])) return false;
     playback->job_stats.head_alt_resident++;
     return true;
 }
@@ -126,27 +165,33 @@ static void media_playback_fail_seek(MediaPlayback *playback)
     }
 }
 
-static MediaPlayback *media_playback_create_sources(
-    Budget *budget, MediaMp4Demux *video_demux,
-    MediaMp4Demux *audio_demux, const MediaBackend *backend,
+MediaPlayback *media_playback_create_sources(
+    Budget *budget, const MediaSampleSource *video_source,
+    const MediaSampleSource *audio_source, const MediaBackend *backend,
     const MediaPlaybackOptions *options, char *error, size_t error_size)
 {
     if (error != NULL && error_size != 0) error[0] = '\0';
-    if (budget == NULL || video_demux == NULL || backend == NULL
+    if (budget == NULL || !source_valid(video_source) || backend == NULL
         || backend->submit == NULL || backend->advance == NULL
         || backend->destroy == NULL) {
         playback_error(error, error_size, "media: invalid backend");
         return NULL;
     }
     size_t largest = 0;
-    bool has_audio = audio_demux != NULL;
-    MediaMp4Demux *sources[2] = {video_demux, audio_demux};
-    size_t source_count = audio_demux == NULL ? 1u : 2u;
+    bool has_audio = audio_source != NULL;
+    const MediaSampleSource *sources[2] = {video_source, audio_source};
+    size_t source_count = audio_source == NULL ? 1u : 2u;
+    if (audio_source != NULL && !source_valid(audio_source)) {
+        playback_error(error, error_size, "media: invalid audio source");
+        return NULL;
+    }
     for (size_t source = 0; source < source_count; source++) {
         for (size_t i = 0;
-             i < media_mp4_track_count(sources[source]); i++) {
+             i < sources[source]->ops->track_count(
+                     sources[source]->opaque); i++) {
             MediaMp4TrackInfo info;
-            if (!media_mp4_track_info(sources[source], i, &info)) {
+            if (!sources[source]->ops->track_info(
+                    sources[source]->opaque, i, &info)) {
                 playback_error(
                     error, error_size,
                     "MP4 track metadata unavailable");
@@ -182,9 +227,9 @@ static MediaPlayback *media_playback_create_sources(
         return NULL;
     }
     playback->budget = budget;
-    playback->demux[0] = video_demux;
-    playback->demux[1] = audio_demux;
-    playback->demux_count = source_count;
+    playback->source[0] = *video_source;
+    if (audio_source != NULL) playback->source[1] = *audio_source;
+    playback->source_count = source_count;
     playback->backend = *backend;
     playback->packet_capacity = initial_capacity;
     playback->maximum_packet_bytes = maximum;
@@ -201,8 +246,13 @@ MediaPlayback *media_playback_create(
     Budget *budget, MediaMp4Demux *demux, const MediaBackend *backend,
     const MediaPlaybackOptions *options, char *error, size_t error_size)
 {
+    MediaSampleSource source;
+    if (!media_sample_source_from_mp4(demux, &source)) {
+        playback_error(error, error_size, "media: invalid MP4 source");
+        return NULL;
+    }
     return media_playback_create_sources(
-        budget, demux, NULL, backend, options, error, error_size);
+        budget, &source, NULL, backend, options, error, error_size);
 }
 
 MediaPlayback *media_playback_create_split(
@@ -215,8 +265,14 @@ MediaPlayback *media_playback_create_split(
                        "adaptive audio unavailable");
         return NULL;
     }
+    MediaSampleSource video_source, audio_source;
+    if (!media_sample_source_from_mp4(video_demux, &video_source)
+        || !media_sample_source_from_mp4(audio_demux, &audio_source)) {
+        playback_error(error, error_size, "media: invalid MP4 source");
+        return NULL;
+    }
     return media_playback_create_sources(
-        budget, video_demux, audio_demux, backend,
+        budget, &video_source, &audio_source, backend,
         options, error, error_size);
 }
 
@@ -274,7 +330,7 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
      * clock horizon. The next public call starts from the earliest source
      * again, so neither track can be skipped indefinitely.
      */
-    size_t deferred_source = playback->demux_count;
+    size_t deferred_source = playback->source_count;
     MediaPlaybackAdvanceResult status = MEDIA_PLAYBACK_ADVANCE_COMPLETE;
     bool source_blocked = false;
     while (true) {
@@ -286,12 +342,12 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
             status = MEDIA_PLAYBACK_ADVANCE_PENDING;
             break;
         }
-        for (size_t source = 0; source < playback->demux_count; source++) {
+        for (size_t source = 0; source < playback->source_count; source++) {
             if (!playback->have_pending[source]
                 && !playback->source_ended[source]) {
-                if (!media_mp4_next_sample(
-                        playback->demux[source],
-                        &playback->pending[source])) {
+                MediaSampleSource *input = &playback->source[source];
+                if (!input->ops->next_sample(
+                        input->opaque, &playback->pending[source])) {
                     if (tilefinch_cancellation_requested(cancellation)) {
                         return MEDIA_PLAYBACK_ADVANCE_CANCELLED;
                     }
@@ -301,7 +357,7 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
                      * pending and let the pump retire this unit: the fetch the
                      * demuxer just asked for proceeds while the decoder works.
                      */
-                    if (media_mp4_would_block(playback->demux[source])) {
+                    if (input->ops->would_block(input->opaque)) {
                         source_blocked = true;
                         /* Source zero is the video demuxer in both shapes:
                            the split form is contractually video-then-audio,
@@ -311,8 +367,8 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
                         continue;
                     }
                     char demux_error[256] = {0};
-                    if (media_mp4_last_error(
-                            playback->demux[source],
+                    if (input->ops->last_error(
+                            input->opaque,
                             demux_error, sizeof(demux_error))) {
                         playback_error(
                             error, error_size, "%s", demux_error);
@@ -326,10 +382,10 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
                 }
             }
         }
-        size_t selected = playback->demux_count;
+        size_t selected = playback->source_count;
         uint64_t selected_time = UINT64_MAX;
         bool held_audio_pending = false;
-        for (size_t source = 0; source < playback->demux_count; source++) {
+        for (size_t source = 0; source < playback->source_count; source++) {
             if (source == deferred_source) continue;
             if (!playback->have_pending[source]) continue;
             /* In the split form source one is contractually audio. During a
@@ -340,27 +396,27 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
                 continue;
             }
             uint64_t candidate = playback->pending_time_us[source];
-            if (selected == playback->demux_count
+            if (selected == playback->source_count
                 || candidate < selected_time) {
                 selected = source;
                 selected_time = candidate;
             }
         }
-        if (selected == playback->demux_count
-            && deferred_source != playback->demux_count) {
+        if (selected == playback->source_count
+            && deferred_source != playback->source_count) {
             /* The other source advanced as far as this bounded call allowed;
                the original blocked head is intentionally still pending for
                the next call. It is not end-of-stream and must never drain. */
             status = MEDIA_PLAYBACK_ADVANCE_PENDING;
             break;
         }
-        if (selected == playback->demux_count && held_audio_pending) {
+        if (selected == playback->source_count && held_audio_pending) {
             /* The video source is caught up for this horizon. Audio is
                intentionally retained, not EOF and not a drain condition. */
             status = MEDIA_PLAYBACK_ADVANCE_PENDING;
             break;
         }
-        if (selected == playback->demux_count && source_blocked) {
+        if (selected == playback->source_count && source_blocked) {
             /* Nothing to submit and at least one source is still fetching:
                this is a pending pipeline, not a drained one. Draining here
                would publish end-of-stream in the middle of a refill. */
@@ -369,7 +425,7 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
             status = MEDIA_PLAYBACK_ADVANCE_PENDING;
             break;
         }
-        if (selected == playback->demux_count) {
+        if (selected == playback->source_count) {
             playback->job_stats.source_ended_breaks++;
             if (playback->backend.drain == NULL) {
                 playback->ended = true;
@@ -430,37 +486,19 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
             processed++;
             continue;
         }
-        if (playback->pending[selected].size
-                > playback->packet_capacity) {
-            size_t needed = playback->pending[selected].size;
-            if (needed > playback->maximum_packet_bytes) {
-                playback_error(
-                    error, error_size,
-                    "MP4 sample %zu > %zu-byte limit",
-                    needed, playback->maximum_packet_bytes);
-                return MEDIA_PLAYBACK_ADVANCE_ERROR;
-            }
-            unsigned char *grown = budget_realloc_category(
-                playback->budget, BUDGET_CATEGORY_RESOURCE,
-                playback->packet, needed);
-            if (grown == NULL) {
-                playback_error(
-                    error, error_size,
-                    "media packet growth exceeds budget");
-                return MEDIA_PLAYBACK_ADVANCE_ERROR;
-            }
-            playback->packet = grown;
-            playback->packet_capacity = needed;
-        }
-        if (!media_mp4_read_sample(
-                playback->demux[selected], &playback->pending[selected],
+        if (!playback_ensure_packet_capacity(
+                playback, playback->pending[selected].size,
+                error, error_size)) return MEDIA_PLAYBACK_ADVANCE_ERROR;
+        MediaSampleSource *selected_source = &playback->source[selected];
+        if (!selected_source->ops->read_sample(
+                selected_source->opaque, &playback->pending[selected],
                 playback->packet, playback->packet_capacity)) {
             if (tilefinch_cancellation_requested(cancellation)) {
                 return MEDIA_PLAYBACK_ADVANCE_CANCELLED;
             }
             /* The payload is not buffered. The sample stays pending, so the
                next pump re-reads exactly this one once the window lands. */
-            if (media_mp4_would_block(playback->demux[selected])) {
+            if (selected_source->ops->would_block(selected_source->opaque)) {
                 playback->job_stats.would_block_calls++;
                 playback->job_stats.source_block_calls++;
                 /* The sample is chosen and eligible and its payload is not
@@ -472,7 +510,7 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
                     playback, selected, horizon);
                 status = MEDIA_PLAYBACK_ADVANCE_PENDING;
                 if (can_bypass
-                    && deferred_source == playback->demux_count) {
+                    && deferred_source == playback->source_count) {
                     deferred_source = selected;
                     playback->job_stats.head_alt_bypasses++;
                     continue;
@@ -480,8 +518,8 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
                 break;
             }
             char demux_error[256] = {0};
-            if (media_mp4_last_error(
-                    playback->demux[selected],
+            if (selected_source->ops->last_error(
+                    selected_source->opaque,
                     demux_error, sizeof(demux_error))) {
                 playback_error(error, error_size, "%s", demux_error);
             } else {
@@ -502,7 +540,7 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
             bool can_bypass = playback_note_head_block(
                 playback, selected, horizon);
             status = MEDIA_PLAYBACK_ADVANCE_PENDING;
-            if (deferred_source != playback->demux_count) {
+            if (deferred_source != playback->source_count) {
                 playback->job_stats.head_alt_blocked++;
             } else if (can_bypass) {
                 deferred_source = selected;
@@ -520,7 +558,7 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
         playback->have_pending[selected] = false;
         processed++;
         playback->job_stats.packets_submitted++;
-        if (deferred_source != playback->demux_count
+        if (deferred_source != playback->source_count
             && selected != deferred_source)
             playback->job_stats.head_alt_submitted++;
         /*
@@ -616,6 +654,11 @@ unsigned media_playback_ready_video_frames(const MediaPlayback *playback)
         : 0;
 }
 
+unsigned media_playback_startup_ready_frames(const MediaPlayback *playback)
+{
+    return playback == NULL ? 0 : playback->backend.startup_ready_frames;
+}
+
 bool media_playback_ready_video_start_us(
     const MediaPlayback *playback, uint64_t *start_us)
 {
@@ -653,7 +696,7 @@ bool media_playback_set_audio_submission_blocked(
     MediaPlayback *playback, bool blocked)
 {
     if (playback == NULL) return false;
-    if (blocked && playback->demux_count < 2u) return false;
+    if (blocked && playback->source_count < 2u) return false;
     playback->audio_submission_blocked = blocked;
     return true;
 }
@@ -665,6 +708,97 @@ bool media_playback_take_video_frame(MediaPlayback *playback,
         && playback->backend.take_video_frame != NULL
         && playback->backend.take_video_frame(
             playback->backend.opaque, frame);
+}
+
+bool media_playback_borrow_video_slot(
+    MediaPlayback *playback, unsigned slot, uint32_t generation)
+{
+    const MediaBackendPresentationOps *ops = playback != NULL
+        ? playback->backend.presentation : NULL;
+    return ops == NULL || ops->borrow == NULL
+        || ops->borrow(playback->backend.opaque, slot, generation);
+}
+
+void media_playback_release_video_read(
+    MediaPlayback *playback, unsigned slot)
+{
+    const MediaBackendPresentationOps *ops = playback != NULL
+        ? playback->backend.presentation : NULL;
+    if (ops != NULL && ops->release != NULL)
+        ops->release(playback->backend.opaque, slot);
+}
+
+void media_playback_end_auxiliary_video_read(
+    MediaPlayback *playback, unsigned slot)
+{
+    const MediaBackendPresentationOps *ops = playback != NULL
+        ? playback->backend.presentation : NULL;
+    if (ops != NULL && ops->end_auxiliary_read != NULL)
+        ops->end_auxiliary_read(playback->backend.opaque, slot);
+}
+
+void media_playback_quarantine_video_slot(
+    MediaPlayback *playback, unsigned slot)
+{
+    const MediaBackendPresentationOps *ops = playback != NULL
+        ? playback->backend.presentation : NULL;
+    if (ops != NULL && ops->quarantine != NULL)
+        ops->quarantine(playback->backend.opaque, slot);
+}
+
+void media_playback_release_video_slot_quarantine(
+    MediaPlayback *playback, unsigned slot)
+{
+    const MediaBackendPresentationOps *ops = playback != NULL
+        ? playback->backend.presentation : NULL;
+    if (ops != NULL && ops->release_quarantine != NULL)
+        ops->release_quarantine(playback->backend.opaque, slot);
+}
+
+bool media_playback_video_slot_quarantined(
+    const MediaPlayback *playback, unsigned slot)
+{
+    const MediaBackendPresentationOps *ops = playback != NULL
+        ? playback->backend.presentation : NULL;
+    return ops != NULL && ops->is_quarantined != NULL
+        && ops->is_quarantined(playback->backend.opaque, slot);
+}
+
+void media_playback_note_frame_staged(
+    MediaPlayback *playback, const MediaVideoFrame *frame)
+{
+    const MediaBackendPresentationOps *ops = playback != NULL
+        ? playback->backend.presentation : NULL;
+    if (ops != NULL && ops->note_staged != NULL)
+        ops->note_staged(playback->backend.opaque, frame);
+}
+
+void media_playback_note_frame_displayed(
+    MediaPlayback *playback, const MediaVideoFrame *frame, int present_path)
+{
+    const MediaBackendPresentationOps *ops = playback != NULL
+        ? playback->backend.presentation : NULL;
+    if (ops != NULL && ops->note_displayed != NULL)
+        ops->note_displayed(playback->backend.opaque, frame, present_path);
+}
+
+void media_playback_note_frame_quiesced(
+    MediaPlayback *playback, const MediaVideoFrame *frame)
+{
+    const MediaBackendPresentationOps *ops = playback != NULL
+        ? playback->backend.presentation : NULL;
+    if (ops != NULL && ops->note_quiesced != NULL)
+        ops->note_quiesced(playback->backend.opaque, frame);
+}
+
+void media_playback_note_stage_signature(
+    MediaPlayback *playback, const MediaVideoFrame *frame,
+    uint32_t signature)
+{
+    const MediaBackendPresentationOps *ops = playback != NULL
+        ? playback->backend.presentation : NULL;
+    if (ops != NULL && ops->note_stage_signature != NULL)
+        ops->note_stage_signature(playback->backend.opaque, frame, signature);
 }
 
 size_t media_playback_discard_video_before(
@@ -709,7 +843,7 @@ uint64_t media_playback_buffered_until_us(const MediaPlayback *playback)
 {
     if (playback == NULL) return 0;
     uint64_t buffered = playback->buffered_until_us;
-    for (size_t source = 0; source < playback->demux_count; source++) {
+    for (size_t source = 0; source < playback->source_count; source++) {
         if (playback->have_pending[source]) {
             uint64_t pending = playback->pending_time_us[source];
             if (pending > buffered) buffered = pending;
@@ -722,36 +856,38 @@ static bool playback_warm_source(
     MediaPlayback *playback, size_t index, uint64_t target_us,
     char *error, size_t error_size)
 {
-    if (playback == NULL || index >= playback->demux_count
-        || playback->demux[index] == NULL || playback->packet == NULL) {
+    if (playback == NULL || index >= playback->source_count
+        || !source_valid(&playback->source[index])
+        || playback->packet == NULL) {
         return false;
     }
     MediaMp4Sample sample;
-    if (!media_mp4_next_sample(playback->demux[index], &sample)) {
+    MediaSampleSource *source = &playback->source[index];
+    if (!source->ops->next_sample(source->opaque, &sample)) {
         /* The window has not arrived, or the source ended. Neither is a
            reason to fail the open; the playing path will make the connection
            if this could not. Restore the cursor either way. */
-        (void) media_mp4_seek_us(playback->demux[index], target_us, NULL);
+        (void) source->ops->seek_us(source->opaque, target_us, NULL);
         return false;
     }
     bool warmed = false;
     if (sample.size <= playback->packet_capacity) {
-        warmed = media_mp4_read_sample_waiting(
-            playback->demux[index], &sample, playback->packet,
+        warmed = source->ops->read_sample_waiting(
+            source->opaque, &sample, playback->packet,
             playback->packet_capacity);
     }
     /* The read advanced past the keyframe; put the cursor back so the decode
        that follows begins at the target. The sidx window is cached, so this
        re-seek is local. */
     uint64_t restored = 0;
-    if (media_mp4_seek_us(playback->demux[index], target_us, &restored)) {
+    if (source->ops->seek_us(source->opaque, target_us, &restored)) {
         memset(playback->have_pending, 0, sizeof(playback->have_pending));
         memset(playback->source_ended, 0, sizeof(playback->source_ended));
     } else if (error != NULL && error_size != 0) {
         /* A failed restore is the caller's to notice; leave a message but do
            not manufacture a return code the warm has no use for. */
-        (void) media_mp4_last_error(
-            playback->demux[index], error, error_size);
+        (void) source->ops->last_error(
+            source->opaque, error, error_size);
     }
     return warmed;
 }
@@ -765,10 +901,140 @@ bool media_playback_warm_video(MediaPlayback *playback, uint64_t target_us,
 bool media_playback_warm_audio(MediaPlayback *playback, uint64_t target_us,
                                char *error, size_t error_size)
 {
-    /* Only an adaptive stream has a second source to warm; a progressive MP4
-       carries audio in source zero, which warming video already reached. */
-    if (playback == NULL || playback->demux_count < 2) return false;
-    return playback_warm_source(playback, 1, target_us, error, error_size);
+    if (playback == NULL || !playback->has_audio) return false;
+    /* Split A/V keeps AAC in source one. An audio-only pipeline deliberately
+       installs that same adaptive AAC demux as its sole source. Progressive
+       A/V remains source zero and callers warm it through warm_video. */
+    if (playback->source_count < 2) {
+        return playback_warm_source(
+            playback, 0, target_us, error, error_size);
+    }
+    return playback_warm_source(
+        playback, 1, target_us, error, error_size);
+}
+
+#define MEDIA_PLAYBACK_PRIME_MAXIMUM_SKIPPED_SAMPLES 64u
+
+static MediaPlaybackSourcePrimeStatus playback_prime_source(
+    MediaPlayback *playback, size_t index, uint64_t target_us,
+    bool at_or_after_target, bool absent_is_ready, uint64_t *sample_us,
+    char *error, size_t error_size)
+{
+    if (sample_us != NULL) *sample_us = target_us;
+    if (playback == NULL || playback->packet == NULL) {
+        playback_error(error, error_size, "media source is unavailable");
+        return MEDIA_PLAYBACK_SOURCE_PRIME_FAILED;
+    }
+    if (index >= playback->source_count
+        || !source_valid(&playback->source[index])) {
+        if (absent_is_ready) return MEDIA_PLAYBACK_SOURCE_PRIME_READY;
+        playback_error(error, error_size, "media video source is unavailable");
+        return MEDIA_PLAYBACK_SOURCE_PRIME_FAILED;
+    }
+    MediaSampleSource *source = &playback->source[index];
+    if (!source->ops->seek_us(source->opaque, target_us, NULL)) {
+        if (source->ops->would_block(source->opaque))
+            return MEDIA_PLAYBACK_SOURCE_PRIME_PENDING;
+        if (!source->ops->last_error(source->opaque, error, error_size))
+            playback_error(error, error_size,
+                           "media source could not seek for priming");
+        return MEDIA_PLAYBACK_SOURCE_PRIME_FAILED;
+    }
+
+    MediaMp4Sample sample = {0};
+    bool found = false;
+    bool scan_limit_reached = false;
+    for (unsigned skipped = 0;
+         skipped <= MEDIA_PLAYBACK_PRIME_MAXIMUM_SKIPPED_SAMPLES;
+         skipped++) {
+        if (!source->ops->next_sample(source->opaque, &sample)) break;
+        uint64_t time_us = sample_time_us(&sample);
+        if (!at_or_after_target || time_us >= target_us) {
+            found = true;
+            if (sample_us != NULL) *sample_us = time_us;
+            break;
+        }
+        if (skipped == MEDIA_PLAYBACK_PRIME_MAXIMUM_SKIPPED_SAMPLES)
+            scan_limit_reached = true;
+    }
+    if (!found) {
+        bool pending = source->ops->would_block(source->opaque);
+        bool failed = source->ops->last_error(
+            source->opaque, error, error_size);
+        (void) source->ops->seek_us(source->opaque, target_us, NULL);
+        if (pending) return MEDIA_PLAYBACK_SOURCE_PRIME_PENDING;
+        if (scan_limit_reached) {
+            playback_error(error, error_size,
+                           "media source prime scan exceeded %u samples",
+                           MEDIA_PLAYBACK_PRIME_MAXIMUM_SKIPPED_SAMPLES);
+            return MEDIA_PLAYBACK_SOURCE_PRIME_FAILED;
+        }
+        /* End-of-track is a terminally known source head, not a delivery
+           failure. This is reachable near the end of a split stream when
+           audio legitimately finishes before the last video frame. The
+           ordinary pump will rediscover EOF after the cursor restore. */
+        return failed ? MEDIA_PLAYBACK_SOURCE_PRIME_FAILED
+                      : MEDIA_PLAYBACK_SOURCE_PRIME_READY;
+    }
+    if (!playback_ensure_packet_capacity(
+            playback, sample.size, error, error_size)) {
+        (void) source->ops->seek_us(source->opaque, target_us, NULL);
+        return MEDIA_PLAYBACK_SOURCE_PRIME_FAILED;
+    }
+
+    bool ready = source->ops->sample_resident(source->opaque, &sample);
+    bool pending = false;
+    bool failed = false;
+    if (!ready) {
+        ready = source->ops->read_sample(
+            source->opaque, &sample, playback->packet,
+            playback->packet_capacity);
+        pending = !ready && source->ops->would_block(source->opaque);
+        if (!ready && !pending)
+            failed = source->ops->last_error(
+                source->opaque, error, error_size);
+    }
+    if (!source->ops->seek_us(source->opaque, target_us, NULL)) {
+        bool restore_pending = source->ops->would_block(source->opaque);
+        if (restore_pending) {
+            ready = false;
+            pending = true;
+        } else {
+            if (!source->ops->last_error(
+                    source->opaque, error, error_size))
+                playback_error(error, error_size,
+                               "media source could not restore seek target");
+            return MEDIA_PLAYBACK_SOURCE_PRIME_FAILED;
+        }
+    }
+    memset(playback->have_pending, 0, sizeof(playback->have_pending));
+    memset(playback->source_ended, 0, sizeof(playback->source_ended));
+    if (ready) return MEDIA_PLAYBACK_SOURCE_PRIME_READY;
+    if (pending) return MEDIA_PLAYBACK_SOURCE_PRIME_PENDING;
+    if (!failed)
+        playback_error(error, error_size, "media source priming failed");
+    return MEDIA_PLAYBACK_SOURCE_PRIME_FAILED;
+}
+
+MediaPlaybackSourcePrimeStatus media_playback_prime_video_source(
+    MediaPlayback *playback, uint64_t target_us, uint64_t *sample_us,
+    char *error, size_t error_size)
+{
+    return playback_prime_source(
+        playback, 0u, target_us, false, false, sample_us,
+        error, error_size);
+}
+
+MediaPlaybackSourcePrimeStatus media_playback_prime_audio_source(
+    MediaPlayback *playback, uint64_t target_us, uint64_t *sample_us,
+    char *error, size_t error_size)
+{
+    size_t source = playback != NULL && playback->has_audio
+            && playback->source_count == 1u
+        ? 0u : 1u;
+    return playback_prime_source(
+        playback, source, target_us, true, true, sample_us,
+        error, error_size);
 }
 
 static bool media_playback_seek_internal(MediaPlayback *playback,
@@ -786,13 +1052,13 @@ static bool media_playback_seek_internal(MediaPlayback *playback,
     if (!playback->backend.reset(
             playback->backend.opaque, error, error_size)
         || !(strictly_after
-             ? media_mp4_seek_after_us(
-                   playback->demux[0], target_us, &selected_us)
-             : media_mp4_seek_us(
-                   playback->demux[0], target_us, &selected_us))) {
+             ? playback->source[0].ops->seek_after_us(
+                   playback->source[0].opaque, target_us, &selected_us)
+             : playback->source[0].ops->seek_us(
+                   playback->source[0].opaque, target_us, &selected_us))) {
         char demux_error[256] = {0};
-        if (media_mp4_last_error(
-                playback->demux[0],
+        if (playback->source[0].ops->last_error(
+                playback->source[0].opaque,
                 demux_error, sizeof(demux_error))) {
             playback_error(error, error_size, "%s", demux_error);
         } else if (error != NULL && error_size != 0 && error[0] == '\0') {
@@ -801,12 +1067,12 @@ static bool media_playback_seek_internal(MediaPlayback *playback,
         media_playback_fail_seek(playback);
         return false;
     }
-    for (size_t source = 1; source < playback->demux_count; source++) {
-        if (!media_mp4_seek_us(
-                playback->demux[source], selected_us, NULL)) {
+    for (size_t source = 1; source < playback->source_count; source++) {
+        if (!playback->source[source].ops->seek_us(
+                playback->source[source].opaque, selected_us, NULL)) {
             char demux_error[256] = {0};
-            if (media_mp4_last_error(
-                    playback->demux[source],
+            if (playback->source[source].ops->last_error(
+                    playback->source[source].opaque,
                     demux_error, sizeof(demux_error))) {
                 playback_error(error, error_size, "%s", demux_error);
             } else {

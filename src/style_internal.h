@@ -19,7 +19,17 @@ enum {
     STYLE_MODERN_ROTATE = 1u << 6,
     STYLE_MODERN_SCALE = 1u << 7,
     STYLE_MODERN_ISOLATION = 1u << 8,
-    STYLE_MODERN_LOGICAL_RADIUS = 1u << 9
+    STYLE_MODERN_LOGICAL_RADIUS = 1u << 9,
+    STYLE_MODERN_TYPOGRAPHY = 1u << 10,
+    STYLE_MODERN_MIX_BLEND = 1u << 11,
+    STYLE_MODERN_BACKDROP_FILTER = 1u << 12
+};
+
+enum {
+    STYLE_MODERN_TYPOGRAPHY_HYPHENS = 1u << 0,
+    STYLE_MODERN_TYPOGRAPHY_TAB_SIZE = 1u << 1,
+    STYLE_MODERN_TYPOGRAPHY_KERNING = 1u << 2,
+    STYLE_MODERN_TYPOGRAPHY_TEXT_RENDERING = 1u << 3
 };
 #include "style_paint_internal.h"
 
@@ -800,6 +810,8 @@ _Static_assert(sizeof(StyleGridTrackTemplate) == 88,
                "Grid track templates must remain compact");
 _Static_assert(sizeof(StyleGridAreas) == 3555,
                "optional Grid metadata must remain within its PSP budget");
+_Static_assert(sizeof(StyleCustomRule) == 356,
+               "retained sparse-rule metadata must stay padding-neutral");
 
 /* CSS initial font size and the engine's used-font-size clamp (px). */
 #define STYLE_DEFAULT_FONT_PX 16
@@ -950,6 +962,9 @@ bool style_parse_mask_layer_position(Stylesheet *sheet, const char *text,
 bool style_parse_background_layer_position(
     Stylesheet *sheet, const char *text, size_t length,
     ComputedStyle *style);
+bool style_parse_background_layer_position_axis(
+    Stylesheet *sheet, const char *text, size_t length,
+    ComputedStyle *style, bool horizontal);
 bool style_parse_background_layer_size(
     Stylesheet *sheet, const char *text, size_t length,
     ComputedStyle *style);

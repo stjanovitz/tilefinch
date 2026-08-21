@@ -1076,6 +1076,152 @@ static bool script_lazy_plan_prepare(Budget *budget, const char *source,
     return true;
 }
 
+static bool script_cost_identifier_equal(
+    const char *source, size_t begin, size_t end, const char *word)
+{
+    size_t length = end - begin;
+    return strlen(word) == length
+        && memcmp(source + begin, word, length) == 0;
+}
+
+/* One allocation-free lexical pass. It deliberately ignores strings and
+   comments and does not attempt to parse JavaScript; false negatives merely
+   retain today's bounded evaluator, while admission rejection requires a
+   large cross-origin body plus multiple independent risk signals. */
+void script_static_cost_profile(
+    const char *source, size_t length, ScriptStaticCostProfile *profile)
+{
+    if (profile == NULL) return;
+    ScriptStaticCostProfile result = {.bytes = length};
+    if (source == NULL) {
+        *profile = result;
+        return;
+    }
+    bool line_comment = false, block_comment = false;
+    char quote = 0;
+    bool escaped = false;
+    bool saw_document = false;
+    for (size_t i = 0; i < length;) {
+        char value = source[i];
+        if (line_comment) {
+            if (value == '\n' || value == '\r') line_comment = false;
+            i++;
+            continue;
+        }
+        if (block_comment) {
+            if (value == '*' && i + 1u < length && source[i + 1u] == '/') {
+                block_comment = false;
+                i += 2u;
+            } else i++;
+            continue;
+        }
+        if (quote != 0) {
+            if (escaped) escaped = false;
+            else if (value == '\\') escaped = true;
+            else if (value == quote) quote = 0;
+            i++;
+            continue;
+        }
+        if (value == '/' && i + 1u < length) {
+            if (source[i + 1u] == '/') {
+                line_comment = true;
+                i += 2u;
+                continue;
+            }
+            if (source[i + 1u] == '*') {
+                block_comment = true;
+                i += 2u;
+                continue;
+            }
+        }
+        if (value == '\'' || value == '"' || value == '`') {
+            quote = value;
+            i++;
+            continue;
+        }
+        unsigned char byte = (unsigned char) value;
+        if (!(isalpha(byte) || value == '_' || value == '$')) {
+            if (!isspace(byte) && value != '.') saw_document = false;
+            i++;
+            continue;
+        }
+        size_t begin = i++;
+        while (i < length) {
+            unsigned char next = (unsigned char) source[i];
+            if (!(isalnum(next) || source[i] == '_' || source[i] == '$')) {
+                break;
+            }
+            i++;
+        }
+        if (script_cost_identifier_equal(source, begin, i, "for")
+            || script_cost_identifier_equal(source, begin, i, "while")) {
+            result.loops++;
+        } else if (script_cost_identifier_equal(source, begin, i, "eval")) {
+            result.flags |= SCRIPT_COST_SIGNAL_EVAL;
+        } else if (script_cost_identifier_equal(
+                       source, begin, i, "Function")) {
+            result.flags |= SCRIPT_COST_SIGNAL_FUNCTION_CTOR;
+        } else if (script_cost_identifier_equal(
+                       source, begin, i, "function")) {
+            result.flags |= SCRIPT_COST_SIGNAL_FUNCTION_DECL;
+        } else if (saw_document
+                   && script_cost_identifier_equal(
+                          source, begin, i, "write")) {
+            result.flags |= SCRIPT_COST_SIGNAL_DOCUMENT_WRITE;
+        }
+        saw_document = script_cost_identifier_equal(
+            source, begin, i, "document");
+    }
+    *profile = result;
+}
+
+bool script_static_cost_rejects(
+    const ScriptStaticCostProfile *signals, bool third_party, bool module)
+{
+    if (signals == NULL || module || !third_party) return false;
+    const unsigned dynamic = SCRIPT_COST_SIGNAL_EVAL
+                           | SCRIPT_COST_SIGNAL_FUNCTION_CTOR
+                           | SCRIPT_COST_SIGNAL_DOCUMENT_WRITE;
+    if (signals->bytes >= 384u * 1024u) return true;
+    if (signals->bytes >= 192u * 1024u
+        && (signals->flags & dynamic) != 0 && signals->loops >= 2u) {
+        return true;
+    }
+    return signals->bytes >= 256u * 1024u && signals->loops >= 16u;
+}
+
+static void script_record_watchdog_profile(
+    const ScriptStaticCostProfile *signals,
+    ExternalScriptMetrics *metrics)
+{
+    if (signals == NULL || metrics == NULL) return;
+    metrics->watchdog_classification_misses++;
+    if (signals->bytes
+        > SIZE_MAX - metrics->watchdog_classification_miss_bytes) {
+        metrics->watchdog_classification_miss_bytes = SIZE_MAX;
+    } else {
+        metrics->watchdog_classification_miss_bytes += signals->bytes;
+    }
+    if (signals->loops
+        > SIZE_MAX - metrics->watchdog_classification_miss_loops) {
+        metrics->watchdog_classification_miss_loops = SIZE_MAX;
+    } else {
+        metrics->watchdog_classification_miss_loops += signals->loops;
+    }
+    metrics->watchdog_classification_miss_flags |= signals->flags;
+}
+
+static void script_record_watchdog_miss(
+    ScriptRuntime *runtime, const char *source, size_t source_length,
+    ExternalScriptMetrics *metrics)
+{
+    if (runtime == NULL || source == NULL || metrics == NULL
+        || !script_runtime_last_slice_interrupted(runtime)) return;
+    ScriptStaticCostProfile signals;
+    script_static_cost_profile(source, source_length, &signals);
+    script_record_watchdog_profile(&signals, metrics);
+}
+
 static void script_lazy_source_release(void *opaque)
 {
     browser_shared_body_release((BrowserSharedBody *) opaque);
@@ -1162,6 +1308,10 @@ static bool script_evaluate_external_node(
         : script_runtime_evaluate_external_classic_cached(
               runtime, node, source, source_length, request_url,
               response_url, result);
+    if (!ok) {
+        script_record_watchdog_miss(
+            runtime, source, source_length, metrics);
+    }
     if (!ok && trace_failure) {
         fprintf(stderr,
                 "script-evaluation-failure url=\"%s\" bytes=%zu "
@@ -1189,8 +1339,25 @@ static bool script_quota_claim_executable(ScriptRuntime *runtime)
 
 static bool script_evaluate_inline_node(ScriptRuntime *runtime, Budget *budget,
                                         lxb_dom_node_t *node, bool module,
+                                        bool try_data_fast_path,
                                         ExternalScriptMetrics *metrics)
 {
+    ScriptStaticCostProfile inline_cost = {0};
+    if (!try_data_fast_path) {
+        for (lxb_dom_node_t *child = node == NULL ? NULL : node->first_child;
+             child != NULL; child = child->next) {
+            size_t length = 0;
+            const char *source = document_text_data(child, &length);
+            if (source == NULL || length == 0) continue;
+            ScriptStaticCostProfile part;
+            script_static_cost_profile(source, length, &part);
+            inline_cost.bytes = length > SIZE_MAX - inline_cost.bytes
+                ? SIZE_MAX : inline_cost.bytes + length;
+            inline_cost.loops = part.loops > SIZE_MAX - inline_cost.loops
+                ? SIZE_MAX : inline_cost.loops + part.loops;
+            inline_cost.flags |= part.flags;
+        }
+    }
     bool trace_failure = getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL;
     char id_copy[128] = {0};
     size_t id_copy_length = 0;
@@ -1209,7 +1376,7 @@ static bool script_evaluate_inline_node(ScriptRuntime *runtime, Budget *budget,
     bool ok = false;
     ScriptInlineDataEvaluation data = SCRIPT_INLINE_DATA_FALLBACK;
     size_t data_bytes = 0;
-    if (!module) {
+    if (!module && try_data_fast_path) {
         data = script_runtime_evaluate_inline_data(
             runtime, node, &data_bytes);
         if (getenv("TILEFINCH_TRACE_SCRIPT_ATTEMPTS") != NULL) {
@@ -1239,6 +1406,9 @@ static bool script_evaluate_inline_node(ScriptRuntime *runtime, Budget *budget,
        collect at this safe top-level boundary so DOMContentLoaded and later
        small scripts still have a chance to run inside the unchanged limit. */
     if (!ok) (void) script_runtime_collect_and_trim(runtime);
+    if (!ok && script_runtime_last_slice_interrupted(runtime)) {
+        script_record_watchdog_profile(&inline_cost, metrics);
+    }
     /* Author code may remove this element (or replace its whole ancestor
        subtree) during evaluation.  Diagnostics therefore use the bounded
        pre-evaluation copy and never dereference `node` afterwards. */
@@ -1252,6 +1422,89 @@ static bool script_evaluate_inline_node(ScriptRuntime *runtime, Budget *budget,
     }
     budget_free(budget, result);
     return ok;
+}
+
+static bool script_admit_inline_node(
+    ScriptRuntime *runtime, Budget *budget, lxb_dom_node_t *node,
+    const TilefinchContentSecurityPolicy *csp,
+    ExternalScriptMetrics *metrics);
+
+static bool script_admit_inline_data_node(
+    ScriptRuntime *runtime, Budget *budget, lxb_dom_node_t *node,
+    const TilefinchContentSecurityPolicy *csp,
+    ExternalScriptMetrics *metrics, size_t *source_length)
+{
+    if (source_length != NULL) *source_length = 0;
+    if (runtime == NULL || budget == NULL || node == NULL || metrics == NULL
+        || source_length == NULL) return false;
+    if (!tilefinch_csp_allows_inline_script(csp, node)) {
+        metrics->failed++;
+        return false;
+    }
+    if (!script_runtime_inline_data_candidate(node, source_length)) {
+        return false;
+    }
+    /* The source already belongs to the DOM. The fast path needs one bounded
+       copy plus the parsed JSON graph, but no compiler/bytecode expansion.
+       Reserve one source-sized working set in each allocator while preserving
+       the ordinary presentation floor. */
+    return script_admit_known_working_set_with_reserve(
+        runtime, budget, *source_length,
+        SCRIPT_PRESENTATION_RESERVE_BYTES, *source_length, metrics);
+}
+
+/* Execute a classic inline script with data-shape admission ahead of the
+   realm's executable quota. A false-positive candidate falls back to the
+   compiler only after claiming the ordinary quota, preserving JavaScript
+   semantics without charging strict JSON assignments for bytecode they do
+   not create. Rejection is a clean no-op at the document level. */
+static bool script_execute_inline_admitted(
+    ScriptRuntime *runtime, Budget *budget, lxb_dom_node_t *node, bool module,
+    bool executable_precounted, bool prefer_data,
+    const TilefinchContentSecurityPolicy *csp,
+    ExternalScriptMetrics *metrics)
+{
+    if (!module && prefer_data) {
+        size_t source_length = 0;
+        if (script_admit_inline_data_node(
+                runtime, budget, node, csp, metrics, &source_length)) {
+            ScriptInlineDataEvaluation data =
+                script_runtime_evaluate_inline_data(runtime, node, NULL);
+            if (data == SCRIPT_INLINE_DATA_APPLIED) {
+                metrics->inline_data_fast_paths++;
+                metrics->inline_data_quota_exemptions++;
+                if (source_length
+                    > SIZE_MAX - metrics->inline_data_fast_path_bytes) {
+                    metrics->inline_data_fast_path_bytes = SIZE_MAX;
+                } else {
+                    metrics->inline_data_fast_path_bytes += source_length;
+                }
+                return true;
+            }
+            if (data == SCRIPT_INLINE_DATA_FAILED) {
+                metrics->failed++;
+                (void) script_runtime_collect_and_trim(runtime);
+                return true;
+            }
+            /* The allocation-free scan is conservative, while JS_ParseJSON
+               remains authoritative. An ambiguity receives normal script
+               treatment rather than being silently discarded. */
+        } else if (script_runtime_inline_data_candidate(node, NULL)) {
+            return true;
+        }
+    }
+    if (!executable_precounted && !script_quota_claim_executable(runtime)) {
+        metrics->skipped_quota++;
+        return true;
+    }
+    if (!script_admit_inline_node(runtime, budget, node, csp, metrics)) {
+        return true;
+    }
+    if (!script_evaluate_inline_node(
+            runtime, budget, node, module, false, metrics)) {
+        metrics->failed++;
+    }
+    return true;
 }
 
 static bool script_admit_inline_node(ScriptRuntime *runtime, Budget *budget,
@@ -1556,6 +1809,25 @@ static bool execute_external_node(
             return true;
         }
         size_t cached_length = cached_source.length;
+        const char *cached_response_url = module
+            ? cached->module_effective_url : resolved;
+        bool cost_rejected = false;
+        if (!module && cached_length >= 192u * 1024u
+            && !tilefinch_url_same_origin(
+                   document_url, cached_response_url)) {
+            ScriptStaticCostProfile cost;
+            script_static_cost_profile(
+                cached_source.data, cached_length, &cost);
+            cost_rejected = script_static_cost_rejects(
+                &cost, true, false);
+        }
+        if (cost_rejected) {
+            script_runtime_script_quota_abort(runtime, &quota);
+            script_cache_source_release(&cached_source);
+            metrics->cost_class_rejections++;
+            (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
+            return true;
+        }
         if (!script_runtime_script_quota_commit(
                 runtime, &quota, cached_length)) {
             script_runtime_script_quota_abort(runtime, &quota);
@@ -1757,6 +2029,20 @@ static bool execute_external_node(
     if (has_lazy_plan && source_body == NULL) {
         script_lazy_webpack_plan_destroy(&lazy_plan);
         has_lazy_plan = false;
+    }
+    if (ok && !module && source_length >= 192u * 1024u
+        && !tilefinch_url_same_origin(document_url, response_url)) {
+        ScriptStaticCostProfile cost;
+        script_static_cost_profile(source, source_length, &cost);
+        if (script_static_cost_rejects(&cost, true, false)) {
+            script_runtime_script_quota_abort(runtime, &quota);
+            if (has_lazy_plan) script_lazy_webpack_plan_destroy(&lazy_plan);
+            metrics->cost_class_rejections++;
+            (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
+            fetch_result_free(fetch);
+            script_cache_source_release(&cached_source);
+            return true;
+        }
     }
     if (ok && !script_runtime_script_quota_commit(
                   runtime, &quota, source_length)) {
@@ -2442,6 +2728,7 @@ static bool script_node_is_attached(const lxb_dom_node_t *node)
 typedef enum {
     SCRIPT_ADMISSION_PENDING = 0,
     SCRIPT_ADMISSION_COUNTED,
+    SCRIPT_ADMISSION_INLINE_DATA,
     SCRIPT_ADMISSION_MODULE_ALIAS,
     SCRIPT_ADMISSION_DENIED
 } ScriptAdmission;
@@ -2567,6 +2854,24 @@ static void script_plan_initial_admission(
     for (size_t i = 0; i < EXTERNAL_SCRIPT_HARD_LIMIT; i++) {
         plan->module_alias_of[i] = UINT16_MAX;
     }
+    /* Strict assignment-only JSON is installed without compilation. Mark it
+       before reserving executable slots so server-rendered data carriers do
+       not displace later, small logic scripts. The live execution check is
+       repeated because an earlier author script may mutate a later node. */
+    for (size_t i = 0; i < script_count; i++) {
+        lxb_dom_node_t *node = script_runtime_node_handle_resolve(
+            runtime, plan->scripts[i]);
+        if (!script_node_is_attached(node)
+            || script_runtime_dynamic_script_is_scheduled(runtime, node)
+            || script_was_parser_executed(streaming, plan->scripts[i])
+            || script_kind(node) != SCRIPT_KIND_CLASSIC) continue;
+        size_t source_length = 0;
+        const char *source = script_source_attribute(node, &source_length);
+        if ((source == NULL || source_length == 0)
+            && script_runtime_inline_data_candidate(node, NULL)) {
+            plan->admission[i] = SCRIPT_ADMISSION_INLINE_DATA;
+        }
+    }
     /* Parser markup often repeats the same component module once per
        instance. Those elements share one module-map entry and therefore one
        executable quota slot. Mark exact parser references as aliases before
@@ -2609,8 +2914,20 @@ static void script_plan_initial_admission(
         }
     }
 
-    size_t prefix_limit = maximum_scripts < script_count
-        ? maximum_scripts : script_count;
+    /* The historical envelope is the first N executable roots, not the first
+       N script elements: inert/data-only elements consume no browser work in
+       a conforming implementation. Find that bounded cutoff without changing
+       source-order execution. */
+    size_t prefix_limit = script_count;
+    size_t executable_roots = 0;
+    for (size_t i = 0; i < script_count; i++) {
+        if (plan->admission[i] != SCRIPT_ADMISSION_PENDING) continue;
+        if (executable_roots == maximum_scripts) {
+            prefix_limit = i;
+            break;
+        }
+        executable_roots++;
+    }
     size_t critical_claims = 0;
     for (size_t i = prefix_limit;
          i < script_count
@@ -2805,13 +3122,13 @@ static bool document_scripts_execute_internal(
                 return script_execution_plan_finish(
                     module_context, plan, output_metrics, false);
             }
-        } else if (!script_admit_inline_node(
-                       runtime, budget, node,
+        } else if (!script_execute_inline_admitted(
+                       runtime, budget, node, module,
+                       plan->admission[i] == SCRIPT_ADMISSION_COUNTED,
+                       plan->admission[i] == SCRIPT_ADMISSION_INLINE_DATA,
                        &document->content_security_policy, metrics)) {
-            continue;
-        } else if (!script_evaluate_inline_node(
-                       runtime, budget, node, module, metrics)) {
-            metrics->failed++;
+            return script_execution_plan_finish(
+                module_context, plan, output_metrics, false);
         }
     }
     for (size_t i = 0; i < deferred_count; i++) {
@@ -2834,14 +3151,13 @@ static bool document_scripts_execute_internal(
                 return script_execution_plan_finish(
                     module_context, plan, output_metrics, false);
             }
-        } else if (!script_admit_inline_node(
+        } else if (!script_execute_inline_admitted(
                        runtime, budget, node,
+                       script_plan_flag(plan, i, false),
+                       script_plan_flag(plan, i, true), false,
                        &document->content_security_policy, metrics)) {
-            continue;
-        } else if (!script_evaluate_inline_node(
-                       runtime, budget, node,
-                       script_plan_flag(plan, i, false), metrics)) {
-            metrics->failed++;
+            return script_execution_plan_finish(
+                module_context, plan, output_metrics, false);
         }
     }
     /* Scripts inserted by an earlier script are not part of the parser's
@@ -2873,10 +3189,6 @@ static bool document_scripts_execute_internal(
             ScriptKind kind = script_kind(node);
             bool module = kind == SCRIPT_KIND_MODULE;
             if (kind == SCRIPT_KIND_INERT) continue;
-            if (!script_quota_claim_executable(runtime)) {
-                metrics->skipped_quota++;
-                continue;
-            }
             if (module) metrics->modules++;
             metrics->asynchronous++;
             size_t source_length = 0;
@@ -2886,19 +3198,17 @@ static bool document_scripts_execute_internal(
                 if (!execute_external_node_live(
                         document, runtime, budget, session, scheduler, node,
                         base_url, document_url, referrer_policy, module,
-                        true,
+                        false,
                         maximum_total_bytes, maximum_file_bytes, timeout_ms,
                         metrics)) {
                     return script_execution_plan_finish(
                         module_context, plan, output_metrics, false);
                 }
-            } else if (!script_admit_inline_node(
-                           runtime, budget, node,
+            } else if (!script_execute_inline_admitted(
+                           runtime, budget, node, module, false, !module,
                            &document->content_security_policy, metrics)) {
-                continue;
-            } else if (!script_evaluate_inline_node(
-                           runtime, budget, node, module, metrics)) {
-                metrics->failed++;
+                return script_execution_plan_finish(
+                    module_context, plan, output_metrics, false);
             }
         }
         if (added == 0) break;
@@ -2940,12 +3250,6 @@ bool document_scripts_process_closed(
         state->early.skipped_quota++;
         return true;
     }
-    if (!script_quota_claim_executable(runtime)) {
-        state->early.skipped_quota++;
-        state->parser_executed[state->parser_executed_count++] =
-            element_handle;
-        return true;
-    }
     state->parser_executed[state->parser_executed_count++] = element_handle;
     size_t source_length = 0;
     const char *source = script_source_attribute(element, &source_length);
@@ -2955,15 +3259,12 @@ bool document_scripts_process_closed(
         ok = execute_external_node(
             runtime, budget, session, scheduler, element, base_url,
             document_url, referrer_policy, content_security_policy,
-            false, true, maximum_total_bytes,
+            false, false, maximum_total_bytes,
             maximum_file_bytes, timeout_ms, &state->early);
-    } else if (!script_admit_inline_node(
-                   runtime, budget, element, content_security_policy,
-                   &state->early)) {
-        return true;
-    } else if (!script_evaluate_inline_node(
-                   runtime, budget, element, false, &state->early)) {
-        state->early.failed++;
+    } else {
+        ok = script_execute_inline_admitted(
+            runtime, budget, element, false, false, true,
+            content_security_policy, &state->early);
     }
     return ok;
 }

@@ -14,13 +14,18 @@
 
 #define BUDGET_MAGIC UINT32_C(0x42554447)
 #define BUDGET_ALLOCATION_OWNER_MAX UINT32_C(0x00ffffff)
-#define BUDGET_CATEGORY_VALUE_MASK UINT8_C(0x3f)
+#define BUDGET_CATEGORY_VALUE_MASK UINT8_C(0x1f)
+#define BUDGET_ALLOCATION_CACHELINE UINT8_C(0x20)
 #define BUDGET_ALLOCATION_EXTERNAL UINT8_C(0x40)
 #define BUDGET_ALLOCATION_LEXBOR UINT8_C(0x80)
+#define BUDGET_CACHE_LINE_BYTES 64u
 #define BUDGET_CONCURRENT_MAGIC UINT32_C(0x434f4e43)
 #define BUDGET_CONCURRENT_STATE_MAGIC UINT32_C(0x43504f4c)
 
 typedef union AllocationHeader AllocationHeader;
+
+_Static_assert(BUDGET_CATEGORY_COUNT <= BUDGET_CATEGORY_VALUE_MASK + 1u,
+               "Budget categories must fit below allocation flags");
 
 union AllocationHeader {
     struct {
@@ -87,6 +92,11 @@ static bool header_is_lexbor(const AllocationHeader *header)
 static bool header_is_external(const AllocationHeader *header)
 {
     return (header->data.category & BUDGET_ALLOCATION_EXTERNAL) != 0;
+}
+
+static bool header_is_cacheline(const AllocationHeader *header)
+{
+    return (header->data.category & BUDGET_ALLOCATION_CACHELINE) != 0;
 }
 
 static void header_mark_lexbor(void *pointer)
@@ -254,6 +264,64 @@ void *budget_malloc_category(Budget *budget, BudgetCategory category,
     return header + 1;
 }
 
+void *budget_malloc_cacheline_category(Budget *budget,
+                                       BudgetCategory category,
+                                       size_t size)
+{
+    if (budget == NULL) return NULL;
+    if (size == 0) size = 1;
+    if (budget_should_inject_failure(budget)) return NULL;
+
+    if (size > SIZE_MAX - (BUDGET_CACHE_LINE_BYTES - 1u)) {
+        budget->failure_count++;
+        return NULL;
+    }
+    size_t padded = (size + BUDGET_CACHE_LINE_BYTES - 1u)
+        & ~(size_t) (BUDGET_CACHE_LINE_BYTES - 1u);
+    const size_t overhead = sizeof(void *) + sizeof(AllocationHeader)
+        + BUDGET_CACHE_LINE_BYTES - 1u;
+    if (padded > SIZE_MAX - overhead) {
+        budget->failure_count++;
+        return NULL;
+    }
+    size_t charge = overhead + padded;
+    if (charge > budget_remaining(budget)) {
+        budget->failure_count++;
+        return NULL;
+    }
+
+    unsigned char *raw = malloc(charge);
+    if (raw == NULL) {
+        budget->failure_count++;
+        return NULL;
+    }
+    uintptr_t minimum = (uintptr_t) raw + sizeof(void *)
+        + sizeof(AllocationHeader);
+    uintptr_t payload_address = (minimum + BUDGET_CACHE_LINE_BYTES - 1u)
+        & ~(uintptr_t) (BUDGET_CACHE_LINE_BYTES - 1u);
+    AllocationHeader *header = (AllocationHeader *) payload_address - 1;
+    ((void **) header)[-1] = raw;
+
+    header->data.size = size;
+    header->data.owner = budget;
+    header->data.magic = BUDGET_MAGIC;
+    header->data.category = (uint8_t) valid_category(category)
+        | BUDGET_ALLOCATION_CACHELINE;
+    header->data.sequence = ++budget->next_sequence;
+    budget_debug_trap(header->data.sequence);
+    header_set_allocation_owner(header, budget->active_allocation_owner);
+    header->data.previous = NULL;
+    header->data.next = budget->allocation_head;
+    if (header->data.next != NULL)
+        header->data.next->data.previous = header;
+    budget->allocation_head = header;
+    budget->current += charge;
+    budget_category_grow(budget, category, charge, true);
+    budget_capture_global_peak(budget);
+    budget->allocation_count++;
+    return (void *) payload_address;
+}
+
 void *budget_malloc(Budget *budget, size_t size)
 {
     return budget_malloc_category(
@@ -359,7 +427,8 @@ void *budget_realloc_category(Budget *budget, BudgetCategory category,
     AllocationHeader *old_header = header_from_payload(ptr);
     if (budget == NULL || old_header->data.magic != BUDGET_MAGIC
         || old_header->data.owner != budget
-        || header_is_external(old_header)) {
+        || header_is_external(old_header)
+        || header_is_cacheline(old_header)) {
         return NULL;
     }
     if (size == 0) {
@@ -433,7 +502,16 @@ void budget_free(Budget *budget, void *ptr)
     }
 
     size_t size = header->data.size;
+    bool cacheline = header_is_cacheline(header);
     size_t charge = sizeof(AllocationHeader) + size;
+    void *allocation = header;
+    if (cacheline) {
+        size_t padded = (size + BUDGET_CACHE_LINE_BYTES - 1u)
+            & ~(size_t) (BUDGET_CACHE_LINE_BYTES - 1u);
+        charge = sizeof(void *) + sizeof(AllocationHeader)
+            + BUDGET_CACHE_LINE_BYTES - 1u + padded;
+        allocation = ((void **) header)[-1];
+    }
     BudgetCategory category = header_category(header);
     bool external = header_is_external(header);
     if (header->data.previous != NULL) {
@@ -479,7 +557,7 @@ void budget_free(Budget *budget, void *ptr)
         }
     }
     budget->free_count++;
-    free(header);
+    free(allocation);
 }
 
 size_t budget_usable_size(const void *ptr)

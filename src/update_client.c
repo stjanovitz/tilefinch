@@ -32,10 +32,12 @@ struct TilefinchUpdateClient {
     char metadata_url[768];
     char package_url[768];
     char metadata_asset[96];
+    char release_tag[64];
     bool package_relative_to_metadata;
     bool package_url_override;
     bool custom_endpoint;
     bool signed_endpoint_override;
+    bool allow_downgrade;
     TilefinchUpdateTrust trust;
     TilefinchUpdateArtifact artifact;
     uint64_t request_id;
@@ -247,6 +249,14 @@ TilefinchUpdateClient *tilefinch_update_client_create(
             && options->embedded_root == NULL)
         || (options->trust != TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED
             && options->package_url_override != NULL)
+        || (options->release_tag != NULL
+            && (options->artifact != TILEFINCH_UPDATE_ARTIFACT_BROWSER
+                || options->trust != TILEFINCH_UPDATE_TRUST_SIGNED
+                || options->metadata_url_override != NULL
+                || !update_identifier(options->release_tag, 64)))
+        || (options->allow_downgrade
+            && (options->release_tag == NULL
+                || options->trust != TILEFINCH_UPDATE_TRUST_SIGNED))
         || (options->trust == TILEFINCH_UPDATE_TRUST_DEVELOPER_UNSIGNED
             && (options->metadata_url_override == NULL
                 || (!options->package_relative_to_metadata
@@ -274,6 +284,10 @@ TilefinchUpdateClient *tilefinch_update_client_create(
     if (options->metadata_asset != NULL)
         snprintf(client->metadata_asset, sizeof(client->metadata_asset),
                  "%s", options->metadata_asset);
+    if (options->release_tag != NULL)
+        snprintf(client->release_tag, sizeof(client->release_tag),
+                 "%s", options->release_tag);
+    client->allow_downgrade = options->allow_downgrade;
     client->installed_sequence = options->installed_sequence;
     client->installed_sequence_valid = options->installed_sequence_valid;
     client->installed_pair_valid = options->installed_pair_valid;
@@ -305,6 +319,12 @@ TilefinchUpdateClient *tilefinch_update_client_create(
                options->metadata_url_override, client->metadata_url,
                sizeof(client->metadata_url))
                ? (int) strlen(client->metadata_url) : -1)
+        : options->release_tag != NULL
+          ? snprintf(
+                client->metadata_url, sizeof(client->metadata_url),
+                "https://github.com/%s/%s/releases/download/%s/%s",
+                client->owner, client->repository, client->release_tag,
+                "tilefinch-update-v1.tfum")
         : snprintf(
               client->metadata_url, sizeof(client->metadata_url),
               "https://github.com/%s/%s/releases/latest/download/%s",
@@ -553,7 +573,10 @@ static void update_finish_check(
             .launcher_protocol = client->launcher_protocol,
             .installed_sequence = client->installed_sequence,
             .installed_sequence_valid = client->installed_sequence_valid,
-            .installed_pair_valid = client->installed_pair_valid
+            .installed_pair_valid = client->installed_pair_valid,
+            .expected_tag = client->release_tag[0] == '\0'
+                ? NULL : client->release_tag,
+            .allow_downgrade = client->allow_downgrade
         };
         memcpy(
             options.installed_package_sha256, client->installed_sha256, 32);

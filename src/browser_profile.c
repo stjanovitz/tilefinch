@@ -52,6 +52,7 @@ struct BrowserProfile {
     BrowserChromeTheme chrome_theme;
     BrowserYoutubeQuality youtube_quality;
     bool youtube_compact_results;
+    bool youtube_audio_only;
     bool resume_offline_downloads;
     /* Two-valued, so it is stored as the bool it is and lands in the padding
        the neighbouring bool already leaves. The public type stays an enum
@@ -61,6 +62,7 @@ struct BrowserProfile {
     BrowserTextEntryMode text_entry_mode;
     BrowserReaderFont reader_font;
     bool remember_reader_site_scale;
+    bool reader_auto_mode;
     bool update_check_enabled;
     BrowserUpdateChannel update_channel;
     BrowserGlyphLanguage glyph_language;
@@ -160,7 +162,7 @@ static bool profile_valid_update_channel(BrowserUpdateChannel channel)
 static bool profile_valid_glyph_language(BrowserGlyphLanguage language)
 {
     return language >= BROWSER_GLYPH_LANGUAGE_EMBEDDED
-        && language <= BROWSER_GLYPH_LANGUAGE_KOREAN;
+        && language < BROWSER_GLYPH_LANGUAGE_COUNT;
 }
 
 static bool profile_valid_block_site(const char *host)
@@ -480,12 +482,13 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
         /* Fields are append-only: old binaries ignore a suffix and newer
            binaries supply defaults for a missing suffix. */
         ok = fprintf(
-            file, "MEDIA\t%u\t%u\t%u\t%u\t%u\n",
+            file, "MEDIA\t%u\t%u\t%u\t%u\t%u\t%u\n",
             (unsigned) profile->youtube_quality,
             profile->resume_offline_downloads ? 1u : 0u,
             profile->video_scaling_sharp ? 1u : 0u,
             profile->video_startup_buffering ? 1u : 0u,
-            profile->youtube_compact_results ? 1u : 0u) > 0;
+            profile->youtube_compact_results ? 1u : 0u,
+            profile->youtube_audio_only ? 1u : 0u) > 0;
     }
     if (ok) {
         ok = fprintf(
@@ -572,9 +575,10 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
     }
     if (ok) {
         ok = fprintf(
-            file, "READER\t%u\t%u\n",
+            file, "READER\t%u\t%u\t%u\n",
             (unsigned) profile->reader_font,
-            profile->remember_reader_site_scale ? 1u : 0u) > 0;
+            profile->remember_reader_site_scale ? 1u : 0u,
+            profile->reader_auto_mode ? 1u : 0u) > 0;
     }
     for (size_t i = 0;
          ok && i < profile->reader_site_count; i++) {
@@ -809,6 +813,8 @@ static bool profile_load_internal(
             if (fourth != NULL) *fourth++ = '\0';
             char *fifth = fourth == NULL ? NULL : strchr(fourth, '\t');
             if (fifth != NULL) *fifth++ = '\0';
+            char *sixth = fifth == NULL ? NULL : strchr(fifth, '\t');
+            if (sixth != NULL) *sixth++ = '\0';
             BrowserYoutubeQuality quality =
                 (BrowserYoutubeQuality) strtoul(first, NULL, 10);
             if (profile_valid_youtube_quality(quality))
@@ -829,6 +835,9 @@ static bool profile_load_internal(
             if (fifth != NULL)
                 loaded->youtube_compact_results =
                     strtoul(fifth, NULL, 10) != 0;
+            if (sixth != NULL)
+                loaded->youtube_audio_only =
+                    strtoul(sixth, NULL, 10) != 0;
         } else if (strcmp(line, "BLOCK") == 0) {
             ContentBlockerMode mode =
                 (ContentBlockerMode) strtoul(first, NULL, 10);
@@ -932,11 +941,15 @@ static bool profile_load_internal(
             if (second != NULL)
                 loaded->color_emoji = strtoul(second, NULL, 10) != 0;
         } else if (strcmp(line, "READER") == 0 && second != NULL) {
+            char *third = strchr(second, '\t');
+            if (third != NULL) *third++ = '\0';
             BrowserReaderFont font =
                 (BrowserReaderFont) strtoul(first, NULL, 10);
             if (profile_valid_reader_font(font)) loaded->reader_font = font;
             loaded->remember_reader_site_scale =
                 strtoul(second, NULL, 10) != 0;
+            if (third != NULL)
+                loaded->reader_auto_mode = strtoul(third, NULL, 10) != 0;
             if (!loaded->remember_reader_site_scale) {
                 loaded->reader_site_count = 0;
                 memset(loaded->reader_sites, 0, sizeof(loaded->reader_sites));
@@ -1202,6 +1215,11 @@ bool browser_profile_youtube_compact_results(
     return profile != NULL && profile->youtube_compact_results;
 }
 
+bool browser_profile_youtube_audio_only(const BrowserProfile *profile)
+{
+    return profile != NULL && profile->youtube_audio_only;
+}
+
 BrowserVideoScaling browser_profile_video_scaling(
     const BrowserProfile *profile)
 {
@@ -1256,6 +1274,11 @@ bool browser_profile_remember_reader_site_scale(
     const BrowserProfile *profile)
 {
     return profile != NULL && profile->remember_reader_site_scale;
+}
+
+bool browser_profile_reader_auto_mode(const BrowserProfile *profile)
+{
+    return profile != NULL && profile->reader_auto_mode;
 }
 
 bool browser_profile_update_check_enabled(const BrowserProfile *profile)
@@ -1528,6 +1551,12 @@ void browser_profile_set_youtube_compact_results(
     if (profile != NULL) profile->youtube_compact_results = compact;
 }
 
+void browser_profile_set_youtube_audio_only(
+    BrowserProfile *profile, bool enabled)
+{
+    if (profile != NULL) profile->youtube_audio_only = enabled;
+}
+
 void browser_profile_set_video_startup_buffering(
     BrowserProfile *profile, bool enabled)
 {
@@ -1594,6 +1623,12 @@ void browser_profile_set_remember_reader_site_scale(
                    * sizeof(profile->reader_sites[0]));
         profile->reader_site_count = kept;
     }
+}
+
+void browser_profile_set_reader_auto_mode(
+    BrowserProfile *profile, bool enabled)
+{
+    if (profile != NULL) profile->reader_auto_mode = enabled;
 }
 
 bool browser_profile_reader_site_font_percent(
@@ -2341,7 +2376,7 @@ bool browser_profile_build_page(
         && profile_html_text(&out, "</h1>");
     if (ok && history && !profile->history_enabled)
         ok = profile_html_text(
-            &out, "<p class=empty>URL history is off. Enable it in Options."
+            &out, "<p class=empty>URL history is off. Enable it in Settings."
                   "</p>");
     else if (ok && count == 0)
         ok = profile_html_text(

@@ -25,7 +25,16 @@
 #define PSP_DISPLAY_SCREEN_HEIGHT 272
 /* Scanout rows are padded to 512 pixels regardless of the visible width. */
 #define PSP_DISPLAY_STRIDE 512
-#define PSP_DISPLAY_BUFFER_COUNT 2u
+/*
+ * Page chrome gets a third scanout buffer from EDRAM that video already
+ * reserves.  With NEXTFRAME, two buffers require a whole extra vblank before
+ * the old front is safe to write again; the third buffer lets continuous
+ * pointer feedback prepare the following frame immediately.  Video retains
+ * two much larger 8888 buffers so its texture and overlay scratch still fit
+ * in the fixed 2 MiB EDRAM plan.
+ */
+#define PSP_DISPLAY_PAGE_BUFFER_COUNT 3u
+#define PSP_DISPLAY_VIDEO_BUFFER_COUNT 2u
 
 /* Values match the PSPSDK enumerations; the device backend static-asserts
    the equality so this header cannot drift from the SDK. */
@@ -112,6 +121,7 @@ typedef struct {
  *   Page mode
  *     0x000000  page buffer 0      278,528 B
  *     0x044000  page buffer 1      278,528 B
+ *     0x088000  page buffer 2      278,528 B
  *
  *   Video mode
  *     0x000000  video buffer 0     557,056 B   (over both page buffers)
@@ -141,7 +151,7 @@ typedef struct {
 #define PSP_DISPLAY_VIDEO_BASE_BYTES ((size_t) 0)
 #define PSP_DISPLAY_VIDEO_TEXTURE_BASE_BYTES \
     (PSP_DISPLAY_VIDEO_BASE_BYTES \
-     + PSP_DISPLAY_VIDEO_BUFFER_BYTES * PSP_DISPLAY_BUFFER_COUNT)
+     + PSP_DISPLAY_VIDEO_BUFFER_BYTES * PSP_DISPLAY_VIDEO_BUFFER_COUNT)
 /* One 512-pixel-wide surface, which is the shipping texture geometry. */
 #define PSP_DISPLAY_VIDEO_TEXTURE_BYTES PSP_DISPLAY_VIDEO_BUFFER_BYTES
 #define PSP_DISPLAY_OVERLAY_BASE_BYTES \
@@ -162,7 +172,7 @@ bool psp_display_begin(PspDisplay *display, const PspDisplayBackend *backend);
  * out.  Both are compose-side (uncached on device) addresses.
  *
  * NULL while the video surface is active. Every 16-bit composer in the
- * process reaches the panel through these two, so answering NULL is what
+ * process reaches the panel through these accessors, so answering NULL is what
  * stops one of them writing 565 rows into a 32-bit buffer if a caller is ever
  * added that forgets to leave the video surface first.
  */

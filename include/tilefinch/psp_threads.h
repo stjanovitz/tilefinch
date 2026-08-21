@@ -27,6 +27,7 @@
 #define TILEFINCH_PSP_THREAD_PRIORITY_CODEC         0x19
 #define TILEFINCH_PSP_THREAD_PRIORITY_TRANSPORT     0x1f
 #define TILEFINCH_PSP_THREAD_PRIORITY_BROWSER       0x20
+#define TILEFINCH_PSP_THREAD_PRIORITY_SWDEC         0x21
 #define TILEFINCH_PSP_THREAD_PRIORITY_TRANSPORT_SETUP 0x21
 #define TILEFINCH_PSP_THREAD_PRIORITY_CLOCK         0x21
 
@@ -54,5 +55,8 @@ _Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_BROWSER
 _Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_BROWSER
                    < TILEFINCH_PSP_THREAD_PRIORITY_CLOCK,
                "input and chrome must outrank best-effort clock changes");
+_Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_BROWSER
+                   < TILEFINCH_PSP_THREAD_PRIORITY_SWDEC,
+               "software reconstruction must remain preemptible by input");
 
 #endif

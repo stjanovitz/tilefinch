@@ -4,7 +4,6 @@
 #include <string.h>
 #include <strings.h>
 
-#include "tilefinch/content_blocker.h"
 #include "tilefinch/youtube_lite.h"
 
 typedef struct SiteAdapterDefinition SiteAdapterDefinition;
@@ -367,18 +366,16 @@ bool site_adapter_reader_css(
     }
     css[0] = '\0';
     adapter[0] = '\0';
-    char site[CONTENT_BLOCKER_HOST_LIMIT];
-    if (!content_blocker_site_from_url(url, site)) return false;
-    size_t site_length = strlen(site);
-    if (strcmp(site, "localhost") == 0
-        || (site_length >= 6u
-            && strcmp(site + site_length - 6u, ".local") == 0)) {
+    if (url == NULL
+        || (strncasecmp(url, "https://", 8u) != 0
+            && strncasecmp(url, "http://", 7u) != 0)
+        || strstr(url, "://tilefinch.local/") != NULL) {
         return false;
     }
 
     const char *family = font == SITE_ADAPTER_READER_FONT_SERIF
         ? "serif" : "sans-serif";
-    char base[1536];
+    char base[2048];
     int length = snprintf(
         base, sizeof(base),
         "html{font-size:%u%%!important;background:transparent!important}"
@@ -392,8 +389,10 @@ bool site_adapter_reader_css(
         "body>header,body>footer,body>nav,body>aside,"
         "[role=banner],[role=navigation],[role=complementary],"
         "[aria-label*=navigation i],[aria-label*=sidebar i]{display:none!important}"
-        "body:has(article)>*:not(article):not(main):not(:has(article)),"
-        "body:not(:has(article)):has(main)>*:not(main):not(:has(main))"
+        "body:not([data-tilefinch-reader-kind]):has(article)>*"
+        ":not(article):not(main):not(:has(article)),"
+        "body:not([data-tilefinch-reader-kind]):not(:has(article)):has(main)>*"
+        ":not(main):not(:has(main))"
         "{display:none!important}"
         "main,article,[role=main],#content,.content,.main-content{"
         "box-sizing:border-box!important;display:block!important;"
@@ -411,34 +410,38 @@ bool site_adapter_reader_css(
     size_t used = 0;
     if (!reader_append(css, capacity, &used, base)) return false;
 
-    const char *specific = "";
-    const char *name = "reader-generic";
-    if (strcmp(site, "wikipedia.org") == 0) {
-        name = "reader-wikipedia";
-        specific =
-            ".header-container,.mw-header,.vector-header-container,.vector-column-start,"
-            ".vector-column-end,.mw-footer,.page-actions-menu,"
-            ".minerva__tab-container,.mw-editsection,.navbox,.metadata,"
-            ".infobox-above{display:none!important}"
-            "#content,.mw-body,.mw-body-content,.mw-parser-output{"
-            "width:100%!important;max-width:none!important;margin:0!important;"
-            "padding:0!important;float:none!important}";
-    } else if (strcmp(site, "reddit.com") == 0) {
-        name = "reader-reddit";
-        specific =
-            "#header,.side,.footer-parent,.promoted,.rank,.midcol,"
-            ".listing-chooser{display:none!important}"
-            ".content,.sitetable,.thing,.entry{width:100%!important;"
-            "max-width:none!important;margin:0!important;float:none!important}";
-    } else if (strcmp(site, "nytimes.com") == 0) {
-        name = "reader-nytimes";
-        specific =
-            "header,nav,aside,footer,[data-testid*=ad],"
-            "[data-testid*=newsletter]{display:none!important}"
-            "#site-content,main,article{width:100%!important;max-width:none!important;"
-            "margin:0!important;padding:0!important}";
-    }
-    if (!reader_append(css, capacity, &used, specific)) return false;
-    snprintf(adapter, adapter_capacity, "%s", name);
+    const char *content_shape =
+        "body[data-tilefinch-reader-kind]"
+        " [data-tilefinch-reader-path]>*:not([data-tilefinch-reader-path])"
+        ":not([data-tilefinch-reader-article])"
+        ":not([data-tilefinch-reader-list]){display:none!important}"
+        "[data-tilefinch-reader-article]{display:block!important;width:100%!important;"
+        "max-width:none!important;margin:0!important;padding:0!important;"
+        "float:none!important;position:static!important}"
+        "[data-tilefinch-reader-list]{display:block!important;width:100%!important;"
+        "margin:0!important;padding:0!important}"
+        "[data-tilefinch-reader-list]>*:not([data-tilefinch-reader-entry])"
+        "{display:none!important}"
+        "[data-tilefinch-reader-entry]{display:block!important;box-sizing:border-box!important;"
+        "width:100%!important;min-height:72px!important;margin:0!important;"
+        "padding:6px 2px!important;overflow:hidden!important;"
+        "border-bottom:1px solid #b8a58f!important}"
+        "[data-tilefinch-reader-thumb]{display:block!important;float:left!important;"
+        "width:112px!important;height:63px!important;object-fit:cover!important;"
+        "margin:0 9px 3px 0!important}"
+        "[data-tilefinch-reader-title]{display:block!important;font-weight:bold!important;"
+        "font-size:1rem!important;line-height:1.25!important;margin:1px 0 4px!important}"
+        "[data-tilefinch-reader-title][data-tilefinch-reader-label]{font-size:0!important}"
+        "[data-tilefinch-reader-title][data-tilefinch-reader-label]::after{"
+        "content:attr(data-tilefinch-reader-label)!important;font-size:1rem!important;"
+        "line-height:1.25!important}"
+        "[data-tilefinch-reader-meta]{display:block!important;font-size:.82rem!important;"
+        "line-height:1.25!important;color:#66594d!important}"
+        "[data-tilefinch-reader-hide]{display:none!important}"
+        "body[data-tilefinch-reader-kind=watch] [data-tilefinch-reader-list]{"
+        "clear:both!important;margin-top:16px!important;padding-top:8px!important;"
+        "border-top:2px solid #8f775f!important}";
+    if (!reader_append(css, capacity, &used, content_shape)) return false;
+    snprintf(adapter, adapter_capacity, "%s", "reader-content-shape");
     return true;
 }

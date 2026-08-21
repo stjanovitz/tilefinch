@@ -22,6 +22,7 @@ static bool request_destination_valid(TilefinchRequestDestination destination)
         case TILEFINCH_DESTINATION_FETCH:
         case TILEFINCH_DESTINATION_OTHER:
         case TILEFINCH_DESTINATION_FONT:
+        case TILEFINCH_DESTINATION_MEDIA:
             return true;
     }
     return false;
@@ -208,6 +209,7 @@ const char *tilefinch_request_fetch_destination(
         case TILEFINCH_DESTINATION_IMAGE: return "image";
         case TILEFINCH_DESTINATION_FETCH: return "empty";
         case TILEFINCH_DESTINATION_FONT: return "font";
+        case TILEFINCH_DESTINATION_MEDIA: return "video";
         case TILEFINCH_DESTINATION_OTHER: return "empty";
     }
     return "empty";

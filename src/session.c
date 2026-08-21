@@ -2144,6 +2144,15 @@ static void cache_remove(BrowserSession *session, BrowserCacheEntry *entry)
         }
         browser_shared_body_release(entry->stylesheet_parsed_ir);
     }
+    if (entry->decoded_image_pixels != NULL) {
+        size_t pixel_length = entry->decoded_image_pixels->length;
+        if (pixel_length <= session->cache_bytes) {
+            session->cache_bytes -= pixel_length;
+        } else {
+            session->cache_bytes = 0;
+        }
+        browser_shared_body_release(entry->decoded_image_pixels);
+    }
     if (entry->data != NULL) {
         if (entry->length <= session->cache_bytes) {
             session->cache_bytes -= entry->length;
@@ -2453,6 +2462,120 @@ bool browser_session_stylesheet_ir_put_take(
     entry->stylesheet_parsed_ir = body;
     entry->stamp = ++session->clock;
     session->cache_bytes += ir_length;
+    return true;
+}
+
+static BrowserCacheEntry *cache_decoded_image_response_entry(
+    BrowserSession *session, const char *request_url,
+    const TilefinchRequestContext *request_context,
+    const unsigned char *source, size_t source_length)
+{
+    if (session == NULL || request_url == NULL || request_context == NULL
+        || source == NULL || source_length == 0
+        || request_context->destination != TILEFINCH_DESTINATION_IMAGE) {
+        return NULL;
+    }
+    char key[TILEFINCH_URL_SERIALIZED_LIMIT];
+    if (!tilefinch_url_request_key(request_url, key, sizeof(key))) {
+        return NULL;
+    }
+    BrowserCacheEntry *entry = cache_find_resource_key(
+        session, key, request_context);
+    if (entry == NULL || entry->data == NULL
+        || entry->length != source_length
+        || (entry->data != source
+            && memcmp(entry->data, source, source_length) != 0)) {
+        return NULL;
+    }
+    return entry;
+}
+
+bool browser_session_decoded_image_acquire(
+    BrowserSession *session, const char *request_url,
+    const TilefinchRequestContext *request_context,
+    const unsigned char *source, size_t source_length,
+    BrowserDecodedImage *decoded)
+{
+    if (decoded != NULL) *decoded = (BrowserDecodedImage) {0};
+    BrowserCacheEntry *entry = cache_decoded_image_response_entry(
+        session, request_url, request_context, source, source_length);
+    if (decoded == NULL || entry == NULL
+        || entry->decoded_image_pixels == NULL
+        || entry->decoded_image_source_width <= 0
+        || entry->decoded_image_source_height <= 0
+        || entry->decoded_image_width <= 0
+        || entry->decoded_image_height <= 0) return false;
+    BrowserSharedBody *pixels = browser_shared_body_retain(
+        entry->decoded_image_pixels);
+    if (pixels == NULL) return false;
+    *decoded = (BrowserDecodedImage) {
+        .pixels = pixels,
+        .source_width = entry->decoded_image_source_width,
+        .source_height = entry->decoded_image_source_height,
+        .width = entry->decoded_image_width,
+        .height = entry->decoded_image_height
+    };
+    entry->stamp = ++session->clock;
+    return true;
+}
+
+static void cache_decoded_image_invalidate_entry(
+    BrowserSession *session, BrowserCacheEntry *entry)
+{
+    if (entry == NULL || entry->decoded_image_pixels == NULL) return;
+    size_t length = entry->decoded_image_pixels->length;
+    if (length <= session->cache_bytes) session->cache_bytes -= length;
+    else session->cache_bytes = 0;
+    browser_shared_body_release(entry->decoded_image_pixels);
+    entry->decoded_image_pixels = NULL;
+    entry->decoded_image_source_width = 0;
+    entry->decoded_image_source_height = 0;
+    entry->decoded_image_width = 0;
+    entry->decoded_image_height = 0;
+}
+
+bool browser_session_decoded_image_put(
+    BrowserSession *session, const char *request_url,
+    const TilefinchRequestContext *request_context,
+    const unsigned char *source, size_t source_length,
+    BrowserSharedBody *pixels, int source_width, int source_height,
+    int width, int height)
+{
+    if (session == NULL || pixels == NULL || pixels->data == NULL
+        || pixels->length == 0 || pixels->budget != session->budget
+        || source_width <= 0 || source_height <= 0
+        || width <= 0 || height <= 0
+        || (size_t) width > SIZE_MAX / (size_t) height
+        || (size_t) width * (size_t) height > SIZE_MAX / 4u
+        || pixels->length != (size_t) width * (size_t) height * 4u
+        || pixels->length > session->maximum_cache_bytes) return false;
+    BrowserCacheEntry *entry = cache_decoded_image_response_entry(
+        session, request_url, request_context, source, source_length);
+    if (entry == NULL) return false;
+    cache_decoded_image_invalidate_entry(session, entry);
+    while (session->cache_bytes
+           > session->maximum_cache_bytes - pixels->length) {
+        BrowserCacheEntry *victim = NULL;
+        for (size_t i = 0; i < BROWSER_CACHE_ENTRIES; i++) {
+            BrowserCacheEntry *candidate = &session->cache[i];
+            if (candidate->data != NULL && candidate != entry
+                && (victim == NULL || candidate->stamp < victim->stamp)) {
+                victim = candidate;
+            }
+        }
+        if (victim == NULL) return false;
+        cache_remove(session, victim);
+        session->cache_evictions++;
+    }
+    BrowserSharedBody *retained = browser_shared_body_retain(pixels);
+    if (retained == NULL) return false;
+    entry->decoded_image_pixels = retained;
+    entry->decoded_image_source_width = source_width;
+    entry->decoded_image_source_height = source_height;
+    entry->decoded_image_width = width;
+    entry->decoded_image_height = height;
+    entry->stamp = ++session->clock;
+    session->cache_bytes += pixels->length;
     return true;
 }
 
@@ -2848,6 +2971,21 @@ static bool cache_put_http_shared_variant(
             return false;
         }
         replaced_bytes += ir_length;
+    }
+    if (entry->decoded_image_pixels != NULL) {
+        size_t pixel_length = entry->decoded_image_pixels->length;
+        if (pixel_length > SIZE_MAX - replaced_bytes) {
+            browser_shared_body_release(retained);
+            budget_free(session->budget, module_effective_url);
+            budget_free(session->budget, module_initiator_origin);
+            budget_free(session->budget, module_partition_key);
+            budget_free(session->budget, module_request_fragment);
+            budget_free(session->budget, resource_partition_key);
+            budget_free(session->budget, resource_initiator_origin);
+            budget_free(session->budget, resource_initiator_site);
+            return false;
+        }
+        replaced_bytes += pixel_length;
     }
     if (replaced_bytes > session->cache_bytes) {
         browser_shared_body_release(retained);
