@@ -214,6 +214,12 @@ if(PSP)
         src/psp_time.c)
     target_include_directories(tilefinch-launcher PRIVATE
         include "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    if(TILEFINCH_PSP_VALIDATION_LOG)
+        # Launcher phase stamps go only to stdout/PSPLink. They deliberately
+        # do not start the browser's Memory Stick validation logger.
+        target_compile_definitions(tilefinch-launcher PRIVATE
+            TILEFINCH_PSP_LAUNCHER_TIMING=1)
+    endif()
     target_compile_options(tilefinch-launcher PRIVATE -flto)
     target_link_options(tilefinch-launcher PRIVATE -flto)
     target_link_libraries(tilefinch-launcher PRIVATE
@@ -222,6 +228,19 @@ if(PSP)
         pspdisplay pspge pspctrl psprtc)
     set_target_properties(tilefinch-launcher PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/launcher")
+    if(TILEFINCH_STRIP_RELEASE_EBOOT)
+        # create_pbp_file packages the target in place. Strip the launcher's
+        # DWARF just as we do the browser, retaining a local symbol sidecar for
+        # crash analysis and size inspection. This removes no loadable bytes.
+        add_custom_command(TARGET tilefinch-launcher POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy
+                $<TARGET_FILE:tilefinch-launcher>
+                $<TARGET_FILE:tilefinch-launcher>.unstripped
+            COMMAND "${PSPDEV}/bin/psp-strip"
+                $<TARGET_FILE:tilefinch-launcher>
+            COMMENT
+                "Stripping packaged PSP launcher (keeping .unstripped symbols)")
+    endif()
     create_pbp_file(
         TARGET tilefinch-launcher TITLE "Tilefinch"
         ICON_PATH
@@ -325,6 +344,7 @@ if(PSP)
             src/psp_app/psp_app_page.c
             src/psp_app/psp_app_runtime.c
             src/psp_app/psp_app_surfaces.c
+            src/psp_app/psp_app_youtube.c
             src/psp_app/psp_app_exit_handoff.c
             src/psp_app/psp_app_glyph_component.c
             src/psp_app/psp_app_voice_component.c

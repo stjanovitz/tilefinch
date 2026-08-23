@@ -601,6 +601,36 @@
           && attribute_equals(
               runtime_status, "data-edit-activation",
               "pointerdown|mousedown|focus|pointerup|mouseup|click"));
+
+    /* A background relayout may leave a still-live old region owner while
+       the new focus table represents the same link with another node. The
+       retained URL must repair activation and d-pad movement in the same
+       press; resolution failure must not erase that identity. */
+    const LayoutDocument *stale_focus_layout = &interactive.page.layout;
+    CHECK(stale_focus_layout->link_count != 0
+          && stale_focus_layout->links[0].url_length != 0
+          && stale_focus_layout->links[0].url_length
+                 < sizeof(controller.focus_link_url));
+    controller.focus_kind = CONTROLLER_FOCUS_LINK;
+    controller.focus_index = 0;
+    controller.focus_node = runtime_status;
+    controller.focus_handle = 0;
+    memcpy(controller.focus_link_url, stale_focus_layout->links[0].url,
+           stale_focus_layout->links[0].url_length);
+    controller.focus_link_url[stale_focus_layout->links[0].url_length] = '\0';
+    controller.focus_link_url_length = stale_focus_layout->links[0].url_length;
+    ControllerAction stale_link_action = {0};
+    CHECK(controller_activate(&controller, &stale_link_action)
+          && stale_link_action.type == CONTROLLER_ACTION_NAVIGATE
+          && strcmp(stale_link_action.url,
+                    "https://example.test/next") == 0);
+    controller.focus_kind = CONTROLLER_FOCUS_LINK;
+    controller.focus_index = 0;
+    controller.focus_node = runtime_status;
+    controller.focus_handle = 0;
+    CHECK(controller_focus_direction(&controller, CONTROLLER_FOCUS_DOWN)
+          && controller.focus_kind == CONTROLLER_FOCUS_CONTROL);
+
     edit_region = &interactive.page.layout.controls[0];
     CHECK(controller_focus_at(&controller, edit_region->x, edit_region->y)
           && controller_insert_text(&controller, "BC", 2));

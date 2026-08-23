@@ -22,6 +22,8 @@
 
 #define MIB (1024u * 1024u)
 
+static lxb_dom_node_t *test_find_id(lxb_dom_node_t *node, const char *id);
+
 static bool replay_begin(void)
 {
     char error[256] = {0};
@@ -88,6 +90,15 @@ static bool deferred_document_images_replay_begin(void)
     return fetch_trace_replay_begin(
         TILEFINCH_TEST_SOURCE_DIR
             "/fixtures/http-deferred-document-images",
+        error, sizeof(error));
+}
+
+static bool deferred_document_images_partial_failure_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-deferred-document-images-partial-failure",
         error, sizeof(error));
 }
 
@@ -596,6 +607,462 @@ static bool test_static_images_retry_after_transient_idle_failure(void)
                 navigation.performance.background_image_failures,
                 navigation.last_error);
     }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_visible_lazy_static_image_waits_until_idle(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Lazy image</title>"
+        "<style>html,body{margin:0}img{display:block;width:24px;height:24px}"
+        "</style><body><img loading=lazy src=/hero.svg></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && deferred_document_images_replay_begin();
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_static_html(
+        &navigation, generation, "https://deferred-images.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool ok = committed && navigation.page.loaded
+        && navigation.page.images.stats.loaded == 0
+        && navigation.page.deferred_image_count == 1
+        && navigation.page.deferred_image_cursor == 0
+        && navigation_background_resources_pending(&navigation);
+    if (!ok) {
+        fprintf(stderr,
+                "visible-lazy ready=%d committed=%d loaded=%zu "
+                "queue=%zu/%zu pending=%d error=\"%s\"\n",
+                ready, committed, navigation.page.images.stats.loaded,
+                navigation.page.deferred_image_cursor,
+                navigation.page.deferred_image_count,
+                navigation_background_resources_pending(&navigation),
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_visible_lazy_pair_overlaps_transport_and_decode(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Lazy image pair</title>"
+        "<style>html,body{margin:0}img{display:block;width:24px;height:24px}"
+        "</style><body><img id=first loading=lazy src=/hero.svg>"
+        "<img id=second loading=lazy src=/tail.svg></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && deferred_document_images_replay_begin();
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_static_html(
+        &navigation, generation, "https://deferred-images.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool admitted = committed
+        && navigation.page.deferred_image_count == 2
+        && navigation.page.images.stats.loaded == 0
+        && navigation_run_background_resources(&navigation)
+        && navigation.page.deferred_image_job != NULL
+        && navigation.page.deferred_image_batch_count == 2
+        && navigation.page.images.stats.loaded == 0;
+    size_t first_publish_pumps = 0;
+    while (admitted && navigation.page.images.stats.loaded == 0
+           && first_publish_pumps++ < 8u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+    }
+    bool first_published = admitted
+        && navigation.page.deferred_image_job != NULL
+        && navigation.page.deferred_image_batch_count == 2
+        && navigation.page.images.stats.loaded == 1
+        && navigation.performance.background_images_loaded == 1
+        && navigation.performance.background_image_relayouts == 1;
+    lxb_dom_node_t *root = ready
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    lxb_dom_node_t *first = root == NULL
+        ? NULL : test_find_id(root, "first");
+    lxb_dom_node_t *second = root == NULL
+        ? NULL : test_find_id(root, "second");
+    first_published = first_published && first != NULL && second != NULL
+        && image_resource_available(images_find_node(
+               &navigation.page.images, first))
+        && !image_resource_available(images_find_node(
+               &navigation.page.images, second));
+    size_t pumps = 0;
+    while (first_published
+           && navigation_background_resources_pending(&navigation)
+           && pumps++ < 16u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+    }
+    bool ok = first_published
+        && !navigation_background_resources_pending(&navigation)
+        && navigation.page.images.stats.loaded == 2
+        && navigation.performance.background_images_loaded == 2
+        && navigation.performance.background_image_relayouts == 2;
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_deferred_jpeg_decode_publishes_on_later_pump(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Deferred JPEG</title>"
+        "<style>img{display:block;width:24px;height:24px}</style>"
+        "<img id=thumb loading=lazy src=\"data:image/jpeg;base64,"
+        "/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYyLjI4LjEwMgD/2wBDAAgEBAQE"
+        "BAUFBQUFBQYGBgYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJ"
+        "CQoKCgwMCwsODg4RERT/xABMAAEBAAAAAAAAAAAAAAAAAAAABQEBAQAAAAAAAAAA"
+        "AAAAAAAAAAYQAQAAAAAAAAAAAAAAAAAAAAARAQAAAAAAAAAAAAAAAAAAAAD/wAAR"
+        "CABAAEADASIAAhEAAxEA/9oADAMBAAIRAxEAPwCUAvEOAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAA//2Q==\">";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && deferred_document_images_replay_begin();
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_static_html(
+        &navigation, generation, "https://deferred-images.test/jpeg",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool saw_pending_decode = false;
+    size_t pumps = 0;
+    while (committed && navigation_background_resources_pending(&navigation)
+           && pumps++ < 16u) {
+        size_t loaded_before = navigation.page.images.stats.loaded;
+        if (!navigation_run_background_resources(&navigation)) break;
+        if (navigation.page.deferred_image_job != NULL
+            && loaded_before == 0
+            && navigation.page.images.stats.loaded == 0) {
+            saw_pending_decode = true;
+        }
+    }
+    lxb_dom_node_t *root = ready
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    lxb_dom_node_t *thumb = root == NULL
+        ? NULL : test_find_id(root, "thumb");
+    const ImageResource *image = thumb == NULL ? NULL
+        : images_find_node(&navigation.page.images, thumb);
+    bool ok = committed && saw_pending_decode
+        && !navigation_background_resources_pending(&navigation)
+        && navigation.page.images.stats.loaded == 1
+        && navigation.page.images.stats.downsampled == 1
+        && image != NULL && image->pixels != NULL
+        && image->source_width == 64 && image->source_height == 64
+        && image->width > 0 && image->width <= 24
+        && image->height > 0 && image->height <= 24;
+    if (!ok) {
+        fprintf(stderr,
+                "deferred-jpeg ready=%d committed=%d pending=%d pumps=%zu "
+                "loaded=%zu downsampled=%zu image=%d pixels=%d "
+                "source=%dx%d target=%dx%d skipped=%zu error=\"%s\"\n",
+                ready, committed, saw_pending_decode, pumps,
+                navigation.page.images.stats.loaded,
+                navigation.page.images.stats.downsampled,
+                image != NULL, image != NULL && image->pixels != NULL,
+                image == NULL ? 0 : image->source_width,
+                image == NULL ? 0 : image->source_height,
+                image == NULL ? 0 : image->width,
+                image == NULL ? 0 : image->height,
+                navigation.page.images.stats.skipped_limit,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_visible_lazy_queue_continues_after_first_pair(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Lazy image queue</title>"
+        "<style>html,body{margin:0}img{display:block;width:24px;height:24px}"
+        "</style><body><img id=first loading=lazy src=/hero.svg>"
+        "<img id=second loading=lazy src=/tail.svg>"
+        "<img id=third loading=lazy src=/hero.svg>"
+        "<img id=fourth loading=lazy src=/tail.svg></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && deferred_document_images_replay_begin();
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 4, 64 * 1024, 16 * 1024,
+            4, 64 * 1024, 16 * 1024, 128 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_static_html(
+        &navigation, generation, "https://deferred-images.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool first_pair = committed
+        && navigation.page.deferred_image_count == 4
+        && navigation_run_background_resources(&navigation)
+        && navigation.page.deferred_image_batch_count == 2;
+    size_t first_publish_pumps = 0;
+    while (first_pair && navigation.page.images.stats.loaded == 0
+           && first_publish_pumps++ < 8u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+    }
+    first_pair = first_pair && navigation.page.images.stats.loaded == 1;
+    size_t pumps = 0;
+    while (first_pair
+           && navigation_background_resources_pending(&navigation)
+           && pumps++ < 24u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+    }
+    lxb_dom_node_t *root = ready
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    bool ok = first_pair
+        && !navigation_background_resources_pending(&navigation)
+        && image_resource_available(images_find_node(
+               &navigation.page.images, test_find_id(root, "first")))
+        && image_resource_available(images_find_node(
+               &navigation.page.images, test_find_id(root, "second")))
+        && image_resource_available(images_find_node(
+               &navigation.page.images, test_find_id(root, "third")))
+        && image_resource_available(images_find_node(
+               &navigation.page.images, test_find_id(root, "fourth")));
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_focused_deferred_image_follows_active_pair(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Focused lazy image</title>"
+        "<style>html,body{margin:0}img{display:block;width:24px;height:24px}"
+        "</style><body><img id=first loading=lazy src=/hero.svg>"
+        "<img id=second loading=lazy src=/tail.svg>"
+        "<img id=third loading=lazy src=/hero.svg>"
+        "<img id=fourth loading=lazy src=/tail.svg></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && deferred_document_images_replay_begin();
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 4, 64 * 1024, 16 * 1024,
+            4, 64 * 1024, 16 * 1024, 128 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_static_html(
+        &navigation, generation, "https://deferred-images.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool first_published = committed
+        && navigation.page.deferred_image_count == 4
+        && navigation_run_background_resources(&navigation)
+        && navigation.page.deferred_image_job != NULL
+        && navigation.page.deferred_image_batch_count == 2;
+    size_t first_publish_pumps = 0;
+    while (first_published && navigation.page.images.stats.loaded == 0
+           && first_publish_pumps++ < 8u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+    }
+    first_published = first_published
+        && navigation.page.images.stats.loaded == 1
+        && navigation.page.deferred_image_job != NULL;
+    lxb_dom_node_t *second = first_published
+        ? test_find_id(
+              lxb_dom_interface_node(navigation.page.document.html), "second")
+        : NULL;
+    lxb_dom_node_t *third = first_published
+        ? test_find_id(
+              lxb_dom_interface_node(navigation.page.document.html), "third")
+        : NULL;
+    lxb_dom_node_t *fourth = first_published
+        ? test_find_id(
+              lxb_dom_interface_node(navigation.page.document.html), "fourth")
+        : NULL;
+    lxb_dom_node_t *first = first_published
+        ? test_find_id(
+              lxb_dom_interface_node(navigation.page.document.html), "first")
+        : NULL;
+    bool prioritized = first_published && second != NULL && third != NULL
+        && fourth != NULL && first != NULL
+        && navigation_prioritize_deferred_image(&navigation, fourth);
+    bool reprioritized = prioritized
+        && navigation_prioritize_deferred_image(&navigation, third);
+    bool ok = reprioritized
+        && navigation.page.deferred_image_job != NULL
+        && navigation.page.deferred_image_batch_count == 2
+        && navigation.page.deferred_image_cursor == 0
+        && navigation.page.deferred_image_targets[0].node == first
+        && navigation.page.deferred_image_targets[1].node == second
+        && navigation.page.deferred_image_targets[2].node == third
+        && navigation.page.deferred_image_targets[3].node == fourth
+        && navigation.page.images.stats.loaded == 1
+        && image_resource_available(images_find_node(
+               &navigation.page.images, first));
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_deferred_image_focus_rotation_preserves_order(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Stable focused order</title>"
+        "<style>html,body{margin:0}img{display:block;width:24px;height:24px}"
+        "</style><body><img id=first loading=lazy src=/one.svg>"
+        "<img id=second loading=lazy src=/two.svg>"
+        "<img id=third loading=lazy src=/three.svg>"
+        "<img id=fourth loading=lazy src=/four.svg></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 4, 64 * 1024, 16 * 1024,
+            4, 64 * 1024, 16 * 1024, 128 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_static_html(
+        &navigation, generation, "https://stable-order.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    lxb_dom_node_t *root = committed
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    lxb_dom_node_t *first = root == NULL
+        ? NULL : test_find_id(root, "first");
+    lxb_dom_node_t *second = root == NULL
+        ? NULL : test_find_id(root, "second");
+    lxb_dom_node_t *third = root == NULL
+        ? NULL : test_find_id(root, "third");
+    lxb_dom_node_t *fourth = root == NULL
+        ? NULL : test_find_id(root, "fourth");
+    bool initial = committed && first != NULL && second != NULL
+        && third != NULL && fourth != NULL
+        && navigation.page.deferred_image_count == 4
+        && navigation.page.deferred_image_cursor == 0
+        && navigation.page.deferred_image_targets[0].node == first
+        && navigation.page.deferred_image_targets[1].node == second
+        && navigation.page.deferred_image_targets[2].node == third
+        && navigation.page.deferred_image_targets[3].node == fourth;
+    bool promoted_second = initial
+        && navigation_prioritize_deferred_image(&navigation, second)
+        && navigation.page.deferred_image_targets[0].node == second
+        && navigation.page.deferred_image_targets[1].node == first
+        && navigation.page.deferred_image_targets[2].node == third
+        && navigation.page.deferred_image_targets[3].node == fourth;
+    /* Model the singular queue transition after item 2 commits. The image
+       loader's completion mechanics are covered separately; this test pins
+       only the ordering reducer so no transport timing can obscure it. */
+    if (promoted_second) navigation.page.deferred_image_cursor = 1;
+    bool promoted_third = promoted_second
+        && navigation_prioritize_deferred_image(&navigation, third);
+    bool ok = promoted_third
+        && navigation.page.deferred_image_cursor == 1
+        && navigation.page.deferred_image_targets[0].node == second
+        && navigation.page.deferred_image_targets[1].node == third
+        && navigation.page.deferred_image_targets[2].node == first
+        && navigation.page.deferred_image_targets[3].node == fourth;
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_visible_lazy_pair_retries_only_failed_suffix(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Lazy image partial failure</title>"
+        "<style>html,body{margin:0}img{display:block;width:24px;height:24px}"
+        "</style><body><img loading=lazy src=/hero.svg>"
+        "<img loading=lazy src=/tail.svg></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && deferred_document_images_partial_failure_replay_begin();
+    if (ready) {
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_static_html(
+        &navigation, generation, "https://deferred-images.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool first_published = false;
+    bool suffix_failed = false;
+    size_t pumps = 0;
+    while (committed && navigation_background_resources_pending(&navigation)
+           && pumps++ < 24u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+        if (navigation.page.images.stats.loaded == 1
+            && navigation.page.deferred_image_cursor == 0) {
+            first_published = true;
+        }
+        if (navigation.page.deferred_image_cursor == 1
+            && navigation.page.deferred_image_targets != NULL
+            && navigation.page.deferred_image_targets[1].retry_count == 1) {
+            suffix_failed = true;
+            break;
+        }
+    }
+    bool ok = first_published && suffix_failed
+        && navigation.page.images.stats.loaded == 1
+        && image_resource_available(images_find_node(
+               &navigation.page.images,
+               navigation.page.deferred_image_targets[0].node))
+        && !image_resource_available(images_find_node(
+               &navigation.page.images,
+               navigation.page.deferred_image_targets[1].node));
     if (ready) fetch_trace_end();
     if (installed) navigation_destroy(&navigation);
     bool clean = budget.current == 0
@@ -1639,8 +2106,6 @@ static bool prior_page(NavigationSession *navigation)
 {
     return prior_page_at(navigation, "https://prior.test/#old");
 }
-
-static lxb_dom_node_t *test_find_id(lxb_dom_node_t *node, const char *id);
 
 /* Navigation tests retain a single executable and shared fixture lifetime;
    these ordered units follow document, transaction, and runtime boundaries. */

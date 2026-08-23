@@ -1443,5 +1443,48 @@
     font_set_destroy(&missing_primary_fonts);
     CHECK(budget.current == 0);
 
+    FontSet staged_fonts = {0};
+    CHECK(font_set_load_selected(
+              &staged_fonts, &budget,
+              TILEFINCH_TEST_SANS_FONT, TILEFINCH_TEST_SERIF_FONT,
+              TILEFINCH_TEST_SANS_ITALIC_FONT,
+              TILEFINCH_TEST_SANS_BOLD_FONT,
+              TILEFINCH_TEST_SERIF_BOLD_FONT,
+              TILEFINCH_TEST_METRIC_SANS_FONT,
+              TILEFINCH_TEST_METRIC_SANS_BOLD_FONT,
+              4 * MIB, FONT_SET_FACE_SANS)
+          && staged_fonts.sans.loaded
+          && !staged_fonts.serif.loaded
+          && !staged_fonts.metric_sans.loaded);
+    size_t staged_sans_bytes = font_set_loaded_bytes(&staged_fonts);
+    CHECK(staged_sans_bytes != 0
+          && font_set_load_selected(
+                 &staged_fonts, &budget,
+                 TILEFINCH_TEST_SANS_FONT, TILEFINCH_TEST_SERIF_FONT,
+                 TILEFINCH_TEST_SANS_ITALIC_FONT,
+                 TILEFINCH_TEST_SANS_BOLD_FONT,
+                 TILEFINCH_TEST_SERIF_BOLD_FONT,
+                 TILEFINCH_TEST_METRIC_SANS_FONT,
+                 TILEFINCH_TEST_METRIC_SANS_BOLD_FONT,
+                 4 * MIB,
+                 FONT_SET_FACE_METRIC_SANS | FONT_SET_FACE_SANS_BOLD)
+          && staged_fonts.metric_sans.loaded
+          && staged_fonts.sans_bold.loaded
+          && font_set_loaded_bytes(&staged_fonts) > staged_sans_bytes);
+    /* A strict staged request fails without disturbing faces already owned. */
+    CHECK(!font_set_load_selected(
+              &staged_fonts, &budget,
+              TILEFINCH_TEST_SANS_FONT, "/definitely/missing/serif.ttf",
+              TILEFINCH_TEST_SANS_ITALIC_FONT,
+              TILEFINCH_TEST_SANS_BOLD_FONT,
+              TILEFINCH_TEST_SERIF_BOLD_FONT,
+              TILEFINCH_TEST_METRIC_SANS_FONT,
+              TILEFINCH_TEST_METRIC_SANS_BOLD_FONT,
+              4 * MIB, FONT_SET_FACE_SERIF)
+          && !staged_fonts.serif.loaded
+          && staged_fonts.sans.loaded);
+    font_set_destroy(&staged_fonts);
+    CHECK(budget.current == 0);
+
     return 0;
 }

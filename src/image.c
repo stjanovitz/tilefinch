@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,13 @@
 #include "tilefinch/url.h"
 #include "style_internal.h"
 
+#if defined(__PSP__)
+#include <pspkernel.h>
+
+#include "tilefinch/psp_threads.h"
+#include "psp_thread_contract.h"
+#endif
+
 #include <lexbor/html/serialize.h>
 #include <webp/decode.h>
 
@@ -29,7 +37,100 @@
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_RESOURCE, (n), (s))
 #define budget_realloc(b, p, s) budget_realloc_category((b), BUDGET_CATEGORY_RESOURCE, (p), (s))
 
+typedef struct {
+    unsigned char *base;
+    size_t capacity;
+    size_t used;
+    bool exhausted;
+} ImageDecodeArena;
+
+typedef union {
+    struct {
+        size_t size;
+    } value;
+    max_align_t alignment;
+} ImageDecodeArenaHeader;
+
 static Budget *decode_budget;
+static ImageDecodeArena *decode_arena;
+static atomic_bool decode_gate = ATOMIC_VAR_INIT(false);
+static atomic_bool image_worker_decode_pending = ATOMIC_VAR_INIT(false);
+
+static bool image_decode_begin_budget(Budget *budget)
+{
+    bool expected = false;
+    if (budget == NULL || atomic_load_explicit(
+            &image_worker_decode_pending, memory_order_acquire)
+        || !atomic_compare_exchange_strong_explicit(
+            &decode_gate, &expected, true,
+            memory_order_acquire, memory_order_relaxed)) return false;
+    decode_budget = budget;
+    decode_arena = NULL;
+    return true;
+}
+
+static bool image_decode_begin_arena(ImageDecodeArena *arena)
+{
+    bool expected = false;
+    if (arena == NULL || !atomic_compare_exchange_strong_explicit(
+            &decode_gate, &expected, true,
+            memory_order_acquire, memory_order_relaxed)) return false;
+    decode_budget = NULL;
+    decode_arena = arena;
+    return true;
+}
+
+static void image_decode_end(void)
+{
+    decode_budget = NULL;
+    decode_arena = NULL;
+    atomic_store_explicit(&decode_gate, false, memory_order_release);
+}
+
+static bool image_decode_busy(void)
+{
+    return atomic_load_explicit(
+               &image_worker_decode_pending, memory_order_acquire)
+        || atomic_load_explicit(&decode_gate, memory_order_acquire);
+}
+
+static void *image_arena_malloc(size_t size)
+{
+    ImageDecodeArena *arena = decode_arena;
+    if (arena == NULL) return NULL;
+    if (size == 0) size = 1;
+    const size_t alignment = _Alignof(max_align_t);
+    size_t header_at = arena->used;
+    size_t remainder = header_at % alignment;
+    if (remainder != 0) header_at += alignment - remainder;
+    if (header_at > arena->capacity
+        || sizeof(ImageDecodeArenaHeader) > arena->capacity - header_at
+        || size > arena->capacity - header_at
+                         - sizeof(ImageDecodeArenaHeader)) {
+        arena->exhausted = true;
+        return NULL;
+    }
+    ImageDecodeArenaHeader *header =
+        (ImageDecodeArenaHeader *) (void *) (arena->base + header_at);
+    header->value.size = size;
+    arena->used = header_at + sizeof(*header) + size;
+    return header + 1;
+}
+
+static void *image_arena_realloc(void *pointer, size_t size)
+{
+    if (pointer == NULL) return image_arena_malloc(size);
+    if (size == 0) return NULL;
+    ImageDecodeArenaHeader *header =
+        ((ImageDecodeArenaHeader *) pointer) - 1;
+    void *replacement = image_arena_malloc(size);
+    if (replacement != NULL) {
+        size_t copied = header->value.size < size
+            ? header->value.size : size;
+        memcpy(replacement, pointer, copied);
+    }
+    return replacement;
+}
 
 static bool image_is_webp(const unsigned char *encoded, size_t length)
 {
@@ -134,17 +235,20 @@ static unsigned char *image_decode_webp_scaled(
 
 static void *image_malloc(size_t size)
 {
-    return budget_malloc(decode_budget, size);
+    return decode_arena != NULL
+        ? image_arena_malloc(size) : budget_malloc(decode_budget, size);
 }
 
 static void *image_realloc(void *pointer, size_t size)
 {
-    return budget_realloc(decode_budget, pointer, size);
+    return decode_arena != NULL
+        ? image_arena_realloc(pointer, size)
+        : budget_realloc(decode_budget, pointer, size);
 }
 
 static void image_free(void *pointer)
 {
-    budget_free(decode_budget, pointer);
+    if (decode_arena == NULL) budget_free(decode_budget, pointer);
 }
 
 #define STBI_MALLOC(size) image_malloc(size)
@@ -211,7 +315,7 @@ static unsigned char *image_decode_gif_first_frame(
 static unsigned char *image_decode_jpeg_scaled(
     const unsigned char *encoded, int encoded_length,
     int target_width, int target_height, int *source_width,
-    int *source_height, int *components)
+    int *source_height, int *components, unsigned char *external_output)
 {
     if (encoded == NULL || encoded_length <= 0
         || target_width <= 0 || target_height <= 0) return NULL;
@@ -272,7 +376,9 @@ static unsigned char *image_decode_jpeg_scaled(
         }
     }
     size_t target_bytes = (size_t) target_width * (size_t) target_height * 4u;
-    stbi_uc *output = setup_ok ? (stbi_uc *) stbi__malloc(target_bytes) : NULL;
+    stbi_uc *output = setup_ok && external_output != NULL
+        ? external_output
+        : setup_ok ? (stbi_uc *) stbi__malloc(target_bytes) : NULL;
     stbi_uc *rgba_row = output == NULL
         ? NULL : (stbi_uc *) stbi__malloc((size_t) width * 4u);
     if (output == NULL || rgba_row == NULL) setup_ok = false;
@@ -377,13 +483,417 @@ static unsigned char *image_decode_jpeg_scaled(
     stbi__cleanup_jpeg(jpeg);
     STBI_FREE(jpeg);
     if (!setup_ok || next_target_y != target_height) {
-        STBI_FREE(output);
+        if (external_output == NULL) STBI_FREE(output);
         return NULL;
     }
     if (source_width != NULL) *source_width = width;
     if (source_height != NULL) *source_height = height;
     if (components != NULL) *components = stream.img_n >= 3 ? 3 : 1;
     return output;
+}
+
+/* JPEG entropy decoding is the one raster operation that cannot be sliced
+   inside stb without maintaining a private fork. On PSP it therefore runs
+   in one lower-priority slot: input preempts the worker, while the browser
+   thread remains the sole publisher of pixels and layout. The worker never
+   enters Budget. Its complete allocation arena is admitted by the browser
+   thread before dispatch and shrunk to the final RGBA prefix on collection. */
+#define IMAGE_DECODE_WORKER_STACK_BYTES (32u * 1024u)
+#define IMAGE_DECODE_WORKER_WAKE 1u
+#define IMAGE_DECODE_WORKER_SCRATCH_FLOOR (128u * 1024u)
+
+typedef enum {
+    IMAGE_DECODE_WORKER_FREE = 0,
+    IMAGE_DECODE_WORKER_QUEUED,
+    IMAGE_DECODE_WORKER_RUNNING,
+    IMAGE_DECODE_WORKER_READY
+} ImageDecodeWorkerState;
+
+typedef struct {
+    ImageDecodeStatus status;
+    unsigned char *pixels;
+    size_t pixel_bytes;
+    int source_width;
+    int source_height;
+} ImageDecodeWorkerResult;
+
+typedef enum {
+    IMAGE_DECODE_SUBMIT_REJECTED = -1,
+    IMAGE_DECODE_SUBMIT_BUSY = 0,
+    IMAGE_DECODE_SUBMIT_ACCEPTED = 1
+} ImageDecodeSubmitResult;
+
+typedef struct {
+    atomic_uint state;
+    atomic_bool stop_requested;
+    atomic_bool failed;
+    Budget *budget;
+    BudgetReservation stack_reservation;
+    BrowserSharedBody *encoded_body;
+    unsigned char *arena_storage;
+    size_t arena_bytes;
+    size_t output_bytes;
+    ImageDecodeArena arena;
+    uint32_t generation;
+    const unsigned char *encoded;
+    size_t encoded_length;
+    int target_width;
+    int target_height;
+    int source_width;
+    int source_height;
+    ImageDecodeStatus result_status;
+    uint32_t abandoned_generation;
+    bool initialized;
+#if defined(__PSP__)
+    SceUID event;
+    SceUID thread;
+#endif
+} ImageDecodeWorker;
+
+static ImageDecodeWorker image_decode_worker;
+
+static void image_decode_worker_execute(ImageDecodeWorker *worker)
+{
+    if (worker == NULL) return;
+    atomic_store_explicit(
+        &worker->state, IMAGE_DECODE_WORKER_RUNNING,
+        memory_order_release);
+    int source_width = 0, source_height = 0, components = 0;
+    unsigned char *pixels = NULL;
+    bool entered = image_decode_begin_arena(&worker->arena);
+    if (entered) {
+        pixels = image_decode_jpeg_scaled(
+            worker->encoded, (int) worker->encoded_length,
+            worker->target_width, worker->target_height,
+            &source_width, &source_height, &components,
+            worker->arena_storage);
+        image_decode_end();
+    }
+    worker->source_width = source_width;
+    worker->source_height = source_height;
+    worker->result_status = pixels != NULL
+        && source_width > 0 && source_height > 0
+        ? IMAGE_DECODE_SUCCEEDED
+        : worker->arena.exhausted || !entered
+          ? IMAGE_DECODE_TRANSIENT_FAILURE
+          : IMAGE_DECODE_DETERMINISTIC_FAILURE;
+    atomic_store_explicit(
+        &worker->state, IMAGE_DECODE_WORKER_READY,
+        memory_order_release);
+}
+
+#if defined(__PSP__)
+static int image_decode_worker_main(SceSize argument_size, void *arguments)
+{
+    ImageDecodeWorker *worker = NULL;
+    if (arguments != NULL && argument_size == sizeof(worker))
+        memcpy(&worker, arguments, sizeof(worker));
+    if (worker == NULL) return -1;
+    while (!atomic_load_explicit(
+               &worker->stop_requested, memory_order_acquire)) {
+        uint32_t bits = 0;
+        int waited = sceKernelWaitEventFlag(
+            worker->event, IMAGE_DECODE_WORKER_WAKE,
+            PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR, &bits, NULL);
+        if (waited < 0) {
+            atomic_store_explicit(
+                &worker->failed, true, memory_order_release);
+            if (atomic_load_explicit(
+                    &worker->state, memory_order_acquire)
+                == IMAGE_DECODE_WORKER_QUEUED) {
+                worker->result_status = IMAGE_DECODE_TRANSIENT_FAILURE;
+                atomic_store_explicit(
+                    &worker->state, IMAGE_DECODE_WORKER_READY,
+                    memory_order_release);
+            }
+            break;
+        }
+        if (atomic_load_explicit(
+                &worker->stop_requested, memory_order_acquire)) break;
+        if (atomic_load_explicit(
+                &worker->state, memory_order_acquire)
+            == IMAGE_DECODE_WORKER_QUEUED) {
+            image_decode_worker_execute(worker);
+        }
+    }
+    return 0;
+}
+#endif
+
+static bool image_decode_worker_start(Budget *budget)
+{
+    ImageDecodeWorker *worker = &image_decode_worker;
+    /* The PSP frontend owns one BrowserEngine and one Budget at a time. Keep
+       that physical ownership explicit: a second host engine must use the
+       synchronous fallback rather than sharing a worker whose stack and job
+       arena are charged to the first engine. */
+    if (worker->initialized) return worker->budget == budget;
+    memset(worker, 0, sizeof(*worker));
+    atomic_init(&worker->state, IMAGE_DECODE_WORKER_FREE);
+    atomic_init(&worker->stop_requested, false);
+    atomic_init(&worker->failed, false);
+    worker->budget = budget;
+#if defined(__PSP__)
+    worker->event = -1;
+    worker->thread = -1;
+    if (!budget_reservation_acquire(
+            &worker->stack_reservation, budget,
+            BUDGET_CATEGORY_RESOURCE,
+            IMAGE_DECODE_WORKER_STACK_BYTES)) return false;
+    worker->event = sceKernelCreateEventFlag(
+        "tilefinch_jpeg", PSP_EVENT_WAITSINGLE, 0, NULL);
+    worker->thread = worker->event < 0 ? -1 : sceKernelCreateThread(
+        "tilefinch_jpeg", image_decode_worker_main,
+        TILEFINCH_PSP_THREAD_PRIORITY_IMAGE_DECODE,
+        IMAGE_DECODE_WORKER_STACK_BYTES, PSP_THREAD_ATTR_USER, NULL);
+    ImageDecodeWorker *pointer = worker;
+    if (worker->event < 0 || worker->thread < 0
+        || sceKernelStartThread(
+               worker->thread, sizeof(pointer), &pointer) < 0) {
+        if (worker->thread >= 0)
+            (void) sceKernelDeleteThread(worker->thread);
+        if (worker->event >= 0)
+            (void) sceKernelDeleteEventFlag(worker->event);
+        budget_reservation_release(&worker->stack_reservation);
+        memset(worker, 0, sizeof(*worker));
+        return false;
+    }
+#endif
+    worker->initialized = true;
+    return true;
+}
+
+static void image_decode_worker_release_job(ImageDecodeWorker *worker)
+{
+    if (worker == NULL) return;
+    browser_shared_body_release(worker->encoded_body);
+    worker->encoded_body = NULL;
+    budget_free(worker->budget, worker->arena_storage);
+    worker->arena_storage = NULL;
+    worker->arena_bytes = 0;
+    worker->output_bytes = 0;
+    worker->encoded = NULL;
+    worker->encoded_length = 0;
+    worker->abandoned_generation = 0;
+    memset(&worker->arena, 0, sizeof(worker->arena));
+    atomic_store_explicit(
+        &image_worker_decode_pending, false, memory_order_release);
+    atomic_store_explicit(
+        &worker->state, IMAGE_DECODE_WORKER_FREE,
+        memory_order_release);
+}
+
+static bool image_jpeg_progressive(
+    const unsigned char *encoded, size_t length)
+{
+    if (encoded == NULL || length < 4u
+        || encoded[0] != 0xffu || encoded[1] != 0xd8u) return false;
+    size_t at = 2u;
+    while (at + 1u < length) {
+        while (at < length && encoded[at] != 0xffu) at++;
+        while (at < length && encoded[at] == 0xffu) at++;
+        if (at >= length) break;
+        unsigned marker = encoded[at++];
+        if (marker == 0xc2u) return true;
+        if (marker == 0xc0u || marker == 0xc1u || marker == 0xdau
+            || marker == 0xd9u) return false;
+        if (marker == 0x01u || (marker >= 0xd0u && marker <= 0xd8u))
+            continue;
+        if (at + 1u >= length) break;
+        size_t segment = ((size_t) encoded[at] << 8u) | encoded[at + 1u];
+        if (segment < 2u || segment > length - at) break;
+        at += segment;
+    }
+    return false;
+}
+
+static ImageDecodeSubmitResult image_decode_worker_submit(
+    const ImageResource *resource, Budget *budget, uint32_t *token)
+{
+    if (resource == NULL || budget == NULL || token == NULL
+        || resource->encoded_body == NULL
+        || resource->encoded == NULL || resource->encoded_length < 2u
+        || resource->encoded_length > INT32_MAX
+        || resource->encoded[0] != 0xffu || resource->encoded[1] != 0xd8u
+        || resource->source_width <= resource->width
+        || resource->source_height <= resource->height
+        || resource->width <= 0 || resource->height <= 0
+        || resource->source_width <= 0 || resource->source_height <= 0)
+        return IMAGE_DECODE_SUBMIT_REJECTED;
+    ImageDecodeWorker *worker = &image_decode_worker;
+    if (!image_decode_worker_start(budget))
+        return IMAGE_DECODE_SUBMIT_REJECTED;
+    if (atomic_load_explicit(&worker->failed, memory_order_acquire))
+        return IMAGE_DECODE_SUBMIT_REJECTED;
+    unsigned state = atomic_load_explicit(
+        &worker->state, memory_order_acquire);
+    if (state == IMAGE_DECODE_WORKER_READY) {
+        /* READY belongs to the token holder until it collects or explicitly
+           abandons the generation. Never make room for a second producer by
+           silently discarding another continuation's completed pixels. */
+        if (worker->abandoned_generation != worker->generation)
+            return IMAGE_DECODE_SUBMIT_BUSY;
+        image_decode_worker_release_job(worker);
+        state = IMAGE_DECODE_WORKER_FREE;
+    }
+    if (state != IMAGE_DECODE_WORKER_FREE)
+        return IMAGE_DECODE_SUBMIT_BUSY;
+    size_t source_width = (size_t) resource->source_width;
+    size_t source_height = (size_t) resource->source_height;
+    size_t target_width = (size_t) resource->width;
+    size_t target_height = (size_t) resource->height;
+    if (source_width > SIZE_MAX / source_height
+        || target_width > SIZE_MAX / target_height) {
+        return IMAGE_DECODE_SUBMIT_REJECTED;
+    }
+    size_t source_pixels = source_width * source_height;
+    size_t target_pixels = target_width * target_height;
+    if (target_pixels > SIZE_MAX / 4u)
+        return IMAGE_DECODE_SUBMIT_REJECTED;
+    size_t output_bytes = target_pixels * 4u;
+    size_t output_aligned = output_bytes;
+    const size_t alignment = _Alignof(max_align_t);
+    size_t remainder = output_aligned % alignment;
+    if (remainder != 0) {
+        size_t padding = alignment - remainder;
+        if (output_aligned > SIZE_MAX - padding)
+            return IMAGE_DECODE_SUBMIT_REJECTED;
+        output_aligned += padding;
+    }
+    /* Progressive JPEG keeps coefficient planes alongside component data.
+       Baseline thumbnails need only the component bound; reserve the larger
+       peak only when the authored stream actually carries progressive SOF. */
+    size_t scratch_per_pixel = image_jpeg_progressive(
+        resource->encoded, resource->encoded_length) ? 8u : 4u;
+    if (source_pixels > (SIZE_MAX - IMAGE_DECODE_WORKER_SCRATCH_FLOOR
+                         - resource->encoded_length) / scratch_per_pixel)
+        return IMAGE_DECODE_SUBMIT_REJECTED;
+    size_t scratch_bytes = source_pixels * scratch_per_pixel
+        + resource->encoded_length + IMAGE_DECODE_WORKER_SCRATCH_FLOOR;
+    if (output_aligned > SIZE_MAX - scratch_bytes)
+        return IMAGE_DECODE_SUBMIT_REJECTED;
+    size_t arena_bytes = output_aligned + scratch_bytes;
+    unsigned char *storage = budget_malloc(budget, arena_bytes);
+    BrowserSharedBody *body = storage == NULL ? NULL
+        : browser_shared_body_retain(resource->encoded_body);
+    if (storage == NULL || body == NULL) {
+        budget_free(budget, storage);
+        return IMAGE_DECODE_SUBMIT_REJECTED;
+    }
+    worker->encoded_body = body;
+    worker->arena_storage = storage;
+    worker->arena_bytes = arena_bytes;
+    worker->output_bytes = output_bytes;
+    worker->arena = (ImageDecodeArena) {
+        .base = storage + output_aligned,
+        .capacity = scratch_bytes
+    };
+    worker->encoded = body->data;
+    worker->encoded_length = resource->encoded_length;
+    worker->target_width = resource->width;
+    worker->target_height = resource->height;
+    worker->source_width = 0;
+    worker->source_height = 0;
+    worker->result_status = IMAGE_DECODE_TRANSIENT_FAILURE;
+    worker->generation++;
+    if (worker->generation == 0) worker->generation++;
+    *token = worker->generation;
+    atomic_store_explicit(
+        &image_worker_decode_pending, true, memory_order_release);
+    atomic_store_explicit(
+        &worker->state, IMAGE_DECODE_WORKER_QUEUED,
+        memory_order_release);
+#if defined(__PSP__)
+    if (sceKernelSetEventFlag(
+            worker->event, IMAGE_DECODE_WORKER_WAKE) < 0) {
+        atomic_store_explicit(
+            &worker->failed, true, memory_order_release);
+        image_decode_worker_release_job(worker);
+        return IMAGE_DECODE_SUBMIT_REJECTED;
+    }
+#else
+    image_decode_worker_execute(worker);
+#endif
+    return IMAGE_DECODE_SUBMIT_ACCEPTED;
+}
+
+static bool image_decode_worker_collect(
+    uint32_t token, ImageDecodeWorkerResult *result)
+{
+    ImageDecodeWorker *worker = &image_decode_worker;
+    if (!worker->initialized || result == NULL
+        || atomic_load_explicit(&worker->state, memory_order_acquire)
+               != IMAGE_DECODE_WORKER_READY
+        || worker->generation != token) return false;
+    *result = (ImageDecodeWorkerResult) {
+        .status = worker->result_status,
+        .pixel_bytes = worker->output_bytes,
+        .source_width = worker->source_width,
+        .source_height = worker->source_height
+    };
+    if (result->status == IMAGE_DECODE_SUCCEEDED) {
+        unsigned char *shrunk = budget_realloc(
+            worker->budget, worker->arena_storage,
+            worker->output_bytes);
+        result->pixels = shrunk != NULL
+            ? shrunk : worker->arena_storage;
+        worker->arena_storage = NULL;
+    }
+    image_decode_worker_release_job(worker);
+    return true;
+}
+
+static void image_decode_worker_abandon(uint32_t token)
+{
+    ImageDecodeWorker *worker = &image_decode_worker;
+    if (!worker->initialized || token == 0
+        || worker->generation != token) return;
+    worker->abandoned_generation = token;
+    if (atomic_load_explicit(&worker->state, memory_order_acquire)
+            == IMAGE_DECODE_WORKER_READY) {
+        image_decode_worker_release_job(worker);
+        worker->abandoned_generation = 0;
+    }
+}
+
+bool images_decode_worker_reap_cancelled(Budget *budget)
+{
+    ImageDecodeWorker *worker = &image_decode_worker;
+    if (!worker->initialized) return true;
+    if (worker->budget != budget) return false;
+    if (worker->abandoned_generation == 0) return true;
+    if (atomic_load_explicit(&worker->state, memory_order_acquire)
+            != IMAGE_DECODE_WORKER_READY) return false;
+    if (worker->generation == worker->abandoned_generation)
+        image_decode_worker_release_job(worker);
+    worker->abandoned_generation = 0;
+    return true;
+}
+
+bool images_decode_worker_shutdown(Budget *budget)
+{
+    ImageDecodeWorker *worker = &image_decode_worker;
+    if (!worker->initialized) return true;
+    if (worker->budget != budget) return false;
+#if defined(__PSP__)
+    atomic_store_explicit(
+        &worker->stop_requested, true, memory_order_release);
+    (void) sceKernelSetEventFlag(worker->event, IMAGE_DECODE_WORKER_WAKE);
+    if (psp_thread_wait_end_bounded(worker->thread, 2000000u) < 0)
+        return false;
+    (void) sceKernelDeleteThread(worker->thread);
+    (void) sceKernelDeleteEventFlag(worker->event);
+#endif
+    unsigned state = atomic_load_explicit(
+        &worker->state, memory_order_acquire);
+    if (state != IMAGE_DECODE_WORKER_FREE)
+        image_decode_worker_release_job(worker);
+#if defined(__PSP__)
+    budget_reservation_release(&worker->stack_reservation);
+#endif
+    memset(worker, 0, sizeof(*worker));
+    atomic_store_explicit(&decode_gate, false, memory_order_release);
+    return true;
 }
 
 static Budget *svg_budget;
@@ -506,6 +1016,19 @@ typedef struct {
 } ImageRequestScratch;
 
 typedef struct {
+    ImageResource resource;
+    PendingImageTarget *targets;
+    char *url;
+    size_t target_count;
+    size_t encoded_length;
+    size_t source_decoded_bytes;
+    size_t decoded_bytes;
+    double prepared_ms;
+    uint32_t token;
+    bool active;
+} ImagePendingRasterDecode;
+
+typedef struct {
     const PocDocument *document;
     ImageResources *images;
     Stylesheet *stylesheet;
@@ -541,6 +1064,7 @@ typedef struct {
     size_t slice_work_units;
     bool eager_decode_rasters;
     bool deadline_cancelled;
+    ImagePendingRasterDecode raster_decode;
     /* The owner supplies the scheduling boundary. A decoded response is one
        complete idle unit, so do not call the global cooperation hook from
        inside that unit and accidentally turn benign input into image failure. */
@@ -549,7 +1073,8 @@ typedef struct {
 
 struct ImagePriorityLoadJob {
     ImageLoadContext context;
-    ImagePriorityTarget target;
+    ImagePriorityTarget targets[IMAGE_PRIORITY_LOAD_BATCH_LIMIT];
+    size_t target_count;
     ExternalImageStats retained_stats;
     size_t retained_count;
     double started_ms;
@@ -2660,6 +3185,141 @@ static PendingImageFetch *pending_find_free(ImageLoadContext *context)
     return NULL;
 }
 
+static void image_pending_raster_release(ImageLoadContext *context)
+{
+    if (context == NULL || !context->raster_decode.active) return;
+    ImagePendingRasterDecode *pending = &context->raster_decode;
+    image_decode_worker_abandon(pending->token);
+    image_resource_release_owned_pixels(context->budget, &pending->resource);
+    if (pending->resource.owns_encoded) {
+        if (pending->resource.encoded_body != NULL) {
+            browser_shared_body_release(pending->resource.encoded_body);
+        } else {
+            budget_free(context->budget, pending->resource.encoded);
+        }
+    }
+    budget_free(context->budget, pending->targets);
+    budget_free(context->budget, pending->url);
+    memset(pending, 0, sizeof(*pending));
+}
+
+static bool image_pending_raster_publish(
+    ImageLoadContext *context, ImageDecodeWorkerResult *decoded)
+{
+    ImagePendingRasterDecode *pending = &context->raster_decode;
+    ImageResource *resource = &pending->resource;
+    ImageResources *images = context->images;
+    if (decoded->status != IMAGE_DECODE_SUCCEEDED
+        || decoded->pixels == NULL
+        || decoded->pixel_bytes != pending->decoded_bytes
+        || decoded->source_width != resource->source_width
+        || decoded->source_height != resource->source_height) {
+        budget_free(context->budget, decoded->pixels);
+        images->stats.skipped_limit++;
+        image_pending_raster_release(context);
+        return true;
+    }
+    resource->pixels = decoded->pixels;
+    resource->owns_pixels = true;
+    BrowserSharedBody *pixel_body = browser_shared_body_take(
+        context->budget, decoded->pixels, decoded->pixel_bytes);
+    if (pixel_body != NULL) {
+        resource->pixel_body = pixel_body;
+        if (context->session != NULL && pending->url != NULL) {
+            TilefinchRequestContext request_context =
+                image_request_context(context, pending->url);
+            (void) browser_session_decoded_image_put(
+                context->session, pending->url, &request_context,
+                resource->encoded, resource->encoded_length, pixel_body,
+                resource->source_width, resource->source_height,
+                resource->width, resource->height);
+        }
+    }
+    if (resource->encoded_body != NULL) {
+        browser_shared_body_release(resource->encoded_body);
+    } else {
+        budget_free(context->budget, resource->encoded);
+    }
+    resource->encoded = NULL;
+    resource->encoded_body = NULL;
+    resource->encoded_length = 0;
+    resource->owns_encoded = false;
+    if (!image_add(images, *resource)) {
+        image_resource_release_owned_pixels(context->budget, resource);
+        image_pending_raster_release(context);
+        return false;
+    }
+    /* The primary entry now owns the surface. The pending transaction keeps
+       only metadata so rollback can release through ImageResources once. */
+    resource->owns_pixels = false;
+    images->stats.loaded++;
+    if (resource->is_mask) images->stats.masks_loaded++;
+    if (resource->is_background) images->stats.backgrounds_loaded++;
+    images->stats.encoded_bytes += pending->encoded_length;
+    images->stats.decoded_bytes += pending->decoded_bytes;
+    if (resource->width != resource->source_width
+        || resource->height != resource->source_height) {
+        images->stats.downsampled++;
+    }
+    if (pending->source_decoded_bytes
+            > images->stats.largest_source_decode_bytes) {
+        images->stats.largest_source_decode_bytes =
+            pending->source_decoded_bytes;
+    }
+    if (pending->decoded_bytes
+            > images->stats.largest_target_decode_bytes) {
+        images->stats.largest_target_decode_bytes =
+            pending->decoded_bytes;
+    }
+    for (size_t i = 1; i < pending->target_count; i++) {
+        PendingImageTarget target = pending->targets[i];
+        ImageResource alias = *resource;
+        alias.node = target.node;
+        alias.source_hash = target.source_hash;
+        alias.is_mask = target.is_mask;
+        alias.is_background = target.is_background;
+        alias.pseudo = target.pseudo;
+        alias.owns_pixels = false;
+        alias.owns_encoded = false;
+        images->stats.duplicate++;
+        if (!image_add(images, alias)) {
+            image_pending_raster_release(context);
+            return false;
+        }
+    }
+    budget_free(context->budget, pending->targets);
+    budget_free(context->budget, pending->url);
+    memset(pending, 0, sizeof(*pending));
+    return true;
+}
+
+static ImagePriorityLoadStatus image_pending_raster_pump(
+    ImageLoadContext *context)
+{
+    ImagePendingRasterDecode *pending = &context->raster_decode;
+    if (!pending->active) return IMAGE_PRIORITY_LOAD_COMPLETE;
+    if (pending->token == 0) {
+        ImageDecodeSubmitResult submit = image_decode_worker_submit(
+            &pending->resource, context->budget, &pending->token);
+        if (submit == IMAGE_DECODE_SUBMIT_ACCEPTED) {
+            return IMAGE_PRIORITY_LOAD_PENDING;
+        }
+        if (submit == IMAGE_DECODE_SUBMIT_BUSY
+            && image_now_ms() - pending->prepared_ms
+                < (double) context->timeout_ms) {
+            return IMAGE_PRIORITY_LOAD_PENDING;
+        }
+        context->images->stats.skipped_limit++;
+        image_pending_raster_release(context);
+        return IMAGE_PRIORITY_LOAD_COMPLETE;
+    }
+    ImageDecodeWorkerResult decoded = {0};
+    if (!image_decode_worker_collect(pending->token, &decoded))
+        return IMAGE_PRIORITY_LOAD_PENDING;
+    return image_pending_raster_publish(context, &decoded)
+        ? IMAGE_PRIORITY_LOAD_COMPLETE : IMAGE_PRIORITY_LOAD_FAILED;
+}
+
 static bool finish_image_fetch(ImageLoadContext *context,
                                PendingImageFetch *pending,
                                FetchResult *fetched, bool success)
@@ -2763,12 +3423,12 @@ static bool finish_image_fetch(ImageLoadContext *context,
     } else if (!is_svg) {
         uint64_t probe_checkpoint = budget_checkpoint(context->budget);
         size_t probe_baseline = context->budget->current;
-        decode_budget = context->budget;
-        supported = fetched->length <= INT32_MAX
+        bool decode_entered = image_decode_begin_budget(context->budget);
+        supported = decode_entered && fetched->length <= INT32_MAX
                     && stbi_info_from_memory((const stbi_uc *) fetched->data,
                                              (int) fetched->length, &width,
                                              &height, &components) != 0;
-        decode_budget = NULL;
+        if (decode_entered) image_decode_end();
         /* stb_image's metadata API has no returned allocation ownership.
            Malformed inputs in some format probes can strand decoder scratch;
            reclaim only allocations made by this synchronous probe. */
@@ -2881,6 +3541,32 @@ static bool finish_image_fetch(ImageLoadContext *context,
         fetched->data = NULL;
         fetched->length = 0;
         fetched->capacity = 0;
+        bool scaled_jpeg = resource.encoded_length >= 2u
+            && resource.encoded[0] == 0xffu
+            && resource.encoded[1] == 0xd8u
+            && resource.source_width > resource.width
+            && resource.source_height > resource.height;
+        if (context->externally_pumped && context->eager_decode_rasters
+            && scaled_jpeg && resource.encoded_body != NULL
+            && !context->raster_decode.active) {
+            context->raster_decode = (ImagePendingRasterDecode) {
+                .resource = resource,
+                .targets = pending->targets,
+                .url = pending->url,
+                .target_count = pending->target_count,
+                .encoded_length = encoded_length,
+                .source_decoded_bytes = source_decoded,
+                .decoded_bytes = decoded,
+                .prepared_ms = image_now_ms(),
+                .active = true
+            };
+            pending->targets = NULL;
+            pending->target_count = 0;
+            pending->target_capacity = 0;
+            pending->url = NULL;
+            fetch_result_destroy(fetched);
+            return true;
+        }
         /* Priority resources are discovered before page script and the full
            resource walk inflate the shared realm.  Decode their bounded,
            viewport-sized target now while that temporary working window is
@@ -2989,9 +3675,32 @@ static bool finish_one_pending(ImageLoadContext *context, bool wait)
     if (fetched == NULL) return false;
     size_t idle_polls = 0;
     for (;;) {
-        for (size_t i = 0; i < IMAGE_FETCH_CONCURRENCY; i++) {
+        size_t first = 0;
+        size_t last = IMAGE_FETCH_CONCURRENCY;
+        if (context->externally_pumped
+            && context->priority_target_count > 1u) {
+            /* A visible batch overlaps transport, but its pixels must become
+               authoritative in priority order. Otherwise a faster second
+               thumbnail relayouts and paints before the focused first card.
+               Completed later responses remain safely retained by the
+               scheduler until the preceding request is consumed. */
+            while (first < IMAGE_FETCH_CONCURRENCY
+                   && context->pending[first].request_id == 0) first++;
+            last = first < IMAGE_FETCH_CONCURRENCY ? first + 1u : first;
+        }
+        for (size_t i = first; i < last; i++) {
             PendingImageFetch *pending = &context->pending[i];
             if (pending->request_id == 0) continue;
+            /* Do not take ownership of a completed response until its format
+               probe can enter the decoder. A previous page may abandon a
+               lower-priority JPEG job without waiting; during that bounded
+               tail, consuming this result would turn gate contention into a
+               terminal unsupported-format verdict. The scheduler safely
+               retains the completion for the next pump. Never spin here: the
+               browser outranks the worker on PSP and must yield a frame/poll
+               so the worker can release the gate. */
+            (void) images_decode_worker_reap_cancelled(context->budget);
+            if (image_decode_busy()) continue;
             bool success = false;
             if (!fetch_scheduler_take(context->scheduler,
                                       pending->request_id,
@@ -3111,6 +3820,7 @@ static void cancel_pending(ImageLoadContext *context)
     }
     context->pending_count = 0;
     context->pending_reserved_bytes = 0;
+    image_pending_raster_release(context);
 }
 
 /* Many image CDNs expose the same asset through an extension-selected
@@ -4013,7 +4723,7 @@ static bool images_load_external_impl(
         || maximum_count == 0
         || maximum_total_encoded_bytes == 0
         || maximum_single_encoded_bytes == 0 || maximum_decoded_bytes == 0
-        || timeout_ms <= 0 || decode_budget != NULL) return false;
+        || timeout_ms <= 0 || image_decode_busy()) return false;
     /* A caller may request more images than the engine can track (a
        reference-scoring profile can raise the count to fit a busy 106-image
        page).  Exceeding a limit must soft-skip, never fail the
@@ -4481,14 +5191,34 @@ ImagePriorityLoadJob *images_priority_load_begin(
     size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session)
 {
+    return images_priority_load_begin_batch(
+        document, stylesheet, images, target, 1u, budget, base_url,
+        document_url, referrer_policy, maximum_count,
+        maximum_total_encoded_bytes, maximum_single_encoded_bytes,
+        maximum_decoded_bytes, timeout_ms, scheduler, session);
+}
+
+ImagePriorityLoadJob *images_priority_load_begin_batch(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, const ImagePriorityTarget *targets,
+    size_t target_count, Budget *budget, const char *base_url,
+    const char *document_url, const char *referrer_policy,
+    size_t maximum_count, size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session)
+{
     if (document == NULL || document->html == NULL || stylesheet == NULL
-        || images == NULL || target == NULL || target->node == NULL
-        || target->kind != IMAGE_PRIORITY_KIND_DOCUMENT
+        || images == NULL || targets == NULL || target_count == 0
+        || target_count > IMAGE_PRIORITY_LOAD_BATCH_LIMIT
         || budget == NULL || base_url == NULL || document_url == NULL
         || maximum_count == 0 || maximum_total_encoded_bytes == 0
         || maximum_single_encoded_bytes == 0 || maximum_decoded_bytes == 0
-        || timeout_ms <= 0 || scheduler == NULL || decode_budget != NULL) {
+        || timeout_ms <= 0 || scheduler == NULL || image_decode_busy()) {
         return NULL;
+    }
+    for (size_t at = 0; at < target_count; at++) {
+        if (targets[at].node == NULL
+            || targets[at].kind != IMAGE_PRIORITY_KIND_DOCUMENT) return NULL;
     }
     if (maximum_count > MAX_TRACKED_IMAGE_NODES) {
         maximum_count = MAX_TRACKED_IMAGE_NODES;
@@ -4501,7 +5231,8 @@ ImagePriorityLoadJob *images_priority_load_begin(
     }
     ImagePriorityLoadJob *job = budget_calloc(budget, 1, sizeof(*job));
     if (job == NULL) return NULL;
-    job->target = *target;
+    memcpy(job->targets, targets, target_count * sizeof(*targets));
+    job->target_count = target_count;
     job->retained_count = images->count;
     job->retained_stats = images->stats;
     job->retained_priority_staged = images->priority_staged;
@@ -4522,8 +5253,8 @@ ImagePriorityLoadJob *images_priority_load_begin(
         .scheduler = scheduler,
         .session = session,
         .viewport_width = stylesheet->viewport_width,
-        .priority_targets = &job->target,
-        .priority_target_count = 1,
+        .priority_targets = job->targets,
+        .priority_target_count = target_count,
         .deadline_ms = 0.0,
         .slice_started_us = tilefinch_platform_monotonic_time_us(),
         .eager_decode_rasters = true,
@@ -4553,11 +5284,26 @@ ImagePriorityLoadStatus images_priority_load_pump(
         job->started_ms = image_now_ms();
         context->deadline_ms =
             job->started_ms + (double) context->timeout_ms;
-        if (!image_work(context, 1, false, "deferred-image-admission")
-            || !image_process_priority_target(context, &job->target)) {
-            return image_priority_load_fail(job);
+        for (size_t at = 0; at < job->target_count; at++) {
+            if (at != 0 && fetch_scheduler_enqueue_would_block(
+                    context->scheduler,
+                    context->maximum_single_encoded_bytes)) {
+                /* The second visible target is optional overlap, never an
+                   admission failure. Leave it in the page queue for the next
+                   job when only one descriptor is presently available. */
+                job->target_count = at;
+                context->priority_target_count = at;
+                break;
+            }
+            if (!image_work(context, 1, false,
+                            "deferred-image-admission")
+                || !image_process_priority_target(
+                       context, &job->targets[at])) {
+                return image_priority_load_fail(job);
+            }
         }
-        if (context->pending_count == 0) {
+        if (context->pending_count == 0
+            && !context->raster_decode.active) {
             image_finish_slice(context);
             context->images->priority_staged = true;
             job->terminal = true;
@@ -4567,6 +5313,19 @@ ImagePriorityLoadStatus images_priority_load_pump(
            or cache-backed transport result is consumed on the next call. */
         image_finish_slice(context);
         return IMAGE_PRIORITY_LOAD_PENDING;
+    }
+
+    if (context->raster_decode.active) {
+        ImagePriorityLoadStatus decode_status =
+            image_pending_raster_pump(context);
+        image_finish_slice(context);
+        if (decode_status == IMAGE_PRIORITY_LOAD_FAILED)
+            return image_priority_load_fail(job);
+        if (decode_status == IMAGE_PRIORITY_LOAD_PENDING
+            || context->pending_count != 0) {
+            return IMAGE_PRIORITY_LOAD_PENDING;
+        }
+        goto image_priority_load_complete;
     }
 
     cancel_expired_pending(context);
@@ -4581,16 +5340,35 @@ ImagePriorityLoadStatus images_priority_load_pump(
     image_note_pending_progress(context);
     image_cancel_no_progress_pending(context);
     if (completed == 0) {
-        image_finish_slice(context);
-        return IMAGE_PRIORITY_LOAD_PENDING;
-    }
-    if (!finish_one_pending(context, false)) {
+        /* A later request can already be complete while ordered publication
+           waits for the first one. Once the first is consumed, the retained
+           later completion produces no new scheduler-completion edge, so
+           explicitly try to take it before declaring this slice idle. */
+        if (!(context->externally_pumped
+              && context->priority_target_count > 1u)) {
+            image_finish_slice(context);
+            return IMAGE_PRIORITY_LOAD_PENDING;
+        }
+        size_t pending_before = context->pending_count;
+        if (!finish_one_pending(context, false)) {
+            return image_priority_load_fail(job);
+        }
+        if (context->pending_count == pending_before) {
+            image_finish_slice(context);
+            return IMAGE_PRIORITY_LOAD_PENDING;
+        }
+    } else if (!finish_one_pending(context, false)) {
         return image_priority_load_fail(job);
     }
     if (context->pending_count != 0) {
         image_finish_slice(context);
         return IMAGE_PRIORITY_LOAD_PENDING;
     }
+    if (context->raster_decode.active) {
+        image_finish_slice(context);
+        return IMAGE_PRIORITY_LOAD_PENDING;
+    }
+image_priority_load_complete:
     context->images->stats.deadline_cancelled =
         context->deadline_cancelled ? 1u : 0u;
     context->images->stats.deadline_exceeded =
@@ -4602,6 +5380,31 @@ ImagePriorityLoadStatus images_priority_load_pump(
     context->images->priority_staged = true;
     job->terminal = true;
     return IMAGE_PRIORITY_LOAD_COMPLETE;
+}
+
+void images_priority_load_commit_progress(ImagePriorityLoadJob *job)
+{
+    if (job == NULL || job->context.images == NULL || job->rolled_back)
+        return;
+    job->retained_count = job->context.images->count;
+    job->retained_stats = job->context.images->stats;
+    job->retained_priority_staged =
+        job->context.images->priority_staged;
+}
+
+size_t images_priority_load_target_count(const ImagePriorityLoadJob *job)
+{
+    return job == NULL ? 0 : job->target_count;
+}
+
+bool images_priority_load_contains_node(
+    const ImagePriorityLoadJob *job, const lxb_dom_node_t *node)
+{
+    if (job == NULL || node == NULL) return false;
+    for (size_t at = 0; at < job->target_count; at++) {
+        if (job->targets[at].node == node) return true;
+    }
+    return false;
 }
 
 void images_priority_load_destroy(ImagePriorityLoadJob *job)
@@ -4637,10 +5440,10 @@ ImageDecodeStatus image_resource_decode_checked(
         || image->encoded_length > INT32_MAX) {
         return IMAGE_DECODE_DETERMINISTIC_FAILURE;
     }
-    if (decode_budget != NULL) return IMAGE_DECODE_TRANSIENT_FAILURE;
+    if (!image_decode_begin_budget(budget))
+        return IMAGE_DECODE_TRANSIENT_FAILURE;
     int width = 0, height = 0, components = 0;
     size_t failures_before = budget->failure_count;
-    decode_budget = budget;
     bool scaled_jpeg = image->encoded_length >= 2u
         && image->encoded[0] == 0xffu && image->encoded[1] == 0xd8u
         && image->source_width > image->width
@@ -4661,11 +5464,12 @@ ImageDecodeStatus image_resource_decode_checked(
         : scaled_jpeg
         ? image_decode_jpeg_scaled(
               image->encoded, (int) image->encoded_length,
-              image->width, image->height, &width, &height, &components)
+              image->width, image->height, &width, &height, &components,
+              NULL)
         : stbi_load_from_memory(
               image->encoded, (int) image->encoded_length,
               &width, &height, &components, 4);
-    decode_budget = NULL;
+    image_decode_end();
     int source_width = image->source_width > 0
                        ? image->source_width : image->width;
     int source_height = image->source_height > 0

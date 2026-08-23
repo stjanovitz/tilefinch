@@ -295,6 +295,8 @@ typedef enum {
     IMAGE_PRIORITY_LOAD_FAILED
 } ImagePriorityLoadStatus;
 
+#define IMAGE_PRIORITY_LOAD_BATCH_LIMIT 2u
+
 static inline int image_resource_intrinsic_width(const ImageResource *image)
 {
     return image == NULL ? 0
@@ -500,9 +502,33 @@ ImagePriorityLoadJob *images_priority_load_begin(
     size_t maximum_total_encoded_bytes,
     size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session);
+/* The same ownership transaction may admit two already-proven-visible
+   targets. Both share one rollback snapshot; the first completed response is
+   still decoded and publishable while transport advances the second. */
+ImagePriorityLoadJob *images_priority_load_begin_batch(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, const ImagePriorityTarget *targets,
+    size_t target_count, Budget *budget, const char *base_url,
+    const char *document_url, const char *referrer_policy,
+    size_t maximum_count, size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session);
 ImagePriorityLoadStatus images_priority_load_pump(
     ImagePriorityLoadJob *job);
+/* Advance the job's rollback boundary after the owner has successfully
+   rebuilt layout around newly decoded pixels. */
+void images_priority_load_commit_progress(ImagePriorityLoadJob *job);
+size_t images_priority_load_target_count(const ImagePriorityLoadJob *job);
+bool images_priority_load_contains_node(
+    const ImagePriorityLoadJob *job, const lxb_dom_node_t *node);
 void images_priority_load_destroy(ImagePriorityLoadJob *job);
+/* Stop the process-wide PSP JPEG worker before its owning Budget is torn
+   down. Navigation cancellation itself never waits for the worker: a stale
+   completion is discarded by generation on a later browser-thread pump. */
+bool images_decode_worker_shutdown(Budget *budget);
+/* Browser-thread reap for a navigation-cancelled completion. False means a
+   lower-priority decode is still running; callers never wait for it. */
+bool images_decode_worker_reap_cancelled(Budget *budget);
 const ImageResource *images_find_node(const ImageResources *images,
                                       const lxb_dom_node_t *node);
 const ImageResource *images_find_mask_node(const ImageResources *images,

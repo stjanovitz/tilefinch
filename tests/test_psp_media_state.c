@@ -86,7 +86,8 @@ static bool test_one_shot_presentation_boundaries(void)
     CHECK(!machine.pause_after_frame);
 
     CHECK(apply(&machine, (PspMediaEvent) {
-        .type = PSP_MEDIA_EVENT_SEEK
+        .type = PSP_MEDIA_EVENT_SEEK,
+        .resume_playing = false
     }));
     CHECK(apply(&machine, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_PREVIEW_STARTED
@@ -291,14 +292,20 @@ static bool test_seek_supersede_and_recovery(void)
     CHECK(apply(&machine, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_PRIME_READY
     }));
-    CHECK(apply(&machine, (PspMediaEvent) {.type = PSP_MEDIA_EVENT_SEEK}));
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_SEEK,
+        .resume_playing = true
+    }));
     uint64_t first_generation = machine.seek_generation;
     CHECK(machine.state == PSP_MEDIA_SESSION_SEEKING);
     CHECK(apply(&machine, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_SOURCE_STARVED
     }));
     CHECK(machine.seeking_phase == PSP_MEDIA_SEEK_WAITING_FOR_SOURCE);
-    CHECK(apply(&machine, (PspMediaEvent) {.type = PSP_MEDIA_EVENT_SEEK}));
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_SEEK,
+        .resume_playing = true
+    }));
     CHECK(machine.state == PSP_MEDIA_SESSION_SEEKING);
     CHECK(machine.seeking_phase == PSP_MEDIA_SEEK_PREPARING);
     CHECK(machine.seek_generation == first_generation + 1u);
@@ -306,7 +313,10 @@ static bool test_seek_supersede_and_recovery(void)
         .type = PSP_MEDIA_EVENT_DECODER_REFUSED
     }));
     CHECK(machine.state == PSP_MEDIA_SESSION_RECOVERING);
-    CHECK(apply(&machine, (PspMediaEvent) {.type = PSP_MEDIA_EVENT_SEEK}));
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_SEEK,
+        .resume_playing = true
+    }));
     CHECK(machine.state == PSP_MEDIA_SESSION_RECOVERING);
     CHECK(machine.pending_seek);
     CHECK(apply(&machine, (PspMediaEvent) {
@@ -315,6 +325,44 @@ static bool test_seek_supersede_and_recovery(void)
     CHECK(machine.state == PSP_MEDIA_SESSION_SEEKING);
     CHECK(!machine.pending_seek);
     CHECK(machine.seek_generation == first_generation + 2u);
+    return true;
+}
+
+static bool test_seek_resume_intent_is_authoritative(void)
+{
+    PspMediaMachine machine = psp_media_machine_initial();
+    CHECK(open_to_priming(&machine, true, true));
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_PRIME_READY
+    }));
+    CHECK(machine.state == PSP_MEDIA_SESSION_PLAYING);
+
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_SEEK,
+        .resume_playing = true
+    }));
+    CHECK(machine.state == PSP_MEDIA_SESSION_SEEKING);
+    CHECK(machine.resume_target == PSP_MEDIA_RESUME_PLAYING);
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_SEEK_COMPLETE
+    }));
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_PRIME_READY
+    }));
+    CHECK(machine.state == PSP_MEDIA_SESSION_PLAYING);
+
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_SEEK,
+        .resume_playing = false
+    }));
+    CHECK(machine.resume_target == PSP_MEDIA_RESUME_PAUSED);
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_SEEK_COMPLETE
+    }));
+    CHECK(apply(&machine, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_PRIME_READY
+    }));
+    CHECK(machine.state == PSP_MEDIA_SESSION_PAUSED);
     return true;
 }
 
@@ -678,11 +726,12 @@ static bool test_randomized_lifecycle_sequences_preserve_invariants(void)
                 .type = (PspMediaEventType) (
                     1u + bits % (PSP_MEDIA_EVENT_COUNT - 1u)),
                 .autoplay = (bits & (UINT64_C(1) << 8)) != 0,
-                .has_separate_audio = (bits & (UINT64_C(1) << 9)) != 0,
-                .retain_pipeline = (bits & (UINT64_C(1) << 10)) != 0,
-                .reuse_pipeline = (bits & (UINT64_C(1) << 11)) != 0,
+                .resume_playing = (bits & (UINT64_C(1) << 9)) != 0,
+                .has_separate_audio = (bits & (UINT64_C(1) << 10)) != 0,
+                .retain_pipeline = (bits & (UINT64_C(1) << 11)) != 0,
+                .reuse_pipeline = (bits & (UINT64_C(1) << 12)) != 0,
                 .readiness = (PspMediaPresentationReadiness) (
-                    (bits >> 12) % 3u)
+                    (bits >> 13) % 3u)
             };
             uint64_t generation_before = machine.seek_generation;
             PspMediaDecision decision =
@@ -715,6 +764,7 @@ int main(void)
         || !test_video_only_skips_audio_open_phases()
         || !test_audio_only_skips_video_open_phases()
         || !test_buffering_readiness_dispatch()
+        || !test_seek_resume_intent_is_authoritative()
         || !test_prime_ready_while_source_starved_enters_buffering()
         || !test_source_stabilizes_before_prime_ready()
         || !test_seek_supersede_and_recovery()

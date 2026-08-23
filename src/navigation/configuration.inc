@@ -409,6 +409,7 @@ uint64_t navigation_begin(NavigationSession *session)
     session->last_transport_timed_out = false;
     session->last_tls12_compatibility_retry = false;
     session->last_tls_version[0] = '\0';
+    session->last_tls_peer_issuer[0] = '\0';
     session->last_error[0] = '\0';
     /* Direct navigation_commit_html callers do not pass through the
        asynchronous load-state metric reset. A prior provisional paint must

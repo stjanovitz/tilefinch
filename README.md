@@ -226,14 +226,14 @@ it is installed into the inactive slot and must pass the same trial boot.
   is enabled — the GitHub releases API at most twice a week to compare
   version numbers. That check can be turned off in Settings and sends no
   identifying information beyond an ordinary HTTPS request.
-- On the start page, when you rest on one of your own tiles (a bookmark or a
-  built-in card) for about a third of a second, Tilefinch quietly opens the
-  connection to that site in the background so it is ready the instant you
-  press X. It only ever does this for a tile you have highlighted — never a
-  page-supplied address — and it opens the connection only: it completes the
-  TLS handshake and stops, sending no web request and fetching no content
-  until you actually open the site. Only one such connection is ever open at
-  a time, and it is dropped the moment you move away or the browser suspends.
+- On the start page, resting on the built-in YouTube tile for about a third of
+  a second lets Tilefinch quietly open that connection in the background so it
+  is ready the instant you press X. It does this only for the highlighted
+  built-in provider tile — never a bookmark or page-supplied address — by
+  sending one bodyless request with no cookies, credentials, or referrer. It
+  fetches no page content until you actually open the site. Only one such
+  connection is ever open at a time, and it is dropped the moment you move
+  away or the browser suspends.
 - Voice search runs entirely on the PSP; audio is recognized on-device and
   never leaves it.
 

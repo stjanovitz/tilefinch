@@ -6,7 +6,7 @@ set_property(CACHE TILEFINCH_PSP_TRANSPORT_MODE PROPERTY STRINGS OWNED LEGACY)
 option(TILEFINCH_PSP_HTTP2
     "Enable nghttp2-backed HTTP/2 with HTTP/1.1 fallback on PSP" ON)
 # Allegrex maddu multiply-accumulate core for mbed TLS's bignum inner loop
-# (patches/mbedtls-3.6.6-psp-bnmul.patch). Mbed TLS 3.6.6 already ships a
+# (patches/mbedtls-3.6.6-psp-bnmul.patch). Mbed TLS 3.6.7 already ships a
 # generic MIPS32 MULADDC block and that block is already active on this
 # target; this option swaps it for an Allegrex-specific one. OFF until the
 # crypto selftest EBOOT has run green under PPSSPP for the configuration
@@ -17,7 +17,7 @@ option(TILEFINCH_PSP_ALLEGREX_BIGNUM_ASM
     "Use the Allegrex maddu MULADDC core in mbed TLS instead of the stock MIPS32 one"
     OFF)
 # Project Everest's formally-verified Curve25519 for the x25519 key exchange
-# (docs/engineering/PSP_TRANSPORT.md). Mbed TLS 3.6.6 always builds
+# (docs/engineering/PSP_TRANSPORT.md). Mbed TLS 3.6.7 always builds
 # libeverest.a, but with MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED off the everest
 # translation units compile to empty objects and x25519 runs the generic ECP
 # ladder. Defining the macro for the whole mbedTLS build (the same -D
@@ -57,7 +57,7 @@ set(TILEFINCH_PSP_TRANSPORT_IS_OWNED ON)
 set(_transport_prefix "${CMAKE_CURRENT_BINARY_DIR}/psp-transport/prefix")
 set(_transport_lock
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/psp_transport/dependencies.lock")
-set(_mbedtls_archive "${TILEFINCH_PSP_TRANSPORT_CACHE}/mbedtls-3.6.6.tar.bz2")
+set(_mbedtls_archive "${TILEFINCH_PSP_TRANSPORT_CACHE}/mbedtls-3.6.7.tar.bz2")
 set(_curl_archive "${TILEFINCH_PSP_TRANSPORT_CACHE}/curl-8.21.0.tar.xz")
 set(_nghttp2_archive
     "${TILEFINCH_PSP_TRANSPORT_CACHE}/nghttp2-1.69.0.tar.xz")
@@ -68,7 +68,7 @@ endif()
 file(READ "${_transport_lock}" _transport_lock_contents)
 foreach(_locked_dependency IN ITEMS
         "curl|8.21.0|curl-8.21.0.tar.xz|aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6|https://curl.se/download/curl-8.21.0.tar.xz"
-        "mbedtls|3.6.6|mbedtls-3.6.6.tar.bz2|8fb65fae8dcae5840f793c0a334860a411f884cc537ea290ce1c52bb64ca007a|https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.6/mbedtls-3.6.6.tar.bz2"
+        "mbedtls|3.6.7|mbedtls-3.6.7.tar.bz2|a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6|https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2"
         "nghttp2|1.69.0|nghttp2-1.69.0.tar.xz|1fb324b6ec2c56f6bde0658f4139ffd8209fa9e77ce98fd7a5f63af8d0e508ad|https://github.com/nghttp2/nghttp2/releases/download/v1.69.0/nghttp2-1.69.0.tar.xz")
     string(FIND "${_transport_lock_contents}" "${_locked_dependency}"
         _locked_dependency_at)
@@ -136,7 +136,7 @@ endif()
 ExternalProject_Add(tilefinch_psp_mbedtls
     URL "${_mbedtls_archive}"
     URL_HASH
-        SHA256=8fb65fae8dcae5840f793c0a334860a411f884cc537ea290ce1c52bb64ca007a
+        SHA256=a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     PREFIX "${CMAKE_CURRENT_BINARY_DIR}/psp-transport/mbedtls"
     PATCH_COMMAND
@@ -265,7 +265,7 @@ target_include_directories(tilefinch_psp_transport INTERFACE
 target_compile_definitions(tilefinch_psp_transport INTERFACE
     TILEFINCH_PSP_OWNED_TRANSPORT=1
     TILEFINCH_PSP_CURL_VERSION="8.21.0"
-    TILEFINCH_PSP_MBEDTLS_VERSION="3.6.6"
+    TILEFINCH_PSP_MBEDTLS_VERSION="3.6.7"
     TILEFINCH_PSP_NGHTTP2_VERSION="1.69.0")
 target_link_libraries(tilefinch_psp_transport INTERFACE
     "${_transport_prefix}/lib/libcurl.a")
@@ -296,4 +296,4 @@ set(TILEFINCH_PSP_TRANSPORT_LIBRARIES tilefinch_psp_transport)
 set(TILEFINCH_PSP_CRYPTO_LIBRARIES tilefinch_psp_crypto)
 set(TILEFINCH_PSP_TRANSPORT_DEPENDENCY tilefinch_psp_curl)
 message(STATUS
-    "PSP transport: project-owned curl 8.21.0 + Mbed TLS 3.6.6, HTTP/2=${TILEFINCH_PSP_HTTP2}")
+    "PSP transport: project-owned curl 8.21.0 + Mbed TLS 3.6.7, HTTP/2=${TILEFINCH_PSP_HTTP2}")

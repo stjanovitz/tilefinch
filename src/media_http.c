@@ -1487,6 +1487,13 @@ static MediaRangeReadStatus range_fill_window(
     uint64_t deadline_us = 0;
     if (may_wait) {
         uint64_t now_us = tilefinch_platform_monotonic_time_us();
+        /* Opening metadata is no less urgent than a playback sample. Without
+           this demand edge, a dead CDN connection sat untouched for the
+           entire per-read timeout, then caused the caller to throw away an
+           otherwise valid resolved stream URL. The ordinary demanded-window
+           policy instead retries on bounded fresh connections while keeping
+           the same absolute open-transaction deadline. */
+        range_window_mark_demanded(range);
         deadline_us = now_us
             + (uint64_t) (range->timeout_ms > 0 ? range->timeout_ms : 15000)
                 * 1000u;

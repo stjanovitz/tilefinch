@@ -316,7 +316,8 @@ static bool test_youtube_navigation_media_journey(void)
     CHECK(harness.machine.state == PSP_MEDIA_SESSION_PLAYING);
 
     CHECK(dispatch(&harness, (PspMediaEvent) {
-        .type = PSP_MEDIA_EVENT_SEEK
+        .type = PSP_MEDIA_EVENT_SEEK,
+        .resume_playing = true
     }));
     CHECK(dispatch(&harness, (PspMediaEvent) {
         .type = PSP_MEDIA_EVENT_PREVIEW_STARTED
@@ -419,7 +420,8 @@ static bool test_authoritative_lifecycle_presentation_trace(void)
     CHECK(presentation_is_motion_stable(&harness, 11u));
 
     CHECK(dispatch(&harness, (PspMediaEvent) {
-        .type = PSP_MEDIA_EVENT_SEEK
+        .type = PSP_MEDIA_EVENT_SEEK,
+        .resume_playing = true
     }));
     CHECK(harness.machine.state == PSP_MEDIA_SESSION_SEEKING);
     CHECK(presentation_is_motion_stable(&harness, 13u));

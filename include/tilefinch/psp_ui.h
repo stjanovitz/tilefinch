@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "tilefinch/diagnostic_qr.h"
+#include "tilefinch/diagnostics.h"
 #include "tilefinch/psp_media_state.h"
 
 #include "tilefinch/browser_profile.h"
@@ -15,6 +16,11 @@
 #define PSP_UI_URL_CAPACITY 512
 #define PSP_UI_TITLE_CAPACITY 128
 #define PSP_UI_STATUS_CAPACITY 80
+/* Character ceiling of a scale-2 toast on the 480-pixel PSP display. */
+#define PSP_UI_LARGE_TOAST_CHARACTER_LIMIT 36u
+/* Multiline diagnostics use measured proportional width, so the explanatory
+   line can be longer without shrinking the chrome font. */
+#define PSP_UI_MULTILINE_TOAST_CHARACTER_LIMIT 64u
 #define PSP_UI_MENU_ITEM_COUNT 7
 #define PSP_UI_MEDIA_TITLE_CAPACITY 128
 #define PSP_UI_TAB_LIMIT 5
@@ -405,8 +411,11 @@ typedef struct {
     bool persist_local_storage;
     bool update_primary_enabled;
     bool update_cancel_enabled;
-    uint8_t validation_power_test_phase;
-    uint8_t validation_media_test_phase;
+    uint8_t validation_power_test_phase : 1;
+    uint8_t validation_media_test_phase : 1;
+    /* Zero for an ordinary status. Other values are TilefinchTlsGuidance;
+       share the validation byte instead of enlarging the 1 KiB state. */
+    uint8_t tls_toast_guidance : 3;
     unsigned youtube_240p : 1;
     unsigned youtube_compact_results : 1;
     unsigned youtube_audio_only : 1;
@@ -609,6 +618,10 @@ typedef struct {
     bool visible;
     bool controls_visible;
     bool resolving;
+    /* Seeking uses the centre loading panel but retains the committed
+       timeline underneath it. Ordinary open/prime keeps only the quiet
+       footer ground until a duration and target exist. */
+    bool seek_in_progress;
     bool failed;
     /*
      * A failure the process cannot retry: the firmware decoder was
@@ -733,6 +746,9 @@ void psp_ui_set_focus(PspUiState *ui, bool visible, int x, int y,
                       int width, int height);
 void psp_ui_show_status(PspUiState *ui, const char *status,
                         unsigned duration_frames);
+void psp_ui_show_tls_status(
+    PspUiState *ui, const char *headline,
+    TilefinchTlsGuidance guidance, unsigned duration_frames);
 void psp_ui_set_update(
     PspUiState *ui, const char *version, const char *status,
     const char *notes, int progress_per_mille, const char *primary_label,

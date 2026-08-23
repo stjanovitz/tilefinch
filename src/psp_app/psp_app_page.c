@@ -258,6 +258,17 @@ bool psp_begin_page_load(BrowserEngine *engine, PspUiState *ui,
     psp_ui_show_status(ui, "LOADING  O CANCEL", 120);
     psp_navigation_cooperate_begin(ui, frame, engine);
     psp_text_input_before_navigation(text_input);
+    /* The loading surface is already visible while the provider's bounded
+       trusted-face set is prepared. Rebind chrome once here as metric bold
+       may have become available; the engine repeats the preparation cheaply
+       inside begin_navigation for non-PSP callers. */
+    if (site_adapter_navigation_requires_stable_typography("GET", url)
+        && browser_engine_prepare_navigation_fonts(engine, "GET", url)) {
+        psp_ui_set_chrome_fonts(
+            browser_engine_font_face(engine, FONT_SANS),
+            browser_engine_font_face_variant(
+                engine, FONT_METRIC_SANS, false, true));
+    }
     bool started = psp_retry_navigation_url_after_reclaim(
         engine, url, maximum_bytes, timeout_ms, record_history);
     if (!started) {
@@ -530,6 +541,38 @@ bool psp_run_initial_page_load(
            (unsigned long long) metrics.maximum_irreducible_unit_us,
            metrics.irreducible_unit_overruns,
            (unsigned long long) metrics.elapsed_us);
+    if (metrics.adapter_commit_us != 0) {
+        printf(
+            "tilefinch-adapter-commit: total=%lluus parse=%lluus "
+            "style=%lluus resource=%lluus layout=%lluus runtime=%lluus\n",
+            (unsigned long long) metrics.adapter_commit_us,
+            (unsigned long long) metrics.adapter_parse_us,
+            (unsigned long long) metrics.adapter_style_us,
+            (unsigned long long) metrics.adapter_resource_us,
+            (unsigned long long) metrics.adapter_layout_us,
+            (unsigned long long) metrics.adapter_runtime_us);
+    }
+    if (metrics.adapter_transport_samples != 0
+        || metrics.adapter_document_cache_hits != 0
+        || metrics.adapter_document_cache_stores != 0) {
+        printf(
+            "tilefinch-adapter-transport: samples=%zu reused=%zu "
+            "cache-hit=%zu cache-store=%zu "
+            "wall=%lluus transport=%lluus dns=%lluus tcp=%lluus "
+            "tls=%lluus server=%lluus body=%lluus overhead=%lluus\n",
+            metrics.adapter_transport_samples,
+            metrics.adapter_reused_connections,
+            metrics.adapter_document_cache_hits,
+            metrics.adapter_document_cache_stores,
+            (unsigned long long) metrics.adapter_request_wall_us,
+            (unsigned long long) metrics.adapter_transport_total_us,
+            (unsigned long long) metrics.adapter_dns_us,
+            (unsigned long long) metrics.adapter_tcp_us,
+            (unsigned long long) metrics.adapter_tls_us,
+            (unsigned long long) metrics.adapter_server_us,
+            (unsigned long long) metrics.adapter_body_transfer_us,
+            (unsigned long long) metrics.adapter_admission_collect_us);
+    }
     psp_report_blocking_script_samples(performance);
     psp_report_background_transport_metrics();
     if (dump_provisional && !provisional_dump_attempted) {
@@ -539,6 +582,19 @@ bool psp_run_initial_page_load(
     psp_ui_set_loading(
         ui, false,
         status == BROWSER_NAVIGATION_JOB_SUCCEEDED ? 1000 : 0);
+    if (status == BROWSER_NAVIGATION_JOB_FAILED) {
+        char visible_error[PSP_UI_STATUS_CAPACITY];
+        TilefinchTlsGuidance tls_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
+        const char *visible_detail = psp_user_visible_error(
+            browser_engine_last_error(engine),
+            browser_engine_last_tls_verify_result(engine),
+            &tls_guidance, visible_error, sizeof(visible_error));
+        if (tls_guidance == TILEFINCH_TLS_GUIDANCE_NONE)
+            psp_ui_show_status(ui, visible_detail, 300);
+        else
+            psp_ui_show_tls_status(
+                ui, visible_detail, tls_guidance, 300);
+    }
     if (stopped != NULL)
         *stopped = status == BROWSER_NAVIGATION_JOB_CANCELLED;
     psp_navigation_cooperate_end("initial");

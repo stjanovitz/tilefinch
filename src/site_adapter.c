@@ -30,6 +30,7 @@ struct SiteAdapterDefinition {
     const char *name;
     bool requires_network;
     bool (*matches)(const char *url);
+    bool (*requires_stable_typography)(const char *url);
     SiteAdapterBeginCallback begin;
     SiteAdapterPumpCallback pump;
     SiteAdapterStatusCallback status;
@@ -49,6 +50,13 @@ struct SiteAdapterLoad {
 static bool youtube_matches(const char *url)
 {
     return youtube_lite_route(url) != YOUTUBE_LITE_ROUTE_NONE;
+}
+
+static bool youtube_requires_stable_typography(const char *url)
+{
+    YoutubeLiteRoute route = youtube_lite_route(url);
+    return route != YOUTUBE_LITE_ROUTE_NONE
+        && route != YOUTUBE_LITE_ROUTE_HOME;
 }
 
 static void *youtube_begin(
@@ -145,11 +153,23 @@ static bool youtube_metrics(
         .quota_yields = youtube.quota_yields,
         .requests_started = youtube.requests_started,
         .requests_completed = youtube.requests_completed,
+        .document_cache_hits = youtube.document_cache_hits,
+        .document_cache_stores = youtube.document_cache_stores,
+        .transport_samples = youtube.transport_samples,
+        .reused_connections = youtube.reused_connections,
         .build_slices = youtube.build_slices,
         .transform_quota_overruns =
             youtube.transform_quota_overruns,
         .network_us = youtube.network_us,
         .build_us = youtube.build_us,
+        .request_wall_us = youtube.request_wall_us,
+        .transport_total_us = youtube.transport_total_us,
+        .dns_us = youtube.dns_us,
+        .tcp_us = youtube.tcp_us,
+        .tls_us = youtube.tls_us,
+        .server_us = youtube.server_us,
+        .body_transfer_us = youtube.body_transfer_us,
+        .admission_collect_us = youtube.admission_collect_us,
         .maximum_pump_us = youtube.maximum_pump_us,
         .maximum_transform_slice_us =
             youtube.maximum_transform_slice_us,
@@ -174,6 +194,7 @@ static const SiteAdapterDefinition adapters[] = {
         .name = "youtube-lite",
         .requires_network = true,
         .matches = youtube_matches,
+        .requires_stable_typography = youtube_requires_stable_typography,
         .begin = youtube_begin,
         .pump = youtube_pump,
         .status = youtube_status,
@@ -207,6 +228,18 @@ bool site_adapter_navigation_requires_network(
     const SiteAdapterDefinition *definition =
         site_adapter_find(method, url);
     return definition == NULL || definition->requires_network;
+}
+
+bool site_adapter_navigation_requires_stable_typography(
+    const char *method, const char *url)
+{
+    const SiteAdapterDefinition *definition = site_adapter_find(method, url);
+    if (definition == NULL) return false;
+    /* The provider entry surface contains only the search affordance and is
+       intentionally useful on baseline fonts while optional faces load.
+       Result, channel, and watch documents use metric-sensitive cards. */
+    return definition->requires_stable_typography != NULL
+        && definition->requires_stable_typography(url);
 }
 
 SiteAdapterLoad *site_adapter_load_begin(

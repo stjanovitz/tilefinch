@@ -952,7 +952,8 @@ bool psp_media_open_pump(
             if (phase_before == PSP_MEDIA_JOB_OPEN_PLAYBACK
                 && psp_media_seek_phase(media->job_phase)) {
                 psp_media_session_dispatch_event(media, (PspMediaEvent) {
-                    .type = PSP_MEDIA_EVENT_SEEK
+                    .type = PSP_MEDIA_EVENT_SEEK,
+                    .resume_playing = media->job_resume_playing
                 }, "open-resume-seek");
             } else if (phase_before == PSP_MEDIA_JOB_OPEN_PLAYBACK) {
                 (void) psp_media_begin_startup_preroll(media);
@@ -1084,6 +1085,28 @@ static void psp_media_open_report(PspMediaSession *media, const char *event)
     }
 }
 
+/* The resolver may need several bounded client attempts and about a megabyte
+   of response data before it can name a stream. Represent that real progress
+   inside the resolve phase instead of leaving the player apparently frozen
+   at 8%. The cap stays below decoder preparation (22%), and the caller only
+   commits increases so a rejected client attempt cannot move the bar back. */
+static unsigned psp_media_resolver_progress(
+    const YoutubeResolveJob *job, unsigned current)
+{
+    YoutubeResolveJobMetrics metrics = {0};
+    if (!youtube_resolve_job_metrics(job, &metrics)) return current;
+    unsigned progress = 80u;
+    unsigned attempts = metrics.attempts > 4u ? 4u : metrics.attempts;
+    progress += attempts * 20u;
+    if (metrics.request_active) progress += 5u;
+    size_t response_kib = metrics.response_bytes / 1024u;
+    unsigned response_progress = response_kib > 40u
+        ? 40u : (unsigned) response_kib;
+    progress += response_progress;
+    if (progress > 210u) progress = 210u;
+    return progress > current ? progress : current;
+}
+
 /*
  * The open's own deadline and cancellation check, asked in one place.
  *
@@ -1156,7 +1179,15 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             media->reopen_reuse_resolved_stream
             && psp_media_resolved_stream_reusable(media);
         media->reopen_reuse_resolved_stream = reuse_resolved_stream;
+        /* The prepared resolver belongs to this open, but the old pipeline
+           does not. Detach it across teardown so pipeline_destroy can retain
+           its unconditional rule that every job still attached to a dying
+           pipeline is cancelled. */
+        YoutubeResolveJob *prepared_resolver =
+            media->prepared_resolver_job;
+        media->prepared_resolver_job = NULL;
         psp_media_pipeline_destroy(media);
+        media->resolver_job = prepared_resolver;
         if (!reuse_resolved_stream)
             memset(&media->stream, 0, sizeof(media->stream));
         media->job_phase = PSP_MEDIA_JOB_OPEN_RESOLVE;
@@ -1200,8 +1231,14 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
     if ((size_t) media->job_phase
             < sizeof(progress) / sizeof(progress[0])
         && progress[media->job_phase] != 0u) {
+        unsigned visible_progress = progress[media->job_phase];
+        if (media->job_phase == PSP_MEDIA_JOB_OPEN_RESOLVE) {
+            visible_progress = psp_media_resolver_progress(
+                media->resolver_job,
+                media->ui.resolving_progress_per_mille);
+        }
         psp_ui_media_set_resolving_progress(
-            &media->ui, "Loading...", progress[media->job_phase]);
+            &media->ui, "Loading...", visible_progress);
     }
     char error[256] = {0};
     bool ok = true;

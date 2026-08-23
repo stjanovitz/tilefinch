@@ -17,9 +17,8 @@
     (PSP_MEDIA_SEEK_PRIME_VIDEO | PSP_MEDIA_SEEK_PRIME_AUDIO)
 
 static bool psp_media_reopen_backward_seek(
-    PspMediaSession *media, uint64_t target_us)
+    PspMediaSession *media, uint64_t target_us, bool resume_playing)
 {
-    bool resume_playing = media->ui.playing || media->job_resume_playing;
     uint64_t from_us = media->clock_us;
     bool reuse_resolved_stream =
         psp_media_resolved_stream_reusable(media);
@@ -54,6 +53,8 @@ static bool psp_media_reopen_backward_seek(
         .has_separate_audio = false
     }, "backward-seek-reopen-open");
     psp_ui_media_set_resolving(&media->ui, "Seeking video");
+    media->ui.seek_in_progress = true;
+    media->ui.current_time_us = target_us;
     psp_ui_media_set_resolving_progress(
         &media->ui, "Restarting decoder", 20u);
     printf(
@@ -66,8 +67,9 @@ static bool psp_media_reopen_backward_seek(
     return true;
 }
 
-bool psp_media_request_seek(PspMediaSession *media,
-                                   uint64_t target_us, bool preview)
+bool psp_media_request_seek_with_resume(
+    PspMediaSession *media, uint64_t target_us, bool preview,
+    bool resume_playing)
 {
     if (media == NULL
         || (media->hls == NULL
@@ -83,8 +85,7 @@ bool psp_media_request_seek(PspMediaSession *media,
     if (preview) {
         if (!media->seek_preview_started) {
             media->seek_preview_started = true;
-            media->seek_preview_was_playing =
-                psp_media_machine_wants_playing(media);
+            media->seek_preview_was_playing = resume_playing;
             media->seek_preview_cancel_pending = false;
             media->job_restore_us = media->clock_us;
         }
@@ -100,10 +101,12 @@ bool psp_media_request_seek(PspMediaSession *media,
             media->clock_us, target_us, preview)) {
         if (media->last_resume_saved_us == UINT64_MAX)
             media->last_resume_saved_us = 0;
-        return psp_media_reopen_backward_seek(media, target_us);
+        return psp_media_reopen_backward_seek(
+            media, target_us, resume_playing);
     }
     psp_media_session_dispatch_event(media, (PspMediaEvent) {
-        .type = PSP_MEDIA_EVENT_SEEK
+        .type = PSP_MEDIA_EVENT_SEEK,
+        .resume_playing = resume_playing
     }, preview ? "preview-seek-request" : "seek-request");
     if (media->machine.preview_active) {
         psp_media_session_dispatch_event(media, (PspMediaEvent) {
@@ -118,13 +121,17 @@ bool psp_media_request_seek(PspMediaSession *media,
         media->last_resume_saved_us = 0;
     }
     media->job_target_us = target_us;
+    /* Keep the committed marker visible while the decoder and range source
+       seek. The state projection identifies this as seeking, so the
+       cooperative presenter redraws the real timeline instead of replacing
+       all 78 footer rows with an empty loading ground. */
+    media->ui.current_time_us = target_us;
     media->job_actual_us = target_us;
     media->job_prime_audio_us = target_us;
     media->job_prime_ready_mask = 0;
     psp_media_release_presentation_preroll(media, true);
     media->job_preview = false;
-    media->job_resume_playing = media->seek_preview_started
-        ? media->seek_preview_was_playing : media->ui.playing;
+    media->job_resume_playing = resume_playing;
     media->ui.playing = false;
     if (media->playback != NULL)
         media_playback_set_playing(media->playback, false);
@@ -141,6 +148,18 @@ bool psp_media_request_seek(PspMediaSession *media,
            (int) media->job_phase);
     psp_media_session_checkpoint(media, "seek-request");
     return true;
+}
+
+bool psp_media_request_seek(
+    PspMediaSession *media, uint64_t target_us, bool preview)
+{
+    bool resume_playing = media != NULL
+        && (media->seek_preview_started
+                ? media->seek_preview_was_playing
+                : (media->ui.playing
+                   || psp_media_machine_wants_playing(media)));
+    return psp_media_request_seek_with_resume(
+        media, target_us, preview, resume_playing);
 }
 
 static bool psp_media_copy_preview(PspMediaSession *media)

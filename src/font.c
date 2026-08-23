@@ -5,6 +5,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -59,6 +60,84 @@ static bool face_adopt_trusted(FontFace *face, Budget *budget,
         .loaded = true
     };
     return true;
+}
+
+struct FontFaceLoad {
+    Budget *budget;
+    FILE *file;
+    unsigned char *data;
+    size_t length;
+    size_t offset;
+};
+
+FontFaceLoad *font_face_load_begin(
+    Budget *budget, const char *path, size_t maximum_bytes)
+{
+    if (budget == NULL || path == NULL || path[0] == '\0'
+        || maximum_bytes == 0) return NULL;
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return NULL;
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    long end = ftell(file);
+    if (end <= 0 || (size_t) end > maximum_bytes
+        || fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    FontFaceLoad *load = budget_calloc(budget, 1, sizeof(*load));
+    unsigned char *data = budget_malloc(budget, (size_t) end);
+    if (load == NULL || data == NULL) {
+        budget_free(budget, data);
+        budget_free(budget, load);
+        fclose(file);
+        return NULL;
+    }
+    load->budget = budget;
+    load->file = file;
+    load->data = data;
+    load->length = (size_t) end;
+    return load;
+}
+
+FontFaceLoadStatus font_face_load_pump(
+    FontFaceLoad *load, size_t maximum_bytes, FontFace *face)
+{
+    if (load == NULL || load->budget == NULL || load->file == NULL
+        || load->data == NULL || load->offset >= load->length
+        || maximum_bytes == 0 || face == NULL || face->loaded) {
+        return FONT_FACE_LOAD_FAILED;
+    }
+    size_t amount = load->length - load->offset;
+    if (amount > maximum_bytes) amount = maximum_bytes;
+    size_t received = fread(load->data + load->offset, 1, amount, load->file);
+    if (received != amount || ferror(load->file) != 0) {
+        return FONT_FACE_LOAD_FAILED;
+    }
+    load->offset += received;
+    if (load->offset < load->length) return FONT_FACE_LOAD_PENDING;
+    if (fclose(load->file) != 0) {
+        load->file = NULL;
+        return FONT_FACE_LOAD_FAILED;
+    }
+    load->file = NULL;
+    if (!face_adopt_trusted(
+            face, load->budget, load->data, load->length)) {
+        return FONT_FACE_LOAD_FAILED;
+    }
+    load->data = NULL;
+    return FONT_FACE_LOAD_COMPLETE;
+}
+
+void font_face_load_destroy(FontFaceLoad *load)
+{
+    if (load == NULL) return;
+    Budget *budget = load->budget;
+    if (load->file != NULL) fclose(load->file);
+    budget_free(budget, load->data);
+    budget_free(budget, load);
 }
 
 static bool face_load(FontFace *face, Budget *budget, const char *path,
@@ -214,47 +293,85 @@ bool font_set_load(FontSet *fonts, Budget *budget,
 {
     if (fonts == NULL || budget == NULL || max_total_bytes == 0) return false;
     memset(fonts, 0, sizeof(*fonts));
-    bool sans = face_load(&fonts->sans, budget, sans_path, max_total_bytes);
-    size_t remaining = sans
-        ? (fonts->sans.data_length < max_total_bytes
-           ? max_total_bytes - fonts->sans.data_length : 0)
-        : max_total_bytes;
-    bool serif = remaining != 0
-                 && face_load(&fonts->serif, budget, serif_path, remaining);
-    if (serif && fonts->serif.data_length < remaining) {
-        remaining -= fonts->serif.data_length;
-    } else if (serif) {
-        remaining = 0;
-    }
-    if (remaining != 0) {
-        (void) face_load(&fonts->sans_italic, budget, sans_italic_path,
-                         remaining);
-        if (fonts->sans_italic.loaded) remaining -= fonts->sans_italic.data_length;
-    }
-    if (remaining != 0) {
-        (void) face_load(&fonts->sans_bold, budget, sans_bold_path, remaining);
-        if (fonts->sans_bold.loaded) remaining -= fonts->sans_bold.data_length;
-    }
-    if (remaining != 0) {
-        (void) face_load(&fonts->serif_bold, budget, serif_bold_path, remaining);
-        if (fonts->serif_bold.loaded) remaining -= fonts->serif_bold.data_length;
-    }
-    if (remaining != 0) {
-        (void) face_load(&fonts->metric_sans, budget, metric_sans_path,
-                         remaining);
-        if (fonts->metric_sans.loaded) {
-            remaining -= fonts->metric_sans.data_length;
+    const FontSetFaceMask entries[] = {
+        FONT_SET_FACE_SANS,
+        FONT_SET_FACE_SERIF,
+        FONT_SET_FACE_SANS_ITALIC,
+        FONT_SET_FACE_SANS_BOLD,
+        FONT_SET_FACE_SERIF_BOLD,
+        FONT_SET_FACE_METRIC_SANS,
+        FONT_SET_FACE_METRIC_SANS_BOLD
+    };
+    bool any = false;
+    for (size_t at = 0; at < sizeof(entries) / sizeof(entries[0]); at++) {
+        /* Preserve the historical all-font contract: a missing optional face
+           does not discard the usable faces that precede or follow it. */
+        if (font_set_load_selected(
+                fonts, budget, sans_path, serif_path, sans_italic_path,
+                sans_bold_path, serif_bold_path, metric_sans_path,
+                metric_sans_bold_path, max_total_bytes, entries[at])) {
+            any = true;
         }
     }
-    if (remaining != 0) {
-        (void) face_load(&fonts->metric_sans_bold, budget,
-                         metric_sans_bold_path, remaining);
+    return any;
+}
+
+size_t font_set_loaded_bytes(const FontSet *fonts)
+{
+    if (fonts == NULL) return 0;
+    return fonts->sans.data_length + fonts->sans_bold.data_length
+        + fonts->sans_italic.data_length + fonts->serif.data_length
+        + fonts->serif_bold.data_length + fonts->metric_sans.data_length
+        + fonts->metric_sans_bold.data_length;
+}
+
+static bool font_set_load_one(FontFace *face, Budget *budget,
+                              const char *path, size_t maximum_total_bytes,
+                              size_t loaded_bytes)
+{
+    if (face == NULL || budget == NULL) return false;
+    if (face->loaded) return true;
+    if (loaded_bytes >= maximum_total_bytes) return false;
+    return face_load(face, budget, path, maximum_total_bytes - loaded_bytes);
+}
+
+bool font_set_load_selected(
+    FontSet *fonts, Budget *budget, const char *sans_path,
+    const char *serif_path, const char *sans_italic_path,
+    const char *sans_bold_path, const char *serif_bold_path,
+    const char *metric_sans_path, const char *metric_sans_bold_path,
+    size_t max_total_bytes, FontSetFaceMask selected)
+{
+    if (fonts == NULL || budget == NULL || max_total_bytes == 0
+        || (selected & ~FONT_SET_FACE_ALL) != 0) return false;
+    struct FontLoadEntry {
+        FontSetFaceMask bit;
+        FontFace *face;
+        const char *path;
+    } entries[] = {
+        { FONT_SET_FACE_SANS, &fonts->sans, sans_path },
+        { FONT_SET_FACE_SERIF, &fonts->serif, serif_path },
+        { FONT_SET_FACE_SANS_ITALIC, &fonts->sans_italic,
+          sans_italic_path },
+        { FONT_SET_FACE_SANS_BOLD, &fonts->sans_bold, sans_bold_path },
+        { FONT_SET_FACE_SERIF_BOLD, &fonts->serif_bold,
+          serif_bold_path },
+        { FONT_SET_FACE_METRIC_SANS, &fonts->metric_sans,
+          metric_sans_path },
+        { FONT_SET_FACE_METRIC_SANS_BOLD, &fonts->metric_sans_bold,
+          metric_sans_bold_path }
+    };
+    bool any = false;
+    for (size_t at = 0; at < sizeof(entries) / sizeof(entries[0]); at++) {
+        if ((selected & entries[at].bit) == 0) continue;
+        if (!font_set_load_one(
+                entries[at].face, budget, entries[at].path,
+                max_total_bytes, font_set_loaded_bytes(fonts))) {
+            return false;
+        }
+        any = true;
     }
-    if (!sans && !serif && !fonts->sans_italic.loaded
-        && !fonts->sans_bold.loaded && !fonts->serif_bold.loaded
-        && !fonts->metric_sans.loaded
-        && !fonts->metric_sans_bold.loaded) return false;
-    return true;
+    return any || selected == 0;
 }
 
 void font_face_destroy(FontFace *face)

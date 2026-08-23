@@ -3,7 +3,7 @@
 Tilefinch owns the complete HTTPS chain used by the PSP release build:
 
 - curl 8.21.0;
-- Mbed TLS 3.6.6 LTS;
+- Mbed TLS 3.6.7 LTS;
 - nghttp2 1.69.0 when HTTP/2 is enabled;
 - PSPDEV zlib 1.3.1.
 
@@ -110,11 +110,44 @@ exposed to pages, and is offered only to its recorded site.
 
 ### HOME preconnect
 
-Holding focus on a built-in HOME destination for 300 ms may queue one
-`CONNECT_ONLY` operation. It resolves and establishes transport/TLS but sends
-no HTTP request and receives no response body. Moving focus, navigating
+Holding focus on the built-in YouTube HOME destination for 300 ms may queue one
+bodyless `HEAD` request with the same pinned mobile User-Agent as an ordinary
+page request. It resolves and establishes transport/TLS but sends no cookies,
+credentials, referrer, or response body. Moving focus, navigating
 elsewhere, or suspending cancels it. User bookmarks, page-provided links, and
 arbitrary typed destinations do not receive speculative preconnect authority.
+
+Completing an ordinary HTTP request returns the socket to curl's shared live
+connection cache. The following provider request can therefore reuse TCP and
+TLS rather than merely resuming a TLS session. Media bytes served by a
+different CDN origin necessarily use that origin's own connection.
+
+### Focused-result pre-resolution
+
+On a generated YouTube results page, a Play card held in focus for 700 ms may
+own one speculative player-metadata resolver. Admission waits until page
+transport is idle and the shared page budget has 2 MiB of working space plus a
+1 MiB reserve. Its watch/player responses are independently capped at 1.5 MiB
+and 512 KiB so optional work cannot grow to the ordinary foreground resolver's
+larger limits. Input and rendering take precedence over browser-thread resolver
+pumps. Moving focus, navigating, opening a modal, voice-memory reclaim, or
+suspend cancels the single job.
+
+Each focused result follows one explicit bounded state sequence: thumbnail,
+dwell, resolving, then ready (or failed/consumed). A resolver cannot enter its
+admission state until the focused card's thumbnail has decoded or the image
+pipeline has classified that thumbnail as terminal. Moving focus retires the
+old resolver before the page's next idle-image slice; if the requested row is
+outside an active two-image batch, only that batch's uncommitted suffix is
+cancelled and any thumbnail already published through layout is preserved.
+
+The resolver may obtain signed media descriptors from YouTube, but it never
+opens the media CDN before activation. Pressing Play transfers the same job—
+complete or still in flight—to the media session, so no request is repeated.
+Results age out after 90 seconds, and one selected result is not speculated
+again until focus leaves it. A pending resolver older than 15 seconds is not
+transferred: explicit Play receives a fresh full deadline instead. Details
+remains an ordinary page navigation.
 
 ### Measurement
 
@@ -139,7 +172,8 @@ latency claim.
 - The system clock must be valid before certificate verification.
 - CA and hostname verification fail closed.
 - TLS resumption never bypasses ordinary peer verification.
-- A preconnect carries no page request headers, cookies, or body.
+- A preconnect carries only the pinned User-Agent: no page credentials,
+  cookies, referrer, or body.
 - HTTP status codes, TLS-policy failures, and CDN throttling are not evidence
   that the PSP network stack regressed.
 - Transport slots cannot grant request authority; they accept only a prepared

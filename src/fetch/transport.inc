@@ -925,6 +925,8 @@ static bool fetch_request_internal(Budget *budget, const char *url,
     CURLcode code = CURLE_FAILED_INIT;
     long failed_transport_code = 0;
     long failed_tls_verify_result = 0;
+    char failed_tls_version[sizeof(result->tls_version)] = {0};
+    char failed_tls_peer_issuer[sizeof(result->tls_peer_issuer)] = {0};
     bool timed_out = false;
     bool tls12_retry_attempted = false;
     bool redirect_origin_tainted = false;
@@ -1256,8 +1258,14 @@ failed:
     failed_transport_code = (long) code;
     failed_tls_verify_result = 0;
     if (easy != NULL) {
+        result->transport_code = failed_transport_code;
         fetch_result_set_transport_info(easy, result);
         failed_tls_verify_result = result->tls_verify_result;
+        snprintf(failed_tls_version, sizeof(failed_tls_version), "%s",
+                 result->tls_version);
+        snprintf(failed_tls_peer_issuer,
+                 sizeof(failed_tls_peer_issuer), "%s",
+                 result->tls_peer_issuer);
     }
     redirect_origin_tainted = result->redirect_origin_tainted
         || (hop != NULL && hop->origin_tainted);
@@ -1287,6 +1295,11 @@ failed:
     result->timed_out = timed_out;
     result->transport_code = failed_transport_code;
     result->tls_verify_result = failed_tls_verify_result;
+    snprintf(result->tls_version, sizeof(result->tls_version), "%s",
+             failed_tls_version);
+    snprintf(result->tls_peer_issuer,
+             sizeof(result->tls_peer_issuer), "%s",
+             failed_tls_peer_issuer);
     result->redirect_origin_tainted = redirect_origin_tainted;
     (void) snprintf(result->error, sizeof(result->error), "%s", failure);
     if (fetch_trace.mode == FETCH_TRACE_CAPTURE && stream == NULL) {

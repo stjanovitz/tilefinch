@@ -64,6 +64,9 @@ typedef struct {
        observe it. Dynamic attribute mutations conservatively reopen the JS
        probe from the bootstrap side. */
     bool pointer_event_attributes_present;
+    /* Aggregate authored focus intent. The engine carries one bounded
+       post-layout autofocus obligation only for documents that need it. */
+    bool autofocus_attribute_present;
 } PocDocument;
 
 typedef struct {

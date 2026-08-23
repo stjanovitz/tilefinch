@@ -1,5 +1,6 @@
 #include "tilefinch/diagnostics.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -76,4 +77,64 @@ const char *tilefinch_diagnostic_code_name(TilefinchDiagnosticCode value)
     };
     return (unsigned) value <= TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED
         ? names[value] : "unknown";
+}
+
+static bool diagnostic_contains_ascii_folded(
+    const char *text, const char *needle)
+{
+    if (text == NULL || needle == NULL || needle[0] == '\0') return false;
+    for (; *text != '\0'; text++) {
+        const char *left = text;
+        const char *right = needle;
+        while (*left != '\0' && *right != '\0'
+               && tolower((unsigned char) *left)
+                      == tolower((unsigned char) *right)) {
+            left++;
+            right++;
+        }
+        if (*right == '\0') return true;
+    }
+    return false;
+}
+
+bool tilefinch_error_is_certificate_verification_failure(
+    const char *detail)
+{
+    if (detail == NULL || detail[0] == '\0') return false;
+    bool certificate = diagnostic_contains_ascii_folded(
+                           detail, "certificate")
+        || diagnostic_contains_ascii_folded(detail, "x.509")
+        || diagnostic_contains_ascii_folded(detail, "x509");
+    bool verification = diagnostic_contains_ascii_folded(detail, "mbedtls")
+        || diagnostic_contains_ascii_folded(detail, "ssl")
+        || diagnostic_contains_ascii_folded(detail, "tls")
+        || diagnostic_contains_ascii_folded(detail, "trusted ca")
+        || diagnostic_contains_ascii_folded(detail, "local issuer")
+        || diagnostic_contains_ascii_folded(detail, "not correctly signed")
+        || diagnostic_contains_ascii_folded(detail, "peer verification")
+        || diagnostic_contains_ascii_folded(detail, "verification failed")
+        || diagnostic_contains_ascii_folded(detail, "verify failed")
+        || diagnostic_contains_ascii_folded(detail, "not yet valid")
+        || diagnostic_contains_ascii_folded(detail, "expired");
+    return certificate && verification;
+}
+
+TilefinchTlsGuidance tilefinch_tls_verification_guidance(
+    uint32_t flags, bool rtc_valid)
+{
+    if (!rtc_valid
+        || (flags & (TILEFINCH_TLS_VERIFY_EXPIRED
+                     | TILEFINCH_TLS_VERIFY_FUTURE)) != 0) {
+        return TILEFINCH_TLS_GUIDANCE_TIME;
+    }
+    if ((flags & TILEFINCH_TLS_VERIFY_HOSTNAME) != 0)
+        return TILEFINCH_TLS_GUIDANCE_REDIRECTED;
+    if ((flags & TILEFINCH_TLS_VERIFY_NOT_TRUSTED) != 0)
+        return TILEFINCH_TLS_GUIDANCE_UNTRUSTED;
+    if ((flags & (TILEFINCH_TLS_VERIFY_BAD_MD
+                  | TILEFINCH_TLS_VERIFY_BAD_PK
+                  | TILEFINCH_TLS_VERIFY_BAD_KEY)) != 0) {
+        return TILEFINCH_TLS_GUIDANCE_UNSUPPORTED;
+    }
+    return TILEFINCH_TLS_GUIDANCE_DETAILS;
 }

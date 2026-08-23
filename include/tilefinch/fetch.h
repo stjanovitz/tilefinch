@@ -16,6 +16,9 @@ struct TilefinchContentSecurityPolicy;
 
 #define FETCH_SET_COOKIE_LIMIT 4096
 #define FETCH_RESPONSE_COOKIE_CAPACITY 32
+#define TILEFINCH_CA_BUNDLE_VERSION 2u
+#define TILEFINCH_CA_BUNDLE_SHA256_BYTES 32u
+#define TILEFINCH_TLS_PEER_ISSUER_LIMIT 96u
 /* Current large-site CSP fields exceed 4 KiB by themselves (4,527 bytes was
    measured in the acceptance corpus on 2026-08-01). Keep this fixed and
    modest: it is part of every FetchResult, but must hold one complete security
@@ -71,6 +74,22 @@ bool fetch_response_security_metadata_from_snapshot(
     FetchResponseSecurityMetadata *metadata,
     const char *headers, size_t headers_length, bool snapshot_truncated);
 
+/* Cumulative libcurl timing for one completed transport hop. The values all
+   share the request start as their zero point; consumers derive disjoint
+   DNS/TCP/TLS/server/body phases by subtraction. Replay and transports which
+   cannot expose the monotonic microsecond counters leave measured false. */
+typedef struct {
+    bool measured;
+    uint32_t name_lookup_us;
+    uint32_t connect_us;
+    uint32_t appconnect_us;
+    uint32_t first_byte_us;
+    uint32_t total_us;
+} FetchTransportTiming;
+
+_Static_assert(sizeof(FetchTransportTiming) == 24u,
+               "transport timing must stay compact on PSP");
+
 typedef struct {
     Budget *budget;
     char *data;
@@ -93,6 +112,7 @@ typedef struct {
     long tls_verify_result;
     long negotiated_http_version;
     long new_connections;
+    FetchTransportTiming transport_timing;
     /* TLS handshake attribution for the final transport hop of this request,
        on the same footing as the two fields above: it describes the transfer
        libcurl actually completed, not the whole redirect chain.  Every field
@@ -111,6 +131,7 @@ typedef struct {
     /* Negotiated protocol name ("TLSv1.2"/"TLSv1.3").  Empty when the linked
        TLS backend does not expose it to libcurl callers. */
     char tls_version[16];
+    char tls_peer_issuer[TILEFINCH_TLS_PEER_ISSUER_LIMIT];
     /* Normalized browser-visible response URL. Unlike the HTTP request/cache
        key, this preserves the logical fragment: fragmentless redirects
        inherit the current fragment and an explicit Location fragment replaces
@@ -502,6 +523,7 @@ typedef struct {
     long tls_verify_result;
     long negotiated_http_version;
     long new_connections;
+    FetchTransportTiming transport_timing;
     bool success;
     bool timed_out;
     bool tls_handshake_measured;
@@ -509,6 +531,8 @@ typedef struct {
     bool tls_connection_reuse_known;
     bool tls_connection_reused;
     bool tls12_compatibility_retry;
+    char tls_version[16];
+    char tls_peer_issuer[TILEFINCH_TLS_PEER_ISSUER_LIMIT];
     char effective_url[4096];
     char content_range[128];
     char content_type[128];
@@ -539,6 +563,7 @@ typedef struct {
     size_t received_body_bytes;
     long status_code;
     long new_connections;
+    FetchTransportTiming transport_timing;
     bool success;
     bool timed_out;
     bool tls_handshake_measured;
@@ -751,23 +776,23 @@ bool fetch_tls_handshake_counters_format(
  *
  * A HOME tile that holds focus during the user's think-time is a host they are
  * about to open.  fetch_preconnect begins a single speculative TCP+TLS
- * connection to that host, parked in the shared transport's connection/session
- * cache, so the handshake is already paid by the time X is pressed.  It is a
- * connect-only handshake: CURLOPT_CONNECT_ONLY, no HTTP request, no bytes sent
- * beyond the TLS handshake, no content fetched.  The warm DNS entry and the
- * TLS session it leaves in the shared cache let the following navigation
- * resume; the bounded TLS session store can also preserve it across boots.
- * On PSP the shared transport worker owns this handshake through a dedicated
+ * connection to that host and completes one HEAD request without a response
+ * body. Unlike CURLOPT_CONNECT_ONLY, completing a normal HTTP request returns
+ * the live socket to curl's shared connection pool for the real navigation.
+ * The bounded TLS session store can also preserve its session across boots.
+ * On PSP the shared transport worker owns this request through a dedicated
  * compact descriptor; it does not consume or reduce the six response lanes.
  *
- * Privacy: the caller resolves the target only from the user's own tiles --
- * their bookmarks or the two built-in cards -- never a page-supplied host.
+ * Privacy: the PSP caller restricts this to the built-in, adapter-owned
+ * YouTube destination. Bookmarks and page-supplied hosts never receive
+ * speculative authority.
  *
  * These counters describe preconnect activity itself; the navigation-side
  * payoff (a reused/resumed connection on the real fetch) is reported by the
  * FetchTlsHandshakeCounters above.
  *   started   - a new speculative connection was initiated.
- *   completed - the TCP+TLS handshake finished; the host is warm.
+ *   completed - the bodyless HTTP request finished; the live connection is
+ *               eligible for reuse.
  *   reused    - a preconnect request was satisfied by the speculative
  *               connection already outstanding/warm for that same host, so no
  *               new socket was opened.
@@ -788,8 +813,8 @@ void fetch_preconnect_counters_reset(void);
  * Begins at most one speculative connection to the host of url_or_host (a full
  * URL or a bare host; only the scheme/host/port are used).  budget must be the
  * same page budget the browser's navigation transport uses, because the
- * speculative handle is share-attached so its warm connection is the one the
- * real navigation reuses.  Returns true when a speculative connection is
+ * speculative handle shares its DNS, connection, and TLS-session state with
+ * later real requests. Returns true when a speculative connection is
  * outstanding for that host afterward -- freshly started, or already warm (a
  * "reused" no-op).  Inert (returns false) when the transport runtime is
  * unavailable, when handle creation fails (e.g. the hermetic replay/stub
@@ -812,6 +837,9 @@ void fetch_preconnect_pump(void);
 
 /* True while a speculative connection is outstanding or parked warm. */
 bool fetch_preconnect_active(void);
+/* True only while DNS/TCP/TLS/HTTP work is still in flight. A completed warm
+   connection remains active but must not suppress unrelated idle work. */
+bool fetch_preconnect_in_flight(void);
 
 /*
  * Pure dwell/eligibility state machine for the HOME preconnect call site,
@@ -895,6 +923,12 @@ bool fetch_request_stream_cancelable(
  */
 bool fetch_set_ca_bundle_path(const char *path);
 const char *fetch_ca_bundle_path(void);
+/* Available after the first HTTPS request has loaded the configured blob.
+   Computing the digest piggybacks on that one read; diagnostics never reopen
+   roots.pem. */
+bool fetch_ca_bundle_identity(
+    uint32_t *version, size_t *length,
+    uint8_t digest[TILEFINCH_CA_BUNDLE_SHA256_BYTES]);
 /*
  * Selects the on-stick file backing cross-boot TLS session resumption
  * (docs/engineering/PSP_TRANSPORT.md). Transport teardown

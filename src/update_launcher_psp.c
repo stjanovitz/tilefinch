@@ -35,12 +35,42 @@ PSP_HEAP_SIZE_KB(2048);
 #define LAUNCHER_HEIGHT PSP_DISPLAY_SCREEN_HEIGHT
 #define LAUNCHER_STRIDE PSP_DISPLAY_STRIDE
 
+/* Safe start is a pre-held chord, not a reaction-time prompt. Several fresh
+   controller samples cover pad initialization without adding half a second
+   to every ordinary launch. Filesystem work runs inside the same window. */
+#define LAUNCHER_SAFE_START_WINDOW_US UINT64_C(80000)
+#define LAUNCHER_SAFE_START_MAXIMUM_US UINT64_C(160000)
+#define LAUNCHER_SAFE_START_POLL_US 16000u
+
 static PspDisplay launcher_display;
 static uint16_t *launcher_pixels;
 static int launcher_text_x;
 static int launcher_text_y;
 static bool launcher_frame_visible;
 static bool launcher_frame_prepared;
+
+#ifdef TILEFINCH_PSP_LAUNCHER_TIMING
+typedef struct {
+    uint64_t entered_us;
+    uint64_t previous_us;
+} LauncherTiming;
+
+static void launcher_timing_mark(LauncherTiming *timing, const char *stage)
+{
+    if (timing == NULL || stage == NULL) return;
+    uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
+    printf("tilefinch-launcher-timing: stage=%s elapsed=%lluus "
+           "delta=%lluus\n",
+           stage, (unsigned long long) (now_us - timing->entered_us),
+           (unsigned long long) (now_us - timing->previous_us));
+    timing->previous_us = now_us;
+}
+#define LAUNCHER_TIMING_MARK(stage_name) \
+    launcher_timing_mark(&launcher_timing, (stage_name))
+#else
+#define LAUNCHER_TIMING_MARK(stage_name) \
+    do { (void) (stage_name); } while (0)
+#endif
 
 static const uint8_t *launcher_glyph(char character)
 {
@@ -279,7 +309,7 @@ static void launcher_present_splash(void)
        has closed. One muted line, on the launcher's embedded glyphs: the
        launcher must stay independent of the browser's fonts. */
     launcher_draw_text_at(
-        177, 248, "HOLD L FOR SAFE START", PSP_THEME_TEXT_MUTED, 1);
+        177, 248, "HOLD L WHILE STARTING", PSP_THEME_TEXT_MUTED, 1);
     launcher_text_x = 20;
     launcher_text_y = 18;
     launcher_publish_prepared();
@@ -457,18 +487,41 @@ static uint32_t launcher_wait_pressed(unsigned milliseconds)
     return 0;
 }
 
-static bool launcher_wait_held(uint32_t button, unsigned milliseconds)
+static bool launcher_sample_button(uint32_t button, bool *held)
 {
-    unsigned elapsed = 0;
-    do {
-        SceCtrlData current = {0};
-        sceCtrlPeekBufferPositive(&current, 1);
-        if ((current.Buttons & button) != 0) return true;
-        if (elapsed >= milliseconds) break;
-        sceKernelDelayThread(16000);
-        elapsed += 16;
-    } while (true);
-    return false;
+    SceCtrlData current = {0};
+    int samples = sceCtrlPeekBufferPositive(&current, 1);
+    if (samples <= 0) return false;
+    if (held != NULL && (current.Buttons & button) != 0) *held = true;
+    return true;
+}
+
+static bool launcher_finish_safe_start_window(
+    uint32_t button, uint64_t started_us, bool held,
+    bool sample_observed)
+{
+    for (;;) {
+        sample_observed = launcher_sample_button(button, &held)
+            || sample_observed;
+        uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
+        uint64_t elapsed_us = now_us >= started_us
+            ? now_us - started_us : LAUNCHER_SAFE_START_MAXIMUM_US;
+        if (elapsed_us >= LAUNCHER_SAFE_START_WINDOW_US
+            && sample_observed) return held;
+        if (elapsed_us >= LAUNCHER_SAFE_START_MAXIMUM_US) {
+            /* Failing open preserves ordinary boot if the controller service
+               itself is unavailable; a healthy service normally satisfies
+               this on the first sample, keeping the fast 80 ms path. */
+            printf("tilefinch-launcher: safe-start controller sample "
+                   "unavailable\n");
+            return held;
+        }
+        uint64_t remaining_us =
+            LAUNCHER_SAFE_START_MAXIMUM_US - elapsed_us;
+        unsigned delay_us = remaining_us < LAUNCHER_SAFE_START_POLL_US
+            ? (unsigned) remaining_us : LAUNCHER_SAFE_START_POLL_US;
+        if (delay_us != 0u) sceKernelDelayThread(delay_us);
+    }
 }
 
 static bool launcher_recover(
@@ -518,13 +571,25 @@ static bool launcher_recover(
 int main(int argc, char **argv)
 {
     (void) argc;
+#ifdef TILEFINCH_PSP_LAUNCHER_TIMING
+    uint64_t launcher_entered_us =
+        (uint64_t) sceKernelGetSystemTimeWide();
+    LauncherTiming launcher_timing = {
+        .entered_us = launcher_entered_us,
+        .previous_us = launcher_entered_us
+    };
+#endif
     launcher_setup_callbacks();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_ANALOG);
     (void) launcher_screen_init();
     launcher_present_splash();
-    bool recovery_button =
-        launcher_wait_held(PSP_CTRL_LTRIGGER, 500);
+    uint64_t safe_start_started_us =
+        (uint64_t) sceKernelGetSystemTimeWide();
+    bool recovery_button = false;
+    bool controller_sample_observed = launcher_sample_button(
+        PSP_CTRL_LTRIGGER, &recovery_button);
+    LAUNCHER_TIMING_MARK("splash-presented");
 
     const char *argv0 = argv != NULL && argv[0] != NULL
         ? argv[0] : "EBOOT.PBP";
@@ -543,9 +608,16 @@ int main(int argc, char **argv)
         state.generation = 1;
         state.active_slot = TILEFINCH_UPDATE_SLOT_A;
         state.installed_sequence = TILEFINCH_RELEASE_SEQUENCE;
-        (void) tilefinch_update_journal_store(
-            paths.data_dir, &state, NULL, NULL);
+        /* A first-install boot does not need durable state to choose slot A.
+           Avoid a synchronous Memory Stick device flush in the launch path;
+           the first update transaction persists this same default before it
+           can stage a trial. */
     }
+    LAUNCHER_TIMING_MARK("journal-ready");
+    recovery_button = launcher_finish_safe_start_window(
+        PSP_CTRL_LTRIGGER, safe_start_started_us, recovery_button,
+        controller_sample_observed);
+    LAUNCHER_TIMING_MARK("safe-start-sampled");
 
     if (recovery_button) {
         launcher_clear();
@@ -566,6 +638,7 @@ int main(int argc, char **argv)
     TilefinchUpdateSlot slot = state.active_slot;
     TilefinchUpdateBootAction action = tilefinch_update_boot_decide(
         &state, recovery_button, pending_verified, &slot);
+    LAUNCHER_TIMING_MARK("update-decision");
 
     if (action == TILEFINCH_UPDATE_BOOT_START_TRIAL) {
         launcher_puts(
@@ -631,6 +704,7 @@ int main(int argc, char **argv)
             }
         }
     }
+    LAUNCHER_TIMING_MARK("handoff");
     if (!launcher_boot_slot(&paths, slot)) {
         launcher_puts(
             "\nCould not start this slot.\n"

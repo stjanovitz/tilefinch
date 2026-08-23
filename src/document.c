@@ -227,6 +227,7 @@ typedef struct {
     size_t body_text_nodes;
     uint8_t glyph_script_mask;
     bool pointer_event_attributes_present;
+    bool autofocus_attribute_present;
 } DocumentStats;
 
 static uint8_t document_codepoint_glyph_script(unsigned codepoint)
@@ -343,6 +344,10 @@ static bool gather_stats(lxb_dom_node_t *node, bool in_body, bool hidden,
                 if (pointer_event_attribute_name(
                         attribute_name, name_length)) {
                     stats->pointer_event_attributes_present = true;
+                }
+                if (attribute_name != NULL && name_length == 9u
+                    && memcmp(attribute_name, "autofocus", 9u) == 0) {
+                    stats->autofocus_attribute_present = true;
                 }
                 if (!document_stats_add(&stats->attributes, 1)
                     || (attr->value != NULL
@@ -681,6 +686,8 @@ bool document_refresh(PocDocument *document)
     document->glyph_script_mask = stats.glyph_script_mask;
     document->pointer_event_attributes_present =
         stats.pointer_event_attributes_present;
+    document->autofocus_attribute_present =
+        stats.autofocus_attribute_present;
     document_note_connected_mutation(document);
     document_allocation_owner_leave(document, previous);
     return true;

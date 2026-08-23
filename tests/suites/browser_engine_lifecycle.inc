@@ -71,6 +71,20 @@ static int test_engine_lifecycle(void)
           && browser_engine_controller(engine) == NULL
           && browser_engine_render_shell(engine) == NULL);
 
+    /* Native HOME commits a script-free placeholder with policy disabled,
+       then the first real navigation reapplies the configured policy. The
+       placeholder must not allocate a realm merely to give chrome a valid
+       document shape. */
+    static const char home_placeholder[] =
+        "<!doctype html><title>Tilefinch</title><body>";
+    CHECK(browser_engine_set_javascript_enabled(engine, false)
+          && browser_engine_commit_html(
+                 engine, TILEFINCH_HOMEPAGE_URL, home_placeholder,
+                 sizeof(home_placeholder) - 1u, false)
+          && browser_engine_navigation(engine)->page.runtime == NULL
+          && browser_engine_set_javascript_enabled(engine, true)
+          && browser_engine_navigation(engine)->page.runtime == NULL);
+
     static const char page[] =
         "<!doctype html><title>Engine</title>"
         "<style>body{margin:4px}#probe{height:24px}"
@@ -81,6 +95,7 @@ static int test_engine_lifecycle(void)
     CHECK(browser_engine_commit_html(
         engine, "https://engine.test/", page, sizeof(page) - 1, true));
     CHECK(browser_engine_controller(engine) != NULL
+          && browser_engine_navigation(engine)->page.runtime != NULL
           && browser_engine_render_shell(engine) != NULL);
     CHECK(browser_engine_navigation_view(engine)
               == browser_engine_navigation(engine)
@@ -187,10 +202,27 @@ static int test_engine_lifecycle(void)
         browser_engine_controller(engine);
     ScriptRuntime *reclaim_runtime =
         browser_engine_navigation(engine)->page.runtime;
-    BrowserOptionalMemoryReclaim reclaimed = {0};
-    CHECK(browser_engine_reclaim_optional_memory(engine, &reclaimed));
+    BrowserOptionalMemoryReclaimJob no_pressure = {0};
+    browser_engine_prepare_optional_memory_reclaim(
+        engine, 0, &no_pressure);
+    CHECK(!browser_engine_optional_memory_reclaim_pending(&no_pressure));
+    BrowserOptionalMemoryReclaimJob reclaim_job = {0};
+    browser_engine_prepare_optional_memory_reclaim(
+        engine, SIZE_MAX, &reclaim_job);
+    CHECK(browser_engine_optional_memory_reclaim_pending(&reclaim_job));
+    size_t reclaim_pumps = 0;
+    while (browser_engine_optional_memory_reclaim_pending(&reclaim_job)
+           && reclaim_pumps < 128u) {
+        (void) browser_engine_pump_optional_memory_reclaim(
+            engine, &reclaim_job);
+        reclaim_pumps++;
+    }
+    CHECK(!browser_engine_optional_memory_reclaim_pending(&reclaim_job));
+    CHECK(reclaim_pumps >= 3u && reclaim_pumps < 128u);
+    BrowserOptionalMemoryReclaim reclaimed = reclaim_job.reclaimed;
     CHECK(reclaimed.total_bytes
-              == reclaimed.javascript_bytes
+              == reclaimed.font_staging_bytes
+                 + reclaimed.javascript_bytes
                  + reclaimed.session_cache_bytes
                  + reclaimed.render_cache_bytes);
     CHECK(browser_engine_controller(engine) == reclaim_controller
@@ -298,7 +330,7 @@ static int test_engine_lifecycle(void)
           && metrics.page_loaded
           && metrics.controller_ready && metrics.render_ready
           && metrics.backing_kind == DOCUMENT_BACKING_FULL
-          && metrics.loads_started == 2 && metrics.loads_committed == 1
+          && metrics.loads_started == 3 && metrics.loads_committed == 2
           && metrics.rendered_frames == 7
           && metrics.budget_current != 0
           && metrics.control_bytes != 0
@@ -309,6 +341,8 @@ static int test_engine_lifecycle(void)
                     + sizeof(((BrowserSession *) 0)->cookies)
                     + sizeof(((BrowserSession *) 0)->cache)
                     + sizeof(((BrowserSession *) 0)->site_adapter_state)
+                    + sizeof(((BrowserSession *) 0)
+                                 ->site_adapter_document_cache)
           && metrics.budget_external_reserved
                  >= metrics.session_inline_accounting_bytes
           && metrics.budget_external_reserved_peak
@@ -595,6 +629,7 @@ static int test_engine_lifecycle(void)
           && strcmp(diagnostics.last_name, "engine-shutdown") == 0);
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
+
     return 0;
 }
 
@@ -883,6 +918,292 @@ static int test_nomodule_capability_suppression(void)
           && navigation->script_attempted == 0u
           && navigation->preloads_discovered == 0u
           && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_staged_optional_fonts_relayout_before_repaint(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    char sans[512], serif[512], italic[512], bold[512];
+    char serif_bold[512], metric[512], metric_bold[512];
+    snprintf(sans, sizeof(sans), "%s/fonts/DejaVuSans-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(serif, sizeof(serif), "%s/fonts/DejaVuSerif-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(italic, sizeof(italic),
+             "%s/fonts/DejaVuSans-Oblique-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(bold, sizeof(bold), "%s/fonts/DejaVuSans-Bold-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(serif_bold, sizeof(serif_bold),
+             "%s/fonts/DejaVuSerif-Bold-Latin.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(metric, sizeof(metric), "%s/fonts/TilefinchSans-Regular.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    snprintf(metric_bold, sizeof(metric_bold),
+             "%s/fonts/TilefinchSans-Bold.ttf",
+             TILEFINCH_TEST_SOURCE_DIR);
+    CHECK(browser_config_set_font_paths(
+              &config, sans, serif, italic, bold, serif_bold,
+              metric, metric_bold, 1536u * 1024u));
+    browser_config_set_staged_font_loading(&config, true);
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    CHECK(!browser_engine_baseline_fonts_ready(engine)
+          && browser_engine_prepare_native_home_font(engine)
+          && browser_engine_native_home_font(engine) != NULL
+          && browser_engine_native_home_font(engine)->loaded
+          && (browser_engine_font_face(engine, FONT_METRIC_SANS) == NULL
+              || !browser_engine_font_face(engine, FONT_METRIC_SANS)->loaded)
+          && !browser_engine_baseline_fonts_ready(engine));
+    for (size_t i = 0;
+         i < 4 && !browser_engine_baseline_fonts_ready(engine); i++) {
+        CHECK(browser_engine_pump_baseline_fonts(engine));
+    }
+    CHECK(browser_engine_baseline_fonts_ready(engine));
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}#probe{display:block;"
+        "font:700 22px serif;width:180px}</style><body>"
+        "<a id=probe autofocus data-tilefinch-provider-media "
+        "href='https://www.youtube.com/watch?v=TFTEST00001'>"
+        "Metric-sensitive text wraps across this bounded box</a>"
+        "<input value='Search'>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://font.test/", page, sizeof(page) - 1u, true)
+          && browser_engine_focus_move(engine, true));
+    size_t relayouts_before =
+        browser_engine_navigation(engine)->incremental_relayouts;
+    size_t visual_changes = 0;
+    size_t pending_slices = 0;
+    bool interrupted_staging = false;
+    for (size_t i = 0; i < 32; i++) {
+        bool visual_changed = false;
+        bool pending = browser_engine_run_idle_work(
+            engine, &visual_changed);
+        if (visual_changed) {
+            visual_changes++;
+            CHECK(browser_engine_render_frame(engine, NULL));
+        }
+        if (pending) pending_slices++;
+        if (pending && !interrupted_staging) {
+            BrowserOptionalMemoryReclaim font_reclaim = {0};
+            CHECK(browser_engine_reclaim_optional_memory(
+                      engine, &font_reclaim)
+                  && font_reclaim.font_staging_bytes != 0
+                  && font_reclaim.total_bytes
+                         >= font_reclaim.font_staging_bytes);
+            interrupted_staging = true;
+        }
+        const FontFace *serif_face = browser_engine_font_face_variant(
+            engine, FONT_SERIF, false, true);
+        if (font_set_face_is_bold(
+                browser_engine_fonts(engine), serif_face)) break;
+    }
+    CHECK(interrupted_staging && pending_slices >= 2 && visual_changes == 2
+          && browser_engine_navigation(engine)->incremental_relayouts
+                 >= relayouts_before + 2u
+          && font_set_face_is_bold(
+                 browser_engine_fonts(engine),
+                 browser_engine_font_face_variant(
+                     engine, FONT_SERIF, false, true)));
+    ControllerAction action = {0};
+    CHECK(browser_engine_activate(engine, &action));
+    CHECK(action.type == CONTROLLER_ACTION_NAVIGATE
+          && action.prefer_native_media
+          && strcmp(action.url,
+                    "https://www.youtube.com/watch?v=TFTEST00001") == 0);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+
+    /* A built-in provider has a known typography contract: its bold faces
+       must be ready before the candidate can perform its first layout. A
+       normal destination and provider Home keep staged loading. */
+    engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    while (!browser_engine_baseline_fonts_ready(engine))
+        CHECK(browser_engine_pump_baseline_fonts(engine));
+    CHECK(browser_engine_prepare_navigation_fonts(
+              engine, "GET", "https://example.test/")
+          && !font_set_face_is_bold(
+                 browser_engine_fonts(engine),
+                 browser_engine_font_face_variant(
+                     engine, FONT_SANS, false, true)));
+    CHECK(browser_engine_prepare_navigation_fonts(
+              engine, "GET", "https://www.youtube.com/")
+          && !font_set_face_is_bold(
+                 browser_engine_fonts(engine),
+                 browser_engine_font_face_variant(
+                     engine, FONT_SANS, false, true)));
+    static const char provider_home[] =
+        "<!doctype html><style>b{font-weight:700}</style>"
+        "<body><b>Search videos</b><input autofocus>";
+    CHECK(browser_engine_commit_html(
+              engine, "https://www.youtube.com/", provider_home,
+              sizeof(provider_home) - 1u, true));
+    for (size_t i = 0; i < 8; i++) {
+        bool visual_changed = false;
+        (void) browser_engine_run_idle_work(engine, &visual_changed);
+        CHECK(!visual_changed);
+    }
+    CHECK(!font_set_face_is_bold(
+        browser_engine_fonts(engine),
+        browser_engine_font_face_variant(engine, FONT_SANS, false, true)));
+    CHECK(browser_engine_prepare_navigation_fonts(
+              engine, "GET",
+              "https://m.youtube.com/results?search_query=fixture")
+          && font_set_face_is_bold(
+                 browser_engine_fonts(engine),
+                 browser_engine_font_face_variant(
+                     engine, FONT_SANS, false, true))
+          && font_set_face_is_bold(
+                 browser_engine_fonts(engine),
+                 browser_engine_font_face_variant(
+                     engine, FONT_METRIC_SANS, false, true))
+          && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_deferred_image_relayout_requests_repaint(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    config.progressive_first_paint = false;
+    config.resources.enabled = true;
+    config.javascript.enabled = false;
+    config.javascript.document_scripts_enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    static const char page[] =
+        "<!doctype html><style>html,body{margin:0;background:#000}"
+        "img{display:block;width:24px;height:24px}</style><body>"
+        "<a href=/first><img loading=lazy src=/hero.svg>First</a>"
+        "<a href=/second><img loading=lazy src=/tail.svg>Second</a>";
+    CHECK(engine != NULL);
+    static const char blank[] =
+        "<!doctype html><style>html,body{margin:0;background:#000}</style>";
+    CHECK(browser_engine_commit_html(
+              engine, "https://blank.test/", blank,
+              sizeof(blank) - 1u, true)
+          && browser_engine_render_frame(engine, NULL));
+    size_t pixels = 0;
+    const uint16_t *frame = browser_engine_framebuffer(engine, &pixels);
+    uint64_t placeholder = frame_checksum(frame, pixels);
+
+    bool trace_ready = fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-deferred-document-images",
+        error, sizeof(error));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    uint64_t generation = trace_ready ? navigation_begin(navigation) : 0;
+    bool committed = trace_ready && navigation_commit_static_html(
+        navigation, generation, "https://deferred-images.test/page", page,
+        sizeof(page) - 1u, config.device.navigation_viewport_width,
+        NULL, NULL, true);
+    if (!trace_ready || !committed
+        || browser_engine_navigation(engine)->page.images.stats.loaded != 0u
+        || browser_engine_navigation(engine)->page.deferred_image_count
+               != 2u) {
+        fprintf(stderr,
+                "deferred setup trace=%d committed=%d loaded=%zu "
+                "deferred=%zu error=\"%s\"\n",
+                trace_ready, committed,
+                browser_engine_navigation(engine)->page.images.stats.loaded,
+                browser_engine_navigation(engine)->page.deferred_image_count,
+                browser_engine_last_error(engine));
+    }
+    bool initial_rendered = browser_engine_render_frame(engine, NULL);
+    bool initial_focused = browser_engine_focus_move(engine, true);
+    if (!initial_rendered || !initial_focused) {
+        fprintf(stderr,
+                "deferred focus setup rendered=%d focused=%d links=%zu "
+                "controls=%zu\n",
+                initial_rendered, initial_focused,
+                browser_engine_navigation(engine)->page.layout.link_count,
+                browser_engine_navigation(engine)->page.layout.control_count);
+    }
+    CHECK(trace_ready && committed
+          && browser_engine_navigation(engine)->page.images.stats.loaded == 0u
+          && browser_engine_navigation(engine)->page.deferred_image_count
+                 == 2u
+          && initial_rendered && initial_focused);
+    size_t visual_changes = 0;
+    bool input_during_relayout = false;
+    for (size_t pumps = 0; pumps < 16u; pumps++) {
+        bool visual_changed = false;
+        bool pending = browser_engine_run_deferred_image_work(
+            engine, &visual_changed);
+        if (visual_changed) {
+            visual_changes++;
+            CHECK(browser_engine_render_frame(engine, NULL));
+            if (!input_during_relayout) {
+                ControllerAction during_load = {0};
+                CHECK(browser_engine_focus_direction(
+                          engine, CONTROLLER_FOCUS_DOWN)
+                      && browser_engine_activate(engine, &during_load)
+                      && during_load.type == CONTROLLER_ACTION_NAVIGATE
+                      && strcmp(during_load.url,
+                                "https://deferred-images.test/second") == 0
+                      && browser_engine_focus_direction(
+                             engine, CONTROLLER_FOCUS_UP));
+                input_during_relayout = true;
+            }
+        }
+        if (!pending) break;
+    }
+    frame = browser_engine_framebuffer(engine, &pixels);
+    uint64_t painted = frame == NULL ? 0 : frame_checksum(frame, pixels);
+    if (visual_changes != 2u
+        || browser_engine_navigation(engine)->page.images.stats.loaded != 2u
+        || painted == placeholder) {
+        fprintf(stderr,
+                "deferred repaint changes=%zu loaded=%zu "
+                "placeholder=%llx painted=%llx relayouts=%zu/%zu "
+                "background=%zu/%zu\n",
+                visual_changes,
+                browser_engine_navigation(engine)->page.images.stats.loaded,
+                (unsigned long long) placeholder,
+                (unsigned long long) painted,
+                browser_engine_navigation(engine)->performance.fast_relayouts,
+                browser_engine_navigation(engine)->performance.full_relayouts,
+                browser_engine_navigation(engine)->performance
+                    .background_images_loaded,
+                browser_engine_navigation(engine)->performance
+                    .background_image_relayouts);
+    }
+    CHECK(visual_changes == 2u
+          && input_during_relayout
+          && browser_engine_navigation(engine)->page.images.stats.loaded
+                 == 2u
+          && painted != placeholder);
+    const TileCache *deferred_render =
+        browser_engine_render_metrics_view(engine);
+    CHECK(deferred_render != NULL
+          && deferred_render->frames_rendered >= visual_changes + 1u);
+    ControllerAction focus_action = {0};
+    CHECK(browser_engine_activate(engine, &focus_action)
+          && focus_action.type == CONTROLLER_ACTION_NAVIGATE
+          && strcmp(focus_action.url,
+                    "https://deferred-images.test/first") == 0);
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
     return 0;
 }

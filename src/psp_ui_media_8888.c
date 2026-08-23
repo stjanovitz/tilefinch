@@ -28,6 +28,7 @@
 #include "tilefinch/psp_ui.h"
 
 #include <stddef.h>
+#include <string.h>
 
 #include "psp_media_pixels.h"
 
@@ -81,11 +82,23 @@ static void ui_media_composite_8888(
         count = 1u;
     }
     for (size_t band = 0; band < count; band++) {
+        /* The control strip owns every visible pixel through an opaque
+           ground. Do not import the moving decoded picture into its scratch
+           rows first: besides wasting about 37k pixel conversions per video
+           frame, any future one-pixel coverage mistake would reveal changing
+           video as the bottom-edge shimmer seen on hardware. Other bands
+           contain rounded silhouettes and still need their real backdrop. */
+        bool opaque_control_strip = media->controls_visible
+            && !media->failed && bands[band].bottom == height;
         for (int y = bands[band].top; y < bands[band].bottom; y++) {
             const uint32_t *source = pixels + (size_t) y * (size_t) stride;
             uint16_t *destination = scratch + (size_t) y * (size_t) stride;
-            for (int x = 0; x < width; x++)
-                destination[x] = ui_media_narrow(source[x]);
+            if (opaque_control_strip) {
+                memset(destination, 0, (size_t) width * sizeof(*destination));
+            } else {
+                for (int x = 0; x < width; x++)
+                    destination[x] = ui_media_narrow(source[x]);
+            }
         }
     }
     /* The scratch is stride-wide and full-height, so every coordinate the

@@ -38,6 +38,14 @@ typedef enum {
     BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY
 } BrowserSessionPersistenceStatus;
 
+typedef struct BrowserSessionPersistenceLoad BrowserSessionPersistenceLoad;
+
+typedef enum {
+    BROWSER_SESSION_PERSISTENCE_LOAD_PENDING = 0,
+    BROWSER_SESSION_PERSISTENCE_LOAD_COMPLETE,
+    BROWSER_SESSION_PERSISTENCE_LOAD_FAILED
+} BrowserSessionPersistenceLoadProgress;
+
 void browser_session_persistence_limits_default(
     BrowserSessionPersistenceLimits *limits);
 
@@ -56,6 +64,26 @@ BrowserSessionPersistenceStatus browser_session_persistence_load(
     BrowserSession *session, const char *path,
     BrowserSessionPersistenceMask mask,
     const BrowserSessionPersistenceLimits *limits);
+
+/*
+ * Incremental counterpart to load(). The loader keeps one file open and
+ * reads at most maximum_bytes per pump. Restored objects remain in a staging
+ * session until the complete payload, record counts, and checksum validate;
+ * cancellation or failure therefore leaves the live session unchanged.
+ *
+ * begin() may open the primary file and allocate the small loader/staging
+ * records, but does not read payload bytes. A corrupt or missing primary is
+ * retried from the rotated backup within later pump calls.
+ */
+BrowserSessionPersistenceLoad *browser_session_persistence_load_begin(
+    BrowserSession *session, const char *path,
+    BrowserSessionPersistenceMask mask,
+    const BrowserSessionPersistenceLimits *limits);
+BrowserSessionPersistenceLoadProgress browser_session_persistence_load_pump(
+    BrowserSessionPersistenceLoad *load, size_t maximum_bytes,
+    BrowserSessionPersistenceStatus *status);
+void browser_session_persistence_load_destroy(
+    BrowserSessionPersistenceLoad *load);
 BrowserSessionPersistenceStatus browser_session_persistence_clear(
     BrowserSession *session, BrowserSessionPersistenceMask mask);
 

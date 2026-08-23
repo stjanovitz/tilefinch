@@ -108,6 +108,30 @@
    speculative background TCP+TLS connect (docs/engineering/
    PSP_TRANSPORT.md). */
 #define PSP_HOME_PRECONNECT_DWELL_MS 300u
+/* Result-row speculation waits longer than a TCP preconnect because resolving
+   a video can consume a substantial response. A settled focus is evidence of
+   intent; d-pad traversal is not. */
+#define PSP_YOUTUBE_PRERESOLVE_DWELL_US UINT64_C(700000)
+/* Completed descriptors remain useful across a short focus-to-Play pause,
+   but signed media URLs and scarce response storage should not sit parked
+   behind a five-minute focus. */
+#define PSP_YOUTUBE_PRERESOLVE_RETENTION_US UINT64_C(90000000)
+/* A pending job retains its original 30-second resolver deadline. Preserve at
+   least half of that budget for an explicit Play instead of transferring a
+   nearly expired speculative attempt. Completed jobs are unaffected. */
+#define PSP_YOUTUBE_PRERESOLVE_PENDING_ADOPT_US UINT64_C(15000000)
+#define PSP_YOUTUBE_PRERESOLVE_WORKING_BYTES (2u * MIB)
+#define PSP_YOUTUBE_PRERESOLVE_RESERVE_BYTES (1u * MIB)
+#define PSP_YOUTUBE_PRERESOLVE_WATCH_BYTES (1536u * KIB)
+#define PSP_YOUTUBE_PRERESOLVE_PLAYER_BYTES (512u * KIB)
+_Static_assert(
+    PSP_YOUTUBE_PRERESOLVE_WATCH_BYTES
+        <= PSP_YOUTUBE_PRERESOLVE_WORKING_BYTES,
+    "speculative watch response must fit its admission charge");
+_Static_assert(
+    PSP_YOUTUBE_PRERESOLVE_PLAYER_BYTES
+        <= PSP_YOUTUBE_PRERESOLVE_WORKING_BYTES,
+    "speculative player response must fit its admission charge");
 #define PSP_NETWORK_PRESENT_INTERVAL_US UINT64_C(100000)
 #define PSP_NAVIGATION_PRESENT_INTERVAL_US UINT64_C(100000)
 #define PSP_HOME_EXIT_GRACE_MS 30000u
@@ -283,6 +307,15 @@ typedef struct {
     volatile unsigned presenting;
     volatile unsigned provisional_present_requested;
     volatile int provisional_scroll_requests;
+    /* Button edges observed while the browser thread is inside a bounded
+       page-owned service. The callback thread records them, but never calls
+       into the controller or DOM; cooperate_end transfers the FIFO back to
+       the browser thread after fencing the callback. Four entries cover a
+       short burst without making an unexpectedly slow service an unbounded
+       input queue. */
+    uint32_t pending_page_input[4];
+    uint8_t pending_page_input_count;
+    uint8_t pending_page_input_dropped;
     /* Latest media command accepted by the callback-thread supervisor while
        the browser thread is inside one bounded decoder/range service. The
        supervisor owns this tuple until cooperate_end fences presentation;
@@ -336,6 +369,7 @@ void psp_work_cooperate_begin_media_open(
 void psp_navigation_cooperate_end(const char *scope);
 bool psp_navigation_cooperate_take_media_intent(
     PspUiMediaIntent *intent);
+bool psp_navigation_cooperate_take_page_input(uint32_t *pressed);
 bool psp_navigation_cooperate_active(void);
 bool psp_navigation_cooperate_supervised(void);
 bool psp_navigation_cancel_requested(void);
@@ -344,6 +378,10 @@ uint32_t psp_navigation_observed_buttons(void);
 bool psp_request_provisional_scroll(
     BrowserEngine *engine, PspUiState *ui, int direction);
 void psp_background_ui_tick(void);
+const char *psp_user_visible_error(
+    const char *detail, long tls_verify_result,
+    TilefinchTlsGuidance *tls_guidance,
+    char *summary, size_t summary_size);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
 void psp_sample_wifi_strength(const PspNetwork *network, uint64_t now_us);
 #endif
@@ -461,6 +499,9 @@ void psp_find_sync(BrowserEngine *engine, PspUiState *ui,
                    PspUiFindView *view);
 size_t psp_text_input_prepare_voice(void *user);
 uint32_t psp_ui_buttons(uint32_t buttons);
+/* Consume button-down transitions accumulated by the PSP controller service.
+   Current held state and analog axes still come from SceCtrlData. */
+uint32_t psp_controller_take_latched_pressed(void);
 PspUiInput psp_ui_input(const SceCtrlData *pad, uint32_t previous_buttons,
                         unsigned elapsed_ms);
 const char *psp_ui_action_name(PspUiAction action);
@@ -635,6 +676,56 @@ typedef struct {
 bool psp_engine_views_refresh(
     PspEngineViews *views, const BrowserEngine *engine);
 
+typedef enum {
+    PSP_YOUTUBE_PRERESOLVE_IDLE = 0,
+    PSP_YOUTUBE_PRERESOLVE_THUMBNAIL,
+    PSP_YOUTUBE_PRERESOLVE_DWELL,
+    PSP_YOUTUBE_PRERESOLVE_RESOLVING,
+    PSP_YOUTUBE_PRERESOLVE_READY,
+    PSP_YOUTUBE_PRERESOLVE_FAILED,
+    PSP_YOUTUBE_PRERESOLVE_CONSUMED
+} PspYoutubePreresolveState;
+
+/* One speculative provider resolver, owned by the browser lifetime but not by
+   the media machine. The explicit state makes thumbnail-before-resolution a
+   lifecycle invariant. Only RESOLVING and READY may own `job`; transfer
+   clears that pointer before the same activation records CONSUMED. It never
+   opens a CDN URL: ownership moves to the media session only after an explicit
+   Play activation. */
+typedef struct {
+    YoutubeResolveJob *job;
+    char video_id[YOUTUBE_VIDEO_ID_CAPACITY];
+    char observed_video_id[YOUTUBE_VIDEO_ID_CAPACITY];
+    uint64_t generation;
+    uint64_t observed_generation;
+    uint64_t focus_since_us;
+    uint64_t started_us;
+    uint64_t ready_us;
+    int maximum_height;
+    unsigned starts;
+    unsigned completions;
+    unsigned cancellations;
+    unsigned memory_deferrals;
+    size_t observed_focus_moves;
+    size_t observed_focus_index;
+    ControllerFocusKind observed_focus_kind;
+    PspYoutubePreresolveState state;
+    bool observation_valid;
+} PspYoutubePreresolve;
+
+void psp_youtube_preresolve_reset(
+    PspYoutubePreresolve *preresolve, const char *reason);
+void psp_youtube_preresolve_tick(
+    PspYoutubePreresolve *preresolve, Budget *budget,
+    BrowserSession *session, const char *focused_video_id,
+    uint64_t generation, int maximum_height, uint64_t now_us,
+    bool thumbnail_settled, bool eligible, bool transport_capacity,
+    bool pump_allowed);
+YoutubeResolveJob **psp_youtube_preresolve_job_for_open(
+    PspYoutubePreresolve *preresolve, const char *url,
+    uint64_t generation, int maximum_height, uint64_t now_us);
+void psp_youtube_preresolve_note_taken(PspYoutubePreresolve *preresolve);
+
 /* Process-lifetime storage and physical ownership facts. This record does not
    decide lifecycle transitions: media/network machines remain authoritative,
    while `clock_live` only records whether teardown owes a worker join. */
@@ -662,6 +753,7 @@ typedef struct {
     PspProfileStore profile_store;
     PspOfflineStore offline_store;
     PspMediaSession media;
+    PspYoutubePreresolve youtube_preresolve;
     PspUpdateSession update_session;
     PspVoiceComponentSession *voice_component_session;
     PspGlyphComponentSession *glyph_component_session;
@@ -700,6 +792,29 @@ typedef struct {
     uint32_t retained;
 } PspShutdownReport;
 
+typedef enum {
+    PSP_SITE_DATA_RESTORE_DISABLED = 0,
+    PSP_SITE_DATA_RESTORE_LOCAL_STORAGE,
+    PSP_SITE_DATA_RESTORE_CACHE,
+    PSP_SITE_DATA_RESTORE_DONE
+} PspSiteDataRestorePhase;
+
+/* One-shot post-Home restore operation. The parser owns the transactional
+   staging session; this record only sequences the two independent files and
+   accounts bounded idle slices. */
+typedef struct {
+    BrowserSessionPersistenceLoad *load;
+    BrowserSessionPersistenceLimits cache_limits;
+    BrowserSessionPersistenceLimits storage_limits;
+    PspSiteDataRestorePhase phase;
+    size_t pumps;
+    size_t bytes_budgeted;
+    bool cache_enabled;
+    /* Navigation may discard an uncommitted cache restore. Until a later boot
+       reads that snapshot, exit must not rotate it behind an empty live cache. */
+    bool cache_restore_cancelled_unread;
+} PspSiteDataRestore;
+
 /* Persistent state owned by one interactive-loop invocation. These are
    operation records and counters, not parallel media/network control state. */
 typedef struct {
@@ -708,6 +823,7 @@ typedef struct {
     PspTabTransition tab_transition;
     PspRecoveryTracker recovery;
     PspExitPlan exit;
+    PspSiteDataRestore site_data_restore;
     PspReaderNavigation reader_navigation;
     bool lifecycle_retry_available;
     char lifecycle_retry_url[NAVIGATION_URL_LIMIT];
@@ -715,6 +831,12 @@ typedef struct {
        usable media pipeline. This is an input mailbox, not lifecycle state. */
     PspUiMediaIntent deferred_media_intent;
     bool deferred_media_intent_pending;
+    /* Direct provider activation commits the player before any pressure
+       reclaim. The job is armed only when decoder headroom is actually short
+       and advances by one bounded phase per frame after that presentation. */
+    BrowserOptionalMemoryReclaimJob provider_handoff_reclaim;
+    uint64_t provider_handoff_reclaim_pump_us;
+    bool provider_handoff_present_pending;
     bool validation_media_play_injected;
     bool validation_media_play_confirmed;
     bool media_stability_active;
@@ -796,6 +918,12 @@ typedef struct {
     bool pointer_activation;
 } PspAppFrameState;
 
+/* src/psp_app/psp_app_youtube.c */
+void psp_app_youtube_preresolve_tick(
+    PspApp *app, const PspAppFrameState *frame, const PspUiIntent *intent,
+    bool render_job_pending, bool site_data_restore_work,
+    bool offline_download_active, bool input_active);
+
 /* src/psp_app/psp_app_surfaces.c -- declared after PspApp because they take
    it. Every internal-home navigation goes through these two; see the
    definitions for why the classifier and the routing must stay paired. */
@@ -805,6 +933,8 @@ bool psp_route_native_home(PspApp *app, const char *url);
 /* src/psp_app/psp_app_actions.c */
 void psp_app_dispatch_action(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent);
+void psp_app_pump_provider_handoff_reclaim(
+    PspApp *app, uint64_t frame_us, bool player_presented);
 /* src/psp_app/psp_app_settings.c */
 void psp_app_apply_setting(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent);
@@ -830,6 +960,8 @@ bool psp_input_script_frame(
 bool psp_input_script_busy_frame(PspUiInput *input);
 void psp_input_script_observe(
     const PspUiIntent *intent, const PspUiState *ui);
+void psp_input_script_observe_page(
+    const NavigationSession *navigation);
 void psp_input_script_observe_media(
     const PspUiMediaIntent *intent, const PspUiMediaState *media);
 void psp_input_script_capture_live_mark(

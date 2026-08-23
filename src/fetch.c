@@ -1,10 +1,12 @@
 #include "tilefinch/fetch.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/content_security_policy.h"
+#include "tilefinch/diagnostics.h"
 #include "tilefinch/fetch_fault.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_threads.h"
 #include "tilefinch/session.h"
+#include "tilefinch/sha256.h"
 #include "tilefinch/tls_session_store.h"
 #include "tilefinch/url.h"
 
@@ -46,6 +48,23 @@ extern CURLcode curl_easy_impersonate(CURL *handle, const char *target,
    libcurl's documented mbedTLS seams without patching either dependency. */
 #include <mbedtls/ssl.h>
 #include <mbedtls/version.h>
+#include <mbedtls/x509.h>
+_Static_assert(MBEDTLS_X509_BADCERT_EXPIRED == TILEFINCH_TLS_VERIFY_EXPIRED,
+               "TLS expired flag must match the linked Mbed TLS ABI");
+_Static_assert(MBEDTLS_X509_BADCERT_CN_MISMATCH
+                   == TILEFINCH_TLS_VERIFY_HOSTNAME,
+               "TLS hostname flag must match the linked Mbed TLS ABI");
+_Static_assert(MBEDTLS_X509_BADCERT_NOT_TRUSTED
+                   == TILEFINCH_TLS_VERIFY_NOT_TRUSTED,
+               "TLS trust flag must match the linked Mbed TLS ABI");
+_Static_assert(MBEDTLS_X509_BADCERT_FUTURE == TILEFINCH_TLS_VERIFY_FUTURE,
+               "TLS future flag must match the linked Mbed TLS ABI");
+_Static_assert(MBEDTLS_X509_BADCERT_BAD_MD == TILEFINCH_TLS_VERIFY_BAD_MD,
+               "TLS digest flag must match the linked Mbed TLS ABI");
+_Static_assert(MBEDTLS_X509_BADCERT_BAD_PK == TILEFINCH_TLS_VERIFY_BAD_PK,
+               "TLS key-type flag must match the linked Mbed TLS ABI");
+_Static_assert(MBEDTLS_X509_BADCERT_BAD_KEY == TILEFINCH_TLS_VERIFY_BAD_KEY,
+               "TLS key flag must match the linked Mbed TLS ABI");
 #endif
 #include <ctype.h>
 #include <errno.h>
@@ -341,6 +360,8 @@ static char fetch_ca_bundle[1024];
 #ifdef TILEFINCH_FETCH_CA_BLOB
 static unsigned char *fetch_ca_blob_data;
 static size_t fetch_ca_blob_length;
+static uint8_t fetch_ca_blob_digest[TILEFINCH_CA_BUNDLE_SHA256_BYTES];
+static bool fetch_ca_blob_digest_valid;
 static char fetch_ca_blob_source[sizeof(fetch_ca_bundle)];
 #endif
 /* Cross-boot TLS session resumption store. Empty disables it. */
@@ -359,6 +380,8 @@ static void fetch_ca_blob_reset(void)
     free(fetch_ca_blob_data);
     fetch_ca_blob_data = NULL;
     fetch_ca_blob_length = 0;
+    memset(fetch_ca_blob_digest, 0, sizeof(fetch_ca_blob_digest));
+    fetch_ca_blob_digest_valid = false;
     fetch_ca_blob_source[0] = '\0';
 #endif
 }
@@ -384,6 +407,26 @@ bool fetch_set_ca_bundle_path(const char *path)
 const char *fetch_ca_bundle_path(void)
 {
     return fetch_ca_bundle[0] == '\0' ? NULL : fetch_ca_bundle;
+}
+
+bool fetch_ca_bundle_identity(
+    uint32_t *version, size_t *length,
+    uint8_t digest[TILEFINCH_CA_BUNDLE_SHA256_BYTES])
+{
+    if (version != NULL) *version = TILEFINCH_CA_BUNDLE_VERSION;
+    if (length != NULL) *length = 0;
+    if (digest != NULL) memset(digest, 0, TILEFINCH_CA_BUNDLE_SHA256_BYTES);
+#ifdef TILEFINCH_FETCH_CA_BLOB
+    if (fetch_ca_blob_data == NULL || !fetch_ca_blob_digest_valid)
+        return false;
+    if (length != NULL) *length = fetch_ca_blob_length;
+    if (digest != NULL)
+        memcpy(digest, fetch_ca_blob_digest,
+               TILEFINCH_CA_BUNDLE_SHA256_BYTES);
+    return true;
+#else
+    return false;
+#endif
 }
 
 #ifdef TILEFINCH_FETCH_CA_BLOB
@@ -412,6 +455,12 @@ static bool fetch_ca_blob_ensure(void)
     if (!ok) { free(data); return false; }
     fetch_ca_blob_data = data;
     fetch_ca_blob_length = (size_t) size;
+    fetch_ca_blob_digest_valid = tilefinch_sha256_digest(
+        data, (size_t) size, fetch_ca_blob_digest);
+    if (!fetch_ca_blob_digest_valid) {
+        fetch_ca_blob_reset();
+        return false;
+    }
     snprintf(fetch_ca_blob_source, sizeof(fetch_ca_blob_source), "%s",
              fetch_ca_bundle);
     return true;
@@ -590,6 +639,48 @@ static bool fetch_transport_hop_is_tls(CURL *easy)
         && url != NULL && strncasecmp(url, "https://", 8) == 0;
 }
 
+static void fetch_transport_timing_sample(
+    CURL *easy, FetchTransportTiming *timing)
+{
+    if (timing == NULL) return;
+    memset(timing, 0, sizeof(*timing));
+#if LIBCURL_VERSION_NUM >= 0x073D00 /* 7.61.0 introduced the _TIME_T infos */
+    if (easy == NULL) return;
+    curl_off_t name_lookup_us = 0;
+    curl_off_t connect_us = 0;
+    curl_off_t appconnect_us = 0;
+    curl_off_t first_byte_us = 0;
+    curl_off_t total_us = 0;
+    if (curl_easy_getinfo(
+            easy, CURLINFO_NAMELOOKUP_TIME_T, &name_lookup_us) != CURLE_OK
+        || curl_easy_getinfo(
+               easy, CURLINFO_CONNECT_TIME_T, &connect_us) != CURLE_OK
+        || curl_easy_getinfo(
+               easy, CURLINFO_APPCONNECT_TIME_T, &appconnect_us) != CURLE_OK
+        || curl_easy_getinfo(
+               easy, CURLINFO_STARTTRANSFER_TIME_T, &first_byte_us) != CURLE_OK
+        || curl_easy_getinfo(
+               easy, CURLINFO_TOTAL_TIME_T, &total_us) != CURLE_OK
+        || name_lookup_us < 0 || connect_us < 0 || appconnect_us < 0
+        || first_byte_us < 0 || total_us < 0) return;
+    /* Every Tilefinch request has a deadline far below UINT32_MAX us. Keep
+       these per-slot samples compact on the 32-bit target and saturate rather
+       than narrowing a backend anomaly. Aggregates widen to uint64_t. */
+#define FETCH_TIMING_US(value) \
+    ((uint32_t) ((value) > (curl_off_t) UINT32_MAX \
+        ? UINT32_MAX : (value)))
+    timing->measured = true;
+    timing->name_lookup_us = FETCH_TIMING_US(name_lookup_us);
+    timing->connect_us = FETCH_TIMING_US(connect_us);
+    timing->appconnect_us = FETCH_TIMING_US(appconnect_us);
+    timing->first_byte_us = FETCH_TIMING_US(first_byte_us);
+    timing->total_us = FETCH_TIMING_US(total_us);
+#undef FETCH_TIMING_US
+#else
+    (void) easy;
+#endif
+}
+
 /* Samples the completed hop on `easy`.  Only call this for a hop that
    reached the HTTP layer: on a connection that failed to establish, the
    zeroed timers would otherwise be indistinguishable from reuse. */
@@ -688,26 +779,53 @@ bool fetch_tls_handshake_counters_format(
    valid only while the transfer owns its connection, so it is sampled from
    the response status line rather than after the transfer completes.  The
    host OpenSSL path leaves tls_version empty. */
-static void fetch_result_capture_tls_version(CURL *easy, FetchResult *result)
+static void fetch_capture_tls_security(
+    CURL *easy, char *version, size_t version_size,
+    char *issuer, size_t issuer_size, bool capture_issuer)
 {
 #if defined(TILEFINCH_PSP_OWNED_TRANSPORT)
-    if (easy == NULL || result == NULL || result->tls_version[0] != '\0') {
-        return;
-    }
+    if (easy == NULL) return;
     struct curl_tlssessioninfo *session = NULL;
     if (curl_easy_getinfo(easy, CURLINFO_TLS_SSL_PTR, &session) != CURLE_OK
         || session == NULL || session->internals == NULL
         || session->backend != CURLSSLBACKEND_MBEDTLS) return;
-    const char *version = mbedtls_ssl_get_version(
-        (const mbedtls_ssl_context *) session->internals);
-    if (version == NULL || version[0] == '\0'
-        || strcmp(version, "unknown") == 0) return;
-    (void) snprintf(result->tls_version, sizeof(result->tls_version), "%s",
-                    version);
+    const mbedtls_ssl_context *ssl = session->internals;
+    const char *negotiated = mbedtls_ssl_get_version(ssl);
+    if (version != NULL && version_size != 0
+        && negotiated != NULL && negotiated[0] != '\0'
+        && strcmp(negotiated, "unknown") != 0) {
+        (void) snprintf(version, version_size, "%s", negotiated);
+    }
+    if (capture_issuer && issuer != NULL && issuer_size != 0) {
+        const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(ssl);
+        char candidate[TILEFINCH_TLS_PEER_ISSUER_LIMIT] = {0};
+        if (peer != NULL && mbedtls_x509_dn_gets(
+                candidate, sizeof(candidate), &peer->issuer) > 0) {
+            /* Certificate names are peer-controlled. Keep the line-oriented
+               failure snapshot parseable even for an injected local cert. */
+            for (size_t at = 0; candidate[at] != '\0'; at++) {
+                unsigned char value = (unsigned char) candidate[at];
+                if (value < 0x20u || value == 0x7fu) candidate[at] = '?';
+            }
+            (void) snprintf(issuer, issuer_size, "%s", candidate);
+        }
+    }
 #else
     (void) easy;
-    (void) result;
+    (void) version;
+    (void) version_size;
+    (void) issuer;
+    (void) issuer_size;
+    (void) capture_issuer;
 #endif
+}
+
+static void fetch_result_capture_tls_version(CURL *easy, FetchResult *result)
+{
+    if (result == NULL) return;
+    fetch_capture_tls_security(
+        easy, result->tls_version, sizeof(result->tls_version),
+        result->tls_peer_issuer, sizeof(result->tls_peer_issuer), false);
 }
 
 static void fetch_result_set_transport_info(CURL *easy, FetchResult *result)
@@ -717,10 +835,16 @@ static void fetch_result_set_transport_info(CURL *easy, FetchResult *result)
         easy, CURLINFO_SSL_VERIFYRESULT, &result->tls_verify_result);
     (void) curl_easy_getinfo(
         easy, CURLINFO_HTTP_VERSION, &result->negotiated_http_version);
+    fetch_capture_tls_security(
+        easy, result->tls_version, sizeof(result->tls_version),
+        result->tls_peer_issuer, sizeof(result->tls_peer_issuer),
+        result->transport_code != CURLE_OK
+            || result->tls_verify_result != 0);
 #if LIBCURL_VERSION_NUM >= 0x073200 /* 7.50.0 */
     (void) curl_easy_getinfo(
         easy, CURLINFO_NUM_CONNECTS, &result->new_connections);
 #endif
+    fetch_transport_timing_sample(easy, &result->transport_timing);
     FetchHandshakeSample sample;
     fetch_handshake_sample(easy, &sample);
     /* Assign unconditionally: a handle reused across redirect hops must not
@@ -909,17 +1033,15 @@ static long fetch_connect_timeout_ms(
  * by an EXPIRE_SPEEDCHECK timer that fires every second even with no socket
  * activity), so it needs no progress callback of ours and no polling.
  *
- * The threshold is deliberately at the floor: fewer than one byte per second
- * averaged over three seconds is a dead transfer, not a slow one, so this is
- * safe to apply to every blocking request rather than only to media. A page
- * load gains the same thing video does -- a stalled response fails in three
- * seconds instead of at the deadline -- and no genuinely progressing PSP Wi-Fi
- * transfer, however slow, can trip it. The scheduler's asynchronous
- * subresource path is deliberately left alone: it does not block a thread, so
- * a stall there costs no responsiveness.
+ * The threshold stays at the floor, but the time window must tolerate the
+ * multi-second gaps seen on real PSP Wi-Fi after hundreds of KiB of useful
+ * response data. Transport now runs off the browser thread, so allowing six
+ * seconds here does not freeze input; the request's absolute deadline remains
+ * the outer bound. The scheduler's asynchronous subresource path is
+ * deliberately left alone because it already has its own bounded lifecycle.
  */
 #define FETCH_STALL_LOW_SPEED_BYTES_PER_SECOND 1L
-#define FETCH_STALL_LOW_SPEED_SECONDS 3L
+#define FETCH_STALL_LOW_SPEED_SECONDS 6L
 
 static bool fetch_configure_stall_watchdog(CURL *easy)
 {

@@ -877,7 +877,7 @@ static int fetch_background_find_buffer(bool streaming)
     return -1;
 }
 
-/* The transport can be created by HOME's connect-only speculation, which
+/* The transport can be created by HOME's bodyless speculation, which
    needs no response storage and runs at the tightest point in the native
    boot footprint. Grow streaming storage on the browser thread only when a
    real response is admitted. The count includes queued descriptors so the
@@ -969,6 +969,13 @@ static void fetch_background_publish_complete(
         (void) curl_easy_getinfo(
             slot->easy, CURLINFO_SSL_VERIFYRESULT,
             &slot->result.tls_verify_result);
+        fetch_capture_tls_security(
+            slot->easy,
+            slot->result.tls_version,
+            sizeof(slot->result.tls_version),
+            slot->result.tls_peer_issuer,
+            sizeof(slot->result.tls_peer_issuer),
+            code != CURLE_OK || slot->result.tls_verify_result != 0);
     }
     slot->result.success = success;
     slot->result.length = slot->streaming
@@ -1132,6 +1139,8 @@ static void fetch_background_finish_easy(
     (void) curl_easy_getinfo(
         slot->easy, CURLINFO_NUM_CONNECTS, &slot->result.new_connections);
 #endif
+    fetch_transport_timing_sample(
+        slot->easy, &slot->result.transport_timing);
     FetchHandshakeSample handshake;
     fetch_handshake_sample(slot->easy, &handshake);
     slot->result.tls_connection_reuse_known = handshake.classified;
@@ -1202,7 +1211,10 @@ static bool fetch_background_preconnect_configure(void)
         || !fetch_configure_http_version(easy)
         || curl_easy_setopt(easy, CURLOPT_URL, preconnect->origin)
                != CURLE_OK
-        || curl_easy_setopt(easy, CURLOPT_CONNECT_ONLY, 1L) != CURLE_OK
+        || curl_easy_setopt(easy, CURLOPT_NOBODY, 1L) != CURLE_OK
+        || curl_easy_setopt(
+               easy, CURLOPT_USERAGENT, FETCH_BACKGROUND_USER_AGENT)
+               != CURLE_OK
         || curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L) != CURLE_OK
         || curl_easy_setopt(
                easy, CURLOPT_CONNECTTIMEOUT_MS, preconnect->timeout_ms)
@@ -1255,15 +1267,15 @@ static bool fetch_background_finish_preconnect(
     FetchBackgroundPreconnect *preconnect = &fetch_background.preconnect;
     if (easy == NULL || easy != preconnect->easy) return false;
     fetch_background_record_network_regression(code);
-    (void) curl_multi_remove_handle(fetch_background.multi, easy);
     preconnect->result = code;
     if (atomic_load_explicit(
             &preconnect->cancel_requested, memory_order_acquire)) {
         fetch_background_preconnect_release(true);
     } else if (code == CURLE_OK) {
-        /* Retain the CONNECT_ONLY easy/socket exactly as the old homepage
-           path did. Navigation cancellation releases it after the shared DNS
-           and TLS-session state has been warmed. */
+        /* Cleanup of a completed ordinary easy leaves its idle connection in
+           curl's shared connection cache. The descriptor remains CONNECTED
+           only as a browser-thread-visible warmup result. */
+        fetch_background_preconnect_release(false);
         atomic_store_explicit(
             &preconnect->state, FETCH_BACKGROUND_PRECONNECT_CONNECTED,
             memory_order_release);
@@ -1474,7 +1486,7 @@ static void fetch_background_expire_active_deadlines(void)
             slot->result.error, sizeof(slot->result.error), "%s",
             deadline_expired
                 ? "background active transport deadline expired"
-                : "background response made no progress for three seconds");
+                : "background response made no progress for six seconds");
         fetch_background_slot_release_curl(slot);
         slot->result.success = false;
         slot->result.timed_out = true;
@@ -2489,6 +2501,7 @@ static void fetch_background_copy_response_metadata(
     destination->tls_verify_result = source->tls_verify_result;
     destination->negotiated_http_version = source->negotiated_http_version;
     destination->new_connections = source->new_connections;
+    destination->transport_timing = source->transport_timing;
     destination->tls_handshake_measured = source->tls_handshake_measured;
     destination->tls_handshake_us = source->tls_handshake_us;
     destination->tls_connection_reuse_known =
@@ -2496,6 +2509,11 @@ static void fetch_background_copy_response_metadata(
     destination->tls_connection_reused = source->tls_connection_reused;
     destination->tls12_compatibility_retry =
         source->tls12_compatibility_retry;
+    snprintf(destination->tls_version, sizeof(destination->tls_version),
+             "%s", source->tls_version);
+    snprintf(destination->tls_peer_issuer,
+             sizeof(destination->tls_peer_issuer), "%s",
+             source->tls_peer_issuer);
     destination->timed_out = source->timed_out;
     snprintf(destination->effective_url, sizeof(destination->effective_url),
              "%s", source->effective_url);
@@ -2589,6 +2607,7 @@ static void fetch_background_copy_media_response(
     destination->length = source->length;
     destination->received_body_bytes = source->received_body_bytes;
     destination->new_connections = source->new_connections;
+    destination->transport_timing = source->transport_timing;
     destination->success = source->success;
     destination->timed_out = source->timed_out;
     destination->tls_handshake_measured = source->tls_handshake_measured;

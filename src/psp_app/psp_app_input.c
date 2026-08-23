@@ -108,10 +108,12 @@ size_t psp_text_input_prepare_voice(void *user)
     }
 #endif
     printf(
-        "tilefinch-voice-reclaim: total=%zu js=%zu http=%zu render=%zu "
+        "tilefinch-voice-reclaim: total=%zu fonts=%zu js=%zu http=%zu "
+        "render=%zu "
         "media=%d "
         "network-cancelled=%zu budget_remaining=%zu\n",
-        reclaim.total_bytes, reclaim.javascript_bytes,
+        reclaim.total_bytes, reclaim.font_staging_bytes,
+        reclaim.javascript_bytes,
         reclaim.session_cache_bytes, reclaim.render_cache_bytes,
         media_reclaimed ? 1 : 0,
         cancelled_network,
@@ -135,6 +137,26 @@ uint32_t psp_ui_buttons(uint32_t buttons)
     if (buttons & PSP_CTRL_START) mapped |= PSP_UI_BUTTON_ADDRESS;
     if (buttons & PSP_CTRL_SELECT) mapped |= PSP_UI_BUTTON_MENU;
     return mapped;
+}
+
+uint32_t psp_controller_take_latched_pressed(void)
+{
+    /* The browser loop and callback supervisor hand controller ownership
+       back and forth. Never let their scope boundary turn ReadLatch into a
+       blocking two-reader race: a losing caller falls back to current-state
+       sampling and the winner retains every accumulated transition. */
+    static volatile unsigned latch_reader;
+    if (!__sync_bool_compare_and_swap(&latch_reader, 0u, 1u)) return 0;
+    SceCtrlLatch pending = {0};
+    SceCtrlLatch consumed = {0};
+    uint32_t pressed = 0;
+    if (sceCtrlPeekLatch(&pending) > 0
+        && sceCtrlReadLatch(&consumed) > 0) {
+        pressed = psp_ui_buttons(consumed.uiMake);
+    }
+    __sync_synchronize();
+    latch_reader = 0;
+    return pressed;
 }
 
 PspUiInput psp_ui_input(const SceCtrlData *pad,

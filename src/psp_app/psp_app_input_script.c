@@ -188,6 +188,37 @@ void psp_input_script_observe(const PspUiIntent *intent, const PspUiState *ui)
            (unsigned) intent->tab_index);
 }
 
+void psp_input_script_observe_page(
+    const NavigationSession *navigation)
+{
+    const char *mark = psp_input_script_mark(&psp_input_script);
+    if (mark == NULL || navigation == NULL) return;
+    const NavigationPage *page = &navigation->page;
+    const ExternalImageStats *images = &page->images.stats;
+    printf("tilefinch-input-script-images: mark=%s cursor=%zu/%zu "
+           "job=%d batch=%u attempts=%zu loaded=%zu failed=%zu "
+           "bytes=%zu/%zu progress=%zu/%zu/%zu "
+           "fetch-failures=%zu/%zu/%zu/%zu/%zu/%zu "
+           "idle=%zu/%zu/%zu/%zu\n",
+           mark, page->deferred_image_cursor, page->deferred_image_count,
+           page->deferred_image_job != NULL ? 1 : 0,
+           (unsigned) page->deferred_image_batch_count,
+           images->attempted, images->loaded, images->failed,
+           images->encoded_bytes, images->decoded_bytes,
+           images->progress_samples, images->progress_events,
+           images->progress_bytes,
+           images->fetch_failures_http_4xx,
+           images->fetch_failures_http_5xx,
+           images->fetch_failures_timeout,
+           images->fetch_failures_cancelled,
+           images->fetch_failures_quota,
+           images->fetch_failures_transport,
+           navigation->performance.background_image_batches,
+           navigation->performance.background_images_loaded,
+           navigation->performance.background_image_relayouts,
+           navigation->performance.background_image_failures);
+}
+
 /*
  * Media controls bypass PspUiIntent and are dispatched through their own
  * receiver.  Record that seam explicitly: a controller trace which only says

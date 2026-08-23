@@ -522,6 +522,10 @@ static void psp_media_transition_active(
             PSP_MEDIA_FAILURE_PLAYBACK);
         return;
     }
+    if (event->type == PSP_MEDIA_EVENT_SEEK) {
+        decision->next.resume_target = event->resume_playing
+            ? PSP_MEDIA_RESUME_PLAYING : PSP_MEDIA_RESUME_PAUSED;
+    }
     if (event->type == PSP_MEDIA_EVENT_SEEK
         && decision->next.state != PSP_MEDIA_SESSION_SEEKING
         && decision->next.state != PSP_MEDIA_SESSION_RECOVERING) {

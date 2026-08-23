@@ -3,14 +3,12 @@
  * (docs/engineering/PSP_TRANSPORT.md).
  *
  * When a HOME tile holds focus during the user's think-time, it is a host they
- * are about to open.  This unit opens a single speculative TCP+TLS connection
- * to that host, share-attached so the warm DNS entry and TLS session it leaves
- * behind are the ones the real navigation reuses/resumes.  It is connect-only
- * (CURLOPT_CONNECT_ONLY): the TLS handshake completes with full certificate
- * validation, then the transfer stops -- no HTTP request, no bytes beyond the
- * handshake, no content fetched.
+ * are about to open. This unit sends one bodyless HEAD request on a
+ * share-attached connection. Completing an ordinary HTTP transfer returns the
+ * live socket to curl's shared connection cache; CONNECT_ONLY sockets are
+ * deliberately excluded from that pool and could warm only DNS/TLS sessions.
  *
- * On PSP the shared transport worker owns the CONNECT_ONLY easy and advances
+ * On PSP the shared transport worker owns the bodyless easy and advances
  * it on its existing multi handle. A dedicated compact descriptor means this
  * never consumes one of the six page/resource response lanes. Host builds
  * retain the deterministic cooperative multi below. The pure dwell/
@@ -157,7 +155,7 @@ static void fetch_preconnect_teardown(void)
 }
 
 /* Normalizes a full URL or bare host into a scheme://host:port origin, the key
-   used both to dedup and as the CONNECT_ONLY target.  A bare host is assumed
+   used both to dedup and as the bodyless HEAD target. A bare host is assumed
    HTTPS.  Returns false for empty or unparseable input. */
 static bool fetch_preconnect_origin(const char *url_or_host, char *output,
                                     size_t output_size)
@@ -222,7 +220,10 @@ bool fetch_preconnect(const char *url_or_host, Budget *budget)
     }
     if (!curl_easy_attach_shared_state(easy)
         || curl_easy_setopt(easy, CURLOPT_URL, origin) != CURLE_OK
-        || curl_easy_setopt(easy, CURLOPT_CONNECT_ONLY, 1L) != CURLE_OK
+        || curl_easy_setopt(easy, CURLOPT_NOBODY, 1L) != CURLE_OK
+        || curl_easy_setopt(
+               easy, CURLOPT_USERAGENT, TILEFINCH_BROWSER_USER_AGENT)
+               != CURLE_OK
         || curl_easy_setopt(easy, CURLOPT_NOSIGNAL, 1L) != CURLE_OK
         || curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS,
                             FETCH_PRECONNECT_TIMEOUT_MS) != CURLE_OK
@@ -294,9 +295,14 @@ void fetch_preconnect_pump(void)
             continue;
         }
         if (message->data.result == CURLE_OK) {
-            /* Handshake done: the host is warm.  Keep the handle parked (its
-               socket stays open under CONNECT_ONLY, its session is now in the
-               shared cache) and stop pumping. */
+            /* A completed ordinary transfer returns its socket to the shared
+               connection cache. Retain the global/share owner until the real
+               navigation has acquired its own reference, but the easy itself
+               is no longer useful. */
+            (void) curl_multi_remove_handle(
+                fetch_preconnect_state.multi, fetch_preconnect_state.easy);
+            curl_easy_cleanup(fetch_preconnect_state.easy);
+            fetch_preconnect_state.easy = NULL;
             fetch_preconnect_state.connected = true;
             fetch_preconnect_counters_state.completed++;
             fetch_preconnect_log("completed");
@@ -325,4 +331,10 @@ void fetch_preconnect_cancel(const char *reason)
 bool fetch_preconnect_active(void)
 {
     return fetch_preconnect_state.outstanding;
+}
+
+bool fetch_preconnect_in_flight(void)
+{
+    return fetch_preconnect_state.outstanding
+        && !fetch_preconnect_state.connected;
 }

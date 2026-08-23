@@ -18,6 +18,21 @@ the first one. If your working profile is not the first, set
 `PSP/GAME/TILEFINCH/data/boot-overrides.cfg` — create the file if it does
 not exist, one `key=value` per line.
 
+## A secure page says its certificate failed
+
+Check the PSP's date and time under **Settings → Date & Time Settings**, then
+retry the page. HTTPS certificates are valid only during a stated date range,
+so a PSP that has reset to an old date can make a valid site look untrusted.
+Tilefinch keeps the page-fetch failure on the first line and reports **Try
+correcting PSP date/time, then retry** on a second line (or **Set PSP
+date/time, then retry** when the clock is clearly old) instead of clipping the
+TLS library's less useful error sentence.
+
+Tilefinch does not bypass certificate checks or set the clock from an
+unauthenticated network source. If the clock is correct and the error remains,
+open **Help & diagnostics → Diagnostic QR** and share every QR page; the report
+includes the exact RTC value and the original certificate error.
+
 ## A page won't finish loading
 
 This is by design. Tilefinch gives every page a fixed memory budget on the

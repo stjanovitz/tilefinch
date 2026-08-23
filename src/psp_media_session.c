@@ -232,6 +232,21 @@ BrowserYoutubeQuality psp_media_open_quality(PspMediaSession *media)
     return (BrowserYoutubeQuality) admitted;
 }
 
+size_t psp_media_startup_headroom_bytes(const PspMediaSession *media)
+{
+    if (media == NULL) return 0;
+    size_t working = media->audio_only
+        ? PSP_MEDIA_AUDIO_ONLY_EXTERNAL_RESERVE
+        : media->requested_quality == BROWSER_YOUTUBE_QUALITY_240P
+            ? PSP_MEDIA_240P_EXTERNAL_RESERVE
+            : PSP_MEDIA_360P_EXTERNAL_RESERVE;
+    /* Playback preallocates its bounded packet. Leave another 512 KiB for
+       the small playback record and open-time allocations which remain live
+       when the backend claims its external firmware working set. */
+    size_t remainder = PSP_MEDIA_MAXIMUM_PACKET_BYTES + 512u * KIB;
+    return working > SIZE_MAX - remainder ? SIZE_MAX : working + remainder;
+}
+
 bool psp_media_offline_route(const PspMediaSession *media,
                              const char *url)
 {
@@ -907,6 +922,8 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     psp_media_buffering_end(media, psp_media_now_us(media));
     youtube_resolve_job_destroy(media->resolver_job);
     media->resolver_job = NULL;
+    youtube_resolve_job_destroy(media->prepared_resolver_job);
+    media->prepared_resolver_job = NULL;
     if (media->page_media_probe_request != 0) {
         (void) fetch_background_transport_cancel(
             media->page_media_probe_request, "page media closed");
@@ -1548,8 +1565,9 @@ void psp_media_prepare_route(
         media, url, generation, PSP_MEDIA_ROUTE_DOCUMENT, offline_autoplay);
 }
 
-bool psp_media_open_provider_route(
-    PspMediaSession *media, const char *url, uint64_t backing_generation)
+bool psp_media_open_provider_route_prepared(
+    PspMediaSession *media, const char *url, uint64_t backing_generation,
+    YoutubeResolveJob **prepared_resolver_job)
 {
     if (media == NULL || !youtube_watch_url_supported(url)
         || backing_generation == 0 || media->system_suspended) return false;
@@ -1560,8 +1578,25 @@ bool psp_media_open_provider_route(
         && strcmp(media->source, url) == 0
         && (media->open_service_pending || media->playback != NULL
             || media->ui.failed);
+    if (accepted && media->open_service_pending && media->playback == NULL
+        && media->resolver_job == NULL
+        && media->prepared_resolver_job == NULL
+        && prepared_resolver_job != NULL
+        && youtube_resolve_job_matches(
+               *prepared_resolver_job, url,
+               (int) media->requested_quality)) {
+        media->prepared_resolver_job = *prepared_resolver_job;
+        *prepared_resolver_job = NULL;
+    }
     if (!accepted) media->provider_direct_route = false;
     return accepted;
+}
+
+bool psp_media_open_provider_route(
+    PspMediaSession *media, const char *url, uint64_t backing_generation)
+{
+    return psp_media_open_provider_route_prepared(
+        media, url, backing_generation, NULL);
 }
 
 static bool psp_media_open_page_source_kind(
@@ -1776,9 +1811,8 @@ void psp_media_execute_intent(PspMediaSession *media,
                         &media->ui, media->stream.title);
                     psp_ui_media_set_resolving_progress(
                         &media->ui, "RESTARTING VIDEO", 940u);
-                    if (psp_media_request_seek(media, 0, false)) {
-                        media->job_resume_playing = true;
-                    } else {
+                    if (!psp_media_request_seek_with_resume(
+                            media, 0, false, true)) {
                         psp_media_raise_error(
                             media, "VIDEO COULD NOT RESTART", NULL);
                     }
@@ -1873,12 +1907,10 @@ void psp_media_execute_intent(PspMediaSession *media,
                     &media->ui, intent.seek_time_us);
                 break;
             }
-            media->job_resume_playing = resume;
             media->seek_preview_started = false;
             media->seek_preview_cancel_pending = false;
-            (void) psp_media_request_seek(
-                media, intent.seek_time_us, false);
-            media->job_resume_playing = resume;
+            (void) psp_media_request_seek_with_resume(
+                media, intent.seek_time_us, false, resume);
             break;
         }
         case PSP_UI_MEDIA_ACTION_RETRY:
@@ -2107,9 +2139,10 @@ static bool psp_media_start_pending_preview_commit(
         || media->job_phase != PSP_MEDIA_JOB_NONE) return false;
     uint64_t target_us = media->preview_commit_target_us;
     bool resume_playing = media->preview_commit_resume_playing;
-    /* A large backward seek reads this before rebuilding the pipeline. */
-    media->job_resume_playing = resume_playing;
-    if (!psp_media_request_seek(media, target_us, false)) return false;
+    /* Carry this through the request itself: a large backward seek rebuilds
+       the pipeline before any later session field could repair the intent. */
+    if (!psp_media_request_seek_with_resume(
+            media, target_us, false, resume_playing)) return false;
     media->preview_commit_target_us = 0;
     media->preview_commit_pending = false;
     media->preview_commit_resume_playing = false;
@@ -2117,7 +2150,6 @@ static bool psp_media_start_pending_preview_commit(
     media->reopen_preview_pending = false;
     media->seek_preview_started = false;
     media->seek_preview_cancel_pending = false;
-    media->job_resume_playing = resume_playing;
     psp_ui_media_cancel_seek_preview(&media->ui);
     return true;
 }

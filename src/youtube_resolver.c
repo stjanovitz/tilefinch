@@ -1422,6 +1422,8 @@ struct YoutubeResolveJob {
     YoutubeResolverCancelCallback cancel;
     void *cancel_opaque;
     int maximum_height;
+    size_t watch_maximum_bytes;
+    size_t player_maximum_bytes;
     uint64_t deadline_ns;
     YoutubeResolvePhase phase;
     size_t client_index;
@@ -1608,16 +1610,39 @@ static void youtube_resolve_job_log_response(
     uint64_t now = tilefinch_platform_monotonic_time_ns();
     uint64_t elapsed_us = now >= job->request_started_ns
         ? (now - job->request_started_ns) / UINT64_C(1000) : 0;
+    const FetchTransportTiming *timing = &job->response.transport_timing;
+    uint64_t ready_us = timing->connect_us;
+    if (timing->appconnect_us > ready_us) ready_us = timing->appconnect_us;
+    uint64_t dns_us = timing->name_lookup_us;
+    uint64_t tcp_us = timing->connect_us >= timing->name_lookup_us
+        ? timing->connect_us - timing->name_lookup_us : 0;
+    uint64_t tls_us = timing->appconnect_us >= timing->connect_us
+        ? timing->appconnect_us - timing->connect_us : 0;
+    uint64_t server_us = timing->first_byte_us >= ready_us
+        ? timing->first_byte_us - ready_us : 0;
+    uint64_t body_us = timing->total_us >= timing->first_byte_us
+        ? timing->total_us - timing->first_byte_us : 0;
     printf("tilefinch-youtube-resolver: phase=%s client=%s ok=%d "
            "status=%ld bytes=%zu received=%zu chunks=%zu pumps=%zu "
-           "elapsed=%lluus cached=%d admission-waits=%zu\n",
+           "elapsed=%lluus cached=%d admission-waits=%zu "
+           "timing=%d reused=%d dns=%lluus tcp=%lluus tls=%lluus "
+           "server=%lluus body=%lluus transport=%lluus\n",
            phase, client == NULL ? "none" : client,
            job->response_ok ? 1 : 0, job->response.status_code,
            job->response.length, job->response.received_body_bytes,
            job->request_chunks, job->request_pumps,
            (unsigned long long) elapsed_us,
            job->enriched_from_cached_identity ? 1 : 0,
-           job->admission_deferrals);
+           job->admission_deferrals,
+           timing->measured ? 1 : 0,
+           job->response.tls_connection_reuse_known
+                   && job->response.tls_connection_reused ? 1 : 0,
+           (unsigned long long) dns_us,
+           (unsigned long long) tcp_us,
+           (unsigned long long) tls_us,
+           (unsigned long long) server_us,
+           (unsigned long long) body_us,
+           (unsigned long long) timing->total_us);
 }
 
 static bool youtube_resolve_job_take_watch_prefix(YoutubeResolveJob *job)
@@ -1703,18 +1728,27 @@ static bool youtube_resolve_job_prepare_watch(YoutubeResolveJob *job)
     }
     return youtube_resolve_job_start_request(
         job, job->canonical_watch, &request,
-        YOUTUBE_WATCH_MAXIMUM_BYTES, remaining_ms,
+        job->watch_maximum_bytes, remaining_ms,
         YOUTUBE_RESOLVE_PHASE_WATCH_WAIT)
         != YOUTUBE_REQUEST_START_FAILED;
 }
 
-YoutubeResolveJob *youtube_resolve_job_begin(
+YoutubeResolveJob *youtube_resolve_job_begin_bounded(
     Budget *budget, BrowserSession *session, const char *watch_url,
     int maximum_height, long timeout_ms,
+    const YoutubeResolveJobLimits *limits,
     YoutubeResolverCancelCallback cancel, void *cancel_opaque)
 {
+    size_t watch_maximum_bytes = limits == NULL
+        ? YOUTUBE_WATCH_MAXIMUM_BYTES : limits->watch_response_bytes;
+    size_t player_maximum_bytes = limits == NULL
+        ? YOUTUBE_PLAYER_MAXIMUM_BYTES : limits->player_response_bytes;
     if (budget == NULL || session == NULL || watch_url == NULL
         || maximum_height <= 0 || timeout_ms <= 0
+        || watch_maximum_bytes == 0
+        || watch_maximum_bytes > YOUTUBE_WATCH_MAXIMUM_BYTES
+        || player_maximum_bytes == 0
+        || player_maximum_bytes > YOUTUBE_PLAYER_MAXIMUM_BYTES
         || !fetch_background_transport_available()
         || !fetch_background_transport_initialize(budget)) return NULL;
     YoutubeResolveJob *job = budget_calloc_category(
@@ -1725,6 +1759,8 @@ YoutubeResolveJob *youtube_resolve_job_begin(
     job->cancel = cancel;
     job->cancel_opaque = cancel_opaque;
     job->maximum_height = maximum_height;
+    job->watch_maximum_bytes = watch_maximum_bytes;
+    job->player_maximum_bytes = player_maximum_bytes;
     job->phase = YOUTUBE_RESOLVE_PHASE_DIRECT_START;
     job->response.budget = budget;
     if (!youtube_watch_url_video_id(watch_url, job->video_id)) {
@@ -1760,6 +1796,16 @@ YoutubeResolveJob *youtube_resolve_job_begin(
     job->deadline_ns = duration > UINT64_MAX - now
         ? UINT64_MAX : now + duration;
     return job;
+}
+
+YoutubeResolveJob *youtube_resolve_job_begin(
+    Budget *budget, BrowserSession *session, const char *watch_url,
+    int maximum_height, long timeout_ms,
+    YoutubeResolverCancelCallback cancel, void *cancel_opaque)
+{
+    return youtube_resolve_job_begin_bounded(
+        budget, session, watch_url, maximum_height, timeout_ms,
+        NULL, cancel, cancel_opaque);
 }
 
 YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
@@ -1807,14 +1853,14 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
             youtube_remaining_timeout_ms(job->deadline_ns));
         YoutubeRequestStartStatus started = youtube_resolve_job_start_request(
             job, job->prepared.url, &job->prepared.request,
-            YOUTUBE_PLAYER_MAXIMUM_BYTES, remaining_ms,
+            job->player_maximum_bytes, remaining_ms,
             YOUTUBE_RESOLVE_PHASE_DIRECT_WAIT);
         if (started == YOUTUBE_REQUEST_START_ADMITTED) job->attempts++;
         break;
     }
     case YOUTUBE_RESOLVE_PHASE_DIRECT_WAIT:
         (void) youtube_resolve_job_poll_response(
-            job, YOUTUBE_PLAYER_MAXIMUM_BYTES,
+            job, job->player_maximum_bytes,
             YOUTUBE_RESOLVE_PHASE_DIRECT_PARSE);
         break;
     case YOUTUBE_RESOLVE_PHASE_DIRECT_PARSE: {
@@ -1882,7 +1928,7 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
         break;
     case YOUTUBE_RESOLVE_PHASE_WATCH_WAIT:
         (void) youtube_resolve_job_poll_response(
-            job, YOUTUBE_WATCH_MAXIMUM_BYTES,
+            job, job->watch_maximum_bytes,
             YOUTUBE_RESOLVE_PHASE_WATCH_PARSE);
         if (job->phase == YOUTUBE_RESOLVE_PHASE_WATCH_WAIT)
             (void) youtube_resolve_job_take_watch_prefix(job);
@@ -1947,14 +1993,14 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
             youtube_remaining_timeout_ms(job->deadline_ns));
         YoutubeRequestStartStatus started = youtube_resolve_job_start_request(
             job, job->prepared.url, &job->prepared.request,
-            YOUTUBE_PLAYER_MAXIMUM_BYTES, remaining_ms,
+            job->player_maximum_bytes, remaining_ms,
             YOUTUBE_RESOLVE_PHASE_ENRICHED_WAIT);
         if (started == YOUTUBE_REQUEST_START_ADMITTED) job->attempts++;
         break;
     }
     case YOUTUBE_RESOLVE_PHASE_ENRICHED_WAIT:
         (void) youtube_resolve_job_poll_response(
-            job, YOUTUBE_PLAYER_MAXIMUM_BYTES,
+            job, job->player_maximum_bytes,
             YOUTUBE_RESOLVE_PHASE_ENRICHED_PARSE);
         break;
     case YOUTUBE_RESOLVE_PHASE_ENRICHED_PARSE: {
@@ -2067,6 +2113,18 @@ bool youtube_resolve_job_metrics(
         .cached_identity = job->enriched_from_cached_identity
     };
     return true;
+}
+
+bool youtube_resolve_job_matches(
+    const YoutubeResolveJob *job, const char *watch_url,
+    int maximum_height)
+{
+    char video_id[YOUTUBE_VIDEO_ID_CAPACITY] = {0};
+    return job != NULL && maximum_height > 0
+        && job->phase != YOUTUBE_RESOLVE_PHASE_FAILED
+        && job->maximum_height == maximum_height
+        && youtube_watch_url_video_id(watch_url, video_id)
+        && strcmp(job->video_id, video_id) == 0;
 }
 
 void youtube_resolve_job_cancel(YoutubeResolveJob *job, const char *reason)

@@ -81,6 +81,10 @@ typedef struct {
     PspUiMediaState ui;
     YoutubeStream stream;
     YoutubeResolveJob *resolver_job;
+    /* A focused result's resolver may already be complete or in flight when
+       Play is pressed. It waits here until the open service has destroyed the
+       previous pipeline, then becomes resolver_job without restarting. */
+    YoutubeResolveJob *prepared_resolver_job;
     PspMediaSessionPlatform platform;
     PspSwdecComponent swdec;
     /* Physical decoder selection for this pipeline. Lifecycle authority
@@ -467,6 +471,10 @@ void psp_media_suspend(PspMediaSession *media);
 void psp_media_resume(PspMediaSession *media);
 bool psp_media_system_suspended(const PspMediaSession *media);
 bool psp_media_open_work_pending(const PspMediaSession *media);
+/* Conservative page-Budget headroom for the selected decoder working set,
+   playback packet, and bounded open-time remainder. Used only to decide
+   whether optional browser caches need pressure reclamation before open. */
+size_t psp_media_startup_headroom_bytes(const PspMediaSession *media);
 /*
  * Enforce the open transaction's deadline and cancellation on a frame that
  * does not pump it.
@@ -483,6 +491,9 @@ void psp_media_prepare_route(
     PspMediaSession *media, const char *url, uint64_t generation);
 bool psp_media_open_provider_route(
     PspMediaSession *media, const char *url, uint64_t backing_generation);
+bool psp_media_open_provider_route_prepared(
+    PspMediaSession *media, const char *url, uint64_t backing_generation,
+    YoutubeResolveJob **prepared_resolver_job);
 bool psp_media_open_page_source(
     PspMediaSession *media, const char *source_url,
     const char *document_url, uint64_t generation,

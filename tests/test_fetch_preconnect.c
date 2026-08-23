@@ -168,14 +168,14 @@ static int test_api_rejects_bad_input(void)
     CHECK(!fetch_preconnect(NULL, &budget));
     CHECK(!fetch_preconnect("", &budget));
     CHECK(!fetch_preconnect("not a url", &budget));
-    CHECK(!fetch_preconnect_active());
+    CHECK(!fetch_preconnect_active() && !fetch_preconnect_in_flight());
     fetch_preconnect_counters(&counters);
     CHECK(counters.started == 0 && counters.cancelled == 0
           && counters.reused == 0);
 
     /* Cancel with nothing outstanding is a safe no-op. */
     fetch_preconnect_cancel("noop");
-    CHECK(!fetch_preconnect_active());
+    CHECK(!fetch_preconnect_active() && !fetch_preconnect_in_flight());
     /* Pump with nothing outstanding is a safe no-op. */
     fetch_preconnect_pump();
     return 0;
@@ -194,12 +194,12 @@ static int test_api_one_outstanding_accounting(void)
         /* No usable transport in this build (e.g. curl unavailable). The dwell
            bounds above are the portable proof; report the skip and pass. */
         printf("  (transport unavailable; API accounting skipped)\n");
-        CHECK(!fetch_preconnect_active());
+        CHECK(!fetch_preconnect_active() && !fetch_preconnect_in_flight());
         return 0;
     }
     FetchPreconnectCounters counters = {0};
     fetch_preconnect_counters(&counters);
-    CHECK(fetch_preconnect_active());
+    CHECK(fetch_preconnect_active() && fetch_preconnect_in_flight());
     CHECK(counters.started == 1 && counters.reused == 0
           && counters.cancelled == 0);
 
@@ -225,7 +225,7 @@ static int test_api_one_outstanding_accounting(void)
     fetch_preconnect_cancel("test-teardown");
     fetch_preconnect_counters(&counters);
     CHECK(counters.cancelled == 2);
-    CHECK(!fetch_preconnect_active());
+    CHECK(!fetch_preconnect_active() && !fetch_preconnect_in_flight());
 
     /* The transport reference must have been released: the page budget returns
        to (near) empty rather than pinning curl's pool. */

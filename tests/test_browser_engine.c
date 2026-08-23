@@ -235,6 +235,8 @@ int main(void)
     CHECK(test_page_audio_activation() == 0);
     CHECK(test_structured_audio_preview_activation() == 0);
     CHECK(test_nomodule_capability_suppression() == 0);
+    CHECK(test_staged_optional_fonts_relayout_before_repaint() == 0);
+    CHECK(test_deferred_image_relayout_requests_repaint() == 0);
     CHECK(test_committed_document_glyph_script_hints() == 0);
     CHECK(test_responsive_navigation_convergence() == 0);
     CHECK(test_scrollable_provisional_navigation() == 0);
@@ -306,6 +308,43 @@ int main(void)
                         (TilefinchDiagnosticSubsystem) -1), "unknown") == 0
           && strcmp(tilefinch_diagnostic_code_name(
                         (TilefinchDiagnosticCode) -1), "unknown") == 0);
+    CHECK(tilefinch_error_is_certificate_verification_failure(
+              "YouTube page fetch failed: mbedTLS: The certificate is not "
+              "correctly signed by the trusted CA")
+          && tilefinch_error_is_certificate_verification_failure(
+              "SSL peer certificate verification failed")
+          && tilefinch_error_is_certificate_verification_failure(
+              "SSL certificate problem: unable to get local issuer "
+              "certificate")
+          && tilefinch_error_is_certificate_verification_failure(
+              "TLS certificate is not correctly signed")
+          && tilefinch_error_is_certificate_verification_failure(
+              "X.509 certificate is not yet valid")
+          && !tilefinch_error_is_certificate_verification_failure(
+              "page mentions a certificate")
+          && !tilefinch_error_is_certificate_verification_failure(
+              "request deadline expired"));
+    CHECK(tilefinch_tls_verification_guidance(0, false)
+              == TILEFINCH_TLS_GUIDANCE_TIME
+          && tilefinch_tls_verification_guidance(
+                 TILEFINCH_TLS_VERIFY_EXPIRED, true)
+              == TILEFINCH_TLS_GUIDANCE_TIME
+          && tilefinch_tls_verification_guidance(
+                 TILEFINCH_TLS_VERIFY_FUTURE, true)
+              == TILEFINCH_TLS_GUIDANCE_TIME
+          && tilefinch_tls_verification_guidance(
+                 TILEFINCH_TLS_VERIFY_HOSTNAME
+                     | TILEFINCH_TLS_VERIFY_NOT_TRUSTED,
+                 true)
+              == TILEFINCH_TLS_GUIDANCE_REDIRECTED
+          && tilefinch_tls_verification_guidance(
+                 TILEFINCH_TLS_VERIFY_NOT_TRUSTED, true)
+              == TILEFINCH_TLS_GUIDANCE_UNTRUSTED
+          && tilefinch_tls_verification_guidance(
+                 TILEFINCH_TLS_VERIFY_BAD_KEY, true)
+              == TILEFINCH_TLS_GUIDANCE_UNSUPPORTED
+          && tilefinch_tls_verification_guidance(0, true)
+              == TILEFINCH_TLS_GUIDANCE_DETAILS);
     puts("tilefinch-browser-engine-tests: all checks passed");
     return 0;
 }

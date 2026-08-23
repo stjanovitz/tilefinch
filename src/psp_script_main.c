@@ -32,6 +32,25 @@
    path writes, but a network/page failure on hardware remains actionable. */
 static const TilefinchInstallPaths *psp_failure_report_paths;
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static TILEFINCH_COLD_PATH void psp_log_engine_creation(
+    const BrowserEngine *engine)
+{
+    BrowserEngineCreationMetrics metrics = {0};
+    if (!browser_engine_creation_metrics(engine, &metrics)) return;
+    psp_log_printf(
+        "tilefinch-engine-create: control=%lluus session=%lluus "
+        "blocker=%lluus navigation=%lluus fonts=%lluus "
+        "framebuffer=%lluus\n",
+        (unsigned long long) metrics.control_ready_us,
+        (unsigned long long) metrics.session_ready_us,
+        (unsigned long long) metrics.blocker_ready_us,
+        (unsigned long long) metrics.navigation_ready_us,
+        (unsigned long long) metrics.fonts_ready_us,
+        (unsigned long long) metrics.framebuffer_ready_us);
+}
+#endif
+
 typedef struct {
     bool transport_present;
     long transport_code;
@@ -39,6 +58,7 @@ typedef struct {
     bool transport_timed_out;
     bool tls12_compatibility_retry;
     char tls_version[16];
+    char tls_peer_issuer[TILEFINCH_TLS_PEER_ISSUER_LIMIT];
     bool worker_present;
     size_t worker_occupied_slots;
     size_t worker_queued_slots;
@@ -87,17 +107,41 @@ static bool psp_write_failure_report_data(
     uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
     unsigned long long unix_time = (unsigned long long) time(NULL);
+    ScePspDateTime rtc = {0};
+    int rtc_result = sceRtcGetCurrentClock(&rtc, 0);
+    bool rtc_valid = rtc_result >= 0 && sceRtcCheckValid(&rtc) == 0;
 #else
     unsigned long long unix_time = 0;
+    ScePspDateTime rtc = {0};
+    bool rtc_valid = false;
 #endif
+    uint32_t ca_bundle_version = 0;
+    size_t ca_bundle_bytes = 0;
+    uint8_t ca_bundle_digest[TILEFINCH_CA_BUNDLE_SHA256_BYTES];
+    bool ca_bundle_present = fetch_ca_bundle_identity(
+        &ca_bundle_version, &ca_bundle_bytes, ca_bundle_digest);
+    char ca_bundle_sha256[TILEFINCH_CA_BUNDLE_SHA256_BYTES * 2u + 1u];
+    if (ca_bundle_present) {
+        for (size_t at = 0; at < TILEFINCH_CA_BUNDLE_SHA256_BYTES; at++) {
+            (void) snprintf(
+                ca_bundle_sha256 + at * 2u, 3u, "%02x",
+                (unsigned) ca_bundle_digest[at]);
+        }
+    } else {
+        snprintf(ca_bundle_sha256, sizeof(ca_bundle_sha256), "absent");
+    }
     bool okay = fprintf(
         file,
-        "tilefinch-device-error-v2\n"
+        "tilefinch-device-error-v3\n"
         "version=%s\nrelease-sequence=%llu\n"
         "stage=%s\nhttp=%ld\nnative=0x%08x\n"
-        "uptime-us=%llu\nunix-time=%llu\nfree=%d\nlargest=%d\n"
+        "uptime-us=%llu\nunix-time=%llu\nrtc-valid=%d\n"
+        "rtc=%04u-%02u-%02uT%02u:%02u:%02uZ\nfree=%d\nlargest=%d\n"
         "transport-present=%d\ncurl-code=%ld\ntimed-out=%d\n"
         "tls-verify=0x%08lx\ntls-version=%s\ntls12-retry=%d\n"
+        "tls-peer-issuer=%s\nca-bundle-present=%d\n"
+        "ca-bundle-version=%u\nca-bundle-bytes=%zu\n"
+        "ca-bundle-sha256=%s\n"
         "worker-present=%d\nworker-slots=%zu\nworker-queued=%zu\n"
         "worker-running=%zu\nworker-complete=%zu\n"
         "network-present=%d\nnetwork-status=%d\n"
@@ -113,6 +157,9 @@ static bool psp_write_failure_report_data(
         (unsigned long long) TILEFINCH_RELEASE_SEQUENCE,
         stage == NULL ? "unknown" : stage, http_status,
         (unsigned) native_result, (unsigned long long) now_us, unix_time,
+        rtc_valid ? 1 : 0, (unsigned) rtc.year, (unsigned) rtc.month,
+        (unsigned) rtc.day, (unsigned) rtc.hour, (unsigned) rtc.minute,
+        (unsigned) rtc.second,
         sceKernelTotalFreeMemSize(), sceKernelMaxFreeMemSize(),
         diagnostics->transport_present ? 1 : 0,
         diagnostics->transport_code,
@@ -121,6 +168,10 @@ static bool psp_write_failure_report_data(
         diagnostics->tls_version[0] == '\0'
             ? "absent" : diagnostics->tls_version,
         diagnostics->tls12_compatibility_retry ? 1 : 0,
+        diagnostics->tls_peer_issuer[0] == '\0'
+            ? "absent" : diagnostics->tls_peer_issuer,
+        ca_bundle_present ? 1 : 0,
+        (unsigned) ca_bundle_version, ca_bundle_bytes, ca_bundle_sha256,
         diagnostics->worker_present ? 1 : 0,
         diagnostics->worker_occupied_slots,
         diagnostics->worker_queued_slots,
@@ -199,6 +250,9 @@ bool psp_write_navigation_failure_report(
     }
     snprintf(diagnostics.tls_version, sizeof(diagnostics.tls_version),
              "%s", navigation->last_tls_version);
+    snprintf(diagnostics.tls_peer_issuer,
+             sizeof(diagnostics.tls_peer_issuer), "%s",
+             navigation->last_tls_peer_issuer);
     return psp_write_failure_report_data(
         stage, detail, url, navigation->last_http_status, 0,
         &diagnostics);
@@ -981,6 +1035,7 @@ static TILEFINCH_COLD_PATH void psp_storage_paths_init(
 static TILEFINCH_COLD_PATH bool psp_save_site_data_on_exit(
     BrowserSession *session, const BrowserProfile *profile,
     bool persistent_site_data_available,
+    bool preserve_persisted_cache,
     const TilefinchInstallPaths *install_paths,
     const PspStoragePaths *storage, PspUiState *ui,
     const uint16_t *engine_frame)
@@ -988,7 +1043,8 @@ static TILEFINCH_COLD_PATH bool psp_save_site_data_on_exit(
     bool saved = true;
     bool stick_full = false;
     unsigned cache_mb = browser_profile_persistent_cache_mb(profile);
-    bool cache_enabled = persistent_site_data_available && cache_mb != 0;
+    bool cache_enabled = persistent_site_data_available && cache_mb != 0
+        && !preserve_persisted_cache;
     bool storage_enabled =
         persistent_site_data_available
         && browser_profile_site_data_allowed(profile)
@@ -1021,6 +1077,9 @@ static TILEFINCH_COLD_PATH bool psp_save_site_data_on_exit(
         saved = psp_site_data_save(
             session, storage->persistent_cache,
             BROWSER_SESSION_PERSIST_CACHE, &limits);
+    } else if (preserve_persisted_cache) {
+        printf("tilefinch-site-data: cache-save=skipped "
+               "reason=restore-unread\n");
     }
     if (!stick_full && storage_enabled) {
         BrowserSessionPersistenceLimits limits = psp_site_data_limits(0);
@@ -1039,6 +1098,193 @@ static TILEFINCH_COLD_PATH bool psp_save_site_data_on_exit(
         psp_present(engine_frame, ui);
     }
     return saved;
+}
+
+static void psp_site_data_restore_init(
+    PspSiteDataRestore *restore, bool cache_enabled,
+    unsigned cache_megabytes, bool storage_enabled)
+{
+    if (restore == NULL) return;
+    memset(restore, 0, sizeof(*restore));
+    restore->cache_enabled = cache_enabled;
+    restore->cache_limits = psp_site_data_limits(cache_megabytes);
+    restore->storage_limits = psp_site_data_limits(0);
+    restore->phase = storage_enabled
+        ? PSP_SITE_DATA_RESTORE_LOCAL_STORAGE
+        : (cache_enabled ? PSP_SITE_DATA_RESTORE_CACHE
+                         : PSP_SITE_DATA_RESTORE_DONE);
+}
+
+static const char *psp_site_data_restore_name(
+    PspSiteDataRestorePhase phase)
+{
+    return phase == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE
+        ? "local-storage"
+        : (phase == PSP_SITE_DATA_RESTORE_CACHE ? "disk-cache" : "none");
+}
+
+static TILEFINCH_OUT_OF_LINE bool psp_site_data_restore_pump(
+    PspSiteDataRestore *restore, BrowserSession *session,
+    const PspStoragePaths *storage, size_t maximum_bytes)
+{
+    if (restore == NULL || session == NULL || storage == NULL
+        || restore->phase == PSP_SITE_DATA_RESTORE_DISABLED
+        || restore->phase == PSP_SITE_DATA_RESTORE_DONE) return false;
+    const char *path = restore->phase
+            == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE
+        ? storage->local_storage : storage->persistent_cache;
+    BrowserSessionPersistenceMask mask = restore->phase
+            == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE
+        ? BROWSER_SESSION_PERSIST_LOCAL_STORAGE
+        : BROWSER_SESSION_PERSIST_CACHE;
+    const BrowserSessionPersistenceLimits *limits = restore->phase
+            == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE
+        ? &restore->storage_limits : &restore->cache_limits;
+    if (restore->load == NULL) {
+        restore->load = browser_session_persistence_load_begin(
+            session, path, mask, limits);
+        if (restore->load == NULL) {
+            printf("tilefinch-site-data: deferred-%s load=unavailable\n",
+                   psp_site_data_restore_name(restore->phase));
+            restore->phase = restore->phase
+                    == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE
+                && restore->cache_enabled
+                ? PSP_SITE_DATA_RESTORE_CACHE
+                : PSP_SITE_DATA_RESTORE_DONE;
+            return true;
+        }
+    }
+    BrowserSessionPersistenceStatus status =
+        BROWSER_SESSION_PERSISTENCE_OK;
+    BrowserSessionPersistenceLoadProgress progress =
+        browser_session_persistence_load_pump(
+            restore->load, maximum_bytes, &status);
+    restore->pumps++;
+    restore->bytes_budgeted += maximum_bytes;
+    if (progress == BROWSER_SESSION_PERSISTENCE_LOAD_PENDING)
+        return true;
+    PspSiteDataRestorePhase completed = restore->phase;
+    browser_session_persistence_load_destroy(restore->load);
+    restore->load = NULL;
+    printf(
+        "tilefinch-site-data: deferred-%s load=%s pumps=%zu "
+        "budget=%zuB\n",
+        psp_site_data_restore_name(completed),
+        status == BROWSER_SESSION_PERSISTENCE_OK
+            ? "ok" : browser_session_persistence_status_name(status),
+        restore->pumps, restore->bytes_budgeted);
+    restore->pumps = 0;
+    restore->bytes_budgeted = 0;
+    restore->phase = completed == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE
+            && restore->cache_enabled
+        ? PSP_SITE_DATA_RESTORE_CACHE : PSP_SITE_DATA_RESTORE_DONE;
+    return true;
+}
+
+static TILEFINCH_OUT_OF_LINE bool psp_site_data_restore_gate_navigation(
+    PspSiteDataRestore *restore, BrowserSession *session,
+    const PspStoragePaths *storage)
+{
+    if (restore == NULL) return false;
+    if (restore->phase == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE) {
+        (void) psp_site_data_restore_pump(
+            restore, session, storage, 16u * KIB);
+        if (restore->phase == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE)
+            return true;
+    }
+    /* A destination has started. Restored cache bodies are merely an
+       optimization, and committing them now could replace responses the new
+       page just admitted. Keep localStorage's semantic gate above, but drop
+       unfinished cache staging and let this navigation populate a new cache. */
+    if (restore->phase == PSP_SITE_DATA_RESTORE_CACHE) {
+        browser_session_persistence_load_destroy(restore->load);
+        restore->load = NULL;
+        restore->cache_restore_cancelled_unread = true;
+        restore->phase = PSP_SITE_DATA_RESTORE_DONE;
+        printf("tilefinch-site-data: deferred-disk-cache load=cancelled "
+               "reason=navigation\n");
+    }
+    return false;
+}
+
+static void psp_site_data_restore_destroy(PspSiteDataRestore *restore)
+{
+    if (restore == NULL) return;
+    browser_session_persistence_load_destroy(restore->load);
+    restore->load = NULL;
+    restore->phase = PSP_SITE_DATA_RESTORE_DONE;
+}
+
+static void psp_site_data_restore_cancel_mask(
+    PspSiteDataRestore *restore, BrowserSessionPersistenceMask mask)
+{
+    if (restore == NULL) return;
+    if ((mask & BROWSER_SESSION_PERSIST_CACHE) != 0) {
+        restore->cache_enabled = false;
+        /* An explicit clear intentionally retires the unread generation; a
+           newly populated live cache may be saved on exit. */
+        restore->cache_restore_cancelled_unread = false;
+        if (restore->phase == PSP_SITE_DATA_RESTORE_CACHE) {
+            browser_session_persistence_load_destroy(restore->load);
+            restore->load = NULL;
+            restore->phase = PSP_SITE_DATA_RESTORE_DONE;
+        }
+    }
+    if ((mask & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0) {
+        if (restore->phase == PSP_SITE_DATA_RESTORE_LOCAL_STORAGE) {
+            browser_session_persistence_load_destroy(restore->load);
+            restore->load = NULL;
+            restore->phase = restore->cache_enabled
+                ? PSP_SITE_DATA_RESTORE_CACHE
+                : PSP_SITE_DATA_RESTORE_DONE;
+        }
+    }
+}
+
+static void psp_site_data_restore_pause(PspSiteDataRestore *restore)
+{
+    if (restore == NULL) return;
+    browser_session_persistence_load_destroy(restore->load);
+    restore->load = NULL;
+}
+
+static TILEFINCH_OUT_OF_LINE bool psp_site_data_restore_idle_pump(
+    PspApp *app, const PspUiInput *input, bool page_dirty,
+    bool render_job_pending)
+{
+    if (app == NULL || input == NULL) return false;
+    if (app->interactive->site_data_restore.phase
+            == PSP_SITE_DATA_RESTORE_DISABLED
+        || app->interactive->site_data_restore.phase
+            == PSP_SITE_DATA_RESTORE_DONE) return false;
+    bool cache_restore_may_run = true;
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+    /* Association is latency-sensitive firmware work. localStorage is a
+       semantic prerequisite for navigation, but stale cache bodies are
+       optional: do not make their Memory Stick reads compete with an
+       in-progress warm-up. */
+    cache_restore_may_run =
+        app->interactive->site_data_restore.phase
+                != PSP_SITE_DATA_RESTORE_CACHE
+        || !psp_network_lifecycle_started(app->network_lifecycle)
+        || psp_network_lifecycle_ready(app->network_lifecycle);
+#endif
+    uint32_t active_download = 0;
+    if (input->held != 0 || input->pressed != 0
+        || !cache_restore_may_run || page_dirty || render_job_pending
+        || browser_engine_navigation_pending(app->browser->engine)
+        || app->browser->media.ui.visible
+        || psp_media_open_work_pending(&app->browser->media)
+        || app->interactive->screenshot.writer.status
+               == SCREENSHOT_PNG_PENDING
+        || psp_update_session_active(&app->browser->update_session)
+        || offline_download_manager_active(
+               &app->browser->offline_store.download, &active_download)) {
+        return false;
+    }
+    return psp_site_data_restore_pump(
+        &app->interactive->site_data_restore, app->browser->session,
+        &app->process->storage, 16u * KIB);
 }
 
 
@@ -1156,6 +1402,49 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation(
     ui->page_font_percent = percent;
     (void) psp_engine_views_refresh(app->views, engine);
     frame->page_dirty = true;
+}
+
+/* Focus and scroll repaint before optional image work. Once that bounded
+   render has completed, spend one image-only continuation unit after
+   presentation. Keeping the policy out of the resident loop preserves its
+   instruction-cache ratchet; this helper is intentionally not cold because it
+   is sampled once per browser frame. */
+static TILEFINCH_OUT_OF_LINE bool psp_deferred_image_after_present(
+    PspApp *app, bool page_idle_pumped, bool render_job_pending,
+    bool site_data_restore_work, bool offline_download_active,
+    bool input_active)
+{
+    if (app == NULL || app->browser == NULL || page_idle_pumped
+        || render_job_pending || site_data_restore_work || input_active
+        || app->browser->media.ui.visible
+        || psp_media_open_work_pending(&app->browser->media)
+        || psp_media_decode_work_pending(&app->browser->media)
+        || app->browser->media.playback != NULL
+        || offline_download_active
+        || browser_engine_navigation_pending(app->browser->engine)
+        || psp_navigation_cooperate_active()) return false;
+    bool visual_changed = false;
+    (void) browser_engine_run_deferred_image_work(
+        app->browser->engine, &visual_changed);
+    return visual_changed;
+}
+
+static TILEFINCH_OUT_OF_LINE bool psp_advance_page_runtime(
+    PspApp *app, bool *layout_changed)
+{
+    if (layout_changed != NULL) *layout_changed = false;
+    if (app == NULL || app->browser == NULL || app->interactive == NULL
+        || app->process == NULL) return false;
+    /* A pressure handoff deliberately splits the two QuickJS graph
+       collections across frames. Do not run author tasks between those
+       passes: they can rebuild the cycles just collected and spend CPU while
+       the native player is waiting for decoder admission. */
+    if (app->interactive->provider_handoff_present_pending
+        || browser_engine_optional_memory_reclaim_pending(
+               &app->interactive->provider_handoff_reclaim)) return true;
+    return browser_engine_advance_runtime(
+        app->browser->engine, (unsigned) app->process->config.tick_ms, 2,
+        layout_changed);
 }
 
 /* The resident frame loop. It borrows physical owners and returns only
@@ -1475,6 +1764,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     browser_engine_cancel_navigation(
                         browser->engine, "system suspended");
                 }
+                psp_youtube_preresolve_reset(
+                    &browser->youtube_preresolve, "system suspended");
                 if (render_job_pending) {
                     browser_engine_cancel_render_job(browser->engine);
                     render_job_pending = false;
@@ -1486,6 +1777,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     interactive->screenshot.pixels = NULL;
                 }
                 browser_engine_cancel_idle_work(browser->engine);
+                psp_site_data_restore_pause(
+                    &interactive->site_data_restore);
                 if (psp_navigation_cooperate_active())
                     psp_navigation_cooperate_end("system-suspend");
                 /* The media-open owner survives ordinary frame boundaries,
@@ -1763,6 +2056,11 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         unsigned media_elapsed_ms = ui_elapsed_ms;
         PspUiInput input = psp_ui_input(
             &pad, interactive->previous_buttons, ui_elapsed_ms);
+        input.pressed |= psp_controller_take_latched_pressed();
+        uint32_t supervisor_page_pressed = 0;
+        bool supervisor_page_input =
+            psp_navigation_cooperate_take_page_input(
+                &supervisor_page_pressed);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         /*
          * The scripted source replaces the sampled pad outright, and only
@@ -1784,6 +2082,14 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 interactive->media_stability_auto_exit = false;
                 process->presentation.ui.validation_media_test_phase = 0;
                 input.pressed = input.held;
+            } else if (supervisor_page_input) {
+                /* The scripted edge was already advanced and captured by
+                   the callback supervisor. Replay it before asking the
+                   script for another command, preserving one receiver and
+                   one browser action per authored edge. */
+                memset(&input, 0, sizeof(input));
+                input.analog_x = 128;
+                input.analog_y = 128;
             } else {
                 uint32_t scripted_download_id = 0;
                 bool scripted_background_idle =
@@ -1823,6 +2129,10 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             ui_elapsed_ms = 16u;
         }
 #endif
+        if (supervisor_page_input) {
+            input.pressed |= supervisor_page_pressed;
+            input.held |= supervisor_page_pressed;
+        }
         interactive->previous_buttons = input.held;
         bool reader_shortcut = false;
         bool toolbar_held =
@@ -2276,14 +2586,15 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             /*
              * Speculative preconnect (docs/engineering/
              * PSP_TRANSPORT.md). While a HOME tile settles under
-             * focus, warm its host's TCP+TLS in the background so the
-             * handshake is already paid when the user opens it. Bounds are
+             * focus, warm one reusable HTTP connection in the background so
+             * later navigation can avoid TCP and TLS setup.
+             * Bounds are
              * carried by the pure dwell state machine: only the user's own
-             * tiles (bookmarks / the built-in cards), at most one
+             * built-in provider tile, at most one
              * connection, started only after ~300 ms of focus, cancelled on
              * focus move, never before the network is READY or under the
-             * deterministic harness. It is connect-only -- no request is
-             * sent. The pump is non-blocking and rides this cooperative
+             * deterministic harness. It sends one bodyless HEAD request. The
+             * pump is non-blocking and rides this cooperative
              * checkpoint without a scheduler slot.
              */
             {
@@ -2298,6 +2609,11 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                         ? psp_home_target_url(
                               &process->presentation.home_surface, process->presentation.ui.home_selection, browser->profile)
                         : NULL;
+                if (preconnect_url != NULL
+                    && !site_adapter_handles_navigation(
+                           "GET", preconnect_url)) {
+                    preconnect_url = NULL;
+                }
                 uint32_t preconnect_key =
                     preconnect_url == NULL
                         ? 0u : fetch_preconnect_tile_key(preconnect_url);
@@ -2653,6 +2969,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         /* After both receivers, so the line records a screen the
            dispatch has already moved to rather than the one it left. */
         psp_input_script_observe(&intent, &process->presentation.ui);
+        psp_input_script_observe_page(engine_views->navigation);
 #endif
         if (intent.load_content_blocker_allowlist_requested) {
             BrowserProfileAllowlistImport imported = {0};
@@ -2706,6 +3023,9 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 imported.truncated ? "yes" : "no");
         }
         if (intent.clear_cache_requested) {
+            psp_site_data_restore_cancel_mask(
+                &interactive->site_data_restore,
+                BROWSER_SESSION_PERSIST_CACHE);
             (void) browser_session_persistence_clear(
                 browser->session, BROWSER_SESSION_PERSIST_CACHE);
             /* The TLS session store holds resumption secrets, so CLEAR
@@ -2728,6 +3048,9 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             psp_ui_show_status(&process->presentation.ui, "COOKIES CLEARED", 180);
         }
         if (intent.clear_local_storage_requested) {
+            psp_site_data_restore_cancel_mask(
+                &interactive->site_data_restore,
+                BROWSER_SESSION_PERSIST_LOCAL_STORAGE);
             (void) browser_session_persistence_clear(
                 browser->session, BROWSER_SESSION_PERSIST_LOCAL_STORAGE);
             BrowserSessionPersistenceStatus clear_status =
@@ -2773,6 +3096,10 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         }
 
         if (browser_engine_navigation_pending(browser->engine)) {
+            bool site_data_waiting =
+                psp_site_data_restore_gate_navigation(
+                    &interactive->site_data_restore, browser->session,
+                    &process->storage);
             /* A closed player retains its native decoder only for a fast
                replay on the same watch page. Release it before the first
                pump of any other candidate so the candidate receives the
@@ -2798,13 +3125,15 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             BrowserNavigationJobQuota navigation_quota =
                 psp_navigation_quota();
             BrowserNavigationJobStatus navigation_status =
-                browser_engine_pump_navigation(
-                    browser->engine, &navigation_quota);
+                site_data_waiting
+                    ? BROWSER_NAVIGATION_JOB_PENDING
+                    : browser_engine_pump_navigation(
+                          browser->engine, &navigation_quota);
             /* Same cooperation point the boot loop marks: this loop
                polls the pad every pass, so the gap between two pumps is
                not a blind window and must not be charged as one. */
-            navigation_pump_boundaries++;
-            if (!tilefinch_platform_cooperate(
+            if (!site_data_waiting) navigation_pump_boundaries++;
+            if (!site_data_waiting && !tilefinch_platform_cooperate(
                     "navigation-pump", navigation_pump_boundaries)
                 && navigation_status
                        == BROWSER_NAVIGATION_JOB_PENDING) {
@@ -2830,6 +3159,12 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             navigation_visual_changed = true;
             uint64_t now_us =
                 (uint64_t) sceKernelGetSystemTimeWide();
+            if (site_data_waiting) {
+                /* Deferred localStorage is part of boot recovery, not network
+                   progress. Start the 35-second navigation watchdog only once
+                   the candidate is actually allowed to pump. */
+                interactive->navigation_job_started_us = now_us;
+            }
             if (navigation_status == BROWSER_NAVIGATION_JOB_PENDING
                 && interactive->navigation_job_started_us != 0
                 && now_us - interactive->navigation_job_started_us
@@ -2949,13 +3284,26 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                             browser_engine_last_error(browser->engine), process->presentation.ui.url,
                             engine_views->navigation);
                     }
-                    psp_ui_show_status(
-                        &process->presentation.ui,
-                        navigation_status
-                                == BROWSER_NAVIGATION_JOB_CANCELLED
+                    char visible_error[PSP_UI_STATUS_CAPACITY];
+                    TilefinchTlsGuidance tls_guidance =
+                        TILEFINCH_TLS_GUIDANCE_NONE;
+                    const char *visible_detail =
+                        navigation_status == BROWSER_NAVIGATION_JOB_CANCELLED
                             ? "PAGE LOAD STOPPED"
-                            : browser_engine_last_error(browser->engine),
-                        300);
+                            : psp_user_visible_error(
+                                  browser_engine_last_error(browser->engine),
+                                  engine_views->navigation
+                                      ->last_tls_verify_result,
+                                  &tls_guidance,
+                                  visible_error, sizeof(visible_error));
+                    if (tls_guidance == TILEFINCH_TLS_GUIDANCE_NONE) {
+                        psp_ui_show_status(
+                            &process->presentation.ui, visible_detail, 300);
+                    } else {
+                        psp_ui_show_tls_status(
+                            &process->presentation.ui, visible_detail,
+                            tls_guidance, 300);
+                    }
                     /* Keep the actionable failure in its own bounded
                        record. The attribution line below intentionally
                        carries many counters and may be truncated by the
@@ -3070,6 +3418,54 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                            navigation_metrics.elapsed_us,
                            sceKernelTotalFreeMemSize(),
                            sceKernelMaxFreeMemSize());
+                if (navigation_metrics.adapter_commit_us != 0) {
+                    printf(
+                        "tilefinch-adapter-commit: total=%lluus "
+                        "parse=%lluus style=%lluus resource=%lluus "
+                        "layout=%lluus runtime=%lluus\n",
+                        (unsigned long long)
+                            navigation_metrics.adapter_commit_us,
+                        (unsigned long long)
+                            navigation_metrics.adapter_parse_us,
+                        (unsigned long long)
+                            navigation_metrics.adapter_style_us,
+                        (unsigned long long)
+                            navigation_metrics.adapter_resource_us,
+                        (unsigned long long)
+                            navigation_metrics.adapter_layout_us,
+                        (unsigned long long)
+                            navigation_metrics.adapter_runtime_us);
+                }
+                if (navigation_metrics.adapter_transport_samples != 0
+                    || navigation_metrics.adapter_document_cache_hits != 0
+                    || navigation_metrics.adapter_document_cache_stores != 0) {
+                    printf(
+                        "tilefinch-adapter-transport: samples=%zu "
+                        "reused=%zu cache-hit=%zu cache-store=%zu "
+                        "wall=%lluus transport=%lluus "
+                        "dns=%lluus tcp=%lluus tls=%lluus server=%lluus "
+                        "body=%lluus overhead=%lluus\n",
+                        navigation_metrics.adapter_transport_samples,
+                        navigation_metrics.adapter_reused_connections,
+                        navigation_metrics.adapter_document_cache_hits,
+                        navigation_metrics.adapter_document_cache_stores,
+                        (unsigned long long)
+                            navigation_metrics.adapter_request_wall_us,
+                        (unsigned long long)
+                            navigation_metrics.adapter_transport_total_us,
+                        (unsigned long long)
+                            navigation_metrics.adapter_dns_us,
+                        (unsigned long long)
+                            navigation_metrics.adapter_tcp_us,
+                        (unsigned long long)
+                            navigation_metrics.adapter_tls_us,
+                        (unsigned long long)
+                            navigation_metrics.adapter_server_us,
+                        (unsigned long long)
+                            navigation_metrics.adapter_body_transfer_us,
+                        (unsigned long long)
+                            navigation_metrics.adapter_admission_collect_us);
+                }
                 psp_report_blocking_script_samples(
                     &engine_views->navigation->performance);
                 psp_report_background_transport_metrics();
@@ -3140,9 +3536,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
 
         bool runtime_layout_changed = false;
         psp_log_heartbeat();
-        bool runtime_ok = browser_engine_advance_runtime(
-            browser->engine, (unsigned) process->config.tick_ms, 2,
-            &runtime_layout_changed);
+        bool runtime_ok = psp_advance_page_runtime(
+            &app, &runtime_layout_changed);
         (void) runtime_ok;
         frame.page_dirty = runtime_layout_changed || frame.page_dirty;
         ScriptMediaRequest dom_media_request;
@@ -3228,6 +3623,20 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     SCRIPT_MEDIA_STATE_ERROR, 0.0, 0.0);
             }
         }
+        bool site_data_restore_work = psp_site_data_restore_idle_pump(
+            &app, &input, frame.page_dirty, render_job_pending);
+        bool page_idle_pumped = false;
+        bool page_input_active = input.pressed != 0 || input.held != 0
+            || intent.action != PSP_UI_ACTION_NONE
+            || intent.pointer_phase != PSP_UI_POINTER_NONE
+            || intent.scroll_delta != 0;
+        /* Observe focus before page-idle admission. This retires an old
+           result's resolver in the same frame and lets the newly focused
+           thumbnail consume the otherwise blocked idle slice below. */
+        psp_app_youtube_preresolve_tick(
+            &app, &frame, &intent, render_job_pending,
+            site_data_restore_work, offline_download_active,
+            page_input_active);
         if (frame.page_dirty) {
             if (!render_job_pending) {
                 render_job_last_progress_us =
@@ -3235,11 +3644,45 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             }
             render_job_pending = true;
             browser_engine_cancel_idle_work(browser->engine);
-        } else if (!render_job_pending) {
-            (void) browser_engine_run_idle_work(browser->engine);
+        } else if (!page_input_active && !render_job_pending
+                   && !site_data_restore_work
+                   && !browser->media.ui.visible
+                   && !psp_media_open_work_pending(&browser->media)
+                   && !psp_media_decode_work_pending(&browser->media)) {
+            /* Pre-resolution was pumped above, so it always gets the first
+               browser-thread slice and the media transport lane. Continue
+               one bounded page-idle slice afterward: otherwise its 30 s
+               network deadline freezes the deferred-thumbnail queue after
+               the initial two-image batch. A focus move still retires that
+               resolver before reaching this branch and promotes the newly
+               focused thumbnail to the queue head. */
+            bool idle_visual_changed = false;
+            (void) browser_engine_run_idle_work(
+                browser->engine, &idle_visual_changed);
+            page_idle_pumped = true;
+            if (idle_visual_changed) {
+                psp_presentation_bind_chrome_fonts(
+                    &process->presentation, browser->engine);
+                frame.page_dirty = true;
+                render_job_pending = true;
+                render_job_last_progress_us =
+                    (uint64_t) sceKernelGetSystemTimeWide();
+            }
         }
         const NavigationEntry *current_entry =
             navigation_current(engine_views->navigation);
+        /* Watch documents no longer autoplay: the thumbnail is the sole
+           authored native-player target. The validation-only autoplay knob
+           must therefore perform that activation explicitly instead of
+           waiting for document route reconciliation to open media. Shipping
+           configuration strips this knob before the interactive loop. */
+        if (process->config.validation_media_play != 0
+            && current_entry != NULL
+            && browser->media.source[0] == '\0') {
+            (void) psp_media_open_provider_route(
+                &browser->media, current_entry->url,
+                engine_views->navigation->generation);
+        }
         bool media_open_was_pending =
             psp_media_open_work_pending(&browser->media);
         psp_media_prepare_route(
@@ -3260,6 +3703,9 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         bool navigation_still_pending =
             browser_engine_navigation_pending(browser->engine);
         if (media_open_before && !navigation_still_pending
+            && !interactive->provider_handoff_present_pending
+            && !browser_engine_optional_memory_reclaim_pending(
+                   &interactive->provider_handoff_reclaim)
             && !psp_navigation_cooperate_active()) {
             psp_work_cooperate_begin_media_open(
                 &process->presentation.ui, engine_views->frame, &browser->media.ui);
@@ -3277,7 +3723,12 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         }
         /* Do not start a second blocking-origin operation while a page
            candidate owns the cancellation token and UI supervisor. */
-        if (!media_open_before || !navigation_still_pending) {
+        psp_app_pump_provider_handoff_reclaim(
+            &app, frame.ui_sample_us, false);
+        if ((!media_open_before || !navigation_still_pending)
+            && !interactive->provider_handoff_present_pending
+            && !browser_engine_optional_memory_reclaim_pending(
+                   &interactive->provider_handoff_reclaim)) {
             media_visual_changed =
                 psp_media_advance(
                     &browser->media, media_elapsed_ms,
@@ -3669,7 +4120,22 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 psp_log_set_phase(PSP_LOG_PHASE_RENDER);
                 psp_present(engine_views->frame, &process->presentation.ui);
                 psp_log_set_phase(PSP_LOG_PHASE_INTERACTIVE);
+                /* Direct Play commits the native player before the optional
+                   page-memory trim. Resolver work was held above for this
+                   presentation, so the trim cannot race decoder admission. */
+                psp_app_pump_provider_handoff_reclaim(
+                    &app, frame.ui_sample_us, true);
             }
+        }
+        /* The current input response is already visible. A newly decoded
+           image schedules one coalesced render for the next frame. */
+        if (psp_deferred_image_after_present(
+                &app, page_idle_pumped, render_job_pending,
+                site_data_restore_work, offline_download_active,
+                page_input_active)) {
+            render_job_pending = true;
+            render_job_last_progress_us =
+                (uint64_t) sceKernelGetSystemTimeWide();
         }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         /* The callback supervisor owns both scripted advancement and
@@ -3713,11 +4179,15 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     psp_report_network_result(network);
                     /* The selected HOME tile has already remained stable
                        throughout association, far longer than the 300 ms
-                       speculative dwell. Start its connect-only work now
+                       speculative dwell. Start its connection warmup now
                        instead of charging another post-association delay;
                        the shared worker keeps DNS/TCP/TLS off this loop. */
                     const char *url = psp_home_target_url(
                         &process->presentation.home_surface, process->presentation.ui.home_selection, browser->profile);
+                    if (url != NULL
+                        && !site_adapter_handles_navigation("GET", url)) {
+                        url = NULL;
+                    }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
                     printf("tilefinch-preconnect: event=selected "
                            "selection=%u url=%s\n",
@@ -3738,6 +4208,20 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                        "retry=on-navigation\n",
                        psp_network_status_name(network->status));
                 psp_report_network_result(network);
+            }
+        }
+        /* Spend association wait frames on one font file at a time. On the
+           transition-to-Ready frame, start the selected-site preconnect first;
+           any remaining font work yields while that handshake is active. */
+        bool baseline_fonts_were_ready =
+            browser_engine_baseline_fonts_ready(browser->engine);
+        if (!baseline_fonts_were_ready
+            && (psp_network_lifecycle_warming(network_lifecycle)
+                || !fetch_preconnect_in_flight())) {
+            (void) browser_engine_pump_baseline_fonts(browser->engine);
+            if (browser_engine_baseline_fonts_ready(browser->engine)) {
+                psp_presentation_bind_chrome_fonts(
+                    &process->presentation, browser->engine);
             }
         }
 #endif
@@ -3879,6 +4363,8 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
 
     cleanup_operation =
         psp_log_operation_begin("media-cleanup");
+    psp_youtube_preresolve_reset(
+        &browser->youtube_preresolve, "browser shutdown");
     psp_offline_store_destroy(&browser->offline_store);
     bool media_resume_changed =
         psp_media_record_resume(&browser->media, false);
@@ -3904,9 +4390,33 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
 
     cleanup_operation =
         psp_log_operation_begin("site-data-save");
+    /* An immediate exit from HOME must not replace an unread snapshot with
+       an empty live cache. Finish any remaining sequential restore now;
+       cleanup is already non-interactive, while each parser call remains
+       bounded and keeps the watchdog heartbeat alive. */
+    size_t restore_cleanup_pumps = 0;
+    while (interactive->site_data_restore.phase
+               != PSP_SITE_DATA_RESTORE_DISABLED
+           && interactive->site_data_restore.phase
+               != PSP_SITE_DATA_RESTORE_DONE
+           && restore_cleanup_pumps++ < 192u) {
+        psp_log_heartbeat();
+        (void) psp_site_data_restore_pump(
+            &interactive->site_data_restore, browser->session,
+            &process->storage, 64u * KIB);
+    }
+    bool preserve_persisted_cache =
+        interactive->site_data_restore.cache_restore_cancelled_unread
+        || (interactive->site_data_restore.cache_enabled
+            && interactive->site_data_restore.phase
+                   != PSP_SITE_DATA_RESTORE_DISABLED
+            && interactive->site_data_restore.phase
+                   != PSP_SITE_DATA_RESTORE_DONE);
+    psp_site_data_restore_destroy(&interactive->site_data_restore);
     bool site_data_saved = psp_save_site_data_on_exit(
         browser->session, browser->profile,
         process->persistent_site_data_available,
+        preserve_persisted_cache,
         &process->install_paths, &process->storage,
         &process->presentation.ui, engine_views->frame);
     psp_log_operation_end(
@@ -4044,6 +4554,28 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
     return shutdown_report;
 }
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+typedef struct {
+    uint64_t entered_us;
+    uint64_t previous_us;
+} PspBootTiming;
+
+static TILEFINCH_COLD_PATH void psp_boot_timing_mark(
+    PspBootTiming *timing, const char *stage)
+{
+    if (timing == NULL || stage == NULL) return;
+    uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
+    printf("tilefinch-boot-timing: stage=%s elapsed=%lluus delta=%lluus\n",
+           stage, (unsigned long long) (now_us - timing->entered_us),
+           (unsigned long long) (now_us - timing->previous_us));
+    timing->previous_us = now_us;
+}
+#define PSP_BOOT_TIMING_MARK(stage_name) \
+    psp_boot_timing_mark(&boot_timing, (stage_name))
+#else
+#define PSP_BOOT_TIMING_MARK(stage_name) do { (void) (stage_name); } while (0)
+#endif
+
 int main(int argc, char *argv[])
 {
     PspProcessResources process = {0};
@@ -4060,6 +4592,12 @@ int main(int argc, char *argv[])
     psp_failure_report_paths = &process.install_paths;
     if (process.install_paths.slotted) (void) mkdir(process.install_paths.data_dir, 0777);
     uint64_t main_entered_us = (uint64_t) sceKernelGetSystemTimeWide();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    PspBootTiming boot_timing = {
+        .entered_us = main_entered_us,
+        .previous_us = main_entered_us
+    };
+#endif
     atomic_init(&psp_home_exit_requested, false);
     psp_lifecycle_init(&psp_lifecycle);
     /*
@@ -4078,6 +4616,7 @@ int main(int argc, char *argv[])
     psp_present_boot_entrance(0u, "STARTING TILEFINCH", false, NULL);
     uint64_t boot_surface_presented_us =
         (uint64_t) sceKernelGetSystemTimeWide();
+    PSP_BOOT_TIMING_MARK("first-scanout");
     int callback_result = -1;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     char log_identity[TILEFINCH_INSTALL_PATH_LIMIT];
@@ -4148,6 +4687,7 @@ int main(int argc, char *argv[])
         .log_message = psp_log_message,
     };
     tilefinch_platform_set_services(&services);
+    PSP_BOOT_TIMING_MARK("platform-ready");
     /*
      * Reserve the Media Engine's memory before anything else can grow the
      * heap. The extra RAM bank a custom firmware unlocks starts at 0x0A000000
@@ -4159,6 +4699,7 @@ int main(int argc, char *argv[])
      * backend owns the sizing and the logging so this stays a single call.
      */
     media_psp_backend_reserve_pool();
+    PSP_BOOT_TIMING_MARK("media-pool-ready");
 
     printf("tilefinch-validation: version=3 persistent=%d "
            "crash-journal=%d operation-input=redacted "
@@ -4182,6 +4723,7 @@ int main(int argc, char *argv[])
            scePowerGetCpuClockFrequencyInt(),
            scePowerGetBusClockFrequencyInt(),
            sceKernelTotalFreeMemSize(), sceKernelMaxFreeMemSize());
+    PSP_BOOT_TIMING_MARK("runtime-ready");
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_clock_validation_probe();
     psp_power_log_battery("boot", PSP_POWER_TEST_OFF, 0);
@@ -4213,6 +4755,9 @@ int main(int argc, char *argv[])
         printf("tilefinch-psp-script: heap-capacity=%dMB\n", count);
     }
 #endif
+    /* Separate release-relevant startup from deliberately expensive
+       validation-only power and heap probes in the timing trace. */
+    PSP_BOOT_TIMING_MARK("validation-probes-complete");
     /* The boot surface was painted before the log existed, so report the
        scanout outcome here.  A browser nobody can see must not look like a
        healthy boot. */
@@ -4366,6 +4911,7 @@ int main(int argc, char *argv[])
            process.config.exit_to[0] == '\0' ? "none" : process.config.exit_to);
 #endif
     psp_log_checkpoint("config-accepted");
+    PSP_BOOT_TIMING_MARK("config-accepted");
     /* The bypass is restricted to probes that require an initial document.
        Passive automation must observe the shipping entrance and native HOME
        or it cannot validate what users actually run. */
@@ -4591,6 +5137,11 @@ int main(int argc, char *argv[])
         printf("tilefinch-psp-script: font configuration failed\n");
         goto sleep_forever;
     }
+    /* Native HOME uses the embedded chrome fallback. Page fonts are loaded
+       after its first frame, one bounded file at a time while association is
+       otherwise waiting on firmware. */
+    browser_config_set_staged_font_loading(engine_config, true);
+    PSP_BOOT_TIMING_MARK("engine-configured");
 
     char engine_error[256] = {0};
     browser.engine = browser_engine_create(
@@ -4601,7 +5152,11 @@ int main(int argc, char *argv[])
                engine_error);
         goto sleep_forever;
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_log_engine_creation(browser.engine);
+#endif
     psp_log_checkpoint("engine-created");
+    PSP_BOOT_TIMING_MARK("engine-created");
     if (deterministic_boot) {
         psp_present_boot_surface(
             PSP_UI_STARTUP_HOMEPAGE, "OPENING HOME", 760);
@@ -4675,6 +5230,14 @@ int main(int argc, char *argv[])
             process.config.exit_to);
     }
 #endif
+    /* Native HOME uses the regular page sans face for its card labels. Load
+       that one face before the first HOME frame so the visible UI never
+       switches from bitmap fallback to scalable glyphs. Metric sans and all
+       optional faces remain staged behind interaction/network work. */
+    if (!browser_engine_prepare_native_home_font(browser.engine)) {
+        printf("tilefinch-fonts: native-home face unavailable; "
+               "using stable fallback\n");
+    }
     psp_presentation_init(&process.presentation);
     psp_presentation_bind_chrome_fonts(&process.presentation, browser.engine);
     /* The client snapshots carry bounded manifest tables and would enlarge
@@ -4700,6 +5263,17 @@ int main(int argc, char *argv[])
     if (browser_profile_load_without_content_blocker_sites(
             browser.profile, process.storage.profile))
         printf("tilefinch-profile: loaded\n");
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Automated device runs must never enter Sony's modal OSK: it outlives a
+       stopped test process on some firmware and poisons the next PSPLink
+       launch. This is an in-memory harness override; shipping profiles and
+       the profile file on host0 remain unchanged. */
+    if (process.config.input_script[0] != '\0') {
+        browser_profile_set_text_entry_mode(
+            browser.profile, BROWSER_TEXT_ENTRY_DANZEFF);
+        printf("tilefinch-input-script: text-entry=danzeff\n");
+    }
+#endif
     bool tls_session_persistence =
         browser_profile_tls_session_persistence(browser.profile);
     (void) fetch_set_tls_session_persistence_enabled(
@@ -4733,10 +5307,6 @@ int main(int argc, char *argv[])
         browser_profile_javascript_enabled(browser.profile);
     bool site_data_allowed =
         browser_profile_site_data_allowed(browser.profile);
-    if (!browser_engine_set_javascript_enabled(
-            browser.engine, javascript_enabled)) {
-        printf("tilefinch-profile: JavaScript policy unavailable\n");
-    }
     browser_session_set_site_data_allowed(browser.session, site_data_allowed);
     psp_profile_store_init(&browser.profile_store, browser.profile, process.storage.profile);
     ContentBlockerMode content_blocker_mode =
@@ -4779,6 +5349,7 @@ int main(int argc, char *argv[])
         printf("tilefinch-site-data: cache limit unavailable bytes=%zu\n",
                live_cache_bytes);
     }
+    PSP_BOOT_TIMING_MARK("profile-and-home-data-ready");
     char startup_url[BROWSER_PROFILE_URL_LIMIT];
     snprintf(startup_url, sizeof(startup_url), "%s", process.config.url);
     BrowserRecoveryCheckpoint startup_recovery = {0};
@@ -4824,6 +5395,19 @@ int main(int argc, char *argv[])
             &boot_queue,
             restoring_last_page ? startup_recovery.url
                                 : BROWSER_PROFILE_HOMEPAGE_URL);
+    }
+    /* Native HOME owns its presentation and executes no author code. Keep
+       the placeholder document realm-free; every real navigation re-applies
+       the configured global/per-site policy in psp_begin_page_load() before
+       it is admitted. Direct initial-page boots apply that same effective
+       policy after their final restored/configured URL has been selected. */
+    bool initial_javascript_allowed = native_home_boot
+        ? false
+        : browser_profile_javascript_allowed_for_url(
+              browser.profile, startup_url);
+    if (!browser_engine_set_javascript_enabled(
+            browser.engine, initial_javascript_allowed)) {
+        printf("tilefinch-profile: JavaScript policy unavailable\n");
     }
     (void) browser_session_set_third_party_cookie_site_allowed(
         browser.session, startup_url,
@@ -5074,12 +5658,20 @@ int main(int argc, char *argv[])
         }
     }
 
-    /*
-     * Persistent site data is opt-in and Memory Stick latency is unbounded
-     * enough to be visible. Never put that read ahead of the first frame:
-     * users should see stable chrome even while a larger cache is restored.
-     */
-    if (process.persistent_site_data_available && live_cache_limit_set
+    /* Direct page boots need their storage before author code can observe it.
+       Native HOME instead starts a transactional, byte-bounded restore from
+       the interactive loop: bookmarks and boot settings are profile data and
+       have already populated HOME independently of these two files. */
+    psp_site_data_restore_init(
+        &interactive.site_data_restore,
+        native_home_boot && process.persistent_site_data_available
+            && live_cache_limit_set && persistent_cache_mb != 0,
+        persistent_cache_mb,
+        native_home_boot && process.persistent_site_data_available
+            && site_data_allowed
+            && browser_profile_persist_local_storage(browser.profile));
+    if (!native_home_boot
+        && process.persistent_site_data_available && live_cache_limit_set
         && persistent_cache_mb != 0) {
         BrowserSessionPersistenceLimits limits =
             psp_site_data_limits(persistent_cache_mb);
@@ -5089,7 +5681,7 @@ int main(int argc, char *argv[])
         printf("tilefinch-site-data: disk-cache=%uMB load=%s\n",
                persistent_cache_mb, loaded ? "ok" : "empty");
     }
-    if (process.persistent_site_data_available
+    if (!native_home_boot && process.persistent_site_data_available
         && site_data_allowed
         && browser_profile_persist_local_storage(browser.profile)) {
         BrowserSessionPersistenceLimits limits =
@@ -5166,6 +5758,7 @@ int main(int argc, char *argv[])
                spend ten uninterruptible full-screen presents on an entrance
                animation immediately before the input loop starts. */
             psp_present(engine_views.frame, &process.presentation.ui);
+            PSP_BOOT_TIMING_MARK("native-home-presented");
         }
     } else {
         loaded = initial_profile_page != PSP_PROFILE_PAGE_NONE
@@ -5596,6 +6189,7 @@ report:
         printf("tilefinch-psp-script: DONE\n");
         psp_log_set_phase(PSP_LOG_PHASE_INTERACTIVE);
         psp_log_checkpoint("interactive-ready");
+        PSP_BOOT_TIMING_MARK("interactive-ready");
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         psp_ui_show_status(
             &process.presentation.ui,
@@ -5605,6 +6199,11 @@ report:
             360);
         psp_present(engine_views.frame, &process.presentation.ui);
 #endif
+
+        /* Discard launcher/boot transitions before the interactive loop
+           becomes authoritative. Later frames consume the PSP latch so a
+           quick tap cannot begin and end between two 30 Hz page samples. */
+        (void) psp_controller_take_latched_pressed();
 
         PspInteractiveResult interactive_result =
             psp_app_run_interactive(

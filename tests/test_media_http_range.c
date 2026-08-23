@@ -417,6 +417,25 @@ static MediaHttpRange *open_range(
         budget, mode, port, length, cache_bytes, NULL, NULL);
 }
 
+static MediaHttpRange *open_range_with_timeout(
+    Budget *budget, const char *mode, int port, uint64_t length,
+    size_t cache_bytes, long timeout_ms)
+{
+    char url[256];
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%d/%s/media.mp4", port, mode);
+    MediaHttpRangeOptions options = {
+        .cache_bytes = cache_bytes,
+        .timeout_ms = timeout_ms,
+        .connect_timeout_ms = timeout_ms
+    };
+    char error[256] = {0};
+    MediaHttpRange *range = media_http_range_create(
+        budget, NULL, url, length, &options, error, sizeof(error));
+    if (range == NULL) printf("open %s failed: %s\n", mode, error);
+    return range;
+}
+
 static MediaHttpRange *open_range_with_lookahead(
     Budget *budget, const char *mode, int port, uint64_t length,
     size_t cache_bytes)
@@ -1737,6 +1756,38 @@ static void test_a_transaction_budget_bounds_every_read_in_it(
     CHECK(budget.current == 0);
 }
 
+/* Opening used to wait on one dead connection until the whole read deadline,
+   even though playing refills already used the bounded fresh-connection
+   liveness policy. A short real transport deadline makes that distinction
+   observable without a long test: the 2-second no-progress edge must replace
+   the request before the 3-second read bound reports failure. */
+static void test_a_blocking_open_reconnects_a_dead_window(
+    int port, uint64_t length)
+{
+    Budget budget;
+    budget_init(&budget, 8u * 1024u * 1024u);
+    MediaHttpRange *range = open_range_with_timeout(
+        &budget, "stall", port, length, 64u * 1024u, 3000);
+    CHECK(range != NULL);
+    if (range == NULL) return;
+    MediaRangeReader reader = media_http_range_reader(range);
+    unsigned char probe[8] = {0};
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    CHECK(!reader.read(reader.opaque, 0, probe, sizeof(probe)));
+    uint64_t elapsed_us =
+        tilefinch_platform_monotonic_time_us() - started_us;
+    MediaHttpRangeStats stats = {0};
+    CHECK(media_http_range_stats(range, &stats)
+          && stats.reconnects == 1u
+          && stats.starved_reconnects == 1u
+          && stats.requests == 2u
+          && stats.failures == 1u);
+    CHECK(elapsed_us >= UINT64_C(2000000)
+          && elapsed_us < UINT64_C(6000000));
+    media_http_range_destroy(range);
+    CHECK(budget.current == 0);
+}
+
 /* The owner's absolute law: a stop request is answered within three seconds,
    in every phase, whatever the phase is waiting on. */
 #define MEDIA_RANGE_CANCEL_LAW_US UINT64_C(3000000)
@@ -2514,6 +2565,8 @@ int main(int argc, char **argv)
     test_slow_progress_is_retained(port, length);
     puts("test: a prolonged demanded window remains supersedable");
     test_prolonged_window_can_be_superseded(port, length);
+    puts("test: a blocking open retries a dead connection before timeout");
+    test_a_blocking_open_reconnects_a_dead_window(port, length);
     puts("test: one transaction budget bounds every blocking read in it");
     test_a_transaction_budget_bounds_every_read_in_it(port, length);
     puts("test: a stalled read answers a stop request inside the law");

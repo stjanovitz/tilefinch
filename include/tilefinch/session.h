@@ -27,6 +27,13 @@
    session budget and prevents an adapter from growing an unbounded cache. */
 #define BROWSER_SITE_ADAPTER_STATE_KEY_LIMIT 64
 #define BROWSER_SITE_ADAPTER_STATE_DATA_LIMIT 1408
+/* Generated adapter documents are useful for immediate Back/Forward and a
+   repeated search, but raw provider responses are far too large to retain on
+   PSP. Keep two short-lived, exact-keyed scriptless documents instead. */
+#define BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES 2
+#define BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ADAPTER_LIMIT 32
+#define BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_KEY_LIMIT 2048
+#define BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRY_LIMIT (96u * 1024u)
 
 struct ContentBlocker;
 struct FetchResponseSecurityMetadata;
@@ -216,6 +223,33 @@ typedef struct {
     bool valid;
 } BrowserSiteAdapterState;
 
+typedef struct {
+    char adapter[BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ADAPTER_LIMIT];
+    char *key;
+    unsigned char *data;
+    size_t length;
+    size_t source_bytes;
+    size_t result_count;
+    uint64_t stored_at_ns;
+    uint64_t cookie_fingerprint;
+    size_t last_used;
+    uint32_t variant;
+    long status_code;
+    char server[64];
+    char cf_mitigated[32];
+    bool valid;
+} BrowserSiteAdapterDocumentCacheEntry;
+
+typedef struct {
+    const unsigned char *data;
+    size_t length;
+    size_t source_bytes;
+    size_t result_count;
+    long status_code;
+    const char *server;
+    const char *cf_mitigated;
+} BrowserSiteAdapterDocumentCacheView;
+
 typedef struct BrowserSession {
     Budget *budget;
     /* Non-owning engine-lifetime request policy. */
@@ -224,6 +258,8 @@ typedef struct BrowserSession {
     BrowserCookieEntry cookies[BROWSER_COOKIE_ENTRIES];
     BrowserCacheEntry cache[BROWSER_CACHE_ENTRIES];
     BrowserSiteAdapterState site_adapter_state;
+    BrowserSiteAdapterDocumentCacheEntry site_adapter_document_cache[
+        BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES];
     size_t storage_bytes;
     size_t cookie_bytes;
     size_t cookie_long_path_bytes;
@@ -239,6 +275,7 @@ typedef struct BrowserSession {
     size_t cache_stale_hits;
     size_t cache_misses;
     size_t cache_evictions;
+    size_t site_adapter_document_clock;
     /* Global page policy. HTTP cache remains independently configurable. */
     bool site_data_allowed;
     /* Security compatibility grants are bounded. Mixed-content grants are
@@ -310,6 +347,19 @@ bool browser_session_site_adapter_state_get(
     uint64_t maximum_age_ns);
 void browser_session_site_adapter_state_remove(
     BrowserSession *session, const char *key);
+bool browser_session_site_adapter_document_cache_put(
+    BrowserSession *session, const char *adapter, const char *key,
+    uint32_t variant, const TilefinchRequestContext *authority_context,
+    const void *data, size_t data_length,
+    size_t source_bytes, size_t result_count, long status_code,
+    const char *server, const char *cf_mitigated, uint64_t now_ns);
+bool browser_session_site_adapter_document_cache_get(
+    BrowserSession *session, const char *adapter, const char *key,
+    uint32_t variant, const TilefinchRequestContext *authority_context,
+    uint64_t now_ns, uint64_t maximum_age_ns,
+    BrowserSiteAdapterDocumentCacheView *view);
+void browser_session_site_adapter_document_cache_clear(
+    BrowserSession *session);
 bool browser_session_storage_get(const BrowserSession *session,
                                  const char *url, bool local,
                                  const char *key, const char **value,
@@ -339,6 +389,11 @@ bool browser_session_cookie_header(const BrowserSession *session,
 bool browser_session_cookie_header_context(
     const BrowserSession *session, const TilefinchRequestContext *context,
     char *output, size_t output_capacity);
+/* Hashes exactly the Cookie header authority visible to this request context,
+   without materializing a potentially multi-kilobyte header. */
+bool browser_session_cookie_header_fingerprint_context(
+    const BrowserSession *session, const TilefinchRequestContext *context,
+    uint64_t *fingerprint);
 /* Builder fast path: facts must have been analyzed from this exact immutable
    context. Public callers normally use browser_session_cookie_header_context. */
 bool browser_session_cookie_header_request_facts(

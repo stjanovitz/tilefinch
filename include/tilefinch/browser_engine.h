@@ -69,6 +69,7 @@ typedef struct {
 
 typedef struct {
     bool enabled;
+    bool staged_loading;
     size_t maximum_total_bytes;
     char sans_path[BROWSER_ENGINE_PATH_LIMIT];
     char serif_path[BROWSER_ENGINE_PATH_LIMIT];
@@ -172,12 +173,45 @@ typedef struct {
     NavigationPerformance navigation;
 } BrowserEngineMetrics;
 
+/* Validation-only phase attribution for BrowserEngine construction. Release
+   builds return false from browser_engine_creation_metrics() and carry no
+   per-engine storage for these timestamps. */
 typedef struct {
+    uint64_t control_ready_us;
+    uint64_t session_ready_us;
+    uint64_t blocker_ready_us;
+    uint64_t navigation_ready_us;
+    uint64_t fonts_ready_us;
+    uint64_t framebuffer_ready_us;
+} BrowserEngineCreationMetrics;
+
+typedef struct {
+    size_t font_staging_bytes;
     size_t javascript_bytes;
     size_t session_cache_bytes;
     size_t render_cache_bytes;
     size_t total_bytes;
 } BrowserOptionalMemoryReclaim;
+
+typedef enum {
+    BROWSER_OPTIONAL_RECLAIM_FONT_STAGING = 0,
+    BROWSER_OPTIONAL_RECLAIM_SESSION_CACHE,
+    BROWSER_OPTIONAL_RECLAIM_RENDER_CACHE,
+    BROWSER_OPTIONAL_RECLAIM_JS_FIRST_GC,
+    BROWSER_OPTIONAL_RECLAIM_JS_SECOND_GC,
+    BROWSER_OPTIONAL_RECLAIM_JS_TRIM,
+    BROWSER_OPTIONAL_RECLAIM_PHASE_COUNT
+} BrowserOptionalMemoryReclaimPhase;
+
+/* A pressure-triggered, one-phase-per-pump reclaim. `target_remaining_bytes`
+   is a headroom goal, not an amount to evict; the job stops as soon as the
+   shared Budget reaches it. */
+typedef struct {
+    BrowserOptionalMemoryReclaim reclaimed;
+    size_t target_remaining_bytes;
+    BrowserOptionalMemoryReclaimPhase phase;
+    bool active;
+} BrowserOptionalMemoryReclaimJob;
 
 typedef struct BrowserEngine BrowserEngine;
 
@@ -205,6 +239,27 @@ typedef struct {
     uint64_t provisional_first_present_us;
     uint64_t maximum_transform_slice_us;
     uint64_t maximum_irreducible_unit_us;
+    /* Final commit of a bounded adapter-authored document. These deltas keep
+       provider transform time separate from generic parser/style/layout
+       cost without embedding a precompiled page in the executable. */
+    uint64_t adapter_commit_us;
+    uint64_t adapter_parse_us;
+    uint64_t adapter_style_us;
+    uint64_t adapter_resource_us;
+    uint64_t adapter_layout_us;
+    uint64_t adapter_runtime_us;
+    uint64_t adapter_request_wall_us;
+    uint64_t adapter_transport_total_us;
+    uint64_t adapter_dns_us;
+    uint64_t adapter_tcp_us;
+    uint64_t adapter_tls_us;
+    uint64_t adapter_server_us;
+    uint64_t adapter_body_transfer_us;
+    uint64_t adapter_admission_collect_us;
+    size_t adapter_transport_samples;
+    size_t adapter_reused_connections;
+    size_t adapter_document_cache_hits;
+    size_t adapter_document_cache_stores;
     size_t pump_calls;
     size_t incumbent_pages_preserved;
     size_t provisional_paints;
@@ -237,6 +292,8 @@ bool browser_config_set_font_paths(
     const char *sans_italic_path, const char *sans_bold_path,
     const char *serif_bold_path, const char *metric_sans_path,
     const char *metric_sans_bold_path, size_t maximum_total_bytes);
+void browser_config_set_staged_font_loading(
+    BrowserConfig *config, bool staged);
 bool browser_config_validate(const BrowserConfig *config,
                              char *error, size_t error_capacity);
 
@@ -259,10 +316,13 @@ const BrowserConfig *browser_engine_config(const BrowserEngine *engine);
 bool browser_engine_set_javascript_enabled(
     BrowserEngine *engine, bool enabled);
 const char *browser_engine_last_error(const BrowserEngine *engine);
+long browser_engine_last_tls_verify_result(const BrowserEngine *engine);
 TilefinchDiagnosticCode browser_engine_last_diagnostic_code(
     const BrowserEngine *engine);
 bool browser_engine_metrics(const BrowserEngine *engine,
                             BrowserEngineMetrics *metrics);
+bool browser_engine_creation_metrics(
+    const BrowserEngine *engine, BrowserEngineCreationMetrics *metrics);
 bool browser_engine_content_blocker_configure(
     BrowserEngine *engine, ContentBlockerMode mode,
     const char *custom_path);
@@ -395,8 +455,23 @@ bool browser_engine_replace_text(BrowserEngine *engine, const char *utf8,
 bool browser_engine_insert_text(BrowserEngine *engine, const char *utf8,
                                 size_t length);
 bool browser_engine_backspace(BrowserEngine *engine);
+/* Restore the document's authored autofocus target when an incremental
+   relayout temporarily left the controller without a focus owner. This does
+   not fall back to the first arbitrary control. */
+bool browser_engine_restore_autofocus(BrowserEngine *engine);
 bool browser_engine_activate(BrowserEngine *engine,
                              ControllerAction *action);
+/* Read the focused built-in provider's direct-media target without firing
+ * page handlers or changing focus. This is intentionally narrower than an
+ * activation preview: callers may use it for bounded speculation, while the
+ * real activation remains the sole source of user-visible actions. */
+bool browser_engine_focused_provider_media_url(
+    const BrowserEngine *engine, char *url, size_t capacity);
+/* Promote the focused provider card's authored image to the head of the
+   deferred plan. False means that image is still pending; true means it is
+   decoded or no longer fetchable, so media speculation may proceed. */
+bool browser_engine_prepare_focused_provider_media_thumbnail(
+    BrowserEngine *engine);
 /* Page media is consumed by a platform player rather than by navigation.
    The facade keeps DOM/CSP ownership on the engine side and exposes only an
    already-resolved, bounded request plus state feedback. */
@@ -482,7 +557,10 @@ BrowserRenderJobStatus browser_engine_render_frame_bounded_cancelable(
     BrowserEngine *engine, uint64_t budget_us, size_t maximum_units,
     const TilefinchCancellation *cancellation);
 void browser_engine_cancel_render_job(BrowserEngine *engine);
-bool browser_engine_run_idle_work(BrowserEngine *engine);
+bool browser_engine_run_idle_work(
+    BrowserEngine *engine, bool *visual_changed);
+bool browser_engine_run_deferred_image_work(
+    BrowserEngine *engine, bool *visual_changed);
 void browser_engine_cancel_idle_work(BrowserEngine *engine);
 /*
  * Make room for a short-lived device service such as voice recognition.
@@ -491,6 +569,16 @@ void browser_engine_cancel_idle_work(BrowserEngine *engine);
  */
 bool browser_engine_reclaim_optional_memory(
     BrowserEngine *engine, BrowserOptionalMemoryReclaim *reclaim);
+void browser_engine_prepare_optional_memory_reclaim(
+    BrowserEngine *engine, size_t target_remaining_bytes,
+    BrowserOptionalMemoryReclaimJob *job);
+bool browser_engine_optional_memory_reclaim_pending(
+    const BrowserOptionalMemoryReclaimJob *job);
+/* Runs at most one potentially expensive phase. Returns true once the target
+   was reached or every optional source was exhausted. */
+bool browser_engine_pump_optional_memory_reclaim(
+    BrowserEngine *engine, BrowserOptionalMemoryReclaimJob *job);
+bool browser_engine_maintain_background_workers(BrowserEngine *engine);
 bool browser_engine_bind_document_backing(BrowserEngine *engine,
                                           const DocumentBacking *backing);
 const DocumentBacking *browser_engine_document_backing(
@@ -565,6 +653,20 @@ const FontFace *browser_engine_font_face(
     const BrowserEngine *engine, FontFamily family);
 const FontFace *browser_engine_font_face_variant(
     const BrowserEngine *engine, FontFamily family, bool italic, bool bold);
+/* Load only the regular sans face used by native HOME chrome. This is a
+   deliberate pre-presentation boundary: HOME must never switch from the
+   embedded fallback after it is already visible, while every other page
+   face remains staged. */
+bool browser_engine_prepare_native_home_font(BrowserEngine *engine);
+const FontFace *browser_engine_native_home_font(
+    const BrowserEngine *engine);
+bool browser_engine_pump_baseline_fonts(BrowserEngine *engine);
+bool browser_engine_baseline_fonts_ready(const BrowserEngine *engine);
+/* Finish the bounded trusted-face set required by a built-in provider before
+   its candidate page can measure or expose text. Ordinary pages retain the
+   staged, CSS-census-driven optional-font path. */
+bool browser_engine_prepare_navigation_fonts(
+    BrowserEngine *engine, const char *method, const char *url);
 const TileCache *browser_engine_render_metrics_view(
     const BrowserEngine *engine);
 

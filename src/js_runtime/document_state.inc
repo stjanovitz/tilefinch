@@ -137,25 +137,20 @@ void script_runtime_relocate_document_storage(ScriptRuntime *runtime,
     runtime->bridge.document_base_dirty = true;
 }
 
-size_t script_runtime_collect_and_trim(ScriptRuntime *runtime)
+size_t script_runtime_collect_and_trim_phase(
+    ScriptRuntime *runtime, ScriptRuntimeCollectPhase phase)
 {
     if (runtime == NULL || runtime->runtime == NULL
-        || runtime->quickjs_pool == NULL) return 0;
-    /* A DOM wrapper can participate in a self-cycle (classList and author
-       listeners are common examples).  Bellard QuickJS removes that cycle
-       in one pass and clears its WeakRef/FinalizationRegistry target in the
-       next.  This explicit full-collection boundary therefore needs both
-       bounded passes before allocator trimming. */
-    JS_RunGC(runtime->runtime);
-    JS_RunGC(runtime->runtime);
-    /* QuickJS raises its automatic-GC threshold from the allocation peak
-       which triggered a collection. An embedding-requested full collection
-       can reduce the live heap dramatically while leaving that old threshold
-       above the hard memory limit, so a later synchronous allocation burst
-       reaches OOM without another automatic collection. Re-arm the ordinary
-       1.5x heuristic from post-collection live usage, retaining at least the
-       dependency's default 256 KiB growth window and a bounded pre-limit
-       reserve. */
+        || runtime->quickjs_pool == NULL
+        || phase >= SCRIPT_RUNTIME_COLLECT_PHASE_COUNT) return 0;
+    if (phase == SCRIPT_RUNTIME_COLLECT_FIRST_GC
+        || phase == SCRIPT_RUNTIME_COLLECT_SECOND_GC) {
+        JS_RunGC(runtime->runtime);
+        return 0;
+    }
+    /* The trim phase follows both graph passes. Re-arm automatic collection
+       from the post-collection live heap before returning cached pages to the
+       shared browser Budget. */
     JSMemoryUsage usage;
     memset(&usage, 0, sizeof(usage));
     JS_ComputeMemoryUsage(runtime->runtime, &usage);
@@ -178,6 +173,31 @@ size_t script_runtime_collect_and_trim(ScriptRuntime *runtime)
             threshold > SIZE_MAX ? SIZE_MAX : (size_t) threshold);
     }
     return budget_quickjs_pool_trim(runtime->quickjs_pool, 0);
+}
+
+size_t script_runtime_collect_and_trim(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->runtime == NULL
+        || runtime->quickjs_pool == NULL) return 0;
+    /* A DOM wrapper can participate in a self-cycle (classList and author
+       listeners are common examples).  Bellard QuickJS removes that cycle
+       in one pass and clears its WeakRef/FinalizationRegistry target in the
+       next.  This explicit full-collection boundary therefore needs both
+       bounded passes before allocator trimming. */
+    (void) script_runtime_collect_and_trim_phase(
+        runtime, SCRIPT_RUNTIME_COLLECT_FIRST_GC);
+    (void) script_runtime_collect_and_trim_phase(
+        runtime, SCRIPT_RUNTIME_COLLECT_SECOND_GC);
+    /* QuickJS raises its automatic-GC threshold from the allocation peak
+       which triggered a collection. An embedding-requested full collection
+       can reduce the live heap dramatically while leaving that old threshold
+       above the hard memory limit, so a later synchronous allocation burst
+       reaches OOM without another automatic collection. Re-arm the ordinary
+       1.5x heuristic from post-collection live usage, retaining at least the
+       dependency's default 256 KiB growth window and a bounded pre-limit
+       reserve. */
+    return script_runtime_collect_and_trim_phase(
+        runtime, SCRIPT_RUNTIME_COLLECT_TRIM);
 }
 
 size_t script_runtime_heap_remaining(const ScriptRuntime *runtime)

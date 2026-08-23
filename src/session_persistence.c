@@ -30,20 +30,91 @@ typedef struct {
 } PersistWriter;
 
 typedef struct {
-    FILE *file;
-    size_t remaining;
-    size_t cache_bytes;
-    uint32_t hash;
-    BrowserSessionPersistenceStatus status;
-} PersistReader;
-
-typedef struct {
     BrowserSessionPersistenceMask mask;
     size_t cache_count;
     size_t storage_count;
     size_t cache_bytes;
     uint64_t cache_slots;
 } PersistPlan;
+
+typedef enum {
+    ASYNC_LOAD_HEADER = 0,
+    ASYNC_LOAD_RECORD_TYPE,
+    ASYNC_LOAD_RECORD_BYTES,
+    ASYNC_LOAD_CACHE_URL_LENGTH,
+    ASYNC_LOAD_CACHE_URL,
+    ASYNC_LOAD_CACHE_BODY_LENGTH,
+    ASYNC_LOAD_CACHE_BODY,
+    ASYNC_LOAD_CACHE_STAMP,
+    ASYNC_LOAD_CACHE_ETAG_LENGTH,
+    ASYNC_LOAD_CACHE_ETAG,
+    ASYNC_LOAD_CACHE_MODIFIED_LENGTH,
+    ASYNC_LOAD_CACHE_MODIFIED,
+    ASYNC_LOAD_CACHE_CONTENT_TYPE_LENGTH,
+    ASYNC_LOAD_CACHE_CONTENT_TYPE,
+    ASYNC_LOAD_CACHE_VARY_LENGTH,
+    ASYNC_LOAD_CACHE_VARY,
+    ASYNC_LOAD_CACHE_FLAGS,
+    ASYNC_LOAD_CACHE_RESPONSE_LENGTH,
+    ASYNC_LOAD_CACHE_RESPONSE,
+    ASYNC_LOAD_CACHE_POLICY_LENGTH,
+    ASYNC_LOAD_CACHE_POLICY,
+    ASYNC_LOAD_STORAGE_ORIGIN_LENGTH,
+    ASYNC_LOAD_STORAGE_ORIGIN,
+    ASYNC_LOAD_STORAGE_KEY_LENGTH,
+    ASYNC_LOAD_STORAGE_KEY,
+    ASYNC_LOAD_STORAGE_VALUE_LENGTH,
+    ASYNC_LOAD_STORAGE_VALUE,
+    ASYNC_LOAD_TRAILING,
+    ASYNC_LOAD_FINISHED
+} AsyncLoadPhase;
+
+struct BrowserSessionPersistenceLoad {
+    BrowserSession *target;
+    BrowserSession *staging;
+    FILE *file;
+    BrowserSessionPersistenceLimits limits;
+    BrowserSessionPersistenceMask requested_mask;
+    BrowserSessionPersistenceMask stored_mask;
+    BrowserSessionPersistenceStatus status;
+    BrowserSessionPersistenceStatus primary_status;
+    AsyncLoadPhase phase;
+    char primary[PERSIST_PATH_BYTES];
+    char backup[PERSIST_PATH_BYTES];
+    bool trying_backup;
+    unsigned char header[PERSIST_HEADER_BYTES];
+    size_t header_read;
+    size_t payload_remaining;
+    size_t record_remaining;
+    size_t cache_bytes;
+    size_t parsed_cache;
+    size_t parsed_storage;
+    size_t expected_cache;
+    size_t expected_storage;
+    uint32_t expected_hash;
+    uint32_t hash;
+    unsigned char scalar[8];
+    size_t scalar_read;
+    size_t scalar_size;
+    size_t value_read;
+    size_t value_size;
+    uint32_t record_type;
+    uint32_t record_bytes;
+    char url[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char etag[sizeof(((BrowserCacheEntry *) 0)->etag)];
+    char modified[sizeof(((BrowserCacheEntry *) 0)->last_modified)];
+    char content_type[sizeof(((BrowserCacheEntry *) 0)->content_type)];
+    char vary[sizeof(((BrowserCacheEntry *) 0)->vary)];
+    char response[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char policy[BROWSER_REFERRER_POLICY_LIMIT];
+    char origin[BROWSER_ORIGIN_LIMIT];
+    char key[BROWSER_KEY_LIMIT];
+    unsigned char *value;
+    size_t body_length;
+    uint64_t stamp;
+    uint32_t flags;
+    bool body_skipped;
+};
 
 static uint32_t hash_update(uint32_t hash, const void *data, size_t length)
 {
@@ -466,57 +537,6 @@ BrowserSessionPersistenceStatus browser_session_persistence_save(
     return BROWSER_SESSION_PERSISTENCE_OK;
 }
 
-static void reader_bytes(PersistReader *reader, void *data, size_t length)
-{
-    if (reader == NULL
-        || reader->status != BROWSER_SESSION_PERSISTENCE_OK) return;
-    if (length > reader->remaining) {
-        reader->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
-        return;
-    }
-    if (fread(data, 1, length, reader->file) != length) {
-        reader->status = ferror(reader->file)
-            ? BROWSER_SESSION_PERSISTENCE_IO_ERROR
-            : BROWSER_SESSION_PERSISTENCE_CORRUPT;
-        return;
-    }
-    reader->remaining -= length;
-    reader->hash = hash_update(reader->hash, data, length);
-}
-
-static uint32_t reader_u32(PersistReader *reader)
-{
-    unsigned char encoded[4] = {0};
-    reader_bytes(reader, encoded, sizeof(encoded));
-    return get_u32(encoded);
-}
-
-static uint64_t reader_u64(PersistReader *reader)
-{
-    unsigned char encoded[8] = {0};
-    reader_bytes(reader, encoded, sizeof(encoded));
-    return get_u64(encoded);
-}
-
-static void reader_field(PersistReader *reader, char *output,
-                         size_t capacity, bool allow_empty)
-{
-    uint32_t length = reader_u32(reader);
-    if (reader->status != BROWSER_SESSION_PERSISTENCE_OK) return;
-    if (capacity == 0 || length >= capacity
-        || (!allow_empty && length == 0)) {
-        reader->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
-        return;
-    }
-    reader_bytes(reader, output, length);
-    if (reader->status == BROWSER_SESSION_PERSISTENCE_OK
-        && memchr(output, '\0', length) != NULL) {
-        reader->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
-    } else if (reader->status == BROWSER_SESSION_PERSISTENCE_OK) {
-        output[length] = '\0';
-    }
-}
-
 static bool http_field_value_valid(const char *value)
 {
     if (value == NULL) return false;
@@ -526,56 +546,6 @@ static bool http_field_value_valid(const char *value)
             return false;
     }
     return true;
-}
-
-static unsigned char *reader_blob(PersistReader *reader, Budget *budget,
-                                  size_t maximum, size_t allocation_maximum,
-                                  size_t *length, bool allow_empty,
-                                  bool *skipped)
-{
-    if (length != NULL) *length = 0;
-    if (skipped != NULL) *skipped = false;
-    uint32_t encoded_length = reader_u32(reader);
-    if (reader->status != BROWSER_SESSION_PERSISTENCE_OK) return NULL;
-    if (encoded_length > reader->remaining) {
-        reader->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
-        return NULL;
-    }
-    if (encoded_length > maximum || (!allow_empty && encoded_length == 0)
-        || (size_t) encoded_length + 1u < encoded_length) {
-        reader->status = BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
-        return NULL;
-    }
-    if (length != NULL) *length = encoded_length;
-    if (encoded_length > allocation_maximum) {
-        unsigned char buffer[PERSIST_SKIP_BUFFER_BYTES];
-        size_t remaining = encoded_length;
-        while (remaining != 0
-               && reader->status == BROWSER_SESSION_PERSISTENCE_OK) {
-            size_t chunk = remaining < sizeof(buffer)
-                ? remaining : sizeof(buffer);
-            reader_bytes(reader, buffer, chunk);
-            remaining -= chunk;
-        }
-        if (reader->status == BROWSER_SESSION_PERSISTENCE_OK
-            && skipped != NULL) {
-            *skipped = true;
-        }
-        return NULL;
-    }
-    unsigned char *value = budget_malloc_category(
-        budget, BUDGET_CATEGORY_SESSION, (size_t) encoded_length + 1u);
-    if (value == NULL) {
-        reader->status = BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY;
-        return NULL;
-    }
-    reader_bytes(reader, value, encoded_length);
-    if (reader->status != BROWSER_SESSION_PERSISTENCE_OK) {
-        budget_free(budget, value);
-        return NULL;
-    }
-    value[encoded_length] = 0;
-    return value;
 }
 
 static BrowserCacheEntry *cache_entry_direct(BrowserSession *session,
@@ -589,154 +559,6 @@ static BrowserCacheEntry *cache_entry_direct(BrowserSession *session,
             return &session->cache[i];
     }
     return NULL;
-}
-
-static void parse_cache(PersistReader *reader, BrowserSession *staging,
-                        const BrowserSessionPersistenceLimits *limits)
-{
-    char url[TILEFINCH_URL_SERIALIZED_LIMIT];
-    char etag[sizeof(staging->cache[0].etag)];
-    char modified[sizeof(staging->cache[0].last_modified)];
-    char content_type[sizeof(staging->cache[0].content_type)];
-    char vary[sizeof(staging->cache[0].vary)];
-    char response[TILEFINCH_URL_SERIALIZED_LIMIT];
-    char policy[BROWSER_REFERRER_POLICY_LIMIT];
-    reader_field(reader, url, sizeof(url), false);
-    size_t body_length = 0;
-    bool body_skipped = false;
-    unsigned char *data = reader_blob(
-        reader, staging->budget, limits->maximum_cache_bytes,
-        staging->maximum_cache_bytes, &body_length, false,
-        &body_skipped);
-    uint64_t stamp = reader_u64(reader);
-    reader_field(reader, etag, sizeof(etag), true);
-    reader_field(reader, modified, sizeof(modified), true);
-    reader_field(reader, content_type, sizeof(content_type), true);
-    reader_field(reader, vary, sizeof(vary), true);
-    uint32_t flags = reader_u32(reader);
-    reader_field(reader, response, sizeof(response), true);
-    reader_field(reader, policy, sizeof(policy), true);
-    if (reader->status != BROWSER_SESSION_PERSISTENCE_OK) {
-        budget_free(staging->budget, data);
-        return;
-    }
-    if (body_length > limits->maximum_cache_bytes
-        || reader->cache_bytes
-               > limits->maximum_cache_bytes - body_length) {
-        budget_free(staging->budget, data);
-        reader->status = BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
-        return;
-    }
-    reader->cache_bytes += body_length;
-    char key[TILEFINCH_URL_SERIALIZED_LIMIT];
-    if ((flags & ~UINT32_C(31)) != 0
-        || ((flags & UINT32_C(16)) != 0
-            && (flags & UINT32_C(8)) == 0)
-        || stamp > SIZE_MAX
-        || !http_field_value_valid(etag)
-        || !http_field_value_valid(modified)
-        || !http_field_value_valid(content_type)
-        || !http_field_value_valid(vary)
-        || !tilefinch_url_request_key(url, key, sizeof(key))
-        || strcmp(url, key) != 0 || cache_entry_direct(staging, url) != NULL) {
-        budget_free(staging->budget, data);
-        reader->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
-        return;
-    }
-    if (body_skipped) {
-        /*
-         * The disk snapshot may predate a lower live-memory preference.
-         * Its bytes and metadata have still participated in bounds checks and
-         * the whole-file hash, but do not make one oversized object consume
-         * its disk-sized body in memory or defeat the transactional restore.
-         */
-        return;
-    }
-    BrowserSharedBody *body = browser_shared_body_take(
-        staging->budget, data, body_length);
-    if (body == NULL) {
-        budget_free(staging->budget, data);
-        reader->status = BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY;
-        return;
-    }
-    char cache_control[48] = {0};
-    if ((flags & UINT32_C(1)) != 0) strcat(cache_control, "no-cache");
-    if ((flags & UINT32_C(2)) != 0)
-        strcat(cache_control, cache_control[0] == '\0'
-                              ? "must-revalidate" : ",must-revalidate");
-    if ((flags & UINT32_C(4)) != 0)
-        strcat(cache_control, cache_control[0] == '\0'
-                              ? "immutable" : ",immutable");
-    bool stored = browser_session_cache_put_http_shared(
-        staging, url, body, etag, modified, content_type,
-        cache_control, vary, 0);
-    browser_shared_body_release(body);
-    if (!stored) {
-        reader->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
-        return;
-    }
-    BrowserCacheEntry *entry = cache_entry_direct(staging, url);
-    if (entry == NULL) {
-        reader->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
-        return;
-    }
-    (void) stamp;
-    /*
-     * HTTP freshness timestamps use a per-process monotonic clock and cannot
-     * be compared across a reboot. A restored body is always stale so ETag or
-     * Last-Modified must revalidate it before reuse as a fresh response.
-     */
-    entry->stored_at_ns = 0;
-    entry->fresh_until_ns = 0;
-    entry->no_cache = true;
-    entry->must_revalidate = (flags & UINT32_C(2)) != 0;
-    entry->immutable = (flags & UINT32_C(4)) != 0;
-    bool provenance_ok = true;
-    if ((flags & UINT32_C(8)) != 0) {
-        const char *final_url = response[0] == '\0' ? url : response;
-        provenance_ok = (flags & UINT32_C(16)) != 0
-            ? browser_session_cache_set_response_provenance(
-                  staging, url, final_url, policy)
-            : browser_session_cache_set_response_url(
-                  staging, url, final_url);
-    } else if (response[0] != '\0' || policy[0] != '\0') {
-        provenance_ok = false;
-    }
-    if (!provenance_ok)
-        reader->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
-}
-
-static void parse_storage(PersistReader *reader, BrowserSession *staging)
-{
-    char origin[BROWSER_ORIGIN_LIMIT], normalized[BROWSER_ORIGIN_LIMIT];
-    char key[BROWSER_KEY_LIMIT];
-    reader_field(reader, origin, sizeof(origin), false);
-    reader_field(reader, key, sizeof(key), true);
-    size_t value_length = 0;
-    unsigned char *value = reader_blob(
-        reader, staging->budget, staging->maximum_storage_bytes,
-        staging->maximum_storage_bytes, &value_length, true, NULL);
-    if (reader->status != BROWSER_SESSION_PERSISTENCE_OK) {
-        budget_free(staging->budget, value);
-        return;
-    }
-    const char *old_value = NULL;
-    if (!tilefinch_url_origin(origin, normalized, sizeof(normalized))
-        || strcmp(origin, normalized) != 0
-        || browser_session_storage_get(
-               staging, origin, true, key, &old_value, NULL)) {
-        budget_free(staging->budget, value);
-        reader->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
-        return;
-    }
-    if (!browser_session_storage_set(
-            staging, origin, true, key, (const char *) value,
-            value_length)) {
-        budget_free(staging->budget, value);
-        reader->status = BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY;
-        return;
-    }
-    budget_free(staging->budget, value);
 }
 
 static bool local_commit_fits(const BrowserSession *target,
@@ -789,111 +611,639 @@ static void commit_staging(BrowserSession *target, BrowserSession *staging,
     }
 }
 
-static BrowserSessionPersistenceStatus load_one(
-    BrowserSession *session, const char *path,
-    BrowserSessionPersistenceMask requested_mask,
-    const BrowserSessionPersistenceLimits *limits)
+static void async_release_attempt(BrowserSessionPersistenceLoad *load)
 {
-    FILE *file = fopen(path, "rb");
-    if (file == NULL) return errno == ENOENT
-        ? BROWSER_SESSION_PERSISTENCE_NOT_FOUND
-        : BROWSER_SESSION_PERSISTENCE_IO_ERROR;
-    unsigned char header[PERSIST_HEADER_BYTES];
-    bool header_ok = fread(header, 1, sizeof(header), file) == sizeof(header);
-    if (!header_ok) {
-        BrowserSessionPersistenceStatus status = ferror(file)
+    if (load->file != NULL) {
+        fclose(load->file);
+        load->file = NULL;
+    }
+    budget_free(load->target->budget, load->value);
+    load->value = NULL;
+    if (load->staging != NULL) {
+        browser_session_destroy(load->staging);
+        budget_free(load->target->budget, load->staging);
+        load->staging = NULL;
+    }
+}
+
+static void async_reset_fields(BrowserSessionPersistenceLoad *load)
+{
+    load->stored_mask = 0;
+    load->phase = ASYNC_LOAD_HEADER;
+    load->header_read = 0;
+    load->payload_remaining = 0;
+    load->record_remaining = 0;
+    load->cache_bytes = 0;
+    load->parsed_cache = 0;
+    load->parsed_storage = 0;
+    load->expected_cache = 0;
+    load->expected_storage = 0;
+    load->expected_hash = 0;
+    load->hash = UINT32_C(2166136261);
+    load->scalar_read = 0;
+    load->scalar_size = 0;
+    load->value_read = 0;
+    load->value_size = 0;
+    load->record_type = 0;
+    load->record_bytes = 0;
+    load->body_length = 0;
+    load->stamp = 0;
+    load->flags = 0;
+    load->body_skipped = false;
+    memset(load->header, 0, sizeof(load->header));
+}
+
+static BrowserSessionPersistenceStatus async_open_attempt(
+    BrowserSessionPersistenceLoad *load, const char *path)
+{
+    async_release_attempt(load);
+    async_reset_fields(load);
+    load->file = fopen(path, "rb");
+    if (load->file == NULL) {
+        return errno == ENOENT ? BROWSER_SESSION_PERSISTENCE_NOT_FOUND
+                               : BROWSER_SESSION_PERSISTENCE_IO_ERROR;
+    }
+    return BROWSER_SESSION_PERSISTENCE_OK;
+}
+
+static bool async_read(
+    BrowserSessionPersistenceLoad *load, void *destination, size_t length,
+    size_t *offset, size_t *budget, bool payload, bool record)
+{
+    if (*offset >= length) return true;
+    if (*budget == 0 || load->status != BROWSER_SESSION_PERSISTENCE_OK)
+        return false;
+    size_t chunk = length - *offset;
+    if (chunk > *budget) chunk = *budget;
+    if (payload && chunk > load->payload_remaining) {
+        load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        return false;
+    }
+    if (record && chunk > load->record_remaining) {
+        load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        return false;
+    }
+    unsigned char *at = (unsigned char *) destination + *offset;
+    size_t received = fread(at, 1, chunk, load->file);
+    if (received != chunk) {
+        load->status = ferror(load->file)
             ? BROWSER_SESSION_PERSISTENCE_IO_ERROR
             : BROWSER_SESSION_PERSISTENCE_CORRUPT;
-        fclose(file);
-        return status;
+        return false;
     }
-    uint32_t stored_mask = get_u32(header + 16);
-    uint32_t payload_bytes = get_u32(header + 20);
-    uint32_t expected_hash = get_u32(header + 24);
-    uint32_t cache_count = get_u32(header + 28);
-    uint32_t storage_count = get_u32(header + 32);
-    if (memcmp(header, persist_magic, sizeof(persist_magic)) != 0
-        || get_u32(header + 8) != PERSIST_VERSION
-        || get_u32(header + 12) != PERSIST_HEADER_BYTES
-        || stored_mask == 0
-        || (stored_mask & ~BROWSER_SESSION_PERSIST_ALL) != 0
-        || payload_bytes > limits->maximum_file_bytes - PERSIST_HEADER_BYTES
-        || cache_count > limits->maximum_cache_entries
-        || storage_count > limits->maximum_local_storage_entries) {
-        fclose(file);
-        return BROWSER_SESSION_PERSISTENCE_CORRUPT;
+    if (payload) {
+        load->payload_remaining -= received;
+        load->hash = hash_update(load->hash, at, received);
     }
-    BrowserSession *staging = budget_calloc_category(
-        session->budget, BUDGET_CATEGORY_SESSION, 1, sizeof(*staging));
-    if (staging == NULL) {
-        fclose(file);
-        return BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY;
+    if (record) load->record_remaining -= received;
+    *offset += received;
+    *budget -= received;
+    return *offset == length;
+}
+
+static bool async_read_scalar(
+    BrowserSessionPersistenceLoad *load, size_t bytes, size_t *budget,
+    bool record)
+{
+    if (load->scalar_size == 0) load->scalar_size = bytes;
+    if (load->scalar_size != bytes) {
+        load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        return false;
     }
-    size_t staging_cache_limit = session->maximum_cache_bytes;
-    if (staging_cache_limit > limits->maximum_cache_bytes)
-        staging_cache_limit = limits->maximum_cache_bytes;
-    if (!browser_session_init(staging, session->budget,
-                              staging_cache_limit)) {
-        fclose(file);
-        budget_free(session->budget, staging);
-        return BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY;
+    return async_read(
+        load, load->scalar, bytes, &load->scalar_read, budget, true, record);
+}
+
+static uint32_t async_take_u32(BrowserSessionPersistenceLoad *load)
+{
+    uint32_t value = get_u32(load->scalar);
+    load->scalar_read = 0;
+    load->scalar_size = 0;
+    return value;
+}
+
+static uint64_t async_take_u64(BrowserSessionPersistenceLoad *load)
+{
+    uint64_t value = get_u64(load->scalar);
+    load->scalar_read = 0;
+    load->scalar_size = 0;
+    return value;
+}
+
+static bool async_field_length(
+    BrowserSessionPersistenceLoad *load, size_t capacity, bool allow_empty,
+    size_t *budget)
+{
+    if (!async_read_scalar(load, 4u, budget, true)) return false;
+    uint32_t length = async_take_u32(load);
+    if (capacity == 0 || length >= capacity
+        || (!allow_empty && length == 0)) {
+        load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        return false;
     }
-    PersistReader reader = {
-        .file = file, .remaining = payload_bytes,
-        .hash = UINT32_C(2166136261),
-        .status = BROWSER_SESSION_PERSISTENCE_OK
-    };
-    size_t parsed_cache = 0, parsed_storage = 0;
-    while (reader.status == BROWSER_SESSION_PERSISTENCE_OK
-           && reader.remaining != 0) {
-        size_t before = reader.remaining;
-        uint32_t type = reader_u32(&reader);
-        uint32_t record_bytes = reader_u32(&reader);
-        if (reader.status != BROWSER_SESSION_PERSISTENCE_OK) break;
-        if (record_bytes > reader.remaining) {
-            reader.status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+    load->value_size = length;
+    load->value_read = 0;
+    return true;
+}
+
+static bool async_field_body(
+    BrowserSessionPersistenceLoad *load, char *value, size_t capacity,
+    size_t *budget)
+{
+    if (load->value_size >= capacity) {
+        load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        return false;
+    }
+    if (!async_read(
+            load, value, load->value_size, &load->value_read,
+            budget, true, true)) return false;
+    if (memchr(value, '\0', load->value_size) != NULL) {
+        load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        return false;
+    }
+    value[load->value_size] = '\0';
+    load->value_size = 0;
+    load->value_read = 0;
+    return true;
+}
+
+static bool async_commit_cache(BrowserSessionPersistenceLoad *load)
+{
+    BrowserSession *staging = load->staging;
+    size_t body_length = load->body_length;
+    if (body_length > load->limits.maximum_cache_bytes
+        || load->cache_bytes
+               > load->limits.maximum_cache_bytes - body_length) {
+        load->status = BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
+        return false;
+    }
+    load->cache_bytes += body_length;
+    char request_key[TILEFINCH_URL_SERIALIZED_LIMIT];
+    if ((load->flags & ~UINT32_C(31)) != 0
+        || ((load->flags & UINT32_C(16)) != 0
+            && (load->flags & UINT32_C(8)) == 0)
+        || load->stamp > SIZE_MAX
+        || !http_field_value_valid(load->etag)
+        || !http_field_value_valid(load->modified)
+        || !http_field_value_valid(load->content_type)
+        || !http_field_value_valid(load->vary)
+        || !tilefinch_url_request_key(
+               load->url, request_key, sizeof(request_key))
+        || strcmp(load->url, request_key) != 0
+        || cache_entry_direct(staging, load->url) != NULL) {
+        load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        return false;
+    }
+    if (load->body_skipped) return true;
+    BrowserSharedBody *body = browser_shared_body_take(
+        staging->budget, load->value, body_length);
+    if (body == NULL) {
+        load->status = BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY;
+        return false;
+    }
+    load->value = NULL;
+    char cache_control[48] = {0};
+    if ((load->flags & UINT32_C(1)) != 0)
+        strcat(cache_control, "no-cache");
+    if ((load->flags & UINT32_C(2)) != 0)
+        strcat(cache_control, cache_control[0] == '\0'
+                              ? "must-revalidate" : ",must-revalidate");
+    if ((load->flags & UINT32_C(4)) != 0)
+        strcat(cache_control, cache_control[0] == '\0'
+                              ? "immutable" : ",immutable");
+    bool stored = browser_session_cache_put_http_shared(
+        staging, load->url, body, load->etag, load->modified,
+        load->content_type, cache_control, load->vary, 0);
+    browser_shared_body_release(body);
+    BrowserCacheEntry *entry = stored
+        ? cache_entry_direct(staging, load->url) : NULL;
+    if (entry == NULL) {
+        load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        return false;
+    }
+    entry->stored_at_ns = 0;
+    entry->fresh_until_ns = 0;
+    entry->no_cache = true;
+    entry->must_revalidate = (load->flags & UINT32_C(2)) != 0;
+    entry->immutable = (load->flags & UINT32_C(4)) != 0;
+    bool provenance_ok = true;
+    if ((load->flags & UINT32_C(8)) != 0) {
+        const char *final_url = load->response[0] == '\0'
+            ? load->url : load->response;
+        provenance_ok = (load->flags & UINT32_C(16)) != 0
+            ? browser_session_cache_set_response_provenance(
+                  staging, load->url, final_url, load->policy)
+            : browser_session_cache_set_response_url(
+                  staging, load->url, final_url);
+    } else if (load->response[0] != '\0' || load->policy[0] != '\0') {
+        provenance_ok = false;
+    }
+    if (!provenance_ok) {
+        load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        return false;
+    }
+    return true;
+}
+
+static bool async_commit_storage(BrowserSessionPersistenceLoad *load)
+{
+    char normalized[BROWSER_ORIGIN_LIMIT];
+    const char *old_value = NULL;
+    if (!tilefinch_url_origin(
+            load->origin, normalized, sizeof(normalized))
+        || strcmp(load->origin, normalized) != 0
+        || browser_session_storage_get(
+               load->staging, load->origin, true, load->key,
+               &old_value, NULL)) {
+        load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        return false;
+    }
+    if (!browser_session_storage_set(
+            load->staging, load->origin, true, load->key,
+            (const char *) load->value, load->body_length)) {
+        load->status = BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY;
+        return false;
+    }
+    budget_free(load->target->budget, load->value);
+    load->value = NULL;
+    return true;
+}
+
+static bool async_prepare_staging(BrowserSessionPersistenceLoad *load)
+{
+    load->staging = budget_calloc_category(
+        load->target->budget, BUDGET_CATEGORY_SESSION,
+        1, sizeof(*load->staging));
+    if (load->staging == NULL) return false;
+    size_t cache_limit = load->target->maximum_cache_bytes;
+    if (cache_limit > load->limits.maximum_cache_bytes)
+        cache_limit = load->limits.maximum_cache_bytes;
+    if (!browser_session_init(
+            load->staging, load->target->budget, cache_limit)) {
+        budget_free(load->target->budget, load->staging);
+        load->staging = NULL;
+        return false;
+    }
+    return true;
+}
+
+static void async_select_backup_failure(
+    BrowserSessionPersistenceLoad *load,
+    BrowserSessionPersistenceStatus backup_status)
+{
+    if (load->primary_status == BROWSER_SESSION_PERSISTENCE_NOT_FOUND
+        || (backup_status != BROWSER_SESSION_PERSISTENCE_NOT_FOUND
+            && backup_status != BROWSER_SESSION_PERSISTENCE_CORRUPT)) {
+        load->status = backup_status;
+    } else {
+        load->status = load->primary_status;
+    }
+    load->phase = ASYNC_LOAD_FINISHED;
+}
+
+static bool async_handle_failure(BrowserSessionPersistenceLoad *load)
+{
+    if (load->status == BROWSER_SESSION_PERSISTENCE_OK) return false;
+    if (!load->trying_backup
+        && (load->status == BROWSER_SESSION_PERSISTENCE_NOT_FOUND
+            || load->status == BROWSER_SESSION_PERSISTENCE_CORRUPT)) {
+        load->primary_status = load->status;
+        load->trying_backup = true;
+        BrowserSessionPersistenceStatus backup_status =
+            async_open_attempt(load, load->backup);
+        load->status = backup_status;
+        if (backup_status != BROWSER_SESSION_PERSISTENCE_OK)
+            async_select_backup_failure(load, backup_status);
+        return true;
+    }
+    if (load->trying_backup)
+        async_select_backup_failure(load, load->status);
+    else
+        load->phase = ASYNC_LOAD_FINISHED;
+    return true;
+}
+
+BrowserSessionPersistenceLoad *browser_session_persistence_load_begin(
+    BrowserSession *session, const char *path,
+    BrowserSessionPersistenceMask mask,
+    const BrowserSessionPersistenceLimits *requested_limits)
+{
+    BrowserSessionPersistenceLimits limits;
+    char backup[PERSIST_PATH_BYTES];
+    if (session == NULL || session->budget == NULL
+        || mask == 0 || (mask & ~BROWSER_SESSION_PERSIST_ALL) != 0
+        || !effective_limits(requested_limits, &limits)
+        || !make_path(path, ".bak", backup)) return NULL;
+    BrowserSessionPersistenceLoad *load = budget_calloc_category(
+        session->budget, BUDGET_CATEGORY_SESSION, 1, sizeof(*load));
+    if (load == NULL) return NULL;
+    load->target = session;
+    load->limits = limits;
+    load->requested_mask = mask;
+    load->status = BROWSER_SESSION_PERSISTENCE_OK;
+    load->primary_status = BROWSER_SESSION_PERSISTENCE_OK;
+    snprintf(load->primary, sizeof(load->primary), "%s", path);
+    snprintf(load->backup, sizeof(load->backup), "%s", backup);
+    BrowserSessionPersistenceStatus open_status =
+        async_open_attempt(load, load->primary);
+    load->status = open_status;
+    if (open_status != BROWSER_SESSION_PERSISTENCE_OK)
+        (void) async_handle_failure(load);
+    return load;
+}
+
+static void async_finish_record(BrowserSessionPersistenceLoad *load)
+{
+    if (load->record_remaining != 0) {
+        load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        return;
+    }
+    if (load->record_type == RECORD_CACHE) {
+        if (!async_commit_cache(load)) return;
+        load->parsed_cache++;
+    } else {
+        if (!async_commit_storage(load)) return;
+        load->parsed_storage++;
+    }
+    load->phase = load->payload_remaining == 0
+        ? ASYNC_LOAD_TRAILING : ASYNC_LOAD_RECORD_TYPE;
+}
+
+BrowserSessionPersistenceLoadProgress browser_session_persistence_load_pump(
+    BrowserSessionPersistenceLoad *load, size_t maximum_bytes,
+    BrowserSessionPersistenceStatus *reported_status)
+{
+    if (reported_status != NULL)
+        *reported_status = BROWSER_SESSION_PERSISTENCE_INVALID_ARGUMENT;
+    if (load == NULL || maximum_bytes == 0)
+        return BROWSER_SESSION_PERSISTENCE_LOAD_FAILED;
+    size_t budget = maximum_bytes;
+    unsigned transitions = 0;
+    while (load->phase != ASYNC_LOAD_FINISHED
+           && load->status == BROWSER_SESSION_PERSISTENCE_OK
+           && budget != 0 && transitions++ < 64u) {
+        switch (load->phase) {
+        case ASYNC_LOAD_HEADER:
+            if (!async_read(
+                    load, load->header, sizeof(load->header),
+                    &load->header_read, &budget, false, false)) break;
+            load->stored_mask = get_u32(load->header + 16);
+            load->payload_remaining = get_u32(load->header + 20);
+            load->expected_hash = get_u32(load->header + 24);
+            load->expected_cache = get_u32(load->header + 28);
+            load->expected_storage = get_u32(load->header + 32);
+            if (memcmp(
+                    load->header, persist_magic, sizeof(persist_magic)) != 0
+                || get_u32(load->header + 8) != PERSIST_VERSION
+                || get_u32(load->header + 12) != PERSIST_HEADER_BYTES
+                || load->stored_mask == 0
+                || (load->stored_mask & ~BROWSER_SESSION_PERSIST_ALL) != 0
+                || load->payload_remaining
+                       > load->limits.maximum_file_bytes
+                             - PERSIST_HEADER_BYTES
+                || load->expected_cache
+                       > load->limits.maximum_cache_entries
+                || load->expected_storage
+                       > load->limits.maximum_local_storage_entries) {
+                load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+                break;
+            }
+            if (!async_prepare_staging(load)) {
+                load->status = BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY;
+                break;
+            }
+            load->phase = load->payload_remaining == 0
+                ? ASYNC_LOAD_TRAILING : ASYNC_LOAD_RECORD_TYPE;
+            break;
+        case ASYNC_LOAD_RECORD_TYPE:
+            if (!async_read_scalar(load, 4u, &budget, false)) break;
+            load->record_type = async_take_u32(load);
+            load->phase = ASYNC_LOAD_RECORD_BYTES;
+            break;
+        case ASYNC_LOAD_RECORD_BYTES:
+            if (!async_read_scalar(load, 4u, &budget, false)) break;
+            load->record_bytes = async_take_u32(load);
+            if (load->record_bytes > load->payload_remaining
+                || (load->record_type != RECORD_CACHE
+                    && load->record_type != RECORD_LOCAL_STORAGE)
+                || (load->record_type == RECORD_CACHE
+                    && (load->stored_mask
+                        & BROWSER_SESSION_PERSIST_CACHE) == 0)
+                || (load->record_type == RECORD_LOCAL_STORAGE
+                    && (load->stored_mask
+                        & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) == 0)) {
+                load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+                break;
+            }
+            load->record_remaining = load->record_bytes;
+            load->phase = load->record_type == RECORD_CACHE
+                ? ASYNC_LOAD_CACHE_URL_LENGTH
+                : ASYNC_LOAD_STORAGE_ORIGIN_LENGTH;
+            break;
+#define ASYNC_FIELD_LENGTH_CASE(phase_name, next_phase, member, allow) \
+        case phase_name: \
+            if (async_field_length( \
+                    load, sizeof(load->member), allow, &budget)) \
+                load->phase = next_phase; \
+            break
+#define ASYNC_FIELD_BODY_CASE(phase_name, next_phase, member) \
+        case phase_name: \
+            if (async_field_body( \
+                    load, load->member, sizeof(load->member), &budget)) \
+                load->phase = next_phase; \
+            break
+        ASYNC_FIELD_LENGTH_CASE(
+            ASYNC_LOAD_CACHE_URL_LENGTH, ASYNC_LOAD_CACHE_URL, url, false);
+        ASYNC_FIELD_BODY_CASE(
+            ASYNC_LOAD_CACHE_URL, ASYNC_LOAD_CACHE_BODY_LENGTH, url);
+        case ASYNC_LOAD_CACHE_BODY_LENGTH:
+            if (!async_read_scalar(load, 4u, &budget, true)) break;
+            load->body_length = async_take_u32(load);
+            if (load->body_length > load->record_remaining) {
+                load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+                break;
+            }
+            if (load->body_length > load->limits.maximum_cache_bytes
+                || load->body_length == 0
+                || load->body_length + 1u < load->body_length) {
+                load->status = BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
+                break;
+            }
+            load->body_skipped =
+                load->body_length > load->staging->maximum_cache_bytes;
+            if (!load->body_skipped) {
+                load->value = budget_malloc_category(
+                    load->target->budget, BUDGET_CATEGORY_SESSION,
+                    load->body_length + 1u);
+                if (load->value == NULL) {
+                    load->status = BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY;
+                    break;
+                }
+            }
+            load->value_read = 0;
+            load->phase = ASYNC_LOAD_CACHE_BODY;
+            break;
+        case ASYNC_LOAD_CACHE_BODY: {
+            unsigned char skipped[PERSIST_SKIP_BUFFER_BYTES];
+            size_t target = load->body_skipped
+                ? load->body_length - load->value_read
+                : load->body_length;
+            if (load->body_skipped) {
+                size_t chunk = target < sizeof(skipped)
+                    ? target : sizeof(skipped);
+                if (chunk > budget) chunk = budget;
+                size_t at = 0;
+                if (!async_read(
+                        load, skipped, chunk, &at, &budget, true, true))
+                    break;
+                load->value_read += chunk;
+                if (load->value_read != load->body_length) break;
+            } else if (!async_read(
+                           load, load->value, target, &load->value_read,
+                           &budget, true, true)) break;
+            if (load->value != NULL)
+                load->value[load->body_length] = 0;
+            load->value_read = 0;
+            load->phase = ASYNC_LOAD_CACHE_STAMP;
             break;
         }
-        if (type == RECORD_CACHE
-            && (stored_mask & BROWSER_SESSION_PERSIST_CACHE) != 0) {
-            parsed_cache++;
-            parse_cache(&reader, staging, limits);
-        } else if (type == RECORD_LOCAL_STORAGE
-                   && (stored_mask
-                       & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0) {
-            parsed_storage++;
-            parse_storage(&reader, staging);
-        } else {
-            reader.status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        case ASYNC_LOAD_CACHE_STAMP:
+            if (!async_read_scalar(load, 8u, &budget, true)) break;
+            load->stamp = async_take_u64(load);
+            load->phase = ASYNC_LOAD_CACHE_ETAG_LENGTH;
+            break;
+        ASYNC_FIELD_LENGTH_CASE(
+            ASYNC_LOAD_CACHE_ETAG_LENGTH, ASYNC_LOAD_CACHE_ETAG,
+            etag, true);
+        ASYNC_FIELD_BODY_CASE(
+            ASYNC_LOAD_CACHE_ETAG, ASYNC_LOAD_CACHE_MODIFIED_LENGTH, etag);
+        ASYNC_FIELD_LENGTH_CASE(
+            ASYNC_LOAD_CACHE_MODIFIED_LENGTH, ASYNC_LOAD_CACHE_MODIFIED,
+            modified, true);
+        ASYNC_FIELD_BODY_CASE(
+            ASYNC_LOAD_CACHE_MODIFIED,
+            ASYNC_LOAD_CACHE_CONTENT_TYPE_LENGTH, modified);
+        ASYNC_FIELD_LENGTH_CASE(
+            ASYNC_LOAD_CACHE_CONTENT_TYPE_LENGTH,
+            ASYNC_LOAD_CACHE_CONTENT_TYPE, content_type, true);
+        ASYNC_FIELD_BODY_CASE(
+            ASYNC_LOAD_CACHE_CONTENT_TYPE, ASYNC_LOAD_CACHE_VARY_LENGTH,
+            content_type);
+        ASYNC_FIELD_LENGTH_CASE(
+            ASYNC_LOAD_CACHE_VARY_LENGTH, ASYNC_LOAD_CACHE_VARY,
+            vary, true);
+        ASYNC_FIELD_BODY_CASE(
+            ASYNC_LOAD_CACHE_VARY, ASYNC_LOAD_CACHE_FLAGS, vary);
+        case ASYNC_LOAD_CACHE_FLAGS:
+            if (!async_read_scalar(load, 4u, &budget, true)) break;
+            load->flags = async_take_u32(load);
+            load->phase = ASYNC_LOAD_CACHE_RESPONSE_LENGTH;
+            break;
+        ASYNC_FIELD_LENGTH_CASE(
+            ASYNC_LOAD_CACHE_RESPONSE_LENGTH, ASYNC_LOAD_CACHE_RESPONSE,
+            response, true);
+        ASYNC_FIELD_BODY_CASE(
+            ASYNC_LOAD_CACHE_RESPONSE, ASYNC_LOAD_CACHE_POLICY_LENGTH,
+            response);
+        ASYNC_FIELD_LENGTH_CASE(
+            ASYNC_LOAD_CACHE_POLICY_LENGTH, ASYNC_LOAD_CACHE_POLICY,
+            policy, true);
+        case ASYNC_LOAD_CACHE_POLICY:
+            if (async_field_body(
+                    load, load->policy, sizeof(load->policy), &budget))
+                async_finish_record(load);
+            break;
+        ASYNC_FIELD_LENGTH_CASE(
+            ASYNC_LOAD_STORAGE_ORIGIN_LENGTH, ASYNC_LOAD_STORAGE_ORIGIN,
+            origin, false);
+        ASYNC_FIELD_BODY_CASE(
+            ASYNC_LOAD_STORAGE_ORIGIN, ASYNC_LOAD_STORAGE_KEY_LENGTH,
+            origin);
+        ASYNC_FIELD_LENGTH_CASE(
+            ASYNC_LOAD_STORAGE_KEY_LENGTH, ASYNC_LOAD_STORAGE_KEY,
+            key, true);
+        ASYNC_FIELD_BODY_CASE(
+            ASYNC_LOAD_STORAGE_KEY, ASYNC_LOAD_STORAGE_VALUE_LENGTH, key);
+        case ASYNC_LOAD_STORAGE_VALUE_LENGTH:
+            if (!async_read_scalar(load, 4u, &budget, true)) break;
+            load->body_length = async_take_u32(load);
+            if (load->body_length > load->record_remaining) {
+                load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+                break;
+            }
+            if (load->body_length
+                    > load->staging->maximum_storage_bytes
+                || load->body_length + 1u < load->body_length) {
+                load->status = BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
+                break;
+            }
+            load->value = budget_malloc_category(
+                load->target->budget, BUDGET_CATEGORY_SESSION,
+                load->body_length + 1u);
+            if (load->value == NULL) {
+                load->status = BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY;
+                break;
+            }
+            load->value_read = 0;
+            load->phase = ASYNC_LOAD_STORAGE_VALUE;
+            break;
+        case ASYNC_LOAD_STORAGE_VALUE:
+            if (!async_read(
+                    load, load->value, load->body_length,
+                    &load->value_read, &budget, true, true)) break;
+            load->value[load->body_length] = 0;
+            async_finish_record(load);
+            break;
+        case ASYNC_LOAD_TRAILING: {
+            int trailing = fgetc(load->file);
+            budget--;
+            if (trailing != EOF || ferror(load->file)
+                || load->payload_remaining != 0
+                || load->hash != load->expected_hash
+                || load->parsed_cache != load->expected_cache
+                || load->parsed_storage != load->expected_storage) {
+                load->status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+                break;
+            }
+            BrowserSessionPersistenceMask commit_mask =
+                load->requested_mask & load->stored_mask;
+            if ((commit_mask & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0
+                && !local_commit_fits(load->target, load->staging)) {
+                load->status = BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
+                break;
+            }
+            commit_staging(load->target, load->staging, commit_mask);
+            if (load->trying_backup) {
+                (void) remove(load->primary);
+            }
+            load->phase = ASYNC_LOAD_FINISHED;
+            break;
         }
-        size_t consumed = before - reader.remaining;
-        if (reader.status == BROWSER_SESSION_PERSISTENCE_OK
-            && (consumed < 8u || consumed - 8u != record_bytes)) {
-            reader.status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
+        case ASYNC_LOAD_FINISHED:
+            break;
         }
+#undef ASYNC_FIELD_LENGTH_CASE
+#undef ASYNC_FIELD_BODY_CASE
+        if (load->status != BROWSER_SESSION_PERSISTENCE_OK)
+            (void) async_handle_failure(load);
     }
-    int trailing = reader.status == BROWSER_SESSION_PERSISTENCE_OK
-        ? fgetc(file) : EOF;
-    if (reader.status == BROWSER_SESSION_PERSISTENCE_OK
-        && (reader.remaining != 0 || trailing != EOF || ferror(file)
-            || reader.hash != expected_hash
-            || parsed_cache != cache_count
-            || parsed_storage != storage_count)) {
-        reader.status = BROWSER_SESSION_PERSISTENCE_CORRUPT;
-    }
-    fclose(file);
-    BrowserSessionPersistenceMask commit_mask =
-        requested_mask & stored_mask;
-    if (reader.status == BROWSER_SESSION_PERSISTENCE_OK
-        && (commit_mask & BROWSER_SESSION_PERSIST_LOCAL_STORAGE) != 0
-        && !local_commit_fits(session, staging)) {
-        reader.status = BROWSER_SESSION_PERSISTENCE_LIMIT_EXCEEDED;
-    }
-    if (reader.status == BROWSER_SESSION_PERSISTENCE_OK)
-        commit_staging(session, staging, commit_mask);
-    browser_session_destroy(staging);
-    budget_free(session->budget, staging);
-    return reader.status;
+    if (load->status != BROWSER_SESSION_PERSISTENCE_OK)
+        (void) async_handle_failure(load);
+    if (reported_status != NULL) *reported_status = load->status;
+    if (load->phase != ASYNC_LOAD_FINISHED)
+        return BROWSER_SESSION_PERSISTENCE_LOAD_PENDING;
+    return load->status == BROWSER_SESSION_PERSISTENCE_OK
+        ? BROWSER_SESSION_PERSISTENCE_LOAD_COMPLETE
+        : BROWSER_SESSION_PERSISTENCE_LOAD_FAILED;
+}
+
+void browser_session_persistence_load_destroy(
+    BrowserSessionPersistenceLoad *load)
+{
+    if (load == NULL || load->target == NULL) return;
+    Budget *budget = load->target->budget;
+    async_release_attempt(load);
+    budget_free(budget, load);
 }
 
 BrowserSessionPersistenceStatus browser_session_persistence_load(
@@ -909,24 +1259,20 @@ BrowserSessionPersistenceStatus browser_session_persistence_load(
         || !make_path(path, ".bak", backup)) {
         return BROWSER_SESSION_PERSISTENCE_INVALID_ARGUMENT;
     }
+    BrowserSessionPersistenceLoad *load =
+        browser_session_persistence_load_begin(
+            session, path, mask, &limits);
+    if (load == NULL)
+        return BROWSER_SESSION_PERSISTENCE_OUT_OF_MEMORY;
     BrowserSessionPersistenceStatus status =
-        load_one(session, path, mask, &limits);
-    if (status == BROWSER_SESSION_PERSISTENCE_NOT_FOUND
-        || status == BROWSER_SESSION_PERSISTENCE_CORRUPT) {
-        BrowserSessionPersistenceStatus backup_status =
-            load_one(session, backup, mask, &limits);
-        if (backup_status == BROWSER_SESSION_PERSISTENCE_OK) {
-            /* Do not let a known-torn primary replace the recovered generation
-               during the next save's rotation. */
-            (void) remove(path);
-            return backup_status;
-        }
-        if (status == BROWSER_SESSION_PERSISTENCE_NOT_FOUND
-            || (backup_status != BROWSER_SESSION_PERSISTENCE_NOT_FOUND
-                && backup_status != BROWSER_SESSION_PERSISTENCE_CORRUPT)) {
-            return backup_status;
-        }
+        BROWSER_SESSION_PERSISTENCE_OK;
+    BrowserSessionPersistenceLoadProgress progress =
+        BROWSER_SESSION_PERSISTENCE_LOAD_PENDING;
+    while (progress == BROWSER_SESSION_PERSISTENCE_LOAD_PENDING) {
+        progress = browser_session_persistence_load_pump(
+            load, 64u * 1024u, &status);
     }
+    browser_session_persistence_load_destroy(load);
     return status;
 }
 

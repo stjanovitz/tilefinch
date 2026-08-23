@@ -30,6 +30,7 @@
 #define TILEFINCH_PSP_THREAD_PRIORITY_SWDEC         0x21
 #define TILEFINCH_PSP_THREAD_PRIORITY_TRANSPORT_SETUP 0x21
 #define TILEFINCH_PSP_THREAD_PRIORITY_CLOCK         0x21
+#define TILEFINCH_PSP_THREAD_PRIORITY_IMAGE_DECODE  0x22
 
 _Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_CALLBACK
                    < TILEFINCH_PSP_THREAD_PRIORITY_WATCHDOG,
@@ -58,5 +59,8 @@ _Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_BROWSER
 _Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_BROWSER
                    < TILEFINCH_PSP_THREAD_PRIORITY_SWDEC,
                "software reconstruction must remain preemptible by input");
+_Static_assert(TILEFINCH_PSP_THREAD_PRIORITY_BROWSER
+                   < TILEFINCH_PSP_THREAD_PRIORITY_IMAGE_DECODE,
+               "thumbnail decode must remain preemptible by input");
 
 #endif

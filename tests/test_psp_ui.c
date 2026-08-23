@@ -1890,8 +1890,13 @@ static bool test_large_toast_uses_full_psp_width(void)
     enum { WIDTH = 480, HEIGHT = 272 };
     static uint16_t thirty_four[WIDTH * HEIGHT];
     static uint16_t thirty_five[WIDTH * HEIGHT];
+    static uint16_t certificate_hint[WIDTH * HEIGHT];
+    static uint16_t certificate_hint_without_tail[WIDTH * HEIGHT];
+    static uint16_t redirect_hint[WIDTH * HEIGHT];
+    static uint16_t redirect_hint_without_tail[WIDTH * HEIGHT];
     PspUiState ui;
     psp_ui_init(&ui);
+    psp_ui_clear_chrome_font();
     ui.browser_ui_scale = 2;
     psp_ui_show_status(&ui, "1234567890123456789012345678901234", 60);
     ui.toast_entry_frames = 0;
@@ -1904,6 +1909,47 @@ static bool test_large_toast_uses_full_psp_width(void)
     /* The former fixed 34-character cap made these frames identical and
        clipped the final letter of the network-cancellation hint. */
     CHECK(memcmp(thirty_four, thirty_five, sizeof(thirty_four)) != 0);
+
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    FontSet fonts;
+    CHECK(font_set_load(
+        &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
+        NULL, NULL, 1024u * 1024u));
+    psp_ui_set_chrome_fonts(font_set_face(&fonts, FONT_SANS), NULL);
+    psp_ui_show_status(
+        &ui, "YouTube page fetch failed\n"
+             "Try correcting PSP date/time, then retry", 60);
+    ui.toast_entry_frames = 0;
+    psp_ui_composite(&ui, certificate_hint, WIDTH, HEIGHT, WIDTH);
+    psp_ui_show_status(
+        &ui, "YouTube page fetch failed\n"
+             "Try correcting PSP date/time, then      ", 60);
+    ui.toast_entry_frames = 0;
+    psp_ui_composite(
+        &ui, certificate_hint_without_tail, WIDTH, HEIGHT, WIDTH);
+    /* The second line's final word must reach the compositor at the largest
+       UI scale. If either the per-line cap or multiline path regresses, both
+       otherwise-identical frames become equal. */
+    CHECK(memcmp(certificate_hint, certificate_hint_without_tail,
+                 sizeof(certificate_hint)) != 0);
+    psp_ui_show_tls_status(
+        &ui, "Secure page fetch failed",
+        TILEFINCH_TLS_GUIDANCE_REDIRECTED, 60);
+    ui.toast_entry_frames = 0;
+    psp_ui_composite(&ui, redirect_hint, WIDTH, HEIGHT, WIDTH);
+    psp_ui_show_tls_status(
+        &ui, "Secure page fetch failed",
+        TILEFINCH_TLS_GUIDANCE_UNTRUSTED, 60);
+    ui.toast_entry_frames = 0;
+    psp_ui_composite(
+        &ui, redirect_hint_without_tail, WIDTH, HEIGHT, WIDTH);
+    CHECK(ui.tls_toast_guidance == TILEFINCH_TLS_GUIDANCE_UNTRUSTED
+          && memcmp(redirect_hint, redirect_hint_without_tail,
+                    sizeof(redirect_hint)) != 0);
+    psp_ui_clear_chrome_font();
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0 && budget_categories_reconcile(&budget));
     return true;
 }
 
@@ -3707,6 +3753,79 @@ static bool test_media_first_frame_transition_keeps_bottom_ground_stable(void)
     return true;
 }
 
+/*
+ * A committed seek is invoked work, but it is not a new media open. The
+ * frozen scrubber is useful state and must remain the exact surface Playing
+ * will inherit. Treating SEEKING as generic resolving used to erase all 78
+ * footer rows during every cooperative work slice, then restore them at the
+ * first post-seek frame; the physical LCD showed that transition as a noisy
+ * shimmer across the bottom edge.
+ */
+static bool test_media_committed_seek_keeps_timeline_stable(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272, CONTROL_HEIGHT = 78 };
+    static uint32_t video[WIDTH * HEIGHT];
+    static uint16_t scratch[WIDTH * HEIGHT];
+    static uint32_t seeking_bottom[WIDTH * CONTROL_HEIGHT];
+    PspUiMediaState media;
+    psp_ui_media_init(&media);
+    psp_ui_media_set(
+        &media, true, true, false,
+        UINT64_C(60000000), UINT64_C(120000000), "Seek stability");
+    psp_ui_media_show_controls(&media);
+    PspMediaUiProjection seeking = {
+        .mode = PSP_MEDIA_UI_SEEKING,
+        .visible = true,
+        .controls_enabled = true,
+        .play_pause_enabled = true,
+        .seek_enabled = true,
+        .show_progress = true,
+        .playing = true
+    };
+    psp_ui_media_apply_projection(&media, &seeking);
+    CHECK(media.resolving && media.seek_in_progress);
+
+    for (size_t at = 0; at < sizeof(video) / sizeof(video[0]); at++)
+        video[at] = UINT32_C(0xff2070e0);
+    psp_ui_media_composite_8888(
+        &media, NULL, video, WIDTH, HEIGHT, WIDTH, scratch);
+    memcpy(
+        seeking_bottom,
+        video + (size_t) (HEIGHT - CONTROL_HEIGHT) * WIDTH,
+        sizeof(seeking_bottom));
+
+    /* A second supervisor repaint over a different frozen buffer must be
+       byte-identical, including the progress segment at the left. */
+    for (size_t at = 0; at < sizeof(video) / sizeof(video[0]); at++)
+        video[at] = UINT32_C(0xffe06020);
+    psp_ui_media_composite_controls_8888(
+        &media, video, WIDTH, HEIGHT, WIDTH, scratch);
+    CHECK(memcmp(
+              seeking_bottom,
+              video + (size_t) (HEIGHT - CONTROL_HEIGHT) * WIDTH,
+              sizeof(seeking_bottom)) == 0);
+
+    PspMediaUiProjection playing = {
+        .mode = PSP_MEDIA_UI_PLAYING,
+        .visible = true,
+        .controls_enabled = true,
+        .play_pause_enabled = true,
+        .seek_enabled = true,
+        .playing = true
+    };
+    psp_ui_media_apply_projection(&media, &playing);
+    CHECK(!media.resolving && !media.seek_in_progress);
+    for (size_t at = 0; at < sizeof(video) / sizeof(video[0]); at++)
+        video[at] = UINT32_C(0xff20d060);
+    psp_ui_media_composite_8888(
+        &media, NULL, video, WIDTH, HEIGHT, WIDTH, scratch);
+    CHECK(memcmp(
+              seeking_bottom,
+              video + (size_t) (HEIGHT - CONTROL_HEIGHT) * WIDTH,
+              sizeof(seeking_bottom)) == 0);
+    return true;
+}
+
 int main(void)
 {
     if (!test_input_mapping_and_menu()
@@ -3743,6 +3862,7 @@ int main(void)
         || !test_media_buffering_transition_frames_are_stable()
         || !test_media_chrome_is_stable_across_motion_sequence()
         || !test_media_first_frame_transition_keeps_bottom_ground_stable()
+        || !test_media_committed_seek_keeps_timeline_stable()
         || !test_native_surfaces_own_the_panel()
         || !test_home_traversal_and_activation()
         || !test_implicit_cursor_handoff()

@@ -12,6 +12,7 @@
 #   scripts/run-ppsspp-input-script.sh [options]
 #     --build-dir DIR   PSP build directory (default build-preset-psp-validation)
 #     --script NAME     scenario in tests/input-scripts (default menu-tour)
+#     --url URL         start on an HTTPS page instead of native HOME
 #     --timeout N       seconds to wait for the run (default 300)
 #     --runs N          replay N times and require identical traces (default 1)
 #     --debug-log       add PPSSPP's -d syscall trace to the emulator log
@@ -48,6 +49,7 @@ timeout_seconds=300
 runs=1
 debug_log=0
 update_golden=0
+start_url=
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -55,6 +57,8 @@ while [ "$#" -gt 0 ]; do
         --build-dir=*) build_dir=${1#--build-dir=}; shift ;;
         --script) scenario=$2; shift 2 ;;
         --script=*) scenario=${1#--script=}; shift ;;
+        --url) start_url=$2; shift 2 ;;
+        --url=*) start_url=${1#--url=}; shift ;;
         --timeout) timeout_seconds=$2; shift 2 ;;
         --timeout=*) timeout_seconds=${1#--timeout=}; shift ;;
         --runs) runs=$2; shift 2 ;;
@@ -69,6 +73,13 @@ done
 case "$runs:$timeout_seconds" in
     *[!0-9:]*|0:*|*:0) printf 'runs and timeout must be positive integers\n' >&2; exit 2 ;;
 esac
+
+if [ -n "$start_url" ]; then
+    case "$start_url" in
+        https://*) ;;
+        *) printf 'scripted-input start URL must use HTTPS\n' >&2; exit 2 ;;
+    esac
+fi
 
 case "$build_dir" in
     /*) ;;
@@ -267,7 +278,7 @@ run_once() {
     {
         printf '%s\n' \
             "# Generated only for the isolated PPSSPP scripted-input run." \
-            "url=" \
+            "url=$start_url" \
             "trace=none" \
             "profile=realistic" \
             "network_profile=1" \
@@ -372,11 +383,19 @@ run_once() {
         printf 'FAIL: run %s never reached a clean exit.\n' "$run_index" >&2
         return 1
     }
-    if ! grep -q \
-        'tilefinch-boot-order: surface=native-home deferred=no url-override=0 trace=0 validation=0' \
-        "$validation_log"; then
+    if [ -z "$start_url" ] && ! grep -q \
+            'tilefinch-boot-order: surface=native-home deferred=no url-override=0 trace=0 validation=0' \
+            "$validation_log"; then
         printf '%s\n' \
             'FAIL: scripted input did not use the shipping native-HOME boot.' \
+            "See $run_result/tilefinch-validation.txt" >&2
+        return 1
+    fi
+    if [ -n "$start_url" ] && ! grep -q \
+            'tilefinch-boot-order: .*url-override=1 trace=0 validation=0' \
+            "$validation_log"; then
+        printf '%s\n' \
+            'FAIL: scripted input did not use the requested direct URL.' \
             "See $run_result/tilefinch-validation.txt" >&2
         return 1
     fi

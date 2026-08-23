@@ -86,6 +86,17 @@ save pre-flights free space and reports a refusal or failure on screen
 (see [Free-space requirements](#free-space-requirements)) instead of only
 logging `site-data-save … save-failed`.
 
+When booting to native HOME, neither file is read before the first interactive
+frame. Restoration is sequential and transactional in bounded 16 KiB idle
+slices: a target store is unchanged until the whole file validates. Local
+storage must finish before the first real navigation proceeds; an unfinished
+cache restore is cancelled when navigation starts, because the cache is an
+optimization and must not overwrite responses produced by the new page.
+Booting directly to a page retains synchronous restoration so author script
+observes the persisted local-storage state from its first instruction. Profile
+settings and bookmarks live in `profile.cfg` and remain part of the pre-HOME
+load because the native UI needs them.
+
 By default, `tls-sessions.bin` is written only during explicit suspend or
 controlled-exit flushes (curl's session cache is dumped there through
 `curl_easy_ssls_export`) and read back once when the transport is first

@@ -1,17 +1,21 @@
 # PSP TLS trust bundle
 
 `roots.pem` is the deliberately compact trust bundle staged beside the live
-PSP EBOOT. It contains nineteen public root certificates:
+PSP EBOOT. It contains twenty-three public root certificates:
 
 - Amazon Root CA 1 (expires 2038-01-17)
 - DigiCert Global Root G2 (expires 2038-01-15)
 - DigiCert Global Root G3 (expires 2038-01-15)
 - GlobalSign ECC Root CA - R5 (expires 2038-01-19)
+- GlobalSign ECC Root CA - R4 (expires 2038-01-19)
 - GlobalSign Root CA R1 (expires 2028-01-28)
 - GlobalSign Root CA R3 (expires 2029-03-18)
 - GlobalSign Root R46 (expires 2046-03-20)
 - Go Daddy Root Certificate Authority - G2 (expires 2037-12-31)
 - GTS Root R1 (expires 2036-06-22)
+- GTS Root R2 (expires 2036-06-22)
+- GTS Root R3 (expires 2036-06-22)
+- GTS Root R4 (expires 2036-06-22)
 - HARICA TLS RSA Root CA 2021 (expires 2045-02-13)
 - IdenTrust Commercial Root CA 1 (expires 2034-01-16)
 - ISRG Root X1 (expires 2035-06-04)
@@ -32,6 +36,12 @@ verified the alternate Google chain
 `WR2 -> GTS Root R1 -> GlobalSign Root CA R1` served to the mobile YouTube
 endpoint. The legacy R1 anchor is retained specifically for old TLS chain
 builders and must be reviewed or replaced before its 2028 expiry.
+
+The current GTS R2-R4 roots and GlobalSign R4 compatibility anchor are the
+digitalSignature variants published by Google Trust Services. GlobalSign R2
+is intentionally not retained: that compatibility root expired in 2021, so
+adding it would spend bundle space without making a currently valid chain
+acceptable.
 
 The USERTrust ECC anchor verifies Sectigo's E46 chain, including the chain
 currently served by GitHub. Its DER certificate is published by Sectigo at

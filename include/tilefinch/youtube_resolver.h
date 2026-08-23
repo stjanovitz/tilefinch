@@ -121,6 +121,11 @@ typedef struct {
     bool cached_identity;
 } YoutubeResolveJobMetrics;
 
+typedef struct {
+    size_t watch_response_bytes;
+    size_t player_response_bytes;
+} YoutubeResolveJobLimits;
+
 /*
  * PSP-native pumpable resolver. Network production occurs on the bounded
  * transport worker; each pump consumes at most one response chunk or one
@@ -131,12 +136,25 @@ YoutubeResolveJob *youtube_resolve_job_begin(
     Budget *budget, BrowserSession *session, const char *watch_url,
     int maximum_height, long timeout_ms,
     YoutubeResolverCancelCallback cancel, void *cancel_opaque);
+/* Lower response ceilings for optional/speculative work. Exceeding either
+ * ceiling fails this job softly; an explicit caller may retry through the
+ * ordinary begin function with the normal limits. */
+YoutubeResolveJob *youtube_resolve_job_begin_bounded(
+    Budget *budget, BrowserSession *session, const char *watch_url,
+    int maximum_height, long timeout_ms,
+    const YoutubeResolveJobLimits *limits,
+    YoutubeResolverCancelCallback cancel, void *cancel_opaque);
 YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job);
 bool youtube_resolve_job_take(
     YoutubeResolveJob *job, YoutubeStream *stream);
 const char *youtube_resolve_job_error(const YoutubeResolveJob *job);
 bool youtube_resolve_job_metrics(
     const YoutubeResolveJob *job, YoutubeResolveJobMetrics *metrics);
+/* Ownership-transfer guard for speculative resolvers. A media session must
+ * not trust a caller to attach a job prepared for another video or quality. */
+bool youtube_resolve_job_matches(
+    const YoutubeResolveJob *job, const char *watch_url,
+    int maximum_height);
 void youtube_resolve_job_cancel(YoutubeResolveJob *job, const char *reason);
 void youtube_resolve_job_destroy(YoutubeResolveJob *job);
 

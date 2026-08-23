@@ -341,8 +341,8 @@ static const struct {
     const char *detail;
     const char *url;
 } psp_home_builtin[] = {
-    {"WIKIPEDIA", "Articles and search", "https://en.wikipedia.org/"},
-    {"YOUTUBE", "Browse and play video", "https://m.youtube.com/"}
+    {"YOUTUBE", "Browse and play video", "https://m.youtube.com/"},
+    {"WIKIPEDIA", "Articles and search", "https://en.wikipedia.org/"}
 };
 
 #define PSP_HOME_BUILTIN_COUNT \

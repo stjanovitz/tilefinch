@@ -365,10 +365,21 @@ static void psp_app_dispatch_heavy_action(
                 break;
             }
             if (app->views->controller->focus_kind == CONTROLLER_FOCUS_NONE) {
-                frame->page_dirty =
-                    browser_engine_focus_move(engine, true)
-                    || frame->page_dirty;
-                break;
+                /* A provider result authors autofocus on its primary Play
+                   surface. Optional thumbnail/font relayout can briefly
+                   leave the controller without a resolved region even
+                   though that DOM target is still live. Restore that exact
+                   target and spend this same Cross press on activation;
+                   only pages without authored autofocus retain the ordinary
+                   focus-first, activate-second interaction. */
+                if (browser_engine_restore_autofocus(engine)) {
+                    frame->page_dirty = true;
+                } else {
+                    frame->page_dirty =
+                        browser_engine_focus_move(engine, true)
+                        || frame->page_dirty;
+                    break;
+                }
             }
             ControllerTextInputInfo text_info = {0};
             bool focused_text =
@@ -405,6 +416,8 @@ static void psp_app_dispatch_heavy_action(
                 if (!submit_after_edit) break;
             }
             ControllerAction action;
+            size_t activations_before =
+                app->views->controller->activations;
             if (browser_engine_activate(engine, &action)) {
                 bool navigates =
                     action.type == CONTROLLER_ACTION_NAVIGATE
@@ -493,23 +506,60 @@ static void psp_app_dispatch_heavy_action(
                        useful while the player owns the screen, and retiring
                        them makes the resolver's first worker descriptor
                        available immediately. */
+                    int youtube_quality = (int)
+                        browser_profile_youtube_quality(profile);
+                    YoutubeResolveJob **prepared_resolver =
+                        entry == NULL ? NULL
+                        : psp_youtube_preresolve_job_for_open(
+                              &app->browser->youtube_preresolve,
+                              action.url,
+                              app->views->navigation->generation,
+                              youtube_quality, frame->ui_sample_us);
+                    bool offered_prepared_resolver =
+                        prepared_resolver != NULL
+                        && *prepared_resolver != NULL;
                     bool opened = entry != NULL
-                        && psp_media_open_provider_route(
+                        && psp_media_open_provider_route_prepared(
                             &app->browser->media, action.url,
-                            app->views->navigation->generation);
+                            app->views->navigation->generation,
+                            prepared_resolver);
+                    if (opened && offered_prepared_resolver
+                        && prepared_resolver != NULL
+                        && *prepared_resolver == NULL) {
+                        psp_youtube_preresolve_note_taken(
+                            &app->browser->youtube_preresolve);
+                    }
                     if (opened) {
                         (void) browser_engine_cancel_network_work(
                             engine, "provider video selected");
-                        BrowserOptionalMemoryReclaim reclaimed = {0};
-                        (void) browser_engine_reclaim_optional_memory(
-                            engine, &reclaimed);
+                        /* Reclaim only when the selected decoder cannot fit.
+                           Even then the loop presents the player before it
+                           spends one bounded reclaim phase per frame. */
+                        app->interactive->provider_handoff_reclaim_pump_us =
+                            0;
+                        browser_engine_prepare_optional_memory_reclaim(
+                            engine,
+                            psp_media_startup_headroom_bytes(
+                                &app->browser->media),
+                            &app->interactive->provider_handoff_reclaim);
+                        /* Presentation is a prerequisite only when reclaim
+                           will actually run. With ample headroom, retaining
+                           this latch suppresses the resolver while the media
+                           supervisor owns presentation, so neither side can
+                           clear it. */
+                        app->interactive->provider_handoff_present_pending =
+                            browser_engine_optional_memory_reclaim_pending(
+                                &app->interactive
+                                     ->provider_handoff_reclaim);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
-                        printf("tilefinch-provider-handoff: "
-                               "reclaimed=%zu js=%zu session=%zu render=%zu\n",
-                               reclaimed.total_bytes,
-                               reclaimed.javascript_bytes,
-                               reclaimed.session_cache_bytes,
-                               reclaimed.render_cache_bytes);
+                        printf("tilefinch-provider-handoff: phase=armed "
+                               "pressure=%d free=%zu target=%zu\n",
+                               browser_engine_optional_memory_reclaim_pending(
+                                   &app->interactive
+                                        ->provider_handoff_reclaim) ? 1 : 0,
+                               budget_remaining(app->browser->budget),
+                               app->interactive->provider_handoff_reclaim
+                                   .target_remaining_bytes);
 #endif
                         psp_ui_set_loading(
                             &app->process->presentation.ui, false, 0);
@@ -711,6 +761,22 @@ static void psp_app_dispatch_heavy_action(
                     psp_ui_show_status(
                         &app->process->presentation.ui, browser_engine_last_error(engine), 300);
                 }
+            } else if (app->views->controller->activations
+                           == activations_before) {
+                /* Resolution can fail only after the retained target truly
+                   leaves the current layout. Do not silently consume Cross:
+                   move to a live target and paint its focus in this frame.
+                   A failure after a handler began is deliberately excluded
+                   so no page-side action is followed by an unrelated move. */
+                bool recovered = browser_engine_restore_autofocus(engine)
+                    || browser_engine_focus_move(engine, true);
+                if (recovered) {
+                    frame->page_dirty = true;
+                } else {
+                    psp_ui_show_status(
+                        &app->process->presentation.ui,
+                        "PAGE ITEM IS NO LONGER AVAILABLE", 120);
+                }
             }
             break;
         }
@@ -799,8 +865,14 @@ static void psp_app_dispatch_heavy_action(
             psp_navigation_cooperate_begin(
                 &app->process->presentation.ui, engine_frame, engine);
             psp_text_input_before_navigation(&app->process->text_input);
-            bool started = browser_engine_begin_navigation_history(
-                engine, forward, 4 * MIB, 30000);
+            bool javascript_ready = history_url != NULL
+                && browser_engine_set_javascript_enabled(
+                    engine,
+                    browser_profile_javascript_allowed_for_url(
+                        profile, history_url));
+            bool started = javascript_ready
+                && browser_engine_begin_navigation_history(
+                    engine, forward, 4 * MIB, 30000);
             if (started) {
                 app->interactive->navigation_job_started_us =
                     (uint64_t) sceKernelGetSystemTimeWide();
@@ -815,6 +887,9 @@ static void psp_app_dispatch_heavy_action(
             break;
         }
         case PSP_UI_ACTION_VOICE_FOCUSED_TEXT:
+            psp_youtube_preresolve_reset(
+                &app->browser->youtube_preresolve,
+                "voice input memory reclaim");
             if (psp_replace_focused_text(
                     engine, engine_frame, &app->process->presentation.ui,
                     &app->process->text_input, true, NULL)) {
@@ -1091,6 +1166,11 @@ static void psp_app_dispatch_heavy_action(
         case PSP_UI_ACTION_OPEN_VOICE_ADDRESS: {
             bool use_voice =
                 intent->action == PSP_UI_ACTION_OPEN_VOICE_ADDRESS;
+            if (use_voice) {
+                psp_youtube_preresolve_reset(
+                    &app->browser->youtube_preresolve,
+                    "voice input memory reclaim");
+            }
             const NavigationEntry *entry =
                 navigation_current(app->views->navigation);
             char destination[NAVIGATION_URL_LIMIT] = {0};
@@ -1788,4 +1868,41 @@ static void psp_app_dispatch_heavy_action(
         default:
             break;
     }
+}
+
+void psp_app_pump_provider_handoff_reclaim(
+    PspApp *app, uint64_t frame_us, bool player_presented)
+{
+    if (app == NULL || app->interactive == NULL || app->browser == NULL
+        || frame_us == 0) return;
+    /* Direct Play cancels page image work immediately. A JPEG already inside
+       entropy decode finishes below browser priority; reap its arena here on
+       the first later frame instead of retaining it through playback. */
+    (void) browser_engine_maintain_background_workers(
+        app->browser->engine);
+    if (app->interactive->provider_handoff_present_pending) {
+        if (!player_presented) return;
+        app->interactive->provider_handoff_present_pending = false;
+    }
+    BrowserOptionalMemoryReclaimJob *job =
+        &app->interactive->provider_handoff_reclaim;
+    if (!browser_engine_optional_memory_reclaim_pending(job)
+        || app->interactive->provider_handoff_reclaim_pump_us == frame_us)
+        return;
+    app->interactive->provider_handoff_reclaim_pump_us = frame_us;
+    bool complete = browser_engine_pump_optional_memory_reclaim(
+        app->browser->engine, job);
+#ifndef TILEFINCH_PSP_VALIDATION_LOG
+    (void) complete;
+#endif
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    printf("tilefinch-provider-handoff: phase=reclaim step=%u done=%d "
+           "free=%zu target=%zu reclaimed=%zu/%zu/%zu/%zu\n",
+           (unsigned) job->phase, complete ? 1 : 0,
+           budget_remaining(app->browser->budget),
+           job->target_remaining_bytes, job->reclaimed.font_staging_bytes,
+           job->reclaimed.javascript_bytes,
+           job->reclaimed.session_cache_bytes,
+           job->reclaimed.render_cache_bytes);
+#endif
 }

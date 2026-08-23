@@ -649,6 +649,13 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
         && strstr(document.html, "name=search_query") != NULL
         && strstr(document.html, "<a class=card autofocus") != NULL
         && strstr(document.html, "data-tilefinch-provider-media") != NULL
+        /* Play is a native action and only needs the canonical video ID.
+           Keeping the (potentially 3x-encoded) search query belongs to the
+           Details link, where it restores the search form on the watch page. */
+        && strstr(document.html,
+                  "data-tilefinch-provider-media href=\""
+                  "https://www.youtube.com/watch?v=abc_DEF-123\">")
+               != NULL
         && strstr(document.html,
                   "class=details href=\"https://www.youtube.com/watch?v=")
                != NULL
@@ -670,6 +677,8 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
                   "PSP%20%26%20homebrew") != NULL
         && strstr(document.html,
                   "i.ytimg.com/vi/abc_DEF-123/mqdefault.jpg") != NULL
+        && strstr(document.html,
+                  "width=160 height=90 loading=lazy alt=\"\"") != NULL
         && strstr(document.html, "Channel One") != NULL
         && strstr(document.html, "<span class=channel>Channel One</span>")
                != NULL
@@ -901,7 +910,8 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
                   "The first line.<br>Second &lt;line&gt;.") != NULL
         && strstr(document.html, "View full description") != NULL
         && strstr(document.html, "View comments") != NULL
-        && strstr(document.html, "Play in native player") != NULL
+        && strstr(document.html, "Play in native player") == NULL
+        && strstr(document.html, "class=play-label") == NULL
         && strstr(
                document.html,
                "tilefinch.local/offline/youtube?id=TFTEST00001") != NULL

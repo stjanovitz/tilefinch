@@ -578,6 +578,112 @@ static int test_bounded_site_adapter_state(Budget *budget)
     return 0;
 }
 
+static int test_bounded_site_adapter_document_cache(Budget *budget)
+{
+    BrowserSession session;
+    static const unsigned char first[] = "first generated page";
+    static const unsigned char second[] = "second generated page";
+    static const unsigned char third[] = "third generated page";
+    BrowserSiteAdapterDocumentCacheView view = {0};
+    TilefinchRequestContext authority = {
+        .target_url = "https://fixture.test/",
+        .top_level_url = "https://fixture.test/",
+        .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NAVIGATE,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_DOCUMENT,
+        .top_level_navigation = true,
+        .user_activated = true
+    };
+    CHECK(browser_session_init(&session, budget, 16u * 1024u)
+          && browser_session_site_adapter_document_cache_put(
+              &session, "fixture", "https://fixture.test/one", 1,
+              &authority,
+              first, sizeof(first), 100, 2, 200, "fixture", "", 100)
+          && browser_session_site_adapter_document_cache_put(
+              &session, "fixture", "https://fixture.test/two", 1,
+              &authority,
+              second, sizeof(second), 200, 3, 200, "fixture", "", 110)
+          && browser_session_site_adapter_document_cache_get(
+              &session, "fixture", "https://fixture.test/one", 1,
+              &authority,
+              120, 50, &view)
+          && view.length == sizeof(first)
+          && view.source_bytes == 100 && view.result_count == 2
+          && memcmp(view.data, first, sizeof(first)) == 0);
+    /* Touching the first entry makes the second the LRU victim. */
+    CHECK(browser_session_site_adapter_document_cache_put(
+              &session, "fixture", "https://fixture.test/three", 1,
+              &authority,
+              third, sizeof(third), 300, 4, 200, "fixture", "", 125)
+          && !browser_session_site_adapter_document_cache_get(
+              &session, "fixture", "https://fixture.test/two", 1,
+              &authority,
+              126, 50, &view)
+          && browser_session_site_adapter_document_cache_get(
+              &session, "fixture", "https://fixture.test/one", 1,
+              &authority,
+              126, 50, &view));
+    /* An unrelated origin does not alter this request's Cookie header and
+       therefore must not defeat an otherwise reusable provider document. */
+    CHECK(browser_session_cookie_set_http(
+              &session, "https://unrelated.test/",
+              "other=present; Path=/; Secure")
+          && browser_session_site_adapter_document_cache_get(
+              &session, "fixture", "https://fixture.test/one", 1,
+              &authority,
+              127, 50, &view));
+    CHECK(browser_session_cookie_set_http(
+              &session, "https://fixture.test/",
+              "sid=changed; Path=/; Secure")
+          && !browser_session_site_adapter_document_cache_get(
+              &session, "fixture", "https://fixture.test/one", 1,
+              &authority,
+              128, 50, &view));
+    /* The removed first slot leaves a hole before the surviving entry. Exact
+       replacement must still scan past that hole instead of retaining two
+       entries with the same key. */
+    CHECK(browser_session_site_adapter_document_cache_put(
+              &session, "fixture", "https://fixture.test/three", 1,
+              &authority,
+              second, sizeof(second), 220, 5, 200, "fixture", "", 190));
+    size_t matching_entries = 0;
+    for (size_t i = 0;
+         i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++) {
+        BrowserSiteAdapterDocumentCacheEntry *entry =
+            &session.site_adapter_document_cache[i];
+        if (entry->valid
+            && strcmp(entry->key, "https://fixture.test/three") == 0) {
+            matching_entries++;
+        }
+    }
+    CHECK(matching_entries == 1);
+    CHECK(browser_session_site_adapter_document_cache_put(
+              &session, "fixture", "https://fixture.test/fresh", 0,
+              &authority,
+              first, sizeof(first), 100, 2, 200, "fixture", "", 200)
+          && !browser_session_site_adapter_document_cache_get(
+              &session, "fixture", "https://fixture.test/fresh", 0,
+              &authority,
+              251, 50, &view));
+    size_t reclaimed = browser_session_cache_reclaim(&session, SIZE_MAX);
+    CHECK(reclaimed != 0);
+    for (size_t i = 0;
+         i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++) {
+        CHECK(!session.site_adapter_document_cache[i].valid);
+    }
+    CHECK(browser_session_site_adapter_document_cache_put(
+              &session, "fixture", "https://fixture.test/clear", 0,
+              &authority,
+              first, sizeof(first), 100, 2, 200, "fixture", "", 300));
+    browser_session_cache_clear(&session);
+    CHECK(!browser_session_site_adapter_document_cache_get(
+              &session, "fixture", "https://fixture.test/clear", 0,
+              &authority, 301, 50, &view));
+    browser_session_destroy(&session);
+    return 0;
+}
+
 /* The HttpOnly and Secure overwrite guards run on the exact-key path only.
    Eviction re-points an entry at a victim chosen by age, so victim selection
    has to apply the same two rules; otherwise a caller that may not overwrite
@@ -1166,6 +1272,7 @@ int main(void)
           && strcmp(tilefinch_request_fetch_site(&opaque_context),
                     "cross-site") == 0);
     CHECK(test_bounded_site_adapter_state(&budget) == 0);
+    CHECK(test_bounded_site_adapter_document_cache(&budget) == 0);
     CHECK(test_global_site_data_policy(&budget) == 0);
     CHECK(test_cookie_eviction_guard(&budget) == 0);
     CHECK(test_redacted_cookie_seed(&budget) == 0);
@@ -1187,6 +1294,7 @@ int main(void)
                     + sizeof(expiry_session.cookies)
                     + sizeof(expiry_session.cache)
                     + sizeof(expiry_session.site_adapter_state)
+                    + sizeof(expiry_session.site_adapter_document_cache)
           && budget.external_reserved == expiry_session.accounting_bytes
           && budget_categories_reconcile(&budget));
     for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {

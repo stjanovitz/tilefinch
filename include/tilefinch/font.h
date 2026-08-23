@@ -69,6 +69,26 @@ typedef struct {
     FontFace metric_sans_bold;
 } FontSet;
 
+typedef struct FontFaceLoad FontFaceLoad;
+
+typedef enum {
+    FONT_FACE_LOAD_FAILED = 0,
+    FONT_FACE_LOAD_PENDING,
+    FONT_FACE_LOAD_COMPLETE
+} FontFaceLoadStatus;
+
+typedef uint8_t FontSetFaceMask;
+enum {
+    FONT_SET_FACE_SANS = 1u << 0,
+    FONT_SET_FACE_SANS_BOLD = 1u << 1,
+    FONT_SET_FACE_SANS_ITALIC = 1u << 2,
+    FONT_SET_FACE_SERIF = 1u << 3,
+    FONT_SET_FACE_SERIF_BOLD = 1u << 4,
+    FONT_SET_FACE_METRIC_SANS = 1u << 5,
+    FONT_SET_FACE_METRIC_SANS_BOLD = 1u << 6,
+    FONT_SET_FACE_ALL = (1u << 7) - 1u
+};
+
 /* Page-owned faces stay separate from the application fallback set so a
    transactional navigation can stage and discard them without mutating the
    incumbent page.  The style layer encodes the family slot plus a bounded
@@ -119,6 +139,21 @@ bool font_set_load(FontSet *fonts, Budget *budget,
                    const char *metric_sans_path,
                    const char *metric_sans_bold_path,
                    size_t max_total_bytes);
+bool font_set_load_selected(
+    FontSet *fonts, Budget *budget, const char *sans_path,
+    const char *serif_path, const char *sans_italic_path,
+    const char *sans_bold_path, const char *serif_bold_path,
+    const char *metric_sans_path, const char *metric_sans_bold_path,
+    size_t max_total_bytes, FontSetFaceMask selected);
+/* Trusted application faces are read in bounded chunks so a Memory Stick
+   access cannot monopolize the browser thread for a whole frame. The load
+   owns its staging bytes until COMPLETE transfers them into `face`. */
+FontFaceLoad *font_face_load_begin(
+    Budget *budget, const char *path, size_t maximum_bytes);
+FontFaceLoadStatus font_face_load_pump(
+    FontFaceLoad *load, size_t maximum_bytes, FontFace *face);
+void font_face_load_destroy(FontFaceLoad *load);
+size_t font_set_loaded_bytes(const FontSet *fonts);
 void font_set_destroy(FontSet *fonts);
 const FontFace *font_set_face(const FontSet *fonts, FontFamily family);
 const FontFace *font_set_face_style(const FontSet *fonts, FontFamily family,

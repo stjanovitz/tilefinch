@@ -1107,7 +1107,10 @@ static bool loop_drain_turn(BrowserEngine *engine,
     /* Runs the background resource continuation, refreshes the render shell
        when it relaid out, and prepares idle tiles; returns whether any of
        that work remains. */
-    bool work_pending = browser_engine_run_idle_work(engine);
+    bool idle_visual_changed = false;
+    bool work_pending = browser_engine_run_idle_work(
+        engine, &idle_visual_changed);
+    (void) idle_visual_changed;
     bool media_changed = false;
     if (!interactive_media_advance(media, navigation, cache, elapsed_ms,
                                    &media_changed)) {

@@ -8,7 +8,7 @@ import re
 import sys
 
 
-EXPECTED_CERTIFICATE_COUNT = 19
+EXPECTED_CERTIFICATE_COUNT = 23
 REQUIRED_SHA256_FINGERPRINTS = {
     # GitHub's current Sectigo chain.
     "4ff460d54b9c86dabfbcfc5712e0400d2bed3fbc4d4fbdaa86e06adcd2a9ad7a",
@@ -31,6 +31,12 @@ REQUIRED_SHA256_FINGERPRINTS = {
     "c32ffd9f46f936d16c3673990959434b9ad60aafbb9e7cf33654f144cc1ba143",
     # Sectigo's current RSA server-authentication hierarchy.
     "7bb647a62aeeac88bf257aa522d01ffea395e0ab45c73f93f65654ec38f25a06",
+    # Current Google Trust Services roots and its GlobalSign R4
+    # compatibility anchor, from pki.goog's repository.
+    "8d25cd97229dbf70356bda4eb3cc734031e24cf00fafcfd32dc76eb5841c7ea8",
+    "34d8a73ee208d9bcdb0d956520934b4e40e69482596e8b6f73c8426b010a6f48",
+    "349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d",
+    "b085d70b964f191a73e4af0d54ae7a0e07aafdaf9b71dd0862138ab7325a24a2",
 }
 
 

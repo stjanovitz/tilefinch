@@ -1,5 +1,5 @@
 # Exercise input and visible acknowledgement while a genuine navigation is
-# still busy. HOME starts focused on Wikipedia.
+# still busy. HOME starts focused on YouTube.
 # Let the homepage's eager Wi-Fi association finish first. Without this the
 # press exercises cancellation of association rather than the shared-worker
 # page navigation this scenario is named for.

@@ -107,6 +107,7 @@ runs concurrently:
 | Worker | Owns | Publishes |
 |---|---|---|
 | transport | curl handles and fixed response buffers | immutable response chunks and terminal status |
+| raster decode | one browser-admitted JPEG arena | generation-tagged RGBA completion |
 | codec | one prepared firmware job at a time | decoded audio or a generation-tagged video surface |
 | DMA | framebuffer staging transfer | completion for the exact slot generation |
 | audio | PSP audio submission | consumed PCM position |
@@ -117,7 +118,9 @@ Workers never traverse the DOM, call page allocators, update chrome, or write
 profile state. Cross-thread messages use bounded slots, generation tokens, and
 release/acquire publication. Thread priorities are named together in
 `include/tilefinch/psp_threads.h`, where their ordering is reviewable as one
-system.
+system. JPEG entropy decode runs below the browser priority; cancellation
+invalidates its token without waiting, and only the browser thread may adopt
+the finished pixels or trigger the resulting relayout.
 
 ### 3. Commit complete state, never partial state
 
@@ -296,9 +299,14 @@ snapshot. Resource-cache entries carry their partition and authorization
 grant; authority-bearing entries remain memory-only rather than being
 serialized as generic cache records.
 
+The bounded two-entry provider-document cache is optional session memory. It
+participates in ordinary cache reclaim and **Clear HTTP caches**, so a
+generated provider page cannot outlive the user's clear action or crowd out an
+authoritative navigation under pressure.
+
 On PSP, one shared transport worker owns curl. Up to six ordinary response
 lanes grow lazily with concurrency; media uses two larger fixed range windows,
-and HOME preconnect has one bodyless descriptor. Redirects remain singular:
+and the YouTube HOME preconnect has one bodyless descriptor. Redirects remain singular:
 the browser authorizes one hop, the worker executes it, and the next hop is not
 started until the browser accepts the result. Independent requests still run
 concurrently, and HTTP/2 multiplexing remains available.
@@ -317,8 +325,16 @@ digest-pinned, runtime provenance is checked, HTTP/2 negotiates through ALPN
 with HTTP/1.1 fallback, and HTTP/3 is out of scope. By default, TLS sessions
 are retained in a bounded, checksummed store, scoped to the same site, and
 cleared with cache data; a global preference disables cross-boot retention
-without disabling process-local reuse. A highlighted built-in HOME destination
-may open one bodyless preconnection; moving focus or suspending cancels it.
+without disabling process-local reuse. A highlighted built-in YouTube HOME
+destination may open one bodyless connection warmup; moving focus or suspending
+cancels it.
+
+The native provider retains at most two generated Home/first-search documents
+for two minutes in the session Budget. Keys include the exact URL, presentation
+variant, and the cookie authority visible to that request; eviction is LRU and
+clearing site data drops the entries. Raw provider responses and decoded images
+are not retained. Result cards commit with fixed thumbnail geometry, while
+their explicit lazy images enter the ordinary post-paint resource queue.
 
 See [PSP transport](engineering/PSP_TRANSPORT.md) and the
 [security model](SECURITY_MODEL.md) for the exact protocol and policy
@@ -455,7 +471,36 @@ release is safe.
 
 HOME and Collections are native chrome rather than hidden HTML documents. They
 can render immediately from bounded profile snapshots while network warm-up
-and page machinery progress in the background. Five tabs retain navigation,
+and page machinery progress in the background. The native HOME placeholder is
+committed with JavaScript disabled, so it owns no otherwise-unused QuickJS
+realm; the configured global and per-site policy is applied at the boundary of
+the first real navigation. Profile settings, bookmarks, and HOME destinations
+are still loaded before the first frame because they define that native UI.
+
+Page fonts follow the same staged boundary, with one presentation invariant:
+the regular sans face used by native HOME is loaded before HOME's first frame,
+so its labels never change from bitmap fallback after becoming visible. This
+is the only page-font read on that boundary. Its metric-only counterpart loads
+during association wait frames. On the frame networking becomes ready, the
+highlighted built-in provider's preconnect takes precedence over any remaining
+font read. A navigation that outruns warm-up completes this two-face baseline
+before measuring text. Serif, italic, and bold faces are requested from the
+committed page's bounded draw-command census and load one at a time in 16 KiB
+idle slices. Navigation and rendering can pre-empt between slices. A newly
+arrived metric face triggers one transactional relayout before its first
+repaint, so fallback measurements never survive under the real glyph advances.
+
+Optional disk cache and local-storage restoration starts only after HOME is
+interactive. A transactional reader advances in bounded 16 KiB idle slices
+and publishes nothing until its checksum and record counts validate. Local
+storage finishes before the first real navigation can commit, preserving web
+storage semantics; cache restoration is expendable optimization work and is
+cancelled when navigation needs the transport or memory. If navigation cancels
+an unread cache snapshot, exit preserves that on-disk generation instead of
+rotating an empty live cache over it. Direct page boots restore both stores
+before author code, since they do not have a native HOME idle window.
+
+Five tabs retain navigation,
 scroll, focus, find, and thumbnail facts; only one engine page graph is live.
 Optional tab hibernation and session restore serialize bounded navigation
 facts, never a DOM or JavaScript heap.

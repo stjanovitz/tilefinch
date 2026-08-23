@@ -172,7 +172,8 @@ bool browser_session_init(BrowserSession *session, Budget *budget,
     session->accounting_bytes = sizeof(session->storage)
                                 + sizeof(session->cookies)
                                 + sizeof(session->cache)
-                                + sizeof(session->site_adapter_state);
+                                + sizeof(session->site_adapter_state)
+                                + sizeof(session->site_adapter_document_cache);
     if (!budget_reservation_acquire(
             &session->accounting_reservation, budget,
             BUDGET_CATEGORY_SESSION, session->accounting_bytes)) {
@@ -236,6 +237,165 @@ bool browser_session_site_adapter_state_get(
     memcpy(data, state->data, state->length);
     if (data_length != NULL) *data_length = state->length;
     return true;
+}
+
+static void site_adapter_document_cache_remove(
+    BrowserSession *session, BrowserSiteAdapterDocumentCacheEntry *entry)
+{
+    if (session == NULL || entry == NULL) return;
+    budget_free(session->budget, entry->key);
+    budget_free(session->budget, entry->data);
+    memset(entry, 0, sizeof(*entry));
+}
+
+void browser_session_site_adapter_document_cache_clear(
+    BrowserSession *session)
+{
+    if (session == NULL || session->budget == NULL) return;
+    for (size_t i = 0;
+         i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++) {
+        site_adapter_document_cache_remove(
+            session, &session->site_adapter_document_cache[i]);
+    }
+    session->site_adapter_document_clock = 0;
+}
+
+bool browser_session_site_adapter_document_cache_put(
+    BrowserSession *session, const char *adapter, const char *key,
+    uint32_t variant, const TilefinchRequestContext *authority_context,
+    const void *data, size_t data_length,
+    size_t source_bytes, size_t result_count, long status_code,
+    const char *server, const char *cf_mitigated, uint64_t now_ns)
+{
+    if (session == NULL || session->budget == NULL || adapter == NULL
+        || key == NULL || authority_context == NULL
+        || data == NULL || data_length == 0
+        || data_length > BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRY_LIMIT
+        || strnlen(adapter, BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ADAPTER_LIMIT)
+               >= BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ADAPTER_LIMIT) {
+        return false;
+    }
+    uint64_t authority_fingerprint = 0;
+    if (!browser_session_cookie_header_fingerprint_context(
+            session, authority_context, &authority_fingerprint)) return false;
+    size_t key_length = strnlen(
+        key, BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_KEY_LIMIT);
+    if (key_length >= BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_KEY_LIMIT)
+        return false;
+    size_t matching = BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES;
+    size_t first_free = BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES;
+    size_t victim = BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES;
+    size_t oldest = SIZE_MAX;
+    for (size_t i = 0;
+         i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++) {
+        BrowserSiteAdapterDocumentCacheEntry *entry =
+            &session->site_adapter_document_cache[i];
+        if (entry->valid && entry->variant == variant
+            && strcmp(entry->adapter, adapter) == 0
+            && strcmp(entry->key, key) == 0) {
+            matching = i;
+            break;
+        }
+        if (!entry->valid) {
+            if (first_free >= BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES)
+                first_free = i;
+            continue;
+        }
+        if (entry->last_used < oldest) {
+            oldest = entry->last_used;
+            victim = i;
+        }
+    }
+    if (matching < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES) {
+        victim = matching;
+    } else if (first_free < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES) {
+        victim = first_free;
+    }
+    if (victim >= BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES) {
+        return false;
+    }
+    BrowserSiteAdapterDocumentCacheEntry *entry =
+        &session->site_adapter_document_cache[victim];
+    /* A full cache may evict before allocating the replacement: this avoids
+       requiring enough budget for a transient third 96 KiB document. Exact-key
+       replacement keeps the old value until both new copies are admitted. */
+    if (entry->valid
+        && matching >= BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES) {
+        site_adapter_document_cache_remove(session, entry);
+    }
+    char *key_copy = budget_malloc_category(
+        session->budget, BUDGET_CATEGORY_SESSION, key_length + 1u);
+    unsigned char *data_copy = budget_malloc_category(
+        session->budget, BUDGET_CATEGORY_SESSION, data_length);
+    if (key_copy == NULL || data_copy == NULL) {
+        budget_free(session->budget, key_copy);
+        budget_free(session->budget, data_copy);
+        return false;
+    }
+    memcpy(key_copy, key, key_length + 1u);
+    memcpy(data_copy, data, data_length);
+    if (entry->valid) site_adapter_document_cache_remove(session, entry);
+    *entry = (BrowserSiteAdapterDocumentCacheEntry) {
+        .key = key_copy,
+        .data = data_copy,
+        .length = data_length,
+        .source_bytes = source_bytes,
+        .result_count = result_count,
+        .stored_at_ns = now_ns,
+        .cookie_fingerprint = authority_fingerprint,
+        .last_used = ++session->site_adapter_document_clock,
+        .variant = variant,
+        .status_code = status_code,
+        .valid = true
+    };
+    snprintf(entry->adapter, sizeof(entry->adapter), "%s", adapter);
+    snprintf(entry->server, sizeof(entry->server), "%s",
+             server == NULL ? "" : server);
+    snprintf(entry->cf_mitigated, sizeof(entry->cf_mitigated), "%s",
+             cf_mitigated == NULL ? "" : cf_mitigated);
+    return true;
+}
+
+bool browser_session_site_adapter_document_cache_get(
+    BrowserSession *session, const char *adapter, const char *key,
+    uint32_t variant, const TilefinchRequestContext *authority_context,
+    uint64_t now_ns, uint64_t maximum_age_ns,
+    BrowserSiteAdapterDocumentCacheView *view)
+{
+    if (view != NULL) *view = (BrowserSiteAdapterDocumentCacheView) {0};
+    if (session == NULL || session->budget == NULL || adapter == NULL
+        || key == NULL || authority_context == NULL || view == NULL)
+        return false;
+    uint64_t fingerprint = 0;
+    if (!browser_session_cookie_header_fingerprint_context(
+            session, authority_context, &fingerprint)) return false;
+    for (size_t i = 0;
+         i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++) {
+        BrowserSiteAdapterDocumentCacheEntry *entry =
+            &session->site_adapter_document_cache[i];
+        if (!entry->valid || entry->variant != variant
+            || strcmp(entry->adapter, adapter) != 0
+            || strcmp(entry->key, key) != 0) continue;
+        bool expired = maximum_age_ns != 0
+            && (now_ns < entry->stored_at_ns
+                || now_ns - entry->stored_at_ns > maximum_age_ns);
+        if (expired || entry->cookie_fingerprint != fingerprint) {
+            site_adapter_document_cache_remove(session, entry);
+            return false;
+        }
+        entry->last_used = ++session->site_adapter_document_clock;
+        *view = (BrowserSiteAdapterDocumentCacheView) {
+            .data = entry->data,
+            .length = entry->length,
+            .source_bytes = entry->source_bytes,
+            .result_count = entry->result_count,
+            .status_code = entry->status_code,
+            .server = entry->server,
+            .cf_mitigated = entry->cf_mitigated
+        };
+        return true;
+    }
+    return false;
 }
 
 void browser_session_site_adapter_state_remove(
@@ -815,10 +975,11 @@ static bool cookie_string(const BrowserCookieStore *store, const char *url,
                           const TilefinchRequestContext *request,
                           const TilefinchRequestFacts *facts,
                           bool include_http_only, char *output,
-                          size_t output_capacity)
+                          size_t output_capacity, uint64_t *fingerprint)
 {
-    if (store == NULL || store->cookies == NULL || output == NULL
-        || output_capacity == 0) return false;
+    bool writing = output != NULL && output_capacity != 0;
+    if (store == NULL || store->cookies == NULL
+        || (!writing && fingerprint == NULL)) return false;
     CookieURL parsed;
     if (!parse_cookie_url(url, &parsed)) return false;
     size_t used = 0;
@@ -839,7 +1000,8 @@ static bool cookie_string(const BrowserCookieStore *store, const char *url,
     bool lax_allowed = request == NULL
         || (facts != NULL ? facts->allows_lax_cookie
                           : tilefinch_request_allows_lax_cookie(request));
-    output[0] = '\0';
+    if (writing) output[0] = '\0';
+    uint64_t hash = UINT64_C(1469598103934665603);
     size_t candidates[BROWSER_COOKIE_ENTRIES];
     size_t candidate_count = 0;
     for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {
@@ -891,19 +1053,30 @@ static bool cookie_string(const BrowserCookieStore *store, const char *url,
         size_t name_length = strlen(entry->name);
         size_t needed = (used == 0 ? 0 : 2) + name_length + 1
                         + entry->value_length;
-        if (needed >= output_capacity - used) {
+        if (writing && needed >= output_capacity - used) {
             /* Callers may deliberately treat cookie construction failure as
                an empty Cookie header. Never leave a sendable partial prefix. */
             output[0] = '\0';
             return false;
         }
-        if (used != 0) { output[used++] = ';'; output[used++] = ' '; }
-        memcpy(output + used, entry->name, name_length); used += name_length;
-        output[used++] = '=';
-        memcpy(output + used, entry->value, entry->value_length);
-        used += entry->value_length;
-        output[used] = '\0';
+        if (fingerprint != NULL) {
+            static const char separator[] = "; ";
+            if (candidate != 0)
+                hash = session_hash_bytes(hash, separator, 2);
+            hash = session_hash_bytes(hash, entry->name, name_length);
+            hash = session_hash_bytes(hash, "=", 1);
+            hash = session_hash_bytes(hash, entry->value, entry->value_length);
+        }
+        if (writing) {
+            if (used != 0) { output[used++] = ';'; output[used++] = ' '; }
+            memcpy(output + used, entry->name, name_length); used += name_length;
+            output[used++] = '=';
+            memcpy(output + used, entry->value, entry->value_length);
+            used += entry->value_length;
+            output[used] = '\0';
+        }
     }
+    if (fingerprint != NULL) *fingerprint = hash;
     return true;
 }
 
@@ -919,7 +1092,7 @@ bool browser_session_cookie_get(const BrowserSession *session,
     BrowserCookieStore store = browser_session_cookie_store(
         (BrowserSession *) session);
     return cookie_string(
-        &store, url, NULL, NULL, false, output, output_capacity);
+        &store, url, NULL, NULL, false, output, output_capacity, NULL);
 }
 
 bool browser_session_cookie_header(const BrowserSession *session,
@@ -940,7 +1113,7 @@ bool browser_session_cookie_header(const BrowserSession *session,
     BrowserCookieStore store = browser_session_cookie_store(
         (BrowserSession *) session);
     return cookie_string(&store, url, &context, NULL, true, output,
-                         output_capacity);
+                         output_capacity, NULL);
 }
 
 bool browser_session_cookie_header_context(
@@ -979,7 +1152,26 @@ bool browser_session_cookie_header_request_facts(
         (BrowserSession *) session);
     return cookie_string(
         &store, context->target_url, context, facts, true,
-        output, output_capacity);
+        output, output_capacity, NULL);
+}
+
+bool browser_session_cookie_header_fingerprint_context(
+    const BrowserSession *session, const TilefinchRequestContext *context,
+    uint64_t *fingerprint)
+{
+    if (fingerprint != NULL) *fingerprint = 0;
+    TilefinchRequestFacts facts;
+    if (session == NULL || context == NULL || fingerprint == NULL
+        || !tilefinch_request_context_analyze(context, &facts)) return false;
+    if (!session->site_data_allowed || !facts.sends_credentials) {
+        *fingerprint = UINT64_C(1469598103934665603);
+        return true;
+    }
+    BrowserCookieStore store = browser_session_cookie_store(
+        (BrowserSession *) session);
+    return cookie_string(
+        &store, context->target_url, context, &facts, true,
+        NULL, 0, fingerprint);
 }
 
 /* Creation order is observable when paths have equal specificity. If a long
@@ -1532,6 +1724,7 @@ void browser_session_cookie_clear(BrowserSession *session)
     session->cookie_clock = 0;
     memset(&session->site_adapter_state, 0,
            sizeof(session->site_adapter_state));
+    browser_session_site_adapter_document_cache_clear(session);
 }
 
 BrowserCookieOverlay *browser_session_cookie_overlay_create(
@@ -1609,7 +1802,7 @@ bool browser_cookie_overlay_header_context(
     BrowserCookieStore store = browser_overlay_cookie_store(
         (BrowserCookieOverlay *) overlay);
     return cookie_string(&store, context->target_url, context, NULL, true,
-                         output, output_capacity);
+                         output, output_capacity, NULL);
 }
 
 bool browser_cookie_overlay_set_http_context(
@@ -3357,6 +3550,23 @@ size_t browser_session_cache_reclaim(BrowserSession *session,
         size_t after = budget_remaining(session->budget);
         reclaimed = after > before ? after - before : 0;
     }
+    while (reclaimed < target_bytes) {
+        BrowserSiteAdapterDocumentCacheEntry *victim = NULL;
+        for (size_t i = 0;
+             i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++) {
+            BrowserSiteAdapterDocumentCacheEntry *candidate =
+                &session->site_adapter_document_cache[i];
+            if (candidate->valid
+                && (victim == NULL
+                    || candidate->last_used < victim->last_used)) {
+                victim = candidate;
+            }
+        }
+        if (victim == NULL) break;
+        site_adapter_document_cache_remove(session, victim);
+        size_t after = budget_remaining(session->budget);
+        reclaimed = after > before ? after - before : 0;
+    }
     return reclaimed;
 }
 
@@ -3390,6 +3600,7 @@ void browser_session_cache_clear(BrowserSession *session)
     for (size_t i = 0; i < BROWSER_CACHE_ENTRIES; i++) {
         cache_remove(session, &session->cache[i]);
     }
+    browser_session_site_adapter_document_cache_clear(session);
     session->clock = 0;
 }
 
@@ -3406,6 +3617,7 @@ void browser_session_destroy(BrowserSession *session)
     for (size_t i = 0; i < BROWSER_CACHE_ENTRIES; i++) {
         cache_remove(session, &session->cache[i]);
     }
+    browser_session_site_adapter_document_cache_clear(session);
     budget_reservation_release(&session->accounting_reservation);
     memset(session, 0, sizeof(*session));
 }

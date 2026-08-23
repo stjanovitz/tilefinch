@@ -2965,11 +2965,14 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
     if (!style_resolve_value(sheet, text, length, resolved, sizeof(resolved),
                              0)) return false;
     length = strlen(resolved);
-    /* Split into top-level layers and remember the last one holding a url,
+    /* Split into top-level layers and remember the last one holding a URL,
        tracking parentheses and quotes so a comma inside url()/rgb() or a
-       quoted string never splits a layer. */
+       quoted string never splits a layer. Each layer is then tokenized once
+       more so a standard one-layer shorthand such as
+       `background:#222 linear-gradient(...)` retains both components. */
     size_t layer_count = 0;
     size_t chosen_start = 0, chosen_end = 0;
+    size_t chosen_image_start = 0, chosen_image_end = 0;
     size_t chosen_layer = SIZE_MAX;
     bool chosen_found = false;
     size_t gradient_count = 0;
@@ -2997,21 +3000,59 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
             retained.gradient = (StyleGradient) {0};
             stack.backgrounds[layer_index] = retained;
         }
-        StyleGradient candidate = {0};
-        if (style_parse_gradient(sheet, resolved + seg_start,
-                                 seg_end - seg_start, &candidate)) {
-            gradient_count++;
-            if (layer_index < STYLE_PAINT_LAYER_LIMIT) {
-                StylePaintLayer *paint = &stack.backgrounds[layer_index];
-                paint->kind = STYLE_PAINT_IMAGE_GRADIENT;
-                paint->gradient = candidate;
-                stack.background_count = (uint8_t) (layer_index + 1u);
+        bool layer_image_found = false;
+        for (size_t at = seg_start; at < seg_end;) {
+            while (at < seg_end
+                   && isspace((unsigned char) resolved[at])) at++;
+            if (at == seg_end) break;
+            size_t token_start = at;
+            unsigned depth = 0;
+            char quote = 0;
+            while (at < seg_end) {
+                char c = resolved[at];
+                if (quote != 0) {
+                    if (c == quote) quote = 0;
+                    at++;
+                    continue;
+                }
+                if (c == '\'' || c == '"') {
+                    quote = c;
+                    at++;
+                    continue;
+                }
+                if (c == '(') depth++;
+                else if (c == ')' && depth != 0) depth--;
+                else if (depth == 0 && isspace((unsigned char) c)) break;
+                at++;
             }
-        }
-        for (size_t i = seg_start; i + 4 <= seg_end; i++) {
-            if (memcmp(resolved + i, "url(", 4) == 0) {
+            size_t token_length = at - token_start;
+            if (token_length == 0) continue;
+            StyleGradient candidate = {0};
+            if (style_parse_gradient(
+                    sheet, resolved + token_start, token_length,
+                    &candidate)) {
+                if (layer_image_found) return false;
+                layer_image_found = true;
+                gradient_count++;
+                if (layer_index < STYLE_PAINT_LAYER_LIMIT) {
+                    StylePaintLayer *paint =
+                        &stack.backgrounds[layer_index];
+                    paint->kind = STYLE_PAINT_IMAGE_GRADIENT;
+                    paint->gradient = candidate;
+                    stack.background_count =
+                        (uint8_t) (layer_index + 1u);
+                }
+                continue;
+            }
+            if (token_length >= 4
+                && strncasecmp(
+                       resolved + token_start, "url(", 4) == 0) {
+                if (layer_image_found) return false;
+                layer_image_found = true;
                 chosen_start = seg_start;
                 chosen_end = seg_end;
+                chosen_image_start = token_start;
+                chosen_image_end = at;
                 chosen_layer = layer_index;
                 chosen_found = true;
                 if (layer_index < STYLE_PAINT_LAYER_LIMIT) {
@@ -3019,8 +3060,8 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
                         &stack.backgrounds[layer_index];
                     const char *url = NULL;
                     if (style_parse_image_url(
-                            sheet, resolved + seg_start,
-                            seg_end - seg_start, &url)) {
+                            sheet, resolved + token_start,
+                            token_length, &url)) {
                         paint->kind = url == NULL
                             ? STYLE_PAINT_IMAGE_NONE
                             : STYLE_PAINT_IMAGE_URL;
@@ -3029,7 +3070,6 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
                             (uint8_t) (layer_index + 1u);
                     }
                 }
-                break;
             }
         }
         if (layer_index < STYLE_PAINT_LAYER_LIMIT
@@ -3039,7 +3079,8 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
                 &stack.backgrounds[layer_index]);
         }
     }
-    if (layer_count < 2) return false;
+    if (layer_count < 2 && !reset_geometry) return false;
+    if (!chosen_found && gradient_count == 0) return false;
     if (!chosen_found && gradient_count != 0) {
         style->background_image_kind = STYLE_BACKGROUND_IMAGE_GRADIENT;
     }
@@ -3051,8 +3092,9 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
     }
     const char *layer = resolved + chosen_start;
     size_t layer_length = chosen_end - chosen_start;
-    (void) style_parse_image_url(sheet, layer, layer_length,
-                                 &style->background_image);
+    (void) style_parse_image_url(
+        sheet, resolved + chosen_image_start,
+        chosen_image_end - chosen_image_start, &style->background_image);
     /* Under the three-layer PSP cap, preserve a trailing authored bitmap
        rather than spending every retained slot on decorative gradients.
        Hero art and sprites are commonly the final layer beneath several
@@ -3103,6 +3145,32 @@ bool style_parse_background_shorthand_image(Stylesheet *sheet,
         if (token_length == 0) continue;
         if (token_length == 1 && token[0] == '/') { after_slash = true; continue; }
         if (token_length >= 4 && memcmp(token, "url(", 4) == 0) continue;
+        const char *slash = memchr(token, '/', token_length);
+        if (slash != NULL) {
+            size_t before_length = (size_t) (slash - token);
+            const char *after = slash + 1;
+            size_t after_length = token_length - before_length - 1u;
+            if (before_length != 0
+                && (background_position_keyword(token, before_length)
+                    || background_length_token(token, before_length))) {
+                if (position_length != 0
+                    && position_length + 1 < sizeof(position)) {
+                    position[position_length++] = ' ';
+                }
+                if (position_length + before_length < sizeof(position)) {
+                    memcpy(position + position_length, token, before_length);
+                    position_length += before_length;
+                }
+            }
+            if (after_length == 5 && memcmp(after, "cover", 5) == 0) {
+                style->background_fit = 1;
+            } else if (after_length == 7
+                       && memcmp(after, "contain", 7) == 0) {
+                style->background_fit = 2;
+            }
+            after_slash = true;
+            continue;
+        }
         if (token_length == 5 && memcmp(token, "cover", 5) == 0) {
             style->background_fit = 1;
             continue;

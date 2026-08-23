@@ -386,17 +386,23 @@ static bool navigation_collect_layout_image_geometry(
     *count = 0;
     *visible_count = 0;
     if (layout == NULL || targets == NULL || capacity == 0) return false;
-    /* Keep visible boxes first, followed by below-fold boxes in layout order.
-       This preserves the first-render priority set while making the suffix a
-       directly copyable deferred queue. */
-    for (unsigned pass = 0; pass < 2; pass++) {
+    /* Keep visible eager boxes first, followed by below-fold eager boxes and
+       finally explicit lazy boxes in layout order.  The caller loads only the
+       first prefix before paint, while retaining the complete list as its
+       geometry-aware idle queue.  A visible loading=lazy image therefore
+       reserves the right box without silently becoming paint-blocking again. */
+    for (unsigned pass = 0; pass < 3; pass++) {
         for (size_t i = 0; i < layout->node_box_count; i++) {
             const LayoutNodeBox *box = &layout->node_boxes[i];
             if (box->node == NULL || !node_name_is(box->node, "img")
                 || box->width <= 0 || box->height <= 0) continue;
             bool visible = box->y < viewport_height
                 && (int64_t) box->y + box->height > 0;
-            if (visible != (pass == 0)) continue;
+            bool lazy = navigation_attribute_equals(
+                box->node, "loading", "lazy");
+            if ((pass == 0 && (!visible || lazy))
+                || (pass == 1 && (visible || lazy))
+                || (pass == 2 && !lazy)) continue;
             int width = layout_css_to_visual(layout, box->width);
             int height = layout_css_to_visual(layout, box->height);
             if (width <= 0 || height <= 0

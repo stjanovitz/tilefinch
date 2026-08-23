@@ -57,7 +57,7 @@ runtime assets or immutable engine data.
 - **libcurl 8.21.0**: curl license (MIT-style). The default PSP release
   cross-builds this hash-pinned official source archive inside the project;
   `TILEFINCH_PSP_TRANSPORT_MODE=LEGACY` is a non-release escape hatch.
-- **mbed TLS 3.6.6 LTS**: dual Apache-2.0 / GPL-2.0-or-later; Tilefinch
+- **mbed TLS 3.6.7 LTS**: dual Apache-2.0 / GPL-2.0-or-later; Tilefinch
   elects Apache-2.0. The default PSP release cross-builds the hash-pinned
   official source archive with a narrow PSP entropy/time portability patch
   (`patches/mbedtls-3.6.6-psp.patch`), plus an Allegrex bignum

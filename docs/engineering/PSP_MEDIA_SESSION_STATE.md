@@ -171,6 +171,12 @@ no-ops, not absent cases. Important non-obvious cells include:
 
 - `PAUSE` during priming, seeking, buffering, or recovery updates the resume
   target without violating an in-flight operation;
+- every `SEEK` carries the intended post-seek play/pause state; seeking while
+  playing therefore feeds the first new frame without requiring a second Play
+  input, while a seek from Pause remains paused;
+- `Seeking` projects a distinct UI fact from generic opening/priming: the
+  centre may report loading, but the committed scrubber and opaque footer stay
+  present across cooperative work slices and the first replacement frame;
 - `SEEK` during seeking re-enters it with a new generation;
 - `SEEK` during recovery records the newest target and starts it at the first
   safe recovery boundary;

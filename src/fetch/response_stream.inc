@@ -635,6 +635,7 @@ static void reset_response_metadata(FetchResult *result)
     result->server[0] = '\0';
     result->cf_ray[0] = '\0';
     result->tls_version[0] = '\0';
+    result->tls_peer_issuer[0] = '\0';
     result->redirect_origin_tainted = false;
     fetch_response_security_metadata_reset(&result->security);
     result->response_referrer_policy[0] = '\0';

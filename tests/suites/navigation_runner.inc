@@ -14,6 +14,13 @@ int main(void)
     RUN_TEST(test_background_images_continue_after_useful_paint);
     RUN_TEST(test_background_image_failure_retains_visible_prefix);
     RUN_TEST(test_static_images_retry_after_transient_idle_failure);
+    RUN_TEST(test_visible_lazy_static_image_waits_until_idle);
+    RUN_TEST(test_visible_lazy_pair_overlaps_transport_and_decode);
+    RUN_TEST(test_deferred_jpeg_decode_publishes_on_later_pump);
+    RUN_TEST(test_visible_lazy_queue_continues_after_first_pair);
+    RUN_TEST(test_focused_deferred_image_follows_active_pair);
+    RUN_TEST(test_deferred_image_focus_rotation_preserves_order);
+    RUN_TEST(test_visible_lazy_pair_retries_only_failed_suffix);
     RUN_TEST(test_failed_visible_image_retries_after_first_paint);
     RUN_TEST(test_web_fonts_begin_after_fallback_layout);
     RUN_TEST(test_streaming_preview_precedes_eof);

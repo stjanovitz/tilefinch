@@ -62,12 +62,20 @@ static bool test_ca_bundle_configuration(void)
 {
     Budget budget;
     budget_init(&budget, 2u * 1024u * 1024u);
+    uint32_t bundle_version = 0;
+    size_t bundle_length = 1;
+    uint8_t bundle_digest[TILEFINCH_CA_BUNDLE_SHA256_BYTES];
+    memset(bundle_digest, 0xa5, sizeof(bundle_digest));
     bool ok = fetch_transport_version() != NULL
         && fetch_transport_version()[0] != '\0'
         && fetch_transport_tls_version() != NULL
         && fetch_transport_tls_version()[0] != '\0'
         && fetch_transport_http2_version() != NULL
         && fetch_transport_http2_version()[0] != '\0'
+        && !fetch_ca_bundle_identity(
+               &bundle_version, &bundle_length, bundle_digest)
+        && bundle_version == TILEFINCH_CA_BUNDLE_VERSION
+        && bundle_length == 0 && bundle_digest[0] == 0
         && strcmp(fetch_http_version_name(0), "unknown") == 0
         && fetch_set_ca_bundle_path("/tmp/tilefinch-roots.pem")
         && fetch_ca_bundle_path() != NULL

@@ -14,6 +14,7 @@
 #define BROWSER_PROVISIONAL_FRAME_LIMIT 2u
 #define BROWSER_PROVISIONAL_FINAL_RESERVE (1u * MIB)
 #define BROWSER_PROVISIONAL_GROW_MAX_ALLOC_US UINT64_C(100000)
+#define BROWSER_FONT_IDLE_READ_BYTES (16u * KIB)
 
 typedef struct {
     NavigationLoad *load;
@@ -46,6 +47,8 @@ struct BrowserEngine {
     BrowserController controller;
     BrowserController candidate_controller;
     FontSet fonts;
+    FontFaceLoad *font_load;
+    FontSetFaceMask font_loading_face;
     TileCache render;
     TileCache candidate_render;
     uint16_t *provisional_frames;
@@ -62,6 +65,8 @@ struct BrowserEngine {
     bool session_ready;
     bool navigation_ready;
     bool fonts_ready;
+    FontSetFaceMask font_requested_faces;
+    FontSetFaceMask font_failed_faces;
     bool controller_ready;
     bool render_ready;
     bool candidate_controller_ready;
@@ -70,6 +75,7 @@ struct BrowserEngine {
     bool replacement_frame_frozen;
     bool forced_dark;
     bool youtube_compact_results;
+    bool autofocus_pending;
     size_t render_relayout_generation;
     size_t render_focus_paint_generation;
     size_t unchanged_runtime_frames_suppressed;
@@ -81,6 +87,9 @@ struct BrowserEngine {
     /* Compile-admission rejections already observed on the current page, so
        each rejection produces one warning event rather than one per frame. */
     size_t observed_compile_rejections;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    BrowserEngineCreationMetrics creation_metrics;
+#endif
     BrowserEngineNavigationWork navigation_work;
     char last_error[256];
 };
@@ -286,6 +295,181 @@ bool browser_config_set_font_paths(
     candidate.maximum_total_bytes = maximum_total_bytes;
     candidate.enabled = true;
     config->fonts = candidate;
+    return true;
+}
+
+void browser_config_set_staged_font_loading(
+    BrowserConfig *config, bool staged)
+{
+    if (config != NULL) config->fonts.staged_loading = staged;
+}
+
+static bool browser_engine_load_font_faces(
+    BrowserEngine *engine, FontSetFaceMask faces)
+{
+    if (engine == NULL || !engine->config.fonts.enabled) return false;
+    const BrowserFontConfig *fonts = &engine->config.fonts;
+    return font_set_load_selected(
+        &engine->fonts, &engine->budget, fonts->sans_path,
+        fonts->serif_path, fonts->sans_italic_path,
+        fonts->sans_bold_path, fonts->serif_bold_path,
+        fonts->metric_sans_path, fonts->metric_sans_bold_path,
+        fonts->maximum_total_bytes, faces);
+}
+
+#define BROWSER_BASELINE_FONT_FACES ((FontSetFaceMask) (                 \
+    FONT_SET_FACE_SANS | FONT_SET_FACE_METRIC_SANS))
+
+/* Built-in provider documents are authored by Tilefinch and have a stable
+   typography contract. Load the one page face they use before admitting the
+   navigation, so the committed document is never first shown with synthetic
+   bold metrics and then laid out again when idle work reaches the font. */
+#define BROWSER_PROVIDER_FONT_FACES ((FontSetFaceMask) (                 \
+    FONT_SET_FACE_SANS_BOLD | FONT_SET_FACE_METRIC_SANS_BOLD))
+
+bool browser_engine_prepare_native_home_font(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE)
+        return false;
+    if (!engine->config.fonts.enabled || engine->fonts.sans.loaded)
+        return true;
+    if ((engine->font_failed_faces & FONT_SET_FACE_SANS) != 0)
+        return false;
+    if (!browser_engine_load_font_faces(engine, FONT_SET_FACE_SANS)) {
+        /* Keep the fallback stable for this process if the one required file
+           is unavailable; the later baseline pump must not make HOME change
+           typography after the failure. */
+        engine->font_failed_faces |= FONT_SET_FACE_SANS;
+        return false;
+    }
+    return true;
+}
+
+const FontFace *browser_engine_native_home_font(const BrowserEngine *engine)
+{
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+            && engine->fonts.sans.loaded
+        ? &engine->fonts.sans : NULL;
+}
+
+bool browser_engine_baseline_fonts_ready(const BrowserEngine *engine)
+{
+    return engine != NULL
+        && (!engine->config.fonts.enabled || engine->fonts_ready);
+}
+
+bool browser_engine_pump_baseline_fonts(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE)
+        return false;
+    if (!engine->config.fonts.enabled) return true;
+    if (engine->fonts_ready) return true;
+    if ((engine->font_failed_faces & BROWSER_BASELINE_FONT_FACES) != 0)
+        return false;
+    const FontSetFaceMask order[] = {
+        FONT_SET_FACE_SANS, FONT_SET_FACE_METRIC_SANS
+    };
+    FontSetFaceMask loaded = 0;
+    if (engine->fonts.sans.loaded) loaded |= FONT_SET_FACE_SANS;
+    if (engine->fonts.metric_sans.loaded)
+        loaded |= FONT_SET_FACE_METRIC_SANS;
+    for (size_t at = 0; at < sizeof(order) / sizeof(order[0]); at++) {
+        if ((loaded & order[at]) != 0) continue;
+        if (!browser_engine_load_font_faces(engine, order[at])) {
+            engine->font_failed_faces |= order[at];
+            return false;
+        }
+        loaded |= order[at];
+        break;
+    }
+    engine->fonts_ready =
+        (loaded & BROWSER_BASELINE_FONT_FACES)
+            == BROWSER_BASELINE_FONT_FACES;
+    return true;
+}
+
+static bool browser_engine_ensure_baseline_fonts(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->config.fonts.enabled) return true;
+    while (!engine->fonts_ready) {
+        if (!browser_engine_pump_baseline_fonts(engine)) return false;
+    }
+    return true;
+}
+
+static FontSetFaceMask browser_engine_loaded_font_faces(
+    const BrowserEngine *engine)
+{
+    if (engine == NULL) return 0;
+    FontSetFaceMask loaded = 0;
+    if (engine->fonts.sans.loaded) loaded |= FONT_SET_FACE_SANS;
+    if (engine->fonts.serif.loaded) loaded |= FONT_SET_FACE_SERIF;
+    if (engine->fonts.sans_italic.loaded)
+        loaded |= FONT_SET_FACE_SANS_ITALIC;
+    if (engine->fonts.sans_bold.loaded) loaded |= FONT_SET_FACE_SANS_BOLD;
+    if (engine->fonts.serif_bold.loaded)
+        loaded |= FONT_SET_FACE_SERIF_BOLD;
+    if (engine->fonts.metric_sans.loaded)
+        loaded |= FONT_SET_FACE_METRIC_SANS;
+    if (engine->fonts.metric_sans_bold.loaded)
+        loaded |= FONT_SET_FACE_METRIC_SANS_BOLD;
+    return loaded;
+}
+
+bool browser_engine_prepare_navigation_fonts(
+    BrowserEngine *engine, const char *method, const char *url)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || method == NULL || url == NULL) return false;
+    if (!browser_engine_ensure_baseline_fonts(engine)) return false;
+    if (!site_adapter_navigation_requires_stable_typography(method, url)
+        || !engine->config.fonts.enabled) return true;
+
+    FontSetFaceMask requested = BROWSER_PROVIDER_FONT_FACES;
+    engine->font_requested_faces |= requested;
+    FontSetFaceMask missing = requested
+        & (FontSetFaceMask) ~(browser_engine_loaded_font_faces(engine)
+                             | engine->font_failed_faces);
+    if (missing == 0) return true;
+
+    /* Navigation already suppresses optional idle work. Drop any partial
+       staging allocation as well, otherwise it can make the trusted provider
+       face lose an otherwise-valid bounded-budget admission. */
+    if (engine->font_load != NULL) {
+        font_face_load_destroy(engine->font_load);
+        engine->font_load = NULL;
+        engine->font_loading_face = 0;
+    }
+
+    FontSetFaceMask loaded_before = browser_engine_loaded_font_faces(engine);
+    const FontSetFaceMask order[] = {
+        FONT_SET_FACE_SANS_BOLD, FONT_SET_FACE_METRIC_SANS_BOLD
+    };
+    for (size_t at = 0; at < sizeof(order) / sizeof(order[0]); at++) {
+        FontSetFaceMask face = order[at];
+        if ((missing & face) == 0) continue;
+        if (!browser_engine_load_font_faces(engine, face)) {
+            /* Optional faces fail stable: keep the fallback for the whole
+               document instead of revealing a late metric transition. */
+            engine->font_failed_faces |= face;
+        }
+    }
+    FontSetFaceMask loaded_after = browser_engine_loaded_font_faces(engine);
+    FontSetFaceMask newly_loaded = loaded_after
+        & (FontSetFaceMask) ~loaded_before;
+    if (newly_loaded == 0) return true;
+
+    /* A still-visible incumbent may also use bold text. Keep rollback pixels
+       and geometry coherent before the candidate begins. */
+    if ((newly_loaded & FONT_SET_FACE_SANS_BOLD) != 0
+        && engine->navigation.page.loaded
+        && !navigation_relayout(&engine->navigation)) {
+        font_face_destroy(&engine->fonts.sans_bold);
+        engine->font_failed_faces |= FONT_SET_FACE_SANS_BOLD;
+        newly_loaded &= (FontSetFaceMask) ~FONT_SET_FACE_SANS_BOLD;
+    }
+    if (engine->render_ready && newly_loaded != 0)
+        tile_cache_invalidate_glyphs(&engine->render);
     return true;
 }
 
@@ -1106,6 +1290,16 @@ static bool browser_engine_configure_navigation(BrowserEngine *engine)
 BrowserEngine *browser_engine_create(const BrowserConfig *config,
                                      char *error, size_t error_capacity)
 {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t create_started_us = tilefinch_platform_monotonic_time_us();
+    BrowserEngineCreationMetrics create_metrics = {0};
+#define BROWSER_ENGINE_CREATE_MARK(member_name) do { \
+    uint64_t create_now_us = tilefinch_platform_monotonic_time_us(); \
+    create_metrics.member_name = create_now_us - create_started_us; \
+} while (0)
+#else
+#define BROWSER_ENGINE_CREATE_MARK(member_name) do {} while (0)
+#endif
     if (!browser_config_validate(config, error, error_capacity)) return NULL;
     if (active_engine != NULL) {
         copy_error(error, error_capacity,
@@ -1133,6 +1327,7 @@ BrowserEngine *browser_engine_create(const BrowserConfig *config,
         goto failed;
     }
     active_engine = engine;
+    BROWSER_ENGINE_CREATE_MARK(control_ready_us);
 
     if (!browser_session_init(&engine->session, &engine->budget,
                               config->session_cache_limit)) {
@@ -1143,6 +1338,7 @@ BrowserEngine *browser_engine_create(const BrowserConfig *config,
         goto failed;
     }
     engine->session_ready = true;
+    BROWSER_ENGINE_CREATE_MARK(session_ready_us);
     engine->content_blocker = content_blocker_create(&engine->budget);
     if (engine->content_blocker == NULL) {
         set_error_code(engine, TILEFINCH_SUBSYSTEM_STORAGE,
@@ -1152,6 +1348,7 @@ BrowserEngine *browser_engine_create(const BrowserConfig *config,
         goto failed;
     }
     engine->session.content_blocker = engine->content_blocker;
+    BROWSER_ENGINE_CREATE_MARK(blocker_ready_us);
     if (!navigation_init(&engine->navigation, &engine->budget,
                          config->history_capacity)) {
         set_error_code(engine, TILEFINCH_SUBSYSTEM_ENGINE,
@@ -1161,8 +1358,9 @@ BrowserEngine *browser_engine_create(const BrowserConfig *config,
     }
     engine->navigation_ready = true;
     if (!browser_engine_configure_navigation(engine)) goto failed;
+    BROWSER_ENGINE_CREATE_MARK(navigation_ready_us);
 
-    if (config->fonts.enabled) {
+    if (config->fonts.enabled && !config->fonts.staged_loading) {
         const BrowserFontConfig *fonts = &config->fonts;
         if (!font_set_load(
                 &engine->fonts, &engine->budget, fonts->sans_path,
@@ -1177,6 +1375,7 @@ BrowserEngine *browser_engine_create(const BrowserConfig *config,
         }
         engine->fonts_ready = true;
     }
+    BROWSER_ENGINE_CREATE_MARK(fonts_ready_us);
 
     if (config->tile_capacity != 0) {
         engine->framebuffer_pixels =
@@ -1193,12 +1392,17 @@ BrowserEngine *browser_engine_create(const BrowserConfig *config,
             goto failed;
         }
     }
+    BROWSER_ENGINE_CREATE_MARK(framebuffer_ready_us);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    engine->creation_metrics = create_metrics;
+#endif
     (void) emit_diagnostic(
         engine, TILEFINCH_DIAGNOSTIC_INFO,
         TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_LIFECYCLE,
         "engine-created", config->device.name, config->memory_limit,
         engine->framebuffer_pixels * sizeof(*engine->framebuffer));
     copy_error(error, error_capacity, "");
+#undef BROWSER_ENGINE_CREATE_MARK
     return engine;
 
 failed: {
@@ -1208,6 +1412,20 @@ failed: {
         copy_error(error, error_capacity, retained);
         return NULL;
     }
+}
+
+bool browser_engine_creation_metrics(
+    const BrowserEngine *engine, BrowserEngineCreationMetrics *metrics)
+{
+    if (metrics != NULL) *metrics = (BrowserEngineCreationMetrics) {0};
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (engine == NULL || metrics == NULL) return false;
+    *metrics = engine->creation_metrics;
+    return true;
+#else
+    (void) engine;
+    return false;
+#endif
 }
 
 bool browser_engine_set_javascript_enabled(
@@ -1242,6 +1460,17 @@ bool browser_engine_shutdown(BrowserEngine *engine)
             && budget_active_allocations(&engine->budget, NULL) == 0;
     }
     browser_engine_cancel_navigation(engine, "browser engine shutdown");
+    /* A page cancellation only invalidates the JPEG completion token; it
+       deliberately never waits on entropy decoding. Engine teardown is the
+       ownership boundary that must join the worker before destroying the
+       page Budget and its retained encoded body. */
+    if (!images_decode_worker_shutdown(&engine->budget)) {
+        set_error_code(engine, TILEFINCH_SUBSYSTEM_ENGINE,
+                       TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED,
+                       "image-worker-shutdown",
+                       "JPEG worker did not quiesce before teardown");
+        return false;
+    }
     browser_engine_find_clear(engine);
     if (engine->navigation_ready)
         document_backing_uninstall(&engine->navigation);
@@ -1257,7 +1486,11 @@ bool browser_engine_shutdown(BrowserEngine *engine)
         navigation_destroy(&engine->navigation);
     }
     engine->navigation_ready = false;
-    if (engine->fonts_ready) font_set_destroy(&engine->fonts);
+    font_face_load_destroy(engine->font_load);
+    engine->font_load = NULL;
+    engine->font_loading_face = 0;
+    if (font_set_loaded_bytes(&engine->fonts) != 0)
+        font_set_destroy(&engine->fonts);
     engine->fonts_ready = false;
     if (engine->session_ready) engine->session.content_blocker = NULL;
     content_blocker_destroy(engine->content_blocker);
@@ -1303,6 +1536,12 @@ const BrowserConfig *browser_engine_config(const BrowserEngine *engine)
 const char *browser_engine_last_error(const BrowserEngine *engine)
 {
     return engine == NULL ? "browser engine is null" : engine->last_error;
+}
+
+long browser_engine_last_tls_verify_result(const BrowserEngine *engine)
+{
+    return engine == NULL || !engine->navigation_ready
+        ? 0 : engine->navigation.last_tls_verify_result;
 }
 
 TilefinchDiagnosticCode browser_engine_last_diagnostic_code(
@@ -1673,32 +1912,112 @@ static void browser_engine_navigation_restore_view(
         &engine->navigation, work->restore_scroll_y);
 }
 
-static bool browser_engine_node_has_autofocus(lxb_dom_node_t *node)
+static lxb_dom_node_t *browser_engine_attribute_owner(
+    lxb_dom_node_t *node, const lxb_char_t *name, size_t name_length)
 {
-    return node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
-        && lxb_dom_element_has_attribute(
-            lxb_dom_interface_element(node),
-            (const lxb_char_t *) "autofocus", 9);
+    /* Inline layout can associate a link region with the nested image/span
+       that produced its box rather than with the authored anchor. Walk only
+       the small inline ancestry needed to recover attributes on that anchor;
+       never turn autofocus/provider inspection into a document traversal. */
+    for (unsigned depth = 0; node != NULL && depth < 8u;
+         depth++, node = node->parent) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && lxb_dom_element_has_attribute(
+                lxb_dom_interface_element(node), name, name_length)) {
+            return node;
+        }
+    }
+    return NULL;
 }
 
-static void browser_engine_apply_autofocus(BrowserEngine *engine)
+static lxb_dom_node_t *browser_engine_autofocus_target(
+    const BrowserEngine *engine)
 {
-    if (engine == NULL) return;
+    if (engine == NULL) return NULL;
     const LayoutDocument *layout = &engine->navigation.page.layout;
     for (size_t at = 0; at < layout->link_count; at++) {
         lxb_dom_node_t *node = layout->links[at].node;
-        if (node != NULL && browser_engine_node_has_autofocus(node)) {
-            (void) controller_focus_node(&engine->controller, node);
-            return;
-        }
+        lxb_dom_node_t *owner = browser_engine_attribute_owner(
+            node, (const lxb_char_t *) "autofocus", 9u);
+        if (owner != NULL) return owner;
     }
     for (size_t at = 0; at < layout->control_count; at++) {
         lxb_dom_node_t *node = layout->controls[at].node;
-        if (node != NULL && browser_engine_node_has_autofocus(node)) {
-            (void) controller_focus_node(&engine->controller, node);
-            return;
+        lxb_dom_node_t *owner = browser_engine_attribute_owner(
+            node, (const lxb_char_t *) "autofocus", 9u);
+        if (owner != NULL) return owner;
+    }
+    return NULL;
+}
+
+static bool browser_engine_apply_autofocus(BrowserEngine *engine)
+{
+    lxb_dom_node_t *target = browser_engine_autofocus_target(engine);
+    if (target == NULL) return false;
+    return controller_focus_node(&engine->controller, target);
+}
+
+static void browser_engine_apply_or_defer_autofocus(BrowserEngine *engine)
+{
+    lxb_dom_node_t *target = browser_engine_autofocus_target(engine);
+    if (target != NULL)
+        (void) controller_focus_node(&engine->controller, target);
+    /* The commit layout can precede the first bounded font/resource relayout.
+       Keep one obligation through idle settling even when the initial target
+       is not represented by a focus region yet. This is not standing work:
+       the retry clears itself once the first settled layout has been
+       inspected. */
+    engine->autofocus_pending =
+        engine->navigation.page.document.autofocus_attribute_present;
+}
+
+static bool browser_engine_retry_deferred_autofocus(
+    BrowserEngine *engine, bool layout_still_settling)
+{
+    if (engine == NULL || !engine->autofocus_pending
+        || browser_engine_navigation_pending(engine)) return false;
+    lxb_dom_node_t *target = browser_engine_autofocus_target(engine);
+    if (target == NULL) {
+        if (!layout_still_settling)
+            engine->autofocus_pending = false;
+        return false;
+    }
+    if (!controller_focus_node(&engine->controller, target)) return false;
+    engine->autofocus_pending = false;
+    return true;
+}
+
+static void browser_engine_census_page_fonts(BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->navigation.page.loaded) return;
+    const NavigationEntry *entry = navigation_current(&engine->navigation);
+    if (entry != NULL
+        && site_adapter_handles_navigation("GET", entry->url)
+        && !site_adapter_navigation_requires_stable_typography(
+               "GET", entry->url)) {
+        /* Provider entry surfaces intentionally stay on the baseline pair:
+           the search control becomes usable immediately and no idle-time
+           face arrival can visibly move it underneath the user. */
+        return;
+    }
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    FontSetFaceMask requested = 0;
+    for (size_t at = 0; at < layout->count; at++) {
+        const DrawCommand *command = &layout->commands[at];
+        if (command->type != DRAW_TEXT) continue;
+        FontFamily family = draw_command_font_family(command);
+        bool serif = family == FONT_SERIF;
+        if (serif) requested |= FONT_SET_FACE_SERIF;
+        if (draw_command_font_italic(command) && !serif)
+            requested |= FONT_SET_FACE_SANS_ITALIC;
+        if (draw_command_font_weight_code(command) >= 65u) {
+            requested |= serif
+                ? FONT_SET_FACE_SERIF_BOLD
+                : (FontSetFaceMask) (FONT_SET_FACE_SANS_BOLD
+                                     | FONT_SET_FACE_METRIC_SANS_BOLD);
         }
     }
+    engine->font_requested_faces |= requested;
 }
 
 static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
@@ -1720,6 +2039,26 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
             work->metrics.load.total_pump_us = adapter.network_us;
             work->metrics.load.maximum_pump_us =
                 adapter.maximum_pump_us;
+            work->metrics.adapter_request_wall_us =
+                adapter.request_wall_us;
+            work->metrics.adapter_transport_total_us =
+                adapter.transport_total_us;
+            work->metrics.adapter_dns_us = adapter.dns_us;
+            work->metrics.adapter_tcp_us = adapter.tcp_us;
+            work->metrics.adapter_tls_us = adapter.tls_us;
+            work->metrics.adapter_server_us = adapter.server_us;
+            work->metrics.adapter_body_transfer_us =
+                adapter.body_transfer_us;
+            work->metrics.adapter_admission_collect_us =
+                adapter.admission_collect_us;
+            work->metrics.adapter_transport_samples =
+                adapter.transport_samples;
+            work->metrics.adapter_reused_connections =
+                adapter.reused_connections;
+            work->metrics.adapter_document_cache_hits =
+                adapter.document_cache_hits;
+            work->metrics.adapter_document_cache_stores =
+                adapter.document_cache_stores;
             work->metrics.maximum_transform_slice_us =
                 adapter.maximum_transform_slice_us;
             work->metrics.transform_slices =
@@ -1770,8 +2109,10 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
     site_adapter_load_destroy(work->adapter);
     work->adapter = NULL;
     if (succeeded) {
+        browser_engine_census_page_fonts(engine);
         browser_engine_navigation_restore_view(engine, work);
-        if (!work->history_move) browser_engine_apply_autofocus(engine);
+        if (!work->history_move)
+            browser_engine_apply_or_defer_autofocus(engine);
         if (had_provisional && provisional_scroll_y > 0) {
             (void) navigation_set_scroll(
                 &engine->navigation, provisional_scroll_y);
@@ -1839,6 +2180,15 @@ static bool browser_engine_begin_navigation_request(
             TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "navigation-start",
             "browser navigation job cannot be started");
     }
+    /* Native HOME can become interactive before any page font file is read.
+       If the user outruns Wi-Fi association, finish the two-face baseline
+       here before the candidate is allowed to measure text. */
+    if (!browser_engine_prepare_navigation_fonts(engine, method, url)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED, "font-baseline",
+            "bounded baseline font loading failed");
+    }
     /* Release incumbent-page transport lanes before the candidate scheduler
        tries to enqueue its authoritative document request. On PSP the six
        shared descriptors can otherwise all belong to thumbnails, fonts or
@@ -1877,6 +2227,7 @@ static bool browser_engine_begin_navigation_request(
     work->metrics.status = BROWSER_NAVIGATION_JOB_PENDING;
     if (engine->navigation.page.loaded)
         work->metrics.incumbent_pages_preserved = 1;
+    engine->autofocus_pending = false;
     browser_engine_cancel_idle_work(engine);
     browser_engine_cancel_render_job(engine);
     browser_engine_reset_provisional_viewport(engine);
@@ -2052,12 +2403,38 @@ BrowserNavigationJobStatus browser_engine_pump_navigation(
         SiteAdapterDocument document = {0};
         bool acquired = adapter_status == SITE_ADAPTER_LOAD_SUCCEEDED
             && site_adapter_load_take_document(work->adapter, &document);
+        uint64_t parse_before = engine->navigation.performance.parse_us;
+        uint64_t style_before = engine->navigation.performance.style_us;
+        uint64_t resource_before = engine->navigation.performance.resource_us;
+        uint64_t layout_before = engine->navigation.performance.layout_us;
+        uint64_t runtime_before = engine->navigation.performance.runtime_us;
+        uint64_t commit_started_us = acquired
+            ? tilefinch_platform_monotonic_time_us() : 0;
         bool committed = acquired && navigation_commit_static_html(
             &engine->navigation, work->generation, work->url,
             document.html, document.html_length,
             engine->config.device.navigation_viewport_width,
             engine->fonts_ready ? &engine->fonts : NULL, NULL,
             work->record_history);
+        uint64_t commit_finished_us = acquired
+            ? tilefinch_platform_monotonic_time_us() : 0;
+        if (acquired) {
+            NavigationPerformance *performance =
+                &engine->navigation.performance;
+#define ADAPTER_DELTA(output, input, before) \
+            work->metrics.output = performance->input >= (before) \
+                ? performance->input - (before) : 0
+            ADAPTER_DELTA(adapter_parse_us, parse_us, parse_before);
+            ADAPTER_DELTA(adapter_style_us, style_us, style_before);
+            ADAPTER_DELTA(
+                adapter_resource_us, resource_us, resource_before);
+            ADAPTER_DELTA(adapter_layout_us, layout_us, layout_before);
+            ADAPTER_DELTA(adapter_runtime_us, runtime_us, runtime_before);
+#undef ADAPTER_DELTA
+            work->metrics.adapter_commit_us =
+                commit_finished_us >= commit_started_us
+                    ? commit_finished_us - commit_started_us : 0;
+        }
         if (acquired) {
             engine->navigation.last_http_status = document.status_code;
             snprintf(engine->navigation.last_server,
@@ -2205,6 +2582,26 @@ bool browser_engine_navigation_job_metrics(
                 adapter.peak_buffered_bytes;
             metrics->load.total_pump_us = adapter.network_us;
             metrics->load.maximum_pump_us = adapter.maximum_pump_us;
+            metrics->adapter_request_wall_us =
+                adapter.request_wall_us;
+            metrics->adapter_transport_total_us =
+                adapter.transport_total_us;
+            metrics->adapter_dns_us = adapter.dns_us;
+            metrics->adapter_tcp_us = adapter.tcp_us;
+            metrics->adapter_tls_us = adapter.tls_us;
+            metrics->adapter_server_us = adapter.server_us;
+            metrics->adapter_body_transfer_us =
+                adapter.body_transfer_us;
+            metrics->adapter_admission_collect_us =
+                adapter.admission_collect_us;
+            metrics->adapter_transport_samples =
+                adapter.transport_samples;
+            metrics->adapter_reused_connections =
+                adapter.reused_connections;
+            metrics->adapter_document_cache_hits =
+                adapter.document_cache_hits;
+            metrics->adapter_document_cache_stores =
+                adapter.document_cache_stores;
             metrics->maximum_transform_slice_us =
                 adapter.maximum_transform_slice_us;
             metrics->transform_slices = adapter.build_slices;
@@ -2322,6 +2719,7 @@ static bool browser_engine_run_load(BrowserEngine *engine,
        only unfinished network embellishment is superseded. */
     (void) navigation_cancel_network_work(
         &engine->navigation, "superseded by a new navigation");
+    engine->autofocus_pending = false;
     browser_engine_cancel_idle_work(engine);
     (void) emit_diagnostic(
         engine, TILEFINCH_DIAGNOSTIC_INFO,
@@ -2378,6 +2776,11 @@ static bool browser_engine_run_load(BrowserEngine *engine,
             TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "shell-commit",
             "committed navigation has no promoted render shell");
     }
+    /* Synchronous commits (native/generated pages and host loads) use this
+       path rather than finish_navigation_work. They need the same font census
+       so a late metric face cannot be skipped merely because no responsive
+       fetch job owned the commit. */
+    browser_engine_census_page_fonts(engine);
     (void) emit_diagnostic(
         engine, TILEFINCH_DIAGNOSTIC_INFO,
         TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_LIFECYCLE,
@@ -2553,7 +2956,8 @@ bool browser_engine_load_url_with_limits(
        document. Do the same here so a synchronous load (host lab, scripted
        navigation) lands on the page's declared entry control instead of the
        first focusable node. History restores supply their own focus. */
-    if (loaded && record_history) browser_engine_apply_autofocus(engine);
+    if (loaded && record_history)
+        browser_engine_apply_or_defer_autofocus(engine);
     engine->config.maximum_document_bytes = saved_maximum;
     engine->config.navigation_timeout_ms = saved_timeout;
     return loaded;
@@ -3060,8 +3464,119 @@ bool browser_engine_activate(BrowserEngine *engine,
 {
     if (!browser_engine_input_ready(engine) || action == NULL) return false;
     browser_engine_cancel_idle_work(engine);
+    size_t activations_before = engine->controller.activations;
+    bool activated = controller_activate(&engine->controller, action);
+    /* A layout generation can retire the last focus region immediately
+       before activation. If failure occurred before the controller counted
+       an activation, no page event or default action ran. Resolve the exact
+       authored autofocus target and retry once so a single user press is not
+       split into repair-then-activate. Script/handler failures occur after
+       the activation count changes and are never replayed. */
+    if (!activated
+        && engine->controller.activations == activations_before
+        && browser_engine_apply_autofocus(engine)) {
+        engine->autofocus_pending = false;
+        activated = controller_activate(&engine->controller, action);
+    }
     return browser_engine_finish_input(
-        engine, controller_activate(&engine->controller, action));
+        engine, activated);
+}
+
+bool browser_engine_restore_autofocus(BrowserEngine *engine)
+{
+    if (!browser_engine_input_ready(engine)) return false;
+    browser_engine_cancel_idle_work(engine);
+    engine->autofocus_pending = false;
+    return browser_engine_finish_input(
+        engine, browser_engine_apply_autofocus(engine));
+}
+
+bool browser_engine_focused_provider_media_url(
+    const BrowserEngine *engine, char *url, size_t capacity)
+{
+    if (url != NULL && capacity != 0) url[0] = '\0';
+    if (engine == NULL || url == NULL || capacity == 0
+        || !browser_engine_input_ready(engine)) {
+        return false;
+    }
+    const LinkRegion *link = NULL;
+    if (!controller_focused_link_region(&engine->controller, &link)) {
+        return false;
+    }
+    lxb_dom_node_t *node = link->node;
+    static const lxb_char_t provider_media_attribute[] =
+        "data-tilefinch-provider-media";
+    if (browser_engine_attribute_owner(
+            node, provider_media_attribute,
+            sizeof(provider_media_attribute) - 1u) == NULL) {
+        return false;
+    }
+    const NavigationEntry *current = navigation_current(&engine->navigation);
+    if (current != NULL
+        && fetch_resolve_url(current->url, link->url, url, capacity)) {
+        return true;
+    }
+    if (link->url_length >= capacity) return false;
+    memcpy(url, link->url, link->url_length);
+    url[link->url_length] = '\0';
+    return true;
+}
+
+static lxb_dom_node_t *browser_engine_provider_media_thumbnail(
+    const BrowserEngine *engine)
+{
+    if (engine == NULL || !browser_engine_input_ready(engine)) return NULL;
+    const LinkRegion *link = NULL;
+    if (!controller_focused_link_region(&engine->controller, &link)) {
+        return NULL;
+    }
+    static const lxb_char_t provider_media_attribute[] =
+        "data-tilefinch-provider-media";
+    lxb_dom_node_t *root = browser_engine_attribute_owner(
+        link->node, provider_media_attribute,
+        sizeof(provider_media_attribute) - 1u);
+    if (root == NULL) return NULL;
+
+    /* Provider cards are deliberately shallow, but keep the search generic
+       and bounded so malformed markup cannot turn a focus sample into a
+       document traversal. */
+    lxb_dom_node_t *node = root->first_child;
+    for (unsigned inspected = 0; node != NULL && inspected < 64u;
+         inspected++) {
+        size_t name_length = 0;
+        const char *name = document_element_name(node, &name_length);
+        if (name != NULL && name_length == 3u
+            && strncasecmp(name, "img", 3u) == 0) {
+            return node;
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        if (node == root) break;
+        node = node->next;
+    }
+    return NULL;
+}
+
+bool browser_engine_prepare_focused_provider_media_thumbnail(
+    BrowserEngine *engine)
+{
+    lxb_dom_node_t *thumbnail =
+        browser_engine_provider_media_thumbnail(engine);
+    if (thumbnail == NULL) return true;
+    NavigationPage *page = &engine->navigation.page;
+    const ImageResource *image = images_find_node(&page->images, thumbnail);
+    if (image != NULL && image->pixels != NULL) {
+        return true;
+    }
+    if (navigation_prioritize_deferred_image(
+            &engine->navigation, thumbnail)) return false;
+    /* The target was omitted or exhausted its bounded retry. Do not block
+       video resolution forever for pixels the image pipeline has already
+       classified as terminal. */
+    return true;
 }
 
 bool browser_engine_consume_media_request(
@@ -3397,10 +3912,88 @@ void browser_engine_cancel_render_job(BrowserEngine *engine)
     tile_cache_cancel_frame_work(&engine->render);
 }
 
-bool browser_engine_run_idle_work(BrowserEngine *engine)
+bool browser_engine_run_idle_work(
+    BrowserEngine *engine, bool *visual_changed)
 {
+    if (visual_changed != NULL) *visual_changed = false;
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
         || !engine->render_ready) return false;
+    size_t focus_relayout_generation =
+        engine->navigation.incremental_relayouts;
+    bool font_work = false;
+    FontSetFaceMask optional = engine->font_requested_faces
+        & (FontSetFaceMask) ~(BROWSER_BASELINE_FONT_FACES
+                             | engine->font_failed_faces);
+    const struct {
+        FontSetFaceMask bit;
+        FontFace *face;
+        const char *path;
+    } font_order[] = {
+        { FONT_SET_FACE_SERIF, &engine->fonts.serif,
+          engine->config.fonts.serif_path },
+        { FONT_SET_FACE_SANS_ITALIC, &engine->fonts.sans_italic,
+          engine->config.fonts.sans_italic_path },
+        { FONT_SET_FACE_SANS_BOLD, &engine->fonts.sans_bold,
+          engine->config.fonts.sans_bold_path },
+        { FONT_SET_FACE_METRIC_SANS_BOLD, &engine->fonts.metric_sans_bold,
+          engine->config.fonts.metric_sans_bold_path },
+        { FONT_SET_FACE_SERIF_BOLD, &engine->fonts.serif_bold,
+          engine->config.fonts.serif_bold_path }
+    };
+    if (!browser_engine_navigation_pending(engine)) {
+        for (size_t at = 0;
+             at < sizeof(font_order) / sizeof(font_order[0]); at++) {
+            if ((optional & font_order[at].bit) == 0
+                || font_order[at].face->loaded
+                || (engine->font_load != NULL
+                    && engine->font_loading_face != font_order[at].bit)) {
+                continue;
+            }
+            if (engine->font_load == NULL) {
+                size_t loaded = font_set_loaded_bytes(&engine->fonts);
+                size_t maximum = engine->config.fonts.maximum_total_bytes;
+                if (loaded >= maximum) {
+                    engine->font_failed_faces |= font_order[at].bit;
+                    break;
+                }
+                engine->font_load = font_face_load_begin(
+                    &engine->budget, font_order[at].path, maximum - loaded);
+                if (engine->font_load == NULL) {
+                    engine->font_failed_faces |= font_order[at].bit;
+                    break;
+                }
+                engine->font_loading_face = font_order[at].bit;
+            }
+            FontFaceLoadStatus status = font_face_load_pump(
+                engine->font_load, BROWSER_FONT_IDLE_READ_BYTES,
+                font_order[at].face);
+            font_work = status == FONT_FACE_LOAD_PENDING;
+            font_face_load_destroy(
+                status == FONT_FACE_LOAD_PENDING ? NULL : engine->font_load);
+            if (status == FONT_FACE_LOAD_PENDING) break;
+            engine->font_load = NULL;
+            engine->font_loading_face = 0;
+            if (status != FONT_FACE_LOAD_COMPLETE) {
+                engine->font_failed_faces |= font_order[at].bit;
+                break;
+            }
+            /* The first layout measured this run with a fallback face. Rebuild
+               geometry transactionally before a repaint can observe the new
+               metrics. On refusal, discard the optional face and keep the
+               already-valid fallback layout. */
+            if (!navigation_relayout(&engine->navigation)) {
+                font_face_destroy(font_order[at].face);
+                engine->font_failed_faces |= font_order[at].bit;
+                break;
+            }
+            tile_cache_invalidate_glyphs(&engine->render);
+            font_work = true;
+            if (visual_changed != NULL) *visual_changed = true;
+            break;
+        }
+    } else if (engine->font_load != NULL) {
+        font_work = true;
+    }
     size_t relayouts_before =
         engine->navigation.performance.fast_relayouts
         + engine->navigation.performance.full_relayouts;
@@ -3413,13 +4006,69 @@ bool browser_engine_run_idle_work(BrowserEngine *engine)
     size_t relayouts_after =
         engine->navigation.performance.fast_relayouts
         + engine->navigation.performance.full_relayouts;
-    if (relayouts_after != relayouts_before
-        && !browser_engine_refresh_shell(engine)) return false;
+    if (engine->navigation.incremental_relayouts
+            != focus_relayout_generation) {
+        /* Optional font and image work share this continuation. Rebind once
+           after all of it so neither path can expose a stale focus to input. */
+        (void) controller_rebind_focus(&engine->controller);
+    }
+    if (relayouts_after != relayouts_before) {
+        /* The relayout already computed the union of changed command bounds.
+           Preserve decoded images, tiles outside that damage, and the active
+           frame job rather than destroying the complete render shell for one
+           optional font or thumbnail arrival. */
+        if (!browser_engine_apply_layout_damage(engine)) return false;
+        /* A background image/font continuation committed new layout and
+           display commands. The shell refresh alone does not repaint the
+           PSP framebuffer; tell the frontend to schedule that frame. */
+        if (visual_changed != NULL) *visual_changed = true;
+    }
+    /* Autofocus is a commitment of the settled layout, not of the earlier
+       parser checkpoint. Run it after optional font/resource work so a
+       relayout cannot immediately retire the region we just selected. */
+    bool layout_still_settling = font_work
+        || engine->font_load != NULL
+        || navigation_background_resources_pending(&engine->navigation);
+    bool autofocus_work = browser_engine_retry_deferred_autofocus(
+        engine, layout_still_settling);
+    if (autofocus_work) {
+        if (!browser_engine_finish_input(engine, true)) return false;
+        if (visual_changed != NULL) *visual_changed = true;
+    }
     (void) tile_cache_run_idle_work(
         &engine->render, engine->config.idle_work_budget_us,
         engine->config.idle_work_maximum_units);
-    return navigation_background_resources_pending(&engine->navigation)
+    return autofocus_work || font_work
+        || navigation_background_resources_pending(&engine->navigation)
         || tile_cache_idle_work_pending(&engine->render);
+}
+
+bool browser_engine_run_deferred_image_work(
+    BrowserEngine *engine, bool *visual_changed)
+{
+    if (visual_changed != NULL) *visual_changed = false;
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->render_ready || browser_engine_navigation_pending(engine)) {
+        return false;
+    }
+    size_t relayouts_before =
+        engine->navigation.performance.fast_relayouts
+        + engine->navigation.performance.full_relayouts;
+    if (!navigation_run_deferred_image_work(&engine->navigation)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_NETWORK,
+            TILEFINCH_DIAGNOSTIC_NETWORK_FAILED, "deferred-image-work",
+            "deferred image continuation failed");
+    }
+    size_t relayouts_after =
+        engine->navigation.performance.fast_relayouts
+        + engine->navigation.performance.full_relayouts;
+    if (relayouts_after != relayouts_before) {
+        (void) controller_rebind_focus(&engine->controller);
+        if (!browser_engine_apply_layout_damage(engine)) return false;
+        if (visual_changed != NULL) *visual_changed = true;
+    }
+    return navigation_background_resources_pending(&engine->navigation);
 }
 
 void browser_engine_cancel_idle_work(BrowserEngine *engine)
@@ -3435,6 +4084,14 @@ bool browser_engine_reclaim_optional_memory(
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE) return false;
 
     BrowserOptionalMemoryReclaim result = {0};
+    if (engine->font_load != NULL) {
+        size_t before = budget_remaining(&engine->budget);
+        font_face_load_destroy(engine->font_load);
+        engine->font_load = NULL;
+        engine->font_loading_face = 0;
+        size_t after = budget_remaining(&engine->budget);
+        result.font_staging_bytes = after > before ? after - before : 0;
+    }
     if (engine->navigation_ready && engine->navigation.page.runtime != NULL) {
         result.javascript_bytes = script_runtime_collect_and_trim(
             engine->navigation.page.runtime);
@@ -3447,7 +4104,12 @@ bool browser_engine_reclaim_optional_memory(
         result.render_cache_bytes = tile_cache_reclaim_optional(
             &engine->render);
     }
-    result.total_bytes = result.javascript_bytes;
+    result.total_bytes = result.font_staging_bytes;
+    if (result.total_bytes <= SIZE_MAX - result.javascript_bytes) {
+        result.total_bytes += result.javascript_bytes;
+    } else {
+        result.total_bytes = SIZE_MAX;
+    }
     if (result.total_bytes <= SIZE_MAX - result.session_cache_bytes) {
         result.total_bytes += result.session_cache_bytes;
     } else {
@@ -3465,6 +4127,133 @@ bool browser_engine_reclaim_optional_memory(
         "optional-memory-reclaimed", "", result.total_bytes,
         budget_remaining(&engine->budget));
     return true;
+}
+
+static void browser_optional_reclaim_add(
+    size_t *total, size_t amount)
+{
+    if (total == NULL) return;
+    *total = amount > SIZE_MAX - *total ? SIZE_MAX : *total + amount;
+}
+
+void browser_engine_prepare_optional_memory_reclaim(
+    BrowserEngine *engine, size_t target_remaining_bytes,
+    BrowserOptionalMemoryReclaimJob *job)
+{
+    if (job == NULL) return;
+    memset(job, 0, sizeof(*job));
+    job->target_remaining_bytes = target_remaining_bytes;
+    job->phase = BROWSER_OPTIONAL_RECLAIM_FONT_STAGING;
+    job->active = engine != NULL
+        && engine->state == BROWSER_ENGINE_ACTIVE
+        && budget_remaining(&engine->budget) < target_remaining_bytes;
+}
+
+bool browser_engine_optional_memory_reclaim_pending(
+    const BrowserOptionalMemoryReclaimJob *job)
+{
+    return job != NULL && job->active;
+}
+
+bool browser_engine_pump_optional_memory_reclaim(
+    BrowserEngine *engine, BrowserOptionalMemoryReclaimJob *job)
+{
+    if (job == NULL || !job->active) return true;
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || budget_remaining(&engine->budget)
+               >= job->target_remaining_bytes) {
+        job->active = false;
+        return true;
+    }
+
+    size_t reclaimed = 0;
+    switch (job->phase) {
+    case BROWSER_OPTIONAL_RECLAIM_FONT_STAGING:
+        if (engine->font_load != NULL) {
+            size_t before = budget_remaining(&engine->budget);
+            font_face_load_destroy(engine->font_load);
+            engine->font_load = NULL;
+            engine->font_loading_face = 0;
+            size_t after = budget_remaining(&engine->budget);
+            reclaimed = after > before ? after - before : 0;
+            job->reclaimed.font_staging_bytes = reclaimed;
+        }
+        job->phase = BROWSER_OPTIONAL_RECLAIM_SESSION_CACHE;
+        break;
+    case BROWSER_OPTIONAL_RECLAIM_SESSION_CACHE:
+        if (engine->session_ready) {
+            /* Bound a frame by reclaimed bytes rather than draining the
+               entire cache. One oversized oldest entry may exceed the slice,
+               but the fixed entry table keeps lookup/free work finite. */
+            size_t remaining = budget_remaining(&engine->budget);
+            size_t deficit = remaining < job->target_remaining_bytes
+                ? job->target_remaining_bytes - remaining : 0;
+            size_t slice = deficit < 256u * 1024u
+                ? deficit : 256u * 1024u;
+            reclaimed = browser_session_cache_reclaim(
+                &engine->session, slice == 0 ? 1u : slice);
+            browser_optional_reclaim_add(
+                &job->reclaimed.session_cache_bytes, reclaimed);
+        }
+        if (reclaimed == 0)
+            job->phase = BROWSER_OPTIONAL_RECLAIM_RENDER_CACHE;
+        break;
+    case BROWSER_OPTIONAL_RECLAIM_RENDER_CACHE:
+        if (engine->render_ready) {
+            reclaimed = tile_cache_reclaim_optional(&engine->render);
+            job->reclaimed.render_cache_bytes = reclaimed;
+        }
+        job->phase = BROWSER_OPTIONAL_RECLAIM_JS_FIRST_GC;
+        break;
+    case BROWSER_OPTIONAL_RECLAIM_JS_FIRST_GC:
+        if (engine->navigation_ready
+            && engine->navigation.page.runtime != NULL) {
+            (void) script_runtime_collect_and_trim_phase(
+                engine->navigation.page.runtime,
+                SCRIPT_RUNTIME_COLLECT_FIRST_GC);
+        }
+        job->phase = BROWSER_OPTIONAL_RECLAIM_JS_SECOND_GC;
+        break;
+    case BROWSER_OPTIONAL_RECLAIM_JS_SECOND_GC:
+        if (engine->navigation_ready
+            && engine->navigation.page.runtime != NULL) {
+            (void) script_runtime_collect_and_trim_phase(
+                engine->navigation.page.runtime,
+                SCRIPT_RUNTIME_COLLECT_SECOND_GC);
+        }
+        job->phase = BROWSER_OPTIONAL_RECLAIM_JS_TRIM;
+        break;
+    case BROWSER_OPTIONAL_RECLAIM_JS_TRIM:
+        if (engine->navigation_ready
+            && engine->navigation.page.runtime != NULL) {
+            reclaimed = script_runtime_collect_and_trim_phase(
+                engine->navigation.page.runtime,
+                SCRIPT_RUNTIME_COLLECT_TRIM);
+            job->reclaimed.javascript_bytes = reclaimed;
+        }
+        job->phase = BROWSER_OPTIONAL_RECLAIM_PHASE_COUNT;
+        break;
+    case BROWSER_OPTIONAL_RECLAIM_PHASE_COUNT:
+        break;
+    }
+    browser_optional_reclaim_add(
+        &job->reclaimed.total_bytes, reclaimed);
+    if (budget_remaining(&engine->budget) >= job->target_remaining_bytes
+        || job->phase >= BROWSER_OPTIONAL_RECLAIM_PHASE_COUNT) {
+        job->active = false;
+        (void) emit_diagnostic(
+            engine, TILEFINCH_DIAGNOSTIC_DEBUG,
+            TILEFINCH_SUBSYSTEM_ENGINE, TILEFINCH_DIAGNOSTIC_OK,
+            "optional-memory-reclaim-complete", "",
+            job->reclaimed.total_bytes, budget_remaining(&engine->budget));
+    }
+    return !job->active;
+}
+
+bool browser_engine_maintain_background_workers(BrowserEngine *engine)
+{
+    return engine == NULL || images_decode_worker_reap_cancelled(
+        &engine->budget);
 }
 
 const DocumentBacking *browser_engine_document_backing(

@@ -124,6 +124,12 @@ static int test_cooperative_site_adapter_navigation(void)
           && metrics.maximum_transform_slice_us < UINT64_C(50000)
           && metrics.transform_slices > 6
           && metrics.maximum_irreducible_unit_us < UINT64_C(100000)
+          && metrics.adapter_commit_us > 0
+          && metrics.adapter_parse_us <= metrics.adapter_commit_us
+          && metrics.adapter_style_us <= metrics.adapter_commit_us
+          && metrics.adapter_resource_us <= metrics.adapter_commit_us
+          && metrics.adapter_layout_us <= metrics.adapter_commit_us
+          && metrics.adapter_runtime_us == 0
           && strstr(
                  browser_engine_navigation(engine)->page.document.title,
                  "Cooperative fixture video") != NULL
@@ -507,15 +513,31 @@ static int test_cooperative_site_adapter_navigation(void)
           && strstr(
               browser_engine_navigation(engine)->page.document.title,
               "ratchet") != NULL);
+    char focused_provider_url[NAVIGATION_URL_LIMIT] = {0};
+    CHECK(browser_engine_focused_provider_media_url(
+              engine, focused_provider_url,
+              sizeof(focused_provider_url)));
     ControllerAction compact_play = {0};
     CHECK(browser_engine_activate(engine, &compact_play)
           && compact_play.prefer_native_media
+          && strcmp(focused_provider_url, compact_play.url) == 0
           && browser_engine_focus_direction(
                  engine, CONTROLLER_FOCUS_RIGHT));
+    CHECK(!browser_engine_focused_provider_media_url(
+              engine, focused_provider_url,
+              sizeof(focused_provider_url))
+          && focused_provider_url[0] == '\0');
     ControllerAction compact_details = {0};
     CHECK(browser_engine_activate(engine, &compact_details)
           && !compact_details.prefer_native_media
-          && strcmp(compact_details.url, compact_play.url) == 0
+          && strstr(compact_play.url, "search_query=") == NULL
+          && strstr(compact_details.url, "search_query=") != NULL
+          && strlen(compact_play.url)
+                 == (size_t) (strstr(
+                         compact_details.url, "&search_query=")
+                     - compact_details.url)
+          && memcmp(compact_play.url, compact_details.url,
+                    strlen(compact_play.url)) == 0
           && browser_engine_focus_direction(
                  engine, CONTROLLER_FOCUS_LEFT));
     ControllerAction compact_play_again = {0};
@@ -531,6 +553,30 @@ static int test_cooperative_site_adapter_navigation(void)
           && compact_next_play.prefer_native_media
           && strcmp(compact_next_play.url, compact_play.url) != 0);
     fetch_trace_end();
+
+    /* The exact repeated search is rebuilt from the two-entry, cookie-bound
+       RAM cache. It must not consume another trace response or report any
+       network work; the compact preference is part of the cache variant. */
+    CHECK(browser_engine_begin_navigation_url(
+              engine,
+              "https://www.youtube.com/results?search_query=ratchet",
+              1u * MIB, 2000, true));
+    status = BROWSER_NAVIGATION_JOB_PENDING;
+    for (size_t pumps = 0;
+         pumps < 32 && status == BROWSER_NAVIGATION_JOB_PENDING;
+         pumps++) {
+        status = browser_engine_pump_navigation(engine, &large_quota);
+    }
+    BrowserNavigationJobMetrics cached_metrics = {0};
+    CHECK(browser_engine_navigation_job_metrics(engine, &cached_metrics)
+          && status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && cached_metrics.adapter_document_cache_hits == 1
+          && cached_metrics.adapter_document_cache_stores == 0
+          && cached_metrics.adapter_transport_samples == 0
+          && cached_metrics.load.body_bytes == 0
+          && strstr(
+              browser_engine_navigation(engine)->page.document.title,
+              "ratchet") != NULL);
     remove_large_youtube_replay(large_fixture);
 
     /* The provider's primary result action remains a canonical navigation URL
@@ -540,11 +586,73 @@ static int test_cooperative_site_adapter_navigation(void)
     static const char provider_actions[] =
         "<!doctype html><title>Provider results</title>"
         "<a autofocus data-tilefinch-provider-media "
-        "href='https://www.youtube.com/watch?v=TFTEST00001'>Play</a>"
+        "href='https://www.youtube.com/watch?v=TFTEST00001'>"
+        "<span><img alt='Preview'><span>Play</span></span></a>"
         "<a href='https://www.youtube.com/watch?v=TFTEST00001'>Details</a>";
     CHECK(browser_engine_commit_html(
         engine, "https://www.youtube.com/results?search_query=fixture",
         provider_actions, sizeof(provider_actions) - 1u, true));
+    /* An incremental provider relayout may invalidate the controller's
+       region index between autofocus and the user's first Cross press. The
+       authored target is still unambiguous, so restoring it must allow that
+       same press to activate Play instead of consuming a focus-only press. */
+    BrowserController *provider_controller =
+        browser_engine_controller(engine);
+    CHECK(provider_controller != NULL);
+    provider_controller->focus_kind = CONTROLLER_FOCUS_NONE;
+    provider_controller->focus_index = 0;
+    provider_controller->focus_node = NULL;
+    provider_controller->focus_handle = 0;
+    provider_controller->focus_link_url[0] = '\0';
+    provider_controller->focus_link_url_length = 0;
+    CHECK(browser_engine_restore_autofocus(engine));
+    ControllerAction restored_provider_action = {0};
+    CHECK(browser_engine_activate(engine, &restored_provider_action)
+          && restored_provider_action.type == CONTROLLER_ACTION_NAVIGATE
+          && restored_provider_action.prefer_native_media
+          && strcmp(
+                 restored_provider_action.url,
+                 "https://www.youtube.com/watch?v=TFTEST00001") == 0);
+    /* Also cover the narrower race: the press arrives with a stale region
+       owner, activation discovers that it is gone, and the facade repairs
+       authored autofocus before returning from that same call. */
+    lxb_dom_node_t *retained_provider_node = provider_controller->focus_node;
+    CHECK(retained_provider_node != NULL);
+    provider_controller->focus_kind = CONTROLLER_FOCUS_LINK;
+    provider_controller->focus_index = SIZE_MAX;
+    provider_controller->focus_node = retained_provider_node;
+    provider_controller->focus_handle = 0;
+    provider_controller->focus_link_url[0] = '\0';
+    provider_controller->focus_link_url_length = 0;
+    char stale_focused_url[NAVIGATION_URL_LIMIT] = {0};
+    CHECK(browser_engine_focused_provider_media_url(
+              engine, stale_focused_url, sizeof(stale_focused_url))
+          && strcmp(
+                 stale_focused_url,
+                 "https://www.youtube.com/watch?v=TFTEST00001") == 0);
+    provider_controller->focus_node = NULL;
+    ControllerAction stale_provider_action = {0};
+    bool stale_provider_activated =
+        browser_engine_activate(engine, &stale_provider_action);
+    if (!stale_provider_activated
+        || stale_provider_action.type != CONTROLLER_ACTION_NAVIGATE
+        || !stale_provider_action.prefer_native_media) {
+        fprintf(stderr,
+                "stale provider activation: accepted=%d focus=%d index=%zu "
+                "type=%d native=%d url=%s\n",
+                stale_provider_activated ? 1 : 0,
+                (int) provider_controller->focus_kind,
+                provider_controller->focus_index,
+                (int) stale_provider_action.type,
+                stale_provider_action.prefer_native_media ? 1 : 0,
+                stale_provider_action.url);
+    }
+    CHECK(stale_provider_activated
+          && stale_provider_action.type == CONTROLLER_ACTION_NAVIGATE
+          && stale_provider_action.prefer_native_media
+          && strcmp(
+                 stale_provider_action.url,
+                 "https://www.youtube.com/watch?v=TFTEST00001") == 0);
     const LayoutDocument *provider_layout =
         &browser_engine_navigation(engine)->page.layout;
     lxb_dom_node_t *provider_node = NULL;

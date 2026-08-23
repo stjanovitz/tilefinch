@@ -82,12 +82,17 @@ PSPDEV=/path/to/pspdev cmake --build build-preset-psp-validation \
 scripts/run-ppsspp-input-script.sh
 scripts/run-ppsspp-input-script.sh --runs 2
 scripts/run-ppsspp-input-script.sh --update-golden
+scripts/run-ppsspp-input-script.sh --url 'https://example.test/' \
+  --script live-page-scenario
 ```
 
 The runner creates an isolated HOME directory, writes the boot configuration,
 waits for the clean terminal record, and extracts only
 `tilefinch-input-script:` lines. Artifacts are placed under
 `build-preset-psp-validation/ppsspp-input-script-latest/`.
+Without `--url` the native-HOME entrance remains mandatory. An explicit HTTPS
+URL is intended for live page/media scenarios and is verified against the
+direct-URL boot record before the run is accepted.
 
 Use `--debug-log` when the question is which PSP call PPSSPP accepted or
 rejected. The wrapper launches PPSSPP through the macOS-safe path described in

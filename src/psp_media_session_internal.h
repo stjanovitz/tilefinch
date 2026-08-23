@@ -72,6 +72,9 @@ void psp_media_open_clear_wait_budget(PspMediaSession *media);
 bool psp_media_seek_decode_pump(
     PspMediaSession *media,
     const TilefinchCancellation *cancellation);
+bool psp_media_request_seek_with_resume(
+    PspMediaSession *media, uint64_t target_us, bool preview,
+    bool resume_playing);
 void psp_media_interrupt_decode(PspMediaSession *media);
 bool psp_media_machine_wants_playing(const PspMediaSession *media);
 void psp_media_session_dispatch_event(

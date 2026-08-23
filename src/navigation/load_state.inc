@@ -1138,6 +1138,9 @@ NavigationLoadStatus navigation_load_pump(
     snprintf(session->last_tls_version,
              sizeof(session->last_tls_version), "%s",
              load->response.tls_version);
+    snprintf(session->last_tls_peer_issuer,
+             sizeof(session->last_tls_peer_issuer), "%s",
+             load->response.tls_peer_issuer);
     if (!success) {
         if (navigation_load_retry_zero_body_deadline(load)) {
             return load->status;

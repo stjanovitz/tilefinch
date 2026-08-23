@@ -123,8 +123,8 @@ int main(int argc, char **argv)
             .continue_count = 3,
             .engine_ready = true,
             .tiles = {
-                {"WIKIPEDIA", "Articles and search"},
                 {"YOUTUBE", "Browse and play video"},
+                {"WIKIPEDIA", "Articles and search"},
                 {"ARS TECHNICA", "arstechnica.com"},
                 {"HACKER NEWS", "news.ycombinator.com"},
                 {"LOBSTERS", "lobste.rs"},
@@ -280,8 +280,8 @@ int main(int argc, char **argv)
         .continue_count = 3,
         .engine_ready = true,
         .tiles = {
-            {"WIKIPEDIA", "Articles and search"},
             {"YOUTUBE", "Browse and play video"},
+            {"WIKIPEDIA", "Articles and search"},
             {"ARS TECHNICA", "arstechnica.com"},
             {"HACKER NEWS", "news.ycombinator.com"},
             {"LOBSTERS", "lobste.rs"},
@@ -533,6 +533,12 @@ int main(int argc, char **argv)
         psp_ui_set_loading(&ui, true, 380);
         ui.loading_phase = 46u;
         ui.toast_frames = 0;
+    } else if (strcmp(mode, "tls-error") == 0) {
+        ui.browser_ui_scale = 2;
+        psp_ui_show_status(
+            &ui, "YouTube page fetch failed\n"
+                 "Try correcting PSP date/time, then retry", 300);
+        ui.toast_entry_frames = 0;
     } else if (strcmp(mode, "page-capture") == 0
                || strcmp(mode, "reader-capture") == 0) {
         /* README/documentation captures feed a real engine frame through

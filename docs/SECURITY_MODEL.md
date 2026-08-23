@@ -485,7 +485,7 @@ classes.
 Unsupported directives must not be inferred from the presence of that subset.
 
 The default PSP release cross-builds hash-pinned curl 8.21.0 and Mbed TLS
-3.6.6 LTS; HTTP/2 builds additionally pin nghttp2 1.69.0. Runtime startup
+3.6.7 LTS; HTTP/2 builds additionally pin nghttp2 1.69.0. Runtime startup
 checks that linked provenance and fails closed on drift. Tilefinch still
 narrows curl to HTTP(S), disables automatic redirects and curl cookie state,
 applies peer and host verification on every easy handle, and runs curl/nghttp2
@@ -493,6 +493,22 @@ allocations inside a fixed one-MiB budget pool. The SDK's older transport
 remains only as an explicit, non-release `LEGACY` escape hatch. Source,
 offline-build, and measured-size details are in
 `docs/engineering/PSP_TRANSPORT.md`.
+
+The PSP trust store is a small, reviewed set of public roots rather than the
+firmware's certificate database. It includes current GTS R1-R4 and the
+GlobalSign R4 compatibility anchor; expired compatibility roots are excluded.
+Certificate verification remains fail-closed. The recovery hint shown to the
+user is selected from Mbed TLS's verification bits: clock validity for
+expired/not-yet-valid certificates, network redirection for hostname mismatch,
+another network or an update for an untrusted issuer, and an update for an
+unsupported signature or key.
+
+The bounded last-error snapshot records the raw verification mask, negotiated
+TLS version, peer-certificate issuer when Mbed TLS still exposes it, and the
+version, byte length, and SHA-256 digest of the exact in-memory CA bundle. The
+digest is computed during the bundle's existing first-use read; diagnostics do
+not reopen the Memory Stick file. This distinguishes an outdated staged bundle
+from an alternate public chain or a certificate injected by the local network.
 
 Security-sensitive behavior should keep failing closed as these pieces are
 added; acceptance-site compatibility is not permission to weaken these

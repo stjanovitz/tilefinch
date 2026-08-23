@@ -15,6 +15,47 @@ atomic_uint psp_background_ui_available;
 atomic_bool psp_home_exit_requested;
 PspLifecycle psp_lifecycle;
 
+#define PSP_CERTIFICATE_YOUTUBE_HEAD "YouTube page fetch failed"
+#define PSP_CERTIFICATE_GENERIC_HEAD "Secure page fetch failed"
+_Static_assert(
+    sizeof(PSP_CERTIFICATE_YOUTUBE_HEAD) - 1u
+        <= PSP_UI_LARGE_TOAST_CHARACTER_LIMIT,
+    "YouTube certificate headline must fit the large PSP toast");
+_Static_assert(
+    sizeof(PSP_CERTIFICATE_GENERIC_HEAD) - 1u
+        <= PSP_UI_LARGE_TOAST_CHARACTER_LIMIT,
+    "generic certificate headline must fit the large PSP toast");
+const char *psp_user_visible_error(
+    const char *detail, long tls_verify_result,
+    TilefinchTlsGuidance *tls_guidance,
+    char *summary, size_t summary_size)
+{
+    if (detail == NULL) detail = "";
+    if (tls_guidance != NULL) *tls_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
+    if (summary == NULL || summary_size == 0
+        || (tls_verify_result == 0
+            && !tilefinch_error_is_certificate_verification_failure(detail))) {
+        return detail;
+    }
+    ScePspDateTime rtc = {0};
+    int rtc_result = sceRtcGetCurrentClock(&rtc, 0);
+    bool rtc_valid = rtc_result >= 0
+        && sceRtcCheckValid(&rtc) == 0 && rtc.year >= 2024u;
+    /* Keep the useful route-level context, but move the recovery action onto
+       its own full-width line. The unabridged backend sentence remains in the
+       failure report rather than being clipped into an unreadable toast. */
+    const char *headline = strstr(
+            detail, "YouTube page fetch failed") != NULL
+        ? PSP_CERTIFICATE_YOUTUBE_HEAD
+        : PSP_CERTIFICATE_GENERIC_HEAD;
+    if (tls_guidance != NULL) {
+        *tls_guidance = tilefinch_tls_verification_guidance(
+            (uint32_t) tls_verify_result, rtc_valid);
+    }
+    snprintf(summary, summary_size, "%s", headline);
+    return summary;
+}
+
 bool psp_exit_plan_requested(const PspExitPlan *plan)
 {
     return plan != NULL && plan->cause != PSP_EXIT_NONE;
@@ -52,8 +93,11 @@ void psp_presentation_bind_chrome_fonts(
     PspPresentationResources *presentation, BrowserEngine *engine)
 {
     if (presentation == NULL || engine == NULL) return;
+    const FontFace *regular = browser_engine_font_face(engine, FONT_SANS);
+    if (regular == NULL)
+        regular = browser_engine_native_home_font(engine);
     psp_ui_set_chrome_fonts(
-        browser_engine_font_face(engine, FONT_SANS),
+        regular,
         browser_engine_font_face_variant(
             engine, FONT_SANS, false, true));
     presentation->chrome_fonts_bound = true;
@@ -1763,6 +1807,10 @@ void psp_present_boot_surface(
 
 PspNavigationCooperate psp_navigation_cooperate;
 static PspUiMediaIntent psp_completed_supervisor_media_intent;
+enum { PSP_SUPERVISOR_PAGE_INPUT_LIMIT = 4 };
+static uint32_t psp_completed_supervisor_page_input[
+    PSP_SUPERVISOR_PAGE_INPUT_LIMIT];
+static uint8_t psp_completed_supervisor_page_input_count;
 volatile unsigned psp_validation_cancel_after_ms;
 volatile unsigned psp_validation_preview_scroll;
 
@@ -1851,6 +1899,8 @@ void psp_work_cooperate_begin(
     psp_navigation_cooperate.presenting = 0;
     psp_navigation_cooperate.provisional_present_requested = 0;
     psp_navigation_cooperate.provisional_scroll_requests = 0;
+    psp_navigation_cooperate.pending_page_input_count = 0;
+    psp_navigation_cooperate.pending_page_input_dropped = 0;
     psp_navigation_cooperate.pending_media_intent =
         (PspUiMediaIntent) {0};
     tilefinch_cancellation_init(&psp_navigation_cooperate.cancellation);
@@ -2012,6 +2062,36 @@ void psp_navigation_cooperate_end(const char *scope)
         psp_completed_supervisor_media_intent =
             psp_navigation_cooperate.pending_media_intent;
     }
+    if (!psp_navigation_cancel_requested()
+        && !psp_navigation_cooperate.media_surface
+        && !psp_navigation_cooperate.media_detached) {
+        for (uint8_t at = 0;
+             at < psp_navigation_cooperate.pending_page_input_count;
+             at++) {
+            if (psp_completed_supervisor_page_input_count
+                    == PSP_SUPERVISOR_PAGE_INPUT_LIMIT) {
+                memmove(
+                    &psp_completed_supervisor_page_input[0],
+                    &psp_completed_supervisor_page_input[1],
+                    (PSP_SUPERVISOR_PAGE_INPUT_LIMIT - 1u)
+                        * sizeof(psp_completed_supervisor_page_input[0]));
+                psp_completed_supervisor_page_input_count--;
+            }
+            psp_completed_supervisor_page_input[
+                psp_completed_supervisor_page_input_count++] =
+                    psp_navigation_cooperate.pending_page_input[at];
+        }
+    }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (psp_navigation_cooperate.pending_page_input_count != 0
+        || psp_navigation_cooperate.pending_page_input_dropped != 0) {
+        printf("tilefinch-ui-supervisor-input: scope=%s queued=%u "
+               "dropped=%u\n",
+               scope == NULL ? "unknown" : scope,
+               (unsigned) psp_navigation_cooperate.pending_page_input_count,
+               (unsigned) psp_navigation_cooperate.pending_page_input_dropped);
+    }
+#endif
     bool cancelled = psp_navigation_cancel_requested();
     bool report =
         psp_navigation_cooperate.log_session || cancelled
@@ -2084,6 +2164,27 @@ bool psp_navigation_cooperate_take_media_intent(
     return true;
 }
 
+bool psp_navigation_cooperate_take_page_input(uint32_t *pressed)
+{
+    if (pressed == NULL
+        || psp_completed_supervisor_page_input_count == 0) return false;
+    *pressed = psp_completed_supervisor_page_input[0];
+    psp_completed_supervisor_page_input_count--;
+    if (psp_completed_supervisor_page_input_count != 0) {
+        memmove(
+            &psp_completed_supervisor_page_input[0],
+            &psp_completed_supervisor_page_input[1],
+            psp_completed_supervisor_page_input_count
+                * sizeof(psp_completed_supervisor_page_input[0]));
+    }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    printf("tilefinch-ui-supervisor-input: replay=0x%04x remaining=%u\n",
+           (unsigned) *pressed,
+           (unsigned) psp_completed_supervisor_page_input_count);
+#endif
+    return true;
+}
+
 void psp_background_ui_tick(void)
 {
     PspNavigationCooperate *cooperate = &psp_navigation_cooperate;
@@ -2133,7 +2234,10 @@ void psp_background_ui_tick(void)
             pad.Buttons & ~cooperate->supervisor_previous_buttons;
         cooperate->supervisor_previous_buttons = pad.Buttons;
     }
-    if (!scripted) ui_pressed = psp_ui_buttons(physical_pressed);
+    if (!scripted) {
+        ui_pressed = psp_ui_buttons(physical_pressed)
+            | psp_controller_take_latched_pressed();
+    }
     if ((ui_pressed & PSP_UI_BUTTON_CANCEL) != 0
         && !tilefinch_cancellation_requested(
             &cooperate->cancellation)) {
@@ -2208,6 +2312,29 @@ void psp_background_ui_tick(void)
             cooperate, cooperate->media_surface || cooperate->media_detached
                 ? "VIDEO IS STILL STOPPING" : "STILL STOPPING - PLEASE WAIT");
         urgent_present = true;
+    } else if (ui_pressed != 0
+               && cooperate->engine == NULL
+               && !cooperate->media_surface) {
+        /* The stable page is still authoritative while a raster or other
+           bounded page service runs. Retain input for the browser-thread
+           controller instead of acknowledging and discarding it. The queue
+           is deliberately tiny; if a pathological service outlives a burst,
+           prefer the newest four commands so the eventual state follows the
+           user's latest intent. */
+        if (cooperate->pending_page_input_count
+                == PSP_SUPERVISOR_PAGE_INPUT_LIMIT) {
+            memmove(
+                &cooperate->pending_page_input[0],
+                &cooperate->pending_page_input[1],
+                (PSP_SUPERVISOR_PAGE_INPUT_LIMIT - 1u)
+                    * sizeof(cooperate->pending_page_input[0]));
+            cooperate->pending_page_input_count--;
+            cooperate->pending_page_input_dropped++;
+        }
+        cooperate->pending_page_input[
+            cooperate->pending_page_input_count++] = ui_pressed;
+        cooperate->input_acknowledgements++;
+        acknowledgement_started_us = sceKernelGetSystemTimeWide();
     } else if (ui_pressed != 0
                && cooperate->acknowledge_non_cancel_busy) {
         cooperate->input_acknowledgements++;
@@ -2432,10 +2559,10 @@ bool psp_platform_cooperate(
  * Init presents whichever frame of the choreography it has reached; the
  * frame is a pure function of that index, so a fast boot skips ahead and a
  * slow one simply holds on the frame it got to. Nothing here waits, polls,
- * or samples input: the safe-start window belongs to the update launcher
- * (src/update_launcher_psp.c, `launcher_wait_held(PSP_CTRL_LTRIGGER, 500)`),
- * which runs and finishes before this process starts. The line this surface
- * draws is a statement about that window, not a reader of it.
+ * or samples input: safe start belongs to the update launcher, which samples
+ * a pre-held L trigger over its short startup window and finishes before this
+ * process starts. The line this surface draws restates that launch contract;
+ * it is not a reader of the button.
  *
  * When a stage overruns, the entrance holds the mark centred and shows the
  * stage's own name -- the single muted line the slow branch allows. The

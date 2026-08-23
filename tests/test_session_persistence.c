@@ -164,6 +164,25 @@ static BrowserCacheEntry *find_cache(BrowserSession *session,
     return NULL;
 }
 
+static BrowserSessionPersistenceStatus pump_load(
+    BrowserSessionPersistenceLoad *load, size_t bytes_per_pump,
+    size_t *pump_count)
+{
+    BrowserSessionPersistenceStatus status =
+        BROWSER_SESSION_PERSISTENCE_INVALID_ARGUMENT;
+    BrowserSessionPersistenceLoadProgress progress =
+        BROWSER_SESSION_PERSISTENCE_LOAD_PENDING;
+    size_t pumps = 0;
+    while (progress == BROWSER_SESSION_PERSISTENCE_LOAD_PENDING
+           && pumps++ < 100000u) {
+        progress = browser_session_persistence_load_pump(
+            load, bytes_per_pump, &status);
+    }
+    if (pump_count != NULL) *pump_count = pumps;
+    return progress == BROWSER_SESSION_PERSISTENCE_LOAD_COMPLETE
+        ? BROWSER_SESSION_PERSISTENCE_OK : status;
+}
+
 static bool populate(BrowserSession *session)
 {
     static const unsigned char css[] = "body{color:#123}";
@@ -250,8 +269,44 @@ static int test_round_trip_and_clear(void)
     browser_session_persistence_limits_default(&limits);
     CHECK(browser_session_persistence_save(
               &source, persistence_path, BROWSER_SESSION_PERSIST_ALL,
-              &limits) == BROWSER_SESSION_PERSISTENCE_OK
-          && !file_contains(persistence_path, "durable=yes")
+              &limits) == BROWSER_SESSION_PERSISTENCE_OK);
+
+    /* A one-byte pump exercises every scalar/field continuation. Nothing is
+       visible in the target until the final checksum commits the staging
+       session. */
+    BrowserSession incremental;
+    CHECK(browser_session_init(
+              &incremental, &budget, 4u * 1024u * 1024u)
+          && browser_session_cache_put(
+              &incremental, "https://sentinel.test/old",
+              (const unsigned char *) "old", 3));
+    BrowserSessionPersistenceLoad *incremental_load =
+        browser_session_persistence_load_begin(
+            &incremental, persistence_path, BROWSER_SESSION_PERSIST_ALL,
+            &limits);
+    BrowserSessionPersistenceStatus incremental_status =
+        BROWSER_SESSION_PERSISTENCE_INVALID_ARGUMENT;
+    CHECK(incremental_load != NULL
+          && browser_session_persistence_load_pump(
+                 incremental_load, 1, &incremental_status)
+                 == BROWSER_SESSION_PERSISTENCE_LOAD_PENDING
+          && find_cache(
+                 &incremental, "https://sentinel.test/old") != NULL);
+    size_t incremental_pumps = 0;
+    CHECK(pump_load(incremental_load, 1, &incremental_pumps)
+              == BROWSER_SESSION_PERSISTENCE_OK
+          && incremental_pumps > 32
+          && find_cache(
+                 &incremental, "https://sentinel.test/old") == NULL
+          && find_cache(
+                 &incremental, "https://static.test/site.css") != NULL
+          && browser_session_storage_get(
+                 &incremental, "https://www.wikipedia.org/", true,
+                 "theme", NULL, NULL));
+    browser_session_persistence_load_destroy(incremental_load);
+    browser_session_destroy(&incremental);
+
+    CHECK(!file_contains(persistence_path, "durable=yes")
           && !file_contains(persistence_path, "session_only=no")
           && !file_contains(persistence_path, "source-only")
           && browser_session_persistence_load(
@@ -458,6 +513,25 @@ static int test_transaction_limits_and_backup(void)
                  == BROWSER_SESSION_PERSISTENCE_OK
           && find_cache(
                  &recovered, "https://static.test/site.css") != NULL);
+
+    file = fopen(persistence_path, "wb");
+    CHECK(file != NULL && fwrite("bad", 1, 3, file) == 3
+          && fclose(file) == 0);
+    BrowserSession recovered_incremental;
+    CHECK(browser_session_init(
+              &recovered_incremental, &budget, 4u * 1024u * 1024u));
+    BrowserSessionPersistenceLoad *recovery_load =
+        browser_session_persistence_load_begin(
+            &recovered_incremental, persistence_path,
+            BROWSER_SESSION_PERSIST_CACHE, &limits);
+    CHECK(recovery_load != NULL
+          && pump_load(recovery_load, 3, NULL)
+                 == BROWSER_SESSION_PERSISTENCE_OK
+          && find_cache(
+                 &recovered_incremental,
+                 "https://static.test/site.css") != NULL);
+    browser_session_persistence_load_destroy(recovery_load);
+    browser_session_destroy(&recovered_incremental);
 
     browser_session_destroy(&recovered);
     browser_session_destroy(&target);

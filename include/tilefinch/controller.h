@@ -145,6 +145,13 @@ bool controller_commit_pointer_click(BrowserController *controller);
 void controller_pointer_discard_click(BrowserController *controller);
 bool controller_focus_node(BrowserController *controller,
                            lxb_dom_node_t *node);
+/* Rebind the retained semantic focus to the current layout generation without
+   dispatching DOM events, revealing the target, or counting a user move. */
+bool controller_rebind_focus(BrowserController *controller);
+/* Resolve a retained link focus against the current layout generation without
+   firing DOM focus events or counting a user focus move. */
+bool controller_focused_link_region(
+    const BrowserController *controller, const LinkRegion **link);
 bool controller_focused_rect(const BrowserController *controller,
                              int *x, int *y, int *width, int *height);
 /*

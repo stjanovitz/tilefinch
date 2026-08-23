@@ -151,6 +151,10 @@ typedef enum {
 typedef struct {
     PspMediaEventType type;
     bool autoplay;
+    /* SEEK carries the state the user expects after source priming. Keeping
+       this in the reducer event prevents the physical job and lifecycle
+       machine from disagreeing about whether playback may feed frames. */
+    bool resume_playing;
     bool has_separate_audio;
     bool audio_only;
     bool retain_pipeline;

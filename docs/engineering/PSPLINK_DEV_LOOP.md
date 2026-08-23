@@ -55,11 +55,18 @@ probe() {
 
 ### Preferred zero-Memory-Stick cycle
 
-For rate investigations, build and load the browser PRX directly from `host0:`:
+For ordinary iteration, build and load the browser PRX directly from `host0:`:
 
 ```sh
-cmake --build build-preset-psp-validation \
-  --target psp-browser-script-dev-prx
+PSPDEV=/path/to/pspdev scripts/psplink-device.sh memory
+```
+
+The wrapper builds only `psp-browser-script-dev-prx`, bounds PSPLink commands
+so a disconnected device cannot hang the shell, unloads a stale browser
+module, and starts the fresh PRX. The equivalent manual commands remain:
+
+```sh
+cmake --build build-preset-psp-validation --target psp-browser-script-dev-prx -j8
 pspsh -e "ld host0:/psp-browser-script-dev.prx"
 ```
 
@@ -94,40 +101,48 @@ install entry, or shipping ELF ratchet. Those gates remain attached to the
 actual EBOOT.
 
 Use the slotted EBOOT cycle below only for launcher/install-path validation.
-Its three setup copies plus the device log are within the project's hard
-ten-write ceiling, but they are unnecessary wear and timing noise for media
-iteration.
+It is unnecessary wear and timing noise for media iteration.
 
 ### Slotted EBOOT cycle
 
-1. **Build** (never `build-preset-dev`):
-   `cmake --build build-preset-psp-validation -j8`
+1. **Build and deploy** (never `build-preset-dev`):
+   `PSPDEV=/path/to/pspdev scripts/psplink-device.sh slot`
    After any source change, rebuild before flashing. When a change adds
    telemetry, verify it is really in
    the binary: `strings build-preset-psp-validation/EBOOT.PBP | grep <field>`.
-2. **Flash**:
-   `pspsh -e "cp host0:/EBOOT.PBP ms0:/PSP/GAME/TILEFINCH/slot-a/EBOOT.PBP"`
-3. **Config** — slotted installs read `DATA/`, not the EBOOT's directory:
+   The development-only `tfdeploy.prx` reads the EBOOT from `host0:` in 1 MiB
+   units, writes `EBOOT.PBP.new` in at most eight Memory Stick payload writes,
+   verifies its length, and only then promotes it over slot A. The previous
+   EBOOT survives any incomplete copy. This avoids PSPLink's 2 KiB `cp` loop
+   and its in-place partial-file failure mode. It never ships in a release.
+   Launch the deployed build normally from the XMB. Do not chain a shipping
+   EBOOT through `tfexec.prx`: its ordinary `sceKernelExitGame` return can
+   leave the XMB in a transient invalid state because it was not entered by
+   the normal launcher lifecycle.
+2. **Config** — slotted installs read `DATA/`, not the EBOOT's directory:
    `pspsh -e "cp host0:/boot-overrides.cfg ms0:/PSP/GAME/TILEFINCH/DATA/boot-overrides.cfg"`
-4. **Reset the resume state EVERY run**:
+3. **Reset the resume state when a scripted run requires it**:
    `pspsh -e "cp host0:/profile-clean.cfg ms0:/PSP/GAME/TILEFINCH/DATA/profile.cfg"`
    Why: the profile's `R <video-id> <position-us> <duration-us>` lines persist
    the resume position at exit — including a failed run's seek target. Without
    this reset, the next run resumes at a far cold offset and dies in ways that
    look like new bugs. `profile-clean.cfg` is the checked-in-to-the-build-dir
    copy with all `R` positions zeroed.
-5. **Launch**: `pspsh -e "ldstart host0:/tfexec.prx"`
-6. **Wait**: a full 120s stability soak ≈ 35s boot/open + 120s + exit ≈ 165s.
+4. **Launch**: use the XMB for ordinary/manual slotted tests. The separate
+   `tfexec.prx` loop is reserved for validation EBOOTs whose checked
+   `exit_to=` handoff returns directly to PSPLink; never use it with a
+   shipping build that exits to the XMB.
+5. **Wait**: a full 120s stability soak ≈ 35s boot/open + 120s + exit ≈ 165s.
    Sleep ~150s, then run the bounded probe every 15s until PSPLink answers
    (the app's `exit_to` config returns to PSPLink automatically on any clean
    exit, including harness-declared failures).
-7. **Pull the log**:
+6. **Pull the log**:
    `pspsh -e "cp ms0:/PSP/GAME/TILEFINCH/DATA/tilefinch-validation.txt host0:/run-<name>.txt"`
    then `mv build-preset-psp-validation/run-<name>.txt device-runs/` —
    **immediately**. Files left in `build-*` are deleted by rebuilds; two soak
    logs were lost that way. `device-runs/` (repo root, untracked) is the
    archive.
-8. **AU dump hygiene** (only when `validation_media_au_dump=1`): the dump is
+7. **AU dump hygiene** (only when `validation_media_au_dump=1`): the dump is
    buffered and written once to `host0:/tilefinch-au-dump.bin`. It has no
    `ms0:` fallback, so even this failure diagnostic performs zero Memory Stick
    I/O. Move it out of the served build directory immediately. Format TFAU v1

@@ -138,6 +138,12 @@ int main(void)
         "box-sizing:border-box;display:block;width:120px;height:40px;"
         "padding:6px 17px}"
         ".button.button-secondary{color:var(--button-text);background:0 0}"
+        "#gradient-pure{background:linear-gradient(110deg,#242424 30%,"
+        "#606060 48%,#242424 66%)}"
+        "#gradient-combined{background:#242424 linear-gradient(110deg,"
+        "#242424 30%,#606060 48%,#242424 66%)}"
+        "#gradient-longhand{background-color:#242424;background-image:"
+        "linear-gradient(110deg,#242424 30%,#606060 48%,#242424 66%)}"
         ".special.button{margin-left:99px}"
         ".missing section .card{margin-right:99px}"
         "</style><section>"
@@ -145,6 +151,8 @@ int main(void)
         "<a id=secondary class='button button-secondary'>Login</a>"
         "<div id=target class='card hot' data-x=1></div>"
         "<p id=other class=cold></p>"
+        "<div id=gradient-pure></div><div id=gradient-combined></div>"
+        "<div id=gradient-longhand></div>"
         "</section>";
     PocDocument document = {0};
     CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
@@ -153,8 +161,12 @@ int main(void)
     lxb_dom_node_t *other = find_id(root, "other");
     lxb_dom_node_t *primary = find_id(root, "primary");
     lxb_dom_node_t *secondary = find_id(root, "secondary");
+    lxb_dom_node_t *gradient_pure = find_id(root, "gradient-pure");
+    lxb_dom_node_t *gradient_combined = find_id(root, "gradient-combined");
+    lxb_dom_node_t *gradient_longhand = find_id(root, "gradient-longhand");
     CHECK(target != NULL && other != NULL && primary != NULL
-          && secondary != NULL);
+          && secondary != NULL && gradient_pure != NULL
+          && gradient_combined != NULL && gradient_longhand != NULL);
 
     (void) unsetenv("TILEFINCH_DISABLE_STYLE_INDEX");
     (void) unsetenv("TILEFINCH_DISABLE_COMPILED_SELECTORS");
@@ -230,6 +242,18 @@ int main(void)
                                                      NULL);
     ComputedStyle indexed_before = style_for_pseudo(
         &indexed, target, PSEUDO_BEFORE, &indexed_target);
+    ComputedStyle indexed_gradient_pure = style_for_node(
+        &indexed, gradient_pure, NULL);
+    ComputedStyle indexed_gradient_combined = style_for_node(
+        &indexed, gradient_combined, NULL);
+    ComputedStyle indexed_gradient_longhand = style_for_node(
+        &indexed, gradient_longhand, NULL);
+    const StyleGradient *pure_gradient = stylesheet_background_gradient(
+        &indexed, &indexed_gradient_pure);
+    const StyleGradient *combined_gradient = stylesheet_background_gradient(
+        &indexed, &indexed_gradient_combined);
+    const StyleGradient *longhand_gradient = stylesheet_background_gradient(
+        &indexed, &indexed_gradient_longhand);
     CHECK(computed_style_hyphens_none(&indexed_target)
           && !computed_style_hyphens_none(&indexed_other)
           && indexed.rule_index_ready && indexed.rule_index_bytes != 0
@@ -262,6 +286,15 @@ int main(void)
           && indexed.rule_index_queries >= 3
           && indexed.rule_index_candidates
                < indexed.rule_index_queries * indexed.count
+          && pure_gradient != NULL && combined_gradient != NULL
+          && longhand_gradient != NULL
+          && memcmp(pure_gradient, combined_gradient,
+                    sizeof(*pure_gradient)) == 0
+          && memcmp(pure_gradient, longhand_gradient,
+                    sizeof(*pure_gradient)) == 0
+          && indexed_gradient_combined.has_background
+          && indexed_gradient_combined.background == 0x242424
+          && indexed_gradient_combined.background_alpha == 255
           && indexed.rule_filters != NULL
           && indexed.rule_compound_filter_rejections != 0
           && indexed.rule_ancestor_filter_rejections != 0);

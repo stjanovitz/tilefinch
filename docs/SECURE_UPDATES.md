@@ -316,11 +316,16 @@ the launcher keeps its checked framebuffer visible and displays both result
 codes instead of failing to a blank screen.
 
 The launcher displays its first complete frame before sampling safe-start
-input and accepts L throughout a bounded 500-millisecond window. The user
-should begin holding L while selecting Tilefinch from the XMB. On the initial
-manual installation there is no previous slot yet, so L is acknowledged but
-continues into slot A; a previous version exists only after the first
-successful A/B update.
+input. Safe start is a pre-held chord: the user begins holding L while
+selecting Tilefinch from the XMB, and the launcher samples it repeatedly over
+an 80-millisecond window while it reads the bounded update journal. The fast
+path completes only after `sceCtrl` has returned a valid sample; if it has not,
+the launcher continues polling for at most another 80 milliseconds rather
+than silently treating missing controller data as an unheld button. It does
+not reserve a separate half-second reaction delay on every boot. On the
+initial manual installation there is no previous slot yet, so L is
+acknowledged but continues into slot A; a previous version exists only after
+the first successful A/B update.
 
 The browser must split its current sibling-path policy:
 
@@ -730,7 +735,11 @@ The two updater-state records contain a generation, active slot, pending slot,
 trial state, and checksum. Each state transition writes the older copy first
 through a temporary file, synchronizes it, and retains the other valid
 generation. The launcher selects the newest valid record; it never relies on
-one FAT rename being an atomic transaction.
+one FAT rename being an atomic transaction. A fresh manual installation with
+no journal boots slot A from the same in-memory default instead of forcing a
+Memory Stick device sync before first use. The first update transaction
+persists that default together with its pending trial before the candidate can
+run.
 
 Before first execution, the launcher independently verifies the pending slot's
 complete root chain, signed manifest, and files. It records that a trial is

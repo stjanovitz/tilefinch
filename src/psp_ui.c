@@ -1619,11 +1619,24 @@ void psp_ui_show_status(PspUiState *ui, const char *status,
                         unsigned duration_frames)
 {
     if (ui == NULL) return;
+    ui->tls_toast_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
     copy_string(ui->status, sizeof(ui->status), status);
     unsigned frames = duration_frames == 0
         ? UI_TOAST_DEFAULT_FRAMES : duration_frames;
     ui->toast_frames = (uint16_t) (frames > UINT16_MAX ? UINT16_MAX : frames);
     ui->toast_entry_frames = PSP_THEME_MOTION_TOAST_FRAMES;
+}
+
+void psp_ui_show_tls_status(
+    PspUiState *ui, const char *headline,
+    TilefinchTlsGuidance guidance, unsigned duration_frames)
+{
+    if (ui == NULL) return;
+    psp_ui_show_status(ui, headline, duration_frames);
+    if (guidance > TILEFINCH_TLS_GUIDANCE_NONE
+        && guidance <= TILEFINCH_TLS_GUIDANCE_DETAILS) {
+        ui->tls_toast_guidance = (unsigned) guidance;
+    }
 }
 
 void psp_ui_set_update(
@@ -5823,31 +5836,94 @@ static void draw_toast(const PspUiState *ui, uint16_t *pixels, int width,
             }
         }
     }
+    char *embedded_second_line = strchr(presented, '\n');
+    const char *second_line = embedded_second_line;
+    if (embedded_second_line != NULL) {
+        *embedded_second_line++ = '\0';
+        second_line = embedded_second_line;
+        /* Toasts intentionally support one explanatory continuation line.
+           Flatten any later line break rather than letting an error grow an
+           unbounded modal over the page. */
+        char *extra_line = strchr(embedded_second_line, '\n');
+        if (extra_line != NULL) *extra_line = ' ';
+    }
+    static const char *const tls_guidance[] = {
+        "",
+        "Try correcting PSP date/time, then retry",
+        "Try another Wi-Fi or update Tilefinch",
+        "Secure connection was redirected. Try another Wi-Fi network",
+        "Secure connection unsupported. Update Tilefinch",
+        "Open Help & diagnostics for details"
+    };
+    if (ui->tls_toast_guidance > TILEFINCH_TLS_GUIDANCE_NONE
+        && ui->tls_toast_guidance <= TILEFINCH_TLS_GUIDANCE_DETAILS) {
+        second_line = tls_guidance[ui->tls_toast_guidance];
+    }
+    bool multiline = second_line != NULL && second_line[0] != '\0';
     int scale = browser_ui_scale(ui);
-    /* Derive the final text capacity from the actual toast interior.  The
-       previous large-text cap was 34 even though the 480-pixel viewport has
-       room for 36 glyph cells; network status strings therefore lost their
-       last character.  Keeping the preferred bound avoids unexpectedly wide
-       small-text toasts while the viewport bound makes narrower harness
-       surfaces safe as well. */
-    size_t preferred_maximum = scale == 2 ? 36u : 56u;
+    if (multiline && scale > 1) {
+        size_t first_length = strlen(presented);
+        size_t second_length = strlen(second_line);
+        int first_scaled = chrome_text_width_bytes(
+            presented, first_length, scale, false);
+        int second_scaled = chrome_text_width_bytes(
+            second_line, second_length, scale, false);
+        if (first_scaled > width - 48 || second_scaled > width - 48)
+            scale = 1;
+    }
+    /* Derive the final text capacity from the actual toast interior. Large
+       single-line status remains conservatively cell-bounded. A multiline
+       diagnostic gets a slightly longer bound when the proportional face's
+       measured pixels fit, and falls back to the cell bound on a narrow
+       surface. */
+    size_t preferred_maximum = multiline
+        ? PSP_UI_MULTILINE_TOAST_CHARACTER_LIMIT
+        : (scale == 2 ? PSP_UI_LARGE_TOAST_CHARACTER_LIMIT : 56u);
     size_t viewport_maximum = width > 48
         ? (size_t) (width - 48) / (size_t) (6 * scale)
         : 1u;
-    size_t maximum = preferred_maximum < viewport_maximum
-        ? preferred_maximum : viewport_maximum;
-    size_t characters = strlen(presented);
+    size_t maximum = preferred_maximum;
+    if (!multiline && maximum > viewport_maximum)
+        maximum = viewport_maximum;
+    size_t first_characters = strlen(presented);
+    size_t second_characters = second_line == NULL ? 0u : strlen(second_line);
+    size_t characters = first_characters > second_characters
+        ? first_characters : second_characters;
     if (characters > maximum) characters = maximum;
-    int box_width = (int) characters * 6 * scale + 24;
+    int first_width = chrome_text_width_bytes(
+        presented, first_characters < maximum ? first_characters : maximum,
+        scale, false);
+    int second_width = second_line == NULL ? 0 : chrome_text_width_bytes(
+        second_line,
+        second_characters < maximum ? second_characters : maximum,
+        scale, false);
+    int text_width = first_width > second_width ? first_width : second_width;
+    if (multiline && text_width > width - 48) {
+        maximum = preferred_maximum < viewport_maximum
+            ? preferred_maximum : viewport_maximum;
+        first_width = chrome_text_width_bytes(
+            presented,
+            first_characters < maximum ? first_characters : maximum,
+            scale, false);
+        second_width = second_line == NULL ? 0 : chrome_text_width_bytes(
+            second_line,
+            second_characters < maximum ? second_characters : maximum,
+            scale, false);
+        text_width = first_width > second_width ? first_width : second_width;
+    }
+    int box_width = multiline
+        ? text_width + 24 : (int) characters * 6 * scale + 24;
     if (box_width > width - 24) box_width = width - 24;
     int reserved_bottom = ui->screen == PSP_UI_SCREEN_PAGE
                            && ui->chrome_visible
         ? browser_bottom_height(ui)
         : (psp_ui_screen_is_native_surface(ui->screen)
                ? UI_SURFACE_HINT_HEIGHT : 0);
+    int box_height = multiline
+        ? (scale == 2 ? 52 : 38) : (scale == 2 ? 32 : 23);
     UiRect box = { (width - box_width) / 2,
-                   height - reserved_bottom - (scale == 2 ? 32 : 23) - 8,
-                   box_width, scale == 2 ? 32 : 23 };
+                   height - reserved_bottom - box_height - 8,
+                   box_width, box_height };
     unsigned toast_frames = ui->toast_entry_frames;
     if (toast_frames > PSP_THEME_MOTION_TOAST_FRAMES)
         toast_frames = PSP_THEME_MOTION_TOAST_FRAMES;
@@ -5862,9 +5938,16 @@ static void draw_toast(const PspUiState *ui, uint16_t *pixels, int width,
                     PSP_THEME_RADIUS_PANEL, PSP_THEME_PANEL, 4);
     fill_round_edge_bar(pixels, width, height, stride, box,
                         PSP_THEME_RADIUS_PANEL, 4, accent);
-    draw_text(pixels, width, height, stride, box.x + 12,
-              box.y + (scale == 2 ? 9 : 8),
+    int first_y = box.y + (multiline
+        ? (scale == 2 ? 5 : 4) : (scale == 2 ? 9 : 8));
+    draw_text(pixels, width, height, stride, box.x + 12, first_y,
               presented, maximum, PSP_THEME_TEXT, scale);
+    if (multiline) {
+        draw_text(
+            pixels, width, height, stride, box.x + 12,
+            box.y + (scale == 2 ? 27 : 20), second_line, maximum,
+            PSP_THEME_TEXT, scale);
+    }
 }
 
 typedef struct {
@@ -6205,7 +6288,7 @@ static void draw_startup_splash(
         text, 1);
     draw_text(
         pixels, width, height, stride, width / 2 - 63, height - 18,
-        "HOLD L FOR SAFE START", 21, muted, 1);
+        "HOLD L WHILE STARTING", 21, muted, 1);
 }
 
 static void draw_startup_homepage(
@@ -6237,10 +6320,10 @@ static void draw_startup_homepage(
         {16, 119, (width - 41) / 2, 64},
         {25 + (width - 41) / 2, 119, (width - 41) / 2, 64}
     };
-    const char *names[2] = {"WIKIPEDIA", "YOUTUBE"};
+    const char *names[2] = {"YOUTUBE", "WIKIPEDIA"};
     const char *descriptions[2] = {
-        "ARTICLES AND SEARCH",
-        "BROWSE AND PLAY VIDEO"
+        "BROWSE AND PLAY VIDEO",
+        "ARTICLES AND SEARCH"
     };
     for (size_t at = 0; at < 2; at++) {
         fill_round_rect(
@@ -6346,6 +6429,7 @@ void psp_ui_media_set(PspUiMediaState *media, bool visible, bool playing,
     bool became_visible = visible && !media->visible;
     media->visible = visible;
     media->resolving = false;
+    media->seek_in_progress = false;
     media->failed = false;
     media->status[0] = '\0';
     media->playing = playing;
@@ -6371,6 +6455,7 @@ void psp_ui_media_set_resolving(PspUiMediaState *media, const char *title)
     media->visible = true;
     media->controls_visible = true;
     media->resolving = true;
+    media->seek_in_progress = false;
     media->failed = false;
     media->playing = false;
     media->ended = false;
@@ -6451,6 +6536,7 @@ void psp_ui_media_set_error(PspUiMediaState *media, const char *message)
     media->visible = true;
     media->controls_visible = true;
     media->resolving = false;
+    media->seek_in_progress = false;
     media->failed = true;
     media->retry_unavailable = false;
     media->playing = false;
@@ -6500,6 +6586,8 @@ void psp_ui_media_apply_projection(
         || projection->mode == PSP_MEDIA_UI_SEEKING
         || projection->mode == PSP_MEDIA_UI_RECOVERING
         || projection->mode == PSP_MEDIA_UI_STOPPING;
+    media->seek_in_progress =
+        projection->mode == PSP_MEDIA_UI_SEEKING;
     media->buffering = projection->mode == PSP_MEDIA_UI_BUFFERING;
     /* The controller owns decoder-preview transactions, but the nub's target
        is deliberately UI-local until release coalesces it into one request.
@@ -7176,7 +7264,10 @@ void psp_ui_media_composite_controls(
         || width <= 0 || height < UI_MEDIA_CONTROL_BAR_HEIGHT
         || stride < width) return;
     if (media->resolving) {
-        draw_media_control_bar_ground(pixels, width, height, stride);
+        if (media->seek_in_progress)
+            draw_media_control_bar(media, pixels, width, height, stride);
+        else
+            draw_media_control_bar_ground(pixels, width, height, stride);
         return;
     }
     draw_media_control_bar(media, pixels, width, height, stride);
@@ -7215,8 +7306,12 @@ void psp_ui_media_composite_with_preview(
                Priming. Paint the eventual bar's stable ground now so the
                loading-to-playing handoff changes controls, not 78 rows of
                moving picture. */
-            draw_media_control_bar_ground(
-                pixels, width, height, stride);
+            if (media->seek_in_progress)
+                draw_media_control_bar(
+                    media, pixels, width, height, stride);
+            else
+                draw_media_control_bar_ground(
+                    pixels, width, height, stride);
         }
         UiRect message = media->failed
             ? media_failed_panel_rect(width, height)

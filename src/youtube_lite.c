@@ -36,6 +36,9 @@
 #define YOUTUBE_LITE_IDENTITY_CACHE_VERSION 1u
 #define YOUTUBE_LITE_IDENTITY_CACHE_MAX_AGE_NS \
     (UINT64_C(30) * 60u * UINT64_C(1000000000))
+#define YOUTUBE_LITE_DOCUMENT_CACHE_ADAPTER "youtube-lite"
+#define YOUTUBE_LITE_DOCUMENT_CACHE_MAX_AGE_NS \
+    (UINT64_C(2) * 60u * UINT64_C(1000000000))
 
 #define YOUTUBE_LITE_MOBILE_UA \
     "Mozilla/5.0 (Linux; Android 10; K) " \
@@ -1013,9 +1016,16 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         ".details:focus{background:#303030}.details:focus .details-icon{"
         "background:#eee;border-color:#fff}.details:focus .details-i-dot,"
         ".details:focus .details-i-stem{background:#111}"
-        ".thumb-wrap{position:relative;width:160px;"
-        "height:90px;flex:none}.thumb{display:block;width:100%;height:100%;"
-        "background:#292929;border-radius:7px;object-fit:cover}"
+        /* Keep the skeleton on the wrapper, behind the replaced image. The
+           PSP renderer deliberately flattens replaced-element decoration;
+           placing the gradient on <img> can therefore cover decoded pixels
+           even though CSS painting order would put its background behind
+           them. This parent layer needs no animation or repeated raster. */
+        ".thumb-wrap{position:relative;width:160px;height:90px;flex:none;"
+        "background:#242424 linear-gradient(110deg,#242424 30%,"
+        "#383838 48%,#242424 66%);border-radius:7px}"
+        ".thumb{display:block;width:100%;height:100%;border-radius:7px;"
+        "object-fit:cover}"
         ".info{min-width:0}.title{display:block;font-size:15px;line-height:1.25;"
         "font-weight:bold;margin:1px 0 5px}.meta{font-size:12px;"
         "display:block;line-height:1.35;margin-top:2px}.duration{position:"
@@ -1055,8 +1065,7 @@ static bool lite_html_header(YoutubeLiteHtml *html, const char *query,
         "font-weight:normal;z-index:2}"
         ".watch-copy{flex:1;min-width:0}.watch-copy h1{font-size:17px;"
         "line-height:1.25;margin:0 0 8px}.watch-meta{line-height:1.45;"
-        "margin:0 0 8px}.play-label{display:inline-block;background:#eee;"
-        "color:#111;border-radius:16px;padding:7px 13px;font-weight:bold}"
+        "margin:0 0 8px}"
         ".description{background:#1d1d1d;border-radius:8px;padding:10px;"
         "line-height:1.45;color:#ddd}.comments-link{display:inline-block;"
         "color:#fff;border:1px solid #666;border-radius:16px;padding:7px 13px;"
@@ -1131,14 +1140,12 @@ static bool lite_html_video(YoutubeLiteHtml *html,
     if (!lite_html_format(
             html, "<div class=result-row><a class=card%s "
                   "data-tilefinch-provider-media href=\""
-                  "https://www.youtube.com/watch?v=%s",
+                  "https://www.youtube.com/watch?v=%s\">",
             autofocus ? " autofocus" : "", video->id)
-        || (retain_query
-            && (!lite_html_text(html, "&amp;search_query=")
-                || !lite_html_text(html, encoded_query)))
         || !lite_html_format(
-            html, "\"><span class=thumb-wrap><img class=thumb "
-                  "src=\"https://i.ytimg.com/vi/%s/mqdefault.jpg\" alt=\"\">",
+            html, "<span class=thumb-wrap><img class=thumb "
+                  "src=\"https://i.ytimg.com/vi/%s/mqdefault.jpg\" "
+                  "width=160 height=90 loading=lazy alt=\"\">",
             video->id)
         || (video->duration[0] != '\0'
             && (!lite_html_text(html, "<span class=duration>")
@@ -1605,12 +1612,9 @@ static bool lite_html_watch_intro(
         ok = lite_html_text(html, "<br>Category: ")
             && lite_html_escape(html, watch->category);
     return ok
-        && lite_html_text(html, "</p><span class=play-label>")
-        && lite_html_text(
-            html, autofocus ? "Play in native player" : "Play video")
         && lite_html_format(
             html,
-            "</span><p><a class=comments-link href=\"https://tilefinch.local/"
+            "</p><p><a class=comments-link href=\"https://tilefinch.local/"
             "offline/youtube?id=%s\">Save video offline</a></p>"
             "</div></section>",
             watch->video.id);
@@ -2718,6 +2722,7 @@ struct YoutubeLiteLoadJob {
     YoutubeLiteLoadStatus status;
     long timeout_ms;
     uint64_t started_us;
+    uint64_t request_started_us;
     size_t maximum_source_bytes;
     bool supplemental_requested;
     bool supplemental_fetched;
@@ -3164,16 +3169,115 @@ static bool lite_load_enqueue_primary(YoutubeLiteLoadJob *job)
     };
     long remaining_ms = lite_load_remaining_timeout_ms(job);
     if (remaining_ms <= 0) return false;
+    uint64_t request_started_us = tilefinch_platform_monotonic_time_us();
     job->request_id = fetch_scheduler_enqueue(
         job->scheduler, job->fetch_url, &request,
         job->maximum_source_bytes, remaining_ms);
     if (job->request_id == 0) return false;
+    job->request_started_us = request_started_us;
     job->phase = YOUTUBE_LITE_JOB_PRIMARY;
     job->metrics.requests_started++;
     return true;
 }
 
 static bool lite_load_enqueue_supplemental(YoutubeLiteLoadJob *job);
+
+static bool lite_document_cacheable(
+    YoutubeLiteRoute route, const char *url)
+{
+    if (route == YOUTUBE_LITE_ROUTE_HOME) return true;
+    char token[YOUTUBE_LITE_CONTINUATION_LIMIT] = {0};
+    return route == YOUTUBE_LITE_ROUTE_SEARCH
+        && !lite_query_value(
+            url, "tilefinch_token", token, sizeof(token));
+}
+
+static uint32_t lite_document_cache_variant(bool compact_results)
+{
+    return compact_results ? UINT32_C(1) : UINT32_C(0);
+}
+
+static void lite_apply_preference_cookies(YoutubeLiteLoadJob *job)
+{
+    if (job == NULL || job->session == NULL || job->fetch_url[0] == '\0')
+        return;
+    char preference_cookie[64];
+    int preference_length = snprintf(
+        preference_cookie, sizeof(preference_cookie),
+        "PREF=hl=%s&tz=UTC; Domain=.youtube.com; Path=/", job->language);
+    if (preference_length > 0
+        && (size_t) preference_length < sizeof(preference_cookie)) {
+        (void) browser_session_cookie_set(
+            job->session, job->fetch_url, preference_cookie);
+    }
+    (void) browser_session_cookie_set(
+        job->session, job->fetch_url,
+        "SOCS=CAI; Domain=.youtube.com; Path=/; Secure");
+}
+
+static bool lite_document_cache_get(YoutubeLiteLoadJob *job)
+{
+    if (job == NULL
+        || !lite_document_cacheable(job->route, job->url)) return false;
+    BrowserSiteAdapterDocumentCacheView cached = {0};
+    TilefinchRequestContext authority =
+        lite_primary_context(job->url, job->fetch_url);
+    if (!browser_session_site_adapter_document_cache_get(
+            job->session, YOUTUBE_LITE_DOCUMENT_CACHE_ADAPTER, job->url,
+            lite_document_cache_variant(job->compact_results),
+            &authority,
+            tilefinch_platform_monotonic_time_ns(),
+            YOUTUBE_LITE_DOCUMENT_CACHE_MAX_AGE_NS, &cached)
+        || cached.data == NULL || cached.length == 0
+        || cached.length > YOUTUBE_LITE_MAXIMUM_HTML_BYTES
+        || cached.length == SIZE_MAX) return false;
+    char *html = budget_malloc_category(
+        job->budget, BUDGET_CATEGORY_RESOURCE, cached.length + 1u);
+    if (html == NULL) return false;
+    memcpy(html, cached.data, cached.length);
+    html[cached.length] = '\0';
+    job->document = (YoutubeLiteDocument) {
+        .budget = job->budget,
+        .html = html,
+        .html_length = cached.length,
+        .source_bytes = cached.source_bytes,
+        .result_count = cached.result_count,
+        .route = job->route,
+        .status_code = cached.status_code
+    };
+    snprintf(job->document.server, sizeof(job->document.server), "%s",
+             cached.server == NULL ? "" : cached.server);
+    snprintf(
+        job->document.cf_mitigated, sizeof(job->document.cf_mitigated),
+        "%s", cached.cf_mitigated == NULL ? "" : cached.cf_mitigated);
+    job->metrics.document_cache_hits++;
+    job->status = YOUTUBE_LITE_LOAD_SUCCEEDED;
+    return true;
+}
+
+static void lite_document_cache_store(YoutubeLiteLoadJob *job)
+{
+    if (job == NULL || job->document.html == NULL
+        || !lite_document_cacheable(job->route, job->url)) return;
+    /* A provider response may refresh PREF/SOCS attributes. Normalize them to
+       the exact state the next provider request establishes before binding
+       the cached document to the cookie jar, otherwise a harmless expiry
+       change makes the new entry miss immediately. */
+    lite_apply_preference_cookies(job);
+    TilefinchRequestContext authority =
+        lite_primary_context(job->url, job->fetch_url);
+    if (browser_session_site_adapter_document_cache_put(
+            job->session, YOUTUBE_LITE_DOCUMENT_CACHE_ADAPTER, job->url,
+            lite_document_cache_variant(job->compact_results),
+            &authority,
+            job->document.html, job->document.html_length,
+            job->document.source_bytes, job->document.result_count,
+            job->document.status_code, job->document.server,
+            job->document.cf_mitigated,
+            tilefinch_platform_monotonic_time_ns())) {
+        job->metrics.document_cache_stores++;
+    }
+}
 
 YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
     Budget *budget, BrowserSession *session, const char *url,
@@ -3216,18 +3320,17 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
         youtube_lite_load_destroy(job);
         return NULL;
     }
-    char preference_cookie[64];
-    int preference_length = snprintf(
-        preference_cookie, sizeof(preference_cookie),
-        "PREF=hl=%s&tz=UTC; Domain=.youtube.com; Path=/", job->language);
-    if (preference_length > 0
-        && (size_t) preference_length < sizeof(preference_cookie)) {
-        (void) browser_session_cookie_set(
-            session, job->fetch_url, preference_cookie);
-    }
-    (void) browser_session_cookie_set(
-        session, job->fetch_url,
-        "SOCS=CAI; Domain=.youtube.com; Path=/; Secure");
+    lite_apply_preference_cookies(job);
+    job->supplemental_requested =
+        route == YOUTUBE_LITE_ROUTE_WATCH
+        && lite_comments_view_requested(url);
+    char search_token[YOUTUBE_LITE_CONTINUATION_LIMIT] = {0};
+    job->supplemental_requested =
+        job->supplemental_requested ||
+        (route == YOUTUBE_LITE_ROUTE_SEARCH
+         && lite_query_value(
+             url, "tilefinch_token", search_token, sizeof(search_token)));
+    if (lite_document_cache_get(job)) return job;
     size_t reservation = maximum_source_bytes;
     if (reservation < YOUTUBE_LITE_MAXIMUM_COMMENTS_BYTES)
         reservation = YOUTUBE_LITE_MAXIMUM_COMMENTS_BYTES;
@@ -3248,15 +3351,6 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
        hop's DNS/TLS/body production moves to the bounded transport worker. */
     (void) fetch_scheduler_enable_background_transport(
         job->scheduler, true);
-    job->supplemental_requested =
-        route == YOUTUBE_LITE_ROUTE_WATCH
-        && lite_comments_view_requested(url);
-    char search_token[YOUTUBE_LITE_CONTINUATION_LIMIT] = {0};
-    job->supplemental_requested =
-        job->supplemental_requested ||
-        (route == YOUTUBE_LITE_ROUTE_SEARCH
-         && lite_query_value(
-             url, "tilefinch_token", search_token, sizeof(search_token)));
     bool can_skip_primary =
         route == YOUTUBE_LITE_ROUTE_SEARCH && search_token[0] != '\0'
         && lite_identity_cache_get(session, &job->identity);
@@ -3308,6 +3402,41 @@ static void lite_metrics_add_pump(
     if (pump->quota_yielded) metrics->quota_yields++;
 }
 
+static uint64_t lite_elapsed_part(uint64_t end, uint64_t start)
+{
+    return end >= start ? end - start : 0;
+}
+
+static void lite_metrics_add_transport(
+    YoutubeLiteLoadMetrics *metrics, const FetchResult *result,
+    uint64_t request_wall_us)
+{
+    if (metrics == NULL || result == NULL) return;
+    metrics->request_wall_us += request_wall_us;
+    if (result->tls_connection_reuse_known
+        && result->tls_connection_reused) {
+        metrics->reused_connections++;
+    }
+    const FetchTransportTiming *timing = &result->transport_timing;
+    if (!timing->measured) return;
+    uint64_t transport_ready_us = timing->connect_us;
+    if (timing->appconnect_us > transport_ready_us)
+        transport_ready_us = timing->appconnect_us;
+    metrics->transport_samples++;
+    metrics->transport_total_us += timing->total_us;
+    metrics->dns_us += timing->name_lookup_us;
+    metrics->tcp_us += lite_elapsed_part(
+        timing->connect_us, timing->name_lookup_us);
+    metrics->tls_us += lite_elapsed_part(
+        timing->appconnect_us, timing->connect_us);
+    metrics->server_us += lite_elapsed_part(
+        timing->first_byte_us, transport_ready_us);
+    metrics->body_transfer_us += lite_elapsed_part(
+        timing->total_us, timing->first_byte_us);
+    metrics->admission_collect_us += lite_elapsed_part(
+        request_wall_us, timing->total_us);
+}
+
 static bool lite_load_enqueue_supplemental(YoutubeLiteLoadJob *job)
 {
     bool comments = job->route == YOUTUBE_LITE_ROUTE_WATCH;
@@ -3336,6 +3465,7 @@ static bool lite_load_enqueue_supplemental(YoutubeLiteLoadJob *job)
         budget_free(job->budget, prepared);
         return false;
     }
+    uint64_t request_started_us = tilefinch_platform_monotonic_time_us();
     job->request_id = fetch_scheduler_enqueue(
         job->scheduler, prepared->endpoint, &prepared->request,
         YOUTUBE_LITE_MAXIMUM_COMMENTS_BYTES, remaining_ms);
@@ -3345,6 +3475,7 @@ static bool lite_load_enqueue_supplemental(YoutubeLiteLoadJob *job)
         budget_free(job->budget, prepared);
         return false;
     }
+    job->request_started_us = request_started_us;
     snprintf(job->supplemental_url, sizeof(job->supplemental_url), "%s",
              prepared->endpoint);
     budget_free(job->budget, prepared);
@@ -3465,6 +3596,7 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
                 sizeof(job->document.cf_mitigated), "%s",
                 metadata != NULL
                     ? metadata->cf_mitigated : job->primary_cf_mitigated);
+            lite_document_cache_store(job);
             job->status = YOUTUBE_LITE_LOAD_SUCCEEDED;
         } else if (job->direct_continuation
                    && lite_load_fallback_to_primary(job)) {
@@ -3549,6 +3681,11 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
     }
     job->request_id = 0;
     job->metrics.requests_completed++;
+    uint64_t request_finished_us = tilefinch_platform_monotonic_time_us();
+    uint64_t request_wall_us = request_finished_us >= job->request_started_us
+        ? request_finished_us - job->request_started_us : 0;
+    lite_metrics_add_transport(&job->metrics, result, request_wall_us);
+    job->request_started_us = 0;
     if (!fetched) {
         if (job->phase == YOUTUBE_LITE_JOB_SUPPLEMENTAL) {
             fprintf(stderr, "youtube-lite supplemental data unavailable: %s\n",

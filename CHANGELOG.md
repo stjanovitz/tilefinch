@@ -8,6 +8,32 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.10 — 2026-08-22
+
+- Improved time to playback from YouTube results: Play now opens the native
+  player directly and can reuse preparation performed while a result is
+  selected; Details remains an ordinary watch page.
+- Made YouTube result pages interactive before thumbnails arrive, then load
+  and reveal visible thumbnails progressively without stale placeholders.
+- Prioritized the focused result's decoded thumbnail before speculative video
+  resolution, and let a focus change redirect that work to the new row.
+- Made video-resolution progress advance through its real preparation stages
+  instead of appearing stuck near the start.
+- Fixed confirmed seeks so playback resumes automatically when the video was
+  playing, while seeking from Pause continues to preserve the paused state.
+- Kept the player timeline stable while a committed seek is loading instead
+  of briefly replacing the footer, prevented moving video from bleeding into
+  the opaque control strip, and restored one-press Play activation on YouTube
+  results when a late relayout invalidates the autofocus region.
+- Kept result-page controls responsive while JPEG thumbnails decode and
+  arrive, preserving focus and deferred-image order across relayouts.
+- Made video opening retry stalled CDN ranges on bounded fresh connections
+  before discarding an otherwise valid resolved stream.
+- Reduced startup and first-navigation delay by presenting native Home before
+  deferred site-data restoration and staging page fonts around network work.
+- Expanded HTTPS compatibility and made certificate failures more actionable
+  with cause-specific guidance and richer diagnostics.
+
 ## 0.1.9 — 2026-08-21
 
 - Fixed the YouTube info control so it opens the watch page without starting

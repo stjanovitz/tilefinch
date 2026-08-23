@@ -81,4 +81,34 @@ const char *tilefinch_diagnostic_severity_name(TilefinchDiagnosticSeverity value
 const char *tilefinch_diagnostic_subsystem_name(TilefinchDiagnosticSubsystem value);
 const char *tilefinch_diagnostic_code_name(TilefinchDiagnosticCode value);
 
+/* Recognizes transport-authentication failures without binding callers to a
+   particular libcurl TLS backend's wording.  Presentation layers use this to
+   replace an opaque backend sentence with platform-appropriate recovery
+   guidance; the original detail remains the diagnostic record. */
+bool tilefinch_error_is_certificate_verification_failure(
+    const char *detail);
+
+/* Mbed TLS exposes certificate verification as a bit mask. Keep the stable
+   values at the presentation-independent boundary so host tests can verify
+   recovery guidance without pulling PSP TLS headers into the UI. */
+#define TILEFINCH_TLS_VERIFY_EXPIRED UINT32_C(0x000001)
+#define TILEFINCH_TLS_VERIFY_HOSTNAME UINT32_C(0x000004)
+#define TILEFINCH_TLS_VERIFY_NOT_TRUSTED UINT32_C(0x000008)
+#define TILEFINCH_TLS_VERIFY_FUTURE UINT32_C(0x000200)
+#define TILEFINCH_TLS_VERIFY_BAD_MD UINT32_C(0x004000)
+#define TILEFINCH_TLS_VERIFY_BAD_PK UINT32_C(0x008000)
+#define TILEFINCH_TLS_VERIFY_BAD_KEY UINT32_C(0x010000)
+
+typedef enum {
+    TILEFINCH_TLS_GUIDANCE_NONE = 0,
+    TILEFINCH_TLS_GUIDANCE_TIME,
+    TILEFINCH_TLS_GUIDANCE_UNTRUSTED,
+    TILEFINCH_TLS_GUIDANCE_REDIRECTED,
+    TILEFINCH_TLS_GUIDANCE_UNSUPPORTED,
+    TILEFINCH_TLS_GUIDANCE_DETAILS
+} TilefinchTlsGuidance;
+
+TilefinchTlsGuidance tilefinch_tls_verification_guidance(
+    uint32_t verification_flags, bool rtc_valid);
+
 #endif

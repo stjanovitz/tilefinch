@@ -937,6 +937,27 @@ static bool link_region_matches_focus(const BrowserController *controller,
                   link->url_length) == 0;
 }
 
+static bool retain_link_focus(BrowserController *controller, size_t index);
+
+static bool resolve_link_focus_by_url(BrowserController *controller)
+{
+    if (controller == NULL || controller->navigation == NULL
+        || controller->focus_kind != CONTROLLER_FOCUS_LINK
+        || controller->focus_link_url_length == 0) return false;
+    const LayoutDocument *layout = &controller->navigation->page.layout;
+    if (controller->focus_index < layout->link_count
+        && link_region_matches_focus(
+            controller, &layout->links[controller->focus_index])) {
+        return retain_link_focus(controller, controller->focus_index);
+    }
+    for (size_t i = 0; i < layout->link_count; i++) {
+        if (link_region_matches_focus(controller, &layout->links[i])) {
+            return retain_link_focus(controller, i);
+        }
+    }
+    return false;
+}
+
 static bool retain_link_focus(BrowserController *controller, size_t index)
 {
     const LayoutDocument *layout = &controller->navigation->page.layout;
@@ -961,23 +982,7 @@ static bool resolve_focus_node(BrowserController *controller,
     const LayoutDocument *layout = &controller->navigation->page.layout;
     /* A live retained node is stronger than a URL shared by several links. */
     if (node == NULL && controller->focus_kind == CONTROLLER_FOCUS_LINK
-        && controller->focus_link_url_length != 0) {
-        if (controller->focus_index < layout->link_count
-            && link_region_matches_focus(
-                controller, &layout->links[controller->focus_index])) {
-            retain_focus_node(
-                controller, layout->links[controller->focus_index].node);
-            return true;
-        }
-        for (size_t i = 0; i < layout->link_count; i++) {
-            if (!link_region_matches_focus(controller, &layout->links[i])) {
-                continue;
-            }
-            controller->focus_index = i;
-            retain_focus_node(controller, layout->links[i].node);
-            return true;
-        }
-    }
+        && resolve_link_focus_by_url(controller)) return true;
     if (controller->focus_kind == CONTROLLER_FOCUS_POINTER
         && controller->pointer_node == node) return true;
     if (controller->focus_kind == CONTROLLER_FOCUS_LINK
@@ -1008,28 +1013,37 @@ static bool resolve_focus_node(BrowserController *controller,
     }
     /* OOM while constructing the optional index must not change focus
        correctness. Only that case retains the former bounded linear path. */
-    if (layout->focus_index != NULL) return false;
-    for (size_t i = 0; i < layout->link_count; i++) {
-        if (layout->links[i].node != node) continue;
-        controller->focus_kind = CONTROLLER_FOCUS_LINK;
-        controller->focus_index = i;
-        return retain_link_focus(controller, i);
+    if (layout->focus_index == NULL) {
+        for (size_t i = 0; i < layout->link_count; i++) {
+            if (layout->links[i].node != node) continue;
+            controller->focus_kind = CONTROLLER_FOCUS_LINK;
+            controller->focus_index = i;
+            return retain_link_focus(controller, i);
+        }
+        for (size_t i = 0; i < layout->control_count; i++) {
+            if (layout->controls[i].node != node) continue;
+            controller->focus_kind = CONTROLLER_FOCUS_CONTROL;
+            controller->focus_index = i;
+            clear_link_focus_identity(controller);
+            retain_focus_node(controller, node);
+            return true;
+        }
     }
-    for (size_t i = 0; i < layout->control_count; i++) {
-        if (layout->controls[i].node != node) continue;
-        controller->focus_kind = CONTROLLER_FOCUS_CONTROL;
-        controller->focus_index = i;
-        clear_link_focus_identity(controller);
-        retain_focus_node(controller, node);
-        return true;
-    }
-    controller->focus_kind = CONTROLLER_FOCUS_NONE;
-    controller->focus_index = 0;
-    controller->focus_node = NULL;
-    controller->focus_handle = 0;
-    controller->has_authored_focus_outline = false;
-    clear_link_focus_identity(controller);
-    controller->pointer_node = NULL;
+    /* A relayout may replace the region owner while preserving the authored
+       link and URL. Try that semantic identity even when the old weak node is
+       still live; requiring node == NULL made the stale-but-live case eat the
+       next activation. Never clear identity on failure: callers need it for
+       same-press recovery and a later layout may represent it again. */
+    if (resolve_link_focus_by_url(controller)) return true;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    printf("tilefinch-focus-resolve: result=unresolved kind=%d index=%zu "
+           "node=%s url=%s links=%zu controls=%zu hash=%s\n",
+           (int) controller->focus_kind, controller->focus_index,
+           node == NULL ? "missing" : "live",
+           controller->focus_link_url_length == 0 ? "missing" : "present",
+           layout->link_count, layout->control_count,
+           layout->focus_index == NULL ? "absent" : "miss");
+#endif
     return false;
 }
 
@@ -1078,18 +1092,36 @@ static bool current_focus_region(const BrowserController *controller,
     }
     if (layout_focus_for_node(
             layout, focus_node, control, index)) return true;
-    if (layout->focus_index != NULL) return false;
-    for (size_t i = 0; i < layout->link_count; i++) {
-        if (layout->links[i].node != focus_node) continue;
-        *control = false;
-        *index = i;
-        return true;
+    if (layout->focus_index == NULL) {
+        for (size_t i = 0; i < layout->link_count; i++) {
+            if (layout->links[i].node != focus_node) continue;
+            *control = false;
+            *index = i;
+            return true;
+        }
+        for (size_t i = 0; i < layout->control_count; i++) {
+            if (layout->controls[i].node != focus_node) continue;
+            *control = true;
+            *index = i;
+            return true;
+        }
     }
-    for (size_t i = 0; i < layout->control_count; i++) {
-        if (layout->controls[i].node != focus_node) continue;
-        *control = true;
-        *index = i;
-        return true;
+    if (!want_control && controller->focus_link_url_length != 0) {
+        if (candidate < layout->link_count
+            && link_region_matches_focus(
+                controller, &layout->links[candidate])) {
+            *control = false;
+            *index = candidate;
+            return true;
+        }
+        for (size_t i = 0; i < layout->link_count; i++) {
+            if (!link_region_matches_focus(controller, &layout->links[i])) {
+                continue;
+            }
+            *control = false;
+            *index = i;
+            return true;
+        }
     }
     return false;
 }
@@ -1225,16 +1257,26 @@ static bool controller_focus_relative(BrowserController *controller,
     if (count == 0) return false;
     bool had_focus = controller->focus_kind == CONTROLLER_FOCUS_LINK
         || controller->focus_kind == CONTROLLER_FOCUS_CONTROL;
-    if (had_focus
-        && !resolve_focus_node(controller, retained_focus_node(controller))) {
-        controller->focus_kind = CONTROLLER_FOCUS_NONE;
-        controller->has_authored_focus_outline = false;
-        had_focus = false;
-    }
+    bool resolved = !had_focus || resolve_focus_node(
+        controller, retained_focus_node(controller));
     lxb_dom_node_t *current = had_focus
         ? retained_focus_node(controller) : NULL;
-    size_t candidate = had_focus ? flat_focus(controller)
-        : (forward ? count - 1u : 0u);
+    size_t candidate = forward ? count - 1u : 0u;
+    if (had_focus) {
+        const LayoutDocument *layout = &controller->navigation->page.layout;
+        if (resolved) {
+            candidate = flat_focus(controller);
+        } else if (controller->focus_kind == CONTROLLER_FOCUS_LINK
+                   && layout->link_count != 0) {
+            candidate = controller->focus_index < layout->link_count
+                ? controller->focus_index : layout->link_count - 1u;
+        } else if (controller->focus_kind == CONTROLLER_FOCUS_CONTROL
+                   && layout->control_count != 0) {
+            size_t control = controller->focus_index < layout->control_count
+                ? controller->focus_index : layout->control_count - 1u;
+            candidate = layout->link_count + control;
+        }
+    }
     /*
      * LinkRegion is a hit-test fragment, not a tab stop. A wrapped anchor may
      * contribute many adjacent regions; walk at most the raw region count and
@@ -1393,7 +1435,9 @@ bool controller_focus_direction(BrowserController *controller,
     if ((controller->focus_kind == CONTROLLER_FOCUS_LINK
          || controller->focus_kind == CONTROLLER_FOCUS_CONTROL)
         && !resolve_focus_node(controller, retained_focus_node(controller))) {
-        controller->focus_kind = CONTROLLER_FOCUS_NONE;
+        /* Keep the semantic identity and old ordinal. The geometric lookup
+           below will fall back to sequential movement in this same press;
+           clearing here restarted d-pad traversal at a list edge. */
         controller->has_authored_focus_outline = false;
     }
     int from_x = 0, from_y = 0, from_width = 0, from_height = 0;
@@ -1748,6 +1792,35 @@ bool controller_focus_node(BrowserController *controller,
     controller->focus_moves++;
     return synchronize_dom_focus(controller, node)
            && controller_reveal_focus(controller);
+}
+
+bool controller_rebind_focus(BrowserController *controller)
+{
+    if (controller == NULL || controller->navigation == NULL) return false;
+    if (controller->focus_kind == CONTROLLER_FOCUS_NONE
+        || controller->focus_kind == CONTROLLER_FOCUS_POINTER) return true;
+    lxb_dom_node_t *node = retained_focus_node(controller);
+    if (!resolve_focus_node(controller, node)) return false;
+    controller_refresh_authored_focus_outline(
+        controller, retained_focus_node(controller));
+    return true;
+}
+
+bool controller_focused_link_region(
+    const BrowserController *controller, const LinkRegion **link)
+{
+    if (link != NULL) *link = NULL;
+    if (controller == NULL || controller->navigation == NULL
+        || link == NULL) return false;
+    bool control = false;
+    size_t index = 0;
+    if (!current_focus_region(controller, &control, &index) || control) {
+        return false;
+    }
+    const LayoutDocument *layout = &controller->navigation->page.layout;
+    if (index >= layout->link_count) return false;
+    *link = &layout->links[index];
+    return true;
 }
 
 bool controller_focused_rect(const BrowserController *controller,

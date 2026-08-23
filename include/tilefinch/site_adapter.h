@@ -54,10 +54,22 @@ typedef struct {
     size_t quota_yields;
     size_t requests_started;
     size_t requests_completed;
+    size_t document_cache_hits;
+    size_t document_cache_stores;
+    size_t transport_samples;
+    size_t reused_connections;
     size_t build_slices;
     size_t transform_quota_overruns;
     uint64_t network_us;
     uint64_t build_us;
+    uint64_t request_wall_us;
+    uint64_t transport_total_us;
+    uint64_t dns_us;
+    uint64_t tcp_us;
+    uint64_t tls_us;
+    uint64_t server_us;
+    uint64_t body_transfer_us;
+    uint64_t admission_collect_us;
     uint64_t maximum_pump_us;
     uint64_t maximum_transform_slice_us;
     uint64_t maximum_irreducible_unit_us;
@@ -75,6 +87,11 @@ bool site_adapter_handles_navigation(const char *method, const char *url);
    Unowned navigations require the ordinary network loader; an owned adapter
    declares whether its implementation needs transport. */
 bool site_adapter_navigation_requires_network(
+    const char *method, const char *url);
+/* Provider-owned result/detail documents may opt into completing their
+   trusted font set before first layout. Lightweight entry surfaces remain on
+   baseline fonts so controls become interactive immediately. */
+bool site_adapter_navigation_requires_stable_typography(
     const char *method, const char *url);
 SiteAdapterLoad *site_adapter_load_begin(
     Budget *budget, BrowserSession *session, const char *method,

@@ -895,6 +895,7 @@ static void page_destroy_value(NavigationSession *session,
         &page->external_fonts);
     images_priority_load_destroy(page->deferred_image_job);
     page->deferred_image_job = NULL;
+    page->deferred_image_batch_count = 0;
     budget_free(session->budget, page->deferred_image_targets);
     page->deferred_image_targets = NULL;
     page->deferred_image_count = 0;

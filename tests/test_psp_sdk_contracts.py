@@ -100,6 +100,32 @@ def psp_media_session_sources():
 
 
 class PspSdkContractTests(unittest.TestCase):
+    def test_psplink_deployer_is_bounded_and_transactional(self):
+        source = without_comments(
+            (ROOT / "tools" / "psplink-deploy" / "main.c").read_text(
+                encoding="utf-8"))
+
+        self.assertIn("TF_DEPLOY_CHUNK_BYTES (1024u * 1024u)", source)
+        self.assertIn("TF_DEPLOY_MAX_BYTES (8u * 1024u * 1024u)", source)
+        self.assertIn("TfDeployWriteBound", source)
+        self.assertIn('"ms0:/PSP/GAME/TILEFINCH/slot-a/EBOOT.PBP"', source)
+        self.assertIn("write_calls > 8u", source)
+        self.assertEqual(1, source.count("sceIoWrite(file, data, size)"))
+        self.assertIn("read_unit(source_file, transfer_buffer, request)",
+                      source)
+        self.assertIn('destination, ".new"', source)
+        self.assertIn('destination, ".previous"', source)
+        self.assertLess(
+            source.index('sceIoRename(previous, destination)'),
+            source.index('sceIoRemove(temporary)'))
+        self.assertLess(
+            source.index("sceIoRename(destination, previous)"),
+            source.index("sceIoRename(temporary, destination)"))
+        self.assertIn('sceIoSync("ms0:", 0)', source)
+        self.assertIn("sceKernelSelfStopUnloadModule(1, 0, NULL)", source)
+        self.assertNotIn("tilefinch-validation", source)
+        self.assertNotIn("tilefinch-crash", source)
+
     def test_official_psp_preset_embeds_the_pinned_public_update_root(self):
         presets = json.loads(
             (ROOT / "CMakePresets.json").read_text(encoding="utf-8"))
@@ -404,7 +430,7 @@ class PspSdkContractTests(unittest.TestCase):
         loop = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
         suppressed = loop[
-            loop.index("if (!media_open_before || !navigation_still_pending)"):]
+            loop.index("if ((!media_open_before || !navigation_still_pending)"):]
         suppressed = suppressed[:suppressed.index("bool stability_needs_play")]
         self.assertIn("psp_media_open_watchdog(&browser->media)", suppressed)
         self.assertIn("else if", suppressed)
@@ -857,12 +883,18 @@ class PspSdkContractTests(unittest.TestCase):
             runtime.index("bool psp_platform_cooperate(")]
         self.assertIn("psp_ui_media_update(", tick)
         self.assertIn("cooperate->pending_media_intent", tick)
+        self.assertIn("cooperate->pending_page_input", tick)
+        self.assertIn("psp_controller_take_latched_pressed()", tick)
+        self.assertIn("PSP_SUPERVISOR_PAGE_INPUT_LIMIT", tick)
+        self.assertLess(tick.index("cooperate->pending_page_input"),
+                        tick.index('"BUSY - CIRCLE CANCELS"'))
         end = runtime[
             runtime.index("void psp_navigation_cooperate_end("):
             runtime.index("bool psp_navigation_cooperate_take_media_intent(")]
         self.assertLess(
             end.index("while (psp_navigation_cooperate.presenting != 0)"),
             end.index("psp_completed_supervisor_media_intent ="))
+        self.assertIn("psp_completed_supervisor_page_input", end)
 
         open_source = without_comments(
             (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
@@ -960,7 +992,7 @@ class PspSdkContractTests(unittest.TestCase):
         source = without_comments(
             psp_media_session_sources())
         seek = source[
-            source.index("bool psp_media_request_seek("):
+            source.index("bool psp_media_request_seek_with_resume("):
             source.index("static bool psp_media_copy_preview(")]
         self.assertIn("!preview", seek)
         self.assertIn("media->last_resume_saved_us == UINT64_MAX", seek)
@@ -1257,7 +1289,7 @@ class PspSdkContractTests(unittest.TestCase):
         source = without_comments(
             psp_media_session_sources())
         request = source[
-            source.index("bool psp_media_request_seek("):
+            source.index("bool psp_media_request_seek_with_resume("):
             source.index("static bool psp_media_copy_preview(")]
         preview = request[
             request.index("if (preview) {"):
@@ -1344,7 +1376,7 @@ class PspSdkContractTests(unittest.TestCase):
         skipped = skipped[:skipped.index("media->job_phase = restore")]
         self.assertIn("media->presentation_floor_us = target_us", skipped)
         request = source[
-            source.index("bool psp_media_request_seek("):
+            source.index("bool psp_media_request_seek_with_resume("):
             source.index("static bool psp_media_copy_preview(")]
         self.assertLess(
             request.index("PSP_MEDIA_EVENT_SEEK"),
@@ -1641,7 +1673,7 @@ class PspSdkContractTests(unittest.TestCase):
         seek = without_comments(
             (ROOT / "src/psp_media_seek.c").read_text(encoding="utf-8"))
         request = seek[
-            seek.index("bool psp_media_request_seek("):
+            seek.index("bool psp_media_request_seek_with_resume("):
             seek.index("bool psp_media_seek_decode_pump(")]
         self.assertIn("media->hls == NULL", request)
         hls = without_comments(
@@ -1768,10 +1800,20 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("static bool fetch_background_preconnect_begin(")]
         self.assertNotIn(
             "budget_malloc_category", initialize,
-            "connect-only HOME speculation must not allocate response buffers")
+            "bodyless HOME speculation must not allocate response buffers")
         self.assertIn(
             "fetch_background_ensure_stream_capacity()", source,
             "stream buffers must grow only when a real response is admitted")
+        preconnect = without_comments(
+            (ROOT / "src/fetch/preconnect.inc").read_text(encoding="utf-8"))
+        self.assertIn("CURLOPT_NOBODY, 1L", preconnect)
+        self.assertIn("CURLOPT_NOBODY, 1L", source)
+        self.assertIn("CURLOPT_USERAGENT, TILEFINCH_BROWSER_USER_AGENT",
+                      preconnect)
+        self.assertIn("CURLOPT_USERAGENT, FETCH_BACKGROUND_USER_AGENT",
+                      source)
+        self.assertNotIn("CURLOPT_CONNECT_ONLY,", preconnect)
+        self.assertNotIn("CURLOPT_CONNECT_ONLY,", source)
         self.assertIn("curl_easy_attach_shared_state(slot->easy)", source)
         self.assertIn("CURLOPT_TIMEOUT_MS, 0L", source)
         worker_work = source[
@@ -1848,6 +1890,19 @@ class PspSdkContractTests(unittest.TestCase):
             start.index("curl_global_acquire("))
         self.assertIn("if (fetch_background_transport_available())", start)
         self.assertIn("return false;", start)
+
+    def test_home_preconnect_is_limited_to_adapter_owned_destination(self):
+        source = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        loop = source[
+            source.index("const char *preconnect_url ="):
+            source.index("fetch_preconnect_pump();")]
+        self.assertIn("site_adapter_handles_navigation(", loop)
+        self.assertIn('"GET", preconnect_url', loop)
+        warmup = source[
+            source.index("if (network_was_warming"):
+            source.index("if (process->config.interactive_validation_ticks")]
+        self.assertIn('site_adapter_handles_navigation("GET", url)', warmup)
 
     def test_page_script_networking_keeps_policy_on_bridge_thread(self):
         source = without_comments(
@@ -3487,6 +3542,30 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertLess(
             priority("BROWSER"), priority("TRANSPORT_SETUP"))
         self.assertLess(priority("BROWSER"), priority("CLOCK"))
+        self.assertLess(priority("BROWSER"), priority("IMAGE_DECODE"))
+
+        image = without_comments(
+            (ROOT / "src/image.c").read_text(encoding="utf-8"))
+        self.assertIn(
+            "TILEFINCH_PSP_THREAD_PRIORITY_IMAGE_DECODE", image)
+        self.assertIn("IMAGE_DECODE_WORKER_QUEUED", image)
+        self.assertIn("IMAGE_DECODE_WORKER_RUNNING", image)
+        self.assertIn("IMAGE_DECODE_WORKER_READY", image)
+        self.assertIn("images_decode_worker_shutdown", image)
+        busy = image[
+            image.index("static bool image_decode_busy(void)"):
+            image.index("static void *image_arena_malloc(")]
+        self.assertIn("atomic_load_explicit(&decode_gate", busy)
+        self.assertNotIn("atomic_compare_exchange", busy)
+        self.assertNotIn("atomic_flag_test_and_set", busy)
+        finish_pending = image[
+            image.index("static bool finish_one_pending("):
+            image.index("static void cancel_pending(")]
+        self.assertLess(
+            finish_pending.index("if (image_decode_busy()) continue;"),
+            finish_pending.index("fetch_scheduler_take("),
+            "A contended decoder must leave the completed image response "
+            "in scheduler ownership for a later pump.")
 
         transport = without_comments(
             (ROOT / "src/fetch/background_transport.inc").read_text(
@@ -4575,7 +4654,8 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("!psp_navigation_cooperate_active()", begin)
         decode_begin = main[
             main.index("bool media_decode_scope = false;"):
-            main.index("if (!media_open_before || !navigation_still_pending)")]
+            main.index(
+                "if ((!media_open_before || !navigation_still_pending)")]
         self.assertIn("!psp_navigation_cooperate_active()", decode_begin)
 
     def test_media_network_attempts_bound_their_blind_connect_phase(self):
@@ -4618,7 +4698,7 @@ class PspSdkContractTests(unittest.TestCase):
             (ROOT / "src/fetch.c").read_text(encoding="utf-8"))
         self.assertIn(
             "#define FETCH_STALL_LOW_SPEED_BYTES_PER_SECOND 1L", fetch)
-        self.assertIn("#define FETCH_STALL_LOW_SPEED_SECONDS 3L", fetch)
+        self.assertIn("#define FETCH_STALL_LOW_SPEED_SECONDS 6L", fetch)
         watchdog = fetch[
             fetch.index("static bool fetch_configure_stall_watchdog("):
             fetch.index("static bool fetch_try_tls12_compatibility(")]
@@ -4682,6 +4762,93 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("FETCH_BACKGROUND_ENQUEUE_SATURATED", start)
         self.assertIn("FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED", start)
         self.assertNotIn("queue unavailable", start)
+
+    def test_youtube_result_preresolution_is_bounded_and_adopted(self):
+        frontend = without_comments(
+            (ROOT / "src/psp_app/psp_app_youtube.c").read_text(
+                encoding="utf-8"))
+        internal = without_comments(
+            (ROOT / "src/psp_app/psp_app_internal.h").read_text(
+                encoding="utf-8"))
+        actions = without_comments(
+            (ROOT / "src/psp_app/psp_app_actions.c").read_text(
+                encoding="utf-8"))
+        session = without_comments(
+            (ROOT / "src/psp_media_session.c").read_text(
+                encoding="utf-8"))
+        opening = without_comments(
+            (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+
+        self.assertIn("YoutubeResolveJob *job", internal)
+        self.assertIn("PSP_YOUTUBE_PRERESOLVE_DWELL_US", frontend)
+        self.assertIn("PSP_YOUTUBE_PRERESOLVE_RETENTION_US", frontend)
+        self.assertIn("PSP_YOUTUBE_PRERESOLVE_PENDING_ADOPT_US", frontend)
+        self.assertIn("budget_pressure_required(", frontend)
+        self.assertIn("youtube_resolve_job_begin_bounded(", frontend)
+        self.assertIn("PSP_YOUTUBE_PRERESOLVE_WATCH_BYTES", frontend)
+        self.assertIn("PSP_YOUTUBE_PRERESOLVE_PLAYER_BYTES", frontend)
+        self.assertIn(
+            "transport.occupied_slots < FETCH_BACKGROUND_REQUEST_LIMIT",
+            frontend)
+        self.assertNotIn("!transport_capacity || !pump_allowed", frontend)
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        idle_start = main.index("} else if (!page_input_active")
+        idle = main[idle_start:main.index(
+            "browser_engine_run_idle_work(", idle_start)]
+        self.assertNotIn("browser->youtube_preresolve.state", idle)
+        self.assertNotIn("PSP_YOUTUBE_PRERESOLVE_RESOLVING", idle)
+        self.assertIn("!page_input_active", idle)
+        self.assertIn("!browser->media.ui.visible", idle)
+        self.assertIn("!psp_media_open_work_pending(&browser->media)", idle)
+        observe = main.index("psp_app_youtube_preresolve_tick(")
+        idle_pump = main.index("browser_engine_run_idle_work(", observe)
+        self.assertLess(observe, idle_pump)
+        present = main.index("psp_present(engine_views->frame", idle_pump)
+        after_present = main.index(
+            "psp_deferred_image_after_present(", present)
+        self.assertLess(present, after_present)
+        helper = main.index("psp_deferred_image_after_present(")
+        image_pump = main.index(
+            "browser_engine_run_deferred_image_work(", helper)
+        post_present_guard = main[helper:image_pump]
+        self.assertIn("page_idle_pumped", post_present_guard)
+        self.assertIn("render_job_pending", post_present_guard)
+        self.assertIn("input_active", post_present_guard)
+        self.assertIn("media.ui.visible", post_present_guard)
+        self.assertIn(
+            "browser_engine_prepare_focused_provider_media_thumbnail(",
+            frontend)
+        self.assertIn("PSP_YOUTUBE_PRERESOLVE_THUMBNAIL", frontend)
+        self.assertIn("observed_focus_index", internal)
+        self.assertIn("observed_focus_kind", internal)
+        self.assertIn("PSP_YOUTUBE_PRERESOLVE_DWELL", frontend)
+        self.assertIn("youtube_resolve_job_pump(", frontend)
+        self.assertIn("youtube_resolve_job_cancel(", frontend)
+        self.assertNotIn("media_http_", frontend)
+        self.assertNotIn("googlevideo", frontend.lower())
+        self.assertIn("observed_focus_moves", frontend)
+        self.assertIn("psp_youtube_focused_video_id(", frontend)
+        self.assertIn(
+            "psp_media_open_provider_route_prepared(", actions)
+        self.assertIn("prepared_resolver_job = *prepared_resolver_job", session)
+        self.assertIn("youtube_resolve_job_matches(", session)
+        self.assertIn("*prepared_resolver_job = NULL", session)
+        self.assertIn(
+            "youtube_resolve_job_destroy(media->prepared_resolver_job)",
+            session)
+
+        service_start = opening.index("if (media->open_service_pending)")
+        service = opening[
+            service_start:opening.index(
+                "if (media->job_phase < PSP_MEDIA_JOB_OPEN_RESOLVE",
+                service_start)]
+        self.assertLess(
+            service.index("media->prepared_resolver_job = NULL"),
+            service.index("psp_media_pipeline_destroy(media)"))
+        self.assertLess(
+            service.index("psp_media_pipeline_destroy(media)"),
+            service.index("media->resolver_job = prepared_resolver"))
 
     def test_video_open_prioritizes_media_and_does_not_wait_for_readahead(self):
         main = without_comments(
@@ -4895,12 +5062,66 @@ class PspSdkContractTests(unittest.TestCase):
             actions.index("bool opened = entry != NULL"):
             actions.index("action.prefer_native_media = false;")]
         opened = handoff[handoff.index("if (opened) {"):]
+        self.assertIn("browser_engine_cancel_network_work(", opened)
+        self.assertIn("provider_handoff_present_pending", opened)
         self.assertLess(
-            opened.index("browser_engine_cancel_network_work("),
-            opened.index("browser_engine_reclaim_optional_memory("))
+            opened.index("browser_engine_prepare_optional_memory_reclaim("),
+            opened.index("provider_handoff_present_pending ="))
+        self.assertIn(
+            "provider_handoff_present_pending =\n"
+            "                            "
+            "browser_engine_optional_memory_reclaim_pending(",
+            opened)
+        self.assertIn(
+            "browser_engine_prepare_optional_memory_reclaim(", opened)
+        self.assertNotIn("browser_engine_reclaim_optional_memory(", opened)
+
+        loop = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        media_pump = loop[
+            loop.index("bool media_open_before ="):
+            loop.index("if (browser->media.page_source", loop.index(
+                "bool media_open_before ="))]
+        self.assertIn(
+            "!interactive->provider_handoff_present_pending", media_pump)
+        self.assertIn(
+            "browser_engine_optional_memory_reclaim_pending(", media_pump)
+        media_scope = loop[
+            loop.index("if (media_open_before && !navigation_still_pending"):
+            loop.index("bool media_decode_scope = false;")]
+        self.assertIn(
+            "!interactive->provider_handoff_present_pending", media_scope)
+        self.assertIn(
+            "browser_engine_optional_memory_reclaim_pending(", media_scope)
+        runtime = loop[
+            loop.index("bool runtime_layout_changed = false;"):
+            loop.index("ScriptMediaRequest dom_media_request;")]
+        self.assertIn("psp_advance_page_runtime(", runtime)
+        runtime_helper = loop[
+            loop.index("static TILEFINCH_OUT_OF_LINE bool "
+                       "psp_advance_page_runtime("):
+            loop.index("static TILEFINCH_HOT_BOUNDARY "
+                       "PspInteractiveResult psp_app_run_interactive(")]
+        self.assertIn("provider_handoff_present_pending", runtime_helper)
+        self.assertIn(
+            "browser_engine_optional_memory_reclaim_pending(", runtime_helper)
         self.assertLess(
-            opened.index("browser_engine_reclaim_optional_memory("),
-            opened.index("break;"))
+            runtime_helper.index(
+                "browser_engine_optional_memory_reclaim_pending("),
+            runtime_helper.index("browser_engine_advance_runtime("))
+        present = loop[
+            loop.index("if (frame.page_dirty || render_visual_changed"):
+            loop.index("if (psp_deferred_image_after_present(")]
+        self.assertLess(
+            present.index("psp_present("),
+            present.index("psp_app_pump_provider_handoff_reclaim("))
+
+        reclaim = actions[
+            actions.index(
+                "void psp_app_pump_provider_handoff_reclaim("):]
+        self.assertIn(
+            "browser_engine_pump_optional_memory_reclaim(", reclaim)
+        self.assertNotIn("browser_engine_reclaim_optional_memory(", reclaim)
 
     def test_audio_open_precedes_aggressive_video_successor(self):
         opening = without_comments(
@@ -5015,6 +5236,46 @@ class PspSdkContractTests(unittest.TestCase):
             targets.index("target_link_libraries(psp-browser-script PRIVATE")]
         self.assertIn("src/psp_app/psp_app_exit_handoff.c", browser_sources)
 
+    def test_launcher_fast_path_keeps_safe_start_and_symbols(self):
+        launcher = without_comments(
+            (ROOT / "src/update_launcher_psp.c").read_text(encoding="utf-8"))
+        self.assertIn(
+            "#define LAUNCHER_SAFE_START_WINDOW_US UINT64_C(80000)",
+            launcher)
+        self.assertIn(
+            "#define LAUNCHER_SAFE_START_MAXIMUM_US UINT64_C(160000)",
+            launcher)
+        self.assertIn("launcher_sample_button(", launcher)
+        self.assertIn("&& sample_observed", launcher)
+        self.assertIn('"HOLD L WHILE STARTING"', launcher)
+        self.assertNotIn("launcher_wait_held", launcher)
+        self.assertLess(
+            launcher.index("tilefinch_update_journal_load("),
+            launcher.index(
+                "recovery_button = launcher_finish_safe_start_window("),
+            "The bounded journal read should overlap the safe-start window.")
+        missing_state = launcher[
+            launcher.index("if (!tilefinch_update_journal_load("):
+            launcher.index('LAUNCHER_TIMING_MARK("journal-ready")')]
+        self.assertNotIn(
+            "tilefinch_update_journal_store(", missing_state,
+            "First install must not synchronously flush a default journal "
+            "before handoff.")
+
+        targets = (ROOT / "cmake/TilefinchTargets.cmake").read_text(
+            encoding="utf-8")
+        launcher_target = targets[
+            targets.index("add_executable(tilefinch-launcher"):
+            targets.index("add_executable(psp-browser-fixture")]
+        self.assertIn("TILEFINCH_PSP_LAUNCHER_TIMING=1", launcher_target)
+        self.assertIn("$<TARGET_FILE:tilefinch-launcher>.unstripped",
+                      launcher_target)
+        self.assertIn('"${PSPDEV}/bin/psp-strip"', launcher_target)
+        self.assertLess(
+            launcher_target.index('"${PSPDEV}/bin/psp-strip"'),
+            launcher_target.index("create_pbp_file("),
+            "The launcher must be stripped before create_pbp_file packages it.")
+
     def test_every_process_exit_hands_the_console_back(self):
         main = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
@@ -5085,6 +5346,54 @@ class PspSdkContractTests(unittest.TestCase):
                     "psp_log_finish(", preceding,
                     "psp_exit_console() must follow psp_log_finish(): the "
                     "handoff load replaces the process")
+
+    def test_unread_deferred_cache_is_never_replaced_at_exit(self):
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        gate = main[
+            main.index("static TILEFINCH_OUT_OF_LINE bool "
+                       "psp_site_data_restore_gate_navigation("):
+            main.index("static void psp_site_data_restore_destroy(")]
+        self.assertIn("cache_restore_cancelled_unread = true", gate)
+        self.assertIn("restore->phase = PSP_SITE_DATA_RESTORE_DONE", gate)
+
+        save = main[
+            main.index("static TILEFINCH_COLD_PATH bool "
+                       "psp_save_site_data_on_exit("):
+            main.index("static void psp_site_data_restore_init(")]
+        self.assertIn("bool preserve_persisted_cache", save)
+        self.assertIn("&& !preserve_persisted_cache", save)
+
+        close = main[
+            main.index("static TILEFINCH_COLD_PATH PspShutdownReport "
+                       "psp_browser_close("):
+            main.index("\nint main(")]
+        preserve = close.index("bool preserve_persisted_cache =")
+        destroy = close.index("psp_site_data_restore_destroy(", preserve)
+        persist = close.index("psp_save_site_data_on_exit(", destroy)
+        self.assertLess(preserve, destroy)
+        self.assertLess(destroy, persist)
+        self.assertIn("preserve_persisted_cache,", close[persist:persist + 500])
+
+    def test_deferred_cache_idle_work_is_terminal_and_not_watchdog_time(self):
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        idle = main[
+            main.index("static TILEFINCH_OUT_OF_LINE bool "
+                       "psp_site_data_restore_idle_pump("):
+            main.index("typedef struct {", main.index(
+                "psp_site_data_restore_idle_pump("))]
+        terminal = idle.index("PSP_SITE_DATA_RESTORE_DONE) return false")
+        veto_chain = idle.index("bool cache_restore_may_run")
+        self.assertLess(terminal, veto_chain)
+
+        navigation = main[
+            main.index("bool site_data_waiting ="):
+            main.index("if (navigation_status == BROWSER_NAVIGATION_JOB_PENDING", main.index(
+                "bool site_data_waiting ="))]
+        waiting = navigation[
+            navigation.index("if (site_data_waiting)"):]
+        self.assertIn("navigation_job_started_us = now_us", waiting)
 
     def test_media_overlay_has_no_unreachable_close_control(self):
         ui = without_comments(

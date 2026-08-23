@@ -962,6 +962,8 @@ bool navigation_background_resources_pending(
             || session->page.image_continuation_pending);
 }
 
+static void navigation_deferred_images_finish(NavigationSession *session);
+
 size_t navigation_cancel_network_work(
     NavigationSession *session, const char *reason)
 {
@@ -974,6 +976,7 @@ size_t navigation_cancel_network_work(
         cancelled += script_runtime_cancel_network(
             session->page.frames[i].runtime, reason);
     }
+    navigation_deferred_images_finish(session);
     return cancelled;
 }
 
@@ -982,6 +985,7 @@ static void navigation_deferred_images_finish(NavigationSession *session)
     if (session == NULL) return;
     images_priority_load_destroy(session->page.deferred_image_job);
     session->page.deferred_image_job = NULL;
+    session->page.deferred_image_batch_count = 0;
     budget_free(session->budget, session->page.deferred_image_targets);
     session->page.deferred_image_targets = NULL;
     session->page.deferred_image_count = 0;
@@ -1010,6 +1014,100 @@ static void navigation_deferred_image_failed(
         target->retry_delay = 0;
     }
     page->deferred_image_cursor++;
+}
+
+static size_t navigation_deferred_image_available_prefix(
+    const NavigationPage *page, size_t maximum)
+{
+    if (page == NULL || page->deferred_image_targets == NULL) return 0;
+    size_t available = 0;
+    while (available < maximum
+           && page->deferred_image_cursor + available
+                  < page->deferred_image_count) {
+        const ImagePriorityTarget *target =
+            &page->deferred_image_targets[
+                page->deferred_image_cursor + available];
+        if (!image_resource_available(
+                images_find_node(&page->images, target->node))) break;
+        available++;
+    }
+    return available;
+}
+
+bool navigation_prioritize_deferred_image(
+    NavigationSession *session, lxb_dom_node_t *node)
+{
+    if (session == NULL || node == NULL) return false;
+    NavigationPage *page = &session->page;
+    size_t found = page->deferred_image_count;
+    for (size_t at = page->deferred_image_cursor;
+         at < page->deferred_image_count; at++) {
+        if (page->deferred_image_targets[at].node == node) {
+            found = at;
+            break;
+        }
+    }
+    if (found == page->deferred_image_count) return false;
+    if (page->deferred_image_job != NULL
+        && images_priority_load_contains_node(
+               page->deferred_image_job, node)) {
+        return true;
+    }
+    if (page->deferred_image_job != NULL) {
+        /* Focus changes are latency-sensitive. Do not cancel the current
+           transport/decode batch merely to prioritize a different row: job
+           destruction synchronously cancels and takes its descriptors, rolls
+           back optional image state, and throws away useful network progress.
+           Preserve that admitted prefix and rotate the focused target to the
+           first position after it instead. It will start as soon as the
+           bounded one-or-two-image batch retires, while the input path remains
+           allocation-free and transport-free. */
+        size_t active_count = images_priority_load_target_count(
+            page->deferred_image_job);
+        if (active_count == 0) active_count = 1u;
+        size_t promote_at = page->deferred_image_cursor;
+        if (active_count <= page->deferred_image_count - promote_at) {
+            promote_at += active_count;
+        } else {
+            promote_at = page->deferred_image_count;
+        }
+        if (found < promote_at) return true;
+        if (found != promote_at) {
+            ImagePriorityTarget focused = page->deferred_image_targets[found];
+            size_t shifted = found - promote_at;
+            memmove(
+                &page->deferred_image_targets[promote_at + 1u],
+                &page->deferred_image_targets[promote_at],
+                shifted * sizeof(*page->deferred_image_targets));
+            page->deferred_image_targets[promote_at] = focused;
+        }
+        const NavigationEntry *entry = navigation_current(session);
+        page->deferred_image_rank_scroll_y = entry == NULL ? 0 : entry->scroll_y;
+        page->deferred_image_rank_valid = true;
+        return true;
+    }
+    if (found != page->deferred_image_cursor) {
+        /* Focus is a temporary priority, not permission to shuffle every
+           bystander. Rotate the focused target to the cursor so the natural
+           viewport order of all remaining thumbnails stays stable. A swap
+           teleported the old head to the focused row's former position and
+           repeated d-pad moves could therefore strand the first card near
+           the end of the queue. */
+        ImagePriorityTarget focused = page->deferred_image_targets[found];
+        size_t shifted = found - page->deferred_image_cursor;
+        memmove(
+            &page->deferred_image_targets[
+                page->deferred_image_cursor + 1u],
+            &page->deferred_image_targets[page->deferred_image_cursor],
+            shifted * sizeof(*page->deferred_image_targets));
+        page->deferred_image_targets[page->deferred_image_cursor] = focused;
+    }
+    /* Keep the explicit focus order until scrolling changes. Otherwise an
+       all-visible result list can immediately swap the old first row back. */
+    const NavigationEntry *entry = navigation_current(session);
+    page->deferred_image_rank_scroll_y = entry == NULL ? 0 : entry->scroll_y;
+    page->deferred_image_rank_valid = true;
+    return true;
 }
 
 static uint64_t navigation_deferred_image_distance(
@@ -1113,8 +1211,28 @@ static bool navigation_run_deferred_image(NavigationSession *session)
         } else {
             maximum_attempts = SIZE_MAX;
         }
-        page->deferred_image_job = images_priority_load_begin(
+        size_t batch_count = 1u;
+        if (target->retry_count == 0
+            && page->deferred_image_cursor + 1u
+                   < page->deferred_image_count) {
+            ImagePriorityTarget *next = &page->deferred_image_targets[
+                page->deferred_image_cursor + 1u];
+            uint16_t next_width = next->display_width;
+            uint16_t next_height = next->display_height;
+            uint64_t current_distance = navigation_deferred_image_distance(
+                session, target, scroll_y, NULL, NULL);
+            uint64_t next_distance = navigation_deferred_image_distance(
+                session, next, scroll_y, &next_width, &next_height);
+            if (current_distance == 0 && next_distance == 0
+                && next->retry_count == 0) {
+                next->display_width = next_width;
+                next->display_height = next_height;
+                batch_count = 2u;
+            }
+        }
+        page->deferred_image_job = images_priority_load_begin_batch(
             &page->document, &page->stylesheet, &page->images, target,
+            batch_count,
             session->budget, page->resource_base_url, page->document_url,
             page->referrer_policy, maximum_attempts,
             session->maximum_image_bytes,
@@ -1126,23 +1244,18 @@ static bool navigation_run_deferred_image(NavigationSession *session)
             navigation_deferred_image_failed(session, target);
             return true;
         }
+        page->deferred_image_batch_count = (uint8_t) batch_count;
     }
 
     size_t loaded_before = page->images.stats.loaded;
     session->performance.background_image_batches++;
     ImagePriorityLoadStatus status = images_priority_load_pump(
         page->deferred_image_job);
-    if (status == IMAGE_PRIORITY_LOAD_PENDING) return true;
-    images_priority_load_destroy(page->deferred_image_job);
-    page->deferred_image_job = NULL;
-    ImagePriorityTarget *target =
-        &page->deferred_image_targets[page->deferred_image_cursor];
-    if (status == IMAGE_PRIORITY_LOAD_FAILED) {
-        navigation_deferred_image_failed(session, target);
-    } else {
-        target->retry_count = 0;
-        target->retry_delay = 0;
-        page->deferred_image_cursor++;
+    size_t admitted_batch = images_priority_load_target_count(
+        page->deferred_image_job);
+    if (admitted_batch != 0
+        && admitted_batch < page->deferred_image_batch_count) {
+        page->deferred_image_batch_count = (uint8_t) admitted_batch;
     }
     size_t added = page->images.stats.loaded >= loaded_before
         ? page->images.stats.loaded - loaded_before : 0;
@@ -1165,11 +1278,52 @@ static bool navigation_run_deferred_image(NavigationSession *session)
             return true;
         }
         session->performance.background_image_relayouts++;
+        images_priority_load_commit_progress(page->deferred_image_job);
+    }
+    if (status == IMAGE_PRIORITY_LOAD_PENDING) return true;
+    images_priority_load_destroy(page->deferred_image_job);
+    page->deferred_image_job = NULL;
+    ImagePriorityTarget *target =
+        &page->deferred_image_targets[page->deferred_image_cursor];
+    size_t batch_count = page->deferred_image_batch_count == 0
+        ? 1u : page->deferred_image_batch_count;
+    page->deferred_image_batch_count = 0;
+    size_t available = navigation_deferred_image_available_prefix(
+        page, batch_count);
+    if (status == IMAGE_PRIORITY_LOAD_FAILED || available < batch_count) {
+        /* Individual image failures are intentionally soft inside the image
+           loader, so a completed batch can still contain a missing suffix.
+           Attribute either shape to the first still-missing target rather
+           than re-fetching a thumbnail that is already visible. If
+           completions arrived out of order, the prefix remains zero and the
+           ordinary retry path safely revisits target 0; a retained target 1
+           resource is reused later without another transport request. */
+        page->deferred_image_cursor += available;
+        target = page->deferred_image_cursor < page->deferred_image_count
+            ? &page->deferred_image_targets[page->deferred_image_cursor]
+            : NULL;
+        if (target != NULL) navigation_deferred_image_failed(session, target);
+    } else {
+        for (size_t at = 0; at < batch_count; at++) {
+            ImagePriorityTarget *completed = &page->deferred_image_targets[
+                page->deferred_image_cursor + at];
+            completed->retry_count = 0;
+            completed->retry_delay = 0;
+        }
+        page->deferred_image_cursor += batch_count;
     }
     if (page->deferred_image_cursor >= page->deferred_image_count) {
         navigation_deferred_images_finish(session);
     }
     return true;
+}
+
+bool navigation_run_deferred_image_work(NavigationSession *session)
+{
+    if (session == NULL || !session->page.loaded) return false;
+    if (!session->page.image_continuation_pending
+        || session->page.deferred_image_targets == NULL) return true;
+    return navigation_run_deferred_image(session);
 }
 
 bool navigation_run_background_resources(NavigationSession *session)
@@ -2026,6 +2180,10 @@ void navigation_destroy(NavigationSession *session)
 {
     if (session == NULL) return;
     page_destroy(session);
+    /* Direct NavigationSession owners do not pass through BrowserEngine's
+       teardown coordinator. Reap the process-wide JPEG slot here as well so
+       its retained body and arena cannot outlive this session's Budget. */
+    (void) images_decode_worker_shutdown(session->budget);
     navigation_compiled_stylesheet_cache_discard(session);
     if (session->budget != NULL) {
         for (size_t i = 0; i < session->history_count; i++) {

@@ -716,6 +716,17 @@ void script_runtime_relocate_document_storage(ScriptRuntime *runtime,
    remain unbound and return false when passed a non-empty binding. */
 bool script_runtime_rebind_remote_document(
     ScriptRuntime *runtime, const ScriptRemoteDocumentBinding *binding);
+typedef enum {
+    SCRIPT_RUNTIME_COLLECT_FIRST_GC = 0,
+    SCRIPT_RUNTIME_COLLECT_SECOND_GC,
+    SCRIPT_RUNTIME_COLLECT_TRIM,
+    SCRIPT_RUNTIME_COLLECT_PHASE_COUNT
+} ScriptRuntimeCollectPhase;
+/* One allocation-free collection phase. The two QuickJS graph passes remain
+   indivisible, but callers can put a frame/input boundary between them and
+   the allocator trim. */
+size_t script_runtime_collect_and_trim_phase(
+    ScriptRuntime *runtime, ScriptRuntimeCollectPhase phase);
 size_t script_runtime_collect_and_trim(ScriptRuntime *runtime);
 /* Remaining active QuickJS heap allowance. Unlike the browser Budget this
    excludes allocator cache capacity and reflects JS_SetMemoryLimit(). */

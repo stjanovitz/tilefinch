@@ -144,6 +144,7 @@ typedef struct {
     size_t deferred_image_count;
     size_t deferred_image_cursor;
     ImagePriorityLoadJob *deferred_image_job;
+    uint8_t deferred_image_batch_count;
     int deferred_image_rank_scroll_y;
     bool deferred_image_rank_valid;
     bool loaded;
@@ -551,6 +552,7 @@ struct NavigationSession {
     bool last_transport_timed_out;
     bool last_tls12_compatibility_retry;
     char last_tls_version[16];
+    char last_tls_peer_issuer[TILEFINCH_TLS_PEER_ISSUER_LIMIT];
     size_t client_hint_retries;
     char last_cf_mitigated[32];
     char last_server[64];
@@ -866,8 +868,18 @@ bool navigation_advance_runtime(NavigationSession *session,
    current layout, so owners refresh their render shell when relayout counters
    change. */
 bool navigation_run_background_resources(NavigationSession *session);
+/* Pump exactly one deferred document-image continuation unit without also
+   advancing webfonts, scripts, or other idle work. Frontends may use this
+   after presenting an input frame so continuous focus/scroll activity cannot
+   starve visible lazy images while input latency remains bounded. */
+bool navigation_run_deferred_image_work(NavigationSession *session);
 bool navigation_background_resources_pending(
     const NavigationSession *session);
+/* Move a still-deferred document image to the next owner-idle slot. If a
+   different two-image batch is active, cancel only its uncommitted suffix;
+   any image already published through layout remains owned by the page. */
+bool navigation_prioritize_deferred_image(
+    NavigationSession *session, lxb_dom_node_t *node);
 /* Close page and frame transport handles before the platform network stack
    is rebuilt. Completed cancellations are consumed by their normal owners. */
 size_t navigation_cancel_network_work(
