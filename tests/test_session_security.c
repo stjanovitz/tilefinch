@@ -1251,6 +1251,43 @@ static int test_typed_response_security_and_request_authority(Budget *budget)
     return 0;
 }
 
+static int test_site_data_inspection_and_clear(Budget *budget)
+{
+    BrowserSession session;
+    CHECK(browser_session_init(&session, budget, 64u * 1024u));
+    CHECK(browser_session_cookie_set_http(
+              &session, "https://www.example.test/page",
+              "sid=abc; Path=/; Secure; HttpOnly")
+          && browser_session_cookie_set_http(
+              &session, "https://other.test/", "other=1; Path=/; Secure")
+          && browser_session_storage_set(
+              &session, "https://www.example.test/page", true,
+              "local", "value", 5)
+          && browser_session_storage_set(
+              &session, "https://www.example.test/page", false,
+              "session", "value", 5));
+    BrowserSiteDataUsage usage = {0};
+    CHECK(browser_session_site_data_usage(
+              &session, "https://www.example.test/elsewhere", &usage)
+          && usage.cookie_count == 1
+          && usage.local_storage_count == 1
+          && usage.session_storage_count == 1
+          && usage.cookie_bytes != 0 && usage.storage_bytes != 0);
+    CHECK(browser_session_clear_site_data(
+              &session, "https://www.example.test/elsewhere")
+          && browser_session_site_data_usage(
+              &session, "https://www.example.test/", &usage)
+          && usage.cookie_count == 0
+          && usage.local_storage_count == 0
+          && usage.session_storage_count == 0);
+    char cookies[64];
+    CHECK(browser_session_cookie_header(
+              &session, "https://other.test/", cookies, sizeof(cookies))
+          && strstr(cookies, "other=1") != NULL);
+    browser_session_destroy(&session);
+    return 0;
+}
+
 int main(void)
 {
     Budget budget;
@@ -1272,6 +1309,7 @@ int main(void)
           && strcmp(tilefinch_request_fetch_site(&opaque_context),
                     "cross-site") == 0);
     CHECK(test_bounded_site_adapter_state(&budget) == 0);
+    CHECK(test_site_data_inspection_and_clear(&budget) == 0);
     CHECK(test_bounded_site_adapter_document_cache(&budget) == 0);
     CHECK(test_global_site_data_policy(&budget) == 0);
     CHECK(test_cookie_eviction_guard(&budget) == 0);

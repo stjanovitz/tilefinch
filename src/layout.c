@@ -879,12 +879,20 @@ bool node_effectively_disabled(lxb_dom_node_t *node)
 
 const char *first_text_data(lxb_dom_node_t *node, size_t *length)
 {
-    for (lxb_dom_node_t *child = node == NULL ? NULL : node->first_child;
-         child != NULL; child = child->next) {
-        const char *text = document_text_data(child, length);
+    if (length == NULL) return NULL;
+    lxb_dom_node_t *boundary = node;
+    lxb_dom_node_t *at = node == NULL ? NULL : node->first_child;
+    size_t visited = 0;
+    while (at != NULL && visited++ < LAYOUT_FALLBACK_VISIT_LIMIT) {
+        const char *text = document_text_data(at, length);
         if (text != NULL && *length != 0) return text;
-        text = first_text_data(child, length);
-        if (text != NULL && *length != 0) return text;
+        if (at->first_child != NULL) {
+            at = at->first_child;
+            continue;
+        }
+        while (at != boundary && at->next == NULL) at = at->parent;
+        if (at == boundary) break;
+        at = at->next;
     }
     *length = 0;
     return NULL;
@@ -1297,6 +1305,26 @@ static void compact_layout_storage(LayoutDocument *layout)
             layout->capacity = layout->count;
         }
     }
+    if (layout->bidi_glyph_count != 0
+        && layout->bidi_glyph_count < layout->bidi_glyph_capacity) {
+        LayoutBidiGlyph *glyphs = budget_realloc(
+            layout->budget, layout->bidi_glyphs,
+            layout->bidi_glyph_count * sizeof(*glyphs));
+        if (glyphs != NULL) {
+            layout->bidi_glyphs = glyphs;
+            layout->bidi_glyph_capacity = layout->bidi_glyph_count;
+        }
+    }
+    if (layout->bidi_command_count != 0
+        && layout->bidi_command_count < layout->bidi_command_capacity) {
+        LayoutBidiCommand *commands = budget_realloc(
+            layout->budget, layout->bidi_commands,
+            layout->bidi_command_count * sizeof(*commands));
+        if (commands != NULL) {
+            layout->bidi_commands = commands;
+            layout->bidi_command_capacity = layout->bidi_command_count;
+        }
+    }
     if (layout->link_count != 0
         && layout->link_count < layout->link_capacity) {
         LinkRegion *links = budget_realloc(
@@ -1553,6 +1581,9 @@ static bool layout_job_init(LayoutBuildJob *job)
     context->web_fonts = layout->web_fonts;
     context->images = job->images;
     context->reuse = job->reuse;
+    context->document_bidi_text_present = job->document->bidi_text_present;
+    context->document_bidi_markup_present =
+        job->document->bidi_markup_present;
     if (job->stylesheet != NULL) {
         context->style_variable_cache_owned = style_variable_cache_begin(
             (Stylesheet *) job->stylesheet, job->budget);
@@ -2017,6 +2048,8 @@ static bool layout_build_context_internal(
     context->web_fonts = layout->web_fonts;
     context->images = images;
     context->reuse = reuse;
+    context->document_bidi_text_present = document->bidi_text_present;
+    context->document_bidi_markup_present = document->bidi_markup_present;
     context->preview_y_limit = preview_y_limit;
     if (stylesheet != NULL) {
         context->style_variable_cache_owned = style_variable_cache_begin(
@@ -2265,7 +2298,10 @@ static bool layout_build_context_internal(
                 "intrinsic-cache-misses=%llu flex-basis=%llu flex-minimum=%llu "
                 "tree-depth=%zu/%u depth-fallbacks=%zu fallback-visits=%zu "
                 "block-scratch-pages=%zu block-scratch-bytes=%zu "
-                "block-scratch-allocation-failures=%zu\n",
+                "block-scratch-allocation-failures=%zu "
+                "bidi-paragraphs=%llu bidi-fallbacks=%llu "
+                "bidi-limit-degradations=%llu bidi-us=%llu "
+                "bidi-peak-transient=%zu\n",
                 (unsigned long long) context->style_resolutions,
                 (unsigned long long) context->style_cache_hits,
                 (unsigned long long) context->style_cache_misses,
@@ -2283,7 +2319,13 @@ static bool layout_build_context_internal(
                 context->block_scratch_page_count
                     * LAYOUT_BLOCK_SCRATCH_PAGE_DEPTH
                     * sizeof(LayoutBlockScratch),
-                context->block_scratch_allocation_failures);
+                context->block_scratch_allocation_failures,
+                (unsigned long long) layout->performance.bidi_paragraphs,
+                (unsigned long long) layout->performance.bidi_line_fallbacks,
+                (unsigned long long)
+                    layout->performance.bidi_limit_degradations,
+                (unsigned long long) layout->performance.bidi_us,
+                layout->performance.bidi_peak_transient_bytes);
     }
     layout->performance.finalize_us =
         layout_performance_now_us() - phase_started_us;
@@ -2677,8 +2719,18 @@ bool layout_clone_visual(LayoutDocument *visual,
     visual->fixed_count = visual->fixed_capacity = source->fixed_count;
     visual->node_box_count = visual->node_box_capacity = source->node_box_count;
     visual->paint_order_count = source->paint_order_count;
+    visual->bidi_glyph_count = visual->bidi_glyph_capacity =
+        source->bidi_glyph_count;
+    visual->bidi_command_count = visual->bidi_command_capacity =
+        source->bidi_command_count;
     visual->commands = clone_array(source->budget, source->commands,
                                    source->count, sizeof(*source->commands));
+    visual->bidi_glyphs = clone_array(
+        source->budget, source->bidi_glyphs, source->bidi_glyph_count,
+        sizeof(*source->bidi_glyphs));
+    visual->bidi_commands = clone_array(
+        source->budget, source->bidi_commands, source->bidi_command_count,
+        sizeof(*source->bidi_commands));
     visual->links = clone_array(source->budget, source->links,
                                 source->link_count, sizeof(*source->links));
     visual->controls = clone_array(source->budget, source->controls,
@@ -2706,6 +2758,8 @@ bool layout_clone_visual(LayoutDocument *visual,
         source->budget, source->paint_order, source->paint_order_count,
         sizeof(*source->paint_order));
     if ((source->count != 0 && visual->commands == NULL)
+        || (source->bidi_glyph_count != 0 && visual->bidi_glyphs == NULL)
+        || (source->bidi_command_count != 0 && visual->bidi_commands == NULL)
         || (source->link_count != 0 && visual->links == NULL)
         || (source->control_count != 0 && visual->controls == NULL)
         || (source->sticky_count != 0 && visual->sticky_ranges == NULL)
@@ -2735,6 +2789,17 @@ bool layout_clone_visual(LayoutDocument *visual,
     visual->viewport.declared = source->viewport.declared;
     visual->viewport.device_width_declared =
         source->viewport.device_width_declared;
+    for (size_t i = 0; i < visual->bidi_glyph_count; i++) {
+        LayoutBidiGlyph *glyph = &visual->bidi_glyphs[i];
+        glyph->x_fixed = layout_fixed_scale_floor(
+            glyph->x_fixed, numerator, denominator);
+        uint64_t advance = (uint64_t) glyph->advance_fixed
+                           * (unsigned) numerator;
+        advance = (advance + (unsigned) denominator - 1u)
+                  / (unsigned) denominator;
+        glyph->advance_fixed = (uint16_t) (
+            advance > UINT16_MAX ? UINT16_MAX : advance);
+    }
     for (size_t i = 0; i < visual->count; i++) {
         DrawCommand *command = &visual->commands[i];
         int text_x_fixed = command->type == DRAW_TEXT
@@ -2785,6 +2850,25 @@ bool layout_clone_visual(LayoutDocument *visual,
                after converting device deltas back to CSS.  Scaling it here
                would apply the viewport ratio twice, sliding a downscaled
                crop with a large negative offset off its art. */
+        } else if (command->type == DRAW_IMAGE) {
+            /* Replaced images pack object-position into radius/font_size.
+               Preserve each percentage and scale only its signed CSS-pixel
+               offset. Treating these words as radius codes corrupts both
+               axes in a scaled visual clone. */
+            uint16_t x = (uint16_t) draw_command_image_offset_x(command);
+            uint16_t y = (uint16_t) draw_command_image_offset_y(command);
+            draw_command_set_object_position(
+                command,
+                style_object_position_encode(
+                    style_object_position_percent(x),
+                    viewport_scale_floor(
+                        style_object_position_offset(x),
+                        numerator, denominator)),
+                style_object_position_encode(
+                    style_object_position_percent(y),
+                    viewport_scale_floor(
+                        style_object_position_offset(y),
+                        numerator, denominator)));
         } else {
             command->radius = layout_scale_radius_code(
                 command->radius, numerator, denominator);
@@ -2883,6 +2967,8 @@ void layout_destroy(LayoutDocument *layout)
         budget_free(layout->budget, layout->node_interaction_ranges);
         budget_free(layout->budget, layout->controls);
         budget_free(layout->budget, layout->generated_text_storage);
+        budget_free(layout->budget, layout->bidi_glyphs);
+        budget_free(layout->budget, layout->bidi_commands);
         budget_free(layout->budget, layout->sticky_ranges);
         budget_free(layout->budget, layout->fixed_ranges);
         budget_free(layout->budget, layout->node_boxes);

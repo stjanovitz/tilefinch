@@ -134,11 +134,12 @@ static void fill_motion(uint32_t *pixels, unsigned phase)
     }
 }
 
-static bool row_is_declared(
-    int y, const PspUiRowBand *bands, size_t count)
+static bool pixel_is_declared(
+    int x, int y, const PspUiOverlayRegion *regions, size_t count)
 {
     for (size_t at = 0; at < count; at++) {
-        if (y >= bands[at].top && y < bands[at].bottom) return true;
+        if (x >= regions[at].left && x < regions[at].right
+            && y >= regions[at].top && y < regions[at].bottom) return true;
     }
     return false;
 }
@@ -148,19 +149,19 @@ static bool render(PresentationHarness *harness, unsigned phase)
     fill_motion(harness->frame, phase);
     static uint32_t source[WIDTH * HEIGHT];
     memcpy(source, harness->frame, sizeof(source));
-    PspUiRowBand bands[PSP_UI_MEDIA_OVERLAY_BAND_LIMIT];
-    size_t count = psp_ui_media_overlay_bands(
-        &harness->ui, WIDTH, HEIGHT, bands,
-        PSP_UI_MEDIA_OVERLAY_BAND_LIMIT);
+    PspUiOverlayRegion regions[PSP_UI_MEDIA_OVERLAY_REGION_LIMIT];
+    size_t count = psp_ui_media_overlay_regions(
+        &harness->ui, NULL, WIDTH, HEIGHT, regions,
+        PSP_UI_MEDIA_OVERLAY_REGION_LIMIT);
     psp_ui_media_composite_8888(
         &harness->ui, NULL, harness->frame,
         WIDTH, HEIGHT, WIDTH, harness->scratch);
     for (int y = 0; y < HEIGHT; y++) {
-        if (row_is_declared(y, bands, count)) continue;
-        CHECK(memcmp(
-                  harness->frame + (size_t) y * WIDTH,
-                  source + (size_t) y * WIDTH,
-                  WIDTH * sizeof(*source)) == 0);
+        for (int x = 0; x < WIDTH; x++) {
+            if (pixel_is_declared(x, y, regions, count)) continue;
+            CHECK(harness->frame[(size_t) y * WIDTH + x]
+                  == source[(size_t) y * WIDTH + x]);
+        }
     }
     return true;
 }

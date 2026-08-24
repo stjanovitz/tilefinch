@@ -3,6 +3,18 @@ static uint64_t navigation_elapsed_us(uint64_t started, uint64_t finished)
     return finished >= started ? finished - started : 0;
 }
 
+static void navigation_stream_capture_server_body(
+    NavigationDocumentStream *stream, PocDocument *document)
+{
+    if (stream == NULL || document == NULL
+        || stream->server_body_snapshot.markup != NULL) return;
+    /* Capture at most once. Serializing before every blocking script would
+       turn a safety net into quadratic parser work; if a head script has no
+       useful body yet, capture simply fails and the next checkpoint retries. */
+    (void) document_body_snapshot_capture(
+        document, &stream->server_body_snapshot);
+}
+
 static void navigation_record_blocking_script_sample(
     NavigationSession *session,
     const NavigationBlockingScriptSample *sample)
@@ -143,6 +155,7 @@ static bool navigation_stream_element_closed(void *opaque,
         script_runtime_telemetry(stream->runtime, &telemetry_before);
         size_t source_bytes_before = stream->scripts.early.bytes;
         uint64_t script_started = navigation_now_us();
+        navigation_stream_capture_server_body(stream, document);
         bool processed = document_scripts_process_closed(
             stream->runtime, session->budget, session->browser_session,
             stream->resource_base_url, stream->document_url,
@@ -304,6 +317,7 @@ static bool navigation_stream_element_closed(void *opaque,
         navigation_stream_settle_script_preload(
             stream, source_reference);
     }
+    navigation_stream_capture_server_body(stream, document);
     bool processed = document_scripts_process_closed(
         stream->runtime, session->budget, session->browser_session,
         stream->resource_base_url, stream->document_url,

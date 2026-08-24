@@ -1132,6 +1132,10 @@ NavigationLoadStatus navigation_load_pump(
     session->last_http_status = load->response.status_code;
     session->last_transport_code = load->response.transport_code;
     session->last_tls_verify_result = load->response.tls_verify_result;
+    session->last_tls_verify_result_available =
+        load->response.tls_verify_result_available;
+    session->last_tls_verification_failed =
+        load->response.tls_verification_failed;
     session->last_transport_timed_out = load->response.timed_out;
     session->last_tls12_compatibility_retry =
         load->response.tls12_compatibility_retry;

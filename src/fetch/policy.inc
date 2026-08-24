@@ -150,6 +150,27 @@ static bool fetch_request_is_top_level_navigation(const FetchRequest *request)
         && strcasecmp(request->sec_fetch_mode, "navigate") == 0;
 }
 
+static bool fetch_request_is_captive_portal_navigation_with_session(
+    const FetchRequest *request, const BrowserSession *session)
+{
+    if (request == NULL || session == NULL
+        || !browser_session_captive_portal_active(session)
+        || !fetch_request_is_top_level_navigation(request)) return false;
+    const TilefinchRequestContext *page = request->page_context;
+    return page != NULL
+        && (browser_session_captive_portal_url_allowed(
+                session, page->initiator_url)
+            || browser_session_captive_portal_url_allowed(
+                session, page->target_url));
+}
+
+static bool fetch_request_is_captive_portal_navigation(
+    const FetchRequest *request)
+{
+    return fetch_request_is_captive_portal_navigation_with_session(
+        request, request == NULL ? NULL : request->cookie_session);
+}
+
 static bool fetch_url_has_private_address_literal(const TilefinchUrl *url);
 
 static bool fetch_url_names_local_network(const char *url)
@@ -175,10 +196,19 @@ static bool fetch_url_names_local_network(const char *url)
                            local_suffix, suffix_length) == 0);
 }
 
-static bool fetch_request_private_network_protected(
-    const FetchRequest *request, const char *initial_url)
+static bool fetch_request_private_network_protected_with_session(
+    const FetchRequest *request, const BrowserSession *session,
+    const char *initial_url)
 {
     if (request == NULL) return false;
+    if (session != NULL
+        && browser_session_captive_portal_url_allowed(
+            session, initial_url)) return false;
+    /* An active portal session is an exact-origin grant.  A redirect does
+       not inherit the initiating portal's authority to reach a second LAN
+       origin, even when both addresses are private. */
+    if (session != NULL && browser_session_captive_portal_active(session))
+        return true;
     if (request->block_private_network) return true;
     const TilefinchRequestContext *page = request->page_context;
     /* Only an explicit user-entered navigation whose requested address is
@@ -197,6 +227,14 @@ static bool fetch_request_private_network_protected(
         ? request->initiator_url : request->page_context->initiator_url;
     return request->page_context != NULL
         && !fetch_url_names_local_network(initiator);
+}
+
+static bool fetch_request_private_network_protected(
+    const FetchRequest *request, const char *initial_url)
+{
+    return fetch_request_private_network_protected_with_session(
+        request, request == NULL ? NULL : request->cookie_session,
+        initial_url);
 }
 
 static bool fetch_request_mixed_override(const FetchRequest *request)
@@ -258,7 +296,10 @@ static bool fetch_request_prepare_security_url_with_session(
         && !tilefinch_url_potentially_trustworthy(upgraded)
         /* Explicit LAN navigation is a supported escape hatch. Do not turn
            http://192.168.x.y into a request its appliance cannot answer. */
-        && !fetch_url_names_local_network(upgraded);
+        && !fetch_url_names_local_network(upgraded)
+        && !browser_session_captive_portal_url_allowed(
+            security_session, upgraded)
+        && !fetch_request_is_captive_portal_navigation(request);
     const char *initiator_url = request == NULL ? NULL
         : (request->page_context == NULL ? request->initiator_url
             : request->page_context->initiator_url);
@@ -300,8 +341,9 @@ static bool fetch_request_prepare_security_url(
  * accidentally omit it. It is also applied again to every explicit redirect
  * hop; libcurl never follows redirects on its own.
  */
-static bool fetch_request_target_allowed(const FetchRequest *request,
-                                         const char *target_url)
+static bool fetch_request_target_allowed_with_session(
+    const FetchRequest *request, const BrowserSession *session,
+    const char *target_url)
 {
     const TilefinchRequestContext *page = request == NULL
         ? NULL : request->page_context;
@@ -309,10 +351,24 @@ static bool fetch_request_target_allowed(const FetchRequest *request,
         ? (request == NULL ? NULL : request->initiator_url)
         : page->initiator_url;
     if (target_url == NULL) return false;
+    bool captive_portal_active = request != NULL && session != NULL
+        && browser_session_captive_portal_active(session);
+    if (captive_portal_active
+        && page != NULL
+        && page->destination == TILEFINCH_DESTINATION_MEDIA) return false;
+    bool captive_portal_target = request != NULL && session != NULL
+        && browser_session_captive_portal_url_allowed(
+            session, target_url);
     if (page != NULL && request->content_security_policy != NULL
         && !tilefinch_csp_allows_request(
                request->content_security_policy, page->destination,
                target_url)) return false;
+    /* Portal authority relaxes only mixed-content/PNA policy. It must not
+       bypass the portal document's own CSP. Initial user navigation is still
+       admitted far enough for the resolved-peer PNA guard to provide its
+       specific diagnostic; redirect hops require an exact admitted origin. */
+    if (fetch_request_is_captive_portal_navigation(request)) return true;
+    if (captive_portal_active) return captive_portal_target;
     if (initiator_url == NULL) return true;
     TilefinchUrl initiator;
     TilefinchUrl target;
@@ -324,6 +380,24 @@ static bool fetch_request_target_allowed(const FetchRequest *request,
         return true;
     }
     return fetch_request_mixed_override(request);
+}
+
+bool fetch_request_security_allows_target(const FetchRequest *request,
+                                          const char *target_url)
+{
+    /* Portal authority relaxes mixed-content/PNA policy in the shared check,
+       but never the initiating document's CSP.  Keeping the single policy
+       path also ensures the initial request and every redirect hop make the
+       same decision. */
+    return fetch_request_target_allowed_with_session(
+        request, request == NULL ? NULL : request->cookie_session,
+        target_url);
+}
+
+static bool fetch_request_target_allowed(const FetchRequest *request,
+                                         const char *target_url)
+{
+    return fetch_request_security_allows_target(request, target_url);
 }
 
 static ContentBlocker *fetch_request_content_blocker(

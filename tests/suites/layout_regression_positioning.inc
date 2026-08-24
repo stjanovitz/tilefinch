@@ -294,6 +294,18 @@
           && grid_track_sheet.grid_tracks->capacity
              < STYLE_GRID_TRACK_BLOCK_COUNT
           && grid_track_sheet.grid_areas == NULL);
+    size_t retained_grid_floor = sizeof(*grid_track_sheet.grid_tracks)
+        + grid_track_sheet.grid_tracks->capacity
+            * sizeof(*grid_track_sheet.grid_tracks->blocks);
+    for (size_t block = 0;
+         block < grid_track_sheet.grid_tracks->capacity; block++) {
+        if (grid_track_sheet.grid_tracks->blocks[block] != NULL) {
+            retained_grid_floor += STYLE_GRID_TRACK_BLOCK_SIZE
+                * sizeof(*grid_track_sheet.grid_tracks->blocks[block]);
+        }
+    }
+    CHECK(stylesheet_retained_bytes(&grid_track_sheet)
+          >= retained_grid_floor);
     lxb_dom_node_t *weighted = find_id(
         lxb_dom_interface_node(grid_track_document.html), "weighted");
     lxb_dom_node_t *weighted_a = find_id(
@@ -658,6 +670,57 @@
     layout_destroy(&grid_rows_layout);
     stylesheet_destroy(&grid_rows_sheet);
     document_destroy(&grid_rows_document);
+    CHECK(budget.current == 0);
+
+    puts("test: mixed explicit grid rows retain all bounded track heights");
+    static const char mixed_grid_rows_page[] =
+        "<!doctype html><style>html,body{margin:0;padding:0}"
+        "#grid{display:grid;width:40px;"
+        "grid-template-rows:10px 11px 12px 13px 14px 15px 16px 17px 18px}"
+        "#r1{grid-row:1}#r2{grid-row:2}#r3{grid-row:3}#r4{grid-row:4}"
+        "#r5{grid-row:5}#r6{grid-row:6}#r7{grid-row:7}#r8{grid-row:8}"
+        "#ninth{grid-row:9}</style><div id=grid>"
+        "<i id=r1></i><i id=r2></i><i id=r3></i><i id=r4></i>"
+        "<i id=r5></i><i id=r6></i><i id=r7></i><i id=r8></i>"
+        "<i id=ninth>N</i></div>";
+    PocDocument mixed_grid_rows_document = {0};
+    Stylesheet mixed_grid_rows_sheet = {0};
+    LayoutDocument mixed_grid_rows_layout = {0};
+    CHECK(document_parse(
+              &mixed_grid_rows_document, &budget, mixed_grid_rows_page,
+              strlen(mixed_grid_rows_page), 16)
+          && stylesheet_build(
+              &mixed_grid_rows_sheet, &budget,
+              &mixed_grid_rows_document, 80)
+          && layout_build(
+              &mixed_grid_rows_layout, &budget,
+              &mixed_grid_rows_document, &mixed_grid_rows_sheet,
+              NULL, NULL, 80));
+    lxb_dom_node_t *mixed_grid_rows_root = lxb_dom_interface_node(
+        mixed_grid_rows_document.html);
+    lxb_dom_node_t *mixed_grid_node = find_id(
+        mixed_grid_rows_root, "grid");
+    ComputedStyle mixed_grid_style = style_for_node(
+        &mixed_grid_rows_sheet, mixed_grid_node, NULL);
+    const LayoutNodeBox *ninth_row_box = layout_box_for_node(
+        &mixed_grid_rows_layout,
+        find_id(mixed_grid_rows_root, "ninth"));
+    if (ninth_row_box == NULL || ninth_row_box->y != 108
+        || ninth_row_box->height != 18) {
+        fprintf(stderr, "mixed ninth row y=%d height=%d\n",
+                ninth_row_box == NULL ? INT_MIN : ninth_row_box->y,
+                ninth_row_box == NULL ? INT_MIN : ninth_row_box->height);
+        fprintf(stderr, "mixed rows declared=%u row9=%u\n",
+                stylesheet_grid_track_count(
+                    &mixed_grid_rows_sheet, &mixed_grid_style, true),
+                stylesheet_grid_track_value(
+                    &mixed_grid_rows_sheet, &mixed_grid_style, true, 8));
+    }
+    CHECK(ninth_row_box != NULL && ninth_row_box->y == 108
+          && ninth_row_box->height == 18);
+    layout_destroy(&mixed_grid_rows_layout);
+    stylesheet_destroy(&mixed_grid_rows_sheet);
+    document_destroy(&mixed_grid_rows_document);
     CHECK(budget.current == 0);
 
     puts("test: zero-flex grid rows collapse bounded accordion content");
@@ -1084,6 +1147,8 @@
         "16px 17px 18px 19px 20px 21px}"
         "#row-min{display:grid;grid-template-rows:minmax(25px,1fr);"
         "grid-template-columns:25% 1.5fr}"
+        "#bounded-name{display:grid;"
+        "grid-template-columns:repeat(15,1px)[end]}"
         "</style><body><div id=parent><div id=child>"
         "<i id=inherited-column></i><i id=local-column></i>"
         "<i id=inherited-row></i></div></div>"
@@ -1091,7 +1156,8 @@
         "<i id=override-column></i><i id=override-row></i></div></div>"
         "<div id=wide><i></i><i></i><i></i><i></i><i></i><i></i>"
         "<i></i><i></i><i></i><i></i><i></i>"
-        "<i id=wide-last></i></div><div id=row-min></div></body>";
+        "<i id=wide-last></i></div><div id=row-min></div>"
+        "<div id=bounded-name></div></body>";
     PocDocument subgrid_document;
     Stylesheet subgrid_sheet;
     LayoutDocument subgrid_layout;
@@ -1114,6 +1180,7 @@
     lxb_dom_node_t *wide = find_id(subgrid_root, "wide");
     lxb_dom_node_t *wide_last = find_id(subgrid_root, "wide-last");
     lxb_dom_node_t *row_min = find_id(subgrid_root, "row-min");
+    lxb_dom_node_t *bounded_name = find_id(subgrid_root, "bounded-name");
     lxb_dom_node_t *override_parent =
         find_id(subgrid_root, "override-parent");
     lxb_dom_node_t *override_child =
@@ -1125,7 +1192,7 @@
     CHECK(subgrid_parent != NULL && subgrid_child != NULL
           && inherited_column != NULL && local_column != NULL
           && inherited_row != NULL && wide != NULL && wide_last != NULL
-          && row_min != NULL
+          && row_min != NULL && bounded_name != NULL
           && override_parent != NULL && override_child != NULL
           && override_column != NULL && override_row != NULL);
     ComputedStyle subgrid_child_style = style_for_node(
@@ -1134,6 +1201,8 @@
         &subgrid_sheet, wide, NULL);
     ComputedStyle row_min_style = style_for_node(
         &subgrid_sheet, row_min, NULL);
+    ComputedStyle bounded_name_style = style_for_node(
+        &subgrid_sheet, bounded_name, NULL);
     char subgrid_columns[160];
     char wide_columns[256];
     char fractional_columns[64];
@@ -1186,6 +1255,8 @@
                  &subgrid_sheet, &row_min_style, true,
                  minimum_rows, sizeof(minimum_rows))
           && strcmp(minimum_rows, "minmax(25px,1fr)") == 0);
+    CHECK(stylesheet_grid_track_count(
+              &subgrid_sheet, &bounded_name_style, false) == 0);
     CHECK(subgrid_parent_box != NULL && subgrid_child_box != NULL
           && inherited_column_box != NULL && local_column_box != NULL
           && inherited_row_box != NULL
@@ -1822,6 +1893,7 @@
         "#scroller{display:block;width:120px;height:80px;overflow:auto;"
         "scroll-snap-type:y mandatory;scroll-padding-top:1px;"
         "scroll-padding:10px;scroll-padding-right:14px;"
+        "scroll-padding-top:25%;scroll-padding-bottom:50%;"
         "overscroll-behavior-y:auto;overscroll-behavior:contain;"
         "overscroll-behavior-x:auto;scrollbar-width:thin}"
         "#scroller>div{display:block;height:60px}"
@@ -1858,9 +1930,11 @@
           && scroll_interaction_layout.scroll_container_count == 1
           && scroll_interaction_layout.scroll_snap_candidate_count == 1
           && !scroll_interaction_layout.scroll_metadata_truncated);
-    CHECK(scroll_interaction_layout.scroll_containers[0].padding_top == 10
+    CHECK(scroll_interaction_layout.scroll_containers[0].padding_top == 20
           && scroll_interaction_layout.scroll_containers[0].padding_right
-             == 14);
+             == 14
+          && scroll_interaction_layout.scroll_containers[0].padding_bottom
+             == 40);
     CHECK(scroll_interaction_layout.scroll_snap_candidates[0].margin_top == 5
           && scroll_interaction_layout.scroll_snap_candidates[0].margin_right
              == 7);
@@ -1870,17 +1944,23 @@
                  == LAYOUT_CURSOR_POINTER
           && layout_scroll_node_reveal(
                  &scroll_interaction_layout, scroll_target));
-    CHECK(scroll_scroller_box->scroll_y == 55
-          && layout_scroll_node(
-                 &scroll_interaction_layout, scroll_scroller, 0, 0)
+    int reveal_scroll_y = scroll_scroller_box->scroll_y;
+    CHECK(layout_scroll_node(
+              &scroll_interaction_layout, scroll_scroller, 0, 0)
           && layout_scroll_node_chain(
-                 &scroll_interaction_layout, scroll_target,
-                 0, 70, NULL, &remaining_y)
-          && remaining_y == 0
-          && scroll_scroller_box->scroll_y == 70
-          && layout_scroll_node_settle(
-                 &scroll_interaction_layout, scroll_target)
-          && scroll_scroller_box->scroll_y == 45);
+              &scroll_interaction_layout, scroll_target,
+              0, 70, NULL, &remaining_y));
+    int chained_scroll_y = scroll_scroller_box->scroll_y;
+    CHECK(layout_scroll_node_settle(
+        &scroll_interaction_layout, scroll_target));
+    int settled_scroll_y = scroll_scroller_box->scroll_y;
+    if (reveal_scroll_y != 85 || chained_scroll_y != 70
+        || settled_scroll_y != 35) {
+        fprintf(stderr, "scroll percentages reveal=%d chain=%d settle=%d\n",
+                reveal_scroll_y, chained_scroll_y, settled_scroll_y);
+    }
+    CHECK(reveal_scroll_y == 85 && remaining_y == 0
+          && chained_scroll_y == 70 && settled_scroll_y == 35);
     CHECK(layout_scroll_node_chain(
               &scroll_interaction_layout, scroll_target,
               40, 100, &remaining_x, &remaining_y)

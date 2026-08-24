@@ -22,7 +22,11 @@ enum {
     STYLE_MODERN_LOGICAL_RADIUS = 1u << 9,
     STYLE_MODERN_TYPOGRAPHY = 1u << 10,
     STYLE_MODERN_MIX_BLEND = 1u << 11,
-    STYLE_MODERN_BACKDROP_FILTER = 1u << 12
+    STYLE_MODERN_BACKDROP_FILTER = 1u << 12,
+    STYLE_MODERN_BACKFACE_VISIBILITY = 1u << 13,
+    STYLE_MODERN_TRANSFORM_STYLE = 1u << 14,
+    STYLE_MODERN_COLOR_SCHEME = 1u << 15,
+    STYLE_MODERN_BORDER_IMAGE = 1u << 16
 };
 
 enum {
@@ -682,6 +686,10 @@ enum {
     STYLE_CONTAINER_TYPE_SIZE
 };
 
+/* Host regression seam. Production never arms it; the browser remains
+   single-threaded while style probes mutate their temporary marker. */
+void style_test_inject_focus_marker_remove_failures(size_t count);
+
 /* Selectors are bounded to 191 bytes, so the upper byte of the prepared
    rightmost-compound offset can carry a one-based @container query id
    without growing StyleRule on the PSP. */
@@ -897,7 +905,7 @@ bool style_copy_border_color(
     Stylesheet *sheet, ComputedStyle *target, const ComputedStyle *source,
     StyleBorderSide side);
 bool style_parse_pair_with_auto(const Stylesheet *sheet, const char *text, size_t length, int values[2], bool automatic[2], bool percentages[2]);
-void style_parse_pair(const Stylesheet *sheet, const char *text, size_t length, int *first, int *second);
+bool style_parse_pair(const Stylesheet *sheet, const char *text, size_t length, int *first, int *second);
 bool style_parse_grid_line(const Stylesheet *sheet, const char *text, size_t length, int *line, int *span);
 bool style_parse_grid_track(const Stylesheet *sheet, const char *text,
                             size_t length, uint8_t *type, unsigned *value,

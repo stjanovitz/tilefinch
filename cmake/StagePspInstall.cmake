@@ -1,11 +1,11 @@
-if(NOT LAUNCHER_EBOOT OR NOT BROWSER_EBOOT OR NOT ASSET_DIR OR NOT OUTPUT
-        OR NOT SOURCE_DIR)
+if(NOT LAUNCHER_EBOOT OR NOT BROWSER_EBOOT OR NOT XMB_REDIRECT_PRX
+        OR NOT ASSET_DIR OR NOT OUTPUT OR NOT SOURCE_DIR)
     message(FATAL_ERROR
-        "StagePspInstall requires LAUNCHER_EBOOT, BROWSER_EBOOT, ASSET_DIR, "
-        "SOURCE_DIR, and OUTPUT")
+        "StagePspInstall requires LAUNCHER_EBOOT, BROWSER_EBOOT, "
+        "XMB_REDIRECT_PRX, ASSET_DIR, SOURCE_DIR, and OUTPUT")
 endif()
 foreach(required IN ITEMS
-        "${LAUNCHER_EBOOT}" "${BROWSER_EBOOT}"
+        "${LAUNCHER_EBOOT}" "${BROWSER_EBOOT}" "${XMB_REDIRECT_PRX}"
         "${ASSET_DIR}/roots.pem" "${ASSET_DIR}/boot-defaults.cfg"
         "${ASSET_DIR}/fonts"
         "${SOURCE_DIR}/LICENSE"
@@ -20,9 +20,12 @@ foreach(required IN ITEMS
 endforeach()
 file(REMOVE_RECURSE "${OUTPUT}")
 file(MAKE_DIRECTORY
-    "${OUTPUT}/slot-a" "${OUTPUT}/slot-b" "${OUTPUT}/data")
+    "${OUTPUT}/slot-a" "${OUTPUT}/slot-b" "${OUTPUT}/data"
+    "${OUTPUT}/OPTIONAL")
 file(COPY_FILE "${LAUNCHER_EBOOT}" "${OUTPUT}/EBOOT.PBP")
 file(COPY_FILE "${BROWSER_EBOOT}" "${OUTPUT}/slot-a/EBOOT.PBP")
+file(COPY_FILE "${XMB_REDIRECT_PRX}"
+    "${OUTPUT}/OPTIONAL/tilefinch_xmb.prx")
 file(COPY
     "${ASSET_DIR}/roots.pem"
     "${ASSET_DIR}/boot-defaults.cfg"

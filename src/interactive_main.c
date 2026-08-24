@@ -34,6 +34,7 @@
 #include "tilefinch/section_router.h"
 #include "tilefinch/script_loader.h"
 #include "tilefinch/session.h"
+#include "tilefinch/site_adapter.h"
 #include "tilefinch/youtube_resolver.h"
 
 #define MIB (1024u * 1024u)
@@ -275,6 +276,7 @@ int main(int argc, char **argv)
     bool forced_dark = false;
     bool progressive_first_paint = true;
     bool hide_cookie_banners = false;
+    bool reader_mode = false;
     bool wpt_test_rendered = false;
     bool low_memory_navigation = false;
     bool experimental_compressed_sections = false;
@@ -323,6 +325,9 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--hide-cookie-banners") == 0) {
             hide_cookie_banners = true;
+        }
+        else if (strcmp(argv[i], "--reader-mode") == 0) {
+            reader_mode = true;
         }
         else if (strcmp(argv[i], "--adaptive-resources") == 0) {
             adaptive_resources = true;
@@ -538,7 +543,9 @@ int main(int argc, char **argv)
             && (visual_state_marker == NULL || commands_path == NULL
                 || !deterministic_replay_requested
                 || !response_keyed_replay || !loop_capture_frames))
-        || (probe_script != NULL && fixture == NULL)) {
+        || (probe_script != NULL && fixture == NULL)
+        || (reader_mode && (user_css != NULL || hide_cookie_banners
+                            || experimental_compressed_sections))) {
         usage(argv[0]); return 2;
     }
 
@@ -1539,6 +1546,30 @@ int main(int argc, char **argv)
         dump_probe_dom(lxb_dom_interface_node(navigation.page.document.html),
                        0, &remaining);
     }
+    if (reader_mode) {
+        ReaderDocumentAnalysis reader = {0};
+        const NavigationEntry *entry = navigation_current(&navigation);
+        const char *reader_url = entry == NULL
+            ? navigation.page.document_url : entry->url;
+        char reader_css[SITE_ADAPTER_READER_CSS_LIMIT];
+        char adapter[32];
+        if (!browser_engine_prepare_reader(engine, &reader)
+            || !site_adapter_reader_css(
+                   reader_url, SITE_ADAPTER_READER_FONT_SANS, 100u,
+                   reader_css, sizeof(reader_css), adapter, sizeof(adapter))
+            || !browser_engine_apply_user_css(
+                   engine, reader_css, strlen(reader_css))) {
+            fprintf(stderr, "interactive Reader mode failed\n");
+            goto cleanup;
+        }
+        printf("reader-mode kind=%s high-confidence=%s entries=%u "
+               "visited=%u bounded=%s adapter=%s\n",
+               reader_page_kind_name(reader.kind),
+               reader.high_confidence ? "yes" : "no",
+               (unsigned) reader.listing_entries,
+               (unsigned) reader.visited_nodes,
+               reader.bounded_out ? "yes" : "no", adapter);
+    }
     application->engine_controller = browser_engine_controller(engine);
     if (application->engine_controller == NULL) {
         if (!browser_engine_refresh_shell(engine)) goto cleanup;
@@ -2240,7 +2271,8 @@ int main(int argc, char **argv)
            "margin-visits=%llu cache=%llu/%llu "
            "iterators=%llu/%llu+%llu/%llu "
            "flex-measures=%llu/%llu "
-           "float-bands=%llu/%llu style-copy-bytes=%llu\n",
+           "float-bands=%llu/%llu coordinate=%llu/%llu@%d "
+           "style-copy-bytes=%llu\n",
            (unsigned long long) layout_performance->total_us,
            (unsigned long long) layout_performance->root_style_us,
            (unsigned long long) layout_performance->flow_us,
@@ -2289,6 +2321,9 @@ int main(int argc, char **argv)
            (unsigned long long) layout_performance->flex_minimum_requests,
            (unsigned long long) layout_performance->float_band_queries,
            (unsigned long long) layout_performance->float_exclusion_probes,
+           (unsigned long long) layout_performance->coordinate_clamps,
+           (unsigned long long) layout_performance->coordinate_containments,
+           layout_performance->first_coordinate_clamp_y,
            (unsigned long long) (
              layout_performance->style_resolutions
              * sizeof(ComputedStyle)));

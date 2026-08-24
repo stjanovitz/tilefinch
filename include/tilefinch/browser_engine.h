@@ -317,6 +317,10 @@ bool browser_engine_set_javascript_enabled(
     BrowserEngine *engine, bool enabled);
 const char *browser_engine_last_error(const BrowserEngine *engine);
 long browser_engine_last_tls_verify_result(const BrowserEngine *engine);
+bool browser_engine_last_tls_verify_result_available(
+    const BrowserEngine *engine);
+bool browser_engine_last_tls_verification_failed(
+    const BrowserEngine *engine);
 TilefinchDiagnosticCode browser_engine_last_diagnostic_code(
     const BrowserEngine *engine);
 bool browser_engine_metrics(const BrowserEngine *engine,
@@ -528,7 +532,7 @@ bool browser_engine_optional_glyphs_updated(BrowserEngine *engine);
 bool browser_engine_optional_glyph_payloads_ready(BrowserEngine *engine);
 /* Visible Unicode-script hints gathered without a second DOM walk. The
    frontend may use these to attach installed optional glyph packs lazily. */
-uint8_t browser_engine_glyph_script_mask(const BrowserEngine *engine);
+uint16_t browser_engine_glyph_script_mask(const BrowserEngine *engine);
 /* Choose the generated YouTube search-result density. This is an engine
    preference, not a query parameter exposed by the provider page. */
 bool browser_engine_set_youtube_compact_results(
@@ -602,6 +606,11 @@ typedef struct {
     int focus_y;
     int focus_width;
     int focus_height;
+    long tls_verify_result;
+    bool tls_verify_result_available;
+    bool tls_verification_failed;
+    char tls_version[16];
+    char tls_peer_issuer[TILEFINCH_TLS_PEER_ISSUER_LIMIT];
     uint64_t navigation_generation;
 } BrowserViewSnapshot;
 

@@ -6,6 +6,13 @@ profile/module/init/association ladder remains intact and is invoked as the
 `Starting` service. The supervisor makes ownership, suspend, retry and
 teardown policy explicit around that proven ladder.
 
+`Ready` deliberately means “associated with an IP address.” Internet
+availability and captive-portal sign-in are not extra supervisor states: the
+browser's on-demand, isolated portal operation holds an ordinary transport
+lease while it probes and renders, then reports success or failure without
+changing stack ownership. See the captive-portal section of the public
+security model for that authority boundary.
+
 ## Control model
 
 ```mermaid

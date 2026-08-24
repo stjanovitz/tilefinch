@@ -112,6 +112,7 @@ static const char *const runtime_host_callback_names[
     "__tilefinchPendingTimers",
     "__tilefinchPendingNetworkRequests",
     "__tilefinchDeliverNetwork",
+    "__tilefinchDetachNetwork",
     "__tilefinchPumpTimers",
     "__tilefinchRebindDocument",
     "__tilefinchCommitSameDocument",
@@ -585,6 +586,13 @@ lxb_dom_node_t *script_runtime_node_handle_resolve(
             ? runtime->bridge.nodes[slot] : NULL;
 }
 
+lxb_dom_node_t *script_runtime_node_handle_resolve_connected(
+    const ScriptRuntime *runtime, long handle)
+{
+    lxb_dom_node_t *node = script_runtime_node_handle_resolve(runtime, handle);
+    return node != NULL && bridge_node_is_connected(node) ? node : NULL;
+}
+
 bool script_runtime_dynamic_script_is_scheduled(
     const ScriptRuntime *runtime, const lxb_dom_node_t *node)
 {
@@ -697,6 +705,13 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
 {
     if (completed_out != NULL) *completed_out = 0;
     DomBridge *bridge = &runtime->bridge;
+    if (bridge->document == NULL) {
+        /* detach_document() drains normal work before clearing authority.
+           This guard keeps a partial/OOM cleanup from turning a stale count
+           into a document-budget dereference. */
+        (void) script_runtime_cancel_network(runtime, "document detached");
+        return true;
+    }
     for (;;) {
         if (bridge->fetch_scheduler != NULL
             && fetch_scheduler_pending(bridge->fetch_scheduler) >= 4) break;

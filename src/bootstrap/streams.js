@@ -29,8 +29,10 @@
     }
     releaseLock() {
       if (!this._stream) return;
-      if (this._stream._reads.length)
-        throw new TypeError("reader has pending reads");
+      if (this._stream._reads.length) {
+        const error = new TypeError("reader lock released");
+        for (const read of this._stream._reads.splice(0)) read.reject(error);
+      }
       this._stream.locked = false;
       this._stream = null;
     }

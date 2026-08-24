@@ -988,23 +988,12 @@ void psp_app_apply_setting(
         } else {
             psp_profile_store_mark_dirty(
                 &app->browser->profile_store, frame->ui_sample_us);
-            char reload_url[NAVIGATION_URL_LIMIT];
-            snprintf(reload_url, sizeof(reload_url), "%s", app->process->presentation.ui.url);
-            bool started = psp_begin_page_load(
-                engine, &app->process->presentation.ui, profile, engine_frame, &app->process->text_input,
-                reload_url, false, 4 * MIB, 30000);
-            if (started) {
-                app->interactive->navigation_job_started_us =
-                    (uint64_t) sceKernelGetSystemTimeWide();
-                psp_ui_show_status(
-                    &app->process->presentation.ui,
-                    desired ? "SITE ALLOWED - RELOADING"
-                            : "BLOCKING SITE - RELOADING",
-                    240);
-            } else {
-                psp_ui_show_status(
-                    &app->process->presentation.ui, "SITE SETTING SAVED - RELOAD FAILED", 300);
-            }
+            psp_app_reload_for_site_security_setting(
+                app, frame,
+                desired ? "SITE ALLOWED - RELOADING"
+                        : "BLOCKING SITE - RELOADING",
+                desired ? "SITE ALLOWLIST SAVED"
+                        : "SITE BLOCKING SAVED");
         }
     }
     if (intent->setting.id == PSP_UI_SETTING_COOKIE_BANNER_HIDDEN) {

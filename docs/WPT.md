@@ -55,6 +55,7 @@ be updated deliberately rather than hidden by a permissive runner.
 | scroll interaction | `run-upstream-wpt-scroll-interaction.sh` | overflow, snapping, anchoring, focus scrolling |
 | modern mobile CSS | `run-upstream-wpt-modern-mobile-css.sh` | mobile presentation and interaction properties |
 | intrinsic/clamp/visibility | `run-upstream-wpt-intrinsic-clamp-visibility.sh` | intrinsic sizing, line clamp, content visibility |
+| Canvas 2D | `run-upstream-wpt-canvas2d.sh` | paths, drawing state, and bounded shadows |
 
 The path lists are larger than the executable manifests because they include
 support files, reference pages, fonts, stylesheets, and scripts required by

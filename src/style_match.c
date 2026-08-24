@@ -113,23 +113,30 @@ static void scan_select_options(lxb_dom_node_t *node,
                                 lxb_dom_node_t **first,
                                 lxb_dom_node_t **selected)
 {
-    for (lxb_dom_node_t *child = node == NULL ? NULL : node->first_child;
-         child != NULL; child = child->next) {
-        if (style_tag_is(child, "option")) {
-            if (*first == NULL) *first = child;
+    if (node == NULL) return;
+    lxb_dom_node_t *at = node->first_child;
+    while (at != NULL) {
+        if (style_tag_is(at, "option")) {
+            if (*first == NULL) *first = at;
             size_t state_length = 0;
             const char *state = document_attribute(
-                child, "data-tilefinch-option-selected", &state_length);
+                at, "data-tilefinch-option-selected", &state_length);
             bool is_selected = state != NULL
                 ? state_length == 4 && memcmp(state, "true", 4) == 0
                 : lxb_dom_element_has_attribute(
-                      lxb_dom_interface_element(child),
+                      lxb_dom_interface_element(at),
                       (const lxb_char_t *) "selected", 8);
             if (*selected == NULL && is_selected) {
-                *selected = child;
+                *selected = at;
             }
         }
-        scan_select_options(child, first, selected);
+        if (at->first_child != NULL) {
+            at = at->first_child;
+            continue;
+        }
+        while (at != node && at->next == NULL) at = at->parent;
+        if (at == node) break;
+        at = at->next;
     }
 }
 

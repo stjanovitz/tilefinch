@@ -1,0 +1,10 @@
+resources
+html/canvas/resources
+images/green-100x50.png
+html/canvas/element/drawing-rectangles-to-the-canvas/2d.fillRect.shadow.html
+html/canvas/element/drawing-rectangles-to-the-canvas/2d.clearRect.shadow.html
+html/canvas/element/drawing-rectangles-to-the-canvas/2d.strokeRect.shadow.html
+html/canvas/element/shadows/2d.shadow.attributes.shadowBlur.invalid.html
+html/canvas/element/shadows/2d.shadow.attributes.shadowOffset.invalid.html
+html/canvas/element/path-objects/2d.path.fill.winding.evenodd.2.html
+html/canvas/element/path-objects/2d.path.arc.negative.html

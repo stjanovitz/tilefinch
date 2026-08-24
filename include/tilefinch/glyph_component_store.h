@@ -17,11 +17,13 @@ typedef enum {
     TILEFINCH_GLYPH_PACK_COLOR_EMOJI,
     TILEFINCH_GLYPH_PACK_CYRILLIC,
     TILEFINCH_GLYPH_PACK_LATIN_EXTENDED,
+    TILEFINCH_GLYPH_PACK_ARABIC,
+    TILEFINCH_GLYPH_PACK_HEBREW,
     TILEFINCH_GLYPH_PACK_COUNT
 } TilefinchGlyphPack;
 
-_Static_assert(TILEFINCH_GLYPH_PACK_COUNT <= 8,
-               "glyph pack mask must fit in uint8_t");
+_Static_assert(TILEFINCH_GLYPH_PACK_COUNT <= 16,
+               "glyph pack mask must fit in uint16_t");
 
 typedef struct {
     const char *id;
@@ -46,6 +48,16 @@ bool tilefinch_glyph_component_installed_identity(
 typedef struct TilefinchGlyphComponentInstall
     TilefinchGlyphComponentInstall;
 
+typedef enum {
+    TILEFINCH_GLYPH_INSTALL_FAULT_SELF_CHECK = 0,
+    TILEFINCH_GLYPH_INSTALL_FAULT_REMOVE_PREVIOUS,
+    TILEFINCH_GLYPH_INSTALL_FAULT_ACTIVATE_CANDIDATE,
+    TILEFINCH_GLYPH_INSTALL_FAULT_POST_ACTIVATION_SYNC,
+    TILEFINCH_GLYPH_INSTALL_FAULT_TOMBSTONE_UNLINK
+} TilefinchGlyphInstallFaultPoint;
+typedef bool (*TilefinchGlyphInstallFaultHook)(
+    void *opaque, TilefinchGlyphInstallFaultPoint point);
+
 typedef struct {
     const char *package_path;
     const uint8_t *envelope;
@@ -54,6 +66,8 @@ typedef struct {
     const uint8_t *manifest_digest;
     const char *install_root;
     TilefinchGlyphPack pack;
+    TilefinchGlyphInstallFaultHook fault;
+    void *fault_opaque;
 } TilefinchGlyphComponentInstallOptions;
 
 TilefinchGlyphComponentInstall *tilefinch_glyph_component_install_create(
@@ -67,6 +81,8 @@ bool tilefinch_glyph_component_install_pump(
 bool tilefinch_glyph_component_install_snapshot(
     const TilefinchGlyphComponentInstall *job,
     TilefinchUpdateInstallSnapshot *snapshot);
+bool tilefinch_glyph_component_install_activated(
+    const TilefinchGlyphComponentInstall *job);
 bool tilefinch_glyph_component_remove(
     const TilefinchInstallPaths *paths, TilefinchGlyphPack pack);
 

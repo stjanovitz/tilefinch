@@ -148,8 +148,9 @@ top of the installed `2 × P` footprint.
 Optional components are siblings of the browser slots so A/B browser updates
 neither duplicate nor delete them. Voice uses `components/voice-en-us/`;
 glyph packs use `components/glyph-ja/`, `glyph-zh-hans/`, `glyph-zh-hant/`,
-`glyph-ko/`, `glyph-emoji-color/`, `glyph-cyrillic/`, and
-`glyph-latin-extended/`. A user-built video decoder uses `components/swdec/`
+`glyph-ko/`, `glyph-emoji-color/`, `glyph-cyrillic/`,
+`glyph-latin-extended/`, `glyph-arabic/`, and `glyph-hebrew/`. A user-built
+video decoder uses `components/swdec/`
 and contains exactly `tilefinch-swdec.prx`, `swdec-meload.prx`, and the small
 `component-info.txt` ABI record. Tilefinch never writes or updates those
 three files; the user replaces them together after a decoder-ABI change.

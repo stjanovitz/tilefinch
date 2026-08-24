@@ -5,6 +5,17 @@ void script_runtime_detach_document(ScriptRuntime *runtime,
     if (runtime == NULL || owner == 0) return;
     DomBridge *bridge = &runtime->bridge;
 
+    if (runtime->document == document) {
+        /* The realm may outlive this tree, but page-authorized requests may
+           not. Reject JS fetch promises while the CSP/budget authority is
+           still live, then cancel every native request before clearing the
+           document pointers used by completion delivery. */
+        (void) runtime_call_host(
+            runtime, SCRIPT_HOST_DETACH_NETWORK, 0, NULL, NULL);
+        (void) script_runtime_cancel_network(runtime, "document detached");
+        js_rt_event_sources_destroy(bridge);
+    }
+
     bool preserve_foreign_source_scope = false;
     if (bridge->current_script_source_active) {
         for (size_t i = 0; i < bridge->script_source_node_count; i++) {

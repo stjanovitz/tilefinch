@@ -95,6 +95,8 @@ void layout_scale_range(LayoutDocument *layout, size_t command_start,
                         lxb_dom_node_t *source)
 {
     if (scale_q6 == 64) return;
+    layout_bidi_scale_commands(
+        layout, command_start, origin_x_twice, scale_q6);
     for (size_t i = command_start; i < layout->count; i++) {
         DrawCommand *command = &layout->commands[i];
         if (command->type == DRAW_TEXT) {
@@ -283,12 +285,16 @@ void layout_rotate_range_quadrants(LayoutDocument *layout,
     if (layout == NULL || (quadrants &= 3u) == 0) return;
     for (size_t i = command_start; i < layout->count; i++) {
         DrawCommand *command = &layout->commands[i];
+        int old_text_x_fixed = command->type == DRAW_TEXT
+            ? draw_command_text_x_fixed(command) : 0;
         unsigned combined = (draw_command_rotation_quadrants(command)
                              + quadrants) & 3u;
         rotate_rect_quadrants(
             &command->x, &command->y, &command->width, &command->height,
             origin_x_twice, origin_y_twice, quadrants);
         draw_command_set_rotation_quadrants(command, combined);
+        if (command->type == DRAW_TEXT)
+            layout_bidi_rebase_command(layout, i, old_text_x_fixed);
     }
     for (size_t i = link_start; i < layout->link_count; i++) {
         LinkRegion *link = &layout->links[i];
@@ -540,6 +546,11 @@ bool add_sticky_range(LayoutDocument *layout, size_t start,
                              size_t end, int origin_y, int top)
 {
     if (start >= end) return true;
+    if (layout->sticky_count == LAYOUT_STICKY_RANGE_LIMIT) {
+        /* Beyond the structural cap, retain ordinary-flow paint rather than
+           failing the page or admitting unbounded overlay scans. */
+        return true;
+    }
     if (layout->sticky_count == layout->sticky_capacity) {
         size_t capacity = layout->sticky_capacity == 0
                           ? 4 : layout->sticky_capacity * 2;
@@ -563,6 +574,11 @@ bool add_fixed_range(LayoutDocument *layout, size_t start, size_t end,
                             bool from_bottom)
 {
     if (start >= end) return true;
+    if (layout->fixed_count == LAYOUT_FIXED_RANGE_LIMIT) {
+        /* The deterministic fallback scrolls with the page. Its commands
+           remain valid and no additional nested overlay work is retained. */
+        return true;
+    }
     if (layout->fixed_count == layout->fixed_capacity) {
         size_t capacity = layout->fixed_capacity == 0
                           ? 4 : layout->fixed_capacity * 2;
@@ -1589,6 +1605,7 @@ void layout_translate_range(LayoutDocument *layout, size_t command_start,
                             const char *phase,
                             lxb_dom_node_t *source)
 {
+    layout_bidi_translate_commands(layout, command_start, dx);
     for (size_t i = command_start; i < layout->count; i++) {
         layout->commands[i].x += dx;
         layout->commands[i].y += dy;
@@ -1601,9 +1618,8 @@ void layout_translate_range(LayoutDocument *layout, size_t command_start,
         layout->controls[i].x += dx;
         layout->controls[i].y += dy;
     }
-    for (size_t i = 0; i < layout->node_box_count; i++) {
+    for (size_t i = node_box_start; i < layout->node_box_count; i++) {
         LayoutNodeBox *box = &layout->node_boxes[i];
-        if (i < node_box_start) continue;
         if (source != NULL && !layout_node_within(box->node, source)) continue;
         if (box->command_start < command_start
             || box->command_end > layout->count) continue;

@@ -120,13 +120,15 @@ bool tilefinch_error_is_certificate_verification_failure(
 }
 
 TilefinchTlsGuidance tilefinch_tls_verification_guidance(
-    uint32_t flags, bool rtc_valid)
+    uint32_t flags, bool flags_available, PspTimeStatus clock_status)
 {
-    if (!rtc_valid
-        || (flags & (TILEFINCH_TLS_VERIFY_EXPIRED
-                     | TILEFINCH_TLS_VERIFY_FUTURE)) != 0) {
+    if (clock_status != PSP_TIME_OK) {
         return TILEFINCH_TLS_GUIDANCE_TIME;
     }
+    if (!flags_available) return TILEFINCH_TLS_GUIDANCE_DETAILS;
+    if ((flags & (TILEFINCH_TLS_VERIFY_EXPIRED
+                  | TILEFINCH_TLS_VERIFY_FUTURE)) != 0)
+        return TILEFINCH_TLS_GUIDANCE_TIME;
     if ((flags & TILEFINCH_TLS_VERIFY_HOSTNAME) != 0)
         return TILEFINCH_TLS_GUIDANCE_REDIRECTED;
     if ((flags & TILEFINCH_TLS_VERIFY_NOT_TRUSTED) != 0)

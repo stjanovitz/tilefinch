@@ -185,10 +185,23 @@ typedef struct ImageResource {
     int height;
     bool is_mask;
     bool is_background;
+    /* Mutable page-authored canvas snapshots use the same bounded decoded
+       surface path as images, but are never refetched or colour-remapped. */
+    bool is_canvas;
+    /* A no-CORS image whose final response origin differs from the owning
+       document may be painted, but it taints any canvas that consumes it. */
+    bool cross_origin;
     PseudoElement pseudo;
     bool owns_pixels;
     bool owns_encoded;
 } ImageResource;
+
+typedef enum {
+    IMAGE_CANVAS_COMMIT_REFUSED = 0,
+    IMAGE_CANVAS_COMMIT_CREATED,
+    IMAGE_CANVAS_COMMIT_UPDATED,
+    IMAGE_CANVAS_COMMIT_RESIZED
+} ImageCanvasCommitResult;
 
 typedef struct {
     size_t discovered;
@@ -576,6 +589,15 @@ bool images_replace_with_decoded_surface(ImageResources *images,
                                          lxb_dom_node_t *node,
                                          unsigned char *rgba_pixels,
                                          int width, int height);
+/* Copies a bounded dirty rectangle from one script-owned RGBA canvas into a
+   native, budget-owned page surface. At most four surfaces and 1 MiB of
+   native canvas pixels may be retained per page. The caller keeps ownership
+   of rgba_pixels. */
+ImageCanvasCommitResult images_commit_canvas_surface(
+    ImageResources *images, Budget *budget, lxb_dom_node_t *node,
+    const unsigned char *rgba_pixels, size_t rgba_length,
+    int width, int height, int dirty_left, int dirty_top,
+    int dirty_right, int dirty_bottom);
 bool image_resource_available(const ImageResource *image);
 const void *image_resource_backing_identity(const ImageResource *image);
 /* Distinguishes corrupt/unsupported data, which is safe to negative-cache,

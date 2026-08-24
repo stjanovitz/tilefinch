@@ -112,11 +112,13 @@ typedef enum {
     BROWSER_GLYPH_LANGUAGE_KOREAN,
     BROWSER_GLYPH_LANGUAGE_CYRILLIC,
     BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED,
+    BROWSER_GLYPH_LANGUAGE_ARABIC,
+    BROWSER_GLYPH_LANGUAGE_HEBREW,
     BROWSER_GLYPH_LANGUAGE_COUNT
 } BrowserGlyphLanguage;
 
-_Static_assert(BROWSER_GLYPH_LANGUAGE_COUNT <= 8,
-               "glyph language selection must fit in three bits");
+_Static_assert(BROWSER_GLYPH_LANGUAGE_COUNT <= 16,
+               "glyph language selection must fit in four bits");
 
 /* Pointers remain owned by the profile and are valid until it is mutated. */
 typedef struct {
@@ -256,6 +258,11 @@ void browser_profile_set_javascript_enabled(
     BrowserProfile *profile, bool enabled);
 bool browser_profile_set_site_javascript_enabled(
     BrowserProfile *profile, const char *url, bool enabled);
+/* Restores every per-site compatibility/security choice to its global
+   default. A remembered Reader font scale is presentation data, not a
+   permission, and is preserved while the site's automatic-Reader bit clears. */
+bool browser_profile_reset_site_permissions(
+    BrowserProfile *profile, const char *url);
 void browser_profile_set_site_data_allowed(
     BrowserProfile *profile, bool allowed);
 bool browser_profile_set_third_party_cookie_site_allowed(

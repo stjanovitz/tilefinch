@@ -3,10 +3,32 @@
 #include <string.h>
 #include <sys/statvfs.h>
 
-bool tilefinch_update_query_free_space(
-    const char *directory, uint64_t *available)
+_Static_assert(sizeof(((struct statvfs *) 0)->f_bavail) <= sizeof(uint64_t),
+               "statvfs available-block count must fit uint64_t");
+_Static_assert(sizeof(((struct statvfs *) 0)->f_frsize) <= sizeof(uint64_t),
+               "statvfs fragment size must fit uint64_t");
+_Static_assert(sizeof(((struct statvfs *) 0)->f_bsize) <= sizeof(uint64_t),
+               "statvfs block size must fit uint64_t");
+
+static bool system_space_query(
+    void *opaque, const char *path, uint64_t *blocks_available,
+    uint64_t *fragment_size, uint64_t *block_size)
 {
-    if (directory == NULL || available == NULL) return false;
+    (void) opaque;
+    struct statvfs status;
+    if (path == NULL || blocks_available == NULL || fragment_size == NULL
+        || block_size == NULL || statvfs(path, &status) != 0) return false;
+    *blocks_available = (uint64_t) status.f_bavail;
+    *fragment_size = (uint64_t) status.f_frsize;
+    *block_size = (uint64_t) status.f_bsize;
+    return true;
+}
+
+bool tilefinch_update_query_free_space_with(
+    const char *directory, uint64_t *available,
+    TilefinchUpdateSpaceQuery query, void *opaque)
+{
+    if (directory == NULL || available == NULL || query == NULL) return false;
     const char *query_path = directory;
 #if defined(__PSP__)
     /*
@@ -25,13 +47,18 @@ bool tilefinch_update_query_free_space(
         query_path = device;
     }
 #endif
-    struct statvfs status;
-    if (statvfs(query_path, &status) != 0) return false;
-    uint64_t block = status.f_frsize != 0
-        ? status.f_frsize : status.f_bsize;
-    if (block != 0 && (uint64_t) status.f_bavail > UINT64_MAX / block)
-        *available = UINT64_MAX;
-    else
-        *available = (uint64_t) status.f_bavail * block;
-    return block != 0;
+    uint64_t blocks = 0, fragment = 0, filesystem_block = 0;
+    if (!query(opaque, query_path, &blocks, &fragment, &filesystem_block))
+        return false;
+    uint64_t block = fragment != 0 ? fragment : filesystem_block;
+    if (block == 0 || blocks > UINT64_MAX / block) return false;
+    *available = blocks * block;
+    return true;
+}
+
+bool tilefinch_update_query_free_space(
+    const char *directory, uint64_t *available)
+{
+    return tilefinch_update_query_free_space_with(
+        directory, available, system_space_query, NULL);
 }

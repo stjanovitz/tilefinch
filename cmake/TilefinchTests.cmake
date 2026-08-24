@@ -54,6 +54,16 @@ if(PSP_BROWSER_BUILD_TESTS)
         TILEFINCH_TEST_METRIC_SANS_FONT="${PSP_BROWSER_METRIC_SANS_FONT}"
         TILEFINCH_TEST_METRIC_SANS_BOLD_FONT="${PSP_BROWSER_METRIC_SANS_BOLD_FONT}")
 
+    add_executable(tilefinch-xmb-redirect-policy-tests
+        tests/test_xmb_redirect_policy.c
+        src/xmb_redirect_policy.c)
+    target_include_directories(tilefinch-xmb-redirect-policy-tests PRIVATE
+        include)
+    add_test(NAME tilefinch-xmb-redirect-policy-tests
+        COMMAND tilefinch-xmb-redirect-policy-tests)
+    set_tests_properties(tilefinch-xmb-redirect-policy-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;xmb" TIMEOUT 10)
+
     add_executable(tilefinch-layout-tests tests/test_layout.c)
     target_link_libraries(tilefinch-layout-tests PRIVATE tilefinch_core)
     target_compile_definitions(tilefinch-layout-tests PRIVATE
@@ -65,6 +75,12 @@ if(PSP_BROWSER_BUILD_TESTS)
         TILEFINCH_TEST_SERIF_BOLD_FONT="${PSP_BROWSER_SERIF_BOLD_FONT}"
         TILEFINCH_TEST_METRIC_SANS_FONT="${PSP_BROWSER_METRIC_SANS_FONT}"
         TILEFINCH_TEST_METRIC_SANS_BOLD_FONT="${PSP_BROWSER_METRIC_SANS_BOLD_FONT}")
+
+    add_executable(tilefinch-text-bidi-tests tests/test_text_bidi.c)
+    target_link_libraries(tilefinch-text-bidi-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-text-bidi-tests COMMAND tilefinch-text-bidi-tests)
+    set_tests_properties(tilefinch-text-bidi-tests PROPERTIES
+        LABELS "tilefinch;unit;layout;unicode" TIMEOUT 30)
 
     add_executable(tilefinch-media-mp4-tests tests/test_media_mp4.c)
     target_link_libraries(tilefinch-media-mp4-tests PRIVATE tilefinch_core)
@@ -726,6 +742,15 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;network;psp;state"
         TIMEOUT 30)
 
+    add_executable(tilefinch-captive-portal-tests
+        tests/test_captive_portal.c)
+    target_link_libraries(tilefinch-captive-portal-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-captive-portal-tests
+        COMMAND tilefinch-captive-portal-tests)
+    set_tests_properties(tilefinch-captive-portal-tests PROPERTIES
+        LABELS "tilefinch;unit;network;security"
+        TIMEOUT 30)
+
     add_test(NAME tilefinch-memory-ledger-tests
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_memory_ledger.sh)
     set_tests_properties(tilefinch-memory-ledger-tests PROPERTIES
@@ -787,9 +812,11 @@ if(PSP_BROWSER_BUILD_TESTS)
                 --reference-root ${CMAKE_CURRENT_SOURCE_DIR}/fidelity/references
                 --work-dir ${CMAKE_CURRENT_SOURCE_DIR}/fidelity/floor-check
                 --lab $<TARGET_FILE:psp-browser-lab>
+                --jobs 4
                 --check-floors ${CMAKE_CURRENT_SOURCE_DIR}/tests/fidelity-baselines.tsv)
         set_tests_properties(tilefinch-fidelity-floor-tests PROPERTIES
             LABELS "tilefinch;acceptance;tooling;fidelity"
+            PROCESSORS 4
             SKIP_RETURN_CODE 77
             TIMEOUT 300)
         endif()

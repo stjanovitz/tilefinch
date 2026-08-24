@@ -12,6 +12,7 @@
 #include <lexbor/dom/interfaces/node.h>
 
 #include "tilefinch/platform.h"
+#include "../src/js_runtime_internal.h"
 
 #define MIB (1024u * 1024u)
 
@@ -56,6 +57,31 @@ static bool compile_abort_cooperate(void *context, const char *phase,
     }                                                                        \
 } while (0)
 
+static int test_reduced_dom_event_counter(void)
+{
+    JSRuntime *runtime = JS_NewRuntime();
+    CHECK(runtime != NULL);
+    JSContext *context = JS_NewContext(runtime);
+    CHECK(context != NULL);
+
+    JS_SetContextOpaque(context, NULL);
+    (void) js_dom_record_event(context, JS_UNDEFINED, 0, NULL);
+
+    DomBridge bridge = {0};
+    JS_SetContextOpaque(context, &bridge);
+    (void) js_dom_record_event(context, JS_UNDEFINED, 0, NULL);
+
+    ScriptResult result = {0};
+    bridge.result = &result;
+    (void) js_dom_record_event(context, JS_UNDEFINED, 0, NULL);
+    CHECK(result.events_dispatched == 1);
+
+    JS_SetContextOpaque(context, NULL);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    return 0;
+}
+
 static lxb_dom_node_t *find_script(lxb_dom_node_t *node)
 {
     for (; node != NULL; node = node->next) {
@@ -64,6 +90,20 @@ static lxb_dom_node_t *find_script(lxb_dom_node_t *node)
         if (name != NULL && length == 6 && memcmp(name, "script", 6) == 0)
             return node;
         lxb_dom_node_t *nested = find_script(node->first_child);
+        if (nested != NULL) return nested;
+    }
+    return NULL;
+}
+
+static lxb_dom_node_t *find_element_id(lxb_dom_node_t *node,
+                                       const char *wanted)
+{
+    for (; node != NULL; node = node->next) {
+        size_t length = 0;
+        const char *id = document_attribute(node, "id", &length);
+        if (id != NULL && strlen(wanted) == length
+            && memcmp(id, wanted, length) == 0) return node;
+        lxb_dom_node_t *nested = find_element_id(node->first_child, wanted);
         if (nested != NULL) return nested;
     }
     return NULL;
@@ -336,6 +376,7 @@ static int test_native_dynamic_code_policy(void)
 
 int main(void)
 {
+    CHECK(test_reduced_dom_event_counter() == 0);
     CHECK(test_native_dynamic_code_policy() == 0);
     uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES];
     CHECK(tilefinch_sha256_digest(NULL, 0, digest)
@@ -379,6 +420,19 @@ int main(void)
                  "text/javascript", "text/plain")
           && !script_module_revalidated_mime_allowed(
                  "text/plain", "text/javascript"));
+    bool attribute_module = false;
+    static const char spaced_classic[] = " \tText/JavaScript1.5 \r";
+    static const char spaced_module[] = "\n MoDuLe \t";
+    CHECK(script_type_attribute_classify(
+              spaced_classic, sizeof(spaced_classic) - 1u,
+              &attribute_module)
+          && !attribute_module
+          && script_type_attribute_classify(
+              spaced_module, sizeof(spaced_module) - 1u,
+              &attribute_module)
+          && attribute_module
+          && !script_type_attribute_classify(
+              " application/json ", 18u, &attribute_module));
 
     ScriptExecutionPolicy lab, strict, realistic, invalid;
     CHECK(script_execution_policy_for_profile(
@@ -683,6 +737,114 @@ int main(void)
     }
     CHECK(hardening_ok
           && strcmp(result.summary, "REALM-HARDENING-OK") == 0);
+
+    puts("test: exception formatting cannot poison the runtime");
+    static const char hostile_exception_probe[] =
+        "throw {[Symbol.toPrimitive](){throw new Error('secondary')}}";
+    CHECK(!script_runtime_evaluate_diagnostic(
+              runtime, hostile_exception_probe,
+              "<hostile-exception-formatting>", &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, "globalThis.pocSummary='EXCEPTION-RECOVERED'",
+              "<hostile-exception-recovery>", &result)
+          && strcmp(result.summary, "EXCEPTION-RECOVERED") == 0);
+    static const char hostile_rejection_probe[] =
+        "globalThis.__hostileRejection=Promise.reject({"
+        "[Symbol.toPrimitive](){throw new Error('secondary')},"
+        "get stack(){throw new Error('secondary-stack')}});"
+        "globalThis.pocSummary='REJECTION-FORMATTED'";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, hostile_rejection_probe,
+              "<hostile-rejection-formatting>", &result)
+          && strcmp(result.summary, "REJECTION-FORMATTED") == 0
+          && script_runtime_evaluate_diagnostic(
+              runtime, "__hostileRejection.catch(()=>{});"
+                       "globalThis.pocSummary='REJECTION-RECOVERED'",
+              "<hostile-rejection-recovery>", &result)
+          && strcmp(result.summary, "REJECTION-RECOVERED") == 0);
+
+    puts("test: selector-list commas ignore quoted syntax");
+    static const char quoted_selector_probe[] =
+        "(()=>{const a=document.createElement('div'),"
+        "b=document.createElement('div');a.title='(';a.id='quoted-open';"
+        "b.id='quoted-other';document.body.append(a,b);"
+        "const first=document.querySelectorAll('[title=\"(\"], #quoted-other'),"
+        "second=document.querySelectorAll('[title=\"a,b\"], #quoted-other');"
+        "a.title='a,b';const third=document.querySelectorAll("
+        "'[title=\"a,b\"], #quoted-other');a.remove();b.remove();"
+        "globalThis.pocSummary=first.length===2&&second.length===1"
+        "&&third.length===2?'QUOTED-SELECTOR-OK':'QUOTED-SELECTOR-FAILED';})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, quoted_selector_probe, "<quoted-selector-probe>",
+              &result)
+          && strcmp(result.summary, "QUOTED-SELECTOR-OK") == 0);
+
+    puts("test: lower-level web compatibility regressions stay fixed");
+    static const char compatibility_probe[] =
+        "(async()=>{const source=new ArrayBuffer(8),"
+        "view=new DataView(source,2,3);view.setUint8(0,41);"
+        "const cloned=structuredClone(view),dataViewOk="
+        "cloned instanceof DataView&&cloned.byteOffset===2"
+        "&&cloned.byteLength===3&&cloned.getUint8(0)===41;"
+        "const form=document.createElement('form'),"
+        "select=document.createElement('select'),"
+        "first=document.createElement('option'),"
+        "second=document.createElement('option');"
+        "first.value='first';second.value='second';"
+        "select.append(first,second);form.append(select);"
+        "document.body.append(form);select.selectedIndex=1;form.reset();"
+        "const selectOk=select.selectedIndex===0&&first.selected"
+        "&&!second.selected;form.remove();"
+        "const flex=document.createElement('div');flex.style.flex='2 3 25%';"
+        "document.body.append(flex);const flexValue=flex.style.flex,"
+        "flexOk=flexValue==='2 3 25%';flex.remove();"
+        "const stream=new ReadableStream({start(){}}),reader=stream.getReader(),"
+        "pending=reader.read().then(()=>'',error=>error.name);"
+        "let releaseThrew=false;try{reader.releaseLock()}catch(_){"
+        "releaseThrew=true}const pendingName=await pending,streamOk="
+        "!releaseThrew&&pendingName==='TypeError'&&!stream.locked;"
+        "globalThis.pocSummary=dataViewOk&&selectOk&&flexOk&&streamOk"
+        "?'COMPATIBILITY-REGRESSIONS-OK':'COMPATIBILITY-REGRESSIONS-FAILED:'"
+        "+JSON.stringify({dataViewOk,selectOk,flexOk,streamOk,flexValue});"
+        "})().catch(error=>{"
+        "globalThis.pocSummary='COMPATIBILITY-REGRESSIONS-ERROR:'+error});";
+    bool compatibility_ok = script_runtime_evaluate_diagnostic(
+        runtime, compatibility_probe, "<compatibility-regressions>", &result);
+    for (size_t tick = 0; compatibility_ok && tick < 8
+         && strncmp(result.summary, "COMPATIBILITY-REGRESSIONS-", 26) != 0;
+         tick++) {
+        compatibility_ok = script_runtime_advance(runtime, 0, 64, &result);
+    }
+    if (!compatibility_ok
+        || strcmp(result.summary, "COMPATIBILITY-REGRESSIONS-OK") != 0) {
+        fprintf(stderr, "compatibility probe: ok=%d summary=%s error=%s\n",
+                compatibility_ok, result.summary, result.error);
+    }
+    CHECK(compatibility_ok
+          && strcmp(result.summary, "COMPATIBILITY-REGRESSIONS-OK") == 0);
+
+    puts("test: oversized data script fails visibly and remains counted");
+    size_t oversized_data_failed_before = result.dynamic_scripts_failed;
+    static const char oversized_data_script_probe[] =
+        "(()=>{const script=document.createElement('script');"
+        "script.src='data:text/javascript,'+'x'.repeat(16384);"
+        "script.addEventListener('load',()=>{"
+        "globalThis.pocSummary='OVERSIZED-DATA-LOADED'});"
+        "script.addEventListener('error',()=>{"
+        "globalThis.pocSummary='OVERSIZED-DATA-ERROR'});"
+        "document.head.appendChild(script);"
+        "globalThis.pocSummary='OVERSIZED-DATA-PENDING';})()";
+    bool oversized_data_ok = script_runtime_evaluate_diagnostic(
+        runtime, oversized_data_script_probe, "<oversized-data-script>",
+        &result);
+    for (size_t tick = 0; oversized_data_ok && tick < 16
+         && strcmp(result.summary, "OVERSIZED-DATA-ERROR") != 0; tick++) {
+        oversized_data_ok = script_runtime_advance(runtime, 0, 128, &result);
+    }
+    CHECK(oversized_data_ok
+          && strcmp(result.summary, "OVERSIZED-DATA-ERROR") == 0
+          && result.dynamic_scripts_failed
+                 == oversized_data_failed_before + 1u);
 
     static const char trusted_dispatch_setup[] =
         "globalThis.__tilefinchTrustedDispatchHits=0;"
@@ -1239,14 +1401,23 @@ int main(void)
         "const supplied=new ImageData(new Uint8ClampedArray([1,2,3,4]),1);"
         "context.putImageData(supplied,1,0);const put="
         "context.getImageData(1,0,1,1).data;"
+        "const compositeCanvas=document.createElement('canvas');"
+        "compositeCanvas.width=1;compositeCanvas.height=1;"
+        "const compositeContext=compositeCanvas.getContext('2d');"
+        "compositeContext.fillStyle='red';compositeContext.fillRect(0,0,1,1);"
+        "compositeContext.globalCompositeOperation='destination-out';"
+        "compositeContext.globalAlpha=.5;compositeContext.fillRect(0,0,1,1);"
+        "compositeContext.globalCompositeOperation='invalid';"
+        "const composite=compositeContext.getImageData(0,0,1,1).data,"
+        "compositeMode=compositeContext.globalCompositeOperation;"
         "context.fillStyle='hsl(120 100% 25%)';const hsl=context.fillStyle;"
         "canvas.setAttribute('width','2');const reset="
         "context.fillStyle==='#000000'&&context.globalAlpha===1"
         "&&context.getImageData(0,0,1,1).data.every(value=>value===0);"
-        "canvas.width=257;canvas.height=257;context.fillStyle='#123456';"
+        "canvas.width=513;canvas.height=257;context.fillStyle='#123456';"
         "context.fillRect(0,0,1,1);const bounded="
         "context.getImageData(0,0,1,1).data.every(value=>value===0);"
-        "let quota=false,index=false;try{context.createImageData(257,257)}"
+        "let quota=false,index=false;try{context.createImageData(513,257)}"
         "catch(error){quota=error instanceof DOMException"
         "&&error.name==='QuotaExceededError'}"
         "try{context.getImageData(0,0,0,1)}catch(error){"
@@ -1256,12 +1427,16 @@ int main(void)
         "&&alphaRetained&&restored&&pixel[0]===128&&pixel[1]===0"
         "&&pixel[2]===128&&pixel[3]===255"
         "&&clear.every(value=>value===0)&&put[0]===1&&put[1]===2"
-        "&&put[2]===3&&put[3]===4&&hsl==='#008000'&&reset&&bounded"
+        "&&put[2]===3&&put[3]===4&&composite[0]===255"
+        "&&composite[1]===0&&composite[2]===0&&composite[3]===128"
+        "&&compositeMode==='destination-out'"
+        "&&hsl==='#008000'&&reset&&bounded"
         "&&quota&&index&&supplied.width===1&&supplied.height===1"
         "&&supplied.colorSpace==='srgb';globalThis.pocSummary=ok?"
         "'CANVAS-2D-OK':'CANVAS-2D-FAILED:'+JSON.stringify({defaults,same,"
         "unsupported,invalidRetained,named,alphaRetained,restored,"
-        "pixel:[...pixel],clear:[...clear],put:[...put],hsl,reset,bounded,"
+        "pixel:[...pixel],clear:[...clear],put:[...put],"
+        "composite:[...composite],compositeMode,hsl,reset,bounded,"
         "quota,index});})()";
     bool canvas_2d_ok = script_runtime_evaluate_diagnostic(
         runtime, canvas_2d_probe, "<canvas-2d-probe>", &result);
@@ -1270,6 +1445,171 @@ int main(void)
                 canvas_2d_ok, result.summary, result.error);
     }
     CHECK(canvas_2d_ok && strcmp(result.summary, "CANVAS-2D-OK") == 0);
+
+    static const char canvas_save_overflow_probe[] =
+        "(()=>{const canvas=document.createElement('canvas'),"
+        "context=canvas.getContext('2d');context.fillStyle='red';"
+        "for(let i=0;i<17;i++)context.save();context.fillStyle='blue';"
+        "context.restore();const paired=context.fillStyle==='#0000ff';"
+        "for(let i=0;i<16;i++)context.restore();const restored="
+        "context.fillStyle==='#ff0000';globalThis.pocSummary=paired&&restored"
+        "?'CANVAS-SAVE-OVERFLOW-OK':'CANVAS-SAVE-OVERFLOW-FAILED';})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, canvas_save_overflow_probe,
+              "<canvas-save-overflow-probe>", &result)
+          && strcmp(result.summary, "CANVAS-SAVE-OVERFLOW-OK") == 0);
+
+    /* Coercion may run arbitrary page code.  A stale canvas handle must not
+       survive wrapper release plus a document subtree replacement between
+       argument conversion and the native surface commit. */
+    ImageResources canvas_commit_images = {.budget = &budget};
+    script_runtime_set_images(runtime, &canvas_commit_images);
+    static const char canvas_commit_lifetime_probe[] =
+        "(()=>{const old=document.createElement('canvas');old.width=1;"
+        "old.height=1;document.body.appendChild(old);const handle=old.__handle,"
+        "lease=old.__tilefinchHandleLease,pixels=new Uint8ClampedArray(4);"
+        "let released=false;"
+        "const hostile={valueOf(){old.remove();released="
+        "__tilefinchReleaseNodeWrapper(handle,lease);document.body.innerHTML="
+        "'<canvas id=replacement width=1 height=1></canvas>';return 1;}};"
+        "const committed=__tilefinchCommitCanvasSurface(handle,hostile,1,"
+        "pixels,0,0,1,1),replacement=document.getElementById('replacement');"
+        "globalThis.pocSummary=!committed&&replacement&&released"
+        "?'CANVAS-COMMIT-LIFETIME-OK':'CANVAS-COMMIT-LIFETIME-FAILED:'+"
+        "JSON.stringify({committed,released,replacement:!!replacement,"
+        "connected:old.isConnected});})()";
+    bool canvas_commit_lifetime_ok = script_runtime_evaluate_diagnostic(
+        runtime, canvas_commit_lifetime_probe,
+        "<canvas-commit-lifetime-probe>", &result);
+    if (!canvas_commit_lifetime_ok
+        || strcmp(result.summary, "CANVAS-COMMIT-LIFETIME-OK") != 0) {
+        fprintf(stderr, "canvas commit lifetime probe: ok=%d summary=%s error=%s\n",
+                canvas_commit_lifetime_ok, result.summary, result.error);
+    }
+    CHECK(canvas_commit_lifetime_ok
+          && strcmp(result.summary, "CANVAS-COMMIT-LIFETIME-OK") == 0);
+
+    static const char canvas_taint_source_probe[] =
+        "(()=>{const image=document.createElement('img');"
+        "image.id='cross-origin-canvas-source';"
+        "image.src='https://images.example.test/private.png';"
+        "document.body.appendChild(image);globalThis.pocSummary="
+        "'CANVAS-TAINT-SOURCE-READY';})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, canvas_taint_source_probe,
+              "<canvas-taint-source-probe>", &result)
+          && strcmp(result.summary, "CANVAS-TAINT-SOURCE-READY") == 0);
+    lxb_dom_node_t *taint_source = find_element_id(
+        lxb_dom_interface_node(runtime->document->html),
+        "cross-origin-canvas-source");
+    static unsigned char private_pixel[4] = {17u, 34u, 51u, 255u};
+    canvas_commit_images.items = budget_calloc_category(
+        &budget, BUDGET_CATEGORY_RESOURCE, 1,
+        sizeof(*canvas_commit_images.items));
+    CHECK(taint_source != NULL && canvas_commit_images.items != NULL);
+    canvas_commit_images.capacity = 1u;
+    canvas_commit_images.count = 1u;
+    canvas_commit_images.items[0] = (ImageResource) {
+        .node = taint_source,
+        .pixels = private_pixel,
+        .source_width = 1,
+        .source_height = 1,
+        .width = 1,
+        .height = 1,
+        .cross_origin = true
+    };
+    static const char canvas_taint_probe[] =
+        "(()=>{const image=document.getElementById('cross-origin-canvas-source'),"
+        "canvas=document.createElement('canvas'),context=canvas.getContext('2d');"
+        "canvas.width=1;canvas.height=1;context.drawImage(image,0,0);"
+        "const denied=call=>{try{call();return false}catch(error){return "
+        "error instanceof DOMException&&error.name==='SecurityError'}};"
+        "const pixels=denied(()=>context.getImageData(0,0,1,1)),"
+        "url=denied(()=>canvas.toDataURL()),blob=denied(()=>canvas.toBlob(()=>{}));"
+        "const patterned=document.createElement('canvas'),"
+        "patternContext=patterned.getContext('2d');patterned.width=1;"
+        "patterned.height=1;patternContext.createPattern(image,'repeat');"
+        "const pattern=denied(()=>patternContext.getImageData(0,0,1,1));"
+        "const copied=document.createElement('canvas'),copy=copied.getContext('2d');"
+        "copied.width=1;copied.height=1;copy.drawImage(canvas,0,0);"
+        "const propagated=denied(()=>copy.getImageData(0,0,1,1));"
+        "canvas.width=1;const reset=context.getImageData(0,0,1,1).data[3]===0;"
+        "globalThis.pocSummary=pixels&&url&&blob&&pattern&&propagated&&reset"
+        "?'CANVAS-TAINT-OK':'CANVAS-TAINT-FAILED';})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, canvas_taint_probe, "<canvas-taint-probe>", &result)
+          && strcmp(result.summary, "CANVAS-TAINT-OK") == 0);
+
+    /* The retained queue is capped at eight canvases.  Disconnect its first
+       eight entries before their microtasks run, leaving a connected ninth
+       entry outside the queue.  That ninth microtask must publish its own
+       surface rather than assuming an earlier batch included it. */
+    static const char canvas_ninth_commit_probe[] =
+        "(()=>{const before=__tilefinchCanvasDiagnostics.surfaceCommits,"
+        "canvases=[];for(let i=0;i<9;i++){const canvas="
+        "document.createElement('canvas');canvas.width=1;canvas.height=1;"
+        "document.body.appendChild(canvas);const context=canvas.getContext('2d');"
+        "context.fillStyle='red';context.fillRect(0,0,1,1);canvases.push(canvas)}"
+        "for(let i=0;i<8;i++)canvases[i].remove();globalThis.pocSummary="
+        "'CANVAS-NINTH-COMMIT-PENDING';queueMicrotask(()=>{const committed="
+        "__tilefinchCanvasDiagnostics.surfaceCommits-before;"
+        "globalThis.pocSummary=committed===1?'CANVAS-NINTH-COMMIT-OK':"
+        "'CANVAS-NINTH-COMMIT-FAILED:'+committed;canvases[8].remove()})})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, canvas_ninth_commit_probe,
+              "<canvas-ninth-commit-probe>", &result)
+          && script_runtime_advance(runtime, 0, 32, &result)
+          && result.success
+          && strcmp(result.summary, "CANVAS-NINTH-COMMIT-OK") == 0);
+    script_runtime_set_images(runtime, NULL);
+    images_destroy(&canvas_commit_images);
+
+    /* Direct packed-command natives are an untrusted boundary even though
+       the authored bootstrap normally sends small finite coordinates. */
+    static const char canvas_numeric_boundary_probe[] =
+        "(()=>{const pixels=new Uint8ClampedArray(16),base="
+        "[0,0,1,1,255,0,0,255,1,1],bad=[NaN,Infinity,Number.MAX_VALUE];"
+        "let rejected=true;for(const value of bad){const command="
+        "new Float64Array(base);command[0]=value;rejected="
+        "rejected&&!__tilefinchCanvasRasterRectBatch(pixels,2,2,command);}"
+        "const points=new Float64Array([0,0,1,0]),empty=new Float64Array(),"
+        "identity=new Float64Array([1,0,0,1,0,0]);"
+        "rejected=rejected&&!__tilefinchCanvasRasterPath(pixels,2,2,points,"
+        "true,false,0,0,0,255,1,1,1,0,0,10,empty,0,"
+        "new Float64Array([NaN,0,2,2]),empty,empty);"
+        "const imageCommand=new Float64Array([0,1,1,0,0,1,1,0,0,1,1,0,1,"
+        "Number.MAX_VALUE,1,0,0,1,0,0,0,0,2,2]);"
+        "rejected=rejected&&!__tilefinchCanvasRasterImageBatch(pixels,2,2,"
+        "[new Uint8ClampedArray(4)],imageCommand);"
+        "rejected=rejected&&!__tilefinchCanvasRasterImage(pixels,2,2,"
+        "new Uint8ClampedArray(4),1,1,0,0,1,1,0,0,1,1,false,1,1,"
+        "new Float64Array([1,0,0,1,Number.MAX_VALUE,0]),"
+        "new Float64Array([0,0,2,2]),empty);"
+        "rejected=rejected&&!__tilefinchCanvasRasterText(pixels,2,2,'x',"
+        "Number.MAX_VALUE,1,8,0,false,false,0,0,0,255,1,1,false,1,identity,"
+        "new Float64Array([0,0,2,2]),1,empty);"
+        "globalThis.pocSummary=rejected?'CANVAS-NUMERIC-BOUNDARY-OK':"
+        "'CANVAS-NUMERIC-BOUNDARY-FAILED';})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, canvas_numeric_boundary_probe,
+              "<canvas-numeric-boundary-probe>", &result)
+          && strcmp(result.summary, "CANVAS-NUMERIC-BOUNDARY-OK") == 0);
+
+    /* A hostile stroke can multiply glyph pixels by a 33x33 neighborhood.
+       The native call must degrade within its fixed work allowance and return
+       control to JavaScript instead of monopolizing the browser thread. */
+    static const char canvas_native_work_bound_probe[] =
+        "(()=>{const canvas=document.createElement('canvas');canvas.width=512;"
+        "canvas.height=256;const context=canvas.getContext('2d');"
+        "context.font='64px sans-serif';context.lineWidth=16;"
+        "context.strokeText('W'.repeat(256),0,96);"
+        "context.fillStyle='red';context.fillRect(0,0,1,1);"
+        "globalThis.pocSummary=context.getImageData(0,0,1,1).data[3]>0"
+        "?'CANVAS-NATIVE-WORK-BOUND-OK':'CANVAS-NATIVE-WORK-BOUND-FAILED';})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, canvas_native_work_bound_probe,
+              "<canvas-native-work-bound-probe>", &result)
+          && strcmp(result.summary, "CANVAS-NATIVE-WORK-BOUND-OK") == 0);
 
     static const char class_list_probe[] =
         "(()=>{const node=document.createElement('div');"
@@ -1648,6 +1988,61 @@ int main(void)
           && result.indexed_db_records == 0
           && result.indexed_db_bytes == 0);
 
+    static const char indexeddb_unique_probe[] =
+        "(async()=>{const request=req=>new Promise((resolve,reject)=>{"
+        "req.addEventListener('success',()=>resolve(req.result));"
+        "req.addEventListener('error',()=>reject(req.error));}),"
+        "finished=tx=>new Promise((resolve,reject)=>{"
+        "tx.addEventListener('complete',resolve);tx.addEventListener('abort',"
+        "()=>reject(tx.error));}),name='tilefinch-idb-unique',"
+        "opening=indexedDB.open(name,1);opening.addEventListener("
+        "'upgradeneeded',()=>{const store=opening.result.createObjectStore("
+        "'items',{keyPath:'id'});store.createIndex('email','email',{unique:true})});"
+        "const db=await request(opening),first=db.transaction('items','readwrite'),"
+        "firstDone=finished(first);await Promise.all([request(first.objectStore("
+        "'items').add({id:1,email:'same@example.test'})),firstDone]);"
+        "const duplicate=db.transaction('items','readwrite'),"
+        "duplicateDone=finished(duplicate).then(()=>'',error=>error.name),"
+        "duplicateRequest=request(duplicate.objectStore('items').add("
+        "{id:2,email:'same@example.test'})).then(()=>'',error=>error.name),"
+        "duplicateNames=await Promise.all([duplicateRequest,duplicateDone]);"
+        "db.close();await request(indexedDB.deleteDatabase(name));"
+        "const existing=indexedDB.open(name,1);existing.addEventListener("
+        "'upgradeneeded',()=>existing.result.createObjectStore('items',"
+        "{keyPath:'id'}));const existingDb=await request(existing),"
+        "seed=existingDb.transaction('items','readwrite'),seedDone=finished(seed),"
+        "seedStore=seed.objectStore('items');await Promise.all(["
+        "request(seedStore.add({id:1,email:'same@example.test'})),"
+        "request(seedStore.add({id:2,email:'same@example.test'})),seedDone]);"
+        "existingDb.close();let createName='';const upgrade=indexedDB.open(name,2);"
+        "upgrade.addEventListener('upgradeneeded',()=>{try{upgrade.transaction."
+        "objectStore('items').createIndex('email','email',{unique:true})}"
+        "catch(error){createName=error.name;upgrade.transaction.abort()}});"
+        "const upgradeName=await request(upgrade).then(()=>'',error=>error.name);"
+        "await request(indexedDB.deleteDatabase(name));"
+        "globalThis.pocSummary=duplicateNames[0]==='ConstraintError'"
+        "&&duplicateNames[1]==='ConstraintError'&&createName==='ConstraintError'"
+        "&&upgradeName==='AbortError'?'INDEXEDDB-UNIQUE-OK':"
+        "'INDEXEDDB-UNIQUE-FAILED:'+JSON.stringify({duplicateNames,createName,"
+        "upgradeName});})().catch(error=>{globalThis.pocSummary="
+        "'INDEXEDDB-UNIQUE-ERROR:'+String(error&&error.stack||error)});";
+    bool indexeddb_unique_ok = script_runtime_evaluate_diagnostic(
+        runtime, indexeddb_unique_probe, "<indexeddb-unique-probe>", &result);
+    for (size_t tick = 0; indexeddb_unique_ok && tick < 32
+         && strncmp(result.summary, "INDEXEDDB-UNIQUE-", 17) != 0; tick++) {
+        indexeddb_unique_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    if (!indexeddb_unique_ok
+        || strcmp(result.summary, "INDEXEDDB-UNIQUE-OK") != 0) {
+        fprintf(stderr, "indexeddb unique probe: ok=%d summary=%s error=%s\n",
+                indexeddb_unique_ok, result.summary, result.error);
+    }
+    CHECK(indexeddb_unique_ok
+          && strcmp(result.summary, "INDEXEDDB-UNIQUE-OK") == 0
+          && result.indexed_db_records == 0
+          && result.indexed_db_bytes == 0);
+
     /* hardening.js runs once, over a snapshot of the globals that exist at
        that moment, so a __tilefinch global created lazily on a later write used
        to stay enumerable for the rest of the page. And the host entry points
@@ -1661,6 +2056,8 @@ int main(void)
         "'__tilefinchParentAppendBypass','__tilefinchMutationSuppressed',"
         "'__tilefinchNow'],"
         "entries=['__tilefinchCommitSameDocument','__tilefinchDeliverNetwork',"
+        "'__tilefinchRecordEventHandler','__tilefinchReportUncaught',"
+        "'__tilefinchRunTask',"
         "'__tilefinchDispatchDOMContentLoaded',"
         "'__tilefinchIntersectionRecheck','__tilefinchParserMutationCheckpoint',"
         "'__tilefinchMediaRecheck',"
@@ -1678,9 +2075,11 @@ int main(void)
         "Object.getOwnPropertyDescriptor(globalThis,name);"
         "return !d||typeof d.value!=='function'||d.writable!==false"
         "||d.configurable!==false;});"
-        "const pumpBefore=__tilefinchPumpTimers;"
+        "const pumpBefore=__tilefinchPumpTimers,taskBefore=__tilefinchRunTask;"
         "try{globalThis.__tilefinchPumpTimers=()=>0;}catch(error){}"
-        "const held=__tilefinchPumpTimers===pumpBefore;"
+        "try{globalThis.__tilefinchRunTask=(_,callback)=>callback();}catch(error){}"
+        "const held=__tilefinchPumpTimers===pumpBefore"
+        "&&__tilefinchRunTask===taskBefore;"
         "globalThis.pocSummary=enumerable.length===0&&writable.length===0"
         "&&held?'HARDENING-OK':'HARDENING-FAILED:'"
         "+enumerable.join(',')+'|'+writable.join(',')+'|'+held;})()";
@@ -2593,6 +2992,24 @@ int main(void)
           && strcmp(result.summary, "TRACED-MODULE-EXECUTED") == 0
           && result.last_compile_source_kind
                == SCRIPT_COMPILE_SOURCE_MODULE);
+
+    puts("test: detached runtimes reject new network work");
+    script_runtime_detach_document(runtime, &document);
+    static const char detached_fetch_probe[] =
+        "fetch('/after-detach').then(()=>{"
+        "globalThis.pocSummary='DETACHED-FETCH-RESOLVED'"
+        "}).catch(error=>{globalThis.pocSummary=error instanceof TypeError"
+        "?'DETACHED-FETCH-REJECTED':'DETACHED-FETCH-WRONG:'+error});";
+    bool detached_fetch_ok = script_runtime_evaluate_diagnostic(
+        runtime, detached_fetch_probe, "<detached-fetch-probe>", &result);
+    for (size_t tick = 0; detached_fetch_ok && tick < 8
+         && strcmp(result.summary, "DETACHED-FETCH-REJECTED") != 0; tick++) {
+        detached_fetch_ok = script_runtime_advance(runtime, 0, 64, &result);
+    }
+    CHECK(detached_fetch_ok
+          && strcmp(result.summary, "DETACHED-FETCH-REJECTED") == 0
+          && result.async_network_active_native == 0
+          && result.async_network_pending_logical == 0);
 
     script_runtime_destroy(runtime);
     runtime = NULL;

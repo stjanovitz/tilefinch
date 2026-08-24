@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import re
 import subprocess
@@ -251,6 +252,29 @@ def score(candidate: Path, reference: Path) -> dict[str, str]:
             else str(data.get(name, "-")) for name in METRICS}
 
 
+def render_and_score(lab: str, row: dict, trace_root: Path,
+                     reference_root: Path, work_dir: Path
+                     ) -> tuple[list[str], list[str]]:
+    """Render one independent scenario and return ordered rows/messages."""
+    name = row["scenario"]
+    reference_dir = reference_root / name
+    if not (reference_dir / "reference-state.json").exists():
+        return [], [f"# {name}: no eligible reference captured; skipped"]
+    frames = render(lab, row, trace_root / row["replay_dir"], work_dir / name)
+    result = []
+    messages = []
+    for checkpoint in frames:
+        reference = reference_dir / f"{checkpoint}.png"
+        if not reference.exists():
+            messages.append(
+                f"# {name}/{checkpoint}: no reference captured; skipped")
+            continue
+        metrics = score(frames[checkpoint], reference)
+        result.append(name + "\t" + checkpoint + "\t"
+                      + "\t".join(metrics[m] for m in METRICS))
+    return result, messages
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True, type=Path)
@@ -263,6 +287,9 @@ def main() -> int:
                         help="baseline TSV; regress past tolerance -> exit 2")
     parser.add_argument("--floor-tolerance", type=float, default=0.02)
     parser.add_argument(
+        "--jobs", type=int, default=1,
+        help="independent scenarios to render concurrently (default: 1)")
+    parser.add_argument(
         "--scenario", action="append", default=[],
         help="render only this scenario (repeatable; default: all)")
     args = parser.parse_args()
@@ -272,33 +299,33 @@ def main() -> int:
               file=sys.stderr)
         return 77
 
+    if args.jobs < 1 or args.jobs > 16:
+        parser.error("--jobs must be between 1 and 16")
+
     rows = ["scenario\tcheckpoint\t" + "\t".join(METRICS)]
     failures = 0
-    for row in scenarios(args.manifest):
-        name = row["scenario"]
-        if args.scenario and name not in args.scenario:
-            continue
-        reference_dir = args.reference_root / name
-        if not (reference_dir / "reference-state.json").exists():
-            print(f"# {name}: no eligible reference captured; skipped",
-                  file=sys.stderr)
-            continue
+    selected = [row for row in scenarios(args.manifest)
+                if not args.scenario or row["scenario"] in args.scenario]
+
+    def run(row: dict) -> tuple[list[str], list[str]]:
         try:
-            frames = render(args.lab, row,
-                            args.trace_root / row["replay_dir"],
-                            args.work_dir / name)
-            for checkpoint in frames:
-                reference = reference_dir / f"{checkpoint}.png"
-                if not reference.exists():
-                    print(f"# {name}/{checkpoint}: no reference captured; "
-                          "skipped", file=sys.stderr)
-                    continue
-                metrics = score(frames[checkpoint], reference)
-                rows.append(name + "\t" + checkpoint + "\t"
-                            + "\t".join(metrics[m] for m in METRICS))
+            return render_and_score(
+                args.lab, row, args.trace_root, args.reference_root,
+                args.work_dir)
         except RuntimeError as error:
-            print(f"# {name}: {error}", file=sys.stderr)
-            failures += 1
+            return [], [f"# {row['scenario']}: ERROR: {error}"]
+
+    # executor.map preserves manifest order even though the independent
+    # render subprocesses finish out of order, keeping the scoreboard stable.
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(args.jobs, len(selected) or 1)) as executor:
+        results = list(executor.map(run, selected))
+    for scenario_rows, messages in results:
+        rows.extend(scenario_rows)
+        for message in messages:
+            print(message, file=sys.stderr)
+            if ": ERROR:" in message:
+                failures += 1
     report = "\n".join(rows) + "\n"
     sys.stdout.write(report)
     if args.output:

@@ -14,9 +14,14 @@ one of four forms:
 - **Listing:** at least eight repeated, evidenced media entries share a list
   container. A matching link alone is insufficient; each entry also needs a
   thumbnail or nearby duration/view metadata.
-- **Watch:** the document declares primary media through `<video>`,
-  `VideoObject`, or `og:type`. This check precedes listing detection so a
-  related-items rail does not turn a watch page into a listing.
+- **Media:** the document has a visible playable `<video>`/`<audio>` element
+  or a high-confidence discovered candidate colocated with its primary title.
+  Schema.org and `og:type` media hints alone do not promote a page to Media;
+  promotional metadata would otherwise misclassify ordinary landing pages.
+  Those head hints do veto high-confidence Listing classification, however,
+  so a script-injected player with a related-items rail degrades to Article or
+  Raw rather than hiding its description as a listing. The internal page-kind
+  name remains `watch` for stylesheet and telemetry compatibility.
 - **Raw:** no high-confidence shape was found. Manual Reader mode still
   applies the conservative generic reflow.
 
@@ -34,7 +39,7 @@ Reader mode is manual by default. Choose **Menu → Page tools → Reader
 mode** to enable it for the current page. **Always use Reader mode** is a
 bounded per-site preference. **Settings → Appearance → Auto Reader** is
 an explicit global opt-in that engages only when the classifier reports a
-high-confidence article, listing, or watch page.
+high-confidence article, listing, or media page.
 
 Reader font is a persisted Sans/Serif choice. While Reader mode is active, the
 normal Web pages scale control adjusts Reader text. `Remember size` is off by

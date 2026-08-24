@@ -1,0 +1,8 @@
+# id	suite	panel	kind	test	reference
+canvas-shadow-fill	html	canvas-shadows	testharness	html/canvas/element/drawing-rectangles-to-the-canvas/2d.fillRect.shadow.html	-
+canvas-shadow-clear	html	canvas-shadows	testharness	html/canvas/element/drawing-rectangles-to-the-canvas/2d.clearRect.shadow.html	-
+canvas-shadow-stroke	html	canvas-shadows	testharness	html/canvas/element/drawing-rectangles-to-the-canvas/2d.strokeRect.shadow.html	-
+canvas-shadow-blur-invalid	html	canvas-state	testharness	html/canvas/element/shadows/2d.shadow.attributes.shadowBlur.invalid.html	-
+canvas-shadow-offset-invalid	html	canvas-state	testharness	html/canvas/element/shadows/2d.shadow.attributes.shadowOffset.invalid.html	-
+canvas-path-evenodd	html	canvas-paths	testharness	html/canvas/element/path-objects/2d.path.fill.winding.evenodd.2.html	-
+canvas-path-arc-negative	html	canvas-paths	testharness	html/canvas/element/path-objects/2d.path.arc.negative.html	-

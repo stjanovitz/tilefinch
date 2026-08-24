@@ -78,6 +78,58 @@ int main(void)
         &find, &budget, &layout, "brown\xc2\xa0" "fox"));
     CHECK(find.match_count == 1);
 
+    /* Search remains logical, while its highlight follows the retained
+       visual-order glyph map rather than interpolating the command box. */
+    DrawCommand bidi_text = {
+        .type = DRAW_TEXT, .text = "abc", .text_length = 3,
+        .x = 10, .y = 60, .width = 30, .height = 18
+    };
+    LayoutBidiGlyph bidi_glyphs[] = {
+        {.codepoint = 'c', .x_fixed = 10 * 64,
+         .logical_byte_offset = 2, .advance_fixed = 10 * 64,
+         .logical_byte_length = 1, .level = 1},
+        {.codepoint = 'b', .x_fixed = 20 * 64,
+         .logical_byte_offset = 1, .advance_fixed = 10 * 64,
+         .logical_byte_length = 1, .level = 1},
+        {.codepoint = 'a', .x_fixed = 30 * 64,
+         .logical_byte_offset = 0, .advance_fixed = 10 * 64,
+         .logical_byte_length = 1, .level = 1}
+    };
+    LayoutBidiCommand bidi_map = {
+        .command_index = 0, .glyph_start = 0, .glyph_count = 3, .level = 1
+    };
+    LayoutDocument bidi_layout = {
+        .commands = &bidi_text, .count = 1,
+        .bidi_glyphs = bidi_glyphs, .bidi_glyph_count = 3,
+        .bidi_commands = &bidi_map, .bidi_command_count = 1
+    };
+    CHECK(page_find_build(&find, &budget, &bidi_layout, "a")
+          && find.match_count == 1);
+    rect_count = page_find_match_rects(
+        &find, &bidi_layout, 0, rects, PAGE_FIND_RECT_LIMIT);
+    CHECK(rect_count == 1 && rects[0].x == 30 && rects[0].width == 10);
+    CHECK(page_find_build(&find, &budget, &bidi_layout, "c")
+          && find.match_count == 1);
+    rect_count = page_find_match_rects(
+        &find, &bidi_layout, 0, rects, PAGE_FIND_RECT_LIMIT);
+    CHECK(rect_count == 1 && rects[0].x == 10 && rects[0].width == 10);
+    size_t logical = SIZE_MAX;
+    int caret_x = -1;
+    CHECK(layout_bidi_visual_hit_test(
+              &bidi_layout, 0, 10 * 64, &logical, &caret_x)
+          && logical == 3 && caret_x == 10 * 64);
+    CHECK(layout_bidi_visual_step(
+              &bidi_layout, 0, caret_x, 1, &logical, &caret_x)
+          && logical == 2 && caret_x == 20 * 64);
+    CHECK(layout_bidi_visual_step(
+              &bidi_layout, 0, caret_x, 1, &logical, &caret_x)
+          && logical == 1 && caret_x == 30 * 64);
+    CHECK(layout_bidi_visual_step(
+              &bidi_layout, 0, caret_x, 1, &logical, &caret_x)
+          && logical == 0 && caret_x == 40 * 64);
+    CHECK(!layout_bidi_visual_step(
+        &bidi_layout, 0, caret_x, 1, &logical, &caret_x));
+
     char repeated[PAGE_FIND_MATCH_LIMIT + 32u];
     memset(repeated, 'x', sizeof(repeated));
     DrawCommand repeated_command = {

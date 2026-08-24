@@ -1,0 +1,129 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Canvas 2D qualification</title>
+<style>
+  html, body { margin: 0; background: #16151d; overflow: hidden; }
+  canvas { display: block; width: 440px; height: 220px; margin: 10px 20px; }
+</style>
+<canvas id="chart" width="440" height="220"></canvas>
+<script>
+  const canvas = document.getElementById("chart");
+  const context = canvas.getContext("2d");
+
+  context.fillStyle = "#232130";
+  context.fillRect(0, 0, 440, 220);
+
+  const header = context.createLinearGradient(0, 0, 440, 0);
+  header.addColorStop(0, "#ff8a48");
+  header.addColorStop(1, "#7759f6");
+  context.shadowColor = "rgba(0, 0, 0, 0.65)";
+  context.shadowBlur = 5;
+  context.shadowOffsetY = 2;
+  context.fillStyle = header;
+  context.beginPath();
+  context.roundRect(12, 10, 416, 42, 10);
+  context.fill();
+  context.shadowColor = "transparent";
+  context.shadowBlur = 0;
+  context.shadowOffsetY = 0;
+
+  context.fillStyle = "white";
+  context.font = "bold 18px sans-serif";
+  context.textBaseline = "middle";
+  context.fillText("Canvas activity", 26, 31);
+  context.font = "11px sans-serif";
+  context.textAlign = "right";
+  context.fillText("PSP native raster", 414, 31);
+  context.textAlign = "start";
+
+  context.save();
+  context.beginPath();
+  context.roundRect(12, 62, 300, 144, 10);
+  context.clip();
+  context.fillStyle = "#1b1a25";
+  context.fillRect(12, 62, 300, 144);
+  context.strokeStyle = "#3c394f";
+  context.lineWidth = 1;
+  context.setLineDash([3, 4]);
+  for (let row = 0; row < 4; row++) {
+    context.beginPath();
+    context.moveTo(22, 82 + row * 31);
+    context.lineTo(302, 82 + row * 31);
+    context.stroke();
+  }
+  context.setLineDash([]);
+
+  const area = context.createLinearGradient(0, 74, 0, 195);
+  area.addColorStop(0, "#ff955b");
+  area.addColorStop(1, "#5c335f");
+  context.fillStyle = area;
+  context.beginPath();
+  context.moveTo(22, 184);
+  context.lineTo(22, 166);
+  context.bezierCurveTo(64, 150, 75, 176, 112, 131);
+  context.bezierCurveTo(151, 87, 180, 151, 214, 106);
+  context.bezierCurveTo(247, 63, 278, 111, 302, 76);
+  context.lineTo(302, 194);
+  context.lineTo(22, 194);
+  context.closePath();
+  context.fill();
+  context.strokeStyle = "#ffd0b7";
+  context.lineWidth = 3;
+  context.lineJoin = "round";
+  context.lineCap = "round";
+  context.stroke();
+  context.restore();
+
+  context.fillStyle = "#2a2837";
+  context.beginPath();
+  context.roundRect(324, 62, 104, 144, 10);
+  context.fill();
+  const trendIcon = new Path2D("M338 145l10 -8 9 5 14 -16 12 7");
+  const trendCopy = new Path2D();
+  trendCopy.addPath(trendIcon, new DOMMatrix());
+  context.strokeStyle = "#ffb187";
+  context.lineWidth = 2;
+  context.stroke(trendCopy);
+  context.fillStyle = "#c9c5da";
+  context.font = "12px sans-serif";
+  context.fillText("Current", 338, 86);
+  context.fillStyle = "white";
+  context.font = "bold 24px sans-serif";
+  context.fillText("72", 338, 116);
+  context.font = "12px sans-serif";
+  context.fillStyle = "#8d88a2";
+  context.fillText("frames", 374, 114);
+
+  const sprite = document.createElement("canvas");
+  sprite.width = 8;
+  sprite.height = 8;
+  const spriteContext = sprite.getContext("2d");
+  spriteContext.fillStyle = "#ff8a48";
+  spriteContext.fillRect(0, 0, 4, 8);
+  spriteContext.fillStyle = "#7759f6";
+  spriteContext.fillRect(4, 0, 4, 8);
+  context.imageSmoothingEnabled = true;
+  context.save();
+  context.translate(377, 158);
+  context.rotate(-0.18);
+  context.drawImage(sprite, 0, 0, 8, 8, -24, -18, 48, 36);
+  context.restore();
+
+  let frame = 0;
+  function animate(timestamp) {
+    frame++;
+    context.fillStyle = "#2a2837";
+    context.fillRect(336, 181, 78, 15);
+    const pulse = new Path2D(
+      `M336 177h${Math.max(4, Math.min(76, frame * 25))}`,
+    );
+    context.strokeStyle = "#ff8a48";
+    context.lineWidth = 1;
+    context.stroke(pulse);
+    context.fillStyle = "#b7b2ca";
+    context.font = "10px monospace";
+    context.fillText(String(Math.round(timestamp)) + " ms", 340, 192);
+    if (frame < 3) requestAnimationFrame(animate);
+  }
+  requestAnimationFrame(animate);
+</script>

@@ -79,6 +79,11 @@ runtime assets or immutable engine data.
   the user-triggered diagnostic export screen; the complete license is
   reproduced in the source headers and at
   `third_party/notices/qrcodegen/LICENSE`.
+- **SheenBidi 3.0.0**: Apache License 2.0. Tilefinch vendors the allocation-
+  bounded C implementation of Unicode Bidirectional Algorithm rules and its
+  generated Unicode 17 bidi/bracket tables. The optional text-editing API is
+  disabled; paragraph allocations are routed through Tilefinch's page budget.
+  The complete license is at `third_party/notices/sheenbidi/LICENSE`.
 - **OpenSSL** (host builds only): `OpenSSL::Crypto` is linked into host
   laboratory and test binaries. Apache License 2.0. Not part of the PSP
   EBOOT.
@@ -187,7 +192,8 @@ notice in this file.
 A browser release archive must bundle, at minimum: the Lexbor `LICENSE` and
 `NOTICE`;
 the FreeType FTL text and credit line (plus its embedded zlib/HarfBuzz
-notices); the MIT texts for QuickJS, stb, and the QR encoder; the NanoSVG zlib text; the
+notices); the MIT texts for QuickJS, stb, and the QR encoder; the SheenBidi
+Apache-2.0 text; the NanoSVG zlib text; the
 libwebp copyright license and patent grant;
 Public Suffix List MPL-2.0 and Chromium BSD-3-Clause texts with the source
 pointer; the complete PocketSphinx compound license; the DejaVu and both OFL

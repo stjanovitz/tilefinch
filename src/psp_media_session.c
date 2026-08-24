@@ -178,6 +178,13 @@ void psp_media_raise_error(
     } else {
         psp_ui_media_set_error(&media->ui, message);
     }
+    bool youtube_route = !media->offline_source && !media->page_source
+        && youtube_watch_url_supported(media->source);
+    media->ui.audio_only_recovery_available =
+        youtube_route && !media->audio_only;
+    media->ui.lower_quality_recovery_available =
+        youtube_route && !media->audio_only
+        && media->requested_quality == BROWSER_YOUTUBE_QUALITY_360P;
     /* A visible terminal panel owns no range delivery. Return the reserved
        media descriptors immediately; the singular open-service boundary
        re-acquires them for Retry, resume, or a fresh route. */
@@ -356,6 +363,10 @@ static void psp_media_apply_active_projection(PspMediaSession *media)
     PspMediaUiProjection projection =
         psp_media_machine_project_ui(&media->machine);
     psp_ui_media_apply_projection(&media->ui, &projection);
+    if (media->stream.live_hls) {
+        media->ui.live = true;
+        media->ui.seek_enabled = false;
+    }
     media->controller_audio_hold =
         !media->audio_only
         && (media->machine.state == PSP_MEDIA_SESSION_PRIMING
@@ -823,6 +834,10 @@ void psp_media_pump_ranges(PspMediaSession *media)
 {
     if (media == NULL) return;
     uint64_t now_us = psp_media_internal_now_us(media);
+    /* HLS is a streaming sample source rather than a byte range. It still
+       receives exactly one bounded delivery visit per frame so a live
+       playlist can refresh while already-decoded samples are being played. */
+    psp_media_hls_pump_delivery(media->hls, now_us);
     if (media->range != NULL
         && (media->video_lookahead_next_sample_us == 0
             || now_us >= media->video_lookahead_next_sample_us)) {
@@ -1798,6 +1813,24 @@ bool psp_media_reclaim_hidden_pipeline_for_navigation(
     return psp_media_reclaim_hidden_pipeline(media);
 }
 
+static void psp_media_request_user_retry(PspMediaSession *media)
+{
+    if (media == NULL || media->source[0] == '\0') return;
+    if (!media->reopen_resume_pending && media->playback != NULL)
+        psp_media_remember_retry_state(media, false);
+    /* An explicit recovery choice is a new incident initiated by the user,
+       so it receives a fresh bounded candidate allowance. */
+    media->transport_reresolve_attempts = 0;
+    media->transport_refresh_rearm_us = 0;
+    media->transport_next_expiry_check_us = 0;
+    media->failure_report_level = 0;
+    media->open_service_pending = true;
+    psp_ui_media_set_resolving(&media->ui, "YouTube video");
+    psp_media_dispatch(media, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_RETRY
+    }, "retry-intent");
+}
+
 void psp_media_execute_intent(PspMediaSession *media,
                                      PspUiMediaIntent intent)
 {
@@ -1914,22 +1947,18 @@ void psp_media_execute_intent(PspMediaSession *media,
             break;
         }
         case PSP_UI_MEDIA_ACTION_RETRY:
-            if (media->source[0] != '\0') {
-                if (!media->reopen_resume_pending
-                    && media->playback != NULL) {
-                    psp_media_remember_retry_state(media, false);
-                }
-                /* An explicit Retry is a new incident initiated by the user,
-                   so it receives a fresh bounded candidate allowance. */
-                media->transport_reresolve_attempts = 0;
-                media->transport_refresh_rearm_us = 0;
-                media->transport_next_expiry_check_us = 0;
-                media->failure_report_level = 0;
-                media->open_service_pending = true;
-                psp_ui_media_set_resolving(&media->ui, "YouTube video");
-                psp_media_dispatch(media, (PspMediaEvent) {
-                    .type = PSP_MEDIA_EVENT_RETRY
-                }, "retry-intent");
+            psp_media_request_user_retry(media);
+            break;
+        case PSP_UI_MEDIA_ACTION_AUDIO_ONLY:
+            if (media->ui.audio_only_recovery_available) {
+                media->audio_only = true;
+                psp_media_request_user_retry(media);
+            }
+            break;
+        case PSP_UI_MEDIA_ACTION_LOWER_QUALITY:
+            if (media->ui.lower_quality_recovery_available) {
+                media->requested_quality = BROWSER_YOUTUBE_QUALITY_240P;
+                psp_media_request_user_retry(media);
             }
             break;
         case PSP_UI_MEDIA_ACTION_CLOSE:
@@ -2443,8 +2472,16 @@ bool psp_media_advance(
         return true;
     }
     if (advance == MEDIA_PLAYBACK_ADVANCE_ERROR) {
+        /* A live manifest or segment URL can expire, rotate, or briefly vanish
+           without a MediaHttpRange object to carry the usual HTTP-failure
+           evidence. The source keeps every such failure under an HLS-labelled
+           error. Spend the same bounded re-resolution budget as progressive
+           delivery and reopen at the new live edge; decoder failures remain
+           on their existing recovery path. */
+        bool live_delivery_failed = media->stream.live_hls
+            && psp_media_hls_failed(media->hls);
         if (psp_media_retry_delivery_failure(
-                media, "decode", error, false)) return true;
+                media, "decode", error, live_delivery_failed)) return true;
         if (psp_media_retry_240p(
                 media, "decode", error, false)) return true;
         MediaHttpRangeStats video_http = {0};
@@ -2948,6 +2985,7 @@ bool psp_media_advance(
             ended, media->clock_us,
             psp_media_duration_us(media),
             media->stream.title);
+        media->ui.live = media->stream.live_hls;
     }
     uint64_t buffered =
         media_playback_buffered_until_us(media->playback);

@@ -8,6 +8,27 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.11 — 2026-08-23
+
+- Added an optional ARK-4 XMB redirect that opens Tilefinch from Sony's
+  Internet Browser icon, with an L-trigger bypass and fail-open behavior.
+- Added isolated Wi-Fi sign-in for captive portals without weakening normal
+  HTTPS verification or sharing ordinary browsing cookies and storage.
+- Added YouTube live-stream and premiere support, improved native page audio
+  and video routing, and hardened playback, seeking, buffering, and player
+  presentation across changing network and media conditions.
+- Expanded Canvas 2D for charts, controls, and simple games with native text,
+  clipping, paths, sprites, animation batching, shadows, and safer bounded
+  raster work.
+- Added bounded bidirectional page text, Arabic-family shaping, and optional
+  Arabic and Hebrew glyph-pack support while preserving the fast LTR path.
+- Improved Reader mode, long-page rendering, script-failure degradation,
+  responsive layouts, and static fallbacks for animation-heavy pages.
+- Added clearer contextual failure recovery, richer site information, and a
+  resumable download manager with bounded Memory Stick writes.
+- Improved PSP chrome composition and made HOME-button exit responsive even
+  while the browser is cancelling foreground work.
+
 ## 0.1.10 — 2026-08-22
 
 - Improved time to playback from YouTube results: Play now opens the native

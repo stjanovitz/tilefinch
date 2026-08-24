@@ -174,6 +174,40 @@
     }
     return current;
   };
+  const indexKeysForValue = (value, schema) => {
+    let keys = keyAtPath(value, schema.keyPath);
+    keys = schema.multiEntry && Array.isArray(keys) ? keys : [keys];
+    const output = [],
+      seen = new Set();
+    for (const key of keys) {
+      if (key === undefined) continue;
+      try {
+        validateKey(key);
+      } catch (_) {
+        continue;
+      }
+      const token = keyToken(key);
+      if (seen.has(token)) continue;
+      seen.add(token);
+      output.push(key);
+    }
+    return output;
+  };
+  const assertUniqueIndexes = (store, value, primaryToken) => {
+    for (const schema of store.indexes.values()) {
+      if (!schema.unique) continue;
+      const wanted = new Set(
+        indexKeysForValue(value, schema).map((key) => keyToken(key)),
+      );
+      if (!wanted.size) continue;
+      for (const [recordToken, record] of store.records) {
+        if (recordToken === primaryToken) continue;
+        for (const key of indexKeysForValue(record.value, schema))
+          if (wanted.has(keyToken(key)))
+            throw fail("Unique index key already exists", "ConstraintError");
+      }
+    }
+  };
 
   class DOMStringList extends Array {
     contains(value) {
@@ -667,6 +701,7 @@
       const previous = this._store.records.get(token);
       if (!overwrite && previous)
         throw fail("Key already exists", "ConstraintError");
+      assertUniqueIndexes(this._store, value, token);
       const bytes = serializedSize(key, value);
       const delta = bytes - (previous ? previous.bytes : 0);
       if (
@@ -803,6 +838,19 @@
         multiEntry: !!options.multiEntry,
         unique: !!options.unique,
       };
+      if (schema.unique) {
+        const seen = new Set();
+        for (const record of this._store.records.values())
+          for (const key of indexKeysForValue(record.value, schema)) {
+            const token = keyToken(key);
+            if (seen.has(token))
+              throw fail(
+                "Existing records violate the unique index",
+                "ConstraintError",
+              );
+            seen.add(token);
+          }
+      }
       this._store.indexes.set(name, schema);
       return new IDBIndex(this.transaction, this, schema);
     }
@@ -849,10 +897,8 @@
     _entries(query, count = 0) {
       const output = [];
       for (const record of this.objectStore._store.records.values()) {
-        let keys = keyAtPath(record.value, this.keyPath);
-        keys = this.multiEntry && Array.isArray(keys) ? keys : [keys];
-        for (const key of keys) {
-          if (key !== undefined && matchesQuery(key, query))
+        for (const key of indexKeysForValue(record.value, this._schema)) {
+          if (matchesQuery(key, query))
             output.push({ indexKey: key, record });
         }
       }

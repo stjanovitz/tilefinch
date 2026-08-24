@@ -63,7 +63,7 @@
       (timestamp) => callback(timestamp),
       16,
       false,
-      [now + 16],
+      [],
       "animation-frame",
     );
   };
@@ -517,7 +517,12 @@
         "timer:" + String(timer.kind) + ":id=" + String(timer.id),
         () => {
           try {
-            timer.callback(...timer.args);
+            /* Animation timestamps describe the frame that is actually being
+               serviced. A late browser tick therefore skips time instead of
+               replaying a backlog of synthetic 16 ms frames. Inactive page
+               runtimes are not pumped, so their callbacks remain paused. */
+            if (timer.kind === "animation-frame") timer.callback(now);
+            else timer.callback(...timer.args);
           } catch (error) {
             __tilefinchReportUncaught(error, "timer callback");
           }
@@ -670,8 +675,28 @@
   };
   let pointerHoverTarget = null,
     pointerMoveProbeTarget = null,
+    pointerCaptureTarget = null,
     pointerMarkupPossible =
       !!globalThis.__tilefinchPointerMarkupInitiallyPresent;
+  Element.prototype.setPointerCapture = function (pointerId) {
+    if (Number(pointerId) !== 1)
+      throw new DOMException("Unknown pointer", "NotFoundError");
+    if (pointerCaptureTarget === this) return;
+    if (pointerCaptureTarget)
+      pointerCaptureTarget.dispatchEvent(
+        tilefinchEvent("lostpointercapture", { pointerId: 1 }),
+      );
+    pointerCaptureTarget = this;
+    this.dispatchEvent(tilefinchEvent("gotpointercapture", { pointerId: 1 }));
+  };
+  Element.prototype.releasePointerCapture = function (pointerId) {
+    if (Number(pointerId) !== 1 || pointerCaptureTarget !== this) return;
+    pointerCaptureTarget = null;
+    this.dispatchEvent(tilefinchEvent("lostpointercapture", { pointerId: 1 }));
+  };
+  Element.prototype.hasPointerCapture = function (pointerId) {
+    return Number(pointerId) === 1 && pointerCaptureTarget === this;
+  };
   globalThis.__tilefinchPointerMarkupChanged = () => {
     pointerMarkupPossible = true;
     pointerMoveProbeTarget = null;
@@ -721,7 +746,9 @@
     buttons = 0,
   ) => {
     phase = Number(phase) | 0;
-    const target = trustedWrap(Number(handle));
+    let target = trustedWrap(Number(handle));
+    if (pointerCaptureTarget && phase >= 1 && phase <= 4)
+      target = pointerCaptureTarget;
     if ((!target && phase !== 1) || (target?.disabled && phase !== 1))
       return false;
     if (phase === 1) {
@@ -746,6 +773,11 @@
     if (phase) {
       clientX = Number(clientX) || 0;
       clientY = Number(clientY) || 0;
+      if (pointerCaptureTarget && typeof target.getBoundingClientRect === "function") {
+        const bounds = target.getBoundingClientRect();
+        offsetX = clientX - bounds.left;
+        offsetY = clientY - bounds.top;
+      }
       point = {
         clientX,
         clientY,
@@ -798,9 +830,26 @@
     if (phase === 3) {
       const pointerAccepted = fire("pointerup"),
         mouseAccepted = fire("mouseup");
+      if (pointerCaptureTarget) {
+        const captured = pointerCaptureTarget;
+        pointerCaptureTarget = null;
+        captured.dispatchEvent(
+          tilefinchEvent("lostpointercapture", { pointerId: 1 }),
+        );
+      }
       return pointerAccepted && mouseAccepted;
     }
-    if (phase === 4) return fire("pointercancel");
+    if (phase === 4) {
+      const accepted = fire("pointercancel");
+      if (pointerCaptureTarget) {
+        const captured = pointerCaptureTarget;
+        pointerCaptureTarget = null;
+        captured.dispatchEvent(
+          tilefinchEvent("lostpointercapture", { pointerId: 1 }),
+        );
+      }
+      return accepted;
+    }
     const clickDefault = () => {
       const controlState =
           globalThis.__tilefinchBeginControlDefault?.(target, true) || null,

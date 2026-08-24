@@ -187,10 +187,12 @@ static void scroll_container_style(
             sheet, box->node, "scroll-padding", &box_values)) {
         for (size_t side = 0; side < 4; side++) {
             if ((box_values.present_mask & (1u << side)) == 0) continue;
+            int reference = side == 0 || side == 2
+                ? box->client_height : box->client_width;
             edges[side] = scroll_length(
                 sheet, box_values.values[side],
                 strlen(box_values.values[side]),
-                box->client_width, true);
+                reference, true);
         }
     }
     container->padding_top = scroll_clamp_i16(edges[0]);

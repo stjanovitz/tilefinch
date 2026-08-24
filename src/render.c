@@ -15,6 +15,19 @@
 
 enum { RENDER_GRADIENT_CACHE_ENTRIES = 2 };
 
+static int render_saturating_add_int(int left, int right)
+{
+    int64_t sum = (int64_t) left + right;
+    return sum > INT_MAX ? INT_MAX : (sum < INT_MIN ? INT_MIN : (int) sum);
+}
+
+static int render_saturating_subtract_int(int left, int right)
+{
+    int64_t difference = (int64_t) left - right;
+    return difference > INT_MAX ? INT_MAX
+        : (difference < INT_MIN ? INT_MIN : (int) difference);
+}
+
 typedef struct {
     size_t slot;
     const DrawCommand *command;
@@ -520,9 +533,13 @@ static bool fixed_screen_command(const TileCache *cache,
         || index >= cache->layout->count) return false;
     *command = cache->layout->commands[index];
     int target_y = range->from_bottom
-                   ? viewport_height - range->inset - range->height
-                   : range->inset;
-    command->y += target_y - range->origin_y;
+        ? render_saturating_subtract_int(
+              render_saturating_subtract_int(
+                  viewport_height, range->inset), range->height)
+        : range->inset;
+    command->y = render_saturating_add_int(
+        command->y,
+        render_saturating_subtract_int(target_y, range->origin_y));
     return true;
 }
 
@@ -603,19 +620,24 @@ static bool fixed_screen_command_geometry(
             MAXIMUM_ROUNDED_CLIPS);
     }
 
-    int fixed_dy = (range->from_bottom
-                    ? viewport_height - range->inset - range->height
-                    : range->inset) - range->origin_y;
-    fixed->command.x += dx;
-    fixed->command.y += dy;
+    int fixed_target_y = range->from_bottom
+        ? render_saturating_subtract_int(
+              render_saturating_subtract_int(
+                  viewport_height, range->inset), range->height)
+        : range->inset;
+    int fixed_dy = render_saturating_subtract_int(
+        fixed_target_y, range->origin_y);
+    fixed->command.x = render_saturating_add_int(fixed->command.x, dx);
+    fixed->command.y = render_saturating_add_int(fixed->command.y, dy);
     if (clip_left > fixed->clip_left) fixed->clip_left = clip_left;
     if (clip_right < fixed->clip_right) fixed->clip_right = clip_right;
-    if (clip_top > INT_MIN / 2 - fixed_dy) clip_top += fixed_dy;
-    if (clip_bottom > INT_MIN / 2 - fixed_dy) clip_bottom += fixed_dy;
+    clip_top = render_saturating_add_int(clip_top, fixed_dy);
+    clip_bottom = render_saturating_add_int(clip_bottom, fixed_dy);
     if (clip_top > fixed->clip_top) fixed->clip_top = clip_top;
     if (clip_bottom < fixed->clip_bottom) fixed->clip_bottom = clip_bottom;
     for (size_t i = 0; i < fixed->rounded_clip_count; i++) {
-        fixed->rounded_clips[i].y += fixed_dy;
+        fixed->rounded_clips[i].y = render_saturating_add_int(
+            fixed->rounded_clips[i].y, fixed_dy);
     }
     return fixed->clip_right > fixed->clip_left
         && fixed->clip_bottom > fixed->clip_top
@@ -892,7 +914,8 @@ static void paint_sticky_overlays(TileCache *cache, uint16_t *frame,
     for (size_t range_index = 0;
          range_index < cache->layout->sticky_count; range_index++) {
         const StickyRange *range = &cache->layout->sticky_ranges[range_index];
-        int trigger = range->origin_y - range->top;
+        int trigger = render_saturating_subtract_int(
+            range->origin_y, range->top);
         if (scroll_y <= trigger) continue;
         for (size_t order = 0; order < cache->layout->count; order++) {
             size_t i = cache->layout->paint_order_count == cache->layout->count
@@ -900,8 +923,8 @@ static void paint_sticky_overlays(TileCache *cache, uint16_t *frame,
             if (i < range->command_start || i >= range->command_end) continue;
             const DrawCommand *source = &cache->layout->commands[i];
             DrawCommand command = *source;
-            int sticky_dy = scroll_y - trigger;
-            command.y += sticky_dy;
+            int sticky_dy = render_saturating_subtract_int(scroll_y, trigger);
+            command.y = render_saturating_add_int(command.y, sticky_dy);
             if (cache->layout->command_flags == NULL
                 || !(cache->layout->command_flags[i]
                      & LAYOUT_COMMAND_OVERFLOW)) {
@@ -931,10 +954,10 @@ static void paint_sticky_overlays(TileCache *cache, uint16_t *frame,
                            &clip_right, &clip_bottom)) {
                 continue;
             }
-            command.x += dx;
-            command.y += dy;
-            clip_top += sticky_dy;
-            clip_bottom += sticky_dy;
+            command.x = render_saturating_add_int(command.x, dx);
+            command.y = render_saturating_add_int(command.y, dy);
+            clip_top = render_saturating_add_int(clip_top, sticky_dy);
+            clip_bottom = render_saturating_add_int(clip_bottom, sticky_dy);
             RoundedClip rounded_clips[MAXIMUM_ROUNDED_CLIPS];
             size_t rounded_clip_count = geometry != NULL
                 ? overflow_cached_rounded_clips(
@@ -942,14 +965,17 @@ static void paint_sticky_overlays(TileCache *cache, uint16_t *frame,
                 : overflow_rounded_clips(
                     cache->layout, i, rounded_clips, MAXIMUM_ROUNDED_CLIPS);
             for (size_t clip = 0; clip < rounded_clip_count; clip++) {
-                rounded_clips[clip].y += sticky_dy;
+                rounded_clips[clip].y = render_saturating_add_int(
+                    rounded_clips[clip].y, sticky_dy);
             }
             int visible_left = clip_left > 0 ? clip_left : 0;
             int visible_right = clip_right < viewport_width
                 ? clip_right : viewport_width;
             int visible_top = clip_top > scroll_y ? clip_top : scroll_y;
-            int visible_bottom = clip_bottom < scroll_y + viewport_height
-                ? clip_bottom : scroll_y + viewport_height;
+            int viewport_bottom = render_saturating_add_int(
+                scroll_y, viewport_height);
+            int visible_bottom = clip_bottom < viewport_bottom
+                ? clip_bottom : viewport_bottom;
             if (visible_right <= visible_left
                 || visible_bottom <= visible_top
                 || !intersects(&command, visible_left, visible_top,
@@ -1063,8 +1089,12 @@ static void paint_scroll_indicator(const TileCache *cache, uint16_t *frame,
 }
 
 bool render_write_frame_ppm(const char *path, const uint16_t *frame,
-                            int width, int height)
+                            size_t frame_pixels, int width, int height)
 {
+    if (path == NULL || frame == NULL || width <= 0 || height <= 0
+        || (size_t) width > SIZE_MAX / (size_t) height) return false;
+    size_t pixels = (size_t) width * (size_t) height;
+    if (pixels > frame_pixels) return false;
     FILE *file = fopen(path, "wb");
     if (file == NULL) return false;
     fprintf(file, "P6\n%d %d\n255\n", width, height);
@@ -1072,7 +1102,6 @@ bool render_write_frame_ppm(const char *path, const uint16_t *frame,
        three fputc calls per pixel dominated capture cost. */
     enum { RENDER_PPM_CHUNK_PIXELS = 1024 };
     unsigned char chunk[RENDER_PPM_CHUNK_PIXELS * 3];
-    size_t pixels = (size_t) width * (size_t) height;
     for (size_t at = 0; at < pixels;) {
         size_t batch = pixels - at < RENDER_PPM_CHUNK_PIXELS
                        ? pixels - at : RENDER_PPM_CHUNK_PIXELS;
@@ -1618,8 +1647,10 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
     }
     if (ok && output_path != NULL) {
         uint64_t write_started = render_now_us();
-        ok = render_write_frame_ppm(output_path, frame, viewport_width,
-                                    viewport_height);
+        ok = render_write_frame_ppm(
+            output_path, frame,
+            temporary_frame ? pixels : cache->frame_pixels,
+            viewport_width, viewport_height);
         cache->frame_io_us += render_now_us() - write_started;
     }
     if (temporary_frame) budget_free(cache->budget, frame);
@@ -1945,13 +1976,35 @@ static bool tile_cache_prewarm_text_glyph(TileCache *cache,
         bold_face);
     if (face == NULL) return false;
     unsigned codepoint = 0;
-    size_t used = font_utf8_next(command->text + *text_offset,
-                                 command->text_length - *text_offset,
-                                 &codepoint);
-    if (used == 0) return false;
-    codepoint = draw_command_transform_codepoint(
-        command, codepoint, *text_offset == 0);
-    *text_offset += used;
+    const LayoutBidiCommand *bidi = NULL;
+    uintptr_t command_address = (uintptr_t) command;
+    uintptr_t commands_address = (uintptr_t) cache->layout->commands;
+    size_t commands_bytes = cache->layout->count * sizeof(DrawCommand);
+    if (commands_address <= UINTPTR_MAX - commands_bytes
+        && command_address >= commands_address
+        && command_address < commands_address + commands_bytes
+        && (command_address - commands_address) % sizeof(DrawCommand) == 0) {
+        bidi = layout_bidi_command_for_index(
+            cache->layout,
+            (command_address - commands_address) / sizeof(DrawCommand));
+    }
+    if (bidi != NULL) {
+        size_t glyph_index = *text_offset;
+        if (glyph_index >= bidi->glyph_count) return false;
+        codepoint = cache->layout->bidi_glyphs[
+            bidi->glyph_start + glyph_index].codepoint;
+        glyph_index++;
+        *text_offset = glyph_index >= bidi->glyph_count
+            ? command->text_length : glyph_index;
+    } else {
+        size_t used = font_utf8_next(command->text + *text_offset,
+                                     command->text_length - *text_offset,
+                                     &codepoint);
+        if (used == 0) return false;
+        codepoint = draw_command_transform_codepoint(
+            command, codepoint, *text_offset == 0);
+        *text_offset += used;
+    }
     unsigned weight = draw_font_weight(command);
     bool synthetic_bold = weight >= 550u
         && (weight < 650u

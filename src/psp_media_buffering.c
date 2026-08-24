@@ -57,6 +57,10 @@ void psp_media_buffering_begin(
 static uint64_t psp_media_network_ahead_us(const PspMediaSession *media)
 {
     if (media == NULL || media->offline_source) return UINT64_MAX;
+    MediaHlsStats hls = {0};
+    if (psp_media_hls_stats(media->hls, &hls))
+        return hls.buffered_until_us > media->clock_us
+            ? hls.buffered_until_us - media->clock_us : 0;
     uint64_t duration_us = psp_media_duration_us(media);
     if (media->audio_only)
         return media_http_range_buffered_ahead_us(

@@ -604,7 +604,8 @@ third, non-interchangeable authority: `TFGMv1` envelopes sign the
 `tilefinch:glyph-component-manifest:v1` domain and authorize only raw bounded
 `TFGFv1` packages (format 3). Fixed asset names identify Japanese, Simplified
 Chinese, Traditional Chinese, Korean, Cyrillic, Extended Latin, and color
-emoji. Each pack has its own monotonic sequence and component ID; the installer
+emoji, plus Arabic and Hebrew page-text packs. Each pack has its own monotonic
+sequence and component ID; the installer
 verifies the signed size and digest, parses the complete bounded index, writes
 `READY` last, and then promotes `candidate.tmp → active` while retaining one
 `previous` generation. An `UNINSTALLED` marker suppresses both generations

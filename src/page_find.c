@@ -287,6 +287,55 @@ size_t page_find_match_rects(const PageFindIndex *index,
         size_t start = 0, end = 0;
         find_command_range(match, command, at, &start, &end);
         if (end <= start) continue;
+        const LayoutBidiCommand *bidi = layout_bidi_command_for_index(
+            layout, at);
+        if (bidi != NULL) {
+            for (size_t glyph_at = 0; glyph_at < bidi->glyph_count;
+                 glyph_at++) {
+                const LayoutBidiGlyph *glyph = &layout->bidi_glyphs[
+                    bidi->glyph_start + glyph_at];
+                size_t glyph_start = glyph->logical_byte_offset;
+                size_t glyph_end = glyph_start
+                    + glyph->logical_byte_length;
+                if (glyph_end <= start || glyph_start >= end) continue;
+                int left = glyph->x_fixed / 64;
+                if (glyph->x_fixed < 0 && glyph->x_fixed % 64 != 0) left--;
+                int64_t right_fixed = (int64_t) glyph->x_fixed
+                                      + glyph->advance_fixed;
+                int64_t right_wide = right_fixed / 64;
+                if (right_fixed > 0 && right_fixed % 64 != 0) right_wide++;
+                int right = right_wide > INT_MAX ? INT_MAX
+                    : (right_wide < INT_MIN ? INT_MIN : (int) right_wide);
+                if (right <= left) right = left + 1;
+                PageFindRect rect = {
+                    .x = left,
+                    .y = command->y,
+                    .width = right - left,
+                    .height = command->height > 0 ? command->height : 1,
+                    .fixed = layout->command_flags != NULL
+                        && (layout->command_flags[at]
+                            & LAYOUT_COMMAND_FIXED) != 0
+                };
+                if (count != 0) {
+                    PageFindRect *previous = &rects[count - 1u];
+                    int64_t previous_right = (int64_t) previous->x
+                                             + previous->width;
+                    if (previous->y == rect.y
+                        && previous->height == rect.height
+                        && previous->fixed == rect.fixed
+                        && (int64_t) rect.x >= previous_right
+                        && (int64_t) rect.x - previous_right <= 2) {
+                        int64_t merged_right = (int64_t) rect.x + rect.width;
+                        int64_t merged_width = merged_right - previous->x;
+                        previous->width = merged_width > INT_MAX
+                            ? INT_MAX : (int) merged_width;
+                        continue;
+                    }
+                }
+                if (count < capacity) rects[count++] = rect;
+            }
+            continue;
+        }
         int width = command->width > 0 ? command->width : 1;
         int64_t first = (int64_t) width * (int64_t) start
                         / (int64_t) command->text_length;

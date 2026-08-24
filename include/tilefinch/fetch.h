@@ -108,7 +108,8 @@ typedef struct {
     long transport_code;
     /* Backend certificate-verification result. The PSP mbedTLS transport
        exposes its MBEDTLS_X509_BADCERT_* flag mask here; other TLS backends
-       retain their native CURLINFO_SSL_VERIFYRESULT value. */
+       retain their native CURLINFO_SSL_VERIFYRESULT value. Availability is
+       separate because zero can mean either verified clean or not reported. */
     long tls_verify_result;
     long negotiated_http_version;
     long new_connections;
@@ -123,6 +124,8 @@ typedef struct {
     uint64_t tls_handshake_us;
     bool tls_connection_reuse_known;
     bool tls_connection_reused;
+    bool tls_verify_result_available;
+    bool tls_verification_failed;
     /* The PSP transport normally offers TLS 1.3. Some otherwise valid TLS
        endpoints reject that ClientHello before HTTP with a protocol alert.
        A set field records that this request made the single bounded TLS 1.2
@@ -375,6 +378,11 @@ const FetchRequest *fetch_prepared_page_request(
     const FetchPreparedPageRequest *prepared);
 const TilefinchRequestContext *fetch_prepared_page_request_context(
     const FetchPreparedPageRequest *prepared);
+/* Pure target-policy check used by transports before the initial request and
+   every redirect hop. Exposed so security contract tests can prove that
+   prepared portal requests retain CSP enforcement. */
+bool fetch_request_security_allows_target(
+    const FetchRequest *request, const char *target_url);
 
 /* Applies the transport/replay request-injection boundary without allocating.
    A NULL request is the canonical default GET request. */
@@ -526,6 +534,8 @@ typedef struct {
     FetchTransportTiming transport_timing;
     bool success;
     bool timed_out;
+    bool tls_verify_result_available;
+    bool tls_verification_failed;
     bool tls_handshake_measured;
     uint64_t tls_handshake_us;
     bool tls_connection_reuse_known;
@@ -625,7 +635,9 @@ uint64_t fetch_background_transport_enqueue_media_stream_diagnosed(
     size_t maximum_bytes, long timeout_ms,
     FetchBackgroundEnqueueStatus *status);
 /* Media can request a smaller publication quantum without imposing its
-   latency/throughput tradeoff on navigation and update streams. */
+   latency/throughput tradeoff on navigation and update streams. Values over
+   48 KiB are defensively clamped so the fixed worker buffer always retains
+   room for the libcurl callback that crosses the publication threshold. */
 uint64_t fetch_background_transport_enqueue_stream_sized(
     const char *url, const FetchRequest *request,
     size_t maximum_bytes, long timeout_ms, size_t publication_bytes);

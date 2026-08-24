@@ -144,14 +144,20 @@ prepares the controller and tile shell. The final adoption moves already-owned
 state and cannot allocate.
 
 The same candidate-shell transaction carries Reader presentation across page
-navigations. After a page is active, its first Reader request runs one bounded,
-budget-charged content-shape pass and caches the resulting article, listing,
-watch, or raw classification beside the page. When Reader is already active,
-the candidate DOM is classified and journaled before its first authoritative
-layout, avoiding an author-layout/Reader-layout pair. User CSS and marker
-installation are both transactional. A navigation failure may leave the user
-on the old page or on a bounded error surface, but it does not publish half a
-candidate with stale controller or render state.
+navigations. After admitted scripts settle, one bounded, budget-charged
+content-shape pass classifies the page as article, listing, watch, or raw and
+installs a hidden semantic extraction. That tree retains headings, paragraphs,
+lists, links, images, captions, tables, and code under explicit node, depth,
+and byte limits; the untouched raw DOM remains beside it. Reader CSS switches
+between the two trees without reparsing, and text anchors preserve the nearest
+reading position across the relayout. When Reader is already active, this
+happens before the candidate's first authoritative layout, avoiding an
+author-layout/Reader-layout pair. A navigation failure leaves the incumbent
+usable and opens a bounded recovery surface over it. Retry and Reader retry the
+retained candidate URL; portal, site-JavaScript, audio-only, and quality
+actions appear only when their context can help. Return simply exposes the
+incumbent again. None of these actions publishes half a candidate with stale
+controller or render state.
 
 The experimental compressed-section mode is the named exception: replacing a
 resident section may retire its old DOM before materializing its neighbor in
@@ -189,6 +195,15 @@ The engine uses several PSP-specific fast paths without changing results:
   cascade per image;
 - repeated gradients, glyphs, and tiles use bounded caches with measured
   eviction rather than unbounded memoization.
+
+Mixed-direction page text is a sparse extension of the same retained layout,
+not a second document representation. A parser/style census bypasses ordinary
+LTR paragraphs. Admitted RTL paragraphs retain logical DOM text while a
+bounded UAX #9 analysis produces levels, Arabic-family contextual forms,
+shaped advances, line visual order, and logical-to-visual glyph sidecars.
+Painting, links, controls, focus hit testing, and find highlights consume the
+same visual geometry. The exact limits and clean degradation contract are in
+[Bidirectional page text](TEXT_BIDI.md).
 
 ### 5. Host determinism and device truth are separate gates
 
@@ -256,7 +271,11 @@ execution failure never enables the legacy alternative.
 Large cross-origin classic bundles pass an allocation-free lexical cost scan;
 only high-cost bodies are shed, with source size and watchdog-miss signals
 retained as tuning telemetry. Rejection is page-local and server-rendered
-content remains usable.
+content remains usable. Before the first parser-blocking author callback, the
+stream retains at most one complete, visibly useful body snapshot. If later
+hydration fails or exhausts its quota and collapses that content, commit
+restores the snapshot transactionally; a successful useful replacement stays
+authoritative.
 Compiled external scripts and parsed stylesheet fragments may be reused from
 bounded in-memory caches during a process lifetime; neither cache writes
 compiled code to storage.
@@ -273,15 +292,58 @@ focus metadata. The renderer rasterizes 128×128 RGB565 tiles on demand and
 keeps a bounded spatial index so scroll work is proportional to visible
 content rather than document length.
 
+Unsupported motion resolves to one coherent static presentation: terminal
+visibility and opacity are retained, scroll-linked transforms flatten, and
+synthetic spacer scenes are contained. The layout records the first coordinate
+clamp and confines a saturated non-root subtree rather than letting the
+coordinate sentinel blank every later scroll viewport.
+
 Web content and native chrome are separate layers. The browser frame is stable
 while menus, find, keyboard, loading, and player controls animate over it.
 Mode-specific painters are deliberately out of line so the per-frame browser
 and media compositors remain small enough for the Allegrex instruction cache;
 the ELF build ratchets those hot symbols independently from total `.text`.
 
+Fullscreen video keeps the decoder's 8888 scanout rather than narrowing the
+whole picture to the page renderer's RGB565 format. The native player projects
+its overlay into at most 16 clipped, disjoint rectangles. Opaque title and
+control bars begin from cleared RGB565 scratch and therefore never import the
+moving picture; only translucent badges, previews, and panels import their
+bounded backdrop before the ordinary chrome compositor runs. The result is
+widened only inside those rectangles, and every pixel outside them remains the
+decoder's original byte-for-byte output. Fixed player shapes use precomputed
+coverage from the same bounded antialiasing sampler used by the generic path.
+
 Images are decoded without applying forced-dark color inversion. Dark mode
 transforms authored foreground and background colors at paint boundaries,
 while photographs, thumbnails, and decoded video retain their source colors.
+
+Canvas 2D uses an exact, lazily allocated RGBA backing array inside the page's
+QuickJS budget, plus at most four budget-owned native snapshots (1 MiB total).
+That keeps `getImageData()` and `putImageData()` deterministic without giving
+every canvas an unrestricted framebuffer. The native raster seam draws actual
+Tilefinch font glyphs, 2×2-coverage paths and strokes, per-pixel gradients, and
+transformed nearest-neighbour or bilinear sprites. It supports bounded nested
+clips, rounded geometry, line caps/joins/dashes, and the practical Porter-Duff
+subset; ordinary decoded `<img>` resources and other canvases use the same
+sprite path. `Path2D` accepts bounded SVG path strings and transformed
+`addPath()` geometry. Small path and text shadows use a fixed native sampling
+pattern; complex geometry degrades to one offset sample rather than allowing
+blur work to grow with page input.
+
+Solid rectangles batch up to 64 commands and consecutive sprite blits batch
+up to 16 commands per JavaScript turn. Paths and text share a separate
+16-command queue so an animated chart's geometry and labels cross the
+JavaScript/native boundary together. All drawing for a turn coalesces into one
+dirty rectangle, copies only those rows into the
+native snapshot, and invalidates only the affected page tiles. A same-size
+animation therefore does not rebuild style, layout, or the retained display
+list. Animation-frame callbacks run at most once per presented browser tick,
+use that tick's monotonic timestamp, remain paused with an inactive page, and
+skip elapsed frames rather than replaying a callback backlog. Pointer capture
+and layout-derived canvas-relative coordinates keep canvas controls stable
+through hover, drag, and release. Oversized surfaces, deep clip stacks, and
+excess raster work fail soft while the rest of the page remains usable.
 
 ## Request authority, transport, and cache provenance
 
@@ -359,6 +421,14 @@ retires. Link errors are hints followed by an APCTL probe, so an HTTP error or
 CDN rate limit cannot spuriously restart networking. The complete state and
 event contract is in [PSP network supervisor](engineering/PSP_NETWORK_SUPERVISOR.md).
 
+`Ready` means the PSP stack is associated and has an address, not that an
+access network has granted Internet service. Captive-portal discovery remains
+a separate, user-initiated frontend operation: one bounded probe may open an
+ephemeral tab/session authority, then re-probe and restore the incumbent tab.
+It does not add portal guesses to the network reducer or relax TLS globally.
+The isolation and origin rules are specified in the
+[security model](SECURITY_MODEL.md#captive-portal-sign-in).
+
 ### Media session
 
 The media controller distinguishes opening, priming, playing, paused,
@@ -408,17 +478,28 @@ incompatible backend.
 The player has one source-independent packet pipeline. The built-in provider supplies
 resolved split or progressive streams, offline downloads supply bounded local
 files, and compatible page `<video>`/`<audio>` elements supply authorized
-progressive MP4/M4A or VOD HLS URLs. MP4 performs a one-byte standard HTTP
-Range probe. HLS
-parses bounded master/media playlists and streams at most the current and next
-MPEG-TS segment through the shared worker. Both retain response authority and
-feed the same decoder, buffering, seek, clock, and presentation services. HLS
-queues at most 64 samples and 576 KiB of payload; it rejects encrypted, live,
-fragmented-MP4, and byte-range playlists. Neither route writes media bytes to
-the Memory Stick. HLS seek resets only the selected segment and preserves an
+progressive MP4/M4A or HLS URLs. MP4 performs a one-byte standard HTTP Range
+probe. HLS parses bounded master/media playlists and streams at most the
+current and next MPEG-TS segment through the shared worker. A live source
+starts from the last three advertised segments, refreshes the rolling media
+playlist at half its target duration, maps media-sequence changes onto one
+continuous local clock, and records any skipped window as a discontinuity.
+One of the two request slots remains available for a near-edge playlist
+refresh. Stale snapshots, temporary refresh failures, signed-URL replacement,
+and an eventual `ENDLIST` are all bounded transitions; a playlist which makes
+no progress for 60 seconds fails visibly instead of spinning forever.
+
+Both source forms retain response authority and feed the same decoder,
+buffering, clock, and presentation services. HLS queues at most 64 samples and
+576 KiB of payload; it rejects encrypted, fragmented-MP4, byte-range, and
+explicitly non-AVC variants. Neither route writes media bytes to the Memory
+Stick. Finite HLS seek resets only the selected segment and preserves an
 untouched in-flight request across repeated cooperative readiness probes;
-video-only variants may prime as soon as their PMT and first video sample are
-known rather than filling the entire first segment.
+rolling live playback deliberately has no scrubber. Video-only variants may
+prime as soon as their PMT and first video sample are known rather than filling
+the entire first segment. HLS uses the separately built optional decoder
+component; firmware-compatible progressive MP4 remains the official-build
+path.
 
 Audio-only playback is a route-time pipeline choice, not a hidden video
 surface. YouTube admits its adaptive AAC representation; a page `<audio>`

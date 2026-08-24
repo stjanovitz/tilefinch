@@ -1126,6 +1126,12 @@ static BuiltinBitmapCache *builtin_bitmap_decode_block(
     size_t expected = glyphs * 32u;
     uint32_t source_at = bitmap->block_offsets[block];
     uint32_t source_end = bitmap->block_offsets[block + 1u];
+    /* This direct-mapped slot may still describe an older valid block. The
+       refill writes in place, so invalidate that identity before the first
+       byte changes; malformed trusted data must leave a miss, not a valid
+       cache key pointing at partially replaced pixels. */
+    cache->valid = false;
+    cache->bytes = 0;
     size_t output_at = 0;
     while (output_at < expected && source_at < source_end) {
         unsigned flags = bitmap->compressed[source_at++];

@@ -32,6 +32,11 @@ void swdec_me_mark_dead(void);    /* force the recover path when the watchdog di
 #define SWDEC_ME_CSC_SLOTS 25
 void swdec_me_csc_begin(int slot, void *dst_rgb565, int stride_pixels,
                         size_t capacity_bytes);
+int swdec_me_csc_picture(int slot, void *dst_rgb565, int stride_pixels,
+                         size_t capacity_bytes,
+                         const uint8_t *y, const uint8_t *u,
+                         const uint8_t *v, int y_stride, int uv_stride,
+                         int width, int height);
 void swdec_me_csc_off(void);
 int  swdec_me_csc_close(void);                          /* 1 = slot holds a frame */
 unsigned swdec_me_csc_stats(unsigned *cpu_batches);     /* returns ME batches */

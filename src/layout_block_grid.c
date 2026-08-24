@@ -959,16 +959,21 @@ bool layout_block_grid_section(LayoutContext *context,
                 }
             }
         }
-        int explicit_row_heights[GRID_EXPLICIT_TRACK_LIMIT] = {0};
+        /* placement_rows is structurally capped at 64. Keep a complete
+           snapshot because the remapping loop below may overwrite an entry
+           before a shifted explicit row reads it. The former eight-entry
+           cache indexed past its stack object on a ninth mixed-size row. */
+        int explicit_row_heights[GRID_PLACEMENT_ROW_LIMIT] = {0};
         for (int row = 0; row < explicit_grid_rows
-                          && row < GRID_EXPLICIT_TRACK_LIMIT; row++) {
+                          && row < GRID_PLACEMENT_ROW_LIMIT; row++) {
             explicit_row_heights[row] = uniform_row_height > 0
                 ? uniform_row_height : row_track_heights[row];
         }
         for (int row = 0; row < placement_rows; row++) {
             int explicit_row = row - grid_row_origin;
             if (explicit_row >= 0
-                && explicit_row < explicit_grid_rows) {
+                && explicit_row < explicit_grid_rows
+                && explicit_row < GRID_PLACEMENT_ROW_LIMIT) {
                 if (uniform_row_height > 0) {
                     row_track_heights[row] = uniform_row_height;
                 } else {

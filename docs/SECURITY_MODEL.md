@@ -143,6 +143,57 @@ navigation and pages already identified by a local URL may use that address
 space. This is a fail-closed address-space boundary, not full Fetch PNA
 preflight support.
 
+Decoded images retain the origin of their final authorized response. Drawing
+a cross-origin image, or a canvas that already contains one, permanently
+taints the destination canvas until its dimensions reset the backing surface.
+Creating a pattern from such an image is conservatively treated the same way.
+`getImageData()`, `toDataURL()`, and `toBlob()` then throw `SecurityError`, so
+credentialed no-CORS image pixels cannot become a cross-origin read channel.
+
+## Captive-portal sign-in
+
+Association and an APCTL address prove that the PSP joined Wi-Fi; they do not
+prove that the network permits Internet traffic. Tilefinch therefore exposes
+an on-demand **Help & diagnostics → Check Wi-Fi sign-in** operation. It makes
+one credential-free, cookie-free HTTP request to
+`http://connectivitycheck.gstatic.com/generate_204`. An empty 204 means the
+Internet path is available. A bounded redirect, status 511, or unexpected
+bounded response body is treated as a portal interception. Tilefinch does not
+run this probe after every association. A TLS hostname redirect or two
+consecutive navigation failures with no HTTP response can offer the same
+operation; the user still has to press X before the probe is sent.
+
+The detected page opens in a temporary tab and a temporary session context:
+
+- the ordinary cookie jar, local/session storage, HSTS state, HTTP cache,
+  provider cache, content blocker, and compatibility grants are unavailable;
+- portal cookies and storage are budget-owned and destroyed rather than
+  persisted when the flow closes;
+- certificate and hostname verification, CSP, request authority, response
+  bounds, and explicit redirect processing remain enabled;
+- mixed HTTP and private-address access are relaxed only for the detected
+  origin and at most three additional origins reached by an authored
+  top-level navigation or accepted redirect;
+- media, updates, optional-component installs, offline saves, screenshots,
+  tab switching, and access to the ordinary library/history are refused;
+- each page is limited to 512 KiB and a 20-second navigation deadline, the
+  ordinary five-hop redirect bound still applies, and the interactive portal
+  context expires after five minutes.
+
+After a submitted portal navigation, Tilefinch repeats the cookie-free probe.
+Success first retires the portal document and script runtime, then destroys
+the temporary authority and retries the previous page; the portal can never
+run against the restored ordinary cookie and storage tables. Failure leaves
+the portal open for correction. Circle cancels and returns to the prior tab.
+HTTPS is never disabled to make a portal work. Networks that require
+unsupported identity providers, WebAuthn, modern CAPTCHA, or an oversized
+application bundle may still be unusable.
+
+RFC 8908 and RFC 8910 define an authenticated captive-portal API and network
+advertisement. The PSP networking APIs used here do not expose the DHCP/RA
+advertisement, so this release uses the traditional, user-initiated HTTP probe
+instead of guessing or weakening TLS after association.
+
 ## Cookie policy
 
 The browser session stores a fixed number of budget-owned cookies. Contextual
@@ -465,6 +516,15 @@ again. Its bounded content-shape classification and DOM markers are
 presentation hints, never evidence that advertising, tracking, or hostile
 content was removed. Network blocking is a separate pre-transport policy
 described in `CONTENT_BLOCKING.md`.
+
+The unified **Page tools → Site information** screen reports the committed
+page's copied TLS version/issuer snapshot and bounded cookie/storage usage for
+that origin. Its permissions child exposes the same scoped compatibility
+grants described above. “Clear data for this site” removes applicable cookies
+and exact-origin local/session storage; “Reset permissions” removes the site's
+JavaScript, blocker, Reader, third-party-cookie, and mixed-content exceptions.
+Both destructive actions require confirmation. Inspection and deletion remain
+available even when global site-data admission is disabled.
 
 Offline Reader snapshots cross a separate persistence boundary: only escaped
 body text, a bounded title, and the source URL are serialized. Live DOM

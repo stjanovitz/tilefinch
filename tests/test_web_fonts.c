@@ -3,6 +3,7 @@
 #include "tilefinch/document.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/font.h"
+#include "tilefinch/navigation.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/request_context.h"
 #include "tilefinch/resources.h"
@@ -675,6 +676,61 @@ static bool test_async_font_loader_is_fallback_first(void)
     return true;
 }
 
+static bool test_optional_font_relayout_refusal_is_soft(void)
+{
+    static const char html[] =
+        "<!doctype html><style>"
+        "@font-face{font-family:AsyncFace;"
+        "src:url(https://font-async.test/font.ttf) format(truetype)}"
+        "body{font-family:AsyncFace,sans-serif}"
+        "</style><body>keep the committed fallback page</body>";
+    unsigned char *font = NULL;
+    size_t font_length = 0;
+    CHECK(read_file(TILEFINCH_TEST_SOURCE_DIR
+                    "/fonts/TilefinchSans-Regular.ttf",
+                    &font, &font_length));
+    char directory[128] = {0};
+    CHECK(write_async_font_replay(font, font_length, directory));
+    char replay_error[256] = {0};
+    CHECK(fetch_trace_replay_begin_response_keyed(
+        directory, replay_error, sizeof(replay_error)));
+
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    CHECK(browser_session_init(&browser, &budget, 128u * KIB)
+          && navigation_init(&navigation, &budget, 4));
+    navigation_attach_browser_session(&navigation, &browser);
+    navigation_enable_web_fonts(
+        &navigation, 1, 256u * KIB, 256u * KIB, 1u * MIB, 1000);
+    uint64_t generation = navigation_begin(&navigation);
+    CHECK(navigation_commit_html(
+        &navigation, generation, "https://font-async.test/page", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true));
+    navigation_test_refuse_next_background_font_relayout();
+    NavigationBackgroundWorkOutcome outcome =
+        NAVIGATION_BACKGROUND_WORK_SUCCESS;
+    for (size_t slice = 0; slice < 16u; slice++) {
+        outcome = navigation_run_background_resources(&navigation);
+        if (outcome != NAVIGATION_BACKGROUND_WORK_SUCCESS) break;
+    }
+    CHECK(outcome == NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL
+          && navigation.page.loaded
+          && navigation.last_error[0] == '\0'
+          && navigation.performance.background_fonts_loaded == 1u
+          && navigation.performance.background_font_failures == 1u
+          && navigation.performance.background_font_relayouts == 0u);
+    navigation_destroy(&navigation);
+    browser_session_destroy(&browser);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    fetch_trace_end();
+    remove_async_font_replay(directory);
+    free(font);
+    return true;
+}
+
 static bool test_blocked_font_settles_without_backpressure_retry(void)
 {
     static const char html[] =
@@ -1197,6 +1253,7 @@ int main(void)
 {
     if (!test_bounded_font_loader()
         || !test_async_font_loader_is_fallback_first()
+        || !test_optional_font_relayout_refusal_is_soft()
         || !test_blocked_font_settles_without_backpressure_retry()
         || !test_inline_discovery_and_canonicalization()
         || !test_single_pass_forward_reference_reinterns()

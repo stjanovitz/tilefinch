@@ -126,7 +126,7 @@ typedef int32_t StyleLength;
 #define STYLE_GRID_AREA_NAME_LIMIT 32
 #define STYLE_GRID_AREA_NAME_CAPACITY 32
 #define STYLE_GRID_AREA_RECT_LIMIT 12
-#define STYLE_GRID_AREA_ROW_LIMIT 8
+#define STYLE_GRID_AREA_ROW_LIMIT GRID_TRACK_REPEAT_LIMIT
 #define STYLE_GRID_TRACK_TEMPLATE_LIMIT 31
 #define STYLE_GRID_LINE_NAME_LIMIT 15
 #define STYLE_GRID_LINE_NAMES_PER_LINE 2
@@ -871,13 +871,30 @@ typedef struct {
     uint8_t list_style_type : 4;
     uint8_t list_style_inside : 1;
     uint8_t generated_expression : 1;
-    uint8_t unicode_bidi_override : 1;
+    uint8_t unicode_bidi : 3;
     /* Element scroll indicators overlay content on Tilefinch, so a stable
        gutter occupies no geometry while the computed keyword is retained. */
     uint8_t scrollbar_gutter_stable : 1;
     uint16_t object_position_x;
     uint16_t object_position_y;
 } ComputedStyle;
+
+typedef uint8_t StyleUnicodeBidi;
+enum {
+    STYLE_UNICODE_BIDI_NORMAL = 0,
+    STYLE_UNICODE_BIDI_EMBED,
+    STYLE_UNICODE_BIDI_ISOLATE,
+    STYLE_UNICODE_BIDI_OVERRIDE,
+    STYLE_UNICODE_BIDI_ISOLATE_OVERRIDE,
+    STYLE_UNICODE_BIDI_PLAINTEXT
+};
+
+static inline bool computed_style_bidi_override(const ComputedStyle *style)
+{
+    return style != NULL
+        && (style->unicode_bidi == STYLE_UNICODE_BIDI_OVERRIDE
+            || style->unicode_bidi == STYLE_UNICODE_BIDI_ISOLATE_OVERRIDE);
+}
 
 typedef uint8_t StyleContentVisibility;
 enum {
@@ -1793,6 +1810,10 @@ typedef struct {
     /* Monotonic parse summary used to activate the ROM-backed motion module
        without rescanning the DOM or retaining authored CSS in JavaScript. */
     bool has_motion_keyframes;
+    /* At least one declaration can establish a directional boundary. This
+       lets layout skip bidi subtree probes on the overwhelmingly common
+       sheets that never mention direction or unicode-bidi. */
+    bool has_bidi_declarations;
     /* Lazily materialized exact indices for the uncommon focus-state
        classifier. A representative article retains 25 entries instead of
        rescanning roughly 1,300 rules on every d-pad move. */
@@ -1995,7 +2016,7 @@ typedef struct {
     bool has_cursor_rules;
     /* Bitset of sparse modern mobile declarations present in this sheet.
        Nodes on ordinary pages skip the retained-property pass entirely. */
-    uint16_t modern_property_mask;
+    uint32_t modern_property_mask;
     /* Per-property typography presence consumes the alignment byte that
        preceded relative_selector_cache_epoch.  It prevents one authored
        sparse property from making every node query the other three. */

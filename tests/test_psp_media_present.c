@@ -44,10 +44,9 @@ static bool rect_equals(
    band erase the picture. */
 static bool bands_tile_the_panel(const PspMediaPresentPlan *plan)
 {
-    static unsigned char covered[SCREEN_HEIGHT][SCREEN_WIDTH];
-    memset(covered, 0, sizeof(covered));
     PspMediaPresentRect rects[PSP_MEDIA_PRESENT_MAX_BANDS + 1];
     size_t count = 0;
+    size_t covered_area = 0;
     rects[count++] = plan->video;
     for (size_t at = 0; at < plan->band_count; at++)
         rects[count++] = plan->bands[at];
@@ -57,19 +56,21 @@ static bool bands_tile_the_panel(const PspMediaPresentPlan *plan)
         if (rect.x < 0 || rect.y < 0) return false;
         if (rect.x + rect.width > SCREEN_WIDTH) return false;
         if (rect.y + rect.height > SCREEN_HEIGHT) return false;
-        for (int y = rect.y; y < rect.y + rect.height; y++) {
-            for (int x = rect.x; x < rect.x + rect.width; x++) {
-                if (covered[y][x] != 0) return false;
-                covered[y][x] = 1;
-            }
+        covered_area += (size_t) rect.width * (size_t) rect.height;
+        for (size_t previous = 0; previous < at; previous++) {
+            PspMediaPresentRect other = rects[previous];
+            bool separate = rect.x + rect.width <= other.x
+                || other.x + other.width <= rect.x
+                || rect.y + rect.height <= other.y
+                || other.y + other.height <= rect.y;
+            if (!separate) return false;
         }
     }
-    for (int y = 0; y < SCREEN_HEIGHT; y++) {
-        for (int x = 0; x < SCREEN_WIDTH; x++) {
-            if (covered[y][x] == 0) return false;
-        }
-    }
-    return true;
+    /* Axis-aligned rectangles wholly inside the panel, with no overlap and
+       exactly the panel's area, necessarily tile it with neither gaps nor
+       overdraw.  This is the same proof as the old per-pixel occupancy map,
+       without repainting 130,560 cells for every swept geometry. */
+    return covered_area == (size_t) SCREEN_WIDTH * SCREEN_HEIGHT;
 }
 
 /* The quads must together cover the video rectangle's columns exactly once,

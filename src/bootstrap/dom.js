@@ -5255,6 +5255,7 @@
         }
         if (!globalThis.__tilefinchCustomElementMovePreserved)
           globalThis.__tilefinchCustomElementConnected?.(child);
+        globalThis.__tilefinchCanvasConnected?.(child);
         if (oldParent)
           globalThis.__tilefinchNotifyMutation?.(
             oldParent,
@@ -5556,6 +5557,7 @@
           globalThis.__tilefinchAdoptNodeOwner?.(node, targetOwner);
         if (!globalThis.__tilefinchCustomElementMovePreserved)
           globalThis.__tilefinchCustomElementConnected?.(node);
+        globalThis.__tilefinchCanvasConnected?.(node);
         if (oldParent)
           globalThis.__tilefinchNotifyMutation?.(
             oldParent,

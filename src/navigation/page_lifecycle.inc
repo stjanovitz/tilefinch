@@ -480,7 +480,8 @@ static ScriptRuntime *navigation_create_runtime(
     const char *referrer_policy, bool defer_document_scripts,
     const ViewportContext *viewport, ScriptDocumentScope document_scope,
     bool inherit_remote_document, FetchSchedulerDomain *fetch_domain,
-    const Stylesheet *stylesheet,
+    const Stylesheet *stylesheet, ImageResources *canvas_images,
+    const FontSet *fonts,
     ScriptResult *result)
 {
     if (session == NULL) return NULL;
@@ -488,6 +489,7 @@ static ScriptRuntime *navigation_create_runtime(
         && document_scope == SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL;
     ScriptRuntimeOptions options = {
         .session = session->browser_session,
+        .fonts = fonts,
         .top_level_url = document_scope == SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME
             ? session->page.document_url : url,
         .fetch_scheduler_domain = fetch_domain,
@@ -536,9 +538,13 @@ static ScriptRuntime *navigation_create_runtime(
         .section_identity = bind_remote_document
             ? session->runtime_section_identity : 0
     };
-    return script_runtime_create_configured(
+    ScriptRuntime *runtime = script_runtime_create_configured(
         document, session->budget, session->js_memory_limit,
         session->js_timeout_ms, url, &options, result);
+    if (runtime != NULL && canvas_images != NULL) {
+        script_runtime_set_images(runtime, canvas_images);
+    }
+    return runtime;
 }
 
 static void navigation_attach_layout(NavigationSession *session)
@@ -548,7 +554,7 @@ static void navigation_attach_layout(NavigationSession *session)
                                   &session->page.layout,
                                   session->viewport.css_height);
         script_runtime_set_images(session->page.runtime,
-                                  session->images);
+                                  &session->page.images);
         script_runtime_intersection_recheck(session->page.runtime);
         script_runtime_media_recheck(session->page.runtime);
     }
@@ -1702,17 +1708,19 @@ static bool stack_generated_location(const char *stack,
     return end != column_start && *column != 0;
 }
 
-static bool collect_iframes(lxb_dom_node_t *node,
-                            lxb_dom_node_t **frames, size_t capacity,
+static bool collect_iframes(ScriptRuntime *runtime, lxb_dom_node_t *node,
+                            long *frames, size_t capacity,
                             size_t *count)
 {
-    if (node == NULL) return true;
+    if (runtime == NULL || node == NULL) return true;
     lxb_dom_node_t *boundary_parent = node->parent;
     size_t visited = 0;
     while (node != NULL && node != boundary_parent && *count < capacity) {
         if (++visited > NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT) return false;
         if (node_name_is(node, "iframe")) {
-            if (*count < capacity) frames[(*count)++] = node;
+            long handle = script_runtime_node_weak_handle(runtime, node);
+            if (handle == 0) return false;
+            if (*count < capacity) frames[(*count)++] = handle;
         }
         if (*count == capacity) break;
         if (node->first_child != NULL) {
@@ -1728,22 +1736,22 @@ static bool collect_iframes(lxb_dom_node_t *node,
 }
 
 static bool frame_element_was_discovered(const NavigationPage *page,
-                                         const lxb_dom_node_t *node)
+                                         long handle)
 {
     for (size_t i = 0; i < page->discovered_frame_element_count; i++) {
-        if (page->discovered_frame_elements[i] == node) return true;
+        if (page->discovered_frame_handles[i] == handle) return true;
     }
     return false;
 }
 
 static bool remember_discovered_frame(NavigationPage *page,
-                                      lxb_dom_node_t *node)
+                                      long handle)
 {
-    if (frame_element_was_discovered(page, node)) return false;
+    if (handle == 0 || frame_element_was_discovered(page, handle)) return false;
     if (page->discovered_frame_element_count
         >= NAVIGATION_FRAME_DISCOVERY_LIMIT) return false;
-    page->discovered_frame_elements[page->discovered_frame_element_count++] =
-        node;
+    page->discovered_frame_handles[page->discovered_frame_element_count++] =
+        handle;
     return true;
 }
 
@@ -1802,13 +1810,14 @@ static bool navigation_load_frames(NavigationSession *session,
                                    const char *parent_url)
 {
     if (session->page.runtime == NULL || parent_url == NULL) return true;
-    lxb_dom_node_t *nodes[NAVIGATION_FRAME_DISCOVERY_LIMIT] = {0};
+    long handles[NAVIGATION_FRAME_DISCOVERY_LIMIT] = {0};
     size_t count = 0;
     if (!collect_iframes(
-            lxb_dom_interface_node(session->page.document.html), nodes,
+            session->page.runtime,
+            lxb_dom_interface_node(session->page.document.html), handles,
             NAVIGATION_FRAME_DISCOVERY_LIMIT, &count)) {
         snprintf(session->last_error, sizeof(session->last_error),
-                 "frame discovery traversal exceeded %u nodes",
+                 "frame discovery exceeded %u nodes or handle capacity",
                  NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT);
         return false;
     }
@@ -1818,15 +1827,18 @@ static bool navigation_load_frames(NavigationSession *session,
             navigation_queue_frame_message,
             session)) return false;
     for (size_t i = 0; i < count; i++) {
+        lxb_dom_node_t *node = script_runtime_node_handle_resolve_connected(
+            session->page.runtime, handles[i]);
+        if (node == NULL) continue;
         size_t srcdoc_length = 0;
         const char *srcdoc = document_attribute(
-            nodes[i], "srcdoc", &srcdoc_length);
+            node, "srcdoc", &srcdoc_length);
         /* Same-origin srcdoc/about:blank/Blob frames live in the bounded
            bootstrap frame realm. They must never also enqueue a remote
            fetch or dispatch a second load/error event here. */
         if (srcdoc != NULL) continue;
         long parent_handle = script_runtime_node_handle(
-            session->page.runtime, nodes[i]);
+            session->page.runtime, node);
         NavigationFrame *frame = NULL;
         for (size_t slot = 0; slot < session->page.frame_count; slot++) {
             NavigationFrame *candidate = &session->page.frames[slot];
@@ -1835,13 +1847,14 @@ static bool navigation_load_frames(NavigationSession *session,
                 break;
             }
         }
-        bool known = frame_element_was_discovered(&session->page, nodes[i]);
+        bool known = frame_element_was_discovered(
+            &session->page, handles[i]);
         size_t source_length = 0;
-        const char *source = document_attribute(nodes[i], "src",
+        const char *source = document_attribute(node, "src",
                                                 &source_length);
         size_t sandbox_length = 0;
         const char *sandbox = document_attribute(
-            nodes[i], "sandbox", &sandbox_length);
+            node, "sandbox", &sandbox_length);
         uint32_t sandbox_flags = tilefinch_frame_sandbox_parse(
             sandbox, sandbox_length, sandbox != NULL);
         /* Missing src is the local about:blank document installed by the
@@ -1861,7 +1874,8 @@ static bool navigation_load_frames(NavigationSession *session,
         if (frame != NULL && !frame->retired
             && strcmp(frame->url, resolved_url) == 0
             && frame->sandbox_flags == sandbox_flags) continue;
-        if (!known && !remember_discovered_frame(&session->page, nodes[i])) {
+        if (!known && !remember_discovered_frame(
+                &session->page, handles[i])) {
             continue;
         }
         session->frames_discovered++;
@@ -1894,7 +1908,7 @@ static bool navigation_load_frames(NavigationSession *session,
         if (append_frame) {
             if (session->page.frame_count >= NAVIGATION_FRAME_LIMIT) {
                 session->frames_failed++;
-                (void) navigation_dispatch_node_event(session, nodes[i],
+                (void) navigation_dispatch_node_event(session, node,
                                                        "error");
                 continue;
             }
@@ -1907,7 +1921,7 @@ static bool navigation_load_frames(NavigationSession *session,
         snprintf(frame->url, sizeof(frame->url), "%s", resolved_url);
         snprintf(frame->parent_url, sizeof(frame->parent_url), "%s",
                  parent_url);
-        frame->element = nodes[i];
+        frame->element = node;
         frame->parent_handle = parent_handle;
         frame->sandbox_flags = sandbox_flags;
         frame->opaque_origin = !tilefinch_frame_sandbox_allows(
@@ -1919,7 +1933,7 @@ static bool navigation_load_frames(NavigationSession *session,
             session->next_frame_lifecycle_generation;
         if (session->page.resource_scheduler == NULL) {
             session->frames_failed++;
-            (void) navigation_dispatch_node_event(session, nodes[i],
+            (void) navigation_dispatch_node_event(session, node,
                                                   "error");
             continue;
         }
@@ -1940,7 +1954,7 @@ static bool navigation_load_frames(NavigationSession *session,
                 &session->page.script_result)) return false;
         if (!frame->fetch_pending) {
             session->frames_failed++;
-            (void) navigation_dispatch_node_event(session, nodes[i],
+            (void) navigation_dispatch_node_event(session, node,
                                                   "error");
         }
     }
@@ -2068,7 +2082,7 @@ static bool navigation_complete_frame(NavigationSession *session,
             frame->referrer_policy, true, &session->viewport,
             SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME, false,
             session->page.fetch_domain,
-            NULL,
+            NULL, NULL, session->fonts,
             &frame->script_result);
         ok = frame->runtime != NULL
             && script_runtime_configure_messaging(

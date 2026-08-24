@@ -7,6 +7,7 @@ bool psp_voice_component_handle_frame(
         || app->browser->voice_component_session == NULL
         || app->browser->profile == NULL
         || intent == NULL) return false;
+    if (psp_captive_portal_active(app->interactive)) return false;
     PspVoiceComponentSession *session = app->browser->voice_component_session;
     PspUiState *ui = &app->process->presentation.ui;
     bool visual_changed = false;

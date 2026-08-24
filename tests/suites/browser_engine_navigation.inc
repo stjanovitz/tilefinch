@@ -9,12 +9,14 @@ static int test_committed_document_glyph_script_hints(void)
         &config, error, sizeof(error));
     static const char html[] =
         "<!doctype html><title>Scripts</title><body>"
-        "&#x0416; &#x1ED9; &#x6F22; &#x3042; &#xD55C;";
-    const uint8_t expected = DOCUMENT_GLYPH_SCRIPT_CYRILLIC
+        "&#x0416; &#x1ED9; &#x6F22; &#x3042; &#xD55C; &#x0633; &#x05E9;";
+    const uint16_t expected = DOCUMENT_GLYPH_SCRIPT_CYRILLIC
         | DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED
         | DOCUMENT_GLYPH_SCRIPT_HAN
         | DOCUMENT_GLYPH_SCRIPT_JAPANESE
-        | DOCUMENT_GLYPH_SCRIPT_KOREAN;
+        | DOCUMENT_GLYPH_SCRIPT_KOREAN
+        | DOCUMENT_GLYPH_SCRIPT_ARABIC
+        | DOCUMENT_GLYPH_SCRIPT_HEBREW;
     CHECK(engine != NULL
           && browser_engine_commit_html(
                  engine, "https://scripts.test/", html,

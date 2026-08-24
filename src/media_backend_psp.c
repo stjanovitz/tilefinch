@@ -140,7 +140,10 @@ typedef enum {
     /* sceMpegDelete and sceMpegCreate are the same class of unbounded Media
        Engine call the teardown tail runs here for, so a reset that rebuilds the
        decoder object rides the worker for the same reason. */
-    PSP_MEDIA_CODEC_KIND_RECREATE = 5
+    PSP_MEDIA_CODEC_KIND_RECREATE = 5,
+    /* In-place MPEG/AAC reset is firmware work too. It must never fall back
+       to the browser thread when the worker is unavailable. */
+    PSP_MEDIA_CODEC_KIND_RESET = 6
 } PspMediaCodecJobKind;
 
 /*
@@ -196,7 +199,9 @@ typedef enum {
     PSP_MEDIA_CODEC_STAGE_MPEG_FINISH = 11,
     /* Appended, never renumbered: a stage number is what a hang log names. */
     PSP_MEDIA_CODEC_STAGE_MPEG_CREATE = 12,
-    PSP_MEDIA_CODEC_STAGE_MPEG_INIT_AU = 13
+    PSP_MEDIA_CODEC_STAGE_MPEG_INIT_AU = 13,
+    PSP_MEDIA_CODEC_STAGE_AVC_FLUSH = 14,
+    PSP_MEDIA_CODEC_STAGE_AAC_INIT = 15
 } PspMediaCodecNativeStage;
 
 /* These are private firmware ABIs copied from the mature raw-MP4 player
@@ -539,6 +544,9 @@ typedef struct {
        reads both only after the job has published. */
     bool codec_recreate_ran;
     int codec_recreate_status;
+    bool codec_reset_ran;
+    int codec_reset_status;
+    int codec_reset_stage;
     /* Access units still to come before a no-touch reposition stops treating an
        over-long picture batch as the Media Engine releasing what it held.
        Zero everywhere except inside that window. */
@@ -3509,6 +3517,10 @@ static const char *psp_media_codec_stage_name(int stage)
         return "sceMpegCreate-recreate";
     case PSP_MEDIA_CODEC_STAGE_MPEG_INIT_AU:
         return "sceMpegInitAu-recreate";
+    case PSP_MEDIA_CODEC_STAGE_AVC_FLUSH:
+        return "sceMpegAvcDecodeFlush-reset";
+    case PSP_MEDIA_CODEC_STAGE_AAC_INIT:
+        return "sceAudiocodecInit-reset";
     default:
         return "codec-worker";
     }
@@ -4366,6 +4378,70 @@ static MediaBackendResult psp_media_run_teardown_job(
  *
  * Runs on the codec worker, for the same reason the teardown tail does.
  */
+static int psp_media_reset_audio_program(PspMediaBackend *backend)
+{
+    if (!backend->have_audio) return 0;
+    backend->audio_codec[6] = 0;
+    backend->audio_codec[7] = 0;
+    backend->audio_codec[8] = 0;
+    backend->audio_codec[9] = 0;
+    sceKernelDcacheWritebackInvalidateRange(
+        backend->audio_codec,
+        psp_media_cache_extent(PSP_MEDIA_AUDIO_CODEC_BYTES));
+    psp_media_codec_stage(backend, PSP_MEDIA_CODEC_STAGE_AAC_INIT);
+    int status = sceAudiocodecInit(backend->audio_codec, PSP_CODEC_AAC);
+    if (status >= 0) {
+        /* This firmware wrapper writes the control block through the CPU
+           cache. Publish those writes before the worker hands ownership back. */
+        sceKernelDcacheWritebackInvalidateRange(
+            backend->audio_codec,
+            psp_media_cache_extent(PSP_MEDIA_AUDIO_CODEC_BYTES));
+    }
+    return status;
+}
+
+static MediaBackendResult psp_media_run_reset_job(
+    PspMediaBackend *backend, char *error, size_t error_size)
+{
+    backend->codec_reset_ran = false;
+    backend->codec_reset_status = 0;
+    backend->codec_reset_stage = PSP_MEDIA_CODEC_STAGE_NONE;
+    int status = 0;
+    if (backend->have_video) {
+        psp_media_codec_stage(backend, PSP_MEDIA_CODEC_STAGE_AVC_FLUSH);
+        status = sceMpegAvcDecodeFlush(&backend->mpeg);
+        if (status >= 0) {
+            memset(backend->video_au, 0xFF, PSP_MEDIA_VIDEO_AU_BYTES);
+            sceKernelDcacheWritebackInvalidateRange(
+                backend->video_au, PSP_MEDIA_VIDEO_AU_BYTES);
+            psp_media_codec_stage(
+                backend, PSP_MEDIA_CODEC_STAGE_MPEG_INIT_AU);
+            status = sceMpegInitAu(
+                &backend->mpeg, backend->video_es, backend->video_au);
+            if (status >= 0) {
+                sceKernelDcacheWritebackInvalidateRange(
+                    backend->video_au, PSP_MEDIA_VIDEO_AU_BYTES);
+            }
+        }
+    }
+    if (status >= 0) status = psp_media_reset_audio_program(backend);
+    backend->codec_reset_stage = atomic_load_explicit(
+        &backend->codec_native_stage, memory_order_acquire);
+    backend->codec_reset_status = status;
+    backend->codec_reset_ran = true;
+    if (status < 0) {
+        const char *stage = psp_media_codec_stage_name(
+            backend->codec_reset_stage);
+        backend->stats.last_native_error = status;
+        psp_media_log_failure(backend, stage, status);
+        psp_media_error(
+            error, error_size, "PSP decoder %s failed: 0x%08X",
+            stage, (unsigned) status);
+        return MEDIA_BACKEND_ERROR;
+    }
+    return MEDIA_BACKEND_ACCEPTED;
+}
+
 static MediaBackendResult psp_media_run_recreate_job(
     PspMediaBackend *backend, char *error, size_t error_size)
 {
@@ -4418,6 +4494,10 @@ static MediaBackendResult psp_media_run_recreate_job(
                     backend->video_au, PSP_MEDIA_VIDEO_AU_BYTES);
             }
         }
+    }
+    if (status >= 0 && backend->have_audio) {
+        stage = "sceAudiocodecInit-reset";
+        status = psp_media_reset_audio_program(backend);
     }
     psp_media_log(
         "tilefinch-media-decoder: event=mpeg-recreate status=0x%08X "
@@ -4591,6 +4671,10 @@ static int psp_media_codec_thread(SceSize argument_size, void *arguments)
                     sizeof(backend->codec_job_error));
             } else if (job_kind == PSP_MEDIA_CODEC_KIND_RECREATE) {
                 backend->codec_job_result = psp_media_run_recreate_job(
+                    backend, backend->codec_job_error,
+                    sizeof(backend->codec_job_error));
+            } else if (job_kind == PSP_MEDIA_CODEC_KIND_RESET) {
+                backend->codec_job_result = psp_media_run_reset_job(
                     backend, backend->codec_job_error,
                     sizeof(backend->codec_job_error));
             } else {
@@ -5953,7 +6037,14 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
         codec_reset_wait_us);
     (void) codec_reset_wait_us;
     if (psp_media_collect_codec_job(
-            backend, error, error_size) < 0) return false;
+            backend, error, error_size) < 0) {
+        /* Reset owns the admission gate only for the duration of this
+           transaction.  A worker failure is reported to the session, which
+           may retry or quiesce, but it must not leave an otherwise live
+           backend permanently refusing every later submission. */
+        backend->admissions_closed = false;
+        return false;
+    }
     atomic_store_explicit(
         &backend->audio_resetting, true, memory_order_release);
     atomic_store(&backend->playing, false);
@@ -6105,9 +6196,9 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
      * sceMpegCreate are unbounded Media Engine calls, and this function runs on
      * the browser thread. Everything above has already quiesced that worker, so
      * the job slot is free and the wait is the same bounded one destroy uses.
-     * A worker that has died takes the in-place path instead: it cannot make
-     * matters worse, and an unbounded firmware call on the browser thread
-     * could.
+     * A worker that has died fails the reset. There is deliberately no inline
+     * fallback: every firmware reset call is potentially unbounded and the
+     * browser thread must remain responsive enough to enter quarantine.
      */
     /* A flush or a rebuild leaves firmware holding nothing, so only the
        no-touch branch below re-opens this window. */
@@ -6116,20 +6207,21 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
         && psp_media_reset_mode == PSP_MEDIA_RESET_MODE_NO_TOUCH;
     bool rebuild_requested = backend->have_video && (refusal_rebuild
         || psp_media_reset_mode == PSP_MEDIA_RESET_MODE_RECREATE);
-    bool rebuild = rebuild_requested
-        && psp_media_codec_worker_dispatchable(backend);
-    if (!backend->have_video) {
-        native_stage = "audio-only-reset";
-        status = 0;
-    } else if (rebuild_requested && !rebuild) {
-        native_stage = refusal_rebuild
-            ? "codec-recreate-refusal-worker"
-            : "codec-recreate-worker";
+    bool worker_ready = psp_media_codec_worker_dispatchable(backend);
+    bool needs_worker = !no_touch
+        && (backend->have_video || backend->have_audio);
+    if (backend->have_audio)
+        memset(backend->audio_pcm, 0, PSP_MEDIA_AUDIO_PCM_BYTES);
+    if (needs_worker && !worker_ready) {
+        native_stage = rebuild_requested
+            ? (refusal_rebuild
+                   ? "codec-recreate-refusal-worker"
+                   : "codec-recreate-worker")
+            : "codec-reset-worker";
         status = (int) PSP_MEDIA_ERROR_BUSY;
         psp_media_log(
-            "tilefinch-media-decoder: event=mpeg-recreate status=0x%08X "
-            "stage=worker-unreachable required=-1 held=%d mode=%d "
-            "refusal=%d",
+            "tilefinch-media-decoder: event=decoder-reset status=0x%08X "
+            "stage=worker-unreachable held=%d mode=%d refusal=%d",
             (unsigned) status, backend->mpeg_memory_bytes,
             backend->mpeg_mode, refusal_rebuild ? 1 : 0);
     } else if (no_touch) {
@@ -6153,27 +6245,34 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
             "primed=%d drain-units=%u mode=%d",
             backend->decoder_primed ? 1 : 0,
             backend->video_reposition_drain_units, backend->mpeg_mode);
-    } else if (rebuild) {
-        native_stage = "codec-recreate-queue";
+    } else if (needs_worker) {
+        PspMediaCodecJobKind reset_kind = rebuild_requested
+            ? PSP_MEDIA_CODEC_KIND_RECREATE : PSP_MEDIA_CODEC_KIND_RESET;
+        native_stage = rebuild_requested
+            ? "codec-recreate-queue" : "codec-reset-queue";
         psp_media_log(
-            "tilefinch-media-decoder: event=mpeg-recreate-request "
-            "refusal=%d mode=%d",
+            "tilefinch-media-decoder: event=decoder-reset-request "
+            "kind=%s refusal=%d mode=%d",
+            rebuild_requested ? "recreate" : "in-place",
             refusal_rebuild ? 1 : 0, psp_media_reset_mode);
-        uint32_t recreate_wait_us = 0;
+        uint32_t worker_wait_us = 0;
         backend->codec_recreate_ran = false;
+        backend->codec_reset_ran = false;
         if (psp_media_queue_codec_job(
-                backend, PSP_MEDIA_CODEC_KIND_RECREATE, NULL, 0)
+                backend, reset_kind, NULL, 0)
             != MEDIA_BACKEND_QUEUED) {
             status = (int) PSP_MEDIA_ERROR_BUSY;
         } else if (!psp_media_wait_codec_job(
                        backend, PSP_MEDIA_CODEC_QUIESCE_WAIT_US,
-                       &recreate_wait_us)
-                   || !backend->codec_recreate_ran) {
-            /* The worker is inside sceMpegDelete or sceMpegCreate and has not
-               come back. The object's ownership is unknown, so this reset
-               fails; destroy's own quiesce is what quarantines the backend
-               rather than freeing memory firmware may still be reading. */
-            native_stage = "codec-recreate-wait";
+                       &worker_wait_us)
+                   || (rebuild_requested
+                           ? !backend->codec_recreate_ran
+                           : !backend->codec_reset_ran)) {
+            /* The worker is inside firmware and has not come back. Ownership
+               is unknown, so destroy quarantines rather than freeing memory
+               the Media Engine may still be reading. */
+            native_stage = rebuild_requested
+                ? "codec-recreate-wait" : "codec-reset-wait";
             status = (int) PSP_MEDIA_ERROR_BUSY;
         } else {
             atomic_store_explicit(
@@ -6182,77 +6281,13 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
             atomic_store_explicit(
                 &backend->codec_job_kind, PSP_MEDIA_CODEC_KIND_NONE,
                 memory_order_release);
-            status = backend->codec_recreate_status;
-            native_stage = "codec-recreate";
-        }
-    } else {
-        status = sceMpegAvcDecodeFlush(&backend->mpeg);
-        if (status >= 0) {
-            memset(backend->video_au, 0xFF, PSP_MEDIA_VIDEO_AU_BYTES);
-            sceKernelDcacheWritebackInvalidateRange(
-                backend->video_au, PSP_MEDIA_VIDEO_AU_BYTES);
-            native_stage = "sceMpegInitAu-reset";
-            status = sceMpegInitAu(
-                &backend->mpeg, backend->video_es, backend->video_au);
-            /* sceMpegInitAu fills the descriptor from the main CPU, so its
-               stores are sitting dirty in the data cache. Write them back
-               before the lines are dropped: a pure invalidate here is what left
-               RAM holding the 0xFF fill and handed the raw-NAL bridge a garbage
-               descriptor. */
-            if (status >= 0) {
-                sceKernelDcacheWritebackInvalidateRange(
-                    backend->video_au, PSP_MEDIA_VIDEO_AU_BYTES);
-            }
-        }
-    }
-    if (status >= 0 && backend->have_audio) {
-        /*
-         * The audio program is re-initialised on both paths, and deliberately
-         * no further than that. The run that wedged sceAudiocodecDecode is why
-         * it is re-initialised at all -- whatever a reset disturbs reaches the
-         * AAC side too. What is not re-run is sceAudiocodecCheckNeedMem and the
-         * work-buffer grant: control word 3 still points at a live pool block,
-         * the pool has no per-block free, and its whole budget for that line is
-         * 64 KiB, so a handful of resets that re-granted would strand every
-         * earlier buffer and exhaust it. Word 3 and word 4 survive untouched;
-         * only the input/output descriptors below are cleared.
-         *
-         * The PCM zero-fill leaves dirty lines behind on purpose; the decode
-         * path writeback-invalidates that range before every firmware call,
-         * so they reach RAM rather than being discarded.
-         */
-        memset(backend->audio_pcm, 0, PSP_MEDIA_AUDIO_PCM_BYTES);
-        /*
-         * Mode 2 stops here. The reference mutes its output across a
-         * reposition rather than stopping or re-initialising its decoder, and
-         * everything that actually prevents stale sound has already happened
-         * above without firmware being told anything: the output was quiesced,
-         * the queue generation was bumped so a block in flight is discarded on
-         * arrival, the read cursor was snapped to the write cursor, and the
-         * PCM staging was zeroed just now. Re-initialising the AAC program is
-         * the audio half of the very sequence this mode exists to remove --
-         * and it is a reset that once left sceAudiocodecDecode not returning.
-         * Control words 6 to 9 are the input and output descriptors, and the
-         * decode path rewrites all four before every call, so leaving them is
-         * not leaving anything stale behind.
-         */
-        if (!no_touch) {
-            backend->audio_codec[6] = 0;
-            backend->audio_codec[7] = 0;
-            backend->audio_codec[8] = 0;
-            backend->audio_codec[9] = 0;
-            sceKernelDcacheWritebackInvalidateRange(
-                backend->audio_codec,
-                psp_media_cache_extent(PSP_MEDIA_AUDIO_CODEC_BYTES));
-            native_stage = "sceAudiocodecInit-reset";
-            status = sceAudiocodecInit(
-                backend->audio_codec, PSP_CODEC_AAC);
-            /* Main-CPU firmware call writing the control block: write back,
-               then drop. See the creation-path sceAudiocodecInit for why. */
-            if (status >= 0) {
-                sceKernelDcacheWritebackInvalidateRange(
-                    backend->audio_codec,
-                    psp_media_cache_extent(PSP_MEDIA_AUDIO_CODEC_BYTES));
+            if (rebuild_requested) {
+                status = backend->codec_recreate_status;
+                native_stage = "codec-recreate";
+            } else {
+                status = backend->codec_reset_status;
+                native_stage = psp_media_codec_stage_name(
+                    backend->codec_reset_stage);
             }
         }
     }

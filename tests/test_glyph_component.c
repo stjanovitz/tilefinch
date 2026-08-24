@@ -255,7 +255,11 @@ static bool test_pack_catalog(void)
          "tilefinch-glyph-cyrillic-v1.tfgf"},
         {"glyph-latin-extended", "Extended Latin",
          "tilefinch-glyph-latin-extended-v1.tfgm",
-         "tilefinch-glyph-latin-extended-v1.tfgf"}
+         "tilefinch-glyph-latin-extended-v1.tfgf"},
+        {"glyph-arabic", "Arabic", "tilefinch-glyph-arabic-v1.tfgm",
+         "tilefinch-glyph-arabic-v1.tfgf"},
+        {"glyph-hebrew", "Hebrew", "tilefinch-glyph-hebrew-v1.tfgm",
+         "tilefinch-glyph-hebrew-v1.tfgf"}
     };
     CHECK(TILEFINCH_GLYPH_PACK_JAPANESE == 0
           && TILEFINCH_GLYPH_PACK_CHINESE_SIMPLIFIED == 1
@@ -264,6 +268,8 @@ static bool test_pack_catalog(void)
           && TILEFINCH_GLYPH_PACK_COLOR_EMOJI == 4
           && TILEFINCH_GLYPH_PACK_CYRILLIC == 5
           && TILEFINCH_GLYPH_PACK_LATIN_EXTENDED == 6
+          && TILEFINCH_GLYPH_PACK_ARABIC == 7
+          && TILEFINCH_GLYPH_PACK_HEBREW == 8
           && TILEFINCH_GLYPH_PACK_COUNT
                  == sizeof(expected) / sizeof(expected[0]));
     for (TilefinchGlyphPack pack = 0;
@@ -372,15 +378,25 @@ static bool test_release_artifacts(void)
                && strcmp(stage_selection, "latin-extended") == 0) {
         staged_language = BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED;
         staged_pack = TILEFINCH_GLYPH_PACK_LATIN_EXTENDED;
+    } else if (stage_selection != NULL
+               && strcmp(stage_selection, "arabic") == 0) {
+        staged_language = BROWSER_GLYPH_LANGUAGE_ARABIC;
+        staged_pack = TILEFINCH_GLYPH_PACK_ARABIC;
+    } else if (stage_selection != NULL
+               && strcmp(stage_selection, "hebrew") == 0) {
+        staged_language = BROWSER_GLYPH_LANGUAGE_HEBREW;
+        staged_pack = TILEFINCH_GLYPH_PACK_HEBREW;
     }
     static const unsigned probes[TILEFINCH_GLYPH_PACK_COUNT] = {
         0x65e5u, 0x6c49u, 0x6f22u, 0xac00u, 0x1f600u,
-        0x0490u, 0x1ed9u
+        0x0490u, 0x1ed9u, 0xfeb3u, 0x05e9u
     };
     static const char *const samples[TILEFINCH_GLYPH_PACK_COUNT] = {
         NULL, NULL, NULL, NULL, NULL,
         "Привет мир Привіт, Україно",
-        "Tiếng Việt"
+        "Tiếng Việt",
+        "مرحبا فارسی اردو",
+        "שלום עולם"
     };
     for (TilefinchGlyphPack pack = 0;
          pack < TILEFINCH_GLYPH_PACK_COUNT; pack++) {
@@ -419,7 +435,9 @@ static bool test_release_artifacts(void)
         CHECK(strcmp(verified.manifest.tag, "components-v1") == 0);
         CHECK(strcmp(verified.manifest.asset, spec->pack_asset) == 0);
         if (pack == TILEFINCH_GLYPH_PACK_CYRILLIC
-            || pack == TILEFINCH_GLYPH_PACK_LATIN_EXTENDED) {
+            || pack == TILEFINCH_GLYPH_PACK_LATIN_EXTENDED
+            || pack == TILEFINCH_GLYPH_PACK_ARABIC
+            || pack == TILEFINCH_GLYPH_PACK_HEBREW) {
             CHECK(verified.manifest.root_version == 1u
                   && verified.manifest.expires_unix
                          == UINT64_C(1818115200));
@@ -513,6 +531,10 @@ static bool test_release_artifacts(void)
             ? "Привет мир — Привіт, Україно — Tiếng Việt"
             : staged_language == BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED
                 ? "Tiếng Việt — Привет мир"
+            : staged_language == BROWSER_GLYPH_LANGUAGE_ARABIC
+                ? "مرحبا — فارسی — اردو"
+            : staged_language == BROWSER_GLYPH_LANGUAGE_HEBREW
+                ? "שלום עולם"
                 : "日本語  漢字  한국어  😀";
         CHECK(browser_profile_add_bookmark(
             profile, "https://example.com/", bookmark_title));
@@ -773,7 +795,9 @@ static bool test_new_pack_store_lifecycle(void)
 {
     static const TilefinchGlyphPack packs[] = {
         TILEFINCH_GLYPH_PACK_CYRILLIC,
-        TILEFINCH_GLYPH_PACK_LATIN_EXTENDED
+        TILEFINCH_GLYPH_PACK_LATIN_EXTENDED,
+        TILEFINCH_GLYPH_PACK_ARABIC,
+        TILEFINCH_GLYPH_PACK_HEBREW
     };
     for (size_t at = 0; at < sizeof(packs) / sizeof(packs[0]); at++) {
         const TilefinchGlyphPack pack = packs[at];
@@ -829,11 +853,171 @@ static bool test_new_pack_store_lifecycle(void)
     return true;
 }
 
+typedef struct {
+    TilefinchGlyphInstallFaultPoint point;
+    bool fired;
+    bool persistent;
+} GlyphInstallFault;
+
+static bool glyph_install_fault_once(
+    void *opaque, TilefinchGlyphInstallFaultPoint point)
+{
+    GlyphInstallFault *fault = opaque;
+    if (fault == NULL || fault->point != point
+        || (fault->fired && !fault->persistent)) return false;
+    fault->fired = true;
+    return true;
+}
+
+static TilefinchGlyphComponentInstall *create_fixture_install(
+    Budget *budget, const char *root, const char *package,
+    TilefinchGlyphInstallFaultHook fault, void *fault_opaque)
+{
+    uint8_t digest[32];
+    uint64_t size = 0;
+    if (!hash_file(package, digest, &size)) return NULL;
+    TilefinchUpdateManifest manifest = {
+        .package_format = TILEFINCH_UPDATE_PACKAGE_GLYPH,
+        .package_size = size
+    };
+    memcpy(manifest.package_sha256, digest, sizeof(digest));
+    snprintf(manifest.asset, sizeof(manifest.asset), "%s",
+             tilefinch_glyph_pack_spec(TILEFINCH_GLYPH_PACK_JAPANESE)
+                 ->pack_asset);
+    static const uint8_t envelope[16] = {0};
+    static const uint8_t manifest_digest[32] = {0x6d};
+    return tilefinch_glyph_component_install_create(
+        budget, &(TilefinchGlyphComponentInstallOptions) {
+            .package_path = package,
+            .envelope = envelope,
+            .envelope_length = sizeof(envelope),
+            .manifest = &manifest,
+            .manifest_digest = manifest_digest,
+            .install_root = root,
+            .pack = TILEFINCH_GLYPH_PACK_JAPANESE,
+            .fault = fault,
+            .fault_opaque = fault_opaque
+        });
+}
+
+static bool pump_fixture_install(
+    TilefinchGlyphComponentInstall *install,
+    TilefinchUpdateInstallSnapshot *snapshot)
+{
+    for (size_t pump = 0; pump < 4096u; pump++) {
+        CHECK(tilefinch_glyph_component_install_pump(install, 7u)
+              && tilefinch_glyph_component_install_snapshot(
+                  install, snapshot));
+        if (snapshot->phase >= TILEFINCH_UPDATE_INSTALL_COMPLETE) return true;
+    }
+    return false;
+}
+
+static bool test_phase_aware_install_faults(void)
+{
+    static const TilefinchGlyphInstallFaultPoint faults[] = {
+        TILEFINCH_GLYPH_INSTALL_FAULT_SELF_CHECK,
+        TILEFINCH_GLYPH_INSTALL_FAULT_REMOVE_PREVIOUS,
+        TILEFINCH_GLYPH_INSTALL_FAULT_ACTIVATE_CANDIDATE,
+        TILEFINCH_GLYPH_INSTALL_FAULT_POST_ACTIVATION_SYNC,
+        TILEFINCH_GLYPH_INSTALL_FAULT_TOMBSTONE_UNLINK
+    };
+    for (size_t at = 0; at < sizeof(faults) / sizeof(faults[0]); at++) {
+        char root[] = "/tmp/tilefinch-glyph-fault-XXXXXX";
+        CHECK(mkdtemp(root) != NULL);
+        Budget budget;
+        budget_init(&budget, 4u * 1024u * 1024u);
+        /* Two generations ensure previous-generation cleanup is real rather
+           than an ENOENT-only control. */
+        CHECK(install_test_generation(
+                  &budget, root, TILEFINCH_GLYPH_PACK_JAPANESE, false)
+              && install_test_generation(
+                  &budget, root, TILEFINCH_GLYPH_PACK_JAPANESE, false));
+        TilefinchInstallPaths paths = {.slotted = true};
+        snprintf(paths.install_root, sizeof(paths.install_root), "%s", root);
+        char old_active[TILEFINCH_INSTALL_PATH_LIMIT];
+        CHECK(tilefinch_glyph_component_resolve(
+            &paths, TILEFINCH_GLYPH_PACK_JAPANESE,
+            old_active, sizeof(old_active)));
+
+        if (faults[at] == TILEFINCH_GLYPH_INSTALL_FAULT_TOMBSTONE_UNLINK) {
+            char tombstone[TILEFINCH_INSTALL_PATH_LIMIT];
+            snprintf(tombstone, sizeof(tombstone),
+                     "%s/components/glyph-ja/UNINSTALLED", root);
+            FILE *file = fopen(tombstone, "wb");
+            CHECK(file != NULL && fputs("TFGRv1\n", file) >= 0
+                  && fclose(file) == 0);
+        }
+
+        char package[128];
+        CHECK(write_fixture(package, "glyph-ja"));
+        bool pre_activation = faults[at]
+            <= TILEFINCH_GLYPH_INSTALL_FAULT_ACTIVATE_CANDIDATE;
+        GlyphInstallFault fault = {
+            .point = faults[at],
+            .persistent = !pre_activation
+        };
+        TilefinchGlyphComponentInstall *install = create_fixture_install(
+            &budget, root, package, glyph_install_fault_once, &fault);
+        CHECK(install != NULL);
+        TilefinchUpdateInstallSnapshot snapshot = {0};
+        if (pre_activation) {
+            CHECK(pump_fixture_install(install, &snapshot) && fault.fired);
+            struct stat information;
+            char resolved[TILEFINCH_INSTALL_PATH_LIMIT];
+            CHECK(snapshot.phase == TILEFINCH_UPDATE_INSTALL_ERROR
+                  && !tilefinch_glyph_component_install_activated(install)
+                  && stat(package, &information) == 0
+                  && tilefinch_glyph_component_resolve(
+                      &paths, TILEFINCH_GLYPH_PACK_JAPANESE,
+                      resolved, sizeof(resolved))
+                  && strcmp(resolved, old_active) == 0);
+            tilefinch_glyph_component_install_destroy(install);
+            install = create_fixture_install(
+                &budget, root, package, NULL, NULL);
+            memset(&snapshot, 0, sizeof(snapshot));
+            CHECK(install != NULL && pump_fixture_install(install, &snapshot)
+                  && snapshot.phase == TILEFINCH_UPDATE_INSTALL_COMPLETE);
+        } else {
+            char resolved[TILEFINCH_INSTALL_PATH_LIMIT];
+            CHECK(pump_fixture_install(install, &snapshot) && fault.fired);
+            /* Reconciliation exhausted its bounded retries. Active—not the
+               vanished download path—still owns the verified pack. This is
+               also the power-loss boundary the session re-probes. */
+            CHECK(snapshot.phase == TILEFINCH_UPDATE_INSTALL_ERROR
+                  && tilefinch_glyph_component_install_activated(install)
+                  && access(package, F_OK) != 0
+                  && tilefinch_glyph_component_resolve(
+                      &paths, TILEFINCH_GLYPH_PACK_JAPANESE,
+                      resolved, sizeof(resolved)));
+            tilefinch_glyph_component_install_destroy(install);
+            install = NULL;
+            CHECK(tilefinch_glyph_component_resolve(
+                &paths, TILEFINCH_GLYPH_PACK_JAPANESE,
+                resolved, sizeof(resolved)));
+        }
+        tilefinch_glyph_component_install_destroy(install);
+        CHECK(tilefinch_glyph_component_remove(
+            &paths, TILEFINCH_GLYPH_PACK_JAPANESE));
+        char cleanup[TILEFINCH_INSTALL_PATH_LIMIT];
+        snprintf(cleanup, sizeof(cleanup),
+                 "%s/components/glyph-ja/UNINSTALLED", root);
+        CHECK(unlink(cleanup) == 0);
+        snprintf(cleanup, sizeof(cleanup), "%s/components/glyph-ja", root);
+        CHECK(rmdir(cleanup) == 0);
+        snprintf(cleanup, sizeof(cleanup), "%s/components", root);
+        CHECK(rmdir(cleanup) == 0 && rmdir(root) == 0);
+        CHECK(budget.current == 0);
+    }
+    return true;
+}
+
 int main(void)
 {
     if (!test_pack_catalog()) return 1;
     if (!test_bounded_pack_provider()) return 1;
     if (!test_new_pack_store_lifecycle()) return 1;
+    if (!test_phase_aware_install_faults()) return 1;
     if (!test_release_artifacts()) return 1;
     puts("glyph-component-tests status=PASS");
     return 0;

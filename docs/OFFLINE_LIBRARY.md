@@ -35,19 +35,30 @@ current 240p/360p quality option, and downloads the selected direct MP4 video
 and (when needed) audio tracks. Ciphered, DRM-protected, live, unavailable, and
 unsupported formats are refused rather than saved incorrectly.
 
-Only one download is active at a time. Transfers use exact 256 KiB ranged
+Only one download is active at a time. The Downloads section is the manager:
+X pauses or resumes an incomplete item and opens a completed item in the
+native player. Its active row reports percent complete, measured transfer
+speed, and the last sampled free-space reserve; paused and failed rows retain
+the bounded failure reason across restarts.
+
+Transfers use exact 256 KiB ranged
 chunks, expose at most 32 KiB/2 ms of body work to one UI pump, and write
-directly to `.part` files; a complete stream is renamed into place. Circle
-pauses a resolving or downloading item. **Resume**, **Pause**, **Play**, and
-**Delete** are available from the offline library. Restarting after an app or
+directly to `.part` files; a complete stream is renamed into place. **Resume**,
+**Pause**, **Play**, and **Delete** are available from the offline library.
+Restarting after an app or
 power interruption converts an in-progress record to Paused and reconciles
 bounded file sizes, so Resume obtains a fresh expiring YouTube URL and
 continues from the retained byte offset.
 
-**Options → Resume saves** is off by default. When enabled, Tilefinch lazily
+**Settings → Device & storage → Resume saves** is off by default. When enabled, Tilefinch lazily
 opens the offline index after the initial page is ready and resumes the first
 paused or queued video; successful completion then advances through the queue.
 Keeping it off preserves the default no-library-I/O boot path.
+
+The fixed range and per-frame pump limits bound Memory Stick and browser-thread
+work. Users control when writes occur by pausing individual items and by the
+off-by-default Resume saves preference; merely viewing Downloads performs no
+payload write.
 
 Each video and audio stream is capped at 512 MiB, the library holds at most 12
 combined items, and a download refuses to begin unless it can retain at least

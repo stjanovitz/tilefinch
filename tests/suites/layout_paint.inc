@@ -88,6 +88,8 @@ static int test_linear_gradient_parse(Budget *budget)
         "#thirds{background:linear-gradient(#000,#888 25%,#fff)}"
         "#spread{background:linear-gradient(#000,#111,#222,#fff)}"
         "#alpha{background:linear-gradient(rgba(0,0,0,0),#000)}"
+        "#alpha-two-position{background:linear-gradient("
+        "rgba(1,2,3,.5) 20% 40%,#fff)}"
         /* Generated ramps beyond the retained stop cap degrade to an evenly
            sampled bounded gradient rather than dropping a readability
            overlay completely. */
@@ -110,7 +112,8 @@ static int test_linear_gradient_parse(Budget *budget)
         "</style><body>"
         "<i id=down></i><i id=right></i><i id=corner></i><i id=angled></i>"
         "<i id=wrapped></i><i id=thirds></i><i id=spread></i>"
-        "<i id=alpha></i><i id=capped></i><i id=repeating></i>"
+        "<i id=alpha></i><i id=alpha-two-position></i>"
+        "<i id=capped></i><i id=repeating></i>"
         "<i id=turned></i><i id=lonely></i><i id=hinted></i>"
         "<i id=spaced></i><i id=radial></i><i id=interpolated></i>"
         "<i id=inherit-parent style='background-image:linear-gradient("
@@ -170,6 +173,10 @@ static int test_linear_gradient_parse(Budget *budget)
     CHECK(GRADIENT_OF("alpha")->stop_argb[0] == 0x00000000u
           && GRADIENT_OF("alpha")->stop_argb[1]
              == 0xff000000u);
+    const StyleGradient *alpha_two = GRADIENT_OF("alpha-two-position");
+    CHECK(alpha_two != NULL && alpha_two->stop_count == 3
+          && alpha_two->stop_argb[0] == 0x80010203u
+          && alpha_two->stop_argb[1] == 0x80010203u);
 
     ComputedStyle capped_style = style_for_node(
         &sheet, find_id(root, "capped"), NULL);
@@ -612,6 +619,8 @@ static int test_bounded_shared_paint_stack(Budget *budget)
         "mask-size:50% 25%,10px 20px;"
         "mask-position:right 20% bottom 70%,5px 6px;"
         "mask-repeat:no-repeat,repeat-x}"
+        "#mask-order{mask-image:url(order.svg);mask-position:7px 9px;"
+        "mask-repeat:no-repeat;mask-size:12px 14px}"
         "#box-defaults{background-clip:content-box,padding-box}"
         "#text-clip{color:#17253d;-webkit-text-fill-color:transparent;"
         "background-image:linear-gradient(#000,#fff),"
@@ -637,7 +646,8 @@ static int test_bounded_shared_paint_stack(Budget *budget)
         "background-position:10% 20%;background-position-x:right 3px;"
         "background-position-y:75%}"
         "table{border-spacing:12px 7px}</style>"
-        "<body><div id=probe></div><div id=box-defaults></div>"
+        "<body><div id=probe></div><div id=mask-order></div>"
+        "<div id=box-defaults></div>"
         "<div id=text-clip>Readable heading</div>"
         "<div id=mask-replacement></div>"
         "<div id=mask-shorthand></div><div id=pseudo-mask "
@@ -704,6 +714,32 @@ static int test_bounded_shared_paint_stack(Budget *budget)
               & STYLE_BACKGROUND_NO_REPEAT_Y) != 0
           && sheet.paint_storage != NULL
           && sheet.paint_storage->count <= STYLE_PAINT_STACK_LIMIT);
+    size_t retained_paint_floor = sizeof(*sheet.paint_storage)
+        + sheet.paint_storage->capacity
+            * sizeof(*sheet.paint_storage->blocks);
+    for (size_t block = 0; block < sheet.paint_storage->capacity; block++) {
+        if (sheet.paint_storage->blocks[block] != NULL) {
+            retained_paint_floor += STYLE_PAINT_STACK_BLOCK_SIZE
+                * sizeof(*sheet.paint_storage->blocks[block]);
+        }
+    }
+    CHECK(stylesheet_retained_bytes(&sheet) >= retained_paint_floor);
+    ComputedStyle mask_order = style_for_node(
+        &sheet, find_id(root, "mask-order"), NULL);
+    const StylePaintStack *mask_order_paint = stylesheet_paint_stack(
+        &sheet, computed_style_paint_stack_id(&mask_order));
+    CHECK(mask_order_paint != NULL && mask_order_paint->mask_count == 1
+          && mask_order_paint->masks[0].width == 12
+          && mask_order_paint->masks[0].height == 14
+          && mask_order_paint->masks[0].position_x == 7
+          && mask_order_paint->masks[0].position_y == 9
+          && (mask_order_paint->masks[0].flags
+              & STYLE_BACKGROUND_POSITION_PIXELS) != 0
+          && (mask_order_paint->masks[0].flags
+              & (STYLE_BACKGROUND_NO_REPEAT_X
+                 | STYLE_BACKGROUND_NO_REPEAT_Y))
+             == (STYLE_BACKGROUND_NO_REPEAT_X
+                 | STYLE_BACKGROUND_NO_REPEAT_Y));
     ComputedStyle box_defaults = style_for_node(
         &sheet, find_id(root, "box-defaults"), NULL);
     const StylePaintStack *box_paint = stylesheet_paint_stack(
@@ -908,6 +944,124 @@ static int test_bounded_shared_paint_stack(Budget *budget)
           && failed_id == 0);
     stylesheet_destroy(&failure_sheet);
     CHECK(failure_budget.current == 0);
+    return 0;
+}
+
+static int test_style_value_transactionality(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static const char page[] =
+        "<!doctype html><style>"
+        "#parent{opacity:.4;visibility:hidden}"
+        "#child{opacity:inherit;visibility:inherit}"
+        "#box{margin:7px;padding:6px;border-width:5px;gap:4px;"
+        "margin:bogus;padding:-2px;border-width:nope;gap:-3px}"
+        "#thin{border:thin red}#dash{border:dashed thick red}"
+        "#badstyle{border-style:dashed;"
+        "border-style:solid dotted double dashed hidden}"
+        "#badtop{border-top-style:dashed;"
+        "border-top-style:solid dotted}"
+        "#logical{writing-mode:vertical-rl;direction:ltr;"
+        "border-inline-start-color:#123456;"
+        "border-block-end-color:#abcdef}"
+        "#percent{gap:10% 50%;border-width:2px;"
+        "border-top-width:50%;border-right-width:calc(10% + 1px)}"
+        "</style><div id=parent><span id=child></span></div>"
+        "<div id=box></div><div id=thin></div><div id=dash></div>"
+        "<div id=badstyle></div><div id=badtop></div>"
+        "<div id=logical></div><div id=percent></div>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, budget, page, strlen(page), 67)
+          && stylesheet_build(&sheet, budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    ComputedStyle parent = style_for_node(
+        &sheet, find_id(root, "parent"), NULL);
+    ComputedStyle child = style_for_node(
+        &sheet, find_id(root, "child"), &parent);
+    CHECK(parent.opacity == 102 && child.opacity == parent.opacity
+          && parent.visibility_hidden && child.visibility_hidden);
+    ComputedStyle box = style_for_node(
+        &sheet, find_id(root, "box"), NULL);
+    CHECK(box.margin.top == 7 && box.margin.right == 7
+          && box.margin.bottom == 7 && box.margin.left == 7
+          && box.padding.top == 6 && box.padding.right == 6
+          && box.padding.bottom == 6 && box.padding.left == 6
+          && box.border.top == 5 && box.border.right == 5
+          && box.border.bottom == 5 && box.border.left == 5
+          && box.gap == 4 && box.row_gap == 4);
+    ComputedStyle percent = style_for_node(
+        &sheet, find_id(root, "percent"), NULL);
+    CHECK(percent.row_gap == -11 && percent.gap == -51
+          && percent.border.top == 2 && percent.border.right == 2
+          && percent.border.bottom == 2 && percent.border.left == 2);
+    ComputedStyle thin = style_for_node(
+        &sheet, find_id(root, "thin"), NULL);
+    ComputedStyle dash = style_for_node(
+        &sheet, find_id(root, "dash"), NULL);
+    CHECK(thin.border.top == 1
+          && computed_style_border_line(&thin, STYLE_BORDER_TOP)
+             == STYLE_BORDER_NONE
+          && dash.border.top == 5
+          && computed_style_border_line(&dash, STYLE_BORDER_TOP)
+             == STYLE_BORDER_DASHED);
+    ComputedStyle badstyle = style_for_node(
+        &sheet, find_id(root, "badstyle"), NULL);
+    ComputedStyle badtop = style_for_node(
+        &sheet, find_id(root, "badtop"), NULL);
+    CHECK(computed_style_border_line(&badstyle, STYLE_BORDER_TOP)
+              == STYLE_BORDER_DASHED
+          && computed_style_border_line(&badstyle, STYLE_BORDER_RIGHT)
+              == STYLE_BORDER_DASHED
+          && computed_style_border_line(&badtop, STYLE_BORDER_TOP)
+              == STYLE_BORDER_DASHED);
+    ComputedStyle logical = style_for_node(
+        &sheet, find_id(root, "logical"), NULL);
+    CHECK(stylesheet_border_color(
+              &sheet, &logical, STYLE_BORDER_TOP, NULL) == 0x123456
+          && stylesheet_border_color(
+              &sheet, &logical, STYLE_BORDER_LEFT, NULL) == 0xabcdef);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+static int test_nested_selector_bounded_batching(Budget *budget)
+{
+    static const char p1[] =
+        "paaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char p2[] =
+        "pbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    static const char p3[] =
+        "pcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    static const char c1[] =
+        "caaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char c2[] =
+        "cbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    static const char c3[] =
+        "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    char page[4096];
+    int written = snprintf(
+        page, sizeof(page),
+        "<!doctype html><style>.%s,.%s,.%s{&.%s,&.%s,&.%s{color:#123456}}"
+        "</style><div id=probe class='%s %s'></div>",
+        p1, p2, p3, c1, c2, c3, p3, c3);
+    CHECK(written > 0 && (size_t) written < sizeof(page));
+    size_t baseline = budget->current;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(
+              &document, budget, page, (size_t) written, 69)
+          && stylesheet_build(&sheet, budget, &document, 480));
+    ComputedStyle probe = style_for_node(
+        &sheet, find_id(lxb_dom_interface_node(document.html), "probe"),
+        NULL);
+    CHECK(probe.color == 0x123456
+          && sheet.diagnostic_selector_drops == 0);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
     return 0;
 }
 
@@ -1648,6 +1802,185 @@ static bool paint_layout_frame(
         && tile_cache_render_frame(&cache, 0, width, height, NULL);
     tile_cache_destroy(&cache);
     return ok;
+}
+
+static int test_cover_object_position_stays_in_source(Budget *budget)
+{
+    enum { FRAME_WIDTH = 4, FRAME_HEIGHT = 2 };
+    unsigned char horizontal[8u * 2u * 4u];
+    unsigned char vertical[2u * 8u * 4u];
+    memset(horizontal, 0xff, sizeof(horizontal));
+    memset(vertical, 0xff, sizeof(vertical));
+    ImageResource images[2] = {
+        {.pixels = horizontal, .width = 8, .height = 2},
+        {.pixels = vertical, .width = 2, .height = 8}
+    };
+    DrawCommand commands[2] = {
+        {.image = &images[0], .x = 0, .y = 0, .width = 2, .height = 2,
+         .opacity_scale = 256, .type = DRAW_IMAGE,
+         .image_fit = LAYOUT_IMAGE_FIT_COVER},
+        {.image = &images[1], .x = 2, .y = 0, .width = 2, .height = 2,
+         .opacity_scale = 256, .type = DRAW_IMAGE,
+         .image_fit = LAYOUT_IMAGE_FIT_COVER}
+    };
+    draw_command_set_object_position(
+        &commands[0], style_object_position_encode(0, 20),
+        style_object_position_encode(50, 0));
+    draw_command_set_object_position(
+        &commands[1], style_object_position_encode(50, 0),
+        style_object_position_encode(0, 20));
+    LayoutDocument layout = {
+        .budget = budget,
+        .commands = commands,
+        .count = 2,
+        .capacity = 2,
+        .width = FRAME_WIDTH,
+        .scroll_width = FRAME_WIDTH,
+        .height = FRAME_HEIGHT,
+        .page_background = 0
+    };
+    CHECK(viewport_context_init(
+        &layout.viewport, FRAME_WIDTH, FRAME_HEIGHT,
+        FRAME_WIDTH, FRAME_HEIGHT));
+    uint16_t frame[FRAME_WIDTH * FRAME_HEIGHT];
+    CHECK(paint_layout_frame(
+        budget, &layout, frame, FRAME_WIDTH, FRAME_HEIGHT));
+    for (size_t i = 0; i < sizeof(frame) / sizeof(frame[0]); i++) {
+        CHECK(frame[i] == UINT16_C(0xffff));
+    }
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_visual_clone_preserves_object_position(Budget *budget)
+{
+    DrawCommand commands[2] = {
+        {.type = DRAW_IMAGE, .image_fit = LAYOUT_IMAGE_FIT_COVER},
+        {.type = DRAW_IMAGE, .image_fit = LAYOUT_IMAGE_FIT_SPRITE}
+    };
+    draw_command_set_object_position(
+        &commands[0], style_object_position_encode(25, 8),
+        style_object_position_encode(75, -8));
+    draw_command_set_image_offset(&commands[1], -20, 5);
+    LayoutDocument source = {
+        .budget = budget,
+        .commands = commands,
+        .count = 2,
+        .capacity = 2,
+        .width = 960,
+        .scroll_width = 960,
+        .height = 544
+    };
+    CHECK(viewport_context_init(&source.viewport, 960, 544, 480, 272));
+    LayoutDocument visual = {0};
+    CHECK(layout_clone_visual(&visual, &source));
+    uint16_t x = (uint16_t) draw_command_image_offset_x(&visual.commands[0]);
+    uint16_t y = (uint16_t) draw_command_image_offset_y(&visual.commands[0]);
+    CHECK(style_object_position_percent(x) == 25
+          && style_object_position_offset(x) == 4
+          && style_object_position_percent(y) == 75
+          && style_object_position_offset(y) == -4
+          && draw_command_image_offset_x(&visual.commands[1]) == -20
+          && draw_command_image_offset_y(&visual.commands[1]) == 5);
+    layout_destroy(&visual);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_render_ppm_rejects_invalid_extent(void)
+{
+    uint16_t frame[4] = {0};
+    char path[96];
+    snprintf(path, sizeof(path), "/tmp/tilefinch-ppm-%ld.ppm",
+             (long) getpid());
+    unlink(path);
+    CHECK(!render_write_frame_ppm(path, frame, 3, 2, 2)
+          && access(path, F_OK) != 0
+          && !render_write_frame_ppm(path, frame, 4, -1, 2)
+          && !render_write_frame_ppm(NULL, frame, 4, 2, 2)
+          && render_write_frame_ppm(path, frame, 4, 2, 2)
+          && unlink(path) == 0);
+    return 0;
+}
+
+static int test_first_text_data_deep_walk(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><title>deep text</title><body></body>";
+    static const lxb_char_t div_tag[] = "div";
+    static const lxb_char_t sentinel[] = "deep sentinel";
+    enum { DEPTH = 2048 };
+    PocDocument document = {0};
+    CHECK(document_parse(
+        &document, budget, page, sizeof(page) - 1u, 16));
+    BudgetAllocationOwner previous =
+        document_allocation_owner_enter(&document);
+    lxb_dom_node_t *body = document_body_node(&document);
+    lxb_dom_node_t *cursor = body;
+    for (size_t depth = 0; depth < DEPTH; depth++) {
+        lxb_dom_element_t *element = lxb_dom_document_create_element(
+            &document.html->dom_document, div_tag, sizeof(div_tag) - 1u,
+            NULL);
+        CHECK(element != NULL
+              && lxb_dom_node_append_child(
+                     cursor, lxb_dom_interface_node(element))
+                     == LXB_DOM_EXCEPTION_OK);
+        cursor = lxb_dom_interface_node(element);
+    }
+    lxb_dom_text_t *text = lxb_dom_document_create_text_node(
+        &document.html->dom_document, sentinel, sizeof(sentinel) - 1u);
+    CHECK(text != NULL
+          && lxb_dom_node_append_child(cursor, lxb_dom_interface_node(text))
+             == LXB_DOM_EXCEPTION_OK);
+    document_allocation_owner_leave(&document, previous);
+    size_t length = 0;
+    const char *found = first_text_data(body, &length);
+    CHECK(found != NULL && length == sizeof(sentinel) - 1u
+          && memcmp(found, sentinel, length) == 0);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_select_option_deep_walk(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><body><select id=select></select></body>";
+    static const lxb_char_t div_tag[] = "div";
+    static const lxb_char_t option_tag[] = "option";
+    enum { DEPTH = 2048 };
+    size_t baseline = budget->current;
+    PocDocument document = {0};
+    CHECK(document_parse(
+        &document, budget, page, sizeof(page) - 1u, 68));
+    lxb_dom_node_t *select = find_id(
+        lxb_dom_interface_node(document.html), "select");
+    CHECK(select != NULL);
+    BudgetAllocationOwner previous =
+        document_allocation_owner_enter(&document);
+    lxb_dom_node_t *cursor = select;
+    for (size_t depth = 0; depth < DEPTH; depth++) {
+        lxb_dom_element_t *element = lxb_dom_document_create_element(
+            &document.html->dom_document, div_tag, sizeof(div_tag) - 1u,
+            NULL);
+        CHECK(element != NULL
+              && lxb_dom_node_append_child(
+                     cursor, lxb_dom_interface_node(element))
+                 == LXB_DOM_EXCEPTION_OK);
+        cursor = lxb_dom_interface_node(element);
+    }
+    lxb_dom_element_t *option = lxb_dom_document_create_element(
+        &document.html->dom_document, option_tag, sizeof(option_tag) - 1u,
+        NULL);
+    CHECK(option != NULL
+          && lxb_dom_node_append_child(
+                 cursor, lxb_dom_interface_node(option))
+             == LXB_DOM_EXCEPTION_OK);
+    document_allocation_owner_leave(&document, previous);
+    CHECK(option_is_displayed_by_default(lxb_dom_interface_node(option)));
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return 0;
 }
 
 /*

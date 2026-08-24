@@ -1,4 +1,5 @@
 #include "swdec_bounds.h"
+#include "swdec_csc_mask.h"
 
 #include <stdio.h>
 
@@ -39,6 +40,22 @@ int main(void)
     CHECK(!swdec_audio_channels_admitted(0));
     CHECK(!swdec_audio_channels_admitted(3));
     CHECK(!swdec_audio_channels_admitted(8));
+
+    puts("test: clock correction re-anchors instead of accumulating");
+    CHECK(swdec_clock_reanchor_slip(1000000u, 925000u) == 75000u);
+    CHECK(swdec_clock_reanchor_slip(1000000u, 925000u) == 75000u);
+    CHECK(swdec_clock_reanchor_slip(900000u, 925000u) == 0u);
+
+    puts("test: CSC completion covers the bottom of a 272-row frame");
+    SwdecCscMask mask = {{0, 0}};
+    for (unsigned unit = 0; unit < 34u; unit++)
+        swdec_csc_mask_set(&mask, unit);
+    CHECK(swdec_csc_mask_test(&mask, 31u));
+    CHECK(swdec_csc_mask_test(&mask, 32u)); /* rows 256..263 */
+    CHECK(swdec_csc_mask_test(&mask, 33u)); /* rows 264..271 */
+    CHECK(!swdec_csc_mask_test(&mask, SWDEC_CSC_MASK_UNITS));
+    swdec_csc_mask_clear(&mask);
+    CHECK(!swdec_csc_mask_test(&mask, 32u));
     puts("swdec bounds tests passed");
     return 0;
 }

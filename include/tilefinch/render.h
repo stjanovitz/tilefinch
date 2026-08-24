@@ -329,7 +329,7 @@ void render_paint_find_highlight(
     int viewport_width, int viewport_height,
     int x, int y, int width, int height, bool current);
 bool render_write_frame_ppm(const char *path, const uint16_t *frame,
-                            int width, int height);
+                            size_t frame_pixels, int width, int height);
 void tile_cache_prefetch_row(TileCache *cache, int world_y, int viewport_width);
 void tile_cache_schedule_prefetch_row(TileCache *cache, int world_y,
                                       int viewport_width);

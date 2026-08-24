@@ -390,10 +390,28 @@ void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
 }
 
 void script_runtime_set_images(ScriptRuntime *runtime,
-                               const ImageResources *images)
+                               ImageResources *images)
 {
     if (runtime == NULL) return;
     runtime->bridge.images = images;
+    if (images == NULL) return;
+    /* A canvas can be drawn by an inline script before final layout attaches
+       the page resource table. Retry that bounded dirty publication now; a
+       failed pressure admission remains a soft visual degradation. */
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    JSValue flush = JS_GetPropertyStr(
+        runtime->context, global, "__tilefinchFlushCanvasSurfaces");
+    if (JS_IsFunction(runtime->context, flush)) {
+        JSValue called = JS_Call(
+            runtime->context, flush, JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(called)) {
+            JSValue exception = JS_GetException(runtime->context);
+            JS_FreeValue(runtime->context, exception);
+        }
+        JS_FreeValue(runtime->context, called);
+    }
+    JS_FreeValue(runtime->context, flush);
+    JS_FreeValue(runtime->context, global);
 }
 
 void script_runtime_set_stylesheet(ScriptRuntime *runtime,

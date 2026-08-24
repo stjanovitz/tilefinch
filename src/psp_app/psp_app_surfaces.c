@@ -554,6 +554,7 @@ static const char *psp_collections_offline_state(OfflineItemState state)
 void psp_collections_sync_ui(
     PspUiState *ui, PspCollectionsSurface *surface,
     const BrowserProfile *profile, const OfflineLibrary *library,
+    const OfflineDownloadManager *downloads,
     PspUiCollectionSection section)
 {
     if (ui == NULL || surface == NULL) return;
@@ -562,19 +563,59 @@ void psp_collections_sync_ui(
     size_t rows = 0;
     if (section == PSP_UI_COLLECTION_SAVED
         || section == PSP_UI_COLLECTION_DOWNLOADS) {
-        bool downloads = section == PSP_UI_COLLECTION_DOWNLOADS;
-        surface->view.empty_message = downloads
+        bool is_downloads = section == PSP_UI_COLLECTION_DOWNLOADS;
+        surface->view.empty_message = is_downloads
             ? "NO VIDEO DOWNLOADS YET" : "NO SAVED ARTICLES YET";
         size_t count = library == NULL ? 0u : library->count;
         for (size_t at = 0;
              at < count && rows < PSP_UI_COLLECTIONS_ROW_LIMIT; at++) {
             const OfflineLibraryItem *item = &library->items[at];
-            if (downloads != (item->type == OFFLINE_ITEM_YOUTUBE)) continue;
+            if (is_downloads != (item->type == OFFLINE_ITEM_YOUTUBE)) continue;
             surface->view.rows[rows].title = item->title;
             surface->view.rows[rows].detail = item->source_url;
             surface->view.rows[rows].deletable = true;
+            surface->view.rows[rows].offline_state = (uint8_t) item->state;
+            OfflineDownloadSnapshot snapshot = {0};
+            if (downloads != NULL
+                && offline_download_manager_snapshot(
+                    downloads, item->id, &snapshot)
+                && snapshot.total_bytes != 0) {
+                surface->view.rows[rows].progress_per_mille = (uint16_t)
+                    psp_ui_ratio_extent_u64(
+                        snapshot.downloaded_bytes,
+                        snapshot.total_bytes, 1000u);
+            }
             const char *state = psp_collections_offline_state(item->state);
-            if (state[0] != '\0') {
+            if (item->state == OFFLINE_ITEM_DOWNLOADING) {
+                unsigned percent =
+                    surface->view.rows[rows].progress_per_mille / 10u;
+                snprintf(surface->view.rows[rows].trailing,
+                         sizeof(surface->view.rows[rows].trailing), "%u%%",
+                         percent);
+                if (snapshot.bytes_per_second != 0
+                    && snapshot.available_bytes != 0) {
+                    snprintf(surface->download_detail[rows],
+                             sizeof(surface->download_detail[rows]),
+                             "%lu KB/s  |  %llu MB free",
+                             (unsigned long)
+                                 (snapshot.bytes_per_second / 1024u),
+                             (unsigned long long)
+                                 (snapshot.available_bytes / UINT64_C(1048576)));
+                } else {
+                    snprintf(surface->download_detail[rows],
+                             sizeof(surface->download_detail[rows]),
+                             "Preparing resumable download");
+                }
+                surface->view.rows[rows].detail =
+                    surface->download_detail[rows];
+            } else if ((item->state == OFFLINE_ITEM_PAUSED
+                        || item->state == OFFLINE_ITEM_FAILED)
+                       && item->failure_reason[0] != '\0') {
+                surface->view.rows[rows].detail = item->failure_reason;
+                snprintf(surface->view.rows[rows].trailing,
+                         sizeof(surface->view.rows[rows].trailing), "%s",
+                         state);
+            } else if (state[0] != '\0') {
                 snprintf(surface->view.rows[rows].trailing,
                          sizeof(surface->view.rows[rows].trailing), "%s",
                          state);

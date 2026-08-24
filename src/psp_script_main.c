@@ -9,6 +9,7 @@
  */
 
 #include "psp_app/psp_app_internal.h"
+#include "tilefinch/psp_time.h"
 #include "tilefinch/psp_threads.h"
 #include "tilefinch/psp_voice_component_session.h"
 #include "tilefinch/update_history.h"
@@ -55,6 +56,8 @@ typedef struct {
     bool transport_present;
     long transport_code;
     long tls_verify_result;
+    bool tls_verify_result_available;
+    bool tls_verification_failed;
     bool transport_timed_out;
     bool tls12_compatibility_retry;
     char tls_version[16];
@@ -106,14 +109,15 @@ static bool psp_write_failure_report_data(
     if (file == NULL) return false;
     uint64_t now_us = (uint64_t) sceKernelGetSystemTimeWide();
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
-    unsigned long long unix_time = (unsigned long long) time(NULL);
-    ScePspDateTime rtc = {0};
-    int rtc_result = sceRtcGetCurrentClock(&rtc, 0);
-    bool rtc_valid = rtc_result >= 0 && sceRtcCheckValid(&rtc) == 0;
+    time_t sampled_epoch = 0;
+    PspTimeFields rtc = {0};
+    PspTimeStatus rtc_status = psp_time_read_utc_fields(
+        &rtc, &sampled_epoch);
+    unsigned long long unix_time = (unsigned long long) sampled_epoch;
 #else
     unsigned long long unix_time = 0;
-    ScePspDateTime rtc = {0};
-    bool rtc_valid = false;
+    PspTimeFields rtc = {0};
+    PspTimeStatus rtc_status = PSP_TIME_UNREADABLE;
 #endif
     uint32_t ca_bundle_version = 0;
     size_t ca_bundle_bytes = 0;
@@ -135,10 +139,11 @@ static bool psp_write_failure_report_data(
         "tilefinch-device-error-v3\n"
         "version=%s\nrelease-sequence=%llu\n"
         "stage=%s\nhttp=%ld\nnative=0x%08x\n"
-        "uptime-us=%llu\nunix-time=%llu\nrtc-valid=%d\n"
+        "uptime-us=%llu\nunix-time=%llu\nrtc-valid=%d\nrtc-status=%s\n"
         "rtc=%04u-%02u-%02uT%02u:%02u:%02uZ\nfree=%d\nlargest=%d\n"
         "transport-present=%d\ncurl-code=%ld\ntimed-out=%d\n"
-        "tls-verify=0x%08lx\ntls-version=%s\ntls12-retry=%d\n"
+        "tls-verify=0x%08lx\ntls-verify-available=%d\n"
+        "tls-verification-failed=%d\ntls-version=%s\ntls12-retry=%d\n"
         "tls-peer-issuer=%s\nca-bundle-present=%d\n"
         "ca-bundle-version=%u\nca-bundle-bytes=%zu\n"
         "ca-bundle-sha256=%s\n"
@@ -157,7 +162,9 @@ static bool psp_write_failure_report_data(
         (unsigned long long) TILEFINCH_RELEASE_SEQUENCE,
         stage == NULL ? "unknown" : stage, http_status,
         (unsigned) native_result, (unsigned long long) now_us, unix_time,
-        rtc_valid ? 1 : 0, (unsigned) rtc.year, (unsigned) rtc.month,
+        rtc_status == PSP_TIME_OK ? 1 : 0,
+        psp_time_status_name(rtc_status),
+        (unsigned) rtc.year, (unsigned) rtc.month,
         (unsigned) rtc.day, (unsigned) rtc.hour, (unsigned) rtc.minute,
         (unsigned) rtc.second,
         sceKernelTotalFreeMemSize(), sceKernelMaxFreeMemSize(),
@@ -165,6 +172,8 @@ static bool psp_write_failure_report_data(
         diagnostics->transport_code,
         diagnostics->transport_timed_out ? 1 : 0,
         (unsigned long) diagnostics->tls_verify_result,
+        diagnostics->tls_verify_result_available ? 1 : 0,
+        diagnostics->tls_verification_failed ? 1 : 0,
         diagnostics->tls_version[0] == '\0'
             ? "absent" : diagnostics->tls_version,
         diagnostics->tls12_compatibility_retry ? 1 : 0,
@@ -236,6 +245,10 @@ bool psp_write_navigation_failure_report(
         .transport_present = true,
         .transport_code = navigation->last_transport_code,
         .tls_verify_result = navigation->last_tls_verify_result,
+        .tls_verify_result_available =
+            navigation->last_tls_verify_result_available,
+        .tls_verification_failed =
+            navigation->last_tls_verification_failed,
         .transport_timed_out = navigation->last_transport_timed_out,
         .tls12_compatibility_retry =
             navigation->last_tls12_compatibility_retry
@@ -1299,6 +1312,92 @@ typedef struct {
     uint64_t power_transition_ms;
 } PspInteractiveResult;
 
+static TILEFINCH_OUT_OF_LINE bool psp_navigation_suggests_wifi_sign_in(
+    PspInteractiveState *interactive, BrowserNavigationJobStatus status,
+    const NavigationSession *navigation, const char *error,
+    TilefinchTlsGuidance tls_guidance)
+{
+    if (interactive == NULL || navigation == NULL) return false;
+    if (tls_guidance == TILEFINCH_TLS_GUIDANCE_REDIRECTED) return true;
+    bool transport_failure = navigation->last_transport_code != 0
+        || navigation->last_transport_timed_out
+        || (error != NULL
+            && (strstr(error, "background hop") != NULL
+                || strstr(error, "background transport") != NULL));
+    if (status == BROWSER_NAVIGATION_JOB_CANCELLED
+        || navigation->last_http_status != 0 || !transport_failure
+        || tls_guidance != TILEFINCH_TLS_GUIDANCE_NONE) return false;
+    if (interactive->captive_portal_failure_count < 2u)
+        interactive->captive_portal_failure_count++;
+    return interactive->captive_portal_failure_count >= 2u;
+}
+
+static TILEFINCH_OUT_OF_LINE void psp_navigation_present_failure(
+    PspProcessResources *process, PspBrowserResources *browser,
+    PspEngineViews *views, PspInteractiveState *interactive,
+    BrowserNavigationJobStatus status)
+{
+    if (process == NULL || browser == NULL || views == NULL
+        || views->navigation == NULL || interactive == NULL) return;
+    if (status != BROWSER_NAVIGATION_JOB_CANCELLED) {
+        (void) psp_write_navigation_failure_report(
+            "navigation", browser_engine_last_error(browser->engine),
+            process->presentation.ui.url, views->navigation);
+    }
+    char visible_error[PSP_UI_STATUS_CAPACITY];
+    TilefinchTlsGuidance tls_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
+    const char *visible_detail = status == BROWSER_NAVIGATION_JOB_CANCELLED
+        ? "PAGE LOAD STOPPED"
+        : psp_user_visible_error(
+              browser_engine_last_error(browser->engine),
+              views->navigation->last_tls_verify_result,
+              views->navigation->last_tls_verify_result_available,
+              views->navigation->last_tls_verification_failed,
+              &tls_guidance,
+              visible_error, sizeof(visible_error));
+    bool wifi_sign_in = psp_navigation_suggests_wifi_sign_in(
+            interactive, status, views->navigation,
+            browser_engine_last_error(browser->engine),
+            tls_guidance);
+    if (wifi_sign_in) {
+        psp_ui_show_wifi_sign_in_status(
+            &process->presentation.ui,
+            "THIS WI-FI MAY REQUIRE SIGN-IN", 600);
+    } else if (tls_guidance == TILEFINCH_TLS_GUIDANCE_NONE) {
+        psp_ui_show_status(
+            &process->presentation.ui, visible_detail, 300);
+    } else {
+        psp_ui_show_tls_status(
+            &process->presentation.ui, visible_detail, tls_guidance, 300);
+    }
+    if (status != BROWSER_NAVIGATION_JOB_CANCELLED
+        && process->presentation.ui.url[0] != '\0') {
+        snprintf(interactive->lifecycle_retry_url,
+                 sizeof(interactive->lifecycle_retry_url), "%s",
+                 process->presentation.ui.url);
+        interactive->lifecycle_retry_available = true;
+        uint8_t actions = 0u;
+        if (wifi_sign_in) actions |= PSP_UI_FAILURE_WIFI;
+        if (browser_profile_javascript_allowed_for_url(
+                browser->profile, interactive->lifecycle_retry_url))
+            actions |= PSP_UI_FAILURE_DISABLE_JAVASCRIPT;
+        if (youtube_watch_url_supported(
+                interactive->lifecycle_retry_url)) {
+            if (!browser_profile_youtube_audio_only(browser->profile))
+                actions |= PSP_UI_FAILURE_AUDIO_ONLY;
+            if (browser_profile_youtube_quality(browser->profile)
+                    == BROWSER_YOUTUBE_QUALITY_360P)
+                actions |= PSP_UI_FAILURE_LOWER_QUALITY;
+        }
+        psp_ui_show_failure_recovery(
+            &process->presentation.ui, visible_detail, actions);
+    }
+    psp_report_job_failure(
+        "navigation", NULL, (int) status,
+        views->navigation->last_http_status,
+        browser_engine_last_error(browser->engine));
+}
+
 /* Release discovery is an explicit, rare Settings action. Keep its network
    preparation and session replacement out of the resident frame-loop symbol;
    the loop retains only the event gate. */
@@ -1312,6 +1411,12 @@ static TILEFINCH_COLD_PATH bool psp_handle_update_version_intent(
 {
     if (process == NULL || browser == NULL || engine_views == NULL
         || intent == NULL) return false;
+    if (browser_session_captive_portal_active(browser->session)) {
+        psp_ui_show_status(
+            &process->presentation.ui,
+            "UNAVAILABLE DURING WI-FI SIGN-IN", 150);
+        return true;
+    }
     if (intent->update_versions_requested) {
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
         char history_url[256];
@@ -1445,6 +1550,123 @@ static TILEFINCH_OUT_OF_LINE bool psp_advance_page_runtime(
     return browser_engine_advance_runtime(
         app->browser->engine, (unsigned) app->process->config.tick_ms, 2,
         layout_changed);
+}
+
+/* Site-information mutations are deliberate menu operations, never resident
+   frame work. Keep their storage/profile reconciliation out of the Allegrex
+   loop's instruction-cache footprint. */
+static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
+    PspProcessResources *process, PspBrowserResources *browser,
+    PspInteractiveState *interactive, PspEngineViews *engine_views,
+    const PspUiIntent *intent, uint64_t sampled_us, bool *page_dirty)
+{
+    if (process == NULL || browser == NULL || interactive == NULL
+        || engine_views == NULL || intent == NULL || page_dirty == NULL)
+        return;
+    if (intent->clear_cache_requested) {
+        psp_site_data_restore_cancel_mask(
+            &interactive->site_data_restore,
+            BROWSER_SESSION_PERSIST_CACHE);
+        (void) browser_session_persistence_clear(
+            browser->session, BROWSER_SESSION_PERSIST_CACHE);
+        /* Resumption blobs are credentials, not an independent hidden
+           cache. The user's cache-clear operation erases both stores. */
+        (void) fetch_tls_session_store_clear();
+        BrowserSessionPersistenceStatus status =
+            process->persistent_site_data_available
+                ? browser_session_persistence_remove(
+                      process->storage.persistent_cache)
+                : BROWSER_SESSION_PERSISTENCE_OK;
+        psp_ui_show_status(
+            &process->presentation.ui,
+            status == BROWSER_SESSION_PERSISTENCE_OK
+                ? "HTTP CACHES CLEARED"
+                : "CACHE FILE COULD NOT BE CLEARED",
+            240);
+        return;
+    }
+    if (intent->clear_cookies_requested) {
+        browser_session_cookie_clear(browser->session);
+        psp_ui_show_status(
+            &process->presentation.ui, "COOKIES CLEARED", 180);
+        return;
+    }
+    if (intent->clear_local_storage_requested) {
+        psp_site_data_restore_cancel_mask(
+            &interactive->site_data_restore,
+            BROWSER_SESSION_PERSIST_LOCAL_STORAGE);
+        (void) browser_session_persistence_clear(
+            browser->session, BROWSER_SESSION_PERSIST_LOCAL_STORAGE);
+        BrowserSessionPersistenceStatus status =
+            process->persistent_site_data_available
+                ? browser_session_persistence_remove(
+                      process->storage.local_storage)
+                : BROWSER_SESSION_PERSISTENCE_OK;
+        psp_ui_show_status(
+            &process->presentation.ui,
+            status == BROWSER_SESSION_PERSISTENCE_OK
+                ? "LOCAL STORAGE CLEARED"
+                : "LOCAL FILE COULD NOT BE CLEARED",
+            240);
+        return;
+    }
+    if (intent->clear_session_storage_requested) {
+        browser_session_storage_clear_all(browser->session, false);
+        psp_ui_show_status(
+            &process->presentation.ui, "SESSION STORAGE CLEARED", 180);
+        return;
+    }
+    char site_url[NAVIGATION_URL_LIMIT];
+    snprintf(site_url, sizeof(site_url), "%s", process->presentation.ui.url);
+    if (intent->clear_site_data_requested) {
+        bool cleared = browser_session_clear_site_data(
+            browser->session, site_url);
+        if (cleared) {
+            /* Persisted snapshots are rewritten from the now-cleared
+               in-memory authority at ordinary shutdown; no extra stick
+               write is introduced by opening Site information. */
+            psp_sync_ui(
+                &process->presentation.ui, browser->engine,
+                browser->profile);
+        }
+        psp_ui_show_status(
+            &process->presentation.ui,
+            cleared ? "SITE DATA CLEARED"
+                    : "SITE DATA COULD NOT BE CLEARED",
+            240);
+        return;
+    }
+    bool reset = browser_profile_reset_site_permissions(
+            browser->profile, site_url)
+        && browser_session_set_mixed_content_site_allowed(
+            browser->session, site_url, false)
+        && browser_session_set_third_party_cookie_site_allowed(
+            browser->session, site_url, false)
+        && psp_content_blocker_apply_allowed_sites(
+            browser->engine, browser->profile);
+    if (reset) {
+        (void) browser_engine_set_javascript_enabled(
+            browser->engine,
+            browser_profile_javascript_enabled(browser->profile));
+        psp_profile_store_mark_dirty(&browser->profile_store, sampled_us);
+        const NavigationEntry *entry =
+            navigation_current(engine_views->navigation);
+        (void) psp_set_presentation_css(
+            browser->engine, &process->presentation.ui,
+            browser->profile, process->presentation.ui.reader_mode,
+            entry == NULL ? site_url : entry->url,
+            process->presentation.ui.page_font_percent, true);
+        (void) psp_engine_views_refresh(engine_views, browser->engine);
+        *page_dirty = true;
+        psp_sync_ui(
+            &process->presentation.ui, browser->engine,
+            browser->profile);
+    }
+    psp_ui_show_status(
+        &process->presentation.ui,
+        reset ? "SITE PERMISSIONS RESET"
+              : "SITE PERMISSIONS COULD NOT RESET",
+        240);
 }
 
 /* The resident frame loop. It borrows physical owners and returns only
@@ -2485,6 +2707,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     process->storage.tab_hibernation);
                 psp_tabs_sync_ui(&process->presentation.ui, browser->tabs, &process->presentation.tab_view);
             }
+            psp_captive_portal_navigation_settled(
+                &app, &frame, false, true);
             navigation_visual_changed = true;
             input.pressed &= ~PSP_UI_BUTTON_CANCEL;
             psp_log_operation_end(
@@ -2643,8 +2867,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             }
         }
         bool voice_component_visual_changed =
-            psp_voice_component_handle_frame(
-                &app, &intent, frame.ui_sample_us);
+            psp_app_background_handle_frame(
+                &app, &frame, &intent, frame.ui_sample_us);
         bool glyph_component_visual_changed =
             psp_glyph_component_handle_frame(
                 &app, &intent, frame.ui_sample_us);
@@ -3022,54 +3246,15 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 imported.resident_full ? "yes" : "no",
                 imported.truncated ? "yes" : "no");
         }
-        if (intent.clear_cache_requested) {
-            psp_site_data_restore_cancel_mask(
-                &interactive->site_data_restore,
-                BROWSER_SESSION_PERSIST_CACHE);
-            (void) browser_session_persistence_clear(
-                browser->session, BROWSER_SESSION_PERSIST_CACHE);
-            /* The TLS session store holds resumption secrets, so CLEAR
-               HTTP CACHES erases it too (README privacy note). */
-            (void) fetch_tls_session_store_clear();
-            BrowserSessionPersistenceStatus clear_status =
-                process->persistent_site_data_available
-                    ? browser_session_persistence_remove(
-                          process->storage.persistent_cache)
-                    : BROWSER_SESSION_PERSISTENCE_OK;
-            psp_ui_show_status(
-                &process->presentation.ui,
-                clear_status == BROWSER_SESSION_PERSISTENCE_OK
-                    ? "HTTP CACHES CLEARED"
-                    : "CACHE FILE COULD NOT BE CLEARED",
-                240);
-        }
-        if (intent.clear_cookies_requested) {
-            browser_session_cookie_clear(browser->session);
-            psp_ui_show_status(&process->presentation.ui, "COOKIES CLEARED", 180);
-        }
-        if (intent.clear_local_storage_requested) {
-            psp_site_data_restore_cancel_mask(
-                &interactive->site_data_restore,
-                BROWSER_SESSION_PERSIST_LOCAL_STORAGE);
-            (void) browser_session_persistence_clear(
-                browser->session, BROWSER_SESSION_PERSIST_LOCAL_STORAGE);
-            BrowserSessionPersistenceStatus clear_status =
-                process->persistent_site_data_available
-                    ? browser_session_persistence_remove(
-                          process->storage.local_storage)
-                    : BROWSER_SESSION_PERSISTENCE_OK;
-            psp_ui_show_status(
-                &process->presentation.ui,
-                clear_status == BROWSER_SESSION_PERSISTENCE_OK
-                    ? "LOCAL STORAGE CLEARED"
-                    : "LOCAL FILE COULD NOT BE CLEARED",
-                240);
-        }
-        if (intent.clear_session_storage_requested) {
-            browser_session_storage_clear_all(browser->session, false);
-            psp_ui_show_status(
-                &process->presentation.ui, "SESSION STORAGE CLEARED", 180);
-        }
+        if (intent.clear_cache_requested
+            || intent.clear_cookies_requested
+            || intent.clear_local_storage_requested
+            || intent.clear_session_storage_requested
+            || intent.clear_site_data_requested
+            || intent.reset_site_permissions_requested)
+            psp_apply_storage_and_site_intent(
+                process, browser, interactive, engine_views, &intent,
+                frame.ui_sample_us, &frame.page_dirty);
 
         if (intent.scroll_delta != 0) {
             bool log_scroll = (scroll_log_counter++ & 31u) == 0;
@@ -3176,6 +3361,10 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             }
             if (navigation_status
                     != BROWSER_NAVIGATION_JOB_PENDING) {
+                bool isolated_portal_navigation =
+                    browser->session != NULL
+                    && browser_session_captive_portal_active(
+                           browser->session);
                 ContentBlockerMetrics blocker_metrics = {0};
                 size_t page_blocked = 0;
                 if (browser_engine_content_blocker_metrics(
@@ -3204,6 +3393,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                         ? 1000 : 0);
                 if (navigation_status
                         == BROWSER_NAVIGATION_JOB_SUCCEEDED) {
+                    interactive->captive_portal_failure_count = 0;
                     interactive->lifecycle_retry_available = false;
                     process->presentation.ui.page_requests_blocked =
                         page_blocked > UINT32_MAX
@@ -3236,21 +3426,24 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     }
                     psp_tabs_sync_ui(&process->presentation.ui, browser->tabs, &process->presentation.tab_view);
                     frame.page_dirty = true;
-                    psp_profile_record_current(
-                        browser->profile, &browser->profile_store, engine_views->navigation,
-                        frame.ui_sample_us);
-                    if (psp_recovery_record_current(
-                            browser->profile, process->storage.recovery, engine_views->navigation)) {
-                        interactive->recovery.entry =
-                            navigation_current(engine_views->navigation);
-                        interactive->recovery.observed_scroll =
-                            interactive->recovery.entry == NULL
-                                ? 0 : interactive->recovery.entry->scroll_y;
-                        interactive->recovery.observed_generation =
-                            engine_views->navigation->generation;
-                        interactive->recovery.last_change_us =
-                            (uint64_t) sceKernelGetSystemTimeWide();
-                        interactive->recovery.dirty = false;
+                    if (!isolated_portal_navigation) {
+                        psp_profile_record_current(
+                            browser->profile, &browser->profile_store,
+                            engine_views->navigation, frame.ui_sample_us);
+                        if (psp_recovery_record_current(
+                            browser->profile, process->storage.recovery,
+                            engine_views->navigation)) {
+                            interactive->recovery.entry =
+                                navigation_current(engine_views->navigation);
+                            interactive->recovery.observed_scroll =
+                                interactive->recovery.entry == NULL
+                                    ? 0 : interactive->recovery.entry->scroll_y;
+                            interactive->recovery.observed_generation =
+                                engine_views->navigation->generation;
+                            interactive->recovery.last_change_us =
+                                (uint64_t) sceKernelGetSystemTimeWide();
+                            interactive->recovery.dirty = false;
+                        }
                     }
                     char ready_status[PSP_UI_STATUS_CAPACITY];
                     if (page_blocked != 0) {
@@ -3277,42 +3470,16 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                             process->storage.tab_hibernation);
                         psp_tabs_sync_ui(&process->presentation.ui, browser->tabs, &process->presentation.tab_view);
                     }
-                    if (navigation_status
-                            != BROWSER_NAVIGATION_JOB_CANCELLED) {
-                        (void) psp_write_navigation_failure_report(
-                            "navigation",
-                            browser_engine_last_error(browser->engine), process->presentation.ui.url,
-                            engine_views->navigation);
-                    }
-                    char visible_error[PSP_UI_STATUS_CAPACITY];
-                    TilefinchTlsGuidance tls_guidance =
-                        TILEFINCH_TLS_GUIDANCE_NONE;
-                    const char *visible_detail =
-                        navigation_status == BROWSER_NAVIGATION_JOB_CANCELLED
-                            ? "PAGE LOAD STOPPED"
-                            : psp_user_visible_error(
-                                  browser_engine_last_error(browser->engine),
-                                  engine_views->navigation
-                                      ->last_tls_verify_result,
-                                  &tls_guidance,
-                                  visible_error, sizeof(visible_error));
-                    if (tls_guidance == TILEFINCH_TLS_GUIDANCE_NONE) {
-                        psp_ui_show_status(
-                            &process->presentation.ui, visible_detail, 300);
-                    } else {
-                        psp_ui_show_tls_status(
-                            &process->presentation.ui, visible_detail,
-                            tls_guidance, 300);
-                    }
-                    /* Keep the actionable failure in its own bounded
-                       record. The attribution line below intentionally
-                       carries many counters and may be truncated by the
-                       fixed-size device logger before its tail. */
-                    psp_report_job_failure(
-                        "navigation", NULL, (int) navigation_status,
-                        engine_views->navigation->last_http_status,
-                        browser_engine_last_error(browser->engine));
+                    psp_navigation_present_failure(
+                        process, browser, engine_views, interactive,
+                        navigation_status);
                 }
+                psp_captive_portal_navigation_settled(
+                    &app, &frame,
+                    navigation_status
+                        == BROWSER_NAVIGATION_JOB_SUCCEEDED,
+                    navigation_status
+                        == BROWSER_NAVIGATION_JOB_CANCELLED);
                 printf("tilefinch-navigation-job: status=%d "
                        "http=%ld server=\"%.32s\" mitigated=\"%.16s\" "
                        "pumps=%zu body=%zuB yields=%zu "
@@ -3517,6 +3684,18 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 offline_library_find(
                     &browser->offline_store.library,
                     remains_active ? remaining_id : offline_download_id);
+            if (process->presentation.ui.screen
+                    == PSP_UI_SCREEN_COLLECTIONS
+                && process->presentation.ui.collections_section
+                    == PSP_UI_COLLECTION_DOWNLOADS) {
+                psp_collections_sync_ui(
+                    &process->presentation.ui,
+                    &process->presentation.collections_surface,
+                    browser->profile,
+                    &browser->offline_store.library,
+                    &browser->offline_store.download,
+                    PSP_UI_COLLECTION_DOWNLOADS);
+            }
             int progress = -1;
             if (download_item != NULL) {
                 uint64_t total = download_item->content_bytes
@@ -4347,6 +4526,16 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
     fetch_preconnect_cancel("shutdown");
 #endif
 
+    /* A portal tab and its temporary cookie/storage tables are never part of
+       session persistence. Restore the ordinary context before any save. */
+    PspApp portal_cleanup_app = {
+        .process = process,
+        .browser = browser,
+        .views = engine_views,
+        .interactive = interactive
+    };
+    psp_captive_portal_destroy(&portal_cleanup_app);
+
     screenshot_png_cancel(&interactive->screenshot.writer);
     budget_free(browser->budget, interactive->screenshot.pixels);
     interactive->screenshot.pixels = NULL;
@@ -4950,18 +5139,20 @@ int main(int argc, char *argv[])
             printf("tilefinch-network: trust bundle configuration failed\n");
             goto sleep_forever;
         }
-        time_t tls_time = time(NULL);
-        if (tls_time <= 0) {
-            printf("tilefinch-network: RTC unavailable for TLS\n");
+        time_t tls_time = 0;
+        PspTimeFields rtc = {0};
+        PspTimeStatus rtc_status = psp_time_read_utc_fields(
+            &rtc, &tls_time);
+        if (rtc_status != PSP_TIME_OK) {
+            printf("tilefinch-network: RTC unavailable for TLS status=%s\n",
+                   psp_time_status_name(rtc_status));
             goto sleep_forever;
         }
-        ScePspDateTime rtc = {0};
-        int rtc_result = sceRtcGetCurrentClock(&rtc, 0);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         printf("tilefinch-network: trust-bytes=%zu trust-sha256="
                "%02x%02x%02x%02x%02x%02x%02x%02x "
                "verification=required utc-epoch=%ld "
-               "rtc=%04u-%02u-%02uT%02u:%02u:%02uZ rtc-result=0x%08x "
+               "rtc=%04u-%02u-%02uT%02u:%02u:%02uZ rtc-status=%s "
                "curl=%s tls=%s http2=%s http2-enabled=%u\n",
                ca_bundle_bytes,
                ca_bundle_digest[0], ca_bundle_digest[1],
@@ -4970,7 +5161,7 @@ int main(int argc, char *argv[])
                ca_bundle_digest[6], ca_bundle_digest[7],
                (long) tls_time, rtc.year, rtc.month, rtc.day,
                rtc.hour, rtc.minute, rtc.second,
-               (unsigned) rtc_result,
+               psp_time_status_name(rtc_status),
                fetch_transport_version(),
                fetch_transport_tls_version(),
                fetch_transport_http2_version(),
@@ -4982,9 +5173,8 @@ int main(int argc, char *argv[])
          * allocating, and hashing the entire file before a local homepage
          * that does not need transport. Validation builds retain that
          * diagnostic so device reports still attest to the copied asset.
-         */
+        */
         (void) rtc;
-        (void) rtc_result;
 #endif
         psp_log_checkpoint("tls-assets-ready");
 #else
@@ -5921,7 +6111,7 @@ int main(int argc, char *argv[])
 report:
     psp_log_set_phase(PSP_LOG_PHASE_REPORT);
     printf("tilefinch-psp-script: total-elapsed=%llums height=%d links=%zu "
-           "glyph-scripts=0x%02x budget=%zu peak=%zu\n",
+           "glyph-scripts=0x%04x budget=%zu peak=%zu\n",
            (unsigned long long) (((uint64_t) sceKernelGetSystemTimeWide()
                                   - load_started_us) / 1000u),
            engine_views.navigation->page.layout.height,

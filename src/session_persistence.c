@@ -499,6 +499,7 @@ BrowserSessionPersistenceStatus browser_session_persistence_save(
     BrowserSessionPersistenceLimits limits;
     char temporary[PERSIST_PATH_BYTES], backup[PERSIST_PATH_BYTES];
     if (session == NULL || session->budget == NULL
+        || browser_session_captive_portal_active(session)
         || mask == 0 || (mask & ~BROWSER_SESSION_PERSIST_ALL) != 0
         || !effective_limits(requested_limits, &limits)
         || !make_path(path, ".tmp", temporary)

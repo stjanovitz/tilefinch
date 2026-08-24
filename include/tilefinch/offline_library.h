@@ -13,6 +13,7 @@
 #define OFFLINE_LIBRARY_DIRECTORY_LIMIT 768u
 #define OFFLINE_LIBRARY_TITLE_LIMIT 128u
 #define OFFLINE_LIBRARY_URL_LIMIT 1024u
+#define OFFLINE_LIBRARY_FAILURE_LIMIT 128u
 #define OFFLINE_LIBRARY_INDEX_LIMIT (32u * 1024u)
 #define OFFLINE_LIBRARY_ARTICLE_LIMIT (1024u * 1024u)
 
@@ -36,6 +37,7 @@ typedef struct {
     char title[OFFLINE_LIBRARY_TITLE_LIMIT];
     char source_url[OFFLINE_LIBRARY_URL_LIMIT];
     char video_id[YOUTUBE_VIDEO_ID_CAPACITY];
+    char failure_reason[OFFLINE_LIBRARY_FAILURE_LIMIT];
     uint64_t content_bytes;
     uint64_t audio_bytes;
     uint64_t downloaded_bytes;

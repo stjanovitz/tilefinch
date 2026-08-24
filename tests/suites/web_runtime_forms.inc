@@ -217,10 +217,18 @@
     CHECK(budget.current == 0);
 
     puts("test: bounded Canvas 2D paths, transforms, pixels, and PNG");
+    FontSet canvas_fonts = {0};
+    CHECK(font_set_load(
+        &canvas_fonts, &budget, TILEFINCH_TEST_SANS_FONT,
+        TILEFINCH_TEST_SERIF_FONT, TILEFINCH_TEST_SANS_ITALIC_FONT,
+        TILEFINCH_TEST_SANS_BOLD_FONT, TILEFINCH_TEST_SERIF_BOLD_FONT,
+        TILEFINCH_TEST_METRIC_SANS_FONT,
+        TILEFINCH_TEST_METRIC_SANS_BOLD_FONT, 2 * MIB));
     static const char canvas_page[] =
         "<!doctype html><body><script>"
         "const canvas=document.createElement('canvas');canvas.width=32;"
-        "canvas.height=16;const context=canvas.getContext('2d');"
+        "canvas.height=16;document.body.appendChild(canvas);"
+        "const context=canvas.getContext('2d');"
         "context.fillStyle='#ff0000';context.fillRect(0,0,8,8);"
         "context.save();context.translate(8,0);context.fillStyle='#0000ff';"
         "context.fillRect(0,0,8,8);context.restore();"
@@ -254,10 +262,126 @@
         "&&copied.data.join(',')==='255,0,0,255'"
         "&&dataURL.startsWith('data:image/png;base64,')"
         "&&png.charCodeAt(0)===137&&png.slice(1,4)==='PNG';"
+        "const advanced=document.createElement('canvas');advanced.width=64;"
+        "advanced.height=40;document.body.appendChild(advanced);"
+        "const draw=advanced.getContext('2d');"
+        "draw.font='bold 16px sans-serif';const narrow=draw.measureText('III'),"
+        "wide=draw.measureText('WWW');draw.fillStyle='white';"
+        "draw.fillText('W',1,17);let glyphInk=0;for(const value of "
+        "draw.getImageData(0,0,20,20).data.filter((_,i)=>i%4===3))"
+        "if(value)glyphInk++;draw.save();draw.beginPath();draw.roundRect(24,1,16,14,4);"
+        "draw.clip();draw.fillStyle='red';draw.beginPath();draw.rect(20,0,24,20);"
+        "draw.fill();"
+        "const clippedOut=draw.getImageData(23,1,1,1).data[3],"
+        "clippedIn=draw.getImageData(28,5,1,1).data[3];draw.restore();"
+        "const boundedClip=document.createElement('canvas');boundedClip.width=8;"
+        "boundedClip.height=8;const bounded=boundedClip.getContext('2d');"
+        "for(let i=0;i<5;i++){bounded.beginPath();bounded.moveTo(0,0);"
+        "bounded.lineTo(8,0);bounded.lineTo(4,8);bounded.closePath();bounded.clip();}"
+        "bounded.fillRect(0,0,8,8);const fifthClipEmpty="
+        "bounded.getImageData(4,2,1,1).data[3]===0;"
+        "const sprite=document.createElement('canvas');sprite.width=2;"
+        "sprite.height=1;const spriteContext=sprite.getContext('2d');"
+        "spriteContext.fillStyle='red';spriteContext.fillRect(0,0,1,1);"
+        "spriteContext.fillStyle='blue';spriteContext.fillRect(1,0,1,1);"
+        "draw.imageSmoothingEnabled=true;draw.drawImage(sprite,0,0,2,1,0,24,3,1);"
+        "const smooth=draw.getImageData(1,24,1,1).data;"
+        "draw.imageSmoothingEnabled=false;draw.drawImage(sprite,0,0,2,1,0,26,4,1);"
+        "const nearestLeft=draw.getImageData(0,26,1,1).data,"
+        "nearestRight=draw.getImageData(3,26,1,1).data;"
+        "draw.beginPath();draw.moveTo(46,4);draw.arcTo(58,4,58,16,5);"
+        "draw.lineTo(58,16);draw.lineWidth=4;draw.lineCap='round';"
+        "draw.lineJoin='round';draw.miterLimit=8;draw.setLineDash([3,2]);"
+        "draw.strokeStyle='lime';draw.stroke();const strokeHit="
+        "draw.isPointInStroke(47,4),dashProbe=new Path2D;"
+        "dashProbe.moveTo(0,38);dashProbe.lineTo(20,38);draw.setLineDash([4,4]);"
+        "const dashOn=draw.isPointInStroke(dashProbe,2,38),"
+        "dashOff=draw.isPointInStroke(dashProbe,6,38);let captured=0,capturedMoves=0;"
+        "const captureOther=document.createElement('div');"
+        "document.body.appendChild(captureOther);advanced.addEventListener("
+        "'gotpointercapture',()=>captured++);advanced.addEventListener("
+        "'lostpointercapture',()=>captured++);advanced.addEventListener("
+        "'pointermove',event=>{if(event.pointerId===1&&Number.isFinite("
+        "event.offsetX)&&Number.isFinite(event.offsetY))capturedMoves++;});"
+        "advanced.setPointerCapture(1);__tilefinchDispatchActivationHandle("
+        "captureOther.__handle,1,10,12,0,0,1);"
+        "advanced.releasePointerCapture(1);const advancedOk=wide.width>narrow.width"
+        "&&wide.actualBoundingBoxAscent>0&&glyphInk>8&&glyphInk<300"
+        "&&clippedOut===0&&clippedIn===255&&fifthClipEmpty"
+        "&&smooth[0]>0&&smooth[2]>0"
+        "&&nearestLeft[0]===255&&nearestLeft[2]===0"
+        "&&nearestRight[0]===0&&nearestRight[2]===255"
+        "&&strokeHit&&dashOn&&!dashOff&&draw.getLineDash().join(',')==='4,4'"
+        "&&draw.miterLimit===8&&captured===2&&capturedMoves===1;"
+        "const diagnosticBefore="
+        "{...__tilefinchCanvasDiagnostics};for(let i=0;i<130;i++)"
+        "draw.fillRect(i%64,30+(i%8),1,1);draw.getImageData(0,30,1,1);"
+        "const rectangleBatchOk=__tilefinchCanvasDiagnostics.rectangleCommands"
+        "-diagnosticBefore.rectangleCommands===130&&"
+        "__tilefinchCanvasDiagnostics.rectangleBatches"
+        "-diagnosticBefore.rectangleBatches===3;const imageBefore="
+        "{...__tilefinchCanvasDiagnostics};for(let i=0;i<18;i++)"
+        "draw.drawImage(sprite,40,30,2,1);draw.getImageData(40,30,1,1);"
+        "const imageBatchOk=__tilefinchCanvasDiagnostics.imageCommands"
+        "-imageBefore.imageCommands===18&&__tilefinchCanvasDiagnostics.imageBatches"
+        "-imageBefore.imageBatches===2;"
+        "const paintCanvas=document.createElement('canvas');paintCanvas.width=64;"
+        "paintCanvas.height=24;const paint=paintCanvas.getContext('2d'),paintBefore="
+        "{...__tilefinchCanvasDiagnostics};paint.beginPath();paint.rect(1,1,8,8);"
+        "paint.fill();paint.font='10px sans-serif';paint.fillText('A',12,10);"
+        "paint.beginPath();paint.moveTo(24,2);paint.lineTo(32,10);paint.stroke();"
+        "paint.strokeText('B',36,10);paint.getImageData(0,0,1,1);"
+        "const paintBatchOk=__tilefinchCanvasDiagnostics.paintCommands"
+        "-paintBefore.paintCommands===4&&__tilefinchCanvasDiagnostics.paintBatches"
+        "-paintBefore.paintBatches===1&&__tilefinchCanvasDiagnostics.pathRasters"
+        "-paintBefore.pathRasters===2&&__tilefinchCanvasDiagnostics.textRasters"
+        "-paintBefore.textRasters===2;"
+        "const svgCanvas=document.createElement('canvas');svgCanvas.width=40;"
+        "svgCanvas.height=16;const svg=svgCanvas.getContext('2d'),"
+        "svgPath=new Path2D('M1 1h8v8h-8z'),movedPath=new Path2D;"
+        "movedPath.addPath(svgPath,new DOMMatrix({a:1,b:0,c:0,d:1,e:12,f:0}));"
+        "svg.fillStyle='rgb(0,255,0)';svg.fill(svgPath);svg.fill(movedPath);"
+        "const svgFirst=svg.getImageData(4,4,1,1).data,"
+        "svgMoved=svg.getImageData(16,4,1,1).data,"
+        "svgPathOk=svgFirst[1]===255&&svgMoved[1]===255"
+        "&&svg.isPointInPath(svgPath,4,4)&&svg.isPointInPath(movedPath,16,4);"
+        "const curveTextCanvas=document.createElement('canvas'),"
+        "curveApiCanvas=document.createElement('canvas');curveTextCanvas.width="
+        "curveApiCanvas.width=48;curveTextCanvas.height=curveApiCanvas.height=24;"
+        "const curveTextContext=curveTextCanvas.getContext('2d'),"
+        "curveApiContext=curveApiCanvas.getContext('2d'),curveText=new Path2D("
+        "'M2 12Q6 2 10 12T18 12C20 2 24 2 26 12S32 22 34 12M36 12A4 4 0 0 1 44 12'),"
+        "curveApi=new Path2D;curveApi.moveTo(2,12);"
+        "curveApi.quadraticCurveTo(6,2,10,12);"
+        "curveApi.quadraticCurveTo(14,22,18,12);"
+        "curveApi.bezierCurveTo(20,2,24,2,26,12);"
+        "curveApi.bezierCurveTo(28,22,32,22,34,12);curveApi.moveTo(36,12);"
+        "curveApi.ellipse(40,12,4,4,0,Math.PI,Math.PI*2);"
+        "curveTextContext.strokeStyle=curveApiContext.strokeStyle='white';"
+        "curveTextContext.stroke(curveText);curveApiContext.stroke(curveApi);"
+        "const curveTextPixels=curveTextContext.getImageData(0,0,48,24).data,"
+        "curveApiPixels=curveApiContext.getImageData(0,0,48,24).data;"
+        "let svgCurveOk=true;for(let i=0;i<curveTextPixels.length;i++)"
+        "if(curveTextPixels[i]!==curveApiPixels[i]){svgCurveOk=false;break;}"
+        "const shadowCanvas=document.createElement('canvas');shadowCanvas.width=24;"
+        "shadowCanvas.height=12;const shadow=shadowCanvas.getContext('2d'),"
+        "shadowBefore={...__tilefinchCanvasDiagnostics};shadow.fillStyle='red';"
+        "shadow.shadowColor='rgb(0,255,0)';shadow.shadowOffsetX=8;"
+        "shadow.fillRect(1,1,4,4);const shadowSource="
+        "shadow.getImageData(2,2,1,1).data,shadowPixel="
+        "shadow.getImageData(10,2,1,1).data,shadowOk=shadowSource[0]===255"
+        "&&shadowSource[1]===0&&shadowPixel[0]===0&&shadowPixel[1]===255"
+        "&&__tilefinchCanvasDiagnostics.shadowCommands"
+        "-shadowBefore.shadowCommands===1;"
         "canvas.toBlob(blob=>blob.arrayBuffer().then(buffer=>{"
         "const bytes=new Uint8Array(buffer);globalThis.pocSummary="
-        "syncOk&&blob.type==='image/png'&&bytes[0]===137?"
-        "'canvas:ok':'canvas:fail';}));"
+        "syncOk&&advancedOk&&rectangleBatchOk&&imageBatchOk&&paintBatchOk"
+        "&&svgPathOk&&svgCurveOk&&shadowOk&&blob.type==='image/png'"
+        "&&bytes[0]===137?"
+        "'canvas:ok':'canvas:fail:'+"
+        "[syncOk,advancedOk,rectangleBatchOk,imageBatchOk,paintBatchOk,svgPathOk,"
+        "svgCurveOk,shadowOk,blob.type,bytes[0],"
+        "strokeHit,dashOn,dashOff,draw.getLineDash().join(',')].join('|');}));"
         "</script></body>";
     NavigationSession canvas_navigation;
     CHECK(navigation_init(&canvas_navigation, &budget, 2));
@@ -266,7 +390,7 @@
     CHECK(navigation_commit_html(
         &canvas_navigation, canvas_generation,
         "https://canvas.test/", canvas_page, strlen(canvas_page),
-        480, NULL, NULL, true));
+        480, &canvas_fonts, NULL, true));
     for (size_t tick = 0;
          tick < 16
          && strcmp(canvas_navigation.page.script_result.summary,
@@ -285,6 +409,7 @@
           && canvas_navigation.page.script_result
                  .bootstrap_lazy_module_failures == 0);
     navigation_destroy(&canvas_navigation);
+    font_set_destroy(&canvas_fonts);
     CHECK(budget.current == 0);
 
     puts("test: bounded native input widgets and controller defaults");
@@ -1069,6 +1194,42 @@
           && split_sheet.diagnostic_selector_drops >= 1u);
     stylesheet_destroy(&split_sheet);
     document_destroy(&split_document);
+    CHECK(budget.current == 0);
+
+    puts("test: bounded selector admission retains attribute-only rules");
+    PocDocument attribute_document;
+    Stylesheet attribute_sheet;
+    CHECK(document_parse(
+              &attribute_document, &budget,
+              "<!doctype html><div id=attribute data-probe></div>",
+              strlen("<!doctype html><div id=attribute data-probe></div>"),
+              17)
+          && stylesheet_build(
+                 &attribute_sheet, &budget, &attribute_document, 480));
+    size_t attribute_start = attribute_sheet.count;
+    uint32_t empty_bloom[2] = {0};
+    attribute_sheet.source_rule_head_limit_end = attribute_start;
+    attribute_sheet.source_rule_relevant_limit_end = attribute_start + 1u;
+    attribute_sheet.source_rule_limit_end = attribute_start + 1u;
+    attribute_sheet.source_rule_token_bloom = empty_bloom;
+    attribute_sheet.source_rule_token_bloom_words = 2u;
+    CHECK(stylesheet_add_css(
+              &attribute_sheet, "[data-probe]{padding-left:11px}",
+              strlen("[data-probe]{padding-left:11px}")));
+    attribute_sheet.source_rule_limit_end = 0;
+    attribute_sheet.source_rule_head_limit_end = 0;
+    attribute_sheet.source_rule_relevant_limit_end = 0;
+    attribute_sheet.source_rule_token_bloom = NULL;
+    attribute_sheet.source_rule_token_bloom_words = 0;
+    lxb_dom_node_t *attribute = find_id(
+        lxb_dom_interface_node(attribute_document.html), "attribute");
+    ComputedStyle attribute_style = style_for_node(
+        &attribute_sheet, attribute, NULL);
+    CHECK(attribute != NULL
+          && attribute_sheet.count == attribute_start + 1u
+          && attribute_style.padding.left == 11);
+    stylesheet_destroy(&attribute_sheet);
+    document_destroy(&attribute_document);
     CHECK(budget.current == 0);
 
     puts("test: exhausted author realm reveals unresolved component light DOM");

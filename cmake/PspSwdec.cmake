@@ -79,6 +79,7 @@ add_custom_command(
         "${_swdec_source}/swdec.c"
         "${_swdec_source}/swdec.h"
         "${_swdec_source}/swdec_bounds.h"
+        "${_swdec_source}/swdec_csc_mask.h"
         "${_swdec_source}/swdec_arena.c"
         "${_swdec_source}/swdec_arena.h"
         "${_swdec_source}/swdec_me.c"

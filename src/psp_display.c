@@ -182,6 +182,12 @@ bool psp_display_video_begin(PspDisplay *display)
      * describes means the panel keeps showing the last complete 16-bit frame
      * until a complete 32-bit one replaces it.
      */
+    /* Page mode has three rotation values while video has two.  Normalize
+       before the two-way XOR rotation: leaving video maps video slot 0 to
+       page slot 0 and video slot 1 to page slot 2.  Carrying page index 2
+       into the XOR would produce index 3 and make video_end() reassert page
+       slot 2 even though the displayed video front was slot 0. */
+    display->back_buffer %= PSP_DISPLAY_VIDEO_BUFFER_COUNT;
     display->surface = PSP_DISPLAY_SURFACE_RGBA8888;
     display->surface_entries++;
     return true;

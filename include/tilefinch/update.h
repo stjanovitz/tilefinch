@@ -131,6 +131,15 @@ typedef struct {
 const char *tilefinch_update_status_name(TilefinchUpdateStatus status);
 bool tilefinch_update_query_free_space(
     const char *directory, uint64_t *available);
+typedef bool (*TilefinchUpdateSpaceQuery)(
+    void *opaque, const char *path, uint64_t *blocks_available,
+    uint64_t *fragment_size, uint64_t *block_size);
+/* Injectable filesystem-stat seam used by host fault tests. The production
+   wrapper below supplies statvfs without assigning sentinel meanings to any
+   valid fsblkcnt_t value. */
+bool tilefinch_update_query_free_space_with(
+    const char *directory, uint64_t *available,
+    TilefinchUpdateSpaceQuery query, void *opaque);
 bool tilefinch_update_key_id(
     const uint8_t public_point[65], uint8_t output[32]);
 bool tilefinch_update_signature_is_low_s(const uint8_t signature[64]);

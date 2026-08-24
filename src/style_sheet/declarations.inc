@@ -1965,6 +1965,9 @@ static bool collect_custom_rules(Stylesheet *sheet, const char *selector,
         "hyphens", "tab-size", "font-kerning", "text-rendering",
         "contain-intrinsic-size",
         "translate", "rotate", "scale", "isolation", "mix-blend-mode",
+        "backface-visibility", "transform-style", "color-scheme",
+        "border-image", "border-image-source", "border-image-slice",
+        "border-image-width", "border-image-outset", "border-image-repeat",
         "backdrop-filter", "-webkit-backdrop-filter",
         "border-start-start-radius", "border-start-end-radius",
         "border-end-start-radius", "border-end-end-radius"
@@ -2012,6 +2015,12 @@ static bool collect_custom_rules(Stylesheet *sheet, const char *selector,
                 && name[0] == '-' && name[1] == '-';
             const char *stored_name = name;
             size_t stored_name_length = name_length;
+            if (!retained
+                && span_case_equal(name, name_length, "color-scheme")) {
+                retained = true;
+                stored_name = "color-scheme";
+                stored_name_length = sizeof("color-scheme") - 1u;
+            }
             if (!retained) {
                 const char *canonical = retained_presentation_property(
                     name, name_length);
@@ -2071,7 +2080,7 @@ static bool collect_custom_rules(Stylesheet *sheet, const char *selector,
                 sheet->has_scroll_interaction_rules = true;
             }
             if (retained) {
-                uint16_t modern = 0;
+                uint32_t modern = 0;
                 if (span_case_equal(stored_name, stored_name_length,
                                     "user-select")
                     || span_case_equal(stored_name, stored_name_length,
@@ -2136,6 +2145,19 @@ static bool collect_custom_rules(Stylesheet *sheet, const char *selector,
                 } else if (span_case_equal(stored_name, stored_name_length,
                                            "mix-blend-mode")) {
                     modern = STYLE_MODERN_MIX_BLEND;
+                } else if (span_case_equal(stored_name, stored_name_length,
+                                           "backface-visibility")) {
+                    modern = STYLE_MODERN_BACKFACE_VISIBILITY;
+                } else if (span_case_equal(stored_name, stored_name_length,
+                                           "transform-style")) {
+                    modern = STYLE_MODERN_TRANSFORM_STYLE;
+                } else if (span_case_equal(stored_name, stored_name_length,
+                                           "color-scheme")) {
+                    modern = STYLE_MODERN_COLOR_SCHEME;
+                } else if (stored_name_length >= 12u
+                           && strncasecmp(
+                                  stored_name, "border-image", 12u) == 0) {
+                    modern = STYLE_MODERN_BORDER_IMAGE;
                 } else if (span_case_equal(stored_name, stored_name_length,
                                            "backdrop-filter")
                            || span_case_equal(stored_name, stored_name_length,

@@ -44,6 +44,7 @@ typedef enum {
 typedef struct {
     atomic_int state;
     atomic_uint readers;
+    atomic_bool retire_when_unborrowed;
     uint32_t generation;
     uint64_t identity;
     uint64_t pts_us;
@@ -56,7 +57,6 @@ typedef struct {
     uint64_t au;
     uint64_t pts_us;
     uint64_t duration_us;
-    int slot;
 } SwdecAuSlot;
 
 typedef struct {
@@ -116,8 +116,6 @@ typedef struct {
 
     SwdecVideoSlot slots[SWDEC_RING_SLOTS];
     SwdecAuSlot au_slots[SWDEC_AU_MAP_SLOTS];
-    int pending_csc_slot;
-    uint64_t pending_csc_au;
     int last_claimed_slot;
     uint64_t next_au;
     uint64_t next_identity;
@@ -322,23 +320,12 @@ static void swdec_free_slot(PspSwdecBackend *backend, int slot)
         return;
     SwdecVideoSlot *state = &backend->slots[slot];
     state->claimed = false;
+    atomic_store_explicit(
+        &state->retire_when_unborrowed, false, memory_order_release);
     if (!state->quarantined) {
         atomic_store_explicit(
             &state->state, SWDEC_SLOT_FREE, memory_order_release);
     }
-}
-
-static void swdec_close_pending_csc(PspSwdecBackend *backend)
-{
-    if (backend->pending_csc_slot < 0) return;
-    int slot = backend->pending_csc_slot;
-    uint64_t au = backend->pending_csc_au;
-    if (!backend->api->csc_close()) {
-        SwdecAuSlot *mapping = &backend->au_slots[au & 63u];
-        if (mapping->au == au && mapping->slot == slot) mapping->slot = -1;
-        swdec_free_slot(backend, slot);
-    }
-    backend->pending_csc_slot = -1;
 }
 
 static void swdec_publish_picture(
@@ -346,21 +333,22 @@ static void swdec_publish_picture(
 {
     uint64_t source_au = picture->pts;
     SwdecAuSlot *mapping = &backend->au_slots[source_au & 63u];
-    if (mapping->au != source_au || mapping->slot < 0
-        || mapping->slot >= (int) SWDEC_RING_SLOTS) {
+    if (mapping->au != source_au || backend->job_slot < 0
+        || backend->job_slot >= (int) SWDEC_RING_SLOTS) {
+        if (backend->job_slot >= 0
+            && backend->job_slot < (int) SWDEC_RING_SLOTS)
+            swdec_free_slot(backend, backend->job_slot);
         atomic_store_explicit(
             &backend->worker_error, -20, memory_order_release);
         return;
     }
-    int slot = mapping->slot;
+    int slot = backend->job_slot;
     if (picture->width != (int) backend->width
         || picture->height != (int) backend->height
         || !swdec_rgb565_destination_fits(
             picture->width, picture->height, (int) backend->rgb_stride,
             backend->rgb_slot_bytes)) {
-        mapping->slot = -1;
         backend->api->csc_off();
-        backend->pending_csc_slot = -1;
         swdec_free_slot(backend, slot);
         atomic_store_explicit(
             &backend->worker_error, -23, memory_order_release);
@@ -368,16 +356,13 @@ static void swdec_publish_picture(
     }
     uint64_t pts_us = mapping->pts_us;
     uint64_t duration_us = mapping->duration_us;
-    mapping->slot = -1;
-    if (backend->pending_csc_slot == slot) {
-        if (!backend->api->csc_close()) {
-            backend->pending_csc_slot = -1;
-            swdec_free_slot(backend, slot);
-            atomic_store_explicit(
-                &backend->worker_error, -21, memory_order_release);
-            return;
-        }
-        backend->pending_csc_slot = -1;
+    if (!backend->api->csc_picture(
+            slot, swdec_rgb_slot(backend, slot),
+            (int) backend->rgb_stride, backend->rgb_slot_bytes, picture)) {
+        swdec_free_slot(backend, slot);
+        atomic_store_explicit(
+            &backend->worker_error, -21, memory_order_release);
+        return;
     }
     /* The ME and the bounded CPU tail have both written this isolated
        surface and published their writes before csc_close returns. Discard
@@ -391,6 +376,8 @@ static void swdec_publish_picture(
     state->pts_us = pts_us;
     state->duration_us = duration_us;
     state->claimed = false;
+    atomic_store_explicit(
+        &state->retire_when_unborrowed, false, memory_order_release);
     atomic_fetch_add_explicit(
         &backend->ready_count, 1u, memory_order_relaxed);
     atomic_store_explicit(
@@ -417,25 +404,12 @@ static void swdec_select_speed(PspSwdecBackend *backend)
 
 static void swdec_decode_job(PspSwdecBackend *backend)
 {
-    swdec_close_pending_csc(backend);
     if (backend->job_slot >= 0) {
         SwdecAuSlot *mapping =
             &backend->au_slots[backend->job_au & 63u];
-        if (mapping->slot >= 0) {
-            atomic_store_explicit(
-                &backend->worker_error, -22, memory_order_release);
-            backend->job_result = -1;
-            return;
-        }
         mapping->au = backend->job_au;
         mapping->pts_us = backend->job_pts_us;
         mapping->duration_us = backend->job_duration_us;
-        mapping->slot = backend->job_slot;
-        backend->api->csc_begin(
-            backend->job_slot, swdec_rgb_slot(backend, backend->job_slot),
-            (int) backend->rgb_stride, backend->rgb_slot_bytes);
-    } else {
-        backend->api->csc_off();
     }
     swdec_select_speed(backend);
     TilefinchSwdecPicture picture = {0};
@@ -445,13 +419,13 @@ static void swdec_decode_job(PspSwdecBackend *backend)
         backend->job_flush ? 0 : backend->job_bytes,
         backend->job_au, &picture);
     backend->job_result = result;
-    if (backend->job_slot >= 0) {
-        backend->pending_csc_slot = backend->job_slot;
-        backend->pending_csc_au = backend->job_au;
-    }
     if (result == 1) swdec_publish_picture(backend, &picture);
-    else if (result < 0) atomic_store_explicit(
-        &backend->worker_error, result, memory_order_release);
+    else {
+        if (backend->job_slot >= 0)
+            swdec_free_slot(backend, backend->job_slot);
+        if (result < 0) atomic_store_explicit(
+            &backend->worker_error, result, memory_order_release);
+    }
     if (backend->job_flush && result == 0) backend->drained = true;
 }
 
@@ -739,8 +713,10 @@ static MediaBackendResult swdec_drain(
             ? MEDIA_BACKEND_WOULD_BLOCK : MEDIA_BACKEND_END;
     }
     if (backend->drained) return MEDIA_BACKEND_END;
+    int slot = swdec_find_free_slot(backend);
+    if (slot < 0) return MEDIA_BACKEND_WOULD_BLOCK;
     backend->job_bytes = 0;
-    backend->job_slot = -1;
+    backend->job_slot = slot;
     backend->job_au = backend->next_au++;
     backend->job_pts_us += backend->job_duration_us;
     backend->job_flush = true;
@@ -752,6 +728,7 @@ static MediaBackendResult swdec_drain(
     if (sceKernelSetEventFlag(backend->worker_event, SWDEC_EVENT_WAKE) < 0) {
         atomic_store_explicit(
             &backend->job_state, SWDEC_JOB_IDLE, memory_order_release);
+        swdec_free_slot(backend, slot);
         swdec_error(error, error_size, "swdec drain wake failed");
         return MEDIA_BACKEND_ERROR;
     }
@@ -781,8 +758,18 @@ static void swdec_release_prior_claim(PspSwdecBackend *backend, int keep)
     int prior = backend->last_claimed_slot;
     if (prior < 0 || prior == keep) return;
     SwdecVideoSlot *state = &backend->slots[prior];
-    if (atomic_load_explicit(&state->readers, memory_order_acquire) == 0)
-        swdec_free_slot(backend, prior);
+    /* Publish retirement before sampling readers. If the last reader raced
+       just ahead of this store, the zero-reader recheck below performs the
+       retire; if it races after, release performs it. */
+    atomic_store_explicit(
+        &state->retire_when_unborrowed, true, memory_order_release);
+    state->claimed = false;
+    if (atomic_load_explicit(&state->readers, memory_order_acquire) == 0) {
+        if (atomic_exchange_explicit(
+                &state->retire_when_unborrowed, false,
+                memory_order_acq_rel))
+            swdec_free_slot(backend, prior);
+    }
     backend->last_claimed_slot = -1;
 }
 
@@ -809,9 +796,12 @@ static bool swdec_take_video_frame(void *opaque, MediaVideoFrame *frame)
         && selected_pts - effective_clock > state->duration_us / 2u)
         return false;
     if (effective_clock > selected_pts + 8000u) {
-        uint64_t late = effective_clock - selected_pts;
-        backend->clock_slip_us = late > UINT64_MAX - backend->clock_slip_us
-            ? UINT64_MAX : backend->clock_slip_us + late;
+        /* Re-anchor the correction to this displayed frame. Accumulating
+           lateness treats the same clock error as new on every take and can
+           grow without bound; this absolute anchor makes effective_clock
+           exactly selected_pts and carries only the measured clock offset. */
+        backend->clock_slip_us = swdec_clock_reanchor_slip(
+            backend->presentation_clock_us, selected_pts);
     }
     swdec_release_prior_claim(backend, selected);
     state->claimed = true;
@@ -946,9 +936,19 @@ static void swdec_release(void *opaque, unsigned slot)
     if (readers == 0) return;
     readers = atomic_fetch_sub_explicit(
         &state->readers, 1u, memory_order_acq_rel) - 1u;
-    if (readers == 0 && !state->quarantined)
-        atomic_store_explicit(
-            &state->state, SWDEC_SLOT_READY, memory_order_release);
+    if (readers != 0 || state->quarantined) return;
+    if (atomic_exchange_explicit(
+            &state->retire_when_unborrowed, false,
+            memory_order_acq_rel)) {
+        swdec_free_slot(backend, (int) slot);
+    } else {
+        /* A concurrent supersession may already have freed this slot. Only
+           return the exact READING generation to READY; never resurrect FREE. */
+        int expected = SWDEC_SLOT_READING;
+        (void) atomic_compare_exchange_strong_explicit(
+            &state->state, &expected, SWDEC_SLOT_READY,
+            memory_order_acq_rel, memory_order_acquire);
+    }
 }
 
 static void swdec_quarantine(void *opaque, unsigned slot)
@@ -1042,7 +1042,6 @@ static bool swdec_reset(void *opaque, char *error, size_t error_size)
         }
     }
     if (backend->decoder != NULL) {
-        swdec_close_pending_csc(backend);
         backend->api->csc_off();
     }
     if (backend->have_audio
@@ -1074,16 +1073,16 @@ static bool swdec_reset(void *opaque, char *error, size_t error_size)
             return false;
         }
     }
-    for (unsigned i = 0; i < SWDEC_AU_MAP_SLOTS; i++)
-        backend->au_slots[i].slot = -1;
+    memset(backend->au_slots, 0, sizeof(backend->au_slots));
     for (unsigned i = 0; i < SWDEC_RING_SLOTS; i++) {
         SwdecVideoSlot *slot = &backend->slots[i];
         slot->claimed = false;
         slot->quarantined = false;
         atomic_store_explicit(
+            &slot->retire_when_unborrowed, false, memory_order_release);
+        atomic_store_explicit(
             &slot->state, SWDEC_SLOT_FREE, memory_order_release);
     }
-    backend->pending_csc_slot = -1;
     backend->last_claimed_slot = -1;
     backend->drained = false;
     backend->clock_slip_us = 0;
@@ -1129,7 +1128,6 @@ static void swdec_destroy(void *opaque)
     if (backend->worker_event >= 0)
         sceKernelDeleteEventFlag(backend->worker_event);
     if (backend->decoder != NULL) {
-        swdec_close_pending_csc(backend);
         backend->api->csc_off();
     }
     if (backend->audio_arena_bound
@@ -1234,7 +1232,6 @@ bool media_psp_swdec_backend_create_sources(
     backend->worker_event = -1;
     backend->worker_thread = -1;
     backend->audio_thread = -1;
-    backend->pending_csc_slot = -1;
     backend->last_claimed_slot = -1;
     backend->width = width;
     backend->height = height;
@@ -1242,11 +1239,11 @@ bool media_psp_swdec_backend_create_sources(
     backend->nal_length_size = nal_length;
     backend->speed = -1;
     backend->epoch = 1;
-    for (unsigned i = 0; i < SWDEC_AU_MAP_SLOTS; i++)
-        backend->au_slots[i].slot = -1;
+    memset(backend->au_slots, 0, sizeof(backend->au_slots));
     for (unsigned i = 0; i < SWDEC_RING_SLOTS; i++) {
         atomic_init(&backend->slots[i].state, SWDEC_SLOT_FREE);
         atomic_init(&backend->slots[i].readers, 0u);
+        atomic_init(&backend->slots[i].retire_when_unborrowed, false);
     }
     atomic_init(&backend->job_state, SWDEC_JOB_IDLE);
     atomic_init(&backend->stop, false);
@@ -1489,7 +1486,6 @@ bool media_psp_swdec_backend_create_audio(
     backend->worker_event = -1;
     backend->worker_thread = -1;
     backend->audio_thread = -1;
-    backend->pending_csc_slot = -1;
     backend->last_claimed_slot = -1;
     backend->speed = -1;
     backend->epoch = 1;
@@ -1497,11 +1493,11 @@ bool media_psp_swdec_backend_create_audio(
     backend->audio_info = audio_info;
     backend->audio_packet_stride = swdec_cache_extent(
         (size_t) audio.largest_sample + 7u);
-    for (unsigned i = 0; i < SWDEC_AU_MAP_SLOTS; i++)
-        backend->au_slots[i].slot = -1;
+    memset(backend->au_slots, 0, sizeof(backend->au_slots));
     for (unsigned i = 0; i < SWDEC_RING_SLOTS; i++) {
         atomic_init(&backend->slots[i].state, SWDEC_SLOT_FREE);
         atomic_init(&backend->slots[i].readers, 0u);
+        atomic_init(&backend->slots[i].retire_when_unborrowed, false);
     }
     atomic_init(&backend->job_state, SWDEC_JOB_IDLE);
     atomic_init(&backend->stop, false);

@@ -174,7 +174,7 @@ static bool psp_navigation_start_retryable(const char *error)
             || strstr(error, "budget") != NULL);
 }
 
-static bool psp_retry_navigation_url_after_reclaim(
+bool psp_retry_navigation_url_after_reclaim(
     BrowserEngine *engine, const char *url, size_t maximum_bytes,
     long timeout_ms, bool record_history)
 {
@@ -588,6 +588,8 @@ bool psp_run_initial_page_load(
         const char *visible_detail = psp_user_visible_error(
             browser_engine_last_error(engine),
             browser_engine_last_tls_verify_result(engine),
+            browser_engine_last_tls_verify_result_available(engine),
+            browser_engine_last_tls_verification_failed(engine),
             &tls_guidance, visible_error, sizeof(visible_error));
         if (tls_guidance == TILEFINCH_TLS_GUIDANCE_NONE)
             psp_ui_show_status(ui, visible_detail, 300);

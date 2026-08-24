@@ -31,6 +31,14 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
+# Host tools and tests share one engine image.  Building dependencies as PIC
+# lets that image be a shared library on ELF platforms as well as macOS, so an
+# engine-only edit does not force every small test executable to relink.  PSP
+# remains entirely static and pays neither the code-size nor runtime cost.
+if(NOT PSP)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 if(PSP)
     # Most engine sources intentionally contain several cohesive internal
     # functions in one translation unit. Let the PSP linker discard functions

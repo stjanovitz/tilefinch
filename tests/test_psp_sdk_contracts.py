@@ -100,6 +100,73 @@ def psp_media_session_sources():
 
 
 class PspSdkContractTests(unittest.TestCase):
+    def test_home_exit_returns_callback_thread_to_the_busy_supervisor(self):
+        runtime = without_comments(
+            (ROOT / "src/psp_app/psp_app_runtime.c").read_text(
+                encoding="utf-8"))
+        callback = runtime[
+            runtime.index("static int psp_exit_callback("):
+            runtime.index("bool psp_home_exit_pending(")]
+        self.assertIn("psp_start_home_exit_watchdog()", callback)
+        self.assertIn("if (psp_start_home_exit_watchdog()) return 0;",
+                      callback)
+        watchdog = runtime[
+            runtime.index("static int psp_home_exit_watchdog("):
+            runtime.index("static int psp_exit_callback(")]
+        self.assertIn("PSP_HOME_EXIT_GRACE_MS", watchdog)
+        self.assertIn("sceKernelExitGame();", watchdog)
+
+        tick = runtime[
+            runtime.index("void psp_background_ui_tick(void)"):
+            runtime.index("bool psp_platform_cooperate(")]
+        self.assertIn("if (psp_home_exit_pending()", tick)
+        self.assertIn(
+            "tilefinch_cancellation_request(&cooperate->cancellation)",
+            tick)
+        self.assertIn('"CLOSING..."', tick)
+
+    def test_xmb_redirect_is_event_driven_read_only_and_fail_open(self):
+        source = without_comments(
+            (ROOT / "src/psp_xmb_redirect.c").read_text(encoding="utf-8"))
+
+        self.assertIn("sctrlHENSetStartModuleHandler(on_module_start)", source)
+        self.assertIn("TILEFINCH_XMB_REDIRECT_BYPASS_BUTTON PSP_CTRL_LTRIGGER",
+                      source)
+        self.assertIn("sceIoGetstat(tilefinch_ms_launcher", source)
+        self.assertIn("sceIoGetstat(tilefinch_ef_launcher", source)
+        self.assertIn("previous_start_handler(module)", source)
+        self.assertIn("launch_armed = 0;", source)
+        handler = source[
+            source.index("static int on_module_start("):
+            source.index("int module_start(")]
+        for loader_unsafe_call in (
+                "sceCtrlPeekBufferPositive", "sceIoGetstat",
+                "sceKernelDelayThread", "sctrlKernelLoadExecVSH"):
+            self.assertNotIn(loader_unsafe_call, handler)
+        self.assertLess(
+            handler.index("previous_start_handler(module)"),
+            handler.index("sceKernelCreateThread("))
+        self.assertIn("TILEFINCH_XMB_REDIRECT_CALLBACK_RELEASE_US", source)
+        self.assertIn(
+            "TILEFINCH_XMB_REDIRECT_CALLBACK_RELEASE_US) < 0",
+            source)
+        self.assertIn("previous == on_module_start ? NULL : previous", source)
+        self.assertIn("char launcher[sizeof(tilefinch_ms_launcher)]", source)
+        cmake = (ROOT / "cmake/TilefinchTargets.cmake").read_text(
+            encoding="utf-8")
+        redirect_target = cmake[
+            cmake.index("add_prx_module(tilefinch-xmb-redirect"):
+            cmake.index("# Stable, deliberately small A/B launcher")]
+        self.assertIn("-fno-pic", redirect_target)
+        self.assertNotIn("sctrlHENPatchSyscall", source)
+        self.assertNotIn("sctrlHookImportByNID", source)
+        for mutation in (
+                "sceIoOpen(", "sceIoWrite(", "sceIoRemove(",
+                "sceIoRename(", "sceIoMkdir(", "sceIoRmdir("):
+            self.assertNotIn(
+                mutation, source,
+                "The optional VSH redirect must never mutate storage.")
+
     def test_psplink_deployer_is_bounded_and_transactional(self):
         source = without_comments(
             (ROOT / "tools" / "psplink-deploy" / "main.c").read_text(
@@ -1647,16 +1714,38 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("uint64_t duration_us = mapping->duration_us", publish)
         self.assertIn("state->pts_us = pts_us", publish)
         self.assertNotIn("state->pts_us = backend->job_pts_us", publish)
+        # A flush reserves an output surface just like an ordinary decode.
+        # The returned picture's source AU supplies timing, while conversion
+        # is bound only after receive_frame identifies that picture.
+        drain = source[
+            source.index("static MediaBackendResult swdec_drain("):
+            source.index("static bool swdec_advance(")]
+        self.assertIn("int slot = swdec_find_free_slot(backend)", drain)
+        self.assertIn("backend->job_slot = slot", drain)
+        decode = source[
+            source.index("static void swdec_decode_job("):
+            source.index("static int swdec_worker_main(")]
+        self.assertIn("if (result == 1) swdec_publish_picture", decode)
+        self.assertIn("backend->api->csc_picture(", publish)
+        self.assertIn("int slot = backend->job_slot", publish)
         self.assertIn("sceKernelDcacheInvalidateRange(", publish)
         self.assertIn("backend->rgb_slot_bytes", publish)
         self.assertIn(
             "backend->rgb_slot_bytes = swdec_cache_extent(", create)
-        self.assertIn(
-            "backend->rgb_slot_bytes);", source[source.index(
-                "static void swdec_decode_job("):
-                source.index("static int swdec_worker_main(")])
+        self.assertIn("backend->rgb_slot_bytes, picture", publish)
         self.assertIn(
             "media_h264_annexb_sample_is_admitted(", submit)
+        release_prior = source[
+            source.index("static void swdec_release_prior_claim("):
+            source.index("static bool swdec_take_video_frame(")]
+        release = source[
+            source.index("static void swdec_release(void *opaque"):
+            source.index("static void swdec_quarantine(")]
+        self.assertLess(
+            release_prior.index("retire_when_unborrowed"),
+            release_prior.index("state->readers"))
+        self.assertIn("atomic_exchange_explicit(", release)
+        self.assertIn("swdec_free_slot(backend, (int) slot)", release)
         component = without_comments(
             (ROOT / "src/swdec/swdec.c").read_text(encoding="utf-8"))
         self.assertIn("d->max_width = max_width", component)
@@ -1668,6 +1757,33 @@ class PspSdkContractTests(unittest.TestCase):
             me.count("swdec_rgb565_destination_fits("), 3)
         self.assertGreaterEqual(
             me.count("swdec_audio_channels_admitted(out.channels)"), 2)
+
+    def test_swdec_prx_cleanup_tracks_partial_module_and_me_ownership(self):
+        source = without_comments(
+            (ROOT / "src/psp_swdec_component.c").read_text(encoding="utf-8"))
+        load = source[
+            source.index("static bool psp_swdec_component_load("):
+            source.index("bool psp_swdec_component_prepare(")]
+        self.assertLess(
+            load.index("component->module_id = module"),
+            load.index("sceKernelStartModule("))
+        self.assertIn("component_unload_module(component)", load)
+        cleanup = source[
+            source.index("static bool component_unload_module("):
+            source.index("static void component_failed_message(")]
+        self.assertIn("component->took_me", cleanup)
+        self.assertIn("sceKernelStopModule(", cleanup)
+        self.assertIn("sceKernelUnloadModule(", cleanup)
+        self.assertLess(
+            cleanup.index("sceKernelUnloadModule("),
+            cleanup.index("budget_reservation_release("))
+        prepare = source[
+            source.index("bool psp_swdec_component_prepare("):
+            source.index("bool psp_swdec_component_suspend(")]
+        self.assertLess(
+            prepare.index("component->took_me = true"),
+            prepare.index("component->api.attach_me("))
+        self.assertIn("component->took_me = false", prepare)
 
     def test_hls_seek_enters_the_hls_source_and_preserves_probe_progress(self):
         seek = without_comments(
@@ -1746,6 +1862,12 @@ class PspSdkContractTests(unittest.TestCase):
             media.index("static bool range_fill_install(")]
         self.assertNotIn("FetchResult", install)
         self.assertNotIn("FetchBackgroundResult", install)
+        self.assertLess(
+            install.index("range_stream_drain_background(range)"),
+            install.index("range_take_background_stream("),
+            "a completed transfer must publish its final queued bytes before "
+            "the compact result is consumed")
+        self.assertIn("range->fill_streamed_bytes != wanted", install)
         self.assertIn("range_take_background_stream(", install)
         self.assertIn("range_take_background_fixed(", install)
         for helper in (
@@ -1792,9 +1914,8 @@ class PspSdkContractTests(unittest.TestCase):
             "if (buffer < 0) continue;",
             source,
             "fixed-buffer pressure must not serialize independent streams")
-        self.assertIn(
-            "FETCH_BACKGROUND_STREAM_CHUNK_TARGET (48u * 1024u)",
-            source)
+        self.assertIn("FETCH_BACKGROUND_STREAM_CHUNK_TARGET", source)
+        self.assertIn("FETCH_BACKGROUND_STREAM_PUBLICATION_MAX", source)
         initialize = source[
             source.index("bool fetch_background_transport_initialize("):
             source.index("static bool fetch_background_preconnect_begin(")]
@@ -3077,8 +3198,18 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertNotIn("sceMpegDelete", reset)
         self.assertNotIn("sceMpegCreate", reset)
         self.assertIn("PSP_MEDIA_CODEC_KIND_RECREATE", reset)
-        # The rebuild replaces the in-place pair; it does not run beside it.
-        self.assertIn("sceMpegAvcDecodeFlush", reset)
+        # Both rebuild and in-place reset are worker jobs. No unbounded
+        # firmware reset call is allowed to fall back to the browser thread.
+        self.assertNotIn("sceMpegAvcDecodeFlush(", reset)
+        self.assertNotIn("sceMpegInitAu(", reset)
+        self.assertNotIn("sceAudiocodecInit(", reset)
+        self.assertIn("PSP_MEDIA_CODEC_KIND_RESET", reset)
+        worker_reset = source[
+            source.index("static MediaBackendResult psp_media_run_reset_job("):
+            source.index("static MediaBackendResult psp_media_run_recreate_job(")]
+        self.assertIn("sceMpegAvcDecodeFlush(", worker_reset)
+        self.assertIn("sceMpegInitAu(", worker_reset)
+        self.assertIn("psp_media_reset_audio_program", worker_reset)
         self.assertIn("psp_media_reset_mode", reset)
 
     def test_a_refused_unit_keeps_the_timestamp_its_picture_will_claim(self):
@@ -3260,16 +3391,20 @@ class PspSdkContractTests(unittest.TestCase):
             "        || psp_media_reset_mode != PSP_MEDIA_RESET_MODE_NO_TOUCH)\n"
             "        backend->decoder_primed = false;",
             reset)
-        # The audio re-init is inside the guarded branch, not beside it.
-        self.assertIn("if (!no_touch) {", reset)
-        audio = reset[reset.index("if (!no_touch) {"):]
-        self.assertIn("sceAudiocodecInit", audio)
+        # The audio re-init is admitted only through a worker job when the
+        # no-touch branch is false, never called inline from reset.
+        self.assertIn("bool needs_worker = !no_touch", reset)
+        self.assertNotIn("sceAudiocodecInit(", reset)
         # The quiesce is not optional in any mode: the demuxer and the packet
         # staging are repositioned under a decoder that may still be reading
         # them, so an in-flight job is always collected first.
         quiesce = reset[:reset.index("bool no_touch")]
         self.assertIn("psp_media_collect_codec_job", quiesce)
         self.assertIn("PSP_MEDIA_CODEC_QUIESCE_WAIT_US", quiesce)
+        collect_failure = quiesce[
+            quiesce.index("if (psp_media_collect_codec_job("):
+            quiesce.index("audio_resetting")]
+        self.assertIn("backend->admissions_closed = false", collect_failure)
         # Our own queues are still dropped -- a pre-seek timestamp must never
         # pair with a post-seek picture.
         self.assertIn("backend->video_timestamps.count = 0", quiesce)
@@ -3546,15 +3681,23 @@ class PspSdkContractTests(unittest.TestCase):
 
         image = without_comments(
             (ROOT / "src/image.c").read_text(encoding="utf-8"))
+        image_decode = without_comments(
+            (ROOT / "src/image_decode.c").read_text(encoding="utf-8"))
+        image_svg_decode = without_comments(
+            (ROOT / "src/image_svg_decode.c").read_text(encoding="utf-8"))
+        self.assertNotIn("NANOSVG_IMPLEMENTATION", image)
+        self.assertNotIn("NANOSVGRAST_IMPLEMENTATION", image)
+        self.assertIn("NANOSVG_IMPLEMENTATION", image_svg_decode)
+        self.assertIn("NANOSVGRAST_IMPLEMENTATION", image_svg_decode)
         self.assertIn(
-            "TILEFINCH_PSP_THREAD_PRIORITY_IMAGE_DECODE", image)
-        self.assertIn("IMAGE_DECODE_WORKER_QUEUED", image)
-        self.assertIn("IMAGE_DECODE_WORKER_RUNNING", image)
-        self.assertIn("IMAGE_DECODE_WORKER_READY", image)
-        self.assertIn("images_decode_worker_shutdown", image)
-        busy = image[
-            image.index("static bool image_decode_busy(void)"):
-            image.index("static void *image_arena_malloc(")]
+            "TILEFINCH_PSP_THREAD_PRIORITY_IMAGE_DECODE", image_decode)
+        self.assertIn("IMAGE_DECODE_WORKER_QUEUED", image_decode)
+        self.assertIn("IMAGE_DECODE_WORKER_RUNNING", image_decode)
+        self.assertIn("IMAGE_DECODE_WORKER_READY", image_decode)
+        self.assertIn("images_decode_worker_shutdown", image_decode)
+        busy = image_decode[
+            image_decode.index("bool image_decode_busy(void)"):
+            image_decode.index("static void *image_arena_malloc(")]
         self.assertIn("atomic_load_explicit(&decode_gate", busy)
         self.assertNotIn("atomic_compare_exchange", busy)
         self.assertNotIn("atomic_flag_test_and_set", busy)
@@ -4763,6 +4906,26 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("FETCH_BACKGROUND_ENQUEUE_ADMISSION_CLOSED", start)
         self.assertNotIn("queue unavailable", start)
 
+    def test_youtube_watch_requests_share_redirect_and_linear_scan_policy(self):
+        resolver = without_comments(
+            (ROOT / "src/youtube_resolver.c").read_text(encoding="utf-8"))
+        sync_start = resolver.index(
+            "bool youtube_resolve_progressive_mp4_cancelable(")
+        request_start = resolver.index("FetchRequest watch_request", sync_start)
+        sync_request = resolver[request_start:request_start + 1600]
+        self.assertIn(".redirect_same_origin_only = true", sync_request)
+        self.assertIn(
+            ".redirect_url_validator = youtube_resolver_url_supported",
+            sync_request)
+        prefix = resolver[
+            resolver.index("static bool youtube_resolve_job_take_watch_prefix("):
+            resolver.index("static bool youtube_resolve_job_prepare_watch(")]
+        self.assertIn("watch_scan_offset", prefix)
+        self.assertIn("YOUTUBE_WATCH_SCAN_OVERLAP", prefix)
+        self.assertNotIn(
+            "job->response.data, job->response.length, \"VISITOR_DATA\"",
+            prefix)
+
     def test_youtube_result_preresolution_is_bounded_and_adopted(self):
         frontend = without_comments(
             (ROOT / "src/psp_app/psp_app_youtube.c").read_text(
@@ -5409,6 +5572,174 @@ class PspSdkContractTests(unittest.TestCase):
             ui.index("void psp_ui_media_composite_with_preview("):]
         self.assertNotIn('"X"', composite)
         self.assertNotIn("{width - 38, 6, 30, 30}", composite)
+
+    def test_open_phase_completion_keeps_its_physical_service_token(self):
+        opening = without_comments(
+            (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+        pump = opening[
+            opening.index("bool psp_media_open_pump("):
+            opening.index("static const char *psp_media_open_stage_name(")]
+        snapshot = pump.index("phase_service_command = media->service.command")
+        step = pump.index("psp_media_open_pump_step(media)")
+        completion = pump.index("PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE", step)
+        self.assertLess(snapshot, step)
+        guard = pump[step:completion]
+        self.assertIn("media->service.command == phase_service_command", guard)
+        self.assertIn("media->service.epoch == phase_service_epoch", guard)
+        event = pump[completion:completion + 300]
+        self.assertIn(".service_command = phase_service_command", event)
+        self.assertIn(".service_epoch = phase_service_epoch", event)
+        self.assertNotIn("psp_media_service_completion(", event)
+
+    def test_supervisor_media_invalidates_present_records_before_scanout(self):
+        runtime = without_comments(
+            (ROOT / "src/psp_app/psp_app_runtime.c").read_text(
+                encoding="utf-8"))
+        supervisor = runtime[
+            runtime.index("static void psp_present_supervisor_media("):
+            runtime.index("void psp_present_boot_surface(")]
+        forget = supervisor.index("psp_media_present_forget_buffers()")
+        self.assertLess(
+            forget,
+            supervisor.index("psp_display_video_active(&psp_display)"))
+        self.assertLess(forget, supervisor.index("memcpy(back, front"))
+        self.assertLess(forget, supervisor.index("memset(vram +"))
+
+    def test_home_tab_rows_reuse_the_tab_action_receiver(self):
+        actions = without_comments(
+            (ROOT / "src/psp_app/psp_app_actions.c").read_text(
+                encoding="utf-8"))
+        resolver = actions[
+            actions.index("static bool psp_app_resolve_home_tab_action("):
+            actions.index("void psp_app_dispatch_action(")]
+        self.assertIn("PSP_HOME_TARGET_TAB", resolver)
+        self.assertIn("resolved->action = PSP_UI_ACTION_SWITCH_TAB", resolver)
+        self.assertIn("resolved->tab_index = target", resolver)
+        heavy = actions[
+            actions.index("static void psp_app_dispatch_heavy_action("):
+            actions.index("case PSP_UI_ACTION_TOGGLE_BOOKMARK:")]
+        remap = heavy.index("psp_app_resolve_home_tab_action(")
+        switch = heavy.index("switch (intent->action)")
+        tab_case = heavy.index("case PSP_UI_ACTION_SWITCH_TAB:")
+        self.assertLess(remap, switch)
+        self.assertLess(switch, tab_case)
+        self.assertIn("psp_tabs_request(", heavy[tab_case:])
+
+    def test_site_allowlist_uses_local_surface_reload_policy(self):
+        settings = without_comments(
+            (ROOT / "src/psp_app/psp_app_settings.c").read_text(
+                encoding="utf-8"))
+        branch = settings[
+            settings.index("PSP_UI_SETTING_CONTENT_BLOCKER_SITE_ALLOWED"):
+            settings.index("PSP_UI_SETTING_COOKIE_BANNER_HIDDEN")]
+        self.assertIn("psp_app_reload_for_site_security_setting(", branch)
+        self.assertNotIn("psp_begin_page_load(", branch)
+        helper = settings[
+            settings.index("static void psp_app_reload_for_site_security_setting("):
+            settings.index("void psp_app_refresh_network_profile_label(")]
+        self.assertIn("base_screen == PSP_UI_SCREEN_HOME", helper)
+        self.assertIn("if (started && !local_surface)", helper)
+
+    def test_x25519_comparison_requires_a_valid_generic_result(self):
+        source = without_comments(
+            (ROOT / "src/psp_crypto_selftest_main.c").read_text(
+                encoding="utf-8"))
+        check = source[
+            source.index("static int check_x25519("):
+            source.index("static int run_x25519_vectors(")]
+        self.assertIn("bool generic_ok = false", check)
+        self.assertIn("generic_ok = true", check)
+        self.assertIn("else if (generic_ok", check)
+        self.assertIn("memcmp(got_everest, got_generic, 32)", check)
+
+    def test_experimental_resume_reverses_failed_history_move(self):
+        commands = without_comments(
+            (ROOT / "src/interactive/commands.inc").read_text(
+                encoding="utf-8"))
+        resume = commands[
+            commands.index("static bool experimental_resume_history("):
+            commands.index("static bool loop_history(")]
+        rebuild = resume.index("bool rebuilt = experimental_rebuild_document(")
+        rollback = resume.index("if (!rebuilt)", rebuild)
+        self.assertIn("forward ? navigation_back", resume[rollback:])
+        self.assertIn(": navigation_forward", resume[rollback:])
+        self.assertIn("return rebuilt", resume[rollback:])
+
+    def test_dom_event_counter_tolerates_reduced_bridge_state(self):
+        bindings = without_comments(
+            (ROOT / "src/js_dom_bindings.c").read_text(encoding="utf-8"))
+        recorder = bindings[
+            bindings.index("JSValue js_dom_record_event("):
+            bindings.index("JSValue js_dom_record_event_handler(")]
+        self.assertIn("bridge != NULL && bridge->result != NULL", recorder)
+        self.assertLess(
+            recorder.index("bridge->result != NULL"),
+            recorder.index("bridge->result->events_dispatched++"))
+
+    def test_focus_probe_best_effort_restores_live_marker(self):
+        resolver = without_comments(
+            (ROOT / "src/style_resolve.c").read_text(encoding="utf-8"))
+        helper = resolver[
+            resolver.index("static bool restore_focus_marker("):
+            resolver.index("static bool computed_style_equal_without_outline(")]
+        self.assertIn("set_focus_marker(node, false)", helper)
+        classify = resolver[
+            resolver.index("StyleFocusChange style_focus_change_classify("):
+            resolver.index("bool style_focus_change_is_outline_only(")]
+        first = classify.index("restored = restore_focus_marker(")
+        retry = classify.index("restored = restore_focus_marker(", first + 1)
+        unsafe = classify.index("return STYLE_FOCUS_CHANGE_UNSAFE", retry)
+        self.assertLess(first, retry)
+        self.assertLess(retry, unsafe)
+
+    def test_psp_tls_clock_uses_one_bounded_status(self):
+        clock = without_comments(
+            (ROOT / "src/psp_time.c").read_text(encoding="utf-8"))
+        self.assertIn("return PSP_TIME_UNREADABLE", clock)
+        self.assertIn("psp_time_classify_utc(&sampled, epoch)", clock)
+        self.assertIn("psp_time_read_utc(&result)", clock)
+        runtime = without_comments(
+            (ROOT / "src/psp_app/psp_app_runtime.c").read_text(
+                encoding="utf-8"))
+        self.assertIn("PspTimeStatus clock_status = psp_time_read_utc(NULL)",
+                      runtime)
+        report = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        self.assertIn("psp_time_read_utc_fields(", report)
+        self.assertIn("rtc-status=%s", report)
+        self.assertNotIn("sceRtcCheckValid", report)
+
+    def test_psp_curl_patch_retains_and_resets_verify_flags(self):
+        patch = (ROOT / "patches/curl-8.21.0-psp.patch").read_text(
+            encoding="utf-8")
+        callback = patch[
+            patch.index("static int mbed_verify_cb("):
+            patch.index("static CURLcode mbed_connect_step1(")]
+        self.assertIn("ssl_config->certverifyresult |= (long)*flags", callback)
+        handshake = patch[patch.index("static CURLcode mbed_connect_step1("):]
+        reset = handshake.index("ssl_config->certverifyresult = 0")
+        version_gate = handshake.index("if((conn_config->version")
+        self.assertLess(reset, version_gate)
+
+    def test_tls_verify_availability_reaches_guidance_and_report(self):
+        fetch = without_comments(
+            (ROOT / "src/fetch.c").read_text(encoding="utf-8"))
+        self.assertIn(
+            "result->tls_verify_result_available = curl_easy_getinfo(", fetch)
+        navigation = without_comments(
+            (ROOT / "src/navigation/load_state.inc").read_text(
+                encoding="utf-8"))
+        self.assertIn("last_tls_verify_result_available", navigation)
+        runtime = without_comments(
+            (ROOT / "src/psp_app/psp_app_runtime.c").read_text(
+                encoding="utf-8"))
+        self.assertIn("tls_verify_result_available, clock_status", runtime)
+        self.assertNotIn(
+            "tilefinch_error_is_certificate_verification_failure(detail)",
+            runtime)
+        report = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        self.assertIn("tls-verify-available=%d", report)
+        self.assertIn("tls-verification-failed=%d", report)
 
 
 if __name__ == "__main__":

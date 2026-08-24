@@ -235,6 +235,8 @@ static bool test_document_equivalent(PocDocument *left,
         && left->element_count == right->element_count
         && left->text_bytes == right->text_bytes
         && left->glyph_script_mask == right->glyph_script_mask
+        && left->bidi_text_present == right->bidi_text_present
+        && left->bidi_markup_present == right->bidi_markup_present
         && strcmp(left->title, right->title) == 0
         && left_body != NULL && right_body != NULL
         && strcmp(left_body, right_body) == 0
@@ -381,17 +383,21 @@ static bool test_parser_scripting_noscript_model(Budget *budget)
 static bool test_visible_text_glyph_script_hints(Budget *budget)
 {
     static const char html[] =
-        "<!doctype html><body><p>Привет Tiếng Việt 日本語 かな 한국어 漢</p>"
+        "<!doctype html><body><p>Привет Tiếng Việt 日本語 かな 한국어 漢 "
+        "مرحبا שלום</p>"
         "<script>const hidden='Ґ';</script><style>.x{content:'ộ'}</style>";
     PocDocument document = {0};
-    const uint8_t expected = DOCUMENT_GLYPH_SCRIPT_HAN
+    const uint16_t expected = DOCUMENT_GLYPH_SCRIPT_HAN
         | DOCUMENT_GLYPH_SCRIPT_JAPANESE | DOCUMENT_GLYPH_SCRIPT_KOREAN
         | DOCUMENT_GLYPH_SCRIPT_CYRILLIC
-        | DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED;
+        | DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED
+        | DOCUMENT_GLYPH_SCRIPT_ARABIC | DOCUMENT_GLYPH_SCRIPT_HEBREW;
     bool ok = document_parse(
             &document, budget, html, sizeof(html) - 1u, 7u)
         && document.glyph_script_mask == expected;
-    if (!ok) fprintf(stderr, "glyph script mask=%02x expected=%02x\n",
+    ok = ok && document.bidi_text_present
+         && !document.bidi_markup_present;
+    if (!ok) fprintf(stderr, "glyph script mask=%04x expected=%04x\n",
                      document.glyph_script_mask, expected);
     document_destroy(&document);
 
@@ -401,9 +407,11 @@ static bool test_visible_text_glyph_script_hints(Budget *budget)
     ok = ok && document_parse(
                    &document, budget, hidden_only,
                    sizeof(hidden_only) - 1u, 5u)
-        && document.glyph_script_mask == 0;
+        && document.glyph_script_mask == 0
+        && !document.bidi_text_present
+        && !document.bidi_markup_present;
     if (document.glyph_script_mask != 0)
-        fprintf(stderr, "hidden glyph script mask=%02x\n",
+        fprintf(stderr, "hidden glyph script mask=%04x\n",
                 document.glyph_script_mask);
     document_destroy(&document);
     return ok;
@@ -1914,7 +1922,10 @@ static bool test_deep_document_resource_walkers(Budget *budget)
         "<!doctype html><title>Deep traversal</title><body></body>";
     static const lxb_char_t div_tag[] = "div";
     static const lxb_char_t meta_tag[] = "meta";
+    static const lxb_char_t link_tag[] = "link";
+    static const lxb_char_t style_tag[] = "style";
     static const lxb_char_t text[] = "deep body sentinel";
+    static const lxb_char_t css[] = ".external-flex{display:grid}";
     static const lxb_char_t name_attr[] = "name";
     static const lxb_char_t viewport_value[] = "viewport";
     static const lxb_char_t content_attr[] = "content";
@@ -1924,6 +1935,8 @@ static bool test_deep_document_resource_walkers(Budget *budget)
     PocDocument document = {0};
     Stylesheet stylesheet = {0};
     ImageResources images = {0};
+    StylesheetDocumentResources stylesheet_resources = {0};
+    ExternalStylesheetStats stylesheet_stats = {0};
     size_t baseline = budget->current;
     bool ok = document_parse(
         &document, budget, html, sizeof(html) - 1, 17);
@@ -1961,7 +1974,40 @@ static bool test_deep_document_resource_walkers(Budget *budget)
               &document.html->dom_document, meta_tag,
               sizeof(meta_tag) - 1, NULL)
         : NULL;
-    ok = ok && text_node != NULL && meta != NULL
+    lxb_dom_element_t *link = ok
+        ? lxb_dom_document_create_element(
+              &document.html->dom_document, link_tag,
+              sizeof(link_tag) - 1, NULL)
+        : NULL;
+    lxb_dom_element_t *style = ok
+        ? lxb_dom_document_create_element(
+              &document.html->dom_document, style_tag,
+              sizeof(style_tag) - 1, NULL)
+        : NULL;
+    lxb_dom_text_t *style_text = ok
+        ? lxb_dom_document_create_text_node(
+              &document.html->dom_document, css, sizeof(css) - 1)
+        : NULL;
+    ok = ok && text_node != NULL && meta != NULL && link != NULL
+        && style != NULL && style_text != NULL
+        && lxb_dom_element_set_attribute(
+               lxb_dom_interface_element(cursor),
+               (const lxb_char_t *) "class", 5,
+               (const lxb_char_t *) "external-flex", 13) != NULL
+        && lxb_dom_element_set_attribute(
+               link, (const lxb_char_t *) "rel", 3,
+               (const lxb_char_t *) "stylesheet", 10) != NULL
+        && lxb_dom_element_set_attribute(
+               link, (const lxb_char_t *) "href", 4,
+               (const lxb_char_t *) "https://fixture.test/layout.css", 31)
+               != NULL
+        && lxb_dom_node_append_child(
+               cursor, lxb_dom_interface_node(link)) == LXB_DOM_EXCEPTION_OK
+        && lxb_dom_node_append_child(
+               lxb_dom_interface_node(style),
+               lxb_dom_interface_node(style_text)) == LXB_DOM_EXCEPTION_OK
+        && lxb_dom_node_append_child(
+               cursor, lxb_dom_interface_node(style)) == LXB_DOM_EXCEPTION_OK
         && lxb_dom_node_append_child(
                cursor, lxb_dom_interface_node(text_node))
                == LXB_DOM_EXCEPTION_OK
@@ -1979,6 +2025,8 @@ static bool test_deep_document_resource_walkers(Budget *budget)
     }
 
     MobileViewport viewport = {0};
+    char replay_error[256] = {0};
+    bool replaying = false;
     ok = ok && document_refresh(&document)
         && document.node_count > DEEP_WALK_DEPTH
         && document_body_text(&document) != NULL
@@ -1987,12 +2035,28 @@ static bool test_deep_document_resource_walkers(Budget *budget)
         && document_mobile_viewport(&document, 480, 980, &viewport)
         && viewport.declared && viewport.device_width
         && viewport.layout_width == 480
-        && stylesheet_build(&stylesheet, budget, &document, 480)
+        && stylesheet_build(&stylesheet, budget, &document, 480);
+    if (ok) {
+        replaying = fetch_trace_replay_begin(
+            TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-section-external-layout",
+            replay_error, sizeof(replay_error));
+        ok = replaying && stylesheets_load_external_tracked(
+            &document, &stylesheet, budget,
+            "https://fixture.test/page", 4, 4096, 4096, 1000,
+            NULL, NULL, &stylesheet_resources, &stylesheet_stats);
+    }
+    ComputedStyle deep_style = ok
+        ? style_for_node(&stylesheet, cursor, NULL) : (ComputedStyle) {0};
+    ok = ok && stylesheet_stats.discovered == 1
+        && stylesheet_stats.loaded == 1
+        && deep_style.display == DISPLAY_GRID
         && images_load_external(
             &document, &stylesheet, &images, budget,
             "https://deep-walk.test/", "https://deep-walk.test/", NULL,
             1, 4096, 4096, 4096, 1000, NULL, NULL)
         && images.stats.discovered == 0;
+    if (replaying) fetch_trace_end();
+    stylesheet_document_resources_destroy(&stylesheet_resources);
     images_destroy(&images);
     stylesheet_destroy(&stylesheet);
     document_destroy(&document);

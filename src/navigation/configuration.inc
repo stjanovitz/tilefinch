@@ -406,6 +406,8 @@ uint64_t navigation_begin(NavigationSession *session)
     session->last_http_status = 0;
     session->last_transport_code = 0;
     session->last_tls_verify_result = 0;
+    session->last_tls_verify_result_available = false;
+    session->last_tls_verification_failed = false;
     session->last_transport_timed_out = false;
     session->last_tls12_compatibility_retry = false;
     session->last_tls_version[0] = '\0';
@@ -547,11 +549,18 @@ typedef struct {
     char resource_base_url[NAVIGATION_URL_LIMIT];
     char referrer_policy[128];
     ScriptRuntime *runtime;
+    /* First complete, visibly useful body prefix observed before an author
+       parser callback.  It is a rollback source only; the live document
+       remains authoritative unless later hydration collapses its content. */
+    DocumentBodySnapshot server_body_snapshot;
     FetchSchedulerDomain *fetch_domain;
     FetchScheduler *scheduler;
     StreamingScriptState scripts;
     ScriptResult script_result;
     Stylesheet blocking_stylesheet;
+    /* Parser-time canvas drawing must survive retirement of a short-lived
+       script realm and move atomically with the candidate document. */
+    ImageResources canvas_images;
     StylesheetDocumentResources stylesheet_resources;
     ExternalStylesheetStats blocking_stylesheets;
     LayoutReuseCache *preview_layout_reuse;

@@ -1796,7 +1796,8 @@ bool style_parse_gradient(const Stylesheet *sheet, const char *text,
         count++;
         if (has_second_position) {
             if (count >= STYLE_GRADIENT_PARSE_STOP_LIMIT) return false;
-            colors[count] = color;
+            /* Duplicate the complete stop, including its alpha channel. */
+            colors[count] = colors[count - 1u];
             positions[count] = position;
             positioned[count] = true;
             positions[count - 1] = second_position;
@@ -2737,7 +2738,15 @@ static bool style_parse_layer_geometry(
             stack.masks[index].width = parsed.background_width;
             stack.masks[index].height = parsed.background_height;
             stack.masks[index].fit = parsed.background_fit;
-            stack.masks[index].flags = parsed.background_size_flags;
+            const uint8_t size_flags =
+                STYLE_BACKGROUND_SIZE_EXPLICIT
+                | STYLE_BACKGROUND_WIDTH_PERCENT
+                | STYLE_BACKGROUND_HEIGHT_PERCENT
+                | STYLE_BACKGROUND_WIDTH_AUTO
+                | STYLE_BACKGROUND_HEIGHT_AUTO;
+            stack.masks[index].flags = (uint8_t) (
+                (stack.masks[index].flags & (uint8_t) ~size_flags)
+                | (parsed.background_size_flags & size_flags));
         } else if (component == 1) {
             if (!style_parse_paint_position_value(
                     sheet, value, span, &stack.masks[index])) return false;
@@ -3237,7 +3246,8 @@ uint64_t style_parse_box(const Stylesheet *sheet, const char *text,
     length = strlen(resolved);
     int values[4] = {0};
     size_t count = 0;
-    for (size_t at = 0; at < length && count < 4;) {
+    size_t at = 0;
+    for (; at < length && count < 4;) {
         while (at < length && isspace((unsigned char) text[at])) at++;
         size_t end = at;
         int parentheses = 0;
@@ -3247,9 +3257,16 @@ uint64_t style_parse_box(const Stylesheet *sheet, const char *text,
             if (parentheses == 0 && isspace((unsigned char) text[end])) break;
             end++;
         }
-        if (end > at) values[count++] = style_parse_length(sheet, text + at, end - at, 0, NULL);
+        if (end > at) {
+            int parsed = style_parse_length(
+                sheet, text + at, end - at, INT_MIN, NULL);
+            if (parsed == INT_MIN || (padding && parsed < 0)) return 0;
+            values[count++] = parsed;
+        }
         at = end;
     }
+    while (at < length && isspace((unsigned char) text[at])) at++;
+    if (at != length) return 0;
     if (count == 0) return 0;
     edges->top = values[0];
     edges->right = count > 1 ? values[1] : values[0];
@@ -3297,7 +3314,8 @@ static bool parse_style_length_components(Stylesheet *sheet,
         }
         if (end == at || parentheses != 0
             || !parse_style_length(sheet, resolved + at, end - at,
-                                   &values[used], NULL)) {
+                                   &values[used], NULL)
+            || values[used] < 0) {
             style_math_restore(sheet, program_count, instruction_count);
             return false;
         }
@@ -3392,7 +3410,9 @@ uint64_t style_parse_margin_box(const Stylesheet *sheet, const char *text,
         if (end > at) {
             automatic[count] = style_length_is_auto(sheet, text + at, end - at);
             values[count] = automatic[count] ? 0 : style_parse_length(
-                sheet, text + at, end - at, 0, &percentages[count]);
+                sheet, text + at, end - at, INT_MIN,
+                &percentages[count]);
+            if (!automatic[count] && values[count] == INT_MIN) return 0;
             count++;
         }
         at = end;
@@ -3539,16 +3559,13 @@ uint64_t style_parse_border(
     int parsed_width = -1;
     bool has_color = false;
     unsigned parsed_style = STYLE_BORDER_NONE;
+    bool has_style = false;
     /* CSS drops a declaration it cannot parse, leaving the previous cascaded
        value in force.  Track whether ANY component of this value was
        understood so a wholly unparseable `border` value (an unresolvable
        var(), say) reports "no edges touched" instead of silently rewriting
        the border to the 1px default. */
     bool recognized = false;
-    static const char *const border_styles[] = {
-        "solid", "dotted", "dashed", "double", "groove", "ridge",
-        "inset", "outset", "thin", "medium", "thick"
-    };
     for (size_t at = 0; at < length;) {
         while (at < length && isspace((unsigned char) text[at])) at++;
         size_t end = at;
@@ -3564,7 +3581,9 @@ uint64_t style_parse_border(
             uint8_t candidate_alpha = 255;
             if (span_equal(text + at, end - at, "none")
                 || span_equal(text + at, end - at, "hidden")) {
+                if (has_style) return 0;
                 parsed_style = STYLE_BORDER_NONE;
+                has_style = true;
                 recognized = true;
             } else if (style_parse_color_with_alpha(sheet, text + at, end - at,
                                        &candidate, &candidate_alpha)) {
@@ -3576,28 +3595,44 @@ uint64_t style_parse_border(
                 int candidate_width = style_parse_length(sheet, text + at,
                                                    end - at, -1, NULL);
                 if (candidate_width >= 0) {
+                    if (parsed_width >= 0) return 0;
                     parsed_width = candidate_width;
                     recognized = true;
+                } else if (span_equal(text + at, end - at, "thin")
+                           || span_equal(text + at, end - at, "medium")
+                           || span_equal(text + at, end - at, "thick")) {
+                    if (parsed_width >= 0) return 0;
+                    parsed_width = span_equal(text + at, end - at, "thin")
+                        ? 1 : (span_equal(text + at, end - at, "medium")
+                               ? 3 : 5);
+                    recognized = true;
                 } else {
-                    for (size_t i = 0; i < sizeof(border_styles)
-                                             / sizeof(border_styles[0]); i++) {
-                        if (span_equal(text + at, end - at,
-                                       border_styles[i])) {
-                            parsed_style = i == 1 ? STYLE_BORDER_DOTTED
-                                : (i == 2 ? STYLE_BORDER_DASHED
-                                          : STYLE_BORDER_SOLID);
-                            recognized = true;
-                            break;
-                        }
-                    }
+                    unsigned candidate_style = STYLE_BORDER_NONE;
+                    bool style_token = true;
+                    if (span_equal(text + at, end - at, "dotted"))
+                        candidate_style = STYLE_BORDER_DOTTED;
+                    else if (span_equal(text + at, end - at, "dashed"))
+                        candidate_style = STYLE_BORDER_DASHED;
+                    else if (span_equal(text + at, end - at, "solid")
+                             || span_equal(text + at, end - at, "double")
+                             || span_equal(text + at, end - at, "groove")
+                             || span_equal(text + at, end - at, "ridge")
+                             || span_equal(text + at, end - at, "inset")
+                             || span_equal(text + at, end - at, "outset"))
+                        candidate_style = STYLE_BORDER_SOLID;
+                    else style_token = false;
+                    if (!style_token || has_style) return 0;
+                    parsed_style = candidate_style;
+                    has_style = true;
+                    recognized = true;
                 }
             }
         }
         at = end;
     }
     if (!recognized) return 0;
-    if (parsed_style == STYLE_BORDER_NONE) parsed_width = 0;
-    else if (parsed_width < 0) parsed_width = 1;
+    if (has_style && parsed_style == STYLE_BORDER_NONE) parsed_width = 0;
+    else if (parsed_width < 0) parsed_width = 3;
     *width = parsed_width;
     *line_style = parsed_style;
     if (!has_color) {
@@ -3607,12 +3642,13 @@ uint64_t style_parse_border(
     return edge_mask;
 }
 
-void style_parse_pair(const Stylesheet *sheet, const char *text,
-                       size_t length, int *first, int *second)
+bool style_parse_pair(const Stylesheet *sheet, const char *text,
+                      size_t length, int *first, int *second)
 {
     int values[2] = {0, 0};
     size_t count = 0;
-    for (size_t at = 0; at < length && count < 2;) {
+    size_t at = 0;
+    for (; at < length && count < 2;) {
         while (at < length && isspace((unsigned char) text[at])) at++;
         size_t end = at;
         int parentheses = 0;
@@ -3623,12 +3659,18 @@ void style_parse_pair(const Stylesheet *sheet, const char *text,
             end++;
         }
         if (end > at) {
-            values[count++] = style_parse_length(sheet, text + at, end - at, 0, NULL);
+            int parsed = style_parse_length(
+                sheet, text + at, end - at, INT_MIN, NULL);
+            if (parsed == INT_MIN) return false;
+            values[count++] = parsed;
         }
         at = end;
     }
+    while (at < length && isspace((unsigned char) text[at])) at++;
+    if (count == 0 || at != length) return false;
     *first = values[0];
     *second = count > 1 ? values[1] : values[0];
+    return true;
 }
 
 bool style_parse_pair_with_auto(const Stylesheet *sheet, const char *text,
@@ -3636,7 +3678,8 @@ bool style_parse_pair_with_auto(const Stylesheet *sheet, const char *text,
                                  bool automatic[2], bool percentages[2])
 {
     size_t count = 0;
-    for (size_t at = 0; at < length && count < 2;) {
+    size_t at = 0;
+    for (; at < length && count < 2;) {
         while (at < length && isspace((unsigned char) text[at])) at++;
         size_t end = at;
         int parentheses = 0;
@@ -3650,13 +3693,15 @@ bool style_parse_pair_with_auto(const Stylesheet *sheet, const char *text,
             automatic[count] = style_length_is_auto(sheet, text + at, end - at);
             bool percent = false;
             values[count] = automatic[count] ? 0 : style_parse_length(
-                sheet, text + at, end - at, 0, &percent);
+                sheet, text + at, end - at, INT_MIN, &percent);
+            if (!automatic[count] && values[count] == INT_MIN) return false;
             if (percentages != NULL) percentages[count] = percent;
             count++;
         }
         at = end;
     }
-    if (count == 0) return false;
+    while (at < length && isspace((unsigned char) text[at])) at++;
+    if (count == 0 || at != length) return false;
     if (count == 1) {
         values[1] = values[0];
         automatic[1] = automatic[0];
@@ -4997,6 +5042,18 @@ static bool style_parse_grid_track_template(
         at = end;
     }
     if (!subgrid && parsed.track_count == 0) return false;
+    /* Positive grid placements occupy only values 1..9 in the compact
+       four-bit representation; values 10..15 encode negative lines.  A
+       named template must therefore keep its final positive line at nine or
+       below instead of resolving a later name to a silently clamped line. */
+    if (has_line_names
+        && ((subgrid
+             && subgrid_line > COMPUTED_GRID_NEGATIVE_LINE_MIN - 1u)
+            || (!subgrid
+                && parsed.track_count
+                   >= COMPUTED_GRID_NEGATIVE_LINE_MIN - 1u))) {
+        return false;
+    }
 
     ComputedStyle candidate = *style;
     if (rows) {

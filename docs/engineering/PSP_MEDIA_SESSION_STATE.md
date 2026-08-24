@@ -15,14 +15,16 @@ compatible page `<video>`/`<audio>` elements enter the same opening and
 playback states. A high-confidence structured `AudioObject` preview uses the
 same page-audio route with no synthetic DOM element or node handle. For page
 media, activation resolves the selected
-MP4/M4A or VOD HLS source, applies
+MP4/M4A or HLS source, applies
 `media-src`, mixed-content, private-network, CORS, cookie, redirect, and content-
 blocking policy, and launches the native player. MP4 uses a one-byte Range
 probe before the progressive demux; page audio selects its AAC track and the
 existing audio-only backend without allocating a video surface. HLS uses
-bounded master/media playlists, two segment requests, and the MPEG-TS packet
-source. All routes then use the same clock and state transitions. No page-media
-bytes are written to the Memory Stick.
+bounded master/media playlists, two shared request slots, and the MPEG-TS
+packet source. Rolling live HLS periodically replaces its playlist window and
+keeps a continuous local timestamp origin; it exposes Play/Pause and Close but
+not seek. All routes then use the same clock and state transitions. No
+page-media bytes are written to the Memory Stick.
 
 ## Resource invariants
 
@@ -221,6 +223,14 @@ Chrome is a pure projection of `(state, context)`, not a list of UI deltas.
 This prevents stale overlays and makes authoritative and shadow projections
 directly comparable. The projection describes visibility, progress overlay,
 control availability, playing state, and whether Retry is legal.
+
+The projection also declares the exact bounded rectangles it may write. The
+8888 video bridge imports a decoded-picture backdrop only for translucent
+regions; the opaque title and bottom bars start from clean scratch and cannot
+sample a changing frame. Host tests composite onto a poisoned surface and
+require every changed pixel to lie inside the declaration, while pixels
+outside it must retain the decoder's exact bytes. Geometry and ownership
+therefore remain part of one projection rather than parallel compositor state.
 
 Input handling and publication preserve that single authority. Revealing the
 controls, moving a seek preview, dismissing a preview, closing, and retrying

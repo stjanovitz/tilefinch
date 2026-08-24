@@ -44,6 +44,36 @@ static bool component_file_exists(const char *path)
     return true;
 }
 
+/* Release the user module only while it cannot own the Media Engine. A stop or
+   unload failure deliberately retains the budget reservation: firmware still
+   owns the resident bytes, so reporting them free would make later admission
+   unsafe even if the component itself is no longer usable. */
+static bool component_unload_module(PspSwdecComponent *component)
+{
+    if (component == NULL || component->module_id < 0 || component->took_me)
+        return component != NULL && component->module_id < 0;
+    if (component->module_started) {
+        int module_status = 0;
+        int stopped = sceKernelStopModule(
+            component->module_id, 0, NULL, &module_status, NULL);
+        if (stopped < 0 || module_status != 0) {
+            component->last_native_error = stopped < 0
+                ? stopped : module_status;
+            return false;
+        }
+        component->module_started = false;
+    }
+    int unloaded = sceKernelUnloadModule(component->module_id);
+    if (unloaded < 0) {
+        component->last_native_error = unloaded;
+        return false;
+    }
+    component->module_id = -1;
+    memset(&component->api, 0, sizeof(component->api));
+    budget_reservation_release(&component->resident_reservation);
+    return true;
+}
+
 static void component_failed_message(
     const PspSwdecComponent *component,
     char *error, size_t error_size)
@@ -162,6 +192,7 @@ static bool psp_swdec_component_load(
                         (unsigned) module);
         return false;
     }
+    component->module_id = module;
     TilefinchSwdecComponentStart start = {
         .magic = TILEFINCH_SWDEC_COMPONENT_MAGIC,
         .abi_version = TILEFINCH_SWDEC_COMPONENT_ABI_VERSION,
@@ -171,6 +202,7 @@ static bool psp_swdec_component_load(
     int status = -1;
     int result = sceKernelStartModule(
         module, sizeof(start), &start, &status, NULL);
+    component->module_started = result >= 0;
     if (result < 0 || status != 0
         || component->api.magic != TILEFINCH_SWDEC_COMPONENT_MAGIC
         || component->api.abi_version
@@ -194,16 +226,17 @@ static bool psp_swdec_component_load(
         || component->api.audio_reset == NULL
         || component->api.audio_shutdown == NULL
         || component->api.csc_begin == NULL
+        || component->api.csc_picture == NULL
         || component->api.csc_close == NULL
         || component->api.csc_off == NULL) {
         component->last_native_error = result < 0 ? result : status;
         component->state = PSP_SWDEC_COMPONENT_FAILED;
         component->failure = PSP_SWDEC_COMPONENT_FAILURE_REBUILD;
         memset(&component->api, 0, sizeof(component->api));
+        (void) component_unload_module(component);
         component_failed_message(component, error, error_size);
         return false;
     }
-    component->module_id = module;
     component->state = PSP_SWDEC_COMPONENT_LOADED;
     printf("tilefinch-swdec: event=component-loaded module=0x%08x\n",
            (unsigned) module);
@@ -224,22 +257,31 @@ bool psp_swdec_component_prepare(
                         "OPTIONAL VIDEO DECODER IS INCOMPLETE - SEE README");
         component->state = PSP_SWDEC_COMPONENT_FAILED;
         component->failure = PSP_SWDEC_COMPONENT_FAILURE_REBUILD;
+        (void) component_unload_module(component);
         return false;
     }
+    /* From the first attach call onward, assume the component may own ME state
+       until restore proves otherwise. This is conservative for an early
+       failure and prevents failure cleanup from unloading code after a
+       partial takeover. */
+    component->took_me = true;
     int result = component->api.attach_me(helper, component_log);
     if (result != 0) {
         component->last_native_error = result;
         /* Attach can fail after the helper patched the firmware preamble.
            Restore unconditionally before declaring this route unavailable. */
         component->api.detach_me();
-        (void) component->api.restore_me();
+        int restored = component->api.restore_me();
+        if (restored == 0 || restored == 1) {
+            component->took_me = false;
+            (void) component_unload_module(component);
+        }
         component->state = PSP_SWDEC_COMPONENT_FAILED;
         component->failure = PSP_SWDEC_COMPONENT_FAILURE_RUNTIME;
         component_error(error, error_size,
                         "software decoder ME attach failed (%d)", result);
         return false;
     }
-    component->took_me = true;
     component->state = PSP_SWDEC_COMPONENT_ATTACHED;
     return true;
 }
@@ -276,11 +318,17 @@ void psp_swdec_component_shutdown(PspSwdecComponent *component)
     if (component->took_me
         && component->state == PSP_SWDEC_COMPONENT_ATTACHED)
         component->api.detach_me();
-    if (component->took_me && component->api.restore_me != NULL)
-        (void) component->api.restore_me();
-    if (component->took_me)
+    bool restored = !component->took_me;
+    if (component->took_me && component->api.restore_me != NULL) {
+        int result = component->api.restore_me();
+        restored = result == 0 || result == 1;
+        if (!restored) component->last_native_error = result;
+    }
+    if (restored) {
+        component->took_me = false;
         component->state = PSP_SWDEC_COMPONENT_RESTORED;
-    budget_reservation_release(&component->resident_reservation);
+        (void) component_unload_module(component);
+    }
 }
 
 bool psp_swdec_component_owns_me(const PspSwdecComponent *component)

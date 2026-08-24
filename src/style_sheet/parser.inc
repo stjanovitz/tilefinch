@@ -623,6 +623,7 @@ static bool parse_nested_style_block(StyleCssParseContext *context,
             char expanded[STYLE_SELECTOR_CAPACITY * 8];
             size_t expanded_length = 0;
             size_t combinations = 0;
+            bool combination_limit = false;
             for (size_t parent_at = 0; parent_at < selector_length;) {
                 size_t parent_end = css_selector_item_end(
                     selectors, selector_length, parent_at);
@@ -630,8 +631,13 @@ static bool parse_nested_style_block(StyleCssParseContext *context,
                     size_t child_end = css_selector_item_end(
                         header, header_length, child_at);
                     char one[STYLE_SELECTOR_CAPACITY];
-                    if (++combinations > 32
-                        || !nested_selector_expand_one(
+                    if (++combinations > 32) {
+                        diagnostic_saturating_add(
+                            &sheet->diagnostic_selector_drops, 1);
+                        combination_limit = true;
+                        break;
+                    }
+                    if (!nested_selector_expand_one(
                                selectors + parent_at, parent_end - parent_at,
                                header + child_at, child_end - child_at, one)) {
                         return false;
@@ -639,7 +645,17 @@ static bool parse_nested_style_block(StyleCssParseContext *context,
                     size_t one_length = strlen(one);
                     if (expanded_length + one_length
                             + (expanded_length != 0) + 1
-                        > sizeof(expanded)) return false;
+                        > sizeof(expanded)) {
+                        /* Flush a bounded selector batch instead of making
+                           a long but otherwise valid cartesian expansion
+                           invalidate the complete stylesheet. */
+                        expanded[expanded_length] = '\0';
+                        if (expanded_length == 0
+                            || !parse_nested_style_block(
+                                context, css, delimiter + 1, close, expanded,
+                                expanded_length, depth + 1)) return false;
+                        expanded_length = 0;
+                    }
                     if (expanded_length != 0) {
                         expanded[expanded_length++] = ',';
                     }
@@ -647,10 +663,11 @@ static bool parse_nested_style_block(StyleCssParseContext *context,
                     expanded_length += one_length;
                     child_at = child_end + (child_end < header_length);
                 }
+                if (combination_limit) break;
                 parent_at = parent_end + (parent_end < selector_length);
             }
             expanded[expanded_length] = '\0';
-            if (!parse_nested_style_block(
+            if (expanded_length != 0 && !parse_nested_style_block(
                     context, css, delimiter + 1, close, expanded,
                     expanded_length, depth + 1)) return false;
         }

@@ -126,6 +126,7 @@ static int test_block_boundary_whitespace(Budget *budget)
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget->current == 0);
+
     return 0;
 }
 static int test_ua_body_spacing(Budget *budget)
@@ -311,6 +312,53 @@ static int test_ua_body_spacing(Budget *budget)
           && quirks_author_form_style.margin.left == 0);
     stylesheet_destroy(&quirks_form_sheet);
     document_destroy(&quirks_form_document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_scroll_scene_coordinate_containment(Budget *budget)
+{
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}.scene{height:1048575px;"
+        "animation:scroll-scene 2s linear}.tail{height:20px}"
+        "@keyframes scroll-scene{from{transform:translateY(100vh);opacity:0}"
+        "to{transform:none;opacity:1}}</style><body>"
+        "<div class=scene></div><p id=tail class=tail>TAIL-AFTER-SCENE</p>"
+        "</body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1u, 31u)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    const DrawCommand *tail = text_command(&layout, "TAIL-AFTER-SCENE");
+    CHECK(tail != NULL && tail->y > 0 && tail->y < 272 * 16
+          && layout.height < 272 * 20
+          && layout.performance.coordinate_containments == 1u
+          && layout.performance.first_coordinate_clamp_y == 0);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+
+    static const char root_page[] =
+        "<!doctype html><style>body{margin:0;height:1048575px}</style>"
+        "<body><p>ROOT-CONTENT</p></body>";
+    PocDocument root_document = {0};
+    Stylesheet root_sheet = {0};
+    LayoutDocument root_layout = {0};
+    CHECK(document_parse(&root_document, budget, root_page,
+                         sizeof(root_page) - 1u, 32u));
+    CHECK(stylesheet_build(&root_sheet, budget, &root_document, 480));
+    CHECK(layout_build(&root_layout, budget, &root_document, &root_sheet,
+                       NULL, NULL, 480));
+    CHECK(root_layout.height < 272 * 65);
+    CHECK(root_layout.performance.coordinate_clamps == 1u);
+    CHECK(root_layout.performance.coordinate_containments == 1u);
+    layout_destroy(&root_layout);
+    stylesheet_destroy(&root_sheet);
+    document_destroy(&root_document);
     CHECK(budget->current == 0);
     return 0;
 }

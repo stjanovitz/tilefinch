@@ -310,6 +310,18 @@ bool style_container_layout_state_add(Stylesheet *sheet,
             query_trim(&type_text, &type_length);
             (void) parse_container_type_value(type_text, type_length, &type);
             names = container_name_bits(sheet, name, name_length);
+        } else {
+            const char *value = shorthand;
+            size_t value_length = strlen(shorthand);
+            query_trim(&value, &value_length);
+            if (!query_span_case_equal(value, value_length, "none")
+                && !parse_container_type_value(
+                    value, value_length, &type)) {
+                /* A recognized type may stand alone. Any other non-none
+                   token is the name-only shorthand and leaves the type at
+                   normal. */
+                names = container_name_bits(sheet, value, value_length);
+            }
         }
     }
     if (has_type) {

@@ -12,7 +12,14 @@
 #include <ctype.h>
 #include <strings.h>
 
-bool script_module_mime_type_allowed(const char *content_type)
+static bool script_ascii_whitespace(unsigned char value)
+{
+    return value == 0x09u || value == 0x0au || value == 0x0cu
+        || value == 0x0du || value == 0x20u;
+}
+
+static bool script_javascript_mime_span_allowed(
+    const char *content_type, size_t length)
 {
     static const char *const javascript_mime_types[] = {
         "application/ecmascript", "application/javascript",
@@ -23,10 +30,16 @@ bool script_module_mime_type_allowed(const char *content_type)
         "text/livescript", "text/x-ecmascript", "text/x-javascript"
     };
     if (content_type == NULL) return false;
-    while (isspace((unsigned char) *content_type)) content_type++;
-    size_t length = strcspn(content_type, ";");
     while (length != 0
-           && isspace((unsigned char) content_type[length - 1])) length--;
+           && script_ascii_whitespace((unsigned char) *content_type)) {
+        content_type++;
+        length--;
+    }
+    const char *semicolon = memchr(content_type, ';', length);
+    if (semicolon != NULL) length = (size_t) (semicolon - content_type);
+    while (length != 0
+           && script_ascii_whitespace(
+                  (unsigned char) content_type[length - 1])) length--;
     if (length == 0) return false;
     for (size_t i = 0;
          i < sizeof(javascript_mime_types)
@@ -36,6 +49,34 @@ bool script_module_mime_type_allowed(const char *content_type)
                    == 0) return true;
     }
     return false;
+}
+
+bool script_module_mime_type_allowed(const char *content_type)
+{
+    return content_type != NULL
+        && script_javascript_mime_span_allowed(
+            content_type, strlen(content_type));
+}
+
+bool script_type_attribute_classify(
+    const char *type, size_t length, bool *module)
+{
+    if (module != NULL) *module = false;
+    if (type == NULL) return true;
+    while (length != 0
+           && script_ascii_whitespace((unsigned char) *type)) {
+        type++;
+        length--;
+    }
+    while (length != 0
+           && script_ascii_whitespace(
+                  (unsigned char) type[length - 1u])) length--;
+    if (length == 0) return true;
+    if (length == 6u && strncasecmp(type, "module", 6u) == 0) {
+        if (module != NULL) *module = true;
+        return true;
+    }
+    return script_javascript_mime_span_allowed(type, length);
 }
 
 bool script_module_revalidated_mime_allowed(

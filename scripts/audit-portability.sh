@@ -98,7 +98,8 @@ gif_log="$output_dir/desktop-gif-stack.log"
 # known stb exception is still audited instead of silently disappearing.
 "$compiler" $defines $includes -UTILEFINCH_DISABLE_GIF \
     -std=c11 -O2 -Wframe-larger-than=16384 \
-    -c "$root/src/image.c" -o "$output_dir/objects/image-desktop.o" \
+    -c "$root/src/image_decode.c" \
+    -o "$output_dir/objects/image-decode-desktop.o" \
     >> "$gif_log" 2>&1
 gif_warnings=$(grep -c "stb_image.h:.*warning: stack frame size" \
     "$gif_log" || true)

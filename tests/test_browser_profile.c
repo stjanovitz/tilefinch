@@ -96,10 +96,14 @@ int main(void)
           && BROWSER_GLYPH_LANGUAGE_KOREAN == 4
           && BROWSER_GLYPH_LANGUAGE_CYRILLIC == 5
           && BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED == 6
-          && BROWSER_GLYPH_LANGUAGE_COUNT == 7);
+          && BROWSER_GLYPH_LANGUAGE_ARABIC == 7
+          && BROWSER_GLYPH_LANGUAGE_HEBREW == 8
+          && BROWSER_GLYPH_LANGUAGE_COUNT == 9);
     CHECK(glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_CYRILLIC)
           && glyph_language_roundtrips(
-                 BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED));
+                 BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED)
+          && glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_ARABIC)
+          && glyph_language_roundtrips(BROWSER_GLYPH_LANGUAGE_HEBREW));
     Budget budget;
     budget_init(&budget, 2u * 1024u * 1024u);
     BrowserProfile *profile = browser_profile_create(&budget);
@@ -265,6 +269,33 @@ int main(void)
                  profile, "https://m.news.example/other")
           && browser_profile_cookie_banner_hidden(
                  profile, "https://other.example/"));
+    CHECK(browser_profile_set_site_javascript_enabled(
+              profile, "https://reset.example/page", false)
+          && browser_profile_set_third_party_cookie_site_allowed(
+              profile, "https://reset.example/page", true)
+          && browser_profile_set_cookie_banner_hidden(
+              profile, "https://reset.example/page", false)
+          && browser_profile_set_content_blocker_site_allowed(
+              profile, "https://reset.example/page", true)
+          && browser_profile_record_reader_site_font_percent(
+              profile, "https://reset.example/page", 125)
+          && browser_profile_set_reader_site_always(
+              profile, "https://reset.example/page", true)
+          && browser_profile_reset_site_permissions(
+              profile, "https://reset.example/page")
+          && browser_profile_site_javascript_enabled(
+              profile, "https://reset.example/other")
+          && !browser_profile_third_party_cookie_site_allowed(
+              profile, "https://reset.example/other")
+          && browser_profile_cookie_banner_hidden(
+              profile, "https://reset.example/other")
+          && !browser_profile_content_blocker_site_allowed(
+              profile, "https://reset.example/other")
+          && !browser_profile_reader_site_always(
+              profile, "https://reset.example/other")
+          && browser_profile_reader_site_font_percent(
+              profile, "https://reset.example/other", &reader_percent)
+          && reader_percent == 125);
     CHECK(browser_profile_add_bookmark(
         profile, "https://example.test/a?x=1&y=2", "A <page>"));
     CHECK(browser_profile_has_bookmark(

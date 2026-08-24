@@ -61,6 +61,8 @@ const char *psp_input_script_action_name(PspUiAction action)
         case PSP_UI_ACTION_SHOW_HOMEPAGE: return "show-homepage";
         case PSP_UI_ACTION_SHOW_HISTORY: return "show-history";
         case PSP_UI_ACTION_SCREENSHOT: return "screenshot";
+        case PSP_UI_ACTION_CHECK_WIFI_SIGN_IN:
+            return "check-wifi-sign-in";
         case PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR:
             return "build-diagnostic-qr";
         case PSP_UI_ACTION_DIAGNOSTIC_QR_PREVIOUS:
@@ -81,6 +83,14 @@ const char *psp_input_script_action_name(PspUiAction action)
         case PSP_UI_ACTION_HOME_ACTIVATE: return "home-activate";
         case PSP_UI_ACTION_COLLECTION_ACTIVATE: return "collection-activate";
         case PSP_UI_ACTION_COLLECTION_DELETE: return "collection-delete";
+        case PSP_UI_ACTION_RECOVERY_READER: return "recovery-reader";
+        case PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT:
+            return "recovery-disable-javascript";
+        case PSP_UI_ACTION_RECOVERY_AUDIO_ONLY:
+            return "recovery-audio-only";
+        case PSP_UI_ACTION_RECOVERY_LOWER_QUALITY:
+            return "recovery-lower-quality";
+        case PSP_UI_ACTION_RECOVERY_RETURN: return "recovery-return";
         case PSP_UI_ACTION_EXIT: return "exit";
     }
     return "unknown";
@@ -157,6 +167,7 @@ const char *psp_input_script_screen_name(PspUiScreen screen)
         case PSP_UI_SCREEN_PAGE_TOOLS: return "page-tools";
         case PSP_UI_SCREEN_SITE_CONTROLS: return "site-controls";
         case PSP_UI_SCREEN_PAGE_INFORMATION: return "page-information";
+        case PSP_UI_SCREEN_FAILURE_RECOVERY: return "failure-recovery";
         case PSP_UI_SCREEN_HELP: return "help";
         case PSP_UI_SCREEN_HELP_DETAIL: return "help-detail";
         case PSP_UI_SCREEN_OPTIONS: return "options";
@@ -474,10 +485,18 @@ bool psp_input_script_load(
        rather than sizing a buffer from a file the device just found. */
     char text[8192];
     size_t read = fread(text, 1u, sizeof(text) - 1u, file);
-    bool overflowed = !feof(file) || ferror(file);
+    bool read_failed = ferror(file) != 0;
+    bool overflowed = false;
+    if (!read_failed && read == sizeof(text) - 1u) {
+        int extra = fgetc(file);
+        if (extra != EOF) overflowed = true;
+        else if (ferror(file) != 0) read_failed = true;
+    }
     (void) fclose(file);
-    if (overflowed) {
-        if (warning != NULL) warning(warning_context, path, 0, "too large");
+    if (read_failed || overflowed) {
+        if (warning != NULL)
+            warning(warning_context, path, 0,
+                    read_failed ? "read failed" : "too large");
         return false;
     }
     text[read] = '\0';

@@ -87,6 +87,15 @@ scripts/run-ppsspp-network.sh --media-fixture-test
 Only hardware may emit a media hardware pass after decoder pixels and audio
 actually progress.
 
+Player-chrome qualification covers controls-visible playback, buffering,
+seek preview, resolving, and failure panels. Host poisoned-surface tests prove
+that the 8888 bridge writes only its declared rectangles and preserves every
+pixel outside them. A physical PSP timing comparison should sample hidden and
+controls-visible frames through the existing compositing counter, and visual
+review should specifically check the bottom bar and its left edge for shimmer
+while playback starts, pauses, resumes, and seeks. Host or emulator pixels do
+not substitute for that cadence and panel evidence.
+
 ### Raster fixture
 
 `validation_raster_fixture_auto=1` renders an embedded atlas through the PSP

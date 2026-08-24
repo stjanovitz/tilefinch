@@ -22,6 +22,17 @@ typedef enum {
 } OfflineDownloadPhase;
 
 typedef struct {
+    uint32_t id;
+    OfflineDownloadPhase phase;
+    uint64_t downloaded_bytes;
+    uint64_t total_bytes;
+    uint64_t available_bytes;
+    uint32_t bytes_per_second;
+    bool active;
+    char failure_reason[OFFLINE_LIBRARY_FAILURE_LIMIT];
+} OfflineDownloadSnapshot;
+
+typedef struct {
     Budget *budget;
     BrowserSession *session;
     OfflineLibrary *library;
@@ -43,6 +54,10 @@ typedef struct {
     YoutubeResolverCancelCallback cancel;
     void *cancel_opaque;
     int maximum_height;
+    uint64_t available_bytes;
+    uint64_t speed_sample_us;
+    uint64_t speed_sample_bytes;
+    uint32_t bytes_per_second;
 } OfflineDownloadManager;
 
 void offline_download_manager_init(
@@ -69,6 +84,9 @@ bool offline_download_manager_pause(
     OfflineDownloadManager *manager, uint32_t id);
 bool offline_download_manager_active(
     const OfflineDownloadManager *manager, uint32_t *id);
+bool offline_download_manager_snapshot(
+    const OfflineDownloadManager *manager, uint32_t id,
+    OfflineDownloadSnapshot *snapshot);
 void offline_download_manager_destroy(OfflineDownloadManager *manager);
 
 #endif

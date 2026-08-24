@@ -210,7 +210,8 @@ static bool psp_history_open_internal(
         psp_ui_show_collections(&app->process->presentation.ui, collection);
         psp_collections_sync_ui(
             &app->process->presentation.ui, &app->process->presentation.collections_surface, profile,
-            &app->browser->offline_store.library, collection);
+            &app->browser->offline_store.library,
+            &app->browser->offline_store.download, collection);
     } else if (screenshots) {
         opened = psp_open_screenshot_list(
             engine, app->process->install_paths.data_dir, false);
@@ -260,6 +261,24 @@ static void psp_app_dispatch_find_step(
     }
 }
 
+/* HOME Continue rows carry tab identity, not a URL. Translate that one
+   presentation action into the ordinary tab command before the receiver
+   switch so it reuses the complete request/restore/finish path below. */
+static bool psp_app_resolve_home_tab_action(
+    const PspApp *app, const PspUiIntent *source, PspUiIntent *resolved)
+{
+    if (app == NULL || source == NULL || resolved == NULL
+        || source->action != PSP_UI_ACTION_HOME_ACTIVATE) return false;
+    size_t target = 0;
+    if (psp_home_target_kind(
+            &app->process->presentation.home_surface,
+            source->list_index, &target) != PSP_HOME_TARGET_TAB) return false;
+    *resolved = *source;
+    resolved->action = PSP_UI_ACTION_SWITCH_TAB;
+    resolved->tab_index = target;
+    return true;
+}
+
 /*
  * Keep the actions used while reading and spatially navigating out of the
  * large receiver below.  On Allegrex the full switch needs an 8 KiB stack
@@ -271,6 +290,37 @@ void psp_app_dispatch_action(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
 {
     if (intent == NULL || intent->action == PSP_UI_ACTION_NONE) return;
+    if (psp_captive_portal_active(app->interactive)) {
+        switch (intent->action) {
+            case PSP_UI_ACTION_FOCUS_PREVIOUS:
+            case PSP_UI_ACTION_FOCUS_NEXT:
+            case PSP_UI_ACTION_FOCUS_UP:
+            case PSP_UI_ACTION_FOCUS_DOWN:
+            case PSP_UI_ACTION_FOCUS_LEFT:
+            case PSP_UI_ACTION_FOCUS_RIGHT:
+            case PSP_UI_ACTION_FOCUS_AT:
+            case PSP_UI_ACTION_ACTIVATE:
+            case PSP_UI_ACTION_SUBMIT_FOCUSED_TEXT:
+            case PSP_UI_ACTION_BACK:
+            case PSP_UI_ACTION_RELOAD:
+            case PSP_UI_ACTION_PAGE_UP:
+            case PSP_UI_ACTION_PAGE_DOWN:
+            case PSP_UI_ACTION_SCROLL_TOP:
+            case PSP_UI_ACTION_SCROLL_BOTTOM:
+            case PSP_UI_ACTION_OPEN_FIND:
+            case PSP_UI_ACTION_FIND_PREVIOUS:
+            case PSP_UI_ACTION_FIND_NEXT:
+            case PSP_UI_ACTION_FIND_EDIT:
+            case PSP_UI_ACTION_FIND_CLOSE:
+            case PSP_UI_ACTION_EXIT:
+                break;
+            default:
+                psp_ui_show_status(
+                    &app->process->presentation.ui,
+                    "UNAVAILABLE DURING WI-FI SIGN-IN", 150);
+                return;
+        }
+    }
     switch (intent->action) {
         case PSP_UI_ACTION_FOCUS_PREVIOUS:
             frame->page_dirty = browser_engine_focus_move(app->browser->engine, false)
@@ -347,6 +397,9 @@ static void psp_app_dispatch_heavy_action(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
 {
     if (intent == NULL || intent->action == PSP_UI_ACTION_NONE) return;
+    PspUiIntent resolved_home_tab;
+    if (psp_app_resolve_home_tab_action(
+            app, intent, &resolved_home_tab)) intent = &resolved_home_tab;
     BrowserEngine *engine = app->browser->engine;
     Budget *budget = app->browser->budget;
     BrowserProfile *profile = app->browser->profile;
@@ -424,6 +477,13 @@ static void psp_app_dispatch_heavy_action(
                     || action.type
                          == CONTROLLER_ACTION_FORM_SUBMIT;
                 if (action.type == CONTROLLER_ACTION_MEDIA) {
+                    if (browser_session_captive_portal_active(
+                            app->browser->session)) {
+                        psp_ui_show_status(
+                            &app->process->presentation.ui,
+                            "MEDIA IS DISABLED DURING WI-FI SIGN-IN", 180);
+                        break;
+                    }
                     if (action.media_kind == MEDIA_DISCOVERY_WEBM) {
                         psp_ui_show_status(
                             &app->process->presentation.ui,
@@ -487,6 +547,13 @@ static void psp_app_dispatch_heavy_action(
                 }
                 if (navigates && action.prefer_native_media
                     && youtube_watch_url_supported(action.url)) {
+                    if (browser_session_captive_portal_active(
+                            app->browser->session)) {
+                        psp_ui_show_status(
+                            &app->process->presentation.ui,
+                            "MEDIA IS DISABLED DURING WI-FI SIGN-IN", 180);
+                        break;
+                    }
                     const NavigationEntry *entry =
                         navigation_current(app->views->navigation);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
@@ -782,6 +849,8 @@ static void psp_app_dispatch_heavy_action(
         }
         case PSP_UI_ACTION_BACK:
         case PSP_UI_ACTION_FORWARD: {
+            if (intent->action == PSP_UI_ACTION_BACK
+                && psp_captive_portal_cancel(app, frame)) break;
             bool forward = intent->action == PSP_UI_ACTION_FORWARD;
             const char *history_url = NULL;
             if (app->views->navigation->history_count != 0) {
@@ -924,6 +993,7 @@ static void psp_app_dispatch_heavy_action(
                     &app->process->presentation.ui,
                     &app->process->presentation.collections_surface,
                     profile, &app->browser->offline_store.library,
+                    &app->browser->offline_store.download,
                     PSP_UI_COLLECTION_SCREENSHOTS);
                 break;
             }
@@ -948,7 +1018,88 @@ static void psp_app_dispatch_heavy_action(
                 180);
             break;
         }
-        case PSP_UI_ACTION_RELOAD: {
+        case PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT:
+            if (!app->interactive->lifecycle_retry_available
+                || !browser_profile_set_site_javascript_enabled(
+                    profile, lifecycle_retry_url, false)) {
+                psp_ui_show_status(
+                    &app->process->presentation.ui,
+                    "SITE JAVASCRIPT COULD NOT BE DISABLED", 240);
+                break;
+            }
+            psp_profile_store_mark_dirty(
+                &app->browser->profile_store, frame->ui_sample_us);
+            goto recovery_reload;
+        case PSP_UI_ACTION_RECOVERY_AUDIO_ONLY:
+            browser_profile_set_youtube_audio_only(profile, true);
+            psp_profile_store_mark_dirty(
+                &app->browser->profile_store, frame->ui_sample_us);
+            goto recovery_reload;
+        case PSP_UI_ACTION_RECOVERY_LOWER_QUALITY:
+            browser_profile_set_youtube_quality(
+                profile, BROWSER_YOUTUBE_QUALITY_240P);
+            psp_profile_store_mark_dirty(
+                &app->browser->profile_store, frame->ui_sample_us);
+            goto recovery_reload;
+        case PSP_UI_ACTION_RECOVERY_RETURN:
+            app->interactive->lifecycle_retry_available = false;
+            psp_ui_show_status(
+                &app->process->presentation.ui,
+                "RETURNED TO LAST USABLE PAGE", 180);
+            break;
+        case PSP_UI_ACTION_RECOVERY_READER: {
+            if (!app->interactive->lifecycle_retry_available) {
+                psp_ui_show_status(
+                    &app->process->presentation.ui,
+                    "FAILED PAGE IS NO LONGER AVAILABLE", 180);
+                break;
+            }
+#ifdef TILEFINCH_PSP_LIVE_NETWORK
+            if (strcmp(app->process->config.trace, "none") == 0
+                && !psp_ensure_network_for_navigation(
+                       app->network, app->network_lifecycle,
+                       (int) app->process->config.network_profile,
+                       "GET", lifecycle_retry_url, true,
+                       engine_frame, &app->process->presentation.ui)) {
+                break;
+            }
+#endif
+            app->process->presentation.ui.reader_mode = true;
+            bool prepared = psp_reader_navigation_prepare(
+                engine, &app->process->presentation.ui, profile,
+                &app->interactive->reader_navigation,
+                lifecycle_retry_url);
+            psp_ui_set_navigation_target(
+                &app->process->presentation.ui, lifecycle_retry_url);
+            psp_ui_set_loading(&app->process->presentation.ui, true, -1);
+            psp_ui_show_status(
+                &app->process->presentation.ui,
+                prepared ? "LOADING READER PAGE" : "READER MODE UNAVAILABLE",
+                240);
+            if (!prepared) break;
+            psp_navigation_cooperate_begin(
+                &app->process->presentation.ui, engine_frame, engine);
+            psp_text_input_before_navigation(&app->process->text_input);
+            bool started = psp_retry_navigation_url_after_reclaim(
+                engine, lifecycle_retry_url, 4 * MIB, 30000, false);
+            if (started) {
+                app->interactive->lifecycle_retry_available = false;
+                app->interactive->navigation_job_started_us =
+                    (uint64_t) sceKernelGetSystemTimeWide();
+            } else {
+                psp_navigation_cooperate_end("reader-retry-start-failed");
+                psp_reader_navigation_finish(
+                    engine, &app->process->presentation.ui, profile,
+                    &app->interactive->reader_navigation, NULL, false);
+                psp_ui_set_loading(&app->process->presentation.ui, false, 0);
+                psp_ui_show_status(
+                    &app->process->presentation.ui,
+                    browser_engine_last_error(engine), 300);
+            }
+            break;
+        }
+        case PSP_UI_ACTION_RELOAD:
+recovery_reload: {
             const NavigationEntry *entry =
                 navigation_current(app->views->navigation);
             char reload_url[NAVIGATION_URL_LIMIT];
@@ -1274,6 +1425,13 @@ static void psp_app_dispatch_heavy_action(
         case PSP_UI_ACTION_SWITCH_TAB:
         case PSP_UI_ACTION_NEW_TAB:
         case PSP_UI_ACTION_CLOSE_TAB: {
+            if (browser_session_captive_portal_active(
+                    app->browser->session)) {
+                psp_ui_show_status(
+                    &app->process->presentation.ui,
+                    "FINISH OR CANCEL WI-FI SIGN-IN FIRST", 180);
+                break;
+            }
             const char *homepage_url =
                 browser_profile_custom_homepage_enabled(profile)
                 ? BROWSER_PROFILE_HOMEPAGE_URL
@@ -1355,7 +1513,8 @@ static void psp_app_dispatch_heavy_action(
                         psp_ui_show_collections(&app->process->presentation.ui, legacy_section);
                     psp_collections_sync_ui(
                         &app->process->presentation.ui, &app->process->presentation.collections_surface, profile,
-                        &app->browser->offline_store.library, legacy_section);
+                        &app->browser->offline_store.library,
+                        &app->browser->offline_store.download, legacy_section);
                     (void) psp_engine_views_refresh(app->views, engine);
                     psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
                 } else if (profile_page != PSP_PROFILE_PAGE_NONE) {
@@ -1513,7 +1672,8 @@ static void psp_app_dispatch_heavy_action(
                 psp_ui_show_collections(&app->process->presentation.ui, section);
             psp_collections_sync_ui(
                 &app->process->presentation.ui, &app->process->presentation.collections_surface, profile,
-                &app->browser->offline_store.library, section);
+                &app->browser->offline_store.library,
+                &app->browser->offline_store.download, section);
             break;
         }
         case PSP_UI_ACTION_COLLECTION_ACTIVATE: {
@@ -1554,18 +1714,49 @@ static void psp_app_dispatch_heavy_action(
                     == PSP_UI_COLLECTION_SAVED
                 || app->process->presentation.ui.collections_section
                     == PSP_UI_COLLECTION_DOWNLOADS) {
-                char offline_url[NAVIGATION_URL_LIMIT];
-                const OfflineLibraryItem *item =
+                uint32_t selected_id =
+                    app->process->presentation.collections_surface.id[
+                        intent->list_index];
+                const OfflineLibraryItem *selected_item =
                     offline_library_find(
-                        &app->browser->offline_store.library,
-                        app->process->presentation.collections_surface.id[intent->list_index]);
+                        &app->browser->offline_store.library, selected_id);
+                if (app->process->presentation.ui.collections_section
+                        == PSP_UI_COLLECTION_DOWNLOADS
+                    && selected_item != NULL
+                    && selected_item->state != OFFLINE_ITEM_READY) {
+                    uint32_t active_id = 0;
+                    bool active = offline_download_manager_active(
+                        &app->browser->offline_store.download, &active_id)
+                        && active_id == selected_id;
+                    bool changed = active
+                        ? offline_download_manager_pause(
+                              &app->browser->offline_store.download,
+                              selected_id)
+                        : offline_download_manager_start(
+                              &app->browser->offline_store.download,
+                              selected_id);
+                    psp_collections_sync_ui(
+                        &app->process->presentation.ui,
+                        &app->process->presentation.collections_surface,
+                        profile, &app->browser->offline_store.library,
+                        &app->browser->offline_store.download,
+                        PSP_UI_COLLECTION_DOWNLOADS);
+                    psp_ui_show_status(
+                        &app->process->presentation.ui,
+                        changed ? (active ? "DOWNLOAD PAUSED"
+                                          : "DOWNLOAD RESUMED")
+                                : "DOWNLOAD STATE DID NOT CHANGE",
+                        180);
+                    break;
+                }
+                char offline_url[NAVIGATION_URL_LIMIT];
                 snprintf(
                     offline_url, sizeof(offline_url),
                     "https://tilefinch.local/offline/%s?id=%u",
-                    item != NULL && item->type == OFFLINE_ITEM_YOUTUBE
+                    selected_item != NULL
+                            && selected_item->type == OFFLINE_ITEM_YOUTUBE
                         ? "video" : "article",
-                    (unsigned)
-                        app->process->presentation.collections_surface.id[intent->list_index]);
+                    (unsigned) selected_id);
                 psp_text_input_before_navigation(&app->process->text_input);
                 psp_ui_leave_native_surface(&app->process->presentation.ui);
                 psp_leave_reader_for_navigation(
@@ -1651,7 +1842,8 @@ static void psp_app_dispatch_heavy_action(
             }
             psp_collections_sync_ui(
                 &app->process->presentation.ui, &app->process->presentation.collections_surface, profile,
-                &app->browser->offline_store.library, section);
+                &app->browser->offline_store.library,
+                &app->browser->offline_store.download, section);
             psp_ui_show_status(
                 &app->process->presentation.ui, removed ? "DELETED" : "COULD NOT DELETE", 150);
             break;
@@ -1733,6 +1925,9 @@ static void psp_app_dispatch_heavy_action(
                     * sizeof(*app->interactive->screenshot.pixels));
             break;
         }
+        case PSP_UI_ACTION_CHECK_WIFI_SIGN_IN:
+            (void) psp_captive_portal_start(app, frame);
+            break;
         case PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR:
             psp_app_build_diagnostic_qr(app, frame);
             break;

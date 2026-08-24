@@ -26,11 +26,12 @@ typedef enum {
 /*
  * Process-lifetime owner for the optional software decoder.
  *
- * The user PRX and its small kernel helper remain resident once loaded. The
- * state below owns only lifecycle facts; media-session policy decides when a
- * route needs the component. `took_me` is deliberately monotonic between
+ * The state below owns only lifecycle facts; media-session policy decides when
+ * a route needs the component. `took_me` is deliberately monotonic between
  * suspend cycles: after the first successful attach, ordinary firmware AVC
- * must not be used until restore has completed.
+ * must not be used until restore has completed. The user PRX may be unloaded
+ * only after a successful ME restore; a partial takeover retains both module
+ * and budget reservation rather than freeing executable memory still in use.
  */
 typedef struct {
     Budget *budget;
@@ -41,6 +42,7 @@ typedef struct {
     int last_native_error;
     PspSwdecComponentState state;
     PspSwdecComponentFailure failure;
+    bool module_started;
     bool took_me;
     bool shared_install;
 } PspSwdecComponent;

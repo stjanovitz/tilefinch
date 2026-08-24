@@ -94,6 +94,7 @@ static bool style_property_direction(const StylePropertyParse *parse)
         return true;
     }
     *parse->mask_high |= S2_DIRECTION;
+    parse->sheet->has_bidi_declarations = true;
     return true;
 }
 
@@ -103,10 +104,25 @@ static bool style_property_unicode_bidi(const StylePropertyParse *parse)
     if (!style_resolve_value(parse->sheet, parse->value,
                              parse->value_length, resolved,
                              sizeof(resolved), 0)) return true;
-    parse->style->unicode_bidi_override =
-        strcmp(resolved, "bidi-override") == 0
-        || strcmp(resolved, "isolate-override") == 0;
+    StyleUnicodeBidi value = STYLE_UNICODE_BIDI_NORMAL;
+    if (strcmp(resolved, "embed") == 0) {
+        value = STYLE_UNICODE_BIDI_EMBED;
+    } else if (strcmp(resolved, "isolate") == 0) {
+        value = STYLE_UNICODE_BIDI_ISOLATE;
+    } else if (strcmp(resolved, "bidi-override") == 0) {
+        value = STYLE_UNICODE_BIDI_OVERRIDE;
+    } else if (strcmp(resolved, "isolate-override") == 0) {
+        value = STYLE_UNICODE_BIDI_ISOLATE_OVERRIDE;
+    } else if (strcmp(resolved, "plaintext") == 0) {
+        value = STYLE_UNICODE_BIDI_PLAINTEXT;
+    } else if (strcmp(resolved, "normal") != 0
+               && strcmp(resolved, "initial") != 0
+               && strcmp(resolved, "unset") != 0) {
+        return true;
+    }
+    parse->style->unicode_bidi = value;
     *parse->mask_high |= S2_UNICODE_BIDI;
+    parse->sheet->has_bidi_declarations = true;
     return true;
 }
 
@@ -1471,6 +1487,20 @@ static bool style_property_z_index(const StylePropertyParse *parse)
 
 static bool style_property_opacity(const StylePropertyParse *parse)
 {
+    if (span_case_equal(parse->value, parse->value_length, "inherit")) {
+        *parse->inherit_mask |= S_OPACITY;
+        *parse->mask |= S_OPACITY;
+        return true;
+    }
+    if (span_case_equal(parse->value, parse->value_length, "initial")
+        || span_case_equal(parse->value, parse->value_length, "unset")
+        || span_case_equal(parse->value, parse->value_length, "revert")
+        || span_case_equal(parse->value, parse->value_length,
+                           "revert-layer")) {
+        parse->style->opacity = 255;
+        *parse->mask |= S_OPACITY;
+        return true;
+    }
     Stylesheet *sheet = parse->sheet;
     const char *value = parse->value;
     size_t value_length = parse->value_length;
@@ -1481,8 +1511,14 @@ static bool style_property_opacity(const StylePropertyParse *parse)
                           sizeof(resolved), 0)) {
             char *end = NULL;
             double opacity = strtod(resolved, &end);
-            while (end != NULL && isspace((unsigned char) *end)) end++;
-            if (end != NULL && *end == '%') opacity /= 100.0;
+            if (end == resolved) return true;
+            while (isspace((unsigned char) *end)) end++;
+            if (*end == '%') {
+                opacity /= 100.0;
+                end++;
+                while (isspace((unsigned char) *end)) end++;
+            }
+            if (*end != '\0' || !isfinite(opacity)) return true;
             if (opacity < 0.0) opacity = 0.0;
             if (opacity > 1.0) opacity = 1.0;
             style->opacity = (uint8_t) (opacity * 255.0 + 0.5);

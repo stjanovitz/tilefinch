@@ -16,6 +16,8 @@
 #define LAYOUT_GRADIENT_LIMIT 32
 #define LAYOUT_VISUAL_PRIORITY_LIMIT 128
 #define LAYOUT_GENERATED_TEXT_LIMIT 4096
+#define LAYOUT_STICKY_RANGE_LIMIT 64u
+#define LAYOUT_FIXED_RANGE_LIMIT 64u
 #define LAYOUT_COMMAND_FIXED UINT8_C(1)
 #define LAYOUT_COMMAND_OVERFLOW UINT8_C(2)
 #define LAYOUT_COMMAND_DYNAMIC_OVERFLOW UINT8_C(4)
@@ -144,6 +146,47 @@ typedef struct {
     int8_t letter_spacing;
     uint8_t image_fit;
 } DrawCommand;
+
+/* Sparse visual-order data exists only for commands in paragraphs that need
+   bidi analysis. DrawCommand keeps logical UTF-8 and its stable PSP size;
+   these glyphs supply shaped codepoints and exact visual positions to paint,
+   hit testing, and find geometry without duplicating ordinary LTR text. */
+#define LAYOUT_BIDI_GLYPH_LIMIT 4096u
+#define LAYOUT_BIDI_COMMAND_LIMIT 1024u
+typedef struct {
+    uint32_t codepoint;
+    int32_t x_fixed;
+    uint16_t logical_byte_offset;
+    uint16_t advance_fixed;
+    uint8_t logical_byte_length;
+    uint8_t level;
+} LayoutBidiGlyph;
+
+_Static_assert(sizeof(LayoutBidiGlyph) == 16,
+               "bidi glyph sidecar must remain compact");
+
+typedef struct {
+    uint32_t command_index;
+    uint32_t glyph_start;
+    uint16_t glyph_count;
+    uint8_t level;
+    uint8_t reserved;
+} LayoutBidiCommand;
+
+struct LayoutDocument;
+const LayoutBidiCommand *layout_bidi_command_for_index(
+    const struct LayoutDocument *layout, size_t command_index);
+/* Map a visual x position to the nearest logical UTF-8 caret boundary. The
+   returned x is an exact retained glyph edge. These allocation-free helpers
+   are the shared seam for page-text selection, caret movement, and hit
+   testing; ordinary LTR commands stay on their existing direct path. */
+bool layout_bidi_visual_hit_test(
+    const struct LayoutDocument *layout, size_t command_index, int x_fixed,
+    size_t *logical_byte_offset, int *caret_x_fixed);
+bool layout_bidi_visual_step(
+    const struct LayoutDocument *layout, size_t command_index,
+    int current_x_fixed, int visual_direction,
+    size_t *logical_byte_offset, int *caret_x_fixed);
 
 #define LAYOUT_COMMAND_FONT_ITALIC UINT8_C(1)
 #define LAYOUT_COMMAND_ROTATION_SHIFT 1
@@ -761,6 +804,14 @@ typedef struct {
     uint64_t flex_minimum_requests;
     uint64_t float_band_queries;
     uint64_t float_exclusion_probes;
+    uint64_t coordinate_clamps;
+    uint64_t coordinate_containments;
+    uint64_t bidi_paragraphs;
+    uint64_t bidi_line_fallbacks;
+    uint64_t bidi_limit_degradations;
+    uint64_t bidi_us;
+    size_t bidi_peak_transient_bytes;
+    int first_coordinate_clamp_y;
     size_t resumable_phases;
     size_t resumable_passes;
     uint64_t maximum_resumable_phase_us;
@@ -774,7 +825,7 @@ _Static_assert(sizeof(LayoutNodeBox) == 72,
                "64-bit LayoutNodeBox host layout changed");
 #endif
 
-typedef struct {
+typedef struct LayoutDocument {
     Budget *budget;
     DrawCommand *commands;
     size_t count;
@@ -796,6 +847,12 @@ typedef struct {
        content and list markers referenced by retained draw commands. */
     char *generated_text_storage;
     size_t generated_text_used;
+    LayoutBidiGlyph *bidi_glyphs;
+    size_t bidi_glyph_count;
+    size_t bidi_glyph_capacity;
+    LayoutBidiCommand *bidi_commands;
+    size_t bidi_command_count;
+    size_t bidi_command_capacity;
     int width;
     int scroll_width;
     int height;

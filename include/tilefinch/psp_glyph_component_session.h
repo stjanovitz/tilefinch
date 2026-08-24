@@ -21,10 +21,10 @@ typedef struct {
     TilefinchUpdateInstallSnapshot install_snapshot;
     char package_path[TILEFINCH_INSTALL_PATH_LIMIT];
     TilefinchGlyphPack operation_pack;
-    uint8_t installed_mask;
-    uint8_t attached_mask;
-    uint8_t lazy_attempted_mask;
-    uint8_t lazy_processed_script_mask;
+    uint16_t installed_mask;
+    uint16_t attached_mask;
+    uint16_t lazy_attempted_mask;
+    uint16_t lazy_processed_script_mask;
     uint8_t lazy_attached_count;
     bool root_ready;
     bool operation_initialized;
@@ -49,7 +49,7 @@ bool psp_glyph_component_session_pump_runtime(
    add no more than two other installed language packs. */
 bool psp_glyph_component_session_attach_hinted(
     PspGlyphComponentSession *session,
-    const TilefinchInstallPaths *paths, uint8_t script_mask,
+    const TilefinchInstallPaths *paths, uint16_t script_mask,
     BrowserEngine *engine);
 
 void psp_glyph_component_session_probe(

@@ -324,27 +324,68 @@ int main(void)
               "page mentions a certificate")
           && !tilefinch_error_is_certificate_verification_failure(
               "request deadline expired"));
-    CHECK(tilefinch_tls_verification_guidance(0, false)
+    PspTimeFields rtc = {
+        .year = 1970, .month = 1, .day = 1
+    };
+    time_t rtc_epoch = (time_t) -1;
+    CHECK(psp_time_classify_utc(NULL, &rtc_epoch) == PSP_TIME_UNREADABLE
+          && rtc_epoch == 0);
+    rtc.year = 1969;
+    CHECK(psp_time_classify_utc(&rtc, &rtc_epoch)
+              == PSP_TIME_OUT_OF_TIME_T_RANGE
+          && rtc_epoch == 0);
+    rtc.year = 1970;
+    CHECK(psp_time_classify_utc(&rtc, &rtc_epoch) == PSP_TIME_OK
+          && rtc_epoch == 0);
+    rtc = (PspTimeFields) {
+        .year = 2037, .month = 12, .day = 31,
+        .hour = 23, .minute = 59, .second = 59
+    };
+    CHECK(psp_time_classify_utc(&rtc, &rtc_epoch) == PSP_TIME_OK
+          && (uint64_t) rtc_epoch == UINT64_C(2145916799));
+    rtc.year = 2038;
+    CHECK(psp_time_classify_utc(&rtc, &rtc_epoch)
+              == PSP_TIME_OUT_OF_TIME_T_RANGE);
+    rtc.year = 2040;
+    CHECK(psp_time_classify_utc(&rtc, &rtc_epoch)
+              == PSP_TIME_OUT_OF_TIME_T_RANGE);
+    rtc = (PspTimeFields) {.year = 2028, .month = 2, .day = 30};
+    CHECK(psp_time_classify_utc(&rtc, &rtc_epoch)
+              == PSP_TIME_INVALID_FIELDS);
+    rtc = (PspTimeFields) {
+        .year = 2028, .month = 2, .day = 29, .microsecond = 1000000
+    };
+    CHECK(psp_time_classify_utc(&rtc, &rtc_epoch)
+              == PSP_TIME_INVALID_FIELDS
+          && strcmp(psp_time_status_name(PSP_TIME_UNREADABLE),
+                    "unreadable") == 0);
+
+    CHECK(tilefinch_tls_verification_guidance(
+              0, false, PSP_TIME_UNREADABLE)
               == TILEFINCH_TLS_GUIDANCE_TIME
           && tilefinch_tls_verification_guidance(
-                 TILEFINCH_TLS_VERIFY_EXPIRED, true)
+                 0, false, PSP_TIME_OK)
+              == TILEFINCH_TLS_GUIDANCE_DETAILS
+          && tilefinch_tls_verification_guidance(
+                 0, true, PSP_TIME_OK)
+              == TILEFINCH_TLS_GUIDANCE_DETAILS
+          && tilefinch_tls_verification_guidance(
+                 TILEFINCH_TLS_VERIFY_EXPIRED, true, PSP_TIME_OK)
               == TILEFINCH_TLS_GUIDANCE_TIME
           && tilefinch_tls_verification_guidance(
-                 TILEFINCH_TLS_VERIFY_FUTURE, true)
+                 TILEFINCH_TLS_VERIFY_FUTURE, true, PSP_TIME_OK)
               == TILEFINCH_TLS_GUIDANCE_TIME
           && tilefinch_tls_verification_guidance(
                  TILEFINCH_TLS_VERIFY_HOSTNAME
                      | TILEFINCH_TLS_VERIFY_NOT_TRUSTED,
-                 true)
+                 true, PSP_TIME_OK)
               == TILEFINCH_TLS_GUIDANCE_REDIRECTED
           && tilefinch_tls_verification_guidance(
-                 TILEFINCH_TLS_VERIFY_NOT_TRUSTED, true)
+                 TILEFINCH_TLS_VERIFY_NOT_TRUSTED, true, PSP_TIME_OK)
               == TILEFINCH_TLS_GUIDANCE_UNTRUSTED
           && tilefinch_tls_verification_guidance(
-                 TILEFINCH_TLS_VERIFY_BAD_KEY, true)
-              == TILEFINCH_TLS_GUIDANCE_UNSUPPORTED
-          && tilefinch_tls_verification_guidance(0, true)
-              == TILEFINCH_TLS_GUIDANCE_DETAILS);
+                 TILEFINCH_TLS_VERIFY_BAD_KEY, true, PSP_TIME_OK)
+              == TILEFINCH_TLS_GUIDANCE_UNSUPPORTED);
     puts("tilefinch-browser-engine-tests: all checks passed");
     return 0;
 }

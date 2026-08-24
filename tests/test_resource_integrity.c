@@ -35,6 +35,16 @@ int main(void)
     CHECK(tilefinch_resource_integrity_verify(
               sha512, sizeof(sha512) - 1, body, sizeof(body) - 1)
           == TILEFINCH_INTEGRITY_MATCH);
+    static const char uppercase_sha256[] =
+        "SHA256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=";
+    static const char mixed_case_sha384[] =
+        "sHa384-WeF0h3dEjGnea4ANejO7+5/xtGPkQ1TDVTvNucZm+pASWjx5+QOXvfX2oT3oKGhP";
+    CHECK(tilefinch_resource_integrity_verify(
+              uppercase_sha256, sizeof(uppercase_sha256) - 1,
+              body, sizeof(body) - 1) == TILEFINCH_INTEGRITY_MATCH);
+    CHECK(tilefinch_resource_integrity_verify(
+              mixed_case_sha384, sizeof(mixed_case_sha384) - 1,
+              body, sizeof(body) - 1) == TILEFINCH_INTEGRITY_MATCH);
 
     static const char strongest_mismatch[] =
         "sha256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ= "

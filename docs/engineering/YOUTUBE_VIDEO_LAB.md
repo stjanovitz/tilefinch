@@ -14,9 +14,9 @@ mobile URL
   -> ordinary Tilefinch HTML page
   -> watch activation
   -> bounded player-response resolver
-  -> progressive MP4, separate AVC/AAC MP4 sources, or AAC alone
-  -> HTTP range reader
-  -> portable MP4 demuxer
+  -> progressive MP4, separate AVC/AAC MP4, AAC alone, or live HLS
+  -> HTTP range reader or rolling HLS playlist/segment source
+  -> portable MP4 or MPEG-TS demuxer
   -> host or PSP codec backend
   -> native player surface
 ```
@@ -68,9 +68,11 @@ invalidated when the cookie jar changes.
 ## Resolver and admission policy
 
 The resolver calls a fixed, signed table of client profiles. It parses
-`playabilityStatus` before format selection so age, login, region, live, and
-premiere restrictions produce useful errors rather than a generic malformed
-inventory message.
+`playabilityStatus` before format selection so age, login, region, and
+not-yet-started premiere restrictions produce useful errors rather than a
+generic malformed inventory message. An active live stream or premiere
+supplies an HLS manifest and enters the ordinary native-player lifecycle;
+Retry re-resolves a scheduled event after it begins.
 
 The final direct/enriched profile is VisionOS. The resolver does not use the
 Android VR identity because its media URLs may stop serving after a small
@@ -83,7 +85,12 @@ than fabricating attestation state.
 
 Only unciphered HTTPS media URLs are admitted. The resolver prefers a
 progressive AVC/AAC MP4 within the configured height, then separate AVC MP4
-and AAC MP4 streams. The shipping preference is 360p; users can select the
+and AAC MP4 streams. Active live delivery selects the bounded AVC MPEG-TS HLS
+variant at or below 240p and requires the optional software-decoder component
+described in the public build instructions. Live playback begins three
+segments behind the advertised edge for radio-loss tolerance and has no seek
+operation because its zero and duration move with the playlist. The shipping
+preference for finite video is 360p; users can select the
 smaller 240p path, and the PSP session can retry once at 240p after a
 wide-profile admission or decoder failure. HE-AAC is rejected because the PSP
 audio path is dimensioned for AAC-LC.
@@ -91,8 +98,9 @@ audio path is dimensioned for AAC-LC.
 Provider-resolved URLs must remain on HTTPS port 443 at `googlevideo.com` or
 one of its subdomains. Redirects are disabled for those sources. Expiring URLs
 are rejected before playback when their remaining lifetime is inadequate;
-one bounded mid-playback refresh may re-resolve and seek to the current
-position after an expiry-related failure.
+the bounded mid-playback refresh ladder may re-resolve and seek to the current
+position after an expiry-related failure. Live refresh reopens at the new edge
+instead of attempting to seek into an expired rolling window.
 
 Failures emit a bounded `tilefinch-youtube:` record containing the stage,
 HTTP status, selected client, itag, attempt count, and remaining lifetime.

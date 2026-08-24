@@ -385,7 +385,7 @@ int main(int argc, char **argv)
         ui.glyph_language = BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED;
         ui.glyph_options_selection = 0;
         ui.glyph_installed_mask =
-            (uint8_t) (1u << TILEFINCH_GLYPH_PACK_LATIN_EXTENDED);
+            (uint16_t) (1u << TILEFINCH_GLYPH_PACK_LATIN_EXTENDED);
         ui.toast_frames = 0;
     } else if (strcmp(mode, "adblock") == 0) {
         ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;

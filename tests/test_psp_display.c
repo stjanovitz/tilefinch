@@ -427,6 +427,36 @@ static bool test_video_surface_switches_format_and_buffers(void)
     return true;
 }
 
+/* Page buffer 2 has no same-numbered video slot.  Entering video from that
+   point must normalize the rotation before XOR selects the next video slot;
+   otherwise exit clears and latches page slot 2 (the start of video slot 1)
+   while the panel had actually been showing video slot 0. */
+static bool test_video_exit_maps_page_rotation_two_to_video_front(void)
+{
+    CHECK(fake_reset());
+    PspDisplay display;
+    CHECK(psp_display_begin(&display, &fake_backend));
+    CHECK(psp_display_publish(&display));
+    CHECK(psp_display_publish(&display));
+    CHECK(display.back_buffer == 2u);
+
+    CHECK(psp_display_video_begin(&display));
+    CHECK(display.back_buffer == 0u);
+    uint32_t *video_front_after_publish = psp_display_video_back_buffer(
+        &display);
+    CHECK(video_front_after_publish
+          == (uint32_t *) (void *) fake.memory);
+    CHECK(psp_display_publish(&display));
+    CHECK(fake.last_address == video_front_after_publish);
+
+    CHECK(psp_display_video_end(&display));
+    CHECK(fake.last_address == (void *) fake.memory);
+    CHECK(psp_display_front_buffer(&display) == fake.memory);
+    CHECK(psp_display_back_buffer(&display)
+          == fake.memory + PSP_DISPLAY_BUFFER_PIXELS);
+    return true;
+}
+
 /* A display service that refuses the 16-bit reassert must not leave the
    process believing it is back on the page's surface without saying so. */
 static bool test_video_surface_exit_failure_is_observable(void)
@@ -476,6 +506,7 @@ int main(void)
         && test_rearm_reasserts_last_front_without_rotation()
         && test_rearm_failure_is_observable()
         && test_video_surface_switches_format_and_buffers()
+        && test_video_exit_maps_page_rotation_two_to_video_front()
         && test_video_surface_exit_failure_is_observable()
         && test_rearm_follows_the_active_surface();
     free(fake.memory);

@@ -19,6 +19,8 @@ set(TILEFINCH_NOTICES_MANIFEST
     NOTICES/quickjs/LICENSE
     NOTICES/stb/LICENSE
     NOTICES/qrcodegen/LICENSE
+    # Unicode bidi implementation.
+    NOTICES/sheenbidi/LICENSE
     # NanoSVG zlib text.
     NOTICES/nanosvg/LICENSE.txt
     # libwebp copyright license and additional patent grant.

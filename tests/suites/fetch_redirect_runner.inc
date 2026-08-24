@@ -32,6 +32,10 @@ int main(int argc, char **argv)
         "private-network-admission",
         test_private_network_admission(&budget, (unsigned) parsed));
     RUN_REDIRECT_TEST(
+        "captive-portal-redirect-origin-isolation",
+        test_captive_portal_redirect_origin_isolation(
+            &budget, (unsigned) parsed));
+    RUN_REDIRECT_TEST(
         "hsts-security-header",
         test_hsts_is_security_header(&budget, (unsigned) parsed));
     RUN_REDIRECT_TEST(

@@ -1344,6 +1344,17 @@ bool layout_line_clamp_overflow(LineState *line)
 void layout_flush_line(LineState *line)
 {
     if (line->line_height != 0 || line->line_height_fixed != 0) {
+        bool bidi_resolved = layout_bidi_resolve_line(line);
+        if (line->bidi_pipeline_expected && !bidi_resolved) {
+            /* A bounded/OOM degradation remains logical text. Never route a
+               paragraph that attempted UAX #9 back through the historical
+               reverse-codepoint heuristic. */
+            for (size_t i = line->command_start;
+                 i < line->layout->count; i++) {
+                if (line->layout->commands[i].type == DRAW_TEXT)
+                    line->layout->commands[i].radius &= ~LAYOUT_TEXT_RTL;
+            }
+        }
         int fragment_height = line->line_height_fixed != 0
             ? layout_fixed_ceil(line->line_height_fixed)
             : line->line_height;
@@ -1356,7 +1367,7 @@ void layout_flush_line(LineState *line)
                 command->font_size = 0;
             }
         }
-        if (line->direction_rtl) {
+        if (line->direction_rtl && !bidi_resolved) {
             int start_fixed = layout_fixed_from_integer(line->start_x);
             int content_right_fixed = line_cursor_fixed(line);
             int content_right = layout_fixed_ceil(content_right_fixed);
@@ -2002,6 +2013,40 @@ static size_t fitting_text_prefix(const FontFace *face,
     return used == 0 ? 1 : used;
 }
 
+static int measured_line_text_width_fixed(
+    LineState *line, const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
+    TextTransformMode transform, bool kerning)
+{
+    int shaped = 0;
+    if (layout_bidi_measure_shaped_text(
+            line, face, metric_family, text, length, font_size_fixed,
+            synthetic_bold, metric_bold, letter_spacing, transform,
+            kerning, &shaped)) return shaped;
+    return measured_flow_text_width_fixed(
+        face, metric_family, text, length, font_size_fixed,
+        synthetic_bold, metric_bold, scale, letter_spacing,
+        transform, kerning);
+}
+
+static size_t fitting_line_text_prefix(
+    LineState *line, const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int scale, int letter_spacing,
+    int available_fixed, TextTransformMode transform, bool kerning)
+{
+    size_t shaped = 0;
+    if (layout_bidi_fitting_shaped_prefix(
+            line, face, metric_family, text, length, font_size_fixed,
+            synthetic_bold, metric_bold, letter_spacing, transform,
+            kerning, available_fixed, &shaped)) return shaped;
+    return fitting_text_prefix(
+        face, metric_family, text, length, font_size_fixed,
+        synthetic_bold, metric_bold, scale, letter_spacing,
+        available_fixed, transform, kerning);
+}
+
 bool layout_add_replaced_alt_text(
     LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *style, int x, int y, int width, int height)
@@ -2114,8 +2159,8 @@ bool flow_text(LayoutContext *context, LineState *line,
         && line_cursor_fixed(line)
                == layout_fixed_from_integer(line->start_x)
         && available_pixels > 0 && length <= 512u) {
-        int total_fixed = measured_flow_text_width_fixed(
-            face, metric_family, text, length, font_size_fixed,
+        int total_fixed = measured_line_text_width_fixed(
+            line, face, metric_family, text, length, font_size_fixed,
             synthetic_bold, metric_bold, scale, style->letter_spacing,
             style->text_transform, !computed_style_kerning_none(style));
         int available_fixed = layout_fixed_from_integer(available_pixels);
@@ -2321,8 +2366,8 @@ bool flow_text(LayoutContext *context, LineState *line,
             at = end;
             continue;
         }
-        int word_width_fixed = measured_flow_text_width_fixed(
-            face, metric_family, text + at, end - at, font_size_fixed,
+        int word_width_fixed = measured_line_text_width_fixed(
+            line, face, metric_family, text + at, end - at, font_size_fixed,
             synthetic_bold, metric_bold, scale, style->letter_spacing,
             style->text_transform, !computed_style_kerning_none(style));
         int boundary_fixed = line->has_text_character
@@ -2423,16 +2468,16 @@ bool flow_text(LayoutContext *context, LineState *line,
             int width_fixed;
             bool truncated_for_ellipsis = false;
             if (!no_wrap && break_inside) {
-                size_t prefix = fitting_text_prefix(
-                    face, metric_family, text + piece_at, end - piece_at,
+                size_t prefix = fitting_line_text_prefix(
+                    line, face, metric_family, text + piece_at, end - piece_at,
                     font_size_fixed, synthetic_bold, metric_bold, scale,
                     style->letter_spacing, available_fixed,
                     style->text_transform,
                     !computed_style_kerning_none(style));
                 piece_end = piece_at + prefix;
                 if (piece_end > end) piece_end = end;
-                width_fixed = measured_flow_text_width_fixed(
-                    face, metric_family, text + piece_at,
+                width_fixed = measured_line_text_width_fixed(
+                    line, face, metric_family, text + piece_at,
                     piece_end - piece_at, font_size_fixed,
                     synthetic_bold, metric_bold, scale,
                     style->letter_spacing, style->text_transform,
@@ -2448,8 +2493,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                     available_fixed = layout_fixed_subtract(
                         layout_fixed_from_integer(wrap_right),
                         cursor_fixed);
-                    prefix = fitting_text_prefix(
-                        face, metric_family, text + piece_at,
+                    prefix = fitting_line_text_prefix(
+                        line, face, metric_family, text + piece_at,
                         end - piece_at, font_size_fixed,
                         synthetic_bold, metric_bold, scale,
                         style->letter_spacing, available_fixed,
@@ -2457,8 +2502,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                         !computed_style_kerning_none(style));
                     piece_end = piece_at + prefix;
                     if (piece_end > end) piece_end = end;
-                    width_fixed = measured_flow_text_width_fixed(
-                        face, metric_family, text + piece_at,
+                    width_fixed = measured_line_text_width_fixed(
+                        line, face, metric_family, text + piece_at,
                         piece_end - piece_at, font_size_fixed,
                         synthetic_bold, metric_bold, scale,
                         style->letter_spacing, style->text_transform,
@@ -2470,8 +2515,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                     && (int64_t) cursor_fixed + space_fixed + width_fixed
                            > layout_fixed_from_integer(wrap_right)) {
                     static const char marker[] = "\xe2\x80\xa6";
-                    int marker_width = measured_flow_text_width_fixed(
-                        face, metric_family, marker, sizeof(marker) - 1,
+                    int marker_width = measured_line_text_width_fixed(
+                        line, face, metric_family, marker, sizeof(marker) - 1,
                         font_size_fixed, synthetic_bold, metric_bold,
                         scale, style->letter_spacing,
                         TEXT_TRANSFORM_NONE,
@@ -2484,8 +2529,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                             space_fixed),
                         marker_width);
                     size_t prefix = available <= 0 ? 0
-                        : fitting_text_prefix(
-                              face, metric_family, text + piece_at,
+                        : fitting_line_text_prefix(
+                              line, face, metric_family, text + piece_at,
                               end - piece_at, font_size_fixed,
                               synthetic_bold, metric_bold, scale,
                               style->letter_spacing, available,
@@ -2494,8 +2539,8 @@ bool flow_text(LayoutContext *context, LineState *line,
                     if (prefix > end - piece_at) prefix = end - piece_at;
                     piece_end = piece_at + prefix;
                     width_fixed = prefix == 0 ? 0
-                        : measured_flow_text_width_fixed(
-                              face, metric_family, text + piece_at,
+                        : measured_line_text_width_fixed(
+                              line, face, metric_family, text + piece_at,
                               prefix, font_size_fixed, synthetic_bold,
                               metric_bold, scale, style->letter_spacing,
                               style->text_transform,
@@ -2553,7 +2598,7 @@ bool flow_text(LayoutContext *context, LineState *line,
                     | ((int) style->text_transform
                        << LAYOUT_TEXT_TRANSFORM_SHIFT)
                     | ((computed_style_direction_rtl(style)
-                        || (!style->unicode_bidi_override
+                        || (!computed_style_bidi_override(style)
                             && text_span_has_strong_rtl(
                                 text + piece_at,
                                 piece_end - piece_at)))
@@ -2610,8 +2655,9 @@ bool flow_text(LayoutContext *context, LineState *line,
             size_t link_index = context->layout->link_count;
             DrawCommand *stored = NULL;
             if (piece_end != piece_at) {
-                if (!layout_add_text_shadow_commands(
-                        context, style, &command)) {
+                if (!line->bidi_pipeline_expected
+                    && !layout_add_text_shadow_commands(
+                           context, style, &command)) {
                     return false;
                 }
                 size_t command_index = context->layout->count;
@@ -2622,6 +2668,12 @@ bool flow_text(LayoutContext *context, LineState *line,
                            link_url, link_url_length, link_node)) {
                     return false;
                 }
+                layout_bidi_note_text_command(
+                    line, command_index, command.text, command.text_length,
+                    width_fixed,
+                    layout_fixed_add(
+                        space_width_fixed,
+                        layout_fixed_from_integer(style->letter_spacing)));
                 line->find_block_start = false;
                 if (underlined) {
                     previous_decorated_command = command_index;
@@ -2809,6 +2861,13 @@ bool flow_inline(LayoutContext *context, lxb_dom_node_t *node,
         ? 0 : context->layout->link_count;
     size_t control_start = context == NULL || context->layout == NULL
         ? 0 : context->layout->control_count;
+    size_t node_box_start = context == NULL || context->layout == NULL
+        ? 0 : context->layout->node_box_count;
+    size_t previous_line_command_start = line == NULL
+        ? 0 : line->command_start;
+    int previous_cursor_fixed = line == NULL ? 0
+        : (line->x_fixed_valid ? line->x_fixed
+                               : layout_fixed_from_integer(line->x));
     if (!layout_tree_enter(context, node, "inline")) {
         bool success = context != NULL && !context->cancelled
             && flow_inline_fallback(context, node, parent, line, link_url,
@@ -2824,6 +2883,12 @@ bool flow_inline(LayoutContext *context, lxb_dom_node_t *node,
     bool success = flow_inline_impl(context, node, parent, line, link_url,
                                     link_url_length, link_node,
                                     &resolved_hidden);
+    if (success) {
+        layout_bidi_note_atomic(
+            line, node, command_start, link_start, control_start,
+            node_box_start, previous_line_command_start,
+            previous_cursor_fixed);
+    }
     if (success && parent != NULL
         && resolved_hidden != parent->visibility_hidden
         && !layout_record_visibility_range(

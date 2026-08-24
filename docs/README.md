@@ -28,6 +28,8 @@ Tilefinch's documentation has three layers:
   supported uBlock/EasyList network syntax, limits, and per-site allowlisting.
 - [Reader mode](READER_MODE.md): reversible presentation transform,
   typography controls, site profiles, and explicit limits.
+- [Bidirectional text](TEXT_BIDI.md): bounded UAX #9 page layout, Arabic-family
+  shaping, logical/visual mappings, optional glyph packs, and degradation.
 - [Offline library](OFFLINE_LIBRARY.md): bounded Reader snapshots and
   resumable YouTube downloads, including storage and trust boundaries.
 - [Memory Stick storage](STORAGE.md): the complete on-stick layout map,

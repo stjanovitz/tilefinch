@@ -84,7 +84,8 @@ static bool host_platform_present(void *opaque, const uint16_t *pixels,
     if (simulator->frames_presented == 0
         && simulator->first_frame_output != NULL) {
         simulator->first_frame_written = render_write_frame_ppm(
-            simulator->first_frame_output, pixels, (int) width, (int) height);
+            simulator->first_frame_output, pixels, stride * height,
+            (int) width, (int) height);
         if (!simulator->first_frame_written) return false;
     }
     simulator->last_frame_hash = hash;

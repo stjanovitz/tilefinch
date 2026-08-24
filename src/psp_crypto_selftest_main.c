@@ -473,6 +473,7 @@ static int check_x25519(mbedtls_ctr_drbg_context *rng, const char *name,
 {
     unsigned char scalar[32], point[32], want[32], got_generic[32];
     int bad = 0;
+    bool generic_ok = false;
 
     if (hex32(scalar_hex, scalar) != 0 || hex32(point_hex, point) != 0
         || hex32(want_hex, want) != 0) {
@@ -484,12 +485,16 @@ static int check_x25519(mbedtls_ctr_drbg_context *rng, const char *name,
         printf("tilefinch-crypto: x25519=%s result=FAIL reason=generic-error\n",
                name);
         bad++;
-    } else if (memcmp(got_generic, want, 32) != 0) {
-        printf("tilefinch-crypto: x25519=%s path=generic result=FAIL "
-               "reason=mismatch\n", name);
-        bad++;
     } else {
-        printf("tilefinch-crypto: x25519=%s path=generic result=pass\n", name);
+        generic_ok = true;
+        if (memcmp(got_generic, want, 32) != 0) {
+            printf("tilefinch-crypto: x25519=%s path=generic result=FAIL "
+                   "reason=mismatch\n", name);
+            bad++;
+        } else {
+            printf("tilefinch-crypto: x25519=%s path=generic result=pass\n",
+                   name);
+        }
     }
 
 #if defined(MBEDTLS_ECDH_VARIANT_EVEREST_ENABLED)
@@ -500,7 +505,8 @@ static int check_x25519(mbedtls_ctr_drbg_context *rng, const char *name,
             printf("tilefinch-crypto: x25519=%s path=everest result=FAIL "
                    "reason=mismatch\n", name);
             bad++;
-        } else if (memcmp(got_everest, got_generic, 32) != 0) {
+        } else if (generic_ok
+                   && memcmp(got_everest, got_generic, 32) != 0) {
             printf("tilefinch-crypto: x25519=%s result=FAIL "
                    "reason=everest-vs-generic-disagree\n", name);
             bad++;

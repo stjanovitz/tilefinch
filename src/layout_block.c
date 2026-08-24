@@ -185,6 +185,8 @@ static bool layout_block_with_float_output(
                                      positioned_box, bottom, scratch,
                                      float_output, float_output_capacity,
                                      float_output_count);
+    layout_bidi_flow_destroy(scratch->bidi_flow);
+    scratch->bidi_flow = NULL;
     if (!success && context != NULL && !context->failure_reported
         && LAYOUT_TRACE(context->layout, LAYOUT)) {
         size_t name_length = 0, id_length = 0, class_length = 0;
@@ -723,6 +725,14 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     line->first_line_indent = text_indent;
     line->start_x += text_indent;
     line_cursor_set(line, line->start_x);
+    if (context->document_bidi_text_present
+        || context->document_bidi_markup_present
+        || (context->sheet != NULL
+            && context->sheet->has_bidi_declarations)) {
+        scratch->bidi_flow = layout_bidi_flow_create(
+            context, node, style, &line->bidi_pipeline_expected);
+        line->bidi_flow = scratch->bidi_flow;
+    }
 
     /*
      * Adjacent child margins collapse in a block formatting context even
@@ -814,6 +824,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     if (before_pseudo_flowed_inline) first_flow_content = false;
 
     bool audio_element = layout_node_name_is(node, "audio");
+    bool canvas_element = layout_node_name_is(node, "canvas");
     bool audio_controls = audio_element
         && lxb_dom_element_has_attribute(
             lxb_dom_interface_element(node),
@@ -821,6 +832,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     bool image_element = layout_node_name_is(node, "img")
                          || layout_node_name_is(node, "svg")
                          || layout_node_name_is(node, "video")
+                         || canvas_element
                          || audio_element
                          || layout_node_name_is(node, "iframe");
     const ImageResource *block_image = image_element
@@ -848,6 +860,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     int image_height = image_available
         ? image_resource_intrinsic_height(block_image) : 0;
     if ((layout_node_name_is(node, "video")
+         || canvas_element
          || audio_controls
          || layout_node_name_is(node, "iframe"))
         && (image_width <= 0 || image_height <= 0)) {
@@ -855,7 +868,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         image_height = audio_controls ? 54 : 150;
     }
     int intrinsic_image_height = image_height;
-    bool replaced_image = image_available
+    bool replaced_image = image_available || canvas_element
                           || (image_element
                               && (audio_controls
                                   || (style->has_width
@@ -926,7 +939,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             if (layout_add_command(context->layout, command) == NULL) {
                 return false;
             }
-        } else if (!layout_add_replaced_alt_text(
+        } else if (!canvas_element && !layout_add_replaced_alt_text(
                        context, node, style, content_x, line->y,
                        image_width, image_height)) {
             return false;
@@ -1981,6 +1994,83 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
             painted_content_bottom = child_bottom;
         }
     }
+    bool coordinate_contained = false;
+    int scene_limit = layout_clamp_coordinate(
+        (int64_t) viewport_height * 64);
+    int static_motion_limit = viewport_height;
+    if (natural_content_height > static_motion_limit) {
+        static_motion_limit = natural_content_height;
+    }
+    int static_motion_maximum = layout_clamp_coordinate(
+        (int64_t) viewport_height * 4);
+    if (static_motion_limit > static_motion_maximum) {
+        static_motion_limit = static_motion_maximum;
+    }
+    bool root_box = layout_node_name_is(node, "html")
+        || layout_node_name_is(node, "body");
+    bool synthetic_motion_scene = context->sheet != NULL
+        && context->sheet->has_motion_keyframes
+        && declared_height > scene_limit
+        && natural_content_height < viewport_height * 4;
+    /* A clipped descendant can still have commands at its pre-containment
+       coordinates. The root overflow walk sees those retained commands, so
+       it must close the final escape hatch too; otherwise nested scenes are
+       individually bounded while the document still reports the sentinel. */
+    bool saturated_subtree =
+        painted_content_bottom >= LAYOUT_COORDINATE_LIMIT;
+    if (synthetic_motion_scene || saturated_subtree) {
+        int contained_height = synthetic_motion_scene
+            ? static_motion_limit : scene_limit;
+        int cap = layout_add_coordinate(outer_y, contained_height);
+        if (root_box
+            && context->layout->performance.coordinate_containments != 0u) {
+            /* Recover the last coherently paintable static state around the
+               first contained scene. Ignore giant retained backdrop/spacer
+               commands, but preserve ordinary text, controls, and images
+               immediately around that scene so Bottom remains useful. */
+            int useful_cap = layout_add_coordinate(outer_y, viewport_height);
+            int useful_limit = layout_add_coordinate(
+                context->layout->performance.first_coordinate_clamp_y,
+                static_motion_maximum);
+            for (size_t i = node_command_start;
+                 i < context->layout->count; i++) {
+                const DrawCommand *command = &context->layout->commands[i];
+                if (command->height > static_motion_maximum) continue;
+                int command_bottom = layout_add_coordinate(
+                    command->y, command->height);
+                if (command_bottom < LAYOUT_COORDINATE_LIMIT
+                    && command_bottom <= useful_limit
+                    && command_bottom > useful_cap) {
+                    useful_cap = command_bottom;
+                }
+            }
+            cap = useful_cap;
+        } else if (saturated_subtree
+            && content_bottom < LAYOUT_COORDINATE_LIMIT) {
+            /* Flow has already incorporated each contained child's used
+               height. Prefer that truthful edge over stale, pre-clip paint
+               coordinates retained inside an unsupported scroll scene. This
+               also prevents every ancestor from re-expanding the same scene. */
+            int minimum_flow_cap = layout_add_coordinate(
+                outer_y, viewport_height);
+            cap = content_bottom > minimum_flow_cap
+                ? content_bottom : minimum_flow_cap;
+        }
+        if (cap < content_bottom || cap < painted_content_bottom) {
+            if (context->layout->performance.coordinate_containments == 0u)
+                context->layout->performance.first_coordinate_clamp_y = outer_y;
+            context->layout->performance.coordinate_containments++;
+            if (painted_content_bottom >= LAYOUT_COORDINATE_LIMIT)
+                context->layout->performance.coordinate_clamps++;
+            content_bottom = cap;
+            painted_content_bottom = cap;
+            line->y = layout_subtract_coordinate(
+                layout_subtract_coordinate(cap, style->padding.bottom),
+                content_border_bottom);
+            flow_bottom_margin = 0;
+            coordinate_contained = true;
+        }
+    }
     int border_height = content_bottom - outer_y;
     if (!layout_block_patch_decoration(
             context, style, &paint_plan, outer_x, outer_y, outer_width,
@@ -2270,7 +2360,7 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
           + (overflow_clip_box == STYLE_OVERFLOW_CLIP_CONTENT_BOX
              ? style->padding.top : 0);
     bool clips_x = style->overflow_x_scroll;
-    bool clips_y = style->overflow_y_scroll;
+    bool clips_y = style->overflow_y_scroll || coordinate_contained;
     int clip_radius = paint_plan.border_radius_code;
     unsigned clip_path_type = computed_style_clip_path_type(style);
     if (clip_path_type != STYLE_CLIP_PATH_NONE) {

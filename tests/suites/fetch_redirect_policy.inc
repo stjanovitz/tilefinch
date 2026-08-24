@@ -122,6 +122,128 @@ static bool test_private_network_admission(Budget *budget, unsigned port)
     CHECK(fetch_scheduled(budget, url, request, &result)
           && result.status_code == 200);
     fetch_result_destroy(&result);
+
+    /* The isolated sign-in context may reach only a private origin that the
+       detector already admitted. A portal page cannot use top-level
+       navigation as a generic public-to-LAN escape, and media remains off. */
+    BrowserSession portal_session;
+    CHECK(browser_session_init(&portal_session, budget, 64u * 1024u));
+    CHECK(browser_session_captive_portal_begin(&portal_session, url));
+    context.initiator_url = url;
+    context.top_level_url = url;
+    context.target_url = url;
+    context.mode = TILEFINCH_REQUEST_MODE_NAVIGATE;
+    context.destination = TILEFINCH_DESTINATION_DOCUMENT;
+    context.top_level_navigation = true;
+    context.user_activated = true;
+    CHECK(fetch_prepare_page_request_context(
+        &context, url, NULL, &portal_session, NULL, NULL,
+        &transport, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    result = (FetchResult) {.budget = budget};
+    CHECK(fetch_redirect(budget, url, request, &result)
+          && result.status_code == 200);
+    fetch_result_destroy(&result);
+
+    context.mode = TILEFINCH_REQUEST_MODE_NO_CORS;
+    context.destination = TILEFINCH_DESTINATION_MEDIA;
+    context.top_level_navigation = false;
+    context.user_activated = false;
+    CHECK(fetch_prepare_page_request_context(
+        &context, url, NULL, &portal_session, NULL, NULL,
+        &transport, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    result = (FetchResult) {.budget = budget};
+    CHECK(!fetch_redirect(budget, url, request, &result));
+    fetch_result_destroy(&result);
+    browser_session_captive_portal_end(&portal_session);
+
+    CHECK(browser_session_captive_portal_begin(
+        &portal_session, "http://portal.public.example/start"));
+    context.initiator_url = "http://portal.public.example/start";
+    context.top_level_url = context.initiator_url;
+    context.target_url = url;
+    context.mode = TILEFINCH_REQUEST_MODE_NAVIGATE;
+    context.destination = TILEFINCH_DESTINATION_DOCUMENT;
+    context.top_level_navigation = true;
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, NULL, &portal_session,
+        NULL, NULL, &transport, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    result = (FetchResult) {.budget = budget};
+    CHECK(!fetch_redirect(budget, url, request, &result)
+          && strstr(result.error, "private network") != NULL);
+    fetch_result_destroy(&result);
+    browser_session_destroy(&portal_session);
+    return true;
+}
+
+static bool portal_probe_received_nothing(Budget *budget, unsigned port)
+{
+    char url[256];
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%u/portal-probe-count", port);
+    FetchRequest request = {.method = "GET", .allow_http_errors = true};
+    FetchResult result = {.budget = budget};
+    bool ok = fetch_redirect(budget, url, &request, &result)
+        && result.status_code == 200 && result.data != NULL
+        && strstr((const char *) result.data, "requests=0;body=0") != NULL;
+    fetch_result_destroy(&result);
+    return ok;
+}
+
+static bool test_captive_portal_redirect_origin_isolation(
+    Budget *budget, unsigned port)
+{
+    static const unsigned statuses[] = {301, 302, 303, 307, 308};
+    static const char payload[] = "portal-secret-must-not-cross";
+    char admitted_url[256];
+    snprintf(admitted_url, sizeof(admitted_url),
+             "http://127.0.0.1:%u/portal-redirect-301", port);
+    BrowserSession session = {0};
+    CHECK(browser_session_init(&session, budget, 64u * 1024u));
+    CHECK(browser_session_captive_portal_begin(&session, admitted_url));
+
+    for (size_t i = 0; i < sizeof(statuses) / sizeof(statuses[0]); i++) {
+        char url[256];
+        snprintf(url, sizeof(url),
+                 "http://127.0.0.1:%u/portal-redirect-%u",
+                 port, statuses[i]);
+        TilefinchRequestContext context = {
+            .target_url = url,
+            .initiator_url = admitted_url,
+            .top_level_url = admitted_url,
+            .method = "POST",
+            .mode = TILEFINCH_REQUEST_MODE_NAVIGATE,
+            .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+            .destination = TILEFINCH_DESTINATION_DOCUMENT,
+            .top_level_navigation = true,
+            .user_activated = true
+        };
+        FetchRequest transport = {
+            .method = "POST",
+            .body = payload,
+            .body_length = sizeof(payload) - 1u,
+            .content_type = "text/plain",
+            .allow_http_errors = true
+        };
+        FetchPreparedPageRequest prepared;
+        CHECK(fetch_prepare_page_request_context(
+            &context, admitted_url, NULL, &session, NULL, NULL,
+            &transport, &prepared, NULL));
+        const FetchRequest *request = fetch_prepared_page_request(&prepared);
+        CHECK(request != NULL);
+        for (size_t scheduled = 0; scheduled < 2u; scheduled++) {
+            FetchResult result = {.budget = budget};
+            bool followed = scheduled == 0u
+                ? fetch_redirect(budget, url, request, &result)
+                : fetch_scheduled(budget, url, request, &result);
+            CHECK(!followed);
+            fetch_result_destroy(&result);
+            CHECK(portal_probe_received_nothing(budget, port));
+        }
+    }
+    browser_session_destroy(&session);
     return true;
 }
 

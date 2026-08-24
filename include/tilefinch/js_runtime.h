@@ -304,7 +304,10 @@ typedef enum {
     SCRIPT_MUTATION_INNER_HTML,
     SCRIPT_MUTATION_ATTRIBUTE,
     SCRIPT_MUTATION_INLINE_STYLE,
-    SCRIPT_MUTATION_CHILD_LIST
+    SCRIPT_MUTATION_CHILD_LIST,
+    /* Pixel-only canvas publication. The DOM and computed style are
+       unchanged; navigation may invalidate just the canvas box. */
+    SCRIPT_MUTATION_CANVAS
 } ScriptMutationKind;
 
 typedef struct {
@@ -435,6 +438,11 @@ typedef void (*ScriptModuleOpaqueDestroyCallback)(void *opaque);
 /* Module scripts require a JavaScript MIME essence; missing and generic text
    types fail even without X-Content-Type-Options. Parameters are ignored. */
 bool script_module_mime_type_allowed(const char *content_type);
+/* Classify an HTML script type attribute without assuming NUL termination.
+   Empty/whitespace and JavaScript MIME values are classic; `module` is the
+   module keyword. Matching is ASCII-case-insensitive. */
+bool script_type_attribute_classify(
+    const char *type, size_t length, bool *module);
 /* A 304 inherits the stored representation MIME only when the response omits
    Content-Type. Any supplied conflicting/non-JavaScript type fails closed. */
 bool script_module_revalidated_mime_allowed(
@@ -622,6 +630,10 @@ typedef struct {
 
 typedef struct {
     BrowserSession *session;
+    /* Borrowed immutable application faces used by Canvas 2D. A NULL set is
+       valid for standalone/test runtimes and retains the bounded metric
+       fallback in the JavaScript facade. */
+    const FontSet *fonts;
     /* Immutable top-level document URL for network partitioning. Child
        runtimes receive their embedder's top-level URL, not their own URL. */
     const char *top_level_url;
@@ -710,6 +722,13 @@ void script_runtime_detach_document(ScriptRuntime *runtime,
    author JavaScript or invalidate still-valid DOM handles. */
 void script_runtime_relocate_document_storage(ScriptRuntime *runtime,
                                               PocDocument *document);
+/* Replaces body children without running author code. Existing JavaScript
+   wrappers keep detached subtrees alive; unretained handles, mutation targets,
+   script states, and native control state retire before Lexbor frees nodes.
+   Parsed script elements in the replacement are inert, matching innerHTML. */
+bool script_runtime_replace_document_body(
+    ScriptRuntime *runtime, PocDocument *document,
+    const char *markup, size_t length);
 /* Replaces the complete live top-level binding in one non-allocating step.
    Pending materialization requests are invalidated before the old opaque
    values can be released. NULL clears the binding. Child-frame runtimes
@@ -902,6 +921,11 @@ long script_runtime_node_weak_handle(ScriptRuntime *runtime,
    after destructive author mutations invalidate and free their old nodes. */
 lxb_dom_node_t *script_runtime_node_handle_resolve(
     const ScriptRuntime *runtime, long handle);
+/* Resolves a weak snapshot only while its generation is live and the node is
+   still connected to a document. Discovery frontiers must use this rather
+   than retaining a raw DOM pointer across author-script turns. */
+lxb_dom_node_t *script_runtime_node_handle_resolve_connected(
+    const ScriptRuntime *runtime, long handle);
 /* True after a post-parse script element has been admitted to the native
    dynamic loader. Document/section rescans use this to avoid executing the
    same node through the parser-oriented loader a second time. */
@@ -1042,7 +1066,7 @@ bool script_runtime_consume_scroll(ScriptRuntime *runtime, int *scroll_y);
 void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
                                int viewport_height);
 void script_runtime_set_images(ScriptRuntime *runtime,
-                               const ImageResources *images);
+                               ImageResources *images);
 void script_runtime_set_stylesheet(ScriptRuntime *runtime,
                                    const Stylesheet *stylesheet);
 void script_runtime_set_synchronous_layout_callback(

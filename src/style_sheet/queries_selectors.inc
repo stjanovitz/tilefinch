@@ -983,6 +983,7 @@ static bool style_selector_admission_matches_document_tokens(
     size_t square = 0;
     char quote = 0;
     bool compound_start = true;
+    bool has_attribute = false;
     for (size_t at = 0; at < length;) {
         unsigned char value = (unsigned char) selector[at];
         if (quote != 0) {
@@ -998,7 +999,13 @@ static bool style_selector_admission_matches_document_tokens(
             at++;
             continue;
         }
-        if (value == '[') { square++; compound_start = false; at++; continue; }
+        if (value == '[') {
+            square++;
+            has_attribute = true;
+            compound_start = false;
+            at++;
+            continue;
+        }
         if (value == ']' && square != 0) { square--; at++; continue; }
         if (square != 0) {
             at++;
@@ -1039,7 +1046,11 @@ static bool style_selector_admission_matches_document_tokens(
             return false;
         }
     }
-    return functional ? checked == 0 : checked != 0;
+    /* Attribute names are absent from the document token bloom, so
+       attribute-only selectors such as [hidden] must be admitted
+       conservatively. */
+    return functional ? checked == 0 || has_attribute
+                      : checked != 0 || has_attribute;
 }
 
 static bool selector_to_rule(
@@ -1628,7 +1639,11 @@ static bool supports_retained_layout_value(
     if (span_case_equal(name, name_length, "container")) {
         if (span_case_equal(value, value_length, "none")) return true;
         const char *slash = memchr(value, '/', value_length);
-        if (slash == NULL) return false;
+        /* Without a slash the token is a container name, even when it is
+           spelled `inline-size`; the type remains its initial `normal`. */
+        if (slash == NULL) {
+            return supports_ascii_identifier_list(value, value_length);
+        }
         const char *container_name = value;
         size_t container_name_length = (size_t) (slash - value);
         const char *container_type = slash + 1;

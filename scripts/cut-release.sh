@@ -230,6 +230,7 @@ tree="$root/build-preset-psp/tilefinch-install/Tilefinch"
 for required in \
     "$tree/EBOOT.PBP" \
     "$tree/slot-a/EBOOT.PBP" \
+    "$tree/OPTIONAL/tilefinch_xmb.prx" \
     "$tree/slot-a/roots.pem" \
     "$tree/slot-a/boot-defaults.cfg"
 do
@@ -267,7 +268,11 @@ printf 'Notices manifest verified: %s required files present.\n' \
 # the release builder's source tree or home directory. Check the staged PBPs
 # before either the first-install zip or update package can be assembled.
 step "Checking staged binaries for local build paths"
-for binary in "$tree/EBOOT.PBP" "$tree/slot-a/EBOOT.PBP"; do
+for binary in \
+    "$tree/EBOOT.PBP" \
+    "$tree/slot-a/EBOOT.PBP" \
+    "$tree/OPTIONAL/tilefinch_xmb.prx"
+do
     if LC_ALL=C grep -aFq "$root/" "$binary"; then
         fail "$binary contains the local source/build path $root"
     fi

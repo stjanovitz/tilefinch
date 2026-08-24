@@ -19,6 +19,7 @@
 #include "swdec.h"
 #include "swdec_arena.h"
 #include "swdec_bounds.h"
+#include "swdec_csc_mask.h"
 #include "libavcodec/h264dec.h"
 #include "libavcodec/swdec_pipe.h"
 
@@ -152,12 +153,11 @@ static void me_post_deblock(void) { me_dcache_writeback_all(); }
 #endif
 
 /* ---------------- CSC on the parser core (row-hot after deblock) ----------------
- * The CPU assigns an RGB565 destination slot before each AU; the ME converts
- * each 16-pixel row batch the moment the batch above it finishes deblocking
- * (its pixels are final and still in the ME dcache). The CPU finishes the
- * batches the ME didn't reach (normally the frame tail it deblocks itself)
- * at AU end via swdec_me_csc_close() - the done mask makes the split
- * self-balancing, same as the deblock work stealing. */
+ * Once receive_frame identifies the picture produced by an AU (or by the EOF
+ * flush), the CPU binds that picture to an RGB565 destination slot. The ME and
+ * CPU then share its final eight-row units; the two-word done mask makes the
+ * split self-balancing and covers the full 272-pixel PSP display without a
+ * tear-prone shared uint64_t. */
 #define CSC_SLOTS SWDEC_ME_CSC_SLOTS
 typedef struct {
     const uint8_t *y, *u, *v;       /* source planes (recorded by the ME) */
@@ -165,7 +165,7 @@ typedef struct {
     uint16_t *dst;
     int dst_stride;
     size_t dst_capacity;
-    volatile unsigned done;         /* bit n = row batch n converted */
+    SwdecCscMask done;              /* bit n = eight-row unit n converted */
     volatile unsigned recorded;     /* the ME saw this frame */
     volatile unsigned rejected;     /* decoded geometry exceeds dst */
     volatile int max_final;         /* highest row batch whose pixels are final */
@@ -252,22 +252,26 @@ static void me_csc_idle_one_ex(int wb)
         || !swdec_rgb565_destination_fits(
             s->w, s->h, s->dst_stride, s->dst_capacity)) return;
     int mf = s->max_final;
-    unsigned did = 0;
+    SwdecCscMask did = {{0, 0}};
     int n = 0;
+    if (mf >= (int) SWDEC_CSC_MASK_UNITS)
+        mf = (int) SWDEC_CSC_MASK_UNITS - 1;
     for (int b = 0; b <= mf && n < (wb ? 3 : 1); b++) {
-        if ((s->done | did) & (1u << b)) continue;
+        if (swdec_csc_mask_test(&s->done, (unsigned) b)
+            || swdec_csc_mask_test(&did, (unsigned) b)) continue;
         csc_batch(s, b);
-        did |= 1u << b;
+        swdec_csc_mask_set(&did, (unsigned) b);
         n++;
         if (!wb) break;
     }
-    if (!did) return;
+    if (did.words[0] == 0 && did.words[1] == 0) return;
     /* inter-AU: write the pixels back BEFORE publishing the bits, so the CPU
        can never see done=1 for rows that are still only in the ME dcache
        (one sweep per batch of units, not per unit - the sweep also evicts the
        working set, so batching it matters) */
     if (wb) me_dcache_writeback_all();
-    s->done = s->done | did;
+    s->done.words[0] = s->done.words[0] | did.words[0];
+    s->done.words[1] = s->done.words[1] | did.words[1];
     *(volatile unsigned *) UNC(&csc_me_batches) += (unsigned) n;
 }
 static void me_csc_idle_one(void) { me_csc_idle_one_ex(0); }
@@ -285,10 +289,35 @@ void swdec_me_csc_begin(int slot, void *dst_rgb565, int stride_pixels,
     s->dst = dst_rgb565;
     s->dst_stride = stride_pixels;
     s->dst_capacity = capacity_bytes;
-    s->done = 0; s->recorded = 0; s->rejected = 0; s->max_final = -1;
+    swdec_csc_mask_clear(&s->done);
+    s->recorded = 0; s->rejected = 0; s->max_final = -1;
     s->y = s->u = s->v = NULL;
     __asm__ volatile ("sync" ::: "memory");
     *(volatile int *) UNC(&csc_active) = slot;
+}
+int swdec_me_csc_picture(int slot, void *dst_rgb565, int stride_pixels,
+                         size_t capacity_bytes,
+                         const uint8_t *y, const uint8_t *u,
+                         const uint8_t *v, int y_stride, int uv_stride,
+                         int width, int height)
+{
+    if (y == NULL || u == NULL || v == NULL
+        || !swdec_rgb565_destination_fits(
+            width, height, stride_pixels, capacity_bytes)) return 0;
+    swdec_me_csc_begin(
+        slot, dst_rgb565, stride_pixels, capacity_bytes);
+    if (slot < 0 || slot >= CSC_SLOTS) return 0;
+    SwdecCscSlot *s = (SwdecCscSlot *) UNC(&csc_slots[slot]);
+    s->y = y; s->u = u; s->v = v;
+    s->ys = y_stride; s->uvs = uv_stride;
+    s->w = width; s->h = height;
+    s->recorded = 1;
+    s->max_final = (height + 7) / 8 - 1;
+    /* This path binds conversion after receive_frame has identified the
+       actual output picture. It is used for reordered and EOF-delayed
+       pictures, where preselecting a destination from the submitted AU is
+       incorrect. */
+    return swdec_me_csc_close();
 }
 void swdec_me_csc_off(void) { *(volatile int *) UNC(&csc_active) = -1; }
 /* AU done: finish the batches the ME didn't reach; returns 1 if the slot holds
@@ -303,13 +332,14 @@ int swdec_me_csc_close(void)
         || !swdec_rgb565_destination_fits(
             s->w, s->h, s->dst_stride, s->dst_capacity)) return 0;
     int nb = (s->h + 7) / 8;
-    if (nb > 32) nb = 32;
+    if (nb > (int) SWDEC_CSC_MASK_UNITS)
+        nb = (int) SWDEC_CSC_MASK_UNITS;
     int did_cpu = 0;
     for (int b = 0; b < nb; b++) {
-        if (s->done & (1u << b)) continue;
+        if (swdec_csc_mask_test(&s->done, (unsigned) b)) continue;
         /* the CPU wrote these pixels last (tail deblock): its cache is current */
         csc_batch(s, b);
-        s->done = s->done | (1u << b);
+        swdec_csc_mask_set(&s->done, (unsigned) b);
         csc_cpu_batches++;
         int j0 = b * 8, j1 = (b + 1) * 8; if (j1 > s->h) j1 = s->h;
         sceKernelDcacheWritebackRange(

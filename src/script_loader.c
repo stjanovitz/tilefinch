@@ -471,16 +471,10 @@ static ScriptKind script_declared_kind(lxb_dom_node_t *node)
     if (!node_name_is(node, "script")) return SCRIPT_KIND_INERT;
     size_t length = 0;
     const char *type = document_attribute(node, "type", &length);
-    if (type != NULL && length == 6 && memcmp(type, "module", 6) == 0) {
-        return SCRIPT_KIND_MODULE;
-    }
-    if (type == NULL || length == 0
-        || (length == 15 && memcmp(type, "text/javascript", 15) == 0)
-        || (length == 22
-            && memcmp(type, "application/javascript", 22) == 0)) {
-        return SCRIPT_KIND_CLASSIC;
-    }
-    return SCRIPT_KIND_INERT;
+    bool module = false;
+    if (!script_type_attribute_classify(type, length, &module))
+        return SCRIPT_KIND_INERT;
+    return module ? SCRIPT_KIND_MODULE : SCRIPT_KIND_CLASSIC;
 }
 
 static bool script_has_nomodule(lxb_dom_node_t *node)
@@ -733,6 +727,8 @@ bool external_scripts_load(NavigationSession *navigation,
         if (reference == NULL || reference_length == 0
             || reference_length >= NAVIGATION_URL_LIMIT) {
             metrics->failed++;
+            (void) navigation_dispatch_node_event(
+                navigation, node, "error");
             continue;
         }
         char reference_copy[NAVIGATION_URL_LIMIT];
@@ -781,6 +777,8 @@ bool external_scripts_load(NavigationSession *navigation,
         ScriptQuotaReservation quota = {0};
         if (metrics->bytes >= maximum_total_bytes) {
             metrics->skipped_quota++; script_trace_skip(resolved);
+            (void) navigation_dispatch_node_event(
+                navigation, node, "error");
             continue;
         }
         size_t requested_bytes = maximum_total_bytes - metrics->bytes;
@@ -797,6 +795,8 @@ bool external_scripts_load(NavigationSession *navigation,
             script_runtime_script_quota_abort(
                 navigation->page.runtime, &quota);
             metrics->skipped_quota++; script_trace_skip(resolved);
+            (void) navigation_dispatch_node_event(
+                navigation, node, "error");
             continue;
         }
         size_t response_limit = quota.reserved_bytes;
@@ -813,6 +813,8 @@ bool external_scripts_load(NavigationSession *navigation,
                 script_runtime_script_quota_abort(
                     navigation->page.runtime, &quota);
                 metrics->skipped_quota++; script_trace_skip(resolved);
+                (void) navigation_dispatch_node_event(
+                    navigation, node, "error");
                 continue;
             }
             metrics->attempted++; script_trace_attempt(resolved);
@@ -859,6 +861,8 @@ bool external_scripts_load(NavigationSession *navigation,
                     navigation->page.runtime, resolved, "script");
             } else {
                 metrics->failed++;
+                (void) navigation_dispatch_node_event(
+                    navigation, node, "error");
             }
             continue;
         }
@@ -880,6 +884,8 @@ bool external_scripts_load(NavigationSession *navigation,
             script_runtime_script_quota_abort(
                 navigation->page.runtime, &quota);
             script_cache_source_release(&cached_source);
+            (void) navigation_dispatch_node_event(
+                navigation, node, "error");
             return false;
         }
         metrics->attempted++; script_trace_attempt(resolved);
@@ -902,6 +908,8 @@ bool external_scripts_load(NavigationSession *navigation,
             metrics->failed++;
             fetch_result_free(fetch);
             script_cache_source_release(&cached_source);
+            (void) navigation_dispatch_node_event(
+                navigation, node, "error");
             continue;
         }
         const FetchRequest *request = fetch_prepared_page_request(&prepared);
@@ -993,6 +1001,8 @@ bool external_scripts_load(NavigationSession *navigation,
                 navigation->page.runtime, resolved, "script");
         } else {
             metrics->failed++;
+            (void) navigation_dispatch_node_event(
+                navigation, node, "error");
         }
         fetch_result_free(fetch);
         script_cache_source_release(&cached_source);
@@ -1703,7 +1713,17 @@ static bool execute_external_node(
             return true;
         }
         char data_url[NAVIGATION_URL_LIMIT];
-        if (reference_length >= sizeof(data_url)) return true;
+        if (reference_length >= sizeof(data_url)) {
+            metrics->failed++;
+            if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+                fprintf(stderr,
+                        "data-script-url-too-long length=%zu limit=%zu\n",
+                        reference_length, sizeof(data_url) - 1u);
+            }
+            (void) script_runtime_dispatch_node(
+                runtime, node, "error", NULL);
+            return true;
+        }
         memcpy(data_url, reference, reference_length);
         data_url[reference_length] = '\0';
         if (!tilefinch_csp_allows_request(
@@ -1799,6 +1819,7 @@ static bool execute_external_node(
         || quota.reserved_bytes == 0) {
         script_runtime_script_quota_abort(runtime, &quota);
         metrics->skipped_quota++; script_trace_skip(resolved);
+        (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
         return true;
     }
     size_t response_limit = quota.reserved_bytes;
@@ -1807,6 +1828,7 @@ static bool execute_external_node(
             runtime, top_level_url, sizeof(top_level_url))) {
         script_runtime_script_quota_abort(runtime, &quota);
         metrics->failed++;
+        (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
         return true;
     }
     TilefinchRequestContext request_context = script_request_context(
@@ -1830,6 +1852,8 @@ static bool execute_external_node(
         if (cached == NULL || cached->length > response_limit) {
             script_runtime_script_quota_abort(runtime, &quota);
             metrics->skipped_quota++; script_trace_skip(resolved);
+            (void) script_runtime_dispatch_node(
+                runtime, node, "error", NULL);
             return true;
         }
         ScriptCacheSource cached_source;

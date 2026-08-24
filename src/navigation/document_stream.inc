@@ -390,12 +390,10 @@ static void navigation_stream_preload_scan_tag(
             tag, length, "src", &src, &src_length);
         bool has_type = navigation_preload_scan_attribute(
             tag, length, "type", &type, &type_length);
-        bool module = has_type
-            && navigation_span_equal(type, type_length, "module");
-        bool classic = !has_type || type_length == 0
-            || navigation_span_equal(type, type_length, "text/javascript")
-            || navigation_span_equal(
-                type, type_length, "application/javascript");
+        bool module = false;
+        bool executable = script_type_attribute_classify(
+            has_type ? type : NULL, has_type ? type_length : 0u, &module);
+        bool classic = executable && !module;
         const char *nomodule_value = NULL;
         size_t nomodule_length = 0;
         bool nomodule = navigation_preload_scan_attribute(
@@ -1426,11 +1424,13 @@ static void navigation_stream_destroy_staging(
     layout_reuse_cache_destroy(stream->preview_layout_reuse);
     stream->preview_layout_reuse = NULL;
     navigation_stream_release_blocking_stylesheet(stream);
+    document_body_snapshot_destroy(&stream->server_body_snapshot);
     budget_free(stream->session == NULL ? NULL : stream->session->budget,
                 stream->stylesheet_inputs);
     stream->stylesheet_inputs = NULL;
     stream->stylesheet_input_count = 0;
     stylesheet_document_resources_destroy(&stream->stylesheet_resources);
+    images_destroy(&stream->canvas_images);
     if (!stream->runtime_transferred) {
         script_runtime_destroy(stream->runtime);
     }
@@ -1550,7 +1550,7 @@ static bool navigation_stream_prepare_runtime(NavigationDocumentStream *stream,
                                          : stream->document_url,
         stream->referrer_policy, true, &stream->viewport,
         SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL, false, stream->fetch_domain,
-        NULL,
+        NULL, &stream->canvas_images, stream->fonts,
         &stream->script_result);
     if (stream->runtime != NULL) {
         script_runtime_set_synchronous_layout_callback(

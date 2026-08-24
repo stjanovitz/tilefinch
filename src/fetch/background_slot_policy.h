@@ -9,6 +9,7 @@
 
 #define FETCH_BACKGROUND_MEDIA_RESERVED_SLOTS 2u
 #define FETCH_BACKGROUND_RESPONSE_COOKIE_BYTES (16u * 1024u)
+#define FETCH_BACKGROUND_STREAM_PUBLICATION_MAX (48u * 1024u)
 
 typedef enum {
     FETCH_BACKGROUND_COOKIE_CAPTURED = 0,
@@ -51,6 +52,35 @@ static inline bool fetch_background_redirect_cookie_overflow_fatal(
     return status_code == 301 || status_code == 302
         || status_code == 303 || status_code == 307
         || status_code == 308;
+}
+
+/* Once the terminating blank line has published a header snapshot, libcurl
+   may still route HTTP trailers through the header callback. A trailer is
+   never part of the already-published response-header authority. */
+static inline bool fetch_background_header_line_ignored(
+    bool header_block_complete, bool header_snapshot_published,
+    bool status_line)
+{
+    return header_block_complete
+        && (header_snapshot_published || !status_line);
+}
+
+static inline bool fetch_background_header_block_publishable(
+    bool single_hop, long status_code, bool has_location)
+{
+    return single_hop || status_code < 300 || status_code >= 400
+        || !has_location;
+}
+
+/* The 64 KiB worker buffer needs one libcurl write callback (normally 16
+   KiB) of spare capacity after the publication threshold is crossed. */
+static inline size_t fetch_background_stream_publication_target(
+    size_t requested, size_t maximum_bytes)
+{
+    size_t target = requested == 0
+        || requested > FETCH_BACKGROUND_STREAM_PUBLICATION_MAX
+        ? FETCH_BACKGROUND_STREAM_PUBLICATION_MAX : requested;
+    return target > maximum_bytes ? maximum_bytes : target;
 }
 
 static inline uint32_t fetch_background_generation_next(uint32_t current)

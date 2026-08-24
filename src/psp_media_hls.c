@@ -29,6 +29,7 @@ struct PspMediaHlsContext {
     size_t playlist_length;
     MediaHlsPlaylist *playlist;
     MediaHlsSource *source;
+    uint64_t playlist_request_id;
     unsigned master_depth;
     PspHlsRequest requests[PSP_HLS_REQUEST_LIMIT];
     bool failed;
@@ -288,7 +289,8 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
                                                 : PSP_MEDIA_HLS_OPEN_PENDING;
     }
     if (context->requests[0].background_id == 0
-        && context->requests[1].background_id == 0) {
+        && context->requests[1].background_id == 0
+        && context->playlist_request_id == 0) {
         char start_error[160] = {0};
         uint64_t id = psp_hls_start(
             context, context->playlist_url,
@@ -299,9 +301,14 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
             return context->failed ? PSP_MEDIA_HLS_OPEN_FAILED
                                    : PSP_MEDIA_HLS_OPEN_PENDING;
         }
+        context->playlist_request_id = id;
     }
-    PspHlsRequest *request = context->requests[0].background_id != 0
-        ? &context->requests[0] : &context->requests[1];
+    PspHlsRequest *request = psp_hls_request(
+        context, context->playlist_request_id);
+    if (request == NULL) {
+        psp_hls_error(context, "HLS playlist request disappeared");
+        return PSP_MEDIA_HLS_OPEN_FAILED;
+    }
     size_t length = 0;
     MediaHlsTransportPollResult result = psp_hls_poll(
         context, request->background_id,
@@ -313,6 +320,7 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
         return PSP_MEDIA_HLS_OPEN_PENDING;
     }
     if (result == MEDIA_HLS_TRANSPORT_WAIT) return PSP_MEDIA_HLS_OPEN_PENDING;
+    context->playlist_request_id = 0;
     if (result == MEDIA_HLS_TRANSPORT_ERROR) {
         psp_hls_error(context, error[0] == '\0'
             ? "HLS playlist fetch failed" : error);
@@ -364,6 +372,82 @@ PspMediaHlsOpenStatus psp_media_hls_pump(
     return PSP_MEDIA_HLS_OPEN_PENDING;
 }
 
+void psp_media_hls_pump_delivery(
+    PspMediaHlsContext *context, uint64_t now_us)
+{
+    if (context == NULL || context->failed || context->source == NULL) return;
+    media_hls_source_pump(context->source, now_us);
+    if (context->playlist_request_id == 0
+        && media_hls_source_wants_playlist_refresh(
+               context->source, now_us)) {
+        char error[160] = {0};
+        context->playlist_request_id = psp_hls_start(
+            context, context->playlist_url,
+            MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES,
+            error, sizeof(error));
+        if (context->playlist_request_id == 0 && error[0] != '\0')
+            media_hls_source_note_playlist_refresh_failure(
+                context->source, now_us);
+    }
+    if (context->playlist_request_id == 0) return;
+    PspHlsRequest *request = psp_hls_request(
+        context, context->playlist_request_id);
+    if (request == NULL) {
+        context->playlist_request_id = 0;
+        media_hls_source_note_playlist_refresh_failure(
+            context->source, now_us);
+        return;
+    }
+    size_t length = 0;
+    char error[160] = {0};
+    MediaHlsTransportPollResult result = psp_hls_poll(
+        context, context->playlist_request_id,
+        context->playlist_bytes + context->playlist_length,
+        MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES - context->playlist_length,
+        &length, error, sizeof(error));
+    if (result == MEDIA_HLS_TRANSPORT_CHUNK) {
+        context->playlist_length += length;
+        return;
+    }
+    if (result == MEDIA_HLS_TRANSPORT_WAIT) return;
+    context->playlist_request_id = 0;
+    if (result == MEDIA_HLS_TRANSPORT_ERROR) {
+        context->playlist_length = 0;
+        media_hls_source_note_playlist_refresh_failure(
+            context->source, now_us);
+        return;
+    }
+    MediaHlsPlaylist *replacement = media_hls_playlist_parse(
+        context->budget, context->playlist_url,
+        context->playlist_bytes, context->playlist_length,
+        error, sizeof(error));
+    context->playlist_length = 0;
+    if (replacement == NULL
+        || media_hls_playlist_kind(replacement)
+             != MEDIA_HLS_PLAYLIST_MEDIA) {
+        media_hls_playlist_destroy(replacement);
+        media_hls_source_note_playlist_refresh_failure(
+            context->source, now_us);
+        return;
+    }
+    (void) media_hls_source_update_playlist(
+        context->source, replacement, now_us, error, sizeof(error));
+}
+
+bool psp_media_hls_is_live(const PspMediaHlsContext *context)
+{
+    MediaHlsStats stats = {0};
+    if (context == NULL || context->source == NULL) return false;
+    media_hls_source_stats(context->source, &stats);
+    return stats.live;
+}
+
+bool psp_media_hls_failed(const PspMediaHlsContext *context)
+{
+    return context != NULL
+        && (context->failed || media_hls_source_failed(context->source));
+}
+
 bool psp_media_hls_sample_source(
     PspMediaHlsContext *context, MediaSampleSource *source)
 {
@@ -385,6 +469,7 @@ bool psp_media_hls_stats(
     if (context == NULL || context->source == NULL || stats == NULL)
         return false;
     media_hls_source_stats(context->source, stats);
+    if (context->playlist_request_id != 0) stats->active_requests++;
     return true;
 }
 

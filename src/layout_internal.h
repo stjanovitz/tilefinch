@@ -200,6 +200,8 @@ typedef struct {
     bool hidden;
 } LayoutVisibilityRange;
 
+typedef struct LayoutBidiFlow LayoutBidiFlow;
+
 typedef struct {
     lxb_dom_node_t *node;
     ComputedStyle style;
@@ -375,6 +377,8 @@ typedef struct {
        the retained cache instead of repeatedly traversing and blurring it. */
     uint8_t backdrop_filter_count;
     bool backdrop_filter_disabled;
+    bool document_bidi_text_present;
+    bool document_bidi_markup_present;
     bool cancelled;
     LayoutReuseCache *reuse;
 } LayoutContext;
@@ -481,6 +485,8 @@ typedef struct {
     int clamp_right;
     size_t float_count;
     FloatExclusion floats[ACTIVE_FLOAT_LIMIT];
+    LayoutBidiFlow *bidi_flow;
+    bool bidi_pipeline_expected;
 } LineState;
 
 bool layout_line_clamp_overflow(LineState *line);
@@ -571,7 +577,7 @@ typedef struct {
     size_t order_index;
 } FlexItemIterator;
 
-#define GRID_EXPLICIT_TRACK_LIMIT 8
+#define FLEX_ORDER_VALUE_LIMIT 32u
 #define GRID_TRACK_LIMIT GRID_TRACK_REPEAT_LIMIT
 #define GRID_PLACEMENT_ROW_LIMIT 64
 
@@ -609,6 +615,7 @@ struct LayoutBlockScratch {
     PositionedBox descendant_positioned_box;
     FlexOrderPlan row_order;
     FlexOrderPlan column_order;
+    LayoutBidiFlow *bidi_flow;
     union {
         struct {
             FlatItemIterator iterator;
@@ -707,6 +714,40 @@ static inline size_t layout_pointer_hash(const void *pointer)
 
 AlignItems flex_item_alignment(const ComputedStyle *container, const ComputedStyle *item);
 ComputedStyle layout_style_for_node(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent);
+LayoutBidiFlow *layout_bidi_flow_create(
+    LayoutContext *context, lxb_dom_node_t *node,
+    const ComputedStyle *style, bool *attempted);
+void layout_bidi_flow_destroy(LayoutBidiFlow *flow);
+void layout_bidi_note_text_command(
+    LineState *line, size_t command_index,
+    const char *text, size_t length, int logical_advance_fixed,
+    int space_advance_fixed);
+void layout_bidi_note_atomic(
+    LineState *line, lxb_dom_node_t *node,
+    size_t command_start, size_t link_start,
+    size_t control_start, size_t node_box_start,
+    size_t previous_line_command_start, int previous_cursor_fixed);
+bool layout_bidi_measure_shaped_text(
+    LineState *line, const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int letter_spacing,
+    TextTransformMode transform, bool kerning, int *width_fixed);
+bool layout_bidi_fitting_shaped_prefix(
+    LineState *line, const FontFace *face, FontFamily metric_family,
+    const char *text, size_t length, int font_size_fixed,
+    bool synthetic_bold, bool metric_bold, int letter_spacing,
+    TextTransformMode transform, bool kerning, int available_fixed,
+    size_t *prefix);
+bool layout_bidi_resolve_line(LineState *line);
+const LayoutBidiCommand *layout_bidi_command_for_index(
+    const LayoutDocument *layout, size_t command_index);
+void layout_bidi_translate_commands(
+    LayoutDocument *layout, size_t command_start, int dx);
+void layout_bidi_scale_commands(
+    LayoutDocument *layout, size_t command_start,
+    int origin_x_twice, uint8_t scale_q6);
+void layout_bidi_rebase_command(
+    LayoutDocument *layout, size_t command_index, int old_x_fixed);
 DrawCommand *layout_add_command(LayoutDocument *layout, DrawCommand command);
 bool layout_add_text_shadow_commands(
     LayoutContext *context, const ComputedStyle *style,

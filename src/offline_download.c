@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 
 #include "tilefinch/media_http.h"
+#include "tilefinch/platform.h"
 #include "tilefinch/update.h"
 
 #include "tilefinch/user_agent.h"
@@ -153,6 +154,8 @@ static void download_set_state(
         : offline_library_find_mutable(manager->library, manager->active_id);
     if (item != NULL) {
         item->state = state;
+        snprintf(item->failure_reason, sizeof(item->failure_reason), "%s",
+                 error == NULL ? "" : error);
         (void) offline_library_save(manager->library);
     }
     if (manager != NULL && error != NULL && error != manager->error)
@@ -177,6 +180,10 @@ static void download_reset_active(OfflineDownloadManager *manager)
     manager->request_length = 0;
     manager->request_written = 0;
     manager->headers_valid = false;
+    manager->available_bytes = 0;
+    manager->speed_sample_us = 0;
+    manager->speed_sample_bytes = 0;
+    manager->bytes_per_second = 0;
     memset(&manager->stream, 0, sizeof(manager->stream));
 }
 
@@ -214,6 +221,7 @@ bool offline_download_manager_start(
     manager->error[0] = '\0';
     OfflineItemState previous_state = item->state;
     item->state = OFFLINE_ITEM_DOWNLOADING;
+    item->failure_reason[0] = '\0';
     if (offline_library_save(manager->library)) return true;
     item->state = previous_state;
     download_reset_active(manager);
@@ -386,6 +394,10 @@ bool offline_download_manager_adopt_resolved(
         download_reset_active(manager);
         return false;
     }
+    manager->available_bytes = available;
+    manager->speed_sample_us = tilefinch_platform_monotonic_time_us();
+    manager->speed_sample_bytes = retained;
+    manager->bytes_per_second = 0;
     uint64_t remaining = required >= retained ? required - retained : required;
     if (available < OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE
         || remaining > available - OFFLINE_DOWNLOAD_FREE_SPACE_RESERVE) {
@@ -407,6 +419,7 @@ bool offline_download_manager_adopt_resolved(
             || final_audio == stream->audio_content_length)) {
         item->downloaded_bytes = required;
         item->state = OFFLINE_ITEM_READY;
+        item->failure_reason[0] = '\0';
         (void) offline_library_save(manager->library);
         download_reset_active(manager);
         return true;
@@ -537,6 +550,7 @@ static bool download_advance_part(OfflineDownloadManager *manager)
     if (item != NULL) {
         item->downloaded_bytes = item->content_bytes + item->audio_bytes;
         item->state = OFFLINE_ITEM_READY;
+        item->failure_reason[0] = '\0';
         if (!offline_library_save(manager->library)) {
             item->state = OFFLINE_ITEM_PAUSED;
             snprintf(manager->error, sizeof(manager->error),
@@ -606,6 +620,22 @@ bool offline_download_manager_pump(OfflineDownloadManager *manager)
         uint64_t video_done = manager->phase == OFFLINE_DOWNLOAD_AUDIO
             ? item->content_bytes : 0;
         item->downloaded_bytes = video_done + manager->part_offset;
+        uint64_t now = tilefinch_platform_monotonic_time_us();
+        uint64_t elapsed = now >= manager->speed_sample_us
+            ? now - manager->speed_sample_us : 0;
+        if (elapsed >= UINT64_C(250000)
+            && item->downloaded_bytes >= manager->speed_sample_bytes) {
+            uint64_t delta = item->downloaded_bytes
+                - manager->speed_sample_bytes;
+            uint64_t rate = delta * UINT64_C(1000000) / elapsed;
+            manager->bytes_per_second = rate > UINT32_MAX
+                ? UINT32_MAX : (uint32_t) rate;
+            manager->speed_sample_us = now;
+            manager->speed_sample_bytes = item->downloaded_bytes;
+        }
+        manager->available_bytes = manager->available_bytes
+                >= manager->request_length
+            ? manager->available_bytes - manager->request_length : 0;
     }
     return true;
 }
@@ -638,6 +668,31 @@ bool offline_download_manager_active(
 {
     if (manager == NULL || manager->active_id == 0) return false;
     if (id != NULL) *id = manager->active_id;
+    return true;
+}
+
+bool offline_download_manager_snapshot(
+    const OfflineDownloadManager *manager, uint32_t id,
+    OfflineDownloadSnapshot *snapshot)
+{
+    if (snapshot != NULL) memset(snapshot, 0, sizeof(*snapshot));
+    if (manager == NULL || manager->library == NULL || snapshot == NULL
+        || id == 0) return false;
+    const OfflineLibraryItem *item = offline_library_find(
+        manager->library, id);
+    if (item == NULL || item->type != OFFLINE_ITEM_YOUTUBE) return false;
+    snapshot->id = id;
+    snapshot->phase = manager->active_id == id
+        ? manager->phase : OFFLINE_DOWNLOAD_IDLE;
+    snapshot->downloaded_bytes = item->downloaded_bytes;
+    snapshot->total_bytes = item->content_bytes + item->audio_bytes;
+    snapshot->available_bytes = manager->active_id == id
+        ? manager->available_bytes : 0;
+    snapshot->bytes_per_second = manager->active_id == id
+        ? manager->bytes_per_second : 0;
+    snapshot->active = manager->active_id == id;
+    snprintf(snapshot->failure_reason, sizeof(snapshot->failure_reason),
+             "%s", item->failure_reason);
     return true;
 }
 

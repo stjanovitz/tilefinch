@@ -289,13 +289,30 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
                                                : (int) baseline_wide);
     unsigned previous = 0;
     bool word_start = true;
-    bool rtl = draw_command_text_rtl(command);
+    const LayoutBidiCommand *bidi_command = NULL;
+    uintptr_t command_address = (uintptr_t) command;
+    uintptr_t commands_address = (uintptr_t) cache->layout->commands;
+    size_t commands_bytes = cache->layout->count * sizeof(DrawCommand);
+    if (commands_address <= UINTPTR_MAX - commands_bytes
+        && command_address >= commands_address
+        && command_address < commands_address + commands_bytes
+        && (command_address - commands_address) % sizeof(DrawCommand) == 0) {
+        size_t command_index = (command_address - commands_address)
+                               / sizeof(DrawCommand);
+        bidi_command = layout_bidi_command_for_index(
+            cache->layout, command_index);
+    }
+    size_t bidi_at = 0;
+    bool rtl = bidi_command == NULL && draw_command_text_rtl(command);
     size_t rtl_number_at = 0, rtl_number_end = 0;
     for (size_t at = rtl ? command->text_length : 0;
-         rtl ? (at > 0 || rtl_number_at < rtl_number_end)
-             : at < command->text_length;) {
+         bidi_command != NULL ? bidi_at < bidi_command->glyph_count
+         : (rtl ? (at > 0 || rtl_number_at < rtl_number_end)
+                : at < command->text_length);) {
         size_t character_at = at;
-        if (rtl && rtl_number_at < rtl_number_end) {
+        if (bidi_command != NULL) {
+            character_at = 0;
+        } else if (rtl && rtl_number_at < rtl_number_end) {
             character_at = rtl_number_at;
         } else if (rtl) {
             character_at--;
@@ -321,7 +338,13 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
         unsigned codepoint = 0;
         size_t used = 0;
         bool provider_sequence = false;
-        if (!rtl) {
+        if (bidi_command != NULL) {
+            const LayoutBidiGlyph *glyph = &cache->layout->bidi_glyphs[
+                bidi_command->glyph_start + bidi_at];
+            codepoint = glyph->codepoint;
+            pen_x_fixed = glyph->x_fixed;
+            used = 1;
+        } else if (!rtl) {
             provider_sequence = font_optional_glyph_match_sequence(
                 command->text + character_at,
                 command->text_length - character_at, &used, &codepoint);
@@ -339,7 +362,7 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
                                   command->text_length - character_at,
                                   &codepoint);
         if (used == 0) break;
-        if (!provider_sequence
+        if (bidi_command == NULL && !provider_sequence
             && font_codepoint_default_ignorable(codepoint)) {
             if (rtl_number_at < rtl_number_end) {
                 rtl_number_at = character_at + used;
@@ -351,14 +374,15 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
             }
             continue;
         }
-        if (!provider_sequence)
+        if (bidi_command == NULL && !provider_sequence)
             codepoint = draw_command_transform_codepoint(
                 command, codepoint, word_start);
         word_start = false;
-        if (previous != 0) {
+        if (bidi_command == NULL && previous != 0) {
             pen_x_fixed += command->letter_spacing * 64;
         }
-        if (!provider_sequence && !draw_command_text_kerning_none(command))
+        if (bidi_command == NULL && !provider_sequence
+            && !draw_command_text_kerning_none(command))
             pen_x_fixed += font_kerning_at_size_fixed(
                 face, previous, codepoint, pixel_height_fixed);
         FontGlyph temporary;
@@ -525,12 +549,17 @@ static void rasterize_truetype_text(TileCache *cache, RasterTarget *target,
                 }
             }
         }
-        pen_x_fixed += font_glyph_advance_for_family_at_size_fixed(
-            metric_family, codepoint, pixel_height_fixed,
-            synthetic_bold, metric_bold, glyph->advance_fixed);
+        if (bidi_command == NULL) {
+            pen_x_fixed += font_glyph_advance_for_family_at_size_fixed(
+                metric_family, codepoint, pixel_height_fixed,
+                synthetic_bold, metric_bold, glyph->advance_fixed);
+        }
         previous = provider_sequence ? 0 : codepoint;
         font_glyph_destroy(face, &temporary);
-        if (rtl_number_at < rtl_number_end) {
+        if (bidi_command != NULL) {
+            bidi_at++;
+            previous = 0;
+        } else if (rtl_number_at < rtl_number_end) {
             rtl_number_at = character_at + used;
             if (rtl_number_at >= rtl_number_end) {
                 rtl_number_at = rtl_number_end = 0;

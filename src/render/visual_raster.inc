@@ -488,14 +488,20 @@ static void rasterize_image(TileCache *cache, RasterTarget *target,
             draw_height = tilefinch_mul_div_int(
                 command->width, pixel_height, pixel_width);
             if (draw_height < 1) draw_height = 1;
-            draw_y += (command->height - draw_height) * position_y / 100
-                      + position_offset_y;
+            draw_y = render_saturating_add_int(
+                draw_y, render_saturating_add_int(
+                    tilefinch_mul_div_int(
+                        command->height - draw_height, position_y, 100),
+                    position_offset_y));
         } else {
             draw_width = tilefinch_mul_div_int(
                 command->height, pixel_width, pixel_height);
             if (draw_width < 1) draw_width = 1;
-            draw_x += (command->width - draw_width) * position_x / 100
-                      + position_offset_x;
+            draw_x = render_saturating_add_int(
+                draw_x, render_saturating_add_int(
+                    tilefinch_mul_div_int(
+                        command->width - draw_width, position_x, 100),
+                    position_offset_x));
         }
     } else if (command->image_fit == LAYOUT_IMAGE_FIT_COVER) {
         if ((int64_t) pixel_width * command->height
@@ -503,22 +509,32 @@ static void rasterize_image(TileCache *cache, RasterTarget *target,
             source_width = tilefinch_mul_div_int(
                 pixel_height, command->width, command->height);
             if (source_width < 1) source_width = 1;
-            source_x_offset = (pixel_width - source_width) * position_x / 100
-                              - position_offset_x;
+            source_x_offset = render_saturating_subtract_int(
+                tilefinch_mul_div_int(
+                    pixel_width - source_width, position_x, 100),
+                position_offset_x);
         } else {
             source_height = tilefinch_mul_div_int(
                 pixel_width, command->height, command->width);
             if (source_height < 1) source_height = 1;
-            source_y_offset = (pixel_height - source_height)
-                              * position_y / 100 - position_offset_y;
+            source_y_offset = render_saturating_subtract_int(
+                tilefinch_mul_div_int(
+                    pixel_height - source_height, position_y, 100),
+                position_offset_y);
         }
     } else if (command->image_fit == LAYOUT_IMAGE_FIT_NONE || scale_down) {
         draw_width = pixel_width;
         draw_height = pixel_height;
-        draw_x += (command->width - draw_width) * position_x / 100
-                  + position_offset_x;
-        draw_y += (command->height - draw_height) * position_y / 100
-                  + position_offset_y;
+        draw_x = render_saturating_add_int(
+            draw_x, render_saturating_add_int(
+                tilefinch_mul_div_int(
+                    command->width - draw_width, position_x, 100),
+                position_offset_x));
+        draw_y = render_saturating_add_int(
+            draw_y, render_saturating_add_int(
+                tilefinch_mul_div_int(
+                    command->height - draw_height, position_y, 100),
+                position_offset_y));
     }
     int x0 = draw_x > target->left ? draw_x : target->left;
     int y0 = draw_y > target->top ? draw_y : target->top;
@@ -657,7 +673,9 @@ static void rasterize_image(TileCache *cache, RasterTarget *target,
     ScaleStepper source_y_step = scale_stepper(y0 - draw_y, source_height,
                                                 draw_height);
     for (int y = y0; y < y1; y++) {
-        int source_y = source_y_offset + source_y_step.value;
+        int source_y = render_saturating_add_int(
+            source_y_offset, source_y_step.value);
+        if (source_y < 0) source_y = 0;
         if (source_y >= pixel_height) source_y = pixel_height - 1;
         int span_x0 = 0, span_x1 = 0;
         size_t index = 0;
@@ -680,7 +698,9 @@ static void rasterize_image(TileCache *cache, RasterTarget *target,
         ScaleStepper source_x_step = scale_stepper(
             span_x0 - draw_x, source_width, draw_width);
         for (int x = span_x0; x < span_x1; x++, index++) {
-            int source_x = source_x_offset + source_x_step.value;
+            int source_x = render_saturating_add_int(
+                source_x_offset, source_x_step.value);
+            if (source_x < 0) source_x = 0;
             if (source_x >= pixel_width) source_x = pixel_width - 1;
             const unsigned char *pixel = pixels
                 + ((size_t) source_y * (size_t) pixel_width

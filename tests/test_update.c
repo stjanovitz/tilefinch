@@ -607,6 +607,26 @@ typedef struct {
     unsigned operation;
 } JournalFault;
 
+typedef struct {
+    uint64_t blocks;
+    uint64_t fragment;
+    uint64_t block;
+    bool succeeds;
+} SpaceQueryFixture;
+
+static bool fixture_space_query(
+    void *opaque, const char *path, uint64_t *blocks_available,
+    uint64_t *fragment_size, uint64_t *block_size)
+{
+    SpaceQueryFixture *fixture = opaque;
+    if (path == NULL || fixture == NULL) return false;
+    if (!fixture->succeeds) return false;
+    *blocks_available = fixture->blocks;
+    *fragment_size = fixture->fragment;
+    *block_size = fixture->block;
+    return true;
+}
+
 static bool journal_fault(void *opaque, const char *operation)
 {
     (void) operation;
@@ -619,6 +639,26 @@ static int test_journal_faults(void)
     uint64_t available = 0;
     CHECK(tilefinch_update_query_free_space("/tmp", &available)
           && available > 0);
+    SpaceQueryFixture space = {
+        .blocks = UINT64_MAX,
+        .fragment = 1,
+        .block = 4096,
+        .succeeds = true
+    };
+    available = 7;
+    CHECK(tilefinch_update_query_free_space_with(
+              "/fixture", &available, fixture_space_query, &space)
+          && available == UINT64_MAX);
+    space.fragment = 2;
+    CHECK(!tilefinch_update_query_free_space_with(
+              "/fixture", &available, fixture_space_query, &space)
+          && available == UINT64_MAX);
+    space.blocks = 4;
+    space.fragment = 0;
+    space.block = 4096;
+    CHECK(tilefinch_update_query_free_space_with(
+              "/fixture", &available, fixture_space_query, &space)
+          && available == 16384);
     /* Seed both copies so every fault is exercised while replacing the stale
        target generation. This is the first write shape on which PSP FAT and
        POSIX rename semantics differ. */

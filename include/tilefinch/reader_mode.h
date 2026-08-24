@@ -24,9 +24,10 @@ typedef struct {
     bool bounded_out;
 } ReaderDocumentAnalysis;
 
-/* Analyze and mark one loaded DOM in a single bounded operation. The markers
-   are inert until the generic Reader stylesheet is enabled. The caller keeps
-   the result beside the page and does not repeat this work while scrolling. */
+/* Analyze one loaded DOM and install one hidden, bounded semantic Reader tree
+   in a single operation. The raw DOM remains intact; the generic Reader
+   stylesheet switches which tree is presented. The caller keeps the result
+   beside the page and does not repeat this work while scrolling. */
 bool reader_document_prepare(PocDocument *document,
                              ReaderDocumentAnalysis *analysis);
 

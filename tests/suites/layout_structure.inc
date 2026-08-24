@@ -166,6 +166,60 @@ static int test_bounded_container_queries(Budget *budget)
     CHECK(stylesheet_injected_failures >= 4
           && stylesheet_uninjected_builds == 2);
 
+    static const char shorthand_page[] =
+        "<!doctype html><style>"
+        "#inline{container:inline-size}#size{container:size}"
+        "#named{container:sidebar}"
+        "@container sidebar (width > 1px){#probe{display:block}}"
+        "</style><div id=inline></div><div id=size></div>"
+        "<div id=named></div><div id=probe></div>";
+    PocDocument shorthand_document = {0};
+    Stylesheet shorthand_sheet = {0};
+    CHECK(document_parse(
+              &shorthand_document, budget, shorthand_page,
+              strlen(shorthand_page), 32)
+          && stylesheet_build(
+              &shorthand_sheet, budget, &shorthand_document, 480)
+          && style_container_layout_state_begin(
+              &shorthand_sheet, budget, 3));
+    lxb_dom_node_t *shorthand_root = lxb_dom_interface_node(
+        shorthand_document.html);
+    lxb_dom_node_t *inline_container = find_id(shorthand_root, "inline");
+    lxb_dom_node_t *size_container = find_id(shorthand_root, "size");
+    lxb_dom_node_t *named_container = find_id(shorthand_root, "named");
+    CHECK(style_container_layout_state_add(
+              &shorthand_sheet, inline_container, 100, 50, 0, 0)
+          && style_container_layout_state_add(
+              &shorthand_sheet, size_container, 100, 50, 0, 0)
+          && style_container_layout_state_add(
+              &shorthand_sheet, named_container, 100, 50, 0, 0));
+    const StyleContainerState *inline_state = NULL;
+    const StyleContainerState *size_state = NULL;
+    const StyleContainerState *named_state = NULL;
+    for (size_t state_index = 0;
+         state_index < shorthand_sheet.resolve_scratch->container_state_capacity;
+         state_index++) {
+        const StyleContainerState *state =
+            &shorthand_sheet.resolve_scratch->container_states[state_index];
+        if (!state->occupied) continue;
+        if (state->node == inline_container) inline_state = state;
+        if (state->node == size_container) size_state = state;
+        if (state->node == named_container) named_state = state;
+    }
+    CHECK(inline_state != NULL
+          && inline_state->type == STYLE_CONTAINER_TYPE_INLINE_SIZE
+          && inline_state->name_bits == 0
+          && size_state != NULL
+          && size_state->type == STYLE_CONTAINER_TYPE_SIZE
+          && size_state->name_bits == 0
+          && named_state != NULL
+          && named_state->type == STYLE_CONTAINER_TYPE_NONE
+          && named_state->name_bits != 0);
+    style_container_layout_state_clear(&shorthand_sheet);
+    stylesheet_destroy(&shorthand_sheet);
+    document_destroy(&shorthand_document);
+    CHECK(budget->current == baseline);
+
     PocDocument document = {0};
     Stylesheet sheet = {0};
     LayoutDocument layout = {0};
@@ -411,6 +465,10 @@ static int test_international_line_flow(Budget *budget)
         "#opening{display:block;width:80px}"
         "#rtl-start,#rtl-end{display:block;width:120px;direction:rtl}"
         "#rtl-start{text-align:start}#rtl-end{text-align:end}"
+        "#isolate{unicode-bidi:isolate}#plain{unicode-bidi:plaintext}"
+        "#override{direction:rtl;unicode-bidi:bidi-override}"
+        "#atomic{direction:rtl;width:240px}#atomic button{display:inline-block;width:48px}"
+        "#caps{text-transform:uppercase}"
         "</style>"
         "<div id=cjk>\xe6\xbc\xa2\xe5\xad\x97</div>"
         "<div id=opening>\xe3\x80\x8c\xe6\xbc\xa2\xe5\xad\x97</div>"
@@ -418,7 +476,14 @@ static int test_international_line_flow(Budget *budget)
         "<div id=nbsp>AA\xc2\xa0" "BB</div>"
         "<div id=rtl-start>FIRST SECOND</div>"
         "<div id=rtl-end>LEFT EDGE</div>"
-        "<div id=hebrew dir=rtl>\xd7\x90\xd7\x91\xd7\x92</div>";
+        "<div id=hebrew dir=rtl>\xd7\x90\xd7\x91\xd7\x92</div>"
+        "<div id=arabic dir=rtl>\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85</div>"
+        "<div id=isolate dir=rtl>\xd7\x90\xd7\x91 <a href=/x>ABC 123</a> \xd7\x92</div>"
+        "<div id=plain dir=auto>ABC \xd7\x90\xd7\x91</div>"
+        "<div id=nested dir=rtl>\xd7\x90 <span dir=ltr>ABC (12)</span> \xd7\x91</div>"
+        "<div dir=rtl>\xd7\x90 <span id=caps>abc</span></div>"
+        "<div id=atomic>\xd7\x90\xd7\x91 <button id=atomic-button>GO</button> \xd7\x92\xd7\x93</div>"
+        "<div id=override>ABC</div>";
     PocDocument document = {0};
     Stylesheet sheet = {0};
     LayoutDocument layout = {0};
@@ -441,6 +506,15 @@ static int test_international_line_flow(Budget *budget)
     const DrawCommand *edge = text_command(&layout, "EDGE");
     const DrawCommand *hebrew = text_command(
         &layout, "\xd7\x90\xd7\x91\xd7\x92");
+    const DrawCommand *arabic = text_command(
+        &layout, "\xd8\xb3\xd9\x84\xd8\xa7\xd9\x85");
+    const DrawCommand *mixed_ltr = text_command(&layout, "ABC");
+    const DrawCommand *caps = text_command(&layout, "abc");
+    const DrawCommand *atomic_first = text_command(
+        &layout, "\xd7\x90\xd7\x91");
+    const DrawCommand *atomic_last = text_command(
+        &layout, "\xd7\x92\xd7\x93");
+    const DrawCommand *atomic_label = text_command(&layout, "GO");
     lxb_dom_node_t *hebrew_node = find_id(
         lxb_dom_interface_node(document.html), "hebrew");
     ComputedStyle hebrew_style = style_for_node(
@@ -449,12 +523,92 @@ static int test_international_line_flow(Budget *budget)
           && opening != NULL && opening->text_length == 6
           && aa != NULL && bb != NULL && bb->y > aa->y
           && nbsp != NULL && nbsp->text_length == 6
+          /* Each wrapped LTR run keeps its internal order while its line is
+             aligned against the RTL paragraph's requested start edge. */
           && first != NULL && second != NULL && first->x > second->x
-          && left != NULL && edge != NULL && left->x > edge->x
+          && left != NULL && edge != NULL && left->x < edge->x
           && first->x + first->width > 100
-          && edge->x < 60
-          && hebrew != NULL && draw_command_text_rtl(hebrew)
+          && left->x < 20
+          && hebrew != NULL && !draw_command_text_rtl(hebrew)
+          && layout.bidi_command_count != 0
+          && arabic != NULL && mixed_ltr != NULL
+          && caps != NULL
           && computed_style_direction_rtl(&hebrew_style));
+    size_t arabic_index = (size_t) (arabic - layout.commands);
+    const LayoutBidiCommand *arabic_bidi = layout_bidi_command_for_index(
+        &layout, arabic_index);
+    CHECK(arabic_bidi != NULL && arabic_bidi->glyph_count == 4);
+    const LayoutBidiGlyph *arabic_glyphs =
+        &layout.bidi_glyphs[arabic_bidi->glyph_start];
+    CHECK(arabic_glyphs[0].codepoint == 0xfee1u
+          && arabic_glyphs[1].codepoint == 0xfe8eu
+          && arabic_glyphs[2].codepoint == 0xfee0u
+          && arabic_glyphs[3].codepoint == 0xfeb3u
+          && arabic_glyphs[0].x_fixed < arabic_glyphs[3].x_fixed);
+    size_t visual_logical = SIZE_MAX;
+    int visual_caret = -1;
+    CHECK(layout_bidi_visual_hit_test(
+              &layout, arabic_index, arabic_glyphs[0].x_fixed,
+              &visual_logical, &visual_caret)
+          && visual_logical == arabic->text_length
+          && visual_caret == arabic_glyphs[0].x_fixed);
+    int next_visual_caret = -1;
+    CHECK(layout_bidi_visual_step(
+              &layout, arabic_index, visual_caret, 1,
+              &visual_logical, &next_visual_caret)
+          && next_visual_caret > visual_caret
+          && visual_logical < arabic->text_length);
+    size_t mixed_index = (size_t) (mixed_ltr - layout.commands);
+    const LayoutBidiCommand *mixed_bidi = layout_bidi_command_for_index(
+        &layout, mixed_index);
+    CHECK(mixed_bidi != NULL && mixed_bidi->glyph_count == 3
+          && layout.links != NULL);
+    const LayoutBidiCommand *caps_bidi = layout_bidi_command_for_index(
+        &layout, (size_t) (caps - layout.commands));
+    CHECK(caps_bidi != NULL && caps_bidi->glyph_count == 3);
+    const LayoutBidiGlyph *caps_glyphs =
+        &layout.bidi_glyphs[caps_bidi->glyph_start];
+    CHECK(caps_glyphs[0].codepoint == 'A'
+          && caps_glyphs[1].codepoint == 'B'
+          && caps_glyphs[2].codepoint == 'C');
+    lxb_dom_node_t *atomic_node = find_id(
+        lxb_dom_interface_node(document.html), "atomic-button");
+    const ControlRegion *atomic_control = NULL;
+    for (size_t i = 0; i < layout.control_count; i++) {
+        if (layout.controls[i].node == atomic_node) {
+            atomic_control = &layout.controls[i];
+            break;
+        }
+    }
+    CHECK(atomic_first != NULL && atomic_last != NULL
+          && atomic_label != NULL && atomic_control != NULL
+          && atomic_last->x < atomic_control->x
+          && atomic_control->x < atomic_first->x
+          && atomic_label->x >= atomic_control->x
+          && atomic_label->x + atomic_label->width
+                 <= atomic_control->x + atomic_control->width
+          && layout_control_at(
+                 &layout,
+                 atomic_control->x + atomic_control->width / 2,
+                 atomic_control->y + atomic_control->height / 2)
+                 == atomic_control);
+    bool mixed_link_hit = false;
+    for (size_t i = 0; i < layout.link_count; i++) {
+        const LinkRegion *link = &layout.links[i];
+        if (link->url_length == 2 && memcmp(link->url, "/x", 2) == 0) {
+            const LinkRegion *hit = layout_link_at(
+                &layout, link->x + link->width / 2,
+                link->y + link->height / 2);
+            mixed_link_hit = hit == link;
+            break;
+        }
+    }
+    CHECK(mixed_link_hit);
+    CHECK(layout.performance.bidi_paragraphs >= 8
+          && layout.performance.bidi_line_fallbacks == 0
+          && layout.performance.bidi_limit_degradations == 0
+          && layout.performance.bidi_peak_transient_bytes
+                 <= 160u * 1024u);
     for (size_t i = 0; i < layout.count; i++) {
         const DrawCommand *command = &layout.commands[i];
         CHECK(command->type != DRAW_TEXT
@@ -462,6 +616,94 @@ static int test_international_line_flow(Budget *budget)
               || memcmp(command->text, "\xe2\x80\x8b", 3) != 0);
     }
 
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+
+    /* English pages are rejected by the parser census before a block-level
+       subtree scan or any paragraph scratch allocation. */
+    static const char ltr_page[] =
+        "<!doctype html><p>Wikipedia (2026) — ordinary Latin text.</p>";
+    CHECK(document_parse(
+              &document, budget, ltr_page, sizeof(ltr_page) - 1u, 444)
+          && !document.bidi_text_present
+          && !document.bidi_markup_present
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(
+              &layout, budget, &document, &sheet, NULL, NULL, 480)
+          && layout.performance.bidi_paragraphs == 0
+          && layout.performance.bidi_us == 0
+          && layout.performance.bidi_peak_transient_bytes == 0
+          && layout.bidi_command_count == 0
+          && layout.bidi_glyph_count == 0);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+
+    /* ASCII still enters the paragraph pipeline when an authored HTML or
+       CSS direction boundary requires it. The ordinary English gate above
+       proves this uncommon scan is not paid by pages without such markup. */
+    static const char markup_page[] =
+        "<!doctype html><p>left <span dir=rtl>ABC 12</span> right</p>";
+    CHECK(document_parse(
+              &document, budget, markup_page, sizeof(markup_page) - 1u, 445)
+          && !document.bidi_text_present
+          && document.bidi_markup_present
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(
+              &layout, budget, &document, &sheet, NULL, NULL, 480)
+          && layout.performance.bidi_paragraphs != 0
+          && layout.bidi_command_count != 0);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+
+    static const char css_direction_page[] =
+        "<!doctype html><style>span{direction:rtl;unicode-bidi:isolate}"
+        "</style><p>left <span>ABC 12</span> right</p>";
+    CHECK(document_parse(
+              &document, budget, css_direction_page,
+              sizeof(css_direction_page) - 1u, 446)
+          && !document.bidi_text_present
+          && !document.bidi_markup_present
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && sheet.has_bidi_declarations
+          && layout_build(
+              &layout, budget, &document, &sheet, NULL, NULL, 480)
+          && layout.performance.bidi_paragraphs != 0
+          && layout.bidi_command_count != 0);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+
+    /* An oversized paragraph must degrade in logical source order. In
+       particular it must never fall back to the historical codepoint
+       reversal bit after the bounded UAX #9 pipeline declined the input. */
+    char oversized_page[TEXT_BIDI_PARAGRAPH_BYTE_LIMIT + 512u];
+    static const char oversized_prefix[] =
+        "<!doctype html><style>p{direction:rtl}</style><p>";
+    static const char oversized_suffix[] = "</p>";
+    size_t oversized_used = sizeof(oversized_prefix) - 1u;
+    memcpy(oversized_page, oversized_prefix, oversized_used);
+    while (oversized_used + 2u + sizeof(oversized_suffix)
+           < sizeof(oversized_page)) {
+        oversized_page[oversized_used++] = (char) 0xd7;
+        oversized_page[oversized_used++] = (char) 0x90;
+    }
+    memcpy(oversized_page + oversized_used, oversized_suffix,
+           sizeof(oversized_suffix));
+    oversized_used += sizeof(oversized_suffix) - 1u;
+    CHECK(document_parse(
+              &document, budget, oversized_page, oversized_used, 447)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(
+              &layout, budget, &document, &sheet, NULL, NULL, 480)
+          && layout.performance.bidi_limit_degradations != 0
+          && layout.bidi_command_count == 0);
+    for (size_t i = 0; i < layout.count; i++) {
+        CHECK(layout.commands[i].type != DRAW_TEXT
+              || !draw_command_text_rtl(&layout.commands[i]));
+    }
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -1410,7 +1652,9 @@ static int test_bounded_large_layout_values(Budget *budget)
               && box->content_height >= 0
               && box->content_height <= EXTENT_LIMIT);
     }
-    CHECK(layout.height == EXTENT_LIMIT
+    CHECK(layout.height < 272 * 65
+          && layout.performance.coordinate_clamps != 0u
+          && layout.performance.coordinate_containments != 0u
           && layout.scroll_width == EXTENT_LIMIT
           && last_tall_box != NULL && last_tall_box->y == EXTENT_LIMIT
           && last_tall_box->height == 0
@@ -1591,7 +1835,8 @@ static int test_native_form_control_fidelity(Budget *budget)
 {
     size_t baseline = budget->current;
     static const char page[] =
-        "<!doctype html><style>html,body{margin:0;padding:0}"
+        "<!doctype html><html class=scheme><style>.scheme{color-scheme:dark}"
+        "html,body{margin:0;padding:0}"
         ".row{display:flex;align-items:center;gap:6px}"
         "#slider{display:block;width:160px}"
         "#choice{display:block;width:140px;height:30px;padding:6px}"
@@ -1699,6 +1944,102 @@ static int test_native_form_control_fidelity(Budget *budget)
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget->current == baseline);
+    return 0;
+}
+
+static int test_positioned_range_caps(Budget *budget)
+{
+    enum { EXTRA = 4, COUNT = LAYOUT_FIXED_RANGE_LIMIT + EXTRA };
+    char page[24576];
+    size_t used = (size_t) snprintf(
+        page, sizeof(page),
+        "<!doctype html><style>html,body{margin:0}.f,.s{display:block;"
+        "background:#000}"
+        ".f{position:fixed;"
+        "top:0;width:1px;height:1px}.s{position:sticky;top:0;"
+        "width:1px;height:1px}</style><body>");
+    for (size_t i = 0; i < COUNT && used < sizeof(page); i++) {
+        int wrote = snprintf(page + used, sizeof(page) - used,
+                             "<i class=f id=f%zu></i><b class=s></b>", i);
+        CHECK(wrote > 0 && (size_t) wrote < sizeof(page) - used);
+        used += (size_t) wrote;
+    }
+    CHECK(used + sizeof("</body>") <= sizeof(page));
+    memcpy(page + used, "</body>", sizeof("</body>"));
+    used += sizeof("</body>") - 1u;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, used, 32)
+          && stylesheet_build(&sheet, budget, &document, 480));
+    lxb_dom_node_t *range_root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *first_fixed = find_id(range_root, "f0");
+    ComputedStyle first_fixed_style = style_for_node(
+        &sheet, first_fixed, NULL);
+    if (first_fixed == NULL || !first_fixed_style.fixed_position) {
+        fprintf(stderr, "positioned range fixture missing=%d fixed=%d\n",
+                first_fixed == NULL, first_fixed_style.fixed_position);
+    }
+    CHECK(first_fixed != NULL && first_fixed_style.fixed_position
+          && layout_build(
+              &layout, budget, &document, &sheet, NULL, NULL, 480));
+    if (layout.fixed_count != LAYOUT_FIXED_RANGE_LIMIT
+        || layout.sticky_count != LAYOUT_STICKY_RANGE_LIMIT) {
+        fprintf(stderr, "positioned range caps fixed=%zu sticky=%zu\n",
+                layout.fixed_count, layout.sticky_count);
+    }
+    CHECK(layout.fixed_count == LAYOUT_FIXED_RANGE_LIMIT
+          && layout.sticky_count == LAYOUT_STICKY_RANGE_LIMIT);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_flex_order_group_cap(Budget *budget)
+{
+    enum { COUNT = FLEX_ORDER_VALUE_LIMIT + 1u };
+    char page[12288];
+    size_t used = (size_t) snprintf(
+        page, sizeof(page),
+        "<!doctype html><style>html,body{margin:0}#host{display:flex;"
+        "width:80px}#host>i{display:block;flex:0 0 1px;height:1px}"
+        "</style><div id=host>");
+    for (size_t i = 0; i < COUNT && used < sizeof(page); i++) {
+        int wrote = snprintf(
+            page + used, sizeof(page) - used,
+            "<i id=o%zu style=order:%zu></i>", i, COUNT - i);
+        CHECK(wrote > 0 && (size_t) wrote < sizeof(page) - used);
+        used += (size_t) wrote;
+    }
+    CHECK(used + sizeof("</div>") <= sizeof(page));
+    memcpy(page + used, "</div>", sizeof("</div>"));
+    used += sizeof("</div>") - 1u;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, used, 24)
+          && stylesheet_build(&sheet, budget, &document, 80)
+          && layout_build(
+              &layout, budget, &document, &sheet, NULL, NULL, 80));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    const LayoutNodeBox *first = layout_box_for_node(
+        &layout, find_id(root, "o0"));
+    const LayoutNodeBox *last = layout_box_for_node(
+        &layout, find_id(root, "o32"));
+    if (first == NULL || last == NULL || first->x != 0
+        || last->x <= first->x) {
+        fprintf(stderr, "flex order cap first=%d last=%d\n",
+                first == NULL ? INT_MIN : first->x,
+                last == NULL ? INT_MIN : last->x);
+    }
+    CHECK(first != NULL && last != NULL
+          && first->x == 0 && last->x > first->x);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
     return 0;
 }
 
@@ -2226,15 +2567,20 @@ static int test_modern_mobile_css_interaction_and_presentation(Budget *budget)
 {
     size_t baseline = budget->current;
     static const char page[] =
-        "<!doctype html><style>html,body{margin:0;padding:0}"
+        "<!doctype html><style>:root{color-scheme:dark}"
+        "html,body{margin:0;padding:0}"
         "#policy{user-select:none;touch-action:pan-x;text-wrap:balance;"
         "text-size-adjust:120%}"
         "#child{font-size:20px}"
         "#transform{display:block;width:40px;height:20px;"
         "background:#123456;translate:10px 5px;rotate:90deg;scale:2;"
+        "box-sizing:border-box;"
         "isolation:isolate;border-start-start-radius:7px;"
         "border-start-end-radius:9px;border-end-start-radius:11px;"
-        "border-end-end-radius:13px}"
+        "border-end-end-radius:13px;backface-visibility:hidden;"
+        "transform-style:preserve-3d;color-scheme:dark;"
+        "border:2px solid transparent;"
+        "border-image:linear-gradient(red,blue) 1}"
         "#transform-list{transform:translate(10px,5px) scale(2) "
         "rotate(.25turn)}"
         "#transform-matrix{transform:matrix(0,2,-2,0,7,9)}"
@@ -2264,6 +2610,8 @@ static int test_modern_mobile_css_interaction_and_presentation(Budget *budget)
     CHECK(document_parse(&document, budget, page, strlen(page), 93)
           && stylesheet_build(&sheet, budget, &document, 480));
     lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *body_node = document_body_node(&document);
+    lxb_dom_node_t *html_node = body_node == NULL ? NULL : body_node->parent;
     lxb_dom_node_t *policy_node = find_id(root, "policy");
     lxb_dom_node_t *child_node = find_id(root, "child");
     lxb_dom_node_t *transform_node = find_id(root, "transform");
@@ -2275,6 +2623,7 @@ static int test_modern_mobile_css_interaction_and_presentation(Budget *budget)
     lxb_dom_node_t *support_node = find_id(root, "support");
     lxb_dom_node_t *unsupported_node = find_id(root, "unsupported");
     ComputedStyle policy = style_for_node(&sheet, policy_node, NULL);
+    ComputedStyle html_style = style_for_node(&sheet, html_node, NULL);
     ComputedStyle child = style_for_node(&sheet, child_node, &policy);
     ComputedStyle transform = style_for_node(
         &sheet, transform_node, NULL);
@@ -2288,6 +2637,13 @@ static int test_modern_mobile_css_interaction_and_presentation(Budget *budget)
     ComputedStyle support = style_for_node(&sheet, support_node, NULL);
     ComputedStyle unsupported = style_for_node(
         &sheet, unsupported_node, NULL);
+    if ((sheet.modern_property_mask & UINT16_C(0xe000)) != UINT16_C(0xe000)
+        || !html_style.has_background || html_style.background != 0x121212
+        || html_style.color != 0xe8e8e8) {
+        fprintf(stderr, "modern-static mask=%04x html-bg=%d/%06x color=%06x node=%p\n",
+                sheet.modern_property_mask, html_style.has_background,
+                html_style.background, html_style.color, (void *) html_node);
+    }
     CHECK((sheet.modern_property_mask & STYLE_MODERN_USER_SELECT) != 0
           && (sheet.modern_property_mask & STYLE_MODERN_TOUCH_ACTION) != 0
           && (sheet.modern_property_mask & STYLE_MODERN_TEXT_SIZE_ADJUST) != 0
@@ -2297,13 +2653,25 @@ static int test_modern_mobile_css_interaction_and_presentation(Budget *budget)
           && (sheet.modern_property_mask & STYLE_MODERN_ROTATE) != 0
           && (sheet.modern_property_mask & STYLE_MODERN_SCALE) != 0
           && (sheet.modern_property_mask & STYLE_MODERN_ISOLATION) != 0
-          && (sheet.modern_property_mask & STYLE_MODERN_LOGICAL_RADIUS) != 0);
+          && (sheet.modern_property_mask & STYLE_MODERN_LOGICAL_RADIUS) != 0
+          && (sheet.modern_property_mask
+              & STYLE_MODERN_BACKFACE_VISIBILITY) != 0
+          && (sheet.modern_property_mask & STYLE_MODERN_TRANSFORM_STYLE) != 0
+          && (sheet.modern_property_mask & STYLE_MODERN_COLOR_SCHEME) != 0
+          && (sheet.modern_property_mask & STYLE_MODERN_BORDER_IMAGE) != 0
+          && html_style.has_background
+          && html_style.background == 0x121212
+          && html_style.color == 0xe8e8e8);
     CHECK(computed_style_user_select(&policy) == STYLE_USER_SELECT_NONE
           && computed_style_user_select(&child) == STYLE_USER_SELECT_AUTO
           && policy.touch_action == STYLE_TOUCH_ACTION_PAN_X
           && computed_style_text_wrap(&policy) == STYLE_TEXT_WRAP_BALANCE
           && computed_style_font_size_fixed(&child) == 24 * 64);
-    CHECK(transform.has_transform && transform.transform_x == 10
+    uint8_t border_alpha = 0;
+    CHECK(stylesheet_border_color(
+              &sheet, &transform, STYLE_BORDER_TOP, &border_alpha) == 0xff0000
+          && border_alpha == 255
+          && transform.has_transform && transform.transform_x == 10
           && transform.transform_y == 5
           && !transform.transform_x_percent
           && !transform.transform_y_percent

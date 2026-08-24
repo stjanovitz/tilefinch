@@ -28,6 +28,8 @@ static void fetch_hop_destroy(FetchHopState *hop)
 }
 
 static bool fetch_github_release_url_allowed(const char *value);
+static bool fetch_configure_private_network(
+    CURL *easy, FetchPrivateNetworkGuard *guard);
 
 static bool fetch_method_omits_same_origin_origin(const char *method)
 {
@@ -341,9 +343,14 @@ static bool fetch_hop_advance(FetchHopState *hop,
         }
     }
     const FetchRequest *base = hop->base;
+    bool admitted_portal_target = hop->security_session != NULL
+        && browser_session_captive_portal_url_allowed(
+               hop->security_session, next);
     if (tilefinch_url_is_downgrade(hop->url, next)
-        && !fetch_request_mixed_override(base)) return false;
-    if (!fetch_request_target_allowed(base, next)) return false;
+        && !fetch_request_mixed_override(base)
+        && !admitted_portal_target) return false;
+    if (!fetch_request_target_allowed_with_session(
+            base, hop->security_session, next)) return false;
     if (fetch_origin_blocked(next)
         || fetch_request_content_blocked(base, next)) return false;
     if (base != NULL
@@ -352,6 +359,13 @@ static bool fetch_hop_advance(FetchHopState *hop,
     if (base != NULL
         && base->redirect_url_validator != NULL
         && !base->redirect_url_validator(next)) return false;
+    /* Redirect admission is per hop.  The guard points at stable hop-owned
+       storage, so updating it here changes the socket policy before the next
+       URL can be configured or any request bytes can be sent. */
+    hop->private_network.required =
+        fetch_request_private_network_protected_with_session(
+            base, hop->security_session, next);
+    hop->private_network.blocked = false;
     bool cross_origin = !tilefinch_url_same_origin(hop->url, next);
     /* A script request must never forward its body or author-controlled
        headers to a new origin before the caller can apply CORS.  Same-origin
@@ -722,7 +736,8 @@ static bool fetch_configure_redirect_hop(
             easy, hop->method, request, hop->body_enabled)) return false;
     long remaining_ms = fetch_hop_remaining_ms(hop);
     if (remaining_ms <= 0) return false;
-    if (curl_easy_setopt(easy, CURLOPT_URL, hop->url) != CURLE_OK
+    if (!fetch_configure_private_network(easy, &hop->private_network)
+        || curl_easy_setopt(easy, CURLOPT_URL, hop->url) != CURLE_OK
         || curl_easy_setopt(easy, CURLOPT_REFERER, hop->referer) != CURLE_OK
         || curl_easy_setopt(
                easy, CURLOPT_TIMEOUT_MS, remaining_ms) != CURLE_OK
@@ -925,6 +940,8 @@ static bool fetch_request_internal(Budget *budget, const char *url,
     CURLcode code = CURLE_FAILED_INIT;
     long failed_transport_code = 0;
     long failed_tls_verify_result = 0;
+    bool failed_tls_verify_result_available = false;
+    bool failed_tls_verification_failed = false;
     char failed_tls_version[sizeof(result->tls_version)] = {0};
     char failed_tls_peer_issuer[sizeof(result->tls_peer_issuer)] = {0};
     bool timed_out = false;
@@ -1257,10 +1274,15 @@ static bool fetch_request_internal(Budget *budget, const char *url,
 failed:
     failed_transport_code = (long) code;
     failed_tls_verify_result = 0;
+    failed_tls_verify_result_available = false;
+    failed_tls_verification_failed = false;
     if (easy != NULL) {
         result->transport_code = failed_transport_code;
         fetch_result_set_transport_info(easy, result);
         failed_tls_verify_result = result->tls_verify_result;
+        failed_tls_verify_result_available =
+            result->tls_verify_result_available;
+        failed_tls_verification_failed = result->tls_verification_failed;
         snprintf(failed_tls_version, sizeof(failed_tls_version), "%s",
                  result->tls_version);
         snprintf(failed_tls_peer_issuer,
@@ -1295,6 +1317,9 @@ failed:
     result->timed_out = timed_out;
     result->transport_code = failed_transport_code;
     result->tls_verify_result = failed_tls_verify_result;
+    result->tls_verify_result_available =
+        failed_tls_verify_result_available;
+    result->tls_verification_failed = failed_tls_verification_failed;
     snprintf(result->tls_version, sizeof(result->tls_version), "%s",
              failed_tls_version);
     snprintf(result->tls_peer_issuer,

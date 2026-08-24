@@ -92,6 +92,11 @@ int main(void)
               TILEFINCH_TEST_SOURCE_DIR "/fixtures/offline-download",
               trace_error, sizeof(trace_error))
           && offline_download_manager_adopt_resolved(&download, &stream));
+    OfflineDownloadSnapshot snapshot = {0};
+    CHECK(offline_download_manager_snapshot(
+              &download, video_id, &snapshot)
+          && snapshot.active && snapshot.total_bytes == 34
+          && snapshot.available_bytes != 0);
     for (unsigned pump = 0; pump < 16
          && offline_download_manager_active(&download, NULL); pump++)
         (void) offline_download_manager_pump(&download);
@@ -102,6 +107,14 @@ int main(void)
     fetch_trace_end();
     offline_download_manager_destroy(&download);
     browser_session_destroy(&session);
+    OfflineLibraryItem *failed_item = offline_library_find_mutable(
+        &library, video_id);
+    CHECK(failed_item != NULL);
+    failed_item->state = OFFLINE_ITEM_PAUSED;
+    snprintf(failed_item->failure_reason,
+             sizeof(failed_item->failure_reason),
+             "network interrupted after a resumable chunk");
+    CHECK(offline_library_save(&library));
 
     char orphan_path[200];
     snprintf(orphan_path, sizeof(orphan_path),
@@ -114,7 +127,15 @@ int main(void)
     CHECK(offline_library_load(&loaded) && loaded.count == 2
           && offline_library_find(&loaded, article_id) != NULL
           && offline_library_find(&loaded, video_id)->content_bytes == 17
+          && strstr(
+                 offline_library_find(&loaded, video_id)->failure_reason,
+                 "resumable chunk") != NULL
           && access(orphan_path, F_OK) != 0);
+    OfflineLibraryItem *loaded_video = offline_library_find_mutable(
+        &loaded, video_id);
+    CHECK(loaded_video != NULL);
+    loaded_video->state = OFFLINE_ITEM_READY;
+    loaded_video->failure_reason[0] = '\0';
 
     char index_path[200], index_temporary[200], index_backup[200];
     snprintf(index_path, sizeof(index_path), "%s/library.bin", directory);

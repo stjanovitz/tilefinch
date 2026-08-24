@@ -743,8 +743,28 @@ static bool selector_list_matches(lxb_dom_node_t *node,
 {
     size_t start = 0;
     int square = 0, round = 0;
+    char quote = 0;
+    bool escaped = false;
     for (size_t i = 0; i <= length; i++) {
         char value = i < length ? selector[i] : ',';
+        if (quote != 0) {
+            if (escaped) escaped = false;
+            else if (value == '\\') escaped = true;
+            else if (value == quote) quote = 0;
+            continue;
+        }
+        if (i < length && escaped) {
+            escaped = false;
+            continue;
+        }
+        if (i < length && value == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (value == '\'' || value == '"') {
+            quote = value;
+            continue;
+        }
         if (value == '[') square++;
         else if (value == ']' && square > 0) square--;
         else if (value == '(') round++;
@@ -1291,6 +1311,11 @@ static void bridge_mutated_with_relational(
             (subtree & BRIDGE_MUTATION_RESOURCE_BOUNDED_OUT) != 0;
         break;
     }
+    case SCRIPT_MUTATION_CANVAS:
+        /* The resource already exists by the time this record is emitted.
+           Creation/resizing still takes the ordinary fast-layout path;
+           same-geometry publication is eligible for paint-only damage. */
+        break;
     case SCRIPT_MUTATION_UNKNOWN:
     default:
         conservative_scan = true;
@@ -1346,6 +1371,19 @@ static void bridge_mutated_with_relational(
                 resource_rebuild, image_resource_scan,
                 image_resource_refresh, conservative_scan);
     }
+}
+
+void js_rt_bridge_note_canvas_mutation(DomBridge *bridge,
+                                       lxb_dom_node_t *node,
+                                       bool paint_only)
+{
+    static const char paint[] = "paint";
+    static const char structure[] = "surface";
+    bridge_mutated_with_relational(
+        bridge, SCRIPT_MUTATION_CANVAS, node,
+        paint_only ? paint : structure,
+        paint_only ? sizeof(paint) - 1u : sizeof(structure) - 1u,
+        false);
 }
 
 static void bridge_mutated(DomBridge *bridge, ScriptMutationKind kind,
@@ -2632,6 +2670,70 @@ JSValue js_dom_get_inner_html(JSContext *context,
     return value;
 }
 
+static bool bridge_replace_inner_html(
+    DomBridge *bridge, lxb_dom_node_t *node,
+    const char *html, size_t length, bool prepare_dynamic_scripts)
+{
+    if (bridge == NULL || bridge->document == NULL || node == NULL
+        || (node->type != LXB_DOM_NODE_TYPE_ELEMENT
+            && node->type != LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT)
+        || (html == NULL && length != 0)
+        || length > DOM_INNER_HTML_LIMIT) return false;
+    static const char div_name[] = "div";
+    size_t context_name_length = sizeof(div_name) - 1u;
+    const char *context_name = div_name;
+    if (node->type == LXB_DOM_NODE_TYPE_ELEMENT)
+        context_name = document_element_name(node, &context_name_length);
+    lxb_dom_element_t *container = context_name == NULL ? NULL
+        : lxb_dom_document_create_element(
+              &bridge->document->html->dom_document,
+              (const lxb_char_t *) context_name, context_name_length, NULL);
+    lxb_dom_node_t *container_node = container == NULL ? NULL
+        : lxb_dom_interface_node(container);
+    bool valid = container_node != NULL
+        && document_set_element_inner_html(
+               bridge->document, container_node,
+               html == NULL ? "" : html, length);
+    bool changed = false;
+    if (valid) {
+        bridge_detach_and_discard_children(bridge, node);
+        changed = true;
+        while (container_node->first_child != NULL) {
+            lxb_dom_node_t *child = container_node->first_child;
+            lxb_dom_node_remove(child);
+            if (lxb_dom_node_append_child(node, child)
+                != LXB_DOM_EXCEPTION_OK) {
+                valid = false;
+                break;
+            }
+        }
+    }
+    if (container_node != NULL) lxb_dom_node_destroy_deep(container_node);
+    if (changed) {
+        /* Fragment parsing does not execute scripts. Register every restored
+           source node as already started before publishing the mutation. */
+        script_element_states_register_parsed_subtree(bridge, node);
+        bridge_mutated(
+            bridge, SCRIPT_MUTATION_INNER_HTML, node, NULL, 0);
+        if (prepare_dynamic_scripts)
+            (void) js_rt_dynamic_prepare_subtree(
+                bridge->host->context, node);
+    }
+    return valid;
+}
+
+bool script_runtime_replace_document_body(
+    ScriptRuntime *runtime, PocDocument *document,
+    const char *markup, size_t length)
+{
+    if (runtime == NULL || document == NULL
+        || runtime->document != document
+        || runtime->bridge.document != document) return false;
+    lxb_dom_node_t *body = document_body_node(document);
+    return bridge_replace_inner_html(
+        &runtime->bridge, body, markup, length, false);
+}
+
 JSValue js_dom_set_inner_html(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv)
@@ -2647,45 +2749,9 @@ JSValue js_dom_set_inner_html(JSContext *context,
     size_t length = 0;
     const char *html = JS_ToCStringLen(context, &length, argv[1]);
     if (html == NULL) return JS_EXCEPTION;
-    bool valid = false, changed = false;
-    if (length <= DOM_INNER_HTML_LIMIT) {
-        static const char div_name[] = "div";
-        size_t context_name_length = sizeof(div_name) - 1;
-        const char *context_name = div_name;
-        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-            context_name = document_element_name(node, &context_name_length);
-        }
-        lxb_dom_element_t *container = lxb_dom_document_create_element(
-            &bridge->document->html->dom_document,
-            (const lxb_char_t *) context_name, context_name_length, NULL);
-        lxb_dom_node_t *container_node = container == NULL ? NULL
-            : lxb_dom_interface_node(container);
-        valid = container != NULL && context_name != NULL
-            && document_set_element_inner_html(
-                   bridge->document, container_node, html, length);
-        if (valid) {
-            bridge_detach_and_discard_children(bridge, node);
-            changed = true;
-            while (container_node->first_child != NULL) {
-                lxb_dom_node_t *child = container_node->first_child;
-                lxb_dom_node_remove(child);
-                if (lxb_dom_node_append_child(node, child)
-                    != LXB_DOM_EXCEPTION_OK) {
-                    valid = false;
-                    break;
-                }
-            }
-        }
-        if (container_node != NULL) {
-            lxb_dom_node_destroy_deep(container_node);
-        }
-    }
+    bool valid = bridge_replace_inner_html(
+        bridge, node, html, length, true);
     JS_FreeCString(context, html);
-    if (changed) {
-        script_element_states_register_parsed_subtree(bridge, node);
-        bridge_mutated(bridge, SCRIPT_MUTATION_INNER_HTML, node, NULL, 0);
-        (void) js_rt_dynamic_prepare_subtree(context, node);
-    }
     return JS_NewBool(context, valid);
 }
 
@@ -2977,7 +3043,11 @@ static bool sparse_modern_property(const char *name, size_t length)
         "text-wrap", "text-wrap-style", "translate", "rotate", "scale",
         "isolation", "hyphens", "tab-size", "font-kerning",
         "text-rendering", "mix-blend-mode", "backdrop-filter",
-        "-webkit-backdrop-filter", "border-start-start-radius",
+        "-webkit-backdrop-filter", "backface-visibility",
+        "transform-style", "color-scheme", "border-image",
+        "border-image-source", "border-image-slice", "border-image-width",
+        "border-image-outset", "border-image-repeat",
+        "border-start-start-radius",
         "border-start-end-radius", "border-end-start-radius",
         "border-end-end-radius"
     };
@@ -2990,7 +3060,7 @@ static bool sparse_modern_property(const char *name, size_t length)
     return false;
 }
 
-static uint16_t sparse_modern_property_mask(const char *name, size_t length)
+static uint32_t sparse_modern_property_mask(const char *name, size_t length)
 {
 #define MODERN_PROPERTY(wanted, bit) \
     if (property_equal(name, length, wanted, sizeof(wanted) - 1u)) return bit
@@ -3014,6 +3084,11 @@ static uint16_t sparse_modern_property_mask(const char *name, size_t length)
     MODERN_PROPERTY("mix-blend-mode", STYLE_MODERN_MIX_BLEND);
     MODERN_PROPERTY("backdrop-filter", STYLE_MODERN_BACKDROP_FILTER);
     MODERN_PROPERTY("-webkit-backdrop-filter", STYLE_MODERN_BACKDROP_FILTER);
+    MODERN_PROPERTY("backface-visibility", STYLE_MODERN_BACKFACE_VISIBILITY);
+    MODERN_PROPERTY("transform-style", STYLE_MODERN_TRANSFORM_STYLE);
+    MODERN_PROPERTY("color-scheme", STYLE_MODERN_COLOR_SCHEME);
+    if (length >= 12u && strncasecmp(name, "border-image", 12u) == 0)
+        return STYLE_MODERN_BORDER_IMAGE;
     if (length >= 18u
         && strncasecmp(name, "border-", 7u) == 0
         && strncasecmp(name + length - 7u, "-radius", 7u) == 0) {
@@ -4084,6 +4159,23 @@ JSValue js_computed_style_get(JSContext *context,
     } else if (property_equal(name, name_length, "box-sizing", 10)) {
         snprintf(value, sizeof(value), "%s",
                  style.box_sizing_border_box ? "border-box" : "content-box");
+    } else if (property_equal(name, name_length, "flex", 4)) {
+        char basis[32];
+        if (!style.has_flex_basis) {
+            snprintf(basis, sizeof(basis), "auto");
+        } else if (style.flex_basis == STYLE_LENGTH_MIN_CONTENT) {
+            snprintf(basis, sizeof(basis), "min-content");
+        } else if (style.flex_basis == STYLE_LENGTH_MAX_CONTENT) {
+            snprintf(basis, sizeof(basis), "max-content");
+        } else if (style.flex_basis == STYLE_LENGTH_FIT_CONTENT) {
+            snprintf(basis, sizeof(basis), "fit-content");
+        } else {
+            snprintf(basis, sizeof(basis), "%d%s", style.flex_basis,
+                     style.flex_basis_percent ? "%" : "px");
+        }
+        snprintf(value, sizeof(value), "%.3g %.3g %s",
+                 (double) style.flex_grow / 1000.0,
+                 (double) style.flex_shrink / 512.0, basis);
     } else if (property_equal(name, name_length, "flex-direction", 14)) {
         static const char *direction_names[] = {
             "row", "row-reverse", "column", "column-reverse"
@@ -4457,7 +4549,7 @@ JSValue js_style_set(JSContext *context, JSValueConst this_value,
         (const lxb_char_t *) updated, used) == NULL
         ? LXB_STATUS_ERROR : LXB_STATUS_OK;
     if (status == LXB_STATUS_OK) {
-        uint16_t modern = sparse_modern_property_mask(
+        uint32_t modern = sparse_modern_property_mask(
             wanted, wanted_length);
         if (modern != 0 && bridge->stylesheet != NULL) {
             /* The mask is a monotonic presence summary, not stylesheet
@@ -4625,7 +4717,9 @@ JSValue js_dom_record_event(JSContext *context,
 {
     (void) this_value; (void) argc; (void) argv;
     DomBridge *bridge = JS_GetContextOpaque(context);
-    bridge->result->events_dispatched++;
+    if (bridge != NULL && bridge->result != NULL) {
+        bridge->result->events_dispatched++;
+    }
     return JS_UNDEFINED;
 }
 

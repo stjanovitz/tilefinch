@@ -937,15 +937,29 @@ bool psp_media_open_pump(
            hide this because a later pump naturally entered with RESOLVE. */
         phase_before = PSP_MEDIA_JOB_OPEN_RESOLVE;
     }
+    /* The physical phase below belongs to exactly this service token. A
+       delivery retry may synchronously quiesce the old pipeline and dispatch
+       a replacement OPEN from inside the step. In that case the old pump
+       must not manufacture a completion from the replacement token or clear
+       it while advancing work the replacement has not performed. */
+    PspMediaCommand phase_service_command = media->service.command;
+    uint64_t phase_service_epoch = media->service.epoch;
     media->open_cancellation = cancellation;
     bool pumped = psp_media_open_pump_step(media);
     media->open_cancellation = NULL;
     if (phase_before >= PSP_MEDIA_JOB_OPEN_RESOLVE
         && phase_before <= PSP_MEDIA_JOB_OPEN_PLAYBACK
-        && media->job_phase != phase_before) {
+        && media->job_phase != phase_before
+        && phase_service_command == PSP_MEDIA_COMMAND_START_OPEN_PHASE
+        && phase_service_epoch != 0
+        && media->service.command == phase_service_command
+        && media->service.epoch == phase_service_epoch) {
         if (!media->ui.failed) {
-            PspMediaEvent completed = psp_media_service_completion(
-                media, PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE);
+            PspMediaEvent completed = {
+                .type = PSP_MEDIA_EVENT_OPEN_PHASE_COMPLETE,
+                .service_command = phase_service_command,
+                .service_epoch = phase_service_epoch
+            };
             completed.has_separate_audio = media->stream.split_streams;
             completed.audio_only = media->audio_only;
             psp_media_session_dispatch_event(media, completed, "open-phase");
@@ -1258,12 +1272,18 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                 (unsigned long long) (media->offline_source
                     || media->stream.expires_unix <= now
                         ? 0 : media->stream.expires_unix - now));
-        } else if (media->page_hls) {
+        } else if (media->page_hls
+                   || (media->stream.live_hls && media->hls != NULL)) {
+            bool provider_live = media->stream.live_hls;
             if (media->hls == NULL) {
                 media->hls = psp_media_hls_create(
                     media->budget, media->session,
-                    media->source, media->page_document_url,
-                    media->page_media_mode, media->page_media_credentials,
+                    provider_live ? media->stream.media_url : media->source,
+                    provider_live ? media->source : media->page_document_url,
+                    provider_live ? TILEFINCH_REQUEST_MODE_NO_CORS
+                                  : media->page_media_mode,
+                    provider_live ? TILEFINCH_CREDENTIALS_INCLUDE
+                                  : media->page_media_credentials,
                     error, sizeof(error));
             }
             if (media->hls == NULL) {
@@ -1283,10 +1303,12 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                     ok = psp_media_hls_stream_info(
                         media->hls, &video, &audio);
                     if (ok) {
-                        memset(&media->stream, 0, sizeof(media->stream));
-                        snprintf(media->stream.title,
-                                 sizeof(media->stream.title), "%s",
-                                 "Page video");
+                        if (!provider_live) {
+                            memset(&media->stream, 0, sizeof(media->stream));
+                            snprintf(media->stream.title,
+                                     sizeof(media->stream.title), "%s",
+                                     "Page video");
+                        }
                         snprintf(media->stream.mime_type,
                                  sizeof(media->stream.mime_type), "%s",
                                  "video/mp2t; codecs=avc1.64001e,mp4a.40.2");
@@ -1376,6 +1398,21 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             snprintf(error, sizeof(error), "%s",
                      "format: adaptive AAC unavailable for audio-only");
         }
+        if (ok && media->stream.live_hls && media->hls == NULL) {
+            media->hls = psp_media_hls_create(
+                media->budget, media->session,
+                media->stream.media_url, media->source,
+                TILEFINCH_REQUEST_MODE_NO_CORS,
+                TILEFINCH_CREDENTIALS_INCLUDE,
+                error, sizeof(error));
+            if (media->hls == NULL) {
+                ok = false;
+            } else {
+                /* Keep OPEN_RESOLVE authoritative until the selected media
+                   playlist has yielded decoder metadata and one picture. */
+                break;
+            }
+        }
         if (ok) {
             psp_media_apply_decoder_hint(media);
             uint64_t now = tilefinch_platform_wall_time_ns()
@@ -1417,7 +1454,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                Generic page media says only video/mp4 until avcC is parsed;
                defer its decoder choice until VIDEO_DEMUX rather than loading
                firmware first and the larger software component afterward. */
-            media->job_phase = media->page_hls
+            media->job_phase = (media->page_hls || media->stream.live_hls)
                 ? PSP_MEDIA_JOB_OPEN_DECODER_PREPARE
                 : media->page_audio
                 ? PSP_MEDIA_JOB_OPEN_DECODER_PREPARE

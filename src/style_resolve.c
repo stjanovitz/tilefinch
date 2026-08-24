@@ -386,7 +386,7 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
 {
     if (sheet == NULL || node == NULL || style == NULL
         || sheet->modern_property_mask == 0) return;
-    uint16_t mask = sheet->modern_property_mask;
+    uint32_t mask = sheet->modern_property_mask;
     char value[96];
     bool paint_dirty = false;
     StylePaintStack paint = {0};
@@ -599,6 +599,57 @@ static void style_apply_modern_properties(const Stylesheet *sheet,
             style->transform_scale_q6 = (uint8_t) (
                 combined / 64u > 255u ? 255u : combined / 64u);
             style->has_transform |= scale != 64;
+        }
+    }
+    /* Tilefinch's retained display list is intrinsically flat. Accepting
+       preserve-3d/backface declarations while resolving them to the front
+       face gives unsupported 3D scenes one stable, visible 2D state instead
+       of dropping the entire declaration block. No per-node state is needed. */
+    if ((mask & STYLE_MODERN_COLOR_SCHEME) != 0 && root_element
+        && retained_modern_value(sheet, node, "color-scheme", value)
+        && modern_keyword(value, "dark")) {
+        if (!style->has_background) {
+            style->background = UINT32_C(0x121212);
+            style->background_alpha = 255u;
+            style->has_background = true;
+        }
+        if (style->color == 0u && style->color_alpha != 0u) {
+            style->color = UINT32_C(0xe8e8e8);
+        }
+    }
+    if ((mask & STYLE_MODERN_BORDER_IMAGE) != 0) {
+        bool found = retained_modern_value(
+            sheet, node, "border-image-source", value);
+        if (!found) found = retained_modern_value(
+            sheet, node, "border-image", value);
+        if (found) {
+            size_t gradient_length = strlen(value);
+            const char *open = strchr(value, '(');
+            if (open != NULL) {
+                unsigned nesting = 0;
+                for (const char *at = open;
+                     *at != '\0'; at++) {
+                    if (*at == '(') nesting++;
+                    else if (*at == ')' && nesting != 0
+                             && --nesting == 0) {
+                        gradient_length = (size_t) (at - value) + 1u;
+                        break;
+                    }
+                }
+            }
+            StyleGradient gradient = {0};
+            if (style_parse_gradient(
+                    sheet, value, gradient_length, &gradient)
+                && gradient.stop_count != 0) {
+                /* The compact display list has solid borders, not nine-slice
+                   images. Preserve the authored geometry and use the first
+                   ramp stop as a stable bounded approximation instead of
+                   dropping the border-image declaration entirely. */
+                uint32_t argb = gradient.stop_argb[0];
+                style->border_color = argb & UINT32_C(0x00ffffff);
+                style->border_alpha = (uint8_t) (argb >> 24);
+                style->border_color_set = 0;
+            }
         }
     }
     if ((mask & STYLE_MODERN_ROTATE) != 0
@@ -2081,7 +2132,7 @@ static void apply_values(Stylesheet *sheet, ComputedStyle *style,
             | (values->filter_code & STYLE_DIRECTION_RTL));
     }
     if (mask_high & S2_UNICODE_BIDI) {
-        style->unicode_bidi_override = values->unicode_bidi_override;
+        style->unicode_bidi = values->unicode_bidi;
     }
     if (mask & S_GAP) {
         style->gap = values->gap;
@@ -2407,6 +2458,12 @@ static void apply_inherit_mask(Stylesheet *sheet, ComputedStyle *style,
     if (inherit_mask & S_COLOR) {
         style->color = parent->color;
         style->color_alpha = parent->color_alpha;
+    }
+    if (inherit_mask & S_OPACITY) {
+        style->opacity = parent->opacity;
+    }
+    if (inherit_mask & S_VISIBILITY) {
+        style->visibility_hidden = parent->visibility_hidden;
     }
     if (inherit_mask & S_BACKGROUND) {
         style->has_background = parent->has_background;
@@ -3383,6 +3440,13 @@ static bool focus_selector_side_effects_are_local(
     return true;
 }
 
+static size_t focus_marker_remove_failures;
+
+void style_test_inject_focus_marker_remove_failures(size_t count)
+{
+    focus_marker_remove_failures = count;
+}
+
 static bool set_focus_marker(lxb_dom_node_t *node, bool focused)
 {
     static const lxb_char_t name[] = "data-tilefinch-focus";
@@ -3393,8 +3457,24 @@ static bool set_focus_marker(lxb_dom_node_t *node, bool focused)
             element, name, sizeof(name) - 1,
             (const lxb_char_t *) "", 0) != NULL;
     }
+    if (focus_marker_remove_failures != 0) {
+        focus_marker_remove_failures--;
+        return false;
+    }
     return lxb_dom_element_remove_attribute(
         element, name, sizeof(name) - 1) == LXB_STATUS_OK;
+}
+
+static bool restore_focus_marker(
+    lxb_dom_node_t *node, bool originally_focused,
+    const char *original_value, size_t original_length)
+{
+    static const lxb_char_t name[] = "data-tilefinch-focus";
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
+    if (!originally_focused) return set_focus_marker(node, false);
+    return lxb_dom_element_set_attribute(
+        lxb_dom_interface_element(node), name, sizeof(name) - 1u,
+        (const lxb_char_t *) original_value, original_length) != NULL;
 }
 
 static bool computed_style_equal_without_outline(
@@ -3490,13 +3570,16 @@ StyleFocusChange style_focus_change_classify(
         *normal = style_for_node(sheet, node, parent);
         ok = ok && focus_selector_side_effects_are_local(sheet, node);
     }
-    bool restored = originally_focused
-        ? lxb_dom_element_set_attribute(
-              lxb_dom_interface_element(node),
-              (const lxb_char_t *) marker, sizeof(marker) - 1,
-              (const lxb_char_t *) original_value,
-              original_length) != NULL
-        : (!focused_set || normal_set);
+    bool restored = restore_focus_marker(
+        node, originally_focused, original_value, original_length);
+    if (!restored) {
+        /* Lexbor normally makes attribute replacement atomic. If a reduced
+           harness or future allocator fault reports failure after mutation,
+           make one best-effort restoration attempt before
+           returning UNSAFE so a probe cannot leave the live DOM focused. */
+        restored = restore_focus_marker(
+            node, originally_focused, original_value, original_length);
+    }
     style_variable_cache_invalidate_node((Stylesheet *) sheet, node);
     if (!ok || !restored) return STYLE_FOCUS_CHANGE_UNSAFE;
     if (computed_style_equal_without_outline(normal, focused)) {

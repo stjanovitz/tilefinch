@@ -36,6 +36,35 @@ class RedirectHandler(BaseHTTPRequestHandler):
             ("Set-Cookie", cookie),
         ))
 
+    def portal_redirect(self, path):
+        prefix = "/portal-redirect-"
+        if not path.startswith(prefix):
+            return False
+        try:
+            status = int(path[len(prefix):])
+        except ValueError:
+            return False
+        if status not in (301, 302, 303, 307, 308):
+            return False
+        location = (f"http://127.0.0.1:{self.server.cross_port}"
+                    "/portal-private-sink")
+        self.redirect(status, location, "portal_hop=seen; Path=/")
+        return True
+
+    def portal_sink(self, body=b""):
+        with self.server.portal_probe_lock:
+            self.server.portal_probe["requests"] += 1
+            self.server.portal_probe["body_bytes"] += len(body)
+        self.reply(204)
+
+    def portal_probe_count(self):
+        with self.server.portal_probe_lock:
+            requests = self.server.portal_probe["requests"]
+            body_bytes = self.server.portal_probe["body_bytes"]
+        self.reply(200, f"requests={requests};body={body_bytes}".encode(), (
+            ("Content-Type", "text/plain"),
+        ))
+
     def filled_policy_redirect(self):
         # Location remains in the bounded page-visible snapshot, while the
         # late Referrer-Policy deliberately falls just beyond its capacity.
@@ -168,7 +197,13 @@ class RedirectHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        if path == "/same":
+        if self.portal_redirect(path):
+            return
+        if path == "/portal-private-sink":
+            self.portal_sink()
+        elif path == "/portal-probe-count":
+            self.portal_probe_count()
+        elif path == "/same":
             self.redirect(302, "/final", "hop=seen; Path=/")
         elif path == "/fragment-inherit":
             self.redirect(302, "/final?fragment=inherit",
@@ -637,7 +672,11 @@ class RedirectHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
         path = urlparse(self.path).path
-        if path == "/post302":
+        if self.portal_redirect(path):
+            return
+        if path == "/portal-private-sink":
+            self.portal_sink(body)
+        elif path == "/post302":
             self.redirect(302, "/method", "post302=seen; Path=/")
         elif path == "/post307":
             self.redirect(307, "/method", "post307=seen; Path=/")
@@ -676,9 +715,13 @@ def main():
     cross_server.cross_port = server.server_address[1]
     server.blocked_port = blocked_socket.getsockname()[1]
     cross_server.blocked_port = blocked_socket.getsockname()[1]
+    portal_probe = {"requests": 0, "body_bytes": 0}
+    portal_probe_lock = Lock()
     for fixture in (server, cross_server, proxy_server):
         fixture.state_lock = Lock()
         fixture.empty_location_attempts = {}
+        fixture.portal_probe = portal_probe
+        fixture.portal_probe_lock = portal_probe_lock
     thread = Thread(target=server.serve_forever, daemon=True)
     cross_thread = Thread(target=cross_server.serve_forever, daemon=True)
     proxy_thread = Thread(target=proxy_server.serve_forever, daemon=True)

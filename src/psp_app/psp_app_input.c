@@ -194,6 +194,14 @@ const char *psp_ui_action_name(PspUiAction action)
         case PSP_UI_ACTION_HOME_ACTIVATE: return "home-activate";
         case PSP_UI_ACTION_COLLECTION_ACTIVATE: return "collection-activate";
         case PSP_UI_ACTION_COLLECTION_DELETE: return "collection-delete";
+        case PSP_UI_ACTION_RECOVERY_READER: return "recovery-reader";
+        case PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT:
+            return "recovery-disable-javascript";
+        case PSP_UI_ACTION_RECOVERY_AUDIO_ONLY:
+            return "recovery-audio-only";
+        case PSP_UI_ACTION_RECOVERY_LOWER_QUALITY:
+            return "recovery-lower-quality";
+        case PSP_UI_ACTION_RECOVERY_RETURN: return "recovery-return";
         case PSP_UI_ACTION_FOCUS_PREVIOUS: return "focus-previous";
         case PSP_UI_ACTION_FOCUS_NEXT: return "focus-next";
         case PSP_UI_ACTION_FOCUS_UP: return "focus-up";
@@ -231,6 +239,8 @@ const char *psp_ui_action_name(PspUiAction action)
         case PSP_UI_ACTION_SHOW_HOMEPAGE: return "show-homepage";
         case PSP_UI_ACTION_SHOW_HISTORY: return "show-history";
         case PSP_UI_ACTION_SCREENSHOT: return "screenshot";
+        case PSP_UI_ACTION_CHECK_WIFI_SIGN_IN:
+            return "check-wifi-sign-in";
         case PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR:
             return "build-diagnostic-qr";
         case PSP_UI_ACTION_DIAGNOSTIC_QR_PREVIOUS:
@@ -264,6 +274,16 @@ const char *psp_ui_action_acknowledgement(PspUiAction action)
         case PSP_UI_ACTION_FORWARD:
             return "FORWARD RECEIVED - OPENING...";
         case PSP_UI_ACTION_RELOAD: return "RELOAD RECEIVED - STARTING...";
+        case PSP_UI_ACTION_RECOVERY_READER:
+            return "TRYING READER MODE...";
+        case PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT:
+            return "DISABLING JAVASCRIPT AND RETRYING...";
+        case PSP_UI_ACTION_RECOVERY_AUDIO_ONLY:
+            return "TRYING AUDIO-ONLY...";
+        case PSP_UI_ACTION_RECOVERY_LOWER_QUALITY:
+            return "TRYING LOWER VIDEO QUALITY...";
+        case PSP_UI_ACTION_RECOVERY_RETURN:
+            return "RETURNING TO LAST PAGE...";
         case PSP_UI_ACTION_OPEN_ADDRESS: return "OPENING ADDRESS INPUT...";
         case PSP_UI_ACTION_OPEN_FIND:
         case PSP_UI_ACTION_FIND_EDIT:
@@ -291,6 +311,8 @@ const char *psp_ui_action_acknowledgement(PspUiAction action)
             return "OPENING MY HOMEPAGE...";
         case PSP_UI_ACTION_SHOW_HISTORY: return "OPENING HISTORY...";
         case PSP_UI_ACTION_SCREENSHOT: return NULL;
+        case PSP_UI_ACTION_CHECK_WIFI_SIGN_IN:
+            return "CHECKING WI-FI SIGN-IN...";
         case PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR:
             return "BUILDING DIAGNOSTIC QR...";
         case PSP_UI_ACTION_DIAGNOSTIC_QR_PREVIOUS:
@@ -545,6 +567,8 @@ const char *psp_media_action_name(PspUiMediaAction action)
             return "media-cancel-seek-preview";
         case PSP_UI_MEDIA_ACTION_SEEK: return "media-seek";
         case PSP_UI_MEDIA_ACTION_RETRY: return "media-retry";
+        case PSP_UI_MEDIA_ACTION_AUDIO_ONLY: return "media-audio-only";
+        case PSP_UI_MEDIA_ACTION_LOWER_QUALITY: return "media-lower-quality";
         case PSP_UI_MEDIA_ACTION_CLOSE: return "media-close";
         case PSP_UI_MEDIA_ACTION_NONE:
         default: return "media-none";
@@ -741,6 +765,41 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
     if (profile != NULL) {
         const BrowserSession *security_session =
             browser_engine_session_view(engine);
+        if (ui->screen == PSP_UI_SCREEN_PAGE_TOOLS
+            || ui->screen == PSP_UI_SCREEN_PAGE_INFORMATION
+            || ui->screen == PSP_UI_SCREEN_SITE_CONTROLS) {
+        BrowserSiteDataUsage site_usage = {0};
+        if (browser_session_site_data_usage(
+                security_session, view.url, &site_usage)) {
+            size_t cookie_count = site_usage.cookie_count;
+            size_t storage_count = site_usage.local_storage_count
+                + site_usage.session_storage_count;
+            size_t data_bytes = site_usage.cookie_bytes
+                + site_usage.storage_bytes;
+            ui->site_cookie_count = cookie_count > UINT16_MAX
+                ? UINT16_MAX : (uint16_t) cookie_count;
+            ui->site_storage_count = storage_count > UINT16_MAX
+                ? UINT16_MAX : (uint16_t) storage_count;
+            ui->site_data_bytes = data_bytes > UINT32_MAX
+                ? UINT32_MAX : (uint32_t) data_bytes;
+        } else {
+            ui->site_cookie_count = 0;
+            ui->site_storage_count = 0;
+            ui->site_data_bytes = 0;
+        }
+        ui->site_tls_verify_result = (int32_t) view.tls_verify_result;
+        ui->site_tls_verify_result_available =
+            view.tls_verify_result_available;
+        snprintf(ui->site_tls_version, sizeof(ui->site_tls_version), "%s",
+                 view.tls_version[0] == '\0'
+                    ? (view.secure ? "TLS" : "HTTP")
+                    : view.tls_version);
+        snprintf(ui->site_tls_issuer, sizeof(ui->site_tls_issuer), "%s",
+                 view.tls_peer_issuer[0] == '\0'
+                    ? (view.secure ? "Certificate issuer unavailable"
+                                   : "No TLS certificate")
+                    : view.tls_peer_issuer);
+        }
         ui->site_javascript_enabled =
             browser_profile_site_javascript_enabled(profile, view.url);
         ui->mixed_content_site_allowed =

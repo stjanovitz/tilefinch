@@ -3326,6 +3326,17 @@
     queueMicrotask(pumpNetworkQueue);
     return true;
   };
+  globalThis.__tilefinchDetachNetwork = () => {
+    const reason = new TypeError("document detached");
+    /* Snapshot the keys: cancelNetwork mutates both maps and may start a
+       queued successor after each cancellation. Repeating to a fixed bound
+       drains successors too without trusting author-modified iteration. */
+    for (let pass = 0; pass < networkQueueLimit && pendingNetwork.size; pass++) {
+      const ids = Array.from(pendingNetwork.keys()).slice(0, networkQueueLimit);
+      for (const id of ids) cancelNetwork(id, reason, true);
+    }
+    return pendingNetwork.size === 0;
+  };
   globalThis.__tilefinchDeliverNetwork = (id, ok, value) => {
     const entry = nativeNetwork.get(Number(id));
     if (!entry) {

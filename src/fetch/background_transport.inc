@@ -95,7 +95,8 @@ bool fetch_background_transport_stream_shape_supported(
 /* libcurl may deliver another CURL_MAX_WRITE_SIZE (normally 16 KiB) body
    callback before observing the published pause state. Hand the current
    chunk to the browser with one such callback of spare capacity. */
-#define FETCH_BACKGROUND_STREAM_CHUNK_TARGET (48u * 1024u)
+#define FETCH_BACKGROUND_STREAM_CHUNK_TARGET \
+    FETCH_BACKGROUND_STREAM_PUBLICATION_MAX
 #define FETCH_BACKGROUND_THREAD_STACK_BYTES (256u * 1024u)
 /*
  * One notch above the 0x20 browser thread. A lower-priority curl worker was
@@ -183,6 +184,7 @@ typedef struct {
     bool send_client_hints;
     bool suppress_high_client_hints;
     bool tls12_retry_attempted;
+    bool response_headers_complete;
     size_t total_length;
     size_t response_cookie_bytes;
     size_t response_cookie_count;
@@ -366,6 +368,7 @@ static void fetch_background_reset_response_headers(
 {
     if (slot == NULL) return;
     slot->header_status = 0;
+    slot->response_headers_complete = false;
     slot->location[0] = '\0';
     slot->content_range[0] = '\0';
     slot->content_type_response[0] = '\0';
@@ -373,6 +376,7 @@ static void fetch_background_reset_response_headers(
     slot->response_cookie_count = 0;
     slot->result.status_code = 0;
     slot->result.effective_url[0] = '\0';
+    slot->result.content_range[0] = '\0';
     slot->result.content_type[0] = '\0';
     slot->result.etag[0] = '\0';
     slot->result.last_modified[0] = '\0';
@@ -516,7 +520,17 @@ static size_t fetch_background_receive_header(
         &fetch_background.header_callbacks, 1u, memory_order_relaxed);
     size_t length = size * count;
     slot->last_progress_us = fetch_background_now_us();
-    if (length >= 5u && strncasecmp(data, "HTTP/", 5u) == 0) {
+    bool status_line = length >= 5u
+        && strncasecmp(data, "HTTP/", 5u) == 0;
+    bool header_snapshot_published = atomic_load_explicit(
+        &slot->headers_state, memory_order_acquire)
+        != FETCH_BACKGROUND_HEADERS_EMPTY;
+    if (fetch_background_header_line_ignored(
+            slot->response_headers_complete,
+            header_snapshot_published, status_line)) {
+        return length;
+    }
+    if (status_line) {
         long status = 0;
         char status_line[128];
         size_t copied = length < sizeof(status_line) - 1u
@@ -545,9 +559,20 @@ static size_t fetch_background_receive_header(
             slot->result.status_code = slot->header_status;
             snprintf(slot->result.effective_url,
                      sizeof(slot->result.effective_url), "%s", slot->url);
-            atomic_store_explicit(
-                &slot->headers_state, FETCH_BACKGROUND_HEADERS_READY,
-                memory_order_release);
+            snprintf(slot->result.content_range,
+                     sizeof(slot->result.content_range), "%s",
+                     slot->content_range);
+            slot->response_headers_complete = true;
+            /* Redirects followed by this worker are not browser-visible
+               responses. Keep their fields private until the next status
+               line resets them; only terminal snapshots get published. */
+            if (fetch_background_header_block_publishable(
+                    slot->single_hop, slot->header_status,
+                    slot->location[0] != '\0')) {
+                atomic_store_explicit(
+                    &slot->headers_state, FETCH_BACKGROUND_HEADERS_READY,
+                    memory_order_release);
+            }
         }
     } else {
         if (!fetch_background_store_header(slot, data, length)) return 0;
@@ -796,6 +821,8 @@ static bool fetch_background_configure_easy(FetchBackgroundSlot *slot)
         || curl_easy_setopt(slot->easy, CURLOPT_URL, slot->url) != CURLE_OK
         || curl_easy_setopt(slot->easy, CURLOPT_FOLLOWLOCATION, 0L) != CURLE_OK
         || curl_easy_setopt(
+               slot->easy, CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L) != CURLE_OK
+        || curl_easy_setopt(
                slot->easy, TILEFINCH_CURL_PROTOCOLS_OPT,
                TILEFINCH_CURL_HTTP_PROTOCOLS) != CURLE_OK
         || curl_easy_setopt(
@@ -966,9 +993,13 @@ static void fetch_background_publish_complete(
 {
     slot->result.transport_code = (long) code;
     if (slot->easy != NULL) {
-        (void) curl_easy_getinfo(
+        slot->result.tls_verify_result_available = curl_easy_getinfo(
             slot->easy, CURLINFO_SSL_VERIFYRESULT,
-            &slot->result.tls_verify_result);
+            &slot->result.tls_verify_result) == CURLE_OK;
+        slot->result.tls_verification_failed =
+            code == CURLE_PEER_FAILED_VERIFICATION
+            || (slot->result.tls_verify_result_available
+                && slot->result.tls_verify_result != 0);
         fetch_capture_tls_security(
             slot->easy,
             slot->result.tls_version,
@@ -984,7 +1015,11 @@ static void fetch_background_publish_complete(
         &slot->received_body_bytes, memory_order_acquire);
     slot->result.timed_out = code == CURLE_OPERATION_TIMEDOUT
         || slot->result.timed_out;
-    slot->result.status_code = slot->header_status;
+    if (atomic_load_explicit(
+            &slot->headers_state, memory_order_acquire)
+            == FETCH_BACKGROUND_HEADERS_EMPTY) {
+        slot->result.status_code = slot->header_status;
+    }
     slot->result.tls12_compatibility_retry = slot->tls12_retry_attempted;
     if (!success && slot->result.error[0] == '\0') {
         const char *message = atomic_load_explicit(
@@ -1121,17 +1156,23 @@ static void fetch_background_finish_easy(
        supervisor still corroborates this hint with APCTL/WLAN state. */
     if (!slot->private_network.blocked)
         fetch_background_record_network_regression(code);
-    slot->result.status_code = status;
+    bool header_snapshot_published = atomic_load_explicit(
+        &slot->headers_state, memory_order_acquire)
+        != FETCH_BACKGROUND_HEADERS_EMPTY;
+    if (!header_snapshot_published) slot->result.status_code = status;
     if (slot->private_network.blocked) {
         snprintf(slot->result.error, sizeof(slot->result.error), "%s",
                  "blocked private network target");
     }
-    if (effective_url != NULL) {
+    if (!header_snapshot_published && effective_url != NULL) {
         snprintf(slot->result.effective_url,
                  sizeof(slot->result.effective_url), "%s", effective_url);
     }
-    snprintf(slot->result.content_range,
-             sizeof(slot->result.content_range), "%s", slot->content_range);
+    if (!header_snapshot_published) {
+        snprintf(slot->result.content_range,
+                 sizeof(slot->result.content_range), "%s",
+                 slot->content_range);
+    }
     (void) curl_easy_getinfo(
         slot->easy, CURLINFO_HTTP_VERSION,
         &slot->result.negotiated_http_version);
@@ -2079,10 +2120,9 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
         slot->private_network.blocked = false;
         slot->validator = request->redirect_url_validator;
         slot->maximum_bytes = maximum_bytes;
-        slot->stream_chunk_target = publication_bytes == 0
-            ? FETCH_BACKGROUND_STREAM_CHUNK_TARGET : publication_bytes;
-        if (slot->stream_chunk_target > maximum_bytes)
-            slot->stream_chunk_target = maximum_bytes;
+        slot->stream_chunk_target =
+            fetch_background_stream_publication_target(
+                publication_bytes, maximum_bytes);
         slot->timeout_ms = timeout_ms;
         slot->connect_timeout_ms = request->connect_timeout_ms;
         slot->started_us = fetch_background_now_us();
@@ -2095,6 +2135,7 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
         slot->redirect_loop_detected = false;
         slot->tls12_retry_attempted = false;
         slot->header_status = 0;
+        slot->response_headers_complete = false;
         slot->length = 0;
         slot->total_length = 0;
         slot->location[0] = '\0';
@@ -2492,29 +2533,14 @@ bool fetch_background_transport_metrics(
     return true;
 }
 
-static void fetch_background_copy_response_metadata(
+/* Fields frozen before headers_state is release-published.  The transfer
+   timing/result tail remains worker-owned until SLOT_COMPLETE and must not be
+   read by the browser's early-header path. */
+static void fetch_background_copy_header_snapshot(
     FetchResult *destination, const FetchBackgroundResult *source)
 {
     if (destination == NULL || source == NULL) return;
     destination->status_code = source->status_code;
-    destination->transport_code = source->transport_code;
-    destination->tls_verify_result = source->tls_verify_result;
-    destination->negotiated_http_version = source->negotiated_http_version;
-    destination->new_connections = source->new_connections;
-    destination->transport_timing = source->transport_timing;
-    destination->tls_handshake_measured = source->tls_handshake_measured;
-    destination->tls_handshake_us = source->tls_handshake_us;
-    destination->tls_connection_reuse_known =
-        source->tls_connection_reuse_known;
-    destination->tls_connection_reused = source->tls_connection_reused;
-    destination->tls12_compatibility_retry =
-        source->tls12_compatibility_retry;
-    snprintf(destination->tls_version, sizeof(destination->tls_version),
-             "%s", source->tls_version);
-    snprintf(destination->tls_peer_issuer,
-             sizeof(destination->tls_peer_issuer), "%s",
-             source->tls_peer_issuer);
-    destination->timed_out = source->timed_out;
     snprintf(destination->effective_url, sizeof(destination->effective_url),
              "%s", source->effective_url);
     snprintf(destination->content_type, sizeof(destination->content_type),
@@ -2530,8 +2556,7 @@ static void fetch_background_copy_response_metadata(
     snprintf(destination->accept_ch, sizeof(destination->accept_ch), "%s",
              source->accept_ch);
     snprintf(destination->critical_ch,
-             sizeof(destination->critical_ch), "%s",
-             source->critical_ch);
+             sizeof(destination->critical_ch), "%s", source->critical_ch);
     snprintf(destination->server, sizeof(destination->server), "%s",
              source->server);
     snprintf(destination->cf_ray, sizeof(destination->cf_ray), "%s",
@@ -2557,6 +2582,34 @@ static void fetch_background_copy_response_metadata(
     destination->set_cookies_truncated = source->set_cookies_truncated;
 }
 
+static void fetch_background_copy_response_metadata(
+    FetchResult *destination, const FetchBackgroundResult *source)
+{
+    if (destination == NULL || source == NULL) return;
+    fetch_background_copy_header_snapshot(destination, source);
+    destination->transport_code = source->transport_code;
+    destination->tls_verify_result = source->tls_verify_result;
+    destination->tls_verify_result_available =
+        source->tls_verify_result_available;
+    destination->tls_verification_failed = source->tls_verification_failed;
+    destination->negotiated_http_version = source->negotiated_http_version;
+    destination->new_connections = source->new_connections;
+    destination->transport_timing = source->transport_timing;
+    destination->tls_handshake_measured = source->tls_handshake_measured;
+    destination->tls_handshake_us = source->tls_handshake_us;
+    destination->tls_connection_reuse_known =
+        source->tls_connection_reuse_known;
+    destination->tls_connection_reused = source->tls_connection_reused;
+    destination->tls12_compatibility_retry =
+        source->tls12_compatibility_retry;
+    snprintf(destination->tls_version, sizeof(destination->tls_version),
+             "%s", source->tls_version);
+    snprintf(destination->tls_peer_issuer,
+             sizeof(destination->tls_peer_issuer), "%s",
+             source->tls_peer_issuer);
+    destination->timed_out = source->timed_out;
+}
+
 static void fetch_background_copy_media_headers(
     FetchBackgroundMediaResponse *destination,
     const FetchBackgroundSlot *slot)
@@ -2570,7 +2623,7 @@ static void fetch_background_copy_media_headers(
     destination->effective_url[url_length] = '\0';
     snprintf(destination->content_range,
              sizeof(destination->content_range), "%s",
-             slot->content_range);
+             source->content_range);
     destination->content_length[0] = '\0';
     size_t offset = 0;
     static const char content_length_name[] = "content-length";
@@ -2635,7 +2688,7 @@ bool fetch_background_transport_take_headers(
             &slot->headers_state, &expected,
             FETCH_BACKGROUND_HEADERS_TAKEN,
             memory_order_acq_rel, memory_order_acquire)) return false;
-    fetch_background_copy_response_metadata(metadata, &slot->result);
+    fetch_background_copy_header_snapshot(metadata, &slot->result);
     return true;
 }
 

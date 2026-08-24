@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "tilefinch/psp_time.h"
+
 typedef enum {
     TILEFINCH_DIAGNOSTIC_DEBUG = 0,
     TILEFINCH_DIAGNOSTIC_INFO,
@@ -109,6 +111,7 @@ typedef enum {
 } TilefinchTlsGuidance;
 
 TilefinchTlsGuidance tilefinch_tls_verification_guidance(
-    uint32_t verification_flags, bool rtc_valid);
+    uint32_t verification_flags, bool verification_flags_available,
+    PspTimeStatus clock_status);
 
 #endif

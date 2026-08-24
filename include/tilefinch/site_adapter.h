@@ -118,8 +118,9 @@ void site_adapter_document_destroy(SiteAdapterDocument *document);
 
 /*
  * Reader mode is a content-shaped presentation, not a hostname adapter. It
- * emits one bounded stylesheet for the markers produced by reader_mode.h so
- * the caller can toggle the transform without reparsing or losing page state.
+ * emits one bounded stylesheet for the extracted tree produced by
+ * reader_mode.h so the caller can toggle it without reparsing or losing the
+ * raw page state.
  */
 bool site_adapter_reader_css(
     const char *url, SiteAdapterReaderFont font, unsigned font_percent,

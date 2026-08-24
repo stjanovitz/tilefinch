@@ -8,6 +8,7 @@
 #define SCRIPT_LAZY_FACTORY_LIMIT 4096u
 #define SCRIPT_LAZY_SCAN_BYTE_LIMIT (8u * 1024u * 1024u)
 #define SCRIPT_LAZY_SIGNATURE_SCAN_LIMIT 1024u
+#define SCRIPT_LAZY_TEMPLATE_DEPTH_LIMIT 64u
 
 #define js_malloc(b, s) \
     budget_malloc_category((b), BUDGET_CATEGORY_JAVASCRIPT, (s))
@@ -36,6 +37,7 @@ typedef struct {
     size_t length;
     size_t offset;
     size_t *work_remaining;
+    unsigned template_depth;
     bool expression_expected;
     bool failed;
 } JsLexer;
@@ -151,6 +153,10 @@ static bool skip_regular_expression(JsLexer *lexer, size_t *end)
    treating their braces as factory-body braces. */
 static bool skip_template(JsLexer *lexer, size_t *end)
 {
+    if (lexer->template_depth >= SCRIPT_LAZY_TEMPLATE_DEPTH_LIMIT) {
+        lexer->failed = true;
+        return false;
+    }
     size_t at = lexer->offset + 1;
     while (at < lexer->length) {
         unsigned char byte = (unsigned char) lexer->source[at++];
@@ -171,6 +177,7 @@ static bool skip_template(JsLexer *lexer, size_t *end)
             .length = lexer->length,
             .offset = at,
             .work_remaining = lexer->work_remaining,
+            .template_depth = lexer->template_depth + 1u,
             .expression_expected = true
         };
         size_t depth = 1;

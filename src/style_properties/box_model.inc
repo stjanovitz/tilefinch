@@ -79,6 +79,19 @@ static void style_margin_edge_set(ComputedStyle *style, unsigned edge,
     }
 }
 
+static bool style_parse_margin_component(const Stylesheet *sheet,
+                                         const char *text, size_t length,
+                                         int *value, bool *automatic,
+                                         bool *percentage)
+{
+    *automatic = style_length_is_auto(sheet, text, length);
+    *percentage = false;
+    if (*automatic) { *value = 0; return true; }
+    *value = style_parse_length(
+        sheet, text, length, INT_MIN, percentage);
+    return *value != INT_MIN;
+}
+
 static bool style_property_margin(const StylePropertyParse *parse)
 {
     Stylesheet *sheet = parse->sheet;
@@ -111,13 +124,13 @@ static bool style_property_margin_top(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            style->margin_top_auto = style_length_is_auto(sheet, value,
-                                                value_length);
-        bool percent = false;
-        style->margin.top = style->margin_top_auto ? 0
-            : style_parse_length(sheet, value, value_length, 0, &percent);
-        style->margin_top_percent = percent;
-        *mask |= S_MARGIN_TOP;
+        int parsed = 0; bool automatic = false, percent = false;
+        if (style_parse_margin_component(sheet, value, value_length,
+                                         &parsed, &automatic, &percent)) {
+            style_margin_edge_set(style, STYLE_PHYSICAL_TOP, parsed,
+                                  automatic, percent);
+            *mask |= S_MARGIN_TOP;
+        }
     
     return true;
 }
@@ -129,13 +142,13 @@ static bool style_property_margin_right(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            style->margin_right_auto = style_length_is_auto(sheet, value,
-                                                  value_length);
-        bool percent = false;
-        style->margin.right = style->margin_right_auto ? 0
-            : style_parse_length(sheet, value, value_length, 0, &percent);
-        style->margin_right_percent = percent;
-        *mask |= S_MARGIN_RIGHT;
+        int parsed = 0; bool automatic = false, percent = false;
+        if (style_parse_margin_component(sheet, value, value_length,
+                                         &parsed, &automatic, &percent)) {
+            style_margin_edge_set(style, STYLE_PHYSICAL_RIGHT, parsed,
+                                  automatic, percent);
+            *mask |= S_MARGIN_RIGHT;
+        }
     
     return true;
 }
@@ -147,13 +160,13 @@ static bool style_property_margin_bottom(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            style->margin_bottom_auto = style_length_is_auto(sheet, value,
-                                                   value_length);
-        bool percent = false;
-        style->margin.bottom = style->margin_bottom_auto ? 0
-            : style_parse_length(sheet, value, value_length, 0, &percent);
-        style->margin_bottom_percent = percent;
-        *mask |= S_MARGIN_BOTTOM;
+        int parsed = 0; bool automatic = false, percent = false;
+        if (style_parse_margin_component(sheet, value, value_length,
+                                         &parsed, &automatic, &percent)) {
+            style_margin_edge_set(style, STYLE_PHYSICAL_BOTTOM, parsed,
+                                  automatic, percent);
+            *mask |= S_MARGIN_BOTTOM;
+        }
     
     return true;
 }
@@ -165,13 +178,13 @@ static bool style_property_margin_left(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            style->margin_left_auto = style_length_is_auto(sheet, value,
-                                                 value_length);
-        bool percent = false;
-        style->margin.left = style->margin_left_auto ? 0
-            : style_parse_length(sheet, value, value_length, 0, &percent);
-        style->margin_left_percent = percent;
-        *mask |= S_MARGIN_LEFT;
+        int parsed = 0; bool automatic = false, percent = false;
+        if (style_parse_margin_component(sheet, value, value_length,
+                                         &parsed, &automatic, &percent)) {
+            style_margin_edge_set(style, STYLE_PHYSICAL_LEFT, parsed,
+                                  automatic, percent);
+            *mask |= S_MARGIN_LEFT;
+        }
     
     return true;
 }
@@ -233,10 +246,11 @@ static bool style_property_margin_inline_start(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-        bool automatic = style_length_is_auto(sheet, value, value_length);
-        bool percent = false;
-        int parsed = automatic ? 0
-            : style_parse_length(sheet, value, value_length, 0, &percent);
+        bool automatic = false, percent = false;
+        int parsed = 0;
+        if (!style_parse_margin_component(sheet, value, value_length,
+                                          &parsed, &automatic, &percent))
+            return true;
         unsigned start, end;
         style_logical_edge_indices(sheet, style, true, &start, &end);
         style_margin_edge_set(style, start, parsed, automatic, percent);
@@ -252,10 +266,11 @@ static bool style_property_margin_inline_end(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-        bool automatic = style_length_is_auto(sheet, value, value_length);
-        bool percent = false;
-        int parsed = automatic ? 0
-            : style_parse_length(sheet, value, value_length, 0, &percent);
+        bool automatic = false, percent = false;
+        int parsed = 0;
+        if (!style_parse_margin_component(sheet, value, value_length,
+                                          &parsed, &automatic, &percent))
+            return true;
         unsigned start, end;
         style_logical_edge_indices(sheet, style, true, &start, &end);
         style_margin_edge_set(style, end, parsed, automatic, percent);
@@ -271,10 +286,11 @@ static bool style_property_margin_block_start(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-        bool automatic = style_length_is_auto(sheet, value, value_length);
-        bool percent = false;
-        int parsed = automatic ? 0
-            : style_parse_length(sheet, value, value_length, 0, &percent);
+        bool automatic = false, percent = false;
+        int parsed = 0;
+        if (!style_parse_margin_component(sheet, value, value_length,
+                                          &parsed, &automatic, &percent))
+            return true;
         unsigned start, end;
         style_logical_edge_indices(sheet, style, false, &start, &end);
         style_margin_edge_set(style, start, parsed, automatic, percent);
@@ -290,10 +306,11 @@ static bool style_property_margin_block_end(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-        bool automatic = style_length_is_auto(sheet, value, value_length);
-        bool percent = false;
-        int parsed = automatic ? 0
-            : style_parse_length(sheet, value, value_length, 0, &percent);
+        bool automatic = false, percent = false;
+        int parsed = 0;
+        if (!style_parse_margin_component(sheet, value, value_length,
+                                          &parsed, &automatic, &percent))
+            return true;
         unsigned start, end;
         style_logical_edge_indices(sheet, style, false, &start, &end);
         style_margin_edge_set(style, end, parsed, automatic, percent);
@@ -311,7 +328,7 @@ static bool style_property_padding_top(const StylePropertyParse *parse)
     uint64_t *mask = parse->mask;
             StyleLength parsed = 0;
         if (parse_style_length(sheet, value, value_length, &parsed,
-                               NULL)) {
+                               NULL) && parsed >= 0) {
             style->padding.top = parsed;
             *mask |= S_PADDING_TOP;
         }
@@ -328,7 +345,7 @@ static bool style_property_padding_right(const StylePropertyParse *parse)
     uint64_t *mask = parse->mask;
             StyleLength parsed = 0;
         if (parse_style_length(sheet, value, value_length, &parsed,
-                               NULL)) {
+                               NULL) && parsed >= 0) {
             style->padding.right = parsed;
             *mask |= S_PADDING_RIGHT;
         }
@@ -345,7 +362,7 @@ static bool style_property_padding_bottom(const StylePropertyParse *parse)
     uint64_t *mask = parse->mask;
             StyleLength parsed = 0;
         if (parse_style_length(sheet, value, value_length, &parsed,
-                               NULL)) {
+                               NULL) && parsed >= 0) {
             style->padding.bottom = parsed;
             *mask |= S_PADDING_BOTTOM;
         }
@@ -362,7 +379,7 @@ static bool style_property_padding_left(const StylePropertyParse *parse)
     uint64_t *mask = parse->mask;
             StyleLength parsed = 0;
         if (parse_style_length(sheet, value, value_length, &parsed,
-                               NULL)) {
+                               NULL) && parsed >= 0) {
             style->padding.left = parsed;
             *mask |= S_PADDING_LEFT;
         }
@@ -421,7 +438,7 @@ static bool style_property_padding_inline_start(const StylePropertyParse *parse)
     uint64_t *mask = parse->mask;
         StyleLength parsed = 0;
         if (parse_style_length(sheet, value, value_length, &parsed,
-                               NULL)) {
+                               NULL) && parsed >= 0) {
             unsigned start, end;
             style_logical_edge_indices(sheet, style, true, &start, &end);
             *style_edge_value(&style->padding, start) = parsed;
@@ -440,7 +457,7 @@ static bool style_property_padding_inline_end(const StylePropertyParse *parse)
     uint64_t *mask = parse->mask;
         StyleLength parsed = 0;
         if (parse_style_length(sheet, value, value_length, &parsed,
-                               NULL)) {
+                               NULL) && parsed >= 0) {
             unsigned start, end;
             style_logical_edge_indices(sheet, style, true, &start, &end);
             *style_edge_value(&style->padding, end) = parsed;
@@ -459,7 +476,7 @@ static bool style_property_padding_block_start(const StylePropertyParse *parse)
     uint64_t *mask = parse->mask;
         StyleLength parsed = 0;
         if (parse_style_length(sheet, value, value_length, &parsed,
-                               NULL)) {
+                               NULL) && parsed >= 0) {
             unsigned start, end;
             style_logical_edge_indices(sheet, style, false, &start, &end);
             *style_edge_value(&style->padding, start) = parsed;
@@ -478,7 +495,7 @@ static bool style_property_padding_block_end(const StylePropertyParse *parse)
     uint64_t *mask = parse->mask;
         StyleLength parsed = 0;
         if (parse_style_length(sheet, value, value_length, &parsed,
-                               NULL)) {
+                               NULL) && parsed >= 0) {
             unsigned start, end;
             style_logical_edge_indices(sheet, style, false, &start, &end);
             *style_edge_value(&style->padding, end) = parsed;
@@ -927,6 +944,53 @@ static bool style_property_border_color(const StylePropertyParse *parse)
                 style_set_border_color(
                     sheet, style, STYLE_BORDER_LEFT, color, alpha);
                 visuals = S2_BORDER_COLOR_LEFT;
+            } else if (span_equal(name, name_length,
+                                  "border-inline-start-color")
+                       || span_equal(name, name_length,
+                                     "border-inline-end-color")
+                       || span_equal(name, name_length,
+                                     "border-block-start-color")
+                       || span_equal(name, name_length,
+                                     "border-block-end-color")
+                       || span_equal(name, name_length,
+                                     "border-inline-color")
+                       || span_equal(name, name_length,
+                                     "border-block-color")) {
+                bool inline_axis = name_length >= 13
+                    && memcmp(name + 7, "inline", 6) == 0;
+                unsigned start = 0, end = 0;
+                style_logical_edge_indices(
+                    sheet, style, inline_axis, &start, &end);
+                bool only_start = span_equal(
+                        name, name_length, "border-inline-start-color")
+                    || span_equal(
+                        name, name_length, "border-block-start-color");
+                bool only_end = span_equal(
+                        name, name_length, "border-inline-end-color")
+                    || span_equal(
+                        name, name_length, "border-block-end-color");
+                if (!only_end) {
+                    style_set_border_color(
+                        sheet, style, (StyleBorderSide) start, color, alpha);
+                    visuals |= start == STYLE_PHYSICAL_TOP
+                        ? S2_BORDER_COLOR_TOP
+                        : (start == STYLE_PHYSICAL_RIGHT
+                           ? S2_BORDER_COLOR_RIGHT
+                           : (start == STYLE_PHYSICAL_BOTTOM
+                              ? S2_BORDER_COLOR_BOTTOM
+                              : S2_BORDER_COLOR_LEFT));
+                }
+                if (!only_start) {
+                    style_set_border_color(
+                        sheet, style, (StyleBorderSide) end, color, alpha);
+                    visuals |= end == STYLE_PHYSICAL_TOP
+                        ? S2_BORDER_COLOR_TOP
+                        : (end == STYLE_PHYSICAL_RIGHT
+                           ? S2_BORDER_COLOR_RIGHT
+                           : (end == STYLE_PHYSICAL_BOTTOM
+                              ? S2_BORDER_COLOR_BOTTOM
+                              : S2_BORDER_COLOR_LEFT));
+                }
             } else {
                 style->border_color = color;
                 style->border_alpha = alpha;
@@ -962,6 +1026,53 @@ static unsigned border_line_style(const char *text, size_t length)
     return UINT_MAX;
 }
 
+static bool parse_border_width_value(Stylesheet *sheet, const char *text,
+                                     size_t length, int *width)
+{
+    if (span_case_equal(text, length, "thin")) { *width = 1; return true; }
+    if (span_case_equal(text, length, "medium")) { *width = 3; return true; }
+    if (span_case_equal(text, length, "thick")) { *width = 5; return true; }
+    StyleLength parsed = 0;
+    bool percent = false;
+    if (!parse_style_length(sheet, text, length, &parsed, &percent)
+        || percent || parsed < 0
+        || parsed >= STYLE_LENGTH_PERCENT_TAG) return false;
+    *width = parsed;
+    return true;
+}
+
+static bool parse_border_width_box(Stylesheet *sheet, const char *text,
+                                   size_t length, StyleEdges *edges)
+{
+    int values[4] = {0};
+    size_t count = 0;
+    size_t at = 0;
+    while (at < length && count < 4) {
+        while (at < length && isspace((unsigned char) text[at])) at++;
+        size_t end = at;
+        unsigned parentheses = 0;
+        while (end < length) {
+            if (text[end] == '(') parentheses++;
+            else if (text[end] == ')' && parentheses != 0) parentheses--;
+            if (parentheses == 0
+                && isspace((unsigned char) text[end])) break;
+            end++;
+        }
+        if (end == at
+            || !parse_border_width_value(
+                   sheet, text + at, end - at, &values[count])) return false;
+        count++;
+        at = end;
+    }
+    while (at < length && isspace((unsigned char) text[at])) at++;
+    if (count == 0 || at != length) return false;
+    edges->top = values[0];
+    edges->right = count > 1 ? values[1] : values[0];
+    edges->bottom = count > 2 ? values[2] : values[0];
+    edges->left = count > 3 ? values[3] : edges->right;
+    return true;
+}
+
 static bool style_property_border_style(const StylePropertyParse *parse)
 {
     char resolved[96];
@@ -970,8 +1081,9 @@ static bool style_property_border_style(const StylePropertyParse *parse)
                              sizeof(resolved), 0)) return true;
     unsigned values[4] = {0};
     size_t count = 0;
-    for (size_t at = 0, length = strlen(resolved);
-         at < length && count < 4;) {
+    size_t at = 0;
+    size_t length = strlen(resolved);
+    for (; at < length && count < 4;) {
         while (at < length && isspace((unsigned char) resolved[at])) at++;
         size_t end = at;
         while (end < length
@@ -982,7 +1094,8 @@ static bool style_property_border_style(const StylePropertyParse *parse)
         values[count++] = line;
         at = end;
     }
-    if (count == 0) return true;
+    while (at < length && isspace((unsigned char) resolved[at])) at++;
+    if (count == 0 || at != length) return true;
     unsigned sides[4] = {
         values[0],
         count > 1 ? values[1] : values[0],
@@ -992,6 +1105,8 @@ static bool style_property_border_style(const StylePropertyParse *parse)
     const char *name = parse->name;
     size_t name_length = parse->name_length;
     uint64_t visual_mask = 0;
+    bool shorthand = span_equal(name, name_length, "border-style");
+    if (!shorthand && count != 1) return true;
     if (span_equal(name, name_length, "border-top-style")) {
         computed_style_set_border_line(
             parse->style, STYLE_BORDER_TOP, sides[0]);
@@ -1036,10 +1151,10 @@ static bool style_property_border_width(const StylePropertyParse *parse)
             *mask |= S_BORDER_ALL;
             return true;
         }
-        uint64_t parsed_mask = style_parse_box(sheet, value, value_length,
-                                         &parsed, false);
-        style->border = parsed;
-        if (parsed_mask != 0) *mask |= S_BORDER_ALL;
+        if (parse_border_width_box(sheet, value, value_length, &parsed)) {
+            style->border = parsed;
+            *mask |= S_BORDER_ALL;
+        }
     
     return true;
 }
@@ -1076,8 +1191,10 @@ static bool style_property_border_top_width(const StylePropertyParse *parse)
             || span_case_equal(value, value_length, "revert-layer")) {
             *edge = 3;
         } else {
-            *edge = style_parse_length(
-                sheet, value, value_length, 0, NULL);
+            int parsed = 0;
+            if (!parse_border_width_value(
+                    sheet, value, value_length, &parsed)) return true;
+            *edge = parsed;
         }
         *mask |= edge_mask;
     
@@ -1091,9 +1208,13 @@ static bool style_property_border_inline_width(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            style_parse_pair(sheet, value, value_length, &style->border.left,
-                   &style->border.right);
-        *mask |= S_BORDER_LEFT | S_BORDER_RIGHT;
+        int first = 0, second = 0;
+        if (style_parse_pair(sheet, value, value_length, &first, &second)
+            && first >= 0 && second >= 0) {
+            style->border.left = first;
+            style->border.right = second;
+            *mask |= S_BORDER_LEFT | S_BORDER_RIGHT;
+        }
     
     return true;
 }
@@ -1105,9 +1226,13 @@ static bool style_property_border_block_width(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            style_parse_pair(sheet, value, value_length, &style->border.top,
-                   &style->border.bottom);
-        *mask |= S_BORDER_TOP | S_BORDER_BOTTOM;
+        int first = 0, second = 0;
+        if (style_parse_pair(sheet, value, value_length, &first, &second)
+            && first >= 0 && second >= 0) {
+            style->border.top = first;
+            style->border.bottom = second;
+            *mask |= S_BORDER_TOP | S_BORDER_BOTTOM;
+        }
     
     return true;
 }
@@ -1119,9 +1244,11 @@ static bool style_property_border_inline_start_width(const StylePropertyParse *p
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            style->border.left = style_parse_length(sheet, value, value_length,
-                                          0, NULL);
-        *mask |= S_BORDER_LEFT;
+        int parsed = 0;
+        if (parse_border_width_value(sheet, value, value_length, &parsed)) {
+            style->border.left = parsed;
+            *mask |= S_BORDER_LEFT;
+        }
     
     return true;
 }
@@ -1133,9 +1260,11 @@ static bool style_property_border_inline_end_width(const StylePropertyParse *par
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            style->border.right = style_parse_length(sheet, value, value_length,
-                                           0, NULL);
-        *mask |= S_BORDER_RIGHT;
+        int parsed = 0;
+        if (parse_border_width_value(sheet, value, value_length, &parsed)) {
+            style->border.right = parsed;
+            *mask |= S_BORDER_RIGHT;
+        }
     
     return true;
 }
@@ -1147,9 +1276,11 @@ static bool style_property_border_block_start_width(const StylePropertyParse *pa
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            style->border.top = style_parse_length(sheet, value, value_length,
-                                         0, NULL);
-        *mask |= S_BORDER_TOP;
+        int parsed = 0;
+        if (parse_border_width_value(sheet, value, value_length, &parsed)) {
+            style->border.top = parsed;
+            *mask |= S_BORDER_TOP;
+        }
     
     return true;
 }
@@ -1161,9 +1292,11 @@ static bool style_property_border_block_end_width(const StylePropertyParse *pars
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-            style->border.bottom = style_parse_length(sheet, value, value_length,
-                                            0, NULL);
-        *mask |= S_BORDER_BOTTOM;
+        int parsed = 0;
+        if (parse_border_width_value(sheet, value, value_length, &parsed)) {
+            style->border.bottom = parsed;
+            *mask |= S_BORDER_BOTTOM;
+        }
     
     return true;
 }
@@ -1175,17 +1308,60 @@ static bool style_property_gap(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-        style_parse_pair(sheet, value, value_length, &style->row_gap,
-                         &style->gap);
         bool specified =
             !span_case_equal(value, value_length, "normal")
             && !span_case_equal(value, value_length, "initial")
             && !span_case_equal(value, value_length, "unset")
             && !span_case_equal(value, value_length, "revert")
             && !span_case_equal(value, value_length, "revert-layer");
-        computed_style_set_grid_column_gap_specified(style, specified);
-        computed_style_set_grid_row_gap_specified(style, specified);
-        *mask |= S_GAP | S_ROW_GAP;
+        if (!specified) {
+            style->row_gap = 0;
+            style->gap = 0;
+            computed_style_set_grid_column_gap_specified(style, false);
+            computed_style_set_grid_row_gap_specified(style, false);
+            *mask |= S_GAP | S_ROW_GAP;
+        } else {
+            StyleLength values[2] = {0, 0};
+            bool percents[2] = {false, false};
+            size_t count = 0, at = 0;
+            while (at < value_length && count < 2u) {
+                while (at < value_length
+                       && isspace((unsigned char) value[at])) at++;
+                size_t end = at;
+                unsigned parentheses = 0;
+                while (end < value_length) {
+                    if (value[end] == '(') parentheses++;
+                    else if (value[end] == ')' && parentheses != 0)
+                        parentheses--;
+                    if (parentheses == 0
+                        && isspace((unsigned char) value[end])) break;
+                    end++;
+                }
+                if (end == at || !parse_dimension_length(
+                        sheet, value + at, end - at,
+                        &values[count], &percents[count])) break;
+                count++;
+                at = end;
+            }
+            while (at < value_length
+                   && isspace((unsigned char) value[at])) at++;
+            if (count != 0 && at == value_length
+                && values[0] >= 0
+                && values[0] < STYLE_LENGTH_PERCENT_TAG
+                && (count == 1u || (values[1] >= 0
+                    && values[1] < STYLE_LENGTH_PERCENT_TAG))) {
+                StyleLength row = values[0];
+                StyleLength column = count == 1u ? row : values[1];
+                bool row_percent = percents[0];
+                bool column_percent = count == 1u
+                    ? row_percent : percents[1];
+                style->row_gap = row_percent ? -row - 1 : row;
+                style->gap = column_percent ? -column - 1 : column;
+                computed_style_set_grid_column_gap_specified(style, true);
+                computed_style_set_grid_row_gap_specified(style, true);
+                *mask |= S_GAP | S_ROW_GAP;
+            }
+        }
     
     return true;
 }
@@ -1197,18 +1373,31 @@ static bool style_property_column_gap(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-        bool percent = false;
-        int parsed = style_parse_length(sheet, value, value_length, 0,
-                                        &percent);
-        style->gap = percent ? -parsed - 1 : parsed;
-        computed_style_set_grid_column_gap_specified(
-            style, !span_case_equal(value, value_length, "normal")
+        bool specified = !span_case_equal(value, value_length, "normal")
                    && !span_case_equal(value, value_length, "initial")
                    && !span_case_equal(value, value_length, "unset")
                    && !span_case_equal(value, value_length, "revert")
                    && !span_case_equal(
-                          value, value_length, "revert-layer"));
-        *mask |= S_GAP;
+                          value, value_length, "revert-layer");
+        if (!specified) {
+            style->gap = 0;
+            computed_style_set_grid_column_gap_specified(style, false);
+            *mask |= S_GAP;
+        } else {
+            bool percent = false;
+            StyleLength parsed = 0;
+            if (parse_dimension_length(sheet, value, value_length,
+                                       &parsed, &percent)
+                && parsed >= 0 && parsed < STYLE_LENGTH_PERCENT_TAG) {
+                /* The compact legacy gap representation stores an integral
+                   percentage as -(percent + 1). Mixed calc expressions stay
+                   tagged and are rejected instead of becoming gigapixel
+                   gaps in the integer layout paths. */
+                style->gap = percent ? -parsed - 1 : parsed;
+                computed_style_set_grid_column_gap_specified(style, true);
+                *mask |= S_GAP;
+            }
+        }
     
     return true;
 }
@@ -1220,16 +1409,27 @@ static bool style_property_row_gap(const StylePropertyParse *parse)
     size_t value_length = parse->value_length;
     ComputedStyle *style = parse->style;
     uint64_t *mask = parse->mask;
-        style->row_gap = style_parse_length(sheet, value, value_length,
-                                            0, NULL);
-        computed_style_set_grid_row_gap_specified(
-            style, !span_case_equal(value, value_length, "normal")
+        bool specified = !span_case_equal(value, value_length, "normal")
                    && !span_case_equal(value, value_length, "initial")
                    && !span_case_equal(value, value_length, "unset")
                    && !span_case_equal(value, value_length, "revert")
                    && !span_case_equal(
-                          value, value_length, "revert-layer"));
-        *mask |= S_ROW_GAP;
+                          value, value_length, "revert-layer");
+        if (!specified) {
+            style->row_gap = 0;
+            computed_style_set_grid_row_gap_specified(style, false);
+            *mask |= S_ROW_GAP;
+        } else {
+            StyleLength parsed = 0;
+            bool percent = false;
+            if (parse_dimension_length(sheet, value, value_length,
+                                       &parsed, &percent)
+                && parsed >= 0 && parsed < STYLE_LENGTH_PERCENT_TAG) {
+                style->row_gap = percent ? -parsed - 1 : parsed;
+                computed_style_set_grid_row_gap_specified(style, true);
+                *mask |= S_ROW_GAP;
+            }
+        }
     
     return true;
 }

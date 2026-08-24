@@ -57,6 +57,23 @@ static void test_redirect_cookie_overflow_policy(void)
               4095u, 4u,
               FETCH_BACKGROUND_RESPONSE_COOKIE_BYTES - 4095u)
           == FETCH_BACKGROUND_COOKIE_TRUNCATED);
+
+    CHECK(fetch_background_header_line_ignored(true, false, false));
+    CHECK(fetch_background_header_line_ignored(true, true, false));
+    CHECK(fetch_background_header_line_ignored(true, true, true));
+    CHECK(!fetch_background_header_line_ignored(false, true, false));
+    CHECK(!fetch_background_header_line_ignored(true, false, true));
+    CHECK(!fetch_background_header_block_publishable(false, 302, true));
+    CHECK(fetch_background_header_block_publishable(true, 302, true));
+    CHECK(fetch_background_header_block_publishable(false, 200, false));
+
+    CHECK(fetch_background_stream_publication_target(
+              16u * 1024u, 256u * 1024u) == 16u * 1024u);
+    CHECK(fetch_background_stream_publication_target(
+              49u * 1024u, 256u * 1024u)
+          == FETCH_BACKGROUND_STREAM_PUBLICATION_MAX);
+    CHECK(fetch_background_stream_publication_target(
+              SIZE_MAX, 32u * 1024u) == 32u * 1024u);
 }
 
 static uint64_t model_claim(

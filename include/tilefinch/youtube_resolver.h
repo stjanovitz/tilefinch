@@ -49,6 +49,7 @@ typedef struct {
     size_t player_bytes;
     uint64_t expires_unix;
     unsigned client_attempts;
+    bool live_hls;
     char client_name[YOUTUBE_CLIENT_NAME_CAPACITY];
 } YoutubeStream;
 

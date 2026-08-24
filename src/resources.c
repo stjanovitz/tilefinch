@@ -2326,12 +2326,21 @@ static bool process_stylesheet_node(
 
 static bool walk(ResourceContext *context, lxb_dom_node_t *node)
 {
-    for (; node != NULL; node = node->next) {
+    if (node == NULL) return true;
+    lxb_dom_node_t *const boundary_parent = node->parent;
+    for (;;) {
         if (!resource_work(context, 1, false)) return false;
         if (!process_stylesheet_node(context, node)) return false;
-        if (node->first_child != NULL && !walk(context, node->first_child)) return false;
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node->next == NULL) {
+            if (node->parent == boundary_parent) return true;
+            node = node->parent;
+        }
+        node = node->next;
     }
-    return true;
 }
 
 bool stylesheets_append_ordered_suffix_with_context(

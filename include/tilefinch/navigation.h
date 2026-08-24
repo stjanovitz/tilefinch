@@ -150,7 +150,7 @@ typedef struct {
     bool loaded;
     NavigationFrame frames[NAVIGATION_FRAME_LIMIT];
     size_t frame_count;
-    lxb_dom_node_t *discovered_frame_elements[NAVIGATION_FRAME_DISCOVERY_LIMIT];
+    long discovered_frame_handles[NAVIGATION_FRAME_DISCOVERY_LIMIT];
     size_t discovered_frame_element_count;
     NavigationStylesheetEventRecord stylesheet_events[
         NAVIGATION_STYLESHEET_EVENT_LIMIT];
@@ -466,6 +466,10 @@ struct NavigationSession {
     int relayout_damage_top;
     int relayout_damage_right;
     int relayout_damage_bottom;
+    /* Same-geometry canvas publication changes pixels, not layout. The
+       browser engine uses this to invalidate mutable image derivatives and
+       the affected tiles without cloning the display list. */
+    bool canvas_paint_damage_pending;
     /* A successful outline-only focus relayout gate already resolved the
        focused style. Preserve its compact paint result so the controller
        does not repeat the same bounded selector/style work before present. */
@@ -549,6 +553,8 @@ struct NavigationSession {
     long last_http_status;
     long last_transport_code;
     long last_tls_verify_result;
+    bool last_tls_verify_result_available;
+    bool last_tls_verification_failed;
     bool last_transport_timed_out;
     bool last_tls12_compatibility_retry;
     char last_tls_version[16];
@@ -867,7 +873,18 @@ bool navigation_advance_runtime(NavigationSession *session,
    lab-only compatibility experiment. A completed resource may replace the
    current layout, so owners refresh their render shell when relayout counters
    change. */
-bool navigation_run_background_resources(NavigationSession *session);
+typedef enum {
+    NAVIGATION_BACKGROUND_WORK_HARD_FAILURE = 0,
+    NAVIGATION_BACKGROUND_WORK_SUCCESS = 1,
+    NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL = 2
+} NavigationBackgroundWorkOutcome;
+NavigationBackgroundWorkOutcome navigation_run_background_resources(
+    NavigationSession *session);
+#if !defined(__PSP__)
+/* Deterministic host-only fault seam for the transactional optional-font
+   relayout boundary. */
+void navigation_test_refuse_next_background_font_relayout(void);
+#endif
 /* Pump exactly one deferred document-image continuation unit without also
    advancing webfonts, scripts, or other idle work. Frontends may use this
    after presenting an input frame so continuous focus/scroll activity cannot

@@ -111,7 +111,8 @@ static bool loop_render(BrowserEngine *engine, TileCache *cache,
     }
     uint64_t present_finished = interaction_now_us();
     bool ok = host_platform_simulator != NULL || path == NULL
-        || render_write_frame_ppm(path, cache->frame, 480, 272);
+        || render_write_frame_ppm(
+            path, cache->frame, cache->frame_pixels, 480, 272);
     if (timing != NULL) {
         *timing = (InteractionPaintTiming) {
             .raster_us = cache->raster_us - raster_before,
@@ -992,9 +993,15 @@ static bool experimental_resume_history(
     if (!(forward ? navigation_forward(navigation, &moved)
                   : navigation_back(navigation, &moved))) return false;
     *handled = true;
-    return experimental_rebuild_document(
+    bool rebuilt = experimental_rebuild_document(
         experimental, navigation, controller, selected, restore_scroll,
         target_url, user_css, "resume");
+    if (!rebuilt) {
+        const NavigationEntry *ignored = NULL;
+        (void) (forward ? navigation_back(navigation, &ignored)
+                        : navigation_forward(navigation, &ignored));
+    }
+    return rebuilt;
 }
 
 static bool loop_history(BrowserEngine *engine,

@@ -968,6 +968,24 @@ static bool range_fill_install_into(
     bool result_ready = true;
 
     if (range->fill_streaming) {
+        /* Completion belongs to the transfer, not necessarily to the
+           browser-side chunk queue. Drain every already-published terminal
+           chunk before consuming the result, otherwise the consumed-byte
+           count can reject a valid response or install a short final window.
+           The body and publication quantum bound the loop. */
+        if (range_uses_background(range)) {
+            size_t quantum = range->stream_publication_bytes == 0
+                ? 1u : range->stream_publication_bytes;
+            size_t limit = wanted / quantum + 2u;
+            for (size_t pass = 0;
+                 pass < limit && range->fill_streamed_bytes < wanted;
+                 pass++) {
+                size_t before = range->fill_streamed_bytes;
+                range_stream_drain_background(range);
+                if (range->fill_streamed_bytes == before) break;
+            }
+            if (range->fill_streamed_bytes != wanted) return false;
+        }
         if (range_uses_background(range)) {
             range_take_background_stream(
                 range, id, aligned, wanted, &taken);

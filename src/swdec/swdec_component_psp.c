@@ -46,6 +46,18 @@ static int component_me_failed(void)
     return swdec_me_failed;
 }
 
+static int component_csc_picture(
+    int slot, void *rgb565, int stride_pixels, size_t capacity_bytes,
+    const TilefinchSwdecPicture *picture)
+{
+    if (picture == NULL) return 0;
+    return swdec_me_csc_picture(
+        slot, rgb565, stride_pixels, capacity_bytes,
+        picture->plane[0], picture->plane[1], picture->plane[2],
+        picture->stride[0], picture->stride[1],
+        picture->width, picture->height);
+}
+
 static int component_audio_setup(void)
 {
     return swdec_me_audio_setup(NULL);
@@ -92,6 +104,7 @@ int main(int argument_size, char *argument_data[])
         .audio_reset = swdec_me_audio_reset,
         .audio_shutdown = swdec_me_audio_shutdown,
         .csc_begin = swdec_me_csc_begin,
+        .csc_picture = component_csc_picture,
         .csc_close = swdec_me_csc_close,
         .csc_off = swdec_me_csc_off
     };

@@ -45,6 +45,7 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/budget_quickjs.h"
 #include "tilefinch/cancellation.h"
+#include "tilefinch/captive_portal.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/install_paths.h"
@@ -196,6 +197,9 @@ void psp_reader_navigation_finish(
 bool psp_retry_navigation_action_after_reclaim(
     BrowserEngine *engine, const ControllerAction *action,
     size_t maximum_bytes, long timeout_ms);
+bool psp_retry_navigation_url_after_reclaim(
+    BrowserEngine *engine, const char *url, size_t maximum_bytes,
+    long timeout_ms, bool record_history);
 void psp_report_job_failure(
     const char *kind, const char *checkpoint, int status, long http_status,
     const char *error);
@@ -380,6 +384,7 @@ bool psp_request_provisional_scroll(
 void psp_background_ui_tick(void);
 const char *psp_user_visible_error(
     const char *detail, long tls_verify_result,
+    bool tls_verify_result_available, bool tls_verification_failed,
     TilefinchTlsGuidance *tls_guidance,
     char *summary, size_t summary_size);
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
@@ -608,6 +613,9 @@ typedef struct {
     /* Offline rows carry a library id; bookmark and history rows are read
        back by their position, which is what the accessors take. */
     uint32_t id[PSP_UI_COLLECTIONS_ROW_LIMIT];
+    /* Only the bounded download section needs synthesized status strings;
+       every other row continues borrowing profile/library storage. */
+    char download_detail[OFFLINE_LIBRARY_ITEM_LIMIT][96];
 } PspCollectionsSurface;
 
 /* Process presentation exists independently of a loaded page. The browser
@@ -815,6 +823,8 @@ typedef struct {
     bool cache_restore_cancelled_unread;
 } PspSiteDataRestore;
 
+typedef struct PspCaptivePortal PspCaptivePortal;
+
 /* Persistent state owned by one interactive-loop invocation. These are
    operation records and counters, not parallel media/network control state. */
 typedef struct {
@@ -825,7 +835,9 @@ typedef struct {
     PspExitPlan exit;
     PspSiteDataRestore site_data_restore;
     PspReaderNavigation reader_navigation;
+    PspCaptivePortal *captive_portal;
     bool lifecycle_retry_available;
+    uint8_t captive_portal_failure_count;
     char lifecycle_retry_url[NAVIGATION_URL_LIMIT];
     /* Callback-supervisor input waiting for the browser thread to regain a
        usable media pipeline. This is an input mailbox, not lifecycle state. */
@@ -878,6 +890,7 @@ const char *psp_home_target_url(
 void psp_collections_sync_ui(
     PspUiState *ui, PspCollectionsSurface *surface,
     const BrowserProfile *profile, const OfflineLibrary *library,
+    const OfflineDownloadManager *downloads,
     PspUiCollectionSection section);
 const char *psp_collections_row_url(
     const PspCollectionsSurface *surface, size_t row);
@@ -917,6 +930,19 @@ typedef struct {
     bool page_dirty;
     bool pointer_activation;
 } PspAppFrameState;
+
+/* src/psp_app/psp_app_captive_portal.c. One user-triggered probe and one
+   ephemeral sign-in tab; no background connectivity polling. */
+bool psp_captive_portal_start(PspApp *app, PspAppFrameState *frame);
+void psp_captive_portal_pump(PspApp *app, PspAppFrameState *frame);
+bool psp_app_background_handle_frame(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent,
+    uint64_t now_us);
+void psp_captive_portal_navigation_settled(
+    PspApp *app, PspAppFrameState *frame, bool succeeded, bool cancelled);
+bool psp_captive_portal_cancel(PspApp *app, PspAppFrameState *frame);
+void psp_captive_portal_destroy(PspApp *app);
+bool psp_captive_portal_active(const PspInteractiveState *interactive);
 
 /* src/psp_app/psp_app_youtube.c */
 void psp_app_youtube_preresolve_tick(

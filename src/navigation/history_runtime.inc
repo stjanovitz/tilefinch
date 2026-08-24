@@ -555,6 +555,49 @@ static size_t navigation_mutation_image_refresh_nodes(
     return count;
 }
 
+static bool navigation_mutations_are_canvas_paint_only(
+    NavigationSession *session, const ScriptMutationJournal *mutations)
+{
+    if (session == NULL || mutations == NULL || mutations->count == 0
+        || mutations->overflowed) return false;
+    int left = 0, top = 0, right = 0, bottom = 0;
+    for (size_t i = 0; i < mutations->count; i++) {
+        const ScriptMutationRecord *record = &mutations->records[i];
+        if (record->kind != SCRIPT_MUTATION_CANVAS
+            || strcmp(record->attribute, "paint") != 0
+            || record->node == NULL) return false;
+        const ImageResource *image = images_find_node(
+            &session->page.images, record->node);
+        const LayoutNodeBox *box = layout_box_for_node(
+            &session->page.layout, record->node);
+        if (image == NULL || !image->is_canvas || box == NULL
+            || box->width <= 0 || box->height <= 0) return false;
+        int box_right = box->x > INT_MAX - box->width
+            ? INT_MAX : box->x + box->width;
+        int box_bottom = box->y > INT_MAX - box->height
+            ? INT_MAX : box->y + box->height;
+        if (right <= left || bottom <= top) {
+            left = box->x;
+            top = box->y;
+            right = box_right;
+            bottom = box_bottom;
+        } else {
+            if (box->x < left) left = box->x;
+            if (box->y < top) top = box->y;
+            if (box_right > right) right = box_right;
+            if (box_bottom > bottom) bottom = box_bottom;
+        }
+    }
+    session->relayout_damage_valid = right > left && bottom > top;
+    session->relayout_damage_left = left;
+    session->relayout_damage_top = top;
+    session->relayout_damage_right = right;
+    session->relayout_damage_bottom = bottom;
+    session->canvas_paint_damage_pending = true;
+    session->incremental_relayouts++;
+    return true;
+}
+
 bool navigation_relayout(NavigationSession *session)
 {
     if (session == NULL || !session->page.loaded) return false;
@@ -566,6 +609,22 @@ bool navigation_relayout(NavigationSession *session)
     bool mutation_driven = session->page.runtime != NULL
         && script_runtime_consume_mutations(session->page.runtime,
                                             &mutations);
+    if (mutation_driven) {
+        for (size_t i = 0; i < mutations.count; i++) {
+            if (mutations.records[i].kind == SCRIPT_MUTATION_CANVAS) {
+                /* Canvas snapshots are always page-owned. Ordinary browser
+                   loads already use this table; this also makes standalone
+                   local fixtures adopt the same path after their first
+                   canvas publication. */
+                session->images = &session->page.images;
+                break;
+            }
+        }
+    }
+    if (mutation_driven
+        && navigation_mutations_are_canvas_paint_only(
+            session, &mutations)) return true;
+    session->canvas_paint_damage_pending = false;
     bool conservative_scan = !mutation_driven
         || mutations.conservative_resource_scan;
     bool full_rebuild = session->style_rebuild_required
@@ -1326,9 +1385,22 @@ bool navigation_run_deferred_image_work(NavigationSession *session)
     return navigation_run_deferred_image(session);
 }
 
-bool navigation_run_background_resources(NavigationSession *session)
+#if !defined(__PSP__)
+static bool navigation_refuse_background_font_relayout_once;
+
+void navigation_test_refuse_next_background_font_relayout(void)
 {
-    if (session == NULL || !session->page.loaded) return false;
+    navigation_refuse_background_font_relayout_once = true;
+}
+#endif
+
+NavigationBackgroundWorkOutcome navigation_run_background_resources(
+    NavigationSession *session)
+{
+    if (session == NULL || !session->page.loaded)
+        return NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
+    NavigationBackgroundWorkOutcome outcome =
+        NAVIGATION_BACKGROUND_WORK_SUCCESS;
     if (fonts_external_loader_pending(
             &session->page.external_font_loader)) {
         bool face_loaded = false;
@@ -1379,7 +1451,16 @@ bool navigation_run_background_resources(NavigationSession *session)
             layout_reuse_cache_destroy(session->page.layout_reuse);
             session->page.layout_reuse = NULL;
             session->performance.layout_reuse_retained_bytes = 0;
-            if (!navigation_relayout(session)) {
+            bool relaid_out = false;
+#if !defined(__PSP__)
+            if (navigation_refuse_background_font_relayout_once) {
+                navigation_refuse_background_font_relayout_once = false;
+            } else
+#endif
+            {
+                relaid_out = navigation_relayout(session);
+            }
+            if (!relaid_out) {
                 fonts_external_loader_cancel(
                     &session->page.external_font_loader,
                     session->page.resource_scheduler,
@@ -1387,17 +1468,19 @@ bool navigation_run_background_resources(NavigationSession *session)
                 session->performance.background_font_failures++;
                 /* The fast relayout path constructs a replacement before
                    retiring the current display list. Preserve that valid
-                   committed page and leave image continuation observable;
-                   the caller may report this failed font slice and pump the
-                   remaining background work on the next tick. */
-                return false;
+                   committed page, classify the optional face as refused,
+                   and continue image/tile idle work without manufacturing a
+                   page-network error. */
+                outcome = NAVIGATION_BACKGROUND_WORK_SOFT_REFUSAL;
+            } else {
+                session->performance.background_font_relayouts++;
             }
-            session->performance.background_font_relayouts++;
         }
     }
-    if (!session->page.image_continuation_pending) return true;
+    if (!session->page.image_continuation_pending) return outcome;
     if (session->page.deferred_image_targets != NULL) {
-        return navigation_run_deferred_image(session);
+        return navigation_run_deferred_image(session)
+            ? outcome : NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
     }
     ImageResources *images = &session->page.images;
     size_t loaded_before = images->stats.loaded;
@@ -1422,7 +1505,7 @@ bool navigation_run_background_resources(NavigationSession *session)
            an already usable page. */
         session->images = images;
         layout_reuse_cache_update_images(session->page.layout_reuse, images);
-        return true;
+        return outcome;
     }
     session->images = images;
     layout_reuse_cache_update_images(session->page.layout_reuse, images);
@@ -1439,7 +1522,7 @@ bool navigation_run_background_resources(NavigationSession *session)
             session->page.image_continuation_pending = false;
             session->performance.background_image_failures++;
             session->page.loaded = false;
-            return false;
+            return NAVIGATION_BACKGROUND_WORK_HARD_FAILURE;
         }
         session->performance.background_image_relayouts++;
     }
@@ -1448,7 +1531,7 @@ bool navigation_run_background_resources(NavigationSession *session)
        change semantics because corrupt early resources are intentionally not
        retained in the successful-image table and could consume quota again. */
     session->page.image_continuation_pending = false;
-    return true;
+    return outcome;
 }
 
 static void navigation_accumulate_script_metrics(

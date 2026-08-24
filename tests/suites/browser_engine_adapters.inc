@@ -755,7 +755,7 @@ static int test_reader_presentation_adapter(void)
           && strcmp(adapter, "reader-content-shape") == 0
           && strstr(css, "font-size:125%") != NULL
           && strstr(css, "font-family:serif") != NULL
-          && strstr(css, "data-tilefinch-reader-entry") != NULL
+          && strstr(css, "data-tilefinch-reader-root") != NULL
           && strlen(css) < SITE_ADAPTER_READER_CSS_LIMIT
           && site_adapter_reader_css(
               "https://news.example.test/article",
@@ -836,6 +836,84 @@ static int test_reader_presentation_adapter(void)
         }
     }
     CHECK(restored_hidden_link);
+
+    /* A media page with a related rail makes its primary root both the
+       preserved article and an ancestor of the listing. Path pruning must
+       never hide the player inside that preserved root. */
+    static const char media_html[] =
+        "<!doctype html><head><meta property=og:type content=video.other>"
+        "<script type=application/ld+json>{\"@type\":\"VideoObject\","
+        "\"contentUrl\":\"/primary.mp4\"}</script></head><body>"
+        "<main><div><video controls poster=/poster.png></video></div>"
+        "<h1>Primary media</h1><section>"
+        "<article><a href=/video-0><img src=/0.png alt=Zero></a><span>1:20 10 views</span></article>"
+        "<article><a href=/video-1><img src=/1.png alt=One></a><span>1:21 10 views</span></article>"
+        "<article><a href=/video-2><img src=/2.png alt=Two></a><span>1:22 10 views</span></article>"
+        "<article><a href=/video-3><img src=/3.png alt=Three></a><span>1:23 10 views</span></article>"
+        "<article><a href=/video-4><img src=/4.png alt=Four></a><span>1:24 10 views</span></article>"
+        "<article><a href=/video-5><img src=/5.png alt=Five></a><span>1:25 10 views</span></article>"
+        "<article><a href=/video-6><img src=/6.png alt=Six></a><span>1:26 10 views</span></article>"
+        "<article><a href=/video-7><img src=/7.png alt=Seven></a><span>1:27 10 views</span></article>"
+        "</section></main></body>";
+    browser_engine_set_reader_candidate_mode(engine, true);
+    CHECK(browser_engine_set_user_css(engine, css, strlen(css))
+          && browser_engine_commit_html(
+                 engine, "https://media.example.test/watch", media_html,
+                 sizeof(media_html) - 1u, true));
+    ReaderDocumentAnalysis media_reader = {0};
+    CHECK(browser_engine_reader_analysis(engine, &media_reader)
+          && media_reader.kind == READER_PAGE_WATCH
+          && media_reader.listing_entries == 8u);
+    lxb_dom_node_t *media_node = NULL;
+    for (size_t index = 0;
+         index < browser_engine_navigation(engine)->page.layout.control_count;
+         index++) {
+        lxb_dom_node_t *node = browser_engine_navigation(
+            engine)->page.layout.controls[index].node;
+        size_t name_length = 0;
+        const char *name = document_element_name(node, &name_length);
+        if (name != NULL && name_length == 5u
+            && memcmp(name, "video", 5u) == 0) {
+            media_node = node;
+            break;
+        }
+    }
+    ControllerAction media_action = {0};
+    CHECK(media_node != NULL
+          && browser_engine_focus_node(engine, media_node)
+          && browser_engine_activate(engine, &media_action)
+          && media_action.type == CONTROLLER_ACTION_MEDIA
+          && !media_action.media_audio_only
+          && strcmp(media_action.url,
+                    "https://media.example.test/primary.mp4") == 0);
+
+    static const char audio_html[] =
+        "<!doctype html><head><script type=application/ld+json>"
+        "{\"@type\":\"MusicRecording\",\"name\":\"Field notes\","
+        "\"audio\":{\"@type\":\"AudioObject\","
+        "\"contentUrl\":\"/episode.m4a\"}}</script></head><body>"
+        "<main><h1>Field notes</h1>"
+        "<button aria-label='Play Field notes'>Play episode</button>"
+        "<p>Episode notes remain readable.</p></main></body>";
+    browser_engine_set_reader_candidate_mode(engine, true);
+    CHECK(browser_engine_set_user_css(engine, css, strlen(css))
+          && browser_engine_commit_html(
+                 engine, "https://media.example.test/episode", audio_html,
+                 sizeof(audio_html) - 1u, true));
+    ReaderDocumentAnalysis audio_reader = {0};
+    CHECK(browser_engine_reader_analysis(engine, &audio_reader)
+          && audio_reader.kind == READER_PAGE_RAW
+          && browser_engine_navigation(engine)->page.layout.control_count
+                 == 1u);
+    lxb_dom_node_t *audio_button = browser_engine_navigation(
+        engine)->page.layout.controls[0].node;
+    ControllerAction audio_action = {0};
+    CHECK(browser_engine_focus_node(engine, audio_button)
+          && browser_engine_activate(engine, &audio_action)
+          && audio_action.type == CONTROLLER_ACTION_MEDIA
+          && audio_action.media_audio_only
+          && strcmp(audio_action.url,
+                    "https://media.example.test/episode.m4a") == 0);
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
     return 0;

@@ -39,6 +39,8 @@
 #define DOCUMENT_CONTROL_STATE_LIMIT 128u
 #define DOCUMENT_CONTROL_VALUE_LIMIT 512u
 #define DOCUMENT_CONTROL_STATE_MAGIC UINT32_C(0x4354524c)
+#define DOCUMENT_BODY_SNAPSHOT_LIMIT (256u * 1024u)
+#define DOCUMENT_BODY_SNAPSHOT_CAPACITY (DOCUMENT_BODY_SNAPSHOT_LIMIT + 1u)
 
 static const char document_cssom_style_marker;
 
@@ -225,12 +227,14 @@ typedef struct {
     size_t attribute_value_bytes;
     size_t body_bytes;
     size_t body_text_nodes;
-    uint8_t glyph_script_mask;
+    uint16_t glyph_script_mask;
+    bool bidi_text_present;
+    bool bidi_markup_present;
     bool pointer_event_attributes_present;
     bool autofocus_attribute_present;
 } DocumentStats;
 
-static uint8_t document_codepoint_glyph_script(unsigned codepoint)
+static uint16_t document_codepoint_glyph_script(unsigned codepoint)
 {
     if ((codepoint >= 0x3400u && codepoint <= 0x4dbfu)
         || (codepoint >= 0x4e00u && codepoint <= 0x9fffu)
@@ -264,6 +268,15 @@ static uint8_t document_codepoint_glyph_script(unsigned codepoint)
         || (codepoint >= 0xab30u && codepoint <= 0xab6fu)) {
         return DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED;
     }
+    if ((codepoint >= 0x0590u && codepoint <= 0x05ffu)
+        || (codepoint >= 0xfb1du && codepoint <= 0xfb4fu)) {
+        return DOCUMENT_GLYPH_SCRIPT_HEBREW;
+    }
+    if ((codepoint >= 0x0600u && codepoint <= 0x08ffu)
+        || (codepoint >= 0xfb50u && codepoint <= 0xfdffu)
+        || (codepoint >= 0xfe70u && codepoint <= 0xfeffu)) {
+        return DOCUMENT_GLYPH_SCRIPT_ARABIC;
+    }
     return 0;
 }
 
@@ -271,12 +284,15 @@ static void document_note_glyph_scripts(DocumentStats *stats,
                                         const char *text, size_t length)
 {
     if (stats == NULL || text == NULL || length == 0) return;
-    const uint8_t all = DOCUMENT_GLYPH_SCRIPT_HAN
+    const uint16_t all = DOCUMENT_GLYPH_SCRIPT_HAN
         | DOCUMENT_GLYPH_SCRIPT_JAPANESE | DOCUMENT_GLYPH_SCRIPT_KOREAN
         | DOCUMENT_GLYPH_SCRIPT_CYRILLIC
-        | DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED;
+        | DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED
+        | DOCUMENT_GLYPH_SCRIPT_ARABIC | DOCUMENT_GLYPH_SCRIPT_HEBREW;
     size_t at = 0;
-    while (at < length && stats->glyph_script_mask != all) {
+    while (at < length
+           && (stats->glyph_script_mask != all
+               || !stats->bidi_text_present)) {
         /* Most top-site text is ASCII. Skip it without calling the UTF-8
            decoder; this pass runs only once in the parser's existing visible
            text/statistics walk. */
@@ -287,6 +303,16 @@ static void document_note_glyph_scripts(DocumentStats *stats,
         if (used == 0) {
             at++;
             continue;
+        }
+        if ((codepoint >= 0x0590u && codepoint <= 0x08ffu)
+            || (codepoint >= 0xfb1du && codepoint <= 0xfdffu)
+            || (codepoint >= 0xfe70u && codepoint <= 0xfeffu)
+            || (codepoint >= 0x10800u && codepoint <= 0x10fffu)
+            || (codepoint >= 0x1e800u && codepoint <= 0x1eeffu)
+            || codepoint == 0x200eu || codepoint == 0x200fu
+            || (codepoint >= 0x202au && codepoint <= 0x202eu)
+            || (codepoint >= 0x2066u && codepoint <= 0x2069u)) {
+            stats->bidi_text_present = true;
         }
         stats->glyph_script_mask |=
             document_codepoint_glyph_script(codepoint);
@@ -348,6 +374,10 @@ static bool gather_stats(lxb_dom_node_t *node, bool in_body, bool hidden,
                 if (attribute_name != NULL && name_length == 9u
                     && memcmp(attribute_name, "autofocus", 9u) == 0) {
                     stats->autofocus_attribute_present = true;
+                }
+                if (attribute_name != NULL && name_length == 3u
+                    && memcmp(attribute_name, "dir", 3u) == 0) {
+                    stats->bidi_markup_present = true;
                 }
                 if (!document_stats_add(&stats->attributes, 1)
                     || (attr->value != NULL
@@ -684,6 +714,8 @@ bool document_refresh(PocDocument *document)
     document->body_text_node_count = stats.body_text_nodes;
     document->body_text_length = 0;
     document->glyph_script_mask = stats.glyph_script_mask;
+    document->bidi_text_present = stats.bidi_text_present;
+    document->bidi_markup_present = stats.bidi_markup_present;
     document->pointer_event_attributes_present =
         stats.pointer_event_attributes_present;
     document->autofocus_attribute_present =
@@ -1531,6 +1563,139 @@ bool document_set_element_inner_html(PocDocument *document,
         lxb_html_parser_destroy(fragment_parser);
     }
     return updated;
+}
+
+typedef struct {
+    DocumentBodySnapshot *snapshot;
+    bool failed;
+} DocumentBodySnapshotWriter;
+
+static size_t document_snapshot_visible_text_bytes(lxb_dom_node_t *root)
+{
+    size_t visible = 0;
+    bool previous_space = true;
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 4096u; visited++) {
+        bool skip = node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && (document_name_is(node, "script")
+                || document_name_is(node, "style")
+                || document_name_is(node, "template")
+                || document_name_is(node, "svg")
+                || document_name_is(node, "noscript"));
+        if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t length = 0;
+            const char *text = document_text_data(node, &length);
+            for (size_t at = 0; text != NULL && at < length; at++) {
+                bool space = isspace((unsigned char) text[at]) != 0;
+                if (!space || !previous_space) {
+                    if (visible != SIZE_MAX) visible++;
+                }
+                previous_space = space;
+            }
+        }
+        node = document_bounded_next(node, root, skip);
+    }
+    return visible;
+}
+
+static lxb_status_t document_body_snapshot_receive(
+    const lxb_char_t *data, size_t length, void *opaque)
+{
+    DocumentBodySnapshotWriter *writer = opaque;
+    DocumentBodySnapshot *snapshot = writer == NULL ? NULL : writer->snapshot;
+    if (snapshot == NULL || snapshot->budget == NULL || writer->failed
+        || snapshot->length > DOCUMENT_BODY_SNAPSHOT_LIMIT
+        || length > DOCUMENT_BODY_SNAPSHOT_LIMIT - snapshot->length) {
+        if (writer != NULL) writer->failed = true;
+        return LXB_STATUS_ERROR;
+    }
+    size_t needed = snapshot->length + length + 1u;
+    if (needed > snapshot->capacity) {
+        size_t capacity = snapshot->capacity == 0 ? 4096u
+            : snapshot->capacity;
+        while (capacity < needed) {
+            if (capacity >= DOCUMENT_BODY_SNAPSHOT_LIMIT / 2u) {
+                /* The serialized payload may occupy the entire public bound.
+                   Keep one separately-accounted byte for its terminator. */
+                capacity = DOCUMENT_BODY_SNAPSHOT_CAPACITY;
+                break;
+            }
+            capacity *= 2u;
+        }
+        char *resized = budget_realloc(
+            snapshot->budget, snapshot->markup, capacity);
+        if (resized == NULL) {
+            writer->failed = true;
+            return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+        }
+        snapshot->markup = resized;
+        snapshot->capacity = capacity;
+    }
+    memcpy(snapshot->markup + snapshot->length, data, length);
+    snapshot->length += length;
+    snapshot->markup[snapshot->length] = '\0';
+    return LXB_STATUS_OK;
+}
+
+bool document_body_snapshot_capture(PocDocument *document,
+                                    DocumentBodySnapshot *snapshot)
+{
+    if (snapshot == NULL) return false;
+    *snapshot = (DocumentBodySnapshot) {0};
+    lxb_dom_node_t *body = document_body_node(document);
+    size_t visible_text = document_snapshot_visible_text_bytes(body);
+    if (document == NULL || document->budget == NULL || body == NULL
+        || visible_text < 128u) return false;
+    snapshot->budget = document->budget;
+    snapshot->source_text_bytes = visible_text;
+    DocumentBodySnapshotWriter writer = {.snapshot = snapshot};
+    for (lxb_dom_node_t *child = body->first_child;
+         child != NULL && !writer.failed; child = child->next) {
+        if (lxb_html_serialize_tree_cb(
+                child, document_body_snapshot_receive, &writer)
+            != LXB_STATUS_OK) writer.failed = true;
+    }
+    if (writer.failed || snapshot->length == 0) {
+        document_body_snapshot_destroy(snapshot);
+        return false;
+    }
+    return true;
+}
+
+bool document_body_snapshot_restore_if_degraded(
+    PocDocument *document, const DocumentBodySnapshot *snapshot,
+    DocumentBodySnapshotReplaceCallback replace, void *replace_opaque)
+{
+    if (document == NULL || snapshot == NULL || snapshot->markup == NULL
+        || snapshot->length == 0 || snapshot->source_text_bytes < 128u
+        || !document_refresh(document)) return false;
+    size_t retained = document_snapshot_visible_text_bytes(
+        document_body_node(document));
+    if (retained >= snapshot->source_text_bytes / 3u) return false;
+    lxb_dom_node_t *body = document_body_node(document);
+    if (body == NULL) return false;
+    bool restored = false;
+    if (replace != NULL) {
+        restored = replace(
+            replace_opaque, document, snapshot->markup, snapshot->length);
+    } else {
+        /* Without a live JavaScript realm there are no external DOM handles,
+           but engine-owned form state still points into the old subtree. */
+        restored = document_control_state_discard_subtree(document, body)
+            && document_set_element_inner_html(
+                   document, body, snapshot->markup, snapshot->length);
+    }
+    if (!restored || !document_refresh(document)) return false;
+    if (replace == NULL) document_note_connected_mutation(document);
+    return true;
+}
+
+void document_body_snapshot_destroy(DocumentBodySnapshot *snapshot)
+{
+    if (snapshot == NULL) return;
+    if (snapshot->budget != NULL && snapshot->markup != NULL)
+        budget_free(snapshot->budget, snapshot->markup);
+    *snapshot = (DocumentBodySnapshot) {0};
 }
 
 const char *document_body_text(PocDocument *document)

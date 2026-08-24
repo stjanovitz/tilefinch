@@ -15,13 +15,262 @@ static void script_frontier_probe(void *opaque, size_t script_index,
     probe->active_calls++;
 }
 
+static bool test_canvas_surface_survives_and_updates_without_relayout(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body{margin:0}canvas{display:block}</style>"
+        "<canvas id=chart width=4 height=2></canvas><script>"
+        "const c=document.getElementById('chart').getContext('2d');"
+        "c.fillStyle='#ff0000';c.fillRect(0,0,4,2);"
+        "setTimeout(()=>{c.fillStyle='#0000ff';c.fillRect(2,0,2,2)},1)"
+        "</script>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://canvas.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    const ImageResource *canvas = NULL;
+    bool painted = false;
+    if (committed) {
+        for (size_t i = 0; i < navigation.page.images.count; i++) {
+            if (navigation.page.images.items[i].is_canvas) {
+                canvas = &navigation.page.images.items[i];
+                break;
+            }
+        }
+        for (size_t i = 0; i < navigation.page.layout.count; i++) {
+            if (navigation.page.layout.commands[i].type == DRAW_IMAGE
+                && navigation.page.layout.commands[i].image == canvas) {
+                painted = true;
+                break;
+            }
+        }
+    }
+    bool initial = canvas != NULL && canvas->width == 4 && canvas->height == 2
+        && canvas->pixels != NULL
+        && canvas->pixels[0] == 255 && canvas->pixels[1] == 0
+        && canvas->pixels[2] == 0 && canvas->pixels[3] == 255
+        && canvas->pixels[8] == 255 && canvas->pixels[10] == 0;
+    size_t relayouts = navigation.incremental_relayouts;
+    bool advanced = initial && painted
+        && navigation_advance_runtime(&navigation, 2, 4);
+    canvas = navigation.page.images.count != 0
+        ? &navigation.page.images.items[0] : NULL;
+    bool updated = advanced && canvas != NULL && canvas->is_canvas
+        && canvas->pixels[0] == 255 && canvas->pixels[2] == 0
+        && canvas->pixels[8] == 0 && canvas->pixels[10] == 255
+        && navigation.incremental_relayouts == relayouts + 1u
+        && navigation.canvas_paint_damage_pending;
+    bool ok = committed && initial && painted && updated;
+    if (!ok) {
+        fprintf(stderr,
+                "canvas bridge ready=%d committed=%d images=%zu painted=%d "
+                "initial=%d advanced=%d updated=%d relayouts=%zu/%zu "
+                "error=\"%s\"\n",
+                ready, committed, navigation.page.images.count, painted,
+                initial, advanced, updated, relayouts,
+                navigation.incremental_relayouts, navigation.last_error);
+    }
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_canvas_surface_count_is_bounded(void)
+{
+    static const char html[] =
+        "<!doctype html><body>"
+        "<canvas></canvas><canvas></canvas><canvas></canvas>"
+        "<canvas></canvas><canvas></canvas><script>"
+        "for(const canvas of document.querySelectorAll('canvas')){"
+        "canvas.width=8;canvas.height=8;"
+        "const context=canvas.getContext('2d');"
+        "context.fillStyle='#123456';context.fillRect(0,0,8,8)}"
+        "</script></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        /* This exercises the surface-count policy, not the minimum viable JS
+           heap. Leave bounded headroom for the lazily installed Canvas API;
+           backing arrays are still charged to the 16 MiB page budget. */
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://canvas.test/quota", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    size_t canvas_count = 0;
+    for (size_t i = 0; committed && i < navigation.page.images.count; i++) {
+        if (navigation.page.images.items[i].is_canvas) canvas_count++;
+    }
+    bool ok = committed && navigation.page.images.count == 4u
+        && canvas_count == 4u
+        && navigation.page.images.stats.decoded_bytes == 4u * 8u * 8u * 4u;
+    if (!ok) {
+        fprintf(stderr,
+                "canvas quota ready=%d committed=%d images=%zu canvases=%zu "
+                "bytes=%zu error=\"%s\"\n",
+                ready, committed, navigation.page.images.count, canvas_count,
+                navigation.page.images.stats.decoded_bytes,
+                navigation.last_error);
+    }
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_canvas_draw_image_accepts_loaded_html_image(void)
+{
+    static const char html[] =
+        "<!doctype html><body><img id=source width=1 height=1 "
+        "src='data:image/webp;base64,"
+        "UklGRh4AAABXRUJQVlA4TBEAAAAvAUAAAAfQssI0uf+BiOh/AAA='>"
+        "<canvas id=target width=1 height=1></canvas>"
+        "<script>setInterval(()=>{},1000)</script></body>";
+    static const char probe[] =
+        "(()=>{const canvas=document.getElementById('target'),"
+        "context=canvas.getContext('2d');"
+        "context.drawImage(document.getElementById('source'),0,0);"
+        "const pixel=context.getImageData(0,0,1,1).data;"
+        "globalThis.pocSummary=pixel[3]===255?'canvas-image:ok':"
+        "'canvas-image:fail:'+Array.from(pixel).join(',')})()";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://canvas.test/image", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    ScriptResult result = {0};
+    bool evaluated = committed && navigation.page.runtime != NULL
+        && script_runtime_evaluate_diagnostic(
+            navigation.page.runtime, probe, "<canvas-image>", &result);
+    bool relaid = evaluated && navigation_relayout(&navigation);
+    lxb_dom_node_t *target = committed ? test_find_id(
+        lxb_dom_interface_node(navigation.page.document.html), "target")
+        : NULL;
+    const ImageResource *canvas = target == NULL ? NULL
+        : images_find_node(&navigation.page.images, target);
+    bool ok = evaluated && relaid
+        && strcmp(result.summary, "canvas-image:ok") == 0
+        && canvas != NULL && canvas->is_canvas && canvas->pixels != NULL
+        && canvas->pixels[3] == 255;
+    if (!ok) {
+        fprintf(stderr,
+                "canvas image ready=%d committed=%d runtime=%d eval=%d "
+                "relayout=%d summary=\"%s\" error=\"%s\" images=%zu\n",
+                ready, committed, navigation.page.runtime != NULL,
+                evaluated, relaid, result.summary, result.error,
+                navigation.page.images.count);
+    }
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_detached_canvas_publishes_when_inserted(void)
+{
+    static const char html[] =
+        "<!doctype html><body><script>"
+        "const canvas=document.createElement('canvas');"
+        "canvas.id='late-canvas';canvas.width=3;canvas.height=2;"
+        "const context=canvas.getContext('2d');"
+        "context.fillStyle='#abcdef';context.fillRect(0,0,3,2);"
+        "setTimeout(()=>document.body.appendChild(canvas),1)"
+        "</script></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://canvas.test/detached", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool initially_absent = committed && navigation.page.images.count == 0;
+    bool advanced = initially_absent
+        && navigation_advance_runtime(&navigation, 2, 8);
+    lxb_dom_node_t *canvas_node = advanced ? test_find_id(
+        lxb_dom_interface_node(navigation.page.document.html), "late-canvas")
+        : NULL;
+    const ImageResource *canvas = canvas_node == NULL ? NULL
+        : images_find_node(&navigation.page.images, canvas_node);
+    bool ok = advanced && canvas != NULL && canvas->is_canvas
+        && canvas->width == 3 && canvas->height == 2
+        && canvas->pixels != NULL
+        && canvas->pixels[0] == 0xabu && canvas->pixels[1] == 0xcdu
+        && canvas->pixels[2] == 0xefu && canvas->pixels[3] == 255u;
+    if (!ok) {
+        fprintf(stderr,
+                "detached canvas ready=%d committed=%d absent=%d advanced=%d "
+                "images=%zu node=%p canvas=%p error=\"%s\"\n",
+                ready, committed, initially_absent, advanced,
+                navigation.page.images.count, (void *) canvas_node,
+                (const void *) canvas, navigation.last_error);
+    }
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_navigation_keeps_server_dom_after_author_script_error(void)
 {
     static const char html[] =
         "<!doctype html><title>Usable result</title><body>"
         "<main id=server-content><h1>Server-rendered page</h1>"
+        "<p>This complete server response contains useful navigation and "
+        "enough visible prose to remain preferable to an incomplete loading "
+        "shell when optional hydration exhausts its bounded execution.</p>"
+        "<input id=server-control value=server>"
         "<a href='/next'>Continue reading</a></main>"
-        "<script>throw new Error('missing optional dependency')</script>"
+        "<script>globalThis.hydrationRuns="
+        "(globalThis.hydrationRuns||0)+1;"
+        "globalThis.retainedServer=document.getElementById('server-content');"
+        "globalThis.retainedControl=document.getElementById('server-control');"
+        "globalThis.retainedControl.value='changed';"
+        "document.body.innerHTML='<p>Loading</p>';"
+        "throw new Error('missing optional dependency')</script>"
         "<script>globalThis.pocSummary='later-script-ran'</script>"
         "</body>";
     Budget budget;
@@ -42,20 +291,35 @@ static bool test_navigation_keeps_server_dom_after_author_script_error(void)
     lxb_dom_node_t *content = committed ? test_find_id(
         lxb_dom_interface_node(navigation.page.document.html),
         "server-content") : NULL;
+    ScriptResult retained_probe = {0};
+    bool retained_safe = committed
+        && script_runtime_evaluate_diagnostic(
+            navigation.page.runtime,
+            "const current=document.getElementById('server-content'),"
+            "currentControl=document.getElementById('server-control');"
+            "globalThis.pocSummary=[hydrationRuns,retainedServer.isConnected,"
+            "retainedServer.textContent.includes('Server-rendered page'),"
+            "retainedControl.value,current!==retainedServer,"
+            "currentControl.value].join(':')",
+            "<hydration-retained-handle-probe>", &retained_probe)
+        && strcmp(retained_probe.summary,
+                  "1:false:true:changed:true:server") == 0;
     bool ok = committed && navigation.page.loaded && content != NULL
+        && retained_safe
         && navigation.script_failed == 1u
-        && navigation.page.script_result.scripts_evaluated == 1u
-        && strcmp(navigation.page.script_result.summary,
-                  "later-script-ran") == 0
+        && navigation.page.script_result.scripts_evaluated == 0u
+        && navigation.page.script_result.summary[0] == '\0'
         && strstr(navigation.page.script_result.error,
                   "missing optional dependency") != NULL;
     if (!ok) {
         fprintf(stderr,
                 "soft script ready=%d committed=%d loaded=%d failed=%zu "
-                "evaluated=%zu summary=\"%s\" error=\"%s\" nav=\"%s\"\n",
+                "evaluated=%zu retained-safe=%d retained=\"%s\" "
+                "summary=\"%s\" error=\"%s\" nav=\"%s\"\n",
                 ready, committed, navigation.page.loaded,
                 navigation.script_failed,
                 navigation.page.script_result.scripts_evaluated,
+                retained_safe, retained_probe.summary,
                 navigation.page.script_result.summary,
                 navigation.page.script_result.error,
                 navigation.last_error);
@@ -304,6 +568,47 @@ static bool test_preserved_runtime_retires_replaced_document(void)
         && budget_active_allocations(&budget, NULL) == 0
         && budget_categories_reconcile(&budget);
     if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_iframe_discovery_weak_handle_survives_reclaim(void)
+{
+    static const char html[] =
+        "<!doctype html><body><div id=host></div></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://weak-frame.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    ScriptResult result = {0};
+    bool inserted = committed && script_runtime_evaluate_diagnostic(
+        navigation.page.runtime,
+        "document.getElementById('host').innerHTML="
+        "'<iframe id=late src=/child></iframe>'",
+        "<weak-frame-insert>", &result);
+    lxb_dom_node_t *late = inserted ? test_find_id(
+        lxb_dom_interface_node(navigation.page.document.html), "late") : NULL;
+    long weak = late == NULL ? 0 : script_runtime_node_weak_handle(
+        navigation.page.runtime, late);
+    bool reclaimed = weak != 0 && script_runtime_evaluate_diagnostic(
+        navigation.page.runtime,
+        "document.getElementById('host').textContent=''",
+        "<weak-frame-reclaim>", &result);
+    bool ok = reclaimed
+        && script_runtime_node_handle_resolve(
+               navigation.page.runtime, weak) == NULL
+        && script_runtime_node_handle_resolve_connected(
+               navigation.page.runtime, weak) == NULL;
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
 }
 

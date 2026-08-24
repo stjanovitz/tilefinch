@@ -63,7 +63,11 @@ static bool profile_language_uses_pack(
         || (language == BROWSER_GLYPH_LANGUAGE_CYRILLIC
             && pack == TILEFINCH_GLYPH_PACK_CYRILLIC)
         || (language == BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED
-            && pack == TILEFINCH_GLYPH_PACK_LATIN_EXTENDED);
+            && pack == TILEFINCH_GLYPH_PACK_LATIN_EXTENDED)
+        || (language == BROWSER_GLYPH_LANGUAGE_ARABIC
+            && pack == TILEFINCH_GLYPH_PACK_ARABIC)
+        || (language == BROWSER_GLYPH_LANGUAGE_HEBREW
+            && pack == TILEFINCH_GLYPH_PACK_HEBREW);
 }
 
 bool psp_glyph_component_handle_frame(
@@ -72,11 +76,12 @@ bool psp_glyph_component_handle_frame(
     if (app == NULL || app->process == NULL || app->browser == NULL
         || app->browser->glyph_component_session == NULL
         || app->browser->profile == NULL || intent == NULL) return false;
+    if (psp_captive_portal_active(app->interactive)) return false;
     PspGlyphComponentSession *session =
         app->browser->glyph_component_session;
     PspUiState *ui = &app->process->presentation.ui;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
-    uint8_t attached_before_hint = session->attached_mask;
+    uint16_t attached_before_hint = session->attached_mask;
 #endif
     bool visual_changed = psp_glyph_component_session_attach_hinted(
         session, &app->process->install_paths,
@@ -84,10 +89,10 @@ bool psp_glyph_component_handle_frame(
         app->browser->engine);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (session->attached_mask != attached_before_hint) {
-        printf("tilefinch-glyph-component: lazy-attached=0x%02x "
-               "total=0x%02x\n",
+        printf("tilefinch-glyph-component: lazy-attached=0x%04x "
+               "total=0x%04x\n",
                (unsigned) (session->attached_mask &
-                           (uint8_t) ~attached_before_hint),
+                           (uint16_t) ~attached_before_hint),
                (unsigned) session->attached_mask);
     }
 #endif

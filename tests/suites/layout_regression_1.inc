@@ -18,6 +18,9 @@
     CHECK(test_deep_layout_case(&budget, DEEP_LAYOUT_INLINE, 80, false));
     CHECK(test_deep_layout_case(
         &budget, DEEP_LAYOUT_FLEX_INTRINSIC, 80, false));
+    puts("test: fixed, sticky, and flex-order work has structural caps");
+    CHECK(test_positioned_range_caps(&budget) == 0);
+    CHECK(test_flex_order_group_cap(&budget) == 0);
 
     puts("test: empty blocks and block-boundary whitespace");
     CHECK(test_block_boundary_whitespace(&budget) == 0);
@@ -27,6 +30,7 @@
 
     puts("test: mobile overflow containment and automatic minimums");
     CHECK(test_mobile_overflow_intrinsic_minimums(&budget) == 0);
+    CHECK(test_scroll_scene_coordinate_containment(&budget) == 0);
 
     puts("test: modern mobile interaction and presentation CSS");
     CHECK(test_modern_mobile_css_interaction_and_presentation(&budget) == 0);
@@ -197,6 +201,8 @@
     CHECK(test_linear_gradient_parse(&budget) == 0);
     CHECK(test_retained_paint_stack_addresses_are_stable(&budget) == 0);
     CHECK(test_bounded_shared_paint_stack(&budget) == 0);
+    CHECK(test_style_value_transactionality(&budget) == 0);
+    CHECK(test_nested_selector_bounded_batching(&budget) == 0);
     CHECK(test_compact_visual_css_extensions(&budget) == 0);
     CHECK(test_bounded_typography_and_compositing(&budget) == 0);
     CHECK(test_backdrop_filter_aggregate_budget(&budget) == 0);
@@ -207,6 +213,15 @@
     puts("test: linear-gradient rasterizes as an axial ramp");
     CHECK(test_linear_gradient_raster(&budget) == 0);
     CHECK(test_background_layers_paint_front_to_back(&budget) == 0);
+    puts("test: hostile object-position remains inside decoded pixels");
+    CHECK(test_cover_object_position_stays_in_source(&budget) == 0);
+    puts("test: visual clones preserve packed image positions");
+    CHECK(test_visual_clone_preserves_object_position(&budget) == 0);
+    puts("test: PPM output rejects invalid frame extents");
+    CHECK(test_render_ppm_rejects_invalid_extent() == 0);
+    puts("test: first text discovery uses a bounded constant stack");
+    CHECK(test_first_text_data_deep_walk(&budget) == 0);
+    CHECK(test_select_option_deep_walk(&budget) == 0);
 
     puts("test: flex overlays use final size and flex-item paint order");
     CHECK(test_flex_overlay_used_size_and_paint_order(&budget) == 0);
@@ -724,6 +739,40 @@
           && stylesheet_border_color(
                  &mobile_sheet, &focus_probe_style,
                  STYLE_BORDER_LEFT, NULL) == 0x13579b);
+    ComputedStyle focus_normal = {0}, focus_active = {0};
+    size_t focus_marker_length = 0;
+    CHECK(lxb_dom_element_set_attribute(
+              lxb_dom_interface_element(focus_probe),
+              (const lxb_char_t *) "data-tilefinch-focus",
+              sizeof("data-tilefinch-focus") - 1u,
+              (const lxb_char_t *) "original",
+              sizeof("original") - 1u) != NULL);
+    (void) style_focus_change_classify(
+        &mobile_sheet, focus_probe, &focus_host_style,
+        &focus_normal, &focus_active);
+    const char *restored_focus_marker = document_attribute(
+        focus_probe, "data-tilefinch-focus", &focus_marker_length);
+    CHECK(restored_focus_marker != NULL
+          && focus_marker_length == sizeof("original") - 1u
+          && memcmp(restored_focus_marker, "original",
+                    sizeof("original") - 1u) == 0);
+    CHECK(lxb_dom_element_remove_attribute(
+              lxb_dom_interface_element(focus_probe),
+              (const lxb_char_t *) "data-tilefinch-focus",
+              sizeof("data-tilefinch-focus") - 1u) == LXB_STATUS_OK);
+    (void) style_focus_change_classify(
+        &mobile_sheet, focus_probe, &focus_host_style,
+        &focus_normal, &focus_active);
+    CHECK(document_attribute(
+                 focus_probe, "data-tilefinch-focus",
+                 &focus_marker_length) == NULL);
+    style_test_inject_focus_marker_remove_failures(2);
+    CHECK(style_focus_change_classify(
+              &mobile_sheet, focus_probe, &focus_host_style,
+              &focus_normal, &focus_active) == STYLE_FOCUS_CHANGE_UNSAFE
+          && document_attribute(
+                 focus_probe, "data-tilefinch-focus",
+                 &focus_marker_length) == NULL);
     CHECK(variable_child_style.color == 0x335577
           && variable_child_style.border.left == 5
           && stylesheet_border_color(

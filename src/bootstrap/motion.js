@@ -215,8 +215,22 @@
         easing = firstListItem(
           declarations.get("animation-timing-function"),
         );
+      const timeline = firstListItem(
+        declarations.get("animation-timeline") ||
+          declarations.get("scroll-timeline"),
+      );
+      const scrollLinked =
+        !!timeline && timeline !== "auto" && timeline !== "none";
       return name && name !== "none" && duration > 0
-        ? { name, duration, delay, iterations, direction, easing }
+        ? {
+            name,
+            duration,
+            delay,
+            iterations,
+            direction,
+            easing,
+            scrollLinked,
+          }
         : null;
     },
     keyframeOffset = (header) => {
@@ -371,8 +385,36 @@
       applied.delete(element);
       active.delete(element);
     },
+    staticFrame = (frames, config) => {
+      const reverse =
+        config.direction === "reverse" ||
+        (config.direction === "alternate" && config.iterations % 2 === 0) ||
+        (config.direction === "alternate-reverse" && config.iterations % 2);
+      let frame = frames[reverse ? 0 : frames.length - 1];
+      const hidden = (candidate) =>
+        String(candidate?.opacity || "") === "0" ||
+        String(candidate?.visibility || "").toLowerCase() === "hidden";
+      if (hidden(frame)) {
+        const visible = frames.find((candidate) => !hidden(candidate));
+        if (visible) frame = visible;
+      }
+      return frame;
+    },
+    applyStaticFrame = (element, frames, config, signature) => {
+      const frame = staticFrame(frames, config);
+      if (!frame) return;
+      for (const property of ["opacity", "visibility", "display"]) {
+        if (frame[property] !== undefined)
+          element.style.setProperty(property, frame[property], "important");
+      }
+      if (config.scrollLinked) {
+        element.style.setProperty("transform", "none", "important");
+      } else if (frame.transform !== undefined) {
+        element.style.setProperty("transform", frame.transform, "important");
+      }
+      applied.set(element, { animation: null, config, signature, static: true });
+    },
     scan = () => {
-      pending = false;
       scans++;
       const keyframes = new Map(),
         rules = [];
@@ -439,10 +481,16 @@
           ":" +
           config.easing +
           ":" +
+          config.scrollLinked +
+          ":" +
           JSON.stringify(frames);
         const previous = applied.get(element);
         if (previous?.signature === signature) continue;
         if (previous) stopAnimation(element, previous, true);
+        if (reducedMotion) {
+          applyStaticFrame(element, frames, config, signature);
+          continue;
+        }
         const animation = element.animate(frames, {
             duration: config.duration,
             delay: config.delay,
@@ -472,9 +520,12 @@
       retainedKeyframes = keyframes.size;
       retainedRules = rules.length;
       matchedElements = candidates.size;
+      pending = false;
     },
     documentHasMotionHint = () => {
       try {
+        if (globalThis.__tilefinchStylesheetHasMotionKeyframes?.())
+          return true;
         const roots = [document.head, document.body];
         for (const root of roots) {
           let node = root?.firstElementChild || null;
@@ -500,19 +551,25 @@
 
   globalThis.__tilefinchMotionRecheck = () => {
     if (
-      reducedMotion ||
       pending ||
       (active.size === 0 && !documentHasMotionHint())
     )
       return;
     pending = true;
+    /* Reduced-motion is a static cascade repair, not animation work. Coalesce
+       style + content construction at the end of this script turn so the
+       authoritative layout observes the final state without a timer or a
+       follow-up relayout. */
+    if (reducedMotion) {
+      queueMicrotask(scan);
+      return;
+    }
     const schedule =
       globalThis.__tilefinchScheduleRenderFixup || queueMicrotask;
     schedule(scan);
   };
   const beginObserving = () => {
     if (
-      reducedMotion ||
       observer ||
       !document.documentElement ||
       !documentHasMotionHint()

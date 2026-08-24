@@ -26,14 +26,15 @@ agents are capable of. A web browser was a good test of all three.
 | Feature | Support |
 |---|---|
 | **Web browsing** | Real HTTPS pages with JavaScript, cookies, images, mobile layout, and TrueType text; no proxy or companion computer. |
-| **Native media** | YouTube's lightweight provider and compatible HTML `<video>`/`<audio>` elements open one native player. Official builds use PSP firmware for 240p/360p Baseline/Main MP4 and AAC-in-MP4/M4A audio. A separately built optional decoder adds 240p H.264 High and VOD HLS; seeking, buffering UI, resumable YouTube downloads, and audio-only playback are built in. |
+| **Native media** | YouTube's lightweight provider and compatible HTML `<video>`/`<audio>` elements open one native player. Official builds use PSP firmware for 240p/360p Baseline/Main MP4 and AAC-in-MP4/M4A audio. A separately built optional decoder adds 240p H.264 High and HLS, including active YouTube live streams and premieres; seeking for finite media, buffering UI, resumable YouTube downloads, and audio-only playback are built in. |
 | **Tabs and navigation** | Five tabs, bookmarks, history, address/search suggestions, in-page find, optional session restore, and optional one-tab hibernation. |
 | **Ad blocking** | Conservative request blocking and cosmetic hiding are on by default; custom uBlock/EasyList-style rules and per-site exceptions are supported. |
 | **Cookie notices** | Common consent banners are hidden by default without clicking Accept or creating consent cookies; sites can be exempted individually. |
 | **Reader and offline modes** | Reflow articles for the PSP screen, choose sans/serif text, remember optional per-site sizing, and save articles for later. |
 | **Text entry** | PSP system keyboard or the faster Danzeff radial keyboard, with local bookmark/history completion. |
-| **Appearance** | Automatic or forced dark mode, page text scaling, three chrome themes, and optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, and color-emoji glyph packs. |
+| **Appearance** | Automatic or forced dark mode, page text scaling, three chrome themes, bounded mixed RTL/LTR page layout with Arabic-family shaping, and optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, and color-emoji glyph packs. |
 | **Native PSP UI** | First-frame home screen, Collections, clock, battery/Wi-Fi status, contextual controls, PNG screenshots, and photographed QR diagnostics. |
+| **Optional XMB redirect** | ARK-4 can make Sony's Internet Browser icon launch Tilefinch, with a hold-L bypass back to the original browser. |
 | **Updates** | Signed in-app updates use A/B slots, a trial boot, automatic rollback, explicit approval, and an optional signed previous-version picker. |
 | **Experimental voice search** | Optional separate download; off by default and currently slow and inaccurate. |
 
@@ -41,11 +42,11 @@ agents are capable of. A web browser was a good test of all three.
 
 | | |
 |---|---|
-| **Hardware target** | PSP-3000, 333 MHz MIPS, 64 MiB physical RAM (~43 MiB measured newlib heap; 32 MiB shared page/voice envelope), 480×272 RGB565 display |
+| **Hardware target** | PSP-3000, 333 MHz MIPS, 64 MiB physical RAM (~43 MiB measured newlib heap; 32 MiB shared page/voice envelope), 480×272 display with RGB565 page/chrome surfaces and 8888 fullscreen-video scanout |
 | **Execution model** | Networking, HTML, CSS, JavaScript, layout, and rendering run locally |
 | **Browser engine** | Lexbor HTML parser, Tilefinch style/layout/rendering, QuickJS runtime |
 | **Presentation** | Incremental retained display list with a bounded RGB565 tile cache |
-| **Networking** | HTTPS with certificate and hostname verification, cookies, redirects, and caching |
+| **Networking** | HTTPS with certificate and hostname verification, cookies, redirects, caching, and an isolated Wi-Fi sign-in flow for captive portals |
 | **License** | MIT, with separately licensed third-party components |
 
 ### Engineering highlights
@@ -61,7 +62,7 @@ agents are capable of. A web browser was a good test of all three.
 | **360p through a 480×272 display** | 640×360 frames stage through EDRAM as two guarded strips; the GE performs bilinear downscaling without a CPU per-pixel pass ([device envelope](docs/engineering/PSP_ENVELOPE.md)). |
 | **Explicit lifecycle ownership** | Media and networking use pure reducers, epoch-tokened services, consumer leases, pumped teardown, and quarantine instead of freeing memory beneath live firmware or worker activity ([architecture](docs/ARCHITECTURE.md)). |
 | **Security without pretending to sandbox** | HTTPS-first navigation, CORS/CSP/SRI, private-network protection, partition-aware resource authority, cookie controls, and signed A/B updates are enforced within a documented shared-process model ([security model](docs/SECURITY_MODEL.md)). |
-| **Hardware-aware gates** | Release registers 130 host tests (129 enabled by default), plus sanitizer, hostile-input, WPT, fidelity, PSP cross-build, `.text`, and hot-symbol ratchets ([engineering guide](AGENTS.md)). |
+| **Hardware-aware gates** | Release registers 137 host tests (136 enabled by default), plus sanitizer, hostile-input, WPT, fidelity, PSP cross-build, `.text`, and hot-symbol ratchets ([engineering guide](AGENTS.md)). |
 
 ## What you need
 
@@ -105,11 +106,50 @@ The `.tfum` and `.tfup` files on the release page are for Tilefinch's signed
 in-app updater, not manual installation. Optional language, emoji, and voice
 components are installed from their corresponding Settings screens.
 
+### Optional ARK-4 XMB redirect
+
+ARK-4 users can make **Network → Internet Browser** open Tilefinch. This is
+an optional VSH plugin; it does not modify PSP firmware or `flash0`, does no
+background polling, and writes nothing to the Memory Stick.
+
+1. Install Tilefinch normally at `PSP/GAME/TILEFINCH/`.
+2. Copy `TILEFINCH/OPTIONAL/tilefinch_xmb.prx` from the install archive to
+   `ms0:/SEPLUGINS/tilefinch_xmb.prx`.
+3. In ARK's Custom Launcher or Plugin Manager, install or enable it for the
+   **VSH (XMB)** runlevel.
+4. Restart VSH or reboot the PSP.
+
+The equivalent manual entry in ARK's `PLUGINS.TXT` is:
+
+```text
+vsh, ms0:/SEPLUGINS/tilefinch_xmb.prx, on
+```
+
+On a PSP Go using internal storage, use `ef0:` in both paths instead. Hold
+**L** while opening the Internet Browser icon to use Sony's browser. Because
+L is consumed by this bypass, Tilefinch's previous-version safe start remains
+available by launching Tilefinch normally from **Game → Memory Stick**. If
+Tilefinch is missing or the handoff fails, Sony's browser is left running.
+Disable the plugin in ARK's Plugin Manager and restart VSH to restore the
+original behavior.
+
+The redirect still launches Tilefinch as an ordinary homebrew application,
+not as code resident inside VSH. Leaving Tilefinch therefore reloads XMB and
+may show the normal Sony or ARK startup screen. After replacing the resident
+PRX itself, perform a full power-off and cold boot; Restart VSH can retain the
+previous `NO_STOP` handler in memory.
+
+The redirect starts Tilefinch's stable root launcher, so signed in-app
+updates, A/B trial boots, and automatic rollback continue to work normally.
+See [ARK-4's plugin documentation](https://github.com/PSP-Archive/ARK-4/wiki/Plugins)
+for its plugin-manager and `PLUGINS.TXT` formats.
+
 ### Optional H.264 High / HLS decoder
 
 Official Tilefinch releases do not redistribute the custom H.264 or AAC
 decoder. Compatible Baseline/Main MP4 continues to use the PSP firmware.
-People who want the additional 240p High-profile and VOD HLS path can build
+People who want the additional 240p High-profile and HLS path—including active
+YouTube live streams and premieres—can build
 the add-on from the pinned upstream source by following
 [Optional PSP software decoder](docs/DEVELOPMENT.md#optional-psp-software-decoder),
 then copy its three files to
@@ -171,14 +211,21 @@ hostname rule.
 See [docs/READER_MODE.md](docs/READER_MODE.md) for the exact boundary.
 Use **Page tools → Save article** to create a self-contained text snapshot.
 The Library's Saved and Downloads sections open and delete saved articles and
-pause, resume, play, or delete YouTube downloads. The combined library is
-capped at 12 items and is not read during boot. See
+pause, resume, play, or delete YouTube downloads. Active downloads show
+progress, transfer speed, remaining Memory Stick space, and a durable failure
+reason; an interrupted download resumes from its verified byte boundary
+rather than starting over. The combined library is capped at 12 items and is
+not read during boot. See
 [docs/OFFLINE_LIBRARY.md](docs/OFFLINE_LIBRARY.md) for formats and limits.
+
+When a page cannot open, Tilefinch keeps the last usable page and presents
+recovery choices that fit the failure: retry, Reader mode, Wi-Fi sign-in,
+site-scoped JavaScript disablement, or lower-bandwidth media settings.
 
 Basic ad blocking and conservative cosmetic hiding are on by default.
 **Settings → Privacy & security → Content blocker** selects Off, Basic, or Custom;
 **Hide page ads** controls only cosmetic hiding, and **Page tools → Site
-controls → Content blocking** bypasses both for the page's
+information → Permissions & controls → Content blocking** bypasses both for the page's
 registrable site. Basic performs no Memory Stick list read. Custom reads
 `data/adblock.txt`; **Load allowlist** explicitly imports extra site
 exceptions from `data/adblock-allow.txt` into the bounded 32-site resident
@@ -186,9 +233,14 @@ set. See [docs/CONTENT_BLOCKING.md](docs/CONTENT_BLOCKING.md) for the exact
 built-in hosts/selectors, accepted custom syntax, and limits.
 
 Common cookie-consent overlays are also hidden by default without clicking
-Accept or writing consent cookies. **Page tools → Site controls → Cookie
+Accept or writing consent cookies. **Page tools → Site information →
+Permissions & controls → Cookie
 notices** can show them again for the current site; this preference is
 independent of ad blocking.
+
+**Page tools → Site information** also shows the current connection and
+certificate issuer plus bounded cookie/storage usage. From the same screen you
+can clear data for that site or reset all of its compatibility exceptions.
 
 ## Updating
 
@@ -226,6 +278,10 @@ it is installed into the inactive slot and must pass the same trial boot.
   is enabled — the GitHub releases API at most twice a week to compare
   version numbers. That check can be turned off in Settings and sends no
   identifying information beyond an ordinary HTTPS request.
+- **Help & diagnostics → Check Wi-Fi sign-in** makes one cookie-free HTTP
+  connectivity request to `connectivitycheck.gstatic.com`. It runs only when
+  you ask (or accept a sign-in suggestion), and any detected portal opens with
+  temporary cookies and storage that are deleted when the sign-in closes.
 - On the start page, resting on the built-in YouTube tile for about a third of
   a second lets Tilefinch quietly open that connection in the background so it
   is ready the instant you press X. It does this only for the highlighted
@@ -341,11 +397,11 @@ package carries the Alpha Cephei and CMUdict license files alongside the model;
 the base browser bundle retains the PocketSphinx license required by the
 linked decoder.
 
-Optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, and color-emoji
-packs are likewise not part of the browser download. They are generated from
-Noto fonts, carry their complete SIL Open Font License notice and source-font
-digest, and are fetched only after the user requests one. Tilefinch does not
-read proprietary PSP firmware fonts.
+Optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew,
+and color-emoji packs are likewise not part of the browser download. They are
+generated from Noto fonts, carry their complete SIL Open Font License notice
+and source-font digest, and are fetched only after the user requests one.
+Tilefinch does not read proprietary PSP firmware fonts.
 
 Tilefinch is an independent, unofficial homebrew project. It is not
 affiliated with, sponsored by, or endorsed by Sony Interactive

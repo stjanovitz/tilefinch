@@ -26,6 +26,46 @@ static bool plans(Budget *budget, const char *source,
         budget, source, strlen(source), plan);
 }
 
+static void test_nested_template_depth_is_bounded(Budget *budget)
+{
+    static const char prefix[] =
+        "(self.webpackChunk_depth=self.webpackChunk_depth||[])"
+        ".push([[1],{1:a=>{const value=";
+    static const char suffix[] = ";return value}}]);";
+    static const unsigned depths[] = {16u, 64u, 65u, 80u};
+    for (size_t depth_index = 0;
+         depth_index < sizeof(depths) / sizeof(depths[0]); depth_index++) {
+        unsigned depth = depths[depth_index];
+        size_t capacity = sizeof(prefix) + sizeof(suffix)
+            + (size_t) depth * 5u + 8u;
+        char *source = malloc(capacity);
+        CHECK(source != NULL);
+        if (source == NULL) continue;
+        size_t used = 0;
+        memcpy(source + used, prefix, sizeof(prefix) - 1u);
+        used += sizeof(prefix) - 1u;
+        for (unsigned i = 0; i < depth; i++) {
+            memcpy(source + used, "`${", 3u);
+            used += 3u;
+        }
+        source[used++] = '0';
+        for (unsigned i = 0; i < depth; i++) {
+            memcpy(source + used, "}`", 2u);
+            used += 2u;
+        }
+        memcpy(source + used, suffix, sizeof(suffix));
+        used += sizeof(suffix) - 1u;
+        ScriptLazyWebpackPlan plan = {0};
+        size_t before = budget->current;
+        bool planned = script_lazy_webpack_plan_create(
+            budget, source, used, &plan);
+        CHECK(depth <= 64u ? planned : !planned);
+        if (planned) script_lazy_webpack_plan_destroy(&plan);
+        CHECK(budget->current == before);
+        free(source);
+    }
+}
+
 static lxb_dom_node_t *find_script(lxb_dom_node_t *node)
 {
     for (; node != NULL; node = node->next) {
@@ -320,6 +360,7 @@ int main(int argc, char **argv)
     test_resource_loader_statement_planning();
     Budget budget;
     budget_init(&budget, 2u * 1024u * 1024u);
+    test_nested_template_depth_is_bounded(&budget);
     const char source[] =
         "\"use strict\";(self.webpackChunk_demo=self.webpackChunk_demo||[])"
         ".push([[1,2],{10:(a,b,c)=>{b.x=/[{}]/.test(\"x\");return `v${a}`},"

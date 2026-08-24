@@ -115,13 +115,14 @@ static size_t pes(unsigned char *output, unsigned stream, uint64_t pts,
 }
 
 typedef struct {
-    unsigned char segment[2][188u * 6u];
-    size_t segment_bytes[2];
+    unsigned char segment[8][188u * 6u];
+    size_t segment_bytes[8];
     struct { bool active; size_t segment; size_t offset; } request[4];
     unsigned starts;
     unsigned start_calls;
     unsigned admission_deferrals;
     unsigned cancels;
+    bool fail_segments;
 } MockTransport;
 
 static void build_segment(MockTransport *mock, size_t segment, uint64_t pts)
@@ -203,7 +204,13 @@ static uint64_t mock_start(void *opaque, const char *url, size_t maximum,
         return 0;
     }
     if (maximum != MEDIA_HLS_MAXIMUM_SEGMENT_BYTES) return 0;
-    size_t segment = strstr(url, "two.ts") != NULL ? 1u : 0u;
+    size_t segment = 0;
+    static const char *const names[] = {
+        "one.ts", "two.ts", "three.ts", "four.ts",
+        "five.ts", "six.ts", "seven.ts", "eight.ts"
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (strstr(url, names[i]) != NULL) { segment = i; break; }
     for (size_t i = 0; i < 4u; i++) {
         if (!mock->request[i].active) {
             mock->request[i].active = true;
@@ -226,6 +233,12 @@ static MediaHlsTransportPollResult mock_poll(
     if (handle == 0 || handle > 4u || !mock->request[handle - 1u].active)
         return MEDIA_HLS_TRANSPORT_ERROR;
     size_t index = handle - 1u;
+    if (mock->fail_segments) {
+        mock->request[index].active = false;
+        if (error != NULL && error_size != 0)
+            snprintf(error, error_size, "segment rejected");
+        return MEDIA_HLS_TRANSPORT_ERROR;
+    }
     size_t segment = mock->request[index].segment;
     size_t offset = mock->request[index].offset;
     if (offset == mock->segment_bytes[segment]) {
@@ -268,6 +281,36 @@ static int test_playlists(void)
           && strcmp(url, "https://media.invalid/path/low.m3u8") == 0);
     media_hls_playlist_destroy(playlist);
 
+    static const char mixed_codecs[] =
+        "#EXTM3U\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=100000,RESOLUTION=426x240,"
+        "CODECS=\"vp09.00.10.08,opus\"\nvp9.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=300000,RESOLUTION=426x240,"
+        "CODECS=\"avc1.4d4015,mp4a.40.2\"\navc.m3u8\n";
+    playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/path/master.m3u8",
+        (const unsigned char *) mixed_codecs, strlen(mixed_codecs),
+        error, sizeof(error));
+    CHECK(playlist != NULL && media_hls_playlist_select_variant(
+              playlist, 432u, 240u, 240u, url, sizeof(url))
+          && strcmp(url, "https://media.invalid/path/avc.m3u8") == 0);
+    media_hls_playlist_destroy(playlist);
+
+    static const char average_bandwidth[] =
+        "#EXTM3U\n"
+        "#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=900000,BANDWIDTH=100000,"
+        "CODECS=\"avc1.4d4015,mp4a.40.2\"\nexact-low.m3u8\n"
+        "#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=100000,BANDWIDTH=200000,"
+        "CODECS=\"avc1.4d4015,mp4a.40.2\"\nexact-high.m3u8\n";
+    playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/path/master.m3u8",
+        (const unsigned char *) average_bandwidth,
+        strlen(average_bandwidth), error, sizeof(error));
+    CHECK(playlist != NULL && media_hls_playlist_select_variant(
+              playlist, 432u, 240u, 240u, url, sizeof(url))
+          && strcmp(url, "https://media.invalid/path/exact-low.m3u8") == 0);
+    media_hls_playlist_destroy(playlist);
+
     static const char unsupported[] =
         "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n"
         "#EXTINF:4,\none.ts\n#EXT-X-ENDLIST\n";
@@ -281,7 +324,204 @@ static int test_playlists(void)
               &budget, "https://media.invalid/list.m3u8",
               (const unsigned char *) missing_duration,
               strlen(missing_duration), error, sizeof(error)) == NULL);
+    static const char live[] =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:5\n"
+        "#EXT-X-MEDIA-SEQUENCE:42\n#EXTINF:5,\none.ts\n";
+    playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/live.m3u8",
+        (const unsigned char *) live, strlen(live), error, sizeof(error));
+    CHECK(playlist != NULL && media_hls_playlist_is_live(playlist)
+          && media_hls_playlist_duration_us(playlist) == 5000000u);
+    media_hls_playlist_destroy(playlist);
+    static const char live_without_target[] =
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:42\n#EXTINF:5,\none.ts\n";
+    CHECK(media_hls_playlist_parse(
+              &budget, "https://media.invalid/live.m3u8",
+              (const unsigned char *) live_without_target,
+              strlen(live_without_target), error, sizeof(error)) == NULL);
     CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_live_window_refresh(void)
+{
+    Budget budget;
+    budget_init(&budget, 3u * 1024u * 1024u);
+    static const char initial[] =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n"
+        "#EXT-X-MEDIA-SEQUENCE:100\n"
+        "#EXTINF:4,\none.ts\n#EXTINF:4,\ntwo.ts\n"
+        "#EXTINF:4,\nthree.ts\n#EXTINF:4,\nfour.ts\n";
+    static const char refreshed[] =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n"
+        "#EXT-X-MEDIA-SEQUENCE:102\n"
+        "#EXTINF:4,\nthree.ts\n#EXTINF:4,\nfour.ts\n"
+        "#EXTINF:4,\nfive.ts\n#EXTINF:4,\nsix.ts\n";
+    char error[160] = {0};
+    MediaHlsPlaylist *playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/live.m3u8",
+        (const unsigned char *) initial, strlen(initial),
+        error, sizeof(error));
+    CHECK(playlist != NULL && media_hls_playlist_is_live(playlist));
+    MockTransport mock = {0};
+    for (size_t i = 0; i < 6u; i++) build_segment(
+        &mock, i, UINT64_C(90000) + (uint64_t) i * UINT64_C(360000));
+    MediaHlsTransport transport = {
+        .opaque = &mock, .start = mock_start,
+        .poll = mock_poll, .cancel = mock_cancel
+    };
+    MediaHlsSource *source = media_hls_source_create(
+        &budget, playlist, &transport, error, sizeof(error));
+    CHECK(source != NULL);
+    MediaHlsPrimeStatus status = MEDIA_HLS_PRIME_PENDING;
+    for (unsigned i = 0; i < 64u && status == MEDIA_HLS_PRIME_PENDING; i++)
+        status = media_hls_source_prime(source, error, sizeof(error));
+    CHECK(status == MEDIA_HLS_PRIME_READY);
+    MediaSampleSource samples;
+    CHECK(media_hls_source_sample_source(source, &samples));
+    bool refreshed_once = false;
+    unsigned consumed = 0;
+    unsigned char payload[512];
+    for (uint64_t tick = 1; tick < 500u; tick++) {
+        uint64_t now_us = tick * UINT64_C(100000);
+        media_hls_source_pump(source, now_us);
+        if (!refreshed_once
+            && media_hls_source_wants_playlist_refresh(source, now_us)) {
+            MediaHlsPlaylist *next = media_hls_playlist_parse(
+                &budget, "https://media.invalid/live.m3u8",
+                (const unsigned char *) refreshed, strlen(refreshed),
+                error, sizeof(error));
+            CHECK(next != NULL && media_hls_source_update_playlist(
+                source, next, now_us, error, sizeof(error)));
+            refreshed_once = true;
+        }
+        MediaMp4Sample sample;
+        if (samples.ops->next_sample(samples.opaque, &sample)) {
+            CHECK(samples.ops->read_sample(
+                samples.opaque, &sample, payload, sizeof(payload)));
+            consumed++;
+        }
+        MediaHlsStats stats = {0};
+        media_hls_source_stats(source, &stats);
+        if (refreshed_once && stats.segments_completed >= 5u) break;
+    }
+    MediaHlsStats stats = {0};
+    media_hls_source_stats(source, &stats);
+    CHECK(refreshed_once && stats.live && !stats.ended
+          && stats.playlist_refreshes == 1u
+          && stats.segments_completed >= 5u && consumed != 0u);
+    uint64_t actual = UINT64_MAX;
+    CHECK(!samples.ops->seek_us(samples.opaque, 1000000u, &actual));
+    media_hls_source_destroy(source);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_live_refresh_gap_failure_and_endlist(void)
+{
+    Budget budget;
+    budget_init(&budget, 3u * 1024u * 1024u);
+    static const char initial[] =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n"
+        "#EXT-X-MEDIA-SEQUENCE:100\n"
+        "#EXTINF:4,\none.ts\n#EXTINF:4,\ntwo.ts\n";
+    static const char final_window[] =
+        "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:104\n"
+        "#EXTINF:4,\nfive.ts\n#EXTINF:4,\nsix.ts\n#EXT-X-ENDLIST\n";
+    char error[160] = {0};
+    MediaHlsPlaylist *playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/live.m3u8",
+        (const unsigned char *) initial, strlen(initial),
+        error, sizeof(error));
+    CHECK(playlist != NULL);
+    MockTransport mock = {0};
+    build_segment(&mock, 4u, 90000u);
+    build_segment(&mock, 5u, 450000u);
+    MediaHlsTransport transport = {
+        .opaque = &mock, .start = mock_start,
+        .poll = mock_poll, .cancel = mock_cancel
+    };
+    MediaHlsSource *source = media_hls_source_create(
+        &budget, playlist, &transport, error, sizeof(error));
+    CHECK(source != NULL);
+
+    /* A failed refresh is retried no faster than the bounded backoff. */
+    media_hls_source_note_playlist_refresh_failure(source, 100u);
+    CHECK(!media_hls_source_wants_playlist_refresh(source, 1000000u));
+    CHECK(media_hls_source_wants_playlist_refresh(source, 1000100u));
+
+    /* The server may have advanced beyond every retained segment while Wi-Fi
+       was unavailable. Continue at the oldest surviving sequence, record the
+       exact gap, and make the first replacement segment a discontinuity. */
+    MediaHlsPlaylist *replacement = media_hls_playlist_parse(
+        &budget, "https://media.invalid/live.m3u8",
+        (const unsigned char *) final_window, strlen(final_window),
+        error, sizeof(error));
+    CHECK(replacement != NULL && media_hls_source_update_playlist(
+        source, replacement, 1000100u, error, sizeof(error)));
+    CHECK(!media_hls_source_wants_playlist_refresh(source, UINT64_MAX));
+
+    MediaSampleSource samples;
+    CHECK(media_hls_source_sample_source(source, &samples));
+    unsigned char payload[512];
+    for (unsigned guard = 0; guard < 256u; guard++) {
+        media_hls_source_pump(source, 2000000u + guard * 10000u);
+        MediaMp4Sample sample;
+        if (samples.ops->next_sample(samples.opaque, &sample)) {
+            CHECK(samples.ops->read_sample(
+                samples.opaque, &sample, payload, sizeof(payload)));
+        }
+        MediaHlsStats stats = {0};
+        media_hls_source_stats(source, &stats);
+        if (stats.ended) break;
+    }
+    MediaHlsStats stats = {0};
+    media_hls_source_stats(source, &stats);
+    CHECK(stats.live && stats.ended
+          && stats.playlist_refreshes == 1u
+          && stats.playlist_refresh_failures == 1u
+          && stats.skipped_live_segments == 4u
+          && stats.segments_completed == 2u);
+    media_hls_source_destroy(source);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_live_segment_failure_survives_static_refresh(void)
+{
+    Budget budget;
+    budget_init(&budget, 3u * 1024u * 1024u);
+    static const char live[] =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n"
+        "#EXT-X-MEDIA-SEQUENCE:100\n"
+        "#EXTINF:4,\none.ts\n#EXTINF:4,\ntwo.ts\n";
+    char error[160] = {0};
+    MediaHlsPlaylist *playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/live.m3u8",
+        (const unsigned char *) live, strlen(live), error, sizeof(error));
+    CHECK(playlist != NULL);
+    MockTransport mock = {.fail_segments = true};
+    MediaHlsTransport transport = {
+        .opaque = &mock, .start = mock_start,
+        .poll = mock_poll, .cancel = mock_cancel
+    };
+    MediaHlsSource *source = media_hls_source_create(
+        &budget, playlist, &transport, error, sizeof(error));
+    CHECK(source != NULL);
+    for (unsigned attempt = 0; attempt < 4u; attempt++) {
+        media_hls_source_pump(source, UINT64_C(1000000) * (attempt + 1u));
+        if (media_hls_source_failed(source)) break;
+        MediaHlsPlaylist *same = media_hls_playlist_parse(
+            &budget, "https://media.invalid/live.m3u8",
+            (const unsigned char *) live, strlen(live),
+            error, sizeof(error));
+        CHECK(same != NULL && media_hls_source_update_playlist(
+            source, same, UINT64_C(1000000) * (attempt + 1u),
+            error, sizeof(error)));
+    }
+    CHECK(media_hls_source_failed(source) && mock.starts >= 4u);
+    media_hls_source_destroy(source);
+    CHECK(budget.current == 0u);
     return 0;
 }
 
@@ -406,6 +646,9 @@ int main(void)
     if (test_playlists() != 0) return 1;
     if (test_streaming_source() != 0) return 1;
     if (test_video_only_primes_before_segment_completion() != 0) return 1;
+    if (test_live_window_refresh() != 0) return 1;
+    if (test_live_refresh_gap_failure_and_endlist() != 0) return 1;
+    if (test_live_segment_failure_survives_static_refresh() != 0) return 1;
     puts("media HLS tests passed");
     return 0;
 }

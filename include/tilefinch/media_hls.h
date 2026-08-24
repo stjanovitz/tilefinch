@@ -33,6 +33,7 @@ bool media_hls_playlist_select_variant(
     char *url, size_t url_size);
 size_t media_hls_playlist_segment_count(const MediaHlsPlaylist *playlist);
 uint64_t media_hls_playlist_duration_us(const MediaHlsPlaylist *playlist);
+bool media_hls_playlist_is_live(const MediaHlsPlaylist *playlist);
 void media_hls_playlist_destroy(MediaHlsPlaylist *playlist);
 
 typedef enum {
@@ -69,10 +70,15 @@ typedef struct {
     size_t queued_bytes;
     size_t queue_overflows;
     size_t malformed_segments;
+    size_t playlist_refreshes;
+    size_t playlist_refresh_failures;
+    size_t skipped_live_segments;
     unsigned ts_sync_losses;
     unsigned ts_malformed_packets;
     unsigned ts_malformed_psi;
     unsigned active_requests;
+    uint64_t buffered_until_us;
+    bool live;
     bool ended;
 } MediaHlsStats;
 
@@ -82,6 +88,18 @@ MediaHlsSource *media_hls_source_create(
     const MediaHlsTransport *transport, char *error, size_t error_size);
 MediaHlsPrimeStatus media_hls_source_prime(
     MediaHlsSource *source, char *error, size_t error_size);
+/* One bounded delivery step. The PSP frontend calls this once per frame so
+   segment and live-playlist traffic can progress while decoded samples remain
+   queued; sample reads retain the same call as a starvation fallback. */
+void media_hls_source_pump(MediaHlsSource *source, uint64_t now_us);
+bool media_hls_source_wants_playlist_refresh(
+    const MediaHlsSource *source, uint64_t now_us);
+/* Always consumes replacement, including stale or rejected live snapshots. */
+bool media_hls_source_update_playlist(
+    MediaHlsSource *source, MediaHlsPlaylist *replacement,
+    uint64_t now_us, char *error, size_t error_size);
+void media_hls_source_note_playlist_refresh_failure(
+    MediaHlsSource *source, uint64_t now_us);
 bool media_hls_source_sample_source(
     MediaHlsSource *source, MediaSampleSource *sample_source);
 bool media_hls_source_stream_info(
@@ -89,6 +107,7 @@ bool media_hls_source_stream_info(
     MediaMp4TrackInfo *audio);
 void media_hls_source_stats(const MediaHlsSource *source,
                             MediaHlsStats *stats);
+bool media_hls_source_failed(const MediaHlsSource *source);
 void media_hls_source_destroy(MediaHlsSource *source);
 
 #endif

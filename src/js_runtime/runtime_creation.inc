@@ -848,6 +848,7 @@ static ScriptRuntime *script_runtime_create_internal(
     host->bridge.result = &host->result;
     host->bridge.relayout_dirty = &host->relayout_dirty;
     host->bridge.session = session;
+    host->bridge.fonts = options->fonts;
     host->bridge.document_url = host->document_url;
     host->bridge.top_level_url = host->top_level_url;
     host->bridge.document_base_dirty = true;
@@ -1115,6 +1116,36 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchParseColor",
                                        js_dom_parse_color, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchCommitCanvasSurface",
+                                       js_canvas_commit_surface, 8)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchCanvasImageSource",
+                                       js_canvas_image_source, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchCanvasRasterRect",
+                                       js_canvas_raster_rect, 13)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchCanvasRasterRectBatch",
+                                       js_canvas_raster_rect_batch, 4)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchCanvasMeasureText",
+                                       js_canvas_measure_text, 5)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchCanvasRasterText",
+                                       js_canvas_raster_text, 22)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchCanvasRasterPath",
+                                       js_canvas_raster_path, 21)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchCanvasRasterPaintBatch",
+                                       js_canvas_raster_paint_batch, 4)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchCanvasRasterImage",
+                                       js_canvas_raster_image, 20)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchCanvasRasterImageBatch",
+                                       js_canvas_raster_image_batch, 5)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchNodeType",
                                        js_dom_node_type, 1)

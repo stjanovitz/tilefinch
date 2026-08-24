@@ -7,6 +7,7 @@
 #include "tilefinch/section_store.h"
 #include "tilefinch/style.h"
 #include "tilefinch/user_agent.h"
+#include "../src/image_decode_internal.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -734,6 +735,17 @@ static bool test_visible_lazy_pair_overlaps_transport_and_decode(void)
 
 static bool test_deferred_jpeg_decode_publishes_on_later_pump(void)
 {
+    static const unsigned char probe_png[] = {
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c,
+        0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41,
+        0x54, 0x78, 0xda, 0x63, 0x64, 0xf8, 0x0f, 0x00,
+        0x01, 0x05, 0x01, 0x01, 0x27, 0x18, 0xe3, 0x66,
+        0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+        0xae, 0x42, 0x60, 0x82
+    };
     static const char html[] =
         "<!doctype html><title>Deferred JPEG</title>"
         "<style>img{display:block;width:24px;height:24px}</style>"
@@ -760,6 +772,7 @@ static bool test_deferred_jpeg_decode_publishes_on_later_pump(void)
         &navigation, generation, "https://deferred-images.test/jpeg",
         html, sizeof(html) - 1u, 480, NULL, NULL, true);
     bool saw_pending_decode = false;
+    bool saw_busy_probe = false;
     size_t pumps = 0;
     while (committed && navigation_background_resources_pending(&navigation)
            && pumps++ < 16u) {
@@ -769,6 +782,14 @@ static bool test_deferred_jpeg_decode_publishes_on_later_pump(void)
             && loaded_before == 0
             && navigation.page.images.stats.loaded == 0) {
             saw_pending_decode = true;
+            int width = 0, height = 0, components = 0;
+            bool webp = false;
+            if (image_decode_probe_info(
+                    &budget, probe_png, sizeof(probe_png),
+                    &width, &height, &components, &webp)
+                == IMAGE_DECODE_PROBE_BUSY) {
+                saw_busy_probe = true;
+            }
         }
     }
     lxb_dom_node_t *root = ready
@@ -777,7 +798,12 @@ static bool test_deferred_jpeg_decode_publishes_on_later_pump(void)
         ? NULL : test_find_id(root, "thumb");
     const ImageResource *image = thumb == NULL ? NULL
         : images_find_node(&navigation.page.images, thumb);
-    bool ok = committed && saw_pending_decode
+    int probe_width = 0, probe_height = 0, probe_components = 0;
+    bool probe_webp = false;
+    bool probe_retried = image_decode_probe_info(
+        &budget, probe_png, sizeof(probe_png), &probe_width, &probe_height,
+        &probe_components, &probe_webp) == IMAGE_DECODE_PROBE_SUPPORTED;
+    bool ok = committed && saw_pending_decode && saw_busy_probe && probe_retried
         && !navigation_background_resources_pending(&navigation)
         && navigation.page.images.stats.loaded == 1
         && navigation.page.images.stats.downsampled == 1
@@ -787,10 +813,12 @@ static bool test_deferred_jpeg_decode_publishes_on_later_pump(void)
         && image->height > 0 && image->height <= 24;
     if (!ok) {
         fprintf(stderr,
-                "deferred-jpeg ready=%d committed=%d pending=%d pumps=%zu "
+                "deferred-jpeg ready=%d committed=%d pending=%d busy=%d "
+                "retried=%d pumps=%zu "
                 "loaded=%zu downsampled=%zu image=%d pixels=%d "
                 "source=%dx%d target=%dx%d skipped=%zu error=\"%s\"\n",
-                ready, committed, saw_pending_decode, pumps,
+                ready, committed, saw_pending_decode, saw_busy_probe,
+                probe_retried, pumps,
                 navigation.page.images.stats.loaded,
                 navigation.page.images.stats.downsampled,
                 image != NULL, image != NULL && image->pixels != NULL,

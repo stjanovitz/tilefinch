@@ -93,6 +93,14 @@ with `--psp-profile` when that behavior is the subject of a lab run. All
 presets use the pinned Bellard QuickJS configuration, enable tests, disable the
 unrelated JavaScriptCore spike, and use a compiler cache when available.
 
+Host tools and tests load one shared `tilefinch_core` image. Consequently an
+engine implementation edit rebuilds that image without relinking every test
+executable; the logical build dependency still guarantees that the new image
+is complete before any test starts. PSP configurations continue to link a
+static core and retain the same `.text` and hot-symbol ratchets. The Release
+fidelity gate reserves four CTest processor slots and renders its independent
+scenarios concurrently, while keeping scoreboard rows in manifest order.
+
 On macOS, `scripts/run-sanitizer-tests.sh` runs the suite in parallel with
 symbolization disabled, then reruns only failed tests serially with normal
 symbols while preserving the failed status. This keeps the green path parallel
@@ -130,10 +138,31 @@ PSP-only builds consume.
 The PSP cross-build consumes those checked-in artifacts and does not run a
 host QuickJS generator through the PSP toolchain.
 
+### Optional ARK-4 XMB redirect
+
+The XMB redirect is a small kernel PRX with no dependency on the browser
+engine. Build it explicitly with the PSP toolchain:
+
+```sh
+PSPDEV=/path/to/pspdev cmake --preset psp
+cmake --build build-preset-psp --target tilefinch-xmb-redirect
+```
+
+The result is
+`build-preset-psp/xmb-redirect/tilefinch_xmb.prx`. The release install-tree
+target stages the same file under `TILEFINCH/OPTIONAL/`; it is never placed in
+an A/B application slot or an in-app update package. Its module-start hook is
+name-based (`htmlviewer_plugin_module`) rather than firmware-offset-based,
+chains the previously registered ARK handler, and performs the LoadExec from
+a one-shot thread after the loader callback returns. A missing launcher,
+controller-read failure, thread-creation failure, or LoadExec failure all
+leave Sony's browser available.
+
 ### Optional PSP software decoder
 
-H.264 High-profile playback is a replaceable, user-built PRX so the official
-EBOOT and release archives remain independent of FFmpeg decoder binaries.
+H.264 High-profile and HLS playback (including active YouTube live streams and
+premieres) use a replaceable, user-built PRX so the official EBOOT and release
+archives remain independent of FFmpeg decoder binaries.
 Prepare the narrow LGPL n8.1.2 build once, then point an opt-in PSP configure
 at that ignored workspace:
 

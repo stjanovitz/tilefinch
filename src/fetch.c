@@ -831,8 +831,13 @@ static void fetch_result_capture_tls_version(CURL *easy, FetchResult *result)
 static void fetch_result_set_transport_info(CURL *easy, FetchResult *result)
 {
     if (easy == NULL || result == NULL) return;
-    (void) curl_easy_getinfo(
-        easy, CURLINFO_SSL_VERIFYRESULT, &result->tls_verify_result);
+    result->tls_verify_result_available = curl_easy_getinfo(
+        easy, CURLINFO_SSL_VERIFYRESULT, &result->tls_verify_result)
+        == CURLE_OK;
+    result->tls_verification_failed =
+        result->transport_code == CURLE_PEER_FAILED_VERIFICATION
+        || (result->tls_verify_result_available
+            && result->tls_verify_result != 0);
     (void) curl_easy_getinfo(
         easy, CURLINFO_HTTP_VERSION, &result->negotiated_http_version);
     fetch_capture_tls_security(

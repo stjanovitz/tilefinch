@@ -375,15 +375,46 @@ static bool test_youtube_player_response_parser(void)
         return false;
     }
     static const char live[] =
-        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "{\"playabilityStatus\":{\"status\":\"OK\","
+        "\"liveStreamability\":{}},"
         "\"videoDetails\":{\"isLiveContent\":true},"
         "\"streamingData\":{\"hlsManifestUrl\":"
-        "\"https://manifest.googlevideo.com/live.m3u8\"}}";
-    if (youtube_parse_player_response_diagnostic(
+        "\"https://manifest.googlevideo.com/live.m3u8\","
+        "\"formats\":[{\"height\":240,\"width\":426,\"itag\":18,"
+        "\"contentLength\":\"1000\",\"approxDurationMs\":\"10000\","
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.42001e, mp4a.40.2\\\"\","
+        "\"url\":\"https://rr1.googlevideo.com/transient.mp4\"}]}}";
+    if (!youtube_parse_player_response_diagnostic(
             live, strlen(live), "live", 240,
             &playability, &stream, error, sizeof(error))
-        || playability != YOUTUBE_PLAYABILITY_LIVE_UNSUPPORTED
-        || strstr(error, "live streams") == NULL) {
+        || playability != YOUTUBE_PLAYABILITY_OK
+        || !stream.live_hls
+        || strcmp(stream.media_url,
+                  "https://manifest.googlevideo.com/live.m3u8") != 0
+        || strcmp(stream.mime_type,
+                  "application/vnd.apple.mpegurl") != 0) {
+        return false;
+    }
+    static const char live_flag_only[] =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "\"videoDetails\":{\"isLive\":true},"
+        "\"streamingData\":{\"hlsManifestUrl\":"
+        "\"https://manifest.googlevideo.com/flag-live.m3u8\"}}";
+    if (!youtube_parse_player_response_diagnostic(
+            live_flag_only, strlen(live_flag_only), "live-flag", 240,
+            &playability, &stream, error, sizeof(error))
+        || !stream.live_hls
+        || strstr(stream.media_url, "flag-live.m3u8") == NULL) {
+        return false;
+    }
+    static const char upcoming[] =
+        "{\"playabilityStatus\":{\"status\":\"LIVE_STREAM_OFFLINE\","
+        "\"reason\":\"This premiere will begin soon\"}}";
+    if (youtube_parse_player_response_diagnostic(
+            upcoming, strlen(upcoming), "upcoming", 240,
+            &playability, &stream, error, sizeof(error))
+        || playability != YOUTUBE_PLAYABILITY_UPCOMING_UNSUPPORTED
+        || strstr(error, "has not started yet") == NULL) {
         return false;
     }
 

@@ -1503,6 +1503,57 @@ bool browser_profile_set_site_javascript_enabled(
     return true;
 }
 
+static void profile_remove_exact_site(
+    char (*sites)[CONTENT_BLOCKER_HOST_LIMIT], size_t *count,
+    const char *site)
+{
+    if (sites == NULL || count == NULL || site == NULL) return;
+    for (size_t at = 0; at < *count; at++) {
+        if (strcmp(sites[at], site) != 0) continue;
+        if (at + 1u < *count)
+            memmove(sites[at], sites[at + 1u],
+                    (*count - at - 1u) * sizeof(sites[0]));
+        memset(sites[--*count], 0, sizeof(sites[0]));
+        return;
+    }
+}
+
+bool browser_profile_reset_site_permissions(
+    BrowserProfile *profile, const char *url)
+{
+    char site[CONTENT_BLOCKER_HOST_LIMIT];
+    if (profile == NULL || !content_blocker_site_from_url(url, site))
+        return false;
+    profile_remove_exact_site(
+        profile->javascript_disabled_sites,
+        &profile->javascript_disabled_site_count, site);
+    profile_remove_exact_site(
+        profile->third_party_cookie_allowed_sites,
+        &profile->third_party_cookie_allowed_site_count, site);
+    profile_remove_exact_site(
+        profile->cookie_banner_visible_sites,
+        &profile->cookie_banner_visible_site_count, site);
+    profile_remove_exact_site(
+        profile->content_blocker_allowed_sites,
+        &profile->content_blocker_allowed_site_count, site);
+    for (size_t at = 0; at < profile->reader_site_count; at++) {
+        if (strcmp(profile->reader_sites[at].site, site) != 0) continue;
+        if (profile->remember_reader_site_scale) {
+            profile->reader_sites[at].always = false;
+            break;
+        }
+        if (at + 1u < profile->reader_site_count)
+            memmove(&profile->reader_sites[at],
+                    &profile->reader_sites[at + 1u],
+                    (profile->reader_site_count - at - 1u)
+                        * sizeof(profile->reader_sites[0]));
+        memset(&profile->reader_sites[--profile->reader_site_count], 0,
+               sizeof(profile->reader_sites[0]));
+        break;
+    }
+    return true;
+}
+
 void browser_profile_set_site_data_allowed(
     BrowserProfile *profile, bool allowed)
 {

@@ -1544,6 +1544,20 @@ long browser_engine_last_tls_verify_result(const BrowserEngine *engine)
         ? 0 : engine->navigation.last_tls_verify_result;
 }
 
+bool browser_engine_last_tls_verify_result_available(
+    const BrowserEngine *engine)
+{
+    return engine != NULL && engine->navigation_ready
+        && engine->navigation.last_tls_verify_result_available;
+}
+
+bool browser_engine_last_tls_verification_failed(
+    const BrowserEngine *engine)
+{
+    return engine != NULL && engine->navigation_ready
+        && engine->navigation.last_tls_verification_failed;
+}
+
 TilefinchDiagnosticCode browser_engine_last_diagnostic_code(
     const BrowserEngine *engine)
 {
@@ -1705,6 +1719,34 @@ bool browser_engine_apply_layout_damage(BrowserEngine *engine)
         return true;
     }
     browser_engine_cancel_idle_work(engine);
+    if (engine->navigation.canvas_paint_damage_pending) {
+        const ImageResources *images = &engine->navigation.page.images;
+        for (size_t i = 0; i < images->count; i++) {
+            const ImageResource *image = &images->items[i];
+            if (image->is_canvas) {
+                tile_cache_invalidate_image_identity(
+                    &engine->render,
+                    image_resource_backing_identity(image));
+            }
+        }
+        if (!tile_cache_sync_layout_paint(
+                &engine->render,
+                engine->navigation.relayout_damage_left,
+                engine->navigation.relayout_damage_top,
+                engine->navigation.relayout_damage_right,
+                engine->navigation.relayout_damage_bottom)) {
+            return set_error_code(
+                engine, TILEFINCH_SUBSYSTEM_RENDER,
+                TILEFINCH_DIAGNOSTIC_RENDER_FAILED,
+                "render-canvas-damage",
+                "render shell could not apply canvas damage");
+        }
+        engine->navigation.canvas_paint_damage_pending = false;
+        engine->render_relayout_generation =
+            engine->navigation.incremental_relayouts;
+        clear_error(engine);
+        return true;
+    }
     if (!tile_cache_replace_layout_damage(
             &engine->render, &engine->navigation.page.layout,
             engine->navigation.relayout_damage_left,
@@ -1774,7 +1816,7 @@ bool browser_engine_optional_glyph_payloads_ready(BrowserEngine *engine)
     return true;
 }
 
-uint8_t browser_engine_glyph_script_mask(const BrowserEngine *engine)
+uint16_t browser_engine_glyph_script_mask(const BrowserEngine *engine)
 {
     return engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
         ? 0 : engine->navigation.page.document.glyph_script_mask;
@@ -3804,6 +3846,7 @@ bool browser_engine_render_frame(BrowserEngine *engine,
     if (optional_ppm_path != NULL
         && !render_write_frame_ppm(
             optional_ppm_path, engine->render.frame,
+            engine->render.frame_pixels,
             engine->config.device.framebuffer_width,
             engine->config.device.framebuffer_height)) {
         return set_error_code(
@@ -3997,7 +4040,9 @@ bool browser_engine_run_idle_work(
     size_t relayouts_before =
         engine->navigation.performance.fast_relayouts
         + engine->navigation.performance.full_relayouts;
-    if (!navigation_run_background_resources(&engine->navigation)) {
+    NavigationBackgroundWorkOutcome background_outcome =
+        navigation_run_background_resources(&engine->navigation);
+    if (background_outcome == NAVIGATION_BACKGROUND_WORK_HARD_FAILURE) {
         return set_error_code(
             engine, TILEFINCH_SUBSYSTEM_NETWORK,
             TILEFINCH_DIAGNOSTIC_NETWORK_FAILED, "background-resources",
@@ -4298,6 +4343,16 @@ bool browser_engine_view_snapshot(
         &navigation->viewport, navigation->page.layout.height);
     snapshot->loading = browser_engine_navigation_pending(engine);
     snapshot->navigation_generation = navigation->generation;
+    snapshot->tls_verify_result = navigation->last_tls_verify_result;
+    snapshot->tls_verify_result_available =
+        navigation->last_tls_verify_result_available;
+    snapshot->tls_verification_failed =
+        navigation->last_tls_verification_failed;
+    snprintf(snapshot->tls_version, sizeof(snapshot->tls_version), "%s",
+             navigation->last_tls_version);
+    snprintf(snapshot->tls_peer_issuer,
+             sizeof(snapshot->tls_peer_issuer), "%s",
+             navigation->last_tls_peer_issuer);
 
     if (engine->controller_ready) {
         int x = 0, y = 0, width = 0, height = 0;

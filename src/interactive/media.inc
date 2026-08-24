@@ -397,6 +397,8 @@ static bool interactive_media_execute_intent(
             return sought;
         }
         case PSP_UI_MEDIA_ACTION_RETRY:
+        case PSP_UI_MEDIA_ACTION_AUDIO_ONLY:
+        case PSP_UI_MEDIA_ACTION_LOWER_QUALITY:
             return true;
         case PSP_UI_MEDIA_ACTION_CLOSE:
             return interactive_media_set_visible(

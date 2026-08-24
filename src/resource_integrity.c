@@ -29,18 +29,33 @@ static bool integrity_ascii_whitespace(unsigned char character)
         || character == '\r' || character == ' ';
 }
 
+static bool integrity_ascii_equal_lower(
+    const char *value, const char *lower, size_t length)
+{
+    for (size_t i = 0; i < length; i++) {
+        unsigned char character = (unsigned char) value[i];
+        if (character >= 'A' && character <= 'Z')
+            character = (unsigned char) (character - 'A' + 'a');
+        if (character != (unsigned char) lower[i]) return false;
+    }
+    return true;
+}
+
 static IntegrityHash integrity_hash_name(const char *token, size_t length,
                                          size_t *prefix_length)
 {
-    if (length >= 7u && memcmp(token, "sha256-", 7u) == 0) {
+    if (length >= 7u
+        && integrity_ascii_equal_lower(token, "sha256-", 7u)) {
         *prefix_length = 7u;
         return INTEGRITY_HASH_SHA256;
     }
-    if (length >= 7u && memcmp(token, "sha384-", 7u) == 0) {
+    if (length >= 7u
+        && integrity_ascii_equal_lower(token, "sha384-", 7u)) {
         *prefix_length = 7u;
         return INTEGRITY_HASH_SHA384;
     }
-    if (length >= 7u && memcmp(token, "sha512-", 7u) == 0) {
+    if (length >= 7u
+        && integrity_ascii_equal_lower(token, "sha512-", 7u)) {
         *prefix_length = 7u;
         return INTEGRITY_HASH_SHA512;
     }

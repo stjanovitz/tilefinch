@@ -1268,6 +1268,19 @@
       },
       getPropertyValue(name) {
         name = cssName(name);
+        if (name === "flex") {
+          const grow = this.getPropertyValue("flex-grow"),
+            shrink = this.getPropertyValue("flex-shrink"),
+            basis = this.getPropertyValue("flex-basis");
+          if (!grow && !shrink && !basis) return "";
+          return (
+            (grow || "0") +
+            " " +
+            (shrink || "1") +
+            " " +
+            (basis || "auto")
+          );
+        }
         if (placeLonghands[name]) {
           const longhands = placeLonghands[name],
             first = this.getPropertyValue(longhands[0]),

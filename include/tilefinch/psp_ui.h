@@ -31,6 +31,7 @@
 #define PSP_UI_TEXT_ENTRY_CAPACITY 512
 #define PSP_UI_TEXT_SUGGESTION_LIMIT BROWSER_PROFILE_SUGGESTION_LIMIT
 #define PSP_UI_FIND_QUERY_LIMIT 96u
+#define PSP_UI_GLYPH_INSTALLED_MASK_BITS 9u
 
 /*
  * Native chrome surfaces (HOME and COLLECTIONS). Both read bounded views the
@@ -93,6 +94,8 @@ typedef struct {
     const char *detail;
     char trailing[PSP_UI_COLLECTIONS_TRAILING_CAPACITY];
     bool deletable;
+    uint16_t progress_per_mille;
+    uint8_t offline_state;
 } PspUiCollectionsRow;
 
 typedef struct {
@@ -161,6 +164,7 @@ typedef enum {
     PSP_UI_ACTION_SHOW_HOMEPAGE,
     PSP_UI_ACTION_SHOW_HISTORY,
     PSP_UI_ACTION_SCREENSHOT,
+    PSP_UI_ACTION_CHECK_WIFI_SIGN_IN,
     PSP_UI_ACTION_BUILD_DIAGNOSTIC_QR,
     PSP_UI_ACTION_DIAGNOSTIC_QR_PREVIOUS,
     PSP_UI_ACTION_DIAGNOSTIC_QR_NEXT,
@@ -185,8 +189,21 @@ typedef enum {
     PSP_UI_ACTION_HOME_ACTIVATE,
     PSP_UI_ACTION_COLLECTION_ACTIVATE,
     PSP_UI_ACTION_COLLECTION_DELETE,
+    PSP_UI_ACTION_RECOVERY_READER,
+    PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT,
+    PSP_UI_ACTION_RECOVERY_AUDIO_ONLY,
+    PSP_UI_ACTION_RECOVERY_LOWER_QUALITY,
+    PSP_UI_ACTION_RECOVERY_RETURN,
     PSP_UI_ACTION_EXIT
 } PspUiAction;
+
+enum {
+    PSP_UI_FAILURE_READER = 1u << 0,
+    PSP_UI_FAILURE_WIFI = 1u << 1,
+    PSP_UI_FAILURE_DISABLE_JAVASCRIPT = 1u << 2,
+    PSP_UI_FAILURE_AUDIO_ONLY = 1u << 3,
+    PSP_UI_FAILURE_LOWER_QUALITY = 1u << 4
+};
 
 typedef struct {
     uint32_t held;
@@ -320,6 +337,8 @@ typedef struct {
     bool clear_cookies_requested;
     bool clear_local_storage_requested;
     bool clear_session_storage_requested;
+    bool clear_site_data_requested;
+    bool reset_site_permissions_requested;
     bool update_primary_requested;
     bool update_cancel_requested;
     bool update_versions_requested;
@@ -343,6 +362,7 @@ typedef enum {
     PSP_UI_SCREEN_PAGE_TOOLS,
     PSP_UI_SCREEN_SITE_CONTROLS,
     PSP_UI_SCREEN_PAGE_INFORMATION,
+    PSP_UI_SCREEN_FAILURE_RECOVERY,
     PSP_UI_SCREEN_HELP,
     PSP_UI_SCREEN_HELP_DETAIL,
     PSP_UI_SCREEN_OPTIONS,
@@ -449,7 +469,12 @@ typedef struct {
     unsigned mixed_content_site_allowed : 1;
     unsigned third_party_cookie_site_allowed : 1;
     unsigned reader_site_always : 1;
+    unsigned captive_portal_active : 1;
+    unsigned captive_portal_suggested : 1;
     unsigned collections_section : 3;
+    /* Collections becomes the base while its menus are open, so one bit
+       remembers whether its original surface was HOME rather than PAGE. */
+    unsigned collections_return_home : 1;
     /* The experimental decoder-program knob the Experimental screen shows, as
        an index into psp_media_wide_program_choice, and whether a saved
        selection is currently asking to restart. Seeded from the parsed boot
@@ -474,7 +499,7 @@ typedef struct {
     /* Encodes -1..1000 as 0..1001 in the remaining bitfield word instead of
        growing this per-frame state beyond its 1 KiB ratchet. */
     unsigned voice_component_progress_plus_one : 10;
-    unsigned glyph_language : 3;
+    unsigned glyph_language : 4;
     unsigned color_emoji : 1;
     unsigned glyph_component_phase : 3;
     unsigned glyph_component_remove_confirmation : 1;
@@ -517,9 +542,12 @@ typedef struct {
     uint8_t data_clear_confirmation;
     uint8_t tab_selection;
     uint8_t experimental_options_selection;
-    uint8_t glyph_options_selection;
-    uint8_t glyph_installed_mask;
-    uint8_t glyph_operation_pack;
+    /* Nine installed packs, the active operation, and the three-row glyph
+       submenu share two bytes. This preserves the 1 KiB per-frame state
+       ratchet while leaving the provider's four-pack runtime limit intact. */
+    uint16_t glyph_installed_mask : PSP_UI_GLYPH_INSTALLED_MASK_BITS;
+    uint16_t glyph_operation_pack : 4;
+    uint16_t glyph_options_selection : 2;
     /* Native surfaces. HOME indexes tiles then CONTINUE rows in one space;
        COLLECTIONS keeps a row selection, its first visible row, and zero or
        the row awaiting a delete confirmation plus one. */
@@ -531,6 +559,7 @@ typedef struct {
     uint8_t collections_selection;
     uint8_t collections_first_row;
     uint8_t collections_delete_confirmation;
+    uint8_t failure_actions;
     const PspUiTabsView *tabs;
     /* Exactly one native surface is showing at a time, so their views share
        a slot the way the text-entry and find views already do. */
@@ -583,6 +612,15 @@ typedef struct {
         char update_history_versions[TILEFINCH_UPDATE_HISTORY_LIMIT]
                                     [TILEFINCH_UPDATE_HISTORY_VERSION_CAPACITY];
         char network_profile_label[128];
+        struct {
+            char site_tls_version[16];
+            char site_tls_issuer[96];
+            uint32_t site_data_bytes;
+            uint16_t site_cookie_count;
+            uint16_t site_storage_count;
+            int32_t site_tls_verify_result;
+            bool site_tls_verify_result_available;
+        };
     };
     /* Borrowed only while the synchronous native text-entry loop is active;
        psp_ui_clear_text_entry() runs before that stack frame can unwind. */
@@ -593,6 +631,9 @@ typedef struct {
     };
 } PspUiState;
 
+void psp_ui_show_failure_recovery(
+    PspUiState *ui, const char *detail, uint8_t available_actions);
+
 typedef enum {
     PSP_UI_MEDIA_ACTION_NONE = 0,
     PSP_UI_MEDIA_ACTION_PLAY_PAUSE,
@@ -600,6 +641,8 @@ typedef enum {
     PSP_UI_MEDIA_ACTION_CANCEL_SEEK_PREVIEW,
     PSP_UI_MEDIA_ACTION_SEEK,
     PSP_UI_MEDIA_ACTION_RETRY,
+    PSP_UI_MEDIA_ACTION_AUDIO_ONLY,
+    PSP_UI_MEDIA_ACTION_LOWER_QUALITY,
     PSP_UI_MEDIA_ACTION_CLOSE
 } PspUiMediaAction;
 
@@ -631,9 +674,12 @@ typedef struct {
      * so a caller which knows nothing about quarantine keeps the retry.
      */
     bool retry_unavailable;
+    bool audio_only_recovery_available;
+    bool lower_quality_recovery_available;
     bool playing;
     bool ended;
     bool buffering;
+    bool live;
     bool seek_preview_active;
     /* Authoritative capabilities projected by the media state machine. */
     bool controls_enabled;
@@ -749,6 +795,8 @@ void psp_ui_show_status(PspUiState *ui, const char *status,
 void psp_ui_show_tls_status(
     PspUiState *ui, const char *headline,
     TilefinchTlsGuidance guidance, unsigned duration_frames);
+void psp_ui_show_wifi_sign_in_status(
+    PspUiState *ui, const char *headline, unsigned duration_frames);
 void psp_ui_set_update(
     PspUiState *ui, const char *version, const char *status,
     const char *notes, int progress_per_mille, const char *primary_label,
@@ -761,7 +809,7 @@ void psp_ui_set_voice_component(
     PspUiState *ui, PspUiVoiceComponentPhase phase,
     int progress_per_mille);
 void psp_ui_set_glyph_component(
-    PspUiState *ui, uint8_t installed_mask, uint8_t operation_pack,
+    PspUiState *ui, uint16_t installed_mask, uint8_t operation_pack,
     PspUiGlyphComponentPhase phase, int progress_per_mille);
 void psp_ui_set_tabs(PspUiState *ui, const PspUiTabsView *tabs);
 /*
@@ -895,31 +943,26 @@ void psp_ui_media_composite_with_preview(
     uint16_t *pixels, int width, int height, int stride);
 
 /*
- * The rows psp_ui_media_composite_with_preview may write, as half-open
- * [top, bottom) ranges, sorted and merged.
- *
- * The player's overlay is composed in 16-bit colour and, during fullscreen
- * video, has to reach a 32-bit buffer (see src/psp_ui_media_8888.c). The
- * conversion is per row, so what the wrapper needs is exactly this: which rows
- * the composite reads as a blend backdrop and writes as a result. Everything
- * else in the frame is the decoder's bytes and must not be round-tripped
- * through 16 bits at all.
- *
- * Returns the number of bands written, 0 when the composite would draw
- * nothing. tests/test_psp_ui.c holds the two in step by compositing into a
- * poisoned surface and requiring that no pixel outside the declared bands
- * moved.
+ * The exact rectangles psp_ui_media_composite_with_preview may touch. They
+ * are half-open, clipped, disjoint, and carry whether untouched pixels inside
+ * the rectangle must be imported as the rounded shape's blend backdrop.
+ * Opaque title/control bars can begin from cleared scratch instead, avoiding
+ * any decoded-video RGB565 round trip. The bounded sweep in psp_ui.c unions
+ * overlaps without widening them to an enclosing rectangle.
  */
 typedef struct {
+    int left;
     int top;
+    int right;
     int bottom;
-} PspUiRowBand;
+    bool needs_backdrop;
+} PspUiOverlayRegion;
 
-#define PSP_UI_MEDIA_OVERLAY_BAND_LIMIT 3u
+#define PSP_UI_MEDIA_OVERLAY_REGION_LIMIT 16u
 
-size_t psp_ui_media_overlay_bands(
-    const PspUiMediaState *media, int width, int height,
-    PspUiRowBand *bands, size_t capacity);
+size_t psp_ui_media_overlay_regions(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    int width, int height, PspUiOverlayRegion *regions, size_t capacity);
 
 /* Repaint only the opaque scrubber/legend band. This is used by the
  * cooperative seek supervisor while the last complete video frame remains
@@ -931,8 +974,8 @@ void psp_ui_media_composite_controls(
 /*
  * Composite the same overlay over a 32-bit video buffer, using `scratch` --
  * a 16-bit surface of the same stride and height -- as the working surface.
- * Only the rows psp_ui_media_overlay_bands reports are converted in either
- * direction; the picture keeps the decoder's own bytes. See
+ * Only the rectangles psp_ui_media_overlay_regions reports are copied in
+ * either direction; the picture keeps the decoder's own bytes. See
  * src/psp_ui_media_8888.c for the channel mapping and where it was measured.
  */
 void psp_ui_media_composite_8888(

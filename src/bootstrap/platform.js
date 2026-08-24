@@ -2195,6 +2195,9 @@
         const options = selectOptions(control);
         for (const option of options)
           markOptionSelected(option, option.hasAttribute("selected"));
+        if (!control.multiple && !selectedOptionSet(control).length
+            && options.length) markOptionSelected(options[0], true);
+        syncSelectedContent(control);
       } else if (control instanceof HTMLOutputElement) {
         control.value = control.defaultValue;
       } else {
@@ -2455,6 +2458,10 @@
     )
       return value;
     if (value instanceof ArrayBuffer) return value.slice(0);
+    if (value instanceof DataView) {
+      const buffer = value.buffer.slice(0);
+      return new DataView(buffer, value.byteOffset, value.byteLength);
+    }
     if (ArrayBuffer.isView(value)) return new value.constructor(value);
     if (Array.isArray(value)) {
       if (value.length > 1024)
@@ -6238,6 +6245,7 @@
     "rotate",
     "scale",
     "isolation",
+    "flex",
     "flex-basis",
     "content-visibility",
     "-webkit-line-clamp",

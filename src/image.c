@@ -3,7 +3,6 @@
 #include <ctype.h>
 #include <limits.h>
 #include <math.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,923 +17,21 @@
 #include "tilefinch/layout.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/url.h"
+#include "image_decode_internal.h"
+#include "image_svg_decode_internal.h"
 #include "style_internal.h"
 
-#if defined(__PSP__)
-#include <pspkernel.h>
-
-#include "tilefinch/psp_threads.h"
-#include "psp_thread_contract.h"
-#endif
-
 #include <lexbor/html/serialize.h>
-#include <webp/decode.h>
 
 #undef budget_malloc
 #undef budget_calloc
 #undef budget_realloc
-#define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_RESOURCE, (s))
-#define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_RESOURCE, (n), (s))
-#define budget_realloc(b, p, s) budget_realloc_category((b), BUDGET_CATEGORY_RESOURCE, (p), (s))
-
-typedef struct {
-    unsigned char *base;
-    size_t capacity;
-    size_t used;
-    bool exhausted;
-} ImageDecodeArena;
-
-typedef union {
-    struct {
-        size_t size;
-    } value;
-    max_align_t alignment;
-} ImageDecodeArenaHeader;
-
-static Budget *decode_budget;
-static ImageDecodeArena *decode_arena;
-static atomic_bool decode_gate = ATOMIC_VAR_INIT(false);
-static atomic_bool image_worker_decode_pending = ATOMIC_VAR_INIT(false);
-
-static bool image_decode_begin_budget(Budget *budget)
-{
-    bool expected = false;
-    if (budget == NULL || atomic_load_explicit(
-            &image_worker_decode_pending, memory_order_acquire)
-        || !atomic_compare_exchange_strong_explicit(
-            &decode_gate, &expected, true,
-            memory_order_acquire, memory_order_relaxed)) return false;
-    decode_budget = budget;
-    decode_arena = NULL;
-    return true;
-}
-
-static bool image_decode_begin_arena(ImageDecodeArena *arena)
-{
-    bool expected = false;
-    if (arena == NULL || !atomic_compare_exchange_strong_explicit(
-            &decode_gate, &expected, true,
-            memory_order_acquire, memory_order_relaxed)) return false;
-    decode_budget = NULL;
-    decode_arena = arena;
-    return true;
-}
-
-static void image_decode_end(void)
-{
-    decode_budget = NULL;
-    decode_arena = NULL;
-    atomic_store_explicit(&decode_gate, false, memory_order_release);
-}
-
-static bool image_decode_busy(void)
-{
-    return atomic_load_explicit(
-               &image_worker_decode_pending, memory_order_acquire)
-        || atomic_load_explicit(&decode_gate, memory_order_acquire);
-}
-
-static void *image_arena_malloc(size_t size)
-{
-    ImageDecodeArena *arena = decode_arena;
-    if (arena == NULL) return NULL;
-    if (size == 0) size = 1;
-    const size_t alignment = _Alignof(max_align_t);
-    size_t header_at = arena->used;
-    size_t remainder = header_at % alignment;
-    if (remainder != 0) header_at += alignment - remainder;
-    if (header_at > arena->capacity
-        || sizeof(ImageDecodeArenaHeader) > arena->capacity - header_at
-        || size > arena->capacity - header_at
-                         - sizeof(ImageDecodeArenaHeader)) {
-        arena->exhausted = true;
-        return NULL;
-    }
-    ImageDecodeArenaHeader *header =
-        (ImageDecodeArenaHeader *) (void *) (arena->base + header_at);
-    header->value.size = size;
-    arena->used = header_at + sizeof(*header) + size;
-    return header + 1;
-}
-
-static void *image_arena_realloc(void *pointer, size_t size)
-{
-    if (pointer == NULL) return image_arena_malloc(size);
-    if (size == 0) return NULL;
-    ImageDecodeArenaHeader *header =
-        ((ImageDecodeArenaHeader *) pointer) - 1;
-    void *replacement = image_arena_malloc(size);
-    if (replacement != NULL) {
-        size_t copied = header->value.size < size
-            ? header->value.size : size;
-        memcpy(replacement, pointer, copied);
-    }
-    return replacement;
-}
-
-static bool image_is_webp(const unsigned char *encoded, size_t length)
-{
-    return encoded != NULL && length >= 12
-        && memcmp(encoded, "RIFF", 4) == 0
-        && memcmp(encoded + 8, "WEBP", 4) == 0;
-}
-
-static unsigned char *image_decode_webp_scaled(
-    const unsigned char *encoded, size_t encoded_length,
-    int target_width, int target_height, int *source_width,
-    int *source_height, int *components, bool *interrupted)
-{
-    if (interrupted != NULL) *interrupted = false;
-    if (decode_budget == NULL || !image_is_webp(encoded, encoded_length)
-        || target_width <= 0 || target_height <= 0
-        || encoded_length > INT32_MAX) return NULL;
-    WebPDecoderConfig config;
-    if (!WebPInitDecoderConfig(&config)
-        || WebPGetFeatures(encoded, encoded_length, &config.input)
-               != VP8_STATUS_OK
-        || config.input.width <= 0 || config.input.height <= 0
-        || config.input.has_animation
-        || target_width > config.input.width
-        || target_height > config.input.height) return NULL;
-    const int decoded_source_width = config.input.width;
-    const int decoded_source_height = config.input.height;
-    if ((size_t) target_width > SIZE_MAX / (size_t) target_height
-        || (size_t) target_width * (size_t) target_height
-               > SIZE_MAX / 4u) return NULL;
-    size_t target_pixels = (size_t) target_width * (size_t) target_height;
-
-    /* libwebp owns transient coefficient/YUV scratch even when its RGBA
-       destination is caller-owned. Lossless streams alone retain a four-byte
-       source-sized transform plane plus row caches and Huffman metadata, so
-       pre-admit a conservative eight source bytes per pixel plus the encoded
-       stream before entering the upstream allocator. The ordinary shared
-       budget can refuse a very large image without exposing raw allocations
-       outside Tilefinch's memory discipline. */
-    if ((size_t) decoded_source_width
-            > SIZE_MAX / (size_t) decoded_source_height) return NULL;
-    size_t source_pixels = (size_t) decoded_source_width
-                           * (size_t) decoded_source_height;
-    if (source_pixels > (SIZE_MAX - encoded_length) / 8u) return NULL;
-    size_t scratch_bytes = source_pixels * 8u + encoded_length;
-    BudgetReservation scratch = {0};
-    if (!budget_reservation_acquire(
-            &scratch, decode_budget, BUDGET_CATEGORY_RESOURCE,
-            scratch_bytes)) return NULL;
-    size_t target_bytes = target_pixels * 4u;
-    unsigned char *output = budget_malloc(decode_budget, target_bytes);
-    if (output == NULL) {
-        budget_reservation_release(&scratch);
-        return NULL;
-    }
-    config.options.use_scaling = target_width != config.input.width
-                                 || target_height != config.input.height;
-    config.options.scaled_width = target_width;
-    config.options.scaled_height = target_height;
-    config.options.use_threads = 0;
-    config.output.colorspace = MODE_RGBA;
-    config.output.is_external_memory = 1;
-    config.output.u.RGBA.rgba = output;
-    config.output.u.RGBA.stride = target_width * 4;
-    config.output.u.RGBA.size = target_bytes;
-    /* The one-shot decoder can spend hundreds of milliseconds inside one
-       upstream call on Allegrex, including when invoked by a raster cache
-       miss. Feed the same decoder incrementally so input/cancel/watchdog
-       service gets a checkpoint between small compressed-data windows. The
-       external destination and source-pixel reservation keep ownership and
-       memory accounting identical to the one-shot path. */
-    WebPIDecoder *decoder = WebPIDecode(NULL, 0, &config);
-    VP8StatusCode status = VP8_STATUS_SUSPENDED;
-    size_t offset = 0;
-    size_t work_units = 0;
-    while (decoder != NULL && offset < encoded_length
-           && status == VP8_STATUS_SUSPENDED) {
-        size_t chunk = encoded_length - offset;
-        if (chunk > 2048u) chunk = 2048u;
-        status = WebPIAppend(decoder, encoded + offset, chunk);
-        offset += chunk;
-        work_units++;
-        if (status == VP8_STATUS_SUSPENDED && offset < encoded_length
-            && !tilefinch_platform_cooperate(
-                   "image-webp-decode", work_units)) {
-            if (interrupted != NULL) *interrupted = true;
-            break;
-        }
-    }
-    if (decoder != NULL) WebPIDelete(decoder);
-    WebPFreeDecBuffer(&config.output);
-    budget_reservation_release(&scratch);
-    if (status != VP8_STATUS_OK) {
-        budget_free(decode_budget, output);
-        return NULL;
-    }
-    if (source_width != NULL) *source_width = decoded_source_width;
-    if (source_height != NULL) *source_height = decoded_source_height;
-    if (components != NULL) *components = config.input.has_alpha ? 4 : 3;
-    return output;
-}
-
-static void *image_malloc(size_t size)
-{
-    return decode_arena != NULL
-        ? image_arena_malloc(size) : budget_malloc(decode_budget, size);
-}
-
-static void *image_realloc(void *pointer, size_t size)
-{
-    return decode_arena != NULL
-        ? image_arena_realloc(pointer, size)
-        : budget_realloc(decode_budget, pointer, size);
-}
-
-static void image_free(void *pointer)
-{
-    if (decode_arena == NULL) budget_free(decode_budget, pointer);
-}
-
-#define STBI_MALLOC(size) image_malloc(size)
-#define STBI_REALLOC(pointer, size) image_realloc((pointer), (size))
-#define STBI_FREE(pointer) image_free(pointer)
-#define STBI_NO_STDIO
-#define STBI_NO_HDR
-#define STBI_NO_LINEAR
-#if defined(TILEFINCH_DISABLE_GIF)
-#define STBI_NO_GIF
-#endif
-#define STB_IMAGE_IMPLEMENTATION
-#include <stb_image.h>
-
-#if !defined(TILEFINCH_DISABLE_GIF)
-static bool image_is_gif(const unsigned char *encoded, size_t length)
-{
-    return encoded != NULL && length >= 6u
-        && (memcmp(encoded, "GIF87a", 6u) == 0
-            || memcmp(encoded, "GIF89a", 6u) == 0);
-}
-
-/* stb's public GIF entry point places stbi__gif (whose LZW table is roughly
-   35 KiB) on the caller's stack. That exceeds the PSP thread-frame policy.
-   The same internal decoder is safe when its state is charged to the bounded
-   image Budget instead; Tilefinch needs only the first composited frame. */
-static unsigned char *image_decode_gif_first_frame(
-    const unsigned char *encoded, int encoded_length,
-    int *width, int *height, int *components)
-{
-    if (encoded == NULL || encoded_length <= 0 || width == NULL
-        || height == NULL || components == NULL) return NULL;
-    stbi__context stream;
-    stbi__start_mem(&stream, encoded, encoded_length);
-    if (!stbi__gif_test(&stream)) return NULL;
-    stbi__rewind(&stream);
-    stbi__gif *gif = (stbi__gif *) stbi__malloc(sizeof(*gif));
-    if (gif == NULL) return NULL;
-    memset(gif, 0, sizeof(*gif));
-    stbi_uc *pixels = stbi__gif_load_next(
-        &stream, gif, components, 4, NULL);
-    if (pixels == (stbi_uc *) &stream) pixels = NULL;
-    if (pixels != NULL) {
-        *width = gif->w;
-        *height = gif->h;
-        *components = 4;
-    } else if (gif->out != NULL) {
-        STBI_FREE(gif->out);
-    }
-    STBI_FREE(gif->history);
-    STBI_FREE(gif->background);
-    STBI_FREE(gif);
-    return pixels;
-}
-#endif
-
-/* stb_image's ordinary JPEG path materializes a full RGBA source after its
-   component planes.  That transient peak is unnecessary when the retained
-   resource is already bounded to the physical viewport.  Reuse stb's JPEG
-   decoder and resamplers, but emit only the requested rows and columns into
-   the final target.  The component decoder remains upstream and unchanged;
-   this function only replaces load_jpeg_image's full-size color-conversion
-   surface. */
-static unsigned char *image_decode_jpeg_scaled(
-    const unsigned char *encoded, int encoded_length,
-    int target_width, int target_height, int *source_width,
-    int *source_height, int *components, unsigned char *external_output)
-{
-    if (encoded == NULL || encoded_length <= 0
-        || target_width <= 0 || target_height <= 0) return NULL;
-    stbi__context stream;
-    stbi__start_mem(&stream, encoded, encoded_length);
-    if (!stbi__jpeg_test(&stream)) return NULL;
-    stbi__rewind(&stream);
-    stbi__jpeg *jpeg = (stbi__jpeg *) stbi__malloc(sizeof(*jpeg));
-    if (jpeg == NULL) return NULL;
-    memset(jpeg, 0, sizeof(*jpeg));
-    jpeg->s = &stream;
-    stbi__setup_jpeg(jpeg);
-    if (!stbi__decode_jpeg_image(jpeg)) {
-        stbi__cleanup_jpeg(jpeg);
-        STBI_FREE(jpeg);
-        return NULL;
-    }
-    int width = stream.img_x;
-    int height = stream.img_y;
-    int decode_components = stream.img_n;
-    if (width <= 0 || height <= 0 || decode_components <= 0
-        || target_width > width || target_height > height
-        || (size_t) target_width > SIZE_MAX / (size_t) target_height
-        || (size_t) target_width * (size_t) target_height > SIZE_MAX / 4u) {
-        stbi__cleanup_jpeg(jpeg);
-        STBI_FREE(jpeg);
-        return NULL;
-    }
-
-    stbi__resample resample[4];
-    stbi_uc *component_rows[4] = {NULL, NULL, NULL, NULL};
-    bool setup_ok = decode_components <= 4;
-    for (int component = 0; setup_ok && component < decode_components;
-         component++) {
-        stbi__resample *row = &resample[component];
-        jpeg->img_comp[component].linebuf =
-            (stbi_uc *) stbi__malloc((size_t) width + 3u);
-        if (jpeg->img_comp[component].linebuf == NULL) {
-            setup_ok = false;
-            break;
-        }
-        row->hs = jpeg->img_h_max / jpeg->img_comp[component].h;
-        row->vs = jpeg->img_v_max / jpeg->img_comp[component].v;
-        row->ystep = row->vs >> 1;
-        row->w_lores = (width + row->hs - 1) / row->hs;
-        row->ypos = 0;
-        row->line0 = row->line1 = jpeg->img_comp[component].data;
-        if (row->hs == 1 && row->vs == 1) {
-            row->resample = resample_row_1;
-        } else if (row->hs == 1 && row->vs == 2) {
-            row->resample = stbi__resample_row_v_2;
-        } else if (row->hs == 2 && row->vs == 1) {
-            row->resample = stbi__resample_row_h_2;
-        } else if (row->hs == 2 && row->vs == 2) {
-            row->resample = jpeg->resample_row_hv_2_kernel;
-        } else {
-            row->resample = stbi__resample_row_generic;
-        }
-    }
-    size_t target_bytes = (size_t) target_width * (size_t) target_height * 4u;
-    stbi_uc *output = setup_ok && external_output != NULL
-        ? external_output
-        : setup_ok ? (stbi_uc *) stbi__malloc(target_bytes) : NULL;
-    stbi_uc *rgba_row = output == NULL
-        ? NULL : (stbi_uc *) stbi__malloc((size_t) width * 4u);
-    if (output == NULL || rgba_row == NULL) setup_ok = false;
-
-    int next_target_y = 0;
-    bool source_is_rgb = stream.img_n == 3
-        && (jpeg->rgb == 3
-            || (jpeg->app14_color_transform == 0 && !jpeg->jfif));
-    for (int source_y = 0; setup_ok && source_y < height; source_y++) {
-        for (int component = 0; component < decode_components; component++) {
-            stbi__resample *row = &resample[component];
-            int lower = row->ystep >= (row->vs >> 1);
-            component_rows[component] = row->resample(
-                jpeg->img_comp[component].linebuf,
-                lower ? row->line1 : row->line0,
-                lower ? row->line0 : row->line1,
-                row->w_lores, row->hs);
-            if (++row->ystep >= row->vs) {
-                row->ystep = 0;
-                row->line0 = row->line1;
-                if (++row->ypos < jpeg->img_comp[component].y) {
-                    row->line1 += jpeg->img_comp[component].w2;
-                }
-            }
-        }
-        int wanted_source_y = next_target_y < target_height
-            ? tilefinch_mul_div_int(next_target_y, height, target_height)
-            : height;
-        if (wanted_source_y != source_y) continue;
-
-        if (stream.img_n == 3 && source_is_rgb) {
-            for (int x = 0; x < width; x++) {
-                rgba_row[(size_t) x * 4u] = component_rows[0][x];
-                rgba_row[(size_t) x * 4u + 1u] = component_rows[1][x];
-                rgba_row[(size_t) x * 4u + 2u] = component_rows[2][x];
-                rgba_row[(size_t) x * 4u + 3u] = 255;
-            }
-        } else if (stream.img_n == 3) {
-            jpeg->YCbCr_to_RGB_kernel(
-                rgba_row, component_rows[0], component_rows[1],
-                component_rows[2], width, 4);
-        } else if (stream.img_n == 4
-                   && jpeg->app14_color_transform == 0) {
-            for (int x = 0; x < width; x++) {
-                stbi_uc multiplier = component_rows[3][x];
-                rgba_row[(size_t) x * 4u] = stbi__blinn_8x8(
-                    component_rows[0][x], multiplier);
-                rgba_row[(size_t) x * 4u + 1u] = stbi__blinn_8x8(
-                    component_rows[1][x], multiplier);
-                rgba_row[(size_t) x * 4u + 2u] = stbi__blinn_8x8(
-                    component_rows[2][x], multiplier);
-                rgba_row[(size_t) x * 4u + 3u] = 255;
-            }
-        } else if (stream.img_n == 4
-                   && jpeg->app14_color_transform == 2) {
-            jpeg->YCbCr_to_RGB_kernel(
-                rgba_row, component_rows[0], component_rows[1],
-                component_rows[2], width, 4);
-            for (int x = 0; x < width; x++) {
-                stbi_uc multiplier = component_rows[3][x];
-                rgba_row[(size_t) x * 4u] = stbi__blinn_8x8(
-                    255 - rgba_row[(size_t) x * 4u], multiplier);
-                rgba_row[(size_t) x * 4u + 1u] = stbi__blinn_8x8(
-                    255 - rgba_row[(size_t) x * 4u + 1u], multiplier);
-                rgba_row[(size_t) x * 4u + 2u] = stbi__blinn_8x8(
-                    255 - rgba_row[(size_t) x * 4u + 2u], multiplier);
-            }
-        } else if (stream.img_n >= 3) {
-            jpeg->YCbCr_to_RGB_kernel(
-                rgba_row, component_rows[0], component_rows[1],
-                component_rows[2], width, 4);
-        } else {
-            for (int x = 0; x < width; x++) {
-                stbi_uc value = component_rows[0][x];
-                rgba_row[(size_t) x * 4u] = value;
-                rgba_row[(size_t) x * 4u + 1u] = value;
-                rgba_row[(size_t) x * 4u + 2u] = value;
-                rgba_row[(size_t) x * 4u + 3u] = 255;
-            }
-        }
-        while (next_target_y < target_height
-               && tilefinch_mul_div_int(
-                      next_target_y, height, target_height) == source_y) {
-            stbi_uc *target_row = output
-                + (size_t) next_target_y * (size_t) target_width * 4u;
-            int source_x = 0;
-            int remainder = 0;
-            for (int target_x = 0; target_x < target_width; target_x++) {
-                memcpy(target_row + (size_t) target_x * 4u,
-                       rgba_row + (size_t) source_x * 4u, 4u);
-                remainder += width;
-                while (remainder >= target_width) {
-                    source_x++;
-                    remainder -= target_width;
-                }
-                if (source_x >= width) source_x = width - 1;
-            }
-            next_target_y++;
-        }
-    }
-    STBI_FREE(rgba_row);
-    stbi__cleanup_jpeg(jpeg);
-    STBI_FREE(jpeg);
-    if (!setup_ok || next_target_y != target_height) {
-        if (external_output == NULL) STBI_FREE(output);
-        return NULL;
-    }
-    if (source_width != NULL) *source_width = width;
-    if (source_height != NULL) *source_height = height;
-    if (components != NULL) *components = stream.img_n >= 3 ? 3 : 1;
-    return output;
-}
-
-/* JPEG entropy decoding is the one raster operation that cannot be sliced
-   inside stb without maintaining a private fork. On PSP it therefore runs
-   in one lower-priority slot: input preempts the worker, while the browser
-   thread remains the sole publisher of pixels and layout. The worker never
-   enters Budget. Its complete allocation arena is admitted by the browser
-   thread before dispatch and shrunk to the final RGBA prefix on collection. */
-#define IMAGE_DECODE_WORKER_STACK_BYTES (32u * 1024u)
-#define IMAGE_DECODE_WORKER_WAKE 1u
-#define IMAGE_DECODE_WORKER_SCRATCH_FLOOR (128u * 1024u)
-
-typedef enum {
-    IMAGE_DECODE_WORKER_FREE = 0,
-    IMAGE_DECODE_WORKER_QUEUED,
-    IMAGE_DECODE_WORKER_RUNNING,
-    IMAGE_DECODE_WORKER_READY
-} ImageDecodeWorkerState;
-
-typedef struct {
-    ImageDecodeStatus status;
-    unsigned char *pixels;
-    size_t pixel_bytes;
-    int source_width;
-    int source_height;
-} ImageDecodeWorkerResult;
-
-typedef enum {
-    IMAGE_DECODE_SUBMIT_REJECTED = -1,
-    IMAGE_DECODE_SUBMIT_BUSY = 0,
-    IMAGE_DECODE_SUBMIT_ACCEPTED = 1
-} ImageDecodeSubmitResult;
-
-typedef struct {
-    atomic_uint state;
-    atomic_bool stop_requested;
-    atomic_bool failed;
-    Budget *budget;
-    BudgetReservation stack_reservation;
-    BrowserSharedBody *encoded_body;
-    unsigned char *arena_storage;
-    size_t arena_bytes;
-    size_t output_bytes;
-    ImageDecodeArena arena;
-    uint32_t generation;
-    const unsigned char *encoded;
-    size_t encoded_length;
-    int target_width;
-    int target_height;
-    int source_width;
-    int source_height;
-    ImageDecodeStatus result_status;
-    uint32_t abandoned_generation;
-    bool initialized;
-#if defined(__PSP__)
-    SceUID event;
-    SceUID thread;
-#endif
-} ImageDecodeWorker;
-
-static ImageDecodeWorker image_decode_worker;
-
-static void image_decode_worker_execute(ImageDecodeWorker *worker)
-{
-    if (worker == NULL) return;
-    atomic_store_explicit(
-        &worker->state, IMAGE_DECODE_WORKER_RUNNING,
-        memory_order_release);
-    int source_width = 0, source_height = 0, components = 0;
-    unsigned char *pixels = NULL;
-    bool entered = image_decode_begin_arena(&worker->arena);
-    if (entered) {
-        pixels = image_decode_jpeg_scaled(
-            worker->encoded, (int) worker->encoded_length,
-            worker->target_width, worker->target_height,
-            &source_width, &source_height, &components,
-            worker->arena_storage);
-        image_decode_end();
-    }
-    worker->source_width = source_width;
-    worker->source_height = source_height;
-    worker->result_status = pixels != NULL
-        && source_width > 0 && source_height > 0
-        ? IMAGE_DECODE_SUCCEEDED
-        : worker->arena.exhausted || !entered
-          ? IMAGE_DECODE_TRANSIENT_FAILURE
-          : IMAGE_DECODE_DETERMINISTIC_FAILURE;
-    atomic_store_explicit(
-        &worker->state, IMAGE_DECODE_WORKER_READY,
-        memory_order_release);
-}
-
-#if defined(__PSP__)
-static int image_decode_worker_main(SceSize argument_size, void *arguments)
-{
-    ImageDecodeWorker *worker = NULL;
-    if (arguments != NULL && argument_size == sizeof(worker))
-        memcpy(&worker, arguments, sizeof(worker));
-    if (worker == NULL) return -1;
-    while (!atomic_load_explicit(
-               &worker->stop_requested, memory_order_acquire)) {
-        uint32_t bits = 0;
-        int waited = sceKernelWaitEventFlag(
-            worker->event, IMAGE_DECODE_WORKER_WAKE,
-            PSP_EVENT_WAITOR | PSP_EVENT_WAITCLEAR, &bits, NULL);
-        if (waited < 0) {
-            atomic_store_explicit(
-                &worker->failed, true, memory_order_release);
-            if (atomic_load_explicit(
-                    &worker->state, memory_order_acquire)
-                == IMAGE_DECODE_WORKER_QUEUED) {
-                worker->result_status = IMAGE_DECODE_TRANSIENT_FAILURE;
-                atomic_store_explicit(
-                    &worker->state, IMAGE_DECODE_WORKER_READY,
-                    memory_order_release);
-            }
-            break;
-        }
-        if (atomic_load_explicit(
-                &worker->stop_requested, memory_order_acquire)) break;
-        if (atomic_load_explicit(
-                &worker->state, memory_order_acquire)
-            == IMAGE_DECODE_WORKER_QUEUED) {
-            image_decode_worker_execute(worker);
-        }
-    }
-    return 0;
-}
-#endif
-
-static bool image_decode_worker_start(Budget *budget)
-{
-    ImageDecodeWorker *worker = &image_decode_worker;
-    /* The PSP frontend owns one BrowserEngine and one Budget at a time. Keep
-       that physical ownership explicit: a second host engine must use the
-       synchronous fallback rather than sharing a worker whose stack and job
-       arena are charged to the first engine. */
-    if (worker->initialized) return worker->budget == budget;
-    memset(worker, 0, sizeof(*worker));
-    atomic_init(&worker->state, IMAGE_DECODE_WORKER_FREE);
-    atomic_init(&worker->stop_requested, false);
-    atomic_init(&worker->failed, false);
-    worker->budget = budget;
-#if defined(__PSP__)
-    worker->event = -1;
-    worker->thread = -1;
-    if (!budget_reservation_acquire(
-            &worker->stack_reservation, budget,
-            BUDGET_CATEGORY_RESOURCE,
-            IMAGE_DECODE_WORKER_STACK_BYTES)) return false;
-    worker->event = sceKernelCreateEventFlag(
-        "tilefinch_jpeg", PSP_EVENT_WAITSINGLE, 0, NULL);
-    worker->thread = worker->event < 0 ? -1 : sceKernelCreateThread(
-        "tilefinch_jpeg", image_decode_worker_main,
-        TILEFINCH_PSP_THREAD_PRIORITY_IMAGE_DECODE,
-        IMAGE_DECODE_WORKER_STACK_BYTES, PSP_THREAD_ATTR_USER, NULL);
-    ImageDecodeWorker *pointer = worker;
-    if (worker->event < 0 || worker->thread < 0
-        || sceKernelStartThread(
-               worker->thread, sizeof(pointer), &pointer) < 0) {
-        if (worker->thread >= 0)
-            (void) sceKernelDeleteThread(worker->thread);
-        if (worker->event >= 0)
-            (void) sceKernelDeleteEventFlag(worker->event);
-        budget_reservation_release(&worker->stack_reservation);
-        memset(worker, 0, sizeof(*worker));
-        return false;
-    }
-#endif
-    worker->initialized = true;
-    return true;
-}
-
-static void image_decode_worker_release_job(ImageDecodeWorker *worker)
-{
-    if (worker == NULL) return;
-    browser_shared_body_release(worker->encoded_body);
-    worker->encoded_body = NULL;
-    budget_free(worker->budget, worker->arena_storage);
-    worker->arena_storage = NULL;
-    worker->arena_bytes = 0;
-    worker->output_bytes = 0;
-    worker->encoded = NULL;
-    worker->encoded_length = 0;
-    worker->abandoned_generation = 0;
-    memset(&worker->arena, 0, sizeof(worker->arena));
-    atomic_store_explicit(
-        &image_worker_decode_pending, false, memory_order_release);
-    atomic_store_explicit(
-        &worker->state, IMAGE_DECODE_WORKER_FREE,
-        memory_order_release);
-}
-
-static bool image_jpeg_progressive(
-    const unsigned char *encoded, size_t length)
-{
-    if (encoded == NULL || length < 4u
-        || encoded[0] != 0xffu || encoded[1] != 0xd8u) return false;
-    size_t at = 2u;
-    while (at + 1u < length) {
-        while (at < length && encoded[at] != 0xffu) at++;
-        while (at < length && encoded[at] == 0xffu) at++;
-        if (at >= length) break;
-        unsigned marker = encoded[at++];
-        if (marker == 0xc2u) return true;
-        if (marker == 0xc0u || marker == 0xc1u || marker == 0xdau
-            || marker == 0xd9u) return false;
-        if (marker == 0x01u || (marker >= 0xd0u && marker <= 0xd8u))
-            continue;
-        if (at + 1u >= length) break;
-        size_t segment = ((size_t) encoded[at] << 8u) | encoded[at + 1u];
-        if (segment < 2u || segment > length - at) break;
-        at += segment;
-    }
-    return false;
-}
-
-static ImageDecodeSubmitResult image_decode_worker_submit(
-    const ImageResource *resource, Budget *budget, uint32_t *token)
-{
-    if (resource == NULL || budget == NULL || token == NULL
-        || resource->encoded_body == NULL
-        || resource->encoded == NULL || resource->encoded_length < 2u
-        || resource->encoded_length > INT32_MAX
-        || resource->encoded[0] != 0xffu || resource->encoded[1] != 0xd8u
-        || resource->source_width <= resource->width
-        || resource->source_height <= resource->height
-        || resource->width <= 0 || resource->height <= 0
-        || resource->source_width <= 0 || resource->source_height <= 0)
-        return IMAGE_DECODE_SUBMIT_REJECTED;
-    ImageDecodeWorker *worker = &image_decode_worker;
-    if (!image_decode_worker_start(budget))
-        return IMAGE_DECODE_SUBMIT_REJECTED;
-    if (atomic_load_explicit(&worker->failed, memory_order_acquire))
-        return IMAGE_DECODE_SUBMIT_REJECTED;
-    unsigned state = atomic_load_explicit(
-        &worker->state, memory_order_acquire);
-    if (state == IMAGE_DECODE_WORKER_READY) {
-        /* READY belongs to the token holder until it collects or explicitly
-           abandons the generation. Never make room for a second producer by
-           silently discarding another continuation's completed pixels. */
-        if (worker->abandoned_generation != worker->generation)
-            return IMAGE_DECODE_SUBMIT_BUSY;
-        image_decode_worker_release_job(worker);
-        state = IMAGE_DECODE_WORKER_FREE;
-    }
-    if (state != IMAGE_DECODE_WORKER_FREE)
-        return IMAGE_DECODE_SUBMIT_BUSY;
-    size_t source_width = (size_t) resource->source_width;
-    size_t source_height = (size_t) resource->source_height;
-    size_t target_width = (size_t) resource->width;
-    size_t target_height = (size_t) resource->height;
-    if (source_width > SIZE_MAX / source_height
-        || target_width > SIZE_MAX / target_height) {
-        return IMAGE_DECODE_SUBMIT_REJECTED;
-    }
-    size_t source_pixels = source_width * source_height;
-    size_t target_pixels = target_width * target_height;
-    if (target_pixels > SIZE_MAX / 4u)
-        return IMAGE_DECODE_SUBMIT_REJECTED;
-    size_t output_bytes = target_pixels * 4u;
-    size_t output_aligned = output_bytes;
-    const size_t alignment = _Alignof(max_align_t);
-    size_t remainder = output_aligned % alignment;
-    if (remainder != 0) {
-        size_t padding = alignment - remainder;
-        if (output_aligned > SIZE_MAX - padding)
-            return IMAGE_DECODE_SUBMIT_REJECTED;
-        output_aligned += padding;
-    }
-    /* Progressive JPEG keeps coefficient planes alongside component data.
-       Baseline thumbnails need only the component bound; reserve the larger
-       peak only when the authored stream actually carries progressive SOF. */
-    size_t scratch_per_pixel = image_jpeg_progressive(
-        resource->encoded, resource->encoded_length) ? 8u : 4u;
-    if (source_pixels > (SIZE_MAX - IMAGE_DECODE_WORKER_SCRATCH_FLOOR
-                         - resource->encoded_length) / scratch_per_pixel)
-        return IMAGE_DECODE_SUBMIT_REJECTED;
-    size_t scratch_bytes = source_pixels * scratch_per_pixel
-        + resource->encoded_length + IMAGE_DECODE_WORKER_SCRATCH_FLOOR;
-    if (output_aligned > SIZE_MAX - scratch_bytes)
-        return IMAGE_DECODE_SUBMIT_REJECTED;
-    size_t arena_bytes = output_aligned + scratch_bytes;
-    unsigned char *storage = budget_malloc(budget, arena_bytes);
-    BrowserSharedBody *body = storage == NULL ? NULL
-        : browser_shared_body_retain(resource->encoded_body);
-    if (storage == NULL || body == NULL) {
-        budget_free(budget, storage);
-        return IMAGE_DECODE_SUBMIT_REJECTED;
-    }
-    worker->encoded_body = body;
-    worker->arena_storage = storage;
-    worker->arena_bytes = arena_bytes;
-    worker->output_bytes = output_bytes;
-    worker->arena = (ImageDecodeArena) {
-        .base = storage + output_aligned,
-        .capacity = scratch_bytes
-    };
-    worker->encoded = body->data;
-    worker->encoded_length = resource->encoded_length;
-    worker->target_width = resource->width;
-    worker->target_height = resource->height;
-    worker->source_width = 0;
-    worker->source_height = 0;
-    worker->result_status = IMAGE_DECODE_TRANSIENT_FAILURE;
-    worker->generation++;
-    if (worker->generation == 0) worker->generation++;
-    *token = worker->generation;
-    atomic_store_explicit(
-        &image_worker_decode_pending, true, memory_order_release);
-    atomic_store_explicit(
-        &worker->state, IMAGE_DECODE_WORKER_QUEUED,
-        memory_order_release);
-#if defined(__PSP__)
-    if (sceKernelSetEventFlag(
-            worker->event, IMAGE_DECODE_WORKER_WAKE) < 0) {
-        atomic_store_explicit(
-            &worker->failed, true, memory_order_release);
-        image_decode_worker_release_job(worker);
-        return IMAGE_DECODE_SUBMIT_REJECTED;
-    }
-#else
-    image_decode_worker_execute(worker);
-#endif
-    return IMAGE_DECODE_SUBMIT_ACCEPTED;
-}
-
-static bool image_decode_worker_collect(
-    uint32_t token, ImageDecodeWorkerResult *result)
-{
-    ImageDecodeWorker *worker = &image_decode_worker;
-    if (!worker->initialized || result == NULL
-        || atomic_load_explicit(&worker->state, memory_order_acquire)
-               != IMAGE_DECODE_WORKER_READY
-        || worker->generation != token) return false;
-    *result = (ImageDecodeWorkerResult) {
-        .status = worker->result_status,
-        .pixel_bytes = worker->output_bytes,
-        .source_width = worker->source_width,
-        .source_height = worker->source_height
-    };
-    if (result->status == IMAGE_DECODE_SUCCEEDED) {
-        unsigned char *shrunk = budget_realloc(
-            worker->budget, worker->arena_storage,
-            worker->output_bytes);
-        result->pixels = shrunk != NULL
-            ? shrunk : worker->arena_storage;
-        worker->arena_storage = NULL;
-    }
-    image_decode_worker_release_job(worker);
-    return true;
-}
-
-static void image_decode_worker_abandon(uint32_t token)
-{
-    ImageDecodeWorker *worker = &image_decode_worker;
-    if (!worker->initialized || token == 0
-        || worker->generation != token) return;
-    worker->abandoned_generation = token;
-    if (atomic_load_explicit(&worker->state, memory_order_acquire)
-            == IMAGE_DECODE_WORKER_READY) {
-        image_decode_worker_release_job(worker);
-        worker->abandoned_generation = 0;
-    }
-}
-
-bool images_decode_worker_reap_cancelled(Budget *budget)
-{
-    ImageDecodeWorker *worker = &image_decode_worker;
-    if (!worker->initialized) return true;
-    if (worker->budget != budget) return false;
-    if (worker->abandoned_generation == 0) return true;
-    if (atomic_load_explicit(&worker->state, memory_order_acquire)
-            != IMAGE_DECODE_WORKER_READY) return false;
-    if (worker->generation == worker->abandoned_generation)
-        image_decode_worker_release_job(worker);
-    worker->abandoned_generation = 0;
-    return true;
-}
-
-bool images_decode_worker_shutdown(Budget *budget)
-{
-    ImageDecodeWorker *worker = &image_decode_worker;
-    if (!worker->initialized) return true;
-    if (worker->budget != budget) return false;
-#if defined(__PSP__)
-    atomic_store_explicit(
-        &worker->stop_requested, true, memory_order_release);
-    (void) sceKernelSetEventFlag(worker->event, IMAGE_DECODE_WORKER_WAKE);
-    if (psp_thread_wait_end_bounded(worker->thread, 2000000u) < 0)
-        return false;
-    (void) sceKernelDeleteThread(worker->thread);
-    (void) sceKernelDeleteEventFlag(worker->event);
-#endif
-    unsigned state = atomic_load_explicit(
-        &worker->state, memory_order_acquire);
-    if (state != IMAGE_DECODE_WORKER_FREE)
-        image_decode_worker_release_job(worker);
-#if defined(__PSP__)
-    budget_reservation_release(&worker->stack_reservation);
-#endif
-    memset(worker, 0, sizeof(*worker));
-    atomic_store_explicit(&decode_gate, false, memory_order_release);
-    return true;
-}
-
-static Budget *svg_budget;
-
-static void *svg_malloc(size_t size)
-{
-    return budget_malloc(svg_budget, size);
-}
-
-static void *svg_realloc(void *pointer, size_t size)
-{
-    return budget_realloc(svg_budget, pointer, size);
-}
-
-static void svg_free(void *pointer)
-{
-    budget_free(svg_budget, pointer);
-}
-
-#define malloc(size) svg_malloc(size)
-#define realloc(pointer, size) svg_realloc((pointer), (size))
-#define free(pointer) svg_free(pointer)
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wsign-compare"
-#elif defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wsign-compare"
-#endif
-#define NANOSVG_IMPLEMENTATION
-#include <nanosvg.h>
-#define NANOSVGRAST_IMPLEMENTATION
-#include <nanosvgrast.h>
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#elif defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
-#undef malloc
-#undef realloc
-#undef free
+#define budget_malloc(b, s) \
+    budget_malloc_category((b), BUDGET_CATEGORY_RESOURCE, (s))
+#define budget_calloc(b, n, s) \
+    budget_calloc_category((b), BUDGET_CATEGORY_RESOURCE, (n), (s))
+#define budget_realloc(b, p, s) \
+    budget_realloc_category((b), BUDGET_CATEGORY_RESOURCE, (p), (s))
 
 #define MAX_TRACKED_IMAGE_NODES 128
 #define MAX_RASTER_DECODE_WORKING_BYTES (8u * 1024u * 1024u)
@@ -998,6 +95,11 @@ typedef struct {
     bool from_resource_cache;
     bool resource_grant_valid;
     TilefinchResourceGrant resource_grant;
+    /* A scheduler completion whose metadata probe encountered the decode
+       gate remains owned here and is retried on a later pump. */
+    FetchResult *retained_result;
+    bool retained_success;
+    bool response_side_effects_applied;
     PendingImageTarget *targets;
     size_t target_count;
     size_t target_capacity;
@@ -1071,6 +173,22 @@ typedef struct {
     bool externally_pumped;
 } ImageLoadContext;
 
+static bool image_response_cross_origin(const char *document_url,
+                                        const char *response_url)
+{
+    TilefinchUrl response;
+    if (response_url != NULL
+        && strncasecmp(response_url, "data:", 5u) == 0) return false;
+    if (response_url == NULL
+        || !tilefinch_url_parse(response_url, &response)) return true;
+    /* Inline/data images inherit the document's canvas authority. Only
+       network responses can carry cross-origin authenticated pixels. */
+    if (response.scheme != TILEFINCH_URL_SCHEME_HTTP
+        && response.scheme != TILEFINCH_URL_SCHEME_HTTPS) return false;
+    return document_url == NULL
+        || !tilefinch_url_same_origin(document_url, response_url);
+}
+
 struct ImagePriorityLoadJob {
     ImageLoadContext context;
     ImagePriorityTarget targets[IMAGE_PRIORITY_LOAD_BATCH_LIMIT];
@@ -1084,10 +202,6 @@ struct ImagePriorityLoadJob {
     bool failed;
     bool rolled_back;
 };
-
-static unsigned char *decode_svg(const void *data, size_t length,
-                                 Budget *budget, size_t maximum_decoded_bytes,
-                                 int *width, int *height);
 
 static TilefinchRequestContext image_request_context(
     const ImageLoadContext *context, const char *url)
@@ -1180,7 +294,8 @@ static void image_note_pending_progress(ImageLoadContext *context)
     double now = image_now_ms();
     for (size_t i = 0; i < IMAGE_FETCH_CONCURRENCY; i++) {
         PendingImageFetch *pending = &context->pending[i];
-        if (pending->request_id == 0) continue;
+        if (pending->request_id == 0
+            || pending->retained_result != NULL) continue;
         FetchRequestProgress progress;
         if (!fetch_scheduler_request_progress(
                 context->scheduler, pending->request_id, &progress)) {
@@ -1224,7 +339,8 @@ static void image_cancel_no_progress_pending(ImageLoadContext *context)
     double now = image_now_ms();
     for (size_t i = 0; i < IMAGE_FETCH_CONCURRENCY; i++) {
         PendingImageFetch *pending = &context->pending[i];
-        if (pending->request_id == 0 || pending->no_progress_cancelled
+        if (pending->request_id == 0 || pending->retained_result != NULL
+            || pending->no_progress_cancelled
             || now - pending->last_progress_ms < limit) continue;
         FetchRequestProgress progress;
         if (!fetch_scheduler_request_progress(
@@ -1372,7 +488,8 @@ static void cancel_expired_pending(ImageLoadContext *context)
     if (context->deadline_cancelled || !image_stage_expired(context)) return;
     context->deadline_cancelled = true;
     for (size_t i = 0; i < IMAGE_FETCH_CONCURRENCY; i++) {
-        if (context->pending[i].request_id != 0) {
+        if (context->pending[i].request_id != 0
+            && context->pending[i].retained_result == NULL) {
             (void) fetch_scheduler_cancel(context->scheduler,
                                           context->pending[i].request_id,
                                           "image stage deadline exceeded");
@@ -1463,6 +580,160 @@ static bool image_node_already_tracked(const ImageResources *images,
                                        uint64_t source_hash,
                                        bool is_mask, bool is_background,
                                        PseudoElement pseudo);
+
+#define IMAGE_CANVAS_SURFACE_LIMIT 4u
+#define IMAGE_CANVAS_BYTES_LIMIT (1024u * 1024u)
+#define IMAGE_CANVAS_SINGLE_BYTES_LIMIT (512u * 1024u)
+
+static size_t images_canvas_bytes(const ImageResources *images,
+                                  size_t *surface_count)
+{
+    size_t bytes = 0;
+    size_t count = 0;
+    if (images != NULL) {
+        for (size_t i = 0; i < images->count; i++) {
+            const ImageResource *item = &images->items[i];
+            if (!item->is_canvas) continue;
+            count++;
+            if (item->width <= 0 || item->height <= 0
+                || (size_t) item->width > SIZE_MAX / (size_t) item->height
+                || (size_t) item->width * (size_t) item->height
+                       > SIZE_MAX / 4u) {
+                continue;
+            }
+            size_t item_bytes =
+                (size_t) item->width * (size_t) item->height * 4u;
+            if (item_bytes > SIZE_MAX - bytes) {
+                bytes = SIZE_MAX;
+                break;
+            }
+            bytes += item_bytes;
+        }
+    }
+    if (surface_count != NULL) *surface_count = count;
+    return bytes;
+}
+
+static void image_canvas_copy_rect(unsigned char *destination,
+                                   const unsigned char *source,
+                                   int width, int left, int top,
+                                   int right, int bottom)
+{
+    size_t stride = (size_t) width * 4u;
+    size_t row_bytes = (size_t) (right - left) * 4u;
+    for (int row = top; row < bottom; row++) {
+        size_t offset = (size_t) row * stride + (size_t) left * 4u;
+        memcpy(destination + offset, source + offset, row_bytes);
+    }
+}
+
+ImageCanvasCommitResult images_commit_canvas_surface(
+    ImageResources *images, Budget *budget, lxb_dom_node_t *node,
+    const unsigned char *rgba_pixels, size_t rgba_length,
+    int width, int height, int dirty_left, int dirty_top,
+    int dirty_right, int dirty_bottom)
+{
+    if (images == NULL || budget == NULL || node == NULL
+        || rgba_pixels == NULL || width <= 0 || height <= 0
+        || (size_t) width > SIZE_MAX / (size_t) height
+        || (size_t) width * (size_t) height > SIZE_MAX / 4u
+        || (images->budget != NULL && images->budget != budget)) {
+        return IMAGE_CANVAS_COMMIT_REFUSED;
+    }
+    size_t surface_bytes = (size_t) width * (size_t) height * 4u;
+    if (surface_bytes > IMAGE_CANVAS_SINGLE_BYTES_LIMIT
+        || rgba_length < surface_bytes) {
+        return IMAGE_CANVAS_COMMIT_REFUSED;
+    }
+    if (dirty_left < 0) dirty_left = 0;
+    if (dirty_top < 0) dirty_top = 0;
+    if (dirty_right > width) dirty_right = width;
+    if (dirty_bottom > height) dirty_bottom = height;
+    if (dirty_right <= dirty_left || dirty_bottom <= dirty_top) {
+        return IMAGE_CANVAS_COMMIT_REFUSED;
+    }
+
+    ImageResource *existing = NULL;
+    for (size_t i = 0; i < images->count; i++) {
+        ImageResource *item = &images->items[i];
+        if (item->node == node && !item->is_mask && !item->is_background
+            && item->pseudo == PSEUDO_NONE) {
+            existing = item;
+            break;
+        }
+    }
+    if (existing != NULL && !existing->is_canvas) {
+        return IMAGE_CANVAS_COMMIT_REFUSED;
+    }
+    if (existing != NULL && existing->pixels != NULL
+        && existing->width == width && existing->height == height) {
+        image_canvas_copy_rect(existing->pixels, rgba_pixels, width,
+                               dirty_left, dirty_top,
+                               dirty_right, dirty_bottom);
+        return IMAGE_CANVAS_COMMIT_UPDATED;
+    }
+
+    size_t surface_count = 0;
+    size_t retained_bytes = images_canvas_bytes(images, &surface_count);
+    size_t old_bytes = 0;
+    if (existing != NULL && existing->width > 0 && existing->height > 0) {
+        old_bytes = (size_t) existing->width
+                    * (size_t) existing->height * 4u;
+    }
+    if (existing == NULL && surface_count >= IMAGE_CANVAS_SURFACE_LIMIT) {
+        return IMAGE_CANVAS_COMMIT_REFUSED;
+    }
+    if (old_bytes > retained_bytes) return IMAGE_CANVAS_COMMIT_REFUSED;
+    retained_bytes -= old_bytes;
+    if (retained_bytes > IMAGE_CANVAS_BYTES_LIMIT
+        || surface_bytes > IMAGE_CANVAS_BYTES_LIMIT - retained_bytes) {
+        return IMAGE_CANVAS_COMMIT_REFUSED;
+    }
+    unsigned char *copy = budget_malloc_category(
+        budget, BUDGET_CATEGORY_RESOURCE, surface_bytes);
+    if (copy == NULL) return IMAGE_CANVAS_COMMIT_REFUSED;
+    memcpy(copy, rgba_pixels, surface_bytes);
+
+    images->budget = budget;
+    if (existing == NULL) {
+        size_t before = images->count;
+        if (!image_add(images, (ImageResource) {
+                .node = node,
+                .pixels = copy,
+                .source_width = width,
+                .source_height = height,
+                .width = width,
+                .height = height,
+                .is_canvas = true,
+                .owns_pixels = true
+            }) || images->count == before) {
+            budget_free(budget, copy);
+            return IMAGE_CANVAS_COMMIT_REFUSED;
+        }
+        images->stats.discovered++;
+        images->stats.attempted++;
+        images->stats.loaded++;
+        images->stats.decoded_bytes += surface_bytes;
+        return IMAGE_CANVAS_COMMIT_CREATED;
+    }
+
+    if (existing->owns_pixels) image_resource_release_owned_pixels(
+        budget, existing);
+    existing->pixels = copy;
+    existing->pixel_body = NULL;
+    existing->source_width = width;
+    existing->source_height = height;
+    existing->width = width;
+    existing->height = height;
+    existing->owns_pixels = true;
+    if (old_bytes <= images->stats.decoded_bytes) {
+        images->stats.decoded_bytes -= old_bytes;
+    } else {
+        images->stats.decoded_bytes = 0;
+    }
+    images->stats.decoded_bytes += surface_bytes;
+    return IMAGE_CANVAS_COMMIT_RESIZED;
+}
 
 bool images_adopt_decoded_surface(ImageResources *images, Budget *budget,
                                   lxb_dom_node_t *node,
@@ -2506,7 +1777,7 @@ static bool load_inline_svg(ImageLoadContext *context, lxb_dom_node_t *node,
                        - images->stats.decoded_bytes;
     int width = 0, height = 0;
     images->stats.attempted++;
-    unsigned char *pixels = decode_svg(
+    unsigned char *pixels = image_svg_decode(
         source.data, source.length, context->budget, remaining,
         &width, &height);
     budget_free(context->budget, source.data);
@@ -2893,82 +2164,6 @@ static bool svg_response(const FetchResult *fetched)
     return false;
 }
 
-static unsigned char *decode_svg(const void *data, size_t length,
-                                 Budget *budget, size_t maximum_decoded_bytes,
-                                 int *width, int *height)
-{
-    if (data == NULL || budget == NULL || width == NULL || height == NULL
-        || maximum_decoded_bytes < 4 || svg_budget != NULL) return NULL;
-    uint64_t metadata_checkpoint = budget_checkpoint(budget);
-    svg_budget = budget;
-    char *source = budget_malloc(budget, length + 1);
-    if (source != NULL) {
-        memcpy(source, data, length);
-        source[length] = '\0';
-    }
-    NSVGimage *svg = source == NULL
-        ? NULL : nsvgParse(source, "px", 96.0f);
-    if (svg == NULL || svg->width <= 0.0f || svg->height <= 0.0f
-        || svg->width > 32767.0f || svg->height > 32767.0f) {
-        if (svg != NULL) nsvgDelete(svg);
-        svg_budget = NULL;
-        budget_rollback(budget, metadata_checkpoint);
-        return NULL;
-    }
-    int output_width = (int) ceilf(svg->width);
-    int output_height = (int) ceilf(svg->height);
-    if (output_width <= 0 || output_height <= 0
-        || (size_t) output_width > SIZE_MAX / (size_t) output_height
-        || (size_t) output_width * (size_t) output_height > SIZE_MAX / 4u
-        || (size_t) output_width * (size_t) output_height * 4u
-           > maximum_decoded_bytes) {
-        nsvgDelete(svg);
-        svg_budget = NULL;
-        budget_rollback(budget, metadata_checkpoint);
-        return NULL;
-    }
-    nsvgDelete(svg);
-    svg_budget = NULL;
-    budget_rollback(budget, metadata_checkpoint);
-
-    size_t bytes = (size_t) output_width * (size_t) output_height * 4u;
-    unsigned char *pixels = budget_calloc(budget, 1, bytes);
-    if (pixels == NULL) return NULL;
-    uint64_t raster_checkpoint = budget_checkpoint(budget);
-    svg_budget = budget;
-    source = budget_malloc(budget, length + 1);
-    if (source != NULL) {
-        memcpy(source, data, length);
-        source[length] = '\0';
-    }
-    svg = source == NULL ? NULL : nsvgParse(source, "px", 96.0f);
-    NSVGrasterizer *rasterizer = svg != NULL
-        ? nsvgCreateRasterizer() : NULL;
-    if (svg == NULL || rasterizer == NULL) {
-        if (rasterizer != NULL) nsvgDeleteRasterizer(rasterizer);
-        if (svg != NULL) nsvgDelete(svg);
-        svg_budget = NULL;
-        budget_rollback(budget, raster_checkpoint);
-        budget_free(budget, pixels);
-        return NULL;
-    }
-    float scale_x = (float) output_width / svg->width;
-    float scale_y = (float) output_height / svg->height;
-    float scale = scale_x < scale_y ? scale_x : scale_y;
-    nsvgRasterize(rasterizer, svg, 0.0f, 0.0f, scale, pixels,
-                  output_width, output_height, output_width * 4);
-    nsvgDeleteRasterizer(rasterizer);
-    nsvgDelete(svg);
-    svg_budget = NULL;
-    /* Parser/rasterizer state is scratch-only. A generation rollback also
-       contains malformed-input leaks in the third-party SVG parser while the
-       pixel allocation, made before the checkpoint, remains owned. */
-    budget_rollback(budget, raster_checkpoint);
-    *width = output_width;
-    *height = output_height;
-    return pixels;
-}
-
 static bool pending_add_target(ImageLoadContext *context,
                                PendingImageFetch *pending,
                                lxb_dom_node_t *node, uint64_t source_hash,
@@ -3107,6 +2302,9 @@ static ImageDecodedCacheResult image_adopt_decoded_cache(
         .source_height = decoded.source_height,
         .width = decoded.width,
         .height = decoded.height,
+        .cross_origin = image_response_cross_origin(
+            context->document_url,
+            browser_cache_entry_response_url(cached)),
         .is_mask = primary.is_mask,
         .is_background = primary.is_background,
         .pseudo = primary.pseudo,
@@ -3322,8 +2520,10 @@ static ImagePriorityLoadStatus image_pending_raster_pump(
 
 static bool finish_image_fetch(ImageLoadContext *context,
                                PendingImageFetch *pending,
-                               FetchResult *fetched, bool success)
+                               FetchResult *fetched, bool success,
+                               bool *probe_busy)
 {
+    if (probe_busy != NULL) *probe_busy = false;
     ImageResources *images = context->images;
     if (!success) {
         images->stats.failed++;
@@ -3332,7 +2532,8 @@ static bool finish_image_fetch(ImageLoadContext *context,
         fetch_result_destroy(fetched);
         return true;
     }
-    image_accept_response_cookies(context, pending->url, fetched);
+    if (!pending->response_side_effects_applied)
+        image_accept_response_cookies(context, pending->url, fetched);
     TilefinchRequestContext request_context = image_request_context(
         context, pending->url);
     TilefinchResourceGrant resource_grant = pending->resource_grant;
@@ -3345,12 +2546,17 @@ static bool finish_image_fetch(ImageLoadContext *context,
         fetch_result_destroy(fetched);
         return true;
     }
+    if (!pending->resource_grant_valid) {
+        pending->resource_grant = resource_grant;
+        pending->resource_grant_valid = true;
+    }
     (void) fetch_result_share_body(fetched);
     bool transient_large_sprite = pending->target_count != 0
         && fetched->length > context->maximum_single_encoded_bytes
         && inline_svg_external_use_href(
                pending->targets[0].node, NULL) != NULL;
-    if (context->session != NULL && pending->url != NULL
+    if (!pending->response_side_effects_applied
+        && context->session != NULL && pending->url != NULL
         && !pending->from_resource_cache && !transient_large_sprite) {
         char cache_control[256] = {0};
         char vary[128] = {0};
@@ -3377,6 +2583,7 @@ static bool finish_image_fetch(ImageLoadContext *context,
         image_trace("cache-bypass-large-sprite", pending->url,
                     pending->url == NULL ? 0 : strlen(pending->url));
     }
+    pending->response_side_effects_applied = true;
     if (pending->target_count == 0
         || fetched->length > context->maximum_total_encoded_bytes
                               - images->stats.encoded_bytes) {
@@ -3415,25 +2622,24 @@ static bool finish_image_fetch(ImageLoadContext *context,
         }
     }
     const unsigned char *encoded = (const unsigned char *) fetched->data;
-    bool is_webp = image_is_webp(encoded, fetched->length);
-    if (is_webp) {
-        supported = WebPGetInfo(
-            encoded, fetched->length, &width, &height) != 0;
-        components = 4;
-    } else if (!is_svg) {
+    bool is_webp = false;
+    if (!is_svg) {
         uint64_t probe_checkpoint = budget_checkpoint(context->budget);
         size_t probe_baseline = context->budget->current;
-        bool decode_entered = image_decode_begin_budget(context->budget);
-        supported = decode_entered && fetched->length <= INT32_MAX
-                    && stbi_info_from_memory((const stbi_uc *) fetched->data,
-                                             (int) fetched->length, &width,
-                                             &height, &components) != 0;
-        if (decode_entered) image_decode_end();
+        ImageDecodeProbeResult probe = image_decode_probe_info(
+            context->budget, encoded, fetched->length,
+            &width, &height, &components, &is_webp);
+        supported = probe == IMAGE_DECODE_PROBE_SUPPORTED;
         /* stb_image's metadata API has no returned allocation ownership.
            Malformed inputs in some format probes can strand decoder scratch;
            reclaim only allocations made by this synchronous probe. */
         if (context->budget->current != probe_baseline) {
             budget_rollback(context->budget, probe_checkpoint);
+        }
+        if (probe == IMAGE_DECODE_PROBE_BUSY) {
+            if (probe_busy != NULL) *probe_busy = true;
+            budget_free(context->budget, external_symbol.data);
+            return true;
         }
     }
     size_t decoded_remaining = context->maximum_decoded_bytes
@@ -3442,7 +2648,7 @@ static bool finish_image_fetch(ImageLoadContext *context,
     if (is_svg && (!external_use || external_symbol.data != NULL)) {
         uint64_t svg_checkpoint = budget_checkpoint(context->budget);
         size_t svg_baseline = context->budget->current;
-        pixels = decode_svg(decode_data, decode_length, context->budget,
+        pixels = image_svg_decode(decode_data, decode_length, context->budget,
                             decoded_remaining, &width, &height);
         supported = pixels != NULL;
         /* NanoSVG does not expose a partial parse object when parsing fails.
@@ -3528,6 +2734,9 @@ static bool finish_image_fetch(ImageLoadContext *context,
                               .source_height = source_height,
                               .width = width,
                               .height = height,
+                              .cross_origin = image_response_cross_origin(
+                                  context->document_url,
+                                  fetched->effective_url),
                               .is_mask = primary.is_mask,
                               .is_background = primary.is_background,
                               .pseudo = primary.pseudo,
@@ -3699,34 +2908,51 @@ static bool finish_one_pending(ImageLoadContext *context, bool wait)
                retains the completion for the next pump. Never spin here: the
                browser outranks the worker on PSP and must yield a frame/poll
                so the worker can release the gate. */
-            (void) images_decode_worker_reap_cancelled(context->budget);
-            if (image_decode_busy()) continue;
-            bool success = false;
-            if (!fetch_scheduler_take(context->scheduler,
-                                      pending->request_id,
-                                      &success, fetched)) {
-                continue;
+            FetchResult *candidate = pending->retained_result;
+            bool success = pending->retained_success;
+            bool newly_taken = candidate == NULL;
+            if (newly_taken) {
+                (void) images_decode_worker_reap_cancelled(context->budget);
+                if (image_decode_busy()) continue;
+                if (!fetch_scheduler_take(context->scheduler,
+                                          pending->request_id,
+                                          &success, fetched)) {
+                    continue;
+                }
+                candidate = fetched;
+                context->pending_reserved_bytes -= pending->reserved_bytes;
+                image_note_request_finished(
+                    context, pending, candidate, success);
             }
-            context->pending_count--;
-            context->pending_reserved_bytes -= pending->reserved_bytes;
-            image_note_request_finished(
-                context, pending, fetched, success);
             if (scheduler_started != 0) {
                 context->images->stats.scheduler_us +=
                     image_profile_now_us() - scheduler_started;
             }
             uint64_t finish_started = image_profile_enabled()
                 ? image_profile_now_us() : 0;
-            bool finished = finish_image_fetch(context, pending, fetched,
-                                               success);
+            bool probe_busy = false;
+            bool finished = finish_image_fetch(
+                context, pending, candidate, success, &probe_busy);
             if (finish_started != 0) {
                 context->images->stats.finish_us +=
                     image_profile_now_us() - finish_started;
             }
+            if (probe_busy) {
+                if (newly_taken) {
+                    pending->retained_result = candidate;
+                    pending->retained_success = success;
+                    return true;
+                }
+                fetch_result_free(fetched);
+                return true;
+            }
+            pending->retained_result = NULL;
+            context->pending_count--;
             budget_free(context->budget, pending->targets);
             budget_free(context->budget, pending->url);
             memset(pending, 0, sizeof(*pending));
-            fetch_result_free(fetched);
+            fetch_result_free(candidate);
+            if (!newly_taken) fetch_result_free(fetched);
             /*
              * Decoding one response is the largest single unit this stage
              * owns, and the completion path above reaches it without passing
@@ -3782,7 +3008,8 @@ static bool finish_one_pending(ImageLoadContext *context, bool wait)
             context->deadline_cancelled = true;
             for (size_t i = 0; i < IMAGE_FETCH_CONCURRENCY; i++) {
                 PendingImageFetch *pending = &context->pending[i];
-                if (pending->request_id != 0) {
+                if (pending->request_id != 0
+                    && pending->retained_result == NULL) {
                     (void) fetch_scheduler_cancel(
                         context->scheduler, pending->request_id,
                         "image pipeline made no progress");
@@ -3801,7 +3028,10 @@ static void cancel_pending(ImageLoadContext *context)
 {
     for (size_t i = 0; i < IMAGE_FETCH_CONCURRENCY; i++) {
         PendingImageFetch *pending = &context->pending[i];
-        if (pending->request_id != 0) {
+        if (pending->retained_result != NULL) {
+            fetch_result_destroy(pending->retained_result);
+            fetch_result_free(pending->retained_result);
+        } else if (pending->request_id != 0) {
             (void) fetch_scheduler_cancel(context->scheduler,
                                           pending->request_id,
                                           "image pipeline aborted");
@@ -3939,23 +3169,22 @@ static bool load_image_node_with_provenance_impl(
             image_trace("data-uri-invalid", source, 40);
             return true;
         }
-        PendingImageTarget target = {
-            .node = node,
-            .source_hash = source_hash,
-            .display_width = context->current_display_width,
-            .display_height = context->current_display_height,
-            .is_mask = is_mask,
-            .is_background = is_background,
-            .pseudo = pseudo
-        };
         PendingImageFetch pending = {
-            .url_hash = hash,
-            .targets = &target,
-            .target_count = 1,
-            .target_capacity = 1
+            .url_hash = hash
         };
+        /* finish_image_fetch may transfer this target into the asynchronous
+           JPEG worker.  Use the same budget-owned target storage as network
+           responses; a borrowed stack target would outlive this call and be
+           dereferenced/freed when the worker publishes. */
+        if (!pending_add_target(
+                context, &pending, node, source_hash,
+                is_mask, is_background, pseudo)) {
+            budget_free(context->budget, body);
+            return false;
+        }
         FetchResult *fetched = fetch_result_create(context->budget);
         if (fetched == NULL) {
+            budget_free(context->budget, pending.targets);
             budget_free(context->budget, body);
             return false;
         }
@@ -3968,8 +3197,20 @@ static bool load_image_node_with_provenance_impl(
         snprintf(fetched->content_type, sizeof(fetched->content_type), "%s",
                  media_type);
         image_trace("data-uri", source, 40);
-        bool finished = finish_image_fetch(context, &pending, fetched, true);
+        bool probe_busy = false;
+        bool finished = finish_image_fetch(
+            context, &pending, fetched, true, &probe_busy);
+        if (probe_busy) {
+            /* Inline bodies have no asynchronous scheduler slot. Defer
+               without misclassifying the format; a later page resource pass
+               may retry the authored source once the worker yields. */
+            fetch_result_destroy(fetched);
+            finished = true;
+        }
         fetch_result_free(fetched);
+        /* The asynchronous path nulls the pointer when it adopts ownership;
+           synchronous publication leaves it here for the caller to retire. */
+        budget_free(context->budget, pending.targets);
         return finished;
     }
     uint64_t resolve_started = image_profile_enabled()
@@ -4176,14 +3417,22 @@ static bool load_image_node_with_provenance_impl(
             cached_result->capacity = cached->length + 1;
         }
         cached_result->length = cached->length;
+        snprintf(cached_result->effective_url,
+                 sizeof(cached_result->effective_url), "%s",
+                 browser_cache_entry_response_url(cached));
         snprintf(cached_result->content_type,
                  sizeof(cached_result->content_type), "%s",
                  cached->content_type);
         images->stats.cache_hits++;
         char *cached_url = pending->url;
         pending->url = NULL;
+        bool probe_busy = false;
         bool finished = finish_image_fetch(
-            context, pending, cached_result, true);
+            context, pending, cached_result, true, &probe_busy);
+        if (probe_busy) {
+            fetch_result_destroy(cached_result);
+            finished = true;
+        }
         fetch_result_free(cached_result);
         pending->url = cached_url;
         budget_free(context->budget, pending->targets);
@@ -5340,15 +4589,9 @@ ImagePriorityLoadStatus images_priority_load_pump(
     image_note_pending_progress(context);
     image_cancel_no_progress_pending(context);
     if (completed == 0) {
-        /* A later request can already be complete while ordered publication
-           waits for the first one. Once the first is consumed, the retained
-           later completion produces no new scheduler-completion edge, so
-           explicitly try to take it before declaring this slice idle. */
-        if (!(context->externally_pumped
-              && context->priority_target_count > 1u)) {
-            image_finish_slice(context);
-            return IMAGE_PRIORITY_LOAD_PENDING;
-        }
+        /* A scheduler completion retained after decode-gate contention also
+           produces no new completion edge, including for a one-image job.
+           Always give the ordered consumer one nonblocking retry. */
         size_t pending_before = context->pending_count;
         if (!finish_one_pending(context, false)) {
             return image_priority_load_fail(job);
@@ -5428,108 +4671,6 @@ const void *image_resource_backing_identity(const ImageResource *image)
     if (image->pixels != NULL) return image->pixels;
     if (image->encoded_body != NULL) return image->encoded_body;
     return image->encoded;
-}
-
-ImageDecodeStatus image_resource_decode_checked(
-    const ImageResource *image, Budget *budget, unsigned char **decoded)
-{
-    if (decoded == NULL) return IMAGE_DECODE_DETERMINISTIC_FAILURE;
-    *decoded = NULL;
-    if (image == NULL || budget == NULL || image->encoded == NULL
-        || image->encoded_length == 0
-        || image->encoded_length > INT32_MAX) {
-        return IMAGE_DECODE_DETERMINISTIC_FAILURE;
-    }
-    if (!image_decode_begin_budget(budget))
-        return IMAGE_DECODE_TRANSIENT_FAILURE;
-    int width = 0, height = 0, components = 0;
-    size_t failures_before = budget->failure_count;
-    bool scaled_jpeg = image->encoded_length >= 2u
-        && image->encoded[0] == 0xffu && image->encoded[1] == 0xd8u
-        && image->source_width > image->width
-        && image->source_height > image->height;
-    bool webp = image_is_webp(image->encoded, image->encoded_length);
-    bool webp_interrupted = false;
-    unsigned char *pixels = webp
-        ? image_decode_webp_scaled(
-              image->encoded, image->encoded_length,
-              image->width, image->height,
-              &width, &height, &components, &webp_interrupted)
-#if !defined(TILEFINCH_DISABLE_GIF)
-        : image_is_gif(image->encoded, image->encoded_length)
-        ? image_decode_gif_first_frame(
-              image->encoded, (int) image->encoded_length,
-              &width, &height, &components)
-#endif
-        : scaled_jpeg
-        ? image_decode_jpeg_scaled(
-              image->encoded, (int) image->encoded_length,
-              image->width, image->height, &width, &height, &components,
-              NULL)
-        : stbi_load_from_memory(
-              image->encoded, (int) image->encoded_length,
-              &width, &height, &components, 4);
-    image_decode_end();
-    int source_width = image->source_width > 0
-                       ? image->source_width : image->width;
-    int source_height = image->source_height > 0
-                        ? image->source_height : image->height;
-    if (pixels == NULL) {
-        return webp_interrupted || budget->failure_count != failures_before
-            ? IMAGE_DECODE_TRANSIENT_FAILURE
-            : IMAGE_DECODE_DETERMINISTIC_FAILURE;
-    }
-    if (width != source_width || height != source_height) {
-        image_resource_free_decoded(budget, pixels);
-        return IMAGE_DECODE_DETERMINISTIC_FAILURE;
-    }
-    if (scaled_jpeg || webp) {
-        *decoded = pixels;
-        return IMAGE_DECODE_SUCCEEDED;
-    }
-    if (width == image->width && height == image->height) {
-        *decoded = pixels;
-        return IMAGE_DECODE_SUCCEEDED;
-    }
-    if (image->width <= 0 || image->height <= 0
-        || (size_t) image->width > SIZE_MAX / (size_t) image->height
-        || (size_t) image->width * (size_t) image->height > SIZE_MAX / 4u) {
-        image_resource_free_decoded(budget, pixels);
-        return IMAGE_DECODE_DETERMINISTIC_FAILURE;
-    }
-    size_t target_bytes = (size_t) image->width * (size_t) image->height * 4u;
-    unsigned char *target = budget_malloc(budget, target_bytes);
-    if (target == NULL) {
-        image_resource_free_decoded(budget, pixels);
-        return IMAGE_DECODE_TRANSIENT_FAILURE;
-    }
-    for (int y = 0; y < image->height; y++) {
-        int source_y = (int) ((int64_t) y * height / image->height);
-        for (int x = 0; x < image->width; x++) {
-            int source_x = (int) ((int64_t) x * width / image->width);
-            memcpy(target + ((size_t) y * image->width + x) * 4u,
-                   pixels + ((size_t) source_y * width + source_x) * 4u,
-                   4u);
-        }
-    }
-    image_resource_free_decoded(budget, pixels);
-    *decoded = target;
-    return IMAGE_DECODE_SUCCEEDED;
-}
-
-unsigned char *image_resource_decode(const ImageResource *image,
-                                     Budget *budget)
-{
-    unsigned char *pixels = NULL;
-    return image_resource_decode_checked(image, budget, &pixels)
-               == IMAGE_DECODE_SUCCEEDED
-        ? pixels : NULL;
-}
-
-void image_resource_free_decoded(Budget *budget, unsigned char *pixels)
-{
-    if (budget == NULL || pixels == NULL) return;
-    budget_free(budget, pixels);
 }
 
 const ImageResource *images_find_node(const ImageResources *images,

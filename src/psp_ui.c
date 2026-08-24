@@ -7,6 +7,7 @@
 #include "tilefinch/danzeff_input.h"
 #include "tilefinch/build_version.h"
 #include "tilefinch/glyph_component_store.h"
+#include "tilefinch/offline_library.h"
 #include "tilefinch/update_history.h"
 #include "psp_boot_mark.h"
 #include "psp_ui_menu.h"
@@ -16,6 +17,10 @@
    gate accepts, from the one table that defines them, so no selection can
    ever produce the halt a hand-edited typo still gets. */
 #include "media_backend_psp_policy.h"
+
+_Static_assert(TILEFINCH_GLYPH_PACK_COUNT
+                   <= PSP_UI_GLYPH_INSTALLED_MASK_BITS,
+               "installed glyph packs exceed PspUiState mask width");
 
 #define UI_TOP_HEIGHT 39
 #define UI_BOTTOM_HEIGHT 21
@@ -122,11 +127,14 @@ typedef struct {
        discipline the clock keeps when it has no reading. */
     bool wifi_valid;
     uint8_t wifi_bars;
+    char clock[9];
 } UiDeviceStatus;
 
 #define UI_WIFI_BARS_MAX 4u
 
 static UiDeviceStatus device_status;
+
+static void ui_format_clock(char *out, size_t size);
 
 typedef enum {
     UI_OPTION_BROWSER_UI_SCALE = 0,
@@ -1042,6 +1050,7 @@ void psp_ui_set_device_status(
     device_status.charging = charging;
     device_status.twelve_hour = twelve_hour;
     device_status.valid = true;
+    ui_format_clock(device_status.clock, sizeof(device_status.clock));
     /* A negative count means the link is not READY (or this is not a
        live-network build): show no bars at all rather than an empty
        cluster. Otherwise clamp into the drawable 0..MAX range. */
@@ -1176,6 +1185,17 @@ static const FontGlyph *chrome_font_glyph(
 
 static size_t utf8_character_count(const char *text, size_t bytes)
 {
+    /* Chrome labels are overwhelmingly ASCII. Preserve the decoder's exact
+       malformed-UTF-8 behavior for every non-ASCII string, but avoid walking
+       the font decoder for the ordinary one-byte case. */
+    bool ascii = true;
+    for (size_t at = 0; at < bytes; at++) {
+        if ((unsigned char) text[at] >= 0x80u) {
+            ascii = false;
+            break;
+        }
+    }
+    if (ascii) return bytes;
     size_t characters = 0;
     for (size_t at = 0; at < bytes;) {
         unsigned codepoint = 0;
@@ -1620,11 +1640,20 @@ void psp_ui_show_status(PspUiState *ui, const char *status,
 {
     if (ui == NULL) return;
     ui->tls_toast_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
+    ui->captive_portal_suggested = false;
     copy_string(ui->status, sizeof(ui->status), status);
     unsigned frames = duration_frames == 0
         ? UI_TOAST_DEFAULT_FRAMES : duration_frames;
     ui->toast_frames = (uint16_t) (frames > UINT16_MAX ? UINT16_MAX : frames);
     ui->toast_entry_frames = PSP_THEME_MOTION_TOAST_FRAMES;
+}
+
+void psp_ui_show_wifi_sign_in_status(
+    PspUiState *ui, const char *headline, unsigned duration_frames)
+{
+    if (ui == NULL) return;
+    psp_ui_show_status(ui, headline, duration_frames);
+    ui->captive_portal_suggested = true;
 }
 
 void psp_ui_show_tls_status(
@@ -1704,7 +1733,7 @@ void psp_ui_set_voice_component(
 }
 
 void psp_ui_set_glyph_component(
-    PspUiState *ui, uint8_t installed_mask, uint8_t operation_pack,
+    PspUiState *ui, uint16_t installed_mask, uint8_t operation_pack,
     PspUiGlyphComponentPhase phase, int progress_per_mille)
 {
     if (ui == NULL) return;
@@ -1789,6 +1818,11 @@ void psp_ui_show_collections(
     PspUiState *ui, PspUiCollectionSection section)
 {
     if (ui == NULL) return;
+    if (ui->screen != PSP_UI_SCREEN_COLLECTIONS) {
+        ui->collections_return_home =
+            ui->screen == PSP_UI_SCREEN_HOME
+            || ui->base_screen == PSP_UI_SCREEN_HOME;
+    }
     ui->collections_section =
         (unsigned) section % PSP_UI_COLLECTION_SECTION_COUNT;
     ui->collections_selection = 0;
@@ -1796,6 +1830,20 @@ void psp_ui_show_collections(
     ui->collections_delete_confirmation = 0;
     ui_open_overlay(ui, PSP_UI_SCREEN_COLLECTIONS);
     ui->base_screen = (uint8_t) PSP_UI_SCREEN_COLLECTIONS;
+}
+
+void psp_ui_show_failure_recovery(
+    PspUiState *ui, const char *detail, uint8_t available_actions)
+{
+    if (ui == NULL) return;
+    ui->base_screen = (uint8_t) (psp_ui_screen_is_native_surface(ui->screen)
+        ? ui->screen : PSP_UI_SCREEN_PAGE);
+    ui->failure_actions = available_actions | PSP_UI_FAILURE_READER;
+    ui->menu_selection = 0u;
+    snprintf(ui->status, sizeof(ui->status), "%s",
+             detail == NULL || detail[0] == '\0'
+                ? "The page could not be opened" : detail);
+    ui_open_overlay(ui, PSP_UI_SCREEN_FAILURE_RECOVERY);
 }
 
 bool psp_ui_legacy_collection_url(
@@ -2213,8 +2261,10 @@ static void ui_update_collections(
         if (ui->collections_delete_confirmation != 0) {
             ui->collections_delete_confirmation = 0;
         } else {
-            ui->base_screen = (uint8_t) PSP_UI_SCREEN_PAGE;
-            ui->screen = PSP_UI_SCREEN_PAGE;
+            PspUiScreen destination = ui->collections_return_home
+                ? PSP_UI_SCREEN_HOME : PSP_UI_SCREEN_PAGE;
+            ui->base_screen = (uint8_t) destination;
+            ui->screen = destination;
         }
         intent->visual_changed = true;
         return;
@@ -2330,7 +2380,10 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
     }
     if (ui->toast_frames > 0) {
         ui->toast_frames--;
-        if (ui->toast_frames == 0) intent.visual_changed = true;
+        if (ui->toast_frames == 0) {
+            ui->captive_portal_suggested = false;
+            intent.visual_changed = true;
+        }
     }
 
     uint32_t pressed = input->pressed;
@@ -2403,6 +2456,22 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
     if ((pressed & PSP_UI_BUTTON_MENU) != 0u
         || psp_ui_menu_owns_screen(ui->screen)) {
         if (psp_ui_menu_update(ui, pressed, &intent)) return intent;
+    }
+
+    if (ui->captive_portal_suggested && ui->toast_frames != 0) {
+        if (pressed & PSP_UI_BUTTON_CONFIRM) {
+            ui->captive_portal_suggested = false;
+            ui->toast_frames = 0;
+            intent.action = PSP_UI_ACTION_CHECK_WIFI_SIGN_IN;
+            intent.visual_changed = true;
+            return intent;
+        }
+        if (pressed & PSP_UI_BUTTON_CANCEL) {
+            ui->captive_portal_suggested = false;
+            ui->toast_frames = 0;
+            intent.visual_changed = true;
+            return intent;
+        }
     }
 
     if (ui->screen == PSP_UI_SCREEN_UPDATE) {
@@ -3594,16 +3663,15 @@ static void draw_top_bar(const PspUiState *ui, uint16_t *pixels, int width,
 
     /* Same clock preference as the native surfaces; the address field
        yields whatever the formatted string actually needs. */
-    char clock[12] = {0};
     /* Reload is a Square shortcut rather than a pointer target. Keep the
        device status at the trailing edge and spend the reclaimed chip width
        on the address, where it helps on every page. */
     int clock_right = width - 33;
     int clock_left = clock_right;
     if (device_status.valid) {
-        ui_format_clock(clock, sizeof(clock));
         clock_left = clock_right
-            - chrome_text_width_bytes(clock, strlen(clock), 1, false);
+            - chrome_text_width_bytes(
+                  device_status.clock, strlen(device_status.clock), 1, false);
     }
     int address_right = device_status.valid
         ? clock_left - PSP_THEME_SPACE_S : width - 8;
@@ -3631,8 +3699,9 @@ static void draw_top_bar(const PspUiState *ui, uint16_t *pixels, int width,
 
     if (device_status.valid) {
         draw_text_right_aligned(pixels, width, height, stride,
-                                clock_right, 14, clock,
-                                sizeof(clock) - 1u, muted, 1, false);
+                                clock_right, 14, device_status.clock,
+                                sizeof(device_status.clock) - 1u,
+                                muted, 1, false);
         UiRect battery = {width - 27, 13, 17, 9};
         outline_rect(pixels, width, height, stride, battery, muted, 1);
         fill_rect(pixels, width, height, stride,
@@ -3667,6 +3736,21 @@ static void draw_bottom_bar(const PspUiState *ui, uint16_t *pixels, int width,
               PSP_THEME_HINT_BAR, 4);
     fill_rect(pixels, width, height, stride,
               (UiRect) { 0, top, width, 1 }, PSP_THEME_LINE, 4);
+    if (ui->captive_portal_active) {
+        char domain[128], detail[256];
+        ui_url_presentation(
+            ui, domain, sizeof(domain), detail, sizeof(detail));
+        char label[180];
+        snprintf(label, sizeof(label), "WI-FI SIGN-IN: %s", domain);
+        draw_text_with_font(
+            pixels, width, height, stride, 7, top + (scale == 2 ? 7 : 6),
+            label, 48, width - 92, accent, scale == 2 ? 2 : 1,
+            NULL, true);
+        draw_button_legend(
+            pixels, width, height, stride, width - 83, top + 4,
+            "O", "Cancel", accent, text);
+        return;
+    }
     if (scale == 2) {
         draw_text(pixels, width, height, stride, 7, top + 7,
                   ui->focus_editable
@@ -3815,11 +3899,10 @@ static TILEFINCH_OUT_OF_LINE void draw_page_tools(
 {
     static const char *const labels[UI_PAGE_TOOLS_ITEM_COUNT] = {
         "Find in page", "Reader mode", "Add/remove bookmark",
-        "Save article", "Save screenshot", "Site controls",
-        "Page information"
+        "Save article", "Save screenshot", "Site information"
     };
     const char *values[UI_PAGE_TOOLS_ITEM_COUNT] = {
-        ">", ui->reader_mode ? "On" : "Off", NULL, NULL, NULL, ">", ">"
+        ">", ui->reader_mode ? "On" : "Off", NULL, NULL, NULL, ">"
     };
     draw_routed_list(
         ui, pixels, width, height, stride, "Page tools", NULL,
@@ -3861,8 +3944,8 @@ static TILEFINCH_OUT_OF_LINE void draw_help(
     int stride, uint16_t accent, uint16_t text, uint16_t muted)
 {
     static const char *const labels[UI_HELP_ITEM_COUNT] = {
-        "Diagnostic QR", "Last error summary", "Controls guide",
-        "Version & system", "Licences"
+        "Check Wi-Fi sign-in", "Diagnostic QR", "Last error summary",
+        "Controls guide", "Version & system", "Licences"
     };
     static const char *const values[UI_HELP_ITEM_COUNT] = {
         ">", ">", ">", ">", ">"
@@ -3877,34 +3960,125 @@ static TILEFINCH_OUT_OF_LINE void draw_page_information(
     const PspUiState *ui, uint16_t *pixels, int width, int height,
     int stride, uint16_t accent, uint16_t text, uint16_t muted)
 {
-    UiRect box = {52, 24, width - 104, 224};
+    UiRect box = {42, 12, width - 84, 248};
     ui_apply_overlay_motion(ui, &box);
     draw_panel_shell(pixels, width, height, stride, box);
-    draw_panel_rule(pixels, width, height, stride, box, box.y + 43);
+    draw_panel_rule(pixels, width, height, stride, box, box.y + 40);
     draw_panel_hint_bar(pixels, width, height, stride, box,
                         box.y + box.height - 20);
     draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 14,
-                   "Page tools  >  Page information", 38, text, 2);
-    char domain[64], detail[128], blocked[48];
+                   "Page tools  >  Site information", 40, text, 2);
+    char domain[64], detail[128], connection[48], data[64];
     ui_url_presentation(ui, domain, sizeof(domain), detail, sizeof(detail));
-    snprintf(blocked, sizeof(blocked), "%u requests blocked",
-             (unsigned) ui->page_requests_blocked);
+    bool tls_verified = ui->secure
+        && ui->site_tls_verify_result_available
+        && ui->site_tls_verify_result == 0;
+    snprintf(connection, sizeof(connection), "%s  |  %s",
+             tls_verified ? "Secure"
+                : (ui->secure && !ui->site_tls_verify_result_available
+                       ? "TLS status unavailable"
+                       : (ui->secure ? "Certificate warning" : "Not secure")),
+             ui->site_tls_version);
+    snprintf(data, sizeof(data), "%u cookies  |  %u storage  |  %u KB",
+             (unsigned) ui->site_cookie_count,
+             (unsigned) ui->site_storage_count,
+             (unsigned) ((ui->site_data_bytes + 1023u) / 1024u));
     draw_text_bold(pixels, width, height, stride,
-                   box.x + 18, box.y + 58, domain, 38, accent, 2);
+                   box.x + 16, box.y + 49, domain, 38, accent, 2);
+    draw_text(pixels, width, height, stride,
+        box.x + 16, box.y + 72, connection, 44,
+        tls_verified
+            ? PSP_THEME_TEXT_BODY : PSP_THEME_WARN, 1);
     draw_text_with_font(pixels, width, height, stride,
-        box.x + 18, box.y + 83, ui->title, 48, box.x + box.width - 18,
-        PSP_THEME_TEXT_BODY, 2, NULL, false);
-    draw_text_with_font(pixels, width, height, stride,
-        box.x + 18, box.y + 108, detail, 56, box.x + box.width - 18,
-        muted, 1, NULL, false);
+        box.x + 16, box.y + 89, ui->site_tls_issuer, 54,
+        box.x + box.width - 16, muted, 1, NULL, false);
     draw_text(pixels, width, height, stride,
-        box.x + 18, box.y + 136, ui->secure ? "Secure HTTPS page"
-                                             : "Connection is not secure",
-        34, ui->secure ? PSP_THEME_TEXT_BODY : PSP_THEME_WARN, 2);
+        box.x + 16, box.y + 107, data, 48, muted, 1);
+    static const char *const actions[3] = {
+        "Permissions & controls", "Clear data for this site",
+        "Reset permissions"
+    };
+    for (size_t at = 0; at < 3u; at++) {
+        UiRect row = {box.x + 12, box.y + 126 + (int) at * 28,
+                      box.width - 24, 24};
+        bool selected = ui->menu_selection == at;
+        bool confirm = selected
+            && ui->data_clear_confirmation == (uint8_t) (at + 1u);
+        if (selected)
+            fill_round_rect(pixels, width, height, stride, row,
+                            PSP_THEME_RADIUS_ROW,
+                            PSP_THEME_SURFACE_FOCUS, 4);
+        draw_text(pixels, width, height, stride, row.x + 8, row.y + 4,
+                  confirm ? "Press X again to confirm" : actions[at], 42,
+                  confirm ? PSP_THEME_WARN
+                          : (selected ? text : PSP_THEME_TEXT_BODY), 1);
+        if (at == 0u && !confirm)
+            draw_text_right_aligned(
+                pixels, width, height, stride,
+                row.x + row.width - 8, row.y + 4, ">", 2,
+                selected ? accent : muted, 1, true);
+    }
     draw_text(pixels, width, height, stride,
-        box.x + 18, box.y + 161, blocked, 34, muted, 2);
+        box.x + 16, box.y + box.height - 20,
+        "X Open / confirm   O Back", 28, muted, 1);
+}
+
+static size_t ui_failure_labels(
+    const PspUiState *ui, const char **labels, size_t capacity)
+{
+    size_t count = 0;
+#define ADD_FAILURE_LABEL(text_) \
+    do { if (count < capacity) labels[count++] = (text_); } while (0)
+    ADD_FAILURE_LABEL("Retry");
+    ADD_FAILURE_LABEL("Try Reader mode");
+    if (ui->failure_actions & PSP_UI_FAILURE_WIFI)
+        ADD_FAILURE_LABEL("Open Wi-Fi sign-in");
+    if (ui->failure_actions & PSP_UI_FAILURE_DISABLE_JAVASCRIPT)
+        ADD_FAILURE_LABEL("Disable JavaScript for this site");
+    if (ui->failure_actions & PSP_UI_FAILURE_AUDIO_ONLY)
+        ADD_FAILURE_LABEL("Use audio-only");
+    if (ui->failure_actions & PSP_UI_FAILURE_LOWER_QUALITY)
+        ADD_FAILURE_LABEL("Lower video quality");
+    ADD_FAILURE_LABEL("Return to the last usable page");
+#undef ADD_FAILURE_LABEL
+    return count;
+}
+
+static TILEFINCH_OUT_OF_LINE void draw_failure_recovery(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t accent, uint16_t text, uint16_t muted)
+{
+    UiRect box = {38, 8, width - 76, 256};
+    ui_apply_overlay_motion(ui, &box);
+    draw_panel_shell(pixels, width, height, stride, box);
+    draw_panel_rule(pixels, width, height, stride, box, box.y + 40);
+    draw_panel_hint_bar(pixels, width, height, stride, box,
+                        box.y + box.height - 20);
+    draw_text_bold(pixels, width, height, stride,
+                   box.x + 15, box.y + 13, "Page did not open", 34,
+                   PSP_THEME_WARN, 2);
+    draw_text_with_font(
+        pixels, width, height, stride, box.x + 15, box.y + 48,
+        ui->status, 64, box.x + box.width - 15, muted, 1, NULL, false);
+    const char *labels[7] = {0};
+    size_t count = ui_failure_labels(ui, labels, 7u);
+    int top = box.y + 70;
+    int row_height = count > 6u ? 23 : 25;
+    for (size_t at = 0; at < count; at++) {
+        UiRect row = {box.x + 11, top + (int) at * row_height,
+                      box.width - 22, row_height - 2};
+        bool selected = ui->menu_selection == at;
+        if (selected)
+            fill_round_rect(pixels, width, height, stride, row,
+                            PSP_THEME_RADIUS_ROW,
+                            PSP_THEME_SURFACE_FOCUS, 4);
+        draw_text(pixels, width, height, stride, row.x + 8, row.y + 3,
+                  labels[at], 48, selected ? text : PSP_THEME_TEXT_BODY, 1);
+    }
     draw_text(pixels, width, height, stride,
-        box.x + 16, box.y + box.height - 20, "O Back", 12, muted, 2);
+              box.x + 15, box.y + box.height - 20,
+              "X Choose   O Return", 24, muted, 1);
+    (void) accent;
 }
 
 static TILEFINCH_OUT_OF_LINE void draw_help_detail(
@@ -3919,19 +4093,19 @@ static TILEFINCH_OUT_OF_LINE void draw_help_detail(
                         box.y + box.height - 20);
     const char *title = "Help";
     const char *lines[5] = {NULL, NULL, NULL, NULL, NULL};
-    if (ui->menu_selection == 1u) {
+    if (ui->menu_selection == 2u) {
         title = "Last error summary";
         lines[0] = "The last saved error is included first";
         lines[1] = "in Diagnostic QR. Photograph every";
         lines[2] = "part to preserve the complete report.";
-    } else if (ui->menu_selection == 2u) {
+    } else if (ui->menu_selection == 3u) {
         title = "Controls guide";
         lines[0] = "X opens or toggles.  O goes back.";
         lines[1] = "Start opens Address.  Square reloads.";
         lines[2] = "Select opens or closes the menu.";
         lines[3] = "L/R changes tabs or categories.";
         lines[4] = "Analog moves the pointer or scrolls.";
-    } else if (ui->menu_selection == 3u) {
+    } else if (ui->menu_selection == 4u) {
         title = "Version & system";
         lines[0] = "Tilefinch " TILEFINCH_VERSION_STRING;
         lines[1] = "Sony PSP release build";
@@ -4008,20 +4182,27 @@ static TILEFINCH_OUT_OF_LINE void draw_tabs(
             };
             if (has_thumbnail) {
                 const uint16_t *thumbnail = ui->tabs->thumbnails[at];
-                for (int row = 0; row < PSP_UI_TAB_THUMBNAIL_HEIGHT; row++) {
-                    int destination_y = thumbnail_box.y + row;
-                    if (destination_y < 0 || destination_y >= height)
-                        continue;
-                    for (int column = 0;
-                         column < PSP_UI_TAB_THUMBNAIL_WIDTH; column++) {
-                        int destination_x = thumbnail_box.x + column;
-                        if (destination_x < 0 || destination_x >= width)
-                            continue;
-                        pixels[(size_t) destination_y * (size_t) stride
-                               + (size_t) destination_x] =
-                            thumbnail[(size_t) row
-                                      * PSP_UI_TAB_THUMBNAIL_WIDTH
-                                      + (size_t) column];
+                int left = thumbnail_box.x < 0 ? 0 : thumbnail_box.x;
+                int top = thumbnail_box.y < 0 ? 0 : thumbnail_box.y;
+                int right = thumbnail_box.x + thumbnail_box.width;
+                int bottom = thumbnail_box.y + thumbnail_box.height;
+                if (right > width) right = width;
+                if (bottom > height) bottom = height;
+                if (left < right && top < bottom) {
+                    size_t source_x = (size_t) (left - thumbnail_box.x);
+                    size_t row_bytes = (size_t) (right - left)
+                        * sizeof(uint16_t);
+                    for (int destination_y = top;
+                         destination_y < bottom; destination_y++) {
+                        size_t source_y =
+                            (size_t) (destination_y - thumbnail_box.y);
+                        memcpy(
+                            pixels + (size_t) destination_y * (size_t) stride
+                                + (size_t) left,
+                            thumbnail
+                                + source_y * PSP_UI_TAB_THUMBNAIL_WIDTH
+                                + source_x,
+                            row_bytes);
                     }
                 }
             } else {
@@ -4128,6 +4309,211 @@ static TILEFINCH_OUT_OF_LINE void draw_options(
         box.x + box.width - 14, muted, 2, NULL, false);
 }
 
+static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
+    const PspUiState *ui, size_t selection, const char **label,
+    const char **value, char *formatted, size_t formatted_size)
+{
+    *label = "";
+    *value = "";
+    if (formatted_size != 0u) formatted[0] = '\0';
+    switch (ui_option_id(selection)) {
+        case UI_OPTION_BROWSER_UI_SCALE:
+            *label = "Browser UI";
+            *value = ui->browser_ui_scale >= 2u ? "Large" : "Compact";
+            break;
+        case UI_OPTION_PAGE_FONT_PERCENT:
+            *label = ui->reader_mode ? "Reader text" : "Web pages";
+            snprintf(formatted, formatted_size, "%u%%", ui->page_font_percent);
+            *value = formatted;
+            break;
+        case UI_OPTION_READER_FONT:
+            *label = "Reader font";
+            *value = ui->reader_font_serif ? "Serif" : "Sans";
+            break;
+        case UI_OPTION_REMEMBER_READER_SCALE:
+            *label = "Remember size";
+            *value = ui->remember_reader_site_scale ? "Per site" : "Off";
+            break;
+        case UI_OPTION_READER_AUTO_MODE:
+            *label = "Auto Reader";
+            *value = ui->reader_auto_mode ? "On" : "Off";
+            break;
+        case UI_OPTION_CUSTOM_HOMEPAGE:
+            *label = "Home page";
+            *value = ui->custom_homepage_enabled ? "My links" : "Built-in";
+            break;
+        case UI_OPTION_HISTORY:
+            *label = "URL history";
+            *value = ui->history_enabled ? "On" : "Off";
+            break;
+        case UI_OPTION_RESTORE_LAST_PAGE:
+            *label = "Restore page";
+            *value = ui->restore_last_page ? "On" : "Off";
+            break;
+        case UI_OPTION_TAB_HIBERNATION:
+            *label = "Hibernate tab";
+            *value = ui->tab_hibernation_enabled ? "On" : "Off";
+            break;
+        case UI_OPTION_EXPERIMENTAL:
+            *label = "Experimental";
+            *value = ">";
+            break;
+        case UI_OPTION_ANALOG_CURSOR:
+            *label = "Analog cursor";
+            *value = ui->analog_cursor_enabled ? "On" : "Off";
+            break;
+        case UI_OPTION_JAVASCRIPT:
+            *label = "JavaScript";
+            *value = ui->javascript_enabled ? "On" : "Off";
+            break;
+        case UI_OPTION_SITE_JAVASCRIPT:
+            *label = "This site JS";
+            *value = !ui->javascript_enabled
+                ? "Global off" : (ui->site_javascript_enabled ? "On" : "Off");
+            break;
+        case UI_OPTION_TEXT_ENTRY:
+            *label = "Keyboard";
+            *value = ui->danzeff_text_input ? "Danzeff" : "PSP OSK";
+            break;
+        case UI_OPTION_SEARCH_ENGINE:
+            *label = "Search";
+            *value = ui_search_engine_name(ui->search_engine);
+            break;
+        case UI_OPTION_COLOR_MODE:
+            *label = "Night mode";
+            *value = ui->color_mode == BROWSER_COLOR_MODE_DARK
+                ? "Dark" : (ui->color_mode == BROWSER_COLOR_MODE_LIGHT
+                                ? "Light" : "Auto");
+            break;
+        case UI_OPTION_CHROME_THEME:
+            *label = "Theme";
+            *value = ui_chrome_theme_name((BrowserChromeTheme) ui->chrome_theme);
+            break;
+        case UI_OPTION_LANGUAGE_AND_EMOJI:
+            *label = "Language & emoji";
+            *value = ">";
+            break;
+        case UI_OPTION_VIDEO_SCALING:
+            *label = "Video scaling";
+            *value = ui->video_scaling_sharp ? "Sharp" : "Smooth";
+            break;
+        case UI_OPTION_YOUTUBE_QUALITY:
+            *label = "YouTube";
+            snprintf(formatted, formatted_size, "%up",
+                     ui->youtube_240p ? 240u : 360u);
+            *value = formatted;
+            break;
+        case UI_OPTION_YOUTUBE_AUDIO_ONLY:
+            *label = "Audio-only";
+            *value = ui->youtube_audio_only ? "On" : "Off";
+            break;
+        case UI_OPTION_YOUTUBE_RESULTS:
+            *label = "YouTube results";
+            *value = ui->youtube_compact_results ? "Compact" : "Detailed";
+            break;
+        case UI_OPTION_VIDEO_STARTUP_BUFFERING:
+            *label = "Video start";
+            *value = ui->video_startup_buffering ? "Buffered" : "Immediate";
+            break;
+        case UI_OPTION_RESUME_DOWNLOADS:
+            *label = "Resume saves";
+            *value = ui->resume_offline_downloads ? "On" : "Off";
+            break;
+        case UI_OPTION_CONTENT_BLOCKER: {
+            *label = "Content blocker";
+            const char *mode = ui->content_blocker_mode == CONTENT_BLOCKER_BASIC
+                ? "Basic" : (ui->content_blocker_mode == CONTENT_BLOCKER_CUSTOM
+                                ? "Custom" : "Off");
+            char count[12];
+            if (ui->total_requests_blocked >= UINT64_C(1000000))
+                snprintf(count, sizeof(count), "%lluM", (unsigned long long)
+                         (ui->total_requests_blocked / UINT64_C(1000000)));
+            else if (ui->total_requests_blocked >= UINT64_C(1000))
+                snprintf(count, sizeof(count), "%lluK", (unsigned long long)
+                         (ui->total_requests_blocked / UINT64_C(1000)));
+            else
+                snprintf(count, sizeof(count), "%llu",
+                         (unsigned long long) ui->total_requests_blocked);
+            snprintf(formatted, formatted_size, "%s / %s", mode, count);
+            *value = formatted;
+            break;
+        }
+        case UI_OPTION_COSMETIC_HIDING:
+            *label = "Hide page ads";
+            *value = ui->content_blocker_cosmetic_hiding ? "On" : "Off";
+            break;
+        case UI_OPTION_COOKIE_BANNERS:
+            *label = "Cookie notices";
+            *value = !ui_content_blocker_site_available(ui)
+                ? "N/A" : (ui->cookie_banner_hidden ? "Hide" : "Show");
+            break;
+        case UI_OPTION_ALLOW_SITE:
+            *label = "Allow site";
+            *value = ui->content_blocker_mode == CONTENT_BLOCKER_OFF
+                    || !ui_content_blocker_site_available(ui)
+                ? "N/A" : (ui->content_blocker_site_allowed ? "Yes" : "No");
+            break;
+        case UI_OPTION_LOAD_ALLOWLIST:
+            *label = "Load allowlist";
+            *value = ">";
+            break;
+        case UI_OPTION_SITE_DATA_ALLOWED:
+            *label = "Site data";
+            *value = ui->site_data_allowed ? "Allow" : "Block";
+            break;
+        case UI_OPTION_TLS_SESSION_PERSISTENCE:
+            *label = "TLS ticket saving";
+            *value = ui->tls_session_persistence ? "On" : "Off";
+            break;
+        case UI_OPTION_MIXED_CONTENT_SITE:
+            *label = "HTTP (session)";
+            *value = ui->mixed_content_site_allowed ? "Allow" : "Block";
+            break;
+        case UI_OPTION_THIRD_PARTY_COOKIES_SITE:
+            *label = "3rd-party cookies";
+            *value = ui->third_party_cookie_site_allowed ? "Allow" : "Block";
+            break;
+        case UI_OPTION_NETWORK_PROFILE:
+            *label = "Wi-Fi profile";
+            if (ui->network_profile_label_valid) {
+                *value = ui->network_profile_label;
+            } else {
+                snprintf(formatted, formatted_size, "Profile %u",
+                         ui->network_profile == 0u ? 1u
+                                                   : (unsigned) ui->network_profile);
+                *value = formatted;
+            }
+            break;
+        case UI_OPTION_DIAGNOSTIC_QR:
+            *label = "Diagnostic QR";
+            *value = ">";
+            break;
+#ifdef TILEFINCH_PSP_POWER_TEST_MENU
+        case UI_OPTION_POWER_TEST:
+            *label = "Power test";
+            *value = ui->validation_power_test_phase != 0
+                ? "Running" : "2 min auto";
+            break;
+        case UI_OPTION_MEDIA_TEST:
+            *label = "Video test";
+            *value = ui->validation_media_test_phase != 0 ? "Running" : "Auto";
+            break;
+#endif
+        case UI_OPTION_UPDATE_CHECK:
+            *label = "Update check";
+            *value = ui->update_check_enabled ? "On" : "Off";
+            break;
+        case UI_OPTION_UPDATE:
+            *label = "Version and update";
+            *value = ui->update_release_available ? "New" : ">";
+            break;
+        case UI_OPTION_SITE_DATA:
+            *label = "Manage site data";
+            *value = ">";
+            break;
+    }
+}
+
 static TILEFINCH_OUT_OF_LINE void draw_option_items(
                               const PspUiState *ui, uint16_t *pixels,
                               int width, int height, int stride,
@@ -4154,230 +4540,6 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
     draw_text_right_aligned(
         pixels, width, height, stride, box.x + box.width - 16,
         box.y + 31, "L/R category   O Back", 22, muted, 1, false);
-    char page_size[12], blocked_value[24], youtube_quality[8];
-    snprintf(page_size, sizeof(page_size), "%u%%", ui->page_font_percent);
-    snprintf(youtube_quality, sizeof(youtube_quality), "%up",
-             ui->youtube_240p ? 240u : 360u);
-    const char *mode_name = ui->color_mode == BROWSER_COLOR_MODE_DARK
-        ? "Dark" : (ui->color_mode == BROWSER_COLOR_MODE_LIGHT
-                        ? "Light" : "Auto");
-    const char *blocking_name = ui->content_blocker_mode
-                                    == CONTENT_BLOCKER_BASIC
-        ? "Basic" : (ui->content_blocker_mode == CONTENT_BLOCKER_CUSTOM
-                          ? "Custom" : "Off");
-    char blocked_total[12];
-    if (ui->total_requests_blocked >= UINT64_C(1000000))
-        snprintf(blocked_total, sizeof(blocked_total), "%lluM",
-                 (unsigned long long)
-                     (ui->total_requests_blocked / UINT64_C(1000000)));
-    else if (ui->total_requests_blocked >= UINT64_C(1000))
-        snprintf(blocked_total, sizeof(blocked_total), "%lluK",
-                 (unsigned long long)
-                     (ui->total_requests_blocked / UINT64_C(1000)));
-    else
-        snprintf(blocked_total, sizeof(blocked_total), "%llu",
-                 (unsigned long long) ui->total_requests_blocked);
-    snprintf(blocked_value, sizeof(blocked_value), "%s / %s",
-             blocking_name, blocked_total);
-#ifdef TILEFINCH_PSP_POWER_TEST_MENU
-    const char *power_test_value =
-        ui->validation_power_test_phase != 0
-            ? "Running" : "2 min auto";
-    const char *media_test_value =
-        ui->validation_media_test_phase != 0
-            ? "Running" : "Auto";
-#endif
-    const char *labels[UI_OPTIONS_ITEM_COUNT];
-    const char *values[UI_OPTIONS_ITEM_COUNT];
-    char network_profile[16];
-    snprintf(network_profile, sizeof(network_profile), "Profile %u",
-             ui->network_profile == 0u ? 1u
-                                       : (unsigned) ui->network_profile);
-    for (size_t at = 0; at < UI_OPTIONS_ITEM_COUNT; at++) {
-        values[at] = "";
-        switch (ui_option_id(at)) {
-            case UI_OPTION_BROWSER_UI_SCALE:
-                labels[at] = "Browser UI";
-                values[at] = ui->browser_ui_scale >= 2u
-                    ? "Large" : "Compact";
-                break;
-            case UI_OPTION_PAGE_FONT_PERCENT:
-                labels[at] = ui->reader_mode ? "Reader text" : "Web pages";
-                values[at] = page_size;
-                break;
-            case UI_OPTION_READER_FONT:
-                labels[at] = "Reader font";
-                values[at] = ui->reader_font_serif ? "Serif" : "Sans";
-                break;
-            case UI_OPTION_REMEMBER_READER_SCALE:
-                labels[at] = "Remember size";
-                values[at] = ui->remember_reader_site_scale
-                    ? "Per site" : "Off";
-                break;
-            case UI_OPTION_READER_AUTO_MODE:
-                labels[at] = "Auto Reader";
-                values[at] = ui->reader_auto_mode ? "On" : "Off";
-                break;
-            case UI_OPTION_CUSTOM_HOMEPAGE:
-                labels[at] = "Home page";
-                values[at] = ui->custom_homepage_enabled
-                    ? "My links" : "Built-in";
-                break;
-            case UI_OPTION_HISTORY:
-                labels[at] = "URL history";
-                values[at] = ui->history_enabled ? "On" : "Off";
-                break;
-            case UI_OPTION_RESTORE_LAST_PAGE:
-                labels[at] = "Restore page";
-                values[at] = ui->restore_last_page ? "On" : "Off";
-                break;
-            case UI_OPTION_TAB_HIBERNATION:
-                labels[at] = "Hibernate tab";
-                values[at] = ui->tab_hibernation_enabled ? "On" : "Off";
-                break;
-            case UI_OPTION_EXPERIMENTAL:
-                labels[at] = "Experimental";
-                values[at] = ">";
-                break;
-            case UI_OPTION_ANALOG_CURSOR:
-                labels[at] = "Analog cursor";
-                values[at] = ui->analog_cursor_enabled ? "On" : "Off";
-                break;
-            case UI_OPTION_JAVASCRIPT:
-                labels[at] = "JavaScript";
-                values[at] = ui->javascript_enabled ? "On" : "Off";
-                break;
-            case UI_OPTION_SITE_JAVASCRIPT:
-                labels[at] = "This site JS";
-                values[at] = !ui->javascript_enabled
-                    ? "Global off"
-                    : (ui->site_javascript_enabled ? "On" : "Off");
-                break;
-            case UI_OPTION_TEXT_ENTRY:
-                labels[at] = "Keyboard";
-                values[at] = ui->danzeff_text_input
-                    ? "Danzeff" : "PSP OSK";
-                break;
-            case UI_OPTION_SEARCH_ENGINE:
-                labels[at] = "Search";
-                values[at] = ui_search_engine_name(ui->search_engine);
-                break;
-            case UI_OPTION_COLOR_MODE:
-                labels[at] = "Night mode";
-                values[at] = mode_name;
-                break;
-            case UI_OPTION_CHROME_THEME:
-                labels[at] = "Theme";
-                values[at] = ui_chrome_theme_name(
-                    (BrowserChromeTheme) ui->chrome_theme);
-                break;
-            case UI_OPTION_LANGUAGE_AND_EMOJI:
-                labels[at] = "Language & emoji";
-                values[at] = ">";
-                break;
-            case UI_OPTION_VIDEO_SCALING:
-                labels[at] = "Video scaling";
-                values[at] = ui->video_scaling_sharp ? "Sharp" : "Smooth";
-                break;
-            case UI_OPTION_YOUTUBE_QUALITY:
-                labels[at] = "YouTube";
-                values[at] = youtube_quality;
-                break;
-            case UI_OPTION_YOUTUBE_AUDIO_ONLY:
-                labels[at] = "Audio-only";
-                values[at] = ui->youtube_audio_only ? "On" : "Off";
-                break;
-            case UI_OPTION_YOUTUBE_RESULTS:
-                labels[at] = "YouTube results";
-                values[at] = ui->youtube_compact_results
-                    ? "Compact" : "Detailed";
-                break;
-            case UI_OPTION_VIDEO_STARTUP_BUFFERING:
-                labels[at] = "Video start";
-                values[at] = ui->video_startup_buffering
-                    ? "Buffered" : "Immediate";
-                break;
-            case UI_OPTION_RESUME_DOWNLOADS:
-                labels[at] = "Resume saves";
-                values[at] = ui->resume_offline_downloads ? "On" : "Off";
-                break;
-            case UI_OPTION_CONTENT_BLOCKER:
-                labels[at] = "Content blocker";
-                values[at] = blocked_value;
-                break;
-            case UI_OPTION_COSMETIC_HIDING:
-                labels[at] = "Hide page ads";
-                values[at] = ui->content_blocker_cosmetic_hiding
-                    ? "On" : "Off";
-                break;
-            case UI_OPTION_COOKIE_BANNERS:
-                labels[at] = "Cookie notices";
-                values[at] = !ui_content_blocker_site_available(ui)
-                    ? "N/A" : (ui->cookie_banner_hidden ? "Hide" : "Show");
-                break;
-            case UI_OPTION_ALLOW_SITE:
-                labels[at] = "Allow site";
-                values[at] = ui->content_blocker_mode == CONTENT_BLOCKER_OFF
-                    || !ui_content_blocker_site_available(ui)
-                    ? "N/A" : (ui->content_blocker_site_allowed
-                                   ? "Yes" : "No");
-                break;
-            case UI_OPTION_LOAD_ALLOWLIST:
-                labels[at] = "Load allowlist";
-                values[at] = ">";
-                break;
-            case UI_OPTION_SITE_DATA_ALLOWED:
-                labels[at] = "Site data";
-                values[at] = ui->site_data_allowed ? "Allow" : "Block";
-                break;
-            case UI_OPTION_TLS_SESSION_PERSISTENCE:
-                labels[at] = "TLS ticket saving";
-                values[at] = ui->tls_session_persistence ? "On" : "Off";
-                break;
-            case UI_OPTION_MIXED_CONTENT_SITE:
-                labels[at] = "HTTP (session)";
-                values[at] = ui->mixed_content_site_allowed
-                    ? "Allow" : "Block";
-                break;
-            case UI_OPTION_THIRD_PARTY_COOKIES_SITE:
-                labels[at] = "3rd-party cookies";
-                values[at] = ui->third_party_cookie_site_allowed
-                    ? "Allow" : "Block";
-                break;
-            case UI_OPTION_NETWORK_PROFILE:
-                labels[at] = "Wi-Fi profile";
-                values[at] = ui->network_profile_label_valid
-                    ? ui->network_profile_label : network_profile;
-                break;
-            case UI_OPTION_DIAGNOSTIC_QR:
-                labels[at] = "Diagnostic QR";
-                values[at] = ">";
-                break;
-#ifdef TILEFINCH_PSP_POWER_TEST_MENU
-            case UI_OPTION_POWER_TEST:
-                labels[at] = "Power test";
-                values[at] = power_test_value;
-                break;
-            case UI_OPTION_MEDIA_TEST:
-                labels[at] = "Video test";
-                values[at] = media_test_value;
-                break;
-#endif
-            case UI_OPTION_UPDATE_CHECK:
-                labels[at] = "Update check";
-                values[at] = ui->update_check_enabled ? "On" : "Off";
-                break;
-            case UI_OPTION_UPDATE:
-                labels[at] = "Version and update";
-                values[at] =
-                    ui->update_release_available ? "New" : ">";
-                break;
-            case UI_OPTION_SITE_DATA:
-                labels[at] = "Manage site data";
-                values[at] = ">";
-                break;
-        }
-    }
     size_t group = ui_option_group_index(
         ui_option_id(ui->options_selection));
     size_t group_items[UI_OPTIONS_ITEM_COUNT];
@@ -4409,6 +4571,11 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
     const int scroll_gutter_x = box.x + box.width - 17;
     for (size_t row = first; row < end; row++) {
         size_t at = group_items[row];
+        const char *label = "";
+        const char *value = "";
+        char formatted[32];
+        ui_option_row_presentation(
+            ui, at, &label, &value, formatted, sizeof(formatted));
         int row_y = box.y + 60 + (int) (row - first) * row_spacing;
         bool selected = at == ui->options_selection;
         if (selected)
@@ -4420,12 +4587,12 @@ static TILEFINCH_OUT_OF_LINE void draw_option_items(
                 PSP_THEME_RADIUS_ROW, accent, 4);
         draw_text_with_font(
             pixels, width, height, stride, box.x + 18, row_y,
-            labels[at], 28, label_right,
+            label, 28, label_right,
             selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
             2, NULL, false);
         draw_text_right_aligned(
             pixels, width, height, stride, value_right,
-            row_y, values[at], 22,
+            row_y, value, 22,
             selected ? PSP_THEME_ON_ACCENT : accent, 2, true);
     }
     if (first != 0)
@@ -4577,6 +4744,8 @@ static const char *ui_glyph_language_name(unsigned language)
         case BROWSER_GLYPH_LANGUAGE_CYRILLIC: return "Cyrillic";
         case BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED:
             return "Extended Latin";
+        case BROWSER_GLYPH_LANGUAGE_ARABIC: return "Arabic";
+        case BROWSER_GLYPH_LANGUAGE_HEBREW: return "Hebrew";
         case BROWSER_GLYPH_LANGUAGE_COUNT:
         case BROWSER_GLYPH_LANGUAGE_EMBEDDED:
         default: return "Embedded";
@@ -4605,6 +4774,12 @@ static bool ui_glyph_language_pack(
             return true;
         case BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED:
             *pack = TILEFINCH_GLYPH_PACK_LATIN_EXTENDED;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_ARABIC:
+            *pack = TILEFINCH_GLYPH_PACK_ARABIC;
+            return true;
+        case BROWSER_GLYPH_LANGUAGE_HEBREW:
+            *pack = TILEFINCH_GLYPH_PACK_HEBREW;
             return true;
         case BROWSER_GLYPH_LANGUAGE_COUNT:
         case BROWSER_GLYPH_LANGUAGE_EMBEDDED:
@@ -5113,13 +5288,11 @@ static void draw_surface_status(
         }
         clock_anchor = cluster_left - PSP_THEME_SPACE_S;
     }
-    char clock[12];
-    ui_format_clock(clock, sizeof(clock));
     /* Right-align against the neighbour rather than a fixed column:
        the 12-hour string is wider than the 24-hour one. */
     draw_text_right_aligned(
         pixels, width, height, stride, clock_anchor, 3,
-        clock, sizeof(clock) - 1u,
+        device_status.clock, sizeof(device_status.clock) - 1u,
         ui_fade_step(PSP_THEME_TEXT_BODY, fade), 1, false);
     outline_rect(pixels, width, height, stride, battery,
                  ui_fade_step(PSP_THEME_TEXT_MUTED, fade), 1);
@@ -5482,11 +5655,26 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
 
     bool deletable = ui->collections_selection < rows
         && ui->collections->rows[ui->collections_selection].deletable;
+    const PspUiCollectionsRow *selected =
+        ui->collections_selection < rows
+            ? &ui->collections->rows[ui->collections_selection] : NULL;
+    const char *primary = "X OPEN";
+    if (ui->collections_section == PSP_UI_COLLECTION_DOWNLOADS
+        && selected != NULL) {
+        if (selected->offline_state == OFFLINE_ITEM_DOWNLOADING)
+            primary = "X PAUSE";
+        else if (selected->offline_state == OFFLINE_ITEM_READY)
+            primary = "X PLAY";
+        else
+            primary = "X RESUME";
+    }
+    char hint[64];
+    snprintf(hint, sizeof(hint), "%s%s   L/R SECTION",
+             primary, deletable ? "   SQUARE DELETE" : "");
     draw_surface_hint(
         pixels, width, height, stride,
         confirming ? "SQUARE DELETE   O CANCEL"
-                   : (deletable ? "X OPEN   SQUARE DELETE   L/R SECTION"
-                                : "X OPEN   L/R SECTION   O BACK"), 2u);
+                   : hint, 2u);
 }
 
 /*
@@ -5859,6 +6047,8 @@ static void draw_toast(const PspUiState *ui, uint16_t *pixels, int width,
         && ui->tls_toast_guidance <= TILEFINCH_TLS_GUIDANCE_DETAILS) {
         second_line = tls_guidance[ui->tls_toast_guidance];
     }
+    if (ui->captive_portal_suggested)
+        second_line = "X Open Wi-Fi sign-in  O Cancel";
     bool multiline = second_line != NULL && second_line[0] != '\0';
     int scale = browser_ui_scale(ui);
     if (multiline && scale > 1) {
@@ -6047,6 +6237,9 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
             ui, pixels, width, height, stride, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_PAGE_INFORMATION) {
         draw_page_information(
+            ui, pixels, width, height, stride, accent, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_FAILURE_RECOVERY) {
+        draw_failure_recovery(
             ui, pixels, width, height, stride, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_HELP) {
         draw_help(ui, pixels, width, height, stride, accent, text, muted);
@@ -6431,10 +6624,13 @@ void psp_ui_media_set(PspUiMediaState *media, bool visible, bool playing,
     media->resolving = false;
     media->seek_in_progress = false;
     media->failed = false;
+    media->audio_only_recovery_available = false;
+    media->lower_quality_recovery_available = false;
     media->status[0] = '\0';
     media->playing = playing;
     media->ended = ended;
     media->buffering = false;
+    media->live = false;
     media->controls_enabled = visible;
     media->play_pause_enabled = visible;
     media->seek_enabled = visible && duration_us != 0;
@@ -6457,9 +6653,12 @@ void psp_ui_media_set_resolving(PspUiMediaState *media, const char *title)
     media->resolving = true;
     media->seek_in_progress = false;
     media->failed = false;
+    media->audio_only_recovery_available = false;
+    media->lower_quality_recovery_available = false;
     media->playing = false;
     media->ended = false;
     media->buffering = false;
+    media->live = false;
     media->seek_preview_active = false;
     media->controls_enabled = false;
     media->play_pause_enabled = false;
@@ -6539,9 +6738,12 @@ void psp_ui_media_set_error(PspUiMediaState *media, const char *message)
     media->seek_in_progress = false;
     media->failed = true;
     media->retry_unavailable = false;
+    media->audio_only_recovery_available = false;
+    media->lower_quality_recovery_available = false;
     media->playing = false;
     media->ended = false;
     media->buffering = false;
+    media->live = false;
     media->seek_preview_active = false;
     media->controls_enabled = true;
     media->play_pause_enabled = false;
@@ -6726,7 +6928,15 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
             intent.action = PSP_UI_MEDIA_ACTION_CLOSE;
         }
     } else if (media->failed) {
-        if ((pressed & PSP_UI_BUTTON_CONFIRM) != 0
+        if (!media->retry_unavailable
+            && (pressed & PSP_UI_BUTTON_TOOLBAR) != 0
+            && media->audio_only_recovery_available)
+            intent.action = PSP_UI_MEDIA_ACTION_AUDIO_ONLY;
+        else if (!media->retry_unavailable
+                 && (pressed & PSP_UI_BUTTON_RELOAD) != 0
+                 && media->lower_quality_recovery_available)
+            intent.action = PSP_UI_MEDIA_ACTION_LOWER_QUALITY;
+        else if ((pressed & PSP_UI_BUTTON_CONFIRM) != 0
             && !media->retry_unavailable)
             intent.action = PSP_UI_MEDIA_ACTION_RETRY;
         return intent;
@@ -6872,6 +7082,57 @@ PspUiMediaIntent psp_ui_media_activate_at(PspUiMediaState *media,
  */
 static const int ui_subpixel_offsets[4] = {1, 3, 5, 7};
 
+/* Exact coverage produced by the sampler below for the two fixed player
+   radii and the fixed play glyph. Keeping the sampled result in rodata
+   removes thousands of multiplies from every controls-visible frame while
+   retaining the generic sampler for variable geometry. */
+static const uint8_t ui_round_12_coverage[144] = {
+     0,  0,  0,  0,  0,  0,  0,  2,  7, 12, 15, 16,
+     0,  0,  0,  0,  0,  2, 10, 16, 16, 16, 16, 16,
+     0,  0,  0,  0,  6, 15, 16, 16, 16, 16, 16, 16,
+     0,  0,  0,  6, 16, 16, 16, 16, 16, 16, 16, 16,
+     0,  0,  6, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+     0,  2, 15, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+     0, 10, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+     2, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+     7, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    12, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    15, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+};
+
+static const uint8_t ui_round_11_coverage[121] = {
+     0,  0,  0,  0,  0,  0,  1,  7, 11, 15, 16,
+     0,  0,  0,  0,  1,  8, 15, 16, 16, 16, 16,
+     0,  0,  0,  3, 13, 16, 16, 16, 16, 16, 16,
+     0,  0,  3, 15, 16, 16, 16, 16, 16, 16, 16,
+     0,  1, 13, 16, 16, 16, 16, 16, 16, 16, 16,
+     0,  8, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+     1, 15, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+     7, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    11, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    15, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+};
+
+static const uint8_t ui_play_15_coverage[225] = {
+    12,  4,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    16, 16, 12,  4,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    16, 16, 16, 16, 12,  4,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    16, 16, 16, 16, 16, 16, 12,  4,  0,  0,  0,  0,  0,  0,  0,
+    16, 16, 16, 16, 16, 16, 16, 16, 12,  4,  0,  0,  0,  0,  0,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 12,  4,  0,  0,  0,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 12,  4,  0,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,  8,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 12,  4,  0,
+    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 12,  4,  0,  0,  0,
+    16, 16, 16, 16, 16, 16, 16, 16, 12,  4,  0,  0,  0,  0,  0,
+    16, 16, 16, 16, 16, 16, 12,  4,  0,  0,  0,  0,  0,  0,  0,
+    16, 16, 16, 16, 12,  4,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    16, 16, 12,  4,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+    12,  4,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+};
+
 /*
  * fill_round_rect decides each corner pixel with one inside/outside test, so
  * a 12px arc lands as five visible stair steps -- fine for a chip whose
@@ -6919,6 +7180,9 @@ static __attribute__((noinline)) void fill_round_rect_aa_resolved(
               (UiRect) {rect.x + rect.width - radius, inner_top,
                         radius, inner_height},
               surface, 4);
+    const uint8_t *fixed_coverage = radius == 12
+        ? ui_round_12_coverage
+        : (radius == 11 ? ui_round_11_coverage : NULL);
     int radius_squared = radius * 8 * (radius * 8);
     for (unsigned corner = 0; corner < 4u; corner++) {
         bool right = (corner & 1u) != 0u;
@@ -6930,19 +7194,32 @@ static __attribute__((noinline)) void fill_round_rect_aa_resolved(
         for (int y = corner_y; y < corner_y + radius; y++) {
             if (y < 0 || y >= height) continue;
             int reach[4];
-            for (unsigned sy = 0; sy < 4u; sy++) {
-                int dy = y * 8 + ui_subpixel_offsets[sy] - center_y;
-                reach[sy] = radius_squared - dy * dy;
+            if (fixed_coverage == NULL) {
+                for (unsigned sy = 0; sy < 4u; sy++) {
+                    int dy = y * 8 + ui_subpixel_offsets[sy] - center_y;
+                    reach[sy] = radius_squared - dy * dy;
+                }
             }
             uint16_t *row = pixels + (size_t) y * (size_t) stride;
             for (int x = corner_x; x < corner_x + radius; x++) {
                 if (x < 0 || x >= width) continue;
-                unsigned covered = 0;
-                for (unsigned sx = 0; sx < 4u; sx++) {
-                    int dx = x * 8 + ui_subpixel_offsets[sx] - center_x;
-                    int squared = dx * dx;
-                    for (unsigned sy = 0; sy < 4u; sy++)
-                        if (squared <= reach[sy]) covered++;
+                unsigned covered;
+                if (fixed_coverage != NULL) {
+                    int local_x = x - corner_x;
+                    int local_y = y - corner_y;
+                    if (right) local_x = radius - 1 - local_x;
+                    if (bottom) local_y = radius - 1 - local_y;
+                    covered = fixed_coverage[
+                        (size_t) local_y * (size_t) radius
+                        + (size_t) local_x];
+                } else {
+                    covered = 0;
+                    for (unsigned sx = 0; sx < 4u; sx++) {
+                        int dx = x * 8 + ui_subpixel_offsets[sx] - center_x;
+                        int squared = dx * dx;
+                        for (unsigned sy = 0; sy < 4u; sy++)
+                            if (squared <= reach[sy]) covered++;
+                    }
                 }
                 unsigned blend =
                     (covered * UI_BLEND_PARTS + 8u) / 16u;
@@ -6968,24 +7245,35 @@ static __attribute__((noinline)) void fill_play_triangle_aa(
     uint16_t *pixels, int width, int height, int stride,
     int left, int top, int size, uint16_t color)
 {
+    const uint8_t *fixed_coverage = size == 15
+        ? ui_play_15_coverage : NULL;
     int apex = (left + size) * 8;
     int axis = top * 8 + size * 4;
     for (int y = top; y < top + size; y++) {
         if (y < 0 || y >= height) continue;
         int reach[4];
-        for (unsigned sy = 0; sy < 4u; sy++) {
-            int dy = y * 8 + ui_subpixel_offsets[sy] - axis;
-            if (dy < 0) dy = -dy;
-            reach[sy] = apex - dy * 2;
+        if (fixed_coverage == NULL) {
+            for (unsigned sy = 0; sy < 4u; sy++) {
+                int dy = y * 8 + ui_subpixel_offsets[sy] - axis;
+                if (dy < 0) dy = -dy;
+                reach[sy] = apex - dy * 2;
+            }
         }
         uint16_t *row = pixels + (size_t) y * (size_t) stride;
         for (int x = left; x < left + size; x++) {
             if (x < 0 || x >= width) continue;
-            unsigned covered = 0;
-            for (unsigned sx = 0; sx < 4u; sx++) {
-                int sample = x * 8 + ui_subpixel_offsets[sx];
-                for (unsigned sy = 0; sy < 4u; sy++)
-                    if (sample <= reach[sy]) covered++;
+            unsigned covered;
+            if (fixed_coverage != NULL) {
+                covered = fixed_coverage[
+                    (size_t) (y - top) * (size_t) size
+                    + (size_t) (x - left)];
+            } else {
+                covered = 0;
+                for (unsigned sx = 0; sx < 4u; sx++) {
+                    int sample = x * 8 + ui_subpixel_offsets[sx];
+                    for (unsigned sy = 0; sy < 4u; sy++)
+                        if (sample <= reach[sy]) covered++;
+                }
             }
             if (covered == 0u) continue;
             unsigned parts = (covered + 1u) / 2u;
@@ -7099,91 +7387,213 @@ static void draw_media_buffering(uint16_t *pixels, int width, int height,
 #define UI_MEDIA_PREVIEW_HEIGHT 72
 #define UI_MEDIA_PREVIEW_PANEL_MARGIN 3
 #define UI_MEDIA_PREVIEW_PANEL_EXTRA 31
+#define UI_MEDIA_BUFFERING_REGION_HALF_WIDTH 80
 
-static void ui_media_add_band(
-    PspUiRowBand *bands, size_t capacity, size_t *count,
-    int top, int bottom, int height)
+typedef struct {
+    int left;
+    int top;
+    int right;
+    int bottom;
+    bool needs_backdrop;
+} UiMediaRawRegion;
+
+#define UI_MEDIA_RAW_REGION_LIMIT 4u
+
+static void ui_media_add_raw_region(
+    UiMediaRawRegion *raw, size_t *count, int left, int top,
+    int right, int bottom, int width, int height, bool needs_backdrop)
 {
+    if (raw == NULL || count == NULL || *count >= UI_MEDIA_RAW_REGION_LIMIT)
+        return;
+    if (left < 0) left = 0;
     if (top < 0) top = 0;
+    if (right > width) right = width;
     if (bottom > height) bottom = height;
-    if (bottom <= top || bands == NULL || count == NULL) return;
-    /* Merge into the previous band when they touch or overlap. Callers add in
-       increasing row order, which every case below does. */
-    if (*count != 0 && top <= bands[*count - 1u].bottom) {
-        if (bottom > bands[*count - 1u].bottom)
-            bands[*count - 1u].bottom = bottom;
-        return;
-    }
-    if (*count >= capacity) {
-        /* Never drop rows: widening the last band is wrong but safe, whereas
-           omitting one would leave 16-bit pixels in a 32-bit buffer. */
-        if (*count != 0 && bottom > bands[*count - 1u].bottom)
-            bands[*count - 1u].bottom = bottom;
-        return;
-    }
-    bands[*count].top = top;
-    bands[*count].bottom = bottom;
+    if (right <= left || bottom <= top) return;
+    raw[*count] = (UiMediaRawRegion) {
+        left, top, right, bottom, needs_backdrop
+    };
     (*count)++;
 }
 
-size_t psp_ui_media_overlay_bands(
-    const PspUiMediaState *media, int width, int height,
-    PspUiRowBand *bands, size_t capacity)
+static void ui_media_sort_unique_edges(int *edges, size_t *count)
 {
-    size_t count = 0;
-    if (media == NULL || !media->visible || bands == NULL || capacity == 0
-        || width <= 0 || height <= 0) {
-        return 0;
+    if (edges == NULL || count == NULL) return;
+    for (size_t at = 1; at < *count; at++) {
+        int value = edges[at];
+        size_t before = at;
+        while (before != 0u && edges[before - 1u] > value) {
+            edges[before] = edges[before - 1u];
+            before--;
+        }
+        edges[before] = value;
     }
+    size_t unique = 0;
+    for (size_t at = 0; at < *count; at++) {
+        if (unique == 0u || edges[at] != edges[unique - 1u])
+            edges[unique++] = edges[at];
+    }
+    *count = unique;
+}
+
+static bool ui_media_emit_region(
+    PspUiOverlayRegion *regions, size_t *count,
+    const PspUiOverlayRegion *region)
+{
+    if (regions == NULL || count == NULL || region == NULL) return false;
+    /* Identical horizontal spans in adjacent sweep strips are one rectangle,
+       so ordinary player states retain only three or four regions. */
+    for (size_t at = 0; at < *count; at++) {
+        PspUiOverlayRegion *previous = &regions[at];
+        if (previous->left == region->left
+            && previous->right == region->right
+            && previous->bottom == region->top
+            && previous->needs_backdrop == region->needs_backdrop) {
+            previous->bottom = region->bottom;
+            return true;
+        }
+    }
+    if (*count >= PSP_UI_MEDIA_OVERLAY_REGION_LIMIT) return false;
+    regions[(*count)++] = *region;
+    return true;
+}
+
+static size_t ui_media_union_regions(
+    const UiMediaRawRegion *raw, size_t raw_count,
+    int width, int height, PspUiOverlayRegion *regions, size_t capacity)
+{
+    if (raw_count == 0u || regions == NULL || capacity == 0u) return 0u;
+    int x_edges[UI_MEDIA_RAW_REGION_LIMIT * 2u];
+    int y_edges[UI_MEDIA_RAW_REGION_LIMIT * 2u];
+    size_t x_count = 0u, y_count = 0u;
+    for (size_t at = 0; at < raw_count; at++) {
+        x_edges[x_count++] = raw[at].left;
+        x_edges[x_count++] = raw[at].right;
+        y_edges[y_count++] = raw[at].top;
+        y_edges[y_count++] = raw[at].bottom;
+    }
+    ui_media_sort_unique_edges(x_edges, &x_count);
+    ui_media_sort_unique_edges(y_edges, &y_count);
+
+    PspUiOverlayRegion exact[PSP_UI_MEDIA_OVERLAY_REGION_LIMIT];
+    size_t exact_count = 0u;
+    bool overflow = false;
+    for (size_t y = 0; y + 1u < y_count && !overflow; y++) {
+        PspUiOverlayRegion strip[UI_MEDIA_RAW_REGION_LIMIT * 2u];
+        size_t strip_count = 0u;
+        for (size_t x = 0; x + 1u < x_count; x++) {
+            bool covered = false;
+            bool needs_backdrop = false;
+            for (size_t at = 0; at < raw_count; at++) {
+                bool contains = raw[at].left <= x_edges[x]
+                    && raw[at].right >= x_edges[x + 1u]
+                    && raw[at].top <= y_edges[y]
+                    && raw[at].bottom >= y_edges[y + 1u];
+                if (!contains) continue;
+                covered = true;
+                needs_backdrop = needs_backdrop || raw[at].needs_backdrop;
+            }
+            if (!covered) continue;
+            if (strip_count != 0u
+                && strip[strip_count - 1u].right == x_edges[x]
+                && strip[strip_count - 1u].needs_backdrop
+                       == needs_backdrop) {
+                strip[strip_count - 1u].right = x_edges[x + 1u];
+            } else {
+                strip[strip_count++] = (PspUiOverlayRegion) {
+                    x_edges[x], y_edges[y], x_edges[x + 1u],
+                    y_edges[y + 1u], needs_backdrop
+                };
+            }
+        }
+        for (size_t at = 0; at < strip_count; at++) {
+            if (!ui_media_emit_region(exact, &exact_count, &strip[at])) {
+                overflow = true;
+                break;
+            }
+        }
+    }
+    if (overflow || exact_count > capacity) {
+        /* The fixed player geometry never reaches this path. If a future
+           overlay exceeds the compact union, retain correctness by importing
+           one full backdrop rather than silently omitting written pixels. */
+        regions[0] = (PspUiOverlayRegion) {
+            0, 0, width, height, true
+        };
+        return 1u;
+    }
+    memcpy(regions, exact, exact_count * sizeof(*regions));
+    return exact_count;
+}
+
+size_t psp_ui_media_overlay_regions(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    int width, int height, PspUiOverlayRegion *regions, size_t capacity)
+{
+    if (media == NULL || !media->visible || regions == NULL || capacity == 0u
+        || width <= 0 || height <= 0) return 0u;
+    UiMediaRawRegion raw[UI_MEDIA_RAW_REGION_LIMIT];
+    size_t raw_count = 0u;
     if (!media->controls_visible) {
         if (media->buffering) {
-            ui_media_add_band(
-                bands, capacity, &count,
-                height / 2 - 19, height / 2 + 19, height);
+            ui_media_add_raw_region(
+                raw, &raw_count,
+                width / 2 - UI_MEDIA_BUFFERING_REGION_HALF_WIDTH,
+                height / 2 - 19,
+                width / 2 + UI_MEDIA_BUFFERING_REGION_HALF_WIDTH,
+                height / 2 + 19,
+                width, height, true);
         }
-        return count;
+        return ui_media_union_regions(
+            raw, raw_count, width, height, regions, capacity);
     }
-    /* The title bar, which every state draws. */
-    ui_media_add_band(bands, capacity, &count, 0,
-                      UI_MEDIA_TITLE_BAR_HEIGHT, height);
+    ui_media_add_raw_region(
+        raw, &raw_count, 0, 0, width, UI_MEDIA_TITLE_BAR_HEIGHT,
+        width, height, false);
     if (media->resolving || media->failed) {
-        /* One panel, and the composite returns straight after it. The shadow
-           draw_panel_shell puts under the box extends it downward by five. */
         UiRect message = media->failed
             ? media_failed_panel_rect(width, height)
             : (UiRect) {width / 2 - 152, height / 2 - 41, 304, 82};
-        ui_media_add_band(
-            bands, capacity, &count, message.y,
-            message.y + message.height + 5, height);
+        ui_media_add_raw_region(
+            raw, &raw_count, message.x, message.y,
+            message.x + message.width + 4,
+            message.y + message.height + 5,
+            width, height, true);
         if (media->resolving) {
-            /* Priming can already have a decoded picture behind this
-               overlay. Keep the same opaque footer ground that Playing will
-               inherit, rather than exposing motion there for one frame and
-               replacing it at the first-frame boundary. */
-            ui_media_add_band(
-                bands, capacity, &count,
-                height - UI_MEDIA_CONTROL_BAR_HEIGHT, height, height);
+            ui_media_add_raw_region(
+                raw, &raw_count, 0,
+                height - UI_MEDIA_CONTROL_BAR_HEIGHT, width, height,
+                width, height, false);
         }
-        return count;
+        return ui_media_union_regions(
+            raw, raw_count, width, height, regions, capacity);
     }
-    if (media->seek_preview_active) {
+    if (media->seek_preview_active && preview != NULL
+        && preview->pixels != NULL && preview->width > 0
+        && preview->height > 0 && preview->stride >= preview->width) {
         int top = UI_MEDIA_PREVIEW_TOP - UI_MEDIA_PREVIEW_PANEL_MARGIN;
-        ui_media_add_band(
-            bands, capacity, &count, top,
+        ui_media_add_raw_region(
+            raw, &raw_count,
+            18 - UI_MEDIA_PREVIEW_PANEL_MARGIN, top,
+            18 + 128 + UI_MEDIA_PREVIEW_PANEL_MARGIN,
             top + UI_MEDIA_PREVIEW_HEIGHT + UI_MEDIA_PREVIEW_PANEL_EXTRA,
-            height);
+            width, height, true);
     }
-    /* The play/pause badge, centred. */
-    ui_media_add_band(
-        bands, capacity, &count,
+    int half_width = media->buffering
+        ? UI_MEDIA_BUFFERING_REGION_HALF_WIDTH
+        : UI_MEDIA_BADGE_WIDTH / 2;
+    ui_media_add_raw_region(
+        raw, &raw_count, width / 2 - half_width,
         height / 2 - UI_MEDIA_BADGE_HEIGHT / 2,
-        height / 2 - UI_MEDIA_BADGE_HEIGHT / 2 + UI_MEDIA_BADGE_HEIGHT,
-        height);
-    /* The scrubber and the hint bar below it, to the bottom edge. */
-    ui_media_add_band(
-        bands, capacity, &count,
-        height - UI_MEDIA_CONTROL_BAR_HEIGHT, height, height);
-    return count;
+        width / 2 + half_width,
+        height / 2 - UI_MEDIA_BADGE_HEIGHT / 2
+            + UI_MEDIA_BADGE_HEIGHT,
+        width, height, true);
+    ui_media_add_raw_region(
+        raw, &raw_count, 0, height - UI_MEDIA_CONTROL_BAR_HEIGHT,
+        width, height, width, height, false);
+    return ui_media_union_regions(
+        raw, raw_count, width, height, regions, capacity);
 }
 
 static void draw_media_control_bar_ground(
@@ -7210,6 +7620,22 @@ static void draw_media_control_bar(
     fill_round_rect(pixels, width, height, stride,
                     (UiRect) {left, track_y, right - left, 4}, 2,
                     PSP_THEME_TEXT_FAINT, 4);
+    if (media->live) {
+        /* A rolling window has no stable zero or duration. Keep the familiar
+           control surface but make its timeline explicitly non-seekable. */
+        fill_round_rect(pixels, width, height, stride,
+                        (UiRect) {right - 26, track_y, 26, 4}, 2,
+                        accent, 4);
+        fill_round_rect(pixels, width, height, stride,
+                        (UiRect) {right - 5, track_y - 3, 10, 10}, 5,
+                        PSP_THEME_ACCENT_EMBER_HI, 4);
+        draw_text(pixels, width, height, stride, left, height - 53,
+                  "LIVE", 8, text, 2);
+        draw_text(pixels, width, height, stride, left, height - 29,
+                  media->playing ? "X PAUSE" : "X PLAY",
+                  16, muted, 2);
+        return;
+    }
     if (media->duration_us != 0 && media->buffered_until_us != 0) {
         uint64_t buffered = media->buffered_until_us < media->duration_us
             ? media->buffered_until_us : media->duration_us;
@@ -7399,6 +7825,21 @@ void psp_ui_media_composite_with_preview(
                 pixels, width, height, stride,
                 back.x + (back.width - back_width) / 2,
                 back.y + (back.height - 18) / 2, "O Back", 6, text, 2);
+            if (!media->retry_unavailable
+                && (media->audio_only_recovery_available
+                    || media->lower_quality_recovery_available)) {
+                const char *recovery =
+                    media->audio_only_recovery_available
+                        && media->lower_quality_recovery_available
+                    ? "Triangle Audio-only   Square 240p"
+                    : media->audio_only_recovery_available
+                        ? "Triangle Audio-only"
+                        : "Square 240p";
+                draw_text_with_font(
+                    pixels, width, height, stride,
+                    message.x + 18, message.y + 112, recovery, 38,
+                    message.x + message.width - 18, muted, 1, NULL, false);
+            }
         }
         return;
     }

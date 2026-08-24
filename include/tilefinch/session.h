@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "tilefinch/budget.h"
+#include "tilefinch/captive_portal.h"
 #include "tilefinch/request_context.h"
 
 #define BROWSER_STORAGE_ENTRIES 64
@@ -37,6 +38,7 @@
 
 struct ContentBlocker;
 struct FetchResponseSecurityMetadata;
+struct BrowserCaptivePortalStash;
 
 typedef enum {
     BROWSER_COOKIE_SAME_SITE_DEFAULT = 0,
@@ -297,6 +299,10 @@ typedef struct BrowserSession {
         bool include_subdomains;
     } hsts[BROWSER_HSTS_ENTRY_LIMIT];
     size_t hsts_clock;
+    /* A captive sign-in temporarily moves cookies/storage into an owned
+       stash and uses the now-empty tables as an ephemeral partition. Cache
+       access is disabled while this pointer is non-NULL. */
+    struct BrowserCaptivePortalStash *captive_portal_stash;
     BudgetReservation accounting_reservation;
     size_t accounting_bytes;
 } BrowserSession;
@@ -327,6 +333,18 @@ bool browser_session_set_third_party_cookie_site_allowed(
     BrowserSession *session, const char *url, bool allowed);
 bool browser_session_third_party_cookie_site_allowed(
     const BrowserSession *session, const char *url);
+/* Begins and ends a temporary captive-portal partition. The normal cookie and
+   storage tables are restored byte-for-byte; portal data is destroyed. */
+bool browser_session_captive_portal_begin(
+    BrowserSession *session, const char *portal_url);
+void browser_session_captive_portal_end(BrowserSession *session);
+bool browser_session_captive_portal_active(const BrowserSession *session);
+/* The detected entry origin and at most three redirect/user-navigation
+   origins form the only HTTP/PNA exception available to the portal context. */
+bool browser_session_captive_portal_url_allowed(
+    const BrowserSession *session, const char *url);
+bool browser_session_captive_portal_authorize_navigation(
+    BrowserSession *session, const char *from_url, const char *target_url);
 /* HSTS is intentionally memory-only. It strengthens a running session
    without adding boot or navigation-path storage I/O. */
 bool browser_session_hsts_observe(
@@ -366,6 +384,21 @@ bool browser_session_storage_get(const BrowserSession *session,
                                  size_t *value_length);
 size_t browser_session_storage_length(
     const BrowserSession *session, const char *url, bool local);
+typedef struct {
+    size_t cookie_count;
+    size_t local_storage_count;
+    size_t session_storage_count;
+    size_t cookie_bytes;
+    size_t storage_bytes;
+} BrowserSiteDataUsage;
+/* Summarizes and clears only the origin/domain represented by url.  These
+   operations remain available when ordinary site-data admission is disabled,
+   because a user must always be able to inspect and remove retained data. */
+bool browser_session_site_data_usage(
+    const BrowserSession *session, const char *url,
+    BrowserSiteDataUsage *usage);
+bool browser_session_clear_site_data(
+    BrowserSession *session, const char *url);
 bool browser_session_storage_key(
     const BrowserSession *session, const char *url, bool local,
     size_t index, const char **key);

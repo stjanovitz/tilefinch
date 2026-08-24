@@ -10,11 +10,12 @@
  * that this file has no business duplicating in a second pixel format.
  *
  * So it is not duplicated. The overlay is composed exactly as it always was,
- * into a scratch surface, and only the rows it touches make the round trip:
+ * into a scratch surface, and only the regions it touches make the round trip:
  * the video's 32-bit pixels are narrowed into the scratch as a blend backdrop,
  * the existing composite runs over them at its ordinary coordinates, and the
- * result is widened back. Everything outside those rows -- the picture itself,
- * which is most of the frame -- never passes through sixteen bits at all.
+ * result is widened back. Everything outside those exact rectangles -- the
+ * picture itself, which is most of the frame -- never passes through sixteen
+ * bits at all.
  *
  * The mapping follows the PSP's native formats: byte 0 is red in 8888 and the
  * low five-bit field is red in 5650. The shared target-aware RGB565 helpers
@@ -38,7 +39,7 @@
  * full-scale channel stays full-scale. A pixel that makes the round trip loses
  * the low three bits of red and blue and the low two of green -- exactly the
  * quantization the overlay's backdrop has always had, because the whole frame
- * used to be 16-bit -- and only inside the overlay's own rows.
+ * used to be 16-bit -- and only inside the overlay's own regions.
  */
 static uint16_t ui_media_narrow(uint32_t pixel)
 {
@@ -67,36 +68,34 @@ static void ui_media_composite_8888(
 {
     if (media == NULL || pixels == NULL || scratch == NULL
         || width <= 0 || height <= 0 || stride < width) return;
-    PspUiRowBand bands[PSP_UI_MEDIA_OVERLAY_BAND_LIMIT];
-    size_t count = psp_ui_media_overlay_bands(
-        media, width, height, bands, PSP_UI_MEDIA_OVERLAY_BAND_LIMIT);
-    if (count == 0) return;
+    PspUiOverlayRegion regions[PSP_UI_MEDIA_OVERLAY_REGION_LIMIT];
+    size_t count = psp_ui_media_overlay_regions(
+        media, preview, width, height, regions,
+        PSP_UI_MEDIA_OVERLAY_REGION_LIMIT);
     if (controls_only) {
-        size_t bottom = count;
-        while (bottom != 0u) {
-            bottom--;
-            if (bands[bottom].bottom == height) break;
-        }
-        if (bands[bottom].bottom != height) return;
-        bands[0] = bands[bottom];
+        size_t bottom = 0u;
+        while (bottom < count
+               && !(regions[bottom].left == 0
+                    && regions[bottom].right == width
+                    && regions[bottom].bottom == height
+                    && !regions[bottom].needs_backdrop)) bottom++;
+        if (bottom == count) return;
+        regions[0] = regions[bottom];
         count = 1u;
     }
-    for (size_t band = 0; band < count; band++) {
-        /* The control strip owns every visible pixel through an opaque
-           ground. Do not import the moving decoded picture into its scratch
-           rows first: besides wasting about 37k pixel conversions per video
-           frame, any future one-pixel coverage mistake would reveal changing
-           video as the bottom-edge shimmer seen on hardware. Other bands
-           contain rounded silhouettes and still need their real backdrop. */
-        bool opaque_control_strip = media->controls_visible
-            && !media->failed && bands[band].bottom == height;
-        for (int y = bands[band].top; y < bands[band].bottom; y++) {
+    if (count == 0u) return;
+    for (size_t region = 0; region < count; region++) {
+        const PspUiOverlayRegion *bounds = &regions[region];
+        for (int y = bounds->top; y < bounds->bottom; y++) {
             const uint32_t *source = pixels + (size_t) y * (size_t) stride;
             uint16_t *destination = scratch + (size_t) y * (size_t) stride;
-            if (opaque_control_strip) {
-                memset(destination, 0, (size_t) width * sizeof(*destination));
+            size_t pixels_wide = (size_t) (bounds->right - bounds->left);
+            if (!bounds->needs_backdrop) {
+                memset(
+                    destination + bounds->left, 0,
+                    pixels_wide * sizeof(*destination));
             } else {
-                for (int x = 0; x < width; x++)
+                for (int x = bounds->left; x < bounds->right; x++)
                     destination[x] = ui_media_narrow(source[x]);
             }
         }
@@ -111,11 +110,12 @@ static void ui_media_composite_8888(
         psp_ui_media_composite_with_preview(
             media, preview, scratch, width, height, stride);
     }
-    for (size_t band = 0; band < count; band++) {
-        for (int y = bands[band].top; y < bands[band].bottom; y++) {
+    for (size_t region = 0; region < count; region++) {
+        const PspUiOverlayRegion *bounds = &regions[region];
+        for (int y = bounds->top; y < bounds->bottom; y++) {
             const uint16_t *source = scratch + (size_t) y * (size_t) stride;
             uint32_t *destination = pixels + (size_t) y * (size_t) stride;
-            for (int x = 0; x < width; x++)
+            for (int x = bounds->left; x < bounds->right; x++)
                 destination[x] = ui_media_widen(source[x]);
         }
     }

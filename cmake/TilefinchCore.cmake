@@ -3,6 +3,7 @@ set(TILEFINCH_CORE_SOURCES
     src/browser_profile.c
     src/browser_tabs.c
     src/budget.c
+    src/captive_portal.c
     src/content_blocker.c
     src/content_security_policy.c
     src/controller.c
@@ -19,16 +20,20 @@ set(TILEFINCH_CORE_SOURCES
     src/glyph_component.c
     src/glyph_component_store.c
     src/image.c
+    src/image_decode.c
+    src/image_svg_decode.c
     src/install_paths.c
     src/generated/js_bootstrap.c
     src/generated/js_bootstrap_bytecode.c
     src/js_dom_bindings.c
+    src/js_canvas_bridge.c
     src/js_fetch_cors.c
     src/js_lazy_webpack.c
     src/js_module_loader.c
     src/js_remote_bindings.c
     src/js_runtime.c
     src/layout.c
+    src/layout_bidi.c
     src/media_backend.c
     src/media_hls.c
     src/swdec/swdec_ts.c
@@ -56,6 +61,7 @@ set(TILEFINCH_CORE_SOURCES
     src/offline_library.c
     src/page_find.c
     src/platform.c
+    src/psp_time_policy.c
     src/psp_media_state.c
     src/psp_network_supervisor.c
     src/public_suffix.c
@@ -84,6 +90,7 @@ set(TILEFINCH_CORE_SOURCES
     src/style_values.c
     src/swdec_component_store.c
     src/tls_session_store.c
+    src/text_bidi.c
     src/url.c
     src/update_manifest.c
     src/update_root_embedded.c
@@ -100,6 +107,14 @@ set(TILEFINCH_CORE_SOURCES
     src/youtube_lite.c
     src/youtube_resolver.c
 )
+
+add_library(tilefinch_sheenbidi STATIC
+    third_party/sheenbidi/Source/SheenBidi.c)
+target_include_directories(tilefinch_sheenbidi PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sheenbidi/Headers"
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sheenbidi/Source")
+target_compile_definitions(tilefinch_sheenbidi PRIVATE
+    SB_CONFIG_UNITY=1 SB_CONFIG_DISABLE_SCRATCH_MEMORY=1)
 
 set(TILEFINCH_PSP_FRONTEND_SOURCES
     src/main.c
@@ -125,7 +140,18 @@ file(GENERATE
     OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/tilefinch-portability-sources.txt"
     CONTENT "${TILEFINCH_PORTABILITY_SOURCE_MANIFEST}\n")
 
-add_library(tilefinch_core ${TILEFINCH_CORE_SOURCES})
+if(PSP)
+    add_library(tilefinch_core STATIC ${TILEFINCH_CORE_SOURCES})
+else()
+    # Every host executable used to statically link this large archive.  One
+    # engine edit consequently relinked the complete test fleet.  Host tools
+    # are not shipped, so keep one shared engine image and let its consumers
+    # retain their existing executable whenever only the implementation
+    # changes.  The logical target dependency still guarantees the library is
+    # rebuilt before a tool or test is run.
+    add_library(tilefinch_core SHARED ${TILEFINCH_CORE_SOURCES})
+    set(CMAKE_LINK_DEPENDS_NO_SHARED ON)
+endif()
 target_include_directories(tilefinch_core PUBLIC
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
 if(PSP)
@@ -205,9 +231,10 @@ endif()
 
 target_include_directories(tilefinch_core PUBLIC include PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sheenbidi/Source"
     "${stb_SOURCE_DIR}" "${nanosvg_SOURCE_DIR}/src"
     "${libwebp_SOURCE_DIR}/src")
-target_link_libraries(tilefinch_core PUBLIC webpdecoder)
+target_link_libraries(tilefinch_core PUBLIC webpdecoder tilefinch_sheenbidi)
 if(NOT PSP_BROWSER_ENABLE_GIF)
     # Consumers need the same advertised image capability set as tilefinch_core;
     # tests and frontends must not assume GIF appears in Accept when its

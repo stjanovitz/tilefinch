@@ -79,6 +79,9 @@ static bool test_input_mapping_and_menu(void)
     ui.menu_selection = 5;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     (void) psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_PAGE_INFORMATION);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    (void) psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_SITE_CONTROLS);
     psp_ui_set_page(&ui, "Publisher", "https://publisher.example/", true);
     ui.menu_selection = 0;
@@ -504,6 +507,8 @@ static bool test_input_mapping_and_menu(void)
         BROWSER_GLYPH_LANGUAGE_KOREAN,
         BROWSER_GLYPH_LANGUAGE_CYRILLIC,
         BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED,
+        BROWSER_GLYPH_LANGUAGE_ARABIC,
+        BROWSER_GLYPH_LANGUAGE_HEBREW,
         BROWSER_GLYPH_LANGUAGE_EMBEDDED
     };
     for (size_t glyph = 0;
@@ -516,9 +521,9 @@ static bool test_input_mapping_and_menu(void)
     }
     input.pressed = PSP_UI_BUTTON_LEFT;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.glyph_language == BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED
+    CHECK(ui.glyph_language == BROWSER_GLYPH_LANGUAGE_HEBREW
           && intent.setting.value.glyph_language
-                 == BROWSER_GLYPH_LANGUAGE_LATIN_EXTENDED);
+                 == BROWSER_GLYPH_LANGUAGE_HEBREW);
     input.pressed = PSP_UI_BUTTON_RIGHT;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.glyph_language == BROWSER_GLYPH_LANGUAGE_EMBEDDED);
@@ -884,6 +889,104 @@ static bool test_input_mapping_and_menu(void)
     input.analog_y = 0;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.scroll_delta < 0);
+    return true;
+}
+
+static bool test_wifi_sign_in_suggestion_is_actionable(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_show_wifi_sign_in_status(
+        &ui, "THIS WI-FI MAY REQUIRE SIGN-IN", 600);
+    CHECK(ui.captive_portal_suggested && ui.toast_frames != 0);
+    PspUiInput input = {
+        .pressed = PSP_UI_BUTTON_CONFIRM,
+        .analog_x = 128,
+        .analog_y = 128
+    };
+    PspUiIntent intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_CHECK_WIFI_SIGN_IN);
+    CHECK(!ui.captive_portal_suggested && ui.toast_frames == 0);
+
+    psp_ui_show_wifi_sign_in_status(
+        &ui, "THIS WI-FI MAY REQUIRE SIGN-IN", 600);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_NONE);
+    CHECK(!ui.captive_portal_suggested && ui.toast_frames == 0);
+    return true;
+}
+
+static bool test_contextual_failure_recovery_actions(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_show_failure_recovery(
+        &ui, "Connection timed out",
+        PSP_UI_FAILURE_WIFI | PSP_UI_FAILURE_DISABLE_JAVASCRIPT
+            | PSP_UI_FAILURE_AUDIO_ONLY | PSP_UI_FAILURE_LOWER_QUALITY);
+    CHECK(ui.screen == PSP_UI_SCREEN_FAILURE_RECOVERY
+          && ui.menu_selection == 0
+          && strstr(ui.status, "timed out") != NULL);
+    ui.overlay_animation_frames = 0;
+    PspUiInput input = {.pressed = PSP_UI_BUTTON_DOWN,
+                        .analog_x = 128, .analog_y = 128};
+    PspUiIntent intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_NONE && ui.menu_selection == 1);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_RECOVERY_READER
+          && ui.screen == PSP_UI_SCREEN_PAGE);
+
+    psp_ui_show_failure_recovery(&ui, "Failed", 0);
+    ui.overlay_animation_frames = 0;
+    ui.menu_selection = 2;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_RECOVERY_RETURN);
+    return true;
+}
+
+static bool test_site_information_actions_are_scoped_and_confirmed(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    psp_ui_set_page(
+        &ui, "Publisher", "https://publisher.example/article", true);
+    ui.base_screen = PSP_UI_SCREEN_PAGE;
+    ui.screen = PSP_UI_SCREEN_PAGE_INFORMATION;
+    PspUiInput input = {.analog_x = 128, .analog_y = 128};
+
+    /* The controls row is a child of Site information and Circle returns
+       exactly one level rather than closing the whole menu hierarchy. */
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    PspUiIntent intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_NONE
+          && ui.screen == PSP_UI_SCREEN_SITE_CONTROLS);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_NONE
+          && ui.screen == PSP_UI_SCREEN_PAGE_INFORMATION);
+
+    /* Both destructive operations require a second X on the same row. */
+    ui.menu_selection = 1u;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(!intent.clear_site_data_requested
+          && ui.data_clear_confirmation == 2u);
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.clear_site_data_requested
+          && !intent.reset_site_permissions_requested
+          && ui.data_clear_confirmation == 0u);
+
+    ui.menu_selection = 2u;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(!intent.reset_site_permissions_requested
+          && ui.data_clear_confirmation == 3u);
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.reset_site_permissions_requested
+          && !intent.clear_site_data_requested
+          && ui.data_clear_confirmation == 0u);
     return true;
 }
 
@@ -1510,6 +1613,7 @@ static bool test_panels_draw_the_token_ground(void)
     static const PspUiScreen panels[] = {
         PSP_UI_SCREEN_MENU, PSP_UI_SCREEN_PAGE_TOOLS,
         PSP_UI_SCREEN_SITE_CONTROLS, PSP_UI_SCREEN_PAGE_INFORMATION,
+        PSP_UI_SCREEN_FAILURE_RECOVERY,
         PSP_UI_SCREEN_HELP, PSP_UI_SCREEN_HELP_DETAIL,
         PSP_UI_SCREEN_OPTIONS,
         PSP_UI_SCREEN_OPTION_ITEMS, PSP_UI_SCREEN_DATA_OPTIONS,
@@ -2197,6 +2301,29 @@ static bool test_media_controls_and_composite(void)
     CHECK(media.buffering
           && media.buffered_until_us == UINT64_C(9000000));
 
+    /* Live playback keeps Play/Pause and Close, but exposes no synthetic
+       zero-duration scrub target. */
+    psp_ui_media_set(&media, true, true, false, 0, 0, "Live example");
+    media.live = true;
+    media.seek_enabled = false;
+    PspUiInput live_input = {
+        .pressed = PSP_UI_BUTTON_RIGHT,
+        .analog_x = 255,
+        .analog_y = 128,
+        .elapsed_ms = 16
+    };
+    PspUiMediaIntent live_intent = psp_ui_media_update(&media, &live_input);
+    CHECK(live_intent.action == PSP_UI_MEDIA_ACTION_NONE
+          && !media.seek_preview_active);
+    memset(frame, 0, sizeof(frame));
+    psp_ui_media_composite(&media, frame, WIDTH, HEIGHT, WIDTH);
+    CHECK(frame[(HEIGHT - 69) * WIDTH + WIDTH - 28]
+          != PSP_THEME_TEXT_FAINT);
+
+    psp_ui_media_set(&media, true, false, false,
+                     UINT64_C(5000000), UINT64_C(20000000),
+                     "Example video");
+
     PspUiInput input = {
         .pressed = PSP_UI_BUTTON_RIGHT,
         .analog_x = 128,
@@ -2419,6 +2546,14 @@ static bool test_media_controls_and_composite(void)
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_media_update(&media, &input);
     CHECK(intent.action == PSP_UI_MEDIA_ACTION_RETRY);
+    media.audio_only_recovery_available = true;
+    media.lower_quality_recovery_available = true;
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    CHECK(psp_ui_media_update(&media, &input).action
+          == PSP_UI_MEDIA_ACTION_AUDIO_ONLY);
+    input.pressed = PSP_UI_BUTTON_RELOAD;
+    CHECK(psp_ui_media_update(&media, &input).action
+          == PSP_UI_MEDIA_ACTION_LOWER_QUALITY);
     /*
      * A quarantined firmware decoder cannot be retried at all: the backend
      * refuses every later open for the rest of the process. The panel must
@@ -2427,6 +2562,10 @@ static bool test_media_controls_and_composite(void)
      * lower row.
      */
     media.retry_unavailable = true;
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    CHECK(psp_ui_media_update(&media, &input).action
+          == PSP_UI_MEDIA_ACTION_NONE);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_media_update(&media, &input);
     CHECK(intent.action == PSP_UI_MEDIA_ACTION_NONE
           && intent.visual_changed);
@@ -2928,6 +3067,21 @@ static bool test_native_surfaces_own_the_panel(void)
     CHECK(ui.screen == PSP_UI_SCREEN_COLLECTIONS
           && ui.collections_section == PSP_UI_COLLECTION_BOOKMARKS
           && ui.collections_selection == 0);
+    /* Changing sections must not overwrite the surface that opened the
+       library. */
+    input.pressed = PSP_UI_BUTTON_PAGE_DOWN;
+    (void) psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_COLLECTIONS
+          && ui.collections_section == PSP_UI_COLLECTION_HISTORY);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    (void) psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_HOME
+          && ui.base_screen == PSP_UI_SCREEN_HOME);
+
+    psp_ui_leave_native_surface(&ui);
+    psp_ui_show_collections(&ui, PSP_UI_COLLECTION_BOOKMARKS);
+    input.pressed = PSP_UI_BUTTON_PAGE_DOWN;
+    (void) psp_ui_update(&ui, &input);
     input.pressed = PSP_UI_BUTTON_CANCEL;
     (void) psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_PAGE
@@ -3284,21 +3438,21 @@ static bool test_native_motion_budget(void)
 }
 
 /*
- * The overlay's declared rows, and the 32-bit path that trusts them.
+ * The overlay's declared regions, and the 32-bit path that trusts them.
  *
  * During fullscreen video the panel scans out 8888 so the decoder's bytes
  * reach it unconverted, and the player's chrome -- which is 16-bit code --
- * reaches that buffer by round-tripping only the rows it touches. If the
+ * reaches that buffer by round-tripping only the regions it touches. If the
  * declaration and the composite ever disagree, the consequence is silent:
- * either a strip of the picture is needlessly quantized, or, far worse, a
- * strip of 16-bit chrome is left in a 32-bit buffer and shows as noise.
+ * either unrelated picture pixels are needlessly quantized, or chrome drawn
+ * into scratch is never copied to the 32-bit scanout.
  *
  * So the declaration is not trusted, it is measured: composite into a poisoned
  * surface and require that every pixel which moved lies inside a declared
- * band. Every state the overlay has is swept, because the panel and the
- * preview move the bands.
+ * region. Every state the overlay has is swept, because the panel and the
+ * preview change the regions.
  */
-static bool media_overlay_bands_cover_every_written_row(
+static bool media_overlay_regions_cover_every_written_pixel(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     int width, int height, const char *label)
 {
@@ -3307,28 +3461,40 @@ static bool media_overlay_bands_cover_every_written_row(
     for (int at = 0; at < width * height; at++) surface[at] = poison;
     psp_ui_media_composite_with_preview(
         media, preview, surface, width, height, width);
-    PspUiRowBand bands[PSP_UI_MEDIA_OVERLAY_BAND_LIMIT];
-    size_t count = psp_ui_media_overlay_bands(
-        media, width, height, bands, PSP_UI_MEDIA_OVERLAY_BAND_LIMIT);
-    /* Sorted, disjoint and inside the panel, or the wrapper's loops are not
-       the loops the declaration describes. */
-    for (size_t band = 0; band < count; band++) {
-        CHECK(bands[band].top >= 0 && bands[band].bottom <= height);
-        CHECK(bands[band].top < bands[band].bottom);
-        if (band != 0) CHECK(bands[band].top > bands[band - 1u].bottom);
+    PspUiOverlayRegion regions[PSP_UI_MEDIA_OVERLAY_REGION_LIMIT];
+    size_t count = psp_ui_media_overlay_regions(
+        media, preview, width, height, regions,
+        PSP_UI_MEDIA_OVERLAY_REGION_LIMIT);
+    for (size_t region = 0; region < count; region++) {
+        const PspUiOverlayRegion *bounds = &regions[region];
+        CHECK(bounds->left >= 0 && bounds->right <= width);
+        CHECK(bounds->top >= 0 && bounds->bottom <= height);
+        CHECK(bounds->left < bounds->right && bounds->top < bounds->bottom);
+        for (size_t before = 0; before < region; before++) {
+            const PspUiOverlayRegion *other = &regions[before];
+            bool separate = bounds->right <= other->left
+                || other->right <= bounds->left
+                || bounds->bottom <= other->top
+                || other->bottom <= bounds->top;
+            CHECK(separate);
+        }
     }
     for (int y = 0; y < height; y++) {
-        bool declared = false;
-        for (size_t band = 0; band < count; band++) {
-            if (y >= bands[band].top && y < bands[band].bottom)
-                declared = true;
-        }
-        if (declared) continue;
         for (int x = 0; x < width; x++) {
+            bool declared = false;
+            for (size_t region = 0; region < count; region++) {
+                const PspUiOverlayRegion *bounds = &regions[region];
+                if (x >= bounds->left && x < bounds->right
+                    && y >= bounds->top && y < bounds->bottom) {
+                    declared = true;
+                    break;
+                }
+            }
+            if (declared) continue;
             if (surface[(size_t) y * width + x] != poison) {
                 fprintf(stderr,
                         "FAIL %s: row %d column %d written outside the "
-                        "declared bands\n", label, y, x);
+                        "declared regions\n", label, y, x);
                 return false;
             }
         }
@@ -3336,39 +3502,42 @@ static bool media_overlay_bands_cover_every_written_row(
     return true;
 }
 
-static bool test_media_overlay_bands_and_the_32_bit_wrapper(void)
+static bool test_media_overlay_regions_and_the_32_bit_wrapper(void)
 {
     enum { WIDTH = 480, HEIGHT = 272 };
     PspUiMediaState media;
     psp_ui_media_init(&media);
     /* An invisible or control-free player draws nothing, so it declares
        nothing and the wrapper must not touch the picture at all. */
-    PspUiRowBand bands[PSP_UI_MEDIA_OVERLAY_BAND_LIMIT];
-    CHECK(psp_ui_media_overlay_bands(
-        &media, WIDTH, HEIGHT, bands, PSP_UI_MEDIA_OVERLAY_BAND_LIMIT) == 0);
+    PspUiOverlayRegion initial_regions[PSP_UI_MEDIA_OVERLAY_REGION_LIMIT];
+    CHECK(psp_ui_media_overlay_regions(
+        &media, NULL, WIDTH, HEIGHT, initial_regions,
+        PSP_UI_MEDIA_OVERLAY_REGION_LIMIT) == 0);
     psp_ui_media_set(&media, true, true, false,
                      UINT64_C(5000000), UINT64_C(20000000), "Example video");
     media.controls_visible = false;
-    CHECK(psp_ui_media_overlay_bands(
-        &media, WIDTH, HEIGHT, bands, PSP_UI_MEDIA_OVERLAY_BAND_LIMIT) == 0);
+    CHECK(psp_ui_media_overlay_regions(
+        &media, NULL, WIDTH, HEIGHT, initial_regions,
+        PSP_UI_MEDIA_OVERLAY_REGION_LIMIT) == 0);
     psp_ui_media_set_buffering(&media, true, UINT64_C(9000000));
     CHECK(!media.controls_visible
-          && media_overlay_bands_cover_every_written_row(
+          && media_overlay_regions_cover_every_written_pixel(
                  &media, NULL, WIDTH, HEIGHT, "buffering-pill-only"));
     psp_ui_media_set_buffering(&media, false, UINT64_C(9000000));
-    CHECK(psp_ui_media_overlay_bands(
-        &media, WIDTH, HEIGHT, bands, PSP_UI_MEDIA_OVERLAY_BAND_LIMIT) == 0);
+    CHECK(psp_ui_media_overlay_regions(
+        &media, NULL, WIDTH, HEIGHT, initial_regions,
+        PSP_UI_MEDIA_OVERLAY_REGION_LIMIT) == 0);
 
     psp_ui_media_show_controls(&media);
-    CHECK(media_overlay_bands_cover_every_written_row(
+    CHECK(media_overlay_regions_cover_every_written_pixel(
         &media, NULL, WIDTH, HEIGHT, "playing"));
     psp_ui_media_set(&media, true, false, false,
                      UINT64_C(5000000), UINT64_C(20000000), "Example video");
     psp_ui_media_show_controls(&media);
-    CHECK(media_overlay_bands_cover_every_written_row(
+    CHECK(media_overlay_regions_cover_every_written_pixel(
         &media, NULL, WIDTH, HEIGHT, "paused"));
     psp_ui_media_set_buffering(&media, true, UINT64_C(9000000));
-    CHECK(media_overlay_bands_cover_every_written_row(
+    CHECK(media_overlay_regions_cover_every_written_pixel(
         &media, NULL, WIDTH, HEIGHT, "buffering"));
     psp_ui_media_set_buffering(&media, false, UINT64_C(9000000));
 
@@ -3379,24 +3548,24 @@ static bool test_media_overlay_bands_and_the_32_bit_wrapper(void)
         .pixels = preview, .width = 128, .height = 72, .stride = 128
     };
     psp_ui_media_set_seek_preview(&media, UINT64_C(10000000));
-    CHECK(media_overlay_bands_cover_every_written_row(
+    CHECK(media_overlay_regions_cover_every_written_pixel(
         &media, &preview_view, WIDTH, HEIGHT, "seek-preview"));
     psp_ui_media_cancel_seek_preview(&media);
 
     psp_ui_media_set_resolving(&media, "Example video");
     psp_ui_media_set_resolving_progress(&media, "Opening video", 400u);
-    CHECK(media_overlay_bands_cover_every_written_row(
+    CHECK(media_overlay_regions_cover_every_written_pixel(
         &media, NULL, WIDTH, HEIGHT, "resolving"));
     psp_ui_media_set_error(&media, "VIDEO OPEN TIMED OUT IN video-demux");
-    CHECK(media_overlay_bands_cover_every_written_row(
+    CHECK(media_overlay_regions_cover_every_written_pixel(
         &media, NULL, WIDTH, HEIGHT, "failed"));
     media.retry_unavailable = true;
-    CHECK(media_overlay_bands_cover_every_written_row(
+    CHECK(media_overlay_regions_cover_every_written_pixel(
         &media, NULL, WIDTH, HEIGHT, "failed-quarantined"));
     media.retry_unavailable = false;
 
     /*
-     * And the wrapper itself: the picture outside the bands keeps the
+     * And the wrapper itself: the picture outside the regions keeps the
      * decoder's own bytes, the chrome inside them lands, and a colour that
      * survives the narrowing survives the whole trip. Full-scale channels are
      * chosen deliberately -- they are what the replicate-low-bits widening
@@ -3412,17 +3581,38 @@ static bool test_media_overlay_bands_and_the_32_bit_wrapper(void)
     memset(scratch, 0, sizeof(scratch));
     psp_ui_media_composite_8888(
         &media, NULL, video, WIDTH, HEIGHT, WIDTH, scratch);
-    size_t count = psp_ui_media_overlay_bands(
-        &media, WIDTH, HEIGHT, bands, PSP_UI_MEDIA_OVERLAY_BAND_LIMIT);
+    PspUiOverlayRegion regions[PSP_UI_MEDIA_OVERLAY_REGION_LIMIT];
+    size_t count = psp_ui_media_overlay_regions(
+        &media, NULL, WIDTH, HEIGHT, regions,
+        PSP_UI_MEDIA_OVERLAY_REGION_LIMIT);
     CHECK(count != 0);
+    size_t imported_pixels = 0u;
+    size_t exported_pixels = 0u;
+    for (size_t region = 0; region < count; region++) {
+        size_t area = (size_t) (regions[region].right - regions[region].left)
+            * (size_t) (regions[region].bottom - regions[region].top);
+        exported_pixels += area;
+        if (regions[region].needs_backdrop) imported_pixels += area;
+    }
+    /* At 480x272 the old row-band bridge imported and exported 75,840
+       pixels. The exact bridge needs a backdrop only for the 50x38 badge;
+       title and footer are opaque and are exported without importing video. */
+    CHECK(imported_pixels == 50u * 38u);
+    CHECK(exported_pixels
+          == 50u * 38u + (size_t) WIDTH * (42u + 78u));
     bool overlay_landed = false;
     for (int y = 0; y < HEIGHT; y++) {
-        bool declared = false;
-        for (size_t band = 0; band < count; band++) {
-            if (y >= bands[band].top && y < bands[band].bottom)
-                declared = true;
-        }
         for (int x = 0; x < WIDTH; x++) {
+            bool declared = false;
+            for (size_t region = 0; region < count; region++) {
+                if (x >= regions[region].left
+                    && x < regions[region].right
+                    && y >= regions[region].top
+                    && y < regions[region].bottom) {
+                    declared = true;
+                    break;
+                }
+            }
             uint32_t pixel = video[(size_t) y * WIDTH + x];
             if (!declared) {
                 /* Untouched, byte for byte. */
@@ -3829,6 +4019,9 @@ static bool test_media_committed_seek_keeps_timeline_stable(void)
 int main(void)
 {
     if (!test_input_mapping_and_menu()
+        || !test_wifi_sign_in_suggestion_is_actionable()
+        || !test_contextual_failure_recovery_actions()
+        || !test_site_information_actions_are_scoped_and_confirmed()
         || !test_time_based_analog_scroll()
         || !test_focus_hold_repeat()
         || !test_page_dark_transform()
@@ -3858,7 +4051,7 @@ int main(void)
         || !test_media_title_uses_unicode_fallback_font()
         || !test_media_play_control_matches_the_page_overlay()
         || !test_media_status_uses_antialiased_chrome_font()
-        || !test_media_overlay_bands_and_the_32_bit_wrapper()
+        || !test_media_overlay_regions_and_the_32_bit_wrapper()
         || !test_media_buffering_transition_frames_are_stable()
         || !test_media_chrome_is_stable_across_motion_sequence()
         || !test_media_first_frame_transition_keeps_bottom_ground_stable()

@@ -177,6 +177,7 @@ bool youtube_direct_delivery_admitted(
         }
     }
     if (profile == NULL) return false;
+    if (stream->live_hls) return true;
     if (!profile->direct_delivery_requires_enrichment) return true;
     if (stream->content_length == 0
         || stream->content_length
@@ -422,6 +423,25 @@ static bool json_unsigned_value(YoutubeJson *json, uint64_t *value)
     unsigned long long parsed = strtoull(text, &end, 10);
     if (errno == ERANGE || end == NULL || *end != '\0') return false;
     *value = (uint64_t) parsed;
+    return true;
+}
+
+static bool json_boolean_value(YoutubeJson *json, bool *value)
+{
+    if (json == NULL || value == NULL) return false;
+    json_space(json);
+    size_t remaining = (size_t) (json->end - json->at);
+    size_t length = remaining >= 4u
+        && memcmp(json->at, "true", 4u) == 0 ? 4u
+        : remaining >= 5u
+          && memcmp(json->at, "false", 5u) == 0 ? 5u : 0u;
+    if (length == 0) return false;
+    YoutubeJson after = {json->at + length, json->end};
+    json_space(&after);
+    if (after.at < after.end
+        && strchr(",}]", *after.at) == NULL) return false;
+    *value = length == 4u;
+    json->at += length;
     return true;
 }
 
@@ -710,6 +730,24 @@ static bool youtube_ascii_contains(const char *text, const char *wanted)
     return false;
 }
 
+static bool youtube_use_live_hls(YoutubeJson value, YoutubeStream *parsed,
+                                 YoutubeStream *stream, char *error,
+                                 size_t error_size)
+{
+    if (!json_string(
+            &value, parsed->media_url, sizeof(parsed->media_url))
+        || !youtube_media_url_supported(parsed->media_url)) {
+        youtube_error(error, error_size,
+                      "format: untrusted live HLS manifest");
+        return false;
+    }
+    snprintf(parsed->mime_type, sizeof(parsed->mime_type), "%s",
+             "application/vnd.apple.mpegurl");
+    parsed->live_hls = true;
+    *stream = *parsed;
+    return true;
+}
+
 const char *youtube_playability_name(YoutubePlayability playability)
 {
     switch (playability) {
@@ -719,7 +757,7 @@ const char *youtube_playability_name(YoutubePlayability playability)
     case YOUTUBE_PLAYABILITY_REGION_BLOCKED: return "region-blocked";
     case YOUTUBE_PLAYABILITY_LIVE_UNSUPPORTED: return "live-unsupported";
     case YOUTUBE_PLAYABILITY_UPCOMING_UNSUPPORTED:
-        return "upcoming-unsupported";
+        return "upcoming";
     case YOUTUBE_PLAYABILITY_UNAVAILABLE: return "unavailable";
     case YOUTUBE_PLAYABILITY_CLIENT_REJECTED: return "client-rejected";
     case YOUTUBE_PLAYABILITY_UNKNOWN:
@@ -847,6 +885,12 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
             classified = YOUTUBE_PLAYABILITY_UNAVAILABLE;
         }
         if (playability != NULL) *playability = classified;
+        if (classified == YOUTUBE_PLAYABILITY_UPCOMING_UNSUPPORTED) {
+            youtube_error(
+                error, error_size,
+                "playability: upcoming: Premiere or live stream has not started yet");
+            return false;
+        }
         youtube_error(
             error, error_size, "playability: %s: %s%s%s",
             youtube_playability_name(classified), status,
@@ -865,10 +909,10 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
         youtube_find_key(json, length, "videoDetails", &value)
         && youtube_object_span(value, &details_json, &details_length);
     /*
-     * isLiveContent describes the video's provenance, not necessarily its
-     * current delivery mode. Archived broadcasts retain it while exposing a
-     * finite MP4 inventory and are ordinary playable VODs. Reject the active
-     * live contract below when an HLS manifest is actually present.
+     * isLiveContent describes provenance and remains true on archived
+     * broadcasts. isLive/liveStreamability are active-delivery signals:
+     * prefer the rolling HLS window even if the response also exposes a
+     * transient MP4 inventory.
      */
     if (playability != NULL) *playability = YOUTUBE_PLAYABILITY_OK;
     if (have_details
@@ -886,6 +930,20 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
     }
     bool have_hls_manifest = youtube_find_key(
         streaming_json, streaming_length, "hlsManifestUrl", &value);
+    YoutubeJson hls_value = value;
+    /* Some client profiles omit videoDetails.isLive but expose the active
+       contract through liveStreamability. LIVE_STREAM_OFFLINE was rejected
+       above, so an upcoming event cannot be mistaken for a playable feed. */
+    bool active_live = youtube_find_key(
+        playability_json, playability_length, "liveStreamability", &value);
+    if (have_details
+        && youtube_find_key(details_json, details_length, "isLive", &value)) {
+        (void) json_boolean_value(&value, &active_live);
+    }
+    if (active_live && have_hls_manifest) {
+        return youtube_use_live_hls(
+            hls_value, parsed, stream, error, error_size);
+    }
     YoutubeFormat *selected = &scratch->selected;
     bool have_progressive = youtube_find_key(
         streaming_json, streaming_length, "formats", &value);
@@ -913,12 +971,8 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
     }
     if (!have_progressive && !have_adaptive) {
         if (have_hls_manifest) {
-            if (playability != NULL)
-                *playability = YOUTUBE_PLAYABILITY_LIVE_UNSUPPORTED;
-            youtube_error(
-                error, error_size,
-                "playability: live-unsupported: live streams are not supported");
-            return false;
+            return youtube_use_live_hls(
+                hls_value, parsed, stream, error, error_size);
         }
         youtube_error(error, error_size, "format: no stream inventory");
         return false;
@@ -935,12 +989,8 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
     }
     if (selected->url[0] == '\0') {
         if (have_hls_manifest) {
-            if (playability != NULL)
-                *playability = YOUTUBE_PLAYABILITY_LIVE_UNSUPPORTED;
-            youtube_error(
-                error, error_size,
-                "playability: live-unsupported: live streams are not supported");
-            return false;
+            return youtube_use_live_hls(
+                hls_value, parsed, stream, error, error_size);
         }
         youtube_error(
             error, error_size,
@@ -1448,6 +1498,10 @@ struct YoutubeResolveJob {
     char visitor[1024];
     char api_key[128];
     uint64_t signature_timestamp;
+    size_t watch_scan_offset;
+    bool watch_have_visitor;
+    bool watch_have_api_key;
+    bool watch_have_signature_timestamp;
     TilefinchRequestContext watch_context;
     char watch_cookies[4096];
     char last_error[256];
@@ -1649,23 +1703,47 @@ static bool youtube_resolve_job_take_watch_prefix(YoutubeResolveJob *job)
 {
     if (job == NULL || job->response.data == NULL
         || job->response.length == 0) return false;
-    char visitor[sizeof(job->visitor)] = {0};
-    char api_key[sizeof(job->api_key)] = {0};
-    uint64_t signature_timestamp = 0;
-    if (!youtube_watch_string(
-            job->response.data, job->response.length, "VISITOR_DATA",
-            visitor, sizeof(visitor))
-        || !youtube_watch_string(
-            job->response.data, job->response.length,
-            "INNERTUBE_API_KEY", api_key, sizeof(api_key))
-        || !youtube_watch_unsigned(
-            job->response.data, job->response.length, "STS",
-            &signature_timestamp)
-        || !youtube_header_value_safe(visitor)
-        || !youtube_api_key_safe(api_key)) return false;
-    snprintf(job->visitor, sizeof(job->visitor), "%s", visitor);
-    snprintf(job->api_key, sizeof(job->api_key), "%s", api_key);
-    job->signature_timestamp = signature_timestamp;
+    /* Each network chunk used to rescan the whole accumulated prefix for all
+       three keys, making a large watch page cumulative O(n^2). Scan only the
+       new suffix plus enough overlap for the largest admitted value. */
+    enum { YOUTUBE_WATCH_SCAN_OVERLAP = 2048 };
+    size_t start = job->watch_scan_offset;
+    if (start > job->response.length) start = job->response.length;
+    start = start > YOUTUBE_WATCH_SCAN_OVERLAP
+        ? start - YOUTUBE_WATCH_SCAN_OVERLAP : 0;
+    const char *window = job->response.data + start;
+    size_t window_length = job->response.length - start;
+    if (!job->watch_have_visitor) {
+        char visitor[sizeof(job->visitor)] = {0};
+        if (youtube_watch_string(
+                window, window_length, "VISITOR_DATA",
+                visitor, sizeof(visitor))
+            && youtube_header_value_safe(visitor)) {
+            snprintf(job->visitor, sizeof(job->visitor), "%s", visitor);
+            job->watch_have_visitor = true;
+        }
+    }
+    if (!job->watch_have_api_key) {
+        char api_key[sizeof(job->api_key)] = {0};
+        if (youtube_watch_string(
+                window, window_length, "INNERTUBE_API_KEY",
+                api_key, sizeof(api_key))
+            && youtube_api_key_safe(api_key)) {
+            snprintf(job->api_key, sizeof(job->api_key), "%s", api_key);
+            job->watch_have_api_key = true;
+        }
+    }
+    if (!job->watch_have_signature_timestamp) {
+        uint64_t signature_timestamp = 0;
+        if (youtube_watch_unsigned(
+                window, window_length, "STS", &signature_timestamp)) {
+            job->signature_timestamp = signature_timestamp;
+            job->watch_have_signature_timestamp = true;
+        }
+    }
+    job->watch_scan_offset = job->response.length;
+    if (!job->watch_have_visitor || !job->watch_have_api_key
+        || !job->watch_have_signature_timestamp) return false;
     job->watch_bytes = job->response.length;
     job->watch_status = 0;
     uint64_t now = tilefinch_platform_monotonic_time_ns();
@@ -2328,6 +2406,8 @@ bool youtube_resolve_progressive_mp4_cancelable(
         .credential_origin = canonical_watch,
         .initiator_url = canonical_watch,
         .connect_timeout_ms = YOUTUBE_RESOLVER_CONNECT_TIMEOUT_MS,
+        .redirect_same_origin_only = true,
+        .redirect_url_validator = youtube_resolver_url_supported,
         .cookie_session = session,
         .cookie_context = &watch_context
     };

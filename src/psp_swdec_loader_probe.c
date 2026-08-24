@@ -92,7 +92,8 @@ int main(int argc, char *argv[])
         || api.abi_version != TILEFINCH_SWDEC_COMPONENT_ABI_VERSION
         || api.struct_size < sizeof(api)
         || api.attach_me == NULL || api.detach_me == NULL
-        || api.restore_me == NULL || api.audio_shutdown == NULL) {
+        || api.restore_me == NULL || api.audio_shutdown == NULL
+        || api.csc_picture == NULL) {
         failures++;
         goto finished;
     }

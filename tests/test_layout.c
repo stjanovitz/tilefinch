@@ -3,6 +3,11 @@
    layout translation units they exercise. */
 
 #include "tilefinch_test_common.h"
+#include "tilefinch/text_bidi.h"
+#include "../src/layout_internal.h"
+#undef budget_malloc
+#undef budget_calloc
+#undef budget_realloc
 #include "../src/style_internal.h"
 
 typedef enum {

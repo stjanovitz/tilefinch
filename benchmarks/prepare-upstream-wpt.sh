@@ -27,6 +27,7 @@ sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' \
     "$root/benchmarks/wpt/component-reactivity-paths.txt" \
     "$root/benchmarks/wpt/modern-component-apis-paths.txt" \
     "$root/benchmarks/wpt/scroll-interaction-paths.txt" \
+    "$root/benchmarks/wpt/canvas2d-paths.txt" \
     "$root/benchmarks/wpt/modern-mobile-css-paths.txt" |
     git -C "$wpt_root" sparse-checkout set --no-cone --stdin
 git -C "$wpt_root" checkout

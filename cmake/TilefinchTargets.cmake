@@ -196,6 +196,31 @@ if(NOT PSP)
 endif()
 
 if(PSP)
+    # Optional ARK-4 VSH plugin. It observes the firmware HTML-viewer module
+    # start, then hands off to the stable root launcher. It is deliberately a
+    # separate kernel PRX: ordinary Tilefinch builds never load privileged
+    # code, and the in-app A/B updater remains unaware of /SEPLUGINS.
+    add_prx_module(tilefinch-xmb-redirect
+        src/psp_xmb_redirect.c
+        src/xmb_redirect_policy.c)
+    target_include_directories(tilefinch-xmb-redirect PRIVATE include)
+    target_compile_options(tilefinch-xmb-redirect PRIVATE
+        -Os -G0 -fno-pic
+        -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration
+        "SHELL:-isystem ${PSPDEV}/psp/sdk/include")
+    target_link_options(tilefinch-xmb-redirect PRIVATE
+        -nostdlib
+        "${PSPDEV}/psp/sdk/lib/prxexports.o")
+    target_link_libraries(tilefinch-xmb-redirect PRIVATE
+        pspsystemctrl_kernel
+        pspdebug pspdisplay_driver pspctrl_driver
+        pspmodinfo pspsdk pspkernel)
+    set_target_properties(tilefinch-xmb-redirect PROPERTIES
+        OUTPUT_NAME tilefinch_xmb
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/xmb-redirect")
+    set_property(TARGET tilefinch-xmb-redirect APPEND PROPERTY LINK_DEPENDS
+        "${PSPDEV}/psp/sdk/lib/prxexports.o")
+
     # Stable, deliberately small A/B launcher. It owns no network or browser
     # engine code: on trial boots it re-verifies signed Stable/Beta slots from
     # the embedded root, or every digest in an explicitly marked unsigned
@@ -211,7 +236,8 @@ if(PSP)
         src/update_slot.c
         src/update_root_embedded.c
         src/update_crypto_mbedtls.c
-        src/psp_time.c)
+        src/psp_time.c
+        src/psp_time_policy.c)
     target_include_directories(tilefinch-launcher PRIVATE
         include "${CMAKE_CURRENT_BINARY_DIR}/generated")
     if(TILEFINCH_PSP_VALIDATION_LOG)
@@ -338,6 +364,7 @@ if(PSP)
         add_executable(psp-browser-script
             src/psp_script_main.c
             src/psp_app/psp_app_actions.c
+            src/psp_app/psp_app_captive_portal.c
             src/psp_app/psp_app_input.c
             src/psp_app/psp_app_settings.c
             src/psp_app/psp_app_network.c
@@ -750,13 +777,15 @@ if(PSP)
             COMMAND ${CMAKE_COMMAND}
                 "-DLAUNCHER_EBOOT=${CMAKE_CURRENT_BINARY_DIR}/launcher/EBOOT.PBP"
                 "-DBROWSER_EBOOT=${CMAKE_CURRENT_BINARY_DIR}/EBOOT.PBP"
+                "-DXMB_REDIRECT_PRX=${CMAKE_CURRENT_BINARY_DIR}/xmb-redirect/tilefinch_xmb.prx"
                 "-DASSET_DIR=${CMAKE_CURRENT_BINARY_DIR}"
                 "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
                 "-DOUTPUT=${TILEFINCH_PSP_INSTALL_TREE}"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StagePspInstall.cmake"
             DEPENDS tilefinch-launcher psp-browser-script
+                tilefinch-xmb-redirect
             COMMENT
-                "Staging launcher + slot-a + shared data PSP install tree"
+                "Staging launcher + slot-a + optional XMB redirect"
             VERBATIM)
     endif()
 
@@ -769,7 +798,8 @@ if(PSP)
             psp-browser-fixture
             psp-crypto-selftest
             psp-browser-script
-            psp-browser-script-dev-prx)
+            psp-browser-script-dev-prx
+            tilefinch-xmb-redirect)
         if(TARGET ${psp_target})
             set_property(TARGET ${psp_target} APPEND PROPERTY LINK_DEPENDS
                 "${PSP_BROWSER_GC_KEEP_SCRIPT}")

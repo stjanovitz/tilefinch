@@ -13,12 +13,22 @@
 
 typedef struct DocumentControlState DocumentControlState;
 
+typedef struct {
+    Budget *budget;
+    char *markup;
+    size_t length;
+    size_t capacity;
+    size_t source_text_bytes;
+} DocumentBodySnapshot;
+
 typedef enum {
     DOCUMENT_GLYPH_SCRIPT_HAN = 1u << 0,
     DOCUMENT_GLYPH_SCRIPT_JAPANESE = 1u << 1,
     DOCUMENT_GLYPH_SCRIPT_KOREAN = 1u << 2,
     DOCUMENT_GLYPH_SCRIPT_CYRILLIC = 1u << 3,
-    DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED = 1u << 4
+    DOCUMENT_GLYPH_SCRIPT_LATIN_EXTENDED = 1u << 4,
+    DOCUMENT_GLYPH_SCRIPT_ARABIC = 1u << 5,
+    DOCUMENT_GLYPH_SCRIPT_HEBREW = 1u << 6
 } DocumentGlyphScript;
 
 typedef struct {
@@ -39,7 +49,14 @@ typedef struct {
     /* Visible-text ranges observed by the existing parser statistics pass.
        The PSP frontend uses this compact hint to attach installed fallback
        packs lazily; it is not serialized and causes no storage I/O here. */
-    uint8_t glyph_script_mask;
+    uint16_t glyph_script_mask;
+    /* Existing parser-census fact that keeps ordinary LTR pages out of the
+       paragraph bidi pipeline without a second DOM walk. */
+    bool bidi_text_present;
+    /* An authored `dir` boundary can require visual reordering even when its
+       current text is ASCII. Keep that uncommon fact separate so ordinary
+       documents still bypass bidi before style/layout work. */
+    bool bidi_markup_present;
     /* Monotonic connected-content identity. Layout-owned document caches use
        this instead of rescanning the complete DOM on every relayout. */
     uint64_t content_generation;
@@ -68,6 +85,10 @@ typedef struct {
        post-layout autofocus obligation only for documents that need it. */
     bool autofocus_attribute_present;
 } PocDocument;
+
+typedef bool (*DocumentBodySnapshotReplaceCallback)(
+    void *opaque, PocDocument *document,
+    const char *markup, size_t length);
 
 typedef struct {
     bool declared;
@@ -140,6 +161,16 @@ void document_note_connected_mutation(PocDocument *document);
 bool document_set_element_inner_html(PocDocument *document,
                                      lxb_dom_node_t *element,
                                      const char *html, size_t length);
+/* Retain one complete, bounded server-rendered body across author-script
+   execution. A partial serialization is never exposed as a fallback. */
+bool document_body_snapshot_capture(PocDocument *document,
+                                    DocumentBodySnapshot *snapshot);
+/* A replacement callback owns external-handle retirement and mutation
+   publication; the callback-free path performs the native equivalents. */
+bool document_body_snapshot_restore_if_degraded(
+    PocDocument *document, const DocumentBodySnapshot *snapshot,
+    DocumentBodySnapshotReplaceCallback replace, void *replace_opaque);
+void document_body_snapshot_destroy(DocumentBodySnapshot *snapshot);
 /* Materializes the legacy aggregate body-text view on first use. The live DOM
    remains authoritative and document_refresh invalidates this derived cache. */
 const char *document_body_text(PocDocument *document);

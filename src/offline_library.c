@@ -12,7 +12,7 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/update.h"
 
-#define OFFLINE_INDEX_VERSION 2u
+#define OFFLINE_INDEX_VERSION 3u
 #define OFFLINE_INDEX_MINIMUM_VERSION 1u
 #define OFFLINE_INDEX_HEADER_BYTES 20u
 #define OFFLINE_ARTICLE_NODE_LIMIT 32768u
@@ -210,7 +210,10 @@ static bool encode_item(
                sizeof(item->source_url))
         && put_text(
                data, capacity, used, item->video_id,
-               sizeof(item->video_id));
+               sizeof(item->video_id))
+        && put_text(
+               data, capacity, used, item->failure_reason,
+               sizeof(item->failure_reason));
 }
 
 static bool decode_item(
@@ -242,7 +245,11 @@ static bool decode_item(
                sizeof(staged.source_url))
         || !get_text(
                data, length, used, staged.video_id,
-               sizeof(staged.video_id))) return false;
+               sizeof(staged.video_id))
+        || (version >= 3u
+            && !get_text(
+                   data, length, used, staged.failure_reason,
+                   sizeof(staged.failure_reason)))) return false;
     staged.type = (OfflineItemType) type;
     staged.state = (OfflineItemState) state;
     staged.width = (int) (int32_t) width;

@@ -61,6 +61,8 @@ static bool menu_handle_escape(
     } else {
         if (ui->screen == PSP_UI_SCREEN_DIAGNOSTIC_QR)
             intent->action = PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR;
+        else if (ui->screen == PSP_UI_SCREEN_FAILURE_RECOVERY)
+            intent->action = PSP_UI_ACTION_RECOVERY_RETURN;
         else if (ui->screen == PSP_UI_SCREEN_UPDATE_VERSIONS)
             intent->update_versions_closed = true;
         else if (ui->screen == PSP_UI_SCREEN_FIND) {
@@ -156,8 +158,110 @@ static void menu_update_site_controls(
         }
         intent->visual_changed = true;
     } else if (pressed & PSP_UI_BUTTON_CANCEL) {
+        if (ui->data_clear_confirmation == 3u) {
+            ui->data_clear_confirmation = 0u;
+            ui->menu_selection = 0u;
+            menu_open_parent(ui, PSP_UI_SCREEN_PAGE_INFORMATION);
+        } else {
+            ui->menu_selection = 5u;
+            menu_open_parent(ui, PSP_UI_SCREEN_PAGE_TOOLS);
+        }
+        intent->visual_changed = true;
+    }
+}
+
+static void menu_update_page_information(
+    PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
+{
+    enum { SITE_INFO_ACTION_COUNT = 3 };
+    if (pressed & PSP_UI_BUTTON_UP) {
+        ui->menu_selection = (uint8_t) (
+            (ui->menu_selection + SITE_INFO_ACTION_COUNT - 1u)
+            % SITE_INFO_ACTION_COUNT);
+        ui->data_clear_confirmation = 0u;
+        intent->visual_changed = true;
+    } else if (pressed & PSP_UI_BUTTON_DOWN) {
+        ui->menu_selection = (uint8_t) (
+            (ui->menu_selection + 1u) % SITE_INFO_ACTION_COUNT);
+        ui->data_clear_confirmation = 0u;
+        intent->visual_changed = true;
+    } else if (pressed & PSP_UI_BUTTON_CONFIRM) {
+        if (ui->menu_selection == 0u) {
+            ui->data_clear_confirmation = 3u;
+            ui->menu_selection = 0u;
+            menu_open_child(ui, PSP_UI_SCREEN_SITE_CONTROLS);
+        } else {
+            uint8_t confirmation = (uint8_t) (ui->menu_selection + 1u);
+            if (ui->data_clear_confirmation != confirmation) {
+                ui->data_clear_confirmation = confirmation;
+            } else {
+                intent->clear_site_data_requested =
+                    ui->menu_selection == 1u;
+                intent->reset_site_permissions_requested =
+                    ui->menu_selection == 2u;
+                ui->data_clear_confirmation = 0u;
+            }
+        }
+        intent->visual_changed = true;
+    } else if (pressed & PSP_UI_BUTTON_CANCEL) {
+        ui->data_clear_confirmation = 0u;
         ui->menu_selection = 5u;
         menu_open_parent(ui, PSP_UI_SCREEN_PAGE_TOOLS);
+        intent->visual_changed = true;
+    }
+}
+
+static size_t menu_failure_action_count(const PspUiState *ui)
+{
+    size_t count = 3u; /* Retry, Reader, return. */
+    if (ui->failure_actions & PSP_UI_FAILURE_WIFI) count++;
+    if (ui->failure_actions & PSP_UI_FAILURE_DISABLE_JAVASCRIPT) count++;
+    if (ui->failure_actions & PSP_UI_FAILURE_AUDIO_ONLY) count++;
+    if (ui->failure_actions & PSP_UI_FAILURE_LOWER_QUALITY) count++;
+    return count;
+}
+
+static PspUiAction menu_failure_action(
+    const PspUiState *ui, size_t selected)
+{
+    if (selected-- == 0u) return PSP_UI_ACTION_RELOAD;
+    if (selected-- == 0u) return PSP_UI_ACTION_RECOVERY_READER;
+    if ((ui->failure_actions & PSP_UI_FAILURE_WIFI) != 0u) {
+        if (selected-- == 0u) return PSP_UI_ACTION_CHECK_WIFI_SIGN_IN;
+    }
+    if ((ui->failure_actions & PSP_UI_FAILURE_DISABLE_JAVASCRIPT) != 0u) {
+        if (selected-- == 0u)
+            return PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT;
+    }
+    if ((ui->failure_actions & PSP_UI_FAILURE_AUDIO_ONLY) != 0u) {
+        if (selected-- == 0u) return PSP_UI_ACTION_RECOVERY_AUDIO_ONLY;
+    }
+    if ((ui->failure_actions & PSP_UI_FAILURE_LOWER_QUALITY) != 0u) {
+        if (selected-- == 0u)
+            return PSP_UI_ACTION_RECOVERY_LOWER_QUALITY;
+    }
+    return PSP_UI_ACTION_RECOVERY_RETURN;
+}
+
+static void menu_update_failure_recovery(
+    PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
+{
+    size_t count = menu_failure_action_count(ui);
+    if (pressed & PSP_UI_BUTTON_UP) {
+        ui->menu_selection = (uint8_t) (
+            (ui->menu_selection + count - 1u) % count);
+        intent->visual_changed = true;
+    } else if (pressed & PSP_UI_BUTTON_DOWN) {
+        ui->menu_selection = (uint8_t) (
+            (ui->menu_selection + 1u) % count);
+        intent->visual_changed = true;
+    } else if (pressed & PSP_UI_BUTTON_CONFIRM) {
+        intent->action = menu_failure_action(ui, ui->menu_selection);
+        menu_close(ui);
+        intent->visual_changed = true;
+    } else if (pressed & PSP_UI_BUTTON_CANCEL) {
+        intent->action = PSP_UI_ACTION_RECOVERY_RETURN;
+        menu_close(ui);
         intent->visual_changed = true;
     }
 }
@@ -183,10 +287,7 @@ static void menu_update_page_tools(
             case 4: intent->action = PSP_UI_ACTION_SCREENSHOT; break;
             case 5:
                 ui->menu_selection = 0u;
-                menu_open_child(ui, PSP_UI_SCREEN_SITE_CONTROLS);
-                intent->visual_changed = true;
-                return;
-            case 6:
+                ui->data_clear_confirmation = 0u;
                 menu_open_child(ui, PSP_UI_SCREEN_PAGE_INFORMATION);
                 intent->visual_changed = true;
                 return;
@@ -215,6 +316,10 @@ static void menu_update_help(
         intent->visual_changed = true;
     } else if (pressed & PSP_UI_BUTTON_CONFIRM) {
         if (ui->menu_selection == 0u) {
+            intent->action = PSP_UI_ACTION_CHECK_WIFI_SIGN_IN;
+            ui->menu_selection = UI_MENU_ROW_HELP;
+            menu_close(ui);
+        } else if (ui->menu_selection == 1u) {
             ui->status[0] = '\0';
             ui->toast_frames = 0u;
             menu_open_child(ui, PSP_UI_SCREEN_DIAGNOSTIC_QR);
@@ -364,11 +469,10 @@ bool psp_ui_menu_update(
     if (menu_handle_escape(ui, pressed, intent)) return true;
     switch (ui->screen) {
         case PSP_UI_SCREEN_PAGE_INFORMATION:
-            if (pressed & PSP_UI_BUTTON_CANCEL) {
-                ui->menu_selection = 6u;
-                menu_open_parent(ui, PSP_UI_SCREEN_PAGE_TOOLS);
-                intent->visual_changed = true;
-            }
+            menu_update_page_information(ui, pressed, intent);
+            return true;
+        case PSP_UI_SCREEN_FAILURE_RECOVERY:
+            menu_update_failure_recovery(ui, pressed, intent);
             return true;
         case PSP_UI_SCREEN_HELP_DETAIL:
             if (pressed & PSP_UI_BUTTON_CANCEL) {

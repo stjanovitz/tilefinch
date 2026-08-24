@@ -8,6 +8,7 @@
  */
 #include "psp_app_internal.h"
 #include <psputility_sysparam.h>
+#include "tilefinch/psp_time.h"
 #include "tilefinch/psp_threads.h"
 
 PspMediaSession *psp_active_media;
@@ -27,20 +28,17 @@ _Static_assert(
     "generic certificate headline must fit the large PSP toast");
 const char *psp_user_visible_error(
     const char *detail, long tls_verify_result,
+    bool tls_verify_result_available, bool tls_verification_failed,
     TilefinchTlsGuidance *tls_guidance,
     char *summary, size_t summary_size)
 {
     if (detail == NULL) detail = "";
     if (tls_guidance != NULL) *tls_guidance = TILEFINCH_TLS_GUIDANCE_NONE;
     if (summary == NULL || summary_size == 0
-        || (tls_verify_result == 0
-            && !tilefinch_error_is_certificate_verification_failure(detail))) {
+        || !tls_verification_failed) {
         return detail;
     }
-    ScePspDateTime rtc = {0};
-    int rtc_result = sceRtcGetCurrentClock(&rtc, 0);
-    bool rtc_valid = rtc_result >= 0
-        && sceRtcCheckValid(&rtc) == 0 && rtc.year >= 2024u;
+    PspTimeStatus clock_status = psp_time_read_utc(NULL);
     /* Keep the useful route-level context, but move the recovery action onto
        its own full-width line. The unabridged backend sentence remains in the
        failure report rather than being clipped into an unreadable toast. */
@@ -50,7 +48,8 @@ const char *psp_user_visible_error(
         : PSP_CERTIFICATE_GENERIC_HEAD;
     if (tls_guidance != NULL) {
         *tls_guidance = tilefinch_tls_verification_guidance(
-            (uint32_t) tls_verify_result, rtc_valid);
+            (uint32_t) tls_verify_result,
+            tls_verify_result_available, clock_status);
     }
     snprintf(summary, summary_size, "%s", headline);
     return summary;
@@ -114,9 +113,42 @@ void psp_presentation_unbind_chrome_fonts(
 static atomic_int psp_callback_setup_ready;
 static atomic_int psp_callback_setup_result;
 static atomic_int psp_power_callback_setup_result;
+static atomic_int psp_home_exit_watchdog_started;
 
 /* For PSP_SYSTEMPARAM_ID_INT_TIME_FORMAT, read once for the status clock. */
 #include <psputility.h>
+
+static int psp_home_exit_watchdog(SceSize args, void *argp)
+{
+    (void) args;
+    (void) argp;
+    for (unsigned waited_ms = 0;
+         waited_ms < PSP_HOME_EXIT_GRACE_MS; waited_ms += 10u) {
+        (void) sceKernelDelayThread(10000);
+    }
+    psp_log_emergency("home-exit-grace-expired");
+    sceKernelExitGame();
+    sceKernelExitDeleteThread(0);
+    return 0;
+}
+
+static bool psp_start_home_exit_watchdog(void)
+{
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &psp_home_exit_watchdog_started, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire)) return true;
+    int thread_id = sceKernelCreateThread(
+        "home-exit-watchdog", psp_home_exit_watchdog,
+        TILEFINCH_PSP_THREAD_PRIORITY_WATCHDOG, 4u * 1024u, 0, NULL);
+    int started = thread_id < 0
+        ? thread_id : sceKernelStartThread(thread_id, 0, NULL);
+    if (started >= 0) return true;
+    if (thread_id >= 0) (void) sceKernelDeleteThread(thread_id);
+    atomic_store_explicit(
+        &psp_home_exit_watchdog_started, 0, memory_order_release);
+    return false;
+}
 
 static int psp_exit_callback(int arg1, int arg2, void *common)
 {
@@ -124,13 +156,16 @@ static int psp_exit_callback(int arg1, int arg2, void *common)
     atomic_store_explicit(
         &psp_home_exit_requested, true, memory_order_release);
     psp_log_emergency("home-exit-requested");
-    /*
-     * HOME is delivered on the callback thread. Engine/session state belongs
-     * to the main thread, so never serialize it here. Cooperative jobs observe
-     * the atomic request, unwind through the ordinary cleanup path, and call
-     * sceKernelExitGame themselves. A broken/non-cooperative path still has a
-     * finite escape hatch rather than trapping the user in the application.
-     */
+    /* HOME is delivered on the callback thread. Engine/session state belongs
+       to the main thread, so never serialize it here. Return immediately so
+       this same thread can resume the busy-screen supervisor: it turns the
+       request into transport cancellation and visible CLOSING feedback on
+       its next tick. A separate one-shot thread retains the finite escape
+       hatch for a genuinely non-cooperative firmware call. */
+    if (psp_start_home_exit_watchdog()) return 0;
+    /* Low-memory fallback: if the tiny failsafe thread cannot be admitted,
+       preserve the old terminal guarantee even though presentation cannot
+       advance during this exceptional wait. */
     for (unsigned waited_ms = 0;
          waited_ms < PSP_HOME_EXIT_GRACE_MS; waited_ms += 10u) {
         (void) sceKernelDelayThread(10000);
@@ -215,6 +250,8 @@ int psp_setup_callbacks(void)
         &psp_power_callback_setup_result, -1, memory_order_relaxed);
     atomic_store_explicit(
         &psp_background_ui_available, 0u, memory_order_relaxed);
+    atomic_store_explicit(
+        &psp_home_exit_watchdog_started, 0, memory_order_relaxed);
     int thread_id = sceKernelCreateThread(
         "callbacks", psp_callback_thread,
         TILEFINCH_PSP_THREAD_PRIORITY_CALLBACK, 8u * 1024u, 0, NULL);
@@ -1738,6 +1775,13 @@ static void psp_present_supervisor_media(const PspUiMediaState *media)
 {
     if (media == NULL
         || !psp_lifecycle_presentation_allowed(&psp_lifecycle)) return;
+    /* The supervisor may write either scanout format without presenting a
+       decoded picture. Forget both buffer identities before touching either
+       path, including attempts whose later publication fails, so an ordinary
+       presenter can never skip against supervisor chrome or black pixels.
+       This callback runs inside the same cooperative presentation scope as
+       the ordinary presenter, preserving record-table serialization. */
+    psp_media_present_forget_buffers();
     if (psp_display_video_active(&psp_display)) {
         /* A cooperative preview seek must not switch the panel from the
            32-bit video surface to a separately-cleared 16-bit surface merely
@@ -2213,6 +2257,15 @@ void psp_background_ui_tick(void)
     const bool scripted = false;
 #endif
     uint64_t now_us = sceKernelGetSystemTimeWide();
+    if (psp_home_exit_pending()
+        && !tilefinch_cancellation_requested(&cooperate->cancellation)) {
+        tilefinch_cancellation_request(&cooperate->cancellation);
+        cooperate->cancellation_requested_us = now_us;
+        acknowledgement_started_us = now_us;
+        cooperate->input_acknowledgements++;
+        psp_ui_show_status(&cooperate->supervisor_ui, "CLOSING...", 600);
+        urgent_present = true;
+    }
     unsigned validation_cancel_after_ms =
         psp_validation_cancel_after_ms;
     if (validation_cancel_after_ms != 0

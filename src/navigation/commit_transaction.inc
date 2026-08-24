@@ -1,5 +1,24 @@
 #define NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT 128u
 
+static bool navigation_replace_server_body_with_runtime(
+    void *opaque, PocDocument *document,
+    const char *markup, size_t length)
+{
+    return script_runtime_replace_document_body(
+        opaque, document, markup, length);
+}
+
+static bool navigation_restore_server_body_if_degraded(
+    NavigationSession *session, const DocumentBodySnapshot *snapshot)
+{
+    if (session == NULL || snapshot == NULL) return false;
+    ScriptRuntime *runtime = session->page.runtime;
+    return document_body_snapshot_restore_if_degraded(
+        &session->page.document, snapshot,
+        runtime == NULL ? NULL : navigation_replace_server_body_with_runtime,
+        runtime);
+}
+
 static bool navigation_commit_checkpoint(
     NavigationSession *session, const char *phase, size_t completed_work)
 {
@@ -701,22 +720,8 @@ static bool navigation_document_requires_runtime(
         if (script) {
             size_t type_length = 0;
             const char *type = document_attribute(node, "type", &type_length);
-            while (type_length != 0
-                   && isspace((unsigned char) *type)) {
-                type++;
-                type_length--;
-            }
-            while (type_length != 0
-                   && isspace((unsigned char) type[type_length - 1u])) {
-                type_length--;
-            }
-            bool executable = type == NULL || type_length == 0
-                || (type_length == 6 && strncasecmp(type, "module", 6) == 0)
-                || (type_length == 15
-                    && strncasecmp(type, "text/javascript", 15) == 0)
-                || (type_length == 22
-                    && strncasecmp(
-                        type, "application/javascript", 22) == 0);
+            bool executable = script_type_attribute_classify(
+                type, type_length, NULL);
             if (executable) return true;
         }
         if (name != NULL) {
@@ -808,6 +813,11 @@ static bool navigation_finish_authoritative_layout(
     navigation_paint_authoritative_layout(
         session, streaming, previous_page, progressive_preview_candidate,
         &session->page.layout);
+    /* Publish the exact resource/font owners used by the committed layout
+       before attaching its runtime. Canvas dirty snapshots queued by inline
+       scripts can then join the page resource table during that attach. */
+    session->fonts = fonts;
+    session->images = images;
     if (session->page.runtime != NULL) {
         navigation_attach_layout(session);
         (void) script_runtime_consume_relayout(session->page.runtime);
@@ -826,8 +836,6 @@ static bool navigation_finish_authoritative_layout(
         fingerprint_finished >= phase_started
             ? fingerprint_finished - phase_started : 0;
     session->style_rebuild_required = false;
-    session->fonts = fonts;
-    session->images = images;
     if (session->document_scripts_enabled
         && session->page.runtime != NULL
         && !session->defer_document_script_pipeline
@@ -862,12 +870,6 @@ static bool navigation_commit_document(
         || url == NULL || document == NULL || document->html == NULL
         || viewport_width <= 0) return false;
     ReaderDocumentAnalysis reader_analysis = {0};
-    if (session->prepare_reader_candidates
-        && !reader_document_prepare(document, &reader_analysis)) {
-        snprintf(session->last_error, sizeof(session->last_error),
-                 "reader candidate analysis failed within the page budget");
-        return false;
-    }
     NavigationCandidatePrepareCallback candidate_prepare =
         session->candidate_prepare;
     NavigationCandidateFinalizeCallback candidate_abort =
@@ -931,9 +933,17 @@ static bool navigation_commit_document(
     int previous_relayout_damage_top = session->relayout_damage_top;
     int previous_relayout_damage_right = session->relayout_damage_right;
     int previous_relayout_damage_bottom = session->relayout_damage_bottom;
+    bool previous_canvas_paint_damage_pending =
+        session->canvas_paint_damage_pending;
     bool candidate_hook_attempted = false;
     session->pending_response_referrer_policy[0] = '\0';
+    session->canvas_paint_damage_pending = false;
     memset(&session->page, 0, sizeof(session->page));
+    if (streaming != NULL) {
+        session->page.images = streaming->canvas_images;
+        memset(&streaming->canvas_images, 0,
+               sizeof(streaming->canvas_images));
+    }
     session->page.fetch_domain = candidate_fetch_domain;
     if (fetch_domain_from_stream) streaming->fetch_domain = NULL;
     snprintf(session->page.referrer_policy,
@@ -995,6 +1005,12 @@ static bool navigation_commit_document(
         }
         session->page.script_result = streaming->script_result;
         streaming->runtime_transferred = true;
+        /* canvas_images moved from streaming storage into page storage before
+           this realm was adopted. Rebind before any remaining deferred script
+           runs so a late drawing cannot publish into the emptied staging
+           table. */
+        script_runtime_set_images(
+            session->page.runtime, &session->page.images);
     } else if (streaming != NULL
                && streaming->script_disabled_after_failure) {
         session->page.script_result = streaming->script_result;
@@ -1277,7 +1293,8 @@ static bool navigation_commit_document(
                     || session->defer_document_script_pipeline,
                 &session->viewport, SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL,
                 !isolates_remote_document, session->page.fetch_domain,
-                &session->page.stylesheet,
+                &session->page.stylesheet, &session->page.images,
+                fonts,
                 &session->page.script_result);
         }
         if (session->page.runtime == NULL) {
@@ -1298,7 +1315,16 @@ static bool navigation_commit_document(
         }
         if (session->document_scripts_enabled
             && !session->defer_document_script_pipeline) {
-            ExternalScriptMetrics metrics;
+            ExternalScriptMetrics metrics = {0};
+            DocumentBodySnapshot server_snapshot = {0};
+            const DocumentBodySnapshot *rollback_snapshot = NULL;
+            if (streamed_runtime
+                && streaming->server_body_snapshot.markup != NULL) {
+                rollback_snapshot = &streaming->server_body_snapshot;
+            } else if (document_body_snapshot_capture(
+                           &session->page.document, &server_snapshot)) {
+                rollback_snapshot = &server_snapshot;
+            }
             bool scripts_ok = streamed_runtime
                 ? document_scripts_finish_streaming(
                     &session->page.document, session->page.runtime,
@@ -1342,9 +1368,19 @@ static bool navigation_commit_document(
                    script. Infrastructure failures and cancellation remain
                    transactional failures. */
                 if (!navigation_retire_exhausted_script_realms(session)) {
+                    document_body_snapshot_destroy(&server_snapshot);
                     goto fail;
                 }
             }
+            bool hydration_degraded = !scripts_ok || metrics.failed != 0
+                || metrics.skipped_quota != 0
+                || metrics.skipped_pressure != 0
+                || metrics.cost_class_rejections != 0;
+            if (hydration_degraded) {
+                (void) navigation_restore_server_body_if_degraded(
+                    session, rollback_snapshot);
+            }
+            document_body_snapshot_destroy(&server_snapshot);
             session->script_discovered = metrics.discovered;
             session->script_attempted = metrics.attempted;
             session->script_loaded = metrics.loaded;
@@ -1388,6 +1424,11 @@ static bool navigation_commit_document(
                a reason to discard the already parsed server-rendered page. */
             navigation_record_soft_script_error(session, &metrics);
         }
+    }
+    if (streaming != NULL && streaming->script_disabled_after_failure
+        && streaming->server_body_snapshot.markup != NULL) {
+        (void) navigation_restore_server_body_if_degraded(
+            session, &streaming->server_body_snapshot);
     }
     session->performance.script_us += navigation_record_script_slices(
         session, phase_started, &session->page.script_result,
@@ -1526,6 +1567,15 @@ static bool navigation_commit_document(
             &session->page.stylesheet);
         (void) document_install_static_shell_fallback(
             &session->page.document);
+    }
+    if (session->prepare_reader_candidates) {
+        if (!reader_document_prepare(
+                &session->page.document, &reader_analysis)) {
+            snprintf(session->last_error, sizeof(session->last_error),
+                     "reader candidate analysis failed within the page budget");
+            goto fail;
+        }
+        session->page.reader_analysis = reader_analysis;
     }
     if (!navigation_commit_checkpoint(
             session, "navigation-final-style",
@@ -1742,6 +1792,12 @@ static bool navigation_commit_document(
     }
     if (!final_layout_ready) {
         phase_started = navigation_now_us();
+        if (session->page.images.count != 0) {
+            /* Parser-time canvases are page resources even when ordinary
+               external image loading is disabled (for example a data-only
+               local document). Include them in the authoritative layout. */
+            images = &session->page.images;
+        }
         if (defer_authoritative_layout && previous_page == NULL
             && !record_history && candidate_prepare == NULL
             && deferred_layout_job != NULL
@@ -1849,6 +1905,8 @@ fail:
     session->relayout_damage_top = previous_relayout_damage_top;
     session->relayout_damage_right = previous_relayout_damage_right;
     session->relayout_damage_bottom = previous_relayout_damage_bottom;
+    session->canvas_paint_damage_pending =
+        previous_canvas_paint_damage_pending;
     if (rollback_progressive_frame) {
         (void) session->progressive_paint(
             session->progressive_paint_opaque, session, NULL);

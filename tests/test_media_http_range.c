@@ -1666,17 +1666,23 @@ static void test_prolonged_window_can_be_superseded(
     uint64_t started_us = tilefinch_platform_monotonic_time_us();
     while (status == MEDIA_RANGE_READ_WOULD_BLOCK
            && tilefinch_platform_monotonic_time_us() - started_us
-                  < UINT64_C(16000000)) {
+                  < UINT64_C(5000000)) {
         status = reader.poll(
             reader.opaque, failed_offset, probe, sizeof(probe));
         (void) media_http_range_pump(range);
+        MediaHttpRangeStats progress = {0};
+        if (media_http_range_stats(range, &progress)
+            && progress.reconnects != 0u) break;
         usleep(10000);
     }
     MediaHttpRangeStats stats = {0};
     CHECK(status == MEDIA_RANGE_READ_WOULD_BLOCK);
     CHECK(media_http_range_stats(range, &stats)
           && stats.window_pending && !stats.delivery_stalled
-          && stats.reconnects == MEDIA_HTTP_TRICKLE_MAXIMUM_RECONNECTS
+          /* The synthetic-clock policy test above exhaustively pins all
+             three 2/4/8-second replacements. This socket case only needs to
+             prove that one real replacement remains supersedable. */
+          && stats.reconnects == 1u
           && stats.stalled_reconnect_exhaustions == 0u
           && stats.failures == 0u);
 

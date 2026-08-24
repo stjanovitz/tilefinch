@@ -36,6 +36,11 @@ signed release sequence.
 | `tilefinch-update-v1.tfum` | Signed release metadata (fixed name; produced offline, never by the script) |
 | `SHA256SUMS.txt` | Digests of the zip and TFUP for independent verification before signing |
 
+The first-install zip also carries the optional ARK-4 XMB redirect at
+`TILEFINCH/OPTIONAL/tilefinch_xmb.prx`. It is not part of the signed TFUP slot:
+installing it into `/SEPLUGINS` is an explicit CFW-level user choice, while
+ordinary in-app updates continue to replace only Tilefinch's A/B app slots.
+
 The official zip and TFUP never contain `tilefinch-swdec.prx` or
 `swdec-meload.prx`. The cut script forces the decoder build option off and
 fails if either file appears in the staged tree. The separately buildable
@@ -231,8 +236,9 @@ python3 tools/tilefinch_update_tool.py envelope --glyph-component \
 ```
 
 Repeat with the fixed names for `zh-hans`, `zh-hant`, `ko`, `emoji-color`,
-`cyrillic`, and `latin-extended`. The newest models release must contain every
-current voice and glyph asset pair because the device deliberately fetches
+`cyrillic`, `latin-extended`, `arabic`, and `hebrew`. The newest models release
+must contain every current
+voice and glyph asset pair because the device deliberately fetches
 fixed names from `releases/latest/download`. Before publishing, require a
 byte-identical producer rebuild; verify the embedded source-font SHA-256 and
 complete OFL; verify every final envelope with the embedded public root; and

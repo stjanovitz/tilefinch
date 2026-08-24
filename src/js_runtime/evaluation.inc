@@ -132,10 +132,27 @@ static bool node_name_is(lxb_dom_node_t *node, const char *wanted)
            && memcmp(name, wanted, length) == 0;
 }
 
+/* Error formatting is best-effort. A hostile thrown value can itself throw
+   from ToPrimitive/toString; drain that secondary exception so it cannot
+   replace the original browser-task failure or poison the next QuickJS API. */
+static void js_rt_clear_formatting_exception(JSContext *context)
+{
+    JSValue secondary = JS_GetException(context);
+    JS_FreeValue(context, secondary);
+}
+
+static const char *js_rt_exception_to_cstring(
+    JSContext *context, JSValueConst value)
+{
+    const char *text = JS_ToCString(context, value);
+    if (text == NULL) js_rt_clear_formatting_exception(context);
+    return text;
+}
+
 void js_rt_record_exception(JSContext *context, ScriptResult *result)
 {
     JSValue exception = JS_GetException(context);
-    const char *message = JS_ToCString(context, exception);
+    const char *message = js_rt_exception_to_cstring(context, exception);
     if (message != NULL) {
         snprintf(result->error, sizeof(result->error), "%s", message);
         JS_FreeCString(context, message);
@@ -143,8 +160,12 @@ void js_rt_record_exception(JSContext *context, ScriptResult *result)
         snprintf(result->error, sizeof(result->error), "JavaScript exception");
     }
     JSValue stack_value = JS_GetPropertyStr(context, exception, "stack");
+    if (JS_IsException(stack_value)) {
+        js_rt_clear_formatting_exception(context);
+        stack_value = JS_UNDEFINED;
+    }
     const char *stack = JS_IsUndefined(stack_value)
-                        ? NULL : JS_ToCString(context, stack_value);
+        ? NULL : js_rt_exception_to_cstring(context, stack_value);
     if (stack != NULL && stack[0] != '\0') {
         size_t used = strlen(result->error);
         if (used + 2 < sizeof(result->error)) {
@@ -247,14 +268,18 @@ static void promise_rejection_tracker(JSContext *context,
     }
     result->promise_rejections = state->count;
     state->last_reported = identity;
-    const char *message = JS_ToCString(context, reason);
+    const char *message = js_rt_exception_to_cstring(context, reason);
     snprintf(result->last_promise_rejection,
              sizeof(result->last_promise_rejection), "%s",
              message == NULL ? "unhandled promise rejection" : message);
     if (message != NULL) JS_FreeCString(context, message);
     JSValue stack_value = JS_GetPropertyStr(context, reason, "stack");
+    if (JS_IsException(stack_value)) {
+        js_rt_clear_formatting_exception(context);
+        stack_value = JS_UNDEFINED;
+    }
     const char *stack = JS_IsUndefined(stack_value)
-                        ? NULL : JS_ToCString(context, stack_value);
+        ? NULL : js_rt_exception_to_cstring(context, stack_value);
     if (stack != NULL && stack[0] != '\0') {
         size_t used = strlen(result->last_promise_rejection);
         if (used + 2 < sizeof(result->last_promise_rejection)) {
@@ -918,17 +943,15 @@ static bool evaluate_script_node(JSContext *context, lxb_dom_node_t *node,
     }
     size_t type_length = 0;
     const char *type = document_attribute(node, "type", &type_length);
-    if (type != NULL && type_length == 6
-        && memcmp(type, "module", 6) == 0) {
+    bool module = false;
+    bool executable = script_type_attribute_classify(
+        type, type_length, &module);
+    if (module) {
         /* Module loading is deliberately outside this bounded host. */
         result->external_scripts_skipped++;
         return true;
     }
-    if (type != NULL && type_length != 0
-        && !(type_length == 15 && memcmp(type, "text/javascript", 15) == 0)
-        && !(type_length == 22 && memcmp(type, "application/javascript", 22) == 0)) {
-        return true;
-    }
+    if (!executable) return true;
     source_length = 0;
     for (lxb_dom_node_t *child = node->first_child; child != NULL;
          child = child->next) {

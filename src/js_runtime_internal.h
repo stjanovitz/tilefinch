@@ -243,6 +243,7 @@ typedef struct DomBridge {
     bool *relayout_dirty;
     ScriptMutationJournal mutations;
     BrowserSession *session;
+    const FontSet *fonts;
     char *document_url;
     const char *top_level_url;
     bool opaque_origin;
@@ -322,7 +323,7 @@ typedef struct DomBridge {
     size_t script_source_node_count;
     size_t script_source_node_capacity;
     LayoutDocument *layout;
-    const ImageResources *images;
+    ImageResources *images;
     ScriptSynchronousLayoutCallback synchronous_layout;
     void *synchronous_layout_opaque;
     ElementScrollIntent scroll_intents[DOM_SCROLL_INTENT_LIMIT];
@@ -391,6 +392,7 @@ typedef enum {
     SCRIPT_HOST_PENDING_TIMERS,
     SCRIPT_HOST_PENDING_NETWORK_REQUESTS,
     SCRIPT_HOST_DELIVER_NETWORK,
+    SCRIPT_HOST_DETACH_NETWORK,
     SCRIPT_HOST_PUMP_TIMERS,
     SCRIPT_HOST_REBIND_DOCUMENT,
     SCRIPT_HOST_COMMIT_SAME_DOCUMENT,
@@ -714,6 +716,39 @@ void bridge_invalidate_node_slot(DomBridge *bridge, size_t slot);
 void bridge_release_native_node_pin(DomBridge *bridge, int64_t handle);
 bool js_rt_bridge_flush_synchronous_layout(DomBridge *bridge);
 bool bridge_node_is_connected(const lxb_dom_node_t *node);
+void js_rt_bridge_note_canvas_mutation(DomBridge *bridge,
+                                       lxb_dom_node_t *node,
+                                       bool paint_only);
+JSValue js_canvas_commit_surface(JSContext *context,
+                                 JSValueConst this_value,
+                                 int argc, JSValueConst *argv);
+JSValue js_canvas_image_source(JSContext *context,
+                               JSValueConst this_value,
+                               int argc, JSValueConst *argv);
+JSValue js_canvas_raster_rect(JSContext *context,
+                              JSValueConst this_value,
+                              int argc, JSValueConst *argv);
+JSValue js_canvas_raster_rect_batch(JSContext *context,
+                                    JSValueConst this_value,
+                                    int argc, JSValueConst *argv);
+JSValue js_canvas_measure_text(JSContext *context,
+                               JSValueConst this_value,
+                               int argc, JSValueConst *argv);
+JSValue js_canvas_raster_text(JSContext *context,
+                              JSValueConst this_value,
+                              int argc, JSValueConst *argv);
+JSValue js_canvas_raster_path(JSContext *context,
+                              JSValueConst this_value,
+                              int argc, JSValueConst *argv);
+JSValue js_canvas_raster_paint_batch(JSContext *context,
+                                     JSValueConst this_value,
+                                     int argc, JSValueConst *argv);
+JSValue js_canvas_raster_image(JSContext *context,
+                               JSValueConst this_value,
+                               int argc, JSValueConst *argv);
+JSValue js_canvas_raster_image_batch(JSContext *context,
+                                     JSValueConst this_value,
+                                     int argc, JSValueConst *argv);
 lxb_dom_node_t *dom_document_order_next(
     DomDocumentOrderTraversal *traversal);
 JSValue js_computed_style_get(JSContext *context,

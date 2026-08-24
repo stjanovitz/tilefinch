@@ -1,5 +1,6 @@
 #include "tilefinch/session.h"
 
+#include "tilefinch/captive_portal.h"
 #include "tilefinch/public_suffix.h"
 #include "tilefinch/fetch.h"
 
@@ -198,7 +199,8 @@ bool browser_session_site_adapter_state_put(
     BrowserSession *session, const char *key, const void *data,
     size_t data_length, uint64_t now_ns)
 {
-    if (session == NULL || session->budget == NULL || key == NULL
+    if (session == NULL || session->budget == NULL
+        || session->captive_portal_stash != NULL || key == NULL
         || data == NULL || data_length == 0
         || data_length > BROWSER_SITE_ADAPTER_STATE_DATA_LIMIT
         || strlen(key) >= BROWSER_SITE_ADAPTER_STATE_KEY_LIMIT) {
@@ -222,7 +224,8 @@ bool browser_session_site_adapter_state_get(
     uint64_t maximum_age_ns)
 {
     if (data_length != NULL) *data_length = 0;
-    if (session == NULL || session->budget == NULL || key == NULL
+    if (session == NULL || session->budget == NULL
+        || session->captive_portal_stash != NULL || key == NULL
         || data == NULL) return false;
     BrowserSiteAdapterState *state = &session->site_adapter_state;
     bool expired = maximum_age_ns != 0
@@ -267,7 +270,8 @@ bool browser_session_site_adapter_document_cache_put(
     size_t source_bytes, size_t result_count, long status_code,
     const char *server, const char *cf_mitigated, uint64_t now_ns)
 {
-    if (session == NULL || session->budget == NULL || adapter == NULL
+    if (session == NULL || session->budget == NULL
+        || session->captive_portal_stash != NULL || adapter == NULL
         || key == NULL || authority_context == NULL
         || data == NULL || data_length == 0
         || data_length > BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRY_LIMIT
@@ -363,7 +367,8 @@ bool browser_session_site_adapter_document_cache_get(
     BrowserSiteAdapterDocumentCacheView *view)
 {
     if (view != NULL) *view = (BrowserSiteAdapterDocumentCacheView) {0};
-    if (session == NULL || session->budget == NULL || adapter == NULL
+    if (session == NULL || session->budget == NULL
+        || session->captive_portal_stash != NULL || adapter == NULL
         || key == NULL || authority_context == NULL || view == NULL)
         return false;
     uint64_t fingerprint = 0;
@@ -1727,6 +1732,79 @@ void browser_session_cookie_clear(BrowserSession *session)
     browser_session_site_adapter_document_cache_clear(session);
 }
 
+static bool site_cookie_matches(
+    const BrowserCookieEntry *entry, const CookieURL *parsed)
+{
+    return entry != NULL && parsed != NULL && entry->value != NULL
+        && (entry->host_only
+            ? strcmp(parsed->host, entry->domain) == 0
+            : domain_matches(parsed->host, entry->domain));
+}
+
+bool browser_session_site_data_usage(
+    const BrowserSession *session, const char *url,
+    BrowserSiteDataUsage *usage)
+{
+    if (usage != NULL) memset(usage, 0, sizeof(*usage));
+    if (session == NULL || url == NULL || usage == NULL) return false;
+    char origin[BROWSER_ORIGIN_LIMIT];
+    CookieURL parsed;
+    if (!copy_origin(url, origin) || !parse_cookie_url(url, &parsed))
+        return false;
+    int64_t now = cookie_now();
+    for (size_t at = 0; at < BROWSER_COOKIE_ENTRIES; at++) {
+        const BrowserCookieEntry *entry = &session->cookies[at];
+        if (!site_cookie_matches(entry, &parsed)
+            || (entry->expires_at != 0 && entry->expires_at <= now))
+            continue;
+        usage->cookie_count++;
+        usage->cookie_bytes += entry->value_length + strlen(entry->name)
+            + entry->path_length;
+    }
+    for (size_t at = 0; at < BROWSER_STORAGE_ENTRIES; at++) {
+        const BrowserStorageEntry *entry = &session->storage[at];
+        if (entry->value == NULL || strcmp(entry->origin, origin) != 0)
+            continue;
+        if (entry->local) usage->local_storage_count++;
+        else usage->session_storage_count++;
+        usage->storage_bytes += entry->value_length + strlen(entry->key);
+    }
+    return true;
+}
+
+bool browser_session_clear_site_data(
+    BrowserSession *session, const char *url)
+{
+    if (session == NULL || session->budget == NULL || url == NULL)
+        return false;
+    char origin[BROWSER_ORIGIN_LIMIT];
+    CookieURL parsed;
+    if (!copy_origin(url, origin) || !parse_cookie_url(url, &parsed))
+        return false;
+    BrowserCookieStore store = browser_session_cookie_store(session);
+    for (size_t at = 0; at < BROWSER_COOKIE_ENTRIES; at++)
+        if (site_cookie_matches(&session->cookies[at], &parsed))
+            clear_cookie_entry(&store, &session->cookies[at]);
+    for (size_t at = 0; at < BROWSER_STORAGE_ENTRIES; at++) {
+        BrowserStorageEntry *entry = &session->storage[at];
+        if (entry->value == NULL || strcmp(entry->origin, origin) != 0)
+            continue;
+        if (entry->value_length <= session->storage_bytes)
+            session->storage_bytes -= entry->value_length;
+        else
+            session->storage_bytes = 0;
+        budget_free(session->budget, entry->value);
+        memset(entry, 0, sizeof(*entry));
+    }
+    /* Provider documents may reflect authenticated/session state.  A site
+       clear must not leave one available from the bounded generated-page
+       cache after its cookies and storage are gone. */
+    memset(&session->site_adapter_state, 0,
+           sizeof(session->site_adapter_state));
+    browser_session_site_adapter_document_cache_clear(session);
+    return true;
+}
+
 BrowserCookieOverlay *browser_session_cookie_overlay_create(
     Budget *budget, const BrowserSession *source)
 {
@@ -1842,7 +1920,8 @@ bool browser_session_cache_get(BrowserSession *session, const char *url,
 const BrowserCacheEntry *browser_session_cache_lookup(
     BrowserSession *session, const char *url)
 {
-    if (session == NULL || url == NULL) return NULL;
+    if (session == NULL || session->captive_portal_stash != NULL
+        || url == NULL) return NULL;
     char key[TILEFINCH_URL_SERIALIZED_LIMIT];
     if (!tilefinch_url_request_key(url, key, sizeof(key))) {
         session->cache_misses++;
@@ -1965,7 +2044,8 @@ BrowserCacheStatus browser_session_cache_match_module(
     uint64_t now_ns, const BrowserCacheEntry **matched)
 {
     if (matched != NULL) *matched = NULL;
-    if (session == NULL || request_url == NULL || initiator_origin == NULL
+    if (session == NULL || session->captive_portal_stash != NULL
+        || request_url == NULL || initiator_origin == NULL
         || top_level_url == NULL || initiator_opaque
         || (credentials != TILEFINCH_CREDENTIALS_SAME_ORIGIN
             && credentials != TILEFINCH_CREDENTIALS_INCLUDE)) {
@@ -2186,6 +2266,7 @@ static bool cache_module_referrer_provenance_valid(
 static BrowserCacheEntry *cache_find_key(BrowserSession *session,
                                          const char *key)
 {
+    if (session == NULL || session->captive_portal_stash != NULL) return NULL;
     for (size_t i = 0; i < BROWSER_CACHE_ENTRIES; i++) {
         if (session->cache[i].data != NULL
             && !session->cache[i].resource_grant_valid
@@ -2254,7 +2335,8 @@ static BrowserCacheEntry *cache_find_resource_key(
     BrowserSession *session, const char *key,
     const TilefinchRequestContext *context)
 {
-    if (session == NULL || key == NULL || context == NULL) return NULL;
+    if (session == NULL || session->captive_portal_stash != NULL
+        || key == NULL || context == NULL) return NULL;
     for (size_t i = 0; i < BROWSER_CACHE_ENTRIES; i++) {
         BrowserCacheEntry *entry = &session->cache[i];
         if (entry->data != NULL && strcmp(entry->url, key) == 0
@@ -2775,7 +2857,8 @@ bool browser_session_decoded_image_put(
 static BrowserCacheEntry *cache_response_entry(BrowserSession *session,
                                                const char *request_url)
 {
-    if (session == NULL || request_url == NULL) return NULL;
+    if (session == NULL || session->captive_portal_stash != NULL
+        || request_url == NULL) return NULL;
     char key[TILEFINCH_URL_SERIALIZED_LIMIT];
     if (!tilefinch_url_request_key(request_url, key, sizeof(key))) return NULL;
     return cache_find_key(session, key);
@@ -3001,7 +3084,8 @@ static bool cache_put_http_shared_variant(
     const TilefinchRequestContext *resource_context,
     const TilefinchResourceGrant *resource_grant)
 {
-    if (session == NULL || url == NULL || body == NULL
+    if (session == NULL || session->captive_portal_stash != NULL
+        || url == NULL || body == NULL
         || body->data == NULL || body->length == 0
         || body->references == 0 || body->budget != session->budget
         || !budget_owns(body->budget, body->data)
@@ -3604,9 +3688,184 @@ void browser_session_cache_clear(BrowserSession *session)
     session->clock = 0;
 }
 
+struct BrowserCaptivePortalStash {
+    BrowserStorageEntry storage[BROWSER_STORAGE_ENTRIES];
+    BrowserCookieEntry cookies[BROWSER_COOKIE_ENTRIES];
+    size_t storage_bytes;
+    size_t cookie_bytes;
+    size_t cookie_long_path_bytes;
+    size_t cookie_clock;
+    bool site_data_allowed;
+    struct ContentBlocker *content_blocker;
+    char mixed_content_allowed_sites[BROWSER_SECURITY_SITE_LIMIT]
+                                    [BROWSER_ORIGIN_LIMIT];
+    char third_party_cookie_allowed_sites[BROWSER_SECURITY_SITE_LIMIT]
+                                         [BROWSER_ORIGIN_LIMIT];
+    size_t mixed_content_allowed_site_count;
+    size_t third_party_cookie_allowed_site_count;
+    unsigned char hsts[sizeof(((BrowserSession *) 0)->hsts)];
+    size_t hsts_clock;
+    char origins[TILEFINCH_CAPTIVE_PORTAL_ORIGIN_LIMIT]
+                [BROWSER_ORIGIN_LIMIT];
+    size_t origin_count;
+};
+
+static bool captive_portal_origin(
+    const char *url, char output[BROWSER_ORIGIN_LIMIT])
+{
+    return url != NULL
+        && tilefinch_url_origin(url, output, BROWSER_ORIGIN_LIMIT);
+}
+
+static bool captive_portal_origin_index(
+    const BrowserSession *session, const char *url, size_t *index)
+{
+    char origin[BROWSER_ORIGIN_LIMIT];
+    if (index != NULL) *index = 0;
+    if (session == NULL || session->captive_portal_stash == NULL
+        || !captive_portal_origin(url, origin)) return false;
+    const struct BrowserCaptivePortalStash *stash =
+        session->captive_portal_stash;
+    for (size_t at = 0; at < stash->origin_count; at++) {
+        if (strcmp(stash->origins[at], origin) == 0) {
+            if (index != NULL) *index = at;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool browser_session_captive_portal_active(const BrowserSession *session)
+{
+    return session != NULL && session->captive_portal_stash != NULL;
+}
+
+bool browser_session_captive_portal_url_allowed(
+    const BrowserSession *session, const char *url)
+{
+    return captive_portal_origin_index(session, url, NULL);
+}
+
+bool browser_session_captive_portal_authorize_navigation(
+    BrowserSession *session, const char *from_url, const char *target_url)
+{
+    if (!browser_session_captive_portal_active(session)
+        || !browser_session_captive_portal_url_allowed(session, from_url)) {
+        return false;
+    }
+    TilefinchUrl parsed;
+    char origin[BROWSER_ORIGIN_LIMIT];
+    if (!tilefinch_url_parse(target_url, &parsed)
+        || (parsed.scheme != TILEFINCH_URL_SCHEME_HTTP
+            && parsed.scheme != TILEFINCH_URL_SCHEME_HTTPS)
+        || !captive_portal_origin(target_url, origin)) return false;
+    if (browser_session_captive_portal_url_allowed(session, target_url))
+        return true;
+    struct BrowserCaptivePortalStash *stash = session->captive_portal_stash;
+    if (stash->origin_count >= TILEFINCH_CAPTIVE_PORTAL_ORIGIN_LIMIT)
+        return false;
+    snprintf(
+        stash->origins[stash->origin_count++],
+        BROWSER_ORIGIN_LIMIT, "%s", origin);
+    return true;
+}
+
+bool browser_session_captive_portal_begin(
+    BrowserSession *session, const char *portal_url)
+{
+    if (session == NULL || session->budget == NULL
+        || session->captive_portal_stash != NULL) return false;
+    TilefinchUrl parsed;
+    char origin[BROWSER_ORIGIN_LIMIT];
+    if (!tilefinch_url_parse(portal_url, &parsed)
+        || (parsed.scheme != TILEFINCH_URL_SCHEME_HTTP
+            && parsed.scheme != TILEFINCH_URL_SCHEME_HTTPS)
+        || !captive_portal_origin(portal_url, origin)) return false;
+    struct BrowserCaptivePortalStash *stash = budget_calloc(
+        session->budget, 1, sizeof(*stash));
+    if (stash == NULL) return false;
+    memcpy(stash->storage, session->storage, sizeof(stash->storage));
+    memcpy(stash->cookies, session->cookies, sizeof(stash->cookies));
+    stash->storage_bytes = session->storage_bytes;
+    stash->cookie_bytes = session->cookie_bytes;
+    stash->cookie_long_path_bytes = session->cookie_long_path_bytes;
+    stash->cookie_clock = session->cookie_clock;
+    stash->site_data_allowed = session->site_data_allowed;
+    stash->content_blocker = session->content_blocker;
+    memcpy(stash->mixed_content_allowed_sites,
+           session->mixed_content_allowed_sites,
+           sizeof(stash->mixed_content_allowed_sites));
+    memcpy(stash->third_party_cookie_allowed_sites,
+           session->third_party_cookie_allowed_sites,
+           sizeof(stash->third_party_cookie_allowed_sites));
+    stash->mixed_content_allowed_site_count =
+        session->mixed_content_allowed_site_count;
+    stash->third_party_cookie_allowed_site_count =
+        session->third_party_cookie_allowed_site_count;
+    memcpy(stash->hsts, session->hsts, sizeof(stash->hsts));
+    stash->hsts_clock = session->hsts_clock;
+
+    memset(session->storage, 0, sizeof(session->storage));
+    memset(session->cookies, 0, sizeof(session->cookies));
+    session->storage_bytes = 0;
+    session->cookie_bytes = 0;
+    session->cookie_long_path_bytes = 0;
+    session->cookie_clock = 0;
+    session->site_data_allowed = true;
+    session->content_blocker = NULL;
+    memset(session->mixed_content_allowed_sites, 0,
+           sizeof(session->mixed_content_allowed_sites));
+    memset(session->third_party_cookie_allowed_sites, 0,
+           sizeof(session->third_party_cookie_allowed_sites));
+    session->mixed_content_allowed_site_count = 0;
+    session->third_party_cookie_allowed_site_count = 0;
+    memset(session->hsts, 0, sizeof(session->hsts));
+    session->hsts_clock = 0;
+    session->captive_portal_stash = stash;
+    stash->origin_count = 1;
+    snprintf(stash->origins[0], BROWSER_ORIGIN_LIMIT, "%s", origin);
+    return true;
+}
+
+void browser_session_captive_portal_end(BrowserSession *session)
+{
+    if (session == NULL || session->budget == NULL
+        || session->captive_portal_stash == NULL) return;
+    struct BrowserCaptivePortalStash *stash = session->captive_portal_stash;
+    for (size_t at = 0; at < BROWSER_STORAGE_ENTRIES; at++)
+        budget_free(session->budget, session->storage[at].value);
+    for (size_t at = 0; at < BROWSER_COOKIE_ENTRIES; at++) {
+        budget_free(session->budget, session->cookies[at].value);
+        budget_free(session->budget, session->cookies[at].long_path);
+    }
+    memcpy(session->storage, stash->storage, sizeof(session->storage));
+    memcpy(session->cookies, stash->cookies, sizeof(session->cookies));
+    session->storage_bytes = stash->storage_bytes;
+    session->cookie_bytes = stash->cookie_bytes;
+    session->cookie_long_path_bytes = stash->cookie_long_path_bytes;
+    session->cookie_clock = stash->cookie_clock;
+    session->site_data_allowed = stash->site_data_allowed;
+    session->content_blocker = stash->content_blocker;
+    memcpy(session->mixed_content_allowed_sites,
+           stash->mixed_content_allowed_sites,
+           sizeof(session->mixed_content_allowed_sites));
+    memcpy(session->third_party_cookie_allowed_sites,
+           stash->third_party_cookie_allowed_sites,
+           sizeof(session->third_party_cookie_allowed_sites));
+    session->mixed_content_allowed_site_count =
+        stash->mixed_content_allowed_site_count;
+    session->third_party_cookie_allowed_site_count =
+        stash->third_party_cookie_allowed_site_count;
+    memcpy(session->hsts, stash->hsts, sizeof(session->hsts));
+    session->hsts_clock = stash->hsts_clock;
+    session->captive_portal_stash = NULL;
+    budget_free(session->budget, stash);
+}
+
 void browser_session_destroy(BrowserSession *session)
 {
     if (session == NULL || session->budget == NULL) return;
+    browser_session_captive_portal_end(session);
     for (size_t i = 0; i < BROWSER_STORAGE_ENTRIES; i++) {
         budget_free(session->budget, session->storage[i].value);
     }

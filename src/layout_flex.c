@@ -407,6 +407,7 @@ static int intrinsic_replaced_width(
                (const lxb_char_t *) "controls", 8u);
     if (natural_width <= 0
         && (layout_node_name_is(node, "video")
+            || layout_node_name_is(node, "canvas")
             || audio_controls
             || layout_node_name_is(node, "iframe"))) {
         natural_width = 300;
@@ -1674,6 +1675,18 @@ bool flex_order_plan_build(FlexOrderPlan *plan,
         }
         if (insert < plan->count && plan->values[insert] == item.style.order) {
             continue;
+        }
+        if (plan->count == FLEX_ORDER_VALUE_LIMIT) {
+            /* More distinct authored order groups would make every later
+               iterator rescan the full child list again. Degrade the whole
+               container to stable DOM order rather than retain a partial,
+               semantically misleading order plan or quadratic work. */
+            flex_order_plan_destroy(plan);
+            plan->budget = context->layout->budget;
+            plan->values = plan->inline_values;
+            plan->capacity = sizeof(plan->inline_values)
+                             / sizeof(plan->inline_values[0]);
+            return true;
         }
         if (plan->count == plan->capacity) {
             size_t capacity = plan->capacity * 2;

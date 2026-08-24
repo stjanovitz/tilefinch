@@ -10,6 +10,10 @@
 #define HLS_SAMPLE_LIMIT 64u
 #define HLS_QUEUE_BYTES (576u * 1024u)
 #define HLS_PARAMETER_SET_BYTES 4096u
+#define HLS_LIVE_EDGE_SEGMENTS 3u
+#define HLS_LIVE_REFRESH_RUNWAY_SEGMENTS 2u
+#define HLS_LIVE_REFRESH_MINIMUM_US UINT64_C(1000000)
+#define HLS_LIVE_STALL_LIMIT_US UINT64_C(60000000)
 
 typedef struct {
     uint32_t text_offset;
@@ -19,6 +23,8 @@ typedef struct {
     uint16_t height;
     uint32_t duration_ms;
     uint32_t bandwidth;
+    uint64_t sequence;
+    bool codecs_compatible;
     bool discontinuity;
 } HlsEntry;
 
@@ -30,6 +36,8 @@ struct MediaHlsPlaylist {
     HlsEntry entries[MEDIA_HLS_MAXIMUM_SEGMENTS];
     size_t entry_count;
     uint64_t duration_us;
+    uint64_t media_sequence;
+    uint32_t target_duration_ms;
     MediaHlsPlaylistKind kind;
     bool end_list;
 };
@@ -65,6 +73,7 @@ struct MediaHlsSource {
     size_t queue_used;
     uint64_t next_identity;
     HlsRequest requests[2];
+    MediaHlsPlaylist *pending_playlist;
     size_t segment_index;
     size_t prepared_segment;
     size_t transport_tail;
@@ -80,6 +89,11 @@ struct MediaHlsSource {
     bool segment_origin_valid;
     uint64_t segment_origin90k;
     uint64_t segment_base90k;
+    uint64_t live_timeline90k;
+    uint64_t next_sequence;
+    uint64_t refresh_next_us;
+    uint64_t live_edge_since_us;
+    uint64_t failed_sequence;
     uint64_t last_video_pts90k;
     uint64_t last_audio_pts90k;
     uint32_t audio_duration90k;
@@ -87,6 +101,10 @@ struct MediaHlsSource {
     MediaMp4TrackInfo audio_info;
     unsigned char parameter_sets[HLS_PARAMETER_SET_BYTES];
     size_t parameter_set_bytes;
+    unsigned live_segment_failures;
+    bool failed_sequence_valid;
+    bool live_session;
+    bool force_refresh;
     char error[256];
     MediaHlsStats stats;
 };
@@ -139,11 +157,18 @@ static bool hls_parse_decimal_ms(const char *text, uint32_t *milliseconds)
 static bool hls_attribute_unsigned(const char *line, const char *name,
                                    uint32_t *value)
 {
-    const char *at = strstr(line, name);
-    if (at == NULL) return false;
-    at += strlen(name);
-    if (*at != '=') return false;
-    at++;
+    if (line == NULL || name == NULL || value == NULL) return false;
+    size_t name_length = strlen(name);
+    const char *at = line;
+    for (;;) {
+        at = strstr(at, name);
+        if (at == NULL) return false;
+        bool left_boundary = at == line || at[-1] == ','
+            || at[-1] == ' ' || at[-1] == '\t';
+        if (left_boundary && at[name_length] == '=') break;
+        at += name_length;
+    }
+    at += name_length + 1u;
     uint32_t result = 0;
     bool any = false;
     while (*at >= '0' && *at <= '9') {
@@ -153,6 +178,26 @@ static bool hls_attribute_unsigned(const char *line, const char *name,
         any = true;
     }
     if (!any) return false;
+    *value = result;
+    return true;
+}
+
+static bool hls_line_u64(const char *line, const char *prefix,
+                         uint64_t *value)
+{
+    size_t prefix_length = strlen(prefix);
+    if (line == NULL || value == NULL
+        || strncmp(line, prefix, prefix_length) != 0) return false;
+    const char *at = line + prefix_length;
+    uint64_t result = 0;
+    bool any = false;
+    while (*at >= '0' && *at <= '9') {
+        uint64_t digit = (uint64_t) (*at++ - '0');
+        if (result > (UINT64_MAX - digit) / 10u) return false;
+        result = result * 10u + digit;
+        any = true;
+    }
+    if (!any || *at != '\0') return false;
     *value = result;
     return true;
 }
@@ -179,6 +224,28 @@ static void hls_variant_geometry(const char *line,
         *width = (uint16_t) w;
         *height = (uint16_t) h;
     }
+}
+
+static bool hls_variant_codecs_compatible(const char *line)
+{
+    const char *at = strstr(line, "CODECS=");
+    if (at == NULL) return true;
+    at += strlen("CODECS=");
+    char quote = (*at == '\'' || *at == '"') ? *at++ : '\0';
+    const char *end = at;
+    while (*end != '\0'
+           && (quote != '\0' ? *end != quote : *end != ',')) end++;
+    /* The streaming backend consumes Annex-B AVC. A master which explicitly
+       advertises only VP9/AV1 must not win merely because that rendition has
+       the cheapest 240p bandwidth. Missing CODECS remains admissible and is
+       verified later by the bounded TS/SPS probe. */
+    for (const char *token = at; token + 4u <= end; token++) {
+        if ((token[0] == 'a' || token[0] == 'A')
+            && (token[1] == 'v' || token[1] == 'V')
+            && (token[2] == 'c' || token[2] == 'C')
+            && (token[3] == '1' || token[3] == '3')) return true;
+    }
+    return false;
 }
 
 MediaHlsPlaylist *media_hls_playlist_parse(
@@ -212,6 +279,7 @@ MediaHlsPlaylist *media_hls_playlist_parse(
 
     bool header = false, pending_variant = false;
     bool pending_discontinuity = false, pending_duration_valid = false;
+    bool pending_codecs_compatible = true;
     uint32_t pending_duration = 0, pending_bandwidth = 0;
     uint32_t total_duration_ms = 0;
     uint16_t pending_width = 0, pending_height = 0;
@@ -245,6 +313,10 @@ MediaHlsPlaylist *media_hls_playlist_parse(
                 line + 18u, "BANDWIDTH", &pending_bandwidth);
             hls_variant_geometry(
                 line + 18u, &pending_width, &pending_height);
+            /* Store this on the following URI entry, like geometry and
+               bandwidth. */
+            pending_codecs_compatible =
+                hls_variant_codecs_compatible(line + 18u);
             continue;
         }
         if (strncmp(line, "#EXTINF:", 8u) == 0) {
@@ -254,6 +326,30 @@ MediaHlsPlaylist *media_hls_playlist_parse(
                 return NULL;
             }
             pending_duration_valid = true;
+            continue;
+        }
+        if (strncmp(line, "#EXT-X-MEDIA-SEQUENCE:", 22u) == 0) {
+            if (!hls_line_u64(
+                    line, "#EXT-X-MEDIA-SEQUENCE:",
+                    &playlist->media_sequence)) {
+                hls_error(error, error_size,
+                          "invalid HLS media sequence");
+                media_hls_playlist_destroy(playlist);
+                return NULL;
+            }
+            continue;
+        }
+        if (strncmp(line, "#EXT-X-TARGETDURATION:", 22u) == 0) {
+            uint64_t seconds = 0;
+            if (!hls_line_u64(
+                    line, "#EXT-X-TARGETDURATION:", &seconds)
+                || seconds == 0 || seconds > UINT32_MAX / 1000u) {
+                hls_error(error, error_size,
+                          "invalid HLS target duration");
+                media_hls_playlist_destroy(playlist);
+                return NULL;
+            }
+            playlist->target_duration_ms = (uint32_t) seconds * 1000u;
             continue;
         }
         if (strcmp(line, "#EXT-X-DISCONTINUITY") == 0) {
@@ -298,7 +394,9 @@ MediaHlsPlaylist *media_hls_playlist_parse(
             entry->bandwidth = pending_bandwidth;
             entry->width = pending_width;
             entry->height = pending_height;
+            entry->codecs_compatible = pending_codecs_compatible;
             pending_variant = false;
+            pending_codecs_compatible = true;
         } else {
             if (playlist->kind == MEDIA_HLS_PLAYLIST_MASTER) {
                 hls_error(error, error_size, "master HLS entry lacks metadata");
@@ -315,6 +413,7 @@ MediaHlsPlaylist *media_hls_playlist_parse(
                 return NULL;
             }
             playlist->kind = MEDIA_HLS_PLAYLIST_MEDIA;
+            entry->sequence = playlist->entry_count - 1u;
             entry->start_ms = total_duration_ms;
             entry->duration_ms = pending_duration;
             entry->discontinuity = pending_discontinuity;
@@ -328,13 +427,26 @@ MediaHlsPlaylist *media_hls_playlist_parse(
     }
     if (!header || playlist->entry_count == 0
         || (playlist->kind == MEDIA_HLS_PLAYLIST_MEDIA
-            && !playlist->end_list)) {
+            && !playlist->end_list
+            && playlist->target_duration_ms == 0)) {
         hls_error(error, error_size,
                   playlist->entry_count == 0
                       ? "HLS playlist is empty"
-                      : "live HLS playlists are unsupported");
+                      : "live HLS playlist lacks target duration");
         media_hls_playlist_destroy(playlist);
         return NULL;
+    }
+    if (playlist->kind == MEDIA_HLS_PLAYLIST_MEDIA) {
+        for (size_t i = 0; i < playlist->entry_count; i++) {
+            if (i > UINT64_MAX - playlist->media_sequence) {
+                hls_error(error, error_size,
+                          "HLS media sequence exceeds its bound");
+                media_hls_playlist_destroy(playlist);
+                return NULL;
+            }
+            playlist->entries[i].sequence =
+                playlist->media_sequence + (uint64_t) i;
+        }
     }
     return playlist;
 }
@@ -356,6 +468,7 @@ bool media_hls_playlist_select_variant(
     uint32_t selected_cost = UINT32_MAX;
     for (size_t i = 0; i < playlist->entry_count; i++) {
         const HlsEntry *entry = &playlist->entries[i];
+        if (!entry->codecs_compatible) continue;
         if (entry->width != 0 && entry->height != 0
             && (entry->width > maximum_width
                 || entry->height > maximum_height)) continue;
@@ -398,6 +511,13 @@ size_t media_hls_playlist_segment_count(const MediaHlsPlaylist *playlist)
 uint64_t media_hls_playlist_duration_us(const MediaHlsPlaylist *playlist)
 {
     return playlist == NULL ? 0 : playlist->duration_us;
+}
+
+bool media_hls_playlist_is_live(const MediaHlsPlaylist *playlist)
+{
+    return playlist != NULL
+        && playlist->kind == MEDIA_HLS_PLAYLIST_MEDIA
+        && !playlist->end_list;
 }
 
 void media_hls_playlist_destroy(MediaHlsPlaylist *playlist)
@@ -702,13 +822,72 @@ static void hls_prepare_segment(MediaHlsSource *source, size_t segment)
             source->ts, hls_video_callback, hls_audio_callback, source);
         source->transport_tail = 0;
     }
-    uint32_t start_ms = source->playlist->entries[segment].start_ms;
-    source->segment_base90k =
-        (uint64_t) (start_ms / 1000u) * UINT64_C(90000)
-        + (uint32_t) (start_ms % 1000u) * 90u;
+    if (source->live_session) {
+        source->segment_base90k = source->live_timeline90k;
+    } else {
+        uint32_t start_ms = source->playlist->entries[segment].start_ms;
+        source->segment_base90k =
+            (uint64_t) (start_ms / 1000u) * UINT64_C(90000)
+            + (uint32_t) (start_ms % 1000u) * 90u;
+    }
     source->segment_origin90k = 0;
     source->segment_origin_valid = false;
     source->prepared_segment = segment;
+}
+
+static size_t hls_sequence_index(
+    const MediaHlsPlaylist *playlist, uint64_t sequence)
+{
+    if (playlist == NULL) return SIZE_MAX;
+    for (size_t i = 0; i < playlist->entry_count; i++)
+        if (playlist->entries[i].sequence >= sequence) return i;
+    return SIZE_MAX;
+}
+
+static bool hls_apply_pending_playlist(MediaHlsSource *source)
+{
+    if (source == NULL || source->pending_playlist == NULL
+        || source->requests[0].handle != 0
+        || source->requests[1].handle != 0) return false;
+    MediaHlsPlaylist *replacement = source->pending_playlist;
+    size_t selected = hls_sequence_index(replacement, source->next_sequence);
+    if (selected == SIZE_MAX) {
+        /* A refresh is allowed to be unchanged while the current edge is
+           still being consumed. It is not allowed to move the cursor
+           backwards; discard it and ask again at the target-duration pace. */
+        source->pending_playlist = NULL;
+        media_hls_playlist_destroy(replacement);
+        return false;
+    }
+    uint64_t selected_sequence = replacement->entries[selected].sequence;
+    bool advanced = selected_sequence > source->next_sequence;
+    if (advanced) {
+        uint64_t skipped = replacement->entries[selected].sequence
+            - source->next_sequence;
+        source->stats.skipped_live_segments =
+            skipped > SIZE_MAX - source->stats.skipped_live_segments
+                ? SIZE_MAX
+                : source->stats.skipped_live_segments + (size_t) skipped;
+        replacement->entries[selected].discontinuity = true;
+    }
+    media_hls_playlist_destroy(source->playlist);
+    source->playlist = replacement;
+    source->pending_playlist = NULL;
+    source->segment_index = selected;
+    source->next_sequence = selected_sequence;
+    source->prepared_segment = SIZE_MAX;
+    source->ended = false;
+    source->force_refresh = false;
+    /* A healthy manifest that still points at the same persistently failing
+       segment is not delivery progress. Preserve the retry/stall incident
+       until the live edge actually moves beyond that sequence. */
+    if (advanced && (!source->failed_sequence_valid
+                     || selected_sequence > source->failed_sequence)) {
+        source->live_segment_failures = 0;
+        source->failed_sequence_valid = false;
+        source->live_edge_since_us = 0;
+    }
+    return true;
 }
 
 static void hls_complete_segment(MediaHlsSource *source)
@@ -719,6 +898,19 @@ static void hls_complete_segment(MediaHlsSource *source)
        next base and appears to jump at every boundary. */
     swdec_ts_flush(source->ts);
     source->stats.segments_completed++;
+    source->live_segment_failures = 0;
+    source->failed_sequence_valid = false;
+    source->live_edge_since_us = 0;
+    const HlsEntry *completed =
+        &source->playlist->entries[source->segment_index];
+    if (source->live_session) {
+        uint64_t increment = (uint64_t) completed->duration_ms * 90u;
+        source->live_timeline90k =
+            increment > UINT64_MAX - source->live_timeline90k
+                ? UINT64_MAX : source->live_timeline90k + increment;
+        source->next_sequence = completed->sequence == UINT64_MAX
+            ? UINT64_MAX : completed->sequence + 1u;
+    }
     source->segment_index++;
     source->requests[0] = (HlsRequest) {0};
     if (source->requests[1].handle != 0
@@ -726,20 +918,39 @@ static void hls_complete_segment(MediaHlsSource *source)
         source->requests[0] = source->requests[1];
         source->requests[1] = (HlsRequest) {0};
     }
-    if (source->segment_index >= source->playlist->entry_count) {
-        source->ended = true;
-    }
+    (void) hls_apply_pending_playlist(source);
+    if (source->segment_index >= source->playlist->entry_count)
+        source->ended = source->playlist->end_list;
 }
 
-static void hls_pump(MediaHlsSource *source)
+static void hls_pump(MediaHlsSource *source, uint64_t now_us)
 {
     if (source == NULL || source->failed || source->ended) return;
+    (void) hls_apply_pending_playlist(source);
+    if (source->segment_index >= source->playlist->entry_count
+        || (source->live_session && source->force_refresh)) {
+        if (source->live_session) {
+            if (source->live_edge_since_us == 0)
+                source->live_edge_since_us = now_us;
+            if (now_us != 0 && source->live_edge_since_us != 0
+                && now_us >= source->live_edge_since_us
+                && now_us - source->live_edge_since_us
+                     >= HLS_LIVE_STALL_LIMIT_US) {
+                hls_source_fail(source,
+                                "live HLS playlist stopped advancing");
+            }
+        }
+        return;
+    }
     if (source->requests[0].handle == 0) {
         (void) hls_start_request(source, 0u, source->segment_index);
         if (source->requests[0].handle == 0) return;
     }
     if (source->requests[1].handle == 0
-        && source->segment_index + 1u < source->playlist->entry_count) {
+        && source->segment_index + 1u < source->playlist->entry_count
+        && (!source->live_session
+            || source->segment_index + HLS_LIVE_REFRESH_RUNWAY_SEGMENTS + 1u
+                 < source->playlist->entry_count)) {
         (void) hls_start_request(source, 1u, source->segment_index + 1u);
     }
     hls_prepare_segment(source, source->segment_index);
@@ -751,8 +962,27 @@ static void hls_pump(MediaHlsSource *source)
         MEDIA_HLS_TRANSPORT_CHUNK_BYTES, &length, error, sizeof(error));
     if (result == MEDIA_HLS_TRANSPORT_WAIT) return;
     if (result == MEDIA_HLS_TRANSPORT_ERROR) {
-        hls_source_fail(source, "%s",
-                        error[0] == '\0' ? "HLS segment fetch failed" : error);
+        uint64_t failed_sequence = source->playlist->entries[
+            source->segment_index].sequence;
+        source->requests[0] = (HlsRequest) {0};
+        if (source->live_session && source->live_segment_failures < 3u) {
+            if (source->requests[1].handle != 0)
+                source->transport.cancel(
+                    source->transport.opaque,
+                    source->requests[1].handle);
+            source->requests[1] = (HlsRequest) {0};
+            source->live_segment_failures++;
+            source->failed_sequence = failed_sequence;
+            source->failed_sequence_valid = true;
+            source->force_refresh = true;
+            source->refresh_next_us = 0;
+            if (source->live_edge_since_us == 0)
+                source->live_edge_since_us = now_us;
+        } else {
+            hls_source_fail(
+                source, "%s", error[0] == '\0'
+                    ? "HLS segment fetch failed" : error);
+        }
         return;
     }
     if (result == MEDIA_HLS_TRANSPORT_CHUNK) {
@@ -823,6 +1053,15 @@ MediaHlsSource *media_hls_source_create(
     source->transport_chunk = chunk;
     source->prepared_segment = SIZE_MAX;
     source->seek_segment = SIZE_MAX;
+    source->live_session = !playlist->end_list;
+    source->stats.live = source->live_session;
+    if (source->live_session) {
+        source->segment_index = playlist->entry_count > HLS_LIVE_EDGE_SEGMENTS
+            ? playlist->entry_count - HLS_LIVE_EDGE_SEGMENTS : 0u;
+        source->next_sequence =
+            playlist->entries[source->segment_index].sequence;
+        source->seek_pristine = true;
+    }
     swdec_ts_init(ts, hls_video_callback, hls_audio_callback, source);
     return source;
 }
@@ -851,7 +1090,7 @@ MediaHlsPrimeStatus media_hls_source_prime(
         source->track_layout_known = true;
         return MEDIA_HLS_PRIME_READY;
     }
-    hls_pump(source);
+    hls_pump(source, 0);
     if (source->failed) {
         hls_error(error, error_size, "%s", source->error);
         return MEDIA_HLS_PRIME_FAILED;
@@ -867,6 +1106,63 @@ MediaHlsPrimeStatus media_hls_source_prime(
     return ready ? MEDIA_HLS_PRIME_READY : MEDIA_HLS_PRIME_PENDING;
 }
 
+void media_hls_source_pump(MediaHlsSource *source, uint64_t now_us)
+{
+    if (source == NULL || source->failed || source->ended) return;
+    /* One 16 KiB TS chunk can publish several audio and video samples. Leave
+       enough descriptor and payload headroom before producing proactively;
+       starvation reads may still pump immediately from an empty queue. */
+    if (source->queue_count <= 16u
+        && source->queue_used <= HLS_QUEUE_BYTES / 2u)
+        hls_pump(source, now_us);
+}
+
+bool media_hls_source_wants_playlist_refresh(
+    const MediaHlsSource *source, uint64_t now_us)
+{
+    if (source == NULL || source->failed || !source->live_session
+        || source->ended || source->playlist->end_list
+        || source->pending_playlist != NULL
+        || now_us < source->refresh_next_us) return false;
+    return source->force_refresh
+        || source->segment_index + HLS_LIVE_REFRESH_RUNWAY_SEGMENTS
+             >= source->playlist->entry_count;
+}
+
+bool media_hls_source_update_playlist(
+    MediaHlsSource *source, MediaHlsPlaylist *replacement,
+    uint64_t now_us, char *error, size_t error_size)
+{
+    if (error != NULL && error_size != 0) error[0] = '\0';
+    if (source == NULL || replacement == NULL
+        || replacement->kind != MEDIA_HLS_PLAYLIST_MEDIA
+        || !source->live_session) {
+        media_hls_playlist_destroy(replacement);
+        hls_error(error, error_size, "invalid live HLS refresh");
+        return false;
+    }
+    source->stats.playlist_refreshes++;
+    media_hls_playlist_destroy(source->pending_playlist);
+    source->pending_playlist = replacement;
+    uint64_t delay = (uint64_t) replacement->target_duration_ms * 500u;
+    if (delay < HLS_LIVE_REFRESH_MINIMUM_US)
+        delay = HLS_LIVE_REFRESH_MINIMUM_US;
+    source->refresh_next_us = delay > UINT64_MAX - now_us
+        ? UINT64_MAX : now_us + delay;
+    (void) hls_apply_pending_playlist(source);
+    return true;
+}
+
+void media_hls_source_note_playlist_refresh_failure(
+    MediaHlsSource *source, uint64_t now_us)
+{
+    if (source == NULL || !source->live_session || source->failed) return;
+    source->stats.playlist_refresh_failures++;
+    source->refresh_next_us = now_us > UINT64_MAX - HLS_LIVE_REFRESH_MINIMUM_US
+        ? UINT64_MAX : now_us + HLS_LIVE_REFRESH_MINIMUM_US;
+    if (source->live_edge_since_us == 0) source->live_edge_since_us = now_us;
+}
+
 static size_t hls_track_count(const void *opaque)
 {
     const MediaHlsSource *source = opaque;
@@ -880,14 +1176,16 @@ static bool hls_track_info(const void *opaque, size_t index,
     if (source == NULL || info == NULL) return false;
     if (index == 0 && source->video_info_valid) {
         *info = source->video_info;
-        info->duration = (source->playlist->duration_us / 1000000u) * 90000u
+        info->duration = source->live_session ? 0
+            : (source->playlist->duration_us / 1000000u) * 90000u
             + ((source->playlist->duration_us % 1000000u) * 90000u)
                 / 1000000u;
         return true;
     }
     if (index == 1 && source->audio_info_valid) {
         *info = source->audio_info;
-        info->duration = (source->playlist->duration_us / 1000000u) * 90000u
+        info->duration = source->live_session ? 0
+            : (source->playlist->duration_us / 1000000u) * 90000u
             + ((source->playlist->duration_us % 1000000u) * 90000u)
                 / 1000000u;
         return true;
@@ -899,7 +1197,7 @@ static bool hls_next_sample(void *opaque, MediaMp4Sample *sample)
 {
     MediaHlsSource *source = opaque;
     if (source == NULL || sample == NULL || source->failed) return false;
-    if (source->queue_count == 0) hls_pump(source);
+    if (source->queue_count == 0) hls_pump(source, 0);
     if (source->queue_count == 0) return false;
     const HlsQueuedSample *queued = &source->queue[source->queue_head];
     uint64_t dts = queued->raw_pts90k;
@@ -1010,6 +1308,14 @@ static bool hls_seek_common(void *opaque, uint64_t target_us,
 {
     MediaHlsSource *source = opaque;
     if (source == NULL || source->failed) return false;
+    /* MediaPlayback probes zero while constructing and priming a source. A
+       rolling window has no stable random-access timeline, but that initial
+       no-op must succeed so the ordinary player can adopt the already-primed
+       live edge. User seeking remains disabled and every later seek fails. */
+    if (source->live_session) {
+        if (actual_us != NULL) *actual_us = 0;
+        return target_us == 0 && !strictly_after && source->seek_pristine;
+    }
     size_t segment = hls_segment_for_us(
         source, target_us, strictly_after, actual_us);
     /* Priming repeatedly proves and restores the same source position. HLS
@@ -1047,7 +1353,9 @@ static bool hls_seek_after_us(void *opaque, uint64_t target_us,
 
 static void hls_rewind(void *opaque)
 {
-    (void) hls_seek_common(opaque, 0, false, NULL);
+    MediaHlsSource *source = opaque;
+    if (source != NULL && source->live_session) return;
+    (void) hls_seek_common(source, 0, false, NULL);
 }
 
 static size_t hls_retained_bytes(const void *opaque)
@@ -1056,7 +1364,10 @@ static size_t hls_retained_bytes(const void *opaque)
     if (source == NULL) return 0;
     return sizeof(*source) + sizeof(*source->ts) + HLS_QUEUE_BYTES
         + MEDIA_HLS_TRANSPORT_CHUNK_BYTES + 188u
-        + sizeof(*source->playlist) + source->playlist->text_length + 1u;
+        + sizeof(*source->playlist) + source->playlist->text_length + 1u
+        + (source->pending_playlist == NULL ? 0
+            : sizeof(*source->pending_playlist)
+              + source->pending_playlist->text_length + 1u);
 }
 
 static const MediaSampleSourceOps hls_source_ops = {
@@ -1107,8 +1418,25 @@ void media_hls_source_stats(const MediaHlsSource *source,
     if (source != NULL) {
         for (size_t i = 0; i < 2u; i++)
             if (source->requests[i].handle != 0) stats->active_requests++;
+        uint64_t buffered90k = 0;
+        for (size_t i = 0; i < source->queue_count; i++) {
+            size_t at = (source->queue_head + i) % HLS_SAMPLE_LIMIT;
+            uint64_t end = source->queue[at].raw_pts90k;
+            if (source->queue[at].duration90k
+                    <= UINT64_MAX - end)
+                end += source->queue[at].duration90k;
+            if (end > buffered90k) buffered90k = end;
+        }
+        stats->buffered_until_us = buffered90k / 90u * 1000u
+            + (buffered90k % 90u) * 1000u / 90u;
+        stats->live = source->live_session;
         stats->ended = source->ended;
     }
+}
+
+bool media_hls_source_failed(const MediaHlsSource *source)
+{
+    return source != NULL && source->failed;
 }
 
 void media_hls_source_destroy(MediaHlsSource *source)
@@ -1116,6 +1444,7 @@ void media_hls_source_destroy(MediaHlsSource *source)
     if (source == NULL) return;
     hls_cancel_requests(source);
     Budget *budget = source->budget;
+    media_hls_playlist_destroy(source->pending_playlist);
     media_hls_playlist_destroy(source->playlist);
     budget_free(budget, source->transport_chunk);
     budget_free(budget, source->queue_bytes);

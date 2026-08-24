@@ -524,6 +524,20 @@ static bool style_property_clip(const StylePropertyParse *parse)
 
 static bool style_property_visibility(const StylePropertyParse *parse)
 {
+    if (span_case_equal(parse->value, parse->value_length, "inherit")
+        || span_case_equal(parse->value, parse->value_length, "unset")) {
+        *parse->inherit_mask |= S_VISIBILITY;
+        *parse->mask |= S_VISIBILITY;
+        return true;
+    }
+    if (span_case_equal(parse->value, parse->value_length, "initial")
+        || span_case_equal(parse->value, parse->value_length, "revert")
+        || span_case_equal(parse->value, parse->value_length,
+                           "revert-layer")) {
+        parse->style->visibility_hidden = false;
+        *parse->mask |= S_VISIBILITY;
+        return true;
+    }
     Stylesheet *sheet = parse->sheet;
     const char *value = parse->value;
     size_t value_length = parse->value_length;
@@ -532,6 +546,9 @@ static bool style_property_visibility(const StylePropertyParse *parse)
             char resolved[32];
         if (style_resolve_value(sheet, value, value_length, resolved,
                           sizeof(resolved), 0)) {
+            if (strcmp(resolved, "visible") != 0
+                && strcmp(resolved, "hidden") != 0
+                && strcmp(resolved, "collapse") != 0) return true;
             style->visibility_hidden = strcmp(resolved, "hidden") == 0
                                        || strcmp(resolved, "collapse") == 0;
             *mask |= S_VISIBILITY;

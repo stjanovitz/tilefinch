@@ -12,16 +12,7 @@ static bool dynamic_script_type(lxb_dom_node_t *node, bool *module)
     if (module != NULL) *module = false;
     size_t type_length = 0;
     const char *type = document_attribute(node, "type", &type_length);
-    if (type != NULL && type_length == 6
-        && strncasecmp(type, "module", 6) == 0) {
-        if (module != NULL) *module = true;
-        return true;
-    }
-    return type == NULL || type_length == 0
-        || (type_length == 15
-            && strncasecmp(type, "text/javascript", 15) == 0)
-        || (type_length == 22
-            && strncasecmp(type, "application/javascript", 22) == 0);
+    return script_type_attribute_classify(type, type_length, module);
 }
 
 static bool script_node_source_length(lxb_dom_node_t *node,

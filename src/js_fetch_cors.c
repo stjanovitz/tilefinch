@@ -731,7 +731,7 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
 {
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || argc < 2) {
+    if (bridge == NULL || bridge->document == NULL || argc < 2) {
         return JS_ThrowTypeError(context, "fetch requires method and URL");
     }
     size_t method_length = 0, reference_length = 0;
@@ -924,7 +924,7 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
 {
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || argc < 2) {
+    if (bridge == NULL || bridge->document == NULL || argc < 2) {
         return JS_ThrowTypeError(context, "fetch requires method and URL");
     }
     size_t method_length = 0, reference_length = 0;
@@ -1160,7 +1160,7 @@ static JSValue js_event_source_start(JSContext *context,
 {
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
-    if (bridge == NULL || argc < 1) {
+    if (bridge == NULL || bridge->document == NULL || argc < 1) {
         return JS_ThrowTypeError(context, "EventSource requires a URL");
     }
     size_t reference_length = 0, last_id_length = 0;

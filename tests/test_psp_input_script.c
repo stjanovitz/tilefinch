@@ -92,6 +92,46 @@ static bool test_parser(void)
     return true;
 }
 
+static bool write_capacity_fixture(const char *path, size_t bytes)
+{
+    static const char prefix[] = "wait 1\n";
+    if (bytes < sizeof(prefix) - 1u) return false;
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool ok = fwrite(prefix, 1u, sizeof(prefix) - 1u, file)
+        == sizeof(prefix) - 1u;
+    for (size_t at = sizeof(prefix) - 1u; ok && at < bytes; at++) {
+        unsigned char value = ((at - (sizeof(prefix) - 1u)) & 1u) == 0
+            ? '#' : '\n';
+        ok = fputc(value, file) != EOF;
+    }
+    return fclose(file) == 0 && ok;
+}
+
+static bool test_file_capacity_boundary(void)
+{
+    static const char path[] = "tilefinch-input-script-capacity.tmp";
+    PspInputScript script;
+    CHECK(write_capacity_fixture(path, 8190u));
+    warning_count = 0;
+    CHECK(psp_input_script_load(
+              &script, path, record_warning, NULL)
+          && script.step_count == 1u && warning_count == 0u);
+    CHECK(write_capacity_fixture(path, 8191u));
+    warning_count = 0;
+    CHECK(psp_input_script_load(
+              &script, path, record_warning, NULL)
+          && script.step_count == 1u && warning_count == 0u);
+    CHECK(write_capacity_fixture(path, 8192u));
+    warning_count = 0;
+    CHECK(!psp_input_script_load(
+              &script, path, record_warning, NULL)
+          && warning_count == 1u
+          && strcmp(last_warning, "0:too large") == 0);
+    CHECK(remove(path) == 0);
+    return true;
+}
+
 static bool test_stepper(void)
 {
     PspInputScript script;
@@ -445,7 +485,8 @@ int main(int argc, char **argv)
              "%s/menu-tour.host-trace.txt", directory);
     snprintf(trace_path, sizeof(trace_path), "menu-tour.host-trace.produced");
 
-    if (!test_parser() || !test_stepper() || !test_names()
+    if (!test_parser() || !test_file_capacity_boundary()
+        || !test_stepper() || !test_names()
         || !test_live_media_scenario(directory)) return 1;
 
     if (update) {

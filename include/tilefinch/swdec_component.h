@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #define TILEFINCH_SWDEC_COMPONENT_MAGIC UINT32_C(0x54465344)
-#define TILEFINCH_SWDEC_COMPONENT_ABI_VERSION 4u
+#define TILEFINCH_SWDEC_COMPONENT_ABI_VERSION 5u
 #define TILEFINCH_SWDEC_COMPONENT_HELPER_PATH_LIMIT 192u
 #define TILEFINCH_SWDEC_CSC_SLOT_COUNT 25u
 #define TILEFINCH_SWDEC_PCM_SLOT_COUNT 128u
@@ -59,6 +59,9 @@ typedef struct TilefinchSwdecComponentApi {
 
     void (*csc_begin)(int slot, void *rgb565, int stride_pixels,
                       size_t capacity_bytes);
+    int (*csc_picture)(int slot, void *rgb565, int stride_pixels,
+                       size_t capacity_bytes,
+                       const TilefinchSwdecPicture *picture);
     int (*csc_close)(void);
     void (*csc_off)(void);
 } TilefinchSwdecComponentApi;

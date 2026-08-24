@@ -34,4 +34,13 @@ static inline bool swdec_audio_channels_admitted(int channels)
     return channels == 1 || channels == 2;
 }
 
+/* Absolute clock correction after selecting a late frame. Repeated visits to
+ * the same timing error must not accumulate another copy of that error. */
+static inline uint64_t swdec_clock_reanchor_slip(
+    uint64_t presentation_clock_us, uint64_t selected_pts_us)
+{
+    return presentation_clock_us >= selected_pts_us
+        ? presentation_clock_us - selected_pts_us : 0;
+}
+
 #endif

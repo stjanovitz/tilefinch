@@ -826,6 +826,24 @@
     CHECK(deterministic_tick_result.success
           && strcmp(deterministic_tick_result.summary,
                     "BOUNDED-ANIMATION-OK") == 0);
+    static const char late_animation_frame_source[] =
+        "(()=>{globalThis.pocSummary='RAF-LATE-PENDING';let first=0;"
+        "requestAnimationFrame(timestamp=>{first=timestamp;"
+        "requestAnimationFrame(next=>{globalThis.pocSummary="
+        "next-first===50?'RAF-LATE-OK':'RAF-LATE-FAILED:'+(next-first);});});})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              deterministic_tick_runtime, late_animation_frame_source,
+              "<late-animation-frame>", &deterministic_tick_result)
+          && script_runtime_advance(
+              deterministic_tick_runtime, 50, 16,
+              &deterministic_tick_result)
+          && strcmp(deterministic_tick_result.summary,
+                    "RAF-LATE-PENDING") == 0
+          && script_runtime_advance(
+              deterministic_tick_runtime, 50, 16,
+              &deterministic_tick_result)
+          && strcmp(deterministic_tick_result.summary,
+                    "RAF-LATE-OK") == 0);
     script_runtime_destroy(deterministic_tick_runtime);
 
     puts("test: motion-free class changes reuse a negative inline hint");
@@ -851,7 +869,7 @@
                     "MOTION-NEGATIVE-CACHED") == 0);
     script_runtime_destroy(motion_free_runtime);
 
-    puts("test: reduced-motion mode skips stylesheet animation scans");
+    puts("test: reduced-motion mode resolves one static stylesheet state");
     ScriptResult stylesheet_animation_result;
     ScriptRuntimeOptions stylesheet_animation_options =
         deterministic_tick_options;
@@ -866,15 +884,18 @@
     static const char stylesheet_animation_source[] =
         "(()=>{const style=document.createElement('style'),"
         "box=document.createElement('div');"
-        "style.textContent='@keyframes pulse{from{opacity:0}'"
-        "+'to{opacity:1}}.motion-probe{animation:pulse 32ms linear}';"
+        "style.textContent='@keyframes pulse{from{opacity:0;transform:translateY(800px)}'"
+        "+'to{opacity:1;transform:translateY(20px)}}.motion-probe{'"
+        "+'animation:pulse 32ms linear;animation-timeline:scroll()}';"
         "box.className='motion-probe';"
         "document.head.appendChild(style);document.body.appendChild(box);"
         "queueMicrotask(()=>{globalThis.pocSummary="
         "matchMedia('(prefers-reduced-motion:reduce)').matches"
-        "&&__tilefinchRootCensus.motionScans===0"
-        "?'STYLESHEET-MOTION-REDUCED':'STYLESHEET-MOTION-SCANNED:'+"
-        "__tilefinchRootCensus.motionScans});"
+        "&&__tilefinchRootCensus.motionScans===1&&box.style.opacity==='1'"
+        "&&box.style.transform==='none'"
+        "?'STYLESHEET-MOTION-STATIC':'STYLESHEET-MOTION-BAD:'+"
+        "[__tilefinchRootCensus.motionScans,box.style.opacity,"
+        "box.style.transform].join(',')});"
         "globalThis.pocSummary='STYLESHEET-MOTION-PENDING';})()";
     CHECK(stylesheet_animation_runtime != NULL
           && script_runtime_evaluate_diagnostic(
@@ -882,21 +903,21 @@
               "<stylesheet-animation>", &stylesheet_animation_result));
     for (size_t tick = 0; tick < 2
                           && strcmp(stylesheet_animation_result.summary,
-                                    "STYLESHEET-MOTION-REDUCED") != 0;
+                                    "STYLESHEET-MOTION-STATIC") != 0;
          tick++) {
         CHECK(script_runtime_advance(
             stylesheet_animation_runtime, 16, 16,
             &stylesheet_animation_result));
     }
     if (strcmp(stylesheet_animation_result.summary,
-               "STYLESHEET-MOTION-REDUCED") != 0) {
+               "STYLESHEET-MOTION-STATIC") != 0) {
         fprintf(stderr, "stylesheet animation summary=%s error=%s\n",
                 stylesheet_animation_result.summary,
                 stylesheet_animation_result.error);
     }
     CHECK(stylesheet_animation_result.success
           && strcmp(stylesheet_animation_result.summary,
-                    "STYLESHEET-MOTION-REDUCED") == 0
+                    "STYLESHEET-MOTION-STATIC") == 0
           && stylesheet_animation_result.bootstrap_lazy_module_loads == 1
           && stylesheet_animation_result.bootstrap_lazy_module_failures == 0);
 
@@ -1326,6 +1347,80 @@
           && script_failure_result.scripts_evaluated == 1
           && strcmp(script_failure_result.summary, "continued") == 0);
     document_destroy(&script_failure_document);
+
+    puts("test: failed hydration restores a complete server-rendered body");
+    static const char hydration_page[] =
+        "<!doctype html><body><main><h1>Server title</h1>"
+        "<p>The server-rendered article remains useful when an author script "
+        "clears its mount point and then exhausts its execution budget. This "
+        "text deliberately exceeds the useful-content threshold.</p>"
+        "<input id=hydration-control value=server>"
+        "<a href='/next'>Continue reading</a></main></body>";
+    PocDocument hydration_document = {0};
+    CHECK(document_parse(&hydration_document, &budget, hydration_page,
+                         strlen(hydration_page), 97u));
+    DocumentBodySnapshot hydration_snapshot = {0};
+    CHECK(document_body_snapshot_capture(
+              &hydration_document, &hydration_snapshot));
+    lxb_dom_node_t *hydration_body = document_body_node(&hydration_document);
+    CHECK(hydration_body != NULL
+          && document_set_element_inner_html(
+                 &hydration_document, hydration_body,
+                 "<input id=loading-control value=loading>",
+                 sizeof("<input id=loading-control value=loading>") - 1u));
+    lxb_dom_node_t *hydration_control = find_id(
+        lxb_dom_interface_node(hydration_document.html), "loading-control");
+    CHECK(hydration_control != NULL
+          && document_control_value_set(
+                 &hydration_document, hydration_control, "changed", 7u)
+          && hydration_document.control_state_count == 1u
+          && document_body_snapshot_restore_if_degraded(
+                 &hydration_document, &hydration_snapshot, NULL, NULL));
+    const char *hydration_text = document_body_text(&hydration_document);
+    CHECK(hydration_text != NULL
+          && strstr(hydration_text, "Server title") != NULL
+          && strstr(hydration_text, "Continue reading") != NULL
+          && hydration_document.control_state_count == 0u
+          && find_id(lxb_dom_interface_node(hydration_document.html),
+                     "hydration-control") != NULL);
+    document_body_snapshot_destroy(&hydration_snapshot);
+    document_destroy(&hydration_document);
+    CHECK(budget.current == listener_baseline);
+
+    puts("test: body snapshot reserves its exact-bound terminator");
+    enum { exact_snapshot_bytes = 256u * 1024u };
+    static const char exact_prefix[] = "<!doctype html><body><main>";
+    static const char exact_suffix[] = "</main></body>";
+    size_t exact_text_bytes = exact_snapshot_bytes
+        - (sizeof("<main>") - 1u) - (sizeof("</main>") - 1u);
+    size_t exact_source_bytes = sizeof(exact_prefix) - 1u
+        + exact_text_bytes + sizeof(exact_suffix) - 1u;
+    char *exact_source = malloc(exact_source_bytes + 1u);
+    CHECK(exact_source != NULL);
+    size_t exact_used = 0;
+    memcpy(exact_source + exact_used, exact_prefix,
+           sizeof(exact_prefix) - 1u);
+    exact_used += sizeof(exact_prefix) - 1u;
+    memset(exact_source + exact_used, 'x', exact_text_bytes);
+    exact_used += exact_text_bytes;
+    memcpy(exact_source + exact_used, exact_suffix,
+           sizeof(exact_suffix) - 1u);
+    exact_used += sizeof(exact_suffix) - 1u;
+    exact_source[exact_used] = '\0';
+    PocDocument exact_snapshot_document = {0};
+    DocumentBodySnapshot exact_snapshot = {0};
+    CHECK(exact_used == exact_source_bytes
+          && document_parse(
+                 &exact_snapshot_document, &budget,
+                 exact_source, exact_source_bytes, 4096u)
+          && document_body_snapshot_capture(
+                 &exact_snapshot_document, &exact_snapshot)
+          && exact_snapshot.length == exact_snapshot_bytes
+          && exact_snapshot.capacity >= exact_snapshot_bytes + 1u
+          && exact_snapshot.markup[exact_snapshot_bytes] == '\0');
+    document_body_snapshot_destroy(&exact_snapshot);
+    document_destroy(&exact_snapshot_document);
+    free(exact_source);
     CHECK(budget.current == listener_baseline);
 
     TileCache cache;

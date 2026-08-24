@@ -64,6 +64,7 @@ tap select
 tap cross
 press 5 down
 tap cross
+tap cross
 press 3 down
 tap cross
 wait 10

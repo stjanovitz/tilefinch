@@ -29,9 +29,35 @@ size_t stylesheet_retained_bytes(const Stylesheet *sheet)
           + sheet->image_sources->capacity
               * sizeof(*sheet->image_sources->items)
           + sheet->image_sources->retained_base_bytes;
+    size_t paint_bytes = 0;
+    if (sheet->paint_storage != NULL) {
+        paint_bytes = sizeof(*sheet->paint_storage)
+            + sheet->paint_storage->capacity
+                * sizeof(*sheet->paint_storage->blocks);
+        for (size_t i = 0; i < sheet->paint_storage->capacity; i++) {
+            if (sheet->paint_storage->blocks[i] != NULL) {
+                paint_bytes += STYLE_PAINT_STACK_BLOCK_SIZE
+                    * sizeof(*sheet->paint_storage->blocks[i]);
+            }
+        }
+    }
+    size_t grid_track_bytes = 0;
+    if (sheet->grid_tracks != NULL) {
+        grid_track_bytes = sizeof(*sheet->grid_tracks)
+            + sheet->grid_tracks->capacity
+                * sizeof(*sheet->grid_tracks->blocks);
+        for (size_t i = 0; i < sheet->grid_tracks->capacity; i++) {
+            if (sheet->grid_tracks->blocks[i] != NULL) {
+                grid_track_bytes += STYLE_GRID_TRACK_BLOCK_SIZE
+                    * sizeof(*sheet->grid_tracks->blocks[i]);
+            }
+        }
+    }
     return sheet->capacity * sizeof(*sheet->rules)
         + sheet->focus_rule_count * sizeof(*sheet->focus_rule_indices)
         + sheet->declaration_capacity * sizeof(*sheet->declarations)
+        + sheet->revert_rule_mask_capacity
+            * sizeof(*sheet->revert_rule_masks)
         + sheet->declaration_index_slot_count
             * sizeof(*sheet->declaration_index_slots)
         + sheet->selector_program_bytes
@@ -47,6 +73,15 @@ size_t stylesheet_retained_bytes(const Stylesheet *sheet)
         + sheet->math_program_capacity * sizeof(*sheet->math_programs)
         + sheet->deferred_instruction_capacity
             * sizeof(*sheet->deferred_instructions)
+        + sheet->custom_rule_index_bytes
+        + (sheet->conditional_queries == NULL ? 0
+           : sizeof(*sheet->conditional_queries))
+        + (sheet->grid_areas == NULL ? 0 : sizeof(*sheet->grid_areas))
+        + sheet->border_color_set_capacity
+            * sizeof(*sheet->border_color_sets)
+        + (sheet->resolve_scratch == NULL ? 0
+           : sizeof(*sheet->resolve_scratch))
+        + paint_bytes + grid_track_bytes
         + sheet->deferred_bytes + sheet->generated_text_bytes
         + sheet->image_url_bytes + sheet->rule_index_bytes
         + web_font_bytes + image_source_bytes;
