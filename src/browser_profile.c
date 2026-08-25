@@ -51,6 +51,9 @@ struct BrowserProfile {
     BrowserColorMode color_mode;
     BrowserChromeTheme chrome_theme;
     BrowserYoutubeQuality youtube_quality;
+    BrowserVideoLanguage video_language;
+    BrowserSubtitleLanguage subtitle_language;
+    BrowserAlternateLanguage alternate_language;
     bool youtube_compact_results;
     bool youtube_audio_only;
     bool resume_offline_downloads;
@@ -60,6 +63,7 @@ struct BrowserProfile {
     bool video_scaling_sharp;
     bool video_startup_buffering;
     BrowserTextEntryMode text_entry_mode;
+    TilefinchGamepadFaceMapping gamepad_face_mapping;
     BrowserReaderFont reader_font;
     bool remember_reader_site_scale;
     bool reader_auto_mode;
@@ -85,6 +89,24 @@ struct BrowserProfile {
     BrowserProfilePage history[BROWSER_PROFILE_HISTORY_LIMIT];
     BrowserProfileResume resumes[BROWSER_PROFILE_RESUME_LIMIT];
 };
+
+_Static_assert(BROWSER_VIDEO_LANGUAGE_SYSTEM == 0
+               && BROWSER_VIDEO_LANGUAGE_ORIGINAL == 1
+               && BROWSER_VIDEO_LANGUAGE_ENGLISH == 2
+               && BROWSER_VIDEO_LANGUAGE_RUSSIAN == 12,
+               "serialized audio-language values changed");
+_Static_assert(BROWSER_SUBTITLE_LANGUAGE_RUSSIAN < 16
+               && BROWSER_ALTERNATE_LANGUAGE_RUSSIAN < 16,
+               "video language preferences exceed compact PSP storage");
+_Static_assert((int) BROWSER_SUBTITLE_LANGUAGE_ENGLISH
+                   == (int) BROWSER_VIDEO_LANGUAGE_ENGLISH
+               && (int) BROWSER_SUBTITLE_LANGUAGE_RUSSIAN
+                   == (int) BROWSER_VIDEO_LANGUAGE_RUSSIAN
+               && (int) BROWSER_ALTERNATE_LANGUAGE_ENGLISH
+                   == (int) BROWSER_VIDEO_LANGUAGE_ENGLISH
+               && (int) BROWSER_ALTERNATE_LANGUAGE_RUSSIAN
+                   == (int) BROWSER_VIDEO_LANGUAGE_RUSSIAN,
+               "explicit language identities diverged");
 
 typedef struct {
     Budget *budget;
@@ -130,6 +152,38 @@ static bool profile_valid_youtube_quality(BrowserYoutubeQuality quality)
         || quality == BROWSER_YOUTUBE_QUALITY_360P;
 }
 
+static bool profile_valid_video_language(BrowserVideoLanguage language)
+{
+    return language >= BROWSER_VIDEO_LANGUAGE_SYSTEM
+        && language < BROWSER_VIDEO_LANGUAGE_COUNT;
+}
+
+static bool profile_valid_subtitle_language(
+    BrowserSubtitleLanguage language)
+{
+    return language >= BROWSER_SUBTITLE_LANGUAGE_SYSTEM
+        && language < BROWSER_SUBTITLE_LANGUAGE_COUNT;
+}
+
+static bool profile_valid_alternate_language(
+    BrowserAlternateLanguage language)
+{
+    return language == BROWSER_ALTERNATE_LANGUAGE_NONE
+        || (language >= BROWSER_ALTERNATE_LANGUAGE_ENGLISH
+            && language < BROWSER_ALTERNATE_LANGUAGE_COUNT);
+}
+
+static bool profile_valid_language_tag(const char *language)
+{
+    if (language == NULL || language[0] == '\0') return false;
+    size_t length = 0;
+    for (const unsigned char *at = (const unsigned char *) language;
+         *at != '\0'; at++, length++) {
+        if (length >= 15u || (!isalnum(*at) && *at != '-')) return false;
+    }
+    return length >= 2u;
+}
+
 static bool profile_valid_video_scaling(BrowserVideoScaling scaling)
 {
     return scaling == BROWSER_VIDEO_SCALING_SMOOTH
@@ -140,6 +194,13 @@ static bool profile_valid_text_entry_mode(BrowserTextEntryMode mode)
 {
     return mode == BROWSER_TEXT_ENTRY_OSK
         || mode == BROWSER_TEXT_ENTRY_DANZEFF;
+}
+
+static bool profile_valid_gamepad_face_mapping(
+    TilefinchGamepadFaceMapping mapping)
+{
+    return mapping >= TILEFINCH_GAMEPAD_FACE_X_PRIMARY
+        && mapping < TILEFINCH_GAMEPAD_FACE_MAPPING_COUNT;
 }
 
 static bool profile_valid_reader_font(BrowserReaderFont font)
@@ -209,6 +270,9 @@ BrowserProfile *browser_profile_create(Budget *budget)
     profile->analog_cursor_enabled = true;
     profile->live_cache_kib = BROWSER_PROFILE_TRANSIENT_CACHE_KIB;
     profile->youtube_quality = BROWSER_YOUTUBE_QUALITY_360P;
+    profile->video_language = BROWSER_VIDEO_LANGUAGE_SYSTEM;
+    profile->subtitle_language = BROWSER_SUBTITLE_LANGUAGE_SYSTEM;
+    profile->alternate_language = BROWSER_ALTERNATE_LANGUAGE_NONE;
     profile->video_startup_buffering = true;
     profile->content_blocker_mode = CONTENT_BLOCKER_BASIC;
     profile->content_blocker_cosmetic_hiding = true;
@@ -489,6 +553,20 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
             profile->video_startup_buffering ? 1u : 0u,
             profile->youtube_compact_results ? 1u : 0u,
             profile->youtube_audio_only ? 1u : 0u) > 0;
+    }
+    if (ok) {
+        /* Separate append-only record: older A/B slots ignore it and retain
+           their historical system-language behavior. */
+        ok = fprintf(file, "VIDLANG\t%u\t%u\t%u\n",
+                     (unsigned) profile->video_language,
+                     (unsigned) profile->subtitle_language,
+                     (unsigned) profile->alternate_language) > 0;
+    }
+    if (ok) {
+        /* Independent of browser input: this mapping is consulted only after
+           the explicit page-control handoff. */
+        ok = fprintf(file, "GAMEPAD\t%u\n",
+                     (unsigned) profile->gamepad_face_mapping) > 0;
     }
     if (ok) {
         ok = fprintf(
@@ -838,6 +916,30 @@ static bool profile_load_internal(
             if (sixth != NULL)
                 loaded->youtube_audio_only =
                     strtoul(sixth, NULL, 10) != 0;
+        } else if (strcmp(line, "VIDLANG") == 0) {
+            BrowserVideoLanguage language =
+                (BrowserVideoLanguage) strtoul(first, NULL, 10);
+            if (profile_valid_video_language(language))
+                loaded->video_language = language;
+            if (second != NULL) {
+                char *third = strchr(second, '\t');
+                if (third != NULL) *third++ = '\0';
+                BrowserSubtitleLanguage subtitle =
+                    (BrowserSubtitleLanguage) strtoul(second, NULL, 10);
+                if (profile_valid_subtitle_language(subtitle))
+                    loaded->subtitle_language = subtitle;
+                if (third != NULL) {
+                    BrowserAlternateLanguage alternate =
+                        (BrowserAlternateLanguage) strtoul(third, NULL, 10);
+                    if (profile_valid_alternate_language(alternate))
+                        loaded->alternate_language = alternate;
+                }
+            }
+        } else if (strcmp(line, "GAMEPAD") == 0) {
+            TilefinchGamepadFaceMapping mapping =
+                (TilefinchGamepadFaceMapping) strtoul(first, NULL, 10);
+            if (profile_valid_gamepad_face_mapping(mapping))
+                loaded->gamepad_face_mapping = mapping;
         } else if (strcmp(line, "BLOCK") == 0) {
             ContentBlockerMode mode =
                 (ContentBlockerMode) strtoul(first, NULL, 10);
@@ -1209,6 +1311,81 @@ BrowserYoutubeQuality browser_profile_youtube_quality(
         ? BROWSER_YOUTUBE_QUALITY_360P : profile->youtube_quality;
 }
 
+BrowserVideoLanguage browser_profile_video_language(
+    const BrowserProfile *profile)
+{
+    return profile == NULL
+        ? BROWSER_VIDEO_LANGUAGE_SYSTEM : profile->video_language;
+}
+
+BrowserSubtitleLanguage browser_profile_subtitle_language(
+    const BrowserProfile *profile)
+{
+    return profile == NULL
+        ? BROWSER_SUBTITLE_LANGUAGE_SYSTEM : profile->subtitle_language;
+}
+
+BrowserAlternateLanguage browser_profile_alternate_language(
+    const BrowserProfile *profile)
+{
+    return profile == NULL
+        ? BROWSER_ALTERNATE_LANGUAGE_NONE : profile->alternate_language;
+}
+
+static const char *profile_explicit_video_language_tag(unsigned language)
+{
+    static const char *const tags[BROWSER_VIDEO_LANGUAGE_COUNT] = {
+        [BROWSER_VIDEO_LANGUAGE_ENGLISH] = "en",
+        [BROWSER_VIDEO_LANGUAGE_SPANISH] = "es",
+        [BROWSER_VIDEO_LANGUAGE_FRENCH] = "fr",
+        [BROWSER_VIDEO_LANGUAGE_GERMAN] = "de",
+        [BROWSER_VIDEO_LANGUAGE_ITALIAN] = "it",
+        [BROWSER_VIDEO_LANGUAGE_PORTUGUESE] = "pt",
+        [BROWSER_VIDEO_LANGUAGE_JAPANESE] = "ja",
+        [BROWSER_VIDEO_LANGUAGE_KOREAN] = "ko",
+        [BROWSER_VIDEO_LANGUAGE_CHINESE_SIMPLIFIED] = "zh-CN",
+        [BROWSER_VIDEO_LANGUAGE_CHINESE_TRADITIONAL] = "zh-TW",
+        [BROWSER_VIDEO_LANGUAGE_RUSSIAN] = "ru"
+    };
+    return language < BROWSER_VIDEO_LANGUAGE_COUNT ? tags[language] : NULL;
+}
+
+const char *browser_video_language_tag(
+    BrowserVideoLanguage language, const char *system_language)
+{
+    if (!profile_valid_video_language(language)) language =
+        BROWSER_VIDEO_LANGUAGE_SYSTEM;
+    if (language == BROWSER_VIDEO_LANGUAGE_ORIGINAL) return NULL;
+    if (language == BROWSER_VIDEO_LANGUAGE_SYSTEM)
+        return profile_valid_language_tag(system_language)
+            ? system_language : "en";
+    const char *tag = profile_explicit_video_language_tag((unsigned) language);
+    return tag == NULL ? "en" : tag;
+}
+
+const char *browser_subtitle_language_tag(
+    BrowserSubtitleLanguage language, const char *system_language,
+    const char *audio_language)
+{
+    if (!profile_valid_subtitle_language(language))
+        language = BROWSER_SUBTITLE_LANGUAGE_SYSTEM;
+    if (language == BROWSER_SUBTITLE_LANGUAGE_SYSTEM)
+        return profile_valid_language_tag(system_language)
+            ? system_language : "en";
+    if (language == BROWSER_SUBTITLE_LANGUAGE_SAME_AS_AUDIO)
+        return profile_valid_language_tag(audio_language)
+            ? audio_language : NULL;
+    return profile_explicit_video_language_tag((unsigned) language);
+}
+
+const char *browser_alternate_language_tag(
+    BrowserAlternateLanguage language)
+{
+    if (!profile_valid_alternate_language(language)
+        || language == BROWSER_ALTERNATE_LANGUAGE_NONE) return NULL;
+    return profile_explicit_video_language_tag((unsigned) language);
+}
+
 bool browser_profile_youtube_compact_results(
     const BrowserProfile *profile)
 {
@@ -1244,6 +1421,13 @@ BrowserTextEntryMode browser_profile_text_entry_mode(
 {
     return profile == NULL
         ? BROWSER_TEXT_ENTRY_OSK : profile->text_entry_mode;
+}
+
+TilefinchGamepadFaceMapping browser_profile_gamepad_face_mapping(
+    const BrowserProfile *profile)
+{
+    return profile == NULL ? TILEFINCH_GAMEPAD_FACE_X_PRIMARY
+                           : profile->gamepad_face_mapping;
 }
 
 ContentBlockerMode browser_profile_content_blocker_mode(
@@ -1596,6 +1780,27 @@ void browser_profile_set_youtube_quality(
         profile->youtube_quality = quality;
 }
 
+void browser_profile_set_video_language(
+    BrowserProfile *profile, BrowserVideoLanguage language)
+{
+    if (profile != NULL && profile_valid_video_language(language))
+        profile->video_language = language;
+}
+
+void browser_profile_set_subtitle_language(
+    BrowserProfile *profile, BrowserSubtitleLanguage language)
+{
+    if (profile != NULL && profile_valid_subtitle_language(language))
+        profile->subtitle_language = language;
+}
+
+void browser_profile_set_alternate_language(
+    BrowserProfile *profile, BrowserAlternateLanguage language)
+{
+    if (profile != NULL && profile_valid_alternate_language(language))
+        profile->alternate_language = language;
+}
+
 void browser_profile_set_youtube_compact_results(
     BrowserProfile *profile, bool compact)
 {
@@ -1625,6 +1830,13 @@ void browser_profile_set_text_entry_mode(
 {
     if (profile != NULL && profile_valid_text_entry_mode(mode))
         profile->text_entry_mode = mode;
+}
+
+void browser_profile_set_gamepad_face_mapping(
+    BrowserProfile *profile, TilefinchGamepadFaceMapping mapping)
+{
+    if (profile != NULL && profile_valid_gamepad_face_mapping(mapping))
+        profile->gamepad_face_mapping = mapping;
 }
 
 void browser_profile_set_content_blocker_mode(

@@ -196,6 +196,11 @@ bool psp_display_video_begin(PspDisplay *display);
 bool psp_display_video_end(PspDisplay *display);
 bool psp_display_video_active(const PspDisplay *display);
 
+/* Changes whenever video mode claims the EDRAM layout which aliases page
+   WebGL's retained texture cache.  Cache users compare this generation before
+   trusting metadata retained across routes. */
+uint32_t psp_display_edram_content_epoch(void);
+
 /*
  * True when `address` lies inside the 2 MiB of EDRAM this front end owns.
  * Where the graphics engine's texture lives is the largest term in a video

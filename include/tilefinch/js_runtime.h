@@ -7,6 +7,7 @@
 
 #include "tilefinch/budget.h"
 #include "tilefinch/document.h"
+#include "tilefinch/gamepad.h"
 #include "tilefinch/session.h"
 #include "tilefinch/layout.h"
 #include "tilefinch/style.h"
@@ -274,6 +275,47 @@ typedef struct {
     size_t lazy_webpack_syntax_preflight_source_bytes;
     uint64_t lazy_webpack_syntax_preflight_total_us;
 } ScriptResult;
+
+/* Validation census for the bounded PSP WebGL translator. Shipping builds
+   expose an empty snapshot without adding timing work to the frame path. */
+typedef struct {
+    size_t frames;
+    size_t vertices;
+    uint64_t seed_us;
+    uint64_t command_us;
+    uint64_t sync_us;
+    uint64_t readback_us;
+    uint64_t total_us;
+    uint64_t maximum_total_us;
+    uint64_t scratch_bytes;
+    size_t maximum_scratch_bytes;
+    size_t texture_cache_owner_resets;
+    size_t texture_cache_capacity_resets;
+    size_t texture_upload_bytes;
+} ScriptWebglNativeMetrics;
+
+bool script_runtime_webgl_native_metrics(
+    ScriptWebglNativeMetrics *metrics);
+
+/* Host-testable admission seam for the process-global PSP GE texture owner.
+   Production cache metadata uses the same transition helper.  A changed
+   realm epoch or canvas handle must clear both retained counters before any
+   texture lookup can occur. */
+typedef struct {
+    uint32_t realm_epoch_high;
+    uint32_t realm_epoch_low;
+    int64_t canvas_handle;
+    size_t cached_entries;
+    size_t cached_bytes;
+    bool valid;
+} ScriptWebglCacheAdmission;
+
+bool script_runtime_webgl_cache_admit(
+    ScriptWebglCacheAdmission *state,
+    uint32_t realm_epoch_high,
+    uint32_t realm_epoch_low,
+    int64_t canvas_handle,
+    bool *reset);
 
 /* Cheap, allocation-free counters for attributing one host evaluation
    boundary. Unlike ScriptResult, this intentionally does not refresh or copy
@@ -958,6 +1000,19 @@ ScriptQuotaProgressResult script_runtime_script_quota_progress(
     ScriptRuntime *runtime, unsigned maximum_wait_ms);
 bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
                             size_t callback_budget, ScriptResult *result);
+/* Updates one fixed standards-facing Gamepad snapshot. Identical samples are
+   ignored, so a held controller creates no per-frame JavaScript garbage. */
+bool script_runtime_set_gamepad_state(
+    ScriptRuntime *runtime, const TilefinchGamepadState *state);
+/* Queues an edge for the next ordinary author-task checkpoint. The fixed
+   two-entry queue preserves suspend/resume ordering without running author
+   callbacks inside a platform power deadline. */
+bool script_runtime_set_page_visibility(ScriptRuntime *runtime, bool visible);
+/* Page Fullscreen API presentation state. Querying also reconciles a
+   fullscreen element detached by author mutation. */
+bool script_runtime_page_fullscreen_active(ScriptRuntime *runtime);
+bool script_runtime_exit_page_fullscreen(ScriptRuntime *runtime);
+void script_runtime_suspend_game_audio(ScriptRuntime *runtime);
 bool script_runtime_dispatch(ScriptRuntime *runtime, const char *selector,
                              const char *event_type, ScriptResult *result);
 bool script_runtime_dispatch_node(ScriptRuntime *runtime,

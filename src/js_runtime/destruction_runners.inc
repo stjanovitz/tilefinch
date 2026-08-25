@@ -2,6 +2,14 @@ void script_runtime_destroy(ScriptRuntime *runtime)
 {
     if (runtime == NULL) return;
     Budget *budget = runtime->budget;
+    /* Defense in depth only: lookup admission also compares the unforgeable
+       realm epoch, so correctness never depends on teardown running. */
+    js_webgl_realm_epoch_release(&runtime->bridge);
+    if (runtime->bridge.stylesheet != NULL)
+        ((Stylesheet *) runtime->bridge.stylesheet)->fullscreen_node = NULL;
+    runtime->bridge.fullscreen_node_handle = 0;
+    tilefinch_game_audio_destroy(runtime->game_audio);
+    runtime->game_audio = NULL;
     if (getenv("TILEFINCH_TRACE_TASKS") != NULL) {
         /* Teardown must never invoke author-overridable JavaScript. Apart from
            reentrancy, a detached incumbent runtime may no longer point at its
@@ -56,6 +64,11 @@ void script_runtime_destroy(ScriptRuntime *runtime)
             runtime->context, runtime->dom_content_loaded_dispatch);
         JS_FreeValue(runtime->context, runtime->media_state_for);
         JS_FreeValue(runtime->context, runtime->media_update);
+        JS_FreeValue(runtime->context,
+                     runtime->page_visibility_host_apply);
+        JS_FreeValue(runtime->context, runtime->fullscreen_host_exit);
+        JS_FreeValue(runtime->context, runtime->game_audio_host_suspend);
+        JS_FreeValue(runtime->context, runtime->game_audio_host_complete);
         JS_FreeValue(runtime->context, runtime->dispatch_input_handle);
         JS_FreeValue(runtime->context,
                      runtime->dispatch_activation_handle);
@@ -70,6 +83,10 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         runtime->dom_content_loaded_dispatch = JS_UNDEFINED;
         runtime->media_state_for = JS_UNDEFINED;
         runtime->media_update = JS_UNDEFINED;
+        runtime->page_visibility_host_apply = JS_UNDEFINED;
+        runtime->fullscreen_host_exit = JS_UNDEFINED;
+        runtime->game_audio_host_suspend = JS_UNDEFINED;
+        runtime->game_audio_host_complete = JS_UNDEFINED;
         runtime->dispatch_input_handle = JS_UNDEFINED;
         runtime->dispatch_activation_handle = JS_UNDEFINED;
         runtime->dispatch_handle = JS_UNDEFINED;

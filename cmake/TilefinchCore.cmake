@@ -17,6 +17,8 @@ set(TILEFINCH_CORE_SOURCES
     src/fetch_fault.c
     src/frame_sandbox.c
     src/font.c
+    src/game_audio.c
+    src/gamepad.c
     src/glyph_component.c
     src/glyph_component_store.c
     src/image.c
@@ -27,6 +29,7 @@ set(TILEFINCH_CORE_SOURCES
     src/generated/js_bootstrap_bytecode.c
     src/js_dom_bindings.c
     src/js_canvas_bridge.c
+    src/js_webgl_bridge.c
     src/js_fetch_cors.c
     src/js_lazy_webpack.c
     src/js_module_loader.c
@@ -92,6 +95,7 @@ set(TILEFINCH_CORE_SOURCES
     src/tls_session_store.c
     src/text_bidi.c
     src/url.c
+    src/web_app_manifest.c
     src/update_manifest.c
     src/update_root_embedded.c
     src/update_client.c
@@ -106,6 +110,7 @@ set(TILEFINCH_CORE_SOURCES
     src/viewport.c
     src/youtube_lite.c
     src/youtube_resolver.c
+    src/youtube_subtitles.c
 )
 
 add_library(tilefinch_sheenbidi STATIC
@@ -167,7 +172,7 @@ if(PSP)
         src/systemctrl_user_imports.S)
     target_link_libraries(tilefinch_core PUBLIC
         tilefinch_psp_media_imports tilefinch_psp_systemctrl_imports
-        pspaudiocodec pspaudio psputility)
+        pspaudiocodec pspaudio psputility pspgum)
 endif()
 
 if(PSP)

@@ -1,0 +1,1 @@
+<!doctype html><title>Animated candidate</title><canvas id=c width=4 height=2></canvas><script>const x=c.getContext('2d');let n=0;function f(){x.fillStyle=n++&1?'red':'blue';x.fillRect(0,0,4,2);requestAnimationFrame(f)}requestAnimationFrame(f)</script>

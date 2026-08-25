@@ -1488,6 +1488,13 @@ static void navigation_page_relocate_runtime_storage(
         script_runtime_set_layout(session->page.runtime,
                                   &session->page.layout,
                                   session->viewport.css_height);
+        /* Transactional promotion memcpy-moves the inline NavigationPage.
+           The realm's publication target must follow that move just like
+           its document, layout, and stylesheet views.  Otherwise a later
+           canvas/WebGL animation frame writes through the freed candidate
+           session address and its native surface becomes orphaned. */
+        script_runtime_set_images(session->page.runtime,
+                                  &session->page.images);
         script_runtime_set_stylesheet(session->page.runtime,
                                       &session->page.stylesheet);
         script_runtime_relocate_messaging_opaque(session->page.runtime,

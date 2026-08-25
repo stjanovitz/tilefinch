@@ -1022,6 +1022,8 @@ static bool compound_matches_depth(
                                               "focus-visible");
             bool focus_within_pseudo = span_equal(
                 text + at, pseudo_length, "focus-within");
+            bool fullscreen_pseudo = span_equal(
+                text + at, pseudo_length, "fullscreen");
             bool root_pseudo = span_equal(text + at, pseudo_length, "root");
             bool scope_pseudo = span_equal(text + at, pseudo_length, "scope");
             bool defined_pseudo = span_equal(text + at, pseudo_length,
@@ -1075,6 +1077,7 @@ static bool compound_matches_depth(
                                                    "nth-last-of-type");
             if (!root_pseudo && !scope_pseudo && !defined_pseudo
                 && !focus_pseudo && !focus_within_pseudo
+                && !fullscreen_pseudo
                 && !first_pseudo && !last_pseudo && !empty_pseudo
                 && !not_pseudo && !is_pseudo && !has_pseudo
                 && !first_type_pseudo && !last_type_pseudo
@@ -1094,6 +1097,10 @@ static bool compound_matches_depth(
             }
             if (focus_within_pseudo
                 && !node_or_descendant_has_focus(node)) return false;
+            if (fullscreen_pseudo
+                && (sheet == NULL || sheet->fullscreen_node != node)) {
+                return false;
+            }
             if (root_pseudo) {
                 size_t node_length = 0;
                 const char *node_name = document_element_name(node, &node_length);

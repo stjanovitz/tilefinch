@@ -30,32 +30,35 @@ writes.
 The language is line-oriented. Blank lines and `#` comments are ignored.
 
 ```text
-wait-ready [MAX_FRAMES]
-wait-screen SCREEN [MAX_FRAMES]
-wait-menu MODE [MAX_FRAMES]
-wait-busy [MAX_FRAMES]
-wait-idle [MAX_FRAMES]
-press BUTTONS [FRAMES]
-release [FRAMES]
+wait COUNT
+tap BUTTONS
+hold COUNT BUTTONS
+press COUNT BUTTONS
+stick COUNT DIRECTION
 mark NAME
-capture NAME
 end
 ```
+
+Append `-live` to `wait`, `tap`, `hold`, `press`, `stick`, or `mark` when
+that step must continue while the application reports asynchronous work. For
+example, `wait-live 30` advances for 30 presented frames during a navigation
+or sustained media session. Without the suffix, a step pauses until the
+ordinary browser loop is ready to accept scripted input.
 
 `BUTTONS` joins names with `+`: `up`, `down`, `left`, `right`, `cross`,
 `circle`, `triangle`, `square`, `ltrigger`, `rtrigger`, `start`, and `select`.
 The parser accepts at most 256 steps, 20 characters per mark, and 8 KiB per
 file. The boot key accepts only a leaf filename—no separators or `..`.
 
-`press` is frame-counted, not time-counted. Avoid using it to qualify the
-Triangle hold shortcut, whose meaning is intentionally millisecond-based.
+`hold` holds one chord continuously for the requested frame count. `press`
+emits that many distinct press/release pairs. `stick` accepts `up`, `down`,
+`left`, or `right`. Counts are frame-counted, not time-counted; avoid using
+them to qualify shortcuts whose meaning is intentionally millisecond-based.
 
-The useful wait distinction is:
-
-- `wait-busy` proves the operation actually entered an asynchronous state;
-- `wait-idle` proves the later stable state;
-- `wait-ready` waits for ordinary UI readiness and is not appropriate while
-  sustained media playback intentionally remains active.
+The script does not infer semantic readiness from pixels. Use ordinary steps
+when input must wait for the browser's ready boundary, `-live` steps when the
+scenario deliberately overlaps ongoing work, and correlate `mark` records
+with the operation journal to prove the state the scenario reached.
 
 ## Arming a run
 

@@ -12,7 +12,7 @@
 #include "tilefinch/platform.h"
 #include "tilefinch/update.h"
 
-#define OFFLINE_INDEX_VERSION 3u
+#define OFFLINE_INDEX_VERSION 5u
 #define OFFLINE_INDEX_MINIMUM_VERSION 1u
 #define OFFLINE_INDEX_HEADER_BYTES 20u
 #define OFFLINE_ARTICLE_NODE_LIMIT 32768u
@@ -169,12 +169,15 @@ static bool offline_item_valid(const OfflineLibraryItem *item)
 {
     return item != NULL && item->id != 0
         && (item->type == OFFLINE_ITEM_ARTICLE
-            || item->type == OFFLINE_ITEM_YOUTUBE)
+            || item->type == OFFLINE_ITEM_YOUTUBE
+            || item->type == OFFLINE_ITEM_WEB_APP)
         && item->state >= OFFLINE_ITEM_QUEUED
         && item->state <= OFFLINE_ITEM_FAILED
         && item->content_bytes <= UINT64_MAX - item->audio_bytes
+        && item->content_bytes + item->audio_bytes
+               <= UINT64_MAX - item->icon_bytes
         && item->downloaded_bytes
-               <= item->content_bytes + item->audio_bytes
+               <= item->content_bytes + item->audio_bytes + item->icon_bytes
         && item->title[0] != '\0' && item->source_url[0] != '\0'
         && strnlen(item->title, sizeof(item->title)) < sizeof(item->title)
         && strnlen(item->source_url, sizeof(item->source_url))
@@ -182,7 +185,16 @@ static bool offline_item_valid(const OfflineLibraryItem *item)
         && (item->type != OFFLINE_ITEM_YOUTUBE
             || (item->video_id[0] != '\0'
                 && strnlen(item->video_id, sizeof(item->video_id))
-                       < sizeof(item->video_id)));
+                       < sizeof(item->video_id)))
+        && (item->type != OFFLINE_ITEM_WEB_APP
+            || (item->state == OFFLINE_ITEM_READY
+                && item->content_bytes <= OFFLINE_LIBRARY_APP_DOCUMENT_LIMIT
+                && item->audio_bytes <= OFFLINE_LIBRARY_APP_PACK_LIMIT
+                && item->icon_bytes <= OFFLINE_LIBRARY_APP_ICON_LIMIT
+                && item->resource_count
+                       <= BROWSER_OFFLINE_CACHE_ENTRY_LIMIT
+                && item->app_display_mode
+                       < TILEFINCH_WEB_APP_DISPLAY_COUNT));
 }
 
 static bool encode_item(
@@ -199,11 +211,20 @@ static bool encode_item(
         && put_u64(data, capacity, used, item->duration_ms)
         && put_u64(data, capacity, used, item->saved_at_unix)
         && put_u32(data, capacity, used, item->article_hash)
+        && put_u32(data, capacity, used, item->auxiliary_hash)
+        && put_u32(data, capacity, used, item->icon_hash)
+        && put_u32(data, capacity, used, item->resource_count)
+        && put_u32(data, capacity, used, item->icon_bytes)
         && put_u32(data, capacity, used, (uint32_t) item->width)
         && put_u32(data, capacity, used, (uint32_t) item->height)
         && put_u32(data, capacity, used, (uint32_t) item->itag)
         && put_u32(data, capacity, used, (uint32_t) item->audio_itag)
         && put_u32(data, capacity, used, item->split_streams ? 1u : 0u)
+        && put_u32(data, capacity, used, item->app_theme_color)
+        && put_u32(data, capacity, used, item->app_theme_alpha)
+        && put_u32(data, capacity, used, item->app_display_mode)
+        && put_u32(data, capacity, used,
+                   item->app_theme_color_valid ? 1u : 0u)
         && put_text(data, capacity, used, item->title, sizeof(item->title))
         && put_text(
                data, capacity, used, item->source_url,
@@ -222,6 +243,8 @@ static bool decode_item(
 {
     uint32_t type = 0, state = 0, width = 0, height = 0;
     uint32_t itag = 0, audio_itag = 0, split = 0;
+    uint32_t app_theme_color = 0, app_theme_alpha = 0;
+    uint32_t app_display_mode = 0, app_theme_color_valid = 0;
     OfflineLibraryItem staged = {0};
     if (!get_u32(data, length, used, &staged.id)
         || !get_u32(data, length, used, &type)
@@ -233,11 +256,22 @@ static bool decode_item(
         || (version >= 2u
             && !get_u64(data, length, used, &staged.saved_at_unix))
         || !get_u32(data, length, used, &staged.article_hash)
+        || (version >= 4u
+            && (!get_u32(data, length, used, &staged.auxiliary_hash)
+                || !get_u32(data, length, used, &staged.icon_hash)
+                || !get_u32(data, length, used, &staged.resource_count)
+                || !get_u32(data, length, used, &staged.icon_bytes)))
         || !get_u32(data, length, used, &width)
         || !get_u32(data, length, used, &height)
         || !get_u32(data, length, used, &itag)
         || !get_u32(data, length, used, &audio_itag)
         || !get_u32(data, length, used, &split)
+        || (version >= 5u
+            && (!get_u32(data, length, used, &app_theme_color)
+                || !get_u32(data, length, used, &app_theme_alpha)
+                || !get_u32(data, length, used, &app_display_mode)
+                || !get_u32(data, length, used,
+                            &app_theme_color_valid)))
         || !get_text(
                data, length, used, staged.title, sizeof(staged.title))
         || !get_text(
@@ -257,7 +291,14 @@ static bool decode_item(
     staged.itag = (int) (int32_t) itag;
     staged.audio_itag = (int) (int32_t) audio_itag;
     staged.split_streams = split == 1u;
-    if (split > 1u || !offline_item_valid(&staged)) return false;
+    staged.app_theme_color = app_theme_color;
+    staged.app_theme_alpha = (uint8_t) app_theme_alpha;
+    staged.app_display_mode = (uint8_t) app_display_mode;
+    staged.app_theme_color_valid = app_theme_color_valid == 1u;
+    if (split > 1u || app_theme_alpha > UINT8_MAX
+        || app_display_mode >= TILEFINCH_WEB_APP_DISPLAY_COUNT
+        || app_theme_color_valid > 1u || !offline_item_valid(&staged))
+        return false;
     *item = staged;
     return true;
 }
@@ -515,6 +556,8 @@ static bool offline_library_load_with_staged(
                 continue;
             static const char *owned[] = {
                 ".article.html", ".article.tmp", ".article.bak",
+                ".app.html", ".app.pack", ".app.icon",
+                ".app-html.tmp", ".app-pack.tmp", ".app-icon.tmp",
                 ".video.part", ".video.mp4", ".audio.part", ".audio.mp4"
             };
             bool recognized = false;
@@ -1023,6 +1066,521 @@ bool offline_library_read_article(
     return true;
 }
 
+typedef struct {
+    Budget *budget;
+    unsigned char *data;
+    size_t length;
+    size_t capacity;
+    size_t limit;
+} OfflineBlob;
+
+static bool offline_blob_reserve(OfflineBlob *blob, size_t extra)
+{
+    if (blob == NULL || extra > blob->limit - blob->length) return false;
+    size_t needed = blob->length + extra;
+    if (needed <= blob->capacity) return true;
+    size_t capacity = blob->capacity == 0 ? 4096u : blob->capacity;
+    while (capacity < needed) {
+        size_t grown = capacity + capacity / 2u;
+        if (grown <= capacity || grown > blob->limit) grown = blob->limit;
+        capacity = grown;
+        if (capacity < needed && capacity == blob->limit) return false;
+    }
+    unsigned char *resized = budget_realloc_category(
+        blob->budget, BUDGET_CATEGORY_SESSION, blob->data, capacity);
+    if (resized == NULL) return false;
+    blob->data = resized;
+    blob->capacity = capacity;
+    return true;
+}
+
+static bool offline_blob_bytes(OfflineBlob *blob, const void *bytes,
+                               size_t length)
+{
+    if ((bytes == NULL && length != 0) || !offline_blob_reserve(blob, length))
+        return false;
+    memcpy(blob->data + blob->length, bytes, length);
+    blob->length += length;
+    return true;
+}
+
+static bool offline_blob_u32(OfflineBlob *blob, uint32_t value)
+{
+    unsigned char bytes[4];
+    size_t used = 0;
+    return put_u32(bytes, sizeof(bytes), &used, value)
+        && offline_blob_bytes(blob, bytes, sizeof(bytes));
+}
+
+static bool offline_blob_text(OfflineBlob *blob, const char *text,
+                              size_t limit)
+{
+    size_t length = text == NULL ? 0 : strnlen(text, limit);
+    return length < limit && length <= UINT32_MAX
+        && offline_blob_u32(blob, (uint32_t) length)
+        && offline_blob_bytes(blob, text, length);
+}
+
+static lxb_status_t offline_document_receive(
+    const lxb_char_t *data, size_t length, void *opaque)
+{
+    return offline_blob_bytes(opaque, data, length)
+        ? LXB_STATUS_OK : LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+}
+
+static bool offline_pack_view(OfflineBlob *blob,
+                              const BrowserOfflineCacheView *view)
+{
+    const TilefinchResourceGrant *grant = &view->resource_grant;
+    return view->length <= UINT32_MAX
+        && offline_blob_u32(blob, (uint32_t) view->kind)
+        && offline_blob_u32(blob, (uint32_t) view->length)
+        && offline_blob_text(blob, view->url, OFFLINE_LIBRARY_URL_LIMIT)
+        && offline_blob_text(blob, view->content_type, 128u)
+        && offline_blob_text(blob, view->response_url,
+                             OFFLINE_LIBRARY_URL_LIMIT)
+        && offline_blob_text(blob, view->response_referrer_policy, 128u)
+        && offline_blob_u32(blob, (uint32_t) grant->destination)
+        && offline_blob_u32(blob, (uint32_t) grant->mode)
+        && offline_blob_u32(blob, (uint32_t) grant->credentials)
+        && offline_blob_u32(blob, (uint32_t) grant->corp)
+        && offline_blob_u32(blob, grant->initiator_opaque ? 1u : 0u)
+        && offline_blob_u32(blob, grant->final_same_origin ? 1u : 0u)
+        && offline_blob_u32(blob, grant->final_same_site ? 1u : 0u)
+        && offline_blob_u32(blob, grant->cors_validated ? 1u : 0u)
+        && offline_blob_u32(blob, grant->nosniff ? 1u : 0u)
+        && offline_blob_u32(blob, grant->mime_validated ? 1u : 0u)
+        && offline_blob_u32(blob, (uint32_t) view->module_credentials)
+        && offline_blob_u32(blob, view->module_cors_validated ? 1u : 0u)
+        && offline_blob_u32(blob,
+                            view->module_redirect_origin_tainted ? 1u : 0u)
+        && offline_blob_u32(blob,
+                            view->module_javascript_mime_validated ? 1u : 0u)
+        && offline_blob_bytes(blob, view->data, view->length);
+}
+
+static bool offline_write_blob(const OfflineLibrary *library, uint32_t id,
+                               const char *suffix, const OfflineBlob *blob)
+{
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    if (!offline_library_item_path(library, id, suffix, path, sizeof(path)))
+        return false;
+    FILE *file = fopen(path, "wb");
+    bool okay = file != NULL
+        && fwrite(blob->data, 1, blob->length, file) == blob->length
+        && fflush(file) == 0 && ferror(file) == 0;
+    if (file != NULL && fclose(file) != 0) okay = false;
+    if (!okay) (void) remove(path);
+    return okay;
+}
+
+static void offline_remove_app_payloads(const OfflineLibrary *library,
+                                        uint32_t id)
+{
+    static const char *suffixes[] = {
+        ".app.html", ".app.pack", ".app.icon",
+        ".app-html.tmp", ".app-pack.tmp", ".app-icon.tmp"
+    };
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    for (size_t at = 0; at < sizeof(suffixes) / sizeof(suffixes[0]); at++)
+        if (offline_library_item_path(
+                library, id, suffixes[at], path, sizeof(path)))
+            (void) remove(path);
+}
+
+typedef struct {
+    OfflineBlob html;
+    OfflineBlob pack;
+    size_t resource_count;
+} OfflineAppSnapshot;
+
+static void offline_app_snapshot_destroy(
+    OfflineLibrary *library, OfflineAppSnapshot *snapshot)
+{
+    if (library == NULL || snapshot == NULL) return;
+    budget_free(library->budget, snapshot->html.data);
+    budget_free(library->budget, snapshot->pack.data);
+    memset(snapshot, 0, sizeof(*snapshot));
+}
+
+static bool offline_app_snapshot_build(
+    OfflineLibrary *library, PocDocument *document, BrowserSession *session,
+    const char *source_url, OfflineAppSnapshot *snapshot,
+    char *error, size_t error_size)
+{
+    if (library == NULL || document == NULL || session == NULL
+        || source_url == NULL || snapshot == NULL) return false;
+    *snapshot = (OfflineAppSnapshot) {
+        .html = {
+            .budget = library->budget,
+            .limit = OFFLINE_LIBRARY_APP_DOCUMENT_LIMIT
+        },
+        .pack = {
+            .budget = library->budget,
+            .limit = OFFLINE_LIBRARY_APP_PACK_LIMIT
+        }
+    };
+    BrowserOfflineCacheView views[BROWSER_OFFLINE_CACHE_ENTRY_LIMIT];
+    size_t resource_bytes = 0;
+    bool complete = false;
+    size_t cache_limit = session->maximum_cache_bytes
+        < OFFLINE_LIBRARY_APP_RESOURCE_LIMIT
+        ? session->maximum_cache_bytes : OFFLINE_LIBRARY_APP_RESOURCE_LIMIT;
+    snapshot->resource_count =
+        browser_session_cache_collect_offline_same_origin(
+            session, source_url, views, BROWSER_OFFLINE_CACHE_ENTRY_LIMIT,
+            cache_limit, &resource_bytes, &complete);
+    if (!complete) {
+        offline_error(error, error_size,
+                      "app resources exceed the offline package bound");
+        return false;
+    }
+    static const unsigned char magic[8] = {'T','F','A','P','P','0','1',0};
+    bool okay = lxb_html_serialize_tree_cb(
+            lxb_dom_interface_node(document->html),
+            offline_document_receive, &snapshot->html) == LXB_STATUS_OK
+        && snapshot->html.length != 0
+        && offline_blob_bytes(&snapshot->pack, magic, sizeof(magic))
+        && offline_blob_u32(&snapshot->pack, 1u)
+        && offline_blob_u32(
+               &snapshot->pack, (uint32_t) snapshot->resource_count);
+    for (size_t at = 0; okay && at < snapshot->resource_count; at++)
+        okay = offline_pack_view(&snapshot->pack, &views[at]);
+    if (!okay) {
+        offline_error(error, error_size,
+                      "offline app exceeded snapshot bounds");
+        offline_app_snapshot_destroy(library, snapshot);
+    }
+    return okay;
+}
+
+bool offline_library_preview_web_app(
+    OfflineLibrary *library, PocDocument *document, BrowserSession *session,
+    const char *source_url, const TilefinchWebAppManifest *manifest,
+    const unsigned char *icon, size_t icon_length,
+    OfflineWebAppPreview *preview, char *error, size_t error_size)
+{
+    if (preview != NULL) *preview = (OfflineWebAppPreview) {0};
+    if (error != NULL && error_size != 0) error[0] = '\0';
+    if (library == NULL || document == NULL || session == NULL
+        || source_url == NULL || manifest == NULL || preview == NULL
+        || strlen(source_url) >= OFFLINE_LIBRARY_URL_LIMIT
+        || icon_length > OFFLINE_LIBRARY_APP_ICON_LIMIT
+        || !offline_library_load(library)) {
+        offline_error(error, error_size, "offline app input is invalid");
+        return false;
+    }
+    OfflineAppSnapshot snapshot = {0};
+    if (!offline_app_snapshot_build(
+            library, document, session, source_url, &snapshot,
+            error, error_size)) return false;
+    preview->estimated_bytes = (uint64_t) snapshot.html.length
+        + snapshot.pack.length + icon_length;
+    preview->document_hash = offline_hash(
+        snapshot.html.data, snapshot.html.length);
+    preview->resource_hash = offline_hash(
+        snapshot.pack.data, snapshot.pack.length);
+    preview->icon_hash = icon_length == 0 ? 0 : offline_hash(icon, icon_length);
+    preview->resource_count = (uint32_t) snapshot.resource_count;
+    preview->operation = OFFLINE_WEB_APP_INSTALL;
+    for (size_t at = 0; at < library->count; at++) {
+        const OfflineLibraryItem *item = &library->items[at];
+        if (item->type != OFFLINE_ITEM_WEB_APP
+            || strcmp(item->source_url, source_url) != 0) continue;
+        bool unchanged = item->article_hash == preview->document_hash
+            && item->auxiliary_hash == preview->resource_hash
+            && item->icon_hash == preview->icon_hash
+            && item->app_theme_color == manifest->theme_color
+            && item->app_theme_alpha == manifest->theme_alpha
+            && item->app_display_mode == (uint8_t) manifest->display_mode
+            && item->app_theme_color_valid == manifest->theme_color_valid;
+        preview->operation = unchanged
+            ? OFFLINE_WEB_APP_REINSTALL : OFFLINE_WEB_APP_UPDATE;
+        break;
+    }
+    offline_app_snapshot_destroy(library, &snapshot);
+    return true;
+}
+
+bool offline_library_save_web_app(
+    OfflineLibrary *library, PocDocument *document, BrowserSession *session,
+    const char *source_url, const TilefinchWebAppManifest *manifest,
+    const unsigned char *icon, size_t icon_length,
+    uint32_t *saved_id, char *error, size_t error_size)
+{
+    if (error != NULL && error_size != 0) error[0] = '\0';
+    if (library == NULL || document == NULL || session == NULL
+        || source_url == NULL || manifest == NULL
+        || strlen(source_url) >= OFFLINE_LIBRARY_URL_LIMIT
+        || icon_length > OFFLINE_LIBRARY_APP_ICON_LIMIT
+        || !offline_library_load(library) || !offline_directory_ready(library)) {
+        offline_error(error, error_size, "offline app input is invalid");
+        return false;
+    }
+    OfflineAppSnapshot snapshot = {0};
+    if (!offline_app_snapshot_build(
+            library, document, session, source_url, &snapshot,
+            error, error_size)) return false;
+    OfflineBlob *html = &snapshot.html;
+    OfflineBlob *pack = &snapshot.pack;
+    size_t resource_count = snapshot.resource_count;
+    bool okay = true;
+    uint64_t free_bytes = 0;
+    uint64_t required = (uint64_t) html->length + pack->length + icon_length
+        + OFFLINE_ARTICLE_FREE_SPACE_RESERVE;
+    if (!tilefinch_update_query_free_space(library->directory, &free_bytes)
+        || free_bytes < required) {
+        offline_error(error, error_size,
+                      "not enough free Memory Stick space");
+        okay = false;
+    }
+    size_t slot = library->count;
+    for (size_t at = 0; at < library->count; at++)
+        if (library->items[at].type == OFFLINE_ITEM_WEB_APP
+            && strcmp(library->items[at].source_url, source_url) == 0) {
+            slot = at;
+            break;
+        }
+    if (slot == library->count && library->count >= OFFLINE_LIBRARY_ITEM_LIMIT)
+        okay = false;
+    bool replacing = slot < library->count;
+    OfflineLibraryItem previous = {0};
+    if (replacing) previous = library->items[slot];
+    uint32_t previous_next_id = library->next_id;
+    uint32_t id = library->next_id++;
+    if (id == 0) id = library->next_id++;
+    OfflineBlob icon_blob = {
+        .budget = library->budget, .data = (unsigned char *) icon,
+        .length = icon_length, .capacity = icon_length,
+        .limit = OFFLINE_LIBRARY_APP_ICON_LIMIT
+    };
+    if (!okay
+        || !offline_write_blob(library, id, ".app-html.tmp", html)
+        || !offline_write_blob(library, id, ".app-pack.tmp", pack)
+        || (icon_length != 0
+            && !offline_write_blob(library, id, ".app-icon.tmp", &icon_blob))) {
+        offline_error(error, error_size,
+                      "offline app exceeded storage or write bounds");
+        goto fail;
+    }
+    char temporary[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    char final[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    const char *pairs[][2] = {
+        {".app-html.tmp", ".app.html"}, {".app-pack.tmp", ".app.pack"},
+        {".app-icon.tmp", ".app.icon"}
+    };
+    for (size_t at = 0; at < (icon_length == 0 ? 2u : 3u); at++) {
+        if (!offline_library_item_path(library, id, pairs[at][0], temporary,
+                                       sizeof(temporary))
+            || !offline_library_item_path(library, id, pairs[at][1], final,
+                                           sizeof(final))) goto fail;
+        (void) remove(final);
+        if (rename(temporary, final) != 0) goto fail;
+    }
+    OfflineLibraryItem item = {
+        .id = id, .type = OFFLINE_ITEM_WEB_APP, .state = OFFLINE_ITEM_READY,
+        .content_bytes = html->length, .audio_bytes = pack->length,
+        .downloaded_bytes = html->length + pack->length + icon_length,
+        .saved_at_unix = offline_now_unix(),
+        .article_hash = offline_hash(html->data, html->length),
+        .auxiliary_hash = offline_hash(pack->data, pack->length),
+        .icon_hash = icon_length == 0 ? 0 : offline_hash(icon, icon_length),
+        .resource_count = (uint32_t) resource_count,
+        .icon_bytes = (uint32_t) icon_length,
+        .app_theme_color = manifest->theme_color,
+        .app_theme_alpha = manifest->theme_alpha,
+        .app_display_mode = (uint8_t) manifest->display_mode,
+        .app_theme_color_valid = manifest->theme_color_valid
+    };
+    const char *name = manifest->short_name[0] != '\0'
+        ? manifest->short_name : manifest->name;
+    snprintf(item.title, sizeof(item.title), "%s", name[0] == '\0'
+             ? (document->title == NULL ? "Offline app" : document->title)
+             : name);
+    snprintf(item.source_url, sizeof(item.source_url), "%s", source_url);
+    library->items[slot] = item;
+    if (!replacing) library->count++;
+    if (!offline_library_save(library)) {
+        if (replacing) library->items[slot] = previous;
+        else library->count--;
+        library->next_id = previous_next_id;
+        goto fail;
+    }
+    if (replacing) offline_remove_app_payloads(library, previous.id);
+    if (saved_id != NULL) *saved_id = id;
+    offline_app_snapshot_destroy(library, &snapshot);
+    return true;
+fail:
+    offline_remove_app_payloads(library, id);
+    if (library->next_id != previous_next_id
+        && (slot >= library->count || library->items[slot].id != id))
+        library->next_id = previous_next_id;
+    offline_app_snapshot_destroy(library, &snapshot);
+    return false;
+}
+
+static bool offline_read_file(const OfflineLibrary *library, Budget *budget,
+                              uint32_t id, const char *suffix, size_t size,
+                              uint32_t hash, unsigned char **output)
+{
+    if (size == 0 || size > SIZE_MAX - 1u || output == NULL) return false;
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    if (!offline_library_item_path(library, id, suffix, path, sizeof(path)))
+        return false;
+    unsigned char *data = budget_malloc_category(
+        budget, BUDGET_CATEGORY_SESSION, size + 1u);
+    FILE *file = data == NULL ? NULL : fopen(path, "rb");
+    bool okay = file != NULL && fread(data, 1, size, file) == size
+        && fgetc(file) == EOF && !ferror(file);
+    if (file != NULL && fclose(file) != 0) okay = false;
+    if (okay) okay = offline_hash(data, size) == hash;
+    if (!okay) {
+        budget_free(budget, data);
+        return false;
+    }
+    data[size] = 0;
+    *output = data;
+    return true;
+}
+
+static bool offline_pack_text(const unsigned char *data, size_t length,
+                              size_t *used, const char **text)
+{
+    uint32_t size = 0;
+    if (!get_u32(data, length, used, &size) || *used > length
+        || size > length - *used) return false;
+    *text = (const char *) data + *used;
+    *used += size;
+    return true;
+}
+
+bool offline_library_read_web_app(
+    const OfflineLibrary *library, Budget *budget, BrowserSession *session,
+    uint32_t id, char **html, size_t *length,
+    char *error, size_t error_size)
+{
+    if (html != NULL) *html = NULL;
+    if (length != NULL) *length = 0;
+    const OfflineLibraryItem *item = offline_library_find(library, id);
+    if (item == NULL || item->type != OFFLINE_ITEM_WEB_APP
+        || item->state != OFFLINE_ITEM_READY || budget == NULL
+        || session == NULL || html == NULL || length == NULL
+        || item->content_bytes > OFFLINE_LIBRARY_APP_DOCUMENT_LIMIT
+        || item->audio_bytes > OFFLINE_LIBRARY_APP_PACK_LIMIT) {
+        offline_error(error, error_size, "offline app is unavailable");
+        return false;
+    }
+    unsigned char *document = NULL, *pack = NULL;
+    if (!offline_read_file(library, budget, id, ".app.html",
+                           (size_t) item->content_bytes, item->article_hash,
+                           &document)
+        || !offline_read_file(library, budget, id, ".app.pack",
+                              (size_t) item->audio_bytes,
+                              item->auxiliary_hash, &pack)) goto fail;
+    static const unsigned char magic[8] = {'T','F','A','P','P','0','1',0};
+    size_t used = 0;
+    uint32_t version = 0, count = 0;
+    if (item->audio_bytes < sizeof(magic)
+        || memcmp(pack, magic, sizeof(magic)) != 0) goto fail;
+    used = sizeof(magic);
+    if (!get_u32(pack, (size_t) item->audio_bytes, &used, &version)
+        || !get_u32(pack, (size_t) item->audio_bytes, &used, &count)
+        || version != 1u || count != item->resource_count
+        || count > BROWSER_OFFLINE_CACHE_ENTRY_LIMIT) goto fail;
+    for (uint32_t at = 0; at < count; at++) {
+        uint32_t kind = 0, body_length = 0, fields[14] = {0};
+        const char *texts[4] = {0};
+        size_t starts[4] = {0}, sizes[4] = {0};
+        if (!get_u32(pack, (size_t) item->audio_bytes, &used, &kind)
+            || !get_u32(pack, (size_t) item->audio_bytes, &used, &body_length))
+            goto fail;
+        for (size_t field = 0; field < 4u; field++) {
+            starts[field] = used;
+            if (!offline_pack_text(pack, (size_t) item->audio_bytes,
+                                   &used, &texts[field])) goto fail;
+            sizes[field] = used - starts[field] - 4u;
+        }
+        for (size_t field = 0; field < 14u; field++)
+            if (!get_u32(pack, (size_t) item->audio_bytes, &used,
+                         &fields[field])) goto fail;
+        if (used > item->audio_bytes || body_length > item->audio_bytes - used
+            || kind > BROWSER_OFFLINE_CACHE_MODULE) goto fail;
+        char url[OFFLINE_LIBRARY_URL_LIMIT];
+        char content_type[128];
+        char response_url[OFFLINE_LIBRARY_URL_LIMIT];
+        char referrer_policy[BROWSER_REFERRER_POLICY_LIMIT];
+        char *strings[4] = {
+            url, content_type, response_url, referrer_policy
+        };
+        const size_t capacities[4] = {
+            sizeof(url), sizeof(content_type), sizeof(response_url),
+            sizeof(referrer_policy)
+        };
+        for (size_t field = 0; field < 4u; field++) {
+            if (sizes[field] >= capacities[field]) goto fail;
+            memcpy(strings[field], texts[field], sizes[field]);
+            strings[field][sizes[field]] = '\0';
+        }
+        BrowserOfflineCacheView view = {
+            .kind = (BrowserOfflineCacheKind) kind,
+            .url = strings[0], .content_type = strings[1],
+            .response_url = strings[2],
+            .response_referrer_policy = strings[3],
+            .data = pack + used, .length = body_length,
+            .resource_grant = {
+                .destination = (TilefinchRequestDestination) fields[0],
+                .mode = (TilefinchRequestMode) fields[1],
+                .credentials = (TilefinchCredentialsMode) fields[2],
+                .corp = (TilefinchCrossOriginResourcePolicy) fields[3],
+                .initiator_opaque = fields[4] != 0,
+                .final_same_origin = fields[5] != 0,
+                .final_same_site = fields[6] != 0,
+                .cors_validated = fields[7] != 0,
+                .nosniff = fields[8] != 0,
+                .mime_validated = fields[9] != 0
+            },
+            .module_credentials = (TilefinchCredentialsMode) fields[10],
+            .module_cors_validated = fields[11] != 0,
+            .module_redirect_origin_tainted = fields[12] != 0,
+            .module_javascript_mime_validated = fields[13] != 0
+        };
+        if (!browser_session_cache_restore_offline(
+                session, item->source_url, &view)) goto fail;
+        used += body_length;
+    }
+    if (used != item->audio_bytes) goto fail;
+    budget_free(budget, pack);
+    *html = (char *) document;
+    *length = (size_t) item->content_bytes;
+    return true;
+fail:
+    budget_free(budget, document);
+    budget_free(budget, pack);
+    offline_error(error, error_size, "offline app failed integrity checks");
+    return false;
+}
+
+bool offline_library_read_web_app_icon(
+    const OfflineLibrary *library, uint32_t id,
+    unsigned char output[OFFLINE_LIBRARY_APP_ICON_LIMIT])
+{
+    const OfflineLibraryItem *item = offline_library_find(library, id);
+    if (item == NULL || item->type != OFFLINE_ITEM_WEB_APP
+        || item->icon_bytes != OFFLINE_LIBRARY_APP_ICON_LIMIT
+        || output == NULL) return false;
+    char path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    if (!offline_library_item_path(
+            library, id, ".app.icon", path, sizeof(path))) return false;
+    FILE *file = fopen(path, "rb");
+    bool okay = file != NULL
+        && fread(output, 1, OFFLINE_LIBRARY_APP_ICON_LIMIT, file)
+               == OFFLINE_LIBRARY_APP_ICON_LIMIT
+        && fgetc(file) == EOF && !ferror(file);
+    if (file != NULL && fclose(file) != 0) okay = false;
+    return okay && offline_hash(output, OFFLINE_LIBRARY_APP_ICON_LIMIT)
+                       == item->icon_hash;
+}
+
 bool offline_library_enqueue_youtube(
     OfflineLibrary *library, const char *watch_url, const char *title,
     uint32_t *queued_id, char *error, size_t error_size)
@@ -1119,6 +1677,8 @@ bool offline_library_remove(OfflineLibrary *library, uint32_t id)
     budget_free(library->budget, previous);
     const char *suffixes[] = {
         ".article.html", ".article.bak", ".article.tmp",
+        ".app.html", ".app.pack", ".app.icon",
+        ".app-html.tmp", ".app-pack.tmp", ".app-icon.tmp",
         ".video.mp4", ".audio.mp4",
         ".video.part", ".audio.part"
     };
@@ -1216,7 +1776,7 @@ bool offline_library_build_page(
         "color:#202020}h1{font-size:22px}.item{background:white;border:1px solid #ccc;"
         "border-radius:8px;padding:10px;margin:9px 0}.meta{color:#666;font-size:13px}"
         "a{color:#0645ad;margin-right:14px}</style><h1>Saved offline</h1>"
-        "<p>Reader articles and YouTube downloads are stored on the Memory Stick.</p>");
+        "<p>Reader articles, offline web apps, and YouTube downloads are stored on the Memory Stick.</p>");
     if (okay && have_free_space)
         okay = html_append(
             &html, "<p class=meta>Free space: %llu.%llu MB</p>",
@@ -1261,7 +1821,8 @@ bool offline_library_build_page(
             && html_append(
                 &html, "</strong><div class=meta>%s &middot; %s",
                 item->type == OFFLINE_ITEM_ARTICLE ? "Reader article"
-                                                   : "YouTube video",
+                    : item->type == OFFLINE_ITEM_WEB_APP ? "Offline web app"
+                                                        : "YouTube video",
                 state);
         if (okay && total != 0)
             okay = html_append(
@@ -1285,7 +1846,9 @@ bool offline_library_build_page(
             okay = html_append(
                 &html, item->type == OFFLINE_ITEM_ARTICLE
                     ? "<a href=\"https://tilefinch.local/offline/article?id=%u\">Open</a>"
-                    : "<a href=\"https://tilefinch.local/offline/video?id=%u\">Play</a>",
+                    : item->type == OFFLINE_ITEM_WEB_APP
+                        ? "<a href=\"https://tilefinch.local/offline/app?id=%u\">Open</a>"
+                        : "<a href=\"https://tilefinch.local/offline/video?id=%u\">Play</a>",
                 (unsigned) item->id);
         if (okay && item->type == OFFLINE_ITEM_YOUTUBE
             && item->state != OFFLINE_ITEM_READY)

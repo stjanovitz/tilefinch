@@ -270,6 +270,12 @@ typedef struct {
     ImageResource *items;
     size_t count;
     size_t capacity;
+    struct {
+        lxb_dom_node_t *node;
+        uint16_t *values;
+        int width;
+        int height;
+    } canvas_depth[2];
     ExternalImageStats stats;
     bool priority_staged;
 } ImageResources;
@@ -598,6 +604,24 @@ ImageCanvasCommitResult images_commit_canvas_surface(
     const unsigned char *rgba_pixels, size_t rgba_length,
     int width, int height, int dirty_left, int dirty_top,
     int dirty_right, int dirty_bottom);
+/* Reserve the native canvas surface without a script-owned pixel copy.
+   WebGL renders into a bounded native backend and asks for this destination
+   only after the command list completes. The returned pointer remains owned
+   by ImageResources and is valid until resize or page teardown. */
+ImageCanvasCommitResult images_prepare_canvas_surface(
+    ImageResources *images, Budget *budget, lxb_dom_node_t *node,
+    int width, int height, unsigned char **rgba_pixels);
+/* Persistent depth is separate from the hot ImageResource entries and exists
+   only for the at-most-two bounded WebGL contexts. Values use the PSP GE's
+   reversed 16-bit depth representation (near is larger). */
+bool images_prepare_canvas_depth(ImageResources *images, Budget *budget,
+                                 lxb_dom_node_t *node, int width, int height,
+                                 uint16_t **depth_values);
+/* Deterministically retire one canvas's page-owned color/depth storage.
+   Used by WebGL context loss so a terminal context cannot retain one of the
+   two bounded depth slots until whole-page teardown. */
+bool images_release_canvas(ImageResources *images, Budget *budget,
+                           lxb_dom_node_t *node);
 bool image_resource_available(const ImageResource *image);
 const void *image_resource_backing_identity(const ImageResource *image);
 /* Distinguishes corrupt/unsupported data, which is safe to negative-cache,

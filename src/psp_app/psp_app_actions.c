@@ -210,8 +210,7 @@ static bool psp_history_open_internal(
         psp_ui_show_collections(&app->process->presentation.ui, collection);
         psp_collections_sync_ui(
             &app->process->presentation.ui, &app->process->presentation.collections_surface, profile,
-            &app->browser->offline_store.library,
-            &app->browser->offline_store.download, collection);
+            &app->browser->offline_store, collection);
     } else if (screenshots) {
         opened = psp_open_screenshot_list(
             engine, app->process->install_paths.data_dir, false);
@@ -986,14 +985,69 @@ static void psp_app_dispatch_heavy_action(
                 saved ? 180 : (cancelled ? 120 : 240));
             break;
         }
+        case PSP_UI_ACTION_INSTALL_OFFLINE_APP: {
+            psp_ui_show_status(&app->process->presentation.ui,
+                               "PREPARING APP PREVIEW - CIRCLE STOPS", 120);
+            psp_work_cooperate_begin(
+                &app->process->presentation.ui, engine_frame, true, true,
+                false, "STOPPING APP PREVIEW...", "offline-app-preview",
+                NULL, NULL);
+            bool prepared = psp_offline_store_prepare_current_app(
+                &app->browser->offline_store, engine);
+            bool cancelled = psp_navigation_cancel_requested();
+            uint32_t observed_buttons =
+                psp_ui_buttons(psp_navigation_observed_buttons());
+            psp_navigation_cooperate_end("offline-app-preview");
+            app->interactive->previous_buttons = observed_buttons;
+            if (prepared && !cancelled) {
+                psp_ui_show_offline_app_preview(
+                    &app->process->presentation.ui,
+                    psp_offline_store_app_preview(
+                        &app->browser->offline_store));
+            } else {
+                psp_offline_store_discard_app_preparation(
+                    &app->browser->offline_store);
+                psp_ui_show_status(
+                    &app->process->presentation.ui,
+                    cancelled ? "APP PREVIEW STOPPED"
+                              : psp_offline_store_status(
+                                    &app->browser->offline_store),
+                    cancelled ? 120 : 240);
+            }
+            break;
+        }
+        case PSP_UI_ACTION_CONFIRM_OFFLINE_APP: {
+            psp_ui_show_status(&app->process->presentation.ui,
+                               "INSTALLING OFFLINE APP - CIRCLE STOPS", 120);
+            psp_work_cooperate_begin(
+                &app->process->presentation.ui, engine_frame, true, true,
+                false, "STOPPING APP INSTALL...", "offline-app", NULL, NULL);
+            bool saved = psp_offline_store_install_current_app(
+                &app->browser->offline_store, engine);
+            bool cancelled = psp_navigation_cancel_requested();
+            uint32_t observed_buttons =
+                psp_ui_buttons(psp_navigation_observed_buttons());
+            psp_navigation_cooperate_end("offline-app");
+            app->interactive->previous_buttons = observed_buttons;
+            psp_ui_show_status(
+                &app->process->presentation.ui,
+                cancelled ? "APP INSTALL STOPPED"
+                          : psp_offline_store_status(
+                                &app->browser->offline_store),
+                saved ? 180 : (cancelled ? 120 : 240));
+            break;
+        }
+        case PSP_UI_ACTION_CANCEL_OFFLINE_APP:
+            psp_offline_store_discard_app_preparation(
+                &app->browser->offline_store);
+            break;
         case PSP_UI_ACTION_SHOW_SCREENSHOTS: {
             if (app->process->presentation.ui.screen
                     == PSP_UI_SCREEN_COLLECTIONS) {
                 psp_collections_sync_ui(
                     &app->process->presentation.ui,
                     &app->process->presentation.collections_surface,
-                    profile, &app->browser->offline_store.library,
-                    &app->browser->offline_store.download,
+                    profile, &app->browser->offline_store,
                     PSP_UI_COLLECTION_SCREENSHOTS);
                 break;
             }
@@ -1513,8 +1567,7 @@ recovery_reload: {
                         psp_ui_show_collections(&app->process->presentation.ui, legacy_section);
                     psp_collections_sync_ui(
                         &app->process->presentation.ui, &app->process->presentation.collections_surface, profile,
-                        &app->browser->offline_store.library,
-                        &app->browser->offline_store.download, legacy_section);
+                        &app->browser->offline_store, legacy_section);
                     (void) psp_engine_views_refresh(app->views, engine);
                     psp_tabs_sync_ui(&app->process->presentation.ui, tabs, &app->process->presentation.tab_view);
                 } else if (profile_page != PSP_PROFILE_PAGE_NONE) {
@@ -1672,8 +1725,7 @@ recovery_reload: {
                 psp_ui_show_collections(&app->process->presentation.ui, section);
             psp_collections_sync_ui(
                 &app->process->presentation.ui, &app->process->presentation.collections_surface, profile,
-                &app->browser->offline_store.library,
-                &app->browser->offline_store.download, section);
+                &app->browser->offline_store, section);
             break;
         }
         case PSP_UI_ACTION_COLLECTION_ACTIVATE: {
@@ -1738,8 +1790,7 @@ recovery_reload: {
                     psp_collections_sync_ui(
                         &app->process->presentation.ui,
                         &app->process->presentation.collections_surface,
-                        profile, &app->browser->offline_store.library,
-                        &app->browser->offline_store.download,
+                        profile, &app->browser->offline_store,
                         PSP_UI_COLLECTION_DOWNLOADS);
                     psp_ui_show_status(
                         &app->process->presentation.ui,
@@ -1755,7 +1806,10 @@ recovery_reload: {
                     "https://tilefinch.local/offline/%s?id=%u",
                     selected_item != NULL
                             && selected_item->type == OFFLINE_ITEM_YOUTUBE
-                        ? "video" : "article",
+                        ? "video"
+                        : selected_item != NULL
+                              && selected_item->type == OFFLINE_ITEM_WEB_APP
+                            ? "app" : "article",
                     (unsigned) selected_id);
                 psp_text_input_before_navigation(&app->process->text_input);
                 psp_ui_leave_native_surface(&app->process->presentation.ui);
@@ -1821,8 +1875,15 @@ recovery_reload: {
             PspUiCollectionSection section =
                 (PspUiCollectionSection) app->process->presentation.ui.collections_section;
             bool removed = false;
+            bool uninstalling = false;
             if (section == PSP_UI_COLLECTION_SAVED
                 || section == PSP_UI_COLLECTION_DOWNLOADS) {
+                const OfflineLibraryItem *selected = offline_library_find(
+                    &app->browser->offline_store.library,
+                    app->process->presentation.collections_surface.id[
+                        intent->list_index]);
+                uninstalling = selected != NULL
+                    && selected->type == OFFLINE_ITEM_WEB_APP;
                 removed = offline_library_remove(
                     &app->browser->offline_store.library,
                     app->process->presentation.collections_surface.id[intent->list_index]);
@@ -1842,10 +1903,14 @@ recovery_reload: {
             }
             psp_collections_sync_ui(
                 &app->process->presentation.ui, &app->process->presentation.collections_surface, profile,
-                &app->browser->offline_store.library,
-                &app->browser->offline_store.download, section);
+                &app->browser->offline_store, section);
             psp_ui_show_status(
-                &app->process->presentation.ui, removed ? "DELETED" : "COULD NOT DELETE", 150);
+                &app->process->presentation.ui,
+                removed ? (uninstalling ? "OFFLINE APP UNINSTALLED"
+                                         : "DELETED")
+                        : (uninstalling ? "APP COULD NOT BE UNINSTALLED"
+                                        : "COULD NOT DELETE"),
+                150);
             break;
         }
         case PSP_UI_ACTION_SCREENSHOT: {

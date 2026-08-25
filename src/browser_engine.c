@@ -3628,6 +3628,10 @@ bool browser_engine_consume_media_request(
         || engine->navigation.page.runtime == NULL
         || !script_runtime_consume_media_request(
                engine->navigation.page.runtime, request)) return false;
+    /* Native page media owns the scarce PSP audio hardware. Keep decoded
+       game sounds resident but suspend their channel until the page
+       explicitly resumes its AudioContext after returning. */
+    script_runtime_suspend_game_audio(engine->navigation.page.runtime);
     bool allowed = request->source[0] != '\0'
         && tilefinch_csp_allows_request(
             &engine->navigation.page.document.content_security_policy,
@@ -3676,6 +3680,60 @@ bool browser_engine_advance_runtime(BrowserEngine *engine,
     }
     if (advanced) clear_error(engine);
     return advanced;
+}
+
+bool browser_engine_page_gamepad_available(const BrowserEngine *engine)
+{
+    return browser_engine_input_ready(engine)
+        && engine->navigation.page.loaded
+        && engine->navigation.page.runtime != NULL;
+}
+
+bool browser_engine_set_gamepad_state(
+    BrowserEngine *engine, const TilefinchGamepadState *state)
+{
+    /* A pending transactional navigation makes ordinary page input not-ready,
+       but its incumbent runtime is still live and may be restored on failure.
+       Deliver the disconnect to that realm instead of leaving a connected
+       Gamepad object behind after browser input authority has returned. */
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && navigation_set_gamepad_state(&engine->navigation, state);
+}
+
+bool browser_engine_set_page_visibility(BrowserEngine *engine, bool visible)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || !engine->navigation.page.loaded)
+        return false;
+    ScriptRuntime *runtime = engine->navigation.page.runtime;
+    return runtime == NULL
+        || script_runtime_set_page_visibility(runtime, visible);
+}
+
+bool browser_engine_page_fullscreen_active(BrowserEngine *engine)
+{
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && engine->navigation_ready && engine->navigation.page.loaded
+        && script_runtime_page_fullscreen_active(
+               engine->navigation.page.runtime);
+}
+
+bool browser_engine_exit_page_fullscreen(BrowserEngine *engine)
+{
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && engine->navigation_ready && engine->navigation.page.loaded
+        && script_runtime_exit_page_fullscreen(
+               engine->navigation.page.runtime);
+}
+
+void browser_engine_suspend_page_presentations(BrowserEngine *engine)
+{
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || !engine->navigation.page.loaded)
+        return;
+    ScriptRuntime *runtime = engine->navigation.page.runtime;
+    script_runtime_suspend_game_audio(runtime);
+    (void) script_runtime_exit_page_fullscreen(runtime);
 }
 
 bool browser_engine_execute_action(BrowserEngine *engine,
@@ -3953,6 +4011,18 @@ void browser_engine_cancel_render_job(BrowserEngine *engine)
 {
     if (engine == NULL || !engine->render_ready) return;
     tile_cache_cancel_frame_work(&engine->render);
+}
+
+bool browser_engine_render_frame_pending(const BrowserEngine *engine)
+{
+    return engine != NULL && tile_cache_frame_work_pending(&engine->render);
+}
+
+bool browser_engine_canvas_frame_pending(const BrowserEngine *engine)
+{
+    return engine != NULL
+        && (engine->navigation.canvas_paint_damage_pending
+            || tile_cache_canvas_frame_work_pending(&engine->render));
 }
 
 bool browser_engine_run_idle_work(

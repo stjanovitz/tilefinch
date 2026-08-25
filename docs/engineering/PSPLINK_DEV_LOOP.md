@@ -62,8 +62,11 @@ PSPDEV=/path/to/pspdev scripts/psplink-device.sh memory
 ```
 
 The wrapper builds only `psp-browser-script-dev-prx`, bounds PSPLink commands
-so a disconnected device cannot hang the shell, unloads a stale browser
-module, and starts the fresh PRX. The equivalent manual commands remain:
+so a disconnected device cannot hang the shell, and starts the fresh PRX.
+Exit a running Tilefinch instance normally with HOME first. The wrapper
+deliberately refuses to force-stop it: PSPLink can remove a live module before
+its browser, transport, or codec threads have unwound, leaving too little
+clean user memory for the next load. The equivalent manual commands remain:
 
 ```sh
 cmake --build build-preset-psp-validation --target psp-browser-script-dev-prx -j8

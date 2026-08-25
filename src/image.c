@@ -627,12 +627,11 @@ static void image_canvas_copy_rect(unsigned char *destination,
     }
 }
 
-ImageCanvasCommitResult images_commit_canvas_surface(
+ImageCanvasCommitResult images_prepare_canvas_surface(
     ImageResources *images, Budget *budget, lxb_dom_node_t *node,
-    const unsigned char *rgba_pixels, size_t rgba_length,
-    int width, int height, int dirty_left, int dirty_top,
-    int dirty_right, int dirty_bottom)
+    int width, int height, unsigned char **rgba_pixels)
 {
+    if (rgba_pixels != NULL) *rgba_pixels = NULL;
     if (images == NULL || budget == NULL || node == NULL
         || rgba_pixels == NULL || width <= 0 || height <= 0
         || (size_t) width > SIZE_MAX / (size_t) height
@@ -641,15 +640,7 @@ ImageCanvasCommitResult images_commit_canvas_surface(
         return IMAGE_CANVAS_COMMIT_REFUSED;
     }
     size_t surface_bytes = (size_t) width * (size_t) height * 4u;
-    if (surface_bytes > IMAGE_CANVAS_SINGLE_BYTES_LIMIT
-        || rgba_length < surface_bytes) {
-        return IMAGE_CANVAS_COMMIT_REFUSED;
-    }
-    if (dirty_left < 0) dirty_left = 0;
-    if (dirty_top < 0) dirty_top = 0;
-    if (dirty_right > width) dirty_right = width;
-    if (dirty_bottom > height) dirty_bottom = height;
-    if (dirty_right <= dirty_left || dirty_bottom <= dirty_top) {
+    if (surface_bytes > IMAGE_CANVAS_SINGLE_BYTES_LIMIT) {
         return IMAGE_CANVAS_COMMIT_REFUSED;
     }
 
@@ -667,9 +658,7 @@ ImageCanvasCommitResult images_commit_canvas_surface(
     }
     if (existing != NULL && existing->pixels != NULL
         && existing->width == width && existing->height == height) {
-        image_canvas_copy_rect(existing->pixels, rgba_pixels, width,
-                               dirty_left, dirty_top,
-                               dirty_right, dirty_bottom);
+        *rgba_pixels = existing->pixels;
         return IMAGE_CANVAS_COMMIT_UPDATED;
     }
 
@@ -689,12 +678,15 @@ ImageCanvasCommitResult images_commit_canvas_surface(
         || surface_bytes > IMAGE_CANVAS_BYTES_LIMIT - retained_bytes) {
         return IMAGE_CANVAS_COMMIT_REFUSED;
     }
+    /* image_add() grows the resource table through its owning Budget. A
+       canvas can be the first page image, so bind that owner before the first
+       table growth rather than only after the pixel allocation succeeds. */
+    images->budget = budget;
     unsigned char *copy = budget_malloc_category(
         budget, BUDGET_CATEGORY_RESOURCE, surface_bytes);
     if (copy == NULL) return IMAGE_CANVAS_COMMIT_REFUSED;
-    memcpy(copy, rgba_pixels, surface_bytes);
+    memset(copy, 0, surface_bytes);
 
-    images->budget = budget;
     if (existing == NULL) {
         size_t before = images->count;
         if (!image_add(images, (ImageResource) {
@@ -714,6 +706,7 @@ ImageCanvasCommitResult images_commit_canvas_surface(
         images->stats.attempted++;
         images->stats.loaded++;
         images->stats.decoded_bytes += surface_bytes;
+        *rgba_pixels = copy;
         return IMAGE_CANVAS_COMMIT_CREATED;
     }
 
@@ -732,7 +725,114 @@ ImageCanvasCommitResult images_commit_canvas_surface(
         images->stats.decoded_bytes = 0;
     }
     images->stats.decoded_bytes += surface_bytes;
+    *rgba_pixels = copy;
     return IMAGE_CANVAS_COMMIT_RESIZED;
+}
+
+bool images_prepare_canvas_depth(ImageResources *images, Budget *budget,
+                                 lxb_dom_node_t *node, int width, int height,
+                                 uint16_t **depth_values)
+{
+    if (depth_values != NULL) *depth_values = NULL;
+    if (images == NULL || budget == NULL || node == NULL
+        || depth_values == NULL || width <= 0 || height <= 0
+        || (size_t) width > SIZE_MAX / (size_t) height
+        || (size_t) width * (size_t) height > SIZE_MAX / sizeof(uint16_t)
+        || (images->budget != NULL && images->budget != budget)) return false;
+    size_t bytes = (size_t) width * (size_t) height * sizeof(uint16_t);
+    size_t selected = 2u;
+    for (size_t i = 0; i < 2u; i++) {
+        if (images->canvas_depth[i].node == node) {
+            selected = i;
+            break;
+        }
+        if (selected == 2u && images->canvas_depth[i].node == NULL)
+            selected = i;
+    }
+    if (selected == 2u) return false;
+    if (images->canvas_depth[selected].values != NULL
+        && images->canvas_depth[selected].width == width
+        && images->canvas_depth[selected].height == height) {
+        *depth_values = images->canvas_depth[selected].values;
+        return true;
+    }
+    uint16_t *replacement = budget_malloc_category(
+        budget, BUDGET_CATEGORY_RENDER, bytes);
+    if (replacement == NULL) return false;
+    memset(replacement, 0, bytes);
+    budget_free(budget, images->canvas_depth[selected].values);
+    images->canvas_depth[selected].node = node;
+    images->canvas_depth[selected].values = replacement;
+    images->canvas_depth[selected].width = width;
+    images->canvas_depth[selected].height = height;
+    images->budget = budget;
+    *depth_values = replacement;
+    return true;
+}
+
+bool images_release_canvas(ImageResources *images, Budget *budget,
+                           lxb_dom_node_t *node)
+{
+    if (images == NULL || budget == NULL || node == NULL
+        || (images->budget != NULL && images->budget != budget)) return false;
+    for (size_t i = 0; i < images->count; ) {
+        ImageResource *resource = &images->items[i];
+        if (resource->node != node || !resource->is_canvas) {
+            i++;
+            continue;
+        }
+        size_t bytes = resource->width > 0 && resource->height > 0
+            ? (size_t) resource->width * (size_t) resource->height * 4u : 0u;
+        image_resource_release_owned_pixels(budget, resource);
+        if (bytes <= images->stats.decoded_bytes)
+            images->stats.decoded_bytes -= bytes;
+        else images->stats.decoded_bytes = 0;
+        images->count--;
+        if (i != images->count) {
+            memmove(&images->items[i], &images->items[i + 1u],
+                    (images->count - i) * sizeof(images->items[0]));
+        }
+        memset(&images->items[images->count], 0, sizeof(images->items[0]));
+    }
+    for (size_t i = 0; i < 2u; i++) {
+        if (images->canvas_depth[i].node != node) continue;
+        budget_free(budget, images->canvas_depth[i].values);
+        memset(&images->canvas_depth[i], 0,
+               sizeof(images->canvas_depth[i]));
+    }
+    return true;
+}
+
+ImageCanvasCommitResult images_commit_canvas_surface(
+    ImageResources *images, Budget *budget, lxb_dom_node_t *node,
+    const unsigned char *rgba_pixels, size_t rgba_length,
+    int width, int height, int dirty_left, int dirty_top,
+    int dirty_right, int dirty_bottom)
+{
+    if (rgba_pixels == NULL || width <= 0 || height <= 0
+        || (size_t) width > SIZE_MAX / (size_t) height
+        || (size_t) width * (size_t) height > SIZE_MAX / 4u) {
+        return IMAGE_CANVAS_COMMIT_REFUSED;
+    }
+    size_t surface_bytes = (size_t) width * (size_t) height * 4u;
+    if (rgba_length < surface_bytes) return IMAGE_CANVAS_COMMIT_REFUSED;
+    if (dirty_left < 0) dirty_left = 0;
+    if (dirty_top < 0) dirty_top = 0;
+    if (dirty_right > width) dirty_right = width;
+    if (dirty_bottom > height) dirty_bottom = height;
+    if (dirty_right <= dirty_left || dirty_bottom <= dirty_top) {
+        return IMAGE_CANVAS_COMMIT_REFUSED;
+    }
+    unsigned char *destination = NULL;
+    ImageCanvasCommitResult prepared = images_prepare_canvas_surface(
+        images, budget, node, width, height, &destination);
+    if (prepared == IMAGE_CANVAS_COMMIT_REFUSED || destination == NULL) {
+        return IMAGE_CANVAS_COMMIT_REFUSED;
+    }
+    image_canvas_copy_rect(destination, rgba_pixels, width,
+                           dirty_left, dirty_top,
+                           dirty_right, dirty_bottom);
+    return prepared;
 }
 
 bool images_adopt_decoded_surface(ImageResources *images, Budget *budget,
@@ -4790,6 +4890,8 @@ void images_destroy(ImageResources *images)
                 }
             }
         }
+        for (size_t i = 0; i < 2u; i++)
+            budget_free(images->budget, images->canvas_depth[i].values);
         budget_free(images->budget, images->items);
     }
     memset(images, 0, sizeof(*images));

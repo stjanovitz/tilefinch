@@ -19,12 +19,14 @@ MP4/M4A or HLS source, applies
 `media-src`, mixed-content, private-network, CORS, cookie, redirect, and content-
 blocking policy, and launches the native player. MP4 uses a one-byte Range
 probe before the progressive demux; page audio selects its AAC track and the
-existing audio-only backend without allocating a video surface. HLS uses
-bounded master/media playlists, two shared request slots, and the MPEG-TS
-packet source. Rolling live HLS periodically replaces its playlist window and
-keeps a continuous local timestamp origin; it exposes Play/Pause and Close but
-not seek. All routes then use the same clock and state transitions. No
-page-media bytes are written to the Memory Stick.
+existing audio-only backend without allocating a video surface. HLS parses
+large rolling playlists incrementally, retains only a bounded live-edge
+window, and uses at most one video and one audio MPEG-TS sample source.
+Baseline/Main plus AAC-LC routes through the PSP firmware backend; High routes
+through the optional decoder. Rolling live HLS periodically replaces its
+playlist window and keeps a continuous local timestamp origin; it exposes
+Play/Pause and Close but not seek. All routes then use the same clock and state
+transitions. No page-media bytes are written to the Memory Stick.
 
 ## Resource invariants
 
@@ -56,6 +58,23 @@ reducing later page and search capacity from six descriptors to four.
 No resource-bearing state transitions directly to `Failed` or `Suspended`.
 It first enters `Quiescing`, even when an early open failed before allocation;
 the service then completes its irrelevant phases immediately.
+
+## Language and track changes
+
+The profile's preferred video language is sampled into each YouTube resolver
+service token, including speculative pre-resolution, so a cached resolution
+cannot be adopted after the preference changes. Resolution retains bounded
+six-entry audio and subtitle catalogs. A native-player audio selection records
+the exact track id and enters the existing retry/reopen path at the current
+position; it is not a second decoder-control authority.
+
+Subtitles are optional presentation data rather than a media-machine state.
+They default off. After an explicit selection and only once A/V is ready, the
+session fetches one bounded credential-free WebVTT document outside the two
+media-reserved transport slots. Parsing creates one capped cue table charged to
+the session budget. Seek uses the same clock lookup, and close/reopen cancels
+the request and releases every cue. Fetch, parse, or unsupported-track failure
+never changes playback state.
 
 ## Control graph
 

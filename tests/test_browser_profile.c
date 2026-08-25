@@ -141,12 +141,31 @@ int main(void)
                  == BROWSER_YOUTUBE_QUALITY_360P
           && !browser_profile_youtube_compact_results(profile)
           && !browser_profile_youtube_audio_only(profile)
+          && browser_profile_video_language(profile)
+                 == BROWSER_VIDEO_LANGUAGE_SYSTEM
+          && browser_profile_subtitle_language(profile)
+                 == BROWSER_SUBTITLE_LANGUAGE_SYSTEM
+          && browser_profile_alternate_language(profile)
+                 == BROWSER_ALTERNATE_LANGUAGE_NONE
+          && strcmp(browser_subtitle_language_tag(
+                        BROWSER_SUBTITLE_LANGUAGE_SYSTEM, NULL, NULL),
+                    "en") == 0
+          && browser_subtitle_language_tag(
+                 BROWSER_SUBTITLE_LANGUAGE_SAME_AS_AUDIO,
+                 "ja-JP", NULL) == NULL
+          && browser_alternate_language_tag(
+                 BROWSER_ALTERNATE_LANGUAGE_NONE) == NULL
+          && strcmp(browser_video_language_tag(
+                        browser_profile_video_language(profile), "ja-JP"),
+                    "ja-JP") == 0
           && browser_profile_video_scaling(profile)
                  == BROWSER_VIDEO_SCALING_SMOOTH
           && browser_profile_video_startup_buffering(profile)
           && !browser_profile_resume_offline_downloads(profile)
           && browser_profile_text_entry_mode(profile)
                  == BROWSER_TEXT_ENTRY_OSK
+          && browser_profile_gamepad_face_mapping(profile)
+                 == TILEFINCH_GAMEPAD_FACE_X_PRIMARY
           && browser_profile_content_blocker_mode(profile)
                  == CONTENT_BLOCKER_BASIC
           && browser_profile_content_blocker_cosmetic_hiding(profile)
@@ -209,11 +228,27 @@ int main(void)
         profile, BROWSER_YOUTUBE_QUALITY_240P);
     browser_profile_set_youtube_compact_results(profile, true);
     browser_profile_set_youtube_audio_only(profile, true);
+    browser_profile_set_video_language(
+        profile, BROWSER_VIDEO_LANGUAGE_SPANISH);
+    browser_profile_set_subtitle_language(
+        profile, BROWSER_SUBTITLE_LANGUAGE_SAME_AS_AUDIO);
+    browser_profile_set_alternate_language(
+        profile, BROWSER_ALTERNATE_LANGUAGE_FRENCH);
+    browser_profile_set_subtitle_language(
+        profile, (BrowserSubtitleLanguage) 99);
+    browser_profile_set_alternate_language(
+        profile, (BrowserAlternateLanguage) 99);
+    CHECK(browser_profile_subtitle_language(profile)
+              == BROWSER_SUBTITLE_LANGUAGE_SAME_AS_AUDIO
+          && browser_profile_alternate_language(profile)
+              == BROWSER_ALTERNATE_LANGUAGE_FRENCH);
     browser_profile_set_video_scaling(profile, BROWSER_VIDEO_SCALING_SHARP);
     browser_profile_set_video_startup_buffering(profile, false);
     browser_profile_set_resume_offline_downloads(profile, true);
     browser_profile_set_text_entry_mode(
         profile, BROWSER_TEXT_ENTRY_DANZEFF);
+    browser_profile_set_gamepad_face_mapping(
+        profile, TILEFINCH_GAMEPAD_FACE_O_PRIMARY);
     browser_profile_set_content_blocker_mode(
         profile, CONTENT_BLOCKER_CUSTOM);
     browser_profile_set_content_blocker_cosmetic_hiding(profile, false);
@@ -416,12 +451,23 @@ int main(void)
                  == BROWSER_YOUTUBE_QUALITY_240P
           && browser_profile_youtube_compact_results(loaded)
           && browser_profile_youtube_audio_only(loaded)
+          && browser_profile_video_language(loaded)
+                 == BROWSER_VIDEO_LANGUAGE_SPANISH
+          && browser_profile_subtitle_language(loaded)
+                 == BROWSER_SUBTITLE_LANGUAGE_SAME_AS_AUDIO
+          && browser_profile_alternate_language(loaded)
+                 == BROWSER_ALTERNATE_LANGUAGE_FRENCH
+          && strcmp(browser_video_language_tag(
+                        browser_profile_video_language(loaded), NULL),
+                    "es") == 0
           && browser_profile_video_scaling(loaded)
                  == BROWSER_VIDEO_SCALING_SHARP
           && !browser_profile_video_startup_buffering(loaded)
           && browser_profile_resume_offline_downloads(loaded)
           && browser_profile_text_entry_mode(loaded)
                  == BROWSER_TEXT_ENTRY_DANZEFF
+          && browser_profile_gamepad_face_mapping(loaded)
+                 == TILEFINCH_GAMEPAD_FACE_O_PRIMARY
           && browser_profile_content_blocker_mode(loaded)
                  == CONTENT_BLOCKER_CUSTOM
           && !browser_profile_content_blocker_cosmetic_hiding(loaded)
@@ -530,6 +576,12 @@ int main(void)
                  == BROWSER_YOUTUBE_QUALITY_360P
           && !browser_profile_youtube_compact_results(legacy_loaded)
           && !browser_profile_youtube_audio_only(legacy_loaded)
+          && browser_profile_video_language(legacy_loaded)
+                 == BROWSER_VIDEO_LANGUAGE_SYSTEM
+          && browser_profile_subtitle_language(legacy_loaded)
+                 == BROWSER_SUBTITLE_LANGUAGE_SYSTEM
+          && browser_profile_alternate_language(legacy_loaded)
+                 == BROWSER_ALTERNATE_LANGUAGE_NONE
           && browser_profile_video_scaling(legacy_loaded)
                  == BROWSER_VIDEO_SCALING_SMOOTH
           && browser_profile_video_startup_buffering(legacy_loaded)
@@ -600,6 +652,7 @@ int main(void)
         "UI\t2\t125\t1\t2\t1\t1\t0\t2\t1\t1\t77\tfuture\n"
         "DATA\t4\t1\t1024\tfuture\n"
         "BLOCK\t0\n"
+        "VIDLANG\t99\t99\t1\n"
         "UPDCHK\t0\t123\t7\tfuture\n"
         "FUTURE\tignored\twithout\tshifting\n",
         forward) >= 0);
@@ -624,6 +677,12 @@ int main(void)
           && browser_profile_persistent_cache_mb(forward_loaded) == 4
           && browser_profile_live_cache_kib(forward_loaded) == 1024
           && browser_profile_persist_local_storage(forward_loaded));
+    CHECK(browser_profile_video_language(forward_loaded)
+              == BROWSER_VIDEO_LANGUAGE_SYSTEM
+          && browser_profile_subtitle_language(forward_loaded)
+              == BROWSER_SUBTITLE_LANGUAGE_SYSTEM
+          && browser_profile_alternate_language(forward_loaded)
+              == BROWSER_ALTERNATE_LANGUAGE_NONE);
     CHECK(browser_profile_text_entry_mode(forward_loaded)
               == BROWSER_TEXT_ENTRY_OSK
           && browser_profile_content_blocker_mode(forward_loaded)

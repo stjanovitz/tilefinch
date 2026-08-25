@@ -1802,6 +1802,29 @@ const char *document_attribute(lxb_dom_node_t *node, const char *name,
         strlen(name), length);
 }
 
+const char *document_web_app_manifest_href(
+    const PocDocument *document, size_t *length)
+{
+    if (length != NULL) *length = 0;
+    if (document == NULL || document->html == NULL) return NULL;
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 4096u; visited++) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && document_name_is(node, "link")
+            && document_attribute_has_token(node, "rel", "manifest")) {
+            size_t href_length = 0;
+            const char *href = document_attribute(node, "href", &href_length);
+            if (href != NULL && href_length != 0) {
+                if (length != NULL) *length = href_length;
+                return href;
+            }
+        }
+        node = document_bounded_next(node, root, false);
+    }
+    return NULL;
+}
+
 const char *document_control_value(lxb_dom_node_t *node, size_t *length)
 {
     if (length != NULL) *length = 0;

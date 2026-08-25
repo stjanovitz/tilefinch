@@ -63,6 +63,8 @@ static bool menu_handle_escape(
             intent->action = PSP_UI_ACTION_CLOSE_DIAGNOSTIC_QR;
         else if (ui->screen == PSP_UI_SCREEN_FAILURE_RECOVERY)
             intent->action = PSP_UI_ACTION_RECOVERY_RETURN;
+        else if (ui->screen == PSP_UI_SCREEN_OFFLINE_APP_PREVIEW)
+            intent->action = PSP_UI_ACTION_CANCEL_OFFLINE_APP;
         else if (ui->screen == PSP_UI_SCREEN_UPDATE_VERSIONS)
             intent->update_versions_closed = true;
         else if (ui->screen == PSP_UI_SCREEN_FIND) {
@@ -71,7 +73,8 @@ static bool menu_handle_escape(
         }
         if (ui->screen == PSP_UI_SCREEN_PAGE_TOOLS
             || ui->screen == PSP_UI_SCREEN_SITE_CONTROLS
-            || ui->screen == PSP_UI_SCREEN_PAGE_INFORMATION)
+            || ui->screen == PSP_UI_SCREEN_PAGE_INFORMATION
+            || ui->screen == PSP_UI_SCREEN_OFFLINE_APP_PREVIEW)
             ui->menu_selection = UI_MENU_ROW_PAGE_TOOLS;
         else if (ui->screen == PSP_UI_SCREEN_HELP
                  || ui->screen == PSP_UI_SCREEN_HELP_DETAIL
@@ -87,10 +90,29 @@ static bool menu_handle_escape(
             ui->menu_selection = UI_MENU_ROW_SETTINGS;
         else if (ui->screen == PSP_UI_SCREEN_TABS)
             ui->menu_selection = UI_MENU_ROW_TABS;
+        if (ui->screen == PSP_UI_SCREEN_OFFLINE_APP_PREVIEW)
+            ui->offline_app_preview = NULL;
         menu_close(ui);
     }
     intent->visual_changed = true;
     return true;
+}
+
+static void menu_update_offline_app_preview(
+    PspUiState *ui, uint32_t pressed, PspUiIntent *intent)
+{
+    if (pressed & PSP_UI_BUTTON_CONFIRM) {
+        intent->action = PSP_UI_ACTION_CONFIRM_OFFLINE_APP;
+        menu_close(ui);
+        ui->offline_app_preview = NULL;
+        intent->visual_changed = true;
+    } else if (pressed & PSP_UI_BUTTON_CANCEL) {
+        intent->action = PSP_UI_ACTION_CANCEL_OFFLINE_APP;
+        ui->offline_app_preview = NULL;
+        ui->menu_selection = 6u;
+        menu_open_parent(ui, PSP_UI_SCREEN_PAGE_TOOLS);
+        intent->visual_changed = true;
+    }
 }
 
 static void menu_update_site_controls(
@@ -291,6 +313,7 @@ static void menu_update_page_tools(
                 menu_open_child(ui, PSP_UI_SCREEN_PAGE_INFORMATION);
                 intent->visual_changed = true;
                 return;
+            case 6: intent->action = PSP_UI_ACTION_INSTALL_OFFLINE_APP; break;
         }
         ui->menu_selection = UI_MENU_ROW_PAGE_TOOLS;
         menu_close(ui);
@@ -468,6 +491,9 @@ bool psp_ui_menu_update(
     if (ui == NULL || intent == NULL) return false;
     if (menu_handle_escape(ui, pressed, intent)) return true;
     switch (ui->screen) {
+        case PSP_UI_SCREEN_OFFLINE_APP_PREVIEW:
+            menu_update_offline_app_preview(ui, pressed, intent);
+            return true;
         case PSP_UI_SCREEN_PAGE_INFORMATION:
             menu_update_page_information(ui, pressed, intent);
             return true;

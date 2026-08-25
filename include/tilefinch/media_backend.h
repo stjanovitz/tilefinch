@@ -1007,6 +1007,13 @@ bool media_psp_backend_create_split(
     Budget *budget, const MediaMp4Demux *video_demux,
     const MediaMp4Demux *audio_demux,
     MediaBackend *backend, char *error, size_t error_size);
+/* Generic sample-source form used by bounded streaming containers. Track
+   metadata is snapshotted at construction; samples continue through the
+   existing MediaPlayback scheduler and backend submit contract. */
+bool media_psp_backend_create_sources(
+    Budget *budget, const MediaSampleSource *video_source,
+    const MediaSampleSource *audio_source,
+    MediaBackend *backend, char *error, size_t error_size);
 /* Optional 240p software H.264 backend. The caller owns the loaded component
    and must keep its API table alive until backend destruction. */
 bool media_psp_swdec_backend_create_split(

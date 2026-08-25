@@ -1896,6 +1896,11 @@ typedef struct {
     bool selector_cooperate_cancelled;
     int viewport_width;
     int viewport_height;
+    /* Borrowed active element for the page Fullscreen API. The runtime owns
+       the DOM handle and clears this pointer before that handle can retire;
+       style matching uses it for :fullscreen without exposing a spoofable
+       data attribute to author code. */
+    lxb_dom_node_t *fullscreen_node;
     unsigned current_origin;
     unsigned next_order;
     size_t cascade_starts[4];

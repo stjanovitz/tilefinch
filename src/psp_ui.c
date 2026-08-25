@@ -28,9 +28,9 @@ _Static_assert(TILEFINCH_GLYPH_PACK_COUNT
 #define UI_TOAST_DEFAULT_FRAMES 180u
 #define UI_MEDIA_CONTROLS_MS 3000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 40u
+#define UI_OPTIONS_ITEM_COUNT 42u
 #else
-#define UI_OPTIONS_ITEM_COUNT 38u
+#define UI_OPTIONS_ITEM_COUNT 40u
 #endif
 #define UI_DATA_OPTIONS_ITEM_COUNT 7u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -178,8 +178,17 @@ typedef enum {
     UI_OPTION_UPDATE_CHECK,
     UI_OPTION_UPDATE,
     UI_OPTION_SITE_DATA,
-    UI_OPTION_READER_AUTO_MODE
+    UI_OPTION_READER_AUTO_MODE,
+    UI_OPTION_VIDEO_LANGUAGE,
+    UI_OPTION_GAMEPAD_FACE_MAPPING
 } UiOptionId;
+
+_Static_assert(BROWSER_VIDEO_LANGUAGE_COUNT <= 16,
+               "video language no longer fits PspUiState");
+_Static_assert(BROWSER_SUBTITLE_LANGUAGE_COUNT <= 16,
+               "subtitle language no longer fits PspUiState");
+_Static_assert(BROWSER_ALTERNATE_LANGUAGE_COUNT <= 16,
+               "alternate language no longer fits PspUiState");
 
 static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_BROWSER_UI_SCALE,
@@ -224,9 +233,11 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_UPDATE,
     UI_OPTION_SITE_DATA,
     /* Appended so existing option indices remain stable for input scripts
-       and deterministic previews. Group navigation still presents it under
-       Appearance. */
-    UI_OPTION_READER_AUTO_MODE
+       and deterministic previews. Group navigation still presents each row
+       under its declared category. */
+    UI_OPTION_READER_AUTO_MODE,
+    UI_OPTION_VIDEO_LANGUAGE,
+    UI_OPTION_GAMEPAD_FACE_MAPPING
 };
 
 static UiOptionId ui_option_id(size_t selection)
@@ -256,11 +267,13 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_TAB_HIBERNATION:
         case UI_OPTION_TEXT_ENTRY:
         case UI_OPTION_ANALOG_CURSOR:
+        case UI_OPTION_GAMEPAD_FACE_MAPPING:
         case UI_OPTION_JAVASCRIPT:
         case UI_OPTION_SEARCH_ENGINE:
             return "BROWSING & INPUT";
         case UI_OPTION_VIDEO_SCALING:
         case UI_OPTION_YOUTUBE_QUALITY:
+        case UI_OPTION_VIDEO_LANGUAGE:
         case UI_OPTION_YOUTUBE_AUDIO_ONLY:
         case UI_OPTION_YOUTUBE_RESULTS:
         case UI_OPTION_VIDEO_STARTUP_BUFFERING:
@@ -379,6 +392,8 @@ static const char *ui_option_description(UiOptionId option)
             return "Danzeff uses analog groups and face buttons";
         case UI_OPTION_ANALOG_CURSOR:
             return "Move a pointer with the analog stick";
+        case UI_OPTION_GAMEPAD_FACE_MAPPING:
+            return "Primary face button while Page controls are on";
         case UI_OPTION_JAVASCRIPT:
             return "Run scripts on pages across all sites";
         case UI_OPTION_SITE_JAVASCRIPT:
@@ -395,6 +410,8 @@ static const char *ui_option_description(UiOptionId option)
             return "Optional signed packs; embedded fallback remains";
         case UI_OPTION_YOUTUBE_QUALITY:
             return "360p is sharper; 240p uses less memory";
+        case UI_OPTION_VIDEO_LANGUAGE:
+            return "Rank YouTube audio and subtitle tracks";
         case UI_OPTION_YOUTUBE_AUDIO_ONLY:
             return "Skip video downloads and decoding on YouTube";
         case UI_OPTION_YOUTUBE_RESULTS:
@@ -1832,6 +1849,16 @@ void psp_ui_show_collections(
     ui->base_screen = (uint8_t) PSP_UI_SCREEN_COLLECTIONS;
 }
 
+void psp_ui_show_offline_app_preview(
+    PspUiState *ui, const PspUiOfflineAppPreview *preview)
+{
+    if (ui == NULL || preview == NULL) return;
+    ui->base_screen = (uint8_t) PSP_UI_SCREEN_PAGE;
+    ui->offline_app_preview = preview;
+    ui->menu_selection = 0u;
+    ui_open_overlay(ui, PSP_UI_SCREEN_OFFLINE_APP_PREVIEW);
+}
+
 void psp_ui_show_failure_recovery(
     PspUiState *ui, const char *detail, uint8_t available_actions)
 {
@@ -2641,6 +2668,65 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
         return intent;
     }
 
+    if (ui->screen == PSP_UI_SCREEN_VIDEO_LANGUAGE_OPTIONS) {
+        if (pressed & (PSP_UI_BUTTON_UP | PSP_UI_BUTTON_PAGE_UP)) {
+            ui->data_options_selection =
+                (uint8_t) ((ui->data_options_selection + 2u) % 3u);
+            intent.visual_changed = true;
+        } else if (pressed & (PSP_UI_BUTTON_DOWN
+                              | PSP_UI_BUTTON_PAGE_DOWN)) {
+            ui->data_options_selection =
+                (uint8_t) ((ui->data_options_selection + 1u) % 3u);
+            intent.visual_changed = true;
+        } else if (pressed & PSP_UI_BUTTON_CANCEL) {
+            ui_open_parent_overlay(ui, PSP_UI_SCREEN_OPTION_ITEMS);
+            intent.visual_changed = true;
+        } else if (pressed & (PSP_UI_BUTTON_LEFT | PSP_UI_BUTTON_RIGHT
+                              | PSP_UI_BUTTON_CONFIRM)) {
+            int direction = (pressed & PSP_UI_BUTTON_LEFT) ? -1 : 1;
+            if (ui->data_options_selection == 0u) {
+                int language = (int) ui->video_language;
+                language = (language + (int) BROWSER_VIDEO_LANGUAGE_COUNT
+                            + direction)
+                    % (int) BROWSER_VIDEO_LANGUAGE_COUNT;
+                ui->video_language = (uint16_t) language;
+                intent.setting.id = PSP_UI_SETTING_VIDEO_LANGUAGE;
+                intent.setting.value.video_language =
+                    (BrowserVideoLanguage) language;
+            } else if (ui->data_options_selection == 1u) {
+                int language = (int) ui->subtitle_language;
+                language =
+                    (language + (int) BROWSER_SUBTITLE_LANGUAGE_COUNT
+                     + direction)
+                    % (int) BROWSER_SUBTITLE_LANGUAGE_COUNT;
+                ui->subtitle_language = (uint16_t) language;
+                intent.setting.id = PSP_UI_SETTING_SUBTITLE_LANGUAGE;
+                intent.setting.value.subtitle_language =
+                    (BrowserSubtitleLanguage) language;
+            } else {
+                int language = (int) ui->alternate_language;
+                if (direction > 0)
+                    language = language == BROWSER_ALTERNATE_LANGUAGE_NONE
+                        ? BROWSER_ALTERNATE_LANGUAGE_ENGLISH
+                        : language + 1 >= BROWSER_ALTERNATE_LANGUAGE_COUNT
+                            ? BROWSER_ALTERNATE_LANGUAGE_NONE
+                            : language + 1;
+                else
+                    language = language == BROWSER_ALTERNATE_LANGUAGE_NONE
+                        ? BROWSER_ALTERNATE_LANGUAGE_RUSSIAN
+                        : language == BROWSER_ALTERNATE_LANGUAGE_ENGLISH
+                            ? BROWSER_ALTERNATE_LANGUAGE_NONE
+                            : language - 1;
+                ui->alternate_language = (uint16_t) language;
+                intent.setting.id = PSP_UI_SETTING_ALTERNATE_LANGUAGE;
+                intent.setting.value.alternate_language =
+                    (BrowserAlternateLanguage) language;
+            }
+            intent.visual_changed = true;
+        }
+        return intent;
+    }
+
     if (ui->screen == PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS) {
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
         /* A saved selection is already on the card; this only asks whether to
@@ -2997,6 +3083,16 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                             ? BROWSER_TEXT_ENTRY_DANZEFF
                             : BROWSER_TEXT_ENTRY_OSK;
                     break;
+                case UI_OPTION_GAMEPAD_FACE_MAPPING:
+                    ui->gamepad_circle_primary =
+                        !ui->gamepad_circle_primary;
+                    intent.setting.id =
+                        PSP_UI_SETTING_GAMEPAD_FACE_MAPPING;
+                    intent.setting.value.gamepad_face_mapping =
+                        ui->gamepad_circle_primary
+                            ? TILEFINCH_GAMEPAD_FACE_O_PRIMARY
+                            : TILEFINCH_GAMEPAD_FACE_X_PRIMARY;
+                    break;
                 case UI_OPTION_SEARCH_ENGINE: {
                     int selected = (int) ui->search_engine;
                     selected = (selected + 3 + direction) % 3;
@@ -3043,6 +3139,12 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                             ? BROWSER_YOUTUBE_QUALITY_240P
                             : BROWSER_YOUTUBE_QUALITY_360P;
                     break;
+                case UI_OPTION_VIDEO_LANGUAGE: {
+                    ui_open_child_overlay(
+                        ui, PSP_UI_SCREEN_VIDEO_LANGUAGE_OPTIONS);
+                    ui->data_options_selection = 0u;
+                    break;
+                }
                 case UI_OPTION_YOUTUBE_AUDIO_ONLY:
                     ui->youtube_audio_only = !ui->youtube_audio_only;
                     intent.setting.id = PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY;
@@ -3736,6 +3838,16 @@ static void draw_bottom_bar(const PspUiState *ui, uint16_t *pixels, int width,
               PSP_THEME_HINT_BAR, 4);
     fill_rect(pixels, width, height, stride,
               (UiRect) { 0, top, width, 1 }, PSP_THEME_LINE, 4);
+    if (ui->page_gamepad_capture) {
+        draw_text_with_font(
+            pixels, width, height, stride, 7,
+            top + (scale == 2 ? 7 : 6),
+            scale == 2 ? "PAGE CONTROLS  START+SELECT EXIT"
+                       : "PAGE CONTROLS  HOLD START+SELECT TO EXIT",
+            40,
+            width - 7, accent, scale == 2 ? 2 : 1, NULL, true);
+        return;
+    }
     if (ui->captive_portal_active) {
         char domain[128], detail[256];
         ui_url_presentation(
@@ -3899,10 +4011,11 @@ static TILEFINCH_OUT_OF_LINE void draw_page_tools(
 {
     static const char *const labels[UI_PAGE_TOOLS_ITEM_COUNT] = {
         "Find in page", "Reader mode", "Add/remove bookmark",
-        "Save article", "Save screenshot", "Site information"
+        "Save article", "Save screenshot", "Site information",
+        "Install offline app"
     };
     const char *values[UI_PAGE_TOOLS_ITEM_COUNT] = {
-        ">", ui->reader_mode ? "On" : "Off", NULL, NULL, NULL, ">"
+        ">", ui->reader_mode ? "On" : "Off", NULL, NULL, NULL, ">", NULL
     };
     draw_routed_list(
         ui, pixels, width, height, stride, "Page tools", NULL,
@@ -4023,6 +4136,79 @@ static TILEFINCH_OUT_OF_LINE void draw_page_information(
         "X Open / confirm   O Back", 28, muted, 1);
 }
 
+static TILEFINCH_OUT_OF_LINE void draw_offline_app_preview(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t accent, uint16_t text, uint16_t muted)
+{
+    const PspUiOfflineAppPreview *preview = ui->offline_app_preview;
+    UiRect box = {42, 12, width - 84, 248};
+    ui_apply_overlay_motion(ui, &box);
+    draw_panel_shell(pixels, width, height, stride, box);
+    draw_panel_rule(pixels, width, height, stride, box, box.y + 40);
+    draw_panel_hint_bar(pixels, width, height, stride, box,
+                        box.y + box.height - 20);
+    static const char *const operations[] = {
+        "Install offline app", "Update offline app", "Reinstall offline app"
+    };
+    static const char *const modes[] = {
+        "Browser", "Minimal UI", "Standalone", "Fullscreen"
+    };
+    unsigned operation = preview == NULL || preview->operation >= 3u
+        ? 0u : preview->operation;
+    unsigned mode = preview == NULL || preview->display_mode >= 4u
+        ? 0u : preview->display_mode;
+    draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 14,
+                   operations[operation], 36, text, 2);
+    if (preview == NULL) return;
+    draw_text_bold(pixels, width, height, stride,
+                   box.x + 16, box.y + 54, preview->name, 48, accent, 2);
+    char size_line[64], resource_line[72], mode_line[48];
+    uint64_t kib = (preview->estimated_bytes + 1023u) / 1024u;
+    if (kib < 1024u)
+        snprintf(size_line, sizeof(size_line),
+                 "Estimated size: %llu KB", (unsigned long long) kib);
+    else
+        snprintf(size_line, sizeof(size_line),
+                 "Estimated size: %llu.%01llu MB",
+                 (unsigned long long) (kib / 1024u),
+                 (unsigned long long) ((kib % 1024u) * 10u / 1024u));
+    snprintf(resource_line, sizeof(resource_line),
+             "%u captured  |  %u unavailable",
+             (unsigned) preview->captured_resources,
+             (unsigned) preview->unavailable_resources);
+    snprintf(mode_line, sizeof(mode_line), "Display: %s", modes[mode]);
+    draw_text(pixels, width, height, stride,
+              box.x + 16, box.y + 84, size_line, 54,
+              PSP_THEME_TEXT_BODY, 1);
+    draw_text(pixels, width, height, stride,
+              box.x + 16, box.y + 106, resource_line, 60,
+              preview->unavailable_resources == 0 ? muted : PSP_THEME_WARN, 1);
+    draw_text(pixels, width, height, stride,
+              box.x + 16, box.y + 128, mode_line, 40, muted, 1);
+    if (preview->theme_color_valid) {
+        uint16_t swatch = rgb565(
+            (preview->theme_color >> 16) & 0xffu,
+            (preview->theme_color >> 8) & 0xffu,
+            preview->theme_color & 0xffu);
+        fill_round_rect(
+            pixels, width, height, stride,
+            (UiRect) {box.x + 16, box.y + 151, 24, 14},
+            PSP_THEME_RADIUS_CHIP, swatch, 4);
+        draw_text(pixels, width, height, stride,
+                  box.x + 48, box.y + 152, "App theme color", 30, muted, 1);
+    }
+    draw_text_with_font(
+        pixels, width, height, stride,
+        box.x + 16, box.y + 177,
+        preview->unavailable_resources == 0
+            ? "Only already-loaded same-origin resources are included."
+            : "Unavailable resources may still need a network connection.",
+        64, box.x + box.width - 16, muted, 1, NULL, false);
+    draw_text(pixels, width, height, stride,
+              box.x + 16, box.y + box.height - 20,
+              "X Confirm   O Back", 24, muted, 1);
+}
+
 static size_t ui_failure_labels(
     const PspUiState *ui, const char **labels, size_t capacity)
 {
@@ -4102,9 +4288,9 @@ static TILEFINCH_OUT_OF_LINE void draw_help_detail(
         title = "Controls guide";
         lines[0] = "X opens or toggles.  O goes back.";
         lines[1] = "Start opens Address.  Square reloads.";
-        lines[2] = "Select opens or closes the menu.";
-        lines[3] = "L/R changes tabs or categories.";
-        lines[4] = "Analog moves the pointer or scrolls.";
+        lines[2] = "Select: menu.  L/R: page/category.";
+        lines[3] = "Analog moves the pointer or scrolls.";
+        lines[4] = "Hold Start+Select for page controls.";
     } else if (ui->menu_selection == 4u) {
         title = "Version & system";
         lines[0] = "Tilefinch " TILEFINCH_VERSION_STRING;
@@ -4309,6 +4495,43 @@ static TILEFINCH_OUT_OF_LINE void draw_options(
         box.x + box.width - 14, muted, 2, NULL, false);
 }
 
+static const char *ui_video_language_name(unsigned language)
+{
+    switch ((BrowserVideoLanguage) language) {
+        case BROWSER_VIDEO_LANGUAGE_SYSTEM: return "PSP system";
+        case BROWSER_VIDEO_LANGUAGE_ORIGINAL: return "Original";
+        case BROWSER_VIDEO_LANGUAGE_ENGLISH: return "English";
+        case BROWSER_VIDEO_LANGUAGE_SPANISH: return "Spanish";
+        case BROWSER_VIDEO_LANGUAGE_FRENCH: return "French";
+        case BROWSER_VIDEO_LANGUAGE_GERMAN: return "German";
+        case BROWSER_VIDEO_LANGUAGE_ITALIAN: return "Italian";
+        case BROWSER_VIDEO_LANGUAGE_PORTUGUESE: return "Portuguese";
+        case BROWSER_VIDEO_LANGUAGE_JAPANESE: return "Japanese";
+        case BROWSER_VIDEO_LANGUAGE_KOREAN: return "Korean";
+        case BROWSER_VIDEO_LANGUAGE_CHINESE_SIMPLIFIED:
+            return "Chinese (S)";
+        case BROWSER_VIDEO_LANGUAGE_CHINESE_TRADITIONAL:
+            return "Chinese (T)";
+        case BROWSER_VIDEO_LANGUAGE_RUSSIAN: return "Russian";
+        case BROWSER_VIDEO_LANGUAGE_COUNT:
+        default: return "PSP system";
+    }
+}
+
+static const char *ui_subtitle_language_name(unsigned language)
+{
+    if (language == BROWSER_SUBTITLE_LANGUAGE_SYSTEM) return "PSP system";
+    if (language == BROWSER_SUBTITLE_LANGUAGE_SAME_AS_AUDIO)
+        return "Same as audio";
+    return ui_video_language_name(language);
+}
+
+static const char *ui_alternate_language_name(unsigned language)
+{
+    return language == BROWSER_ALTERNATE_LANGUAGE_NONE
+        ? "None" : ui_video_language_name(language);
+}
+
 static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
     const PspUiState *ui, size_t selection, const char **label,
     const char **value, char *formatted, size_t formatted_size)
@@ -4375,6 +4598,10 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
             *label = "Keyboard";
             *value = ui->danzeff_text_input ? "Danzeff" : "PSP OSK";
             break;
+        case UI_OPTION_GAMEPAD_FACE_MAPPING:
+            *label = "Game buttons";
+            *value = ui->gamepad_circle_primary ? "O primary" : "X primary";
+            break;
         case UI_OPTION_SEARCH_ENGINE:
             *label = "Search";
             *value = ui_search_engine_name(ui->search_engine);
@@ -4402,6 +4629,10 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
             snprintf(formatted, formatted_size, "%up",
                      ui->youtube_240p ? 240u : 360u);
             *value = formatted;
+            break;
+        case UI_OPTION_VIDEO_LANGUAGE:
+            *label = "Languages";
+            *value = ">";
             break;
         case UI_OPTION_YOUTUBE_AUDIO_ONLY:
             *label = "Audio-only";
@@ -4883,6 +5114,52 @@ static TILEFINCH_OUT_OF_LINE void draw_glyph_options(
     draw_text_with_font(
         pixels, width, height, stride, box.x + 16,
         box.y + box.height - 22, hint, 34,
+        box.x + box.width - 14, muted, 1, NULL, false);
+}
+
+static TILEFINCH_OUT_OF_LINE void draw_video_language_options(
+    const PspUiState *ui, uint16_t *pixels, int width, int height,
+    int stride, uint16_t panel, uint16_t accent, uint16_t text,
+    uint16_t muted)
+{
+    UiRect box = {42, 30, width - 84, 210};
+    ui_apply_overlay_motion(ui, &box);
+    (void) panel;
+    draw_panel_shell(pixels, width, height, stride, box);
+    draw_panel_rule(pixels, width, height, stride, box, box.y + 41);
+    draw_panel_hint_bar(pixels, width, height, stride, box,
+                        box.y + box.height - 22);
+    draw_text_bold(pixels, width, height, stride,
+                   box.x + 16, box.y + 14,
+                   "Settings > Video > Languages", 30, text, 2);
+    static const char *const labels[3] = {
+        "Audio language", "Subtitle language", "Alternate language"
+    };
+    const char *values[3] = {
+        ui_video_language_name(ui->video_language),
+        ui_subtitle_language_name(ui->subtitle_language),
+        ui_alternate_language_name(ui->alternate_language)
+    };
+    for (size_t at = 0; at < 3u; at++) {
+        int row_y = box.y + 59 + (int) at * 36;
+        bool selected = at == ui->data_options_selection;
+        if (selected)
+            fill_round_rect(
+                pixels, width, height, stride,
+                (UiRect) {box.x + 10, row_y - 6, box.width - 20, 25},
+                PSP_THEME_RADIUS_ROW, accent, 4);
+        uint16_t color = selected ? PSP_THEME_ON_ACCENT
+                                  : PSP_THEME_TEXT_BODY;
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 18, row_y,
+            labels[at], 22, box.x + 206, color, 2, NULL, false);
+        draw_text_right_aligned(
+            pixels, width, height, stride, box.x + box.width - 18,
+            row_y, values[at], 18, color, 2, true);
+    }
+    draw_text_with_font(
+        pixels, width, height, stride, box.x + 16,
+        box.y + box.height - 22, "Left/Right choose   O Back", 30,
         box.x + box.width - 14, muted, 1, NULL, false);
 }
 
@@ -5530,6 +5807,28 @@ static UiRect ui_collections_row_rect(const PspUiState *ui, size_t row)
     };
 }
 
+static void draw_collection_icon(uint16_t *pixels, int width, int height,
+                                 int stride, int x, int y,
+                                 const unsigned char *rgba)
+{
+    if (rgba == NULL) return;
+    for (int row = 0; row < (int) OFFLINE_LIBRARY_APP_ICON_EDGE; row++) {
+        for (int column = 0; column < (int) OFFLINE_LIBRARY_APP_ICON_EDGE;
+             column++) {
+            const unsigned char *source = rgba
+                + ((size_t) row * OFFLINE_LIBRARY_APP_ICON_EDGE + column) * 4u;
+            unsigned parts = (source[3] * UI_BLEND_PARTS + 127u) / 255u;
+            if (parts == 0 || x + column < 0 || x + column >= width
+                || y + row < 0 || y + row >= height) continue;
+            uint16_t color = rgb565(source[0], source[1], source[2]);
+            uint16_t *target = pixels + (size_t) (y + row) * stride
+                + x + column;
+            *target = parts == UI_BLEND_PARTS
+                ? color : blend565(color, *target, parts);
+        }
+    }
+}
+
 static TILEFINCH_OUT_OF_LINE void draw_collections(
                              const PspUiState *ui, uint16_t *pixels,
                              int width, int height, int stride,
@@ -5616,16 +5915,34 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
             : chrome_text_width_bytes(
                   row->trailing, strlen(row->trailing), 2, false)
               + PSP_THEME_SPACE_L;
+        int content_x = box.x + PSP_THEME_SPACE_M;
+        if (row->app_theme_valid) {
+            fill_round_rect(
+                pixels, width, height, stride,
+                (UiRect) {content_x, box.y + 7, 5, 22}, 2,
+                row->app_theme_rgb565, 4);
+            content_x += 9;
+        }
+        if (row->icon_rgba != NULL) {
+            draw_collection_icon(
+                pixels, width, height, stride, content_x, box.y + 5,
+                row->icon_rgba);
+            content_x += (int) OFFLINE_LIBRARY_APP_ICON_EDGE
+                + PSP_THEME_SPACE_S;
+        }
         draw_text_with_font(
             pixels, width, height, stride,
-            box.x + PSP_THEME_SPACE_M, box.y + 1, row->title, 64,
+            content_x, box.y + 1, row->title, 64,
             box.x + box.width - PSP_THEME_SPACE_M - trailing_width,
             selected ? PSP_THEME_TEXT : PSP_THEME_TEXT_BODY, 2, NULL,
             selected);
         draw_text_with_font(
             pixels, width, height, stride,
-            box.x + PSP_THEME_SPACE_M, box.y + UI_COLLECTIONS_ROW_DETAIL_DY,
-            confirm ? "PRESS SQUARE AGAIN TO DELETE" : row->detail, 64,
+            content_x, box.y + UI_COLLECTIONS_ROW_DETAIL_DY,
+            confirm
+                ? (row->is_web_app ? "PRESS SQUARE AGAIN TO UNINSTALL"
+                                   : "PRESS SQUARE AGAIN TO DELETE")
+                : row->detail, 64,
             box.x + box.width - PSP_THEME_SPACE_M - trailing_width,
             confirm ? PSP_THEME_WARN : PSP_THEME_TEXT_MUTED, 2, NULL,
             false);
@@ -5670,11 +5987,16 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
     }
     char hint[64];
     snprintf(hint, sizeof(hint), "%s%s   L/R SECTION",
-             primary, deletable ? "   SQUARE DELETE" : "");
+             primary, deletable
+                 ? (selected != NULL && selected->is_web_app
+                        ? "   SQUARE UNINSTALL" : "   SQUARE DELETE") : "");
     draw_surface_hint(
         pixels, width, height, stride,
-        confirming ? "SQUARE DELETE   O CANCEL"
-                   : hint, 2u);
+        confirming
+            ? (selected != NULL && selected->is_web_app
+                   ? "SQUARE UNINSTALL   O CANCEL"
+                   : "SQUARE DELETE   O CANCEL")
+            : hint, 2u);
 }
 
 /*
@@ -6220,6 +6542,9 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
     } else if (ui->screen == PSP_UI_SCREEN_GLYPH_OPTIONS) {
         draw_glyph_options(
             ui, pixels, width, height, stride, panel, accent, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_VIDEO_LANGUAGE_OPTIONS) {
+        draw_video_language_options(
+            ui, pixels, width, height, stride, panel, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_DATA_OPTIONS) {
         draw_data_options(
             ui, pixels, width, height, stride, panel, accent, text, muted);
@@ -6237,6 +6562,9 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
             ui, pixels, width, height, stride, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_PAGE_INFORMATION) {
         draw_page_information(
+            ui, pixels, width, height, stride, accent, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_OFFLINE_APP_PREVIEW) {
+        draw_offline_app_preview(
             ui, pixels, width, height, stride, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_FAILURE_RECOVERY) {
         draw_failure_recovery(
@@ -6608,10 +6936,63 @@ void psp_ui_media_init(PspUiMediaState *media)
     media->controls_remaining_ms = UI_MEDIA_CONTROLS_MS;
 }
 
+void psp_ui_media_bind_presentation(
+    PspUiMediaState *media, PspUiMediaPresentation *presentation)
+{
+    if (media == NULL) return;
+    media->presentation = presentation;
+    if (presentation == NULL) return;
+    memset(presentation, 0, sizeof(*presentation));
+    presentation->selected_audio_track = -1;
+    presentation->selected_subtitle_track = -1;
+}
+
 void psp_ui_media_set_title_font(PspUiMediaState *media,
                                  const FontFace *font)
 {
-    if (media != NULL) media->title_font = font;
+    if (media != NULL && media->presentation != NULL)
+        media->presentation->title_font = font;
+}
+
+void psp_ui_media_set_tracks(
+    PspUiMediaState *media,
+    const PspUiMediaTrack *audio_tracks, size_t audio_count,
+    int selected_audio,
+    const PspUiMediaTrack *subtitle_tracks, size_t subtitle_count,
+    int selected_subtitle)
+{
+    if (media == NULL || media->presentation == NULL) return;
+    PspUiMediaPresentation *presentation = media->presentation;
+    if (audio_count > PSP_UI_MEDIA_TRACK_LIMIT)
+        audio_count = PSP_UI_MEDIA_TRACK_LIMIT;
+    if (subtitle_count > PSP_UI_MEDIA_TRACK_LIMIT)
+        subtitle_count = PSP_UI_MEDIA_TRACK_LIMIT;
+    memset(presentation->audio_tracks, 0,
+           sizeof(presentation->audio_tracks));
+    memset(presentation->subtitle_tracks, 0,
+           sizeof(presentation->subtitle_tracks));
+    if (audio_tracks != NULL && audio_count != 0)
+        memcpy(presentation->audio_tracks, audio_tracks,
+               audio_count * sizeof(*audio_tracks));
+    if (subtitle_tracks != NULL && subtitle_count != 0)
+        memcpy(presentation->subtitle_tracks, subtitle_tracks,
+               subtitle_count * sizeof(*subtitle_tracks));
+    presentation->audio_track_count = (uint8_t) audio_count;
+    presentation->subtitle_track_count = (uint8_t) subtitle_count;
+    presentation->selected_audio_track = selected_audio >= 0
+            && (size_t) selected_audio < audio_count
+        ? (int8_t) selected_audio : -1;
+    presentation->selected_subtitle_track = selected_subtitle >= 0
+            && (size_t) selected_subtitle < subtitle_count
+        ? (int8_t) selected_subtitle : -1;
+}
+
+void psp_ui_media_set_subtitle(PspUiMediaState *media, const char *text)
+{
+    if (media == NULL || media->presentation == NULL) return;
+    copy_string(media->presentation->subtitle_text,
+                sizeof(media->presentation->subtitle_text),
+                text == NULL ? "" : text);
 }
 
 void psp_ui_media_set(PspUiMediaState *media, bool visible, bool playing,
@@ -6648,6 +7029,8 @@ void psp_ui_media_set(PspUiMediaState *media, bool visible, bool playing,
 void psp_ui_media_set_resolving(PspUiMediaState *media, const char *title)
 {
     if (media == NULL) return;
+    if (media->presentation != NULL)
+        media->presentation->track_menu_open = false;
     media->visible = true;
     media->controls_visible = true;
     media->resolving = true;
@@ -6732,6 +7115,8 @@ static void media_error_wrap(char *status, size_t capacity)
 void psp_ui_media_set_error(PspUiMediaState *media, const char *message)
 {
     if (media == NULL) return;
+    if (media->presentation != NULL)
+        media->presentation->track_menu_open = false;
     media->visible = true;
     media->controls_visible = true;
     media->resolving = false;
@@ -6834,7 +7219,9 @@ void psp_ui_media_tick(PspUiMediaState *media, unsigned elapsed_ms)
 {
     if (media == NULL || !media->visible || !media->controls_visible
         || !media->playing || media->ended || media->resolving
-        || media->seek_preview_active) return;
+        || media->seek_preview_active
+        || (media->presentation != NULL
+            && media->presentation->track_menu_open)) return;
     if (elapsed_ms >= media->controls_remaining_ms) {
         media->controls_remaining_ms = 0;
         media->controls_visible = false;
@@ -6878,7 +7265,53 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
 {
     PspUiMediaIntent intent = {0};
     if (media == NULL || input == NULL || !media->visible) return intent;
+    PspUiMediaPresentation *presentation = media->presentation;
     uint32_t pressed = input->pressed;
+    if (presentation != NULL && presentation->track_menu_open) {
+        unsigned count = presentation->track_menu_tab == 0
+            ? presentation->audio_track_count
+            : (unsigned) presentation->subtitle_track_count + 1u;
+        if (pressed & PSP_UI_BUTTON_CANCEL) {
+            presentation->track_menu_open = false;
+        } else if (pressed & (PSP_UI_BUTTON_PAGE_UP
+                              | PSP_UI_BUTTON_PAGE_DOWN)) {
+            presentation->track_menu_tab ^= 1u;
+            count = presentation->track_menu_tab == 0
+                ? presentation->audio_track_count
+                : (unsigned) presentation->subtitle_track_count + 1u;
+            presentation->track_menu_selection =
+                presentation->track_menu_tab == 0
+                ? (presentation->selected_audio_track < 0
+                    ? 0u : (uint8_t) presentation->selected_audio_track)
+                : (presentation->selected_subtitle_track < 0
+                    ? 0u
+                    : (uint8_t) presentation->selected_subtitle_track + 1u);
+            if (count != 0 && presentation->track_menu_selection >= count)
+                presentation->track_menu_selection =
+                    (uint8_t) (count - 1u);
+        } else if (count != 0 && (pressed & PSP_UI_BUTTON_UP)) {
+            presentation->track_menu_selection =
+                presentation->track_menu_selection == 0
+                ? (uint8_t) (count - 1u)
+                : (uint8_t) (presentation->track_menu_selection - 1u);
+        } else if (count != 0 && (pressed & PSP_UI_BUTTON_DOWN)) {
+            presentation->track_menu_selection = (uint8_t)
+                ((presentation->track_menu_selection + 1u) % count);
+        } else if (count != 0 && (pressed & PSP_UI_BUTTON_CONFIRM)) {
+            if (presentation->track_menu_tab == 0) {
+                intent.action = PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK;
+                intent.track_index = presentation->track_menu_selection;
+            } else {
+                intent.action = PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK;
+                intent.track_index = presentation->track_menu_selection == 0
+                    ? UINT8_MAX
+                    : (uint8_t) (presentation->track_menu_selection - 1u);
+            }
+            presentation->track_menu_open = false;
+        }
+        intent.visual_changed = pressed != 0;
+        return intent;
+    }
     if (pressed == 0 && !media->failed && media->seek_enabled
         && media->duration_us != 0) {
         int analog = (int) input->analog_x - 128;
@@ -6920,7 +7353,21 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
     media->analog_seek_direction = 0;
     psp_ui_media_show_controls(media);
     intent.visual_changed = true;
-    if (pressed & PSP_UI_BUTTON_CANCEL) {
+    if (!media->failed && presentation != NULL
+        && (pressed & PSP_UI_BUTTON_TOOLBAR)
+        && (presentation->audio_track_count != 0
+            || presentation->subtitle_track_count != 0)) {
+        presentation->track_menu_open = true;
+        presentation->track_menu_tab =
+            presentation->audio_track_count == 0 ? 1u : 0u;
+        presentation->track_menu_selection =
+            presentation->track_menu_tab == 0
+            ? (presentation->selected_audio_track < 0
+                ? 0u : (uint8_t) presentation->selected_audio_track)
+            : (presentation->selected_subtitle_track < 0
+                ? 0u
+                : (uint8_t) presentation->selected_subtitle_track + 1u);
+    } else if (pressed & PSP_UI_BUTTON_CANCEL) {
         if (media->seek_preview_active) {
             psp_ui_media_cancel_seek_preview(media);
             intent.action = PSP_UI_MEDIA_ACTION_CANCEL_SEEK_PREVIEW;
@@ -7397,7 +7844,21 @@ typedef struct {
     bool needs_backdrop;
 } UiMediaRawRegion;
 
-#define UI_MEDIA_RAW_REGION_LIMIT 4u
+#define UI_MEDIA_RAW_REGION_LIMIT 6u
+
+static UiRect media_track_menu_rect(int width, int height)
+{
+    (void) height;
+    return (UiRect) {width / 2 - 176, 48, 352, 176};
+}
+
+static UiRect media_subtitle_rect(
+    const PspUiMediaState *media, int width, int height)
+{
+    int bottom = media != NULL && media->controls_visible
+        ? height - UI_MEDIA_CONTROL_BAR_HEIGHT - 8 : height - 18;
+    return (UiRect) {width / 2 - 202, bottom - 30, 404, 30};
+}
 
 static void ui_media_add_raw_region(
     UiMediaRawRegion *raw, size_t *count, int left, int top,
@@ -7532,6 +7993,7 @@ size_t psp_ui_media_overlay_regions(
 {
     if (media == NULL || !media->visible || regions == NULL || capacity == 0u
         || width <= 0 || height <= 0) return 0u;
+    const PspUiMediaPresentation *presentation = media->presentation;
     UiMediaRawRegion raw[UI_MEDIA_RAW_REGION_LIMIT];
     size_t raw_count = 0u;
     if (!media->controls_visible) {
@@ -7542,6 +8004,13 @@ size_t psp_ui_media_overlay_regions(
                 height / 2 - 19,
                 width / 2 + UI_MEDIA_BUFFERING_REGION_HALF_WIDTH,
                 height / 2 + 19,
+                width, height, true);
+        }
+        if (presentation != NULL && presentation->subtitle_text[0] != '\0') {
+            UiRect subtitle = media_subtitle_rect(media, width, height);
+            ui_media_add_raw_region(
+                raw, &raw_count, subtitle.x, subtitle.y,
+                subtitle.x + subtitle.width, subtitle.y + subtitle.height,
                 width, height, true);
         }
         return ui_media_union_regions(
@@ -7592,6 +8061,20 @@ size_t psp_ui_media_overlay_regions(
     ui_media_add_raw_region(
         raw, &raw_count, 0, height - UI_MEDIA_CONTROL_BAR_HEIGHT,
         width, height, width, height, false);
+    if (presentation != NULL && presentation->subtitle_text[0] != '\0') {
+        UiRect subtitle = media_subtitle_rect(media, width, height);
+        ui_media_add_raw_region(
+            raw, &raw_count, subtitle.x, subtitle.y,
+            subtitle.x + subtitle.width, subtitle.y + subtitle.height,
+            width, height, true);
+    }
+    if (presentation != NULL && presentation->track_menu_open) {
+        UiRect menu = media_track_menu_rect(width, height);
+        ui_media_add_raw_region(
+            raw, &raw_count, menu.x, menu.y,
+            menu.x + menu.width, menu.y + menu.height,
+            width, height, true);
+    }
     return ui_media_union_regions(
         raw, raw_count, width, height, regions, capacity);
 }
@@ -7615,6 +8098,9 @@ static void draw_media_control_bar(
     uint16_t text = PSP_THEME_TEXT;
     uint16_t muted = PSP_THEME_TEXT_MUTED;
     uint16_t accent = PSP_THEME_ACCENT_EMBER;
+    bool tracks_available = media->presentation != NULL
+        && (media->presentation->audio_track_count != 0
+            || media->presentation->subtitle_track_count != 0);
     draw_media_control_bar_ground(pixels, width, height, stride);
     int left = 24, right = width - 24, track_y = height - 69;
     fill_round_rect(pixels, width, height, stride,
@@ -7632,8 +8118,12 @@ static void draw_media_control_bar(
         draw_text(pixels, width, height, stride, left, height - 53,
                   "LIVE", 8, text, 2);
         draw_text(pixels, width, height, stride, left, height - 29,
-                  media->playing ? "X PAUSE" : "X PLAY",
-                  16, muted, 2);
+                  tracks_available
+                      ? (media->playing
+                          ? "X PAUSE  TRI TRACKS"
+                          : "X PLAY  TRI TRACKS")
+                      : (media->playing ? "X PAUSE" : "X PLAY"),
+                  24, muted, 2);
         return;
     }
     if (media->duration_us != 0 && media->buffered_until_us != 0) {
@@ -7675,10 +8165,85 @@ static void draw_media_control_bar(
     draw_text(pixels, width, height, stride, left, height - 29,
               media->seek_preview_active
                   ? "X GO   O CANCEL"
-                  : (media->playing
-                      ? "STICK/L/R SEEK   X PAUSE"
-                      : "STICK/L/R SEEK   X PLAY"),
+                  : tracks_available
+                      ? (media->playing
+                          ? "X PAUSE  TRI TRACKS  L/R SEEK"
+                          : "X PLAY  TRI TRACKS  L/R SEEK")
+                      : (media->playing
+                          ? "STICK/L/R SEEK  X PAUSE"
+                          : "STICK/L/R SEEK  X PLAY"),
               32, muted, 2);
+}
+
+static void draw_media_subtitle(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride)
+{
+    if (media == NULL || media->presentation == NULL
+        || media->presentation->subtitle_text[0] == '\0') return;
+    const PspUiMediaPresentation *presentation = media->presentation;
+    UiRect box = media_subtitle_rect(media, width, height);
+    fill_round_rect(pixels, width, height, stride, box, 5,
+                    PSP_THEME_CHROME_BAR, 4);
+    draw_text_with_font(
+        pixels, width, height, stride, box.x + 10, box.y + 8,
+        presentation->subtitle_text, 72, box.x + box.width - 10,
+        PSP_THEME_TEXT, 2, NULL, false);
+}
+
+static void draw_media_track_menu(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride)
+{
+    if (media == NULL || media->presentation == NULL
+        || !media->presentation->track_menu_open) return;
+    const PspUiMediaPresentation *presentation = media->presentation;
+    UiRect box = media_track_menu_rect(width, height);
+    draw_panel_shell(pixels, width, height, stride, box);
+    draw_text_bold(pixels, width, height, stride,
+                   box.x + 16, box.y + 12, "Audio", 5,
+                   presentation->track_menu_tab == 0
+                       ? PSP_THEME_ACCENT_EMBER_HI : PSP_THEME_TEXT_MUTED, 2);
+    draw_text_bold(pixels, width, height, stride,
+                   box.x + 110, box.y + 12, "Subtitles", 9,
+                   presentation->track_menu_tab == 1
+                       ? PSP_THEME_ACCENT_EMBER_HI : PSP_THEME_TEXT_MUTED, 2);
+    draw_panel_rule(pixels, width, height, stride, box, box.y + 35);
+    unsigned count = presentation->track_menu_tab == 0
+        ? presentation->audio_track_count
+        : (unsigned) presentation->subtitle_track_count + 1u;
+    for (unsigned at = 0; at < count && at < PSP_UI_MEDIA_TRACK_LIMIT + 1u;
+         at++) {
+        int y = box.y + 44 + (int) at * 16;
+        bool selected = presentation->track_menu_tab == 0
+            ? presentation->selected_audio_track == (int) at
+            : (at == 0 ? presentation->selected_subtitle_track < 0
+                       : presentation->selected_subtitle_track
+                             == (int) at - 1);
+        if (at == presentation->track_menu_selection)
+            fill_round_rect(
+                pixels, width, height, stride,
+                (UiRect) {box.x + 10, y - 3, box.width - 20, 17},
+                4, PSP_THEME_SURFACE, 4);
+        const char *label = presentation->track_menu_tab == 0
+            ? presentation->audio_tracks[at].label
+            : (at == 0 ? "Off"
+                       : presentation->subtitle_tracks[at - 1u].label);
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 20, y,
+            label, 42, box.x + box.width - 42,
+            at == presentation->track_menu_selection
+                ? PSP_THEME_TEXT : PSP_THEME_TEXT_MUTED,
+            1, NULL, false);
+        if (selected)
+            draw_text(pixels, width, height, stride,
+                      box.x + box.width - 30, y, "X", 1,
+                      PSP_THEME_ACCENT_EMBER_HI, 1);
+    }
+    draw_text(pixels, width, height, stride,
+              box.x + 16, box.y + box.height - 17,
+              "L/R CATEGORY   X SELECT   O BACK", 34,
+              PSP_THEME_TEXT_MUTED, 1);
 }
 
 void psp_ui_media_composite_controls(
@@ -7705,10 +8270,14 @@ void psp_ui_media_composite_with_preview(
 {
     if (media == NULL || !media->visible || pixels == NULL
         || width <= 0 || height <= 0 || stride < width
-        || (!media->controls_visible && !media->buffering)) return;
+        || (!media->controls_visible && !media->buffering
+            && (media->presentation == NULL
+                || media->presentation->subtitle_text[0] == '\0'))) return;
     if (!media->controls_visible) {
-        draw_media_buffering(
-            pixels, width, height, stride, width / 2, height / 2);
+        if (media->buffering)
+            draw_media_buffering(
+                pixels, width, height, stride, width / 2, height / 2);
+        draw_media_subtitle(media, pixels, width, height, stride);
         return;
     }
     /* Ember overlay language: warm near-black chrome, token text, accent
@@ -7724,7 +8293,10 @@ void psp_ui_media_composite_with_preview(
               (UiRect) {0, 0, width, UI_MEDIA_TITLE_BAR_HEIGHT}, bar, 4);
     draw_text_with_font(
         pixels, width, height, stride, 14, 12, media->title, 34,
-        width - 46, text, 2, media->title_font, false);
+        width - 46, text, 2,
+        media->presentation == NULL
+            ? NULL : media->presentation->title_font,
+        false);
 
     if (media->resolving || media->failed) {
         if (media->resolving) {
@@ -7889,6 +8461,8 @@ void psp_ui_media_composite_with_preview(
                               media->playing && !media->ended);
 
     draw_media_control_bar(media, pixels, width, height, stride);
+    draw_media_subtitle(media, pixels, width, height, stride);
+    draw_media_track_menu(media, pixels, width, height, stride);
 }
 
 void psp_ui_media_composite(const PspUiMediaState *media, uint16_t *pixels,

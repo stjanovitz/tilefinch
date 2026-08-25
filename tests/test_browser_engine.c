@@ -239,6 +239,7 @@ int main(void)
     CHECK(test_deferred_image_relayout_requests_repaint() == 0);
     CHECK(test_committed_document_glyph_script_hints() == 0);
     CHECK(test_responsive_navigation_convergence() == 0);
+    CHECK(test_animated_canvas_follows_transactional_page_move() == 0);
     CHECK(test_scrollable_provisional_navigation() == 0);
     CHECK(test_youtube_localized_watch_metadata() == 0);
     CHECK(test_youtube_cooperative_build_convergence() == 0);

@@ -2124,6 +2124,15 @@ bool navigation_advance_runtime(NavigationSession *session,
     return ok;
 }
 
+bool navigation_set_gamepad_state(
+    NavigationSession *session, const TilefinchGamepadState *state)
+{
+    if (session == NULL || state == NULL || !session->page.loaded)
+        return false;
+    if (session->page.runtime == NULL) return !state->connected;
+    return script_runtime_set_gamepad_state(session->page.runtime, state);
+}
+
 bool navigation_dispatch_event(NavigationSession *session,
                                const char *selector,
                                const char *event_type)

@@ -116,6 +116,62 @@ static int test_responsive_navigation_convergence(void)
     return 0;
 }
 
+static int test_animated_canvas_follows_transactional_page_move(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.session_cache_limit = 256u * 1024u;
+    config.maximum_document_bytes = 64u * 1024u;
+    config.tile_capacity = 2;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 3u * MIB;
+    config.javascript.maximum_scripts = 4;
+    config.javascript.maximum_total_bytes = 32u * 1024u;
+    config.javascript.maximum_file_bytes = 16u * 1024u;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    bool replay = engine != NULL && fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/tests/fixtures/http-browser-engine-animated-canvas",
+        error, sizeof(error));
+    bool loaded = replay && browser_engine_load_url_with_limits(
+        engine, "https://animated-canvas.test/page",
+        64u * 1024u, 1000, true);
+    if (engine == NULL || !replay || !loaded) {
+        fprintf(stderr,
+                "animated canvas setup engine=%d replay=%d loaded=%d "
+                "trace-error=\"%s\" engine-error=\"%s\"\n",
+                engine != NULL, replay, loaded, error,
+                engine == NULL ? "" : browser_engine_last_error(engine));
+    }
+    CHECK(engine != NULL && replay && loaded);
+    fetch_trace_end();
+
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    bool visible_changed = false;
+    CHECK(navigation != NULL
+          && navigation->page.images.count == 0
+          && browser_engine_advance_runtime(
+                 engine, 16, 4, &visible_changed));
+    const ImageResource *image = navigation->page.images.count == 1
+        ? &navigation->page.images.items[0] : NULL;
+    CHECK(image != NULL && image->node != NULL && image->is_canvas
+          && image->pixels != NULL
+          && image->width == 4 && image->height == 2
+          && visible_changed && browser_engine_shutdown(engine));
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics)
+          && metrics.budget_current == 0
+          && metrics.budget_active_allocations == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static int test_scrollable_provisional_navigation(void)
 {
     BrowserDeviceProfile profile;

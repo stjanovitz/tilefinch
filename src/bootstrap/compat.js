@@ -622,20 +622,30 @@
     globalThis.Intl.Segmenter = TilefinchSegmenter;
   }
   {
+    let pageVisible = true;
+    const dispatchVisibility = document.dispatchEvent.bind(document);
     Object.defineProperty(document, "visibilityState", {
       configurable: true,
       enumerable: true,
       get() {
-        return "visible";
+        return pageVisible ? "visible" : "hidden";
       },
     });
     Object.defineProperty(document, "hidden", {
       configurable: true,
       enumerable: true,
       get() {
-        return false;
+        return !pageVisible;
       },
     });
+    globalThis.__tilefinchPageVisible = () => pageVisible;
+    globalThis.__tilefinchApplyPageVisibility = (visible) => {
+      visible = !!visible;
+      if (visible === pageVisible) return false;
+      pageVisible = visible;
+      dispatchVisibility(new globalThis.Event("visibilitychange"));
+      return true;
+    };
     document.onDOMContentLoaded = null;
     document.exitPointerLock = function () {};
     navigator.product = "Gecko";
@@ -1055,6 +1065,16 @@
         "movementY",
       ])
         this[name] = Number(options[name]) || 0;
+      /* Canvas examples still use the legacy layer coordinates. In
+         Tilefinch's flat page surface they are the target-relative offsets. */
+      this.layerX = options.layerX === undefined
+        ? this.offsetX
+        : Number(options.layerX) || 0;
+      this.layerY = options.layerY === undefined
+        ? this.offsetY
+        : Number(options.layerY) || 0;
+      this.x = this.clientX;
+      this.y = this.clientY;
       this.button = Number(options.button) || 0;
       this.buttons = Number(options.buttons) || 0;
       this.relatedTarget = options.relatedTarget ?? null;

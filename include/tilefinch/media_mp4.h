@@ -156,6 +156,8 @@ typedef enum {
 } MediaH264DecoderRoute;
 MediaH264DecoderRoute media_h264_avcc_decoder_route(
     const unsigned char *config, size_t length, uint8_t *profile_idc);
+MediaH264DecoderRoute media_h264_annexb_decoder_route(
+    const unsigned char *config, size_t length, uint8_t *profile_idc);
 MediaH264DecoderRoute media_h264_codec_string_decoder_route(
     const char *mime, uint8_t *profile_idc);
 /*
@@ -174,6 +176,23 @@ bool media_h264_avcc_sample_is_admitted(
 bool media_h264_annexb_sample_is_admitted(
     const unsigned char *payload, size_t length,
     uint16_t width, uint16_t height);
+/* Firmware decoders retain the parameter sets admitted at open. In addition
+   to geometry, reject any in-band SPS/PPS which differs from that fixed
+   Annex-B configuration. Access units without parameter sets remain valid. */
+bool media_h264_annexb_sample_matches_config(
+    const unsigned char *payload, size_t length,
+    uint16_t width, uint16_t height,
+    const unsigned char *config, size_t config_length);
+bool media_h264_annexb_parameter_sets(
+    const unsigned char *payload, size_t length,
+    const unsigned char **sps, size_t *sps_length,
+    const unsigned char **pps, size_t *pps_length);
+/* Convert a complete Annex-B access unit to four-byte length-prefixed AVC in
+   place. The caller supplies bounded spare capacity for three-byte start
+   codes; no allocation is performed. */
+bool media_h264_annexb_to_avcc_in_place(
+    unsigned char *payload, size_t length, size_t capacity,
+    size_t *output_length, unsigned *nal_count);
 typedef struct {
     uint32_t sample_rate;
     uint16_t channels;

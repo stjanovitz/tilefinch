@@ -37,7 +37,9 @@ if(PSP_BROWSER_VENDOR_DIR AND EXISTS "${PSP_BROWSER_VENDOR_DIR}/freetype/CMakeLi
 else()
     FetchContent_Declare(
         freetype
-        URL https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz
+        URL
+            https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz
+            https://sourceforge.net/projects/freetype/files/freetype2/2.14.3/freetype-2.14.3.tar.xz/download
         URL_HASH SHA256=36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )

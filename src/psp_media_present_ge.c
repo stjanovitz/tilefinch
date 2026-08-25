@@ -180,6 +180,11 @@ static bool psp_media_present_ge_ready(void)
     return true;
 }
 
+bool psp_media_present_ge_context_acquire(void)
+{
+    return psp_media_present_ge_ready();
+}
+
 static bool psp_media_present_ge_offset(
     const uint32_t *destination, unsigned *offset)
 {
@@ -347,6 +352,11 @@ static void *psp_media_present_ge_pending_rows;
 static unsigned psp_media_present_ge_pending_bytes;
 static uint64_t psp_media_present_ge_submitted_us;
 static bool psp_media_present_ge_pending;
+
+bool psp_media_present_ge_context_idle(void)
+{
+    return psp_media_present_ge_ready() && !psp_media_present_ge_pending;
+}
 
 void psp_media_present_ge_stage_flush(const void *pixels, size_t bytes)
 {
@@ -1363,6 +1373,16 @@ bool psp_media_present_ge_probe(
 }
 
 #else
+
+bool psp_media_present_ge_context_acquire(void)
+{
+    return false;
+}
+
+bool psp_media_present_ge_context_idle(void)
+{
+    return false;
+}
 
 bool psp_media_present_ge_probe(
     void *scratch, size_t scratch_bytes, uint32_t *staging,

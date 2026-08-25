@@ -403,6 +403,7 @@ static FetchRequest scheduled_background_hop_shape(
         .upgrade_insecure_requests = base != NULL
             && base->upgrade_insecure_requests,
         .identity_encoding = base != NULL && base->identity_encoding,
+        .raw_gzip_encoding = base != NULL && base->raw_gzip_encoding,
         .user_agent = base == NULL ? NULL : base->user_agent,
         .connect_timeout_ms = base == NULL ? 0 : base->connect_timeout_ms,
         .block_private_network = base != NULL
@@ -593,6 +594,7 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
         .upgrade_insecure_requests =
             source != NULL && source->upgrade_insecure_requests,
         .identity_encoding = source != NULL && source->identity_encoding,
+        .raw_gzip_encoding = source != NULL && source->raw_gzip_encoding,
         .connect_timeout_ms = source == NULL ? 0 : source->connect_timeout_ms,
         .block_private_network = source != NULL
             && fetch_request_private_network_protected(source, url),
@@ -704,8 +706,13 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
                item->easy, CURLOPT_ACCEPT_ENCODING,
                item->request.identity_encoding
                    ? "identity"
+                   : item->request.raw_gzip_encoding
+                       ? "gzip"
                    : fetch_accept_encoding(
                          diagnostic_mobile_safari)) != CURLE_OK
+        || curl_easy_setopt(
+               item->easy, CURLOPT_HTTP_CONTENT_DECODING,
+               item->request.raw_gzip_encoding ? 0L : 1L) != CURLE_OK
         || curl_easy_setopt(
                item->easy, CURLOPT_USERAGENT,
                fetch_effective_user_agent(

@@ -867,6 +867,12 @@ bool navigation_set_scroll(NavigationSession *session, int scroll_y);
 bool navigation_advance_runtime(NavigationSession *session,
                                 unsigned elapsed_ms,
                                 size_t callback_budget);
+/* The active top-level realm alone receives built-in controller input. This
+   matches the platform's explicit page-capture boundary and does not leak
+   controller state into cross-origin child frames. A page without an author
+   realm accepts the disconnected state as a no-op. */
+bool navigation_set_gamepad_state(
+    NavigationSession *session, const TilefinchGamepadState *state);
 /* Runs one bounded background-resource unit. Simple static pages admit one
    viewport-ranked document image, pump transport without waiting, or consume
    one completed decode; the legacy full-document continuation remains a

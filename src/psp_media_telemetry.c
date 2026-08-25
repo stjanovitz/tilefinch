@@ -383,11 +383,13 @@ void psp_media_telemetry_report_feed(
     MediaBackendStats backend_stats = {0};
     MediaHttpRangeStats video_range = {0};
     MediaHttpRangeStats audio_range = {0};
+    MediaHlsStats hls = {0};
     media_playback_job_stats(media->playback, &stats);
     bool backend_ready =
         psp_media_backend_stats_snapshot(media, &backend_stats);
     (void) media_http_range_stats(media->range, &video_range);
     (void) media_http_range_stats(media->audio_range, &audio_range);
+    bool hls_ready = psp_media_hls_stats(media->hls, &hls);
     PspMediaPresentDmaStats dma = {0};
     psp_media_present_ge_stage_dma_stats(&dma);
     printf(
@@ -475,6 +477,22 @@ void psp_media_telemetry_report_feed(
         audio_range.starved_reconnects,
         video_range.minimum_sustained_bytes_per_second,
         audio_range.minimum_sustained_bytes_per_second);
+    if (hls_ready) {
+        printf(
+            "tilefinch-media-hls: phase=%s playlist=%zuB media=%zuB "
+            "segments=%zu/%zu refresh=%zu/%zu skipped=%zu "
+            "queued=%zu/%zuB active=%u malformed=%zu sync-loss=%u "
+            "buffered-until=%lluus live=%u ended=%u\n",
+            phase == NULL ? "unknown" : phase,
+            hls.playlist_bytes_received, hls.bytes_received,
+            hls.segments_completed, hls.segments_started,
+            hls.playlist_refreshes, hls.playlist_refresh_failures,
+            hls.skipped_live_segments, hls.queued_samples,
+            hls.queued_bytes, hls.active_requests,
+            hls.malformed_segments, hls.ts_sync_losses,
+            (unsigned long long) hls.buffered_until_us,
+            hls.live ? 1u : 0u, hls.ended ? 1u : 0u);
+    }
     printf(
         "tilefinch-media-window: phase=%s "
         "superseded=%zu/%zu complete=%zu/%zu waste=%zu/%zu "

@@ -320,8 +320,18 @@ while photographs, thumbnails, and decoded video retain their source colors.
 
 Canvas 2D uses an exact, lazily allocated RGBA backing array inside the page's
 QuickJS budget, plus at most four budget-owned native snapshots (1 MiB total).
-That keeps `getImageData()` and `putImageData()` deterministic without giving
-every canvas an unrestricted framebuffer. The native raster seam draws actual
+The duplication is deliberate: JavaScript's RGBA array is the exact mutable
+state required by `getImageData()`, export, and canvas-to-canvas drawing, while
+the native snapshot is a stable presentation generation the renderer may read
+after author code continues mutating the canvas. Removing either copy without
+first moving exact readback and generation ownership into a native surface
+would trade memory for stale-frame races or observable pixel changes. This
+keeps `getImageData()` and `putImageData()` deterministic without giving every
+canvas an unrestricted framebuffer. Pixel-oriented scripts can create a
+blank buffer from another `ImageData` object's dimensions, publish only a
+clipped dirty rectangle, or reset the context without replacing the canvas;
+dirty publication uses bounded row copies rather than a JavaScript pixel loop.
+The native raster seam draws actual
 Tilefinch font glyphs, 2×2-coverage paths and strokes, per-pixel gradients, and
 transformed nearest-neighbour or bilinear sprites. It supports bounded nested
 clips, rounded geometry, line caps/joins/dashes, and the practical Porter-Duff
@@ -340,10 +350,111 @@ native snapshot, and invalidates only the affected page tiles. A same-size
 animation therefore does not rebuild style, layout, or the retained display
 list. Animation-frame callbacks run at most once per presented browser tick,
 use that tick's monotonic timestamp, remain paused with an inactive page, and
-skip elapsed frames rather than replaying a callback backlog. Pointer capture
-and layout-derived canvas-relative coordinates keep canvas controls stable
-through hover, drag, and release. Oversized surfaces, deep clip stacks, and
+skip elapsed frames rather than replaying a callback backlog. Native surfaces,
+the media player, and physical suspend also drive the Page Visibility API:
+`document.hidden` and `visibilityState` change at a normal browser-thread task
+checkpoint, `visibilitychange` preserves a suspend/resume pair even when both
+edges arrive before JavaScript resumes, and ordinary timers remain eligible
+while visual callbacks stay queued. Pointer capture and layout-derived
+canvas-relative coordinates keep canvas controls stable through hover, drag,
+and release. Authored canvas dimensions above the PSP surface envelope are
+scaled down proportionally to at most 480×272 and 131,072 pixels; a zero-sized
+axis stays zero while the other axis is still capped. Deep clip stacks and
 excess raster work fail soft while the rest of the page remains usable.
+
+`HTMLImageElement.decode()` exposes bounded decode readiness, and
+`createImageBitmap()` prepares at most eight cropped or resized asset snapshots
+with a 1 MiB aggregate logical ceiling. Bitmap pixels remain in the QuickJS
+budget and preserve canvas origin-clean state. They do not add another ordinary
+canvas backing store; closing or collecting a bitmap returns its separate
+asset allowance.
+
+The Gamepad API exposes one stable standard-mapped controller object for the
+built-in PSP controls. It is disconnected until the user holds Start+Select to
+hand input to the active top-level JavaScript page. Native input authority is a
+small generation-bearing capture record: navigation, native media, or suspend
+disconnects the object and returns control to the browser. Identical physical
+samples do not cross into QuickJS, button objects and axes are retained rather
+than recreated per poll, and cross-origin child frames never receive the
+snapshot. The same sustained chord returns control; the firmware HOME callback
+is outside page capture and remains unconditional.
+
+The page Fullscreen API is a singular top-level presentation state. A trusted
+activation commits the element identity before native chrome is hidden;
+Triangle or Start+Select exits immediately, and navigation or node retirement
+clears the borrowed handle. The PSP has no separate compositor top layer, so
+style resolution gives the active element a fixed viewport-sized box and
+supports `:fullscreen` without adding a spoofable DOM attribute.
+
+WebGL 1 is a lazy, bounded command translator over the PSP graphics engine,
+not a software GLSL interpreter. The JavaScript layer exposes the familiar
+object and state model, admits only fixed-function-compatible vertex-color or
+single-texture shader shapes, combines a bounded chain of position-matrix
+uniforms, and snapshots each draw's buffers, attributes, transform, viewport,
+scissor, depth, cull, and blend state into a bounded command batch. The native
+wire is versioned and uses fixed 32-bit integer and float words; this avoids
+software double-precision conversion on Allegrex while retaining draw-time
+state snapshots. The native boundary reads potentially unaligned words with
+`memcpy` and validates every scalar and byte span again before either the host
+reference rasterizer or PSP GE sees it. Unsupported
+shader control flow and unsupported state fail through WebGL errors or context
+loss while the surrounding document remains usable.
+
+Draw admission validates enabled-attribute spans and indexed-draw alignment,
+count, offset, maximum referenced vertex, and source-buffer bounds before a
+command enters the batch. This makes malformed game geometry an ordinary
+WebGL error rather than a late native-render failure or context loss.
+
+At most two contexts, 24 buffers, eight textures, 64 draws, and 4,096 vertices
+are admitted per realm. Buffer bytes are capped at 512 KiB, retained texture
+pixels at 416 KiB, and a drawing buffer at 480×272 and 131,072 pixels. The PSP
+scales larger authored dimensions proportionally instead of rejecting the
+context or allocating a larger surface. It keeps one bounded EDRAM color
+target, depth target, and texture cache, sharing GE command ownership with the
+media presenter rather than introducing
+a second graphics authority. Texture generations avoid re-uploading unchanged
+pixels within one native `(realm epoch, canvas handle)` owner. Fresh realms,
+context restoration, canvas changes, and the video layout's reuse of the EDRAM
+texture region clear that authority before lookup. Page-owned command, buffer,
+texture, depth, and presentation memory is
+charged through `Budget`; a failed allocation or excess scene refuses the
+operation without growing a hidden heap.
+
+PSP draw translation first counts the exact bounded vertex requirement, then
+charges only that scratch size for the submission. All emitted vertices occupy
+one contiguous prefix, so one cache writeback immediately before `sceGuFinish`
+publishes the batch. GE synchronization remains the ownership boundary before
+CPU readback; command submission is deliberately not asynchronous.
+
+The PSP 8888 alpha channel is also its stencil plane, so Tilefinch advertises
+an opaque drawing buffer (`alpha: false`) and resolves GE output to an opaque
+native surface while copying each completed row. This preserves fast,
+deterministic presentation for games and charts without claiming
+transparent-buffer behavior the hardware cannot
+implement consistently. The host rasterizer exercises pixels, clipping,
+depth, culling, blending, texture wrapping, and line closure. A PSP-target GE
+probe separately measures representative cube, sprite, draw-pressure,
+CPU-vertex, and texture-upload scenes; PPSSPP's software renderer is used when
+an end-to-end browser fixture must read GE pixels back into the page renderer.
+
+Game audio is another lazy, bounded module rather than a second media player.
+One `AudioContext` can decode up to eight PCM WAV buffers into a 512 KiB native
+pool and mix four voices on a PSP audio worker. Buffer sources support bounded
+loop regions; sine, square, sawtooth, and triangle oscillators are generated by
+the same mixer from a 130-byte quarter-wave table. Gain and stereo-pan changes
+publish packed atomic coefficients that the worker samples once per 512-frame
+block, while start and stop times use a wrapping 32-bit output-frame clock and
+a ten-second admission window. No synthesis path allocates or performs
+floating-point work on the audio thread. The context begins suspended and
+native resume requires trusted activation. Suspend releases the scarce PSP
+audio channel while retaining decoded effects; opening native page media does
+the same so game sounds cannot steal the video player's channel. A completed
+or stopped voice holds its generation-bearing slot until the browser thread
+takes its bounded completion notice; only then does the captured bridge
+dispatch `ended`/`onended` and return the slot for reuse. Worker code therefore
+never enters JavaScript, and a late completion cannot target a newer sound.
+Unsupported compressed formats, custom synthesis graphs, long-horizon
+scheduling, and PCM readback fail explicitly.
 
 ## Request authority, transport, and cache provenance
 
@@ -479,8 +590,10 @@ The player has one source-independent packet pipeline. The built-in provider sup
 resolved split or progressive streams, offline downloads supply bounded local
 files, and compatible page `<video>`/`<audio>` elements supply authorized
 progressive MP4/M4A or HLS URLs. MP4 performs a one-byte standard HTTP Range
-probe. HLS parses bounded master/media playlists and streams at most the
-current and next MPEG-TS segment through the shared worker. A live source
+probe. HLS parses masters exactly and large live media playlists incrementally,
+retaining only the newest twelve complete segment records rather than a DVR-
+sized response. Demuxed masters retain at most one video and one audio source;
+each source streams one MPEG-TS segment through the shared worker. A live source
 starts from the last three advertised segments, refreshes the rolling media
 playlist at half its target duration, maps media-sequence changes onto one
 continuous local clock, and records any skipped window as a discontinuity.
@@ -497,9 +610,11 @@ Stick. Finite HLS seek resets only the selected segment and preserves an
 untouched in-flight request across repeated cooperative readiness probes;
 rolling live playback deliberately has no scrubber. Video-only variants may
 prime as soon as their PMT and first video sample are known rather than filling
-the entire first segment. HLS uses the separately built optional decoder
-component; firmware-compatible progressive MP4 remains the official-build
-path.
+the entire first segment. Actual Annex-B SPS data selects the backend:
+Baseline/Main within PSP bounds is converted to the firmware bridge's bounded
+length-prefixed input on the codec worker, while High profile uses the
+separately built optional decoder component. In-band parameter-set changes are
+rejected unless they exactly preserve the firmware configuration.
 
 Audio-only playback is a route-time pipeline choice, not a hidden video
 surface. YouTube admits its adaptive AAC representation; a page `<audio>`
@@ -508,6 +623,20 @@ or demuxer and allocate no MPEG decoder or decoded-picture surfaces. The
 ordinary media state machine, range recovery, clock, buffering, pause, and
 seek contracts remain authoritative. Page `<video>` and saved media are
 deliberately unaffected by the global YouTube audio-only preference.
+
+YouTube resolution carries independent bounded audio, subtitle, and alternate
+language preferences from the profile. PSP system language remains the
+default source. The parser scans the bounded player inventory but retains only
+the six highest-ranked distinct audio and caption descriptors; exact selected
+IDs, exact BCP-47 tags, primary-language fallbacks, alternate language, and
+the authored default are ordered without allocating per track. A late track
+can displace a weaker retained entry, so the menu bound cannot hide a preferred
+language. Triangle opens the native player's track menu; choosing another
+audio track performs an ordinary generation-safe reopen at the current
+position. Subtitles default off, and their preference affects ranking only.
+Selecting one starts a single optional, credential-free WebVTT request only
+after playback has a healthy presentation reserve; it uses no media-reserved
+descriptor and a failure leaves video and controls usable.
 
 When a server-rendered `<video>` omits `src`, activation may perform one
 bounded, allocation-free scan of retained data scripts and generic media
@@ -596,6 +725,14 @@ state use temporary files, flushes, versioned records, and atomic publication
 appropriate to PSP FAT behavior. [Storage](STORAGE.md) is the authoritative
 file and write-frequency map.
 
+Manifest-backed offline apps extend the same library rather than adding a
+second runtime. Installation serializes the committed document and a bounded
+view of the live same-origin HTTP cache. That view retains typed resource
+grants and module provenance; launch restores it before committing the saved
+document under the original URL. The design supports small self-contained
+games without Service Workers, background execution, or an offline-only
+authorization bypass.
+
 The updater uses a stable launcher and A/B browser slots. A compact binary
 manifest signs release sequence, exact file sizes, and digests. The launcher
 anchors verification in the public root embedded by the PSP preset; private
@@ -611,6 +748,7 @@ Tilefinch treats evidence as part of the design:
 | Gate | What it proves |
 |---|---|
 | focused unit and fault-injection tests | bounds, rollback, parser policy, reducers, allocators |
+| Canvas/WebGL game lane | animation lifecycle, Gamepad sampling, pixel output, indexed geometry and graphics bounds |
 | selected upstream WPT | web-platform behavior against unchanged tests |
 | response-keyed replay | deterministic network inputs and closed request ledgers |
 | Chrome fidelity scoreboard | structural pixel similarity at the PSP viewport |

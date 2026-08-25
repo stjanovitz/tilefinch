@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "tilefinch/budget.h"
+#include "tilefinch/media_backend.h"
 #include "tilefinch/media_hls.h"
 
 #define CHECK(condition) do {                                                \
@@ -125,6 +126,53 @@ typedef struct {
     bool fail_segments;
 } MockTransport;
 
+typedef struct {
+    unsigned submits;
+    bool block_first;
+} PlaybackBackend;
+
+static MediaBackendResult playback_submit(
+    void *opaque, const MediaMp4Sample *sample,
+    const unsigned char *bytes, size_t length,
+    char *error, size_t error_size)
+{
+    (void) error;
+    (void) error_size;
+    PlaybackBackend *backend = opaque;
+    if (backend == NULL || sample == NULL || bytes == NULL
+        || length != sample->size) return MEDIA_BACKEND_ERROR;
+    backend->submits++;
+    if (backend->block_first) {
+        backend->block_first = false;
+        return MEDIA_BACKEND_WOULD_BLOCK;
+    }
+    return MEDIA_BACKEND_ACCEPTED;
+}
+
+static MediaBackendResult playback_drain(
+    void *opaque, char *error, size_t error_size)
+{
+    (void) opaque;
+    (void) error;
+    (void) error_size;
+    return MEDIA_BACKEND_END;
+}
+
+static bool playback_advance(
+    void *opaque, uint64_t clock_us, char *error, size_t error_size)
+{
+    (void) opaque;
+    (void) clock_us;
+    (void) error;
+    (void) error_size;
+    return true;
+}
+
+static void playback_destroy(void *opaque)
+{
+    (void) opaque;
+}
+
 static void build_segment(MockTransport *mock, size_t segment, uint64_t pts)
 {
     static const unsigned char pat[] = {
@@ -190,6 +238,24 @@ static void build_video_only_segment(MockTransport *mock, size_t segment,
     bytes = pes(payload, 0xe0u, pts + 3600u,
                 second_au, sizeof(second_au));
     ts_packet(at, 0x101u, true, payload, bytes); at += 188u;
+    mock->segment_bytes[segment] = (size_t) (at - mock->segment[segment]);
+}
+
+static void build_raw_adts_segment(MockTransport *mock, size_t segment)
+{
+    static const unsigned char id3[] = {
+        'I','D','3', 4,0,0, 0,0,0,4, 't','e','s','t'
+    };
+    static const unsigned char adts[] = {
+        0xff,0xf1,0x4c,0x80,0x00,0xff,0xfc
+    };
+    unsigned char *at = mock->segment[segment];
+    memcpy(at, id3, sizeof(id3));
+    at += sizeof(id3);
+    memcpy(at, adts, sizeof(adts));
+    at += sizeof(adts);
+    memcpy(at, adts, sizeof(adts));
+    at += sizeof(adts);
     mock->segment_bytes[segment] = (size_t) (at - mock->segment[segment]);
 }
 
@@ -281,6 +347,65 @@ static int test_playlists(void)
           && strcmp(url, "https://media.invalid/path/low.m3u8") == 0);
     media_hls_playlist_destroy(playlist);
 
+    static const char demuxed[] =
+        "#EXTM3U\n"
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"stereo\",NAME=\"English\","
+        "DEFAULT=YES,URI=\"audio-en.m3u8\"\n"
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"stereo\",NAME=\"Alt\","
+        "DEFAULT=NO,URI=\"audio-alt.m3u8\"\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=300000,RESOLUTION=426x240,"
+        "CODECS=\"avc1.4d4015\",AUDIO=\"stereo\"\nvideo.m3u8\n";
+    playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/live/master.m3u8",
+        (const unsigned char *) demuxed, strlen(demuxed),
+        error, sizeof(error));
+    char audio_url[256];
+    CHECK(playlist != NULL && media_hls_playlist_select_streams(
+              playlist, 432u, 240u, 240u, url, sizeof(url),
+              audio_url, sizeof(audio_url))
+          && strcmp(url, "https://media.invalid/live/video.m3u8") == 0
+          && strcmp(audio_url,
+                    "https://media.invalid/live/audio-en.m3u8") == 0);
+    media_hls_playlist_destroy(playlist);
+
+    static const char aac_choice[] =
+        "#EXTM3U\n"
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"he\",NAME=\"HE\","
+        "DEFAULT=YES,URI=\"audio-he.m3u8\"\n"
+        "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"lc\",NAME=\"LC\","
+        "DEFAULT=YES,URI=\"audio-lc.m3u8\"\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=507418,RESOLUTION=426x240,"
+        "CODECS=\"avc1.4d4015,mp4a.40.5\",AUDIO=\"he\"\nhe.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=591418,RESOLUTION=426x240,"
+        "CODECS=\"avc1.4d4015,mp4a.40.2\",AUDIO=\"lc\"\nlc.m3u8\n";
+    playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/live/master.m3u8",
+        (const unsigned char *) aac_choice, strlen(aac_choice),
+        error, sizeof(error));
+    CHECK(playlist != NULL && media_hls_playlist_select_streams(
+              playlist, 432u, 240u, 240u, url, sizeof(url),
+              audio_url, sizeof(audio_url))
+          && strcmp(url, "https://media.invalid/live/lc.m3u8") == 0
+          && strcmp(audio_url,
+                    "https://media.invalid/live/audio-lc.m3u8") == 0);
+    media_hls_playlist_destroy(playlist);
+
+    static const char missing_audio[] =
+        "#EXTM3U\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=300000,RESOLUTION=426x240,"
+        "CODECS=\"avc1.4d4015\",AUDIO=\"missing\"\nvideo.m3u8\n";
+    playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/live/master.m3u8",
+        (const unsigned char *) missing_audio, strlen(missing_audio),
+        error, sizeof(error));
+    CHECK(playlist != NULL
+          && media_hls_playlist_select_variant(
+              playlist, 432u, 240u, 240u, url, sizeof(url))
+          && !media_hls_playlist_select_streams(
+              playlist, 432u, 240u, 240u, url, sizeof(url),
+              audio_url, sizeof(audio_url)));
+    media_hls_playlist_destroy(playlist);
+
     static const char mixed_codecs[] =
         "#EXTM3U\n"
         "#EXT-X-STREAM-INF:BANDWIDTH=100000,RESOLUTION=426x240,"
@@ -340,6 +465,44 @@ static int test_playlists(void)
               (const unsigned char *) live_without_target,
               strlen(live_without_target), error, sizeof(error)) == NULL);
     CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_oversized_live_playlist_stream(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    char error[160] = {0};
+    MediaHlsPlaylistStream *stream = media_hls_playlist_stream_create(
+        &budget, "https://media.invalid/live/list.m3u8",
+        error, sizeof(error));
+    CHECK(stream != NULL);
+    static const char header[] =
+        "#EXTM3U\n#EXT-X-TARGETDURATION:4\n"
+        "#EXT-X-MEDIA-SEQUENCE:1000\n";
+    CHECK(media_hls_playlist_stream_feed(
+        stream, (const unsigned char *) header, strlen(header),
+        error, sizeof(error)));
+    char line[3072];
+    for (unsigned i = 0; i < 420u; i++) {
+        int length = snprintf(
+            line, sizeof(line),
+            "#EXTINF:4.000,\nsegment-%u.ts?token=%02500u\n", i, i);
+        CHECK(length > 0 && (size_t) length < sizeof(line)
+              && media_hls_playlist_stream_feed(
+                  stream, (const unsigned char *) line, (size_t) length,
+                  error, sizeof(error)));
+    }
+    CHECK(media_hls_playlist_stream_bytes_seen(stream) > 900000u
+          && media_hls_playlist_stream_was_compacted(stream));
+    MediaHlsPlaylist *playlist = media_hls_playlist_stream_finish(
+        stream, error, sizeof(error));
+    CHECK(playlist != NULL && media_hls_playlist_is_live(playlist)
+          && media_hls_playlist_segment_count(playlist)
+               == MEDIA_HLS_RETAINED_LIVE_SEGMENTS);
+    media_hls_playlist_destroy(playlist);
+    media_hls_playlist_stream_destroy(stream);
+    CHECK(budget.current == 0u);
     return 0;
 }
 
@@ -641,11 +804,158 @@ static int test_video_only_primes_before_segment_completion(void)
     return 0;
 }
 
+static int test_demuxed_track_sources_prime_independently(void)
+{
+    Budget budget;
+    budget_init(&budget, 3u * 1024u * 1024u);
+    static const char media[] =
+        "#EXTM3U\n#EXTINF:4.000,\none.ts\n#EXT-X-ENDLIST\n";
+    char error[160] = {0};
+    MediaHlsPlaylist *video_playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/video.m3u8",
+        (const unsigned char *) media, strlen(media), error, sizeof(error));
+    MediaHlsPlaylist *audio_playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/audio.m3u8",
+        (const unsigned char *) media, strlen(media), error, sizeof(error));
+    CHECK(video_playlist != NULL && audio_playlist != NULL);
+    MockTransport video_transport = {0}, audio_transport = {0};
+    build_segment(&video_transport, 0u, 90000u);
+    build_segment(&audio_transport, 0u, 90000u);
+    MediaHlsTransport video_ops = {
+        .opaque = &video_transport, .start = mock_start,
+        .poll = mock_poll, .cancel = mock_cancel
+    };
+    MediaHlsTransport audio_ops = {
+        .opaque = &audio_transport, .start = mock_start,
+        .poll = mock_poll, .cancel = mock_cancel
+    };
+    MediaHlsSource *video = media_hls_source_create_track(
+        &budget, video_playlist, &video_ops, MEDIA_HLS_TRACK_VIDEO,
+        error, sizeof(error));
+    MediaHlsSource *audio = media_hls_source_create_track(
+        &budget, audio_playlist, &audio_ops, MEDIA_HLS_TRACK_AUDIO,
+        error, sizeof(error));
+    CHECK(video != NULL && audio != NULL);
+    MediaHlsPrimeStatus video_status = MEDIA_HLS_PRIME_PENDING;
+    MediaHlsPrimeStatus audio_status = MEDIA_HLS_PRIME_PENDING;
+    for (unsigned guard = 0; guard < 64u
+         && (video_status == MEDIA_HLS_PRIME_PENDING
+             || audio_status == MEDIA_HLS_PRIME_PENDING); guard++) {
+        if (video_status == MEDIA_HLS_PRIME_PENDING)
+            video_status = media_hls_source_prime(
+                video, error, sizeof(error));
+        if (audio_status == MEDIA_HLS_PRIME_PENDING)
+            audio_status = media_hls_source_prime(
+                audio, error, sizeof(error));
+    }
+    MediaMp4TrackInfo video_info = {0}, audio_info = {0};
+    CHECK(video_status == MEDIA_HLS_PRIME_READY
+          && audio_status == MEDIA_HLS_PRIME_READY
+          && media_hls_source_stream_info(video, &video_info, NULL)
+          && media_hls_source_stream_info(audio, NULL, &audio_info)
+          && video_info.packet_format == MEDIA_PACKET_FORMAT_H264_ANNEX_B
+          && audio_info.packet_format == MEDIA_PACKET_FORMAT_AAC_ADTS);
+    MediaSampleSource video_samples = {0}, audio_samples = {0};
+    CHECK(media_hls_source_sample_source(video, &video_samples)
+          && media_hls_source_sample_source(audio, &audio_samples)
+          && video_samples.ops->track_count(video_samples.opaque) == 1u
+          && audio_samples.ops->track_count(audio_samples.opaque) == 1u);
+    MediaMp4Sample sample = {0};
+    CHECK(video_samples.ops->next_sample(video_samples.opaque, &sample)
+          && sample.kind == MEDIA_MP4_TRACK_VIDEO
+          && audio_samples.ops->next_sample(audio_samples.opaque, &sample)
+          && sample.kind == MEDIA_MP4_TRACK_AUDIO);
+    /* HLS reads retire their queue head.  A firmware backend can transiently
+       refuse that copied packet, so playback must retry the retained bytes,
+       not ask the streaming source to recreate an already-consumed AU. */
+    PlaybackBackend playback_fixture = {.block_first = true};
+    MediaBackend backend = {
+        .opaque = &playback_fixture,
+        .submit = playback_submit,
+        .drain = playback_drain,
+        .advance = playback_advance,
+        .destroy = playback_destroy
+    };
+    MediaPlaybackOptions options = {
+        .decode_lead_us = UINT64_C(2000000),
+        .maximum_packet_bytes = 1024u * 1024u
+    };
+    MediaPlayback *playback = media_playback_create_sources(
+        &budget, &video_samples, &audio_samples, &backend, &options,
+        error, sizeof(error));
+    CHECK(playback != NULL
+          && media_playback_advance_bounded(
+                 playback, UINT64_C(1000000), 1u, error, sizeof(error))
+               == MEDIA_PLAYBACK_ADVANCE_PENDING
+          && playback_fixture.submits == 1u
+          && media_playback_advance_bounded(
+                 playback, UINT64_C(1000000), 1u, error, sizeof(error))
+               != MEDIA_PLAYBACK_ADVANCE_ERROR
+          && playback_fixture.submits == 2u);
+    media_playback_destroy(playback);
+    media_hls_source_destroy(video);
+    media_hls_source_destroy(audio);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
+static int test_demuxed_raw_adts_audio_source(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    static const char media[] =
+        "#EXTM3U\n#EXTINF:4.000,\none.ts\n#EXT-X-ENDLIST\n";
+    char error[160] = {0};
+    MediaHlsPlaylist *playlist = media_hls_playlist_parse(
+        &budget, "https://media.invalid/audio.m3u8",
+        (const unsigned char *) media, strlen(media), error, sizeof(error));
+    CHECK(playlist != NULL);
+    MockTransport mock = {0};
+    build_raw_adts_segment(&mock, 0u);
+    MediaHlsTransport transport = {
+        .opaque = &mock, .start = mock_start,
+        .poll = mock_poll, .cancel = mock_cancel
+    };
+    MediaHlsSource *source = media_hls_source_create_track(
+        &budget, playlist, &transport, MEDIA_HLS_TRACK_AUDIO,
+        error, sizeof(error));
+    CHECK(source != NULL);
+    MediaHlsPrimeStatus status = MEDIA_HLS_PRIME_PENDING;
+    for (unsigned guard = 0; guard < 32u
+         && status == MEDIA_HLS_PRIME_PENDING; guard++) {
+        status = media_hls_source_prime(source, error, sizeof(error));
+    }
+    MediaMp4TrackInfo audio = {0};
+    CHECK(status == MEDIA_HLS_PRIME_READY
+          && media_hls_source_stream_info(source, NULL, &audio)
+          && audio.packet_format == MEDIA_PACKET_FORMAT_AAC_ADTS
+          && audio.sample_rate == 48000u && audio.channels == 2u);
+    MediaSampleSource samples = {0};
+    MediaMp4Sample sample = {0};
+    unsigned char payload[16] = {0};
+    CHECK(media_hls_source_sample_source(source, &samples)
+          && samples.ops->next_sample(samples.opaque, &sample)
+          && sample.kind == MEDIA_MP4_TRACK_AUDIO
+          && sample.size == 7u
+          && samples.ops->read_sample(
+              samples.opaque, &sample, payload, sizeof(payload))
+          && payload[0] == 0xffu && payload[1] == 0xf1u);
+    MediaHlsStats stats = {0};
+    media_hls_source_stats(source, &stats);
+    CHECK(stats.malformed_segments == 0u && stats.queue_overflows == 0u);
+    media_hls_source_destroy(source);
+    CHECK(budget.current == 0u);
+    return 0;
+}
+
 int main(void)
 {
     if (test_playlists() != 0) return 1;
+    if (test_oversized_live_playlist_stream() != 0) return 1;
     if (test_streaming_source() != 0) return 1;
     if (test_video_only_primes_before_segment_completion() != 0) return 1;
+    if (test_demuxed_track_sources_prime_independently() != 0) return 1;
+    if (test_demuxed_raw_adts_audio_source() != 0) return 1;
     if (test_live_window_refresh() != 0) return 1;
     if (test_live_refresh_gap_failure_and_endlist() != 0) return 1;
     if (test_live_segment_failure_survives_static_refresh() != 0) return 1;

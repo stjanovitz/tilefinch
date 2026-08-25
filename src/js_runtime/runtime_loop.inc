@@ -263,6 +263,43 @@ static void runtime_apply_gc_slack(ScriptRuntime *runtime)
                       threshold > SIZE_MAX ? SIZE_MAX : (size_t) threshold);
 }
 
+static bool runtime_dispatch_page_visibility_edge(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->page_visibility_queue_count == 0)
+        return true;
+    uint8_t head = runtime->page_visibility_queue_head;
+    bool visible = runtime->page_visibility_queue[head];
+    runtime->page_visibility_queue_head = (uint8_t) ((head + 1u) % 2u);
+    runtime->page_visibility_queue_count--;
+    JSValue argument = JS_NewBool(runtime->context, visible);
+    bool ok = !JS_IsException(argument)
+        && runtime_call_captured(
+               runtime, runtime->page_visibility_host_apply,
+               "page visibility", 1, &argument, NULL);
+    JS_FreeValue(runtime->context, argument);
+    return ok;
+}
+
+static bool runtime_dispatch_game_audio_completion(ScriptRuntime *runtime,
+                                                    bool *dispatched)
+{
+    if (dispatched != NULL) *dispatched = false;
+    if (runtime == NULL || runtime->game_audio == NULL) return true;
+    if (!JS_IsFunction(runtime->context,
+                       runtime->game_audio_host_complete)) return false;
+    uint32_t voice_handle = 0;
+    if (!tilefinch_game_audio_take_completion(
+            runtime->game_audio, &voice_handle)) return true;
+    JSValue argument = JS_NewUint32(runtime->context, voice_handle);
+    bool ok = !JS_IsException(argument)
+        && runtime_call_captured(
+               runtime, runtime->game_audio_host_complete,
+               "game audio completion", 1, &argument, NULL);
+    JS_FreeValue(runtime->context, argument);
+    if (dispatched != NULL) *dispatched = true;
+    return ok;
+}
+
 bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
                             size_t callback_budget, ScriptResult *result)
 {
@@ -346,6 +383,22 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         microtask_elapsed_ns += js_rt_monotonic_time_ns() - phase_started;
     }
     size_t remaining = callback_budget;
+    if (ok && !classic_continuation
+        && !JS_IsJobPending(runtime->runtime)
+        && runtime->page_visibility_queue_count != 0
+        && remaining != 0) {
+        ok = runtime_dispatch_page_visibility_edge(runtime);
+        remaining--;
+        if (ok) ok = js_rt_runtime_run_jobs(runtime);
+    }
+    while (ok && !classic_continuation
+           && !JS_IsJobPending(runtime->runtime) && remaining != 0) {
+        bool dispatched = false;
+        ok = runtime_dispatch_game_audio_completion(runtime, &dispatched);
+        if (!ok || !dispatched) break;
+        remaining--;
+        ok = js_rt_runtime_run_jobs(runtime);
+    }
     size_t callbacks = 0;
     while (ok && remaining != 0
            && (classic_continuation

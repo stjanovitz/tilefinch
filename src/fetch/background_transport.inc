@@ -179,6 +179,7 @@ typedef struct {
     bool redirect_same_origin_only;
     bool body_enabled;
     bool identity_encoding;
+    bool raw_gzip_encoding;
     bool force_fresh_connection;
     bool send_low_client_hints;
     bool send_client_hints;
@@ -830,7 +831,11 @@ static bool fetch_background_configure_easy(FetchBackgroundSlot *slot)
                TILEFINCH_CURL_HTTP_PROTOCOLS) != CURLE_OK
         || curl_easy_setopt(
                slot->easy, CURLOPT_ACCEPT_ENCODING,
-               slot->identity_encoding ? "identity" : "") != CURLE_OK
+               slot->identity_encoding ? "identity"
+               : slot->raw_gzip_encoding ? "gzip" : "") != CURLE_OK
+        || curl_easy_setopt(
+               slot->easy, CURLOPT_HTTP_CONTENT_DECODING,
+               slot->raw_gzip_encoding ? 0L : 1L) != CURLE_OK
         || curl_easy_setopt(
                slot->easy, CURLOPT_USERAGENT,
                slot->user_agent[0] == '\0'
@@ -2110,6 +2115,7 @@ static uint64_t fetch_background_transport_enqueue_stream_internal(
         slot->body_enabled = true;
         slot->body_length = request->body_length;
         slot->identity_encoding = request->identity_encoding;
+        slot->raw_gzip_encoding = request->raw_gzip_encoding;
         slot->force_fresh_connection = request->force_fresh_connection;
         slot->send_low_client_hints = request->send_low_client_hints;
         slot->send_client_hints = request->send_client_hints;
@@ -2323,6 +2329,7 @@ static uint64_t fetch_background_transport_enqueue_fixed_internal(
         slot->redirect_same_origin_only = false;
         slot->body_enabled = false;
         slot->identity_encoding = false;
+        slot->raw_gzip_encoding = false;
         /* Fixed-size media windows use this enqueue path. Preserve the
            caller's retry policy just as the streaming path does; clearing it
            here silently routed every trickle retry back onto the throttled
@@ -2724,7 +2731,7 @@ bool fetch_background_transport_take_chunk(
         || !fetch_background_slot_matches(slot, request_id)) return false;
     size_t available = atomic_load_explicit(
         &slot->chunk_bytes, memory_order_acquire);
-    if (available == 0 || available > capacity) return false;
+    if (available == 0 || capacity == 0) return false;
     int expected = FETCH_BACKGROUND_CHUNK_READY;
     if (!atomic_compare_exchange_strong_explicit(
             &slot->chunk_state, &expected, FETCH_BACKGROUND_CHUNK_TAKING,
@@ -2736,19 +2743,32 @@ bool fetch_background_transport_take_chunk(
             memory_order_release);
         return false;
     }
-    memcpy(destination, source, available);
-    slot->length = 0;
-    *length = available;
-    atomic_store_explicit(
-        &slot->chunk_bytes, 0u, memory_order_release);
-    atomic_store_explicit(
-        &slot->chunk_state, FETCH_BACKGROUND_CHUNK_EMPTY,
-        memory_order_release);
-    (void) sceKernelSetEventFlag(
-        fetch_background.event, FETCH_BACKGROUND_EVENT_WAKE);
+    size_t taken = available < capacity ? available : capacity;
+    memcpy(destination, source, taken);
+    size_t remaining = available - taken;
+    *length = taken;
+    if (remaining != 0) {
+        memmove(source, source + taken, remaining);
+        slot->length = remaining;
+        atomic_store_explicit(
+            &slot->chunk_bytes, (unsigned) remaining,
+            memory_order_release);
+        atomic_store_explicit(
+            &slot->chunk_state, FETCH_BACKGROUND_CHUNK_READY,
+            memory_order_release);
+    } else {
+        slot->length = 0;
+        atomic_store_explicit(
+            &slot->chunk_bytes, 0u, memory_order_release);
+        atomic_store_explicit(
+            &slot->chunk_state, FETCH_BACKGROUND_CHUNK_EMPTY,
+            memory_order_release);
+        (void) sceKernelSetEventFlag(
+            fetch_background.event, FETCH_BACKGROUND_EVENT_WAKE);
 #if LIBCURL_VERSION_NUM >= 0x074400
-    (void) curl_multi_wakeup(fetch_background.multi);
+        (void) curl_multi_wakeup(fetch_background.multi);
 #endif
+    }
     return true;
 }
 

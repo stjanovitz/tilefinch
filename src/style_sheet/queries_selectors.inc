@@ -1727,7 +1727,7 @@ static bool supports_selector_pseudo(const char *name, size_t length)
     static const char *const supported[] = {
         "active", "any-link", "checked", "defined", "disabled", "empty",
         "enabled", "first-child", "first-of-type", "focus",
-        "focus-visible", "focus-within", "has", "hover", "is", "lang",
+        "focus-visible", "focus-within", "fullscreen", "has", "hover", "is", "lang",
         "last-child", "last-of-type", "link", "modal", "not", "nth-child",
         "nth-last-child", "nth-last-of-type", "nth-of-type", "only-child",
         "only-of-type", "open", "optional", "popover-open", "required",

@@ -3081,6 +3081,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
         || layout_node_name_is(node, "svg")
         || layout_node_name_is(node, "video")
         || layout_node_name_is(node, "audio")
+        || layout_node_name_is(node, "canvas")
         || layout_node_name_is(node, "iframe");
     if (is_atomic_inline(style.display) && !input_control
         && !textarea_control && !editable_control && !replaced_element) {
@@ -3486,7 +3487,9 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
     if (layout_node_name_is(node, "img") || layout_node_name_is(node, "svg")
         || layout_node_name_is(node, "video")
         || layout_node_name_is(node, "audio")
+        || layout_node_name_is(node, "canvas")
         || layout_node_name_is(node, "iframe")) {
+        bool canvas_element = layout_node_name_is(node, "canvas");
         bool audio_element = layout_node_name_is(node, "audio");
         bool audio_controls = audio_element
             && lxb_dom_element_has_attribute(
@@ -3515,7 +3518,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             ? image_resource_intrinsic_width(image) : 0;
         int height = image_available
             ? image_resource_intrinsic_height(image) : 0;
-        if ((layout_node_name_is(node, "video")
+        if ((layout_node_name_is(node, "video") || canvas_element
              || audio_controls
              || layout_node_name_is(node, "iframe"))
             && (width <= 0 || height <= 0)) {
@@ -3548,6 +3551,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             && !layout_node_name_is(node, "svg")
             && !layout_node_name_is(node, "video")
             && !layout_node_name_is(node, "audio")
+            && !canvas_element
             && !layout_node_name_is(node, "iframe")) {
             size_t alt_length = 0;
             const char *alt = layout_node_name_is(node, "img")
@@ -3684,7 +3688,7 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             }
             image_command = (size_t) (
                 stored - context->layout->commands);
-        } else if (!layout_add_replaced_alt_text(
+        } else if (!canvas_element && !layout_add_replaced_alt_text(
                        context, node, &style, content_x, content_y,
                        width, height)) {
             return false;

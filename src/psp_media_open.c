@@ -1,5 +1,41 @@
 #include "psp_media_session_internal.h"
 
+static void psp_media_publish_track_catalog(PspMediaSession *media)
+{
+    if (media == NULL) return;
+    size_t audio_count = media->stream.audio_track_count;
+    size_t caption_count = media->stream.caption_track_count;
+    if (audio_count > PSP_UI_MEDIA_TRACK_LIMIT)
+        audio_count = PSP_UI_MEDIA_TRACK_LIMIT;
+    if (caption_count > PSP_UI_MEDIA_TRACK_LIMIT)
+        caption_count = PSP_UI_MEDIA_TRACK_LIMIT;
+    psp_ui_media_set_tracks(
+        &media->ui, NULL, audio_count, media->stream.selected_audio_track,
+        NULL, caption_count, media->stream.selected_caption_track);
+    for (size_t at = 0; at < audio_count; at++) {
+        const YoutubeTrack *track = &media->stream.audio_tracks[at];
+        snprintf(media->ui_presentation.audio_tracks[at].label,
+                 sizeof(media->ui_presentation.audio_tracks[at].label),
+                 "%s%s",
+                 track->label[0] == '\0'
+                    ? (track->language[0] == '\0'
+                        ? "Audio" : track->language)
+                    : track->label,
+                 track->automatic ? " (auto)" : "");
+    }
+    for (size_t at = 0; at < caption_count; at++) {
+        const YoutubeTrack *track = &media->stream.caption_tracks[at];
+        snprintf(media->ui_presentation.subtitle_tracks[at].label,
+                 sizeof(media->ui_presentation.subtitle_tracks[at].label),
+                 "%s%s",
+                 track->label[0] == '\0'
+                    ? (track->language[0] == '\0'
+                        ? "Subtitles" : track->language)
+                    : track->label,
+                 track->automatic ? " (auto)" : "");
+    }
+}
+
 #include <stdio.h>
 #include <string.h>
 
@@ -12,6 +48,9 @@
 #define KIB 1024u
 #define PSP_MEDIA_CONNECT_TIMEOUT_MS 3000
 #define PSP_MEDIA_REUSED_URL_MINIMUM_LIFETIME_SECONDS 60u
+
+_Static_assert(YOUTUBE_TRACK_LIMIT <= PSP_UI_MEDIA_TRACK_LIMIT,
+               "resolver track catalog exceeds player menu");
 
 typedef enum {
     PSP_PAGE_MEDIA_PROBE_PENDING = 0,
@@ -330,11 +369,18 @@ static bool psp_media_create_playback(PspMediaSession *media,
                                       char *error, size_t error_size)
 {
     MediaBackend backend = {0};
+    const MediaSampleSource *hls_audio =
+        media->hls_audio_source.opaque == NULL
+            ? NULL : &media->hls_audio_source;
     bool backend_ready = media->hls != NULL
-        ? media_psp_swdec_backend_create_sources(
-            media->budget, &media->hls_source, NULL,
-            psp_swdec_component_api(&media->swdec),
-            &backend, error, error_size)
+        ? media->use_swdec
+            ? media_psp_swdec_backend_create_sources(
+                media->budget, &media->hls_source, hls_audio,
+                psp_swdec_component_api(&media->swdec),
+                &backend, error, error_size)
+            : media_psp_backend_create_sources(
+                media->budget, &media->hls_source, hls_audio,
+                &backend, error, error_size)
         : media->use_swdec && !media->audio_only
         ? media_psp_swdec_backend_create_split(
             media->budget, media->demux, media->audio_demux,
@@ -370,7 +416,7 @@ static bool psp_media_create_playback(PspMediaSession *media,
     };
     media->playback = media->hls != NULL
         ? media_playback_create_sources(
-            media->budget, &media->hls_source, NULL,
+            media->budget, &media->hls_source, hls_audio,
             &backend, &options, error, error_size)
         : media->audio_only
         ? media_playback_create(
@@ -1076,7 +1122,7 @@ static void psp_media_open_report(PspMediaSession *media, const char *event)
            (unsigned long long) (media->job_phase_started_us == 0
                || now_us < media->job_phase_started_us
                    ? 0 : now_us - media->job_phase_started_us),
-           video.bytes_received + audio.bytes_received,
+           psp_media_range_bytes(media),
            video.window_pending ? 1 : 0, audio.window_pending ? 1 : 0,
            video.bytes_in_flight, audio.bytes_in_flight);
     YoutubeResolveJobMetrics resolver = {0};
@@ -1096,6 +1142,16 @@ static void psp_media_open_report(PspMediaSession *media, const char *event)
                worker.occupied_slots, worker.queued_slots,
                worker.running_slots, worker.cancelled_retired,
                resolver.cached_identity ? 1 : 0);
+    }
+    MediaHlsStats hls = {0};
+    if (psp_media_hls_stats(media->hls, &hls)) {
+        printf("tilefinch-media-hls-open-progress: playlist=%zuB "
+               "segment=%zuB started=%zu complete=%zu queued=%zu/%zuB "
+               "requests=%u live=%d\n",
+               hls.playlist_bytes_received, hls.bytes_received,
+               hls.segments_started, hls.segments_completed,
+               hls.queued_samples, hls.queued_bytes,
+               hls.active_requests, hls.live ? 1 : 0);
     }
 }
 
@@ -1295,13 +1351,36 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                     ok = true;
                     break;
                 }
-                ok = status == PSP_MEDIA_HLS_OPEN_READY
-                    && psp_media_hls_sample_source(
-                        media->hls, &media->hls_source);
+                bool separate_audio = false;
+                bool sources_ready = status == PSP_MEDIA_HLS_OPEN_READY
+                    && psp_media_hls_sample_sources(
+                           media->hls, &media->hls_source,
+                           &media->hls_audio_source, &separate_audio);
+                ok = sources_ready;
+                if (status == PSP_MEDIA_HLS_OPEN_READY && !ok
+                    && error[0] == '\0') {
+                    snprintf(error, sizeof(error), "%s",
+                             "HLS sample-source handoff failed");
+                }
                 if (ok) {
                     MediaMp4TrackInfo video = {0}, audio = {0};
-                    ok = psp_media_hls_stream_info(
+                    bool info_ready = psp_media_hls_stream_info(
                         media->hls, &video, &audio);
+                    ok = info_ready;
+                    if (!ok && error[0] == '\0') {
+                        snprintf(error, sizeof(error), "%s",
+                                 "HLS decoder metadata is unavailable");
+                    }
+                    printf("tilefinch-media-hls-open: status=%d "
+                           "sources=%d info=%d separate=%d "
+                           "video=%ux%u audio=%u/%u error=\"%.120s\"\n",
+                           (int) status, sources_ready ? 1 : 0,
+                           info_ready ? 1 : 0, separate_audio ? 1 : 0,
+                           (unsigned) video.width,
+                           (unsigned) video.height,
+                           (unsigned) audio.sample_rate,
+                           (unsigned) audio.channels,
+                           error);
                     if (ok) {
                         if (!provider_live) {
                             memset(&media->stream, 0, sizeof(media->stream));
@@ -1309,9 +1388,47 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                                      sizeof(media->stream.title), "%s",
                                      "Page video");
                         }
-                        snprintf(media->stream.mime_type,
-                                 sizeof(media->stream.mime_type), "%s",
-                                 "video/mp2t; codecs=avc1.64001e,mp4a.40.2");
+                        uint8_t profile = 0;
+                        MediaH264DecoderRoute route =
+                            media_h264_annexb_decoder_route(
+                                video.codec_config,
+                                video.codec_config_length, &profile);
+                        if (route == MEDIA_H264_DECODER_ROUTE_UNSUPPORTED) {
+                            snprintf(error, sizeof(error), "%s",
+                                     "HLS carries unsupported AVC syntax");
+                            ok = false;
+                            break;
+                        }
+                        media->decoder_profile_idc = profile;
+                        media->use_swdec =
+                            route == MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION
+                            || psp_swdec_component_owns_me(&media->swdec);
+                        if (media->use_swdec
+                            && !psp_swdec_component_prepare(
+                                &media->swdec, error, sizeof(error))) {
+                            ok = false;
+                            break;
+                        }
+                        const unsigned char *sps = NULL, *pps = NULL;
+                        size_t sps_length = 0, pps_length = 0;
+                        bool codec_string_ready =
+                            media_h264_annexb_parameter_sets(
+                                video.codec_config,
+                                video.codec_config_length,
+                                &sps, &sps_length, &pps, &pps_length)
+                            && sps_length >= 4u;
+                        (void) pps;
+                        (void) pps_length;
+                        unsigned constraints = codec_string_ready
+                            ? (unsigned) sps[2] : 0u;
+                        unsigned level = codec_string_ready
+                            ? (unsigned) sps[3] : 0u;
+                        snprintf(
+                            media->stream.mime_type,
+                            sizeof(media->stream.mime_type),
+                            "video/mp2t; codecs=avc1.%02x%02x%02x,"
+                            "mp4a.40.2", (unsigned) profile,
+                            constraints, level);
                         media->stream.width = video.width;
                         media->stream.height = video.height;
                         media->stream.duration_ms =
@@ -1319,8 +1436,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                             : video.duration * UINT64_C(1000)
                                 / video.timescale;
                         media->stream.expires_unix = UINT64_MAX;
-                        media->use_swdec = true;
-                        media->decoder_profile_idc = 100u;
+                        media->stream.split_streams = separate_audio;
                     }
                 }
             }
@@ -1359,6 +1475,13 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                     media->budget, media->session, media->source,
                     (int) media->requested_quality, 30000,
                     psp_media_cancel_callback, media);
+                if (media->resolver_job != NULL
+                    && !youtube_resolve_job_set_track_preferences(
+                           media->resolver_job,
+                           &media->track_preferences)) {
+                    youtube_resolve_job_destroy(media->resolver_job);
+                    media->resolver_job = NULL;
+                }
             }
             if (media->resolver_job == NULL) {
                 ok = false;
@@ -1379,17 +1502,24 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                              youtube_resolve_job_error(
                                  media->resolver_job));
                 }
+                printf("tilefinch-youtube-resolve: status=%d ok=%d "
+                       "live=%d error=\"%.160s\"\n",
+                       (int) status, ok ? 1 : 0,
+                       media->stream.live_hls ? 1 : 0,
+                       ok ? "" : error);
                 youtube_resolve_job_destroy(media->resolver_job);
                 media->resolver_job = NULL;
             }
         } else {
             memset(&media->stream, 0, sizeof(media->stream));
-            ok = youtube_resolve_progressive_mp4_cancelable(
+            ok = youtube_resolve_progressive_mp4_cancelable_with_preferences(
                 media->budget, media->session, media->source,
                 (int) media->requested_quality, 30000,
+                &media->track_preferences,
                 psp_media_cancel_callback, media,
                 &media->stream, error, sizeof(error));
         }
+        if (ok) psp_media_publish_track_catalog(media);
         if (ok && media->audio_only && !media->page_audio
             && (!media->stream.split_streams
                 || media->stream.audio_url[0] == '\0'
@@ -1462,6 +1592,10 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                 ? PSP_MEDIA_JOB_OPEN_VIDEO_RANGE
                 : PSP_MEDIA_JOB_OPEN_DECODER_PREPARE;
         } else {
+            if (error[0] == '\0') {
+                snprintf(error, sizeof(error), "%s",
+                         "format: media source setup failed without detail");
+            }
             const char *stage = "format";
             if (strncmp(error, "watch:", 6) == 0) stage = "watch";
             else if (strncmp(error, "player:", 7) == 0)
@@ -1477,6 +1611,13 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         break;
     }
     case PSP_MEDIA_JOB_OPEN_VIDEO_RANGE: {
+        if (media->hls != NULL) {
+            /* The HLS resolver already owns its bounded sample sources. Keep
+               the authoritative open chart's service boundary even though no
+               MP4 range object is required for this route. */
+            media->job_phase = PSP_MEDIA_JOB_OPEN_VIDEO_DEMUX;
+            break;
+        }
         if (media->offline_source) {
             media->file_range = media_file_range_open(
                 media->budget, media->offline_video_path,
@@ -1564,6 +1705,10 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         break;
     }
     case PSP_MEDIA_JOB_OPEN_VIDEO_DEMUX: {
+        if (media->hls != NULL) {
+            media->job_phase = PSP_MEDIA_JOB_OPEN_VIDEO_PRIME;
+            break;
+        }
         MediaRangeReader reader = media->offline_source
             ? media_file_range_reader(media->file_range)
             : media_http_range_reader(media->range);
@@ -1589,6 +1734,12 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         break;
     }
     case PSP_MEDIA_JOB_OPEN_VIDEO_PRIME: {
+        if (media->hls != NULL) {
+            media->job_phase = media->stream.split_streams
+                ? PSP_MEDIA_JOB_OPEN_AUDIO_RANGE
+                : PSP_MEDIA_JOB_OPEN_PLAYBACK;
+            break;
+        }
         MediaHttpRangePrimeStatus primed = media->offline_source
                 || !browser_profile_video_startup_buffering(media->profile)
             ? MEDIA_HTTP_RANGE_PRIME_READY
@@ -1613,6 +1764,10 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         break;
     }
     case PSP_MEDIA_JOB_OPEN_AUDIO_RANGE: {
+        if (media->hls != NULL) {
+            media->job_phase = PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX;
+            break;
+        }
         if (media->offline_source) {
             media->audio_file_range = media_file_range_open(
                 media->budget, media->offline_audio_path,
@@ -1631,6 +1786,10 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         break;
     }
     case PSP_MEDIA_JOB_OPEN_AUDIO_DEMUX: {
+        if (media->hls != NULL) {
+            media->job_phase = PSP_MEDIA_JOB_OPEN_PLAYBACK;
+            break;
+        }
         MediaRangeReader reader = media->offline_source
             ? media_file_range_reader(media->audio_file_range)
             : media_http_range_reader(media->audio_range);
@@ -1668,7 +1827,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
             ok = prepared == MEDIA_PSP_PREPARE_READY;
         }
         if (ok) media->job_phase = media->hls != NULL
-            ? PSP_MEDIA_JOB_OPEN_PLAYBACK
+            ? PSP_MEDIA_JOB_OPEN_VIDEO_RANGE
             : media->page_audio && media->audio_demux != NULL
             ? PSP_MEDIA_JOB_OPEN_PLAYBACK
             : media->demux != NULL
@@ -1812,6 +1971,20 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                (unsigned long long) audio_http.pump_max_us,
                (unsigned long long) audio_http.install_max_us,
                audio_http.bytes_received);
+        MediaHlsStats hls_stats = {0};
+        if (psp_media_hls_stats(media->hls, &hls_stats)) {
+            printf("tilefinch-media-hls: playlist-bytes=%zu "
+                   "segment-bytes=%zu segments=%zu/%zu refresh=%zu/%zu "
+                   "queued=%zu/%zuB live=%d\n",
+                   hls_stats.playlist_bytes_received,
+                   hls_stats.bytes_received,
+                   hls_stats.segments_completed,
+                   hls_stats.segments_started,
+                   hls_stats.playlist_refreshes,
+                   hls_stats.playlist_refresh_failures,
+                   hls_stats.queued_samples, hls_stats.queued_bytes,
+                   hls_stats.live ? 1 : 0);
+        }
     }
     if (!ok) {
         MediaHttpRangeStats video_stats = {0};

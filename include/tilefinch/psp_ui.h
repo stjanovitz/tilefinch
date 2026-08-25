@@ -94,8 +94,12 @@ typedef struct {
     const char *detail;
     char trailing[PSP_UI_COLLECTIONS_TRAILING_CAPACITY];
     bool deletable;
+    bool is_web_app;
+    bool app_theme_valid;
+    uint16_t app_theme_rgb565;
     uint16_t progress_per_mille;
     uint8_t offline_state;
+    const unsigned char *icon_rgba;
 } PspUiCollectionsRow;
 
 typedef struct {
@@ -104,6 +108,18 @@ typedef struct {
     const char *empty_message;
     PspUiCollectionsRow rows[PSP_UI_COLLECTIONS_ROW_LIMIT];
 } PspUiCollectionsView;
+
+typedef struct {
+    char name[PSP_UI_TITLE_CAPACITY];
+    uint64_t estimated_bytes;
+    uint32_t theme_color;
+    uint16_t captured_resources;
+    uint16_t unavailable_resources;
+    uint8_t theme_alpha;
+    uint8_t display_mode;
+    uint8_t operation;
+    bool theme_color_valid;
+} PspUiOfflineAppPreview;
 
 typedef enum {
     PSP_UI_BUTTON_UP       = 1u << 0,
@@ -153,6 +169,9 @@ typedef enum {
     PSP_UI_ACTION_VOICE_FOCUSED_TEXT,
     PSP_UI_ACTION_HOME,
     PSP_UI_ACTION_SAVE_FOR_LATER,
+    PSP_UI_ACTION_INSTALL_OFFLINE_APP,
+    PSP_UI_ACTION_CONFIRM_OFFLINE_APP,
+    PSP_UI_ACTION_CANCEL_OFFLINE_APP,
     PSP_UI_ACTION_SHOW_OFFLINE,
     PSP_UI_ACTION_SHOW_DOWNLOADS,
     PSP_UI_ACTION_SHOW_SCREENSHOTS,
@@ -247,6 +266,9 @@ typedef enum {
     PSP_UI_SETTING_GLYPH_LANGUAGE,
     PSP_UI_SETTING_COLOR_EMOJI,
     PSP_UI_SETTING_YOUTUBE_QUALITY,
+    PSP_UI_SETTING_VIDEO_LANGUAGE,
+    PSP_UI_SETTING_SUBTITLE_LANGUAGE,
+    PSP_UI_SETTING_ALTERNATE_LANGUAGE,
     PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS,
     PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY,
     PSP_UI_SETTING_VIDEO_SCALING,
@@ -265,7 +287,8 @@ typedef enum {
     PSP_UI_SETTING_THIRD_PARTY_COOKIES_SITE,
     PSP_UI_SETTING_TLS_SESSION_PERSISTENCE,
     PSP_UI_SETTING_NETWORK_PROFILE,
-    PSP_UI_SETTING_UPDATE_CHANNEL
+    PSP_UI_SETTING_UPDATE_CHANNEL,
+    PSP_UI_SETTING_GAMEPAD_FACE_MAPPING
 } PspUiSettingId;
 
 typedef union {
@@ -275,8 +298,12 @@ typedef union {
     BrowserColorMode color_mode;
     BrowserChromeTheme chrome_theme;
     BrowserYoutubeQuality youtube_quality;
+    BrowserVideoLanguage video_language;
+    BrowserSubtitleLanguage subtitle_language;
+    BrowserAlternateLanguage alternate_language;
     BrowserVideoScaling video_scaling;
     BrowserTextEntryMode text_entry_mode;
+    TilefinchGamepadFaceMapping gamepad_face_mapping;
     BrowserReaderFont reader_font;
     BrowserUpdateChannel update_channel;
     BrowserGlyphLanguage glyph_language;
@@ -362,6 +389,7 @@ typedef enum {
     PSP_UI_SCREEN_PAGE_TOOLS,
     PSP_UI_SCREEN_SITE_CONTROLS,
     PSP_UI_SCREEN_PAGE_INFORMATION,
+    PSP_UI_SCREEN_OFFLINE_APP_PREVIEW,
     PSP_UI_SCREEN_FAILURE_RECOVERY,
     PSP_UI_SCREEN_HELP,
     PSP_UI_SCREEN_HELP_DETAIL,
@@ -369,6 +397,7 @@ typedef enum {
     PSP_UI_SCREEN_OPTION_ITEMS,
     PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS,
     PSP_UI_SCREEN_GLYPH_OPTIONS,
+    PSP_UI_SCREEN_VIDEO_LANGUAGE_OPTIONS,
     PSP_UI_SCREEN_UPDATE,
     PSP_UI_SCREEN_UPDATE_VERSIONS,
     PSP_UI_SCREEN_DATA_OPTIONS,
@@ -424,8 +453,10 @@ typedef struct {
     bool danzeff_text_input;
     bool cursor_visible;
     bool cursor_pointer_down;
-    uint8_t cursor_shape;
-    uint8_t page_scrollbar_width;
+    uint16_t cursor_shape : 4;
+    uint16_t video_language : 4;
+    uint16_t subtitle_language : 4;
+    uint16_t alternate_language : 4;
     unsigned persistent_cache_mb;
     unsigned live_cache_kib;
     bool persist_local_storage;
@@ -471,6 +502,14 @@ typedef struct {
     unsigned reader_site_always : 1;
     unsigned captive_portal_active : 1;
     unsigned captive_portal_suggested : 1;
+    /* Explicit user handoff of ordinary PSP controls to the active page.
+       HOME remains firmware-owned; Start+Select exits this mode. */
+    unsigned page_gamepad_capture : 1;
+    unsigned gamepad_circle_primary : 1;
+    /* Standards page fullscreen owns the existing 480x272 page viewport;
+       native chrome stays hidden until the page exits or the browser chord
+       reclaims control. */
+    unsigned page_fullscreen : 1;
     unsigned collections_section : 3;
     /* Collections becomes the base while its menus are open, so one bit
        remembers whether its original surface was HOME rather than PAGE. */
@@ -512,6 +551,8 @@ typedef struct {
     unsigned network_profile_label_valid : 1;
     unsigned update_history_phase : 2;
     unsigned update_history_count : 4;
+    /* The compact 0..3 pixel choice fills this word's remaining spare bits. */
+    unsigned page_scrollbar_width : 2;
     int update_progress_per_mille;
     BrowserSearchEngine search_engine;
     BrowserColorMode color_mode;
@@ -566,6 +607,7 @@ typedef struct {
     union {
         const PspUiHomeView *home;
         const PspUiCollectionsView *collections;
+        const PspUiOfflineAppPreview *offline_app_preview;
     };
     unsigned browser_ui_scale;
     unsigned page_font_percent;
@@ -643,14 +685,43 @@ typedef enum {
     PSP_UI_MEDIA_ACTION_RETRY,
     PSP_UI_MEDIA_ACTION_AUDIO_ONLY,
     PSP_UI_MEDIA_ACTION_LOWER_QUALITY,
+    PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK,
+    PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK,
     PSP_UI_MEDIA_ACTION_CLOSE
 } PspUiMediaAction;
 
 typedef struct {
     PspUiMediaAction action;
     uint64_t seek_time_us;
+    uint8_t track_index;
     bool visual_changed;
 } PspUiMediaIntent;
+
+#define PSP_UI_MEDIA_TRACK_LIMIT 6u
+#define PSP_UI_MEDIA_TRACK_LABEL_CAPACITY 48u
+#define PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY 160u
+
+typedef struct {
+    char label[PSP_UI_MEDIA_TRACK_LABEL_CAPACITY];
+} PspUiMediaTrack;
+
+/* Player-only presentation storage is owned beside the media session rather
+   than copied into every transient UI snapshot. This keeps the hot
+   PspUiMediaState at its established 288-byte bound while allowing a bounded
+   catalog and caption line to survive compositor snapshots safely. */
+typedef struct {
+    const FontFace *title_font;
+    bool track_menu_open;
+    uint8_t track_menu_tab;
+    uint8_t track_menu_selection;
+    uint8_t audio_track_count;
+    uint8_t subtitle_track_count;
+    int8_t selected_audio_track;
+    int8_t selected_subtitle_track;
+    PspUiMediaTrack audio_tracks[PSP_UI_MEDIA_TRACK_LIMIT];
+    PspUiMediaTrack subtitle_tracks[PSP_UI_MEDIA_TRACK_LIMIT];
+    char subtitle_text[PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY];
+} PspUiMediaPresentation;
 
 /*
  * Native media controls are intentionally independent of the page chrome.
@@ -692,7 +763,7 @@ typedef struct {
     uint64_t duration_us;
     uint64_t seek_preview_time_us;
     uint64_t buffered_until_us;
-    const FontFace *title_font;
+    PspUiMediaPresentation *presentation;
     char title[PSP_UI_MEDIA_TITLE_CAPACITY];
     char status[PSP_UI_STATUS_CAPACITY];
 } PspUiMediaState;
@@ -820,6 +891,8 @@ void psp_ui_set_tabs(PspUiState *ui, const PspUiTabsView *tabs);
 void psp_ui_set_home(PspUiState *ui, const PspUiHomeView *home);
 void psp_ui_set_collections(
     PspUiState *ui, const PspUiCollectionsView *collections);
+void psp_ui_show_offline_app_preview(
+    PspUiState *ui, const PspUiOfflineAppPreview *preview);
 /* Opens COLLECTIONS on a section, resetting scroll and any confirmation. */
 void psp_ui_show_collections(
     PspUiState *ui, PspUiCollectionSection section);
@@ -902,6 +975,8 @@ void psp_ui_startup_composite(
     uint16_t *pixels, int width, int height, int stride);
 size_t psp_ui_state_bytes(void);
 void psp_ui_media_init(PspUiMediaState *media);
+void psp_ui_media_bind_presentation(
+    PspUiMediaState *media, PspUiMediaPresentation *presentation);
 void psp_ui_media_set_title_font(PspUiMediaState *media,
                                  const FontFace *font);
 void psp_ui_media_set(PspUiMediaState *media, bool visible, bool playing,
@@ -926,6 +1001,13 @@ void psp_ui_media_set_seek_preview(PspUiMediaState *media,
                                    uint64_t target_time_us);
 void psp_ui_media_cancel_seek_preview(PspUiMediaState *media);
 void psp_ui_media_show_controls(PspUiMediaState *media);
+void psp_ui_media_set_tracks(
+    PspUiMediaState *media,
+    const PspUiMediaTrack *audio_tracks, size_t audio_count,
+    int selected_audio,
+    const PspUiMediaTrack *subtitle_tracks, size_t subtitle_count,
+    int selected_subtitle);
+void psp_ui_media_set_subtitle(PspUiMediaState *media, const char *text);
 void psp_ui_media_tick(PspUiMediaState *media, unsigned elapsed_ms);
 PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
                                      const PspUiInput *input);

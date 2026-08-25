@@ -4,6 +4,8 @@
  */
 #include "psp_app_internal.h"
 
+#include "tilefinch/pixel_math.h"
+
 #define PSP_TAB_INDEX_NONE ((size_t) -1)
 
 
@@ -553,8 +555,7 @@ static const char *psp_collections_offline_state(OfflineItemState state)
 
 void psp_collections_sync_ui(
     PspUiState *ui, PspCollectionsSurface *surface,
-    const BrowserProfile *profile, const OfflineLibrary *library,
-    const OfflineDownloadManager *downloads,
+    const BrowserProfile *profile, PspOfflineStore *offline_store,
     PspUiCollectionSection section)
 {
     if (ui == NULL || surface == NULL) return;
@@ -565,7 +566,11 @@ void psp_collections_sync_ui(
         || section == PSP_UI_COLLECTION_DOWNLOADS) {
         bool is_downloads = section == PSP_UI_COLLECTION_DOWNLOADS;
         surface->view.empty_message = is_downloads
-            ? "NO VIDEO DOWNLOADS YET" : "NO SAVED ARTICLES YET";
+            ? "NO VIDEO DOWNLOADS YET" : "NOTHING SAVED YET";
+        const OfflineLibrary *library = offline_store == NULL
+            ? NULL : &offline_store->library;
+        const OfflineDownloadManager *downloads = offline_store == NULL
+            ? NULL : &offline_store->download;
         size_t count = library == NULL ? 0u : library->count;
         for (size_t at = 0;
              at < count && rows < PSP_UI_COLLECTIONS_ROW_LIMIT; at++) {
@@ -573,6 +578,29 @@ void psp_collections_sync_ui(
             if (is_downloads != (item->type == OFFLINE_ITEM_YOUTUBE)) continue;
             surface->view.rows[rows].title = item->title;
             surface->view.rows[rows].detail = item->source_url;
+            if (item->type == OFFLINE_ITEM_WEB_APP)
+                surface->view.rows[rows].icon_rgba =
+                    psp_offline_store_app_icon(offline_store, item->id);
+            surface->view.rows[rows].is_web_app =
+                item->type == OFFLINE_ITEM_WEB_APP;
+            if (item->type == OFFLINE_ITEM_WEB_APP) {
+                surface->view.rows[rows].app_theme_valid =
+                    item->app_theme_color_valid;
+                surface->view.rows[rows].app_theme_rgb565 =
+                    tilefinch_rgb565_pack_u8(
+                        (item->app_theme_color >> 16) & 0xffu,
+                        (item->app_theme_color >> 8) & 0xffu,
+                        item->app_theme_color & 0xffu);
+                snprintf(surface->download_detail[rows],
+                         sizeof(surface->download_detail[rows]),
+                         "%s  |  %s",
+                         tilefinch_web_app_display_mode_name(
+                             (TilefinchWebAppDisplayMode)
+                                 item->app_display_mode),
+                         item->source_url);
+                surface->view.rows[rows].detail =
+                    surface->download_detail[rows];
+            }
             surface->view.rows[rows].deletable = true;
             surface->view.rows[rows].offline_state = (uint8_t) item->state;
             OfflineDownloadSnapshot snapshot = {0};

@@ -63,6 +63,8 @@ int main(void)
     RUN_TEST(test_safe_section_before_eof);
     RUN_TEST(test_mismatched_close_is_not_sealed);
     RUN_TEST(test_canvas_surface_survives_and_updates_without_relayout);
+    RUN_TEST(test_canvas_fallback_text_mutation_remains_replaced);
+    RUN_TEST(test_canvas_oversized_dimensions_are_bounded);
     RUN_TEST(test_canvas_surface_count_is_bounded);
     RUN_TEST(test_canvas_draw_image_accepts_loaded_html_image);
     RUN_TEST(test_detached_canvas_publishes_when_inserted);

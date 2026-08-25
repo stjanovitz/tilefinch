@@ -494,6 +494,15 @@ bool browser_engine_advance_runtime(BrowserEngine *engine,
                                     unsigned elapsed_ms,
                                     size_t maximum_callbacks,
                                     bool *visible_layout_changed);
+bool browser_engine_page_gamepad_available(const BrowserEngine *engine);
+bool browser_engine_set_gamepad_state(
+    BrowserEngine *engine, const TilefinchGamepadState *state);
+bool browser_engine_set_page_visibility(BrowserEngine *engine, bool visible);
+bool browser_engine_page_fullscreen_active(BrowserEngine *engine);
+bool browser_engine_exit_page_fullscreen(BrowserEngine *engine);
+/* Release page-owned presentation devices before a platform suspend while
+   retaining the document and decoded, budget-owned game assets. */
+void browser_engine_suspend_page_presentations(BrowserEngine *engine);
 /*
  * Commits one already-materialized compressed section and keeps the facade's
  * backing, controller, and render shell synchronized with the navigation
@@ -561,6 +570,8 @@ BrowserRenderJobStatus browser_engine_render_frame_bounded_cancelable(
     BrowserEngine *engine, uint64_t budget_us, size_t maximum_units,
     const TilefinchCancellation *cancellation);
 void browser_engine_cancel_render_job(BrowserEngine *engine);
+bool browser_engine_render_frame_pending(const BrowserEngine *engine);
+bool browser_engine_canvas_frame_pending(const BrowserEngine *engine);
 bool browser_engine_run_idle_work(
     BrowserEngine *engine, bool *visual_changed);
 bool browser_engine_run_deferred_image_work(

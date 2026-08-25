@@ -26,12 +26,13 @@ agents are capable of. A web browser was a good test of all three.
 | Feature | Support |
 |---|---|
 | **Web browsing** | Real HTTPS pages with JavaScript, cookies, images, mobile layout, and TrueType text; no proxy or companion computer. |
-| **Native media** | YouTube's lightweight provider and compatible HTML `<video>`/`<audio>` elements open one native player. Official builds use PSP firmware for 240p/360p Baseline/Main MP4 and AAC-in-MP4/M4A audio. A separately built optional decoder adds 240p H.264 High and HLS, including active YouTube live streams and premieres; seeking for finite media, buffering UI, resumable YouTube downloads, and audio-only playback are built in. |
+| **Native media** | YouTube's lightweight provider and compatible HTML `<video>`/`<audio>` elements open one native player. Official builds use PSP firmware for compatible 240p/360p Baseline/Main MP4 and 240p HLS with AAC-LC, including active YouTube live streams and premieres. A separately built optional decoder adds 240p H.264 High; seeking for finite media, preferred audio/subtitle languages, selectable tracks, buffering UI, resumable downloads, and audio-only playback are built in. |
 | **Tabs and navigation** | Five tabs, bookmarks, history, address/search suggestions, in-page find, optional session restore, and optional one-tab hibernation. |
 | **Ad blocking** | Conservative request blocking and cosmetic hiding are on by default; custom uBlock/EasyList-style rules and per-site exceptions are supported. |
 | **Cookie notices** | Common consent banners are hidden by default without clicking Accept or creating consent cookies; sites can be exempted individually. |
-| **Reader and offline modes** | Reflow articles for the PSP screen, choose sans/serif text, remember optional per-site sizing, and save articles for later. |
+| **Reader and offline modes** | Reflow and save articles, or preview, install, update, reinstall, and uninstall a small manifest-backed web app with its icon and already-loaded same-origin resources for offline use. |
 | **Text entry** | PSP system keyboard or the faster Danzeff radial keyboard, with local bookmark/history completion. |
+| **Canvas games** | Bounded Canvas 2D and WebGL 1 paths for charts and modest games, `ImageBitmap` asset preparation, user-activated PCM game audio, page fullscreen, and the standard Gamepad API for the built-in PSP controls. The repository includes the installable [Prism Break 3D](examples/prism-break-3d/) game. |
 | **Appearance** | Automatic or forced dark mode, page text scaling, three chrome themes, bounded mixed RTL/LTR page layout with Arabic-family shaping, and optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, and color-emoji glyph packs. |
 | **Native PSP UI** | First-frame home screen, Collections, clock, battery/Wi-Fi status, contextual controls, PNG screenshots, and photographed QR diagnostics. |
 | **Optional XMB redirect** | ARK-4 can make Sony's Internet Browser icon launch Tilefinch, with a hold-L bypass back to the original browser. |
@@ -62,7 +63,7 @@ agents are capable of. A web browser was a good test of all three.
 | **360p through a 480×272 display** | 640×360 frames stage through EDRAM as two guarded strips; the GE performs bilinear downscaling without a CPU per-pixel pass ([device envelope](docs/engineering/PSP_ENVELOPE.md)). |
 | **Explicit lifecycle ownership** | Media and networking use pure reducers, epoch-tokened services, consumer leases, pumped teardown, and quarantine instead of freeing memory beneath live firmware or worker activity ([architecture](docs/ARCHITECTURE.md)). |
 | **Security without pretending to sandbox** | HTTPS-first navigation, CORS/CSP/SRI, private-network protection, partition-aware resource authority, cookie controls, and signed A/B updates are enforced within a documented shared-process model ([security model](docs/SECURITY_MODEL.md)). |
-| **Hardware-aware gates** | Release registers 137 host tests (136 enabled by default), plus sanitizer, hostile-input, WPT, fidelity, PSP cross-build, `.text`, and hot-symbol ratchets ([engineering guide](AGENTS.md)). |
+| **Hardware-aware gates** | Release registers 141 host tests (140 enabled by default), plus sanitizer, hostile-input, WPT, fidelity, PSP cross-build, `.text`, and hot-symbol ratchets ([engineering guide](AGENTS.md)). |
 
 ## What you need
 
@@ -144,12 +145,12 @@ updates, A/B trial boots, and automatic rollback continue to work normally.
 See [ARK-4's plugin documentation](https://github.com/PSP-Archive/ARK-4/wiki/Plugins)
 for its plugin-manager and `PLUGINS.TXT` formats.
 
-### Optional H.264 High / HLS decoder
+### Optional H.264 High decoder
 
 Official Tilefinch releases do not redistribute the custom H.264 or AAC
-decoder. Compatible Baseline/Main MP4 continues to use the PSP firmware.
-People who want the additional 240p High-profile and HLS path—including active
-YouTube live streams and premieres—can build
+decoder. Compatible Baseline/Main MP4 and HLS continue to use the PSP
+firmware, including active live streams. People who want the additional 240p
+High-profile path can build
 the add-on from the pinned upstream source by following
 [Optional PSP software decoder](docs/DEVELOPMENT.md#optional-psp-software-decoder),
 then copy its three files to
@@ -174,6 +175,7 @@ generic video failure.
 | Triangle | Show or hide the browser chrome |
 | Start | Address and search bar |
 | Select | Menu: Home, Tabs, Page tools, Library, Settings, Help & diagnostics, Exit |
+| Start + Select (hold together) | Give controls to the active JavaScript page; hold again to return them to the browser |
 | L / R | Page up / page down |
 | L held at boot | Safe start: boot the previous version (after a first update exists) |
 
@@ -187,6 +189,22 @@ matching bookmark/history result. Address completion stays entirely on-device
 and URL history contributes only when its existing opt-in setting is enabled.
 
 Type a URL to go there, or anything else to search.
+
+For a Canvas game, hold **Start + Select together** until **Page controls on**
+appears. The D-pad, analog nub, face buttons, shoulders, Start, and Select then
+use the standard browser Gamepad mapping instead of moving Tilefinch's focus or
+chrome. Hold the same chord to leave the mode. The PSP HOME button always
+remains a system-level way out, and page control ends automatically when the
+document navigates, native media opens, or the PSP suspends.
+**Settings → Browsing & input → Game buttons** chooses X or O as the primary
+face button. Page authors can use the [WebGL on Tilefinch guide](docs/WEBGL.md)
+for the efficient shader, resource, animation, and fallback profile.
+Page fullscreen is entered only after a button activation; Triangle or the
+Start+Select escape chord restores Tilefinch's chrome. Game audio is a bounded
+Web Audio subset for decoded PCM WAV effects and simple generated waveforms,
+with gain, stereo panning, loop points, and short scheduling (one context,
+eight decoded buffers, four simultaneous voices). It is not a compressed-audio
+decoder or an unrestricted audio graph.
 Screenshots are written incrementally to `data/screenshots/` so Memory Stick
 I/O does not freeze navigation. The completion message names the new file;
 **Library → Screenshots** lists the newest 32 captures and their sizes
@@ -260,8 +278,9 @@ it is installed into the inactive slot and must pass the same trial boot.
 ## Privacy
 
 - No telemetry, no analytics, no accounts. Tilefinch sends nothing about
-  you or your browsing anywhere; requests to YouTube carry your PSP's
-  language setting so YouTube can localize results.
+  you or your browsing anywhere; requests to YouTube carry the configured
+  video language (the PSP language by default) so YouTube can localize results
+  and choose an appropriate audio track.
 - Everything the browser stores — history (off by default), cookies, cache,
   saved pages and videos, screenshots, settings — lives on your Memory
   Stick and nowhere else. **Settings → Device & storage → Manage site data** clears HTTP caches,
@@ -318,6 +337,10 @@ known isolation limits are documented in
   Optional **Hibernate tab** storage is off by default; it moves one inactive
   snapshot—not the page heap—to the Memory Stick and marks it `[Z]`.
 - Sites behind Cloudflare managed challenges do not work.
+- WebGL is a bounded, opaque PSP GE subset for conventional vertex-color and
+  textured shaders, not a complete programmable GPU. Complex shaders,
+  transparent drawing buffers, offscreen framebuffers, and large scenes fail
+  soft instead of consuming unbounded memory or frame time.
 - There is no desktop-grade process sandbox or complete CSP. Tilefinch
   enforces a bounded response-header CSP/resource/framing subset, script and
   stylesheet Subresource Integrity, and restrictive iframe sandbox/origin

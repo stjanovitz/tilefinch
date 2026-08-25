@@ -911,6 +911,10 @@ static void page_destroy_value(NavigationSession *session,
     layout_destroy(&page->layout);
     layout_reuse_cache_destroy(page->layout_reuse);
     page->layout_reuse = NULL;
+    /* A queued canvas/WebGL microtask belongs to the dying realm. Detach its
+       publication target before releasing page images so runtime teardown
+       cannot repopulate a resource table whose owner is already gone. */
+    script_runtime_set_images(page->runtime, NULL);
     images_destroy(&page->images);
     stylesheet_destroy(&page->stylesheet);
     stylesheet_document_resources_destroy(&page->stylesheet_resources);

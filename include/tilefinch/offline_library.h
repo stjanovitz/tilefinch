@@ -7,6 +7,8 @@
 
 #include "tilefinch/budget.h"
 #include "tilefinch/document.h"
+#include "tilefinch/session.h"
+#include "tilefinch/web_app_manifest.h"
 #include "tilefinch/youtube_resolver.h"
 
 #define OFFLINE_LIBRARY_ITEM_LIMIT 12u
@@ -16,10 +18,18 @@
 #define OFFLINE_LIBRARY_FAILURE_LIMIT 128u
 #define OFFLINE_LIBRARY_INDEX_LIMIT (32u * 1024u)
 #define OFFLINE_LIBRARY_ARTICLE_LIMIT (1024u * 1024u)
+#define OFFLINE_LIBRARY_APP_DOCUMENT_LIMIT (1024u * 1024u)
+#define OFFLINE_LIBRARY_APP_RESOURCE_LIMIT (1024u * 1024u)
+#define OFFLINE_LIBRARY_APP_PACK_LIMIT \
+    (OFFLINE_LIBRARY_APP_RESOURCE_LIMIT + 160u * 1024u)
+#define OFFLINE_LIBRARY_APP_ICON_EDGE 16u
+#define OFFLINE_LIBRARY_APP_ICON_LIMIT \
+    (OFFLINE_LIBRARY_APP_ICON_EDGE * OFFLINE_LIBRARY_APP_ICON_EDGE * 4u)
 
 typedef enum {
     OFFLINE_ITEM_ARTICLE = 1,
-    OFFLINE_ITEM_YOUTUBE = 2
+    OFFLINE_ITEM_YOUTUBE = 2,
+    OFFLINE_ITEM_WEB_APP = 3
 } OfflineItemType;
 
 typedef enum {
@@ -29,6 +39,21 @@ typedef enum {
     OFFLINE_ITEM_READY,
     OFFLINE_ITEM_FAILED
 } OfflineItemState;
+
+typedef enum {
+    OFFLINE_WEB_APP_INSTALL = 0,
+    OFFLINE_WEB_APP_UPDATE,
+    OFFLINE_WEB_APP_REINSTALL
+} OfflineWebAppOperation;
+
+typedef struct {
+    uint64_t estimated_bytes;
+    uint32_t document_hash;
+    uint32_t resource_hash;
+    uint32_t icon_hash;
+    uint32_t resource_count;
+    OfflineWebAppOperation operation;
+} OfflineWebAppPreview;
 
 typedef struct {
     uint32_t id;
@@ -44,11 +69,19 @@ typedef struct {
     uint64_t duration_ms;
     uint64_t saved_at_unix;
     uint32_t article_hash;
+    uint32_t auxiliary_hash;
+    uint32_t icon_hash;
+    uint32_t resource_count;
+    uint32_t icon_bytes;
     int width;
     int height;
     int itag;
     int audio_itag;
     bool split_streams;
+    uint32_t app_theme_color;
+    uint8_t app_theme_alpha;
+    uint8_t app_display_mode;
+    bool app_theme_color_valid;
 } OfflineLibraryItem;
 
 typedef struct {
@@ -75,6 +108,23 @@ bool offline_library_save_article(
 bool offline_library_read_article(
     const OfflineLibrary *library, Budget *budget, uint32_t id,
     char **html, size_t *length, char *error, size_t error_size);
+bool offline_library_save_web_app(
+    OfflineLibrary *library, PocDocument *document, BrowserSession *session,
+    const char *source_url, const TilefinchWebAppManifest *manifest,
+    const unsigned char *icon, size_t icon_length,
+    uint32_t *saved_id, char *error, size_t error_size);
+bool offline_library_preview_web_app(
+    OfflineLibrary *library, PocDocument *document, BrowserSession *session,
+    const char *source_url, const TilefinchWebAppManifest *manifest,
+    const unsigned char *icon, size_t icon_length,
+    OfflineWebAppPreview *preview, char *error, size_t error_size);
+bool offline_library_read_web_app(
+    const OfflineLibrary *library, Budget *budget, BrowserSession *session,
+    uint32_t id, char **html, size_t *length,
+    char *error, size_t error_size);
+bool offline_library_read_web_app_icon(
+    const OfflineLibrary *library, uint32_t id,
+    unsigned char output[OFFLINE_LIBRARY_APP_ICON_LIMIT]);
 
 bool offline_library_enqueue_youtube(
     OfflineLibrary *library, const char *watch_url, const char *title,

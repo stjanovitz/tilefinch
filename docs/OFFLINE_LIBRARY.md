@@ -1,9 +1,9 @@
 # Offline library
 
-Tilefinch has a small, explicit offline library for Reader articles and videos
-from its built-in YouTube provider. Nothing is scanned or opened during boot.
-The first **Library → View offline library** action lazily reads the index from
-`data/offline/`.
+Tilefinch has a small, explicit offline library for Reader articles, bounded
+web-app snapshots, and videos from its built-in YouTube provider. Nothing is
+scanned or opened during boot. The first **Library** action lazily reads the
+index from `data/offline/`.
 
 ## Reader articles
 
@@ -26,6 +26,60 @@ deletion suggestion instead of silently choosing one for the user.
 This first format intentionally does not archive page images or author CSS.
 That keeps a saved article predictable and useful under the PSP memory limit,
 but it is not a pixel-exact Web archive.
+
+## Offline web apps
+
+**Page tools → Install offline app** is available for a committed HTTPS page
+with a same-origin Web App Manifest. Tilefinch reads the manifest's bounded
+name, short name, start URL, scope, icon metadata, theme color, and display
+mode. Theme colors use the engine's bounded CSS color parser. Display is
+limited to `browser`, `minimal-ui`, `standalone`, and `fullscreen`; unknown
+values use `browser`. Tilefinch stores a 16×16 decoded icon for the native
+Saved list, serializes the current live document, and
+packages the same-origin resource bodies that the current page has already
+loaded. Reopening the item restores those bodies with their original typed
+resource or module authority before parsing the saved document under its
+original origin. A cached script therefore does not become executable merely
+because it was written to disk.
+
+“Already loaded” includes same-origin assets requested dynamically by page
+script, including game images prepared through `decode()` or
+`createImageBitmap()`, when their response is still present in the bounded HTTP
+cache at preview time. Installation does not inspect JavaScript objects or
+crawl guessed URLs; the response cache remains the single authority and size
+boundary.
+
+Installation is a two-step user action. The first pass builds and immediately
+discards a bounded candidate snapshot, then shows its estimated payload size,
+captured resource count, known unavailable-resource count, display mode, and
+theme color. It labels a new app **Install**, changed content at the same source
+**Update**, and byte-identical content **Reinstall**. No payload is written until
+the user confirms. Cancel releases the small retained manifest/icon
+preparation. The confirmed pass repeats every size, budget, and free-space
+check before publishing.
+
+The snapshot is capped at 1 MiB of document markup, 1 MiB of response bodies,
+32 resources, and one fixed-size icon thumbnail. Reinstalling the same source
+publishes a new payload generation and updates the index before deleting the
+old one. This is intended for small, mostly self-contained games and tools.
+It does not crawl links, guess assets that the page never requested, archive
+cross-origin dependencies, retain login cookies, or promise that a
+server-dependent application will work offline.
+
+This is deliberately not a Service Worker implementation. Tilefinch does not
+run background fetch, push, periodic sync, install events, or a page-authored
+offline request router. The saved app is an explicit user snapshot using the
+browser's existing loader and security policy, not a new privileged runtime.
+
+`examples/prism-break-3d/` is the repository's reference offline app. Its
+manifest, stylesheet, and game script are same-origin and self-contained, so
+an HTTPS-hosted copy can be previewed, installed, reopened without a network,
+updated, and uninstalled through the same user-facing path as another small
+web game.
+
+Installed apps appear in **Library → Saved**. Square says **Uninstall** for an
+app and requires a second press on the same row; Circle cancels the armed
+action. The index is made durable before the app payload generation is removed.
 
 ## YouTube downloads
 

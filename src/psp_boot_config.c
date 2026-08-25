@@ -70,6 +70,7 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
         || config->validation_raster_fixture_auto != 0
         || config->validation_power_test_auto != 0
         || config->validation_ge_present_probe != 0
+        || config->validation_webgl_ge_probe != 0
         || config->validation_csc_order_probe != 0
         || config->validation_media_range_probe != 0
         || config->validation_update_auto != 0
@@ -96,6 +97,7 @@ void psp_boot_config_disable_automation(PspBootConfig *config)
     config->validation_raster_fixture_auto = 0;
     config->validation_power_test_auto = 0;
     config->validation_ge_present_probe = 0;
+    config->validation_webgl_ge_probe = 0;
     config->validation_csc_order_probe = 0;
     config->validation_media_range_probe = 0;
     config->validation_update_auto = 0;
@@ -207,6 +209,8 @@ static bool psp_boot_config_load_one(
             loaded.validation_raster_fixture_auto = atol(value);
         } else if (strcmp(line, "validation_ge_present_probe") == 0) {
             loaded.validation_ge_present_probe = atol(value);
+        } else if (strcmp(line, "validation_webgl_ge_probe") == 0) {
+            loaded.validation_webgl_ge_probe = atol(value);
         } else if (strcmp(line, "validation_csc_order_probe") == 0) {
             loaded.validation_csc_order_probe = atol(value);
         } else if (strcmp(line, "validation_media_range_probe") == 0) {
@@ -488,6 +492,10 @@ bool psp_boot_config_validate(
         config->validation_ge_present_probe == 0
             || config->validation_ge_present_probe == 1,
         "validation_ge_present_probe");
+    REQUIRE_CONFIG(
+        config->validation_webgl_ge_probe == 0
+            || config->validation_webgl_ge_probe == 1,
+        "validation_webgl_ge_probe");
     REQUIRE_CONFIG(
         config->validation_csc_order_probe == 0
             || config->validation_csc_order_probe == 1,

@@ -1290,11 +1290,20 @@ void tile_cache_cancel_frame_work(TileCache *cache)
     if (cache == NULL) return;
     if (cache->frame_work.pending) cache->frame_jobs_cancelled++;
     memset(&cache->frame_work, 0, sizeof(cache->frame_work));
+    cache->canvas_paint_pending = false;
 }
 
 bool tile_cache_frame_work_pending(const TileCache *cache)
 {
     return cache != NULL && cache->frame_work.pending;
+}
+
+bool tile_cache_canvas_frame_work_pending(const TileCache *cache)
+{
+    return cache != NULL
+        && (cache->canvas_paint_pending
+            || ((cache->frame_work.pending || cache->frame_work.ready)
+                && cache->frame_work.canvas_paint));
 }
 
 static bool frame_work_matches(const RenderFrameWork *work, int scroll_y,
@@ -1314,6 +1323,7 @@ static void tile_cache_schedule_frame_work(TileCache *cache, int scroll_y,
     if (frame_work_matches(work, scroll_y, viewport_width, viewport_height)) {
         return;
     }
+    bool canvas_paint = cache->canvas_paint_pending;
     tile_cache_cancel_frame_work(cache);
     tile_cache_sync_visual_scroll(cache);
     int first_tx = 0;
@@ -1342,8 +1352,10 @@ static void tile_cache_schedule_frame_work(TileCache *cache, int scroll_y,
         .next_ordinal = first,
         .end_ordinal = first + selected,
         .pending = selected != 0,
-        .ready = selected == 0
+        .ready = selected == 0,
+        .canvas_paint = canvas_paint
     };
+    cache->canvas_paint_pending = false;
     cache->frame_jobs_scheduled++;
     if (work->ready) cache->frame_jobs_completed++;
 }
@@ -2295,6 +2307,7 @@ bool tile_cache_sync_layout_paint(TileCache *cache, int left, int top,
     cache->fixed_backdrop_masked = false;
     tile_cache_invalidate_rect(
         cache, visual_left, visual_top, visual_right, visual_bottom);
+    cache->canvas_paint_pending = true;
     return true;
 }
 

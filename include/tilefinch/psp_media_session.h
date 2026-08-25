@@ -23,6 +23,7 @@
 #include "tilefinch/psp_ui.h"
 #include "tilefinch/session.h"
 #include "tilefinch/youtube_resolver.h"
+#include "tilefinch/youtube_subtitles.h"
 
 typedef enum {
     PSP_MEDIA_JOB_NONE = 0,
@@ -76,10 +77,17 @@ typedef struct {
     MediaMp4Demux *audio_demux;
     PspMediaHlsContext *hls;
     MediaSampleSource hls_source;
+    MediaSampleSource hls_audio_source;
     MediaPlayback *playback;
     MediaVideoFrame frame;
     PspUiMediaState ui;
+    PspUiMediaPresentation ui_presentation;
     YoutubeStream stream;
+    YoutubeTrackPreferences track_preferences;
+    YoutubeSubtitleDocument *subtitles;
+    uint64_t subtitle_request_id;
+    size_t subtitle_cue_cursor;
+    bool subtitle_request_attempted;
     YoutubeResolveJob *resolver_job;
     /* A focused result's resolver may already be complete or in flight when
        Play is pressed. It waits here until the open service has destroyed the
@@ -444,6 +452,8 @@ void psp_media_init(
     PspMediaSession *media, Budget *budget, BrowserSession *session,
     BrowserProfile *profile, const char *profile_path,
     const FontFace *title_font, const PspMediaSessionPlatform *platform);
+void psp_media_default_track_preferences(
+    const BrowserProfile *profile, YoutubeTrackPreferences *preferences);
 void psp_media_pipeline_destroy(PspMediaSession *media);
 bool psp_media_backend_stats_snapshot(
     PspMediaSession *media, MediaBackendStats *stats);

@@ -1004,8 +1004,14 @@ static bool fetch_request_internal(Budget *budget, const char *url,
                easy, CURLOPT_ACCEPT_ENCODING,
                request != NULL && request->identity_encoding
                    ? "identity"
+                   : request != NULL && request->raw_gzip_encoding
+                       ? "gzip"
                    : fetch_accept_encoding(
                          diagnostic_mobile_safari)) != CURLE_OK
+        || curl_easy_setopt(
+               easy, CURLOPT_HTTP_CONTENT_DECODING,
+               request != NULL && request->raw_gzip_encoding ? 0L : 1L)
+               != CURLE_OK
         || curl_easy_setopt(
                easy, CURLOPT_USERAGENT, effective_user_agent) != CURLE_OK
         || curl_easy_setopt(

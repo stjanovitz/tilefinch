@@ -5,6 +5,8 @@
      profile before ordinary script state gets a chance to run. */
   const pixelByteLimit = 512 * 1024,
     pixelLimit = pixelByteLimit / 4,
+    maximumDrawingWidth = 480,
+    maximumDrawingHeight = 272,
     compositeOperations = [
       "", "source-over", "copy", "destination-over", "source-in",
       "source-out", "source-atop", "destination-in", "destination-out",
@@ -12,6 +14,17 @@
     ],
     states = new WeakMap(),
     contexts = new WeakMap(),
+    contextKinds = new WeakMap(),
+    imageBitmapByteLimit = 1024 * 1024,
+    imageBitmapCountLimit = 8,
+    imageBitmapState = { bytes: 0, count: 0 },
+    imageBitmapStates = new WeakMap(),
+    imageBitmapConstructorKey = {},
+    imageBitmapFinalizer = typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry((bytes) => {
+          imageBitmapState.bytes = Math.max(0, imageBitmapState.bytes - bytes);
+          imageBitmapState.count = Math.max(0, imageBitmapState.count - 1);
+        }) : null,
     pendingCommits = [],
     canvasDiagnostics = {
       rectangleCommands: 0,
@@ -169,10 +182,24 @@
         ? value
         : fallback;
     },
-    dimensions = (canvas) => ({
-      width: dimension(canvas, "width", 300),
-      height: dimension(canvas, "height", 150),
-    }),
+    dimensions = (canvas) => {
+      const width = dimension(canvas, "width", 300),
+        height = dimension(canvas, "height", 150);
+      if (!width || !height) return {
+        width: Math.min(width, maximumDrawingWidth),
+        height: Math.min(height, maximumDrawingHeight),
+      };
+      const scale = Math.min(
+        1,
+        maximumDrawingWidth / width,
+        maximumDrawingHeight / height,
+        Math.sqrt(pixelLimit / (width * height)),
+      );
+      return {
+        width: Math.max(1, Math.floor(width * scale)),
+        height: Math.max(1, Math.floor(height * scale)),
+      };
+    },
     resetState = (state) => {
       const size = dimensions(state.canvas);
       state.width = size.width;
@@ -298,6 +325,16 @@
           "QuotaExceededError",
         );
       return { width, height };
+    },
+    imageDataCoordinate = (value) => {
+      value = Number(value);
+      if (Number.isNaN(value)) return 0;
+      if (!Number.isFinite(value) || Math.abs(value) > 0x7fffffff)
+        throw new DOMException(
+          "ImageData coordinate is outside the supported range",
+          "NotSupportedError",
+        );
+      return Math.trunc(value);
     },
     byte = (value) =>
       Math.max(0, Math.min(255, Math.round(Number(value) || 0))),
@@ -1400,6 +1437,115 @@
     }
   }
 
+  class ImageBitmap {
+    constructor(key, width, height, pixels, originClean) {
+      if (key !== imageBitmapConstructorKey)
+        throw new TypeError("Illegal constructor");
+      const state = { width, height, pixels,
+        originClean: originClean !== false, bytes: pixels.byteLength,
+        closed: false, finalizerToken: {} };
+      imageBitmapStates.set(this, state);
+      imageBitmapState.bytes += state.bytes;
+      imageBitmapState.count++;
+      imageBitmapFinalizer?.register(this, state.bytes, state.finalizerToken);
+    }
+    get width() { return imageBitmapStates.get(this)?.width || 0; }
+    get height() { return imageBitmapStates.get(this)?.height || 0; }
+    close() {
+      const state = imageBitmapStates.get(this);
+      if (!state || state.closed) return;
+      state.closed = true;
+      imageBitmapFinalizer?.unregister(state.finalizerToken);
+      imageBitmapState.bytes -= state.bytes;
+      imageBitmapState.count--;
+      state.bytes = 0;
+      state.pixels = null;
+      state.width = 0;
+      state.height = 0;
+    }
+  }
+
+  const liveBitmapState = (bitmap) => {
+      const state = imageBitmapStates.get(bitmap);
+      if (!state || state.closed || !state.pixels)
+        throw new DOMException("ImageBitmap is closed", "InvalidStateError");
+      return state;
+    },
+    bitmapSource = (source) => {
+      if (source instanceof ImageBitmap) {
+        const state = liveBitmapState(source);
+        return { width: state.width, height: state.height,
+          pixels: state.pixels, originClean: state.originClean };
+      }
+      if (source instanceof ImageData)
+        return { width: source.width, height: source.height,
+          pixels: source.data, originClean: true };
+      if (source instanceof HTMLCanvasElement) {
+        const state = contextKinds.get(source) === "webgl"
+          ? globalThis.__tilefinchWebGLReadback?.(source)
+          : stateFor(source);
+        if (!state || (contextKinds.get(source) !== "webgl" &&
+            !flushRectCommands(state)) || !state.pixels) return null;
+        return { width: state.width, height: state.height,
+          pixels: state.pixels, originClean: state.originClean };
+      }
+      if (typeof HTMLImageElement === "function" &&
+          source instanceof HTMLImageElement) {
+        const snapshot = __tilefinchCanvasImageSource(source.__handle);
+        if (!snapshot) return null;
+        return { width: Number(snapshot.width), height: Number(snapshot.height),
+          pixels: new Uint8ClampedArray(snapshot.pixels),
+          originClean: snapshot.sameOrigin !== false };
+      }
+      throw new TypeError("Unsupported ImageBitmap source");
+    },
+    createBitmap = (source, args) => {
+      const input = bitmapSource(source);
+      if (!input) throw new DOMException(
+        "The image is not decoded", "InvalidStateError");
+      let sx = 0, sy = 0, sw = input.width, sh = input.height, options = {};
+      if (args.length === 1) options = args[0] || {};
+      else if (args.length === 5) {
+        [sx, sy, sw, sh, options] = args;
+        options ||= {};
+      } else if (args.length !== 0)
+        throw new TypeError("Invalid createImageBitmap arguments");
+      [sx, sy, sw, sh] = [sx, sy, sw, sh].map(Number);
+      if (![sx, sy, sw, sh].every(Number.isFinite) || sw === 0 || sh === 0)
+        throw new DOMException("Invalid bitmap crop", "IndexSizeError");
+      if (sw < 0) { sx += sw; sw = -sw; }
+      if (sh < 0) { sy += sh; sh = -sh; }
+      const hasWidth = options.resizeWidth !== undefined,
+        hasHeight = options.resizeHeight !== undefined;
+      let width = hasWidth ? Number(options.resizeWidth) : Math.ceil(sw),
+        height = hasHeight ? Number(options.resizeHeight) : Math.ceil(sh);
+      if (hasWidth && !hasHeight && sw > 0)
+        height = Math.max(1, Math.round(sh * width / sw));
+      else if (hasHeight && !hasWidth && sh > 0)
+        width = Math.max(1, Math.round(sw * height / sh));
+      if (!Number.isFinite(width) || !Number.isFinite(height) ||
+          width <= 0 || height <= 0)
+        throw new DOMException("Invalid bitmap size", "InvalidStateError");
+      width = Math.trunc(width); height = Math.trunc(height);
+      const bytes = width * height * 4;
+      if (!Number.isSafeInteger(bytes) || bytes > pixelByteLimit ||
+          imageBitmapState.count >= imageBitmapCountLimit ||
+          bytes > imageBitmapByteLimit - imageBitmapState.bytes)
+        throw new DOMException("ImageBitmap budget exceeded", "QuotaExceededError");
+      const pixels = new Uint8ClampedArray(bytes),
+        smooth = options.resizeQuality !== "pixelated";
+      if (!__tilefinchCanvasRasterImage(
+        pixels, width, height, input.pixels, input.width, input.height,
+        sx, sy, sw, sh, 0, 0, width, height, smooth, 1, 1,
+        new Float64Array([1, 0, 0, 1, 0, 0]),
+        new Float64Array([0, 0, width, height]), new Float64Array(0),
+      )) throw new DOMException("Bitmap conversion failed", "OperationError");
+      return new ImageBitmap(
+        imageBitmapConstructorKey, width, height, pixels, input.originClean);
+    };
+  globalThis.createImageBitmap = (source, ...args) =>
+    Promise.resolve().then(() => createBitmap(source, args));
+
   class CanvasRenderingContext2D {
     constructor(canvas) {
       if (!(canvas instanceof HTMLCanvasElement))
@@ -2261,7 +2407,12 @@
     }
     drawImage(source, ...arguments_) {
       let sourceState = null;
-      if (source instanceof HTMLCanvasElement) sourceState = stateFor(source);
+      if (source instanceof HTMLCanvasElement) {
+        sourceState = contextKinds.get(source) === "webgl"
+          ? globalThis.__tilefinchWebGLReadback?.(source)
+          : stateFor(source);
+        if (!sourceState) return;
+      }
       else if (
         typeof HTMLImageElement === "function" &&
         source instanceof HTMLImageElement
@@ -2283,6 +2434,10 @@
           cachedImageSnapshot = snapshot;
         }
         sourceState = snapshot;
+      } else if (source instanceof ImageBitmap) {
+        const bitmap = liveBitmapState(source);
+        sourceState = { width: bitmap.width, height: bitmap.height,
+          pixels: bitmap.pixels, originClean: bitmap.originClean };
       } else
         throw new DOMException(
           "The image source is not supported by this bounded backend",
@@ -2322,6 +2477,7 @@
       if (sourceState.originClean === false) target.originClean = false;
       if (target.rectCommands.length && !flushRectCommands(target)) return;
       if (source instanceof HTMLCanvasElement &&
+          contextKinds.get(source) !== "webgl" &&
           !flushRectCommands(sourceState)) return;
       const
         retainedSourcePixels =
@@ -2394,10 +2550,16 @@
       if (!["repeat", "repeat-x", "repeat-y", "no-repeat"].includes(repetition))
         throw new DOMException("Invalid pattern repetition", "SyntaxError");
       let retained = source;
-      if (source instanceof HTMLCanvasElement &&
-          !flushRectCommands(stateFor(source))) return null;
+      if (source instanceof HTMLCanvasElement) {
+        retained = contextKinds.get(source) === "webgl"
+          ? globalThis.__tilefinchWebGLReadback?.(source)
+          : stateFor(source);
+        if (!retained || (contextKinds.get(source) !== "webgl" &&
+            !flushRectCommands(retained))) return null;
+      }
       if (
         !(source instanceof HTMLCanvasElement) &&
+        !(source instanceof ImageBitmap) &&
         typeof HTMLImageElement === "function" &&
         source instanceof HTMLImageElement
       ) {
@@ -2409,6 +2571,10 @@
           pixels: new Uint8ClampedArray(snapshot.pixels),
           originClean: snapshot.sameOrigin !== false,
         };
+      } else if (source instanceof ImageBitmap) {
+        const bitmap = liveBitmapState(source);
+        retained = { width: bitmap.width, height: bitmap.height,
+          pixels: bitmap.pixels, originClean: bitmap.originClean };
       } else if (!(source instanceof HTMLCanvasElement))
         throw new DOMException(
           "The pattern source is not supported by this bounded backend",
@@ -2421,6 +2587,13 @@
       return pattern;
     }
     createImageData(width, height) {
+      if (width instanceof ImageData) {
+        if (arguments.length !== 1)
+          throw new TypeError(
+            "createImageData(ImageData) accepts one argument",
+          );
+        return new ImageData(width.width, width.height);
+      }
       return new ImageData(width, height);
     }
     getImageData(x, y, width, height) {
@@ -2452,33 +2625,74 @@
       }
       return output;
     }
-    putImageData(imageData, x, y) {
+    putImageData(
+      imageData,
+      x,
+      y,
+      dirtyX = 0,
+      dirtyY = 0,
+      dirtyWidth = imageData?.width,
+      dirtyHeight = imageData?.height,
+    ) {
       if (!(imageData instanceof ImageData))
         throw new TypeError("putImageData requires ImageData");
-      x = Math.trunc(Number(x));
-      y = Math.trunc(Number(y));
-      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      if (arguments.length !== 3 && arguments.length < 7)
+        throw new TypeError(
+          "putImageData requires either three or seven arguments",
+        );
+      x = imageDataCoordinate(x);
+      y = imageDataCoordinate(y);
+      dirtyX = imageDataCoordinate(dirtyX);
+      dirtyY = imageDataCoordinate(dirtyY);
+      dirtyWidth = imageDataCoordinate(dirtyWidth);
+      dirtyHeight = imageDataCoordinate(dirtyHeight);
+      if (dirtyWidth < 0) {
+        dirtyX += dirtyWidth;
+        dirtyWidth = -dirtyWidth;
+      }
+      if (dirtyHeight < 0) {
+        dirtyY += dirtyHeight;
+        dirtyHeight = -dirtyHeight;
+      }
+      if (!dirtyWidth || !dirtyHeight) return;
       const state = stateFor(this.canvas),
         target = ensureSurface(state);
       if (!target) return;
       if (!flushRectCommands(state)) return;
-      for (let row = 0; row < imageData.height; row++) {
-        const targetY = y + row;
-        if (targetY < 0 || targetY >= state.height) continue;
-        for (let column = 0; column < imageData.width; column++) {
-          const targetX = x + column;
-          if (targetX < 0 || targetX >= state.width) continue;
-          const from = (row * imageData.width + column) * 4,
-            to = (targetY * state.width + targetX) * 4;
-          target[to] = imageData.data[from];
-          target[to + 1] = imageData.data[from + 1];
-          target[to + 2] = imageData.data[from + 2];
-          target[to + 3] = imageData.data[from + 3];
-        }
+      const sourceLeft = Math.max(0, dirtyX, -x),
+        sourceTop = Math.max(0, dirtyY, -y),
+        sourceRight = Math.min(
+          imageData.width,
+          dirtyX + dirtyWidth,
+          state.width - x,
+        ),
+        sourceBottom = Math.min(
+          imageData.height,
+          dirtyY + dirtyHeight,
+          state.height - y,
+        ),
+        copyWidth = sourceRight - sourceLeft,
+        copyHeight = sourceBottom - sourceTop;
+      if (copyWidth <= 0 || copyHeight <= 0) return;
+      const rowBytes = copyWidth * 4;
+      for (let row = 0; row < copyHeight; row++) {
+        const sourceY = sourceTop + row,
+          targetY = y + sourceY,
+          from = (sourceY * imageData.width + sourceLeft) * 4,
+          to = (targetY * state.width + x + sourceLeft) * 4;
+        target.set(imageData.data.subarray(from, from + rowBytes), to);
       }
       const dirty = normalizedRect(
-        state, x, y, imageData.width, imageData.height);
+        state, x + sourceLeft, y + sourceTop, copyWidth, copyHeight);
       scheduleCanvasCommit(state, dirty);
+    }
+    reset() {
+      const state = stateFor(this.canvas);
+      resetState(state);
+      if (!state.surfaceUnavailable && state.width && state.height) {
+        ensureSurface(state);
+        markCanvasFull(state);
+      }
     }
     getContextAttributes() {
       return { alpha: true, colorSpace: "srgb", willReadFrequently: false };
@@ -2511,9 +2725,16 @@
       output.set(uint32Bytes(crc32([type, data])), 8 + data.length);
       return output;
     },
-    encodeCanvasPNG = (canvas) => {
+    canvasReadbackState = (canvas) => {
+      if (contextKinds.get(canvas) === "webgl")
+        return globalThis.__tilefinchWebGLReadback?.(canvas) || null;
       const state = stateFor(canvas);
       flushRectCommands(state);
+      return state;
+    },
+    encodeCanvasPNG = (canvas) => {
+      const state = canvasReadbackState(canvas);
+      if (!state) return new Uint8Array();
       if (state.width === 0 || state.height === 0) return new Uint8Array();
       const pixels =
           state.pixels ||
@@ -2588,7 +2809,7 @@
       configurable: true,
       enumerable: true,
       get() {
-        return dimension(this, "width", 300);
+        return dimensions(this).width;
       },
       set(value) {
         this.setAttribute("width", String(Number(value) >>> 0));
@@ -2598,24 +2819,37 @@
       configurable: true,
       enumerable: true,
       get() {
-        return dimension(this, "height", 150);
+        return dimensions(this).height;
       },
       set(value) {
         this.setAttribute("height", String(Number(value) >>> 0));
       },
     },
   });
-  HTMLCanvasElement.prototype.getContext = function (type) {
-    if (String(type).toLowerCase() !== "2d") return null;
+  HTMLCanvasElement.prototype.getContext = function (type, attributes) {
+    type = String(type).toLowerCase();
+    const existingKind = contextKinds.get(this);
+    if (type === "webgl" || type === "experimental-webgl") {
+      if (existingKind && existingKind !== "webgl") return null;
+      globalThis.__tilefinchEnsureWebGLBootstrap?.();
+      const context = globalThis.__tilefinchCreateWebGLContext?.(
+        this, attributes,
+      ) || null;
+      if (context) contextKinds.set(this, "webgl");
+      return context;
+    }
+    if (type !== "2d" || (existingKind && existingKind !== "2d")) return null;
     let context = contexts.get(this);
     if (!context) {
       context = new CanvasRenderingContext2D(this);
       contexts.set(this, context);
+      contextKinds.set(this, "2d");
     }
     return context;
   };
   HTMLCanvasElement.prototype.toDataURL = function () {
-    const state = stateFor(this);
+    const state = canvasReadbackState(this);
+    if (!state) return "data:,";
     if (!state.originClean)
       throw new DOMException("Canvas is not origin-clean", "SecurityError");
     if (
@@ -2629,7 +2863,11 @@
   HTMLCanvasElement.prototype.toBlob = function (callback) {
     if (typeof callback !== "function")
       throw new TypeError("toBlob requires a callback");
-    const state = stateFor(this);
+    const state = canvasReadbackState(this);
+    if (!state) {
+      queueMicrotask(() => callback(null));
+      return;
+    }
     if (!state.originClean)
       throw new DOMException("Canvas is not origin-clean", "SecurityError");
     setTimeout(() => {
@@ -2655,7 +2893,9 @@
       (name === "width" || name === "height")
     ) {
       const state = states.get(node);
-      if (state) {
+      if (contextKinds.get(node) === "webgl") {
+        globalThis.__tilefinchWebGLResize?.(node);
+      } else if (state) {
         resetState(state);
         if (!state.surfaceUnavailable && state.width && state.height) {
           ensureSurface(state);
@@ -2664,11 +2904,16 @@
       }
     }
   };
-  globalThis.__tilefinchCanvasDimension = (node, name) =>
-    dimension(node, name, name === "width" ? 300 : 150);
+  globalThis.__tilefinchCanvasDimension = (node, name) => {
+    const size = dimensions(node);
+    return name === "width" ? size.width : size.height;
+  };
   globalThis.__tilefinchSetCanvasDimension = (node, name, value) =>
     node.setAttribute(name, String(Number(value) >>> 0));
   globalThis.__tilefinchFlushCanvasSurfaces = flushCanvasSurfaces;
+  globalThis.__tilefinchCanvasReadbackState = canvasReadbackState;
+  globalThis.__tilefinchCanvasContextKind = (node) =>
+    contextKinds.get(node) || "";
   Object.defineProperty(globalThis, "__tilefinchCanvasDiagnostics", {
     configurable: false,
     enumerable: false,
@@ -2685,6 +2930,10 @@
       }
     }
     for (const canvas of candidates) {
+      if (contextKinds.get(canvas) === "webgl") {
+        globalThis.__tilefinchWebGLConnected?.(canvas);
+        continue;
+      }
       const state = states.get(canvas);
       if (state?.dirty) scheduleCanvasCommit(state, state.dirty);
     }
@@ -2696,6 +2945,7 @@
     DOMMatrix,
     DOMMatrixReadOnly: DOMMatrix,
     ImageData,
+    ImageBitmap,
     Path2D,
   });
 })();

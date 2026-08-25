@@ -486,6 +486,14 @@ static bool test_request_validation_before_replay(void)
     if (fetch_request_validate(&candidate, NULL)) return false;
 
     candidate = request();
+    candidate.raw_gzip_encoding = true;
+    if (!fetch_request_validate(&candidate, NULL)) return false;
+    candidate.identity_encoding = true;
+    error = FETCH_REQUEST_VALIDATION_OK;
+    if (fetch_request_validate(&candidate, &error)
+        || error != FETCH_REQUEST_VALIDATION_CONTEXT) return false;
+
+    candidate = request();
     candidate.credentials = (FetchCredentialPolicy) -1;
     error = FETCH_REQUEST_VALIDATION_OK;
     if (fetch_request_validate(&candidate, &error)

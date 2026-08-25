@@ -3,6 +3,13 @@
 #include <stddef.h>
 #include <string.h>
 
+static uint32_t psp_display_content_epoch = 1u;
+
+uint32_t psp_display_edram_content_epoch(void)
+{
+    return psp_display_content_epoch;
+}
+
 bool psp_display_begin(PspDisplay *display, const PspDisplayBackend *backend)
 {
     if (display == NULL) return false;
@@ -188,6 +195,8 @@ bool psp_display_video_begin(PspDisplay *display)
        into the XOR would produce index 3 and make video_end() reassert page
        slot 2 even though the displayed video front was slot 0. */
     display->back_buffer %= PSP_DISPLAY_VIDEO_BUFFER_COUNT;
+    psp_display_content_epoch++;
+    if (psp_display_content_epoch == 0u) psp_display_content_epoch = 1u;
     display->surface = PSP_DISPLAY_SURFACE_RGBA8888;
     display->surface_entries++;
     return true;

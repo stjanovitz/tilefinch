@@ -138,6 +138,43 @@ PSP-only builds consume.
 The PSP cross-build consumes those checked-in artifacts and does not run a
 host QuickJS generator through the PSP toolchain.
 
+### Canvas and WebGL game qualification
+
+The public [WebGL authoring guide](WEBGL.md) defines the bounded PSP profile
+that this lane qualifies and the patterns page authors should use.
+
+The focused game-compatibility lane exercises a bounded Canvas paddle/ball
+loop, an indexed and depth-tested WebGL loop, page-visibility suspension,
+Gamepad sampling, drawing-buffer limits, pixel readback, object deletion, and
+invalid buffer/index ranges. It also runs the complete installable
+`examples/prism-break-3d/` game through deterministic physics, collision,
+level-transition, multiball, power-up, particle, and dynamic-mesh scenarios:
+
+```sh
+cmake --build build-preset-release \
+  --target tilefinch-canvas-webgl-conformance-tests
+ctest --test-dir build-preset-release \
+  -R '^tilefinch-canvas-webgl-conformance-tests$' --output-on-failure
+```
+
+The ordinary lane stays short. A bounded 600-frame allocation soak is opt-in:
+
+```sh
+TILEFINCH_WEBGL_SOAK_FRAMES=600 \
+  build-preset-release/tilefinch-canvas-webgl-conformance-tests
+```
+
+It reports the QuickJS heap before, after, and at its high-water mark together
+with the number of charged allocations. The retained heap must remain within
+256 KiB of its pre-soak value after collection.
+
+The synthetic pages live under
+`tests/fixtures/canvas-webgl-games/`. They are suitable for the host lab and
+the isolated PPSSPP localhost harness; they contain no captured third-party
+game code. PPSSPP proves lifecycle, rendering, and cleanup behavior, but its
+software-renderer timing is not a substitute for the real-PSP performance
+qualification.
+
 ### Optional ARK-4 XMB redirect
 
 The XMB redirect is a small kernel PRX with no dependency on the browser
@@ -160,9 +197,10 @@ leave Sony's browser available.
 
 ### Optional PSP software decoder
 
-H.264 High-profile and HLS playback (including active YouTube live streams and
-premieres) use a replaceable, user-built PRX so the official EBOOT and release
-archives remain independent of FFmpeg decoder binaries.
+H.264 High-profile playback uses a replaceable, user-built PRX so the official
+EBOOT and release archives remain independent of FFmpeg decoder binaries.
+Baseline/Main MP4 and MPEG-TS HLS with AAC-LC use the PSP firmware backend,
+including compatible active YouTube live streams and premieres.
 Prepare the narrow LGPL n8.1.2 build once, then point an opt-in PSP configure
 at that ignored workspace:
 

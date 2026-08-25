@@ -7,6 +7,7 @@
 
 #include "tilefinch/budget.h"
 #include "tilefinch/content_blocker.h"
+#include "tilefinch/gamepad.h"
 #include "tilefinch/omnibox.h"
 
 #define BROWSER_PROFILE_BOOKMARK_LIMIT 32
@@ -68,6 +69,64 @@ typedef enum {
     BROWSER_YOUTUBE_QUALITY_240P = 240,
     BROWSER_YOUTUBE_QUALITY_360P = 360
 } BrowserYoutubeQuality;
+
+/* Audio-language preference for provider video. SYSTEM follows the PSP
+   setting lazily; ORIGINAL asks the provider to retain the authored default.
+   Values are serialized, so append without reordering. */
+typedef enum {
+    BROWSER_VIDEO_LANGUAGE_SYSTEM = 0,
+    BROWSER_VIDEO_LANGUAGE_ORIGINAL,
+    BROWSER_VIDEO_LANGUAGE_ENGLISH,
+    BROWSER_VIDEO_LANGUAGE_SPANISH,
+    BROWSER_VIDEO_LANGUAGE_FRENCH,
+    BROWSER_VIDEO_LANGUAGE_GERMAN,
+    BROWSER_VIDEO_LANGUAGE_ITALIAN,
+    BROWSER_VIDEO_LANGUAGE_PORTUGUESE,
+    BROWSER_VIDEO_LANGUAGE_JAPANESE,
+    BROWSER_VIDEO_LANGUAGE_KOREAN,
+    BROWSER_VIDEO_LANGUAGE_CHINESE_SIMPLIFIED,
+    BROWSER_VIDEO_LANGUAGE_CHINESE_TRADITIONAL,
+    BROWSER_VIDEO_LANGUAGE_RUSSIAN,
+    BROWSER_VIDEO_LANGUAGE_COUNT
+} BrowserVideoLanguage;
+
+/* Subtitle ranking is independent of whether captions are enabled. Values
+   deliberately mirror the explicit BrowserVideoLanguage values, while the
+   first two entries describe subtitle-specific sources. */
+typedef enum {
+    BROWSER_SUBTITLE_LANGUAGE_SYSTEM = 0,
+    BROWSER_SUBTITLE_LANGUAGE_SAME_AS_AUDIO,
+    BROWSER_SUBTITLE_LANGUAGE_ENGLISH,
+    BROWSER_SUBTITLE_LANGUAGE_SPANISH,
+    BROWSER_SUBTITLE_LANGUAGE_FRENCH,
+    BROWSER_SUBTITLE_LANGUAGE_GERMAN,
+    BROWSER_SUBTITLE_LANGUAGE_ITALIAN,
+    BROWSER_SUBTITLE_LANGUAGE_PORTUGUESE,
+    BROWSER_SUBTITLE_LANGUAGE_JAPANESE,
+    BROWSER_SUBTITLE_LANGUAGE_KOREAN,
+    BROWSER_SUBTITLE_LANGUAGE_CHINESE_SIMPLIFIED,
+    BROWSER_SUBTITLE_LANGUAGE_CHINESE_TRADITIONAL,
+    BROWSER_SUBTITLE_LANGUAGE_RUSSIAN,
+    BROWSER_SUBTITLE_LANGUAGE_COUNT
+} BrowserSubtitleLanguage;
+
+/* Zero means no alternate. Explicit entries retain the same numeric language
+   identities used by the audio and subtitle preferences. */
+typedef enum {
+    BROWSER_ALTERNATE_LANGUAGE_NONE = 0,
+    BROWSER_ALTERNATE_LANGUAGE_ENGLISH = 2,
+    BROWSER_ALTERNATE_LANGUAGE_SPANISH,
+    BROWSER_ALTERNATE_LANGUAGE_FRENCH,
+    BROWSER_ALTERNATE_LANGUAGE_GERMAN,
+    BROWSER_ALTERNATE_LANGUAGE_ITALIAN,
+    BROWSER_ALTERNATE_LANGUAGE_PORTUGUESE,
+    BROWSER_ALTERNATE_LANGUAGE_JAPANESE,
+    BROWSER_ALTERNATE_LANGUAGE_KOREAN,
+    BROWSER_ALTERNATE_LANGUAGE_CHINESE_SIMPLIFIED,
+    BROWSER_ALTERNATE_LANGUAGE_CHINESE_TRADITIONAL,
+    BROWSER_ALTERNATE_LANGUAGE_RUSSIAN,
+    BROWSER_ALTERNATE_LANGUAGE_COUNT
+} BrowserAlternateLanguage;
 
 /*
  * How a decoded video frame is scaled onto the panel.
@@ -179,6 +238,21 @@ BrowserChromeTheme browser_profile_chrome_theme(
     const BrowserProfile *profile);
 BrowserYoutubeQuality browser_profile_youtube_quality(
     const BrowserProfile *profile);
+BrowserVideoLanguage browser_profile_video_language(
+    const BrowserProfile *profile);
+BrowserSubtitleLanguage browser_profile_subtitle_language(
+    const BrowserProfile *profile);
+BrowserAlternateLanguage browser_profile_alternate_language(
+    const BrowserProfile *profile);
+/* NULL means the authored/original track. SYSTEM uses system_language after
+   validation and falls back to English; every other result is static. */
+const char *browser_video_language_tag(
+    BrowserVideoLanguage language, const char *system_language);
+const char *browser_subtitle_language_tag(
+    BrowserSubtitleLanguage language, const char *system_language,
+    const char *audio_language);
+const char *browser_alternate_language_tag(
+    BrowserAlternateLanguage language);
 bool browser_profile_youtube_compact_results(
     const BrowserProfile *profile);
 /* YouTube-only transport preference. When enabled, the resolver's adaptive
@@ -195,6 +269,8 @@ bool browser_profile_video_startup_buffering(
 bool browser_profile_resume_offline_downloads(
     const BrowserProfile *profile);
 BrowserTextEntryMode browser_profile_text_entry_mode(
+    const BrowserProfile *profile);
+TilefinchGamepadFaceMapping browser_profile_gamepad_face_mapping(
     const BrowserProfile *profile);
 ContentBlockerMode browser_profile_content_blocker_mode(
     const BrowserProfile *profile);
@@ -279,6 +355,12 @@ void browser_profile_set_video_scaling(
     BrowserProfile *profile, BrowserVideoScaling scaling);
 void browser_profile_set_youtube_quality(
     BrowserProfile *profile, BrowserYoutubeQuality quality);
+void browser_profile_set_video_language(
+    BrowserProfile *profile, BrowserVideoLanguage language);
+void browser_profile_set_subtitle_language(
+    BrowserProfile *profile, BrowserSubtitleLanguage language);
+void browser_profile_set_alternate_language(
+    BrowserProfile *profile, BrowserAlternateLanguage language);
 void browser_profile_set_youtube_compact_results(
     BrowserProfile *profile, bool compact);
 void browser_profile_set_youtube_audio_only(
@@ -289,6 +371,8 @@ void browser_profile_set_resume_offline_downloads(
     BrowserProfile *profile, bool enabled);
 void browser_profile_set_text_entry_mode(
     BrowserProfile *profile, BrowserTextEntryMode mode);
+void browser_profile_set_gamepad_face_mapping(
+    BrowserProfile *profile, TilefinchGamepadFaceMapping mapping);
 void browser_profile_set_content_blocker_mode(
     BrowserProfile *profile, ContentBlockerMode mode);
 void browser_profile_set_content_blocker_cosmetic_hiding(

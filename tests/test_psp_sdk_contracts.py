@@ -99,6 +99,19 @@ def psp_media_session_sources():
         for name in names)
 
 
+def psp_firmware_backend_create(source: str):
+    """Return the shared physical constructor, not its demux/source wrappers."""
+    return source[
+        source.index("static bool psp_media_backend_create_track_info("):
+        source.index("static void psp_media_collect_demux_tracks(")]
+
+
+def psp_firmware_backend_destroy(source: str):
+    return source[
+        source.index("static void psp_media_destroy("):
+        source.index("static bool psp_media_backend_create_track_info(")]
+
+
 class PspSdkContractTests(unittest.TestCase):
     def test_home_exit_returns_callback_thread_to_the_busy_supervisor(self):
         runtime = without_comments(
@@ -429,15 +442,11 @@ class PspSdkContractTests(unittest.TestCase):
     def test_unsafe_audio_teardown_quarantines_future_backends(self):
         source = without_comments(
             (ROOT / "src/media_backend_psp.c").read_text(encoding="utf-8"))
-        destroy = source[
-            source.index("static void psp_media_destroy("):
-            source.index("bool media_psp_backend_create_split(")]
+        destroy = psp_firmware_backend_destroy(source)
         # The latch and the Media Engine pool's poison are one call, so no
         # teardown can refuse future backends while leaving the pool reusable.
         self.assertGreaterEqual(destroy.count("psp_media_quarantine();"), 2)
-        create = source[
-            source.index("bool media_psp_backend_create_split("):
-            source.index("bool media_psp_backend_create(")]
+        create = psp_firmware_backend_create(source)
         self.assertIn("if (psp_media_backend_is_quarantined)", create)
         self.assertLess(
             create.index("if (psp_media_backend_is_quarantined)"),
@@ -580,6 +589,40 @@ class PspSdkContractTests(unittest.TestCase):
             "the media clock's elapsed time is assigned once, from the "
             "measured frame delta")
 
+    def test_page_gamepad_consumes_the_effective_input_source(self):
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        start = main.index("static TILEFINCH_OUT_OF_LINE bool "
+                           "psp_update_page_gamepad(")
+        gamepad = main[start:main.index(
+            "static TILEFINCH_OUT_OF_LINE bool psp_update_page_fullscreen(",
+            start + 80)]
+        self.assertIn("PspUiInput *input", gamepad)
+        self.assertIn("psp_gamepad_standard_ui_buttons(", gamepad)
+        self.assertIn("input->held", gamepad)
+        self.assertIn("input->analog_x", gamepad)
+        self.assertIn("input->analog_y", gamepad)
+        self.assertNotIn("pad->Buttons", gamepad)
+        self.assertNotIn("pad->Lx", gamepad)
+        self.assertNotIn("pad->Ly", gamepad)
+        self.assertNotIn("ui->page_fullscreen && chord", gamepad)
+        self.assertNotIn("browser_engine_exit_page_fullscreen", gamepad)
+
+        call = main[main.index("bool gamepad_visual_changed ="):
+                    main.index("bool gamepad_visual_changed =") + 300]
+        self.assertIn("psp_update_page_gamepad(", call)
+        self.assertIn("&input", call)
+        self.assertNotIn("&pad", call)
+
+        fullscreen_start = main.index(
+            "static TILEFINCH_OUT_OF_LINE bool psp_update_page_fullscreen(",
+            start + 80)
+        fullscreen = main[fullscreen_start:main.index(
+            "static TILEFINCH_OUT_OF_LINE void psp_suspend_page_runtime(",
+            fullscreen_start)]
+        self.assertIn("PSP_UI_BUTTON_TOOLBAR", fullscreen)
+        self.assertIn("browser_engine_exit_page_fullscreen", fullscreen)
+
     def test_voice_reclaims_only_a_hidden_media_pipeline(self):
         session = without_comments(
             psp_media_session_sources())
@@ -642,7 +685,8 @@ class PspSdkContractTests(unittest.TestCase):
             "bool psp_media_open_work_pending(", start)]
         self.assertLess(
             pump.index("media_psp_backend_quarantined()"),
-            pump.index("youtube_resolve_progressive_mp4_cancelable("))
+            pump.index(
+                "youtube_resolve_progressive_mp4_cancelable_with_preferences("))
 
     def test_media_resume_writes_use_debounced_profile_store(self):
         session = without_comments(
@@ -1758,6 +1802,56 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertGreaterEqual(
             me.count("swdec_audio_channels_admitted(out.channels)"), 2)
 
+    def test_hls_routes_from_sampled_profile_to_firmware_or_optional_decoder(self):
+        """HLS is a source shape, not a decoder choice. Actual Annex-B SPS
+        data selects the standard firmware path for Baseline/Main."""
+        opened = without_comments(
+            (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+        hls = opened[
+            opened.index("else if (media->page_hls"):
+            opened.index("else if (media->page_source")]
+        self.assertIn("media_h264_annexb_decoder_route(", hls)
+        self.assertIn("MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION", hls)
+        self.assertIn("psp_swdec_component_prepare(", hls)
+        self.assertNotIn("media->decoder_profile_idc = 100u", hls)
+        playback = opened[
+            opened.index("static bool psp_media_create_playback("):
+            opened.index("static bool psp_media_create_audio_http_range(")]
+        self.assertIn("media_psp_backend_create_sources(", playback)
+        self.assertIn("media_psp_swdec_backend_create_sources(", playback)
+        self.assertIn("media_playback_create_sources(", playback)
+
+        firmware = without_comments(
+            (ROOT / "src/media_backend_psp.c").read_text(encoding="utf-8"))
+        worker = firmware[
+            firmware.index("static MediaBackendResult psp_media_decode_staged_video("):
+            firmware.index("static MediaBackendResult psp_media_decode_staged_audio(")]
+        self.assertIn("media_h264_annexb_to_avcc_in_place(", worker)
+        submit = firmware[
+            firmware.index("static MediaBackendResult psp_media_submit("):
+            firmware.index("static MediaBackendResult psp_media_drain(")]
+        self.assertIn("media_h264_annexb_sample_matches_config(", submit)
+
+        hls_transport = without_comments(
+            (ROOT / "src/psp_media_hls.c").read_text(encoding="utf-8"))
+        self.assertIn(
+            ".raw_gzip_encoding = raw_gzip", hls_transport,
+            "pumpable HLS must own incremental playlist decompression")
+        gzip_pump = without_comments(
+            (ROOT / "src/psp_hls_gzip.c").read_text(encoding="utf-8"))
+        self.assertIn("inflate(&gzip->stream, Z_NO_FLUSH)", gzip_pump)
+        background_transport = without_comments(
+            (ROOT / "src/fetch/background_transport.inc").read_text(
+                encoding="utf-8"))
+        self.assertIn("CURLOPT_HTTP_CONTENT_DECODING", background_transport)
+        self.assertIn("slot->raw_gzip_encoding", background_transport)
+        self.assertIn(
+            "PSP_HLS_PLAYLIST_CHUNK_BYTES", hls_transport,
+            "large playlists must use the bounded full publication quantum")
+        self.assertIn(
+            "psp_hls_playlist_retry_allowed(", hls_transport,
+            "initial playlist transport failure needs one bounded restart")
+
     def test_swdec_prx_cleanup_tracks_partial_module_and_me_ownership(self):
         source = without_comments(
             (ROOT / "src/psp_swdec_component.c").read_text(encoding="utf-8"))
@@ -2166,7 +2260,7 @@ class PspSdkContractTests(unittest.TestCase):
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
         feed_at = loop.index(
             "psp_media_feed_before_blocking(&browser->media)")
-        blank_at = loop.index("sceDisplayWaitVblankStart()", feed_at)
+        blank_at = loop.index("psp_wait_before_interactive_input(", feed_at)
         self.assertLess(feed_at, blank_at)
         self.assertNotIn(
             "psp_media_advance(", loop[feed_at:blank_at])
@@ -2176,8 +2270,14 @@ class PspSdkContractTests(unittest.TestCase):
         # feed and therefore still gives this lower-priority worker CPU.
         between = loop[feed_at:blank_at]
         self.assertIn("fullscreen_media_poll", between)
-        self.assertIn("sceKernelDelayThread(", between)
-        self.assertIn("PSP_MEDIA_FULLSCREEN_POLL_YIELD_US", between)
+        wait = loop[
+            loop.index("static TILEFINCH_OUT_OF_LINE void "
+                       "psp_wait_before_interactive_input("):
+            loop.index("static TILEFINCH_OUT_OF_LINE bool "
+                       "psp_update_page_fullscreen(")]
+        self.assertIn("sceKernelDelayThread(", wait)
+        self.assertIn("PSP_MEDIA_FULLSCREEN_POLL_YIELD_US", wait)
+        self.assertIn("sceDisplayWaitVblankStart()", wait)
         # NEXTFRAME latches only at vblank. Menu motion must not share the
         # media shortcut or the next loop can overwrite the buffer that is
         # still being scanned, a hardware-only flicker the host compositor
@@ -2966,9 +3066,7 @@ class PspSdkContractTests(unittest.TestCase):
         reset = source[
             source.index("static bool psp_media_reset("):
             source.index("static bool psp_media_take_frame(")]
-        destroy = source[
-            source.index("static void psp_media_destroy("):
-            source.index("bool media_psp_backend_create_split(")]
+        destroy = psp_firmware_backend_destroy(source)
         self.assertLess(
             reset.index("psp_media_cancel_prepared_job(backend)"),
             reset.index("backend->session_epoch = psp_media_epoch_advance("))
@@ -3724,9 +3822,7 @@ class PspSdkContractTests(unittest.TestCase):
     def test_stuck_codec_worker_is_bounded_and_quarantined(self):
         source = without_comments(
             (ROOT / "src/media_backend_psp.c").read_text(encoding="utf-8"))
-        destroy = source[
-            source.index("static void psp_media_destroy("):
-            source.index("bool media_psp_backend_create_split(")]
+        destroy = psp_firmware_backend_destroy(source)
         self.assertIn("PSP_MEDIA_CODEC_QUIESCE_WAIT_US", destroy)
         self.assertIn(
             "PSP_MEDIA_CODEC_QUIESCE_WAIT_US 250000u", source)
@@ -3766,9 +3862,7 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("static int psp_media_collect_codec_job(")]
         self.assertIn("PSP_MEDIA_CODEC_KIND_TEARDOWN", worker)
         self.assertIn("psp_media_run_teardown_job(", worker)
-        destroy = source[
-            source.index("static void psp_media_destroy("):
-            source.index("bool media_psp_backend_create_split(")]
+        destroy = psp_firmware_backend_destroy(source)
         for call in ("sceMpegDelete(", "sceMpegFinish()",
                      "sceAudiocodecReleaseEDRAM("):
             self.assertNotIn(call, destroy)
@@ -3840,7 +3934,9 @@ class PspSdkContractTests(unittest.TestCase):
                 "static MediaBackendResult psp_media_decode_staged_video("):
             source.index(
                 "static MediaBackendResult psp_media_decode_staged_audio(")]
-        guard = decode.index("#if defined(TILEFINCH_PSP_VALIDATION_LOG)")
+        event = decode.index("event=avc-bridge-submit")
+        guard = decode.rindex(
+            "#if defined(TILEFINCH_PSP_VALIDATION_LOG)", 0, event)
         end = decode.index("#endif", guard)
         block = decode[guard:end]
         self.assertIn("event=avc-bridge-submit", block)
@@ -3937,9 +4033,7 @@ class PspSdkContractTests(unittest.TestCase):
                 "void media_psp_backend_set_wide_program(const char *name)"):
             backend.index("int media_psp_backend_wide_program(void)")]
         self.assertIn("psp_media_wide_program_configured(name)", setter)
-        create = backend[
-            backend.index("bool media_psp_backend_create_split("):
-            backend.index("bool media_psp_backend_create(")]
+        create = psp_firmware_backend_create(backend)
         clamp = create.index("event=wide-program-clamped")
         self.assertIn("psp_media_wide_program_required(", create)
         self.assertLess(clamp, create.index("psp_media_boot_media_engine("))
@@ -3984,9 +4078,7 @@ class PspSdkContractTests(unittest.TestCase):
         # Pool storage, not the heap: the codec reads this buffer by DMA.
         self.assertIn("psp_media_alloc64(", fake)
         self.assertNotIn("memalign(", fake)
-        create = backend[
-            backend.index("bool media_psp_backend_create_split("):
-            backend.index("bool media_psp_backend_create(")]
+        create = psp_firmware_backend_create(backend)
         # Exactly one grant call, and the knob check has to precede it, so the
         # default path cannot reach sceAudiocodecGetEDRAM at all.
         self.assertEqual(create.count("sceAudiocodecGetEDRAM("), 1)
@@ -4168,9 +4260,7 @@ class PspSdkContractTests(unittest.TestCase):
         # card sync would cost many times the steady-state frame budget.
         self.assertLess(submitted, primed)
         self.assertLess(primed, decode.index("sceMpegGetAvcNalAu("))
-        create = backend[
-            backend.index("bool media_psp_backend_create_split("):
-            backend.index("bool media_psp_backend_create(")]
+        create = psp_firmware_backend_create(backend)
         boot = create.index("psp_media_boot_media_engine(")
         logged = create.index("event=me-boot", boot)
         self.assertLess(logged, create.index("sceMpegQueryMemSize("))
@@ -4337,9 +4427,7 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("event=me-pool-exhausted need=%u ", shared)
         self.assertIn("remaining=%u", shared)
         self.assertIn("memalign(", shared)
-        create = backend[
-            backend.index("bool media_psp_backend_create_split("):
-            backend.index("bool media_psp_backend_create(")]
+        create = psp_firmware_backend_create(backend)
         # No allocation in the create path may bypass the pool.
         self.assertNotIn("memalign(", create)
         self.assertNotIn("malloc(", create)
@@ -4364,9 +4452,7 @@ class PspSdkContractTests(unittest.TestCase):
         # pool must be poisoned rather than rewound by that path -- and no
         # site may latch the refusal without doing it.
         self.assertNotIn("psp_media_backend_is_quarantined = true", create)
-        destroy = backend[
-            backend.index("static void psp_media_destroy(void *opaque)"):
-            backend.index("bool media_psp_backend_create_split(")]
+        destroy = psp_firmware_backend_destroy(backend)
         self.assertNotIn("psp_media_backend_is_quarantined = true", destroy)
         self.assertIn("psp_media_quarantine();", destroy)
         self.assertNotIn("free(backend->", destroy)
@@ -4910,7 +4996,7 @@ class PspSdkContractTests(unittest.TestCase):
         resolver = without_comments(
             (ROOT / "src/youtube_resolver.c").read_text(encoding="utf-8"))
         sync_start = resolver.index(
-            "bool youtube_resolve_progressive_mp4_cancelable(")
+            "bool youtube_resolve_progressive_mp4_cancelable_with_preferences(")
         request_start = resolver.index("FetchRequest watch_request", sync_start)
         sync_request = resolver[request_start:request_start + 1600]
         self.assertIn(".redirect_same_origin_only = true", sync_request)
@@ -5273,7 +5359,7 @@ class PspSdkContractTests(unittest.TestCase):
                 "browser_engine_optional_memory_reclaim_pending("),
             runtime_helper.index("browser_engine_advance_runtime("))
         present = loop[
-            loop.index("if (frame.page_dirty || render_visual_changed"):
+            loop.index("if (frame.page_dirty || render_visual_state != 0"):
             loop.index("if (psp_deferred_image_after_present(")]
         self.assertLess(
             present.index("psp_present("),
@@ -5460,7 +5546,7 @@ class PspSdkContractTests(unittest.TestCase):
         preceding = main[max(0, sites[0] - 400):sites[0]]
         self.assertIn("psp_exit_handoff(exit_to)", preceding)
         self.assertIn("#ifdef TILEFINCH_PSP_VALIDATION_LOG", preceding)
-        # Every mode that stops the process reaches the funnel: the five
+        # Every mode that stops the process reaches the funnel: the six
         # validation qualifications plus the ordinary clean exit. Scan past the
         # funnel's own definition, which is above every caller.
         callers = re.findall(
@@ -5470,6 +5556,7 @@ class PspSdkContractTests(unittest.TestCase):
             sorted([
                 "process.config.exit_to",
                 "config->exit_to",
+                "exit_to",
                 "exit_to",
                 "exit_to",
                 "exit_to",

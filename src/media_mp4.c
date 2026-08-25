@@ -3237,6 +3237,131 @@ static size_t media_h264_annexb_start(
     return SIZE_MAX;
 }
 
+bool media_h264_annexb_parameter_sets(
+    const unsigned char *payload, size_t length,
+    const unsigned char **sps, size_t *sps_length,
+    const unsigned char **pps, size_t *pps_length)
+{
+    if (sps != NULL) *sps = NULL;
+    if (pps != NULL) *pps = NULL;
+    if (sps_length != NULL) *sps_length = 0;
+    if (pps_length != NULL) *pps_length = 0;
+    if (payload == NULL || sps == NULL || sps_length == NULL
+        || pps == NULL || pps_length == NULL) return false;
+    size_t prefix = 0;
+    size_t start = media_h264_annexb_start(payload, length, 0, &prefix);
+    unsigned sps_count = 0, pps_count = 0;
+    while (start != SIZE_MAX) {
+        size_t nal = start + prefix;
+        if (nal >= length) return false;
+        size_t next_prefix = 0;
+        size_t next = media_h264_annexb_start(
+            payload, length, nal + 1u, &next_prefix);
+        size_t end = next == SIZE_MAX ? length : next;
+        while (end > nal && payload[end - 1u] == 0) end--;
+        if (end <= nal) return false;
+        unsigned type = payload[nal] & 0x1fu;
+        if (type == 7u) {
+            if (++sps_count != 1u) return false;
+            *sps = payload + nal;
+            *sps_length = end - nal;
+        } else if (type == 8u) {
+            if (++pps_count != 1u) return false;
+            *pps = payload + nal;
+            *pps_length = end - nal;
+        }
+        start = next;
+        prefix = next_prefix;
+    }
+    return sps_count == 1u && pps_count == 1u;
+}
+
+MediaH264DecoderRoute media_h264_annexb_decoder_route(
+    const unsigned char *config, size_t length, uint8_t *profile_idc)
+{
+    if (profile_idc != NULL) *profile_idc = 0;
+    const unsigned char *sps = NULL, *pps = NULL;
+    size_t sps_length = 0, pps_length = 0;
+    if (!media_h264_annexb_parameter_sets(
+            config, length, &sps, &sps_length, &pps, &pps_length)
+        || sps_length < 2u) return MEDIA_H264_DECODER_ROUTE_UNSUPPORTED;
+    (void) pps;
+    (void) pps_length;
+    uint8_t profile = sps[1];
+    if (profile_idc != NULL) *profile_idc = profile;
+    if (profile == 66u || profile == 77u)
+        return MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE;
+    if (profile == 100u || profile == 110u || profile == 122u
+        || profile == 244u || profile == 44u || profile == 83u
+        || profile == 86u || profile == 118u || profile == 128u
+        || profile == 138u || profile == 139u || profile == 134u
+        || profile == 135u)
+        return MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION;
+    return MEDIA_H264_DECODER_ROUTE_UNSUPPORTED;
+}
+
+bool media_h264_annexb_to_avcc_in_place(
+    unsigned char *payload, size_t length, size_t capacity,
+    size_t *output_length, unsigned *nal_count)
+{
+    if (output_length != NULL) *output_length = 0;
+    if (nal_count != NULL) *nal_count = 0;
+    if (payload == NULL || length == 0 || capacity < length
+        || output_length == NULL) return false;
+    size_t prefix = 0;
+    size_t start = media_h264_annexb_start(payload, length, 0, &prefix);
+    if (start != 0 || (prefix != 3u && prefix != 4u)) return false;
+    size_t growth = 0;
+    unsigned count = 0;
+    for (size_t at = start; at != SIZE_MAX;) {
+        size_t current_prefix = prefix;
+        size_t nal = at + current_prefix;
+        if (nal >= length) return false;
+        size_t next_prefix = 0;
+        size_t next = media_h264_annexb_start(
+            payload, length, nal + 1u, &next_prefix);
+        size_t end = next == SIZE_MAX ? length : next;
+        if (end <= nal || end - nal > UINT32_MAX
+            || (payload[nal] & 0x80u) != 0
+            || (payload[nal] & 0x1fu) == 0u) return false;
+        if (current_prefix == 3u) {
+            if (growth == SIZE_MAX) return false;
+            growth++;
+        }
+        count++;
+        at = next;
+        prefix = next_prefix;
+    }
+    if (growth > capacity - length) return false;
+    memmove(payload + growth, payload, length);
+    const unsigned char *source = payload + growth;
+    size_t source_length = length;
+    size_t read = 0, write = 0;
+    while (read < source_length) {
+        size_t current_prefix = 0;
+        size_t found = media_h264_annexb_start(
+            source, source_length, read, &current_prefix);
+        if (found != read) return false;
+        size_t nal = found + current_prefix;
+        size_t next_prefix = 0;
+        size_t next = media_h264_annexb_start(
+            source, source_length, nal + 1u, &next_prefix);
+        size_t end = next == SIZE_MAX ? source_length : next;
+        size_t bytes = end - nal;
+        payload[write] = (unsigned char) (bytes >> 24u);
+        payload[write + 1u] = (unsigned char) (bytes >> 16u);
+        payload[write + 2u] = (unsigned char) (bytes >> 8u);
+        payload[write + 3u] = (unsigned char) bytes;
+        memmove(payload + write + 4u, source + nal, bytes);
+        write += 4u + bytes;
+        read = end;
+        (void) next_prefix;
+    }
+    *output_length = write;
+    if (nal_count != NULL) *nal_count = count;
+    return write == length + growth;
+}
+
 bool media_h264_annexb_sample_is_admitted(
     const unsigned char *payload, size_t length,
     uint16_t width, uint16_t height)
@@ -3270,4 +3395,42 @@ bool media_h264_annexb_sample_is_admitted(
         prefix = next_prefix;
     }
     return saw_nal;
+}
+
+bool media_h264_annexb_sample_matches_config(
+    const unsigned char *payload, size_t length,
+    uint16_t width, uint16_t height,
+    const unsigned char *config, size_t config_length)
+{
+    if (!media_h264_annexb_sample_is_admitted(
+            payload, length, width, height)) return false;
+    const unsigned char *config_sps = NULL, *config_pps = NULL;
+    size_t config_sps_length = 0, config_pps_length = 0;
+    if (!media_h264_annexb_parameter_sets(
+            config, config_length,
+            &config_sps, &config_sps_length,
+            &config_pps, &config_pps_length)) return false;
+    size_t prefix = 0;
+    size_t start = media_h264_annexb_start(payload, length, 0, &prefix);
+    while (start != SIZE_MAX) {
+        size_t nal = start + prefix;
+        if (nal >= length) return false;
+        size_t next_prefix = 0;
+        size_t next = media_h264_annexb_start(
+            payload, length, nal + 1u, &next_prefix);
+        size_t end = next == SIZE_MAX ? length : next;
+        while (end > nal && payload[end - 1u] == 0) end--;
+        size_t nal_length = end - nal;
+        unsigned type = payload[nal] & 0x1fu;
+        if ((type == 7u
+             && (nal_length != config_sps_length
+                 || memcmp(payload + nal, config_sps, nal_length) != 0))
+            || (type == 8u
+                && (nal_length != config_pps_length
+                    || memcmp(payload + nal, config_pps, nal_length) != 0)))
+            return false;
+        start = next;
+        prefix = next_prefix;
+    }
+    return true;
 }

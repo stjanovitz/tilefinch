@@ -216,6 +216,33 @@ typedef enum {
     BROWSER_CACHE_STALE
 } BrowserCacheStatus;
 
+#define BROWSER_OFFLINE_CACHE_ENTRY_LIMIT 32u
+
+typedef enum {
+    BROWSER_OFFLINE_CACHE_GENERIC = 0,
+    BROWSER_OFFLINE_CACHE_RESOURCE,
+    BROWSER_OFFLINE_CACHE_MODULE
+} BrowserOfflineCacheKind;
+
+/* Borrowed immutable view used only while an explicit offline-app save is
+   serializing the current same-origin working set. Executable/resource
+   authority is carried with the bytes instead of being reconstructed from a
+   URL-only disk cache. */
+typedef struct {
+    const char *url;
+    const unsigned char *data;
+    size_t length;
+    const char *content_type;
+    const char *response_url;
+    const char *response_referrer_policy;
+    BrowserOfflineCacheKind kind;
+    TilefinchResourceGrant resource_grant;
+    TilefinchCredentialsMode module_credentials;
+    bool module_cors_validated;
+    bool module_redirect_origin_tainted;
+    bool module_javascript_mime_validated;
+} BrowserOfflineCacheView;
+
 typedef struct {
     char key[BROWSER_SITE_ADAPTER_STATE_KEY_LIMIT];
     unsigned char data[BROWSER_SITE_ADAPTER_STATE_DATA_LIMIT];
@@ -637,8 +664,15 @@ size_t browser_session_cache_reclaim(BrowserSession *session,
    used entries before returning; zero and values beyond the shared Budget
    ceiling are rejected without changing the session. */
 bool browser_session_cache_set_maximum_bytes(BrowserSession *session,
-                                             size_t maximum_bytes);
+                                              size_t maximum_bytes);
 void browser_session_cache_clear(BrowserSession *session);
+size_t browser_session_cache_collect_offline_same_origin(
+    BrowserSession *session, const char *document_url,
+    BrowserOfflineCacheView *views, size_t capacity,
+    size_t maximum_bytes, size_t *total_bytes, bool *complete);
+bool browser_session_cache_restore_offline(
+    BrowserSession *session, const char *document_url,
+    const BrowserOfflineCacheView *view);
 void browser_session_destroy(BrowserSession *session);
 
 #endif

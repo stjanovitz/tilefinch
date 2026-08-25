@@ -9,6 +9,7 @@
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/budget_quickjs.h"
 #include "tilefinch/fetch.h"
+#include "tilefinch/game_audio.h"
 #include "tilefinch/request_context.h"
 #include "tilefinch/script_lazy.h"
 #include "tilefinch/style.h"
@@ -107,7 +108,7 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_REALM_MAXIMUM_TOTAL_BYTES (128u * 1024u * 1024u)
 #define SCRIPT_DYNAMIC_EXECUTION_RESERVE_BYTES (512u * 1024u)
 #define SCRIPT_DYNAMIC_LAZY_MINIMUM_BYTES (128u * 1024u)
-#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 4u
+#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 6u
 /* A fully hydrated long article exceeds 4096 nodes several times
    over; a truncated walk silently drops querySelectorAll matches (the
    mobile section transform only saw the first few sections).
@@ -240,6 +241,11 @@ typedef struct DomBridge {
     PocDocument *document;
     Budget *budget;
     ScriptResult *result;
+    /* Process-issued identity for native WebGL cache authority.  This is a
+       two-word counter so the 32-bit PSP never relies on a tearing 64-bit
+       atomic.  Page code cannot observe or choose either word. */
+    uint32_t webgl_realm_epoch_high;
+    uint32_t webgl_realm_epoch_low;
     bool *relayout_dirty;
     ScriptMutationJournal mutations;
     BrowserSession *session;
@@ -294,6 +300,8 @@ typedef struct DomBridge {
     int64_t media_node_handle;
     double media_value;
     char *media_source;
+    int64_t fullscreen_node_handle;
+    bool user_activation_active;
     bool scroll_requested;
     int scroll_y;
     ScriptRemoteElementLookupCallback remote_element_lookup;
@@ -399,6 +407,7 @@ typedef enum {
     SCRIPT_HOST_RESTORE_SAME_DOCUMENT,
     SCRIPT_HOST_SAVE_SECTION_STATE,
     SCRIPT_HOST_RESTORE_SECTION_STATE,
+    SCRIPT_HOST_UPDATE_GAMEPAD,
     SCRIPT_HOST_CALLBACK_COUNT
 } ScriptHostCallback;
 
@@ -460,12 +469,29 @@ struct ScriptRuntime {
     JSValue media_state_for;
     /* Created lazily as a private callable, never published to page script. */
     JSValue media_update;
+    /* The page lifecycle queues native visibility edges, then invokes this
+       private compatibility closure at a normal author-task checkpoint. */
+    JSValue page_visibility_host_apply;
+    /* Captured before author code and removed from the global object. Used
+       when native lifecycle observes that the fullscreen element detached. */
+    JSValue fullscreen_host_exit;
+    /* Installed by the lazy game-audio module, captured immediately, and
+       removed before evaluation returns to author code. */
+    JSValue game_audio_host_suspend;
+    JSValue game_audio_host_complete;
     JSValue function_to_string;
     /* Trusted bootstrap callbacks retained before author code runs. The page
        may observe compatibility globals, but native scheduling and document
        lifecycle never look them up through the mutable Window object. */
     JSValue host_global;
     JSValue host_callbacks[SCRIPT_HOST_CALLBACK_COUNT];
+    TilefinchGamepadState gamepad_state;
+    bool gamepad_state_valid;
+    bool page_visibility_desired;
+    bool page_visibility_queue[2];
+    uint8_t page_visibility_queue_head;
+    uint8_t page_visibility_queue_count;
+    TilefinchGameAudio *game_audio;
     struct ScriptLazyRuntimeBundle *lazy_webpack_bundles;
     uint32_t next_lazy_webpack_bundle_id;
     bool lazy_factory_recovery_pending;
@@ -725,6 +751,29 @@ JSValue js_canvas_commit_surface(JSContext *context,
 JSValue js_canvas_image_source(JSContext *context,
                                JSValueConst this_value,
                                int argc, JSValueConst *argv);
+JSValue js_webgl_render(JSContext *context,
+                        JSValueConst this_value,
+                        int argc, JSValueConst *argv);
+JSValue js_webgl_read_pixels(JSContext *context,
+                             JSValueConst this_value,
+                             int argc, JSValueConst *argv);
+JSValue js_webgl_snapshot(JSContext *context,
+                          JSValueConst this_value,
+                          int argc, JSValueConst *argv);
+JSValue js_webgl_release_surface(JSContext *context,
+                                 JSValueConst this_value,
+                                 int argc, JSValueConst *argv);
+bool js_webgl_realm_epoch_advance(DomBridge *bridge);
+void js_webgl_realm_epoch_release(DomBridge *bridge);
+JSValue js_dom_set_fullscreen(JSContext *context,
+                              JSValueConst this_value,
+                              int argc, JSValueConst *argv);
+JSValue js_game_audio_decode(JSContext *context,
+                             JSValueConst this_value,
+                             int argc, JSValueConst *argv);
+JSValue js_game_audio_command(JSContext *context,
+                              JSValueConst this_value,
+                              int argc, JSValueConst *argv);
 JSValue js_canvas_raster_rect(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv);

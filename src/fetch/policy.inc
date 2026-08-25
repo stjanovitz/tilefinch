@@ -636,6 +636,9 @@ static bool fetch_request_validate_with_facts(
             || strcasecmp(method, "HEAD") == 0)) {
         REQUEST_INVALID(FETCH_REQUEST_VALIDATION_BODY);
     }
+    if (request->identity_encoding && request->raw_gzip_encoding) {
+        REQUEST_INVALID(FETCH_REQUEST_VALIDATION_CONTEXT);
+    }
     if ((unsigned) request->credentials
             > (unsigned) FETCH_CREDENTIALS_SAME_ORIGIN
         || (request->credentials == FETCH_CREDENTIALS_SAME_ORIGIN

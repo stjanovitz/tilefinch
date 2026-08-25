@@ -54,6 +54,12 @@ if(PSP_BROWSER_BUILD_TESTS)
         TILEFINCH_TEST_METRIC_SANS_FONT="${PSP_BROWSER_METRIC_SANS_FONT}"
         TILEFINCH_TEST_METRIC_SANS_BOLD_FONT="${PSP_BROWSER_METRIC_SANS_BOLD_FONT}")
 
+    add_executable(tilefinch-gamepad-tests tests/test_gamepad.c)
+    target_link_libraries(tilefinch-gamepad-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-gamepad-tests COMMAND tilefinch-gamepad-tests)
+    set_tests_properties(tilefinch-gamepad-tests PROPERTIES
+        LABELS "tilefinch;unit;javascript;input" TIMEOUT 10)
+
     add_executable(tilefinch-xmb-redirect-policy-tests
         tests/test_xmb_redirect_policy.c
         src/xmb_redirect_policy.c)
@@ -109,6 +115,16 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-media-hls-tests COMMAND tilefinch-media-hls-tests)
     set_tests_properties(tilefinch-media-hls-tests PROPERTIES
         LABELS "tilefinch;unit;media;network;parser" TIMEOUT 30)
+    add_executable(tilefinch-psp-hls-gzip-tests
+        tests/test_psp_hls_gzip.c src/psp_hls_gzip.c)
+    target_include_directories(tilefinch-psp-hls-gzip-tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(tilefinch-psp-hls-gzip-tests PRIVATE
+        tilefinch_core ZLIB::ZLIB)
+    add_test(NAME tilefinch-psp-hls-gzip-tests
+        COMMAND tilefinch-psp-hls-gzip-tests)
+    set_tests_properties(tilefinch-psp-hls-gzip-tests PROPERTIES
+        LABELS "tilefinch;unit;media;network;compression" TIMEOUT 30)
     add_executable(tilefinch-reader-mode-tests tests/test_reader_mode.c)
     target_link_libraries(tilefinch-reader-mode-tests PRIVATE tilefinch_core)
     add_test(NAME tilefinch-reader-mode-tests COMMAND tilefinch-reader-mode-tests)
@@ -631,6 +647,18 @@ if(PSP_BROWSER_BUILD_TESTS)
         LABELS "tilefinch;unit;javascript;responsiveness"
         TIMEOUT 30)
 
+    add_executable(tilefinch-canvas-webgl-conformance-tests
+        tests/test_canvas_webgl_conformance.c)
+    target_link_libraries(tilefinch-canvas-webgl-conformance-tests
+        PRIVATE tilefinch_core)
+    target_compile_definitions(tilefinch-canvas-webgl-conformance-tests PRIVATE
+        TILEFINCH_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME tilefinch-canvas-webgl-conformance-tests
+        COMMAND tilefinch-canvas-webgl-conformance-tests)
+    set_tests_properties(tilefinch-canvas-webgl-conformance-tests PROPERTIES
+        LABELS "tilefinch;unit;javascript;canvas;webgl;game"
+        TIMEOUT 30)
+
     if(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE)
         add_test(NAME tilefinch-property-fault-trace-tests
             COMMAND psp-browser-interactive-lab
@@ -922,6 +950,7 @@ if(PSP_BROWSER_BUILD_TESTS)
         tilefinch-psp-update-session-tests
         tilefinch-dynamic-script-async-tests
         tilefinch-js-responsiveness-tests
+        tilefinch-canvas-webgl-conformance-tests
         tilefinch-script-lazy-tests
         tilefinch-stylesheet-resource-tests
         tilefinch-web-font-tests

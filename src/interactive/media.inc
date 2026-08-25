@@ -2,6 +2,7 @@ typedef struct {
     HostMediaPlayer *player;
     Budget *budget;
     PspUiMediaState ui;
+    PspUiMediaPresentation ui_presentation;
     uint64_t generation;
     bool route_enabled;
     bool native_player;
@@ -29,6 +30,8 @@ static void interactive_media_init(InteractiveMediaSession *media,
     if (media == NULL) return;
     memset(media, 0, sizeof(*media));
     psp_ui_media_init(&media->ui);
+    psp_ui_media_bind_presentation(
+        &media->ui, &media->ui_presentation);
     psp_ui_media_set_title_font(&media->ui, title_font);
     media->route_enabled = route_enabled;
     media->pace_real_time = pace_real_time;
@@ -131,7 +134,7 @@ static bool interactive_media_open(InteractiveMediaSession *media,
 static void interactive_media_destroy(InteractiveMediaSession *media)
 {
     if (media == NULL) return;
-    const FontFace *title_font = media->ui.title_font;
+    const FontFace *title_font = media->ui_presentation.title_font;
 #ifdef TILEFINCH_HAVE_HOST_MEDIA
     host_media_destroy(media->player);
 #endif
@@ -399,6 +402,8 @@ static bool interactive_media_execute_intent(
         case PSP_UI_MEDIA_ACTION_RETRY:
         case PSP_UI_MEDIA_ACTION_AUDIO_ONLY:
         case PSP_UI_MEDIA_ACTION_LOWER_QUALITY:
+        case PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK:
+        case PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK:
             return true;
         case PSP_UI_MEDIA_ACTION_CLOSE:
             return interactive_media_set_visible(

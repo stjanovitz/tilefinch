@@ -74,6 +74,14 @@ static int64_t bridge_invalidate_node_slot_impl(
     if (bridge == NULL || slot >= bridge->node_count
         || bridge->nodes[slot] == NULL) return 0;
     int64_t retired_handle = bridge_node_handle(bridge, slot);
+    if (retired_handle != 0
+        && bridge->fullscreen_node_handle == retired_handle) {
+        if (bridge->stylesheet != NULL) {
+            ((Stylesheet *) bridge->stylesheet)->fullscreen_node = NULL;
+        }
+        bridge->fullscreen_node_handle = 0;
+        if (bridge->relayout_dirty != NULL) *bridge->relayout_dirty = true;
+    }
     bridge->nodes[slot] = NULL;
     bridge->node_owner_document_identities[slot] = 0;
     /* Never wrap an incarnation: a wrapped handle could make an arbitrarily
@@ -91,6 +99,174 @@ static int64_t bridge_invalidate_node_slot_impl(
     }
     if (notify) bridge_notify_node_state_retired(bridge, retired_handle);
     return retired_handle;
+}
+
+JSValue js_dom_set_fullscreen(JSContext *context,
+                              JSValueConst this_value,
+                              int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int32_t enabled = 0;
+    int64_t handle = 0;
+    if (bridge == NULL || bridge->host == NULL || argc < 2
+        || JS_ToInt64(context, &handle, argv[0]) < 0
+        || JS_ToInt32(context, &enabled, argv[1]) < 0) return JS_FALSE;
+    if (enabled != 0) {
+        size_t slot = 0;
+        if (!bridge->user_activation_active
+            || bridge->host->document_scope
+                   != SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL
+            || !js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)
+            || bridge->nodes[slot]->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || !bridge_node_is_connected(bridge->nodes[slot])) {
+            return JS_FALSE;
+        }
+        bridge->fullscreen_node_handle = handle;
+        if (bridge->stylesheet != NULL) {
+            ((Stylesheet *) bridge->stylesheet)->fullscreen_node =
+                bridge->nodes[slot];
+        }
+    } else {
+        bridge->fullscreen_node_handle = 0;
+        if (bridge->stylesheet != NULL) {
+            ((Stylesheet *) bridge->stylesheet)->fullscreen_node = NULL;
+        }
+    }
+    if (bridge->relayout_dirty != NULL) *bridge->relayout_dirty = true;
+    return JS_TRUE;
+}
+
+static TilefinchGameAudio *runtime_game_audio(DomBridge *bridge)
+{
+    if (bridge == NULL || bridge->host == NULL) return NULL;
+    if (bridge->host->game_audio == NULL)
+        bridge->host->game_audio = tilefinch_game_audio_create(bridge->budget);
+    return bridge->host->game_audio;
+}
+
+JSValue js_game_audio_decode(JSContext *context,
+                             JSValueConst this_value,
+                             int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    size_t length = 0;
+    uint8_t *bytes = argc > 0
+        ? JS_GetArrayBuffer(context, &length, argv[0]) : NULL;
+    if (bytes == NULL || length == 0) return JS_NULL;
+    TilefinchGameAudioBufferInfo info = {0};
+    if (!tilefinch_game_audio_decode_wav(
+            runtime_game_audio(bridge), bytes, length, &info)) return JS_NULL;
+    JSValue object = JS_NewObject(context);
+    if (JS_IsException(object)) return object;
+    if (JS_SetPropertyStr(context, object, "handle",
+                          JS_NewUint32(context, info.handle)) < 0
+        || JS_SetPropertyStr(context, object, "length",
+                             JS_NewUint32(context, info.frames)) < 0
+        || JS_SetPropertyStr(context, object, "sampleRate",
+                             JS_NewUint32(context, info.sample_rate)) < 0
+        || JS_SetPropertyStr(context, object, "numberOfChannels",
+                             JS_NewInt32(context, info.channels)) < 0) {
+        JS_FreeValue(context, object);
+        return JS_EXCEPTION;
+    }
+    return object;
+}
+
+JSValue js_game_audio_command(JSContext *context,
+                              JSValueConst this_value,
+                              int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int32_t command = -1;
+    if (bridge == NULL || bridge->host == NULL || argc < 1
+        || JS_ToInt32(context, &command, argv[0]) < 0) return JS_FALSE;
+    if (command == 0) {
+        if (!bridge->user_activation_active) return JS_FALSE;
+        return tilefinch_game_audio_resume(runtime_game_audio(bridge))
+            ? JS_TRUE : JS_FALSE;
+    }
+    if (command == 1) {
+        tilefinch_game_audio_suspend(bridge->host->game_audio);
+        return JS_TRUE;
+    }
+    if (command == 2) {
+        tilefinch_game_audio_destroy(bridge->host->game_audio);
+        bridge->host->game_audio = NULL;
+        return JS_TRUE;
+    }
+    uint32_t handle = 0;
+    if (argc < 2 || JS_ToUint32(context, &handle, argv[1]) < 0)
+        return JS_FALSE;
+    if (command == 4) {
+        double delay = 0;
+        if (argc > 2 && JS_ToFloat64(context, &delay, argv[2]) < 0)
+            return JS_FALSE;
+        tilefinch_game_audio_stop(
+            bridge->host->game_audio, handle, delay);
+        return JS_TRUE;
+    }
+    if (command == 6) {
+        double gain_left = 1, gain_right = 1;
+        if (argc < 4
+            || JS_ToFloat64(context, &gain_left, argv[2]) < 0
+            || JS_ToFloat64(context, &gain_right, argv[3]) < 0)
+            return JS_FALSE;
+        return tilefinch_game_audio_update_voice(
+            bridge->host->game_audio, handle, gain_left, gain_right)
+            ? JS_TRUE : JS_FALSE;
+    }
+    if (command == 7) {
+        double frequency = 0;
+        if (argc < 3
+            || JS_ToFloat64(context, &frequency, argv[2]) < 0)
+            return JS_FALSE;
+        return tilefinch_game_audio_update_oscillator(
+            bridge->host->game_audio, handle, frequency)
+            ? JS_TRUE : JS_FALSE;
+    }
+    if (command == 5) {
+        int32_t type = 0;
+        double frequency = 0, gain_left = 1, gain_right = 1, delay = 0;
+        if (argc < 6 || JS_ToInt32(context, &type, argv[1]) < 0
+            || JS_ToFloat64(context, &frequency, argv[2]) < 0
+            || JS_ToFloat64(context, &gain_left, argv[3]) < 0
+            || JS_ToFloat64(context, &gain_right, argv[4]) < 0
+            || JS_ToFloat64(context, &delay, argv[5]) < 0)
+            return JS_FALSE;
+        TilefinchGameAudio *audio = bridge->host->game_audio;
+        uint32_t voice = 0;
+        if (!tilefinch_game_audio_start_oscillator(
+                audio, (TilefinchGameAudioOscillatorType) type,
+                frequency, gain_left, gain_right, delay, &voice))
+            return JS_FALSE;
+        return JS_NewUint32(context, voice);
+    }
+    double offset = 0, duration = 0, rate = 1;
+    double gain_left = 1, gain_right = 1;
+    double loop_start = 0, loop_end = 0, delay = 0;
+    int loop = 0;
+    if (command != 3 || argc < 11
+        || JS_ToFloat64(context, &offset, argv[2]) < 0
+        || JS_ToFloat64(context, &duration, argv[3]) < 0
+        || JS_ToFloat64(context, &rate, argv[4]) < 0
+        || JS_ToFloat64(context, &gain_left, argv[5]) < 0
+        || JS_ToFloat64(context, &gain_right, argv[6]) < 0
+        || (loop = JS_ToBool(context, argv[7])) < 0
+        || JS_ToFloat64(context, &loop_start, argv[8]) < 0
+        || JS_ToFloat64(context, &loop_end, argv[9]) < 0
+        || JS_ToFloat64(context, &delay, argv[10]) < 0) return JS_FALSE;
+    /* Every coercion above can run author code. Resolve the runtime-owned
+       engine only afterward so a nested close() cannot leave a stale native
+       pointer in this command. */
+    TilefinchGameAudio *audio = bridge->host->game_audio;
+    uint32_t voice = 0;
+    if (!tilefinch_game_audio_start(
+            audio, handle, offset, duration, rate, gain_left, gain_right,
+            loop > 0, loop_start, loop_end, delay, &voice)) return JS_FALSE;
+    return JS_NewUint32(context, voice);
 }
 
 void bridge_invalidate_node_slot(DomBridge *bridge, size_t slot)
@@ -422,6 +598,16 @@ static size_t bridge_discard_unretained_detached_subtree(
     for (size_t i = 0; i < bridge->node_count; i++) {
         if ((retire_slots[i / 8u]
              & (unsigned char) (1u << (i % 8u))) != 0) {
+            /* A detached canvas context can be collected without an explicit
+               context-loss call. Retire its bounded color/depth ownership
+               while the native node is still valid; otherwise a stale node
+               can occupy one of two WebGL depth slots until page teardown. */
+            if (bridge->nodes[i] != NULL
+                && bridge->nodes[i]->local_name == LXB_TAG_CANVAS
+                && bridge->images != NULL && bridge->budget != NULL) {
+                (void) images_release_canvas(
+                    bridge->images, bridge->budget, bridge->nodes[i]);
+            }
             (void) bridge_invalidate_node_slot_impl(bridge, i, false);
             released++;
         }

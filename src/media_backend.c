@@ -21,6 +21,12 @@ struct MediaPlayback {
     uint64_t pending_time_us[2];
     bool have_pending[2];
     bool source_ended[2];
+    /* read_sample() may consume a streaming source.  Once bytes are copied,
+       keep this single shared packet bound to its descriptor until the
+       backend accepts it; a WOULD_BLOCK must never make the source recreate
+       an access unit that it has already retired. */
+    bool packet_loaded;
+    size_t packet_source;
     bool playing;
     bool ended;
     MediaPlaybackJobStats job_stats;
@@ -155,6 +161,7 @@ static void media_playback_fail_seek(MediaPlayback *playback)
     if (playback == NULL) return;
     memset(playback->have_pending, 0, sizeof(playback->have_pending));
     memset(playback->source_ended, 1, sizeof(playback->source_ended));
+    playback->packet_loaded = false;
     playback->buffered_until_us = 0;
     playback->ended = true;
     playback->playing = false;
@@ -382,10 +389,13 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
                 }
             }
         }
-        size_t selected = playback->source_count;
-        uint64_t selected_time = UINT64_MAX;
+        size_t selected = playback->packet_loaded
+            ? playback->packet_source : playback->source_count;
+        uint64_t selected_time = playback->packet_loaded
+            ? playback->pending_time_us[playback->packet_source] : UINT64_MAX;
         bool held_audio_pending = false;
-        for (size_t source = 0; source < playback->source_count; source++) {
+        for (size_t source = 0; !playback->packet_loaded
+             && source < playback->source_count; source++) {
             if (source == deferred_source) continue;
             if (!playback->have_pending[source]) continue;
             /* In the split form source one is contractually audio. During a
@@ -486,13 +496,15 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
             processed++;
             continue;
         }
-        if (!playback_ensure_packet_capacity(
-                playback, playback->pending[selected].size,
-                error, error_size)) return MEDIA_PLAYBACK_ADVANCE_ERROR;
         MediaSampleSource *selected_source = &playback->source[selected];
-        if (!selected_source->ops->read_sample(
-                selected_source->opaque, &playback->pending[selected],
-                playback->packet, playback->packet_capacity)) {
+        if (!playback->packet_loaded
+            && !playback_ensure_packet_capacity(
+                   playback, playback->pending[selected].size,
+                   error, error_size)) return MEDIA_PLAYBACK_ADVANCE_ERROR;
+        if (!playback->packet_loaded
+            && !selected_source->ops->read_sample(
+                   selected_source->opaque, &playback->pending[selected],
+                   playback->packet, playback->packet_capacity)) {
             if (tilefinch_cancellation_requested(cancellation)) {
                 return MEDIA_PLAYBACK_ADVANCE_CANCELLED;
             }
@@ -527,6 +539,10 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
             }
             return MEDIA_PLAYBACK_ADVANCE_ERROR;
         }
+        if (!playback->packet_loaded) {
+            playback->packet_loaded = true;
+            playback->packet_source = selected;
+        }
         if (tilefinch_cancellation_requested(cancellation)) {
             return MEDIA_PLAYBACK_ADVANCE_CANCELLED;
         }
@@ -537,16 +553,13 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
         if (result == MEDIA_BACKEND_WOULD_BLOCK) {
             playback->job_stats.would_block_calls++;
             playback->job_stats.submit_block_calls++;
-            bool can_bypass = playback_note_head_block(
-                playback, selected, horizon);
+            (void) playback_note_head_block(playback, selected, horizon);
             status = MEDIA_PLAYBACK_ADVANCE_PENDING;
-            if (deferred_source != playback->source_count) {
+            /* packet is a single shared staging buffer.  It now owns the
+               selected source's consumed bytes, so an alternate cannot use
+               the buffer until this exact packet is accepted. */
+            if (deferred_source != playback->source_count)
                 playback->job_stats.head_alt_blocked++;
-            } else if (can_bypass) {
-                deferred_source = selected;
-                playback->job_stats.head_alt_bypasses++;
-                continue;
-            }
             break;
         }
         if (result == MEDIA_BACKEND_ERROR) {
@@ -555,6 +568,7 @@ MediaPlaybackAdvanceResult media_playback_advance_bounded_cancelable(
         uint64_t submitted_time = playback->pending_time_us[selected];
         if (submitted_time > playback->buffered_until_us)
             playback->buffered_until_us = submitted_time;
+        playback->packet_loaded = false;
         playback->have_pending[selected] = false;
         processed++;
         playback->job_stats.packets_submitted++;
@@ -883,6 +897,7 @@ static bool playback_warm_source(
     if (source->ops->seek_us(source->opaque, target_us, &restored)) {
         memset(playback->have_pending, 0, sizeof(playback->have_pending));
         memset(playback->source_ended, 0, sizeof(playback->source_ended));
+        playback->packet_loaded = false;
     } else if (error != NULL && error_size != 0) {
         /* A failed restore is the caller's to notice; leave a message but do
            not manufacture a return code the warm has no use for. */
@@ -1009,6 +1024,7 @@ static MediaPlaybackSourcePrimeStatus playback_prime_source(
     }
     memset(playback->have_pending, 0, sizeof(playback->have_pending));
     memset(playback->source_ended, 0, sizeof(playback->source_ended));
+    playback->packet_loaded = false;
     if (ready) return MEDIA_PLAYBACK_SOURCE_PRIME_READY;
     if (pending) return MEDIA_PLAYBACK_SOURCE_PRIME_PENDING;
     if (!failed)
@@ -1085,6 +1101,7 @@ static bool media_playback_seek_internal(MediaPlayback *playback,
     }
     memset(playback->have_pending, 0, sizeof(playback->have_pending));
     memset(playback->source_ended, 0, sizeof(playback->source_ended));
+    playback->packet_loaded = false;
     playback->buffered_until_us =
         selected_us;
     /* An ordinary scrub may begin audio at the user's exact target even when

@@ -102,6 +102,8 @@ typedef struct {
      * picture is ever produced and the presenter is never called.
      */
     long validation_ge_present_probe;
+    /* Run the validation-only WebGL-to-GE workload probe and exit. */
+    long validation_webgl_ge_probe;
     /*
      * Decode one picture from the embedded fixture, then re-run the firmware
      * colour conversion over that same picture with a short list of candidate

@@ -504,6 +504,8 @@ void psp_find_sync(BrowserEngine *engine, PspUiState *ui,
                    PspUiFindView *view);
 size_t psp_text_input_prepare_voice(void *user);
 uint32_t psp_ui_buttons(uint32_t buttons);
+uint32_t psp_gamepad_standard_buttons(uint32_t buttons);
+uint32_t psp_gamepad_standard_ui_buttons(uint32_t buttons);
 /* Consume button-down transitions accumulated by the PSP controller service.
    Current held state and analog axes still come from SceCtrlData. */
 uint32_t psp_controller_take_latched_pressed(void);
@@ -710,6 +712,7 @@ typedef struct {
     uint64_t started_us;
     uint64_t ready_us;
     int maximum_height;
+    YoutubeTrackPreferences track_preferences;
     unsigned starts;
     unsigned completions;
     unsigned cancellations;
@@ -726,7 +729,8 @@ void psp_youtube_preresolve_reset(
 void psp_youtube_preresolve_tick(
     PspYoutubePreresolve *preresolve, Budget *budget,
     BrowserSession *session, const char *focused_video_id,
-    uint64_t generation, int maximum_height, uint64_t now_us,
+    uint64_t generation, int maximum_height,
+    const YoutubeTrackPreferences *track_preferences, uint64_t now_us,
     bool thumbnail_settled, bool eligible, bool transport_capacity,
     bool pump_allowed);
 YoutubeResolveJob **psp_youtube_preresolve_job_for_open(
@@ -829,6 +833,8 @@ typedef struct PspCaptivePortal PspCaptivePortal;
    operation records and counters, not parallel media/network control state. */
 typedef struct {
     uint32_t previous_buttons;
+    TilefinchGamepadCapture gamepad_capture;
+    TilefinchGamepadState gamepad_state;
     uint64_t navigation_job_started_us;
     PspTabTransition tab_transition;
     PspRecoveryTracker recovery;
@@ -889,8 +895,7 @@ const char *psp_home_target_url(
     const BrowserProfile *profile);
 void psp_collections_sync_ui(
     PspUiState *ui, PspCollectionsSurface *surface,
-    const BrowserProfile *profile, const OfflineLibrary *library,
-    const OfflineDownloadManager *downloads,
+    const BrowserProfile *profile, PspOfflineStore *offline_store,
     PspUiCollectionSection section);
 const char *psp_collections_row_url(
     const PspCollectionsSurface *surface, size_t row);

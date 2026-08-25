@@ -314,10 +314,15 @@ static bool test_video_surface_switches_format_and_buffers(void)
     CHECK(psp_display_publish(&display));
     CHECK(psp_display_front_buffer(&display) != NULL);
     int presents_before = fake.present_calls;
+    uint32_t content_epoch_before = psp_display_edram_content_epoch();
 
     /* Entering performs no syscall: the panel keeps showing the last complete
        16-bit frame until a complete 32-bit one replaces it. */
     CHECK(psp_display_video_begin(&display));
+    CHECK(psp_display_edram_content_epoch() != content_epoch_before);
+    uint32_t video_content_epoch = psp_display_edram_content_epoch();
+    CHECK(psp_display_video_begin(&display));
+    CHECK(psp_display_edram_content_epoch() == video_content_epoch);
     CHECK(psp_display_video_active(&display));
     CHECK(fake.present_calls == presents_before);
     CHECK(display.surface_entries == 1);

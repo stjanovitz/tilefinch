@@ -819,6 +819,51 @@ void psp_app_apply_setting(
                 : "YOUTUBE QUALITY 240P",
             180);
     }
+    if (intent->setting.id == PSP_UI_SETTING_VIDEO_LANGUAGE) {
+        BrowserVideoLanguage language = intent->setting.value.video_language;
+        browser_profile_set_video_language(profile, language);
+        psp_youtube_preresolve_reset(
+            &app->browser->youtube_preresolve,
+            "video language changed");
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            language == BROWSER_VIDEO_LANGUAGE_ORIGINAL
+                ? "VIDEO LANGUAGE ORIGINAL - NEXT VIDEO"
+                : "VIDEO LANGUAGE SAVED - NEXT VIDEO",
+            180);
+    }
+    if (intent->setting.id == PSP_UI_SETTING_SUBTITLE_LANGUAGE) {
+        BrowserSubtitleLanguage language =
+            intent->setting.value.subtitle_language;
+        browser_profile_set_subtitle_language(profile, language);
+        psp_youtube_preresolve_reset(
+            &app->browser->youtube_preresolve,
+            "subtitle language changed");
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            "SUBTITLE PREF SAVED - CAPTIONS OFF",
+            180);
+    }
+    if (intent->setting.id == PSP_UI_SETTING_ALTERNATE_LANGUAGE) {
+        BrowserAlternateLanguage language =
+            intent->setting.value.alternate_language;
+        browser_profile_set_alternate_language(profile, language);
+        psp_youtube_preresolve_reset(
+            &app->browser->youtube_preresolve,
+            "alternate language changed");
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            language == BROWSER_ALTERNATE_LANGUAGE_NONE
+                ? "ALTERNATE LANGUAGE OFF"
+                : "ALTERNATE LANGUAGE SAVED - NEXT VIDEO",
+            180);
+    }
     if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS) {
         bool compact = intent->setting.value.boolean;
         browser_profile_set_youtube_compact_results(profile, compact);
@@ -1158,6 +1203,19 @@ void psp_app_apply_setting(
             &app->process->presentation.ui, mode == BROWSER_TEXT_ENTRY_DANZEFF
                 ? "DANZEFF ON - START OPENS IT"
                 : "PSP KEYBOARD ON",
+            180);
+    }
+    if (intent->setting.id == PSP_UI_SETTING_GAMEPAD_FACE_MAPPING) {
+        TilefinchGamepadFaceMapping mapping =
+            intent->setting.value.gamepad_face_mapping;
+        browser_profile_set_gamepad_face_mapping(profile, mapping);
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            mapping == TILEFINCH_GAMEPAD_FACE_O_PRIMARY
+                ? "GAME BUTTONS - O IS PRIMARY"
+                : "GAME BUTTONS - X IS PRIMARY",
             180);
     }
     if (intent->setting.id == PSP_UI_SETTING_PERSISTENT_CACHE_MB) {

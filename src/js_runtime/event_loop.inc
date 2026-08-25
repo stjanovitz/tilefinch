@@ -118,7 +118,8 @@ static const char *const runtime_host_callback_names[
     "__tilefinchCommitSameDocument",
     "__tilefinchRestoreSameDocument",
     "__tilefinchSaveSectionState",
-    "__tilefinchRestoreSectionState"
+    "__tilefinchRestoreSectionState",
+    "__tilefinchUpdateGamepad"
 };
 
 static bool runtime_capture_host_callbacks(ScriptRuntime *runtime,
@@ -200,6 +201,44 @@ static bool runtime_call_host(ScriptRuntime *runtime,
     else JS_FreeValue(runtime->context, value);
     js_lazy_webpack_recover_failure(runtime);
     document_allocation_owner_leave(runtime->document, previous_owner);
+    return true;
+}
+
+static bool gamepad_state_equal(const TilefinchGamepadState *left,
+                                const TilefinchGamepadState *right)
+{
+    if (left == NULL || right == NULL
+        || left->connected != right->connected
+        || left->buttons != right->buttons
+        || left->timestamp_ms != right->timestamp_ms) return false;
+    for (size_t i = 0; i < TILEFINCH_GAMEPAD_AXIS_COUNT; i++) {
+        if (left->axes[i] != right->axes[i]) return false;
+    }
+    return true;
+}
+
+bool script_runtime_set_gamepad_state(
+    ScriptRuntime *runtime, const TilefinchGamepadState *state)
+{
+    if (runtime == NULL || runtime->context == NULL || state == NULL)
+        return false;
+    if (runtime->gamepad_state_valid
+        && gamepad_state_equal(&runtime->gamepad_state, state)) return true;
+
+    JSValue arguments[5] = {
+        JS_NewBool(runtime->context, state->connected),
+        JS_NewUint32(runtime->context, state->buttons),
+        JS_NewInt32(runtime->context, state->axes[0]),
+        JS_NewInt32(runtime->context, state->axes[1]),
+        JS_NewFloat64(runtime->context, (double) state->timestamp_ms)
+    };
+    bool ok = runtime_call_host(runtime, SCRIPT_HOST_UPDATE_GAMEPAD,
+                                5, arguments, NULL);
+    for (size_t i = 0; i < sizeof(arguments) / sizeof(arguments[0]); i++)
+        JS_FreeValue(runtime->context, arguments[i]);
+    if (!ok) return false;
+    runtime->gamepad_state = *state;
+    runtime->gamepad_state_valid = true;
     return true;
 }
 

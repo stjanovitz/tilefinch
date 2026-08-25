@@ -377,6 +377,59 @@ static int test_web_runtime(void)
     budget_free(&budget, image_cache_frame);
     CHECK(budget.current == 0);
 
+    puts("test: mutable canvases scale directly without transient RGBA copies");
+    static unsigned char canvas_scale_pixels[] = {
+        255, 0, 0, 255,    0, 255, 0, 255,
+        0, 0, 255, 255,    255, 255, 255, 255
+    };
+    ImageResource canvas_scale_image = {
+        .pixels = canvas_scale_pixels,
+        .source_width = 2, .source_height = 2,
+        .width = 2, .height = 2,
+        .is_canvas = true
+    };
+    DrawCommand canvas_scale_command = {
+        .image = &canvas_scale_image,
+        .x = 0, .y = 0, .width = 4, .height = 4,
+        .opacity_scale = 256,
+        .type = DRAW_IMAGE,
+        .image_fit = LAYOUT_IMAGE_FIT_STRETCH
+    };
+    LayoutDocument canvas_scale_layout = {
+        .budget = &budget,
+        .commands = &canvas_scale_command,
+        .count = 1,
+        .width = 4, .scroll_width = 4, .height = 4,
+        .page_background = 0
+    };
+    TileCache canvas_scale_cache;
+    uint16_t canvas_scale_frame[16] = {0};
+    CHECK(tile_cache_init(
+              &canvas_scale_cache, &budget, &canvas_scale_layout, 1)
+          && tile_cache_set_frame(
+              &canvas_scale_cache, canvas_scale_frame,
+              sizeof(canvas_scale_frame) / sizeof(canvas_scale_frame[0]))
+          && tile_cache_render_frame(
+              &canvas_scale_cache, 0, 4, 4, NULL)
+          && canvas_scale_cache.scaled_image_builds == 0
+          && canvas_scale_cache.scaled_image_cache_bytes == 0
+          && canvas_scale_frame[0] == test_rgb565(0xff0000)
+          && canvas_scale_frame[3] == test_rgb565(0x00ff00)
+          && canvas_scale_frame[12] == test_rgb565(0x0000ff)
+          && canvas_scale_frame[15] == test_rgb565(0xffffff));
+    CHECK(tile_cache_sync_layout_paint(
+              &canvas_scale_cache, 0, 0, 4, 4)
+          && tile_cache_canvas_frame_work_pending(&canvas_scale_cache)
+          && tile_cache_prepare_frame_bounded(
+                 &canvas_scale_cache, 0, 4, 4, UINT64_MAX / 2u, 1)
+                 == RENDER_FRAME_WORK_READY
+          && tile_cache_canvas_frame_work_pending(&canvas_scale_cache)
+          && tile_cache_render_frame(
+              &canvas_scale_cache, 0, 4, 4, NULL)
+          && !tile_cache_canvas_frame_work_pending(&canvas_scale_cache));
+    tile_cache_destroy(&canvas_scale_cache);
+    CHECK(budget.current == 0);
+
     puts("test: transient decoded-image OOM retries after tile pressure");
     DrawCommand retry_image_command = {
         .image = &cache_image_a,

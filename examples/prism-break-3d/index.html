@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#071229">
+  <title>Prism Break 3D</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="game.css">
+  <script defer src="game.js"></script>
+</head>
+<body>
+  <main id="game-shell">
+    <canvas id="game" width="320" height="180"
+            aria-label="Prism Break 3D game field" tabindex="0"></canvas>
+    <header id="hud" aria-live="polite">
+      <span id="score">000000</span>
+      <span id="level">LEVEL 1</span>
+      <span id="lives">LIVES 3</span>
+    </header>
+    <div id="power" aria-live="polite"></div>
+    <section id="panel">
+      <h1>PRISM BREAK 3D</h1>
+      <p id="message">Break every prism. Catch falling power cores.</p>
+      <button id="play" autofocus>Play</button>
+      <p class="controls">Hold Start+Select to enter page controls.<br>
+        Nub/D-pad moves · X launches/fires · Triangle pauses</p>
+    </section>
+    <div id="toast" aria-live="polite"></div>
+  </main>
+</body>
+</html>

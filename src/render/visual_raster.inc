@@ -221,7 +221,14 @@ static const unsigned char *image_pixels_for_command(
     if (identity == NULL) identity = image;
     int scaled_width = command->width;
     int scaled_height = command->height;
-    bool wants_scaled = command->image_fit == LAYOUT_IMAGE_FIT_STRETCH
+    /* Mutable canvas pixels are replaced every animation frame. Building a
+       second, destination-sized RGBA copy makes a viewport canvas pay for a
+       full scale allocation and copy immediately before the tile rasterizer
+       samples it once and invalidates it. The normal span stepper already
+       scales directly from the source surface, so keep immutable network
+       images on the reusable cache path and make canvases single-pass. */
+    bool wants_scaled = !image->is_canvas
+        && command->image_fit == LAYOUT_IMAGE_FIT_STRETCH
         && (scaled_width != image->width || scaled_height != image->height);
     bool direct_scaled_jpeg = false;
     if (command->image_fit == LAYOUT_IMAGE_FIT_COVER

@@ -9,6 +9,152 @@ static int test_psp_profile_check(int profile, void *context)
     return profile >= 1 && profile <= 5 ? results[profile - 1] : -1;
 }
 
+static bool youtube_fixture_append(char *buffer, size_t capacity,
+                                   size_t *length, const char *format, ...)
+{
+    if (buffer == NULL || length == NULL || *length >= capacity) return false;
+    va_list arguments;
+    va_start(arguments, format);
+    int written = vsnprintf(
+        buffer + *length, capacity - *length, format, arguments);
+    va_end(arguments);
+    if (written < 0 || (size_t) written >= capacity - *length) return false;
+    *length += (size_t) written;
+    return true;
+}
+
+static bool test_youtube_ranked_track_retention(void)
+{
+    char json[64u * 1024u];
+    size_t length = 0;
+    if (!youtube_fixture_append(
+            json, sizeof(json), &length,
+            "{\"playabilityStatus\":{\"status\":\"OK\"},"
+            "\"videoDetails\":{\"title\":\"Bounded tracks\"},"
+            "\"streamingData\":{\"adaptiveFormats\":["
+            "{\"itag\":133,\"width\":426,\"height\":240,"
+            "\"bitrate\":260000,\"contentLength\":\"3100\","
+            "\"mimeType\":\"video/mp4; codecs=\\\"avc1.4d400d\\\"\","
+            "\"url\":\"https://rr2.googlevideo.com/video.mp4\"}"))
+        return false;
+    static const char *const languages[22] = {
+        "fr", "de", "en", "es", "it", "pt", "ja", "ko", "zh-CN",
+        "zh-TW", "ru", "nl", "sv", "da", "fi", "pl", "cs", "tr",
+        "id", "vi", "th", "en-US"
+    };
+    for (size_t at = 0; at < 22u; at++) {
+        bool original = at == 21u;
+        if (!youtube_fixture_append(
+                json, sizeof(json), &length,
+                ",{\"itag\":140,\"bitrate\":%u,"
+                "\"contentLength\":\"%u\","
+                "\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+                "\"url\":\"https://rr3.googlevideo.com/a%zu.m4a\","
+                "\"audioTrack\":{\"id\":\"%s.%zu\","
+                "\"displayName\":\"Track %zu\"%s}}",
+                100000u + (unsigned) at, 2000u + (unsigned) at, at,
+                languages[at], at, at,
+                original ? ",\"audioIsDefault\":true" : "")) return false;
+    }
+    if (!youtube_fixture_append(
+            json, sizeof(json), &length,
+            "]},\"captions\":{\"playerCaptionsTracklistRenderer\":{"
+            "\"captionTracks\":[")) return false;
+    for (size_t at = 0; at < 20u; at++) {
+        const char *language = at == 0u ? "es"
+            : at == 1u || at == 14u || at == 15u ? "en-US"
+            : at == 2u ? "en" : at == 17u ? "ja"
+            : languages[(at + 4u) % 22u];
+        const char *id = at == 1u ? ".en-US-auto"
+            : at == 14u || at == 15u ? ".en-US-human"
+            : at == 17u ? ".selected-late" : NULL;
+        char generated_id[32];
+        if (id == NULL) {
+            snprintf(generated_id, sizeof(generated_id), ".cap%zu", at);
+            id = generated_id;
+        }
+        if (!youtube_fixture_append(
+                json, sizeof(json), &length,
+                "%s{\"baseUrl\":\"https://www.youtube.com/api/timedtext?"
+                "v=synthetic&n=%zu\",\"languageCode\":\"%s\","
+                "\"vssId\":\"%s\",\"name\":{\"simpleText\":"
+                "\"Caption %zu\"}%s}",
+                at == 0u ? "" : ",", at, language, id, at,
+                at == 1u ? ",\"kind\":\"asr\"" : "")) return false;
+    }
+    if (!youtube_fixture_append(
+            json, sizeof(json), &length,
+            ",{\"baseUrl\":\"data:text/plain,not-caption\","
+            "\"languageCode\":\"en-US\",\"vssId\":\".malformed\"}"))
+        return false;
+    if (!youtube_fixture_append(
+            json, sizeof(json), &length, "]}}}")) return false;
+
+    YoutubeTrackPreferences preferences = {0};
+    snprintf(preferences.audio_language,
+             sizeof(preferences.audio_language), "%s", "en-US");
+    snprintf(preferences.caption_language,
+             sizeof(preferences.caption_language), "%s", "en-US");
+    snprintf(preferences.alternate_language,
+             sizeof(preferences.alternate_language), "%s", "es");
+    YoutubeStream stream;
+    char error[256];
+    if (!youtube_parse_player_response_with_preferences(
+            json, length, "ranked", 240, &preferences,
+            &stream, error, sizeof(error))
+        || stream.audio_track_count != YOUTUBE_TRACK_LIMIT
+        || stream.caption_track_count != YOUTUBE_TRACK_LIMIT
+        || strcmp(stream.audio_tracks[0].id, "en-US.21") != 0
+        || strcmp(stream.audio_tracks[1].id, "en.2") != 0
+        || strcmp(stream.audio_tracks[2].id, "es.3") != 0
+        || strcmp(stream.caption_tracks[0].id, ".en-US-human") != 0
+        || strcmp(stream.caption_tracks[1].id, ".en-US-auto") != 0
+        || strcmp(stream.caption_tracks[2].id, ".cap2") != 0
+        || stream.selected_caption_track != -1
+        || stream.caption_url[0] != '\0') return false;
+
+    snprintf(preferences.audio_track_id,
+             sizeof(preferences.audio_track_id), "%s", "fr.0");
+    if (!youtube_parse_player_response_with_preferences(
+            json, length, "audio-reopen", 240, &preferences,
+            &stream, error, sizeof(error))
+        || stream.selected_audio_track != 0
+        || strcmp(stream.audio_tracks[0].id, "fr.0") != 0
+        || strstr(stream.audio_url, "a0.m4a") == NULL) return false;
+    preferences.audio_track_id[0] = '\0';
+
+    preferences.prefer_original_audio = true;
+    preferences.audio_language[0] = '\0';
+    preferences.caption_same_as_audio = true;
+    preferences.caption_language[0] = '\0';
+    if (!youtube_parse_player_response_with_preferences(
+            json, length, "original", 240, &preferences,
+            &stream, error, sizeof(error))
+        || strcmp(stream.audio_tracks[0].id, "en-US.21") != 0
+        || strcmp(stream.caption_tracks[0].id, ".en-US-human") != 0)
+        return false;
+
+    snprintf(preferences.caption_track_id,
+             sizeof(preferences.caption_track_id), "%s", ".selected-late");
+    if (!youtube_parse_player_response_with_preferences(
+            json, length, "reopen", 240, &preferences,
+            &stream, error, sizeof(error))
+        || stream.selected_caption_track != 0
+        || strcmp(stream.caption_tracks[0].id, ".selected-late") != 0
+        || strstr(stream.caption_url, "n=17") == NULL) return false;
+
+    memset(&preferences, 0, sizeof(preferences));
+    snprintf(preferences.audio_language,
+             sizeof(preferences.audio_language), "%s", "zz-ZZ");
+    snprintf(preferences.caption_language,
+             sizeof(preferences.caption_language), "%s", "zz-ZZ");
+    return youtube_parse_player_response_with_preferences(
+               json, length, "missing", 240, &preferences,
+               &stream, error, sizeof(error))
+        && stream.selected_caption_track == -1
+        && stream.caption_url[0] == '\0';
+}
+
 static bool test_psp_network_reinitialization_policy(void)
 {
     static const struct {
@@ -430,6 +576,114 @@ static bool test_youtube_player_response_parser(void)
             &stream, error, sizeof(error))
         || strstr(error, "untrusted media") == NULL) return false;
 
+    static const char localized_tracks[] =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "\"videoDetails\":{\"title\":\"Track fixture\"},"
+        "\"streamingData\":{\"adaptiveFormats\":["
+        "{\"itag\":133,\"width\":426,\"height\":240,"
+        "\"bitrate\":260,\"contentLength\":\"3100\","
+        "\"mimeType\":\"video/mp4; codecs=\\\"avc1.4d400d\\\"\","
+        "\"url\":\"https://rr2.googlevideo.com/video.mp4\"},"
+        "{\"itag\":140,\"bitrate\":150000,\"contentLength\":\"1400\","
+        "\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+        "\"url\":\"https://rr3.googlevideo.com/en.m4a\","
+        "\"audioTrack\":{\"id\":\"en.1\",\"displayName\":\"English\","
+        "\"audioIsDefault\":true}},"
+        "{\"itag\":140,\"bitrate\":120000,\"contentLength\":\"1300\","
+        "\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+        "\"url\":\"https://rr3.googlevideo.com/es.m4a\","
+        "\"audioTrack\":{\"id\":\"es.1\",\"displayName\":\"Español\"}}]},"
+        "\"captions\":{\"playerCaptionsTracklistRenderer\":{"
+        "\"captionTracks\":[{\"baseUrl\":"
+        "\"https://www.youtube.com/api/timedtext?v=test&lang=es\","
+        "\"languageCode\":\"es\",\"vssId\":\".es\","
+        "\"name\":{\"simpleText\":\"Español\"}}]}}}";
+    YoutubeTrackPreferences track_preferences = {0};
+    snprintf(track_preferences.audio_language,
+             sizeof(track_preferences.audio_language), "%s", "es");
+    snprintf(track_preferences.caption_track_id,
+             sizeof(track_preferences.caption_track_id), "%s", ".es");
+    if (!youtube_parse_player_response_with_preferences(
+            localized_tracks, strlen(localized_tracks), "tracks", 240,
+            &track_preferences, &stream, error, sizeof(error))
+        || strcmp(stream.audio_url,
+                  "https://rr3.googlevideo.com/es.m4a") != 0
+        || stream.audio_track_count != 2u
+        || stream.selected_audio_track < 0
+        || stream.caption_track_count != 1u
+        || stream.selected_caption_track != 0
+        || strstr(stream.caption_url, "fmt=vtt") == NULL) return false;
+    memset(&track_preferences, 0, sizeof(track_preferences));
+    track_preferences.prefer_original_audio = true;
+    if (!youtube_parse_player_response_with_preferences(
+            localized_tracks, strlen(localized_tracks), "tracks", 240,
+            &track_preferences, &stream, error, sizeof(error))
+        || strcmp(stream.audio_url,
+                  "https://rr3.googlevideo.com/en.m4a") != 0)
+        return false;
+    memset(&track_preferences, 0, sizeof(track_preferences));
+    snprintf(track_preferences.audio_language,
+             sizeof(track_preferences.audio_language), "%s", "en");
+    snprintf(track_preferences.audio_track_id,
+             sizeof(track_preferences.audio_track_id), "%s", "es.1");
+    if (!youtube_parse_player_response_with_preferences(
+            localized_tracks, strlen(localized_tracks), "tracks", 240,
+            &track_preferences, &stream, error, sizeof(error))
+        || strcmp(stream.audio_url,
+                  "https://rr3.googlevideo.com/es.m4a") != 0)
+        return false;
+
+    static const char capped_tracks[] =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "\"streamingData\":{\"adaptiveFormats\":["
+        "{\"itag\":133,\"width\":426,\"height\":240,"
+        "\"contentLength\":\"3100\",\"mimeType\":\"video/mp4; "
+        "codecs=\\\"avc1.4d400d\\\"\",\"url\":"
+        "\"https://rr2.googlevideo.com/video.mp4\"},"
+        "{\"itag\":140,\"bitrate\":101000,\"contentLength\":\"1001\","
+        "\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+        "\"url\":\"https://rr3.googlevideo.com/a1.m4a\","
+        "\"audioTrack\":{\"id\":\"en.1\"}},"
+        "{\"itag\":140,\"bitrate\":102000,\"contentLength\":\"1002\","
+        "\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+        "\"url\":\"https://rr3.googlevideo.com/a2.m4a\","
+        "\"audioTrack\":{\"id\":\"es.2\"}},"
+        "{\"itag\":140,\"bitrate\":103000,\"contentLength\":\"1003\","
+        "\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+        "\"url\":\"https://rr3.googlevideo.com/a3.m4a\","
+        "\"audioTrack\":{\"id\":\"de.3\"}},"
+        "{\"itag\":140,\"bitrate\":104000,\"contentLength\":\"1004\","
+        "\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+        "\"url\":\"https://rr3.googlevideo.com/a4.m4a\","
+        "\"audioTrack\":{\"id\":\"it.4\"}},"
+        "{\"itag\":140,\"bitrate\":105000,\"contentLength\":\"1005\","
+        "\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+        "\"url\":\"https://rr3.googlevideo.com/a5.m4a\","
+        "\"audioTrack\":{\"id\":\"pt.5\"}},"
+        "{\"itag\":140,\"bitrate\":106000,\"contentLength\":\"1006\","
+        "\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+        "\"url\":\"https://rr3.googlevideo.com/a6.m4a\","
+        "\"audioTrack\":{\"id\":\"ja.6\"}},"
+        "{\"itag\":140,\"bitrate\":100000,\"contentLength\":\"1007\","
+        "\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+        "\"url\":\"https://rr3.googlevideo.com/a7.m4a\","
+        "\"audioTrack\":{\"id\":\"fr.7\","
+        "\"displayName\":\"Français\"}}]}}";
+    memset(&track_preferences, 0, sizeof(track_preferences));
+    snprintf(track_preferences.audio_track_id,
+             sizeof(track_preferences.audio_track_id), "%s", "fr.7");
+    if (!youtube_parse_player_response_with_preferences(
+            capped_tracks, strlen(capped_tracks), "track-cap", 240,
+            &track_preferences, &stream, error, sizeof(error))
+        || strcmp(stream.audio_url,
+                  "https://rr3.googlevideo.com/a7.m4a") != 0
+        || stream.audio_track_count != YOUTUBE_TRACK_LIMIT
+        || stream.selected_audio_track < 0
+        || strcmp(stream.audio_tracks[
+                      (size_t) stream.selected_audio_track].id,
+                  "fr.7") != 0)
+        return false;
+
     static const char ciphered[] =
         "{\"playabilityStatus\":{\"status\":\"OK\"},"
         "\"streamingData\":{\"formats\":[{\"itag\":18,\"width\":320,"
@@ -441,6 +695,37 @@ static bool test_youtube_player_response_parser(void)
         &stream, error, sizeof(error))
         && (strstr(error, "adaptive inventory") != NULL
             || strstr(error, "unciphered AVC") != NULL);
+}
+
+static bool test_youtube_subtitle_parser(void)
+{
+    static const unsigned char vtt[] =
+        "WEBVTT\n\n"
+        "00:00:01.000 --> 00:00:02.500\n"
+        "Hello &amp; <b>welcome</b>\n\n"
+        "cue-two\n"
+        "00:02.500 --> 00:04.000 align:center\n"
+        "Second line\ncontinued\n\n";
+    Budget budget;
+    budget_init(&budget, 128u * 1024u);
+    YoutubeSubtitleDocument *document = youtube_subtitles_parse_vtt(
+        &budget, vtt, sizeof(vtt) - 1u);
+    size_t cursor = 0;
+    bool ok = document != NULL
+        && youtube_subtitles_cue_count(document) == 2u
+        && youtube_subtitles_text_at(document, 500000u, &cursor) == NULL;
+    const char *first = youtube_subtitles_text_at(
+        document, UINT64_C(1500000), &cursor);
+    const char *second = youtube_subtitles_text_at(
+        document, UINT64_C(3000000), &cursor);
+    ok = ok && first != NULL && strcmp(first, "Hello & welcome") == 0
+        && second != NULL && strcmp(second, "Second line continued") == 0;
+    /* A backwards seek must reset the monotonic lookup cursor. */
+    first = youtube_subtitles_text_at(
+        document, UINT64_C(1500000), &cursor);
+    ok = ok && first != NULL && strcmp(first, "Hello & welcome") == 0;
+    youtube_subtitles_destroy(document);
+    return ok && budget.current == 0;
 }
 
 typedef struct {
@@ -1049,6 +1334,10 @@ static int test_foundation(void)
     CHECK(test_psp_network_reinitialization_policy());
     puts("test: bounded YouTube player response parser");
     CHECK(test_youtube_player_response_parser());
+    puts("test: ranked YouTube audio and subtitle retention");
+    CHECK(test_youtube_ranked_track_retention());
+    puts("test: bounded YouTube subtitle parser");
+    CHECK(test_youtube_subtitle_parser());
     puts("test: bounded YouTube lightweight page builder");
     CHECK(test_youtube_lite_document_builder(&budget));
     puts("test: YouTube adapter commit parses cooperatively");

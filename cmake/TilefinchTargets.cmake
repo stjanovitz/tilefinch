@@ -380,6 +380,7 @@ if(PSP)
             src/psp_media_buffering.c
             src/psp_media_open.c
             src/psp_media_hls.c
+            src/psp_hls_gzip.c
             src/psp_media_present_session.c
             src/psp_media_seek.c
             src/psp_media_session.c
@@ -455,10 +456,12 @@ if(PSP)
             target_sources(psp-browser-script PRIVATE
                 src/psp_input_script.c
                 src/psp_app/psp_app_input_script.c
+                src/psp_webgl_ge_probe.c
                 src/psp_media_fixture.c
                 src/psp_media_range_probe.c
                 src/psp_raster_fixture.c
                 "${_tilefinch_media_fixture_blob}")
+            target_link_libraries(psp-browser-script PRIVATE pspgum)
             set_property(TARGET psp-browser-script APPEND PROPERTY
                 LINK_DEPENDS
                 "${TILEFINCH_MEDIA_FIXTURE_240}"
@@ -739,6 +742,13 @@ if(PSP)
             target_link_libraries(psp-browser-script-dev-prx PRIVATE
                 m pspdisplay pspge pspctrl pspgu pspdmac psppower
                 pspaudiocodec pspaudio psputility)
+            if(TILEFINCH_PSP_VALIDATION_LOG)
+                # Validation objects include the native WebGL GE probe. The
+                # relocatable PSPLink link reuses those exact objects, so it
+                # must carry the same GUM dependency as the validation EBOOT.
+                target_link_libraries(psp-browser-script-dev-prx PRIVATE
+                    pspgum)
+            endif()
             if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.31")
                 set_property(TARGET psp-browser-script-dev-prx PROPERTY
                     LINK_LIBRARIES_STRATEGY REORDER_MINIMALLY)

@@ -3,6 +3,7 @@
 #include "tilefinch/captive_portal.h"
 #include "tilefinch/public_suffix.h"
 #include "tilefinch/fetch.h"
+#include "tilefinch/platform.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -3686,6 +3687,182 @@ void browser_session_cache_clear(BrowserSession *session)
     }
     browser_session_site_adapter_document_cache_clear(session);
     session->clock = 0;
+}
+
+static bool offline_cache_entry_view(
+    const BrowserCacheEntry *entry, const char *origin,
+    BrowserOfflineCacheView *view)
+{
+    if (entry == NULL || entry->data == NULL || entry->length == 0
+        || origin == NULL || view == NULL) return false;
+    char entry_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    if (!tilefinch_url_origin(entry->url, entry_origin, sizeof(entry_origin))
+        || strcmp(entry_origin, origin) != 0) return false;
+    BrowserOfflineCacheKind kind = BROWSER_OFFLINE_CACHE_GENERIC;
+    if (entry->module_effective_url != NULL) {
+        char effective_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+        if (entry->module_initiator_origin == NULL
+            || strcmp(entry->module_initiator_origin, origin) != 0
+            || !entry->module_cors_validated
+            || !entry->module_javascript_mime_validated
+            || !tilefinch_url_origin(entry->module_effective_url,
+                                     effective_origin,
+                                     sizeof(effective_origin))
+            || strcmp(effective_origin, origin) != 0) return false;
+        kind = BROWSER_OFFLINE_CACHE_MODULE;
+    } else if (entry->resource_grant_valid) {
+        if (entry->resource_initiator_origin == NULL
+            || strcmp(entry->resource_initiator_origin, origin) != 0
+            || !entry->resource_grant.final_same_origin) return false;
+        kind = BROWSER_OFFLINE_CACHE_RESOURCE;
+    } else if (entry->classic_script_origin_variant
+               || entry->module_request_fragment != NULL) {
+        return false;
+    }
+    *view = (BrowserOfflineCacheView) {
+        .url = entry->url,
+        .data = entry->data,
+        .length = entry->length,
+        .content_type = entry->content_type,
+        .response_url = entry->response_url_known
+            ? entry->response_url : entry->url,
+        .response_referrer_policy = kind == BROWSER_OFFLINE_CACHE_MODULE
+            ? entry->module_response_referrer_policy
+            : (entry->response_referrer_policy_known
+                   ? entry->response_referrer_policy : ""),
+        .kind = kind,
+        .resource_grant = entry->resource_grant,
+        .module_credentials = entry->module_credentials,
+        .module_cors_validated = entry->module_cors_validated,
+        .module_redirect_origin_tainted =
+            entry->module_cors_redirect_origin_tainted,
+        .module_javascript_mime_validated =
+            entry->module_javascript_mime_validated
+    };
+    return true;
+}
+
+size_t browser_session_cache_collect_offline_same_origin(
+    BrowserSession *session, const char *document_url,
+    BrowserOfflineCacheView *views, size_t capacity,
+    size_t maximum_bytes, size_t *total_bytes, bool *complete)
+{
+    if (total_bytes != NULL) *total_bytes = 0;
+    if (complete != NULL) *complete = false;
+    if (session == NULL || document_url == NULL || views == NULL
+        || capacity == 0 || maximum_bytes == 0) return 0;
+    if (capacity > BROWSER_OFFLINE_CACHE_ENTRY_LIMIT)
+        capacity = BROWSER_OFFLINE_CACHE_ENTRY_LIMIT;
+    char origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    if (!tilefinch_url_origin(document_url, origin, sizeof(origin))) return 0;
+    bool selected[BROWSER_CACHE_ENTRIES] = {0};
+    size_t count = 0, bytes = 0;
+    bool all = true;
+    for (;;) {
+        size_t candidate = BROWSER_CACHE_ENTRIES;
+        size_t newest = 0;
+        BrowserOfflineCacheView candidate_view = {0};
+        for (size_t at = 0; at < BROWSER_CACHE_ENTRIES; at++) {
+            BrowserOfflineCacheView probe = {0};
+            if (selected[at]
+                || !offline_cache_entry_view(&session->cache[at], origin,
+                                             &probe)) continue;
+            if (candidate == BROWSER_CACHE_ENTRIES
+                || session->cache[at].stamp > newest) {
+                candidate = at;
+                newest = session->cache[at].stamp;
+                candidate_view = probe;
+            }
+        }
+        if (candidate == BROWSER_CACHE_ENTRIES) break;
+        selected[candidate] = true;
+        if (count >= capacity || bytes > maximum_bytes
+            || candidate_view.length > maximum_bytes - bytes) {
+            all = false;
+            continue;
+        }
+        views[count++] = candidate_view;
+        bytes += candidate_view.length;
+    }
+    if (total_bytes != NULL) *total_bytes = bytes;
+    if (complete != NULL) *complete = all;
+    return count;
+}
+
+bool browser_session_cache_restore_offline(
+    BrowserSession *session, const char *document_url,
+    const BrowserOfflineCacheView *view)
+{
+    if (session == NULL || document_url == NULL || view == NULL
+        || view->url == NULL || view->data == NULL || view->length == 0)
+        return false;
+    if (view->length == SIZE_MAX) return false;
+    char document_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    char resource_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    if (!tilefinch_url_origin(document_url, document_origin,
+                              sizeof(document_origin))
+        || !tilefinch_url_origin(view->url, resource_origin,
+                                 sizeof(resource_origin))
+        || strcmp(document_origin, resource_origin) != 0) return false;
+    static const char policy[] = "public, max-age=31536000, immutable";
+    uint64_t now = tilefinch_platform_monotonic_time_ns();
+    if (view->kind == BROWSER_OFFLINE_CACHE_GENERIC)
+        return browser_session_cache_put_http(
+            session, view->url, view->data, view->length, "", "",
+            view->content_type, policy, "", now);
+    if (view->kind == BROWSER_OFFLINE_CACHE_MODULE) {
+        char origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+        if (!tilefinch_url_origin(document_url, origin, sizeof(origin)))
+            return false;
+        BrowserModuleCacheProvenance provenance = {
+            .effective_url = view->response_url == NULL
+                ? view->url : view->response_url,
+            .initiator_origin = origin,
+            .top_level_url = document_url,
+            .response_referrer_policy =
+                view->response_referrer_policy == NULL
+                    ? "" : view->response_referrer_policy,
+            .credentials = view->module_credentials,
+            .cors_validated = view->module_cors_validated,
+            .cors_redirect_origin_tainted =
+                view->module_redirect_origin_tainted,
+            .javascript_mime_validated =
+                view->module_javascript_mime_validated
+        };
+        return browser_session_cache_put_http_module(
+            session, view->url, view->data, view->length, "", "",
+            view->content_type, policy, "", now, &provenance);
+    }
+    TilefinchRequestContext context = {
+        .target_url = view->url,
+        .initiator_url = document_url,
+        .top_level_url = document_url,
+        .method = "GET",
+        .mode = view->resource_grant.mode,
+        .credentials = view->resource_grant.credentials,
+        .destination = view->resource_grant.destination
+    };
+    if (!tilefinch_request_context_valid(&context)) return false;
+    unsigned char *copy = budget_malloc(session->budget, view->length + 1u);
+    if (copy == NULL) return false;
+    memcpy(copy, view->data, view->length);
+    copy[view->length] = 0;
+    BrowserSharedBody *body = browser_shared_body_take(
+        session->budget, copy, view->length);
+    if (body == NULL) {
+        budget_free(session->budget, copy);
+        return false;
+    }
+    bool restored = browser_session_cache_put_http_shared_resource(
+        session, view->url, body, "", "", view->content_type,
+        policy, "", now, &context, &view->resource_grant);
+    browser_shared_body_release(body);
+    if (restored && view->response_url != NULL)
+        restored = browser_session_cache_set_resource_response_provenance(
+            session, view->url, &context, view->response_url,
+            view->response_referrer_policy == NULL
+                ? "" : view->response_referrer_policy);
+    return restored;
 }
 
 struct BrowserCaptivePortalStash {

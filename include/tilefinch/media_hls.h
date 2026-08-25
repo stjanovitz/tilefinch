@@ -9,6 +9,8 @@
 #include "tilefinch/media_source.h"
 
 #define MEDIA_HLS_MAXIMUM_PLAYLIST_BYTES (64u * 1024u)
+#define MEDIA_HLS_MAXIMUM_PLAYLIST_DOWNLOAD_BYTES (2u * 1024u * 1024u)
+#define MEDIA_HLS_RETAINED_LIVE_SEGMENTS 12u
 #define MEDIA_HLS_MAXIMUM_SEGMENTS 256u
 #define MEDIA_HLS_MAXIMUM_SEGMENT_BYTES (2u * 1024u * 1024u)
 #define MEDIA_HLS_TRANSPORT_CHUNK_BYTES (16u * 1024u)
@@ -19,6 +21,7 @@ typedef enum {
 } MediaHlsPlaylistKind;
 
 typedef struct MediaHlsPlaylist MediaHlsPlaylist;
+typedef struct MediaHlsPlaylistStream MediaHlsPlaylistStream;
 
 MediaHlsPlaylist *media_hls_playlist_parse(
     Budget *budget, const char *playlist_url,
@@ -31,10 +34,36 @@ bool media_hls_playlist_select_variant(
     const MediaHlsPlaylist *playlist, unsigned maximum_width,
     unsigned maximum_height, unsigned target_height,
     char *url, size_t url_size);
+/* Select the video rendition and, when the chosen variant names an AUDIO
+   group, its default (or first) audio rendition. `audio_url` is left empty
+   for an ordinary muxed variant. */
+bool media_hls_playlist_select_streams(
+    const MediaHlsPlaylist *playlist, unsigned maximum_width,
+    unsigned maximum_height, unsigned target_height,
+    char *video_url, size_t video_url_size,
+    char *audio_url, size_t audio_url_size);
 size_t media_hls_playlist_segment_count(const MediaHlsPlaylist *playlist);
 uint64_t media_hls_playlist_duration_us(const MediaHlsPlaylist *playlist);
 bool media_hls_playlist_is_live(const MediaHlsPlaylist *playlist);
 void media_hls_playlist_destroy(MediaHlsPlaylist *playlist);
+
+/* Incremental playlist capture. Small playlists retain their exact bytes.
+   Oversized media playlists retain only the newest bounded live window;
+   oversized masters fail rather than silently losing rendition metadata. */
+MediaHlsPlaylistStream *media_hls_playlist_stream_create(
+    Budget *budget, const char *playlist_url,
+    char *error, size_t error_size);
+bool media_hls_playlist_stream_feed(
+    MediaHlsPlaylistStream *stream,
+    const unsigned char *bytes, size_t length,
+    char *error, size_t error_size);
+MediaHlsPlaylist *media_hls_playlist_stream_finish(
+    MediaHlsPlaylistStream *stream, char *error, size_t error_size);
+size_t media_hls_playlist_stream_bytes_seen(
+    const MediaHlsPlaylistStream *stream);
+bool media_hls_playlist_stream_was_compacted(
+    const MediaHlsPlaylistStream *stream);
+void media_hls_playlist_stream_destroy(MediaHlsPlaylistStream *stream);
 
 typedef enum {
     MEDIA_HLS_TRANSPORT_WAIT = 0,
@@ -57,6 +86,12 @@ typedef struct {
 typedef struct MediaHlsSource MediaHlsSource;
 
 typedef enum {
+    MEDIA_HLS_TRACK_MIXED = 0,
+    MEDIA_HLS_TRACK_VIDEO,
+    MEDIA_HLS_TRACK_AUDIO
+} MediaHlsTrackSelection;
+
+typedef enum {
     MEDIA_HLS_PRIME_PENDING = 0,
     MEDIA_HLS_PRIME_READY,
     MEDIA_HLS_PRIME_FAILED
@@ -65,6 +100,7 @@ typedef enum {
 typedef struct {
     size_t segments_started;
     size_t segments_completed;
+    size_t playlist_bytes_received;
     size_t bytes_received;
     size_t queued_samples;
     size_t queued_bytes;
@@ -86,6 +122,10 @@ typedef struct {
 MediaHlsSource *media_hls_source_create(
     Budget *budget, MediaHlsPlaylist *playlist,
     const MediaHlsTransport *transport, char *error, size_t error_size);
+MediaHlsSource *media_hls_source_create_track(
+    Budget *budget, MediaHlsPlaylist *playlist,
+    const MediaHlsTransport *transport, MediaHlsTrackSelection selection,
+    char *error, size_t error_size);
 MediaHlsPrimeStatus media_hls_source_prime(
     MediaHlsSource *source, char *error, size_t error_size);
 /* One bounded delivery step. The PSP frontend calls this once per frame so

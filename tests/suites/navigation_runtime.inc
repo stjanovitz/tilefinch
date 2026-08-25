@@ -18,8 +18,8 @@ static void script_frontier_probe(void *opaque, size_t script_index,
 static bool test_canvas_surface_survives_and_updates_without_relayout(void)
 {
     static const char html[] =
-        "<!doctype html><style>body{margin:0}canvas{display:block}</style>"
-        "<canvas id=chart width=4 height=2></canvas><script>"
+        "<!doctype html><style>body{margin:0}</style>"
+        "<canvas id=chart width=4 height=2>Fallback chart</canvas><script>"
         "const c=document.getElementById('chart').getContext('2d');"
         "c.fillStyle='#ff0000';c.fillRect(0,0,4,2);"
         "setTimeout(()=>{c.fillStyle='#0000ff';c.fillRect(2,0,2,2)},1)"
@@ -72,14 +72,110 @@ static bool test_canvas_surface_survives_and_updates_without_relayout(void)
         && navigation.canvas_paint_damage_pending;
     bool ok = committed && initial && painted && updated;
     if (!ok) {
+        lxb_dom_node_t *chart = test_find_id(
+            lxb_dom_interface_node(navigation.page.document.html), "chart");
+        size_t parent_name_length = 0;
+        const char *parent_name = chart == NULL ? NULL
+            : document_element_name(chart->parent, &parent_name_length);
         fprintf(stderr,
                 "canvas bridge ready=%d committed=%d images=%zu painted=%d "
                 "initial=%d advanced=%d updated=%d relayouts=%zu/%zu "
-                "error=\"%s\"\n",
+                "node=%p image-node=%p parent=%.*s connected=%d error=\"%s\"\n",
                 ready, committed, navigation.page.images.count, painted,
                 initial, advanced, updated, relayouts,
-                navigation.incremental_relayouts, navigation.last_error);
+                navigation.incremental_relayouts, (void *) chart,
+                canvas == NULL ? NULL : (void *) canvas->node,
+                (int) parent_name_length,
+                parent_name == NULL ? "" : parent_name,
+                chart != NULL && chart->parent != NULL,
+                navigation.last_error);
     }
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_canvas_fallback_text_mutation_remains_replaced(void)
+{
+    static const char html[] =
+        "<!doctype html><canvas id=clock width=4 height=2>Fallback</canvas>"
+        "<script>const c=document.getElementById('clock').getContext('2d');"
+        "c.fillStyle='red';c.fillRect(0,0,4,2);setTimeout(()=>{"
+        "c.canvas.innerText='Updated fallback';c.fillStyle='blue';"
+        "c.fillRect(0,0,1,1)},1)</script>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://canvas.test/clock", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool advanced = committed
+        && navigation_advance_runtime(&navigation, 2, 4);
+    lxb_dom_node_t *clock = committed ? test_find_id(
+        lxb_dom_interface_node(navigation.page.document.html), "clock") : NULL;
+    const ImageResource *image = clock == NULL ? NULL
+        : images_find_node(&navigation.page.images, clock);
+    bool painted = false;
+    for (size_t i = 0; image != NULL
+         && i < navigation.page.layout.count; i++) {
+        if (navigation.page.layout.commands[i].type == DRAW_IMAGE
+            && navigation.page.layout.commands[i].image == image) {
+            painted = true;
+            break;
+        }
+    }
+    bool ok = advanced && image != NULL && image->is_canvas
+        && image->pixels != NULL && image->pixels[2] == 255
+        && painted && navigation.page.layout.height > 0
+        && navigation.last_error[0] == '\0';
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_canvas_oversized_dimensions_are_bounded(void)
+{
+    static const char html[] =
+        "<!doctype html><canvas id=large width=640 height=480></canvas>"
+        "<script>const c=document.getElementById('large');"
+        "const x=c.getContext('2d');x.fillStyle='#00ff00';"
+        "x.fillRect(0,0,c.width,c.height)</script>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://canvas.test/bounded", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    const ImageResource *image = committed
+        && navigation.page.images.count == 1
+        ? &navigation.page.images.items[0] : NULL;
+    bool ok = image != NULL && image->is_canvas && image->pixels != NULL
+        && image->width == 362 && image->height == 272
+        && image->pixels[0] == 0 && image->pixels[1] == 255
+        && image->pixels[2] == 0 && image->pixels[3] == 255
+        && navigation.last_error[0] == '\0';
     if (ready) navigation_destroy(&navigation);
     bool clean = budget.current == 0
         && budget_active_allocations(&budget, NULL) == 0

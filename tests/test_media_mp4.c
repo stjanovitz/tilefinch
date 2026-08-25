@@ -1172,6 +1172,44 @@ int main(void)
     };
     CHECK(media_h264_annexb_sample_is_admitted(
               annexb_slice, sizeof(annexb_slice), 432, 240));
+    unsigned char annexb_config[160] = {0, 0, 0, 1};
+    memcpy(annexb_config + 4u, admitted_sps, admitted_length);
+    size_t annexb_config_length = 4u + admitted_length;
+    static const unsigned char annexb_pps[] = {0, 0, 1, 0x68, 0xce};
+    memcpy(annexb_config + annexb_config_length,
+           annexb_pps, sizeof(annexb_pps));
+    annexb_config_length += sizeof(annexb_pps);
+    const unsigned char *found_sps = NULL, *found_pps = NULL;
+    size_t found_sps_length = 0, found_pps_length = 0;
+    CHECK(media_h264_annexb_parameter_sets(
+              annexb_config, annexb_config_length,
+              &found_sps, &found_sps_length,
+              &found_pps, &found_pps_length)
+          && found_sps_length == admitted_length
+          && found_pps_length == 2u
+          && media_h264_annexb_decoder_route(
+                 annexb_config, annexb_config_length, &profile_idc)
+                 == MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE
+          && profile_idc == 66u);
+    unsigned char converted[192];
+    memcpy(converted, annexb_config, annexb_config_length);
+    size_t converted_length = 0;
+    unsigned converted_nals = 0;
+    CHECK(media_h264_annexb_to_avcc_in_place(
+              converted, annexb_config_length, sizeof(converted),
+              &converted_length, &converted_nals)
+          && converted_nals == 2u
+          && converted_length == annexb_config_length + 1u
+          && converted[0] == 0 && converted[1] == 0
+          && converted[2] == 0
+          && converted[3] == admitted_length
+          && converted[4u + admitted_length] == 0
+          && converted[5u + admitted_length] == 0
+          && converted[6u + admitted_length] == 0
+          && converted[7u + admitted_length] == 2u);
+    CHECK(media_h264_annexb_sample_matches_config(
+        annexb_slice, sizeof(annexb_slice), 480, 272,
+        annexb_config, annexb_config_length));
     unsigned char changed_sps[sizeof(admitted_sps)];
     memcpy(changed_sps, admitted_sps, admitted_length);
     changed_sps[2] ^= 0x40u;
@@ -1181,6 +1219,28 @@ int main(void)
     CHECK(!media_h264_avcc_sample_is_admitted(
         admitted_access_unit, admitted_length + 4u,
         4, 480, 272, avcc, avcc_length));
+    unsigned char changed_annexb[96] = {0, 0, 0, 1};
+    memcpy(changed_annexb + 4u, changed_sps, admitted_length);
+    CHECK(!media_h264_annexb_sample_matches_config(
+        changed_annexb, admitted_length + 4u, 480, 272,
+        annexb_config, annexb_config_length));
+    static const unsigned char changed_pps[] = {0, 0, 1, 0x68, 0xcf};
+    CHECK(!media_h264_annexb_sample_matches_config(
+        changed_pps, sizeof(changed_pps), 480, 272,
+        annexb_config, annexb_config_length));
+    unsigned char insufficient[sizeof(annexb_config)];
+    memcpy(insufficient, annexb_config, annexb_config_length);
+    converted_length = 17u;
+    CHECK(!media_h264_annexb_to_avcc_in_place(
+              insufficient, annexb_config_length, annexb_config_length,
+              &converted_length, NULL)
+          && converted_length == 0u);
+    static unsigned char malformed_annexb[] = {0, 0, 1, 0x80};
+    converted_length = 17u;
+    CHECK(!media_h264_annexb_to_avcc_in_place(
+              malformed_annexb, sizeof(malformed_annexb),
+              sizeof(malformed_annexb), &converted_length, NULL)
+          && converted_length == 0u);
     put_u32(admitted_access_unit, 1u);
     admitted_access_unit[4] = 0x68u;
     CHECK(media_h264_avcc_sample_is_admitted(

@@ -15,6 +15,8 @@
       "__tilefinchEventObserverDelta",
       "__tilefinchFocusEventsObserved",
       "__tilefinchFocusObserverDelta",
+      "__tilefinchGameAudioCommand",
+      "__tilefinchGameAudioDecode",
       "__tilefinchPointerHoverEventsObserved",
       "__tilefinchPointerMarkupChanged",
       "__tilefinchPointerMoveEventsObserved",
@@ -57,6 +59,7 @@
       "__tilefinchSaveSectionState",
       "__tilefinchSetFrameWindowState",
       "__tilefinchStylesheetHasMotionKeyframes",
+      "__tilefinchUpdateGamepad",
     ]);
   for (const key of ownKeys(globalThis)) {
     if (typeof key !== "string" || !key.startsWith("__tilefinch")) continue;

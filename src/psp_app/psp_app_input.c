@@ -139,6 +139,36 @@ uint32_t psp_ui_buttons(uint32_t buttons)
     return mapped;
 }
 
+uint32_t psp_gamepad_standard_buttons(uint32_t buttons)
+{
+    return psp_gamepad_standard_ui_buttons(psp_ui_buttons(buttons));
+}
+
+uint32_t psp_gamepad_standard_ui_buttons(uint32_t buttons)
+{
+    uint32_t mapped = 0;
+#define MAP_GAMEPAD(psp_button, standard_button) do { \
+    if ((buttons & (psp_button)) != 0) \
+        mapped |= UINT32_C(1) << (standard_button); \
+} while (0)
+    MAP_GAMEPAD(PSP_UI_BUTTON_CONFIRM, TILEFINCH_GAMEPAD_BUTTON_PRIMARY);
+    MAP_GAMEPAD(PSP_UI_BUTTON_CANCEL, TILEFINCH_GAMEPAD_BUTTON_SECONDARY);
+    MAP_GAMEPAD(PSP_UI_BUTTON_RELOAD, TILEFINCH_GAMEPAD_BUTTON_TERTIARY);
+    MAP_GAMEPAD(PSP_UI_BUTTON_TOOLBAR, TILEFINCH_GAMEPAD_BUTTON_QUATERNARY);
+    MAP_GAMEPAD(PSP_UI_BUTTON_PAGE_UP,
+                TILEFINCH_GAMEPAD_BUTTON_LEFT_SHOULDER);
+    MAP_GAMEPAD(PSP_UI_BUTTON_PAGE_DOWN,
+                TILEFINCH_GAMEPAD_BUTTON_RIGHT_SHOULDER);
+    MAP_GAMEPAD(PSP_UI_BUTTON_MENU, TILEFINCH_GAMEPAD_BUTTON_SELECT);
+    MAP_GAMEPAD(PSP_UI_BUTTON_ADDRESS, TILEFINCH_GAMEPAD_BUTTON_START);
+    MAP_GAMEPAD(PSP_UI_BUTTON_UP, TILEFINCH_GAMEPAD_BUTTON_DPAD_UP);
+    MAP_GAMEPAD(PSP_UI_BUTTON_DOWN, TILEFINCH_GAMEPAD_BUTTON_DPAD_DOWN);
+    MAP_GAMEPAD(PSP_UI_BUTTON_LEFT, TILEFINCH_GAMEPAD_BUTTON_DPAD_LEFT);
+    MAP_GAMEPAD(PSP_UI_BUTTON_RIGHT, TILEFINCH_GAMEPAD_BUTTON_DPAD_RIGHT);
+#undef MAP_GAMEPAD
+    return mapped;
+}
+
 uint32_t psp_controller_take_latched_pressed(void)
 {
     /* The browser loop and callback supervisor hand controller ownership
@@ -228,6 +258,10 @@ const char *psp_ui_action_name(PspUiAction action)
         case PSP_UI_ACTION_VOICE_FOCUSED_TEXT: return "voice-focused-text";
         case PSP_UI_ACTION_HOME: return "home";
         case PSP_UI_ACTION_SAVE_FOR_LATER: return "save-for-later";
+        case PSP_UI_ACTION_INSTALL_OFFLINE_APP: return "install-offline-app";
+        case PSP_UI_ACTION_CONFIRM_OFFLINE_APP:
+            return "confirm-offline-app";
+        case PSP_UI_ACTION_CANCEL_OFFLINE_APP: return "cancel-offline-app";
         case PSP_UI_ACTION_SHOW_OFFLINE: return "show-offline";
         case PSP_UI_ACTION_SHOW_DOWNLOADS: return "show-downloads";
         case PSP_UI_ACTION_SHOW_SCREENSHOTS: return "show-screenshots";
@@ -297,6 +331,11 @@ const char *psp_ui_action_acknowledgement(PspUiAction action)
             return "STARTING EXPERIMENTAL VOICE INPUT...";
         case PSP_UI_ACTION_HOME: return "OPENING HOME...";
         case PSP_UI_ACTION_SAVE_FOR_LATER: return "SAVING ARTICLE...";
+        case PSP_UI_ACTION_INSTALL_OFFLINE_APP:
+            return "PREPARING INSTALL PREVIEW...";
+        case PSP_UI_ACTION_CONFIRM_OFFLINE_APP:
+            return "INSTALLING OFFLINE APP...";
+        case PSP_UI_ACTION_CANCEL_OFFLINE_APP: return NULL;
         case PSP_UI_ACTION_SHOW_OFFLINE: return "OPENING OFFLINE LIBRARY...";
         case PSP_UI_ACTION_SHOW_DOWNLOADS: return "OPENING DOWNLOADS...";
         case PSP_UI_ACTION_SHOW_SCREENSHOTS: return "OPENING SCREENSHOTS...";
@@ -569,6 +608,10 @@ const char *psp_media_action_name(PspUiMediaAction action)
         case PSP_UI_MEDIA_ACTION_RETRY: return "media-retry";
         case PSP_UI_MEDIA_ACTION_AUDIO_ONLY: return "media-audio-only";
         case PSP_UI_MEDIA_ACTION_LOWER_QUALITY: return "media-lower-quality";
+        case PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK:
+            return "media-select-audio-track";
+        case PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK:
+            return "media-select-subtitle-track";
         case PSP_UI_MEDIA_ACTION_CLOSE: return "media-close";
         case PSP_UI_MEDIA_ACTION_NONE:
         default: return "media-none";

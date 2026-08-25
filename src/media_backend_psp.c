@@ -330,6 +330,9 @@ typedef struct {
     int me_boot_type;
     size_t surface_bytes;
     uint8_t nal_length_size;
+    bool video_annexb;
+    bool packet_staging_annexb;
+    size_t annexb_conversions;
     MediaH264PspCompat h264_compat;
     bool mpeg_created;
     /* An AAC work buffer has been attached to the codec control block and
@@ -1985,12 +1988,38 @@ static bool psp_avcc_sets(const MediaMp4TrackInfo *track,
     return true;
 }
 
+static bool psp_annexb_sets(const MediaMp4TrackInfo *track,
+                            PspAvcNal *nal)
+{
+    const unsigned char *sps = NULL, *pps = NULL;
+    size_t sps_length = 0, pps_length = 0;
+    if (track == NULL || nal == NULL
+        || !media_h264_annexb_parameter_sets(
+            track->codec_config, track->codec_config_length,
+            &sps, &sps_length, &pps, &pps_length)
+        || sps_length > INT_MAX || pps_length > INT_MAX) return false;
+    nal->sps_buffer = (void *) sps;
+    nal->sps_size = (int) sps_length;
+    nal->pps_buffer = (void *) pps;
+    nal->pps_size = (int) pps_length;
+    nal->nal_prefix_size = 4;
+    return true;
+}
+
+static bool psp_track_parameter_sets(const MediaMp4TrackInfo *track,
+                                     PspAvcNal *nal)
+{
+    return track != NULL
+        && (track->packet_format == MEDIA_PACKET_FORMAT_H264_ANNEX_B
+            ? psp_annexb_sets(track, nal) : psp_avcc_sets(track, nal));
+}
+
 static bool psp_media_copy_parameter_sets(PspMediaBackend *backend)
 {
     if (backend == NULL) return false;
     PspAvcNal source;
     memset(&source, 0, sizeof(source));
-    if (!psp_avcc_sets(&backend->video, &source)
+    if (!psp_track_parameter_sets(&backend->video, &source)
         || source.sps_size <= 0 || source.pps_size <= 0
         || (size_t) source.sps_size > SIZE_MAX - (size_t) source.pps_size)
         return false;
@@ -3544,6 +3573,37 @@ static MediaBackendResult psp_media_decode_staged_video(
         || backend->last_packet_bytes > INT_MAX) {
         psp_media_error(error, error_size, "PSP AVC config invalid");
         return MEDIA_BACKEND_ERROR;
+    }
+    if (backend->packet_staging_annexb) {
+        size_t converted_bytes = 0;
+        unsigned converted_nals = 0;
+        if (!media_h264_annexb_to_avcc_in_place(
+                backend->packet_staging, backend->last_packet_bytes,
+                backend->packet_staging_bytes,
+                &converted_bytes, &converted_nals)) {
+            psp_media_log_failure(backend, "annexb-to-avcc", -1);
+            psp_media_error(
+                error, error_size,
+                "PSP AVC Annex-B conversion rejected access unit");
+            return MEDIA_BACKEND_ERROR;
+        }
+        backend->last_packet_bytes = converted_bytes;
+        backend->packet_staging_annexb = false;
+        backend->annexb_conversions++;
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+        /* One representative conversion plus the teardown total proves the
+           bridge without turning a live-stream soak into tens of thousands of
+           synchronous log writes that perturb cadence and exhaust the bounded
+           validation journal. */
+        if (backend->annexb_conversions == 1u) {
+            psp_media_log(
+                "tilefinch-media-decoder: event=annexb-to-avcc "
+                "nals=%u bytes=%u",
+                converted_nals, (unsigned) converted_bytes);
+        }
+#else
+        (void) converted_nals;
+#endif
     }
     backend->video_status = 0;
     /* sceMpegGetAvcNalAu sets decoder_primed on success, so the admission
@@ -5153,10 +5213,38 @@ static unsigned psp_media_audio_pending_count(
         : backend->audio_pending_write - backend->audio_pending_read;
 }
 
+static bool psp_media_adts_payload(
+    const unsigned char *packet, size_t packet_bytes,
+    const unsigned char **payload, size_t *payload_bytes)
+{
+    if (packet == NULL || payload == NULL || payload_bytes == NULL
+        || packet_bytes < 7u || packet[0] != 0xffu
+        || (packet[1] & 0xf6u) != 0xf0u
+        || ((packet[2] >> 6u) & 3u) != 1u
+        || (packet[6] & 3u) != 0u) return false;
+    size_t header = (packet[1] & 1u) != 0 ? 7u : 9u;
+    size_t frame = ((size_t) (packet[3] & 3u) << 11u)
+        | ((size_t) packet[4] << 3u) | ((size_t) packet[5] >> 5u);
+    if (packet_bytes < header || frame != packet_bytes || frame <= header)
+        return false;
+    *payload = packet + header;
+    *payload_bytes = packet_bytes - header;
+    return true;
+}
+
 static MediaBackendResult psp_media_enqueue_pending_audio(
     PspMediaBackend *backend, const MediaMp4Sample *sample,
-    const unsigned char *payload, size_t length)
+    const unsigned char *payload, size_t length,
+    char *error, size_t error_size)
 {
+    if (sample != NULL
+        && sample->packet_format == MEDIA_PACKET_FORMAT_AAC_ADTS
+        && !psp_media_adts_payload(
+            payload, length, &payload, &length)) {
+        psp_media_error(error, error_size,
+                        "PSP AAC rejected malformed ADTS frame");
+        return MEDIA_BACKEND_ERROR;
+    }
     unsigned count = psp_media_audio_pending_count(backend);
     if (backend == NULL || sample == NULL || payload == NULL
         || backend->audio_pending == NULL
@@ -5532,11 +5620,18 @@ static MediaBackendResult psp_media_submit(
             backend->cadence.hold_timestamps++;
             return MEDIA_BACKEND_WOULD_BLOCK;
         }
-        if (!media_h264_avcc_sample_is_admitted(
+        bool sample_admitted = backend->video_annexb
+            ? media_h264_annexb_sample_matches_config(
+                payload, length, backend->decoded_width,
+                backend->decoded_height,
+                backend->video.codec_config,
+                backend->video.codec_config_length)
+            : media_h264_avcc_sample_is_admitted(
                 payload, length, backend->nal_length_size,
                 backend->decoded_width, backend->decoded_height,
                 backend->video.codec_config,
-                backend->video.codec_config_length)) {
+                backend->video.codec_config_length);
+        if (!sample_admitted) {
             psp_media_log_failure(
                 backend, "avc-sample-admission", -1);
             psp_media_error(
@@ -5587,8 +5682,9 @@ static MediaBackendResult psp_media_submit(
         }
         memcpy(backend->packet_staging, payload, length);
         size_t staged_length = length;
-        MediaH264PspCompatResult compat_result =
-            media_h264_psp_compat_transform(
+        MediaH264PspCompatResult compat_result = backend->video_annexb
+            ? MEDIA_H264_PSP_COMPAT_PASSTHROUGH
+            : media_h264_psp_compat_transform(
                 &backend->h264_compat, backend->packet_staging,
                 &staged_length, backend->packet_staging_bytes);
         if (compat_result == MEDIA_H264_PSP_COMPAT_ERROR) {
@@ -5600,6 +5696,7 @@ static MediaBackendResult psp_media_submit(
             return MEDIA_BACKEND_ERROR;
         }
         backend->last_packet_bytes = staged_length;
+        backend->packet_staging_annexb = backend->video_annexb;
         /* Exactly what firmware is about to be handed, from the byte range it
            came from -- recorded here rather than on the worker so a unit that
            never returns is already in the buffer when it wedges. */
@@ -5669,7 +5766,7 @@ static MediaBackendResult psp_media_submit(
             return MEDIA_BACKEND_ERROR;
         }
         MediaBackendResult pending_result = psp_media_enqueue_pending_audio(
-            backend, sample, payload, length);
+            backend, sample, payload, length, error, error_size);
         if (pending_result != MEDIA_BACKEND_ACCEPTED) return pending_result;
         unsigned queue_depth = (unsigned) (backend->audio_queue_write
                                            - backend->audio_queue_read);
@@ -7102,11 +7199,13 @@ static void psp_media_destroy(void *opaque)
     if (backend == NULL) return;
     psp_media_log(
         "tilefinch-media-decoder: event=h264-recovery-compat-summary "
-        "enabled=%d recovery-idr=%u marking-clears=%u frame-rebases=%u",
+        "enabled=%d recovery-idr=%u marking-clears=%u frame-rebases=%u "
+        "annexb-au=%zu",
         backend->h264_compat.enabled ? 1 : 0,
         backend->h264_compat.recovery_points_rewritten,
         backend->h264_compat.reference_markings_removed,
-        backend->h264_compat.frame_numbers_rebased);
+        backend->h264_compat.frame_numbers_rebased,
+        backend->annexb_conversions);
     backend->admissions_closed = true;
     psp_media_cancel_prepared_job(backend);
     atomic_store(&backend->playing, false);
@@ -7562,13 +7661,14 @@ static const MediaBackendPresentationOps psp_media_presentation_ops = {
     .note_stage_signature = psp_media_presentation_note_stage_signature
 };
 
-bool media_psp_backend_create_split(
-    Budget *budget, const MediaMp4Demux *video_demux,
-    const MediaMp4Demux *audio_demux,
+static bool psp_media_backend_create_track_info(
+    Budget *budget, const MediaMp4TrackInfo *video_track,
+    const MediaMp4TrackInfo *audio_track, bool require_audio,
     MediaBackend *backend_out, char *error, size_t error_size)
 {
     if (error != NULL && error_size != 0) error[0] = '\0';
-    if (budget == NULL || video_demux == NULL || backend_out == NULL) {
+    if (budget == NULL || backend_out == NULL
+        || (video_track == NULL && audio_track == NULL)) {
         psp_media_error(error, error_size,
                         "PSP media request invalid");
         return false;
@@ -7629,24 +7729,19 @@ bool media_psp_backend_create_split(
     atomic_init(&backend->audio_output_reported, false);
     atomic_init(&backend->audio_worker_error, 0);
     atomic_init(&backend->audio_worker_stage, 0);
-    const MediaMp4Demux *sources[2] = {video_demux, audio_demux};
-    size_t source_count = audio_demux == NULL ? 1u : 2u;
-    for (size_t source = 0; source < source_count; source++) {
-        for (size_t i = 0;
-             i < media_mp4_track_count(sources[source]); i++) {
-            MediaMp4TrackInfo info;
-            if (!media_mp4_track_info(sources[source], i, &info)) continue;
-            if (!backend->have_video && info.kind == MEDIA_MP4_TRACK_VIDEO
-                && info.codec == MEDIA_MP4_FOURCC('a','v','c','1')) {
-                backend->video = info;
-                backend->have_video = true;
-            } else if (!backend->have_audio
-                       && info.kind == MEDIA_MP4_TRACK_AUDIO
-                       && info.codec == MEDIA_MP4_FOURCC('m','p','4','a')) {
-                backend->audio = info;
-                backend->have_audio = true;
-            }
-        }
+    if (video_track != NULL
+        && video_track->kind == MEDIA_MP4_TRACK_VIDEO
+        && video_track->codec == MEDIA_MP4_FOURCC('a','v','c','1')) {
+        backend->video = *video_track;
+        backend->have_video = true;
+        backend->video_annexb =
+            video_track->packet_format == MEDIA_PACKET_FORMAT_H264_ANNEX_B;
+    }
+    if (audio_track != NULL
+        && audio_track->kind == MEDIA_MP4_TRACK_AUDIO
+        && audio_track->codec == MEDIA_MP4_FOURCC('m','p','4','a')) {
+        backend->audio = *audio_track;
+        backend->have_audio = true;
     }
     if ((!backend->have_video && !backend->have_audio)
         || (backend->have_video
@@ -7672,7 +7767,7 @@ bool media_psp_backend_create_split(
         psp_media_destroy(backend);
         return false;
     }
-    if (audio_demux != NULL && !backend->have_audio) {
+    if (require_audio && !backend->have_audio) {
         psp_media_error(error, error_size,
                         "adaptive AAC missing");
         psp_media_destroy(backend);
@@ -7694,10 +7789,22 @@ bool media_psp_backend_create_split(
         return false;
     }
     MediaAacStreamInfo aac_info = {0};
+    bool aac_info_ok = !backend->have_audio;
     if (backend->have_audio
-        && !media_aac_esds_stream_info(
+        && backend->audio.packet_format == MEDIA_PACKET_FORMAT_AAC_ADTS) {
+        aac_info = (MediaAacStreamInfo) {
+            .sample_rate = backend->audio.sample_rate,
+            .channels = backend->audio.channels,
+            .samples_per_frame = 1024u
+        };
+        aac_info_ok = aac_info.sample_rate != 0
+            && aac_info.channels != 0;
+    } else if (backend->have_audio) {
+        aac_info_ok = media_aac_esds_stream_info(
             backend->audio.codec_config,
-            backend->audio.codec_config_length, &aac_info)) {
+            backend->audio.codec_config_length, &aac_info);
+    }
+    if (!aac_info_ok) {
         psp_media_error(
             error, error_size,
             "PSP requires AAC-LC; HE-AAC/SBR is unsupported");
@@ -7722,9 +7829,13 @@ bool media_psp_backend_create_split(
     PspMediaDecoderPolicy decoder_policy = {0};
     if (backend->have_video) {
     uint8_t routed_profile = 0;
-    MediaH264DecoderRoute decoder_route = media_h264_avcc_decoder_route(
-        backend->video.codec_config, backend->video.codec_config_length,
-        &routed_profile);
+    MediaH264DecoderRoute decoder_route = backend->video_annexb
+        ? media_h264_annexb_decoder_route(
+            backend->video.codec_config, backend->video.codec_config_length,
+            &routed_profile)
+        : media_h264_avcc_decoder_route(
+            backend->video.codec_config, backend->video.codec_config_length,
+            &routed_profile);
     if (decoder_route == MEDIA_H264_DECODER_ROUTE_HIGH_EXTENSION) {
         psp_media_error(
             error, error_size,
@@ -7733,12 +7844,24 @@ bool media_psp_backend_create_split(
         psp_media_destroy(backend);
         return false;
     }
-    if (decoder_route != MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE
-        || !media_h264_avcc_dimensions(
+    PspAvcNal admitted_sets;
+    memset(&admitted_sets, 0, sizeof(admitted_sets));
+    bool dimensions_ok = false;
+    if (backend->video_annexb
+        && psp_annexb_sets(&backend->video, &admitted_sets)) {
+        dimensions_ok = media_h264_sps_dimensions(
+            admitted_sets.sps_buffer, (size_t) admitted_sets.sps_size,
+            &backend->decoded_width, &backend->decoded_height);
+        backend->nal_length_size = 4u;
+    } else if (!backend->video_annexb) {
+        dimensions_ok = media_h264_avcc_dimensions(
             backend->video.codec_config,
             backend->video.codec_config_length,
             &backend->decoded_width, &backend->decoded_height,
-            &backend->nal_length_size)
+            &backend->nal_length_size);
+    }
+    if (decoder_route != MEDIA_H264_DECODER_ROUTE_PSP_FIRMWARE
+        || !dimensions_ok
         || backend->decoded_width > 640
         || backend->decoded_height > 360) {
         psp_media_error(
@@ -7747,9 +7870,10 @@ bool media_psp_backend_create_split(
         psp_media_destroy(backend);
         return false;
     }
-    bool h264_compat_enabled = media_h264_psp_compat_init(
-        &backend->h264_compat, backend->video.codec_config,
-        backend->video.codec_config_length);
+    bool h264_compat_enabled = !backend->video_annexb
+        && media_h264_psp_compat_init(
+            &backend->h264_compat, backend->video.codec_config,
+            backend->video.codec_config_length);
 #if defined(TILEFINCH_PSP_VALIDATION_LOG)
     psp_media_log(
         "tilefinch-media-decoder: event=h264-recovery-compat enabled=%d "
@@ -7760,9 +7884,7 @@ bool media_psp_backend_create_split(
 #else
     (void) h264_compat_enabled;
 #endif
-    PspAvcNal admitted_sets;
-    memset(&admitted_sets, 0, sizeof(admitted_sets));
-    if (!psp_avcc_sets(&backend->video, &admitted_sets)) {
+    if (!psp_track_parameter_sets(&backend->video, &admitted_sets)) {
         psp_media_error(
             error, error_size,
             "PSP AVC requires exactly one SPS and PPS");
@@ -7777,10 +7899,11 @@ bool media_psp_backend_create_split(
         psp_media_destroy(backend);
         return false;
     }
-    unsigned avc_profile = backend->video.codec_config_length > 1u
-        ? backend->video.codec_config[1] : 0u;
-    unsigned avc_level = backend->video.codec_config_length > 3u
-        ? backend->video.codec_config[3] : 0u;
+    const unsigned char *policy_sps = admitted_sets.sps_buffer;
+    unsigned avc_profile = admitted_sets.sps_size > 1
+        ? policy_sps[1] : 0u;
+    unsigned avc_level = admitted_sets.sps_size > 3
+        ? policy_sps[3] : 0u;
     bool wide_program_enabled =
         psp_media_wide_program_enabled(psp_media_wide_program_mode);
     /*
@@ -8408,6 +8531,83 @@ native_failure:
                     native_stage, (unsigned) status);
     psp_media_destroy(backend);
     return false;
+}
+
+static void psp_media_collect_demux_tracks(
+    const MediaMp4Demux *demux,
+    MediaMp4TrackInfo *video, bool *have_video,
+    MediaMp4TrackInfo *audio, bool *have_audio)
+{
+    if (demux == NULL) return;
+    for (size_t i = 0; i < media_mp4_track_count(demux); i++) {
+        MediaMp4TrackInfo info = {0};
+        if (!media_mp4_track_info(demux, i, &info)) continue;
+        if (!*have_video && info.kind == MEDIA_MP4_TRACK_VIDEO
+            && info.codec == MEDIA_MP4_FOURCC('a','v','c','1')) {
+            *video = info;
+            *have_video = true;
+        } else if (!*have_audio && info.kind == MEDIA_MP4_TRACK_AUDIO
+                   && info.codec == MEDIA_MP4_FOURCC('m','p','4','a')) {
+            *audio = info;
+            *have_audio = true;
+        }
+    }
+}
+
+static void psp_media_collect_source_tracks(
+    const MediaSampleSource *source,
+    MediaMp4TrackInfo *video, bool *have_video,
+    MediaMp4TrackInfo *audio, bool *have_audio)
+{
+    if (source == NULL || source->opaque == NULL || source->ops == NULL
+        || source->ops->track_count == NULL
+        || source->ops->track_info == NULL) return;
+    size_t count = source->ops->track_count(source->opaque);
+    for (size_t i = 0; i < count; i++) {
+        MediaMp4TrackInfo info = {0};
+        if (!source->ops->track_info(source->opaque, i, &info)) continue;
+        if (!*have_video && info.kind == MEDIA_MP4_TRACK_VIDEO
+            && info.codec == MEDIA_MP4_FOURCC('a','v','c','1')) {
+            *video = info;
+            *have_video = true;
+        } else if (!*have_audio && info.kind == MEDIA_MP4_TRACK_AUDIO
+                   && info.codec == MEDIA_MP4_FOURCC('m','p','4','a')) {
+            *audio = info;
+            *have_audio = true;
+        }
+    }
+}
+
+bool media_psp_backend_create_split(
+    Budget *budget, const MediaMp4Demux *video_demux,
+    const MediaMp4Demux *audio_demux,
+    MediaBackend *backend, char *error, size_t error_size)
+{
+    MediaMp4TrackInfo video = {0}, audio = {0};
+    bool have_video = false, have_audio = false;
+    psp_media_collect_demux_tracks(
+        video_demux, &video, &have_video, &audio, &have_audio);
+    psp_media_collect_demux_tracks(
+        audio_demux, &video, &have_video, &audio, &have_audio);
+    return psp_media_backend_create_track_info(
+        budget, have_video ? &video : NULL, have_audio ? &audio : NULL,
+        audio_demux != NULL, backend, error, error_size);
+}
+
+bool media_psp_backend_create_sources(
+    Budget *budget, const MediaSampleSource *video_source,
+    const MediaSampleSource *audio_source,
+    MediaBackend *backend, char *error, size_t error_size)
+{
+    MediaMp4TrackInfo video = {0}, audio = {0};
+    bool have_video = false, have_audio = false;
+    psp_media_collect_source_tracks(
+        video_source, &video, &have_video, &audio, &have_audio);
+    psp_media_collect_source_tracks(
+        audio_source, &video, &have_video, &audio, &have_audio);
+    return psp_media_backend_create_track_info(
+        budget, have_video ? &video : NULL, have_audio ? &audio : NULL,
+        audio_source != NULL, backend, error, error_size);
 }
 
 bool media_psp_backend_create(

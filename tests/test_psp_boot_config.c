@@ -99,6 +99,7 @@ int main(void)
     shipping.validation_raster_fixture_auto = 1;
     shipping.validation_power_test_auto = 1;
     shipping.validation_ge_present_probe = 1;
+    shipping.validation_webgl_ge_probe = 1;
     shipping.validation_csc_order_probe = 1;
     shipping.validation_media_range_probe = 1;
     shipping.validation_update_auto = 1;
@@ -126,6 +127,7 @@ int main(void)
     CHECK(shipping.validation_raster_fixture_auto == 0);
     CHECK(shipping.validation_power_test_auto == 0);
     CHECK(shipping.validation_ge_present_probe == 0);
+    CHECK(shipping.validation_webgl_ge_probe == 0);
     CHECK(shipping.validation_csc_order_probe == 0);
     CHECK(shipping.validation_media_range_probe == 0);
     CHECK(shipping.validation_update_auto == 0);
@@ -153,6 +155,7 @@ int main(void)
         "validation_media_stability_seconds=900\n"
         "validation_raster_fixture_auto=1\n"
         "validation_ge_present_probe=1\n"
+        "validation_webgl_ge_probe=1\n"
         "validation_csc_order_probe=1\n"
         "validation_media_range_probe=1\n"
         "validation_update_auto=1\n"
@@ -177,6 +180,7 @@ int main(void)
     /* The present probe draws its own pictures and needs no document, so
        unlike the other probes it must not force an engine-first boot. */
     CHECK(config.validation_ge_present_probe == 1);
+    CHECK(config.validation_webgl_ge_probe == 1);
     /* Same for the colour-order probe: it supplies its own picture from the
        embedded fixture and never navigates. */
     CHECK(config.validation_csc_order_probe == 1);
@@ -199,7 +203,7 @@ int main(void)
     CHECK(!psp_boot_config_automation_requires_engine_first(&config)
           || config.validation_media_fixture_auto != 0);
     CHECK(warning.calls == 1);
-    CHECK(warning.line == 16);
+    CHECK(warning.line == 17);
     CHECK(strcmp(warning.key, "mystery") == 0);
     CHECK(strcmp(config.developer_update_url,
                  "https://192.0.2.1/beta/latest.tfum") == 0);

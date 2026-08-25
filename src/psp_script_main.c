@@ -23,6 +23,7 @@
 #include "tilefinch/psp_media_fixture.h"
 #include "tilefinch/psp_media_range_probe.h"
 #include "tilefinch/psp_raster_fixture.h"
+#include "psp_webgl_ge_probe.h"
 /* After the tilefinch headers: the media policy header is written against
    fixed-width types the public headers have already established. */
 #include "media_backend_psp_policy.h"
@@ -462,6 +463,58 @@ static TILEFINCH_COLD_PATH void psp_exit_console(
 }
 
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+static TILEFINCH_COLD_PATH int psp_run_webgl_ge_qualification(
+    BrowserEngine *engine, Budget *budget,
+    PspClockWorker *clock_worker, bool clock_worker_started,
+    const char *exit_to)
+{
+    psp_present_boot_surface(
+        PSP_UI_STARTUP_HOMEPAGE, "TESTING WEBGL GE COST", 720);
+    PspWebglGeProbeReport report;
+    uint16_t *page = psp_display_back_buffer(&psp_display);
+    bool passed = psp_webgl_ge_probe_run(page, &report);
+    if (passed) passed = psp_display_publish(&psp_display);
+    printf(
+        "tilefinch-webgl-ge-probe: memory color=%zu depth=%zu "
+        "texture-cache=%zu context-inits=%u syncs=%u\n",
+        report.color_bytes, report.depth_bytes, report.texture_cache_bytes,
+        report.context_initializations, report.synchronizations);
+    for (unsigned at = 0; at < PSP_WEBGL_GE_PROBE_SCENE_COUNT; at++) {
+        const PspWebglGeProbeScene *scene = &report.scenes[at];
+        if (scene->name == NULL || scene->frames == 0) continue;
+        printf(
+            "tilefinch-webgl-ge-probe: scene=%s frames=%u draws=%u "
+            "vertices=%u upload-bytes=%zu prepare-avg=%lluus "
+            "emit-avg=%lluus wait-avg=%lluus total-avg=%lluus "
+            "total-max=%lluus list-avg=%zu list-max=%zu "
+            "checksum=0x%08x outcome=%s\n",
+            scene->name, scene->frames, scene->draw_calls_per_frame,
+            scene->vertices_per_frame, scene->upload_bytes_per_frame,
+            (unsigned long long) (scene->prepare_us / scene->frames),
+            (unsigned long long) (scene->emit_us / scene->frames),
+            (unsigned long long) (scene->wait_us / scene->frames),
+            (unsigned long long) (scene->total_us / scene->frames),
+            (unsigned long long) scene->maximum_frame_us,
+            scene->list_bytes / scene->frames,
+            scene->maximum_list_bytes, (unsigned) scene->checksum,
+            scene->passed ? "pass" : "fail");
+    }
+    printf("tilefinch-webgl-ge-probe: event=%s detail=\"%s\"\n",
+           passed ? "pass" : "fail", report.detail);
+    psp_report_budget_counters(budget, "webgl-ge-probe-exit");
+    browser_engine_destroy(engine);
+    if (clock_worker_started)
+        (void) psp_clock_worker_shutdown(clock_worker);
+    printf("tilefinch-validation: outcome=%s qualification=%s\n",
+           passed ? "clean-exit" : "qualification-failed",
+           passed ? "webgl-ge-pass" : "webgl-ge-fail");
+    psp_log_checkpoint("webgl-ge-probe-complete");
+    psp_log_finish(
+        passed ? "webgl-ge-probe-pass" : "webgl-ge-probe-fail");
+    psp_exit_console(exit_to);
+    return passed ? 0 : 1;
+}
+
 static TILEFINCH_COLD_PATH int psp_run_ge_present_qualification(
     BrowserEngine *engine, Budget *budget,
     PspClockWorker *clock_worker, bool clock_worker_started,
@@ -1534,6 +1587,16 @@ static TILEFINCH_OUT_OF_LINE bool psp_deferred_image_after_present(
     return visual_changed;
 }
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static uint64_t psp_runtime_advance_total_us;
+static uint64_t psp_runtime_advance_maximum_us;
+static size_t psp_runtime_advance_calls;
+static size_t psp_runtime_layout_changes;
+static size_t psp_runtime_render_deferrals;
+static size_t psp_runtime_handoff_deferrals;
+static size_t psp_runtime_reclaim_deferrals;
+#endif
+
 static TILEFINCH_OUT_OF_LINE bool psp_advance_page_runtime(
     PspApp *app, bool *layout_changed)
 {
@@ -1544,12 +1607,196 @@ static TILEFINCH_OUT_OF_LINE bool psp_advance_page_runtime(
        collections across frames. Do not run author tasks between those
        passes: they can rebuild the cycles just collected and spend CPU while
        the native player is waiting for decoder admission. */
-    if (app->interactive->provider_handoff_present_pending
-        || browser_engine_optional_memory_reclaim_pending(
-               &app->interactive->provider_handoff_reclaim)) return true;
-    return browser_engine_advance_runtime(
+    bool page_visible = app->process->presentation.ui.base_screen
+                            == PSP_UI_SCREEN_PAGE
+        && !app->browser->media.ui.visible;
+    (void) browser_engine_set_page_visibility(
+        app->browser->engine, page_visible);
+    if (app->interactive->provider_handoff_present_pending) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        psp_runtime_handoff_deferrals++;
+#endif
+        return true;
+    }
+    if (browser_engine_optional_memory_reclaim_pending(
+            &app->interactive->provider_handoff_reclaim)) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        psp_runtime_reclaim_deferrals++;
+#endif
+        return true;
+    }
+    /* A second animation callback would invalidate the tiles that are still
+       publishing the preceding canvas frame. Finish that latest-wins frame
+       first; scheduler time advances by one ordinary tick when callbacks
+       resume, so this neither builds a rAF backlog nor accelerates game time. */
+    if (browser_engine_render_frame_pending(app->browser->engine)) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        psp_runtime_render_deferrals++;
+#endif
+        return true;
+    }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
+#endif
+    bool advanced = browser_engine_advance_runtime(
         app->browser->engine, (unsigned) app->process->config.tick_ms, 2,
         layout_changed);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t elapsed_us =
+        (uint64_t) sceKernelGetSystemTimeWide() - started_us;
+    psp_runtime_advance_calls++;
+    psp_runtime_advance_total_us += elapsed_us;
+    if (elapsed_us > psp_runtime_advance_maximum_us)
+        psp_runtime_advance_maximum_us = elapsed_us;
+    if (layout_changed != NULL && *layout_changed)
+        psp_runtime_layout_changes++;
+#endif
+    return advanced;
+}
+
+/* Ordinary page changes retain the one-tile/2 ms input-latency discipline.
+   A canvas animation has already spent its JavaScript turn producing a whole
+   coherent frame, so finish as many visible tiles as fit in one 12 ms slice.
+   This keeps the compositor slice below one 60 Hz interval while preventing
+   rAF from repeatedly cancelling partial frames. */
+static TILEFINCH_OUT_OF_LINE BrowserRenderJobStatus psp_render_page_job(
+    BrowserEngine *engine, const TilefinchCancellation *cancellation)
+{
+    bool canvas = browser_engine_canvas_frame_pending(engine);
+    return browser_engine_render_frame_bounded_cancelable(
+        engine, canvas ? UINT64_C(12000) : PSP_RENDER_JOB_BUDGET_US,
+        canvas ? 48u : PSP_RENDER_JOB_MAXIMUM_TILES, cancellation);
+}
+
+/* A completed page/cursor frame publishes at the next vblank, so another
+   full wait at the top of the following loop would cap continuous canvas
+   animation at 30 Hz. Keep a 1 ms worker-friendly yield for those follow-up
+   frames; ordinary pages retain the established vblank throttle. */
+static TILEFINCH_OUT_OF_LINE void psp_wait_before_interactive_input(
+    bool fullscreen_media_poll, bool fast_page_followup)
+{
+    if (fullscreen_media_poll) {
+        (void) sceKernelDelayThread(PSP_MEDIA_FULLSCREEN_POLL_YIELD_US);
+    } else if (fast_page_followup) {
+        (void) sceKernelDelayThread(1000);
+    } else {
+        sceDisplayWaitVblankStart();
+    }
+}
+
+static TILEFINCH_OUT_OF_LINE bool psp_update_page_fullscreen(
+    PspApp *app, PspUiInput *input);
+
+/* The page gets controls only after an explicit sustained chord. Input is
+   sampled once here, before author callbacks, and published as one fixed
+   Gamepad object. The firmware HOME callback is not part of SceCtrlData and
+   therefore remains an unconditional exit path even while capture is active. */
+static TILEFINCH_OUT_OF_LINE bool psp_update_page_gamepad(
+    PspApp *app, PspUiInput *input,
+    unsigned elapsed_ms, uint64_t sampled_us)
+{
+    if (app == NULL || app->browser == NULL || app->interactive == NULL
+        || app->process == NULL || app->views == NULL || input == NULL)
+        return false;
+    bool visual_changed = psp_update_page_fullscreen(app, input);
+    PspUiState *ui = &app->process->presentation.ui;
+    TilefinchGamepadCapture *capture = &app->interactive->gamepad_capture;
+    const uint32_t chord_buttons =
+        PSP_UI_BUTTON_ADDRESS | PSP_UI_BUTTON_MENU;
+    bool chord = (input->held & chord_buttons) == chord_buttons;
+    if (!capture->active && !capture->chord_held && !chord)
+        return visual_changed;
+    bool page_available = ui->screen == PSP_UI_SCREEN_PAGE
+        && !app->browser->media.ui.visible
+        && !browser_engine_navigation_pending(app->browser->engine)
+        && browser_engine_page_gamepad_available(app->browser->engine);
+    uint64_t generation = app->views->navigation->generation;
+    TilefinchGamepadCaptureEvent event = tilefinch_gamepad_capture_step(
+        capture, page_available, generation, chord, elapsed_ms);
+    visual_changed |= event != TILEFINCH_GAMEPAD_CAPTURE_NO_CHANGE;
+    if (event == TILEFINCH_GAMEPAD_CAPTURE_ENTERED) {
+        psp_ui_show_status(
+            ui, ui->gamepad_circle_primary
+                ? "PAGE CONTROLS ON - O PRIMARY"
+                : "PAGE CONTROLS ON - X PRIMARY",
+            300);
+    } else if (event == TILEFINCH_GAMEPAD_CAPTURE_EXITED) {
+        psp_ui_show_status(ui, "PAGE CONTROLS OFF", 120);
+    } else if (event == TILEFINCH_GAMEPAD_CAPTURE_UNAVAILABLE) {
+        psp_ui_show_status(ui, "PAGE CONTROLS NEED AN ACTIVE JS PAGE", 180);
+    }
+    ui->page_gamepad_capture = capture->active;
+
+    uint32_t game_buttons = 0;
+    int16_t axis_x = 0, axis_y = 0;
+    if (capture->active) {
+        /* The capture chord is browser authority, never game input. Mask it
+           so entering the mode cannot also press Start/Select in the game. */
+        game_buttons = psp_gamepad_standard_ui_buttons(
+            chord ? input->held & ~chord_buttons : input->held);
+        game_buttons = tilefinch_gamepad_apply_face_mapping(
+            game_buttons,
+            ui->gamepad_circle_primary
+                ? TILEFINCH_GAMEPAD_FACE_O_PRIMARY
+                : TILEFINCH_GAMEPAD_FACE_X_PRIMARY);
+        axis_x = tilefinch_gamepad_axis_from_u8(input->analog_x);
+        axis_y = tilefinch_gamepad_axis_from_u8(input->analog_y);
+    }
+    if (tilefinch_gamepad_state_update(
+            &app->interactive->gamepad_state, capture->active,
+            game_buttons, axis_x, axis_y, sampled_us / UINT64_C(1000))) {
+        (void) browser_engine_set_gamepad_state(
+            app->browser->engine, &app->interactive->gamepad_state);
+    }
+
+    if (tilefinch_gamepad_capture_consumes_browser_input(capture)) {
+        input->pressed = 0;
+        input->held = 0;
+        input->analog_x = 128;
+        input->analog_y = 128;
+    }
+    return visual_changed;
+}
+
+/* Fullscreen is uncommon per frame and belongs outside the ratcheted
+   interactive-loop body. This synchronizes the standards state with native
+   chrome and gives Triangle an immediate browser-owned escape. */
+static TILEFINCH_OUT_OF_LINE bool psp_update_page_fullscreen(
+    PspApp *app, PspUiInput *input)
+{
+    if (app == NULL || app->browser == NULL || app->process == NULL
+        || input == NULL) return false;
+    PspUiState *ui = &app->process->presentation.ui;
+    bool active = browser_engine_page_fullscreen_active(
+        app->browser->engine);
+    bool changed = ui->page_fullscreen != active;
+    if (changed) {
+        ui->page_fullscreen = active;
+        ui->chrome_visible = !active;
+    }
+    if (ui->page_fullscreen
+        && (input->pressed & PSP_UI_BUTTON_TOOLBAR) != 0) {
+        (void) browser_engine_exit_page_fullscreen(app->browser->engine);
+        ui->page_fullscreen = false;
+        ui->chrome_visible = true;
+        input->pressed &= ~PSP_UI_BUTTON_TOOLBAR;
+        input->held &= ~PSP_UI_BUTTON_TOOLBAR;
+        changed = true;
+    }
+    return changed;
+}
+
+static TILEFINCH_OUT_OF_LINE void psp_suspend_page_runtime(
+    PspBrowserResources *browser, PspProcessResources *process,
+    PspInteractiveState *interactive)
+{
+    if (browser == NULL || process == NULL || interactive == NULL) return;
+    browser_engine_cancel_idle_work(browser->engine);
+    (void) browser_engine_set_page_visibility(browser->engine, false);
+    browser_engine_suspend_page_presentations(browser->engine);
+    process->presentation.ui.page_fullscreen = false;
+    process->presentation.ui.chrome_visible = true;
+    psp_site_data_restore_pause(&interactive->site_data_restore);
 }
 
 /* Site-information mutations are deliberate menu operations, never resident
@@ -1823,7 +2070,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
     bool media_stability_lifecycle_injected = false;
     uint64_t previous_ui_sample_us =
         (uint64_t) sceKernelGetSystemTimeWide();
-    bool cursor_feedback_published_last_loop = false;
+    bool fast_page_followup = false;
     uint64_t next_color_mode_check_us =
         previous_ui_sample_us + UINT64_C(60000000);
     unsigned power_worker_completions = 0;
@@ -1964,6 +2211,20 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 break;
             if (lifecycle_action
                     == PSP_LIFECYCLE_ACTION_QUIESCE) {
+                if (interactive->gamepad_capture.active) {
+                    interactive->gamepad_capture.active = false;
+                    interactive->gamepad_capture.chord_latched = false;
+                    interactive->gamepad_capture.chord_held = false;
+                    interactive->gamepad_capture.chord_hold_ms = 0;
+                    process->presentation.ui.page_gamepad_capture = false;
+                    if (tilefinch_gamepad_state_update(
+                            &interactive->gamepad_state, false, 0, 0, 0,
+                            (uint64_t) sceKernelGetSystemTimeWide()
+                                / UINT64_C(1000))) {
+                        (void) browser_engine_set_gamepad_state(
+                            browser->engine, &interactive->gamepad_state);
+                    }
+                }
                 bool navigation_was_pending =
                     browser_engine_navigation_pending(browser->engine);
                 bool render_was_pending = render_job_pending;
@@ -1998,9 +2259,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     budget_free(browser->budget, interactive->screenshot.pixels);
                     interactive->screenshot.pixels = NULL;
                 }
-                browser_engine_cancel_idle_work(browser->engine);
-                psp_site_data_restore_pause(
-                    &interactive->site_data_restore);
+                psp_suspend_page_runtime(browser, process, interactive);
                 if (psp_navigation_cooperate_active())
                     psp_navigation_cooperate_end("system-suspend");
                 /* The media-open owner survives ordinary frame boundaries,
@@ -2216,16 +2475,9 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
            neither scanned nor queued for NEXTFRAME. A short yield samples
            input again without the otherwise mandatory extra vblank. Video
            remains double buffered and uses its separately fenced path. */
-        bool cursor_followup = cursor_feedback_published_last_loop;
-        cursor_feedback_published_last_loop = false;
-        if (fullscreen_media_poll) {
-            (void) sceKernelDelayThread(
-                PSP_MEDIA_FULLSCREEN_POLL_YIELD_US);
-        } else if (cursor_followup) {
-            (void) sceKernelDelayThread(1000);
-        } else {
-            sceDisplayWaitVblankStart();
-        }
+        psp_wait_before_interactive_input(
+            fullscreen_media_poll, fast_page_followup);
+        fast_page_followup = false;
 #ifdef TILEFINCH_HAVE_PSP_VOICE
         if ((++voice_pressure_ticks & 63u) == 0)
             psp_text_input_trim(&process->text_input);
@@ -2356,6 +2608,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             input.held |= supervisor_page_pressed;
         }
         interactive->previous_buttons = input.held;
+        bool gamepad_visual_changed = psp_update_page_gamepad(
+            &app, &input, ui_elapsed_ms, frame.ui_sample_us);
         bool reader_shortcut = false;
         bool toolbar_held =
             (input.held & PSP_UI_BUTTON_TOOLBAR) != 0;
@@ -2803,8 +3057,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 psp_cursor_latency_sample(frame.ui_sample_us);
                 cursor_feedback_presented = psp_present_cursor_feedback(
                     engine_views->frame, &process->presentation.ui);
-                cursor_feedback_published_last_loop =
-                    cursor_feedback_presented;
+                fast_page_followup = cursor_feedback_presented;
             }
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
             /*
@@ -3042,7 +3295,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             }
         }
 #endif
-        frame.page_dirty = color_mode_visual_changed;
+        frame.page_dirty = color_mode_visual_changed
+            || gamepad_visual_changed;
         navigation_visual_changed |= voice_component_visual_changed
             || glyph_component_visual_changed;
         frame.pointer_activation = false;
@@ -3692,8 +3946,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     &process->presentation.ui,
                     &process->presentation.collections_surface,
                     browser->profile,
-                    &browser->offline_store.library,
-                    &browser->offline_store.download,
+                    &browser->offline_store,
                     PSP_UI_COLLECTION_DOWNLOADS);
             }
             int progress = -1;
@@ -4155,7 +4408,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         if (process->presentation.ui.cursor_shape != cursor_shape_before_dispatch)
             navigation_visual_changed = true;
         psp_find_sync(browser->engine, &process->presentation.ui, &process->presentation.find_view);
-        bool render_visual_changed = false;
+        unsigned render_visual_state = 0;
         if (render_job_pending) {
             psp_log_set_phase(PSP_LOG_PHASE_RENDER);
             psp_log_heartbeat();
@@ -4169,14 +4422,13 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             }
             const TileCache *render_stats =
                 browser_engine_render_metrics_view(browser->engine);
+            bool canvas_render =
+                browser_engine_canvas_frame_pending(browser->engine);
             size_t units_before = render_stats == NULL ? 0
                 : render_stats->frame_job_units;
-            BrowserRenderJobStatus render_status =
-                browser_engine_render_frame_bounded_cancelable(
-                    browser->engine, PSP_RENDER_JOB_BUDGET_US,
-                    PSP_RENDER_JOB_MAXIMUM_TILES,
-                    render_scope
-                        ? psp_navigation_cancellation() : NULL);
+            BrowserRenderJobStatus render_status = psp_render_page_job(
+                browser->engine,
+                render_scope ? psp_navigation_cancellation() : NULL);
             uint64_t render_now_us =
                 (uint64_t) sceKernelGetSystemTimeWide();
             if (render_stats != NULL
@@ -4200,7 +4452,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     &process->presentation.ui, browser_engine_last_error(browser->engine), 300);
                 render_job_pending = false;
                 render_job_last_progress_us = 0;
-                render_visual_changed = true;
+                render_visual_state = 1;
             } else if (render_cancelled) {
                 render_job_pending = false;
                 render_job_last_progress_us = 0;
@@ -4211,14 +4463,14 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                  * that unrequested candidate frame.
                  */
                 frame.page_dirty = false;
-                render_visual_changed = false;
+                render_visual_state = 0;
                 psp_ui_show_status(
                     &process->presentation.ui, "PAGE UPDATE STOPPED", 180);
                 psp_present_supervisor_ui(engine_views->frame, &process->presentation.ui);
             } else if (render_status == BROWSER_RENDER_JOB_COMPLETE) {
                 render_job_pending = false;
                 render_job_last_progress_us = 0;
-                render_visual_changed = true;
+                render_visual_state = canvas_render ? 2u : 1u;
                 (void) psp_engine_views_refresh(engine_views, browser->engine);
             } else {
                 if (render_job_last_progress_us != 0
@@ -4227,7 +4479,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     browser_engine_cancel_render_job(browser->engine);
                     render_job_pending = false;
                     render_job_last_progress_us = 0;
-                    render_visual_changed = true;
+                    render_visual_state = 1;
                     psp_ui_show_status(
                         &process->presentation.ui, "PAGE PAINT STOPPED", 300);
                     printf("tilefinch-render-job: no-progress-timeout "
@@ -4288,7 +4540,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             && profile_flush_attempted) {
             printf("tilefinch-profile: deferred save failed\n");
         }
-        if (frame.page_dirty || render_visual_changed
+        if (frame.page_dirty || render_visual_state != 0
             || (intent.visual_changed
                 && !(predispatch_presented && predispatch_complete))
             || media_visual_changed
@@ -4298,6 +4550,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             if (!psp_navigation_cooperate_supervised()) {
                 psp_log_set_phase(PSP_LOG_PHASE_RENDER);
                 psp_present(engine_views->frame, &process->presentation.ui);
+                fast_page_followup |= render_visual_state == 2u;
                 psp_log_set_phase(PSP_LOG_PHASE_INTERACTIVE);
                 /* Direct Play commits the native player before the optional
                    page-memory trim. Resolver work was held above for this
@@ -4645,6 +4898,64 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
                exit_engine_metrics.unchanged_runtime_frames_suppressed,
                exit_engine_metrics.rendered_frames);
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    const TileCache *exit_render =
+        browser_engine_render_metrics_view(browser->engine);
+    if (exit_render != NULL) {
+        printf("tilefinch-animation-cadence: rendered=%zu scheduled=%zu "
+               "completed=%zu cancelled=%zu slices=%zu units=%zu "
+               "budget-exhausted=%zu max-slice=%lluus max-unit=%lluus "
+               "scaled-builds=%zu scaled-us=%lluus\n",
+               exit_render->frames_rendered,
+               exit_render->frame_jobs_scheduled,
+               exit_render->frame_jobs_completed,
+               exit_render->frame_jobs_cancelled,
+               exit_render->frame_job_slices,
+               exit_render->frame_job_units,
+               exit_render->frame_job_budget_exhaustions,
+               (unsigned long long) exit_render->max_frame_job_slice_us,
+               (unsigned long long) exit_render->max_frame_job_unit_us,
+               exit_render->scaled_image_builds,
+               (unsigned long long) exit_render->scaled_image_us);
+    }
+    ScriptWebglNativeMetrics webgl_metrics = {0};
+    if (script_runtime_webgl_native_metrics(&webgl_metrics)) {
+        printf("tilefinch-webgl-cadence: frames=%zu vertices=%zu "
+               "seed-avg=%lluus command-avg=%lluus sync-avg=%lluus "
+               "readback-avg=%lluus total-avg=%lluus total-max=%lluus "
+               "scratch-avg=%llu scratch-max=%zu owner-resets=%zu "
+               "capacity-resets=%zu texture-upload=%zu\n",
+               webgl_metrics.frames, webgl_metrics.vertices,
+               (unsigned long long) (webgl_metrics.seed_us
+                   / webgl_metrics.frames),
+               (unsigned long long) (webgl_metrics.command_us
+                   / webgl_metrics.frames),
+               (unsigned long long) (webgl_metrics.sync_us
+                   / webgl_metrics.frames),
+               (unsigned long long) (webgl_metrics.readback_us
+                   / webgl_metrics.frames),
+               (unsigned long long) (webgl_metrics.total_us
+                   / webgl_metrics.frames),
+               (unsigned long long) webgl_metrics.maximum_total_us,
+               (unsigned long long) (webgl_metrics.scratch_bytes
+                   / webgl_metrics.frames),
+               webgl_metrics.maximum_scratch_bytes,
+               webgl_metrics.texture_cache_owner_resets,
+               webgl_metrics.texture_cache_capacity_resets,
+               webgl_metrics.texture_upload_bytes);
+    }
+    if (psp_runtime_advance_calls != 0) {
+        printf("tilefinch-runtime-cadence: calls=%zu changes=%zu "
+               "render-deferrals=%zu handoff-deferrals=%zu "
+               "reclaim-deferrals=%zu average=%lluus maximum=%lluus\n",
+               psp_runtime_advance_calls, psp_runtime_layout_changes,
+               psp_runtime_render_deferrals, psp_runtime_handoff_deferrals,
+               psp_runtime_reclaim_deferrals,
+               (unsigned long long) (psp_runtime_advance_total_us
+                   / psp_runtime_advance_calls),
+               (unsigned long long) psp_runtime_advance_maximum_us);
+    }
+#endif
     psp_report_presentation_cadence("controlled-exit");
     cleanup_operation =
         psp_log_operation_begin("engine-cleanup");
@@ -5414,6 +5725,11 @@ int main(int argc, char *argv[])
             browser.engine, browser.budget, &process.clock_worker, process.clock_live,
             process.config.exit_to);
     }
+    if (process.config.validation_webgl_ge_probe != 0) {
+        return psp_run_webgl_ge_qualification(
+            browser.engine, browser.budget, &process.clock_worker,
+            process.clock_live, process.config.exit_to);
+    }
     if (process.config.validation_csc_order_probe != 0) {
         return psp_run_csc_order_qualification(
             browser.engine, browser.budget, &process.clock_worker, process.clock_live,
@@ -5730,6 +6046,9 @@ int main(int argc, char *argv[])
     process.presentation.ui.danzeff_text_input =
         browser_profile_text_entry_mode(browser.profile)
             == BROWSER_TEXT_ENTRY_DANZEFF;
+    process.presentation.ui.gamepad_circle_primary =
+        browser_profile_gamepad_face_mapping(browser.profile)
+            == TILEFINCH_GAMEPAD_FACE_O_PRIMARY;
     process.presentation.ui.persistent_cache_mb = persistent_cache_mb;
     process.presentation.ui.live_cache_kib = live_cache_kib;
     process.presentation.ui.persist_local_storage =
@@ -5758,6 +6077,12 @@ int main(int argc, char *argv[])
     process.presentation.ui.youtube_240p =
         browser_profile_youtube_quality(browser.profile)
             == BROWSER_YOUTUBE_QUALITY_240P;
+    process.presentation.ui.video_language = (uint8_t)
+        browser_profile_video_language(browser.profile);
+    process.presentation.ui.subtitle_language = (uint8_t)
+        browser_profile_subtitle_language(browser.profile);
+    process.presentation.ui.alternate_language = (uint8_t)
+        browser_profile_alternate_language(browser.profile);
     process.presentation.ui.youtube_compact_results =
         browser_profile_youtube_compact_results(browser.profile);
     process.presentation.ui.youtube_audio_only =

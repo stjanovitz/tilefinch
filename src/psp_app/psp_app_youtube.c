@@ -22,7 +22,23 @@ static void psp_youtube_preresolve_clear_facts(
     preresolve->started_us = 0;
     preresolve->ready_us = 0;
     preresolve->maximum_height = 0;
+    memset(&preresolve->track_preferences, 0,
+           sizeof(preresolve->track_preferences));
     preresolve->state = PSP_YOUTUBE_PRERESOLVE_IDLE;
+}
+
+static bool psp_youtube_track_preferences_equal(
+    const YoutubeTrackPreferences *left,
+    const YoutubeTrackPreferences *right)
+{
+    return left != NULL && right != NULL
+        && strcmp(left->audio_language, right->audio_language) == 0
+        && strcmp(left->caption_language, right->caption_language) == 0
+        && strcmp(left->alternate_language, right->alternate_language) == 0
+        && strcmp(left->audio_track_id, right->audio_track_id) == 0
+        && strcmp(left->caption_track_id, right->caption_track_id) == 0
+        && left->prefer_original_audio == right->prefer_original_audio
+        && left->caption_same_as_audio == right->caption_same_as_audio;
 }
 
 void psp_youtube_preresolve_reset(
@@ -52,11 +68,15 @@ void psp_youtube_preresolve_reset(
 static bool psp_youtube_preresolve_same_candidate(
     const PspYoutubePreresolve *preresolve,
     const char video_id[YOUTUBE_VIDEO_ID_CAPACITY],
-    uint64_t generation, int maximum_height)
+    uint64_t generation, int maximum_height,
+    const YoutubeTrackPreferences *track_preferences)
 {
     return preresolve != NULL && video_id != NULL
+        && track_preferences != NULL
         && preresolve->generation == generation
         && preresolve->maximum_height == maximum_height
+        && psp_youtube_track_preferences_equal(
+               &preresolve->track_preferences, track_preferences)
         && strcmp(preresolve->video_id, video_id) == 0;
 }
 
@@ -78,12 +98,14 @@ static bool psp_youtube_video_id_valid(const char *video_id)
 void psp_youtube_preresolve_tick(
     PspYoutubePreresolve *preresolve, Budget *budget,
     BrowserSession *session, const char *focused_video_id,
-    uint64_t generation, int maximum_height, uint64_t now_us,
+    uint64_t generation, int maximum_height,
+    const YoutubeTrackPreferences *track_preferences, uint64_t now_us,
     bool thumbnail_settled, bool eligible, bool transport_capacity,
     bool pump_allowed)
 {
     if (preresolve == NULL) return;
     bool candidate = generation != 0 && maximum_height > 0
+        && track_preferences != NULL
         && psp_youtube_video_id_valid(focused_video_id);
     if (!candidate) {
         if (preresolve->video_id[0] != '\0')
@@ -91,13 +113,15 @@ void psp_youtube_preresolve_tick(
         return;
     }
     if (!psp_youtube_preresolve_same_candidate(
-            preresolve, focused_video_id, generation, maximum_height)) {
+            preresolve, focused_video_id, generation, maximum_height,
+            track_preferences)) {
         psp_youtube_preresolve_reset(preresolve, "focus changed");
         snprintf(
             preresolve->video_id, sizeof(preresolve->video_id), "%s",
             focused_video_id);
         preresolve->generation = generation;
         preresolve->maximum_height = maximum_height;
+        preresolve->track_preferences = *track_preferences;
         preresolve->focus_since_us = now_us;
         preresolve->state = thumbnail_settled
             ? PSP_YOUTUBE_PRERESOLVE_DWELL
@@ -126,6 +150,7 @@ void psp_youtube_preresolve_tick(
             focused_video_id);
         preresolve->generation = generation;
         preresolve->maximum_height = maximum_height;
+        preresolve->track_preferences = *track_preferences;
         preresolve->focus_since_us = now_us;
         preresolve->state = thumbnail_settled
             ? PSP_YOUTUBE_PRERESOLVE_DWELL
@@ -167,6 +192,12 @@ void psp_youtube_preresolve_tick(
         preresolve->job = youtube_resolve_job_begin_bounded(
             budget, session, watch_url, maximum_height, 30000,
             &limits, NULL, NULL);
+        if (preresolve->job != NULL
+            && !youtube_resolve_job_set_track_preferences(
+                   preresolve->job, &preresolve->track_preferences)) {
+            youtube_resolve_job_destroy(preresolve->job);
+            preresolve->job = NULL;
+        }
         if (preresolve->job == NULL) {
             preresolve->state = PSP_YOUTUBE_PRERESOLVE_FAILED;
             printf(
@@ -221,7 +252,10 @@ YoutubeResolveJob **psp_youtube_preresolve_job_for_open(
         || preresolve->state == PSP_YOUTUBE_PRERESOLVE_FAILED
         || !youtube_watch_url_video_id(url, video_id)
         || !psp_youtube_preresolve_same_candidate(
-               preresolve, video_id, generation, maximum_height)) {
+               preresolve, video_id, generation, maximum_height,
+               &preresolve->track_preferences)
+        || !youtube_resolve_job_matches_track_preferences(
+               preresolve->job, &preresolve->track_preferences)) {
         return NULL;
     }
     if (preresolve->state != PSP_YOUTUBE_PRERESOLVE_READY
@@ -347,6 +381,9 @@ void psp_app_youtube_preresolve_tick(
         && !offline_download_active
         && !psp_navigation_cooperate_active();
     bool transport_capacity = false;
+    YoutubeTrackPreferences track_preferences = {0};
+    psp_media_default_track_preferences(
+        app->browser->profile, &track_preferences);
     bool admission_due = eligible
         && thumbnail_settled
         && preresolve->state == PSP_YOUTUBE_PRERESOLVE_DWELL
@@ -374,6 +411,7 @@ void psp_app_youtube_preresolve_tick(
         focused_provider_result ? preresolve->observed_video_id : NULL,
         generation,
         (int) browser_profile_youtube_quality(app->browser->profile),
-        frame->ui_sample_us, thumbnail_settled, eligible,
+        &track_preferences, frame->ui_sample_us,
+        thumbnail_settled, eligible,
         transport_capacity, pump_allowed);
 }

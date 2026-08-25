@@ -8,6 +8,7 @@
 #include "psp_media_session_internal.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/psp_log.h"
+#include "tilefinch/user_agent.h"
 
 #define printf psp_log_printf
 #define KIB 1024u
@@ -239,6 +240,40 @@ BrowserYoutubeQuality psp_media_open_quality(PspMediaSession *media)
     return (BrowserYoutubeQuality) admitted;
 }
 
+void psp_media_default_track_preferences(
+    const BrowserProfile *profile, YoutubeTrackPreferences *preferences)
+{
+    if (preferences == NULL) return;
+    *preferences = (YoutubeTrackPreferences) {0};
+    BrowserVideoLanguage language = browser_profile_video_language(profile);
+    const char *system_language = tilefinch_platform_preferred_language();
+    preferences->prefer_original_audio =
+        language == BROWSER_VIDEO_LANGUAGE_ORIGINAL;
+    const char *tag = browser_video_language_tag(
+        language, system_language);
+    if (tag == NULL)
+        tag = browser_video_language_tag(
+            BROWSER_VIDEO_LANGUAGE_SYSTEM, system_language);
+    snprintf(preferences->audio_language,
+             sizeof(preferences->audio_language), "%s",
+             tag == NULL ? "en" : tag);
+    BrowserSubtitleLanguage subtitle =
+        browser_profile_subtitle_language(profile);
+    preferences->caption_same_as_audio =
+        subtitle == BROWSER_SUBTITLE_LANGUAGE_SAME_AS_AUDIO;
+    const char *caption_tag = browser_subtitle_language_tag(
+        subtitle, system_language, preferences->audio_language);
+    if (caption_tag != NULL)
+        snprintf(preferences->caption_language,
+                 sizeof(preferences->caption_language), "%s", caption_tag);
+    const char *alternate_tag = browser_alternate_language_tag(
+        browser_profile_alternate_language(profile));
+    if (alternate_tag != NULL)
+        snprintf(preferences->alternate_language,
+                 sizeof(preferences->alternate_language), "%s",
+                 alternate_tag);
+}
+
 size_t psp_media_startup_headroom_bytes(const PspMediaSession *media)
 {
     if (media == NULL) return 0;
@@ -307,7 +342,7 @@ PspMediaPipelineState psp_media_owned_pipeline(
     if (media->range != NULL
         || media->audio_range != NULL || media->file_range != NULL
         || media->audio_file_range != NULL || media->demux != NULL
-        || media->audio_demux != NULL)
+        || media->audio_demux != NULL || media->hls != NULL)
         return PSP_MEDIA_PIPELINE_PARTIAL;
     return PSP_MEDIA_PIPELINE_NONE;
 }
@@ -406,7 +441,20 @@ void psp_media_session_checkpoint(
     uint32_t violations =
         psp_media_machine_violations(&media->machine);
     uint32_t mismatch = 0;
-    if (media->machine.pipeline != pipeline) mismatch |= 1u << 0;
+    bool pipeline_matches = media->machine.pipeline == pipeline;
+    /* An open service commits its command before invoking physical work.  A
+       pumpable range/source constructor can therefore own the partial
+       pipeline while that command is still in flight, before its completion
+       event commits PARTIAL to the chart.  This is actuator progress, not a
+       second controller.  Once the service completes (or is replaced), exact
+       agreement is required again. */
+    if (!pipeline_matches
+        && media->machine.state == PSP_MEDIA_SESSION_OPENING
+        && media->service.command == PSP_MEDIA_COMMAND_START_OPEN_PHASE
+        && pipeline > media->machine.pipeline) {
+        pipeline_matches = true;
+    }
+    if (!pipeline_matches) mismatch |= 1u << 0;
     if (media->machine.backend_health != backend) mismatch |= 1u << 1;
     if (violations != 0) mismatch |= 1u << 2;
     if (mismatch != 0) {
@@ -817,8 +865,11 @@ size_t psp_media_range_bytes(const PspMediaSession *media)
     MediaHttpRangeStats audio = {0};
     if (media == NULL) return 0;
     MediaHlsStats hls = {0};
-    if (psp_media_hls_stats(media->hls, &hls))
-        return hls.bytes_received;
+    if (psp_media_hls_stats(media->hls, &hls)) {
+        return hls.playlist_bytes_received > SIZE_MAX - hls.bytes_received
+            ? SIZE_MAX
+            : hls.playlist_bytes_received + hls.bytes_received;
+    }
     (void) media_http_range_stats(media->range, &video);
     (void) media_http_range_stats(media->audio_range, &audio);
     return video.bytes_received + video.bytes_in_flight
@@ -939,6 +990,16 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     media->resolver_job = NULL;
     youtube_resolve_job_destroy(media->prepared_resolver_job);
     media->prepared_resolver_job = NULL;
+    if (media->subtitle_request_id != 0) {
+        (void) fetch_background_transport_cancel(
+            media->subtitle_request_id, "subtitle request closed");
+        media->subtitle_request_id = 0;
+    }
+    youtube_subtitles_destroy(media->subtitles);
+    media->subtitles = NULL;
+    media->subtitle_cue_cursor = 0;
+    media->subtitle_request_attempted = false;
+    psp_ui_media_set_subtitle(&media->ui, NULL);
     if (media->page_media_probe_request != 0) {
         (void) fetch_background_transport_cancel(
             media->page_media_probe_request, "page media closed");
@@ -1048,6 +1109,7 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     media->playback = NULL;
     media->hls = NULL;
     media->hls_source = (MediaSampleSource) {0};
+    media->hls_audio_source = (MediaSampleSource) {0};
     media->demux = NULL;
     media->audio_demux = NULL;
     media->range = NULL;
@@ -1142,8 +1204,11 @@ void psp_media_init(
         &media->swdec, budget, media->platform.install_paths);
     media->requested_quality =
         browser_profile_youtube_quality(profile);
+    psp_media_default_track_preferences(profile, &media->track_preferences);
     media->audio_only = false;
     psp_ui_media_init(&media->ui);
+    psp_ui_media_bind_presentation(
+        &media->ui, &media->ui_presentation);
     psp_ui_media_set_title_font(&media->ui, title_font);
     media->machine = psp_media_machine_initial();
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -1479,6 +1544,8 @@ static void psp_media_prepare_route_kind(
     media->generation = generation;
     media->last_resume_saved_us = 0;
     media->requested_quality = psp_media_open_quality(media);
+    psp_media_default_track_preferences(
+        media->profile, &media->track_preferences);
     media->quality_fallback_attempted = false;
     media->reopen_resume_us = 0;
     media->reopen_resume_playing = false;
@@ -1599,7 +1666,9 @@ bool psp_media_open_provider_route_prepared(
         && prepared_resolver_job != NULL
         && youtube_resolve_job_matches(
                *prepared_resolver_job, url,
-               (int) media->requested_quality)) {
+               (int) media->requested_quality)
+        && youtube_resolve_job_matches_track_preferences(
+               *prepared_resolver_job, &media->track_preferences)) {
         media->prepared_resolver_job = *prepared_resolver_job;
         *prepared_resolver_job = NULL;
     }
@@ -1961,6 +2030,52 @@ void psp_media_execute_intent(PspMediaSession *media,
                 psp_media_request_user_retry(media);
             }
             break;
+        case PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK:
+            if (intent.track_index < media->stream.audio_track_count) {
+                const YoutubeTrack *track =
+                    &media->stream.audio_tracks[intent.track_index];
+                if (media->stream.selected_audio_track
+                        != (int) intent.track_index) {
+                    snprintf(media->track_preferences.audio_track_id,
+                             sizeof(media->track_preferences.audio_track_id),
+                             "%s", track->id);
+                    snprintf(media->track_preferences.audio_language,
+                             sizeof(media->track_preferences.audio_language),
+                             "%s", track->language);
+                    media->track_preferences.prefer_original_audio = false;
+                    psp_media_request_user_retry(media);
+                }
+            }
+            break;
+        case PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK:
+            if (intent.track_index == UINT8_MAX) {
+                media->track_preferences.caption_track_id[0] = '\0';
+                media->stream.selected_caption_track = -1;
+                media->stream.caption_url[0] = '\0';
+                if (media->subtitle_request_id != 0) {
+                    (void) fetch_background_transport_cancel(
+                        media->subtitle_request_id,
+                        "subtitles turned off");
+                    media->subtitle_request_id = 0;
+                }
+                youtube_subtitles_destroy(media->subtitles);
+                media->subtitles = NULL;
+                media->subtitle_request_attempted = false;
+                media->subtitle_cue_cursor = 0;
+                media->ui_presentation.selected_subtitle_track = -1;
+                psp_ui_media_set_subtitle(&media->ui, NULL);
+            } else if (intent.track_index
+                           < media->stream.caption_track_count
+                       && media->stream.selected_caption_track
+                           != (int) intent.track_index) {
+                const YoutubeTrack *track =
+                    &media->stream.caption_tracks[intent.track_index];
+                snprintf(media->track_preferences.caption_track_id,
+                         sizeof(media->track_preferences.caption_track_id),
+                         "%s", track->id);
+                psp_media_request_user_retry(media);
+            }
+            break;
         case PSP_UI_MEDIA_ACTION_CLOSE:
             psp_media_close(media);
             break;
@@ -1969,6 +2084,76 @@ void psp_media_execute_intent(PspMediaSession *media,
             break;
     }
     psp_media_session_checkpoint(media, "intent");
+}
+
+static bool psp_media_subtitle_pump(PspMediaSession *media)
+{
+    if (media == NULL || media->track_preferences.caption_track_id[0] == '\0'
+        || media->stream.caption_url[0] == '\0') return false;
+    if (media->subtitles == NULL && media->subtitle_request_id == 0
+        && !media->subtitle_request_attempted) {
+        /* Captions are optional. They never occupy the two descriptors
+           reserved for media delivery, and do not begin until the selected
+           A/V route has reached a presentable reserve. */
+        if (media->playback == NULL || media->ui.buffering
+            || psp_media_sample_readiness(media)
+                   != PSP_MEDIA_PRESENTATION_READY) return false;
+        if (!fetch_background_transport_available()) {
+            media->subtitle_request_attempted = true;
+            return false;
+        }
+        FetchRequest request = {
+            .allow_http_errors = false,
+            .accept = "text/vtt,text/plain;q=0.9,*/*;q=0.2",
+            .user_agent = TILEFINCH_BROWSER_USER_AGENT,
+            .credentials = FETCH_CREDENTIALS_OMIT,
+            .connect_timeout_ms = 10000,
+            .redirect_same_origin_only = true,
+            .redirect_url_validator = youtube_caption_url_supported
+        };
+        media->subtitle_request_id =
+            fetch_background_transport_enqueue(
+                media->stream.caption_url, &request,
+                YOUTUBE_SUBTITLE_BODY_LIMIT, 15000);
+        if (media->subtitle_request_id == 0) return false;
+        media->subtitle_request_attempted = true;
+        return false;
+    }
+    if (media->subtitle_request_id != 0) {
+        FetchBackgroundProgress progress = {0};
+        if (!fetch_background_transport_progress(
+                media->subtitle_request_id, &progress)) {
+            media->subtitle_request_id = 0;
+            return false;
+        }
+        if (!progress.complete) return false;
+        FetchResult *result = fetch_result_create(media->budget);
+        uint64_t request = media->subtitle_request_id;
+        media->subtitle_request_id = 0;
+        if (result == NULL) {
+            /* A completed descriptor still has to be retired when response
+               materialization is refused by the page budget. Leaving it in
+               COMPLETE would permanently reduce the bounded transport pool. */
+            (void) fetch_background_transport_cancel(
+                request, "subtitle result admission failed");
+            return false;
+        }
+        bool taken = fetch_background_transport_take_fetch_result(
+            request, media->budget, result);
+        if (taken && result->status_code >= 200 && result->status_code < 300)
+            media->subtitles = youtube_subtitles_parse_vtt(
+                media->budget, (const unsigned char *) result->data,
+                result->length);
+        if (result != NULL) fetch_result_free(result);
+    }
+    if (media->subtitles == NULL) return false;
+    const char *text = youtube_subtitles_text_at(
+        media->subtitles, media->clock_us, &media->subtitle_cue_cursor);
+    const char *display = text == NULL ? "" : text;
+    if (strcmp(media->ui_presentation.subtitle_text, display) == 0)
+        return false;
+    psp_ui_media_set_subtitle(&media->ui, display);
+    return true;
 }
 
 /*
@@ -2227,6 +2412,7 @@ bool psp_media_advance(
         }
         return true;
     }
+    changed = psp_media_subtitle_pump(media) || changed;
     if (psp_media_start_pending_preview_commit(media)) return true;
     if (media->reopen_preview_pending
         && media->playback != NULL

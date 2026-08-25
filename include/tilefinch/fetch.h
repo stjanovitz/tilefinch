@@ -232,6 +232,11 @@ typedef struct {
     bool sec_fetch_user;
     bool upgrade_insecure_requests;
     bool identity_encoding;
+    /* Receive a gzip response without asking libcurl to decode it. This is a
+       narrow streaming escape hatch for consumers that own a bounded,
+       incremental inflater. It is mutually exclusive with identity_encoding;
+       ordinary page fetches must leave it false. */
+    bool raw_gzip_encoding;
     const char *user_agent;
     /*
      * Optional per-request connect bound in milliseconds, covering DNS-to-TLS
@@ -674,6 +679,9 @@ bool fetch_background_transport_take_headers(
    take_headers; a caller must select exactly one representation. */
 bool fetch_background_transport_take_media_headers(
     uint64_t request_id, FetchBackgroundMediaResponse *metadata);
+/* Takes up to capacity bytes from the current published streaming chunk. A
+   smaller destination consumes a prefix; the worker remains paused and the
+   suffix stays published until a later call drains it. */
 bool fetch_background_transport_take_chunk(
     uint64_t request_id, unsigned char *destination,
     size_t capacity, size_t *length);

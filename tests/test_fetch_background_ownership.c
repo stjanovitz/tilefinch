@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "../src/fetch/background_slot_policy.h"
+#include "../src/psp_media_hls_policy.h"
 
 typedef enum {
     MODEL_FREE = 0,
@@ -74,6 +75,12 @@ static void test_redirect_cookie_overflow_policy(void)
           == FETCH_BACKGROUND_STREAM_PUBLICATION_MAX);
     CHECK(fetch_background_stream_publication_target(
               SIZE_MAX, 32u * 1024u) == 32u * 1024u);
+    CHECK(PSP_HLS_PLAYLIST_CHUNK_BYTES
+          == FETCH_BACKGROUND_STREAM_PUBLICATION_MAX);
+    CHECK(psp_hls_playlist_retry_allowed(0u, true));
+    CHECK(psp_hls_playlist_retry_allowed(1u, true));
+    CHECK(!psp_hls_playlist_retry_allowed(2u, true));
+    CHECK(!psp_hls_playlist_retry_allowed(0u, false));
 }
 
 static uint64_t model_claim(

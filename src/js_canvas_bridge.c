@@ -884,10 +884,10 @@ static bool canvas_path_inside(const uint8_t *points, size_t point_count,
     return even_odd ? parity : winding != 0;
 }
 
-static double canvas_segment_distance(double x, double y,
-                                      double x0, double y0,
-                                      double x1, double y1,
-                                      double *position)
+static double canvas_segment_distance_squared(double x, double y,
+                                              double x0, double y0,
+                                              double x1, double y1,
+                                              double *position)
 {
     double dx = x1 - x0, dy = y1 - y0;
     double length_squared = dx * dx + dy * dy;
@@ -898,7 +898,9 @@ static double canvas_segment_distance(double x, double y,
     if (t > 1.0) t = 1.0;
     if (position != NULL) *position = raw_t;
     double nearest_x = x0 + t * dx, nearest_y = y0 + t * dy;
-    return hypot(x - nearest_x, y - nearest_y);
+    double nearest_dx = x - nearest_x;
+    double nearest_dy = y - nearest_y;
+    return nearest_dx * nearest_dx + nearest_dy * nearest_dy;
 }
 
 static bool canvas_dash_on(const uint8_t *dash, size_t count,
@@ -1173,6 +1175,7 @@ static bool canvas_raster_path_stroke(
     size_t work_remaining = CANVAS_RASTER_WORK_LIMIT;
     bool work_exhausted = false;
     size_t sample_cost = clip_path_count / 2u + dash_count + 1u;
+    double radius_squared = radius * radius;
     while (start < point_count && !work_exhausted) {
         while (start < point_count
                && !isfinite(canvas_double_at(points, start * 2u))) start++;
@@ -1229,14 +1232,15 @@ static bool canvas_raster_path_stroke(
                             if ((coverage[mask_at] & bit) != 0u) continue;
                             double px = x + sample[sx], py = y + sample[sy];
                             double position = 0.0;
-                            double distance = canvas_segment_distance(
+                            double distance_squared =
+                                canvas_segment_distance_squared(
                                 px, py, x0, y0, x1, y1, &position);
                             bool inside = position >= 0.0 && position <= 1.0
-                                && distance <= radius;
+                                && distance_squared <= radius_squared;
                             if (!inside && line_cap == 1
                                 && ((position < 0.0 && start_cap)
                                     || (position > 1.0 && end_cap))) {
-                                inside = distance <= radius;
+                                inside = distance_squared <= radius_squared;
                             } else if (!inside && line_cap == 2
                                        && ((position < 0.0 && start_cap)
                                            || (position > 1.0 && end_cap))) {

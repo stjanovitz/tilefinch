@@ -8,6 +8,17 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.12 — 2026-08-24
+
+- YouTube live-stream and premiere support.
+- Added audio and subtitle track selection plus preferred, alternate, original,
+  and PSP-system language ranking. Captions remain off until selected.
+- Added page-control mode and the Gamepad API, expanded Canvas 2D and Web
+  Audio support, and started WebGL support. The source tree now includes the
+  installable Prism Break 3D game.
+- Added installable offline web apps with size previews, update and reinstall
+  status, uninstall controls, icons, and bounded manifest presentation.
+
 ## 0.1.11 — 2026-08-23
 
 - Added an optional ARK-4 XMB redirect that opens Tilefinch from Sony's

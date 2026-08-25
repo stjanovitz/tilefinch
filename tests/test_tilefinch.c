@@ -1,6 +1,8 @@
 #include "tilefinch_test_common.h"
 #include "../src/psp_network_policy.h"
 
+#include <stdarg.h>
+
 static bool test_cache_put_stylesheet(BrowserSession *session,
                                       const char *url,
                                       const unsigned char *data,

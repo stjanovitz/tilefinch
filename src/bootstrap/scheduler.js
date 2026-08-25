@@ -8,6 +8,7 @@
     value: 0,
   });
   const trustedWrap = globalThis.__tilefinchWrap,
+    pageVisible = globalThis.__tilefinchPageVisible,
     diagnosticString = String,
     diagnosticOwnDescriptor = Object.getOwnPropertyDescriptor;
   Object.defineProperty(globalThis, "__tilefinchDiagnosticLookup", {
@@ -502,7 +503,8 @@
     now += Math.max(0, Number(elapsed) || 0);
     globalThis.__tilefinchNow = now;
     let ran = 0;
-    const maximum = Math.max(0, Number(maxCallbacks) || 0);
+    const maximum = Math.max(0, Number(maxCallbacks) || 0),
+      visible = pageVisible();
     while (ran < maximum) {
       timers.sort(
         (a, b) =>
@@ -510,17 +512,23 @@
           timerPriority(a) - timerPriority(b) ||
           a.id - b.id,
       );
-      const timer = timers[0];
+      const timerIndex = visible
+          ? (timers[0]?.due <= now ? 0 : -1)
+          : timers.findIndex((candidate) =>
+            candidate.due <= now && candidate.kind !== "animation-frame" &&
+            candidate.kind !== "render-observer" &&
+            candidate.kind !== "render-fixup");
+      const timer = timerIndex < 0 ? null : timers[timerIndex];
       if (!timer || timer.due > now) break;
-      timers.shift();
+      timers.splice(timerIndex, 1);
       globalThis.__tilefinchRunTask(
         "timer:" + String(timer.kind) + ":id=" + String(timer.id),
         () => {
           try {
             /* Animation timestamps describe the frame that is actually being
                serviced. A late browser tick therefore skips time instead of
-               replaying a backlog of synthetic 16 ms frames. Inactive page
-               runtimes are not pumped, so their callbacks remain paused. */
+               replaying a backlog of synthetic 16 ms frames. Visual timers
+               remain queued while the owning document is hidden. */
             if (timer.kind === "animation-frame") timer.callback(now);
             else timer.callback(...timer.args);
           } catch (error) {

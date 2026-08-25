@@ -1,0 +1,10 @@
+{
+  "name": "Prism Break 3D",
+  "short_name": "Prism Break",
+  "description": "A compact 3D brick-breaking game built for Tilefinch.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "fullscreen",
+  "theme_color": "#071229",
+  "background_color": "#02050d"
+}

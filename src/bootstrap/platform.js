@@ -1562,6 +1562,75 @@
     if (tag === "input" || tag === "textarea")
       __tilefinchSetControlValue(control.__handle, String(value ?? ""));
   };
+  /* A page fullscreen state is deliberately singular and presentation-only.
+     Native code owns the viewport/chrome transition; JavaScript retains the
+     standards-facing element identity and events. */
+  let fullscreenElement = null;
+  const dispatchFullscreenChange = (element) => {
+      const target = element?.isConnected ? element : document;
+      target.dispatchEvent(new Event("fullscreenchange", { bubbles: true }));
+    },
+    leaveFullscreen = (fromHost = false) => {
+      const previous = fullscreenElement;
+      if (!previous) return true;
+      if (!fromHost && !__tilefinchSetFullscreen(0, 0)) return false;
+      fullscreenElement = null;
+      dispatchFullscreenChange(previous);
+      return true;
+    };
+  Object.defineProperties(document, {
+    fullscreenElement: {
+      configurable: true,
+      enumerable: true,
+      get() {
+        if (fullscreenElement && !fullscreenElement.isConnected)
+          leaveFullscreen(false);
+        return fullscreenElement;
+      },
+    },
+    fullscreenEnabled: {
+      configurable: true,
+      enumerable: true,
+      get: () => true,
+    },
+    webkitFullscreenElement: {
+      configurable: true,
+      get() { return document.fullscreenElement; },
+    },
+  });
+  Element.prototype.requestFullscreen = function () {
+    return new Promise((resolve, reject) => {
+      if (!this.isConnected || !__tilefinchSetFullscreen(this.__handle, 1)) {
+        const error = new DOMException(
+          "Fullscreen requires a connected element and user activation",
+          "NotAllowedError",
+        );
+        this.dispatchEvent(new Event("fullscreenerror", { bubbles: true }));
+        reject(error);
+        return;
+      }
+      const previous = fullscreenElement;
+      fullscreenElement = this;
+      dispatchFullscreenChange(previous || this);
+      resolve();
+    });
+  };
+  Element.prototype.webkitRequestFullscreen =
+    Element.prototype.requestFullscreen;
+  document.exitFullscreen = () => new Promise((resolve, reject) => {
+    if (!fullscreenElement) { resolve(); return; }
+    if (!leaveFullscreen(false)) {
+      reject(new DOMException("Could not leave fullscreen", "InvalidStateError"));
+      return;
+    }
+    resolve();
+  });
+  document.webkitExitFullscreen = document.exitFullscreen;
+  globalThis.__tilefinchExitFullscreenFromHost = () => leaveFullscreen(true);
+  globalThis.__tilefinchRegisterNativeNodeStateCleanup?.((handle) => {
+    if (fullscreenElement?.__handle === Number(handle)) leaveFullscreen(true);
+  });
+
   const indeterminateState = new Map(),
     checkedDefaultState = new Map();
   globalThis.__tilefinchRegisterNativeNodeStateCleanup?.((handle) => {
@@ -4319,6 +4388,44 @@
         },
       },
     });
+    let pendingImageDecodes = 0;
+    HTMLImageElement.prototype.decode = function () {
+      const image = this;
+      return new Promise((resolve, reject) => {
+        if (pendingImageDecodes >= 16) {
+          reject(new DOMException(
+            "Too many pending image decodes", "QuotaExceededError"));
+          return;
+        }
+        pendingImageDecodes++;
+        let settled = false, polls = 0;
+        const finish = (error = null) => {
+          if (settled) return;
+          settled = true;
+          pendingImageDecodes--;
+          image.removeEventListener("load", loaded);
+          image.removeEventListener("error", failed);
+          if (error) reject(error); else resolve();
+        },
+        loaded = () => finish(),
+        failed = () => finish(new DOMException(
+          "The image could not be decoded", "EncodingError")),
+        poll = () => {
+          if (settled) return;
+          if (!image.src) { failed(); return; }
+          if (image.complete) {
+            if (image.naturalWidth > 0 && image.naturalHeight > 0) loaded();
+            else failed();
+            return;
+          }
+          if (++polls >= 300) { failed(); return; }
+          setTimeout(poll, 100);
+        };
+        image.addEventListener("load", loaded, { once: true });
+        image.addEventListener("error", failed, { once: true });
+        queueMicrotask(poll);
+      });
+    };
     Object.defineProperties(HTMLSourceElement.prototype, {
       srcset: reflect("srcset"),
       sizes: reflect("sizes"),
@@ -6077,6 +6184,99 @@
           },
         },
       };
+  {
+    /* One fixed built-in controller is exposed only while the user has
+       explicitly handed page input to the document. Keep every public object
+       stable and mutate bounded closure state so a 30 Hz game loop does not
+       allocate a new Gamepad graph on every poll. */
+    const buttonValues = new Array(17).fill(0),
+      axisValues = [0, 0, 0, 0],
+      buttons = buttonValues.map((_, index) =>
+        Object.freeze({
+          get pressed() {
+            return buttonValues[index] !== 0;
+          },
+          get touched() {
+            return buttonValues[index] !== 0;
+          },
+          get value() {
+            return buttonValues[index];
+          },
+          [Symbol.toStringTag]: "GamepadButton",
+        }),
+      ),
+      axes = [];
+    for (let index = 0; index < 4; index++)
+      Object.defineProperty(axes, index, {
+        enumerable: true,
+        get: () => axisValues[index],
+      });
+    Object.defineProperty(axes, "length", { value: 4 });
+    Object.freeze(axes);
+    Object.freeze(buttons);
+    let connected = false,
+      timestamp = 0;
+    const gamepad = Object.freeze({
+        id: "PSP Built-in Controller",
+        index: 0,
+        mapping: "standard",
+        get connected() {
+          return connected;
+        },
+        get timestamp() {
+          return timestamp;
+        },
+        axes,
+        buttons,
+        vibrationActuator: null,
+        [Symbol.toStringTag]: "Gamepad",
+      }),
+      connectedPads = Object.freeze([gamepad]),
+      disconnectedPads = Object.freeze([null]);
+    class GamepadEvent {
+      constructor(type, init = {}) {
+        /* Event is installed by the later compatibility bootstrap. Controller
+           publication begins only after the complete bootstrap, so resolve
+           it at construction time rather than making platform.js depend on
+           source ordering. */
+        if (typeof globalThis.Event === "function") {
+          const event = new globalThis.Event(type, init);
+          Object.setPrototypeOf(GamepadEvent.prototype, Event.prototype);
+          Object.setPrototypeOf(event, GamepadEvent.prototype);
+          event.gamepad = init.gamepad || null;
+          return event;
+        }
+        this.type = String(type);
+        this.gamepad = init.gamepad || null;
+      }
+    }
+    globalThis.GamepadEvent = GamepadEvent;
+    navigator.getGamepads = () =>
+      connected ? connectedPads : disconnectedPads;
+    globalThis.__tilefinchUpdateGamepad = (
+      nextConnected,
+      buttonBits,
+      axisX,
+      axisY,
+      nextTimestamp,
+    ) => {
+      nextConnected = !!nextConnected;
+      buttonBits = Number(buttonBits) >>> 0;
+      for (let index = 0; index < 17; index++)
+        buttonValues[index] = buttonBits & (1 << index) ? 1 : 0;
+      const normalizeAxis = (value) =>
+        Math.max(-1, Math.min(1, Number(value) / 32767));
+      axisValues[0] = normalizeAxis(axisX);
+      axisValues[1] = normalizeAxis(axisY);
+      axisValues[2] = 0;
+      axisValues[3] = 0;
+      timestamp = Math.max(0, Number(nextTimestamp) || 0);
+      if (connected === nextConnected) return;
+      connected = nextConnected;
+      const type = connected ? "gamepadconnected" : "gamepaddisconnected";
+      queueMicrotask(() => dispatchEvent(new GamepadEvent(type, { gamepad })));
+    };
+  }
   navigator.clipboard = {
     writeText(value) {
       try {

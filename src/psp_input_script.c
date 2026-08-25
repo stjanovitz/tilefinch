@@ -50,6 +50,10 @@ const char *psp_input_script_action_name(PspUiAction action)
         case PSP_UI_ACTION_VOICE_FOCUSED_TEXT: return "voice-focused-text";
         case PSP_UI_ACTION_HOME: return "home";
         case PSP_UI_ACTION_SAVE_FOR_LATER: return "save-for-later";
+        case PSP_UI_ACTION_INSTALL_OFFLINE_APP: return "install-offline-app";
+        case PSP_UI_ACTION_CONFIRM_OFFLINE_APP:
+            return "confirm-offline-app";
+        case PSP_UI_ACTION_CANCEL_OFFLINE_APP: return "cancel-offline-app";
         case PSP_UI_ACTION_SHOW_OFFLINE: return "show-offline";
         case PSP_UI_ACTION_SHOW_DOWNLOADS: return "show-downloads";
         case PSP_UI_ACTION_SHOW_SCREENSHOTS: return "show-screenshots";
@@ -125,6 +129,9 @@ const char *psp_input_script_setting_name(PspUiSettingId setting)
         case PSP_UI_SETTING_GLYPH_LANGUAGE: return "glyph-language";
         case PSP_UI_SETTING_COLOR_EMOJI: return "color-emoji";
         case PSP_UI_SETTING_YOUTUBE_QUALITY: return "youtube-quality";
+        case PSP_UI_SETTING_VIDEO_LANGUAGE: return "video-language";
+        case PSP_UI_SETTING_SUBTITLE_LANGUAGE: return "subtitle-language";
+        case PSP_UI_SETTING_ALTERNATE_LANGUAGE: return "alternate-language";
         case PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS:
             return "youtube-compact-results";
         case PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY:
@@ -155,6 +162,8 @@ const char *psp_input_script_setting_name(PspUiSettingId setting)
             return "tls-session-persistence";
         case PSP_UI_SETTING_NETWORK_PROFILE: return "network-profile";
         case PSP_UI_SETTING_UPDATE_CHANNEL: return "update-channel";
+        case PSP_UI_SETTING_GAMEPAD_FACE_MAPPING:
+            return "gamepad-face-mapping";
     }
     return "unknown";
 }
@@ -167,6 +176,8 @@ const char *psp_input_script_screen_name(PspUiScreen screen)
         case PSP_UI_SCREEN_PAGE_TOOLS: return "page-tools";
         case PSP_UI_SCREEN_SITE_CONTROLS: return "site-controls";
         case PSP_UI_SCREEN_PAGE_INFORMATION: return "page-information";
+        case PSP_UI_SCREEN_OFFLINE_APP_PREVIEW:
+            return "offline-app-preview";
         case PSP_UI_SCREEN_FAILURE_RECOVERY: return "failure-recovery";
         case PSP_UI_SCREEN_HELP: return "help";
         case PSP_UI_SCREEN_HELP_DETAIL: return "help-detail";
@@ -174,6 +185,8 @@ const char *psp_input_script_screen_name(PspUiScreen screen)
         case PSP_UI_SCREEN_OPTION_ITEMS: return "option-items";
         case PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS: return "experimental";
         case PSP_UI_SCREEN_GLYPH_OPTIONS: return "glyph-options";
+        case PSP_UI_SCREEN_VIDEO_LANGUAGE_OPTIONS:
+            return "video-language-options";
         case PSP_UI_SCREEN_UPDATE: return "update";
         case PSP_UI_SCREEN_UPDATE_VERSIONS: return "update-versions";
         case PSP_UI_SCREEN_DATA_OPTIONS: return "data-options";

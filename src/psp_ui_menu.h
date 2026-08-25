@@ -17,7 +17,7 @@
 #define UI_MENU_ROW_SETTINGS 4u
 #define UI_MENU_ROW_HELP 5u
 #define UI_MENU_ROW_EXIT 6u
-#define UI_PAGE_TOOLS_ITEM_COUNT 6u
+#define UI_PAGE_TOOLS_ITEM_COUNT 7u
 #define UI_SITE_CONTROLS_ITEM_COUNT 6u
 #define UI_HELP_ITEM_COUNT 6u
 #define UI_SETTINGS_GROUP_COUNT 7u
@@ -31,6 +31,7 @@ static inline bool psp_ui_menu_owns_screen(PspUiScreen screen)
         case PSP_UI_SCREEN_PAGE_TOOLS:
         case PSP_UI_SCREEN_SITE_CONTROLS:
         case PSP_UI_SCREEN_PAGE_INFORMATION:
+        case PSP_UI_SCREEN_OFFLINE_APP_PREVIEW:
         case PSP_UI_SCREEN_FAILURE_RECOVERY:
         case PSP_UI_SCREEN_HELP:
         case PSP_UI_SCREEN_HELP_DETAIL:

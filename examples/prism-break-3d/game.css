@@ -1,0 +1,134 @@
+:root {
+  color-scheme: dark;
+  font-family: sans-serif;
+  background: #02050d;
+  color: #f4f8ff;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: #02050d;
+}
+
+#game-shell {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 180px;
+  overflow: hidden;
+  background: radial-gradient(circle at 50% 38%, #142954 0%, #071229 45%, #02050d 100%);
+}
+
+#game {
+  display: block;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
+  background: #02050d;
+}
+
+#hud {
+  position: absolute;
+  top: 5px;
+  left: 7px;
+  right: 7px;
+  display: flex;
+  justify-content: space-between;
+  color: #dff7ff;
+  font-size: 11px;
+  font-weight: bold;
+  letter-spacing: 1px;
+  text-shadow: 0 1px 2px #000;
+  pointer-events: none;
+}
+
+#power {
+  position: absolute;
+  left: 7px;
+  bottom: 6px;
+  min-width: 1px;
+  color: #82ffdc;
+  font-size: 10px;
+  font-weight: bold;
+  text-shadow: 0 1px 2px #000;
+  pointer-events: none;
+}
+
+#panel {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: min(276px, 86%);
+  padding: 13px 14px 11px;
+  transform: translate(-50%, -50%);
+  border: 1px solid #63d9ff;
+  border-radius: 11px;
+  background: rgba(3, 12, 31, .92);
+  box-shadow: 0 0 18px rgba(47, 183, 255, .35);
+  text-align: center;
+}
+
+#panel[hidden] { display: none; }
+
+h1 {
+  margin: 0 0 7px;
+  color: #ffffff;
+  font-size: 22px;
+  letter-spacing: 2px;
+}
+
+#message {
+  margin: 0 0 9px;
+  color: #b8d6ee;
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+#play {
+  min-width: 112px;
+  min-height: 30px;
+  padding: 5px 16px;
+  border: 1px solid #bffaff;
+  border-radius: 7px;
+  background: linear-gradient(#34d7e8, #1685d5);
+  color: #02101d;
+  font: bold 13px sans-serif;
+}
+
+#play:focus { outline: 2px solid #ffffff; outline-offset: 2px; }
+
+.controls {
+  margin: 9px 0 0;
+  color: #83a7c5;
+  font-size: 9px;
+  line-height: 1.35;
+}
+
+#toast {
+  position: absolute;
+  left: 50%;
+  top: 42px;
+  min-width: 1px;
+  padding: 4px 9px;
+  transform: translateX(-50%);
+  border-radius: 9px;
+  background: rgba(0, 0, 0, .72);
+  color: #fff7a8;
+  font-size: 10px;
+  font-weight: bold;
+  opacity: 0;
+  pointer-events: none;
+}
+
+#toast.visible { opacity: 1; }
+
+@media (max-height: 210px) {
+  #panel { padding: 8px 12px; }
+  h1 { font-size: 18px; }
+  .controls { margin-top: 6px; }
+}

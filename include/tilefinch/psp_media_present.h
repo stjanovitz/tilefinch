@@ -301,6 +301,15 @@ bool psp_media_present_ge_complete(PspMediaPresentGeCost *cost);
  */
 bool psp_media_present_ge_drawing(void);
 
+/* Idempotently ensure the one process-wide GU initialization used by bounded
+   page graphics and media presentation.  Despite the historical "acquire"
+   name, this is not a refcounted lock and has no matching release operation.
+   `idle` only reports whether submitted GE work remains pending.  Page WebGL
+   and media presentation are route-exclusive and share this initializer
+   rather than independently calling sceGuInit(). */
+bool psp_media_present_ge_context_acquire(void);
+bool psp_media_present_ge_context_idle(void);
+
 /*
  * Push a staged texture out of the CPU's cache. The engine reads physical
  * memory and snoops nothing, so a staged buffer the CPU has just written

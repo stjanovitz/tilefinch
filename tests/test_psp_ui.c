@@ -164,6 +164,42 @@ static bool test_input_mapping_and_menu(void)
     ui.menu_selection = 2;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     (void) psp_ui_update(&ui, &input);
+    ui.menu_selection = 6;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_INSTALL_OFFLINE_APP);
+
+    PspUiOfflineAppPreview app_preview = {
+        .estimated_bytes = 180u * 1024u,
+        .theme_color = UINT32_C(0x123456),
+        .captured_resources = 7,
+        .unavailable_resources = 2,
+        .theme_alpha = 255,
+        .display_mode = 2,
+        .operation = 1,
+        .theme_color_valid = true
+    };
+    snprintf(app_preview.name, sizeof(app_preview.name), "Pocket game");
+    psp_ui_show_offline_app_preview(&ui, &app_preview);
+    CHECK(ui.screen == PSP_UI_SCREEN_OFFLINE_APP_PREVIEW
+          && ui.offline_app_preview == &app_preview);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_CONFIRM_OFFLINE_APP
+          && ui.screen == PSP_UI_SCREEN_PAGE);
+    psp_ui_show_offline_app_preview(&ui, &app_preview);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_CANCEL_OFFLINE_APP
+          && ui.screen == PSP_UI_SCREEN_PAGE_TOOLS);
+
+    input.pressed = PSP_UI_BUTTON_MENU;
+    (void) psp_ui_update(&ui, &input);
+    input.pressed = PSP_UI_BUTTON_MENU;
+    (void) psp_ui_update(&ui, &input);
+    ui.menu_selection = 2;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    (void) psp_ui_update(&ui, &input);
     ui.menu_selection = 2;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
@@ -274,6 +310,18 @@ static bool test_input_mapping_and_menu(void)
     CHECK(ui.reader_auto_mode
           && intent.setting.id == PSP_UI_SETTING_READER_AUTO_MODE
           && intent.setting.value.boolean);
+    ui.options_selection = 39;
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.gamepad_circle_primary
+          && intent.setting.id == PSP_UI_SETTING_GAMEPAD_FACE_MAPPING
+          && intent.setting.value.gamepad_face_mapping
+                 == TILEFINCH_GAMEPAD_FACE_O_PRIMARY);
+    input.pressed = PSP_UI_BUTTON_LEFT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(!ui.gamepad_circle_primary
+          && intent.setting.value.gamepad_face_mapping
+                 == TILEFINCH_GAMEPAD_FACE_X_PRIMARY);
     input.pressed = PSP_UI_BUTTON_CANCEL;
     (void) psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_OPTIONS
@@ -589,6 +637,68 @@ static bool test_input_mapping_and_menu(void)
           && intent.setting.id
                  == PSP_UI_SETTING_RESUME_OFFLINE_DOWNLOADS
           && intent.setting.value.boolean);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    intent = psp_ui_update(&ui, &input);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_VIDEO_LANGUAGE_OPTIONS
+          && ui.data_options_selection == 0u);
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.video_language == BROWSER_VIDEO_LANGUAGE_ORIGINAL
+          && intent.setting.id == PSP_UI_SETTING_VIDEO_LANGUAGE
+          && intent.setting.value.video_language
+                 == BROWSER_VIDEO_LANGUAGE_ORIGINAL);
+    for (unsigned expected = BROWSER_VIDEO_LANGUAGE_ENGLISH;
+         expected < BROWSER_VIDEO_LANGUAGE_COUNT; expected++) {
+        input.pressed = PSP_UI_BUTTON_RIGHT;
+        intent = psp_ui_update(&ui, &input);
+        CHECK(ui.video_language == expected
+              && intent.setting.id == PSP_UI_SETTING_VIDEO_LANGUAGE);
+    }
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    (void) psp_ui_update(&ui, &input);
+    CHECK(ui.video_language == BROWSER_VIDEO_LANGUAGE_SYSTEM);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    (void) psp_ui_update(&ui, &input);
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.subtitle_language == BROWSER_SUBTITLE_LANGUAGE_SAME_AS_AUDIO
+          && intent.setting.id == PSP_UI_SETTING_SUBTITLE_LANGUAGE
+          && intent.setting.value.subtitle_language
+                 == BROWSER_SUBTITLE_LANGUAGE_SAME_AS_AUDIO);
+    for (unsigned expected = BROWSER_SUBTITLE_LANGUAGE_ENGLISH;
+         expected < BROWSER_SUBTITLE_LANGUAGE_COUNT; expected++) {
+        input.pressed = PSP_UI_BUTTON_RIGHT;
+        intent = psp_ui_update(&ui, &input);
+        CHECK(ui.subtitle_language == expected
+              && intent.setting.id == PSP_UI_SETTING_SUBTITLE_LANGUAGE);
+    }
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    (void) psp_ui_update(&ui, &input);
+    CHECK(ui.subtitle_language == BROWSER_SUBTITLE_LANGUAGE_SYSTEM);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    (void) psp_ui_update(&ui, &input);
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.alternate_language == BROWSER_ALTERNATE_LANGUAGE_ENGLISH
+          && intent.setting.id == PSP_UI_SETTING_ALTERNATE_LANGUAGE
+          && intent.setting.value.alternate_language
+                 == BROWSER_ALTERNATE_LANGUAGE_ENGLISH);
+    for (unsigned expected = BROWSER_ALTERNATE_LANGUAGE_SPANISH;
+         expected < BROWSER_ALTERNATE_LANGUAGE_COUNT; expected++) {
+        input.pressed = PSP_UI_BUTTON_RIGHT;
+        intent = psp_ui_update(&ui, &input);
+        CHECK(ui.alternate_language == expected
+              && intent.setting.id == PSP_UI_SETTING_ALTERNATE_LANGUAGE);
+    }
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    (void) psp_ui_update(&ui, &input);
+    CHECK(ui.alternate_language == BROWSER_ALTERNATE_LANGUAGE_NONE);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS
+          && intent.setting.id == PSP_UI_SETTING_NONE);
     /*
      * Video scaling is the last Appearance row. It defaults to Smooth -- the
      * graphics chip's bilinear -- and a press asks for Sharp, which is the
@@ -1618,6 +1728,7 @@ static bool test_panels_draw_the_token_ground(void)
         PSP_UI_SCREEN_OPTIONS,
         PSP_UI_SCREEN_OPTION_ITEMS, PSP_UI_SCREEN_DATA_OPTIONS,
         PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS, PSP_UI_SCREEN_GLYPH_OPTIONS,
+        PSP_UI_SCREEN_VIDEO_LANGUAGE_OPTIONS,
         PSP_UI_SCREEN_TABS,
         PSP_UI_SCREEN_UPDATE, PSP_UI_SCREEN_UPDATE_VERSIONS
     };
@@ -2291,7 +2402,9 @@ static bool test_media_controls_and_composite(void)
     static uint16_t frame[WIDTH * HEIGHT];
     memset(frame, 0, sizeof(frame));
     PspUiMediaState media;
+    PspUiMediaPresentation presentation;
     psp_ui_media_init(&media);
+    psp_ui_media_bind_presentation(&media, &presentation);
     psp_ui_media_set(&media, true, false, false,
                      UINT64_C(5000000), UINT64_C(20000000),
                      "Example video");
@@ -2375,6 +2488,44 @@ static bool test_media_controls_and_composite(void)
     intent = psp_ui_media_update(&media, &input);
     CHECK(intent.action == PSP_UI_MEDIA_ACTION_PLAY_PAUSE
           && !psp_ui_media_intent_has_predispatch_visual(&intent));
+
+    PspUiMediaTrack audio_tracks[2] = {{"Original"}, {"Español"}};
+    PspUiMediaTrack subtitle_tracks[2] = {{"English"}, {"Español"}};
+    psp_ui_media_set_tracks(
+        &media, audio_tracks, 2u, 0, subtitle_tracks, 2u, -1);
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    intent = psp_ui_media_update(&media, &input);
+    CHECK(presentation.track_menu_open
+          && intent.action == PSP_UI_MEDIA_ACTION_NONE);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SELECT_AUDIO_TRACK
+          && intent.track_index == 1u && !presentation.track_menu_open);
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    intent = psp_ui_media_update(&media, &input);
+    CHECK(!presentation.track_menu_open
+          && presentation.selected_audio_track == 0
+          && intent.action == PSP_UI_MEDIA_ACTION_NONE);
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_PAGE_DOWN;
+    (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    (void) psp_ui_media_update(&media, &input);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_media_update(&media, &input);
+    CHECK(intent.action == PSP_UI_MEDIA_ACTION_SELECT_SUBTITLE_TRACK
+          && intent.track_index == 0u);
+    psp_ui_media_set_subtitle(&media, "A bounded subtitle line");
+    memset(frame, 0, sizeof(frame));
+    psp_ui_media_composite(&media, frame, WIDTH, HEIGHT, WIDTH);
+    CHECK(frame[(HEIGHT - 110) * WIDTH + WIDTH / 2] != 0);
 
     /* The same rule applies in the other direction. The UI update only makes
        controls visible; Playing becomes Paused when the session consumes the
@@ -2774,7 +2925,9 @@ static bool test_media_title_uses_unicode_fallback_font(void)
         &fonts, &budget, TILEFINCH_TEST_SANS_FONT, NULL, NULL, NULL, NULL,
         NULL, NULL, 1024u * 1024u));
     PspUiMediaState media;
+    PspUiMediaPresentation presentation;
     psp_ui_media_init(&media);
+    psp_ui_media_bind_presentation(&media, &presentation);
     psp_ui_media_set(
         &media, true, false, false, 0, UINT64_C(20000000),
         "Fixture artist (\xed\x85\x8c\xec\x8a\xa4\xed\x8a\xb8)");

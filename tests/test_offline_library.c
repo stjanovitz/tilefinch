@@ -29,10 +29,17 @@ int main(void)
     budget_install_lexbor(&budget);
     PocDocument document = {0};
     static const char page[] =
-        "<!doctype html><title>A &amp; B</title><nav>Do not save me</nav>"
+        "<!doctype html><title>A &amp; B</title>"
+        "<link rel=manifest href=/app.webmanifest>"
+        "<nav>Do not save me</nav>"
         "<main><h1>Heading</h1><aside>Also do not save me</aside>"
         "<p>One &amp; two.</p><script>hidden()</script><p>Three.</p></main>";
     CHECK(document_parse(&document, &budget, page, sizeof(page) - 1u, 4096));
+    size_t manifest_href_length = 0;
+    const char *manifest_href = document_web_app_manifest_href(
+        &document, &manifest_href_length);
+    CHECK(manifest_href != NULL && manifest_href_length == 16u
+          && memcmp(manifest_href, "/app.webmanifest", 16u) == 0);
 
     OfflineLibrary library;
     offline_library_init(&library, &budget, directory);
@@ -226,6 +233,121 @@ int main(void)
     CHECK(offline_library_remove(&loaded, article_id)
           && loaded.count == 1
           && offline_library_find(&loaded, article_id) == NULL);
+
+    static const char manifest_json[] =
+        "{\"name\":\"Tiny Game\",\"short_name\":\"Tiny\","
+        "\"start_url\":\"./play\",\"scope\":\"/\","
+        "\"theme_color\":\"#123456\",\"display\":\"standalone\","
+        "\"icons\":[{\"src\":\"icon.png\",\"sizes\":\"64x64\","
+        "\"type\":\"image/png\"}]}";
+    TilefinchWebAppManifest manifest = {0};
+    CHECK(tilefinch_web_app_manifest_parse(
+              manifest_json, sizeof(manifest_json) - 1u,
+              "https://example.test/app.webmanifest",
+              "https://example.test/game", &manifest,
+              error, sizeof(error))
+          && strcmp(manifest.short_name, "Tiny") == 0
+          && strcmp(manifest.start_url, "https://example.test/play") == 0
+          && manifest.theme_color_valid
+          && manifest.theme_color == UINT32_C(0x123456)
+          && manifest.theme_alpha == 255u
+          && manifest.display_mode == TILEFINCH_WEB_APP_DISPLAY_STANDALONE
+          && strcmp(tilefinch_web_app_display_mode_name(
+                        manifest.display_mode), "Standalone") == 0
+          && strcmp(manifest.icon_url,
+                    "https://example.test/icon.png") == 0);
+    CHECK(!tilefinch_web_app_manifest_parse(
+              manifest_json, sizeof(manifest_json) - 1u,
+              "https://other.test/app.webmanifest",
+              "https://example.test/game", &manifest,
+              error, sizeof(error)));
+    TilefinchWebAppManifest empty_manifest = {0};
+    CHECK(tilefinch_web_app_manifest_parse(
+              "{}", 2u, "https://example.test/app.webmanifest",
+              "https://example.test/game", &empty_manifest,
+              error, sizeof(error))
+          && empty_manifest.name[0] == '\0'
+          && empty_manifest.start_url[0] == '\0'
+          && empty_manifest.display_mode
+                 == TILEFINCH_WEB_APP_DISPLAY_BROWSER);
+    BrowserSession app_session;
+    CHECK(browser_session_init(&app_session, &budget, 2u * 1024u * 1024u));
+    static const unsigned char css[] = "canvas{width:100%}";
+    CHECK(browser_session_cache_put_http(
+        &app_session, "https://example.test/game.css", css,
+        sizeof(css) - 1u, "", "", "text/css",
+        "public,max-age=3600", "", 1u));
+    static const unsigned char icon[OFFLINE_LIBRARY_APP_ICON_LIMIT] = {
+        0x20, 0x40, 0x80, 0xff
+    };
+    OfflineWebAppPreview app_preview = {0};
+    CHECK(offline_library_preview_web_app(
+              &loaded, &document, &app_session,
+              "https://example.test/game", &manifest,
+              icon, sizeof(icon), &app_preview, error, sizeof(error))
+          && app_preview.operation == OFFLINE_WEB_APP_INSTALL
+          && app_preview.resource_count == 1u
+          && app_preview.estimated_bytes > sizeof(css));
+    uint32_t app_id = 0;
+    CHECK(offline_library_save_web_app(
+              &loaded, &document, &app_session,
+              "https://example.test/game", &manifest,
+              icon, sizeof(icon), &app_id, error, sizeof(error))
+          && app_id != 0
+          && offline_library_find(&loaded, app_id)->type
+                 == OFFLINE_ITEM_WEB_APP
+          && offline_library_find(&loaded, app_id)->app_theme_color_valid
+          && offline_library_find(&loaded, app_id)->app_theme_color
+                 == UINT32_C(0x123456)
+          && offline_library_find(&loaded, app_id)->app_display_mode
+                 == TILEFINCH_WEB_APP_DISPLAY_STANDALONE);
+    CHECK(offline_library_preview_web_app(
+              &loaded, &document, &app_session,
+              "https://example.test/game", &manifest,
+              icon, sizeof(icon), &app_preview, error, sizeof(error))
+          && app_preview.operation == OFFLINE_WEB_APP_REINSTALL);
+    TilefinchWebAppManifest changed_manifest = manifest;
+    changed_manifest.theme_color = UINT32_C(0x654321);
+    CHECK(offline_library_preview_web_app(
+              &loaded, &document, &app_session,
+              "https://example.test/game", &changed_manifest,
+              icon, sizeof(icon), &app_preview, error, sizeof(error))
+          && app_preview.operation == OFFLINE_WEB_APP_UPDATE);
+    OfflineLibrary reloaded;
+    offline_library_init(&reloaded, &budget, directory);
+    CHECK(offline_library_load(&reloaded));
+    const OfflineLibraryItem *reloaded_app = offline_library_find(
+        &reloaded, app_id);
+    CHECK(reloaded_app != NULL
+          && reloaded_app->app_theme_color == UINT32_C(0x123456)
+          && reloaded_app->app_theme_alpha == 255u
+          && reloaded_app->app_display_mode
+                 == TILEFINCH_WEB_APP_DISPLAY_STANDALONE);
+    unsigned char restored_icon[OFFLINE_LIBRARY_APP_ICON_LIMIT];
+    CHECK(offline_library_read_web_app_icon(
+              &loaded, app_id, restored_icon)
+          && memcmp(restored_icon, icon, sizeof(icon)) == 0);
+    browser_session_cache_clear(&app_session);
+    html = NULL;
+    html_length = 0;
+    CHECK(offline_library_read_web_app(
+              &loaded, &budget, &app_session, app_id,
+              &html, &html_length, error, sizeof(error))
+          && strstr(html, "Heading") != NULL);
+    const BrowserCacheEntry *restored = NULL;
+    CHECK(browser_session_cache_match_http(
+              &app_session, "https://example.test/game.css",
+              UINT64_C(2), &restored) == BROWSER_CACHE_FRESH
+          && restored != NULL && restored->length == sizeof(css) - 1u);
+    budget_free(&budget, html);
+    browser_session_destroy(&app_session);
+    listing = NULL;
+    CHECK(offline_library_build_page(
+              &loaded, &budget, &listing, &listing_length)
+          && strstr(listing, "Offline web app") != NULL
+          && strstr(listing, "/offline/app?id=") != NULL);
+    budget_free(&budget, listing);
+    CHECK(offline_library_remove(&loaded, app_id));
 
     char index[200], video[200], audio[200];
     snprintf(index, sizeof(index), "%s/library.bin", directory);

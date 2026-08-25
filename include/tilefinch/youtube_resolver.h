@@ -13,6 +13,33 @@
 #define YOUTUBE_MEDIA_URL_CAPACITY 4096
 #define YOUTUBE_MIME_CAPACITY 160
 #define YOUTUBE_CLIENT_NAME_CAPACITY 32
+#define YOUTUBE_TRACK_LIMIT 6u
+#define YOUTUBE_TRACK_LANGUAGE_CAPACITY 16
+#define YOUTUBE_TRACK_ID_CAPACITY 32
+#define YOUTUBE_TRACK_LABEL_CAPACITY 48
+#define YOUTUBE_CAPTION_URL_CAPACITY 1024
+
+typedef struct {
+    char language[YOUTUBE_TRACK_LANGUAGE_CAPACITY];
+    char id[YOUTUBE_TRACK_ID_CAPACITY];
+    char label[YOUTUBE_TRACK_LABEL_CAPACITY];
+    bool authored_default;
+    bool automatic;
+} YoutubeTrack;
+
+/* A per-open selection. Empty IDs mean language/default selection; an empty
+   caption ID keeps subtitles off. Caption language affects catalog ranking
+   only. `prefer_original_audio` ignores audio_language for track selection;
+   caption_same_as_audio resolves against the audio track actually selected. */
+typedef struct {
+    char audio_language[YOUTUBE_TRACK_LANGUAGE_CAPACITY];
+    char caption_language[YOUTUBE_TRACK_LANGUAGE_CAPACITY];
+    char alternate_language[YOUTUBE_TRACK_LANGUAGE_CAPACITY];
+    char audio_track_id[YOUTUBE_TRACK_ID_CAPACITY];
+    char caption_track_id[YOUTUBE_TRACK_ID_CAPACITY];
+    bool prefer_original_audio;
+    bool caption_same_as_audio;
+} YoutubeTrackPreferences;
 
 typedef enum {
     YOUTUBE_PLAYABILITY_UNKNOWN = 0,
@@ -51,6 +78,13 @@ typedef struct {
     unsigned client_attempts;
     bool live_hls;
     char client_name[YOUTUBE_CLIENT_NAME_CAPACITY];
+    YoutubeTrack audio_tracks[YOUTUBE_TRACK_LIMIT];
+    YoutubeTrack caption_tracks[YOUTUBE_TRACK_LIMIT];
+    uint8_t audio_track_count;
+    uint8_t caption_track_count;
+    int8_t selected_audio_track;
+    int8_t selected_caption_track;
+    char caption_url[YOUTUBE_CAPTION_URL_CAPACITY];
 } YoutubeStream;
 
 const char *youtube_playability_name(YoutubePlayability playability);
@@ -82,6 +116,7 @@ bool youtube_watch_url_video_id(
 /* Revalidate both the resolver result and FFmpeg's effective redirect URL.
    Only HTTPS/443 googlevideo.com hosts (or their subdomains) are admitted. */
 bool youtube_media_url_supported(const char *url);
+bool youtube_caption_url_supported(const char *url);
 
 /*
  * Resolves an ordinary YouTube watch URL through the same bounded fetch and
@@ -145,6 +180,9 @@ YoutubeResolveJob *youtube_resolve_job_begin_bounded(
     int maximum_height, long timeout_ms,
     const YoutubeResolveJobLimits *limits,
     YoutubeResolverCancelCallback cancel, void *cancel_opaque);
+/* Must be called before the first pump. The job copies the bounded values. */
+bool youtube_resolve_job_set_track_preferences(
+    YoutubeResolveJob *job, const YoutubeTrackPreferences *preferences);
 YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job);
 bool youtube_resolve_job_take(
     YoutubeResolveJob *job, YoutubeStream *stream);
@@ -156,6 +194,9 @@ bool youtube_resolve_job_metrics(
 bool youtube_resolve_job_matches(
     const YoutubeResolveJob *job, const char *watch_url,
     int maximum_height);
+bool youtube_resolve_job_matches_track_preferences(
+    const YoutubeResolveJob *job,
+    const YoutubeTrackPreferences *preferences);
 void youtube_resolve_job_cancel(YoutubeResolveJob *job, const char *reason);
 void youtube_resolve_job_destroy(YoutubeResolveJob *job);
 
@@ -168,6 +209,12 @@ void youtube_resolve_job_destroy(YoutubeResolveJob *job);
 bool youtube_resolve_progressive_mp4_cancelable(
     Budget *budget, BrowserSession *session, const char *watch_url,
     int maximum_height, long timeout_ms,
+    YoutubeResolverCancelCallback cancel, void *cancel_opaque,
+    YoutubeStream *stream, char *error, size_t error_size);
+bool youtube_resolve_progressive_mp4_cancelable_with_preferences(
+    Budget *budget, BrowserSession *session, const char *watch_url,
+    int maximum_height, long timeout_ms,
+    const YoutubeTrackPreferences *preferences,
     YoutubeResolverCancelCallback cancel, void *cancel_opaque,
     YoutubeStream *stream, char *error, size_t error_size);
 
@@ -187,6 +234,10 @@ bool youtube_parse_player_response(
 bool youtube_parse_player_response_diagnostic(
     const char *json, size_t length, const char *video_id,
     int maximum_height, YoutubePlayability *playability,
+    YoutubeStream *stream, char *error, size_t error_size);
+bool youtube_parse_player_response_with_preferences(
+    const char *json, size_t length, const char *video_id,
+    int maximum_height, const YoutubeTrackPreferences *preferences,
     YoutubeStream *stream, char *error, size_t error_size);
 
 #endif

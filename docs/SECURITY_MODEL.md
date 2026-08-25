@@ -149,6 +149,16 @@ taints the destination canvas until its dimensions reset the backing surface.
 Creating a pattern from such an image is conservatively treated the same way.
 `getImageData()`, `toDataURL()`, and `toBlob()` then throw `SecurityError`, so
 credentialed no-CORS image pixels cannot become a cross-origin read channel.
+The PSP GE texture cache is additionally keyed by a native process-issued
+realm epoch and canvas handle. A fresh realm cannot reuse EDRAM pixels merely
+by repeating page-controlled texture identifiers, generations, or dimensions;
+entering the aliased video EDRAM layout invalidates the cache as well.
+
+Page fullscreen and game-audio resume are admitted only while the native input
+dispatcher is executing a trusted top-level activation. JavaScript cannot
+manufacture that transient fact, and navigation, suspend, native-media entry,
+or node retirement returns the affected native presentation resource to the
+browser.
 
 ## Captive-portal sign-in
 
@@ -529,6 +539,12 @@ available even when global site-data admission is disabled.
 Offline Reader snapshots cross a separate persistence boundary: only escaped
 body text, a bounded title, and the source URL are serialized. Live DOM
 objects, scripts, forms, cookies, and event state never enter the snapshot.
+Explicit offline web-app installs use a different bounded format: the current
+DOM serialization and up to 32 already-loaded same-origin response bodies are
+stored with their resource grants or module provenance. On reopen, the page
+keeps its original origin and each response must re-enter the matching typed
+cache; disk storage never converts it into a generic URL-authorized response.
+No cookie jar, local storage, Service Worker, or cross-origin body is included.
 YouTube downloads accept direct media URLs only after the existing provider
 host policy validates them; internal enqueue and management routes are also
 source-page gated by the PSP frontend. The offline index and payloads are

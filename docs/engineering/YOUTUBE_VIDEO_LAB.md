@@ -86,7 +86,8 @@ than fabricating attestation state.
 Only unciphered HTTPS media URLs are admitted. The resolver prefers a
 progressive AVC/AAC MP4 within the configured height, then separate AVC MP4
 and AAC MP4 streams. Active live delivery selects the bounded AVC MPEG-TS HLS
-variant at or below 240p and requires the optional software-decoder component
+variant at or below 240p. Baseline/Main plus AAC-LC uses the standard PSP
+firmware backend; High profile uses the optional software-decoder component
 described in the public build instructions. Live playback begins three
 segments behind the advertised edge for radio-loss tolerance and has no seek
 operation because its zero and duration move with the playlist. The shipping

@@ -183,13 +183,15 @@ free-space helper.
 |---|---|---|---|---|
 | `library.bin` (+`.bak`) | `offline_library.c` | ≤ 32 KB | never (12-item index) | backup rotation; loader tries primary, `.tmp`, then `.bak` |
 | `<id>.article.html` (+`.bak`) | `offline_library.c` | ≤ 1 MB each | user delete; replaced when the same URL is saved again | backup rotation; length + FNV checksum verified on read |
+| `<id>.app.html`, `<id>.app.pack`, `<id>.app.icon` | `offline_library.c` | ≤ 1 MB markup + 1 MiB/32 same-origin responses + 1 KiB icon | user delete or reinstall | each generation has a fresh id; lengths and FNV checksums gate restore, and the index publishes before the prior generation is removed |
 | `<id>.video.mp4`, `<id>.audio.mp4` | `offline_download.c` | ≤ 512 MB per stream | user delete | `.part` renamed into place after exact-length ranged download |
 | `<id>.video.part`, `<id>.audio.part` | `offline_download.c` | ≤ stream size | resumed, or reclaimed by the orphan sweep | append-only; size re-validated against the index on load |
 
 The library holds at most 12 items. Saves are refused up-front with honest
 messages when space is short: articles need `1 MB + 256 KB` free
 ("not enough free Memory Stick space"), video downloads need the remaining
-bytes plus an 8 MB reserve (the item is set to *paused*, not failed). Each
+bytes plus an 8 MB reserve (the item is set to *paused*, not failed), and a
+web-app install needs its measured package plus 256 KiB. Each
 `offline_library_load()` runs a bounded sweep (≤ 128 directory entries) that
 deletes recognized library-named files whose id is not in the index, so parts
 and articles stranded by a power cut between file publication and index
@@ -248,6 +250,7 @@ degrading when a pre-flight fails.
 | Browsing, site data off | ~2 MB (settings, recovery, tab session, all generations) | not enforced; writers fail individually and keep the prior generation |
 | Browsing with disk cache and local storage on | + up to 15 MB per enabled store (3 × 5 MB generations during a save; disk-cache payload further capped at 4 MB) | pre-flight in the exit cleanup (`psp_script_main.c`): one whole new generation per enabled store — the configured cache size (1/2/4 MB) plus 5 MB for local storage — else the save is refused with "MEMORY STICK FULL - SITE DATA NOT SAVED" and the prior generation is kept |
 | Saving an offline article | 1.25 MB (1 MB article + 256 KB reserve) | pre-flight in `offline_library_save_article` |
+| Installing an offline web app | previewed document + typed resource pack + icon + 256 KiB | preview measurement and confirmed pre-flight in `offline_library_preview_web_app` / `offline_library_save_web_app` |
 | Downloading an offline video | remaining stream bytes + 8 MB reserve | pre-flight in `offline_download.c` (pauses, does not fail, the item) |
 | Downloading + staging an update for a release of size *P* | `2 × P + 4 MB` (≤ 68 MB at the 32 MB package ceiling) | pre-flights in `update_client.c` and `update_installer.c` |
 | Taking a screenshot | 1 MB (one ≈ 385 KB capture plus headroom) | pre-flight in `psp_screenshot_destination`; total stored captures are still unbounded |

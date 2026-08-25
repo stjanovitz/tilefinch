@@ -109,9 +109,12 @@ bool script_runtime_dispatch_pointer_node(
         JS_NewInt32(runtime->context, (int32_t) buttons)
     };
     JSValue returned = JS_UNDEFINED;
+    bool trusted_activation = phase == 0u || phase == 2u || phase == 5u;
+    runtime->bridge.user_activation_active = trusted_activation;
     bool ok = runtime_call_captured(
         runtime, runtime->dispatch_activation_handle,
         "__tilefinchDispatchActivationHandle", 7, arguments, &returned);
+    runtime->bridge.user_activation_active = false;
     for (size_t i = 0; i < 7; i++)
         JS_FreeValue(runtime->context, arguments[i]);
     if (ok) runtime->result.last_event_cancelled =
@@ -122,6 +125,98 @@ bool script_runtime_dispatch_pointer_node(
     runtime->result.success = ok;
     js_rt_runtime_update_result(runtime, result);
     return ok;
+}
+
+static bool runtime_clear_page_fullscreen(ScriptRuntime *runtime,
+                                          bool dispatch_event)
+{
+    if (runtime == NULL) return false;
+    bool had_fullscreen = runtime->bridge.fullscreen_node_handle != 0;
+    runtime->bridge.fullscreen_node_handle = 0;
+    if (runtime->bridge.stylesheet != NULL) {
+        ((Stylesheet *) runtime->bridge.stylesheet)->fullscreen_node = NULL;
+    }
+    if (had_fullscreen) runtime->relayout_dirty = true;
+    if (!had_fullscreen || !dispatch_event || runtime->context == NULL
+        || !JS_IsFunction(runtime->context, runtime->fullscreen_host_exit)) {
+        return had_fullscreen;
+    }
+    JSValue returned = JS_Call(runtime->context,
+                               runtime->fullscreen_host_exit,
+                               JS_UNDEFINED, 0, NULL);
+    bool ok = !JS_IsException(returned);
+    if (!ok) {
+        JSValue exception = JS_GetException(runtime->context);
+        JS_FreeValue(runtime->context, exception);
+    }
+    JS_FreeValue(runtime->context, returned);
+    return ok;
+}
+
+bool script_runtime_page_fullscreen_active(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->bridge.fullscreen_node_handle == 0)
+        return false;
+    size_t slot = 0;
+    if (!js_rt_bridge_node_slot_for_handle(
+            &runtime->bridge, runtime->bridge.fullscreen_node_handle, &slot)
+        || !bridge_node_is_connected(runtime->bridge.nodes[slot])) {
+        (void) runtime_clear_page_fullscreen(runtime, true);
+        return false;
+    }
+    return true;
+}
+
+bool script_runtime_exit_page_fullscreen(ScriptRuntime *runtime)
+{
+    if (runtime == NULL) return false;
+    if (runtime->bridge.fullscreen_node_handle == 0) return true;
+    return runtime_clear_page_fullscreen(runtime, true);
+}
+
+bool script_runtime_set_page_visibility(ScriptRuntime *runtime, bool visible)
+{
+    if (runtime == NULL) return false;
+    if (runtime->page_visibility_desired == visible) return true;
+    runtime->page_visibility_desired = visible;
+    uint8_t count = runtime->page_visibility_queue_count;
+    if (count < 2u) {
+        uint8_t at = (uint8_t) (
+            (runtime->page_visibility_queue_head + count) % 2u);
+        runtime->page_visibility_queue[at] = visible;
+        runtime->page_visibility_queue_count++;
+    } else {
+        /* Only suspend -> resume can produce two undrained edges in normal
+           operation. If a platform toggles again, preserve the oldest edge
+           and coalesce the tail to the final observable state. */
+        uint8_t head = runtime->page_visibility_queue_head;
+        if (runtime->page_visibility_queue[head] == visible) {
+            runtime->page_visibility_queue_count = 1u;
+        } else {
+            uint8_t tail = (uint8_t) ((head + 1u) % 2u);
+            runtime->page_visibility_queue[tail] = visible;
+        }
+    }
+    return true;
+}
+
+void script_runtime_suspend_game_audio(ScriptRuntime *runtime)
+{
+    if (runtime == NULL) return;
+    tilefinch_game_audio_suspend(runtime->game_audio);
+    if (runtime->context == NULL || runtime->game_audio == NULL
+        || !JS_IsFunction(runtime->context,
+                          runtime->game_audio_host_suspend)) return;
+    {
+        JSValue returned = JS_Call(
+            runtime->context, runtime->game_audio_host_suspend,
+            JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(returned)) {
+            JSValue exception = JS_GetException(runtime->context);
+            JS_FreeValue(runtime->context, exception);
+        }
+        JS_FreeValue(runtime->context, returned);
+    }
 }
 
 bool script_runtime_dispatch_input_node(ScriptRuntime *runtime,
@@ -401,6 +496,18 @@ void script_runtime_set_images(ScriptRuntime *runtime,
     JSValue global = JS_GetGlobalObject(runtime->context);
     JSValue flush = JS_GetPropertyStr(
         runtime->context, global, "__tilefinchFlushCanvasSurfaces");
+    if (JS_IsFunction(runtime->context, flush)) {
+        JSValue called = JS_Call(
+            runtime->context, flush, JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(called)) {
+            JSValue exception = JS_GetException(runtime->context);
+            JS_FreeValue(runtime->context, exception);
+        }
+        JS_FreeValue(runtime->context, called);
+    }
+    JS_FreeValue(runtime->context, flush);
+    flush = JS_GetPropertyStr(
+        runtime->context, global, "__tilefinchFlushWebGLSurfaces");
     if (JS_IsFunction(runtime->context, flush)) {
         JSValue called = JS_Call(
             runtime->context, flush, JS_UNDEFINED, 0, NULL);

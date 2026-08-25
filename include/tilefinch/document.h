@@ -219,5 +219,9 @@ bool document_referrer_policy(const PocDocument *document,
                               char *output, size_t output_size);
 bool document_mobile_viewport(const PocDocument *document, int device_width,
                               int legacy_width, MobileViewport *viewport);
+/* Returns the first connected manifest link's borrowed href. Callers resolve
+   it against document_base_url before any network or storage operation. */
+const char *document_web_app_manifest_href(
+    const PocDocument *document, size_t *length);
 
 #endif

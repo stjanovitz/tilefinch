@@ -143,6 +143,10 @@ typedef struct {
     size_t end_ordinal;
     bool pending;
     bool ready;
+    /* Keep the source of an in-flight frame explicit across bounded slices.
+       Animation scheduling uses this to finish the current canvas publish
+       before admitting another requestAnimationFrame mutation. */
+    bool canvas_paint;
 } RenderFrameWork;
 
 typedef struct {
@@ -252,6 +256,7 @@ typedef struct {
     uint64_t frame_job_us;
     uint64_t max_frame_job_slice_us;
     uint64_t max_frame_job_unit_us;
+    bool canvas_paint_pending;
     size_t idle_jobs_scheduled;
     size_t idle_jobs_completed;
     size_t idle_jobs_cancelled;
@@ -313,6 +318,7 @@ RenderFrameWorkResult tile_cache_prepare_frame_bounded_cancelable(
     const TilefinchCancellation *cancellation);
 void tile_cache_cancel_frame_work(TileCache *cache);
 bool tile_cache_frame_work_pending(const TileCache *cache);
+bool tile_cache_canvas_frame_work_pending(const TileCache *cache);
 void render_paint_focus_outline(uint16_t *frame, size_t frame_pixels,
                                 int viewport_width, int viewport_height,
                                 int x, int y, int width, int height);

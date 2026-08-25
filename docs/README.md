@@ -30,6 +30,8 @@ Tilefinch's documentation has three layers:
   typography controls, site profiles, and explicit limits.
 - [Bidirectional text](TEXT_BIDI.md): bounded UAX #9 page layout, Arabic-family
   shaping, logical/visual mappings, optional glyph packs, and degradation.
+- [WebGL authoring](WEBGL.md): the PSP-efficient shader, resource, animation,
+  input, and offline-packaging profile for small games and charts.
 - [Offline library](OFFLINE_LIBRARY.md): bounded Reader snapshots and
   resumable YouTube downloads, including storage and trust boundaries.
 - [Memory Stick storage](STORAGE.md): the complete on-stick layout map,

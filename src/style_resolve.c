@@ -1157,6 +1157,7 @@ static ComputedStyle default_style(const Stylesheet *sheet,
         style.display = DISPLAY_INLINE_BLOCK;
     }
     if (NODE_TAG_IS("video") || NODE_TAG_IS("audio")
+        || NODE_TAG_IS("canvas")
         || NODE_TAG_IS("iframe")) {
         /* Both are replaced inline-level elements.  Hiding video in the
            historical UA defaults also hid its poster and made intrinsic
@@ -1202,8 +1203,7 @@ static ComputedStyle default_style(const Stylesheet *sheet,
     if (NODE_TAG_IS("script") || NODE_TAG_IS("style")
         || NODE_TAG_IS("head") || NODE_TAG_IS("meta")
         || NODE_TAG_IS("link") || NODE_TAG_IS("title")
-        || NODE_TAG_IS("source")
-        || NODE_TAG_IS("canvas") || NODE_TAG_IS("noscript")) {
+        || NODE_TAG_IS("source") || NODE_TAG_IS("noscript")) {
         style.display = DISPLAY_NONE;
     }
     /* The HTML UA sheet gives body an 8px margin, not padding.  Keeping the
@@ -2950,6 +2950,35 @@ static ComputedStyle style_apply_node_cascade(
         sheet, parent, node, &subject, &index_plan, PSEUDO_NONE,
         sheet->cascade_starts[CASCADE_USER_IMPORTANT],
         sheet->cascade_ends[CASCADE_USER_IMPORTANT], &style, false);
+    if (sheet->fullscreen_node == node) {
+        /* The PSP has no compositor top layer. Apply the bounded equivalent
+           after the author cascade so a fullscreen request always owns the
+           existing 480x272 page viewport without rewriting author styles. */
+        style.display = DISPLAY_BLOCK;
+        style.hidden = false;
+        style.visibility_hidden = false;
+        style.fixed_position = true;
+        style.relative_position = false;
+        style.sticky_position = false;
+        style.out_of_flow = true;
+        style.has_top = true;
+        style.has_right = true;
+        style.has_bottom = true;
+        style.has_left = true;
+        style.top = style.right = style.bottom = style.left = 0;
+        style.inset_percent_mask = 0;
+        style.margin.top = style.margin.right = 0;
+        style.margin.bottom = style.margin.left = 0;
+        style.has_width = true;
+        style.width_percent = true;
+        style.width = 100;
+        style.has_height = true;
+        style.height_percent = true;
+        style.height = 100;
+        style.has_z_index = true;
+        style.z_index = STYLE_LENGTH_DIRECT_LIMIT;
+        style.opacity = UINT8_MAX;
+    }
     return style;
 }
 

@@ -233,6 +233,8 @@ typedef enum {
     LAZY_BOOTSTRAP_INDEXED_DB,
     LAZY_BOOTSTRAP_MOTION,
     LAZY_BOOTSTRAP_STREAMS,
+    LAZY_BOOTSTRAP_GAME_AUDIO,
+    LAZY_BOOTSTRAP_WEBGL,
     LAZY_BOOTSTRAP_COUNT
 } LazyBootstrapFeature;
 
@@ -258,6 +260,8 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
     {"DOMMatrix", LAZY_BOOTSTRAP_CANVAS, LAZY_BOOTSTRAP_GLOBAL},
     {"DOMMatrixReadOnly", LAZY_BOOTSTRAP_CANVAS, LAZY_BOOTSTRAP_GLOBAL},
     {"ImageData", LAZY_BOOTSTRAP_CANVAS, LAZY_BOOTSTRAP_GLOBAL},
+    {"ImageBitmap", LAZY_BOOTSTRAP_CANVAS, LAZY_BOOTSTRAP_GLOBAL},
+    {"createImageBitmap", LAZY_BOOTSTRAP_CANVAS, LAZY_BOOTSTRAP_GLOBAL},
     {"Path2D", LAZY_BOOTSTRAP_CANVAS, LAZY_BOOTSTRAP_GLOBAL},
     {"getContext", LAZY_BOOTSTRAP_CANVAS,
      LAZY_BOOTSTRAP_CANVAS_PROTOTYPE},
@@ -288,7 +292,16 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
      LAZY_BOOTSTRAP_GLOBAL},
     {"TransformStream", LAZY_BOOTSTRAP_STREAMS, LAZY_BOOTSTRAP_GLOBAL},
     {"TextEncoderStream", LAZY_BOOTSTRAP_STREAMS, LAZY_BOOTSTRAP_GLOBAL},
-    {"TextDecoderStream", LAZY_BOOTSTRAP_STREAMS, LAZY_BOOTSTRAP_GLOBAL}
+    {"TextDecoderStream", LAZY_BOOTSTRAP_STREAMS, LAZY_BOOTSTRAP_GLOBAL},
+    {"AudioContext", LAZY_BOOTSTRAP_GAME_AUDIO, LAZY_BOOTSTRAP_GLOBAL},
+    {"webkitAudioContext", LAZY_BOOTSTRAP_GAME_AUDIO,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"BaseAudioContext", LAZY_BOOTSTRAP_GAME_AUDIO,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"AudioBuffer", LAZY_BOOTSTRAP_GAME_AUDIO, LAZY_BOOTSTRAP_GLOBAL},
+    {"AudioBufferSourceNode", LAZY_BOOTSTRAP_GAME_AUDIO,
+     LAZY_BOOTSTRAP_GLOBAL},
+    {"GainNode", LAZY_BOOTSTRAP_GAME_AUDIO, LAZY_BOOTSTRAP_GLOBAL}
 };
 
 static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
@@ -298,6 +311,8 @@ static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
     case LAZY_BOOTSTRAP_INDEXED_DB: return "IndexedDB";
     case LAZY_BOOTSTRAP_MOTION: return "Motion";
     case LAZY_BOOTSTRAP_STREAMS: return "Streams";
+    case LAZY_BOOTSTRAP_GAME_AUDIO: return "Game audio";
+    case LAZY_BOOTSTRAP_WEBGL: return "WebGL";
     default: return "Platform feature";
     }
 }
@@ -389,6 +404,59 @@ static bool runtime_load_lazy_bootstrap(
             "<browser-streams-lazy>",
             &browser_bootstrap_streams_bytecode, false, trace,
             &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_GAME_AUDIO) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_game_audio,
+                         browser_bootstrap_game_audio_bytecode),
+            "<browser-game-audio-lazy>",
+            &browser_bootstrap_game_audio_bytecode, false, trace,
+            &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_WEBGL) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_webgl,
+                         browser_bootstrap_webgl_bytecode),
+            "<browser-webgl-lazy>", &browser_bootstrap_webgl_bytecode,
+            false, trace, &total_us, &compile_us);
+    }
+    if (evaluated && feature == LAZY_BOOTSTRAP_GAME_AUDIO) {
+        JSValue global = JS_GetGlobalObject(runtime->context);
+        runtime->game_audio_host_suspend = JS_GetPropertyStr(
+            runtime->context, global,
+            "__tilefinchSuspendGameAudioFromHost");
+        runtime->game_audio_host_complete = JS_GetPropertyStr(
+            runtime->context, global,
+            "__tilefinchCompleteGameAudioVoice");
+        JSAtom suspend_atom = JS_NewAtom(
+            runtime->context, "__tilefinchSuspendGameAudioFromHost");
+        JSAtom complete_atom = JS_NewAtom(
+            runtime->context, "__tilefinchCompleteGameAudioVoice");
+        bool functions_ok = JS_IsFunction(
+                runtime->context, runtime->game_audio_host_suspend)
+            && JS_IsFunction(
+                runtime->context, runtime->game_audio_host_complete);
+        bool suspend_deleted = suspend_atom != JS_ATOM_NULL
+            && JS_DeleteProperty(
+                   runtime->context, global, suspend_atom, 0) > 0;
+        bool complete_deleted = complete_atom != JS_ATOM_NULL
+            && JS_DeleteProperty(
+                   runtime->context, global, complete_atom, 0) > 0;
+        bool captured = functions_ok && suspend_deleted && complete_deleted;
+        if (suspend_atom != JS_ATOM_NULL)
+            JS_FreeAtom(runtime->context, suspend_atom);
+        if (complete_atom != JS_ATOM_NULL)
+            JS_FreeAtom(runtime->context, complete_atom);
+        JS_FreeValue(runtime->context, global);
+        if (!captured) {
+            JS_FreeValue(runtime->context,
+                         runtime->game_audio_host_suspend);
+            runtime->game_audio_host_suspend = JS_UNDEFINED;
+            JS_FreeValue(runtime->context,
+                         runtime->game_audio_host_complete);
+            runtime->game_audio_host_complete = JS_UNDEFINED;
+            evaluated = false;
+        }
     }
     *state = evaluated ? 2 : 3;
     if (evaluated) {
@@ -519,6 +587,22 @@ static JSValue js_runtime_ensure_motion_bootstrap(
             bridge->host, LAZY_BOOTSTRAP_MOTION)) {
         return JS_ThrowInternalError(
             context, "Motion support could not be initialized");
+    }
+    return JS_TRUE;
+}
+
+static JSValue js_runtime_ensure_webgl_bootstrap(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || !runtime_load_lazy_bootstrap(
+            bridge->host, LAZY_BOOTSTRAP_WEBGL)) {
+        return JS_ThrowInternalError(
+            context, "WebGL support could not be initialized");
     }
     return JS_TRUE;
 }
@@ -669,6 +753,10 @@ static ScriptRuntime *script_runtime_create_internal(
     host->dom_content_loaded_dispatch = JS_UNDEFINED;
     host->media_state_for = JS_UNDEFINED;
     host->media_update = JS_UNDEFINED;
+    host->page_visibility_host_apply = JS_UNDEFINED;
+    host->fullscreen_host_exit = JS_UNDEFINED;
+    host->game_audio_host_suspend = JS_UNDEFINED;
+    host->game_audio_host_complete = JS_UNDEFINED;
     host->function_to_string = JS_UNDEFINED;
     host->host_global = JS_UNDEFINED;
     for (size_t callback = 0; callback < SCRIPT_HOST_CALLBACK_COUNT;
@@ -676,6 +764,7 @@ static ScriptRuntime *script_runtime_create_internal(
         host->host_callbacks[callback] = JS_UNDEFINED;
     }
     host->bridge.current_script = JS_NULL;
+    host->page_visibility_desired = true;
     host->bridge.trusted_node_wrap = JS_UNDEFINED;
     host->bridge.trusted_stable_script_wrap = JS_UNDEFINED;
     host->bridge.trusted_retire_native_node_state = JS_UNDEFINED;
@@ -903,6 +992,12 @@ static ScriptRuntime *script_runtime_create_internal(
     host->bridge.viewport_width = css_viewport_width;
     host->bridge.viewport_height = css_viewport_height;
     host->bridge.host = host;
+    if (!js_webgl_realm_epoch_advance(&host->bridge)) {
+        snprintf(result->error, sizeof(result->error),
+                 "could not assign WebGL realm identity");
+        script_runtime_destroy(host);
+        return NULL;
+    }
     host->bridge.performance_origin_ns = js_rt_monotonic_time_ns();
     host->bridge.deterministic_entropy = deterministic;
     host->bridge.deterministic_clock = deterministic;
@@ -944,6 +1039,21 @@ static ScriptRuntime *script_runtime_create_internal(
                    0) < 0) {
             if (JS_IsException(ensure_motion)) {
                 JS_FreeValue(host->context, ensure_motion);
+            }
+            setup_ok = false;
+        }
+    }
+    if (setup_ok) {
+        JSValue ensure_webgl = JS_NewCFunction(
+            host->context, js_runtime_ensure_webgl_bootstrap,
+            "__tilefinchEnsureWebGLBootstrap", 0);
+        if (JS_IsException(ensure_webgl)
+            || JS_DefinePropertyValueStr(
+                   host->context, global,
+                   "__tilefinchEnsureWebGLBootstrap", ensure_webgl,
+                   0) < 0) {
+            if (JS_IsException(ensure_webgl)) {
+                JS_FreeValue(host->context, ensure_webgl);
             }
             setup_ok = false;
         }
@@ -1122,6 +1232,27 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchCanvasImageSource",
                                        js_canvas_image_source, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchWebGLRender",
+                                       js_webgl_render, 6)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchWebGLReadPixels",
+                                       js_webgl_read_pixels, 7)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchWebGLSnapshot",
+                                       js_webgl_snapshot, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchWebGLReleaseSurface",
+                                       js_webgl_release_surface, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchSetFullscreen",
+                                       js_dom_set_fullscreen, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchGameAudioDecode",
+                                       js_game_audio_decode, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchGameAudioCommand",
+                                       js_game_audio_command, 11)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchCanvasRasterRect",
                                        js_canvas_raster_rect, 13)
@@ -1495,6 +1626,10 @@ static ScriptRuntime *script_runtime_create_internal(
                 host, LAZY_BOOTSTRAP_STREAMS);
         }
         if (evaluated) {
+            evaluated = runtime_install_lazy_bootstrap_feature(
+                host, LAZY_BOOTSTRAP_GAME_AUDIO);
+        }
+        if (evaluated) {
             evaluated = runtime_evaluate_bootstrap_profiled(
                 host, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
                           browser_bootstrap_compat,
@@ -1580,6 +1715,12 @@ static ScriptRuntime *script_runtime_create_internal(
                 "__tilefinchDispatchDOMContentLoaded");
             host->media_state_for = JS_GetPropertyStr(
                 host->context, global, "__tilefinchMediaStateFor");
+            host->page_visibility_host_apply = JS_GetPropertyStr(
+                host->context, global,
+                "__tilefinchApplyPageVisibility");
+            host->fullscreen_host_exit = JS_GetPropertyStr(
+                host->context, global,
+                "__tilefinchExitFullscreenFromHost");
             host->bridge.trusted_node_wrap = JS_GetPropertyStr(
                 host->context, global, "__tilefinchWrap");
             host->bridge.trusted_stable_script_wrap = JS_GetPropertyStr(
@@ -1608,6 +1749,11 @@ static ScriptRuntime *script_runtime_create_internal(
                             host->dom_content_loaded_dispatch)
                      && JS_IsFunction(host->context,
                                       host->media_state_for)
+                     && JS_IsFunction(
+                            host->context,
+                            host->page_visibility_host_apply)
+                     && JS_IsFunction(host->context,
+                                      host->fullscreen_host_exit)
                      && JS_IsFunction(host->context,
                                       host->bridge.trusted_node_wrap)
                      && JS_IsFunction(
@@ -1633,16 +1779,34 @@ static ScriptRuntime *script_runtime_create_internal(
                 host->context, "__tilefinchRunWorker");
             JSAtom media_state_atom = JS_NewAtom(
                 host->context, "__tilefinchMediaStateFor");
+            JSAtom fullscreen_exit_atom = JS_NewAtom(
+                host->context, "__tilefinchExitFullscreenFromHost");
+            JSAtom visibility_apply_atom = JS_NewAtom(
+                host->context, "__tilefinchApplyPageVisibility");
+            JSAtom visibility_query_atom = JS_NewAtom(
+                host->context, "__tilefinchPageVisible");
             if (run_worker_atom == JS_ATOM_NULL
                 || media_state_atom == JS_ATOM_NULL
+                || fullscreen_exit_atom == JS_ATOM_NULL
+                || visibility_apply_atom == JS_ATOM_NULL
+                || visibility_query_atom == JS_ATOM_NULL
                 || JS_DeleteProperty(
                        host->context, global, run_worker_atom, 0) < 0
                 || JS_DeleteProperty(
-                       host->context, global, media_state_atom, 0) < 0) {
+                       host->context, global, media_state_atom, 0) < 0
+                || JS_DeleteProperty(
+                       host->context, global, fullscreen_exit_atom, 0) < 0
+                || JS_DeleteProperty(
+                       host->context, global, visibility_apply_atom, 0) <= 0
+                || JS_DeleteProperty(
+                       host->context, global, visibility_query_atom, 0) <= 0) {
                 evaluated = false;
             }
             JS_FreeAtom(host->context, run_worker_atom);
             JS_FreeAtom(host->context, media_state_atom);
+            JS_FreeAtom(host->context, fullscreen_exit_atom);
+            JS_FreeAtom(host->context, visibility_apply_atom);
+            JS_FreeAtom(host->context, visibility_query_atom);
         }
         /* Trusted bootstrap may use dynamic compilation to construct bounded
            browser shims. Author code begins only after the native QuickJS

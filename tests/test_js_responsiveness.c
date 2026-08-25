@@ -665,6 +665,59 @@ int main(void)
           && result.nonpreemptible_compile_count == 0
           && result.nonpreemptible_callback_count == 0);
 
+    puts("test: bounded Gamepad API publishes one stable PSP controller");
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.__gamepadEvents=[];const bridge="
+              "Object.getOwnPropertyDescriptor(globalThis,"
+              "'__tilefinchUpdateGamepad');"
+              "addEventListener('gamepadconnected',e=>"
+              "__gamepadEvents.push(e.type+':'+e.gamepad.index));"
+              "addEventListener('gamepaddisconnected',e=>"
+              "__gamepadEvents.push(e.type+':'+e.gamepad.index));"
+              "globalThis.pocSummary=bridge&&!bridge.writable&&"
+              "!bridge.configurable&&navigator.getGamepads()[0]===null?"
+              "'GAMEPAD-HIDDEN':'GAMEPAD-LEAKED'",
+              "<gamepad-install>", &result)
+          && strcmp(result.summary, "GAMEPAD-HIDDEN") == 0);
+    TilefinchGamepadState gamepad = {
+        .buttons = (UINT32_C(1) << TILEFINCH_GAMEPAD_BUTTON_PRIMARY)
+            | (UINT32_C(1) << TILEFINCH_GAMEPAD_BUTTON_DPAD_UP),
+        .axes = {INT16_MAX, -INT16_MAX, 0, 0},
+        .timestamp_ms = 1234,
+        .connected = true
+    };
+    CHECK(script_runtime_set_gamepad_state(runtime, &gamepad)
+          && script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const first=navigator.getGamepads(),p=first[0],"
+              "second=navigator.getGamepads()[0];globalThis.pocSummary="
+              "first.length===1&&p===second&&p.id==='PSP Built-in Controller'"
+              "&&p.mapping==='standard'&&p.buttons.length===17"
+              "&&p.buttons[0].pressed&&p.buttons[12].value===1"
+              "&&!p.buttons[1].pressed&&p.axes.length===4"
+              "&&p.axes[0]===1&&p.axes[1]===-1&&p.timestamp===1234?"
+              "'GAMEPAD-MAPPED':'GAMEPAD-BAD'})()",
+              "<gamepad-connected>", &result)
+          && strcmp(result.summary, "GAMEPAD-MAPPED") == 0
+          && script_runtime_advance(runtime, 0, 8, &result)
+          && script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=__gamepadEvents.join(',')",
+              "<gamepad-connect-event>", &result)
+          && strcmp(result.summary, "gamepadconnected:0") == 0);
+    CHECK(tilefinch_gamepad_state_update(
+              &gamepad, false, 0, 0, 0, 1250)
+          && script_runtime_set_gamepad_state(runtime, &gamepad)
+          && script_runtime_advance(runtime, 0, 8, &result)
+          && script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=navigator.getGamepads()[0]===null&&"
+              "__gamepadEvents.join(',')==='gamepadconnected:0,"
+              "gamepaddisconnected:0'?'GAMEPAD-DISCONNECTED':'GAMEPAD-BAD'",
+              "<gamepad-disconnected>", &result)
+          && strcmp(result.summary, "GAMEPAD-DISCONNECTED") == 0);
+
     puts("test: asynchronous callback entry observes cancellation");
     CHECK(script_runtime_evaluate_diagnostic(
               runtime,
@@ -1161,6 +1214,276 @@ int main(void)
               runtime, image_factory_probe, "<image-factory-probe>", &result)
           && strcmp(result.summary, "IMAGE-FACTORY-OK") == 0);
 
+    puts("test: page visibility pauses visual tasks and preserves edges");
+    static const char visibility_setup[] =
+        "globalThis.__visibilityEdges=[];globalThis.__hiddenRaf=0;"
+        "globalThis.__visibilityHandlerEdges=[];globalThis.__hiddenTimer=0;"
+        "if(typeof __tilefinchPageVisible!=='undefined'||"
+        "typeof __tilefinchApplyPageVisibility!=='undefined')"
+        "throw new Error('visibility host bridge leaked');"
+        "document.onvisibilitychange=()=>__visibilityHandlerEdges.push("
+        "document.visibilityState);document.addEventListener("
+        "'visibilitychange',()=>__visibilityEdges.push("
+        "document.visibilityState));requestAnimationFrame(()=>__hiddenRaf++);"
+        "setTimeout(()=>__hiddenTimer++,0);";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, visibility_setup, "<visibility-setup>", &result)
+          && script_runtime_set_page_visibility(runtime, false)
+          && script_runtime_advance(runtime, 16, 16, &result)
+          && script_runtime_evaluate_diagnostic(
+                 runtime,
+                 "globalThis.pocSummary=document.hidden&&"
+                 "document.visibilityState==='hidden'&&"
+                 "__visibilityEdges.join(',')==='hidden'&&"
+                 "__visibilityHandlerEdges.join(',')==='hidden'&&"
+                 "__hiddenTimer===1&&__hiddenRaf===0"
+                 "?'VISIBILITY-HIDDEN-OK':'VISIBILITY-HIDDEN-FAILED'",
+                 "<visibility-hidden>", &result)
+          && strcmp(result.summary, "VISIBILITY-HIDDEN-OK") == 0);
+    CHECK(script_runtime_set_page_visibility(runtime, true)
+          && script_runtime_advance(runtime, 16, 16, &result)
+          && script_runtime_evaluate_diagnostic(
+                 runtime,
+                 "globalThis.pocSummary=!document.hidden&&"
+                 "document.visibilityState==='visible'&&"
+                 "__visibilityEdges.join(',')==='hidden,visible'&&"
+                 "__visibilityHandlerEdges.join(',')==='hidden,visible'&&"
+                 "__hiddenRaf===1"
+                 "?'VISIBILITY-RESTORED-OK':'VISIBILITY-RESTORE-FAILED'",
+                 "<visibility-restored>", &result)
+          && strcmp(result.summary, "VISIBILITY-RESTORED-OK") == 0);
+    CHECK(script_runtime_set_page_visibility(runtime, false)
+          && script_runtime_set_page_visibility(runtime, true)
+          && script_runtime_advance(runtime, 0, 1, &result)
+          && script_runtime_evaluate_diagnostic(
+                 runtime,
+                 "globalThis.pocSummary=document.hidden&&"
+                 "__visibilityEdges.slice(-1)[0]==='hidden'"
+                 "?'VISIBILITY-QUEUED-HIDDEN-OK':"
+                 "'VISIBILITY-QUEUED-HIDDEN-FAILED'",
+                 "<visibility-queued-hidden>", &result)
+          && strcmp(result.summary, "VISIBILITY-QUEUED-HIDDEN-OK") == 0
+          && script_runtime_advance(runtime, 0, 1, &result)
+          && script_runtime_evaluate_diagnostic(
+                 runtime,
+                 "globalThis.pocSummary=!document.hidden&&"
+                 "__visibilityEdges.slice(-2).join(',')==='hidden,visible'"
+                 "?'VISIBILITY-QUEUED-VISIBLE-OK':"
+                 "'VISIBILITY-QUEUED-VISIBLE-FAILED'",
+                 "<visibility-queued-visible>", &result)
+          && strcmp(result.summary, "VISIBILITY-QUEUED-VISIBLE-OK") == 0);
+
+    puts("test: page fullscreen requires native user activation");
+    static const char fullscreen_setup[] =
+        "(()=>{const target=document.createElement('div');"
+        "target.id='fullscreen-target';document.body.append(target);"
+        "globalThis.__fullscreenChanges=0;"
+        "document.addEventListener('fullscreenchange',()=>"
+        "globalThis.__fullscreenChanges++);"
+        "target.requestFullscreen().then(()=>"
+        "globalThis.pocSummary='FULLSCREEN-DIRECT-BAD',error=>"
+        "globalThis.pocSummary=error.name==='NotAllowedError'"
+        "?'FULLSCREEN-DIRECT-BLOCKED':'FULLSCREEN-DIRECT-WRONG');"
+        "target.addEventListener('click',()=>target.requestFullscreen().then("
+        "()=>globalThis.pocSummary=document.fullscreenElement===target"
+        "?'FULLSCREEN-ENTERED':'FULLSCREEN-ENTER-FAILED'));})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, fullscreen_setup, "<fullscreen-setup>", &result)
+          && strcmp(result.summary, "FULLSCREEN-DIRECT-BLOCKED") == 0);
+    lxb_dom_node_t *fullscreen_target = find_element_id(
+        lxb_dom_interface_node(document.html), "fullscreen-target");
+    CHECK(fullscreen_target != NULL
+          && script_runtime_dispatch_activation_node(
+                 runtime, fullscreen_target, &result)
+          && strcmp(result.summary, "FULLSCREEN-ENTERED") == 0
+          && script_runtime_page_fullscreen_active(runtime));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "document.exitFullscreen().then(()=>globalThis.pocSummary="
+              "document.fullscreenElement===null&&__fullscreenChanges===2"
+              "?'FULLSCREEN-EXITED':'FULLSCREEN-EXIT-FAILED')",
+              "<fullscreen-exit>", &result)
+          && strcmp(result.summary, "FULLSCREEN-EXITED") == 0
+          && !script_runtime_page_fullscreen_active(runtime));
+    /* Entry and exit queue the same bounded render-fixup a real frame would
+       service. Drain it before the later raw timer-cap probe. */
+    CHECK(script_runtime_advance(runtime, 16, 16, &result));
+
+    puts("test: bounded game audio decodes and starts under user activation");
+    static const char game_audio_setup[] =
+        "(()=>{const bytes=new Uint8Array(52),view=new DataView(bytes.buffer),"
+        "text=(at,value)=>{for(let i=0;i<value.length;i++)bytes[at+i]="
+        "value.charCodeAt(i)},u16=(at,value)=>view.setUint16(at,value,true),"
+        "u32=(at,value)=>view.setUint32(at,value,true);text(0,'RIFF');"
+        "u32(4,44);text(8,'WAVE');text(12,'fmt ');u32(16,16);u16(20,1);"
+        "u16(22,1);u32(24,44100);u32(28,88200);u16(32,2);u16(34,16);"
+        "text(36,'data');u32(40,8);view.setInt16(44,1000,true);"
+        "view.setInt16(46,-1000,true);view.setInt16(48,2000,true);"
+        "view.setInt16(50,-2000,true);const context=new AudioContext(),"
+        "target=document.createElement('button');target.id='game-audio-target';"
+        "document.body.append(target);context.resume().then(()=>"
+        "globalThis.pocSummary='GAME-AUDIO-DIRECT-BAD',error=>"
+        "globalThis.pocSummary=error.name==='NotAllowedError'"
+        "?'GAME-AUDIO-DIRECT-BLOCKED':'GAME-AUDIO-DIRECT-WRONG');"
+        "context.decodeAudioData(bytes.buffer).then(buffer=>{"
+        "globalThis.__gameAudioBuffer=buffer;target.addEventListener('click',"
+        "()=>{context.resume().then(()=>{const source=context.createBufferSource();"
+        "source.buffer=buffer;source.connect(context.destination);source.start();"
+        "globalThis.__gameAudioSource=source;globalThis.__gameAudioEnded=[];"
+        "source.addEventListener('ended',()=>__gameAudioEnded.push('listener'));"
+        "source.onended=()=>__gameAudioEnded.push('handler');"
+        "globalThis.pocSummary=context.state==='running'&&buffer.length===4"
+        "?'GAME-AUDIO-STARTED':'GAME-AUDIO-START-FAILED'})})})})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, game_audio_setup, "<game-audio-setup>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-DIRECT-BLOCKED") == 0);
+    lxb_dom_node_t *game_audio_target = find_element_id(
+        lxb_dom_interface_node(document.html), "game-audio-target");
+    CHECK(game_audio_target != NULL
+          && script_runtime_dispatch_activation_node(
+                 runtime, game_audio_target, &result)
+          && strcmp(result.summary, "GAME-AUDIO-STARTED") == 0);
+    int16_t game_audio_samples[8] = {0};
+    CHECK(runtime->game_audio != NULL
+          && tilefinch_game_audio_mix(runtime->game_audio,
+                                      game_audio_samples, 4)
+          && game_audio_samples[0] == 1000
+          && game_audio_samples[2] == -1000);
+    CHECK(script_runtime_advance(runtime, 0, 4, &result)
+          && script_runtime_evaluate_diagnostic(
+                 runtime,
+                 "globalThis.pocSummary=__gameAudioSource._voice===0&&"
+                 "__gameAudioEnded.includes('listener')&&"
+                 "__gameAudioEnded.includes('handler')&&"
+                 "__gameAudioEnded.length===2"
+                 "?'GAME-AUDIO-ENDED-OK':'GAME-AUDIO-ENDED-FAILED'",
+                 "<game-audio-ended>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-ENDED-OK") == 0);
+    puts("test: game audio supports bounded synthesis, panning, and schedules");
+    static const char game_audio_synthesis_probe[] =
+        "(()=>{const context=__gameAudioBuffer._context,gain="
+        "context.createGain(),pan=context.createStereoPanner(),"
+        "osc=context.createOscillator();gain.gain.value=.5;pan.pan.value=1;"
+        "osc.frequency.value=11025;osc.connect(gain).connect(pan).connect("
+        "context.destination);globalThis.__gameOscEnded=0;"
+        "osc.onended=()=>__gameOscEnded++;const now=context.currentTime;"
+        "osc.start(now+.005);osc.stop(now+.008);"
+        "globalThis.pocSummary=osc.type==='sine'&&pan.pan.value===1"
+        "?'GAME-AUDIO-SYNTHESIS-STARTED':"
+        "'GAME-AUDIO-SYNTHESIS-FAILED'})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, game_audio_synthesis_probe,
+              "<game-audio-synthesis>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-SYNTHESIS-STARTED") == 0);
+    int16_t game_audio_synthesis_samples[800];
+    memset(game_audio_synthesis_samples, 0x55,
+           sizeof(game_audio_synthesis_samples));
+    CHECK(tilefinch_game_audio_mix(runtime->game_audio,
+                                  game_audio_synthesis_samples, 400));
+    bool oscillator_silent_before_start = true;
+    bool oscillator_right_channel_played = false;
+    for (size_t frame = 0; frame < 400; frame++) {
+        if (game_audio_synthesis_samples[frame * 2u] != 0)
+            oscillator_silent_before_start = false;
+        if (frame < 180u
+            && game_audio_synthesis_samples[frame * 2u + 1u] != 0)
+            oscillator_silent_before_start = false;
+        if (frame >= 180u
+            && game_audio_synthesis_samples[frame * 2u + 1u] != 0)
+            oscillator_right_channel_played = true;
+    }
+    CHECK(oscillator_silent_before_start && oscillator_right_channel_played);
+    CHECK(script_runtime_advance(runtime, 0, 4, &result)
+          && script_runtime_evaluate_diagnostic(
+                 runtime,
+                 "globalThis.pocSummary=__gameOscEnded===1"
+                 "?'GAME-AUDIO-SYNTHESIS-ENDED':"
+                 "'GAME-AUDIO-SYNTHESIS-END-FAILED'",
+                 "<game-audio-synthesis-ended>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-SYNTHESIS-ENDED") == 0);
+    static const char game_audio_loop_probe[] =
+        "(()=>{const context=__gameAudioBuffer._context,source="
+        "context.createBufferSource(),pan=context.createStereoPanner();"
+        "source.buffer=__gameAudioBuffer;source.loop=true;"
+        "source.loopStart=1/44100;source.loopEnd=3/44100;"
+        "source.connect(pan).connect(context.destination);source.start();"
+        "pan.pan.value=-1;globalThis.__gameLoopSource=source;"
+        "globalThis.pocSummary='GAME-AUDIO-LOOP-STARTED'})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, game_audio_loop_probe,
+              "<game-audio-loop>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-LOOP-STARTED") == 0);
+    int16_t game_audio_loop_samples[12] = {0};
+    CHECK(tilefinch_game_audio_mix(runtime->game_audio,
+                                  game_audio_loop_samples, 6)
+          && game_audio_loop_samples[0] == 1000
+          && game_audio_loop_samples[1] == 0
+          && game_audio_loop_samples[2] == -1000
+          && game_audio_loop_samples[4] == 2000
+          && game_audio_loop_samples[6] == -1000
+          && game_audio_loop_samples[8] == 2000);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "__gameLoopSource.stop();globalThis.pocSummary="
+              "'GAME-AUDIO-LOOP-STOPPED'",
+              "<game-audio-loop-stop>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-LOOP-STOPPED") == 0
+          && script_runtime_advance(runtime, 0, 4, &result));
+    static const char game_audio_bounds_probe[] =
+        "(()=>{const context=__gameAudioBuffer._context,sources=[];"
+        "for(let i=0;i<4;i++){const source=context.createBufferSource();"
+        "source.buffer=__gameAudioBuffer;source.loop=true;"
+        "source.connect(context.destination);source.start();sources.push(source)}"
+        "let bounded=false;try{const extra=context.createBufferSource();"
+        "extra.buffer=__gameAudioBuffer;extra.connect(context.destination);"
+        "extra.start()}catch(error){bounded=error.name==='QuotaExceededError'}"
+        "globalThis.__stoppedAudioEnded=0;for(const source of sources){"
+        "source.onended=()=>__stoppedAudioEnded++;source.stop()}"
+        "let pinned=false;try{const pending=context.createBufferSource();"
+        "pending.buffer=__gameAudioBuffer;pending.connect(context.destination);"
+        "pending.start()}catch(error){pinned=error.name==='QuotaExceededError'}"
+        "globalThis.pocSummary=bounded&&pinned"
+        "?'GAME-AUDIO-BOUNDS-OK':'GAME-AUDIO-BOUNDS-FAILED'})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, game_audio_bounds_probe,
+              "<game-audio-bounds>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-BOUNDS-OK") == 0);
+    CHECK(script_runtime_advance(runtime, 0, 4, &result)
+          && script_runtime_evaluate_diagnostic(
+                 runtime,
+                 "(()=>{let reused=false;try{const source="
+                 "__gameAudioBuffer._context.createBufferSource();"
+                 "source.buffer=__gameAudioBuffer;"
+                 "source.connect(__gameAudioBuffer._context.destination);"
+                 "source.start();source.stop();reused=true}catch(error){}"
+                 "globalThis.pocSummary=__stoppedAudioEnded===4&&reused"
+                 "?'GAME-AUDIO-STOP-ENDED-OK':"
+                 "'GAME-AUDIO-STOP-ENDED-FAILED'})()",
+                 "<game-audio-stop-ended>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-STOP-ENDED-OK") == 0);
+    script_runtime_suspend_game_audio(runtime);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=__gameAudioBuffer._context.state==="
+              "'suspended'?'GAME-AUDIO-HOST-SUSPEND-OK':"
+              "'GAME-AUDIO-HOST-SUSPEND-FAILED'",
+              "<game-audio-host-suspend>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-HOST-SUSPEND-OK") == 0);
+    static const char game_audio_reentrant_close_probe[] =
+        "(()=>{const context=__gameAudioBuffer._context,source="
+        "context.createBufferSource();source.buffer=__gameAudioBuffer;"
+        "source.connect(context.destination);let safe=false;try{source.start(0,"
+        "{valueOf(){context.close();return 0}})}catch(error){safe="
+        "context.state==='closed'}globalThis.pocSummary=safe"
+        "?'GAME-AUDIO-REENTRANT-CLOSE-OK':"
+        "'GAME-AUDIO-REENTRANT-CLOSE-FAILED'})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, game_audio_reentrant_close_probe,
+              "<game-audio-reentrant-close>", &result)
+          && strcmp(result.summary,
+                    "GAME-AUDIO-REENTRANT-CLOSE-OK") == 0
+          && runtime->game_audio == NULL);
+
     static const char responsive_embedding_probe[] =
         "(()=>{const picture=document.createElement('picture'),"
         "source=document.createElement('source'),img=document.createElement('img');"
@@ -1401,6 +1724,35 @@ int main(void)
         "const supplied=new ImageData(new Uint8ClampedArray([1,2,3,4]),1);"
         "context.putImageData(supplied,1,0);const put="
         "context.getImageData(1,0,1,1).data;"
+        "const cloned=context.createImageData(supplied),cloneSized="
+        "cloned.width===1&&cloned.height===1&&cloned!==supplied"
+        "&&cloned.data.every(value=>value===0);"
+        "const dirtyCanvas=document.createElement('canvas');"
+        "dirtyCanvas.width=3;dirtyCanvas.height=1;"
+        "const dirtyContext=dirtyCanvas.getContext('2d'),dirtySource="
+        "new ImageData(new Uint8ClampedArray([255,0,0,255,0,255,0,255,"
+        "0,0,255,255]),3,1);"
+        "dirtyContext.putImageData(dirtySource,0,0,1,0,1,1);"
+        "const dirtyPixels=dirtyContext.getImageData(0,0,3,1).data,"
+        "dirtyPut=dirtyPixels[3]===0&&dirtyPixels[4]===0"
+        "&&dirtyPixels[5]===255&&dirtyPixels[6]===0"
+        "&&dirtyPixels[7]===255&&dirtyPixels[11]===0;"
+        "dirtyContext.clearRect(0,0,3,1);"
+        "dirtyContext.putImageData(dirtySource,0,0,2,0,-2,1);"
+        "const negativeDirty=dirtyContext.getImageData(0,0,3,1).data,"
+        "negativeDirtyPut=negativeDirty[0]===255&&negativeDirty[3]===255"
+        "&&negativeDirty[4]===0&&negativeDirty[5]===255"
+        "&&negativeDirty[7]===255&&negativeDirty[11]===0;"
+        "let dirtyRange=false;try{dirtyContext.putImageData("
+        "dirtySource,Infinity,0)}catch(error){dirtyRange="
+        "error instanceof DOMException&&error.name==='NotSupportedError'}"
+        "dirtyContext.fillStyle='red';dirtyContext.fillRect(0,0,3,1);"
+        "dirtyContext.save();dirtyContext.translate(2,0);"
+        "dirtyContext.lineWidth=7;dirtyContext.reset();"
+        "dirtyContext.restore();const apiReset="
+        "dirtyContext.lineWidth===1&&dirtyContext.fillStyle==='#000000'"
+        "&&dirtyContext.getTransform().e===0"
+        "&&dirtyContext.getImageData(0,0,3,1).data.every(value=>value===0);"
         "const compositeCanvas=document.createElement('canvas');"
         "compositeCanvas.width=1;compositeCanvas.height=1;"
         "const compositeContext=compositeCanvas.getContext('2d');"
@@ -1415,8 +1767,13 @@ int main(void)
         "context.fillStyle==='#000000'&&context.globalAlpha===1"
         "&&context.getImageData(0,0,1,1).data.every(value=>value===0);"
         "canvas.width=513;canvas.height=257;context.fillStyle='#123456';"
-        "context.fillRect(0,0,1,1);const bounded="
-        "context.getImageData(0,0,1,1).data.every(value=>value===0);"
+        "context.fillRect(0,0,1,1);const boundedPixel="
+        "context.getImageData(0,0,1,1).data,bounded="
+        "canvas.width===480&&canvas.height===240"
+        "&&boundedPixel[0]===18&&boundedPixel[1]===52"
+        "&&boundedPixel[2]===86&&boundedPixel[3]===255;"
+        "canvas.width=2147483647;canvas.height=0;const zeroBound="
+        "canvas.width===480&&canvas.height===0;"
         "let quota=false,index=false;try{context.createImageData(513,257)}"
         "catch(error){quota=error instanceof DOMException"
         "&&error.name==='QuotaExceededError'}"
@@ -1430,14 +1787,17 @@ int main(void)
         "&&put[2]===3&&put[3]===4&&composite[0]===255"
         "&&composite[1]===0&&composite[2]===0&&composite[3]===128"
         "&&compositeMode==='destination-out'"
-        "&&hsl==='#008000'&&reset&&bounded"
+        "&&hsl==='#008000'&&reset&&bounded&&zeroBound"
         "&&quota&&index&&supplied.width===1&&supplied.height===1"
-        "&&supplied.colorSpace==='srgb';globalThis.pocSummary=ok?"
+        "&&supplied.colorSpace==='srgb'&&cloneSized&&dirtyPut"
+        "&&negativeDirtyPut&&dirtyRange&&apiReset;"
+        "globalThis.pocSummary=ok?"
         "'CANVAS-2D-OK':'CANVAS-2D-FAILED:'+JSON.stringify({defaults,same,"
         "unsupported,invalidRetained,named,alphaRetained,restored,"
         "pixel:[...pixel],clear:[...clear],put:[...put],"
-        "composite:[...composite],compositeMode,hsl,reset,bounded,"
-        "quota,index});})()";
+        "composite:[...composite],compositeMode,hsl,reset,bounded,zeroBound,"
+        "quota,index,cloneSized,dirtyPut,negativeDirtyPut,dirtyRange,"
+        "apiReset});})()";
     bool canvas_2d_ok = script_runtime_evaluate_diagnostic(
         runtime, canvas_2d_probe, "<canvas-2d-probe>", &result);
     if (!canvas_2d_ok || strcmp(result.summary, "CANVAS-2D-OK") != 0) {
@@ -1445,6 +1805,32 @@ int main(void)
                 canvas_2d_ok, result.summary, result.error);
     }
     CHECK(canvas_2d_ok && strcmp(result.summary, "CANVAS-2D-OK") == 0);
+
+    static const char image_bitmap_probe[] =
+        "(async()=>{const data=new ImageData(new Uint8ClampedArray(["
+        "255,0,0,255,0,0,255,255]),2,1),"
+        "bitmap=await createImageBitmap(data,1,0,1,1,{resizeWidth:2,"
+        "resizeHeight:2,resizeQuality:'pixelated'}),"
+        "ratio=await createImageBitmap(data,{resizeWidth:4}),"
+        "canvas=document.createElement('canvas');canvas.width=2;canvas.height=2;"
+        "const context=canvas.getContext('2d');context.drawImage(bitmap,0,0);"
+        "const pixel=context.getImageData(1,1,1,1).data,good="
+        "bitmap instanceof ImageBitmap&&bitmap.width===2&&bitmap.height===2"
+        "&&ratio.width===4&&ratio.height===2"
+        "&&pixel[0]===0&&pixel[1]===0&&pixel[2]===255&&pixel[3]===255;"
+        "bitmap.close();ratio.close();let closed=false,illegal=false;"
+        "try{context.drawImage(bitmap,0,0)}"
+        "catch(error){closed=error.name==='InvalidStateError'}"
+        "try{new ImageBitmap()}catch(error){illegal=error instanceof TypeError}"
+        "globalThis.pocSummary=good&&closed&&illegal?'IMAGE-BITMAP-OK':"
+        "'IMAGE-BITMAP-FAILED';})().catch(error=>globalThis.pocSummary="
+        "'IMAGE-BITMAP-ERROR:'+error)";
+    bool image_bitmap_ok = script_runtime_evaluate_diagnostic(
+        runtime, image_bitmap_probe, "<image-bitmap-probe>", &result);
+    if (!image_bitmap_ok || strcmp(result.summary, "IMAGE-BITMAP-OK") != 0)
+        fprintf(stderr, "image bitmap probe: ok=%d summary=%s error=%s\n",
+                image_bitmap_ok, result.summary, result.error);
+    CHECK(image_bitmap_ok && strcmp(result.summary, "IMAGE-BITMAP-OK") == 0);
 
     static const char canvas_save_overflow_probe[] =
         "(()=>{const canvas=document.createElement('canvas'),"
@@ -1518,6 +1904,23 @@ int main(void)
         .height = 1,
         .cross_origin = true
     };
+    static const char image_decode_probe[] =
+        "(async()=>{const image=document.getElementById("
+        "'cross-origin-canvas-source');await image.decode();const bitmap="
+        "await createImageBitmap(image),canvas=document.createElement('canvas'),"
+        "context=canvas.getContext('2d');canvas.width=1;canvas.height=1;"
+        "context.drawImage(bitmap,0,0);let tainted=false;try{context.getImageData("
+        "0,0,1,1)}catch(error){tainted=error.name==='SecurityError'}bitmap.close();"
+        "const empty="
+        "document.createElement('img');let rejected=false;try{await empty.decode()}"
+        "catch(error){rejected=error.name==='EncodingError'}"
+        "globalThis.pocSummary=image.complete&&image.naturalWidth===1&&tainted"
+        "&&rejected"
+        "?'IMAGE-DECODE-OK':'IMAGE-DECODE-FAILED'})().catch(error=>"
+        "globalThis.pocSummary='IMAGE-DECODE-ERROR:'+error)";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, image_decode_probe, "<image-decode-probe>", &result)
+          && strcmp(result.summary, "IMAGE-DECODE-OK") == 0);
     static const char canvas_taint_probe[] =
         "(()=>{const image=document.getElementById('cross-origin-canvas-source'),"
         "canvas=document.createElement('canvas'),context=canvas.getContext('2d');"
@@ -1533,6 +1936,9 @@ int main(void)
         "const copied=document.createElement('canvas'),copy=copied.getContext('2d');"
         "copied.width=1;copied.height=1;copy.drawImage(canvas,0,0);"
         "const propagated=denied(()=>copy.getImageData(0,0,1,1));"
+        "const webglSource=document.createElement('canvas'),webgl2d="
+        "webglSource.getContext('2d');webglSource.width=1;webglSource.height=1;"
+        "webgl2d.drawImage(image,0,0);globalThis.__taintedWebglSource=webglSource;"
         "canvas.width=1;const reset=context.getImageData(0,0,1,1).data[3]===0;"
         "globalThis.pocSummary=pixels&&url&&blob&&pattern&&propagated&&reset"
         "?'CANVAS-TAINT-OK':'CANVAS-TAINT-FAILED';})()";
@@ -1561,6 +1967,197 @@ int main(void)
           && script_runtime_advance(runtime, 0, 32, &result)
           && result.success
           && strcmp(result.summary, "CANVAS-NINTH-COMMIT-OK") == 0);
+
+    static const char webgl_basic_probe[] =
+        "(()=>{const canvas=document.createElement('canvas');canvas.width=8;"
+        "canvas.height=8;document.body.appendChild(canvas);const gl="
+        "canvas.getContext('webgl'),same=gl===canvas.getContext('experimental-webgl'),"
+        "exclusive=canvas.getContext('2d')===null,vs=gl.createShader(gl.VERTEX_SHADER),"
+        "fs=gl.createShader(gl.FRAGMENT_SHADER);globalThis.__testWebgl=gl;"
+        "const taintTexture=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,taintTexture);"
+        "let taintRejected=false;try{gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,"
+        "gl.UNSIGNED_BYTE,__taintedWebglSource)}catch(error){taintRejected="
+        "error.name==='SecurityError'}"
+        "gl.shaderSource(vs,'attribute vec2 position;void main(){gl_Position='"
+        "+'vec4(position,0.0,1.0);}');gl.compileShader(vs);"
+        "gl.shaderSource(fs,'precision mediump float;uniform vec4 tint;void main()'"
+        "+'{gl_FragColor=tint;}');gl.compileShader(fs);const program=gl.createProgram();"
+        "gl.attachShader(program,vs);gl.attachShader(program,fs);gl.linkProgram(program);"
+        "gl.useProgram(program);const buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);"
+        "gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,0,1]),gl.STATIC_DRAW);"
+        "const location=gl.getAttribLocation(program,'position');gl.enableVertexAttribArray(location);"
+        "gl.vertexAttribPointer(location,2,gl.FLOAT,false,0,0);"
+        "gl.uniform4f(gl.getUniformLocation(program,'tint'),1,0,0,1);"
+        "gl.clearColor(0,0,1,1);gl.clear(gl.COLOR_BUFFER_BIT);"
+        "gl.drawArrays(gl.TRIANGLES,0,3);gl.finish();const pixel=new Uint8Array(4);"
+        "gl.readPixels(4,4,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);"
+        "const dvs=gl.createShader(gl.VERTEX_SHADER),dfs=gl.createShader(gl.FRAGMENT_SHADER),"
+        "depthProgram=gl.createProgram();gl.shaderSource(dvs,'attribute vec3 position;'"
+        "+'void main(){gl_Position=vec4(position,1.);}');gl.shaderSource(dfs,"
+        "'precision mediump float;uniform vec4 tint;void main(){gl_FragColor=tint;}');"
+        "gl.compileShader(dvs);gl.compileShader(dfs);gl.attachShader(depthProgram,dvs);"
+        "gl.attachShader(depthProgram,dfs);gl.linkProgram(depthProgram);gl.useProgram(depthProgram);"
+        "const depthBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,depthBuffer);"
+        "gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,.5,1,-1,.5,0,1,.5,"
+        "-1,-1,-.5,1,-1,-.5,0,1,-.5,-1,-1,.5,1,-1,.5,0,1,.5]),gl.STATIC_DRAW);"
+        "const dp=gl.getAttribLocation(depthProgram,'position');gl.enableVertexAttribArray(dp);"
+        "gl.vertexAttribPointer(dp,3,gl.FLOAT,false,0,0);const dt="
+        "gl.getUniformLocation(depthProgram,'tint');gl.enable(gl.DEPTH_TEST);"
+        "gl.clearColor(0,0,0,1);gl.clearDepth(1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);"
+        "gl.uniform4f(dt,0,0,1,1);gl.drawArrays(gl.TRIANGLES,0,3);gl.finish();"
+        "gl.uniform4f(dt,1,0,0,1);gl.drawArrays(gl.TRIANGLES,3,3);gl.finish();"
+        "gl.uniform4f(dt,0,1,0,1);gl.drawArrays(gl.TRIANGLES,6,3);gl.finish();"
+        "const depthPixel=new Uint8Array(4);gl.readPixels(4,4,1,1,gl.RGBA,gl.UNSIGNED_BYTE,depthPixel);"
+        "gl.disable(gl.DEPTH_TEST);"
+        "const texture=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,texture);"
+        "gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);"
+        "gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);"
+        "gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,"
+        "new Uint8Array([0,255,0,255]));const tvs=gl.createShader(gl.VERTEX_SHADER),"
+        "tfs=gl.createShader(gl.FRAGMENT_SHADER),textured=gl.createProgram();"
+        "gl.shaderSource(tvs,'attribute vec2 position;attribute vec2 texcoord;'"
+        "+'varying vec2 uv;void main(){uv=texcoord;gl_Position=vec4(position,0.,1.);}');"
+        "gl.shaderSource(tfs,'precision mediump float;varying vec2 uv;uniform sampler2D image;'"
+        "+'void main(){gl_FragColor=texture2D(image,uv);}');gl.compileShader(tvs);"
+        "gl.compileShader(tfs);gl.attachShader(textured,tvs);gl.attachShader(textured,tfs);"
+        "gl.linkProgram(textured);gl.useProgram(textured);gl.bindBuffer(gl.ARRAY_BUFFER,buffer);"
+        "const p2=gl.getAttribLocation(textured,'position');gl.enableVertexAttribArray(p2);"
+        "gl.vertexAttribPointer(p2,2,gl.FLOAT,false,0,0);const uvBuffer=gl.createBuffer();"
+        "gl.bindBuffer(gl.ARRAY_BUFFER,uvBuffer);gl.bufferData(gl.ARRAY_BUFFER,"
+        "new Float32Array([0,0,1,0,.5,1]),gl.STATIC_DRAW);const uv="
+        "gl.getAttribLocation(textured,'texcoord');gl.enableVertexAttribArray(uv);"
+        "gl.vertexAttribPointer(uv,2,gl.FLOAT,false,0,0);gl.clear(gl.COLOR_BUFFER_BIT);"
+        "gl.drawArrays(gl.TRIANGLES,0,3);gl.finish();const texturedPixel=new Uint8Array(4);"
+        "gl.readPixels(4,4,1,1,gl.RGBA,gl.UNSIGNED_BYTE,texturedPixel);"
+        "const rejectedVs=gl.createShader(gl.VERTEX_SHADER),rejectedFs="
+        "gl.createShader(gl.FRAGMENT_SHADER),rejected=gl.createProgram();"
+        "gl.shaderSource(rejectedVs,'attribute vec2 position;void main(){for(int i=0;i<2;i++){}'"
+        "+'gl_Position=vec4(position,0.,1.);}');gl.compileShader(rejectedVs);"
+        "gl.shaderSource(rejectedFs,'void main(){gl_FragColor=vec4(1.);}');"
+        "gl.compileShader(rejectedFs);gl.attachShader(rejected,rejectedVs);"
+        "gl.attachShader(rejected,rejectedFs);gl.linkProgram(rejected);"
+        "const second=document.createElement('canvas').getContext('webgl'),"
+        "third=document.createElement('canvas').getContext('webgl');"
+        "const ok=gl&&same&&exclusive&&second&&third===null&&taintRejected"
+        "&&gl.getContextAttributes().alpha===false"
+        "&&gl.getProgramParameter(program,gl.LINK_STATUS)"
+        "&&pixel[0]>240&&pixel[1]<8&&pixel[2]<8&&pixel[3]>240"
+        "&&depthPixel[0]>240&&depthPixel[1]<8&&depthPixel[2]<8"
+        "&&texturedPixel[0]<8&&texturedPixel[1]>240&&texturedPixel[2]<8"
+        "&&canvas.toDataURL().startsWith('data:image/png;base64,')"
+        "&&!gl.getProgramParameter(rejected,gl.LINK_STATUS)"
+        "&&gl.getParameter(gl.MAX_TEXTURE_SIZE)===512;"
+        "globalThis.pocSummary=ok?'WEBGL-BASIC-OK':'WEBGL-BASIC-FAILED:'"
+        "+Array.from(pixel).join(',')+':'+gl.getProgramInfoLog(rejected);})()";
+    bool webgl_basic_ok = script_runtime_evaluate_diagnostic(
+        runtime, webgl_basic_probe, "<webgl-basic-probe>", &result);
+    if (!webgl_basic_ok || strcmp(result.summary, "WEBGL-BASIC-OK") != 0) {
+        fprintf(stderr, "WebGL basic probe: ok=%d summary=%s error=%s\n",
+                webgl_basic_ok, result.summary, result.error);
+    }
+    CHECK(webgl_basic_ok && strcmp(result.summary, "WEBGL-BASIC-OK") == 0);
+
+    static const char webgl_state_probe[] =
+        "(()=>{const g=globalThis.__testWebgl,c=g.canvas,v="
+        "g.createShader(g.VERTEX_SHADER),f=g.createShader(g.FRAGMENT_SHADER);"
+        "g.shaderSource(v,'attribute vec2 p;void main(){gl_Position='"
+        "+'vec4(p,0.,1.);}');g.shaderSource(f,'precision mediump float;'"
+        "+'uniform vec4 color;void main(){gl_FragColor=color;}');"
+        "g.compileShader(v);g.compileShader(f);const p=g.createProgram();"
+        "g.attachShader(p,v);g.attachShader(p,f);g.linkProgram(p);g.useProgram(p);"
+        "const b=g.createBuffer();g.bindBuffer(g.ARRAY_BUFFER,b);"
+        "g.bufferData(g.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,0,1]),"
+        "g.STATIC_DRAW);const a=g.getAttribLocation(p,'p');"
+        "g.enableVertexAttribArray(a);g.vertexAttribPointer(a,2,g.FLOAT,false,0,0);"
+        "const color=g.getUniformLocation(p,'color'),pixel=new Uint8Array(4);"
+        "g.clearColor(0,0,1,1);g.clear(g.COLOR_BUFFER_BIT);g.enable(g.BLEND);"
+        "g.uniform4f(color,1,0,0,.5);g.drawArrays(g.TRIANGLES,0,3);g.finish();"
+        "g.readPixels(4,4,1,1,g.RGBA,g.UNSIGNED_BYTE,pixel);"
+        "const replace=pixel[0]>240&&pixel[1]<8&&pixel[2]<8&&pixel[3]>120;"
+        "g.blendFunc(g.SRC_ALPHA,g.ONE_MINUS_SRC_ALPHA);"
+        "g.uniform4f(color,0,1,0,.5);g.drawArrays(g.TRIANGLES,0,3);g.finish();"
+        "g.readPixels(4,4,1,1,g.RGBA,g.UNSIGNED_BYTE,pixel);"
+        "const alpha=pixel[0]>110&&pixel[0]<145&&pixel[1]>110&&pixel[1]<145;"
+        "g.disable(g.BLEND);g.clearColor(0,0,0,1);g.clear(g.COLOR_BUFFER_BIT);"
+        "g.bufferData(g.ARRAY_BUFFER,new Float32Array([-.8,-.8,.8,-.8,.8,.8]),"
+        "g.STATIC_DRAW);g.uniform4f(color,1,1,1,1);g.drawArrays(g.LINE_LOOP,0,3);"
+        "g.finish();g.readPixels(4,4,1,1,g.RGBA,g.UNSIGNED_BYTE,pixel);"
+        "const loop=pixel[0]>200;const frames=[];for(let i=0;i<5;i++)"
+        "frames.push(g.createFramebuffer());const bounded=frames[4]===null;"
+        "g.deleteFramebuffer(frames[0]);const reclaimed=!!g.createFramebuffer();"
+        "while(g.getError()!==g.NO_ERROR){}g.blendFunc(g.DST_COLOR,g.ONE);"
+        "const stateError=g.getError()===g.INVALID_ENUM&&!g.isContextLost();"
+        "const emptyRead=new Uint8Array(0);g.readPixels(0,0,0,0,g.RGBA,"
+        "g.UNSIGNED_BYTE,emptyRead);const zeroRead=g.getError()===g.NO_ERROR;"
+        "g.blendFuncSeparate(g.ONE,g.ZERO,g.SRC_ALPHA,g.ONE_MINUS_SRC_ALPHA);"
+        "const splitError=g.getError()===g.INVALID_OPERATION;"
+        "c.width=640;c.height=480;const boundedSize=g.drawingBufferWidth===362"
+        "&&g.drawingBufferHeight===272;g.clearColor(.25,.5,.75,1);"
+        "g.clear(g.COLOR_BUFFER_BIT|g.DEPTH_BUFFER_BIT);g.finish();"
+        "const largePixel=new Uint8Array(4);g.readPixels(181,136,1,1,g.RGBA,"
+        "g.UNSIGNED_BYTE,largePixel);const largeSurface=!g.isContextLost()"
+        "&&largePixel[0]>55&&largePixel[1]>115&&largePixel[2]>175;"
+        "c.width=2147483647;c.height=0;const zeroBound="
+        "g.drawingBufferWidth===480&&g.drawingBufferHeight===0"
+        "&&!g.isContextLost();"
+        "globalThis.pocSummary=replace&&alpha&&loop&&bounded&&reclaimed&&stateError"
+        "&&zeroRead"
+        "&&splitError"
+        "&&boundedSize&&largeSurface&&zeroBound"
+        "?'WEBGL-STATE-OK':'WEBGL-STATE-FAILED:'+Array.from(pixel).join(',');})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, webgl_state_probe, "<webgl-state-probe>", &result)
+          && strcmp(result.summary, "WEBGL-STATE-OK") == 0);
+
+    /* MDN's 3D tutorial composes projection and model-view mat4 uniforms in
+       its vertex shader. The bounded backend combines that chain before
+       sending one fixed-function transform to the native renderer. */
+    static const char webgl_two_matrix_probe[] =
+        "(()=>{const g=globalThis.__testWebgl,c=g.canvas;c.width=16;c.height=16;"
+        "const v=g.createShader(g.VERTEX_SHADER),f=g.createShader(g.FRAGMENT_SHADER),"
+        "p=g.createProgram();g.shaderSource(v,'attribute vec4 aVertexPosition;'"
+        "+'uniform mat4 uModelViewMatrix;uniform mat4 uProjectionMatrix;'"
+        "+'void main(void){gl_Position=uProjectionMatrix*uModelViewMatrix*'"
+        "+'aVertexPosition;}');g.shaderSource(f,'precision mediump float;'"
+        "+'uniform vec4 color;void main(void){gl_FragColor=color;}');"
+        "g.compileShader(v);g.compileShader(f);g.attachShader(p,v);g.attachShader(p,f);"
+        "g.linkProgram(p);g.useProgram(p);const b=g.createBuffer();"
+        "g.bindBuffer(g.ARRAY_BUFFER,b);g.bufferData(g.ARRAY_BUFFER,new Float32Array("
+        "[-.25,-.25,.25,-.25,0,.25]),g.STATIC_DRAW);const a="
+        "g.getAttribLocation(p,'aVertexPosition');g.enableVertexAttribArray(a);"
+        "g.vertexAttribPointer(a,2,g.FLOAT,false,0,0);const projection=new Float32Array("
+        "[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]),model=new Float32Array("
+        "[1,0,0,0,0,1,0,0,0,0,1,0,.5,0,0,1]);"
+        "g.uniformMatrix4fv(g.getUniformLocation(p,'uProjectionMatrix'),false,projection);"
+        "g.uniformMatrix4fv(g.getUniformLocation(p,'uModelViewMatrix'),false,model);"
+        "g.uniform4f(g.getUniformLocation(p,'color'),1,0,0,1);g.clearColor(0,0,0,1);"
+        "g.clear(g.COLOR_BUFFER_BIT);g.drawArrays(g.TRIANGLES,0,3);g.finish();"
+        "const moved=new Uint8Array(4),origin=new Uint8Array(4);"
+        "g.readPixels(12,8,1,1,g.RGBA,g.UNSIGNED_BYTE,moved);"
+        "g.readPixels(8,8,1,1,g.RGBA,g.UNSIGNED_BYTE,origin);"
+        "globalThis.pocSummary=g.getProgramParameter(p,g.LINK_STATUS)&&moved[0]>240"
+        "&&origin[0]<8?'WEBGL-TWO-MATRIX-OK':'WEBGL-TWO-MATRIX-FAILED:'"
+        "+Array.from(moved).join(',')+':'+Array.from(origin).join(',');})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, webgl_two_matrix_probe, "<webgl-two-matrix-probe>",
+              &result)
+          && strcmp(result.summary, "WEBGL-TWO-MATRIX-OK") == 0);
+
+    static const char webgl_lifetime_probe[] =
+        "(()=>{const old=document.createElement('canvas');old.width=1;"
+        "old.height=1;document.body.appendChild(old);const handle=old.__handle,"
+        "lease=old.__tilefinchHandleLease,commands=new Float64Array(64),"
+        "textures=new Float64Array(),hostile={valueOf(){old.remove();"
+        "__tilefinchReleaseNodeWrapper(handle,lease);document.body.innerHTML="
+        "'<canvas id=webgl-replacement width=1 height=1></canvas>';return 1;}};"
+        "commands[0]=0;commands[1]=0x4000;commands[5]=1;"
+        "const rendered=__tilefinchWebGLRender(handle,hostile,1,commands,[],textures);"
+        "globalThis.pocSummary=!rendered&&document.getElementById('webgl-replacement')"
+        "?'WEBGL-LIFETIME-OK':'WEBGL-LIFETIME-FAILED';})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, webgl_lifetime_probe, "<webgl-lifetime-probe>",
+              &result)
+          && strcmp(result.summary, "WEBGL-LIFETIME-OK") == 0);
     script_runtime_set_images(runtime, NULL);
     images_destroy(&canvas_commit_images);
 
@@ -1815,9 +2412,9 @@ int main(void)
           && result.indexed_db_bytes == 0
           && result.indexed_db_peak_bytes > 0
           && result.indexed_db_quota_errors == 0
-          /* The same realm loaded Canvas and Streams earlier; IndexedDB is
-             the third deferred standards module admitted on demand. */
-          && result.bootstrap_lazy_module_loads == 3
+          /* The same realm loaded Game Audio, Canvas, and Streams earlier;
+             IndexedDB is the fourth deferred standards module admitted. */
+          && result.bootstrap_lazy_module_loads == 5
           && result.bootstrap_lazy_module_failures == 0);
 
     static const char indexeddb_failure_probe[] =
@@ -1861,7 +2458,7 @@ int main(void)
         "const lockedResult=await lockedValue,queuedBeforeRelease="
         "!queuedSettled;await lockedDone;const queuedResult=await queuedValue;"
         "await queuedDone;Array.prototype.includes=originalIncludes;"
-        "const timers=[];for(let i=0;"
+        "const timersBefore=__tilefinchPendingTimers(),timers=[];for(let i=0;"
         "i<160;i++){const id=setTimeout(()=>{},1000);if(!id)break;timers.push(id)}"
         "const saturated=db.transaction('records'),saturatedDone=finished("
         "saturated);await saturatedDone;for(const id of timers)clearTimeout(id);"
@@ -1898,7 +2495,7 @@ int main(void)
         "&&quotaName==='QuotaExceededError'&&quotaTrailing==='AbortError'"
         "&&quotaDoneName==='QuotaExceededError'&&kept==='kept'&&count===1"
         "&&lockedResult==='kept'&&queuedBeforeRelease&&queuedResult==='kept'"
-        "&&timers.length===128"
+        "&&timers.length+timersBefore===128"
         "&&badName==='AbortError'&&retryOld===1&&rolledBack"
         "&&persisted==='kept'&&__tilefinchIndexedDBStats.quotaErrors"
         "===beforeQuota+1&&currentVersion===2&&doomedName==='AbortError'"
@@ -1907,7 +2504,7 @@ int main(void)
         "?'INDEXEDDB-FAILURES-OK':'INDEXEDDB-FAILURES-FAILED:'"
         "+JSON.stringify({abortResults,restoredKey,quotaName,quotaTrailing,"
         "quotaDoneName,kept,count,lockedResult,queuedBeforeRelease,queuedResult,"
-        "timers:timers.length,badName,"
+        "timers:timers.length,timersBefore,badName,"
         "retryOld,rolledBack,persisted,currentVersion,doomedName,"
         "stats:__tilefinchIndexedDBStats});})()"
         ".catch(error=>{globalThis.pocSummary='INDEXEDDB-FAILURES-ERROR:'+"

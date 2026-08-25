@@ -72,6 +72,17 @@ unload_named_modules() {
     done
 }
 
+require_module_absent() {
+    module_name=$1
+    modules=$(run_pspsh "modlist" "$LINK_TIMEOUT_SECONDS")
+    if printf '%s\n' "$modules" | grep -q "Name: $module_name\$"; then
+        echo "$module_name is still running on the PSP." >&2
+        echo "Exit it normally with HOME before reloading; force-unloading " \
+             "can orphan browser, network, and codec threads." >&2
+        return 1
+    fi
+}
+
 case "$MODE" in
     memory)
         [ "$BUILD_DIR" = "$HOST_ROOT" ] || {
@@ -80,7 +91,8 @@ case "$MODE" in
         }
         cmake --build "$BUILD_DIR" \
             --target psp-browser-script-dev-prx -j"$JOBS"
-        unload_named_modules Tilefinch tfdeploy
+        require_module_absent Tilefinch
+        unload_named_modules tfdeploy
         load_output=$(run_pspsh \
             "ld host0:/psp-browser-script-dev.prx" \
             "$LINK_TIMEOUT_SECONDS")

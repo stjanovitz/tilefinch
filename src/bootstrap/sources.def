@@ -41,6 +41,11 @@ BOOTSTRAP_SOURCE(browser_bootstrap_hardening, "hardening.js",
    does not rewrite every established bytecode object after an insertion. */
 BOOTSTRAP_SOURCE(browser_bootstrap_streams, "streams.js",
                  "<browser-streams>", browser_bootstrap_streams_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_game_audio, "game-audio.js",
+                 "<browser-game-audio>",
+                 browser_bootstrap_game_audio_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_webgl, "webgl.js",
+                 "<browser-webgl>", browser_bootstrap_webgl_bytecode)
 BOOTSTRAP_DIAGNOSTIC(browser_dpu_diagnostic, "dpu-diagnostic.js",
                      "<dpu-diagnostic>")
 BOOTSTRAP_DIAGNOSTIC(browser_eval_source_diagnostic,
