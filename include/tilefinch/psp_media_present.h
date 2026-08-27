@@ -289,6 +289,18 @@ bool psp_media_present_ge_submit(
     uint32_t *destination, PspMediaPresentGeCost *cost);
 bool psp_media_present_ge_complete(PspMediaPresentGeCost *cost);
 
+/* Draw one retained opaque RGB565 UI rectangle into an RGBA8888 video back
+ * buffer. This is deliberately narrower than a general compositor: one
+ * bounded, unscaled, nearest-neighbour sprite after the video draw has
+ * completed. `source_changed` permits the PSP cache writeback to happen only
+ * when the retained raster was rebuilt. Host builds return false so the UI
+ * layer takes its pixel-identical CPU fallback. */
+bool psp_media_present_ge_blit_565(
+    const uint16_t *source, int source_width, int source_height,
+    int source_stride, bool source_changed, uint32_t *destination,
+    int destination_stride, int left, int top,
+    PspMediaPresentGeCost *cost);
+
 /*
  * Whether the submitted list is still running, asked without blocking.
  *
@@ -654,14 +666,15 @@ const char *psp_media_present_mode_name(PspMediaPresentMode mode);
 /*
  * What the last present into one back buffer put there.
  *
- * The panel is double buffered, so "the frame already on screen" is really
- * two independent buffers and a present may only be skipped when *this*
- * buffer already holds *this* picture.
+ * The video surface is double buffered and the page/software surface is
+ * triple buffered. A present may only be skipped when *this exact scanout
+ * buffer* already holds *this* picture.
  */
 typedef struct {
     uint64_t identity;
     uint64_t generation;
     PspMediaPresentRect video;
+    uint8_t buffer_index;
     bool valid;
 } PspMediaPresentRecord;
 
@@ -685,12 +698,12 @@ typedef struct {
 bool psp_media_present_skip_allowed(
     const PspMediaPresentRecord *record, uint64_t identity,
     uint64_t generation, const PspMediaPresentRect *video,
-    bool chrome_paints);
+    unsigned buffer_index, bool chrome_paints);
 
 /* Note an overlay-free present of `identity` at `video`. */
 void psp_media_present_record(
     PspMediaPresentRecord *record, uint64_t identity, uint64_t generation,
-    const PspMediaPresentRect *video);
+    const PspMediaPresentRect *video, unsigned buffer_index);
 
 /* Forget what a buffer holds, for every buffer. Any writer that is not this
    presenter -- a page compose, the loading supervisor, a resumed display --

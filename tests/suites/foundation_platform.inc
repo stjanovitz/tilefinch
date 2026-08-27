@@ -98,10 +98,11 @@ static bool test_youtube_ranked_track_retention(void)
     snprintf(preferences.alternate_language,
              sizeof(preferences.alternate_language), "%s", "es");
     YoutubeStream stream;
+    YoutubeCaptionCatalog caption_catalog;
     char error[256];
-    if (!youtube_parse_player_response_with_preferences(
+    if (!youtube_parse_player_response_with_preferences_and_caption_catalog(
             json, length, "ranked", 240, &preferences,
-            &stream, error, sizeof(error))
+            &stream, &caption_catalog, error, sizeof(error))
         || stream.audio_track_count != YOUTUBE_TRACK_LIMIT
         || stream.caption_track_count != YOUTUBE_TRACK_LIMIT
         || strcmp(stream.audio_tracks[0].id, "en-US.21") != 0
@@ -110,8 +111,16 @@ static bool test_youtube_ranked_track_retention(void)
         || strcmp(stream.caption_tracks[0].id, ".en-US-human") != 0
         || strcmp(stream.caption_tracks[1].id, ".en-US-auto") != 0
         || strcmp(stream.caption_tracks[2].id, ".cap2") != 0
+        || caption_catalog.count != YOUTUBE_TRACK_LIMIT
         || stream.selected_caption_track != -1
         || stream.caption_url[0] != '\0') return false;
+    const char *human_url = youtube_caption_catalog_url(
+        &caption_catalog, ".en-US-human");
+    const char *automatic_url = youtube_caption_catalog_url(
+        &caption_catalog, ".en-US-auto");
+    if (human_url == NULL || strstr(human_url, "n=14") == NULL
+        || automatic_url == NULL
+        || strstr(automatic_url, "n=1") == NULL) return false;
 
     snprintf(preferences.audio_track_id,
              sizeof(preferences.audio_track_id), "%s", "fr.0");
@@ -597,7 +606,7 @@ static bool test_youtube_player_response_parser(void)
         "\"captionTracks\":[{\"baseUrl\":"
         "\"https://www.youtube.com/api/timedtext?v=test&lang=es\","
         "\"languageCode\":\"es\",\"vssId\":\".es\","
-        "\"name\":{\"simpleText\":\"Español\"}}]}}}";
+        "\"name\":{\"runs\":[{\"text\":\"Español\"}]}}]}}}";
     YoutubeTrackPreferences track_preferences = {0};
     snprintf(track_preferences.audio_language,
              sizeof(track_preferences.audio_language), "%s", "es");
@@ -611,8 +620,50 @@ static bool test_youtube_player_response_parser(void)
         || stream.audio_track_count != 2u
         || stream.selected_audio_track < 0
         || stream.caption_track_count != 1u
+        || strcmp(stream.caption_tracks[0].label, "Español") != 0
         || stream.selected_caption_track != 0
         || strstr(stream.caption_url, "fmt=vtt") == NULL) return false;
+
+    static const char language_code_tracks[] =
+        "{\"playabilityStatus\":{\"status\":\"OK\"},"
+        "\"streamingData\":{\"adaptiveFormats\":["
+        "{\"itag\":133,\"width\":426,\"height\":240,"
+        "\"contentLength\":\"3100\",\"mimeType\":\"video/mp4; "
+        "codecs=\\\"avc1.4d400d\\\"\",\"url\":"
+        "\"https://rr2.googlevideo.com/video.mp4\"},"
+        "{\"itag\":140,\"contentLength\":\"1400\","
+        "\"mimeType\":\"audio/mp4; codecs=\\\"mp4a.40.2\\\"\","
+        "\"url\":\"https://rr3.googlevideo.com/en.m4a\","
+        "\"audioTrack\":{\"id\":\"en.1\"}}]},"
+        "\"captions\":{\"playerCaptionsTracklistRenderer\":{"
+        "\"captionTracks\":["
+        "{\"baseUrl\":\"https://www.youtube.com/api/timedtext?v=x&l=ar\","
+        "\"languageCode\":\"ar\",\"vssId\":\".ar\"},"
+        "{\"baseUrl\":\"https://www.youtube.com/api/timedtext?v=x&l=bn\","
+        "\"languageCode\":\"bn\",\"vssId\":\".bn\"},"
+        "{\"baseUrl\":\"https://www.youtube.com/api/timedtext?v=x&l=en\","
+        "\"languageCode\":\"en\",\"vssId\":\".en\"}]}}}";
+    memset(&track_preferences, 0, sizeof(track_preferences));
+    snprintf(track_preferences.caption_language,
+             sizeof(track_preferences.caption_language), "%s", "ar");
+    if (!youtube_parse_player_response_with_preferences(
+            language_code_tracks, strlen(language_code_tracks),
+            "language-labels", 240, &track_preferences,
+            &stream, error, sizeof(error))
+        || stream.audio_track_count != 1u
+        || strcmp(stream.audio_tracks[0].label, "English") != 0
+        || stream.caption_track_count != 3u)
+        return false;
+    bool saw_arabic = false, saw_bengali = false, saw_english = false;
+    for (size_t at = 0; at < stream.caption_track_count; at++) {
+        saw_arabic = saw_arabic
+            || strcmp(stream.caption_tracks[at].label, "Arabic") == 0;
+        saw_bengali = saw_bengali
+            || strcmp(stream.caption_tracks[at].label, "Bengali") == 0;
+        saw_english = saw_english
+            || strcmp(stream.caption_tracks[at].label, "English") == 0;
+    }
+    if (!saw_arabic || !saw_bengali || !saw_english) return false;
     memset(&track_preferences, 0, sizeof(track_preferences));
     track_preferences.prefer_original_audio = true;
     if (!youtube_parse_player_response_with_preferences(
@@ -701,18 +752,20 @@ static bool test_youtube_subtitle_parser(void)
 {
     static const unsigned char vtt[] =
         "WEBVTT\n\n"
-        "00:00:01.000 --> 00:00:02.500\n"
+        "00:00:01.000 --> 00:00:02.400\n"
         "Hello &amp; <b>welcome</b>\n\n"
         "cue-two\n"
-        "00:02.500 --> 00:04.000 align:center\n"
-        "Second line\ncontinued\n\n";
+        "00:02.800 --> 00:04.000 align:center\n"
+        "Second line\ncontinued\n\n"
+        "00:05.000 --> 00:06.000\n"
+        "After an authored pause\n\n";
     Budget budget;
-    budget_init(&budget, 128u * 1024u);
+    budget_init(&budget, 256u * 1024u);
     YoutubeSubtitleDocument *document = youtube_subtitles_parse_vtt(
         &budget, vtt, sizeof(vtt) - 1u);
     size_t cursor = 0;
     bool ok = document != NULL
-        && youtube_subtitles_cue_count(document) == 2u
+        && youtube_subtitles_cue_count(document) == 3u
         && youtube_subtitles_text_at(document, 500000u, &cursor) == NULL;
     const char *first = youtube_subtitles_text_at(
         document, UINT64_C(1500000), &cursor);
@@ -720,12 +773,95 @@ static bool test_youtube_subtitle_parser(void)
         document, UINT64_C(3000000), &cursor);
     ok = ok && first != NULL && strcmp(first, "Hello & welcome") == 0
         && second != NULL && strcmp(second, "Second line continued") == 0;
+    cursor = 0;
+    const char *gap = youtube_subtitles_text_at(
+        document, UINT64_C(2700000), &cursor);
+    ok = ok && gap != NULL && strcmp(gap, "Hello & welcome") == 0;
+    gap = youtube_subtitles_text_at(
+        document, UINT64_C(4200000), &cursor);
+    ok = ok && gap != NULL && strcmp(gap, "Second line continued") == 0;
+    gap = youtube_subtitles_text_at(
+        document, UINT64_C(4700000), &cursor);
+    ok = ok && gap != NULL && strcmp(gap, "Second line continued") == 0;
     /* A backwards seek must reset the monotonic lookup cursor. */
     first = youtube_subtitles_text_at(
         document, UINT64_C(1500000), &cursor);
     ok = ok && first != NULL && strcmp(first, "Hello & welcome") == 0;
     youtube_subtitles_destroy(document);
-    return ok && budget.current == 0;
+    if (!ok || budget.current != 0) return false;
+
+    static const unsigned char long_pause_vtt[] =
+        "WEBVTT\n\n"
+        "00:00:02.000 --> 00:00:03.000\n"
+        "Before pause\n\n"
+        "00:00:05.000 --> 00:00:06.000\n"
+        "After pause\n\n";
+    document = youtube_subtitles_parse_vtt(
+        &budget, long_pause_vtt, sizeof(long_pause_vtt) - 1u);
+    cursor = 0u;
+    ok = document != NULL
+        && youtube_subtitles_text_at(
+               document, UINT64_C(3200000), &cursor) == NULL
+        && youtube_subtitles_text_at(
+               document, UINT64_C(4500000), &cursor) == NULL;
+    youtube_subtitles_destroy(document);
+    if (!ok || budget.current != 0) return false;
+
+    /* A current YouTube caption resource can exceed the fixed 256 KiB body
+       lane. Feed an oversized synthetic resource across hostile chunk
+       boundaries and prove adjacent duplicate cues do not consume the
+       retained 2,048-cue bound twice. */
+    const size_t source_capacity = 384u * 1024u;
+    unsigned char *source = malloc(source_capacity);
+    if (source == NULL) return false;
+    size_t source_length = 0;
+    static const char caption_text[] =
+        "A deliberately long caption line that exercises bounded streaming "
+        "without retaining the complete wire response.";
+    for (unsigned cue = 0; cue < 1000u; cue++) {
+        unsigned start = cue;
+        unsigned end = cue + 1u;
+        for (unsigned duplicate = 0; duplicate < 2u; duplicate++) {
+            int written = snprintf(
+                (char *) source + source_length,
+                source_capacity - source_length,
+                "%02u:%02u:%02u.000 --> %02u:%02u:%02u.000\n%s\n\n",
+                start / 3600u, start / 60u % 60u, start % 60u,
+                end / 3600u, end / 60u % 60u, end % 60u,
+                caption_text);
+            if (written <= 0
+                || (size_t) written >= source_capacity - source_length) {
+                free(source);
+                return false;
+            }
+            source_length += (size_t) written;
+        }
+    }
+    Budget streaming_budget;
+    budget_init(&streaming_budget, 512u * 1024u);
+    YoutubeSubtitleBuilder *builder = youtube_subtitles_builder_create(
+        &streaming_budget, 0);
+    for (size_t at = 0; builder != NULL && at < source_length;) {
+        size_t chunk = source_length - at < 137u
+            ? source_length - at : 137u;
+        if (!youtube_subtitles_builder_feed(builder, source + at, chunk)) {
+            youtube_subtitles_builder_destroy(builder);
+            builder = NULL;
+            break;
+        }
+        at += chunk;
+    }
+    free(source);
+    YoutubeSubtitleDocument *streamed = builder == NULL
+        ? NULL : youtube_subtitles_builder_finish(builder);
+    size_t streamed_cursor = 0;
+    const char *late = youtube_subtitles_text_at(
+        streamed, UINT64_C(999500000), &streamed_cursor);
+    ok = streamed != NULL
+        && youtube_subtitles_cue_count(streamed) == 1000u
+        && late != NULL && strcmp(late, caption_text) == 0;
+    youtube_subtitles_destroy(streamed);
+    return ok && streaming_budget.current == 0;
 }
 
 typedef struct {

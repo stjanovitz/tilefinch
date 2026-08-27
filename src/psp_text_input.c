@@ -30,6 +30,21 @@ static unsigned int psp_text_input_gu_list[PSP_GU_LIST_WORDS]
 static bool text_input_cancel_requested(
     const PspTextInputService *service);
 
+/* A modal keyboard samples the controller directly for many frames. Face
+   buttons used as Danzeff characters therefore remain accumulated in the
+   process-wide controller latch even though the keyboard already consumed
+   them. In particular, a prior Circle character could otherwise reach the
+   cooperative navigation supervisor immediately after R+Start submits and
+   cancel the new request as PAGE LOAD STOPPED. Retire those modal-owned
+   edges before returning controller ownership to the browser loop. */
+static void text_input_retire_modal_latch(void)
+{
+    SceCtrlLatch pending = {0};
+    SceCtrlLatch consumed = {0};
+    if (sceCtrlPeekLatch(&pending) > 0)
+        (void) sceCtrlReadLatch(&consumed);
+}
+
 static void present(
     PspTextInputService *service, const uint16_t *frame,
     const PspUiState *ui)
@@ -726,9 +741,10 @@ bool psp_text_input_request_with_submit(
      * repaints only when something marks the page dirty, and cancelling the
      * keyboard marks nothing — so without this the user is left looking at a
      * black screen until they happen to press something that forces a
-     * repaint. Restore on every path, accepted or cancelled.
+    * repaint. Restore on every path, accepted or cancelled.
      */
     present(service, frame, ui);
+    text_input_retire_modal_latch();
     return accepted;
 }
 

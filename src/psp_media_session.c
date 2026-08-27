@@ -76,6 +76,9 @@
    Leave two writes for non-media failures under the user's ten-write run
    ceiling even if several distinct videos fail in one process. */
 #define PSP_MEDIA_FAILURE_REPORT_MAXIMUM_WRITES 8u
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+#define PSP_MEDIA_STARTUP_TRACE_SAMPLE_COUNT 4u
+#endif
 
 uint64_t psp_media_recovery_position_us(
     const PspMediaSession *media);
@@ -303,6 +306,75 @@ static uint64_t psp_media_now_us(const PspMediaSession *media)
     return media != NULL && media->platform.now_us != NULL
         ? media->platform.now_us(media->platform.context) : 0;
 }
+
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static void psp_media_startup_trace_sample(PspMediaSession *media)
+{
+    static const uint32_t thresholds_us[
+        PSP_MEDIA_STARTUP_TRACE_SAMPLE_COUNT] = {
+            0u, 250000u, 1000000u, 2000000u
+        };
+    if (media == NULL || media->playback == NULL
+        || !media->startup_trace_presented_seen
+        || media->startup_trace_count >= PSP_MEDIA_STARTUP_TRACE_SAMPLE_COUNT)
+        return;
+    uint64_t now_us = psp_media_now_us(media);
+    uint64_t since_present_us = now_us - (
+        media->startup_trace_opened_us
+        + media->startup_trace_presented_elapsed_us);
+    unsigned index = media->startup_trace_count;
+    if (since_present_us < thresholds_us[index]) return;
+
+    uint64_t audio_us = 0;
+    MediaBackendStats backend = {0};
+    bool audio_valid = media_playback_audio_cursor_us(
+        media->playback, &audio_us);
+    bool video_valid = media_playback_backend_stats(
+        media->playback, &backend)
+        && backend.video_claims_displayed != 0;
+    media->startup_trace_elapsed_us[index] =
+        now_us - media->startup_trace_opened_us;
+    media->startup_trace_audio_us[index] = audio_us;
+    media->startup_trace_video_us[index] = backend.presented_video_us;
+    media->startup_trace_clock_us[index] = media->clock_us;
+    media->startup_trace_valid[index] =
+        (uint8_t) ((audio_valid ? 1u : 0u) | (video_valid ? 2u : 0u));
+    media->startup_trace_count++;
+}
+
+static void psp_media_startup_trace_report(const PspMediaSession *media)
+{
+    if (media == NULL || media->startup_trace_opened_us == 0) return;
+    printf("tilefinch-media-startup: first-frame=%lluus frame-valid=%d "
+           "first-audio=%lluus audio-valid=%d first-present=%lluus "
+           "present-valid=%d samples=%u\n",
+           (unsigned long long) media->startup_trace_first_frame_elapsed_us,
+           media->startup_trace_first_frame_seen ? 1 : 0,
+           (unsigned long long) media->startup_trace_first_audio_elapsed_us,
+           media->startup_trace_first_audio_seen ? 1 : 0,
+           (unsigned long long) media->startup_trace_presented_elapsed_us,
+           media->startup_trace_presented_seen ? 1 : 0,
+           (unsigned) media->startup_trace_count);
+    for (unsigned i = 0; i < media->startup_trace_count; i++) {
+        uint64_t audio_us = media->startup_trace_audio_us[i];
+        uint64_t video_us = media->startup_trace_video_us[i];
+        int64_t skew_us = audio_us >= video_us
+            ? (audio_us - video_us > INT64_MAX
+                ? INT64_MAX : (int64_t) (audio_us - video_us))
+            : (video_us - audio_us > INT64_MAX
+                ? INT64_MIN : -(int64_t) (video_us - audio_us));
+        printf("tilefinch-media-startup-sample: n=%u elapsed=%lluus "
+               "clock=%lluus audio=%lluus video=%lluus skew=%lldus "
+               "audio-valid=%d video-valid=%d\n",
+               i, (unsigned long long) media->startup_trace_elapsed_us[i],
+               (unsigned long long) media->startup_trace_clock_us[i],
+               (unsigned long long) audio_us,
+               (unsigned long long) video_us, (long long) skew_us,
+               (media->startup_trace_valid[i] & 1u) != 0,
+               (media->startup_trace_valid[i] & 2u) != 0);
+    }
+}
+#endif
 
 PspMediaEvent psp_media_service_completion(
     const PspMediaSession *media, PspMediaEventType type)
@@ -990,6 +1062,9 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     media->resolver_job = NULL;
     youtube_resolve_job_destroy(media->prepared_resolver_job);
     media->prepared_resolver_job = NULL;
+    youtube_resolve_job_destroy(media->caption_resolver_job);
+    media->caption_resolver_job = NULL;
+    media->caption_resolution_pending = false;
     if (media->subtitle_request_id != 0) {
         (void) fetch_background_transport_cancel(
             media->subtitle_request_id, "subtitle request closed");
@@ -997,6 +1072,9 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     }
     youtube_subtitles_destroy(media->subtitles);
     media->subtitles = NULL;
+    youtube_subtitles_builder_destroy(media->subtitle_builder);
+    media->subtitle_builder = NULL;
+    media->subtitle_received_bytes = 0;
     media->subtitle_cue_cursor = 0;
     media->subtitle_request_attempted = false;
     psp_ui_media_set_subtitle(&media->ui, NULL);
@@ -1010,6 +1088,9 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     if (media->have_frame)
         media_playback_note_frame_quiesced(media->playback, &media->frame);
     psp_media_telemetry_report_feed(media, "teardown");
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_media_startup_trace_report(media);
+#endif
     if (media->playback != NULL) {
         MediaPlaybackJobStats stats = {0};
         MediaBackendStats backend_stats = {0};
@@ -1143,6 +1224,16 @@ void psp_media_pipeline_destroy(PspMediaSession *media)
     media->first_frame_pump_us = 0;
     media->first_frame_bytes = 0;
     media->first_frame_codec_logged = false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    media->startup_trace_opened_us = 0;
+    media->startup_trace_first_frame_elapsed_us = 0;
+    media->startup_trace_first_audio_elapsed_us = 0;
+    media->startup_trace_presented_elapsed_us = 0;
+    media->startup_trace_count = 0;
+    media->startup_trace_first_frame_seen = false;
+    media->startup_trace_first_audio_seen = false;
+    media->startup_trace_presented_seen = false;
+#endif
     media->decode_no_progress_ms = 0;
     media->decode_last_packets = 0;
     media->decode_last_range_bytes = 0;
@@ -1171,6 +1262,8 @@ void psp_media_shutdown(PspMediaSession *media)
         .retain_pipeline = false
     }, "shutdown-close");
     psp_media_pipeline_destroy(media);
+    budget_free(media->budget, media->caption_catalog);
+    media->caption_catalog = NULL;
     psp_media_set_transport_priority(media, false);
     psp_media_finish_synchronous_quiesce(
         media, "shutdown-released");
@@ -1210,6 +1303,9 @@ void psp_media_init(
     psp_ui_media_bind_presentation(
         &media->ui, &media->ui_presentation);
     psp_ui_media_set_title_font(&media->ui, title_font);
+    psp_ui_media_set_subtitle_style(
+        &media->ui, browser_profile_subtitle_size(profile),
+        browser_profile_subtitle_background(profile));
     media->machine = psp_media_machine_initial();
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 #endif
@@ -1900,6 +1996,86 @@ static void psp_media_request_user_retry(PspMediaSession *media)
     }, "retry-intent");
 }
 
+static void psp_media_request_track_reopen(PspMediaSession *media)
+{
+    if (media == NULL || media->source[0] == '\0'
+        || media->playback == NULL) return;
+    uint64_t resume_us = psp_media_recovery_position_us(media);
+    bool resume_playing = media->ui.playing
+        || psp_media_machine_wants_playing(media)
+        || media->job_resume_playing;
+    psp_media_dispatch(media, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_CLOSE,
+        .retain_pipeline = false
+    }, "track-switch-close");
+    psp_media_pipeline_destroy(media);
+    psp_media_finish_synchronous_quiesce(media, "track-switch-released");
+    if (media_psp_backend_quarantined()) {
+        psp_media_job_failed(
+            media, "track switch", "VIDEO DECODER NEEDS APP RESTART");
+        return;
+    }
+    media->clock_us = resume_us;
+    media->reopen_resume_us = resume_us;
+    media->reopen_resume_playing = resume_playing;
+    media->reopen_resume_pending = true;
+    media->reopen_reuse_resolved_stream = false;
+    media->reopen_seek_completion_pending = true;
+    media->open_service_pending = true;
+    psp_media_dispatch(media, (PspMediaEvent) {
+        .type = PSP_MEDIA_EVENT_OPEN,
+        .autoplay = resume_playing,
+        .has_separate_audio = false,
+        .audio_only = media->audio_only
+    }, "track-switch-open");
+    psp_ui_media_set_resolving(&media->ui, "Switching audio");
+}
+
+static void psp_media_reset_subtitle_document(PspMediaSession *media,
+                                              const char *reason)
+{
+    if (media == NULL) return;
+    if (media->subtitle_request_id != 0) {
+        (void) fetch_background_transport_cancel(
+            media->subtitle_request_id,
+            reason == NULL ? "subtitle selection changed" : reason);
+        media->subtitle_request_id = 0;
+    }
+    youtube_subtitles_destroy(media->subtitles);
+    media->subtitles = NULL;
+    youtube_subtitles_builder_destroy(media->subtitle_builder);
+    media->subtitle_builder = NULL;
+    media->subtitle_received_bytes = 0;
+    media->subtitle_request_attempted = false;
+    media->subtitle_cue_cursor = 0;
+    psp_ui_media_set_subtitle(&media->ui, NULL);
+}
+
+static void psp_media_request_caption_resolution(PspMediaSession *media,
+                                                 uint8_t track_index)
+{
+    if (media == NULL || track_index >= media->stream.caption_track_count)
+        return;
+    const YoutubeTrack *track = &media->stream.caption_tracks[track_index];
+    snprintf(media->track_preferences.caption_track_id,
+             sizeof(media->track_preferences.caption_track_id),
+             "%s", track->id);
+    youtube_resolve_job_destroy(media->caption_resolver_job);
+    media->caption_resolver_job = NULL;
+    const char *catalog_url = youtube_caption_catalog_url(
+        media->caption_catalog, track->id);
+    media->caption_resolution_pending = catalog_url == NULL;
+    if (catalog_url != NULL) {
+        snprintf(media->stream.caption_url,
+                 sizeof(media->stream.caption_url), "%s", catalog_url);
+    } else {
+        media->stream.caption_url[0] = '\0';
+    }
+    psp_media_reset_subtitle_document(media, "subtitle track changed");
+    media->stream.selected_caption_track = (int8_t) track_index;
+    media->ui_presentation.selected_subtitle_track = (int8_t) track_index;
+}
+
 void psp_media_execute_intent(PspMediaSession *media,
                                      PspUiMediaIntent intent)
 {
@@ -2043,7 +2219,7 @@ void psp_media_execute_intent(PspMediaSession *media,
                              sizeof(media->track_preferences.audio_language),
                              "%s", track->language);
                     media->track_preferences.prefer_original_audio = false;
-                    psp_media_request_user_retry(media);
+                    psp_media_request_track_reopen(media);
                 }
             }
             break;
@@ -2052,28 +2228,18 @@ void psp_media_execute_intent(PspMediaSession *media,
                 media->track_preferences.caption_track_id[0] = '\0';
                 media->stream.selected_caption_track = -1;
                 media->stream.caption_url[0] = '\0';
-                if (media->subtitle_request_id != 0) {
-                    (void) fetch_background_transport_cancel(
-                        media->subtitle_request_id,
-                        "subtitles turned off");
-                    media->subtitle_request_id = 0;
-                }
-                youtube_subtitles_destroy(media->subtitles);
-                media->subtitles = NULL;
-                media->subtitle_request_attempted = false;
-                media->subtitle_cue_cursor = 0;
+                youtube_resolve_job_destroy(media->caption_resolver_job);
+                media->caption_resolver_job = NULL;
+                media->caption_resolution_pending = false;
+                psp_media_reset_subtitle_document(
+                    media, "subtitles turned off");
                 media->ui_presentation.selected_subtitle_track = -1;
-                psp_ui_media_set_subtitle(&media->ui, NULL);
             } else if (intent.track_index
                            < media->stream.caption_track_count
                        && media->stream.selected_caption_track
                            != (int) intent.track_index) {
-                const YoutubeTrack *track =
-                    &media->stream.caption_tracks[intent.track_index];
-                snprintf(media->track_preferences.caption_track_id,
-                         sizeof(media->track_preferences.caption_track_id),
-                         "%s", track->id);
-                psp_media_request_user_retry(media);
+                psp_media_request_caption_resolution(
+                    media, intent.track_index);
             }
             break;
         case PSP_UI_MEDIA_ACTION_CLOSE:
@@ -2086,10 +2252,91 @@ void psp_media_execute_intent(PspMediaSession *media,
     psp_media_session_checkpoint(media, "intent");
 }
 
+static __attribute__((noinline)) bool
+psp_media_subtitle_finish_request(PspMediaSession *media)
+{
+    if (media == NULL || media->subtitle_request_id == 0) return false;
+    FetchBackgroundMediaResponse result = {0};
+    uint64_t request = media->subtitle_request_id;
+    media->subtitle_request_id = 0;
+    bool taken = fetch_background_transport_take_media_result_consumed(
+        request, &result, media->subtitle_received_bytes);
+    if (taken && result.status_code >= 200 && result.status_code < 300
+        && media->subtitle_builder != NULL) {
+        media->subtitles = youtube_subtitles_builder_finish(
+            media->subtitle_builder);
+        media->subtitle_builder = NULL;
+    } else {
+        youtube_subtitles_builder_destroy(media->subtitle_builder);
+        media->subtitle_builder = NULL;
+    }
+    if (media->subtitles != NULL) {
+        printf("tilefinch-subtitles: loaded cues=%zu bytes=%zu\n",
+               youtube_subtitles_cue_count(media->subtitles),
+               media->subtitle_received_bytes);
+    } else {
+        printf("tilefinch-subtitles: load failed http=%ld bytes=%zu %.120s\n",
+               result.status_code, media->subtitle_received_bytes,
+               result.error);
+    }
+    media->subtitle_received_bytes = 0;
+    return media->subtitles != NULL;
+}
+
 static bool psp_media_subtitle_pump(PspMediaSession *media)
 {
-    if (media == NULL || media->track_preferences.caption_track_id[0] == '\0'
-        || media->stream.caption_url[0] == '\0') return false;
+    if (media == NULL || media->track_preferences.caption_track_id[0] == '\0')
+        return false;
+    if (media->caption_resolution_pending) {
+        if (media->caption_resolver_job == NULL) {
+            if (!fetch_background_transport_available()) return false;
+            media->caption_resolver_job = youtube_resolve_job_begin(
+                media->budget, media->session, media->source,
+                (int) media->requested_quality, 30000,
+                psp_media_cancel_callback, media);
+            if (media->caption_resolver_job == NULL
+                || !youtube_resolve_job_set_track_preferences(
+                       media->caption_resolver_job,
+                       &media->track_preferences)) {
+                youtube_resolve_job_destroy(media->caption_resolver_job);
+                media->caption_resolver_job = NULL;
+                return false;
+            }
+        }
+        YoutubeResolveJobStatus status =
+            youtube_resolve_job_pump(media->caption_resolver_job);
+        if (status == YOUTUBE_RESOLVE_JOB_PENDING) return false;
+        bool selected = status == YOUTUBE_RESOLVE_JOB_COMPLETE
+            && youtube_resolve_job_take_captions(
+                   media->caption_resolver_job, &media->stream)
+            && media->stream.selected_caption_track >= 0
+            && media->stream.caption_url[0] != '\0';
+        if (selected) {
+            YoutubeCaptionCatalog *catalog = budget_malloc_category(
+                media->budget, BUDGET_CATEGORY_RESOURCE,
+                sizeof(*catalog));
+            if (catalog != NULL
+                && youtube_resolve_job_copy_caption_catalog(
+                    media->caption_resolver_job, catalog)) {
+                budget_free(media->budget, media->caption_catalog);
+                media->caption_catalog = catalog;
+            } else {
+                budget_free(media->budget, catalog);
+            }
+            psp_media_publish_track_catalog(media);
+        } else {
+            printf("tilefinch-subtitles: selection resolve failed: %.160s\n",
+                   youtube_resolve_job_error(media->caption_resolver_job));
+            media->track_preferences.caption_track_id[0] = '\0';
+            media->stream.selected_caption_track = -1;
+            media->stream.caption_url[0] = '\0';
+            media->ui_presentation.selected_subtitle_track = -1;
+        }
+        youtube_resolve_job_destroy(media->caption_resolver_job);
+        media->caption_resolver_job = NULL;
+        media->caption_resolution_pending = false;
+    }
+    if (media->stream.caption_url[0] == '\0') return false;
     if (media->subtitles == NULL && media->subtitle_request_id == 0
         && !media->subtitle_request_attempted) {
         /* Captions are optional. They never occupy the two descriptors
@@ -2099,6 +2346,14 @@ static bool psp_media_subtitle_pump(PspMediaSession *media)
             || psp_media_sample_readiness(media)
                    != PSP_MEDIA_PRESENTATION_READY) return false;
         if (!fetch_background_transport_available()) {
+            media->subtitle_request_attempted = true;
+            return false;
+        }
+        uint64_t minimum_time_us = media->clock_us > UINT64_C(5000000)
+            ? media->clock_us - UINT64_C(5000000) : 0;
+        media->subtitle_builder = youtube_subtitles_builder_create(
+            media->budget, minimum_time_us);
+        if (media->subtitle_builder == NULL) {
             media->subtitle_request_attempted = true;
             return false;
         }
@@ -2112,10 +2367,15 @@ static bool psp_media_subtitle_pump(PspMediaSession *media)
             .redirect_url_validator = youtube_caption_url_supported
         };
         media->subtitle_request_id =
-            fetch_background_transport_enqueue(
+            fetch_background_transport_enqueue_stream_sized(
                 media->stream.caption_url, &request,
-                YOUTUBE_SUBTITLE_BODY_LIMIT, 15000);
-        if (media->subtitle_request_id == 0) return false;
+                YOUTUBE_SUBTITLE_WIRE_LIMIT, 20000, 16u * KIB);
+        if (media->subtitle_request_id == 0) {
+            youtube_subtitles_builder_destroy(media->subtitle_builder);
+            media->subtitle_builder = NULL;
+            return false;
+        }
+        media->subtitle_received_bytes = 0;
         media->subtitle_request_attempted = true;
         return false;
     }
@@ -2124,27 +2384,35 @@ static bool psp_media_subtitle_pump(PspMediaSession *media)
         if (!fetch_background_transport_progress(
                 media->subtitle_request_id, &progress)) {
             media->subtitle_request_id = 0;
+            youtube_subtitles_builder_destroy(media->subtitle_builder);
+            media->subtitle_builder = NULL;
+            media->subtitle_received_bytes = 0;
             return false;
         }
-        if (!progress.complete) return false;
-        FetchResult *result = fetch_result_create(media->budget);
-        uint64_t request = media->subtitle_request_id;
-        media->subtitle_request_id = 0;
-        if (result == NULL) {
-            /* A completed descriptor still has to be retired when response
-               materialization is refused by the page budget. Leaving it in
-               COMPLETE would permanently reduce the bounded transport pool. */
-            (void) fetch_background_transport_cancel(
-                request, "subtitle result admission failed");
-            return false;
+        unsigned char chunk[2u * KIB];
+        for (unsigned unit = 0; unit < 4u; unit++) {
+            size_t length = 0;
+            if (!fetch_background_transport_take_chunk(
+                    media->subtitle_request_id, chunk,
+                    sizeof(chunk), &length) || length == 0) break;
+            if (!youtube_subtitles_builder_feed(
+                    media->subtitle_builder, chunk, length)) {
+                (void) fetch_background_transport_cancel(
+                    media->subtitle_request_id,
+                    "subtitle parser bound exceeded");
+                media->subtitle_request_id = 0;
+                youtube_subtitles_builder_destroy(media->subtitle_builder);
+                media->subtitle_builder = NULL;
+                media->subtitle_received_bytes = 0;
+                return false;
+            }
+            media->subtitle_received_bytes += length;
         }
-        bool taken = fetch_background_transport_take_fetch_result(
-            request, media->budget, result);
-        if (taken && result->status_code >= 200 && result->status_code < 300)
-            media->subtitles = youtube_subtitles_parse_vtt(
-                media->budget, (const unsigned char *) result->data,
-                result->length);
-        if (result != NULL) fetch_result_free(result);
+        if (!fetch_background_transport_progress(
+                media->subtitle_request_id, &progress)) return false;
+        if (!progress.complete || progress.available_body_bytes != 0)
+            return false;
+        (void) psp_media_subtitle_finish_request(media);
     }
     if (media->subtitles == NULL) return false;
     const char *text = youtube_subtitles_text_at(
@@ -2514,25 +2782,48 @@ bool psp_media_advance(
         && !media->machine.preview_active
         && !media->presentation_preroll_audio_held) {
         uint64_t elapsed_us = (uint64_t) elapsed_ms * 1000u;
-        media->clock_us = elapsed_us > UINT64_MAX - media->clock_us
-            ? UINT64_MAX : media->clock_us + elapsed_us;
         /* The DAC is the stable clock for an A/V stream. Its cursor is based
            on blocks actually accepted by the output worker, not on decode
-           head or queued PCM. Following it prevents a startup video delay
-           from permanently pulling the UI/video clock behind audible sound.
-           Video-only streams retain the wall clock above. */
+           head or queued PCM. Before its first accepted block there is no
+           audio clock yet: keep the first picture still instead of advancing
+           on wall time and then rewinding when the cursor appears. Video-only
+           streams retain the wall clock. */
         uint64_t audio_cursor_us = 0;
-        if (media_playback_audio_cursor_us(
-                media->playback, &audio_cursor_us))
-            media->clock_us = audio_cursor_us;
+        bool audio_cursor_valid = media_playback_audio_cursor_us(
+            media->playback, &audio_cursor_us);
+        bool has_audio = media_playback_has_audio(media->playback);
+        uint64_t provisional_limit_us = 0;
+        if (has_audio && !audio_cursor_valid && media->have_frame
+            && media->frame.duration_us != 0) {
+            provisional_limit_us = media->frame.duration_us
+                    > UINT64_MAX - media->frame.pts_us
+                ? UINT64_MAX
+                : media->frame.pts_us + media->frame.duration_us;
+        }
+        media->clock_us = psp_media_presentation_clock_step_us(
+            media->clock_us, elapsed_us,
+            has_audio, audio_cursor_valid, audio_cursor_us,
+            provisional_limit_us);
+        if (audio_cursor_valid) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            if (!media->startup_trace_first_audio_seen
+                && media->startup_trace_opened_us != 0) {
+                media->startup_trace_first_audio_seen = true;
+                media->startup_trace_first_audio_elapsed_us =
+                    psp_media_now_us(media) - media->startup_trace_opened_us;
+            }
+#endif
+        }
     }
     char error[256] = {0};
-    bool awaiting_first_frame =
+    bool first_frame_pending = psp_media_first_frame_pending(
+        media->have_frame, media->first_frame_opened_us);
+    bool awaiting_pause_boundary =
         media->pause_boundary_pending && !media->have_frame;
     uint64_t decode_clock_us = psp_media_session_decode_clock_us(
-        media, awaiting_first_frame);
-    bool catch_up = media->ui.playing && !awaiting_first_frame;
-    uint64_t pump_started_us = awaiting_first_frame || catch_up
+        media, first_frame_pending);
+    bool catch_up = media->ui.playing && !awaiting_pause_boundary;
+    uint64_t pump_started_us = first_frame_pending || catch_up
         ? psp_media_now_us(media) : 0;
     size_t pump_packets_before = 0;
     if (catch_up) {
@@ -2630,7 +2921,7 @@ bool psp_media_advance(
            false cadence outlier. All source counters remain cumulative, so
            the teardown report loses no information. */
     }
-    if (awaiting_first_frame) {
+    if (first_frame_pending) {
         /* Time the browser spent blocked inside the bounded pump. The codec
            worker is asynchronous, so seconds here mean an HTTP range read. */
         uint64_t pump_ended_us = psp_media_now_us(media);
@@ -2638,7 +2929,7 @@ bool psp_media_advance(
             ? pump_ended_us - pump_started_us : 0;
     }
     if (advance == MEDIA_PLAYBACK_ADVANCE_CANCELLED) {
-        bool interrupted_first_frame = awaiting_first_frame;
+        bool interrupted_first_frame = first_frame_pending;
         psp_media_interrupt_decode(media);
         if (interrupted_first_frame && !media->have_frame) {
             /* cancel_decode retires pause_boundary_pending and the
@@ -2779,6 +3070,14 @@ bool psp_media_advance(
         if (media->presentation_preroll_startup_claimed
             && displayed
                  > media->presentation_preroll_displayed_baseline) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            if (!media->startup_trace_presented_seen
+                && media->startup_trace_opened_us != 0) {
+                media->startup_trace_presented_seen = true;
+                media->startup_trace_presented_elapsed_us =
+                    psp_media_now_us(media) - media->startup_trace_opened_us;
+            }
+#endif
             printf("tilefinch-media-clock: event=startup-prime-ready "
                    "video-ready=%u displayed=%zu\n", ready, displayed);
             psp_media_complete_priming_if_ready(
@@ -2793,6 +3092,7 @@ bool psp_media_advance(
             media_playback_take_video_frame(media->playback, &frame);
     frame_progress = frame_progress || received_frame;
     if (received_frame) {
+        uint64_t first_frame_opened_us = media->first_frame_opened_us;
         if (media->presentation_preroll_startup)
             media->presentation_preroll_startup_claimed = true;
         if (media->presentation_floor_us != 0
@@ -2811,6 +3111,23 @@ bool psp_media_advance(
         media->have_frame = true;
         media->first_frame_started_us = 0;
         media->no_frame_ms = 0;
+        if (first_frame_opened_us != 0) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            if (!media->startup_trace_first_frame_seen
+                && media->startup_trace_opened_us != 0) {
+                media->startup_trace_first_frame_seen = true;
+                media->startup_trace_first_frame_elapsed_us =
+                    psp_media_now_us(media) - media->startup_trace_opened_us;
+            }
+#endif
+            printf("tilefinch-media-first-frame: stage=take-frame "
+                   "elapsed=%lluus pump=%lluus pts=%lluus clock=%lluus\n",
+                   (unsigned long long) (
+                       psp_media_now_us(media) - first_frame_opened_us),
+                   (unsigned long long) media->first_frame_pump_us,
+                   (unsigned long long) frame.pts_us,
+                   (unsigned long long) media->clock_us);
+        }
         if (media->pause_boundary_pending) {
             media->pause_boundary_pending = false;
             psp_media_dispatch(media, psp_media_service_completion(
@@ -2819,12 +3136,6 @@ bool psp_media_advance(
             psp_media_release_presentation_preroll(media, true);
             media_playback_set_playing(media->playback, false);
             media->ui.playing = false;
-            printf("tilefinch-media-first-frame: stage=take-frame "
-                   "elapsed=%lluus pump=%lluus\n",
-                   (unsigned long long) (
-                       psp_media_now_us(media)
-                       - media->first_frame_opened_us),
-                   (unsigned long long) media->first_frame_pump_us);
             printf("tilefinch-media: first frame ready through bounded job\n");
         }
         if (priming_before_take)
@@ -2912,6 +3223,9 @@ bool psp_media_advance(
     }
     psp_media_buffering_update(
         media, &job_stats, psp_media_now_us(media));
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_media_startup_trace_sample(media);
+#endif
     bool packets_advanced =
         job_stats.packets_submitted != media->decode_last_packets;
     /* A pipeline waiting on its next window is making progress as long as the
@@ -3074,10 +3388,10 @@ bool psp_media_advance(
                job_stats.would_block_calls, source_refilling ? 1 : 0);
         return true;
     }
-    awaiting_first_frame =
-        media->pause_boundary_pending && !media->have_frame;
+    first_frame_pending = psp_media_first_frame_pending(
+        media->have_frame, media->first_frame_opened_us);
     uint64_t now_us = psp_media_now_us(media);
-    if (!awaiting_first_frame) {
+    if (!first_frame_pending) {
         media->first_frame_opened_us = 0;
         media->first_frame_pump_us = 0;
     } else if (media->first_frame_opened_us != 0) {
@@ -3156,7 +3470,7 @@ bool psp_media_advance(
             .type = PSP_MEDIA_EVENT_PLAYBACK_ENDED
         }, "playback-ended");
     }
-    if (awaiting_first_frame) {
+    if (first_frame_pending) {
         size_t packet_steps = job_stats.packets_submitted > 7u
             ? 7u : job_stats.packets_submitted;
         /* Network-versus-decoder attribution remains in telemetry. The

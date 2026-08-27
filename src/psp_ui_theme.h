@@ -2,13 +2,14 @@
 #define TILEFINCH_PSP_UI_THEME_H
 
 /*
- * Chrome design tokens for the "Ember" visual language, flattened for the
+ * Chrome design tokens for Tilefinch's visual language, flattened for the
  * RGB565 flat-fill renderer: every alpha-over-ground composite in the
  * original design is pre-multiplied here into a solid color. Chrome surfaces
  * draw with these tokens only; page content colors stay owned by the engine.
  *
- * The accent is theme-selectable (Options -> Theme); everything else is
- * fixed so the three accents stay legible on the same grounds.
+ * These are the built-in dark palette's source values. Runtime chrome reads
+ * a complete palette so the built-in light theme and an optional bounded
+ * custom file can replace colors without changing geometry or typography.
  */
 
 #include <stdint.h>
@@ -36,7 +37,9 @@
 #define PSP_THEME_TEXT_MUTED     PSP_THEME_RGB(0x89, 0x84, 0x80) /* secondary */
 #define PSP_THEME_TEXT_FAINT     PSP_THEME_RGB(0x68, 0x63, 0x60) /* disabled */
 
-/* Accents. Ember is the default; the on-accent ink is shared. */
+/* Accents. Midnight is the blue default; Ember remains available. */
+#define PSP_THEME_ACCENT_MIDNIGHT PSP_THEME_RGB(0x3D, 0x78, 0xB6)
+#define PSP_THEME_ACCENT_MIDNIGHT_HI PSP_THEME_RGB(0x72, 0xAA, 0xE2)
 #define PSP_THEME_ACCENT_EMBER   PSP_THEME_RGB(0xE8, 0x82, 0x3C)
 #define PSP_THEME_ACCENT_EMBER_HI PSP_THEME_RGB(0xF4, 0xA5, 0x6F)
 #define PSP_THEME_ACCENT_COBALT  PSP_THEME_RGB(0x5A, 0xA2, 0xF0)

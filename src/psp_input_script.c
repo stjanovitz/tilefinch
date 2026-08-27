@@ -132,6 +132,9 @@ const char *psp_input_script_setting_name(PspUiSettingId setting)
         case PSP_UI_SETTING_VIDEO_LANGUAGE: return "video-language";
         case PSP_UI_SETTING_SUBTITLE_LANGUAGE: return "subtitle-language";
         case PSP_UI_SETTING_ALTERNATE_LANGUAGE: return "alternate-language";
+        case PSP_UI_SETTING_SUBTITLE_SIZE: return "subtitle-size";
+        case PSP_UI_SETTING_SUBTITLE_BACKGROUND:
+            return "subtitle-background";
         case PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS:
             return "youtube-compact-results";
         case PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY:
@@ -185,6 +188,7 @@ const char *psp_input_script_screen_name(PspUiScreen screen)
         case PSP_UI_SCREEN_OPTION_ITEMS: return "option-items";
         case PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS: return "experimental";
         case PSP_UI_SCREEN_GLYPH_OPTIONS: return "glyph-options";
+        case PSP_UI_SCREEN_THEME_OPTIONS: return "theme-options";
         case PSP_UI_SCREEN_VIDEO_LANGUAGE_OPTIONS:
             return "video-language-options";
         case PSP_UI_SCREEN_UPDATE: return "update";

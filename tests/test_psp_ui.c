@@ -1,10 +1,13 @@
 #include "tilefinch/psp_ui.h"
 #include "tilefinch/psp_power_policy.h"
+#include "tilefinch/youtube_subtitles.h"
 #include "../src/psp_ui_theme.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -12,6 +15,44 @@
         return false; \
     } \
 } while (0)
+
+static unsigned menu_blit_calls;
+static unsigned menu_blit_source_changes;
+static bool menu_blit_valid;
+
+static bool test_menu_blit(
+    void *context, const uint16_t *source, int source_width,
+    int source_height, int source_stride, bool source_changed,
+    uint32_t *destination, int destination_stride, int left, int top)
+{
+    (void) context;
+    if (source_width == (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH
+        && source_height == (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT) {
+        menu_blit_calls++;
+        if (source_changed) menu_blit_source_changes++;
+    }
+    if (source == NULL || destination == NULL || source_width <= 0
+        || source_height <= 0 || source_stride < source_width
+        || destination_stride < left + source_width || left < 0 || top < 0) {
+        menu_blit_valid = false;
+        return false;
+    }
+    for (int y = 0; y < source_height; y++) {
+        for (int x = 0; x < source_width; x++) {
+            uint16_t pixel = source[(size_t) y * source_stride + x];
+            unsigned red = (unsigned) (pixel >> 11) & 31u;
+            unsigned green = (unsigned) (pixel >> 5) & 63u;
+            unsigned blue = (unsigned) pixel & 31u;
+            red = (red << 3) | (red >> 2);
+            green = (green << 2) | (green >> 4);
+            blue = (blue << 3) | (blue >> 2);
+            destination[(size_t) (top + y) * destination_stride + left + x]
+                = (uint32_t) red | ((uint32_t) green << 8)
+                    | ((uint32_t) blue << 16) | UINT32_C(0xff000000);
+        }
+    }
+    return true;
+}
 
 static bool test_input_mapping_and_menu(void)
 {
@@ -521,23 +562,34 @@ static bool test_input_mapping_and_menu(void)
           && intent.setting.id == PSP_UI_SETTING_CHROME_THEME
           && intent.setting.value.chrome_theme
                  == BROWSER_CHROME_THEME_OCEAN);
-    /* Three accents cycle; the legacy fourth value steps into the cycle
-       rather than presenting the default accent twice. */
+    /* Left/right remains a fast built-in cycle. Downloaded files are
+       deliberately behind X so an absent file cannot be selected by an
+       accidental horizontal press. */
     input.pressed = PSP_UI_BUTTON_RIGHT;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.chrome_theme == BROWSER_CHROME_THEME_PLUM);
     input.pressed = PSP_UI_BUTTON_RIGHT;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.chrome_theme == BROWSER_CHROME_THEME_FINCH);
-    ui.chrome_theme = BROWSER_CHROME_THEME_EMBER;
+    CHECK(ui.chrome_theme == BROWSER_CHROME_THEME_EMBER);
     input.pressed = PSP_UI_BUTTON_RIGHT;
     intent = psp_ui_update(&ui, &input);
-    CHECK(ui.chrome_theme == BROWSER_CHROME_THEME_OCEAN);
-    input.pressed = PSP_UI_BUTTON_LEFT;
+    CHECK(ui.chrome_theme == BROWSER_CHROME_THEME_LIGHT);
+    input.pressed = PSP_UI_BUTTON_RIGHT;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.chrome_theme == BROWSER_CHROME_THEME_FINCH);
+    input.pressed = PSP_UI_BUTTON_LEFT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.chrome_theme == BROWSER_CHROME_THEME_LIGHT);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_THEME_OPTIONS
+          && intent.theme_catalog_probe_requested);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS
+          && intent.theme_catalog_closed);
     /* CPU ambient motion is retired and no longer occupies an Options row. */
-    CHECK(!ui.wave_enabled && ui.options_selection == 15);
+    CHECK(ui.options_selection == 15);
     ui.options_selection = 16;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
@@ -695,6 +747,22 @@ static bool test_input_mapping_and_menu(void)
     input.pressed = PSP_UI_BUTTON_RIGHT;
     (void) psp_ui_update(&ui, &input);
     CHECK(ui.alternate_language == BROWSER_ALTERNATE_LANGUAGE_NONE);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    (void) psp_ui_update(&ui, &input);
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.subtitle_size == BROWSER_SUBTITLE_SIZE_SMALL
+          && intent.setting.id == PSP_UI_SETTING_SUBTITLE_SIZE
+          && intent.setting.value.subtitle_size
+                 == BROWSER_SUBTITLE_SIZE_SMALL);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    (void) psp_ui_update(&ui, &input);
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.subtitle_background == BROWSER_SUBTITLE_BACKGROUND_SHADOW
+          && intent.setting.id == PSP_UI_SETTING_SUBTITLE_BACKGROUND
+          && intent.setting.value.subtitle_background
+                 == BROWSER_SUBTITLE_BACKGROUND_SHADOW);
     input.pressed = PSP_UI_BUTTON_CANCEL;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_OPTION_ITEMS
@@ -1710,12 +1778,160 @@ static bool test_clamping_and_bounded_state(void)
     return true;
 }
 
-/*
- * Every overlay panel draws the same warm token ground, whatever accent the
- * theme selects. This is the regression guard for the chrome re-theme: a
- * panel that reintroduces its own colour (the pre-Ember cold navy, or a
- * per-theme tint) fails here rather than in a render nobody looked at.
- */
+static bool test_custom_theme_file_is_bounded_and_atomic(void)
+{
+    const char *path = "/tmp/tilefinch-theme-test.tfth";
+    FILE *file = fopen(path, "wb");
+    CHECK(file != NULL);
+    CHECK(fputs(
+        "tilefinch-theme\n"
+        "format=1\n"
+        "name=Harbor Blue\n"
+        "ground=#112233\n"
+        "panel=#E8EDF5\n"
+        "text=#10213A\n"
+        "accent=#336699\n"
+        "accent_high=#77AADD\n", file) >= 0);
+    CHECK(fclose(file) == 0);
+    char error[64];
+    CHECK(psp_ui_theme_load_custom_file(path, error, sizeof(error)));
+    const PspUiThemePalette *custom =
+        psp_ui_theme_palette(BROWSER_CHROME_THEME_CUSTOM);
+    CHECK(custom->ground == PSP_THEME_RGB(0x11, 0x22, 0x33));
+    CHECK(custom->panel == PSP_THEME_RGB(0xE8, 0xED, 0xF5));
+    CHECK(custom->accent == PSP_THEME_RGB(0x33, 0x66, 0x99));
+    CHECK(strcmp(psp_ui_theme_custom_label(), "Harbor Blue") == 0);
+    uint16_t retained = custom->accent;
+
+    file = fopen(path, "wb");
+    CHECK(file != NULL);
+    CHECK(fputs(
+        "tilefinch-theme\nformat=1\naccent=#123456\naccent=broken\n",
+        file) >= 0);
+    CHECK(fclose(file) == 0);
+    CHECK(!psp_ui_theme_load_custom_file(path, error, sizeof(error)));
+    CHECK(psp_ui_theme_palette(BROWSER_CHROME_THEME_CUSTOM)->accent
+          == retained);
+
+    file = fopen(path, "wb");
+    CHECK(file != NULL);
+    CHECK(fputs(
+        "tilefinch-theme\nformat=2\naccent=#123456\n", file) >= 0);
+    CHECK(fclose(file) == 0);
+    CHECK(!psp_ui_theme_load_custom_file(path, error, sizeof(error)));
+    CHECK(strcmp(error, "UNSUPPORTED THEME FORMAT") == 0);
+    CHECK(psp_ui_theme_palette(BROWSER_CHROME_THEME_CUSTOM)->accent
+          == retained);
+
+    file = fopen(path, "wb");
+    CHECK(file != NULL);
+    CHECK(fputs("tilefinch-theme\naccent=#123456\n", file) >= 0);
+    CHECK(fclose(file) == 0);
+    CHECK(!psp_ui_theme_load_custom_file(path, error, sizeof(error)));
+    CHECK(strcmp(error, "THEME FORMAT MISSING") == 0);
+    CHECK(psp_ui_theme_palette(BROWSER_CHROME_THEME_CUSTOM)->accent
+          == retained);
+
+    file = fopen(path, "wb");
+    CHECK(file != NULL);
+    CHECK(fputs("tilefinch-theme\nformat=1\n", file) >= 0);
+    for (unsigned at = 0; at < PSP_UI_THEME_FIELD_LIMIT; at++)
+        CHECK(fputs("# bounded comment\n", file) >= 0);
+    CHECK(fputs("accent=#123456\n", file) >= 0);
+    CHECK(fclose(file) == 0);
+    CHECK(!psp_ui_theme_load_custom_file(path, error, sizeof(error)));
+    CHECK(strcmp(error, "TOO MANY THEME LINES") == 0);
+    CHECK(psp_ui_theme_palette(BROWSER_CHROME_THEME_CUSTOM)->accent
+          == retained);
+    CHECK(remove(path) == 0);
+    return true;
+}
+
+static bool test_theme_catalog_is_bounded_sorted_and_selectable(void)
+{
+    const char *directory = "/tmp/tilefinch-theme-catalog";
+    (void) mkdir(directory, 0700);
+    char alpha[128], zulu[128], invalid[128];
+    snprintf(alpha, sizeof(alpha), "%s/alpha-night.tfth", directory);
+    snprintf(zulu, sizeof(zulu), "%s/zulu.tfth", directory);
+    snprintf(invalid, sizeof(invalid), "%s/not-a-theme.tfth", directory);
+    FILE *file = fopen(zulu, "wb");
+    CHECK(file != NULL
+          && fputs("tilefinch-theme\nformat=1\nname=Zulu Blue\naccent=#123456\n",
+                   file) >= 0
+          && fclose(file) == 0);
+    file = fopen(alpha, "wb");
+    CHECK(file != NULL
+          && fputs("tilefinch-theme\nformat=1\naccent=#ABCDEF\n", file) >= 0
+          && fclose(file) == 0);
+    file = fopen(invalid, "wb");
+    CHECK(file != NULL && fputs("not a theme\n", file) >= 0
+          && fclose(file) == 0);
+
+    Budget budget;
+    budget_init(&budget, 4096u);
+    char error[64];
+    PspUiThemeCatalog *catalog = psp_ui_theme_catalog_create(
+        &budget, directory, "zulu.tfth", error, sizeof(error));
+    CHECK(catalog != NULL && error[0] == '\0'
+          && psp_ui_theme_catalog_count(catalog) == 2u
+          && strcmp(psp_ui_theme_catalog_label(catalog, 0), "Alpha Night") == 0
+          && strcmp(psp_ui_theme_catalog_label(catalog, 1), "Zulu Blue") == 0
+          && strcmp(psp_ui_theme_catalog_filename(catalog, 1),
+                    "zulu.tfth") == 0
+          && psp_ui_theme_catalog_selected(catalog) == 1u
+          && psp_ui_theme_catalog_accent(catalog, 0)
+                 == PSP_THEME_RGB(0xAB, 0xCD, 0xEF)
+          && !psp_ui_theme_catalog_truncated(catalog));
+    psp_ui_theme_catalog_bind(catalog);
+
+    PspUiState ui;
+    psp_ui_init(&ui);
+    ui.screen = PSP_UI_SCREEN_THEME_OPTIONS;
+    ui.chrome_theme = BROWSER_CHROME_THEME_CUSTOM;
+    ui.data_options_selection = BROWSER_CHROME_THEME_CUSTOM + 1u;
+    PspUiInput input = {.pressed = PSP_UI_BUTTON_CONFIRM,
+                        .analog_x = 128, .analog_y = 128};
+    PspUiIntent intent = psp_ui_update(&ui, &input);
+    CHECK(intent.theme_selected
+          && intent.theme_index == BROWSER_CHROME_THEME_CUSTOM + 1u
+          && ui.screen == PSP_UI_SCREEN_OPTION_ITEMS);
+
+    psp_ui_theme_catalog_bind(NULL);
+    psp_ui_theme_catalog_destroy(catalog);
+    CHECK(budget.current == 0u);
+
+    char extras[13][128];
+    for (size_t at = 0; at < 13u; at++) {
+        snprintf(extras[at], sizeof(extras[at]), "%s/early-%02u.tfth",
+                 directory, (unsigned) at);
+        file = fopen(extras[at], "wb");
+        CHECK(file != NULL
+              && fprintf(file,
+                         "tilefinch-theme\nformat=1\nname=Early %02u\n"
+                         "accent=#234567\n",
+                         (unsigned) at) > 0
+              && fclose(file) == 0);
+    }
+    catalog = psp_ui_theme_catalog_create(
+        &budget, directory, "zulu.tfth", error, sizeof(error));
+    size_t selected = psp_ui_theme_catalog_selected(catalog);
+    CHECK(catalog != NULL && psp_ui_theme_catalog_count(catalog)
+                                == PSP_UI_THEME_CATALOG_LIMIT
+          && psp_ui_theme_catalog_truncated(catalog)
+          && selected != SIZE_MAX
+          && strcmp(psp_ui_theme_catalog_filename(catalog, selected),
+                    "zulu.tfth") == 0);
+    psp_ui_theme_catalog_destroy(catalog);
+    CHECK(budget.current == 0u);
+    for (size_t at = 0; at < 13u; at++) CHECK(remove(extras[at]) == 0);
+    CHECK(remove(alpha) == 0 && remove(zulu) == 0 && remove(invalid) == 0
+          && rmdir(directory) == 0);
+    return true;
+}
+
+/* Every overlay uses the complete selected palette. Dark accents retain a
+   common ground, while Daylight and Custom are allowed to replace it. */
 static bool test_panels_draw_the_token_ground(void)
 {
     enum { WIDTH = 480, HEIGHT = 272 };
@@ -1726,7 +1942,8 @@ static bool test_panels_draw_the_token_ground(void)
         PSP_UI_SCREEN_FAILURE_RECOVERY,
         PSP_UI_SCREEN_HELP, PSP_UI_SCREEN_HELP_DETAIL,
         PSP_UI_SCREEN_OPTIONS,
-        PSP_UI_SCREEN_OPTION_ITEMS, PSP_UI_SCREEN_DATA_OPTIONS,
+        PSP_UI_SCREEN_OPTION_ITEMS, PSP_UI_SCREEN_THEME_OPTIONS,
+        PSP_UI_SCREEN_DATA_OPTIONS,
         PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS, PSP_UI_SCREEN_GLYPH_OPTIONS,
         PSP_UI_SCREEN_VIDEO_LANGUAGE_OPTIONS,
         PSP_UI_SCREEN_TABS,
@@ -1734,7 +1951,8 @@ static bool test_panels_draw_the_token_ground(void)
     };
     static const unsigned themes[] = {
         BROWSER_CHROME_THEME_FINCH, BROWSER_CHROME_THEME_OCEAN,
-        BROWSER_CHROME_THEME_PLUM, BROWSER_CHROME_THEME_EMBER
+        BROWSER_CHROME_THEME_PLUM, BROWSER_CHROME_THEME_EMBER,
+        BROWSER_CHROME_THEME_LIGHT, BROWSER_CHROME_THEME_CUSTOM
     };
     for (size_t theme = 0; theme < sizeof(themes) / sizeof(themes[0]);
          theme++) {
@@ -1757,9 +1975,11 @@ static bool test_panels_draw_the_token_ground(void)
              * per-theme tint) collapses these counts.
              */
             size_t ground = 0, hint = 0;
+            const PspUiThemePalette *palette = psp_ui_theme_palette(
+                (BrowserChromeTheme) themes[theme]);
             for (size_t pixel = 0; pixel < WIDTH * HEIGHT; pixel++) {
-                if (frame[pixel] == PSP_THEME_PANEL) ground++;
-                else if (frame[pixel] == PSP_THEME_HINT_BAR) hint++;
+                if (frame[pixel] == palette->panel) ground++;
+                else if (frame[pixel] == palette->hint_bar) hint++;
             }
             CHECK(ground > 10000u);
             CHECK(hint > 1000u);
@@ -2511,6 +2731,7 @@ static bool test_media_controls_and_composite(void)
     intent = psp_ui_media_update(&media, &input);
     CHECK(!presentation.track_menu_open
           && presentation.selected_audio_track == 0
+          && !media.controls_visible
           && intent.action == PSP_UI_MEDIA_ACTION_NONE);
     input.pressed = PSP_UI_BUTTON_TOOLBAR;
     (void) psp_ui_media_update(&media, &input);
@@ -2526,6 +2747,37 @@ static bool test_media_controls_and_composite(void)
     memset(frame, 0, sizeof(frame));
     psp_ui_media_composite(&media, frame, WIDTH, HEIGHT, WIDTH);
     CHECK(frame[(HEIGHT - 110) * WIDTH + WIDTH / 2] != 0);
+
+    /* A long caption occupies both stable rows instead of truncating on the
+       first. Shadow mode leaves untouched video black in this synthetic
+       frame, so pixels in both halves prove both lines were rasterized. */
+    PspUiMediaState caption_media;
+    PspUiMediaPresentation caption_presentation;
+    psp_ui_media_init(&caption_media);
+    psp_ui_media_bind_presentation(
+        &caption_media, &caption_presentation);
+    psp_ui_media_set(&caption_media, true, true, false,
+                     UINT64_C(5000000), UINT64_C(20000000), NULL);
+    caption_media.controls_visible = false;
+    psp_ui_media_set_subtitle_style(
+        &caption_media, BROWSER_SUBTITLE_SIZE_STANDARD,
+        BROWSER_SUBTITLE_BACKGROUND_SHADOW);
+    psp_ui_media_set_subtitle(
+        &caption_media,
+        "This deliberately long subtitle wraps across two stable lines "
+        "without hiding the final words from the viewer");
+    memset(frame, 0, sizeof(frame));
+    psp_ui_media_composite(&caption_media, frame, WIDTH, HEIGHT, WIDTH);
+    bool first_caption_row = false, second_caption_row = false;
+    for (int y = 212; y < 228; y++) {
+        for (int x = 38; x < 442; x++)
+            first_caption_row |= frame[y * WIDTH + x] != 0;
+    }
+    for (int y = 234; y < 252; y++) {
+        for (int x = 38; x < 442; x++)
+            second_caption_row |= frame[y * WIDTH + x] != 0;
+    }
+    CHECK(first_caption_row && second_caption_row);
 
     /* The same rule applies in the other direction. The UI update only makes
        controls visible; Playing becomes Paused when the session consumes the
@@ -3537,7 +3789,6 @@ static bool test_native_motion_budget(void)
 {
     PspUiState ui;
     psp_ui_init(&ui);
-    CHECK(!ui.wave_enabled);
     PspUiHomeView home = home_fixture(3, 1);
     psp_ui_show_home(&ui);
     psp_ui_set_home(&ui, &home);
@@ -3669,14 +3920,16 @@ static bool test_media_overlay_regions_and_the_32_bit_wrapper(void)
     psp_ui_media_set(&media, true, true, false,
                      UINT64_C(5000000), UINT64_C(20000000), "Example video");
     media.controls_visible = false;
+    CHECK(!psp_ui_media_overlay_paints(&media));
     CHECK(psp_ui_media_overlay_regions(
         &media, NULL, WIDTH, HEIGHT, initial_regions,
         PSP_UI_MEDIA_OVERLAY_REGION_LIMIT) == 0);
     psp_ui_media_set_buffering(&media, true, UINT64_C(9000000));
-    CHECK(!media.controls_visible
+    CHECK(!media.controls_visible && psp_ui_media_overlay_paints(&media)
           && media_overlay_regions_cover_every_written_pixel(
                  &media, NULL, WIDTH, HEIGHT, "buffering-pill-only"));
     psp_ui_media_set_buffering(&media, false, UINT64_C(9000000));
+    CHECK(!psp_ui_media_overlay_paints(&media));
     CHECK(psp_ui_media_overlay_regions(
         &media, NULL, WIDTH, HEIGHT, initial_regions,
         PSP_UI_MEDIA_OVERLAY_REGION_LIMIT) == 0);
@@ -3727,6 +3980,171 @@ static bool test_media_overlay_regions_and_the_32_bit_wrapper(void)
     psp_ui_media_set(&media, true, true, false,
                      UINT64_C(5000000), UINT64_C(20000000), "Example video");
     psp_ui_media_show_controls(&media);
+    PspUiMediaPresentation presentation = {0};
+    psp_ui_media_bind_presentation(&media, &presentation);
+    psp_ui_media_set_subtitle(&media, "A synthetic caption");
+    media.controls_visible = false;
+    CHECK(psp_ui_media_overlay_paints(&media));
+    media.controls_visible = true;
+    psp_ui_media_set_subtitle_style(
+        &media, BROWSER_SUBTITLE_SIZE_STANDARD,
+        BROWSER_SUBTITLE_BACKGROUND_BOX);
+    CHECK(media_overlay_regions_cover_every_written_pixel(
+        &media, NULL, WIDTH, HEIGHT, "subtitle-box"));
+    size_t subtitle_regions = psp_ui_media_overlay_regions(
+        &media, NULL, WIDTH, HEIGHT, initial_regions,
+        PSP_UI_MEDIA_OVERLAY_REGION_LIMIT);
+    bool subtitle_box_found = false;
+    for (size_t at = 0; at < subtitle_regions; at++) {
+        if (initial_regions[at].left == 38
+            && initial_regions[at].top == 136
+            && initial_regions[at].right == 442
+            && initial_regions[at].bottom == 186) {
+            subtitle_box_found = true;
+            CHECK(!initial_regions[at].needs_backdrop);
+        }
+    }
+    CHECK(subtitle_box_found);
+    psp_ui_media_set_subtitle(
+        &media,
+        "This deliberately long subtitle wraps across two stable lines "
+        "without hiding the final words from the viewer");
+    CHECK(media_overlay_regions_cover_every_written_pixel(
+        &media, NULL, WIDTH, HEIGHT, "subtitle-box-two-lines"));
+    subtitle_regions = psp_ui_media_overlay_regions(
+        &media, NULL, WIDTH, HEIGHT, initial_regions,
+        PSP_UI_MEDIA_OVERLAY_REGION_LIMIT);
+    subtitle_box_found = false;
+    for (size_t at = 0; at < subtitle_regions; at++) {
+        if (initial_regions[at].left == 38
+            && initial_regions[at].top == 136
+            && initial_regions[at].right == 442
+            && initial_regions[at].bottom == 186) {
+            subtitle_box_found = true;
+            CHECK(!initial_regions[at].needs_backdrop);
+        }
+    }
+    CHECK(subtitle_box_found);
+    psp_ui_media_set_subtitle_style(
+        &media, BROWSER_SUBTITLE_SIZE_SMALL,
+        BROWSER_SUBTITLE_BACKGROUND_SHADOW);
+    CHECK(media_overlay_regions_cover_every_written_pixel(
+        &media, NULL, WIDTH, HEIGHT, "subtitle-shadow"));
+    psp_ui_media_set_subtitle(&media, NULL);
+    presentation.track_menu_open = true;
+    presentation.audio_track_count = 2;
+    snprintf(presentation.audio_tracks[0].label,
+             sizeof(presentation.audio_tracks[0].label), "Original");
+    snprintf(presentation.audio_tracks[1].label,
+             sizeof(presentation.audio_tracks[1].label), "English");
+    CHECK(media_overlay_regions_cover_every_written_pixel(
+        &media, NULL, WIDTH, HEIGHT, "track-menu"));
+    size_t track_menu_regions = psp_ui_media_overlay_regions(
+        &media, NULL, WIDTH, HEIGHT, initial_regions,
+        PSP_UI_MEDIA_OVERLAY_REGION_LIMIT);
+    bool menu_imported = false;
+    size_t menu_imported_pixels = 0u;
+    for (size_t at = 0; at < track_menu_regions; at++) {
+        if (initial_regions[at].needs_backdrop) {
+            menu_imported_pixels += (size_t) (
+                initial_regions[at].right - initial_regions[at].left)
+                * (size_t) (
+                    initial_regions[at].bottom - initial_regions[at].top);
+        }
+        if (initial_regions[at].left == WIDTH / 2 - 176
+            && initial_regions[at].top == 48
+            && initial_regions[at].right == WIDTH / 2 + 176
+            && initial_regions[at].bottom == 224)
+            menu_imported = initial_regions[at].needs_backdrop;
+    }
+    CHECK(!menu_imported && menu_imported_pixels == 0u);
+    CHECK(psp_ui_media_overlay_regions_without_track_menu(
+              &media, NULL, WIDTH, HEIGHT, initial_regions,
+              PSP_UI_MEDIA_OVERLAY_REGION_LIMIT) == 0u);
+
+    /* The retained compact menu is pixel-identical to the ordinary draw,
+       reuses its raster over a changing picture, and invalidates on a visible
+       selection change. */
+    static uint32_t expected_menu_frame[WIDTH * HEIGHT];
+    static uint32_t cached_menu_frame[WIDTH * HEIGHT];
+    static uint16_t expected_menu_scratch[WIDTH * HEIGHT];
+    static uint16_t cached_menu_scratch[WIDTH * HEIGHT];
+    static uint16_t menu_cache_pixels[
+        PSP_UI_MEDIA_TRACK_MENU_WIDTH * PSP_UI_MEDIA_TRACK_MENU_HEIGHT];
+    PspUiMediaTrackMenuCache menu_cache = {0};
+    menu_blit_calls = 0u;
+    menu_blit_source_changes = 0u;
+    menu_blit_valid = true;
+    psp_ui_theme_select(BROWSER_CHROME_THEME_FINCH);
+    for (size_t at = 0; at < WIDTH * HEIGHT; at++) {
+        expected_menu_frame[at] = UINT32_C(0xff3050d0);
+        cached_menu_frame[at] = UINT32_C(0xff3050d0);
+    }
+    psp_ui_media_composite_8888(
+        &media, NULL, expected_menu_frame,
+        WIDTH, HEIGHT, WIDTH, expected_menu_scratch);
+    psp_ui_media_composite_8888_cached(
+        &media, NULL, cached_menu_frame,
+        WIDTH, HEIGHT, WIDTH, cached_menu_scratch,
+        menu_cache_pixels,
+        sizeof(menu_cache_pixels) / sizeof(menu_cache_pixels[0]),
+        7u, &menu_cache, test_menu_blit, NULL);
+    CHECK(menu_cache.valid
+          && menu_blit_valid && menu_blit_calls == 1u
+          && menu_blit_source_changes == 1u
+          && memcmp(expected_menu_frame, cached_menu_frame,
+                    sizeof(expected_menu_frame)) == 0);
+
+    /* A new video picture reuses the already-rasterized source. The device
+       callback uses this fact to avoid a 124 KiB cache writeback per frame. */
+    for (size_t at = 0; at < WIDTH * HEIGHT; at++) {
+        expected_menu_frame[at] = UINT32_C(0xff804020);
+        cached_menu_frame[at] = UINT32_C(0xff804020);
+    }
+    psp_ui_media_composite_8888(
+        &media, NULL, expected_menu_frame,
+        WIDTH, HEIGHT, WIDTH, expected_menu_scratch);
+    psp_ui_media_composite_8888_cached(
+        &media, NULL, cached_menu_frame,
+        WIDTH, HEIGHT, WIDTH, cached_menu_scratch,
+        menu_cache_pixels,
+        sizeof(menu_cache_pixels) / sizeof(menu_cache_pixels[0]),
+        7u, &menu_cache, test_menu_blit, NULL);
+    CHECK(menu_blit_calls == 2u && menu_blit_source_changes == 1u
+          && memcmp(expected_menu_frame, cached_menu_frame,
+                    sizeof(expected_menu_frame)) == 0);
+
+    presentation.track_menu_selection = 1u;
+    for (size_t at = 0; at < WIDTH * HEIGHT; at++) {
+        expected_menu_frame[at] = UINT32_C(0xffd06020);
+        cached_menu_frame[at] = UINT32_C(0xffd06020);
+    }
+    psp_ui_media_composite_8888(
+        &media, NULL, expected_menu_frame,
+        WIDTH, HEIGHT, WIDTH, expected_menu_scratch);
+    psp_ui_media_composite_8888_cached(
+        &media, NULL, cached_menu_frame,
+        WIDTH, HEIGHT, WIDTH, cached_menu_scratch,
+        menu_cache_pixels,
+        sizeof(menu_cache_pixels) / sizeof(menu_cache_pixels[0]),
+        7u, &menu_cache, test_menu_blit, NULL);
+    CHECK(memcmp(expected_menu_frame, cached_menu_frame,
+                 sizeof(expected_menu_frame)) == 0);
+
+    uint32_t midnight_signature = menu_cache.signature;
+    psp_ui_theme_select(BROWSER_CHROME_THEME_LIGHT);
+    for (size_t at = 0; at < WIDTH * HEIGHT; at++)
+        cached_menu_frame[at] = UINT32_C(0xff3050d0);
+    psp_ui_media_composite_8888_cached(
+        &media, NULL, cached_menu_frame,
+        WIDTH, HEIGHT, WIDTH, cached_menu_scratch,
+        menu_cache_pixels,
+        sizeof(menu_cache_pixels) / sizeof(menu_cache_pixels[0]),
+        7u, &menu_cache, test_menu_blit, NULL);
+    CHECK(menu_cache.signature != midnight_signature);
+    psp_ui_theme_select(BROWSER_CHROME_THEME_FINCH);
+
+    presentation.track_menu_open = false;
     static uint32_t video[512 * 272];
     static uint16_t scratch[512 * 272];
     const uint32_t picture = UINT32_C(0xff0000ff);
@@ -3947,6 +4365,149 @@ static bool test_media_buffering_transition_frames_are_stable(void)
     CHECK(!media.controls_visible);
     for (size_t at = 0; at < sizeof(video) / sizeof(video[0]); at++)
         CHECK(video[at] == frames[3]);
+    return true;
+}
+
+/*
+ * A generated-caption boundary is a presentation sequence, not only a text
+ * lookup.  Exercise it over alternating moving-picture buffers: immediately
+ * after a cue ends, the fixed opaque caption ground must not disappear for a
+ * single short transition and then return with the next cue. Short gaps are
+ * bridged completely; genuinely long pauses are blank from their beginning.
+ */
+static bool test_media_subtitle_transition_ground_is_stable(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272, SAMPLE_X = 40, SAMPLE_Y = 210 };
+    static const unsigned char vtt[] =
+        "WEBVTT\n\n"
+        "00:00:02.800 --> 00:00:04.000\n"
+        "First cue\n\n"
+        "00:00:05.000 --> 00:00:06.000\n"
+        "Second cue\n\n";
+    Budget budget;
+    budget_init(&budget, 64u * 1024u);
+    YoutubeSubtitleDocument *document = youtube_subtitles_parse_vtt(
+        &budget, vtt, sizeof(vtt) - 1u);
+    CHECK(document != NULL);
+
+    PspUiMediaState media;
+    PspUiMediaPresentation presentation = {0};
+    psp_ui_media_init(&media);
+    psp_ui_media_set(&media, true, true, false,
+                     UINT64_C(3900000), UINT64_C(20000000), "Captions");
+    psp_ui_media_bind_presentation(&media, &presentation);
+    psp_ui_media_set_subtitle_style(
+        &media, BROWSER_SUBTITLE_SIZE_STANDARD,
+        BROWSER_SUBTITLE_BACKGROUND_BOX);
+    media.controls_visible = false;
+
+    static uint32_t video[2][WIDTH * HEIGHT];
+    static uint16_t scratch[WIDTH * HEIGHT];
+    const uint32_t pictures[] = {
+        UINT32_C(0xff3050d0), UINT32_C(0xffd06020),
+        UINT32_C(0xff20b050), UINT32_C(0xff8040c0)
+    };
+    const uint64_t times[] = {
+        UINT64_C(3900000), UINT64_C(4200000),
+        UINT64_C(4700000), UINT64_C(5100000)
+    };
+    size_t cursor = 0u;
+    uint32_t stable_ground = 0u;
+    for (size_t frame = 0; frame < 4u; frame++) {
+        uint32_t *surface = video[frame & 1u];
+        for (size_t at = 0; at < WIDTH * HEIGHT; at++)
+            surface[at] = pictures[frame];
+        const char *text = youtube_subtitles_text_at(
+            document, times[frame], &cursor);
+        psp_ui_media_set_subtitle(&media, text);
+        psp_ui_media_composite_8888(
+            &media, NULL, surface, WIDTH, HEIGHT, WIDTH, scratch);
+        uint32_t ground = surface[(size_t) SAMPLE_Y * WIDTH + SAMPLE_X];
+        if (frame == 0u) {
+            stable_ground = ground;
+            CHECK(ground != pictures[frame]);
+        } else {
+            CHECK(ground == stable_ground);
+        }
+    }
+    youtube_subtitles_destroy(document);
+    CHECK(budget.current == 0u);
+    return true;
+}
+
+static bool test_media_timeline_churn_is_bounded(void)
+{
+    PspUiMediaState media;
+    psp_ui_media_init(&media);
+    psp_ui_media_set(
+        &media, true, true, false,
+        UINT64_C(100000000), UINT64_C(432000000), "Timeline");
+    CHECK(media.timeline_visual_pixel == 100u);
+
+    /* The displayed knob retains a one-pixel dead band while authoritative
+       playback time continues to advance normally. */
+    psp_ui_media_set(
+        &media, true, true, false,
+        UINT64_C(101000000), UINT64_C(432000000), "Timeline");
+    CHECK(media.current_time_us == UINT64_C(101000000)
+          && media.timeline_visual_pixel == 100u);
+    psp_ui_media_set(
+        &media, true, true, false,
+        UINT64_C(102000000), UINT64_C(432000000), "Timeline");
+    CHECK(media.timeline_visual_pixel == 102u);
+
+    psp_ui_media_set_seek_preview(&media, UINT64_C(103000000));
+    CHECK(media.seek_preview_time_us == UINT64_C(103000000)
+          && media.timeline_visual_pixel == 102u);
+    psp_ui_media_set_seek_preview(&media, UINT64_C(104000000));
+    CHECK(media.timeline_visual_pixel == 104u);
+    psp_ui_media_cancel_seek_preview(&media);
+    CHECK(media.timeline_visual_pixel == 102u);
+
+    /* Buffered progress publishes at most twice per second. A backwards move
+       remains immediate because it represents invalidated transport state. */
+    psp_ui_media_set_buffering(&media, false, UINT64_C(100000000));
+    CHECK(media.buffered_visual_pixel == 100u);
+    psp_ui_media_set_buffering(&media, false, UINT64_C(200000000));
+    psp_ui_media_tick(&media, 499u);
+    CHECK(media.buffered_visual_pixel == 100u);
+    psp_ui_media_tick(&media, 1u);
+    CHECK(media.buffered_visual_pixel == 200u);
+    psp_ui_media_set_buffering(&media, false, UINT64_C(50000000));
+    CHECK(media.buffered_visual_pixel == 50u);
+    return true;
+}
+
+static bool test_media_subtitle_box_has_hard_opaque_edges(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t frame[WIDTH * HEIGHT];
+    const uint16_t moving_picture = UINT16_C(0x2a55);
+    for (size_t at = 0; at < WIDTH * HEIGHT; at++)
+        frame[at] = moving_picture;
+
+    PspUiMediaState media;
+    PspUiMediaPresentation presentation = {0};
+    psp_ui_media_init(&media);
+    psp_ui_media_set(&media, true, true, false,
+                     UINT64_C(5000000), UINT64_C(20000000), "Captions");
+    psp_ui_media_bind_presentation(&media, &presentation);
+    psp_ui_media_set_subtitle_style(
+        &media, BROWSER_SUBTITLE_SIZE_STANDARD,
+        BROWSER_SUBTITLE_BACKGROUND_BOX);
+    psp_ui_media_set_subtitle(&media, "Hard-edged caption ground");
+    media.controls_visible = false;
+    psp_ui_media_composite(&media, frame, WIDTH, HEIGHT, WIDTH);
+
+    /* The standard hidden-controls box is exactly [38,442) x [204,254).
+       Its corners are fully opaque and the immediately adjacent pixels are
+       untouched video; no rounded or antialiased fringe can oscillate. */
+    CHECK(frame[204u * WIDTH + 38u] != moving_picture);
+    CHECK(frame[253u * WIDTH + 441u] != moving_picture);
+    CHECK(frame[204u * WIDTH + 37u] == moving_picture);
+    CHECK(frame[204u * WIDTH + 442u] == moving_picture);
+    CHECK(frame[203u * WIDTH + 38u] == moving_picture);
+    CHECK(frame[254u * WIDTH + 38u] == moving_picture);
     return true;
 }
 
@@ -4188,6 +4749,8 @@ int main(void)
         || !test_autohide_and_loading()
         || !test_navigation_target_replaces_incumbent_address()
         || !test_clamping_and_bounded_state()
+        || !test_custom_theme_file_is_bounded_and_atomic()
+        || !test_theme_catalog_is_bounded_sorted_and_selectable()
         || !test_panels_draw_the_token_ground()
         || !test_page_chrome_holds_its_edge_over_a_light_page()
         || !test_boot_entrance_becomes_home()
@@ -4206,6 +4769,9 @@ int main(void)
         || !test_media_status_uses_antialiased_chrome_font()
         || !test_media_overlay_regions_and_the_32_bit_wrapper()
         || !test_media_buffering_transition_frames_are_stable()
+        || !test_media_subtitle_transition_ground_is_stable()
+        || !test_media_timeline_churn_is_bounded()
+        || !test_media_subtitle_box_has_hard_opaque_edges()
         || !test_media_chrome_is_stable_across_motion_sequence()
         || !test_media_first_frame_transition_keeps_bottom_ground_stable()
         || !test_media_committed_seek_keeps_timeline_stable()

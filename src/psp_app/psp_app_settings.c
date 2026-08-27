@@ -21,6 +21,166 @@ static bool psp_app_boot_override_path(
         output, capacity);
 }
 
+static bool psp_app_theme_filename_valid(const char *filename)
+{
+    if (filename == NULL) return false;
+    size_t length = strlen(filename);
+    if (length <= 5u || length >= BROWSER_PROFILE_THEME_FILE_LIMIT
+        || filename[0] == '.'
+        || strcmp(filename + length - 5u, ".tfth") != 0)
+        return false;
+    for (size_t at = 0; at < length; at++) {
+        char byte = filename[at];
+        bool alphanumeric = (byte >= 'a' && byte <= 'z')
+            || (byte >= 'A' && byte <= 'Z')
+            || (byte >= '0' && byte <= '9');
+        if (!alphanumeric && byte != '-' && byte != '_' && byte != '.')
+            return false;
+    }
+    return true;
+}
+
+bool psp_app_apply_chrome_theme(
+    PspProcessResources *process, BrowserChromeTheme theme,
+    const char *custom_filename,
+    char *error, size_t error_capacity)
+{
+    if (error != NULL && error_capacity != 0u) error[0] = '\0';
+    if (process == NULL || theme < BROWSER_CHROME_THEME_FINCH
+        || theme >= BROWSER_CHROME_THEME_COUNT) return false;
+    if (theme == BROWSER_CHROME_THEME_CUSTOM) {
+        char path[TILEFINCH_INSTALL_PATH_LIMIT];
+        char relative[BROWSER_PROFILE_THEME_FILE_LIMIT + 8u];
+        const char *theme_path = "theme.tfth";
+        if (custom_filename != NULL && custom_filename[0] != '\0') {
+            if (!psp_app_theme_filename_valid(custom_filename)) {
+                if (error != NULL && error_capacity != 0u)
+                    snprintf(error, error_capacity, "THEME NAME INVALID");
+                return false;
+            }
+            int relative_length = snprintf(
+                relative, sizeof(relative), "themes/%s", custom_filename);
+            if (relative_length < 0
+                || (size_t) relative_length >= sizeof(relative)) {
+                if (error != NULL && error_capacity != 0u)
+                    snprintf(error, error_capacity, "THEME NAME INVALID");
+                return false;
+            }
+            theme_path = relative;
+        }
+        if (!tilefinch_install_data_path(
+                &process->install_paths, theme_path, path, sizeof(path))) {
+            if (error != NULL && error_capacity != 0u)
+                snprintf(error, error_capacity, "THEME PATH UNAVAILABLE");
+            return false;
+        }
+        if (!psp_ui_theme_load_custom_file(path, error, error_capacity))
+            return false;
+    }
+    process->presentation.ui.chrome_theme = (unsigned) theme;
+    psp_ui_theme_select(theme);
+    return true;
+}
+
+static void psp_app_close_theme_catalog(PspBrowserResources *browser)
+{
+    if (browser == NULL) return;
+    psp_ui_theme_catalog_bind(NULL);
+    psp_ui_theme_catalog_destroy(browser->theme_catalog);
+    browser->theme_catalog = NULL;
+}
+
+void psp_app_handle_theme_catalog(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent)
+{
+    if (app == NULL || app->process == NULL || app->browser == NULL
+        || frame == NULL || intent == NULL) return;
+    BrowserProfile *profile = app->browser->profile;
+    PspUiState *ui = &app->process->presentation.ui;
+
+    if (intent->theme_catalog_probe_requested) {
+        psp_app_close_theme_catalog(app->browser);
+        char directory[TILEFINCH_INSTALL_PATH_LIMIT];
+        char error[64] = "";
+        if (!tilefinch_install_data_path(
+                &app->process->install_paths, "themes",
+                directory, sizeof(directory))) {
+            snprintf(error, sizeof(error), "THEME FOLDER UNAVAILABLE");
+        } else {
+            app->browser->theme_catalog = psp_ui_theme_catalog_create(
+                app->browser->budget, directory,
+                browser_profile_chrome_theme_file(profile),
+                error, sizeof(error));
+        }
+        psp_ui_theme_catalog_bind(app->browser->theme_catalog);
+        BrowserChromeTheme active = browser_profile_chrome_theme(profile);
+        size_t selected = active < BROWSER_CHROME_THEME_CUSTOM
+            ? (size_t) active : 0u;
+        if (active == BROWSER_CHROME_THEME_CUSTOM) {
+            size_t custom = psp_ui_theme_catalog_selected(
+                app->browser->theme_catalog);
+            if (custom != SIZE_MAX)
+                selected = (size_t) BROWSER_CHROME_THEME_CUSTOM + custom;
+        }
+        ui->data_options_selection = (uint8_t) selected;
+        if (error[0] != '\0') psp_ui_show_status(ui, error, 240);
+    }
+
+    if (intent->theme_selected) {
+        const size_t builtins = BROWSER_CHROME_THEME_CUSTOM;
+        BrowserChromeTheme selected_theme;
+        const char *selected_file = NULL;
+        if (intent->theme_index < builtins) {
+            selected_theme = (BrowserChromeTheme) intent->theme_index;
+        } else {
+            size_t custom_index = (size_t) intent->theme_index - builtins;
+            selected_file = psp_ui_theme_catalog_filename(
+                app->browser->theme_catalog, custom_index);
+            if (selected_file == NULL) {
+                psp_ui_show_status(ui, "THEME FILE NO LONGER AVAILABLE", 240);
+                psp_app_close_theme_catalog(app->browser);
+                return;
+            }
+            selected_theme = BROWSER_CHROME_THEME_CUSTOM;
+        }
+        char error[64];
+        if (!psp_app_apply_chrome_theme(
+                app->process, selected_theme, selected_file,
+                error, sizeof(error))) {
+            psp_ui_theme_select(browser_profile_chrome_theme(profile));
+            ui->chrome_theme = browser_profile_chrome_theme(profile);
+            psp_ui_show_status(
+                ui, error[0] == '\0' ? "THEME COULD NOT BE APPLIED" : error,
+                240);
+        } else {
+            browser_profile_set_chrome_theme(profile, selected_theme);
+            if (selected_file != NULL)
+                (void) browser_profile_set_chrome_theme_file(
+                    profile, selected_file);
+            psp_profile_store_mark_dirty(
+                &app->browser->profile_store, frame->ui_sample_us);
+            char status[64];
+            snprintf(status, sizeof(status), "THEME %s",
+                     selected_theme == BROWSER_CHROME_THEME_CUSTOM
+                         ? psp_ui_theme_custom_label()
+                         : selected_theme == BROWSER_CHROME_THEME_FINCH
+                               ? "MIDNIGHT"
+                               : selected_theme == BROWSER_CHROME_THEME_OCEAN
+                                     ? "COBALT"
+                                     : selected_theme
+                                               == BROWSER_CHROME_THEME_PLUM
+                                           ? "SLATE"
+                                           : selected_theme
+                                                     == BROWSER_CHROME_THEME_EMBER
+                                                 ? "EMBER" : "DAYLIGHT");
+            psp_ui_show_status(ui, status, 180);
+        }
+        psp_app_close_theme_catalog(app->browser);
+    } else if (intent->theme_catalog_closed) {
+        psp_app_close_theme_catalog(app->browser);
+    }
+}
+
 /*
  * The Developer endpoint is deliberately local configuration, not profile
  * data: a web page cannot write it, it survives A/B slot changes, and an
@@ -754,16 +914,33 @@ void psp_app_apply_setting(
     if (intent->setting.id == PSP_UI_SETTING_CHROME_THEME) {
         BrowserChromeTheme theme =
             intent->setting.value.chrome_theme;
+        BrowserChromeTheme previous =
+            browser_profile_chrome_theme(profile);
+        char theme_error[64];
+        if (!psp_app_apply_chrome_theme(
+                app->process, theme,
+                browser_profile_chrome_theme_file(profile),
+                theme_error, sizeof(theme_error))) {
+            app->process->presentation.ui.chrome_theme = (unsigned) previous;
+            psp_ui_theme_select(previous);
+            psp_ui_show_status(
+                &app->process->presentation.ui,
+                theme_error[0] == '\0' ? "CUSTOM THEME INVALID" : theme_error,
+                240);
+            return;
+        }
         browser_profile_set_chrome_theme(profile, theme);
         psp_profile_store_mark_dirty(
             &app->browser->profile_store, frame->ui_sample_us);
         char status[40];
         snprintf(
             status, sizeof(status), "THEME %s",
-            theme == BROWSER_CHROME_THEME_OCEAN ? "OCEAN"
+            theme == BROWSER_CHROME_THEME_FINCH ? "MIDNIGHT"
+            : theme == BROWSER_CHROME_THEME_OCEAN ? "COBALT"
             : theme == BROWSER_CHROME_THEME_PLUM ? "PLUM"
             : theme == BROWSER_CHROME_THEME_EMBER ? "EMBER"
-            : "FINCH");
+            : theme == BROWSER_CHROME_THEME_LIGHT ? "DAYLIGHT"
+            : "CUSTOM");
         psp_ui_show_status(&app->process->presentation.ui, status, 180);
     }
     if (intent->setting.id == PSP_UI_SETTING_GLYPH_LANGUAGE) {
@@ -862,6 +1039,36 @@ void psp_app_apply_setting(
             language == BROWSER_ALTERNATE_LANGUAGE_NONE
                 ? "ALTERNATE LANGUAGE OFF"
                 : "ALTERNATE LANGUAGE SAVED - NEXT VIDEO",
+            180);
+    }
+    if (intent->setting.id == PSP_UI_SETTING_SUBTITLE_SIZE) {
+        BrowserSubtitleSize size = intent->setting.value.subtitle_size;
+        browser_profile_set_subtitle_size(profile, size);
+        psp_ui_media_set_subtitle_style(
+            &app->browser->media.ui, size,
+            browser_profile_subtitle_background(profile));
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            size == BROWSER_SUBTITLE_SIZE_SMALL
+                ? "SUBTITLES SMALL" : "SUBTITLES STANDARD",
+            180);
+    }
+    if (intent->setting.id == PSP_UI_SETTING_SUBTITLE_BACKGROUND) {
+        BrowserSubtitleBackground background =
+            intent->setting.value.subtitle_background;
+        browser_profile_set_subtitle_background(profile, background);
+        psp_ui_media_set_subtitle_style(
+            &app->browser->media.ui,
+            browser_profile_subtitle_size(profile), background);
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            background == BROWSER_SUBTITLE_BACKGROUND_SHADOW
+                ? "SUBTITLE BACKGROUND SHADOW"
+                : "SUBTITLE BACKGROUND BOX",
             180);
     }
     if (intent->setting.id == PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS) {

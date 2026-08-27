@@ -149,20 +149,28 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("sceIoGetstat(tilefinch_ef_launcher", source)
         self.assertIn("previous_start_handler(module)", source)
         self.assertIn("launch_armed = 0;", source)
+        self.assertIn("TILEFINCH_XMB_REDIRECT_ACTIVATION_BUTTONS", source)
         handler = source[
             source.index("static int on_module_start("):
             source.index("int module_start(")]
         for loader_unsafe_call in (
                 "sceCtrlPeekBufferPositive", "sceIoGetstat",
-                "sceKernelDelayThread", "sctrlKernelLoadExecVSH"):
+                "sceKernelDelayThread", "sceKernelCreateThread",
+                "sceKernelStartThread", "sctrlKernelLoadExecVSH"):
             self.assertNotIn(loader_unsafe_call, handler)
         self.assertLess(
             handler.index("previous_start_handler(module)"),
-            handler.index("sceKernelCreateThread("))
-        self.assertIn("TILEFINCH_XMB_REDIRECT_CALLBACK_RELEASE_US", source)
+            handler.index("sceKernelSetEventFlag("))
+        self.assertIn("sceKernelWaitEventFlag(", source)
+        self.assertIn("TILEFINCH_XMB_REDIRECT_MODULE_SETTLE_US", source)
         self.assertIn(
-            "TILEFINCH_XMB_REDIRECT_CALLBACK_RELEASE_US) < 0",
+            "TILEFINCH_XMB_REDIRECT_MODULE_SETTLE_US) < 0",
             source)
+        module_start = source[source.index("int module_start("):]
+        self.assertLess(
+            module_start.index("sceKernelStartThread("),
+            module_start.index(
+                "sctrlHENSetStartModuleHandler(on_module_start)"))
         self.assertIn("previous == on_module_start ? NULL : previous", source)
         self.assertIn("char launcher[sizeof(tilefinch_ms_launcher)]", source)
         cmake = (ROOT / "cmake/TilefinchTargets.cmake").read_text(
@@ -548,9 +556,9 @@ class PspSdkContractTests(unittest.TestCase):
         session = without_comments(
             (ROOT / "src/psp_media_session.c").read_text(encoding="utf-8"))
         first_frame = session[
-            session.index("if (awaiting_first_frame) {"):
+            session.index("if (first_frame_pending) {"):
             session.index("psp_ui_media_set_buffering(",
-                          session.index("if (awaiting_first_frame) {"))]
+                          session.index("if (first_frame_pending) {"))]
         self.assertIn('psp_ui_media_set_resolving_progress(\n'
                       '            &media->ui, "Loading...",', first_frame)
         self.assertNotIn("DECODING FIRST FRAME", first_frame)
@@ -4653,7 +4661,8 @@ class PspSdkContractTests(unittest.TestCase):
             source.index("static MediaBackendResult psp_media_decode_one_audio_au("):
             source.index("static MediaBackendResult psp_media_decode_staged_audio(")]
         self.assertIn("status == PSP_MEDIA_ERROR_BUSY", decode)
-        self.assertIn("audio_decode_busy_retries < 2u", decode)
+        self.assertIn("audio_decode_busy_retries < 16u", decode)
+        self.assertIn("busy_elapsed_us < UINT32_C(500000)", decode)
         self.assertIn("return MEDIA_BACKEND_WOULD_BLOCK", decode)
         self.assertNotIn("audio_staged_index++", decode)
         self.assertIn("audio_decode_busy_retries = 0u", decode)
@@ -5012,6 +5021,38 @@ class PspSdkContractTests(unittest.TestCase):
             "job->response.data, job->response.length, \"VISITOR_DATA\"",
             prefix)
 
+    def test_native_track_changes_preserve_playback_ownership(self):
+        session = without_comments(
+            (ROOT / "src/psp_media_session.c").read_text(encoding="utf-8"))
+        audio = session[
+            session.index("static void psp_media_request_track_reopen("):
+            session.index("static void psp_media_reset_subtitle_document(")]
+        self.assertIn("psp_media_recovery_position_us(media)", audio)
+        self.assertIn("psp_media_machine_wants_playing(media)", audio)
+        self.assertLess(
+            audio.index('"track-switch-close"'),
+            audio.index("psp_media_pipeline_destroy(media)"))
+        self.assertLess(
+            audio.index("psp_media_pipeline_destroy(media)"),
+            audio.index('"track-switch-open"'))
+        self.assertIn("media->reopen_resume_playing = resume_playing", audio)
+
+        captions = session[
+            session.index("static void psp_media_request_caption_resolution("):
+            session.index("void psp_media_execute_intent(")]
+        self.assertIn("youtube_caption_catalog_url", captions)
+        self.assertIn(
+            "media->caption_resolution_pending = catalog_url == NULL",
+            captions)
+        self.assertIn("psp_media_reset_subtitle_document", captions)
+        self.assertNotIn("psp_media_pipeline_destroy", captions)
+        pump = session[
+            session.index("static bool psp_media_subtitle_pump("):
+            session.index("static bool psp_media_refusal_reset_recover(")]
+        self.assertIn("youtube_resolve_job_take_captions", pump)
+        self.assertIn("psp_media_publish_track_catalog", pump)
+        self.assertNotIn("psp_media_pipeline_destroy", pump)
+
     def test_youtube_result_preresolution_is_bounded_and_adopted(self):
         frontend = without_comments(
             (ROOT / "src/psp_app/psp_app_youtube.c").read_text(
@@ -5042,18 +5083,23 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertNotIn("!transport_capacity || !pump_allowed", frontend)
         main = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
-        idle_start = main.index("} else if (!page_input_active")
+        idle_start = main.index(
+            "static TILEFINCH_OUT_OF_LINE bool "
+            "psp_schedule_page_render_work(")
         idle = main[idle_start:main.index(
             "browser_engine_run_idle_work(", idle_start)]
         self.assertNotIn("browser->youtube_preresolve.state", idle)
         self.assertNotIn("PSP_YOUTUBE_PRERESOLVE_RESOLVING", idle)
-        self.assertIn("!page_input_active", idle)
-        self.assertIn("!browser->media.ui.visible", idle)
-        self.assertIn("!psp_media_open_work_pending(&browser->media)", idle)
+        self.assertIn("page_input_active ||", idle)
+        self.assertIn("app->browser->media.ui.visible", idle)
+        self.assertIn(
+            "psp_media_open_work_pending(&app->browser->media)", idle)
         observe = main.index("psp_app_youtube_preresolve_tick(")
-        idle_pump = main.index("browser_engine_run_idle_work(", observe)
-        self.assertLess(observe, idle_pump)
-        present = main.index("psp_present(engine_views->frame", idle_pump)
+        idle_schedule = main.index(
+            "psp_schedule_page_render_work(", observe)
+        self.assertLess(observe, idle_schedule)
+        present = main.index(
+            "psp_present(engine_views->frame", idle_schedule)
         after_present = main.index(
             "psp_deferred_image_after_present(", present)
         self.assertLess(present, after_present)
@@ -5318,12 +5364,22 @@ class PspSdkContractTests(unittest.TestCase):
             opened.index("provider_handoff_present_pending ="))
         self.assertIn(
             "provider_handoff_present_pending =\n"
-            "                            "
-            "browser_engine_optional_memory_reclaim_pending(",
+            "                            true;",
             opened)
         self.assertIn(
             "browser_engine_prepare_optional_memory_reclaim(", opened)
         self.assertNotIn("browser_engine_reclaim_optional_memory(", opened)
+
+        text_input = without_comments(
+            (ROOT / "src/psp_text_input.c").read_text(encoding="utf-8"))
+        request = text_input[
+            text_input.index("bool psp_text_input_request_with_submit("):
+            text_input.index("bool psp_text_input_request_voice(")]
+        self.assertLess(
+            request.index("present(service, frame, ui);"),
+            request.index("text_input_retire_modal_latch();"),
+            "The modal's final presentation can sample input; retire its "
+            "latch only after that last modal-owned frame.")
 
         loop = without_comments(
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
@@ -5690,7 +5746,107 @@ class PspSdkContractTests(unittest.TestCase):
             forget,
             supervisor.index("psp_display_video_active(&psp_display)"))
         self.assertLess(forget, supervisor.index("memcpy(back, front"))
-        self.assertLess(forget, supervisor.index("memset(vram +"))
+        self.assertLess(
+            forget,
+            supervisor.index("memcpy(vram, front"))
+        self.assertIn("psp_ui_media_composite_controls(", supervisor)
+
+    def test_subtitle_only_overlay_invalidates_present_records(self):
+        runtime = without_comments(
+            (ROOT / "src/psp_app/psp_app_runtime.c").read_text(
+                encoding="utf-8"))
+        self.assertGreaterEqual(
+            runtime.count(
+                "psp_ui_media_overlay_paints(&psp_active_media->ui)"),
+            2)
+        video_calls = [
+            split_arguments(arguments)
+            for arguments in call_arguments(
+                runtime, "psp_present_media_frame_video")
+            if "psp_active_media->frame" in arguments
+        ]
+        software_calls = [
+            split_arguments(arguments)
+            for arguments in call_arguments(runtime, "psp_present_media_frame")
+            if "psp_active_media->frame" in arguments
+        ]
+        self.assertEqual(len(video_calls), 1)
+        self.assertEqual(len(software_calls), 1)
+        self.assertEqual(video_calls[0][2], "overlay_paints")
+        self.assertEqual(software_calls[0][2], "overlay_paints")
+
+    def test_present_records_cover_the_three_buffer_software_surface(self):
+        runtime = without_comments(
+            (ROOT / "src/psp_app/psp_app_runtime.c").read_text(
+                encoding="utf-8"))
+        declaration = runtime[
+            runtime.index("static PspMediaPresentRecord"):
+            runtime.index("static int psp_media_present_reported_mode")]
+        self.assertIn(
+            "psp_media_present_records[PSP_DISPLAY_PAGE_BUFFER_COUNT]",
+            declaration)
+        reset = runtime[
+            runtime.index("void psp_media_present_forget_buffers(void)"):
+            runtime.index("static PspMediaPresentMode", runtime.index(
+                "void psp_media_present_forget_buffers(void)"))]
+        self.assertIn("PSP_DISPLAY_PAGE_BUFFER_COUNT", reset)
+        prepare = runtime[
+            runtime.index("static bool psp_media_present_prepare("):
+            runtime.index("static bool psp_present_media_frame(")]
+        self.assertIn(
+            "psp_display.back_buffer % PSP_DISPLAY_PAGE_BUFFER_COUNT",
+            prepare)
+        self.assertNotIn("back_buffer & 1", prepare)
+
+    def test_navigation_reconciles_the_frontend_render_job_flag(self):
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        helper = main[
+            main.index("static TILEFINCH_OUT_OF_LINE bool "
+                       "psp_schedule_page_render_work("):
+            main.index("#ifdef TILEFINCH_PSP_VALIDATION_LOG", main.index(
+                "psp_schedule_page_render_work("))]
+        self.assertIn("!browser_engine_navigation_pending(engine)", helper)
+        self.assertIn("navigation->page.loaded", helper)
+        self.assertIn("browser_engine_render_shell(engine) != NULL", helper)
+        self.assertIn("!psp_ui_screen_is_native_surface(", helper)
+        self.assertIn("browser_engine_cancel_render_job(engine)", helper)
+        self.assertIn("*render_job_pending = false", helper)
+        self.assertIn("frame->page_dirty = false", helper)
+
+        deferred = main[
+            main.index("static TILEFINCH_OUT_OF_LINE bool "
+                       "psp_deferred_image_after_present("):
+            main.index("static TILEFINCH_OUT_OF_LINE bool "
+                       "psp_schedule_page_render_work(")]
+        self.assertIn(
+            "browser_engine_render_shell(app->browser->engine) == NULL",
+            deferred)
+        self.assertIn("!navigation->page.loaded", deferred)
+        self.assertIn("psp_ui_screen_is_native_surface(", deferred)
+
+        raster_guard = main[
+            main.index("static TILEFINCH_OUT_OF_LINE void "
+                       "psp_reconcile_page_render_before_raster("):
+            main.index("#ifdef TILEFINCH_PSP_VALIDATION_LOG", main.index(
+                "psp_reconcile_page_render_before_raster("))]
+        self.assertIn("!*render_job_pending", raster_guard)
+        self.assertIn("browser_engine_navigation_pending(engine)", raster_guard)
+        self.assertIn("navigation->page.loaded", raster_guard)
+        self.assertIn("browser_engine_render_shell(engine) != NULL", raster_guard)
+        self.assertIn("psp_ui_screen_is_native_surface(", raster_guard)
+        self.assertIn("browser_engine_cancel_render_job(engine)", raster_guard)
+        self.assertIn("*render_job_pending = false", raster_guard)
+        self.assertIn("frame->page_dirty = false", raster_guard)
+
+        loop = main[
+            main.index("PspInteractiveResult psp_app_run_interactive("):]
+        reconcile = loop.index("psp_schedule_page_render_work(")
+        raster_guard_call = loop.index(
+            "psp_reconcile_page_render_before_raster(", reconcile)
+        raster = loop.index("if (render_job_pending)", raster_guard_call)
+        self.assertLess(reconcile, raster)
+        self.assertLess(raster_guard_call, raster)
 
     def test_home_tab_rows_reuse_the_tab_action_receiver(self):
         actions = without_comments(

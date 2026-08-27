@@ -8,6 +8,7 @@ foreach(required IN ITEMS
         "${LAUNCHER_EBOOT}" "${BROWSER_EBOOT}" "${XMB_REDIRECT_PRX}"
         "${ASSET_DIR}/roots.pem" "${ASSET_DIR}/boot-defaults.cfg"
         "${ASSET_DIR}/fonts"
+        "${SOURCE_DIR}/psp-assets/themes"
         "${SOURCE_DIR}/LICENSE"
         "${SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
         "${SOURCE_DIR}/third_party/notices"
@@ -21,7 +22,7 @@ endforeach()
 file(REMOVE_RECURSE "${OUTPUT}")
 file(MAKE_DIRECTORY
     "${OUTPUT}/slot-a" "${OUTPUT}/slot-b" "${OUTPUT}/data"
-    "${OUTPUT}/OPTIONAL")
+    "${OUTPUT}/data/themes" "${OUTPUT}/OPTIONAL")
 file(COPY_FILE "${LAUNCHER_EBOOT}" "${OUTPUT}/EBOOT.PBP")
 file(COPY_FILE "${BROWSER_EBOOT}" "${OUTPUT}/slot-a/EBOOT.PBP")
 file(COPY_FILE "${XMB_REDIRECT_PRX}"
@@ -31,6 +32,8 @@ file(COPY
     "${ASSET_DIR}/boot-defaults.cfg"
     "${ASSET_DIR}/fonts"
     DESTINATION "${OUTPUT}/slot-a")
+file(COPY "${SOURCE_DIR}/psp-assets/themes/"
+    DESTINATION "${OUTPUT}/data/themes")
 # Voice recognition is an explicit, separately signed in-app component.
 # The one default Tilefinch distribution never duplicates its roughly 9 MiB
 # model inside browser A/B slots. Developer EBOOT directories may still stage

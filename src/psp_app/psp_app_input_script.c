@@ -47,6 +47,52 @@ static size_t psp_input_script_capture_count;
 static TilefinchInstallPaths psp_input_script_install_paths;
 static const char *psp_input_script_argv0;
 
+/*
+ * A cue transition can expose one bad scanout for only 16--33 ms. PSPLink's
+ * scrshot command proves what the panel currently scans, but writing a full
+ * bitmap over USB is much too slow to catch alternating buffers. Retain one
+ * preceding publish and nineteen following publishes from the exact caption
+ * footprint at native PSP pixel resolution, packed as RGB332. Trigger on any
+ * caption-text transition: a direct cue-to-cue handoff is just as capable of
+ * exposing a one-frame ground error as a cue-to-empty handoff. This is about
+ * 444 KiB of validation-only BSS, including the preceding-frame and scratch
+ * copies, and zero Memory Stick traffic while playback is live.
+ */
+#define PSP_SUBTITLE_BURST_LIMIT 20u
+#define PSP_SUBTITLE_BURST_LEFT 38u
+#define PSP_SUBTITLE_BURST_WIDTH 404u
+#define PSP_SUBTITLE_BURST_HEIGHT 50u
+#define PSP_SUBTITLE_BURST_CONTROLS_TOP 136u
+#define PSP_SUBTITLE_BURST_PLAIN_TOP 204u
+
+typedef struct {
+    uint8_t pixels[PSP_SUBTITLE_BURST_WIDTH * PSP_SUBTITLE_BURST_HEIGHT];
+    uint64_t captured_us;
+    uint64_t frame_identity;
+    uint64_t frame_epoch;
+    uint32_t frame_generation;
+    uint32_t subtitle_hash;
+    uint32_t pixel_hash;
+    uint64_t record_identity[PSP_DISPLAY_PAGE_BUFFER_COUNT];
+    uint8_t record_valid_mask;
+    uint8_t record_buffer[PSP_DISPLAY_PAGE_BUFFER_COUNT];
+    uint8_t buffer_index;
+    uint8_t ui_flags;
+    uint8_t capture_top;
+    bool video_surface;
+    bool skipped;
+    bool supervisor;
+    char subtitle[64];
+} PspSubtitleBurstFrame;
+
+static PspSubtitleBurstFrame psp_subtitle_burst[PSP_SUBTITLE_BURST_LIMIT];
+static PspSubtitleBurstFrame psp_subtitle_previous;
+static PspSubtitleBurstFrame psp_subtitle_current_scratch;
+static size_t psp_subtitle_burst_count;
+static unsigned psp_subtitle_burst_remaining;
+static bool psp_subtitle_previous_valid;
+static bool psp_subtitle_seen_nonempty;
+
 static void psp_input_script_warning(
     void *context, const char *path, size_t line_number, const char *reason)
 {
@@ -67,6 +113,10 @@ bool psp_input_script_begin(
     psp_input_script_previous_buttons = 0;
     psp_input_script_last_press_step = 0;
     psp_input_script_capture_count = 0;
+    psp_subtitle_burst_count = 0;
+    psp_subtitle_burst_remaining = 0;
+    psp_subtitle_previous_valid = false;
+    psp_subtitle_seen_nonempty = false;
     psp_input_script_argv0 = argv0;
     if (install_paths != NULL)
         psp_input_script_install_paths = *install_paths;
@@ -302,6 +352,224 @@ void psp_input_script_capture_live_mark(
     psp_input_script_capture_named(mark, frame, pixels, stride_pixels);
 }
 
+static uint32_t psp_subtitle_burst_hash_string(const char *text)
+{
+    uint32_t hash = UINT32_C(2166136261);
+    if (text == NULL) return hash;
+    for (size_t at = 0; at < PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY
+         && text[at] != '\0'; at++) {
+        hash = (hash ^ (unsigned char) text[at]) * UINT32_C(16777619);
+    }
+    return hash;
+}
+
+static void psp_subtitle_burst_sample(
+    PspSubtitleBurstFrame *capture, const PspUiMediaState *media,
+    const uint16_t *pixels_565, const uint32_t *pixels_8888,
+    size_t stride_pixels, bool video_surface, unsigned buffer_index,
+    bool skipped, bool supervisor, const MediaVideoFrame *frame,
+    const PspMediaPresentRecord *records, size_t record_count)
+{
+    memset(capture, 0, sizeof(*capture));
+    capture->captured_us = sceKernelGetSystemTimeWide();
+    capture->buffer_index = (uint8_t) buffer_index;
+    capture->video_surface = video_surface;
+    capture->skipped = skipped;
+    capture->supervisor = supervisor;
+    if (frame != NULL) {
+        capture->frame_identity = frame->identity;
+        capture->frame_epoch = frame->epoch;
+        capture->frame_generation = frame->generation;
+    }
+    const char *subtitle = media != NULL && media->presentation != NULL
+        ? media->presentation->subtitle_text : "";
+    capture->subtitle_hash = psp_subtitle_burst_hash_string(subtitle);
+    snprintf(capture->subtitle, sizeof(capture->subtitle), "%.*s",
+             (int) sizeof(capture->subtitle) - 1, subtitle);
+    for (size_t at = 0; capture->subtitle[at] != '\0'; at++) {
+        unsigned char ch = (unsigned char) capture->subtitle[at];
+        if (ch < 0x20u || ch == 0x7fu) capture->subtitle[at] = ' ';
+    }
+    if (media != NULL) {
+        if (media->controls_visible) capture->ui_flags |= 1u << 0;
+        if (media->buffering) capture->ui_flags |= 1u << 1;
+        if (media->playing) capture->ui_flags |= 1u << 2;
+        if (media->resolving) capture->ui_flags |= 1u << 3;
+        if (media->seek_in_progress) capture->ui_flags |= 1u << 4;
+    }
+    if (records != NULL) {
+        if (record_count > PSP_DISPLAY_PAGE_BUFFER_COUNT)
+            record_count = PSP_DISPLAY_PAGE_BUFFER_COUNT;
+        for (size_t at = 0; at < record_count; at++) {
+            capture->record_identity[at] = records[at].identity;
+            capture->record_buffer[at] = records[at].buffer_index;
+            if (records[at].valid)
+                capture->record_valid_mask |= (uint8_t) (1u << at);
+        }
+    }
+
+    capture->capture_top = (uint8_t) (
+        media != NULL && media->controls_visible
+            ? PSP_SUBTITLE_BURST_CONTROLS_TOP
+            : PSP_SUBTITLE_BURST_PLAIN_TOP);
+    uint32_t pixel_hash = UINT32_C(2166136261);
+    for (size_t y = 0; y < PSP_SUBTITLE_BURST_HEIGHT; y++) {
+        size_t source_y = capture->capture_top + y;
+        uint8_t *destination = capture->pixels
+            + y * PSP_SUBTITLE_BURST_WIDTH;
+        for (size_t x = 0; x < PSP_SUBTITLE_BURST_WIDTH; x++) {
+            size_t source_x = PSP_SUBTITLE_BURST_LEFT + x;
+            uint8_t packed;
+            if (video_surface) {
+                const unsigned char *rgba = (const unsigned char *)
+                    &pixels_8888[source_y * stride_pixels + source_x];
+                packed = (uint8_t) ((rgba[0] & 0xe0u)
+                    | ((rgba[1] >> 3u) & 0x1cu)
+                    | (rgba[2] >> 6u));
+            } else {
+                uint16_t pixel =
+                    pixels_565[source_y * stride_pixels + source_x];
+                packed = (uint8_t) (
+                    (tilefinch_rgb565_red_code(pixel) >> 2u) << 5u
+                    | (tilefinch_rgb565_green_code(pixel) >> 3u) << 2u
+                    | (tilefinch_rgb565_blue_code(pixel) >> 3u));
+            }
+            destination[x] = packed;
+            pixel_hash = (pixel_hash ^ packed) * UINT32_C(16777619);
+        }
+    }
+    capture->pixel_hash = pixel_hash;
+}
+
+void psp_input_script_capture_media_present(
+    const PspUiMediaState *media, const uint16_t *pixels_565,
+    const uint32_t *pixels_8888, size_t stride_pixels,
+    bool video_surface, unsigned buffer_index, bool skipped,
+    bool supervisor, const MediaVideoFrame *frame,
+    const PspMediaPresentRecord *records, size_t record_count)
+{
+    if (!psp_input_script_armed(&psp_input_script)
+        || media == NULL || stride_pixels < PSP_SCREEN_WIDTH
+        || (video_surface ? pixels_8888 == NULL : pixels_565 == NULL)
+        || psp_subtitle_burst_count == PSP_SUBTITLE_BURST_LIMIT)
+        return;
+
+    PspSubtitleBurstFrame *current = &psp_subtitle_current_scratch;
+    psp_subtitle_burst_sample(
+        current, media, pixels_565, pixels_8888, stride_pixels,
+        video_surface, buffer_index, skipped, supervisor, frame,
+        records, record_count);
+    bool nonempty = current->subtitle[0] != '\0';
+    if (!psp_subtitle_seen_nonempty) {
+        if (nonempty) psp_subtitle_seen_nonempty = true;
+    } else if (psp_subtitle_burst_remaining == 0
+               && psp_subtitle_previous_valid
+               && psp_subtitle_previous.subtitle[0] != '\0'
+               && current->subtitle_hash
+                      != psp_subtitle_previous.subtitle_hash) {
+        psp_subtitle_burst[0] = psp_subtitle_previous;
+        psp_subtitle_burst[1] = *current;
+        psp_subtitle_burst_count = 2u;
+        psp_subtitle_burst_remaining = PSP_SUBTITLE_BURST_LIMIT - 2u;
+    } else if (psp_subtitle_burst_remaining != 0) {
+        psp_subtitle_burst[psp_subtitle_burst_count++] = *current;
+        psp_subtitle_burst_remaining--;
+    }
+    if (psp_subtitle_burst_remaining == 0
+        && psp_subtitle_burst_count != 0) return;
+    psp_subtitle_previous = *current;
+    psp_subtitle_previous_valid = true;
+}
+
+static bool psp_subtitle_burst_path(
+    const char *name, char *path, size_t path_size)
+{
+    if (name == NULL || path == NULL || path_size == 0) return false;
+    if (psp_input_script_install_paths.slotted) {
+        return tilefinch_install_data_path(
+            &psp_input_script_install_paths, name, path, path_size);
+    }
+    psp_sibling_path(path, path_size, psp_input_script_argv0, name);
+    return path[0] != '\0';
+}
+
+static bool psp_subtitle_burst_write_frame(
+    const PspSubtitleBurstFrame *capture, size_t index)
+{
+    char name[64];
+    snprintf(name, sizeof(name), "frame-subtitle-burst-%02u.ppm",
+             (unsigned) index);
+    char path[TILEFINCH_INSTALL_PATH_LIMIT];
+    if (!psp_subtitle_burst_path(name, path, sizeof(path))) return false;
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool okay = fprintf(
+        file, "P6\n%u %u\n255\n",
+        PSP_SUBTITLE_BURST_WIDTH, PSP_SUBTITLE_BURST_HEIGHT) > 0;
+    uint8_t row[PSP_SUBTITLE_BURST_WIDTH * 3u];
+    for (size_t y = 0; okay && y < PSP_SUBTITLE_BURST_HEIGHT; y++) {
+        const uint8_t *source = capture->pixels
+            + y * PSP_SUBTITLE_BURST_WIDTH;
+        for (size_t x = 0; x < PSP_SUBTITLE_BURST_WIDTH; x++) {
+            uint8_t pixel = source[x];
+            row[x * 3u] = (uint8_t) (((pixel >> 5) & 7u) * 255u / 7u);
+            row[x * 3u + 1u] =
+                (uint8_t) (((pixel >> 2) & 7u) * 255u / 7u);
+            row[x * 3u + 2u] = (uint8_t) ((pixel & 3u) * 255u / 3u);
+        }
+        okay = fwrite(row, 1u, sizeof(row), file) == sizeof(row);
+    }
+    return fclose(file) == 0 && okay;
+}
+
+static bool psp_subtitle_burst_write_metadata(void)
+{
+    char path[TILEFINCH_INSTALL_PATH_LIMIT];
+    if (!psp_subtitle_burst_path(
+            "frame-subtitle-burst.txt", path, sizeof(path))) return false;
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) return false;
+    bool okay = fprintf(
+        file, "tilefinch-subtitle-burst-v2\n"
+              "frames=%u left=%u width=%u height=%u step=1\n",
+        (unsigned) psp_subtitle_burst_count,
+        (unsigned) PSP_SUBTITLE_BURST_LEFT,
+        (unsigned) PSP_SUBTITLE_BURST_WIDTH,
+        (unsigned) PSP_SUBTITLE_BURST_HEIGHT) > 0;
+    for (size_t at = 0; okay && at < psp_subtitle_burst_count; at++) {
+        const PspSubtitleBurstFrame *capture = &psp_subtitle_burst[at];
+        okay = fprintf(
+            file,
+            "frame=%u us=%llu top=%u source=%s surface=%s buffer=%u "
+            "skipped=%u "
+            "ui=0x%02x frame-id=%llu epoch=%llu generation=%lu "
+            "subtitle-hash=0x%08lx pixel-hash=0x%08lx records=0x%02x "
+            "record-buffers=%u/%u/%u record-identities=%llu/%llu/%llu "
+            "subtitle=%s\n",
+            (unsigned) at, (unsigned long long) capture->captured_us,
+            (unsigned) capture->capture_top,
+            capture->supervisor ? "supervisor" : "ordinary",
+            capture->video_surface ? "8888" : "565",
+            (unsigned) capture->buffer_index,
+            capture->skipped ? 1u : 0u,
+            (unsigned) capture->ui_flags,
+            (unsigned long long) capture->frame_identity,
+            (unsigned long long) capture->frame_epoch,
+            (unsigned long) capture->frame_generation,
+            (unsigned long) capture->subtitle_hash,
+            (unsigned long) capture->pixel_hash,
+            (unsigned) capture->record_valid_mask,
+            (unsigned) capture->record_buffer[0],
+            (unsigned) capture->record_buffer[1],
+            (unsigned) capture->record_buffer[2],
+            (unsigned long long) capture->record_identity[0],
+            (unsigned long long) capture->record_identity[1],
+            (unsigned long long) capture->record_identity[2],
+            capture->subtitle) > 0;
+    }
+    return fclose(file) == 0 && okay;
+}
+
 static bool psp_input_script_write_capture(
     const PspInputScriptCapture *capture)
 {
@@ -415,5 +683,17 @@ void psp_input_script_summary(void)
             psp_input_script_captures[at].mark, written ? 1 : 0,
             PSP_INPUT_SCRIPT_CAPTURE_WIDTH,
             PSP_INPUT_SCRIPT_CAPTURE_HEIGHT);
+    }
+    if (psp_subtitle_burst_count != 0) {
+        bool metadata_written = psp_subtitle_burst_write_metadata();
+        size_t frames_written = 0;
+        for (size_t at = 0; at < psp_subtitle_burst_count; at++) {
+            if (psp_subtitle_burst_write_frame(
+                    &psp_subtitle_burst[at], at)) frames_written++;
+        }
+        printf("tilefinch-subtitle-burst: frames=%u/%u metadata=%d\n",
+               (unsigned) frames_written,
+               (unsigned) psp_subtitle_burst_count,
+               metadata_written ? 1 : 0);
     }
 }

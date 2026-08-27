@@ -1,4 +1,5 @@
 #include "tilefinch/psp_ui.h"
+#include "tilefinch/psp_ui_theme.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -21,6 +22,46 @@
 _Static_assert(TILEFINCH_GLYPH_PACK_COUNT
                    <= PSP_UI_GLYPH_INSTALLED_MASK_BITS,
                "installed glyph packs exceed PspUiState mask width");
+_Static_assert(BROWSER_CHROME_THEME_COUNT <= 8,
+               "chrome themes exceed PspUiState representation");
+
+/* The private token sheet supplies geometry and the built-in palette source.
+   Painters use the selected runtime palette for colors. Presentation is
+   serialized on PSP, so selection and painting cannot race. */
+#undef PSP_THEME_GROUND
+#undef PSP_THEME_GROUND_READER
+#undef PSP_THEME_CHROME_BAR
+#undef PSP_THEME_HINT_BAR
+#undef PSP_THEME_PANEL
+#undef PSP_THEME_SURFACE
+#undef PSP_THEME_SURFACE_FOCUS
+#undef PSP_THEME_LINE
+#undef PSP_THEME_TEXT
+#undef PSP_THEME_TEXT_BODY
+#undef PSP_THEME_TEXT_MUTED
+#undef PSP_THEME_TEXT_FAINT
+#undef PSP_THEME_ACCENT_EMBER
+#undef PSP_THEME_ACCENT_EMBER_HI
+#undef PSP_THEME_ON_ACCENT
+#undef PSP_THEME_OK
+#undef PSP_THEME_WARN
+#define PSP_THEME_GROUND (psp_ui_theme_active_palette->ground)
+#define PSP_THEME_GROUND_READER (psp_ui_theme_active_palette->ground_reader)
+#define PSP_THEME_CHROME_BAR (psp_ui_theme_active_palette->chrome_bar)
+#define PSP_THEME_HINT_BAR (psp_ui_theme_active_palette->hint_bar)
+#define PSP_THEME_PANEL (psp_ui_theme_active_palette->panel)
+#define PSP_THEME_SURFACE (psp_ui_theme_active_palette->surface)
+#define PSP_THEME_SURFACE_FOCUS (psp_ui_theme_active_palette->surface_focus)
+#define PSP_THEME_LINE (psp_ui_theme_active_palette->line)
+#define PSP_THEME_TEXT (psp_ui_theme_active_palette->text)
+#define PSP_THEME_TEXT_BODY (psp_ui_theme_active_palette->text_body)
+#define PSP_THEME_TEXT_MUTED (psp_ui_theme_active_palette->text_muted)
+#define PSP_THEME_TEXT_FAINT (psp_ui_theme_active_palette->text_faint)
+#define PSP_THEME_ACCENT_EMBER (psp_ui_theme_active_palette->accent)
+#define PSP_THEME_ACCENT_EMBER_HI (psp_ui_theme_active_palette->accent_high)
+#define PSP_THEME_ON_ACCENT (psp_ui_theme_active_palette->on_accent)
+#define PSP_THEME_OK (psp_ui_theme_active_palette->ok)
+#define PSP_THEME_WARN (psp_ui_theme_active_palette->warn)
 
 #define UI_TOP_HEIGHT 39
 #define UI_BOTTOM_HEIGHT 21
@@ -189,6 +230,9 @@ _Static_assert(BROWSER_SUBTITLE_LANGUAGE_COUNT <= 16,
                "subtitle language no longer fits PspUiState");
 _Static_assert(BROWSER_ALTERNATE_LANGUAGE_COUNT <= 16,
                "alternate language no longer fits PspUiState");
+_Static_assert(BROWSER_SUBTITLE_SIZE_COUNT <= 2
+               && BROWSER_SUBTITLE_BACKGROUND_COUNT <= 2,
+               "subtitle style no longer fits PspUiState");
 
 static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_BROWSER_UI_SCALE,
@@ -403,7 +447,7 @@ static const char *ui_option_description(UiOptionId option)
         case UI_OPTION_COLOR_MODE:
             return "Auto follows the PSP clock";
         case UI_OPTION_CHROME_THEME:
-            return "Color palette used by browser controls";
+            return "X chooses built-in or data/themes file";
         case UI_OPTION_VIDEO_SCALING:
             return "Smooth uses the graphics chip; Sharp the CPU";
         case UI_OPTION_LANGUAGE_AND_EMOJI:
@@ -468,33 +512,28 @@ static const char *ui_search_engine_name(BrowserSearchEngine engine)
     }
 }
 
-/*
- * The persisted BrowserChromeTheme enum predates the Ember token sheet and
- * carries four values; the sheet defines three accent pairs. The enum is
- * append-only profile state, so the values stay and the accents are what
- * move: the default slot carries Ember, and the legacy EMBER value is an
- * alias of it that the option cycle steps past rather than presenting twice.
- */
-#define UI_CHROME_THEME_CYCLE_COUNT 3
+#define UI_CHROME_THEME_CYCLE_COUNT ((unsigned) BROWSER_CHROME_THEME_CUSTOM)
 
 static const char *ui_chrome_theme_name(BrowserChromeTheme theme)
 {
     switch (theme) {
+        case BROWSER_CHROME_THEME_FINCH: return "Midnight";
         case BROWSER_CHROME_THEME_OCEAN: return "Cobalt";
         case BROWSER_CHROME_THEME_PLUM: return "Slate";
-        case BROWSER_CHROME_THEME_EMBER:
-        case BROWSER_CHROME_THEME_FINCH:
-        default: return "Ember";
+        case BROWSER_CHROME_THEME_EMBER: return "Ember";
+        case BROWSER_CHROME_THEME_LIGHT: return "Daylight";
+        case BROWSER_CHROME_THEME_CUSTOM:
+            return psp_ui_theme_custom_label();
+        default: return "Midnight";
     }
 }
 
 static unsigned ui_chrome_theme_step(unsigned theme, int direction)
 {
-    int selected = theme == (unsigned) BROWSER_CHROME_THEME_EMBER
-        ? (int) BROWSER_CHROME_THEME_FINCH : (int) theme;
-    if (selected >= UI_CHROME_THEME_CYCLE_COUNT) selected = 0;
-    selected = (selected + UI_CHROME_THEME_CYCLE_COUNT + direction)
-        % UI_CHROME_THEME_CYCLE_COUNT;
+    int selected = (int) theme;
+    int count = (int) UI_CHROME_THEME_CYCLE_COUNT;
+    if (selected < 0 || selected >= count) selected = 0;
+    selected = (selected + count + direction) % count;
     return (unsigned) selected;
 }
 
@@ -606,34 +645,15 @@ typedef struct {
     uint16_t muted;
 } UiChromePalette;
 
-/*
- * Every panel now speaks the same language as the native surfaces: one warm
- * near-black ground, one text ramp, and the accent as the only part the
- * theme selects. That is the token sheet's own rule -- "the accent is
- * theme-selectable; everything else is fixed so the three accents stay
- * legible on the same grounds" -- so the per-theme panel/muted variants that
- * survived from the cold navy era are gone rather than re-tinted.
- */
 static UiChromePalette ui_chrome_palette(BrowserChromeTheme theme)
 {
+    psp_ui_theme_select(theme);
     UiChromePalette palette = {
         .panel = PSP_THEME_PANEL,
         .accent = PSP_THEME_ACCENT_EMBER,
         .text = PSP_THEME_TEXT,
         .muted = PSP_THEME_TEXT_MUTED
     };
-    switch (theme) {
-        case BROWSER_CHROME_THEME_OCEAN:
-            palette.accent = PSP_THEME_ACCENT_COBALT;
-            break;
-        case BROWSER_CHROME_THEME_PLUM:
-            palette.accent = PSP_THEME_ACCENT_SLATE;
-            break;
-        case BROWSER_CHROME_THEME_EMBER:
-        case BROWSER_CHROME_THEME_FINCH:
-        default:
-            break;
-    }
     return palette;
 }
 
@@ -649,19 +669,9 @@ typedef struct {
 
 static UiSurfaceAccent ui_surface_accent(BrowserChromeTheme theme)
 {
-    switch (theme) {
-        case BROWSER_CHROME_THEME_OCEAN:
-            return (UiSurfaceAccent) {
-                PSP_THEME_ACCENT_COBALT, PSP_THEME_ACCENT_COBALT_HI };
-        case BROWSER_CHROME_THEME_PLUM:
-            return (UiSurfaceAccent) {
-                PSP_THEME_ACCENT_SLATE, PSP_THEME_ACCENT_SLATE_HI };
-        case BROWSER_CHROME_THEME_EMBER:
-        case BROWSER_CHROME_THEME_FINCH:
-        default:
-            return (UiSurfaceAccent) {
-                PSP_THEME_ACCENT_EMBER, PSP_THEME_ACCENT_EMBER_HI };
-    }
+    psp_ui_theme_select(theme);
+    return (UiSurfaceAccent) {
+        PSP_THEME_ACCENT_EMBER, PSP_THEME_ACCENT_EMBER_HI };
 }
 
 /*
@@ -1525,10 +1535,6 @@ void psp_ui_init(PspUiState *ui)
     ui->browser_ui_scale = 1;
     ui->page_font_percent = 100;
     ui->analog_cursor_enabled = true;
-    /* CPU-composited ambient motion is intentionally retired. The bit stays
-       zero for profile compatibility until a GPU-owned implementation can
-       animate without competing with input, Wi-Fi, or page painting. */
-    ui->wave_enabled = 0u;
     ui->javascript_enabled = 1u;
     ui->site_javascript_enabled = 1u;
     ui->site_data_allowed = 1u;
@@ -2668,15 +2674,42 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
         return intent;
     }
 
+    if (ui->screen == PSP_UI_SCREEN_THEME_OPTIONS) {
+        const PspUiThemeCatalog *catalog = psp_ui_theme_catalog_bound();
+        size_t count = (size_t) BROWSER_CHROME_THEME_CUSTOM
+            + psp_ui_theme_catalog_count(catalog);
+        if (count == 0u) count = BROWSER_CHROME_THEME_CUSTOM;
+        if (pressed & (PSP_UI_BUTTON_UP | PSP_UI_BUTTON_PAGE_UP)) {
+            ui->data_options_selection = (uint8_t) (
+                (ui->data_options_selection + count - 1u) % count);
+            intent.visual_changed = true;
+        } else if (pressed & (PSP_UI_BUTTON_DOWN
+                              | PSP_UI_BUTTON_PAGE_DOWN)) {
+            ui->data_options_selection = (uint8_t) (
+                (ui->data_options_selection + 1u) % count);
+            intent.visual_changed = true;
+        } else if (pressed & PSP_UI_BUTTON_CONFIRM) {
+            intent.theme_selected = true;
+            intent.theme_index = ui->data_options_selection;
+            ui_open_parent_overlay(ui, PSP_UI_SCREEN_OPTION_ITEMS);
+            intent.visual_changed = true;
+        } else if (pressed & PSP_UI_BUTTON_CANCEL) {
+            intent.theme_catalog_closed = true;
+            ui_open_parent_overlay(ui, PSP_UI_SCREEN_OPTION_ITEMS);
+            intent.visual_changed = true;
+        }
+        return intent;
+    }
+
     if (ui->screen == PSP_UI_SCREEN_VIDEO_LANGUAGE_OPTIONS) {
         if (pressed & (PSP_UI_BUTTON_UP | PSP_UI_BUTTON_PAGE_UP)) {
             ui->data_options_selection =
-                (uint8_t) ((ui->data_options_selection + 2u) % 3u);
+                (uint8_t) ((ui->data_options_selection + 4u) % 5u);
             intent.visual_changed = true;
         } else if (pressed & (PSP_UI_BUTTON_DOWN
                               | PSP_UI_BUTTON_PAGE_DOWN)) {
             ui->data_options_selection =
-                (uint8_t) ((ui->data_options_selection + 1u) % 3u);
+                (uint8_t) ((ui->data_options_selection + 1u) % 5u);
             intent.visual_changed = true;
         } else if (pressed & PSP_UI_BUTTON_CANCEL) {
             ui_open_parent_overlay(ui, PSP_UI_SCREEN_OPTION_ITEMS);
@@ -2703,7 +2736,7 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                 intent.setting.id = PSP_UI_SETTING_SUBTITLE_LANGUAGE;
                 intent.setting.value.subtitle_language =
                     (BrowserSubtitleLanguage) language;
-            } else {
+            } else if (ui->data_options_selection == 2u) {
                 int language = (int) ui->alternate_language;
                 if (direction > 0)
                     language = language == BROWSER_ALTERNATE_LANGUAGE_NONE
@@ -2721,6 +2754,16 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                 intent.setting.id = PSP_UI_SETTING_ALTERNATE_LANGUAGE;
                 intent.setting.value.alternate_language =
                     (BrowserAlternateLanguage) language;
+            } else if (ui->data_options_selection == 3u) {
+                ui->subtitle_size ^= 1u;
+                intent.setting.id = PSP_UI_SETTING_SUBTITLE_SIZE;
+                intent.setting.value.subtitle_size =
+                    (BrowserSubtitleSize) ui->subtitle_size;
+            } else {
+                ui->subtitle_background ^= 1u;
+                intent.setting.id = PSP_UI_SETTING_SUBTITLE_BACKGROUND;
+                intent.setting.value.subtitle_background =
+                    (BrowserSubtitleBackground) ui->subtitle_background;
             }
             intent.visual_changed = true;
         }
@@ -3110,11 +3153,20 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                     break;
                 }
                 case UI_OPTION_CHROME_THEME: {
-                    ui->chrome_theme =
-                        ui_chrome_theme_step(ui->chrome_theme, direction);
-                    intent.setting.id = PSP_UI_SETTING_CHROME_THEME;
-                    intent.setting.value.chrome_theme =
-                        (BrowserChromeTheme) ui->chrome_theme;
+                    if (pressed & PSP_UI_BUTTON_CONFIRM) {
+                        ui_open_child_overlay(
+                            ui, PSP_UI_SCREEN_THEME_OPTIONS);
+                        ui->data_options_selection = ui->chrome_theme
+                                < BROWSER_CHROME_THEME_CUSTOM
+                            ? ui->chrome_theme : BROWSER_CHROME_THEME_CUSTOM;
+                        intent.theme_catalog_probe_requested = true;
+                    } else {
+                        ui->chrome_theme = ui_chrome_theme_step(
+                            ui->chrome_theme, direction);
+                        intent.setting.id = PSP_UI_SETTING_CHROME_THEME;
+                        intent.setting.value.chrome_theme =
+                            (BrowserChromeTheme) ui->chrome_theme;
+                    }
                     break;
                 }
                 case UI_OPTION_LANGUAGE_AND_EMOJI:
@@ -4532,6 +4584,17 @@ static const char *ui_alternate_language_name(unsigned language)
         ? "None" : ui_video_language_name(language);
 }
 
+static const char *ui_subtitle_size_name(unsigned size)
+{
+    return size == BROWSER_SUBTITLE_SIZE_SMALL ? "Small" : "Standard";
+}
+
+static const char *ui_subtitle_background_name(unsigned background)
+{
+    return background == BROWSER_SUBTITLE_BACKGROUND_SHADOW
+        ? "Shadow" : "Box";
+}
+
 static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
     const PspUiState *ui, size_t selection, const char **label,
     const char **value, char *formatted, size_t formatted_size)
@@ -4631,7 +4694,7 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
             *value = formatted;
             break;
         case UI_OPTION_VIDEO_LANGUAGE:
-            *label = "Languages";
+            *label = "Audio & subtitles";
             *value = ">";
             break;
         case UI_OPTION_YOUTUBE_AUDIO_ONLY:
@@ -5044,6 +5107,88 @@ static const char *ui_glyph_pack_state(
     }
 }
 
+static TILEFINCH_OUT_OF_LINE void draw_theme_options(
+    const PspUiState *ui, uint16_t *pixels, int width, int height, int stride,
+    uint16_t accent, uint16_t text, uint16_t muted)
+{
+    const PspUiThemeCatalog *catalog = psp_ui_theme_catalog_bound();
+    const size_t builtins = BROWSER_CHROME_THEME_CUSTOM;
+    size_t custom_count = psp_ui_theme_catalog_count(catalog);
+    size_t count = builtins + custom_count;
+    UiRect box = {58, 10, width - 116, 252};
+    ui_apply_overlay_motion(ui, &box);
+    draw_panel_shell(pixels, width, height, stride, box);
+    draw_panel_rule(pixels, width, height, stride, box, box.y + 48);
+    draw_panel_hint_bar(pixels, width, height, stride, box,
+                        box.y + box.height - 18);
+    draw_text_bold(pixels, width, height, stride, box.x + 16, box.y + 14,
+                   "Settings", 20, text, 2);
+    draw_text_with_font(pixels, width, height, stride, box.x + 96,
+                        box.y + 14, ">", 1, box.x + 112, accent, 2,
+                        NULL, true);
+    draw_text_with_font(pixels, width, height, stride, box.x + 116,
+                        box.y + 14, "Themes", 16,
+                        box.x + box.width - 16, accent, 2, NULL, true);
+    draw_text_right_aligned(pixels, width, height, stride,
+                            box.x + box.width - 16, box.y + 31,
+                            "X Apply   O Back", 18, muted, 1, false);
+
+    size_t selected = ui->data_options_selection;
+    if (selected >= count) selected = 0u;
+    size_t first = selected >= UI_OPTIONS_VISIBLE_ROWS
+        ? selected - UI_OPTIONS_VISIBLE_ROWS + 1u : 0u;
+    size_t maximum_first = count > UI_OPTIONS_VISIBLE_ROWS
+        ? count - UI_OPTIONS_VISIBLE_ROWS : 0u;
+    if (first > maximum_first) first = maximum_first;
+    size_t end = first + UI_OPTIONS_VISIBLE_ROWS;
+    if (end > count) end = count;
+    size_t active_custom = psp_ui_theme_catalog_selected(catalog);
+    for (size_t row = first; row < end; row++) {
+        bool row_selected = row == selected;
+        bool custom = row >= builtins;
+        size_t custom_index = custom ? row - builtins : 0u;
+        const char *label = custom
+            ? psp_ui_theme_catalog_label(catalog, custom_index)
+            : ui_chrome_theme_name((BrowserChromeTheme) row);
+        const PspUiThemePalette *palette = custom ? NULL
+            : psp_ui_theme_palette((BrowserChromeTheme) row);
+        uint16_t row_accent = custom
+            ? psp_ui_theme_catalog_accent(catalog, custom_index)
+            : palette->accent;
+        bool active = custom
+            ? ui->chrome_theme == BROWSER_CHROME_THEME_CUSTOM
+                && active_custom == custom_index
+            : ui->chrome_theme == row;
+        int row_y = box.y + 60 + (int) (row - first) * 23;
+        if (row_selected)
+            fill_round_rect(
+                pixels, width, height, stride,
+                (UiRect) {box.x + 10, row_y - 4, box.width - 20, 21},
+                PSP_THEME_RADIUS_ROW, accent, 4);
+        fill_round_rect(
+            pixels, width, height, stride,
+            (UiRect) {box.x + box.width - 48, row_y - 1, 18, 10},
+            PSP_THEME_RADIUS_CHIP, row_accent, 4);
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 18, row_y,
+            label == NULL ? "Unnamed" : label, 25, box.x + box.width - 82,
+            row_selected ? PSP_THEME_ON_ACCENT : PSP_THEME_TEXT_BODY,
+            2, NULL, false);
+        if (active)
+            draw_text_right_aligned(
+                pixels, width, height, stride, box.x + box.width - 58,
+                row_y, "Active", 6,
+                row_selected ? PSP_THEME_ON_ACCENT : accent, 1, true);
+    }
+    const char *hint = custom_count == 0u
+        ? "Copy .tfth files into data/themes"
+        : (psp_ui_theme_catalog_truncated(catalog)
+               ? "Showing first 12 valid theme files"
+               : "Built-ins and downloaded theme files");
+    draw_text(pixels, width, height, stride, box.x + 16,
+              box.y + box.height - 18, hint, 46, muted, 1);
+}
+
 static TILEFINCH_OUT_OF_LINE void draw_glyph_options(
     const PspUiState *ui, uint16_t *pixels, int width, int height,
     int stride, uint16_t panel, uint16_t accent, uint16_t text,
@@ -5131,31 +5276,34 @@ static TILEFINCH_OUT_OF_LINE void draw_video_language_options(
                         box.y + box.height - 22);
     draw_text_bold(pixels, width, height, stride,
                    box.x + 16, box.y + 14,
-                   "Settings > Video > Languages", 30, text, 2);
-    static const char *const labels[3] = {
-        "Audio language", "Subtitle language", "Alternate language"
+                   "Settings > Video > Audio & subtitles", 38, text, 2);
+    static const char *const labels[5] = {
+        "Audio language", "Subtitle language", "Alternate language",
+        "Subtitle size", "Subtitle background"
     };
-    const char *values[3] = {
+    const char *values[5] = {
         ui_video_language_name(ui->video_language),
         ui_subtitle_language_name(ui->subtitle_language),
-        ui_alternate_language_name(ui->alternate_language)
+        ui_alternate_language_name(ui->alternate_language),
+        ui_subtitle_size_name(ui->subtitle_size),
+        ui_subtitle_background_name(ui->subtitle_background)
     };
-    for (size_t at = 0; at < 3u; at++) {
-        int row_y = box.y + 59 + (int) at * 36;
+    for (size_t at = 0; at < 5u; at++) {
+        int row_y = box.y + 51 + (int) at * 27;
         bool selected = at == ui->data_options_selection;
         if (selected)
             fill_round_rect(
                 pixels, width, height, stride,
-                (UiRect) {box.x + 10, row_y - 6, box.width - 20, 25},
+                (UiRect) {box.x + 10, row_y - 5, box.width - 20, 22},
                 PSP_THEME_RADIUS_ROW, accent, 4);
         uint16_t color = selected ? PSP_THEME_ON_ACCENT
                                   : PSP_THEME_TEXT_BODY;
         draw_text_with_font(
             pixels, width, height, stride, box.x + 18, row_y,
-            labels[at], 22, box.x + 206, color, 2, NULL, false);
+            labels[at], 24, box.x + 220, color, 1, NULL, false);
         draw_text_right_aligned(
             pixels, width, height, stride, box.x + box.width - 18,
-            row_y, values[at], 18, color, 2, true);
+            row_y, values[at], 18, color, 1, true);
     }
     draw_text_with_font(
         pixels, width, height, stride, box.x + 16,
@@ -5655,7 +5803,7 @@ typedef struct {
  */
 static uint16_t ui_fade_step(uint16_t token, unsigned step)
 {
-    static const uint16_t ramp[4] = {
+    const uint16_t ramp[4] = {
         PSP_THEME_TEXT, PSP_THEME_TEXT_BODY,
         PSP_THEME_TEXT_MUTED, PSP_THEME_TEXT_FAINT
     };
@@ -6539,6 +6687,9 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
     } else if (ui->screen == PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS) {
         draw_experimental_options(
             ui, pixels, width, height, stride, panel, accent, text, muted);
+    } else if (ui->screen == PSP_UI_SCREEN_THEME_OPTIONS) {
+        draw_theme_options(
+            ui, pixels, width, height, stride, accent, text, muted);
     } else if (ui->screen == PSP_UI_SCREEN_GLYPH_OPTIONS) {
         draw_glyph_options(
             ui, pixels, width, height, stride, panel, accent, text, muted);
@@ -6672,7 +6823,7 @@ void psp_ui_boot_entrance_composite(
     if (view == NULL || pixels == NULL || width <= 0 || height <= 0
         || stride < width) return;
     UiSurfaceAccent accent = ui_surface_accent(
-        home == NULL ? BROWSER_CHROME_THEME_EMBER
+        home == NULL ? BROWSER_CHROME_THEME_FINCH
                      : (BrowserChromeTheme) home->chrome_theme);
     unsigned frame = view->frame;
     if (frame > PSP_UI_BOOT_ENTRANCE_FRAMES)
@@ -6891,6 +7042,9 @@ void psp_ui_startup_composite(
     PspUiStartupView view, const char *status, int progress_per_mille,
     uint16_t *pixels, int width, int height, int stride)
 {
+    /* Startup is deliberately file-independent. A custom palette is selected
+       only after the profile has explicitly requested and loaded it. */
+    psp_ui_theme_select(BROWSER_CHROME_THEME_FINCH);
     if (pixels == NULL || width <= 0 || height <= 0 || stride < width)
         return;
     if (view == PSP_UI_STARTUP_HOMEPAGE) {
@@ -6926,6 +7080,41 @@ static void media_format_time(uint64_t microseconds,
                  (unsigned long long) minutes,
                  (unsigned long long) seconds);
     }
+}
+
+#define UI_MEDIA_TIMELINE_PIXELS 432u
+#define UI_MEDIA_BUFFER_VISUAL_INTERVAL_MS 500u
+
+static uint16_t media_timeline_pixel(uint64_t time_us, uint64_t duration_us)
+{
+    if (duration_us == 0u || time_us == 0u) return 0u;
+    uint64_t bounded = time_us < duration_us ? time_us : duration_us;
+    return (uint16_t) psp_ui_ratio_extent_u64(
+        bounded, duration_us, UI_MEDIA_TIMELINE_PIXELS);
+}
+
+static void media_timeline_visual_set(
+    PspUiMediaState *media, uint64_t time_us, bool force)
+{
+    if (media == NULL) return;
+    uint16_t next = media_timeline_pixel(time_us, media->duration_us);
+    uint16_t previous = media->timeline_visual_pixel;
+    unsigned distance = next >= previous
+        ? (unsigned) (next - previous) : (unsigned) (previous - next);
+    /* A one-pixel dead band prevents the AA knob fringe from alternating
+       between adjacent columns as timestamp rounding jitters at a boundary.
+       Larger moves, endpoints and explicit lifecycle resets remain prompt. */
+    if (force || distance > 1u || next == 0u
+        || next == UI_MEDIA_TIMELINE_PIXELS) {
+        media->timeline_visual_pixel = next;
+    }
+}
+
+static void media_buffer_visual_refresh(PspUiMediaState *media)
+{
+    if (media == NULL) return;
+    media->buffered_visual_pixel = media_timeline_pixel(
+        media->buffered_until_us, media->duration_us);
 }
 
 void psp_ui_media_init(PspUiMediaState *media)
@@ -6995,12 +7184,28 @@ void psp_ui_media_set_subtitle(PspUiMediaState *media, const char *text)
                 text == NULL ? "" : text);
 }
 
+void psp_ui_media_set_subtitle_style(
+    PspUiMediaState *media, BrowserSubtitleSize size,
+    BrowserSubtitleBackground background)
+{
+    if (media == NULL || media->presentation == NULL) return;
+    media->presentation->subtitle_size = (uint8_t) (
+        size >= BROWSER_SUBTITLE_SIZE_STANDARD
+            && size < BROWSER_SUBTITLE_SIZE_COUNT
+            ? size : BROWSER_SUBTITLE_SIZE_STANDARD);
+    media->presentation->subtitle_background = (uint8_t) (
+        background >= BROWSER_SUBTITLE_BACKGROUND_BOX
+            && background < BROWSER_SUBTITLE_BACKGROUND_COUNT
+            ? background : BROWSER_SUBTITLE_BACKGROUND_BOX);
+}
+
 void psp_ui_media_set(PspUiMediaState *media, bool visible, bool playing,
                       bool ended, uint64_t current_time_us,
                       uint64_t duration_us, const char *title)
 {
     if (media == NULL) return;
     bool became_visible = visible && !media->visible;
+    bool duration_changed = duration_us != media->duration_us;
     media->visible = visible;
     media->resolving = false;
     media->seek_in_progress = false;
@@ -7018,6 +7223,13 @@ void psp_ui_media_set(PspUiMediaState *media, bool visible, bool playing,
     media->resolving_progress_per_mille = 0;
     media->current_time_us = current_time_us;
     media->duration_us = duration_us;
+    if (duration_changed) {
+        media->buffered_visual_pixel = 0u;
+        media->buffered_visual_elapsed_ms = 0u;
+    }
+    if (!media->seek_preview_active)
+        media_timeline_visual_set(
+            media, current_time_us, became_visible || duration_changed);
     copy_string(media->title, sizeof(media->title),
                 title == NULL || title[0] == '\0' ? "VIDEO" : title);
     if (became_visible || !playing || ended) {
@@ -7048,6 +7260,9 @@ void psp_ui_media_set_resolving(PspUiMediaState *media, const char *title)
     media->seek_enabled = false;
     media->analog_seek_direction = 0;
     media->buffered_until_us = 0;
+    media->timeline_visual_pixel = 0u;
+    media->buffered_visual_pixel = 0u;
+    media->buffered_visual_elapsed_ms = 0u;
     media->current_time_us = 0;
     media->duration_us = 0;
     media->controls_remaining_ms = UI_MEDIA_CONTROLS_MS;
@@ -7136,6 +7351,9 @@ void psp_ui_media_set_error(PspUiMediaState *media, const char *message)
     media->analog_seek_direction = 0;
     media->seek_preview_time_us = 0;
     media->buffered_until_us = 0;
+    media->timeline_visual_pixel = 0u;
+    media->buffered_visual_pixel = 0u;
+    media->buffered_visual_elapsed_ms = 0u;
     media->controls_remaining_ms = UI_MEDIA_CONTROLS_MS;
     media->resolving_progress_per_mille = 0;
     copy_string(media->status, sizeof(media->status),
@@ -7148,8 +7366,15 @@ void psp_ui_media_set_buffering(PspUiMediaState *media, bool buffering,
                                 uint64_t buffered_until_us)
 {
     if (media == NULL) return;
+    bool moved_backward = buffered_until_us < media->buffered_until_us;
     media->buffering = buffering;
     media->buffered_until_us = buffered_until_us;
+    if (moved_backward
+        || (media->buffered_visual_pixel == 0u
+            && buffered_until_us != 0u)) {
+        media_buffer_visual_refresh(media);
+        media->buffered_visual_elapsed_ms = 0u;
+    }
     /* A network pause is not a user request to reopen the chrome. Forcing
        controls visible made the opaque title and scrubber bars flash in and
        out around short refills on the physical panel. The compositor can draw
@@ -7197,6 +7422,7 @@ void psp_ui_media_set_seek_preview(PspUiMediaState *media,
     media->seek_preview_active = true;
     media->seek_preview_time_us = target_time_us < media->duration_us
         ? target_time_us : media->duration_us;
+    media_timeline_visual_set(media, media->seek_preview_time_us, false);
     psp_ui_media_show_controls(media);
 }
 
@@ -7206,6 +7432,7 @@ void psp_ui_media_cancel_seek_preview(PspUiMediaState *media)
     media->seek_preview_active = false;
     media->seek_preview_time_us = 0;
     media->analog_seek_direction = 0;
+    media_timeline_visual_set(media, media->current_time_us, true);
 }
 
 void psp_ui_media_show_controls(PspUiMediaState *media)
@@ -7217,7 +7444,16 @@ void psp_ui_media_show_controls(PspUiMediaState *media)
 
 void psp_ui_media_tick(PspUiMediaState *media, unsigned elapsed_ms)
 {
-    if (media == NULL || !media->visible || !media->controls_visible
+    if (media == NULL) return;
+    unsigned visual_elapsed = media->buffered_visual_elapsed_ms;
+    visual_elapsed = elapsed_ms > UINT16_MAX - visual_elapsed
+        ? UINT16_MAX : visual_elapsed + elapsed_ms;
+    if (visual_elapsed >= UI_MEDIA_BUFFER_VISUAL_INTERVAL_MS) {
+        media_buffer_visual_refresh(media);
+        visual_elapsed %= UI_MEDIA_BUFFER_VISUAL_INTERVAL_MS;
+    }
+    media->buffered_visual_elapsed_ms = (uint16_t) visual_elapsed;
+    if (!media->visible || !media->controls_visible
         || !media->playing || media->ended || media->resolving
         || media->seek_preview_active
         || (media->presentation != NULL
@@ -7273,6 +7509,11 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
             : (unsigned) presentation->subtitle_track_count + 1u;
         if (pressed & PSP_UI_BUTTON_CANCEL) {
             presentation->track_menu_open = false;
+            /* Circle dismisses the modal back to unobscured playback. Keeping
+               controls alive here rebuilt two full-width chrome bands on the
+               same frame and caused a visible one-frame hitch on hardware. */
+            media->controls_visible = false;
+            media->controls_remaining_ms = 0u;
         } else if (pressed & (PSP_UI_BUTTON_PAGE_UP
                               | PSP_UI_BUTTON_PAGE_DOWN)) {
             presentation->track_menu_tab ^= 1u;
@@ -7849,7 +8090,12 @@ typedef struct {
 static UiRect media_track_menu_rect(int width, int height)
 {
     (void) height;
-    return (UiRect) {width / 2 - 176, 48, 352, 176};
+    return (UiRect) {
+        width / 2 - (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH / 2,
+        48,
+        (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH,
+        (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT
+    };
 }
 
 static UiRect media_subtitle_rect(
@@ -7857,7 +8103,32 @@ static UiRect media_subtitle_rect(
 {
     int bottom = media != NULL && media->controls_visible
         ? height - UI_MEDIA_CONTROL_BAR_HEIGHT - 8 : height - 18;
-    return (UiRect) {width / 2 - 202, bottom - 30, 404, 30};
+    bool small = media != NULL && media->presentation != NULL
+        && media->presentation->subtitle_size
+               == BROWSER_SUBTITLE_SIZE_SMALL;
+    /* Keep the opaque ground stable while adjacent cues alternate between
+       one and two rows. Resizing this rectangle at a cue boundary reads as
+       black flicker against moving video on the physical panel. One-row text
+       is centered in the same bounded two-row box. */
+    int subtitle_height = small ? 36 : 50;
+    return (UiRect) {
+        width / 2 - 202, bottom - subtitle_height, 404, subtitle_height
+    };
+}
+
+static int media_badge_center_y(
+    const PspUiMediaState *media, int height)
+{
+    if (media != NULL && media->controls_visible
+        && media->presentation != NULL
+        && media->presentation->subtitle_text[0] != '\0') {
+        /* The two-row caption ground grows upward from the control bar. Lift
+           the transient play/buffering badge into the free picture above it
+           rather than allowing the opaque caption ground to cover the lower
+           edge of the badge. */
+        return height / 2 - 26;
+    }
+    return height / 2;
 }
 
 static void ui_media_add_raw_region(
@@ -7987,9 +8258,10 @@ static size_t ui_media_union_regions(
     return exact_count;
 }
 
-size_t psp_ui_media_overlay_regions(
+static size_t ui_media_overlay_regions(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
-    int width, int height, PspUiOverlayRegion *regions, size_t capacity)
+    int width, int height, PspUiOverlayRegion *regions, size_t capacity,
+    bool include_track_menu)
 {
     if (media == NULL || !media->visible || regions == NULL || capacity == 0u
         || width <= 0 || height <= 0) return 0u;
@@ -8011,7 +8283,25 @@ size_t psp_ui_media_overlay_regions(
             ui_media_add_raw_region(
                 raw, &raw_count, subtitle.x, subtitle.y,
                 subtitle.x + subtitle.width, subtitle.y + subtitle.height,
-                width, height, true);
+                width, height,
+                presentation->subtitle_background
+                    == BROWSER_SUBTITLE_BACKGROUND_SHADOW);
+        }
+        return ui_media_union_regions(
+            raw, raw_count, width, height, regions, capacity);
+    }
+    bool track_menu_open = presentation != NULL
+        && presentation->track_menu_open;
+    /* The chooser is modal and already carries its own opaque ground. Do not
+       spend a video frame painting the title, timeline, badge, or subtitles
+       behind it; on the PSP those obscured layers materially slow decoding. */
+    if (track_menu_open) {
+        if (include_track_menu) {
+            UiRect menu = media_track_menu_rect(width, height);
+            ui_media_add_raw_region(
+                raw, &raw_count, menu.x, menu.y,
+                menu.x + menu.width, menu.y + menu.height,
+                width, height, false);
         }
         return ui_media_union_regions(
             raw, raw_count, width, height, regions, capacity);
@@ -8048,14 +8338,15 @@ size_t psp_ui_media_overlay_regions(
             top + UI_MEDIA_PREVIEW_HEIGHT + UI_MEDIA_PREVIEW_PANEL_EXTRA,
             width, height, true);
     }
+    int badge_center_y = media_badge_center_y(media, height);
     int half_width = media->buffering
         ? UI_MEDIA_BUFFERING_REGION_HALF_WIDTH
         : UI_MEDIA_BADGE_WIDTH / 2;
     ui_media_add_raw_region(
         raw, &raw_count, width / 2 - half_width,
-        height / 2 - UI_MEDIA_BADGE_HEIGHT / 2,
+        badge_center_y - UI_MEDIA_BADGE_HEIGHT / 2,
         width / 2 + half_width,
-        height / 2 - UI_MEDIA_BADGE_HEIGHT / 2
+        badge_center_y - UI_MEDIA_BADGE_HEIGHT / 2
             + UI_MEDIA_BADGE_HEIGHT,
         width, height, true);
     ui_media_add_raw_region(
@@ -8066,17 +8357,28 @@ size_t psp_ui_media_overlay_regions(
         ui_media_add_raw_region(
             raw, &raw_count, subtitle.x, subtitle.y,
             subtitle.x + subtitle.width, subtitle.y + subtitle.height,
-            width, height, true);
-    }
-    if (presentation != NULL && presentation->track_menu_open) {
-        UiRect menu = media_track_menu_rect(width, height);
-        ui_media_add_raw_region(
-            raw, &raw_count, menu.x, menu.y,
-            menu.x + menu.width, menu.y + menu.height,
-            width, height, true);
+            width, height,
+            presentation->subtitle_background
+                == BROWSER_SUBTITLE_BACKGROUND_SHADOW);
     }
     return ui_media_union_regions(
         raw, raw_count, width, height, regions, capacity);
+}
+
+size_t psp_ui_media_overlay_regions(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    int width, int height, PspUiOverlayRegion *regions, size_t capacity)
+{
+    return ui_media_overlay_regions(
+        media, preview, width, height, regions, capacity, true);
+}
+
+size_t psp_ui_media_overlay_regions_without_track_menu(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    int width, int height, PspUiOverlayRegion *regions, size_t capacity)
+{
+    return ui_media_overlay_regions(
+        media, preview, width, height, regions, capacity, false);
 }
 
 static void draw_media_control_bar_ground(
@@ -8126,26 +8428,23 @@ static void draw_media_control_bar(
                   24, muted, 2);
         return;
     }
-    if (media->duration_us != 0 && media->buffered_until_us != 0) {
-        uint64_t buffered = media->buffered_until_us < media->duration_us
-            ? media->buffered_until_us : media->duration_us;
-        int buffered_width = (int) psp_ui_ratio_extent_u64(
-            buffered, media->duration_us, (unsigned) (right - left));
+    if (media->duration_us != 0 && media->buffered_visual_pixel != 0u) {
+        int buffered_width = (int) (
+            (unsigned) media->buffered_visual_pixel
+                * (unsigned) (right - left)
+            / UI_MEDIA_TIMELINE_PIXELS);
         if (buffered_width > 0)
             fill_round_rect(
                 pixels, width, height, stride,
                 (UiRect) {left, track_y, buffered_width, 4},
                 2, muted, 4);
     }
-    int filled = 0;
+    int filled = (int) (
+        (unsigned) media->timeline_visual_pixel
+            * (unsigned) (right - left)
+        / UI_MEDIA_TIMELINE_PIXELS);
     uint64_t display_time = media->seek_preview_active
         ? media->seek_preview_time_us : media->current_time_us;
-    if (media->duration_us != 0) {
-        uint64_t bounded = display_time < media->duration_us
-            ? display_time : media->duration_us;
-        filled = (int) psp_ui_ratio_extent_u64(
-            bounded, media->duration_us, (unsigned) (right - left));
-    }
     if (filled > 0) {
         fill_round_rect(pixels, width, height, stride,
                         (UiRect) {left, track_y, filled, 4},
@@ -8183,23 +8482,98 @@ static void draw_media_subtitle(
         || media->presentation->subtitle_text[0] == '\0') return;
     const PspUiMediaPresentation *presentation = media->presentation;
     UiRect box = media_subtitle_rect(media, width, height);
-    fill_round_rect(pixels, width, height, stride, box, 5,
-                    PSP_THEME_CHROME_BAR, 4);
-    draw_text_with_font(
-        pixels, width, height, stride, box.x + 10, box.y + 8,
-        presentation->subtitle_text, 72, box.x + box.width - 10,
-        PSP_THEME_TEXT, 2, NULL, false);
+    int scale = presentation->subtitle_size == BROWSER_SUBTITLE_SIZE_SMALL
+        ? 1 : 2;
+    char lines[2][PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY] = {{0}};
+    const char *text = presentation->subtitle_text;
+    size_t bytes = strlen(text);
+    size_t at = 0, last_break = SIZE_MAX, after_break = 0;
+    int line_width = 0;
+    int maximum_width = box.width - 20;
+    while (at < bytes) {
+        unsigned codepoint = 0;
+        size_t used = font_utf8_next(text + at, bytes - at, &codepoint);
+        if (used == 0) break;
+        bool known_missing = false;
+        const FontGlyph *glyph = chrome_font_glyph(
+            codepoint, scale, false, &known_missing);
+        int advance = glyph != NULL ? glyph->advance : 6 * scale;
+        if (advance < 0) advance = 0;
+        if (codepoint == '\n' || line_width > maximum_width - advance) break;
+        if (codepoint == ' ' || codepoint == '\t') {
+            last_break = at;
+            after_break = at + used;
+        }
+        line_width += advance;
+        at += used;
+    }
+    size_t first_bytes = bytes;
+    size_t second_at = bytes;
+    if (at < bytes) {
+        if (last_break != SIZE_MAX) {
+            first_bytes = last_break;
+            second_at = after_break;
+        } else if (at != 0) {
+            first_bytes = at;
+            second_at = at;
+        } else {
+            unsigned ignored = 0;
+            size_t used = font_utf8_next(text, bytes, &ignored);
+            first_bytes = used;
+            second_at = used;
+        }
+        while (second_at < bytes
+               && (text[second_at] == ' ' || text[second_at] == '\t'
+                   || text[second_at] == '\n' || text[second_at] == '\r'))
+            second_at++;
+    }
+    if (first_bytes >= sizeof(lines[0])) first_bytes = sizeof(lines[0]) - 1u;
+    memcpy(lines[0], text, first_bytes);
+    lines[0][first_bytes] = '\0';
+    size_t second_bytes = bytes - second_at;
+    if (second_bytes >= sizeof(lines[1]))
+        second_bytes = sizeof(lines[1]) - 1u;
+    memcpy(lines[1], text + second_at, second_bytes);
+    lines[1][second_bytes] = '\0';
+    unsigned line_count = lines[1][0] == '\0' ? 1u : 2u;
+    int line_step = scale == 1 ? 14 : 20;
+    int text_height = (int) line_count * line_step;
+    int text_y = box.y + (box.height - text_height) / 2;
+    if (presentation->subtitle_background
+            == BROWSER_SUBTITLE_BACKGROUND_BOX) {
+        /* An opaque ground avoids importing the moving 8888 picture for
+           every captioned frame. */
+        fill_rect(pixels, width, height, stride, box,
+                  PSP_THEME_CHROME_BAR, 4);
+    }
+    for (unsigned line = 0; line < line_count; line++) {
+        int y = text_y + (int) line * line_step;
+        if (presentation->subtitle_background
+                == BROWSER_SUBTITLE_BACKGROUND_SHADOW) {
+            draw_text_with_font(
+                pixels, width, height, stride, box.x + 11, y + 1,
+                lines[line], 96, box.x + box.width - 9,
+                rgb565(0, 0, 0), scale, NULL, true);
+        }
+        draw_text_with_font(
+            pixels, width, height, stride, box.x + 10, y,
+            lines[line], 96, box.x + box.width - 10,
+            PSP_THEME_TEXT, scale, NULL, false);
+    }
 }
 
-static void draw_media_track_menu(
+static void draw_media_track_menu_box(
     const PspUiMediaState *media, uint16_t *pixels,
-    int width, int height, int stride)
+    int width, int height, int stride, UiRect box)
 {
     if (media == NULL || media->presentation == NULL
         || !media->presentation->track_menu_open) return;
     const PspUiMediaPresentation *presentation = media->presentation;
-    UiRect box = media_track_menu_rect(width, height);
-    draw_panel_shell(pixels, width, height, stride, box);
+    /* This menu covers almost half the display and remains visible for many
+       video frames. Its surface is intentionally opaque so the 8888 bridge
+       can clear and redraw it without narrowing 61,952 moving video pixels
+       to RGB565 on every frame. */
+    fill_rect(pixels, width, height, stride, box, PSP_THEME_PANEL, 4);
     draw_text_bold(pixels, width, height, stride,
                    box.x + 16, box.y + 12, "Audio", 5,
                    presentation->track_menu_tab == 0
@@ -8246,6 +8620,27 @@ static void draw_media_track_menu(
               PSP_THEME_TEXT_MUTED, 1);
 }
 
+static void draw_media_track_menu(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride)
+{
+    draw_media_track_menu_box(
+        media, pixels, width, height, stride,
+        media_track_menu_rect(width, height));
+}
+
+void psp_ui_media_raster_track_menu(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride)
+{
+    if (width < (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH
+        || height < (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT) return;
+    draw_media_track_menu_box(
+        media, pixels, width, height, stride,
+        (UiRect) {0, 0, (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH,
+                  (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT});
+}
+
 void psp_ui_media_composite_controls(
     const PspUiMediaState *media, uint16_t *pixels,
     int width, int height, int stride)
@@ -8264,20 +8659,33 @@ void psp_ui_media_composite_controls(
     draw_media_control_bar(media, pixels, width, height, stride);
 }
 
-void psp_ui_media_composite_with_preview(
-    const PspUiMediaState *media, const PspUiMediaPreview *preview,
-    uint16_t *pixels, int width, int height, int stride)
+bool psp_ui_media_overlay_paints(const PspUiMediaState *media)
 {
-    if (media == NULL || !media->visible || pixels == NULL
-        || width <= 0 || height <= 0 || stride < width
-        || (!media->controls_visible && !media->buffering
-            && (media->presentation == NULL
-                || media->presentation->subtitle_text[0] == '\0'))) return;
+    return media != NULL && media->visible
+        && (media->controls_visible || media->buffering
+            || (media->presentation != NULL
+                && media->presentation->subtitle_text[0] != '\0'));
+}
+
+void psp_ui_media_composite_layers(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    uint16_t *pixels, int width, int height, int stride,
+    bool include_track_menu)
+{
+    if (!psp_ui_media_overlay_paints(media) || pixels == NULL
+        || width <= 0 || height <= 0 || stride < width) return;
     if (!media->controls_visible) {
         if (media->buffering)
             draw_media_buffering(
                 pixels, width, height, stride, width / 2, height / 2);
         draw_media_subtitle(media, pixels, width, height, stride);
+        return;
+    }
+    bool track_menu_open = media->presentation != NULL
+        && media->presentation->track_menu_open;
+    if (track_menu_open) {
+        if (include_track_menu)
+            draw_media_track_menu(media, pixels, width, height, stride);
         return;
     }
     /* Ember overlay language: warm near-black chrome, token text, accent
@@ -8452,17 +8860,33 @@ void psp_ui_media_composite_with_preview(
                   target, 9, text, 2);
     }
 
+    int badge_center_y = media_badge_center_y(media, height);
     if (media->buffering)
         draw_media_buffering(
-            pixels, width, height, stride, width / 2, height / 2);
+            pixels, width, height, stride, width / 2, badge_center_y);
     else
         draw_media_play_pause(pixels, width, height, stride,
-                              width / 2, height / 2,
+                              width / 2, badge_center_y,
                               media->playing && !media->ended);
 
     draw_media_control_bar(media, pixels, width, height, stride);
     draw_media_subtitle(media, pixels, width, height, stride);
-    draw_media_track_menu(media, pixels, width, height, stride);
+}
+
+void psp_ui_media_composite_with_preview(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    uint16_t *pixels, int width, int height, int stride)
+{
+    psp_ui_media_composite_layers(
+        media, preview, pixels, width, height, stride, true);
+}
+
+void psp_ui_media_composite_without_track_menu(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    uint16_t *pixels, int width, int height, int stride)
+{
+    psp_ui_media_composite_layers(
+        media, preview, pixels, width, height, stride, false);
 }
 
 void psp_ui_media_composite(const PspUiMediaState *media, uint16_t *pixels,

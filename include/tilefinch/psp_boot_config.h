@@ -113,6 +113,9 @@ typedef struct {
      * no emulator has the raw-NAL decoder that produces the picture.
      */
     long validation_csc_order_probe;
+    /* Invasive full-surface hashes around every scanout latch. Off unless a
+       flicker investigation explicitly opts in. */
+    long validation_latch_probe;
     /*
      * Resolve `url`, open both bounded range sources, and read samples far
      * enough to cross fragment boundaries -- with no decoder behind them.

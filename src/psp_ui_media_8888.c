@@ -64,14 +64,18 @@ static uint32_t ui_media_widen(uint16_t pixel)
 static void ui_media_composite_8888(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     uint32_t *pixels, int width, int height, int stride,
-    uint16_t *scratch, bool controls_only)
+    uint16_t *scratch, bool controls_only, bool without_track_menu)
 {
     if (media == NULL || pixels == NULL || scratch == NULL
         || width <= 0 || height <= 0 || stride < width) return;
     PspUiOverlayRegion regions[PSP_UI_MEDIA_OVERLAY_REGION_LIMIT];
-    size_t count = psp_ui_media_overlay_regions(
-        media, preview, width, height, regions,
-        PSP_UI_MEDIA_OVERLAY_REGION_LIMIT);
+    size_t count = without_track_menu
+        ? psp_ui_media_overlay_regions_without_track_menu(
+              media, preview, width, height, regions,
+              PSP_UI_MEDIA_OVERLAY_REGION_LIMIT)
+        : psp_ui_media_overlay_regions(
+              media, preview, width, height, regions,
+              PSP_UI_MEDIA_OVERLAY_REGION_LIMIT);
     if (controls_only) {
         size_t bottom = 0u;
         while (bottom < count
@@ -106,6 +110,9 @@ static void ui_media_composite_8888(
     if (controls_only) {
         psp_ui_media_composite_controls(
             media, scratch, width, height, stride);
+    } else if (without_track_menu) {
+        psp_ui_media_composite_without_track_menu(
+            media, preview, scratch, width, height, stride);
     } else {
         psp_ui_media_composite_with_preview(
             media, preview, scratch, width, height, stride);
@@ -127,7 +134,7 @@ void psp_ui_media_composite_8888(
     uint16_t *scratch)
 {
     ui_media_composite_8888(
-        media, preview, pixels, width, height, stride, scratch, false);
+        media, preview, pixels, width, height, stride, scratch, false, false);
 }
 
 void psp_ui_media_composite_controls_8888(
@@ -135,5 +142,119 @@ void psp_ui_media_composite_controls_8888(
     int width, int height, int stride, uint16_t *scratch)
 {
     ui_media_composite_8888(
-        media, NULL, pixels, width, height, stride, scratch, true);
+        media, NULL, pixels, width, height, stride, scratch, true, false);
+}
+
+static uint32_t ui_media_menu_hash_byte(uint32_t hash, unsigned char value)
+{
+    return (hash ^ value) * UINT32_C(16777619);
+}
+
+static uint32_t ui_media_menu_hash_string(uint32_t hash, const char *text,
+                                          size_t capacity)
+{
+    if (text == NULL) return ui_media_menu_hash_byte(hash, 0u);
+    size_t at = 0u;
+    while (at < capacity && text[at] != '\0')
+        hash = ui_media_menu_hash_byte(hash, (unsigned char) text[at++]);
+    return ui_media_menu_hash_byte(hash, 0u);
+}
+
+static uint32_t ui_media_menu_signature(
+    const PspUiMediaPresentation *presentation)
+{
+    uint32_t hash = UINT32_C(2166136261);
+    /* A retained opaque menu is invalid when the process theme changes even
+       if its track catalog is byte-identical. */
+    const unsigned char *palette =
+        (const unsigned char *) psp_ui_theme_active_palette;
+    for (size_t at = 0; at < sizeof(*psp_ui_theme_active_palette); at++)
+        hash = ui_media_menu_hash_byte(hash, palette[at]);
+    if (presentation == NULL) return hash;
+    hash = ui_media_menu_hash_byte(hash, presentation->track_menu_tab);
+    hash = ui_media_menu_hash_byte(hash, presentation->track_menu_selection);
+    hash = ui_media_menu_hash_byte(hash, presentation->audio_track_count);
+    hash = ui_media_menu_hash_byte(hash, presentation->subtitle_track_count);
+    hash = ui_media_menu_hash_byte(
+        hash, (unsigned char) (presentation->selected_audio_track + 1));
+    hash = ui_media_menu_hash_byte(
+        hash, (unsigned char) (presentation->selected_subtitle_track + 1));
+    size_t audio_count = presentation->audio_track_count;
+    if (audio_count > PSP_UI_MEDIA_TRACK_LIMIT)
+        audio_count = PSP_UI_MEDIA_TRACK_LIMIT;
+    for (size_t at = 0; at < audio_count; at++) {
+        hash = ui_media_menu_hash_string(
+            hash, presentation->audio_tracks[at].label,
+            sizeof(presentation->audio_tracks[at].label));
+    }
+    size_t subtitle_count = presentation->subtitle_track_count;
+    if (subtitle_count > PSP_UI_MEDIA_TRACK_LIMIT)
+        subtitle_count = PSP_UI_MEDIA_TRACK_LIMIT;
+    for (size_t at = 0; at < subtitle_count; at++) {
+        hash = ui_media_menu_hash_string(
+            hash, presentation->subtitle_tracks[at].label,
+            sizeof(presentation->subtitle_tracks[at].label));
+    }
+    return hash;
+}
+
+void psp_ui_media_composite_8888_cached(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    uint32_t *pixels, int width, int height, int stride,
+    uint16_t *scratch, uint16_t *menu_pixels, size_t menu_pixel_capacity,
+    uint32_t edram_epoch, PspUiMediaTrackMenuCache *menu_cache,
+    PspUiMediaTrackMenuBlit menu_blit, void *menu_blit_context)
+{
+    const PspUiMediaPresentation *presentation = media == NULL
+        ? NULL : media->presentation;
+    size_t required = (size_t) PSP_UI_MEDIA_TRACK_MENU_WIDTH
+        * (size_t) PSP_UI_MEDIA_TRACK_MENU_HEIGHT;
+    if (presentation == NULL || !presentation->track_menu_open
+        || menu_pixels == NULL || menu_pixel_capacity < required
+        || menu_cache == NULL
+        || width < (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH
+        || height < 48 + (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT) {
+        psp_ui_media_composite_8888(
+            media, preview, pixels, width, height, stride, scratch);
+        return;
+    }
+
+    /* Paint the moving controls first, excluding the opaque menu rectangle.
+       The retained menu is copied last, preserving the ordinary draw order. */
+    ui_media_composite_8888(
+        media, preview, pixels, width, height, stride,
+        scratch, false, true);
+    uint32_t signature = ui_media_menu_signature(presentation);
+    bool source_changed = !menu_cache->valid
+        || menu_cache->signature != signature
+        || menu_cache->edram_epoch != edram_epoch;
+    if (source_changed) {
+        memset(menu_pixels, 0, required * sizeof(*menu_pixels));
+        psp_ui_media_raster_track_menu(
+            media, menu_pixels,
+            (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH,
+            (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT,
+            (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH);
+        menu_cache->signature = signature;
+        menu_cache->edram_epoch = edram_epoch;
+        menu_cache->valid = true;
+    }
+    int left = width / 2 - (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH / 2;
+    int top = 48;
+    if (menu_blit != NULL && menu_blit(
+            menu_blit_context, menu_pixels,
+            (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH,
+            (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT,
+            (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH, source_changed,
+            pixels, stride, left, top)) {
+        return;
+    }
+    for (int y = 0; y < (int) PSP_UI_MEDIA_TRACK_MENU_HEIGHT; y++) {
+        const uint16_t *source = menu_pixels
+            + (size_t) y * PSP_UI_MEDIA_TRACK_MENU_WIDTH;
+        uint32_t *destination = pixels
+            + (size_t) (top + y) * (size_t) stride + (size_t) left;
+        for (int x = 0; x < (int) PSP_UI_MEDIA_TRACK_MENU_WIDTH; x++)
+            destination[x] = ui_media_widen(source[x]);
+    }
 }

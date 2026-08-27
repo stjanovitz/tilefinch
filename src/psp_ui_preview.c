@@ -224,6 +224,8 @@ int main(int argc, char **argv)
     PspUiState ui;
     psp_ui_init(&ui);
     TilefinchDiagnosticQrReport *diagnostic_report = NULL;
+    Budget theme_budget;
+    PspUiThemeCatalog *theme_catalog = NULL;
     psp_ui_set_page(&ui, "PlayStation Portable - Wikipedia",
                     "https://en.wikipedia.org/wiki/PlayStation_Portable",
                     true);
@@ -368,17 +370,35 @@ int main(int argc, char **argv)
         ui.options_selection = 9;
         ui.toast_frames = 0;
     } else if (strcmp(mode, "appearance") == 0
+               || strcmp(mode, "options-midnight") == 0
                || strcmp(mode, "options-ocean") == 0
                || strcmp(mode, "options-plum") == 0
-               || strcmp(mode, "options-ember") == 0) {
+               || strcmp(mode, "options-ember") == 0
+               || strcmp(mode, "options-light") == 0) {
         ui.screen = PSP_UI_SCREEN_OPTION_ITEMS;
         ui.options_selection = strcmp(mode, "appearance") == 0 ? 0 : 15;
-        if (strcmp(mode, "options-ocean") == 0)
+        if (strcmp(mode, "options-midnight") == 0)
+            ui.chrome_theme = BROWSER_CHROME_THEME_FINCH;
+        else if (strcmp(mode, "options-ocean") == 0)
             ui.chrome_theme = BROWSER_CHROME_THEME_OCEAN;
         else if (strcmp(mode, "options-plum") == 0)
             ui.chrome_theme = BROWSER_CHROME_THEME_PLUM;
         else if (strcmp(mode, "options-ember") == 0)
             ui.chrome_theme = BROWSER_CHROME_THEME_EMBER;
+        else if (strcmp(mode, "options-light") == 0)
+            ui.chrome_theme = BROWSER_CHROME_THEME_LIGHT;
+        ui.toast_frames = 0;
+    } else if (strcmp(mode, "themes") == 0) {
+        budget_init(&theme_budget, 4096u);
+        theme_catalog = psp_ui_theme_catalog_create(
+            &theme_budget, "psp-assets/themes", "forest.tfth", NULL, 0u);
+        psp_ui_theme_catalog_bind(theme_catalog);
+        ui.screen = PSP_UI_SCREEN_THEME_OPTIONS;
+        size_t custom = psp_ui_theme_catalog_selected(theme_catalog);
+        ui.chrome_theme = BROWSER_CHROME_THEME_CUSTOM;
+        ui.data_options_selection = (uint8_t) (
+            BROWSER_CHROME_THEME_CUSTOM
+            + (custom == SIZE_MAX ? 0u : custom));
         ui.toast_frames = 0;
     } else if (strcmp(mode, "glyph-options") == 0) {
         ui.screen = PSP_UI_SCREEN_GLYPH_OPTIONS;
@@ -599,6 +619,8 @@ int main(int argc, char **argv)
     bool written = write_ppm(output, frame);
     printf("psp-ui-preview: output=%s state-bytes=%zu\n",
            output, psp_ui_state_bytes());
+    psp_ui_theme_catalog_bind(NULL);
+    psp_ui_theme_catalog_destroy(theme_catalog);
     psp_ui_clear_chrome_font();
     tilefinch_diagnostic_qr_destroy(diagnostic_report);
     if (fonts_ready) font_set_destroy(&fonts);

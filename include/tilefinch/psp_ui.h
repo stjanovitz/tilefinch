@@ -8,6 +8,7 @@
 #include "tilefinch/diagnostic_qr.h"
 #include "tilefinch/diagnostics.h"
 #include "tilefinch/psp_media_state.h"
+#include "tilefinch/psp_ui_theme.h"
 
 #include "tilefinch/browser_profile.h"
 #include "tilefinch/font.h"
@@ -269,6 +270,8 @@ typedef enum {
     PSP_UI_SETTING_VIDEO_LANGUAGE,
     PSP_UI_SETTING_SUBTITLE_LANGUAGE,
     PSP_UI_SETTING_ALTERNATE_LANGUAGE,
+    PSP_UI_SETTING_SUBTITLE_SIZE,
+    PSP_UI_SETTING_SUBTITLE_BACKGROUND,
     PSP_UI_SETTING_YOUTUBE_COMPACT_RESULTS,
     PSP_UI_SETTING_YOUTUBE_AUDIO_ONLY,
     PSP_UI_SETTING_VIDEO_SCALING,
@@ -301,6 +304,8 @@ typedef union {
     BrowserVideoLanguage video_language;
     BrowserSubtitleLanguage subtitle_language;
     BrowserAlternateLanguage alternate_language;
+    BrowserSubtitleSize subtitle_size;
+    BrowserSubtitleBackground subtitle_background;
     BrowserVideoScaling video_scaling;
     BrowserTextEntryMode text_entry_mode;
     TilefinchGamepadFaceMapping gamepad_face_mapping;
@@ -381,6 +386,10 @@ typedef struct {
     bool glyph_component_cancel_requested;
     bool glyph_component_remove_requested;
     uint8_t glyph_component_pack;
+    bool theme_catalog_probe_requested;
+    bool theme_catalog_closed;
+    bool theme_selected;
+    uint8_t theme_index;
 } PspUiIntent;
 
 typedef enum {
@@ -395,6 +404,7 @@ typedef enum {
     PSP_UI_SCREEN_HELP_DETAIL,
     PSP_UI_SCREEN_OPTIONS,
     PSP_UI_SCREEN_OPTION_ITEMS,
+    PSP_UI_SCREEN_THEME_OPTIONS,
     PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS,
     PSP_UI_SCREEN_GLYPH_OPTIONS,
     PSP_UI_SCREEN_VIDEO_LANGUAGE_OPTIONS,
@@ -470,6 +480,8 @@ typedef struct {
     unsigned youtube_240p : 1;
     unsigned youtube_compact_results : 1;
     unsigned youtube_audio_only : 1;
+    unsigned subtitle_size : 1;
+    unsigned subtitle_background : 1;
     /* Nearest neighbour drawn by the CPU rather than the graphics chip's
        bilinear. Clear is Smooth, which is the default. */
     unsigned video_scaling_sharp : 1;
@@ -482,14 +494,12 @@ typedef struct {
     unsigned reader_auto_mode : 1;
     unsigned content_blocker_cosmetic_hiding : 1;
     unsigned cookie_banner_hidden : 1;
-    unsigned chrome_theme : 2;
+    unsigned chrome_theme : 3;
     unsigned update_check_enabled : 1;
     /* A completed background check found a newer signed release. */
     unsigned update_release_available : 1;
     unsigned developer_update_available : 1;
     unsigned update_channel : 2;
-    /* Reserved legacy profile bit. CPU ambient motion is not rendered. */
-    unsigned wave_enabled : 1;
     /* The frontend stepped the clock down or has work pending, so ambient
        motion must stop until it says otherwise. */
     unsigned motion_suppressed : 1;
@@ -700,6 +710,8 @@ typedef struct {
 #define PSP_UI_MEDIA_TRACK_LIMIT 6u
 #define PSP_UI_MEDIA_TRACK_LABEL_CAPACITY 48u
 #define PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY 160u
+#define PSP_UI_MEDIA_TRACK_MENU_WIDTH 352u
+#define PSP_UI_MEDIA_TRACK_MENU_HEIGHT 176u
 
 typedef struct {
     char label[PSP_UI_MEDIA_TRACK_LABEL_CAPACITY];
@@ -718,10 +730,18 @@ typedef struct {
     uint8_t subtitle_track_count;
     int8_t selected_audio_track;
     int8_t selected_subtitle_track;
+    uint8_t subtitle_size;
+    uint8_t subtitle_background;
     PspUiMediaTrack audio_tracks[PSP_UI_MEDIA_TRACK_LIMIT];
     PspUiMediaTrack subtitle_tracks[PSP_UI_MEDIA_TRACK_LIMIT];
     char subtitle_text[PSP_UI_MEDIA_SUBTITLE_TEXT_CAPACITY];
 } PspUiMediaPresentation;
+
+typedef struct {
+    uint32_t signature;
+    uint32_t edram_epoch;
+    bool valid;
+} PspUiMediaTrackMenuCache;
 
 /*
  * Native media controls are intentionally independent of the page chrome.
@@ -759,6 +779,12 @@ typedef struct {
     int8_t analog_seek_direction;
     unsigned controls_remaining_ms;
     unsigned resolving_progress_per_mille;
+    /* Presentation-only timeline state. Playback time and buffered_until_us
+       remain authoritative; these bounded pixel coordinates prevent tiny
+       per-frame changes from repeatedly reblending high-contrast chrome. */
+    uint16_t timeline_visual_pixel;
+    uint16_t buffered_visual_pixel;
+    uint16_t buffered_visual_elapsed_ms;
     uint64_t current_time_us;
     uint64_t duration_us;
     uint64_t seek_preview_time_us;
@@ -1008,6 +1034,9 @@ void psp_ui_media_set_tracks(
     const PspUiMediaTrack *subtitle_tracks, size_t subtitle_count,
     int selected_subtitle);
 void psp_ui_media_set_subtitle(PspUiMediaState *media, const char *text);
+void psp_ui_media_set_subtitle_style(
+    PspUiMediaState *media, BrowserSubtitleSize size,
+    BrowserSubtitleBackground background);
 void psp_ui_media_tick(PspUiMediaState *media, unsigned elapsed_ms);
 PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
                                      const PspUiInput *input);
@@ -1023,6 +1052,21 @@ void psp_ui_media_composite(const PspUiMediaState *media, uint16_t *pixels,
 void psp_ui_media_composite_with_preview(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     uint16_t *pixels, int width, int height, int stride);
+/* Shared implementation behind the full and menu-cache layer views. Kept as
+   a named symbol so the PSP gate ratchets the real per-frame compositor rather
+   than either tiny public dispatcher. */
+void psp_ui_media_composite_layers(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    uint16_t *pixels, int width, int height, int stride,
+    bool include_track_menu);
+/* Internal layer seams used by the 8888 bridge's retained, opaque track-menu
+   raster. Ordinary callers should use the complete compositor above. */
+void psp_ui_media_composite_without_track_menu(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    uint16_t *pixels, int width, int height, int stride);
+void psp_ui_media_raster_track_menu(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride);
 
 /*
  * The exact rectangles psp_ui_media_composite_with_preview may touch. They
@@ -1045,6 +1089,9 @@ typedef struct {
 size_t psp_ui_media_overlay_regions(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     int width, int height, PspUiOverlayRegion *regions, size_t capacity);
+size_t psp_ui_media_overlay_regions_without_track_menu(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    int width, int height, PspUiOverlayRegion *regions, size_t capacity);
 
 /* Repaint only the opaque scrubber/legend band. This is used by the
  * cooperative seek supervisor while the last complete video frame remains
@@ -1052,6 +1099,11 @@ size_t psp_ui_media_overlay_regions(
 void psp_ui_media_composite_controls(
     const PspUiMediaState *media, uint16_t *pixels,
     int width, int height, int stride);
+
+/* True whenever the media compositor will modify the decoded picture. The
+   presenter uses this exact predicate to decide whether a scanout buffer may
+   retain a clean-picture identity across frames. */
+bool psp_ui_media_overlay_paints(const PspUiMediaState *media);
 
 /*
  * Composite the same overlay over a 32-bit video buffer, using `scratch` --
@@ -1064,6 +1116,22 @@ void psp_ui_media_composite_8888(
     const PspUiMediaState *media, const PspUiMediaPreview *preview,
     uint32_t *pixels, int width, int height, int stride,
     uint16_t *scratch);
+
+/* Optional device accelerator for the retained opaque track-menu raster.
+ * `source_changed` is true only when the compact 565 cache was rebuilt, so a
+ * physical-memory consumer can write it back once rather than every frame.
+ * The callback must finish writing `destination` before returning true. */
+typedef bool (*PspUiMediaTrackMenuBlit)(
+    void *context, const uint16_t *source, int source_width,
+    int source_height, int source_stride, bool source_changed,
+    uint32_t *destination, int destination_stride, int left, int top);
+
+void psp_ui_media_composite_8888_cached(
+    const PspUiMediaState *media, const PspUiMediaPreview *preview,
+    uint32_t *pixels, int width, int height, int stride,
+    uint16_t *scratch, uint16_t *menu_pixels, size_t menu_pixel_capacity,
+    uint32_t edram_epoch, PspUiMediaTrackMenuCache *menu_cache,
+    PspUiMediaTrackMenuBlit menu_blit, void *menu_blit_context);
 
 void psp_ui_media_composite_controls_8888(
     const PspUiMediaState *media, uint32_t *pixels,

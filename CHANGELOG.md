@@ -8,6 +8,17 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.13 — 2026-08-26
+
+- Added selectable Midnight, light, and custom RGB565 themes, with a visual
+  theme designer and matching launcher artwork.
+- Improved YouTube audio and subtitle switching, caption rendering and style
+  controls, and user-friendly track language names.
+- Fixed video and subtitle flicker, partial loading frames, and startup A/V
+  skew while keeping playback responsive when track menus are open.
+- Improved direct YouTube playback and search submission, and expanded the
+  included Prism Break 3D game's keyboard and controller support.
+
 ## 0.1.12 — 2026-08-24
 
 - YouTube live-stream and premiere support.

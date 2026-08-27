@@ -435,7 +435,14 @@ static bool offline_open_app(
     }
     bool opened = offline_commit(
         engine, item->source_url, html, length, record_history);
-    offline_status(store, opened ? "OFFLINE APP" : "OFFLINE APP FAILED");
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    bool scripts_missing = opened && navigation != NULL
+        && navigation->script_discovered != 0
+        && navigation->script_loaded == 0;
+    offline_status(store,
+        !opened ? "OFFLINE APP FAILED"
+        : scripts_missing ? "OFFLINE APP NEEDS REINSTALL"
+                          : "OFFLINE APP");
     return opened;
 }
 

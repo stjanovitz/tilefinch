@@ -1,0 +1,758 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tilefinch theme designer</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --page: #0b1017;
+      --page-panel: #111925;
+      --page-line: #29384a;
+      --page-text: #eef5fc;
+      --page-muted: #9babc0;
+      --ground: #100e0d;
+      --ground_reader: #14100e;
+      --chrome_bar: #0e0c0b;
+      --hint_bar: #0a0908;
+      --panel: #140f0d;
+      --surface: #1b1918;
+      --surface_focus: #262322;
+      --line: #232120;
+      --text: #fbf6f2;
+      --text_body: #d2ccc8;
+      --text_muted: #898480;
+      --text_faint: #686360;
+      --accent: #3d78b6;
+      --accent_high: #72aae2;
+      --on_accent: #17120e;
+      --ok: #7fd6a2;
+      --warn: #e08a52;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--page-text);
+      background:
+        radial-gradient(circle at 12% -10%, #183352 0, transparent 31rem),
+        var(--page);
+    }
+    button, input { font: inherit; }
+    button { color: inherit; }
+    .app {
+      display: grid;
+      grid-template-columns: minmax(560px, 1fr) 390px;
+      gap: 24px;
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+    header { grid-column: 1 / -1; }
+    h1 { margin: 0 0 7px; font-size: clamp(26px, 4vw, 42px); letter-spacing: -.035em; }
+    header p { margin: 0; max-width: 760px; color: var(--page-muted); line-height: 1.55; }
+    .preview-column, .editor {
+      min-width: 0;
+      border: 1px solid var(--page-line);
+      border-radius: 18px;
+      background: color-mix(in srgb, var(--page-panel) 92%, transparent);
+      box-shadow: 0 22px 70px #0007;
+    }
+    .preview-column { padding: 20px; align-self: start; position: sticky; top: 18px; }
+    .toolbar, .screen-tabs, .preset-row, .export-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .toolbar { justify-content: space-between; margin-bottom: 14px; }
+    .toolbar label { display: flex; align-items: center; gap: 8px; color: var(--page-muted); }
+    .name-input, .hex-input {
+      border: 1px solid var(--page-line);
+      border-radius: 8px;
+      color: var(--page-text);
+      background: #09101a;
+      padding: 7px 9px;
+    }
+    .name-input { width: 180px; }
+    .screen-tabs { margin-bottom: 14px; }
+    button {
+      border: 1px solid var(--page-line);
+      border-radius: 999px;
+      background: #152131;
+      padding: 7px 11px;
+      cursor: pointer;
+    }
+    button:hover, button:focus-visible { border-color: #71a9df; outline: none; }
+    button[aria-selected="true"], .primary { background: #2f6da8; border-color: #72aae2; }
+    .device-shell {
+      width: min(100%, 560px);
+      margin: 0 auto;
+      padding: 18px 40px;
+      border-radius: 48px;
+      background: linear-gradient(#262b31, #11151a);
+      border: 1px solid #4d555e;
+      box-shadow: inset 0 1px #ffffff2b, 0 18px 30px #0008;
+    }
+    .device-screen {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 480 / 272;
+      overflow: hidden;
+      background: var(--ground);
+      border: 2px solid #050607;
+      border-radius: 3px;
+      color: var(--text_body);
+      font-family: Arial, Helvetica, sans-serif;
+      container-type: inline-size;
+    }
+    .screen { display: none; position: absolute; inset: 0; background: var(--ground); }
+    .screen.active { display: block; }
+    /* Preview geometry is expressed in cqw because 100cqw is exactly the
+       480-pixel PSP width. The fixed 480:272 aspect ratio therefore makes the
+       values below direct renderer measurements, not responsive guesses. */
+    .statusbar {
+      position: relative; height: 3.75cqw;
+      background: var(--chrome_bar); color: var(--text_body);
+      font-size: 1.667cqw;
+    }
+    .brand { position: absolute; left: 3.333cqw; top: .625cqw; color: var(--text_body); font-weight: 700; }
+    .device-clock { position: absolute; right: 11.458cqw; top: .625cqw; }
+    .wifi-bars {
+      position: absolute; left: 89.583cqw; top: .833cqw; width: 2.292cqw;
+      height: 1.875cqw; display: flex; align-items: end; gap: .208cqw;
+    }
+    .wifi-bars i { display: block; width: .417cqw; background: var(--accent); }
+    .wifi-bars i:nth-child(1) { height: .625cqw; }
+    .wifi-bars i:nth-child(2) { height: 1.042cqw; }
+    .wifi-bars i:nth-child(3) { height: 1.458cqw; }
+    .wifi-bars i:nth-child(4) { height: 1.875cqw; background: var(--text_faint); }
+    .battery {
+      position: absolute; left: 92.917cqw; top: .833cqw;
+      width: 3.542cqw; height: 1.875cqw;
+      border: .208cqw solid var(--text_muted);
+    }
+    .battery::after {
+      content: ""; position: absolute; left: 3.542cqw; top: .625cqw;
+      width: .417cqw; height: .625cqw; background: var(--text_muted);
+    }
+    .battery i {
+      position: absolute; left: .208cqw; top: .208cqw;
+      width: 1.667cqw; height: 1.042cqw; background: var(--accent);
+    }
+    .hintbar {
+      position: absolute; left: 0; right: 0; bottom: 0; height: 3.125cqw;
+      display: flex; align-items: center; padding-left: 3.333cqw;
+      background: var(--hint_bar); color: var(--text_muted); font-size: 1.667cqw;
+    }
+    .tiles {
+      position: absolute; left: 3.333cqw; top: 5.417cqw;
+      display: grid; grid-template-columns: repeat(3, 30cqw);
+      grid-auto-rows: 11.667cqw; gap: 1.667cqw;
+    }
+    .tile {
+      width: 30cqw; height: 11.667cqw; padding: 2.083cqw 1.667cqw;
+      border: 0; border-radius: 1.042cqw;
+      background: var(--surface); color: var(--text_body); font-size: 1.667cqw;
+    }
+    .tile strong { display: block; color: var(--text); margin-bottom: 2.5cqw; font-size: 3.125cqw; }
+    .tile small { color: var(--text_muted); font-size: 1.667cqw; }
+    .tile.focus { background: var(--surface_focus); box-shadow: 0 0 0 .417cqw var(--accent); }
+    .continue-label {
+      position: absolute; left: 5cqw; top: 31.667cqw;
+      color: var(--text_muted); font-size: 1.667cqw;
+    }
+    .continue-row {
+      position: absolute; left: 3.333cqw; top: 34.583cqw; width: 93.333cqw;
+      height: 3.958cqw; padding: .833cqw 1.667cqw; border-radius: .833cqw;
+      color: var(--text_body); font-size: 1.667cqw;
+    }
+    .continue-row span { float: right; color: var(--text_muted); }
+    .menu-page { background: linear-gradient(#dce4e9, #f2f5f7); }
+    .fake-page { padding: 8.75cqw 4cqw; color: #30445b; }
+    .fake-page b { display: block; width: 62%; height: 2.5cqw; background: #294a69; margin-bottom: 2cqw; }
+    .fake-line { width: 88%; height: .625cqw; background: #a8b7c3; margin: 1.25cqw 0; }
+    .overlay-panel {
+      position: absolute; left: 12.083cqw; top: 2.083cqw;
+      width: 75.833cqw; height: 52.5cqw;
+      border-radius: 1.25cqw; background: var(--panel); border: .208cqw solid var(--line);
+      box-shadow: .625cqw .833cqw #0008; overflow: hidden;
+    }
+    .panel-title { height: 9.375cqw; padding: 2.917cqw 3.333cqw; color: var(--text); font-size: 3.125cqw; font-weight: 700; border-bottom: .208cqw solid var(--line); }
+    .panel-title span { color: var(--accent_high); }
+    .menu-rows { padding: 2.083cqw; }
+    .menu-row {
+      height: 4.583cqw; display: flex; align-items: center; justify-content: space-between;
+      padding: 0 1.667cqw; color: var(--text_body); font-size: 2.292cqw; border-radius: .833cqw;
+    }
+    .menu-row.focus { color: var(--on_accent); background: var(--accent); font-weight: 700; }
+    .menu-row .value { color: var(--accent_high); }
+    .menu-row.disabled { color: var(--text_faint); }
+    .panel-footer { position: absolute; inset: auto 0 0; height: 4.167cqw; display: flex; align-items: center; padding: 0 3.333cqw; color: var(--text_muted); background: var(--hint_bar); font-size: 1.667cqw; }
+    .reader { background: var(--ground_reader); }
+    .reader article { position: absolute; left: 5cqw; right: 5cqw; top: 7.083cqw; bottom: 4.167cqw; overflow: hidden; }
+    .reader h2 { margin: 0 0 1.25cqw; color: var(--text); font: 700 4.167cqw Georgia, serif; }
+    .reader .byline { color: var(--text_muted); font-size: 1.667cqw; padding-bottom: 1.667cqw; border-bottom: .208cqw solid var(--line); }
+    .reader p { color: var(--text_body); font: 2.5cqw/1.45 Georgia, serif; }
+    .reader a { color: var(--accent_high); text-decoration: underline; }
+    .reader .caption { color: var(--text_faint); font-size: 1.667cqw; }
+    .player { background: #0b0c0e; }
+    .video-art { position: absolute; inset: 0; background: linear-gradient(145deg, #154e64, #151b26 48%, #755a35); }
+    .player-title { position: absolute; left: 0; right: 0; top: 0; height: 8.75cqw; padding: 2.5cqw 2.917cqw; color: var(--text); background: var(--chrome_bar); font-size: 3.125cqw; }
+    .caption-box { position: absolute; left: 7.917cqw; top: 28.333cqw; width: 84.167cqw; height: 10.417cqw; padding: 2.083cqw; display: flex; align-items: center; justify-content: center; text-align: center; background: var(--chrome_bar); color: var(--text); font-size: 2.5cqw; }
+    .controls { position: absolute; inset: auto 0 0; height: 16.25cqw; padding: 0; background: var(--chrome_bar); }
+    .controls::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 7.917cqw; background: var(--hint_bar); }
+    .timeline { position: absolute; left: 5cqw; right: 5cqw; top: 1.875cqw; height: .833cqw; border-radius: .417cqw; background: var(--text_faint); z-index: 1; }
+    .timeline > i { display: block; width: 44%; height: 100%; background: var(--accent); }
+    .timeline > i::after { content: ""; position: absolute; left: 44%; top: -.625cqw; width: 2.083cqw; height: 2.083cqw; border-radius: 50%; background: var(--accent_high); }
+    .media-time { position: absolute; left: 5cqw; top: 4.167cqw; color: var(--text); font-size: 1.667cqw; z-index: 2; }
+    .media-legend { position: absolute; left: 5cqw; bottom: 2.5cqw; color: var(--text_muted); font-size: 1.667cqw; z-index: 2; }
+    .play { position: absolute; left: 44.792cqw; top: 18.958cqw; width: 10.417cqw; height: 7.917cqw; display: flex; align-items: center; justify-content: center; color: #E4E6E8; background: #25282B; border: .208cqw solid #E4E6E8; border-radius: 2.5cqw; font-size: 3.125cqw; }
+    .diagnostic { padding-top: 3.75cqw; }
+    .diag-card { margin: 4.167cqw 7.5cqw; padding: 3.333cqw; border: .208cqw solid var(--line); border-radius: 1.042cqw; background: var(--surface); }
+    .diag-card h2 { margin: 0 0 1.667cqw; color: var(--text); font-size: 3.125cqw; }
+    .diag-card p { margin: 1.25cqw 0; color: var(--text_body); font-size: 1.875cqw; }
+    .pill { display: inline-block; margin: 1.667cqw 1.25cqw 0 0; padding: .833cqw 1.25cqw; border-radius: .625cqw; color: var(--ground); font-size: 1.667cqw; font-weight: 700; }
+    .pill.ok { background: var(--ok); }
+    .pill.warn { background: var(--warn); }
+    .faint-note { color: var(--text_faint) !important; }
+    .token-flash { outline: 2px solid #fff !important; outline-offset: -2px; animation: pulse .8s ease-in-out infinite alternate; }
+    @keyframes pulse { to { outline-color: #ffda75; } }
+    .preview-note { margin: 14px 0 0; color: var(--page-muted); font-size: 13px; line-height: 1.45; }
+    .editor { overflow: hidden; }
+    .editor-head { padding: 18px; border-bottom: 1px solid var(--page-line); }
+    .editor-head h2 { margin: 0 0 6px; font-size: 20px; }
+    .editor-head p { margin: 0; color: var(--page-muted); font-size: 13px; line-height: 1.45; }
+    .preset-row { padding: 13px 18px; border-bottom: 1px solid var(--page-line); }
+    .palette-builder { padding: 15px 18px; border-bottom: 1px solid var(--page-line); }
+    .palette-builder h3 { margin: 0 0 5px; font-size: 15px; }
+    .palette-builder p { margin: 0 0 11px; color: var(--page-muted); font-size: 12px; line-height: 1.45; }
+    .primary-picker { display: grid; grid-template-columns: 1fr 44px 104px; gap: 8px; align-items: center; }
+    .suggestions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 11px; }
+    .suggestion { display: grid; grid-template-columns: 42px 1fr; gap: 9px; align-items: center; border-radius: 10px; text-align: left; padding: 8px; }
+    .suggestion-swatch { width: 38px; height: 30px; border: 1px solid #fff5; border-radius: 7px; box-shadow: inset 19px 0 var(--suggestion-primary); background: var(--suggestion-color); }
+    .suggestion strong, .suggestion small { display: block; }
+    .suggestion small { margin-top: 2px; color: var(--page-muted); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .rgb-code { color: var(--page-muted); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .fields { max-height: calc(100vh - 335px); min-height: 360px; overflow: auto; padding: 10px 18px 18px; }
+    fieldset { border: 0; padding: 0; margin: 12px 0 18px; }
+    legend { padding: 0 0 7px; color: #83b6e8; font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+    .field { display: grid; grid-template-columns: 1fr 44px 104px; gap: 8px; align-items: center; padding: 5px 0; }
+    .field label { min-width: 0; color: var(--page-text); font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    input[type="color"] { width: 42px; height: 32px; padding: 2px; border: 1px solid var(--page-line); border-radius: 7px; background: #09101a; cursor: pointer; }
+    .hex-input { width: 104px; min-width: 0; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; text-transform: uppercase; }
+    .hex-input.invalid { border-color: #e96f65; }
+    .export { padding: 16px 18px 18px; border-top: 1px solid var(--page-line); }
+    .export-actions { margin-bottom: 10px; }
+    .file-button { position: relative; overflow: hidden; }
+    .file-button input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+    textarea { width: 100%; height: 120px; resize: vertical; border: 1px solid var(--page-line); border-radius: 9px; background: #09101a; color: #cfe0f2; padding: 10px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .message { min-height: 1.4em; margin-top: 7px; color: var(--page-muted); font-size: 12px; }
+    @media (max-width: 980px) {
+      .app { grid-template-columns: 1fr; padding: 18px; }
+      .preview-column { position: static; }
+      .fields { max-height: none; }
+    }
+    @media (max-width: 620px) {
+      .app { padding: 10px; gap: 12px; }
+      .preview-column { padding: 10px; }
+      .device-shell { padding: 10px 20px; border-radius: 28px; }
+      .name-input { width: 150px; }
+      .suggestions { grid-template-columns: 1fr; }
+    }
+    @media (prefers-reduced-motion: reduce) { .token-flash { animation: none; } }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <h1>Tilefinch theme designer</h1>
+      <p>Choose colors, switch between representative PSP screens, and export a bounded
+        <code>.tfth</code> file. Hover or focus a field to highlight where that token appears.</p>
+    </header>
+
+    <section class="preview-column" aria-label="Theme preview">
+      <div class="toolbar">
+        <label>Theme name <input class="name-input" id="theme-name" maxlength="31" value="My Theme"></label>
+        <span id="rgb565-note">RGB565 preview · every choice snaps to 5/6/5 bits</span>
+      </div>
+      <div class="screen-tabs" role="tablist" aria-label="Preview screen">
+        <button type="button" role="tab" aria-selected="true" data-screen-button="home">Home</button>
+        <button type="button" role="tab" aria-selected="false" data-screen-button="menu">Menu</button>
+        <button type="button" role="tab" aria-selected="false" data-screen-button="reader">Reader</button>
+        <button type="button" role="tab" aria-selected="false" data-screen-button="player">Player</button>
+        <button type="button" role="tab" aria-selected="false" data-screen-button="diagnostics">Diagnostics</button>
+      </div>
+      <div class="device-shell">
+        <div class="device-screen">
+          <section class="screen active" data-screen="home" data-uses="ground">
+            <div class="statusbar" data-uses="chrome_bar text_body">
+              <span class="brand">TILEFINCH</span><span class="device-clock">14:28</span>
+              <span class="wifi-bars" data-uses="accent text_faint"><i></i><i></i><i></i><i></i></span>
+              <span class="battery" data-uses="text_muted accent"><i></i></span>
+            </div>
+            <div class="tiles">
+              <div class="tile focus" data-uses="surface_focus accent text text_muted"><strong>YouTube</strong><small>Browse and play video</small></div>
+              <div class="tile" data-uses="surface text text_muted"><strong>Wikipedia</strong><small>Articles and search</small></div>
+              <div class="tile" data-uses="surface text text_muted"><strong>Ars Technica</strong><small>arstechnica.com</small></div>
+              <div class="tile" data-uses="surface text text_muted"><strong>Hacker News</strong><small>news.ycombinator.com</small></div>
+              <div class="tile" data-uses="surface text text_muted"><strong>Lobsters</strong><small>lobste.rs</small></div>
+              <div class="tile" data-uses="surface text text_muted"><strong>MDN</strong><small>developer.mozilla.org</small></div>
+            </div>
+            <div class="continue-label" data-uses="text_muted">CONTINUE</div>
+            <div class="continue-row" data-uses="surface_focus text text_muted">PlayStation Portable <span>en.wikipedia.org</span></div>
+            <div class="hintbar" data-uses="hint_bar text_muted">X OPEN &nbsp; START SEARCH &nbsp; SELECT MENU</div>
+          </section>
+
+          <section class="screen menu-page" data-screen="menu">
+            <div class="fake-page"><b></b><div class="fake-line"></div><div class="fake-line"></div><div class="fake-line"></div></div>
+            <div class="overlay-panel" data-uses="panel line">
+              <div class="panel-title" data-uses="text line">Settings <span data-uses="accent_high">› Appearance</span></div>
+              <div class="menu-rows">
+                <div class="menu-row focus" data-uses="accent on_accent"><span>Theme</span><span>Midnight</span></div>
+                <div class="menu-row" data-uses="text_body"><span>Browser UI size</span><span class="value" data-uses="accent_high">Normal</span></div>
+                <div class="menu-row" data-uses="text_body"><span>Page text size</span><span class="value" data-uses="accent_high">100%</span></div>
+                <div class="menu-row" data-uses="text_body"><span>Night mode</span><span class="value" data-uses="accent_high">Off</span></div>
+                <div class="menu-row" data-uses="text_body"><span>Reader font</span><span class="value" data-uses="accent_high">Serif</span></div>
+                <div class="menu-row disabled" data-uses="text_faint"><span>Optional pack</span><span>Not installed</span></div>
+              </div>
+              <div class="panel-footer" data-uses="hint_bar text_muted">X Open or toggle &nbsp; O Back</div>
+            </div>
+          </section>
+
+          <section class="screen reader" data-screen="reader" data-uses="ground_reader">
+            <div class="statusbar" data-uses="chrome_bar text_body">
+              <span class="brand">READER</span><span class="device-clock">14:28</span>
+              <span class="wifi-bars" data-uses="accent text_faint"><i></i><i></i><i></i><i></i></span>
+              <span class="battery" data-uses="text_muted accent"><i></i></span>
+            </div>
+            <article>
+              <h2 data-uses="text">A pocket-sized web</h2>
+              <div class="byline" data-uses="text_muted line">Reader mode · 6 minute read</div>
+              <p data-uses="text_body">Reader mode gives long-form pages a predictable surface while preserving <a href="#" data-uses="accent_high">focusable links</a>, headings, lists, and images.</p>
+              <p data-uses="text_body">The page remains available when you switch back to its original presentation.</p>
+              <div class="caption" data-uses="text_faint">Figure 1 · Article caption</div>
+            </article>
+            <div class="hintbar" data-uses="hint_bar text_muted">Reader &nbsp; SQUARE Reload &nbsp; O Back</div>
+          </section>
+
+          <section class="screen player" data-screen="player">
+            <div class="video-art"></div>
+            <div class="player-title" data-uses="chrome_bar text">Big Buck Bunny</div>
+            <div class="play">Ⅱ</div>
+            <div class="caption-box" data-uses="chrome_bar text">A two-line subtitle uses the same stable box<br>and geometry as the native player.</div>
+            <div class="controls" data-uses="chrome_bar hint_bar">
+              <div class="timeline" data-uses="text_faint"><i data-uses="accent accent_high"></i></div>
+              <div class="media-time" data-uses="text">2:00 / 9:56</div>
+              <div class="media-legend" data-uses="text_muted">STICK/L/R SEEK&nbsp;&nbsp; X PAUSE&nbsp;&nbsp; △ TRACKS</div>
+            </div>
+          </section>
+
+          <section class="screen diagnostic" data-screen="diagnostics" data-uses="ground">
+            <div class="statusbar" data-uses="chrome_bar text_body">
+              <span class="brand">DIAGNOSTICS</span><span class="device-clock">14:28</span>
+              <span class="wifi-bars" data-uses="accent text_faint"><i></i><i></i><i></i><i></i></span>
+              <span class="battery" data-uses="text_muted accent"><i></i></span>
+            </div>
+            <div class="diag-card" data-uses="surface line">
+              <h2 data-uses="text">Connection details</h2>
+              <p data-uses="text_body">HTTPS verified · TLS 1.2</p>
+              <p data-uses="text_muted">Network profile 1 · Home Wi-Fi</p>
+              <span class="pill ok" data-uses="ok ground">SECURE</span>
+              <span class="pill warn" data-uses="warn ground">1 WARNING</span>
+              <p class="faint-note" data-uses="text_faint">Some fields are unavailable for this request.</p>
+            </div>
+            <div class="hintbar" data-uses="hint_bar text_muted">X Details &nbsp; O Back</div>
+          </section>
+        </div>
+      </div>
+      <p class="preview-note">The native chrome uses Tilefinch's measured 480×272 geometry. Web article and video imagery remain illustrative; every themed color is shown after the same RGB565 reduction used on PSP.</p>
+    </section>
+
+    <section class="editor" aria-label="Theme colors">
+      <div class="editor-head">
+        <h2>Colors</h2>
+        <p>Every omitted field inherits Midnight in Tilefinch. This designer exports all fields so the result is portable and explicit.</p>
+      </div>
+      <div class="preset-row" aria-label="Theme presets">
+        <span>Start from:</span>
+        <button type="button" data-preset="midnight">Midnight</button>
+        <button type="button" data-preset="daylight">Daylight</button>
+        <button type="button" data-preset="forest">Forest</button>
+        <button type="button" data-preset="violet">Violet</button>
+      </div>
+      <section class="palette-builder" aria-labelledby="palette-title">
+        <h3 id="palette-title">Primary color suggestions</h3>
+        <p>Choose one RGB565 primary. Tilefinch suggests complementary pairs and can build a contrast-safe dark or light palette from either color.</p>
+        <div class="primary-picker">
+          <label for="primary-hex">Primary color</label>
+          <input id="primary-color" type="color" aria-label="Primary RGB565 color">
+          <input id="primary-hex" class="hex-input" maxlength="7" spellcheck="false" aria-label="Primary color hex value">
+        </div>
+        <div class="suggestions" id="suggestions" aria-live="polite"></div>
+      </section>
+      <div class="fields" id="fields"></div>
+      <div class="export">
+        <div class="export-actions">
+          <button class="primary" type="button" id="download">Download .tfth</button>
+          <button type="button" id="copy">Copy text</button>
+          <label class="file-button"><span>Import .tfth</span><input id="import" type="file" accept=".tfth,text/plain"></label>
+        </div>
+        <textarea id="theme-output" readonly spellcheck="false" aria-label="Generated theme file"></textarea>
+        <div class="message" id="message" role="status"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    "use strict";
+    const groups = [
+      ["Grounds", ["ground", "ground_reader", "chrome_bar", "hint_bar", "panel"]],
+      ["Surfaces", ["surface", "surface_focus", "line"]],
+      ["Text ramp", ["text", "text_body", "text_muted", "text_faint"]],
+      ["Accent", ["accent", "accent_high", "on_accent"]],
+      ["Semantic", ["ok", "warn"]]
+    ];
+    const presets = {
+      midnight: {
+        ground:"#100E0D", ground_reader:"#14100E", chrome_bar:"#0E0C0B",
+        hint_bar:"#0A0908", panel:"#140F0D", surface:"#1B1918",
+        surface_focus:"#262322", line:"#232120", text:"#FBF6F2",
+        text_body:"#D2CCC8", text_muted:"#898480", text_faint:"#686360",
+        accent:"#3D78B6", accent_high:"#72AAE2", on_accent:"#17120E",
+        ok:"#7FD6A2", warn:"#E08A52"
+      },
+      daylight: {
+        ground:"#F2F5FA", ground_reader:"#F7F3EA", chrome_bar:"#E4EAF3",
+        hint_bar:"#DAE2EE", panel:"#EDF1F7", surface:"#FFFFFF",
+        surface_focus:"#D7E6FA", line:"#B7C4D4", text:"#10213A",
+        text_body:"#263B56", text_muted:"#596C83", text_faint:"#8492A5",
+        accent:"#24588F", accent_high:"#3F78B8", on_accent:"#FFFFFF",
+        ok:"#267A55", warn:"#A94F24"
+      },
+      forest: {
+        ground:"#0D1410", ground_reader:"#111912", chrome_bar:"#0A100C",
+        hint_bar:"#080D0A", panel:"#101812", surface:"#18231C",
+        surface_focus:"#223128", line:"#29372E", text:"#F3F8F4",
+        text_body:"#CBD8CE", text_muted:"#839087", text_faint:"#606C64",
+        accent:"#4F9A72", accent_high:"#83C49D", on_accent:"#07150D",
+        ok:"#7FD6A2", warn:"#E08A52"
+      },
+      violet: {
+        ground:"#110F17", ground_reader:"#16121B", chrome_bar:"#0D0B12",
+        hint_bar:"#09080D", panel:"#16111D", surface:"#201B28",
+        surface_focus:"#2D2638", line:"#342D3D", text:"#F8F5FC",
+        text_body:"#D5CFDD", text_muted:"#8C8595", text_faint:"#696170",
+        accent:"#826BC5", accent_high:"#B5A1EA", on_accent:"#100B1B",
+        ok:"#7FD6A2", warn:"#E08A52"
+      }
+    };
+    const values = {...presets.midnight};
+    const THEME_HEADER = "tilefinch-theme";
+    const THEME_FORMAT_VERSION = 1;
+    const fields = document.getElementById("fields");
+    const output = document.getElementById("theme-output");
+    const message = document.getElementById("message");
+    const nameInput = document.getElementById("theme-name");
+    const primaryColor = document.getElementById("primary-color");
+    const primaryHex = document.getElementById("primary-hex");
+    const suggestions = document.getElementById("suggestions");
+
+    function validHex(value) { return /^#[0-9a-f]{6}$/i.test(value); }
+    function hexRgb(value) {
+      return {
+        r: parseInt(value.slice(1, 3), 16),
+        g: parseInt(value.slice(3, 5), 16),
+        b: parseInt(value.slice(5, 7), 16)
+      };
+    }
+    function byteHex(value) { return Math.max(0, Math.min(255, value)).toString(16).padStart(2, "0"); }
+    function rgb565(value) {
+      if (!validHex(value)) return null;
+      const source = hexRgb(value);
+      const r5 = source.r >> 3;
+      const g6 = source.g >> 2;
+      const b5 = source.b >> 3;
+      /* These are the exact expansion identities used by pixel_math.h. */
+      const r = (r5 * 1053) >> 7;
+      const g = (g6 * 259 + 3) >> 6;
+      const b = (b5 * 1053) >> 7;
+      return ("#" + byteHex(r) + byteHex(g) + byteHex(b)).toUpperCase();
+    }
+    function rgb565Label(value) {
+      const rgb = hexRgb(value);
+      return `R${rgb.r >> 3} G${rgb.g >> 2} B${rgb.b >> 3}`;
+    }
+    function rgbToHsl(value) {
+      const rgb = hexRgb(value);
+      const r = rgb.r / 255, g = rgb.g / 255, b = rgb.b / 255;
+      const maximum = Math.max(r, g, b), minimum = Math.min(r, g, b);
+      const lightness = (maximum + minimum) / 2;
+      if (maximum === minimum) return {h: 0, s: 0, l: lightness};
+      const delta = maximum - minimum;
+      const saturation = delta / (1 - Math.abs(2 * lightness - 1));
+      let hue;
+      if (maximum === r) hue = 60 * (((g - b) / delta) % 6);
+      else if (maximum === g) hue = 60 * ((b - r) / delta + 2);
+      else hue = 60 * ((r - g) / delta + 4);
+      if (hue < 0) hue += 360;
+      return {h: hue, s: saturation, l: lightness};
+    }
+    function hslHex(hue, saturation, lightness) {
+      hue = ((hue % 360) + 360) % 360;
+      saturation = Math.max(0, Math.min(1, saturation));
+      lightness = Math.max(0, Math.min(1, lightness));
+      const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation;
+      const section = hue / 60;
+      const x = chroma * (1 - Math.abs((section % 2) - 1));
+      let r = 0, g = 0, b = 0;
+      if (section < 1) { r = chroma; g = x; }
+      else if (section < 2) { r = x; g = chroma; }
+      else if (section < 3) { g = chroma; b = x; }
+      else if (section < 4) { g = x; b = chroma; }
+      else if (section < 5) { r = x; b = chroma; }
+      else { r = chroma; b = x; }
+      const m = lightness - chroma / 2;
+      return rgb565("#" + byteHex(Math.round((r + m) * 255))
+        + byteHex(Math.round((g + m) * 255)) + byteHex(Math.round((b + m) * 255)));
+    }
+    function mixHex(first, second, amount) {
+      const a = hexRgb(first), b = hexRgb(second);
+      return rgb565("#" + byteHex(Math.round(a.r + (b.r - a.r) * amount))
+        + byteHex(Math.round(a.g + (b.g - a.g) * amount))
+        + byteHex(Math.round(a.b + (b.b - a.b) * amount)));
+    }
+    function luminance(value) {
+      const rgb = hexRgb(value);
+      const linear = [rgb.r, rgb.g, rgb.b].map((channel) => {
+        channel /= 255;
+        return channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4;
+      });
+      return .2126 * linear[0] + .7152 * linear[1] + .0722 * linear[2];
+    }
+    function setToken(token, value) {
+      if (!validHex(value)) return false;
+      value = rgb565(value);
+      values[token] = value;
+      document.documentElement.style.setProperty("--" + token, value);
+      const color = document.querySelector(`[data-color="${token}"]`);
+      const hex = document.querySelector(`[data-hex="${token}"]`);
+      if (color) color.value = value;
+      if (hex) { hex.value = value; hex.classList.remove("invalid"); }
+      updateOutput();
+      return true;
+    }
+    function suggestedColors(primary) {
+      const hsl = rgbToHsl(primary);
+      const saturation = Math.max(.42, hsl.s);
+      const lightness = Math.max(.34, Math.min(.68, hsl.l));
+      return [
+        {name: "Complement", color: hslHex(hsl.h + 180, saturation, lightness)},
+        {name: "Split complement +", color: hslHex(hsl.h + 150, saturation, lightness)},
+        {name: "Split complement −", color: hslHex(hsl.h - 150, saturation, lightness)},
+        {name: "Analogous", color: hslHex(hsl.h + 30, saturation, lightness)}
+      ];
+    }
+    function applySuggestedPalette(primary, secondary) {
+      const light = luminance(values.ground) > .42;
+      const neutral = light ? "#FFFFFF" : "#000000";
+      const text = light ? "#10213A" : "#FFFFFF";
+      const body = light ? "#263B56" : "#D6D2CE";
+      const muted = light ? "#596C83" : "#8C8985";
+      const faint = light ? "#8492A5" : "#6B6763";
+      const palette = light ? {
+        ground:mixHex(neutral, secondary, .07), ground_reader:mixHex(neutral, secondary, .04),
+        chrome_bar:mixHex(neutral, secondary, .15), hint_bar:mixHex(neutral, secondary, .22),
+        panel:mixHex(neutral, secondary, .11), surface:neutral,
+        surface_focus:mixHex(neutral, primary, .18), line:mixHex(neutral, secondary, .31)
+      } : {
+        ground:mixHex(neutral, secondary, .12), ground_reader:mixHex(neutral, secondary, .15),
+        chrome_bar:mixHex(neutral, secondary, .09), hint_bar:mixHex(neutral, secondary, .06),
+        panel:mixHex(neutral, secondary, .15), surface:mixHex(neutral, secondary, .19),
+        surface_focus:mixHex(neutral, primary, .27), line:mixHex(neutral, secondary, .30)
+      };
+      Object.assign(palette, {
+        text, text_body:body, text_muted:muted, text_faint:faint,
+        accent:primary, accent_high:mixHex(primary, light ? "#000000" : "#FFFFFF", .28),
+        on_accent:luminance(primary) > .42 ? "#080808" : "#FFFFFF"
+      });
+      Object.entries(palette).forEach(([token, value]) => setToken(token, value));
+      message.textContent = `Applied ${primary} with ${secondary}; all colors snapped to RGB565.`;
+    }
+    function updateSuggestions(value) {
+      const primary = rgb565(value);
+      if (primary === null) { primaryHex.classList.add("invalid"); return; }
+      primaryColor.value = primary;
+      primaryHex.value = primary;
+      primaryHex.classList.remove("invalid");
+      suggestions.replaceChildren();
+      suggestedColors(primary).forEach((suggestion) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "suggestion";
+        button.style.setProperty("--suggestion-primary", primary);
+        button.style.setProperty("--suggestion-color", suggestion.color);
+        button.innerHTML = `<span class="suggestion-swatch"></span><span><strong>${suggestion.name}</strong><small>${suggestion.color} · ${rgb565Label(suggestion.color)}</small></span>`;
+        button.addEventListener("click", () => applySuggestedPalette(primary, suggestion.color));
+        suggestions.appendChild(button);
+      });
+    }
+    function highlight(token, on) {
+      document.querySelectorAll("[data-uses]").forEach((node) => {
+        const uses = node.dataset.uses.split(/\s+/);
+        node.classList.toggle("token-flash", on && uses.includes(token));
+      });
+    }
+    function buildFields() {
+      groups.forEach(([group, tokens]) => {
+        const set = document.createElement("fieldset");
+        const legend = document.createElement("legend");
+        legend.textContent = group;
+        set.appendChild(legend);
+        tokens.forEach((token) => {
+          const row = document.createElement("div");
+          row.className = "field";
+          row.dataset.field = token;
+          const label = document.createElement("label");
+          label.htmlFor = "hex-" + token;
+          label.textContent = token;
+          const color = document.createElement("input");
+          color.type = "color";
+          color.dataset.color = token;
+          color.value = values[token];
+          color.setAttribute("aria-label", token + " color picker");
+          const hex = document.createElement("input");
+          hex.id = "hex-" + token;
+          hex.className = "hex-input";
+          hex.dataset.hex = token;
+          hex.value = values[token];
+          hex.maxLength = 7;
+          hex.spellcheck = false;
+          color.addEventListener("input", () => setToken(token, color.value));
+          hex.addEventListener("input", () => {
+            if (!setToken(token, hex.value)) hex.classList.add("invalid");
+          });
+          [row, color, hex].forEach((node) => {
+            node.addEventListener("mouseenter", () => highlight(token, true));
+            node.addEventListener("mouseleave", () => highlight(token, false));
+            node.addEventListener("focus", () => highlight(token, true));
+            node.addEventListener("blur", () => highlight(token, false));
+          });
+          row.append(label, color, hex);
+          set.appendChild(row);
+        });
+        fields.appendChild(set);
+      });
+    }
+    function safeName() {
+      return nameInput.value.replace(/[^\x20-\x7e]/g, "").replace(/[=\t]/g, " ")
+        .trim().slice(0, 31) || "My Theme";
+    }
+    function updateOutput() {
+      const lines = [THEME_HEADER, "format=" + THEME_FORMAT_VERSION, "name=" + safeName()];
+      groups.forEach(([, tokens]) => tokens.forEach((token) => lines.push(token + "=" + values[token])));
+      output.value = lines.join("\n") + "\n";
+    }
+    function applyPreset(name) {
+      Object.entries(presets[name]).forEach(([token, value]) => setToken(token, value));
+      updateSuggestions(values.accent);
+      nameInput.value = name[0].toUpperCase() + name.slice(1);
+      updateOutput();
+      message.textContent = `Loaded ${nameInput.value}.`;
+    }
+    function parseTheme(text) {
+      if (text.length > 2048) throw new Error("Theme exceeds Tilefinch's 2 KiB limit.");
+      const lines = text.replace(/\r/g, "").split("\n");
+      if (lines.length > 24 || lines[0] !== THEME_HEADER)
+        throw new Error("This is not a bounded Tilefinch theme file.");
+      const next = {...presets.midnight};
+      let importedName = "Imported Theme";
+      let formatSeen = false;
+      const seen = new Set();
+      for (const line of lines.slice(1)) {
+        if (!line || line.startsWith("#")) continue;
+        const equals = line.indexOf("=");
+        if (equals < 1) throw new Error("A theme line is malformed.");
+        const key = line.slice(0, equals);
+        const value = line.slice(equals + 1);
+        if (seen.has(key)) throw new Error(`Duplicate field: ${key}`);
+        seen.add(key);
+        if (key === "format") {
+          if (value !== String(THEME_FORMAT_VERSION))
+            throw new Error(`Unsupported theme format: ${value || "missing"}`);
+          formatSeen = true;
+        } else if (key === "name") {
+          if (!value || value.length > 31 || /[^\x20-\x7e]|[=\t]/.test(value))
+            throw new Error("Theme name is invalid.");
+          importedName = value;
+        } else if (Object.hasOwn(next, key) && validHex(value)) {
+          next[key] = value.toUpperCase();
+        } else {
+          throw new Error(`Unknown or invalid field: ${key}`);
+        }
+      }
+      if (!formatSeen) throw new Error("Theme format version is missing.");
+      Object.entries(next).forEach(([token, value]) => setToken(token, value));
+      nameInput.value = importedName;
+      updateSuggestions(values.accent);
+      updateOutput();
+    }
+
+    document.querySelectorAll("[data-screen-button]").forEach((button) => {
+      button.addEventListener("click", () => {
+        document.querySelectorAll("[data-screen-button]").forEach((other) =>
+          other.setAttribute("aria-selected", String(other === button)));
+        document.querySelectorAll("[data-screen]").forEach((screen) =>
+          screen.classList.toggle("active", screen.dataset.screen === button.dataset.screenButton));
+      });
+    });
+    document.querySelectorAll("[data-preset]").forEach((button) =>
+      button.addEventListener("click", () => applyPreset(button.dataset.preset)));
+    nameInput.addEventListener("input", updateOutput);
+    primaryColor.addEventListener("input", () => updateSuggestions(primaryColor.value));
+    primaryHex.addEventListener("input", () => {
+      if (validHex(primaryHex.value)) updateSuggestions(primaryHex.value);
+      else primaryHex.classList.add("invalid");
+    });
+    document.getElementById("copy").addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(output.value);
+        message.textContent = "Theme text copied.";
+      } catch (_) {
+        output.select();
+        message.textContent = "Select and copy the highlighted theme text.";
+      }
+    });
+    document.getElementById("download").addEventListener("click", () => {
+      const blob = new Blob([output.value], {type: "text/plain;charset=utf-8"});
+      const link = document.createElement("a");
+      const filename = safeName().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "theme";
+      link.href = URL.createObjectURL(blob);
+      link.download = filename + ".tfth";
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(link.href), 0);
+      message.textContent = `Downloaded ${link.download}.`;
+    });
+    document.getElementById("import").addEventListener("change", (event) => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      if (file.size > 2048) { message.textContent = "Theme exceeds Tilefinch's 2 KiB limit."; return; }
+      const reader = new FileReader();
+      reader.onload = () => {
+        try { parseTheme(String(reader.result)); message.textContent = `Imported ${file.name}.`; }
+        catch (error) { message.textContent = error.message; }
+      };
+      reader.onerror = () => { message.textContent = "Could not read that file."; };
+      reader.readAsText(file);
+    });
+
+    buildFields();
+    Object.entries(values).forEach(([token, value]) => setToken(token, value));
+    updateSuggestions(values.accent);
+    updateOutput();
+  </script>
+</body>
+</html>

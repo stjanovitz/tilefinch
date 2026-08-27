@@ -284,7 +284,7 @@ static void launcher_present_splash(void)
        launcher_clear left no buffer behind. main() already tolerates a failed
        screen init and boots on regardless. */
     if (launcher_pixels == NULL) return;
-    uint16_t accent = PSP_THEME_ACCENT_EMBER;
+    uint16_t accent = PSP_THEME_ACCENT_MIDNIGHT;
     uint16_t body = PSP_THEME_ON_ACCENT;
     uint16_t eye = PSP_THEME_TEXT;
 #define LAUNCHER_DRAW_MARK_ROUND(x, y, width, height, radius, color) \
@@ -532,7 +532,7 @@ static bool launcher_recover(
        browser; the body stays on TEXT. Lines are kept inside the 38 columns
        the 2x glyphs give at this margin, so nothing hard-wraps mid-word. */
     launcher_draw_text_at(
-        20, 24, "TILEFINCH SAFE START", PSP_THEME_ACCENT_EMBER, 2);
+        20, 24, "TILEFINCH SAFE START", PSP_THEME_ACCENT_MIDNIGHT, 2);
     launcher_text_x = 20;
     launcher_text_y = 60;
     launcher_puts(

@@ -286,10 +286,11 @@ const char *psp_media_present_mode_name(PspMediaPresentMode mode)
 bool psp_media_present_skip_allowed(
     const PspMediaPresentRecord *record, uint64_t identity,
     uint64_t generation, const PspMediaPresentRect *video,
-    bool chrome_paints)
+    unsigned buffer_index, bool chrome_paints)
 {
     if (record == NULL || video == NULL) return false;
-    if (chrome_paints || !record->valid) return false;
+    if (chrome_paints || !record->valid
+        || record->buffer_index != buffer_index) return false;
     return record->identity == identity
         && record->generation == generation
         && record->video.x == video->x
@@ -300,12 +301,13 @@ bool psp_media_present_skip_allowed(
 
 void psp_media_present_record(
     PspMediaPresentRecord *record, uint64_t identity, uint64_t generation,
-    const PspMediaPresentRect *video)
+    const PspMediaPresentRect *video, unsigned buffer_index)
 {
     if (record == NULL || video == NULL) return;
     record->identity = identity;
     record->generation = generation;
     record->video = *video;
+    record->buffer_index = (uint8_t) buffer_index;
     record->valid = true;
 }
 

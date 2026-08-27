@@ -33,7 +33,7 @@ agents are capable of. A web browser was a good test of all three.
 | **Reader and offline modes** | Reflow and save articles, or preview, install, update, reinstall, and uninstall a small manifest-backed web app with its icon and already-loaded same-origin resources for offline use. |
 | **Text entry** | PSP system keyboard or the faster Danzeff radial keyboard, with local bookmark/history completion. |
 | **Canvas games** | Bounded Canvas 2D and WebGL 1 paths for charts and modest games, `ImageBitmap` asset preparation, user-activated PCM game audio, page fullscreen, and the standard Gamepad API for the built-in PSP controls. The repository includes the installable [Prism Break 3D](examples/prism-break-3d/) game. |
-| **Appearance** | Automatic or forced dark mode, page text scaling, three chrome themes, bounded mixed RTL/LTR page layout with Arabic-family shaping, and optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, and color-emoji glyph packs. |
+| **Appearance** | Automatic or forced page dark mode, dark and light browser chrome, switchable downloaded color-theme files, page text scaling, bounded mixed RTL/LTR layout with Arabic-family shaping, and optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, and color-emoji glyph packs. |
 | **Native PSP UI** | First-frame home screen, Collections, clock, battery/Wi-Fi status, contextual controls, PNG screenshots, and photographed QR diagnostics. |
 | **Optional XMB redirect** | ARK-4 can make Sony's Internet Browser icon launch Tilefinch, with a hold-L bypass back to the original browser. |
 | **Updates** | Signed in-app updates use A/B slots, a trial boot, automatic rollback, explicit approval, and an optional signed previous-version picker. |

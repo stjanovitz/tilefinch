@@ -15,6 +15,7 @@
     lives: document.getElementById("lives"),
     power: document.getElementById("power"),
     toast: document.getElementById("toast"),
+    controls: document.getElementById("controls"),
   };
   if (!gl || !ui.panel || !ui.play) {
     if (ui.message) ui.message.textContent = "WebGL is unavailable.";
@@ -229,6 +230,7 @@
   const input = {
     left: false, right: false, launch: false, pause: false,
     axis: 0, lastPrimary: false, lastPause: false,
+    source: "keyboard", gamepadConnected: false,
   };
   let lastTimestamp = 0, accumulator = 0, toastUntil = 0;
   let hudCache = "", hudDirty = true, hudSecond = -1;
@@ -468,20 +470,63 @@
     }
   }
 
+  function connectedGamepad() {
+    if (typeof navigator.getGamepads !== "function") return null;
+    const pads = navigator.getGamepads();
+    if (!pads) return null;
+    for (let at = 0; at < pads.length; at++) {
+      if (pads[at] && pads[at].connected) return pads[at];
+    }
+    return null;
+  }
+
+  function setInputSource(source) {
+    if (input.source === source) return;
+    input.source = source;
+    /* Edge state belongs to the previous device. A first press on the newly
+       active device must never inherit a held button from another source. */
+    input.lastPrimary = false;
+    input.lastPause = false;
+  }
+
+  function updateControlHint() {
+    const pad = connectedGamepad();
+    input.gamepadConnected = !!pad;
+    if (!ui.controls) return;
+    if (pad) {
+      ui.controls.textContent =
+        "Controller: stick/D-pad moves · A/X acts · Y/Triangle pauses";
+    } else if (navigator.platform === "PSP") {
+      ui.controls.textContent =
+        "Hold Start+Select for page controls · Nub/D-pad moves · X acts · Triangle pauses";
+    } else {
+      ui.controls.textContent =
+        "Keyboard: ←/→ or A/D moves · Space/Enter acts · P/Esc pauses";
+    }
+  }
+
   function pollInput() {
-    let axis = (input.right ? 1 : 0) - (input.left ? 1 : 0);
-    let primary = input.launch, pause = input.pause;
-    input.launch = input.pause = false;
-    const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
-    const pad = gamepads && gamepads[0];
-    if (pad && pad.connected) {
+    const keyboardAxis = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    const pad = connectedGamepad();
+    if (!!pad !== input.gamepadConnected) updateControlHint();
+    let gamepadAxis = 0, gamepadPrimary = false, gamepadPause = false;
+    if (pad) {
       const analog = Number(pad.axes[0]) || 0;
       const digital = (pad.buttons[15]?.pressed ? 1 : 0)
         - (pad.buttons[14]?.pressed ? 1 : 0);
-      axis = Math.abs(analog) > .12 ? analog : digital;
-      primary ||= !!pad.buttons[0]?.pressed;
-      pause ||= !!pad.buttons[3]?.pressed;
+      gamepadAxis = Math.abs(analog) > .12 ? analog : digital;
+      gamepadPrimary = !!pad.buttons[0]?.pressed;
+      gamepadPause = !!pad.buttons[3]?.pressed;
+      /* Merely connecting a controller must not disable desktop keys. The
+         controller becomes authoritative only after it produces input. */
+      if (gamepadAxis || gamepadPrimary || gamepadPause)
+        setInputSource("gamepad");
     }
+    if (!pad && input.source === "gamepad") setInputSource("keyboard");
+    const usingGamepad = input.source === "gamepad" && !!pad;
+    const axis = usingGamepad ? gamepadAxis : keyboardAxis;
+    const primary = usingGamepad ? gamepadPrimary : input.launch;
+    const pause = usingGamepad ? gamepadPause : input.pause;
     input.axis = Math.max(-1, Math.min(1, axis));
     if (primary && !input.lastPrimary) {
       if (state.mode === "playing") launchOrFire();
@@ -496,24 +541,50 @@
     input.lastPause = pause;
   }
 
+  function keyboardAction(event) {
+    const key = String(event.key || "");
+    const code = String(event.code || "");
+    const lower = key.length === 1 ? key.toLowerCase() : key;
+    if (key === "ArrowLeft" || lower === "a" || code === "KeyA")
+      return "left";
+    if (key === "ArrowRight" || lower === "d" || code === "KeyD")
+      return "right";
+    if (key === " " || key === "Spacebar" || key === "Enter"
+        || code === "Space" || code === "Enter") return "launch";
+    if (lower === "p" || key === "Escape" || code === "KeyP")
+      return "pause";
+    return "";
+  }
+
   addEventListener("keydown", (event) => {
-    if (event.key === "ArrowLeft" || event.key === "a") input.left = true;
-    if (event.key === "ArrowRight" || event.key === "d") input.right = true;
-    if (event.key === " " || event.key === "Enter") input.launch = true;
-    if (event.key === "p" || event.key === "Escape") input.pause = true;
+    const action = keyboardAction(event);
+    if (!action) return;
+    input[action] = true;
+    setInputSource("keyboard");
+    event.preventDefault();
   });
   addEventListener("keyup", (event) => {
-    if (event.key === "ArrowLeft" || event.key === "a") input.left = false;
-    if (event.key === "ArrowRight" || event.key === "d") input.right = false;
+    const action = keyboardAction(event);
+    if (!action) return;
+    input[action] = false;
+    event.preventDefault();
   });
+  addEventListener("blur", () => {
+    input.left = input.right = input.launch = input.pause = false;
+    input.lastPrimary = input.lastPause = false;
+  });
+  addEventListener("gamepadconnected", updateControlHint);
+  addEventListener("gamepaddisconnected", updateControlHint);
   canvas.addEventListener("pointermove", (event) => {
     if (!canvas.clientWidth) return;
+    setInputSource("pointer");
     const relative = (event.clientX - canvas.getBoundingClientRect().left)
       / canvas.clientWidth;
     const bound = 4.42 - state.paddle.width * .5;
     state.paddle.x = Math.max(-bound, Math.min(bound, relative * 9 - 4.5));
   });
   canvas.addEventListener("pointerdown", () => {
+    setInputSource("pointer");
     if (state.mode === "playing") launchOrFire();
   });
   document.addEventListener("visibilitychange", () => {
@@ -889,6 +960,8 @@
         shield: state.shield, laser: state.laser,
         meshDrops: state.meshDrops, frames: state.frames,
         titleMotionX: model[12], titleMotionY: model[13],
+        inputSource: input.source,
+        gamepadConnected: input.gamepadConnected,
       };
     },
     stop() { state.running = false; },
@@ -901,7 +974,16 @@
     resetGame();
     setMode("playing");
     launchOrFire();
+  } else {
+    /* Offline installation serializes the live document. Re-establish the
+       authored entry state in case the snapshot was taken while the game or
+       pause overlay had hidden/relabelled this panel. */
+    showPanel(
+      "PRISM BREAK 3D",
+      "Break every prism. Catch falling power cores.",
+      "Play");
   }
+  updateControlHint();
   render();
   requestAnimationFrame(frame);
 })();

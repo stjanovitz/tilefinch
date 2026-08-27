@@ -2972,6 +2972,9 @@ int main(void)
                     - PSP_MEDIA_DECODE_LEAD_US
           && psp_media_decode_clock_us(UINT64_C(700000), true)
                  == UINT64_C(700000)
+          && psp_media_first_frame_pending(false, UINT64_C(1))
+          && !psp_media_first_frame_pending(true, UINT64_C(1))
+          && !psp_media_first_frame_pending(false, 0)
           && !psp_media_deadline_reached(0, UINT64_C(9000000), 1)
           && !psp_media_deadline_reached(
                  UINT64_C(100), UINT64_C(5099), UINT64_C(5000))
@@ -4066,6 +4069,25 @@ int main(void)
                       PSP_MEDIA_VIDEO_STARTUP_CATCHUP_FRAMES)
                   && !psp_media_startup_catchup_settled(
                       PSP_MEDIA_VIDEO_STARTUP_CATCHUP_FRAMES - 1u));
+            /* Until the first DAC block establishes the A/V clock, startup
+               must not run video on wall time and then rewind it. Video-only
+               playback still advances normally. */
+            CHECK(psp_media_presentation_clock_step_us(
+                      33366u, 16000u, true, false, 0u, 66666u) == 49366u
+                  && psp_media_presentation_clock_step_us(
+                         60000u, 16000u, true, false, 0u, 66666u)
+                         == 66666u
+                  && psp_media_presentation_clock_step_us(
+                         60000u, 16000u, true, true, 23219u, 66666u)
+                         == 60000u
+                  && psp_media_presentation_clock_step_us(
+                         60000u, 16000u, true, true, 70000u, 66666u)
+                         == 70000u
+                  && psp_media_presentation_clock_step_us(
+                         33366u, 16000u, false, false, 0u, 0u) == 49366u
+                  && psp_media_presentation_clock_step_us(
+                         UINT64_MAX - 5u, 16u, false, false, 0u, 0u)
+                         == UINT64_MAX);
             slots[0].pts_us = 400000u;
             slots[0].duration_us = 40000u;
             CHECK(!psp_media_video_should_drop_late(

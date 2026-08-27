@@ -1572,7 +1572,10 @@ static TILEFINCH_OUT_OF_LINE bool psp_deferred_image_after_present(
     bool site_data_restore_work, bool offline_download_active,
     bool input_active)
 {
-    if (app == NULL || app->browser == NULL || page_idle_pumped
+    NavigationSession *navigation = app == NULL || app->browser == NULL
+        ? NULL : browser_engine_navigation(app->browser->engine);
+    if (app == NULL || app->browser == NULL || app->process == NULL
+        || page_idle_pumped
         || render_job_pending || site_data_restore_work || input_active
         || app->browser->media.ui.visible
         || psp_media_open_work_pending(&app->browser->media)
@@ -1580,11 +1583,100 @@ static TILEFINCH_OUT_OF_LINE bool psp_deferred_image_after_present(
         || app->browser->media.playback != NULL
         || offline_download_active
         || browser_engine_navigation_pending(app->browser->engine)
+        || navigation == NULL || !navigation->page.loaded
+        || browser_engine_render_shell(app->browser->engine) == NULL
+        || psp_ui_screen_is_native_surface(
+               app->process->presentation.ui.screen)
         || psp_navigation_cooperate_active()) return false;
     bool visual_changed = false;
     (void) browser_engine_run_deferred_image_work(
         app->browser->engine, &visual_changed);
     return visual_changed;
+}
+
+/* BrowserEngine cancels its tile job when a candidate navigation starts,
+   while the PSP loop owns a separate scheduling bit. Reconcile the two at
+   one boundary so a stale bit cannot try to rasterize after the incumbent
+   shell has been retired. Native surfaces also have no visible page raster;
+   suppressing hidden work there keeps HOME input and omnibox startup cheap.
+   Kept out of line because the resident frame function is I-cache ratcheted. */
+static TILEFINCH_OUT_OF_LINE bool psp_schedule_page_render_work(
+    PspApp *app, PspAppFrameState *frame, bool page_input_active,
+    bool site_data_restore_work, bool *render_job_pending,
+    uint64_t *render_job_last_progress_us)
+{
+    if (app == NULL || app->browser == NULL || app->process == NULL
+        || frame == NULL || render_job_pending == NULL
+        || render_job_last_progress_us == NULL) return false;
+    BrowserEngine *engine = app->browser->engine;
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    bool available = engine != NULL
+        && !browser_engine_navigation_pending(engine)
+        && navigation != NULL && navigation->page.loaded
+        && browser_engine_render_shell(engine) != NULL
+        && !psp_ui_screen_is_native_surface(
+               app->process->presentation.ui.screen);
+    if (!available) {
+        if (*render_job_pending && engine != NULL)
+            browser_engine_cancel_render_job(engine);
+        *render_job_pending = false;
+        *render_job_last_progress_us = 0;
+        frame->page_dirty = false;
+        return false;
+    }
+    if (frame->page_dirty) {
+        if (!*render_job_pending) {
+            *render_job_last_progress_us =
+                (uint64_t) sceKernelGetSystemTimeWide();
+        }
+        *render_job_pending = true;
+        browser_engine_cancel_idle_work(engine);
+        return false;
+    }
+    if (page_input_active || *render_job_pending || site_data_restore_work
+        || app->browser->media.ui.visible
+        || psp_media_open_work_pending(&app->browser->media)
+        || psp_media_decode_work_pending(&app->browser->media)) {
+        return false;
+    }
+    bool idle_visual_changed = false;
+    (void) browser_engine_run_idle_work(engine, &idle_visual_changed);
+    if (idle_visual_changed) {
+        psp_presentation_bind_chrome_fonts(
+            &app->process->presentation, engine);
+        frame->page_dirty = true;
+        *render_job_pending = true;
+        *render_job_last_progress_us =
+            (uint64_t) sceKernelGetSystemTimeWide();
+    }
+    return true;
+}
+
+/* A navigation commit and a local-surface transition can retire the page
+   shell after the earlier scheduling decision. Recheck at the point of use;
+   shell loss is an expected cancellation boundary, not a render failure to
+   expose to the user. */
+static TILEFINCH_OUT_OF_LINE void psp_reconcile_page_render_before_raster(
+    PspApp *app, PspAppFrameState *frame, bool *render_job_pending,
+    uint64_t *render_job_last_progress_us)
+{
+    if (app == NULL || app->browser == NULL || app->process == NULL
+        || frame == NULL || render_job_pending == NULL
+        || render_job_last_progress_us == NULL
+        || !*render_job_pending) return;
+    BrowserEngine *engine = app->browser->engine;
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    if (engine != NULL && !browser_engine_navigation_pending(engine)
+        && navigation != NULL && navigation->page.loaded
+        && browser_engine_render_shell(engine) != NULL
+        && !psp_ui_screen_is_native_surface(
+               app->process->presentation.ui.screen)) {
+        return;
+    }
+    if (engine != NULL) browser_engine_cancel_render_job(engine);
+    *render_job_pending = false;
+    *render_job_last_progress_us = 0;
+    frame->page_dirty = false;
 }
 
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -2575,11 +2667,15 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                            &scripted_download_id);
                 bool supervisor_owns_script =
                     psp_navigation_cooperate_supervised();
+                bool scripted_media_ready = browser->media.ui.visible
+                    && !browser->media.ui.resolving
+                    && !browser->media.ui.failed
+                    && browser->media.playback != NULL;
                 bool scripted_ready =
                     scripted_background_idle
                     && !process->presentation.ui.loading
                     && !render_job_pending
-                    && !browser->media.ui.visible
+                    && (!browser->media.ui.visible || scripted_media_ready)
                     && !browser_engine_navigation_pending(browser->engine)
                     && !navigation_background_resources_pending(
                            engine_views->navigation);
@@ -3425,6 +3521,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             }
         }
 
+        psp_app_handle_theme_catalog(&app, &frame, &intent);
         if (intent.setting.id != PSP_UI_SETTING_NONE)
             psp_app_apply_setting(&app, &frame, &intent);
         if (intent.setting.id == PSP_UI_SETTING_UPDATE_CHANNEL) {
@@ -4069,38 +4166,13 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             &app, &frame, &intent, render_job_pending,
             site_data_restore_work, offline_download_active,
             page_input_active);
-        if (frame.page_dirty) {
-            if (!render_job_pending) {
-                render_job_last_progress_us =
-                    (uint64_t) sceKernelGetSystemTimeWide();
-            }
-            render_job_pending = true;
-            browser_engine_cancel_idle_work(browser->engine);
-        } else if (!page_input_active && !render_job_pending
-                   && !site_data_restore_work
-                   && !browser->media.ui.visible
-                   && !psp_media_open_work_pending(&browser->media)
-                   && !psp_media_decode_work_pending(&browser->media)) {
-            /* Pre-resolution was pumped above, so it always gets the first
-               browser-thread slice and the media transport lane. Continue
-               one bounded page-idle slice afterward: otherwise its 30 s
-               network deadline freezes the deferred-thumbnail queue after
-               the initial two-image batch. A focus move still retires that
-               resolver before reaching this branch and promotes the newly
-               focused thumbnail to the queue head. */
-            bool idle_visual_changed = false;
-            (void) browser_engine_run_idle_work(
-                browser->engine, &idle_visual_changed);
-            page_idle_pumped = true;
-            if (idle_visual_changed) {
-                psp_presentation_bind_chrome_fonts(
-                    &process->presentation, browser->engine);
-                frame.page_dirty = true;
-                render_job_pending = true;
-                render_job_last_progress_us =
-                    (uint64_t) sceKernelGetSystemTimeWide();
-            }
-        }
+        /* Pre-resolution was pumped above, so it always gets the first
+           browser-thread slice and the media transport lane. The helper may
+           continue one bounded page-idle slice afterward; it also reconciles
+           the frontend render bit when navigation retires the page shell. */
+        page_idle_pumped = psp_schedule_page_render_work(
+            &app, &frame, page_input_active, site_data_restore_work,
+            &render_job_pending, &render_job_last_progress_us);
         const NavigationEntry *current_entry =
             navigation_current(engine_views->navigation);
         /* Watch documents no longer autoplay: the thumbnail is the sole
@@ -4409,6 +4481,9 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             navigation_visual_changed = true;
         psp_find_sync(browser->engine, &process->presentation.ui, &process->presentation.find_view);
         unsigned render_visual_state = 0;
+        psp_reconcile_page_render_before_raster(
+            &app, &frame, &render_job_pending,
+            &render_job_last_progress_us);
         if (render_job_pending) {
             psp_log_set_phase(PSP_LOG_PHASE_RENDER);
             psp_log_heartbeat();
@@ -4960,6 +5035,9 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
     cleanup_operation =
         psp_log_operation_begin("engine-cleanup");
     psp_update_session_destroy(&browser->update_session);
+    psp_ui_theme_catalog_bind(NULL);
+    psp_ui_theme_catalog_destroy(browser->theme_catalog);
+    browser->theme_catalog = NULL;
     psp_voice_component_session_destroy(
         browser->voice_component_session);
     psp_glyph_component_session_destroy(
@@ -5134,6 +5212,7 @@ int main(int argc, char *argv[])
               stdout);
         fflush(stdout);
     }
+    psp_display_set_validation_logger(psp_log_printf);
     psp_present_boot_entrance(
         1u,
         persistent_log_started
@@ -5366,6 +5445,13 @@ int main(int argc, char *argv[])
                invalid_field == NULL ? "unknown" : invalid_field);
         goto sleep_forever;
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_display_set_latch_probe_enabled(
+        process.config.validation_latch_probe != 0);
+    printf("tilefinch-display: latch-probe=%s\n",
+           process.config.validation_latch_probe != 0
+               ? "enabled" : "disabled");
+#endif
     /* Publish the experimental decoder knob before anything can open a video.
        The backend owns the parse so this boot path stays a single call. */
     media_psp_backend_set_wide_program(process.config.experimental_wide_video);
@@ -6065,7 +6151,18 @@ int main(int argc, char *argv[])
         browser_profile_third_party_cookie_site_allowed(browser.profile, startup_url);
     process.presentation.ui.search_engine = browser_profile_search_engine(browser.profile);
     process.presentation.ui.color_mode = browser_profile_color_mode(browser.profile);
-    process.presentation.ui.chrome_theme = (unsigned) browser_profile_chrome_theme(browser.profile);
+    BrowserChromeTheme chrome_theme =
+        browser_profile_chrome_theme(browser.profile);
+    char chrome_theme_error[64];
+    if (!psp_app_apply_chrome_theme(
+            &process, chrome_theme,
+            browser_profile_chrome_theme_file(browser.profile),
+            chrome_theme_error, sizeof(chrome_theme_error))) {
+        /* A requested custom file is optional external state. Its absence
+           must not block HOME or make ordinary startup depend on storage. */
+        (void) psp_app_apply_chrome_theme(
+            &process, BROWSER_CHROME_THEME_FINCH, NULL, NULL, 0u);
+    }
     process.presentation.ui.glyph_language =
         (unsigned) browser_profile_glyph_language(browser.profile);
     process.presentation.ui.color_emoji =
@@ -6077,12 +6174,7 @@ int main(int argc, char *argv[])
     process.presentation.ui.youtube_240p =
         browser_profile_youtube_quality(browser.profile)
             == BROWSER_YOUTUBE_QUALITY_240P;
-    process.presentation.ui.video_language = (uint8_t)
-        browser_profile_video_language(browser.profile);
-    process.presentation.ui.subtitle_language = (uint8_t)
-        browser_profile_subtitle_language(browser.profile);
-    process.presentation.ui.alternate_language = (uint8_t)
-        browser_profile_alternate_language(browser.profile);
+    psp_sync_video_preferences(&process.presentation.ui, browser.profile);
     process.presentation.ui.youtube_compact_results =
         browser_profile_youtube_compact_results(browser.profile);
     process.presentation.ui.youtube_audio_only =
@@ -6118,7 +6210,6 @@ int main(int argc, char *argv[])
     /* Retain the serialized preference but do not spend CPU or presentation
        bandwidth on ambient motion. A future GPU-owned version
        can migrate the same preference without changing this boot path. */
-    process.presentation.ui.wave_enabled = 0u;
     /* A release recorded by an earlier boot's background check stays marked
        until this build's own sequence catches up to it. */
     process.presentation.ui.update_release_available =

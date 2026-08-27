@@ -40,7 +40,10 @@ typedef struct {
     int last_stride;
     int last_format;
     int last_sync;
-    bool vblank_before_present;
+    unsigned event_sequence;
+    unsigned flush_event;
+    unsigned present_event;
+    unsigned vblank_event;
 } FakeDisplay;
 
 static FakeDisplay fake;
@@ -53,6 +56,7 @@ static void *fake_compose_base(void)
 static void fake_flush_range(void *address, size_t bytes)
 {
     fake.flush_calls++;
+    fake.flush_event = ++fake.event_sequence;
     fake.last_flush_address = address;
     fake.last_flush_bytes = bytes;
     /* Scanout must never be handed a buffer that was not written back. */
@@ -72,6 +76,7 @@ static int fake_set_frame_buffer(void *address, int stride, int format,
                                  int sync)
 {
     fake.present_calls++;
+    fake.present_event = ++fake.event_sequence;
     fake.last_address = address;
     fake.last_stride = stride;
     fake.last_format = format;
@@ -82,9 +87,7 @@ static int fake_set_frame_buffer(void *address, int stride, int format,
 static void fake_wait_vblank(void)
 {
     fake.vblank_waits++;
-    if (fake.vblank_waits > fake.present_calls) {
-        fake.vblank_before_present = true;
-    }
+    fake.vblank_event = ++fake.event_sequence;
 }
 
 static const PspDisplayBackend fake_backend = {
@@ -104,8 +107,19 @@ static bool fake_reset(void)
     fake.memory = calloc(
         PSP_DISPLAY_EDRAM_BYTES / sizeof(*fake.memory),
         sizeof(*fake.memory));
-    fake.vblank_before_present = true;
     return fake.memory != NULL;
+}
+
+static uint32_t expected_widen(uint16_t pixel)
+{
+    unsigned red = (unsigned) (pixel >> 11) & 31u;
+    unsigned green = (unsigned) (pixel >> 5) & 63u;
+    unsigned blue = (unsigned) pixel & 31u;
+    red = (red << 3) | (red >> 2);
+    green = (green << 2) | (green >> 4);
+    blue = (blue << 3) | (blue >> 2);
+    return (uint32_t) red | ((uint32_t) green << 8)
+        | ((uint32_t) blue << 16) | UINT32_C(0xff000000);
 }
 
 /* The browser was blank because it published with the immediate-mode flag.
@@ -124,8 +138,10 @@ static bool test_publish_uses_next_frame_and_claims_the_mode(void)
     CHECK(fake.last_sync == PSP_DISPLAY_SYNC_NEXT_FRAME);
     CHECK(fake.last_format == PSP_DISPLAY_FORMAT_RGB565);
     CHECK(fake.last_stride == PSP_DISPLAY_STRIDE);
-    /* A frame must be complete before it is latched. */
-    CHECK(fake.vblank_before_present);
+    /* A frame must be complete before it is queued, and the old front must
+       not become reusable until the requested next-vblank latch occurs. */
+    CHECK(fake.flush_event < fake.present_event);
+    CHECK(fake.present_event < fake.vblank_event);
     CHECK(psp_display_healthy(&display));
     return true;
 }
@@ -143,6 +159,8 @@ static bool test_rejected_present_is_a_failure_not_a_frame(void)
     CHECK(display.rejections == 1);
     CHECK(display.presents == 1);
     CHECK(display.first_error == -1);
+    /* A refused request has no latch to wait for. */
+    CHECK(fake.vblank_waits == 0);
 
     /* The panel never changed, so the buffer just composed is still the one
        being scanned out; rotating would hand the caller a live surface. */
@@ -311,20 +329,31 @@ static bool test_video_surface_switches_format_and_buffers(void)
     CHECK(!psp_display_video_active(&display));
     CHECK(psp_display_video_back_buffer(&display) == NULL);
     CHECK(psp_display_video_overlay_scratch(&display) == NULL);
+    uint16_t *page_back = psp_display_back_buffer(&display);
+    CHECK(page_back != NULL);
+    for (size_t at = 0; at < PSP_DISPLAY_BUFFER_PIXELS; at++)
+        page_back[at] = (uint16_t) (at * 73u + 0x1234u);
     CHECK(psp_display_publish(&display));
     CHECK(psp_display_front_buffer(&display) != NULL);
     int presents_before = fake.present_calls;
     uint32_t content_epoch_before = psp_display_edram_content_epoch();
 
-    /* Entering performs no syscall: the panel keeps showing the last complete
-       16-bit frame until a complete 32-bit one replaces it. */
+    /* Entering latches one 8888 bridge frame whose pixels exactly reproduce
+       the complete 565 loading UI. The decoded frame is not admitted until
+       this format transition has reached a vertical boundary. */
     CHECK(psp_display_video_begin(&display));
     CHECK(psp_display_edram_content_epoch() != content_epoch_before);
     uint32_t video_content_epoch = psp_display_edram_content_epoch();
     CHECK(psp_display_video_begin(&display));
     CHECK(psp_display_edram_content_epoch() == video_content_epoch);
     CHECK(psp_display_video_active(&display));
-    CHECK(fake.present_calls == presents_before);
+    CHECK(fake.present_calls == presents_before + 1);
+    CHECK(fake.last_format == PSP_DISPLAY_FORMAT_RGBA8888);
+    CHECK(fake.last_address == psp_display_video_front_buffer(&display));
+    const uint32_t *bridge = psp_display_video_front_buffer(&display);
+    CHECK(bridge != NULL);
+    for (size_t at = 0; at < PSP_DISPLAY_BUFFER_PIXELS; at++)
+        CHECK(bridge[at] == expected_widen(page_back[at]));
     CHECK(display.surface_entries == 1);
     /* And the 16-bit accessors refuse, so a composer that forgot to leave
        fails loudly instead of writing 565 rows into a 32-bit buffer. */
@@ -432,33 +461,47 @@ static bool test_video_surface_switches_format_and_buffers(void)
     return true;
 }
 
-/* Page buffer 2 has no same-numbered video slot.  Entering video from that
-   point must normalize the rotation before XOR selects the next video slot;
-   otherwise exit clears and latches page slot 2 (the start of video slot 1)
-   while the panel had actually been showing video slot 0. */
-static bool test_video_exit_maps_page_rotation_two_to_video_front(void)
+/* The video pair overlays the page triple. For every possible page rotation,
+   the first 32-bit compose must use storage disjoint from the 16-bit front
+   the panel is still scanning. The old modulo mapping failed specifically at
+   page back 2/front 1: video slot 0 overwrote that visible page buffer before
+   the format switch, producing two frames of coloured noise on hardware. */
+static bool test_video_entry_avoids_visible_page_buffer(void)
 {
-    CHECK(fake_reset());
-    PspDisplay display;
-    CHECK(psp_display_begin(&display, &fake_backend));
-    CHECK(psp_display_publish(&display));
-    CHECK(psp_display_publish(&display));
-    CHECK(display.back_buffer == 2u);
+    for (unsigned page_back = 0; page_back < 3u; page_back++) {
+        CHECK(fake_reset());
+        PspDisplay display;
+        CHECK(psp_display_begin(&display, &fake_backend));
+        display.back_buffer = page_back;
+        unsigned page_front = (page_back + 2u) % 3u;
+        unsigned char *page_start = (unsigned char *) fake.memory
+            + (size_t) page_front * PSP_DISPLAY_BUFFER_PIXELS
+                * sizeof(uint16_t);
+        unsigned char *page_end = page_start
+            + PSP_DISPLAY_BUFFER_PIXELS * sizeof(uint16_t);
 
-    CHECK(psp_display_video_begin(&display));
-    CHECK(display.back_buffer == 0u);
-    uint32_t *video_front_after_publish = psp_display_video_back_buffer(
-        &display);
-    CHECK(video_front_after_publish
-          == (uint32_t *) (void *) fake.memory);
-    CHECK(psp_display_publish(&display));
-    CHECK(fake.last_address == video_front_after_publish);
+        unsigned expected_video = page_front == 2u ? 0u : 1u;
+        unsigned char *bridge_start = (unsigned char *) fake.memory
+            + (size_t) expected_video * PSP_DISPLAY_VIDEO_BUFFER_BYTES;
+        unsigned char *bridge_end = bridge_start
+            + PSP_DISPLAY_VIDEO_BUFFER_BYTES;
+        CHECK(bridge_end <= page_start || page_end <= bridge_start);
 
-    CHECK(psp_display_video_end(&display));
-    CHECK(fake.last_address == (void *) fake.memory);
-    CHECK(psp_display_front_buffer(&display) == fake.memory);
-    CHECK(psp_display_back_buffer(&display)
-          == fake.memory + PSP_DISPLAY_BUFFER_PIXELS);
+        CHECK(psp_display_video_begin(&display));
+        CHECK(fake.last_address == bridge_start);
+        CHECK(display.back_buffer == (expected_video ^ 1u));
+        unsigned char *video_start = (unsigned char *)
+            psp_display_video_back_buffer(&display);
+
+        CHECK(psp_display_publish(&display));
+        CHECK(fake.last_address == video_start);
+        CHECK(psp_display_video_end(&display));
+        unsigned decoded_video = expected_video ^ 1u;
+        unsigned restored_page = decoded_video == 0u ? 0u : 2u;
+        CHECK(fake.last_address == (unsigned char *) fake.memory
+            + (size_t) restored_page * PSP_DISPLAY_BUFFER_PIXELS
+                * sizeof(uint16_t));
+    }
     return true;
 }
 
@@ -511,7 +554,7 @@ int main(void)
         && test_rearm_reasserts_last_front_without_rotation()
         && test_rearm_failure_is_observable()
         && test_video_surface_switches_format_and_buffers()
-        && test_video_exit_maps_page_rotation_two_to_video_front()
+        && test_video_entry_avoids_visible_page_buffer()
         && test_video_surface_exit_failure_is_observable()
         && test_rearm_follows_the_active_surface();
     free(fake.memory);

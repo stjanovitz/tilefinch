@@ -8,13 +8,15 @@
 
 /*
  * Pure decision seam shared by the host test and the optional VSH plugin.
- * A controller read failure is deliberately fail-open: Sony's browser keeps
- * starting rather than trapping the user in a redirect they cannot bypass.
+ * A controller read failure or a module load without a contemporaneous XMB
+ * confirmation press is deliberately fail-open: Sony's browser keeps
+ * starting rather than turning an incidental startup load into a handoff.
  */
 bool tilefinch_xmb_redirect_should_attempt(
     const char *module_name,
     bool controller_sample_valid,
     uint32_t buttons,
+    uint32_t activation_buttons,
     uint32_t bypass_button,
     bool launch_already_armed);
 

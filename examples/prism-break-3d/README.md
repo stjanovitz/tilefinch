@@ -16,3 +16,8 @@ On PSP, focus **Play** and press X. Hold Start+Select for 0.7 seconds to give
 the page the controls. The nub or D-pad moves, X launches the ball or fires the
 laser, and Triangle pauses. Hold Start+Select again to return controls to the
 browser.
+
+On a computer, use Left/Right or A/D to move, Space or Enter to launch and
+fire, and P or Escape to pause. A connected standard gamepad is also supported.
+The game follows the last device that produces input, so an idle controller
+does not block the keyboard and either device can take over without reloading.

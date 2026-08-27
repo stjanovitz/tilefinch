@@ -8,6 +8,7 @@
  */
 #include "psp_app_internal.h"
 #include <psputility_sysparam.h>
+#include "tilefinch/pixel_math.h"
 #include "tilefinch/psp_time.h"
 #include "tilefinch/psp_threads.h"
 
@@ -381,21 +382,37 @@ void psp_log_message(void *context, const char *message)
    software presenter -- the Sharp option and the fallback -- uses it. */
 static PspMediaScaleMap psp_media_scale_map;
 
-/* What each of the two scanout buffers already holds, so a picture the
-   decoder has not replaced is not re-presented into a buffer that already
-   shows it. See psp_media_present_skip_allowed for the three conditions. */
+/* What each scanout buffer already holds, so a picture the decoder has not
+   replaced is not re-presented into a buffer that already shows it. The
+   software path rotates three page buffers while the GE video surface uses
+   two; size for the larger set and retain the physical index in each record. */
+_Static_assert(
+    PSP_DISPLAY_PAGE_BUFFER_COUNT >= PSP_DISPLAY_VIDEO_BUFFER_COUNT,
+    "present records must cover every physical scanout buffer");
 static PspMediaPresentRecord
-    psp_media_present_records[PSP_DISPLAY_VIDEO_BUFFER_COUNT];
+    psp_media_present_records[PSP_DISPLAY_PAGE_BUFFER_COUNT];
+static PspUiMediaTrackMenuCache psp_media_track_menu_cache;
+_Static_assert(
+    PSP_DISPLAY_VIDEO_AUX_BYTES
+        >= (size_t) PSP_UI_MEDIA_TRACK_MENU_WIDTH
+             * (size_t) PSP_UI_MEDIA_TRACK_MENU_HEIGHT * sizeof(uint16_t),
+    "the bounded video EDRAM tail must hold the retained track menu");
 /* Only so the mode line is printed once rather than once a frame. */
 static int psp_media_present_reported_mode = -1;
 static uint64_t psp_media_present_reported_generation;
 static int psp_media_present_reported_width;
 static int psp_media_present_reported_height;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* Set by the presenter admission seam and sampled only after a successful
+   publish. Validation needs to distinguish a freshly drawn picture from a
+   scanout accepted through the same-picture fast path. */
+static bool psp_media_present_last_skipped;
+#endif
 
 void psp_media_present_forget_buffers(void)
 {
     psp_media_present_records_reset(
-        psp_media_present_records, PSP_DISPLAY_VIDEO_BUFFER_COUNT);
+        psp_media_present_records, PSP_DISPLAY_PAGE_BUFFER_COUNT);
 }
 
 /*
@@ -430,6 +447,22 @@ typedef struct {
     uint32_t native_presentations;
     uint32_t compose_over_16ms;
     uint32_t compose_over_33ms;
+    uint64_t track_menu_compose_total_us;
+    uint64_t track_menu_compose_max_us;
+    uint64_t track_menu_scanout_interval_total_us;
+    uint64_t track_menu_scanout_interval_max_us;
+    uint32_t track_menu_presentations;
+    uint32_t track_menu_scanout_intervals;
+    uint64_t track_menu_blit_total_us;
+    uint64_t track_menu_blit_max_us;
+    uint32_t track_menu_blits;
+    uint32_t track_menu_blit_fallbacks;
+    uint64_t track_menu_open_transition_us;
+    uint64_t track_menu_close_transition_us;
+    uint32_t track_menu_open_transitions;
+    uint32_t track_menu_close_transitions;
+    bool track_menu_state_known;
+    bool track_menu_was_open;
     uint64_t cursor_sample_pending_us;
     uint64_t cursor_sample_previous_us;
     uint64_t cursor_sample_interval_total_us;
@@ -470,6 +503,9 @@ void psp_report_presentation_cadence(const char *phase)
         "tilefinch-ui-cadence: phase=%s presents=%lu native=%lu "
         "compose-total=%lluus compose-max=%lluus compose-average=%lluus "
         "over-16ms=%lu over-33ms=%lu start-gap-max=%lluus "
+        "track-menu-presents=%lu track-menu-compose-average=%lluus "
+        "track-menu-compose-max=%lluus track-menu-blits=%lu/%lu "
+        "track-menu-blit-average=%lluus track-menu-blit-max=%lluus "
         "cursor-samples=%lu cursor-presents=%lu cursor-coalesced=%lu "
         "cursor-average=%lluus cursor-max=%lluus cursor-over-33ms=%lu\n",
         phase == NULL ? "unknown" : phase, metrics->presentations,
@@ -480,6 +516,17 @@ void psp_report_presentation_cadence(const char *phase)
             : metrics->compose_total_us / metrics->presentations),
         metrics->compose_over_16ms, metrics->compose_over_33ms,
         (unsigned long long) metrics->start_gap_max_us,
+        (unsigned long) metrics->track_menu_presentations,
+        (unsigned long long) (metrics->track_menu_presentations == 0 ? 0
+            : metrics->track_menu_compose_total_us
+                / metrics->track_menu_presentations),
+        (unsigned long long) metrics->track_menu_compose_max_us,
+        (unsigned long) metrics->track_menu_blits,
+        (unsigned long) metrics->track_menu_blit_fallbacks,
+        (unsigned long long) (metrics->track_menu_blits == 0 ? 0
+            : metrics->track_menu_blit_total_us
+                / metrics->track_menu_blits),
+        (unsigned long long) metrics->track_menu_blit_max_us,
         metrics->cursor_samples, metrics->cursor_presentations,
         metrics->cursor_coalesced_samples,
         (unsigned long long) (metrics->cursor_presentations == 0 ? 0
@@ -515,6 +562,23 @@ void psp_report_presentation_cadence(const char *phase)
         (unsigned long) metrics->video_scanout_buckets[5],
         (unsigned long) metrics->video_scanout_buckets[6],
         (unsigned long) metrics->video_scanout_buckets[7]);
+    printf(
+        "tilefinch-track-menu-cadence: phase=%s intervals=%lu "
+        "average=%lluus max=%lluus\n",
+        phase == NULL ? "unknown" : phase,
+        (unsigned long) metrics->track_menu_scanout_intervals,
+        (unsigned long long) (metrics->track_menu_scanout_intervals == 0 ? 0
+            : metrics->track_menu_scanout_interval_total_us
+                / metrics->track_menu_scanout_intervals),
+        (unsigned long long) metrics->track_menu_scanout_interval_max_us);
+    printf(
+        "tilefinch-track-menu-transition: phase=%s open=%lu/%lluus "
+        "close=%lu/%lluus\n",
+        phase == NULL ? "unknown" : phase,
+        (unsigned long) metrics->track_menu_open_transitions,
+        (unsigned long long) metrics->track_menu_open_transition_us,
+        (unsigned long) metrics->track_menu_close_transitions,
+        (unsigned long long) metrics->track_menu_close_transition_us);
 }
 
 void psp_cursor_latency_sample(uint64_t sampled_us)
@@ -570,6 +634,27 @@ static void psp_cadence_composed(uint64_t started_us, bool native_surface)
         metrics->compose_max_us = compose_us;
     if (compose_us > UINT64_C(16000)) metrics->compose_over_16ms++;
     if (compose_us > UINT64_C(33000)) metrics->compose_over_33ms++;
+    bool track_menu_open = psp_active_media != NULL
+        && psp_active_media->ui.presentation != NULL
+        && psp_active_media->ui.presentation->track_menu_open;
+    if (metrics->track_menu_state_known
+        && track_menu_open != metrics->track_menu_was_open) {
+        if (track_menu_open) {
+            metrics->track_menu_open_transitions++;
+            metrics->track_menu_open_transition_us = compose_us;
+        } else {
+            metrics->track_menu_close_transitions++;
+            metrics->track_menu_close_transition_us = compose_us;
+        }
+    }
+    metrics->track_menu_state_known = true;
+    metrics->track_menu_was_open = track_menu_open;
+    if (track_menu_open) {
+        metrics->track_menu_presentations++;
+        metrics->track_menu_compose_total_us += compose_us;
+        if (compose_us > metrics->track_menu_compose_max_us)
+            metrics->track_menu_compose_max_us = compose_us;
+    }
     if (metrics->start_previous_us != 0) {
         uint64_t gap = started_us - metrics->start_previous_us;
         if (gap > metrics->start_gap_max_us) metrics->start_gap_max_us = gap;
@@ -625,6 +710,14 @@ static void psp_cadence_video_published(
             metrics->video_scanout_interval_max_us = interval_us;
         metrics->video_scanout_buckets[
             psp_video_scanout_interval_bucket(interval_us)]++;
+        if (psp_active_media != NULL
+            && psp_active_media->ui.presentation != NULL
+            && psp_active_media->ui.presentation->track_menu_open) {
+            metrics->track_menu_scanout_intervals++;
+            metrics->track_menu_scanout_interval_total_us += interval_us;
+            if (interval_us > metrics->track_menu_scanout_interval_max_us)
+                metrics->track_menu_scanout_interval_max_us = interval_us;
+        }
     }
     metrics->video_scanout_previous_us = now_us;
     metrics->video_scanout_identity = frame->identity;
@@ -795,7 +888,8 @@ static void psp_media_present_account(
        buffer they touched no longer holds the picture on its own. */
     if (chrome_paints) record->valid = false;
     else psp_media_present_record(
-        record, frame->identity, generation, &plan->video);
+        record, frame->identity, generation, &plan->video,
+        psp_display.back_buffer);
 }
 
 /* True when the plan and the identity record say this present may be skipped
@@ -807,14 +901,19 @@ static bool psp_media_present_prepare(
 {
     *generation =
         psp_active_media == NULL ? 0 : psp_active_media->generation;
-    *record = &psp_media_present_records[psp_display.back_buffer & 1u];
+    unsigned buffer_index =
+        psp_display.back_buffer % PSP_DISPLAY_PAGE_BUFFER_COUNT;
+    *record = &psp_media_present_records[buffer_index];
     if (!psp_media_present_skip_allowed(
             *record, frame->identity, *generation, &plan->video,
-            chrome_paints)) {
+            buffer_index, chrome_paints)) {
         return false;
     }
     if (psp_active_media != NULL)
         psp_active_media->present_skipped_frames++;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_media_present_last_skipped = true;
+#endif
     return true;
 }
 
@@ -1091,8 +1190,9 @@ static bool psp_media_complete_wide_pass(PspMediaPresentGeCost *cost)
  * navigation away and a system suspend all stop producing decoded frames, and
  * the very next present puts the panel back.
  *
- * Entering costs no syscall (see psp_display_video_begin), so a session that
- * never opens a video never pays for this and the boot counters cannot move.
+ * Entering publishes one visually equivalent 8888 copy of the loading frame
+ * before decoded pixels are admitted. A session that never opens video never
+ * pays for that format bridge and the boot counters cannot move.
  */
 static bool psp_media_video_surface_follow(bool video_owns_screen)
 {
@@ -1110,11 +1210,9 @@ static bool psp_media_video_surface_follow(bool video_owns_screen)
     }
     if (!psp_display_video_begin(&psp_display)) return false;
     /*
-     * Prove the passthrough before the first publish, into the buffer that is
-     * about to be drawn. Nothing has been latched yet, so a mismatch costs a
-     * scribble on a buffer the panel has never shown -- and the alternative,
-     * discovering it after publishing, is a frame of wrong colour on a user's
-     * screen.
+     * The format bridge has already latched the expanded loading UI. Prove the
+     * decoded-pixel passthrough in the other, still-hidden video buffer before
+     * the first actual video publish.
      */
     if (!psp_media_present_ge_passthrough_check(
             psp_display_video_back_buffer(&psp_display))) {
@@ -1123,6 +1221,78 @@ static bool psp_media_video_surface_follow(bool video_owns_screen)
     }
     psp_media_present_forget_buffers();
     return true;
+}
+
+static bool psp_media_track_menu_blit(
+    void *context, const uint16_t *source, int source_width,
+    int source_height, int source_stride, bool source_changed,
+    uint32_t *destination, int destination_stride, int left, int top)
+{
+    (void) context;
+    PspMediaPresentGeCost cost = {0, 0, 0};
+    bool blitted = psp_media_present_ge_blit_565(
+        source, source_width, source_height, source_stride, source_changed,
+        destination, destination_stride, left, top, &cost);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    PspPresentationCadence *metrics = &psp_presentation_cadence;
+    if (blitted) {
+        uint64_t elapsed_us = cost.submit_us + cost.sync_us;
+        metrics->track_menu_blits++;
+        metrics->track_menu_blit_total_us += elapsed_us;
+        if (elapsed_us > metrics->track_menu_blit_max_us)
+            metrics->track_menu_blit_max_us = elapsed_us;
+        if (source_changed) {
+            unsigned mismatches = 0u;
+            unsigned samples = 0u;
+            /* The exhaustive 61,952-pixel device proof is a release-time
+               probe, not interactive work. Keep a deterministic 8x8 oracle
+               in ordinary validation runs so a bad channel map or geometry
+               still fails visibly without stalling the menu-opening frame. */
+            for (unsigned sample_y = 0; sample_y < 8u; sample_y++) {
+                int y = (int) (sample_y
+                    * (unsigned) (source_height - 1) / 7u);
+                for (unsigned sample_x = 0; sample_x < 8u; sample_x++) {
+                    int x = (int) (sample_x
+                        * (unsigned) (source_width - 1) / 7u);
+                    uint16_t pixel = source[(size_t) y * source_stride + x];
+                    unsigned red = tilefinch_rgb565_red_code(pixel);
+                    unsigned green = tilefinch_rgb565_green_code(pixel);
+                    unsigned blue = tilefinch_rgb565_blue_code(pixel);
+                    red = (red << 3) | (red >> 2);
+                    green = (green << 2) | (green >> 4);
+                    blue = (blue << 3) | (blue >> 2);
+                    uint32_t expected = (uint32_t) red
+                        | ((uint32_t) green << 8)
+                        | ((uint32_t) blue << 16)
+                        | UINT32_C(0xff000000);
+                    uint32_t got = destination[
+                        (size_t) (top + y) * destination_stride
+                            + (size_t) (left + x)];
+                    /* GU_TCC_RGB leaves the otherwise-unused scanout alpha
+                       byte unspecified; the panel and later RGB565 backdrop
+                       conversion consume only the three colour channels. */
+                    if ((got & UINT32_C(0x00ffffff))
+                        != (expected & UINT32_C(0x00ffffff))) {
+                        mismatches++;
+                    }
+                    samples++;
+                }
+            }
+            printf(
+                "tilefinch-track-menu-blit: samples=%lu mismatches=%lu "
+                "submit=%lluus sync=%lluus\n",
+                (unsigned long) samples,
+                (unsigned long) mismatches,
+                (unsigned long long) cost.submit_us,
+                (unsigned long long) cost.sync_us);
+        }
+    } else {
+        metrics->track_menu_blit_fallbacks++;
+    }
+#else
+    (void) cost;
+#endif
+    return blitted;
 }
 
 /* One video frame plus its chrome, published. Out of line: the 16-bit
@@ -1136,10 +1306,15 @@ static bool psp_present_video_surface(void)
 #endif
     uint32_t *vram = psp_display_video_back_buffer(&psp_display);
     PspMediaPresentGeCost cost = {0, 0, 0};
+    bool overlay_paints =
+        psp_ui_media_overlay_paints(&psp_active_media->ui);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_media_present_last_skipped = false;
+#endif
     if (vram == NULL
         || !psp_present_media_frame_video(
                vram, &psp_active_media->frame,
-               psp_active_media->ui.controls_visible, &cost)) {
+               overlay_paints, &cost)) {
         /* The engine refused after the surface was entered. Hand the panel
            back and let the next present run the software scaler; publishing a
            buffer nothing drew into would be a frame of noise. */
@@ -1153,18 +1328,32 @@ static bool psp_present_video_surface(void)
         .height = PSP_MEDIA_PREVIEW_HEIGHT,
         .stride = PSP_MEDIA_PREVIEW_WIDTH
     };
-    psp_ui_media_composite_8888(
+    psp_ui_media_composite_8888_cached(
         &psp_active_media->ui,
         psp_active_media->ui.seek_preview_active ? &preview : NULL,
         vram, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT, PSP_VRAM_STRIDE,
-        psp_display_video_overlay_scratch(&psp_display));
+        psp_display_video_overlay_scratch(&psp_display),
+        psp_display_video_aux(&psp_display),
+        psp_display_video_aux_pixels(&psp_display),
+        psp_display_edram_content_epoch(), &psp_media_track_menu_cache,
+        psp_media_track_menu_blit, NULL);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_cadence_composed(presentation_started_us, false);
+#endif
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    unsigned published_index = psp_display.back_buffer;
 #endif
     bool published = psp_display_publish(&psp_display);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_cadence_published(published);
     psp_cadence_video_published(published, &psp_active_media->frame);
+    if (published) {
+        psp_input_script_capture_media_present(
+            &psp_active_media->ui, NULL, vram, PSP_VRAM_STRIDE,
+            true, published_index, psp_media_present_last_skipped, false,
+            &psp_active_media->frame, psp_media_present_records,
+            PSP_DISPLAY_PAGE_BUFFER_COUNT);
+    }
 #endif
     return published;
 }
@@ -1245,9 +1434,14 @@ bool psp_present_internal(
     }
     if (media_visible) {
         if (media_replaces_page) {
+            bool overlay_paints =
+                psp_ui_media_overlay_paints(&psp_active_media->ui);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            psp_media_present_last_skipped = false;
+#endif
             (void) psp_present_media_frame(
                 vram, &psp_active_media->frame,
-                psp_active_media->ui.controls_visible);
+                overlay_paints);
         }
         PspUiMediaPreview preview = {
             .pixels = psp_active_media->seek_preview_pixels,
@@ -1270,9 +1464,20 @@ bool psp_present_internal(
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_cadence_composed(presentation_started_us, native_surface);
 #endif
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    unsigned published_index = psp_display.back_buffer;
+#endif
     bool published = psp_display_publish(&psp_display);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_cadence_published(published);
+    if (published && media_visible) {
+        psp_input_script_capture_media_present(
+            &psp_active_media->ui, vram, NULL, PSP_VRAM_STRIDE,
+            false, published_index,
+            media_replaces_page && psp_media_present_last_skipped,
+            false, media_replaces_page ? &psp_active_media->frame : NULL,
+            psp_media_present_records, PSP_DISPLAY_PAGE_BUFFER_COUNT);
+    }
 #endif
     return published;
 }
@@ -1800,7 +2005,22 @@ static void psp_present_supervisor_media(const PspUiMediaState *media)
             psp_ui_media_composite_controls_8888(
                 media, back, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT,
                 PSP_VRAM_STRIDE, scratch);
-            (void) psp_display_publish(&psp_display);
+            unsigned published_index = psp_display.back_buffer;
+            bool published = psp_display_publish(&psp_display);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            if (published) {
+                psp_input_script_capture_media_present(
+                    media, NULL, back, PSP_VRAM_STRIDE, true,
+                    published_index, false, true,
+                    psp_active_media != NULL && psp_active_media->have_frame
+                        ? &psp_active_media->frame : NULL,
+                    psp_media_present_records,
+                    PSP_DISPLAY_PAGE_BUFFER_COUNT);
+            }
+#else
+            (void) published_index;
+            (void) published;
+#endif
             return;
         }
     }
@@ -1808,16 +2028,34 @@ static void psp_present_supervisor_media(const PspUiMediaState *media)
        about to write rather than assuming the last present left it there --
        the supervisor runs on the callback thread and cannot know. */
     (void) psp_display_video_end(&psp_display);
+    uint16_t *front = psp_display_front_buffer(&psp_display);
     uint16_t *vram = psp_display_back_buffer(&psp_display);
-    if (vram == NULL) return;
-    for (int y = 0; y < PSP_SCREEN_HEIGHT; y++) {
-        memset(vram + (size_t) y * PSP_VRAM_STRIDE, 0,
-               PSP_SCREEN_WIDTH * sizeof(*vram));
-    }
-    psp_ui_media_composite(
+    if (front == NULL || vram == NULL) return;
+    /* The 16-bit software-decoder surface needs the same immutable-picture
+       rule as the 32-bit surface above. Clearing this buffer and drawing all
+       snapshot chrome briefly published black video; copying the last
+       complete scanout preserves the picture and any current caption while
+       the cooperative unit updates only the input-acknowledgement controls. */
+    memcpy(vram, front,
+           PSP_DISPLAY_BUFFER_PIXELS * sizeof(*vram));
+    psp_ui_media_composite_controls(
         media, vram, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT,
         PSP_VRAM_STRIDE);
-    (void) psp_display_publish(&psp_display);
+    unsigned published_index = psp_display.back_buffer;
+    bool published = psp_display_publish(&psp_display);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (published) {
+        psp_input_script_capture_media_present(
+            media, vram, NULL, PSP_VRAM_STRIDE, false,
+            published_index, false, true,
+            psp_active_media != NULL && psp_active_media->have_frame
+                ? &psp_active_media->frame : NULL,
+            psp_media_present_records, PSP_DISPLAY_PAGE_BUFFER_COUNT);
+    }
+#else
+    (void) published_index;
+    (void) published;
+#endif
 }
 
 void psp_present_boot_surface(

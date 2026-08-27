@@ -1,6 +1,6 @@
 #include "psp_media_session_internal.h"
 
-static void psp_media_publish_track_catalog(PspMediaSession *media)
+void psp_media_publish_track_catalog(PspMediaSession *media)
 {
     if (media == NULL) return;
     size_t audio_count = media->stream.audio_track_count;
@@ -1258,8 +1258,11 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         media->prepared_resolver_job = NULL;
         psp_media_pipeline_destroy(media);
         media->resolver_job = prepared_resolver;
-        if (!reuse_resolved_stream)
+        if (!reuse_resolved_stream) {
+            budget_free(media->budget, media->caption_catalog);
+            media->caption_catalog = NULL;
             memset(&media->stream, 0, sizeof(media->stream));
+        }
         media->job_phase = PSP_MEDIA_JOB_OPEN_RESOLVE;
         media->job_started_us =
             psp_media_internal_now_us(media);
@@ -1497,6 +1500,19 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                 ok = status == YOUTUBE_RESOLVE_JOB_COMPLETE
                     && youtube_resolve_job_take(
                            media->resolver_job, &media->stream);
+                if (ok) {
+                    YoutubeCaptionCatalog *catalog =
+                        budget_malloc_category(
+                            media->budget, BUDGET_CATEGORY_RESOURCE,
+                            sizeof(*catalog));
+                    if (catalog != NULL
+                        && youtube_resolve_job_copy_caption_catalog(
+                            media->resolver_job, catalog)) {
+                        media->caption_catalog = catalog;
+                    } else {
+                        budget_free(media->budget, catalog);
+                    }
+                }
                 if (!ok) {
                     snprintf(error, sizeof(error), "%s",
                              youtube_resolve_job_error(
@@ -1851,6 +1867,26 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
         media->first_frame_pump_us = 0;
         media->first_frame_bytes = psp_media_range_bytes(media);
         media->first_frame_codec_logged = false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        media->startup_trace_opened_us = media->first_frame_opened_us;
+        media->startup_trace_first_frame_elapsed_us = 0;
+        media->startup_trace_first_audio_elapsed_us = 0;
+        media->startup_trace_presented_elapsed_us = 0;
+        memset(media->startup_trace_elapsed_us, 0,
+               sizeof(media->startup_trace_elapsed_us));
+        memset(media->startup_trace_audio_us, 0,
+               sizeof(media->startup_trace_audio_us));
+        memset(media->startup_trace_video_us, 0,
+               sizeof(media->startup_trace_video_us));
+        memset(media->startup_trace_clock_us, 0,
+               sizeof(media->startup_trace_clock_us));
+        memset(media->startup_trace_valid, 0,
+               sizeof(media->startup_trace_valid));
+        media->startup_trace_count = 0;
+        media->startup_trace_first_frame_seen = false;
+        media->startup_trace_first_audio_seen = false;
+        media->startup_trace_presented_seen = false;
+#endif
         printf("tilefinch-media-first-frame: stage=open-complete at=%lluus "
                "source=%dx%d itag=%d\n",
                (unsigned long long) media->first_frame_opened_us,

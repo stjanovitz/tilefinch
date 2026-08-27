@@ -405,6 +405,7 @@ typedef struct {
     atomic_int audio_worker_stage;
     uint32_t audio_worker_next_health_us;
     unsigned audio_decode_busy_retries;
+    uint32_t audio_decode_busy_started_us;
     SceInt32 video_status;
     PspAvcDetail2 *video_detail;
     unsigned video_picture_count;
@@ -4141,13 +4142,20 @@ static MediaBackendResult psp_media_decode_one_audio_au(
            the ordinary end-of-visit flush retries exactly that AU without a
            second allocation or a new ownership state. Bound the incident: a
            persistent refusal remains a real decoder failure. */
+        uint32_t busy_now_us = psp_media_stamp_us();
+        if (backend->audio_decode_busy_started_us == 0u)
+            backend->audio_decode_busy_started_us = busy_now_us;
+        uint32_t busy_elapsed_us =
+            busy_now_us - backend->audio_decode_busy_started_us;
         if ((uint32_t) status == PSP_MEDIA_ERROR_BUSY
-            && backend->audio_decode_busy_retries < 2u) {
+            && backend->audio_decode_busy_retries < 16u
+            && busy_elapsed_us < UINT32_C(500000)) {
             backend->audio_decode_busy_retries++;
             psp_media_log(
                 "tilefinch-media-decoder: event=aac-busy-retry "
-                "attempt=%u/2 staged=%u/%u",
+                "attempt=%u/16 elapsed=%uus staged=%u/%u",
                 backend->audio_decode_busy_retries,
+                (unsigned) busy_elapsed_us,
                 backend->audio_staged_index,
                 backend->audio_staged_count);
             return MEDIA_BACKEND_WOULD_BLOCK;
@@ -4189,6 +4197,7 @@ static MediaBackendResult psp_media_decode_one_audio_au(
             "tilefinch-media-decoder: event=aac-busy-recovered attempts=%u",
             backend->audio_decode_busy_retries);
         backend->audio_decode_busy_retries = 0u;
+        backend->audio_decode_busy_started_us = 0u;
     }
     backend->stats.submitted_audio_packets++;
     backend->stats.decoded_audio_samples += PSP_MEDIA_AUDIO_SAMPLES;
@@ -6230,6 +6239,7 @@ static bool psp_media_reset(void *opaque, char *error, size_t error_size)
        discards that staged AU, so a later, unrelated firmware BUSY must get
        its own bounded allowance rather than inheriting the exhausted count. */
     backend->audio_decode_busy_retries = 0u;
+    backend->audio_decode_busy_started_us = 0u;
     backend->audio_pending_read = 0u;
     backend->audio_pending_write = 0u;
     backend->audio_pending_since_us = 0u;

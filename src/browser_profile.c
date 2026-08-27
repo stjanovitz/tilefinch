@@ -50,10 +50,13 @@ struct BrowserProfile {
     BrowserSearchEngine search_engine;
     BrowserColorMode color_mode;
     BrowserChromeTheme chrome_theme;
+    char chrome_theme_file[BROWSER_PROFILE_THEME_FILE_LIMIT];
     BrowserYoutubeQuality youtube_quality;
     BrowserVideoLanguage video_language;
     BrowserSubtitleLanguage subtitle_language;
     BrowserAlternateLanguage alternate_language;
+    BrowserSubtitleSize subtitle_size;
+    BrowserSubtitleBackground subtitle_background;
     bool youtube_compact_results;
     bool youtube_audio_only;
     bool resume_offline_downloads;
@@ -107,6 +110,9 @@ _Static_assert((int) BROWSER_SUBTITLE_LANGUAGE_ENGLISH
                && (int) BROWSER_ALTERNATE_LANGUAGE_RUSSIAN
                    == (int) BROWSER_VIDEO_LANGUAGE_RUSSIAN,
                "explicit language identities diverged");
+_Static_assert(BROWSER_SUBTITLE_SIZE_COUNT <= 4
+               && BROWSER_SUBTITLE_BACKGROUND_COUNT <= 4,
+               "subtitle style exceeds compact PSP storage");
 
 typedef struct {
     Budget *budget;
@@ -143,8 +149,33 @@ static bool profile_valid_color_mode(BrowserColorMode mode)
 static bool profile_valid_chrome_theme(BrowserChromeTheme theme)
 {
     return theme >= BROWSER_CHROME_THEME_FINCH
-        && theme <= BROWSER_CHROME_THEME_EMBER;
+        && theme < BROWSER_CHROME_THEME_COUNT;
 }
+
+static bool profile_valid_theme_filename(const char *filename)
+{
+    if (filename == NULL) return false;
+    size_t length = strlen(filename);
+    if (length == 0u) return true; /* Legacy data/theme.tfth selection. */
+    if (length >= BROWSER_PROFILE_THEME_FILE_LIMIT || length <= 5u
+        || strcmp(filename + length - 5u, ".tfth") != 0)
+        return false;
+    for (size_t at = 0; at < length; at++) {
+        char byte = filename[at];
+        bool alphanumeric = (byte >= 'a' && byte <= 'z')
+            || (byte >= 'A' && byte <= 'Z')
+            || (byte >= '0' && byte <= '9');
+        if (!alphanumeric && byte != '-' && byte != '_' && byte != '.')
+            return false;
+    }
+    return filename[0] != '.';
+}
+
+_Static_assert(BROWSER_CHROME_THEME_FINCH == 0
+                   && BROWSER_CHROME_THEME_OCEAN == 1
+                   && BROWSER_CHROME_THEME_PLUM == 2
+                   && BROWSER_CHROME_THEME_EMBER == 3,
+               "serialized chrome theme values changed");
 
 static bool profile_valid_youtube_quality(BrowserYoutubeQuality quality)
 {
@@ -171,6 +202,19 @@ static bool profile_valid_alternate_language(
     return language == BROWSER_ALTERNATE_LANGUAGE_NONE
         || (language >= BROWSER_ALTERNATE_LANGUAGE_ENGLISH
             && language < BROWSER_ALTERNATE_LANGUAGE_COUNT);
+}
+
+static bool profile_valid_subtitle_size(BrowserSubtitleSize size)
+{
+    return size >= BROWSER_SUBTITLE_SIZE_STANDARD
+        && size < BROWSER_SUBTITLE_SIZE_COUNT;
+}
+
+static bool profile_valid_subtitle_background(
+    BrowserSubtitleBackground background)
+{
+    return background >= BROWSER_SUBTITLE_BACKGROUND_BOX
+        && background < BROWSER_SUBTITLE_BACKGROUND_COUNT;
 }
 
 static bool profile_valid_language_tag(const char *language)
@@ -273,6 +317,8 @@ BrowserProfile *browser_profile_create(Budget *budget)
     profile->video_language = BROWSER_VIDEO_LANGUAGE_SYSTEM;
     profile->subtitle_language = BROWSER_SUBTITLE_LANGUAGE_SYSTEM;
     profile->alternate_language = BROWSER_ALTERNATE_LANGUAGE_NONE;
+    profile->subtitle_size = BROWSER_SUBTITLE_SIZE_STANDARD;
+    profile->subtitle_background = BROWSER_SUBTITLE_BACKGROUND_BOX;
     profile->video_startup_buffering = true;
     profile->content_blocker_mode = CONTENT_BLOCKER_BASIC;
     profile->content_blocker_cosmetic_hiding = true;
@@ -537,6 +583,10 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
     }
     if (ok) {
         ok = fprintf(
+            file, "THEME_FILE\t%s\n", profile->chrome_theme_file) > 0;
+    }
+    if (ok) {
+        ok = fprintf(
             file, "DATA\t%u\t%u\t%u\n",
             profile->persistent_cache_mb,
             profile->persist_local_storage ? 1u : 0u,
@@ -561,6 +611,11 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
                      (unsigned) profile->video_language,
                      (unsigned) profile->subtitle_language,
                      (unsigned) profile->alternate_language) > 0;
+    }
+    if (ok) {
+        ok = fprintf(file, "SUBSTYLE\t%u\t%u\n",
+                     (unsigned) profile->subtitle_size,
+                     (unsigned) profile->subtitle_background) > 0;
     }
     if (ok) {
         /* Independent of browser input: this mapping is consulted only after
@@ -871,6 +926,10 @@ static bool profile_load_internal(
                 (BrowserChromeTheme) strtoul(first, NULL, 10);
             if (profile_valid_chrome_theme(theme))
                 loaded->chrome_theme = theme;
+        } else if (strcmp(line, "THEME_FILE") == 0) {
+            if (profile_valid_theme_filename(first))
+                snprintf(loaded->chrome_theme_file,
+                         sizeof(loaded->chrome_theme_file), "%s", first);
         } else if (strcmp(line, "DATA") == 0 && second != NULL) {
             char *third = strchr(second, '\t');
             if (third != NULL) *third++ = '\0';
@@ -940,6 +999,17 @@ static bool profile_load_internal(
                 (TilefinchGamepadFaceMapping) strtoul(first, NULL, 10);
             if (profile_valid_gamepad_face_mapping(mapping))
                 loaded->gamepad_face_mapping = mapping;
+        } else if (strcmp(line, "SUBSTYLE") == 0) {
+            BrowserSubtitleSize size =
+                (BrowserSubtitleSize) strtoul(first, NULL, 10);
+            if (profile_valid_subtitle_size(size))
+                loaded->subtitle_size = size;
+            if (second != NULL) {
+                BrowserSubtitleBackground background =
+                    (BrowserSubtitleBackground) strtoul(second, NULL, 10);
+                if (profile_valid_subtitle_background(background))
+                    loaded->subtitle_background = background;
+            }
         } else if (strcmp(line, "BLOCK") == 0) {
             ContentBlockerMode mode =
                 (ContentBlockerMode) strtoul(first, NULL, 10);
@@ -1304,6 +1374,12 @@ BrowserChromeTheme browser_profile_chrome_theme(
         ? BROWSER_CHROME_THEME_FINCH : profile->chrome_theme;
 }
 
+const char *browser_profile_chrome_theme_file(
+    const BrowserProfile *profile)
+{
+    return profile == NULL ? "" : profile->chrome_theme_file;
+}
+
 BrowserYoutubeQuality browser_profile_youtube_quality(
     const BrowserProfile *profile)
 {
@@ -1330,6 +1406,20 @@ BrowserAlternateLanguage browser_profile_alternate_language(
 {
     return profile == NULL
         ? BROWSER_ALTERNATE_LANGUAGE_NONE : profile->alternate_language;
+}
+
+BrowserSubtitleSize browser_profile_subtitle_size(
+    const BrowserProfile *profile)
+{
+    return profile == NULL
+        ? BROWSER_SUBTITLE_SIZE_STANDARD : profile->subtitle_size;
+}
+
+BrowserSubtitleBackground browser_profile_subtitle_background(
+    const BrowserProfile *profile)
+{
+    return profile == NULL
+        ? BROWSER_SUBTITLE_BACKGROUND_BOX : profile->subtitle_background;
 }
 
 static const char *profile_explicit_video_language_tag(unsigned language)
@@ -1765,6 +1855,16 @@ void browser_profile_set_chrome_theme(
         profile->chrome_theme = theme;
 }
 
+bool browser_profile_set_chrome_theme_file(
+    BrowserProfile *profile, const char *filename)
+{
+    if (profile == NULL || !profile_valid_theme_filename(filename))
+        return false;
+    snprintf(profile->chrome_theme_file, sizeof(profile->chrome_theme_file),
+             "%s", filename);
+    return true;
+}
+
 void browser_profile_set_video_scaling(
     BrowserProfile *profile, BrowserVideoScaling scaling)
 {
@@ -1799,6 +1899,20 @@ void browser_profile_set_alternate_language(
 {
     if (profile != NULL && profile_valid_alternate_language(language))
         profile->alternate_language = language;
+}
+
+void browser_profile_set_subtitle_size(
+    BrowserProfile *profile, BrowserSubtitleSize size)
+{
+    if (profile != NULL && profile_valid_subtitle_size(size))
+        profile->subtitle_size = size;
+}
+
+void browser_profile_set_subtitle_background(
+    BrowserProfile *profile, BrowserSubtitleBackground background)
+{
+    if (profile != NULL && profile_valid_subtitle_background(background))
+        profile->subtitle_background = background;
 }
 
 void browser_profile_set_youtube_compact_results(

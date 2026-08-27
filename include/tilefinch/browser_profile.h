@@ -19,6 +19,7 @@
 #define BROWSER_PROFILE_SUGGESTION_LIMIT 4
 #define BROWSER_PROFILE_URL_LIMIT 1024
 #define BROWSER_PROFILE_TITLE_LIMIT 128
+#define BROWSER_PROFILE_THEME_FILE_LIMIT 48
 #define BROWSER_PROFILE_TRANSIENT_CACHE_KIB 512u
 #define BROWSER_PROFILE_HOMEPAGE_URL \
     "https://tilefinch.local/my-home"
@@ -62,7 +63,11 @@ typedef enum {
     BROWSER_CHROME_THEME_FINCH = 0,
     BROWSER_CHROME_THEME_OCEAN,
     BROWSER_CHROME_THEME_PLUM,
-    BROWSER_CHROME_THEME_EMBER
+    BROWSER_CHROME_THEME_EMBER,
+    /* Serialized values are append-only. */
+    BROWSER_CHROME_THEME_LIGHT,
+    BROWSER_CHROME_THEME_CUSTOM,
+    BROWSER_CHROME_THEME_COUNT
 } BrowserChromeTheme;
 
 typedef enum {
@@ -127,6 +132,21 @@ typedef enum {
     BROWSER_ALTERNATE_LANGUAGE_RUSSIAN,
     BROWSER_ALTERNATE_LANGUAGE_COUNT
 } BrowserAlternateLanguage;
+
+/* Native-player caption presentation. Values are serialized; append rather
+   than reorder. The deliberately small set keeps the player compositor and
+   480x272 settings surface bounded. */
+typedef enum {
+    BROWSER_SUBTITLE_SIZE_STANDARD = 0,
+    BROWSER_SUBTITLE_SIZE_SMALL,
+    BROWSER_SUBTITLE_SIZE_COUNT
+} BrowserSubtitleSize;
+
+typedef enum {
+    BROWSER_SUBTITLE_BACKGROUND_BOX = 0,
+    BROWSER_SUBTITLE_BACKGROUND_SHADOW,
+    BROWSER_SUBTITLE_BACKGROUND_COUNT
+} BrowserSubtitleBackground;
 
 /*
  * How a decoded video frame is scaled onto the panel.
@@ -236,6 +256,8 @@ BrowserColorMode browser_profile_color_mode(
     const BrowserProfile *profile);
 BrowserChromeTheme browser_profile_chrome_theme(
     const BrowserProfile *profile);
+const char *browser_profile_chrome_theme_file(
+    const BrowserProfile *profile);
 BrowserYoutubeQuality browser_profile_youtube_quality(
     const BrowserProfile *profile);
 BrowserVideoLanguage browser_profile_video_language(
@@ -243,6 +265,10 @@ BrowserVideoLanguage browser_profile_video_language(
 BrowserSubtitleLanguage browser_profile_subtitle_language(
     const BrowserProfile *profile);
 BrowserAlternateLanguage browser_profile_alternate_language(
+    const BrowserProfile *profile);
+BrowserSubtitleSize browser_profile_subtitle_size(
+    const BrowserProfile *profile);
+BrowserSubtitleBackground browser_profile_subtitle_background(
     const BrowserProfile *profile);
 /* NULL means the authored/original track. SYSTEM uses system_language after
    validation and falls back to English; every other result is static. */
@@ -351,6 +377,8 @@ void browser_profile_set_color_mode(
     BrowserProfile *profile, BrowserColorMode mode);
 void browser_profile_set_chrome_theme(
     BrowserProfile *profile, BrowserChromeTheme theme);
+bool browser_profile_set_chrome_theme_file(
+    BrowserProfile *profile, const char *filename);
 void browser_profile_set_video_scaling(
     BrowserProfile *profile, BrowserVideoScaling scaling);
 void browser_profile_set_youtube_quality(
@@ -361,6 +389,10 @@ void browser_profile_set_subtitle_language(
     BrowserProfile *profile, BrowserSubtitleLanguage language);
 void browser_profile_set_alternate_language(
     BrowserProfile *profile, BrowserAlternateLanguage language);
+void browser_profile_set_subtitle_size(
+    BrowserProfile *profile, BrowserSubtitleSize size);
+void browser_profile_set_subtitle_background(
+    BrowserProfile *profile, BrowserSubtitleBackground background);
 void browser_profile_set_youtube_compact_results(
     BrowserProfile *profile, bool compact);
 void browser_profile_set_youtube_audio_only(

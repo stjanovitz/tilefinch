@@ -186,6 +186,7 @@ validation_media_lifecycle_auto=0         # 1 injects logical quiesce/recover at
 validation_media_reset_mode=2             # 0 in-place / 1 recreate / 2 no-touch
 validation_media_refusal_reset=1          # reposition-recovery on AU refusals
 validation_media_au_dump=0                # per-AU dump (256KiB cap, truncate/run)
+validation_latch_probe=0                  # invasive full-frame flicker hashes; opt in only
 ```
 
 An `input_script=` key arms the scripted-input harness instead; note its

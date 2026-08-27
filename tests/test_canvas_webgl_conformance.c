@@ -1,8 +1,10 @@
 #include "tilefinch/budget.h"
 #include "tilefinch/budget_quickjs.h"
+#include "tilefinch/browser_engine.h"
 #include "tilefinch/document.h"
 #include "tilefinch/gamepad.h"
 #include "tilefinch/js_runtime.h"
+#include "tilefinch/offline_library.h"
 #include "tilefinch/resources.h"
 #include "tilefinch/viewport.h"
 #include "tilefinch/web_app_manifest.h"
@@ -12,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "../src/js_runtime_internal.h"
 
@@ -758,6 +762,21 @@ static bool run_prism_break_game(void)
               "<prism-start>", &result)
           && strcmp(result.summary, "PRISM-STARTED") == 0);
 
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "const keyboardStart=__prismBreakDebug.snapshot().paddleX;"
+              "dispatchEvent(new KeyboardEvent('keydown',"
+              "{key:'ArrowRight',code:'ArrowRight',cancelable:true}));"
+              "__prismBreakDebug.step(20);"
+              "dispatchEvent(new KeyboardEvent('keyup',"
+              "{key:'ArrowRight',code:'ArrowRight',cancelable:true}));"
+              "const keyboardEnd=__prismBreakDebug.snapshot();"
+              "globalThis.pocSummary=keyboardEnd.paddleX>keyboardStart+.5"
+              "&&keyboardEnd.inputSource==='keyboard'"
+              "?'PRISM-KEYBOARD':'PRISM-KEYBOARD-FAIL'",
+              "<prism-keyboard>", &result)
+          && strcmp(result.summary, "PRISM-KEYBOARD") == 0);
+
     TilefinchGamepadState gamepad = {
         .axes = {INT16_MAX, 0, 0, 0},
         .timestamp_ms = 1,
@@ -774,6 +793,21 @@ static bool run_prism_break_game(void)
     gamepad.axes[0] = 0;
     gamepad.timestamp_ms = 2;
     CHECK(script_runtime_set_gamepad_state(runtime, &gamepad));
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "const idlePadStart=__prismBreakDebug.snapshot().paddleX;"
+              "dispatchEvent(new KeyboardEvent('keydown',"
+              "{key:'ArrowLeft',code:'ArrowLeft',cancelable:true}));"
+              "__prismBreakDebug.step(20);"
+              "dispatchEvent(new KeyboardEvent('keyup',"
+              "{key:'ArrowLeft',code:'ArrowLeft',cancelable:true}));"
+              "const idlePadEnd=__prismBreakDebug.snapshot();"
+              "globalThis.pocSummary=idlePadEnd.paddleX<idlePadStart-.5"
+              "&&idlePadEnd.inputSource==='keyboard'"
+              "&&idlePadEnd.gamepadConnected"
+              "?'PRISM-IDLE-PAD-KEYBOARD':'PRISM-IDLE-PAD-BLOCKED'",
+              "<prism-idle-gamepad-keyboard>", &result)
+          && strcmp(result.summary, "PRISM-IDLE-PAD-KEYBOARD") == 0);
     bool physics_evaluated = script_runtime_evaluate_diagnostic(
               runtime,
               "__prismBreakDebug.start();__prismBreakDebug.launch();"
@@ -836,6 +870,200 @@ static bool run_prism_break_game(void)
     return true;
 }
 
+static bool cache_prism_resource(
+    BrowserEngine *engine, const char *document_url, const char *url,
+    const char *content_type, TilefinchRequestDestination destination,
+    TilefinchCredentialsMode credentials,
+    const unsigned char *data, size_t length)
+{
+    Budget *budget = browser_engine_budget(engine);
+    BrowserSession *session = browser_engine_session(engine);
+    unsigned char *copy = budget_malloc_category(
+        budget, BUDGET_CATEGORY_RESOURCE, length + 1u);
+    if (copy == NULL) return false;
+    memcpy(copy, data, length);
+    copy[length] = 0;
+    BrowserSharedBody *body = browser_shared_body_take(
+        budget, copy, length);
+    if (body == NULL) {
+        budget_free(budget, copy);
+        return false;
+    }
+    TilefinchRequestContext context = {
+        .target_url = url,
+        .initiator_url = document_url,
+        .top_level_url = document_url,
+        .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = credentials,
+        .destination = destination
+    };
+    TilefinchResourceGrant grant = {
+        .destination = destination,
+        .mode = context.mode,
+        .credentials = credentials,
+        .final_same_origin = true,
+        .final_same_site = true,
+        .mime_validated = true
+    };
+    bool stored = browser_session_cache_put_http_shared_resource(
+        session, url, body, "", "", content_type,
+        "public,max-age=3600", "", UINT64_C(1), &context, &grant);
+    browser_shared_body_release(body);
+    return stored;
+}
+
+static bool run_prism_break_offline_reopen(void)
+{
+    static const char document_url[] =
+        "https://games.test/examples/prism-break-3d/index.html";
+    static const char css_url[] =
+        "https://games.test/examples/prism-break-3d/game.css";
+    static const char script_url[] =
+        "https://games.test/examples/prism-break-3d/game.js";
+    size_t html_length = 0, script_length = 0, css_length = 0;
+    size_t manifest_length = 0;
+    char *html = read_source(
+        "examples/prism-break-3d/index.html", &html_length);
+    char *script = read_source(
+        "examples/prism-break-3d/game.js", &script_length);
+    char *css = read_source(
+        "examples/prism-break-3d/game.css", &css_length);
+    char *manifest_json = read_source(
+        "examples/prism-break-3d/manifest.webmanifest", &manifest_length);
+    CHECK(html != NULL && script != NULL && css != NULL
+          && manifest_json != NULL);
+
+    /* Model installation while the running game has hidden its panel. The
+       installed app must reconstruct a usable entry state when its script
+       starts again. */
+    static const char panel[] = "<section id=\"panel\">";
+    char *panel_at = strstr(html, panel);
+    CHECK(panel_at != NULL);
+    size_t prefix = (size_t) (panel_at - html);
+    static const char hidden_panel[] = "<section id=\"panel\" hidden>";
+    size_t grown_length = html_length
+        + sizeof(hidden_panel) - sizeof(panel);
+    char *snapshot_html = malloc(grown_length + 1u);
+    CHECK(snapshot_html != NULL);
+    memcpy(snapshot_html, html, prefix);
+    memcpy(snapshot_html + prefix, hidden_panel, sizeof(hidden_panel) - 1u);
+    size_t suffix_start = prefix + sizeof(panel) - 1u;
+    memcpy(snapshot_html + prefix + sizeof(hidden_panel) - 1u,
+           html + suffix_start, html_length - suffix_start + 1u);
+
+    BrowserConfig config;
+    browser_config_init(&config, NULL);
+    config.memory_limit = 32u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    char engine_error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, engine_error, sizeof(engine_error));
+    CHECK(engine != NULL);
+    CHECK(cache_prism_resource(
+              engine, document_url, css_url, "text/css",
+              TILEFINCH_DESTINATION_STYLE, TILEFINCH_CREDENTIALS_INCLUDE,
+              (const unsigned char *) css, css_length)
+          && cache_prism_resource(
+              engine, document_url, script_url, "text/javascript",
+              TILEFINCH_DESTINATION_SCRIPT,
+              TILEFINCH_CREDENTIALS_INCLUDE,
+              (const unsigned char *) script, script_length));
+
+    PocDocument snapshot;
+    CHECK(document_parse(
+        &snapshot, browser_engine_budget(engine), snapshot_html,
+        grown_length, 512));
+    TilefinchWebAppManifest manifest = {0};
+    char error[256] = {0};
+    CHECK(tilefinch_web_app_manifest_parse(
+        manifest_json, manifest_length,
+        "https://games.test/examples/prism-break-3d/manifest.webmanifest",
+        document_url, &manifest, error, sizeof(error)));
+    char directory[] = "/tmp/tilefinch-prism-offline-XXXXXX";
+    CHECK(mkdtemp(directory) != NULL);
+    OfflineLibrary library;
+    offline_library_init(
+        &library, browser_engine_budget(engine), directory);
+    uint32_t id = 0;
+    CHECK(offline_library_save_web_app(
+        &library, &snapshot, browser_engine_session(engine), document_url,
+        &manifest, NULL, 0, &id, error, sizeof(error)));
+    document_destroy(&snapshot);
+
+    browser_session_cache_clear(browser_engine_session(engine));
+    char *restored_html = NULL;
+    size_t restored_length = 0;
+    CHECK(offline_library_read_web_app(
+        &library, browser_engine_budget(engine), browser_engine_session(engine),
+        id, &restored_html, &restored_length, error, sizeof(error)));
+    TilefinchRequestContext restored_script_context = {
+        .target_url = script_url,
+        .initiator_url = document_url,
+        .top_level_url = document_url,
+        .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_SCRIPT
+    };
+    const BrowserCacheEntry *restored_script = NULL;
+    BrowserCacheStatus restored_script_status =
+        browser_session_cache_match_classic_script(
+            browser_engine_session(engine), script_url,
+            &restored_script_context, UINT64_C(2), &restored_script);
+    if (restored_script_status != BROWSER_CACHE_FRESH) {
+        fprintf(stderr, "offline Prism: restored script cache status=%d\n",
+                (int) restored_script_status);
+    }
+    CHECK(browser_engine_commit_html(
+        engine, document_url, restored_html, restored_length, true));
+    budget_free(browser_engine_budget(engine), restored_html);
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *restored_panel = find_element_id(
+        lxb_dom_interface_node(navigation->page.document.html), "panel");
+    size_t hidden_length = 0;
+    bool panel_visible = restored_panel != NULL
+        && document_attribute(restored_panel, "hidden", &hidden_length) == NULL;
+    bool gamepad_available = browser_engine_page_gamepad_available(engine);
+    if (!panel_visible || navigation->script_loaded != 1u
+        || navigation->page.runtime == NULL || !gamepad_available) {
+        fprintf(stderr,
+                "offline Prism: panel=%d scripts=%zu/%zu attempted=%zu "
+                "failed=%zu cache-hits=%zu bytes=%zu runtime=%d gamepad=%d "
+                "script-success=%d script-error=%s navigation-error=%s\n",
+                panel_visible, navigation->script_loaded,
+                navigation->script_discovered, navigation->script_attempted,
+                navigation->script_failed, navigation->script_cache_hits,
+                navigation->script_bytes,
+                navigation->page.runtime != NULL, gamepad_available,
+                navigation->page.script_result.success,
+                navigation->page.script_result.error,
+                navigation->last_error);
+    }
+    CHECK(panel_visible && navigation->script_loaded == 1u
+          && navigation->page.runtime != NULL && gamepad_available);
+
+    CHECK(offline_library_remove(&library, id));
+    char index_path[256], backup_path[256], temporary_path[256];
+    snprintf(index_path, sizeof(index_path), "%s/library.bin", directory);
+    snprintf(backup_path, sizeof(backup_path), "%s/library.bin.bak", directory);
+    snprintf(temporary_path, sizeof(temporary_path), "%s/library.bin.tmp",
+             directory);
+    (void) unlink(index_path);
+    (void) unlink(backup_path);
+    (void) unlink(temporary_path);
+    browser_engine_destroy(engine);
+    CHECK(rmdir(directory) == 0);
+    free(snapshot_html);
+    free(html);
+    free(script);
+    free(css);
+    free(manifest_json);
+    return true;
+}
+
 int main(void)
 {
     puts("test: native WebGL cache admission separates realm incarnations");
@@ -860,6 +1088,8 @@ int main(void)
     if (!run_deferred_webgl_flush()) return 1;
     puts("test: installable Prism Break exercises levels, input, and effects");
     if (!run_prism_break_game()) return 1;
+    puts("test: installed Prism Break reopens from its offline resource pack");
+    if (!run_prism_break_offline_reopen()) return 1;
     puts("tilefinch-canvas-webgl-conformance-tests: all checks passed");
     return 0;
 }

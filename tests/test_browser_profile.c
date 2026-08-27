@@ -221,7 +221,15 @@ int main(void)
           && browser_profile_live_cache_kib(profile) == 4096);
     browser_profile_set_search_engine(profile, BROWSER_SEARCH_DUCKDUCKGO);
     browser_profile_set_color_mode(profile, BROWSER_COLOR_MODE_DARK);
-    browser_profile_set_chrome_theme(profile, BROWSER_CHROME_THEME_PLUM);
+    browser_profile_set_chrome_theme(profile, BROWSER_CHROME_THEME_LIGHT);
+    CHECK(browser_profile_chrome_theme(profile)
+          == BROWSER_CHROME_THEME_LIGHT);
+    browser_profile_set_chrome_theme(profile, BROWSER_CHROME_THEME_CUSTOM);
+    CHECK(browser_profile_set_chrome_theme_file(
+              profile, "midnight-rain.tfth")
+          && !browser_profile_set_chrome_theme_file(profile, "../bad.tfth")
+          && strcmp(browser_profile_chrome_theme_file(profile),
+                    "midnight-rain.tfth") == 0);
     CHECK(browser_profile_wave_background(profile));
     browser_profile_set_wave_background(profile, false);
     browser_profile_set_youtube_quality(
@@ -234,6 +242,10 @@ int main(void)
         profile, BROWSER_SUBTITLE_LANGUAGE_SAME_AS_AUDIO);
     browser_profile_set_alternate_language(
         profile, BROWSER_ALTERNATE_LANGUAGE_FRENCH);
+    browser_profile_set_subtitle_size(
+        profile, BROWSER_SUBTITLE_SIZE_SMALL);
+    browser_profile_set_subtitle_background(
+        profile, BROWSER_SUBTITLE_BACKGROUND_SHADOW);
     browser_profile_set_subtitle_language(
         profile, (BrowserSubtitleLanguage) 99);
     browser_profile_set_alternate_language(
@@ -445,7 +457,9 @@ int main(void)
           && browser_profile_color_mode(loaded)
                  == BROWSER_COLOR_MODE_DARK
           && browser_profile_chrome_theme(loaded)
-                 == BROWSER_CHROME_THEME_PLUM
+                 == BROWSER_CHROME_THEME_CUSTOM
+          && strcmp(browser_profile_chrome_theme_file(loaded),
+                    "midnight-rain.tfth") == 0
           && !browser_profile_wave_background(loaded)
           && browser_profile_youtube_quality(loaded)
                  == BROWSER_YOUTUBE_QUALITY_240P
@@ -457,6 +471,10 @@ int main(void)
                  == BROWSER_SUBTITLE_LANGUAGE_SAME_AS_AUDIO
           && browser_profile_alternate_language(loaded)
                  == BROWSER_ALTERNATE_LANGUAGE_FRENCH
+          && browser_profile_subtitle_size(loaded)
+                 == BROWSER_SUBTITLE_SIZE_SMALL
+          && browser_profile_subtitle_background(loaded)
+                 == BROWSER_SUBTITLE_BACKGROUND_SHADOW
           && strcmp(browser_video_language_tag(
                         browser_profile_video_language(loaded), NULL),
                     "es") == 0
@@ -570,6 +588,7 @@ int main(void)
                  == BROWSER_COLOR_MODE_AUTO
           && browser_profile_chrome_theme(legacy_loaded)
                  == BROWSER_CHROME_THEME_FINCH
+          && browser_profile_chrome_theme_file(legacy_loaded)[0] == '\0'
           /* A file written before the WAVE record keeps the default. */
           && browser_profile_wave_background(legacy_loaded)
           && browser_profile_youtube_quality(legacy_loaded)
@@ -582,6 +601,10 @@ int main(void)
                  == BROWSER_SUBTITLE_LANGUAGE_SYSTEM
           && browser_profile_alternate_language(legacy_loaded)
                  == BROWSER_ALTERNATE_LANGUAGE_NONE
+          && browser_profile_subtitle_size(legacy_loaded)
+                 == BROWSER_SUBTITLE_SIZE_STANDARD
+          && browser_profile_subtitle_background(legacy_loaded)
+                 == BROWSER_SUBTITLE_BACKGROUND_BOX
           && browser_profile_video_scaling(legacy_loaded)
                  == BROWSER_VIDEO_SCALING_SMOOTH
           && browser_profile_video_startup_buffering(legacy_loaded)
@@ -765,7 +788,7 @@ int main(void)
           && browser_profile_search_engine(torn)
                  == BROWSER_SEARCH_DUCKDUCKGO
           && browser_profile_chrome_theme(torn)
-                 == BROWSER_CHROME_THEME_PLUM
+                 == BROWSER_CHROME_THEME_CUSTOM
           && browser_profile_bookmark_count(torn) == 2
           && browser_profile_history_count(torn) == 100);
     browser_profile_destroy(torn);

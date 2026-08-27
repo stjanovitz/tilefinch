@@ -519,6 +519,52 @@ static void youtube_track_language_from_id(YoutubeTrack *track)
     track->language[length] = '\0';
 }
 
+typedef struct {
+    const char *tag;
+    const char *label;
+} YoutubeLanguageLabel;
+
+/* Provider payloads normally carry a localized display name, but some track
+   inventories expose only a BCP-47 code. Keep that failure user-facing while
+   remaining fixed-size and allocation-free. Unknown tags still fail soft to
+   the provider code rather than being mislabeled. */
+static void youtube_track_apply_friendly_language_label(YoutubeTrack *track,
+                                                        const char *fallback)
+{
+    if (track == NULL) return;
+    size_t primary_length = strcspn(track->language, "-");
+    bool label_is_code = track->label[0] == '\0'
+        || strcasecmp(track->label, track->language) == 0
+        || (primary_length != 0u
+            && strlen(track->label) == primary_length
+            && strncasecmp(track->label, track->language,
+                           primary_length) == 0);
+    if (!label_is_code) return;
+    static const YoutubeLanguageLabel labels[] = {
+        {"ar", "Arabic"}, {"bn", "Bengali"}, {"cs", "Czech"},
+        {"da", "Danish"}, {"de", "German"}, {"en", "English"},
+        {"es", "Spanish"}, {"fa", "Persian"}, {"fi", "Finnish"},
+        {"fr", "French"}, {"he", "Hebrew"}, {"hi", "Hindi"},
+        {"id", "Indonesian"}, {"it", "Italian"},
+        {"ja", "Japanese"}, {"ko", "Korean"}, {"nl", "Dutch"},
+        {"pl", "Polish"}, {"pt", "Portuguese"},
+        {"ru", "Russian"}, {"sv", "Swedish"}, {"th", "Thai"},
+        {"tr", "Turkish"}, {"uk", "Ukrainian"}, {"ur", "Urdu"},
+        {"vi", "Vietnamese"}, {"zh", "Chinese"}
+    };
+    for (size_t at = 0; at < sizeof(labels) / sizeof(labels[0]); at++) {
+        if (strlen(labels[at].tag) == primary_length
+            && strncasecmp(track->language, labels[at].tag,
+                           primary_length) == 0) {
+            snprintf(track->label, sizeof(track->label), "%s",
+                     labels[at].label);
+            return;
+        }
+    }
+    snprintf(track->label, sizeof(track->label), "%s",
+             track->language[0] == '\0' ? fallback : track->language);
+}
+
 static bool youtube_parse_audio_track_value(
     YoutubeJson *json, YoutubeTrack *track)
 {
@@ -538,9 +584,7 @@ static bool youtube_parse_audio_track_value(
     if (youtube_find_key(object, length, "audioIsDefault", &value))
         (void) json_boolean_value(&value, &track->authored_default);
     youtube_track_language_from_id(track);
-    if (track->label[0] == '\0')
-        snprintf(track->label, sizeof(track->label), "%s",
-                 track->language[0] == '\0' ? "Audio" : track->language);
+    youtube_track_apply_friendly_language_label(track, "Audio");
     return true;
 }
 
@@ -968,8 +1012,40 @@ static void youtube_caption_label(
     size_t length = 0;
     YoutubeJson text;
     if (youtube_object_span(value, &object, &length)
-        && youtube_find_key(object, length, "simpleText", &text))
+        && youtube_find_key(object, length, "simpleText", &text)) {
         (void) json_string(&text, label, YOUTUBE_TRACK_LABEL_CAPACITY);
+        return;
+    }
+    YoutubeJson runs;
+    if (object == NULL || !youtube_find_key(object, length, "runs", &runs))
+        return;
+    json_space(&runs);
+    if (runs.at >= runs.end || *runs.at++ != '[') return;
+    size_t used = 0u;
+    while (runs.at < runs.end && used + 1u < YOUTUBE_TRACK_LABEL_CAPACITY) {
+        json_space(&runs);
+        if (runs.at < runs.end && *runs.at == ']') break;
+        const char *run = NULL;
+        size_t run_length = 0u;
+        YoutubeJson after = runs;
+        if (!youtube_object_span(runs, &run, &run_length)
+            || !json_skip_value(&after, 1)) return;
+        if (youtube_find_key(run, run_length, "text", &text)) {
+            char part[YOUTUBE_TRACK_LABEL_CAPACITY];
+            if (json_string(&text, part, sizeof(part))) {
+                size_t available = YOUTUBE_TRACK_LABEL_CAPACITY - used - 1u;
+                size_t copy = strlen(part);
+                if (copy > available) copy = available;
+                memcpy(label + used, part, copy);
+                used += copy;
+                label[used] = '\0';
+            }
+        }
+        runs = after;
+        json_space(&runs);
+        if (runs.at < runs.end && *runs.at == ',') runs.at++;
+        else if (runs.at >= runs.end || *runs.at != ']') return;
+    }
 }
 
 static unsigned youtube_caption_track_rank(
@@ -991,9 +1067,11 @@ static unsigned youtube_caption_track_rank(
 
 static void youtube_retain_caption_track(
     YoutubeStream *stream, const YoutubeTrack *track,
+    const char *url, YoutubeCaptionCatalog *catalog,
     const YoutubeTrackPreferences *preferences, const char *preferred)
 {
-    if (stream == NULL || track == NULL || track->id[0] == '\0') return;
+    if (stream == NULL || track == NULL || track->id[0] == '\0'
+        || url == NULL || url[0] == '\0') return;
     unsigned rank = youtube_caption_track_rank(track, preferences, preferred);
     for (size_t at = 0; at < stream->caption_track_count; at++) {
         if (!youtube_track_equivalent(&stream->caption_tracks[at], track))
@@ -1006,6 +1084,15 @@ static void youtube_retain_caption_track(
                     &stream->caption_tracks[at + 1u],
                     ((size_t) stream->caption_track_count - at - 1u)
                         * sizeof(stream->caption_tracks[0]));
+        if (catalog != NULL && at + 1u < catalog->count) {
+            memmove(&catalog->ids[at], &catalog->ids[at + 1u],
+                    ((size_t) catalog->count - at - 1u)
+                        * sizeof(catalog->ids[0]));
+            memmove(&catalog->urls[at], &catalog->urls[at + 1u],
+                    ((size_t) catalog->count - at - 1u)
+                        * sizeof(catalog->urls[0]));
+        }
+        if (catalog != NULL && catalog->count != 0) catalog->count--;
         stream->caption_track_count--;
         break;
     }
@@ -1024,11 +1111,27 @@ static void youtube_retain_caption_track(
                     * sizeof(stream->caption_tracks[0]));
     stream->caption_tracks[insert] = *track;
     stream->caption_track_count = (uint8_t) retained;
+    if (catalog != NULL) {
+        if (insert + 1u < retained) {
+            memmove(&catalog->ids[insert + 1u], &catalog->ids[insert],
+                    (retained - insert - 1u)
+                        * sizeof(catalog->ids[0]));
+            memmove(&catalog->urls[insert + 1u], &catalog->urls[insert],
+                    (retained - insert - 1u)
+                        * sizeof(catalog->urls[0]));
+        }
+        snprintf(catalog->ids[insert], sizeof(catalog->ids[insert]), "%s",
+                 track->id);
+        snprintf(catalog->urls[insert], sizeof(catalog->urls[insert]), "%s",
+                 url);
+        catalog->count = (uint8_t) retained;
+    }
 }
 
 static void youtube_parse_caption_tracks(
     const char *json, size_t length,
-    const YoutubeTrackPreferences *preferences, YoutubeStream *stream)
+    const YoutubeTrackPreferences *preferences, YoutubeStream *stream,
+    YoutubeCaptionCatalog *catalog)
 {
     YoutubeJson array;
     if (stream == NULL
@@ -1073,26 +1176,29 @@ static void youtube_parse_caption_tracks(
         track.automatic = strcmp(kind, "asr") == 0;
         if (track.id[0] == '\0')
             snprintf(track.id, sizeof(track.id), "%s", track.language);
-        if (track.label[0] == '\0')
-            snprintf(track.label, sizeof(track.label), "%s",
-                     track.language[0] == '\0'
-                        ? "Subtitles" : track.language);
+        youtube_track_apply_friendly_language_label(&track, "Subtitles");
         if (track.id[0] != '\0' && base_url[0] != '\0'
             && youtube_caption_url_supported(base_url)) {
+            char vtt_url[YOUTUBE_CAPTION_URL_CAPACITY] = {0};
+            int written = snprintf(
+                vtt_url, sizeof(vtt_url), "%s%sfmt=vtt", base_url,
+                strchr(base_url, '?') == NULL ? "?" : "&");
+            if (written <= 0 || (size_t) written >= sizeof(vtt_url)) {
+                array = after;
+                json_space(&array);
+                if (array.at < array.end && *array.at == ',') array.at++;
+                else if (array.at >= array.end || *array.at != ']') break;
+                continue;
+            }
             if (preferences != NULL
                 && preferences->caption_track_id[0] != '\0'
                 && strcmp(track.id,
                           preferences->caption_track_id) == 0) {
-                int written = snprintf(
-                    stream->caption_url, sizeof(stream->caption_url),
-                    "%s%sfmt=vtt", base_url,
-                    strchr(base_url, '?') == NULL ? "?" : "&");
-                if (written <= 0
-                    || (size_t) written >= sizeof(stream->caption_url))
-                    stream->caption_url[0] = '\0';
+                snprintf(stream->caption_url,
+                         sizeof(stream->caption_url), "%s", vtt_url);
             }
             youtube_retain_caption_track(
-                stream, &track, preferences, preferred);
+                stream, &track, vtt_url, catalog, preferences, preferred);
         }
         array = after;
         json_space(&array);
@@ -1211,7 +1317,8 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
     const char *json, size_t length, const char *video_id,
     int maximum_height, YoutubePlayability *playability,
     const YoutubeTrackPreferences *preferences,
-    YoutubeStream *stream, YoutubePlayerParseScratch *scratch,
+    YoutubeStream *stream, YoutubeCaptionCatalog *caption_catalog,
+    YoutubePlayerParseScratch *scratch,
     char *error, size_t error_size)
 {
     if (error != NULL && error_size != 0) error[0] = '\0';
@@ -1222,6 +1329,8 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
         return false;
     }
     memset(scratch, 0, sizeof(*scratch));
+    if (caption_catalog != NULL)
+        memset(caption_catalog, 0, sizeof(*caption_catalog));
     YoutubeStream *parsed = &scratch->parsed;
     parsed->selected_audio_track = -1;
     parsed->selected_caption_track = -1;
@@ -1325,7 +1434,8 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
         (void) json_boolean_value(&value, &active_live);
     }
     if (active_live && have_hls_manifest) {
-        youtube_parse_caption_tracks(json, length, preferences, parsed);
+        youtube_parse_caption_tracks(
+            json, length, preferences, parsed, caption_catalog);
         return youtube_use_live_hls(
             hls_value, parsed, stream, error, error_size);
     }
@@ -1426,7 +1536,8 @@ static bool youtube_parse_player_response_diagnostic_with_scratch(
             }
         }
     }
-    youtube_parse_caption_tracks(json, length, preferences, parsed);
+    youtube_parse_caption_tracks(
+        json, length, preferences, parsed, caption_catalog);
     *stream = *parsed;
     return true;
 }
@@ -1440,7 +1551,7 @@ bool youtube_parse_player_response_diagnostic(
     YoutubePlayerParseScratch scratch;
     return youtube_parse_player_response_diagnostic_with_scratch(
         json, length, video_id, maximum_height, playability,
-        NULL, stream, &scratch, error, error_size);
+        NULL, stream, NULL, &scratch, error, error_size);
 }
 
 bool youtube_parse_player_response_with_preferences(
@@ -1451,14 +1562,27 @@ bool youtube_parse_player_response_with_preferences(
     YoutubePlayerParseScratch scratch;
     return youtube_parse_player_response_diagnostic_with_scratch(
         json, length, video_id, maximum_height, NULL,
-        preferences, stream, &scratch, error, error_size);
+        preferences, stream, NULL, &scratch, error, error_size);
+}
+
+bool youtube_parse_player_response_with_preferences_and_caption_catalog(
+    const char *json, size_t length, const char *video_id,
+    int maximum_height, const YoutubeTrackPreferences *preferences,
+    YoutubeStream *stream, YoutubeCaptionCatalog *catalog,
+    char *error, size_t error_size)
+{
+    YoutubePlayerParseScratch scratch;
+    return youtube_parse_player_response_diagnostic_with_scratch(
+        json, length, video_id, maximum_height, NULL,
+        preferences, stream, catalog, &scratch, error, error_size);
 }
 
 static bool youtube_parse_player_response_diagnostic_budget(
     Budget *budget, const char *json, size_t length, const char *video_id,
     int maximum_height, YoutubePlayability *playability,
     const YoutubeTrackPreferences *preferences,
-    YoutubeStream *stream, char *error, size_t error_size)
+    YoutubeStream *stream, YoutubeCaptionCatalog *caption_catalog,
+    char *error, size_t error_size)
 {
     YoutubePlayerParseScratch *scratch = budget_calloc_category(
         budget, BUDGET_CATEGORY_RESOURCE, 1, sizeof(*scratch));
@@ -1468,7 +1592,7 @@ static bool youtube_parse_player_response_diagnostic_budget(
     }
     bool parsed = youtube_parse_player_response_diagnostic_with_scratch(
         json, length, video_id, maximum_height, playability,
-        preferences, stream, scratch, error, error_size);
+        preferences, stream, caption_catalog, scratch, error, error_size);
     budget_free(budget, scratch);
     return parsed;
 }
@@ -1905,6 +2029,7 @@ struct YoutubeResolveJob {
     YoutubeTrackPreferences track_preferences;
     FetchResult response;
     YoutubeStream stream;
+    YoutubeCaptionCatalog caption_catalog;
     char video_id[YOUTUBE_VIDEO_ID_CAPACITY];
     char canonical_watch[256];
     char visitor[1024];
@@ -2396,6 +2521,7 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
                 job->video_id,
                 job->maximum_height, &classified,
                 &job->track_preferences, &resolved,
+                &job->caption_catalog,
                 job->last_error, sizeof(job->last_error));
             job->last_playability = classified;
             if (classified == YOUTUBE_PLAYABILITY_AGE_RESTRICTED
@@ -2558,6 +2684,7 @@ YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job)
             job->video_id,
             job->maximum_height, &classified,
             &job->track_preferences, &resolved,
+            &job->caption_catalog,
             job->error, sizeof(job->error));
         const YoutubeClientProfile *profile =
             &youtube_client_profiles[
@@ -2607,6 +2734,44 @@ bool youtube_resolve_job_take(
     if (job == NULL || stream == NULL
         || job->phase != YOUTUBE_RESOLVE_PHASE_COMPLETE) return false;
     *stream = job->stream;
+    return true;
+}
+
+bool youtube_resolve_job_copy_caption_catalog(
+    const YoutubeResolveJob *job, YoutubeCaptionCatalog *catalog)
+{
+    if (job == NULL || catalog == NULL
+        || job->phase != YOUTUBE_RESOLVE_PHASE_COMPLETE) return false;
+    *catalog = job->caption_catalog;
+    return true;
+}
+
+const char *youtube_caption_catalog_url(
+    const YoutubeCaptionCatalog *catalog, const char *track_id)
+{
+    if (catalog == NULL || track_id == NULL || track_id[0] == '\0')
+        return NULL;
+    size_t count = catalog->count;
+    if (count > YOUTUBE_TRACK_LIMIT) count = YOUTUBE_TRACK_LIMIT;
+    for (size_t at = 0; at < count; at++) {
+        if (strcmp(catalog->ids[at], track_id) == 0
+            && youtube_caption_url_supported(catalog->urls[at]))
+            return catalog->urls[at];
+    }
+    return NULL;
+}
+
+bool youtube_resolve_job_take_captions(
+    YoutubeResolveJob *job, YoutubeStream *stream)
+{
+    if (job == NULL || stream == NULL
+        || job->phase != YOUTUBE_RESOLVE_PHASE_COMPLETE) return false;
+    memcpy(stream->caption_tracks, job->stream.caption_tracks,
+           sizeof(stream->caption_tracks));
+    stream->caption_track_count = job->stream.caption_track_count;
+    stream->selected_caption_track = job->stream.selected_caption_track;
+    snprintf(stream->caption_url, sizeof(stream->caption_url), "%s",
+             job->stream.caption_url);
     return true;
 }
 
@@ -2817,7 +2982,7 @@ bool youtube_resolve_progressive_mp4_cancelable_with_preferences(
                 budget, response->data, response->length, video_id,
                 maximum_height,
                 &classified, &safe_preferences,
-                resolved, last_error, sizeof(last_error));
+                resolved, NULL, last_error, sizeof(last_error));
             last_playability = classified;
             if (classified == YOUTUBE_PLAYABILITY_AGE_RESTRICTED
                 && actionable_error[0] == '\0') {
@@ -2998,7 +3163,7 @@ bool youtube_resolve_progressive_mp4_cancelable_with_preferences(
     YoutubePlayability classified = YOUTUBE_PLAYABILITY_UNKNOWN;
     bool parsed = youtube_parse_player_response_diagnostic_budget(
         budget, response->data, response->length, video_id, maximum_height,
-        &classified, &safe_preferences, resolved, error, error_size);
+        &classified, &safe_preferences, resolved, NULL, error, error_size);
     if (parsed && !youtube_finish_resolved_stream(
             resolved, enriched_profile, attempts,
             total_player_bytes, response->status_code,

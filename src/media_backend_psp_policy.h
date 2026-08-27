@@ -1329,6 +1329,27 @@ static inline uint64_t psp_media_audio_cursor_advance_us(
     return elapsed_us > accepted_us ? accepted_us : elapsed_us;
 }
 
+/* An A/V session has no authoritative public clock between releasing startup
+   preroll and the DAC accepting its first block. It must advance far enough
+   to free the first decoded surface (otherwise the staged successor blocks
+   the held audio head), but no farther than one picture. Once the DAC cursor
+   appears, never rewind to it: hold briefly until sound catches that bounded
+   provisional lead. Video-only playback continues to use elapsed wall time. */
+static inline uint64_t psp_media_presentation_clock_step_us(
+    uint64_t clock_us, uint64_t elapsed_us, bool has_audio,
+    bool audio_cursor_valid, uint64_t audio_cursor_us,
+    uint64_t provisional_limit_us)
+{
+    if (has_audio && audio_cursor_valid)
+        return audio_cursor_us > clock_us ? audio_cursor_us : clock_us;
+    uint64_t advanced = elapsed_us > UINT64_MAX - clock_us
+        ? UINT64_MAX : clock_us + elapsed_us;
+    if (has_audio && provisional_limit_us != 0
+        && advanced > provisional_limit_us)
+        advanced = provisional_limit_us;
+    return advanced;
+}
+
 static inline bool psp_media_video_should_drop_late(
     uint64_t clock_us,
     const PspMediaSurfaceSlot *current,
@@ -1492,6 +1513,15 @@ static inline uint64_t psp_media_decode_clock_us(
             : 0;
     return awaiting_first_frame && clock_us < preroll_clock
         ? preroll_clock : clock_us;
+}
+
+/* The initial-picture transaction belongs to the open attempt, not to its
+   eventual play/pause target. Autoplay therefore remains a first-frame wait
+   until a picture exists even though it never arms pause_boundary_pending. */
+static inline bool psp_media_first_frame_pending(
+    bool have_frame, uint64_t first_frame_opened_us)
+{
+    return !have_frame && first_frame_opened_us != 0;
 }
 
 /* A seek floor freezes the public clock at an arbitrary authored time. If the

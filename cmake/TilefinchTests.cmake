@@ -580,6 +580,7 @@ if(PSP_BROWSER_BUILD_TESTS)
 
     add_library(tilefinch_psp_power_test_ui STATIC
         src/psp_ui.c
+        src/psp_ui_theme.c
         src/psp_ui_menu.c
         src/psp_power_policy.c)
     target_include_directories(tilefinch_psp_power_test_ui PUBLIC include)
@@ -617,6 +618,18 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-psp-media-present-tests
         COMMAND tilefinch-psp-media-present-tests)
     set_tests_properties(tilefinch-psp-media-present-tests PROPERTIES
+        LABELS "tilefinch;unit;psp;media"
+        TIMEOUT 30)
+
+    add_executable(tilefinch-present-chrome-stability-tests
+        tests/test_present_chrome_stability.c)
+    target_link_libraries(tilefinch-present-chrome-stability-tests PRIVATE
+        tilefinch_psp_display
+        tilefinch_psp_media_present
+        tilefinch_psp_ui)
+    add_test(NAME tilefinch-present-chrome-stability-tests
+        COMMAND tilefinch-present-chrome-stability-tests)
+    set_tests_properties(tilefinch-present-chrome-stability-tests PROPERTIES
         LABELS "tilefinch;unit;psp;media"
         TIMEOUT 30)
 

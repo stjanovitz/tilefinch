@@ -27,6 +27,17 @@ typedef struct {
     bool automatic;
 } YoutubeTrack;
 
+/* Only the six caption tracks retained for the native player receive URLs.
+   This catalog is deliberately separate from YoutubeStream: ordinary stream
+   copies, offline records, and parser stack frames must not each grow by six
+   signed URLs. PSP media owns one Budget-charged instance while a route is
+   open. */
+typedef struct {
+    char ids[YOUTUBE_TRACK_LIMIT][YOUTUBE_TRACK_ID_CAPACITY];
+    char urls[YOUTUBE_TRACK_LIMIT][YOUTUBE_CAPTION_URL_CAPACITY];
+    uint8_t count;
+} YoutubeCaptionCatalog;
+
 /* A per-open selection. Empty IDs mean language/default selection; an empty
    caption ID keeps subtitles off. Caption language affects catalog ranking
    only. `prefer_original_audio` ignores audio_language for track selection;
@@ -186,6 +197,15 @@ bool youtube_resolve_job_set_track_preferences(
 YoutubeResolveJobStatus youtube_resolve_job_pump(YoutubeResolveJob *job);
 bool youtube_resolve_job_take(
     YoutubeResolveJob *job, YoutubeStream *stream);
+bool youtube_resolve_job_copy_caption_catalog(
+    const YoutubeResolveJob *job, YoutubeCaptionCatalog *catalog);
+const char *youtube_caption_catalog_url(
+    const YoutubeCaptionCatalog *catalog, const char *track_id);
+/* Copies only the bounded caption catalog and selected caption URL. This is
+   used by the native player to change captions without replacing its live
+   A/V stream or allocating another YoutubeStream on the PSP stack. */
+bool youtube_resolve_job_take_captions(
+    YoutubeResolveJob *job, YoutubeStream *stream);
 const char *youtube_resolve_job_error(const YoutubeResolveJob *job);
 bool youtube_resolve_job_metrics(
     const YoutubeResolveJob *job, YoutubeResolveJobMetrics *metrics);
@@ -217,6 +237,15 @@ bool youtube_resolve_progressive_mp4_cancelable_with_preferences(
     const YoutubeTrackPreferences *preferences,
     YoutubeResolverCancelCallback cancel, void *cancel_opaque,
     YoutubeStream *stream, char *error, size_t error_size);
+
+/* Parser seam used by bounded adapter regressions. Production pumpable
+   resolution returns the same catalog through
+   youtube_resolve_job_copy_caption_catalog(). */
+bool youtube_parse_player_response_with_preferences_and_caption_catalog(
+    const char *json, size_t length, const char *video_id,
+    int maximum_height, const YoutubeTrackPreferences *preferences,
+    YoutubeStream *stream, YoutubeCaptionCatalog *catalog,
+    char *error, size_t error_size);
 
 /*
  * Bounded pure parser used by deterministic tests and retained captures.

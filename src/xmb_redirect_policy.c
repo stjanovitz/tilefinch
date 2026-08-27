@@ -16,10 +16,12 @@ bool tilefinch_xmb_redirect_should_attempt(
     const char *module_name,
     bool controller_sample_valid,
     uint32_t buttons,
+    uint32_t activation_buttons,
     uint32_t bypass_button,
     bool launch_already_armed)
 {
     return controller_sample_valid
+        && (buttons & activation_buttons) != 0u
         && (buttons & bypass_button) == 0u
         && tilefinch_xmb_redirect_module_matches(
             module_name, launch_already_armed);

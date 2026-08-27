@@ -608,15 +608,17 @@ static void psp_app_dispatch_heavy_action(
                             psp_media_startup_headroom_bytes(
                                 &app->browser->media),
                             &app->interactive->provider_handoff_reclaim);
-                        /* Presentation is a prerequisite only when reclaim
-                           will actually run. With ample headroom, retaining
-                           this latch suppresses the resolver while the media
-                           supervisor owns presentation, so neither side can
-                           clear it. */
+                        /* Publish one complete native-player loading surface
+                           before resolver or decoder work may enter a
+                           cooperative scope. A prepared result can otherwise
+                           reach the first decoded frame in this same browser
+                           iteration, making the 565->8888 bridge expand the
+                           old page/partially cleared footer instead of the
+                           intended full loading UI. This costs one presented
+                           frame, never a network round trip; reclaim remains
+                           independently conditional below. */
                         app->interactive->provider_handoff_present_pending =
-                            browser_engine_optional_memory_reclaim_pending(
-                                &app->interactive
-                                     ->provider_handoff_reclaim);
+                            true;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
                         printf("tilefinch-provider-handoff: phase=armed "
                                "pressure=%d free=%zu target=%zu\n",

@@ -632,11 +632,16 @@ IDs, exact BCP-47 tags, primary-language fallbacks, alternate language, and
 the authored default are ordered without allocating per track. A late track
 can displace a weaker retained entry, so the menu bound cannot hide a preferred
 language. Triangle opens the native player's track menu; choosing another
-audio track performs an ordinary generation-safe reopen at the current
-position. Subtitles default off, and their preference affects ranking only.
-Selecting one starts a single optional, credential-free WebVTT request only
-after playback has a healthy presentation reserve; it uses no media-reserved
-descriptor and a failure leaves video and controls usable.
+audio track performs a generation-safe reopen at the current position and
+preserves the player's play/pause intent. Subtitles default off, and their
+preference affects ranking only. Selecting one re-resolves only the bounded
+caption catalog and selected URL while the existing A/V pipeline keeps
+playing, then starts a single optional, credential-free WebVTT request after
+playback has a healthy presentation reserve. Neither request uses a
+media-reserved descriptor, and a failure leaves video and controls usable.
+Caption size and either an opaque box or text shadow are profile settings;
+the opaque player furniture avoids importing moving 8888 video into the
+RGB565 chrome compositor.
 
 When a server-rendered `<video>` omits `src`, activation may perform one
 bounded, allocation-free scan of retained data scripts and generic media

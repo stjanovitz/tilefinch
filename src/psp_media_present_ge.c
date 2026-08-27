@@ -815,6 +815,120 @@ bool psp_media_present_ge_complete(PspMediaPresentGeCost *cost)
     return true;
 }
 
+static unsigned psp_media_present_texture_extent(unsigned value)
+{
+    unsigned extent = 1u;
+    while (extent < value && extent < 512u) extent <<= 1u;
+    return extent;
+}
+
+bool psp_media_present_ge_blit_565(
+    const uint16_t *source, int source_width, int source_height,
+    int source_stride, bool source_changed, uint32_t *destination,
+    int destination_stride, int left, int top,
+    PspMediaPresentGeCost *cost)
+{
+    if (cost != NULL) *cost = (PspMediaPresentGeCost) {0, 0, 0};
+    if (source == NULL || destination == NULL
+        || source_width <= 0 || source_height <= 0
+        || source_width > 512 || source_height > 512
+        || source_stride < source_width || source_stride > 512
+        || destination_stride != PSP_MEDIA_PRESENT_VRAM_STRIDE
+        || left < 0 || top < 0
+        || source_width > PSP_MEDIA_PRESENT_SCREEN_WIDTH - left
+        || source_height > PSP_MEDIA_PRESENT_SCREEN_HEIGHT - top
+        || psp_media_present_ge_pending
+        || !psp_media_present_ge_ready()) {
+        return false;
+    }
+    unsigned offset = 0;
+    if (!psp_media_present_ge_offset(destination, &offset)) return false;
+
+    size_t source_bytes = (size_t) source_stride
+        * (size_t) source_height * sizeof(*source);
+    if (source_changed)
+        sceKernelDcacheWritebackRange(
+            (void *) (uintptr_t) source, (unsigned) source_bytes);
+
+    /* The CPU may have drawn the title, captions, and control bar into these
+       rows. Retire them before the GE replaces only the opaque menu rectangle;
+       invalidating the same complete rows afterward preserves both writers. */
+    uint32_t *rows = destination
+        + (size_t) top * PSP_MEDIA_PRESENT_VRAM_STRIDE;
+    unsigned row_bytes = (unsigned) source_height
+        * PSP_MEDIA_PRESENT_VRAM_STRIDE * sizeof(*destination);
+    sceKernelDcacheWritebackInvalidateRange(rows, row_bytes);
+
+    uint64_t started_us = (uint64_t) sceKernelGetSystemTimeWide();
+    sceGuStart(GU_DIRECT, psp_media_present_ge_uncached_list());
+    sceGuDrawBufferList(
+        GU_PSM_8888, (void *) (uintptr_t) offset,
+        PSP_MEDIA_PRESENT_VRAM_STRIDE);
+    sceGuOffset(
+        2048u - (unsigned) (PSP_MEDIA_PRESENT_SCREEN_WIDTH / 2),
+        2048u - (unsigned) (PSP_MEDIA_PRESENT_SCREEN_HEIGHT / 2));
+    sceGuViewport(
+        2048, 2048,
+        PSP_MEDIA_PRESENT_SCREEN_WIDTH, PSP_MEDIA_PRESENT_SCREEN_HEIGHT);
+    sceGuScissor(left, top, source_width, source_height);
+    sceGuEnable(GU_SCISSOR_TEST);
+    sceGuDisable(GU_DEPTH_TEST);
+    sceGuDepthMask(GU_TRUE);
+    sceGuDisable(GU_BLEND);
+    sceGuDisable(GU_ALPHA_TEST);
+    sceGuDisable(GU_LIGHTING);
+    sceGuDisable(GU_CULL_FACE);
+    sceGuDisable(GU_CLIP_PLANES);
+    sceGuDisable(GU_DITHER);
+    sceGuShadeModel(GU_FLAT);
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuTexMode(GU_PSM_5650, 0, 0, GU_FALSE);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+    sceGuTexScale(1.0f, 1.0f);
+    sceGuTexOffset(0.0f, 0.0f);
+    sceGuTexImage(
+        0, (int) psp_media_present_texture_extent((unsigned) source_width),
+        (int) psp_media_present_texture_extent((unsigned) source_height),
+        source_stride, source);
+    sceGuTexFlush();
+    PspMediaPresentGeVertex *vertices =
+        sceGuGetMemory(2 * (int) sizeof(*vertices));
+    bool submitted = vertices != NULL;
+    if (submitted) {
+        vertices[0] = (PspMediaPresentGeVertex) {
+            0.0f, 0.0f, (float) left, (float) top, 0.0f};
+        vertices[1] = (PspMediaPresentGeVertex) {
+            (float) source_width, (float) source_height,
+            (float) (left + source_width),
+            (float) (top + source_height), 0.0f};
+        sceGuDrawArray(
+            GU_SPRITES,
+            GU_TEXTURE_32BITF | GU_VERTEX_32BITF | GU_TRANSFORM_2D,
+            2, NULL, vertices);
+    }
+    sceGuFinish();
+    uint64_t submitted_us = (uint64_t) sceKernelGetSystemTimeWide();
+    if (cost != NULL) cost->submit_us = submitted_us - started_us;
+    int synced = sceGuSync(GU_SYNC_FINISH, GU_SYNC_WAIT);
+    uint64_t finished_us = (uint64_t) sceKernelGetSystemTimeWide();
+    if (cost != NULL) {
+        cost->sync_us = finished_us - submitted_us;
+        cost->wait_us = cost->sync_us;
+    }
+    sceKernelDcacheInvalidateRange(rows, row_bytes);
+    if (!submitted) {
+        psp_media_present_ge_latch("display-list-exhausted");
+        return false;
+    }
+    if (synced < 0) {
+        psp_media_present_ge_latch("sceGuSync-menu");
+        return false;
+    }
+    return true;
+}
+
 static bool psp_media_present_ge_draw_plan(
     const PspMediaPresentPlan *plan, const PspMediaPresentTexture *texture,
     uint32_t *destination, PspMediaPresentGeCost *cost)
@@ -1427,6 +1541,25 @@ bool psp_media_present_ge_submit(
 bool psp_media_present_ge_complete(PspMediaPresentGeCost *cost)
 {
     (void) cost;
+    return false;
+}
+
+bool psp_media_present_ge_blit_565(
+    const uint16_t *source, int source_width, int source_height,
+    int source_stride, bool source_changed, uint32_t *destination,
+    int destination_stride, int left, int top,
+    PspMediaPresentGeCost *cost)
+{
+    (void) source;
+    (void) source_width;
+    (void) source_height;
+    (void) source_stride;
+    (void) source_changed;
+    (void) destination;
+    (void) destination_stride;
+    (void) left;
+    (void) top;
+    if (cost != NULL) *cost = (PspMediaPresentGeCost) {0, 0, 0};
     return false;
 }
 

@@ -101,6 +101,7 @@ int main(void)
     shipping.validation_ge_present_probe = 1;
     shipping.validation_webgl_ge_probe = 1;
     shipping.validation_csc_order_probe = 1;
+    shipping.validation_latch_probe = 1;
     shipping.validation_media_range_probe = 1;
     shipping.validation_update_auto = 1;
     snprintf(shipping.validation_update_url,
@@ -129,6 +130,7 @@ int main(void)
     CHECK(shipping.validation_ge_present_probe == 0);
     CHECK(shipping.validation_webgl_ge_probe == 0);
     CHECK(shipping.validation_csc_order_probe == 0);
+    CHECK(shipping.validation_latch_probe == 0);
     CHECK(shipping.validation_media_range_probe == 0);
     CHECK(shipping.validation_update_auto == 0);
     CHECK(shipping.validation_update_url[0] == '\0');
@@ -157,6 +159,7 @@ int main(void)
         "validation_ge_present_probe=1\n"
         "validation_webgl_ge_probe=1\n"
         "validation_csc_order_probe=1\n"
+        "validation_latch_probe=1\n"
         "validation_media_range_probe=1\n"
         "validation_update_auto=1\n"
         "validation_update_url=https://127.0.0.1:8443/"
@@ -184,6 +187,7 @@ int main(void)
     /* Same for the colour-order probe: it supplies its own picture from the
        embedded fixture and never navigates. */
     CHECK(config.validation_csc_order_probe == 1);
+    CHECK(config.validation_latch_probe == 1);
     /* The range probe resolves its own stream from `url` and never commits a
        document either, so it too leaves the shipping boot order alone. */
     CHECK(config.validation_media_range_probe == 1);
@@ -203,7 +207,7 @@ int main(void)
     CHECK(!psp_boot_config_automation_requires_engine_first(&config)
           || config.validation_media_fixture_auto != 0);
     CHECK(warning.calls == 1);
-    CHECK(warning.line == 17);
+    CHECK(warning.line == 18);
     CHECK(strcmp(warning.key, "mystery") == 0);
     CHECK(strcmp(config.developer_update_url,
                  "https://192.0.2.1/beta/latest.tfum") == 0);

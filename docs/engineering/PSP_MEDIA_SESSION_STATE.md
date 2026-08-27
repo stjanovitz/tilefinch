@@ -65,16 +65,19 @@ The profile's preferred video language is sampled into each YouTube resolver
 service token, including speculative pre-resolution, so a cached resolution
 cannot be adopted after the preference changes. Resolution retains bounded
 six-entry audio and subtitle catalogs. A native-player audio selection records
-the exact track id and enters the existing retry/reopen path at the current
-position; it is not a second decoder-control authority.
+the exact track id and performs a close/reopen transaction at the current
+position while preserving the machine's play/pause intent; it is not a second
+decoder-control authority and is not classified as failure recovery.
 
 Subtitles are optional presentation data rather than a media-machine state.
-They default off. After an explicit selection and only once A/V is ready, the
-session fetches one bounded credential-free WebVTT document outside the two
-media-reserved transport slots. Parsing creates one capped cue table charged to
-the session budget. Seek uses the same clock lookup, and close/reopen cancels
-the request and releases every cue. Fetch, parse, or unsupported-track failure
-never changes playback state.
+They default off. An explicit selection runs a separate bounded resolver job
+which copies only the selected caption URL and six-row catalog into the
+session; it never replaces the live A/V stream. Once A/V is ready, the session
+fetches one bounded credential-free WebVTT document outside the two
+media-reserved transport slots. Parsing creates one capped cue table charged
+to the session budget. Seek uses the same clock lookup, and close/reopen
+cancels the resolver/request and releases every cue. Resolve, fetch, parse, or
+unsupported-track failure never changes playback state.
 
 ## Control graph
 

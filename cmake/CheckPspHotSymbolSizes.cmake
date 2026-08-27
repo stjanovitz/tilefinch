@@ -49,7 +49,7 @@ endif()
 check_hot_symbol(psp_app_run_interactive ${PSP_INTERACTIVE_LIMIT})
 check_hot_symbol(layout_block_impl 36864)
 check_hot_symbol(psp_ui_composite_browser 4096)
-check_hot_symbol(psp_ui_media_composite_with_preview 4096)
+check_hot_symbol(psp_ui_media_composite_layers 4096)
 check_hot_symbol(rasterize_command 8192)
 # Spatial navigation and page scrolling enter this receiver on every d-pad
 # repeat.  Keep its rare text/media/update arms behind the cold dispatcher;

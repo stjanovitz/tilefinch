@@ -84,10 +84,18 @@ typedef struct {
     PspUiMediaPresentation ui_presentation;
     YoutubeStream stream;
     YoutubeTrackPreferences track_preferences;
+    YoutubeCaptionCatalog *caption_catalog;
     YoutubeSubtitleDocument *subtitles;
+    YoutubeSubtitleBuilder *subtitle_builder;
     uint64_t subtitle_request_id;
+    size_t subtitle_received_bytes;
     size_t subtitle_cue_cursor;
     bool subtitle_request_attempted;
+    /* The initial resolver retains URLs only for the six presented tracks.
+       A side resolver is a fail-soft fallback for a missing/expired catalog;
+       it never owns or replaces the live A/V pipeline. */
+    YoutubeResolveJob *caption_resolver_job;
+    bool caption_resolution_pending;
     YoutubeResolveJob *resolver_job;
     /* A focused result's resolver may already be complete or in flight when
        Play is pressed. It waits here until the open service has destroyed the
@@ -434,6 +442,22 @@ typedef struct {
     uint32_t stale_service_completions;
     uint32_t deferred_dispatch_overflows;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Four bounded startup samples are retained in RAM and printed only at
+       teardown. Logging while playback begins can itself stall host0 long
+       enough to manufacture the skew this trace is intended to measure. */
+    uint64_t startup_trace_opened_us;
+    uint64_t startup_trace_first_frame_elapsed_us;
+    uint64_t startup_trace_first_audio_elapsed_us;
+    uint64_t startup_trace_presented_elapsed_us;
+    uint64_t startup_trace_elapsed_us[4];
+    uint64_t startup_trace_audio_us[4];
+    uint64_t startup_trace_video_us[4];
+    uint64_t startup_trace_clock_us[4];
+    uint8_t startup_trace_valid[4];
+    uint8_t startup_trace_count;
+    bool startup_trace_first_frame_seen;
+    bool startup_trace_first_audio_seen;
+    bool startup_trace_presented_seen;
     uint32_t controller_events;
     uint32_t controller_mismatches;
     uint32_t controller_violations;

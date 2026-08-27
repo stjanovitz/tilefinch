@@ -190,10 +190,13 @@ The result is
 target stages the same file under `TILEFINCH/OPTIONAL/`; it is never placed in
 an A/B application slot or an in-app update package. Its module-start hook is
 name-based (`htmlviewer_plugin_module`) rather than firmware-offset-based,
-chains the previously registered ARK handler, and performs the LoadExec from
-a one-shot thread after the loader callback returns. A missing launcher,
-controller-read failure, thread-creation failure, or LoadExec failure all
-leave Sony's browser available.
+chains the previously registered ARK handler, and signals an already-waiting
+worker rather than allocating inside ARK's pre-start callback. The worker
+requires an XMB confirmation press, honors the L-trigger bypass, and waits a
+bounded interval for Sony's module start to finish before LoadExec. Incidental
+HTML-viewer loads during XMB startup, a missing launcher, controller-read
+failure, worker setup failure, or LoadExec failure all leave Sony's browser
+available.
 
 ### Optional PSP software decoder
 

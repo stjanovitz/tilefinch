@@ -102,6 +102,20 @@ typedef struct {
     int last_surface_error;
 } PspDisplay;
 
+#if defined(TILEFINCH_PSP_VALIDATION_LOG) \
+    || defined(TILEFINCH_PSP_LATCH_PROBE)
+/* Validation-only sink installed by the full browser after its persistent
+   logger is ready. Keeping the sink out of this shared library lets launcher
+   and fixture users retain the same display object without acquiring the
+   browser log's ownership or link dependency. */
+typedef int (*PspDisplayValidationLogger)(const char *format, ...);
+void psp_display_set_validation_logger(PspDisplayValidationLogger logger);
+/* The full-surface latch hashes are intentionally opt-in even in validation
+   builds: hashing and logging every scanout is invasive enough to change
+   media cadence on a 333 MHz PSP. */
+void psp_display_set_latch_probe_enabled(bool enabled);
+#endif
+
 /* Pixels between the start of one buffer and the next. */
 #define PSP_DISPLAY_BUFFER_PIXELS \
     ((size_t) PSP_DISPLAY_STRIDE * (size_t) PSP_DISPLAY_SCREEN_HEIGHT)
@@ -156,6 +170,12 @@ typedef struct {
 #define PSP_DISPLAY_VIDEO_TEXTURE_BYTES PSP_DISPLAY_VIDEO_BUFFER_BYTES
 #define PSP_DISPLAY_OVERLAY_BASE_BYTES \
     (PSP_DISPLAY_VIDEO_TEXTURE_BASE_BYTES + PSP_DISPLAY_VIDEO_TEXTURE_BYTES)
+#define PSP_DISPLAY_OVERLAY_BYTES \
+    (PSP_DISPLAY_BUFFER_PIXELS * sizeof(uint16_t))
+#define PSP_DISPLAY_VIDEO_AUX_BASE_BYTES \
+    (PSP_DISPLAY_OVERLAY_BASE_BYTES + PSP_DISPLAY_OVERLAY_BYTES)
+#define PSP_DISPLAY_VIDEO_AUX_BYTES \
+    (PSP_DISPLAY_EDRAM_BYTES - PSP_DISPLAY_VIDEO_AUX_BASE_BYTES)
 
 /* Real syscall backend, or NULL when built for a host. */
 const PspDisplayBackend *psp_display_system_backend(void);
@@ -182,12 +202,14 @@ uint16_t *psp_display_front_buffer(const PspDisplay *display);
 /*
  * The fullscreen-video scanout format.
  *
- * `begin` changes what the *next* publish latches and performs no syscall, so
- * the panel keeps showing the last 16-bit frame until a complete 32-bit one
- * replaces it. `end` reasserts the last 16-bit front buffer immediately,
- * because the composers that follow it write a different address and the panel
- * must not be left scanning out video while they do -- an 8888 surface still
- * latched under a 565 compositor is the whole screen turned to noise.
+ * `begin` expands and latches the complete 16-bit front buffer as a visually
+ * equivalent 32-bit bridge frame before exposing the other video buffer to a
+ * decoded-frame composer. This makes the pixel-format transition occur at a
+ * vertical boundary without a torn loading screen. `end` reasserts the last
+ * 16-bit front buffer immediately, because the composers that follow it write
+ * a different address and the panel must not be left scanning out video while
+ * they do -- an 8888 surface still latched under a 565 compositor is the whole
+ * screen turned to noise.
  *
  * `end` is idempotent and safe to call when the surface was never entered,
  * which is what lets every exit path assert it unconditionally.
@@ -216,11 +238,17 @@ uint32_t *psp_display_video_back_buffer(const PspDisplay *display);
 uint32_t *psp_display_video_front_buffer(const PspDisplay *display);
 uint32_t *psp_display_video_texture(const PspDisplay *display);
 uint16_t *psp_display_video_overlay_scratch(const PspDisplay *display);
+/* Bounded EDRAM tail unused by video scanout/texture/scratch. Player chrome
+   may retain derived pixels here only while keying them by the EDRAM content
+   epoch; page WebGL uses the same physical tail outside video mode. */
+uint16_t *psp_display_video_aux(const PspDisplay *display);
+size_t psp_display_video_aux_pixels(const PspDisplay *display);
 
 /*
- * Latch the composed back buffer for the next vblank and rotate.  Returns
- * false when the display service refused the address, which is the failure
- * that must never again be mistaken for a successful frame.
+ * Queue the composed back buffer for the next vblank, wait until that latch
+ * has occurred, and only then rotate.  Returns false when the display service
+ * refused the address, which is the failure that must never again be mistaken
+ * for a successful frame.
  */
 bool psp_display_publish(PspDisplay *display);
 

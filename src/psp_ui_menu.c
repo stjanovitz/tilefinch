@@ -67,6 +67,8 @@ static bool menu_handle_escape(
             intent->action = PSP_UI_ACTION_CANCEL_OFFLINE_APP;
         else if (ui->screen == PSP_UI_SCREEN_UPDATE_VERSIONS)
             intent->update_versions_closed = true;
+        else if (ui->screen == PSP_UI_SCREEN_THEME_OPTIONS)
+            intent->theme_catalog_closed = true;
         else if (ui->screen == PSP_UI_SCREEN_FIND) {
             psp_ui_clear_find(ui);
             intent->action = PSP_UI_ACTION_FIND_CLOSE;
@@ -82,6 +84,7 @@ static bool menu_handle_escape(
             ui->menu_selection = UI_MENU_ROW_HELP;
         else if (ui->screen == PSP_UI_SCREEN_OPTIONS
                  || ui->screen == PSP_UI_SCREEN_OPTION_ITEMS
+                 || ui->screen == PSP_UI_SCREEN_THEME_OPTIONS
                  || ui->screen == PSP_UI_SCREEN_EXPERIMENTAL_OPTIONS
                  || ui->screen == PSP_UI_SCREEN_GLYPH_OPTIONS
                  || ui->screen == PSP_UI_SCREEN_UPDATE

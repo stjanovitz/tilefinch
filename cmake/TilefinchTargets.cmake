@@ -102,6 +102,7 @@ endif()
 
 add_library(tilefinch_psp_ui STATIC
     src/psp_ui.c
+    src/psp_ui_theme.c
     src/psp_ui_menu.c
     src/psp_ui_media_8888.c
     src/psp_power_policy.c)
@@ -141,6 +142,14 @@ endif()
 # on display mode, buffer rotation, sync flag, or result checking again.
 add_library(tilefinch_psp_display STATIC src/psp_display.c)
 target_include_directories(tilefinch_psp_display PUBLIC include)
+if(PSP AND TILEFINCH_PSP_VALIDATION_LOG)
+    # The display library is shared with the launcher, so it cannot depend on
+    # the browser logger directly. Compile the bounded hash probe here; the
+    # browser installs its logger callback only after the persistent sink is
+    # ready, while other consumers leave it inert.
+    target_compile_definitions(tilefinch_psp_display PRIVATE
+        TILEFINCH_PSP_LATCH_PROBE=1)
+endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(tilefinch_psp_display PRIVATE
         -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration)

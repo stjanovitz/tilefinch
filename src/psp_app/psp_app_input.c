@@ -922,6 +922,22 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
         && text_info.editable && !text_info.multiline;
 }
 
+void psp_sync_video_preferences(
+    PspUiState *ui, const BrowserProfile *profile)
+{
+    if (ui == NULL || profile == NULL) return;
+    ui->video_language = (uint8_t)
+        browser_profile_video_language(profile);
+    ui->subtitle_language = (uint8_t)
+        browser_profile_subtitle_language(profile);
+    ui->alternate_language = (uint8_t)
+        browser_profile_alternate_language(profile);
+    ui->subtitle_size = (uint8_t)
+        browser_profile_subtitle_size(profile);
+    ui->subtitle_background = (uint8_t)
+        browser_profile_subtitle_background(profile);
+}
+
 bool psp_engine_views_refresh(
     PspEngineViews *views, const BrowserEngine *engine)
 {

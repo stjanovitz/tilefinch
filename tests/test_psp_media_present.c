@@ -337,41 +337,58 @@ static bool test_ungeable_geometry_still_plans_the_rect(void)
  */
 static bool test_identity_skip_semantics(void)
 {
-    PspMediaPresentRecord records[2];
-    psp_media_present_records_reset(records, 2);
+    PspMediaPresentRecord records[3];
+    psp_media_present_records_reset(records, 3);
     PspMediaPresentRect video = {0, 1, 480, 270};
     PspMediaPresentRect moved = {0, 0, 480, 272};
 
     /* Nothing has been presented yet. */
-    CHECK(!psp_media_present_skip_allowed(&records[0], 7, 1, &video, false));
+    CHECK(!psp_media_present_skip_allowed(
+        &records[0], 7, 1, &video, 0, false));
 
-    psp_media_present_record(&records[0], 7, 1, &video);
-    CHECK(psp_media_present_skip_allowed(&records[0], 7, 1, &video, false));
-    /* The other buffer is a different buffer. Double buffering means a frame
-       presented once has been presented into exactly one of the two. */
-    CHECK(!psp_media_present_skip_allowed(&records[1], 7, 1, &video, false));
+    psp_media_present_record(&records[0], 7, 1, &video, 0);
+    CHECK(psp_media_present_skip_allowed(
+        &records[0], 7, 1, &video, 0, false));
+    /* A record cannot authorize a different physical buffer even when a
+       future indexing regression aliases the same table entry. */
+    CHECK(!psp_media_present_skip_allowed(
+        &records[0], 7, 1, &video, 2, false));
+    CHECK(!psp_media_present_skip_allowed(
+        &records[1], 7, 1, &video, 1, false));
+    CHECK(!psp_media_present_skip_allowed(
+        &records[2], 7, 1, &video, 2, false));
 
     /* A newly decoded picture. */
-    CHECK(!psp_media_present_skip_allowed(&records[0], 8, 1, &video, false));
+    CHECK(!psp_media_present_skip_allowed(
+        &records[0], 8, 1, &video, 0, false));
     /* A different stream that happens to restart its picture count. */
-    CHECK(!psp_media_present_skip_allowed(&records[0], 7, 2, &video, false));
+    CHECK(!psp_media_present_skip_allowed(
+        &records[0], 7, 2, &video, 0, false));
     /* A geometry change moves the rectangle and the bands with it. */
-    CHECK(!psp_media_present_skip_allowed(&records[0], 7, 1, &moved, false));
+    CHECK(!psp_media_present_skip_allowed(
+        &records[0], 7, 1, &moved, 0, false));
     /* The chrome overlay blends at opacity 3, so compositing twice over one
        presented frame darkens it. Never skip while it paints. */
-    CHECK(!psp_media_present_skip_allowed(&records[0], 7, 1, &video, true));
+    CHECK(!psp_media_present_skip_allowed(
+        &records[0], 7, 1, &video, 0, true));
 
     /* Anything that is not this presenter writing the buffer must clear
        every record, not just the one it wrote. */
-    psp_media_present_record(&records[1], 7, 1, &video);
-    psp_media_present_records_reset(records, 2);
-    CHECK(!psp_media_present_skip_allowed(&records[0], 7, 1, &video, false));
-    CHECK(!psp_media_present_skip_allowed(&records[1], 7, 1, &video, false));
+    psp_media_present_record(&records[1], 7, 1, &video, 1);
+    psp_media_present_record(&records[2], 7, 1, &video, 2);
+    psp_media_present_records_reset(records, 3);
+    CHECK(!psp_media_present_skip_allowed(
+        &records[0], 7, 1, &video, 0, false));
+    CHECK(!psp_media_present_skip_allowed(
+        &records[1], 7, 1, &video, 1, false));
+    CHECK(!psp_media_present_skip_allowed(
+        &records[2], 7, 1, &video, 2, false));
 
-    CHECK(!psp_media_present_skip_allowed(NULL, 7, 1, &video, false));
-    CHECK(!psp_media_present_skip_allowed(&records[0], 7, 1, NULL, false));
-    psp_media_present_records_reset(NULL, 2);
-    psp_media_present_record(NULL, 7, 1, &video);
+    CHECK(!psp_media_present_skip_allowed(NULL, 7, 1, &video, 0, false));
+    CHECK(!psp_media_present_skip_allowed(
+        &records[0], 7, 1, NULL, 0, false));
+    psp_media_present_records_reset(NULL, 3);
+    psp_media_present_record(NULL, 7, 1, &video, 0);
     return true;
 }
 

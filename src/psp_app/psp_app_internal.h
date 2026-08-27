@@ -552,6 +552,8 @@ void psp_content_blocker_restore_allowed_site_count(
     BrowserProfile *profile, size_t count);
 void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
                  const BrowserProfile *profile);
+void psp_sync_video_preferences(
+    PspUiState *ui, const BrowserProfile *profile);
 
 /* src/psp_app/psp_app_surfaces.c -- tab strip */
 typedef struct {
@@ -753,6 +755,11 @@ typedef struct {
     bool persistent_site_data_available;
 } PspProcessResources;
 
+bool psp_app_apply_chrome_theme(
+    PspProcessResources *process, BrowserChromeTheme theme,
+    const char *custom_filename,
+    char *error, size_t error_capacity);
+
 /* Resources whose lifetime is bounded by the browser engine. Pointer members
    are owned handles, not expiring views; service objects live here by value.
    Their state machines remain the only control authority. */
@@ -769,6 +776,7 @@ typedef struct {
     PspUpdateSession update_session;
     PspVoiceComponentSession *voice_component_session;
     PspGlyphComponentSession *glyph_component_session;
+    PspUiThemeCatalog *theme_catalog;
 } PspBrowserResources;
 
 /* Why the interactive loop is ending. The tag owns the handoff policy too:
@@ -969,6 +977,8 @@ void psp_app_pump_provider_handoff_reclaim(
 /* src/psp_app/psp_app_settings.c */
 void psp_app_apply_setting(
     PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent);
+void psp_app_handle_theme_catalog(
+    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent);
 void psp_app_refresh_network_profile_label(PspApp *app, int profile);
 bool psp_app_edit_developer_update_url(
     PspApp *app, PspAppFrameState *frame);
@@ -1000,6 +1010,15 @@ void psp_input_script_capture_live_mark(
 void psp_input_script_capture_named(
     const char *mark, const uint16_t *frame, size_t pixels,
     size_t stride_pixels);
+/* Retain a validation-only burst of the actual scanout buffers accepted
+   around a subtitle transition. Writes are deferred to the script summary,
+   so observation cannot manufacture the presentation fault it measures. */
+void psp_input_script_capture_media_present(
+    const PspUiMediaState *media, const uint16_t *pixels_565,
+    const uint32_t *pixels_8888, size_t stride_pixels,
+    bool video_surface, unsigned buffer_index, bool skipped,
+    bool supervisor, const MediaVideoFrame *frame,
+    const PspMediaPresentRecord *records, size_t record_count);
 void psp_input_script_summary(void);
 #endif
 
