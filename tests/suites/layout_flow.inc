@@ -360,6 +360,131 @@ static int test_scroll_scene_coordinate_containment(Budget *budget)
     stylesheet_destroy(&root_sheet);
     document_destroy(&root_document);
     CHECK(budget->current == 0);
+
+    /* Utility frameworks commonly express negative spacing as a product
+       whose scalar has a unary sign.  Treating that sign as calc()'s binary
+       subtraction operator used to turn this ordinary heading margin into
+       INT_MAX, saturate its parent, and make long server-rendered pages look
+       like an unsupported scroll scene. */
+    static const char negative_scalar_page[] =
+        "<!doctype html><style>:root{--spacing:4px}body{margin:0}"
+        ".hero h1{height:48px;padding-bottom:8px;"
+        "margin-block-end:calc(var(--spacing) * -2)}"
+        ".section{height:240px}</style><body>"
+        "<div class=hero><h1 id=calc-heading>REAL HEADING</h1>"
+        "<p>Introductory server-rendered content.</p></div>"
+        "<div class=section>A</div><div class=section>B</div>"
+        "<div class=section>C</div><div class=section>D</div>"
+        "<div class=section>E</div><div class=section>F</div>"
+        "<p id=calc-tail>REAL PAGE TAIL</p></body>";
+    PocDocument negative_scalar_document = {0};
+    Stylesheet negative_scalar_sheet = {0};
+    LayoutDocument negative_scalar_layout = {0};
+    CHECK(document_parse(&negative_scalar_document, budget,
+                         negative_scalar_page,
+                         sizeof(negative_scalar_page) - 1u, 33u)
+          && stylesheet_build(&negative_scalar_sheet, budget,
+                              &negative_scalar_document, 480)
+          && layout_build(&negative_scalar_layout, budget,
+                          &negative_scalar_document, &negative_scalar_sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *negative_scalar_root = lxb_dom_interface_node(
+        negative_scalar_document.html);
+    lxb_dom_node_t *negative_scalar_heading = find_id(
+        negative_scalar_root, "calc-heading");
+    ComputedStyle negative_scalar_heading_style = style_for_node(
+        &negative_scalar_sheet, negative_scalar_heading, NULL);
+    lxb_dom_node_t *negative_scalar_tail = find_id(
+        negative_scalar_root, "calc-tail");
+    const LayoutNodeBox *negative_scalar_tail_box = layout_box_for_node(
+        &negative_scalar_layout, negative_scalar_tail);
+    CHECK(negative_scalar_heading != NULL
+          && negative_scalar_heading_style.margin.bottom == -8
+          && style_parse_length(
+                 &negative_scalar_sheet, "calc(10px - -2px)",
+                 sizeof("calc(10px - -2px)") - 1u,
+                 INT_MIN, NULL) == 12
+          && style_parse_length(
+                 &negative_scalar_sheet, "calc(2px * -3 + 10px)",
+                 sizeof("calc(2px * -3 + 10px)") - 1u,
+                 INT_MIN, NULL) == 4
+          && style_parse_length(
+                 &negative_scalar_sheet, "calc(1e-2px + 1px)",
+                 sizeof("calc(1e-2px + 1px)") - 1u,
+                 INT_MIN, NULL) == 1
+          && style_parse_length(
+                 &negative_scalar_sheet, "calc(8px + broken)",
+                 sizeof("calc(8px + broken)") - 1u,
+                 INT_MIN, NULL) == INT_MIN
+          && negative_scalar_tail_box != NULL
+          && negative_scalar_tail_box->y > 1200
+          && negative_scalar_layout.height > 1400
+          && negative_scalar_layout.height < 2000
+          && negative_scalar_layout.performance.coordinate_containments == 0u);
+    layout_destroy(&negative_scalar_layout);
+    stylesheet_destroy(&negative_scalar_sheet);
+    document_destroy(&negative_scalar_document);
+    CHECK(budget->current == 0);
+
+    /* A sticky child is constrained by its finite containing block.  Once
+       that block has scrolled away, later page content must not be covered by
+       a stale scroll-scene frame. */
+    static const char bounded_sticky_page[] =
+        "<!doctype html><style>body{margin:0}.before{height:40px}"
+        ".scene{position:relative;top:60px;height:300px;background:#112233}"
+        ".sticky{position:sticky;top:0;height:40px;background:#aa5500}"
+        ".scene-fixed{position:fixed;left:0;top:0;width:40px;height:40px;"
+        "background:#cc3300}"
+        ".after{height:400px;background:#224466}</style><body>"
+        "<div class=before></div><section class=scene>"
+        "<div class=sticky>FINITE STICKY<div class=scene-fixed></div></div>"
+        "</section>"
+        "<div class=after>CONTENT AFTER SCENE</div></body>";
+    PocDocument bounded_sticky_document = {0};
+    Stylesheet bounded_sticky_sheet = {0};
+    LayoutDocument bounded_sticky_layout = {0};
+    TileCache bounded_sticky_cache = {0};
+    uint16_t *bounded_sticky_frame = NULL;
+    CHECK(document_parse(&bounded_sticky_document, budget,
+                         bounded_sticky_page,
+                         sizeof(bounded_sticky_page) - 1u, 34u)
+          && stylesheet_build(&bounded_sticky_sheet, budget,
+                              &bounded_sticky_document, 480)
+          && layout_build(&bounded_sticky_layout, budget,
+                          &bounded_sticky_document, &bounded_sticky_sheet,
+                          NULL, NULL, 480));
+    bounded_sticky_frame = budget_malloc(
+        budget, 480u * 272u * sizeof(*bounded_sticky_frame));
+    CHECK(bounded_sticky_layout.sticky_count == 1u
+          && bounded_sticky_layout.fixed_count == 1u
+          && bounded_sticky_layout.height >= 700
+          && bounded_sticky_layout.sticky_ranges[0].origin_y == 100
+          && bounded_sticky_layout.sticky_ranges[0].bottom_y == 140
+          && bounded_sticky_layout.sticky_ranges[0].maximum_offset == 260
+          && bounded_sticky_layout.fixed_ranges[0].scroll_end == 400
+          && bounded_sticky_frame != NULL
+          && tile_cache_init(&bounded_sticky_cache, budget,
+                             &bounded_sticky_layout, 4)
+          && tile_cache_set_frame(&bounded_sticky_cache,
+                                  bounded_sticky_frame, 480u * 272u)
+          && tile_cache_render_frame(&bounded_sticky_cache, 0,
+                                     480, 272, NULL)
+          && bounded_sticky_frame[70u * 480u + 10u]
+                 == test_rgb565(0xcc3300)
+          && tile_cache_render_frame(&bounded_sticky_cache, 350,
+                                     480, 272, NULL)
+          && bounded_sticky_frame[70u * 480u + 10u]
+                 == test_rgb565(0xcc3300)
+          && tile_cache_render_frame(&bounded_sticky_cache, 420,
+                                     480, 272, NULL)
+          && bounded_sticky_frame[70u * 480u + 10u]
+                 == test_rgb565(0x224466));
+    tile_cache_destroy(&bounded_sticky_cache);
+    budget_free(budget, bounded_sticky_frame);
+    layout_destroy(&bounded_sticky_layout);
+    stylesheet_destroy(&bounded_sticky_sheet);
+    document_destroy(&bounded_sticky_document);
+    CHECK(budget->current == 0);
     return 0;
 }
 static int test_inline_replaced_box_model(Budget *budget)

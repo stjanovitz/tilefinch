@@ -218,6 +218,16 @@ typedef enum {
 
 #define BROWSER_OFFLINE_CACHE_ENTRY_LIMIT 32u
 
+/* QuickJS bytecode is an internal compiler artifact, not a web-visible or
+   Tilefinch-release ABI. Bump this only when the QuickJS serializer, compiler
+   configuration, or local compiler patches change incompatibly. Offline apps
+   keep their source response and simply recompile when this does not match. */
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+#define TILEFINCH_QUICKJS_BYTECODE_ABI UINT32_C(0x514a5301)
+#else
+#define TILEFINCH_QUICKJS_BYTECODE_ABI UINT32_C(0x514a4e01)
+#endif
+
 typedef enum {
     BROWSER_OFFLINE_CACHE_GENERIC = 0,
     BROWSER_OFFLINE_CACHE_RESOURCE,
@@ -232,6 +242,8 @@ typedef struct {
     const char *url;
     const unsigned char *data;
     size_t length;
+    const unsigned char *classic_script_bytecode;
+    size_t classic_script_bytecode_length;
     const char *content_type;
     const char *response_url;
     const char *response_referrer_policy;
@@ -660,6 +672,16 @@ bool browser_session_cache_revalidate_module(
    evicted without contributing to the returned physical-byte count. */
 size_t browser_session_cache_reclaim(BrowserSession *session,
                                      size_t target_bytes);
+/* Evicts older HTTP entries until a bounded working set can be inserted
+   without evicting its own earliest members. */
+bool browser_session_cache_reserve_working_set(
+    BrowserSession *session, size_t required_bytes);
+/* Raise, but never lower, the bounded live-cache admission ceiling. Installed
+   offline applications use this when their complete working set is larger
+   than the user's ordinary transient-cache preference. This does not allocate
+   memory. */
+bool browser_session_cache_ensure_maximum_bytes(
+    BrowserSession *session, size_t minimum_bytes);
 /* Changes the live cache ceiling. A smaller ceiling evicts least-recently
    used entries before returning; zero and values beyond the shared Budget
    ceiling are rejected without changing the session. */

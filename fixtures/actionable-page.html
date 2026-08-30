@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Actionable page qualification</title>
+<style>
+  body { font: 16px sans-serif; margin: 12px; }
+  nav { display: flex; gap: 12px; }
+  #details { margin-top: 520px; }
+</style>
+<nav aria-label="Page actions">
+  <a id="noop" href="javascript:void(0)">No-op action</a>
+  <a id="details-link" href="#details"
+     onclick="throw new Error('optional enhancement failed')">Details</a>
+</nav>
+<main>
+  <p>The server-rendered page remains usable when an optional handler fails.</p>
+  <section id="details">
+    <h2>Details</h2>
+    <p id="details-copy">The fragment target is still reachable.</p>
+  </section>
+</main>

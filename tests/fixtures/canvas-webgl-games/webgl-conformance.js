@@ -5,6 +5,8 @@
   canvas.height = 32;
   document.body.appendChild(canvas);
   const gl = canvas.getContext("webgl");
+  const defaultDrawingBufferDiscard =
+    gl.getContextAttributes().preserveDrawingBuffer === false;
   const bad = gl.createShader(gl.VERTEX_SHADER);
   gl.shaderSource(bad, "attribute vec2 p;");
   gl.compileShader(bad);
@@ -167,6 +169,11 @@
     && !gl.getProgramParameter(vertexOverflowProgram, gl.LINK_STATUS)
     && !gl.getProgramParameter(fragmentOverflowProgram, gl.LINK_STATUS)
     && !gl.getProgramParameter(declarationOverflowProgram, gl.LINK_STATUS);
+  for (const testedProgram of [exactUniformProgram, vertexOverflowProgram,
+    fragmentOverflowProgram, declarationOverflowProgram]) {
+    for (const testedShader of gl.getAttachedShaders(testedProgram) || [])
+      gl.deleteShader(testedShader);
+  }
 
   const perspectiveProgram = link(
     "attribute vec3 aPosition;attribute vec2 aTexCoord;uniform mat4 uP;"+
@@ -200,6 +207,10 @@
       === projectionBeforeWrongSetter.join()
     && !gl.isContextLost();
   gl.uniformMatrix4fv(projectionLocation, false, projection);
+  const uniformSnapshot = gl.getUniform(perspectiveProgram, projectionLocation);
+  uniformSnapshot[0] = 99;
+  const uniformSnapshotWorks =
+    gl.getUniform(perspectiveProgram, projectionLocation)[0] === 1;
   const perspectiveTexture = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, perspectiveTexture);
   gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
@@ -275,6 +286,54 @@
   incompatibleWire[1]++;
   const incompatibleWireRejected = __tilefinchWebGLRender(
     canvas.__handle, 32, 32, incompatibleWire, [], gl._textureWireU32) === 0;
+  const trailingWire = new Uint32Array([
+    gl._commandWireU32[0], gl._commandWireU32[1],
+    gl._commandWireU32[2], 0, 0xdeadbeef,
+  ]);
+  const trailingWireRejected = __tilefinchWebGLRender(
+    canvas.__handle, 32, 32, trailingWire, [], gl._textureWireU32) === 0;
+  const wrongWireElementSizeRejected = __tilefinchWebGLRender(
+    canvas.__handle, 32, 32, new Uint16Array(trailingWire.buffer), [],
+    gl._textureWireU32) === 0;
+
+  const depthProgram = link(
+    "attribute vec3 aPosition;void main(){gl_Position=vec4(aPosition,1.);}",
+    "uniform vec4 uColor;void main(){gl_FragColor=uColor;}");
+  gl.useProgram(depthProgram);
+  const depthPosition = gl.getAttribLocation(depthProgram, "aPosition");
+  const depthColor = gl.getUniformLocation(depthProgram, "uColor");
+  const depthBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, depthBuffer);
+  gl.vertexAttribPointer(depthPosition, 3, gl.FLOAT, false, 0, 0);
+  gl.enableVertexAttribArray(depthPosition);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS); gl.clearDepth(1);
+  const depthCase = (mode, near, far) => {
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(near), gl.DYNAMIC_DRAW);
+    gl.uniform4f(depthColor, 0, 1, 0, 1);
+    gl.drawArrays(mode, 0, near.length / 3);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(far), gl.DYNAMIC_DRAW);
+    gl.uniform4f(depthColor, 1, 0, 0, 1);
+    gl.drawArrays(mode, 0, far.length / 3);
+    gl.finish();
+    const samples = new Uint8Array(32 * 32 * 4);
+    gl.readPixels(0, 0, 32, 32, gl.RGBA, gl.UNSIGNED_BYTE, samples);
+    for (let at = 0; at < samples.length; at += 4)
+      if (samples[at + 1] > 240 && samples[at] < 10) return true;
+    return false;
+  };
+  const pointDepthWorks = depthCase(
+    gl.POINTS, [0, 0, -.5], [0, 0, .5]);
+  const lineDepthWorks = depthCase(
+    gl.LINES, [-.8, 0, -.5, .8, 0, -.5],
+    [-.8, 0, .5, .8, 0, .5]);
+  const triangleDepthWorks = depthCase(
+    gl.TRIANGLES, [-.5,-.5,-.5, .5,-.5,-.5, 0,.5,-.5],
+    [-.5,-.5,.5, .5,-.5,.5, 0,.5,.5]);
+  const primitiveDepthParity =
+    pointDepthWorks && lineDepthWorks && triangleDepthWorks;
+  gl.disable(gl.DEPTH_TEST);
 
   const forcedFlushesBefore = __tilefinchWebGLDiagnostics.forcedFlushes;
   gl.clear(gl.COLOR_BUFFER_BIT);
@@ -358,6 +417,38 @@
     && sourceContext._bufferBytes === 0 && sourceContext._textureBytes === 0
     && sourceContext.createBuffer() === null;
 
+  const aaCanvas = document.createElement("canvas");
+  aaCanvas.width = 8; aaCanvas.height = 8;
+  document.body.appendChild(aaCanvas);
+  const aa = aaCanvas.getContext("webgl", {antialias:true, depth:false});
+  const aaCompile = (type, source) => {
+    const shader = aa.createShader(type);
+    aa.shaderSource(shader, source); aa.compileShader(shader); return shader;
+  };
+  const aaProgram = aa.createProgram();
+  aa.attachShader(aaProgram, aaCompile(aa.VERTEX_SHADER,
+    "attribute vec2 aPosition;void main(){gl_Position=vec4(aPosition,0.,1.);}"));
+  aa.attachShader(aaProgram, aaCompile(aa.FRAGMENT_SHADER,
+    "void main(){gl_FragColor=vec4(1.,0.,0.,1.);}"));
+  aa.linkProgram(aaProgram); aa.useProgram(aaProgram);
+  const aaBuffer = aa.createBuffer();
+  aa.bindBuffer(aa.ARRAY_BUFFER, aaBuffer);
+  aa.bufferData(aa.ARRAY_BUFFER,
+    new Float32Array([-1,-1, 1,-1, -1,1]), aa.STATIC_DRAW);
+  const aaPosition = aa.getAttribLocation(aaProgram, "aPosition");
+  aa.vertexAttribPointer(aaPosition, 2, aa.FLOAT, false, 0, 0);
+  aa.enableVertexAttribArray(aaPosition);
+  aa.clearColor(0, 0, 0, 1); aa.clear(aa.COLOR_BUFFER_BIT);
+  aa.drawArrays(aa.TRIANGLES, 0, 3); aa.finish();
+  const aaPixels = new Uint8Array(8 * 8 * 4);
+  aa.readPixels(0, 0, 8, 8, aa.RGBA, aa.UNSIGNED_BYTE, aaPixels);
+  let partialCoverage = false;
+  for (let at = 0; at < aaPixels.length; at += 4)
+    partialCoverage ||= aaPixels[at] > 0 && aaPixels[at] < 255;
+  const boundedAntialiasWorks = aa.getContextAttributes().antialias
+    && partialCoverage && !aa.isContextLost();
+  aa._lose("antialias test complete");
+
   const large = document.createElement("canvas");
   large.width = 640;
   large.height = 480;
@@ -382,30 +473,39 @@
     && largeContext.getError() === largeContext.NO_ERROR
     && largeContext.createBuffer() === null;
   const replacementContext = document.createElement("canvas").getContext("webgl");
-  const passed = badRejected && gl.getProgramParameter(program, gl.LINK_STATUS)
+  const passed = defaultDrawingBufferDiscard && badRejected
+    && gl.getProgramParameter(program, gl.LINK_STATUS)
     && pixel[1] > pixel[0] && pixel[3] === 255
     && boundedError && alignedIndexError && boundedIndexError
     && alignedStrideError && alignedOffsetError && signedByteWorks
     && invalidGeometrySoft && unpackRowsCorrect && invalidUnpackError
-    && uniformLimitsWork && wrongUniformSetterRejected
+    && uniformLimitsWork && wrongUniformSetterRejected && uniformSnapshotWorks
     && perspectiveCorrect && partialReadWorks && offsetAndEmptyScissorWork
     && integerConversionWorks && nativeExceptionPropagated
-    && incompatibleWireRejected && forcedFlushCounted
-    && exactSourceLimitWorks && lostResourcesReleased && distinctErrorsRetained
+    && incompatibleWireRejected && trailingWireRejected
+    && wrongWireElementSizeRejected && primitiveDepthParity
+    && forcedFlushCounted
+    && exactSourceLimitWorks && lostResourcesReleased && boundedAntialiasWorks
+    && distinctErrorsRetained
     && !gl.isBuffer(buffer)
     && largeContext.drawingBufferWidth === 362
     && largeContext.drawingBufferHeight === 272 && third === null
     && terminalLoss && replacementContext;
   globalThis.pocSummary = passed ? "WEBGL-CONFORMANCE-PASS" :
-    `WEBGL-CONFORMANCE-FAIL:${badRejected}:${pixel}:${boundedError}:` +
+    `WEBGL-CONFORMANCE-FAIL:${defaultDrawingBufferDiscard}:${badRejected}:${pixel}:${boundedError}:` +
       `${alignedIndexError}:${boundedIndexError}:` +
       `${alignedStrideError}:${alignedOffsetError}:${signedByteWorks}:`+
       `${invalidGeometrySoft}:${unpackRowsCorrect}:${invalidUnpackError}:`+
-      `${uniformLimitsWork}:${wrongUniformSetterRejected}:${perspectivePixel}:`+
+      `${uniformLimitsWork}:${wrongUniformSetterRejected}:`+
+      `${uniformSnapshotWorks}:${perspectivePixel}:`+
       `${partialReadWorks}:${offsetAndEmptyScissorWork}:`+
       `${integerConversionWorks}:${nativeExceptionPropagated}:`+
-      `${incompatibleWireRejected}:${forcedFlushCounted}:`+
+      `${incompatibleWireRejected}:${trailingWireRejected}:`+
+      `${wrongWireElementSizeRejected}:${primitiveDepthParity}:`+
+      `${pointDepthWorks}:${lineDepthWorks}:${triangleDepthWorks}:`+
+      `${forcedFlushCounted}:`+
       `${exactSourceLimitWorks}:${lostResourcesReleased}:`+
+      `${boundedAntialiasWorks}:`+
       `${distinctErrorsRetained}:${terminalLoss}:${!!replacementContext}:`+
       `${largeContext.drawingBufferWidth}x${largeContext.drawingBufferHeight}:` +
       `${third === null}`;

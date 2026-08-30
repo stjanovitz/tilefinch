@@ -227,6 +227,31 @@ JSValue js_game_audio_command(JSContext *context,
             bridge->host->game_audio, handle, frequency)
             ? JS_TRUE : JS_FALSE;
     }
+    if (command == 8) {
+        double gain_left = 0, gain_right = 0;
+        double delay = 0, time_constant = 0;
+        if (argc < 6
+            || JS_ToFloat64(context, &gain_left, argv[2]) < 0
+            || JS_ToFloat64(context, &gain_right, argv[3]) < 0
+            || JS_ToFloat64(context, &delay, argv[4]) < 0
+            || JS_ToFloat64(context, &time_constant, argv[5]) < 0)
+            return JS_FALSE;
+        /* Numeric coercion can run author code. Resolve the runtime-owned
+           audio pointer only after every coercion has completed. */
+        bridge = JS_GetContextOpaque(context);
+        if (bridge == NULL || bridge->host == NULL) return JS_FALSE;
+        TilefinchGameAudio *audio = bridge->host->game_audio;
+        return tilefinch_game_audio_schedule_envelope_target(
+            audio, handle, gain_left, gain_right, delay, time_constant)
+            ? JS_TRUE : JS_FALSE;
+    }
+    if (command == 9) {
+        bridge = JS_GetContextOpaque(context);
+        if (bridge == NULL || bridge->host == NULL) return JS_FALSE;
+        TilefinchGameAudio *audio = bridge->host->game_audio;
+        return tilefinch_game_audio_cancel_envelope(audio, handle)
+            ? JS_TRUE : JS_FALSE;
+    }
     if (command == 5) {
         int32_t type = 0;
         double frequency = 0, gain_left = 1, gain_right = 1, delay = 0;
@@ -1360,6 +1385,38 @@ static bool bridge_mutation_record_equal(
     return true;
 }
 
+static void bridge_mutation_journal_append(
+    DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
+    const char *attribute, size_t attribute_length)
+{
+    ScriptMutationJournal *journal = &bridge->mutations;
+    for (size_t reverse = journal->count; reverse != 0; reverse--) {
+        if (bridge_mutation_record_equal(
+                &journal->records[reverse - 1], kind, node, attribute,
+                attribute_length)) return;
+    }
+    if (journal->count >= SCRIPT_MUTATION_JOURNAL_LIMIT) {
+        journal->overflowed = true;
+        /* Records beyond the fixed journal cannot be independently audited,
+           so retain the old whole-document fingerprint oracle. */
+        journal->conservative_resource_scan = true;
+        return;
+    }
+    ScriptMutationRecord *record = &journal->records[journal->count++];
+    record->kind = kind;
+    record->node = node;
+    record->owner_document_identity = js_rt_node_owner_identity(node);
+    size_t copy_length = attribute == NULL ? 0 : attribute_length;
+    if (copy_length >= sizeof(record->attribute)) {
+        copy_length = sizeof(record->attribute) - 1;
+    }
+    for (size_t i = 0; i < copy_length; i++) {
+        record->attribute[i] = (char) tolower(
+            (unsigned char) attribute[i]);
+    }
+    record->attribute[copy_length] = '\0';
+}
+
 static void bridge_mutated_with_relational(
     DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
     const char *attribute, size_t attribute_length,
@@ -1384,35 +1441,8 @@ static void bridge_mutated_with_relational(
     if (bridge->relayout_dirty != NULL) *bridge->relayout_dirty = true;
 
     ScriptMutationJournal *journal = &bridge->mutations;
-    bool coalesced = false;
-    for (size_t reverse = journal->count; reverse != 0; reverse--) {
-        if (bridge_mutation_record_equal(
-                &journal->records[reverse - 1], kind, node, attribute,
-                attribute_length)) {
-            coalesced = true;
-            break;
-        }
-    }
-    if (!coalesced && journal->count < SCRIPT_MUTATION_JOURNAL_LIMIT) {
-        ScriptMutationRecord *record = &journal->records[journal->count++];
-        record->kind = kind;
-        record->node = node;
-        record->owner_document_identity = js_rt_node_owner_identity(node);
-        size_t copy_length = attribute == NULL ? 0 : attribute_length;
-        if (copy_length >= sizeof(record->attribute)) {
-            copy_length = sizeof(record->attribute) - 1;
-        }
-        for (size_t i = 0; i < copy_length; i++) {
-            record->attribute[i] = (char) tolower(
-                (unsigned char) attribute[i]);
-        }
-        record->attribute[copy_length] = '\0';
-    } else if (!coalesced) {
-        journal->overflowed = true;
-        /* Records beyond the fixed journal cannot be independently audited,
-           so retain the old whole-document fingerprint oracle. */
-        journal->conservative_resource_scan = true;
-    }
+    bridge_mutation_journal_append(
+        bridge, kind, node, attribute, attribute_length);
 
     bool resource_rebuild = false;
     bool image_resource_scan = false;
@@ -1565,10 +1595,23 @@ void js_rt_bridge_note_canvas_mutation(DomBridge *bridge,
 {
     static const char paint[] = "paint";
     static const char structure[] = "surface";
+    if (paint_only) {
+        /* Replacing pixels in an already-sized canvas changes neither the
+           connected DOM nor document-derived title/body/statistics. Publish
+           bounded paint damage without making js_rt_runtime_refresh() walk
+           and re-summarize the complete document on every animation frame. */
+        if (bridge == NULL || node == NULL
+            || !bridge_node_is_connected(node)) return;
+        if (bridge->result != NULL) bridge->result->relayout_required = true;
+        if (bridge->relayout_dirty != NULL) *bridge->relayout_dirty = true;
+        bridge_mutation_journal_append(
+            bridge, SCRIPT_MUTATION_CANVAS, node,
+            paint, sizeof(paint) - 1u);
+        return;
+    }
     bridge_mutated_with_relational(
         bridge, SCRIPT_MUTATION_CANVAS, node,
-        paint_only ? paint : structure,
-        paint_only ? sizeof(paint) - 1u : sizeof(structure) - 1u,
+        structure, sizeof(structure) - 1u,
         false);
 }
 
@@ -2737,6 +2780,150 @@ JSValue js_dom_get_text(JSContext *context, JSValueConst this_value,
     return value;
 }
 
+#define DOM_TEXT_PREFIX_BYTE_LIMIT (256u * 1024u)
+#define DOM_TEXT_PREFIX_NODE_LIMIT 4096u
+
+static size_t bridge_utf8_prefix_length(
+    const unsigned char *text, size_t length, size_t maximum_bytes)
+{
+    if (text == NULL || length == 0 || maximum_bytes == 0) return 0;
+    size_t take = length < maximum_bytes ? length : maximum_bytes;
+    if (take < length) {
+        while (take > 0 && (text[take] & 0xc0u) == 0x80u) take--;
+    }
+    return take;
+}
+
+static JSValue bridge_text_prefix_result(
+    JSContext *context, JSValue text, uint32_t visited_nodes)
+{
+    if (JS_IsException(text)) return text;
+    JSValue result = JS_NewObject(context);
+    if (JS_IsException(result)
+        || JS_SetPropertyStr(context, result, "text", text) < 0
+        || JS_SetPropertyStr(context, result, "nodes",
+                             JS_NewUint32(context, visited_nodes)) < 0) {
+        if (JS_IsException(result)) JS_FreeValue(context, text);
+        else JS_FreeValue(context, result);
+        return JS_EXCEPTION;
+    }
+    return result;
+}
+
+/* Bootstrap consumers sometimes need only a bounded prefix of a large style
+   node.  Keep Node.textContent standards-observable and complete; this private
+   primitive walks the native tree and never materializes the omitted suffix in
+   either the Budget or QuickJS heap. */
+JSValue js_dom_get_text_prefix(JSContext *context,
+                               JSValueConst this_value,
+                               int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    uint32_t maximum_bytes = 0;
+    uint32_t maximum_nodes = 0;
+    if (bridge == NULL || argc < 3) return JS_NULL;
+    /* Coercion may run author code. Resolve the native node only after every
+       coercion so a hostile valueOf() cannot detach a previously resolved
+       pointer underneath this bootstrap helper. */
+    if (JS_ToUint32(context, &maximum_bytes, argv[1]) < 0
+        || JS_ToUint32(context, &maximum_nodes, argv[2]) < 0) {
+        return JS_EXCEPTION;
+    }
+    lxb_dom_node_t *node = js_rt_bridge_node_arg(
+        context, bridge, argv[0]);
+    if (node == NULL) return JS_NULL;
+    if (maximum_bytes > DOM_TEXT_PREFIX_BYTE_LIMIT) {
+        maximum_bytes = DOM_TEXT_PREFIX_BYTE_LIMIT;
+    }
+    if (maximum_nodes > DOM_TEXT_PREFIX_NODE_LIMIT) {
+        maximum_nodes = DOM_TEXT_PREFIX_NODE_LIMIT;
+    }
+    if (maximum_bytes == 0 || maximum_nodes == 0) {
+        return bridge_text_prefix_result(
+            context, JS_NewString(context, ""), 0);
+    }
+
+    size_t required = 0;
+    uint32_t visited = 0;
+    DomDocumentOrderTraversal traversal = {
+        .next = node, .boundary = node
+    };
+    for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
+         at != NULL && visited < maximum_nodes && required < maximum_bytes;
+         at = dom_document_order_next(&traversal)) {
+        visited++;
+        size_t text_length = 0;
+        const unsigned char *text = (const unsigned char *)
+            document_text_data(at, &text_length);
+        if (text == NULL || text_length == 0) continue;
+        size_t take = bridge_utf8_prefix_length(
+            text, text_length, maximum_bytes - required);
+        if (take == 0) break;
+        required += take;
+        if (take < text_length) break;
+    }
+    if (required == 0) {
+        return bridge_text_prefix_result(
+            context, JS_NewString(context, ""), visited);
+    }
+    const uint32_t consumed_nodes = visited;
+
+    unsigned char *prefix = budget_malloc(bridge->budget, required);
+    if (prefix == NULL) return JS_NULL;
+    size_t used = 0;
+    visited = 0;
+    traversal = (DomDocumentOrderTraversal) {
+        .next = node, .boundary = node
+    };
+    for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
+         at != NULL && visited < maximum_nodes && used < required;
+         at = dom_document_order_next(&traversal)) {
+        visited++;
+        size_t text_length = 0;
+        const unsigned char *text = (const unsigned char *)
+            document_text_data(at, &text_length);
+        if (text == NULL || text_length == 0) continue;
+        size_t take = text_length;
+        if (take > required - used) take = required - used;
+        memcpy(prefix + used, text, take);
+        used += take;
+    }
+    JSValue value = JS_NewStringLen(
+        context, (const char *) prefix, used);
+    budget_free(bridge->budget, prefix);
+    return bridge_text_prefix_result(context, value, consumed_nodes);
+}
+
+JSValue js_dom_get_style_attribute_prefix(
+    JSContext *context, JSValueConst this_value,
+    int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    uint32_t maximum_bytes = 0;
+    if (bridge == NULL || argc < 2) return JS_NULL;
+    /* This coercion can execute author code, so resolve the handle last. */
+    if (JS_ToUint32(context, &maximum_bytes, argv[1]) < 0) {
+        return JS_EXCEPTION;
+    }
+    lxb_dom_node_t *node = js_rt_bridge_node_arg(
+        context, bridge, argv[0]);
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) {
+        return JS_NULL;
+    }
+    if (maximum_bytes > DOM_TEXT_PREFIX_BYTE_LIMIT) {
+        maximum_bytes = DOM_TEXT_PREFIX_BYTE_LIMIT;
+    }
+    size_t value_length = 0;
+    const unsigned char *value = (const unsigned char *)
+        document_attribute(node, "style", &value_length);
+    if (value == NULL) return JS_NULL;
+    size_t take = bridge_utf8_prefix_length(
+        value, value_length, maximum_bytes);
+    return JS_NewStringLen(context, (const char *) value, take);
+}
+
 JSValue js_dom_set_text(JSContext *context, JSValueConst this_value,
                         int argc, JSValueConst *argv)
 {
@@ -3010,6 +3197,32 @@ JSValue js_dom_image_property(JSContext *context,
     return JS_NewInt32(context, 0);
 }
 
+static bool js_dom_latch_checked_default(DomBridge *bridge,
+                                         lxb_dom_node_t *node,
+                                         const char *name,
+                                         size_t name_length)
+{
+    if (bridge == NULL || bridge->document == NULL || node == NULL
+        || name == NULL || name_length != sizeof("checked") - 1u
+        || strncasecmp(name, "checked", name_length) != 0
+        || !bridge_mutation_node_name_is(node, "input")) return true;
+    size_t type_length = 0;
+    const char *type = document_attribute(node, "type", &type_length);
+    bool checkable = type != NULL
+        && ((type_length == sizeof("checkbox") - 1u
+             && strncasecmp(type, "checkbox", type_length) == 0)
+            || (type_length == sizeof("radio") - 1u
+                && strncasecmp(type, "radio", type_length) == 0));
+    if (!checkable) return true;
+    bool ignored_default = false;
+    return document_control_checked_default(
+        bridge->document, node,
+        lxb_dom_element_has_attribute(
+            lxb_dom_interface_element(node),
+            (const lxb_char_t *) "checked", sizeof("checked") - 1u),
+        &ignored_default);
+}
+
 JSValue js_dom_set_attribute(JSContext *context,
                              JSValueConst this_value,
                              int argc, JSValueConst *argv)
@@ -3028,6 +3241,12 @@ JSValue js_dom_set_attribute(JSContext *context,
         if (name != NULL) JS_FreeCString(context, name);
         if (value != NULL) JS_FreeCString(context, value);
         return JS_EXCEPTION;
+    }
+    if (!js_dom_latch_checked_default(
+            bridge, node, name, name_length)) {
+        JS_FreeCString(context, value);
+        JS_FreeCString(context, name);
+        return JS_FALSE;
     }
     size_t old_value_length = 0;
     const lxb_char_t *old_value = lxb_dom_element_get_attribute(
@@ -3158,6 +3377,11 @@ JSValue js_dom_remove_attribute(JSContext *context,
     size_t name_length = 0;
     const char *name = JS_ToCStringLen(context, &name_length, argv[1]);
     if (name == NULL) return JS_EXCEPTION;
+    if (!js_dom_latch_checked_default(
+            bridge, node, name, name_length)) {
+        JS_FreeCString(context, name);
+        return JS_FALSE;
+    }
     bool existed = lxb_dom_element_has_attribute(
         lxb_dom_interface_element(node), (const lxb_char_t *) name,
         name_length);

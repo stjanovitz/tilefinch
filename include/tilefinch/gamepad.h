@@ -53,6 +53,10 @@ typedef struct {
     bool active;
     bool chord_held;
     bool chord_latched;
+    /* A page API request is admitted from the same physical activation that
+       clicked Play. Do not leak that still-held face button into the newly
+       connected Gamepad object; publish neutral input until it is released. */
+    bool suppress_input_until_release;
 } TilefinchGamepadCapture;
 
 typedef enum {
@@ -66,6 +70,9 @@ void tilefinch_gamepad_capture_init(TilefinchGamepadCapture *capture);
 TilefinchGamepadCaptureEvent tilefinch_gamepad_capture_step(
     TilefinchGamepadCapture *capture, bool page_available,
     uint64_t page_generation, bool chord_held, unsigned elapsed_ms);
+TilefinchGamepadCaptureEvent tilefinch_gamepad_capture_request(
+    TilefinchGamepadCapture *capture, bool page_available,
+    uint64_t page_generation);
 bool tilefinch_gamepad_capture_consumes_browser_input(
     const TilefinchGamepadCapture *capture);
 

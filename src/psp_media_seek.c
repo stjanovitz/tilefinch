@@ -53,8 +53,8 @@ static bool psp_media_reopen_backward_seek(
         .has_separate_audio = false
     }, "backward-seek-reopen-open");
     psp_ui_media_set_resolving(&media->ui, "Seeking video");
-    media->ui.seek_in_progress = true;
-    media->ui.current_time_us = target_us;
+    media->ui.duration_us = psp_media_duration_us(media);
+    psp_ui_media_commit_seek(&media->ui, target_us);
     psp_ui_media_set_resolving_progress(
         &media->ui, "Restarting decoder", 20u);
     printf(
@@ -125,7 +125,7 @@ bool psp_media_request_seek_with_resume(
        seek. The state projection identifies this as seeking, so the
        cooperative presenter redraws the real timeline instead of replacing
        all 78 footer rows with an empty loading ground. */
-    media->ui.current_time_us = target_us;
+    psp_ui_media_commit_seek(&media->ui, target_us);
     media->job_actual_us = target_us;
     media->job_prime_audio_us = target_us;
     media->job_prime_ready_mask = 0;
@@ -595,6 +595,12 @@ bool psp_media_seek_decode_pump(
                 target_us,
                 psp_media_duration_us(media),
                 media->stream.title);
+            /* Decoding has reached the committed keyframe, but audio/video
+               priming may still need more source data. Keep the target as
+               the authoritative scrubber position until PRIME_READY instead
+               of briefly projecting the pre-seek clock again. */
+            if (!restore)
+                psp_ui_media_commit_seek(&media->ui, target_us);
             media->job_phase = PSP_MEDIA_JOB_NONE;
             if (!restore) media->seek_preview_started = false;
             if (cancelled_preview) {

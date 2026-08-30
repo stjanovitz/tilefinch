@@ -155,6 +155,7 @@ typedef enum {
     PSP_UI_ACTION_FORWARD,
     PSP_UI_ACTION_RELOAD,
     PSP_UI_ACTION_TOGGLE_READER,
+    PSP_UI_ACTION_TOGGLE_BASIC,
     PSP_UI_ACTION_TOGGLE_READER_SITE,
     PSP_UI_ACTION_PAGE_UP,
     PSP_UI_ACTION_PAGE_DOWN,
@@ -566,7 +567,11 @@ typedef struct {
     int update_progress_per_mille;
     BrowserSearchEngine search_engine;
     BrowserColorMode color_mode;
-    bool page_dark;
+    uint8_t page_dark : 1;
+    /* Basic and Reader are mutually exclusive extracted presentations. The
+       source DOM remains connected in either mode. Pack this beside the
+       existing page-color bit so the fixed 1 KiB UI state does not grow. */
+    uint8_t basic_mode : 1;
     bool loading;
     bool secure;
     bool can_go_back;
@@ -609,6 +614,9 @@ typedef struct {
     uint8_t home_selection;
     uint8_t collections_selection;
     uint8_t collections_first_row;
+    /* Values 1..row-count are delete confirmations. The otherwise-unused
+       high bit is one pre-dispatch activation-feedback frame, preserving the
+       1 KiB UI-state ratchet. */
     uint8_t collections_delete_confirmation;
     uint8_t failure_actions;
     const PspUiTabsView *tabs;
@@ -684,6 +692,13 @@ typedef struct {
 } PspUiState;
 
 void psp_ui_show_failure_recovery(
+    PspUiState *ui, const char *detail, uint8_t available_actions);
+/* Show the same bounded recovery surface while treating available_actions as
+   authoritative.  Ordinary navigation failures use the convenience wrapper
+   above, which always offers Reader; a successfully fetched hydration shell
+   whose bounded Reader analysis is RAW must not advertise an action that
+   cannot produce content. */
+void psp_ui_show_failure_recovery_actions(
     PspUiState *ui, const char *detail, uint8_t available_actions);
 
 typedef enum {
@@ -990,6 +1005,24 @@ void psp_ui_apply_page_dark_rgb565(
     uint16_t *pixels, int width, int height, int stride);
 void psp_ui_composite(const PspUiState *ui, uint16_t *pixels,
                       int width, int height, int stride);
+/* Opaque browser-chrome rows that psp_ui_composite() will replace in full.
+   The presenter may omit those rows from its page-to-scanout base copy. */
+void psp_ui_opaque_chrome_rows(
+    const PspUiState *ui, unsigned *top_rows, unsigned *bottom_rows);
+#if defined(TILEFINCH_PSP_VALIDATION_LOG) \
+    || defined(TILEFINCH_PSP_UI_TIMING)
+typedef struct {
+    uint64_t focus_scroll_us;
+    uint64_t chrome_us;
+    uint64_t cursor_us;
+    uint64_t screen_us;
+    uint64_t toast_us;
+    uint64_t loading_us;
+    uint32_t sequence;
+} PspUiCompositeTiming;
+
+bool psp_ui_validation_last_timing(PspUiCompositeTiming *timing);
+#endif
 /*
  * Immediate, allocation-free startup presentation. The splash requires no
  * filesystem or engine state; the homepage view mirrors the compiled-in
@@ -1025,6 +1058,11 @@ void psp_ui_media_apply_projection(
     PspUiMediaState *media, const PspMediaUiProjection *projection);
 void psp_ui_media_set_seek_preview(PspUiMediaState *media,
                                    uint64_t target_time_us);
+/* Replace a tentative scrub target with the committed seek position. The
+ * marker remains at this position until decoded playback becomes
+ * authoritative; decoder preparation must not expose the old clock. */
+void psp_ui_media_commit_seek(PspUiMediaState *media,
+                              uint64_t target_time_us);
 void psp_ui_media_cancel_seek_preview(PspUiMediaState *media);
 void psp_ui_media_show_controls(PspUiMediaState *media);
 void psp_ui_media_set_tracks(

@@ -1,5 +1,21 @@
 #define NAVIGATION_SPECULATIVE_RESOURCE_TIMEOUT_MS 5000L
 
+#if !defined(__PSP__)
+static bool navigation_test_stream_scheduler_refusal_pending;
+
+void navigation_test_refuse_next_stream_scheduler_creation(void)
+{
+    navigation_test_stream_scheduler_refusal_pending = true;
+}
+
+static bool navigation_test_consume_stream_scheduler_refusal(void)
+{
+    bool pending = navigation_test_stream_scheduler_refusal_pending;
+    navigation_test_stream_scheduler_refusal_pending = false;
+    return pending;
+}
+#endif
+
 static void navigation_stream_adopt_stylesheet_event_baseline(
     NavigationDocumentStream *stream)
 {
@@ -1101,7 +1117,8 @@ static void navigation_stream_settle_style_preloads(
 }
 
 static void navigation_stream_settle_script_preload(
-    NavigationDocumentStream *stream, const char *reference)
+    NavigationDocumentStream *stream, const char *reference,
+    uint64_t parser_deadline_us)
 {
     if (stream == NULL || stream->scheduler == NULL || reference == NULL
         || reference[0] == '\0') return;
@@ -1121,11 +1138,17 @@ static void navigation_stream_settle_script_preload(
            && !target->complete) {
         navigation_stream_progress_preloads(stream, false);
         if (target->request_id == 0 || target->complete) return;
-        if (stream->preload_deadline_us != 0
-            && navigation_now_us() >= stream->preload_deadline_us) {
+        uint64_t now_us = navigation_now_us();
+        bool navigation_deadline = stream->preload_deadline_us != 0
+            && now_us >= stream->preload_deadline_us;
+        bool parser_deadline = parser_deadline_us != 0
+            && now_us >= parser_deadline_us;
+        if (navigation_deadline || parser_deadline) {
             (void) fetch_scheduler_cancel(
                 stream->scheduler, target->request_id,
-                "parser-blocking script preload deadline exceeded");
+                parser_deadline
+                    ? "parser script stage deadline exceeded"
+                    : "parser-blocking script preload deadline exceeded");
             FetchResult *result =
                 fetch_result_create(stream->session->budget);
             bool ignored = false;
@@ -1526,8 +1549,14 @@ static bool navigation_stream_prepare_runtime(NavigationDocumentStream *stream,
         /* An SPA can hold several concurrent async chunk fetches while a
            synchronous module-loader fetch also needs a slot; capacity must
            cover the async bridge's native limit plus that headroom. */
-        stream->scheduler = fetch_scheduler_create_in_domain(
-            stream->fetch_domain, 12, reserved);
+        bool refuse_scheduler = false;
+#if !defined(__PSP__)
+        refuse_scheduler =
+            navigation_test_consume_stream_scheduler_refusal();
+#endif
+        stream->scheduler = refuse_scheduler ? NULL
+            : fetch_scheduler_create_in_domain(
+                  stream->fetch_domain, 12, reserved);
         if (stream->scheduler == NULL) {
             navigation_stream_shed_optional_work(
                 stream, "Optional resources stopped at the page memory limit",

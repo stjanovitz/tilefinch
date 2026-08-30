@@ -23,6 +23,21 @@ static bool psp_input_script_saw_exit;
 static uint32_t psp_input_script_previous_buttons;
 static uint16_t psp_input_script_last_press_step;
 
+/* End-to-end Page-controls evidence. Script step counts prove only that the
+   validation source emitted input; these counters sit at the Gamepad API
+   publication boundary and prove that a connected page received it. */
+static uint32_t psp_input_gamepad_connected_frames;
+static uint32_t psp_input_gamepad_button_frames;
+static uint32_t psp_input_gamepad_analog_frames;
+static uint32_t psp_input_gamepad_publications;
+static uint32_t psp_input_gamepad_connections;
+static uint32_t psp_input_gamepad_buttons_seen;
+static int16_t psp_input_gamepad_axis_x_min;
+static int16_t psp_input_gamepad_axis_x_max;
+static int16_t psp_input_gamepad_axis_y_min;
+static int16_t psp_input_gamepad_axis_y_max;
+static bool psp_input_gamepad_was_connected;
+
 /* Coverage tally. Indexed by enum value; both spaces are small and closed,
    and the summary prints only the entries a run actually reached. */
 #define PSP_INPUT_SCRIPT_ACTION_SLOTS 64u
@@ -112,6 +127,17 @@ bool psp_input_script_begin(
     psp_input_script_saw_exit = false;
     psp_input_script_previous_buttons = 0;
     psp_input_script_last_press_step = 0;
+    psp_input_gamepad_connected_frames = 0;
+    psp_input_gamepad_button_frames = 0;
+    psp_input_gamepad_analog_frames = 0;
+    psp_input_gamepad_publications = 0;
+    psp_input_gamepad_connections = 0;
+    psp_input_gamepad_buttons_seen = 0;
+    psp_input_gamepad_axis_x_min = 0;
+    psp_input_gamepad_axis_x_max = 0;
+    psp_input_gamepad_axis_y_min = 0;
+    psp_input_gamepad_axis_y_max = 0;
+    psp_input_gamepad_was_connected = false;
     psp_input_script_capture_count = 0;
     psp_subtitle_burst_count = 0;
     psp_subtitle_burst_remaining = 0;
@@ -129,7 +155,11 @@ bool psp_input_script_begin(
            sizeof(psp_input_script_setting_hits));
     if (name == NULL || name[0] == '\0') return false;
     char path[TILEFINCH_INSTALL_PATH_LIMIT];
-    if (install_paths != NULL && install_paths->slotted) {
+    /* argv[0] belongs to the PSP loader's startup frame and is not a durable
+       path source once the interactive loop begins. install_paths is the
+       owned copy derived during boot and works for slot, Memory Stick, and
+       host0: runs alike. */
+    if (install_paths != NULL) {
         if (!tilefinch_install_program_path(
                 install_paths, name, path, sizeof(path))) {
             printf("tilefinch-input-script: rejected path=\"%s\" line=0 "
@@ -180,6 +210,8 @@ bool psp_input_script_frame(
                    ready ? 1 : 0);
         }
     }
+    psp_webgl_measurement_mark(
+        psp_input_script_mark(&psp_input_script));
     return driving;
 }
 
@@ -200,6 +232,8 @@ bool psp_input_script_busy_frame(PspUiInput *input)
                    (unsigned) frame_step, (unsigned) input->pressed);
         }
     }
+    psp_webgl_measurement_mark(
+        psp_input_script_mark(&psp_input_script));
     return driving;
 }
 
@@ -214,9 +248,16 @@ void psp_input_script_observe(const PspUiIntent *intent, const PspUiState *ui)
     const char *screen = ui == NULL
         ? "unknown" : psp_input_script_screen_name(ui->screen);
     const char *mark = psp_input_script_mark(&psp_input_script);
-    if (mark != NULL)
+    if (mark != NULL) {
         printf("tilefinch-input-script: mark=%s step=%u screen=%s\n",
                mark, (unsigned) psp_input_script.step, screen);
+        printf("tilefinch-focus-probe: mark=%s visible=%d rect=%d,%d,%d,%d\n",
+               mark, ui != NULL && ui->has_focus ? 1 : 0,
+               ui == NULL ? 0 : ui->focus_x,
+               ui == NULL ? 0 : ui->focus_y,
+               ui == NULL ? 0 : ui->focus_width,
+               ui == NULL ? 0 : ui->focus_height);
+    }
     if (intent == NULL) return;
     PspUiAction action = intent->action;
     PspUiSettingId setting = intent->setting.id;
@@ -245,6 +286,25 @@ void psp_input_script_observe_page(
     if (mark == NULL || navigation == NULL) return;
     const NavigationPage *page = &navigation->page;
     const ExternalImageStats *images = &page->images.stats;
+    printf("tilefinch-input-script-js: mark=%s discovered=%zu attempted=%zu "
+           "loaded=%zu failed=%zu bytecode=%zu/%zu/%zu "
+           "dynamic=%zu/%zu/%zu/%zu/%zu/%zu/%zu pending=%zu summary=\"%.96s\" "
+           "error=\"%.160s\"\n",
+           mark, navigation->script_discovered,
+           navigation->script_attempted, navigation->script_loaded,
+           navigation->script_failed,
+           page->script_result.external_script_bytecode_cache_hits,
+           page->script_result.external_script_bytecode_cache_misses,
+           page->script_result.external_script_bytecode_cache_restore_failures,
+           page->script_result.dynamic_scripts_queued,
+           page->script_result.dynamic_scripts_started,
+           page->script_result.dynamic_scripts_completed,
+           page->script_result.dynamic_scripts_failed,
+           page->script_result.dynamic_scripts_cache_hits,
+           page->script_result.dynamic_scripts_quota_rejected,
+           page->script_result.dynamic_script_bytes,
+           page->script_result.pending_tasks,
+           page->script_result.summary, page->script_result.error);
     printf("tilefinch-input-script-images: mark=%s cursor=%zu/%zu "
            "job=%d batch=%u attempts=%zu loaded=%zu failed=%zu "
            "bytes=%zu/%zu progress=%zu/%zu/%zu "
@@ -309,6 +369,42 @@ void psp_input_script_observe_media(
            (unsigned long long) media->seek_preview_time_us);
 }
 
+void psp_input_script_observe_gamepad(
+    bool connected, uint32_t buttons, int16_t axis_x, int16_t axis_y,
+    bool published)
+{
+    if (!psp_input_script_armed(&psp_input_script)) return;
+    if (connected && !psp_input_gamepad_was_connected)
+        psp_input_gamepad_connections++;
+    psp_input_gamepad_was_connected = connected;
+    if (!connected) return;
+    psp_input_gamepad_connected_frames++;
+    if (published) psp_input_gamepad_publications++;
+    if (buttons != 0u) {
+        psp_input_gamepad_button_frames++;
+        psp_input_gamepad_buttons_seen |= buttons;
+    }
+    if (axis_x != 0 || axis_y != 0) psp_input_gamepad_analog_frames++;
+    if (axis_x < psp_input_gamepad_axis_x_min)
+        psp_input_gamepad_axis_x_min = axis_x;
+    if (axis_x > psp_input_gamepad_axis_x_max)
+        psp_input_gamepad_axis_x_max = axis_x;
+    if (axis_y < psp_input_gamepad_axis_y_min)
+        psp_input_gamepad_axis_y_min = axis_y;
+    if (axis_y > psp_input_gamepad_axis_y_max)
+        psp_input_gamepad_axis_y_max = axis_y;
+}
+
+uint16_t psp_input_script_diagnostic_step(void)
+{
+    return psp_input_script.step;
+}
+
+uint32_t psp_input_script_diagnostic_buttons(void)
+{
+    return psp_input_script_previous_buttons;
+}
+
 void psp_input_script_capture_named(
     const char *mark, const uint16_t *frame, size_t pixels,
     size_t stride_pixels)
@@ -349,6 +445,15 @@ void psp_input_script_capture_live_mark(
     if (mark == NULL || psp_input_script.step >= psp_input_script.step_count
         || !psp_input_script.steps[psp_input_script.step].advance_while_busy)
         return;
+    /* Measurement delimiters and the Page-controls state transition are
+       control records, not visual checkpoints. Keeping them out of the
+       three-frame capture ring makes the installed-game input trace
+       deterministic even when the supervisor observes a marker between two
+       display publications. The game-input-end image proves captured play. */
+    if (strcmp(mark, "webgl-measure-start") == 0
+        || strcmp(mark, "webgl-measure-end") == 0
+        || strcmp(mark, "auto-controls") == 0
+        || strcmp(mark, "controls-exited") == 0) return;
     psp_input_script_capture_named(mark, frame, pixels, stride_pixels);
 }
 
@@ -675,6 +780,19 @@ void psp_input_script_summary(void)
     printf("tilefinch-input-telemetry: busy-frames=%u busy-presses=%u\n",
            (unsigned) psp_input_script.busy_ticks,
            (unsigned) psp_input_script.busy_press_edges);
+    printf("tilefinch-input-gamepad: connected-frames=%u button-frames=%u "
+           "analog-frames=%u publications=%u connections=%u "
+           "buttons=0x%08X axis-x=%d/%d axis-y=%d/%d\n",
+           (unsigned) psp_input_gamepad_connected_frames,
+           (unsigned) psp_input_gamepad_button_frames,
+           (unsigned) psp_input_gamepad_analog_frames,
+           (unsigned) psp_input_gamepad_publications,
+           (unsigned) psp_input_gamepad_connections,
+           (unsigned) psp_input_gamepad_buttons_seen,
+           (int) psp_input_gamepad_axis_x_min,
+           (int) psp_input_gamepad_axis_x_max,
+           (int) psp_input_gamepad_axis_y_min,
+           (int) psp_input_gamepad_axis_y_max);
     for (size_t at = 0; at < psp_input_script_capture_count; at++) {
         bool written = psp_input_script_write_capture(
             &psp_input_script_captures[at]);

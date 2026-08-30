@@ -3955,12 +3955,10 @@
     };
   }
   {
-    /*
-     * The PSP SDK's libcurl 7.64 has no WebSocket framing API. Expose the
-     * standard object and deterministic asynchronous failure lifecycle, but
-     * never claim OPEN or send data until a native duplex transport is
-     * installed. This is safer than a polling protocol disguised as a socket.
-     */
+    const webSockets = new Map(),
+      webSocketLimit = 2,
+      webSocketByteLimit = 64 * 1024,
+      webSocketQueueLimit = 16;
     class WebSocket extends EventTarget {
       constructor(url, protocols = []) {
         super();
@@ -3981,9 +3979,27 @@
           throw new DOMException("Invalid WebSocket scheme", "SyntaxError");
         if (parsed.hash)
           throw new DOMException("WebSocket URLs cannot have fragments", "SyntaxError");
-        const list =
-          typeof protocols === "string" ? [protocols] : Array.from(protocols);
+        const list = [];
+        if (typeof protocols === "string") list.push(protocols);
+        else {
+          const iterator = protocols?.[Symbol.iterator];
+          if (typeof iterator !== "function")
+            throw new TypeError("WebSocket protocols must be iterable");
+          const values = iterator.call(protocols);
+          try {
+            while (list.length <= 16) {
+              const next = values.next();
+              if (next.done) break;
+              list.push(String(next.value));
+            }
+          } finally {
+            if (list.length > 16 && typeof values.return === "function")
+              values.return();
+          }
+        }
         if (
+          parsed.username ||
+          parsed.password ||
           list.length > 16 ||
           list.some(
             (item, index) =>
@@ -4000,42 +4016,127 @@
         this.bufferedAmount = 0;
         this.extensions = "";
         this.protocol = "";
-        this.binaryType = "blob";
+        this._binaryType = "blob";
         this.onopen = null;
         this.onmessage = null;
         this.onerror = null;
         this.onclose = null;
-        this._task = setTimeout(() => {
-          if (this.readyState !== WebSocket.CONNECTING) return;
-          this.readyState = WebSocket.CLOSED;
-          const error = new Event("error");
-          this.dispatchEvent(error);
-          if (typeof this.onerror === "function") this.onerror(error);
-          const close = new CloseEvent("close", {
-            code: 1006,
-            reason: "duplex transport unavailable",
-            wasClean: false,
-          });
-          this.dispatchEvent(close);
-          if (typeof this.onclose === "function") this.onclose(close);
-        }, 0);
+        this._nativeId = 0;
+        this._queue = [];
+        this._sending = false;
+        this._closeRequest = null;
+        if (webSockets.size < webSocketLimit) {
+          try {
+            this._nativeId = Number(
+              __tilefinchWebSocketStart(this.url, list.map(String).join(", ")),
+            );
+          } catch (_) {}
+        }
+        if (this._nativeId > 0) webSockets.set(this._nativeId, this);
+        else setTimeout(() => this._fail("duplex transport unavailable"), 0);
       }
-      send() {
+      get binaryType() {
+        return this._binaryType;
+      }
+      set binaryType(value) {
+        value = String(value);
+        if (value === "blob" || value === "arraybuffer")
+          this._binaryType = value;
+      }
+      _emit(event) {
+        this.dispatchEvent(event);
+        const handler = this["on" + event.type];
+        if (typeof handler === "function")
+          globalThis.__tilefinchRunTask(
+            "websocket:" + String(event.type),
+            handler,
+            this,
+            [event],
+          );
+      }
+      _finish(code, reason, wasClean, withError) {
+        if (this.readyState === WebSocket.CLOSED) return;
+        if (this._nativeId) webSockets.delete(this._nativeId);
+        this._nativeId = 0;
+        this.readyState = WebSocket.CLOSED;
+        this._queue = [];
+        this.bufferedAmount = 0;
+        if (withError) this._emit(new Event("error"));
+        this._emit(new CloseEvent("close", { code, reason, wasClean }));
+      }
+      _fail(reason) {
+        this._finish(1006, String(reason || ""), false, true);
+      }
+      _pump() {
+        if (
+          (this.readyState !== WebSocket.OPEN &&
+            this.readyState !== WebSocket.CLOSING) ||
+          this._sending ||
+          !this._queue.length
+        ) {
+          if (
+            !this._sending &&
+            !this._queue.length &&
+            this._closeRequest &&
+            this._nativeId
+          ) {
+            const request = this._closeRequest;
+            this._closeRequest = null;
+            if (!__tilefinchWebSocketClose(
+              this._nativeId, request.code, request.reason))
+              this._fail("WebSocket close admission failed");
+          }
+          return;
+        }
+        const item = this._queue[0];
+        if (__tilefinchWebSocketSend(
+          this._nativeId, item.bytes.buffer, item.binary))
+          this._sending = true;
+      }
+      send(data) {
         if (this.readyState === WebSocket.CONNECTING)
           throw new DOMException("WebSocket is connecting", "InvalidStateError");
         if (this.readyState !== WebSocket.OPEN) return;
+        let bytes, binary = true;
+        if (typeof data === "string") {
+          bytes = new TextEncoder().encode(data);
+          binary = false;
+        } else if (data instanceof ArrayBuffer) {
+          bytes = new Uint8Array(data.slice(0));
+        } else if (ArrayBuffer.isView(data)) {
+          bytes = new Uint8Array(
+            data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
+          );
+        } else if (typeof Blob !== "undefined" && data instanceof Blob) {
+          bytes = new Uint8Array(data._bytes);
+        } else {
+          throw new TypeError("Unsupported WebSocket message type");
+        }
+        if (
+          bytes.byteLength > webSocketByteLimit - this.bufferedAmount ||
+          this._queue.length >= webSocketQueueLimit
+        )
+          throw new DOMException("WebSocket send queue is full", "QuotaExceededError");
+        this._queue.push({ bytes, binary });
+        this.bufferedAmount += bytes.byteLength;
+        this._pump();
       }
       close(code, reason = "") {
+        const numericCode = code === undefined ? 1000 : Number(code);
         if (
           code !== undefined &&
-          code !== 1000 &&
-          (Number(code) < 3000 || Number(code) > 4999)
+          (!Number.isInteger(numericCode) ||
+            (numericCode !== 1000 &&
+              (numericCode < 3000 || numericCode > 4999)))
         )
           throw new DOMException("Invalid WebSocket close code", "InvalidAccessError");
         if (new TextEncoder().encode(String(reason)).length > 123)
           throw new DOMException("WebSocket close reason is too long", "SyntaxError");
-        clearTimeout(this._task);
-        this.readyState = WebSocket.CLOSED;
+        if (this.readyState === WebSocket.CLOSED ||
+            this.readyState === WebSocket.CLOSING) return;
+        this.readyState = WebSocket.CLOSING;
+        this._closeRequest = { code: numericCode, reason: String(reason) };
+        this._pump();
       }
     }
     for (const [name, value] of Object.entries({
@@ -4048,6 +4149,271 @@
       Object.defineProperty(WebSocket.prototype, name, { value });
     }
     globalThis.WebSocket = WebSocket;
+    globalThis.__tilefinchDeliverWebSocket = (
+      id,
+      kind,
+      payload,
+      detail,
+      code,
+      clean,
+    ) => {
+      const socket = webSockets.get(Number(id));
+      if (!socket || socket.readyState === WebSocket.CLOSED) return false;
+      if (kind === "open") {
+        if (socket.readyState !== WebSocket.CONNECTING) return false;
+        socket.protocol = String(detail || "");
+        socket.readyState = WebSocket.OPEN;
+        socket._emit(new Event("open"));
+        socket._pump();
+      } else if (kind === "text" || kind === "binary") {
+        const buffer = payload instanceof ArrayBuffer
+          ? payload : new Uint8Array(payload).buffer;
+        let data;
+        if (kind === "text") data = new TextDecoder().decode(buffer);
+        else data = socket.binaryType === "arraybuffer"
+          ? buffer : new Blob([buffer]);
+        socket._emit(new MessageEvent("message", {
+          data,
+          origin: new URL(socket.url.replace(/^ws/, "http")).origin,
+          source: null,
+        }));
+      } else if (kind === "drain") {
+        const item = socket._queue.shift();
+        socket._sending = false;
+        if (item)
+          socket.bufferedAmount = Math.max(
+            0, socket.bufferedAmount - item.bytes.byteLength);
+        socket._pump();
+      } else {
+        socket._finish(Number(code), String(detail || ""), !!clean, !clean);
+      }
+      return true;
+    };
+  }
+  Object.defineProperty(navigator, "tilefinch", {
+    configurable: false,
+    enumerable: false,
+    value: Object.freeze({
+      requestPageControls(target = document.documentElement) {
+        if (!target || typeof target.requestFullscreen !== "function") {
+          return Promise.reject(new TypeError("Page controls need an element"));
+        }
+        return target.requestFullscreen();
+      },
+      pageControlsExitChord: "Start+Select",
+    }),
+  });
+  {
+    const channels = new Map(),
+      messageLimit = 512,
+      queueLimit = 8,
+      bufferedLimit = messageLimit * queueLimit;
+    const multiplayerEvent = (type, fields = {}) => {
+      const event = new Event(type);
+      for (const [name, value] of Object.entries(fields))
+        Object.defineProperty(event, name, {
+          value, enumerable: true, configurable: true,
+        });
+      return event;
+    };
+    class TilefinchMultiplayerChannel extends EventTarget {
+      constructor(mode, options, inviteCode = "") {
+        super();
+        options = options && typeof options === "object" ? options : {};
+        this.label = String(options.gameId || "").slice(0, 32);
+        this.protocol = "tilefinch-game-v1";
+        this.ordered = false;
+        this.maxPacketLifeTime = null;
+        this.maxRetransmits = 0;
+        this.negotiated = false;
+        this.id = null;
+        this.readyState = "connecting";
+        this.bufferedAmount = 0;
+        this.bufferedAmountLowThreshold = 0;
+        this.binaryType = "arraybuffer";
+        this.onopen = null;
+        this.onmessage = null;
+        this.onbufferedamountlow = null;
+        this.onclose = null;
+        this.onerror = null;
+        this.onstatus = null;
+        this.oninvitecode = null;
+        this.ondiscovered = null;
+        this.onpeerrequest = null;
+        this._queue = [];
+        this._sending = false;
+        this._closeRequest = null;
+        const name = String(options.name || "Player").slice(0, 24);
+        try {
+          this._nativeId = Number(__tilefinchMultiplayerStart(
+            String(mode), this.label, name, String(inviteCode || ""),
+          ));
+        } catch (_) {
+          this._nativeId = 0;
+        }
+        if (this._nativeId > 0) channels.set(this._nativeId, this);
+        else setTimeout(() => this._fail("multiplayer unavailable"), 0);
+      }
+      _emit(event) {
+        this.dispatchEvent(event);
+        const handler = this["on" + event.type];
+        if (typeof handler === "function")
+          globalThis.__tilefinchRunTask(
+            "multiplayer:" + String(event.type), handler, this, [event],
+          );
+      }
+      _fail(detail) {
+        if (this.readyState === "closed") return;
+        this._emit(multiplayerEvent("error", { detail: String(detail || "") }));
+        this._finish(1006, String(detail || ""), false);
+      }
+      _finish(code, reason, clean) {
+        if (this.readyState === "closed") return;
+        if (this._nativeId) channels.delete(this._nativeId);
+        this._nativeId = 0;
+        this.readyState = "closed";
+        this._queue.length = 0;
+        this.bufferedAmount = 0;
+        this._emit(new CloseEvent("close", {
+          code: Number(code) || 0,
+          reason: String(reason || ""),
+          wasClean: !!clean,
+        }));
+      }
+      _pump() {
+        if (!this._nativeId || this._sending || !this._queue.length) {
+          if (!this._sending && !this._queue.length && this._closeRequest
+              && this._nativeId) {
+            const close = this._closeRequest;
+            this._closeRequest = null;
+            if (!__tilefinchMultiplayerClose(
+                this._nativeId, close.code, close.reason))
+              this._fail("close admission failed");
+          }
+          return;
+        }
+        if (this.readyState !== "open" && this.readyState !== "closing")
+          return;
+        const item = this._queue[0];
+        if (__tilefinchMultiplayerSend(
+            this._nativeId, item.bytes.buffer, item.binary))
+          this._sending = true;
+      }
+      send(data) {
+        if (this.readyState !== "open")
+          throw new DOMException("Multiplayer channel is not open", "InvalidStateError");
+        let bytes, binary = true;
+        if (typeof data === "string") {
+          bytes = new TextEncoder().encode(data);
+          binary = false;
+        } else if (data instanceof ArrayBuffer) {
+          bytes = new Uint8Array(data.slice(0));
+        } else if (ArrayBuffer.isView(data)) {
+          bytes = new Uint8Array(
+            data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
+          );
+        } else {
+          throw new TypeError("Unsupported multiplayer message type");
+        }
+        if (bytes.byteLength > messageLimit)
+          throw new DOMException("Multiplayer message is too large", "QuotaExceededError");
+        if (this._queue.length >= queueLimit
+            || bytes.byteLength > bufferedLimit - this.bufferedAmount)
+          throw new DOMException("Multiplayer send queue is full", "QuotaExceededError");
+        this._queue.push({ bytes, binary });
+        this.bufferedAmount += bytes.byteLength;
+        this._pump();
+      }
+      accept(peerIdentity, accepted = true) {
+        if (!this._nativeId || this.readyState !== "connecting") return false;
+        return !!__tilefinchMultiplayerAccept(
+          this._nativeId, Number(peerIdentity) >>> 0, !!accepted,
+        );
+      }
+      addRemoteCode(code) {
+        if (!this._nativeId || this.readyState === "closed") return false;
+        return !!__tilefinchMultiplayerAddRemoteCode(
+          this._nativeId, String(code || ""),
+        );
+      }
+      close(code = 1000, reason = "") {
+        code = Number(code);
+        reason = String(reason);
+        if (!Number.isInteger(code)
+            || (code !== 1000 && (code < 3000 || code > 4999)))
+          throw new DOMException("Invalid close code", "InvalidAccessError");
+        if (new TextEncoder().encode(reason).length > 63)
+          throw new DOMException("Close reason is too long", "SyntaxError");
+        if (this.readyState === "closed" || this.readyState === "closing") return;
+        this.readyState = "closing";
+        this._closeRequest = { code, reason };
+        this._pump();
+      }
+    }
+    const openChannel = (mode, code, options) => {
+      options = options && typeof options === "object" ? options : {};
+      if (!String(options.gameId || ""))
+        throw new TypeError("gameId is required");
+      return new TilefinchMultiplayerChannel(mode, options, code);
+    };
+    Object.defineProperty(navigator, "tilefinchMultiplayer", {
+      configurable: false,
+      enumerable: false,
+      value: Object.freeze({
+        host(options) { return openChannel("host", "", options); },
+        join(code, options) { return openChannel("join", code, options); },
+        discover(options) { return openChannel("discover", "", options); },
+        supported: true,
+        maxMessageSize: messageLimit,
+      }),
+    });
+    globalThis.__tilefinchDeliverMultiplayer = (
+      id, kind, payload, detail, code, clean, peerIdentity, inviteCode, peerName,
+    ) => {
+      const channel = channels.get(Number(id));
+      if (!channel || channel.readyState === "closed") return false;
+      if (kind === "open") {
+        if (channel.readyState !== "connecting") return false;
+        channel.readyState = "open";
+        channel._emit(new Event("open"));
+        channel._pump();
+      } else if (kind === "binary" || kind === "text") {
+        const buffer = payload instanceof ArrayBuffer
+          ? payload : new Uint8Array(payload).buffer;
+        const data = kind === "text"
+          ? new TextDecoder().decode(buffer) : buffer;
+        channel._emit(new MessageEvent("message", {
+          data, origin: "", source: null,
+        }));
+      } else if (kind === "drain") {
+        const before = channel.bufferedAmount;
+        const item = channel._queue.shift();
+        channel._sending = false;
+        if (item) channel.bufferedAmount = Math.max(
+          0, channel.bufferedAmount - item.bytes.byteLength,
+        );
+        if (before > channel.bufferedAmountLowThreshold
+            && channel.bufferedAmount <= channel.bufferedAmountLowThreshold)
+          channel._emit(new Event("bufferedamountlow"));
+        channel._pump();
+      } else if (kind === "status") {
+        channel._emit(multiplayerEvent("status", { detail: String(detail || "") }));
+      } else if (kind === "invitecode") {
+        channel._emit(multiplayerEvent("invitecode", {
+          code: String(inviteCode || ""), detail: String(detail || ""),
+        }));
+      } else if (kind === "discovered" || kind === "peerrequest") {
+        channel._emit(multiplayerEvent(kind, {
+          peerIdentity: Number(peerIdentity) >>> 0,
+          code: String(inviteCode || ""),
+          name: String(peerName || ""),
+          detail: String(detail || ""),
+        }));
+      } else {
+        channel._finish(code, detail, clean);
+      }
+      return true;
+    };
   }
   class TilefinchXMLHttpRequest {
     constructor() {

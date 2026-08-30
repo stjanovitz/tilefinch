@@ -59,6 +59,8 @@ set(TILEFINCH_CORE_SOURCES
     src/media_file.c
     src/media_h264_psp_compat.c
     src/media_mp4.c
+    src/multiplayer.c
+    src/multiplayer_protocol.c
     src/omnibox.c
     src/offline_download.c
     src/offline_library.c

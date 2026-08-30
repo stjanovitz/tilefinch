@@ -37,6 +37,9 @@ media_emulator_unsupported=0
 media_emulator_missing_module=0
 admitted_height=
 youtube_test_url=${TILEFINCH_YOUTUBE_TEST_URL:-}
+host_aliases=${TILEFINCH_PPSSPP_HOST_ALIASES:-}
+trace_source=${TILEFINCH_PPSSPP_TRACE_DIRECTORY:-}
+trace_name=none
 
 usage() {
     printf '%s\n' \
@@ -51,6 +54,8 @@ usage() {
         "--startup-test runs the native HOME and background-WLAN cadence path for about 12 seconds." \
         "--media-stability-test runs two minutes of 360p playback and seeking." \
         "Live YouTube modes require TILEFINCH_YOUTUBE_TEST_URL; the public tree carries no real-video default." \
+        "TILEFINCH_PPSSPP_HOST_ALIASES may contain newline-separated host=IPv4 mappings when PPSSPP's isolated DNS cannot reach the Internet." \
+        "TILEFINCH_PPSSPP_TRACE_DIRECTORY replays a captured live session inside PPSSPP instead of using its network emulation." \
         "--media-fixture-test runs deterministic embedded 240p/360p decoder qualification." \
         "--raster-fixture-test checks the PSP page/font raster and saves its atlas." \
         "--ge-present-probe draws synthetic video frames through the graphics engine and checks the pixels." \
@@ -196,6 +201,19 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+if [ -n "$trace_source" ]; then
+    case "$trace_source" in
+        /*) ;;
+        *) trace_source="$root/$trace_source" ;;
+    esac
+    [ -f "$trace_source/trace.meta" ] || {
+        printf 'invalid PPSSPP replay trace: %s\n' "$trace_source" >&2
+        exit 2
+    }
+    trace_name=replay
+    expect_network=replay
+fi
 
 if [ "$build" -eq 1 ] && [ "$build_dir_overridden" -eq 0 ]; then
     # Keep the ordinary PSP build and its user-facing EBOOT quiet. Validation
@@ -419,8 +437,15 @@ fi
 ppsspp_launchservices=0
 ppsspp_bundle=
 ppsspp_bundle_source=
-if [ "$(uname -s)" = Darwin ] \
-    && [ "${PPSSPP_LAUNCHSERVICES:-1}" != 0 ]; then
+is_darwin=0
+[ "$(uname -s)" = Darwin ] && is_darwin=1
+if [ "$is_darwin" -eq 1 ] && [ "${PPSSPP_LAUNCHSERVICES:-1}" = 0 ]; then
+    printf '%s\n' \
+        "Direct PPSSPP launch is unsafe on macOS." \
+        "Remove PPSSPP_LAUNCHSERVICES=0 and allow LaunchServices instead." >&2
+    exit 2
+fi
+if [ "$is_darwin" -eq 1 ]; then
     ppsspp_real=$(realpath "$ppsspp" 2>/dev/null || printf '%s' "$ppsspp")
     case "$ppsspp_real" in
         *.app/Contents/MacOS/*)
@@ -485,8 +510,7 @@ run_dir=$(mktemp -d "${run_base%/}/tilefinch-ppsspp-network.XXXXXX")
 # outside the Homebrew prefix. That invalidates the bundle seal, so
 # LaunchServices reports a misleading "executable is missing" error. Repair a
 # disposable copy for this run; never mutate the installed emulator.
-if [ "$(uname -s)" = Darwin ] \
-    && [ "${PPSSPP_LAUNCHSERVICES:-1}" != 0 ] \
+if [ "$is_darwin" -eq 1 ] \
     && [ "$ppsspp_launchservices" -eq 0 ] \
     && [ -n "$ppsspp_bundle_source" ]; then
     fixed_bundle="$run_dir/PPSSPPSDL.app"
@@ -538,8 +562,7 @@ if [ "$(uname -s)" = Darwin ] \
         exit 2
     fi
 fi
-if [ "$(uname -s)" = Darwin ] \
-    && [ "${PPSSPP_LAUNCHSERVICES:-1}" != 0 ] \
+if [ "$is_darwin" -eq 1 ] \
     && [ "$ppsspp_launchservices" -ne 1 ]; then
     printf '%s\n' \
         "No safe LaunchServices PPSSPP bundle is available." \
@@ -576,6 +599,9 @@ else
     config_path="$app_dir/boot.cfg"
     validation_log="$app_dir/tilefinch-validation.txt"
 fi
+if [ -n "$trace_source" ]; then
+    cp -R "$trace_source" "$app_dir/$trace_name"
+fi
 
 # An opt-in release qualification can stage signed optional components into
 # this run's isolated Memory Stick. The source directory is produced by the
@@ -609,7 +635,7 @@ fi
     printf '%s\n' \
         "# Generated only for the isolated PPSSPP network smoke test." \
         "url=$url" \
-        "trace=none" \
+        "trace=$trace_name" \
         "profile=realistic" \
         "network_profile=1" \
         "ticks=0" \
@@ -698,6 +724,29 @@ fi
 cp "$run_dir/network.ini" \
     "$home_dir/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
 
+# PPSSPP exposes HostAliases specifically as a local DNS database. It is a
+# useful acceptance seam on hosts where the emulator's raw UDP DNS path is
+# unavailable: HTTPS still connects live and verifies the authored hostname.
+# HostAliases is not a normal ConfigSetting, so it must be present in the base
+# INI before startup rather than only in --appendconfig. Keep the input narrow.
+if [ -n "$host_aliases" ]; then
+    while IFS= read -r alias; do
+        [ -n "$alias" ] || continue
+        case "$alias" in
+            *[!A-Za-z0-9._=-]*|*=*=*|=*|*=)
+                printf 'invalid PPSSPP host alias: %s\n' "$alias" >&2
+                exit 2
+                ;;
+        esac
+    done <<EOF
+$host_aliases
+EOF
+    {
+        printf '%s\n' '[HostAliases]'
+        printf '%s\n' "$host_aliases"
+    } >>"$home_dir/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
+fi
+
 stop_emulator() {
     if [ -n "${emulator_pid:-}" ] \
         && kill -0 "$emulator_pid" 2>/dev/null; then
@@ -736,12 +785,12 @@ start_emulator() {
     # a directly supplied homebrew PBP through its ISO loader on macOS.
     launch_target=$app_dir
     # shellcheck disable=SC2086
-    if [ "$ppsspp_launchservices" -eq 1 ]; then
+    if [ "$is_darwin" -eq 1 ]; then
         # On current macOS, directly exec'ing the SDL app from another GUI
         # application's process coalition can abort inside RegisterApplication
         # before PPSSPP reaches PSP code. LaunchServices establishes the normal
         # Cocoa application context while --env preserves the isolated PSP home.
-        open -n -W \
+        open -g -n -W \
             --env "HOME=$home_dir" \
             --stdout "$emulator_stdout" \
             --stderr "$emulator_stderr" \
@@ -966,6 +1015,14 @@ elif [ "$expect_network" = csc-order ]; then
 elif [ "$expect_network" = ready ]; then
     if ! grep -q 'tilefinch-network: status=ready' "$validation"; then
         printf 'PSP network did not reach ready; see %s\n' "$validation" >&2
+        exit 1
+    fi
+elif [ "$expect_network" = replay ]; then
+    if ! grep -q \
+        'tilefinch-boot-order: .*trace=1' \
+        "$validation"; then
+        printf 'Captured-session replay did not use the trace path; see %s\n' \
+            "$validation" >&2
         exit 1
     fi
 else

@@ -1,0 +1,13 @@
+{
+  "name": "Treadline Arena",
+  "short_name": "Treadline",
+  "description": "A compact third-person 3D tank arena built for Tilefinch.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "fullscreen",
+  "theme_color": "#102b38",
+  "background_color": "#03080b",
+  "icons": [
+    {"src": "icon.svg", "sizes": "96x96"}
+  ]
+}

@@ -41,6 +41,7 @@ int main(void)
     psp_boot_config_defaults(&config);
     CHECK(config.limit_mb == 32);
     CHECK(config.heap_mb == 5);
+    CHECK(config.file_kb == 384);
     CHECK(config.css_width == 480);
     CHECK(config.network_profile == 1);
     CHECK(config.validation_media_stability_seconds == 120);

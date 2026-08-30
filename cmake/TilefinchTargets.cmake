@@ -130,7 +130,8 @@ target_compile_definitions(tilefinch_psp_app_support PRIVATE
 target_link_libraries(psp-browser-interactive-lab PRIVATE tilefinch_psp_ui)
 if(PSP AND TILEFINCH_PSP_VALIDATION_LOG)
     target_compile_definitions(tilefinch_psp_ui PRIVATE
-        TILEFINCH_PSP_POWER_TEST_MENU=1)
+        TILEFINCH_PSP_POWER_TEST_MENU=1
+        TILEFINCH_PSP_UI_TIMING=1)
 endif()
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(tilefinch_psp_ui PRIVATE
@@ -490,6 +491,7 @@ if(PSP)
         if(NOT PSP_BROWSER_CURL_STUB)
             target_sources(psp-browser-script PRIVATE
                 src/psp_network.c
+                src/psp_multiplayer.c
                 src/psp_time.c)
             target_compile_definitions(psp-browser-script PRIVATE
                 TILEFINCH_PSP_LIVE_NETWORK=1)
@@ -539,7 +541,11 @@ if(PSP)
             # old ICON0 unless the link itself depends on the asset.
             "${CMAKE_CURRENT_SOURCE_DIR}/psp-assets/tilefinch-icon0-144x82.png")
         if(TILEFINCH_PSP_VALIDATION_LOG)
-            set(TILEFINCH_PSP_TEXT_LIMIT 4460000)
+            # Native game-audio envelopes keep attack/release progress on the
+            # mixer thread while JavaScript stalls. Keep validation probes
+            # out of the shipping ratchet while allowing measured device-only
+            # instrumentation to grow without code-golfing production paths.
+            set(TILEFINCH_PSP_TEXT_LIMIT 4500000)
         else()
             set(TILEFINCH_PSP_TEXT_LIMIT 4435000)
         endif()
@@ -725,7 +731,42 @@ if(PSP)
             # Ordering, not just object freshness: the browser's ratchets are
             # POST_BUILD steps, so the developer module is not produced by a
             # build whose shipping ELF failed one.
-            add_dependencies(psp-browser-script-dev-prx psp-browser-script)
+            # Runtime assets are inputs to a host0: PRX run, not incidental
+            # leftovers from whichever EBOOT happened to link most recently.
+            # A POST_BUILD copy on psp-browser-script alone does not repair a
+            # manually-cleaned roots.pem when the ELF itself is up to date,
+            # which made otherwise identical PSPLink starts fail at random.
+            add_custom_target(psp-browser-script-dev-assets
+                COMMAND ${CMAKE_COMMAND} -E make_directory
+                    "${CMAKE_CURRENT_BINARY_DIR}/fonts"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${PSP_BROWSER_PSP_SANS_FONT}"
+                    "${PSP_BROWSER_PSP_SERIF_FONT}"
+                    "${PSP_BROWSER_SANS_ITALIC_FONT}"
+                    "${PSP_BROWSER_SANS_BOLD_FONT}"
+                    "${PSP_BROWSER_SERIF_BOLD_FONT}"
+                    "${PSP_BROWSER_METRIC_SANS_FONT}"
+                    "${PSP_BROWSER_METRIC_SANS_BOLD_FONT}"
+                    "${CMAKE_CURRENT_BINARY_DIR}/fonts"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${CMAKE_CURRENT_SOURCE_DIR}/psp-assets/boot-live.cfg"
+                    "${CMAKE_CURRENT_BINARY_DIR}/boot-defaults.cfg"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${PSP_BROWSER_PSP_CA_BUNDLE}"
+                    "${CMAKE_CURRENT_BINARY_DIR}/roots.pem"
+                DEPENDS
+                    "${PSP_BROWSER_PSP_SANS_FONT}"
+                    "${PSP_BROWSER_PSP_SERIF_FONT}"
+                    "${PSP_BROWSER_SANS_ITALIC_FONT}"
+                    "${PSP_BROWSER_SANS_BOLD_FONT}"
+                    "${PSP_BROWSER_SERIF_BOLD_FONT}"
+                    "${PSP_BROWSER_METRIC_SANS_FONT}"
+                    "${PSP_BROWSER_METRIC_SANS_BOLD_FONT}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/psp-assets/boot-live.cfg"
+                    "${PSP_BROWSER_PSP_CA_BUNDLE}"
+                COMMENT "Staging required host0 browser assets")
+            add_dependencies(psp-browser-script-dev-prx
+                psp-browser-script psp-browser-script-dev-assets)
             # The same libraries in the same order as psp-browser-script
             # above, under the same conditions. Deliberately restated rather
             # than shared through a variable: the EBOOT's link line is the one

@@ -8,6 +8,19 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.14 — 2026-08-30
+
+- Added Treadline Arena, an installable 3D tank game with Arcade and Classic
+  controls, aim assist, Onslaught mode, and shareable generated arenas.
+- Added direct multiplayer support for compatible games, with PSP LAN
+  discovery and numeric invites plus service-free pairing in ordinary browsers.
+- Improved WebGL and Canvas game speed, input response, frame pacing, audio,
+  visual stability, and installed-game startup.
+- Improved complex and long-page browsing by preserving useful page content
+  when scripts fail and offering contextual recovery through Basic view.
+- Made Reader mode more reliable and useful for text, links, images, captions,
+  tables, and code, with better position preservation when switching views.
+
 ## 0.1.13 — 2026-08-26
 
 - Added selectable Midnight, light, and custom RGB565 themes, with a visual

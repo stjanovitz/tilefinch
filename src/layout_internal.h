@@ -774,7 +774,10 @@ bool add_node_box(LayoutDocument *layout, lxb_dom_node_t *node, int x, int y,
                   size_t control_start, size_t control_end);
 LayoutNodeBox *layout_box_for_node_mutable(
     LayoutDocument *layout, const lxb_dom_node_t *node);
-bool add_sticky_range(LayoutDocument *layout, size_t start, size_t end, int origin_y, int top);
+bool add_sticky_range(LayoutDocument *layout, size_t start, size_t end,
+                      int origin_y, int top, int bottom_y);
+void layout_bound_sticky_ranges(LayoutDocument *layout, size_t start,
+                                size_t end, int containing_bottom);
 bool attribute_is(lxb_dom_node_t *node, const char *name, const char *wanted);
 bool layout_node_is_hidden_input(lxb_dom_node_t *node);
 bool build_paint_order(LayoutDocument *layout, LayoutContext *context);

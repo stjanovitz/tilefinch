@@ -6,6 +6,7 @@
 #include "js_runtime_internal.h"
 
 #include "tilefinch/content_blocker.h"
+#include "tilefinch/multiplayer.h"
 #include "tilefinch/platform.h"
 
 #include <stdio.h>
@@ -1417,6 +1418,504 @@ bool js_rt_event_sources_deliver(ScriptRuntime *runtime,
     return true;
 }
 
+static JSValue js_websocket_start(JSContext *context,
+                                  JSValueConst this_value,
+                                  int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->document == NULL || argc < 1)
+        return JS_ThrowTypeError(context, "WebSocket requires a URL");
+    size_t url_length = 0, protocols_length = 0;
+    const char *url = JS_ToCStringLen(context, &url_length, argv[0]);
+    const char *protocols = argc > 1 && !JS_IsUndefined(argv[1])
+        ? JS_ToCStringLen(context, &protocols_length, argv[1]) : NULL;
+    bool valid = url != NULL && strlen(url) == url_length
+        && url_length < TILEFINCH_URL_SERIALIZED_LIMIT
+        && bridge->websocket_count < SCRIPT_WEBSOCKET_LIMIT
+        && (protocols == NULL
+            || (strlen(protocols) == protocols_length
+                && protocols_length < FETCH_WEBSOCKET_PROTOCOLS_LIMIT));
+    char policy_url[TILEFINCH_URL_SERIALIZED_LIMIT] = {0};
+    if (valid && strncasecmp(url, "wss://", 6u) == 0) {
+        int written = snprintf(
+            policy_url, sizeof(policy_url), "https%s", url + 3u);
+        valid = written > 0 && (size_t) written < sizeof(policy_url);
+    } else if (valid && strncasecmp(url, "ws://", 5u) == 0) {
+        int written = snprintf(
+            policy_url, sizeof(policy_url), "http%s", url + 2u);
+        valid = written > 0 && (size_t) written < sizeof(policy_url);
+    } else {
+        valid = false;
+    }
+    ScriptWebSocket *socket = NULL;
+    for (size_t i = 0; valid && i < SCRIPT_WEBSOCKET_LIMIT; i++) {
+        if (!bridge->websockets[i].active) {
+            socket = &bridge->websockets[i];
+            break;
+        }
+    }
+    ScriptRequestPolicy policy;
+    valid = valid && socket != NULL
+        && script_request_policy_prepare(
+            bridge, policy_url, "GET", TILEFINCH_REQUEST_MODE_CORS,
+            TILEFINCH_CREDENTIALS_INCLUDE, TILEFINCH_DESTINATION_FETCH,
+            true, &policy);
+    FetchRequest request = {
+        .method = "GET",
+        .allow_http_errors = true,
+        .send_low_client_hints = true,
+        .enforce_cors = false,
+        .redirect_same_origin_only = true
+    };
+    FetchPreparedPageRequest prepared;
+    if (valid) {
+        const FetchRequest *authorized = script_request_policy_apply(
+            &policy, bridge->session, &request, &prepared);
+        if (authorized != NULL) request = *authorized;
+        valid = authorized != NULL;
+    }
+    bool allocated_scratch = false;
+    if (valid && bridge->websocket_event_scratch == NULL) {
+        bridge->websocket_event_scratch = budget_malloc_category(
+            bridge->budget, BUDGET_CATEGORY_JAVASCRIPT,
+            FETCH_WEBSOCKET_MESSAGE_LIMIT);
+        allocated_scratch = bridge->websocket_event_scratch != NULL;
+        valid = allocated_scratch;
+    }
+    uint64_t id = valid ? fetch_background_websocket_open(
+        bridge->budget, url, &request, protocols,
+        bridge->fetch_timeout_ms < 30000
+            ? 30000 : (long) bridge->fetch_timeout_ms) : 0;
+    if (id != 0) {
+        *socket = (ScriptWebSocket) { .active = true, .id = id };
+        bridge->websocket_count++;
+        if (bridge->result != NULL) {
+            bridge->result->network_requests++;
+            bridge->result->async_network_queued++;
+        }
+    } else if (allocated_scratch && bridge->websocket_count == 0) {
+        budget_free(bridge->budget, bridge->websocket_event_scratch);
+        bridge->websocket_event_scratch = NULL;
+    }
+    if (url != NULL) JS_FreeCString(context, url);
+    if (protocols != NULL) JS_FreeCString(context, protocols);
+    return JS_NewInt64(context, (int64_t) id);
+}
+
+static ScriptWebSocket *script_websocket_find(
+    DomBridge *bridge, uint64_t id)
+{
+    if (bridge == NULL || id == 0) return NULL;
+    for (size_t i = 0; i < SCRIPT_WEBSOCKET_LIMIT; i++) {
+        ScriptWebSocket *socket = &bridge->websockets[i];
+        if (socket->active && socket->id == id) return socket;
+    }
+    return NULL;
+}
+
+static JSValue js_websocket_send(JSContext *context,
+                                 JSValueConst this_value,
+                                 int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t id = 0;
+    size_t length = 0;
+    uint8_t *bytes = NULL;
+    bool binary = false;
+    if (bridge == NULL || argc < 3
+        || JS_ToInt64(context, &id, argv[0]) < 0)
+        return JS_EXCEPTION;
+    bytes = JS_GetArrayBuffer(context, &length, argv[1]);
+    int binary_value = JS_ToBool(context, argv[2]);
+    if (bytes == NULL || binary_value < 0) return JS_EXCEPTION;
+    binary = binary_value > 0;
+    ScriptWebSocket *socket = script_websocket_find(
+        bridge, (uint64_t) id);
+    return socket != NULL && fetch_background_websocket_send(
+               socket->id, bytes, length, binary)
+        ? JS_TRUE : JS_FALSE;
+}
+
+static JSValue js_websocket_close(JSContext *context,
+                                  JSValueConst this_value,
+                                  int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t id = 0;
+    int32_t code = 1000;
+    size_t reason_length = 0;
+    if (bridge == NULL || argc < 1
+        || JS_ToInt64(context, &id, argv[0]) < 0
+        || (argc > 1 && JS_ToInt32(context, &code, argv[1]) < 0))
+        return JS_EXCEPTION;
+    const char *reason = argc > 2
+        ? JS_ToCStringLen(context, &reason_length, argv[2]) : NULL;
+    if (argc > 2 && reason == NULL) return JS_EXCEPTION;
+    ScriptWebSocket *socket = script_websocket_find(
+        bridge, (uint64_t) id);
+    bool closed = socket != NULL
+        && code >= 0 && code <= UINT16_MAX
+        && (reason == NULL || strlen(reason) == reason_length)
+        && reason_length <= FETCH_WEBSOCKET_CLOSE_REASON_LIMIT
+        && fetch_background_websocket_close(
+            socket->id, (uint16_t) code, reason == NULL ? "" : reason);
+    if (reason != NULL) JS_FreeCString(context, reason);
+    return closed ? JS_TRUE : JS_FALSE;
+}
+
+void js_rt_websockets_destroy(DomBridge *bridge)
+{
+    if (bridge == NULL) return;
+    for (size_t i = 0; i < SCRIPT_WEBSOCKET_LIMIT; i++) {
+        ScriptWebSocket *socket = &bridge->websockets[i];
+        if (socket->active)
+            (void) fetch_background_websocket_cancel(socket->id);
+        *socket = (ScriptWebSocket) {0};
+    }
+    bridge->websocket_count = 0;
+    budget_free(bridge->budget, bridge->websocket_event_scratch);
+    bridge->websocket_event_scratch = NULL;
+}
+
+size_t js_rt_websockets_abort(DomBridge *bridge)
+{
+    if (bridge == NULL) return 0;
+    size_t aborted = 0;
+    for (size_t i = 0; i < SCRIPT_WEBSOCKET_LIMIT; i++) {
+        ScriptWebSocket *socket = &bridge->websockets[i];
+        if (socket->active
+            && fetch_background_websocket_abort(socket->id)) aborted++;
+    }
+    return aborted;
+}
+
+bool js_rt_websockets_deliver(ScriptRuntime *runtime,
+                              size_t completion_budget,
+                              size_t *author_tasks)
+{
+    if (runtime == NULL || completion_budget == 0) return true;
+    DomBridge *bridge = &runtime->bridge;
+    for (size_t i = 0; i < SCRIPT_WEBSOCKET_LIMIT; i++) {
+        ScriptWebSocket *socket = &bridge->websockets[i];
+        if (!socket->active) continue;
+        if (bridge->websocket_event_scratch == NULL) return false;
+        FetchWebSocketEvent event;
+        if (!fetch_background_websocket_take_event(
+                socket->id, bridge->websocket_event_scratch,
+                FETCH_WEBSOCKET_MESSAGE_LIMIT, &event)) continue;
+        const char *kind = "close";
+        if (event.kind == FETCH_WEBSOCKET_EVENT_OPEN) kind = "open";
+        else if (event.kind == FETCH_WEBSOCKET_EVENT_MESSAGE_TEXT)
+            kind = "text";
+        else if (event.kind == FETCH_WEBSOCKET_EVENT_MESSAGE_BINARY)
+            kind = "binary";
+        else if (event.kind == FETCH_WEBSOCKET_EVENT_DRAIN) kind = "drain";
+        JSValue payload = JS_UNDEFINED;
+        if (event.kind == FETCH_WEBSOCKET_EVENT_MESSAGE_TEXT
+            || event.kind == FETCH_WEBSOCKET_EVENT_MESSAGE_BINARY) {
+            payload = JS_NewArrayBufferCopy(
+                runtime->context, bridge->websocket_event_scratch,
+                event.length);
+        } else if (event.kind == FETCH_WEBSOCKET_EVENT_DRAIN) {
+            payload = JS_NewInt64(
+                runtime->context, (int64_t) event.sent_bytes);
+        }
+        if (JS_IsException(payload)) {
+            (void) fetch_background_websocket_cancel(socket->id);
+            *socket = (ScriptWebSocket) {0};
+            if (bridge->websocket_count != 0) bridge->websocket_count--;
+            return false;
+        }
+        JSValue arguments[6] = {
+            JS_NewInt64(runtime->context, (int64_t) socket->id),
+            JS_NewString(runtime->context, kind),
+            payload,
+            event.kind == FETCH_WEBSOCKET_EVENT_OPEN
+                ? JS_NewString(runtime->context, event.protocol)
+                : JS_NewStringLen(runtime->context, event.reason,
+                                  event.reason_length),
+            JS_NewInt32(runtime->context, (int32_t) event.close_code),
+            JS_NewBool(runtime->context, event.was_clean)
+        };
+        bool delivered = script_call_global(
+            runtime, "__tilefinchDeliverWebSocket", 6, arguments);
+        for (size_t value = 0; value < 6; value++)
+            JS_FreeValue(runtime->context, arguments[value]);
+        if (event.kind == FETCH_WEBSOCKET_EVENT_CLOSE) {
+            *socket = (ScriptWebSocket) {0};
+            if (bridge->websocket_count != 0) bridge->websocket_count--;
+            if (bridge->websocket_count == 0) {
+                budget_free(
+                    bridge->budget, bridge->websocket_event_scratch);
+                bridge->websocket_event_scratch = NULL;
+            }
+            if (bridge->result != NULL) {
+                bridge->result->async_network_completed++;
+                if (!event.was_clean) bridge->result->network_failures++;
+            }
+        }
+        if (!delivered) return false;
+        if (author_tasks != NULL) (*author_tasks)++;
+        return true;
+    }
+    return true;
+}
+
+static bool multiplayer_document_allowed(const DomBridge *bridge)
+{
+    static const char prefix[] = "https://tilefinch.local/offline/app?";
+    return bridge != NULL && bridge->document != NULL
+        && bridge->document_url != NULL
+        && strncmp(bridge->document_url, prefix, sizeof(prefix) - 1u) == 0;
+}
+
+static JSValue js_multiplayer_start(JSContext *context,
+                                    JSValueConst this_value,
+                                    int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || argc < 3)
+        return JS_ThrowTypeError(context, "multiplayer start requires mode, game and peer");
+    size_t mode_length = 0, game_length = 0, peer_length = 0;
+    size_t code_length = 0;
+    const char *mode = JS_ToCStringLen(context, &mode_length, argv[0]);
+    const char *game = JS_ToCStringLen(context, &game_length, argv[1]);
+    const char *peer = JS_ToCStringLen(context, &peer_length, argv[2]);
+    const char *code = argc > 3 && !JS_IsUndefined(argv[3])
+        ? JS_ToCStringLen(context, &code_length, argv[3]) : NULL;
+    if (mode == NULL || game == NULL || peer == NULL
+        || (argc > 3 && !JS_IsUndefined(argv[3]) && code == NULL)) {
+        if (mode != NULL) JS_FreeCString(context, mode);
+        if (game != NULL) JS_FreeCString(context, game);
+        if (peer != NULL) JS_FreeCString(context, peer);
+        if (code != NULL) JS_FreeCString(context, code);
+        return JS_EXCEPTION;
+    }
+    TilefinchMultiplayerMode parsed_mode = 0;
+    if (mode_length == 4u && memcmp(mode, "host", 4u) == 0)
+        parsed_mode = TILEFINCH_MULTIPLAYER_MODE_HOST;
+    else if (mode_length == 4u && memcmp(mode, "join", 4u) == 0)
+        parsed_mode = TILEFINCH_MULTIPLAYER_MODE_JOIN;
+    else if (mode_length == 8u && memcmp(mode, "discover", 8u) == 0)
+        parsed_mode = TILEFINCH_MULTIPLAYER_MODE_DISCOVER;
+    bool valid = parsed_mode != 0
+        && multiplayer_document_allowed(bridge)
+        && bridge->user_activation_active
+        && !bridge->multiplayer.active
+        && game_length <= TILEFINCH_MULTIPLAYER_GAME_ID_LIMIT
+        && peer_length <= TILEFINCH_MULTIPLAYER_PEER_NAME_LIMIT
+        && code_length <= TILEFINCH_MULTIPLAYER_INVITE_CODE_LIMIT
+        && strlen(game) == game_length && strlen(peer) == peer_length
+        && (code == NULL || strlen(code) == code_length);
+    TilefinchMultiplayerRequest request = { .mode = parsed_mode };
+    if (valid) {
+        memcpy(request.game_id, game, game_length);
+        request.game_id[game_length] = '\0';
+        memcpy(request.peer_name, peer, peer_length);
+        request.peer_name[peer_length] = '\0';
+        if (code != NULL) {
+            memcpy(request.invite_code, code, code_length);
+            request.invite_code[code_length] = '\0';
+        }
+    }
+    bool allocated_scratch = false;
+    if (valid && bridge->multiplayer_event_scratch == NULL) {
+        bridge->multiplayer_event_scratch = budget_malloc_category(
+            bridge->budget, BUDGET_CATEGORY_JAVASCRIPT,
+            TILEFINCH_MULTIPLAYER_MESSAGE_LIMIT);
+        allocated_scratch = bridge->multiplayer_event_scratch != NULL;
+        valid = allocated_scratch;
+    }
+    uint64_t id = valid
+        ? tilefinch_multiplayer_open(bridge->budget, &request) : 0;
+    if (id != 0) {
+        bridge->multiplayer = (ScriptMultiplayer) {
+            .active = true, .id = id
+        };
+        if (bridge->result != NULL) {
+            bridge->result->network_requests++;
+            bridge->result->async_network_queued++;
+        }
+    } else if (allocated_scratch) {
+        budget_free(bridge->budget, bridge->multiplayer_event_scratch);
+        bridge->multiplayer_event_scratch = NULL;
+    }
+    JS_FreeCString(context, mode);
+    JS_FreeCString(context, game);
+    JS_FreeCString(context, peer);
+    if (code != NULL) JS_FreeCString(context, code);
+    return JS_NewInt64(context, (int64_t) id);
+}
+
+static JSValue js_multiplayer_send(JSContext *context,
+                                   JSValueConst this_value,
+                                   int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t id = 0;
+    size_t length = 0;
+    if (bridge == NULL || argc < 3
+        || JS_ToInt64(context, &id, argv[0]) < 0) return JS_EXCEPTION;
+    uint8_t *bytes = JS_GetArrayBuffer(context, &length, argv[1]);
+    int binary = JS_ToBool(context, argv[2]);
+    if (bytes == NULL || binary < 0) return JS_EXCEPTION;
+    return bridge->multiplayer.active
+        && bridge->multiplayer.id == (uint64_t) id
+        && tilefinch_multiplayer_send(
+               (uint64_t) id, bytes, length, binary != 0)
+        ? JS_TRUE : JS_FALSE;
+}
+
+static JSValue js_multiplayer_accept(JSContext *context,
+                                     JSValueConst this_value,
+                                     int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t id = 0;
+    uint32_t peer = 0;
+    if (bridge == NULL || argc < 3
+        || JS_ToInt64(context, &id, argv[0]) < 0
+        || JS_ToUint32(context, &peer, argv[1]) < 0) return JS_EXCEPTION;
+    int accepted = JS_ToBool(context, argv[2]);
+    if (accepted < 0) return JS_EXCEPTION;
+    return bridge->multiplayer.active
+        && bridge->multiplayer.id == (uint64_t) id
+        && tilefinch_multiplayer_accept(
+               (uint64_t) id, peer, accepted != 0)
+        ? JS_TRUE : JS_FALSE;
+}
+
+static JSValue js_multiplayer_add_remote_code(
+    JSContext *context, JSValueConst this_value,
+    int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t id = 0;
+    size_t length = 0;
+    if (bridge == NULL || argc < 2
+        || JS_ToInt64(context, &id, argv[0]) < 0) return JS_EXCEPTION;
+    const char *code = JS_ToCStringLen(context, &length, argv[1]);
+    if (code == NULL) return JS_EXCEPTION;
+    bool added = bridge->multiplayer.active
+        && bridge->multiplayer.id == (uint64_t) id
+        && length <= TILEFINCH_MULTIPLAYER_INVITE_CODE_LIMIT
+        && strlen(code) == length
+        && tilefinch_multiplayer_add_remote_code((uint64_t) id, code);
+    JS_FreeCString(context, code);
+    return added ? JS_TRUE : JS_FALSE;
+}
+
+static JSValue js_multiplayer_close(JSContext *context,
+                                    JSValueConst this_value,
+                                    int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t id = 0;
+    int32_t code = 1000;
+    size_t length = 0;
+    if (bridge == NULL || argc < 1
+        || JS_ToInt64(context, &id, argv[0]) < 0
+        || (argc > 1 && JS_ToInt32(context, &code, argv[1]) < 0))
+        return JS_EXCEPTION;
+    const char *reason = argc > 2
+        ? JS_ToCStringLen(context, &length, argv[2]) : NULL;
+    if (argc > 2 && reason == NULL) return JS_EXCEPTION;
+    bool closed = bridge->multiplayer.active
+        && bridge->multiplayer.id == (uint64_t) id
+        && code >= 0 && code <= UINT16_MAX && length <= 63u
+        && (reason == NULL || strlen(reason) == length)
+        && tilefinch_multiplayer_close(
+               (uint64_t) id, (uint16_t) code,
+               reason == NULL ? "" : reason);
+    if (reason != NULL) JS_FreeCString(context, reason);
+    return closed ? JS_TRUE : JS_FALSE;
+}
+
+void js_rt_multiplayer_destroy(DomBridge *bridge)
+{
+    if (bridge == NULL) return;
+    if (bridge->multiplayer.active)
+        (void) tilefinch_multiplayer_cancel(bridge->multiplayer.id);
+    bridge->multiplayer = (ScriptMultiplayer) {0};
+    budget_free(bridge->budget, bridge->multiplayer_event_scratch);
+    bridge->multiplayer_event_scratch = NULL;
+}
+
+size_t js_rt_multiplayer_abort(DomBridge *bridge)
+{
+    if (bridge == NULL || !bridge->multiplayer.active) return 0;
+    return tilefinch_multiplayer_close(
+        bridge->multiplayer.id, 1001u, "navigation") ? 1u : 0u;
+}
+
+bool js_rt_multiplayer_deliver(ScriptRuntime *runtime,
+                               size_t completion_budget,
+                               size_t *author_tasks)
+{
+    if (runtime == NULL || completion_budget == 0) return true;
+    DomBridge *bridge = &runtime->bridge;
+    if (!bridge->multiplayer.active) return true;
+    if (bridge->multiplayer_event_scratch == NULL) return false;
+    TilefinchMultiplayerEvent event = {0};
+    if (!tilefinch_multiplayer_take_event(
+            bridge->multiplayer.id, bridge->multiplayer_event_scratch,
+            TILEFINCH_MULTIPLAYER_MESSAGE_LIMIT, &event)) return true;
+    const char *kind = "close";
+    if (event.kind == TILEFINCH_MULTIPLAYER_EVENT_STATUS) kind = "status";
+    else if (event.kind == TILEFINCH_MULTIPLAYER_EVENT_INVITE_CODE)
+        kind = "invitecode";
+    else if (event.kind == TILEFINCH_MULTIPLAYER_EVENT_DISCOVERED)
+        kind = "discovered";
+    else if (event.kind == TILEFINCH_MULTIPLAYER_EVENT_PEER_REQUEST)
+        kind = "peerrequest";
+    else if (event.kind == TILEFINCH_MULTIPLAYER_EVENT_OPEN) kind = "open";
+    else if (event.kind == TILEFINCH_MULTIPLAYER_EVENT_MESSAGE)
+        kind = event.binary ? "binary" : "text";
+    else if (event.kind == TILEFINCH_MULTIPLAYER_EVENT_DRAIN) kind = "drain";
+    JSValue payload = JS_UNDEFINED;
+    if (event.kind == TILEFINCH_MULTIPLAYER_EVENT_MESSAGE) {
+        payload = JS_NewArrayBufferCopy(
+            runtime->context, bridge->multiplayer_event_scratch, event.length);
+    } else if (event.kind == TILEFINCH_MULTIPLAYER_EVENT_DRAIN) {
+        payload = JS_NewInt64(runtime->context, (int64_t) event.sent_bytes);
+    }
+    if (JS_IsException(payload)) return false;
+    JSValue arguments[9] = {
+        JS_NewInt64(runtime->context, (int64_t) bridge->multiplayer.id),
+        JS_NewString(runtime->context, kind), payload,
+        JS_NewString(runtime->context, event.detail),
+        JS_NewInt32(runtime->context, (int32_t) event.close_code),
+        JS_NewBool(runtime->context, event.clean),
+        JS_NewInt64(runtime->context, (int64_t) event.peer_identity),
+        JS_NewString(runtime->context, event.invite_code),
+        JS_NewString(runtime->context, event.peer_name)
+    };
+    bool delivered = script_call_global(
+        runtime, "__tilefinchDeliverMultiplayer", 9, arguments);
+    for (size_t at = 0; at < 9u; at++)
+        JS_FreeValue(runtime->context, arguments[at]);
+    if (event.kind == TILEFINCH_MULTIPLAYER_EVENT_CLOSE) {
+        bridge->multiplayer = (ScriptMultiplayer) {0};
+        budget_free(bridge->budget, bridge->multiplayer_event_scratch);
+        bridge->multiplayer_event_scratch = NULL;
+        if (bridge->result != NULL) {
+            bridge->result->async_network_completed++;
+            if (!event.clean) bridge->result->network_failures++;
+        }
+    }
+    if (!delivered) return false;
+    if (author_tasks != NULL) (*author_tasks)++;
+    return true;
+}
+
 static JSValue js_fetch_cancel(JSContext *context, JSValueConst this_value,
                                int argc, JSValueConst *argv)
 {
@@ -2520,6 +3019,30 @@ bool js_fetch_cors_install(JSContext *context, JSValue global)
         && js_rt_install_function(context, global,
                                   "__tilefinchEventSourceClose",
                                   js_event_source_close, 1)
+        && js_rt_install_function(context, global,
+                                  "__tilefinchWebSocketStart",
+                                  js_websocket_start, 2)
+        && js_rt_install_function(context, global,
+                                  "__tilefinchWebSocketSend",
+                                  js_websocket_send, 3)
+        && js_rt_install_function(context, global,
+                                  "__tilefinchWebSocketClose",
+                                  js_websocket_close, 3)
+        && js_rt_install_function(context, global,
+                                  "__tilefinchMultiplayerStart",
+                                  js_multiplayer_start, 4)
+        && js_rt_install_function(context, global,
+                                  "__tilefinchMultiplayerSend",
+                                  js_multiplayer_send, 3)
+        && js_rt_install_function(context, global,
+                                  "__tilefinchMultiplayerAccept",
+                                  js_multiplayer_accept, 3)
+        && js_rt_install_function(context, global,
+                                  "__tilefinchMultiplayerAddRemoteCode",
+                                  js_multiplayer_add_remote_code, 2)
+        && js_rt_install_function(context, global,
+                                  "__tilefinchMultiplayerClose",
+                                  js_multiplayer_close, 3)
         && js_rt_install_function(context, global,
                                   "__tilefinchScheduleDynamicScript",
                                   js_schedule_dynamic_script, 1);

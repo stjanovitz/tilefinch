@@ -5,6 +5,7 @@
     protectedFunctions = new Set([
       "__tilefinchBoundedAncestorPath",
       "__tilefinchCurrentScriptForStable",
+      "__tilefinchCurrentDocumentURL",
       "__tilefinchDiagnosticLookup",
       "__tilefinchDispatchActivationHandle",
       "__tilefinchDispatchAt",
@@ -17,6 +18,8 @@
       "__tilefinchFocusObserverDelta",
       "__tilefinchGameAudioCommand",
       "__tilefinchGameAudioDecode",
+      "__tilefinchGetTextPrefix",
+      "__tilefinchGetStyleAttributePrefix",
       "__tilefinchPointerHoverEventsObserved",
       "__tilefinchPointerMarkupChanged",
       "__tilefinchPointerMoveEventsObserved",
@@ -39,7 +42,10 @@
          failing realm. */
       "__tilefinchCommitSameDocument",
       "__tilefinchDeliverEventSource",
+      "__tilefinchDeliverWebSocket",
+      "__tilefinchDeliverMultiplayer",
       "__tilefinchDeliverNetwork",
+      "__tilefinchDocumentURLRevision",
       "__tilefinchDetachNetwork",
       "__tilefinchIntersectionRecheck",
       "__tilefinchMediaRecheck",

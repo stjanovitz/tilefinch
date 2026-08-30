@@ -37,7 +37,6 @@
    nothing. */
 #define DOCUMENT_PARSE_COOPERATE_BYTES (8u * 1024u)
 #define DOCUMENT_CONTROL_STATE_LIMIT 128u
-#define DOCUMENT_CONTROL_VALUE_LIMIT 512u
 #define DOCUMENT_CONTROL_STATE_MAGIC UINT32_C(0x4354524c)
 #define DOCUMENT_BODY_SNAPSHOT_LIMIT (256u * 1024u)
 #define DOCUMENT_BODY_SNAPSHOT_CAPACITY (DOCUMENT_BODY_SNAPSHOT_LIMIT + 1u)
@@ -73,8 +72,14 @@ struct DocumentControlState {
     lxb_dom_node_t *parser_form_owner;
     char *value;
     size_t length;
+    size_t value_capacity;
+    char *default_value;
+    size_t default_length;
+    bool default_value_known;
     int resized_width;
     int resized_height;
+    bool checked_default_known;
+    bool checked_default;
     struct DocumentControlState *next;
 };
 
@@ -1570,9 +1575,46 @@ typedef struct {
     bool failed;
 } DocumentBodySnapshotWriter;
 
-static size_t document_snapshot_visible_text_bytes(lxb_dom_node_t *root)
+typedef struct {
+    size_t visible_text_bytes;
+    size_t action_count;
+} DocumentSnapshotContent;
+
+static bool document_snapshot_is_action(lxb_dom_node_t *node)
 {
-    size_t visible = 0;
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
+    if (document_name_is(node, "button") || document_name_is(node, "input")
+        || document_name_is(node, "select")
+        || document_name_is(node, "textarea")
+        || document_name_is(node, "form")) return true;
+    if (!document_name_is(node, "a")) return false;
+    size_t href_length = 0;
+    const char *href = document_attribute(node, "href", &href_length);
+    return href != NULL && href_length != 0;
+}
+
+static size_t document_snapshot_action_count(lxb_dom_node_t *root)
+{
+    size_t action_count = 0;
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0; node != NULL && visited < 4096u; visited++) {
+        bool skip = node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && (document_name_is(node, "script")
+                || document_name_is(node, "style")
+                || document_name_is(node, "template")
+                || document_name_is(node, "svg")
+                || document_name_is(node, "noscript"));
+        if (document_snapshot_is_action(node) && action_count != SIZE_MAX) {
+            action_count++;
+        }
+        node = document_bounded_next(node, root, skip);
+    }
+    return action_count;
+}
+
+static DocumentSnapshotContent document_snapshot_content(lxb_dom_node_t *root)
+{
+    DocumentSnapshotContent content = {0};
     bool previous_space = true;
     lxb_dom_node_t *node = root;
     for (size_t visited = 0; node != NULL && visited < 4096u; visited++) {
@@ -1588,14 +1630,25 @@ static size_t document_snapshot_visible_text_bytes(lxb_dom_node_t *root)
             for (size_t at = 0; text != NULL && at < length; at++) {
                 bool space = isspace((unsigned char) text[at]) != 0;
                 if (!space || !previous_space) {
-                    if (visible != SIZE_MAX) visible++;
+                    if (content.visible_text_bytes != SIZE_MAX) {
+                        content.visible_text_bytes++;
+                    }
                 }
                 previous_space = space;
             }
         }
+        if (document_snapshot_is_action(node)
+            && content.action_count != SIZE_MAX) {
+            content.action_count++;
+        }
         node = document_bounded_next(node, root, skip);
     }
-    return visible;
+    return content;
+}
+
+size_t document_body_action_count(const PocDocument *document)
+{
+    return document_snapshot_action_count(document_body_node(document));
 }
 
 static lxb_status_t document_body_snapshot_receive(
@@ -1643,11 +1696,13 @@ bool document_body_snapshot_capture(PocDocument *document,
     if (snapshot == NULL) return false;
     *snapshot = (DocumentBodySnapshot) {0};
     lxb_dom_node_t *body = document_body_node(document);
-    size_t visible_text = document_snapshot_visible_text_bytes(body);
+    DocumentSnapshotContent content = document_snapshot_content(body);
     if (document == NULL || document->budget == NULL || body == NULL
-        || visible_text < 128u) return false;
+        || (content.visible_text_bytes < 128u
+            && content.action_count == 0u)) return false;
     snapshot->budget = document->budget;
-    snapshot->source_text_bytes = visible_text;
+    snapshot->source_text_bytes = content.visible_text_bytes;
+    snapshot->source_action_count = content.action_count;
     DocumentBodySnapshotWriter writer = {.snapshot = snapshot};
     for (lxb_dom_node_t *child = body->first_child;
          child != NULL && !writer.failed; child = child->next) {
@@ -1667,11 +1722,25 @@ bool document_body_snapshot_restore_if_degraded(
     DocumentBodySnapshotReplaceCallback replace, void *replace_opaque)
 {
     if (document == NULL || snapshot == NULL || snapshot->markup == NULL
-        || snapshot->length == 0 || snapshot->source_text_bytes < 128u
+        || snapshot->length == 0
+        || (snapshot->source_text_bytes < 128u
+            && snapshot->source_action_count == 0u)
         || !document_refresh(document)) return false;
-    size_t retained = document_snapshot_visible_text_bytes(
+    DocumentSnapshotContent retained = document_snapshot_content(
         document_body_node(document));
-    if (retained >= snapshot->source_text_bytes / 3u) return false;
+    bool text_degraded = retained.visible_text_bytes
+        < snapshot->source_text_bytes / 3u;
+    /* Hydration failures often leave the server prose in place while
+       replacing its only usable form/link with an inert application shell.
+       The snapshot census already records semantic actions so treat their
+       complete disappearance as degradation independently of text.  Keep the
+       predicate conservative: a page retaining any action is not rolled back
+       merely because normal author behavior changed the action count. */
+    bool actions_degraded = snapshot->source_action_count != 0u
+        && retained.action_count == 0u;
+    if (!text_degraded && !actions_degraded) {
+        return false;
+    }
     lxb_dom_node_t *body = document_body_node(document);
     if (body == NULL) return false;
     bool restored = false;
@@ -1753,6 +1822,7 @@ void document_destroy(PocDocument *document)
                 state->node->user = NULL;
             }
             budget_free(document->budget, state->value);
+            budget_free(document->budget, state->default_value);
             budget_free(document->budget, state);
             state = next;
         }
@@ -1852,6 +1922,36 @@ bool document_has_parser_form_owners(const PocDocument *document)
     return document != NULL && document->parser_form_owner_count != 0;
 }
 
+static bool document_control_authored_value(
+    lxb_dom_node_t *node, char *output, size_t *length)
+{
+    if (node == NULL || output == NULL || length == NULL) return false;
+    *length = 0;
+    if (document_name_is(node, "input")) {
+        const char *source = document_attribute(node, "value", length);
+        if (*length > DOCUMENT_CONTROL_VALUE_LIMIT) return false;
+        if (source != NULL && *length != 0)
+            memcpy(output, source, *length);
+        return true;
+    }
+    if (!document_name_is(node, "textarea")) return false;
+    lxb_dom_node_t *at = node->first_child;
+    size_t visited = 0;
+    while (at != NULL && visited++ < DOCUMENT_TRAVERSAL_NODE_LIMIT) {
+        if (at->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t text_length = 0;
+            const char *text = document_text_data(at, &text_length);
+            if (text_length > DOCUMENT_CONTROL_VALUE_LIMIT - *length)
+                return false;
+            if (text_length != 0)
+                memcpy(output + *length, text, text_length);
+            *length += text_length;
+        }
+        at = document_bounded_next(at, node, false);
+    }
+    return visited < DOCUMENT_TRAVERSAL_NODE_LIMIT;
+}
+
 bool document_control_value_set(PocDocument *document, lxb_dom_node_t *node,
                                 const char *value, size_t length)
 {
@@ -1864,24 +1964,337 @@ bool document_control_value_set(PocDocument *document, lxb_dom_node_t *node,
     if (state != NULL
         && (state->magic != DOCUMENT_CONTROL_STATE_MAGIC
             || state->node != node)) return false;
-    BudgetAllocationOwner previous =
-        document_allocation_owner_enter(document);
-    char *copy = budget_malloc(document->budget, length + 1);
+    char authored[DOCUMENT_CONTROL_VALUE_LIMIT + 1u];
+    size_t authored_length = 0;
+    bool capture_default = state == NULL || !state->default_value_known;
+    if (capture_default
+        && !document_control_authored_value(
+               node, authored, &authored_length)) capture_default = false;
+    BudgetAllocationOwner previous = document_allocation_owner_enter(document);
+    size_t required_capacity = length > authored_length
+        ? length + 1u : authored_length + 1u;
+    char *copy = state != NULL && state->value != NULL
+            && state->value_capacity >= required_capacity
+        ? state->value : budget_malloc(document->budget, required_capacity);
     if (copy == NULL) {
         document_allocation_owner_leave(document, previous);
         return false;
     }
-    if (length != 0) memcpy(copy, value, length);
-    copy[length] = '\0';
+    char *default_copy = NULL;
+    if (capture_default) {
+        default_copy = budget_malloc(document->budget, authored_length + 1u);
+        if (default_copy == NULL) {
+            if (state == NULL || copy != state->value)
+                budget_free(document->budget, copy);
+            document_allocation_owner_leave(document, previous);
+            return false;
+        }
+        if (authored_length != 0)
+            memcpy(default_copy, authored, authored_length);
+        default_copy[authored_length] = '\0';
+    }
     if (state == NULL) state = document_control_state_ensure(document, node);
     if (state == NULL) {
+        budget_free(document->budget, default_copy);
         budget_free(document->budget, copy);
         document_allocation_owner_leave(document, previous);
         return false;
     }
-    budget_free(document->budget, state->value);
+    if (capture_default) {
+        state->default_value = default_copy;
+        state->default_length = authored_length;
+        state->default_value_known = true;
+    }
+    if (length != 0) memmove(copy, value, length);
+    copy[length] = '\0';
+    if (copy != state->value)
+        budget_free(document->budget, state->value);
     state->value = copy;
     state->length = length;
+    state->value_capacity = required_capacity > state->value_capacity
+        ? required_capacity : state->value_capacity;
+    document_allocation_owner_leave(document, previous);
+    return true;
+}
+
+bool document_control_value_snapshot(
+    PocDocument *document, lxb_dom_node_t *node,
+    DocumentControlValueSnapshot *snapshot)
+{
+    if (snapshot == NULL) return false;
+    *snapshot = (DocumentControlValueSnapshot) {0};
+    if (document == NULL || document->html == NULL || node == NULL
+        || node->owner_document != &document->html->dom_document) {
+        return false;
+    }
+    DocumentControlState *state = node->user;
+    if (state == NULL) {
+        snapshot->valid = true;
+        snapshot->node = node;
+        return true;
+    }
+    if (state->magic != DOCUMENT_CONTROL_STATE_MAGIC || state->node != node
+        || state->length > DOCUMENT_CONTROL_VALUE_LIMIT
+        || (state->value == NULL
+            && (state->length != 0 || state->value_capacity != 0))
+        || (state->value != NULL
+            && (state->value_capacity <= state->length
+                || state->value_capacity
+                       > DOCUMENT_CONTROL_VALUE_LIMIT + 1u))) return false;
+    snapshot->valid = true;
+    snapshot->node = node;
+    snapshot->state_present = true;
+    snapshot->value_present = state->value != NULL;
+    snapshot->default_value_known = state->default_value_known;
+    snapshot->value_length = state->length;
+    snapshot->value_capacity = state->value_capacity;
+    if (state->value != NULL && state->length != 0)
+        memcpy(snapshot->value, state->value, state->length);
+    snapshot->value[state->length] = '\0';
+    return true;
+}
+
+bool document_control_value_transaction_set(
+    PocDocument *document, lxb_dom_node_t *node,
+    const char *value, size_t length,
+    DocumentControlValueSnapshot *snapshot)
+{
+    if (document == NULL || node == NULL || snapshot == NULL
+        || !snapshot->valid || snapshot->transaction_active
+        || snapshot->node != node
+        || (value == NULL && length != 0)
+        || length > DOCUMENT_CONTROL_VALUE_LIMIT) return false;
+    DocumentControlState *state = node->user;
+    if (snapshot->state_present) {
+        if (state == NULL || state->magic != DOCUMENT_CONTROL_STATE_MAGIC
+            || state->node != node
+            || (state->value != NULL) != snapshot->value_present
+            || state->length != snapshot->value_length
+            || state->value_capacity != snapshot->value_capacity) {
+            return false;
+        }
+        snapshot->retained_value = state->value;
+        state->value = NULL;
+        state->length = 0;
+        state->value_capacity = 0;
+    } else if (state != NULL) {
+        return false;
+    }
+    if (!document_control_value_set(document, node, value, length)) {
+        state = node->user;
+        if (snapshot->state_present && state != NULL
+            && state->magic == DOCUMENT_CONTROL_STATE_MAGIC
+            && state->node == node && state->value == NULL) {
+            state->value = snapshot->retained_value;
+            state->length = snapshot->value_length;
+            state->value_capacity = snapshot->value_capacity;
+        }
+        snapshot->retained_value = NULL;
+        return false;
+    }
+    snapshot->transaction_active = true;
+    return true;
+}
+
+void document_control_value_commit(
+    PocDocument *document, DocumentControlValueSnapshot *snapshot)
+{
+    if (document == NULL || document->budget == NULL || snapshot == NULL
+        || !snapshot->transaction_active) return;
+    budget_free(document->budget, snapshot->retained_value);
+    snapshot->retained_value = NULL;
+    snapshot->transaction_active = false;
+}
+
+bool document_control_value_restore(
+    PocDocument *document, lxb_dom_node_t *node,
+    DocumentControlValueSnapshot *snapshot)
+{
+    if (document == NULL || document->budget == NULL || document->html == NULL
+        || node == NULL || snapshot == NULL || !snapshot->valid
+        || snapshot->node != node
+        || snapshot->value_length > DOCUMENT_CONTROL_VALUE_LIMIT
+        || (snapshot->value_present
+            && (snapshot->value_capacity <= snapshot->value_length
+                || snapshot->value_capacity
+                       > DOCUMENT_CONTROL_VALUE_LIMIT + 1u))
+        || (!snapshot->value_present && snapshot->value_capacity != 0)
+        || node->owner_document != &document->html->dom_document) {
+        return false;
+    }
+    DocumentControlState *state = node->user;
+    if (!snapshot->transaction_active) {
+        if (!snapshot->state_present) return state == NULL;
+        if (state == NULL || state->magic != DOCUMENT_CONTROL_STATE_MAGIC
+            || state->node != node
+            || (state->value != NULL) != snapshot->value_present
+            || state->length != snapshot->value_length
+            || state->value_capacity != snapshot->value_capacity
+            || state->default_value_known
+                   != snapshot->default_value_known) return false;
+        return state->length == 0
+            || memcmp(state->value, snapshot->value, state->length) == 0;
+    }
+    if (!snapshot->state_present) {
+        if (state == NULL) return false;
+        if (state->magic != DOCUMENT_CONTROL_STATE_MAGIC
+            || state->node != node) return false;
+        DocumentControlState **link = &document->control_states;
+        while (*link != NULL && *link != state) link = &(*link)->next;
+        if (*link != state) return false;
+        *link = state->next;
+        if (state->parser_form_owner != NULL
+            && document->parser_form_owner_count != 0) {
+            document->parser_form_owner_count--;
+        }
+        node->user = NULL;
+        state->magic = 0;
+        state->node = NULL;
+        budget_free(document->budget, state->value);
+        budget_free(document->budget, state->default_value);
+        budget_free(document->budget, state);
+        if (document->control_state_count != 0)
+            document->control_state_count--;
+        snapshot->retained_value = NULL;
+        snapshot->transaction_active = false;
+        return true;
+    }
+    if (state == NULL || state->magic != DOCUMENT_CONTROL_STATE_MAGIC
+        || state->node != node) return false;
+    budget_free(document->budget, state->value);
+    state->value = snapshot->retained_value;
+    state->length = snapshot->value_length;
+    state->value_capacity = snapshot->value_capacity;
+    snapshot->retained_value = NULL;
+    snapshot->transaction_active = false;
+    if (!snapshot->default_value_known && state->default_value_known) {
+        budget_free(document->budget, state->default_value);
+        state->default_value = NULL;
+        state->default_length = 0;
+        state->default_value_known = false;
+    } else if (snapshot->default_value_known
+               && !state->default_value_known) {
+        return false;
+    }
+    return true;
+}
+
+bool document_control_checked_snapshot(
+    PocDocument *document, lxb_dom_node_t *node,
+    DocumentControlCheckedSnapshot *snapshot)
+{
+    if (snapshot == NULL) return false;
+    *snapshot = (DocumentControlCheckedSnapshot) {0};
+    if (document == NULL || document->html == NULL || node == NULL
+        || node->owner_document != &document->html->dom_document) {
+        return false;
+    }
+    DocumentControlState *state = node->user;
+    if (state != NULL
+        && (state->magic != DOCUMENT_CONTROL_STATE_MAGIC
+            || state->node != node)) return false;
+    snapshot->valid = true;
+    snapshot->node = node;
+    snapshot->state_present = state != NULL;
+    snapshot->default_known = state != NULL
+        && state->checked_default_known;
+    snapshot->default_checked = state != NULL
+        && state->checked_default;
+    return true;
+}
+
+bool document_control_checked_restore(
+    PocDocument *document, lxb_dom_node_t *node,
+    const DocumentControlCheckedSnapshot *snapshot)
+{
+    if (document == NULL || document->budget == NULL || document->html == NULL
+        || node == NULL || snapshot == NULL || !snapshot->valid
+        || snapshot->node != node
+        || node->owner_document != &document->html->dom_document) {
+        return false;
+    }
+    DocumentControlState *state = node->user;
+    if (!snapshot->state_present) {
+        if (state == NULL) return true;
+        if (state->magic != DOCUMENT_CONTROL_STATE_MAGIC
+            || state->node != node || state->parser_form_owner != NULL
+            || state->value != NULL || state->default_value_known
+            || state->resized_width != 0 || state->resized_height != 0
+            || !state->checked_default_known) return false;
+        DocumentControlState **link = &document->control_states;
+        while (*link != NULL && *link != state) link = &(*link)->next;
+        if (*link != state) return false;
+        *link = state->next;
+        node->user = NULL;
+        state->magic = 0;
+        state->node = NULL;
+        budget_free(document->budget, state);
+        if (document->control_state_count != 0)
+            document->control_state_count--;
+        return true;
+    }
+    if (state == NULL || state->magic != DOCUMENT_CONTROL_STATE_MAGIC
+        || state->node != node) return false;
+    if (snapshot->default_known) {
+        if (!state->checked_default_known) return false;
+        state->checked_default = snapshot->default_checked;
+    } else {
+        state->checked_default_known = false;
+        state->checked_default = false;
+    }
+    return true;
+}
+
+bool document_control_default_value(
+    PocDocument *document, lxb_dom_node_t *node,
+    const char **value, size_t *length)
+{
+    if (value != NULL) *value = NULL;
+    if (length != NULL) *length = 0;
+    if (document == NULL || node == NULL || value == NULL || length == NULL
+        || node->owner_document != &document->html->dom_document) return false;
+    DocumentControlState *state = node->user;
+    if (state != NULL
+        && (state->magic != DOCUMENT_CONTROL_STATE_MAGIC
+            || state->node != node)) return false;
+    if (state == NULL || !state->default_value_known) {
+        size_t live_length = 0;
+        const char *live = document_control_value(node, &live_length);
+        if (live == NULL) {
+            /* Snapshot the authored default transactionally by setting the
+               current live value to that same default. */
+            char authored[DOCUMENT_CONTROL_VALUE_LIMIT + 1u];
+            size_t authored_length = 0;
+            if (!document_control_authored_value(
+                    node, authored, &authored_length)) return false;
+            if (!document_control_value_set(
+                    document, node, authored, authored_length)) return false;
+        }
+        state = node->user;
+    }
+    if (state == NULL || !state->default_value_known) return false;
+    *value = state->default_value;
+    *length = state->default_length;
+    return true;
+}
+
+bool document_control_checked_default(
+    PocDocument *document, lxb_dom_node_t *node, bool authored_checked,
+    bool *default_checked)
+{
+    if (document == NULL || node == NULL || default_checked == NULL
+        || node->owner_document != &document->html->dom_document) return false;
+    BudgetAllocationOwner previous = document_allocation_owner_enter(document);
+    DocumentControlState *state = document_control_state_ensure(document, node);
+    if (state == NULL) {
+        document_allocation_owner_leave(document, previous);
+        return false;
+    }
+    if (!state->checked_default_known) {
+        state->checked_default_known = true;
+        state->checked_default = authored_checked;
+    }
+    *default_checked = state->checked_default;
     document_allocation_owner_leave(document, previous);
     return true;
 }
@@ -1940,6 +2353,7 @@ static void document_control_state_discard_node(
     state->magic = 0;
     state->node = NULL;
     budget_free(document->budget, state->value);
+    budget_free(document->budget, state->default_value);
     budget_free(document->budget, state);
     if (document->control_state_count != 0) {
         document->control_state_count--;

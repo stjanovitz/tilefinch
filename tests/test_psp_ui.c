@@ -117,7 +117,18 @@ static bool test_input_mapping_and_menu(void)
     ui.menu_selection = 2;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 5;
+    ui.menu_selection = 2;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_TOGGLE_BASIC
+          && ui.screen == PSP_UI_SCREEN_PAGE);
+
+    input.pressed = PSP_UI_BUTTON_MENU;
+    (void) psp_ui_update(&ui, &input);
+    ui.menu_selection = 2;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    (void) psp_ui_update(&ui, &input);
+    ui.menu_selection = 6;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     (void) psp_ui_update(&ui, &input);
     CHECK(ui.screen == PSP_UI_SCREEN_PAGE_INFORMATION);
@@ -195,7 +206,7 @@ static bool test_input_mapping_and_menu(void)
     ui.menu_selection = 2;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 3;
+    ui.menu_selection = 4;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_SAVE_FOR_LATER);
@@ -205,7 +216,7 @@ static bool test_input_mapping_and_menu(void)
     ui.menu_selection = 2;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 6;
+    ui.menu_selection = 7;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_INSTALL_OFFLINE_APP);
@@ -241,7 +252,7 @@ static bool test_input_mapping_and_menu(void)
     ui.menu_selection = 2;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 2;
+    ui.menu_selection = 3;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_TOGGLE_BOOKMARK);
@@ -251,7 +262,7 @@ static bool test_input_mapping_and_menu(void)
     ui.menu_selection = 2;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     (void) psp_ui_update(&ui, &input);
-    ui.menu_selection = 4;
+    ui.menu_selection = 5;
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_SCREENSHOT);
@@ -1114,6 +1125,19 @@ static bool test_contextual_failure_recovery_actions(void)
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_RECOVERY_READER
+          && ui.screen == PSP_UI_SCREEN_PAGE);
+
+    /* A fetched-but-empty hydration shell with no semantic Reader tree must
+       not lead the user into a recovery action known to be unavailable. */
+    psp_ui_show_failure_recovery_actions(&ui, "Page scripts stopped", 0u);
+    ui.overlay_animation_frames = 0;
+    CHECK((ui.failure_actions & PSP_UI_FAILURE_READER) == 0u);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_NONE && ui.menu_selection == 1u);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_RECOVERY_RETURN
           && ui.screen == PSP_UI_SCREEN_PAGE);
 
     psp_ui_show_failure_recovery(&ui, "Failed", 0);
@@ -1988,6 +2012,39 @@ static bool test_panels_draw_the_token_ground(void)
     return true;
 }
 
+static bool test_page_tools_windows_last_row_above_hint(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t frame[WIDTH * HEIGHT];
+    PspUiState ui;
+    psp_ui_init(&ui);
+    ui.chrome_theme = BROWSER_CHROME_THEME_FINCH;
+    ui.screen = PSP_UI_SCREEN_PAGE_TOOLS;
+    ui.menu_selection = 6u;
+    ui.overlay_animation_frames = 0u;
+    PspUiInput input = {
+        .pressed = PSP_UI_BUTTON_DOWN,
+        .analog_x = 128,
+        .analog_y = 128
+    };
+    PspUiIntent intent = psp_ui_update(&ui, &input);
+    CHECK(ui.menu_selection == 7u && intent.visual_changed);
+    memset(frame, 0xff, sizeof(frame));
+    psp_ui_composite(&ui, frame, WIDTH, HEIGHT, WIDTH);
+    const PspUiThemePalette *palette =
+        psp_ui_theme_palette(BROWSER_CHROME_THEME_FINCH);
+    CHECK(palette != NULL);
+    /* The selected last row is windowed into physical row seven. */
+    CHECK(frame[(size_t) 217u * WIDTH + 400u] == palette->accent);
+    /* The fixed hint bar remains unobscured by that selection. */
+    CHECK(frame[(size_t) 246u * WIDTH + 400u] == palette->hint_bar);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.action == PSP_UI_ACTION_INSTALL_OFFLINE_APP
+          && ui.screen == PSP_UI_SCREEN_PAGE);
+    return true;
+}
+
 /*
  * The page-view chrome over a light page. This is the pairing the user
  * actually stares at, and the one the cold-era bar was tuned for, so the
@@ -2411,6 +2468,33 @@ static bool test_options_hide_page_loading_indicator(void)
     return true;
 }
 
+static bool test_opaque_chrome_rows_match_visible_surface(void)
+{
+    PspUiState ui;
+    psp_ui_init(&ui);
+    unsigned top = 99u, bottom = 99u;
+    psp_ui_opaque_chrome_rows(&ui, &top, &bottom);
+    CHECK(top == 39u && bottom == 21u);
+
+    ui.browser_ui_scale = 2u;
+    psp_ui_opaque_chrome_rows(&ui, &top, &bottom);
+    CHECK(top == 39u && bottom == 29u);
+
+    ui.screen = PSP_UI_SCREEN_MENU;
+    psp_ui_opaque_chrome_rows(&ui, &top, &bottom);
+    CHECK(top == 39u && bottom == 0u);
+
+    ui.screen = PSP_UI_SCREEN_DIAGNOSTIC_QR;
+    psp_ui_opaque_chrome_rows(&ui, &top, &bottom);
+    CHECK(top == 0u && bottom == 0u);
+
+    ui.screen = PSP_UI_SCREEN_PAGE;
+    ui.chrome_visible = false;
+    psp_ui_opaque_chrome_rows(&ui, &top, &bottom);
+    CHECK(top == 0u && bottom == 0u);
+    return true;
+}
+
 static bool test_chrome_normalizes_common_unicode_punctuation(void)
 {
     enum { WIDTH = 480, HEIGHT = 272 };
@@ -2798,7 +2882,17 @@ static bool test_media_controls_and_composite(void)
     intent = psp_ui_media_update(&media, &input);
     CHECK(intent.action == PSP_UI_MEDIA_ACTION_SEEK);
     CHECK(intent.seek_time_us == UINT64_C(20000000)
-          && !media.seek_preview_active);
+          && media.seek_preview_active);
+    CHECK(media.timeline_visual_pixel == 432u);
+    psp_ui_media_commit_seek(&media, intent.seek_time_us);
+    CHECK(!media.seek_preview_active
+          && media.seek_in_progress && media.resolving
+          && media.current_time_us == UINT64_C(20000000)
+          && media.timeline_visual_pixel == 432u
+          && strcmp(media.status, "Seeking...") == 0);
+    psp_ui_media_set(&media, true, false, false,
+                     UINT64_C(5000000), UINT64_C(20000000),
+                     "Example video");
 
     intent = psp_ui_media_activate_at(&media, WIDTH / 2, HEIGHT - 69,
                                       WIDTH, HEIGHT);
@@ -2877,7 +2971,14 @@ static bool test_media_controls_and_composite(void)
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_media_update(&media, &input);
     CHECK(intent.action == PSP_UI_MEDIA_ACTION_SEEK
-          && !media.seek_preview_active);
+          && media.seek_preview_active);
+    uint64_t committed_nub_target_us = intent.seek_time_us;
+    uint16_t committed_nub_pixel = media.timeline_visual_pixel;
+    psp_ui_media_commit_seek(&media, committed_nub_target_us);
+    CHECK(!media.seek_preview_active
+          && media.seek_in_progress
+          && media.current_time_us == committed_nub_target_us
+          && media.timeline_visual_pixel == committed_nub_pixel);
 
     /* A short refill is reported by the centre pill. It must not replace the
        bottom legend as well: toggling that whole text row after resume made
@@ -3380,6 +3481,76 @@ static bool test_media_status_uses_antialiased_chrome_font(void)
     return true;
 }
 
+static unsigned subtitle_test_luma(uint16_t pixel)
+{
+    unsigned red = (unsigned) (pixel >> 11) & 31u;
+    unsigned green = (unsigned) (pixel >> 5) & 63u;
+    unsigned blue = (unsigned) pixel & 31u;
+    return red * 2u + green + blue * 2u;
+}
+
+static bool test_media_subtitle_shadow_tracks_regular_glyphs(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t frame[WIDTH * HEIGHT];
+    Budget budget;
+    budget_init(&budget, 4u * 1024u * 1024u);
+    FontSet fonts;
+    CHECK(font_set_load(
+        &fonts, &budget, TILEFINCH_TEST_PSP_SANS_FONT, NULL, NULL,
+        TILEFINCH_TEST_PSP_SANS_BOLD_FONT, NULL, NULL, NULL,
+        2u * 1024u * 1024u));
+    const FontFace *regular = font_set_face(&fonts, FONT_SANS);
+    const FontFace *bold = font_set_face_variant(
+        &fonts, FONT_SANS, false, true);
+    CHECK(regular != NULL && bold != NULL && regular != bold);
+    psp_ui_set_chrome_fonts(regular, bold);
+
+    const uint16_t background = 0x8410u;
+    for (size_t at = 0; at < WIDTH * HEIGHT; at++) frame[at] = background;
+    PspUiMediaState media;
+    PspUiMediaPresentation presentation = {0};
+    psp_ui_media_init(&media);
+    psp_ui_media_set(
+        &media, true, true, false, UINT64_C(1000000),
+        UINT64_C(20000000), "Subtitle alignment");
+    media.controls_visible = false;
+    psp_ui_media_bind_presentation(&media, &presentation);
+    psp_ui_media_set_subtitle_style(
+        &media, BROWSER_SUBTITLE_SIZE_STANDARD,
+        BROWSER_SUBTITLE_BACKGROUND_SHADOW);
+    /* Repeated wide glyphs amplify any advance mismatch between the visible
+       run and its shadow. The shipped bold face used to make the shadow's
+       right edge walk several pixels beyond the intended one-pixel offset. */
+    psp_ui_media_set_subtitle(&media, "WMWMWMWMWMWMWMWM");
+    psp_ui_media_composite(&media, frame, WIDTH, HEIGHT, WIDTH);
+
+    unsigned background_luma = subtitle_test_luma(background);
+    int light_left = WIDTH, light_right = -1;
+    int shadow_left = WIDTH, shadow_right = -1;
+    for (int y = 210; y < HEIGHT; y++) {
+        for (int x = 32; x < WIDTH - 32; x++) {
+            unsigned luma = subtitle_test_luma(
+                frame[(size_t) y * WIDTH + (size_t) x]);
+            if (luma > background_luma) {
+                if (x < light_left) light_left = x;
+                if (x > light_right) light_right = x;
+            } else if (luma < background_luma) {
+                if (x < shadow_left) shadow_left = x;
+                if (x > shadow_right) shadow_right = x;
+            }
+        }
+    }
+    CHECK(light_right >= light_left && shadow_right >= shadow_left
+          && shadow_left >= light_left
+          && shadow_right <= light_right + 1);
+
+    psp_ui_clear_chrome_font();
+    font_set_destroy(&fonts);
+    CHECK(budget.current == 0 && budget_categories_reconcile(&budget));
+    return true;
+}
+
 static bool test_startup_views_are_bounded_and_distinct(void)
 {
     enum {
@@ -3724,7 +3895,8 @@ static bool test_collections_sections_and_deletes(void)
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.action == PSP_UI_ACTION_COLLECTION_ACTIVATE
-          && intent.list_index == 2);
+          && intent.list_index == 2
+          && ui.collections_delete_confirmation == UINT8_C(0x80));
 
     /* Deleting costs two deliberate presses on the same row. */
     input.pressed = PSP_UI_BUTTON_RELOAD;
@@ -4677,6 +4849,16 @@ static bool test_media_committed_seek_keeps_timeline_stable(void)
         &media, true, true, false,
         UINT64_C(60000000), UINT64_C(120000000), "Seek stability");
     psp_ui_media_show_controls(&media);
+    psp_ui_media_set_seek_preview(&media, UINT64_C(90000000));
+    PspUiMediaIntent commit_intent = psp_ui_media_update(
+        &media, &(PspUiInput) {.pressed = PSP_UI_BUTTON_CONFIRM});
+    CHECK(commit_intent.action == PSP_UI_MEDIA_ACTION_SEEK
+          && media.seek_preview_active
+          && media.timeline_visual_pixel == 324u);
+    psp_ui_media_commit_seek(&media, commit_intent.seek_time_us);
+    CHECK(!media.seek_preview_active
+          && media.current_time_us == UINT64_C(90000000)
+          && media.timeline_visual_pixel == 324u);
     PspMediaUiProjection seeking = {
         .mode = PSP_MEDIA_UI_SEEKING,
         .visible = true,
@@ -4687,7 +4869,9 @@ static bool test_media_committed_seek_keeps_timeline_stable(void)
         .playing = true
     };
     psp_ui_media_apply_projection(&media, &seeking);
-    CHECK(media.resolving && media.seek_in_progress);
+    CHECK(media.resolving && media.seek_in_progress
+          && media.timeline_visual_pixel == 324u
+          && strcmp(media.status, "Seeking...") == 0);
 
     for (size_t at = 0; at < sizeof(video) / sizeof(video[0]); at++)
         video[at] = UINT32_C(0xff2070e0);
@@ -4709,6 +4893,27 @@ static bool test_media_committed_seek_keeps_timeline_stable(void)
               video + (size_t) (HEIGHT - CONTROL_HEIGHT) * WIDTH,
               sizeof(seeking_bottom)) == 0);
 
+    PspMediaUiProjection priming = {
+        .mode = PSP_MEDIA_UI_PRIMING,
+        .visible = true,
+        .controls_enabled = true,
+        .play_pause_enabled = true,
+        .show_progress = true,
+        .playing = true
+    };
+    psp_ui_media_apply_projection(&media, &priming);
+    CHECK(media.resolving && media.seek_in_progress
+          && media.timeline_visual_pixel == 324u
+          && strcmp(media.status, "Buffering after seek") == 0);
+    for (size_t at = 0; at < sizeof(video) / sizeof(video[0]); at++)
+        video[at] = UINT32_C(0xff9020e0);
+    psp_ui_media_composite_8888(
+        &media, NULL, video, WIDTH, HEIGHT, WIDTH, scratch);
+    CHECK(memcmp(
+              seeking_bottom,
+              video + (size_t) (HEIGHT - CONTROL_HEIGHT) * WIDTH,
+              sizeof(seeking_bottom)) == 0);
+
     PspMediaUiProjection playing = {
         .mode = PSP_MEDIA_UI_PLAYING,
         .visible = true,
@@ -4718,7 +4923,8 @@ static bool test_media_committed_seek_keeps_timeline_stable(void)
         .playing = true
     };
     psp_ui_media_apply_projection(&media, &playing);
-    CHECK(!media.resolving && !media.seek_in_progress);
+    CHECK(!media.resolving && !media.seek_in_progress
+          && media.timeline_visual_pixel == 324u);
     for (size_t at = 0; at < sizeof(video) / sizeof(video[0]); at++)
         video[at] = UINT32_C(0xff20d060);
     psp_ui_media_composite_8888(
@@ -4752,12 +4958,14 @@ int main(void)
         || !test_custom_theme_file_is_bounded_and_atomic()
         || !test_theme_catalog_is_bounded_sorted_and_selectable()
         || !test_panels_draw_the_token_ground()
+        || !test_page_tools_windows_last_row_above_hint()
         || !test_page_chrome_holds_its_edge_over_a_light_page()
         || !test_boot_entrance_becomes_home()
         || !test_cursor_fades_in_and_out()
         || !test_composite_keeps_guards()
         || !test_large_toast_uses_full_psp_width()
         || !test_options_hide_page_loading_indicator()
+        || !test_opaque_chrome_rows_match_visible_surface()
         || !test_startup_views_are_bounded_and_distinct()
         || !test_chrome_normalizes_common_unicode_punctuation()
         || !test_chrome_retains_bounded_unicode_glyphs()
@@ -4767,6 +4975,7 @@ int main(void)
         || !test_media_title_uses_unicode_fallback_font()
         || !test_media_play_control_matches_the_page_overlay()
         || !test_media_status_uses_antialiased_chrome_font()
+        || !test_media_subtitle_shadow_tracks_regular_glyphs()
         || !test_media_overlay_regions_and_the_32_bit_wrapper()
         || !test_media_buffering_transition_frames_are_stable()
         || !test_media_subtitle_transition_ground_is_stable()

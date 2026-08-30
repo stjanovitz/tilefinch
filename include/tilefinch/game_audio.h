@@ -9,6 +9,7 @@
 
 #define TILEFINCH_GAME_AUDIO_BUFFER_LIMIT 8u
 #define TILEFINCH_GAME_AUDIO_VOICE_LIMIT 4u
+#define TILEFINCH_GAME_AUDIO_ENVELOPE_SEGMENT_LIMIT 2u
 #define TILEFINCH_GAME_AUDIO_PCM_BYTE_LIMIT (512u * 1024u)
 #define TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES 512u
 #define TILEFINCH_GAME_AUDIO_SCHEDULE_LIMIT_SECONDS 10.0
@@ -49,6 +50,15 @@ bool tilefinch_game_audio_start_oscillator(
 bool tilefinch_game_audio_update_voice(
     TilefinchGameAudio *audio, uint32_t voice_handle,
     double gain_left, double gain_right);
+/* Two scheduled target segments cover the short attack/release envelopes
+   used by game effects without making the browser thread responsible for
+   ticking gain. The PSP mixer applies them even while JavaScript is stalled. */
+bool tilefinch_game_audio_cancel_envelope(
+    TilefinchGameAudio *audio, uint32_t voice_handle);
+bool tilefinch_game_audio_schedule_envelope_target(
+    TilefinchGameAudio *audio, uint32_t voice_handle,
+    double gain_left, double gain_right,
+    double start_delay_seconds, double time_constant_seconds);
 bool tilefinch_game_audio_update_oscillator(
     TilefinchGameAudio *audio, uint32_t voice_handle, double frequency);
 void tilefinch_game_audio_stop(TilefinchGameAudio *audio,

@@ -1,4 +1,5 @@
 #include "tilefinch/browser_engine.h"
+#include "tilefinch/content_blocker.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/site_adapter.h"
 #include "tilefinch/youtube_lite.h"
@@ -230,6 +231,8 @@ static bool backing_node_write(
 int main(void)
 {
     CHECK(test_engine_lifecycle() == 0);
+    CHECK(test_same_document_and_script_free_defaults() == 0);
+    CHECK(test_same_document_event_mutations_settle_immediately() == 0);
     CHECK(test_page_video_activation() == 0);
     CHECK(test_page_video_data_candidate_activation() == 0);
     CHECK(test_page_audio_activation() == 0);
@@ -245,6 +248,19 @@ int main(void)
     CHECK(test_youtube_cooperative_build_convergence() == 0);
     CHECK(test_youtube_missing_initial_data_terminates() == 0);
     CHECK(test_reader_presentation_adapter() == 0);
+    CHECK(test_blank_reader_frontend_recovery() == 0);
+    CHECK(test_basic_view_admission_and_presentation() == 0);
+    CHECK(test_basic_view_native_root_provenance() == 0);
+    CHECK(test_basic_view_handle_capacity_is_transactional() == 0);
+    CHECK(test_basic_view_bypasses_author_delegated_actions() == 0);
+    /* Native extracted-view provenance and form-safety boundaries. */
+    CHECK(test_basic_view_form_safety_edges() == 0);
+    CHECK(test_basic_view_multiple_select_refuses_transactionally() == 0);
+    CHECK(test_reader_activation_freezes_exact_native_root() == 0);
+    CHECK(test_reader_activation_retires_frame_without_main_runtime() == 0);
+    CHECK(test_reader_manual_image_aliases() == 0);
+    CHECK(test_reader_alias_relocation_rebinds_declined_auto_layout() == 0);
+    CHECK(test_reader_deferred_images_alias_before_relayout() == 0);
     CHECK(test_cooperative_site_adapter_navigation() == 0);
     CHECK(test_headless_repeated_teardown() == 0);
     CHECK(test_single_active_engine() == 0);

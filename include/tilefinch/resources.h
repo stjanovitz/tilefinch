@@ -165,6 +165,14 @@ typedef struct {
     bool active;
 } ExternalFontLoader;
 
+typedef struct ImageCanvasNativeSurface {
+    lxb_dom_node_t *node;
+    const unsigned char *pixels;
+    size_t stride;
+    uint32_t epoch;
+    bool authoritative;
+} ImageCanvasNativeSurface;
+
 typedef struct ImageResource {
     lxb_dom_node_t *node;
     uint64_t url_hash;
@@ -188,6 +196,16 @@ typedef struct ImageResource {
     /* Mutable page-authored canvas snapshots use the same bounded decoded
        surface path as images, but are never refetched or colour-remapped. */
     bool is_canvas;
+    /* WebGL advertises alpha:false and both native backends force every
+       resolved pixel opaque. This lets publication avoid rescanning the
+       complete RGBA surface on every animation frame. Canvas 2D leaves the
+       bit clear because its backing may contain transparency. */
+    bool canvas_opaque;
+    /* A PSP WebGL surface may remain authoritative in EDRAM until normal
+       painting consumes it. The page-owned RGBA allocation remains the
+       bounded fallback/readback store; this borrowed pointer is never freed
+       by ImageResources and is trusted only for its matching display epoch. */
+    ImageCanvasNativeSurface *canvas_native_surface;
     /* A no-CORS image whose final response origin differs from the owning
        document may be painted, but it taints any canvas that consumes it. */
     bool cross_origin;
@@ -276,9 +294,20 @@ typedef struct {
         int width;
         int height;
     } canvas_depth[2];
+    ImageCanvasNativeSurface canvas_native[2];
     ExternalImageStats stats;
     bool priority_staged;
 } ImageResources;
+
+/* Alias insertion can outgrow the bounded resource table after a layout has
+   retained pointers into it. Keep the previous table alive until that layout
+   has rebound its pointers, then release only the table allocation (the
+   copied ImageResource ownership remains with ImageResources.items). */
+typedef struct {
+    ImageResource *previous_items;
+    size_t previous_count;
+    size_t aliased;
+} ImageAliasResult;
 
 #define IMAGE_PRIORITY_KIND_DOCUMENT UINT8_C(0)
 #define IMAGE_PRIORITY_KIND_MASK UINT8_C(1)
@@ -573,6 +602,19 @@ const ImageResource *images_find_pseudo_background(
  */
 const char *image_select_source(const Stylesheet *stylesheet,
                                 lxb_dom_node_t *node, size_t *length);
+/* Associate newly-created document image nodes with an already-admitted
+   resource from the same committed document. This alias-only operation
+   resolves authored sources with the original document provenance, but never
+   fetches, decodes, or duplicates pixels. Traversal and aliases are bounded;
+   aliases borrow the backing through ImageResources rather than retaining a
+   source DOM node. */
+ImageAliasResult images_alias_existing_document_subtree(
+    const Stylesheet *stylesheet, ImageResources *images,
+    lxb_dom_node_t *root, const char *base_url,
+    const char *document_url, const char *referrer_policy,
+    size_t maximum_aliases);
+void images_alias_result_release(ImageResources *images,
+                                 ImageAliasResult *result);
 /*
  * Adopt one already-decoded RGBA surface as a replaced-element resource.
  * This is the generic handoff used by media backends: the producer retains
@@ -617,6 +659,18 @@ ImageCanvasCommitResult images_prepare_canvas_surface(
 bool images_prepare_canvas_depth(ImageResources *images, Budget *budget,
                                  lxb_dom_node_t *node, int width, int height,
                                  uint16_t **depth_values);
+bool images_set_canvas_opaque(ImageResources *images,
+                              lxb_dom_node_t *node, bool opaque);
+bool images_set_canvas_native_surface(ImageResources *images,
+                                      lxb_dom_node_t *node,
+                                      const unsigned char *pixels,
+                                      size_t stride, uint32_t epoch);
+bool images_materialize_canvas_native_surface(ImageResources *images,
+                                              lxb_dom_node_t *node);
+bool image_resource_native_canvas_source(const ImageResource *image,
+                                         const unsigned char **pixels,
+                                         size_t *stride);
+bool image_resource_materialize_native_canvas(ImageResource *image);
 /* Deterministically retire one canvas's page-owned color/depth storage.
    Used by WebGL context loss so a terminal context cannot retain one of the
    two bounded depth slots until whole-page teardown. */

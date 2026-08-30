@@ -1,0 +1,250 @@
+{
+  "profile_id": "tilefinch-game-profile-v1",
+  "title": "Tilefinch Game Profile",
+  "version": 1,
+  "status": "experimental",
+  "authority": "docs/GAME_PROFILE.md",
+  "target": {
+    "device": "Sony PSP",
+    "cpu_clock_hz": 333000000,
+    "display_width_px": 480,
+    "display_height_px": 272,
+    "physical_memory_bytes": 67108864
+  },
+  "memory_profiles": {
+    "shipping": {
+      "page_budget_bytes": 25165824,
+      "javascript_heap_bytes": 5242880
+    },
+    "strict": {
+      "page_budget_bytes": 16777216,
+      "javascript_heap_bytes": 4194304
+    }
+  },
+  "performance_targets": {
+    "aspirational_frame_time_us": 16667,
+    "maximum_steady_frame_time_us": 33333,
+    "qualification_tail_threshold_us": 34000,
+    "physical_device_measurement_required": true
+  },
+  "performance_recipes": {
+    "simulation": {
+      "steps_per_animation_callback": 1,
+      "delta_policy": "bounded_variable_step_without_backlog_replay"
+    },
+    "dynamic_chrome": "retained_in_canvas_mesh",
+    "dom_mutation_in_frame_loop": false,
+    "repeated_geometry": "retained_unit_mesh_with_bounded_instancing",
+    "stable_draw_state": "stable_vao_program_index_range_and_render_state",
+    "dynamic_buffer_updates": "bufferSubData_changed_prefix_only",
+    "instance_draw_chunk_limit": 64,
+    "quantize_visual_state_before_upload": true,
+    "local_input_updates_each_present": true,
+    "background_simulation": "bounded_staggering_without_input_delay",
+    "long_soak_requires_repeated_action_spikes": true
+  },
+  "apis": {
+    "canvas_2d": {
+      "status": "bounded_subset",
+      "interfaces": [
+        "CanvasRenderingContext2D",
+        "Path2D",
+        "ImageData",
+        "ImageBitmap",
+        "createImageBitmap"
+      ],
+      "capabilities": [
+        "paths",
+        "text",
+        "clipping",
+        "gradients",
+        "patterns",
+        "bounded_shadows",
+        "sprite_scaling",
+        "pixel_readback",
+        "png_export"
+      ]
+    },
+    "webgl": {
+      "status": "bounded_webgl_1_subset",
+      "version": "WebGL 1.0",
+      "extensions": [
+        "ANGLE_instanced_arrays",
+        "OES_vertex_array_object"
+      ],
+      "unsupported": [
+        "general_glsl",
+        "shader_loops",
+        "derivatives",
+        "discard",
+        "mipmaps",
+        "stencil",
+        "general_framebuffer_attachments"
+      ]
+    },
+    "gamepad": {
+      "status": "supported",
+      "mapping": "standard",
+      "controllers": 1,
+      "capture_chord": "Start+Select",
+      "request_api": "navigator.tilefinch.requestPageControls(element?)",
+      "request_requires_trusted_activation": true,
+      "request_uses_fullscreen_lifecycle": true,
+      "exit_notice_native": true
+    },
+    "fullscreen": {
+      "status": "supported_top_level",
+      "trusted_activation_required": true,
+      "browser_escape_controls": [
+        "Triangle",
+        "Start+Select",
+        "HOME"
+      ]
+    },
+    "page_visibility": {
+      "status": "supported",
+      "members": [
+        "document.hidden",
+        "document.visibilityState",
+        "visibilitychange"
+      ]
+    },
+    "animation_frame": {
+      "status": "supported",
+      "maximum_callbacks_per_presented_frame": 1,
+      "backlog_policy": "skip_elapsed_frames"
+    },
+    "web_audio": {
+      "status": "bounded_subset",
+      "interfaces": [
+        "AudioContext",
+        "AudioBufferSourceNode",
+        "GainNode",
+        "StereoPannerNode",
+        "OscillatorNode"
+      ],
+      "trusted_activation_required": true,
+      "decoded_formats": [
+        "PCM WAV"
+      ]
+    },
+    "storage": {
+      "local_storage": "bounded_user_persistence_policy",
+      "session_storage": "bounded_session_only",
+      "indexed_db": "bounded_non_durable_compatibility_subset",
+      "service_worker": "unsupported"
+    },
+    "offline_installation": {
+      "status": "supported_snapshot",
+      "requires_https": true,
+      "requires_same_origin_manifest": true,
+      "service_worker_required": false
+    }
+  },
+  "limits": {
+    "canvas_2d": {
+      "maximum_width_px": 480,
+      "maximum_height_px": 272,
+      "maximum_pixels": 131072,
+      "maximum_rgba_bytes_per_canvas": 524288,
+      "native_snapshot_count": 4,
+      "native_snapshot_bytes_total": 1048576,
+      "pending_commit_count": 8,
+      "path_commands": 256,
+      "rectangle_batch_commands": 64,
+      "image_batch_commands": 16,
+      "path_text_batch_commands": 16,
+      "image_bitmap_count": 8,
+      "image_bitmap_bytes_total": 1048576
+    },
+    "webgl": {
+      "contexts_per_realm": 2,
+      "buffer_objects": 24,
+      "buffer_bytes_total": 524288,
+      "texture_objects": 8,
+      "texture_bytes_total": 425984,
+      "shader_objects": 16,
+      "shader_source_bytes_each": 16384,
+      "program_objects": 8,
+      "vertex_array_objects": 8,
+      "draw_command_template_words": 96,
+      "draw_command_template_bytes_per_plan": 384,
+      "draw_command_template_bytes_maximum": 3456,
+      "framebuffer_objects": 4,
+      "renderbuffer_objects": 4,
+      "draws_per_submission": 64,
+      "effective_vertices_per_draw": 4096,
+      "instances_per_draw": 64,
+      "payload_sources": 32,
+      "maximum_texture_dimension_px": 512,
+      "maximum_width_px": 480,
+      "maximum_height_px": 272,
+      "maximum_pixels": 131072,
+      "vertex_attributes": 8,
+      "texture_image_units": 1,
+      "varying_vectors": 2,
+      "vertex_uniform_vectors": 16,
+      "fragment_uniform_vectors": 4
+    },
+    "web_audio": {
+      "contexts": 1,
+      "decoded_buffers": 8,
+      "simultaneous_voices": 4,
+      "audio_nodes": 16,
+      "decoded_pcm_bytes_total": 524288,
+      "mixer_block_frames": 512,
+      "schedule_ahead_us": 10000000,
+      "minimum_sample_rate_hz": 8000,
+      "maximum_sample_rate_hz": 48000,
+      "channels": [
+        1,
+        2
+      ],
+      "sample_bits": [
+        8,
+        16
+      ]
+    },
+    "storage": {
+      "local_and_session_entries": 64,
+      "local_and_session_value_bytes": 16384
+    },
+    "offline_installation": {
+      "manifest_bytes": 65536,
+      "document_bytes": 1048576,
+      "resource_count": 32,
+      "resource_body_bytes_total": 1048576,
+      "classic_script_compile_count": 8,
+      "classic_script_compile_source_bytes": 524288,
+      "classic_script_bytecode_bytes": 524288,
+      "classic_script_source_fallback": true,
+      "resource_pack_bytes": 1736704,
+      "native_icon_width_px": 16,
+      "native_icon_height_px": 16,
+      "native_icon_rgba_bytes": 1024,
+      "library_items": 12
+    }
+  },
+  "lifecycle": {
+    "one_animation_frame_chain": true,
+    "pause_when_hidden": true,
+    "audio_starts_suspended": true,
+    "navigation_ends_gamepad_capture": true,
+    "native_media_ends_gamepad_capture": true,
+    "suspend_ends_gamepad_capture": true,
+    "webgl_restoration_uses_same_context_object": true,
+    "offline_launch_requires_network": false
+  },
+  "fallback_order": [
+    "webgl",
+    "canvas_2d",
+    "static_help"
+  ],
+  "references": [
+    "docs/WEBGL.md",
+    "docs/OFFLINE_LIBRARY.md",
+    "docs/DEVELOPMENT.md",
+    "examples/prism-break-3d/",
+    "examples/treadline-arena/"
+  ]
+}

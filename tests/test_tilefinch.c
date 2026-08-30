@@ -1669,7 +1669,7 @@ static bool test_decoded_media_surface_replaces_poster(Budget *budget)
 {
     static const char html[] =
         "<!doctype html><body><video id=player poster=x.png></video>"
-        "<img id=alias src=x.png>";
+        "<img id=alias src=x.png><img id=alias2 src=x.png>";
     size_t baseline = budget->current;
     PocDocument document = {0};
     ImageResources images = {.budget = budget};
@@ -1679,6 +1679,7 @@ static bool test_decoded_media_surface_replaces_poster(Budget *budget)
         ? lxb_dom_interface_node(document.html) : NULL;
     lxb_dom_node_t *video = ok ? find_id(root, "player") : NULL;
     lxb_dom_node_t *alias_node = ok ? find_id(root, "alias") : NULL;
+    lxb_dom_node_t *alias_node2 = ok ? find_id(root, "alias2") : NULL;
     unsigned char *poster = ok ? budget_malloc_category(
         budget, BUDGET_CATEGORY_RESOURCE, 2u * 2u * 4u) : NULL;
     unsigned char *surface = ok ? budget_malloc_category(
@@ -1686,11 +1687,11 @@ static bool test_decoded_media_surface_replaces_poster(Budget *budget)
     if (poster != NULL) memset(poster, 0x33, 2u * 2u * 4u);
     if (surface != NULL) memset(surface, 0x77, 4u * 3u * 4u);
     if (ok && poster != NULL && surface != NULL) {
-        images.items = budget_calloc(budget, 2, sizeof(*images.items));
+        images.items = budget_calloc(budget, 3, sizeof(*images.items));
         ok = images.items != NULL;
     }
     if (ok) {
-        images.capacity = images.count = 2;
+        images.capacity = images.count = 3;
         images.items[0] = (ImageResource) {
             .node = video, .pixels = poster, .width = 2, .height = 2,
             .source_width = 2, .source_height = 2, .owns_pixels = true
@@ -1698,7 +1699,9 @@ static bool test_decoded_media_surface_replaces_poster(Budget *budget)
         images.items[1] = images.items[0];
         images.items[1].node = alias_node;
         images.items[1].owns_pixels = false;
-        images.stats.loaded = 2;
+        images.items[2] = images.items[1];
+        images.items[2].node = alias_node2;
+        images.stats.loaded = 3;
         images.stats.decoded_bytes = 2u * 2u * 4u;
         ok = images_replace_with_decoded_surface(
             &images, budget, video, surface, 4, 3);
@@ -1707,10 +1710,14 @@ static bool test_decoded_media_surface_replaces_poster(Budget *budget)
         ok ? images_find_node(&images, video) : NULL;
     const ImageResource *alias_image =
         ok ? images_find_node(&images, alias_node) : NULL;
+    const ImageResource *alias_image2 =
+        ok ? images_find_node(&images, alias_node2) : NULL;
     ok = ok && video_image != NULL && alias_image != NULL
+        && alias_image2 != NULL
         && video_image->pixels == surface && video_image->owns_pixels
         && video_image->width == 4 && video_image->height == 3
         && alias_image->pixels == poster && alias_image->owns_pixels
+        && alias_image2->pixels == poster && !alias_image2->owns_pixels
         && images.stats.decoded_bytes == 2u * 2u * 4u + 4u * 3u * 4u;
     if (!ok && surface != NULL
         && (video_image == NULL || video_image->pixels != surface)) {

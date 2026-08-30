@@ -401,21 +401,36 @@ static JSValue js_request_scroll(JSContext *context, JSValueConst this_value,
 
 static bool fixed_box_offset(const LayoutDocument *layout,
                              const LayoutNodeBox *box, int viewport_height,
-                             int *dy)
+                             int scroll_y, bool *matched, int *dy)
 {
+    if (matched != NULL) *matched = false;
     if (layout == NULL || box == NULL || dy == NULL
         || viewport_height <= 0) return false;
-    for (size_t at = layout->fixed_count; at > 0; at--) {
-        const FixedRange *range = &layout->fixed_ranges[at - 1];
+    const FixedRange *owner = NULL;
+    size_t owner_index = SIZE_MAX;
+    size_t owner_span = SIZE_MAX;
+    for (size_t at = 0; at < layout->fixed_count; at++) {
+        const FixedRange *range = &layout->fixed_ranges[at];
         if (box->command_start < range->command_start
             || box->command_end > range->command_end) continue;
-        int target_y = range->from_bottom
-                       ? viewport_height - range->inset - range->height
-                       : range->inset;
-        *dy = target_y - range->origin_y;
-        return true;
+        size_t span = range->command_end >= range->command_start
+            ? range->command_end - range->command_start : SIZE_MAX;
+        if (owner == NULL || span < owner_span
+            || (span == owner_span && at < owner_index)) {
+            owner = range;
+            owner_index = at;
+            owner_span = span;
+        }
     }
-    return false;
+    if (owner == NULL) return false;
+    if (matched != NULL) *matched = true;
+    if (owner->scroll_end != INT_MAX
+        && scroll_y >= owner->scroll_end) return false;
+    int target_y = owner->from_bottom
+                   ? viewport_height - owner->inset - owner->height
+                   : owner->inset;
+    *dy = target_y - owner->origin_y;
+    return true;
 }
 
 static JSValue js_element_geometry(JSContext *context,
@@ -475,8 +490,10 @@ static JSValue js_element_geometry(JSContext *context,
         }
     }
     int fixed_dy = 0;
+    bool fixed_geometry = false;
     if (bridge != NULL
         && fixed_box_offset(bridge->layout, box, bridge->viewport_height,
+                            bridge->page_scroll_y, &fixed_geometry,
                             &fixed_dy)) {
         y += fixed_dy;
     } else {
@@ -495,8 +512,10 @@ static JSValue js_element_geometry(JSContext *context,
     SET_GEOMETRY("retained", box != NULL);
     SET_GEOMETRY(
         "authoritative",
-        box != NULL && box->cssom_geometry_authoritative);
-    if (box != NULL && box->cssom_geometry_authoritative
+        box != NULL
+            && (box->cssom_geometry_authoritative || fixed_geometry));
+    if (box != NULL
+        && (box->cssom_geometry_authoritative || fixed_geometry)
         && bridge != NULL && bridge->result != NULL) {
         bridge->result->geometry_retained_fast_paths++;
     }
@@ -939,7 +958,34 @@ static bool bridge_set_document_url(DomBridge *bridge, const char *url)
     if (js_rt_bridge_calculated_base_url(bridge) == NULL) return false;
     memcpy(bridge->document_url, normalized, strlen(normalized) + 1);
     bridge->document_base_dirty = true;
+    bridge->document_url_revision++;
+    if (bridge->document_url_revision == 0u)
+        bridge->document_url_revision = 1u;
     return true;
+}
+
+static JSValue js_current_document_url(JSContext *context,
+                                       JSValueConst this_value,
+                                       int argc, JSValueConst *argv)
+{
+    (void) this_value; (void) argc; (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->document_url == NULL) {
+        return JS_ThrowInternalError(context,
+                                     "document URL is unavailable");
+    }
+    return JS_NewString(context, bridge->document_url);
+}
+
+static JSValue js_document_url_revision(JSContext *context,
+                                        JSValueConst this_value,
+                                        int argc, JSValueConst *argv)
+{
+    (void) this_value; (void) argc; (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    return bridge == NULL
+        ? JS_ThrowInternalError(context, "document URL is unavailable")
+        : JS_NewUint32(context, bridge->document_url_revision);
 }
 
 static JSValue js_document_base_uri(JSContext *context,
@@ -1298,7 +1344,15 @@ bool js_rt_install_function(JSContext *context, JSValue global,
         && bridge->allow_test_network_primitive_overrides
         && (strcmp(name, "__tilefinchFetchSync") == 0
             || strcmp(name, "__tilefinchFetchAsync") == 0
-            || strcmp(name, "__tilefinchCancelNetwork") == 0);
+            || strcmp(name, "__tilefinchCancelNetwork") == 0
+            || strcmp(name, "__tilefinchWebSocketStart") == 0
+            || strcmp(name, "__tilefinchWebSocketSend") == 0
+            || strcmp(name, "__tilefinchWebSocketClose") == 0
+            || strcmp(name, "__tilefinchMultiplayerStart") == 0
+            || strcmp(name, "__tilefinchMultiplayerSend") == 0
+            || strcmp(name, "__tilefinchMultiplayerAccept") == 0
+            || strcmp(name, "__tilefinchMultiplayerAddRemoteCode") == 0
+            || strcmp(name, "__tilefinchMultiplayerClose") == 0);
     int flags = test_network_override
         ? JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE : 0;
     return JS_DefinePropertyValueStr(

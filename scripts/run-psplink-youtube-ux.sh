@@ -3,9 +3,9 @@ set -eu
 
 # Deterministic real-PSP regression for the ordinary provider journey:
 # natural autoplay, three rapid seek edges, and a committed latest target.
-# usbhostfs_pc must already serve BUILD_DIR as host0:. The browser, profile,
-# input script, and validation log all live on host0; this run performs zero
-# Memory Stick writes.
+# The browser, profile, input script, and validation log all live on host0;
+# the shared wrapper establishes that bridge before this run, which performs
+# zero Memory Stick writes.
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD_DIR=${BUILD_DIR:-$ROOT/build-preset-psp-validation}
@@ -19,6 +19,9 @@ YOUTUBE_TEST_URL=${TILEFINCH_YOUTUBE_TEST_URL:-}
 LOG=$BUILD_DIR/tilefinch-validation.txt
 SCENARIO=youtube-autoplay-seek-live.txt
 BACKUP=$(mktemp -d "${TMPDIR:-/tmp}/tilefinch-psplink-ux.XXXXXX")
+
+PSPSH=$PSPSH HOST_ROOT=$BUILD_DIR \
+    "$ROOT/scripts/psplink-shell.sh" ready
 
 cleanup() {
     # Discard only profile state created by this validation run, then restore

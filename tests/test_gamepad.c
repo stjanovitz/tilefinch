@@ -56,6 +56,20 @@ int main(void)
               == TILEFINCH_GAMEPAD_CAPTURE_EXITED
           && !capture.active);
 
+    CHECK(tilefinch_gamepad_capture_request(&capture, false, 10)
+              == TILEFINCH_GAMEPAD_CAPTURE_UNAVAILABLE
+          && !capture.active);
+    CHECK(tilefinch_gamepad_capture_request(&capture, true, 10)
+              == TILEFINCH_GAMEPAD_CAPTURE_ENTERED
+          && capture.active && capture.page_generation == 10
+          && capture.suppress_input_until_release);
+    CHECK(tilefinch_gamepad_capture_request(&capture, true, 10)
+              == TILEFINCH_GAMEPAD_CAPTURE_NO_CHANGE
+          && capture.active);
+    CHECK(tilefinch_gamepad_capture_step(&capture, true, 11, false, 16)
+              == TILEFINCH_GAMEPAD_CAPTURE_EXITED
+          && !capture.active && !capture.suppress_input_until_release);
+
     CHECK(tilefinch_gamepad_axis_from_u8(128) == 0
           && tilefinch_gamepad_axis_from_u8(120) == 0
           && tilefinch_gamepad_axis_from_u8(136) == 0

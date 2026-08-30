@@ -4,8 +4,11 @@
 from pathlib import Path
 import hashlib
 import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
 
 
@@ -113,6 +116,189 @@ def psp_firmware_backend_destroy(source: str):
 
 
 class PspSdkContractTests(unittest.TestCase):
+    def test_game_profile_v1_matches_runtime_ceiling_contracts(self):
+        profile_path = ROOT / "docs/tilefinch-game-profile-v1.json"
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        self.assertEqual(profile["profile_id"],
+                         "tilefinch-game-profile-v1")
+        self.assertEqual(profile["version"], 1)
+        self.assertEqual(profile["authority"], "docs/GAME_PROFILE.md")
+
+        self.assertEqual(profile["memory_profiles"], {
+            "shipping": {
+                "page_budget_bytes": 24 * 1024 * 1024,
+                "javascript_heap_bytes": 5 * 1024 * 1024,
+            },
+            "strict": {
+                "page_budget_bytes": 16 * 1024 * 1024,
+                "javascript_heap_bytes": 4 * 1024 * 1024,
+            },
+        })
+        self.assertEqual(profile["limits"]["canvas_2d"], {
+            "maximum_width_px": 480,
+            "maximum_height_px": 272,
+            "maximum_pixels": 131072,
+            "maximum_rgba_bytes_per_canvas": 512 * 1024,
+            "native_snapshot_count": 4,
+            "native_snapshot_bytes_total": 1024 * 1024,
+            "pending_commit_count": 8,
+            "path_commands": 256,
+            "rectangle_batch_commands": 64,
+            "image_batch_commands": 16,
+            "path_text_batch_commands": 16,
+            "image_bitmap_count": 8,
+            "image_bitmap_bytes_total": 1024 * 1024,
+        })
+        self.assertEqual(profile["limits"]["webgl"], {
+            "contexts_per_realm": 2,
+            "buffer_objects": 24,
+            "buffer_bytes_total": 512 * 1024,
+            "texture_objects": 8,
+            "texture_bytes_total": 416 * 1024,
+            "shader_objects": 16,
+            "shader_source_bytes_each": 16 * 1024,
+            "program_objects": 8,
+            "vertex_array_objects": 8,
+            "draw_command_template_words": 96,
+            "draw_command_template_bytes_per_plan": 384,
+            "draw_command_template_bytes_maximum": 3456,
+            "framebuffer_objects": 4,
+            "renderbuffer_objects": 4,
+            "draws_per_submission": 64,
+            "effective_vertices_per_draw": 4096,
+            "instances_per_draw": 64,
+            "payload_sources": 32,
+            "maximum_texture_dimension_px": 512,
+            "maximum_width_px": 480,
+            "maximum_height_px": 272,
+            "maximum_pixels": 131072,
+            "vertex_attributes": 8,
+            "texture_image_units": 1,
+            "varying_vectors": 2,
+            "vertex_uniform_vectors": 16,
+            "fragment_uniform_vectors": 4,
+        })
+        self.assertEqual(profile["limits"]["web_audio"], {
+            "contexts": 1,
+            "decoded_buffers": 8,
+            "simultaneous_voices": 4,
+            "audio_nodes": 16,
+            "decoded_pcm_bytes_total": 512 * 1024,
+            "mixer_block_frames": 512,
+            "schedule_ahead_us": 10 * 1000 * 1000,
+            "minimum_sample_rate_hz": 8000,
+            "maximum_sample_rate_hz": 48000,
+            "channels": [1, 2],
+            "sample_bits": [8, 16],
+        })
+        self.assertEqual(profile["limits"]["offline_installation"], {
+            "manifest_bytes": 64 * 1024,
+            "document_bytes": 1024 * 1024,
+            "resource_count": 32,
+            "resource_body_bytes_total": 1024 * 1024,
+            "classic_script_compile_count": 8,
+            "classic_script_compile_source_bytes": 512 * 1024,
+            "classic_script_bytecode_bytes": 512 * 1024,
+            "classic_script_source_fallback": True,
+            "resource_pack_bytes": 1024 * 1024 + 512 * 1024 + 160 * 1024,
+            "native_icon_width_px": 16,
+            "native_icon_height_px": 16,
+            "native_icon_rgba_bytes": 16 * 16 * 4,
+            "library_items": 12,
+        })
+
+        canvas = (ROOT / "src/bootstrap/canvas.js").read_text(
+            encoding="utf-8")
+        for token in (
+            "pixelByteLimit = 512 * 1024",
+            "maximumDrawingWidth = 480",
+            "maximumDrawingHeight = 272",
+            "imageBitmapByteLimit = 1024 * 1024",
+            "imageBitmapCountLimit = 8",
+            "state.paintCommands.length >= 16",
+            "state.rectCommands.length >= 64",
+            "target.imageCommands.length >= 16",
+            "pendingCommits.length < 8",
+            "this._commands.length < 256",
+        ):
+            self.assertIn(token, canvas)
+        image = (ROOT / "src/image.c").read_text(encoding="utf-8")
+        for token in (
+            "#define IMAGE_CANVAS_SURFACE_LIMIT 4u",
+            "#define IMAGE_CANVAS_BYTES_LIMIT (1024u * 1024u)",
+            "#define IMAGE_CANVAS_SINGLE_BYTES_LIMIT (512u * 1024u)",
+        ):
+            self.assertIn(token, image)
+
+        webgl = (ROOT / "src/bootstrap/webgl.js").read_text(
+            encoding="utf-8")
+        for token in (
+            "MAX_CONTEXTS = 2",
+            "MAX_BUFFER_BYTES = 512 * 1024",
+            "MAX_TEXTURE_BYTES = 416 * 1024",
+            "MAX_BUFFER_OBJECTS = 24",
+            "MAX_TEXTURE_OBJECTS = 8",
+            "MAX_SHADER_OBJECTS = 16",
+            "MAX_PROGRAM_OBJECTS = 8",
+            "MAX_VERTEX_ARRAY_OBJECTS = 8",
+            "MAX_FRAMEBUFFER_OBJECTS = 4",
+            "MAX_RENDERBUFFER_OBJECTS = 4",
+            "MAX_SHADER_BYTES = 16 * 1024",
+            "MAX_DRAWS = 64",
+            "MAX_INSTANCES = 64",
+            "MAX_VERTICES = 4096",
+            "MAX_DRAWING_WIDTH = 480",
+            "MAX_DRAWING_HEIGHT = 272",
+            "MAX_DRAWING_PIXELS = 131072",
+        ):
+            self.assertIn(token, webgl)
+
+        audio_header = (ROOT / "include/tilefinch/game_audio.h").read_text(
+            encoding="utf-8")
+        for token in (
+            "#define TILEFINCH_GAME_AUDIO_BUFFER_LIMIT 8u",
+            "#define TILEFINCH_GAME_AUDIO_VOICE_LIMIT 4u",
+            "#define TILEFINCH_GAME_AUDIO_PCM_BYTE_LIMIT (512u * 1024u)",
+            "#define TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES 512u",
+            "#define TILEFINCH_GAME_AUDIO_SCHEDULE_LIMIT_SECONDS 10.0",
+        ):
+            self.assertIn(token, audio_header)
+        audio_js = (ROOT / "src/bootstrap/game-audio.js").read_text(
+            encoding="utf-8")
+        self.assertIn("nodeLimit = 16", audio_js)
+        self.assertIn("Only one game AudioContext is available", audio_js)
+
+        offline = (ROOT / "include/tilefinch/offline_library.h").read_text(
+            encoding="utf-8")
+        for token in (
+            "#define OFFLINE_LIBRARY_ITEM_LIMIT 12u",
+            "#define OFFLINE_LIBRARY_APP_DOCUMENT_LIMIT (1024u * 1024u)",
+            "#define OFFLINE_LIBRARY_APP_RESOURCE_LIMIT (1024u * 1024u)",
+            "#define OFFLINE_LIBRARY_APP_BYTECODE_LIMIT (512u * 1024u)",
+            "+ OFFLINE_LIBRARY_APP_BYTECODE_LIMIT + 160u * 1024u)",
+            "#define OFFLINE_LIBRARY_APP_ICON_EDGE 16u",
+        ):
+            self.assertIn(token, offline)
+        manifest = (ROOT / "include/tilefinch/web_app_manifest.h").read_text(
+            encoding="utf-8")
+        self.assertIn(
+            "#define TILEFINCH_WEB_APP_MANIFEST_LIMIT (64u * 1024u)",
+            manifest)
+        session = (ROOT / "include/tilefinch/session.h").read_text(
+            encoding="utf-8")
+        self.assertIn("#define BROWSER_STORAGE_ENTRIES 64", session)
+        self.assertIn("#define BROWSER_OFFLINE_CACHE_ENTRY_LIMIT 32u",
+                      session)
+        session_source = (ROOT / "src/session.c").read_text(
+            encoding="utf-8")
+        self.assertIn("#define DEFAULT_STORAGE_BYTES (16u * 1024u)",
+                      session_source)
+
+        docs_map = (ROOT / "docs/README.md").read_text(encoding="utf-8")
+        guide = (ROOT / "docs/GAME_PROFILE.md").read_text(encoding="utf-8")
+        self.assertIn("[Game Profile v1](GAME_PROFILE.md)", docs_map)
+        self.assertIn("tilefinch-game-profile-v1.json", guide)
+
     def test_home_exit_returns_callback_thread_to_the_busy_supervisor(self):
         runtime = without_comments(
             (ROOT / "src/psp_app/psp_app_runtime.c").read_text(
@@ -213,6 +399,128 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("sceKernelSelfStopUnloadModule(1, 0, NULL)", source)
         self.assertNotIn("tilefinch-validation", source)
         self.assertNotIn("tilefinch-crash", source)
+
+    def test_psplink_device_loop_establishes_the_host_bridge(self):
+        shell = (ROOT / "scripts/psplink-shell.sh").read_text(
+            encoding="utf-8")
+        deploy = (ROOT / "scripts/psplink-device.sh").read_text(
+            encoding="utf-8")
+        youtube = (ROOT / "scripts/run-psplink-youtube-ux.sh").read_text(
+            encoding="utf-8")
+        self.assertIn('nohup "$USBHOSTFS" "$HOST_ROOT"', shell)
+        self.assertIn("BRIDGE_START_TIMEOUT_SECONDS", shell)
+        self.assertIn('run_pspsh ver "$LINK_TIMEOUT_SECONDS"', shell)
+        self.assertIn('scripts/psplink-shell.sh" ready', deploy)
+        self.assertIn('scripts/psplink-shell.sh" ready', youtube)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / "host"
+            host.mkdir()
+            second_host = root / "second-host"
+            second_host.mkdir()
+            ready = root / "ready"
+            active_root = root / "active-root"
+            pspsh = root / "pspsh"
+            usbhostfs = root / "usbhostfs_pc"
+            pspsh.write_text(
+                "#!/bin/sh\n"
+                "if [ -f \"$MOCK_PSP_READY\" ] "
+                "&& [ \"$(cat \"$MOCK_ACTIVE_ROOT\")\" = "
+                "\"$MOCK_EXPECTED_ROOT\" ]; then\n"
+                "  echo 'PSPLink v3.2.1'\n"
+                "  exit 0\n"
+                "fi\n"
+                "echo 'connect: Connection refused' >&2\n"
+                "exit 1\n", encoding="utf-8")
+            usbhostfs.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$1\" >\"$MOCK_ACTIVE_ROOT\"\n"
+                ": > \"$MOCK_PSP_READY\"\n"
+                "sleep 8\n", encoding="utf-8")
+            pspsh.chmod(0o755)
+            usbhostfs.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update({
+                "HOST_ROOT": str(host),
+                "PSPLINK_STATE_DIR": str(root),
+                "PSPSH": str(pspsh),
+                "USBHOSTFS": str(usbhostfs),
+                "MOCK_PSP_READY": str(ready),
+                "MOCK_ACTIVE_ROOT": str(active_root),
+                "MOCK_EXPECTED_ROOT": str(host),
+                "LINK_TIMEOUT_SECONDS": "2",
+                "BRIDGE_START_TIMEOUT_SECONDS": "3",
+            })
+            result = subprocess.run(
+                [str(ROOT / "scripts/psplink-shell.sh"), "ready"],
+                env=environment, capture_output=True, text=True,
+                timeout=8, check=False)
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertIn("PSPLink ready", result.stdout)
+            self.assertTrue(ready.exists())
+            self.assertTrue((root / ".tilefinch-usbhostfs.pid").exists())
+            self.assertEqual(
+                str(host),
+                (root / ".tilefinch-usbhostfs.root").read_text(
+                    encoding="utf-8").strip())
+
+            environment["HOST_ROOT"] = str(second_host)
+            environment["MOCK_EXPECTED_ROOT"] = str(second_host)
+            switched = subprocess.run(
+                [str(ROOT / "scripts/psplink-shell.sh"), "ready"],
+                env=environment, capture_output=True, text=True,
+                timeout=8, check=False)
+            self.assertEqual(0, switched.returncode, switched.stderr)
+            self.assertEqual(
+                str(second_host), active_root.read_text(
+                    encoding="utf-8").strip())
+            self.assertEqual(
+                str(second_host),
+                (root / ".tilefinch-usbhostfs.root").read_text(
+                    encoding="utf-8").strip())
+            bridge_pid = int((root / ".tilefinch-usbhostfs.pid").read_text(
+                encoding="utf-8").strip())
+            try:
+                os.kill(bridge_pid, 15)
+            except ProcessLookupError:
+                pass
+
+    def test_psplink_bridge_reports_host_socket_denial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / "host"
+            host.mkdir()
+            pspsh = root / "pspsh"
+            usbhostfs = root / "usbhostfs_pc"
+            pspsh.write_text(
+                "#!/bin/sh\n"
+                "echo 'connect: Connection refused' >&2\n"
+                "exit 1\n", encoding="utf-8")
+            usbhostfs.write_text(
+                "#!/bin/sh\n"
+                "echo 'bind: Operation not permitted' >&2\n"
+                "sleep 8\n", encoding="utf-8")
+            pspsh.chmod(0o755)
+            usbhostfs.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update({
+                "HOST_ROOT": str(host),
+                "PSPLINK_STATE_DIR": str(root),
+                "PSPSH": str(pspsh),
+                "USBHOSTFS": str(usbhostfs),
+                "LINK_TIMEOUT_SECONDS": "1",
+                "BRIDGE_START_TIMEOUT_SECONDS": "3",
+            })
+            result = subprocess.run(
+                [str(ROOT / "scripts/psplink-shell.sh"), "ready"],
+                env=environment, capture_output=True, text=True,
+                timeout=8, check=False)
+            self.assertNotEqual(0, result.returncode)
+            self.assertIn(
+                "host environment denied usbhostfs_pc", result.stderr)
+            self.assertIn(
+                "does not need to be relaunched", result.stderr)
 
     def test_official_psp_preset_embeds_the_pinned_public_update_root(self):
         presets = json.loads(
@@ -631,6 +939,19 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("PSP_UI_BUTTON_TOOLBAR", fullscreen)
         self.assertIn("browser_engine_exit_page_fullscreen", fullscreen)
 
+    def test_page_controls_keep_triangle_in_the_game(self):
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        start = main.index("static TILEFINCH_OUT_OF_LINE bool "
+                           "psp_update_page_fullscreen(",
+                           main.index("static TILEFINCH_OUT_OF_LINE bool "
+                                      "psp_update_page_fullscreen(") + 1)
+        end = main.index("static TILEFINCH_OUT_OF_LINE void "
+                         "psp_suspend_page_runtime", start)
+        fullscreen = main[start:end]
+        self.assertIn("!app->interactive->gamepad_capture.active", fullscreen)
+        self.assertIn("PSP_UI_BUTTON_TOOLBAR", fullscreen)
+
     def test_voice_reclaims_only_a_hidden_media_pipeline(self):
         session = without_comments(
             psp_media_session_sources())
@@ -684,6 +1005,29 @@ class PspSdkContractTests(unittest.TestCase):
             main.index("PspUiIntent intent =")]
         self.assertIn(
             "psp_media_reclaim_hidden_pipeline(&browser->media)", updater)
+
+    def test_offline_startup_does_not_wake_network_background_work(self):
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        update = main[
+            main.index("bool background_network_allowed ="):
+            main.index("bool update_check_running = false;")]
+        self.assertIn("!offline_startup", update)
+        self.assertIn("background_network_allowed", update)
+        warmup = main[
+            main.index("tilefinch-network-warmup: status=started") - 1000:
+            main.index("tilefinch-network-warmup: status=started")]
+        self.assertIn("background_network_allowed", warmup)
+        dispatch = main[main.rindex("psp_app_run_interactive("):]
+        self.assertIn("psp_offline_url(startup_url)", dispatch)
+        initial_network = main[
+            main.index("psp_log_checkpoint(\"network-begin\")") - 700:
+            main.index("psp_log_checkpoint(\"network-begin\")")]
+        self.assertIn("!psp_offline_url(startup_url)", initial_network)
+        initial_load = main[
+            main.index("if (native_home_boot) {"):
+            main.index("psp_validation_cancel_after_ms = 0;")]
+        self.assertIn("psp_offline_store_handle_url(", initial_load)
 
     def test_quarantined_media_retry_stops_before_resolution(self):
         source = without_comments(
@@ -1050,15 +1394,17 @@ class PspSdkContractTests(unittest.TestCase):
             advance.index("if (psp_media_start_pending_preview_commit(media))")]
         self.assertIn("media->reopen_preview_pending", open_advance)
         self.assertIn("media->preview_commit_pending", open_advance)
-        self.assertIn("psp_ui_media_set_seek_preview(&media->ui, target_us)",
-                      open_advance)
+        self.assertIn("psp_ui_media_commit_seek(", open_advance)
+        self.assertIn("media->preview_commit_target_us", open_advance)
+        self.assertIn("psp_ui_media_set_seek_preview(", open_advance)
+        self.assertIn("media->reopen_preview_target_us", open_advance)
 
         commit_case = intents[
             intents.index("case PSP_UI_MEDIA_ACTION_SEEK:"):
             intents.index("case PSP_UI_MEDIA_ACTION_RETRY:")]
         self.assertIn("media->preview_commit_pending = true", commit_case)
         self.assertIn("media->reopen_preview_pending = false", commit_case)
-        self.assertIn("psp_ui_media_set_seek_preview(", commit_case)
+        self.assertIn("psp_ui_media_commit_seek(", commit_case)
         commit_start = advance.index(
             "psp_media_start_pending_preview_commit(media)")
         self.assertLess(
@@ -2036,9 +2382,108 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("CURLOPT_USERAGENT, FETCH_BACKGROUND_USER_AGENT",
                       source)
         self.assertNotIn("CURLOPT_CONNECT_ONLY,", preconnect)
-        self.assertNotIn("CURLOPT_CONNECT_ONLY,", source)
+        self.assertEqual(
+            source.count("CURLOPT_CONNECT_ONLY,"), 1,
+            "only the bounded WebSocket lane may retain a connected socket")
+        websocket_config = source[
+            source.index("static bool fetch_background_websocket_configure("):
+            source.index("static void fetch_background_websocket_start_queued(")]
+        self.assertIn("CURLOPT_CONNECT_ONLY, 2L", websocket_config)
+        websocket_open = source[
+            source.index("uint64_t fetch_background_websocket_open("):
+            source.index("bool fetch_background_websocket_send(")]
+        self.assertIn("fetch_websocket_prepare_admission(", websocket_open)
+        self.assertIn(
+            "socket->private_network.required = protect_private_network",
+            websocket_open)
+        self.assertNotIn(
+            "request->block_private_network", websocket_open,
+            "page WebSockets must derive PNA at the native sink")
+        self.assertLess(
+            websocket_open.index("fetch_websocket_prepare_admission("),
+            websocket_open.index("FETCH_BACKGROUND_WEBSOCKET_PREPARING"),
+            "policy must pass before a worker slot is claimed")
+        websocket_send = source[
+            source.index("static void fetch_background_websocket_service_send("):
+            source.index(
+                "static bool fetch_background_websocket_publish_pending_drain(")]
+        self.assertIn(
+            "fetch_background_websocket_publish_close_bytes(",
+            websocket_send,
+            "delayed peer-close publication must preserve its explicit length")
+        self.assertIn("socket->peer_close_reason_length", websocket_send)
+        self.assertIn(
+            "FETCH_BACKGROUND_WEBSOCKET_DRAIN_PENDING", websocket_send,
+            "a busy browser-event slot must not discard send completion")
+        self.assertNotIn(
+            "socket->event.kind = FETCH_WEBSOCKET_EVENT_DRAIN",
+            websocket_send,
+            "send completion must enter the pending latch before publication")
+        websocket_drain = source[
+            source.index(
+                "static bool fetch_background_websocket_publish_pending_drain("):
+            source.index("static void fetch_background_websocket_service_receive(")]
+        self.assertIn(
+            "FETCH_BACKGROUND_WEBSOCKET_DRAIN_PUBLISHED", websocket_drain)
+        self.assertNotIn(
+            "if (sent == 0)", websocket_drain,
+            "a zero-byte text send still requires DRAIN to release the JS queue")
+        websocket_receive = source[
+            source.index("static void fetch_background_websocket_service_receive("):
+            source.index("static void fetch_background_websocket_service(void)")]
+        self.assertLess(
+            websocket_receive.index("fetch_websocket_text_payload_valid("),
+            websocket_receive.index("FETCH_WEBSOCKET_EVENT_MESSAGE_TEXT"),
+            "malformed text must close with 1007 before JavaScript delivery")
+        websocket_service = source[
+            source.index("static void fetch_background_websocket_service(void)"):
+            source.index("static int fetch_background_worker_main(")]
+        self.assertGreaterEqual(
+            websocket_service.count(
+                "fetch_background_websocket_publish_pending_drain(socket)"),
+            2,
+            "pending send completion must run before receive and immediately "
+            "after a completed send")
+        websocket_take = source[
+            source.index("bool fetch_background_websocket_take_event("):
+            source.index("static bool fetch_background_all_free(")]
+        self.assertIn(
+            "FETCH_BACKGROUND_WEBSOCKET_DRAIN_PENDING", websocket_take,
+            "consuming a busy event slot must wake pending DRAIN publication")
+        websocket_native_send = source[
+            source.index("bool fetch_background_websocket_send("):
+            source.index("bool fetch_background_websocket_close(")]
+        self.assertIn("length != 0 && data == NULL", websocket_native_send)
+        self.assertIn(
+            "FETCH_BACKGROUND_WEBSOCKET_DRAIN_EMPTY", websocket_native_send,
+            "the next native send must wait for the preceding DRAIN event")
+        raw_transport_source = (
+            ROOT / "src/fetch/background_transport.inc").read_text(
+                encoding="utf-8")
+        self.assertIn(
+            "Hash-pinned curl 8.21.0 auto-enqueues", raw_transport_source)
+        curl_config = (ROOT / "cmake/PspOwnedTransport.cmake").read_text(
+            encoding="utf-8")
+        self.assertIn("curl-8.21.0", curl_config)
+        self.assertNotIn("CURLWS_NOAUTOPONG", websocket_config)
         self.assertIn("curl_easy_attach_shared_state(slot->easy)", source)
         self.assertIn("CURLOPT_TIMEOUT_MS, 0L", source)
+        shared_state = (ROOT / "src/fetch/response_stream.inc").read_text(
+            encoding="utf-8")
+        attach = shared_state[
+            shared_state.index("static bool curl_easy_attach_shared_state("):
+            shared_state.index("static bool curl_global_release(")]
+        self.assertIn("#if defined(__PSP__)", attach)
+        self.assertIn("CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4", attach)
+        self.assertNotIn("CURL_IPRESOLVE_V4", shared_state[:
+            shared_state.index("static bool curl_easy_attach_shared_state(")])
+        policy = (ROOT / "src/fetch/policy.inc").read_text(encoding="utf-8")
+        transport = (ROOT / "src/fetch/transport.inc").read_text(
+            encoding="utf-8")
+        self.assertIn(
+            "#if defined(AF_INET6) && !defined(__PSP__)", policy)
+        self.assertIn(
+            "#if defined(AF_INET6) && !defined(__PSP__)", transport)
         worker_work = source[
             source.index("static bool fetch_background_has_worker_work("):
             source.index("static int fetch_background_worker_main(")]
@@ -4392,7 +4837,11 @@ class PspSdkContractTests(unittest.TestCase):
             "memalign(PSP_MEDIA_DDR_ALIGNMENT, PSP_MEDIA_POOL_BYTES)",
             reserve)
         self.assertIn("event=me-pool ", reserve)
-        self.assertIn("psp_media_commit_log();", reserve)
+        # A successful boot reservation is not a media failure. In a host0
+        # PRX run, synchronously flushing after pspsh has detached can block
+        # the main thread before browser creation. The ordinary boot
+        # checkpoint persists the already-buffered address line instead.
+        self.assertNotIn("psp_media_commit_log();", reserve)
         # A heap no bigger than a stock partition lies entirely below the
         # Media Engine limit, so it must keep the pre-pool memory behaviour
         # rather than give up several megabytes for a reservation it cannot
@@ -4477,7 +4926,8 @@ class PspSdkContractTests(unittest.TestCase):
             (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
         reserved = main.index("media_psp_backend_reserve_pool();")
         self.assertLess(reserved, main.index('psp_log_checkpoint("boot-ready'))
-        self.assertLess(reserved, main.index("heap-capacity=%dMB"))
+        self.assertLess(
+            reserved, main.index("psp_report_heap_capacity_lower_bound();"))
         self.assertLess(reserved, main.index("psp_boot_config_defaults("))
         self.assertLess(reserved, main.index("browser_engine_create("))
         # Shipping builds get the pool too: only the log lines are gated.
@@ -5047,11 +5497,42 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("psp_media_reset_subtitle_document", captions)
         self.assertNotIn("psp_media_pipeline_destroy", captions)
         pump = session[
-            session.index("static bool psp_media_subtitle_pump("):
+            session.index("static bool psp_media_subtitle_load_pump("):
             session.index("static bool psp_media_refusal_reset_recover(")]
         self.assertIn("youtube_resolve_job_take_captions", pump)
         self.assertIn("psp_media_publish_track_catalog", pump)
         self.assertNotIn("psp_media_pipeline_destroy", pump)
+        self.assertNotIn(
+            "media->machine.state != PSP_MEDIA_SESSION_PAUSED", pump)
+        self.assertIn("PSP_MEDIA_SUBTITLE_PARSE_BYTES", pump)
+        self.assertNotIn("for (unsigned unit", pump)
+        self.assertIn("PSP_MEDIA_SUBTITLE_RESERVE_US", pump)
+        self.assertIn("PSP_MEDIA_SUBTITLE_FRAME_ADMISSION_US", pump)
+        self.assertIn("psp_media_source_refilling(media)", pump)
+
+        advance = session[session.index("bool psp_media_advance("):]
+        subtitle_pump = advance.index(
+            "psp_media_subtitle_load_pump(media)")
+        self.assertGreater(
+            subtitle_pump,
+            advance.index("media_playback_advance_bounded_cancelable("))
+        self.assertGreater(
+            subtitle_pump,
+            advance.index("psp_ui_media_set_buffering("))
+        self.assertGreater(
+            advance.index("psp_media_subtitle_update_display(media)"),
+            subtitle_pump)
+
+        opening = without_comments(
+            (ROOT / "src/psp_media_open.c").read_text(encoding="utf-8"))
+        resolver_catalog = opening[
+            opening.index("YoutubeCaptionCatalog *catalog ="):
+            opening.index(
+                "youtube_resolve_job_destroy(media->resolver_job)",
+                opening.index("YoutubeCaptionCatalog *catalog ="))]
+        self.assertIn(
+            "budget_free(media->budget, media->caption_catalog)",
+            resolver_catalog)
 
     def test_youtube_result_preresolution_is_bounded_and_adopted(self):
         frontend = without_comments(
@@ -5401,7 +5882,8 @@ class PspSdkContractTests(unittest.TestCase):
         runtime = loop[
             loop.index("bool runtime_layout_changed = false;"):
             loop.index("ScriptMediaRequest dom_media_request;")]
-        self.assertIn("psp_advance_page_runtime(", runtime)
+        self.assertIn(
+            "psp_advance_page_runtime_with_reader_recovery(", runtime)
         runtime_helper = loop[
             loop.index("static TILEFINCH_OUT_OF_LINE bool "
                        "psp_advance_page_runtime("):
@@ -5868,6 +6350,141 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertLess(switch, tab_case)
         self.assertIn("psp_tabs_request(", heavy[tab_case:])
 
+    def test_blank_failure_return_reuses_exact_history_receiver(self):
+        actions = without_comments(
+            (ROOT / "src/psp_app/psp_app_actions.c").read_text(
+                encoding="utf-8"))
+        resolver = actions[
+            actions.index("static bool psp_app_resolve_recovery_return_action("):
+            actions.index("void psp_app_dispatch_action(")]
+        self.assertIn("PSP_UI_ACTION_RECOVERY_RETURN", resolver)
+        self.assertIn("lifecycle_retry_return_back", resolver)
+        self.assertIn("lifecycle_retry_return_forward", resolver)
+        self.assertIn("lifecycle_retry_return_home", resolver)
+        self.assertIn("PSP_UI_ACTION_FORWARD : PSP_UI_ACTION_BACK", resolver)
+        self.assertIn(
+            "lifecycle_retry_available = false", resolver)
+        heavy = actions[
+            actions.index("static void psp_app_dispatch_heavy_action("):
+            actions.index("case PSP_UI_ACTION_TOGGLE_BOOKMARK:")]
+        remap = heavy.index("psp_app_resolve_recovery_return_action(")
+        switch = heavy.index("switch (intent->action)")
+        back = heavy.index("case PSP_UI_ACTION_BACK:")
+        self.assertLess(remap, switch)
+        self.assertLess(switch, back)
+        back_branch = heavy[back:heavy.index(
+            "case PSP_UI_ACTION_VOICE_FOCUSED_TEXT:", back)]
+        self.assertIn("browser_engine_begin_navigation_history(", back_branch)
+        self.assertIn("navigation_back(", back_branch)
+        local_fragment = back_branch.index(
+            "navigation_url_is_same_document(")
+        self.assertIn("browser_engine_history_move(engine, forward)",
+                      back_branch[local_fragment:])
+        self.assertLess(local_fragment,
+                        back_branch.index(
+                            "psp_ensure_network_for_navigation(",
+                            local_fragment))
+        self.assertLess(local_fragment,
+                        back_branch.index("psp_ui_set_loading(",
+                                          local_fragment))
+        self.assertLess(local_fragment,
+                        back_branch.index(
+                            "psp_leave_reader_for_navigation(",
+                            local_fragment))
+        ordinary_return = heavy[heavy.index(
+            "case PSP_UI_ACTION_RECOVERY_RETURN:"):
+            heavy.index("case PSP_UI_ACTION_RECOVERY_READER:")]
+        self.assertIn("RETURNED TO LAST USABLE PAGE", ordinary_return)
+        self.assertIn(
+            "lifecycle_retry_return_back = false", ordinary_return)
+        self.assertIn("lifecycle_retry_return_home", ordinary_return)
+        self.assertIn("psp_show_native_home(app)", ordinary_return)
+        disable = heavy[heavy.index(
+            "case PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT:"):
+            heavy.index("case PSP_UI_ACTION_RECOVERY_READER:")]
+        self.assertIn("lifecycle_retry_url", disable)
+        self.assertIn("goto recovery_reload", disable)
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        ordinary_failure = main[
+            main.index("static TILEFINCH_OUT_OF_LINE void "
+                       "psp_navigation_present_failure("):
+            main.index("static TILEFINCH_COLD_PATH bool "
+                       "psp_handle_update_version_intent(")]
+        self.assertIn("lifecycle_retry_return_back = false", ordinary_failure)
+        self.assertIn("lifecycle_retry_return_forward = false", ordinary_failure)
+        blank_recovery = main[
+            main.index("static TILEFINCH_OUT_OF_LINE void "
+                       "psp_apply_reader_after_navigation_dirty("):
+            main.index("static TILEFINCH_OUT_OF_LINE bool "
+                       "psp_deferred_image_after_present(")]
+        unavailable = main[
+            main.index("static TILEFINCH_OUT_OF_LINE void "
+                       "psp_present_blank_reader_unavailable("):
+            main.index("static TILEFINCH_OUT_OF_LINE void "
+                       "psp_apply_reader_after_navigation_dirty(")]
+        self.assertIn(
+            "browser_engine_last_navigation_return_target", unavailable)
+        self.assertIn("BROWSER_NAVIGATION_RETURN_BACK", unavailable)
+        self.assertIn("BROWSER_NAVIGATION_RETURN_FORWARD", unavailable)
+        self.assertIn("BROWSER_NAVIGATION_RETURN_NONE", unavailable)
+        self.assertIn("lifecycle_retry_return_home", unavailable)
+        self.assertIn("BROWSER_BLANK_READER_RECOVERY_DEFERRED", blank_recovery)
+        basic_prepare = blank_recovery.index(
+            "browser_engine_prepare_basic_view_recovery")
+        reader_prepare = blank_recovery.index(
+            "browser_engine_prepare_blank_reader_recovery")
+        self.assertLess(basic_prepare, reader_prepare)
+        self.assertIn(
+            "BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE", blank_recovery)
+        self.assertIn("ui->basic_mode = true", blank_recovery)
+        self.assertIn("ui->reader_mode = false", blank_recovery)
+        self.assertIn("psp_present_blank_reader_unavailable", blank_recovery)
+        self.assertIn("blank_reader_recovery_pending = true", blank_recovery)
+        self.assertIn(
+            "blank_reader_recovery_generation", blank_recovery)
+        retry_helper = main[
+            main.index("static TILEFINCH_OUT_OF_LINE void "
+                       "psp_retry_deferred_blank_reader("):
+            main.index("static TILEFINCH_OUT_OF_LINE bool "
+                       "psp_deferred_image_after_present(")]
+        self.assertIn("blank_reader_recovery_pending", retry_helper)
+        self.assertIn("blank_reader_recovery_generation", retry_helper)
+        self.assertIn("psp_apply_reader_after_navigation", retry_helper)
+        runtime_wrapper = main[
+            main.index("psp_advance_page_runtime_with_reader_recovery("):
+            main.index("static TILEFINCH_OUT_OF_LINE "
+                       "BrowserRenderJobStatus psp_render_page_job(")]
+        self.assertIn("psp_advance_page_runtime", runtime_wrapper)
+        self.assertIn("psp_retry_deferred_blank_reader", runtime_wrapper)
+        self.assertIn("bool *layout_changed", runtime_wrapper)
+        runtime_retry = main[
+            main.index("bool runtime_layout_changed = false;"):
+            main.index("ScriptMediaRequest dom_media_request;")]
+        self.assertIn(
+            "psp_advance_page_runtime_with_reader_recovery", runtime_retry)
+
+    def test_successful_saved_app_launch_clears_library_toast(self):
+        actions = without_comments(
+            (ROOT / "src/psp_app/psp_app_actions.c").read_text(
+                encoding="utf-8"))
+        branch = actions[
+            actions.index("char offline_url[NAVIGATION_URL_LIMIT]"):
+            actions.index("break;", actions.index("bool offline_opened ="))]
+        opened = branch[branch.index("if (offline_opened) {"):]
+        self.assertIn("presentation.ui.status[0] = '\\0'", opened)
+        self.assertIn("presentation.ui.toast_frames = 0u", opened)
+        self.assertIn("presentation.ui.toast_entry_frames = 0u", opened)
+        self.assertIn("if (fullscreen_offline_app)", opened)
+        self.assertIn("presentation.ui.chrome_visible = false", opened)
+        self.assertIn("presentation.ui.cursor_visible = false", opened)
+        self.assertIn(
+            "== TILEFINCH_WEB_APP_DISPLAY_FULLSCREEN",
+            branch[:branch.index("bool offline_opened =")])
+        self.assertLess(
+            opened.index("presentation.ui.status[0] = '\\0'"),
+            opened.index("if (!offline_opened)"))
+
     def test_site_allowlist_uses_local_surface_reload_policy(self):
         settings = without_comments(
             (ROOT / "src/psp_app/psp_app_settings.c").read_text(
@@ -5952,6 +6569,125 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("rtc-status=%s", report)
         self.assertNotIn("sceRtcCheckValid", report)
 
+    def test_invalid_rtc_does_not_halt_local_startup(self):
+        main = without_comments(
+            (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8"))
+        clock = main[main.index(
+            "PspTimeStatus rtc_status = psp_time_read_utc_fields("):]
+        clock = clock[:clock.index("psp_log_checkpoint(\"tls-assets-ready\")")]
+        invalid = clock[clock.index("if (rtc_status != PSP_TIME_OK)"):]
+        self.assertIn("action=continue-offline", invalid)
+        self.assertNotIn("goto sleep_forever", invalid)
+        halted = main[main.index("sleep_forever:"):]
+        self.assertIn("psp_report_startup_failure(", halted)
+        helper = main[
+            main.index("static TILEFINCH_COLD_PATH void "
+                       "psp_report_startup_failure("):
+            main.index("int main(int argc", main.index(
+                "static TILEFINCH_COLD_PATH void "
+                "psp_report_startup_failure("))]
+        self.assertIn('psp_write_failure_report("startup"', helper)
+        self.assertIn("startup_failure_screen", halted)
+        self.assertNotIn("STARTUP FAILED - SEE LOG", halted)
+
+    def test_psplink_browser_target_owns_required_runtime_assets(self):
+        targets = (ROOT / "cmake/TilefinchTargets.cmake").read_text(
+            encoding="utf-8")
+        start = targets.index(
+            "add_custom_target(psp-browser-script-dev-assets")
+        assets = targets[start:targets.index(
+            "add_dependencies(psp-browser-script-dev-prx", start)]
+        self.assertIn("${PSP_BROWSER_PSP_CA_BUNDLE}", assets)
+        self.assertIn('"${CMAKE_CURRENT_BINARY_DIR}/roots.pem"', assets)
+        self.assertIn("${PSP_BROWSER_METRIC_SANS_FONT}", assets)
+        self.assertIn("boot-defaults.cfg", assets)
+        device = (ROOT / "scripts/psplink-device.sh").read_text(
+            encoding="utf-8")
+        self.assertIn('"$BUILD_DIR/roots.pem"', device)
+        self.assertIn('input_script=$(sed -n \'s/^input_script=//p\'',
+                      device)
+        self.assertIn('"$ROOT/tests/input-scripts/$input_script"', device)
+        self.assertIn('"$BUILD_DIR/$input_script"', device)
+        self.assertIn("PSPLink input script missing", device)
+        self.assertLess(
+            device.index('"$BUILD_DIR/roots.pem"'),
+            device.index("require_module_absent Tilefinch"))
+
+    def test_psplink_asset_probe_does_not_require_host0_seeking(self):
+        source = without_comments(
+            (ROOT / "src/psp_app/psp_app_input.c").read_text(
+                encoding="utf-8"))
+        probe = source[source.index("bool psp_probe_file("):]
+        probe = probe[:probe.index("\n}\n") + 3]
+        self.assertIn("sceIoOpen(", probe)
+        self.assertIn("sceIoRead(", probe)
+        self.assertIn("sceIoClose(", probe)
+        self.assertNotIn("fopen(", probe)
+        self.assertNotIn("fread(", probe)
+        self.assertNotIn("fseek(", probe)
+        self.assertNotIn("ftell(", probe)
+        self.assertIn("sceIoGetstat(", probe)
+        self.assertIn("file_stat.st_size > (uint64_t) maximum_bytes", probe)
+        self.assertIn("static uint8_t psp_probe_file_scratch[4096]", source)
+        self.assertIn("sceIoRead(file, psp_probe_file_scratch, request)", probe)
+        self.assertIn("tilefinch_sha256_update", probe)
+        self.assertIn("tilefinch_sha256_final", probe)
+
+    def test_psplink_input_script_uses_the_native_host0_driver(self):
+        source = (ROOT / "src/psp_input_script.c").read_text(
+            encoding="utf-8")
+        loader = source[source.index("bool psp_input_script_load("):]
+        loader = loader[:loader.index("bool psp_input_script_armed(")]
+        psp = loader[loader.index("#ifdef __PSP__"):
+                     loader.index("#else", loader.index("#ifdef __PSP__"))]
+        self.assertIn("sceIoGetstat(path, &file_stat)", psp)
+        self.assertIn("sceIoOpen(path, PSP_O_RDONLY, 0)", psp)
+        self.assertIn("while (!read_failed && read < expected)", psp)
+        self.assertIn("sceIoRead(file, text + read, expected - read)", psp)
+        self.assertIn("sceIoClose(file)", psp)
+        self.assertNotIn("fopen(", psp)
+        self.assertNotIn("fread(", psp)
+        self.assertNotIn("fseek(", psp)
+
+        app_source = (ROOT / "src/psp_app/psp_app_input_script.c").read_text(
+            encoding="utf-8")
+        begin = app_source[app_source.index("bool psp_input_script_begin("):]
+        begin = begin[:begin.index("bool psp_input_script_running(")]
+        self.assertIn("if (install_paths != NULL)", begin)
+        self.assertIn("tilefinch_install_program_path(", begin)
+        self.assertNotIn("install_paths->slotted", begin)
+
+    def test_validation_ca_diagnostic_cannot_brick_local_startup(self):
+        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        probe = main[main.index("if (!psp_probe_file("):]
+        probe = probe[:probe.index("#endif", probe.index("if (!psp_probe_file("))]
+        self.assertIn("trust bundle diagnostic unavailable", probe)
+        self.assertNotIn("goto sleep_forever", probe)
+
+    def test_psp_ca_blob_loader_does_not_seek_device_files(self):
+        fetch = (ROOT / "src/fetch.c").read_text(encoding="utf-8")
+        loader = fetch[fetch.index("/* Reads the configured trust bundle"):]
+        loader = loader[:loader.index("#endif /* TILEFINCH_FETCH_CA_BLOB */")]
+        psp_branch = loader[loader.index("#if defined(__PSP__)"):
+                            loader.index("#else")]
+        self.assertIn("sceIoGetstat(", psp_branch)
+        self.assertIn("sceIoOpen(", psp_branch)
+        self.assertIn("sceIoRead(", psp_branch)
+        self.assertNotIn("fseek(", psp_branch)
+        self.assertNotIn("ftell(", psp_branch)
+
+    def test_validation_preloads_ca_after_media_pool_reservation(self):
+        main = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
+        call = "psp_preload_validation_ca_bundle(&process.install_paths);"
+        self.assertIn("fetch_prepare_ca_bundle()", main)
+        self.assertGreater(main.index(call),
+                           main.index("media_psp_backend_reserve_pool();"))
+        fetch = (ROOT / "src/fetch.c").read_text(encoding="utf-8")
+        self.assertIn("fetch_ca_blob_psp_storage[64u * 1024u]", fetch)
+        setter = fetch[fetch.index("bool fetch_set_ca_bundle_path("):
+                       fetch.index("const char *fetch_ca_bundle_path(")]
+        self.assertIn("strcmp(fetch_ca_bundle, path) == 0", setter)
+
     def test_psp_curl_patch_retains_and_resets_verify_flags(self):
         patch = (ROOT / "patches/curl-8.21.0-psp.patch").read_text(
             encoding="utf-8")
@@ -5983,6 +6719,46 @@ class PspSdkContractTests(unittest.TestCase):
         report = (ROOT / "src/psp_script_main.c").read_text(encoding="utf-8")
         self.assertIn("tls-verify-available=%d", report)
         self.assertIn("tls-verification-failed=%d", report)
+
+    def test_macos_ppsspp_harnesses_never_fall_back_to_direct_launch(self):
+        harnesses = (
+            "scripts/run-ppsspp-input-script.sh",
+            "scripts/run-ppsspp-device-cost.sh",
+            "scripts/run-ppsspp-crypto-selftest.sh",
+            "scripts/run-ppsspp-network.sh",
+        )
+        for relative in harnesses:
+            source = (ROOT / relative).read_text(encoding="utf-8")
+            with self.subTest(harness=relative):
+                self.assertNotIn("ppsspp_direct_fallback", source)
+                self.assertNotIn("lsregister=", source)
+                self.assertIn("Direct PPSSPP launch is unsafe on macOS", source)
+                self.assertIn("CFBundleIdentifier", source)
+                self.assertIn("open -g -n -W", source)
+                direct = source.find('HOME="$home_dir" "$ppsspp"')
+                self.assertGreater(direct, 0)
+                launch_branch = source.rfind(
+                    'if [ "$is_darwin" -eq 1 ]; then', 0, direct)
+                self.assertGreater(launch_branch, 0)
+                self.assertLess(launch_branch, direct)
+        manual = (ROOT / "scripts/launch-ppsspp-safe.sh").read_text(
+            encoding="utf-8")
+        self.assertIn("open -g -n -W", manual)
+
+    def test_ppsspp_live_network_harness_has_bounded_dns_alias_seam(self):
+        source = (ROOT / "scripts/run-ppsspp-network.sh").read_text(
+            encoding="utf-8")
+        self.assertIn("TILEFINCH_PPSSPP_HOST_ALIASES", source)
+        self.assertIn("TILEFINCH_PPSSPP_TRACE_DIRECTORY", source)
+        self.assertIn("[HostAliases]", source)
+        self.assertIn("invalid PPSSPP host alias", source)
+        self.assertIn("invalid PPSSPP replay trace", source)
+        self.assertIn('"trace=$trace_name"', source)
+        self.assertIn("InfrastructureAutoDNS = True", source)
+        base_copy = source.index('cp "$run_dir/network.ini"')
+        alias_append = source.index(
+            '} >>"$home_dir/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"')
+        self.assertLess(base_copy, alias_append)
 
 
 if __name__ == "__main__":

@@ -75,11 +75,25 @@ browser's existing loader and security policy, not a new privileged runtime.
 manifest, stylesheet, and game script are same-origin and self-contained, so
 an HTTPS-hosted copy can be previewed, installed, reopened without a network,
 updated, and uninstalled through the same user-facing path as another small
-web game.
+web game. `examples/treadline-arena/` follows the same packaging contract with
+a self-contained WebGL and Gamepad tank game whose Survival, Team Control, and
+Convoy Escort modes, tank classes, and optional Command rules all reopen
+without network access. Its optional two-player Team Control mode requests the
+network only after the player chooses Host, Find LAN, or Enter code; opening
+the installed game itself remains offline. The channel and discovery contract
+is documented in [Direct multiplayer](MULTIPLAYER.md).
 
 Installed apps appear in **Library → Saved**. Square says **Uninstall** for an
 app and requires a second press on the same row; Circle cancels the armed
 action. The index is made durable before the app payload generation is removed.
+
+An installed app whose captured manifest requests `display: fullscreen` enters
+an immersive page presentation as part of the trusted Library handoff, so the
+browser bars do not cover its first menu frame. This does not grant controller
+capture or DOM fullscreen to page script: Triangle restores Tilefinch chrome,
+and Page-controls still requires a trusted activation or the Start+Select
+chord. Browser, minimal-UI, and standalone snapshots keep the ordinary browser
+presentation for now.
 
 ## YouTube downloads
 

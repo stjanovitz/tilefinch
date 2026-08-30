@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "tilefinch/browser_engine.h"
+#include "tilefinch/browser_profile.h"
 #include "tilefinch/offline_download.h"
 #include "tilefinch/psp_media_session.h"
 #include "tilefinch/psp_ui.h"
@@ -45,8 +46,9 @@ const PspUiOfflineAppPreview *psp_offline_store_app_preview(
 bool psp_offline_store_open_library(
     PspOfflineStore *store, BrowserEngine *engine, bool record_history);
 PspOfflineRouteResult psp_offline_store_handle_url(
-    PspOfflineStore *store, BrowserEngine *engine, const char *url,
-    const char *source_title, bool record_history);
+    PspOfflineStore *store, BrowserEngine *engine,
+    const BrowserProfile *profile, const char *url, const char *source_title,
+    bool record_history);
 bool psp_offline_store_resolve_media(
     void *context, const char *url, PspMediaOfflineSource *source);
 bool psp_offline_store_pump(PspOfflineStore *store);

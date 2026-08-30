@@ -1,0 +1,83 @@
+diff --git a/psplink/main.c b/psplink/main.c
+index 68df5ba..cb7ed94 100644
+--- a/psplink/main.c
++++ b/psplink/main.c
+@@ -10,6 +10,7 @@
+  *
+  */
+ #include <pspkernel.h>
++#include <pspctrl.h>
+ #include <pspdebug.h>
+ #include <pspkdebug.h>
+ #include <pspsdk.h>
+@@ -42,6 +43,62 @@ PSP_MODULE_INFO("PSPLINK", 0x1000, 1, 1);
+ 
+ struct GlobalContext g_context;
+ 
++/*
++ * The bootstrap unloads itself after starting this kernel module, so there is
++ * no ordinary user-mode callback thread left to service the system HOME
++ * dialog.  Keep this watcher deliberately separate from the shell: HOME is a
++ * device-local escape hatch even when the host bridge is gone.  It observes
++ * an edge only after an initial release so launching with HOME held cannot
++ * immediately bounce back to VSH.
++ */
++static int home_exit_thread(SceSize args, void *argp)
++{
++	SceCtrlData pad;
++	int armed = 0;
++	int home_was_down = 0;
++
++	(void) args;
++	(void) argp;
++	memset(&pad, 0, sizeof(pad));
++	for(;;)
++	{
++		int read = sceCtrlPeekBufferPositive(&pad, 1);
++		if(read > 0)
++		{
++			int home_is_down = (pad.Buttons & PSP_CTRL_HOME) != 0;
++			if(!home_is_down)
++			{
++				armed = 1;
++			}
++			else if(armed && !home_was_down)
++			{
++				/* Match reset/load-exec teardown before returning to VSH. */
++				debugDisableHW();
++				psplinkSetK1(0);
++				psplinkStop();
++				stop_usbhost();
++				sceKernelDelayThread(50000);
++				psplinkExitShell();
++				sceKernelExitDeleteThread(-1);
++			}
++			home_was_down = home_is_down;
++		}
++		sceKernelDelayThread(20000);
++	}
++
++	return 0;
++}
++
++static void start_home_exit_thread(void)
++{
++	SceUID thid = sceKernelCreateThread(
++		"PspLinkHomeExit", home_exit_thread, 0x18, 0x1000, 0, NULL);
++	if(thid >= 0)
++	{
++		sceKernelStartThread(thid, 0, NULL);
++	}
++}
++
+ void save_execargs(int argc, char **argv);
+ 
+ int unload_loader(void)
+@@ -367,6 +424,7 @@ void initialise(SceSize args, void *argp)
+ int main_thread(SceSize args, void *argp)
+ {
+ 	initialise(args, argp);
++	start_home_exit_thread();
+ 
+ 	shellParseThread(0, NULL);
+ 	sceKernelSleepThread();

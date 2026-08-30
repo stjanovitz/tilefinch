@@ -9,6 +9,7 @@
    */
   const STYLE_LIMIT = 64,
     STYLE_BYTES_LIMIT = 256 * 1024,
+    STYLE_NODE_LIMIT = 4096,
     KEYFRAME_LIMIT = 16,
     RULE_LIMIT = 128,
     ELEMENT_LIMIT = 128,
@@ -64,6 +65,57 @@
         else if (character === "}" && --depth === 0) return at;
       }
       return limit;
+    },
+    boundedUtf8Length = (text) => {
+      let bytes = 0;
+      for (let at = 0; at < text.length; at++) {
+        const code = text.charCodeAt(at);
+        if (code <= 0x7f) bytes++;
+        else if (code <= 0x7ff) bytes += 2;
+        else if (
+          code >= 0xd800 &&
+          code <= 0xdbff &&
+          at + 1 < text.length &&
+          text.charCodeAt(at + 1) >= 0xdc00 &&
+          text.charCodeAt(at + 1) <= 0xdfff
+        ) {
+          bytes += 4;
+          at++;
+        } else bytes += 3;
+      }
+      return bytes;
+    },
+    styleTextPrefix = (style, maximumBytes, maximumNodes) => {
+      if (!style || maximumBytes <= 0 || maximumNodes <= 0)
+        return { text: "", nodes: 0 };
+      try {
+        const result = globalThis.__tilefinchGetTextPrefix?.(
+            style.__handle,
+            Math.min(STYLE_BYTES_LIMIT, maximumBytes),
+            Math.min(STYLE_NODE_LIMIT, maximumNodes),
+          );
+        return result && typeof result === "object"
+          ? {
+              text: String(result.text || ""),
+              nodes: Math.max(0, Math.min(maximumNodes, result.nodes | 0)),
+            }
+          : { text: "", nodes: 0 };
+      } catch {
+        return { text: "", nodes: 0 };
+      }
+    },
+    styleAttributePrefix = (element, maximumBytes) => {
+      if (!element || maximumBytes <= 0) return "";
+      try {
+        return String(
+          globalThis.__tilefinchGetStyleAttributePrefix?.(
+            element.__handle,
+            Math.min(STYLE_BYTES_LIMIT, maximumBytes),
+          ) ?? "",
+        );
+      } catch {
+        return "";
+      }
     },
     declarationMap = (text) => {
       const declarations = new Map();
@@ -418,18 +470,19 @@
       scans++;
       const keyframes = new Map(),
         rules = [];
-      let retainedBytes = 0;
-      const styleNodes = Array.from(document.querySelectorAll("style")).slice(
-        0,
-        STYLE_LIMIT,
-      );
-      for (const style of styleNodes) {
-        const text = String(style.textContent || ""),
-          available = STYLE_BYTES_LIMIT - retainedBytes;
-        if (available <= 0) break;
-        const retained = text.slice(0, available);
-        retainedBytes += retained.length;
-        parseRules(retained, 0, retained.length, keyframes, rules);
+      let retainedBytes = 0,
+        retainedNodes = 0;
+      const styleNodes = document.querySelectorAll("style"),
+        styleCount = Math.min(STYLE_LIMIT, styleNodes.length);
+      for (let styleIndex = 0; styleIndex < styleCount; styleIndex++) {
+        const style = styleNodes[styleIndex];
+        const available = STYLE_BYTES_LIMIT - retainedBytes,
+          availableNodes = STYLE_NODE_LIMIT - retainedNodes;
+        if (available <= 0 || availableNodes <= 0) break;
+        const retained = styleTextPrefix(style, available, availableNodes);
+        retainedBytes += boundedUtf8Length(retained.text);
+        retainedNodes += retained.nodes;
+        parseRules(retained.text, 0, retained.text.length, keyframes, rules);
       }
       const candidates = new Map();
       for (const rule of rules) {
@@ -451,10 +504,21 @@
         inlineElements = document.querySelectorAll("[style]");
       } catch {}
       for (const element of inlineElements) {
+        if (
+          retainedBytes >= STYLE_BYTES_LIMIT ||
+          retainedNodes >= STYLE_NODE_LIMIT
+        )
+          break;
         if (!candidates.has(element) && candidates.size >= ELEMENT_LIMIT)
           break;
+        const retained = styleAttributePrefix(
+          element,
+          STYLE_BYTES_LIMIT - retainedBytes,
+        );
+        retainedBytes += boundedUtf8Length(retained);
+        retainedNodes++;
         const config = animationConfig(
-          declarationMap(element.getAttribute("style") || ""),
+          declarationMap(retained),
         );
         if (config) candidates.set(element, config);
       }
@@ -527,13 +591,33 @@
         if (globalThis.__tilefinchStylesheetHasMotionKeyframes?.())
           return true;
         const roots = [document.head, document.body];
+        let inspectedBytes = 0,
+          inspectedNodes = 0;
         for (const root of roots) {
           let node = root?.firstElementChild || null;
-          for (let visited = 0; node && visited < STYLE_LIMIT; visited++) {
-            const text =
-              String(node.localName || "").toLowerCase() === "style"
-                ? String(node.textContent || "")
-                : String(node.getAttribute("style") || "");
+          for (
+            let visited = 0;
+            node &&
+            visited < STYLE_LIMIT &&
+            inspectedBytes < STYLE_BYTES_LIMIT &&
+            inspectedNodes < STYLE_NODE_LIMIT;
+            visited++
+          ) {
+            const available = STYLE_BYTES_LIMIT - inspectedBytes;
+            let text = "";
+            if (String(node.localName || "").toLowerCase() === "style") {
+              const retained = styleTextPrefix(
+                node,
+                available,
+                STYLE_NODE_LIMIT - inspectedNodes,
+              );
+              text = retained.text;
+              inspectedNodes += retained.nodes;
+            } else {
+              text = styleAttributePrefix(node, available);
+              inspectedNodes++;
+            }
+            inspectedBytes += boundedUtf8Length(text);
             if (
               /@(?:-webkit-)?keyframes\b|\banimation(?:-name)?\s*:/i.test(
                 text,

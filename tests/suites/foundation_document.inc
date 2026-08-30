@@ -359,7 +359,7 @@
     document_destroy(&request_policy_document);
     CHECK(budget.current == request_policy_baseline);
 
-    puts("test: streamed EventSource and fail-closed WebSocket lifecycle");
+    puts("test: streamed EventSource and bounded WebSocket lifecycle");
     size_t live_network_baseline = budget.current;
     char live_network_trace_error[256] = {0};
     CHECK(fetch_trace_replay_begin(
@@ -372,15 +372,22 @@
     CHECK(document_parse(
         &live_network_document, &budget, live_network_page,
         strlen(live_network_page), 17));
-    ScriptRuntime *live_network_runtime = script_runtime_create_deferred(
+    ScriptRuntimeOptions live_network_options = {
+        .allow_test_network_primitive_overrides = true
+    };
+    CHECK(viewport_context_init(
+        &live_network_options.viewport, 480, 272, 480, 272));
+    ScriptRuntime *live_network_runtime = script_runtime_create_configured(
         &live_network_document, &budget, 5 * MIB, 1000,
-        "https://events.test/page", NULL, &live_network_result);
+        "https://events.test/page", &live_network_options,
+        &live_network_result);
     static const char live_network_source[] =
-        "(()=>{const seen=[];let socketClosed=false,sourceDone=false;"
+        "(()=>{const seen=[];let socketClosed=false,sourceDone=false,"
+        "socketChecks=true,socketSends=0;"
         "const mark=value=>{seen.push(value);globalThis.pocSummary="
         "'live-network:seen:'+seen.join('|');};"
         "const finish=()=>{if(socketClosed&&sourceDone)"
-        "globalThis.pocSummary=seen.join('|');};"
+        "globalThis.pocSummary=socketChecks?'live-network-ok':'socket-bad';};"
         "const source=new EventSource('/feed');"
         "source.onopen=()=>mark('open');"
         "source.addEventListener('status',event=>mark("
@@ -388,14 +395,49 @@
         "source.onmessage=event=>{mark('message:'+event.data+':'"
         "+event.lastEventId);sourceDone=true;source.close();finish();};"
         "source.onerror=()=>{if(!sourceDone)mark('source-error');};"
+        "__tilefinchWebSocketStart=(url,protocols)=>{socketChecks&&="
+        "url==='wss://events.test/socket'&&protocols==='chat';return 77;};"
+        "__tilefinchWebSocketSend=(id,buffer,binary)=>{const bytes="
+        "new Uint8Array(buffer),first=socketSends++===0;socketChecks&&="
+        "id===77&&(first?(!binary&&new TextDecoder().decode(buffer)==="
+        "'bird'):(binary&&bytes.join(',')==='1,2,3'));queueMicrotask(()=>{"
+        "__tilefinchDeliverWebSocket(77,'drain',bytes.length,'',0,false);"
+        "if(first)__tilefinchDeliverWebSocket(77,'text',new TextEncoder()"
+        ".encode('echo:bird').buffer,'',0,false);else "
+        "__tilefinchDeliverWebSocket(77,'binary',new Uint8Array([3,2,1])"
+        ".buffer,'',0,false);});return true;};"
+        "__tilefinchWebSocketClose=(id,code,reason)=>{socketChecks&&="
+        "id===77&&code===1000&&reason==='done';queueMicrotask(()=>"
+        "__tilefinchDeliverWebSocket(77,'close',undefined,'done',1000,true));"
+        "return true;};"
         "const socket=new WebSocket('wss://events.test/socket',['chat']);"
-        "socket.onclose=event=>{socketClosed=event.code===1006"
-        "&&!event.wasClean;mark('socket-closed');finish();};"
+        "socket.onopen=()=>{socketChecks&&=socket.protocol==='chat';"
+        "socket.send('bird');socketChecks&&=socket.bufferedAmount===4;};"
+        "socket.onmessage=event=>{if(typeof event.data==='string'){"
+        "socketChecks&&=event.data==='echo:bird'&&socket.bufferedAmount===0;"
+        "socket.binaryType='arraybuffer';socket.send(new Uint8Array([1,2,3]));"
+        "socketChecks&&=socket.bufferedAmount===3;}else{socketChecks&&="
+        "event.data instanceof ArrayBuffer&&new Uint8Array(event.data)"
+        ".join(',')==='3,2,1'&&socket.bufferedAmount===0;"
+        "socket.close(1000,'done');}};"
+        "socket.onclose=event=>{socketClosed=event.code===1000"
+        "&&event.wasClean&&event.reason==='done';finish();};"
+        "queueMicrotask(()=>__tilefinchDeliverWebSocket("
+        "77,'open',undefined,'chat',0,false));"
         "let invalidClose=false;try{new WebSocket("
         "'wss://events.test/socket#bad');}"
         "catch(error){invalidClose=error instanceof DOMException"
         "&&error.name==='SyntaxError';}"
-        "if(!invalidClose)mark('socket-validation-failed');"
+        "let invalidCode=false;try{socket.close(NaN);}catch(error){"
+        "invalidCode=error instanceof DOMException&&"
+        "error.name==='InvalidAccessError';}"
+        "let iteratorClosed=false,nexts=0,bounded=false;try{new WebSocket("
+        "'wss://events.test/overflow',{[Symbol.iterator](){return{next(){"
+        "nexts++;return{value:'p'+nexts,done:false};},return(){iteratorClosed="
+        "true;return{done:true};}};}});}catch(error){bounded=error instanceof "
+        "DOMException&&error.name==='SyntaxError';}socketChecks&&="
+        "invalidClose&&invalidCode&&bounded&&iteratorClosed&&nexts===17;"
+        "if(!socketChecks)mark('socket-validation-failed');"
         "globalThis.pocSummary='live-network:pending';})()";
     bool live_network_evaluated = live_network_runtime != NULL
         && live_network_result.success
@@ -411,28 +453,101 @@
          tick < 32
          && strcmp(
                 live_network_result.summary,
-                "open|status:first\nsecond:7|message:final bird:7|"
-                "socket-closed") != 0;
+                "live-network-ok") != 0;
          tick++) {
         CHECK(script_runtime_advance(
             live_network_runtime, 1, 4, &live_network_result));
     }
     if (strcmp(
             live_network_result.summary,
-            "open|status:first\nsecond:7|message:final bird:7|"
-            "socket-closed") != 0) {
+            "live-network-ok") != 0) {
         fprintf(stderr, "live network summary=%s error=%s trace=%s\n",
                 live_network_result.summary, live_network_result.error,
                 live_network_trace_error);
     }
     CHECK(strcmp(
         live_network_result.summary,
-        "open|status:first\nsecond:7|message:final bird:7|"
-        "socket-closed") == 0);
+        "live-network-ok") == 0);
     script_runtime_destroy(live_network_runtime);
     document_destroy(&live_network_document);
     fetch_trace_end();
     CHECK(budget.current == live_network_baseline);
+
+    puts("test: installed-game multiplayer channel lifecycle");
+    size_t multiplayer_baseline = budget.current;
+    static const char multiplayer_page[] =
+        "<!doctype html><title>Installed game</title><body></body>";
+    PocDocument multiplayer_document = {0};
+    ScriptResult multiplayer_result = {0};
+    CHECK(document_parse(
+        &multiplayer_document, &budget, multiplayer_page,
+        strlen(multiplayer_page), 17));
+    ScriptRuntimeOptions multiplayer_options = {
+        .allow_test_network_primitive_overrides = true
+    };
+    CHECK(viewport_context_init(
+        &multiplayer_options.viewport, 480, 272, 480, 272));
+    ScriptRuntime *multiplayer_runtime = script_runtime_create_configured(
+        &multiplayer_document, &budget, 5 * MIB, 1000,
+        "https://tilefinch.local/offline/app?id=7", &multiplayer_options,
+        &multiplayer_result);
+    static const char multiplayer_source[] =
+        "(()=>{let good=true,sends=0;"
+        "__tilefinchMultiplayerStart=(mode,game,name,code)=>{good&&="
+        "mode==='host'&&game==='treadline-arena'&&name==='Bird'&&!code;"
+        "return 91;};"
+        "__tilefinchMultiplayerSend=(id,buffer,binary)=>{const bytes="
+        "new Uint8Array(buffer);good&&=id===91&&!binary&&"
+        "new TextDecoder().decode(buffer)==='hello';sends++;"
+        "queueMicrotask(()=>{__tilefinchDeliverMultiplayer(91,'drain',"
+        "bytes.length,'',0,false,0,'','');"
+        "__tilefinchDeliverMultiplayer(91,'binary',new Uint8Array([4,5])"
+        ".buffer,'',0,false,0,'','');});return true;};"
+        "__tilefinchMultiplayerAccept=(id,peer,yes)=>"
+        "(good&&=id===91&&peer===7&&yes,true);"
+        "__tilefinchMultiplayerAddRemoteCode=(id,code)=>"
+        "(good&&=id===91&&code==='123456789012',true);"
+        "__tilefinchMultiplayerClose=(id,code,reason)=>{good&&="
+        "id===91&&code===1000&&reason==='done';queueMicrotask(()=>"
+        "__tilefinchDeliverMultiplayer(91,'close',undefined,'done',1000,"
+        "true,0,'',''));return true;};"
+        "const channel=navigator.tilefinchMultiplayer.host({"
+        "gameId:'treadline-arena',name:'Bird'});"
+        "good&&=channel.readyState==='connecting'&&!channel.ordered&&"
+        "channel.maxRetransmits===0&&navigator.tilefinchMultiplayer."
+        "maxMessageSize===512;"
+        "channel.oninvitecode=e=>{good&&=e.code==='123456789012';"
+        "good&&=channel.addRemoteCode(e.code);};"
+        "channel.onpeerrequest=e=>{good&&=e.peerIdentity===7&&"
+        "e.name==='Finch';good&&=channel.accept(e.peerIdentity);};"
+        "channel.onopen=()=>{channel.send('hello');good&&="
+        "channel.bufferedAmount===5;};"
+        "channel.onmessage=e=>{good&&=e.data instanceof ArrayBuffer&&"
+        "new Uint8Array(e.data).join(',')==='4,5'&&"
+        "channel.bufferedAmount===0&&sends===1;channel.close(1000,'done');};"
+        "channel.onclose=e=>{globalThis.pocSummary=good&&e.wasClean&&"
+        "e.code===1000?'multiplayer-ok':'multiplayer-bad';};"
+        "queueMicrotask(()=>{__tilefinchDeliverMultiplayer(91,'invitecode',"
+        "undefined,'direct',0,false,0,'123456789012','');"
+        "__tilefinchDeliverMultiplayer(91,'peerrequest',undefined,'lan',0,"
+        "false,7,'','Finch');__tilefinchDeliverMultiplayer(91,'open',"
+        "undefined,'',0,false,7,'','Finch');});"
+        "globalThis.pocSummary='multiplayer-pending';})()";
+    CHECK(multiplayer_runtime != NULL && multiplayer_result.success
+          && script_runtime_evaluate_diagnostic(
+                 multiplayer_runtime, multiplayer_source,
+                 "<multiplayer-probe>", &multiplayer_result));
+    for (size_t tick = 0;
+         tick < 16u
+         && strcmp(multiplayer_result.summary, "multiplayer-ok") != 0;
+         tick++) {
+        CHECK(script_runtime_advance(
+            multiplayer_runtime, 1, 4, &multiplayer_result));
+    }
+    CHECK(strcmp(multiplayer_result.summary, "multiplayer-ok") == 0);
+    script_runtime_destroy(multiplayer_runtime);
+    document_destroy(&multiplayer_document);
+    CHECK(budget.current == multiplayer_baseline);
 
     puts("test: cooperative script cancellation and recovery");
     size_t script_cancellation_baseline = budget.current;
@@ -921,6 +1036,101 @@
           && stylesheet_animation_result.bootstrap_lazy_module_loads == 1
           && stylesheet_animation_result.bootstrap_lazy_module_failures == 0);
 
+    puts("test: bounded native text prefixes preserve textContent semantics");
+    static const char bounded_text_prefix_source[] =
+        "(()=>{const style=document.createElement('style');"
+        "style.append(document.createTextNode('\\u00e9a'),"
+        "document.createTextNode('bc'));document.head.appendChild(style);"
+        "const complete=style.textContent,prefix="
+        "__tilefinchGetTextPrefix(style.__handle,3,4096),"
+        "oneNode=__tilefinchGetTextPrefix(style.__handle,16,2),"
+        "allNodes=__tilefinchGetTextPrefix(style.__handle,16,3),"
+        "box=document.createElement('div');"
+        "box.setAttribute('style','\\u00e9abc');"
+        "document.body.appendChild(box);"
+        "const attr=__tilefinchGetStyleAttributePrefix(box.__handle,3);"
+        "globalThis.pocSummary=complete==='\\u00e9abc'"
+        "&&prefix.text==='\\u00e9a'&&prefix.nodes===2"
+        "&&oneNode.text==='\\u00e9a'&&oneNode.nodes===2"
+        "&&allNodes.text==='\\u00e9abc'&&allNodes.nodes===3"
+        "&&attr==='\\u00e9a'&&box.getAttribute('style')==='\\u00e9abc'"
+        "?'BOUNDED-TEXT-PREFIX-OK':'BOUNDED-TEXT-PREFIX-BAD:'"
+        "+[complete,prefix.text,prefix.nodes,oneNode.text,oneNode.nodes,"
+        "allNodes.text,allNodes.nodes,attr].join('|')})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              stylesheet_animation_runtime, bounded_text_prefix_source,
+              "<bounded-text-prefix>", &stylesheet_animation_result)
+          && stylesheet_animation_result.success
+          && strcmp(stylesheet_animation_result.summary,
+                    "BOUNDED-TEXT-PREFIX-OK") == 0);
+
+    puts("test: bounded text prefix charges textless descendants");
+    static const char bounded_textless_start_source[] =
+        "globalThis.__boundedTextless=document.createElement('style');"
+        "__boundedTextless.appendChild(document.createTextNode('x'));"
+        "document.head.appendChild(__boundedTextless)";
+    static const char bounded_textless_finish_source[] =
+        "(()=>{const prefix=__tilefinchGetTextPrefix("
+        "__boundedTextless.__handle,16,128);"
+        "globalThis.pocSummary=prefix.text==='x'"
+        "&&prefix.nodes===128?'BOUNDED-TEXTLESS-NODES-OK':"
+        "'BOUNDED-TEXTLESS-NODES-BAD:'+"
+        "[prefix.text,prefix.nodes].join('|')})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+        stylesheet_animation_runtime, bounded_textless_start_source,
+        "<bounded-textless-start>", &stylesheet_animation_result));
+    lxb_dom_node_t *textless_style = NULL;
+    lxb_dom_node_t *textless_root = lxb_dom_interface_node(
+        deterministic_tick_document.html);
+    lxb_dom_node_t *textless_at = textless_root;
+    for (size_t visited = 0; textless_at != NULL && visited < 512; visited++) {
+        size_t name_length = 0;
+        const char *name = document_element_name(textless_at, &name_length);
+        if (name != NULL && name_length == 5
+            && strncasecmp(name, "style", 5) == 0) {
+            textless_style = textless_at;
+        }
+        if (textless_at->first_child != NULL) {
+            textless_at = textless_at->first_child;
+            continue;
+        }
+        while (textless_at != NULL && textless_at != textless_root
+               && textless_at->next == NULL) {
+            textless_at = textless_at->parent;
+        }
+        textless_at = textless_at == NULL || textless_at == textless_root
+            ? NULL : textless_at->next;
+    }
+    CHECK(textless_style != NULL);
+    BudgetAllocationOwner textless_owner = document_allocation_owner_enter(
+        &deterministic_tick_document);
+    for (size_t child = 0; child < 128 && textless_style != NULL; child++) {
+        static const lxb_char_t tag[] = "i";
+        lxb_dom_element_t *empty = lxb_dom_document_create_element(
+            &deterministic_tick_document.html->dom_document,
+            tag, sizeof(tag) - 1u, NULL);
+        CHECK(empty != NULL
+              && lxb_dom_node_append_child(
+                     textless_style, lxb_dom_interface_node(empty))
+                     == LXB_DOM_EXCEPTION_OK);
+    }
+    document_allocation_owner_leave(
+        &deterministic_tick_document, textless_owner);
+    bool bounded_textless_ok = script_runtime_evaluate_diagnostic(
+        stylesheet_animation_runtime, bounded_textless_finish_source,
+        "<bounded-textless-prefix>", &stylesheet_animation_result);
+    if (!bounded_textless_ok
+        || strcmp(stylesheet_animation_result.summary,
+                  "BOUNDED-TEXTLESS-NODES-OK") != 0) {
+        fprintf(stderr, "bounded textless summary=%s error=%s\n",
+                stylesheet_animation_result.summary,
+                stylesheet_animation_result.error);
+    }
+    CHECK(bounded_textless_ok
+          && stylesheet_animation_result.success
+          && strcmp(stylesheet_animation_result.summary,
+                    "BOUNDED-TEXTLESS-NODES-OK") == 0);
+
     puts("test: motion saturation reveals final authored state");
     static const char saturated_animation_source[] =
         "(()=>{const animations=[];let last=null;"
@@ -947,6 +1157,266 @@
           && strcmp(stylesheet_animation_result.summary,
                     "MOTION-SATURATION-REVEALS-FINAL") == 0);
     script_runtime_destroy(stylesheet_animation_runtime);
+
+    puts("test: oversized style motion scans retain only a bounded prefix");
+    size_t oversized_motion_baseline = budget.current;
+    size_t oversized_motion_budget_limit = budget.limit;
+    CHECK(budget.limit <= SIZE_MAX - 8u * MIB);
+    budget.limit += 8u * MIB;
+    static const char oversized_motion_page[] =
+        "<!doctype html><html><head><style></style></head><body>"
+        "<div id=oversized-motion class=oversized-motion>VISIBLE</div>"
+        "</body></html>";
+    static const char oversized_motion_css_prefix[] =
+        "@keyframes huge{from{opacity:0}to{opacity:1}}"
+        ".oversized-motion{animation:huge 1s linear}/*";
+    const size_t oversized_motion_padding = 5u * MIB;
+    PocDocument oversized_motion_document = {0};
+    CHECK(document_parse(
+        &oversized_motion_document, &budget, oversized_motion_page,
+        sizeof(oversized_motion_page) - 1u, 17));
+    ScriptResult oversized_motion_result = {0};
+    ScriptRuntimeOptions oversized_motion_options =
+        deterministic_tick_options;
+    oversized_motion_options.defer_document_scripts = false;
+    ScriptRuntime *oversized_motion_runtime =
+        script_runtime_create_configured(
+            &oversized_motion_document, &budget, 6u * MIB, 5000,
+            "https://oversized-motion.test/", &oversized_motion_options,
+            &oversized_motion_result);
+    CHECK(oversized_motion_runtime != NULL);
+    if (oversized_motion_runtime != NULL) {
+        lxb_dom_node_t *root = lxb_dom_interface_node(
+            oversized_motion_document.html);
+        lxb_dom_node_t *style_node = NULL;
+        lxb_dom_node_t *at = root;
+        for (size_t visited = 0; at != NULL && visited < 64; visited++) {
+            size_t name_length = 0;
+            const char *name = document_element_name(at, &name_length);
+            if (name != NULL && name_length == 5
+                && strncasecmp(name, "style", 5) == 0) {
+                style_node = at;
+                break;
+            }
+            if (at->first_child != NULL) {
+                at = at->first_child;
+                continue;
+            }
+            while (at != NULL && at != root && at->next == NULL) {
+                at = at->parent;
+            }
+            at = at == NULL || at == root ? NULL : at->next;
+        }
+        const size_t oversized_motion_text_length =
+            sizeof(oversized_motion_css_prefix) - 1u
+            + oversized_motion_padding + 2u;
+        char *oversized_motion_text = malloc(
+            oversized_motion_text_length);
+        CHECK(style_node != NULL && oversized_motion_text != NULL);
+        if (style_node != NULL && oversized_motion_text != NULL) {
+            memcpy(oversized_motion_text, oversized_motion_css_prefix,
+                   sizeof(oversized_motion_css_prefix) - 1u);
+            memset(oversized_motion_text
+                       + sizeof(oversized_motion_css_prefix) - 1u,
+                   ' ', oversized_motion_padding);
+            oversized_motion_text[oversized_motion_text_length - 2u] = '*';
+            oversized_motion_text[oversized_motion_text_length - 1u] = '/';
+            BudgetAllocationOwner previous = document_allocation_owner_enter(
+                &oversized_motion_document);
+            lxb_dom_text_t *padding = lxb_dom_document_create_text_node(
+                &oversized_motion_document.html->dom_document,
+                (const lxb_char_t *) oversized_motion_text,
+                oversized_motion_text_length);
+            bool appended = padding != NULL
+                && lxb_dom_node_append_child(
+                       style_node, lxb_dom_interface_node(padding))
+                       == LXB_DOM_EXCEPTION_OK;
+            document_allocation_owner_leave(
+                &oversized_motion_document, previous);
+            CHECK(appended);
+            if (padding != NULL && !appended) {
+                lxb_dom_node_destroy_deep(lxb_dom_interface_node(padding));
+            }
+            free(oversized_motion_text);
+        }
+        size_t remaining = script_runtime_heap_remaining(
+            oversized_motion_runtime);
+        size_t rejections = script_runtime_heap_rejections(
+            oversized_motion_runtime);
+        /* The old style.textContent path needed one allocation larger than
+           the entire remaining JS heap. */
+        if (!(remaining < oversized_motion_padding
+              && remaining > 384u * 1024u)) {
+            fprintf(stderr,
+                    "oversized motion pre-scan remaining=%zu padding=%zu\n",
+                    remaining, oversized_motion_padding);
+        }
+        CHECK(remaining < oversized_motion_padding
+              && remaining > 384u * 1024u);
+        static const char oversized_motion_start[] =
+            "(()=>{const style=document.querySelector('style'),"
+            "prefix=__tilefinchGetTextPrefix(style.__handle,262144,4096);"
+            "globalThis.pocSummary=prefix.text.startsWith('@keyframes huge')"
+            "&&prefix.text.length===262144&&prefix.nodes===2"
+            "?'OVERSIZED-MOTION-PENDING':"
+            "'OVERSIZED-MOTION-PREFIX-BAD:'+"
+            "[prefix.text.length,prefix.nodes].join(',');"
+            "document.body.setAttribute('style','color:black');"
+            "__tilefinchMaybeStartMotion();})()";
+        bool oversized_motion_started = script_runtime_evaluate_diagnostic(
+            oversized_motion_runtime, oversized_motion_start,
+            "<oversized-motion-start>", &oversized_motion_result);
+        if (!oversized_motion_started) {
+            fprintf(stderr,
+                    "oversized motion start failed summary=%s error=%s "
+                    "remaining=%zu rejects=%zu budget=%zu/%zu\n",
+                    oversized_motion_result.summary,
+                    oversized_motion_result.error, remaining,
+                    script_runtime_heap_rejections(
+                        oversized_motion_runtime),
+                    budget.current, budget.limit);
+        }
+        CHECK(oversized_motion_started);
+        for (size_t tick = 0; tick < 4; tick++) {
+            CHECK(script_runtime_advance(
+                oversized_motion_runtime, 16, 16,
+                &oversized_motion_result));
+        }
+        static const char oversized_motion_initial_check[] =
+            "(()=>{const box=document.getElementById('oversized-motion');"
+            "globalThis.pocSummary=__tilefinchRootCensus.motionScans>=1"
+            "&&box.style.opacity==='1'?'OVERSIZED-MOTION-INITIAL-OK':"
+            "'OVERSIZED-MOTION-INITIAL-BAD:'+"
+            "[__tilefinchRootCensus.motionScans,box.style.opacity].join(',');"
+            "box.className='oversized-motion changed'})()";
+        CHECK(script_runtime_evaluate_diagnostic(
+            oversized_motion_runtime, oversized_motion_initial_check,
+            "<oversized-motion-initial-check>", &oversized_motion_result));
+        for (size_t tick = 0; tick < 4; tick++) {
+            CHECK(script_runtime_advance(
+                oversized_motion_runtime, 16, 16,
+                &oversized_motion_result));
+        }
+        static const char oversized_motion_mutation_check[] =
+            "globalThis.pocSummary="
+            "__tilefinchRootCensus.motionScans>=2"
+            "?'OVERSIZED-MOTION-MUTATION-OK':"
+            "'OVERSIZED-MOTION-MUTATION-BAD:'+"
+            "__tilefinchRootCensus.motionScans";
+        CHECK(script_runtime_evaluate_diagnostic(
+            oversized_motion_runtime, oversized_motion_mutation_check,
+            "<oversized-motion-mutation-check>",
+            &oversized_motion_result));
+        if (strcmp(oversized_motion_result.summary,
+                   "OVERSIZED-MOTION-MUTATION-OK") != 0) {
+            fprintf(stderr,
+                    "oversized motion summary=%s error=%s remaining=%zu "
+                    "rejects=%zu\n",
+                    oversized_motion_result.summary,
+                    oversized_motion_result.error, remaining,
+                    script_runtime_heap_rejections(
+                        oversized_motion_runtime));
+        }
+        CHECK(oversized_motion_result.success
+              && strcmp(oversized_motion_result.summary,
+                        "OVERSIZED-MOTION-MUTATION-OK") == 0
+              && script_runtime_heap_rejections(
+                     oversized_motion_runtime) == rejections);
+        script_runtime_destroy(oversized_motion_runtime);
+    }
+    document_destroy(&oversized_motion_document);
+    budget.limit = oversized_motion_budget_limit;
+    CHECK(budget.current == oversized_motion_baseline);
+
+    puts("test: oversized inline motion styles use the native byte prefix");
+    size_t oversized_inline_baseline = budget.current;
+    size_t oversized_inline_budget_limit = budget.limit;
+    CHECK(budget.limit <= SIZE_MAX - 8u * MIB);
+    budget.limit += 8u * MIB;
+    static const char oversized_inline_page[] =
+        "<!doctype html><html><head></head><body>"
+        "<div id=oversized-inline>VISIBLE</div></body></html>";
+    static const char oversized_inline_prefix[] =
+        "animation:huge 1s linear;--nonascii:\xc3\xa9;";
+    PocDocument oversized_inline_document = {0};
+    CHECK(document_parse(
+        &oversized_inline_document, &budget, oversized_inline_page,
+        sizeof(oversized_inline_page) - 1u, 17));
+    ScriptResult oversized_inline_result = {0};
+    ScriptRuntimeOptions oversized_inline_options = deterministic_tick_options;
+    oversized_inline_options.defer_document_scripts = false;
+    ScriptRuntime *oversized_inline_runtime = script_runtime_create_configured(
+        &oversized_inline_document, &budget, 6u * MIB, 5000,
+        "https://oversized-inline.test/", &oversized_inline_options,
+        &oversized_inline_result);
+    CHECK(oversized_inline_runtime != NULL);
+    if (oversized_inline_runtime != NULL) {
+        const size_t inline_padding = 5u * MIB;
+        const size_t inline_length = sizeof(oversized_inline_prefix) - 1u
+            + inline_padding;
+        char *inline_value = malloc(inline_length);
+        lxb_dom_node_t *body = document_body_node(&oversized_inline_document);
+        lxb_dom_node_t *inline_node = body != NULL ? body->first_child : NULL;
+        CHECK(inline_value != NULL && inline_node != NULL);
+        if (inline_value != NULL && inline_node != NULL) {
+            memcpy(inline_value, oversized_inline_prefix,
+                   sizeof(oversized_inline_prefix) - 1u);
+            memset(inline_value + sizeof(oversized_inline_prefix) - 1u,
+                   ' ', inline_padding);
+            BudgetAllocationOwner previous = document_allocation_owner_enter(
+                &oversized_inline_document);
+            lxb_dom_attr_t *attribute = lxb_dom_element_set_attribute(
+                lxb_dom_interface_element(inline_node),
+                (const lxb_char_t *) "style", 5,
+                (const lxb_char_t *) inline_value, inline_length);
+            document_allocation_owner_leave(
+                &oversized_inline_document, previous);
+            CHECK(attribute != NULL);
+            free(inline_value);
+        }
+        size_t remaining = script_runtime_heap_remaining(
+            oversized_inline_runtime);
+        size_t rejections = script_runtime_heap_rejections(
+            oversized_inline_runtime);
+        CHECK(remaining < inline_padding && remaining > 384u * 1024u);
+        static const char oversized_inline_start[] =
+            "(()=>{const box=document.getElementById('oversized-inline'),"
+            "prefix=__tilefinchGetStyleAttributePrefix(box.__handle,38),"
+            "utf8=new TextEncoder().encode(prefix);"
+            "globalThis.pocSummary=prefix.startsWith('animation:huge')"
+            "&&utf8.length===38&&prefix.endsWith('\\u00e9')"
+            "?'OVERSIZED-INLINE-PENDING':'OVERSIZED-INLINE-PREFIX-BAD:'"
+            "+[prefix,utf8.length].join('|');"
+            "document.body.setAttribute('style','color:black');"
+            "__tilefinchMaybeStartMotion();})()";
+        CHECK(script_runtime_evaluate_diagnostic(
+            oversized_inline_runtime, oversized_inline_start,
+            "<oversized-inline-start>", &oversized_inline_result)
+              && oversized_inline_result.success
+              && strcmp(oversized_inline_result.summary,
+                        "OVERSIZED-INLINE-PENDING") == 0);
+        for (size_t tick = 0; tick < 4; tick++) {
+            CHECK(script_runtime_advance(
+                oversized_inline_runtime, 16, 16,
+                &oversized_inline_result));
+        }
+        static const char oversized_inline_check[] =
+            "globalThis.pocSummary=__tilefinchRootCensus.motionScans>=1"
+            "?'OVERSIZED-INLINE-OK':'OVERSIZED-INLINE-BAD:'"
+            "+__tilefinchRootCensus.motionScans";
+        CHECK(script_runtime_evaluate_diagnostic(
+            oversized_inline_runtime, oversized_inline_check,
+            "<oversized-inline-check>", &oversized_inline_result)
+              && oversized_inline_result.success
+              && strcmp(oversized_inline_result.summary,
+                        "OVERSIZED-INLINE-OK") == 0
+              && script_runtime_heap_rejections(
+                     oversized_inline_runtime) == rejections);
+        script_runtime_destroy(oversized_inline_runtime);
+    }
+    document_destroy(&oversized_inline_document);
+    budget.limit = oversized_inline_budget_limit;
+    CHECK(budget.current == oversized_inline_baseline);
 
     puts("test: deterministic clock source domains and stable callback samples");
     static const char deterministic_clock_sources_source[] =
@@ -1385,6 +1855,79 @@
                      "hydration-control") != NULL);
     document_body_snapshot_destroy(&hydration_snapshot);
     document_destroy(&hydration_document);
+    CHECK(budget.current == listener_baseline);
+
+    puts("test: failed hydration restores vanished server action with prose intact");
+    static const char actionable_hydration_page[] =
+        "<!doctype html><body><main><h1>Account help</h1>"
+        "<p>This server-rendered guidance remains fully visible after the "
+        "application mount fails, so text-only degradation checks must not "
+        "hide the fact that its only useful navigation action disappeared.</p>"
+        "<a id=server-action href='/account/help'>Open account help</a>"
+        "</main></body>";
+    PocDocument actionable_hydration_document = {0};
+    DocumentBodySnapshot actionable_hydration_snapshot = {0};
+    CHECK(document_parse(
+              &actionable_hydration_document, &budget,
+              actionable_hydration_page, strlen(actionable_hydration_page),
+              97u)
+          && document_body_snapshot_capture(
+                 &actionable_hydration_document,
+                 &actionable_hydration_snapshot)
+          && actionable_hydration_snapshot.source_action_count == 1u);
+    lxb_dom_node_t *actionable_hydration_body =
+        document_body_node(&actionable_hydration_document);
+    static const char prose_only_hydration[] =
+        "<main><h1>Account help</h1>"
+        "<p>This server-rendered guidance remains fully visible after the "
+        "application mount fails, so text-only degradation checks must not "
+        "hide the fact that its only useful navigation action disappeared.</p>"
+        "</main>";
+    CHECK(actionable_hydration_body != NULL
+          && document_set_element_inner_html(
+                 &actionable_hydration_document, actionable_hydration_body,
+                 prose_only_hydration, sizeof(prose_only_hydration) - 1u)
+          && document_body_snapshot_restore_if_degraded(
+                 &actionable_hydration_document,
+                 &actionable_hydration_snapshot, NULL, NULL)
+          && find_id(
+                 lxb_dom_interface_node(actionable_hydration_document.html),
+                 "server-action") != NULL);
+    document_body_snapshot_destroy(&actionable_hydration_snapshot);
+    document_destroy(&actionable_hydration_document);
+    CHECK(budget.current == listener_baseline);
+
+    puts("test: compact action-only hydration shell remains recoverable");
+    static const char compact_action_page[] =
+        "<!doctype html><body><form id=compact-action action=/find method=get>"
+        "<input name=q><button>Go</button></form></body>";
+    PocDocument compact_action_document = {0};
+    DocumentBodySnapshot compact_action_snapshot = {0};
+    CHECK(document_parse(
+              &compact_action_document, &budget, compact_action_page,
+              strlen(compact_action_page), 97u)
+          && document_body_snapshot_capture(
+                 &compact_action_document, &compact_action_snapshot)
+          && compact_action_snapshot.source_text_bytes < 128u
+          && compact_action_snapshot.source_action_count != 0u);
+    lxb_dom_node_t *compact_action_body =
+        document_body_node(&compact_action_document);
+    CHECK(compact_action_body != NULL
+          && document_set_element_inner_html(
+                 &compact_action_document, compact_action_body,
+                 "<main id=loading>Loading</main>",
+                 sizeof("<main id=loading>Loading</main>") - 1u)
+          && document_body_snapshot_restore_if_degraded(
+                 &compact_action_document, &compact_action_snapshot,
+                 NULL, NULL)
+          && find_id(
+                 lxb_dom_interface_node(compact_action_document.html),
+                 "compact-action") != NULL
+          && find_id(
+                 lxb_dom_interface_node(compact_action_document.html),
+                 "loading") == NULL);
+    document_body_snapshot_destroy(&compact_action_snapshot);
+    document_destroy(&compact_action_document);
     CHECK(budget.current == listener_baseline);
 
     puts("test: body snapshot reserves its exact-bound terminator");

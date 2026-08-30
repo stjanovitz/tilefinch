@@ -15,6 +15,8 @@
 #define BROWSER_PROVISIONAL_FINAL_RESERVE (1u * MIB)
 #define BROWSER_PROVISIONAL_GROW_MAX_ALLOC_US UINT64_C(100000)
 #define BROWSER_FONT_IDLE_READ_BYTES (16u * KIB)
+#define BROWSER_BLANK_READER_SETTLE_TICKS 12u
+#define BROWSER_RECOVERY_SETTLE_US UINT64_C(250000)
 
 typedef struct {
     NavigationLoad *load;
@@ -87,6 +89,10 @@ struct BrowserEngine {
     /* Compile-admission rejections already observed on the current page, so
        each rejection produces one warning event rather than one per frame. */
     size_t observed_compile_rejections;
+    uint64_t blank_reader_recovery_generation;
+    size_t blank_reader_recovery_first_runtime_tick;
+    uint64_t basic_view_recovery_generation;
+    size_t basic_view_recovery_first_runtime_tick;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     BrowserEngineCreationMetrics creation_metrics;
 #endif
@@ -100,8 +106,48 @@ struct BrowserEngine {
    allocator owner behind when it is destroyed. */
 static BrowserEngine *active_engine;
 
+#if !defined(__PSP__)
+static bool browser_engine_test_refuse_render_shell_init;
+static uint64_t browser_engine_test_recovery_time_us;
+
+void browser_engine_test_refuse_next_render_shell_init(void)
+{
+    browser_engine_test_refuse_render_shell_init = true;
+}
+
+void browser_engine_test_set_recovery_time_us(uint64_t now_us)
+{
+    browser_engine_test_recovery_time_us = now_us;
+}
+
+static bool browser_engine_test_consume_render_shell_refusal(void)
+{
+    if (!browser_engine_test_refuse_render_shell_init) return false;
+    browser_engine_test_refuse_render_shell_init = false;
+    return true;
+}
+#else
+static bool browser_engine_test_consume_render_shell_refusal(void)
+{
+    return false;
+}
+#endif
+
+static uint64_t browser_engine_recovery_now_us(void)
+{
+#if !defined(__PSP__)
+    if (browser_engine_test_recovery_time_us != 0u)
+        return browser_engine_test_recovery_time_us;
+#endif
+    return tilefinch_platform_monotonic_time_us();
+}
+
 static bool browser_engine_input_ready(const BrowserEngine *engine);
+static bool browser_engine_finish_input(BrowserEngine *engine,
+                                        bool succeeded);
 static bool browser_engine_find_refresh(BrowserEngine *engine);
+static void browser_engine_deferred_reader_images_ready(
+    void *opaque, NavigationSession *navigation);
 
 static void copy_error(char *output, size_t capacity, const char *message)
 {
@@ -207,7 +253,10 @@ void browser_config_init(BrowserConfig *config,
             .runtime_timeout_ms = 10000,
             .maximum_scripts = 48,
             .maximum_total_bytes = 4u * MIB,
-            .maximum_file_bytes = 256u * KIB,
+            /* The realistic PSP execution policy admits one bounded Game
+               Profile script up to 384 KiB. Keep the ordinary aggregate
+               quota unchanged; strict mode narrows this unit to 256 KiB. */
+            .maximum_file_bytes = 384u * KIB,
             .network_timeout_ms = 10000
         },
         .resources = {
@@ -256,8 +305,9 @@ bool browser_config_apply_psp_memory_profile(
     size_t script_source_limit = strict ? 1u * MIB : 2u * MIB;
     if (config->javascript.maximum_total_bytes > script_source_limit)
         config->javascript.maximum_total_bytes = script_source_limit;
-    if (config->javascript.maximum_file_bytes > 256u * KIB)
-        config->javascript.maximum_file_bytes = 256u * KIB;
+    size_t script_file_limit = strict ? 256u * KIB : 384u * KIB;
+    if (config->javascript.maximum_file_bytes > script_file_limit)
+        config->javascript.maximum_file_bytes = script_file_limit;
     return script_execution_policy_for_profile(
         strict ? SCRIPT_EXECUTION_PROFILE_PSP_STRICT
                : SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC,
@@ -683,6 +733,12 @@ static bool browser_engine_initialize_render_shell(
     BrowserEngine *engine, const char *diagnostic_name,
     const char *failure_message)
 {
+    if (browser_engine_test_consume_render_shell_refusal()) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED, diagnostic_name,
+            failure_message);
+    }
     if (engine->config.tile_capacity == 0) {
         clear_error(engine);
         return true;
@@ -820,6 +876,10 @@ static bool browser_engine_prepare_candidate_shell(
     }
     engine->candidate_controller_ready = true;
     if (engine->config.tile_capacity != 0 && !keep_progressive_render) {
+        bool injected_refusal =
+            browser_engine_test_consume_render_shell_refusal();
+        if (injected_refusal)
+            budget_inject_failure_after(&engine->budget, 0u);
         if (engine->framebuffer == NULL
             || !browser_engine_init_tile_cache(
                    engine, &engine->candidate_render,
@@ -827,6 +887,8 @@ static bool browser_engine_prepare_candidate_shell(
             || !tile_cache_set_frame(
                    &engine->candidate_render, engine->framebuffer,
                    engine->framebuffer_pixels)) {
+            if (injected_refusal)
+                budget_clear_failure_injection(&engine->budget);
             return set_error_code(
                 engine, TILEFINCH_SUBSYSTEM_RENDER,
                 TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED,
@@ -1221,6 +1283,8 @@ static bool browser_engine_configure_navigation(BrowserEngine *engine)
     navigation->declared_css_width = engine->config.declared_css_width;
     navigation->declared_css_height = engine->config.declared_css_height;
     navigation_attach_browser_session(navigation, &engine->session);
+    navigation_set_deferred_image_ready_hook(
+        navigation, browser_engine_deferred_reader_images_ready, engine);
     if (!navigation_set_replacement_mode(
             navigation, engine->config.navigation_replacement_mode)
         || !navigation_set_replacement_hooks(
@@ -1675,6 +1739,8 @@ bool browser_engine_refresh_shell(BrowserEngine *engine)
             TILEFINCH_DIAGNOSTIC_INVALID_INPUT, "shell-refresh",
             "no committed page is available");
     }
+    lxb_dom_node_t *focused_node = engine->controller_ready
+        ? controller_focused_node(&engine->controller) : NULL;
     browser_engine_reset_shell(engine);
     if (!controller_init(&engine->controller, &engine->navigation))
         return set_error_code(
@@ -1682,6 +1748,9 @@ bool browser_engine_refresh_shell(BrowserEngine *engine)
             TILEFINCH_DIAGNOSTIC_ALLOCATION_FAILED, "controller-init",
             "controller initialization failed");
     engine->controller_ready = true;
+    if (focused_node != NULL)
+        (void) controller_restore_focus_node(
+            &engine->controller, focused_node);
     return browser_engine_initialize_render_shell(
         engine, "render-shell-init",
         "render shell initialization failed");
@@ -1729,7 +1798,7 @@ bool browser_engine_apply_layout_damage(BrowserEngine *engine)
                     image_resource_backing_identity(image));
             }
         }
-        if (!tile_cache_sync_layout_paint(
+        if (!tile_cache_sync_canvas_paint(
                 &engine->render,
                 engine->navigation.relayout_damage_left,
                 engine->navigation.relayout_damage_top,
@@ -1952,6 +2021,57 @@ static void browser_engine_navigation_restore_view(
        viewport, so apply its saved position after those side effects. */
     (void) navigation_set_scroll(
         &engine->navigation, work->restore_scroll_y);
+}
+
+static void browser_engine_store_current_focus(BrowserEngine *engine)
+{
+    NavigationEntry *entry = engine != NULL
+        && engine->navigation.history_count != 0
+        && engine->navigation.history_index < engine->navigation.history_count
+        ? &engine->navigation.history[engine->navigation.history_index]
+        : NULL;
+    if (entry == NULL) return;
+    entry->focus_kind = (int) engine->controller.focus_kind;
+    entry->focus_index = browser_engine_focus_ordinal(engine);
+}
+
+static bool browser_engine_commit_same_document_action(
+    BrowserEngine *engine, const char *url)
+{
+    /* Finish earlier input before publishing the native history entry. */
+    if (!browser_engine_finish_input(engine, true)) return false;
+    if (!navigation_commit_same_document_url(&engine->navigation, url)) {
+        return false;
+    }
+    /* hashchange has now observed the new URL, so native history is
+       authoritative even if its bounded transactional relayout is refused.
+       Settle successful mutations before resolving the fragment against the
+       retained layout and before publishing paint damage. */
+    if (!navigation_settle_same_document_events(&engine->navigation)) {
+        return set_error_code(
+            engine, TILEFINCH_SUBSYSTEM_RENDER,
+            TILEFINCH_DIAGNOSTIC_RENDER_FAILED,
+            "same-document-settle",
+            "same-document event layout could not be settled");
+    }
+    if (!navigation_scroll_to_fragment(&engine->navigation, url)) return false;
+    /* This entry is already authoritative. Retain its logical focus even if
+       the following render-damage publication is refused. */
+    browser_engine_store_current_focus(engine);
+    if (!browser_engine_finish_input(engine, true)) return false;
+    clear_error(engine);
+    return true;
+}
+
+static void browser_engine_rollback_same_document_cursor(
+    BrowserEngine *engine, bool forward)
+{
+    /* Used only when restore preflight fails before popstate/hashchange is
+       dispatched. Once page script observes a history move, issuing inverse
+       callbacks cannot reconstruct its state (or pruned forward entries). */
+    const NavigationEntry *ignored = NULL;
+    (void) (forward ? navigation_back(&engine->navigation, &ignored)
+                    : navigation_forward(&engine->navigation, &ignored));
 }
 
 static lxb_dom_node_t *browser_engine_attribute_owner(
@@ -2370,6 +2490,26 @@ bool browser_engine_begin_navigation_action(
     }
     const char *method = action->type == CONTROLLER_ACTION_FORM_SUBMIT
         ? action->method : "GET";
+    if (action->type == CONTROLLER_ACTION_NAVIGATE
+        && strcasecmp(method, "GET") == 0
+        && navigation_url_is_same_document(
+               &engine->navigation, action->url)) {
+        BrowserEngineNavigationWork *work = &engine->navigation_work;
+        *work = (BrowserEngineNavigationWork) {
+            .status = BROWSER_NAVIGATION_JOB_SUCCEEDED,
+            .started_us = tilefinch_platform_monotonic_time_us(),
+            .record_history = true
+        };
+        snprintf(work->url, sizeof(work->url), "%s", action->url);
+        bool committed = browser_engine_commit_same_document_action(
+            engine, action->url);
+        work->status = committed ? BROWSER_NAVIGATION_JOB_SUCCEEDED
+                                 : BROWSER_NAVIGATION_JOB_FAILED;
+        work->metrics.status = work->status;
+        work->metrics.completion_per_mille = committed ? 1000u : 0u;
+        if (committed) clear_error(engine);
+        return committed;
+    }
     return browser_engine_begin_navigation_request(
         engine, action->url, method,
         action->body_length == 0 ? NULL : action->body,
@@ -2391,6 +2531,12 @@ bool browser_engine_begin_navigation_history(
             "history navigation cannot be started");
     }
     size_t previous_index = engine->navigation.history_index;
+    const NavigationEntry *previous_entry =
+        navigation_current(&engine->navigation);
+    char previous_url[NAVIGATION_URL_LIMIT];
+    if (previous_entry != NULL)
+        snprintf(previous_url, sizeof(previous_url), "%s", previous_entry->url);
+    else previous_url[0] = '\0';
     const NavigationEntry *entry = NULL;
     bool moved = forward
         ? navigation_forward(&engine->navigation, &entry)
@@ -2407,6 +2553,52 @@ bool browser_engine_begin_navigation_history(
     int scroll_y = entry->scroll_y;
     int focus_kind = entry->focus_kind;
     size_t focus_index = entry->focus_index;
+    if (navigation_url_is_same_document(
+            &engine->navigation, previous_url)) {
+        BrowserEngineNavigationWork *work = &engine->navigation_work;
+        *work = (BrowserEngineNavigationWork) {
+            .status = BROWSER_NAVIGATION_JOB_SUCCEEDED,
+            .previous_history_index = previous_index,
+            .restore_scroll_y = scroll_y,
+            .restore_focus_kind = focus_kind,
+            .restore_focus_index = focus_index,
+            .started_us = tilefinch_platform_monotonic_time_us(),
+            .history_move = true,
+            .history_forward = forward
+        };
+        snprintf(work->url, sizeof(work->url), "%s", url);
+        bool restored = navigation_restore_same_document_url(
+            &engine->navigation, url, previous_url);
+        if (!restored) {
+            browser_engine_rollback_same_document_cursor(engine, forward);
+        } else {
+            restored = navigation_settle_same_document_events(
+                &engine->navigation);
+            if (!restored) {
+                (void) set_error_code(
+                    engine, TILEFINCH_SUBSYSTEM_RENDER,
+                    TILEFINCH_DIAGNOSTIC_RENDER_FAILED,
+                    "history-event-settle",
+                    "same-document history event layout could not be settled");
+            }
+        }
+        if (restored) {
+            lxb_dom_node_t *focus = browser_engine_semantic_focus(
+                engine, focus_kind, focus_index);
+            if (focus != NULL)
+                restored = controller_focus_node(&engine->controller, focus);
+            if (restored)
+                restored = navigation_set_scroll(
+                    &engine->navigation, scroll_y);
+            if (restored) restored = browser_engine_finish_input(engine, true);
+        }
+        work->status = restored ? BROWSER_NAVIGATION_JOB_SUCCEEDED
+                                : BROWSER_NAVIGATION_JOB_FAILED;
+        work->metrics.status = work->status;
+        work->metrics.completion_per_mille = restored ? 1000u : 0u;
+        if (restored) clear_error(engine);
+        return restored;
+    }
     if (!browser_engine_begin_navigation_url(
             engine, url, maximum_bytes, timeout_ms, false)) {
         const NavigationEntry *ignored = NULL;
@@ -2590,6 +2782,33 @@ bool browser_engine_navigation_pending(const BrowserEngine *engine)
 {
     return browser_engine_navigation_status(engine)
         == BROWSER_NAVIGATION_JOB_PENDING;
+}
+
+BrowserNavigationReturnTarget browser_engine_last_navigation_return_target(
+    const BrowserEngine *engine)
+{
+    if (engine == NULL
+        || engine->navigation_work.status
+               != BROWSER_NAVIGATION_JOB_SUCCEEDED
+        || !engine->navigation.page.loaded
+        || engine->navigation.history_count == 0u) {
+        return BROWSER_NAVIGATION_RETURN_NONE;
+    }
+    const BrowserEngineNavigationWork *work = &engine->navigation_work;
+    if (work->history_move) {
+        if (work->history_forward) {
+            return engine->navigation.history_index > 0u
+                ? BROWSER_NAVIGATION_RETURN_BACK
+                : BROWSER_NAVIGATION_RETURN_NONE;
+        }
+        return engine->navigation.history_index + 1u
+                   < engine->navigation.history_count
+            ? BROWSER_NAVIGATION_RETURN_FORWARD
+            : BROWSER_NAVIGATION_RETURN_NONE;
+    }
+    return engine->navigation.history_index > 0u
+        ? BROWSER_NAVIGATION_RETURN_BACK
+        : BROWSER_NAVIGATION_RETURN_NONE;
 }
 
 const char *browser_engine_pending_navigation_url(
@@ -3014,6 +3233,12 @@ bool browser_engine_history_move(BrowserEngine *engine, bool forward)
             "browser engine is not active");
     browser_engine_cancel_idle_work(engine);
     size_t previous_index = engine->navigation.history_index;
+    const NavigationEntry *previous_entry =
+        navigation_current(&engine->navigation);
+    char previous_url[NAVIGATION_URL_LIMIT];
+    if (previous_entry != NULL)
+        snprintf(previous_url, sizeof(previous_url), "%s", previous_entry->url);
+    else previous_url[0] = '\0';
     const NavigationEntry *entry = NULL;
     bool moved = forward
         ? navigation_forward(&engine->navigation, &entry)
@@ -3027,6 +3252,44 @@ bool browser_engine_history_move(BrowserEngine *engine, bool forward)
     int scroll_y = entry->scroll_y;
     int focus_kind = entry->focus_kind;
     size_t focus_index = entry->focus_index;
+    if (navigation_url_is_same_document(
+            &engine->navigation, previous_url)) {
+        bool restored = navigation_restore_same_document_url(
+            &engine->navigation, url, previous_url);
+        if (!restored) {
+            browser_engine_rollback_same_document_cursor(engine, forward);
+            return set_error_code(
+                engine, TILEFINCH_SUBSYSTEM_ENGINE,
+                TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "history-fragment",
+                "same-document history restoration failed");
+        }
+        restored = navigation_settle_same_document_events(
+            &engine->navigation);
+        if (!restored) {
+            return set_error_code(
+                engine, TILEFINCH_SUBSYSTEM_RENDER,
+                TILEFINCH_DIAGNOSTIC_RENDER_FAILED,
+                "history-event-settle",
+                "same-document history event layout could not be settled");
+        }
+        lxb_dom_node_t *focus_node = restored
+            ? browser_engine_semantic_focus(engine, focus_kind, focus_index)
+            : NULL;
+        if (focus_node != NULL)
+            restored = controller_focus_node(
+                &engine->controller, focus_node);
+        restored = restored && navigation_set_scroll(
+            &engine->navigation, scroll_y);
+        if (restored) restored = browser_engine_finish_input(engine, true);
+        if (!restored) {
+            return set_error_code(
+                engine, TILEFINCH_SUBSYSTEM_ENGINE,
+                TILEFINCH_DIAGNOSTIC_INTERNAL_FAILED, "history-fragment",
+                "same-document history restoration failed");
+        }
+        clear_error(engine);
+        return true;
+    }
     if (!browser_engine_load_url(engine, url, false)) {
         const NavigationEntry *ignored = NULL;
         if (engine->navigation.history_index != previous_index) {
@@ -3520,6 +3783,21 @@ bool browser_engine_activate(BrowserEngine *engine,
         engine->autofocus_pending = false;
         activated = controller_activate(&engine->controller, action);
     }
+    if (activated && action->type == CONTROLLER_ACTION_NAVIGATE
+        && navigation_url_is_same_document(
+               &engine->navigation, action->url)) {
+        /* A fragment activation is a local HTML default action. Resolve it
+           before returning to chrome so the PSP never associates Wi-Fi,
+           leaves Reader, or paints a network loading surface for work that
+           must not issue request bytes. */
+        activated = browser_engine_commit_same_document_action(
+            engine, action->url);
+        if (activated) {
+            action->type = CONTROLLER_ACTION_CONTROL;
+            action->url[0] = '\0';
+        }
+        return activated;
+    }
     return browser_engine_finish_input(
         engine, activated);
 }
@@ -3760,6 +4038,13 @@ bool browser_engine_execute_action(BrowserEngine *engine,
     }
     const char *method = action->type == CONTROLLER_ACTION_FORM_SUBMIT
         ? action->method : "GET";
+    if (action->type == CONTROLLER_ACTION_NAVIGATE
+        && strcasecmp(method, "GET") == 0
+        && navigation_url_is_same_document(
+               &engine->navigation, action->url)) {
+        return browser_engine_commit_same_document_action(
+            engine, action->url);
+    }
     if (strcasecmp(method, "GET") == 0
         && site_adapter_handles_navigation(method, action->url)) {
         const NavigationEntry *current =
@@ -3862,10 +4147,17 @@ bool browser_engine_render_frame(BrowserEngine *engine,
     bool previous_scroll_valid = engine->render.last_frame_scroll_valid;
     int previous_scroll_y = viewport_device_to_css(
         &engine->navigation.viewport, engine->render.last_frame_scroll_y);
-    if (!tile_cache_render_frame(
+    RenderCanvasFrameResult canvas_frame =
+        tile_cache_render_canvas_frame_fast(
             &engine->render, scroll_y,
             engine->config.device.framebuffer_width,
-            engine->config.device.framebuffer_height, NULL)) {
+            engine->config.device.framebuffer_height);
+    bool frame_rendered = canvas_frame == RENDER_CANVAS_FRAME_COMPLETE;
+    if (canvas_frame == RENDER_CANVAS_FRAME_FAILED
+        || (!frame_rendered && !tile_cache_render_frame(
+            &engine->render, scroll_y,
+            engine->config.device.framebuffer_width,
+            engine->config.device.framebuffer_height, NULL))) {
         return set_error_code(
             engine, TILEFINCH_SUBSYSTEM_RENDER,
             TILEFINCH_DIAGNOSTIC_RENDER_FAILED, "frame-render",
@@ -3979,6 +4271,17 @@ BrowserRenderJobStatus browser_engine_render_frame_bounded_cancelable(
     }
     const NavigationEntry *entry = navigation_current(&engine->navigation);
     int scroll_y = entry == NULL ? 0 : entry->scroll_y;
+    if (tile_cache_canvas_frame_fast_eligible(
+            &engine->render, scroll_y,
+            engine->config.device.framebuffer_width,
+            engine->config.device.framebuffer_height)) {
+        bool rendered = browser_engine_render_frame(engine, NULL);
+        if (tilefinch_cancellation_requested(cancellation)) {
+            return BROWSER_RENDER_JOB_CANCELLED;
+        }
+        return rendered ? BROWSER_RENDER_JOB_COMPLETE
+                        : BROWSER_RENDER_JOB_FAILED;
+    }
     RenderFrameWorkResult prepared =
         tile_cache_prepare_frame_bounded_cancelable(
         &engine->render, scroll_y,
@@ -4440,6 +4743,8 @@ bool browser_engine_view_snapshot(
                 y - snapshot->scroll_y + height);
             snapshot->focus_width = right - snapshot->focus_x;
             snapshot->focus_height = bottom - snapshot->focus_y;
+            snapshot->focus_has_authored_outline =
+                engine->controller.has_authored_focus_outline;
         }
     }
     return true;
@@ -4504,10 +4809,198 @@ bool browser_engine_set_user_css(
 bool browser_engine_apply_user_css(
     BrowserEngine *engine, const char *css, size_t length)
 {
-    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
-        && engine->navigation_ready
-        && navigation_apply_user_css(&engine->navigation, css, length)
-        && browser_engine_refresh_shell(engine);
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready || (css == NULL && length != 0)
+        || browser_engine_navigation_pending(engine)
+        || engine->candidate_shell_prepared
+        || engine->candidate_render.budget != NULL) {
+        return false;
+    }
+    NavigationSession *navigation = &engine->navigation;
+    lxb_dom_node_t *focused_node = engine->controller_ready
+        ? controller_focused_node(&engine->controller) : NULL;
+    NavigationUserCssTransaction *transaction =
+        navigation_apply_user_css_begin(navigation, css, length);
+    if (transaction == NULL) return false;
+
+    /* Build the replacement controller/tile cache while the incumbent shell
+       and the transaction's old layout remain owned. A real Budget refusal
+       therefore destroys only candidate ownership; rollback itself performs
+       no allocation and the already-painted incumbent remains usable. */
+    if (!browser_engine_prepare_candidate_shell(engine, navigation)) {
+        browser_engine_abort_candidate_shell(engine);
+        (void) navigation_apply_user_css_rollback(
+            navigation, transaction);
+        return false;
+    }
+    if (focused_node != NULL) {
+        (void) controller_restore_focus_node(
+            &engine->candidate_controller, focused_node);
+    }
+    browser_engine_commit_candidate_shell(engine);
+    navigation_apply_user_css_commit(navigation, transaction);
+    clear_error(engine);
+    return true;
+}
+
+static bool browser_engine_reader_root_matches(
+    const PocDocument *document, lxb_dom_node_t *root, ReaderPageKind kind)
+{
+    if (document == NULL || root == NULL || kind == READER_PAGE_RAW
+        || root->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || root->parent != document_body_node(document)) return false;
+    size_t name_length = 0;
+    const char *name = document_element_name(root, &name_length);
+    size_t marker_length = 0;
+    const char *marker = document_attribute(
+        root, "data-tilefinch-reader-root", &marker_length);
+    const char *expected = reader_page_kind_name(kind);
+    size_t expected_length = strlen(expected);
+    return name != NULL && name_length == 4u
+        && strncasecmp(name, "main", 4u) == 0
+        && marker != NULL && marker_length == expected_length
+        && memcmp(marker, expected, expected_length) == 0;
+}
+
+/* Discover only the root just appended by the synchronous native extractor.
+   Once that identity is retained, every later lookup goes through the stored
+   pointer/weak handle and never searches an author-controlled marker. */
+static lxb_dom_node_t *browser_engine_discover_reader_root(
+    PocDocument *document, ReaderPageKind kind)
+{
+    lxb_dom_node_t *body = document_body_node(document);
+    lxb_dom_node_t *root = body == NULL ? NULL : body->last_child;
+    return browser_engine_reader_root_matches(document, root, kind)
+        ? root : NULL;
+}
+
+static bool browser_engine_retain_reader_root(
+    NavigationPage *page, lxb_dom_node_t *root, ReaderPageKind kind)
+{
+    if (page == NULL || root == NULL) return false;
+    long handle = page->runtime == NULL ? 0
+        : script_runtime_node_weak_handle(page->runtime, root);
+    if (page->runtime != NULL && handle == 0) return false;
+    page->reader_root = root;
+    page->reader_root_kind = kind;
+    page->reader_root_handle = handle;
+    return true;
+}
+
+static lxb_dom_node_t *browser_engine_resolve_reader_root(
+    NavigationPage *page, ReaderPageKind kind)
+{
+    if (page == NULL || page->reader_root == NULL
+        || page->reader_root_kind != kind) return NULL;
+    lxb_dom_node_t *root = page->runtime == NULL
+        ? (page->reader_root_handle == 0 ? page->reader_root : NULL)
+        : (page->reader_root_handle == 0 ? NULL
+            : script_runtime_node_handle_resolve_connected(
+                  page->runtime, page->reader_root_handle));
+    return root == page->reader_root
+        && browser_engine_reader_root_matches(&page->document, root, kind)
+        ? root : NULL;
+}
+
+static lxb_dom_node_t *browser_engine_establish_reader_root(
+    NavigationPage *page, ReaderPageKind kind)
+{
+    lxb_dom_node_t *root = browser_engine_resolve_reader_root(page, kind);
+    if (root != NULL) return root;
+    /* A nonempty provenance record that no longer resolves means that exact
+       native root was detached or altered. Fail closed; never let a public
+       marker elsewhere in the author DOM replace it. */
+    if (page == NULL || page->reader_root != NULL
+        || page->reader_root_handle != 0
+        || page->reader_root_kind != READER_PAGE_RAW) return NULL;
+    root = browser_engine_discover_reader_root(&page->document, kind);
+    if (root == NULL) return NULL;
+    /* Callers reserve handle capacity before the extractor mutates the DOM.
+       Registration uses a fixed bridge table and cannot allocate, so failure
+       here indicates an invalid lifecycle rather than a recoverable partial
+       admission. Do not publish any provenance in that case. */
+    return browser_engine_retain_reader_root(page, root, kind)
+        ? root : NULL;
+}
+
+typedef enum {
+    BROWSER_READER_ALIAS_PREPARE = 0,
+    BROWSER_READER_ALIAS_DEFERRED
+} BrowserReaderAliasPhase;
+
+static void browser_engine_rebind_reader_visual_images(
+    TileCache *cache, bool ready, const LayoutDocument *source_layout,
+    const ImageAliasResult *alias_result, const ImageResources *images)
+{
+    if (cache == NULL || !ready || source_layout == NULL
+        || alias_result == NULL || images == NULL
+        || !cache->owns_visual_layout
+        || cache->source_layout != source_layout
+        || cache->layout != &cache->visual_layout) return;
+    (void) layout_rebind_image_resources(
+        &cache->visual_layout, alias_result->previous_items,
+        alias_result->previous_count, images);
+}
+
+static void browser_engine_alias_reader_images(
+    BrowserEngine *engine, NavigationSession *navigation,
+    lxb_dom_node_t *reader_root, BrowserReaderAliasPhase phase)
+{
+    if (engine == NULL || navigation == NULL || reader_root == NULL) return;
+    NavigationPage *page = &navigation->page;
+    if (page->images.count != 0u) {
+        ImageAliasResult alias_result =
+            images_alias_existing_document_subtree(
+                &page->stylesheet, &page->images, reader_root,
+                page->resource_base_url, page->document_url,
+                page->referrer_policy,
+                engine->config.resources.maximum_images);
+        if (alias_result.previous_items != NULL) {
+            (void) layout_rebind_image_resources(
+                &page->layout, alias_result.previous_items,
+                alias_result.previous_count, &page->images);
+            /* A scaled viewport keeps a cloned display list. Relocate only
+               caches tied to this exact source layout; an in-flight candidate
+               normally owns unrelated image resources. */
+            browser_engine_rebind_reader_visual_images(
+                &engine->render, engine->render_ready, &page->layout,
+                &alias_result, &page->images);
+            browser_engine_rebind_reader_visual_images(
+                &engine->candidate_render, engine->candidate_render_ready,
+                &page->layout, &alias_result, &page->images);
+        }
+        if (alias_result.aliased != 0u
+            && phase == BROWSER_READER_ALIAS_PREPARE
+            && page->deferred_image_job != NULL) {
+            /* Preparation aliases only resources whose layout transaction is
+               already committed. A deferred completion instead advances this
+               boundary after its immediately-following relayout succeeds. */
+            images_priority_load_commit_progress(
+                page->deferred_image_job);
+        }
+        images_alias_result_release(&page->images, &alias_result);
+        layout_reuse_cache_update_images(
+            page->layout_reuse, &page->images);
+    }
+    if (phase == BROWSER_READER_ALIAS_PREPARE) {
+        /* The Reader clone is a trusted native DOM mutation. Deferred alias
+           publication changes only the resource table, so it does not need
+           another document fingerprint scan. */
+        (void) navigation_accept_native_resource_fingerprint(navigation);
+    }
+}
+
+static void browser_engine_deferred_reader_images_ready(
+    void *opaque, NavigationSession *navigation)
+{
+    BrowserEngine *engine = opaque;
+    if (engine == NULL || navigation == NULL
+        || !navigation->page.reader_analysis.prepared
+        || navigation->page.reader_analysis.kind == READER_PAGE_RAW) return;
+    lxb_dom_node_t *reader_root = browser_engine_resolve_reader_root(
+        &navigation->page, navigation->page.reader_analysis.kind);
+    browser_engine_alias_reader_images(
+        engine, navigation, reader_root, BROWSER_READER_ALIAS_DEFERRED);
 }
 
 bool browser_engine_prepare_reader(
@@ -4517,11 +5010,386 @@ bool browser_engine_prepare_reader(
     if (engine == NULL || !engine->navigation.page.loaded) return false;
     ReaderDocumentAnalysis *stored =
         &engine->navigation.page.reader_analysis;
-    if (!stored->prepared
-        && !reader_document_prepare(
-               &engine->navigation.page.document, stored)) return false;
+    /* Basic and Reader share one hidden extracted-root slot. Never reinterpret
+       a prepared Basic tree as a Reader article or append a second clone. */
+    if (stored->prepared && stored->kind == READER_PAGE_BASIC) {
+        if (analysis != NULL) *analysis = *stored;
+        return false;
+    }
+    bool prepared_now = !stored->prepared;
+    if (prepared_now
+        && !script_runtime_node_handle_capacity_available(
+               engine->navigation.page.runtime)) {
+        ReaderDocumentAnalysis refused = {
+            .prepared = true, .bounded_out = true
+        };
+        if (analysis != NULL) *analysis = refused;
+        return false;
+    }
+    if (prepared_now
+        && !reader_document_prepare_with_stylesheet(
+               &engine->navigation.page.document,
+               &engine->navigation.page.stylesheet, stored)) return false;
+    lxb_dom_node_t *reader_root = stored->kind != READER_PAGE_RAW
+        ? browser_engine_establish_reader_root(
+              &engine->navigation.page, stored->kind)
+        : NULL;
+    if (prepared_now && stored->kind != READER_PAGE_RAW
+        && reader_root == NULL) {
+        ReaderPageKind failed_kind = stored->kind;
+        (void) reader_document_discard_prepared_view(
+            &engine->navigation.page.document, failed_kind);
+        *stored = (ReaderDocumentAnalysis) {0};
+    }
+    if (reader_root != NULL) {
+        browser_engine_alias_reader_images(
+            engine, &engine->navigation, reader_root,
+            BROWSER_READER_ALIAS_PREPARE);
+    }
     if (analysis != NULL) *analysis = *stored;
+    /* Preparation is also the admission boundary used by frontends before
+       applying Reader CSS. A successfully analyzed RAW page has no semantic
+       Reader tree; report that as unavailable so a manual request cannot
+       broadly restyle an error, login, or application shell. The stored
+       analysis remains available through browser_engine_reader_analysis(). */
+    return stored->kind != READER_PAGE_RAW && reader_root != NULL;
+}
+
+bool browser_engine_analyze_reader(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
+{
+    if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {0};
+    if (engine == NULL || analysis == NULL
+        || !engine->navigation.page.loaded) return false;
+    /* A connected extracted root is already authoritative. Report its stored
+       analysis without rewalking source; otherwise keep this probe strictly
+       temporary so low-confidence auto mode cannot block a later Basic view. */
+    const ReaderDocumentAnalysis *stored =
+        &engine->navigation.page.reader_analysis;
+    if (stored->prepared && stored->kind != READER_PAGE_RAW) {
+        *analysis = *stored;
+        return browser_engine_establish_reader_root(
+                   &engine->navigation.page, stored->kind) != NULL;
+    }
+    return reader_document_analyze_with_stylesheet(
+        &engine->navigation.page.document,
+        &engine->navigation.page.stylesheet, analysis);
+}
+
+bool browser_engine_prepare_basic_view(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
+{
+    if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {0};
+    if (engine == NULL || !engine->navigation.page.loaded) return false;
+    ReaderDocumentAnalysis *stored =
+        &engine->navigation.page.reader_analysis;
+    if (stored->prepared && stored->kind == READER_PAGE_BASIC) {
+        lxb_dom_node_t *root = browser_engine_resolve_reader_root(
+            &engine->navigation.page, READER_PAGE_BASIC);
+        if (analysis != NULL) *analysis = *stored;
+        return root != NULL;
+    }
+    /* An installed Reader tree owns the one extracted presentation slot.
+       Switching back to raw CSS is reversible; creating two hidden clones is
+       deliberately not. */
+    if (stored->prepared && stored->kind != READER_PAGE_RAW) {
+        if (analysis != NULL) *analysis = *stored;
+        return false;
+    }
+    if (!script_runtime_node_handle_capacity_available(
+            engine->navigation.page.runtime)) {
+        if (analysis != NULL) {
+            *analysis = (ReaderDocumentAnalysis) {
+                .prepared = true, .bounded_out = true
+            };
+        }
+        return false;
+    }
+    ReaderDocumentAnalysis prepared = {0};
+    if (!reader_document_prepare_basic_complete_with_stylesheet(
+            &engine->navigation.page.document,
+            &engine->navigation.page.stylesheet, &prepared)) {
+        if (analysis != NULL) *analysis = prepared;
+        return false;
+    }
+    if (analysis != NULL) *analysis = prepared;
+    if (prepared.kind != READER_PAGE_BASIC || prepared.bounded_out
+        || prepared.extraction_truncated) return false;
+    lxb_dom_node_t *root = browser_engine_establish_reader_root(
+        &engine->navigation.page, READER_PAGE_BASIC);
+    if (root == NULL) {
+        (void) reader_document_discard_prepared_view(
+            &engine->navigation.page.document, READER_PAGE_BASIC);
+        return false;
+    }
+    *stored = prepared;
+    browser_engine_alias_reader_images(
+        engine, &engine->navigation, root,
+        BROWSER_READER_ALIAS_PREPARE);
     return true;
+}
+
+static bool browser_engine_activate_extracted_view(
+    BrowserEngine *engine, ReaderPageKind kind)
+{
+    if (engine == NULL || !engine->navigation.page.loaded) return false;
+    NavigationPage *page = &engine->navigation.page;
+    if (!page->reader_analysis.prepared
+        || page->reader_analysis.kind != kind) return false;
+    lxb_dom_node_t *root = browser_engine_resolve_reader_root(page, kind);
+    if (root == NULL) return false;
+    /* Freeze only after frontend CSS has succeeded so a failed presentation
+       transaction leaves a functioning raw page and realm untouched. No
+       author turn occurs between synchronous prepare, CSS application, and
+       this exact-root validation. This makes the native clone's :last-child
+       presentation and delegated actions stable for both Reader and Basic. */
+    navigation_retire_current_page_scripts(&engine->navigation);
+    bool realms_retired = page->runtime == NULL;
+    for (size_t frame = 0; frame < page->frame_count; frame++)
+        realms_retired = realms_retired
+            && page->frames[frame].runtime == NULL;
+    return realms_retired && page->reader_root == root
+        && page->reader_root_handle == 0 && page->reader_root_kind == kind;
+}
+
+bool browser_engine_activate_reader_view(BrowserEngine *engine)
+{
+    if (engine == NULL) return false;
+    ReaderPageKind kind = engine->navigation.page.reader_analysis.kind;
+    if (kind != READER_PAGE_ARTICLE && kind != READER_PAGE_LISTING
+        && kind != READER_PAGE_WATCH) return false;
+    return browser_engine_activate_extracted_view(engine, kind);
+}
+
+bool browser_engine_activate_basic_view(BrowserEngine *engine)
+{
+    return browser_engine_activate_extracted_view(
+        engine, READER_PAGE_BASIC);
+}
+
+bool browser_engine_page_is_visually_blank(const BrowserEngine *engine)
+{
+    return engine != NULL && engine->state == BROWSER_ENGINE_ACTIVE
+        && engine->navigation_ready
+        && engine->navigation.page.loaded
+        && navigation_layout_is_visually_blank(
+               &engine->navigation.page.layout);
+}
+
+static bool browser_engine_has_script_degradation(
+    const NavigationSession *navigation)
+{
+    if (navigation == NULL || !navigation->page.loaded) return false;
+    const ScriptResult *result = &navigation->page.script_result;
+    bool heap_rejected = navigation->page.runtime != NULL
+        && script_runtime_heap_rejections(navigation->page.runtime) != 0u;
+    /* A realm retired by navigation_retire_exhausted_script_realms no longer
+       exposes its allocator counter. Its exact engine-authored summary is the
+       durable evidence for that already-completed transition. */
+    bool memory_realm_retired = navigation->page.runtime == NULL
+        && strcmp(result->summary,
+                  "JavaScript stopped at its memory limit") == 0;
+    return navigation->page.script_degradation_observed
+        || result->scripts_failed != 0u
+        || result->external_scripts_failed != 0u
+        || result->dynamic_scripts_failed != 0u
+        || result->dynamic_scripts_quota_rejected != 0u
+        || result->host_compile_rejections != 0u
+        || result->host_compile_watchdog_aborts != 0u
+        || result->uncaught_callback_errors != 0u
+        || result->interrupted || heap_rejected || memory_realm_retired;
+}
+
+static bool browser_engine_recovery_wall_settled(
+    const BrowserEngine *engine)
+{
+    if (engine == NULL || engine->navigation.page.committed_us == 0u)
+        return false;
+    uint64_t now_us = browser_engine_recovery_now_us();
+    return now_us >= engine->navigation.page.committed_us
+        && now_us - engine->navigation.page.committed_us
+               >= BROWSER_RECOVERY_SETTLE_US;
+}
+
+BrowserBlankReaderRecovery browser_engine_prepare_blank_reader_recovery(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
+{
+    if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {0};
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready
+        || !browser_engine_page_is_visually_blank(engine)
+        || !browser_engine_has_script_degradation(&engine->navigation)) {
+        if (engine != NULL) engine->blank_reader_recovery_generation = 0u;
+        return BROWSER_BLANK_READER_RECOVERY_NONE;
+    }
+    if (script_runtime_has_pending_author_work(
+            engine->navigation.page.runtime)) {
+        const uint64_t generation = engine->navigation.generation;
+        const size_t runtime_tick =
+            engine->navigation.page.script_result.runtime_ticks;
+        if (engine->blank_reader_recovery_generation != generation) {
+            engine->blank_reader_recovery_generation = generation;
+            engine->blank_reader_recovery_first_runtime_tick = runtime_tick;
+        }
+        const size_t first_tick =
+            engine->blank_reader_recovery_first_runtime_tick;
+        const size_t settled_ticks = runtime_tick >= first_tick
+            ? runtime_tick - first_tick : BROWSER_BLANK_READER_SETTLE_TICKS;
+        /* Give delayed hydration an ordinary bounded settle window. A
+           permanent interval or self-scheduling animation must not suppress
+           both semantic recovery and the native recovery surface forever. */
+        if (settled_ticks < BROWSER_BLANK_READER_SETTLE_TICKS)
+            return BROWSER_BLANK_READER_RECOVERY_DEFERRED;
+    }
+    /* Runtime ticks and elapsed wall time are independent settle evidence;
+       accumulate them concurrently rather than making a recurring page wait
+       one complete window and only then begin the other. */
+    if (!browser_engine_recovery_wall_settled(engine))
+        return BROWSER_BLANK_READER_RECOVERY_DEFERRED;
+    engine->blank_reader_recovery_generation = 0u;
+    ReaderDocumentAnalysis *stored =
+        &engine->navigation.page.reader_analysis;
+    if (!stored->prepared
+        && !script_runtime_node_handle_capacity_available(
+               engine->navigation.page.runtime)) {
+        if (analysis != NULL) {
+            *analysis = (ReaderDocumentAnalysis) {
+                .prepared = true, .bounded_out = true
+            };
+        }
+        return BROWSER_BLANK_READER_RECOVERY_UNAVAILABLE;
+    }
+    if (!stored->prepared
+        && !reader_document_prepare_complete_with_stylesheet(
+               &engine->navigation.page.document,
+               &engine->navigation.page.stylesheet, stored)) {
+        return BROWSER_BLANK_READER_RECOVERY_UNAVAILABLE;
+    }
+    ReaderDocumentAnalysis prepared = *stored;
+    if (prepared.bounded_out || prepared.extraction_truncated) {
+        if (analysis != NULL) *analysis = prepared;
+        /* Strict automatic recovery deliberately installed no tree. Do not
+           let that analysis-only result suppress a later explicit Reader
+           request, whose bounded/truncated presentation is still useful and
+           visibly labeled as shortened. */
+        *stored = (ReaderDocumentAnalysis) {0};
+        return BROWSER_BLANK_READER_RECOVERY_UNAVAILABLE;
+    }
+    lxb_dom_node_t *reader_root = prepared.kind == READER_PAGE_RAW
+        ? NULL : browser_engine_establish_reader_root(
+              &engine->navigation.page, prepared.kind);
+    bool available = reader_root != NULL;
+    if (prepared.kind != READER_PAGE_RAW && reader_root == NULL) {
+        (void) reader_document_discard_prepared_view(
+            &engine->navigation.page.document, prepared.kind);
+        *stored = (ReaderDocumentAnalysis) {0};
+    }
+    if (reader_root != NULL) {
+        browser_engine_alias_reader_images(
+            engine, &engine->navigation, reader_root,
+            BROWSER_READER_ALIAS_PREPARE);
+    }
+    if (analysis != NULL) *analysis = prepared;
+    return available ? BROWSER_BLANK_READER_RECOVERY_AVAILABLE
+                     : BROWSER_BLANK_READER_RECOVERY_UNAVAILABLE;
+}
+
+static bool browser_engine_has_visible_action_target(
+    const BrowserEngine *engine)
+{
+    if (engine == NULL || !engine->navigation.page.loaded) return false;
+    const LayoutDocument *layout = &engine->navigation.page.layout;
+    for (size_t i = 0; i < layout->link_count; i++) {
+        const LinkRegion *link = &layout->links[i];
+        if (link->node != NULL && link->width > 0 && link->height > 0)
+            return true;
+    }
+    for (size_t i = 0; i < layout->control_count; i++) {
+        const ControlRegion *control = &layout->controls[i];
+        if (control->node != NULL
+            && control->width > 0 && control->height > 0) return true;
+    }
+    return false;
+}
+
+BrowserBasicViewRecovery browser_engine_prepare_basic_view_recovery(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis)
+{
+    if (analysis != NULL) *analysis = (ReaderDocumentAnalysis) {0};
+    if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
+        || !engine->navigation_ready
+        || !browser_engine_has_script_degradation(&engine->navigation)
+        || (!browser_engine_page_is_visually_blank(engine)
+            && browser_engine_has_visible_action_target(engine))) {
+        if (engine != NULL) engine->basic_view_recovery_generation = 0u;
+        return BROWSER_BASIC_VIEW_RECOVERY_NONE;
+    }
+    ReaderDocumentAnalysis *stored =
+        &engine->navigation.page.reader_analysis;
+    if (stored->prepared && stored->kind == READER_PAGE_BASIC) {
+        lxb_dom_node_t *root = browser_engine_resolve_reader_root(
+            &engine->navigation.page, READER_PAGE_BASIC);
+        if (analysis != NULL) *analysis = *stored;
+        return root == NULL
+            ? BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE
+            : BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE;
+    }
+    if (stored->prepared && stored->kind != READER_PAGE_RAW) {
+        if (analysis != NULL) *analysis = *stored;
+        return BROWSER_BASIC_VIEW_RECOVERY_NONE;
+    }
+    if (script_runtime_has_pending_author_work(
+            engine->navigation.page.runtime)) {
+        const uint64_t generation = engine->navigation.generation;
+        const size_t runtime_tick =
+            engine->navigation.page.script_result.runtime_ticks;
+        if (engine->basic_view_recovery_generation != generation) {
+            engine->basic_view_recovery_generation = generation;
+            engine->basic_view_recovery_first_runtime_tick = runtime_tick;
+        }
+        size_t first_tick =
+            engine->basic_view_recovery_first_runtime_tick;
+        size_t settled_ticks = runtime_tick >= first_tick
+            ? runtime_tick - first_tick : BROWSER_BLANK_READER_SETTLE_TICKS;
+        if (settled_ticks < BROWSER_BLANK_READER_SETTLE_TICKS)
+            return BROWSER_BASIC_VIEW_RECOVERY_DEFERRED;
+    }
+    if (!browser_engine_recovery_wall_settled(engine))
+        return BROWSER_BASIC_VIEW_RECOVERY_DEFERRED;
+    engine->basic_view_recovery_generation = 0u;
+    if (!script_runtime_node_handle_capacity_available(
+            engine->navigation.page.runtime)) {
+        if (analysis != NULL) {
+            *analysis = (ReaderDocumentAnalysis) {
+                .prepared = true, .bounded_out = true
+            };
+        }
+        return BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE;
+    }
+    ReaderDocumentAnalysis prepared = {0};
+    if (!reader_document_prepare_basic_complete_with_stylesheet(
+            &engine->navigation.page.document,
+            &engine->navigation.page.stylesheet, &prepared)) {
+        if (analysis != NULL) *analysis = prepared;
+        return BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE;
+    }
+    if (analysis != NULL) *analysis = prepared;
+    if (prepared.kind != READER_PAGE_BASIC || prepared.bounded_out
+        || prepared.extraction_truncated) {
+        return BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE;
+    }
+    lxb_dom_node_t *root = browser_engine_establish_reader_root(
+        &engine->navigation.page, READER_PAGE_BASIC);
+    if (root == NULL) {
+        (void) reader_document_discard_prepared_view(
+            &engine->navigation.page.document, READER_PAGE_BASIC);
+        return BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE;
+    }
+    *stored = prepared;
+    browser_engine_alias_reader_images(
+        engine, &engine->navigation, root,
+        BROWSER_READER_ALIAS_PREPARE);
+    return BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE;
 }
 
 void browser_engine_set_reader_candidate_mode(BrowserEngine *engine,

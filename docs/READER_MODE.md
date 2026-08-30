@@ -1,10 +1,13 @@
 # Reader mode
 
-Reader mode is a reversible presentation transform for ordinary HTTP(S)
-pages. It keeps the parsed document, JavaScript realm, resources, controls,
-and history entry intact, then applies bounded user-origin CSS through the
-existing BrowserEngine seam. Turning Reader mode off restores the author
-layout without refetching the page.
+Reader mode is a bounded native presentation for ordinary HTTP(S) pages. It
+keeps the parsed author document, resources, and history entry, appends one
+semantic extracted tree, then applies user-origin CSS through the existing
+BrowserEngine seam. Once that presentation succeeds, Tilefinch retires the
+current page's author JavaScript realms so later script cannot rewrite or
+intercept the extracted view. Turning Reader mode off restores the retained
+author layout without refetching its pixels, but interactive script state does
+not resume; reload the page to run its JavaScript again.
 
 The transform is driven by document shape rather than a hostname allow-list.
 On its first use for a loaded page, a bounded DOM pass classifies the page as
@@ -22,8 +25,8 @@ one of four forms:
   so a script-injected player with a related-items rail degrades to Article or
   Raw rather than hiding its description as a listing. The internal page-kind
   name remains `watch` for stylesheet and telemetry compatibility.
-- **Raw:** no high-confidence shape was found. Manual Reader mode still
-  applies the conservative generic reflow.
+- **Raw:** no safe semantic shape was found. Reader mode is unavailable and
+  the author presentation remains unchanged.
 
 The pass visits at most 8,192 DOM nodes, tracks at most 128 levels of nesting,
 and retains at most 64 listing entries. Its scratch table is charged to the
@@ -65,13 +68,19 @@ Limits are deliberate:
   scale, while address-bar, tab, internal-page, and explicit history
   navigations continue to leave Reader mode before admitting their target.
 
-Reader mode is not a sanitizer, blocker, or separate browsing realm. Hidden
-nodes remain live, and scripts keep the same authority they had before the
-transform. The host renderer's `--reader-profile` options are older,
-deterministic CSS fixtures for engineering comparisons; they are not the
-device product's content-shape classifier.
+Reader mode is not a sanitizer, content blocker, or separate browsing realm.
+The retained author DOM remains page-owned, while the connected extracted tree
+has exact native provenance and the current page's author realms are retired
+after presentation succeeds. The host renderer's `--reader-profile` options
+are older, deterministic CSS fixtures for engineering comparisons; they are
+not the device product's content-shape classifier.
 
 **Library → Save article for later** is deliberately separate from this live
 presentation transform. It serializes a bounded, text-only Reader document
 rather than retaining the page realm or DOM. See
 [Offline library](OFFLINE_LIBRARY.md).
+
+For a broader fallback which retains bounded, explicit GET/search forms and
+navigation instead of selecting only an article or listing, see
+[Basic view](BASIC_VIEW.md). Reader and Basic share one extracted tree slot;
+neither replaces the authored DOM.

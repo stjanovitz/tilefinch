@@ -1,0 +1,8 @@
+# Let navigation, shader compilation and the first frames settle, then reset
+# validation-only timing counters and retain a long uninterrupted gameplay
+# window. The URL selects ordinary or heavy Prism qualification state.
+wait-live 40
+mark-live webgl-measure-start
+wait-live 1300
+mark-live webgl-measure-end
+end

@@ -11,6 +11,19 @@ typedef struct {
     size_t attempted;
     size_t loaded;
     size_t failed;
+    /* A strict subset of `failed`: author source reached the evaluator and
+       failed there. Transport, MIME, integrity, CSP and quota refusals do not
+       advance this counter, so parser recovery never mistakes dead URLs for
+       a broken JavaScript realm. */
+    size_t execution_failures;
+    /* Monotonic time spent inside the evaluator only. Fetching, stylesheet
+       checkpoints and other element-close work are deliberately excluded. */
+    uint64_t execution_us;
+    /* Security-policy refusals remain part of `failed` for the existing
+       user-visible diagnostics, but are not author-code execution failures.
+       Parser hydration uses this subset to avoid opening its consecutive
+       execution-failure circuit on a deliberately restrictive page policy. */
+    size_t policy_refusals;
     size_t skipped_cross_origin;
     size_t skipped_module;
     size_t skipped_nomodule;
@@ -19,6 +32,11 @@ typedef struct {
     size_t pressure_collections;
     size_t pressure_reclaimed_bytes;
     size_t pressure_capped_requests;
+    /* Complete decoded/cache/network source bytes presented to the script
+       pipeline, whether admission, compilation, or evaluation later succeeds.
+       Parser hydration uses this independent counter as its cumulative work
+       authority; `bytes` retains its historical successfully-loaded meaning. */
+    size_t source_work_bytes;
     size_t bytes;
     size_t cache_hits;
     size_t parser_blocking;
@@ -73,7 +91,16 @@ typedef struct {
    their closing tag. */
 bool document_script_is_parser_blocking(lxb_dom_node_t *element);
 
-bool document_scripts_process_closed(
+typedef enum {
+    DOCUMENT_SCRIPT_PROCESS_COMPLETE = 0,
+    DOCUMENT_SCRIPT_PROCESS_HARD_FAILURE,
+    /* The caller-provided per-source limit rejected the complete external or
+       data: body. Callers which narrowed that limit to a cumulative allowance
+       can distinguish exhaustion from an ordinary transport/load failure. */
+    DOCUMENT_SCRIPT_PROCESS_SOURCE_LIMIT
+} DocumentScriptProcessResult;
+
+DocumentScriptProcessResult document_scripts_process_closed(
     ScriptRuntime *runtime, Budget *budget, BrowserSession *session,
     const char *base_url, const char *document_url,
     const char *referrer_policy,

@@ -275,10 +275,22 @@ content remains usable. Before the first parser-blocking author callback, the
 stream retains at most one complete, visibly useful body snapshot. If later
 hydration fails or exhausts its quota and collapses that content, commit
 restores the snapshot transactionally; a successful useful replacement stays
-authoritative.
+authoritative. Parser-blocking work also has a cumulative circuit breaker: one
+navigation may spend at most 1 MiB of parser-stage source work, eight seconds
+across its blocking checkpoints, or three consecutive failed scripts. When a
+bound trips, remaining blocking scripts are soft-skipped, parsing continues to
+EOF, and the committed page is marked Limited. The author realm is then retired
+for that committed document, so already-queued deferred, asynchronous, and
+dynamic work cannot resume a hydration path that the circuit deliberately
+abandoned. When the circuit does not trip, those script classes retain their
+existing lifecycle and quotas.
 Compiled external scripts and parsed stylesheet fragments may be reused from
-bounded in-memory caches during a process lifetime; neither cache writes
-compiled code to storage.
+bounded in-memory caches during a process lifetime. Ordinary browsing never
+writes compiler artifacts to storage. An explicitly installed offline app is
+the exception: installation may add bounded, locally generated classic-script
+bytecode beside the retained source. The artifact is bound to that source and
+a dedicated QuickJS bytecode ABI—not the Tilefinch release version—and launch
+falls back to source compilation whenever restoration is unavailable or fails.
 
 DOM mutations are journaled and coalesced before they trigger style/layout.
 The journal is bounded, and exhaustion selects a safe broader invalidation
@@ -370,9 +382,12 @@ canvas backing store; closing or collecting a bitmap returns its separate
 asset allowance.
 
 The Gamepad API exposes one stable standard-mapped controller object for the
-built-in PSP controls. It is disconnected until the user holds Start+Select to
-hand input to the active top-level JavaScript page. Native input authority is a
-small generation-bearing capture record: navigation, native media, or suspend
+built-in PSP controls. It is disconnected until the user holds Start+Select or
+a trusted Play click calls the bounded
+`navigator.tilefinch.requestPageControls()` extension. The latter shows a
+native Start+Select exit notice and suppresses the activating face button until
+release. Native input authority is a small generation-bearing capture record:
+navigation, native media, or suspend
 disconnects the object and returns control to the browser. Identical physical
 samples do not cross into QuickJS, button objects and axes are retained rather
 than recreated per poll, and cross-origin child frames never receive the
@@ -419,6 +434,15 @@ texture region clear that authority before lookup. Page-owned command, buffer,
 texture, depth, and presentation memory is
 charged through `Budget`; a failed allocation or excess scene refuses the
 operation without growing a hidden heap.
+
+An opaque, untransformed canvas update can publish without rebuilding the
+viewport's ordinary tiles. The renderer preserves the preceding RGB565 frame,
+overwrites only the canvas rectangle, then replays later document paint and
+fixed/sticky chrome in order. Scaled nearest-neighbour publication converts a
+source pixel once per run and copies repeated source rows, which keeps the fast
+path bounded without another canvas-sized allocation. Transparent, filtered,
+rounded, multiply blended, or ambiguously ordered canvases refuse this path and
+fall back to the normal retained-tile renderer.
 
 PSP draw translation first counts the exact bounded vertex requirement, then
 charges only that scratch size for the submission. All emitted vertices occupy
@@ -471,6 +495,29 @@ and referrer policy consumers do not reinterpret a truncated generic header
 snapshot. Resource-cache entries carry their partition and authorization
 grant; authority-bearing entries remain memory-only rather than being
 serialized as generic cache records.
+
+WebSockets reuse the same owned curl multi worker, TLS state, cookie authority,
+`connect-src`, mixed-content, and Private Network Access decisions rather than
+creating a second network stack. The page API admits two sockets, one 64 KiB
+message per socket, and 64 KiB of queued outbound data; a single published
+receive event provides backpressure instead of a page-sized queue. Handshake
+redirects are disabled, document cancellation closes the socket, and all
+receive/send storage is charged to the page `Budget`. The host runtime keeps
+the native duplex lane unavailable; deterministic JavaScript lifecycle tests
+exercise an injectable native seam, while the Allegrex build links curl's
+actual WS/WSS framing path.
+
+Installed offline games have a separate, explicitly user-activated direct
+multiplayer lane. Its page surface resembles the message/lifecycle portion of
+`RTCDataChannel`, while Tilefinch-specific setup performs bounded LAN
+discovery, public-endpoint discovery through STUN, numeric-code exchange, and
+explicit host approval. The PSP worker owns DNS and UDP; the browser thread
+sees only fixed command and event rings. One session, 512-byte datagrams, and
+fixed deadlines keep the feature inside the page `Budget` and network
+supervisor. Ordinary pages cannot open it, launching an offline app does not
+request Wi-Fi, and leaving the document cancels the worker and lease. There is
+no relay, background lobby, or general page UDP API. [Direct
+multiplayer](MULTIPLAYER.md) defines the author-facing contract.
 
 The bounded two-entry provider-document cache is optional session memory. It
 participates in ordinary cache reclaim and **Clear HTTP caches**, so a
@@ -734,9 +781,11 @@ Manifest-backed offline apps extend the same library rather than adding a
 second runtime. Installation serializes the committed document and a bounded
 view of the live same-origin HTTP cache. That view retains typed resource
 grants and module provenance; launch restores it before committing the saved
-document under the original URL. The design supports small self-contained
-games without Service Workers, background execution, or an offline-only
-authorization bypass.
+document under the original URL. Up to eight bounded classic-script resources
+may be compiled without evaluation during preview/installation; their source
+always remains authoritative, and old package versions remain readable. The
+design supports small self-contained games without Service Workers, background
+execution, or an offline-only authorization bypass.
 
 The updater uses a stable launcher and A/B browser slots. A compact binary
 manifest signs release sequence, exact file sizes, and digests. The launcher

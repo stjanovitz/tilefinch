@@ -117,6 +117,13 @@ typedef struct {
 typedef struct {
     PocDocument document;
     ReaderDocumentAnalysis reader_analysis;
+    /* Native provenance for the one connected extracted presentation root.
+       The generation-tagged handle, rather than an author-controlled marker,
+       lets controller sinks distinguish Basic controls from the live raw
+       realm. A raw pointer is used only when no runtime can mutate the DOM. */
+    lxb_dom_node_t *reader_root;
+    long reader_root_handle;
+    ReaderPageKind reader_root_kind;
     Stylesheet stylesheet;
     StylesheetDocumentResources stylesheet_resources;
     ExternalStylesheetStats external_stylesheets;
@@ -133,6 +140,9 @@ typedef struct {
     char document_url[NAVIGATION_URL_LIMIT];
     ScriptRuntime *runtime;
     ScriptResult script_result;
+    /* Current-document fact. Session script counters are diagnostic totals
+       and can outlive a page; frontend recovery must never consult them. */
+    bool script_degradation_observed;
     FetchSchedulerDomain *fetch_domain;
     FetchScheduler *resource_scheduler;
     /* Optional visual resources continue only from owner idle ticks. The
@@ -148,6 +158,10 @@ typedef struct {
     int deferred_image_rank_scroll_y;
     bool deferred_image_rank_valid;
     bool loaded;
+    /* Monotonic successful-commit boundary. Recovery settle windows begin
+       here rather than at request start, so a slow fetch cannot consume the
+       page's opportunity to reveal itself after first presentation. */
+    uint64_t committed_us;
     NavigationFrame frames[NAVIGATION_FRAME_LIMIT];
     size_t frame_count;
     long discovered_frame_handles[NAVIGATION_FRAME_DISCOVERY_LIMIT];
@@ -203,6 +217,13 @@ typedef bool (*NavigationProgressivePaintCallback)(
     void *opaque, NavigationSession *candidate,
     const LayoutDocument *layout);
 
+/* Optional owner hook after deferred document images become available but
+   before navigation transactionally rebuilds layout. The hook may install
+   bounded same-document aliases; allocation refusal remains a soft resource
+   omission and must leave the committed display list valid. */
+typedef void (*NavigationDeferredImageReadyCallback)(
+    void *opaque, NavigationSession *session);
+
 typedef struct {
     size_t ordinal;
     size_t node_count;
@@ -236,6 +257,17 @@ typedef struct {
     uint64_t parser_script_execute_us;
     uint64_t parser_script_rescan_us;
     size_t parser_script_mutations;
+    /* Cumulative parser-stage circuit telemetry. Admission is measured only
+       at synchronous parser-blocking boundaries. Once the circuit opens, the
+       document's realm is retired as a unit, so its deferred, async, and
+       later dynamic work cannot resume against the preserved server tree. */
+    uint64_t parser_script_stage_us;
+    size_t parser_script_stage_work;
+    size_t parser_script_stage_skipped;
+    size_t parser_script_stage_breakers;
+    size_t parser_script_stage_failure_breakers;
+    size_t parser_script_stage_time_breakers;
+    size_t parser_script_stage_work_breakers;
     NavigationBlockingScriptSample blocking_script_samples[
         NAVIGATION_BLOCKING_SCRIPT_SAMPLE_LIMIT];
     size_t blocking_script_sample_count;
@@ -380,6 +412,18 @@ typedef struct {
     size_t staged_body_compactions;
     size_t staged_body_compaction_bytes;
     size_t optional_work_sheds;
+    /* Parser-time author work is speculative: bounded metadata/style/runtime
+       checkpoints may be refused while the authoritative server DOM keeps
+       parsing to EOF. Keep the reasons separate from hard Lexbor and
+       response-security failures so device diagnostics can distinguish a
+       useful static fallback from a corrupt response. */
+    size_t parser_checkpoint_soft_refusals;
+    size_t parser_checkpoint_metadata_refusals;
+    size_t parser_checkpoint_fingerprint_refusals;
+    size_t parser_checkpoint_stylesheet_refusals;
+    size_t parser_checkpoint_mutation_refusals;
+    size_t parser_checkpoint_cssom_refusals;
+    size_t parser_checkpoint_script_refusals;
     size_t zero_body_navigation_retries;
     size_t frame_message_soft_failures;
     uint64_t max_slice_us;
@@ -600,6 +644,8 @@ struct NavigationSession {
     NavigationProgressivePaintCallback progressive_paint;
     void *progressive_paint_opaque;
     bool progressive_paint_preserves_incumbent;
+    NavigationDeferredImageReadyCallback deferred_image_ready;
+    void *deferred_image_ready_opaque;
     /* Prepare content-shape Reader markers on a completed candidate DOM
        before its first authoritative stylesheet/layout pass. */
     bool prepare_reader_candidates;
@@ -613,6 +659,7 @@ struct NavigationSession {
 };
 
 typedef struct NavigationLoad NavigationLoad;
+typedef struct NavigationUserCssTransaction NavigationUserCssTransaction;
 
 typedef enum {
     NAVIGATION_LOAD_PENDING = 0,
@@ -670,6 +717,12 @@ bool navigation_init(NavigationSession *session, Budget *budget,
 void navigation_enable_scripts(NavigationSession *session,
                                size_t js_memory_limit,
                                unsigned timeout_ms);
+/* Retires only the current document's author realms. The configured policy
+   remains in force for the next navigation. Main and child-frame realms are
+   all retired even when no main realm exists. Native extracted-view
+   provenance is frozen before the handle table is destroyed, so an exact
+   connected Reader or Basic root remains usable without an author VM. */
+void navigation_retire_current_page_scripts(NavigationSession *session);
 /* Applies to subsequently-created page and frame runtimes.  To avoid a
    partially-applied policy, changing it while a page runtime is live fails. */
 bool navigation_set_script_execution_policy(
@@ -688,6 +741,9 @@ bool navigation_set_candidate_commit_hooks(
 bool navigation_set_progressive_paint_hook(
     NavigationSession *session, NavigationProgressivePaintCallback paint,
     void *opaque);
+void navigation_set_deferred_image_ready_hook(
+    NavigationSession *session,
+    NavigationDeferredImageReadyCallback callback, void *opaque);
 /* Bounded CSS-height lookahead used only by a transient streaming preview.
    Fifty preserves the subsystem default; BrowserEngine uses one additional
    viewport so a handheld can expose one provisional page-down snapshot. */
@@ -760,9 +816,22 @@ bool navigation_set_user_css(NavigationSession *session, const char *css,
 void navigation_set_reader_candidate_mode(NavigationSession *session,
                                           bool enabled);
 /* Rebuilds user presentation CSS into staged stylesheet/layout values and
-   adopts them only after every fallible step succeeds. */
+   adopts them only after every fallible step succeeds. The explicit form
+   retains the previous page presentation until its caller publishes a new
+   render shell, allowing allocation-free rollback across that boundary. */
+NavigationUserCssTransaction *navigation_apply_user_css_begin(
+    NavigationSession *session, const char *css, size_t length);
+void navigation_apply_user_css_commit(
+    NavigationSession *session, NavigationUserCssTransaction *transaction);
+bool navigation_apply_user_css_rollback(
+    NavigationSession *session, NavigationUserCssTransaction *transaction);
 bool navigation_apply_user_css(NavigationSession *session, const char *css,
                                size_t length);
+/* Accept resource-bearing DOM installed by a trusted native transform (for
+   example the bounded Reader clone). Author JavaScript must never call this:
+   it deliberately advances the mutation fingerprint without fetching. */
+bool navigation_accept_native_resource_fingerprint(
+    NavigationSession *session);
 void navigation_enable_frame_capability_trace(NavigationSession *session,
                                               bool enabled);
 void navigation_enable_page_capability_trace(NavigationSession *session,
@@ -857,16 +926,32 @@ const NavigationEntry *navigation_current(const NavigationSession *session);
 bool navigation_replace_history(
     NavigationSession *session, const NavigationHistoryRecord *records,
     size_t count, size_t current_index);
+/* True only when url differs from the active entry at most by fragment. */
+bool navigation_url_is_same_document(
+    const NavigationSession *session, const char *url);
 bool navigation_commit_same_document_url(NavigationSession *session,
                                          const char *url);
 bool navigation_restore_same_document_url(NavigationSession *session,
                                           const char *url,
                                           const char *old_url);
+/* Consumes synchronous hashchange/popstate scroll and mutation requests using
+   the ordinary bounded relayout path. The already-published native
+   URL/history remains authoritative when settlement is refused. */
+bool navigation_settle_same_document_events(NavigationSession *session);
+/* Apply the URL fragment to the retained layout without fetching. Missing
+   targets are a successful no-op; an empty fragment scrolls to the top. */
+bool navigation_scroll_to_fragment(
+    NavigationSession *session, const char *url);
 void navigation_discard_current_page(NavigationSession *session);
 bool navigation_set_scroll(NavigationSession *session, int scroll_y);
 bool navigation_advance_runtime(NavigationSession *session,
                                 unsigned elapsed_ms,
                                 size_t callback_budget);
+/* One authoritative settled-layout blank predicate is shared by late
+   allocator recovery and frontend Reader recovery. Decorative paint state on
+   a viewport fill is visible output, even when its base color matches the
+   page background. */
+bool navigation_layout_is_visually_blank(const LayoutDocument *layout);
 /* The active top-level realm alone receives built-in controller input. This
    matches the platform's explicit page-capture boundary and does not leak
    controller state into cross-origin child frames. A page without an author
@@ -886,10 +971,33 @@ typedef enum {
 } NavigationBackgroundWorkOutcome;
 NavigationBackgroundWorkOutcome navigation_run_background_resources(
     NavigationSession *session);
+typedef enum {
+    NAVIGATION_TEST_PARSER_CHECKPOINT_NONE = 0,
+    NAVIGATION_TEST_PARSER_CHECKPOINT_METADATA,
+    NAVIGATION_TEST_PARSER_CHECKPOINT_FINGERPRINT,
+    NAVIGATION_TEST_PARSER_CHECKPOINT_STYLESHEET,
+    NAVIGATION_TEST_PARSER_CHECKPOINT_MUTATION,
+    NAVIGATION_TEST_PARSER_FEED_HARD_FAILURE
+} NavigationParserCheckpointTestFault;
 #if !defined(__PSP__)
+/* Deterministic host-only seams for the streaming parser's typed outcome
+   boundary. Optional checkpoint faults must preserve the server DOM; a feed
+   fault must remain a hard navigation failure. */
+void navigation_test_refuse_next_parser_checkpoint(
+    NavigationParserCheckpointTestFault fault);
+/* Refuse one streaming scheduler creation without consuming an unrelated
+   Budget allocation. This pins the resource-only degradation boundary. */
+void navigation_test_refuse_next_stream_scheduler_creation(void);
 /* Deterministic host-only fault seam for the transactional optional-font
    relayout boundary. */
 void navigation_test_refuse_next_background_font_relayout(void);
+/* Refuse the first Budget allocation made by the next transactional static
+   fallback layout. This pins rollback without depending on unrelated realm-
+   teardown allocation ordering. */
+void navigation_test_refuse_next_static_fallback_layout(void);
+/* Refuse the first layout allocation while settling the next synchronous
+   hashchange/popstate mutation. */
+void navigation_test_refuse_next_same_document_relayout(void);
 #endif
 /* Pump exactly one deferred document-image continuation unit without also
    advancing webfonts, scripts, or other idle work. Frontends may use this

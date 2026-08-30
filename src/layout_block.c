@@ -2462,6 +2462,18 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                         node_control_start, node_box_start, dx, dy,
                         "transform", node);
     }
+    /* Sticky descendants are constrained by their first enclosing block.
+       Their ranges are registered in post-order, so the current node is the
+       first finalized containing box that can publish the lower boundary.
+       Bind before registering this node's own sticky range. */
+    const LayoutNodeBox *sticky_containing_box = layout_box_for_node(
+        context->layout, node);
+    if (sticky_containing_box != NULL) {
+        layout_bound_sticky_ranges(
+            context->layout, node_command_start, context->layout->count,
+            layout_add_coordinate(sticky_containing_box->y,
+                                  sticky_containing_box->height));
+    }
     if (style->out_of_flow) {
         /* CSS 10.3.7/10.6.4: the inset positions the margin edge, so the
            border box lands at inset + margin.  Auto margins are stored as
@@ -2502,9 +2514,16 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     }
     if (style->sticky_position) {
         int sticky_top = style->has_top ? resolved_top : 0;
+        const LayoutNodeBox *sticky_box = layout_box_for_node(
+            context->layout, node);
+        int sticky_origin_y = sticky_box == NULL
+            ? outer_y : sticky_box->y;
+        int sticky_bottom_y = layout_add_coordinate(
+            sticky_origin_y,
+            sticky_box == NULL ? border_height : sticky_box->height);
         if (!add_sticky_range(context->layout, node_command_start,
-                              context->layout->count, outer_y,
-                              sticky_top)) return false;
+                              context->layout->count, sticky_origin_y,
+                              sticky_top, sticky_bottom_y)) return false;
     }
     if (style->fixed_position) {
         if (fixed_captured) {

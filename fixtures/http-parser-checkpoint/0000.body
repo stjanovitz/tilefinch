@@ -1,0 +1,1 @@
+<!doctype html><html><head><title>Checkpoint fallback</title><style>main{display:block;color:#234}p{margin:4px}</style></head><body><main><h1 id="content">Server body remains</h1><script>document.body.setAttribute('data-script-ran','yes');globalThis.pocSummary='checkpoint-script-ran'</script><p id="tail">Tail survived</p></main></body></html>

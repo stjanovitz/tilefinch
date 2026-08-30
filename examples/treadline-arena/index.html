@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#102b38">
+  <title>Treadline Arena</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="game.css">
+  <script>
+    if (!navigator.tilefinchMultiplayer)
+      document.write('<script src="multiplayer-web.js"><\/script>');
+  </script>
+  <script defer src="arena-generator.js"></script>
+  <script defer src="game.js"></script>
+</head>
+<body>
+  <main id="game-shell">
+    <canvas id="game" width="320" height="180"
+            aria-label="Treadline Arena game field" tabindex="0"></canvas>
+    <header id="hud" aria-live="polite">
+      <span id="score">00000</span>
+      <span id="arena">ARENA 1</span>
+      <span id="armor">ARMOR 100</span>
+    </header>
+    <div id="gadget" aria-live="polite">GADGET —</div>
+    <div id="gadget-meter" aria-hidden="true"><i></i></div>
+    <div id="command-status" aria-live="polite" hidden>COMMAND 0%</div>
+    <div id="command-meter" aria-hidden="true" hidden><i></i></div>
+    <div id="objective-arrow" aria-hidden="true">▲</div>
+    <div id="hit-marker" aria-hidden="true">×</div>
+    <div id="damage-arrow" aria-hidden="true">▲</div>
+    <section id="panel">
+      <h1>TREADLINE ARENA</h1>
+      <p id="message">Clear three arenas before your last redeploy.</p>
+      <div id="loadout">
+        <button id="mode-choice" type="button"><small>MODE</small><strong id="mode-value">SURVIVAL</strong></button>
+        <button id="class-choice" type="button"><small>CLASS</small><strong id="class-value">STRIKER</strong></button>
+        <button id="gadget-choice" type="button"><small>GADGET</small><strong id="gadget-value">MINES</strong></button>
+        <button id="difficulty-choice" type="button"><small>BOTS</small><strong id="difficulty-value">VETERAN</strong></button>
+      </div>
+      <div id="preferences">
+        <button id="controls-choice" type="button">Controls <strong id="controls-value">Arcade</strong></button>
+        <button id="assist-choice" type="button">Aim assist <strong id="assist-value">Snap</strong></button>
+        <button id="camera-choice" type="button">Camera <strong id="camera-value">Stable</strong></button>
+        <button id="command-choice" type="button">Command <strong id="command-value">Off</strong></button>
+        <button id="music-choice" type="button">Menu music <strong id="music-value">Off</strong></button>
+        <button id="effects-choice" type="button">Effects <strong id="effects-value">On</strong></button>
+        <button id="shake-choice" type="button">Shake <strong id="shake-value">On</strong></button>
+      </div>
+      <p id="stats" hidden></p>
+      <button id="play" autofocus>Deploy</button>
+      <div id="online-actions">
+        <button id="online-host" type="button">Host online</button>
+        <button id="online-lan" type="button">Find LAN</button>
+        <button id="online-code" type="button">Enter code</button>
+      </div>
+      <section id="online-status" hidden>
+        <p id="online-message">Preparing multiplayer…</p>
+        <output id="online-invite"></output>
+        <button id="online-response" type="button" hidden>Enter response code</button>
+        <div id="online-peer-actions" hidden>
+          <button id="online-accept" type="button">Accept</button>
+          <button id="online-reject" type="button">Reject</button>
+        </div>
+        <button id="online-cancel" type="button">Cancel</button>
+      </section>
+      <section id="code-entry" hidden>
+        <output id="code-value">—</output>
+        <div id="code-keypad" aria-label="Invite code keypad">
+          <button type="button">1</button><button type="button">2</button><button type="button">3</button>
+          <button type="button">4</button><button type="button">5</button><button type="button">6</button>
+          <button type="button">7</button><button type="button">8</button><button type="button">9</button>
+          <button type="button" data-key="delete">⌫</button><button type="button">0</button>
+          <button type="button" data-key="join">Join</button>
+        </div>
+        <button id="code-cancel" type="button">Back</button>
+      </section>
+      <section id="web-pairing" hidden>
+        <p id="web-step">Step 1 of 2</p>
+        <p id="web-help">Pair directly using a private message. No game account or lobby is used.</p>
+        <p id="web-status" role="status" aria-live="polite"></p>
+        <label id="web-share-label" for="web-share">Send this offer to the other player</label>
+        <textarea id="web-share" rows="3" readonly spellcheck="false"
+                  aria-describedby="web-share-size"></textarea>
+        <small id="web-share-size"></small>
+        <button id="web-copy" type="button">Copy</button>
+        <label id="web-input-label" for="web-input">Paste their response</label>
+        <textarea id="web-input" rows="3" spellcheck="false"
+                  autocapitalize="off" autocomplete="off"></textarea>
+        <button id="web-apply" type="button">Use response</button>
+        <button id="web-cancel" type="button">Back</button>
+      </section>
+      <p class="controls" id="controls">Arcade: nub moves | face buttons aim | R fire | L secondary | Up gadget | Down Command</p>
+    </section>
+    <div id="toast" aria-live="polite"></div>
+  </main>
+  <script>
+    /* Deferred scripts are parser-discovered so an installed snapshot can
+       bind them to its typed package entries. The complete menu is parsed
+       before either executes, and this listener preserves an early Deploy. */
+    (function () {
+      var play = document.getElementById("play");
+      if (play) play.addEventListener("click", function () {
+        if (!globalThis.__treadlineBootReady) {
+          globalThis.__treadlineDeployQueued = true;
+          play.textContent = "Starting...";
+          play.setAttribute("aria-busy", "true");
+          /* A delayed replay of this click is no longer a trusted activation.
+             Claim Page-controls now so the queued Deploy enters game mode as
+             soon as the precompiled runtime is ready. */
+          var shell = document.getElementById("game-shell");
+          if (shell && navigator.tilefinch
+              && navigator.tilefinch.requestPageControls) {
+            navigator.tilefinch.requestPageControls(shell).catch(function () {});
+          }
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

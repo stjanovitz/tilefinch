@@ -27,6 +27,7 @@ static void usage(const char *program)
             "[--content-blocker off|basic|custom] "
             "[--content-blocker-list FILE] "
             "[--trace-frames] [--trace-page] "
+            "[--probe-usability] "
             "[--capture-http DIR | --capture-http-from-top-level N DIR | "
             "--replay-http DIR | --replay-http-response-keyed DIR] "
             "[--deterministic-replay-seed N] "

@@ -1,0 +1,9 @@
+# Let navigation, shader compilation, and retained HUD/scenery settle.
+wait-live 260
+mark-live webgl-measure-start
+# The long-soak qualification mode drives the player through bounded combat,
+# obstacle avoidance, and repeated action events while it cycles arenas.
+wait-live 2700
+mark-live webgl-measure-end
+wait-live 10
+end

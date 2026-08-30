@@ -22,8 +22,16 @@ void js_rt_runtime_arm_watchdog(ScriptRuntime *runtime)
 {
     watchdog_finish_slice(&runtime->watchdog);
     runtime->watchdog.started_ms = monotonic_time_ms();
-    runtime->watchdog.deadline_ms = runtime->watchdog.started_ms
-                                    + runtime->timeout_ms;
+    runtime->watchdog.deadline_ms = runtime->timeout_ms
+            > UINT64_MAX - runtime->watchdog.started_ms
+        ? UINT64_MAX
+        : runtime->watchdog.started_ms + runtime->timeout_ms;
+    if (runtime->execution_deadline_cap_ms != 0u
+        && runtime->watchdog.deadline_ms
+               > runtime->execution_deadline_cap_ms) {
+        runtime->watchdog.deadline_ms =
+            runtime->execution_deadline_cap_ms;
+    }
 #if defined(CONFIG_EXECUTION_PROFILE)
     runtime->watchdog.next_profile_ms = runtime->watchdog.started_ms + 1000u;
 #endif
@@ -31,6 +39,30 @@ void js_rt_runtime_arm_watchdog(ScriptRuntime *runtime)
     runtime->watchdog.interrupted = false;
     runtime->watchdog.slice_started_ns = js_rt_monotonic_time_ns();
     runtime->watchdog.slice_work_units = 0;
+}
+
+void script_runtime_limit_execution_for_us(ScriptRuntime *runtime,
+                                           uint64_t remaining_us)
+{
+    if (runtime == NULL) return;
+    uint64_t now_ms = monotonic_time_ms();
+    uint64_t remaining_ms = remaining_us / UINT64_C(1000);
+    if (remaining_us % UINT64_C(1000) != 0u) remaining_ms++;
+    /* Zero is the public sentinel for "no cap", so an exhausted allowance
+       is represented by the current nonzero monotonic instant. */
+    if (remaining_ms > UINT64_MAX - now_ms) {
+        runtime->execution_deadline_cap_ms = UINT64_MAX;
+    } else {
+        runtime->execution_deadline_cap_ms = now_ms + remaining_ms;
+        if (runtime->execution_deadline_cap_ms == 0u) {
+            runtime->execution_deadline_cap_ms = 1u;
+        }
+    }
+}
+
+void script_runtime_clear_execution_limit(ScriptRuntime *runtime)
+{
+    if (runtime != NULL) runtime->execution_deadline_cap_ms = 0u;
 }
 
 static bool runtime_job_exception_is_fatal(const ScriptRuntime *runtime,
@@ -89,6 +121,22 @@ bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
         jobs++;
     }
     return true;
+}
+
+bool script_runtime_has_pending_author_work(ScriptRuntime *runtime)
+{
+    /* Do not use result.pending_tasks here. That diagnostic also counts an
+       open EventSource, WebSocket, or multiplayer channel, none of which has
+       a finite quiescent state. A timer is deliberately conservative: it may
+       be the page's bounded delayed hydration root. */
+    return runtime != NULL
+        && (runtime->pending_timer_tasks != 0u
+            || runtime->pending_network_tasks != 0u
+            || runtime->bridge.async_fetch_count != 0u
+            || runtime->bridge.dynamic_script_count != 0u
+            || JS_IsJobPending(runtime->runtime)
+            || js_rt_dynamic_classic_continuation_pending(runtime)
+            || runtime->page_visibility_queue_count != 0u);
 }
 
 
@@ -615,6 +663,21 @@ long script_runtime_node_weak_handle(ScriptRuntime *runtime,
         ? 0 : (long) js_rt_bridge_register_node(&runtime->bridge, node);
 }
 
+bool script_runtime_node_handle_capacity_available(
+    const ScriptRuntime *runtime)
+{
+    if (runtime == NULL) return true;
+    const DomBridge *bridge = &runtime->bridge;
+    if (bridge->node_count < DOM_BRIDGE_NODE_LIMIT) return true;
+    for (size_t slot = 0; slot < bridge->node_count; slot++) {
+        if (bridge->nodes[slot] == NULL
+            && bridge->node_generations[slot] != 0
+            && bridge->node_generations[slot]
+                   < DOM_BRIDGE_NODE_GENERATION_MAX) return true;
+    }
+    return false;
+}
+
 lxb_dom_node_t *script_runtime_node_handle_resolve(
     const ScriptRuntime *runtime, long handle)
 {
@@ -699,8 +762,9 @@ bool js_rt_runtime_refresh(ScriptRuntime *runtime)
         return false;
     }
     JS_FreeValue(runtime->context, pending);
-    runtime->result.pending_tasks = pending_count > 0
+    runtime->pending_timer_tasks = pending_count > 0
         ? (size_t) pending_count : 0;
+    runtime->result.pending_tasks = runtime->pending_timer_tasks;
     if (!runtime_call_host(runtime, SCRIPT_HOST_PENDING_NETWORK_REQUESTS, 0, NULL,
                       &pending)) {
         return false;
@@ -712,11 +776,13 @@ bool js_rt_runtime_refresh(ScriptRuntime *runtime)
         return false;
     }
     JS_FreeValue(runtime->context, pending);
-    if (pending_count > 0) {
-        runtime->result.pending_tasks += (size_t) pending_count;
-    }
+    runtime->pending_network_tasks = pending_count > 0
+        ? (size_t) pending_count : 0;
+    runtime->result.pending_tasks += runtime->pending_network_tasks;
     runtime->result.pending_tasks += runtime->bridge.async_fetch_count;
     runtime->result.pending_tasks += runtime->bridge.event_source_count;
+    runtime->result.pending_tasks += runtime->bridge.websocket_count;
+    runtime->result.pending_tasks += runtime->bridge.multiplayer.active ? 1u : 0u;
     runtime->result.pending_tasks += runtime->bridge.dynamic_script_count;
     return true;
 }
@@ -733,8 +799,10 @@ size_t script_runtime_cancel_network(
     ScriptRuntime *runtime, const char *reason)
 {
     if (runtime == NULL) return 0;
-    return fetch_scheduler_cancel_all(
+    size_t cancelled = fetch_scheduler_cancel_all(
         runtime->bridge.fetch_scheduler, reason);
+    return cancelled + js_rt_websockets_abort(&runtime->bridge)
+        + js_rt_multiplayer_abort(&runtime->bridge);
 }
 
 static bool runtime_pump_network(ScriptRuntime *runtime,
@@ -792,6 +860,22 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
         if (!js_rt_dynamic_execute_ready(runtime, 1, &author_tasks)) {
             return false;
         }
+        if (completed_out != NULL) *completed_out = author_tasks;
+        return true;
+    }
+    if (!js_rt_websockets_deliver(
+            runtime, completion_budget, &author_tasks)) {
+        return false;
+    }
+    if (author_tasks != 0) {
+        if (completed_out != NULL) *completed_out = author_tasks;
+        return true;
+    }
+    if (!js_rt_multiplayer_deliver(
+            runtime, completion_budget, &author_tasks)) {
+        return false;
+    }
+    if (author_tasks != 0) {
         if (completed_out != NULL) *completed_out = author_tasks;
         return true;
     }

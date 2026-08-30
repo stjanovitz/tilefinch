@@ -1,3 +1,32 @@
+#if !defined(__PSP__)
+static bool navigation_refuse_static_fallback_layout_once;
+static bool navigation_refuse_same_document_relayout_once;
+
+void navigation_test_refuse_next_static_fallback_layout(void)
+{
+    navigation_refuse_static_fallback_layout_once = true;
+}
+
+static bool navigation_test_consume_static_fallback_layout_refusal(void)
+{
+    bool pending = navigation_refuse_static_fallback_layout_once;
+    navigation_refuse_static_fallback_layout_once = false;
+    return pending;
+}
+
+void navigation_test_refuse_next_same_document_relayout(void)
+{
+    navigation_refuse_same_document_relayout_once = true;
+}
+
+static bool navigation_test_consume_same_document_relayout_refusal(void)
+{
+    bool pending = navigation_refuse_same_document_relayout_once;
+    navigation_refuse_same_document_relayout_once = false;
+    return pending;
+}
+#endif
+
 bool navigation_back(NavigationSession *session, const NavigationEntry **entry)
 {
     if (session == NULL || session->history_count == 0
@@ -22,6 +51,31 @@ const NavigationEntry *navigation_current(const NavigationSession *session)
     if (session == NULL || session->history_count == 0
         || session->history_index >= session->history_count) return NULL;
     return &session->history[session->history_index];
+}
+
+static bool navigation_urls_are_distinct_same_request(const char *left,
+                                                       const char *right)
+{
+    char current_url[NAVIGATION_URL_LIMIT];
+    char target_url[NAVIGATION_URL_LIMIT];
+    if (left == NULL || right == NULL
+        || !tilefinch_url_normalize(
+               left, current_url, sizeof(current_url))
+        || !tilefinch_url_normalize(right, target_url, sizeof(target_url))
+        || strcmp(current_url, target_url) == 0) return false;
+    char *current_fragment = strchr(current_url, '#');
+    char *target_fragment = strchr(target_url, '#');
+    if (current_fragment != NULL) *current_fragment = '\0';
+    if (target_fragment != NULL) *target_fragment = '\0';
+    return strcmp(current_url, target_url) == 0;
+}
+
+bool navigation_url_is_same_document(
+    const NavigationSession *session, const char *url)
+{
+    const NavigationEntry *current = navigation_current(session);
+    return current != NULL && url != NULL
+        && navigation_urls_are_distinct_same_request(current->url, url);
 }
 
 bool navigation_replace_history(
@@ -74,7 +128,8 @@ bool navigation_commit_same_document_url(NavigationSession *session,
 {
     const NavigationEntry *current = navigation_current(session);
     if (session == NULL || url == NULL || url[0] == '\0' || current == NULL
-        || strlen(url) >= NAVIGATION_URL_LIMIT) return false;
+        || strlen(url) >= NAVIGATION_URL_LIMIT
+        || !navigation_url_is_same_document(session, url)) return false;
     char old_url[NAVIGATION_URL_LIMIT];
     snprintf(old_url, sizeof(old_url), "%s", current->url);
     char observed_old_base[NAVIGATION_URL_LIMIT];
@@ -85,17 +140,25 @@ bool navigation_commit_same_document_url(NavigationSession *session,
     char next_base[NAVIGATION_URL_LIMIT];
     if (!navigation_document_resource_base(
             &session->page.document, url, next_base)) return false;
-    if (session->page.runtime != NULL
-        && !script_runtime_commit_same_document(
-               session->page.runtime, url, old_url,
-               &session->page.script_result)) return false;
-    if (!history_push(session, url, session->page.document.title)) {
-        if (session->page.runtime != NULL) {
-            (void) script_runtime_restore_same_document(
-                session->page.runtime, old_url, url,
-                &session->page.script_result);
-        }
-        return false;
+    /* Allocate and publish native history first. A broken page realm cannot
+       turn a fragment link into a network request or dead control; URL
+       reflection/hashchange is advisory after the native commit. */
+    if (!history_push(session, url, session->page.document.title)) return false;
+    if (session->page.runtime != NULL) {
+        (void) script_runtime_commit_same_document(
+            session->page.runtime, url, old_url,
+            &session->page.script_result);
+    }
+    /* hashchange is allowed to mutate the first connected <base>.  Publish
+       the resource base from the post-callback DOM, not the pre-dispatch
+       snapshot, so later relative links/forms agree with document.baseURI.
+       Native history is already committed here; a rare bounded
+       recalculation refusal therefore keeps the last valid preflight value
+       rather than reporting a transactional failure after publication. */
+    char post_callback_base[NAVIGATION_URL_LIMIT];
+    if (navigation_document_resource_base(
+            &session->page.document, url, post_callback_base)) {
+        snprintf(next_base, sizeof(next_base), "%s", post_callback_base);
     }
     snprintf(session->page.resource_base_url,
              sizeof(session->page.resource_base_url), "%s", next_base);
@@ -108,7 +171,10 @@ bool navigation_restore_same_document_url(NavigationSession *session,
 {
     const NavigationEntry *current = navigation_current(session);
     if (session == NULL || url == NULL || old_url == NULL || current == NULL
-        || strcmp(current->url, url) != 0) return false;
+        || strcmp(current->url, url) != 0
+        || !navigation_urls_are_distinct_same_request(old_url, url)) {
+        return false;
+    }
     char observed_old_base[NAVIGATION_URL_LIMIT];
     if (!navigation_document_resource_base(
             &session->page.document, old_url, observed_old_base)) {
@@ -117,15 +183,207 @@ bool navigation_restore_same_document_url(NavigationSession *session,
     char next_base[NAVIGATION_URL_LIMIT];
     if (!navigation_document_resource_base(
             &session->page.document, url, next_base)) return false;
-    bool restored = session->page.runtime == NULL
-        || script_runtime_restore_same_document(
-               session->page.runtime, url, old_url,
-               &session->page.script_result);
-    if (restored) {
-        snprintf(session->page.resource_base_url,
-                 sizeof(session->page.resource_base_url), "%s", next_base);
+    if (session->page.runtime != NULL) {
+        (void) script_runtime_restore_same_document(
+            session->page.runtime, url, old_url,
+            &session->page.script_result);
     }
-    return restored;
+    /* popstate/hashchange can likewise replace or edit <base>. */
+    char post_callback_base[NAVIGATION_URL_LIMIT];
+    if (navigation_document_resource_base(
+            &session->page.document, url, post_callback_base)) {
+        snprintf(next_base, sizeof(next_base), "%s", post_callback_base);
+    }
+    snprintf(session->page.resource_base_url,
+             sizeof(session->page.resource_base_url), "%s", next_base);
+    return true;
+}
+
+bool navigation_settle_same_document_events(NavigationSession *session)
+{
+    if (session == NULL || !session->page.loaded) return false;
+    ScriptRuntime *runtime = session->page.runtime;
+    if (runtime == NULL) return true;
+
+    /* The event callbacks themselves are synchronous, but DOM mutations are
+       journaled for a bounded transactional relayout.  Settle that journal
+       before BrowserEngine resolves fragment or restored-history geometry.
+       A page scroll requested by the callback is applied against the new
+       layout, then the user agent's fragment/history scroll may override it. */
+    int requested_scroll = 0;
+    bool has_requested_scroll = script_runtime_consume_scroll(
+        runtime, &requested_scroll);
+    bool relayout_requested = script_runtime_consume_relayout(runtime);
+    if (relayout_requested) {
+#if !defined(__PSP__)
+        bool injected_refusal =
+            navigation_test_consume_same_document_relayout_refusal();
+        if (injected_refusal)
+            budget_inject_failure_after(session->budget, 0u);
+#endif
+        bool relaid_out = navigation_relayout(session);
+#if !defined(__PSP__)
+        if (injected_refusal)
+            budget_clear_failure_injection(session->budget);
+#endif
+        if (!relaid_out) return false;
+    }
+    if (has_requested_scroll) {
+        int maximum = navigation_max_scroll(session);
+        if (!navigation_set_scroll(
+                session, requested_scroll < maximum
+                    ? requested_scroll : maximum)) return false;
+    }
+    return true;
+}
+
+static bool navigation_fragment_decode(const TilefinchUrl *parsed,
+                                       char *output, size_t capacity,
+                                       size_t *length)
+{
+    if (length != NULL) *length = 0;
+    if (parsed == NULL || output == NULL || capacity == 0
+        || parsed->fragment_length >= capacity) return false;
+    size_t used = 0;
+    const char *source = parsed->value + parsed->fragment_offset;
+    for (size_t at = 0; at < parsed->fragment_length; at++) {
+        unsigned char value = (unsigned char) source[at];
+        if (value == '%' && at + 2u < parsed->fragment_length
+            && isxdigit((unsigned char) source[at + 1u])
+            && isxdigit((unsigned char) source[at + 2u])) {
+            unsigned char high = (unsigned char) source[++at];
+            unsigned char low = (unsigned char) source[++at];
+            high = (unsigned char) (isdigit(high) ? high - '0'
+                                      : tolower(high) - 'a' + 10);
+            low = (unsigned char) (isdigit(low) ? low - '0'
+                                     : tolower(low) - 'a' + 10);
+            value = (unsigned char) ((high << 4) | low);
+        }
+        if (value == 0 || used + 1u >= capacity) return false;
+        output[used++] = (char) value;
+    }
+    output[used] = '\0';
+    if (length != NULL) *length = used;
+    return true;
+}
+
+static lxb_dom_node_t *navigation_fragment_target(
+    NavigationSession *session, const char *identifier, size_t length)
+{
+    if (session == NULL || identifier == NULL || length == 0
+        || session->page.document.html == NULL) return NULL;
+    lxb_dom_node_t *root = lxb_dom_interface_node(
+        session->page.document.html);
+    lxb_dom_node_t *body = document_body_node(&session->page.document);
+    size_t reader_kind_length = 0;
+    const char *reader_kind = body == NULL ? NULL
+        : document_attribute(
+              body, "data-tilefinch-reader-kind", &reader_kind_length);
+    /* Never discover this root from an author-controlled attribute. The
+       BrowserEngine retains the exact native clone through a generation-safe
+       handle; an authored direct-child lookalike must not win fragment
+       routing while the actual extracted tree is active. */
+    lxb_dom_node_t *extracted_root = NULL;
+    if (reader_kind != NULL && reader_kind_length != 0u
+        && session->page.reader_root_kind != READER_PAGE_RAW) {
+        const char *expected = reader_page_kind_name(
+            session->page.reader_root_kind);
+        size_t expected_length = strlen(expected);
+        if (expected_length == reader_kind_length
+            && memcmp(expected, reader_kind, expected_length) == 0) {
+            if (session->page.runtime != NULL) {
+                extracted_root = session->page.reader_root_handle == 0
+                    ? NULL : script_runtime_node_handle_resolve_connected(
+                          session->page.runtime,
+                          session->page.reader_root_handle);
+            } else if (session->page.reader_root_handle == 0) {
+                extracted_root = session->page.reader_root;
+            }
+            if (extracted_root != NULL
+                && extracted_root->parent != body) extracted_root = NULL;
+        }
+    }
+    char extracted_identifier[NAVIGATION_URL_LIMIT];
+    static const char prefix[] = "tilefinch-extracted-";
+    size_t prefix_length = sizeof(prefix) - 1u;
+    bool try_extracted = extracted_root != NULL
+        && length < sizeof(extracted_identifier) - prefix_length;
+    if (try_extracted) {
+        memcpy(extracted_identifier, prefix, prefix_length);
+        memcpy(extracted_identifier + prefix_length, identifier, length);
+        extracted_identifier[prefix_length + length] = '\0';
+    }
+    /* Prefer either extracted anchor form before the hidden raw source tree.
+       Basic/Reader keeps authored href fragments stable and prefixes only
+       clone targets, including legacy <a name> anchors. */
+    unsigned pass_count = try_extracted ? 4u : 2u;
+    for (unsigned pass = 0; pass < pass_count; pass++) {
+        bool extracted_pass = try_extracted && pass < 2u;
+        bool legacy_name = try_extracted ? (pass == 1u || pass == 3u)
+                                         : pass == 1u;
+        const char *wanted = extracted_pass
+            ? extracted_identifier : identifier;
+        size_t wanted_length = extracted_pass
+            ? prefix_length + length : length;
+        size_t visited = 0;
+        lxb_dom_node_t *scan_root = extracted_pass
+            ? extracted_root : root;
+        lxb_dom_node_t *node = scan_root;
+        while (node != NULL && visited++ < NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT) {
+            size_t candidate_length = 0;
+            const char *candidate = legacy_name && node->type
+                        == LXB_DOM_NODE_TYPE_ELEMENT
+                    && node->local_name == LXB_TAG_A
+                ? document_attribute(node, "name", &candidate_length)
+                : (!legacy_name
+                    ? document_attribute(node, "id", &candidate_length)
+                    : NULL);
+            const LayoutNodeBox *box = candidate != NULL
+                    && candidate_length == wanted_length
+                    && memcmp(candidate, wanted, wanted_length) == 0
+                ? layout_box_for_node(&session->page.layout, node) : NULL;
+            /* Extracted passes are restricted to the exact native root that
+               matches the body's active presentation marker. This provenance
+               makes its neutral markers and empty legacy anchors safe
+               zero-size targets while preventing a hidden raw-tree duplicate
+               (or an authored look-alike elsewhere) from winning. */
+            if (box != NULL) return node;
+            if (node->first_child != NULL) {
+                node = node->first_child;
+                continue;
+            }
+            while (node != NULL && node != scan_root && node->next == NULL)
+                node = node->parent;
+            node = node == NULL || node == scan_root ? NULL : node->next;
+        }
+    }
+    return NULL;
+}
+
+bool navigation_scroll_to_fragment(
+    NavigationSession *session, const char *url)
+{
+    TilefinchUrl parsed;
+    if (session == NULL || url == NULL
+        || !tilefinch_url_parse(url, &parsed)) return false;
+    if (!parsed.has_fragment || parsed.fragment_length == 0)
+        return navigation_set_scroll(session, 0);
+    char identifier[NAVIGATION_URL_LIMIT];
+    size_t length = 0;
+    if (!navigation_fragment_decode(
+            &parsed, identifier, sizeof(identifier), &length)) return true;
+    lxb_dom_node_t *target = navigation_fragment_target(
+        session, identifier, length);
+    if (target == NULL && length == 3u
+        && strncasecmp(identifier, "top", 3u) == 0)
+        return navigation_set_scroll(session, 0);
+    const LayoutNodeBox *box = target == NULL ? NULL
+        : layout_box_for_node(&session->page.layout, target);
+    if (box == NULL) return true;
+    int maximum = viewport_max_scroll_css(
+        &session->viewport, session->page.layout.height);
+    int scroll = box->y < 0 ? 0 : (box->y < maximum ? box->y : maximum);
+    return navigation_set_scroll(session, scroll);
 }
 
 void navigation_discard_current_page(NavigationSession *session)
@@ -812,7 +1070,7 @@ bool navigation_relayout(NavigationSession *session)
         }
         if (!navigation_dispatch_stylesheet_events(
                 session, session->page.resource_base_url)
-            && !navigation_retire_exhausted_script_realms(session)) {
+            && !navigation_retire_exhausted_script_realms(session, false)) {
             session->page.loaded = false;
             return false;
         }
@@ -871,6 +1129,53 @@ bool navigation_relayout(NavigationSession *session)
     return true;
 }
 
+/* Script retirement changes only the static-degradation cascade. Rebuild the
+   layout against the already-admitted stylesheet/images and adopt it only
+   after success; the general relayout path may destructively rebuild those
+   resources when it notices an abandoned author mutation. */
+static bool navigation_relayout_static_fallback(
+    NavigationSession *session)
+{
+    if (session == NULL || !session->page.loaded) return false;
+    session->focus_outline_cache_valid = false;
+    session->focus_outline_cache_node = NULL;
+    uint64_t fingerprint = 0;
+    bool fingerprint_valid = page_resource_fingerprint(
+        &session->page.document, &fingerprint);
+    navigation_prepare_layout_reuse(session, NULL, true);
+    navigation_evict_layout_reuse_under_pressure(session);
+    LayoutDocument next = {0};
+    uint64_t started = navigation_now_us();
+#if !defined(__PSP__)
+    if (navigation_test_consume_static_fallback_layout_refusal()) {
+        budget_inject_failure_after(session->budget, 0);
+    }
+#endif
+    if (!navigation_build_layout(
+            session, &next, session->fonts, session->images)) {
+        if (fingerprint_valid) session->resource_fingerprint = fingerprint;
+        return false;
+    }
+    /* A pending canvas publication belongs to the retained old layout until
+       the replacement is ready to adopt. A refused build must leave that
+       damage visible to the next frame/retry rather than losing it. */
+    session->canvas_paint_damage_pending = false;
+    layout_transfer_scroll_state(&session->page.layout, &next);
+    navigation_measure_damage(session, &session->page.layout, &next);
+    layout_destroy(&session->page.layout);
+    session->page.layout = next;
+    session->incremental_relayouts++;
+    session->performance.fast_relayouts++;
+    uint64_t elapsed = navigation_record_layout_slices(
+        session, started, &next);
+    session->performance.layout_us += elapsed;
+    session->performance.relayout_us += elapsed;
+    if (fingerprint_valid) session->resource_fingerprint = fingerprint;
+    navigation_attach_layout(session);
+    navigation_clamp_scroll_to_layout(session);
+    return true;
+}
+
 static const DrawCommand *navigation_scroll_text_anchor(
     const LayoutDocument *layout, int scroll_y, int *viewport_offset)
 {
@@ -915,16 +1220,61 @@ static int navigation_scroll_for_text_anchor(
     return fallback;
 }
 
-bool navigation_apply_user_css(NavigationSession *session, const char *css,
-                               size_t length)
+struct NavigationUserCssTransaction {
+    NavigationSession *session;
+    char *previous_user_css;
+    size_t previous_user_css_length;
+    Stylesheet previous_stylesheet;
+    StylesheetDocumentResources previous_resources;
+    ExternalStylesheetStats previous_external;
+    LayoutDocument previous_layout;
+    LayoutReuseCache *previous_layout_reuse;
+    size_t previous_incremental_relayouts;
+    int previous_scroll;
+    int previous_damage_left;
+    int previous_damage_top;
+    int previous_damage_right;
+    int previous_damage_bottom;
+    bool previous_style_rebuild_required;
+    bool previous_damage_valid;
+    bool active;
+};
+
+static void navigation_user_css_transaction_release(
+    NavigationSession *session, NavigationUserCssTransaction *transaction,
+    bool destroy_previous)
+{
+    if (session == NULL || transaction == NULL) return;
+    if (destroy_previous) {
+        layout_destroy(&transaction->previous_layout);
+        stylesheet_destroy(&transaction->previous_stylesheet);
+        stylesheet_document_resources_destroy(
+            &transaction->previous_resources);
+        layout_reuse_cache_destroy(transaction->previous_layout_reuse);
+        budget_free(session->budget, transaction->previous_user_css);
+    }
+    transaction->active = false;
+    budget_free(session->budget, transaction);
+}
+
+NavigationUserCssTransaction *navigation_apply_user_css_begin(
+    NavigationSession *session, const char *css, size_t length)
 {
     if (session == NULL || session->budget == NULL || !session->page.loaded
         || (css == NULL && length != 0) || length > 128u * 1024u)
-        return false;
+        return NULL;
+    NavigationUserCssTransaction *transaction = budget_calloc_category(
+        session->budget, BUDGET_CATEGORY_STYLE, 1u, sizeof(*transaction));
+    if (transaction == NULL) return NULL;
+    transaction->session = session;
     char *copy = NULL;
     if (length != 0) {
         copy = budget_malloc(session->budget, length + 1u);
-        if (copy == NULL) return false;
+        if (copy == NULL) {
+            navigation_user_css_transaction_release(
+                session, transaction, false);
+            return NULL;
+        }
         memcpy(copy, css, length);
         copy[length] = '\0';
     }
@@ -968,7 +1318,9 @@ bool navigation_apply_user_css(NavigationSession *session, const char *css,
         stylesheet_destroy(&next_sheet);
         stylesheet_document_resources_destroy(&next_resources);
         budget_free(session->budget, copy);
-        return false;
+        navigation_user_css_transaction_release(
+            session, transaction, false);
+        return NULL;
     }
 
     const NavigationEntry *entry = navigation_current(session);
@@ -979,17 +1331,29 @@ bool navigation_apply_user_css(NavigationSession *session, const char *css,
     int anchored_scroll = navigation_scroll_for_text_anchor(
         &next_layout, anchor, viewport_offset, old_scroll);
     int old_height = session->page.layout.height;
-    layout_destroy(&session->page.layout);
-    stylesheet_destroy(&session->page.stylesheet);
-    stylesheet_document_resources_destroy(
-        &session->page.stylesheet_resources);
-    layout_reuse_cache_destroy(session->page.layout_reuse);
+    transaction->previous_user_css = session->user_css;
+    transaction->previous_user_css_length = session->user_css_length;
+    transaction->previous_stylesheet = session->page.stylesheet;
+    transaction->previous_resources = session->page.stylesheet_resources;
+    transaction->previous_external = session->page.external_stylesheets;
+    transaction->previous_layout = session->page.layout;
+    transaction->previous_layout_reuse = session->page.layout_reuse;
+    transaction->previous_incremental_relayouts =
+        session->incremental_relayouts;
+    transaction->previous_scroll = old_scroll;
+    transaction->previous_style_rebuild_required =
+        session->style_rebuild_required;
+    transaction->previous_damage_valid = session->relayout_damage_valid;
+    transaction->previous_damage_left = session->relayout_damage_left;
+    transaction->previous_damage_top = session->relayout_damage_top;
+    transaction->previous_damage_right = session->relayout_damage_right;
+    transaction->previous_damage_bottom = session->relayout_damage_bottom;
+    transaction->active = true;
     session->page.layout_reuse = NULL;
     session->page.layout = next_layout;
     session->page.stylesheet = next_sheet;
     session->page.stylesheet_resources = next_resources;
     session->page.external_stylesheets = next_external;
-    budget_free(session->budget, session->user_css);
     session->user_css = copy;
     session->user_css_length = length;
     session->style_rebuild_required = false;
@@ -1009,6 +1373,76 @@ bool navigation_apply_user_css(NavigationSession *session, const char *css,
     (void) navigation_set_scroll(session, anchored_scroll);
     navigation_attach_layout(session);
     navigation_clamp_scroll_to_layout(session);
+    return transaction;
+}
+
+void navigation_apply_user_css_commit(
+    NavigationSession *session, NavigationUserCssTransaction *transaction)
+{
+    if (session == NULL || transaction == NULL || !transaction->active
+        || transaction->session != session) return;
+    navigation_user_css_transaction_release(session, transaction, true);
+}
+
+bool navigation_apply_user_css_rollback(
+    NavigationSession *session, NavigationUserCssTransaction *transaction)
+{
+    if (session == NULL || transaction == NULL || !transaction->active
+        || transaction->session != session) return false;
+    layout_destroy(&session->page.layout);
+    stylesheet_destroy(&session->page.stylesheet);
+    stylesheet_document_resources_destroy(
+        &session->page.stylesheet_resources);
+    layout_reuse_cache_destroy(session->page.layout_reuse);
+    budget_free(session->budget, session->user_css);
+    session->user_css = transaction->previous_user_css;
+    session->user_css_length = transaction->previous_user_css_length;
+    session->page.stylesheet = transaction->previous_stylesheet;
+    session->page.stylesheet_resources = transaction->previous_resources;
+    session->page.external_stylesheets = transaction->previous_external;
+    session->page.layout = transaction->previous_layout;
+    session->page.layout_reuse = transaction->previous_layout_reuse;
+    session->incremental_relayouts =
+        transaction->previous_incremental_relayouts;
+    session->style_rebuild_required =
+        transaction->previous_style_rebuild_required;
+    session->relayout_damage_valid = transaction->previous_damage_valid;
+    session->relayout_damage_left = transaction->previous_damage_left;
+    session->relayout_damage_top = transaction->previous_damage_top;
+    session->relayout_damage_right = transaction->previous_damage_right;
+    session->relayout_damage_bottom = transaction->previous_damage_bottom;
+    if (session->page.runtime != NULL) {
+        script_runtime_set_stylesheet(
+            session->page.runtime, &session->page.stylesheet);
+    }
+    navigation_attach_layout(session);
+    /* The incumbent layout never changed while it was held by the
+       transaction, so its saved scroll position is already valid for that
+       exact layout. Restore it after rebinding the runtime and do not clamp
+       it against the rejected candidate's geometry. */
+    (void) navigation_set_scroll(session, transaction->previous_scroll);
+    transaction->previous_user_css = NULL;
+    transaction->previous_user_css_length = 0;
+    memset(&transaction->previous_stylesheet, 0,
+           sizeof(transaction->previous_stylesheet));
+    memset(&transaction->previous_resources, 0,
+           sizeof(transaction->previous_resources));
+    memset(&transaction->previous_external, 0,
+           sizeof(transaction->previous_external));
+    memset(&transaction->previous_layout, 0,
+           sizeof(transaction->previous_layout));
+    transaction->previous_layout_reuse = NULL;
+    navigation_user_css_transaction_release(session, transaction, false);
+    return true;
+}
+
+bool navigation_apply_user_css(NavigationSession *session, const char *css,
+                               size_t length)
+{
+    NavigationUserCssTransaction *transaction =
+        navigation_apply_user_css_begin(session, css, length);
+    if (transaction == NULL) return false;
+    navigation_apply_user_css_commit(session, transaction);
     return true;
 }
 
@@ -1328,6 +1762,10 @@ static bool navigation_run_deferred_image(NavigationSession *session)
     navigation_ensure_layout_reuse(session);
     layout_reuse_cache_update_images(page->layout_reuse, &page->images);
     if (added != 0) {
+        if (session->deferred_image_ready != NULL) {
+            session->deferred_image_ready(
+                session->deferred_image_ready_opaque, session);
+        }
         if (!navigation_relayout(session)) {
             /* Optional pixels must never retire an already usable display
                list under pressure. The transactional relayout left it
@@ -1537,6 +1975,12 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
 static void navigation_accumulate_script_metrics(
     NavigationSession *session, const ExternalScriptMetrics *metrics)
 {
+    if (metrics->failed != 0u || metrics->skipped_cross_origin != 0u
+        || metrics->skipped_quota != 0u
+        || metrics->skipped_pressure != 0u
+        || metrics->cost_class_rejections != 0u) {
+        session->page.script_degradation_observed = true;
+    }
     session->script_discovered += metrics->discovered;
     session->script_attempted += metrics->attempted;
     session->script_loaded += metrics->loaded;
@@ -1715,7 +2159,7 @@ static void navigation_frontier_script_execute(
         }
         script_runtime_invalidate_document_base(
             walk->session->page.runtime);
-        if (!document_scripts_process_closed(
+        if (document_scripts_process_closed(
                 walk->session->page.runtime, walk->session->budget,
                 walk->session->browser_session,
                 walk->session->page.resource_base_url,
@@ -1725,7 +2169,8 @@ static void navigation_frontier_script_execute(
                 walk->session->maximum_script_file_bytes,
                 walk->session->script_timeout_ms,
                 walk->session->page.resource_scheduler,
-                script, walk->state)) {
+                script, walk->state)
+            == DOCUMENT_SCRIPT_PROCESS_HARD_FAILURE) {
             walk->failed = true;
             break;
         }
@@ -1913,6 +2358,187 @@ bool navigation_execute_current_body_scripts(NavigationSession *session)
     return !relayout || navigation_relayout(session);
 }
 
+bool navigation_layout_is_visually_blank(
+    const LayoutDocument *layout)
+{
+    if (layout == NULL) return false;
+    /* Interaction tables are not paint evidence. visibility:hidden zeros
+       their geometry only at the final visibility pass, while opacity:0
+       deliberately preserves hit testing. In both cases a retained link or
+       control can coexist with a completely blank framebuffer. Ordinary
+       visible links and controls contribute draw commands below. */
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->width <= 0 || command->height <= 0) continue;
+        /* Visibility:hidden and opacity:0 retain geometry for stable layout,
+           hit-test generations, and later author toggles, but rasterize no
+           pixels. They cannot make an otherwise blank page useful. */
+        if (command->opacity_scale == 0u) continue;
+        /* A page-wide background rectangle is still a blank presentation.
+           Text, images, outlines, shadows, and any second painted layer are
+           observable output and must keep author runtime semantics. */
+        if (command->type != DRAW_FILL_RECT
+            || command->color != layout->page_background
+            || draw_command_fill_gradient(command, NULL)
+            || draw_command_backdrop_blur(command) != 0u
+            || draw_command_filter_code(command) != 0u
+            || draw_command_rotation_quadrants(command) != 0u
+            || draw_command_blend_mode(command) != LAYOUT_MIX_BLEND_NORMAL
+            || command->radius != 0
+            || command->opacity_scale != 256u
+            || command->x > 0 || command->y > 0
+            || command->width < layout->viewport.css_width
+            || command->height < layout->viewport.css_height) return false;
+    }
+    return true;
+}
+
+static bool navigation_recovery_semantic_element(lxb_dom_node_t *node)
+{
+    return node_name_is(node, "main") || node_name_is(node, "article")
+        || node_name_is(node, "section") || node_name_is(node, "p")
+        || node_name_is(node, "li") || node_name_is(node, "blockquote")
+        || node_name_is(node, "pre") || node_name_is(node, "table")
+        || node_name_is(node, "details") || node_name_is(node, "h1")
+        || node_name_is(node, "h2") || node_name_is(node, "h3")
+        || node_name_is(node, "h4") || node_name_is(node, "h5")
+        || node_name_is(node, "h6");
+}
+
+static bool navigation_recovery_excluded_element(lxb_dom_node_t *node)
+{
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT)
+        return false;
+    size_t length = 0;
+    const char *aria_hidden = document_attribute(
+        node, "aria-hidden", &length);
+    return node_name_is(node, "script") || node_name_is(node, "style")
+        || node_name_is(node, "template") || node_name_is(node, "noscript")
+        || node_name_is(node, "svg") || node_name_is(node, "dialog")
+        || node_name_is(node, "nav") || node_name_is(node, "aside")
+        || node_name_is(node, "footer") || node_name_is(node, "form")
+        || lxb_dom_element_has_attribute(
+               lxb_dom_interface_element(node),
+               (const lxb_char_t *) "hidden", 6u)
+        || lxb_dom_element_has_attribute(
+               lxb_dom_interface_element(node),
+               (const lxb_char_t *) "inert", 5u)
+        || (aria_hidden != NULL && length == 4u
+            && strncasecmp(aria_hidden, "true", 4u) == 0);
+}
+
+/* This is evidence for static recovery, not a visibility override. Count a
+   bounded amount of prose inside semantic content, excluding navigation,
+   forms, dialogs, and authored hidden/inert subtrees. The subsequent style
+   fallback remains responsible for its narrow, content-shaped reveal rules. */
+static bool navigation_document_has_bounded_retained_content(
+    PocDocument *document)
+{
+    lxb_dom_node_t *root = document_body_node(document);
+    if (root == NULL) return false;
+    enum { RETAINED_TEXT_SCAN_LIMIT = 8192 };
+    size_t text_bytes = 0, semantic_text_bytes = 0, inspected_bytes = 0;
+    lxb_dom_node_t *node = root->first_child;
+    for (size_t visited = 0; node != NULL && visited < 1024u; visited++) {
+        bool skip_children = false;
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            skip_children = navigation_recovery_excluded_element(node);
+        } else if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t length = 0;
+            const char *text = document_text_data(node, &length);
+            bool semantic = false;
+            lxb_dom_node_t *ancestor = node->parent;
+            for (size_t depth = 0;
+                 ancestor != NULL && ancestor != root && depth < 64u;
+                 depth++, ancestor = ancestor->parent) {
+                if (navigation_recovery_semantic_element(ancestor)) {
+                    semantic = true;
+                    break;
+                }
+            }
+            for (size_t at = 0; text != NULL && at < length
+                 && inspected_bytes < RETAINED_TEXT_SCAN_LIMIT; at++) {
+                inspected_bytes++;
+                if (isspace((unsigned char) text[at])) continue;
+                if (text_bytes != SIZE_MAX) text_bytes++;
+                if (semantic && semantic_text_bytes != SIZE_MAX)
+                    semantic_text_bytes++;
+                if (text_bytes >= 128u && semantic_text_bytes >= 96u)
+                    return true;
+                /* Plain server-rendered prose frequently uses only divs.
+                   Enough bounded non-whitespace text is useful recovery
+                   evidence even without an article/main/p ancestor. */
+                if (text_bytes >= 512u) return true;
+            }
+            if (inspected_bytes == RETAINED_TEXT_SCAN_LIMIT) return false;
+        }
+        if (!skip_children && node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        node = node == root ? NULL : node->next;
+    }
+    return false;
+}
+
+static bool navigation_blank_recovery_has_useful_content(
+    NavigationSession *session)
+{
+    if (session == NULL) return false;
+    bool retained = navigation_document_has_bounded_retained_content(
+        &session->page.document);
+    ReaderDocumentAnalysis analysis = session->page.reader_analysis;
+    if (analysis.prepared
+        && (analysis.bounded_out || analysis.extraction_truncated)) {
+        return false;
+    }
+    /* Avoid allocating a Reader clone on the ordinary complete-prose path:
+       this predicate runs inside the allocator-refusal recovery boundary.
+       Conservatively decline documents outside the extractor's structural
+       and byte ceilings; the frontend may still offer an explicit Reader
+       attempt later. */
+    if (retained) {
+        if (session->page.document.node_count > 512u
+            || session->page.document.body_text_length > 256u * 1024u) {
+            return false;
+        }
+        return true;
+    }
+    /* A RAW analysis may have been cached before a late author mutation.
+       RAW installs no markers or clone, so it is safe to analyze the settled
+       document once more at this rare allocator-failure boundary. */
+    bool analyzed_for_recovery =
+        !analysis.prepared || analysis.kind == READER_PAGE_RAW;
+    if (analyzed_for_recovery) {
+        analysis = (ReaderDocumentAnalysis) {0};
+        if (!reader_document_prepare_complete_with_stylesheet(
+                &session->page.document, &session->page.stylesheet,
+                &analysis)) {
+            analysis = (ReaderDocumentAnalysis) {
+                .prepared = true,
+                .bounded_out = true
+            };
+        }
+        session->page.reader_analysis = analysis;
+    }
+    /* Realm retirement is permanent. A bounded prefix can establish useful
+       prose without proving that the uninspected tail is not a form or app
+       shell, so never make that irreversible transition from a truncated
+       extraction. Complete retained semantic text remains a valid fallback
+       even when its score is below Reader's ARTICLE threshold. */
+    if (analysis.bounded_out || analysis.extraction_truncated) {
+        if (analyzed_for_recovery) {
+            /* This strict preflight installed no tree. Leave explicit Reader
+               free to perform its separately permitted shortened extraction
+               later rather than caching analysis-only as presentation-ready. */
+            session->page.reader_analysis.prepared = false;
+        }
+        return false;
+    }
+    return analysis.kind != READER_PAGE_RAW;
+}
+
 bool navigation_advance_runtime(NavigationSession *session,
                                 unsigned elapsed_ms,
                                 size_t callback_budget)
@@ -1923,6 +2549,8 @@ bool navigation_advance_runtime(NavigationSession *session,
        shell, background resources, scrolling, and navigation remain live. */
     if (session->page.runtime == NULL) return true;
     uint64_t runtime_started = navigation_now_us();
+    size_t heap_rejections_before = script_runtime_heap_rejections(
+        session->page.runtime);
     if (!script_runtime_advance(session->page.runtime, elapsed_ms,
                                 callback_budget,
                                 &session->page.script_result)) {
@@ -1935,7 +2563,17 @@ bool navigation_advance_runtime(NavigationSession *session,
          * because their DOM may be incomplete; this path is safe to degrade
          * to the already-committed static document.
          */
-        if (navigation_retire_exhausted_script_realms(session)) return true;
+        if (navigation_retire_exhausted_script_realms(session, false)) {
+            /* Retirement enables the static-content cascade after the last
+               script-driven layout may already have hidden the page shell.
+               Rebuild immediately while the old layout is still retained;
+               a refused rebuild leaves that committed layout usable. */
+            (void) navigation_relayout_static_fallback(session);
+            session->performance.runtime_us += navigation_record_slice(
+                session, NAVIGATION_SLICE_RUNTIME, runtime_started,
+                callback_budget);
+            return true;
+        }
         unsigned long generated_line = 0, generated_column = 0;
         bool captured_generated_source = false;
         if (getenv("TILEFINCH_TRACE_EVAL_SOURCE") != NULL
@@ -2070,8 +2708,12 @@ bool navigation_advance_runtime(NavigationSession *session,
         }
     }
     if (!navigation_deliver_frame_messages(session)) {
-        if (navigation_retire_exhausted_script_realms(session)) {
+        if (navigation_retire_exhausted_script_realms(session, false)) {
             session->performance.frame_message_soft_failures++;
+            (void) navigation_relayout_static_fallback(session);
+            session->performance.runtime_us += navigation_record_slice(
+                session, NAVIGATION_SLICE_RUNTIME, runtime_started,
+                callback_budget);
             return true;
         }
         snprintf(session->last_error, sizeof(session->last_error),
@@ -2117,8 +2759,31 @@ bool navigation_advance_runtime(NavigationSession *session,
         int maximum = navigation_max_scroll(session);
         navigation_set_scroll(session, scroll_y < maximum ? scroll_y : maximum);
     }
-    bool ok = !script_runtime_consume_relayout(session->page.runtime)
-              || navigation_relayout(session);
+    size_t heap_rejections_after = script_runtime_heap_rejections(
+        session->page.runtime);
+    bool relayout_requested =
+        script_runtime_consume_relayout(session->page.runtime);
+    /* A page task may catch an actual QuickJS allocation refusal, leaving the
+       scheduler alive even though its last mutation hid the entire authored
+       shell. Distinguish that allocator fact from an author merely throwing
+       text containing "out of memory", and degrade only a blank, text-rich
+       committed page. */
+    bool allocator_rejected =
+        heap_rejections_after > heap_rejections_before;
+    bool ok = true;
+    if (relayout_requested) {
+        ok = navigation_relayout(session);
+    }
+    /* Inspect the successfully settled layout, not the pre-mutation command
+       count. Only a real allocator rejection plus blank paint/control output
+       and bounded useful content may retire a realm. Hard relayout/security
+       failures still return above their ordinary fail-closed path. */
+    if (ok && allocator_rejected
+        && navigation_layout_is_visually_blank(&session->page.layout)
+        && navigation_blank_recovery_has_useful_content(session)
+        && navigation_retire_exhausted_script_realms(session, true)) {
+        (void) navigation_relayout_static_fallback(session);
+    }
     session->performance.runtime_us += navigation_record_slice(
         session, NAVIGATION_SLICE_RUNTIME, runtime_started, callback_budget);
     return ok;

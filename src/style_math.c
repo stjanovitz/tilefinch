@@ -1086,6 +1086,28 @@ static int parse_calc_product(const Stylesheet *sheet, const char *text,
     return (int) (result < 0.0 ? result - 0.5 : result + 0.5);
 }
 
+static bool calc_additive_operator(const char *text, size_t start, size_t at)
+{
+    if (text == NULL || at <= start
+        || (text[at] != '+' && text[at] != '-')) return false;
+
+    /* A sign after another operator starts the following numeric factor; it
+       is not calc() addition/subtraction.  This matters for framework output
+       such as `calc(var(--spacing) * -2)`. */
+    size_t previous = at;
+    while (previous > start
+           && isspace((unsigned char) text[previous - 1u])) previous--;
+    if (previous == start) return false;
+    char prior = text[previous - 1u];
+    if (prior == '+' || prior == '-' || prior == '*'
+        || prior == '/' || prior == '(' || prior == ',') return false;
+
+    /* CSS numbers may contain an exponent sign.  A directly adjacent e/E is
+       part of that number rather than an additive operator. */
+    if (previous == at && (prior == 'e' || prior == 'E')) return false;
+    return true;
+}
+
 static int parse_length_depth(const Stylesheet *sheet, const char *text,
                               size_t length, int fallback, bool *percent,
                               unsigned depth)
@@ -1122,19 +1144,24 @@ static int parse_length_depth(const Stylesheet *sheet, const char *text,
                 bool split = i == inside_length
                     || (function != LENGTH_CALC && nesting == 0
                         && inside[i] == ',')
-                    || (function == LENGTH_CALC && nesting == 0 && i > start
-                        && (inside[i] == '+' || inside[i] == '-'));
+                    || (function == LENGTH_CALC && nesting == 0
+                        && i < inside_length
+                        && calc_additive_operator(inside, start, i));
                 if (!split) continue;
                 size_t part_start = start, part_length = i - start;
                 const char *part = value + prefix + part_start;
                 trim(&part, &part_length);
                 if (part_length == 0) return fallback;
-                values[count] = function == LENGTH_CALC
+                int parsed = function == LENGTH_CALC
                     ? parse_calc_product(sheet, part, part_length, fallback,
                                          &percentages[count], depth + 1)
                     : parse_length_depth(sheet, part, part_length, fallback,
                                          &percentages[count], depth + 1);
-                values[count] *= calc_sign;
+                /* INT_MIN is the failure sentinel used by declaration
+                   parsers.  Negating it is signed overflow and previously
+                   converted a malformed term into an enormous valid margin. */
+                if (parsed == INT_MIN) return fallback;
+                values[count] = calc_sign < 0 ? -parsed : parsed;
                 count++;
                 if (function == LENGTH_CALC && i < inside_length) {
                     calc_sign = inside[i] == '-' ? -1 : 1;

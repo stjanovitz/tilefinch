@@ -40,8 +40,30 @@ typedef enum {
     CONTROLLER_ACTION_MEDIA
 } ControllerActionType;
 
+/*
+ * The event-dispatch result is intentionally separate from the resulting
+ * HTML default action.  A page without a runtime, or a runtime which fails
+ * while delivering a trusted activation, must not turn an ordinary link or
+ * form control into a dead target.  Conversely, a delivered and cancelled
+ * event is authoritative and its default action is never synthesized.
+ */
+typedef enum {
+    CONTROLLER_ACTIVATION_NOT_DISPATCHED = 0,
+    CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE,
+    CONTROLLER_ACTIVATION_DELIVERED,
+    CONTROLLER_ACTIVATION_CANCELLED,
+    /* The bridge refused before entering the trusted dispatcher; native
+       defaults are still safe because no bootstrap default, hostile getter,
+       or author handler could have run. */
+    CONTROLLER_ACTIVATION_RUNTIME_REFUSED,
+    /* At least one event was delivered before failure. Its side effects are
+       retained, but a control default is not replayed speculatively. */
+    CONTROLLER_ACTIVATION_RUNTIME_FAILED
+} ControllerActivationOutcome;
+
 typedef struct {
     ControllerActionType type;
+    ControllerActivationOutcome activation_outcome;
     /* An engine-authored adapter may mark a normal navigation link as a
        request for the platform's native provider player. The URL remains the
        canonical web URL; frontends which do not implement the native route
@@ -145,6 +167,13 @@ bool controller_commit_pointer_click(BrowserController *controller);
 void controller_pointer_discard_click(BrowserController *controller);
 bool controller_focus_node(BrowserController *controller,
                            lxb_dom_node_t *node);
+/* Resolve the retained semantic focus while its document is unchanged. */
+lxb_dom_node_t *controller_focused_node(
+    const BrowserController *controller);
+/* Restore focus after controller-side state is rebuilt without dispatching a
+   duplicate DOM focus event or counting a user move. */
+bool controller_restore_focus_node(BrowserController *controller,
+                                   lxb_dom_node_t *node);
 /* Rebind the retained semantic focus to the current layout generation without
    dispatching DOM events, revealing the target, or counting a user move. */
 bool controller_rebind_focus(BrowserController *controller);

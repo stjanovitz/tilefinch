@@ -91,6 +91,11 @@ if ! codesign --verify --deep --strict "$ppsspp_bundle" >/dev/null 2>&1; then
         "$launch_bundle/Contents/Info.plist"
     plutil -replace CFBundleLongVersionString -string 1.20.4 \
         "$launch_bundle/Contents/Info.plist"
+    # A unique identity prevents LaunchServices from resolving this repaired
+    # path through stale metadata for the invalid Homebrew bundle.
+    plutil -replace CFBundleIdentifier \
+        -string "org.tilefinch.ppsspp.manual.$$" \
+        "$launch_bundle/Contents/Info.plist"
     xattr -cr "$launch_bundle"
     codesign --force --deep --sign - "$launch_bundle" >/dev/null 2>&1
     codesign --verify --deep --strict "$launch_bundle" >/dev/null 2>&1 || {
@@ -126,4 +131,6 @@ for argument do
     esac
     printf '%s\0' "$resolved" >>"$launch_args_file"
 done
-xargs -0 open -n -W -a "$launch_bundle" --args <"$launch_args_file"
+# `-g` keeps qualification from activating PPSSPP over the user's current
+# application. The emulator still owns a normal LaunchServices/Cocoa context.
+xargs -0 open -g -n -W -a "$launch_bundle" --args <"$launch_args_file"

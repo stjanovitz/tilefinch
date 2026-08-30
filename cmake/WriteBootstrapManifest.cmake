@@ -17,10 +17,6 @@ string(CONCAT manifest
     "# derived by regenerate_tilefinch_bootstrap; do not refresh it by hand.\n")
 foreach(relative_path IN LISTS bootstrap_paths)
     set(full_path "${TILEFINCH_ROOT}/${relative_path}")
-    if(NOT EXISTS "${full_path}")
-        message(FATAL_ERROR
-            "bootstrap manifest input is missing: ${relative_path}")
-    endif()
     file(SHA256 "${full_path}" digest)
     string(APPEND manifest "${digest}  ${relative_path}\n")
 endforeach()

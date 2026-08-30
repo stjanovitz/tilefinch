@@ -1,0 +1,8 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Read-only usability probe</title>
+<main>
+  <a id="probe-target" href="/next"
+     onclick="document.getElementById('probe-state').textContent='CLICKED_BY_PROBE'; fetch('/probe-side-effect'); return false">Open target</a>
+  <p id="probe-state">UNCHANGED</p>
+</main>

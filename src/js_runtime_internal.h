@@ -24,10 +24,11 @@
 void JS_SetPropertyFaultTraceLimit(JSRuntime *runtime, uint32_t limit);
 #endif
 
-/* Public PSP execution profiles refuse to compile any single script larger
-   than this before calling into QuickJS; the bootstrap arrays below are
-   statically bounded by the same ceiling. */
-#define SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES (256u * 1024u)
+/* The realistic PSP profile admits the Game Profile's bounded first-party
+   package while strict keeps the older, smaller non-preemptible unit. The
+   bootstrap arrays below are bounded by the larger public ceiling. */
+#define SCRIPT_PSP_STRICT_MAXIMUM_HOST_COMPILE_BYTES (256u * 1024u)
+#define SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES (384u * 1024u)
 
 typedef struct {
     const unsigned char *data;
@@ -177,6 +178,18 @@ typedef struct {
     FetchStreamOptions stream;
 } ScriptEventSource;
 
+#define SCRIPT_WEBSOCKET_LIMIT FETCH_WEBSOCKET_LIMIT
+
+typedef struct {
+    bool active;
+    uint64_t id;
+} ScriptWebSocket;
+
+typedef struct {
+    bool active;
+    uint64_t id;
+} ScriptMultiplayer;
+
 typedef enum {
     SCRIPT_DYNAMIC_QUEUED = 0,
     SCRIPT_DYNAMIC_FETCHING,
@@ -246,6 +259,8 @@ typedef struct DomBridge {
        atomic.  Page code cannot observe or choose either word. */
     uint32_t webgl_realm_epoch_high;
     uint32_t webgl_realm_epoch_low;
+    ScriptWebglGeometryCacheState webgl_geometry_cache;
+    void *webgl_geometry_vertices[SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT];
     bool *relayout_dirty;
     ScriptMutationJournal mutations;
     BrowserSession *session;
@@ -255,6 +270,10 @@ typedef struct DomBridge {
     bool opaque_origin;
     char calculated_base_url[TILEFINCH_URL_SERIALIZED_LIMIT];
     bool document_base_dirty;
+    /* Native URL publication precedes advisory same-document callbacks.  A
+       generation lets the Location facade detect and repair a callback/OOM
+       split without allocating a URL string on ordinary property reads. */
+    uint32_t document_url_revision;
     char referrer_policy[128];
     lxb_dom_node_t *nodes[DOM_BRIDGE_NODE_LIMIT];
     /* Owner identities are captured at registration so whole-document
@@ -347,6 +366,11 @@ typedef struct DomBridge {
     size_t async_fetch_count;
     ScriptEventSource event_sources[SCRIPT_EVENT_SOURCE_LIMIT];
     size_t event_source_count;
+    ScriptWebSocket websockets[SCRIPT_WEBSOCKET_LIMIT];
+    size_t websocket_count;
+    unsigned char *websocket_event_scratch;
+    ScriptMultiplayer multiplayer;
+    unsigned char *multiplayer_event_scratch;
     ScriptDynamicTask dynamic_scripts[SCRIPT_DYNAMIC_TASK_LIMIT];
     ScriptElementState script_elements[SCRIPT_DYNAMIC_NODE_LIMIT];
     size_t script_element_count;
@@ -367,6 +391,10 @@ typedef struct DomBridge {
     JSValue trusted_node_wrap;
     JSValue trusted_stable_script_wrap;
     JSValue trusted_retire_native_node_state;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t webgl_native_total_us;
+    size_t webgl_native_frames;
+#endif
 } DomBridge;
 
 _Static_assert(SCRIPT_CLOCK_SOURCE_COUNT == 12,
@@ -438,8 +466,17 @@ struct ScriptRuntime {
     ScriptResult result;
     PromiseRejectionState promise_rejection_state;
     unsigned timeout_ms;
+    /* Optional browser-owned absolute cap for the currently executing
+       parser stage.  A later JS slice may arm after a blocking fetch, so a
+       smaller per-call timeout alone cannot enforce a cumulative deadline. */
+    uint64_t execution_deadline_cap_ms;
     size_t refreshed_mutations;
     bool relayout_dirty;
+    /* A blank-page recovery needs to distinguish finite author work that can
+       still reveal the initial document from ambient duplex transports. The
+       public pending_tasks census intentionally includes both. */
+    size_t pending_timer_tasks;
+    size_t pending_network_tasks;
     BrowserSession *session;
     char document_url[2048];
     char top_level_url[2048];
@@ -495,6 +532,9 @@ struct ScriptRuntime {
     struct ScriptLazyRuntimeBundle *lazy_webpack_bundles;
     uint32_t next_lazy_webpack_bundle_id;
     bool lazy_factory_recovery_pending;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    ScriptRuntimeTimingMetrics timing_metrics;
+#endif
 };
 
 typedef struct {
@@ -637,6 +677,16 @@ void js_rt_event_sources_destroy(DomBridge *bridge);
 bool js_rt_event_sources_deliver(ScriptRuntime *runtime,
                                  size_t completion_budget,
                                  size_t *author_tasks);
+void js_rt_websockets_destroy(DomBridge *bridge);
+size_t js_rt_websockets_abort(DomBridge *bridge);
+bool js_rt_websockets_deliver(ScriptRuntime *runtime,
+                              size_t completion_budget,
+                              size_t *author_tasks);
+void js_rt_multiplayer_destroy(DomBridge *bridge);
+size_t js_rt_multiplayer_abort(DomBridge *bridge);
+bool js_rt_multiplayer_deliver(ScriptRuntime *runtime,
+                               size_t completion_budget,
+                               size_t *author_tasks);
 void js_rt_record_network_response(ScriptResult *result,
                                    const FetchResult *fetched);
 void js_rt_script_set_response_body(JSContext *context, JSValue response,
@@ -754,6 +804,15 @@ JSValue js_canvas_image_source(JSContext *context,
 JSValue js_webgl_render(JSContext *context,
                         JSValueConst this_value,
                         int argc, JSValueConst *argv);
+JSValue js_webgl_index_maximum(JSContext *context,
+                               JSValueConst this_value,
+                               int argc, JSValueConst *argv);
+JSValue js_webgl_finite_float32(JSContext *context,
+                                JSValueConst this_value,
+                                int argc, JSValueConst *argv);
+JSValue js_webgl_combine_matrix4(JSContext *context,
+                                 JSValueConst this_value,
+                                 int argc, JSValueConst *argv);
 JSValue js_webgl_read_pixels(JSContext *context,
                              JSValueConst this_value,
                              int argc, JSValueConst *argv);
@@ -862,6 +921,12 @@ JSValue js_dom_get_inner_html(JSContext *context,
                               int argc, JSValueConst *argv);
 JSValue js_dom_get_text(JSContext *context, JSValueConst this_value,
                         int argc, JSValueConst *argv);
+JSValue js_dom_get_text_prefix(JSContext *context,
+                               JSValueConst this_value,
+                               int argc, JSValueConst *argv);
+JSValue js_dom_get_style_attribute_prefix(
+    JSContext *context, JSValueConst this_value,
+    int argc, JSValueConst *argv);
 JSValue js_dom_insert_before(JSContext *context,
                              JSValueConst this_value,
                              int argc, JSValueConst *argv);

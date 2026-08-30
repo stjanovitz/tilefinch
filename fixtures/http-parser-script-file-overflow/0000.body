@@ -1,0 +1,1 @@
+<!doctype html><html><head><title>Per-file script overflow</title></head><body><main><script src="/large.js"></script><script>document.body.setAttribute('data-small-ran','yes')</script><h1 id="content">Server content remains useful</h1><a id="useful-link" href="/next">Continue</a></main></body></html>

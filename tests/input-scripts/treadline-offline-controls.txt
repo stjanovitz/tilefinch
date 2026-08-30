@@ -1,0 +1,56 @@
+# DEVICE-LOOP SCRIPT -- REQUIRES AN INSTALLED TREADLINE ARENA ENTRY.
+#
+# Start from native HOME with Treadline Arena as the first Saved row. This
+# deliberately does not use the game's qualification auto-driver: every
+# movement and action crosses the shipping PSP input -> Page controls ->
+# Gamepad API -> game pollPlayerInput() path.
+
+wait 30
+tap select
+press 3 down
+tap cross
+
+# This fixture data root contains Prism Break first and Treadline Arena second.
+# Move to Treadline, then open Saved row one through the real Offline Library
+# receiver and allow the
+# sealed resource pack, scripts, layout, and first WebGL frame to settle.
+wait 10
+tap down
+tap cross
+wait-live 300
+mark-live offline-open
+
+# The focused Deploy button requests Page controls. Cross is still browser
+# input on this frame; the resulting fullscreen transition activates capture
+# before the later gameplay steps.
+tap-live cross
+wait-live 90
+mark-live auto-controls
+wait-live 12
+mark-live webgl-measure-start
+wait-live 12
+
+# ARCADE input bursts: nub movement, camera-relative face-button aim, held
+# R fire, D-pad gadget/command, and L secondary. These are the combinations a
+# person uses during combat rather than direct writes to tank.command.
+stick-live 90 right
+hold-live 45 triangle+rtrigger
+stick-live 90 up
+tap-live up
+hold-live 45 square+rtrigger
+stick-live 90 left
+tap-live ltrigger
+tap-live down
+hold-live 45 cross+rtrigger
+stick-live 90 down
+hold-live 45 circle+rtrigger
+mark-live game-input-end
+
+# Exercise the manual escape chord only after every gameplay input has crossed
+# the captured Gamepad path. Validation pins UI elapsed time to 16 ms, so 45
+# frames is a bounded 720 ms hold.
+hold-live 45 start+select
+wait-live 4
+mark-live controls-exited
+wait-live 120
+end

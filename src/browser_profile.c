@@ -318,7 +318,7 @@ BrowserProfile *browser_profile_create(Budget *budget)
     profile->subtitle_language = BROWSER_SUBTITLE_LANGUAGE_SYSTEM;
     profile->alternate_language = BROWSER_ALTERNATE_LANGUAGE_NONE;
     profile->subtitle_size = BROWSER_SUBTITLE_SIZE_STANDARD;
-    profile->subtitle_background = BROWSER_SUBTITLE_BACKGROUND_BOX;
+    profile->subtitle_background = BROWSER_SUBTITLE_BACKGROUND_SHADOW;
     profile->video_startup_buffering = true;
     profile->content_blocker_mode = CONTENT_BLOCKER_BASIC;
     profile->content_blocker_cosmetic_hiding = true;
@@ -787,6 +787,7 @@ static bool profile_load_internal(
         .analog_cursor_enabled = true,
         .live_cache_kib = BROWSER_PROFILE_TRANSIENT_CACHE_KIB,
         .youtube_quality = BROWSER_YOUTUBE_QUALITY_360P,
+        .subtitle_background = BROWSER_SUBTITLE_BACKGROUND_SHADOW,
         .video_startup_buffering = true,
         .content_blocker_mode = CONTENT_BLOCKER_BASIC,
         .content_blocker_cosmetic_hiding = true,
@@ -1419,7 +1420,7 @@ BrowserSubtitleBackground browser_profile_subtitle_background(
     const BrowserProfile *profile)
 {
     return profile == NULL
-        ? BROWSER_SUBTITLE_BACKGROUND_BOX : profile->subtitle_background;
+        ? BROWSER_SUBTITLE_BACKGROUND_SHADOW : profile->subtitle_background;
 }
 
 static const char *profile_explicit_video_language_tag(unsigned language)

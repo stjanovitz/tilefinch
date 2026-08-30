@@ -611,6 +611,7 @@ typedef struct {
  * the logging block, because an exhausted pool has to say so.
  */
 static PspMediaPool psp_media_pool;
+static size_t psp_media_heap_capacity_lower_bound;
 
 /*
  * Real firmware historically requires a 64-byte-aligned address AND length
@@ -1565,6 +1566,7 @@ void media_psp_backend_reserve_pool(void)
        after PSPSDK has given newlib the partition it is a constant ~2.2 MB
        and cannot admit anything. */
     size_t capacity_bytes = psp_media_probe_heap_capacity();
+    psp_media_heap_capacity_lower_bound = capacity_bytes;
     int free_bytes = sceKernelTotalFreeMemSize();
     bool admitted = psp_media_pool_reservation_admitted(capacity_bytes);
     void *base = admitted
@@ -1597,7 +1599,16 @@ void media_psp_backend_reserve_pool(void)
     /* Reported, not decided on: a shipping build compiles both lines above
        away and would otherwise carry an unused partition reading. */
     (void) free_bytes;
-    psp_media_commit_log();
+    /* Do not force a transport flush here. The reservation is ordinary boot
+       work, not a media failure, and the next boot checkpoint persists this
+       line. In a host0: PRX run pspsh has already returned after loading the
+       module; flushing its stdout channel here can block browser creation
+       indefinitely even though the reservation itself completed. */
+}
+
+size_t media_psp_backend_heap_capacity_lower_bound(void)
+{
+    return psp_media_heap_capacity_lower_bound;
 }
 
 void media_psp_backend_system_suspend(void)

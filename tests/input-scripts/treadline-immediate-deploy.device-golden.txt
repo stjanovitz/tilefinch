@@ -1,0 +1,16 @@
+tilefinch-input-script: text-entry=danzeff
+tilefinch-input-script: armed script=input-script.txt steps=17 stall-limit=1800
+tilefinch-input-script: step=2 action=show-offline setting=none screen=collections list=0 tab=0
+tilefinch-input-script: step=5 action=collection-activate setting=none screen=page list=1 tab=0
+tilefinch-input-script: mark=deploy-pressed step=8 screen=page
+tilefinch-input-script: step=6 action=activate setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=deploy-30 step=10 screen=page
+tilefinch-input-script: mark=deploy-90 step=12 screen=page
+tilefinch-input-script: mark=deploy-210 step=14 screen=page
+tilefinch-input-script: covered action=activate count=1
+tilefinch-input-script: covered action=show-offline count=1
+tilefinch-input-script: covered action=collection-activate count=1
+tilefinch-input-script: outcome=complete steps=16/17 frames=390 held-frames=8 actions=3 settings=0
+tilefinch-input-script: capture=deploy-pressed written=1 size=240x136
+tilefinch-input-script: capture=deploy-90 written=1 size=240x136
+tilefinch-input-script: capture=deploy-210 written=1 size=240x136

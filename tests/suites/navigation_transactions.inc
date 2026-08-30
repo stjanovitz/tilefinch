@@ -107,6 +107,568 @@ static bool test_script_oom_retains_usable_target(void)
     return ok && clean;
 }
 
+static bool test_late_script_oom_reveals_staged_page_shell(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Late OOM survivor</title>"
+        "<style>body.staged{display:none}</style><body>"
+        "<main id=survivor><h1>Published server heading</h1><p>"
+        "This substantial server-rendered paragraph remains useful when a "
+        "late application task exhausts its bounded JavaScript realm after "
+        "the bootstrap has temporarily hidden the whole document body."
+        "</p></main><script>setTimeout(()=>{"
+        "document.body.className='staged';globalThis.pocSummary='staged';"
+        "setTimeout(()=>{globalThis.retained=[];for(let i=0;i<64;i++)"
+        "retained.push(new ArrayBuffer(128*1024))},1)},1)</script></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://late-oom-target.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    size_t initial_commands = committed ? navigation.page.layout.count : 0;
+    bool staged = committed
+        && navigation_advance_runtime(&navigation, 2, 4)
+        && navigation.page.layout.count == 0;
+    bool retired = staged
+        && navigation_advance_runtime(&navigation, 2, 4);
+    lxb_dom_node_t *survivor = retired ? test_find_id(
+        lxb_dom_interface_node(navigation.page.document.html),
+        "survivor") : NULL;
+    bool ok = committed && initial_commands != 0 && staged && retired
+        && navigation.page.runtime == NULL
+        && navigation.page.stylesheet.static_custom_element_fallback
+        && navigation.page.layout.count != 0 && survivor != NULL
+        && strstr(navigation.page.script_result.summary,
+                  "JavaScript stopped") != NULL;
+    if (!ok) {
+        fprintf(stderr,
+                "late OOM ready=%d committed=%d initial=%zu staged=%d "
+                "retired=%d runtime=%p fallback=%d commands=%zu "
+                "summary=\"%s\" error=\"%s\"\n",
+                ready, committed, initial_commands, staged, retired,
+                (void *) navigation.page.runtime,
+                navigation.page.stylesheet.static_custom_element_fallback,
+                navigation.page.layout.count,
+                navigation.page.script_result.summary,
+                navigation.page.script_result.error);
+    }
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_caught_large_allocation_retires_staged_page_shell(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Caught OOM survivor</title>"
+        "<style>body.staged{display:none}</style><body><main><h1>"
+        "Published server heading</h1><p>This complete server-rendered "
+        "paragraph remains useful after an author task catches one oversized "
+        "allocation refusal while nominal heap headroom still remains."
+        "</p></main><script>setTimeout(()=>{document.body.className='staged';"
+        "try{new ArrayBuffer(8*1024*1024);globalThis.pocSummary='missed'}"
+        "catch(error){globalThis.pocSummary='caught'}},1)</script></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://caught-oom.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool retired = committed
+        && navigation_advance_runtime(&navigation, 2, 4);
+    bool ok = retired && navigation.page.runtime == NULL
+        && navigation.page.stylesheet.static_custom_element_fallback
+        && navigation.page.layout.count != 0
+        && navigation.page.script_result.error[0] == '\0'
+        && strstr(navigation.page.script_result.summary,
+                  "JavaScript stopped") != NULL;
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_caught_large_allocation_keeps_visible_runtime(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Visible allocation refusal</title><body>"
+        "<main><h1>Visible application</h1><p>This complete visible page "
+        "continues to paint useful text and must keep its healthy JavaScript "
+        "runtime when author code catches one oversized allocation refusal."
+        "</p></main><script>setTimeout(()=>{"
+        "try{new ArrayBuffer(8*1024*1024)}catch(error){"
+        "globalThis.pocSummary='caught-visible'}},1)</script></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://visible-oom.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    size_t commands = committed ? navigation.page.layout.count : 0u;
+    bool advanced = committed
+        && navigation_advance_runtime(&navigation, 2, 4);
+    bool ok = advanced && navigation.page.runtime != NULL
+        && navigation.page.layout.count == commands && commands != 0u
+        && !navigation.page.stylesheet.static_custom_element_fallback
+        && strcmp(navigation.page.script_result.summary,
+                  "caught-visible") == 0;
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_caught_allocation_keeps_gradient_presentation(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Gradient allocation refusal</title>"
+        "<style>html,body{margin:0;width:100%;height:100%;background:#fff}"
+        "body{background-image:linear-gradient(#fff,#ccddee)}"
+        "main{display:none}</style><body><main><h1>Retained report</h1>"
+        "<p>This hidden semantic report must not replace an already visible "
+        "gradient merely because a later optional allocation is refused.</p>"
+        "</main><script>setTimeout(()=>{try{new ArrayBuffer(8*1024*1024)}"
+        "catch(error){globalThis.pocSummary='caught-gradient'}},1)"
+        "</script></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://gradient-oom.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool visible_before = committed
+        && !navigation_layout_is_visually_blank(&navigation.page.layout);
+    bool advanced = committed
+        && navigation_advance_runtime(&navigation, 2, 4);
+    bool ok = visible_before && advanced && navigation.page.runtime != NULL
+        && !navigation_layout_is_visually_blank(&navigation.page.layout)
+        && !navigation.page.stylesheet.static_custom_element_fallback
+        && strcmp(navigation.page.script_result.summary,
+                  "caught-gradient") == 0;
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_caught_allocation_keeps_bounded_reader_runtime(void)
+{
+    static const char prefix[] =
+        "<!doctype html><title>Bounded Reader refusal</title>"
+        "<style>body.staged{display:none}</style><body><main>"
+        "<h1>Oversized server report</h1>";
+    static const char unit[] =
+        "<p>Bounded semantic paragraph with useful retained evidence.</p>";
+    static const char suffix[] =
+        "</main><script>setTimeout(()=>{"
+        "document.body.className='staged';"
+        "try{new ArrayBuffer(8*1024*1024)}catch(error){"
+        "globalThis.pocSummary='caught-bounded'}},1)</script></body>";
+    const size_t paragraph_count = 600u;
+    const size_t html_length = sizeof(prefix) - 1u
+        + paragraph_count * (sizeof(unit) - 1u)
+        + sizeof(suffix) - 1u;
+    char *html = malloc(html_length + 1u);
+    if (html == NULL) return false;
+    size_t at = 0u;
+    memcpy(html + at, prefix, sizeof(prefix) - 1u);
+    at += sizeof(prefix) - 1u;
+    for (size_t paragraph = 0; paragraph < paragraph_count; paragraph++) {
+        memcpy(html + at, unit, sizeof(unit) - 1u);
+        at += sizeof(unit) - 1u;
+    }
+    memcpy(html + at, suffix, sizeof(suffix));
+    at += sizeof(suffix) - 1u;
+
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && at == html_length
+        && navigation_commit_html(
+            &navigation, generation, "https://bounded-oom.test/", html,
+            html_length, 480, NULL, NULL, true);
+    free(html);
+    bool analyzed = committed
+        && reader_document_prepare_with_stylesheet(
+            &navigation.page.document, &navigation.page.stylesheet,
+            &navigation.page.reader_analysis)
+        && navigation.page.reader_analysis.bounded_out
+        && navigation.page.reader_analysis.extraction_truncated;
+    bool advanced = committed
+        && navigation_advance_runtime(&navigation, 2, 4);
+    bool ok = analyzed && advanced && navigation.page.runtime != NULL
+        && navigation.page.layout.count == 0u
+        && !navigation.page.stylesheet.static_custom_element_fallback
+        && navigation.page.reader_analysis.prepared
+        && navigation.page.reader_analysis.bounded_out
+        && navigation.page.reader_analysis.extraction_truncated
+        && strcmp(navigation.page.script_result.summary,
+                  "caught-bounded") == 0;
+    if (!ok && ready) {
+        fprintf(stderr,
+                "bounded late OOM committed=%d analyzed=%d advanced=%d runtime=%p "
+                "commands=%zu fallback=%d prepared=%d bounded=%d "
+                "truncated=%d summary=\"%s\" last-error=\"%s\"\n",
+                committed, analyzed, advanced, (void *) navigation.page.runtime,
+                navigation.page.layout.count,
+                navigation.page.stylesheet.static_custom_element_fallback,
+                navigation.page.reader_analysis.prepared,
+                navigation.page.reader_analysis.bounded_out,
+                navigation.page.reader_analysis.extraction_truncated,
+                navigation.page.script_result.summary,
+                navigation.last_error);
+    }
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_caught_large_allocation_does_not_reveal_raw_app_shell(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Raw application shell</title>"
+        "<style>body.staged{display:none}</style><body><div id=app>"
+        "<form><label>Account identifier <input name=account></label>"
+        "<p>Sign in to continue to the application dashboard and manage "
+        "your private account preferences from this interactive form.</p>"
+        "<button>Continue</button></form></div><script>setTimeout(()=>{"
+        "document.body.className='staged';"
+        "try{new ArrayBuffer(8*1024*1024)}catch(error){"
+        "globalThis.pocSummary='caught-raw'}},1)</script></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://raw-oom.test/login", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool advanced = committed
+        && navigation_advance_runtime(&navigation, 2, 4);
+    bool ok = advanced && navigation.page.runtime != NULL
+        && navigation.page.layout.count == 0u
+        && navigation.page.layout.link_count == 0u
+        && navigation.page.layout.control_count == 0u
+        && !navigation.page.stylesheet.static_custom_element_fallback
+        && navigation.page.reader_analysis.prepared
+        && navigation.page.reader_analysis.kind == READER_PAGE_RAW
+        && strcmp(navigation.page.script_result.summary, "caught-raw") == 0;
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_late_script_oom_frees_queued_frame_messages(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body.staged{display:none}</style><body><main>"
+        "<h1>Queued message retirement</h1><p>"
+        "This server-rendered page remains available after the bounded script "
+        "realm exhausts its heap while a frame message is waiting for delivery."
+        "</p><div id=message-anchor></div></main><script>setTimeout(()=>{"
+        "document.body.className='staged';"
+        "setTimeout("
+        "()=>{globalThis.retained=[];for(let i=0;i<64;i++)retained.push("
+        "new ArrayBuffer(128*1024))},1)},1)</script></body>";
+    static const char child_html[] =
+        "<!doctype html><body><p>Message source</p></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://queued-oom.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool primed = committed
+        && navigation_advance_runtime(&navigation, 2, 4)
+        && navigation.page.runtime != NULL;
+    NavigationFrame *frame = &navigation.page.frames[0];
+    bool child_ready = primed && document_parse(
+        &frame->document, &budget, child_html, sizeof(child_html) - 1u, 8u);
+    if (child_ready) {
+        navigation.page.frame_count = 1u;
+        lxb_dom_node_t *anchor = test_find_id(
+            lxb_dom_interface_node(navigation.page.document.html),
+            "message-anchor");
+        long anchor_handle = anchor == NULL ? 0
+            : script_runtime_node_handle(navigation.page.runtime, anchor);
+        frame->runtime = script_runtime_create(
+            &frame->document, &budget, 2u * MIB, 1000,
+            "https://queued-oom-child.test/", &frame->script_result);
+        frame->element = anchor;
+        frame->parent_handle = anchor_handle;
+        frame->lifecycle_generation = 1u;
+        frame->loaded = frame->runtime != NULL;
+        snprintf(frame->url, sizeof(frame->url), "%s",
+                 "https://queued-oom-child.test/");
+        child_ready = frame->runtime != NULL && anchor_handle > 0;
+    }
+    size_t dropped_before = navigation.frame_messages_dropped;
+    size_t charged_before = budget.current;
+    if (child_ready) {
+        NavigationMessage *first = &navigation.page.messages[0];
+        NavigationMessage *second = &navigation.page.messages[1];
+        first->json = budget_malloc(&budget, 65537u);
+        first->target_origin = budget_malloc(&budget, 2u);
+        second->json = budget_malloc(&budget, 8u);
+        second->target_origin = budget_malloc(&budget, 2u);
+        if (first->json != NULL && first->target_origin != NULL
+            && second->json != NULL && second->target_origin != NULL) {
+            first->json[0] = '"';
+            memset(first->json + 1u, 'x', 65534u);
+            first->json[65535] = '"';
+            first->json[65536] = '\0';
+            memcpy(first->target_origin, "*", 2u);
+            memcpy(second->json, "\"later\"", 8u);
+            memcpy(second->target_origin, "*", 2u);
+            for (size_t i = 0; i < 2u; i++) {
+                NavigationMessage *message = &navigation.page.messages[i];
+                message->source = frame->runtime;
+                message->source_frame_handle = frame->parent_handle;
+                message->source_generation = frame->lifecycle_generation;
+                snprintf(message->source_origin,
+                         sizeof(message->source_origin), "%s",
+                         "https://queued-oom-child.test");
+            }
+            navigation.page.message_count = 2u;
+        }
+    }
+    bool queued = child_ready && navigation.page.message_count == 2u
+        && budget.current > charged_before;
+    /* Keep this synthetic queue for the post-frame delivery point: the normal
+       frame-progress pump also drains messages when a scheduler is attached. */
+    FetchScheduler *scheduler = navigation.page.resource_scheduler;
+    navigation.page.resource_scheduler = NULL;
+    bool retired = queued
+        && navigation_advance_runtime(&navigation, 2, 4);
+    navigation.page.resource_scheduler = scheduler;
+    bool freed = retired && navigation.page.runtime == NULL
+        && navigation.page.message_count == 0u
+        && navigation.page.messages[0].json == NULL
+        && navigation.page.messages[0].target_origin == NULL
+        && navigation.page.messages[1].json == NULL
+        && navigation.page.messages[1].target_origin == NULL
+        && navigation.performance.frame_message_soft_failures == 1u
+        && navigation.frame_messages_dropped == dropped_before + 1u;
+    if (!(committed && primed && queued && retired && freed)) {
+        fprintf(stderr,
+                "queued OOM committed=%d primed=%d queued=%d retired=%d "
+                "freed=%d child=%d runtime=%p messages=%zu dropped=%zu/%zu "
+                "soft=%zu "
+                "charged=%zu/%zu error=\"%s\" last=\"%s\" frame=\"%s\"\n",
+                committed, primed, queued, retired, freed,
+                child_ready,
+                (void *) navigation.page.runtime,
+                navigation.page.message_count, dropped_before,
+                navigation.frame_messages_dropped,
+                navigation.performance.frame_message_soft_failures,
+                charged_before,
+                budget.current, navigation.page.script_result.error,
+                navigation.last_error, frame->script_result.error);
+    }
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return committed && primed && child_ready && queued && retired && freed
+        && clean;
+}
+
+static bool test_authored_oom_text_does_not_trigger_static_recovery(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body.staged{display:none}</style><body>"
+        "<main><h1>Ordinary authored state</h1><p>"
+        "This page has enough text to resemble a readable shell, but an "
+        "author-thrown error string is not proof that the heap allocator "
+        "actually rejected work and must not retire a healthy realm."
+        "</p></main><script>setTimeout(()=>{"
+        "document.body.className='staged';"
+        "setTimeout(()=>{throw new Error('author says out of memory')},1)"
+        "},1)</script></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://authored-error.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool advanced = committed
+        && navigation_advance_runtime(&navigation, 2, 4)
+        && navigation_advance_runtime(&navigation, 2, 4);
+    bool ok = advanced && navigation.page.runtime != NULL
+        && !navigation.page.stylesheet.static_custom_element_fallback
+        && navigation.page.layout.count == 0
+        && strstr(navigation.page.script_result.error,
+                  "author says out of memory") != NULL;
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_late_oom_static_relayout_refusal_is_transactional(void)
+{
+    static const char html[] =
+        "<!doctype html><style>body.staged{display:none}main{color:#123456}"
+        "</style><body><main><h1>Transactional static fallback</h1><p>"
+        "This complete server document remains owned when the first static "
+        "fallback layout allocation is deliberately refused after a late "
+        "JavaScript heap exhaustion and an abandoned image source mutation."
+        "</p><img id=swap src='/before.png'></main><script>setTimeout(()=>{"
+        "document.body.className='staged';"
+        "document.getElementById('swap').src='/after.png';"
+        "setTimeout(()=>{globalThis.retained=[];for(let i=0;i<64;i++)"
+        "retained.push(new ArrayBuffer(128*1024))},1)},1)</script></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://late-oom-refusal.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    bool staged = committed
+        && navigation_advance_runtime(&navigation, 2, 4)
+        && navigation.page.layout.count == 0;
+    size_t injected_before = budget.injected_failure_count;
+    /* Refuse precisely at the transactional static-layout boundary. Realm
+       teardown and diagnostics may legitimately change their allocation
+       order without weakening the rollback invariant under test. */
+    if (staged) navigation_test_refuse_next_static_fallback_layout();
+    navigation.canvas_paint_damage_pending = staged;
+    bool retired = staged
+        && navigation_advance_runtime(&navigation, 2, 4);
+    size_t injected_after = budget.injected_failure_count;
+    bool retained_after_refusal = retired
+        && injected_after == injected_before + 1u
+        && navigation.page.loaded
+        && navigation.page.runtime == NULL
+        && navigation.page.stylesheet.count != 0
+        && navigation.page.stylesheet.static_custom_element_fallback
+        && navigation.page.layout.count == 0
+        && navigation.canvas_paint_damage_pending;
+    budget_clear_failure_injection(&budget);
+    bool recovered = retained_after_refusal
+        && navigation_relayout(&navigation)
+        && navigation.page.loaded
+        && navigation.page.layout.count != 0
+        && !navigation.canvas_paint_damage_pending;
+    if (!(committed && staged && retired && retained_after_refusal
+          && recovered)) {
+        fprintf(stderr,
+                "late OOM refusal committed=%d staged=%d retired=%d "
+                "retained=%d recovered=%d injected=%zu/%zu loaded=%d "
+                "runtime=%p rules=%zu commands=%zu error=\"%s\"\n",
+                committed, staged, retired, retained_after_refusal, recovered,
+                injected_before, injected_after, navigation.page.loaded,
+                (void *) navigation.page.runtime,
+                navigation.page.stylesheet.count,
+                navigation.page.layout.count, navigation.last_error);
+    }
+    if (ready) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return committed && staged && retired && retained_after_refusal
+        && recovered && clean;
+}
+
 static bool test_candidate_cancel_preserves_late_incumbent_dom(void)
 {
     Budget budget;

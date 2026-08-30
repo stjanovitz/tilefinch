@@ -43,6 +43,7 @@ extern CURLcode curl_easy_impersonate(CURL *handle, const char *target,
                                       int default_headers);
 #endif
 #if defined(TILEFINCH_PSP_OWNED_TRANSPORT)
+#include <curl/websockets.h>
 /* The project-owned PSP transport links Mbed TLS directly, so the negotiated
    protocol version and the ClientHello preference lists are reachable through
    libcurl's documented mbedTLS seams without patching either dependency. */
@@ -81,6 +82,10 @@ _Static_assert(MBEDTLS_X509_BADCERT_BAD_KEY == TILEFINCH_TLS_VERIFY_BAD_KEY,
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <time.h>
+
+#if defined(__PSP__)
+#include <pspiofilemgr.h>
+#endif
 
 #if defined(TILEFINCH_PSP_OWNED_TRANSPORT)
 #include <pspkernel.h>
@@ -149,6 +154,7 @@ static bool fetch_private_ipv4(const unsigned char address[4])
         || (address[0] == 198u && (address[1] & 0xfeu) == 18u);
 }
 
+#if !defined(__PSP__)
 static bool fetch_private_ipv6(const unsigned char address[16])
 {
     static const unsigned char unspecified[16] = {0};
@@ -165,6 +171,7 @@ static bool fetch_private_ipv6(const unsigned char address[16])
         || (memcmp(address, mapped_prefix, sizeof(mapped_prefix)) == 0
             && fetch_private_ipv4(address + sizeof(mapped_prefix)));
 }
+#endif
 
 static bool fetch_private_sockaddr(const struct sockaddr *address)
 {
@@ -363,6 +370,13 @@ static size_t fetch_ca_blob_length;
 static uint8_t fetch_ca_blob_digest[TILEFINCH_CA_BUNDLE_SHA256_BYTES];
 static bool fetch_ca_blob_digest_valid;
 static char fetch_ca_blob_source[sizeof(fetch_ca_bundle)];
+#if defined(__PSP__)
+/* roots.pem is 34 KiB today. Keep PSP ownership fixed and outside the
+   fragmented general heap; a future bundle beyond this explicit ceiling is
+   a component-format change, not an invitation to allocate opportunistically
+   on the transport worker. */
+static unsigned char fetch_ca_blob_psp_storage[64u * 1024u];
+#endif
 #endif
 /* Cross-boot TLS session resumption store. Empty disables it. */
 static char fetch_tls_session_store_file[1024];
@@ -377,7 +391,9 @@ static void fetch_tls_session_memory_reset(void);
 static void fetch_ca_blob_reset(void)
 {
 #ifdef TILEFINCH_FETCH_CA_BLOB
+#if !defined(__PSP__)
     free(fetch_ca_blob_data);
+#endif
     fetch_ca_blob_data = NULL;
     fetch_ca_blob_length = 0;
     memset(fetch_ca_blob_digest, 0, sizeof(fetch_ca_blob_digest));
@@ -385,6 +401,10 @@ static void fetch_ca_blob_reset(void)
     fetch_ca_blob_source[0] = '\0';
 #endif
 }
+
+#ifdef TILEFINCH_FETCH_CA_BLOB
+static bool fetch_ca_blob_ensure(void);
+#endif
 
 bool fetch_set_ca_bundle_path(const char *path)
 {
@@ -398,6 +418,7 @@ bool fetch_set_ca_bundle_path(const char *path)
     if (length >= sizeof(fetch_ca_bundle)
         || memchr(path, '\r', length) != NULL
         || memchr(path, '\n', length) != NULL) return false;
+    if (strcmp(fetch_ca_bundle, path) == 0) return true;
     memcpy(fetch_ca_bundle, path, length + 1);
     /* Invalidate any blob cached from a previous path; it is re-read lazily. */
     fetch_ca_blob_reset();
@@ -407,6 +428,15 @@ bool fetch_set_ca_bundle_path(const char *path)
 const char *fetch_ca_bundle_path(void)
 {
     return fetch_ca_bundle[0] == '\0' ? NULL : fetch_ca_bundle;
+}
+
+bool fetch_prepare_ca_bundle(void)
+{
+#ifdef TILEFINCH_FETCH_CA_BLOB
+    return fetch_ca_blob_ensure();
+#else
+    return fetch_ca_bundle[0] != '\0';
+#endif
 }
 
 bool fetch_ca_bundle_identity(
@@ -440,6 +470,37 @@ static bool fetch_ca_blob_ensure(void)
         return true;
     }
     fetch_ca_blob_reset();
+#if defined(__PSP__)
+    /* Memory Stick and USBHostFS paths implement sceIo reliably, but their
+       newlib stdio adapters do not consistently implement seek/tell. Read
+       the stat-bounded file through the native PSP interface so both an
+       installed EBOOT and the memory-only PSPLink build use the same trust
+       path. */
+    SceIoStat file_stat;
+    memset(&file_stat, 0, sizeof(file_stat));
+    if (sceIoGetstat(fetch_ca_bundle, &file_stat) < 0
+        || file_stat.st_size <= 0
+        || (uint64_t) file_stat.st_size
+            > (uint64_t) sizeof(fetch_ca_blob_psp_storage)) return false;
+    size_t size = (size_t) file_stat.st_size;
+    unsigned char *data = fetch_ca_blob_psp_storage;
+    SceUID file = sceIoOpen(fetch_ca_bundle, PSP_O_RDONLY, 0);
+    if (file < 0) return false;
+    size_t offset = 0;
+    bool ok = true;
+    while (offset < size) {
+        int received = sceIoRead(file, data + offset, size - offset);
+        if (received <= 0) {
+            ok = false;
+            break;
+        }
+        offset += (size_t) received;
+    }
+    unsigned char excess = 0;
+    if (ok && sceIoRead(file, &excess, 1u) != 0) ok = false;
+    if (sceIoClose(file) < 0) ok = false;
+    if (!ok) return false;
+#else
     FILE *file = fopen(fetch_ca_bundle, "rb");
     if (file == NULL) return false;
     if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return false; }
@@ -453,10 +514,11 @@ static bool fetch_ca_blob_ensure(void)
     bool ok = fread(data, 1, (size_t) size, file) == (size_t) size;
     fclose(file);
     if (!ok) { free(data); return false; }
+#endif
     fetch_ca_blob_data = data;
-    fetch_ca_blob_length = (size_t) size;
+    fetch_ca_blob_length = size;
     fetch_ca_blob_digest_valid = tilefinch_sha256_digest(
-        data, (size_t) size, fetch_ca_blob_digest);
+        data, size, fetch_ca_blob_digest);
     if (!fetch_ca_blob_digest_valid) {
         fetch_ca_blob_reset();
         return false;

@@ -268,7 +268,7 @@ static bool fetch_url_has_private_address_literal(const TilefinchUrl *url)
         ipv4->sin_family = AF_INET;
         return fetch_private_sockaddr((const struct sockaddr *) &address);
     }
-#ifdef AF_INET6
+#if defined(AF_INET6) && !defined(__PSP__)
     unsigned char ipv6[16];
     if (inet_pton(AF_INET6, host, ipv6) == 1)
         return fetch_private_ipv6(ipv6);
@@ -511,6 +511,70 @@ static bool page_request_target_matches(const FetchRequest *request,
                expected, sizeof(expected))
         && tilefinch_url_request_key(target_url, actual, sizeof(actual))
         && strcmp(expected, actual) == 0;
+}
+
+bool fetch_websocket_prepare_admission(
+    const char *websocket_url, const FetchRequest *request,
+    char admitted_url[TILEFINCH_URL_SERIALIZED_LIMIT],
+    bool *protect_private_network)
+{
+    char working_url[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char canonical_target[TILEFINCH_URL_SERIALIZED_LIMIT];
+    if (admitted_url != NULL) admitted_url[0] = '\0';
+    if (protect_private_network != NULL) *protect_private_network = false;
+    if (websocket_url == NULL || request == NULL || admitted_url == NULL
+        || protect_private_network == NULL
+        || request->page_context == NULL
+        || !fetch_request_validate(request, NULL)) return false;
+
+    int written = -1;
+    if (strncasecmp(websocket_url, "wss://", 6u) == 0) {
+        written = snprintf(
+            working_url, sizeof(working_url), "https%s",
+            websocket_url + 3u);
+    } else if (strncasecmp(websocket_url, "ws://", 5u) == 0) {
+        written = snprintf(
+            working_url, sizeof(working_url), "http%s",
+            websocket_url + 2u);
+    }
+    TilefinchUrl initial;
+    if (written <= 0 || (size_t) written >= sizeof(working_url)
+        || !tilefinch_url_parse(working_url, &initial)
+        || initial.has_fragment
+        || !tilefinch_url_request_key(
+               working_url, canonical_target, sizeof(canonical_target))
+        /* Bind the independently supplied WS spelling to the immutable page
+           request before an HSTS transformation changes its scheme. */
+        || !page_request_target_matches(request, canonical_target)
+        || !fetch_request_prepare_security_url(
+               request, canonical_target, true, working_url)
+        || !tilefinch_url_request_key(
+               working_url, canonical_target,
+               sizeof(canonical_target))
+        || !fetch_request_target_allowed(request, canonical_target)
+        || fetch_origin_blocked(canonical_target)) {
+        return false;
+    }
+    /* Content blocking intentionally has no WebSocket resource type. Do not
+       alias sockets to XHR rules; CSP connect-src is the page policy here. */
+
+    TilefinchUrl target;
+    if (!tilefinch_url_parse(canonical_target, &target)) return false;
+    const char *wire_scheme = target.scheme == TILEFINCH_URL_SCHEME_HTTPS
+        ? "wss" : "ws";
+    written = snprintf(
+        admitted_url, TILEFINCH_URL_SERIALIZED_LIMIT, "%s%s",
+        wire_scheme, canonical_target + target.scheme_length);
+    if (written <= 0
+        || (size_t) written >= TILEFINCH_URL_SERIALIZED_LIMIT) {
+        admitted_url[0] = '\0';
+        return false;
+    }
+
+    bool pna = fetch_request_private_network_protected(
+        request, canonical_target);
+    *protect_private_network = pna;
+    return true;
 }
 
 static bool cors_preflight_header_list_valid(const char *value,

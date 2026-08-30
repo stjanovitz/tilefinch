@@ -286,6 +286,29 @@ void script_runtime_telemetry(const ScriptRuntime *runtime,
     telemetry->dom_mutations = runtime->result.dom_mutations;
 }
 
+void script_runtime_preserve_first_error(const ScriptRuntime *runtime,
+                                         ScriptResult *result)
+{
+    if (runtime == NULL || result == NULL) return;
+    /* Preserve the first diagnostic text, but keep monotonic execution facts
+       current.  Parser-stage recovery can call this after several failures;
+       freezing these counters at the first error makes the retained snapshot
+       contradict the loader metrics. */
+    result->interrupted = result->interrupted || runtime->result.interrupted;
+    if (runtime->result.scripts_evaluated > result->scripts_evaluated) {
+        result->scripts_evaluated = runtime->result.scripts_evaluated;
+    }
+    if (runtime->result.scripts_failed > result->scripts_failed) {
+        result->scripts_failed = runtime->result.scripts_failed;
+    }
+    if (result->error[0] != '\0' || runtime->result.error[0] == '\0') return;
+    snprintf(result->error, sizeof(result->error), "%s",
+             runtime->result.error);
+    snprintf(result->error_source_context,
+             sizeof(result->error_source_context), "%s",
+             runtime->result.error_source_context);
+}
+
 bool script_runtime_take_form_submission(
     ScriptRuntime *runtime, lxb_dom_node_t **form,
     lxb_dom_node_t **submitter)

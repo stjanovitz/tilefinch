@@ -46,6 +46,13 @@
  * room for a longer slice comes from.
  */
 #define PSP_MEDIA_PUMP_SLICE_US 12000u
+#define PSP_MEDIA_SUBTITLE_FRAME_ADMISSION_US 8000u
+/* The firmware submission queue is intentionally shallow; two seconds is
+   unreachable in steady play. Source-refill and buffering gates provide the
+   network safety margin, while this small decoded cushion prevents caption
+   work from sharing the last immediately presentable samples. */
+#define PSP_MEDIA_SUBTITLE_RESERVE_US UINT64_C(100000)
+#define PSP_MEDIA_SUBTITLE_PARSE_BYTES 1024u
 #define PSP_MEDIA_PUMP_MAXIMUM_UNITS 8u
 /*
  * The presentation clock is the browser's own elapsed time, and nothing ever
@@ -2065,6 +2072,10 @@ static void psp_media_request_caption_resolution(PspMediaSession *media,
     const char *catalog_url = youtube_caption_catalog_url(
         media->caption_catalog, track->id);
     media->caption_resolution_pending = catalog_url == NULL;
+    printf("tilefinch-subtitles: selection track=%.31s direct=%d catalog=%u\n",
+           track->id, catalog_url != NULL,
+           media->caption_catalog == NULL
+               ? 0u : (unsigned) media->caption_catalog->count);
     if (catalog_url != NULL) {
         snprintf(media->stream.caption_url,
                  sizeof(media->stream.caption_url), "%s", catalog_url);
@@ -2181,7 +2192,7 @@ void psp_media_execute_intent(PspMediaSession *media,
                 media->preview_commit_pending = true;
                 media->preview_commit_resume_playing = resume;
                 media->reopen_preview_pending = false;
-                psp_ui_media_set_seek_preview(
+                psp_ui_media_commit_seek(
                     &media->ui, intent.seek_time_us);
                 break;
             }
@@ -2283,11 +2294,19 @@ psp_media_subtitle_finish_request(PspMediaSession *media)
     return media->subtitles != NULL;
 }
 
-static bool psp_media_subtitle_pump(PspMediaSession *media)
+static bool psp_media_subtitle_load_pump(PspMediaSession *media)
 {
     if (media == NULL || media->track_preferences.caption_track_id[0] == '\0')
         return false;
+    if (media->subtitles != NULL) return false;
     if (media->caption_resolution_pending) {
+        /* The six visible menu tracks normally have URLs in the retained
+           catalog. A missing catalog is the memory-pressure/expired-route
+           fallback and requires parsing another complete player response.
+           This function is called only after A/V pumping and only through
+           psp_media_subtitle_work_admitted(), so even this exceptional job
+           advances by one pump transition when playback has both reserve and
+           browser-frame headroom. */
         if (media->caption_resolver_job == NULL) {
             if (!fetch_background_transport_available()) return false;
             media->caption_resolver_job = youtube_resolve_job_begin(
@@ -2389,12 +2408,11 @@ static bool psp_media_subtitle_pump(PspMediaSession *media)
             media->subtitle_received_bytes = 0;
             return false;
         }
-        unsigned char chunk[2u * KIB];
-        for (unsigned unit = 0; unit < 4u; unit++) {
-            size_t length = 0;
-            if (!fetch_background_transport_take_chunk(
-                    media->subtitle_request_id, chunk,
-                    sizeof(chunk), &length) || length == 0) break;
+        unsigned char chunk[PSP_MEDIA_SUBTITLE_PARSE_BYTES];
+        size_t length = 0;
+        if (fetch_background_transport_take_chunk(
+                media->subtitle_request_id, chunk,
+                sizeof(chunk), &length) && length != 0) {
             if (!youtube_subtitles_builder_feed(
                     media->subtitle_builder, chunk, length)) {
                 (void) fetch_background_transport_cancel(
@@ -2414,7 +2432,33 @@ static bool psp_media_subtitle_pump(PspMediaSession *media)
             return false;
         (void) psp_media_subtitle_finish_request(media);
     }
-    if (media->subtitles == NULL) return false;
+    return media->subtitles != NULL;
+}
+
+static bool psp_media_subtitle_work_admitted(
+    PspMediaSession *media, uint64_t advance_started_us)
+{
+    if (media == NULL || media->playback == NULL
+        || media->track_preferences.caption_track_id[0] == '\0')
+        return false;
+    if (media->machine.state == PSP_MEDIA_SESSION_PAUSED) return true;
+    if (media->machine.state != PSP_MEDIA_SESSION_PLAYING
+        || media->ui.buffering || media->buffering_service_active
+        || media->presentation_preroll_audio_held
+        || psp_media_source_refilling(media)) return false;
+    uint64_t buffered_us = media_playback_buffered_until_us(media->playback);
+    if (buffered_us <= media->clock_us
+        || buffered_us - media->clock_us
+               < PSP_MEDIA_SUBTITLE_RESERVE_US) return false;
+    uint64_t now_us = psp_media_now_us(media);
+    return now_us >= advance_started_us
+        && now_us - advance_started_us
+               < PSP_MEDIA_SUBTITLE_FRAME_ADMISSION_US;
+}
+
+static bool psp_media_subtitle_update_display(PspMediaSession *media)
+{
+    if (media == NULL || media->subtitles == NULL) return false;
     const char *text = youtube_subtitles_text_at(
         media->subtitles, media->clock_us, &media->subtitle_cue_cursor);
     const char *display = text == NULL ? "" : text;
@@ -2632,7 +2676,6 @@ static bool psp_media_start_pending_preview_commit(
     media->reopen_preview_pending = false;
     media->seek_preview_started = false;
     media->seek_preview_cancel_pending = false;
-    psp_ui_media_cancel_seek_preview(&media->ui);
     return true;
 }
 
@@ -2657,6 +2700,7 @@ bool psp_media_advance(
     psp_media_present_release_claimed_surface(media);
     psp_media_present_emit_after_release(media);
     bool changed = false;
+    uint64_t advance_started_us = psp_media_now_us(media);
     /* A closed player may retain a complete paused pipeline for an immediate
        replay, and an internal provider view may temporarily hide one. Neither
        state is permission to refresh expiring URLs, poll firmware, or resume
@@ -2670,17 +2714,17 @@ bool psp_media_advance(
            retry must keep the one highlighted scrub target visible and
            committable throughout the replacement open, not only after its
            final PLAYBACK_CREATE phase. */
-        if (media->reopen_preview_pending
-            || media->preview_commit_pending) {
-            uint64_t target_us = media->preview_commit_pending
-                ? media->preview_commit_target_us
-                : media->reopen_preview_target_us;
+        if (media->preview_commit_pending) {
             media->ui.duration_us = psp_media_duration_us(media);
-            psp_ui_media_set_seek_preview(&media->ui, target_us);
+            psp_ui_media_commit_seek(
+                &media->ui, media->preview_commit_target_us);
+        } else if (media->reopen_preview_pending) {
+            media->ui.duration_us = psp_media_duration_us(media);
+            psp_ui_media_set_seek_preview(
+                &media->ui, media->reopen_preview_target_us);
         }
         return true;
     }
-    changed = psp_media_subtitle_pump(media) || changed;
     if (psp_media_start_pending_preview_commit(media)) return true;
     if (media->reopen_preview_pending
         && media->playback != NULL
@@ -3495,6 +3539,16 @@ bool psp_media_advance(
             && buffered <= media->clock_us + UINT64_C(50000));
     psp_ui_media_set_buffering(&media->ui, buffering, buffered);
     psp_ui_media_tick(&media->ui, elapsed_ms);
+    /* Captions are optional background work. The old ordering parsed as much
+       as 8 KiB before ranges, codec submission, audio queueing and frame
+       collection. On PSP that could drain the shallow AAC queue immediately
+       after a track reopen. Playback now gets the complete frame first;
+       caption fetch/parse consumes one small unit only when the encoded media
+       reserve is healthy and the frame has budget left. Cue lookup remains
+       every-frame work so an already-loaded document stays synchronized. */
+    if (psp_media_subtitle_work_admitted(media, advance_started_us))
+        (void) psp_media_subtitle_load_pump(media);
+    changed = psp_media_subtitle_update_display(media) || changed;
     if (ended && media->last_resume_saved_us != UINT64_MAX) {
         psp_media_record_resume(media, true);
     } else if (media->ui.playing

@@ -1,0 +1,27 @@
+# Open the installed Treadline package through the shipping Offline Library.
+wait 30
+tap select
+press 3 down
+tap cross
+wait 10
+tap down
+tap cross
+wait-live 300
+
+# Autofocus begins on Deploy. Move through every compact bottom-row button,
+# then return geometrically to Deploy and activate it with the same X path a
+# person uses on hardware.
+tap-live down
+wait-live 20
+tap-live right
+wait-live 20
+tap-live right
+wait-live 20
+mark-live bottom-code-focus
+tap-live up
+wait-live 20
+mark-live deploy-return-focus
+tap-live cross
+wait-live 120
+mark-live deploy-result
+end

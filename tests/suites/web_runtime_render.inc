@@ -430,6 +430,236 @@ static int test_web_runtime(void)
     tile_cache_destroy(&canvas_scale_cache);
     CHECK(budget.current == 0);
 
+    puts("test: opaque viewport canvas publishes without viewport tile rebuild");
+    static unsigned char canvas_fast_pixels[2 * 2 * 4];
+    for (size_t pixel = 0; pixel < 2u * 2u; pixel++) {
+        canvas_fast_pixels[pixel * 4u] = 0x18;
+        canvas_fast_pixels[pixel * 4u + 1u] = 0x38;
+        canvas_fast_pixels[pixel * 4u + 2u] = 0x78;
+        canvas_fast_pixels[pixel * 4u + 3u] = 0xff;
+    }
+    ImageResource canvas_fast_image = {
+        .pixels = canvas_fast_pixels,
+        .source_width = 2, .source_height = 2,
+        .width = 2, .height = 2,
+        .is_canvas = true,
+        .canvas_opaque = true
+    };
+    DrawCommand canvas_fast_commands[] = {
+        {.image=&canvas_fast_image, .x=0, .y=0, .width=4, .height=4,
+         .opacity_scale=256, .type=DRAW_IMAGE,
+         .image_fit=LAYOUT_IMAGE_FIT_STRETCH},
+        {.color=0xf0c040, .x=3, .y=3, .width=1, .height=1,
+         .opacity_scale=256, .type=DRAW_FILL_RECT}
+    };
+    uint32_t canvas_fast_order[] = {0, 1};
+    uint8_t canvas_fast_flags[] = {0, 0};
+    LayoutDocument canvas_fast_layout = {
+        .budget = &budget,
+        .commands = canvas_fast_commands,
+        .count = 2,
+        .paint_order = canvas_fast_order,
+        .paint_order_count = 2,
+        .command_flags = canvas_fast_flags,
+        .width = 4, .scroll_width = 4, .height = 4,
+        .page_background = 0
+    };
+    TileCache canvas_fast_cache;
+    uint16_t canvas_fast_frame[16] = {0};
+    uint16_t canvas_ordinary_frame[16] = {0};
+    CHECK(tile_cache_init(
+              &canvas_fast_cache, &budget, &canvas_fast_layout, 1)
+          && tile_cache_set_frame(
+              &canvas_fast_cache, canvas_fast_frame,
+              sizeof(canvas_fast_frame) / sizeof(canvas_fast_frame[0]))
+          && tile_cache_render_frame(
+              &canvas_fast_cache, 0, 4, 4, NULL));
+    for (size_t pixel = 0; pixel < 2u * 2u; pixel++) {
+        canvas_fast_pixels[pixel * 4u] = 0x80;
+        canvas_fast_pixels[pixel * 4u + 1u] = 0x20;
+        canvas_fast_pixels[pixel * 4u + 2u] = 0x30;
+    }
+    CHECK(tile_cache_sync_canvas_paint(&canvas_fast_cache, 0, 0, 4, 4)
+          && tile_cache_canvas_frame_fast_eligible(
+              &canvas_fast_cache, 0, 4, 4)
+          && tile_cache_render_canvas_frame_fast(
+              &canvas_fast_cache, 0, 4, 4)
+                 == RENDER_CANVAS_FRAME_COMPLETE
+          && canvas_fast_cache.canvas_fast_frames == 1
+          && !canvas_fast_cache.canvas_paint_pending
+          && canvas_fast_frame[0] == test_rgb565(0x802030)
+          && canvas_fast_frame[15] == test_rgb565(0xf0c040));
+    memcpy(canvas_ordinary_frame, canvas_fast_frame,
+           sizeof(canvas_ordinary_frame));
+    CHECK(tile_cache_render_frame(&canvas_fast_cache, 0, 4, 4, NULL)
+          && memcmp(canvas_fast_frame, canvas_ordinary_frame,
+                    sizeof(canvas_fast_frame)) == 0);
+    static unsigned char canvas_native_pixels[2 * 12] = {
+        0xf8, 0x00, 0x00, 0xff, 0xf8, 0x00, 0x00, 0xff, 0, 0, 0, 0,
+        0x00, 0xfc, 0x00, 0xff, 0x00, 0xfc, 0x00, 0xff, 0, 0, 0, 0
+    };
+    ImageCanvasNativeSurface canvas_native = {
+        .node = canvas_fast_image.node,
+        .pixels = canvas_native_pixels,
+        .stride = 12u,
+        .epoch = 1u,
+        .authoritative = true
+    };
+    canvas_fast_image.canvas_native_surface = &canvas_native;
+    CHECK(tile_cache_sync_canvas_paint(&canvas_fast_cache, 0, 0, 4, 4)
+          && tile_cache_render_canvas_frame_fast(
+              &canvas_fast_cache, 0, 4, 4)
+                 == RENDER_CANVAS_FRAME_COMPLETE
+          && canvas_fast_frame[0] == test_rgb565(0xf80000)
+          && canvas_fast_frame[12] == test_rgb565(0x00fc00)
+          && image_resource_materialize_native_canvas(&canvas_fast_image)
+          && canvas_fast_image.canvas_native_surface == NULL
+          && canvas_fast_pixels[0] == 0xf8
+          && canvas_fast_pixels[2u * 4u] == 0x00
+          && canvas_fast_pixels[2u * 4u + 1u] == 0xfc);
+    canvas_fast_image.canvas_opaque = false;
+    canvas_fast_pixels[3] = 0xfe;
+    CHECK(tile_cache_sync_canvas_paint(&canvas_fast_cache, 0, 0, 4, 4)
+          && !tile_cache_canvas_frame_fast_eligible(
+              &canvas_fast_cache, 0, 4, 4)
+          && tile_cache_render_canvas_frame_fast(
+              &canvas_fast_cache, 0, 4, 4)
+                 == RENDER_CANVAS_FRAME_NOT_APPLICABLE
+          && canvas_fast_cache.canvas_fast_refusals == 1);
+    tile_cache_destroy(&canvas_fast_cache);
+    CHECK(budget.current == 0);
+
+    puts("test: opaque canvas fast path preserves exact three-to-two scaling");
+    static unsigned char canvas_ratio_pixels[] = {
+        0xf8, 0x00, 0x00, 0xff,  0x00, 0xfc, 0x00, 0xff,
+        0x00, 0x00, 0xf8, 0xff,  0xf8, 0xfc, 0x00, 0xff,
+        0x18, 0x38, 0x78, 0xff,  0x80, 0x20, 0x30, 0xff,
+        0x30, 0xa0, 0xd0, 0xff,  0xe0, 0x48, 0x88, 0xff
+    };
+    ImageResource canvas_ratio_image = {
+        .pixels = canvas_ratio_pixels,
+        .source_width = 4, .source_height = 2,
+        .width = 4, .height = 2,
+        .is_canvas = true, .canvas_opaque = true
+    };
+    DrawCommand canvas_ratio_command = {
+        .image = &canvas_ratio_image,
+        .x = 0, .y = 0, .width = 6, .height = 3,
+        .opacity_scale = 256, .type = DRAW_IMAGE,
+        .image_fit = LAYOUT_IMAGE_FIT_STRETCH
+    };
+    uint32_t canvas_ratio_order[] = {0};
+    uint8_t canvas_ratio_flags[] = {0};
+    LayoutDocument canvas_ratio_layout = {
+        .budget = &budget,
+        .commands = &canvas_ratio_command, .count = 1,
+        .paint_order = canvas_ratio_order, .paint_order_count = 1,
+        .command_flags = canvas_ratio_flags,
+        .width = 6, .scroll_width = 6, .height = 3,
+        .page_background = 0
+    };
+    TileCache canvas_ratio_cache;
+    uint16_t canvas_ratio_frame[18] = {0};
+    CHECK(tile_cache_init(
+              &canvas_ratio_cache, &budget, &canvas_ratio_layout, 1)
+          && tile_cache_set_frame(
+              &canvas_ratio_cache, canvas_ratio_frame,
+              sizeof(canvas_ratio_frame) / sizeof(canvas_ratio_frame[0]))
+          && tile_cache_render_frame(
+              &canvas_ratio_cache, 0, 6, 3, NULL));
+    CHECK(tile_cache_sync_canvas_paint(
+              &canvas_ratio_cache, 0, 0, 6, 3)
+          && tile_cache_render_canvas_frame_fast(
+              &canvas_ratio_cache, 0, 6, 3)
+                 == RENDER_CANVAS_FRAME_COMPLETE
+          && canvas_ratio_frame[0] == test_rgb565(0xf80000)
+          && canvas_ratio_frame[1] == test_rgb565(0xf80000)
+          && canvas_ratio_frame[2] == test_rgb565(0x00fc00)
+          && canvas_ratio_frame[3] == test_rgb565(0x0000f8)
+          && canvas_ratio_frame[4] == test_rgb565(0x0000f8)
+          && canvas_ratio_frame[5] == test_rgb565(0xf8fc00)
+          && canvas_ratio_frame[6] == canvas_ratio_frame[0]
+          && canvas_ratio_frame[12] == test_rgb565(0x183878)
+          && canvas_ratio_frame[17] == test_rgb565(0xe04888));
+    tile_cache_destroy(&canvas_ratio_cache);
+    CHECK(budget.current == 0);
+
+    puts("test: canvas overlay score updates patch one retained region");
+    static unsigned char overlay_canvas_pixels[4 * 2 * 4];
+    for (size_t pixel = 0; pixel < 4u * 2u; pixel++) {
+        overlay_canvas_pixels[pixel * 4u] = 0x18;
+        overlay_canvas_pixels[pixel * 4u + 1u] = 0x38;
+        overlay_canvas_pixels[pixel * 4u + 2u] = 0x78;
+        overlay_canvas_pixels[pixel * 4u + 3u] = 0xff;
+    }
+    ImageResource overlay_canvas_image = {
+        .pixels = overlay_canvas_pixels,
+        .source_width = 4, .source_height = 2,
+        .width = 4, .height = 2,
+        .is_canvas = true, .canvas_opaque = true
+    };
+    DrawCommand overlay_commands[] = {
+        {.image=&overlay_canvas_image, .x=0, .y=0, .width=16, .height=8,
+         .opacity_scale=256, .type=DRAW_IMAGE,
+         .image_fit=LAYOUT_IMAGE_FIT_STRETCH},
+        {.color=0xf0c040, .x=1, .y=1, .width=3, .height=2,
+         .opacity_scale=256, .type=DRAW_FILL_RECT},
+        {.color=0x40e0a0, .x=12, .y=1, .width=3, .height=2,
+         .opacity_scale=256, .type=DRAW_FILL_RECT}
+    };
+    uint32_t overlay_order[] = {0, 1, 2};
+    uint8_t overlay_flags[] = {0, 0, 0};
+    LayoutDocument overlay_layout = {
+        .budget = &budget, .commands = overlay_commands, .count = 3,
+        .paint_order = overlay_order, .paint_order_count = 3,
+        .command_flags = overlay_flags,
+        .width = 16, .scroll_width = 16, .height = 8,
+        .page_background = 0
+    };
+    TileCache overlay_cache;
+    uint16_t overlay_frame[16 * 8] = {0};
+    CHECK(tile_cache_init(&overlay_cache, &budget, &overlay_layout, 2)
+          && tile_cache_set_frame(
+              &overlay_cache, overlay_frame,
+              sizeof(overlay_frame) / sizeof(overlay_frame[0]))
+          && tile_cache_render_frame(&overlay_cache, 0, 16, 8, NULL)
+          && tile_cache_sync_canvas_paint(&overlay_cache, 0, 0, 16, 8)
+          && tile_cache_render_canvas_frame_fast(
+              &overlay_cache, 0, 16, 8) == RENDER_CANVAS_FRAME_COMPLETE
+          && overlay_cache.canvas_overlay_ready
+          && overlay_cache.canvas_overlay_region_count == 2
+          && overlay_cache.canvas_overlay_builds == 1
+          && overlay_frame[1u * 16u + 1u] == test_rgb565(0xf0c040)
+          && overlay_frame[1u * 16u + 12u] == test_rgb565(0x40e0a0));
+
+    DrawCommand updated_overlay_commands[3];
+    memcpy(updated_overlay_commands, overlay_commands,
+           sizeof(updated_overlay_commands));
+    updated_overlay_commands[1].color = 0xff7040;
+    LayoutDocument updated_overlay_layout = overlay_layout;
+    updated_overlay_layout.commands = updated_overlay_commands;
+    CHECK(tile_cache_replace_layout_damage(
+              &overlay_cache, &updated_overlay_layout, 1, 1, 4, 3)
+          && overlay_cache.canvas_overlay_ready
+          && overlay_cache.canvas_overlay_builds == 1
+          && overlay_cache.canvas_overlay_patches == 1
+          && overlay_cache.canvas_overlay_patch_regions == 1
+          && tile_cache_canvas_frame_work_pending(&overlay_cache));
+    for (size_t pixel = 0; pixel < 4u * 2u; pixel++) {
+        overlay_canvas_pixels[pixel * 4u] = 0x20;
+        overlay_canvas_pixels[pixel * 4u + 1u] = 0x50;
+        overlay_canvas_pixels[pixel * 4u + 2u] = 0x90;
+    }
+    CHECK(tile_cache_render_canvas_frame_fast(
+              &overlay_cache, 0, 16, 8) == RENDER_CANVAS_FRAME_COMPLETE
+          && overlay_cache.canvas_overlay_builds == 1
+          && overlay_cache.canvas_fast_frames == 2
+          && overlay_frame[1u * 16u + 1u] == test_rgb565(0xff7040)
+          && overlay_frame[1u * 16u + 12u] == test_rgb565(0x40e0a0)
+          && overlay_frame[7u * 16u + 7u] == test_rgb565(0x205090));
+    tile_cache_destroy(&overlay_cache);
+    CHECK(budget.current == 0);
+
     puts("test: transient decoded-image OOM retries after tile pressure");
     DrawCommand retry_image_command = {
         .image = &cache_image_a,

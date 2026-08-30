@@ -62,6 +62,14 @@ static bool test_request_precedence_and_generations(void)
     CHECK(resolved.cause == PSP_NETWORK_TARGET_CAUSE_NAVIGATION);
     CHECK(resolved.profile_index == 4);
 
+    CHECK(psp_network_request_clear(
+        &table, PSP_NETWORK_REQUEST_NAVIGATION, 7));
+    CHECK(psp_network_request_set(
+        &table, PSP_NETWORK_REQUEST_MULTIPLAYER, 8, 5));
+    resolved = psp_network_request_target(&table);
+    CHECK(resolved.cause == PSP_NETWORK_TARGET_CAUSE_MULTIPLAYER);
+    CHECK(resolved.profile_index == 5);
+
     CHECK(psp_network_request_set(
         &table, PSP_NETWORK_REQUEST_VOICE_INHIBIT, 3, 0));
     CHECK(psp_network_request_target(&table).cause
@@ -86,6 +94,29 @@ static bool test_request_precedence_and_generations(void)
     CHECK(!psp_network_request_set(
         &table, PSP_NETWORK_REQUEST_NAVIGATION, 6, 1));
     CHECK(table.requests[PSP_NETWORK_REQUEST_NAVIGATION].profile_index == 4);
+    return true;
+}
+
+static bool test_offline_open_releases_only_boot_request(void)
+{
+    PspNetworkRequestTable table = psp_network_request_table_initial();
+    CHECK(psp_network_request_set(
+        &table, PSP_NETWORK_REQUEST_BOOT, 1, 2));
+    CHECK(psp_network_request_clear(
+        &table, PSP_NETWORK_REQUEST_BOOT, 1));
+    CHECK(psp_network_request_target(&table).kind
+          == PSP_NETWORK_TARGET_OFF);
+
+    CHECK(psp_network_request_set(
+        &table, PSP_NETWORK_REQUEST_BOOT, 2, 2));
+    CHECK(psp_network_request_set(
+        &table, PSP_NETWORK_REQUEST_MULTIPLAYER, 3, 4));
+    CHECK(psp_network_request_clear(
+        &table, PSP_NETWORK_REQUEST_BOOT, 2));
+    PspNetworkTarget resolved = psp_network_request_target(&table);
+    CHECK(resolved.kind == PSP_NETWORK_TARGET_READY);
+    CHECK(resolved.cause == PSP_NETWORK_TARGET_CAUSE_MULTIPLAYER);
+    CHECK(resolved.profile_index == 4);
     return true;
 }
 
@@ -373,6 +404,7 @@ static bool test_demand_scaled_pump_policy(void)
 int main(void)
 {
     if (!test_request_precedence_and_generations()
+        || !test_offline_open_releases_only_boot_request()
         || !test_retained_suspend_and_resume()
         || !test_suspend_timeout_never_unloads_live_lease()
         || !test_off_timeout_quarantines_until_release()

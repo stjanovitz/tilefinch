@@ -28,6 +28,8 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     budget_free(runtime->bridge.budget, runtime->bridge.media_source);
     runtime->bridge.media_source = NULL;
     js_rt_event_sources_destroy(&runtime->bridge);
+    js_rt_websockets_destroy(&runtime->bridge);
+    js_rt_multiplayer_destroy(&runtime->bridge);
     fetch_scheduler_destroy(runtime->bridge.fetch_scheduler);
     runtime->bridge.fetch_scheduler = NULL;
     fetch_scheduler_domain_release(

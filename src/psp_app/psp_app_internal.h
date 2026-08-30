@@ -17,6 +17,7 @@
 #include <pspctrl.h>
 #include <pspdisplay.h>
 #include <pspge.h>
+#include <pspiofilemgr.h>
 #include <pspkernel.h>
 #include <psploadexec.h>
 #include <psppower.h>
@@ -391,6 +392,31 @@ const char *psp_user_visible_error(
 void psp_sample_wifi_strength(const PspNetwork *network, uint64_t now_us);
 #endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+typedef struct {
+    uint64_t flush_us;
+    uint64_t set_framebuffer_us;
+    uint64_t vblank_us;
+    uint32_t flush_calls;
+    uint32_t set_framebuffer_calls;
+    uint32_t vblank_calls;
+} PspDisplayBackendTiming;
+
+typedef struct {
+    uint64_t base_us;
+    uint64_t composite_us;
+    uint64_t publish_us;
+    uint64_t publish_flush_us;
+    uint64_t publish_set_framebuffer_us;
+    uint64_t publish_vblank_us;
+    uint64_t ui_focus_scroll_us;
+    uint64_t ui_chrome_us;
+    uint64_t ui_cursor_us;
+    uint64_t ui_screen_us;
+    uint64_t ui_toast_us;
+    uint64_t ui_loading_us;
+    uint32_t sequence;
+} PspPresentPhaseTiming;
+
 typedef enum {
     PSP_POWER_TEST_OFF = 0,
     PSP_POWER_TEST_ADAPTIVE,
@@ -446,6 +472,9 @@ typedef struct {
 } PspPowerTestResult;
 
 void psp_report_presentation_cadence(const char *phase);
+bool psp_present_validation_last_timing(PspPresentPhaseTiming *timing);
+bool psp_display_validation_timing_snapshot(
+    PspDisplayBackendTiming *timing);
 void psp_video_scanout_note_discontinuity(void);
 void psp_cursor_latency_sample(uint64_t sampled_us);
 void psp_clock_validation_probe(void);
@@ -850,7 +879,15 @@ typedef struct {
     PspSiteDataRestore site_data_restore;
     PspReaderNavigation reader_navigation;
     PspCaptivePortal *captive_portal;
+    bool blank_reader_recovery_pending;
+    uint64_t blank_reader_recovery_generation;
     bool lifecycle_retry_available;
+    /* Only a successfully committed blank page needs Recovery Return to move
+       history or restore native Home; ordinary failed navigations still sit
+       over their incumbent. */
+    bool lifecycle_retry_return_back;
+    bool lifecycle_retry_return_forward;
+    bool lifecycle_retry_return_home;
     uint8_t captive_portal_failure_count;
     char lifecycle_retry_url[NAVIGATION_URL_LIMIT];
     /* Callback-supervisor input waiting for the browser thread to regain a
@@ -971,7 +1008,7 @@ bool psp_route_native_home(PspApp *app, const char *url);
 
 /* src/psp_app/psp_app_actions.c */
 void psp_app_dispatch_action(
-    PspApp *app, PspAppFrameState *frame, const PspUiIntent *intent);
+    PspApp *app, PspAppFrameState *frame, PspUiIntent *intent);
 void psp_app_pump_provider_handoff_reclaim(
     PspApp *app, uint64_t frame_us, bool player_presented);
 /* src/psp_app/psp_app_settings.c */
@@ -998,6 +1035,7 @@ bool psp_input_script_running(void);
 void psp_input_script_interrupt_by_user(void);
 bool psp_input_script_frame(
     PspUiInput *input, bool ready);
+void psp_webgl_measurement_mark(const char *mark);
 bool psp_input_script_busy_frame(PspUiInput *input);
 void psp_input_script_observe(
     const PspUiIntent *intent, const PspUiState *ui);
@@ -1005,6 +1043,11 @@ void psp_input_script_observe_page(
     const NavigationSession *navigation);
 void psp_input_script_observe_media(
     const PspUiMediaIntent *intent, const PspUiMediaState *media);
+void psp_input_script_observe_gamepad(
+    bool connected, uint32_t buttons, int16_t axis_x, int16_t axis_y,
+    bool published);
+uint16_t psp_input_script_diagnostic_step(void);
+uint32_t psp_input_script_diagnostic_buttons(void);
 void psp_input_script_capture_live_mark(
     const uint16_t *frame, size_t pixels, size_t stride_pixels);
 void psp_input_script_capture_named(

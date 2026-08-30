@@ -46,7 +46,7 @@ tap square
 wait 30
 mark reloaded
 
-# Page tools owns Reader and site-scoped Reader preference.
+# Page tools owns Reader, Basic view, and the site-scoped Reader preference.
 tap select
 tap up
 tap cross
@@ -62,7 +62,7 @@ wait 20
 mark reader-off
 tap select
 tap cross
-press 5 down
+press 6 down
 tap cross
 tap cross
 press 3 down

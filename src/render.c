@@ -15,6 +15,8 @@
 
 enum { RENDER_GRADIENT_CACHE_ENTRIES = 2 };
 
+static void canvas_overlay_cache_clear(TileCache *cache);
+
 static int render_saturating_add_int(int left, int right)
 {
     int64_t sum = (int64_t) left + right;
@@ -294,6 +296,7 @@ void tile_cache_repaint_glyphs(TileCache *cache)
     cache->fixed_ready = false;
     cache->fixed_backdrop = false;
     cache->fixed_backdrop_masked = false;
+    canvas_overlay_cache_clear(cache);
     cache->last_frame_scroll_valid = false;
     cache->invalidations++;
 }
@@ -513,6 +516,7 @@ void tile_cache_destroy(TileCache *cache)
         glyph_cache_clear(cache, false);
         scaled_image_clear(cache);
         decoded_image_clear(cache);
+        canvas_overlay_cache_clear(cache);
         budget_free(cache->budget, cache->fixed_row_last);
         budget_free(cache->budget, cache->fixed_row_first);
         budget_free(cache->budget, cache->fixed_alpha);
@@ -658,9 +662,26 @@ static bool layout_has_css_backdrop_filter(const LayoutDocument *layout)
         size_t end = range->command_end < layout->count
             ? range->command_end : layout->count;
         for (size_t i = range->command_start; i < end; i++) {
-            if (draw_command_backdrop_blur(&layout->commands[i]) != 0u) {
+            if (draw_command_backdrop_blur(&layout->commands[i]) != 0u)
                 return true;
-            }
+        }
+    }
+    return false;
+}
+
+static bool layout_has_unbounded_css_backdrop_filter(
+    const LayoutDocument *layout)
+{
+    if (layout == NULL) return false;
+    for (size_t range_index = 0; range_index < layout->fixed_count;
+         range_index++) {
+        const FixedRange *range = &layout->fixed_ranges[range_index];
+        if (range->scroll_end != INT_MAX) continue;
+        size_t end = range->command_end < layout->count
+            ? range->command_end : layout->count;
+        for (size_t i = range->command_start; i < end; i++) {
+            if (draw_command_backdrop_blur(&layout->commands[i]) != 0u)
+                return true;
         }
     }
     return false;
@@ -676,7 +697,7 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
     /* A backdrop filter samples the already-composited page.  The ordinary
        fixed cache is deliberately page-independent, so route only these rare
        bounded commands through the direct framebuffer path. */
-    if (layout_has_css_backdrop_filter(cache->layout)) return false;
+    if (layout_has_unbounded_css_backdrop_filter(cache->layout)) return false;
     if (cache->layout->command_flags != NULL) {
         (void) overflow_cache_prepare(cache);
     }
@@ -698,8 +719,9 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
     cache->fixed_cache_bytes = 0;
     int left = viewport_width, top = viewport_height, right = 0, bottom = 0;
     for (size_t range_index = 0;
-         range_index < cache->layout->fixed_count; range_index++) {
+        range_index < cache->layout->fixed_count; range_index++) {
         const FixedRange *range = &cache->layout->fixed_ranges[range_index];
+        if (range->scroll_end != INT_MAX) continue;
         for (size_t order = 0; order < cache->layout->count; order++) {
             size_t i = cache->layout->paint_order_count == cache->layout->count
                        ? cache->layout->paint_order[order] : order;
@@ -781,8 +803,9 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
     };
 
     for (size_t range_index = 0;
-         range_index < cache->layout->fixed_count; range_index++) {
+        range_index < cache->layout->fixed_count; range_index++) {
         const FixedRange *range = &cache->layout->fixed_ranges[range_index];
+        if (range->scroll_end != INT_MAX) continue;
         for (size_t order = 0; order < cache->layout->count; order++) {
             size_t i = cache->layout->paint_order_count == cache->layout->count
                        ? cache->layout->paint_order[order] : order;
@@ -820,9 +843,14 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
         cache->fixed_row_last[y] = last;
     }
     cache->fixed_ready = true;
-    cache->fixed_backdrop = cache->layout->fixed_count == 1
+    size_t cacheable_ranges = 0;
+    for (size_t i = 0; i < cache->layout->fixed_count; i++) {
+        if (cache->layout->fixed_ranges[i].scroll_end == INT_MAX)
+            cacheable_ranges++;
+    }
+    cache->fixed_backdrop = cacheable_ranges == 1
         && layout_has_fixed_backdrop(
-            cache->layout, viewport_width, viewport_height);
+               cache->layout, viewport_width, viewport_height);
     cache->fixed_viewport_width = viewport_width;
     cache->fixed_viewport_height = viewport_height;
     cache->fixed_cache_builds++;
@@ -924,6 +952,10 @@ static void paint_sticky_overlays(TileCache *cache, uint16_t *frame,
             const DrawCommand *source = &cache->layout->commands[i];
             DrawCommand command = *source;
             int sticky_dy = render_saturating_subtract_int(scroll_y, trigger);
+            if (range->maximum_offset != INT_MAX
+                && sticky_dy > range->maximum_offset) {
+                sticky_dy = range->maximum_offset;
+            }
             command.y = render_saturating_add_int(command.y, sticky_dy);
             if (cache->layout->command_flags == NULL
                 || !(cache->layout->command_flags[i]
@@ -1003,9 +1035,8 @@ static void paint_sticky_overlays(TileCache *cache, uint16_t *frame,
 
 static void paint_fixed_overlays(TileCache *cache, uint16_t *frame,
                                  int scroll_y, int viewport_width,
-                                 int viewport_height)
+                                 int viewport_height, bool bounded_only)
 {
-    (void) scroll_y;
     RasterTarget target = {
         .pixels = frame,
         .stride = (size_t) viewport_width,
@@ -1019,8 +1050,11 @@ static void paint_fixed_overlays(TileCache *cache, uint16_t *frame,
         .bottom = viewport_height
     };
     for (size_t range_index = 0;
-         range_index < cache->layout->fixed_count; range_index++) {
+        range_index < cache->layout->fixed_count; range_index++) {
         const FixedRange *range = &cache->layout->fixed_ranges[range_index];
+        if (bounded_only && range->scroll_end == INT_MAX) continue;
+        if (range->scroll_end != INT_MAX
+            && scroll_y >= range->scroll_end) continue;
         for (size_t order = 0; order < cache->layout->count; order++) {
             size_t i = cache->layout->paint_order_count == cache->layout->count
                        ? cache->layout->paint_order[order] : order;
@@ -1050,6 +1084,7 @@ static bool layout_has_fixed_backdrop(const LayoutDocument *layout,
     for (size_t range_index = 0; range_index < layout->fixed_count;
          range_index++) {
         const FixedRange *range = &layout->fixed_ranges[range_index];
+        if (range->scroll_end != INT_MAX) continue;
         size_t end = range->command_end < layout->count
             ? range->command_end : layout->count;
         for (size_t i = range->command_start; i < end; i++) {
@@ -1261,6 +1296,786 @@ void render_paint_find_highlight(
         frame[(size_t) py * (size_t) viewport_width
               + (size_t) (right - 1)] = border;
     }
+}
+
+typedef struct {
+    DrawCommand command;
+    const ImageResource *image;
+    size_t command_index;
+    size_t paint_order;
+    int clip_left;
+    int clip_top;
+    int clip_right;
+    int clip_bottom;
+} CanvasFastFrameCandidate;
+
+static bool canvas_surface_is_opaque(const ImageResource *image)
+{
+    if (image == NULL || !image->is_canvas || image->pixels == NULL
+        || image->width <= 0 || image->height <= 0
+        || (size_t) image->width > SIZE_MAX / (size_t) image->height
+        || (size_t) image->width * (size_t) image->height
+               > SIZE_MAX / 4u) {
+        return false;
+    }
+    size_t pixels = (size_t) image->width * (size_t) image->height;
+    for (size_t i = 0; i < pixels; i++) {
+        if (image->pixels[i * 4u + 3u] != 255u) return false;
+    }
+    return true;
+}
+
+static inline uint32_t canvas_fast_rgb565(uint32_t pixel)
+{
+#if defined(_MIPS_ARCH_ALLEGREX)
+    uint32_t red, green, blue;
+    __asm__("ext %0,%1,3,5" : "=r" (red) : "r" (pixel));
+    __asm__("ext %0,%1,10,6" : "=r" (green) : "r" (pixel));
+    __asm__("ext %0,%1,19,5" : "=r" (blue) : "r" (pixel));
+    __asm__("ins %0,%1,5,6" : "+r" (red) : "r" (green));
+    __asm__("ins %0,%1,11,5" : "+r" (red) : "r" (blue));
+    return red;
+#else
+    return ((pixel & UINT32_C(0x000000f8)) << 8)
+        | ((pixel & UINT32_C(0x0000fc00)) >> 5)
+        | ((pixel & UINT32_C(0x00f80000)) >> 19);
+#endif
+}
+
+static inline uint32_t canvas_fast_rgb565_pair(uint32_t low, uint32_t high)
+{
+#if defined(_MIPS_ARCH_ALLEGREX)
+    __asm__("ins %0,%1,16,16" : "+r" (low) : "r" (high));
+    return low;
+#else
+    return low | (high << 16);
+#endif
+}
+
+/* Exact nearest-neighbour 2:3 expansion used by a 320-pixel WebGL drawing
+   buffer presented across the 480-pixel PSP viewport. Four source pixels
+   become p0,p0,p1,p2,p2,p3, written as three aligned 32-bit pairs. */
+static void canvas_fast_scale_row_3_to_2(
+    uint16_t *output, const unsigned char *source, int source_width)
+{
+    const uint32_t *input = (const uint32_t *) (const void *) source;
+    uint32_t *pairs = (uint32_t *) (void *) output;
+    for (int x = 0; x < source_width; x += 4) {
+        uint32_t p0 = canvas_fast_rgb565(input[x]);
+        uint32_t p1 = canvas_fast_rgb565(input[x + 1]);
+        uint32_t p2 = canvas_fast_rgb565(input[x + 2]);
+        uint32_t p3 = canvas_fast_rgb565(input[x + 3]);
+        *pairs++ = canvas_fast_rgb565_pair(p0, p0);
+        *pairs++ = canvas_fast_rgb565_pair(p1, p2);
+        *pairs++ = canvas_fast_rgb565_pair(p2, p3);
+    }
+}
+
+static bool canvas_fast_frame_candidate_impl(
+    const TileCache *cache, int scroll_y, int viewport_width,
+    int viewport_height, bool require_pending,
+    CanvasFastFrameCandidate *candidate)
+{
+    if (candidate != NULL) memset(candidate, 0, sizeof(*candidate));
+    if (cache == NULL || candidate == NULL
+        || (require_pending && !cache->canvas_paint_pending)
+        || cache->frame == NULL || cache->layout == NULL
+        || cache->frame_work.pending || cache->frame_work.ready
+        || !cache->last_frame_scroll_valid
+        || cache->last_frame_scroll_y != scroll_y
+        || viewport_width <= 0 || viewport_height <= 0
+        || cache->frame_pixels
+               < (size_t) viewport_width * (size_t) viewport_height
+        || cache->layout->paint_order_count != cache->layout->count
+        || layout_has_css_backdrop_filter(cache->layout)) return false;
+
+    size_t canvas_count = 0;
+    for (size_t order = 0; order < cache->layout->count; order++) {
+        size_t index = cache->layout->paint_order[order];
+        if (index >= cache->layout->count) return false;
+        const DrawCommand *command = &cache->layout->commands[index];
+        if (command->type != DRAW_IMAGE || command->image == NULL
+            || !command->image->is_canvas) continue;
+        canvas_count++;
+        bool positioned_range = false;
+        for (size_t range = 0; range < cache->layout->fixed_count; range++) {
+            const FixedRange *fixed = &cache->layout->fixed_ranges[range];
+            if (index >= fixed->command_start && index < fixed->command_end) {
+                positioned_range = true;
+                break;
+            }
+        }
+        for (size_t range = 0;
+             !positioned_range && range < cache->layout->sticky_count;
+             range++) {
+            const StickyRange *sticky = &cache->layout->sticky_ranges[range];
+            if (index >= sticky->command_start
+                && index < sticky->command_end) positioned_range = true;
+        }
+        uint8_t flags = cache->layout->command_flags == NULL
+            ? 0 : cache->layout->command_flags[index];
+        if (canvas_count != 1u
+            || positioned_range
+            || (flags & (LAYOUT_COMMAND_FIXED
+                         | LAYOUT_COMMAND_LATE_POSITIONED)) != 0
+            || (flags != 0 && (flags & LAYOUT_COMMAND_OVERFLOW) == 0)
+            || command->image_fit != LAYOUT_IMAGE_FIT_STRETCH
+            || draw_command_rotation_quadrants(command) != 0u
+            || draw_command_image_clip_radius(command) != 0
+            || draw_command_filter_code(command) != 0u
+            || draw_command_blend_mode(command) != LAYOUT_MIX_BLEND_NORMAL
+            || command->opacity_scale != 256u) {
+            return false;
+        }
+        candidate->command = *command;
+        candidate->image = command->image;
+        candidate->command_index = index;
+        candidate->paint_order = order;
+        candidate->clip_left = 0;
+        candidate->clip_top = scroll_y;
+        candidate->clip_right = viewport_width;
+        candidate->clip_bottom = scroll_y + viewport_height;
+        if ((flags & LAYOUT_COMMAND_OVERFLOW) != 0
+            || (cache->layout->command_flags == NULL
+                && command_in_overflow(cache->layout, index))) {
+            int dx = 0, dy = 0;
+            const OverflowGeometry *geometry =
+                overflow_cached_geometry(cache, index);
+            if (geometry != NULL) {
+                if (!geometry->found) return false;
+                dx = geometry->dx;
+                dy = geometry->dy;
+                candidate->clip_left = geometry->clip_left;
+                candidate->clip_top = geometry->clip_top;
+                candidate->clip_right = geometry->clip_right;
+                candidate->clip_bottom = geometry->clip_bottom;
+                RoundedClip rounded[MAXIMUM_ROUNDED_CLIPS];
+                if (overflow_cached_rounded_clips(
+                        cache, index, rounded,
+                        MAXIMUM_ROUNDED_CLIPS) != 0) return false;
+            } else {
+                if (!overflow_command_geometry(
+                        cache->layout, index, &dx, &dy,
+                        &candidate->clip_left, &candidate->clip_top,
+                        &candidate->clip_right, &candidate->clip_bottom)) {
+                    return false;
+                }
+                RoundedClip rounded[MAXIMUM_ROUNDED_CLIPS];
+                if (overflow_rounded_clips(
+                        cache->layout, index, rounded,
+                        MAXIMUM_ROUNDED_CLIPS) != 0) return false;
+            }
+            candidate->command.x = render_saturating_add_int(
+                candidate->command.x, dx);
+            candidate->command.y = render_saturating_add_int(
+                candidate->command.y, dy);
+        }
+        if (candidate->clip_left < 0) candidate->clip_left = 0;
+        if (candidate->clip_top < scroll_y) candidate->clip_top = scroll_y;
+        if (candidate->clip_right > viewport_width)
+            candidate->clip_right = viewport_width;
+        if (candidate->clip_bottom > scroll_y + viewport_height)
+            candidate->clip_bottom = scroll_y + viewport_height;
+        if (candidate->clip_right <= candidate->clip_left
+            || candidate->clip_bottom <= candidate->clip_top
+            || !intersects(&candidate->command,
+                           candidate->clip_left, candidate->clip_top,
+                           candidate->clip_right, candidate->clip_bottom)) {
+            return false;
+        }
+    }
+    return canvas_count == 1u
+        && (candidate->image->canvas_opaque
+            || canvas_surface_is_opaque(candidate->image));
+}
+
+static bool canvas_fast_frame_candidate(
+    const TileCache *cache, int scroll_y, int viewport_width,
+    int viewport_height, CanvasFastFrameCandidate *candidate)
+{
+    return canvas_fast_frame_candidate_impl(
+        cache, scroll_y, viewport_width, viewport_height, true, candidate);
+}
+
+/* Animated canvases are often followed by a small HTML HUD. Retain only
+   disjoint post-canvas regions: a top score and bottom power label should not
+   turn into a second viewport-sized surface. On a DOM mutation the exact
+   damage region is cleared and rerasterized in place, so the common fixed-
+   width score update never rebuilds the other HUD regions. */
+enum { CANVAS_OVERLAY_PIXEL_LIMIT = 32768 };
+
+typedef struct {
+    RenderCanvasOverlayRegion regions[TILEFINCH_CANVAS_OVERLAY_REGION_LIMIT];
+    size_t count;
+    size_t pixels;
+} CanvasOverlayPlan;
+
+typedef struct {
+    DrawCommand command;
+    int clip_left;
+    int clip_top;
+    int clip_right;
+    int clip_bottom;
+    RoundedClip rounded_clips[MAXIMUM_ROUNDED_CLIPS];
+    size_t rounded_clip_count;
+    bool visible;
+} CanvasOverlayCommand;
+
+static void canvas_overlay_cache_clear(TileCache *cache)
+{
+    if (cache == NULL) return;
+    if (cache->budget != NULL) {
+        budget_free(cache->budget, cache->canvas_overlay_alpha);
+        budget_free(cache->budget, cache->canvas_overlay_pixels);
+    }
+    cache->canvas_overlay_pixels = NULL;
+    cache->canvas_overlay_alpha = NULL;
+    cache->canvas_overlay_region_count = 0;
+    cache->canvas_overlay_pixel_count = 0;
+    cache->canvas_overlay_ready = false;
+}
+
+static bool canvas_overlay_plan_add(CanvasOverlayPlan *plan,
+                                    int left, int top, int right, int bottom)
+{
+    RenderCanvasOverlayRegion next = {
+        .left = (int16_t) left, .top = (int16_t) top,
+        .width = (uint16_t) (right - left),
+        .height = (uint16_t) (bottom - top)
+    };
+    for (size_t i = 0; i < plan->count;) {
+        RenderCanvasOverlayRegion *region = &plan->regions[i];
+        if (next.left >= region->left + (int) region->width
+            || next.left + (int) next.width <= region->left
+            || next.top >= region->top + (int) region->height
+            || next.top + (int) next.height <= region->top) {
+            i++;
+            continue;
+        }
+        int merged_left = next.left < region->left
+            ? next.left : region->left;
+        int merged_top = next.top < region->top ? next.top : region->top;
+        int merged_right = next.left + (int) next.width;
+        int region_right = region->left + (int) region->width;
+        if (region_right > merged_right) merged_right = region_right;
+        int merged_bottom = next.top + (int) next.height;
+        int region_bottom = region->top + (int) region->height;
+        if (region_bottom > merged_bottom) merged_bottom = region_bottom;
+        next.left = (int16_t) merged_left;
+        next.top = (int16_t) merged_top;
+        next.width = (uint16_t) (merged_right - merged_left);
+        next.height = (uint16_t) (merged_bottom - merged_top);
+        plan->count--;
+        memmove(&plan->regions[i], &plan->regions[i + 1u],
+                (plan->count - i) * sizeof(*plan->regions));
+        i = 0;
+    }
+    if (plan->count >= TILEFINCH_CANVAS_OVERLAY_REGION_LIMIT) return false;
+    plan->regions[plan->count++] = next;
+    return true;
+}
+
+static void canvas_overlay_command(
+    TileCache *cache, size_t index, int scroll_y,
+    int viewport_width, int viewport_height, CanvasOverlayCommand *resolved)
+{
+    memset(resolved, 0, sizeof(*resolved));
+    resolved->command = cache->layout->commands[index];
+    resolved->clip_left = 0;
+    resolved->clip_top = scroll_y;
+    resolved->clip_right = viewport_width;
+    resolved->clip_bottom = scroll_y + viewport_height;
+    uint8_t flags = cache->layout->command_flags[index];
+    bool overflow = (flags & LAYOUT_COMMAND_OVERFLOW) != 0;
+    if (overflow) {
+        int dx = 0, dy = 0;
+        if (!overflow_command_geometry(
+                cache->layout, index, &dx, &dy,
+                &resolved->clip_left, &resolved->clip_top,
+                &resolved->clip_right, &resolved->clip_bottom)) return;
+        resolved->command.x = render_saturating_add_int(
+            resolved->command.x, dx);
+        resolved->command.y = render_saturating_add_int(
+            resolved->command.y, dy);
+        resolved->rounded_clip_count = overflow_rounded_clips(
+            cache->layout, index, resolved->rounded_clips,
+            MAXIMUM_ROUNDED_CLIPS);
+    }
+    if (resolved->clip_left < 0) resolved->clip_left = 0;
+    if (resolved->clip_top < scroll_y) resolved->clip_top = scroll_y;
+    if (resolved->clip_right > viewport_width) {
+        resolved->clip_right = viewport_width;
+    }
+    if (resolved->clip_bottom > scroll_y + viewport_height) {
+        resolved->clip_bottom = scroll_y + viewport_height;
+    }
+    resolved->visible = resolved->clip_right > resolved->clip_left
+        && resolved->clip_bottom > resolved->clip_top
+        && intersects(&resolved->command, resolved->clip_left,
+                      resolved->clip_top, resolved->clip_right,
+                      resolved->clip_bottom);
+}
+
+static bool canvas_overlay_plan(
+    TileCache *cache, const CanvasFastFrameCandidate *candidate,
+    int scroll_y, int viewport_width, int viewport_height,
+    CanvasOverlayPlan *plan)
+{
+    memset(plan, 0, sizeof(*plan));
+    if (cache->layout->sticky_count != 0
+        || cache->layout->command_flags == NULL) return false;
+    for (size_t order = candidate->paint_order + 1u;
+         order < cache->layout->count; order++) {
+        size_t index = cache->layout->paint_order[order];
+        uint8_t flags = cache->layout->command_flags[index];
+        if ((flags & LAYOUT_COMMAND_FIXED) != 0) continue;
+        bool overflow = (flags & LAYOUT_COMMAND_OVERFLOW) != 0;
+        if (!overflow && flags != 0
+            && (flags & LAYOUT_COMMAND_LATE_POSITIONED) == 0) {
+            continue;
+        }
+        const DrawCommand *command = &cache->layout->commands[index];
+        if (draw_command_blend_mode(command) != LAYOUT_MIX_BLEND_NORMAL
+            || draw_command_backdrop_blur(command) != 0u
+            || (command->type == DRAW_IMAGE && command->image != NULL
+                && command->image->is_canvas)) return false;
+        CanvasOverlayCommand resolved;
+        canvas_overlay_command(
+            cache, index, scroll_y, viewport_width, viewport_height,
+            &resolved);
+        if (!resolved.visible) continue;
+        int left = resolved.command.x > resolved.clip_left
+            ? resolved.command.x : resolved.clip_left;
+        int top = resolved.command.y > resolved.clip_top
+            ? resolved.command.y : resolved.clip_top;
+        int right = resolved.command.x + resolved.command.width;
+        int bottom = resolved.command.y + resolved.command.height;
+        if (right > resolved.clip_right) right = resolved.clip_right;
+        if (bottom > resolved.clip_bottom) bottom = resolved.clip_bottom;
+        if (right <= left || bottom <= top) continue;
+        if (!canvas_overlay_plan_add(
+                plan, left, top - scroll_y, right, bottom - scroll_y)) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < plan->count; i++) {
+        RenderCanvasOverlayRegion *region = &plan->regions[i];
+        size_t area = (size_t) region->width * region->height;
+        if (area > CANVAS_OVERLAY_PIXEL_LIMIT - plan->pixels) return false;
+        region->pixel_offset = (uint32_t) plan->pixels;
+        plan->pixels += area;
+    }
+    return true;
+}
+
+static void canvas_overlay_raster(
+    TileCache *cache, const CanvasFastFrameCandidate *candidate,
+    uint8_t region_mask)
+{
+    for (size_t order = candidate->paint_order + 1u;
+         order < cache->layout->count; order++) {
+        size_t index = cache->layout->paint_order[order];
+        uint8_t flags = cache->layout->command_flags[index];
+        bool overflow = (flags & LAYOUT_COMMAND_OVERFLOW) != 0;
+        if ((flags & LAYOUT_COMMAND_FIXED) != 0
+            || (!overflow && flags != 0
+                && (flags & LAYOUT_COMMAND_LATE_POSITIONED) == 0)) continue;
+        CanvasOverlayCommand resolved;
+        canvas_overlay_command(
+            cache, index, cache->canvas_overlay_scroll_y,
+            cache->canvas_overlay_viewport_width,
+            cache->canvas_overlay_viewport_height, &resolved);
+        if (!resolved.visible) continue;
+        const DrawCommand *command = &resolved.command;
+        for (size_t i = 0; i < cache->canvas_overlay_region_count; i++) {
+            if ((region_mask & (UINT8_C(1) << i)) == 0) continue;
+            const RenderCanvasOverlayRegion *region =
+                &cache->canvas_overlay_regions[i];
+            int world_top = cache->canvas_overlay_scroll_y + region->top;
+            if (!intersects(command, region->left, world_top,
+                            region->left + region->width,
+                            world_top + region->height)) continue;
+            RasterTarget target = {
+                .pixels = cache->canvas_overlay_pixels
+                    + region->pixel_offset,
+                .alpha = cache->canvas_overlay_alpha
+                    + region->pixel_offset,
+                .stride = region->width,
+                .origin_x = region->left,
+                .origin_y = world_top,
+                .width = region->width,
+                .height = region->height,
+                .left = region->left,
+                .top = world_top,
+                .right = region->left + region->width,
+                .bottom = world_top + region->height,
+                .rounded_clips = resolved.rounded_clips,
+                .rounded_clip_count = resolved.rounded_clip_count
+            };
+            if (resolved.clip_left > target.left) {
+                target.left = resolved.clip_left;
+            }
+            if (resolved.clip_top > target.top) target.top = resolved.clip_top;
+            if (resolved.clip_right < target.right) {
+                target.right = resolved.clip_right;
+            }
+            if (resolved.clip_bottom < target.bottom) {
+                target.bottom = resolved.clip_bottom;
+            }
+            rasterize_command(cache, &target, command);
+        }
+    }
+}
+
+static bool canvas_overlay_build(
+    TileCache *cache, const CanvasFastFrameCandidate *candidate,
+    int scroll_y, int viewport_width, int viewport_height)
+{
+    CanvasOverlayPlan plan;
+    if (!canvas_overlay_plan(cache, candidate, scroll_y, viewport_width,
+                             viewport_height, &plan)) return false;
+    canvas_overlay_cache_clear(cache);
+    if (plan.pixels != 0) {
+        cache->canvas_overlay_pixels = budget_calloc(
+            cache->budget, plan.pixels,
+            sizeof(*cache->canvas_overlay_pixels));
+        cache->canvas_overlay_alpha = budget_calloc(
+            cache->budget, plan.pixels,
+            sizeof(*cache->canvas_overlay_alpha));
+        if (cache->canvas_overlay_pixels == NULL
+            || cache->canvas_overlay_alpha == NULL) {
+            canvas_overlay_cache_clear(cache);
+            return false;
+        }
+    }
+    memcpy(cache->canvas_overlay_regions, plan.regions,
+           plan.count * sizeof(*plan.regions));
+    cache->canvas_overlay_region_count = plan.count;
+    cache->canvas_overlay_pixel_count = plan.pixels;
+    cache->canvas_overlay_scroll_y = scroll_y;
+    cache->canvas_overlay_viewport_width = viewport_width;
+    cache->canvas_overlay_viewport_height = viewport_height;
+    if (plan.count != 0) {
+        uint8_t all = (uint8_t) ((UINT16_C(1) << plan.count) - 1u);
+        canvas_overlay_raster(cache, candidate, all);
+    }
+    cache->canvas_overlay_ready = true;
+    cache->canvas_overlay_builds++;
+    return true;
+}
+
+static bool canvas_overlay_patch(
+    TileCache *cache, const CanvasFastFrameCandidate *candidate,
+    int damage_left, int damage_top, int damage_right, int damage_bottom)
+{
+    CanvasOverlayPlan plan;
+    if (!canvas_overlay_plan(
+            cache, candidate, cache->canvas_overlay_scroll_y,
+            cache->canvas_overlay_viewport_width,
+            cache->canvas_overlay_viewport_height, &plan)
+        || !cache->canvas_overlay_ready
+        || cache->canvas_overlay_region_count != plan.count
+        || cache->canvas_overlay_pixel_count != plan.pixels) return false;
+    for (size_t i = 0; i < plan.count; i++) {
+        const RenderCanvasOverlayRegion *left =
+            &cache->canvas_overlay_regions[i];
+        const RenderCanvasOverlayRegion *right = &plan.regions[i];
+        if (left->left != right->left || left->top != right->top
+            || left->width != right->width
+            || left->height != right->height) return false;
+    }
+    uint8_t affected = 0;
+    int screen_top = damage_top - cache->canvas_overlay_scroll_y;
+    int screen_bottom = damage_bottom - cache->canvas_overlay_scroll_y;
+    for (size_t i = 0; i < cache->canvas_overlay_region_count; i++) {
+        const RenderCanvasOverlayRegion *region =
+            &cache->canvas_overlay_regions[i];
+        if (region->left < damage_right
+            && region->left + (int) region->width > damage_left
+            && region->top < screen_bottom
+            && region->top + (int) region->height > screen_top) {
+            affected |= (uint8_t) (UINT8_C(1) << i);
+        }
+    }
+    if (affected == 0) return true;
+    for (size_t i = 0; i < cache->canvas_overlay_region_count; i++) {
+        if ((affected & (UINT8_C(1) << i)) == 0) continue;
+        const RenderCanvasOverlayRegion *region =
+            &cache->canvas_overlay_regions[i];
+        size_t pixels = (size_t) region->width * region->height;
+        memset(cache->canvas_overlay_pixels + region->pixel_offset, 0,
+               pixels * sizeof(*cache->canvas_overlay_pixels));
+        memset(cache->canvas_overlay_alpha + region->pixel_offset, 0,
+               pixels * sizeof(*cache->canvas_overlay_alpha));
+        cache->canvas_overlay_patch_regions++;
+    }
+    canvas_overlay_raster(cache, candidate, affected);
+    cache->canvas_overlay_patches++;
+    return true;
+}
+
+static void canvas_overlay_blit(TileCache *cache, uint16_t *frame,
+                                int viewport_width, int viewport_height)
+{
+    for (size_t i = 0; i < cache->canvas_overlay_region_count; i++) {
+        const RenderCanvasOverlayRegion *region =
+            &cache->canvas_overlay_regions[i];
+        for (size_t y = 0; y < region->height; y++) {
+            int screen_y = region->top + (int) y;
+            if (screen_y < 0 || screen_y >= viewport_height) continue;
+            for (uint16_t x = 0; x < region->width; x++) {
+                int screen_x = region->left + x;
+                if (screen_x < 0 || screen_x >= viewport_width) continue;
+                size_t source = region->pixel_offset
+                    + y * region->width + x;
+                unsigned alpha = cache->canvas_overlay_alpha[source];
+                if (alpha == 0) continue;
+                size_t destination = (size_t) screen_y * viewport_width
+                    + (size_t) screen_x;
+                if (alpha == 255) {
+                    frame[destination] = cache->canvas_overlay_pixels[source];
+                } else {
+                    uint16_t color = cache->canvas_overlay_pixels[source];
+                    uint32_t rgb =
+                        (tilefinch_rgb5_to_u8(
+                             tilefinch_rgb565_red_code(color)) << 16)
+                        | (tilefinch_rgb6_to_u8(
+                               tilefinch_rgb565_green_code(color)) << 8)
+                        | tilefinch_rgb5_to_u8(
+                            tilefinch_rgb565_blue_code(color));
+                    frame[destination] = blend_rgb565(
+                        frame[destination], rgb, alpha);
+                }
+            }
+        }
+    }
+}
+
+static void rasterize_opaque_canvas_fast(
+    RasterTarget *target, const DrawCommand *command,
+    const ImageResource *image)
+{
+    const unsigned char *source_pixels = image->pixels;
+    size_t source_stride = (size_t) image->width * 4u;
+    const unsigned char *native_pixels = NULL;
+    size_t native_stride = 0u;
+    if (image_resource_native_canvas_source(
+            image, &native_pixels, &native_stride)) {
+        source_pixels = native_pixels;
+        source_stride = native_stride;
+    }
+    int64_t right = (int64_t) command->x + command->width;
+    int64_t bottom = (int64_t) command->y + command->height;
+    int x0 = command->x > target->left ? command->x : target->left;
+    int y0 = command->y > target->top ? command->y : target->top;
+    int x1 = right < target->right ? (int) right : target->right;
+    int y1 = bottom < target->bottom ? (int) bottom : target->bottom;
+    ScaleStepper source_y = scale_stepper(
+        y0 - command->y, image->height, command->height);
+    int previous_source_y = -1;
+    int previous_span_x0 = 0;
+    int previous_span_x1 = 0;
+    size_t previous_destination = 0;
+    for (int y = y0; y < y1; y++) {
+        int span_x0 = 0, span_x1 = 0;
+        size_t destination = 0;
+        bool rounded = false;
+        if (!raster_target_span(target, y, x0, x1,
+                                &span_x0, &span_x1,
+                                &destination, &rounded)) {
+            scale_stepper_advance(&source_y);
+            continue;
+        }
+        size_t span_pixels = (size_t) (span_x1 - span_x0);
+        if (source_y.value == previous_source_y
+            && span_x0 == previous_span_x0
+            && span_x1 == previous_span_x1) {
+            memcpy(target->pixels + destination,
+                   target->pixels + previous_destination,
+                   span_pixels * sizeof(*target->pixels));
+            previous_destination = destination;
+            scale_stepper_advance(&source_y);
+            continue;
+        }
+        ScaleStepper source_x = scale_stepper(
+            span_x0 - command->x, image->width, command->width);
+        const unsigned char *source_row = source_pixels
+            + (size_t) source_y.value * source_stride;
+        /* A 320-wide drawing buffer scaled across the PSP's 480 columns is
+           the common game path.  Its exact nearest-neighbour mapping repeats
+           each even source pixel twice and each odd source pixel once.  Use
+           that fixed rational kernel instead of advancing and branching a
+           ScaleStepper for every destination pixel.  Other ratios and clips
+           retain the general pixel-identical path below. */
+        if (span_x0 == command->x
+            && span_x1 - span_x0 == command->width
+            && image->width > 0
+            && image->width % 2 == 0
+            && image->width % 4 == 0
+            && command->width > 0 && command->width % 3 == 0
+            && command->width / 3 * 2 == image->width
+            && ((uintptr_t) (const void *) source_row % 4u) == 0u
+            && ((uintptr_t) (void *)
+                    (target->pixels + destination) % 4u) == 0u) {
+            canvas_fast_scale_row_3_to_2(
+                target->pixels + destination, source_row, image->width);
+            previous_source_y = source_y.value;
+            previous_span_x0 = span_x0;
+            previous_span_x1 = span_x1;
+            previous_destination = destination;
+            scale_stepper_advance(&source_y);
+            continue;
+        }
+        int previous_source_x = -1;
+        uint16_t converted = 0;
+        for (int x = span_x0; x < span_x1; x++, destination++) {
+            if (source_x.value != previous_source_x) {
+                const unsigned char *pixel = source_row
+                    + (size_t) source_x.value * 4u;
+                converted = (uint16_t) (
+                    ((uint16_t) (pixel[0] & 0xf8u) << 8)
+                    | ((uint16_t) (pixel[1] & 0xfcu) << 3)
+                    | ((uint16_t) pixel[2] >> 3));
+                previous_source_x = source_x.value;
+            }
+            target->pixels[destination] = converted;
+            scale_stepper_advance(&source_x);
+        }
+        previous_source_y = source_y.value;
+        previous_span_x0 = span_x0;
+        previous_span_x1 = span_x1;
+        previous_destination = destination - span_pixels;
+        scale_stepper_advance(&source_y);
+    }
+}
+
+bool tile_cache_canvas_frame_fast_eligible(
+    const TileCache *cache, int scroll_y,
+    int viewport_width, int viewport_height)
+{
+    if (cache == NULL || cache->source_layout == NULL
+        || cache->layout == NULL) return false;
+    scroll_y = viewport_css_to_device(&cache->source_layout->viewport,
+                                      scroll_y);
+    int maximum_scroll = cache->layout->height - viewport_height;
+    if (maximum_scroll < 0) maximum_scroll = 0;
+    if (scroll_y > maximum_scroll) scroll_y = maximum_scroll;
+    CanvasFastFrameCandidate candidate;
+    return canvas_fast_frame_candidate(
+        cache, scroll_y, viewport_width, viewport_height, &candidate);
+}
+
+RenderCanvasFrameResult tile_cache_render_canvas_frame_fast(
+    TileCache *cache, int scroll_y, int viewport_width, int viewport_height)
+{
+    if (cache == NULL || cache->source_layout == NULL) {
+        return RENDER_CANVAS_FRAME_FAILED;
+    }
+    scroll_y = viewport_css_to_device(&cache->source_layout->viewport,
+                                      scroll_y);
+    int maximum_scroll = cache->layout->height - viewport_height;
+    if (maximum_scroll < 0) maximum_scroll = 0;
+    if (scroll_y > maximum_scroll) scroll_y = maximum_scroll;
+    CanvasFastFrameCandidate candidate;
+    bool canvas_pending = cache->canvas_paint_pending;
+    if (!canvas_fast_frame_candidate(
+            cache, scroll_y, viewport_width, viewport_height, &candidate)) {
+        if (canvas_pending) cache->canvas_fast_refusals++;
+        return RENDER_CANVAS_FRAME_NOT_APPLICABLE;
+    }
+
+    uint64_t started = render_now_us();
+    RasterTarget target = {
+        .pixels = cache->frame,
+        .stride = (size_t) viewport_width,
+        .origin_x = 0,
+        .origin_y = scroll_y,
+        .width = viewport_width,
+        .height = viewport_height,
+        .left = candidate.clip_left,
+        .top = candidate.clip_top,
+        .right = candidate.clip_right,
+        .bottom = candidate.clip_bottom
+    };
+    rasterize_opaque_canvas_fast(
+        &target, &candidate.command, candidate.image);
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+    uint64_t rastered = render_now_us();
+#endif
+    bool overlay_cached = cache->canvas_overlay_ready
+        && cache->canvas_overlay_scroll_y == scroll_y
+        && cache->canvas_overlay_viewport_width == viewport_width
+        && cache->canvas_overlay_viewport_height == viewport_height;
+    if (!overlay_cached) {
+        overlay_cached = canvas_overlay_build(
+            cache, &candidate, scroll_y, viewport_width, viewport_height);
+    }
+    if (overlay_cached) {
+        canvas_overlay_blit(cache, cache->frame,
+                            viewport_width, viewport_height);
+    } else {
+        target.left = 0;
+        target.top = scroll_y;
+        target.right = viewport_width;
+        target.bottom = scroll_y + viewport_height;
+        for (size_t order = candidate.paint_order + 1u;
+             order < cache->layout->count; order++) {
+            size_t index = cache->layout->paint_order[order];
+            uint8_t flags = cache->layout->command_flags == NULL
+                ? 0 : cache->layout->command_flags[index];
+            if ((flags & LAYOUT_COMMAND_FIXED) != 0) continue;
+            if ((flags & LAYOUT_COMMAND_OVERFLOW) != 0
+                || (cache->layout->command_flags == NULL
+                    && command_in_overflow(cache->layout, index))) {
+                paint_overflow_command(cache, cache->frame, index, scroll_y,
+                                       viewport_width, viewport_height);
+                continue;
+            }
+            if ((flags & LAYOUT_COMMAND_LATE_POSITIONED) != 0) {
+                paint_overlay_command(
+                    cache, cache->frame, &cache->layout->commands[index],
+                    scroll_y, viewport_width, viewport_height);
+                continue;
+            }
+            if (flags != 0) continue;
+            cache->command_candidates++;
+            rasterize_command(
+                cache, &target, &cache->layout->commands[index]);
+        }
+    }
+    paint_sticky_overlays(cache, cache->frame, scroll_y,
+                          viewport_width, viewport_height);
+    if (cache->layout->fixed_count != 0) {
+        if (build_fixed_cache(cache, viewport_width, viewport_height)) {
+            paint_cached_fixed_overlays(cache, cache->frame,
+                                        viewport_width, viewport_height);
+            paint_fixed_overlays(cache, cache->frame, scroll_y,
+                                 viewport_width, viewport_height, true);
+        } else {
+            paint_fixed_overlays(cache, cache->frame, scroll_y,
+                                 viewport_width, viewport_height, false);
+        }
+    }
+    paint_scroll_indicator(cache, cache->frame, scroll_y,
+                           viewport_width, viewport_height);
+    cache->last_frame_scroll_y = scroll_y;
+    cache->last_frame_scroll_valid = true;
+    cache->canvas_paint_pending = false;
+    memset(&cache->frame_work, 0, sizeof(cache->frame_work));
+    uint64_t elapsed = render_now_us() - started;
+    cache->canvas_fast_frames++;
+    cache->canvas_fast_us += elapsed;
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+    cache->canvas_fast_raster_us += rastered - started;
+    cache->canvas_fast_overlay_us += elapsed - (rastered - started);
+#endif
+    if (elapsed > cache->canvas_fast_max_us) {
+        cache->canvas_fast_max_us = elapsed;
+    }
+    cache->frame_us += elapsed;
+    if (elapsed > cache->max_frame_us) cache->max_frame_us = elapsed;
+    cache->frames_rendered++;
+    return RENDER_CANVAS_FRAME_COMPLETE;
 }
 
 static void copy_tile_to_frame(const RenderTile *tile, uint16_t *frame,
@@ -1637,9 +2452,11 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
         if (build_fixed_cache(cache, viewport_width, viewport_height)) {
             paint_cached_fixed_overlays(cache, frame, viewport_width,
                                         viewport_height);
+            paint_fixed_overlays(cache, frame, scroll_y, viewport_width,
+                                 viewport_height, true);
         } else {
             paint_fixed_overlays(cache, frame, scroll_y, viewport_width,
-                                 viewport_height);
+                                 viewport_height, false);
         }
     }
     phase_finished = render_now_us();
@@ -2308,6 +3125,63 @@ bool tile_cache_sync_layout_paint(TileCache *cache, int left, int top,
     tile_cache_invalidate_rect(
         cache, visual_left, visual_top, visual_right, visual_bottom);
     cache->canvas_paint_pending = true;
+    if (cache->canvas_overlay_ready) {
+        CanvasFastFrameCandidate candidate;
+        if (!canvas_fast_frame_candidate_impl(
+                cache, cache->canvas_overlay_scroll_y,
+                cache->canvas_overlay_viewport_width,
+                cache->canvas_overlay_viewport_height, false, &candidate)
+            || !canvas_overlay_patch(
+                cache, &candidate, visual_left, visual_top,
+                visual_right, visual_bottom)) {
+            canvas_overlay_cache_clear(cache);
+        }
+    }
+    return true;
+}
+
+bool tile_cache_sync_canvas_paint(TileCache *cache, int left, int top,
+                                  int right, int bottom)
+{
+    if (cache == NULL || cache->source_layout == NULL || cache->layout == NULL
+        || cache->source_layout->count != cache->layout->count) return false;
+    int visual_left = viewport_css_to_device(
+        &cache->source_layout->viewport, left);
+    int visual_top = viewport_css_to_device(
+        &cache->source_layout->viewport, top);
+    int visual_right = viewport_css_to_device(
+        &cache->source_layout->viewport, right) + 1;
+    int visual_bottom = viewport_css_to_device(
+        &cache->source_layout->viewport, bottom) + 1;
+    /* Overflow geometry and ordinary fixed overlays depend on layout, not on
+       mutable canvas pixels. A backdrop-filter is the exception because its
+       retained pixels sample the page underneath. */
+    bool retained_overlay_samples_canvas =
+        layout_has_css_backdrop_filter(cache->layout);
+    for (size_t range = 0;
+         !retained_overlay_samples_canvas
+             && range < cache->layout->fixed_count;
+         range++) {
+        const FixedRange *fixed = &cache->layout->fixed_ranges[range];
+        size_t end = fixed->command_end < cache->layout->count
+            ? fixed->command_end : cache->layout->count;
+        for (size_t i = fixed->command_start; i < end; i++) {
+            const DrawCommand *command = &cache->layout->commands[i];
+            if (command->type == DRAW_IMAGE && command->image != NULL
+                && command->image->is_canvas) {
+                retained_overlay_samples_canvas = true;
+                break;
+            }
+        }
+    }
+    if (retained_overlay_samples_canvas) {
+        cache->fixed_ready = false;
+        cache->fixed_backdrop = false;
+        cache->fixed_backdrop_masked = false;
+    }
+    tile_cache_invalidate_rect(
+        cache, visual_left, visual_top, visual_right, visual_bottom);
+    cache->canvas_paint_pending = true;
     return true;
 }
 
@@ -2359,6 +3233,7 @@ size_t tile_cache_reclaim_optional(TileCache *cache)
      */
     tile_cache_cancel_idle_work(cache);
     tile_cache_clear_layout_transients(cache);
+    canvas_overlay_cache_clear(cache);
     glyph_cache_clear(cache, true);
     overflow_cache_destroy(cache);
     cache->overflow_cache_disabled = false;
@@ -2421,11 +3296,29 @@ bool tile_cache_replace_layout(TileCache *cache,
         return false;
     }
     tile_cache_commit_layout(cache, layout, &visual);
+    canvas_overlay_cache_clear(cache);
     for (size_t i = 0; i < cache->tile_capacity; i++) {
         cache->tiles[i].valid = false;
     }
     cache->invalidations++;
     return true;
+}
+
+static bool canvas_fast_same_surface(
+    const CanvasFastFrameCandidate *left,
+    const CanvasFastFrameCandidate *right)
+{
+    return left->image == right->image
+        && left->command.x == right->command.x
+        && left->command.y == right->command.y
+        && left->command.width == right->command.width
+        && left->command.height == right->command.height
+        && left->command.image_fit == right->command.image_fit
+        && left->command.opacity_scale == right->command.opacity_scale
+        && left->clip_left == right->clip_left
+        && left->clip_top == right->clip_top
+        && left->clip_right == right->clip_right
+        && left->clip_bottom == right->clip_bottom;
 }
 
 bool tile_cache_replace_layout_damage(TileCache *cache,
@@ -2434,6 +3327,17 @@ bool tile_cache_replace_layout_damage(TileCache *cache,
                                       int right, int bottom)
 {
     if (cache == NULL || layout == NULL) return false;
+    bool preserve_canvas_overlay = cache->canvas_overlay_ready
+        && cache->last_frame_scroll_valid
+        && cache->canvas_overlay_scroll_y == cache->last_frame_scroll_y;
+    CanvasFastFrameCandidate old_canvas;
+    if (preserve_canvas_overlay
+        && !canvas_fast_frame_candidate_impl(
+            cache, cache->canvas_overlay_scroll_y,
+            cache->canvas_overlay_viewport_width,
+            cache->canvas_overlay_viewport_height, false, &old_canvas)) {
+        preserve_canvas_overlay = false;
+    }
     LayoutDocument visual = {0};
     if (!tile_cache_stage_layout(cache, layout, &visual)) {
         return false;
@@ -2446,9 +3350,33 @@ bool tile_cache_replace_layout_damage(TileCache *cache,
         visual_bottom = viewport_css_to_device(&layout->viewport, bottom) + 1;
     }
     tile_cache_commit_layout(cache, layout, &visual);
+    if (preserve_canvas_overlay) {
+        cache->last_frame_scroll_y = cache->canvas_overlay_scroll_y;
+        cache->last_frame_scroll_valid = true;
+        CanvasFastFrameCandidate new_canvas;
+        if (!canvas_fast_frame_candidate_impl(
+                cache, cache->canvas_overlay_scroll_y,
+                cache->canvas_overlay_viewport_width,
+                cache->canvas_overlay_viewport_height, false, &new_canvas)
+            || !canvas_fast_same_surface(&old_canvas, &new_canvas)
+            || !canvas_overlay_patch(
+                cache, &new_canvas, visual_left, visual_top,
+                visual_right, visual_bottom)) {
+            canvas_overlay_cache_clear(cache);
+            cache->last_frame_scroll_valid = false;
+        } else {
+            cache->canvas_paint_pending = true;
+        }
+    } else {
+        canvas_overlay_cache_clear(cache);
+    }
     if (right > left && bottom > top) {
         tile_cache_invalidate_rect(cache, visual_left, visual_top,
                                    visual_right, visual_bottom);
+    }
+    if (preserve_canvas_overlay && cache->canvas_overlay_ready
+        && cache->last_frame_scroll_valid) {
+        cache->canvas_paint_pending = true;
     }
     return true;
 }

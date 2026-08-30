@@ -13,6 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __PSP__
+#include <pspiofilemgr.h>
+#endif
+
 /* The name tables below use switches without a default so that adding a
    PspUiAction, PspUiSettingId, or PspUiScreen is a -Wswitch warning here
    rather than an "unknown" in a golden nobody reads twice. */
@@ -35,6 +39,7 @@ const char *psp_input_script_action_name(PspUiAction action)
         case PSP_UI_ACTION_FORWARD: return "forward";
         case PSP_UI_ACTION_RELOAD: return "reload";
         case PSP_UI_ACTION_TOGGLE_READER: return "toggle-reader";
+        case PSP_UI_ACTION_TOGGLE_BASIC: return "toggle-basic";
         case PSP_UI_ACTION_TOGGLE_READER_SITE: return "toggle-reader-site";
         case PSP_UI_ACTION_PAGE_UP: return "page-up";
         case PSP_UI_ACTION_PAGE_DOWN: return "page-down";
@@ -493,6 +498,33 @@ bool psp_input_script_load(
 {
     if (script != NULL) psp_input_script_reset(script);
     if (script == NULL || path == NULL) return false;
+#ifdef __PSP__
+    /* HostFS may return a short first read even for a small regular file.
+       Size first, then use the same exact native-read loop as the trust-bundle
+       startup probe. This also distinguishes an empty file from a transient
+       short read without involving newlib's unreliable host0: adapter. */
+    SceIoStat file_stat;
+    memset(&file_stat, 0, sizeof(file_stat));
+    if (sceIoGetstat(path, &file_stat) < 0 || file_stat.st_size <= 0) {
+        if (warning != NULL) warning(warning_context, path, 0, "not found");
+        return false;
+    }
+    char text[8192];
+    bool overflowed = (uint64_t) file_stat.st_size >= sizeof(text);
+    size_t expected = overflowed ? 0u : (size_t) file_stat.st_size;
+    SceUID file = overflowed ? -1 : sceIoOpen(path, PSP_O_RDONLY, 0);
+    bool read_failed = !overflowed && file < 0;
+    size_t read = 0;
+    while (!read_failed && read < expected) {
+        int result = sceIoRead(file, text + read, expected - read);
+        if (result <= 0) {
+            read_failed = true;
+            break;
+        }
+        read += (size_t) result;
+    }
+    if (file >= 0 && sceIoClose(file) < 0) read_failed = true;
+#else
     FILE *file = fopen(path, "rb");
     if (file == NULL) {
         if (warning != NULL) warning(warning_context, path, 0, "not found");
@@ -510,6 +542,7 @@ bool psp_input_script_load(
         else if (ferror(file) != 0) read_failed = true;
     }
     (void) fclose(file);
+#endif
     if (read_failed || overflowed) {
         if (warning != NULL)
             warning(warning_context, path, 0,

@@ -14,6 +14,8 @@ void script_runtime_detach_document(ScriptRuntime *runtime,
             runtime, SCRIPT_HOST_DETACH_NETWORK, 0, NULL, NULL);
         (void) script_runtime_cancel_network(runtime, "document detached");
         js_rt_event_sources_destroy(bridge);
+        js_rt_websockets_destroy(bridge);
+        js_rt_multiplayer_destroy(bridge);
     }
 
     bool preserve_foreign_source_scope = false;
@@ -228,6 +230,12 @@ size_t script_runtime_heap_remaining(const ScriptRuntime *runtime)
     return current < limit ? limit - current : 0;
 }
 
+size_t script_runtime_heap_rejections(const ScriptRuntime *runtime)
+{
+    return runtime == NULL
+        ? 0 : budget_quickjs_pool_rejection_count(runtime->quickjs_pool);
+}
+
 bool script_runtime_last_slice_interrupted(const ScriptRuntime *runtime)
 {
     return runtime != NULL && runtime->result.interrupted;
@@ -276,8 +284,6 @@ bool script_runtime_commit_same_document(ScriptRuntime *runtime,
                                          ScriptResult *result)
 {
     if (runtime == NULL || url == NULL || old_url == NULL) return false;
-    char previous_url[TILEFINCH_URL_SERIALIZED_LIMIT];
-    snprintf(previous_url, sizeof(previous_url), "%s", runtime->document_url);
     if (!bridge_set_document_url(&runtime->bridge, url)) return false;
     JSValue arguments[2] = {
         JS_NewString(runtime->context, url),
@@ -289,10 +295,9 @@ bool script_runtime_commit_same_document(ScriptRuntime *runtime,
                         arguments, NULL);
     JS_FreeValue(runtime->context, arguments[1]);
     JS_FreeValue(runtime->context, arguments[0]);
-    if (!committed) {
-        memcpy(runtime->document_url, previous_url, strlen(previous_url) + 1);
-        runtime->bridge.document_base_dirty = true;
-    }
+    /* Native history is authoritative and has already committed. A throwing
+       hashchange listener may fail the advisory callback, but rolling only
+       the bridge URL back would split location/baseURI from native history. */
     if (!committed && runtime->result.error[0] == '\0') {
         js_rt_record_exception(runtime->context, &runtime->result);
     }
@@ -306,8 +311,6 @@ bool script_runtime_restore_same_document(ScriptRuntime *runtime,
                                           ScriptResult *result)
 {
     if (runtime == NULL || url == NULL || old_url == NULL) return false;
-    char previous_url[TILEFINCH_URL_SERIALIZED_LIMIT];
-    snprintf(previous_url, sizeof(previous_url), "%s", runtime->document_url);
     if (!bridge_set_document_url(&runtime->bridge, url)) return false;
     JSValue arguments[2] = {
         JS_NewString(runtime->context, url),
@@ -319,10 +322,9 @@ bool script_runtime_restore_same_document(ScriptRuntime *runtime,
                         arguments, NULL);
     JS_FreeValue(runtime->context, arguments[1]);
     JS_FreeValue(runtime->context, arguments[0]);
-    if (!restored) {
-        memcpy(runtime->document_url, previous_url, strlen(previous_url) + 1);
-        runtime->bridge.document_base_dirty = true;
-    }
+    /* popstate/hashchange delivery is likewise advisory after native history
+       restoration. Keep the bridge at the restored URL even when a handler
+       throws so all URL and base views remain coherent. */
     if (!restored && runtime->result.error[0] == '\0')
         js_rt_record_exception(runtime->context, &runtime->result);
     js_rt_runtime_update_result(runtime, result);

@@ -3,6 +3,7 @@
 #include "tilefinch/psp_offline_store.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -17,6 +18,16 @@
         return 1; \
     } \
 } while (0)
+
+static uint32_t test_offline_hash(const unsigned char *data, size_t length)
+{
+    uint32_t hash = UINT32_C(2166136261);
+    for (size_t index = 0; index < length; index++) {
+        hash ^= data[index];
+        hash *= UINT32_C(16777619);
+    }
+    return hash;
+}
 
 int main(void)
 {
@@ -277,6 +288,51 @@ int main(void)
         &app_session, "https://example.test/game.css", css,
         sizeof(css) - 1u, "", "", "text/css",
         "public,max-age=3600", "", 1u));
+    static const unsigned char game_script[] =
+        "globalThis.offlineGameReady=true";
+    static const unsigned char compiled_game_script[] = {
+        0x54, 0x46, 0x51, 0x4a, 0x53, 0x01
+    };
+    CHECK(browser_session_cache_put_http(
+              &app_session, "https://example.test/game.js", game_script,
+              sizeof(game_script) - 1u, "", "", "text/javascript",
+              "public,max-age=3600", "", 1u)
+          && browser_session_classic_script_bytecode_put(
+              &app_session, "https://example.test/game.js", game_script,
+              sizeof(game_script) - 1u, compiled_game_script,
+              sizeof(compiled_game_script)));
+    static const unsigned char install_compiled_script[] =
+        "globalThis.installCompiled=true";
+    unsigned char *install_script_data = budget_malloc(
+        &budget, sizeof(install_compiled_script) - 1u);
+    CHECK(install_script_data != NULL);
+    memcpy(install_script_data, install_compiled_script,
+           sizeof(install_compiled_script) - 1u);
+    BrowserSharedBody *install_script_body = browser_shared_body_take(
+        &budget, install_script_data, sizeof(install_compiled_script) - 1u);
+    TilefinchRequestContext install_script_context = {
+        .target_url = "https://example.test/install-compiled.js",
+        .initiator_url = "https://example.test/game",
+        .top_level_url = "https://example.test/game",
+        .method = "GET", .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_SCRIPT
+    };
+    TilefinchResourceGrant install_script_grant = {
+        .destination = TILEFINCH_DESTINATION_SCRIPT,
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .corp = TILEFINCH_CORP_UNSPECIFIED,
+        .final_same_origin = true, .final_same_site = true,
+        .mime_validated = true
+    };
+    CHECK(install_script_body != NULL
+          && browser_session_cache_put_http_shared_classic_script(
+              &app_session, install_script_context.target_url,
+              install_script_body, "", "", "text/javascript",
+              "public,max-age=3600", "", 1u, &install_script_context,
+              &install_script_grant));
+    browser_shared_body_release(install_script_body);
     static const unsigned char icon[OFFLINE_LIBRARY_APP_ICON_LIMIT] = {
         0x20, 0x40, 0x80, 0xff
     };
@@ -286,7 +342,7 @@ int main(void)
               "https://example.test/game", &manifest,
               icon, sizeof(icon), &app_preview, error, sizeof(error))
           && app_preview.operation == OFFLINE_WEB_APP_INSTALL
-          && app_preview.resource_count == 1u
+          && app_preview.resource_count == 3u
           && app_preview.estimated_bytes > sizeof(css));
     uint32_t app_id = 0;
     CHECK(offline_library_save_web_app(
@@ -328,17 +384,104 @@ int main(void)
               &loaded, app_id, restored_icon)
           && memcmp(restored_icon, icon, sizeof(icon)) == 0);
     browser_session_cache_clear(&app_session);
+    /* Installed apps larger than the ordinary live-cache preference remain
+       launchable. Integrity checks are unchanged; only bounded admission is
+       raised to the package's complete working set. */
+    const OfflineLibraryItem *installed_app = offline_library_find(
+        &loaded, app_id);
+    CHECK(installed_app != NULL && installed_app->audio_bytes > 1u
+          && browser_session_cache_set_maximum_bytes(
+                 &app_session, (size_t) installed_app->audio_bytes - 1u));
     html = NULL;
     html_length = 0;
     CHECK(offline_library_read_web_app(
               &loaded, &budget, &app_session, app_id,
               &html, &html_length, error, sizeof(error))
           && strstr(html, "Heading") != NULL);
+    /* A first-paint stylesheet artifact must not evict a deferred main game
+       script from an otherwise package-sized cache. */
+    TilefinchRequestContext css_context = {
+        .target_url = "https://example.test/game.css",
+        .initiator_url = "https://example.test/game",
+        .top_level_url = "https://example.test/game",
+        .method = "GET", .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_STYLE
+    };
+    size_t startup_artifact_length = 64u * 1024u;
+    unsigned char *startup_artifact = budget_malloc(
+        &budget, startup_artifact_length);
+    CHECK(startup_artifact != NULL);
+    memset(startup_artifact, 0x5a, startup_artifact_length);
+    CHECK(browser_session_stylesheet_fragment_put_take(
+        &app_session, css_context.target_url, &css_context,
+        css, sizeof(css) - 1u, startup_artifact,
+        startup_artifact_length));
     const BrowserCacheEntry *restored = NULL;
     CHECK(browser_session_cache_match_http(
               &app_session, "https://example.test/game.css",
               UINT64_C(2), &restored) == BROWSER_CACHE_FRESH
           && restored != NULL && restored->length == sizeof(css) - 1u);
+    BrowserSharedBody *restored_bytecode =
+        browser_session_classic_script_bytecode_acquire(
+            &app_session, "https://example.test/game.js", game_script,
+            sizeof(game_script) - 1u);
+    CHECK(restored_bytecode != NULL
+          && restored_bytecode->length == sizeof(compiled_game_script)
+          && memcmp(restored_bytecode->data, compiled_game_script,
+                    sizeof(compiled_game_script)) == 0
+          && browser_session_classic_script_bytecode_acquire(
+                 &app_session, "https://example.test/game.js",
+                 (const unsigned char *) "different", 9u) == NULL);
+    browser_shared_body_release(restored_bytecode);
+    BrowserSharedBody *install_bytecode =
+        browser_session_classic_script_bytecode_acquire(
+            &app_session, install_script_context.target_url,
+            install_compiled_script, sizeof(install_compiled_script) - 1u);
+    CHECK(install_bytecode != NULL && install_bytecode->length != 0);
+    browser_shared_body_release(install_bytecode);
+    budget_free(&budget, html);
+
+    /* A compiler-ABI change discards only the accelerator. The source body
+       must still restore so an updated Tilefinch can recompile normally. */
+    OfflineLibraryItem *mutable_app = offline_library_find_mutable(
+        &loaded, app_id);
+    char app_pack_path[OFFLINE_LIBRARY_DIRECTORY_LIMIT + 40u];
+    CHECK(mutable_app != NULL && mutable_app->audio_bytes >= 32u
+          && offline_library_item_path(
+              &loaded, app_id, ".app.pack", app_pack_path,
+              sizeof(app_pack_path)));
+    size_t app_pack_length = (size_t) mutable_app->audio_bytes;
+    unsigned char *app_pack = malloc(app_pack_length);
+    FILE *app_pack_file = fopen(app_pack_path, "rb");
+    CHECK(app_pack != NULL && app_pack_file != NULL
+          && fread(app_pack, 1, app_pack_length, app_pack_file)
+                 == app_pack_length
+          && fclose(app_pack_file) == 0
+          && app_pack[8] == 2u
+          && (app_pack[24] != 0 || app_pack[25] != 0
+              || app_pack[26] != 0 || app_pack[27] != 0));
+    memset(app_pack + 28u, 0, 4u);
+    app_pack_file = fopen(app_pack_path, "wb");
+    CHECK(app_pack_file != NULL
+          && fwrite(app_pack, 1, app_pack_length, app_pack_file)
+                 == app_pack_length
+          && fflush(app_pack_file) == 0
+          && fclose(app_pack_file) == 0);
+    mutable_app->auxiliary_hash = test_offline_hash(
+        app_pack, app_pack_length);
+    free(app_pack);
+    browser_session_cache_clear(&app_session);
+    html = NULL;
+    html_length = 0;
+    CHECK(offline_library_read_web_app(
+              &loaded, &budget, &app_session, app_id,
+              &html, &html_length, error, sizeof(error))
+          && strstr(html, "Heading") != NULL
+          && browser_session_classic_script_bytecode_acquire(
+                 &app_session, install_script_context.target_url,
+                 install_compiled_script,
+                 sizeof(install_compiled_script) - 1u) == NULL);
     budget_free(&budget, html);
     browser_session_destroy(&app_session);
     listing = NULL;

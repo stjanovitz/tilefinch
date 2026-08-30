@@ -269,10 +269,19 @@ static bool curl_global_acquire(Budget *budget)
 
 static bool curl_easy_attach_shared_state(CURL *easy)
 {
-    return easy != NULL
-        && (curl_shared_state == NULL
-            || curl_easy_setopt(
-                   easy, CURLOPT_SHARE, curl_shared_state) == CURLE_OK);
+    if (easy == NULL) return false;
+#if defined(__PSP__)
+    /* The PSP network ABI is IPv4-only. Letting libcurl attempt an AAAA
+       address asks sceNetInetInetPton() for AF_INET6, which real firmware
+       cannot service and PPSSPP rejects before the IPv4 candidate is tried.
+       Keep this at the shared easy-handle boundary so document requests,
+       resources, media, preconnects, and WebSockets cannot diverge. */
+    if (curl_easy_setopt(easy, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4)
+        != CURLE_OK) return false;
+#endif
+    return curl_shared_state == NULL
+        || curl_easy_setopt(
+               easy, CURLOPT_SHARE, curl_shared_state) == CURLE_OK;
 }
 
 static bool curl_global_release(void)

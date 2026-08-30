@@ -1,4 +1,5 @@
 #include "tilefinch/session.h"
+#include "tilefinch/content_security_policy.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/url.h"
 
@@ -1288,6 +1289,231 @@ static int test_site_data_inspection_and_clear(Budget *budget)
     return 0;
 }
 
+static int test_websocket_policy_and_close_payload(Budget *budget)
+{
+    size_t baseline = budget->current;
+    BrowserSession session;
+    CHECK(browser_session_init(&session, budget, 32u * 1024u));
+    static const char csp_headers[] =
+        "content-security-policy: connect-src https://socket.test\n";
+    TilefinchContentSecurityPolicy csp;
+    CHECK(tilefinch_csp_parse_response_headers(
+        &csp, "https://page.test/", csp_headers,
+        sizeof(csp_headers) - 1u, false));
+
+    TilefinchRequestContext context = {
+        .target_url = "https://socket.test/chat",
+        .initiator_url = "https://page.test/game",
+        .top_level_url = "https://page.test/",
+        .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_FETCH
+    };
+    FetchPreparedPageRequest prepared;
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, NULL, &session, &csp, NULL,
+        NULL, &prepared, NULL));
+    const FetchRequest *request = fetch_prepared_page_request(&prepared);
+    char admitted[TILEFINCH_URL_SERIALIZED_LIMIT];
+    bool protect_private = false;
+    CHECK(request != NULL && !request->block_private_network
+          && fetch_websocket_prepare_admission(
+              "wss://SOCKET.test:443/chat", request,
+              admitted, &protect_private)
+          && strcmp(admitted, "wss://socket.test/chat") == 0
+          && protect_private);
+    /* The independently supplied wire URL cannot escape its prepared target,
+       even through an equivalent-looking alternate host or a fragment. */
+    CHECK(!fetch_websocket_prepare_admission(
+              "wss://other.test/chat", request,
+              admitted, &protect_private)
+          && !fetch_websocket_prepare_admission(
+              "wss://socket.test/chat#secret", request,
+              admitted, &protect_private));
+
+    context.target_url = "https://blocked.test/chat";
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, NULL, &session, &csp, NULL,
+        NULL, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    CHECK(request != NULL
+          && !fetch_websocket_prepare_admission(
+              "wss://blocked.test/chat", request,
+              admitted, &protect_private));
+
+    /* HTTPS documents may not open plaintext sockets unless the existing
+       explicit per-site compatibility control grants that same target. */
+    context.target_url = "http://socket.test/chat";
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, NULL, &session, NULL, NULL,
+        NULL, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    CHECK(request != NULL
+          && !fetch_websocket_prepare_admission(
+              "ws://socket.test/chat", request,
+              admitted, &protect_private)
+          && browser_session_set_mixed_content_site_allowed(
+              &session, context.top_level_url, true)
+          && fetch_websocket_prepare_admission(
+              "ws://socket.test/chat", request,
+              admitted, &protect_private)
+          && strcmp(admitted, "ws://socket.test/chat") == 0
+          && protect_private
+          && browser_session_set_mixed_content_site_allowed(
+              &session, context.top_level_url, false));
+
+    /* Public pages always install the resolved-peer PNA guard. Local pages
+       retain the intended LAN game/appliance workflow. */
+    context = (TilefinchRequestContext) {
+        .target_url = "http://127.0.0.1:9000/chat",
+        .initiator_url = "http://public.test/game",
+        .top_level_url = "http://public.test/",
+        .method = "GET", .mode = TILEFINCH_REQUEST_MODE_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_FETCH
+    };
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, NULL, &session, NULL, NULL,
+        NULL, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    CHECK(request != NULL
+          && fetch_websocket_prepare_admission(
+              "ws://127.0.0.1:9000/chat", request,
+              admitted, &protect_private)
+          && protect_private);
+    context.target_url = "http://192.168.1.3:9000/chat";
+    context.initiator_url = "http://192.168.1.2/game";
+    context.top_level_url = "http://192.168.1.2/";
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, NULL, &session, NULL, NULL,
+        NULL, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    CHECK(request != NULL
+          && fetch_websocket_prepare_admission(
+              "ws://192.168.1.3:9000/chat", request,
+              admitted, &protect_private)
+          && !protect_private);
+
+    /* HSTS transforms both policy and wire representations atomically. */
+    static const char hsts[] =
+        "strict-transport-security: max-age=3600\n";
+    CHECK(browser_session_hsts_observe(
+        &session, "https://socket.test/", hsts, sizeof(hsts) - 1u));
+    context.target_url = "http://socket.test/chat";
+    context.initiator_url = "http://page.test/game";
+    context.top_level_url = "http://page.test/";
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, NULL, &session, NULL, NULL,
+        NULL, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    CHECK(request != NULL
+          && fetch_websocket_prepare_admission(
+              "ws://socket.test/chat", request,
+              admitted, &protect_private)
+          && strcmp(admitted, "wss://socket.test/chat") == 0);
+
+    /* Portal isolation admits only the bounded origin chain recorded by the
+       sign-in session; an arbitrary public socket never reaches the worker. */
+    CHECK(browser_session_captive_portal_begin(
+        &session, "http://192.168.4.1/login"));
+    context = (TilefinchRequestContext) {
+        .target_url = "http://192.168.4.1/socket",
+        .initiator_url = "http://192.168.4.1/login",
+        .top_level_url = "http://192.168.4.1/login",
+        .method = "GET", .mode = TILEFINCH_REQUEST_MODE_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
+        .destination = TILEFINCH_DESTINATION_FETCH
+    };
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, NULL, &session, NULL, NULL,
+        NULL, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    CHECK(request != NULL
+          && fetch_websocket_prepare_admission(
+              "ws://192.168.4.1/socket", request,
+              admitted, &protect_private)
+          && !protect_private);
+    context.target_url = "https://outside.test/socket";
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, NULL, &session, NULL, NULL,
+        NULL, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    CHECK(request != NULL
+          && !fetch_websocket_prepare_admission(
+              "wss://outside.test/socket", request,
+              admitted, &protect_private));
+    browser_session_captive_portal_end(&session);
+
+    static const unsigned char valid_text[] = {
+        'A', 0xe2u, 0x82u, 0xacu, 0xf0u, 0x9fu, 0x92u, 0xa9u
+    };
+    static const unsigned char overlong_text[] = {0xc0u, 0xafu};
+    static const unsigned char surrogate_text[] = {0xedu, 0xa0u, 0x80u};
+    static const unsigned char truncated_text[] = {0xe2u, 0x82u};
+    static const unsigned char excessive_text[] = {0xf4u, 0x90u, 0x80u, 0x80u};
+    CHECK(fetch_websocket_text_payload_valid(NULL, 0u)
+          && fetch_websocket_text_payload_valid(
+              valid_text, sizeof(valid_text))
+          && !fetch_websocket_text_payload_valid(
+              overlong_text, sizeof(overlong_text))
+          && !fetch_websocket_text_payload_valid(
+              surrogate_text, sizeof(surrogate_text))
+          && !fetch_websocket_text_payload_valid(
+              truncated_text, sizeof(truncated_text))
+          && !fetch_websocket_text_payload_valid(
+              excessive_text, sizeof(excessive_text)));
+
+    FetchWebSocketCloseAccumulator accumulator = {0};
+    FetchWebSocketClosePayload parsed;
+    static const unsigned char normal[] = {0x03u, 0xe8u, 'o', 'k'};
+    CHECK(fetch_websocket_close_payload_accumulate(
+              &accumulator, normal, 1u, 3u, &parsed)
+              == FETCH_WEBSOCKET_CLOSE_PAYLOAD_INCOMPLETE
+          && accumulator.active && accumulator.length == 1u
+          && fetch_websocket_close_payload_accumulate(
+              &accumulator, normal + 1u, 3u, 0u, &parsed)
+              == FETCH_WEBSOCKET_CLOSE_PAYLOAD_VALID
+          && !accumulator.active && parsed.has_code
+          && parsed.code == 1000u && parsed.reason_length == 2u
+          && memcmp(parsed.reason, "ok", 2u) == 0);
+    CHECK(fetch_websocket_close_payload_accumulate(
+              &accumulator, NULL, 0u, 0u, &parsed)
+              == FETCH_WEBSOCKET_CLOSE_PAYLOAD_VALID
+          && !parsed.has_code && parsed.code == 1005u);
+    static const unsigned char nul_reason[] = {
+        0x03u, 0xe8u, 'a', 0x00u, 'b'
+    };
+    CHECK(fetch_websocket_close_payload_parse(
+              nul_reason, sizeof(nul_reason), &parsed)
+              == FETCH_WEBSOCKET_CLOSE_PAYLOAD_VALID
+          && parsed.reason_length == 3u
+          && memcmp(parsed.reason, "a\0b", 3u) == 0);
+    static const unsigned char missing_code[] = {0x03u};
+    static const unsigned char reserved_code[] = {0x03u, 0xedu};
+    static const unsigned char invalid_utf8[] = {
+        0x03u, 0xe8u, 0xc0u, 0xafu
+    };
+    CHECK(fetch_websocket_close_payload_parse(
+              missing_code, sizeof(missing_code), &parsed)
+              == FETCH_WEBSOCKET_CLOSE_PAYLOAD_PROTOCOL_ERROR
+          && fetch_websocket_close_payload_parse(
+              reserved_code, sizeof(reserved_code), &parsed)
+              == FETCH_WEBSOCKET_CLOSE_PAYLOAD_PROTOCOL_ERROR
+          && fetch_websocket_close_payload_parse(
+              invalid_utf8, sizeof(invalid_utf8), &parsed)
+              == FETCH_WEBSOCKET_CLOSE_PAYLOAD_INVALID_UTF8);
+    unsigned char bounded[125] = {0x03u, 0xe8u};
+    CHECK(fetch_websocket_close_payload_accumulate(
+              &accumulator, bounded, sizeof(bounded), 1u, &parsed)
+              == FETCH_WEBSOCKET_CLOSE_PAYLOAD_PROTOCOL_ERROR
+          && !accumulator.active && accumulator.length == 0);
+
+    browser_session_destroy(&session);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
 int main(void)
 {
     Budget budget;
@@ -1322,6 +1548,7 @@ int main(void)
     CHECK(test_module_cache_provenance() == 0);
     CHECK(test_response_cache_provenance() == 0);
     CHECK(test_typed_response_security_and_request_authority(&budget) == 0);
+    CHECK(test_websocket_policy_and_close_payload(&budget) == 0);
     BrowserSession expiry_session;
     char expiry_cookie[160];
     char expiry_header[128];

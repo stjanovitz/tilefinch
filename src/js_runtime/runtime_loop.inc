@@ -304,6 +304,14 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
                             size_t callback_budget, ScriptResult *result)
 {
     if (runtime == NULL || callback_budget > 1024) return false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t advance_started_ns = js_rt_monotonic_time_ns();
+    uint64_t prelude_started_ns = advance_started_ns;
+    uint64_t webgl_before_us = runtime->bridge.webgl_native_total_us;
+    size_t webgl_before_frames = runtime->bridge.webgl_native_frames;
+    BudgetQuickJSActivity allocator_before = {0};
+    budget_quickjs_pool_activity(runtime->quickjs_pool, &allocator_before);
+#endif
     runtime_apply_gc_slack(runtime);
     runtime_apply_deterministic_gc(runtime);
     runtime_boot_window_step(runtime);
@@ -329,6 +337,10 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
             : runtime->bridge.clock_monotonic_elapsed_ms
                   + (uint64_t) elapsed_ms;
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    runtime->timing_metrics.prelude_us +=
+        (js_rt_monotonic_time_ns() - prelude_started_ns) / UINT64_C(1000);
+#endif
     bool trace_steps = getenv("TILEFINCH_TRACE_RUNTIME_STEPS") != NULL;
     uint64_t network_elapsed_ns = 0;
     uint64_t timer_elapsed_ns = 0;
@@ -340,7 +352,12 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
     size_t prepared_callbacks = 0;
     bool ok = runtime_pump_timers(runtime, elapsed_ms, 0,
                                   &prepared_callbacks);
-    timer_elapsed_ns += js_rt_monotonic_time_ns() - phase_started;
+    uint64_t timer_prepare_ns = js_rt_monotonic_time_ns() - phase_started;
+    timer_elapsed_ns += timer_prepare_ns;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    runtime->timing_metrics.timer_prepare_us +=
+        timer_prepare_ns / UINT64_C(1000);
+#endif
     if (!ok || prepared_callbacks != 0) {
         runtime->result.success = false;
         js_rt_runtime_update_result(runtime, result);
@@ -425,7 +442,20 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         size_t timer_callbacks = 0;
         phase_started = js_rt_monotonic_time_ns();
         ok = runtime_pump_timers(runtime, 0, 1, &timer_callbacks);
-        timer_elapsed_ns += js_rt_monotonic_time_ns() - phase_started;
+        uint64_t timer_turn_ns = js_rt_monotonic_time_ns() - phase_started;
+        timer_elapsed_ns += timer_turn_ns;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if (timer_callbacks != 0) {
+            uint64_t timer_turn_us = timer_turn_ns / UINT64_C(1000);
+            runtime->timing_metrics.timer_callbacks += timer_callbacks;
+            runtime->timing_metrics.timer_callback_us += timer_turn_us;
+            if (timer_turn_us
+                    > runtime->timing_metrics.maximum_timer_callback_us) {
+                runtime->timing_metrics.maximum_timer_callback_us =
+                    timer_turn_us;
+            }
+        }
+#endif
         if (!ok) break;
         if (timer_callbacks == 0) break;
         callbacks += timer_callbacks;
@@ -455,6 +485,11 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         if (!classic_continuation) {
             phase_started = js_rt_monotonic_time_ns();
             ok = js_rt_runtime_refresh(runtime);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            runtime->timing_metrics.refresh_us +=
+                (js_rt_monotonic_time_ns() - phase_started)
+                    / UINT64_C(1000);
+#endif
             if (trace_steps) {
                 fprintf(stderr, "runtime-step phase=dom-refresh us=%llu\n",
                         (unsigned long long)
@@ -463,7 +498,111 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
             }
         }
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    runtime->timing_metrics.network_us +=
+        network_elapsed_ns / UINT64_C(1000);
+    runtime->timing_metrics.microtask_us +=
+        microtask_elapsed_ns / UINT64_C(1000);
+    uint64_t advance_us =
+        (js_rt_monotonic_time_ns() - advance_started_ns) / UINT64_C(1000);
+    runtime->timing_metrics.advances++;
+    runtime->timing_metrics.total_us += advance_us;
+    runtime->timing_metrics.webgl_native_us +=
+        runtime->bridge.webgl_native_total_us - webgl_before_us;
+    runtime->timing_metrics.webgl_native_frames +=
+        runtime->bridge.webgl_native_frames - webgl_before_frames;
+    BudgetQuickJSActivity allocator_after = {0};
+    budget_quickjs_pool_activity(runtime->quickjs_pool, &allocator_after);
+    runtime->timing_metrics.js_allocation_calls +=
+        allocator_after.allocation_calls - allocator_before.allocation_calls;
+    runtime->timing_metrics.js_free_calls +=
+        allocator_after.free_calls - allocator_before.free_calls;
+    runtime->timing_metrics.js_reallocation_calls +=
+        allocator_after.reallocation_calls
+            - allocator_before.reallocation_calls;
+    runtime->timing_metrics.js_allocated_bytes +=
+        allocator_after.allocated_bytes - allocator_before.allocated_bytes;
+    runtime->timing_metrics.js_freed_bytes +=
+        allocator_after.freed_bytes - allocator_before.freed_bytes;
+    runtime->timing_metrics.js_reallocated_bytes +=
+        allocator_after.reallocated_bytes
+            - allocator_before.reallocated_bytes;
+    runtime->timing_metrics.js_live_bytes = allocator_after.live_bytes;
+    /* Exact js_malloc census: rises are heap-garbage production the pool
+       counters above cannot see; a drop this large between two advances is
+       a full collection.  Steady gameplay must hold rises near zero, or the
+       accumulated garbage paces full-GC pauses onto presented frames. */
+    {
+        size_t js_heap_now = budget_quickjs_pool_js_malloc_current(
+            runtime->quickjs_pool);
+        ScriptRuntimeTimingMetrics *census = &runtime->timing_metrics;
+        if (census->js_heap_samples == 0) {
+            census->js_heap_low_bytes = js_heap_now;
+            census->js_heap_high_bytes = js_heap_now;
+        } else {
+            size_t previous = census->js_heap_last_bytes;
+            if (js_heap_now > previous) {
+                census->js_heap_risen_bytes += js_heap_now - previous;
+            } else if (previous - js_heap_now >= 32u * 1024u) {
+                census->js_heap_gc_drops++;
+                if (previous - js_heap_now > census->js_heap_gc_drop_max_bytes)
+                    census->js_heap_gc_drop_max_bytes =
+                        previous - js_heap_now;
+            }
+            if (js_heap_now < census->js_heap_low_bytes)
+                census->js_heap_low_bytes = js_heap_now;
+            if (js_heap_now > census->js_heap_high_bytes)
+                census->js_heap_high_bytes = js_heap_now;
+        }
+        census->js_heap_last_bytes = js_heap_now;
+        census->js_heap_samples++;
+    }
+    if (advance_us > runtime->timing_metrics.maximum_total_us)
+        runtime->timing_metrics.maximum_total_us = advance_us;
+#endif
     runtime->result.success = ok;
     js_rt_runtime_update_result(runtime, result);
     return ok;
+}
+
+bool script_runtime_timing_metrics(
+    const ScriptRuntime *runtime, ScriptRuntimeTimingMetrics *metrics)
+{
+    if (metrics == NULL) return false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (runtime == NULL) {
+        memset(metrics, 0, sizeof(*metrics));
+        return false;
+    }
+    *metrics = runtime->timing_metrics;
+    return metrics->advances != 0;
+#else
+    (void) runtime;
+    memset(metrics, 0, sizeof(*metrics));
+    return false;
+#endif
+}
+
+void script_runtime_timing_metrics_reset(ScriptRuntime *runtime)
+{
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (runtime == NULL) return;
+    memset(&runtime->timing_metrics, 0, sizeof(runtime->timing_metrics));
+    runtime->bridge.webgl_native_total_us = 0;
+    runtime->bridge.webgl_native_frames = 0;
+#else
+    (void) runtime;
+#endif
+}
+
+/* Validation probe: one timed full collection on the live realm, so a report
+   can state what a garbage-paced GC pause costs on the measured processor
+   instead of inferring it.  The collection itself is always semantically
+   safe; shipping builds simply never ask. */
+uint64_t script_runtime_gc_probe_us(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->runtime == NULL) return 0;
+    uint64_t started_ns = js_rt_monotonic_time_ns();
+    JS_RunGC(runtime->runtime);
+    return (js_rt_monotonic_time_ns() - started_ns) / UINT64_C(1000);
 }

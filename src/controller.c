@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
@@ -23,23 +24,50 @@
 
 static bool controller_set_scroll(BrowserController *controller, int scroll_y,
                                   int viewport_height);
+static ControllerActivationOutcome controller_dispatch_activation(
+    BrowserController *controller, lxb_dom_node_t *node);
+
+static int controller_add_coordinate(int value, int delta)
+{
+    if (delta > 0 && value > INT_MAX - delta) return INT_MAX;
+    if (delta < 0 && value < INT_MIN - delta) return INT_MIN;
+    return value + delta;
+}
 
 static bool fixed_region_offset(const LayoutDocument *layout, bool control,
-                                size_t index, int viewport_height, int *dy)
+                                size_t index, int viewport_height,
+                                int scroll_y, int *dy)
 {
     if (layout == NULL || dy == NULL || viewport_height <= 0) return false;
-    for (size_t at = layout->fixed_count; at > 0; at--) {
-        const FixedRange *range = &layout->fixed_ranges[at - 1];
+    const FixedRange *owner = NULL;
+    size_t owner_index = SIZE_MAX;
+    size_t owner_span = SIZE_MAX;
+    for (size_t at = 0; at < layout->fixed_count; at++) {
+        const FixedRange *range = &layout->fixed_ranges[at];
         size_t start = control ? range->control_start : range->link_start;
         size_t end = control ? range->control_end : range->link_end;
         if (index < start || index >= end) continue;
-        int target_y = range->from_bottom
-                       ? viewport_height - range->inset - range->height
-                       : range->inset;
-        *dy = target_y - range->origin_y;
-        return true;
+        size_t span = range->command_end >= range->command_start
+            ? range->command_end - range->command_start : SIZE_MAX;
+        if (owner == NULL || span < owner_span
+            || (span == owner_span && at < owner_index)) {
+            owner = range;
+            owner_index = at;
+            owner_span = span;
+        }
     }
-    return false;
+    if (owner == NULL) return false;
+    /* A fixed descendant of a bounded scroll scene becomes ordinary
+       document geometry once that scene has left the viewport.  Select its
+       paint-owning range before applying this boundary: falling through to
+       an overlapping outer range would pin an invisible retired control. */
+    if (owner->scroll_end != INT_MAX
+        && scroll_y >= owner->scroll_end) return false;
+    int target_y = owner->from_bottom
+                   ? viewport_height - owner->inset - owner->height
+                   : owner->inset;
+    *dy = target_y - owner->origin_y;
+    return true;
 }
 
 static size_t focus_count(const BrowserController *controller)
@@ -81,6 +109,77 @@ static bool node_descends_from(lxb_dom_node_t *node, lxb_dom_node_t *ancestor)
         if (at == ancestor) return true;
     }
     return false;
+}
+
+static lxb_dom_node_t *controller_native_basic_root(
+    const BrowserController *controller)
+{
+    if (controller == NULL || controller->navigation == NULL) return NULL;
+    const NavigationPage *page = &controller->navigation->page;
+    if (page->reader_root_kind != READER_PAGE_BASIC) return NULL;
+    if (page->runtime != NULL) {
+        return page->reader_root_handle == 0 ? NULL
+            : script_runtime_node_handle_resolve_connected(
+                  page->runtime, page->reader_root_handle);
+    }
+    /* A nonzero handle means a live realm owned the provenance snapshot.
+       Once that realm is retired, fail closed rather than dereferencing a
+       raw pointer that author script may previously have reclaimed. */
+    return page->reader_root_handle == 0 ? page->reader_root : NULL;
+}
+
+static bool controller_node_in_native_basic_root(
+    const BrowserController *controller, lxb_dom_node_t *node)
+{
+    lxb_dom_node_t *root = controller_native_basic_root(controller);
+    if (root == NULL || node == NULL) return false;
+    size_t depth = 0;
+    for (lxb_dom_node_t *at = node;
+         at != NULL && depth++ <= 512u; at = at->parent) {
+        if (at == root) return true;
+    }
+    return false;
+}
+
+static long controller_node_snapshot_handle(
+    const BrowserController *controller, lxb_dom_node_t *node)
+{
+    ScriptRuntime *runtime = controller == NULL
+        || controller->navigation == NULL
+        ? NULL : controller->navigation->page.runtime;
+    return runtime == NULL || node == NULL ? 0
+        : script_runtime_node_weak_handle(runtime, node);
+}
+
+static lxb_dom_node_t *controller_node_snapshot_resolve(
+    const BrowserController *controller, long handle,
+    lxb_dom_node_t *runtime_free_node)
+{
+    ScriptRuntime *runtime = controller == NULL
+        || controller->navigation == NULL
+        ? NULL : controller->navigation->page.runtime;
+    if (runtime != NULL) {
+        return handle == 0 ? NULL
+            : script_runtime_node_handle_resolve_connected(runtime, handle);
+    }
+    /* A nonzero handle proves that this pointer crossed an author callback.
+       If that realm retired during the callback, its raw node is no longer a
+       safe fallback. */
+    return handle == 0 ? runtime_free_node : NULL;
+}
+
+static bool controller_form_method_is_get(lxb_dom_node_t *form)
+{
+    size_t length = 0;
+    const char *value = document_attribute(form, "method", &length);
+    if (value == NULL || length == 0) return true;
+    while (length != 0 && isspace((unsigned char) *value)) {
+        value++;
+        length--;
+    }
+    while (length != 0
+           && isspace((unsigned char) value[length - 1u])) length--;
+    return length == 3u && strncasecmp(value, "get", 3u) == 0;
 }
 
 static bool node_effectively_disabled(lxb_dom_node_t *node)
@@ -771,9 +870,14 @@ static void form_implicit_controls(lxb_dom_node_t *node,
     }
 }
 
+static bool controller_build_form_action_with_outcome(
+    BrowserController *controller, lxb_dom_node_t *form,
+    lxb_dom_node_t *submitter, bool dispatch_submit_event,
+    ControllerActivationOutcome initial_outcome, ControllerAction *action);
+
 static bool controller_build_implicit_form_action(
     BrowserController *controller, lxb_dom_node_t *input,
-    ControllerAction *action)
+    ControllerActivationOutcome initial_outcome, ControllerAction *action)
 {
     lxb_dom_node_t *form = form_ancestor(input);
     if (form == NULL || node_effectively_disabled(input)
@@ -781,28 +885,45 @@ static bool controller_build_implicit_form_action(
     lxb_dom_node_t *submitter = NULL;
     size_t blocking_fields = 0;
     form_implicit_controls(form->first_child, &submitter, &blocking_fields);
-    NavigationSession *navigation = controller->navigation;
     if (submitter != NULL) {
-        if (navigation->page.runtime != NULL
-            && !navigation_dispatch_node_activation(navigation, submitter)) {
-            return false;
-        }
-        if (navigation->page.runtime != NULL
-            && navigation->page.script_result.last_event_cancelled) {
+        long form_handle = controller_node_snapshot_handle(controller, form);
+        long submitter_handle = controller_node_snapshot_handle(
+            controller, submitter);
+        if (controller->navigation->page.runtime != NULL
+            && (form_handle == 0 || submitter_handle == 0)) return false;
+        ControllerActivationOutcome submitter_outcome =
+            controller_dispatch_activation(controller, submitter);
+        if (submitter_outcome == CONTROLLER_ACTIVATION_CANCELLED
+            || submitter_outcome == CONTROLLER_ACTIVATION_RUNTIME_FAILED) {
             memset(action, 0, sizeof(*action));
+            action->activation_outcome = submitter_outcome;
             return true;
         }
-        return controller_build_form_action(controller, form, submitter, true,
-                                            action);
+        form = controller_node_snapshot_resolve(
+            controller, form_handle, form);
+        submitter = controller_node_snapshot_resolve(
+            controller, submitter_handle, submitter);
+        if (form == NULL || submitter == NULL
+            || form_ancestor(submitter) != form) {
+            memset(action, 0, sizeof(*action));
+            action->activation_outcome = submitter_outcome;
+            return true;
+        }
+        return controller_build_form_action_with_outcome(
+            controller, form, submitter, true,
+            submitter_outcome == CONTROLLER_ACTIVATION_NOT_DISPATCHED
+                ? initial_outcome : submitter_outcome,
+            action);
     }
     if (blocking_fields > 1) return false;
-    return controller_build_form_action(controller, form, NULL, true, action);
+    return controller_build_form_action_with_outcome(
+        controller, form, NULL, true, initial_outcome, action);
 }
 
-bool controller_build_form_action(
+static bool controller_build_form_action_with_outcome(
     BrowserController *controller, lxb_dom_node_t *form,
     lxb_dom_node_t *submitter, bool dispatch_submit_event,
-    ControllerAction *action)
+    ControllerActivationOutcome initial_outcome, ControllerAction *action)
 {
     if (controller == NULL || controller->navigation == NULL
         || form == NULL || action == NULL || !node_name_is(form, "form")
@@ -810,26 +931,90 @@ bool controller_build_form_action(
         return false;
     }
     NavigationSession *navigation = controller->navigation;
+    bool native_basic_form = controller_node_in_native_basic_root(
+        controller, form);
+    ScriptRuntime *callback_runtime = dispatch_submit_event
+        && navigation->page.runtime != NULL && !native_basic_form
+        ? navigation->page.runtime : NULL;
+    long form_handle = callback_runtime == NULL ? 0
+        : controller_node_snapshot_handle(controller, form);
+    long submitter_handle = callback_runtime == NULL || submitter == NULL ? 0
+        : controller_node_snapshot_handle(controller, submitter);
+    if (callback_runtime != NULL
+        && (form_handle == 0 || (submitter != NULL && submitter_handle == 0))) {
+        return false;
+    }
     memset(action, 0, sizeof(*action));
-    if (dispatch_submit_event && navigation->page.runtime != NULL
-        && (!navigation_dispatch_node_submit_event(navigation, form,
-                                                   submitter)
-            || navigation->page.script_result.last_event_cancelled)) {
-        return navigation->page.script_result.last_event_cancelled;
+    action->activation_outcome = initial_outcome;
+    if (dispatch_submit_event
+        && (navigation->page.runtime == NULL || native_basic_form)
+        && action->activation_outcome
+               == CONTROLLER_ACTIVATION_NOT_DISPATCHED) {
+        action->activation_outcome = CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE;
+    }
+    if (callback_runtime != NULL) {
+        bool dispatched = navigation_dispatch_node_submit_event(
+            navigation, form, submitter);
+        form = controller_node_snapshot_resolve(
+            controller, form_handle, form);
+        if (submitter != NULL) {
+            submitter = controller_node_snapshot_resolve(
+                controller, submitter_handle, submitter);
+        }
+        if (dispatched
+            && navigation->page.script_result.last_event_cancelled) {
+            action->activation_outcome = CONTROLLER_ACTIVATION_CANCELLED;
+            return true;
+        }
+        if (dispatched
+            && action->activation_outcome
+                   == CONTROLLER_ACTIVATION_NOT_DISPATCHED) {
+            action->activation_outcome = CONTROLLER_ACTIVATION_DELIVERED;
+        }
+        if (!dispatched) {
+            action->activation_outcome =
+                !navigation->page.script_result.event_dispatch_entered
+                    ? CONTROLLER_ACTIVATION_RUNTIME_REFUSED
+                    : CONTROLLER_ACTIVATION_RUNTIME_FAILED;
+            if (form == NULL) return true;
+            /* A handler can call preventDefault() and then exhaust its task
+               budget before dispatch returns the cancellation bit. Form
+               submission can carry credentials and side effects, so this
+               uncertain partial delivery is deliberately fail-closed. */
+            if (action->activation_outcome
+                    == CONTROLLER_ACTIVATION_RUNTIME_FAILED) return true;
+        }
+        if (form == NULL || !node_name_is(form, "form")) return true;
+        if (submitter != NULL && form_ancestor(submitter) != form)
+            submitter = NULL;
+    }
+    /* Basic admission accepts only safe GET/search controls. Recheck that
+       property at the native submission sink so a lingering author realm
+       cannot turn the projected form into POST between extraction and use. */
+    if (native_basic_form && !controller_form_method_is_get(form)) {
+        action->type = CONTROLLER_ACTION_NONE;
+        return true;
     }
     const NavigationEntry *current = navigation_current(navigation);
     if (current == NULL) return false;
     size_t action_length = 0;
     const char *target = document_attribute(form, "action", &action_length);
     char target_copy[NAVIGATION_URL_LIMIT];
+    const char *resolution_base = current->url;
     if (target == NULL || action_length == 0) {
         snprintf(target_copy, sizeof(target_copy), "%s", current->url);
     } else {
         if (action_length >= sizeof(target_copy)) return false;
         memcpy(target_copy, target, action_length);
         target_copy[action_length] = '\0';
+        /* An authored relative action resolves against the document's
+           computed base URL. Empty action remains the current document URL,
+           as required by HTML form submission. */
+        if (navigation->page.resource_base_url[0] != '\0') {
+            resolution_base = navigation->page.resource_base_url;
+        }
     }
-    if (!fetch_resolve_url(current->url, target_copy, action->url,
+    if (!fetch_resolve_url(resolution_base, target_copy, action->url,
                            sizeof(action->url))) return false;
     if (!tilefinch_csp_allows_form_action(
             &navigation->page.document.content_security_policy,
@@ -847,14 +1032,34 @@ bool controller_build_form_action(
         size_t url_length = strlen(action->url);
         size_t needed = 1 + action->body_length;
         if (url_length + needed >= sizeof(action->url)) return false;
-        action->url[url_length++] = strchr(action->url, '?') == NULL
-                                    ? '?' : '&';
-        memcpy(action->url + url_length, action->body,
-               action->body_length + 1);
+        char *fragment = strchr(action->url, '#');
+        size_t insert_at = fragment == NULL
+            ? url_length : (size_t) (fragment - action->url);
+        bool has_query = memchr(action->url, '?', insert_at) != NULL;
+        if (fragment != NULL) {
+            memmove(action->url + insert_at + needed,
+                    action->url + insert_at,
+                    url_length - insert_at + 1u);
+        }
+        action->url[insert_at] = has_query ? '&' : '?';
+        memcpy(action->url + insert_at + 1u, action->body,
+               action->body_length);
+        if (fragment == NULL)
+            action->url[insert_at + needed] = '\0';
         action->body_length = 0;
         action->body[0] = '\0';
     }
     return true;
+}
+
+bool controller_build_form_action(
+    BrowserController *controller, lxb_dom_node_t *form,
+    lxb_dom_node_t *submitter, bool dispatch_submit_event,
+    ControllerAction *action)
+{
+    return controller_build_form_action_with_outcome(
+        controller, form, submitter, dispatch_submit_event,
+        CONTROLLER_ACTIVATION_NOT_DISPATCHED, action);
 }
 
 static lxb_dom_node_t *retained_focus_node(
@@ -1357,12 +1562,14 @@ static bool focus_region_rect(const BrowserController *controller,
         rw = region->width; rh = region->height;
     }
     if (require_area && (rw <= 0 || rh <= 0)) return false;
+    const NavigationEntry *entry =
+        navigation_current(controller->navigation);
+    int scroll_y = entry == NULL ? 0 : entry->scroll_y;
     int fixed_dy = 0;
     if (fixed_region_offset(layout, control, index,
-                            controller->viewport_height, &fixed_dy)) {
-        const NavigationEntry *entry =
-            navigation_current(controller->navigation);
-        ry += fixed_dy + (entry == NULL ? 0 : entry->scroll_y);
+                            controller->viewport_height, scroll_y,
+                            &fixed_dy)) {
+        ry += fixed_dy + scroll_y;
     }
     if (x != NULL) *x = rx;
     if (y != NULL) *y = ry;
@@ -1531,7 +1738,7 @@ static bool controller_hit_test(BrowserController *controller,
         int region_y = region->y;
         int fixed_dy = 0;
         if (fixed_region_offset(layout, true, i, controller->viewport_height,
-                                &fixed_dy)) {
+                                scroll_y, &fixed_dy)) {
             region_y += fixed_dy + scroll_y;
         }
         if (x < region->x || x >= region->x + region->width
@@ -1550,7 +1757,7 @@ static bool controller_hit_test(BrowserController *controller,
         int region_y = region->y;
         int fixed_dy = 0;
         if (fixed_region_offset(layout, false, i, controller->viewport_height,
-                                &fixed_dy)) {
+                                scroll_y, &fixed_dy)) {
             region_y += fixed_dy + scroll_y;
         }
         if (x < region->x || x >= region->x + region->width
@@ -1755,20 +1962,36 @@ void controller_pointer_discard_click(BrowserController *controller)
     if (controller != NULL) controller->pointer_click_pending = false;
 }
 
-static bool controller_dispatch_activation(BrowserController *controller,
-                                           lxb_dom_node_t *node)
+static ControllerActivationOutcome controller_dispatch_activation(
+    BrowserController *controller, lxb_dom_node_t *node)
 {
     NavigationSession *navigation = controller->navigation;
     bool click_only = controller->pointer_click_pending;
     controller->pointer_click_pending = false;
-    if (navigation->page.runtime == NULL || node == NULL) return true;
-    return click_only
+    if (node == NULL) return CONTROLLER_ACTIVATION_NOT_DISPATCHED;
+    /* Basic is a native, action-preserving projection of the raw document.
+       It must not be intercepted by delegated handlers left in the author
+       realm, nor should those handlers be able to mutate a GET clone into a
+       side-effecting submission between admission and the native sink. */
+    if (controller_node_in_native_basic_root(controller, node))
+        return CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE;
+    if (navigation->page.runtime == NULL)
+        return CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE;
+    bool dispatched = click_only
         ? navigation_dispatch_node_pointer(
               navigation, node, 5, controller->pointer_click_x,
               controller->pointer_click_y,
               controller->pointer_click_offset_x,
               controller->pointer_click_offset_y, 0)
         : navigation_dispatch_node_activation(navigation, node);
+    if (!dispatched) {
+        return !navigation->page.script_result.event_dispatch_entered
+            ? CONTROLLER_ACTIVATION_RUNTIME_REFUSED
+            : CONTROLLER_ACTIVATION_RUNTIME_FAILED;
+    }
+    return navigation->page.script_result.last_event_cancelled
+        ? CONTROLLER_ACTIVATION_CANCELLED
+        : CONTROLLER_ACTIVATION_DELIVERED;
 }
 
 bool controller_commit_pointer_click(BrowserController *controller)
@@ -1780,7 +2003,728 @@ bool controller_commit_pointer_click(BrowserController *controller)
         controller->pointer_click_pending = false;
         return true;
     }
-    return controller_dispatch_activation(controller, node);
+    ControllerActivationOutcome outcome =
+        controller_dispatch_activation(controller, node);
+    return outcome != CONTROLLER_ACTIVATION_NOT_DISPATCHED
+        && outcome != CONTROLLER_ACTIVATION_RUNTIME_FAILED;
+}
+
+typedef enum {
+    CONTROLLER_NATIVE_DEFAULT_NONE = 0,
+    CONTROLLER_NATIVE_DEFAULT_CHANGED,
+    CONTROLLER_NATIVE_DEFAULT_FAILED
+} ControllerNativeDefaultResult;
+
+static bool controller_native_default_refresh(BrowserController *controller)
+{
+    return controller != NULL
+        && document_refresh(&controller->navigation->page.document)
+        && navigation_relayout(controller->navigation);
+}
+
+static lxb_dom_node_t *controller_next_node(lxb_dom_node_t *node,
+                                            lxb_dom_node_t *root)
+{
+    if (node == NULL) return NULL;
+    if (node->first_child != NULL) return node->first_child;
+    while (node != NULL && node != root && node->next == NULL)
+        node = node->parent;
+    return node == NULL || node == root ? NULL : node->next;
+}
+
+static bool controller_attribute_set(lxb_dom_node_t *node, const char *name,
+                                     const char *value)
+{
+    return node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && lxb_dom_element_set_attribute(
+               lxb_dom_interface_element(node),
+               (const lxb_char_t *) name, strlen(name),
+               (const lxb_char_t *) value, strlen(value)) != NULL;
+}
+
+static bool controller_attribute_remove(lxb_dom_node_t *node,
+                                        const char *name)
+{
+    return node != NULL && node->type == LXB_DOM_NODE_TYPE_ELEMENT
+        && lxb_dom_element_remove_attribute(
+               lxb_dom_interface_element(node),
+               (const lxb_char_t *) name, strlen(name)) == LXB_STATUS_OK;
+}
+
+static bool controller_checked_set(BrowserController *controller,
+                                   lxb_dom_node_t *node, bool checked,
+                                   bool remember_default)
+{
+    bool ignored_default = false;
+    if (remember_default
+        && !document_control_checked_default(
+               &controller->navigation->page.document, node,
+               has_attribute(node, "checked"), &ignored_default)) return false;
+    return checked ? controller_attribute_set(node, "checked", "")
+                   : (!has_attribute(node, "checked")
+                      || controller_attribute_remove(node, "checked"));
+}
+
+static bool controller_same_radio_group(lxb_dom_node_t *left,
+                                        lxb_dom_node_t *right)
+{
+    if (left == NULL || right == NULL || !node_name_is(right, "input")
+        || !attribute_is(right, "type", "radio")
+        || form_ancestor(left) != form_ancestor(right)) return false;
+    size_t left_length = 0, right_length = 0;
+    const char *left_name = document_attribute(left, "name", &left_length);
+    const char *right_name = document_attribute(
+        right, "name", &right_length);
+    return left_name != NULL && left_length != 0
+        && right_name != NULL && left_length == right_length
+        && memcmp(left_name, right_name, left_length) == 0;
+}
+
+typedef struct {
+    lxb_dom_node_t *node;
+    long handle;
+    bool checked;
+} ControllerChoiceSnapshot;
+
+static bool controller_choice_snapshot(
+    BrowserController *controller, lxb_dom_node_t *node,
+    ControllerChoiceSnapshot *snapshots, size_t *count)
+{
+    if (count != NULL) *count = 0;
+    if (controller == NULL || node == NULL || snapshots == NULL
+        || count == NULL || !node_name_is(node, "input")
+        || (!attribute_is(node, "type", "checkbox")
+            && !attribute_is(node, "type", "radio"))) return true;
+    if (!attribute_is(node, "type", "radio")) {
+        snapshots[0] = (ControllerChoiceSnapshot) {
+            .node = node,
+            .handle = controller_node_snapshot_handle(controller, node),
+            .checked = has_attribute(node, "checked")
+        };
+        if (controller->navigation->page.runtime != NULL
+            && snapshots[0].handle == 0) return false;
+        *count = 1u;
+        return true;
+    }
+    lxb_dom_node_t *root = lxb_dom_interface_node(
+        controller->navigation->page.document.html);
+    size_t visited = 0;
+    for (lxb_dom_node_t *at = root;
+         at != NULL && visited++ < 65536u;
+         at = controller_next_node(at, root)) {
+        if (at != node && !controller_same_radio_group(node, at)) continue;
+        if (*count >= 128u) return false;
+        snapshots[*count] = (ControllerChoiceSnapshot) {
+            .node = at,
+            .handle = controller_node_snapshot_handle(controller, at),
+            .checked = has_attribute(at, "checked")
+        };
+        if (controller->navigation->page.runtime != NULL
+            && snapshots[*count].handle == 0) return false;
+        (*count)++;
+    }
+    return visited < 65536u;
+}
+
+static void controller_choice_restore(
+    BrowserController *controller, const ControllerChoiceSnapshot *snapshots,
+    size_t count)
+{
+    for (size_t at = 0; at < count; at++) {
+        lxb_dom_node_t *node = controller_node_snapshot_resolve(
+            controller, snapshots[at].handle, snapshots[at].node);
+        if (node == NULL) continue;
+        (void) controller_checked_set(
+            controller, node, snapshots[at].checked, false);
+    }
+    if (count != 0) (void) controller_native_default_refresh(controller);
+}
+
+static ControllerNativeDefaultResult controller_toggle_choice(
+    BrowserController *controller, lxb_dom_node_t *node)
+{
+    bool radio = attribute_is(node, "type", "radio");
+    bool checked = has_attribute(node, "checked");
+    if (radio && checked) return CONTROLLER_NATIVE_DEFAULT_NONE;
+    if (!radio) {
+        DocumentControlCheckedSnapshot state_snapshot = {0};
+        if (!document_control_checked_snapshot(
+                &controller->navigation->page.document, node,
+                &state_snapshot)) return CONTROLLER_NATIVE_DEFAULT_FAILED;
+        if (!controller_checked_set(controller, node, !checked, true)) {
+            (void) document_control_checked_restore(
+                &controller->navigation->page.document, node,
+                &state_snapshot);
+            return CONTROLLER_NATIVE_DEFAULT_FAILED;
+        }
+        if (controller_native_default_refresh(controller))
+            return CONTROLLER_NATIVE_DEFAULT_CHANGED;
+        (void) controller_checked_set(controller, node, checked, false);
+        (void) document_control_checked_restore(
+            &controller->navigation->page.document, node, &state_snapshot);
+        (void) controller_native_default_refresh(controller);
+        return CONTROLLER_NATIVE_DEFAULT_FAILED;
+    }
+    lxb_dom_node_t *root = lxb_dom_interface_node(
+        controller->navigation->page.document.html);
+    lxb_dom_node_t *members[128];
+    bool previous_checked[128];
+    DocumentControlCheckedSnapshot state_snapshots[128];
+    size_t member_count = 0;
+    size_t visited = 0;
+    for (lxb_dom_node_t *at = root;
+         at != NULL && visited++ < 65536u;
+         at = controller_next_node(at, root)) {
+        if (at == node || controller_same_radio_group(node, at)) {
+            if (member_count >= 128u)
+                return CONTROLLER_NATIVE_DEFAULT_FAILED;
+            members[member_count] = at;
+            previous_checked[member_count] = has_attribute(at, "checked");
+            if (!document_control_checked_snapshot(
+                    &controller->navigation->page.document, at,
+                    &state_snapshots[member_count])) {
+                return CONTROLLER_NATIVE_DEFAULT_FAILED;
+            }
+            member_count++;
+        }
+    }
+    if (visited >= 65536u) return CONTROLLER_NATIVE_DEFAULT_FAILED;
+    /* Allocate every retained authored default before changing the group.
+       Budget refusal therefore cannot leave a half-selected radio group. */
+    for (size_t at = 0; at < member_count; at++) {
+        bool ignored = false;
+        if (!document_control_checked_default(
+                &controller->navigation->page.document, members[at],
+                previous_checked[at], &ignored)) {
+            for (size_t rollback = 0; rollback <= at; rollback++) {
+                (void) document_control_checked_restore(
+                    &controller->navigation->page.document,
+                    members[rollback], &state_snapshots[rollback]);
+            }
+            return CONTROLLER_NATIVE_DEFAULT_FAILED;
+        }
+    }
+    for (size_t at = 0; at < member_count; at++) {
+        if (controller_checked_set(
+                controller, members[at], members[at] == node, false)) {
+            continue;
+        }
+        for (size_t rollback = 0; rollback < at; rollback++) {
+            (void) controller_checked_set(
+                controller, members[rollback], previous_checked[rollback],
+                false);
+        }
+        for (size_t rollback = 0; rollback < member_count; rollback++) {
+            (void) document_control_checked_restore(
+                &controller->navigation->page.document, members[rollback],
+                &state_snapshots[rollback]);
+        }
+        return CONTROLLER_NATIVE_DEFAULT_FAILED;
+    }
+    if (controller_native_default_refresh(controller))
+        return CONTROLLER_NATIVE_DEFAULT_CHANGED;
+    for (size_t at = 0; at < member_count; at++) {
+        (void) controller_checked_set(
+            controller, members[at], previous_checked[at], false);
+        (void) document_control_checked_restore(
+            &controller->navigation->page.document, members[at],
+            &state_snapshots[at]);
+    }
+    (void) controller_native_default_refresh(controller);
+    return CONTROLLER_NATIVE_DEFAULT_FAILED;
+}
+
+static bool controller_option_selected(lxb_dom_node_t *option)
+{
+    size_t length = 0;
+    const char *state = document_attribute(
+        option, "data-tilefinch-option-selected", &length);
+    return state != NULL ? length == 4 && memcmp(state, "true", 4) == 0
+                         : has_attribute(option, "selected");
+}
+
+static ControllerNativeDefaultResult controller_advance_select(
+    BrowserController *controller, lxb_dom_node_t *select)
+{
+    lxb_dom_node_t *options[128];
+    size_t count = 0, selected = SIZE_MAX, visited = 0;
+    for (lxb_dom_node_t *at = select->first_child;
+         at != NULL && visited++ < 1024u;) {
+        if (node_name_is(at, "option")) {
+            if (count >= 128u) return CONTROLLER_NATIVE_DEFAULT_FAILED;
+            options[count] = at;
+            if (selected == SIZE_MAX && controller_option_selected(at))
+                selected = count;
+            count++;
+        }
+        if (at->first_child != NULL) {
+            at = at->first_child;
+            continue;
+        }
+        while (at != NULL && at != select && at->next == NULL)
+            at = at->parent;
+        if (at == NULL || at == select) break;
+        at = at->next;
+    }
+    if (visited >= 1024u) return CONTROLLER_NATIVE_DEFAULT_FAILED;
+    if (count == 0) return CONTROLLER_NATIVE_DEFAULT_NONE;
+    /* HTML's selectedness default is the first enabled option even when no
+       option carries an authored selected attribute. Activation advances
+       from that effective current option; it must not merely select it. */
+    if (selected == SIZE_MAX) {
+        for (size_t at = 0; at < count; at++) {
+            if (!node_effectively_disabled(options[at])) {
+                selected = at;
+                break;
+            }
+        }
+    }
+    if (selected == SIZE_MAX) return CONTROLLER_NATIVE_DEFAULT_NONE;
+    size_t next = selected;
+    bool found = false;
+    for (size_t checked = 0; checked < count; checked++) {
+        next = (next + 1u) % count;
+        if (!node_effectively_disabled(options[next])) {
+            found = true;
+            break;
+        }
+    }
+    if (!found || next == selected) return CONTROLLER_NATIVE_DEFAULT_NONE;
+    bool marker_present[128];
+    bool marker_selected[128];
+    for (size_t at = 0; at < count; at++) {
+        size_t marker_length = 0;
+        const char *marker = document_attribute(
+            options[at], "data-tilefinch-option-selected", &marker_length);
+        marker_present[at] = marker != NULL;
+        marker_selected[at] = marker != NULL && marker_length == 4u
+            && memcmp(marker, "true", 4u) == 0;
+        if (marker != NULL && !marker_selected[at]
+            && !(marker_length == 5u
+                 && memcmp(marker, "false", 5u) == 0)) {
+            return CONTROLLER_NATIVE_DEFAULT_FAILED;
+        }
+    }
+    for (size_t at = 0; at < count; at++) {
+        if (!controller_attribute_set(
+                options[at], "data-tilefinch-option-selected",
+                at == next ? "true" : "false")) {
+            for (size_t rollback = 0; rollback < at; rollback++) {
+                if (marker_present[rollback]) {
+                    (void) controller_attribute_set(
+                        options[rollback],
+                        "data-tilefinch-option-selected",
+                        marker_selected[rollback] ? "true" : "false");
+                } else {
+                    (void) controller_attribute_remove(
+                        options[rollback],
+                        "data-tilefinch-option-selected");
+                }
+            }
+            return CONTROLLER_NATIVE_DEFAULT_FAILED;
+        }
+    }
+    if (controller_native_default_refresh(controller))
+        return CONTROLLER_NATIVE_DEFAULT_CHANGED;
+    for (size_t at = 0; at < count; at++) {
+        if (marker_present[at]) {
+            (void) controller_attribute_set(
+                options[at], "data-tilefinch-option-selected",
+                marker_selected[at] ? "true" : "false");
+        } else {
+            (void) controller_attribute_remove(
+                options[at], "data-tilefinch-option-selected");
+        }
+    }
+    (void) controller_native_default_refresh(controller);
+    return CONTROLLER_NATIVE_DEFAULT_FAILED;
+}
+
+static bool controller_parse_number(const char *text, size_t length,
+                                    double *value)
+{
+    if (text == NULL || value == NULL || length == 0 || length >= 64u)
+        return false;
+    char copy[64];
+    memcpy(copy, text, length);
+    copy[length] = '\0';
+    char *end = NULL;
+    double parsed = strtod(copy, &end);
+    if (end == copy || *end != '\0' || parsed != parsed
+        || parsed > 1.0e12 || parsed < -1.0e12) return false;
+    *value = parsed;
+    return true;
+}
+
+static bool controller_parse_number_attribute(lxb_dom_node_t *node,
+                                              const char *name,
+                                              double *value)
+{
+    size_t length = 0;
+    const char *text = document_attribute(node, name, &length);
+    return controller_parse_number(text, length, value);
+}
+
+static ControllerNativeDefaultResult controller_advance_range(
+    BrowserController *controller, lxb_dom_node_t *node)
+{
+    size_t length = 0;
+    const char *text = document_control_value(node, &length);
+    if (text == NULL)
+        text = document_attribute(node, "value", &length);
+    double minimum = 0.0, maximum = 100.0, step = 1.0;
+    (void) controller_parse_number_attribute(node, "min", &minimum);
+    (void) controller_parse_number_attribute(node, "max", &maximum);
+    if (maximum < minimum) maximum = minimum;
+    double value = minimum + (maximum - minimum) / 2.0;
+    if (!controller_parse_number(text, length, &value)) {
+        value = minimum + (maximum - minimum) / 2.0;
+    } else if (value < minimum) value = minimum;
+    else if (value > maximum) value = maximum;
+    if (!controller_parse_number_attribute(node, "step", &step)
+        || step <= 0.0) step = 1.0;
+    double next = value + step;
+    if (next > maximum) next = maximum;
+    if (next == value) return CONTROLLER_NATIVE_DEFAULT_NONE;
+    char output[64];
+    int written = snprintf(output, sizeof(output), "%.9g", next);
+    DocumentControlValueSnapshot state_snapshot = {0};
+    if (written <= 0 || (size_t) written >= sizeof(output)
+        || !document_control_value_snapshot(
+               &controller->navigation->page.document, node,
+               &state_snapshot)
+        || !document_control_value_transaction_set(
+               &controller->navigation->page.document, node, output,
+               (size_t) written, &state_snapshot)) {
+        return CONTROLLER_NATIVE_DEFAULT_FAILED;
+    }
+    if (controller_native_default_refresh(controller)) {
+        document_control_value_commit(
+            &controller->navigation->page.document, &state_snapshot);
+        return CONTROLLER_NATIVE_DEFAULT_CHANGED;
+    }
+    (void) document_control_value_restore(
+        &controller->navigation->page.document, node, &state_snapshot);
+    (void) controller_native_default_refresh(controller);
+    return CONTROLLER_NATIVE_DEFAULT_FAILED;
+}
+
+typedef enum {
+    CONTROLLER_RESET_NONE = 0,
+    CONTROLLER_RESET_CHECKED,
+    CONTROLLER_RESET_VALUE,
+    CONTROLLER_RESET_OPTION
+} ControllerResetKind;
+
+typedef struct {
+    lxb_dom_node_t *node;
+    ControllerResetKind kind;
+    bool attribute_present;
+    bool attribute_true;
+    DocumentControlValueSnapshot value_state;
+    DocumentControlCheckedSnapshot checked_state;
+} ControllerResetSnapshot;
+
+static void controller_reset_restore(
+    BrowserController *controller, ControllerResetSnapshot *snapshots,
+    size_t count)
+{
+    for (size_t at = 0; at < count; at++) {
+        ControllerResetSnapshot *snapshot = &snapshots[at];
+        if (snapshot->kind == CONTROLLER_RESET_CHECKED) {
+            (void) controller_checked_set(
+                controller, snapshot->node, snapshot->attribute_present,
+                false);
+            (void) document_control_checked_restore(
+                &controller->navigation->page.document, snapshot->node,
+                &snapshot->checked_state);
+        } else if (snapshot->kind == CONTROLLER_RESET_VALUE) {
+            if (snapshot->value_state.transaction_active) {
+                (void) document_control_value_restore(
+                    &controller->navigation->page.document, snapshot->node,
+                    &snapshot->value_state);
+            }
+        } else if (snapshot->attribute_present) {
+            (void) controller_attribute_set(
+                snapshot->node, "data-tilefinch-option-selected",
+                snapshot->attribute_true ? "true" : "false");
+        } else {
+            (void) controller_attribute_remove(
+                snapshot->node, "data-tilefinch-option-selected");
+        }
+    }
+}
+
+static ControllerNativeDefaultResult controller_reset_form(
+    BrowserController *controller, lxb_dom_node_t *form)
+{
+    /* Admission is a read-only pass. In particular, a form exceeding the
+       bounded snapshot table must not leave defaults or control-state
+       allocations behind merely because Reset was attempted. */
+    size_t admitted_count = 0;
+    size_t visited = 0;
+    for (lxb_dom_node_t *at = form->first_child;
+         at != NULL && visited++ < 65536u;) {
+        bool admitted = node_name_is(at, "input")
+            || node_name_is(at, "textarea")
+            || (node_name_is(at, "option")
+                && has_attribute(
+                    at, "data-tilefinch-option-selected"));
+        if (admitted && ++admitted_count > 128u)
+            return CONTROLLER_NATIVE_DEFAULT_FAILED;
+        if (node_name_is(at, "option")
+            && has_attribute(at, "data-tilefinch-option-selected")) {
+            size_t marker_length = 0;
+            const char *marker = document_attribute(
+                at, "data-tilefinch-option-selected", &marker_length);
+            if (marker == NULL
+                || !((marker_length == 4u
+                      && memcmp(marker, "true", 4u) == 0)
+                     || (marker_length == 5u
+                         && memcmp(marker, "false", 5u) == 0))) {
+                return CONTROLLER_NATIVE_DEFAULT_FAILED;
+            }
+        }
+        if (at->first_child != NULL) {
+            at = at->first_child;
+            continue;
+        }
+        while (at != NULL && at != form && at->next == NULL)
+            at = at->parent;
+        if (at == NULL || at == form) break;
+        at = at->next;
+    }
+    if (visited >= 65536u) return CONTROLLER_NATIVE_DEFAULT_FAILED;
+    if (admitted_count == 0) return CONTROLLER_NATIVE_DEFAULT_NONE;
+    ControllerResetSnapshot *snapshots = budget_calloc(
+        controller->navigation->budget, admitted_count, sizeof(*snapshots));
+    if (snapshots == NULL) return CONTROLLER_NATIVE_DEFAULT_FAILED;
+    size_t snapshot_count = 0;
+    visited = 0;
+    for (lxb_dom_node_t *at = form->first_child;
+         at != NULL && visited++ < 65536u;) {
+        if (node_name_is(at, "input")) {
+            ControllerResetSnapshot *snapshot =
+                &snapshots[snapshot_count++];
+            snapshot->node = at;
+            if (attribute_is(at, "type", "checkbox")
+                || attribute_is(at, "type", "radio")) {
+                if (!document_control_checked_snapshot(
+                        &controller->navigation->page.document, at,
+                        &snapshot->checked_state)) goto failed;
+                if (snapshot->checked_state.state_present
+                    && snapshot->checked_state.default_known) {
+                    snapshot->kind = CONTROLLER_RESET_CHECKED;
+                    snapshot->attribute_present = has_attribute(
+                        at, "checked");
+                }
+            } else {
+                if (!document_control_value_snapshot(
+                        &controller->navigation->page.document, at,
+                        &snapshot->value_state)) goto failed;
+                if (snapshot->value_state.state_present
+                    && snapshot->value_state.value_present) {
+                    if (!snapshot->value_state.default_value_known)
+                        goto failed;
+                    snapshot->kind = CONTROLLER_RESET_VALUE;
+                }
+            }
+        } else if (node_name_is(at, "textarea")) {
+            ControllerResetSnapshot *snapshot =
+                &snapshots[snapshot_count++];
+            snapshot->node = at;
+            if (!document_control_value_snapshot(
+                    &controller->navigation->page.document, at,
+                    &snapshot->value_state)) goto failed;
+            if (snapshot->value_state.state_present
+                && snapshot->value_state.value_present) {
+                if (!snapshot->value_state.default_value_known) goto failed;
+                snapshot->kind = CONTROLLER_RESET_VALUE;
+            }
+        } else if (node_name_is(at, "option")
+                   && has_attribute(
+                          at, "data-tilefinch-option-selected")) {
+            ControllerResetSnapshot *snapshot =
+                &snapshots[snapshot_count++];
+            snapshot->node = at;
+            snapshot->kind = CONTROLLER_RESET_OPTION;
+            snapshot->attribute_present = true;
+            size_t marker_length = 0;
+            const char *marker = document_attribute(
+                at, "data-tilefinch-option-selected", &marker_length);
+            snapshot->attribute_true = marker != NULL && marker_length == 4u
+                && memcmp(marker, "true", 4u) == 0;
+        }
+        if (at->first_child != NULL) {
+            at = at->first_child;
+            continue;
+        }
+        while (at != NULL && at != form && at->next == NULL)
+            at = at->parent;
+        if (at == NULL || at == form) break;
+        at = at->next;
+    }
+    if (visited >= 65536u || snapshot_count != admitted_count) goto failed;
+    bool changed = false;
+    for (size_t at = 0; at < snapshot_count; at++) {
+        ControllerResetSnapshot *snapshot = &snapshots[at];
+        if (snapshot->kind == CONTROLLER_RESET_CHECKED) {
+            bool differs = snapshot->attribute_present
+                != snapshot->checked_state.default_checked;
+            if (differs) {
+                if (!controller_checked_set(
+                        controller, snapshot->node,
+                        snapshot->checked_state.default_checked, false)) {
+                    goto rollback;
+                }
+                changed = true;
+            }
+        } else if (snapshot->kind == CONTROLLER_RESET_VALUE) {
+            size_t length = 0;
+            const char *value = NULL;
+            if (!document_control_default_value(
+                    &controller->navigation->page.document, snapshot->node,
+                    &value, &length)) goto rollback;
+            bool differs = length != snapshot->value_state.value_length
+                || (length != 0
+                    && memcmp(value, snapshot->value_state.value,
+                              length) != 0);
+            if (differs) {
+                if (!document_control_value_transaction_set(
+                        &controller->navigation->page.document,
+                        snapshot->node, value, length,
+                        &snapshot->value_state)) goto rollback;
+                changed = true;
+            }
+        } else if (snapshot->kind == CONTROLLER_RESET_OPTION) {
+            if (!controller_attribute_remove(
+                    snapshot->node,
+                    "data-tilefinch-option-selected")) goto rollback;
+            changed = true;
+        }
+    }
+    if (!changed) {
+        for (size_t at = 0; at < snapshot_count; at++) {
+            if (snapshots[at].value_state.transaction_active) {
+                document_control_value_commit(
+                    &controller->navigation->page.document,
+                    &snapshots[at].value_state);
+            }
+        }
+        budget_free(controller->navigation->budget, snapshots);
+        return CONTROLLER_NATIVE_DEFAULT_NONE;
+    }
+    if (!controller_native_default_refresh(controller)) goto rollback;
+    for (size_t at = 0; at < snapshot_count; at++) {
+        if (snapshots[at].value_state.transaction_active) {
+            document_control_value_commit(
+                &controller->navigation->page.document,
+                &snapshots[at].value_state);
+        }
+    }
+    budget_free(controller->navigation->budget, snapshots);
+    return CONTROLLER_NATIVE_DEFAULT_CHANGED;
+
+rollback:
+    controller_reset_restore(controller, snapshots, snapshot_count);
+    (void) controller_native_default_refresh(controller);
+failed:
+    budget_free(controller->navigation->budget, snapshots);
+    return CONTROLLER_NATIVE_DEFAULT_FAILED;
+}
+
+static lxb_dom_node_t *controller_label_control(
+    BrowserController *controller, lxb_dom_node_t *label)
+{
+    size_t for_length = 0;
+    const char *for_value = document_attribute(label, "for", &for_length);
+    lxb_dom_node_t *root = for_value != NULL && for_length != 0
+        ? lxb_dom_interface_node(controller->navigation->page.document.html)
+        : label;
+    size_t visited = 0;
+    for (lxb_dom_node_t *at = root;
+         at != NULL && visited++ < 65536u;
+         at = controller_next_node(at, root)) {
+        if (for_value != NULL && for_length != 0) {
+            size_t id_length = 0;
+            const char *id = document_attribute(at, "id", &id_length);
+            if (id == NULL || id_length != for_length
+                || memcmp(id, for_value, for_length) != 0) continue;
+        } else if (at == label) {
+            continue;
+        }
+        if (node_name_is(at, "input") || node_name_is(at, "button")
+            || node_name_is(at, "select") || node_name_is(at, "textarea")) {
+            return at;
+        }
+        if (for_value != NULL && for_length != 0) return NULL;
+    }
+    return NULL;
+}
+
+static ControllerNativeDefaultResult controller_native_default(
+    BrowserController *controller, lxb_dom_node_t *node, unsigned depth)
+{
+    if (controller == NULL || node == NULL || depth > 1u
+        || node_effectively_disabled(node)) return CONTROLLER_NATIVE_DEFAULT_NONE;
+    ControllerNativeDefaultResult result = CONTROLLER_NATIVE_DEFAULT_NONE;
+    if (node_name_is(node, "input")
+        && (attribute_is(node, "type", "checkbox")
+            || attribute_is(node, "type", "radio"))) {
+        result = controller_toggle_choice(controller, node);
+    } else if (node_name_is(node, "input")
+               && attribute_is(node, "type", "range")) {
+        result = controller_advance_range(controller, node);
+    } else if (node_name_is(node, "select")) {
+        result = controller_advance_select(controller, node);
+    } else if ((node_name_is(node, "input")
+                || node_name_is(node, "button"))
+               && attribute_is(node, "type", "reset")) {
+        lxb_dom_node_t *form = form_ancestor(node);
+        result = form == NULL ? CONTROLLER_NATIVE_DEFAULT_NONE
+                              : controller_reset_form(controller, form);
+    } else if (node_name_is(node, "summary")
+               && node->parent != NULL
+               && node_name_is(node->parent, "details")) {
+        lxb_dom_node_t *first_summary = NULL;
+        for (lxb_dom_node_t *child = node->parent->first_child;
+             child != NULL; child = child->next) {
+            if (node_name_is(child, "summary")) {
+                first_summary = child;
+                break;
+            }
+        }
+        if (first_summary == node) {
+            bool open = has_attribute(node->parent, "open");
+            bool changed = open
+                ? controller_attribute_remove(node->parent, "open")
+                : controller_attribute_set(node->parent, "open", "");
+            if (!changed) return CONTROLLER_NATIVE_DEFAULT_FAILED;
+            if (controller_native_default_refresh(controller))
+                return CONTROLLER_NATIVE_DEFAULT_CHANGED;
+            (void) (open
+                ? controller_attribute_set(node->parent, "open", "")
+                : controller_attribute_remove(node->parent, "open"));
+            (void) controller_native_default_refresh(controller);
+            return CONTROLLER_NATIVE_DEFAULT_FAILED;
+        }
+    } else if (node_name_is(node, "label")) {
+        lxb_dom_node_t *control = controller_label_control(controller, node);
+        result = control == NULL ? CONTROLLER_NATIVE_DEFAULT_NONE
+            : controller_native_default(controller, control, depth + 1u);
+    }
+    return result;
+}
+
+static bool controller_javascript_reference(const char *value, size_t length)
+{
+    static const char scheme[] = "javascript:";
+    while (length != 0 && isspace((unsigned char) *value)) {
+        value++;
+        length--;
+    }
+    return length >= sizeof(scheme) - 1u
+        && strncasecmp(value, scheme, sizeof(scheme) - 1u) == 0;
 }
 
 bool controller_focus_node(BrowserController *controller,
@@ -1792,6 +2736,28 @@ bool controller_focus_node(BrowserController *controller,
     controller->focus_moves++;
     return synchronize_dom_focus(controller, node)
            && controller_reveal_focus(controller);
+}
+
+lxb_dom_node_t *controller_focused_node(
+    const BrowserController *controller)
+{
+    if (controller == NULL
+        || (controller->focus_kind != CONTROLLER_FOCUS_LINK
+            && controller->focus_kind != CONTROLLER_FOCUS_CONTROL)) {
+        return NULL;
+    }
+    return retained_focus_node(controller);
+}
+
+bool controller_restore_focus_node(BrowserController *controller,
+                                   lxb_dom_node_t *node)
+{
+    if (controller == NULL || controller->navigation == NULL
+        || node == NULL || !resolve_focus_node(controller, node)) {
+        return false;
+    }
+    controller_refresh_authored_focus_outline(controller, node);
+    return true;
 }
 
 bool controller_rebind_focus(BrowserController *controller)
@@ -1836,9 +2802,33 @@ bool controller_focused_rect(const BrowserController *controller,
         if (!focus_region_rect(
                 controller, control_focus, region_index, false,
                                &rx, &ry, &rw, &rh)) return false;
-        if (!control_focus) {
-            const LayoutDocument *layout =
-                &controller->navigation->page.layout;
+        const LayoutDocument *layout =
+            &controller->navigation->page.layout;
+        if (control_focus) {
+            const ControlRegion *control = &layout->controls[region_index];
+            const LayoutNodeBox *box = layout_box_for_node(
+                layout, retained_focus_node(controller));
+            /*
+             * ControlRegion is deliberately at least 30 CSS pixels tall so
+             * small authored controls remain comfortable pointer targets.
+             * That accessibility expansion is not part of the element's
+             * painted border box, however.  Using it for an authored
+             * :focus outline made compact game menus look as though their
+             * buttons had oversized custom chrome.  Preserve the generous
+             * hit target while painting and exposing focus geometry from the
+             * visual box.  Fixed controls carry a viewport-relative delta in
+             * focus_region_rect(), which must follow the replacement box.
+             */
+            if (control->type != CONTROL_RESIZE && box != NULL
+                && box->width > 0 && box->height > 0) {
+                int fixed_delta_x = rx - control->x;
+                int fixed_delta_y = ry - control->y;
+                rx = controller_add_coordinate(box->x, fixed_delta_x);
+                ry = controller_add_coordinate(box->y, fixed_delta_y);
+                rw = box->width;
+                rh = box->height;
+            }
+        } else {
             lxb_dom_node_t *node = retained_focus_node(controller);
             const LayoutNodeBox *box = layout_box_for_node(layout, node);
             /*
@@ -1946,8 +2936,11 @@ bool controller_activate(BrowserController *controller,
         && controller->focus_index < layout->link_count) {
         const LinkRegion *link = &layout->links[controller->focus_index];
         const NavigationEntry *current = navigation_current(navigation);
+        const char *resolution_base = navigation->page.resource_base_url[0]
+            != '\0' ? navigation->page.resource_base_url
+                     : (current == NULL ? NULL : current->url);
         bool resolved = current != NULL
-            && fetch_resolve_url(current->url, link->url, action->url,
+            && fetch_resolve_url(resolution_base, link->url, action->url,
                                  sizeof(action->url));
         if (!resolved) {
             size_t length = link->url_length;
@@ -1956,32 +2949,76 @@ bool controller_activate(BrowserController *controller,
             action->url[length] = '\0';
         }
         lxb_dom_node_t *node = link->node;
-        action->type = CONTROLLER_ACTION_NAVIGATE;
+        bool javascript_reference = controller_javascript_reference(
+            link->url, link->url_length);
+        action->type = javascript_reference
+            ? CONTROLLER_ACTION_CONTROL : CONTROLLER_ACTION_NAVIGATE;
+        if (javascript_reference) action->url[0] = '\0';
         action->prefer_native_media = has_attribute(
             node, "data-tilefinch-provider-media");
         controller->activations++;
-        if (!controller_dispatch_activation(controller, node)) {
-            return false;
-        }
-        if (navigation->page.runtime != NULL
-            && navigation->page.script_result.last_event_cancelled) {
+        action->activation_outcome =
+            controller_dispatch_activation(controller, node);
+        if (action->activation_outcome == CONTROLLER_ACTIVATION_CANCELLED) {
+            action->type = CONTROLLER_ACTION_NONE;
+            action->url[0] = '\0';
+        } else if (action->activation_outcome
+                       == CONTROLLER_ACTIVATION_RUNTIME_FAILED) {
             action->type = CONTROLLER_ACTION_NONE;
             action->url[0] = '\0';
         }
+        /* javascript: URLs are executable navigation defaults, not request
+           targets. Tilefinch has no policy-admitted JavaScript-URL evaluator;
+           in particular javascript:void(0) is therefore a safe inert
+           control after its ordinary click handler runs, never a fetch. */
         return true;
     }
     if (controller->focus_kind == CONTROLLER_FOCUS_CONTROL
         && controller->focus_index < layout->control_count) {
         lxb_dom_node_t *node = layout->controls[controller->focus_index].node;
+        ControllerChoiceSnapshot choice_snapshots[128];
+        size_t choice_snapshot_count = 0;
+        if (!controller_choice_snapshot(
+                controller, node, choice_snapshots,
+                &choice_snapshot_count)) return false;
+        long activation_handle = controller_node_snapshot_handle(
+            controller, node);
+        if (navigation->page.runtime != NULL && activation_handle == 0)
+            return false;
         size_t handlers_before = navigation->page.script_result
             .event_handlers_invoked;
         action->type = CONTROLLER_ACTION_CONTROL;
         controller->activations++;
-        if (!controller_dispatch_activation(controller, node)) {
-            return false;
+        action->activation_outcome =
+            controller_dispatch_activation(controller, node);
+        if (action->activation_outcome == CONTROLLER_ACTIVATION_CANCELLED) {
+            action->type = CONTROLLER_ACTION_NONE;
+            return true;
         }
-        if (navigation->page.runtime != NULL
-            && navigation->page.script_result.last_event_cancelled) {
+        node = controller_node_snapshot_resolve(
+            controller, activation_handle, node);
+        if (node == NULL) {
+            if (action->activation_outcome
+                    == CONTROLLER_ACTIVATION_RUNTIME_FAILED) {
+                controller_choice_restore(
+                    controller, choice_snapshots, choice_snapshot_count);
+            }
+            action->type = CONTROLLER_ACTION_NONE;
+            return true;
+        }
+        if (action->activation_outcome
+                == CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE
+            || action->activation_outcome
+                == CONTROLLER_ACTIVATION_RUNTIME_REFUSED) {
+            ControllerNativeDefaultResult default_result =
+                controller_native_default(controller, node, 0);
+            if (default_result == CONTROLLER_NATIVE_DEFAULT_FAILED)
+                return false;
+        }
+        if (action->activation_outcome
+                == CONTROLLER_ACTIVATION_RUNTIME_FAILED) {
+            controller_choice_restore(
+                controller, choice_snapshots, choice_snapshot_count);
             action->type = CONTROLLER_ACTION_NONE;
             return true;
         }
@@ -1991,13 +3028,14 @@ bool controller_activate(BrowserController *controller,
         }
         bool submit = node_is_submit_button(node);
         if (submit && form_ancestor(node) != NULL) {
-            return controller_build_form_action(
-                controller, form_ancestor(node), node, true, action);
+            return controller_build_form_action_with_outcome(
+                controller, form_ancestor(node), node, true,
+                action->activation_outcome, action);
         }
         if (input_blocks_implicit_submission(node)
             && form_ancestor(node) != NULL) {
-            return controller_build_implicit_form_action(controller, node,
-                                                         action);
+            return controller_build_implicit_form_action(
+                controller, node, action->activation_outcome, action);
         }
         (void) controller_try_structured_audio_fallback(
             controller, node, handlers_before, action);
@@ -2006,14 +3044,55 @@ bool controller_activate(BrowserController *controller,
     if (controller->focus_kind == CONTROLLER_FOCUS_POINTER
         && retained_focus_node(controller) != NULL) {
         lxb_dom_node_t *node = retained_focus_node(controller);
+        ControllerChoiceSnapshot choice_snapshots[128];
+        size_t choice_snapshot_count = 0;
+        if (!controller_choice_snapshot(
+                controller, node, choice_snapshots,
+                &choice_snapshot_count)) return false;
+        long activation_handle = controller_node_snapshot_handle(
+            controller, node);
+        if (navigation->page.runtime != NULL && activation_handle == 0)
+            return false;
         size_t handlers_before = navigation->page.script_result
             .event_handlers_invoked;
         action->type = CONTROLLER_ACTION_CONTROL;
         controller->activations++;
-        if (!controller_dispatch_activation(controller, node)) return false;
-        if (navigation->page.runtime != NULL
-            && navigation->page.script_result.last_event_cancelled) {
+        action->activation_outcome =
+            controller_dispatch_activation(controller, node);
+        if (action->activation_outcome == CONTROLLER_ACTIVATION_CANCELLED) {
             action->type = CONTROLLER_ACTION_NONE;
+        } else {
+            node = controller_node_snapshot_resolve(
+                controller, activation_handle, node);
+            if (node == NULL) {
+                if (action->activation_outcome
+                        == CONTROLLER_ACTIVATION_RUNTIME_FAILED) {
+                    controller_choice_restore(
+                        controller, choice_snapshots,
+                        choice_snapshot_count);
+                }
+                action->type = CONTROLLER_ACTION_NONE;
+                return true;
+            }
+            if (action->activation_outcome
+                    == CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE
+                || action->activation_outcome
+                    == CONTROLLER_ACTIVATION_RUNTIME_REFUSED) {
+                ControllerNativeDefaultResult default_result =
+                    controller_native_default(controller, node, 0);
+                if (default_result == CONTROLLER_NATIVE_DEFAULT_FAILED)
+                    return false;
+            }
+            if (action->activation_outcome
+                    == CONTROLLER_ACTIVATION_RUNTIME_FAILED) {
+                controller_choice_restore(
+                    controller, choice_snapshots, choice_snapshot_count);
+                action->type = CONTROLLER_ACTION_NONE;
+                return true;
+            }
+        }
+        if (action->type == CONTROLLER_ACTION_NONE) {
+            return true;
         } else if (node_name_is(node, "video")
                    || node_name_is(node, "audio")) {
             return controller_build_media_action(
@@ -2043,34 +3122,74 @@ static bool set_control_value(BrowserController *controller,
         && control.type != CONTROL_EDITABLE) {
         return false;
     }
-    if (navigation->page.runtime != NULL) {
+    /* Readonly is part of the native mutation boundary, not merely an OSK
+       presentation hint. This also protects callers that invoke replacement
+       directly without first consulting controller_text_input_info(). */
+    if ((control.type == CONTROL_INPUT
+         || control.type == CONTROL_TEXTAREA)
+        && has_attribute(control.node, "readonly")) return false;
+    bool native_basic = controller_node_in_native_basic_root(
+        controller, control.node);
+    long control_handle = 0;
+    if (navigation->page.runtime != NULL && !native_basic) {
+        control_handle = controller_node_snapshot_handle(
+            controller, control.node);
+        if (control_handle == 0) return false;
         if (!navigation_dispatch_node_input_event(
                 navigation, control.node, "beforeinput", data, input_type,
                 NULL)) {
             return false;
         }
         if (navigation->page.script_result.last_event_cancelled) return true;
+        control.node = controller_node_snapshot_resolve(
+            controller, control_handle, control.node);
+        /* Author code may remove the edited control (or retire the realm)
+           from beforeinput. The input was delivered, but there is no longer
+           a connected native target on which to replay the default. */
+        if (control.node == NULL) return true;
+    }
+    bool retained_value = control.type == CONTROL_INPUT
+        || control.type == CONTROL_TEXTAREA;
+    DocumentControlValueSnapshot value_snapshot = {0};
+    if (retained_value
+        && !document_control_value_snapshot(
+               &navigation->page.document, control.node, &value_snapshot)) {
+        return false;
     }
     BudgetAllocationOwner previous_owner =
         document_allocation_owner_enter(&navigation->page.document);
-    lxb_status_t status;
-    if (control.type == CONTROL_TEXTAREA || control.type == CONTROL_EDITABLE) {
+    lxb_status_t status = LXB_STATUS_OK;
+    if (retained_value) {
+        status = document_control_value_transaction_set(
+            &navigation->page.document, control.node, value, length,
+            &value_snapshot)
+            ? LXB_STATUS_OK : LXB_STATUS_ERROR;
+    } else if (control.type == CONTROL_EDITABLE) {
         status = lxb_dom_node_text_content_set(
             control.node, (const lxb_char_t *) value, length);
-    } else {
-        status = lxb_dom_element_set_attribute(
-            lxb_dom_interface_element(control.node),
-            (const lxb_char_t *) "value", 5,
-            (const lxb_char_t *) value, length) == NULL
-                 ? LXB_STATUS_ERROR : LXB_STATUS_OK;
     }
     bool refreshed = status == LXB_STATUS_OK
         && document_refresh(&navigation->page.document);
     document_allocation_owner_leave(&navigation->page.document,
                                     previous_owner);
-    if (!refreshed || !navigation_relayout(navigation)) return false;
+    if (!refreshed || !navigation_relayout(navigation)) {
+        if (retained_value) {
+            (void) document_control_value_restore(
+                &navigation->page.document, control.node, &value_snapshot);
+            (void) document_refresh(&navigation->page.document);
+            (void) navigation_relayout(navigation);
+        }
+        return false;
+    }
+    if (retained_value) {
+        document_control_value_commit(
+            &navigation->page.document, &value_snapshot);
+    }
     controller->text_edits++;
-    if (navigation->page.runtime != NULL) {
+    if (navigation->page.runtime != NULL && !native_basic) {
+        control.node = controller_node_snapshot_resolve(
+            controller, control_handle, control.node);
+        if (control.node == NULL) return true;
         /* Re-find the corresponding control after relayout by stable node. */
         for (size_t i = 0; i < navigation->page.layout.control_count; i++) {
             if (navigation->page.layout.controls[i].node == control.node) {
@@ -2105,7 +3224,7 @@ static bool current_control_value(const BrowserController *controller,
             control->node, "value", &source_length);
     }
     lxb_char_t *allocated = NULL;
-    if (control->type == CONTROL_TEXTAREA
+    if ((control->type == CONTROL_TEXTAREA && source == NULL)
         || control->type == CONTROL_EDITABLE) {
         allocated = lxb_dom_node_text_content(control->node, &source_length);
         source = (const char *) allocated;
@@ -2187,7 +3306,8 @@ bool controller_text_input_info(
         && control->type != CONTROL_TEXTAREA
         && control->type != CONTROL_EDITABLE) return false;
 
-    info->editable = true;
+    info->editable = control->type == CONTROL_EDITABLE
+        || !has_attribute(control->node, "readonly");
     info->multiline = control->type != CONTROL_INPUT;
     info->voice_allowed = !autocomplete_is_sensitive(control->node);
     if (control->type == CONTROL_INPUT) {

@@ -95,6 +95,8 @@ bool script_runtime_dispatch_pointer_node(
     unsigned buttons, ScriptResult *result)
 {
     if (runtime == NULL || (node == NULL && phase != 1u)) return false;
+    runtime->result.event_dispatch_entered = false;
+    if (result != NULL) result->event_dispatch_entered = false;
     int64_t handle = node == NULL
         ? 0 : js_rt_bridge_register_node(&runtime->bridge, node);
     if (node != NULL && handle == 0) return false;
@@ -111,6 +113,10 @@ bool script_runtime_dispatch_pointer_node(
     JSValue returned = JS_UNDEFINED;
     bool trusted_activation = phase == 0u || phase == 2u || phase == 5u;
     runtime->bridge.user_activation_active = trusted_activation;
+    runtime->result.event_dispatch_entered = true;
+    if (result != NULL) result->event_dispatch_entered = true;
+    js_rt_saturating_add_size(
+        &runtime->result.event_dispatches_entered, 1u);
     bool ok = runtime_call_captured(
         runtime, runtime->dispatch_activation_handle,
         "__tilefinchDispatchActivationHandle", 7, arguments, &returned);
@@ -261,6 +267,8 @@ bool script_runtime_dispatch_submit_node(ScriptRuntime *runtime,
                                          ScriptResult *result)
 {
     if (runtime == NULL || form == NULL) return false;
+    runtime->result.event_dispatch_entered = false;
+    if (result != NULL) result->event_dispatch_entered = false;
     int64_t form_handle = js_rt_bridge_register_node(&runtime->bridge, form);
     int64_t submitter_handle = submitter == NULL ? 0
         : js_rt_bridge_register_node(&runtime->bridge, submitter);
@@ -273,6 +281,10 @@ bool script_runtime_dispatch_submit_node(ScriptRuntime *runtime,
         JS_NewInt64(runtime->context, submitter_handle)
     };
     JSValue returned = JS_UNDEFINED;
+    runtime->result.event_dispatch_entered = true;
+    if (result != NULL) result->event_dispatch_entered = true;
+    js_rt_saturating_add_size(
+        &runtime->result.event_dispatches_entered, 1u);
     bool ok = runtime_call_captured(
         runtime, runtime->dispatch_submit_handle,
         "__tilefinchDispatchSubmitHandle", 2, arguments, &returned);

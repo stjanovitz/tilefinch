@@ -144,11 +144,18 @@ The public [WebGL authoring guide](WEBGL.md) defines the bounded PSP profile
 that this lane qualifies and the patterns page authors should use.
 
 The focused game-compatibility lane exercises a bounded Canvas paddle/ball
-loop, an indexed and depth-tested WebGL loop, page-visibility suspension,
-Gamepad sampling, drawing-buffer limits, pixel readback, object deletion, and
-invalid buffer/index ranges. It also runs the complete installable
+loop, indexed WebGL, point/line/triangle depth parity, uniform snapshots,
+packed-wire boundary refusal, page-visibility suspension, Gamepad sampling,
+drawing-buffer limits, pixel readback, object deletion, and invalid
+buffer/index ranges. It also runs the complete installable
 `examples/prism-break-3d/` game through deterministic physics, collision,
-level-transition, multiball, power-up, particle, and dynamic-mesh scenarios:
+level-transition, multiball, power-up, particle, and dynamic-mesh scenarios.
+The same lane runs `examples/treadline-arena/` through its PSP-realistic
+startup, offline manifest, fixed-step tread movement, firing, pause, one-bounce
+shells, destructible barrier swaps, three armor/speed classes, class-specific
+secondary weapons, directional armor, the opt-in Command meter, all five
+gadgets, Survival, Team Control, Convoy Escort, objective-aware bot movement,
+saved setup preferences, bounded entity pools, and teardown ownership.
 
 ```sh
 cmake --build build-preset-release \
@@ -174,6 +181,129 @@ the isolated PPSSPP localhost harness; they contain no captured third-party
 game code. PPSSPP proves lifecycle, rendering, and cleanup behavior, but its
 software-renderer timing is not a substitute for the real-PSP performance
 qualification.
+
+Physical-device WebGL cadence runs use
+`tests/input-scripts/webgl-game-cadence.txt` with Prism's explicit
+`?qualification=ordinary`, `?qualification=heavy`, and
+`?qualification=profile` URLs. The first mark resets validation-only counters
+after warm-up. The profile mode also splits the example's JavaScript cost into
+update, geometry construction, upload, command setup, and HUD work. The
+terminal report separates author callback time from synchronous native WebGL
+time and records canvas-presentation median, p95, maximum, and 60/30 Hz
+deadline counts. These probes are absent from shipping builds and do not expose
+a higher-resolution clock to arbitrary page JavaScript.
+
+Treadline Arena also provides `?qualification=long-soak`. It keeps the player
+alive, drives the player with the game's bounded target/avoidance planner,
+aims and fires through the ordinary cooldown and projectile paths, cycles
+arenas, and repeats collisions, particles, smoke, and destruction. The run
+therefore proves real movement and combat instead of tracing a blind route
+that can park against scenery or settling into an idle title or victory
+screen. Use
+`tests/input-scripts/treadline-long-soak.txt`: its 2,700-frame measured window
+is roughly ninety seconds at the PSP's intended 30 Hz presentation cadence,
+with marks bracketing the interval. The validation writer
+persists one marked frame per run, so archive a gameplay frame at the first
+mark and use the final active-game summary plus near-zero HTML-overlay time to
+prove that the run did not fall back to a title panel. Use a second paired run
+or a PSPLink screenshot when a visual end-frame comparison is required.
+Validation retains percentile samples for the first 1,024 presented pipelines
+and separately counts every over-34-ms pipeline and the global worst pipeline
+for the complete run; use the latter two values to judge the long tail. Compare
+the pre-interaction and controlled budget/category reports as well as the
+QuickJS retained heap so a smooth run cannot hide gradual growth.
+
+The long soak intentionally calls the game's bounded combat planner directly;
+it is a simulation/render stress test, not an input-routing test. Before a
+release, also run `tests/input-scripts/treadline-offline-controls.txt` from
+native Home with the current Treadline package installed as Saved row one
+(the device fixture keeps Prism Break in row zero).
+That scenario opens **Library → Saved**, launches the sealed offline resource
+pack, activates Deploy, exits and re-enters Page controls with Start+Select,
+then drives nub, face, shoulder, gadget, and command inputs. Its terminal
+`tilefinch-input-gamepad:` line is the receiver proof: connected, button, and
+analog frame counts must all be nonzero, the connection count must cover the
+automatic entry and manual re-entry, and `buttons` must include the exercised
+standard Gamepad slots. Use its canvas cadence report to assess manual-input
+action frames. A direct qualification URL cannot substitute for this run.
+
+For a deterministic PPSSPP pressure bracket, set
+`TILEFINCH_PPSSPP_CPU_MHZ=166` or `111` when invoking
+`scripts/run-ppsspp-input-script.sh`. The harness writes PPSSPP 1.20's
+canonical `[CPU] CPUSpeed` setting and defaults to `0` (normal emulation).
+`TREADLINE_CPU_MHZ` remains a compatibility alias for older local runners.
+Always inspect the isolated run's generated `ppsspp.ini` before trusting a
+new clock experiment: the obsolete `LockedCPUSpeed` spelling is silently
+ignored by current PPSSPP builds.
+
+#### Staging games on a PSP without stale assets
+
+An example directory is the only authored source of its game. A PSP test can
+nevertheless involve two other copies: a temporary HTTP staging tree and an
+installed, integrity-protected offline snapshot. Rebuilding Tilefinch,
+regenerating its JavaScript bootstrap, or loading a new browser PRX does not
+update either copy. In particular, changing only an `index.html` query does
+not invalidate separately cached JavaScript, CSS, or images.
+
+Run the focused host lane above first. For a direct network-backed device run,
+use the content-addressed staging helper. It hashes the complete authored tree,
+copies it to an immutable directory, verifies an existing directory before
+reuse, and writes the exact digest-bearing document URL to the validation
+`boot.cfg`. Because the digest is part of the directory, every subresource gets
+a fresh URL when any authored byte changes:
+
+```sh
+scripts/stage-psp-game.sh \
+  --source examples/treadline-arena \
+  --stage-root /tmp/tilefinch-game-stage \
+  --base-url http://HOST_LAN_IP:8770 \
+  --boot-config build-preset-psp-validation/boot.cfg \
+  --name treadline \
+  --query 'qualification=long-soak&profile=ordinary-cadence'
+python3 -m http.server 8770 --bind HOST_LAN_IP \
+  --directory /tmp/tilefinch-game-stage
+```
+
+The helper prints the full tree digest and final URL. Preserve that output with
+the device log: it is the revision identity for the run. It also selects the
+Game Profile's bounded 384 KiB per-script envelope in the validation boot
+configuration, so a direct device run and an installed offline game admit the
+same authored package. Never edit a staged
+directory. If its contents no longer match the marker, the helper refuses it
+instead of silently testing a mixed revision. It also records a managed binding
+beside `boot.cfg`; `scripts/psplink-device.sh` rehashes and restages the current
+source automatically before every subsequent memory or slot load. Pointing
+`boot.cfg` at another URL disables that binding without rewriting the new task.
+Leave `input_script=` empty for a manual run, exit any resident Tilefinch
+instance normally with HOME, and then use `scripts/psplink-device.sh memory`.
+Do not force-unload a live browser module.
+
+Use the same helper for Prism Break, Treadline Arena, and every other packaged
+game. Do not stage with an ordinary `cp`, reuse a stable game directory, or
+claim a revision from the EBOOT alone. An end capture showing a title, pause,
+Deploy, or completion panel invalidates a gameplay soak even if the WebGL
+counters look healthy; it measured the overlay, not sustained gameplay.
+
+Prove the loaded revision instead of relying on the screen alone:
+
+- the HTTP server must record PSP requests for `index.html`, `game.css`, and
+  `game.js` from the device address;
+- the requested directory digest must match the helper's `stage-digest` output;
+- `tilefinch-validation.txt` must report one discovered and loaded game script,
+  no JavaScript error, and an interactive-ready page;
+- capture a PSPLink screenshot before input, then press Play and verify the
+  Page-controls notice and Start+Select exit;
+- when measuring cadence, use the committed input script and its explicit
+  qualification URL rather than the manual staging configuration.
+
+An installed copy in **Library → Offline apps** is a sealed snapshot. Source or
+staging changes do not mutate it. Open the current network-backed page, choose
+**Page tools → Install offline app**, confirm that the preview says Update or
+Reinstall and lists the expected resources, and complete that operation before
+testing the library entry. An integrity error means the stored document and
+resource pack no longer agree; never repair it by replacing individual files.
+Uninstall and reinstall the whole snapshot. Finally, verify offline launch with
+the network unavailable—the launch itself must not associate Wi-Fi.
 
 ### Optional ARK-4 XMB redirect
 

@@ -589,8 +589,13 @@ static bool experimental_anchor_reference(
     int target_written = snprintf(
         target_url, sizeof(target_url), "%.*s%s",
         (int) locator_length, experimental->locator, fragment);
-    if (target_written < 0 || (size_t) target_written >= sizeof(target_url)
-        || !navigation_commit_same_document_url(navigation, target_url))
+    if (target_written < 0 || (size_t) target_written >= sizeof(target_url))
+        return false;
+    const NavigationEntry *current = navigation_current(navigation);
+    bool already_committed = current != NULL
+        && strcmp(current->url, target_url) == 0;
+    if (!already_committed
+        && !navigation_commit_same_document_url(navigation, target_url))
         return false;
     if (navigation->history_index < 64) {
         experimental->history_sections[navigation->history_index] =
@@ -1804,6 +1809,7 @@ static bool run_command_loop(FILE *commands, bool interactive,
         } else if (strcmp(line, "activate") == 0
                    || strcmp(line, "cross") == 0) {
             bool media_activation = media != NULL && media->ui.visible;
+            size_t activation_history_before = navigation->history_index;
             memset(&scratch->action, 0, sizeof(scratch->action));
             ok = media_activation
                 ? (strcmp(line, "activate") == 0
@@ -1828,6 +1834,23 @@ static bool run_command_loop(FILE *commands, bool interactive,
                     fprintf(stderr, "page video open failed: %s\n",
                             media_error);
                 reset_cache = ok;
+            } else if (!media_activation && ok
+                       && scratch->action.type
+                              == CONTROLLER_ACTION_CONTROL
+                       && navigation->history_index
+                              != activation_history_before) {
+                /* BrowserEngine consumes ordinary same-document fragments
+                   immediately. A compressed-section target can live outside
+                   the currently materialized DOM, so give the experimental
+                   pager the already-committed URL and let it swap the owning
+                   section without pushing a duplicate history entry. */
+                const NavigationEntry *current =
+                    navigation_current(navigation);
+                bool handled = false;
+                ok = current != NULL && experimental_anchor_reference(
+                    experimental, navigation, controller, current->url,
+                    user_css, &handled);
+                reset_cache = ok && handled;
             } else if (!media_activation && ok
                 && (scratch->action.type == CONTROLLER_ACTION_NAVIGATE
                        || scratch->action.type

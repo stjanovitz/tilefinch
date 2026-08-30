@@ -73,17 +73,22 @@
   const documentListeners = new Map(),
     smoothElementScrolls = new WeakMap();
   globalThis.__tilefinchTaskRealm = "top";
-  let activeTask = { kind: "bootstrap", sequence: 0 },
+  let activeTaskKind = "bootstrap",
+    activeTaskSequence = 0,
     nextTaskSequence = 1;
-  globalThis.__tilefinchRunTask = (kind, callback, thisArg, args = []) => {
-    const previous = activeTask,
-      task = { kind: String(kind).slice(0, 96), sequence: nextTaskSequence++ };
-    activeTask = task;
+  globalThis.__tilefinchRunTask = (kind, callback, thisArg, args) => {
+    const previousKind = activeTaskKind,
+      previousSequence = activeTaskSequence;
+    activeTaskKind = typeof kind === "string" && kind.length <= 96
+      ? kind : String(kind).slice(0, 96);
+    activeTaskSequence = nextTaskSequence++;
     try {
       __tilefinchCallbackCheckpoint();
-      return callback.apply(thisArg, args);
+      return args === undefined
+        ? callback.call(thisArg) : callback.apply(thisArg, args);
     } finally {
-      activeTask = previous;
+      activeTaskKind = previousKind;
+      activeTaskSequence = previousSequence;
     }
   };
   const uncaughtErrors = [];
@@ -101,9 +106,9 @@
           "realm=" +
           String(globalThis.__tilefinchTaskRealm || "unknown") +
           " task=" +
-          String(activeTask.kind) +
+          String(activeTaskKind) +
           "#" +
-          String(activeTask.sequence) +
+          String(activeTaskSequence) +
           " context=" +
           String(context).slice(0, 64);
       globalThis.__tilefinchLastUncaughtTask = provenance;
@@ -6841,6 +6846,54 @@
     motionInlineHintCheckedGeneration = 0,
     motionInlineHintCached = false,
     motionInlineHintScans = 0;
+  const motionHintUtf8Length = (text) => {
+    let bytes = 0;
+    for (let at = 0; at < text.length; at++) {
+      const code = text.charCodeAt(at);
+      if (code <= 0x7f) bytes++;
+      else if (code <= 0x7ff) bytes += 2;
+      else if (
+        code >= 0xd800 &&
+        code <= 0xdbff &&
+        at + 1 < text.length &&
+        text.charCodeAt(at + 1) >= 0xdc00 &&
+        text.charCodeAt(at + 1) <= 0xdfff
+      ) {
+        bytes += 4;
+        at++;
+      } else bytes += 3;
+    }
+    return bytes;
+  };
+  const motionStyleTextPrefix = (node, maximumBytes, maximumNodes) => {
+    try {
+      const result = globalThis.__tilefinchGetTextPrefix?.(
+          node?.__handle,
+          maximumBytes,
+          maximumNodes,
+        );
+      return result && typeof result === "object"
+        ? {
+            text: String(result.text || ""),
+            nodes: Math.max(0, Math.min(maximumNodes, result.nodes | 0)),
+          }
+        : { text: "", nodes: 0 };
+    } catch {
+      return { text: "", nodes: 0 };
+    }
+  };
+  const motionStyleAttributePrefix = (node, maximumBytes) => {
+    try {
+      return String(
+        globalThis.__tilefinchGetStyleAttributePrefix?.(
+          node?.__handle,
+          maximumBytes,
+        ) ?? "",
+      );
+    } catch {
+      return "";
+    }
+  };
   globalThis.__tilefinchMaybeStartMotion = () => {
     if (typeof globalThis.__tilefinchMotionRecheck === "function") {
       globalThis.__tilefinchBeginMotionObservation?.();
@@ -6860,13 +6913,33 @@
          * covers completed nested author styles. */
         motionInlineHintCached = false;
         motionInlineHintScans++;
+        let inspectedBytes = 0,
+          inspectedNodes = 0;
         for (const root of [document.head, document.body]) {
           let node = root?.firstElementChild || null;
-          for (let visited = 0; node && visited < 64; visited++) {
-            const text =
-              String(node.localName || "").toLowerCase() === "style"
-                ? String(node.textContent || "")
-                : String(node.getAttribute?.("style") || "");
+          for (
+            let visited = 0;
+            node &&
+            visited < 64 &&
+            inspectedBytes < 256 * 1024 &&
+            inspectedNodes < 4096;
+            visited++
+          ) {
+            const available = 256 * 1024 - inspectedBytes;
+            let text = "";
+            if (String(node.localName || "").toLowerCase() === "style") {
+              const retained = motionStyleTextPrefix(
+                node,
+                available,
+                4096 - inspectedNodes,
+              );
+              text = retained.text;
+              inspectedNodes += retained.nodes;
+            } else {
+              text = motionStyleAttributePrefix(node, available);
+              inspectedNodes++;
+            }
+            inspectedBytes += motionHintUtf8Length(text);
             if (
               /@(?:-webkit-)?keyframes\b|\banimation(?:-name)?\s*:/i.test(
                 text,

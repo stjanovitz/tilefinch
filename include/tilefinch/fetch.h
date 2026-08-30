@@ -173,6 +173,11 @@ typedef struct {
     bool set_cookies_truncated;
     char error[256];
     bool timed_out;
+    /* A typed transport outcome, independent of backend-specific error text.
+       True only when the response body crossed this request's maximum_bytes;
+       allocation pressure, cancellation, HTTP errors, and empty bodies leave
+       it false. */
+    bool response_limit_exceeded;
     /* True when any redirect crossed an origin boundary. The taint is sticky
        even if a later hop returns to the initiator's origin; CORS then uses
        the final wire Origin value "null". */
@@ -539,6 +544,7 @@ typedef struct {
     FetchTransportTiming transport_timing;
     bool success;
     bool timed_out;
+    bool response_limit_exceeded;
     bool tls_verify_result_available;
     bool tls_verification_failed;
     bool tls_handshake_measured;
@@ -739,6 +745,96 @@ void fetch_background_transport_set_media_priority(bool active);
 bool fetch_background_transport_quiesce(unsigned timeout_ms);
 /* Controlled-exit teardown. Must run before the owning Budget is destroyed. */
 bool fetch_background_transport_shutdown(unsigned timeout_ms);
+
+/*
+ * Bounded full-duplex WebSocket lane. Policy and credential preparation stay
+ * on the browser thread; the owned PSP transport deep-copies the resulting
+ * immutable fields before DNS/TCP/TLS and framing move to its existing
+ * worker. At most one event is published per socket, which deliberately
+ * applies receive-side backpressure instead of growing a page-controlled
+ * queue. Host transports expose this as unavailable; deterministic runtime
+ * tests use the JavaScript native seam rather than live sockets.
+ */
+#define FETCH_WEBSOCKET_LIMIT 2u
+#define FETCH_WEBSOCKET_MESSAGE_LIMIT (64u * 1024u)
+#define FETCH_WEBSOCKET_PROTOCOLS_LIMIT 512u
+#define FETCH_WEBSOCKET_CLOSE_REASON_LIMIT 123u
+
+typedef enum {
+    FETCH_WEBSOCKET_EVENT_NONE = 0,
+    FETCH_WEBSOCKET_EVENT_OPEN,
+    FETCH_WEBSOCKET_EVENT_MESSAGE_TEXT,
+    FETCH_WEBSOCKET_EVENT_MESSAGE_BINARY,
+    FETCH_WEBSOCKET_EVENT_DRAIN,
+    FETCH_WEBSOCKET_EVENT_CLOSE
+} FetchWebSocketEventKind;
+
+typedef struct {
+    FetchWebSocketEventKind kind;
+    size_t length;
+    size_t sent_bytes;
+    size_t reason_length;
+    uint16_t close_code;
+    bool was_clean;
+    char protocol[128];
+    char reason[FETCH_WEBSOCKET_CLOSE_REASON_LIMIT + 1u];
+} FetchWebSocketEvent;
+
+typedef enum {
+    FETCH_WEBSOCKET_CLOSE_PAYLOAD_VALID = 0,
+    FETCH_WEBSOCKET_CLOSE_PAYLOAD_PROTOCOL_ERROR,
+    FETCH_WEBSOCKET_CLOSE_PAYLOAD_INVALID_UTF8,
+    FETCH_WEBSOCKET_CLOSE_PAYLOAD_INCOMPLETE
+} FetchWebSocketClosePayloadStatus;
+
+typedef struct {
+    uint16_t code;
+    bool has_code;
+    size_t reason_length;
+    char reason[FETCH_WEBSOCKET_CLOSE_REASON_LIMIT + 1u];
+} FetchWebSocketClosePayload;
+
+typedef struct {
+    size_t length;
+    bool active;
+    unsigned char bytes[125u];
+} FetchWebSocketCloseAccumulator;
+
+/* Pure browser-thread admission boundary shared by the PSP sink and host
+   security tests. websocket_url is canonicalized and bound to the prepared
+   HTTP(S) page target before CSP/mixed-content policy and PNA are derived.
+   The worker must receive only admitted_url and protect_private_network. */
+bool fetch_websocket_prepare_admission(
+    const char *websocket_url, const FetchRequest *request,
+    char admitted_url[TILEFINCH_URL_SERIALIZED_LIMIT],
+    bool *protect_private_network);
+/* Whole-message validation used before an RFC 6455 text message crosses
+   from the native transport into JavaScript. */
+bool fetch_websocket_text_payload_valid(
+    const unsigned char *payload, size_t length);
+/* Bounded RFC 6455 close-payload parser. Feed it only a complete control-frame
+   payload; callers must wait for the transport's bytesleft to reach zero. */
+FetchWebSocketClosePayloadStatus fetch_websocket_close_payload_parse(
+    const unsigned char *payload, size_t length,
+    FetchWebSocketClosePayload *parsed);
+FetchWebSocketClosePayloadStatus fetch_websocket_close_payload_accumulate(
+    FetchWebSocketCloseAccumulator *accumulator,
+    const unsigned char *chunk, size_t chunk_length,
+    size_t bytes_remaining, FetchWebSocketClosePayload *parsed);
+
+uint64_t fetch_background_websocket_open(
+    Budget *budget, const char *url, const FetchRequest *request,
+    const char *protocols, long timeout_ms);
+bool fetch_background_websocket_send(
+    uint64_t socket_id, const unsigned char *data, size_t length,
+    bool binary);
+bool fetch_background_websocket_close(
+    uint64_t socket_id, uint16_t code, const char *reason);
+bool fetch_background_websocket_abort(uint64_t socket_id);
+bool fetch_background_websocket_cancel(uint64_t socket_id);
+bool fetch_background_websocket_take_event(
+    uint64_t socket_id, unsigned char *data, size_t capacity,
+    FetchWebSocketEvent *event);
 
 typedef struct FetchScheduler FetchScheduler;
 typedef struct FetchSchedulerDomain FetchSchedulerDomain;
@@ -943,6 +1039,10 @@ bool fetch_request_stream_cancelable(
  */
 bool fetch_set_ca_bundle_path(const char *path);
 const char *fetch_ca_bundle_path(void);
+/* Eagerly loads the configured bundle into its bounded immutable cache.
+   Ordinary browsing remains lazy; validation may call this before creating
+   a background transport worker whose filesystem context is more limited. */
+bool fetch_prepare_ca_bundle(void);
 /* Available after the first HTTPS request has loaded the configured blob.
    Computing the digest piggybacks on that one read; diagnostics never reopen
    roots.pem. */

@@ -219,6 +219,7 @@ const char *psp_ui_action_name(PspUiAction action)
         case PSP_UI_ACTION_NONE: return "none";
         case PSP_UI_ACTION_FOCUS_AT: return "focus-at";
         case PSP_UI_ACTION_TOGGLE_READER: return "toggle-reader";
+        case PSP_UI_ACTION_TOGGLE_BASIC: return "toggle-basic";
         case PSP_UI_ACTION_TOGGLE_READER_SITE: return "toggle-reader-site";
         case PSP_UI_ACTION_SHOW_HOME: return "show-home";
         case PSP_UI_ACTION_HOME_ACTIVATE: return "home-activate";
@@ -308,6 +309,10 @@ const char *psp_ui_action_acknowledgement(PspUiAction action)
         case PSP_UI_ACTION_FORWARD:
             return "FORWARD RECEIVED - OPENING...";
         case PSP_UI_ACTION_RELOAD: return "RELOAD RECEIVED - STARTING...";
+        case PSP_UI_ACTION_TOGGLE_READER:
+        case PSP_UI_ACTION_TOGGLE_BASIC:
+        case PSP_UI_ACTION_TOGGLE_READER_SITE:
+            return NULL;
         case PSP_UI_ACTION_RECOVERY_READER:
             return "TRYING READER MODE...";
         case PSP_UI_ACTION_RECOVERY_DISABLE_JAVASCRIPT:
@@ -673,30 +678,49 @@ void psp_sibling_path(char *output, size_t size, const char *argv0,
 }
 
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+static uint8_t psp_probe_file_scratch[4096];
+
 bool psp_probe_file(
     const char *path, size_t maximum_bytes, size_t *size_out,
     uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES])
 {
-    if (path == NULL || size_out == NULL || digest == NULL) return false;
+    if (path == NULL || size_out == NULL || digest == NULL
+        || maximum_bytes == SIZE_MAX) return false;
     *size_out = 0;
-    FILE *file = fopen(path, "rb");
-    if (file == NULL || fseek(file, 0, SEEK_END) != 0) {
-        if (file != NULL) fclose(file);
+    /* USBHostFS implements the PSP sceIo contract directly. Its libc stdio
+       adapter is not reliable on every PSPLink build (a file can be visible
+       to `ls host0:/` while seek/tell reports failure), so startup probes use
+       the same native stat/read shape as the transport's CA loader. */
+    SceIoStat file_stat;
+    memset(&file_stat, 0, sizeof(file_stat));
+    if (sceIoGetstat(path, &file_stat) < 0 || file_stat.st_size < 0
+        || (uint64_t) file_stat.st_size > (uint64_t) maximum_bytes)
         return false;
+    size_t size = (size_t) file_stat.st_size;
+    SceUID file = sceIoOpen(path, PSP_O_RDONLY, 0);
+    if (file < 0) return false;
+    TilefinchSha256 sha;
+    tilefinch_sha256_init(&sha);
+    size_t offset = 0;
+    bool ok = true;
+    while (offset < size) {
+        size_t remaining = size - offset;
+        size_t request = remaining < sizeof(psp_probe_file_scratch)
+            ? remaining : sizeof(psp_probe_file_scratch);
+        int count = sceIoRead(file, psp_probe_file_scratch, request);
+        if (count <= 0) {
+            ok = false;
+            break;
+        }
+        if (!tilefinch_sha256_update(
+                &sha, psp_probe_file_scratch, (size_t) count)) {
+            ok = false;
+            break;
+        }
+        offset += (size_t) count;
     }
-    long length = ftell(file);
-    if (length < 0 || (size_t) length > maximum_bytes
-        || fseek(file, 0, SEEK_SET) != 0) {
-        fclose(file);
-        return false;
-    }
-    size_t size = (size_t) length;
-    uint8_t *contents = malloc(size == 0 ? 1 : size);
-    bool ok = contents != NULL
-        && (size == 0 || fread(contents, 1, size, file) == size)
-        && tilefinch_sha256_digest(contents, size, digest);
-    free(contents);
-    fclose(file);
+    if (sceIoClose(file) < 0) ok = false;
+    if (ok && offset == size) ok = tilefinch_sha256_final(&sha, digest);
     if (ok) *size_out = size;
     return ok;
 }
@@ -914,7 +938,8 @@ void psp_sync_ui(PspUiState *ui, const BrowserEngine *engine,
     psp_ui_set_page_interaction(
         ui, shape, (unsigned) browser_engine_root_scrollbar_width(engine));
     psp_ui_set_focus(
-        ui, view.has_focus, view.focus_x, view.focus_y,
+        ui, view.has_focus && !view.focus_has_authored_outline,
+        view.focus_x, view.focus_y,
         view.focus_width, view.focus_height);
     ControllerTextInputInfo text_info = {0};
     ui->focus_editable = view.has_focus

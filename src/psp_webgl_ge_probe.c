@@ -53,6 +53,10 @@
 #define PROBE_CPU_VERTICES 2046u
 #define PROBE_SPRITES 64u
 #define PROBE_PRESSURE_DRAWS 64u
+#define PROBE_CONVERSION_SOURCE_WIDTH 320u
+#define PROBE_CONVERSION_SOURCE_HEIGHT 180u
+#define PROBE_CONVERSION_DEST_WIDTH 480u
+#define PROBE_CONVERSION_DEST_HEIGHT 270u
 
 _Static_assert(PROBE_COLOR_OFFSET == (size_t) 0x0cc000,
                "the probe color surface must follow three page buffers");
@@ -167,9 +171,15 @@ static void probe_target_state(bool depth)
     } else {
         sceGuDisable(GU_DEPTH_TEST);
     }
+    /* Match production's alpha:false resolve contract: alpha aliases the
+       stencil plane on a 8888 GE target, so clear it opaque once and mask it
+       from subsequent geometry writes. */
+    sceGuPixelMask(0u);
     sceGuClearColor(0xff18120cu);
-    sceGuClear(depth ? GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT
-                     : GU_COLOR_BUFFER_BIT);
+    sceGuClearStencil(0xffu);
+    sceGuClear((depth ? GU_COLOR_BUFFER_BIT | GU_DEPTH_BUFFER_BIT
+                      : GU_COLOR_BUFFER_BIT) | GU_STENCIL_BUFFER_BIT);
+    sceGuPixelMask(UINT32_C(0xff000000));
 }
 
 static void probe_texture_state(const uint32_t *texture)
@@ -427,29 +437,79 @@ static bool probe_run_scene(
    top-left pixel rectangle used by the software renderer. This catches the
    easy-to-miss GU contract: the final two arguments are dimensions, not
    right/bottom edges. */
-static bool probe_offset_scissor(uint32_t *color, unsigned *synchronizations)
+static bool probe_offset_scissor(
+    uint32_t *color, unsigned *synchronizations,
+    PspWebglGeProbeReport *report)
 {
-    if (color == NULL || synchronizations == NULL) return false;
+    if (color == NULL || synchronizations == NULL || report == NULL)
+        return false;
     const int left = 100, top = PSP_DISPLAY_SCREEN_HEIGHT - 50 - 50;
     const uint32_t background = UINT32_C(0xff18120c);
     const uint32_t foreground = UINT32_C(0xff30d070);
     sceKernelDcacheWritebackInvalidateRange(color, PROBE_COLOR_BYTES);
-    if (sceGuStart(GU_DIRECT, probe_uncached_list()) < 0) return false;
+    int start_result = sceGuStart(GU_DIRECT, probe_uncached_list());
+    if (start_result < 0) {
+        snprintf(report->detail, sizeof(report->detail),
+                 "offset scissor start failed (0x%08x)",
+                 (unsigned) start_result);
+        return false;
+    }
     probe_target_state(false);
     sceGuScissor(left, top, 50, 50);
-    sceGuClearColor(foreground);
-    sceGuClear(GU_COLOR_BUFFER_BIT);
-    if (sceGuFinish() <= 0
-        || sceGuSync(GU_SYNC_FINISH, GU_SYNC_WAIT) < 0) return false;
+    /* GU clear commands have their own clear-region behavior and therefore
+       cannot qualify the scissor contract used by WebGL draw commands. Draw
+       an ordinary full-screen sprite through the exact production state. */
+    ProbeColorVertex *vertices = sceGuGetMemory(2 * sizeof(*vertices));
+    if (vertices == NULL) {
+        snprintf(report->detail, sizeof(report->detail),
+                 "offset scissor vertex allocation failed");
+        (void) sceGuFinish();
+        (void) sceGuSync(GU_SYNC_FINISH, GU_SYNC_WAIT);
+        return false;
+    }
+    vertices[0] = (ProbeColorVertex) {foreground, 0, 0, 0};
+    vertices[1] = (ProbeColorVertex) {
+        foreground, PSP_DISPLAY_SCREEN_WIDTH, PSP_DISPLAY_SCREEN_HEIGHT, 0
+    };
+    sceGuDisable(GU_TEXTURE_2D);
+    sceGuDrawArray(
+        GU_SPRITES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D,
+        2, NULL, vertices);
+    int finish_result = sceGuFinish();
+    int sync_result = finish_result <= 0
+        ? INT_MIN : sceGuSync(GU_SYNC_FINISH, GU_SYNC_WAIT);
+    if (finish_result <= 0 || sync_result < 0) {
+        snprintf(report->detail, sizeof(report->detail),
+                 "offset scissor submit failed (%08x/%08x)",
+                 (unsigned) finish_result, (unsigned) sync_result);
+        return false;
+    }
     (*synchronizations)++;
     sceKernelDcacheInvalidateRange(color, PROBE_COLOR_BYTES);
-    return color[(size_t) top * PSP_DISPLAY_STRIDE + left] == foreground
-        && color[(size_t) (top + 49) * PSP_DISPLAY_STRIDE + left + 49]
-            == foreground
-        && color[(size_t) (top - 1) * PSP_DISPLAY_STRIDE + left] == background
-        && color[(size_t) top * PSP_DISPLAY_STRIDE + left - 1] == background
-        && color[(size_t) (top + 50) * PSP_DISPLAY_STRIDE + left] == background
-        && color[(size_t) top * PSP_DISPLAY_STRIDE + left + 50] == background;
+    uint32_t inside_a = color[(size_t) top * PSP_DISPLAY_STRIDE + left];
+    uint32_t inside_b = color[
+        (size_t) (top + 49) * PSP_DISPLAY_STRIDE + left + 49];
+    uint32_t above = color[(size_t) (top - 1) * PSP_DISPLAY_STRIDE + left];
+    uint32_t before = color[(size_t) top * PSP_DISPLAY_STRIDE + left - 1];
+    uint32_t below = color[(size_t) (top + 50) * PSP_DISPLAY_STRIDE + left];
+    uint32_t after = color[(size_t) top * PSP_DISPLAY_STRIDE + left + 50];
+    /* Scissor is an RGB coverage contract. Alpha aliases the PSP stencil
+       plane and is intentionally irrelevant to the page's RGB565 conversion;
+       coupling it to this test hid correct offset-scissor results on hardware
+       before the conversion probe could run. */
+    const uint32_t rgb = UINT32_C(0x00ffffff);
+    bool passed = (inside_a & rgb) == (foreground & rgb)
+        && (inside_b & rgb) == (foreground & rgb)
+        && (above & rgb) == (background & rgb)
+        && (before & rgb) == (background & rgb)
+        && (below & rgb) == (background & rgb)
+        && (after & rgb) == (background & rgb);
+    if (!passed) snprintf(
+        report->detail, sizeof(report->detail),
+        "offset scissor pixels %08x/%08x %08x/%08x/%08x/%08x",
+        (unsigned) inside_a, (unsigned) inside_b, (unsigned) above,
+        (unsigned) before, (unsigned) below, (unsigned) after);
+    return passed;
 }
 
 static bool probe_realm_cache_incarnation(
@@ -487,8 +547,236 @@ static bool probe_realm_cache_incarnation(
         uint32_t sampled = color[
             (size_t) (PSP_DISPLAY_SCREEN_HEIGHT / 2) * PSP_DISPLAY_STRIDE
             + PSP_DISPLAY_SCREEN_WIDTH / 2];
-        if (sampled != colors[realm - 1u]) return false;
+        if ((sampled & UINT32_C(0x00ffffff))
+            != (colors[realm - 1u] & UINT32_C(0x00ffffff))) return false;
     }
+    return true;
+}
+
+static uint32_t probe_convert_pixel(uint32_t pixel)
+{
+    uint32_t red, green, blue;
+    __asm__("ext %0,%1,3,5" : "=r" (red) : "r" (pixel));
+    __asm__("ext %0,%1,10,6" : "=r" (green) : "r" (pixel));
+    __asm__("ext %0,%1,19,5" : "=r" (blue) : "r" (pixel));
+    __asm__("ins %0,%1,5,6" : "+r" (red) : "r" (green));
+    __asm__("ins %0,%1,11,5" : "+r" (red) : "r" (blue));
+    return red;
+}
+
+static uint32_t probe_convert_pair(uint32_t low, uint32_t high)
+{
+    __asm__("ins %0,%1,16,16" : "+r" (low) : "r" (high));
+    return low;
+}
+
+static void probe_cpu_convert_row(
+    uint16_t *output, const uint32_t *input)
+{
+    uint32_t *pairs = (uint32_t *) (void *) output;
+    for (unsigned x = 0; x < PROBE_CONVERSION_SOURCE_WIDTH; x += 4u) {
+        uint32_t p0 = probe_convert_pixel(input[x]);
+        uint32_t p1 = probe_convert_pixel(input[x + 1u]);
+        uint32_t p2 = probe_convert_pixel(input[x + 2u]);
+        uint32_t p3 = probe_convert_pixel(input[x + 3u]);
+        *pairs++ = probe_convert_pair(p0, p0);
+        *pairs++ = probe_convert_pair(p1, p2);
+        *pairs++ = probe_convert_pair(p2, p3);
+    }
+}
+
+static void probe_fill_conversion_source(uint32_t *color)
+{
+    for (unsigned y = 0; y < PROBE_CONVERSION_SOURCE_HEIGHT; y++) {
+        uint32_t *row = color + (size_t) y * PSP_DISPLAY_STRIDE;
+        for (unsigned x = 0; x < PROBE_CONVERSION_SOURCE_WIDTH; x++) {
+            unsigned red = (x * 13u + y * 3u + 17u) & 0xffu;
+            unsigned green = (x * 5u + y * 11u + 29u) & 0xffu;
+            unsigned blue = (x * 7u + y * 19u + 43u) & 0xffu;
+            row[x] = UINT32_C(0xff000000)
+                | blue << 16 | green << 8 | red;
+        }
+    }
+    sceKernelDcacheWritebackRange(color, PROBE_COLOR_BYTES);
+}
+
+/* The exact common shipping kernel: a 320x180 drawing buffer is expanded by
+   nearest neighbour to 480x270, with every fourth source-pixel group becoming
+   p0,p0,p1,p2,p2,p3 and repeated destination rows copied instead of converted
+   twice. Keep this probe-local; it measures the current path without making
+   the validation object part of shipping render ownership. */
+static void probe_cpu_convert_3_to_2(
+    uint16_t *destination, const uint32_t *source)
+{
+    for (unsigned source_y = 0, destination_y = 0;
+         source_y < PROBE_CONVERSION_SOURCE_HEIGHT;
+         source_y += 4u, destination_y += 6u) {
+        uint16_t *output = destination
+            + (size_t) destination_y * PROBE_CONVERSION_DEST_WIDTH;
+        const uint32_t *input = source
+            + (size_t) source_y * PSP_DISPLAY_STRIDE;
+        probe_cpu_convert_row(output, input);
+        memcpy(output + PROBE_CONVERSION_DEST_WIDTH, output,
+               PROBE_CONVERSION_DEST_WIDTH * sizeof(*output));
+        probe_cpu_convert_row(
+            output + PROBE_CONVERSION_DEST_WIDTH * 2u,
+            input + PSP_DISPLAY_STRIDE);
+        probe_cpu_convert_row(
+            output + PROBE_CONVERSION_DEST_WIDTH * 3u,
+            input + PSP_DISPLAY_STRIDE * 2u);
+        memcpy(output + PROBE_CONVERSION_DEST_WIDTH * 4u,
+               output + PROBE_CONVERSION_DEST_WIDTH * 3u,
+               PROBE_CONVERSION_DEST_WIDTH * sizeof(*output));
+        probe_cpu_convert_row(
+            output + PROBE_CONVERSION_DEST_WIDTH * 5u,
+            input + PSP_DISPLAY_STRIDE * 3u);
+    }
+}
+
+static void probe_copy_conversion_to_page(
+    uint16_t *page, const uint16_t *converted)
+{
+    for (unsigned y = 0; y < PROBE_CONVERSION_DEST_HEIGHT; y++) memcpy(
+        page + (size_t) y * PSP_DISPLAY_STRIDE,
+        converted + (size_t) y * PROBE_CONVERSION_DEST_WIDTH,
+        PROBE_CONVERSION_DEST_WIDTH * sizeof(*page));
+}
+
+static uint32_t probe_checksum_565(
+    const uint16_t *pixels, size_t stride)
+{
+    uint32_t hash = UINT32_C(2166136261);
+    for (unsigned y = 0; y < PROBE_CONVERSION_DEST_HEIGHT; y++) {
+        for (unsigned x = 0; x < PROBE_CONVERSION_DEST_WIDTH; x++) {
+            uint16_t pixel = pixels[(size_t) y * stride + x];
+            hash ^= pixel & 0xffu; hash *= UINT32_C(16777619);
+            hash ^= pixel >> 8; hash *= UINT32_C(16777619);
+        }
+    }
+    return hash;
+}
+
+static bool probe_ge_convert_3_to_2(
+    uint16_t *page, uint32_t *color,
+    uint64_t *submit_us, uint64_t *wait_us, uint64_t *total_us)
+{
+    uintptr_t base = (uintptr_t) sceGeEdramGetAddr() & PROBE_PHYSICAL_MASK;
+    uintptr_t target = (uintptr_t) page & PROBE_PHYSICAL_MASK;
+    if (target < base || target - base >= PSP_DISPLAY_EDRAM_BYTES)
+        return false;
+    uint64_t started = probe_now();
+    if (sceGuStart(GU_DIRECT, probe_uncached_list()) < 0) return false;
+    sceGuDrawBufferList(
+        GU_PSM_5650, (void *) (target - base), PSP_DISPLAY_STRIDE);
+    sceGuOffset(
+        2048 - PROBE_CONVERSION_DEST_WIDTH / 2,
+        2048 - PROBE_CONVERSION_DEST_HEIGHT / 2);
+    sceGuViewport(
+        2048, 2048,
+        PROBE_CONVERSION_DEST_WIDTH, PROBE_CONVERSION_DEST_HEIGHT);
+    sceGuScissor(
+        0, 0, PROBE_CONVERSION_DEST_WIDTH, PROBE_CONVERSION_DEST_HEIGHT);
+    sceGuEnable(GU_SCISSOR_TEST);
+    sceGuDisable(GU_DEPTH_TEST); sceGuDepthMask(GU_TRUE);
+    sceGuDisable(GU_ALPHA_TEST); sceGuDisable(GU_BLEND);
+    sceGuDisable(GU_DITHER); sceGuEnable(GU_TEXTURE_2D);
+    sceGuPixelMask(0u);
+    sceGuTexMode(GU_PSM_8888, 0, 0, GU_FALSE);
+    sceGuTexImage(0, 512, 256, PSP_DISPLAY_STRIDE, color);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFilter(GU_NEAREST, GU_NEAREST);
+    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
+    sceGuTexScale(1.0f, 1.0f); sceGuTexOffset(0.0f, 0.0f);
+    sceGuTexFlush();
+    ProbeTextureVertex *vertices = sceGuGetMemory(2 * sizeof(*vertices));
+    if (vertices == NULL) {
+        (void) sceGuFinish();
+        (void) sceGuSync(GU_SYNC_FINISH, GU_SYNC_WAIT);
+        return false;
+    }
+    vertices[0] = (ProbeTextureVertex) {
+        0, 0, 0xffffffffu, 0, 0, 0};
+    vertices[1] = (ProbeTextureVertex) {
+        PROBE_CONVERSION_SOURCE_WIDTH, PROBE_CONVERSION_SOURCE_HEIGHT,
+        0xffffffffu,
+        PROBE_CONVERSION_DEST_WIDTH, PROBE_CONVERSION_DEST_HEIGHT, 0};
+    sceGuDrawArray(
+        GU_SPRITES,
+        GU_TEXTURE_32BITF | GU_COLOR_8888 | GU_VERTEX_32BITF
+            | GU_TRANSFORM_2D,
+        2, NULL, vertices);
+    int list_bytes = sceGuFinish();
+    uint64_t submitted = probe_now();
+    if (list_bytes <= 0
+        || sceGuSync(GU_SYNC_FINISH, GU_SYNC_WAIT) < 0) return false;
+    uint64_t synchronized = probe_now();
+    sceKernelDcacheInvalidateRange(
+        page, PSP_DISPLAY_BUFFER_PIXELS * sizeof(*page));
+    uint64_t completed = probe_now();
+    if (submit_us != NULL) *submit_us = submitted - started;
+    if (wait_us != NULL) *wait_us = synchronized - submitted;
+    if (total_us != NULL) *total_us = completed - started;
+    return true;
+}
+
+static bool probe_conversion_cost(
+    uint16_t *page, uint16_t *cpu, size_t cpu_pixels, uint32_t *color,
+    PspWebglGeConversionProbe *result, unsigned *synchronizations)
+{
+    if (page == NULL || cpu == NULL || color == NULL || result == NULL
+        || synchronizations == NULL
+        || cpu_pixels < (size_t) PSP_DISPLAY_SCREEN_WIDTH
+                            * PSP_DISPLAY_SCREEN_HEIGHT) return false;
+    memset(result, 0, sizeof(*result));
+    probe_fill_conversion_source(color);
+    unsigned total_frames = PROBE_WARMUP_FRAMES + PROBE_MEASURED_FRAMES;
+    for (unsigned frame = 0; frame < total_frames; frame++) {
+        uint64_t convert_started = probe_now();
+        probe_cpu_convert_3_to_2(cpu, color);
+        uint64_t converted = probe_now();
+        probe_copy_conversion_to_page(page, cpu);
+        uint64_t copied = probe_now();
+        if (frame < PROBE_WARMUP_FRAMES) continue;
+        uint64_t convert_us = converted - convert_started;
+        uint64_t copy_us = copied - converted;
+        result->cpu_convert_us += convert_us;
+        result->cpu_copy_us += copy_us;
+        if (convert_us > result->cpu_convert_max_us)
+            result->cpu_convert_max_us = convert_us;
+        if (copy_us > result->cpu_copy_max_us)
+            result->cpu_copy_max_us = copy_us;
+    }
+    result->cpu_checksum = probe_checksum_565(
+        cpu, PROBE_CONVERSION_DEST_WIDTH);
+    /* Discard dirty CPU cache lines for the scanout target before GE owns it;
+       otherwise a later writeback could overwrite the conversion we measure. */
+    sceKernelDcacheWritebackInvalidateRange(
+        page, PSP_DISPLAY_BUFFER_PIXELS * sizeof(*page));
+    for (unsigned frame = 0; frame < total_frames; frame++) {
+        uint64_t submit_us = 0, wait_us = 0, total_us = 0;
+        if (!probe_ge_convert_3_to_2(
+                page, color, &submit_us, &wait_us, &total_us)) return false;
+        (*synchronizations)++;
+        if (frame < PROBE_WARMUP_FRAMES) continue;
+        result->ge_submit_us += submit_us;
+        result->ge_wait_us += wait_us;
+        result->ge_total_us += total_us;
+        if (total_us > result->ge_total_max_us)
+            result->ge_total_max_us = total_us;
+    }
+    result->ge_checksum = probe_checksum_565(page, PSP_DISPLAY_STRIDE);
+    for (unsigned y = 0; y < PROBE_CONVERSION_DEST_HEIGHT; y++) {
+        for (unsigned x = 0; x < PROBE_CONVERSION_DEST_WIDTH; x++) {
+            result->compared_pixels++;
+            if (page[(size_t) y * PSP_DISPLAY_STRIDE + x]
+                != cpu[(size_t) y * PROBE_CONVERSION_DEST_WIDTH + x]) {
+                result->mismatched_pixels++;
+            }
+        }
+    }
+    result->frames = PROBE_MEASURED_FRAMES;
+    result->available = true;
+    result->pixel_exact = result->mismatched_pixels == 0;
     return true;
 }
 
@@ -553,7 +841,9 @@ static bool probe_composite_page(uint16_t *page, uint32_t *color)
 }
 
 bool psp_webgl_ge_probe_run(
-    uint16_t *page_destination, PspWebglGeProbeReport *report)
+    uint16_t *page_destination,
+    uint16_t *cpu_destination, size_t cpu_destination_pixels,
+    PspWebglGeProbeReport *report)
 {
     if (report == NULL) return false;
     memset(report, 0, sizeof(*report));
@@ -589,15 +879,24 @@ bool psp_webgl_ge_probe_run(
             break;
         }
     }
-    if (passed && !probe_offset_scissor(color, &report->synchronizations)) {
-        snprintf(report->detail, sizeof(report->detail),
-                 "offset scissor did not match software bounds");
+    if (passed && !probe_offset_scissor(
+            color, &report->synchronizations, report)) {
+        if (report->detail[0] == '\0') snprintf(
+            report->detail, sizeof(report->detail),
+            "offset scissor did not match software bounds");
         passed = false;
     }
     if (passed && !probe_realm_cache_incarnation(
             color, texture, &report->synchronizations)) {
         snprintf(report->detail, sizeof(report->detail),
                  "realm cache incarnation reused stale texture pixels");
+        passed = false;
+    }
+    if (passed && !probe_conversion_cost(
+            page_destination, cpu_destination, cpu_destination_pixels,
+            color, &report->conversion, &report->synchronizations)) {
+        snprintf(report->detail, sizeof(report->detail),
+                 "GE conversion cost probe failed");
         passed = false;
     }
     if (passed && !probe_composite_page(page_destination, color)) {
@@ -615,9 +914,13 @@ bool psp_webgl_ge_probe_run(
 #else
 
 bool psp_webgl_ge_probe_run(
-    uint16_t *page_destination, PspWebglGeProbeReport *report)
+    uint16_t *page_destination,
+    uint16_t *cpu_destination, size_t cpu_destination_pixels,
+    PspWebglGeProbeReport *report)
 {
     (void) page_destination;
+    (void) cpu_destination;
+    (void) cpu_destination_pixels;
     if (report != NULL) {
         memset(report, 0, sizeof(*report));
         snprintf(report->detail, sizeof(report->detail), "PSP-only probe");

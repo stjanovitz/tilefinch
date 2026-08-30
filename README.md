@@ -25,14 +25,14 @@ agents are capable of. A web browser was a good test of all three.
 
 | Feature | Support |
 |---|---|
-| **Web browsing** | Real HTTPS pages with JavaScript, cookies, images, mobile layout, and TrueType text; no proxy or companion computer. |
+| **Web browsing** | Real HTTPS pages with JavaScript, cookies, images, bounded WebSockets, mobile layout, and TrueType text; no proxy or companion computer. |
 | **Native media** | YouTube's lightweight provider and compatible HTML `<video>`/`<audio>` elements open one native player. Official builds use PSP firmware for compatible 240p/360p Baseline/Main MP4 and 240p HLS with AAC-LC, including active YouTube live streams and premieres. A separately built optional decoder adds 240p H.264 High; seeking for finite media, preferred audio/subtitle languages, selectable tracks, buffering UI, resumable downloads, and audio-only playback are built in. |
 | **Tabs and navigation** | Five tabs, bookmarks, history, address/search suggestions, in-page find, optional session restore, and optional one-tab hibernation. |
 | **Ad blocking** | Conservative request blocking and cosmetic hiding are on by default; custom uBlock/EasyList-style rules and per-site exceptions are supported. |
 | **Cookie notices** | Common consent banners are hidden by default without clicking Accept or creating consent cookies; sites can be exempted individually. |
 | **Reader and offline modes** | Reflow and save articles, or preview, install, update, reinstall, and uninstall a small manifest-backed web app with its icon and already-loaded same-origin resources for offline use. |
 | **Text entry** | PSP system keyboard or the faster Danzeff radial keyboard, with local bookmark/history completion. |
-| **Canvas games** | Bounded Canvas 2D and WebGL 1 paths for charts and modest games, `ImageBitmap` asset preparation, user-activated PCM game audio, page fullscreen, and the standard Gamepad API for the built-in PSP controls. The repository includes the installable [Prism Break 3D](examples/prism-break-3d/) game. |
+| **Canvas games** | Bounded Canvas 2D and WebGL 1 paths for charts and modest games, `ImageBitmap` asset preparation, user-activated PCM game audio, page fullscreen, and the standard Gamepad API for the built-in PSP controls. The repository includes the installable [Prism Break 3D](examples/prism-break-3d/) and two-player [Treadline Arena](examples/treadline-arena/) games; PSP play uses LAN discovery or numeric invites, while ordinary browsers use manual service-free WebRTC pairing. |
 | **Appearance** | Automatic or forced page dark mode, dark and light browser chrome, switchable downloaded color-theme files, page text scaling, bounded mixed RTL/LTR layout with Arabic-family shaping, and optional Japanese, Chinese, Korean, Cyrillic, Extended Latin, Arabic, Hebrew, and color-emoji glyph packs. |
 | **Native PSP UI** | First-frame home screen, Collections, clock, battery/Wi-Fi status, contextual controls, PNG screenshots, and photographed QR diagnostics. |
 | **Optional XMB redirect** | ARK-4 can make Sony's Internet Browser icon launch Tilefinch, with a hold-L bypass back to the original browser. |
@@ -197,8 +197,14 @@ chrome. Hold the same chord to leave the mode. The PSP HOME button always
 remains a system-level way out, and page control ends automatically when the
 document navigates, native media opens, or the PSP suspends.
 **Settings → Browsing & input → Game buttons** chooses X or O as the primary
-face button. Page authors can use the [WebGL on Tilefinch guide](docs/WEBGL.md)
-for the efficient shader, resource, animation, and fallback profile.
+face button. Page authors can start with
+[Tilefinch Game Profile v1](docs/GAME_PROFILE.md) for the complete API,
+resource, lifecycle, packaging, and qualification contract, then use the
+[WebGL guide](docs/WEBGL.md) for renderer details.
+Installed games can use Tilefinch's bounded, RTCDataChannel-shaped direct
+multiplayer API. [Direct multiplayer](docs/MULTIPLAYER.md) documents LAN
+discovery, numeric invite entry, NAT traversal, page bounds, and the networks
+that cannot connect without a relay.
 Page fullscreen is entered only after a button activation; Triangle or the
 Start+Select escape chord restores Tilefinch's chrome. Game audio is a bounded
 Web Audio subset for decoded PCM WAV effects and simple generated waveforms,
@@ -218,8 +224,9 @@ consume unbounded memory.
 
 Choose **Menu → Page tools → Reader mode** on an article to hide surrounding navigation and
 sidebars, use the full viewport width, and increase line spacing. It is a
-reversible presentation change: turning it off restores the existing page
-without refetching it. **Settings → Appearance → Reader font** selects Sans or Serif. The
+reversible visual change: turning it off restores the retained author page
+without refetching it. Reader retires that page's script realm after the view
+is successfully shown, so reload to resume its JavaScript. **Settings → Appearance → Reader font** selects Sans or Serif. The
 ordinary Web pages size control changes Reader text while Reader mode is open.
 **Remember size** can retain that scale for at most 16 sites; it is off by
 default, so reading and resizing articles causes no extra Memory Stick writes.

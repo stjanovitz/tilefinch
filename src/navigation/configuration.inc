@@ -47,15 +47,7 @@ void navigation_enable_scripts(NavigationSession *session,
         /* Disabling the global setting is immediate, even if a replacement
            navigation later fails. Keep the already-rendered DOM and retire
            only author realms and their pending callbacks. */
-        script_runtime_set_synchronous_layout_callback(
-            session->page.runtime, NULL, NULL);
-        script_runtime_set_layout(session->page.runtime, NULL, 0);
-        script_runtime_destroy(session->page.runtime);
-        session->page.runtime = NULL;
-        for (size_t i = 0; i < session->page.frame_count; i++) {
-            script_runtime_destroy(session->page.frames[i].runtime);
-            session->page.frames[i].runtime = NULL;
-        }
+        navigation_retire_current_page_scripts(session);
         session->page.script_result.success = true;
         snprintf(session->page.script_result.summary,
                  sizeof(session->page.script_result.summary),
@@ -103,6 +95,15 @@ bool navigation_set_progressive_paint_hook(
     session->progressive_paint = paint;
     session->progressive_paint_opaque = paint == NULL ? NULL : opaque;
     return true;
+}
+
+void navigation_set_deferred_image_ready_hook(
+    NavigationSession *session,
+    NavigationDeferredImageReadyCallback callback, void *opaque)
+{
+    if (session == NULL) return;
+    session->deferred_image_ready = callback;
+    session->deferred_image_ready_opaque = callback == NULL ? NULL : opaque;
 }
 
 bool navigation_set_progressive_preview_lookahead(
@@ -539,6 +540,22 @@ typedef struct {
     bool style;
 } NavigationStylesheetInput;
 
+typedef enum {
+    NAVIGATION_PARSER_CHECKPOINT_OK = 0,
+    NAVIGATION_PARSER_CHECKPOINT_SOFT_REFUSAL,
+    NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE
+} NavigationParserCheckpointOutcome;
+
+typedef enum {
+    NAVIGATION_PARSER_REFUSAL_NONE = 0,
+    NAVIGATION_PARSER_REFUSAL_METADATA,
+    NAVIGATION_PARSER_REFUSAL_FINGERPRINT,
+    NAVIGATION_PARSER_REFUSAL_STYLESHEET,
+    NAVIGATION_PARSER_REFUSAL_MUTATION,
+    NAVIGATION_PARSER_REFUSAL_CSSOM,
+    NAVIGATION_PARSER_REFUSAL_SCRIPT
+} NavigationParserRefusalReason;
+
 typedef struct {
     NavigationSession *session;
     PocDocument *document;
@@ -549,10 +566,15 @@ typedef struct {
     char resource_base_url[NAVIGATION_URL_LIMIT];
     char referrer_policy[128];
     ScriptRuntime *runtime;
-    /* First complete, visibly useful body prefix observed before an author
-       parser callback.  It is a rollback source only; the live document
-       remains authoritative unless later hydration collapses its content. */
+    /* Complete, visibly useful body prefix observed before an author parser
+       callback. Bounded refresh attempts may preserve later server-rendered
+       actions without serializing the body before every script. It is a
+       rollback source only; the live document remains authoritative unless
+       hydration collapses its content. */
     DocumentBodySnapshot server_body_snapshot;
+    size_t server_body_snapshot_node_count;
+    size_t server_body_snapshot_text_bytes;
+    uint8_t server_body_snapshot_refresh_attempts;
     FetchSchedulerDomain *fetch_domain;
     FetchScheduler *scheduler;
     StreamingScriptState scripts;
@@ -590,6 +612,12 @@ typedef struct {
     size_t parsed_body_bytes;
     size_t closed_element_count;
     size_t preview_checkpoint_checks;
+    /* Parser-blocking JavaScript is useful only while its bounded cumulative
+       stage remains healthy. These counters are staging-only: EOF either
+       adopts the live realm or commits the still-authoritative server DOM. */
+    uint64_t parser_script_stage_us;
+    size_t parser_script_stage_work;
+    size_t parser_script_consecutive_failures;
     bool head_closed;
     bool body_closed;
     bool blocking_stylesheet_ready;
@@ -604,6 +632,9 @@ typedef struct {
     bool runtime_document_replacement;
     bool script_disabled_after_failure;
     bool optional_work_shed;
+    bool parser_script_circuit_open;
+    NavigationParserCheckpointOutcome parser_checkpoint_outcome;
+    NavigationParserRefusalReason pending_parser_refusal;
     bool pre_eof_preview_attempted;
     bool pre_eof_preview_painted;
     bool pre_eof_preview_style_refresh_attempted;

@@ -1,0 +1,19 @@
+# Open Treadline through the shipping Saved surface and press Deploy on the
+# first interactive frame, before the large precompiled runtime is restored.
+wait 30
+tap select
+press 3 down
+tap cross
+wait 10
+tap down
+tap cross
+tap-live cross
+mark-live deploy-pressed
+wait-live 30
+mark-live deploy-30
+wait-live 60
+mark-live deploy-90
+wait-live 120
+mark-live deploy-210
+wait-live 120
+end

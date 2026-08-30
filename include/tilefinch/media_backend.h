@@ -993,6 +993,9 @@ typedef enum {
  * addresses either way.
  */
 void media_psp_backend_reserve_pool(void);
+/* Lower bound established by the bounded early-boot admission probe. This is
+   diagnostic only: callers must not use it for allocation decisions. */
+size_t media_psp_backend_heap_capacity_lower_bound(void);
 MediaPspPrepareResult media_psp_backend_prepare_pump(
     char *error, size_t error_size);
 bool media_psp_backend_create(

@@ -426,6 +426,33 @@ fail closed. A 304 may reuse cached representation bytes, but it rebuilds the
 typed grant from the cached normalized grant plus the 304 metadata; restrictive
 CORP, `nosniff`, malformed, or truncated revalidation metadata can revoke use.
 
+Page WebSockets cross the same immutable request-authority boundary before the
+worker sees a URL. CSP `connect-src`, HTTPS-to-plaintext mixed-content policy,
+Private Network Access, cookies, Origin, and TLS verification remain native
+decisions. Redirects are refused. Two sockets, 64 KiB messages, a 64 KiB
+outbound queue, and one pending receive event per socket bound both memory and
+producer pressure; oversize input closes the connection instead of growing a
+page-controlled buffer. Detachment discards pending delivery only after the
+transport has been canceled, so a late worker event cannot enter a newer
+document realm.
+
+Direct game multiplayer is narrower than a page socket. Only an installed
+offline-app document may open the single process-wide channel, and only during
+a trusted user activation. Pages never receive a UDP descriptor or choose an
+arbitrary hostname: native code owns one fixed game-scoped protocol, validates
+every header and exact payload length, and caps messages at 512 bytes. LAN
+advertisements are only candidates; a host must approve the reported peer
+before a nonce-, endpoint-, and cookie-bound session can deliver page data.
+Navigation cancels the channel before the old realm is retired.
+
+Starting Internet multiplayer discloses the user's public IPv4 endpoint to the
+configured STUN service and, through a numeric invite, to the intended peer.
+STUN receives no game payload. The direct datagrams are not end-to-end
+encrypted or suitable for secrets, and invitation checksums are typo detection
+rather than authentication. The feature deliberately provides no relay,
+Internet directory, account identity, background listener, or ordinary-page
+escape hatch; see [Direct multiplayer](MULTIPLAYER.md).
+
 The in-memory cache retains that grant with its response and matches it only
 under the same top-level partition and requesting principal. Multiple
 authorized representations of the same URL may coexist; a generic cache

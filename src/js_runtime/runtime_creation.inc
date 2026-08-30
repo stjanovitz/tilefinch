@@ -941,6 +941,7 @@ static ScriptRuntime *script_runtime_create_internal(
     host->bridge.document_url = host->document_url;
     host->bridge.top_level_url = host->top_level_url;
     host->bridge.document_base_dirty = true;
+    host->bridge.document_url_revision = 1u;
     ScriptRemoteDocumentBinding remote_binding = {
         .element_lookup = options->remote_element_lookup,
         .element_opaque = options->remote_element_opaque,
@@ -1234,7 +1235,16 @@ static ScriptRuntime *script_runtime_create_internal(
                                        js_canvas_image_source, 1)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchWebGLRender",
-                                       js_webgl_render, 6)
+                                       js_webgl_render, 8)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchWebGLIndexMaximum",
+                                       js_webgl_index_maximum, 4)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchWebGLFiniteFloat32",
+                                       js_webgl_finite_float32, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchWebGLCombineMatrix4",
+                                       js_webgl_combine_matrix4, 3)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchWebGLReadPixels",
                                        js_webgl_read_pixels, 7)
@@ -1320,6 +1330,12 @@ static ScriptRuntime *script_runtime_create_internal(
                                        js_dom_release_node_wrapper, 2)
                    && js_rt_install_function(host->context, global, "__tilefinchGetText",
                                        js_dom_get_text, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchGetTextPrefix",
+                                       js_dom_get_text_prefix, 3)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchGetStyleAttributePrefix",
+                                       js_dom_get_style_attribute_prefix, 2)
                    && js_rt_install_function(host->context, global, "__tilefinchSetText",
                                        js_dom_set_text, 2)
                    && js_rt_install_function(host->context, global,
@@ -1418,6 +1434,12 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchDocumentBaseURI",
                                        js_document_base_uri, 0)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchCurrentDocumentURL",
+                                       js_current_document_url, 0)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchDocumentURLRevision",
+                                       js_document_url_revision, 0)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchSetDocumentURL",
                                        js_set_document_url, 1)

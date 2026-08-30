@@ -153,8 +153,15 @@ fi
 ppsspp_launchservices=0
 ppsspp_bundle=
 ppsspp_bundle_source=
-ppsspp_direct_fallback=0
-if [ "$(uname -s)" = Darwin ] && [ "${PPSSPP_LAUNCHSERVICES:-1}" != 0 ]; then
+is_darwin=0
+[ "$(uname -s)" = Darwin ] && is_darwin=1
+if [ "$is_darwin" -eq 1 ] && [ "${PPSSPP_LAUNCHSERVICES:-1}" = 0 ]; then
+    printf '%s\n' \
+        "Direct PPSSPP launch is unsafe on macOS." \
+        "Remove PPSSPP_LAUNCHSERVICES=0 and allow LaunchServices instead." >&2
+    exit 2
+fi
+if [ "$is_darwin" -eq 1 ]; then
     ppsspp_real=$(realpath "$ppsspp" 2>/dev/null || printf '%s' "$ppsspp")
     case "$ppsspp_real" in
         *.app/Contents/MacOS/*)
@@ -183,8 +190,7 @@ session_dir=$(mktemp -d "${run_base%/}/tilefinch-ppsspp-cost.XXXXXX")
 # Homebrew's bundle seal can be invalid (a relocated MoltenVK symlink, or a
 # resource-less signature). Repair a disposable copy for this session; never
 # mutate the installed emulator.
-if [ "$(uname -s)" = Darwin ] \
-    && [ "${PPSSPP_LAUNCHSERVICES:-1}" != 0 ] \
+if [ "$is_darwin" -eq 1 ] \
     && [ "$ppsspp_launchservices" -eq 0 ] \
     && [ -n "$ppsspp_bundle_source" ]; then
     fixed_bundle="$session_dir/PPSSPPSDL.app"
@@ -203,28 +209,26 @@ if [ "$(uname -s)" = Darwin ] \
         plutil -replace "$key" -string 1.20.4 \
             "$fixed_bundle/Contents/Info.plist" >/dev/null 2>&1 || true
     done
+    plutil -replace CFBundleIdentifier \
+        -string "org.tilefinch.ppsspp.cost.$$" \
+        "$fixed_bundle/Contents/Info.plist" >/dev/null 2>&1 || true
     xattr -cr "$fixed_bundle"
     if codesign --force --deep --sign - "$fixed_bundle" >/dev/null 2>&1 \
         && codesign --verify --deep --strict "$fixed_bundle" \
             >/dev/null 2>&1; then
-        lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-        if "$lsregister" -f "$fixed_bundle" >/dev/null 2>&1; then
-            ppsspp_bundle=$fixed_bundle
-            ppsspp_launchservices=1
-        else
-            ppsspp_direct_fallback=1
-        fi
+        ppsspp_bundle=$fixed_bundle
+        ppsspp_launchservices=1
     else
         printf '%s\n' \
             "PPSSPP's macOS app bundle is invalid and could not be repaired." >&2
         exit 2
     fi
 fi
-if [ "$(uname -s)" = Darwin ] \
-    && [ "${PPSSPP_LAUNCHSERVICES:-1}" != 0 ] \
-    && [ "$ppsspp_launchservices" -ne 1 ] \
-    && [ "$ppsspp_direct_fallback" -ne 1 ]; then
-    printf '%s\n' "No safe LaunchServices PPSSPP bundle is available." >&2
+if [ "$is_darwin" -eq 1 ] \
+    && [ "$ppsspp_launchservices" -ne 1 ]; then
+    printf '%s\n' \
+        "No safe LaunchServices PPSSPP bundle is available." \
+        "Reinstall PPSSPP rather than invoking PPSSPPSDL directly." >&2
     exit 2
 fi
 
@@ -328,11 +332,11 @@ run_once() {
     [ "$debug_log" -eq 1 ] && debug_flag=-d
 
     printf 'PPSSPP device cost: %s run %s/%s\n' "$scenario" "$run_index" "$runs"
-    if [ "$ppsspp_launchservices" -eq 1 ]; then
+    if [ "$is_darwin" -eq 1 ]; then
         : >"$emulator_stdout"
         : >"$emulator_stderr"
         # shellcheck disable=SC2086
-        open -n -W \
+        open -g -n -W \
             --env "HOME=$home_dir" \
             --stdout "$emulator_stdout" \
             --stderr "$emulator_stderr" \

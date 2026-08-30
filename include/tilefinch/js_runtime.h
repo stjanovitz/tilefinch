@@ -104,8 +104,19 @@ typedef struct {
     size_t geometry_retained_fast_paths;
     size_t geometry_ancestor_visits;
     size_t geometry_synchronous_layouts;
+    /* Native admission fact recorded immediately before a trusted event
+       dispatcher enters JavaScript.  It deliberately precedes every
+       author-observable property lookup so controller defaults can fail
+       closed even when a hostile getter aborts before ordinary event
+       counters advance. */
+    size_t event_dispatches_entered;
     size_t events_dispatched;
     size_t event_handlers_invoked;
+    /* Per-call authoritative fact, unlike the saturating telemetry counter
+       above. It is published before JS can run and is therefore safe for
+       native default-action decisions even after the counter reaches its
+       diagnostic ceiling. */
+    bool event_dispatch_entered;
     bool last_event_cancelled;
     size_t timer_callbacks_run;
     size_t runtime_ticks;
@@ -283,19 +294,97 @@ typedef struct {
     size_t vertices;
     uint64_t seed_us;
     uint64_t command_us;
+    uint64_t command_decode_us;
+    uint64_t command_cache_us;
+    uint64_t command_vertex_us;
+    uint64_t command_instance_matrix_us;
+    uint64_t command_instance_color_us;
+    uint64_t command_state_us;
+    uint64_t command_emit_us;
+    uint64_t command_antialias_us;
+    uint64_t command_writeback_us;
+    uint64_t command_finalize_us;
     uint64_t sync_us;
     uint64_t readback_us;
     uint64_t total_us;
     uint64_t maximum_total_us;
+    uint64_t maximum_total_seed_us;
+    uint64_t maximum_total_command_us;
+    uint64_t maximum_total_sync_us;
+    uint64_t maximum_total_readback_us;
+    size_t maximum_total_vertices;
+    size_t maximum_total_antialias_draws;
+    size_t maximum_total_antialias_edge_indices;
     uint64_t scratch_bytes;
     size_t maximum_scratch_bytes;
     size_t texture_cache_owner_resets;
     size_t texture_cache_capacity_resets;
     size_t texture_upload_bytes;
+    size_t fast_vertices;
+    size_t geometry_cache_hit_vertices;
+    size_t geometry_cache_misses;
+    size_t commands;
+    size_t draw_calls;
+    size_t matrix_loads;
+    size_t matrix_loads_avoided;
+    size_t state_changes;
+    size_t state_changes_avoided;
+    size_t display_list_bytes;
+    size_t maximum_display_list_bytes;
+    size_t antialias_draws;
+    size_t antialias_edge_indices;
+    size_t antialias_compact_instances;
+    size_t antialias_radius_lt2;
+    size_t antialias_radius_lt3;
+    size_t antialias_radius_lt4;
+    uint64_t median_total_us;
+    uint64_t p95_total_us;
+    size_t sampled_frames;
 } ScriptWebglNativeMetrics;
 
 bool script_runtime_webgl_native_metrics(
     ScriptWebglNativeMetrics *metrics);
+void script_runtime_webgl_native_metrics_reset(void);
+
+/* Validation-only event-loop phase census. The timer-callback interval
+   includes author JavaScript, command serialization and any synchronous
+   native calls made by that callback. Comparing it with the WebGL native
+   census separates page work from the renderer without exposing a timing
+   primitive to page code. Shipping builds return an empty snapshot. */
+typedef struct {
+    size_t advances;
+    size_t timer_callbacks;
+    uint64_t total_us;
+    uint64_t maximum_total_us;
+    uint64_t prelude_us;
+    uint64_t network_us;
+    uint64_t timer_prepare_us;
+    uint64_t timer_callback_us;
+    uint64_t maximum_timer_callback_us;
+    uint64_t webgl_native_us;
+    size_t webgl_native_frames;
+    uint64_t microtask_us;
+    uint64_t refresh_us;
+    uint64_t js_allocation_calls;
+    uint64_t js_free_calls;
+    uint64_t js_reallocation_calls;
+    uint64_t js_allocated_bytes;
+    uint64_t js_freed_bytes;
+    uint64_t js_reallocated_bytes;
+    size_t js_live_bytes;
+    /* Exact QuickJS js_malloc census, sampled once per advance from the O(1)
+       shim counter that already paces the GC threshold.  Rises accumulate as
+       heap-garbage production; a drop of at least the sawtooth threshold is
+       a full collection observed between two advances.  Pool-block activity
+       above cannot see arena-suballocated garbage; this can. */
+    size_t js_heap_samples;
+    size_t js_heap_last_bytes;
+    size_t js_heap_low_bytes;
+    size_t js_heap_high_bytes;
+    uint64_t js_heap_risen_bytes;
+    size_t js_heap_gc_drops;
+    size_t js_heap_gc_drop_max_bytes;
+} ScriptRuntimeTimingMetrics;
 
 /* Host-testable admission seam for the process-global PSP GE texture owner.
    Production cache metadata uses the same transition helper.  A changed
@@ -316,6 +405,71 @@ bool script_runtime_webgl_cache_admit(
     uint32_t realm_epoch_low,
     int64_t canvas_handle,
     bool *reset);
+
+/* Four exact, Budget-backed translated-geometry entries cover the common
+   static/dynamic/instanced/HUD split without the pathological short LRU cycle
+   in which every draw evicts the one needed next frame. The byte ceiling is
+   unchanged: more entries improve locality, not retained-memory authority.
+   The admission state is public only so host tests can pin eviction and
+   incarnation semantics; page code cannot observe or select any part of it. */
+#define SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT 4u
+#define SCRIPT_WEBGL_GEOMETRY_CACHE_SIGNATURE_WORDS 40u
+#define SCRIPT_WEBGL_GEOMETRY_CACHE_BYTE_LIMIT (64u * 1024u)
+
+typedef struct {
+    uint32_t words[SCRIPT_WEBGL_GEOMETRY_CACHE_SIGNATURE_WORDS];
+} ScriptWebglGeometryCacheSignature;
+
+typedef struct {
+    ScriptWebglGeometryCacheSignature signature;
+    size_t bytes;
+    uint32_t age;
+    bool valid;
+} ScriptWebglGeometryCacheRecord;
+
+typedef struct {
+    uint32_t realm_epoch_high;
+    uint32_t realm_epoch_low;
+    int64_t canvas_handle;
+    uint32_t clock;
+    size_t retained_bytes;
+    ScriptWebglGeometryCacheRecord
+        records[SCRIPT_WEBGL_GEOMETRY_CACHE_ENTRY_LIMIT];
+    bool valid;
+} ScriptWebglGeometryCacheState;
+
+bool script_runtime_webgl_geometry_cache_admit(
+    ScriptWebglGeometryCacheState *state,
+    uint32_t realm_epoch_high,
+    uint32_t realm_epoch_low,
+    int64_t canvas_handle,
+    const ScriptWebglGeometryCacheSignature *signature,
+    size_t bytes,
+    size_t *slot,
+    bool *hit,
+    bool *reset);
+
+/* Host-testable admission rule for the PSP's bounded temporal edge pass.
+   It accepts only small finite camera/projection changes and reports whether
+   there was enough movement to make a history sample useful. */
+bool script_runtime_webgl_temporal_matrix_admit(
+    const float previous[16], const float current[16], bool *moved);
+bool script_runtime_webgl_temporal_geometry_admit(
+    bool has_instance_matrix, bool has_instance_transform);
+/* The PSP may keep a non-preserved, fully-cleared depth plane authoritative
+   in EDRAM for the frame instead of copying it back to page memory. */
+bool script_runtime_webgl_depth_readback_required(
+    bool preserve_drawing_buffer, unsigned initial_clear_mask);
+/* AA edge storage and GE work are bounded independently from primary
+   geometry. Oversized meshes degrade to their ordinary filled draw. */
+bool script_runtime_webgl_antialias_edges_admit(
+    size_t admitted_indices, size_t requested_indices);
+/* Sub-three-pixel compact instances are better represented by their filled
+   coverage alone. A smoothed edge on geometry this small toggles as its
+   projected radius crosses a pixel boundary, which reads as shimmer rather
+   than antialiasing on the PSP panel. */
+bool script_runtime_webgl_antialias_radius_admit(
+    float projected_radius_squared);
 
 /* Cheap, allocation-free counters for attributing one host evaluation
    boundary. Unlike ScriptResult, this intentionally does not refresh or copy
@@ -374,6 +528,19 @@ typedef struct {
 } ScriptMutationJournal;
 
 typedef struct ScriptRuntime ScriptRuntime;
+
+bool script_runtime_timing_metrics(
+    const ScriptRuntime *runtime, ScriptRuntimeTimingMetrics *metrics);
+void script_runtime_timing_metrics_reset(ScriptRuntime *runtime);
+uint64_t script_runtime_gc_probe_us(ScriptRuntime *runtime);
+
+/* Temporarily cap newly armed JavaScript watchdog slices to one absolute
+   monotonic deadline.  Navigation uses this around parser-blocking work so
+   time already spent fetching a script is deducted from that same bounded
+   stage.  Passing zero makes the next slice immediately interrupt. */
+void script_runtime_limit_execution_for_us(ScriptRuntime *runtime,
+                                           uint64_t remaining_us);
+void script_runtime_clear_execution_limit(ScriptRuntime *runtime);
 
 /* The navigation/fetch layers serialize URLs into 2 KiB buffers. Keeping the
    media bridge at the same bound avoids carrying an extra 2 KiB in every
@@ -480,6 +647,13 @@ typedef void (*ScriptModuleOpaqueDestroyCallback)(void *opaque);
 /* Module scripts require a JavaScript MIME essence; missing and generic text
    types fail even without X-Content-Type-Options. Parameters are ignored. */
 bool script_module_mime_type_allowed(const char *content_type);
+/* Compiles one bounded classic script without evaluating it. The returned
+   compiler artifact is Budget-owned and remains only an optional accelerator;
+   callers must retain the source as the authoritative fallback. */
+bool script_compile_classic_bytecode(
+    Budget *budget, const char *source, size_t source_length,
+    const char *source_url, size_t maximum_bytecode_length,
+    unsigned char **bytecode, size_t *bytecode_length);
 /* Classify an HTML script type attribute without assuming NUL termination.
    Empty/whitespace and JavaScript MIME values are classic; `module` is the
    module keyword. Matching is ASCII-case-insensitive. */
@@ -792,6 +966,8 @@ size_t script_runtime_collect_and_trim(ScriptRuntime *runtime);
 /* Remaining active QuickJS heap allowance. Unlike the browser Budget this
    excludes allocator cache capacity and reflects JS_SetMemoryLimit(). */
 size_t script_runtime_heap_remaining(const ScriptRuntime *runtime);
+/* O(1) monotonic count of actual allocator refusals for this realm. */
+size_t script_runtime_heap_rejections(const ScriptRuntime *runtime);
 /* Result of the most recently completed top-level evaluation slice. This is
    an O(1), allocation-free telemetry read used by admission tuning. */
 bool script_runtime_last_slice_interrupted(const ScriptRuntime *runtime);
@@ -880,6 +1056,10 @@ ScriptInlineDataEvaluation script_runtime_evaluate_inline_data(
 bool script_runtime_refresh_named_properties(ScriptRuntime *runtime);
 bool script_runtime_finish_loading(ScriptRuntime *runtime,
                                    ScriptResult *result);
+/* True while author work that can still change the committed document is
+   queued. This includes bounded timers/network/script tasks, a partially
+   drained QuickJS job checkpoint, and a continued classic-script slice. */
+bool script_runtime_has_pending_author_work(ScriptRuntime *runtime);
 /* Parser and native DOM owners call this after mutations which bypass the JS
    bridge so the next baseURI/resource preparation observes the live tree. */
 void script_runtime_invalidate_document_base(ScriptRuntime *runtime);
@@ -958,6 +1138,11 @@ long script_runtime_node_handle(ScriptRuntime *runtime,
    Use them for controller/layout and script-discovery frontiers. */
 long script_runtime_node_weak_handle(ScriptRuntime *runtime,
                                      lxb_dom_node_t *node);
+/* O(fixed handle-table capacity), allocation-free admission check used before
+   a native DOM transaction that will require one new provenance handle. No
+   author code runs between this check and registration. */
+bool script_runtime_node_handle_capacity_available(
+    const ScriptRuntime *runtime);
 /* Resolves only a still-live generation-tagged native handle.  The check does
    not dereference a caller-retained DOM pointer, so snapshots remain safe
    after destructive author mutations invalidate and free their old nodes. */
@@ -1098,6 +1283,11 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack(
 bool script_runtime_consume_relayout(ScriptRuntime *runtime);
 void script_runtime_telemetry(const ScriptRuntime *runtime,
                               ScriptRuntimeTelemetry *telemetry);
+/* Preserve the first author/runtime failure before a bounded parser stage
+   retires its realm. This does not run author accessors or rewrite an earlier
+   diagnostic already stored by the candidate navigation. */
+void script_runtime_preserve_first_error(const ScriptRuntime *runtime,
+                                         ScriptResult *result);
 /* Moves the bounded mutation journal into result and clears the runtime copy.
    Returns false when no mutations were recorded. */
 bool script_runtime_consume_mutations(ScriptRuntime *runtime,

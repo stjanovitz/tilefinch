@@ -573,6 +573,8 @@ typedef struct {
     size_t command_end;
     int origin_y;
     int top;
+    int bottom_y;
+    int maximum_offset;
 } StickyRange;
 
 typedef struct {
@@ -585,6 +587,7 @@ typedef struct {
     int origin_y;
     int height;
     int inset;
+    int scroll_end;
     bool from_bottom;
 } FixedRange;
 
@@ -1046,6 +1049,13 @@ void layout_reuse_cache_invalidate_focus(
    an image. */
 void layout_reuse_cache_update_images(LayoutReuseCache *cache,
                                       const ImageResources *images);
+/* Rebind image pointers retained by an already-committed display list after
+   alias insertion moved the bounded ImageResources table. previous_items
+   must remain alive for the duration of this call. */
+size_t layout_rebind_image_resources(LayoutDocument *layout,
+                                     const ImageResource *previous_items,
+                                     size_t previous_count,
+                                     const ImageResources *images);
 /* Rebinds an unchanged stylesheet after transactional struct ownership
    moves. Content rebuilds must use the ordinary invalidation path. */
 void layout_reuse_cache_rebind_stylesheet(

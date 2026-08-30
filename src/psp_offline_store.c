@@ -63,12 +63,28 @@ static bool offline_commit(
     bool record_history)
 {
     if (engine == NULL || url == NULL || html == NULL) return false;
+    /* Offline routes bypass the ordinary network-navigation entrance, which
+       normally completes the regular/metric sans baseline before layout.
+       Do the same local-file-only preparation here. Without it, a fast launch
+       can commit against the uppercase-only emergency bitmap face and an
+       immediately animating app may never yield the idle slice that repairs
+       its lowercase text. Font loss remains fail-soft: a missing local face
+       still leaves the existing bounded fallback available. */
+    (void) browser_engine_prepare_navigation_fonts(engine, "GET", url);
     (void) browser_engine_set_user_css(engine, "", 0);
     bool loaded = browser_engine_commit_html(
         engine, url, html, length, record_history);
     budget_free(browser_engine_budget(engine), html);
-    return loaded && browser_engine_refresh_shell(engine)
-        && browser_engine_render_frame(engine, NULL);
+    if (!loaded || !browser_engine_refresh_shell(engine)) return false;
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    if (navigation != NULL
+        && navigation->page.document.autofocus_attribute_present) {
+        /* HTML autofocus is advisory. A hidden, disabled, or malformed target
+           must not turn a successfully restored offline document into a load
+           failure. */
+        (void) browser_engine_restore_autofocus(engine);
+    }
+    return browser_engine_render_frame(engine, NULL);
 }
 
 void psp_offline_store_init(
@@ -420,8 +436,8 @@ static bool offline_open_article(
 }
 
 static bool offline_open_app(
-    PspOfflineStore *store, BrowserEngine *engine, uint32_t id,
-    bool record_history)
+    PspOfflineStore *store, BrowserEngine *engine,
+    const BrowserProfile *profile, uint32_t id, bool record_history)
 {
     const OfflineLibraryItem *item = offline_library_find(&store->library, id);
     char *html = NULL;
@@ -433,16 +449,26 @@ static bool offline_open_app(
         offline_status(store, error);
         return false;
     }
+    /* Native Home intentionally boots without JavaScript. An installed app
+       must not inherit that transient engine state: apply the user's policy
+       for the app's original origin before committing its retained document. */
+    if (!browser_engine_set_javascript_enabled(
+            engine, browser_profile_javascript_allowed_for_url(
+                        profile, item->source_url))) {
+        budget_free(browser_engine_budget(engine), html);
+        offline_status(store, "OFFLINE APP POLICY FAILED");
+        return false;
+    }
     bool opened = offline_commit(
         engine, item->source_url, html, length, record_history);
-    NavigationSession *navigation = browser_engine_navigation(engine);
-    bool scripts_missing = opened && navigation != NULL
-        && navigation->script_discovered != 0
-        && navigation->script_loaded == 0;
+    /* read_web_app has already authenticated the package and restored every
+       indexed response before the document reaches this point.  A zero
+       script_loaded count at commit is not evidence of an incomplete app:
+       an app may intentionally insert all of its external scripts after the
+       first paint.  Actual missing responses fail through the ordinary
+       script/resource diagnostics when they are requested. */
     offline_status(store,
-        !opened ? "OFFLINE APP FAILED"
-        : scripts_missing ? "OFFLINE APP NEEDS REINSTALL"
-                          : "OFFLINE APP");
+        opened ? item->title : "SAVED GAME COULD NOT OPEN");
     return opened;
 }
 
@@ -515,8 +541,9 @@ static PspOfflineRouteResult offline_enqueue_video(
 }
 
 PspOfflineRouteResult psp_offline_store_handle_url(
-    PspOfflineStore *store, BrowserEngine *engine, const char *url,
-    const char *source_title, bool record_history)
+    PspOfflineStore *store, BrowserEngine *engine,
+    const BrowserProfile *profile, const char *url, const char *source_title,
+    bool record_history)
 {
     size_t root_length = strlen(OFFLINE_ROOT);
     if (store == NULL || engine == NULL || url == NULL
@@ -554,7 +581,7 @@ PspOfflineRouteResult psp_offline_store_handle_url(
         return offline_open_article(store, engine, id, record_history)
             ? PSP_OFFLINE_ROUTE_PAGE : PSP_OFFLINE_ROUTE_ERROR;
     if (offline_route_id(url, "app", &id))
-        return offline_open_app(store, engine, id, record_history)
+        return offline_open_app(store, engine, profile, id, record_history)
             ? PSP_OFFLINE_ROUTE_PAGE : PSP_OFFLINE_ROUTE_ERROR;
     if (offline_route_id(url, "video", &id))
         return offline_open_video_page(store, engine, id, record_history)

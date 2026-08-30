@@ -696,13 +696,10 @@ static void navigation_paint_authoritative_layout(
     }
 }
 
-static bool navigation_document_requires_runtime(
-    const NavigationSession *session, const PocDocument *document)
+static bool navigation_document_has_author_runtime_content(
+    const PocDocument *document)
 {
-    if (session == NULL || document == NULL || document->html == NULL) {
-        return true;
-    }
-    if (session->trace_page_capabilities) return true;
+    if (document == NULL || document->html == NULL) return false;
     lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
     lxb_dom_node_t *node = root;
     size_t visited = 0;
@@ -768,6 +765,16 @@ static bool navigation_document_requires_runtime(
     return false;
 }
 
+static bool navigation_document_requires_runtime(
+    const NavigationSession *session, const PocDocument *document)
+{
+    if (session == NULL || document == NULL || document->html == NULL) {
+        return true;
+    }
+    return session->trace_page_capabilities
+        || navigation_document_has_author_runtime_content(document);
+}
+
 static bool navigation_finish_authoritative_layout(
     NavigationSession *session, const char *url,
     NavigationDocumentStream *streaming,
@@ -783,6 +790,7 @@ static bool navigation_finish_authoritative_layout(
     const char *body_text = session->page.layout.count <= 1u
         ? document_body_text(&session->page.document) : NULL;
     if (body_text != NULL && session->page.document.body_text_length >= 64u
+        && session->page.script_degradation_observed
         && !session->page.stylesheet.static_custom_element_fallback) {
         stylesheet_enable_static_custom_element_fallback(
             &session->page.stylesheet);
@@ -1034,6 +1042,22 @@ static bool navigation_commit_document(
             streaming->scripts.early.watchdog_classification_miss_loops;
         session->script_watchdog_classification_miss_flags =
             streaming->scripts.early.watchdog_classification_miss_flags;
+    }
+    if (streaming != NULL) {
+        const ExternalScriptMetrics *early = &streaming->scripts.early;
+        bool shed_author_script_work =
+            streaming->script_disabled_after_failure
+            && session->scripts_enabled
+            && session->document_scripts_enabled
+            && navigation_document_has_author_runtime_content(
+                   &session->page.document);
+        if (shed_author_script_work
+            || early->failed != 0u || early->skipped_cross_origin != 0u
+            || early->skipped_quota != 0u
+            || early->skipped_pressure != 0u
+            || early->cost_class_rejections != 0u) {
+            session->page.script_degradation_observed = true;
+        }
     }
     if (streaming != NULL && streaming->scheduler != NULL) {
         session->page.resource_scheduler = streaming->scheduler;
@@ -1367,7 +1391,8 @@ static bool navigation_commit_document(
                    poisoned realm and finish this candidate without further
                    script. Infrastructure failures and cancellation remain
                    transactional failures. */
-                if (!navigation_retire_exhausted_script_realms(session)) {
+                if (!navigation_retire_exhausted_script_realms(
+                        session, false)) {
                     document_body_snapshot_destroy(&server_snapshot);
                     goto fail;
                 }
@@ -1376,6 +1401,8 @@ static bool navigation_commit_document(
                 || metrics.skipped_quota != 0
                 || metrics.skipped_pressure != 0
                 || metrics.cost_class_rejections != 0;
+            if (hydration_degraded || metrics.skipped_cross_origin != 0u)
+                session->page.script_degradation_observed = true;
             if (hydration_degraded) {
                 (void) navigation_restore_server_body_if_degraded(
                     session, rollback_snapshot);
@@ -1522,7 +1549,8 @@ static bool navigation_commit_document(
         }
         if (!navigation_dispatch_stylesheet_events(
                 session, session->page.resource_base_url)
-            && !navigation_retire_exhausted_script_realms(session)) {
+            && !navigation_retire_exhausted_script_realms(
+                    session, false)) {
             snprintf(session->last_error, sizeof(session->last_error),
                      "stylesheet completion event dispatch failed");
             goto fail;
@@ -1556,24 +1584,41 @@ static bool navigation_commit_document(
        satisfied reliably; reveal readable light DOM while retaining compact
        author fallbacks for navigation chrome. Successful script pipelines
        keep ordinary custom-element semantics. */
+    /* Session counters are retained diagnostics and can describe an earlier
+       page.  Only the document-local fact may relax custom-element hiding for
+       this commit; otherwise a clean blank shell after a failed navigation
+       can accidentally inherit the previous page's fallback. */
     bool static_script_fallback =
-        (streaming != NULL && streaming->script_disabled_after_failure)
-        || session->script_failed != 0
-        || session->script_skipped_quota != 0
-        || session->script_skipped_pressure != 0
-        || session->script_cost_class_rejections != 0;
+        session->page.script_degradation_observed;
     if (static_script_fallback) {
         stylesheet_enable_static_custom_element_fallback(
             &session->page.stylesheet);
         (void) document_install_static_shell_fallback(
             &session->page.document);
     }
-    if (session->prepare_reader_candidates) {
-        if (!reader_document_prepare(
-                &session->page.document, &reader_analysis)) {
-            snprintf(session->last_error, sizeof(session->last_error),
-                     "reader candidate analysis failed within the page budget");
-            goto fail;
+    /* A full Reader style census is optional and expensive on an ordinary
+       healthy commit. Defer it until an explicit Reader request unless this
+       document already carries hard script-degradation evidence and may need
+       automatic recovery. */
+    if (session->prepare_reader_candidates
+        && (static_script_fallback || optional_work_shed
+            || session->user_css_length != 0u)) {
+        /* The extractor connects its native root atomically, and the
+           BrowserEngine must immediately retain that exact identity. Reserve
+           the fixed weak-handle slot before any DOM mutation so exhaustion
+           declines Reader without leaving an untracked public marker behind. */
+        if (!script_runtime_node_handle_capacity_available(
+                session->page.runtime)) {
+            reader_analysis = (ReaderDocumentAnalysis) {
+                .prepared = true, .bounded_out = true
+            };
+        } else if (!reader_document_prepare_with_stylesheet(
+                       &session->page.document, &session->page.stylesheet,
+                       &reader_analysis)) {
+            reader_analysis = (ReaderDocumentAnalysis) {
+                .prepared = true, .kind = READER_PAGE_RAW,
+                .bounded_out = true
+            };
         }
         session->page.reader_analysis = reader_analysis;
     }
@@ -1882,6 +1927,7 @@ static bool navigation_commit_document(
     budget_free(session->budget, previous_page);
     session->replacement_failure_overlay_active = false;
     session->replacement_failure_message[0] = '\0';
+    session->page.committed_us = navigation_now_us();
     session->loads_committed++;
     return true;
 

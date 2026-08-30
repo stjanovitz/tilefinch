@@ -13,12 +13,44 @@
 
 typedef struct DocumentControlState DocumentControlState;
 
+#define DOCUMENT_CONTROL_VALUE_LIMIT 512u
+
+/* A fixed-size, allocation-free rollback record for one native value edit.
+   The controller takes this after beforeinput author work has settled and
+   restores it if refresh or relayout cannot publish the edit. */
+typedef struct {
+    bool valid;
+    bool state_present;
+    bool value_present;
+    bool default_value_known;
+    bool transaction_active;
+    size_t value_length;
+    size_t value_capacity;
+    lxb_dom_node_t *node;
+    char *retained_value;
+    char value[DOCUMENT_CONTROL_VALUE_LIMIT + 1u];
+} DocumentControlValueSnapshot;
+
+/* A compact rollback record for the authored checkedness latch. Native
+   checkbox/radio defaults can touch up to the bounded group size, so this
+   deliberately stays allocation-free and small enough for a fixed array. */
+typedef struct {
+    bool valid;
+    bool state_present;
+    bool default_known;
+    bool default_checked;
+    lxb_dom_node_t *node;
+} DocumentControlCheckedSnapshot;
+
 typedef struct {
     Budget *budget;
     char *markup;
     size_t length;
     size_t capacity;
     size_t source_text_bytes;
+    /* Bounded semantic-action census retained with the serialized body so a
+       later parser prefix can replace an earlier text-only rollback source. */
+    size_t source_action_count;
 } DocumentBodySnapshot;
 
 typedef enum {
@@ -165,6 +197,9 @@ bool document_set_element_inner_html(PocDocument *document,
    execution. A partial serialization is never exposed as a fallback. */
 bool document_body_snapshot_capture(PocDocument *document,
                                     DocumentBodySnapshot *snapshot);
+/* Allocation-free, 4K-node-bounded census used to detect a compact late
+   server action without serializing the body at every parser checkpoint. */
+size_t document_body_action_count(const PocDocument *document);
 /* A replacement callback owns external-handle retirement and mutation
    publication; the callback-free path performs the native equivalents. */
 bool document_body_snapshot_restore_if_degraded(
@@ -188,6 +223,40 @@ void document_style_attribute_set_cssom_authorized(lxb_dom_node_t *node,
 const char *document_control_value(lxb_dom_node_t *node, size_t *length);
 bool document_control_value_set(PocDocument *document, lxb_dom_node_t *node,
                                 const char *value, size_t length);
+bool document_control_value_snapshot(
+    PocDocument *document, lxb_dom_node_t *node,
+    DocumentControlValueSnapshot *snapshot);
+/* Replaces the live value while retaining the prior allocation in snapshot.
+   Finish with commit on successful presentation or restore on failure. */
+bool document_control_value_transaction_set(
+    PocDocument *document, lxb_dom_node_t *node,
+    const char *value, size_t length,
+    DocumentControlValueSnapshot *snapshot);
+void document_control_value_commit(
+    PocDocument *document, DocumentControlValueSnapshot *snapshot);
+/* Restores without allocating. It also removes a control-state record which
+   the failed edit created for a node that previously had none. */
+bool document_control_value_restore(
+    PocDocument *document, lxb_dom_node_t *node,
+    DocumentControlValueSnapshot *snapshot);
+bool document_control_checked_snapshot(
+    PocDocument *document, lxb_dom_node_t *node,
+    DocumentControlCheckedSnapshot *snapshot);
+bool document_control_checked_restore(
+    PocDocument *document, lxb_dom_node_t *node,
+    const DocumentControlCheckedSnapshot *snapshot);
+/* Returns the bounded authored value captured before the live input/textarea
+   value first changes. Reset defaults remain page-owned and survive later
+   editing without being stored in author-visible data attributes. */
+bool document_control_default_value(
+    PocDocument *document, lxb_dom_node_t *node,
+    const char **value, size_t *length);
+/* Retain the authored checked state before a script-free controller default
+   first mutates a checkbox/radio. The existing bounded control-state table
+   owns this bit; no engine-private data-* attribute leaks into page markup. */
+bool document_control_checked_default(
+    PocDocument *document, lxb_dom_node_t *node, bool authored_checked,
+    bool *default_checked);
 bool document_control_resize_set(PocDocument *document, lxb_dom_node_t *node,
                                  int width, int height);
 bool document_control_resize(lxb_dom_node_t *node,

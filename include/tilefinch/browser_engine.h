@@ -372,6 +372,16 @@ size_t browser_engine_cancel_network_work(
 BrowserNavigationJobStatus browser_engine_navigation_status(
     const BrowserEngine *engine);
 bool browser_engine_navigation_pending(const BrowserEngine *engine);
+typedef enum {
+    BROWSER_NAVIGATION_RETURN_NONE = 0,
+    BROWSER_NAVIGATION_RETURN_BACK,
+    BROWSER_NAVIGATION_RETURN_FORWARD
+} BrowserNavigationReturnTarget;
+/* Exact history direction that returns from the last successful navigation
+   to its originating entry. A successful Back traversal therefore returns
+   FORWARD rather than moving farther away from the usable page. */
+BrowserNavigationReturnTarget browser_engine_last_navigation_return_target(
+    const BrowserEngine *engine);
 /* Borrows the in-flight destination until the job reaches a terminal state. */
 const char *browser_engine_pending_navigation_url(
     const BrowserEngine *engine);
@@ -610,6 +620,7 @@ typedef struct {
     bool can_go_back;
     bool can_go_forward;
     bool has_focus;
+    bool focus_has_authored_outline;
     bool loading;
     int scroll_y;
     int maximum_scroll_y;
@@ -654,7 +665,73 @@ bool browser_engine_set_user_css(
     BrowserEngine *engine, const char *css, size_t length);
 bool browser_engine_apply_user_css(
     BrowserEngine *engine, const char *css, size_t length);
+#if !defined(__PSP__)
+/* Deterministic host seam for proving that CSS adoption and render-shell
+   publication roll back as one transaction. */
+void browser_engine_test_refuse_next_render_shell_init(void);
+/* Deterministic wall clock for recovery-settle tests. Zero restores the
+   platform monotonic clock. */
+void browser_engine_test_set_recovery_time_us(uint64_t now_us);
+#endif
+/* Prepare the bounded semantic tree and return true only when Reader is
+   actually available. A safely analyzed RAW page returns false without
+   changing its committed layout, scroll position, or controller focus; its
+   diagnostic analysis remains readable with browser_engine_reader_analysis. */
 bool browser_engine_prepare_reader(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis);
+/* Freeze a prepared Reader projection after frontend CSS succeeds. The exact
+   native root is revalidated, then only this page's author realms are retired;
+   configured JavaScript policy remains available to later navigations. */
+bool browser_engine_activate_reader_view(BrowserEngine *engine);
+/* Analyze Reader suitability without connecting an extracted root or
+   consuming the page's one Reader/Basic presentation slot. */
+bool browser_engine_analyze_reader(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis);
+/* Prepare an action-preserving Basic view without applying presentation CSS.
+   Admission is complete and transactional: the raw DOM remains authoritative,
+   and no partial extracted tree is connected when a byte/node/form bound is
+   reached. Existing Reader and Basic roots are never accumulated. */
+bool browser_engine_prepare_basic_view(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis);
+/* Freeze a prepared Basic projection into a script-free action surface after
+   the frontend has successfully applied its presentation CSS. This retires
+   only the current page's author realms; configured JavaScript policy remains
+   enabled for later navigations. */
+bool browser_engine_activate_basic_view(BrowserEngine *engine);
+/* Report the same settled-presentation predicate used by automatic blank-page
+   recovery. A viewport background by itself is blank; text, images, controls,
+   links, or any additional painted layer are useful output. */
+bool browser_engine_page_is_visually_blank(const BrowserEngine *engine);
+typedef enum {
+    BROWSER_BLANK_READER_RECOVERY_NONE = 0,
+    BROWSER_BLANK_READER_RECOVERY_AVAILABLE,
+    BROWSER_BLANK_READER_RECOVERY_UNAVAILABLE,
+    /* A live author task can still reveal the page. Frontends should keep
+       the committed raw page and retry after the next ordinary runtime turn. */
+    BROWSER_BLANK_READER_RECOVERY_DEFERRED
+} BrowserBlankReaderRecovery;
+/* Recover a committed author page only when its settled layout paints no
+   useful content or controls, the engine recorded concrete author-script
+   degradation, and the bounded Reader extractor produces a semantic tree.
+   Negative admission does not apply presentation CSS; checks for blank output
+   and script evidence precede Reader DOM preparation. This stricter recovery
+   boundary may admit a bounded low-confidence article that ordinary optional
+   auto-Reader correctly declines, because the alternative is proven blank.
+   A bounded-out or truncated analysis remains unavailable. Live author work
+   returns DEFERRED before Reader analysis or DOM mutation. */
+BrowserBlankReaderRecovery browser_engine_prepare_blank_reader_recovery(
+    BrowserEngine *engine, ReaderDocumentAnalysis *analysis);
+typedef enum {
+    BROWSER_BASIC_VIEW_RECOVERY_NONE = 0,
+    BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE,
+    BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE,
+    BROWSER_BASIC_VIEW_RECOVERY_DEFERRED
+} BrowserBasicViewRecovery;
+/* Offer a hidden Basic clone only after author work settles, current-page
+   script degradation is proven, and the page is blank or has no positive-size
+   actionable region. Preparing the clone does not apply CSS or hide useful
+   raw pixels; the frontend decides whether to switch presentations. */
+BrowserBasicViewRecovery browser_engine_prepare_basic_view_recovery(
     BrowserEngine *engine, ReaderDocumentAnalysis *analysis);
 void browser_engine_set_reader_candidate_mode(BrowserEngine *engine,
                                               bool enabled);

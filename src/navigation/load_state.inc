@@ -1,7 +1,9 @@
-static bool navigation_stream_body(void *opaque, const unsigned char *data,
-                                   size_t length)
+static NavigationParserCheckpointOutcome navigation_stream_body(
+    void *opaque, const unsigned char *data, size_t length)
 {
     NavigationDocumentStream *stream = opaque;
+    if (stream == NULL) return NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
+    stream->parser_checkpoint_outcome = NAVIGATION_PARSER_CHECKPOINT_OK;
     if (stream != NULL && stream->session != NULL
         && stream->session->performance.first_body_byte_us == 0
         && stream->started_us != 0 && length != 0) {
@@ -11,7 +13,9 @@ static bool navigation_stream_body(void *opaque, const unsigned char *data,
     /* The fetch scheduler must exist before parsing can discover preloads,
        but the realm is created at the first parser-blocking script after
        metadata scanning has resolved the page's layout viewport. */
-    if (!navigation_stream_prepare_runtime(stream, false)) return false;
+    if (!navigation_stream_prepare_runtime(stream, false)) {
+        return NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
+    }
     /* Head/body close checkpoints are needed for progressive layout even
        when author JavaScript is disabled. The callback itself gates script
        execution on the session policy. */
@@ -38,8 +42,14 @@ static bool navigation_stream_body(void *opaque, const unsigned char *data,
     navigation_stream_scan_style_preloads(stream, data, length);
     navigation_stream_launch_preloads(stream);
     navigation_stream_progress_preloads(stream, false);
-    if (!document_parser_feed(stream->parser, (const char *) data, length)) {
-        return false;
+    bool hard_feed_fault = navigation_test_consume_parser_checkpoint_fault(
+        NAVIGATION_TEST_PARSER_FEED_HARD_FAILURE);
+    if (hard_feed_fault
+        || !document_parser_feed(
+               stream->parser, (const char *) data, length)) {
+        stream->parser_checkpoint_outcome =
+            NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
+        return NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
     }
     uint64_t preview_after =
         stream->session->performance.streaming_preview_layout_us
@@ -62,7 +72,7 @@ static bool navigation_stream_body(void *opaque, const unsigned char *data,
         }
     }
     navigation_stream_try_pre_eof_preview(stream);
-    return true;
+    return stream->parser_checkpoint_outcome;
 }
 
 static bool navigation_stream_headers(void *opaque,
@@ -338,10 +348,10 @@ static bool navigation_load_stall(void *opaque)
     return true;
 }
 
-static bool navigation_load_process_staged_body(
+static NavigationParserCheckpointOutcome navigation_load_process_staged_body(
     NavigationLoad *load, const NavigationLoadQuota *quota)
 {
-    if (load == NULL) return false;
+    if (load == NULL) return NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
     size_t maximum_bytes = quota == NULL
         || quota->maximum_parser_body_bytes == 0
             ? 64u * 1024u : quota->maximum_parser_body_bytes;
@@ -351,12 +361,15 @@ static bool navigation_load_process_staged_body(
     size_t length = load->staged_body_length < maximum_bytes
         ? load->staged_body_length : maximum_bytes;
     uint64_t started = navigation_now_us();
+    NavigationParserCheckpointOutcome outcome =
+        NAVIGATION_PARSER_CHECKPOINT_OK;
     bool ok = true;
     if (length != 0) {
         if (load->sectioned) {
             ok = section_route_stream_body(
                 &load->section_router,
                 load->staged_body + load->staged_body_offset, length);
+            if (!ok) outcome = NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
             if (ok && load->section_store != NULL) {
                 load->metrics.safe_sections_ready =
                     load->section_store->sealed_section_count;
@@ -364,9 +377,10 @@ static bool navigation_load_process_staged_body(
                     load->section_store->sealed_source_bytes;
             }
         } else {
-            ok = navigation_stream_body(
+            outcome = navigation_stream_body(
                 load->document_stream,
                 load->staged_body + load->staged_body_offset, length);
+            ok = outcome != NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
         }
         if (ok) {
             load->staged_body_length -= length;
@@ -401,7 +415,7 @@ static bool navigation_load_process_staged_body(
     if (load->staged_body_length != 0) {
         load->metrics.parser_quota_yields++;
     }
-    return ok;
+    return ok ? outcome : NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
 }
 
 static bool navigation_load_retry_zero_body_deadline(NavigationLoad *load)
@@ -647,10 +661,11 @@ static bool navigation_load_parse_after_incumbent_retirement(
     while (offset < load->staged_body_length) {
         size_t remaining = load->staged_body_length - offset;
         size_t part = remaining < chunk_bytes ? remaining : chunk_bytes;
-        if (!navigation_stream_body(
-                load->document_stream,
-                load->staged_body + load->staged_body_offset + offset,
-                part)) {
+        NavigationParserCheckpointOutcome outcome = navigation_stream_body(
+            load->document_stream,
+            load->staged_body + load->staged_body_offset + offset,
+            part);
+        if (outcome == NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE) {
             return false;
         }
         offset += part;
@@ -1059,7 +1074,9 @@ NavigationLoadStatus navigation_load_pump(
     load->metrics.pump_calls++;
     if (!defer_candidate_parse
         && (load->staged_body_length != 0 || load->staged_stall)) {
-        if (!navigation_load_process_staged_body(load, quota)) {
+        NavigationParserCheckpointOutcome parser_outcome =
+            navigation_load_process_staged_body(load, quota);
+        if (parser_outcome == NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE) {
             navigation_load_set_error(
                 load, NAVIGATION_LOAD_FAILED,
                 load->sectioned
@@ -1101,14 +1118,18 @@ NavigationLoadStatus navigation_load_pump(
         load->metrics.safe_section_source_bytes =
             load->section_store->sealed_source_bytes;
     }
-    if (!defer_candidate_parse
-        && !navigation_load_process_staged_body(load, quota)) {
-        navigation_load_set_error(
-            load, NAVIGATION_LOAD_FAILED,
-            load->sectioned ? "section parser rejected staged response body"
-                            : "HTML parser rejected staged response body");
-        navigation_load_release_staging(load, true);
-        return load->status;
+    if (!defer_candidate_parse) {
+        NavigationParserCheckpointOutcome parser_outcome =
+            navigation_load_process_staged_body(load, quota);
+        if (parser_outcome == NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE) {
+            navigation_load_set_error(
+                load, NAVIGATION_LOAD_FAILED,
+                load->sectioned
+                  ? "section parser rejected staged response body"
+                  : "HTML parser rejected staged response body");
+            navigation_load_release_staging(load, true);
+            return load->status;
+        }
     }
     uint64_t total_elapsed = navigation_now_us() - started;
     load->metrics.total_pump_us += total_elapsed;
@@ -1256,7 +1277,9 @@ static bool navigation_load_finalize_parse(NavigationLoad *load)
            transactional EOF boundary; blocking resources are resolved by the
            candidate pipeline with their normal priority and failure rules. */
         uint64_t metadata_started = navigation_now_us();
-        if (!navigation_stream_scan_metadata(stream)) {
+        NavigationParserCheckpointOutcome metadata =
+            navigation_stream_metadata_checkpoint(stream);
+        if (metadata == NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE) {
             load->status = NAVIGATION_LOAD_FAILED;
             return false;
         }

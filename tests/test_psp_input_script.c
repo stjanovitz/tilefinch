@@ -274,6 +274,9 @@ static bool test_names(void)
     CHECK(strcmp(psp_input_script_action_name(
                      PSP_UI_ACTION_EDIT_DEVELOPER_URL),
                  "edit-developer-url") == 0);
+    CHECK(strcmp(psp_input_script_action_name(
+                     PSP_UI_ACTION_TOGGLE_BASIC),
+                 "toggle-basic") == 0);
     CHECK(strcmp(psp_input_script_setting_name(
                      PSP_UI_SETTING_PAGE_FONT_PERCENT),
                  "page-font-percent") == 0);
@@ -307,6 +310,75 @@ static bool test_live_media_scenario(const char *directory)
           && strcmp(script.steps[9].mark, "coalesced-seek") == 0
           && strcmp(script.steps[11].mark, "pre-commit") == 0
           && strcmp(script.steps[14].mark, "committed-seek") == 0);
+    return true;
+}
+
+static bool test_treadline_long_soak_scenario(const char *directory)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/treadline-long-soak.txt", directory);
+    PspInputScript script;
+    warning_count = 0;
+    CHECK(psp_input_script_load(
+        &script, path, record_warning, NULL));
+    CHECK(script.step_count == 6u && warning_count == 0u);
+    CHECK(script.steps[0].kind == PSP_INPUT_SCRIPT_STEP_WAIT
+          && script.steps[0].advance_while_busy
+          && script.steps[0].ticks == 260u);
+    CHECK(script.steps[1].kind == PSP_INPUT_SCRIPT_STEP_MARK
+          && strcmp(script.steps[1].mark, "webgl-measure-start") == 0);
+    CHECK(script.steps[2].kind == PSP_INPUT_SCRIPT_STEP_WAIT
+          && script.steps[2].advance_while_busy
+          && script.steps[2].ticks == 2700u);
+    CHECK(script.steps[3].kind == PSP_INPUT_SCRIPT_STEP_MARK
+          && strcmp(script.steps[3].mark, "webgl-measure-end") == 0);
+    CHECK(script.steps[4].ticks == 10u
+          && script.steps[5].kind == PSP_INPUT_SCRIPT_STEP_END);
+    return true;
+}
+
+static bool test_treadline_offline_controls_scenario(const char *directory)
+{
+    char path[512];
+    snprintf(path, sizeof(path), "%s/treadline-offline-controls.txt",
+             directory);
+    PspInputScript script;
+    warning_count = 0;
+    CHECK(psp_input_script_load(
+        &script, path, record_warning, NULL));
+    CHECK(script.step_count == 32u && warning_count == 0u);
+    CHECK(script.steps[1].buttons == PSP_UI_BUTTON_MENU
+          && script.steps[2].kind == PSP_INPUT_SCRIPT_STEP_PRESS
+          && script.steps[2].ticks == 6u
+          && script.steps[2].buttons == PSP_UI_BUTTON_DOWN
+          && script.steps[3].buttons == PSP_UI_BUTTON_CONFIRM
+          && script.steps[5].buttons == PSP_UI_BUTTON_DOWN
+          && script.steps[6].buttons == PSP_UI_BUTTON_CONFIRM);
+    CHECK(script.steps[8].kind == PSP_INPUT_SCRIPT_STEP_MARK
+          && strcmp(script.steps[8].mark, "offline-open") == 0);
+    CHECK(script.steps[9].buttons == PSP_UI_BUTTON_CONFIRM);
+    CHECK(script.steps[13].kind == PSP_INPUT_SCRIPT_STEP_MARK
+          && strcmp(script.steps[13].mark, "webgl-measure-start") == 0);
+    CHECK(script.steps[15].kind == PSP_INPUT_SCRIPT_STEP_ANALOG
+          && script.steps[15].analog_x == 255u
+          && script.steps[15].analog_y == 128u);
+    CHECK(script.steps[16].buttons
+          == (PSP_UI_BUTTON_TOOLBAR | PSP_UI_BUTTON_PAGE_DOWN));
+    CHECK(script.steps[18].buttons == PSP_UI_BUTTON_UP
+          && script.steps[20].kind == PSP_INPUT_SCRIPT_STEP_ANALOG
+          && script.steps[20].analog_x == 0u);
+    CHECK(script.steps[21].buttons == PSP_UI_BUTTON_PAGE_UP
+          && script.steps[22].buttons == PSP_UI_BUTTON_DOWN
+          && script.steps[23].buttons
+              == (PSP_UI_BUTTON_CONFIRM | PSP_UI_BUTTON_PAGE_DOWN));
+    CHECK(script.steps[25].buttons
+          == (PSP_UI_BUTTON_CANCEL | PSP_UI_BUTTON_PAGE_DOWN)
+          && strcmp(script.steps[26].mark, "game-input-end") == 0);
+    CHECK(script.steps[27].buttons
+              == (PSP_UI_BUTTON_ADDRESS | PSP_UI_BUTTON_MENU)
+          && script.steps[27].ticks == 45u
+          && strcmp(script.steps[29].mark, "controls-exited") == 0
+          && script.steps[31].kind == PSP_INPUT_SCRIPT_STEP_END);
     return true;
 }
 
@@ -487,7 +559,9 @@ int main(int argc, char **argv)
 
     if (!test_parser() || !test_file_capacity_boundary()
         || !test_stepper() || !test_names()
-        || !test_live_media_scenario(directory)) return 1;
+        || !test_live_media_scenario(directory)
+        || !test_treadline_long_soak_scenario(directory)
+        || !test_treadline_offline_controls_scenario(directory)) return 1;
 
     if (update) {
         FILE *out = fopen(golden_path, "wb");

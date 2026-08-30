@@ -112,7 +112,7 @@ static void menu_update_offline_app_preview(
     } else if (pressed & PSP_UI_BUTTON_CANCEL) {
         intent->action = PSP_UI_ACTION_CANCEL_OFFLINE_APP;
         ui->offline_app_preview = NULL;
-        ui->menu_selection = 6u;
+        ui->menu_selection = 7u;
         menu_open_parent(ui, PSP_UI_SCREEN_PAGE_TOOLS);
         intent->visual_changed = true;
     }
@@ -188,7 +188,7 @@ static void menu_update_site_controls(
             ui->menu_selection = 0u;
             menu_open_parent(ui, PSP_UI_SCREEN_PAGE_INFORMATION);
         } else {
-            ui->menu_selection = 5u;
+            ui->menu_selection = 6u;
             menu_open_parent(ui, PSP_UI_SCREEN_PAGE_TOOLS);
         }
         intent->visual_changed = true;
@@ -230,7 +230,7 @@ static void menu_update_page_information(
         intent->visual_changed = true;
     } else if (pressed & PSP_UI_BUTTON_CANCEL) {
         ui->data_clear_confirmation = 0u;
-        ui->menu_selection = 5u;
+        ui->menu_selection = 6u;
         menu_open_parent(ui, PSP_UI_SCREEN_PAGE_TOOLS);
         intent->visual_changed = true;
     }
@@ -238,7 +238,8 @@ static void menu_update_page_information(
 
 static size_t menu_failure_action_count(const PspUiState *ui)
 {
-    size_t count = 3u; /* Retry, Reader, return. */
+    size_t count = 2u; /* Retry and return. */
+    if (ui->failure_actions & PSP_UI_FAILURE_READER) count++;
     if (ui->failure_actions & PSP_UI_FAILURE_WIFI) count++;
     if (ui->failure_actions & PSP_UI_FAILURE_DISABLE_JAVASCRIPT) count++;
     if (ui->failure_actions & PSP_UI_FAILURE_AUDIO_ONLY) count++;
@@ -250,7 +251,9 @@ static PspUiAction menu_failure_action(
     const PspUiState *ui, size_t selected)
 {
     if (selected-- == 0u) return PSP_UI_ACTION_RELOAD;
-    if (selected-- == 0u) return PSP_UI_ACTION_RECOVERY_READER;
+    if ((ui->failure_actions & PSP_UI_FAILURE_READER) != 0u) {
+        if (selected-- == 0u) return PSP_UI_ACTION_RECOVERY_READER;
+    }
     if ((ui->failure_actions & PSP_UI_FAILURE_WIFI) != 0u) {
         if (selected-- == 0u) return PSP_UI_ACTION_CHECK_WIFI_SIGN_IN;
     }
@@ -307,16 +310,17 @@ static void menu_update_page_tools(
         switch (ui->menu_selection) {
             case 0: intent->action = PSP_UI_ACTION_OPEN_FIND; break;
             case 1: intent->action = PSP_UI_ACTION_TOGGLE_READER; break;
-            case 2: intent->action = PSP_UI_ACTION_TOGGLE_BOOKMARK; break;
-            case 3: intent->action = PSP_UI_ACTION_SAVE_FOR_LATER; break;
-            case 4: intent->action = PSP_UI_ACTION_SCREENSHOT; break;
-            case 5:
+            case 2: intent->action = PSP_UI_ACTION_TOGGLE_BASIC; break;
+            case 3: intent->action = PSP_UI_ACTION_TOGGLE_BOOKMARK; break;
+            case 4: intent->action = PSP_UI_ACTION_SAVE_FOR_LATER; break;
+            case 5: intent->action = PSP_UI_ACTION_SCREENSHOT; break;
+            case 6:
                 ui->menu_selection = 0u;
                 ui->data_clear_confirmation = 0u;
                 menu_open_child(ui, PSP_UI_SCREEN_PAGE_INFORMATION);
                 intent->visual_changed = true;
                 return;
-            case 6: intent->action = PSP_UI_ACTION_INSTALL_OFFLINE_APP; break;
+            case 7: intent->action = PSP_UI_ACTION_INSTALL_OFFLINE_APP; break;
         }
         ui->menu_selection = UI_MENU_ROW_PAGE_TOOLS;
         menu_close(ui);

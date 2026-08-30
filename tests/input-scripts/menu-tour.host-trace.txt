@@ -37,4 +37,4 @@ mark home screen=home
 mark home-moved screen=home
 step=89 action=exit setting=none screen=home menu=6 option=2 group=0 tab=0
 mark exiting screen=home
-outcome complete frames=394 steps=92/93
+outcome complete frames=396 steps=92/93

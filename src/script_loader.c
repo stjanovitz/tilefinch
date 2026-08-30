@@ -40,6 +40,17 @@ static void script_trace_attempt(const char *url)
                 url == NULL ? "<null>" : url);
 }
 
+static void script_metrics_record_source_work(
+    ExternalScriptMetrics *metrics, size_t source_length)
+{
+    if (metrics == NULL) return;
+    if (source_length > SIZE_MAX - metrics->source_work_bytes) {
+        metrics->source_work_bytes = SIZE_MAX;
+    } else {
+        metrics->source_work_bytes += source_length;
+    }
+}
+
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_JAVASCRIPT, (s))
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_JAVASCRIPT, (n), (s))
 #define budget_realloc(b, p, s) budget_realloc_category((b), BUDGET_CATEGORY_JAVASCRIPT, (p), (s))
@@ -1263,6 +1274,17 @@ static void script_record_watchdog_miss(
     script_record_watchdog_profile(&signals, metrics);
 }
 
+static void script_metrics_record_execution_time(
+    ExternalScriptMetrics *metrics, uint64_t started_ns)
+{
+    if (metrics == NULL) return;
+    uint64_t finished_ns = tilefinch_platform_monotonic_time_ns();
+    uint64_t elapsed_us = finished_ns >= started_ns
+        ? (finished_ns - started_ns) / UINT64_C(1000) : 0;
+    metrics->execution_us = elapsed_us > UINT64_MAX - metrics->execution_us
+        ? UINT64_MAX : metrics->execution_us + elapsed_us;
+}
+
 static void script_lazy_source_release(void *opaque)
 {
     browser_shared_body_release((BrowserSharedBody *) opaque);
@@ -1288,6 +1310,7 @@ static bool script_evaluate_external_node(
         && (script_runtime_origin_is_opaque(runtime)
             || !tilefinch_url_same_origin(request_url, response_url))
         && !module && !script_crossorigin_present(node)) {
+        metrics->policy_refusals++;
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
         return false;
     }
@@ -1297,6 +1320,7 @@ static bool script_evaluate_external_node(
             source_length);
     if (integrity_result == TILEFINCH_INTEGRITY_MISMATCH
         || integrity_result == TILEFINCH_INTEGRITY_INVALID) {
+        metrics->policy_refusals++;
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
         return false;
     }
@@ -1314,10 +1338,14 @@ static bool script_evaluate_external_node(
         BrowserSharedBody *lease = browser_shared_body_retain(source_body);
         if (lease != NULL) {
             metrics->lazy_webpack_candidates++;
+            uint64_t evaluation_started_ns =
+                tilefinch_platform_monotonic_time_ns();
             ScriptLazyEvaluation lazy =
                 script_runtime_evaluate_external_lazy_webpack(
                     runtime, node, source, source_length, response_url,
                     lazy_plan, lease, script_lazy_source_release, result);
+            script_metrics_record_execution_time(
+                metrics, evaluation_started_ns);
             if (lazy != SCRIPT_LAZY_EVALUATION_FALLBACK) {
                 metrics->lazy_webpack_applied++;
                 metrics->lazy_webpack_factories += lazy_plan->factory_count;
@@ -1334,6 +1362,7 @@ static bool script_evaluate_external_node(
                                            : result->error);
                 }
                 bool succeeded = lazy == SCRIPT_LAZY_EVALUATION_SUCCEEDED;
+                if (!succeeded) metrics->execution_failures++;
                 budget_free(budget, result);
                 return succeeded;
             }
@@ -1341,6 +1370,7 @@ static bool script_evaluate_external_node(
             browser_shared_body_release(lease);
         }
     }
+    uint64_t evaluation_started_ns = tilefinch_platform_monotonic_time_ns();
     bool ok = module
         ? script_runtime_evaluate_external_module_context(
               runtime, node, source, source_length, request_url,
@@ -1349,7 +1379,9 @@ static bool script_evaluate_external_node(
         : script_runtime_evaluate_external_classic_cached(
               runtime, node, source, source_length, request_url,
               response_url, result);
+    script_metrics_record_execution_time(metrics, evaluation_started_ns);
     if (!ok) {
+        metrics->execution_failures++;
         script_record_watchdog_miss(
             runtime, source, source_length, metrics);
     }
@@ -1417,6 +1449,7 @@ static bool script_evaluate_inline_node(ScriptRuntime *runtime, Budget *budget,
     bool ok = false;
     ScriptInlineDataEvaluation data = SCRIPT_INLINE_DATA_FALLBACK;
     size_t data_bytes = 0;
+    uint64_t evaluation_started_ns = tilefinch_platform_monotonic_time_ns();
     if (!module && try_data_fast_path) {
         data = script_runtime_evaluate_inline_data(
             runtime, node, &data_bytes);
@@ -1441,12 +1474,14 @@ static bool script_evaluate_inline_node(ScriptRuntime *runtime, Budget *budget,
     } else {
         ok = script_runtime_evaluate_inline(runtime, node, module, result);
     }
+    script_metrics_record_execution_time(metrics, evaluation_started_ns);
     /* An author exception terminates this script, not the document.  In
        particular, a realm-local OOM can leave the allocator at its ceiling
        even after QuickJS has released the failed compilation's temporaries;
        collect at this safe top-level boundary so DOMContentLoaded and later
        small scripts still have a chance to run inside the unchanged limit. */
     if (!ok) (void) script_runtime_collect_and_trim(runtime);
+    if (!ok) metrics->execution_failures++;
     if (!ok && script_runtime_last_slice_interrupted(runtime)) {
         script_record_watchdog_profile(&inline_cost, metrics);
     }
@@ -1480,6 +1515,7 @@ static bool script_admit_inline_data_node(
         || source_length == NULL) return false;
     if (!tilefinch_csp_allows_inline_script(csp, node)) {
         metrics->failed++;
+        metrics->policy_refusals++;
         return false;
     }
     if (!script_runtime_inline_data_candidate(node, source_length)) {
@@ -1509,8 +1545,12 @@ static bool script_execute_inline_admitted(
         size_t source_length = 0;
         if (script_admit_inline_data_node(
                 runtime, budget, node, csp, metrics, &source_length)) {
+            uint64_t evaluation_started_ns =
+                tilefinch_platform_monotonic_time_ns();
             ScriptInlineDataEvaluation data =
                 script_runtime_evaluate_inline_data(runtime, node, NULL);
+            script_metrics_record_execution_time(
+                metrics, evaluation_started_ns);
             if (data == SCRIPT_INLINE_DATA_APPLIED) {
                 metrics->inline_data_fast_paths++;
                 metrics->inline_data_quota_exemptions++;
@@ -1524,6 +1564,7 @@ static bool script_execute_inline_admitted(
             }
             if (data == SCRIPT_INLINE_DATA_FAILED) {
                 metrics->failed++;
+                metrics->execution_failures++;
                 (void) script_runtime_collect_and_trim(runtime);
                 return true;
             }
@@ -1558,6 +1599,7 @@ static bool script_admit_inline_node(ScriptRuntime *runtime, Budget *budget,
     }
     if (!tilefinch_csp_allows_inline_script(csp, node)) {
         metrics->failed++;
+        metrics->policy_refusals++;
         return false;
     }
     size_t source_length = 0;
@@ -1600,7 +1642,8 @@ static bool script_evaluate_data_url_node(
     ScriptRuntime *runtime, Budget *budget, lxb_dom_node_t *node,
     const char *url, size_t url_length, const char *referrer_policy,
     bool module, size_t maximum_file_bytes, long timeout_ms,
-    ExternalScriptMetrics *metrics)
+    ExternalScriptMetrics *metrics,
+    DocumentScriptProcessResult *process_result)
 {
     unsigned char *source = NULL;
     size_t source_length = 0;
@@ -1610,7 +1653,12 @@ static bool script_evaluate_data_url_node(
         &source_length, media_type, sizeof(media_type));
     if (decoded != DATA_URL_DECODED
         || (module && !script_module_mime_type_allowed(media_type))) {
-        if (decoded == DATA_URL_TOO_LARGE) metrics->skipped_quota++;
+        if (decoded == DATA_URL_TOO_LARGE) {
+            metrics->skipped_quota++;
+            if (process_result != NULL) {
+                *process_result = DOCUMENT_SCRIPT_PROCESS_SOURCE_LIMIT;
+            }
+        }
         else metrics->failed++;
         if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
             fprintf(stderr,
@@ -1623,6 +1671,8 @@ static bool script_evaluate_data_url_node(
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
         return true;
     }
+
+    script_metrics_record_source_work(metrics, source_length);
 
     ScriptQuotaReservation quota = {0};
     bool progress_failed = false;
@@ -1690,9 +1740,13 @@ static bool execute_external_node(
     const TilefinchContentSecurityPolicy *content_security_policy,
     bool module, bool executable_precounted,
     size_t maximum_total_bytes, size_t maximum_file_bytes,
-    long timeout_ms, ExternalScriptMetrics *metrics)
+    long timeout_ms, ExternalScriptMetrics *metrics,
+    DocumentScriptProcessResult *process_result)
 {
     (void) maximum_total_bytes;
+    if (process_result != NULL) {
+        *process_result = DOCUMENT_SCRIPT_PROCESS_COMPLETE;
+    }
     size_t reference_length = 0;
     const char *reference = script_source_attribute(node, &reference_length);
     if (reference == NULL || reference_length == 0) {
@@ -1730,13 +1784,14 @@ static bool execute_external_node(
                 content_security_policy, TILEFINCH_DESTINATION_SCRIPT,
                 data_url)) {
             metrics->failed++;
+            metrics->policy_refusals++;
             (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
             return true;
         }
         return script_evaluate_data_url_node(
             runtime, budget, node, reference, reference_length,
             referrer_policy, module, maximum_file_bytes, timeout_ms,
-            metrics);
+            metrics, process_result);
     }
     if (reference_length >= NAVIGATION_URL_LIMIT) {
         metrics->failed++;
@@ -1760,6 +1815,7 @@ static bool execute_external_node(
             content_security_policy, TILEFINCH_DESTINATION_SCRIPT,
             resolved)) {
         metrics->failed++;
+        metrics->policy_refusals++;
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
         return true;
     }
@@ -1768,6 +1824,7 @@ static bool execute_external_node(
     if (!script_integrity_request_eligible(
             node, document_url, resolved, initiator_opaque)) {
         metrics->failed++;
+        metrics->policy_refusals++;
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
         return true;
     }
@@ -1852,6 +1909,10 @@ static bool execute_external_node(
         if (cached == NULL || cached->length > response_limit) {
             script_runtime_script_quota_abort(runtime, &quota);
             metrics->skipped_quota++; script_trace_skip(resolved);
+            if (cached != NULL && cached->length > maximum_file_bytes
+                && process_result != NULL) {
+                *process_result = DOCUMENT_SCRIPT_PROCESS_SOURCE_LIMIT;
+            }
             (void) script_runtime_dispatch_node(
                 runtime, node, "error", NULL);
             return true;
@@ -1864,6 +1925,7 @@ static bool execute_external_node(
             return true;
         }
         size_t cached_length = cached_source.length;
+        script_metrics_record_source_work(metrics, cached_length);
         const char *cached_response_url = module
             ? cached->module_effective_url : resolved;
         bool cost_rejected = false;
@@ -1947,6 +2009,8 @@ static bool execute_external_node(
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
         return true;
     }
+    bool caller_source_limit_enforced =
+        !pressure_capped && response_limit == maximum_file_bytes;
     metrics->attempted++; script_trace_attempt(resolved);
     ScriptCacheSource cached_source = {0};
     bool cached_source_ready = cached != NULL
@@ -1969,6 +2033,16 @@ static bool execute_external_node(
         &prepared, NULL);
     const FetchRequest *request = request_ready
         ? fetch_prepared_page_request(&prepared) : NULL;
+    /* Preserve the transport's policy telemetry by still submitting the
+       request, but snapshot its sink-adjacent decision so an enqueue refusal
+       remains distinguishable from an author-code/load failure. */
+    bool request_policy_refused = request != NULL
+        && (!fetch_request_security_allows_target(request, resolved)
+            || (session != NULL && session->content_blocker != NULL
+                && content_blocker_would_block(
+                       session->content_blocker, resolved,
+                       request->initiator_url, request->sec_fetch_dest,
+                       request->sec_fetch_mode)));
     FetchResult *fetch = fetch_result_create(budget);
     if (fetch == NULL) {
         if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
@@ -1990,10 +2064,22 @@ static bool execute_external_node(
                     resolved, response_limit,
                     pressure_capped ? "yes" : "no", fetch->error);
         }
-        if (script_fetch_was_pressure_rejected(fetch, pressure_capped)) {
+        if (request == NULL) {
+            metrics->failed++;
+        } else if (request_policy_refused) {
+            metrics->failed++;
+            metrics->policy_refusals++;
+        } else if (fetch->response_limit_exceeded && !pressure_capped) {
+            metrics->skipped_quota++;
+        } else if (script_fetch_was_pressure_rejected(fetch, pressure_capped)) {
             metrics->skipped_pressure++;
         } else {
             metrics->failed++;
+        }
+        if (request != NULL && fetch->response_limit_exceeded
+            && caller_source_limit_enforced
+            && process_result != NULL) {
+            *process_result = DOCUMENT_SCRIPT_PROCESS_SOURCE_LIMIT;
         }
         (void) script_runtime_dispatch_node(runtime, node, "error", NULL);
         script_runtime_script_quota_abort(runtime, &quota);
@@ -2018,6 +2104,7 @@ static bool execute_external_node(
             metrics->cache_hits++;
         }
     }
+    script_metrics_record_source_work(metrics, source_length);
     bool ok = (fetch->status_code >= 200 && fetch->status_code < 300)
         || (fetch->status_code == 304 && cached_source_ready);
     const char *accepted_content_type = fetch->status_code == 304
@@ -2204,7 +2291,7 @@ static bool execute_external_node_live(
         document == NULL ? NULL : &document->content_security_policy,
         module, executable_precounted,
         maximum_total_bytes, maximum_file_bytes,
-        timeout_ms, metrics);
+        timeout_ms, metrics, NULL);
 }
 
 typedef struct {
@@ -3281,7 +3368,7 @@ static bool document_scripts_execute_internal(
         module_context, plan, output_metrics, finished);
 }
 
-bool document_scripts_process_closed(
+DocumentScriptProcessResult document_scripts_process_closed(
     ScriptRuntime *runtime, Budget *budget, BrowserSession *session,
     const char *base_url, const char *document_url,
     const char *referrer_policy,
@@ -3294,35 +3381,42 @@ bool document_scripts_process_closed(
         || document_url == NULL
         || scheduler == NULL || element == NULL || state == NULL
         || state->parser_executed_count >= 256
-        || !document_script_is_parser_blocking(element)) return true;
+        || !document_script_is_parser_blocking(element)) {
+        return DOCUMENT_SCRIPT_PROCESS_COMPLETE;
+    }
     (void) maximum_scripts;
     (void) maximum_total_bytes;
     long element_handle = script_runtime_node_weak_handle(runtime, element);
     if (element_handle != 0
-        && script_was_parser_executed(state, element_handle)) return true;
+        && script_was_parser_executed(state, element_handle)) {
+        return DOCUMENT_SCRIPT_PROCESS_COMPLETE;
+    }
     state->early.discovered++;
     state->early.parser_blocking++;
     if (element_handle == 0) {
         state->early.skipped_quota++;
-        return true;
+        return DOCUMENT_SCRIPT_PROCESS_COMPLETE;
     }
     state->parser_executed[state->parser_executed_count++] = element_handle;
     size_t source_length = 0;
     const char *source = script_source_attribute(element, &source_length);
     bool external = source != NULL && source_length != 0;
     bool ok = true;
+    DocumentScriptProcessResult process_result =
+        DOCUMENT_SCRIPT_PROCESS_COMPLETE;
     if (external) {
         ok = execute_external_node(
             runtime, budget, session, scheduler, element, base_url,
             document_url, referrer_policy, content_security_policy,
             false, false, maximum_total_bytes,
-            maximum_file_bytes, timeout_ms, &state->early);
+            maximum_file_bytes, timeout_ms, &state->early,
+            &process_result);
     } else {
         ok = script_execute_inline_admitted(
             runtime, budget, element, false, false, true,
             content_security_policy, &state->early);
     }
-    return ok;
+    return ok ? process_result : DOCUMENT_SCRIPT_PROCESS_HARD_FAILURE;
 }
 
 bool document_scripts_finish_streaming(

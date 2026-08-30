@@ -11,9 +11,12 @@
   let activeContext = null;
 
   class AudioParam {
-    constructor(value, minimum, maximum, changed = null) {
+    constructor(value, minimum, maximum, changed = null,
+                target = null, cancel = null) {
       this._value = value;
       this._changed = changed;
+      this._target = target;
+      this._cancel = cancel;
       this.minValue = minimum;
       this.maxValue = maximum;
       this.defaultValue = value;
@@ -28,7 +31,20 @@
     setValueAtTime(value) { this.value = value; return this; }
     linearRampToValueAtTime(value) { this.value = value; return this; }
     exponentialRampToValueAtTime(value) { this.value = value; return this; }
-    cancelScheduledValues() { return this; }
+    setTargetAtTime(value, when, timeConstant) {
+      value = Number(value); timeConstant = Number(timeConstant);
+      if (!Number.isFinite(value) || !Number.isFinite(timeConstant)
+          || timeConstant <= 0) throw new TypeError(
+        "Audio target and time constant must be finite");
+      value = Math.max(this.minValue, Math.min(this.maxValue, value));
+      if (this._target) this._target(value, when, timeConstant);
+      else this.value = value;
+      return this;
+    }
+    cancelScheduledValues(when = 0) {
+      if (this._cancel) this._cancel(when);
+      return this;
+    }
   }
 
   class AudioNode extends EventTarget {
@@ -67,6 +83,9 @@
       this.gain = new AudioParam(
         Number(options.gain ?? 1), 0, 4,
         () => context._refreshActive?.(),
+        (value, when, timeConstant) =>
+          context._scheduleGainTarget(this, value, when, timeConstant),
+        (when) => context._cancelGainTargets(this, when),
       );
     }
   }
@@ -91,11 +110,12 @@
     return delay;
   };
 
-  const sourceMix = (source) => {
+  const sourceMix = (source, overrideNode = null, overrideGain = 0) => {
     let gain = 1, pan = 0, hasPanner = false;
     let target = source._target, visits = 0;
     while (target && visits++ < 4) {
-      if (target instanceof GainNode) gain *= target.gain.value;
+      if (target instanceof GainNode)
+        gain *= target === overrideNode ? overrideGain : target.gain.value;
       if (target instanceof StereoPannerNode) {
         hasPanner = true;
         pan = Math.max(-1, Math.min(1, pan + target.pan.value));
@@ -264,6 +284,30 @@
     _refreshActive() {
       for (const source of sourcesByVoice.values())
         if (source.context === this) source._updateMix();
+    }
+    _forSourcesThrough(node, callback) {
+      for (const source of sourcesByVoice.values()) {
+        if (source.context !== this || !source._voice) continue;
+        let target = source._target, visits = 0;
+        while (target && visits++ < 4) {
+          if (target === node) { callback(source); break; }
+          target = target._target;
+        }
+      }
+    }
+    _scheduleGainTarget(node, value, when, timeConstant) {
+      const delay = boundedDelay(this, when);
+      this._forSourcesThrough(node, (source) => {
+        const [left, right] = sourceMix(source, node, value);
+        nativeCommand(8, source._voice, left, right, delay, timeConstant);
+      });
+    }
+    _cancelGainTargets(node, when) {
+      const delay = boundedDelay(this, when);
+      if (delay > .001) throw new DOMException(
+        "Future automation cancellation is unavailable", "NotSupportedError");
+      this._forSourcesThrough(node, (source) =>
+        nativeCommand(9, source._voice));
     }
     _stateChanged() {
       const event = new Event("statechange"), handler = this.onstatechange;

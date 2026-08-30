@@ -542,7 +542,8 @@ void psp_media_job_failed(PspMediaSession *media,
         || media->job_phase == PSP_MEDIA_JOB_PREVIEW_RESTORE_DECODE;
     bool tentative_preview = seeking_failure && !restoring_preview
         && media->job_preview && media->seek_preview_started
-        && media->ui.seek_preview_active;
+        && (media->ui.seek_preview_active
+            || media->preview_commit_pending);
     uint64_t source_us = psp_media_seek_failure_clock_us(
         restoring_preview || tentative_preview,
         media->job_target_us, media->job_restore_us);
@@ -597,10 +598,13 @@ void psp_media_job_failed(PspMediaSession *media,
         && (restoring_preview
             || (tentative_preview && media->preview_commit_pending))
         && media->seek_preview_started
-        && media->ui.seek_preview_active
+        && (media->ui.seek_preview_active
+            || media->preview_commit_pending)
         && media->playback != NULL
         && !media_psp_backend_quarantined()) {
-        uint64_t preview_target_us = media->ui.seek_preview_time_us;
+        uint64_t preview_target_us = media->preview_commit_pending
+            ? media->preview_commit_target_us
+            : media->ui.seek_preview_time_us;
         bool preview_was_playing = media->seek_preview_was_playing;
         media->job_phase = PSP_MEDIA_JOB_NONE;
         media->job_started_us = 0;
@@ -621,7 +625,10 @@ void psp_media_job_failed(PspMediaSession *media,
         psp_ui_media_set(
             &media->ui, true, false, false, media->clock_us,
             psp_media_duration_us(media), media->stream.title);
-        psp_ui_media_set_seek_preview(&media->ui, preview_target_us);
+        if (media->preview_commit_pending)
+            psp_ui_media_commit_seek(&media->ui, preview_target_us);
+        else
+            psp_ui_media_set_seek_preview(&media->ui, preview_target_us);
         printf("tilefinch-media: preview unavailable operation=%s "
                "action=retain-target target=%lluus restore=%lluus "
                "reason=\"%.160s\"\n",
@@ -781,7 +788,10 @@ bool psp_media_retry_transport(
     psp_ui_media_set_resolving(&media->ui, "Refreshing video link");
     if (preview_pending || commit_pending) {
         media->ui.duration_us = duration_us;
-        psp_ui_media_set_seek_preview(&media->ui, preview_target_us);
+        if (commit_pending)
+            psp_ui_media_commit_seek(&media->ui, preview_target_us);
+        else
+            psp_ui_media_set_seek_preview(&media->ui, preview_target_us);
     }
     char log_error[161];
     psp_youtube_log_text(error, log_error, sizeof(log_error));
@@ -910,7 +920,10 @@ bool psp_media_retry_240p(
         &media->ui, "Loading...", 20u);
     if (preview_pending || commit_pending) {
         media->ui.duration_us = duration_us;
-        psp_ui_media_set_seek_preview(&media->ui, preview_target_us);
+        if (commit_pending)
+            psp_ui_media_commit_seek(&media->ui, preview_target_us);
+        else
+            psp_ui_media_set_seek_preview(&media->ui, preview_target_us);
     }
     printf(
         "tilefinch-media-quality: fallback=360p-to-240p operation=%s "
@@ -1508,9 +1521,12 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
                     if (catalog != NULL
                         && youtube_resolve_job_copy_caption_catalog(
                             media->resolver_job, catalog)) {
+                        budget_free(media->budget, media->caption_catalog);
                         media->caption_catalog = catalog;
                     } else {
                         budget_free(media->budget, catalog);
+                        budget_free(media->budget, media->caption_catalog);
+                        media->caption_catalog = NULL;
                     }
                 }
                 if (!ok) {
@@ -1902,7 +1918,7 @@ static bool psp_media_open_pump_step(PspMediaSession *media)
            playback-create refresh where Cross may arrive on the supervisor
            thread. */
         if (media->preview_commit_pending)
-            psp_ui_media_set_seek_preview(
+            psp_ui_media_commit_seek(
                 &media->ui, media->preview_commit_target_us);
         else if (media->reopen_preview_pending)
             psp_ui_media_set_seek_preview(

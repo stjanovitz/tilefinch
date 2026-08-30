@@ -1,3 +1,6 @@
+static void navigation_stream_mark_parser_refusal(
+    NavigationDocumentStream *stream, NavigationParserRefusalReason reason);
+
 static void navigation_stream_release_blocking_stylesheet(
     NavigationDocumentStream *stream)
 {
@@ -556,7 +559,11 @@ static bool navigation_stream_flush_cssom_layout(void *opaque)
 
     uint64_t fingerprint = 0;
     if (!navigation_stream_stylesheet_fingerprint(
-            stream, document, &fingerprint)) return false;
+            stream, document, &fingerprint)) {
+        navigation_stream_mark_parser_refusal(
+            stream, NAVIGATION_PARSER_REFUSAL_CSSOM);
+        return false;
+    }
     bool current = stream->blocking_stylesheet_ready
         && stream->blocking_stylesheet_fingerprint_valid
         && stream->blocking_stylesheet_fingerprint == fingerprint;
@@ -567,7 +574,11 @@ static bool navigation_stream_flush_cssom_layout(void *opaque)
             refreshed = navigation_stream_build_blocking_stylesheet(
                 stream, document, fingerprint);
         }
-        if (!refreshed) return false;
+        if (!refreshed) {
+            navigation_stream_mark_parser_refusal(
+                stream, NAVIGATION_PARSER_REFUSAL_CSSOM);
+            return false;
+        }
     }
 
     LayoutDocument fresh = {0};
@@ -576,6 +587,8 @@ static bool navigation_stream_flush_cssom_layout(void *opaque)
             &stream->blocking_stylesheet, stream->fonts, stream->images,
             &stream->viewport)) {
         layout_destroy(&fresh);
+        navigation_stream_mark_parser_refusal(
+            stream, NAVIGATION_PARSER_REFUSAL_CSSOM);
         return false;
     }
     stream->cssom_layout = fresh;

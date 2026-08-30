@@ -1,0 +1,1 @@
+<!doctype html><body><script src="/dead-one.js"></script><script src="/dead-two.js"></script><script src="/dead-three.js"></script><script defer src="/healthy.js"></script><main id="content">Useful server body</main></body>

@@ -6,6 +6,11 @@ PSP graphics engine (GE); it is not a general GLSL interpreter. A scene that
 fits the profile below can remain responsive on a 333 MHz PSP, while an
 unrestricted desktop WebGL application usually cannot.
 
+This is the detailed WebGL guide. The broader, versioned contract for Canvas,
+input, audio, storage, lifecycle, offline packaging, and qualification is
+[Tilefinch Game Profile v1](GAME_PROFILE.md), with a
+[machine-readable companion](tilefinch-game-profile-v1.json).
+
 ## Start with the PSP-sized surface
 
 Request the smallest backing resolution that preserves the game's look, then
@@ -23,16 +28,26 @@ avoids hidden scaling assumptions and reduces fill work.
 const canvas = document.querySelector("#game");
 const gl = canvas.getContext("webgl", {
   alpha: false,
-  antialias: false,
+  antialias: true,
   depth: true
 });
 if (!gl) document.body.textContent = "WebGL is unavailable";
 </script>
 ```
 
-The drawing buffer is opaque. Antialiasing and stencil buffers are not
-advertised. Check the returned context and queried limits instead of assuming
-desktop defaults.
+The drawing buffer is opaque and stencil buffers are not advertised. An
+explicit `antialias:true` enables a bounded edge-coverage mode rather than a
+second multisample framebuffer: the PSP GE adds hardware-smoothed line and
+eligible triangle fringes, while the host fallback uses four fixed coverage
+samples only for triangle rasterization. On PSP, full-clear opaque frames also
+use a bounded temporal edge pass during small camera motion. It reprojects a
+limited number of preceding fringe samples at low alpha, resets across large
+camera, surface, or context changes, and never blends the filled scene. This
+avoids full-frame history, long trails, and another framebuffer while making
+camera shake more stable. It keeps all ordinary vertex and work ceilings.
+Leave it off for deliberately pixelated art or when a measured scene needs
+every last millisecond. Check the returned context attributes and queried
+limits instead of assuming desktop defaults.
 
 ## Use shaders the GE can translate
 
@@ -82,8 +97,16 @@ behavior matters.
 ## Design for few submissions
 
 - Prefer indexed triangles, atlases, and shared static vertex/index buffers.
+- Use `ANGLE_instanced_arrays` for repeated transformed geometry. Tilefinch
+  admits divisors 0 and 1, at most 64 instances in one draw, and a `mat4`
+  per-instance transform occupying four consecutive attribute locations.
 - Separate static geometry from dynamic geometry. Use `bufferSubData()` only
   for the range that changed.
+- Keep a stable VAO, program, primitive shape, and index range for repeated
+  draws. Tilefinch caches the validated draw plan and lazily retains one
+  96-word packed template per active plan; each draw patches only live source
+  indices/generations, matrices, colors, texture selection, and instance
+  count. This is bounded internal acceleration, not a new API.
 - Upload buffers and textures before issuing the frame's draws. A resource
   mutation after draws have queued must flush those draws first to preserve
   WebGL ordering.
@@ -97,14 +120,73 @@ behavior matters.
   texture generations remain cached by the PSP backend.
 
 One realm admits at most two contexts, 24 buffers, eight textures, and eight
-programs. One native submission contains at most 64 draws, 4,096 vertices,
+programs. One native submission contains at most 64 draws and 4,096 effective
+vertices (base vertices multiplied by instance count),
 and exactly 32 distinct payload sources: the maximum 24 buffers plus eight
-textures. Draw state is copied into a fixed 64-record per-context pool, so a
-queued matrix or viewport never aliases later JavaScript state. A temporarily
-detached page may retain an additional submission until its rendering bridge
-returns, within that same 64-record total. Buffer storage is capped at
+textures. Draw state is copied into fixed per-context records, so a queued
+matrix or viewport never aliases later JavaScript state. A temporarily
+detached page may retain an additional ordered 64-record submission until its
+rendering bridge returns, so the fixed command pool contains 128 records while
+each native submission remains capped at 64. Buffer storage is capped at
 512 KiB and retained texture pixels at 416 KiB. Exceeding a true bound fails
 soft; it never grants an unbounded page allocation.
+
+The bounded instancing shader shape is deliberately narrow: the position
+expression may include one `mat4` attribute, with all four columns backed by
+one interleaved float buffer and divisor 1. Other vertex attributes retain
+divisor 0. The native path reuses the admitted unit geometry and applies each
+matrix on the GE; the host fallback produces the same pixels. Divisors above
+1 and arbitrary per-instance attribute layouts are refused rather than
+silently expanded in QuickJS. Check for the extension and retain a normal
+WebGL 1 fallback.
+
+```js
+const instancing = gl.getExtension("ANGLE_instanced_arrays");
+for (let column = 0; instancing && column < 4; column++) {
+  const location = instanceMatrixLocation + column;
+  gl.vertexAttribPointer(location, 4, gl.FLOAT, false, 64, column * 16);
+  gl.enableVertexAttribArray(location);
+  instancing.vertexAttribDivisorANGLE(location, 1);
+}
+instancing?.drawElementsInstancedANGLE(
+  gl.TRIANGLES, indexCount, gl.UNSIGNED_SHORT, 0, instanceCount);
+```
+
+### Canvas publication on PSP
+
+The GE-rendered WebGL color surface lives in EDRAM, but Tilefinch's ordinary
+page framebuffer is a budget-owned RGB565 surface in main RAM. The current
+publication path converts and scales an eligible opaque canvas into that page
+frame, applies retained HTML/browser overlays there, then copies the completed
+page into the triple-buffered scanout surface. This keeps page rendering,
+screenshots, focus damage, and the tear-free vblank owner on one authoritative
+frame.
+
+A direct GE-to-scanout canvas blit is therefore not a drop-in replacement for
+the CPU conversion. It needs an explicit compositor handoff: exact canvas
+geometry and EDRAM epoch must cross the platform-present boundary, overlays
+must be composed after the GE fence, and every fallback/navigation path must
+restore the main-RAM frame without exposing a partially written back buffer.
+Until that ownership transition is qualified pixel-for-pixel on real hardware,
+Tilefinch deliberately keeps the measured CPU fast path. Authors still benefit
+most from a 320×180 opaque canvas and stable overlay geometry.
+
+The Treadline device soak puts an upper bound on the opportunity: canvas
+conversion averaged about 3.9 ms and the page-base copy was about 1.6 ms in
+tail frames. Even removing both entirely would leave that scene around 27–28
+ms, still in the 30 Hz rather than 60 Hz presentation band.
+
+The physical-PSP validation probe now compares the exact 320x180-to-480x270
+CPU kernel with a direct GE 8888-to-RGB565 back-buffer draw. Across 120
+measured frames after 12 warm-ups, CPU conversion averaged 3.175 ms and its
+following page copy 2.058 ms; the GE path averaged 4.315 ms end to end
+(0.035 ms submission and 4.269 ms synchronization), with a 4.371 ms maximum.
+All 129,600 displayed
+pixels matched exactly. That proves the conversion is viable, but its isolated
+saving is only about 0.9 ms before overlay/ownership integration, so it does
+not justify changing the tear-free compositor by itself. Keep the CPU path
+unless a later trace shows publication, rather than page JavaScript, is again
+the limiting phase.
 
 ## Run a single bounded game loop
 
@@ -140,8 +222,10 @@ requestAnimationFrame(frame);
 
 ## PSP controls
 
-The page does not receive PSP controls until the user holds **Start + Select**
-to enter Page controls. Holding the chord again returns input to the browser.
+The page does not receive PSP controls until the user enters Page controls.
+A trusted Play click may call `navigator.tilefinch.requestPageControls(canvas)`;
+Tilefinch displays a Start+Select exit notice. Holding **Start + Select** for
+0.7 seconds remains the manual entry fallback and returns input to the browser.
 The D-pad and analog nub map to the standard Gamepad axes/buttons. Under
 **Settings → Browsing & input → Game buttons**, the user can choose whether X
 or O is the primary face button; games should use the standard Gamepad button
@@ -162,8 +246,14 @@ tight loop.
 
 The repository's [Prism Break 3D](../examples/prism-break-3d/) example shows
 the intended WebGL, Gamepad, Fullscreen, Page Visibility, Web Audio, and
-offline-app patterns together. The focused qualification lane is described in
-[Development](DEVELOPMENT.md#canvas-and-webgl-game-qualification).
+offline-app patterns together. [Treadline Arena](../examples/treadline-arena/)
+adds fixed-step third-person movement, a camera-following world, bounded entity
+pools, one-bounce projectiles, swapped barrier meshes, three objective modes,
+three tank classes, directional armor, class secondaries, an opt-in Command
+meter, five gadgets, role-based bots, camera obstruction handling, persistent
+setup preferences, keyboard fallback, and one compact input record per actor
+suitable for future network transport. The focused qualification lane is
+described in [Development](DEVELOPMENT.md#canvas-and-webgl-game-qualification).
 
 ## Preflight checklist
 

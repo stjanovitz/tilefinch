@@ -15,6 +15,23 @@ void tilefinch_gamepad_capture_init(TilefinchGamepadCapture *capture)
     if (capture != NULL) memset(capture, 0, sizeof(*capture));
 }
 
+TilefinchGamepadCaptureEvent tilefinch_gamepad_capture_request(
+    TilefinchGamepadCapture *capture, bool page_available,
+    uint64_t page_generation)
+{
+    if (capture == NULL) return TILEFINCH_GAMEPAD_CAPTURE_NO_CHANGE;
+    if (!page_available) return TILEFINCH_GAMEPAD_CAPTURE_UNAVAILABLE;
+    if (capture->active && capture->page_generation == page_generation)
+        return TILEFINCH_GAMEPAD_CAPTURE_NO_CHANGE;
+    capture->active = true;
+    capture->page_generation = page_generation;
+    capture->chord_hold_ms = 0;
+    capture->chord_held = false;
+    capture->chord_latched = false;
+    capture->suppress_input_until_release = true;
+    return TILEFINCH_GAMEPAD_CAPTURE_ENTERED;
+}
+
 TilefinchGamepadCaptureEvent tilefinch_gamepad_capture_step(
     TilefinchGamepadCapture *capture, bool page_available,
     uint64_t page_generation, bool chord_held, unsigned elapsed_ms)
@@ -28,6 +45,7 @@ TilefinchGamepadCaptureEvent tilefinch_gamepad_capture_step(
         capture->chord_latched = chord_held;
         capture->chord_hold_ms = 0;
         capture->chord_held = chord_held;
+        capture->suppress_input_until_release = false;
         return TILEFINCH_GAMEPAD_CAPTURE_EXITED;
     }
 
@@ -56,12 +74,14 @@ TilefinchGamepadCaptureEvent tilefinch_gamepad_capture_step(
     capture->chord_latched = true;
     if (capture->active) {
         capture->active = false;
+        capture->suppress_input_until_release = false;
         return TILEFINCH_GAMEPAD_CAPTURE_EXITED;
     }
     if (!page_available)
         return TILEFINCH_GAMEPAD_CAPTURE_UNAVAILABLE;
     capture->active = true;
     capture->page_generation = page_generation;
+    capture->suppress_input_until_release = false;
     return TILEFINCH_GAMEPAD_CAPTURE_ENTERED;
 }
 

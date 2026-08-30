@@ -3655,6 +3655,40 @@ size_t browser_session_cache_reclaim(BrowserSession *session,
     return reclaimed;
 }
 
+bool browser_session_cache_reserve_working_set(
+    BrowserSession *session, size_t required_bytes)
+{
+    if (session == NULL || session->budget == NULL
+        || required_bytes > session->maximum_cache_bytes) return false;
+    size_t retained_limit = session->maximum_cache_bytes - required_bytes;
+    while (session->cache_bytes > retained_limit) {
+        BrowserCacheEntry *victim = NULL;
+        for (size_t i = 0; i < BROWSER_CACHE_ENTRIES; i++) {
+            BrowserCacheEntry *candidate = &session->cache[i];
+            if (candidate->data != NULL
+                && (victim == NULL || candidate->stamp < victim->stamp)) {
+                victim = candidate;
+            }
+        }
+        if (victim == NULL) return false;
+        cache_remove(session, victim);
+        session->cache_evictions++;
+    }
+    return true;
+}
+
+bool browser_session_cache_ensure_maximum_bytes(
+    BrowserSession *session, size_t minimum_bytes)
+{
+    if (session == NULL || session->budget == NULL || minimum_bytes == 0
+        || minimum_bytes > session->budget->limit) {
+        return false;
+    }
+    if (session->maximum_cache_bytes >= minimum_bytes) return true;
+    session->maximum_cache_bytes = minimum_bytes;
+    return true;
+}
+
 bool browser_session_cache_set_maximum_bytes(BrowserSession *session,
                                              size_t maximum_bytes)
 {
@@ -3723,6 +3757,18 @@ static bool offline_cache_entry_view(
         .url = entry->url,
         .data = entry->data,
         .length = entry->length,
+        .classic_script_bytecode =
+            entry->classic_script_bytecode != NULL
+                && entry->classic_script_source_length == entry->length
+                && entry->classic_script_source_hash
+                       == cache_script_source_hash(entry->data, entry->length)
+                ? entry->classic_script_bytecode->data : NULL,
+        .classic_script_bytecode_length =
+            entry->classic_script_bytecode != NULL
+                && entry->classic_script_source_length == entry->length
+                && entry->classic_script_source_hash
+                       == cache_script_source_hash(entry->data, entry->length)
+                ? entry->classic_script_bytecode->length : 0,
         .content_type = entry->content_type,
         .response_url = entry->response_url_known
             ? entry->response_url : entry->url,

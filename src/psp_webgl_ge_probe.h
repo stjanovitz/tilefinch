@@ -25,7 +25,26 @@ typedef struct {
 } PspWebglGeProbeScene;
 
 typedef struct {
+    unsigned frames;
+    uint64_t cpu_convert_us;
+    uint64_t cpu_convert_max_us;
+    uint64_t cpu_copy_us;
+    uint64_t cpu_copy_max_us;
+    uint64_t ge_submit_us;
+    uint64_t ge_wait_us;
+    uint64_t ge_total_us;
+    uint64_t ge_total_max_us;
+    size_t compared_pixels;
+    size_t mismatched_pixels;
+    uint32_t cpu_checksum;
+    uint32_t ge_checksum;
+    bool available;
+    bool pixel_exact;
+} PspWebglGeConversionProbe;
+
+typedef struct {
     PspWebglGeProbeScene scenes[PSP_WEBGL_GE_PROBE_SCENE_COUNT];
+    PspWebglGeConversionProbe conversion;
     size_t color_bytes;
     size_t depth_bytes;
     size_t texture_cache_bytes;
@@ -36,9 +55,14 @@ typedef struct {
 } PspWebglGeProbeReport;
 
 /* Validation-only research probe. `page_destination` is the current RGB565
-   page back buffer. The probe renders into the unused page-mode EDRAM tail,
-   composites its last frame into that buffer, and returns with the GE idle. */
+   page back buffer and `cpu_destination` is the engine's ordinary main-memory
+   480x272 frame. The probe renders into the unused page-mode EDRAM tail,
+   compares the shipping CPU 320x180 -> 480x270 conversion/copy path with a
+   direct GE conversion, composites its last frame, and returns with the GE
+   idle. */
 bool psp_webgl_ge_probe_run(
-    uint16_t *page_destination, PspWebglGeProbeReport *report);
+    uint16_t *page_destination,
+    uint16_t *cpu_destination, size_t cpu_destination_pixels,
+    PspWebglGeProbeReport *report);
 
 #endif

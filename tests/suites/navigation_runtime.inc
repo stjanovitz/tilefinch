@@ -61,6 +61,8 @@ static bool test_canvas_surface_survives_and_updates_without_relayout(void)
         && canvas->pixels[2] == 0 && canvas->pixels[3] == 255
         && canvas->pixels[8] == 255 && canvas->pixels[10] == 0;
     size_t relayouts = navigation.incremental_relayouts;
+    size_t dom_mutations = navigation.page.script_result.dom_mutations;
+    uint64_t content_generation = navigation.page.document.content_generation;
     bool advanced = initial && painted
         && navigation_advance_runtime(&navigation, 2, 4);
     canvas = navigation.page.images.count != 0
@@ -68,6 +70,8 @@ static bool test_canvas_surface_survives_and_updates_without_relayout(void)
     bool updated = advanced && canvas != NULL && canvas->is_canvas
         && canvas->pixels[0] == 255 && canvas->pixels[2] == 0
         && canvas->pixels[8] == 0 && canvas->pixels[10] == 255
+        && navigation.page.script_result.dom_mutations == dom_mutations
+        && navigation.page.document.content_generation == content_generation
         && navigation.incremental_relayouts == relayouts + 1u
         && navigation.canvas_paint_damage_pending;
     bool ok = committed && initial && painted && updated;

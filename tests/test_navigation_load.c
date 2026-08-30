@@ -2,6 +2,7 @@
 #include "tilefinch/fetch.h"
 #include "tilefinch/layout.h"
 #include "tilefinch/navigation.h"
+#include "tilefinch/platform.h"
 #include "tilefinch/render.h"
 #include "tilefinch/script_loader.h"
 #include "tilefinch/section_store.h"
@@ -24,6 +25,11 @@
 #define MIB (1024u * 1024u)
 
 static lxb_dom_node_t *test_find_id(lxb_dom_node_t *node, const char *id);
+/* Private deterministic seam implemented by navigation.c for this test
+   executable; zero always restores the production one-MiB work bound. */
+void navigation_test_set_parser_script_stage_work_limit(size_t limit);
+void navigation_test_set_parser_script_stage_elapsed_us(uint64_t elapsed_us);
+void navigation_test_set_parser_script_stage_time_limit_us(uint64_t limit_us);
 
 static bool replay_begin(void)
 {
@@ -31,6 +37,150 @@ static bool replay_begin(void)
     return fetch_trace_replay_begin(
         TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-stream", error,
         sizeof(error));
+}
+
+static bool parser_checkpoint_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-parser-checkpoint",
+        error, sizeof(error));
+}
+
+static bool parser_script_circuit_replay_begin(bool work_bound)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        work_bound
+            ? TILEFINCH_TEST_SOURCE_DIR
+                "/fixtures/http-parser-script-work-circuit"
+            : TILEFINCH_TEST_SOURCE_DIR
+                "/fixtures/http-parser-script-circuit",
+        error, sizeof(error));
+}
+
+static bool parser_script_transport_failures_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-script-transport-failures",
+        error, sizeof(error));
+}
+
+static bool parser_script_time_circuit_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-script-time-circuit",
+        error, sizeof(error));
+}
+
+static bool parser_script_preload_time_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-script-preload-time",
+        error, sizeof(error));
+}
+
+static bool parser_script_failure_reset_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-script-failure-reset",
+        error, sizeof(error));
+}
+
+static bool parser_script_work_failure_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-script-work-failure",
+        error, sizeof(error));
+}
+
+static bool parser_script_policy_refusal_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-script-policy-refusal",
+        error, sizeof(error));
+}
+
+static bool parser_script_sri_refusal_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-script-sri-refusal",
+        error, sizeof(error));
+}
+
+static bool parser_script_work_external_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-script-work-external",
+        error, sizeof(error));
+}
+
+static bool parser_script_file_overflow_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-script-file-overflow",
+        error, sizeof(error));
+}
+
+static bool parser_script_work_failed_body_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-script-work-failed-body",
+        error, sizeof(error));
+}
+
+static bool parser_script_mutation_rebind_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-script-mutation-rebind",
+        error, sizeof(error));
+}
+
+static bool parser_script_mutation_time_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR
+            "/fixtures/http-parser-script-mutation-time",
+        error, sizeof(error));
+}
+
+static bool parser_script_late_ssr_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-parser-script-late-ssr",
+        error, sizeof(error));
+}
+
+static bool resource_only_shed_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-resource-only-shed",
+        error, sizeof(error));
 }
 
 static bool progressive_preview_replay_begin(void)
@@ -1374,6 +1524,1425 @@ static bool test_streaming_preview_precedes_eof(void)
         && budget_active_allocations(&budget, NULL) == 0
         && budget_categories_reconcile(&budget);
     if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static size_t parser_checkpoint_reason_count(
+    const NavigationPerformance *performance,
+    NavigationParserCheckpointTestFault fault)
+{
+    if (performance == NULL) return 0;
+    switch (fault) {
+    case NAVIGATION_TEST_PARSER_CHECKPOINT_METADATA:
+        return performance->parser_checkpoint_metadata_refusals;
+    case NAVIGATION_TEST_PARSER_CHECKPOINT_FINGERPRINT:
+        return performance->parser_checkpoint_fingerprint_refusals;
+    case NAVIGATION_TEST_PARSER_CHECKPOINT_STYLESHEET:
+        return performance->parser_checkpoint_stylesheet_refusals;
+    case NAVIGATION_TEST_PARSER_CHECKPOINT_MUTATION:
+        return performance->parser_checkpoint_mutation_refusals;
+    case NAVIGATION_TEST_PARSER_CHECKPOINT_NONE:
+    case NAVIGATION_TEST_PARSER_FEED_HARD_FAILURE:
+    default:
+        return 0;
+    }
+}
+
+static bool test_parser_checkpoint_refusals_preserve_server_dom(void)
+{
+    static const NavigationParserCheckpointTestFault faults[] = {
+        NAVIGATION_TEST_PARSER_CHECKPOINT_METADATA,
+        NAVIGATION_TEST_PARSER_CHECKPOINT_FINGERPRINT,
+        NAVIGATION_TEST_PARSER_CHECKPOINT_STYLESHEET,
+        NAVIGATION_TEST_PARSER_CHECKPOINT_MUTATION
+    };
+    bool all_ok = true;
+    for (size_t fault_index = 0;
+         fault_index < sizeof(faults) / sizeof(faults[0]); fault_index++) {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        BrowserSession browser = {0};
+        NavigationSession navigation = {0};
+        bool browser_ready = installed
+            && browser_session_init(&browser, &budget, 64 * 1024);
+        bool ready = browser_ready
+            && navigation_init(&navigation, &budget, 2)
+            && parser_checkpoint_replay_begin();
+        if (ready) {
+            navigation_attach_browser_session(&navigation, &browser);
+            navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+            navigation_enable_document_scripts(
+                &navigation, 4, 64 * 1024, 64 * 1024, 1000);
+            navigation_set_stream_delivery(
+                &navigation, 37, 0, 0, 0, 0, 0);
+            navigation_test_refuse_next_parser_checkpoint(
+                faults[fault_index]);
+        }
+        uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+        bool loaded = ready && navigation_load_url(
+            &navigation, generation, "https://checkpoint.test/document",
+            4096, 1000, 480, NULL, NULL, true);
+        lxb_dom_node_t *content = loaded ? test_find_id(
+            lxb_dom_interface_node(navigation.page.document.html),
+            "content") : NULL;
+        lxb_dom_node_t *tail = loaded ? test_find_id(
+            lxb_dom_interface_node(navigation.page.document.html),
+            "tail") : NULL;
+        lxb_dom_node_t *body = loaded
+            ? document_body_node(&navigation.page.document) : NULL;
+        size_t script_ran_length = 0;
+        const char *script_ran = body == NULL ? NULL : document_attribute(
+            body, "data-script-ran", &script_ran_length);
+        bool ok = loaded && navigation.page.loaded
+            && content != NULL && tail != NULL && script_ran == NULL
+            && navigation.page.runtime == NULL
+            && navigation.last_error[0] == '\0'
+            && navigation.performance.optional_work_sheds == 1
+            && navigation.performance.parser_checkpoint_soft_refusals == 1
+            && parser_checkpoint_reason_count(
+                   &navigation.performance, faults[fault_index]) == 1
+            && strstr(navigation.page.script_result.summary,
+                      "JavaScript stopped") != NULL;
+        if (!ok) {
+            fprintf(stderr,
+                    "parser checkpoint fault=%d ready=%d loaded=%d page=%d "
+                    "content=%p tail=%p script=%.*s runtime=%p sheds=%zu "
+                    "soft=%zu reason=%zu summary=\"%s\" error=\"%s\"\n",
+                    (int) faults[fault_index], ready ? 1 : 0,
+                    loaded ? 1 : 0, navigation.page.loaded ? 1 : 0,
+                    (void *) content, (void *) tail,
+                    (int) script_ran_length,
+                    script_ran == NULL ? "" : script_ran,
+                    (void *) navigation.page.runtime,
+                    navigation.performance.optional_work_sheds,
+                    navigation.performance.parser_checkpoint_soft_refusals,
+                    parser_checkpoint_reason_count(
+                        &navigation.performance, faults[fault_index]),
+                    navigation.page.script_result.summary,
+                    navigation.last_error);
+        }
+        if (ready) fetch_trace_end();
+        if (installed) navigation_destroy(&navigation);
+        if (browser_ready) browser_session_destroy(&browser);
+        bool clean = budget.current == 0
+            && budget_active_allocations(&budget, NULL) == 0
+            && budget_categories_reconcile(&budget);
+        if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+        all_ok = all_ok && ok && clean;
+    }
+
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 2)
+        && parser_checkpoint_replay_begin();
+    if (ready) {
+        navigation_set_stream_delivery(&navigation, 37, 0, 0, 0, 0, 0);
+        navigation_test_refuse_next_parser_checkpoint(
+            NAVIGATION_TEST_PARSER_FEED_HARD_FAILURE);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool loaded = ready && navigation_load_url(
+        &navigation, generation, "https://checkpoint.test/document",
+        4096, 1000, 480, NULL, NULL, true);
+    bool hard_ok = ready && !loaded && !navigation.page.loaded
+        && navigation.performance.parser_checkpoint_soft_refusals == 0
+        && strstr(navigation.last_error,
+                  "HTML parser rejected staged response body") != NULL;
+    if (!hard_ok) {
+        fprintf(stderr,
+                "hard parser checkpoint ready=%d loaded=%d page=%d soft=%zu "
+                "error=\"%s\"\n",
+                ready ? 1 : 0, loaded ? 1 : 0,
+                navigation.page.loaded ? 1 : 0,
+                navigation.performance.parser_checkpoint_soft_refusals,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return all_ok && hard_ok && clean;
+}
+
+static bool test_parser_script_stage_circuit_preserves_actions(void)
+{
+    bool all_ok = true;
+    for (size_t work_case = 0; work_case < 3u; work_case++) {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        BrowserSession browser = {0};
+        NavigationSession navigation = {0};
+        bool browser_ready = installed
+            && browser_session_init(&browser, &budget, 64 * 1024);
+        bool ready = browser_ready
+            && navigation_init(&navigation, &budget, 2)
+            && parser_script_circuit_replay_begin(work_case == 1u);
+        if (ready) {
+            navigation_attach_browser_session(&navigation, &browser);
+            navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+            navigation_enable_document_scripts(
+                &navigation, 8, work_case == 1u ? 512u : 64 * 1024u,
+                work_case == 1u ? 512u : 64 * 1024u, 1000);
+            navigation_set_stream_delivery(
+                &navigation, 43, 0, 0, 0, 0, 0);
+        }
+        uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+        const char *url = work_case == 1u
+            ? "https://script-work-circuit.test/document"
+            : "https://script-circuit.test/document";
+        if (work_case == 1u) {
+            navigation_test_set_parser_script_stage_work_limit(256u);
+        } else if (work_case == 2u) {
+            navigation_test_set_parser_script_stage_elapsed_us(8000000u);
+        }
+        bool loaded = ready && navigation_load_url(
+            &navigation, generation, url, 4096, 1000, 480,
+            NULL, NULL, true);
+        FetchTraceReplayStats replay_stats = {0};
+        bool replay_stats_ready = ready
+            && fetch_trace_replay_stats(&replay_stats);
+        navigation_test_set_parser_script_stage_work_limit(0u);
+        navigation_test_set_parser_script_stage_elapsed_us(0u);
+        lxb_dom_node_t *root = loaded
+            ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+        lxb_dom_node_t *body = loaded
+            ? document_body_node(&navigation.page.document) : NULL;
+        lxb_dom_node_t *link = root == NULL
+            ? NULL : test_find_id(root, "useful-link");
+        lxb_dom_node_t *form = root == NULL
+            ? NULL : test_find_id(root, "usable-form");
+        size_t first_length = 0, second_length = 0, later_length = 0;
+        const char *first = body == NULL ? NULL : document_attribute(
+            body, work_case == 1u ? "data-first-ran" : "data-fourth-ran",
+            &first_length);
+        const char *second = body == NULL || work_case != 1u ? NULL
+            : document_attribute(body, "data-second-ran", &second_length);
+        const char *later = body == NULL ? NULL : document_attribute(
+            body, work_case == 1u ? "data-third-ran" : "data-fifth-ran",
+            &later_length);
+        bool execution_state = work_case == 1u
+            ? first != NULL && first_length == 3u
+                /* The second script would cross the cumulative source cap,
+                   so it is refused before compilation rather than allowing
+                   one whole-file overshoot. */
+                && second == NULL && second_length == 0u
+                && later == NULL && navigation.script_failed == 0u
+            : first == NULL && later == NULL
+                && navigation.script_failed >= (work_case == 0u ? 3u : 1u);
+        const char *expected_summary = work_case == 0u
+            ? "repeated failures" : work_case == 1u
+                ? "bounded parser work" : "parser time limit";
+        bool ok = loaded && navigation.page.loaded
+            && link != NULL && form != NULL
+            && navigation.page.layout.link_count != 0u
+            && navigation.page.layout.control_count != 0u
+            && execution_state
+            && navigation.page.runtime == NULL
+            && navigation.page.script_degradation_observed
+            && navigation.script_skipped_pressure != 0u
+            && navigation.last_error[0] == '\0'
+            && navigation.performance.optional_work_sheds == 1u
+            && navigation.performance.parser_checkpoint_soft_refusals == 1u
+            && navigation.performance.parser_checkpoint_script_refusals == 1u
+            && navigation.performance.parser_script_stage_breakers == 1u
+            && navigation.performance.parser_script_stage_work != 0u
+            && navigation.performance.parser_script_stage_skipped != 0u
+            /* The external script after the third failure has no replay
+               record.  A mere soft failure could otherwise hide an
+               accidental fetch, so pin the request ledger as well. */
+            && (work_case != 0u
+                || (replay_stats_ready
+                    && replay_stats.request_count == 1u
+                    && replay_stats.matched_request_count == 1u
+                    && replay_stats.unmatched_request_count == 0u))
+            && (work_case == 0u
+                    ? navigation.performance
+                          .parser_script_stage_failure_breakers == 1u
+                        && navigation.performance
+                               .parser_script_stage_work_breakers == 0u
+                        && strstr(navigation.page.script_result.error,
+                                  "first expected failure") != NULL
+                    : work_case == 1u
+                        ? navigation.performance
+                          .parser_script_stage_failure_breakers == 0u
+                        && navigation.performance
+                               .parser_script_stage_work_breakers == 1u
+                        : navigation.performance
+                              .parser_script_stage_time_breakers == 1u
+                            && strstr(navigation.page.script_result.error,
+                                      "first expected failure") != NULL)
+            && strstr(navigation.page.script_result.summary,
+                      "Limited page:") != NULL
+            && strstr(navigation.page.script_result.summary,
+                      expected_summary) != NULL;
+        if (!ok) {
+            fprintf(stderr,
+                    "parser script circuit work=%zu ready=%d loaded=%d "
+                    "page=%d link=%p form=%p links=%zu controls=%zu "
+                    "first=%.*s second=%.*s later=%.*s failed=%zu "
+                    "skipped=%zu runtime=%p degraded=%d sheds=%zu soft=%zu "
+                    "script-refusals=%zu stage=%zu/%zu/%zu reasons=%zu/%zu/%zu "
+                    "summary=\"%s\" script-error=\"%s\" error=\"%s\"\n",
+                    work_case, ready ? 1 : 0, loaded ? 1 : 0,
+                    navigation.page.loaded ? 1 : 0, (void *) link,
+                    (void *) form, navigation.page.layout.link_count,
+                    navigation.page.layout.control_count,
+                    (int) first_length, first == NULL ? "" : first,
+                    (int) second_length, second == NULL ? "" : second,
+                    (int) later_length, later == NULL ? "" : later,
+                    navigation.script_failed,
+                    navigation.script_skipped_pressure,
+                    (void *) navigation.page.runtime,
+                    navigation.page.script_degradation_observed ? 1 : 0,
+                    navigation.performance.optional_work_sheds,
+                    navigation.performance.parser_checkpoint_soft_refusals,
+                    navigation.performance.parser_checkpoint_script_refusals,
+                    navigation.performance.parser_script_stage_work,
+                    navigation.performance.parser_script_stage_skipped,
+                    navigation.performance.parser_script_stage_breakers,
+                    navigation.performance
+                        .parser_script_stage_failure_breakers,
+                    navigation.performance.parser_script_stage_time_breakers,
+                    navigation.performance.parser_script_stage_work_breakers,
+                    navigation.page.script_result.summary,
+                    navigation.page.script_result.error,
+                    navigation.last_error);
+        }
+        if (ready) fetch_trace_end();
+        if (installed) navigation_destroy(&navigation);
+        if (browser_ready) browser_session_destroy(&browser);
+        bool clean = budget.current == 0
+            && budget_active_allocations(&budget, NULL) == 0
+            && budget_categories_reconcile(&budget);
+        if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+        all_ok = all_ok && ok && clean;
+    }
+
+    /* CSP/policy refusals remain ordinary failed-script diagnostics, but
+       author policy is not an execution failure. Three refused scripts must
+       therefore leave the realm alive for a later nonce-authorized script. */
+    {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        BrowserSession browser = {0};
+        NavigationSession navigation = {0};
+        bool browser_ready = installed
+            && browser_session_init(&browser, &budget, 64 * 1024);
+        bool ready = browser_ready
+            && navigation_init(&navigation, &budget, 2)
+            && parser_script_policy_refusal_replay_begin();
+        if (ready) {
+            navigation_attach_browser_session(&navigation, &browser);
+            navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+            navigation_enable_document_scripts(
+                &navigation, 8, 64 * 1024u, 64 * 1024u, 1000);
+            navigation_set_stream_delivery(
+                &navigation, 43, 0, 0, 0, 0, 0);
+        }
+        uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+        bool loaded = ready && navigation_load_url(
+            &navigation, generation,
+            "https://script-policy-refusal.test/document",
+            4096, 1000, 480, NULL, NULL, true);
+        lxb_dom_node_t *root = loaded
+            ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+        lxb_dom_node_t *body = loaded
+            ? document_body_node(&navigation.page.document) : NULL;
+        size_t allowed_length = 0, blocked_length = 0;
+        const char *allowed = body == NULL ? NULL : document_attribute(
+            body, "data-allowed-ran", &allowed_length);
+        const char *blocked = body == NULL ? NULL : document_attribute(
+            body, "data-blocked-one", &blocked_length);
+        FetchTraceReplayStats replay_stats = {0};
+        bool replay_stats_ready = ready
+            && fetch_trace_replay_stats(&replay_stats);
+        bool policy_ok = loaded && navigation.page.loaded
+            && root != NULL && test_find_id(root, "useful-link") != NULL
+            && allowed != NULL && allowed_length == 3u
+            && blocked == NULL && blocked_length == 0u
+            && navigation.script_failed >= 3u
+            && navigation.page.runtime != NULL
+            && navigation.page.script_degradation_observed
+            && navigation.performance.parser_script_stage_breakers == 0u
+            && navigation.performance
+                   .parser_script_stage_failure_breakers == 0u
+            && navigation.performance.optional_work_sheds == 0u
+            && navigation.last_error[0] == '\0'
+            && replay_stats_ready && replay_stats.request_count == 1u
+            && replay_stats.matched_request_count == 1u
+            && replay_stats.unmatched_request_count == 0u;
+        if (!policy_ok) {
+            fprintf(stderr,
+                    "parser policy attribution ready=%d loaded=%d page=%d "
+                    "allowed=%.*s blocked=%.*s failed=%zu runtime=%p "
+                    "degraded=%d breaker=%zu/%zu sheds=%zu "
+                    "requests=%zu/%zu/%zu error=\"%s\"\n",
+                    ready ? 1 : 0, loaded ? 1 : 0,
+                    navigation.page.loaded ? 1 : 0,
+                    (int) allowed_length, allowed == NULL ? "" : allowed,
+                    (int) blocked_length, blocked == NULL ? "" : blocked,
+                    navigation.script_failed, (void *) navigation.page.runtime,
+                    navigation.page.script_degradation_observed ? 1 : 0,
+                    navigation.performance.parser_script_stage_breakers,
+                    navigation.performance
+                        .parser_script_stage_failure_breakers,
+                    navigation.performance.optional_work_sheds,
+                    replay_stats.request_count,
+                    replay_stats.matched_request_count,
+                    replay_stats.unmatched_request_count,
+                    navigation.last_error);
+        }
+        if (ready) fetch_trace_end();
+        if (installed) navigation_destroy(&navigation);
+        if (browser_ready) browser_session_destroy(&browser);
+        bool clean = budget.current == 0
+            && budget_active_allocations(&budget, NULL) == 0
+            && budget_categories_reconcile(&budget);
+        if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+        all_ok = all_ok && policy_ok && clean;
+    }
+
+    /* Response-stage integrity mismatches are policy refusals too. They may
+       diagnose each element as failed, but must not consume the consecutive
+       author-execution failure budget and suppress a later valid script. */
+    {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        BrowserSession browser = {0};
+        NavigationSession navigation = {0};
+        bool browser_ready = installed
+            && browser_session_init(&browser, &budget, 64 * 1024);
+        bool ready = browser_ready
+            && navigation_init(&navigation, &budget, 2)
+            && parser_script_sri_refusal_replay_begin();
+        if (ready) {
+            navigation_attach_browser_session(&navigation, &browser);
+            navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+            navigation_enable_document_scripts(
+                &navigation, 8, 64 * 1024u, 64 * 1024u, 1000);
+            navigation_set_stream_delivery(
+                &navigation, 43, 0, 0, 0, 0, 0);
+        }
+        uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+        bool loaded = ready && navigation_load_url(
+            &navigation, generation,
+            "https://script-sri-refusal.test/document",
+            4096, 1000, 480, NULL, NULL, true);
+        FetchTraceReplayStats replay_stats = {0};
+        bool replay_stats_ready = ready
+            && fetch_trace_replay_stats(&replay_stats);
+        bool policy_ok = loaded && navigation.page.loaded
+            && strcmp(navigation.page.script_result.summary,
+                      "SCRIPT-PRELOAD-OK") == 0
+            && navigation.script_failed >= 3u
+            && navigation.script_loaded == 1u
+            && navigation.page.runtime != NULL
+            && navigation.page.script_degradation_observed
+            && navigation.performance.parser_script_stage_breakers == 0u
+            && navigation.performance
+                   .parser_script_stage_failure_breakers == 0u
+            && navigation.performance.optional_work_sheds == 0u
+            && navigation.last_error[0] == '\0'
+            && replay_stats_ready && replay_stats.request_count == 5u
+            && replay_stats.matched_request_count == 5u
+            && replay_stats.unmatched_request_count == 0u;
+        if (!policy_ok) {
+            fprintf(stderr,
+                    "parser SRI attribution ready=%d loaded=%d page=%d "
+                    "summary=\"%s\" loaded-scripts=%zu failed=%zu runtime=%p "
+                    "degraded=%d breaker=%zu/%zu sheds=%zu "
+                    "requests=%zu/%zu/%zu error=\"%s\"\n",
+                    ready ? 1 : 0, loaded ? 1 : 0,
+                    navigation.page.loaded ? 1 : 0,
+                    navigation.page.script_result.summary,
+                    navigation.script_loaded, navigation.script_failed,
+                    (void *) navigation.page.runtime,
+                    navigation.page.script_degradation_observed ? 1 : 0,
+                    navigation.performance.parser_script_stage_breakers,
+                    navigation.performance
+                        .parser_script_stage_failure_breakers,
+                    navigation.performance.optional_work_sheds,
+                    replay_stats.request_count,
+                    replay_stats.matched_request_count,
+                    replay_stats.unmatched_request_count,
+                    navigation.last_error);
+        }
+        if (ready) fetch_trace_end();
+        if (installed) navigation_destroy(&navigation);
+        if (browser_ready) browser_session_destroy(&browser);
+        bool clean = budget.current == 0
+            && budget_active_allocations(&budget, NULL) == 0
+            && budget_categories_reconcile(&budget);
+        if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+        all_ok = all_ok && policy_ok && clean;
+    }
+
+    /* An external body which is larger than the caller's narrowed remaining
+       parser-work allowance is a typed exhaustion, whether it arrives from a
+       raw-scanner preload/cache or directly from replay transport. It opens
+       the work circuit before the following inline script can run. */
+    {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        BrowserSession browser = {0};
+        NavigationSession navigation = {0};
+        bool browser_ready = installed
+            && browser_session_init(&browser, &budget, 64 * 1024);
+        bool ready = browser_ready
+            && navigation_init(&navigation, &budget, 2)
+            && parser_script_work_external_replay_begin();
+        if (ready) {
+            navigation_attach_browser_session(&navigation, &browser);
+            navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+            navigation_enable_document_scripts(
+                &navigation, 8, 512u, 512u, 1000);
+            navigation_set_stream_delivery(
+                &navigation, 43, 0, 0, 0, 0, 0);
+        }
+        uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+        navigation_test_set_parser_script_stage_work_limit(180u);
+        bool loaded = ready && navigation_load_url(
+            &navigation, generation,
+            "https://script-work-external.test/document",
+            4096, 1000, 480, NULL, NULL, true);
+        navigation_test_set_parser_script_stage_work_limit(0u);
+        lxb_dom_node_t *root = loaded
+            ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+        lxb_dom_node_t *body = loaded
+            ? document_body_node(&navigation.page.document) : NULL;
+        size_t first_length = 0, external_length = 0, tail_length = 0;
+        const char *first = body == NULL ? NULL : document_attribute(
+            body, "data-first-ran", &first_length);
+        const char *external = body == NULL ? NULL : document_attribute(
+            body, "data-external-ran", &external_length);
+        const char *tail = body == NULL ? NULL : document_attribute(
+            body, "data-tail-ran", &tail_length);
+        FetchTraceReplayStats replay_stats = {0};
+        bool replay_stats_ready = ready
+            && fetch_trace_replay_stats(&replay_stats);
+        bool work_ok = loaded && navigation.page.loaded
+            && root != NULL && test_find_id(root, "useful-link") != NULL
+            && first != NULL && first_length == 3u
+            && external == NULL && external_length == 0u
+            && tail == NULL && tail_length == 0u
+            && navigation.page.runtime == NULL
+            && navigation.page.script_degradation_observed
+            && navigation.script_skipped_quota != 0u
+            && navigation.performance.parser_script_stage_work == 135u
+            && navigation.performance.parser_script_stage_breakers == 1u
+            && navigation.performance.parser_script_stage_work_breakers == 1u
+            && navigation.performance
+                   .parser_script_stage_failure_breakers == 0u
+            && navigation.performance.optional_work_sheds == 1u
+            && navigation.last_error[0] == '\0'
+            && strstr(navigation.page.script_result.summary,
+                      "bounded parser work") != NULL
+            && replay_stats_ready && replay_stats.request_count == 2u
+            && replay_stats.matched_request_count == 2u
+            && replay_stats.unmatched_request_count == 0u;
+        if (!work_ok) {
+            fprintf(stderr,
+                    "parser external work ready=%d loaded=%d page=%d "
+                    "first=%.*s external=%.*s tail=%.*s runtime=%p "
+                    "degraded=%d skipped=%zu work=%zu breaker=%zu/%zu/%zu "
+                    "sheds=%zu requests=%zu/%zu/%zu summary=\"%s\" "
+                    "error=\"%s\"\n",
+                    ready ? 1 : 0, loaded ? 1 : 0,
+                    navigation.page.loaded ? 1 : 0,
+                    (int) first_length, first == NULL ? "" : first,
+                    (int) external_length,
+                    external == NULL ? "" : external,
+                    (int) tail_length, tail == NULL ? "" : tail,
+                    (void *) navigation.page.runtime,
+                    navigation.page.script_degradation_observed ? 1 : 0,
+                    navigation.script_skipped_quota,
+                    navigation.performance.parser_script_stage_work,
+                    navigation.performance.parser_script_stage_breakers,
+                    navigation.performance.parser_script_stage_work_breakers,
+                    navigation.performance
+                        .parser_script_stage_failure_breakers,
+                    navigation.performance.optional_work_sheds,
+                    replay_stats.request_count,
+                    replay_stats.matched_request_count,
+                    replay_stats.unmatched_request_count,
+                    navigation.page.script_result.summary,
+                    navigation.last_error);
+        }
+        if (ready) fetch_trace_end();
+        if (installed) navigation_destroy(&navigation);
+        if (browser_ready) browser_session_destroy(&browser);
+        bool clean = budget.current == 0
+            && budget_active_allocations(&budget, NULL) == 0
+            && budget_categories_reconcile(&budget);
+        if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+        all_ok = all_ok && work_ok && clean;
+    }
+
+    /* A response which exceeds the ordinary per-file ceiling skips that
+       element only. It is not evidence that the navigation-wide parser-work
+       budget is exhausted, so a later small script must still execute. */
+    {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        BrowserSession browser = {0};
+        NavigationSession navigation = {0};
+        bool browser_ready = installed
+            && browser_session_init(&browser, &budget, 64 * 1024);
+        bool ready = browser_ready
+            && navigation_init(&navigation, &budget, 2)
+            && parser_script_file_overflow_replay_begin();
+        if (ready) {
+            navigation_attach_browser_session(&navigation, &browser);
+            navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+            navigation_enable_document_scripts(
+                &navigation, 8, 512u, 64u, 1000);
+            navigation_set_stream_delivery(
+                &navigation, 43, 0, 0, 0, 0, 0);
+        }
+        uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+        /* Equality is deliberately not cumulative narrowing: the first body
+           exceeds the ordinary 64-byte file cap, while the following inline
+           script still fits in the untouched 64-byte stage allowance. */
+        navigation_test_set_parser_script_stage_work_limit(64u);
+        bool loaded = ready && navigation_load_url(
+            &navigation, generation,
+            "https://script-file-overflow.test/document",
+            4096, 1000, 480, NULL, NULL, true);
+        navigation_test_set_parser_script_stage_work_limit(0u);
+        lxb_dom_node_t *body = loaded
+            ? document_body_node(&navigation.page.document) : NULL;
+        size_t large_length = 0, small_length = 0;
+        const char *large = body == NULL ? NULL : document_attribute(
+            body, "data-large-ran", &large_length);
+        const char *small = body == NULL ? NULL : document_attribute(
+            body, "data-small-ran", &small_length);
+        FetchTraceReplayStats replay_stats = {0};
+        bool replay_stats_ready = ready
+            && fetch_trace_replay_stats(&replay_stats);
+        bool overflow_ok = loaded && navigation.page.loaded
+            && large == NULL && large_length == 0u
+            && small != NULL && small_length == 3u
+            && navigation.page.runtime != NULL
+            && navigation.script_skipped_quota != 0u
+            && navigation.performance.parser_script_stage_breakers == 0u
+            && navigation.performance.parser_script_stage_work_breakers == 0u
+            && navigation.performance.optional_work_sheds == 0u
+            && navigation.last_error[0] == '\0'
+            && replay_stats_ready && replay_stats.request_count == 2u
+            && replay_stats.matched_request_count == 2u
+            && replay_stats.unmatched_request_count == 0u;
+        if (!overflow_ok) {
+            fprintf(stderr,
+                    "parser file overflow ready=%d loaded=%d page=%d "
+                    "large=%.*s small=%.*s runtime=%p skipped=%zu "
+                    "breaker=%zu/%zu sheds=%zu requests=%zu/%zu/%zu "
+                    "summary=\"%s\" error=\"%s\"\n",
+                    ready ? 1 : 0, loaded ? 1 : 0,
+                    navigation.page.loaded ? 1 : 0,
+                    (int) large_length, large == NULL ? "" : large,
+                    (int) small_length, small == NULL ? "" : small,
+                    (void *) navigation.page.runtime,
+                    navigation.script_skipped_quota,
+                    navigation.performance.parser_script_stage_breakers,
+                    navigation.performance.parser_script_stage_work_breakers,
+                    navigation.performance.optional_work_sheds,
+                    replay_stats.request_count,
+                    replay_stats.matched_request_count,
+                    replay_stats.unmatched_request_count,
+                    navigation.page.script_result.summary,
+                    navigation.last_error);
+        }
+        if (ready) fetch_trace_end();
+        if (installed) navigation_destroy(&navigation);
+        if (browser_ready) browser_session_destroy(&browser);
+        bool clean = budget.current == 0
+            && budget_active_allocations(&budget, NULL) == 0
+            && budget_categories_reconcile(&budget);
+        if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+        all_ok = all_ok && overflow_ok && clean;
+    }
+
+    /* A normal external-script failure near the cumulative work ceiling is
+       not evidence that the response itself exhausted that ceiling. The
+       missing replay record makes the request fail deterministically; the
+       page may still shed optional scripting, but it must not report a work
+       breaker or charge bytes it never retained. */
+    {
+        Budget budget;
+        budget_init(&budget, 16 * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        BrowserSession browser = {0};
+        NavigationSession navigation = {0};
+        bool browser_ready = installed
+            && browser_session_init(&browser, &budget, 64 * 1024);
+        bool ready = browser_ready
+            && navigation_init(&navigation, &budget, 2)
+            && parser_script_work_failure_replay_begin();
+        if (ready) {
+            navigation_attach_browser_session(&navigation, &browser);
+            navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+            navigation_enable_document_scripts(
+                &navigation, 8, 512u, 512u, 1000);
+            navigation_set_stream_delivery(
+                &navigation, 43, 0, 0, 0, 0, 0);
+        }
+        uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+        navigation_test_set_parser_script_stage_work_limit(180u);
+        bool loaded = ready && navigation_load_url(
+            &navigation, generation,
+            "https://script-work-failure.test/document",
+            4096, 1000, 480, NULL, NULL, true);
+        navigation_test_set_parser_script_stage_work_limit(0u);
+        lxb_dom_node_t *root = loaded
+            ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+        lxb_dom_node_t *body = loaded
+            ? document_body_node(&navigation.page.document) : NULL;
+        size_t first_length = 0;
+        const char *first = body == NULL ? NULL : document_attribute(
+            body, "data-first-ran", &first_length);
+        FetchTraceReplayStats replay_stats = {0};
+        bool replay_stats_ready = ready
+            && fetch_trace_replay_stats(&replay_stats);
+        bool attributed = loaded && navigation.page.loaded
+            && root != NULL && test_find_id(root, "useful-link") != NULL
+            && first != NULL && first_length == 3u
+            && navigation.performance.parser_script_stage_work == 135u
+            && navigation.performance.parser_script_stage_breakers == 0u
+            && navigation.performance.parser_script_stage_work_breakers == 0u
+            && navigation.performance.optional_work_sheds == 0u
+            && navigation.last_error[0] == '\0'
+            && replay_stats_ready && replay_stats.request_count == 2u
+            && replay_stats.matched_request_count == 1u
+            && replay_stats.unmatched_request_count == 1u;
+        if (!attributed) {
+            fprintf(stderr,
+                    "parser work attribution ready=%d loaded=%d first=%.*s "
+                    "work=%zu breaker=%zu/%zu sheds=%zu requests=%zu/%zu/%zu "
+                    "error=\"%s\"\n",
+                    ready ? 1 : 0, loaded ? 1 : 0,
+                    (int) first_length, first == NULL ? "" : first,
+                    navigation.performance.parser_script_stage_work,
+                    navigation.performance.parser_script_stage_breakers,
+                    navigation.performance.parser_script_stage_work_breakers,
+                    navigation.performance.optional_work_sheds,
+                    replay_stats.request_count,
+                    replay_stats.matched_request_count,
+                    replay_stats.unmatched_request_count,
+                    navigation.last_error);
+        }
+        if (ready) fetch_trace_end();
+        if (installed) navigation_destroy(&navigation);
+        if (browser_ready) browser_session_destroy(&browser);
+        bool clean = budget.current == 0
+            && budget_active_allocations(&budget, NULL) == 0
+            && budget_categories_reconcile(&budget);
+        if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+        all_ok = all_ok && attributed && clean;
+    }
+
+    /* A healthy, small parser hydration remains live and receives the same
+       lifecycle treatment as before the cumulative breaker. */
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready && navigation_init(&navigation, &budget, 2)
+        && parser_checkpoint_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024u, 64 * 1024u, 1000);
+        navigation_set_stream_delivery(&navigation, 37, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    /* The fixture's one 97-byte script sits one byte below this deterministic
+       bound, pinning that exhaustion is cumulative rather than anticipatory. */
+    navigation_test_set_parser_script_stage_work_limit(98u);
+    bool loaded = ready && navigation_load_url(
+        &navigation, generation, "https://checkpoint.test/document",
+        4096, 1000, 480, NULL, NULL, true);
+    navigation_test_set_parser_script_stage_work_limit(0u);
+    lxb_dom_node_t *body = loaded
+        ? document_body_node(&navigation.page.document) : NULL;
+    size_t ran_length = 0;
+    const char *ran = body == NULL ? NULL : document_attribute(
+        body, "data-script-ran", &ran_length);
+    bool healthy = loaded && navigation.page.loaded && ran != NULL
+        && ran_length == 3u && navigation.page.runtime != NULL
+        && !navigation.page.script_degradation_observed
+        && navigation.performance.optional_work_sheds == 0u
+        && navigation.performance.parser_checkpoint_soft_refusals == 0u
+        && navigation.performance.parser_script_stage_work == 97u
+        && navigation.performance.parser_script_stage_breakers == 0u
+        && strcmp(navigation.page.script_result.summary,
+                  "checkpoint-script-ran") == 0;
+    if (!healthy) {
+        fprintf(stderr,
+                "healthy parser hydration ready=%d loaded=%d page=%d "
+                "ran=%.*s runtime=%p degraded=%d sheds=%zu soft=%zu "
+                "summary=\"%s\" error=\"%s\"\n",
+                ready ? 1 : 0, loaded ? 1 : 0,
+                navigation.page.loaded ? 1 : 0,
+                (int) ran_length, ran == NULL ? "" : ran,
+                (void *) navigation.page.runtime,
+                navigation.page.script_degradation_observed ? 1 : 0,
+                navigation.performance.optional_work_sheds,
+                navigation.performance.parser_checkpoint_soft_refusals,
+                navigation.page.script_result.summary,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return all_ok && healthy && clean;
+}
+
+static bool test_parser_transport_failures_do_not_retire_realm(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready
+        && navigation_init(&navigation, &budget, 2)
+        && parser_script_transport_failures_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 8, 64 * 1024u, 64 * 1024u, 1000);
+        navigation_set_stream_delivery(
+            &navigation, 37, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool loaded = ready && navigation_load_url(
+        &navigation, generation,
+        "https://script-transport-failures.test/document",
+        4096, 1000, 480, NULL, NULL, true);
+    bool ok = loaded && navigation.page.loaded
+        && strcmp(navigation.page.script_result.summary,
+                  "SCRIPT-PRELOAD-OK") == 0
+        && navigation.page.runtime != NULL
+        && navigation.performance.parser_script_stage_breakers == 0u
+        && navigation.performance.parser_script_stage_failure_breakers == 0u
+        && navigation.last_error[0] == '\0';
+    if (!ok) {
+        fprintf(stderr,
+                "transport failures ready=%d loaded=%d page=%d evaluated=%zu "
+                "runtime=%p failed=%zu breakers=%zu/%zu summary=\"%s\" "
+                "error=\"%s\"\n",
+                ready ? 1 : 0, loaded ? 1 : 0,
+                navigation.page.loaded ? 1 : 0,
+                navigation.page.script_result.scripts_evaluated,
+                (void *) navigation.page.runtime, navigation.script_failed,
+                navigation.performance.parser_script_stage_breakers,
+                navigation.performance.parser_script_stage_failure_breakers,
+                navigation.page.script_result.summary,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_parser_script_stage_watchdog_and_failure_reset(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready
+        && navigation_init(&navigation, &budget, 2)
+        && parser_script_time_circuit_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1500);
+        navigation_enable_document_scripts(
+            &navigation, 8, 64 * 1024u, 64 * 1024u, 1500);
+        navigation_set_stream_delivery(
+            &navigation, 43, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    navigation_test_set_parser_script_stage_time_limit_us(25000u);
+    /* The watchdog stops the first hostile script near the deadline, but the
+       measured callback can land a few microseconds below it on a fast host.
+       Attribute the configured stage slice deterministically so that the
+       breaker opens on that script rather than after a later script runs. */
+    navigation_test_set_parser_script_stage_elapsed_us(25000u);
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    bool loaded = ready && navigation_load_url(
+        &navigation, generation,
+        "https://script-time-circuit.test/document",
+        4096, 1500, 480, NULL, NULL, true);
+    uint64_t finished_us = tilefinch_platform_monotonic_time_us();
+    navigation_test_set_parser_script_stage_time_limit_us(0u);
+    navigation_test_set_parser_script_stage_elapsed_us(0u);
+    uint64_t wall_us = finished_us >= started_us
+        ? finished_us - started_us : UINT64_MAX;
+    lxb_dom_node_t *root = loaded
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    lxb_dom_node_t *body = loaded
+        ? document_body_node(&navigation.page.document) : NULL;
+    size_t later_length = 0;
+    const char *later = body == NULL ? NULL : document_attribute(
+        body, "data-tail-ran", &later_length);
+    bool watchdog_ok = loaded && navigation.page.loaded
+        && root != NULL && test_find_id(root, "useful-link") != NULL
+        && later == NULL && later_length == 0u
+        && navigation.page.runtime == NULL
+        && navigation.page.script_degradation_observed
+        && navigation.performance.parser_script_stage_time_breakers == 1u
+        && navigation.performance.parser_script_stage_breakers == 1u
+        && navigation.performance.parser_script_stage_skipped != 0u
+        && navigation.last_error[0] == '\0'
+        /* A broken cumulative cap waits for the configured 1.5-second
+           per-script watchdog. Leave ample sanitizer/CI variance while
+           proving that path cannot be reached. */
+        && wall_us < UINT64_C(750000);
+    if (!watchdog_ok) {
+        fprintf(stderr,
+                "parser watchdog ready=%d loaded=%d page=%d wall=%llu "
+                "stage-us=%llu breakers=%zu/%zu skipped=%zu later=%.*s "
+                "runtime=%p summary=\"%s\" error=\"%s\"\n",
+                ready ? 1 : 0, loaded ? 1 : 0,
+                navigation.page.loaded ? 1 : 0,
+                (unsigned long long) wall_us,
+                (unsigned long long)
+                    navigation.performance.parser_script_stage_us,
+                navigation.performance.parser_script_stage_breakers,
+                navigation.performance.parser_script_stage_time_breakers,
+                navigation.performance.parser_script_stage_skipped,
+                (int) later_length, later == NULL ? "" : later,
+                (void *) navigation.page.runtime,
+                navigation.page.script_result.summary,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+
+    /* A raw-scanner preload is settled before the ordinary script fetch.
+       Transport wait is not author evaluation time and must not consume the
+       parser execution breaker; the following healthy script still runs. */
+    budget_init(&budget, 16 * MIB);
+    installed = budget_install_lexbor(&budget);
+    memset(&browser, 0, sizeof(browser));
+    memset(&navigation, 0, sizeof(navigation));
+    browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    ready = browser_ready && navigation_init(&navigation, &budget, 2)
+        && parser_script_preload_time_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1500);
+        navigation_enable_document_scripts(
+            &navigation, 8, 64 * 1024u, 64 * 1024u, 1500);
+        navigation_set_stream_delivery(
+            &navigation, 43, 0, 0, 0, 0, 0);
+    }
+    generation = ready ? navigation_begin(&navigation) : 0;
+    navigation_test_set_parser_script_stage_time_limit_us(25000u);
+    started_us = tilefinch_platform_monotonic_time_us();
+    loaded = ready && navigation_load_url(
+        &navigation, generation,
+        "https://script-preload-time.test/document",
+        4096, 1500, 480, NULL, NULL, true);
+    finished_us = tilefinch_platform_monotonic_time_us();
+    navigation_test_set_parser_script_stage_time_limit_us(0u);
+    wall_us = finished_us >= started_us
+        ? finished_us - started_us : UINT64_MAX;
+    root = loaded
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    body = loaded ? document_body_node(&navigation.page.document) : NULL;
+    later_length = 0;
+    later = body == NULL ? NULL : document_attribute(
+        body, "data-later-ran", &later_length);
+    bool preload_ok = loaded && navigation.page.loaded
+        && root != NULL && test_find_id(root, "useful-link") != NULL
+        && later != NULL && later_length == 3u
+        && navigation.page.runtime != NULL
+        && navigation.performance.parser_script_stage_time_breakers == 0u
+        && navigation.performance.parser_script_stage_breakers == 0u
+        && navigation.preloads_deferred != 0u
+        && navigation.last_error[0] == '\0'
+        && wall_us < UINT64_C(750000);
+    if (!preload_ok) {
+        fprintf(stderr,
+                "parser preload watchdog ready=%d loaded=%d wall=%llu "
+                "breakers=%zu/%zu deferred=%zu later=%.*s runtime=%p "
+                "summary=\"%s\" error=\"%s\"\n",
+                ready ? 1 : 0, loaded ? 1 : 0,
+                (unsigned long long) wall_us,
+                navigation.performance.parser_script_stage_breakers,
+                navigation.performance.parser_script_stage_time_breakers,
+                navigation.preloads_deferred,
+                (int) later_length, later == NULL ? "" : later,
+                (void *) navigation.page.runtime,
+                navigation.page.script_result.summary,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool preload_clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed)
+        preload_clean = budget_uninstall_lexbor(&budget) && preload_clean;
+
+    budget_init(&budget, 16 * MIB);
+    installed = budget_install_lexbor(&budget);
+    memset(&browser, 0, sizeof(browser));
+    memset(&navigation, 0, sizeof(navigation));
+    browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    ready = browser_ready && navigation_init(&navigation, &budget, 2)
+        && parser_script_failure_reset_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 8, 64 * 1024u, 64 * 1024u, 1000);
+        navigation_set_stream_delivery(
+            &navigation, 43, 0, 0, 0, 0, 0);
+    }
+    generation = ready ? navigation_begin(&navigation) : 0;
+    loaded = ready && navigation_load_url(
+        &navigation, generation,
+        "https://script-failure-reset.test/document",
+        4096, 1000, 480, NULL, NULL, true);
+    body = loaded ? document_body_node(&navigation.page.document) : NULL;
+    size_t reset_length = 0, tail_length = 0;
+    const char *reset = body == NULL ? NULL : document_attribute(
+        body, "data-reset-ran", &reset_length);
+    const char *tail = body == NULL ? NULL : document_attribute(
+        body, "data-tail-ran", &tail_length);
+    bool reset_ok = loaded && navigation.page.loaded
+        && reset != NULL && reset_length == 3u
+        && tail != NULL && tail_length == 3u
+        && navigation.page.runtime != NULL
+        && navigation.script_failed == 4u
+        && navigation.performance.parser_script_stage_breakers == 0u
+        && navigation.performance.parser_script_stage_failure_breakers == 0u
+        && navigation.performance.optional_work_sheds == 0u
+        && navigation.last_error[0] == '\0';
+    if (!reset_ok) {
+        fprintf(stderr,
+                "parser failure reset ready=%d loaded=%d reset=%.*s "
+                "tail=%.*s runtime=%p failed=%zu breaker=%zu/%zu "
+                "degraded=%d error=\"%s\"\n",
+                ready ? 1 : 0, loaded ? 1 : 0,
+                (int) reset_length, reset == NULL ? "" : reset,
+                (int) tail_length, tail == NULL ? "" : tail,
+                (void *) navigation.page.runtime, navigation.script_failed,
+                navigation.performance.parser_script_stage_breakers,
+                navigation.performance.parser_script_stage_failure_breakers,
+                navigation.page.script_degradation_observed ? 1 : 0,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool reset_clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed)
+        reset_clean = budget_uninstall_lexbor(&budget) && reset_clean;
+    return watchdog_ok && clean && preload_ok && preload_clean
+        && reset_ok && reset_clean;
+}
+
+static bool test_parser_script_mutation_rebinds_live_node(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready && navigation_init(&navigation, &budget, 2)
+        && parser_script_mutation_rebind_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 8, 64 * 1024u, 64 * 1024u, 1000);
+        navigation_set_stream_delivery(&navigation, 37, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool loaded = ready && navigation_load_url(
+        &navigation, generation,
+        "https://script-mutation-rebind.test/document",
+        4096, 1000, 480, NULL, NULL, true);
+    lxb_dom_node_t *root = loaded
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    lxb_dom_node_t *body = loaded
+        ? document_body_node(&navigation.page.document) : NULL;
+    size_t removed_length = 0, retyped_length = 0, tail_length = 0;
+    size_t victim_ran_length = 0, retyped_ran_length = 0;
+    const char *removed = body == NULL ? NULL : document_attribute(
+        body, "data-removed", &removed_length);
+    const char *retyped = body == NULL ? NULL : document_attribute(
+        body, "data-retyped", &retyped_length);
+    const char *tail = body == NULL ? NULL : document_attribute(
+        body, "data-tail-ran", &tail_length);
+    const char *victim_ran = body == NULL ? NULL : document_attribute(
+        body, "data-victim-ran", &victim_ran_length);
+    const char *retyped_ran = body == NULL ? NULL : document_attribute(
+        body, "data-retyped-ran", &retyped_ran_length);
+    lxb_dom_node_t *retyped_node = root == NULL
+        ? NULL : test_find_id(root, "retyped");
+    size_t type_length = 0;
+    const char *type = retyped_node == NULL ? NULL : document_attribute(
+        retyped_node, "type", &type_length);
+    bool ok = loaded && navigation.page.loaded && root != NULL
+        && test_find_id(root, "useful-link") != NULL
+        && test_find_id(root, "victim") == NULL
+        && removed != NULL && removed_length == 3u
+        && retyped != NULL && retyped_length == 3u
+        && retyped_node != NULL && type != NULL
+        && type_length == sizeof("application/json") - 1u
+        && memcmp(type, "application/json", type_length) == 0
+        && victim_ran == NULL && victim_ran_length == 0u
+        && retyped_ran == NULL && retyped_ran_length == 0u
+        && tail != NULL && tail_length == 3u
+        && navigation.page.runtime != NULL
+        && !navigation.page.script_degradation_observed
+        && navigation.last_error[0] == '\0';
+    if (!ok) {
+        fprintf(stderr,
+                "parser mutation rebind ready=%d loaded=%d page=%d "
+                "victim=%p removed=%.*s retyped=%.*s type=%.*s "
+                "victim-ran=%.*s retyped-ran=%.*s tail=%.*s runtime=%p "
+                "degraded=%d summary=\"%s\" error=\"%s\"\n",
+                ready ? 1 : 0, loaded ? 1 : 0,
+                navigation.page.loaded ? 1 : 0,
+                root == NULL ? NULL : (void *) test_find_id(root, "victim"),
+                (int) removed_length, removed == NULL ? "" : removed,
+                (int) retyped_length, retyped == NULL ? "" : retyped,
+                (int) type_length, type == NULL ? "" : type,
+                (int) victim_ran_length,
+                victim_ran == NULL ? "" : victim_ran,
+                (int) retyped_ran_length,
+                retyped_ran == NULL ? "" : retyped_ran,
+                (int) tail_length, tail == NULL ? "" : tail,
+                (void *) navigation.page.runtime,
+                navigation.page.script_degradation_observed ? 1 : 0,
+                navigation.page.script_result.summary,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_failed_external_parser_source_counts_as_work(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready && navigation_init(&navigation, &budget, 2)
+        && parser_script_work_failed_body_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 8, 512u, 512u, 1000);
+        navigation_set_stream_delivery(&navigation, 37, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    navigation_test_set_parser_script_stage_work_limit(190u);
+    bool loaded = ready && navigation_load_url(
+        &navigation, generation,
+        "https://script-work-failed-body.test/document",
+        4096, 1000, 480, NULL, NULL, true);
+    navigation_test_set_parser_script_stage_work_limit(0u);
+    lxb_dom_node_t *root = loaded
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    lxb_dom_node_t *body = loaded
+        ? document_body_node(&navigation.page.document) : NULL;
+    size_t first_length = 0, tail_length = 0;
+    const char *first = body == NULL ? NULL : document_attribute(
+        body, "data-first-ran", &first_length);
+    const char *tail = body == NULL ? NULL : document_attribute(
+        body, "data-tail-ran", &tail_length);
+    bool ok = loaded && navigation.page.loaded && root != NULL
+        && test_find_id(root, "useful-link") != NULL
+        && first != NULL && first_length == 3u
+        && tail == NULL && tail_length == 0u
+        && navigation.performance.parser_script_stage_work == 154u
+        && navigation.performance.parser_script_stage_breakers == 1u
+        && navigation.performance.parser_script_stage_work_breakers == 1u
+        && navigation.page.script_degradation_observed
+        && navigation.page.runtime == NULL
+        && navigation.last_error[0] == '\0';
+    if (!ok) {
+        fprintf(stderr,
+                "failed parser source work ready=%d loaded=%d page=%d "
+                "first=%.*s tail=%.*s work=%zu breakers=%zu/%zu "
+                "runtime=%p degraded=%d summary=\"%s\" error=\"%s\"\n",
+                ready ? 1 : 0, loaded ? 1 : 0,
+                navigation.page.loaded ? 1 : 0,
+                (int) first_length, first == NULL ? "" : first,
+                (int) tail_length, tail == NULL ? "" : tail,
+                navigation.performance.parser_script_stage_work,
+                navigation.performance.parser_script_stage_breakers,
+                navigation.performance.parser_script_stage_work_breakers,
+                (void *) navigation.page.runtime,
+                navigation.page.script_degradation_observed ? 1 : 0,
+                navigation.page.script_result.summary,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_parser_mutation_checkpoint_uses_stage_deadline(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready && navigation_init(&navigation, &budget, 2)
+        && parser_script_mutation_time_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1500);
+        navigation_enable_document_scripts(
+            &navigation, 8, 64 * 1024u, 64 * 1024u, 1500);
+        navigation_set_stream_delivery(&navigation, 37, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    navigation_test_set_parser_script_stage_time_limit_us(25000u);
+    uint64_t started_us = tilefinch_platform_monotonic_time_us();
+    bool loaded = ready && navigation_load_url(
+        &navigation, generation,
+        "https://script-mutation-time.test/document",
+        4096, 1500, 480, NULL, NULL, true);
+    uint64_t finished_us = tilefinch_platform_monotonic_time_us();
+    navigation_test_set_parser_script_stage_time_limit_us(0u);
+    uint64_t wall_us = finished_us >= started_us
+        ? finished_us - started_us : UINT64_MAX;
+    lxb_dom_node_t *root = loaded
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    lxb_dom_node_t *body = loaded
+        ? document_body_node(&navigation.page.document) : NULL;
+    size_t victim_length = 0, tail_length = 0;
+    const char *victim = body == NULL ? NULL : document_attribute(
+        body, "data-victim-ran", &victim_length);
+    const char *tail = body == NULL ? NULL : document_attribute(
+        body, "data-tail-ran", &tail_length);
+    bool ok = loaded && navigation.page.loaded && root != NULL
+        && test_find_id(root, "useful-link") != NULL
+        && victim == NULL && victim_length == 0u
+        && tail == NULL && tail_length == 0u
+        && navigation.performance.parser_script_stage_time_breakers == 1u
+        && navigation.performance.parser_script_stage_breakers == 1u
+        && navigation.page.script_degradation_observed
+        && navigation.page.runtime == NULL
+        && navigation.last_error[0] == '\0'
+        && wall_us < UINT64_C(750000);
+    if (!ok) {
+        fprintf(stderr,
+                "parser mutation deadline ready=%d loaded=%d page=%d "
+                "wall=%llu victim=%.*s tail=%.*s stage-us=%llu "
+                "breakers=%zu/%zu runtime=%p degraded=%d summary=\"%s\" "
+                "error=\"%s\"\n",
+                ready ? 1 : 0, loaded ? 1 : 0,
+                navigation.page.loaded ? 1 : 0,
+                (unsigned long long) wall_us,
+                (int) victim_length, victim == NULL ? "" : victim,
+                (int) tail_length, tail == NULL ? "" : tail,
+                (unsigned long long)
+                    navigation.performance.parser_script_stage_us,
+                navigation.performance.parser_script_stage_breakers,
+                navigation.performance.parser_script_stage_time_breakers,
+                (void *) navigation.page.runtime,
+                navigation.page.script_degradation_observed ? 1 : 0,
+                navigation.page.script_result.summary,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_late_server_actions_refresh_hydration_snapshot(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready && navigation_init(&navigation, &budget, 2)
+        && parser_script_late_ssr_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 8, 64 * 1024u, 64 * 1024u, 1000);
+        navigation_set_stream_delivery(&navigation, 37, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool loaded = ready && navigation_load_url(
+        &navigation, generation, "https://script-late-ssr.test/document",
+        4096, 1000, 480, NULL, NULL, true);
+    lxb_dom_node_t *root = loaded
+        ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
+    lxb_dom_node_t *early = root == NULL
+        ? NULL : test_find_id(root, "early-content");
+    lxb_dom_node_t *link = root == NULL
+        ? NULL : test_find_id(root, "late-link");
+    lxb_dom_node_t *loading = root == NULL
+        ? NULL : test_find_id(root, "loading");
+    /* The late link adds only one element, one text node, and two text bytes:
+       both old coarse refresh thresholds (8 nodes / 256 bytes) remain unmet. */
+    bool ok = loaded && navigation.page.loaded && early != NULL
+        && link != NULL && loading == NULL
+        && navigation.page.layout.link_count != 0u
+        && navigation.script_failed >= 1u
+        && navigation.page.script_degradation_observed
+        && navigation.last_error[0] == '\0';
+    if (!ok) {
+        fprintf(stderr,
+                "late SSR snapshot ready=%d loaded=%d page=%d early=%p "
+                "link=%p loading=%p links=%zu controls=%zu "
+                "failed=%zu runtime=%p degraded=%d summary=\"%s\" "
+                "error=\"%s\"\n",
+                ready ? 1 : 0, loaded ? 1 : 0,
+                navigation.page.loaded ? 1 : 0, (void *) early,
+                (void *) link, (void *) loading,
+                navigation.page.layout.link_count,
+                navigation.page.layout.control_count,
+                navigation.script_failed, (void *) navigation.page.runtime,
+                navigation.page.script_degradation_observed ? 1 : 0,
+                navigation.page.script_result.summary,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_resource_scheduler_refusal_is_not_script_degradation(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = installed
+        && browser_session_init(&browser, &budget, 64 * 1024);
+    bool ready = browser_ready
+        && navigation_init(&navigation, &budget, 2)
+        && resource_only_shed_replay_begin();
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        navigation_set_reader_candidate_mode(&navigation, true);
+        navigation_test_refuse_next_stream_scheduler_creation();
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool loaded = ready && navigation_load_url(
+        &navigation, generation, "https://resource-only.test/document",
+        4096, 1000, 480, NULL, NULL, true);
+    bool ok = loaded && navigation.page.loaded
+        && navigation.performance.optional_work_sheds == 1u
+        && navigation.page.runtime == NULL
+        && !navigation.scripts_enabled
+        && !navigation.document_scripts_enabled
+        && !navigation.page.script_degradation_observed
+        && navigation_layout_is_visually_blank(&navigation.page.layout)
+        && navigation.page.reader_analysis.prepared
+        && navigation.page.reader_analysis.kind == READER_PAGE_ARTICLE;
+    if (!ok) {
+        fprintf(stderr,
+                "resource-only shed ready=%d loaded=%d page=%d sheds=%zu "
+                "runtime=%p scripts=%d/%d degraded=%d blank=%d "
+                "reader=%d/%d error=\"%s\"\n",
+                ready, loaded, navigation.page.loaded,
+                navigation.performance.optional_work_sheds,
+                (void *) navigation.page.runtime, navigation.scripts_enabled,
+                navigation.document_scripts_enabled,
+                navigation.page.script_degradation_observed,
+                navigation_layout_is_visually_blank(&navigation.page.layout),
+                navigation.page.reader_analysis.prepared,
+                (int) navigation.page.reader_analysis.kind,
+                navigation.last_error);
+    }
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
 }
 

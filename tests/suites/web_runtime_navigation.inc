@@ -147,8 +147,8 @@
         "const hoverEvents=[];for(const type of ['pointerover','pointerenter','pointerout','pointerleave','mouseover','mouseenter','mouseout','mouseleave'])draw.addEventListener(type,event=>{hoverEvents.push(type+':'+(event.relatedTarget?.id||'null'));status.setAttribute('data-hover',hoverEvents.join('|'))});"
         "document.getElementById('remove-on-down').addEventListener('pointerdown',event=>event.currentTarget.remove());"
         "const editActivation=[];for(const type of ['pointerdown','mousedown','focus','pointerup','mouseup','click'])edit.addEventListener(type,()=>{editActivation.push(type);status.setAttribute('data-edit-activation',editActivation.join('|'))});"
-        "edit.addEventListener('beforeinput',event=>{status.setAttribute('data-before',event.constructor.name+':'+event.inputType+':'+event.data+':'+edit.getAttribute('value')+':'+event.isTrusted);if(event.data==='X')event.preventDefault();});"
-        "edit.addEventListener('input',event=>{status.setAttribute('data-value',edit.getAttribute('value'));status.setAttribute('data-input',event.constructor.name+':'+event.inputType+':'+event.data+':'+edit.getAttribute('value')+':'+event.isTrusted);});"
+        "edit.addEventListener('beforeinput',event=>{status.setAttribute('data-before',event.constructor.name+':'+event.inputType+':'+event.data+':'+edit.value+':'+event.isTrusted);if(event.data==='X')event.preventDefault();});"
+        "edit.addEventListener('input',event=>{status.setAttribute('data-value',edit.value);status.setAttribute('data-input',event.constructor.name+':'+event.inputType+':'+event.data+':'+edit.value+':'+event.isTrusted);});"
         "document.getElementById('prompt').addEventListener('input',()=>status.setAttribute('data-prompt','yes'));"
         "const go=document.getElementById('go'),activation=[];for(const type of ['pointerdown','mousedown','pointerup','mouseup','click'])go.addEventListener(type,event=>activation.push(type+':'+event.constructor.name+':'+event.isTrusted));go.addEventListener('click',()=>{status.textContent='CLICKED';status.setAttribute('data-activation',activation.join('|'));});edit.closest('form').addEventListener('submit',event=>status.setAttribute('data-submit',event.constructor.name+':'+(event.submitter===go)+':'+event.isTrusted));"
         "document.getElementById('search-form').addEventListener('submit',event=>status.setAttribute('data-search-submit',event.constructor.name+':'+(event.submitter===null)+':'+event.isTrusted));"
@@ -637,16 +637,21 @@
     lxb_dom_node_t *edit_node = find_id(
         lxb_dom_interface_node(interactive.page.document.html), "edit");
     size_t edit_value_length = 0;
-    const char *edit_value = document_attribute(edit_node, "value",
-                                                &edit_value_length);
+    const char *edit_value = document_control_value(
+        edit_node, &edit_value_length);
+    size_t edit_default_length = 0;
+    const char *edit_default = document_attribute(
+        edit_node, "value", &edit_default_length);
     CHECK(edit_value != NULL && edit_value_length == 3
           && memcmp(edit_value, "ABC", 3) == 0
+          && edit_default != NULL && edit_default_length == 1u
+          && memcmp(edit_default, "A", 1u) == 0
           && attribute_equals(runtime_status, "data-before",
                               "InputEvent:insertText:BC:A:true")
           && attribute_equals(runtime_status, "data-input",
                               "InputEvent:insertText:BC:ABC:true")
           && controller_backspace(&controller));
-    edit_value = document_attribute(edit_node, "value", &edit_value_length);
+    edit_value = document_control_value(edit_node, &edit_value_length);
     CHECK(edit_value != NULL && edit_value_length == 2
           && memcmp(edit_value, "AB", 2) == 0
           && attribute_equals(runtime_status, "data-before",
@@ -654,7 +659,7 @@
           && attribute_equals(runtime_status, "data-input",
                               "InputEvent:deleteContentBackward:null:AB:true"));
     CHECK(controller_insert_text(&controller, "X", 1));
-    edit_value = document_attribute(edit_node, "value", &edit_value_length);
+    edit_value = document_control_value(edit_node, &edit_value_length);
     CHECK(edit_value != NULL && edit_value_length == 2
           && memcmp(edit_value, "AB", 2) == 0
           && attribute_equals(runtime_status, "data-before",
@@ -782,10 +787,17 @@
         "<title>Scroll</title><style>"
         "#space{display:block;height:1200px}#fixed-focus{position:fixed;"
         "left:17px;top:19px;width:90px;height:30px}#nested{height:40px;"
-        "overflow:auto}#nested-space{height:200px}</style><body>"
+        "overflow:auto}#nested-space{height:200px}"
+        "#bounded-scene{position:relative;top:60px;height:300px}"
+        "#bounded-sticky{position:sticky;top:0;height:40px}"
+        "#retired-fixed{position:fixed;left:160px;top:19px;width:90px;"
+        "height:30px}</style><body>"
         "<button id=bottom type=button>Bottom</button>"
         "<button id=fixed-focus type=button>Fixed focus</button>"
-        "<div id=nested><div id=nested-space>nested</div></div><div id=space></div>"
+        "<div id=nested><div id=nested-space>nested</div></div>"
+        "<section id=bounded-scene><div id=bounded-sticky>"
+        "<button id=retired-fixed type=button>Retired fixed</button>"
+        "</div></section><div id=space></div>"
         "<p><a id=end href=/end>END OF PAGE</a></p><script>"
         "const scrollOrder=[];globalThis.pocSummary='scroll:pending';"
         "const recordScroll=name=>{scrollOrder.push(name+':'+scrollY);"
@@ -896,6 +908,77 @@
               "https://example.test/fixed-geometry.js",
               &interactive.page.script_result)
           && strcmp(interactive.page.script_result.summary, "19") == 0);
+
+    /* A fixed control nested in a finite sticky scene retires with that
+       scene.  Its focus, hit-test, and DOM geometry must all stop reporting
+       the viewport-fixed position at the exact paint boundary.  The scene's
+       relative offset also proves that the retained boundary followed the
+       translated command range. */
+    lxb_dom_node_t *retired_fixed_node = find_id(
+        lxb_dom_interface_node(interactive.page.document.html),
+        "retired-fixed");
+    const LayoutNodeBox *retired_fixed_box = layout_box_for_node(
+        &interactive.page.layout, retired_fixed_node);
+    size_t retired_fixed_control = SIZE_MAX;
+    for (size_t i = 0; i < interactive.page.layout.control_count; i++) {
+        if (interactive.page.layout.controls[i].node == retired_fixed_node) {
+            retired_fixed_control = i;
+            break;
+        }
+    }
+    const FixedRange *retired_fixed_range = NULL;
+    for (size_t i = 0; i < interactive.page.layout.fixed_count; i++) {
+        const FixedRange *candidate = &interactive.page.layout.fixed_ranges[i];
+        if (retired_fixed_control >= candidate->control_start
+            && retired_fixed_control < candidate->control_end) {
+            retired_fixed_range = candidate;
+            break;
+        }
+    }
+    CHECK(retired_fixed_node != NULL && retired_fixed_box != NULL
+          && retired_fixed_control != SIZE_MAX
+          && retired_fixed_range != NULL
+          && retired_fixed_range->scroll_end != INT_MAX
+          && retired_fixed_range->scroll_end > 60
+          && retired_fixed_range->scroll_end < scroll_maximum);
+    const ControlRegion *retired_fixed_region =
+        &interactive.page.layout.controls[retired_fixed_control];
+    int retired_active_scroll = retired_fixed_range->scroll_end - 1;
+    CHECK(navigation_set_scroll(&interactive, retired_active_scroll)
+          && controller_focus_node(&controller, retired_fixed_node));
+    int retired_active_y = 0;
+    CHECK(controller_focused_rect(&controller, NULL, &retired_active_y,
+                                  NULL, NULL));
+    int retired_active_client_y = retired_active_y - retired_active_scroll;
+    CHECK(retired_active_client_y >= 0
+          && retired_active_client_y < controller.viewport_height
+          && navigation_set_scroll(
+                 &interactive, retired_fixed_range->scroll_end));
+    int retired_document_y = 0;
+    bool retired_rect_ok = controller_focused_rect(
+        &controller, NULL, &retired_document_y, NULL, NULL);
+    bool retired_hit = controller_focus_at(
+        &controller, retired_fixed_region->x + 1,
+        retired_active_client_y + 1);
+    CHECK(retired_rect_ok
+          && retired_document_y == retired_fixed_box->y
+          && (!retired_hit
+              || controller_focused_node(&controller)
+                     != retired_fixed_node)
+          && navigation_set_scroll(
+                 &interactive, retired_fixed_range->scroll_end));
+    char retired_geometry_expected[32];
+    snprintf(retired_geometry_expected, sizeof(retired_geometry_expected),
+             "%d", retired_fixed_box->y - retired_fixed_range->scroll_end);
+    bool retired_geometry_ok = script_runtime_evaluate_diagnostic(
+        interactive.page.runtime,
+        "globalThis.pocSummary=String(Math.round(document."
+        "getElementById('retired-fixed').getBoundingClientRect().top))",
+        "https://example.test/retired-fixed-geometry.js",
+        &interactive.page.script_result);
+    CHECK(retired_geometry_ok
+          && strcmp(interactive.page.script_result.summary,
+                    retired_geometry_expected) == 0);
     CHECK(controller_scroll_to_bottom(&controller, 272));
     int tall_page_scroll = navigation_current(&interactive)->scroll_y;
     CHECK(script_runtime_evaluate_diagnostic(
@@ -1578,6 +1661,16 @@
                  .focus_paint_relayout_skips == 0
           && focus_invalidation_navigation.focus_paint_generation == 0
           && !focus_invalidation_navigation.focus_paint_damage_valid);
+    const LayoutNodeBox *paint_box = layout_box_for_node(
+        &focus_invalidation_navigation.page.layout, paint);
+    int paint_focus_width = 0, paint_focus_height = 0;
+    CHECK(paint_box != NULL
+          && controller_focused_rect(
+              &focus_invalidation_controller, NULL, NULL,
+              &paint_focus_width, &paint_focus_height)
+          && paint_focus_width == paint_box->width
+          && paint_focus_height == paint_box->height
+          && paint_focus_height < 30);
 
     enum { FOCUS_FRAME_WIDTH = 480, FOCUS_FRAME_HEIGHT = 272 };
     size_t focus_frame_pixels =

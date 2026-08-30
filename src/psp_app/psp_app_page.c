@@ -87,6 +87,7 @@ void psp_leave_reader_for_navigation(
     browser_engine_set_reader_candidate_mode(engine, false);
     unsigned global_percent = browser_profile_page_font_percent(profile);
     ui->reader_mode = false;
+    ui->basic_mode = false;
     ui->page_font_percent = global_percent;
     if (!psp_set_presentation_css(
             engine, ui, profile, false, url, global_percent, false)) {
@@ -142,11 +143,13 @@ void psp_reader_navigation_finish(
     }
     if (succeeded) {
         ui->reader_mode = true;
+        ui->basic_mode = false;
         ui->page_font_percent = navigation->destination_percent;
     } else {
         const char *incumbent_url =
             current_url == NULL ? ui->url : current_url;
         ui->reader_mode = true;
+        ui->basic_mode = false;
         ui->page_font_percent = navigation->incumbent_percent;
         /* Candidate failure leaves the incumbent page and its already-drawn
            Reader layout intact. Restore only the configured sheet so the
@@ -157,6 +160,7 @@ void psp_reader_navigation_finish(
                 navigation->incumbent_percent, false)) {
             (void) browser_engine_set_user_css(engine, "", 0);
             ui->reader_mode = false;
+            ui->basic_mode = false;
             ui->page_font_percent =
                 browser_profile_page_font_percent(profile);
         }

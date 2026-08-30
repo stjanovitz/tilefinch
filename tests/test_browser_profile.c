@@ -147,6 +147,8 @@ int main(void)
                  == BROWSER_SUBTITLE_LANGUAGE_SYSTEM
           && browser_profile_alternate_language(profile)
                  == BROWSER_ALTERNATE_LANGUAGE_NONE
+          && browser_profile_subtitle_background(profile)
+                 == BROWSER_SUBTITLE_BACKGROUND_SHADOW
           && strcmp(browser_subtitle_language_tag(
                         BROWSER_SUBTITLE_LANGUAGE_SYSTEM, NULL, NULL),
                     "en") == 0
@@ -604,7 +606,7 @@ int main(void)
           && browser_profile_subtitle_size(legacy_loaded)
                  == BROWSER_SUBTITLE_SIZE_STANDARD
           && browser_profile_subtitle_background(legacy_loaded)
-                 == BROWSER_SUBTITLE_BACKGROUND_BOX
+                 == BROWSER_SUBTITLE_BACKGROUND_SHADOW
           && browser_profile_video_scaling(legacy_loaded)
                  == BROWSER_VIDEO_SCALING_SMOOTH
           && browser_profile_video_startup_buffering(legacy_loaded)

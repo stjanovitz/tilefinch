@@ -661,17 +661,25 @@
       const serialize = (value) =>
         String(value || "").replace(/[^\x21-\x7e]/gu, (char) =>
           encodeURIComponent(char),
-        );
-      this.protocol = parsed[1];
-      this.hostname = parsed[2];
-      this.port = parsed[3] || "";
-      this.host = this.hostname + (this.port ? ":" + this.port : "");
-      this.pathname = serialize(parsed[4]) || "/";
-      this.search = serialize(parsed[5]);
-      this.hash = serialize(parsed[6]);
-      this.origin = this.protocol + "//" + this.host;
-      this._href = this.origin + this.pathname + this.search + this.hash;
-      this.searchParams = new TilefinchURLSearchParams(this.search, (value) => {
+        ),
+        protocol = parsed[1],
+        hostname = parsed[2],
+        port = parsed[3] || "",
+        host = hostname + (port ? ":" + port : ""),
+        pathname = serialize(parsed[4]) || "/",
+        search = serialize(parsed[5]),
+        hash = serialize(parsed[6]),
+        origin = protocol + "//" + host;
+      this.protocol = protocol;
+      this.hostname = hostname;
+      this.port = port;
+      this.host = host;
+      this.pathname = pathname;
+      this.search = search;
+      this.hash = hash;
+      this.origin = origin;
+      this._href = origin + pathname + search + hash;
+      this.searchParams = new TilefinchURLSearchParams(search, (value) => {
         this.search = value ? "?" + value : "";
         this._href = this.origin + this.pathname + this.search + this.hash;
       });
@@ -2696,13 +2704,68 @@
       }
     }
   };
-  const location = new TilefinchURL(
-    String(globalThis.__tilefinchLocationHref || "https://example.invalid/"),
-  );
+  const tilefinchCurrentDocumentURL =
+      globalThis.__tilefinchCurrentDocumentURL,
+    tilefinchDocumentURLRevision =
+      globalThis.__tilefinchDocumentURLRevision,
+    location = new TilefinchURL(
+      String(globalThis.__tilefinchLocationHref || "https://example.invalid/"),
+    ),
+    locationParts = Object.create(null),
+    locationPartNames = [
+      "protocol",
+      "hostname",
+      "port",
+      "host",
+      "pathname",
+      "search",
+      "hash",
+      "origin",
+      "searchParams",
+    ];
+  let locationRevision = Number(tilefinchDocumentURLRevision()) >>> 0,
+    locationSynchronizing = false;
+  const synchronizeLocation = () => {
+      if (locationSynchronizing) return;
+      const revision = Number(tilefinchDocumentURLRevision()) >>> 0;
+      if (revision === locationRevision) return;
+      const href = tilefinchCurrentDocumentURL();
+      locationSynchronizing = true;
+      try {
+        location._set(String(href));
+        locationRevision = revision;
+      } finally {
+        locationSynchronizing = false;
+      }
+    },
+    setSynchronizedLocation = (href) => {
+      locationSynchronizing = true;
+      try {
+        location._set(String(href));
+        locationRevision = Number(tilefinchDocumentURLRevision()) >>> 0;
+      } finally {
+        locationSynchronizing = false;
+      }
+    };
+  for (const name of locationPartNames) {
+    locationParts[name] = location[name];
+    Object.defineProperty(location, name, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        synchronizeLocation();
+        return locationParts[name];
+      },
+      set(value) {
+        locationParts[name] = value;
+      },
+    });
+  }
   Object.defineProperty(location, "href", {
     configurable: false,
     enumerable: true,
     get() {
+      synchronizeLocation();
       return this._href;
     },
     set(value) {
@@ -6033,7 +6096,7 @@
           !__tilefinchSetDocumentURL(next.href)
         )
           throw new Error("SecurityError");
-        location._set(next.href);
+        setSynchronizedLocation(next.href);
       }
       historyState = state;
     },
@@ -6046,7 +6109,7 @@
     go() {},
   };
   globalThis.__tilefinchCommitSameDocument = (url, oldURL) => {
-    location._set(String(url));
+    setSynchronizedLocation(url);
     historyLength++;
     const event = new Event("hashchange");
     event.oldURL = String(oldURL);
@@ -6054,7 +6117,7 @@
     globalThis.dispatchEvent(event);
   };
   globalThis.__tilefinchRestoreSameDocument = (url, oldURL) => {
-    location._set(String(url));
+    setSynchronizedLocation(url);
     const pop = new Event("popstate");
     pop.state = historyState;
     globalThis.dispatchEvent(pop);
@@ -6215,7 +6278,14 @@
     Object.freeze(axes);
     Object.freeze(buttons);
     let connected = false,
-      timestamp = 0;
+      timestamp = 0,
+      currentButtonBits = 0;
+    /* PSP analog input can change on every sampled frame. Keep that hot
+       publication path allocation-free: defining this helper inside the
+       host callback created a fresh closure for every nub sample, and
+       rewriting all 17 buttons made axis-only movement pay unrelated work. */
+    const normalizeGamepadAxis = (value) =>
+      Math.max(-1, Math.min(1, Number(value) / 32767));
     const gamepad = Object.freeze({
         id: "PSP Built-in Controller",
         index: 0,
@@ -6262,12 +6332,13 @@
     ) => {
       nextConnected = !!nextConnected;
       buttonBits = Number(buttonBits) >>> 0;
-      for (let index = 0; index < 17; index++)
-        buttonValues[index] = buttonBits & (1 << index) ? 1 : 0;
-      const normalizeAxis = (value) =>
-        Math.max(-1, Math.min(1, Number(value) / 32767));
-      axisValues[0] = normalizeAxis(axisX);
-      axisValues[1] = normalizeAxis(axisY);
+      if (buttonBits !== currentButtonBits) {
+        currentButtonBits = buttonBits;
+        for (let index = 0; index < 17; index++)
+          buttonValues[index] = buttonBits & (1 << index) ? 1 : 0;
+      }
+      axisValues[0] = normalizeGamepadAxis(axisX);
+      axisValues[1] = normalizeGamepadAxis(axisY);
       axisValues[2] = 0;
       axisValues[3] = 0;
       timestamp = Math.max(0, Number(nextTimestamp) || 0);

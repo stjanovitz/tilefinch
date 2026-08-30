@@ -58,6 +58,84 @@ bool script_module_mime_type_allowed(const char *content_type)
             content_type, strlen(content_type));
 }
 
+bool script_compile_classic_bytecode(
+    Budget *budget, const char *source, size_t source_length,
+    const char *source_url, size_t maximum_bytecode_length,
+    unsigned char **bytecode, size_t *bytecode_length)
+{
+    if (bytecode != NULL) *bytecode = NULL;
+    if (bytecode_length != NULL) *bytecode_length = 0;
+    if (budget == NULL || source == NULL || source_length == 0
+        || source_url == NULL || source_url[0] == '\0'
+        || maximum_bytecode_length == 0 || bytecode == NULL
+        || bytecode_length == NULL) return false;
+
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(budget);
+    if (pool == NULL) return false;
+    JSRuntime *runtime = JS_NewRuntime2(
+        budget_quickjs_pool_allocator(), pool);
+    JSContext *context = NULL;
+    JSValue compiled = JS_UNDEFINED;
+    uint8_t *serialized = NULL;
+    size_t serialized_length = 0;
+    bool okay = false;
+    if (runtime != NULL) {
+        /* Installation is infrequent, but an untrusted package still must not
+           create a second unbounded JavaScript heap beside the live page. */
+        JS_SetMemoryLimit(runtime, 8u * 1024u * 1024u);
+        JS_SetMaxStackSize(runtime, 256u * 1024u);
+        /* The authoritative source is already retained in the offline pack.
+           Keeping another source copy inside bytecode wastes most of the
+           accelerator budget while adding no fallback or diagnostic value.
+           Large games also carry disproportionately large line/debug tables;
+           restoring those tables delayed their first usable frame by seconds
+           on PSP.  Strip them only for the large-game class. Small scripts
+           keep line metadata, while every package still retains source for a
+           compiler-ABI miss or ordinary source recompile. */
+        JS_SetStripInfo(runtime,
+            source_length >= 128u * 1024u
+                ? JS_STRIP_DEBUG : JS_STRIP_SOURCE);
+        context = JS_NewContext(runtime);
+    }
+    if (context != NULL) {
+        compiled = JS_Eval(
+            context, source, source_length, source_url,
+            JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (!JS_IsException(compiled)) {
+            serialized = JS_WriteObject(
+                context, &serialized_length, compiled,
+                JS_WRITE_OBJ_BYTECODE);
+        }
+        if (serialized != NULL && serialized_length != 0
+            && serialized_length <= maximum_bytecode_length) {
+            unsigned char *copy = budget_malloc_category(
+                budget, BUDGET_CATEGORY_SESSION, serialized_length);
+            if (copy != NULL) {
+                memcpy(copy, serialized, serialized_length);
+                *bytecode = copy;
+                *bytecode_length = serialized_length;
+                okay = true;
+            }
+        }
+        if (JS_IsException(compiled)) {
+            JSValue exception = JS_GetException(context);
+            JS_FreeValue(context, exception);
+        } else {
+            JS_FreeValue(context, compiled);
+        }
+        js_free(context, serialized);
+        JS_FreeContext(context);
+    }
+    if (runtime != NULL) JS_FreeRuntime(runtime);
+    if (!budget_quickjs_pool_destroy(pool)) {
+        budget_free(budget, *bytecode);
+        *bytecode = NULL;
+        *bytecode_length = 0;
+        okay = false;
+    }
+    return okay;
+}
+
 bool script_type_attribute_classify(
     const char *type, size_t length, bool *module)
 {

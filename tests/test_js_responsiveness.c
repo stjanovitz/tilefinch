@@ -82,6 +82,41 @@ static int test_reduced_dom_event_counter(void)
     return 0;
 }
 
+static int test_blank_recovery_author_work_census(void)
+{
+    JSRuntime *quickjs = JS_NewRuntime();
+    CHECK(quickjs != NULL);
+    ScriptRuntime runtime = {0};
+    runtime.runtime = quickjs;
+
+    /* These remain visible in ScriptResult.pending_tasks for diagnostics,
+       but long-lived transports must not keep a blank page in recovery's
+       deferred state forever. */
+    runtime.result.pending_tasks = 4u;
+    runtime.bridge.event_source_count = 1u;
+    runtime.bridge.websocket_count = 1u;
+    runtime.bridge.multiplayer.active = true;
+    CHECK(!script_runtime_has_pending_author_work(&runtime));
+
+    runtime.pending_timer_tasks = 1u;
+    CHECK(script_runtime_has_pending_author_work(&runtime));
+    runtime.pending_timer_tasks = 0u;
+    runtime.pending_network_tasks = 1u;
+    CHECK(script_runtime_has_pending_author_work(&runtime));
+    runtime.pending_network_tasks = 0u;
+    runtime.bridge.async_fetch_count = 1u;
+    CHECK(script_runtime_has_pending_author_work(&runtime));
+    runtime.bridge.async_fetch_count = 0u;
+    runtime.bridge.dynamic_script_count = 1u;
+    CHECK(script_runtime_has_pending_author_work(&runtime));
+    runtime.bridge.dynamic_script_count = 0u;
+    runtime.page_visibility_queue_count = 1u;
+    CHECK(script_runtime_has_pending_author_work(&runtime));
+
+    JS_FreeRuntime(quickjs);
+    return 0;
+}
+
 static lxb_dom_node_t *find_script(lxb_dom_node_t *node)
 {
     for (; node != NULL; node = node->next) {
@@ -377,6 +412,7 @@ static int test_native_dynamic_code_policy(void)
 int main(void)
 {
     CHECK(test_reduced_dom_event_counter() == 0);
+    CHECK(test_blank_recovery_author_work_census() == 0);
     CHECK(test_native_dynamic_code_policy() == 0);
     uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES];
     CHECK(tilefinch_sha256_digest(NULL, 0, digest)
@@ -450,7 +486,9 @@ int main(void)
     CHECK(script_execution_policy_for_profile(
               SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, &realistic)
           && realistic.maximum_host_compile_source_bytes
-               == strict.maximum_host_compile_source_bytes);
+               == 384u * 1024u
+          && realistic.maximum_host_compile_source_bytes
+               > strict.maximum_host_compile_source_bytes);
     invalid.maximum_host_compile_source_bytes = 7;
     CHECK(!script_execution_policy_for_profile(
                (ScriptExecutionProfile) 99, &invalid)
@@ -691,7 +729,10 @@ int main(void)
           && script_runtime_evaluate_diagnostic(
               runtime,
               "(()=>{const first=navigator.getGamepads(),p=first[0],"
-              "second=navigator.getGamepads()[0];globalThis.pocSummary="
+              "second=navigator.getGamepads()[0];"
+              "globalThis.__gamepadRef=p;"
+              "globalThis.__gamepadButtonsRef=p.buttons;"
+              "globalThis.pocSummary="
               "first.length===1&&p===second&&p.id==='PSP Built-in Controller'"
               "&&p.mapping==='standard'&&p.buttons.length===17"
               "&&p.buttons[0].pressed&&p.buttons[12].value===1"
@@ -706,6 +747,21 @@ int main(void)
               "globalThis.pocSummary=__gamepadEvents.join(',')",
               "<gamepad-connect-event>", &result)
           && strcmp(result.summary, "gamepadconnected:0") == 0);
+    gamepad.axes[0] = 8192;
+    gamepad.axes[1] = -4096;
+    gamepad.timestamp_ms = 1240;
+    CHECK(script_runtime_set_gamepad_state(runtime, &gamepad)
+          && script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{const p=navigator.getGamepads()[0];"
+              "globalThis.pocSummary=p===__gamepadRef&&"
+              "p.buttons===__gamepadButtonsRef&&p.buttons[0].pressed&&"
+              "p.buttons[12].pressed&&!p.buttons[1].pressed&&"
+              "p.axes[0]>0.24&&p.axes[0]<0.26&&"
+              "p.axes[1]>-0.13&&p.axes[1]<-0.12&&p.timestamp===1240?"
+              "'GAMEPAD-AXIS-UPDATED':'GAMEPAD-BAD'})()",
+              "<gamepad-axis-only>", &result)
+          && strcmp(result.summary, "GAMEPAD-AXIS-UPDATED") == 0);
     CHECK(tilefinch_gamepad_state_update(
               &gamepad, false, 0, 0, 0, 1250)
           && script_runtime_set_gamepad_state(runtime, &gamepad)
@@ -717,6 +773,31 @@ int main(void)
               "gamepaddisconnected:0'?'GAMEPAD-DISCONNECTED':'GAMEPAD-BAD'",
               "<gamepad-disconnected>", &result)
           && strcmp(result.summary, "GAMEPAD-DISCONNECTED") == 0);
+
+    puts("test: Tilefinch page-controls requests require user activation");
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "navigator.tilefinch.requestPageControls().then(()=>"
+              "globalThis.pocSummary='PAGE-CONTROLS-DIRECT-BAD',error=>"
+              "globalThis.pocSummary=error.name==='NotAllowedError'&&"
+              "navigator.tilefinch.pageControlsExitChord==='Start+Select'"
+              "?'PAGE-CONTROLS-DIRECT-BLOCKED':'PAGE-CONTROLS-WRONG');"
+              "const control=document.createElement('button');"
+              "control.id='page-controls-target';document.body.append(control);"
+              "control.addEventListener('click',()=>navigator.tilefinch."
+              "requestPageControls().then(()=>globalThis.pocSummary="
+              "'PAGE-CONTROLS-REQUESTED'));",
+              "<page-controls-setup>", &result)
+          && strcmp(result.summary, "PAGE-CONTROLS-DIRECT-BLOCKED") == 0
+          && !script_runtime_page_fullscreen_active(runtime));
+    lxb_dom_node_t *page_controls_target = find_element_id(
+        lxb_dom_interface_node(document.html), "page-controls-target");
+    CHECK(page_controls_target != NULL
+          && script_runtime_dispatch_activation_node(
+                 runtime, page_controls_target, &result)
+          && strcmp(result.summary, "PAGE-CONTROLS-REQUESTED") == 0
+          && script_runtime_page_fullscreen_active(runtime)
+          && script_runtime_exit_page_fullscreen(runtime));
 
     puts("test: asynchronous callback entry observes cancellation");
     CHECK(script_runtime_evaluate_diagnostic(
@@ -1366,6 +1447,7 @@ int main(void)
         "osc=context.createOscillator();gain.gain.value=.5;pan.pan.value=1;"
         "osc.frequency.value=11025;osc.connect(gain).connect(pan).connect("
         "context.destination);globalThis.__gameOscEnded=0;"
+        "globalThis.__gameSynthGain=gain;"
         "osc.onended=()=>__gameOscEnded++;const now=context.currentTime;"
         "osc.start(now+.005);osc.stop(now+.008);"
         "globalThis.pocSummary=osc.type==='sine'&&pan.pan.value===1"
@@ -1401,6 +1483,54 @@ int main(void)
                  "'GAME-AUDIO-SYNTHESIS-END-FAILED'",
                  "<game-audio-synthesis-ended>", &result)
           && strcmp(result.summary, "GAME-AUDIO-SYNTHESIS-ENDED") == 0);
+    puts("test: game-audio gain envelopes advance without JavaScript ticks");
+    static const char game_audio_envelope_probe[] =
+        "(()=>{const context=__gameAudioBuffer._context,gain=__gameSynthGain,"
+        "osc=context.createOscillator();gain.gain.value=0;"
+        "osc.frequency.value=440;osc.connect(gain).connect(context.destination);"
+        "osc.start();const now=context.currentTime;gain.gain.cancelScheduledValues(now);"
+        "gain.gain.setValueAtTime(0,now);gain.gain.setTargetAtTime(.5,now,.002);"
+        "gain.gain.setTargetAtTime(0,now+.02,.004);"
+        "globalThis.__gameEnvelopeOsc=osc;globalThis.pocSummary="
+        "typeof gain.gain.setTargetAtTime==='function'"
+        "?'GAME-AUDIO-ENVELOPE-SCHEDULED':'GAME-AUDIO-ENVELOPE-MISSING'})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, game_audio_envelope_probe,
+              "<game-audio-envelope>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-ENVELOPE-SCHEDULED") == 0);
+    int envelope_peak = 0, envelope_tail = 0;
+    int16_t game_audio_envelope_samples[
+        TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES * 2u];
+    for (size_t block = 0; block < 8; block++) {
+        CHECK(tilefinch_game_audio_mix(
+            runtime->game_audio, game_audio_envelope_samples,
+            TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES));
+        for (size_t sample = 0;
+             sample < TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES * 2u; sample++) {
+            int magnitude = game_audio_envelope_samples[sample] < 0
+                ? -(int) game_audio_envelope_samples[sample]
+                : (int) game_audio_envelope_samples[sample];
+            if (magnitude > envelope_peak) envelope_peak = magnitude;
+        }
+        if (block == 7u) {
+            for (size_t sample =
+                     (TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES - 32u) * 2u;
+                 sample < TILEFINCH_GAME_AUDIO_OUTPUT_FRAMES * 2u; sample++) {
+                int magnitude = game_audio_envelope_samples[sample] < 0
+                    ? -(int) game_audio_envelope_samples[sample]
+                    : (int) game_audio_envelope_samples[sample];
+                if (magnitude > envelope_tail) envelope_tail = magnitude;
+            }
+        }
+    }
+    CHECK(envelope_peak > 4000 && envelope_tail < 128);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "__gameEnvelopeOsc.stop();globalThis.pocSummary="
+              "'GAME-AUDIO-ENVELOPE-STOPPED'",
+              "<game-audio-envelope-stop>", &result)
+          && strcmp(result.summary, "GAME-AUDIO-ENVELOPE-STOPPED") == 0
+          && script_runtime_advance(runtime, 0, 4, &result));
     static const char game_audio_loop_probe[] =
         "(()=>{const context=__gameAudioBuffer._context,source="
         "context.createBufferSource(),pan=context.createStereoPanner();"
@@ -3667,6 +3797,52 @@ int main(void)
                  == first_compile_attempts);
     script_runtime_destroy(second_bytecode_runtime);
     browser_session_destroy(&bytecode_session);
+    CHECK(budget.current == bytecode_baseline);
+
+    puts("test: install-time classic bytecode restores without compilation");
+    BrowserSession installed_bytecode_session = {0};
+    CHECK(browser_session_init(
+              &installed_bytecode_session, &budget, 512u * 1024u)
+          && browser_session_cache_put_http(
+              &installed_bytecode_session, cached_script_url,
+              (const unsigned char *) cached_script_source,
+              sizeof(cached_script_source) - 1, "cache-v1", NULL,
+              "text/javascript", "public,max-age=3600", NULL, 1));
+    unsigned char *installed_bytecode = NULL;
+    size_t installed_bytecode_length = 0;
+    CHECK(script_compile_classic_bytecode(
+              &budget, cached_script_source,
+              sizeof(cached_script_source) - 1, cached_script_url,
+              128u * 1024u, &installed_bytecode,
+              &installed_bytecode_length)
+          && installed_bytecode != NULL && installed_bytecode_length != 0
+          && browser_session_classic_script_bytecode_put(
+              &installed_bytecode_session, cached_script_url,
+              (const unsigned char *) cached_script_source,
+              sizeof(cached_script_source) - 1, installed_bytecode,
+              installed_bytecode_length));
+    budget_free(&budget, installed_bytecode);
+    ScriptRuntimeOptions installed_bytecode_options = options;
+    installed_bytecode_options.session = &installed_bytecode_session;
+    ScriptResult installed_bytecode_result = {0};
+    ScriptRuntime *installed_bytecode_runtime =
+        script_runtime_create_configured(
+            &document, &budget, 16u * MIB, 8000,
+            "https://example.test/", &installed_bytecode_options,
+            &installed_bytecode_result);
+    script = find_script(lxb_dom_interface_node(document.html));
+    CHECK(installed_bytecode_runtime != NULL && script != NULL
+          && script_runtime_evaluate_external_classic_cached(
+              installed_bytecode_runtime, script, cached_script_source,
+              sizeof(cached_script_source) - 1, cached_script_url,
+              cached_script_url, &installed_bytecode_result)
+          && strcmp(installed_bytecode_result.summary,
+                    "CLASSIC-BYTECODE-CACHE-OK") == 0
+          && installed_bytecode_result.external_script_bytecode_cache_hits == 1
+          && installed_bytecode_result.external_script_bytecode_cache_misses
+                 == 0);
+    script_runtime_destroy(installed_bytecode_runtime);
+    browser_session_destroy(&installed_bytecode_session);
     CHECK(budget.current == bytecode_baseline);
 
     size_t module_budget_baseline = budget.current;

@@ -414,6 +414,37 @@ void layout_reuse_cache_update_images(LayoutReuseCache *cache,
     if (invalidated) cache->stats.scoped_invalidations++;
 }
 
+size_t layout_rebind_image_resources(LayoutDocument *layout,
+                                     const ImageResource *previous_items,
+                                     size_t previous_count,
+                                     const ImageResources *images)
+{
+    if (layout == NULL || previous_items == NULL || previous_count == 0
+        || images == NULL || images->items == NULL
+        || images->count < previous_count) return 0;
+    size_t rebound = 0;
+    uintptr_t previous_base = (uintptr_t) previous_items;
+    size_t previous_bytes = previous_count * sizeof(*previous_items);
+    for (size_t command_index = 0;
+         command_index < layout->count; command_index++) {
+        DrawCommand *command = &layout->commands[command_index];
+        if (command->image == NULL) continue;
+        /* previous_items is deliberately retained, so its numeric address
+           range remains valid while this bounded display-list pass maps each
+           old entry to the same index in the replacement table. */
+        uintptr_t address = (uintptr_t) command->image;
+        if (address < previous_base) continue;
+        uintptr_t offset = address - previous_base;
+        if (offset >= previous_bytes
+            || offset % sizeof(*previous_items) != 0u) continue;
+        size_t image_index = (size_t) (
+            offset / sizeof(*previous_items));
+        command->image = &images->items[image_index];
+        rebound++;
+    }
+    return rebound;
+}
+
 void layout_reuse_cache_rebind_stylesheet(
     LayoutReuseCache *cache, const Stylesheet *previous,
     const Stylesheet *replacement)
@@ -2899,10 +2930,17 @@ bool layout_clone_visual(LayoutDocument *visual,
                                    &visual->controls[i].height);
     }
     for (size_t i = 0; i < visual->sticky_count; i++) {
-        visual->sticky_ranges[i].origin_y = viewport_scale_floor(
-            visual->sticky_ranges[i].origin_y, numerator, denominator);
-        visual->sticky_ranges[i].top = viewport_scale_floor(
-            visual->sticky_ranges[i].top, numerator, denominator);
+        StickyRange *range = &visual->sticky_ranges[i];
+        range->origin_y = viewport_scale_floor(
+            range->origin_y, numerator, denominator);
+        range->top = viewport_scale_floor(
+            range->top, numerator, denominator);
+        range->bottom_y = viewport_scale_floor(
+            range->bottom_y, numerator, denominator);
+        if (range->maximum_offset != INT_MAX) {
+            range->maximum_offset = viewport_scale_floor(
+                range->maximum_offset, numerator, denominator);
+        }
     }
     for (size_t i = 0; i < visual->fixed_count; i++) {
         FixedRange *range = &visual->fixed_ranges[i];
@@ -2912,6 +2950,10 @@ bool layout_clone_visual(LayoutDocument *visual,
                                             denominator);
         range->inset = viewport_scale_floor(range->inset, numerator,
                                             denominator);
+        if (range->scroll_end != INT_MAX) {
+            range->scroll_end = viewport_scale_floor(
+                range->scroll_end, numerator, denominator);
+        }
     }
     for (size_t i = 0; i < visual->node_box_count; i++) {
         LayoutNodeBox *box = &visual->node_boxes[i];

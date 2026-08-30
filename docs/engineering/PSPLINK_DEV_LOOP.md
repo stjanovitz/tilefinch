@@ -16,15 +16,45 @@ run the loop safely and understand each constraint.
   (source: `tools/psplink-loop/`). It exists because ARK-4 rejects a direct
   `ld`/`modexec` of the browser EBOOT; tfexec LoadExecs it instead.
 
-## The file server (start once, keep alive)
+## The host bridge (automatic)
 
-```
-usbhostfs_pc build-preset-psp-validation
+The PSPLink screen on the device is only half of the connection. On the Mac,
+`usbhostfs_pc` must also be alive: it owns the USB connection, serves `host0:`,
+and exposes the socket used by `pspsh`. A Codex task restart, terminal exit, or
+host reboot can kill that process while the PSP continues to display PSPLink.
+The resulting `connect: Connection refused` is therefore a missing **host
+bridge**, not a reason to power-cycle the PSP.
+
+Use the repository wrapper instead of raw `pspsh` for ad-hoc work:
+
+```sh
+PSPDEV=/path/to/pspdev scripts/psplink-shell.sh ready
+PSPDEV=/path/to/pspdev scripts/psplink-shell.sh exec 'ver'
+PSPDEV=/path/to/pspdev scripts/psplink-shell.sh exec 'ls host0:/'
 ```
 
-Run from the repo root, in the background, and leave it running — it serves
-`build-preset-psp-validation/` as `host0:` for every pspsh command. It dies
-with the host session/reboot; restart it first whenever the link is dead.
+It first performs a bounded probe. If the host bridge is absent, it starts
+`usbhostfs_pc` detached, records its PID, served root, and log in one shared
+temporary state directory, and waits a bounded 12 seconds for PSPLink. Keeping
+the ownership record independent of `host0:` is important: changing from an
+SDK tree to a validation build now restarts the one recorded bridge instead of
+starting a competing server or falsely reporting the old root as the new one.
+It never kills an unknown bridge or spins indefinitely. If a bridge was started
+outside this wrapper, stop it once and rerun `psplink-shell.sh ready` so the
+wrapper can establish tracked ownership. `scripts/psplink-device.sh` and the
+YouTube UX harness invoke this check automatically, so their documented
+commands have no manual file-server prerequisite.
+
+`usbhostfs_pc` binds a local host socket. Sandboxed agent shells may deny that
+operation even while the PSP visibly has PSPLink open. The wrapper detects the
+specific `bind: Operation not permitted` failure, terminates the unusable host
+process, and asks for host-socket permission; rerun the same command with that
+permission instead of relaunching PSPLink. Do not leave the failed process
+around and then mistake the resulting untracked bridge warning for a device
+failure.
+
+The special two-root installed-EBOOT workflow later in this document remains
+manual because it deliberately exposes both `host0:` and `host1:`.
 
 `host0:` paths resolve ONLY under the served directory. `host0:/../foo` does
 not escape it (error 0x80010002). To land a pulled file elsewhere, pull to
@@ -33,23 +63,12 @@ not escape it (error 0x80010002). To land a pulled file elsewhere, pull to
 ## Link health
 
 ```
-pspsh -e "ver"
+PSPDEV=/path/to/pspdev scripts/psplink-shell.sh exec 'ver'
 ```
 
-Healthy: prints `PSPLink v3.2.1`. **When the link is down, pspsh HANGS rather
-than erroring** — never call it bare in a script. Bounded probe pattern
-(macOS has no `timeout(1)`, and `/dev/null` redirects are denied by a user
-hook — redirect to files):
-
-```zsh
-probe() {
-  rm -f "$WORK/probe.txt"
-  pspsh -e "ver" > "$WORK/probe.txt" 2>&1 &
-  local P=$!; sleep 6
-  if kill -0 $P 2>> "$WORK/probe-err.txt"; then kill $P 2>> "$WORK/probe-err.txt"; return 1; fi
-  grep -q "PSPLink" "$WORK/probe.txt"
-}
-```
+Healthy prints `PSPLink v3.2.1`. Never call `pspsh` bare in automation: a
+missing device can hang instead of returning an error. `psplink-shell.sh`
+provides the canonical bounded command runner.
 
 ## One cycle
 
@@ -220,7 +239,10 @@ the script language and deterministic frontend golden.
 ### Memory headroom
 
 Run `meminfo` before loading the PRX and compare partition 2 `MAXFREE` with the
-browser's `free-mem`, `max-free`, and `heap-capacity` boot lines. PSPLink's
+browser's `free-mem`, `max-free`, and `heap-capacity-lower-bound` boot lines.
+The last value is the bounded admission sample taken before the aligned Media
+Engine pool is reserved; validation deliberately does not exhaust the now-
+fragmented heap a second time. PSPLink's
 resident modules are kernel modules when `psplink.ini` keeps `pluser=0`, so
 the user partition should retain the expanded PSP-3000 heap apart from the PRX
 image itself. If it does not, check `pluser`, remove user modules from
@@ -309,8 +331,13 @@ the cadence being measured.
   do not perturb playback cadence. Repeated network sessions can leave PSP
   firmware state unhealthy; the network supervisor must unwind or retain it
   safely rather than terminating beneath a live transport lease.
-- **Host reboot / session death**: restart `usbhostfs_pc`; if the probe still
-  hangs, the PSP side needs the cable replugged or PSPLink relaunched (user).
+- **Host reboot / task/session death**: run `psplink-shell.sh ready` (the normal
+  deploy and validation scripts do this themselves). If it reports that
+  `usbhostfs_pc` is running but PSPLink is unreachable, replug USB or relaunch
+  PSPLink on the device. The ignored `.tilefinch-usbhostfs.log` beside the
+  build records whether the bridge found the PSP or failed before connecting.
+  If it instead reports that the host environment denied the local socket,
+  grant that host command permission and retry; the device is already ready.
 - **ge-present-probe stalls (PPSSPP)**: the harness launches the GUI
   emulator with a hardcoded OpenGL backend; on macOS it intermittently goes
   "application not responding" during pre-boot (window-server/context

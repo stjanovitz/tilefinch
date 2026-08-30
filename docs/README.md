@@ -26,14 +26,22 @@ Tilefinch's documentation has three layers:
   omissions.
 - [Content blocking](CONTENT_BLOCKING.md): built-in and custom-list modes,
   supported uBlock/EasyList network syntax, limits, and per-site allowlisting.
-- [Reader mode](READER_MODE.md): reversible presentation transform,
+- [Reader mode](READER_MODE.md): bounded native semantic presentation,
   typography controls, site profiles, and explicit limits.
+- [Basic view](BASIC_VIEW.md): transactional, action-preserving static
+  fallback for degraded server-rendered pages.
 - [Bidirectional text](TEXT_BIDI.md): bounded UAX #9 page layout, Arabic-family
   shaping, logical/visual mappings, optional glyph packs, and degradation.
 - [Chrome themes](THEMES.md): built-in palettes, the bounded downloaded-theme
   library, and the interactive color designer.
+- [Game Profile v1](GAME_PROFILE.md): the developer and coding-agent contract
+  for PSP-sized Canvas/WebGL games, including APIs, hard ceilings, lifecycle,
+  offline packaging, fallbacks, and qualification. Its
+  [JSON companion](tilefinch-game-profile-v1.json) is machine-readable.
 - [WebGL authoring](WEBGL.md): the PSP-efficient shader, resource, animation,
   input, and offline-packaging profile for small games and charts.
+- [Direct multiplayer](MULTIPLAYER.md): the RTCDataChannel-shaped installed-game
+  API, LAN discovery, numeric invites, UDP hole punching, bounds, and limits.
 - [Offline library](OFFLINE_LIBRARY.md): bounded Reader snapshots and
   resumable YouTube downloads, including storage and trust boundaries.
 - [Memory Stick storage](STORAGE.md): the complete on-stick layout map,

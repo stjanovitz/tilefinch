@@ -796,6 +796,56 @@ static bool test_deterministic_irregular(void)
         && memcmp(left.bytes, regular.bytes, left.length) == 0;
 }
 
+/* A caller-owned response ceiling is distinct from an ordinary transport
+   failure. Parser-script admission uses this typed fact to open its cumulative
+   work breaker; it must not infer exhaustion from an error string. */
+static bool test_response_limit_attribution(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    if (!replay_begin()) return false;
+    FetchScheduler *scheduler = fetch_scheduler_create(&budget, 1, 4096);
+    FetchRequest fetch_request = request();
+    uint64_t id = scheduler == NULL ? 0 : fetch_scheduler_enqueue(
+        scheduler, "https://stream.test/document", &fetch_request, 32, 1000);
+    FetchResult result = {.budget = &budget};
+    bool success = true, taken = false;
+    for (size_t i = 0; id != 0 && i < 8; i++) {
+        (void) fetch_scheduler_pump(scheduler, 1, 0);
+        if (fetch_scheduler_take(scheduler, id, &success, &result)) {
+            taken = true;
+            break;
+        }
+    }
+    bool ok = taken && !success && result.response_limit_exceeded
+        && !result.timed_out && result.data == NULL && result.length == 0u
+        && strstr(result.error, "exceeds request quota") != NULL;
+    fetch_result_destroy(&result);
+    fetch_scheduler_destroy(scheduler);
+    fetch_trace_end();
+    if (!ok || budget.current != 0 || !replay_begin()) return false;
+
+    scheduler = fetch_scheduler_create(&budget, 1, 4096);
+    id = scheduler == NULL ? 0 : fetch_scheduler_enqueue(
+        scheduler, "https://stream.test/document", &fetch_request, 4096, 1000);
+    result = (FetchResult) {.budget = &budget};
+    success = false;
+    taken = false;
+    for (size_t i = 0; id != 0 && i < 8; i++) {
+        (void) fetch_scheduler_pump(scheduler, 1, 0);
+        if (fetch_scheduler_take(scheduler, id, &success, &result)) {
+            taken = true;
+            break;
+        }
+    }
+    ok = taken && success && !result.response_limit_exceeded
+        && result.length == 383u;
+    fetch_result_destroy(&result);
+    fetch_scheduler_destroy(scheduler);
+    fetch_trace_end();
+    return ok && budget.current == 0;
+}
+
 static bool test_cancel_and_truncate(void)
 {
     Budget budget;
@@ -1229,6 +1279,7 @@ int main(void)
         {"absent-handshake", test_replay_reports_absent_handshake_fields},
         {"retained-failure-delay", test_retained_failure_replay_delay},
         {"deterministic-irregular", test_deterministic_irregular},
+        {"response-limit-attribution", test_response_limit_attribution},
         {"cancel-truncate", test_cancel_and_truncate},
         {"buffered-pump-quota", test_buffered_fetch_respects_pump_quota},
         {"allocation-failure", test_allocation_failure},

@@ -1343,6 +1343,173 @@
     document_destroy(&staged_content_document);
     CHECK(budget.current == 0);
 
+    puts("test: failed bootstrap reveals a text-rich staged body only");
+    static const char staged_body_page[] =
+        "<!doctype html><style>html{visibility:hidden}body{display:none;opacity:0}</style><body>"
+        "<header><h1>Published server heading</h1></header><main><p>"
+        "This complete server-rendered introduction remains useful when the "
+        "optional bootstrap cannot add its ready class. It contains enough "
+        "ordinary prose to distinguish a page shell from an empty loader."
+        "</p></main><aside id=staged-dialog style='display:none'>"
+        "<h2>Closed dialog must stay hidden</h2></aside></body>";
+    PocDocument staged_body_document;
+    Stylesheet staged_body_sheet;
+    CHECK(document_parse(&staged_body_document, &budget, staged_body_page,
+                         strlen(staged_body_page), 18)
+          && stylesheet_build(&staged_body_sheet, &budget,
+                              &staged_body_document, 480));
+    lxb_dom_node_t *staged_body = document_body_node(&staged_body_document);
+    lxb_dom_node_t *staged_dialog = find_id(
+        lxb_dom_interface_node(staged_body_document.html), "staged-dialog");
+    ComputedStyle staged_body_before = style_for_node(
+        &staged_body_sheet, staged_body, NULL);
+    lxb_dom_node_t *staged_html = staged_body == NULL
+        ? NULL : staged_body->parent;
+    ComputedStyle staged_html_before = style_for_node(
+        &staged_body_sheet, staged_html, NULL);
+    CHECK(staged_body_before.display == DISPLAY_NONE
+          && staged_body_before.opacity == 0
+          && staged_html_before.visibility_hidden);
+    stylesheet_enable_static_custom_element_fallback(&staged_body_sheet);
+    ComputedStyle staged_html_after = style_for_node(
+        &staged_body_sheet, staged_html, NULL);
+    ComputedStyle staged_body_after = style_for_node(
+        &staged_body_sheet, staged_body, NULL);
+    CHECK(staged_html_after.display == DISPLAY_BLOCK
+          && !staged_html_after.hidden
+          && !staged_html_after.visibility_hidden
+          && staged_body_after.display == DISPLAY_BLOCK
+          && !staged_body_after.hidden
+          && !staged_body_after.visibility_hidden
+          && staged_body_after.opacity == 255
+          && staged_dialog != NULL
+          && style_for_node(
+                 &staged_body_sheet, staged_dialog, &staged_body_after).display
+                 == DISPLAY_NONE);
+    stylesheet_destroy(&staged_body_sheet);
+    document_destroy(&staged_body_document);
+    CHECK(budget.current == 0);
+
+    puts("test: staged root recovery respects a bare hidden body");
+    static const char bare_hidden_body_page[] =
+        "<!doctype html><body hidden><main>"
+        "<h1>Explicitly hidden server document</h1><p>"
+        "This complete text-rich document deliberately uses the boolean hidden "
+        "attribute on its body, so static script fallback must preserve that "
+        "authored state even though the attribute has no explicit value."
+        "</p></main></body>";
+    PocDocument bare_hidden_body_document;
+    Stylesheet bare_hidden_body_sheet;
+    CHECK(document_parse(
+              &bare_hidden_body_document, &budget, bare_hidden_body_page,
+              strlen(bare_hidden_body_page), 12u)
+          && stylesheet_build(
+              &bare_hidden_body_sheet, &budget,
+              &bare_hidden_body_document, 480));
+    lxb_dom_node_t *bare_hidden_body = document_body_node(
+        &bare_hidden_body_document);
+    stylesheet_enable_static_custom_element_fallback(
+        &bare_hidden_body_sheet);
+    ComputedStyle bare_hidden_body_style = style_for_node(
+        &bare_hidden_body_sheet, bare_hidden_body, NULL);
+    CHECK(bare_hidden_body != NULL
+          && lxb_dom_element_has_attribute(
+                 lxb_dom_interface_element(bare_hidden_body),
+                 (const lxb_char_t *) "hidden", 6u)
+          && bare_hidden_body_style.display == DISPLAY_NONE);
+    stylesheet_destroy(&bare_hidden_body_sheet);
+    document_destroy(&bare_hidden_body_document);
+    CHECK(budget.current == 0);
+
+    puts("test: staged root recovery preserves geometry hiding");
+    static const char transformed_body_page[] =
+        "<!doctype html><style>body{display:none;transform:scale(0)}"
+        "</style><body><main><h1>Geometry-hidden document</h1><p>"
+        "This otherwise readable server document deliberately carries an "
+        "independent zero-scale transform which static recovery must not "
+        "erase merely because the same root also uses display none."
+        "</p></main></body>";
+    PocDocument transformed_body_document;
+    Stylesheet transformed_body_sheet;
+    CHECK(document_parse(
+              &transformed_body_document, &budget, transformed_body_page,
+              strlen(transformed_body_page), 16u)
+          && stylesheet_build(
+              &transformed_body_sheet, &budget,
+              &transformed_body_document, 480));
+    lxb_dom_node_t *transformed_body = document_body_node(
+        &transformed_body_document);
+    stylesheet_enable_static_custom_element_fallback(
+        &transformed_body_sheet);
+    ComputedStyle transformed_body_style = style_for_node(
+        &transformed_body_sheet, transformed_body, NULL);
+    if (!(transformed_body_style.display == DISPLAY_NONE
+          && transformed_body_style.hidden
+          && transformed_body_style.has_transform
+          && transformed_body_style.transform_scale_q6 == 0)) {
+        fprintf(stderr,
+                "staged geometry display=%d hidden=%d transform=%d scale=%u\n",
+                transformed_body_style.display, transformed_body_style.hidden,
+                transformed_body_style.has_transform,
+                transformed_body_style.transform_scale_q6);
+    }
+    CHECK(transformed_body_style.display == DISPLAY_NONE
+          && transformed_body_style.hidden
+          && transformed_body_style.has_transform
+          && transformed_body_style.transform_scale_q6 == 0);
+    stylesheet_destroy(&transformed_body_sheet);
+    document_destroy(&transformed_body_document);
+    CHECK(budget.current == 0);
+
+    puts("test: staged root recovery skips a large document head");
+    const size_t staged_head_capacity = 48u * 1024u;
+    char *staged_head_page = malloc(staged_head_capacity);
+    CHECK(staged_head_page != NULL);
+    size_t staged_head_used = (size_t) snprintf(
+        staged_head_page, staged_head_capacity,
+        "<!doctype html><style>html{display:none}</style><head>");
+    for (size_t i = 0; i < 600u; i++) {
+        int wrote = snprintf(
+            staged_head_page + staged_head_used,
+            staged_head_capacity - staged_head_used,
+            "<meta name='fixture-%zu' content='bounded'>", i);
+        CHECK(wrote > 0 && (size_t) wrote
+              < staged_head_capacity - staged_head_used);
+        staged_head_used += (size_t) wrote;
+    }
+    int staged_head_tail = snprintf(
+        staged_head_page + staged_head_used,
+        staged_head_capacity - staged_head_used,
+        "</head><body><main><h1>Useful body after a large head</h1>"
+        "<p>This complete server-rendered body must remain discoverable even "
+        "when hundreds of metadata nodes precede it in the document head. "
+        "The fallback scan skips that non-rendered subtree without growing "
+        "its fixed work bound.</p></main></body>");
+    CHECK(staged_head_tail > 0 && (size_t) staged_head_tail
+          < staged_head_capacity - staged_head_used);
+    staged_head_used += (size_t) staged_head_tail;
+    PocDocument staged_head_document;
+    Stylesheet staged_head_sheet;
+    CHECK(document_parse(&staged_head_document, &budget, staged_head_page,
+                         staged_head_used, 1024u)
+          && stylesheet_build(&staged_head_sheet, &budget,
+                              &staged_head_document, 480));
+    lxb_dom_node_t *staged_head_body = document_body_node(
+        &staged_head_document);
+    lxb_dom_node_t *staged_head_html = staged_head_body == NULL
+        ? NULL : staged_head_body->parent;
+    CHECK(style_for_node(
+              &staged_head_sheet, staged_head_html, NULL).display
+              == DISPLAY_NONE);
+    stylesheet_enable_static_custom_element_fallback(&staged_head_sheet);
+    CHECK(style_for_node(
+              &staged_head_sheet, staged_head_html, NULL).display
+              == DISPLAY_BLOCK);
+    stylesheet_destroy(&staged_head_sheet);
+    document_destroy(&staged_head_document);
+    free(staged_head_page);
+    CHECK(budget.current == 0);
+
     puts("test: escaped CSS identifiers match literal DOM tokens");
     static const char escaped_identifier_page[] =
         "<!doctype html><style>div{padding-top:19px}"

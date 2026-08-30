@@ -210,6 +210,40 @@ typedef struct {
 #include "interactive/media.inc"
 #include "interactive/commands.inc"
 
+static bool interactive_restore_base_user_css(
+    BrowserEngine *engine, NavigationSession *navigation,
+    bool hide_cookie_banners, const char *user_css)
+{
+    if (engine == NULL || navigation == NULL) return false;
+    if (hide_cookie_banners) {
+        char css[CONTENT_BLOCKER_COOKIE_CSS_LIMIT];
+        size_t length = 0u;
+        return content_blocker_cookie_banner_css(
+                   css, sizeof(css), &length)
+            && browser_engine_apply_user_css(engine, css, length);
+    }
+    if (user_css == NULL)
+        return browser_engine_apply_user_css(engine, "", 0u);
+    size_t length = 0u;
+    char *css = read_file(navigation->budget, user_css, &length);
+    bool restored = css != NULL && length <= 128u * KIB
+        && browser_engine_apply_user_css(engine, css, length);
+    budget_free(navigation->budget, css);
+    return restored;
+}
+
+static bool interactive_seed_extracted_recovery(BrowserEngine *engine)
+{
+    ReaderDocumentAnalysis observation = {0};
+    BrowserBasicViewRecovery basic =
+        browser_engine_prepare_basic_view_recovery(engine, &observation);
+    if (basic == BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE
+        || basic == BROWSER_BASIC_VIEW_RECOVERY_DEFERRED) return true;
+    BrowserBlankReaderRecovery reader =
+        browser_engine_prepare_blank_reader_recovery(engine, &observation);
+    return reader != BROWSER_BLANK_READER_RECOVERY_NONE;
+}
+
 int main(int argc, char **argv)
 {
     const char *fixture = NULL;
@@ -268,6 +302,7 @@ int main(int argc, char **argv)
     size_t reloads = 0;
     bool fetch_scripts = false, activate = false, follow_action = false;
     bool trace_frames = false, trace_page = false;
+    bool probe_usability = false;
     bool diagnostic_frame_safari = false;
     bool interactive_loop = false;
     bool loop_capture_frames = true;
@@ -289,6 +324,9 @@ int main(int argc, char **argv)
         }
         else if (strcmp(argv[i], "--trace-frames") == 0) trace_frames = true;
         else if (strcmp(argv[i], "--trace-page") == 0) trace_page = true;
+        else if (strcmp(argv[i], "--probe-usability") == 0) {
+            probe_usability = true;
+        }
         else if (strcmp(argv[i], "--diagnostic-frame-safari") == 0) {
             diagnostic_frame_safari = true;
         }
@@ -1396,6 +1434,18 @@ int main(int argc, char **argv)
         if (spike != NULL) hibernate_spike_tick = atol(spike);
     }
 #endif
+    /* The device frontend observes a blank degraded page after each runtime
+       turn. Seed the same bounded settle window in the host lab without
+       installing Reader or changing pixels: once DEFERRED is observed, the
+       final presentation decision below can account for all intervening
+       ticks, including pages with a permanent interval or recurring rAF. */
+    bool blank_reader_recovery_seeded = false;
+    if (!reader_mode
+        && script_runtime_has_pending_author_work(navigation.page.runtime)
+        && browser_engine_page_is_visually_blank(engine)) {
+        blank_reader_recovery_seeded =
+            interactive_seed_extracted_recovery(engine);
+    }
     for (size_t i = 0; i < ticks; i++) {
 #if !defined(__PSP__)
         if (hibernate_spike_tick >= 0 && i == (size_t) hibernate_spike_tick) {
@@ -1425,6 +1475,13 @@ int main(int argc, char **argv)
         if (!browser_engine_advance_runtime(
                 engine, (unsigned) tick_ms, 8, NULL)) {
             goto cleanup;
+        }
+        if (!reader_mode && !blank_reader_recovery_seeded
+            && script_runtime_has_pending_author_work(
+                   navigation.page.runtime)
+            && browser_engine_page_is_visually_blank(engine)) {
+            blank_reader_recovery_seeded =
+                interactive_seed_extracted_recovery(engine);
         }
         if (!navigation_run_background_resources(&navigation)) {
             goto cleanup;
@@ -1553,22 +1610,38 @@ int main(int argc, char **argv)
             ? navigation.page.document_url : entry->url;
         char reader_css[SITE_ADAPTER_READER_CSS_LIMIT];
         char adapter[32];
-        if (!browser_engine_prepare_reader(engine, &reader)
-            || !site_adapter_reader_css(
-                   reader_url, SITE_ADAPTER_READER_FONT_SANS, 100u,
-                   reader_css, sizeof(reader_css), adapter, sizeof(adapter))
-            || !browser_engine_apply_user_css(
-                   engine, reader_css, strlen(reader_css))) {
+        bool reader_available = browser_engine_prepare_reader(engine, &reader);
+        if (!reader_available && reader.prepared
+            && reader.kind == READER_PAGE_RAW) {
+            /* RAW is a successful bounded classification, not a failed page.
+               Preserve the already-renderable author view so audit captures
+               can distinguish "Reader unavailable" from load failure. */
+            printf("reader-mode kind=%s high-confidence=%s entries=%u "
+                   "visited=%u bounded=%s adapter=none available=no\n",
+                   reader_page_kind_name(reader.kind),
+                   reader.high_confidence ? "yes" : "no",
+                   (unsigned) reader.listing_entries,
+                   (unsigned) reader.visited_nodes,
+                   reader.bounded_out ? "yes" : "no");
+        } else if (!reader_available
+                   || !site_adapter_reader_css(
+                          reader_url, SITE_ADAPTER_READER_FONT_SANS, 100u,
+                          reader_css, sizeof(reader_css), adapter,
+                          sizeof(adapter))
+                   || !browser_engine_apply_user_css(
+                          engine, reader_css, strlen(reader_css))
+                   || !browser_engine_activate_reader_view(engine)) {
             fprintf(stderr, "interactive Reader mode failed\n");
             goto cleanup;
+        } else {
+            printf("reader-mode kind=%s high-confidence=%s entries=%u "
+                   "visited=%u bounded=%s adapter=%s available=yes\n",
+                   reader_page_kind_name(reader.kind),
+                   reader.high_confidence ? "yes" : "no",
+                   (unsigned) reader.listing_entries,
+                   (unsigned) reader.visited_nodes,
+                   reader.bounded_out ? "yes" : "no", adapter);
         }
-        printf("reader-mode kind=%s high-confidence=%s entries=%u "
-               "visited=%u bounded=%s adapter=%s\n",
-               reader_page_kind_name(reader.kind),
-               reader.high_confidence ? "yes" : "no",
-               (unsigned) reader.listing_entries,
-               (unsigned) reader.visited_nodes,
-               reader.bounded_out ? "yes" : "no", adapter);
     }
     application->engine_controller = browser_engine_controller(engine);
     if (application->engine_controller == NULL) {
@@ -1671,6 +1744,85 @@ int main(int argc, char **argv)
             &navigation, pre_style_at_bottom ? maximum_scroll
               : (styled_entry->scroll_y < maximum_scroll
                    ? styled_entry->scroll_y : maximum_scroll));
+    }
+    if (!reader_mode) {
+        /* Automatic recovery is the final presentation decision. In
+           particular, cookie-banner CSS replaces the user sheet, so running
+           this earlier could briefly reveal an extracted tree and then hide
+           it again. Prefer Basic so bounded forms and links survive; Reader
+           remains the text-first fallback. */
+        ReaderDocumentAnalysis recovery = {0};
+        BrowserBasicViewRecovery basic_status =
+            browser_engine_prepare_basic_view_recovery(engine, &recovery);
+        bool basic = basic_status == BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE;
+        bool deferred =
+            basic_status == BROWSER_BASIC_VIEW_RECOVERY_DEFERRED;
+        BrowserBlankReaderRecovery reader_status =
+            BROWSER_BLANK_READER_RECOVERY_NONE;
+        if (!basic && !deferred) {
+            reader_status = browser_engine_prepare_blank_reader_recovery(
+                engine, &recovery);
+            deferred = reader_status
+                == BROWSER_BLANK_READER_RECOVERY_DEFERRED;
+        }
+        bool considered = basic
+            || basic_status == BROWSER_BASIC_VIEW_RECOVERY_UNAVAILABLE
+            || (reader_status != BROWSER_BLANK_READER_RECOVERY_NONE
+                && !deferred);
+        if (considered) {
+            const NavigationEntry *entry = navigation_current(&navigation);
+            const char *recovery_url = entry == NULL
+                ? navigation.page.document_url : entry->url;
+            char recovery_css[
+                SITE_ADAPTER_READER_CSS_LIMIT
+                + CONTENT_BLOCKER_COOKIE_CSS_LIMIT];
+            char recovery_adapter[32];
+            bool available = basic || reader_status
+                == BROWSER_BLANK_READER_RECOVERY_AVAILABLE;
+            bool css_ready = available
+                && site_adapter_reader_css(
+                    recovery_url, SITE_ADAPTER_READER_FONT_SANS, 100u,
+                    recovery_css, SITE_ADAPTER_READER_CSS_LIMIT,
+                    recovery_adapter, sizeof(recovery_adapter));
+            size_t recovery_css_length = css_ready
+                ? strlen(recovery_css) : 0u;
+            if (css_ready && hide_cookie_banners) {
+                size_t cookie_css_length = 0u;
+                char cookie_css[CONTENT_BLOCKER_COOKIE_CSS_LIMIT];
+                css_ready = content_blocker_cookie_banner_css(
+                    cookie_css, sizeof(cookie_css), &cookie_css_length)
+                    && recovery_css_length < sizeof(recovery_css)
+                    && cookie_css_length
+                           <= sizeof(recovery_css) - recovery_css_length - 1u;
+                if (css_ready) {
+                    memcpy(recovery_css + recovery_css_length, cookie_css,
+                           cookie_css_length + 1u);
+                    recovery_css_length += cookie_css_length;
+                }
+            }
+            bool applied = css_ready
+                && browser_engine_apply_user_css(
+                    engine, recovery_css, recovery_css_length);
+            bool activated = applied
+                && (basic ? browser_engine_activate_basic_view(engine)
+                          : browser_engine_activate_reader_view(engine));
+            if (applied && !activated) {
+                (void) interactive_restore_base_user_css(
+                    engine, &navigation, hide_cookie_banners, user_css);
+            }
+            printf("%s-recovery available=%s kind=%s "
+                   "high-confidence=%s entries=%u visited=%u bounded=%s "
+                   "applied=%s activated=%s\n",
+                   basic ? "basic" : "reader",
+                   available ? "yes" : "no",
+                   reader_page_kind_name(recovery.kind),
+                   recovery.high_confidence ? "yes" : "no",
+                   (unsigned) recovery.listing_entries,
+                   (unsigned) recovery.visited_nodes,
+                   recovery.bounded_out ? "yes" : "no",
+                   applied ? "yes" : "no",
+                   activated ? "yes" : "no");
+        }
     }
 #ifdef TILEFINCH_HAVE_HOST_MEDIA
     if (media_file != NULL) {
@@ -1858,6 +2010,8 @@ int main(int argc, char **argv)
            retained_layout->link_count, retained_layout->link_capacity,
            retained_layout->control_count,
            retained_layout->control_capacity);
+    printf("layout-presentation visually-blank=%s\n",
+           browser_engine_page_is_visually_blank(engine) ? "yes" : "no");
     printf("layout-responsiveness work=%zu yields=%zu max-slice-us=%llu "
            "max-slice-work=%zu\n",
            retained_layout->layout_work_units,
@@ -2094,6 +2248,10 @@ int main(int argc, char **argv)
            (unsigned long long) cache.max_prefetch_us,
            cache.overlay_images_prewarmed,
            cache.overflow_images_prewarmed);
+    printf("canvas-fast frames=%zu refusals=%zu total-us=%llu max-us=%llu\n",
+           cache.canvas_fast_frames, cache.canvas_fast_refusals,
+           (unsigned long long) cache.canvas_fast_us,
+           (unsigned long long) cache.canvas_fast_max_us);
     printf("idle-render-work scheduled=%zu completed=%zu cancelled=%zu "
            "pending=%s slices=%zu units=%zu budget-exhaustions=%zu "
            "overruns=%zu image-admission-skips=%zu glyphs=%zu/%zu "
@@ -2196,7 +2354,9 @@ int main(int argc, char **argv)
              navigation.performance.parser_eof_preload_us,
            (unsigned long long) navigation.performance.parser_finish_us);
     printf("parser-blocking-attribution samples=%zu dropped=%zu "
-           "compile-us=%llu execute-us=%llu rescan-us=%llu mutations=%zu\n",
+           "compile-us=%llu execute-us=%llu rescan-us=%llu mutations=%zu "
+           "stage-us=%llu stage-work=%zu stage-skipped=%zu breakers=%zu "
+           "failure-breakers=%zu time-breakers=%zu work-breakers=%zu\n",
            navigation.performance.blocking_script_sample_count,
            navigation.performance.blocking_script_samples_dropped,
            (unsigned long long)
@@ -2205,7 +2365,15 @@ int main(int argc, char **argv)
              navigation.performance.parser_script_execute_us,
            (unsigned long long)
              navigation.performance.parser_script_rescan_us,
-           navigation.performance.parser_script_mutations);
+           navigation.performance.parser_script_mutations,
+           (unsigned long long)
+             navigation.performance.parser_script_stage_us,
+           navigation.performance.parser_script_stage_work,
+           navigation.performance.parser_script_stage_skipped,
+           navigation.performance.parser_script_stage_breakers,
+           navigation.performance.parser_script_stage_failure_breakers,
+           navigation.performance.parser_script_stage_time_breakers,
+           navigation.performance.parser_script_stage_work_breakers);
     for (size_t i = 0;
          i < navigation.performance.blocking_script_sample_count; i++) {
         const NavigationBlockingScriptSample *sample =
@@ -2964,6 +3132,40 @@ int main(int argc, char **argv)
         printed_cookie = true;
     }
     printf("%s\n", printed_cookie ? "" : "none");
+    if (probe_usability) {
+        size_t handlers_before =
+            navigation.page.script_result.event_handlers_invoked;
+        size_t network_before =
+            navigation.page.script_result.network_requests;
+        bool authored_focus =
+            controller.focus_kind == CONTROLLER_FOCUS_LINK
+            || controller.focus_kind == CONTROLLER_FOCUS_CONTROL;
+        bool pointer_focus =
+            controller.focus_kind == CONTROLLER_FOCUS_POINTER;
+        const LayoutDocument *probe_layout = &navigation.page.layout;
+        const char *probe_action_name = authored_focus
+            ? (controller.focus_kind == CONTROLLER_FOCUS_LINK ? "link"
+               : "control")
+            : probe_layout->link_count != 0u ? "link"
+            : probe_layout->control_count != 0u ? "control"
+            : pointer_focus ? "pointer" : "none";
+        bool focus_ready = strcmp(probe_action_name, "link") == 0
+            || strcmp(probe_action_name, "control") == 0;
+        /* This audit runs against live public pages. Inspect retained target
+           shape only: focus movement dispatches `focus`, and activation
+           dispatches `click` plus default form/media behavior. Either would
+           let the diagnostic itself mutate the page or start network work. */
+        printf("usability-probe focus=%s initial=%s activation=%s "
+               "action=%s url=\"%s\" handlers=%zu/%zu network=%zu/%zu\n",
+               focus_ready ? "ready" : "missing",
+               authored_focus ? "authored"
+                   : pointer_focus ? "pointer" : "none",
+               "not-run", probe_action_name, "",
+               handlers_before,
+               navigation.page.script_result.event_handlers_invoked,
+               network_before,
+               navigation.page.script_result.network_requests);
+    }
     printf("controller moves=%zu activations=%zu edits=%zu action=%s url=\"%s\"\n",
            controller.focus_moves, controller.activations,
            controller.text_edits,

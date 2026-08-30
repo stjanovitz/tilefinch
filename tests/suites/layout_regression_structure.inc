@@ -124,6 +124,61 @@
     tile_cache_destroy(&fixed_cache);
     budget_free(&budget, fixed_frame);
 
+    /* A scene-bounded fixed descendant must not disable caching for an
+       unrelated ordinary fixed overlay. Cache the unbounded range once and
+       paint only the bounded range directly until its retirement scroll. */
+    DrawCommand mixed_fixed_commands[2] = {
+        {
+            .type = DRAW_FILL_RECT, .x = 5, .y = 0,
+            .width = 10, .height = 10, .color = 0xcc2200,
+            .opacity_scale = UINT8_MAX
+        },
+        {
+            .type = DRAW_FILL_RECT, .x = 25, .y = 20,
+            .width = 10, .height = 10, .color = 0x22cc00,
+            .opacity_scale = UINT8_MAX
+        }
+    };
+    FixedRange mixed_fixed_ranges[2] = {
+        {
+            .command_start = 0, .command_end = 1,
+            .origin_y = 0, .height = 10, .inset = 0,
+            .scroll_end = INT_MAX
+        },
+        {
+            .command_start = 1, .command_end = 2,
+            .origin_y = 20, .height = 10, .inset = 20,
+            .scroll_end = 100
+        }
+    };
+    LayoutDocument mixed_fixed_layout = {
+        .commands = mixed_fixed_commands, .count = 2,
+        .fixed_ranges = mixed_fixed_ranges, .fixed_count = 2,
+        .width = 80, .height = 300, .page_background = 0xffffff
+    };
+    TileCache mixed_fixed_cache;
+    uint16_t *mixed_fixed_frame = budget_malloc(
+        &budget, 80u * 60u * sizeof(*mixed_fixed_frame));
+    CHECK(mixed_fixed_frame != NULL
+          && tile_cache_init(
+                 &mixed_fixed_cache, &budget, &mixed_fixed_layout, 2)
+          && tile_cache_set_frame(
+                 &mixed_fixed_cache, mixed_fixed_frame, 80u * 60u)
+          && tile_cache_render_frame(
+                 &mixed_fixed_cache, 50, 80, 60, NULL)
+          && mixed_fixed_cache.fixed_cache_builds == 1
+          && mixed_fixed_frame[5] == test_rgb565(0xcc2200)
+          && mixed_fixed_frame[20u * 80u + 25u]
+                 == test_rgb565(0x22cc00));
+    CHECK(tile_cache_render_frame(
+              &mixed_fixed_cache, 120, 80, 60, NULL)
+          && mixed_fixed_cache.fixed_cache_builds == 1
+          && mixed_fixed_frame[5] == test_rgb565(0xcc2200)
+          && mixed_fixed_frame[20u * 80u + 25u]
+                 != test_rgb565(0x22cc00));
+    tile_cache_destroy(&mixed_fixed_cache);
+    budget_free(&budget, mixed_fixed_frame);
+
     puts("test: fixed percentage width uses viewport containing block");
     static const char fixed_percent_page[] =
         "<!doctype html><style>html,body{margin:0;padding:0}"

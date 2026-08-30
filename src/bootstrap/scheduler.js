@@ -29,6 +29,12 @@
     nextId = 1;
   const timers = [];
   const limit = 128;
+  /* The frame loop registers an animation-frame timer every presented frame.
+     Reusing retired records and one shared empty argument list keeps the
+     steady game loop free of per-frame allocations, which would otherwise
+     pace QuickJS's full collections onto gameplay frames. */
+  const EMPTY_TIMER_ARGS = Object.freeze([]);
+  const timerPool = [];
   Object.defineProperty(globalThis.__tilefinchRootCensus, "timers", {
     get: () => timers.length,
   });
@@ -36,12 +42,29 @@
     if (typeof callback !== "function" || timers.length >= limit) return 0;
     const id = nextId++;
     const span = Math.max(0, Number(delay) || 0);
-    timers.push({ id, callback, due: now + span, span, repeat, args, kind });
+    const timer = timerPool.pop();
+    if (timer) {
+      timer.id = id;
+      timer.callback = callback;
+      timer.due = now + span;
+      timer.span = span;
+      timer.repeat = repeat;
+      timer.args = args;
+      timer.kind = kind;
+      timers.push(timer);
+    } else {
+      timers.push({ id, callback, due: now + span, span, repeat, args, kind });
+    }
     return id;
+  }
+  function releaseTimer(timer) {
+    timer.callback = null;
+    timer.args = EMPTY_TIMER_ARGS;
+    if (timerPool.length < limit) timerPool.push(timer);
   }
   function clear(id) {
     const at = timers.findIndex((timer) => timer.id === Number(id));
-    if (at >= 0) timers.splice(at, 1);
+    if (at >= 0) releaseTimer(timers.splice(at, 1)[0]);
   }
   const timerPriority = (timer) =>
     timer.kind === "animation-frame"
@@ -51,6 +74,23 @@
         : timer.kind === "render-fixup"
           ? 2
           : 3;
+  const timerOrder = (a, b) =>
+    a.due - b.due || timerPriority(a) - timerPriority(b) || a.id - b.id;
+  function invokeTimer() {
+    /* Detach before calling so author callbacks never observe the reusable
+       timer record as `this`. */
+    const callback = this.callback;
+    try {
+      /* Animation timestamps describe the frame that is actually being
+         serviced. A late browser tick therefore skips time instead of
+         replaying a backlog of synthetic 16 ms frames. Visual timers
+         remain queued while the owning document is hidden. */
+      if (this.kind === "animation-frame") callback(now);
+      else callback(...this.args);
+    } catch (error) {
+      __tilefinchReportUncaught(error, "timer callback");
+    }
+  }
   globalThis.setTimeout = (callback, delay, ...args) =>
     schedule(callback, delay, false, args, "timeout");
   globalThis.setInterval = (callback, delay, ...args) =>
@@ -60,19 +100,15 @@
   globalThis.requestAnimationFrame = (callback) => {
     if (typeof callback !== "function")
       throw new TypeError("callback must be a function");
-    return schedule(
-      (timestamp) => callback(timestamp),
-      16,
-      false,
-      [],
-      "animation-frame",
-    );
+    /* The dispatcher invokes animation-frame callbacks with exactly one
+       timestamp argument, so the author callback needs no adapter. */
+    return schedule(callback, 16, false, EMPTY_TIMER_ARGS, "animation-frame");
   };
   globalThis.cancelAnimationFrame = clear;
   globalThis.__tilefinchScheduleRenderObserver = (callback) =>
-    schedule(callback, 16, false, [], "render-observer");
+    schedule(callback, 16, false, EMPTY_TIMER_ARGS, "render-observer");
   globalThis.__tilefinchScheduleRenderFixup = (callback) =>
-    schedule(callback, 16, false, [], "render-fixup");
+    schedule(callback, 16, false, EMPTY_TIMER_ARGS, "render-fixup");
   if (globalThis.MessageEvent === undefined)
     globalThis.MessageEvent = class MessageEvent extends Event {
       constructor(type, options = {}) {
@@ -506,12 +542,7 @@
     const maximum = Math.max(0, Number(maxCallbacks) || 0),
       visible = pageVisible();
     while (ran < maximum) {
-      timers.sort(
-        (a, b) =>
-          a.due - b.due ||
-          timerPriority(a) - timerPriority(b) ||
-          a.id - b.id,
-      );
+      timers.sort(timerOrder);
       const timerIndex = visible
           ? (timers[0]?.due <= now ? 0 : -1)
           : timers.findIndex((candidate) =>
@@ -521,26 +552,21 @@
       const timer = timerIndex < 0 ? null : timers[timerIndex];
       if (!timer || timer.due > now) break;
       timers.splice(timerIndex, 1);
-      globalThis.__tilefinchRunTask(
-        "timer:" + String(timer.kind) + ":id=" + String(timer.id),
-        () => {
-          try {
-            /* Animation timestamps describe the frame that is actually being
-               serviced. A late browser tick therefore skips time instead of
-               replaying a backlog of synthetic 16 ms frames. Visual timers
-               remain queued while the owning document is hidden. */
-            if (timer.kind === "animation-frame") timer.callback(now);
-            else timer.callback(...timer.args);
-          } catch (error) {
-            __tilefinchReportUncaught(error, "timer callback");
-          }
-        },
-      );
+      /* Per-frame timer kinds reuse one provenance label; author timers keep
+         the id-bearing label their uncaught-error diagnostics rely on. */
+      const label = timer.kind === "animation-frame"
+        ? "timer:animation-frame"
+        : timer.kind === "render-observer"
+          ? "timer:render-observer"
+          : timer.kind === "render-fixup"
+            ? "timer:render-fixup"
+            : "timer:" + String(timer.kind) + ":id=" + String(timer.id);
+      globalThis.__tilefinchRunTask(label, invokeTimer, timer);
       ran++;
       if (timer.repeat) {
         timer.due = now + timer.span;
         timers.push(timer);
-      }
+      } else releaseTimer(timer);
     }
     return ran;
   };
@@ -863,15 +889,29 @@
           globalThis.__tilefinchBeginControlDefault?.(target, true) || null,
         clickEvent = tilefinchEvent("click", point);
       clickEvent.__tilefinchControlDefaultPrepared = true;
-      const accepted = target.dispatchEvent(clickEvent);
-      globalThis.__tilefinchFinishControlDefault?.(controlState, accepted);
-      if (
-        accepted &&
-        !controlState &&
-        !globalThis.__tilefinchDetailsDefault?.(target)
-      )
-        globalThis.__tilefinchLabelDefault(target, true);
-      return accepted;
+      let accepted = false,
+        completed = false;
+      try {
+        accepted = target.dispatchEvent(clickEvent);
+        completed = true;
+        if (
+          accepted &&
+          !controlState &&
+          !globalThis.__tilefinchDetailsDefault?.(target)
+        )
+          globalThis.__tilefinchLabelDefault(target, true);
+        return accepted;
+      } finally {
+        /* A watchdog can interrupt an author handler after the bootstrap has
+           staged checkbox/radio selectedness but before dispatchEvent
+           returns its cancellation bit. Roll the staged default back on
+           every incomplete dispatch; C then classifies the admitted handler
+           as RUNTIME_FAILED and must not replay it. */
+        globalThis.__tilefinchFinishControlDefault?.(
+          controlState,
+          completed && accepted,
+        );
+      }
     };
     if (phase === 5) return clickDefault();
     const pointerAccepted = fire("pointerdown"),

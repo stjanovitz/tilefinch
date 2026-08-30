@@ -27,6 +27,8 @@ benchmarks/node_modules/
 async-network-results/
 async-network-results-current/
 benchmarks/npm-*.log
+__pycache__/
+*.pyc
 
 # Public trust records may be committed under trust/. Private signing
 # material never belongs in this repository.

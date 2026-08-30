@@ -101,6 +101,20 @@ Use `--debug-log` when the question is which PSP call PPSSPP accepted or
 rejected. The wrapper launches PPSSPP through the macOS-safe path described in
 `AGENTS.md`.
 
+On macOS every automated PPSSPP harness uses LaunchServices, including the
+input, network, crypto, and device-cost runners. They never fall back to direct
+`PPSSPPSDL` execution: when GUI registration is unavailable, the harness stops
+with an actionable error before PPSSPP starts. Direct execution from an
+automation shell can abort in Cocoa before any PSP code runs, so
+`PPSSPP_LAUNCHSERVICES=0` is deliberately rejected. Grant the LaunchServices
+operation and rerun instead; an emulator abort before a Tilefinch log is not a
+browser result.
+
+LaunchServices is invoked with `open -g`, so automated PPSSPP windows remain
+in the background and do not activate over the user's current application.
+Do not remove that flag to make a test easier to watch; inspect the captured
+frames and logs, or explicitly bring PPSSPP forward for a manual run.
+
 ## Physical PSP
 
 Copy the script beside an installed validation EBOOT and name it in
@@ -178,6 +192,27 @@ persistent-state prerequisites. Useful independent panels include:
 - live HOME activation and cancellation;
 - five-tab pressure, close, and hibernation;
 - screenshots with an explicit filename-normalization rule.
+
+Game input needs an additional distinction: a qualification page can mutate
+its simulation directly without ever exercising PSP controls. The committed
+`treadline-offline-controls.txt` scenario instead enters through native Home
+and Library and sends its authored `PspUiInput` through Page controls and the
+standard Gamepad publication path. Validation reports the downstream evidence
+as `tilefinch-input-gamepad:`; the PPSSPP runner requires every scripted face,
+shoulder, D-pad, and analog extreme to appear there. Do not infer delivery
+merely from `held-frames`. Seed the isolated emulator with the same sealed
+library layout used on-device:
+
+```sh
+scripts/run-ppsspp-input-script.sh \
+  --script treadline-offline-controls \
+  --offline-library build-preset-psp-validation/offline \
+  --heap-mb 7 --script-file-kb 384
+```
+
+The optional directory is copied into the run's disposable Memory Stick. It
+must contain `library.bin` and the referenced payload files; the runner never
+falls back to the network to manufacture a missing installed app.
 
 Every new scenario must bound each wait, state whether its evidence is
 hermetic or external, and identify the receiver output that proves success.

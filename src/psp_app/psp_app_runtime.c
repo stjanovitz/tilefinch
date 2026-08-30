@@ -495,6 +495,14 @@ typedef struct {
 } PspPresentationCadence;
 
 static PspPresentationCadence psp_presentation_cadence;
+static PspPresentPhaseTiming psp_present_last_timing;
+
+bool psp_present_validation_last_timing(PspPresentPhaseTiming *timing)
+{
+    if (timing == NULL || psp_present_last_timing.sequence == 0) return false;
+    *timing = psp_present_last_timing;
+    return true;
+}
 
 void psp_report_presentation_cadence(const char *phase)
 {
@@ -1407,6 +1415,8 @@ bool psp_present_internal(
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t presentation_started_us =
         (uint64_t) sceKernelGetSystemTimeWide();
+    uint64_t base_finished_us = presentation_started_us;
+    uint64_t composite_finished_us = presentation_started_us;
 #endif
     bool native_surface = !media_visible && ui != NULL
         && psp_ui_screen_is_native_surface(ui->screen);
@@ -1426,12 +1436,19 @@ bool psp_present_internal(
                    PSP_SCREEN_WIDTH * sizeof(*vram));
         }
     } else if (!media_replaces_page && !native_surface) {
-        for (int y = 0; y < PSP_SCREEN_HEIGHT; y++) {
+        unsigned opaque_top = 0u, opaque_bottom = 0u;
+        psp_ui_opaque_chrome_rows(ui, &opaque_top, &opaque_bottom);
+        unsigned copy_end = PSP_SCREEN_HEIGHT - opaque_bottom;
+        for (unsigned y = opaque_top; y < copy_end; y++) {
             memcpy(vram + (size_t) y * PSP_VRAM_STRIDE,
                    frame + (size_t) y * PSP_SCREEN_WIDTH,
                    PSP_SCREEN_WIDTH * sizeof(*frame));
         }
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    base_finished_us = (uint64_t) sceKernelGetSystemTimeWide();
+    PspUiCompositeTiming ui_timing = {0};
+#endif
     if (media_visible) {
         if (media_replaces_page) {
             bool overlay_paints =
@@ -1457,7 +1474,13 @@ bool psp_present_internal(
     } else if (ui != NULL) {
         psp_ui_composite(ui, vram, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT,
                          PSP_VRAM_STRIDE);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        (void) psp_ui_validation_last_timing(&ui_timing);
+#endif
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    composite_finished_us = (uint64_t) sceKernelGetSystemTimeWide();
+#endif
     /* Publish only a completely composed back buffer at vblank. Writing the
        scanout buffer directly caused visibly half-updated title bars and
        loading flicker on physical hardware. */
@@ -1466,9 +1489,35 @@ bool psp_present_internal(
 #endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     unsigned published_index = psp_display.back_buffer;
+    PspDisplayBackendTiming display_timing_before = {0};
+    (void) psp_display_validation_timing_snapshot(&display_timing_before);
 #endif
     bool published = psp_display_publish(&psp_display);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t published_us = (uint64_t) sceKernelGetSystemTimeWide();
+    PspDisplayBackendTiming display_timing_after = {0};
+    (void) psp_display_validation_timing_snapshot(&display_timing_after);
+    uint32_t sequence = psp_present_last_timing.sequence + 1u;
+    if (sequence == 0) sequence = 1u;
+    psp_present_last_timing = (PspPresentPhaseTiming) {
+        .base_us = base_finished_us - presentation_started_us,
+        .composite_us = composite_finished_us - base_finished_us,
+        .publish_us = published_us - composite_finished_us,
+        .publish_flush_us = display_timing_after.flush_us
+            - display_timing_before.flush_us,
+        .publish_set_framebuffer_us =
+            display_timing_after.set_framebuffer_us
+                - display_timing_before.set_framebuffer_us,
+        .publish_vblank_us = display_timing_after.vblank_us
+            - display_timing_before.vblank_us,
+        .ui_focus_scroll_us = ui_timing.focus_scroll_us,
+        .ui_chrome_us = ui_timing.chrome_us,
+        .ui_cursor_us = ui_timing.cursor_us,
+        .ui_screen_us = ui_timing.screen_us,
+        .ui_toast_us = ui_timing.toast_us,
+        .ui_loading_us = ui_timing.loading_us,
+        .sequence = sequence
+    };
     psp_cadence_published(published);
     if (published && media_visible) {
         psp_input_script_capture_media_present(
@@ -2675,6 +2724,7 @@ void psp_background_ui_tick(void)
                 cooperate->frame, &cooperate->supervisor_ui);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         if (scripted
+            && !cooperate->supervisor_ui.page_gamepad_capture
             && (ui_pressed & PSP_UI_BUTTON_CANCEL) != 0) {
             psp_input_script_capture_named(
                 "cancel-ack", psp_display_front_buffer(&psp_display),

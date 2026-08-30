@@ -514,14 +514,18 @@ void psp_app_apply_setting(
         const NavigationEntry *entry =
             navigation_current(app->views->navigation);
         if (!psp_set_presentation_css(
-                engine, &app->process->presentation.ui, profile, app->process->presentation.ui.reader_mode,
+                engine, &app->process->presentation.ui, profile,
+                app->process->presentation.ui.reader_mode
+                    || app->process->presentation.ui.basic_mode,
                 entry == NULL ? NULL : entry->url,
                 page_font_percent, true)) {
             unsigned fallback =
                 browser_profile_page_font_percent(profile);
             app->process->presentation.ui.page_font_percent = fallback;
             (void) psp_set_presentation_css(
-                engine, &app->process->presentation.ui, profile, app->process->presentation.ui.reader_mode,
+                engine, &app->process->presentation.ui, profile,
+                app->process->presentation.ui.reader_mode
+                    || app->process->presentation.ui.basic_mode,
                 entry == NULL ? NULL : entry->url,
                 fallback, true);
             psp_ui_show_status(
@@ -557,7 +561,8 @@ void psp_app_apply_setting(
             browser_profile_reader_font(profile);
         browser_profile_set_reader_font(profile, requested);
         bool applied = true;
-        if (app->process->presentation.ui.reader_mode) {
+        if (app->process->presentation.ui.reader_mode
+            || app->process->presentation.ui.basic_mode) {
             const NavigationEntry *entry =
                 navigation_current(app->views->navigation);
             applied = psp_set_presentation_css(
@@ -580,7 +585,9 @@ void psp_app_apply_setting(
         } else {
             psp_profile_store_mark_dirty(
                 &app->browser->profile_store, frame->ui_sample_us);
-            frame->page_dirty = app->process->presentation.ui.reader_mode || frame->page_dirty;
+            frame->page_dirty = app->process->presentation.ui.reader_mode
+                || app->process->presentation.ui.basic_mode
+                || frame->page_dirty;
             psp_ui_show_status(
                 &app->process->presentation.ui,
                 requested == BROWSER_READER_FONT_SERIF
@@ -1176,7 +1183,9 @@ void psp_app_apply_setting(
             const NavigationEntry *entry =
                 navigation_current(app->views->navigation);
             (void) psp_set_presentation_css(
-                engine, &app->process->presentation.ui, profile, app->process->presentation.ui.reader_mode,
+                engine, &app->process->presentation.ui, profile,
+                app->process->presentation.ui.reader_mode
+                    || app->process->presentation.ui.basic_mode,
                 entry == NULL ? app->process->presentation.ui.url : entry->url,
                 app->process->presentation.ui.page_font_percent, true);
             (void) psp_engine_views_refresh(app->views, engine);
@@ -1193,7 +1202,9 @@ void psp_app_apply_setting(
         const NavigationEntry *entry =
             navigation_current(app->views->navigation);
         bool applied = psp_set_presentation_css(
-            engine, &app->process->presentation.ui, profile, app->process->presentation.ui.reader_mode,
+            engine, &app->process->presentation.ui, profile,
+            app->process->presentation.ui.reader_mode
+                || app->process->presentation.ui.basic_mode,
             entry == NULL ? app->process->presentation.ui.url : entry->url,
             app->process->presentation.ui.page_font_percent, true);
         if (!applied) {
@@ -1201,7 +1212,9 @@ void psp_app_apply_setting(
                 profile, previous);
             app->process->presentation.ui.content_blocker_cosmetic_hiding = previous;
             (void) psp_set_presentation_css(
-                engine, &app->process->presentation.ui, profile, app->process->presentation.ui.reader_mode,
+                engine, &app->process->presentation.ui, profile,
+                app->process->presentation.ui.reader_mode
+                    || app->process->presentation.ui.basic_mode,
                 entry == NULL ? app->process->presentation.ui.url : entry->url,
                 app->process->presentation.ui.page_font_percent, true);
         } else {
@@ -1260,7 +1273,8 @@ void psp_app_apply_setting(
             ? app->process->presentation.ui.url : entry->url;
         bool applied = changed && psp_set_presentation_css(
             engine, &app->process->presentation.ui, profile,
-            app->process->presentation.ui.reader_mode, url,
+            app->process->presentation.ui.reader_mode
+                || app->process->presentation.ui.basic_mode, url,
             app->process->presentation.ui.page_font_percent, true);
         if (!applied) {
             (void) browser_profile_set_cookie_banner_hidden(
@@ -1268,7 +1282,8 @@ void psp_app_apply_setting(
             app->process->presentation.ui.cookie_banner_hidden = previous;
             (void) psp_set_presentation_css(
                 engine, &app->process->presentation.ui, profile,
-                app->process->presentation.ui.reader_mode, url,
+                app->process->presentation.ui.reader_mode
+                    || app->process->presentation.ui.basic_mode, url,
                 app->process->presentation.ui.page_font_percent, true);
         } else {
             psp_profile_store_mark_dirty(

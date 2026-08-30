@@ -1,0 +1,1 @@
+<!doctype html><title>Preload stage bound</title><body><main><h1 id="content">Server page remains useful</h1><script src="/blocking.js"></script><script>document.body.setAttribute('data-later-ran','yes')</script><a id="useful-link" href="/next">Continue</a></main></body>

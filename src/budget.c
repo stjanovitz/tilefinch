@@ -1423,8 +1423,17 @@ struct BudgetQuickJSPool {
        boot window must actually cover. */
     size_t js_malloc_peak;
     size_t js_malloc_current;
+    size_t rejection_count;
     size_t largest_request;
     size_t peak_dump_watermark;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t allocation_calls;
+    uint64_t free_calls;
+    uint64_t reallocation_calls;
+    uint64_t allocated_bytes;
+    uint64_t freed_bytes;
+    uint64_t reallocated_bytes;
+#endif
 };
 
 static uint16_t quickjs_pool_class_for(const BudgetQuickJSPool *pool,
@@ -1768,6 +1777,10 @@ void budget_quickjs_pool_set_stack_dump_hook(void (*hook)(void *opaque),
 static void bellard_pool_record_reject(const JSMallocState *state,
                                        size_t old_size, size_t size)
 {
+    BudgetQuickJSPool *pool = state == NULL ? NULL : state->opaque;
+    if (pool != NULL && pool->rejection_count != SIZE_MAX) {
+        pool->rejection_count++;
+    }
     if (bellard_pool_reject_count
         >= sizeof(bellard_pool_rejects) / sizeof(bellard_pool_rejects[0])) {
         return;
@@ -1959,6 +1972,11 @@ static void *bellard_pool_malloc(JSMallocState *state, size_t size)
         if (size != 0) bellard_pool_record_reject(state, 0, size);
         return NULL;
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    BudgetQuickJSPool *activity_pool = state->opaque;
+    activity_pool->allocation_calls++;
+    activity_pool->allocated_bytes += size;
+#endif
     bellard_pool_note_request(state->opaque, size);
     bellard_pool_record_big_request(state, 0, size, 0);
     void *pointer = quickjs_pool_malloc(state->opaque, size);
@@ -1992,8 +2010,14 @@ static void *bellard_pool_malloc(JSMallocState *state, size_t size)
 static void bellard_pool_free(JSMallocState *state, void *pointer)
 {
     if (pointer != NULL) {
+        size_t freed_size = quickjs_pool_usable_size(pointer);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        BudgetQuickJSPool *activity_pool = state->opaque;
+        activity_pool->free_calls++;
+        activity_pool->freed_bytes += freed_size;
+#endif
         state->malloc_count--;
-        state->malloc_size -= quickjs_pool_usable_size(pointer);
+        state->malloc_size -= freed_size;
         ((BudgetQuickJSPool *) state->opaque)->js_malloc_current =
             state->malloc_size;
     }
@@ -2017,6 +2041,11 @@ static void *bellard_pool_realloc(JSMallocState *state, void *pointer,
         bellard_pool_capture_prefix(pointer, old_size, size);
         return NULL;
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    BudgetQuickJSPool *activity_pool = state->opaque;
+    activity_pool->reallocation_calls++;
+    activity_pool->reallocated_bytes += size;
+#endif
     bellard_pool_note_request(state->opaque, size);
     bellard_pool_record_big_request(state, old_size, size, 1);
     bellard_pool_capture_prefix(pointer, old_size, size);
@@ -2097,6 +2126,28 @@ size_t budget_quickjs_pool_largest_request(const BudgetQuickJSPool *pool)
 size_t budget_quickjs_pool_js_malloc_current(const BudgetQuickJSPool *pool)
 {
     return pool == NULL ? 0 : pool->js_malloc_current;
+}
+
+size_t budget_quickjs_pool_rejection_count(const BudgetQuickJSPool *pool)
+{
+    return pool == NULL ? 0 : pool->rejection_count;
+}
+
+void budget_quickjs_pool_activity(const BudgetQuickJSPool *pool,
+                                  BudgetQuickJSActivity *activity)
+{
+    if (activity == NULL) return;
+    memset(activity, 0, sizeof(*activity));
+    if (pool == NULL) return;
+    activity->live_bytes = pool->js_malloc_current;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    activity->allocation_calls = pool->allocation_calls;
+    activity->free_calls = pool->free_calls;
+    activity->reallocation_calls = pool->reallocation_calls;
+    activity->allocated_bytes = pool->allocated_bytes;
+    activity->freed_bytes = pool->freed_bytes;
+    activity->reallocated_bytes = pool->reallocated_bytes;
+#endif
 }
 
 void budget_quickjs_pool_report_classes(const BudgetQuickJSPool *pool,

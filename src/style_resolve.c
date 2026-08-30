@@ -197,6 +197,53 @@ static bool style_subtree_has_primary_heading(lxb_dom_node_t *root)
     return false;
 }
 
+/* Some server-rendered sites deliberately hide the whole page shell until their
+   bootstrap adds a ready class.  If that bounded bootstrap is retired, keep
+   the published document usable without broadly revealing hidden components.
+   This check is paid only for the root/body while static degradation is
+   active, uses no allocation, and requires both a semantic heading and a
+   useful amount of authored text. */
+static bool style_subtree_is_readable_page_shell(lxb_dom_node_t *root)
+{
+    if (root == NULL) return false;
+    bool heading = false;
+    size_t text_bytes = 0;
+    lxb_dom_node_t *node = root->first_child;
+    for (size_t visited = 0; node != NULL && visited < 512u; visited++) {
+        bool skip_children = false;
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            skip_children = style_tag_is(node, "head")
+                || style_tag_is(node, "script")
+                || style_tag_is(node, "style")
+                || style_tag_is(node, "template")
+                || style_tag_is(node, "svg")
+                || style_tag_is(node, "noscript")
+                || style_tag_is(node, "dialog")
+                || lxb_dom_element_has_attribute(
+                       lxb_dom_interface_element(node),
+                       (const lxb_char_t *) "hidden", 6u)
+                || style_attribute_token_is(node, "aria-hidden", "true");
+            if (!skip_children
+                && (style_tag_is(node, "h1")
+                    || style_tag_is(node, "h2"))) heading = true;
+        } else if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+            size_t length = 0;
+            const char *value = document_text_data(node, &length);
+            for (size_t at = 0; value != NULL && at < length; at++) {
+                if (!isspace((unsigned char) value[at])
+                    && text_bytes < 128u) text_bytes++;
+            }
+        }
+        if (!skip_children && node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != root && node->next == NULL) node = node->parent;
+        node = node == root ? NULL : node->next;
+    }
+    return heading && text_bytes >= 64u;
+}
+
 static bool style_is_direct_main_child(lxb_dom_node_t *node)
 {
     return node != NULL && node->parent != NULL
@@ -3136,6 +3183,25 @@ ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
     if (style.has_transform && style.transform_scale_q6 == 0) {
         style.hidden = true;
     }
+    /* A text-rich server document may be staged behind body{display:none}
+       until optional hydration adds a ready class.  Reveal only that whole-
+       page shell after the script pipeline has activated the static fallback;
+       element-level hidden content keeps its ordinary cascade semantics. */
+    if (sheet != NULL && sheet->static_custom_element_fallback
+        && (style_tag_is(node, "html") || style_tag_is(node, "body"))
+        && (style.display == DISPLAY_NONE || style.visibility_hidden
+            || style.opacity == 0)
+        && !style.hidden
+        && style_subtree_is_readable_page_shell(node)) {
+        if (!lxb_dom_element_has_attribute(
+                lxb_dom_interface_element(node),
+                (const lxb_char_t *) "hidden", 6u)
+            && !style_attribute_token_is(node, "aria-hidden", "true")) {
+            if (style.display == DISPLAY_NONE) style.display = DISPLAY_BLOCK;
+            style.visibility_hidden = false;
+            if (style.opacity == 0) style.opacity = 255;
+        }
+    }
     /* Script-built mobile headers often ship their complete, accessible
        light DOM but hide it with a CSS-module `loading` token until the
        optional application bundle mounts. If that bundle was shed, reveal
@@ -3155,16 +3221,17 @@ ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
        remain behind a script-controlled wrapper.  Reveal only a non-modal
        wrapper containing an h1; successful pipelines preserve ordinary
        responsive and dialog hiding semantics. */
-    if (sheet != NULL && style.display == DISPLAY_NONE && !style.fixed_position
+    if (sheet != NULL && style.display == DISPLAY_NONE && !style.hidden
+        && !style.fixed_position
         && style_subtree_has_primary_heading(node)
         && (sheet->static_custom_element_fallback
             || style_is_direct_main_child(node))) {
-        size_t ignored = 0;
-        if (document_attribute(node, "hidden", &ignored) == NULL
+        if (!lxb_dom_element_has_attribute(
+                lxb_dom_interface_element(node),
+                (const lxb_char_t *) "hidden", 6u)
             && !style_attribute_token_is(node, "aria-hidden", "true")
             && !style_tag_is(node, "dialog")) {
             style.display = DISPLAY_BLOCK;
-            style.hidden = false;
             style.visibility_hidden = false;
             if (style.opacity == 0) style.opacity = 255;
         }

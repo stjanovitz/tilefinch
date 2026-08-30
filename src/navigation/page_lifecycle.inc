@@ -666,6 +666,17 @@ static bool navigation_resource_fingerprint(
     return false;
 }
 
+bool navigation_accept_native_resource_fingerprint(
+    NavigationSession *session)
+{
+    if (session == NULL || !session->page.loaded) return false;
+    uint64_t fingerprint = 0;
+    if (!navigation_resource_fingerprint(
+            session, &session->page.document, &fingerprint)) return false;
+    session->resource_fingerprint = fingerprint;
+    return true;
+}
+
 static bool draw_command_equal(const DrawCommand *left,
                                const DrawCommand *right)
 {
@@ -876,6 +887,24 @@ static bool page_has_owned_state(const NavigationPage *page)
             || page->fetch_domain != NULL);
 }
 
+static void navigation_clear_frame_messages(
+    NavigationSession *session, NavigationPage *page, bool record_drops)
+{
+    if (session == NULL || page == NULL) return;
+    size_t dropped = page->message_count;
+    for (size_t i = 0; i < dropped; i++) {
+        budget_free(session->budget, page->messages[i].json);
+        budget_free(session->budget, page->messages[i].target_origin);
+    }
+    memset(page->messages, 0, sizeof(page->messages));
+    page->message_count = 0;
+    if (record_drops) {
+        session->frame_messages_dropped =
+            dropped <= SIZE_MAX - session->frame_messages_dropped
+            ? session->frame_messages_dropped + dropped : SIZE_MAX;
+    }
+}
+
 static void page_destroy_value(NavigationSession *session,
                                NavigationPage *page)
 {
@@ -887,11 +916,7 @@ static void page_destroy_value(NavigationSession *session,
     } else {
         work_units = SIZE_MAX;
     }
-    for (size_t i = 0; i < page->message_count; i++) {
-        budget_free(session->budget, page->messages[i].json);
-        budget_free(session->budget,
-                    page->messages[i].target_origin);
-    }
+    navigation_clear_frame_messages(session, page, false);
     for (size_t i = 0; i < page->frame_count; i++) {
         script_runtime_destroy(page->frames[i].runtime);
         document_destroy(&page->frames[i].document);
@@ -933,8 +958,50 @@ static void page_destroy(NavigationSession *session)
     if (session != NULL) page_destroy_value(session, &session->page);
 }
 
+static void navigation_freeze_reader_root_provenance(NavigationPage *page)
+{
+    if (page == NULL || page->runtime == NULL
+        || page->reader_root_handle == 0) return;
+    lxb_dom_node_t *resolved = script_runtime_node_handle_resolve_connected(
+        page->runtime, page->reader_root_handle);
+    if (resolved != NULL && resolved == page->reader_root) {
+        /* No author turn can run after the caller destroys this realm. The
+           connected document-owned node is therefore a safe native pointer
+           until ordinary page teardown. */
+        page->reader_root = resolved;
+        page->reader_root_handle = 0;
+        return;
+    }
+    /* Author code already detached or replaced the native clone. Never let a
+       public look-alike marker inherit its provenance after realm teardown. */
+    page->reader_root = NULL;
+    page->reader_root_handle = 0;
+    page->reader_root_kind = READER_PAGE_RAW;
+}
+
+void navigation_retire_current_page_scripts(NavigationSession *session)
+{
+    if (session == NULL) return;
+    if (session->page.runtime != NULL) {
+        navigation_freeze_reader_root_provenance(&session->page);
+        script_runtime_set_synchronous_layout_callback(
+            session->page.runtime, NULL, NULL);
+        script_runtime_set_layout(session->page.runtime, NULL, 0);
+    }
+    /* postMessage payloads retain raw realm identities. Once every realm is
+       retired they can neither be delivered nor safely remain queued. */
+    navigation_clear_frame_messages(session, &session->page, true);
+    if (session->page.runtime != NULL)
+        script_runtime_destroy(session->page.runtime);
+    session->page.runtime = NULL;
+    for (size_t i = 0; i < session->page.frame_count; i++) {
+        script_runtime_destroy(session->page.frames[i].runtime);
+        session->page.frames[i].runtime = NULL;
+    }
+}
+
 static bool navigation_retire_exhausted_script_realms(
-    NavigationSession *session)
+    NavigationSession *session, bool allocator_rejection_observed)
 {
     if (session == NULL || session->page.runtime == NULL) {
         return false;
@@ -952,7 +1019,12 @@ static bool navigation_retire_exhausted_script_realms(
                 session->page.script_result.error);
     }
 #endif
-    if (!explicit_oom && remaining >= 256u * 1024u) return false;
+    /* A caught allocation failure leaves no exception text and can leave
+       substantial nominal headroom when one oversized request was refused.
+       Only the runtime pump may authorize that case, using the allocator's
+       monotonic rejection counter sampled around the author task. */
+    if (!allocator_rejection_observed
+        && !explicit_oom && remaining >= 256u * 1024u) return false;
     /*
      * Author JavaScript exhausting its separately bounded realm must not
      * discard an otherwise usable document.  The DOM, completed stylesheet,
@@ -961,16 +1033,9 @@ static bool navigation_retire_exhausted_script_realms(
      * Keeping the ScriptResult makes the degraded state visible in device
      * diagnostics without attempting another allocation in the failed VM.
      */
-    script_runtime_set_synchronous_layout_callback(
-        session->page.runtime, NULL, NULL);
-    script_runtime_set_layout(session->page.runtime, NULL, 0);
-    script_runtime_destroy(session->page.runtime);
-    session->page.runtime = NULL;
-    for (size_t i = 0; i < session->page.frame_count; i++) {
-        script_runtime_destroy(session->page.frames[i].runtime);
-        session->page.frames[i].runtime = NULL;
-    }
+    navigation_retire_current_page_scripts(session);
     session->page.script_result.success = false;
+    session->page.script_degradation_observed = true;
     snprintf(session->page.script_result.summary,
              sizeof(session->page.script_result.summary),
              "JavaScript stopped at its memory limit");

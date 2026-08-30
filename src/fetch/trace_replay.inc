@@ -1,3 +1,12 @@
+static bool trace_replay_diagnostics_enabled(void)
+{
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+    return true;
+#else
+    return getenv("TILEFINCH_TRACE_REPLAY_DIAGNOSTICS") != NULL;
+#endif
+}
+
 static bool trace_parse_security_metadata(
     const char *value, FetchResponseSecurityMetadata *metadata)
 {
@@ -1034,7 +1043,7 @@ static bool trace_replay_response_with_scratch(
                       request == NULL || request->referrer_policy == NULL
                         ? "" : request->referrer_policy) == 0);
     if (!request_identity_match) {
-        if (getenv("TILEFINCH_TRACE_REPLAY_DIAGNOSTICS") != NULL) {
+        if (trace_replay_diagnostics_enabled()) {
             fprintf(stderr,
                     "HTTP replay identity record=%zu method=%d url=%d "
                     "v6-shape=%d v7-shape=%d v8-shape=%d "
@@ -1097,6 +1106,7 @@ static bool trace_replay_response_with_scratch(
     }
     *record_status = TRACE_REPLAY_RECORD_MATCHED;
     if (recorded_length > maximum_bytes) {
+        result->response_limit_exceeded = true;
         snprintf(result->error, sizeof(result->error),
                  "HTTP replay record %zu exceeds request quota", sequence);
         return false;
@@ -1761,7 +1771,7 @@ static bool trace_replay_response(Budget *budget, const char *method,
                    : "HTTP replay request does not match any unclaimed "
                      "record for %s %s",
                  method, canonical_url);
-        if (getenv("TILEFINCH_TRACE_REPLAY_DIAGNOSTICS") != NULL) {
+        if (trace_replay_diagnostics_enabled()) {
             fprintf(stderr,
                     "HTTP replay unmatched method=%.12s url=%.700s\n",
                     method, canonical_url);
@@ -1777,7 +1787,7 @@ static bool trace_replay_response(Budget *budget, const char *method,
                                          &served_epoch)) {
             browser_session_advance_cookie_clock(served_epoch);
         }
-    } else if (found && getenv("TILEFINCH_TRACE_REPLAY_DIAGNOSTICS") != NULL) {
+    } else if (found && trace_replay_diagnostics_enabled()) {
         fprintf(stderr,
                 "HTTP replay matched-but-not-served record=%zu method=%.12s "
                 "url=%.420s error=%.220s\n",

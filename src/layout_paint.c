@@ -543,7 +543,7 @@ uint32_t blend_color_over(uint32_t foreground, uint8_t alpha,
 }
 
 bool add_sticky_range(LayoutDocument *layout, size_t start,
-                             size_t end, int origin_y, int top)
+                      size_t end, int origin_y, int top, int bottom_y)
 {
     if (start >= end) return true;
     if (layout->sticky_count == LAYOUT_STICKY_RANGE_LIMIT) {
@@ -562,9 +562,48 @@ bool add_sticky_range(LayoutDocument *layout, size_t start,
         layout->sticky_capacity = capacity;
     }
     layout->sticky_ranges[layout->sticky_count++] = (StickyRange) {
-        start, end, origin_y, top
+        .command_start = start,
+        .command_end = end,
+        .origin_y = origin_y,
+        .top = top,
+        .bottom_y = bottom_y,
+        .maximum_offset = INT_MAX
     };
     return true;
+}
+
+void layout_bound_sticky_ranges(LayoutDocument *layout, size_t start,
+                                size_t end, int containing_bottom)
+{
+    if (layout == NULL || start >= end) return;
+    for (size_t i = 0; i < layout->sticky_count; i++) {
+        StickyRange *range = &layout->sticky_ranges[i];
+        if (range->maximum_offset != INT_MAX
+            || range->command_start < start || range->command_end > end) {
+            continue;
+        }
+        int64_t available = (int64_t) containing_bottom - range->bottom_y;
+        if (available < 0) available = 0;
+        if (available > LAYOUT_COORDINATE_LIMIT) {
+            available = LAYOUT_COORDINATE_LIMIT;
+        }
+        range->maximum_offset = (int) available;
+
+        /* A fixed descendant retained inside a finite sticky scene is a
+           common server-rendered shell for a scroll-driven animation.  When
+           author script cannot run, leaving that descendant viewport-fixed
+           forever covers every later section.  Preserve ordinary fixed UI,
+           but retire a fixed range whose complete command span belongs to
+           this bounded scene once the scene itself has scrolled away. */
+        for (size_t fixed_index = 0;
+             fixed_index < layout->fixed_count; fixed_index++) {
+            FixedRange *fixed = &layout->fixed_ranges[fixed_index];
+            if (fixed->scroll_end != INT_MAX
+                || fixed->command_start < range->command_start
+                || fixed->command_end > range->command_end) continue;
+            fixed->scroll_end = containing_bottom;
+        }
+    }
 }
 
 bool add_fixed_range(LayoutDocument *layout, size_t start, size_t end,
@@ -590,8 +629,17 @@ bool add_fixed_range(LayoutDocument *layout, size_t start, size_t end,
         layout->fixed_capacity = capacity;
     }
     layout->fixed_ranges[layout->fixed_count++] = (FixedRange) {
-        start, end, link_start, link_end, control_start, control_end,
-        origin_y, height, inset, from_bottom
+        .command_start = start,
+        .command_end = end,
+        .link_start = link_start,
+        .link_end = link_end,
+        .control_start = control_start,
+        .control_end = control_end,
+        .origin_y = origin_y,
+        .height = height,
+        .inset = inset,
+        .scroll_end = INT_MAX,
+        .from_bottom = from_bottom
     };
     return true;
 }
@@ -683,7 +731,16 @@ void translate_node_subtree(LayoutDocument *layout,
         StickyRange *range = &layout->sticky_ranges[i];
         if (range->command_start >= command_start
             && range->command_end <= command_end) {
-            range->origin_y += dy;
+            range->origin_y = layout_add_coordinate(range->origin_y, dy);
+            range->bottom_y = layout_add_coordinate(range->bottom_y, dy);
+        }
+    }
+    for (size_t i = 0; i < layout->fixed_count; i++) {
+        FixedRange *range = &layout->fixed_ranges[i];
+        if (range->scroll_end != INT_MAX
+            && range->command_start >= command_start
+            && range->command_end <= command_end) {
+            range->scroll_end = layout_add_coordinate(range->scroll_end, dy);
         }
     }
     const uint32_t *interactions =
@@ -1617,6 +1674,26 @@ void layout_translate_range(LayoutDocument *layout, size_t command_start,
     for (size_t i = control_start; i < layout->control_count; i++) {
         layout->controls[i].x += dx;
         layout->controls[i].y += dy;
+    }
+    /* Sticky/fixed metadata is registered as descendants finish, before a
+       positioned ancestor applies its final relative/out-of-flow offset.
+       Keep those retained paint and interaction bounds in the same
+       coordinate space as the command range being translated. */
+    if (dy != 0) {
+        for (size_t i = 0; i < layout->sticky_count; i++) {
+            StickyRange *range = &layout->sticky_ranges[i];
+            if (range->command_start < command_start
+                || range->command_end > layout->count) continue;
+            range->origin_y = layout_add_coordinate(range->origin_y, dy);
+            range->bottom_y = layout_add_coordinate(range->bottom_y, dy);
+        }
+        for (size_t i = 0; i < layout->fixed_count; i++) {
+            FixedRange *range = &layout->fixed_ranges[i];
+            if (range->scroll_end == INT_MAX
+                || range->command_start < command_start
+                || range->command_end > layout->count) continue;
+            range->scroll_end = layout_add_coordinate(range->scroll_end, dy);
+        }
     }
     for (size_t i = node_box_start; i < layout->node_box_count; i++) {
         LayoutNodeBox *box = &layout->node_boxes[i];

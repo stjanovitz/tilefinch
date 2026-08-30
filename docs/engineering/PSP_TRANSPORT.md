@@ -46,6 +46,8 @@ slots:
 
 - ordinary page and resource lanes allocate 64 KiB response buffers lazily;
 - media range requests use two 256 KiB windows;
+- two optional WebSocket lanes retain one 64 KiB receive message and one
+  64 KiB outbound message each, with one browser-visible event of backpressure;
 - HOME preconnect owns a bodyless descriptor;
 - update traffic uses the same worker but retains updater-owned verification
   and installation state.

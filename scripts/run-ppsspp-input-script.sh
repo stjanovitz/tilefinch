@@ -13,10 +13,20 @@
 #     --build-dir DIR   PSP build directory (default build-preset-psp-validation)
 #     --script NAME     scenario in tests/input-scripts (default menu-tour)
 #     --url URL         start on an HTTPS page instead of native HOME
+#     --offline-library DIR
+#                       seed an exact offline/ directory into the isolated run
+#     --heap-mb N       validation JavaScript heap override
+#     --script-file-kb N
+#                       validation per-script source override
 #     --timeout N       seconds to wait for the run (default 300)
 #     --runs N          replay N times and require identical traces (default 1)
 #     --debug-log       add PPSSPP's -d syscall trace to the emulator log
 #     --update-golden   rewrite the golden from this run instead of diffing
+#
+# Set TILEFINCH_PPSSPP_CPU_MHZ to a positive emulated PSP clock for a
+# deterministic pressure run, or leave it unset/0 for PPSSPP's normal clock.
+# PPSSPP 1.20 renamed the canonical setting to [CPU] CPUSpeed; the older
+# LockedCPUSpeed spelling is silently ignored.
 #
 # Exits 0 only when the EBOOT prints `tilefinch-input-script: outcome=`, the
 # extracted trace matches the golden, and the run reaches
@@ -50,6 +60,10 @@ runs=1
 debug_log=0
 update_golden=0
 start_url=
+offline_library=
+heap_mb=
+script_file_kb=
+ppsspp_cpu_mhz=${TILEFINCH_PPSSPP_CPU_MHZ:-${TREADLINE_CPU_MHZ:-0}}
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -59,6 +73,12 @@ while [ "$#" -gt 0 ]; do
         --script=*) scenario=${1#--script=}; shift ;;
         --url) start_url=$2; shift 2 ;;
         --url=*) start_url=${1#--url=}; shift ;;
+        --offline-library) offline_library=$2; shift 2 ;;
+        --offline-library=*) offline_library=${1#--offline-library=}; shift ;;
+        --heap-mb) heap_mb=$2; shift 2 ;;
+        --heap-mb=*) heap_mb=${1#--heap-mb=}; shift ;;
+        --script-file-kb) script_file_kb=$2; shift 2 ;;
+        --script-file-kb=*) script_file_kb=${1#--script-file-kb=}; shift ;;
         --timeout) timeout_seconds=$2; shift 2 ;;
         --timeout=*) timeout_seconds=${1#--timeout=}; shift ;;
         --runs) runs=$2; shift 2 ;;
@@ -73,12 +93,35 @@ done
 case "$runs:$timeout_seconds" in
     *[!0-9:]*|0:*|*:0) printf 'runs and timeout must be positive integers\n' >&2; exit 2 ;;
 esac
+case "$ppsspp_cpu_mhz" in
+    ''|*[!0-9]*)
+        printf 'TILEFINCH_PPSSPP_CPU_MHZ must be a non-negative integer\n' >&2
+        exit 2 ;;
+esac
+case "$heap_mb:$script_file_kb" in
+    *[!0-9:]*|0:*|*:0)
+        printf 'heap and script-file overrides must be positive integers\n' >&2
+        exit 2 ;;
+esac
 
 if [ -n "$start_url" ]; then
     case "$start_url" in
-        https://*) ;;
-        *) printf 'scripted-input start URL must use HTTPS\n' >&2; exit 2 ;;
+        https://*|http://127.0.0.1:*|http://localhost:*) ;;
+        *) printf '%s\n' \
+            'scripted-input start URL must use HTTPS or loopback HTTP' >&2
+            exit 2 ;;
     esac
+fi
+if [ -n "$offline_library" ]; then
+    case "$offline_library" in
+        /*) ;;
+        *) offline_library="$root/$offline_library" ;;
+    esac
+    [ -f "$offline_library/library.bin" ] || {
+        printf 'offline library has no library.bin: %s\n' \
+            "$offline_library" >&2
+        exit 2
+    }
 fi
 
 case "$build_dir" in
@@ -124,8 +167,15 @@ fi
 ppsspp_launchservices=0
 ppsspp_bundle=
 ppsspp_bundle_source=
-ppsspp_direct_fallback=0
-if [ "$(uname -s)" = Darwin ] && [ "${PPSSPP_LAUNCHSERVICES:-1}" != 0 ]; then
+is_darwin=0
+[ "$(uname -s)" = Darwin ] && is_darwin=1
+if [ "$is_darwin" -eq 1 ] && [ "${PPSSPP_LAUNCHSERVICES:-1}" = 0 ]; then
+    printf '%s\n' \
+        "Direct PPSSPP launch is unsafe on macOS." \
+        "Remove PPSSPP_LAUNCHSERVICES=0 and allow LaunchServices instead." >&2
+    exit 2
+fi
+if [ "$is_darwin" -eq 1 ]; then
     ppsspp_real=$(realpath "$ppsspp" 2>/dev/null || printf '%s' "$ppsspp")
     case "$ppsspp_real" in
         *.app/Contents/MacOS/*)
@@ -154,8 +204,7 @@ session_dir=$(mktemp -d "${run_base%/}/tilefinch-ppsspp-script.XXXXXX")
 # Homebrew's bundle seal can be invalid (a relocated MoltenVK symlink, or a
 # resource-less signature). Repair a disposable copy for this session; never
 # mutate the installed emulator.
-if [ "$(uname -s)" = Darwin ] \
-    && [ "${PPSSPP_LAUNCHSERVICES:-1}" != 0 ] \
+if [ "$is_darwin" -eq 1 ] \
     && [ "$ppsspp_launchservices" -eq 0 ] \
     && [ -n "$ppsspp_bundle_source" ]; then
     fixed_bundle="$session_dir/PPSSPPSDL.app"
@@ -174,28 +223,30 @@ if [ "$(uname -s)" = Darwin ] \
         plutil -replace "$key" -string 1.20.4 \
             "$fixed_bundle/Contents/Info.plist" >/dev/null 2>&1 || true
     done
+    plutil -replace CFBundleIdentifier \
+        -string "org.tilefinch.ppsspp.input.$$" \
+        "$fixed_bundle/Contents/Info.plist" >/dev/null 2>&1 || true
     xattr -cr "$fixed_bundle"
     if codesign --force --deep --sign - "$fixed_bundle" >/dev/null 2>&1 \
         && codesign --verify --deep --strict "$fixed_bundle" \
             >/dev/null 2>&1; then
-        lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-        if "$lsregister" -f "$fixed_bundle" >/dev/null 2>&1; then
-            ppsspp_bundle=$fixed_bundle
-            ppsspp_launchservices=1
-        else
-            ppsspp_direct_fallback=1
-        fi
+        # `open -a /absolute/bundle` registers this unique disposable copy as
+        # part of launching it. Never turn a registration/preflight refusal
+        # into direct execution: Cocoa can abort in _RegisterApplication
+        # before PPSSPP reaches any PSP code.
+        ppsspp_bundle=$fixed_bundle
+        ppsspp_launchservices=1
     else
         printf '%s\n' \
             "PPSSPP's macOS app bundle is invalid and could not be repaired." >&2
         exit 2
     fi
 fi
-if [ "$(uname -s)" = Darwin ] \
-    && [ "${PPSSPP_LAUNCHSERVICES:-1}" != 0 ] \
-    && [ "$ppsspp_launchservices" -ne 1 ] \
-    && [ "$ppsspp_direct_fallback" -ne 1 ]; then
-    printf '%s\n' "No safe LaunchServices PPSSPP bundle is available." >&2
+if [ "$is_darwin" -eq 1 ] \
+    && [ "$ppsspp_launchservices" -ne 1 ]; then
+    printf '%s\n' \
+        "No safe LaunchServices PPSSPP bundle is available." \
+        "Reinstall PPSSPP rather than invoking PPSSPPSDL directly." >&2
     exit 2
 fi
 
@@ -274,6 +325,10 @@ run_once() {
         config_path="$app_dir/boot.cfg"
         validation_log="$app_dir/tilefinch-validation.txt"
     fi
+    if [ -n "$offline_library" ]; then
+        mkdir -p "$app_dir/offline"
+        cp -R "$offline_library/." "$app_dir/offline/"
+    fi
 
     {
         printf '%s\n' \
@@ -293,6 +348,9 @@ run_once() {
             "validation_media_stability_auto=0" \
             "validation_power_test_auto=0"
     } >"$config_path"
+    [ -z "$heap_mb" ] || printf 'heap_mb=%s\n' "$heap_mb" >>"$config_path"
+    [ -z "$script_file_kb" ] \
+        || printf 'file_kb=%s\n' "$script_file_kb" >>"$config_path"
 
     {
         printf '%s\n' \
@@ -300,6 +358,8 @@ run_once() {
             "FirstRun = False" \
             "Enable Logging = True" \
             "AutoRun = True" \
+            "[CPU]" \
+            "CPUSpeed = $ppsspp_cpu_mhz" \
             "[Network]" \
             "EnableWlan = True" \
             "InfrastructureAutoDNS = True" \
@@ -317,11 +377,11 @@ run_once() {
 
     printf 'PPSSPP scripted input: %s run %s/%s\n' \
         "$scenario" "$run_index" "$runs"
-    if [ "$ppsspp_launchservices" -eq 1 ]; then
+    if [ "$is_darwin" -eq 1 ]; then
         : >"$emulator_stdout"
         : >"$emulator_stderr"
         # shellcheck disable=SC2086
-        open -n -W \
+        open -g -n -W \
             --env "HOME=$home_dir" \
             --stdout "$emulator_stdout" \
             --stderr "$emulator_stderr" \
@@ -483,6 +543,32 @@ if [ "$scenario" = navigation-cancel-live ]; then
             >&2
         exit 1
     }
+fi
+
+# This scenario exists specifically to cover a Deploy delivered while the
+# installed game's scripts are still restoring. Reaching the end of the input
+# file only proves that the receiver stayed alive; it must not bless a page
+# left indefinitely on the shell's "Starting..." state.
+if [ "$scenario" = treadline-immediate-deploy ]; then
+    grep -Eq 'tilefinch-input-script-js: mark=deploy-(30|90|210) .*summary="TREADLINE-PLAYING" error=""' \
+        "$telemetry_log" || {
+        printf 'FAIL: immediate Deploy did not reach TREADLINE-PLAYING.\n' >&2
+        grep 'tilefinch-input-script-js: mark=deploy-' "$telemetry_log" \
+            >&2 || true
+        exit 1
+    }
+fi
+if [ "$scenario" = treadline-offline-controls ]; then
+    gamepad_line=$(grep 'tilefinch-input-gamepad:' "$telemetry_log" \
+        | tail -1 || true)
+    printf '%s\n' "$gamepad_line" | grep -Eq \
+        'connected-frames=[1-9][0-9]* button-frames=[1-9][0-9]* analog-frames=[1-9][0-9]* publications=[1-9][0-9]* connections=1 buttons=0x0000303F axis-x=-32767/32767 axis-y=-32767/32767' \
+        || {
+            printf '%s\n' \
+                'FAIL: offline Treadline inputs did not cross the captured Gamepad path.' \
+                "$gamepad_line" >&2
+            exit 1
+        }
 fi
 if [ "$scenario" = cursor-latency ]; then
     cursor_line=$(grep 'tilefinch-ui-cadence: phase=controlled-exit' \

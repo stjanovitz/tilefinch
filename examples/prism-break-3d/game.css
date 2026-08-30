@@ -43,8 +43,13 @@ html, body {
   font-size: 11px;
   font-weight: bold;
   letter-spacing: 1px;
-  text-shadow: 0 1px 2px #000;
   pointer-events: none;
+}
+
+#score {
+  width: 52px;
+  height: 14px;
+  flex: 0 0 52px;
 }
 
 #power {
@@ -55,7 +60,6 @@ html, body {
   color: #82ffdc;
   font-size: 10px;
   font-weight: bold;
-  text-shadow: 0 1px 2px #000;
   pointer-events: none;
 }
 

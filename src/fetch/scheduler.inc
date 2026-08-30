@@ -1457,6 +1457,9 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
         }
     }
     if (!item->success) {
+        if (item->writer.limit_exceeded) {
+            item->result.response_limit_exceeded = true;
+        }
         const char *error = item->result.error;
         if (item->hop->private_network.blocked) {
             error = "blocked private network target";

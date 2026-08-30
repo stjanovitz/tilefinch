@@ -125,6 +125,12 @@ typedef enum {
     RENDER_FRAME_WORK_READY = 1
 } RenderFrameWorkResult;
 
+typedef enum {
+    RENDER_CANVAS_FRAME_NOT_APPLICABLE = 0,
+    RENDER_CANVAS_FRAME_COMPLETE = 1,
+    RENDER_CANVAS_FRAME_FAILED = -1
+} RenderCanvasFrameResult;
+
 /*
  * One latest-wins foreground preparation job. It admits only the resident
  * tiles that the final frame compositor will preserve, so a 480x272 frame
@@ -148,6 +154,16 @@ typedef struct {
        before admitting another requestAnimationFrame mutation. */
     bool canvas_paint;
 } RenderFrameWork;
+
+#define TILEFINCH_CANVAS_OVERLAY_REGION_LIMIT 8u
+
+typedef struct {
+    int16_t left;
+    int16_t top;
+    uint16_t width;
+    uint16_t height;
+    uint32_t pixel_offset;
+} RenderCanvasOverlayRegion;
 
 typedef struct {
     Budget *budget;
@@ -257,6 +273,25 @@ typedef struct {
     uint64_t max_frame_job_slice_us;
     uint64_t max_frame_job_unit_us;
     bool canvas_paint_pending;
+    size_t canvas_fast_frames;
+    size_t canvas_fast_refusals;
+    uint64_t canvas_fast_us;
+    uint64_t canvas_fast_max_us;
+    uint64_t canvas_fast_raster_us;
+    uint64_t canvas_fast_overlay_us;
+    uint16_t *canvas_overlay_pixels;
+    uint8_t *canvas_overlay_alpha;
+    RenderCanvasOverlayRegion
+        canvas_overlay_regions[TILEFINCH_CANVAS_OVERLAY_REGION_LIMIT];
+    size_t canvas_overlay_region_count;
+    size_t canvas_overlay_pixel_count;
+    int canvas_overlay_scroll_y;
+    int canvas_overlay_viewport_width;
+    int canvas_overlay_viewport_height;
+    bool canvas_overlay_ready;
+    size_t canvas_overlay_builds;
+    size_t canvas_overlay_patches;
+    size_t canvas_overlay_patch_regions;
     size_t idle_jobs_scheduled;
     size_t idle_jobs_completed;
     size_t idle_jobs_cancelled;
@@ -304,6 +339,15 @@ void tile_cache_destroy(TileCache *cache);
 bool tile_cache_render_frame(TileCache *cache, int scroll_y,
                              int viewport_width, int viewport_height,
                              const char *output_path);
+/* An opaque, simply transformed canvas can replace its rectangle in the prior
+   page pixels directly and then replay later page overlays. More complex
+   canvas composition returns NOT_APPLICABLE and retains the ordinary tile
+   path unchanged. */
+RenderCanvasFrameResult tile_cache_render_canvas_frame_fast(
+    TileCache *cache, int scroll_y, int viewport_width, int viewport_height);
+bool tile_cache_canvas_frame_fast_eligible(
+    const TileCache *cache, int scroll_y,
+    int viewport_width, int viewport_height);
 RenderFrameWorkResult tile_cache_prepare_frame_bounded(
     TileCache *cache, int scroll_y, int viewport_width, int viewport_height,
     uint64_t budget_us, size_t maximum_units);
@@ -358,6 +402,10 @@ void tile_cache_invalidate_rect(TileCache *cache, int left, int top,
 /* Mirror paint fields from an unchanged source display list into its scaled
    visual clone, then invalidate the CSS-space damage rectangle. */
 bool tile_cache_sync_layout_paint(TileCache *cache, int left, int top,
+                                  int right, int bottom);
+/* Mutable canvas pixels do not change layout or overflow geometry. Preserve
+   those accelerators while invalidating tiles that retain the old pixels. */
+bool tile_cache_sync_canvas_paint(TileCache *cache, int left, int top,
                                   int right, int bottom);
 /* Drop decoded/scaled derivatives for one stable mutable image surface. */
 void tile_cache_invalidate_image_identity(TileCache *cache,

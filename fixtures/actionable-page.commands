@@ -1,0 +1,13 @@
+status
+focus-id noop
+activate
+status
+focus-id details-link
+activate
+status
+back
+status
+forward
+status
+node-text details-copy
+quit

@@ -69,6 +69,13 @@ PspNetworkTarget psp_network_request_target(
                                   PSP_NETWORK_TARGET_CAUSE_NAVIGATION,
                                   request->profile_index);
     }
+    if (table->requests[PSP_NETWORK_REQUEST_MULTIPLAYER].active) {
+        const PspNetworkRequest *request =
+            &table->requests[PSP_NETWORK_REQUEST_MULTIPLAYER];
+        return psp_network_target(PSP_NETWORK_TARGET_READY,
+                                  PSP_NETWORK_TARGET_CAUSE_MULTIPLAYER,
+                                  request->profile_index);
+    }
     if (table->requests[PSP_NETWORK_REQUEST_BOOT].active) {
         const PspNetworkRequest *request =
             &table->requests[PSP_NETWORK_REQUEST_BOOT];

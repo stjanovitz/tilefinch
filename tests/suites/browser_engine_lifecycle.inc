@@ -34,12 +34,14 @@ static int test_engine_lifecycle(void)
           && config.session_cache_limit == 512u * 1024u
           && config.tile_capacity == 8
           && config.javascript.heap_limit == 4u * MIB
-          && config.javascript.maximum_total_bytes == 1u * MIB);
+          && config.javascript.maximum_total_bytes == 1u * MIB
+          && config.javascript.maximum_file_bytes == 256u * 1024u);
     browser_config_init(&config, &profile);
     CHECK(browser_config_apply_psp_memory_profile(
               &config, BROWSER_PSP_MEMORY_REALISTIC)
           && config.javascript.heap_limit == 5u * MIB
-          && config.javascript.maximum_total_bytes == 2u * MIB);
+          && config.javascript.maximum_total_bytes == 2u * MIB
+          && config.javascript.maximum_file_bytes == 384u * 1024u);
     config.memory_limit = 16u * MIB;
     config.session_cache_limit = 512u * 1024u;
     config.maximum_document_bytes = 2u * MIB;
@@ -388,7 +390,7 @@ static int test_engine_lifecycle(void)
     ControllerTextInputInfo text_info = {0};
     bool runtime_layout_changed = true;
     CHECK(browser_engine_activate(engine, &input_action)
-          && input_action.type == CONTROLLER_ACTION_NAVIGATE
+          && input_action.type == CONTROLLER_ACTION_CONTROL
           && browser_engine_focus_move(engine, true)
           && browser_engine_replace_text(engine, "abc", 3)
           && browser_engine_text_value(
@@ -1203,6 +1205,922 @@ static int test_deferred_image_relayout_requests_repaint(void)
           && strcmp(focus_action.url,
                     "https://deferred-images.test/first") == 0);
     fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static lxb_dom_node_t *actionable_find_id(PocDocument *document,
+                                          const char *identifier)
+{
+    if (document == NULL || document->html == NULL || identifier == NULL)
+        return NULL;
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    lxb_dom_node_t *node = root;
+    size_t identifier_length = strlen(identifier);
+    size_t visited = 0;
+    while (node != NULL && visited++ < 65536u) {
+        size_t length = 0;
+        const char *value = document_attribute(node, "id", &length);
+        if (value != NULL && length == identifier_length
+            && memcmp(value, identifier, length) == 0) return node;
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != NULL && node != root && node->next == NULL)
+            node = node->parent;
+        node = node == NULL || node == root ? NULL : node->next;
+    }
+    return NULL;
+}
+
+static bool actionable_has_attribute(lxb_dom_node_t *node,
+                                      const char *name)
+{
+    size_t ignored = 0;
+    return document_attribute(node, name, &ignored) != NULL;
+}
+
+static int test_same_document_and_script_free_defaults(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.runtime_timeout_ms = 20u;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+
+    static const char fragment_page[] =
+        "<!doctype html><title>Fragments</title>"
+        "<base id=base href='/page'><style>"
+        "body{margin:0}a,input{display:block;height:24px}.space{height:700px}"
+        "#target{display:block;height:0}</style>"
+        "<body data-tilefinch-reader-kind=article>"
+        "<a id=jump href='#target'>Jump</a>"
+        "<a id=named-jump href='#legacy'>Named</a>"
+        "<a id=failed-link href='#other' "
+        "onclick='event.preventDefault();while(true){}'>Failed link</a>"
+        "<form action=/submitted "
+        "onsubmit='event.preventDefault();while(true){}'>"
+        "<button id=failed-submit>Submit</button></form>"
+        "<a id=void href='javascript:void(0)' "
+        "onclick=\"document.body.setAttribute('data-void','yes')\">Void</a>"
+        "<a id=cancel href='#other' onclick=\"event.preventDefault()\">Cancel</a>"
+        "<a id=same href='https://actions.test/page#target'>Same</a>"
+        "<input id=partial type=checkbox "
+        "onclick=\"event.preventDefault();while(true){}\">"
+        "<input id=getter-partial type=checkbox>"
+        "<form id=getter-form action=/getter-submitted>"
+        "<button id=getter-submit>Getter submit</button></form>"
+        "<form id=realm-form><input id=realm-check type=checkbox checked>"
+        "<button id=realm-reset type=reset>Reset realm control</button></form>"
+        "<div class=space></div><a id=target></a>"
+        "<a name=legacy style='display:none'></a>"
+        "<div class=space></div>"
+        "<div class=space></div><div id=other>Other</div>"
+        "<a id=base-jump href='#base-target'>Change base</a>"
+        "<a id=base-relative href='next'>Relative after hash</a>"
+        "<div id=base-target>Base target</div>"
+        "<script>globalThis.hashCount=0;globalThis.popCount=0;"
+        "addEventListener('hashchange',()=>{hashCount++;"
+        "if(location.hash==='#base-target')"
+        "document.getElementById('base').setAttribute('href','/mutated/');});"
+        "addEventListener('popstate',()=>popCount++);"
+        "const getterInput=document.getElementById('getter-partial');"
+        "getterInput.addEventListener('tilefinch-keepalive',()=>{});"
+        "const getterDisabled=Object.getOwnPropertyDescriptor("
+        "getterInput,'disabled');"
+        "Object.defineProperty(getterInput,'disabled',{...getterDisabled,"
+        "get(){if(this.id==='getter-partial'){document.body.setAttribute("
+        "'data-getter-ran','yes');while(true){}}"
+        "return getterDisabled.get.call(this);}});"
+        "const getterForm=document.getElementById('getter-form');"
+        "getterForm.addEventListener('tilefinch-keepalive',()=>{});"
+        "getterForm.checkValidity=function(){"
+        "this.setAttribute('data-check-ran','yes');"
+        "throw new Error('hostile checkValidity');};</script>"
+        "<main id=native-reader data-tilefinch-reader-root=article>"
+        "<a name=tilefinch-extracted-legacy>Legacy anchor</a></main>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://actions.test/page", fragment_page,
+        sizeof(fragment_page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    PocDocument *document = &navigation->page.document;
+    lxb_dom_node_t *jump = actionable_find_id(document, "jump");
+    lxb_dom_node_t *named_jump = actionable_find_id(document, "named-jump");
+    lxb_dom_node_t *failed_link = actionable_find_id(document, "failed-link");
+    lxb_dom_node_t *failed_submit = actionable_find_id(
+        document, "failed-submit");
+    lxb_dom_node_t *target = actionable_find_id(document, "target");
+    lxb_dom_node_t *void_link = actionable_find_id(document, "void");
+    lxb_dom_node_t *cancel = actionable_find_id(document, "cancel");
+    lxb_dom_node_t *same = actionable_find_id(document, "same");
+    lxb_dom_node_t *partial = actionable_find_id(document, "partial");
+    lxb_dom_node_t *getter_partial = actionable_find_id(
+        document, "getter-partial");
+    lxb_dom_node_t *getter_form = actionable_find_id(document, "getter-form");
+    lxb_dom_node_t *getter_submit = actionable_find_id(
+        document, "getter-submit");
+    lxb_dom_node_t *base_jump = actionable_find_id(document, "base-jump");
+    lxb_dom_node_t *base_relative = actionable_find_id(
+        document, "base-relative");
+    lxb_dom_node_t *realm_check = actionable_find_id(document, "realm-check");
+    lxb_dom_node_t *realm_reset = actionable_find_id(document, "realm-reset");
+    lxb_dom_node_t *reader_root = actionable_find_id(
+        document, "native-reader");
+    /* This lifecycle fixture predates the extractor tests and constructs its
+       tiny presentation root inline. Explicitly retain that exact node as the
+       native provenance seam; an unretained authored look-alike is covered by
+       the separate Basic/Reader spoof regression. */
+    navigation->page.reader_root = reader_root;
+    navigation->page.reader_root_kind = READER_PAGE_ARTICLE;
+    navigation->page.reader_root_handle =
+        script_runtime_node_weak_handle(
+            navigation->page.runtime, reader_root);
+    const LayoutNodeBox *target_box = layout_box_for_node(
+        &navigation->page.layout, target);
+    CHECK(jump != NULL && named_jump != NULL && failed_link != NULL
+          && failed_submit != NULL && getter_partial != NULL
+          && getter_form != NULL && getter_submit != NULL
+          && base_jump != NULL && base_relative != NULL && realm_check != NULL
+          && realm_reset != NULL
+          && reader_root != NULL
+          && navigation->page.reader_root_handle != 0
+          && target_box != NULL && target_box->height == 0
+          && target_box->y > profile.framebuffer_height);
+    size_t loads_before = navigation->loads_started;
+    uint64_t generation_before = navigation->generation;
+    ControllerAction action = {0};
+    CHECK(browser_engine_focus_node(engine, jump)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_CONTROL
+          && action.activation_outcome == CONTROLLER_ACTIVATION_DELIVERED
+          && navigation->history_count == 2u
+          && strcmp(navigation_current(navigation)->url,
+                    "https://actions.test/page#target") == 0
+          && navigation_current(navigation)->scroll_y > 0
+          && navigation->loads_started == loads_before
+          && navigation->generation == generation_before
+          && !browser_engine_navigation_pending(engine));
+    int target_scroll = navigation_current(navigation)->scroll_y;
+
+    /* An exact self URL remains an ordinary reload candidate. It must not be
+       mistaken for a fragment transition merely because request keys match. */
+    CHECK(same != NULL && browser_engine_focus_node(engine, same)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_NAVIGATE
+          && strcmp(action.url, "https://actions.test/page#target") == 0
+          && navigation->history_count == 2u
+          && navigation->loads_started == loads_before
+          && navigation_set_scroll(navigation, target_scroll));
+    CHECK(!navigation_url_is_same_document(
+        navigation, "HTTPS://ACTIONS.TEST:443/a/../page#target"));
+
+    /* History restoration is immediate and request-free in both the
+       cooperative begin API and the synchronous chrome API. */
+    bool history_back = browser_engine_begin_navigation_history(
+        engine, false, 1024u, 1000);
+    CHECK(history_back
+          && browser_engine_navigation_status(engine)
+                 == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && strcmp(navigation_current(navigation)->url,
+                    "https://actions.test/page") == 0
+          && navigation_current(navigation)->scroll_y == 0
+          && navigation->loads_started == loads_before);
+    bool history_forward = browser_engine_history_move(engine, true);
+    if (!history_forward
+        || strcmp(navigation_current(navigation)->url,
+                  "https://actions.test/page#target") != 0
+        || navigation_current(navigation)->scroll_y != target_scroll
+        || navigation->loads_started != loads_before) {
+        fprintf(stderr,
+                "same-document forward=%d url=%s scroll=%d/%d loads=%zu/%zu "
+                "error=%s\n", history_forward,
+                navigation_current(navigation)->url,
+                navigation_current(navigation)->scroll_y, target_scroll,
+                navigation->loads_started, loads_before,
+                browser_engine_last_error(engine));
+    }
+    CHECK(history_forward
+          && strcmp(navigation_current(navigation)->url,
+                    "https://actions.test/page#target") == 0
+          && navigation_current(navigation)->scroll_y == target_scroll
+          && navigation->loads_started == loads_before);
+
+    CHECK(void_link != NULL && browser_engine_focus_node(engine, void_link)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_CONTROL
+          && action.activation_outcome == CONTROLLER_ACTIVATION_DELIVERED
+          && actionable_has_attribute(
+                 document_body_node(document), "data-void")
+          && navigation->history_count == 2u
+          && navigation->loads_started == loads_before);
+    CHECK(cancel != NULL && browser_engine_focus_node(engine, cancel)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_NONE
+          && action.activation_outcome == CONTROLLER_ACTIVATION_CANCELLED
+          && strcmp(navigation_current(navigation)->url,
+                    "https://actions.test/page#target") == 0
+          && navigation->history_count == 2u
+          && navigation->loads_started == loads_before);
+    bool events_probed = script_runtime_evaluate_diagnostic(
+        navigation->page.runtime,
+        "globalThis.pocSummary=hashCount+':'+popCount+':'"
+        "+location.hash+':'+history.length",
+        "<fragment-events>", &navigation->page.script_result);
+    if (!events_probed
+        || strcmp(navigation->page.script_result.summary,
+                  "3:2:#target:2") != 0) {
+        fprintf(stderr, "fragment events probe=%d summary=%s error=%s\n",
+                events_probed, navigation->page.script_result.summary,
+                navigation->page.script_result.error);
+    }
+    CHECK(events_probed
+          && strcmp(navigation->page.script_result.summary,
+                    "3:2:#target:2") == 0);
+    /* Extracted trees prefix both id and legacy name targets, never the
+       authored fragment exposed in location/history. The hidden raw anchor
+       must not win, and committing the named target remains request-free. */
+    CHECK(browser_engine_focus_node(engine, named_jump)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_CONTROL
+          && strcmp(navigation_current(navigation)->url,
+                    "https://actions.test/page#legacy") == 0
+          && navigation_current(navigation)->scroll_y > target_scroll
+          && navigation->loads_started == loads_before
+          && navigation->generation == generation_before);
+
+    /* Relative action resolution must observe a <base> mutation made by the
+       just-dispatched hashchange listener. Run this while the realm is still
+       healthy, before the deliberate watchdog failures below. */
+    bool base_jump_focused = browser_engine_focus_node(engine, base_jump);
+    bool base_jump_activated = base_jump_focused
+        && browser_engine_activate(engine, &action);
+    bool base_mutated = strcmp(navigation->page.resource_base_url,
+                               "https://actions.test/mutated/") == 0;
+    bool base_relative_focused = base_jump_activated
+        && browser_engine_focus_node(engine, base_relative);
+    bool base_relative_activated = base_relative_focused
+        && browser_engine_activate(engine, &action);
+    if (!base_jump_focused || !base_jump_activated
+        || action.type != CONTROLLER_ACTION_NAVIGATE || !base_mutated
+        || !base_relative_focused || !base_relative_activated
+        || strcmp(action.url, "https://actions.test/mutated/next") != 0) {
+        fprintf(stderr,
+                "base activation jump-focus=%d jump-activate=%d mutated=%d "
+                "relative-focus=%d relative-activate=%d type=%d url=%s "
+                "current=%s base=%s outcome=%d error=%s\n",
+                base_jump_focused, base_jump_activated, base_mutated,
+                base_relative_focused, base_relative_activated,
+                (int) action.type, action.url,
+                navigation_current(navigation)->url,
+                navigation->page.resource_base_url,
+                (int) action.activation_outcome,
+                navigation->page.script_result.error);
+    }
+    CHECK(base_jump_focused && base_jump_activated && base_mutated
+          && base_relative_focused && base_relative_activated
+          && action.type == CONTROLLER_ACTION_NAVIGATE
+          && strcmp(action.url,
+                    "https://actions.test/mutated/next") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+              navigation->page.runtime,
+              "globalThis.pocSummary=document.baseURI",
+              "<post-hash-base>", &navigation->page.script_result)
+          && strcmp(navigation->page.script_result.summary,
+                    navigation->page.resource_base_url) == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+              navigation->page.runtime,
+              "document.getElementById('base').setAttribute('href',"
+              "'/before-restore/');globalThis.pocSummary=document.baseURI",
+              "<pre-history-base>", &navigation->page.script_result)
+          && browser_engine_history_move(engine, false)
+          && strcmp(navigation->page.resource_base_url,
+                    "https://actions.test/before-restore/") == 0
+          && browser_engine_history_move(engine, true)
+          && strcmp(navigation->page.resource_base_url,
+                    "https://actions.test/mutated/") == 0);
+
+    /* Entering the trusted dispatcher is an authoritative native fact. A
+       hostile property getter/checkValidity callback can run before the JS
+       event and handler counters advance; neither path may be mistaken for
+       a pre-dispatch refusal and replay its native default. Run these before
+       the deliberate watchdog failures below so each hostile boundary is
+       independently attributed. */
+    CHECK(browser_engine_focus_node(engine, getter_submit));
+    size_t dispatches_before =
+        navigation->page.script_result.event_dispatches_entered;
+    size_t events_before = navigation->page.script_result.events_dispatched;
+    bool check_activated = browser_engine_activate(engine, &action);
+    if (!check_activated || action.type != CONTROLLER_ACTION_NONE
+        || action.activation_outcome != CONTROLLER_ACTIVATION_RUNTIME_FAILED
+        || action.url[0] != '\0'
+        || navigation->page.script_result.event_dispatches_entered
+               != dispatches_before + 2u
+        || !navigation->page.script_result.event_dispatch_entered
+        || navigation->page.script_result.events_dispatched <= events_before
+        || !actionable_has_attribute(getter_form, "data-check-ran")) {
+        fprintf(stderr,
+                "checkValidity activation=%d type=%d outcome=%d url=%s "
+                "entered=%zu/%zu event-entered=%d events=%zu/%zu ran=%d "
+                "error=%s\n",
+                check_activated, (int) action.type,
+                (int) action.activation_outcome, action.url,
+                navigation->page.script_result.event_dispatches_entered,
+                dispatches_before,
+                navigation->page.script_result.event_dispatch_entered,
+                navigation->page.script_result.events_dispatched,
+                events_before,
+                actionable_has_attribute(getter_form, "data-check-ran"),
+                navigation->page.script_result.error);
+    }
+    CHECK(check_activated
+          && action.type == CONTROLLER_ACTION_NONE
+          && action.activation_outcome
+                 == CONTROLLER_ACTIVATION_RUNTIME_FAILED
+          && action.url[0] == '\0'
+          && navigation->page.script_result.event_dispatches_entered
+                 == dispatches_before + 2u
+          && navigation->page.script_result.event_dispatch_entered
+          && navigation->page.script_result.events_dispatched > events_before
+          && actionable_has_attribute(getter_form, "data-check-ran"));
+
+    CHECK(browser_engine_focus_node(engine, getter_partial));
+    dispatches_before =
+        navigation->page.script_result.event_dispatches_entered;
+    events_before = navigation->page.script_result.events_dispatched;
+    bool getter_activated = browser_engine_activate(engine, &action);
+    if (!getter_activated || action.type != CONTROLLER_ACTION_NONE
+        || action.activation_outcome != CONTROLLER_ACTIVATION_RUNTIME_FAILED
+        || navigation->page.script_result.event_dispatches_entered
+               != dispatches_before + 1u
+        || !navigation->page.script_result.event_dispatch_entered
+        || navigation->page.script_result.events_dispatched != events_before
+        || !actionable_has_attribute(
+               document_body_node(document), "data-getter-ran")
+        || actionable_has_attribute(getter_partial, "checked")) {
+        fprintf(stderr,
+                "getter activation activate=%d type=%d outcome=%d "
+                "entered=%zu/%zu events=%zu/%zu ran=%d checked=%d error=%s\n",
+                getter_activated, (int) action.type,
+                (int) action.activation_outcome,
+                navigation->page.script_result.event_dispatches_entered,
+                dispatches_before,
+                navigation->page.script_result.events_dispatched,
+                events_before,
+                actionable_has_attribute(
+                    document_body_node(document), "data-getter-ran"),
+                actionable_has_attribute(getter_partial, "checked"),
+                navigation->page.script_result.error);
+    }
+    CHECK(getter_activated && action.type == CONTROLLER_ACTION_NONE
+          && action.activation_outcome
+                 == CONTROLLER_ACTIVATION_RUNTIME_FAILED
+          && navigation->page.script_result.event_dispatches_entered
+                 == dispatches_before + 1u
+          && navigation->page.script_result.event_dispatch_entered
+          && navigation->page.script_result.events_dispatched == events_before
+          && actionable_has_attribute(
+                 document_body_node(document), "data-getter-ran")
+          && !actionable_has_attribute(getter_partial, "checked"));
+
+    CHECK(browser_engine_focus_node(engine, failed_link)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_NONE
+          && action.activation_outcome
+                 == CONTROLLER_ACTIVATION_RUNTIME_FAILED
+          && strcmp(navigation_current(navigation)->url,
+                    "https://actions.test/page#base-target") == 0
+          && navigation->loads_started == loads_before);
+    CHECK(browser_engine_focus_node(engine, failed_submit)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_NONE
+          && action.activation_outcome
+                 == CONTROLLER_ACTIVATION_RUNTIME_FAILED
+          && action.url[0] == '\0'
+          && navigation->loads_started == loads_before);
+    /* A failure after click delivery is not permission to replay a native
+       default. The bootstrap already toggled this checkbox once; a second
+       fallback toggle would silently undo it. */
+    bool partial_focused = partial != NULL
+        && browser_engine_focus_node(engine, partial);
+    bool partial_activated = partial_focused
+        && browser_engine_activate(engine, &action);
+    if (!partial_activated || action.type != CONTROLLER_ACTION_NONE
+        || action.activation_outcome != CONTROLLER_ACTIVATION_RUNTIME_FAILED
+        || actionable_has_attribute(partial, "checked")) {
+        fprintf(stderr,
+                "partial activation focus=%d activate=%d type=%d outcome=%d "
+                "checked=%d result=%d events=%zu error=%s\n",
+                partial_focused, partial_activated, (int) action.type,
+                (int) action.activation_outcome,
+                actionable_has_attribute(partial, "checked"),
+                navigation->page.script_result.success,
+                navigation->page.script_result.events_dispatched,
+                navigation->page.script_result.error);
+    }
+    CHECK(partial_activated
+          && action.type == CONTROLLER_ACTION_NONE
+          && action.activation_outcome
+                 == CONTROLLER_ACTIVATION_RUNTIME_FAILED
+          && !actionable_has_attribute(partial, "checked"));
+
+    /* Native history/bridge publication is authoritative even when the URL
+       strings for the advisory JS callback cannot be allocated. The next
+       Location property read must lazily reconcile every component rather
+       than exposing the old href/hash split. */
+    char previous_runtime_url[NAVIGATION_URL_LIMIT];
+    CHECK(script_runtime_copy_document_url(
+        navigation->page.runtime, previous_runtime_url,
+        sizeof(previous_runtime_url)));
+    static const char oom_url[] =
+        "https://actions.test/reconciled/path?oom=1#current";
+    budget_inject_failure_after(navigation->budget, 0u);
+    bool callback_committed = script_runtime_commit_same_document(
+        navigation->page.runtime, oom_url, previous_runtime_url,
+        &navigation->page.script_result);
+    budget_clear_failure_injection(navigation->budget);
+    CHECK(!callback_committed
+          && script_runtime_evaluate_diagnostic(
+                 navigation->page.runtime,
+                 "globalThis.pocSummary=[location.href,location.protocol,"
+                 "location.host,location.pathname,location.search,"
+                 "location.hash].join('|')",
+                 "<same-document-location-reconcile>",
+                 &navigation->page.script_result)
+          && strcmp(navigation->page.script_result.summary,
+                    "https://actions.test/reconciled/path?oom=1#current|"
+                    "https:|actions.test|/reconciled/path|?oom=1|#current")
+                 == 0
+          && script_runtime_commit_same_document(
+                 navigation->page.runtime, previous_runtime_url, oom_url,
+                 &navigation->page.script_result));
+
+    /* A parser-circuit teardown can retire the author realm while retaining
+       its already-mutated DOM. Latch the authored checked state natively at
+       the mutation boundary so a later script-free Reset does not mistake
+       the live mutation for the default. */
+    CHECK(script_runtime_evaluate_diagnostic(
+              navigation->page.runtime,
+              "document.getElementById('realm-check').checked=false;"
+              "globalThis.pocSummary='realm-mutated'",
+              "<checked-default-before-realm-teardown>",
+              &navigation->page.script_result)
+          && !actionable_has_attribute(realm_check, "checked")
+          && browser_engine_set_javascript_enabled(engine, false)
+          && navigation->page.runtime == NULL
+          && browser_engine_focus_node(engine, realm_reset)
+          && browser_engine_activate(engine, &action)
+          && action.activation_outcome
+                 == CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE
+          && actionable_has_attribute(realm_check, "checked"));
+
+    /* With no author realm, the controller supplies the bounded HTML
+       defaults itself. These actions remain useful on script-free/fallback
+       pages rather than becoming inert controls. */
+    static const char controls_page[] =
+        "<!doctype html><title>Controls</title><style>"
+        "label,input,select,button,summary{display:block;height:24px}</style>"
+        "<body><form id=form action=/find>"
+        "<input id=check type=checkbox name=check>"
+        "<input id=fault-check type=checkbox>"
+        "<input id=old-radio type=radio name=pick checked>"
+        "<label id=radio-label for=radio>Pick new</label>"
+        "<input id=radio type=radio name=pick value=new>"
+        "<input id=range type=range min=0 max=4 step=2 value=0>"
+        "<input id=range-default type=range>"
+        "<select id=select name=choice><option selected value=a>A</option>"
+        "<option id=second value=b>B</option></select>"
+        "<select id=select-default><option id=default-first>First</option>"
+        "<option id=default-second>Second</option></select>"
+        "<input id=query name=q value=psp>"
+        "<textarea id=notes name=notes>authored</textarea>"
+        "<button id=submit>Go</button>"
+        "<button id=reset type=reset>Reset</button></form>"
+        "<input id=orphan-fault type=checkbox>"
+        "<input id=orphan-range type=range value=0 min=0 max=4 step=2>"
+        "<details id=details><summary id=summary>More</summary>Text</details>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://actions.test/controls", controls_page,
+        sizeof(controls_page) - 1u, true));
+    navigation = browser_engine_navigation(engine);
+    document = &navigation->page.document;
+    CHECK(navigation->page.runtime == NULL);
+    lxb_dom_node_t *check = actionable_find_id(document, "check");
+    lxb_dom_node_t *old_radio = actionable_find_id(document, "old-radio");
+    lxb_dom_node_t *fault_check = actionable_find_id(document, "fault-check");
+    lxb_dom_node_t *orphan_fault = actionable_find_id(
+        document, "orphan-fault");
+    lxb_dom_node_t *orphan_range = actionable_find_id(
+        document, "orphan-range");
+    lxb_dom_node_t *radio_label = actionable_find_id(document, "radio-label");
+    lxb_dom_node_t *radio = actionable_find_id(document, "radio");
+    lxb_dom_node_t *range = actionable_find_id(document, "range");
+    lxb_dom_node_t *range_default = actionable_find_id(
+        document, "range-default");
+    lxb_dom_node_t *select = actionable_find_id(document, "select");
+    lxb_dom_node_t *second = actionable_find_id(document, "second");
+    lxb_dom_node_t *select_default = actionable_find_id(
+        document, "select-default");
+    lxb_dom_node_t *default_second = actionable_find_id(
+        document, "default-second");
+    lxb_dom_node_t *query = actionable_find_id(document, "query");
+    lxb_dom_node_t *notes = actionable_find_id(document, "notes");
+    lxb_dom_node_t *reset = actionable_find_id(document, "reset");
+    lxb_dom_node_t *summary = actionable_find_id(document, "summary");
+    lxb_dom_node_t *details = actionable_find_id(document, "details");
+    lxb_dom_node_t *submit = actionable_find_id(document, "submit");
+    lxb_dom_node_t *form = actionable_find_id(document, "form");
+    CHECK(check != NULL && fault_check != NULL && orphan_fault != NULL
+          && orphan_range != NULL && old_radio != NULL
+          && radio_label != NULL
+          && radio != NULL && range != NULL && range_default != NULL
+          && select != NULL && second != NULL && select_default != NULL
+          && default_second != NULL && reset != NULL && summary != NULL
+          && details != NULL && submit != NULL && form != NULL
+          && query != NULL && notes != NULL);
+    CHECK(browser_engine_focus_node(engine, check)
+          && browser_engine_activate(engine, &action)
+          && action.activation_outcome
+                 == CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE
+          && actionable_has_attribute(check, "checked")
+          && browser_engine_focus_node(engine, radio_label)
+          && browser_engine_activate(engine, &action)
+          && actionable_has_attribute(radio, "checked")
+          && !actionable_has_attribute(old_radio, "checked")
+          && browser_engine_focus_node(engine, summary)
+          && browser_engine_activate(engine, &action)
+          && actionable_has_attribute(details, "open")
+          && browser_engine_focus_node(engine, select)
+          && browser_engine_activate(engine, &action)
+          && actionable_has_attribute(second,
+                                      "data-tilefinch-option-selected")
+          && browser_engine_focus_node(engine, select_default)
+          && browser_engine_activate(engine, &action)
+          && actionable_has_attribute(
+                 default_second, "data-tilefinch-option-selected")
+          && browser_engine_focus_node(engine, range)
+          && browser_engine_activate(engine, &action));
+    size_t value_length = 0;
+    const char *value = document_control_value(range, &value_length);
+    CHECK(value != NULL && value_length == 1u && value[0] == '2');
+    CHECK(browser_engine_focus_node(engine, range_default)
+          && browser_engine_activate(engine, &action));
+    value = document_control_value(range_default, &value_length);
+    CHECK(value != NULL && value_length == 2u
+          && memcmp(value, "51", 2u) == 0);
+    /* Native default mutation plus refresh/relayout is transactional under
+       bounded page-allocation failures. Prime the retained default, then
+       sweep enough allocation boundaries to exercise both admission and
+       relayout rollback without leaving the checkbox half-toggled. */
+    CHECK(browser_engine_focus_node(engine, fault_check)
+          && browser_engine_activate(engine, &action)
+          && browser_engine_activate(engine, &action)
+          && !actionable_has_attribute(fault_check, "checked"));
+    CHECK(browser_engine_focus_node(engine, fault_check));
+    bool fault_checked_before = actionable_has_attribute(
+        fault_check, "checked");
+    size_t fault_owned_before = navigation->budget->current;
+    size_t fault_states_before = document->control_state_count;
+    budget_inject_failure_after(navigation->budget, 1u);
+    bool fault_accepted = controller_activate(
+        browser_engine_controller(engine), &action);
+    budget_clear_failure_injection(navigation->budget);
+    CHECK(!fault_accepted
+          && actionable_has_attribute(fault_check, "checked")
+                 == fault_checked_before
+          && navigation->budget->current == fault_owned_before
+          && document->control_state_count == fault_states_before);
+    CHECK(browser_engine_focus_node(engine, orphan_fault));
+    fault_owned_before = navigation->budget->current;
+    fault_states_before = document->control_state_count;
+    budget_inject_failure_after(navigation->budget, 1u);
+    CHECK(!browser_engine_activate(engine, &action));
+    budget_clear_failure_injection(navigation->budget);
+    CHECK(!actionable_has_attribute(orphan_fault, "checked")
+          && navigation->budget->current == fault_owned_before
+          && document->control_state_count == fault_states_before);
+    size_t range_owned_before = 0;
+    size_t range_states_before = 0;
+    CHECK(browser_engine_focus_node(engine, orphan_range));
+    range_owned_before = navigation->budget->current;
+    range_states_before = document->control_state_count;
+    budget_inject_failure_after(navigation->budget, 3u);
+    CHECK(!browser_engine_activate(engine, &action));
+    budget_clear_failure_injection(navigation->budget);
+    value = document_control_value(orphan_range, &value_length);
+    CHECK(value == NULL
+          && navigation->budget->current == range_owned_before
+          && document->control_state_count == range_states_before);
+    CHECK(browser_engine_focus_node(engine, range));
+    range_owned_before = navigation->budget->current;
+    range_states_before = document->control_state_count;
+    budget_inject_failure_after(navigation->budget, 1u);
+    CHECK(!browser_engine_activate(engine, &action));
+    budget_clear_failure_injection(navigation->budget);
+    value = document_control_value(range, &value_length);
+    CHECK(value != NULL && value_length == 1u && value[0] == '2'
+          && navigation->budget->current == range_owned_before
+          && document->control_state_count == range_states_before);
+    CHECK(browser_engine_focus_node(engine, query));
+    size_t edit_owned_before = navigation->budget->current;
+    budget_inject_failure_after(navigation->budget, 0u);
+    CHECK(!browser_engine_replace_text(
+        engine, "not-applied", sizeof("not-applied") - 1u));
+    budget_clear_failure_injection(navigation->budget);
+    value = document_control_value(query, &value_length);
+    CHECK(value == NULL
+          && navigation->budget->current == edit_owned_before);
+    CHECK(browser_engine_replace_text(
+              engine, "edited", sizeof("edited") - 1u)
+          && browser_engine_focus_node(engine, notes)
+          && browser_engine_replace_text(
+              engine, "changed", sizeof("changed") - 1u));
+    /* A failed edit after the larger live-value allocation has landed must
+       restore both the prior bytes and the exact Budget charge. Keeping a
+       513-byte allocation for the six-byte value would make repeated failed
+       edits consume page budget even though no visible edit committed. */
+    CHECK(browser_engine_focus_node(engine, query));
+    edit_owned_before = navigation->budget->current;
+    char oversized_edit[DOCUMENT_CONTROL_VALUE_LIMIT];
+    memset(oversized_edit, 'x', sizeof(oversized_edit));
+    budget_inject_failure_after(navigation->budget, 1u);
+    CHECK(!browser_engine_replace_text(
+        engine, oversized_edit, sizeof(oversized_edit)));
+    budget_clear_failure_injection(navigation->budget);
+    value = document_control_value(query, &value_length);
+    CHECK(value != NULL && value_length == sizeof("edited") - 1u
+          && memcmp(value, "edited", value_length) == 0
+          && navigation->budget->current == edit_owned_before);
+    CHECK(browser_engine_focus_node(engine, reset));
+    size_t reset_owned_before = navigation->budget->current;
+    size_t reset_states_before = document->control_state_count;
+    budget_inject_failure_after(navigation->budget, 5u);
+    CHECK(!browser_engine_activate(engine, &action));
+    budget_clear_failure_injection(navigation->budget);
+    value = document_control_value(query, &value_length);
+    CHECK(actionable_has_attribute(check, "checked")
+          && actionable_has_attribute(radio, "checked")
+          && !actionable_has_attribute(old_radio, "checked")
+          && actionable_has_attribute(
+                 second, "data-tilefinch-option-selected")
+          && value != NULL && value_length == sizeof("edited") - 1u
+          && memcmp(value, "edited", value_length) == 0);
+    value = document_control_value(notes, &value_length);
+    CHECK(value != NULL && value_length == sizeof("changed") - 1u
+          && memcmp(value, "changed", value_length) == 0
+          && navigation->budget->current == reset_owned_before
+          && document->control_state_count == reset_states_before);
+    CHECK(browser_engine_activate(engine, &action)
+          && !actionable_has_attribute(check, "checked")
+          && actionable_has_attribute(old_radio, "checked")
+          && !actionable_has_attribute(radio, "checked")
+          && !actionable_has_attribute(
+                 second, "data-tilefinch-option-selected"));
+    value = document_control_value(range, &value_length);
+    CHECK(value != NULL && value_length == 1u && value[0] == '0');
+    value = document_control_value(query, &value_length);
+    CHECK(value != NULL && value_length == sizeof("psp") - 1u
+          && memcmp(value, "psp", value_length) == 0);
+    value = document_control_value(notes, &value_length);
+    CHECK(value != NULL && value_length == sizeof("authored") - 1u
+          && memcmp(value, "authored", value_length) == 0);
+    size_t script_free_loads = navigation->loads_started;
+    bool submit_focused = browser_engine_focus_node(engine, submit);
+    bool submit_activated = submit_focused
+        && browser_engine_activate(engine, &action);
+    if (!submit_activated || action.type != CONTROLLER_ACTION_FORM_SUBMIT
+        || strcmp(action.url,
+                  "https://actions.test/find?pick=on&choice=a&q=psp&notes=authored")
+               != 0) {
+        fprintf(stderr,
+                "script-free submit focus=%d activate=%d type=%d outcome=%d "
+                "method=%s url=%s body=%s\n", submit_focused,
+                submit_activated, (int) action.type,
+                (int) action.activation_outcome, action.method, action.url,
+                action.body);
+    }
+    CHECK(submit_activated
+          && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+          && action.activation_outcome
+                 == CONTROLLER_ACTIVATION_RUNTIME_UNAVAILABLE
+          && strcmp(action.method, "GET") == 0
+          && strcmp(action.url,
+                    "https://actions.test/find?pick=on&choice=a&q=psp&notes=authored")
+                 == 0
+          && navigation->loads_started == script_free_loads);
+    ControllerAction poisoned_action;
+    memset(&poisoned_action, 0xa5, sizeof(poisoned_action));
+    CHECK(controller_build_form_action(
+              browser_engine_controller(engine), form, submit, false,
+              &poisoned_action)
+          && poisoned_action.type == CONTROLLER_ACTION_FORM_SUBMIT
+          && poisoned_action.activation_outcome
+                 == CONTROLLER_ACTIVATION_NOT_DISPATCHED
+          && strcmp(poisoned_action.url,
+                    "https://actions.test/find?pick=on&choice=a&q=psp&notes=authored")
+                 == 0);
+
+    /* Structural refusal is decided before Reset captures any defaults.
+       A hostile oversized form therefore cannot fill the 128-state table or
+       retain Budget ownership merely by being reset repeatedly. */
+    char oversized_form[4096];
+    size_t oversized_length = (size_t) snprintf(
+        oversized_form, sizeof(oversized_form),
+        "<!doctype html><style>button,input{display:block;height:1px}</style>"
+        "<form><button id=overflow-reset type=reset>Reset</button>");
+    CHECK(oversized_length < sizeof(oversized_form));
+    for (size_t at = 0; at < 129u; at++) {
+        int added = snprintf(
+            oversized_form + oversized_length,
+            sizeof(oversized_form) - oversized_length,
+            "<input name=x%zu>", at);
+        CHECK(added > 0
+              && (size_t) added
+                     < sizeof(oversized_form) - oversized_length);
+        oversized_length += (size_t) added;
+    }
+    CHECK(oversized_length + sizeof("</form>") <= sizeof(oversized_form));
+    memcpy(oversized_form + oversized_length, "</form>", sizeof("</form>"));
+    oversized_length += sizeof("</form>") - 1u;
+    CHECK(browser_engine_commit_html(
+        engine, "https://actions.test/oversized-reset", oversized_form,
+        oversized_length, true));
+    navigation = browser_engine_navigation(engine);
+    document = &navigation->page.document;
+    lxb_dom_node_t *overflow_reset = actionable_find_id(
+        document, "overflow-reset");
+    CHECK(overflow_reset != NULL
+          && browser_engine_focus_node(engine, overflow_reset));
+    size_t overflow_owned_before = navigation->budget->current;
+    size_t overflow_states_before = document->control_state_count;
+    CHECK(!browser_engine_activate(engine, &action)
+          && navigation->budget->current == overflow_owned_before
+          && document->control_state_count == overflow_states_before);
+
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* Same-document events run synchronously inside the URL/history bridge.  The
+   browser must settle their mutation journal before it resolves fragment or
+   history geometry; waiting for the next ordinary runtime tick leaves the
+   first painted frame and restored focus/scroll bound to stale boxes. */
+static int test_same_document_event_mutations_settle_immediately(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+
+    static const char page[] =
+        "<!doctype html><title>Same-document settlement</title>"
+        "<style>body{margin:0}a{display:block;height:24px}"
+        "#hash-space,#pop-space{height:0}.tail{height:900px}</style>"
+        "<a id=jump href=#target>Jump</a>"
+        "<a id=refused-link href=#refused>Refused settlement</a>"
+        "<div id=hash-space></div><div id=pop-space></div>"
+        "<a id=target>Target</a><a id=refused>Refused target</a>"
+        "<div class=tail></div>"
+        "<script>"
+        "addEventListener('hashchange',()=>{"
+        "document.getElementById('hash-space').style.height="
+        "location.hash==='#target'?'360px':"
+        "location.hash==='#refused'?'480px':'120px';});"
+        "addEventListener('popstate',()=>{"
+        "document.getElementById('pop-space').style.height="
+        "location.hash==='#target'?'180px':'240px';});"
+        "</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://settle.test/page", page, sizeof(page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    PocDocument *document = &navigation->page.document;
+    lxb_dom_node_t *jump = actionable_find_id(document, "jump");
+    lxb_dom_node_t *refused = actionable_find_id(document, "refused-link");
+    lxb_dom_node_t *target = actionable_find_id(document, "target");
+    lxb_dom_node_t *hash_space = actionable_find_id(document, "hash-space");
+    lxb_dom_node_t *pop_space = actionable_find_id(document, "pop-space");
+    const LayoutNodeBox *initial_target = layout_box_for_node(
+        &navigation->page.layout, target);
+    CHECK(jump != NULL && refused != NULL && target != NULL && hash_space != NULL
+          && pop_space != NULL && initial_target != NULL);
+    int initial_target_y = initial_target->y;
+    size_t loads_before = navigation->loads_started;
+    uint64_t generation_before = navigation->generation;
+    size_t relayouts_before = navigation->incremental_relayouts;
+    ControllerAction action = {0};
+
+    CHECK(browser_engine_focus_node(engine, jump)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_CONTROL
+          && strcmp(navigation_current(navigation)->url,
+                    "https://settle.test/page#target") == 0);
+    const LayoutNodeBox *hash_box = layout_box_for_node(
+        &navigation->page.layout, hash_space);
+    const LayoutNodeBox *pop_box = layout_box_for_node(
+        &navigation->page.layout, pop_space);
+    const LayoutNodeBox *target_box = layout_box_for_node(
+        &navigation->page.layout, target);
+    CHECK(hash_box != NULL && hash_box->height == 360
+          && pop_box != NULL && pop_box->height == 0
+          && target_box != NULL && target_box->y == initial_target_y + 360
+          && navigation_current(navigation)->scroll_y == target_box->y
+          && navigation->incremental_relayouts == relayouts_before + 1u
+          && navigation->loads_started == loads_before
+          && navigation->generation == generation_before);
+    int target_scroll = navigation_current(navigation)->scroll_y;
+
+    relayouts_before = navigation->incremental_relayouts;
+    CHECK(browser_engine_begin_navigation_history(
+              engine, false, 1024u, 1000)
+          && browser_engine_navigation_status(engine)
+                 == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && strcmp(navigation_current(navigation)->url,
+                    "https://settle.test/page") == 0
+          && navigation_current(navigation)->scroll_y == 0);
+    hash_box = layout_box_for_node(&navigation->page.layout, hash_space);
+    pop_box = layout_box_for_node(&navigation->page.layout, pop_space);
+    target_box = layout_box_for_node(&navigation->page.layout, target);
+    CHECK(hash_box != NULL && hash_box->height == 120
+          && pop_box != NULL && pop_box->height == 240
+          && target_box != NULL && target_box->y == initial_target_y + 360
+          && navigation->incremental_relayouts == relayouts_before + 1u
+          && navigation->loads_started == loads_before
+          && navigation->generation == generation_before);
+
+    relayouts_before = navigation->incremental_relayouts;
+    CHECK(browser_engine_history_move(engine, true)
+          && strcmp(navigation_current(navigation)->url,
+                    "https://settle.test/page#target") == 0
+          && navigation_current(navigation)->scroll_y == target_scroll);
+    hash_box = layout_box_for_node(&navigation->page.layout, hash_space);
+    pop_box = layout_box_for_node(&navigation->page.layout, pop_space);
+    target_box = layout_box_for_node(&navigation->page.layout, target);
+    CHECK(hash_box != NULL && hash_box->height == 360
+          && pop_box != NULL && pop_box->height == 180
+          && target_box != NULL && target_box->y == initial_target_y + 540
+          && navigation->incremental_relayouts == relayouts_before + 1u
+          && navigation->loads_started == loads_before
+          && navigation->generation == generation_before);
+
+    /* Once the callback has observed #refused, a real transactional layout
+       refusal leaves the old layout/render shell intact but must not roll the
+       authoritative URL/history cursor back or issue a request. */
+    size_t history_before_refusal = navigation->history_count;
+    size_t relayouts_before_refusal = navigation->incremental_relayouts;
+    int retained_target_y = target_box->y;
+    CHECK(browser_engine_focus_node(engine, refused));
+    int refusal_return_scroll = navigation_current(navigation)->scroll_y;
+    navigation_test_refuse_next_same_document_relayout();
+    CHECK(!browser_engine_activate(engine, &action)
+          && strcmp(navigation_current(navigation)->url,
+                    "https://settle.test/page#refused") == 0
+          && navigation->history_count == history_before_refusal + 1u
+          && navigation->incremental_relayouts == relayouts_before_refusal
+          && navigation->loads_started == loads_before
+          && navigation->generation == generation_before);
+    hash_box = layout_box_for_node(&navigation->page.layout, hash_space);
+    target_box = layout_box_for_node(&navigation->page.layout, target);
+    CHECK(hash_box != NULL && hash_box->height == 360
+          && target_box != NULL && target_box->y == retained_target_y
+          && strstr(browser_engine_last_error(engine), "settled") != NULL);
+    bool recovered_back = browser_engine_history_move(engine, false);
+    if (!recovered_back
+        || strcmp(navigation_current(navigation)->url,
+                  "https://settle.test/page#target") != 0
+        || navigation_current(navigation)->scroll_y != refusal_return_scroll
+        || navigation->loads_started != loads_before) {
+        fprintf(stderr,
+                "same-document refused recovery back=%d url=%s scroll=%d/%d "
+                "loads=%zu/%zu relayouts=%zu error=%s nav-error=%s\n",
+                recovered_back, navigation_current(navigation)->url,
+                navigation_current(navigation)->scroll_y,
+                refusal_return_scroll,
+                navigation->loads_started, loads_before,
+                navigation->incremental_relayouts,
+                browser_engine_last_error(engine), navigation->last_error);
+    }
+    CHECK(recovered_back
+          && strcmp(navigation_current(navigation)->url,
+                    "https://settle.test/page#target") == 0
+          && navigation_current(navigation)->scroll_y == refusal_return_scroll
+          && navigation->loads_started == loads_before);
+
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
     return 0;

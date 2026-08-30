@@ -84,6 +84,10 @@ static const unsigned char *decoded_image_pixels(
     unsigned char **temporary)
 {
     *temporary = NULL;
+    if (image->is_canvas && image->canvas_native_surface != NULL
+        && image->canvas_native_surface->authoritative)
+        (void) image_resource_materialize_native_canvas(
+            (ImageResource *) image);
     if (image->pixels != NULL) return image->pixels;
     const void *identity = image_resource_backing_identity(image);
     if (identity == NULL) identity = image;

@@ -786,7 +786,7 @@ static int fetch_private_network_prerequisite(
         && inet_pton(AF_INET, primary_ip, &ipv4->sin_addr) == 1) {
         ipv4->sin_family = AF_INET;
     } else {
-#ifdef AF_INET6
+#if defined(AF_INET6) && !defined(__PSP__)
         unsigned char ipv6[16];
         if (primary_ip != NULL
             && inet_pton(AF_INET6, primary_ip, ipv6) == 1) {
@@ -942,6 +942,7 @@ static bool fetch_request_internal(Budget *budget, const char *url,
     long failed_tls_verify_result = 0;
     bool failed_tls_verify_result_available = false;
     bool failed_tls_verification_failed = false;
+    bool failed_response_limit_exceeded = false;
     char failed_tls_version[sizeof(result->tls_version)] = {0};
     char failed_tls_peer_issuer[sizeof(result->tls_peer_issuer)] = {0};
     bool timed_out = false;
@@ -1278,6 +1279,7 @@ static bool fetch_request_internal(Budget *budget, const char *url,
     return true;
 
 failed:
+    failed_response_limit_exceeded = context.limit_exceeded;
     failed_transport_code = (long) code;
     failed_tls_verify_result = 0;
     failed_tls_verify_result_available = false;
@@ -1321,6 +1323,7 @@ failed:
         result->budget = budget;
     }
     result->timed_out = timed_out;
+    result->response_limit_exceeded = failed_response_limit_exceeded;
     result->transport_code = failed_transport_code;
     result->tls_verify_result = failed_tls_verify_result;
     result->tls_verify_result_available =

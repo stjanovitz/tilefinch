@@ -5,6 +5,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(TILEFINCH_PSP_UI_TIMING) && defined(__PSP__)
+#include <pspkernel.h>
+#endif
+
 #include "tilefinch/danzeff_input.h"
 #include "tilefinch/build_version.h"
 #include "tilefinch/glyph_component_store.h"
@@ -62,9 +66,12 @@ _Static_assert(BROWSER_CHROME_THEME_COUNT <= 8,
 #define PSP_THEME_ON_ACCENT (psp_ui_theme_active_palette->on_accent)
 #define PSP_THEME_OK (psp_ui_theme_active_palette->ok)
 #define PSP_THEME_WARN (psp_ui_theme_active_palette->warn)
+#define UI_COLLECTIONS_ACTIVATION_FEEDBACK UINT8_C(0x80)
 
 #define UI_TOP_HEIGHT 39
 #define UI_BOTTOM_HEIGHT 21
+#define UI_BROWSER_CHROME_CACHE_WIDTH 480
+#define UI_BROWSER_CHROME_CACHE_BOTTOM_HEIGHT 29
 #define UI_AUTOHIDE_FRAMES 240u
 #define UI_TOAST_DEFAULT_FRAMES 180u
 #define UI_MEDIA_CONTROLS_MS 3000u
@@ -84,6 +91,7 @@ _Static_assert(BROWSER_CHROME_THEME_COUNT <= 8,
 #define UI_EXPERIMENTAL_OPTIONS_ITEM_COUNT 6u
 #endif
 #define UI_OPTIONS_VISIBLE_ROWS 7u
+#define UI_ROUTED_LIST_VISIBLE_ROWS 7u
 #define UI_ANALOG_DEAD_ZONE 24
 #define UI_ANALOG_MAX_ELAPSED_MS 64u
 #define UI_ANALOG_MAX_HOLD_MS 1500u
@@ -715,6 +723,18 @@ static void fill_rect(uint16_t *pixels, int width, int height, int stride,
     if (right > width) right = width;
     if (bottom > height) bottom = height;
     if (left >= right || top >= bottom) return;
+    /* RGB565 half-black is exactly each channel divided by two. Preserve
+       blend565()'s floor semantics with a channel-safe mask, while avoiding
+       three extracts, multiplies, divisions, and a repack for every shadow
+       pixel. Toasts and panel shells use this path heavily. */
+    if (color == 0u && opacity == 2u) {
+        for (int y = top; y < bottom; y++) {
+            uint16_t *row = pixels + (size_t) y * (size_t) stride;
+            for (int x = left; x < right; x++)
+                row[x] = (uint16_t) ((row[x] & 0xf7deu) >> 1u);
+        }
+        return;
+    }
     for (int y = top; y < bottom; y++) {
         uint16_t *row = pixels + (size_t) y * (size_t) stride;
         for (int x = left; x < right; x++) {
@@ -1424,6 +1444,23 @@ static int browser_bottom_height(const PspUiState *ui)
     return browser_ui_scale(ui) == 2 ? 29 : UI_BOTTOM_HEIGHT;
 }
 
+void psp_ui_opaque_chrome_rows(
+    const PspUiState *ui, unsigned *top_rows, unsigned *bottom_rows)
+{
+    unsigned top = 0u, bottom = 0u;
+    /* Diagnostic QR owns its full surface and bypasses browser chrome. Native
+       HOME/Collections likewise do not use the page base-copy path. */
+    if (ui != NULL && ui->chrome_visible
+        && ui->screen != PSP_UI_SCREEN_DIAGNOSTIC_QR
+        && !psp_ui_screen_is_native_surface(ui->screen)) {
+        top = UI_TOP_HEIGHT;
+        if (ui->screen == PSP_UI_SCREEN_PAGE)
+            bottom = (unsigned) browser_bottom_height(ui);
+    }
+    if (top_rows != NULL) *top_rows = top;
+    if (bottom_rows != NULL) *bottom_rows = bottom;
+}
+
 static void draw_chevron(uint16_t *pixels, int width, int height, int stride,
                          int center_x, int center_y, int direction,
                          uint16_t color)
@@ -1865,18 +1902,25 @@ void psp_ui_show_offline_app_preview(
     ui_open_overlay(ui, PSP_UI_SCREEN_OFFLINE_APP_PREVIEW);
 }
 
-void psp_ui_show_failure_recovery(
+void psp_ui_show_failure_recovery_actions(
     PspUiState *ui, const char *detail, uint8_t available_actions)
 {
     if (ui == NULL) return;
     ui->base_screen = (uint8_t) (psp_ui_screen_is_native_surface(ui->screen)
         ? ui->screen : PSP_UI_SCREEN_PAGE);
-    ui->failure_actions = available_actions | PSP_UI_FAILURE_READER;
+    ui->failure_actions = available_actions;
     ui->menu_selection = 0u;
     snprintf(ui->status, sizeof(ui->status), "%s",
              detail == NULL || detail[0] == '\0'
                 ? "The page could not be opened" : detail);
     ui_open_overlay(ui, PSP_UI_SCREEN_FAILURE_RECOVERY);
+}
+
+void psp_ui_show_failure_recovery(
+    PspUiState *ui, const char *detail, uint8_t available_actions)
+{
+    psp_ui_show_failure_recovery_actions(
+        ui, detail, available_actions | PSP_UI_FAILURE_READER);
 }
 
 bool psp_ui_legacy_collection_url(
@@ -2335,7 +2379,8 @@ static void ui_update_collections(
         return;
     }
     if (pressed & PSP_UI_BUTTON_CONFIRM) {
-        ui->collections_delete_confirmation = 0;
+        ui->collections_delete_confirmation =
+            UI_COLLECTIONS_ACTIVATION_FEEDBACK;
         intent->action = PSP_UI_ACTION_COLLECTION_ACTIVATE;
         intent->list_index = ui->collections_selection;
         intent->visual_changed = true;
@@ -3592,6 +3637,7 @@ bool psp_ui_intent_has_predispatch_visual(const PspUiIntent *intent)
         case PSP_UI_ACTION_FORWARD:
         case PSP_UI_ACTION_RELOAD:
         case PSP_UI_ACTION_TOGGLE_READER:
+        case PSP_UI_ACTION_TOGGLE_BASIC:
         case PSP_UI_ACTION_TOGGLE_READER_SITE:
         case PSP_UI_ACTION_OPEN_ADDRESS:
         case PSP_UI_ACTION_OPEN_VOICE_ADDRESS:
@@ -3953,6 +3999,141 @@ static void draw_bottom_bar(const PspUiState *ui, uint16_t *pixels, int width,
     }
 }
 
+/*
+ * Page chrome is opaque and changes far less often than an animated canvas.
+ * Rasterizing its proportional text and rounded controls for every frame
+ * costs several milliseconds on Allegrex, even though the resulting rows
+ * are byte-identical. Retain exactly one bounded top/bottom pair and copy it
+ * into each rotating scanout buffer. The key stores the complete inputs used
+ * by the painters rather than relying on a hash, so a collision can never
+ * expose stale URL, security, or device state.
+ *
+ * This is application chrome, not page-owned storage. It is fixed at 65,280
+ * bytes and does not grow with the document or number of canvases.
+ */
+typedef struct {
+    PspUiThemePalette palette;
+    UiDeviceStatus device;
+    const FontFace *regular_font;
+    const FontFace *bold_font;
+    uint8_t scale;
+    uint8_t can_go_back;
+    uint8_t can_go_forward;
+    uint8_t secure;
+    uint8_t loading;
+    char url[PSP_UI_URL_CAPACITY];
+    char title[PSP_UI_TITLE_CAPACITY];
+} UiTopBarCacheKey;
+
+typedef struct {
+    PspUiThemePalette palette;
+    const FontFace *regular_font;
+    const FontFace *bold_font;
+    int32_t scroll_y;
+    int32_t maximum_scroll_y;
+    uint32_t page_requests_blocked;
+    uint8_t scale;
+    uint8_t page_gamepad_capture;
+    uint8_t captive_portal_active;
+    uint8_t focus_editable;
+    char url[PSP_UI_URL_CAPACITY];
+} UiBottomBarCacheKey;
+
+typedef struct {
+    bool top_valid;
+    bool bottom_valid;
+    UiTopBarCacheKey top_key;
+    UiBottomBarCacheKey bottom_key;
+    uint16_t top[UI_BROWSER_CHROME_CACHE_WIDTH * UI_TOP_HEIGHT];
+    uint16_t bottom[UI_BROWSER_CHROME_CACHE_WIDTH
+                    * UI_BROWSER_CHROME_CACHE_BOTTOM_HEIGHT];
+} UiBrowserChromeCache;
+
+static UiBrowserChromeCache browser_chrome_cache;
+
+static void ui_copy_cached_rows(
+    uint16_t *destination, int destination_stride,
+    const uint16_t *source, int rows)
+{
+    for (int row = 0; row < rows; row++) {
+        memcpy(destination + (size_t) row * (size_t) destination_stride,
+               source + (size_t) row * UI_BROWSER_CHROME_CACHE_WIDTH,
+               UI_BROWSER_CHROME_CACHE_WIDTH * sizeof(uint16_t));
+    }
+}
+
+static void draw_cached_top_bar(
+    const PspUiState *ui, uint16_t *pixels, int width, int height, int stride,
+    uint16_t panel, uint16_t accent, uint16_t text, uint16_t muted)
+{
+    if (width != UI_BROWSER_CHROME_CACHE_WIDTH || height < UI_TOP_HEIGHT) {
+        draw_top_bar(ui, pixels, width, height, stride,
+                     panel, accent, text, muted);
+        return;
+    }
+    UiTopBarCacheKey key = {0};
+    key.palette = *psp_ui_theme_active_palette;
+    key.device = device_status;
+    key.regular_font = chrome_font_cache.faces[0];
+    key.bold_font = chrome_font_cache.faces[1];
+    key.scale = (uint8_t) browser_ui_scale(ui);
+    key.can_go_back = ui->can_go_back;
+    key.can_go_forward = ui->can_go_forward;
+    key.secure = ui->secure;
+    key.loading = ui->loading;
+    copy_string(key.url, sizeof(key.url), ui->url);
+    copy_string(key.title, sizeof(key.title), ui->title);
+    if (!browser_chrome_cache.top_valid
+        || memcmp(&key, &browser_chrome_cache.top_key, sizeof(key)) != 0) {
+        draw_top_bar(
+            ui, browser_chrome_cache.top,
+            UI_BROWSER_CHROME_CACHE_WIDTH, UI_TOP_HEIGHT,
+            UI_BROWSER_CHROME_CACHE_WIDTH, panel, accent, text, muted);
+        browser_chrome_cache.top_key = key;
+        browser_chrome_cache.top_valid = true;
+    }
+    ui_copy_cached_rows(
+        pixels, stride, browser_chrome_cache.top, UI_TOP_HEIGHT);
+}
+
+static void draw_cached_bottom_bar(
+    const PspUiState *ui, uint16_t *pixels, int width, int height, int stride,
+    uint16_t panel, uint16_t accent, uint16_t text)
+{
+    int bottom_height = browser_bottom_height(ui);
+    if (width != UI_BROWSER_CHROME_CACHE_WIDTH
+        || bottom_height > UI_BROWSER_CHROME_CACHE_BOTTOM_HEIGHT
+        || height < bottom_height) {
+        draw_bottom_bar(ui, pixels, width, height, stride,
+                        panel, accent, text);
+        return;
+    }
+    UiBottomBarCacheKey key = {0};
+    key.palette = *psp_ui_theme_active_palette;
+    key.regular_font = chrome_font_cache.faces[0];
+    key.bold_font = chrome_font_cache.faces[1];
+    key.scroll_y = ui->scroll_y;
+    key.maximum_scroll_y = ui->maximum_scroll_y;
+    key.page_requests_blocked = ui->page_requests_blocked;
+    key.scale = (uint8_t) browser_ui_scale(ui);
+    key.page_gamepad_capture = ui->page_gamepad_capture;
+    key.captive_portal_active = ui->captive_portal_active;
+    key.focus_editable = ui->focus_editable;
+    copy_string(key.url, sizeof(key.url), ui->url);
+    if (!browser_chrome_cache.bottom_valid
+        || memcmp(&key, &browser_chrome_cache.bottom_key, sizeof(key)) != 0) {
+        draw_bottom_bar(
+            ui, browser_chrome_cache.bottom,
+            UI_BROWSER_CHROME_CACHE_WIDTH, bottom_height,
+            UI_BROWSER_CHROME_CACHE_WIDTH, panel, accent, text);
+        browser_chrome_cache.bottom_key = key;
+        browser_chrome_cache.bottom_valid = true;
+    }
+    ui_copy_cached_rows(
+        pixels + (size_t) (height - bottom_height) * (size_t) stride,
+        stride, browser_chrome_cache.bottom, bottom_height);
+}
+
 static TILEFINCH_OUT_OF_LINE void draw_menu(
                       const PspUiState *ui, uint16_t *pixels, int width,
                       int height, int stride, uint16_t panel,
@@ -4032,8 +4213,19 @@ static void draw_routed_list(
         draw_text_right_aligned(
             pixels, width, height, stride, box.x + box.width - 16,
             box.y + 15, context, 25, accent, 1, true);
-    for (size_t at = 0; at < count; at++) {
-        int row_y = box.y + 57 + (int) at * 24;
+    /* Seven 24px rows fit above the fixed hint bar. Longer routed lists are
+       selection-windowed; drawing an eighth physical row would overlap the
+       bottom hint and make its action label unreadable. */
+    size_t visible = count < UI_ROUTED_LIST_VISIBLE_ROWS
+        ? count : UI_ROUTED_LIST_VISIBLE_ROWS;
+    size_t first = 0u;
+    if (count > visible) {
+        if (selection >= count) first = count - visible;
+        else if (selection >= visible) first = selection - visible + 1u;
+    }
+    size_t end = first + visible;
+    for (size_t at = first; at < end; at++) {
+        int row_y = box.y + 57 + (int) (at - first) * 24;
         bool selected = at == selection;
         if (selected)
             fill_round_rect(
@@ -4062,12 +4254,13 @@ static TILEFINCH_OUT_OF_LINE void draw_page_tools(
     int stride, uint16_t accent, uint16_t text, uint16_t muted)
 {
     static const char *const labels[UI_PAGE_TOOLS_ITEM_COUNT] = {
-        "Find in page", "Reader mode", "Add/remove bookmark",
-        "Save article", "Save screenshot", "Site information",
-        "Install offline app"
+        "Find in page", "Reader mode", "Basic view",
+        "Add/remove bookmark", "Save article", "Save screenshot",
+        "Site information", "Install offline app"
     };
     const char *values[UI_PAGE_TOOLS_ITEM_COUNT] = {
-        ">", ui->reader_mode ? "On" : "Off", NULL, NULL, NULL, ">", NULL
+        ">", ui->reader_mode ? "On" : "Off",
+        ui->basic_mode ? "On" : "Off", NULL, NULL, NULL, ">", NULL
     };
     draw_routed_list(
         ui, pixels, width, height, stride, "Page tools", NULL,
@@ -4268,7 +4461,8 @@ static size_t ui_failure_labels(
 #define ADD_FAILURE_LABEL(text_) \
     do { if (count < capacity) labels[count++] = (text_); } while (0)
     ADD_FAILURE_LABEL("Retry");
-    ADD_FAILURE_LABEL("Try Reader mode");
+    if (ui->failure_actions & PSP_UI_FAILURE_READER)
+        ADD_FAILURE_LABEL("Try Reader mode");
     if (ui->failure_actions & PSP_UI_FAILURE_WIFI)
         ADD_FAILURE_LABEL("Open Wi-Fi sign-in");
     if (ui->failure_actions & PSP_UI_FAILURE_DISABLE_JAVASCRIPT)
@@ -4608,7 +4802,8 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
             *value = ui->browser_ui_scale >= 2u ? "Large" : "Compact";
             break;
         case UI_OPTION_PAGE_FONT_PERCENT:
-            *label = ui->reader_mode ? "Reader text" : "Web pages";
+            *label = (ui->reader_mode || ui->basic_mode)
+                ? "Extracted text" : "Web pages";
             snprintf(formatted, formatted_size, "%u%%", ui->page_font_percent);
             *value = formatted;
             break;
@@ -6045,13 +6240,19 @@ static TILEFINCH_OUT_OF_LINE void draw_collections(
         const PspUiCollectionsRow *row = &ui->collections->rows[at];
         UiRect box = ui_collections_row_rect(ui, at);
         bool selected = at == ui->collections_selection;
+        bool activating = selected
+            && ui->collections_delete_confirmation
+                   == UI_COLLECTIONS_ACTIVATION_FEEDBACK;
         bool confirm = selected
             && ui->collections_delete_confirmation == (uint8_t) (at + 1u);
         if (confirm) confirming = true;
         if (selected) {
             fill_round_rect(
                 pixels, width, height, stride, box, PSP_THEME_RADIUS_ROW,
-                PSP_THEME_SURFACE_FOCUS, 4);
+                activating
+                    ? blend565(accent.accent, PSP_THEME_SURFACE_FOCUS, 2)
+                    : PSP_THEME_SURFACE_FOCUS,
+                4);
             fill_round_edge_bar(
                 pixels, width, height, stride, box, PSP_THEME_RADIUS_ROW,
                 PSP_THEME_FOCUS_STROKE,
@@ -6619,6 +6820,10 @@ typedef struct {
     UiChromePalette palette;
 } PspUiCompositeContext;
 
+#if defined(TILEFINCH_PSP_UI_TIMING) && defined(__PSP__)
+static PspUiCompositeTiming psp_ui_validation_timing;
+#endif
+
 /* Native surfaces are common during a session but absent from the steady
    browser frame. Keep their substantial painters out of the browser's
    instruction-cache footprint without mislabeling them as cold code. */
@@ -6656,6 +6861,14 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
     uint16_t accent = context->palette.accent;
     uint16_t text = context->palette.text;
     uint16_t muted = context->palette.muted;
+#if defined(TILEFINCH_PSP_UI_TIMING) && defined(__PSP__)
+    uint64_t timing_started_us = (uint64_t) sceKernelGetSystemTimeWide();
+    uint64_t timing_focus_us = timing_started_us;
+    uint64_t timing_chrome_us = timing_started_us;
+    uint64_t timing_cursor_us = timing_started_us;
+    uint64_t timing_screen_us = timing_started_us;
+    uint64_t timing_toast_us = timing_started_us;
+#endif
 
     if (ui->screen == PSP_UI_SCREEN_DIAGNOSTIC_QR) {
         draw_diagnostic_qr(ui, pixels, width, height, stride, accent);
@@ -6665,15 +6878,24 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
     if (ui->screen != PSP_UI_SCREEN_FIND)
         draw_focus(ui, pixels, width, height, stride, accent);
     draw_scrollbar(ui, pixels, width, height, stride, accent);
+#if defined(TILEFINCH_PSP_UI_TIMING) && defined(__PSP__)
+    timing_focus_us = (uint64_t) sceKernelGetSystemTimeWide();
+#endif
     if (ui->chrome_visible) {
-        draw_top_bar(ui, pixels, width, height, stride, panel, accent,
-                     text, muted);
+        draw_cached_top_bar(ui, pixels, width, height, stride, panel, accent,
+                            text, muted);
         if (ui->screen == PSP_UI_SCREEN_PAGE)
-            draw_bottom_bar(ui, pixels, width, height, stride, panel, accent,
-                            text);
+            draw_cached_bottom_bar(
+                ui, pixels, width, height, stride, panel, accent, text);
     }
+#if defined(TILEFINCH_PSP_UI_TIMING) && defined(__PSP__)
+    timing_chrome_us = (uint64_t) sceKernelGetSystemTimeWide();
+#endif
     if (ui->screen != PSP_UI_SCREEN_FIND)
         draw_cursor(ui, pixels, width, height, stride, accent);
+#if defined(TILEFINCH_PSP_UI_TIMING) && defined(__PSP__)
+    timing_cursor_us = (uint64_t) sceKernelGetSystemTimeWide();
+#endif
     if (ui->screen == PSP_UI_SCREEN_MENU) {
         draw_menu(ui, pixels, width, height, stride, panel, accent, text,
                   muted);
@@ -6737,11 +6959,41 @@ static TILEFINCH_OUT_OF_LINE void psp_ui_composite_browser(
         draw_find(ui, pixels, width, height, stride,
                   panel, accent, text, muted);
     }
+#if defined(TILEFINCH_PSP_UI_TIMING) && defined(__PSP__)
+    timing_screen_us = (uint64_t) sceKernelGetSystemTimeWide();
+#endif
     if (ui->screen != PSP_UI_SCREEN_TEXT_ENTRY)
         draw_toast(ui, pixels, width, height, stride, panel, accent, text);
+#if defined(TILEFINCH_PSP_UI_TIMING) && defined(__PSP__)
+    timing_toast_us = (uint64_t) sceKernelGetSystemTimeWide();
+#endif
     if (ui->screen == PSP_UI_SCREEN_PAGE)
         draw_loading(ui, pixels, width, height, stride, accent);
+#if defined(TILEFINCH_PSP_UI_TIMING) && defined(__PSP__)
+    uint64_t timing_finished_us = (uint64_t) sceKernelGetSystemTimeWide();
+    uint32_t sequence = psp_ui_validation_timing.sequence + 1u;
+    if (sequence == 0) sequence = 1u;
+    psp_ui_validation_timing = (PspUiCompositeTiming) {
+        .focus_scroll_us = timing_focus_us - timing_started_us,
+        .chrome_us = timing_chrome_us - timing_focus_us,
+        .cursor_us = timing_cursor_us - timing_chrome_us,
+        .screen_us = timing_screen_us - timing_cursor_us,
+        .toast_us = timing_toast_us - timing_screen_us,
+        .loading_us = timing_finished_us - timing_toast_us,
+        .sequence = sequence
+    };
+#endif
 }
+
+#if defined(TILEFINCH_PSP_UI_TIMING) && defined(__PSP__)
+bool psp_ui_validation_last_timing(PspUiCompositeTiming *timing)
+{
+    if (timing == NULL || psp_ui_validation_timing.sequence == 0)
+        return false;
+    *timing = psp_ui_validation_timing;
+    return true;
+}
+#endif
 
 void psp_ui_composite(const PspUiState *ui, uint16_t *pixels,
                       int width, int height, int stride)
@@ -7386,6 +7638,11 @@ void psp_ui_media_apply_projection(
     PspUiMediaState *media, const PspMediaUiProjection *projection)
 {
     if (media == NULL || projection == NULL) return;
+    bool continuing_seek = media->seek_in_progress
+        && (projection->mode == PSP_MEDIA_UI_OPENING
+            || projection->mode == PSP_MEDIA_UI_PRIMING
+            || projection->mode == PSP_MEDIA_UI_SEEKING
+            || projection->mode == PSP_MEDIA_UI_RECOVERING);
     bool local_analog_preview = media->analog_seek_direction != 0
         && media->seek_preview_active && projection->seek_enabled;
     media->visible = projection->visible;
@@ -7399,8 +7656,13 @@ void psp_ui_media_apply_projection(
         || projection->mode == PSP_MEDIA_UI_RECOVERING
         || projection->mode == PSP_MEDIA_UI_STOPPING;
     media->seek_in_progress =
-        projection->mode == PSP_MEDIA_UI_SEEKING;
+        projection->mode == PSP_MEDIA_UI_SEEKING || continuing_seek;
     media->buffering = projection->mode == PSP_MEDIA_UI_BUFFERING;
+    if (media->seek_in_progress) {
+        copy_string(media->status, sizeof(media->status),
+                    projection->mode == PSP_MEDIA_UI_SEEKING
+                        ? "Seeking..." : "Buffering after seek");
+    }
     /* The controller owns decoder-preview transactions, but the nub's target
        is deliberately UI-local until release coalesces it into one request.
        Preserve that target across unrelated controller projections (notably
@@ -7423,6 +7685,24 @@ void psp_ui_media_set_seek_preview(PspUiMediaState *media,
     media->seek_preview_time_us = target_time_us < media->duration_us
         ? target_time_us : media->duration_us;
     media_timeline_visual_set(media, media->seek_preview_time_us, false);
+    psp_ui_media_show_controls(media);
+}
+
+void psp_ui_media_commit_seek(PspUiMediaState *media,
+                              uint64_t target_time_us)
+{
+    if (media == NULL || !media->visible) return;
+    uint64_t target = media->duration_us != 0u
+            && target_time_us > media->duration_us
+        ? media->duration_us : target_time_us;
+    media->seek_preview_active = false;
+    media->seek_preview_time_us = target;
+    media->analog_seek_direction = 0;
+    media->current_time_us = target;
+    media->seek_in_progress = true;
+    media->resolving = true;
+    media_timeline_visual_set(media, target, true);
+    copy_string(media->status, sizeof(media->status), "Seeking...");
     psp_ui_media_show_controls(media);
 }
 
@@ -7637,8 +7917,10 @@ PspUiMediaIntent psp_ui_media_update(PspUiMediaState *media,
                instead of dropping Cross until the picture returns. */
             intent.action = PSP_UI_MEDIA_ACTION_SEEK;
             intent.seek_time_us = media->seek_preview_time_us;
-            if (!media->resolving)
-                psp_ui_media_cancel_seek_preview(media);
+            /* The session atomically replaces this tentative target with a
+               committed one. Clearing it here exposed the old playback clock
+               during the pre-dispatch repaint, making the scrubber snap back
+               for one or more frames before decoder preparation began. */
         } else if (media->play_pause_enabled) {
             intent.action = PSP_UI_MEDIA_ACTION_PLAY_PAUSE;
         }
@@ -8553,7 +8835,7 @@ static void draw_media_subtitle(
             draw_text_with_font(
                 pixels, width, height, stride, box.x + 11, y + 1,
                 lines[line], 96, box.x + box.width - 9,
-                rgb565(0, 0, 0), scale, NULL, true);
+                rgb565(0, 0, 0), scale, NULL, false);
         }
         draw_text_with_font(
             pixels, width, height, stride, box.x + 10, y,

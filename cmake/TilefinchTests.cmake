@@ -33,6 +33,12 @@ if(PSP_BROWSER_BUILD_TESTS)
                 ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(tilefinch-psp-sdk-contract-tests PROPERTIES
             LABELS "tilefinch;unit;psp;architecture"
+            TIMEOUT 20)
+        add_test(NAME tilefinch-psp-game-stage-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stage_psp_game.py)
+        set_tests_properties(tilefinch-psp-game-stage-tests PROPERTIES
+            LABELS "tilefinch;unit;psp;game;tooling"
             TIMEOUT 10)
         add_test(NAME tilefinch-ca-bundle-tests
             COMMAND ${Python3_EXECUTABLE}
@@ -59,6 +65,24 @@ if(PSP_BROWSER_BUILD_TESTS)
     add_test(NAME tilefinch-gamepad-tests COMMAND tilefinch-gamepad-tests)
     set_tests_properties(tilefinch-gamepad-tests PROPERTIES
         LABELS "tilefinch;unit;javascript;input" TIMEOUT 10)
+
+    add_executable(tilefinch-multiplayer-tests tests/test_multiplayer.c)
+    target_link_libraries(tilefinch-multiplayer-tests PRIVATE tilefinch_core)
+    add_test(NAME tilefinch-multiplayer-tests COMMAND tilefinch-multiplayer-tests)
+    set_tests_properties(tilefinch-multiplayer-tests PROPERTIES
+        LABELS "tilefinch;unit;javascript;network" TIMEOUT 10)
+    if(NOT PSP)
+        find_program(TILEFINCH_TEST_NODE_EXECUTABLE NAMES node)
+        if(TILEFINCH_TEST_NODE_EXECUTABLE)
+            add_test(NAME tilefinch-treadline-web-multiplayer-tests
+                COMMAND ${TILEFINCH_TEST_NODE_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_treadline_web_multiplayer.js)
+            set_tests_properties(tilefinch-treadline-web-multiplayer-tests
+                PROPERTIES
+                    LABELS "tilefinch;unit;javascript;network;game"
+                    TIMEOUT 10)
+        endif()
+    endif()
 
     add_executable(tilefinch-xmb-redirect-policy-tests
         tests/test_xmb_redirect_policy.c
@@ -661,7 +685,7 @@ if(PSP_BROWSER_BUILD_TESTS)
         TIMEOUT 30)
 
     add_executable(tilefinch-canvas-webgl-conformance-tests
-        tests/test_canvas_webgl_conformance.c)
+        tests/test_canvas_webgl_conformance.c src/psp_offline_store.c)
     target_link_libraries(tilefinch-canvas-webgl-conformance-tests
         PRIVATE tilefinch_core)
     target_compile_definitions(tilefinch-canvas-webgl-conformance-tests PRIVATE
@@ -671,6 +695,38 @@ if(PSP_BROWSER_BUILD_TESTS)
     set_tests_properties(tilefinch-canvas-webgl-conformance-tests PROPERTIES
         LABELS "tilefinch;unit;javascript;canvas;webgl;game"
         TIMEOUT 30)
+
+    add_test(NAME tilefinch-usability-probe-read-only
+        COMMAND psp-browser-interactive-lab
+            --fixture ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/usability-probe-inert.html
+            --fetch-scripts --ticks 2 --probe-usability --no-loop-capture)
+    set_tests_properties(tilefinch-usability-probe-read-only PROPERTIES
+        PASS_REGULAR_EXPRESSION
+            "usability-probe focus=ready.*activation=not-run.*handlers=0/0 network=0/0"
+        FAIL_REGULAR_EXPRESSION "CLICKED_BY_PROBE;activations=[1-9]"
+        LABELS "tilefinch;unit;acceptance;tooling;javascript"
+        TIMEOUT 10)
+
+    add_test(NAME tilefinch-blank-reader-recurring-recovery
+        COMMAND psp-browser-interactive-lab
+            --fixture
+                ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/reader-recovery-recurring.html
+            --fetch-scripts --ticks 16 --tick-ms 20 --pace-real-time
+            --no-loop-capture)
+    set_tests_properties(tilefinch-blank-reader-recurring-recovery PROPERTIES
+        PASS_REGULAR_EXPRESSION
+            "(basic|reader)-recovery available=yes.*applied=yes activated=yes"
+        LABELS "tilefinch;unit;acceptance;tooling;javascript;reader;lifecycle"
+        TIMEOUT 10)
+
+    add_test(NAME tilefinch-actionable-page-qualification
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/run-actionable-page-qualification.sh
+            ${CMAKE_CURRENT_BINARY_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}/actionable-page-qualification)
+    set_tests_properties(tilefinch-actionable-page-qualification PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        LABELS "tilefinch;unit;acceptance;navigation;javascript;usability"
+        TIMEOUT 15)
 
     if(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE)
         add_test(NAME tilefinch-property-fault-trace-tests

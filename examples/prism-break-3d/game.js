@@ -3,7 +3,7 @@
 
   const canvas = document.getElementById("game");
   const gl = canvas && canvas.getContext("webgl", {
-    alpha: false, depth: true, antialias: false,
+    alpha: false, depth: true, antialias: true,
   });
   const ui = {
     panel: document.getElementById("panel"),
@@ -22,6 +22,7 @@
     globalThis.pocSummary = "PRISM-BREAK-NO-WEBGL";
     return;
   }
+  const instancing = gl.getExtension("ANGLE_instanced_arrays");
 
   const MAX_VERTICES = 3072;
   const MAX_INDICES = 4608;
@@ -29,6 +30,12 @@
   const colors = new Float32Array(MAX_VERTICES * 4);
   const indices = new Uint16Array(MAX_INDICES);
   let vertexCount = 0, indexCount = 0;
+  const HUD_GLYPH_LIMIT = 48;
+  const HUD_RECT_LIMIT = HUD_GLYPH_LIMIT * 10;
+  const hudVertices = new Float32Array(HUD_RECT_LIMIT * 4 * 6);
+  const hudIndices = new Uint16Array(HUD_RECT_LIMIT * 6);
+  let hudVertexCount = 0, hudIndexCount = 0, hudCharacterCount = 0;
+  let hudMeshDirty = true;
 
   const compile = (type, source) => {
     const shader = gl.createShader(type);
@@ -54,6 +61,8 @@
     varying lowp vec4 vColor;
     void main(void) { gl_FragColor = vColor; }
   `));
+  gl.bindAttribLocation(program, 0, "aPosition");
+  gl.bindAttribLocation(program, 1, "aColor");
   gl.linkProgram(program);
   if (!gl.getProgramParameter(program, gl.LINK_STATUS))
     throw new Error(gl.getProgramInfoLog(program));
@@ -74,15 +83,36 @@
   const indexBuffer = gl.createBuffer();
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices.byteLength, gl.DYNAMIC_DRAW);
-  const staticPositionBuffer = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, staticPositionBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, positions.byteLength, gl.DYNAMIC_DRAW);
-  const staticColorBuffer = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, staticColorBuffer);
-  gl.bufferData(gl.ARRAY_BUFFER, colors.byteLength, gl.DYNAMIC_DRAW);
-  const staticIndexBuffer = gl.createBuffer();
-  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, staticIndexBuffer);
-  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices.byteLength, gl.DYNAMIC_DRAW);
+  /* The non-instanced fallback allocates these after extension admission.
+     Tilefinch's retained brick stream needs two compact instance buffers
+     instead of three maximum-sized CPU meshes. */
+  let staticPositionBuffer = null, staticColorBuffer = null;
+  let staticIndexBuffer = null, staticVertexArray = null;
+  /* Scenery never changes after construction. Keep it in an exact-sized
+     immutable stream so a brick update does not invalidate and rebuild the
+     native bridge's decoded background geometry. */
+  const backgroundPositionBuffer = gl.createBuffer();
+  const backgroundColorBuffer = gl.createBuffer();
+  const backgroundIndexBuffer = gl.createBuffer();
+  const vertexArrays = gl.getExtension("OES_vertex_array_object");
+  function createMeshVertexArray(position, color, index) {
+    if (!vertexArrays) return null;
+    const array = vertexArrays.createVertexArrayOES();
+    vertexArrays.bindVertexArrayOES(array);
+    gl.bindBuffer(gl.ARRAY_BUFFER, position);
+    gl.vertexAttribPointer(positionLocation, 3, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(positionLocation);
+    gl.bindBuffer(gl.ARRAY_BUFFER, color);
+    gl.vertexAttribPointer(colorLocation, 4, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(colorLocation);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, index);
+    return array;
+  }
+  const dynamicVertexArray = createMeshVertexArray(
+    positionBuffer, colorBuffer, indexBuffer);
+  const backgroundVertexArray = createMeshVertexArray(
+    backgroundPositionBuffer, backgroundColorBuffer, backgroundIndexBuffer);
+  if (vertexArrays) vertexArrays.bindVertexArrayOES(null);
 
   const projection = new Float32Array(16);
   const f = 1 / Math.tan(52 * Math.PI / 360), aspect = 320 / 180,
@@ -101,6 +131,74 @@
   gl.enable(gl.BLEND);
   gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   gl.clearColor(.008, .016, .045, 1);
+  gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+
+  /* Gameplay text is a fixed 3x5 rectangle mesh rendered in screen space. Updating
+     this retained mesh is much cheaper on the PSP than mutating text nodes,
+     which would force style/layout and rebuild the post-canvas overlay. */
+  const HUD_CHARS = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-";
+  const HUD_PATTERNS = {
+    " ": "000000000000000", "0": "111101101101111",
+    "1": "010110010010111", "2": "111001111100111",
+    "3": "111001111001111", "4": "101101111001001",
+    "5": "111100111001111", "6": "111100111101111",
+    "7": "111001001001001", "8": "111101111101111",
+    "9": "111101111001111", "A": "010101111101101",
+    "B": "110101110101110", "C": "111100100100111",
+    "D": "110101101101110", "E": "111100110100111",
+    "F": "111100110100100", "G": "111100101101111",
+    "H": "101101111101101", "I": "111010010010111",
+    "J": "001001001101111", "K": "101101110101101",
+    "L": "100100100100111", "M": "101111111101101",
+    "N": "101111111111101", "O": "111101101101111",
+    "P": "111101111100100", "Q": "111101101111001",
+    "R": "111101111110101", "S": "111100111001111",
+    "T": "111010010010010", "U": "101101101101111",
+    "V": "101101101101010", "W": "101101111111101",
+    "X": "101101010101101", "Y": "101101010010010",
+    "Z": "111001010100111", "-": "000000111000000",
+  };
+  const HUD_SCORE_TINT = [.87, .97, 1, 1];
+  const HUD_POWER_TINT = [.51, 1, .86, 1];
+  const HUD_TOAST_TINT = [1, .97, .66, 1];
+  const hudProgram = gl.createProgram();
+  gl.attachShader(hudProgram, compile(gl.VERTEX_SHADER, `
+    attribute vec2 aPosition;
+    attribute vec4 aTint;
+    varying lowp vec4 vTint;
+    void main(void) {
+      gl_Position = vec4(aPosition, 0.0, 1.0);
+      vTint = aTint;
+    }
+  `));
+  gl.attachShader(hudProgram, compile(gl.FRAGMENT_SHADER, `
+    varying lowp vec4 vTint;
+    void main(void) { gl_FragColor = vTint; }
+  `));
+  gl.bindAttribLocation(hudProgram, 0, "aPosition");
+  gl.bindAttribLocation(hudProgram, 1, "aTint");
+  gl.linkProgram(hudProgram);
+  if (!gl.getProgramParameter(hudProgram, gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(hudProgram));
+  const hudVertexBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, hudVertexBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, hudVertices.byteLength, gl.DYNAMIC_DRAW);
+  const hudIndexBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, hudIndexBuffer);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, hudIndices.byteLength,
+    gl.DYNAMIC_DRAW);
+  let hudVertexArray = null;
+  if (vertexArrays) {
+    hudVertexArray = vertexArrays.createVertexArrayOES();
+    vertexArrays.bindVertexArrayOES(hudVertexArray);
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, hudVertexBuffer);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 24, 0);
+  gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 24, 8);
+  gl.enableVertexAttribArray(0);
+  gl.enableVertexAttribArray(1);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, hudIndexBuffer);
+  if (vertexArrays) vertexArrays.bindVertexArrayOES(null);
 
   const BOX_VERTICES = new Int8Array([
     -1,-1, 1,  1,-1, 1,  1, 1, 1, -1, 1, 1,
@@ -127,6 +225,66 @@
   const cosX = Math.cos(rotationX), sinX = Math.sin(rotationX);
   const cosY = Math.cos(rotationY), sinY = Math.sin(rotationY);
 
+  /* Dynamic effects retain one octahedron and submit only bounded transform
+     records when instancing is available.  The fallback below remains the
+     ordinary WebGL 1 mesh builder, so the example still runs elsewhere. */
+  const MAX_OCTA_INSTANCES = 128, MAX_INSTANCES_PER_DRAW = 64;
+  const octaTransforms = new Float32Array(MAX_OCTA_INSTANCES * 4);
+  const octaTints = new Float32Array(MAX_OCTA_INSTANCES * 4);
+  let octaInstanceCount = 0;
+  let collectInstancedOcta = false;
+  let instanceProgram = null, instancePosition = null, instanceShade = null;
+  let instanceIndex = null, instanceTransform = null, instanceTint = null;
+  let instanceVertexArray = null;
+  let instancePositionLocation = -1, instanceShadeLocation = -1;
+  let instanceTransformLocation = -1, instanceModelLocation = null;
+  let instanceTintLocation = -1;
+  let instancePointerStart = -1;
+
+  const BRICK_COLUMNS = 8, BRICK_ROWS = 6;
+  const MAX_BRICK_INSTANCES = BRICK_COLUMNS * BRICK_ROWS;
+  const MAX_BOX_INSTANCES = 16;
+  const boxInstanceMatrices = new Float32Array(MAX_BOX_INSTANCES * 16);
+  const boxInstanceTints = new Float32Array(MAX_BOX_INSTANCES * 4);
+  let boxInstanceCount = 0, collectInstancedBoxes = false;
+  let boxInstanceProgram = null, boxInstancePosition = null;
+  let boxInstanceShade = null, boxInstanceIndex = null;
+  let boxInstanceMatrix = null, boxInstanceTint = null;
+  let boxInstanceVertexArray = null, boxInstanceModelLocation = null;
+  let boxInstanceMatrixLocation = -1, boxInstanceTintLocation = -1;
+  const brickInstanceMatrices = new Float32Array(
+    MAX_BRICK_INSTANCES * 16);
+  const brickInstanceTints = new Float32Array(MAX_BRICK_INSTANCES * 4);
+  let brickInstanceCount = 0, brickInstanceMatrix = null;
+  let brickInstanceTint = null, brickInstanceVertexArray = null;
+  let brickMatrixDirtyFirst = MAX_BRICK_INSTANCES, brickMatrixDirtyLast = -1;
+  let brickTintDirtyFirst = MAX_BRICK_INSTANCES, brickTintDirtyLast = -1;
+  let brickInstanceUploads = 0, brickInstanceFloatsUploaded = 0;
+
+  function resetOctaInstances() {
+    octaInstanceCount = 0;
+  }
+
+  function addOctaInstance(x, y, z, radius, color, alpha) {
+    if (octaInstanceCount >= MAX_OCTA_INSTANCES) return false;
+    let alphaStep = (alpha * 7 + .5) | 0;
+    if (alphaStep < 0) alphaStep = 0;
+    else if (alphaStep > 7) alphaStep = 7;
+    if (alphaStep === 0) return true;
+    const instance = octaInstanceCount++;
+    const tintAt = instance * 4;
+    octaTints[tintAt] = color[0];
+    octaTints[tintAt + 1] = color[1];
+    octaTints[tintAt + 2] = color[2];
+    octaTints[tintAt + 3] = alphaStep / 7;
+    const at = instance * 4;
+    octaTransforms[at] = x;
+    octaTransforms[at + 1] = y;
+    octaTransforms[at + 2] = z;
+    octaTransforms[at + 3] = radius;
+    return true;
+  }
+
   function writeVertex(x, y, z, color, shade, alpha = 1,
                        brightness = 1) {
     if (vertexCount >= MAX_VERTICES) return false;
@@ -148,6 +306,26 @@
 
   function addBox(x, y, z, width, height, depth, color, alpha = 1,
                   brightness = 1) {
+    if (collectInstancedBoxes && boxInstanceProgram) {
+      if (boxInstanceCount >= MAX_BOX_INSTANCES) return false;
+      const instance = boxInstanceCount++;
+      const matrixAt = instance * 16;
+      /* Off-diagonal entries never change from the typed array's zero-filled
+         initialization; overwrite only the seven authored components. */
+      boxInstanceMatrices[matrixAt] = width * .5;
+      boxInstanceMatrices[matrixAt + 5] = height * .5;
+      boxInstanceMatrices[matrixAt + 10] = depth * .5;
+      boxInstanceMatrices[matrixAt + 12] = x;
+      boxInstanceMatrices[matrixAt + 13] = y;
+      boxInstanceMatrices[matrixAt + 14] = z;
+      boxInstanceMatrices[matrixAt + 15] = 1;
+      const tintAt = instance * 4;
+      boxInstanceTints[tintAt] = color[0] * brightness;
+      boxInstanceTints[tintAt + 1] = color[1] * brightness;
+      boxInstanceTints[tintAt + 2] = color[2] * brightness;
+      boxInstanceTints[tintAt + 3] = alpha;
+      return true;
+    }
     if (vertexCount + 24 > MAX_VERTICES || indexCount + 36 > MAX_INDICES)
       return false;
     const base = vertexCount;
@@ -164,6 +342,8 @@
   }
 
   function addOctahedron(x, y, z, radius, color, alpha = 1) {
+    if (collectInstancedOcta)
+      return addOctaInstance(x, y, z, radius, color, alpha);
     if (vertexCount + 6 > MAX_VERTICES || indexCount + 24 > MAX_INDICES)
       return false;
     const base = vertexCount;
@@ -178,6 +358,259 @@
     for (let at = 0; at < 24; at++)
       indices[indexCount++] = base + OCTA_INDICES[at];
     return true;
+  }
+
+  function initializeInstancing() {
+    if (!instancing) return;
+    instanceProgram = gl.createProgram();
+    gl.attachShader(instanceProgram, compile(gl.VERTEX_SHADER, `
+      attribute vec3 aPosition;
+      attribute vec4 aColor;
+      attribute vec4 aInstanceTransform;
+      attribute vec4 aInstanceTint;
+      uniform mat4 uProjection;
+      uniform mat4 uModel;
+      uniform mat4 uView;
+      varying lowp vec4 vColor;
+      void main(void) {
+        gl_Position = uProjection * uModel * uView
+          * vec4(aPosition * aInstanceTransform.w
+              + aInstanceTransform.xyz, 1.0);
+        vColor = aColor * aInstanceTint;
+      }
+    `));
+    gl.attachShader(instanceProgram, compile(gl.FRAGMENT_SHADER, `
+      varying lowp vec4 vColor;
+      void main(void) { gl_FragColor = vColor; }
+    `));
+    gl.bindAttribLocation(instanceProgram, 0, "aPosition");
+    gl.bindAttribLocation(instanceProgram, 1, "aColor");
+    gl.bindAttribLocation(instanceProgram, 2, "aInstanceTransform");
+    gl.bindAttribLocation(instanceProgram, 3, "aInstanceTint");
+    gl.linkProgram(instanceProgram);
+    if (!gl.getProgramParameter(instanceProgram, gl.LINK_STATUS)) {
+      instanceProgram = null; return;
+    }
+    instancePositionLocation = gl.getAttribLocation(
+      instanceProgram, "aPosition");
+    instanceShadeLocation = gl.getAttribLocation(instanceProgram, "aColor");
+    instanceTransformLocation = gl.getAttribLocation(
+      instanceProgram, "aInstanceTransform");
+    instanceTintLocation = gl.getAttribLocation(
+      instanceProgram, "aInstanceTint");
+    instanceModelLocation = gl.getUniformLocation(instanceProgram, "uModel");
+
+    instancePosition = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, instancePosition);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(OCTA_VERTICES),
+      gl.STATIC_DRAW);
+    instanceShade = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceShade);
+    const shades = new Float32Array(6 * 4);
+    for (let at = 0; at < 6; at++) {
+      const shade = at < 2 ? .82 : at < 4 ? 1.08 : 1;
+      shades.set([shade, shade, shade, 1], at * 4);
+    }
+    gl.bufferData(gl.ARRAY_BUFFER, shades, gl.STATIC_DRAW);
+    instanceIndex = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, instanceIndex);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,
+      new Uint16Array(OCTA_INDICES), gl.STATIC_DRAW);
+    instanceTransform = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceTransform);
+    gl.bufferData(gl.ARRAY_BUFFER, octaTransforms.byteLength, gl.DYNAMIC_DRAW);
+    instanceTint = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceTint);
+    gl.bufferData(gl.ARRAY_BUFFER, octaTints.byteLength, gl.DYNAMIC_DRAW);
+    if (vertexArrays) {
+      instanceVertexArray = vertexArrays.createVertexArrayOES();
+      vertexArrays.bindVertexArrayOES(instanceVertexArray);
+      gl.bindBuffer(gl.ARRAY_BUFFER, instancePosition);
+      gl.vertexAttribPointer(
+        instancePositionLocation, 3, gl.FLOAT, false, 0, 0);
+      gl.enableVertexAttribArray(instancePositionLocation);
+      gl.bindBuffer(gl.ARRAY_BUFFER, instanceShade);
+      gl.vertexAttribPointer(
+        instanceShadeLocation, 4, gl.FLOAT, false, 0, 0);
+      gl.enableVertexAttribArray(instanceShadeLocation);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, instanceIndex);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceTransform);
+    gl.vertexAttribPointer(
+      instanceTransformLocation, 4, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(instanceTransformLocation);
+    instancing.vertexAttribDivisorANGLE(instanceTransformLocation, 1);
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceTint);
+    gl.vertexAttribPointer(instanceTintLocation, 4, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(instanceTintLocation);
+    instancing.vertexAttribDivisorANGLE(instanceTintLocation, 1);
+    if (vertexArrays) vertexArrays.bindVertexArrayOES(null);
+    instancePointerStart = 0;
+    gl.useProgram(instanceProgram);
+    gl.uniformMatrix4fv(
+      gl.getUniformLocation(instanceProgram, "uProjection"), false, projection);
+    gl.uniformMatrix4fv(
+      gl.getUniformLocation(instanceProgram, "uView"), false,
+      new Float32Array([
+        cosY, sinX * sinY, -cosX * sinY, 0,
+        0, cosX, sinX, 0,
+        sinY, -sinX * cosY, cosX * cosY, 0,
+        0, 0, -7.7, 1,
+      ]));
+    gl.useProgram(program);
+  }
+  initializeInstancing();
+
+  function initializeBoxInstancing() {
+    if (!instancing) return;
+    boxInstanceProgram = gl.createProgram();
+    gl.attachShader(boxInstanceProgram, compile(gl.VERTEX_SHADER, `
+      attribute vec3 aPosition;
+      attribute vec4 aColor;
+      attribute mat4 aInstanceModel;
+      attribute vec4 aInstanceTint;
+      uniform mat4 uProjection;
+      uniform mat4 uModel;
+      uniform mat4 uView;
+      varying lowp vec4 vColor;
+      void main(void) {
+        gl_Position = uProjection * uModel * uView * aInstanceModel
+          * vec4(aPosition, 1.0);
+        vColor = aColor * aInstanceTint;
+      }
+    `));
+    gl.attachShader(boxInstanceProgram, compile(gl.FRAGMENT_SHADER, `
+      varying lowp vec4 vColor;
+      void main(void) { gl_FragColor = vColor; }
+    `));
+    gl.bindAttribLocation(boxInstanceProgram, 0, "aPosition");
+    gl.bindAttribLocation(boxInstanceProgram, 1, "aColor");
+    gl.bindAttribLocation(boxInstanceProgram, 2, "aInstanceModel");
+    gl.bindAttribLocation(boxInstanceProgram, 6, "aInstanceTint");
+    gl.linkProgram(boxInstanceProgram);
+    if (!gl.getProgramParameter(boxInstanceProgram, gl.LINK_STATUS)) {
+      boxInstanceProgram = null;
+      return;
+    }
+    boxInstanceMatrixLocation = gl.getAttribLocation(
+      boxInstanceProgram, "aInstanceModel");
+    boxInstanceTintLocation = gl.getAttribLocation(
+      boxInstanceProgram, "aInstanceTint");
+    boxInstanceModelLocation = gl.getUniformLocation(
+      boxInstanceProgram, "uModel");
+    boxInstancePosition = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, boxInstancePosition);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(BOX_VERTICES),
+      gl.STATIC_DRAW);
+    boxInstanceShade = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, boxInstanceShade);
+    const shades = new Float32Array(24 * 4);
+    for (let vertex = 0; vertex < 24; vertex++) {
+      const shade = FACE_SHADE[(vertex / 4) | 0];
+      shades.set([shade, shade, shade, 1], vertex * 4);
+    }
+    gl.bufferData(gl.ARRAY_BUFFER, shades, gl.STATIC_DRAW);
+    boxInstanceIndex = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, boxInstanceIndex);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(BOX_INDICES),
+      gl.STATIC_DRAW);
+    boxInstanceMatrix = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, boxInstanceMatrix);
+    gl.bufferData(gl.ARRAY_BUFFER, boxInstanceMatrices.byteLength,
+      gl.DYNAMIC_DRAW);
+    boxInstanceTint = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, boxInstanceTint);
+    gl.bufferData(gl.ARRAY_BUFFER, boxInstanceTints.byteLength,
+      gl.DYNAMIC_DRAW);
+    if (vertexArrays) {
+      boxInstanceVertexArray = vertexArrays.createVertexArrayOES();
+      vertexArrays.bindVertexArrayOES(boxInstanceVertexArray);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, boxInstancePosition);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, boxInstanceShade);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(1);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, boxInstanceIndex);
+    gl.bindBuffer(gl.ARRAY_BUFFER, boxInstanceMatrix);
+    for (let column = 0; column < 4; column++) {
+      const location = boxInstanceMatrixLocation + column;
+      gl.vertexAttribPointer(location, 4, gl.FLOAT, false, 64, column * 16);
+      gl.enableVertexAttribArray(location);
+      instancing.vertexAttribDivisorANGLE(location, 1);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, boxInstanceTint);
+    gl.vertexAttribPointer(boxInstanceTintLocation, 4,
+      gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(boxInstanceTintLocation);
+    instancing.vertexAttribDivisorANGLE(boxInstanceTintLocation, 1);
+    if (vertexArrays) vertexArrays.bindVertexArrayOES(null);
+
+    /* Bricks use the same immutable unit box and shader, but retain their
+       own compact transforms and tints.  A collision can therefore patch
+       one 16-byte tint (or one 64-byte transform when a brick disappears)
+       without rebuilding the complete field. */
+    brickInstanceMatrix = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, brickInstanceMatrix);
+    gl.bufferData(gl.ARRAY_BUFFER, brickInstanceMatrices.byteLength,
+      gl.DYNAMIC_DRAW);
+    brickInstanceTint = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, brickInstanceTint);
+    gl.bufferData(gl.ARRAY_BUFFER, brickInstanceTints.byteLength,
+      gl.DYNAMIC_DRAW);
+    if (vertexArrays) {
+      brickInstanceVertexArray = vertexArrays.createVertexArrayOES();
+      vertexArrays.bindVertexArrayOES(brickInstanceVertexArray);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, boxInstancePosition);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, boxInstanceShade);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(1);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, boxInstanceIndex);
+    gl.bindBuffer(gl.ARRAY_BUFFER, brickInstanceMatrix);
+    for (let column = 0; column < 4; column++) {
+      const location = boxInstanceMatrixLocation + column;
+      gl.vertexAttribPointer(location, 4, gl.FLOAT, false, 64, column * 16);
+      gl.enableVertexAttribArray(location);
+      instancing.vertexAttribDivisorANGLE(location, 1);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, brickInstanceTint);
+    gl.vertexAttribPointer(boxInstanceTintLocation, 4,
+      gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(boxInstanceTintLocation);
+    instancing.vertexAttribDivisorANGLE(boxInstanceTintLocation, 1);
+    if (vertexArrays) vertexArrays.bindVertexArrayOES(null);
+
+    gl.useProgram(boxInstanceProgram);
+    gl.uniformMatrix4fv(gl.getUniformLocation(
+      boxInstanceProgram, "uProjection"), false, projection);
+    gl.uniformMatrix4fv(gl.getUniformLocation(
+      boxInstanceProgram, "uView"), false, new Float32Array([
+        cosY, sinX * sinY, -cosX * sinY, 0,
+        0, cosX, sinX, 0,
+        sinY, -sinX * cosY, cosX * cosY, 0,
+        0, 0, -7.7, 1,
+      ]));
+    gl.useProgram(program);
+  }
+  initializeBoxInstancing();
+
+  if (!boxInstanceProgram) {
+    staticPositionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, staticPositionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, positions.byteLength, gl.DYNAMIC_DRAW);
+    staticColorBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, staticColorBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, colors.byteLength, gl.DYNAMIC_DRAW);
+    staticIndexBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, staticIndexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices.byteLength,
+      gl.DYNAMIC_DRAW);
+    staticVertexArray = createMeshVertexArray(
+      staticPositionBuffer, staticColorBuffer, staticIndexBuffer);
   }
 
   const LEVELS = [
@@ -198,11 +631,12 @@
     shield: "PRISM SHIELD", laser: "LASER CORE",
   };
   const powerCycle = ["wide", "multi", "slow", "shield", "laser"];
+  const brickGrid = new Array(BRICK_COLUMNS * BRICK_ROWS).fill(null);
   const SCENE_COLORS = {
-    star: [.28,.55,1], floor: [.05,.16,.32], rail: [.08,.32,.58],
+    star: [.28,.55,1], floor: [.05,.16,.32], rail: [.12,.52,.88],
     paddle: [.16,.72,1], paddleWide: [.2,1,.65], paddleLaser: [1,.28,.22],
     shield: [1,.88,.22], trail: [.24,.85,1], ball: [1,.97,.7],
-    shot: [1,.25,.18], flash: [1,1,1],
+    shot: [1,.25,.18],
   };
   const stars = [];
   let randomState = 0x51f15e1d;
@@ -221,10 +655,10 @@
 
   const state = {
     mode: "title", score: 0, lives: 3, level: 0, combo: 0,
-    bricks: [], balls: [], particles: [], powerups: [], shots: [],
+    bricks: [], balls: [], powerups: [], shots: [],
     paddle: { x: 0, width: 1.55 },
     shield: 0, laser: 0, wideUntil: 0, slowUntil: 0,
-    time: 0, transition: 0, shake: 0, flash: 0,
+    time: 0, transition: 0,
     destroyed: 0, frames: 0, meshDrops: 0, running: true,
   };
   const input = {
@@ -232,20 +666,125 @@
     axis: 0, lastPrimary: false, lastPause: false,
     source: "keyboard", gamepadConnected: false,
   };
-  let lastTimestamp = 0, accumulator = 0, toastUntil = 0;
-  let hudCache = "", hudDirty = true, hudSecond = -1;
+  let lastTimestamp = 0, toastUntil = 0;
+  let hudCache = "", hudScore = "", hudLevel = "", hudLives = "",
+    hudPower = "", hudToast = "", hudDirty = true,
+    hudSecond = -1, hudTick = -1,
+    hudScoreTick = -1;
+  let backgroundDirty = true, backgroundVertexCount = 0;
+  let backgroundIndexCount = 0;
   let staticDirty = true, staticVertexCount = 0, staticIndexCount = 0;
-
-  function makeBall(x = state.paddle.x, y = -2.45, vx = 1.8, vy = 3.2) {
-    return {
-      x, y, vx, vy, radius: .12, stuck: true, alive: true,
+  let qualificationHeavy = false, qualificationProfile = false;
+  let qualificationBridgeProfile = false;
+  let qualificationBurstAt = 0;
+  const qualificationTiming = {
+    samples: 0, update: 0, build: 0, upload: 0, commands: 0, hud: 0,
+    model: 0, clear: 0, staticDraw: 0, dynamicDraw: 0, instanceDraw: 0,
+    frame: 0, maxUpdate: 0, maxBuild: 0, maxUpload: 0, maxCommands: 0,
+    maxHud: 0, maxFrame: 0,
+  };
+  /* Particle bursts are deliberately frequent in the qualification scene.
+     Keep the fixed-capacity effect in compact parallel arrays: this avoids
+     both allocation/collection stalls and dozens of interpreted object-
+     property walks per update/build on the PSP. Direction vectors are also
+     computed once rather than paying trigonometry in the burst frame. */
+  const PARTICLE_LIMIT = 48;
+  const particleX = new Float32Array(PARTICLE_LIMIT);
+  const particleY = new Float32Array(PARTICLE_LIMIT);
+  const particleVx = new Float32Array(PARTICLE_LIMIT);
+  const particleVy = new Float32Array(PARTICLE_LIMIT);
+  const particleLife = new Float32Array(PARTICLE_LIMIT);
+  const particleColors = new Array(PARTICLE_LIMIT);
+  let particleCount = 0;
+  const particleDirections = new Float32Array(32 * 2);
+  for (let at = 0; at < 32; at++) {
+    const angle = at * Math.PI * 2 / 32;
+    particleDirections[at * 2] = Math.cos(angle);
+    particleDirections[at * 2 + 1] = Math.sin(angle);
+  }
+  const BALL_LIMIT = 3;
+  const ballPool = new Array(BALL_LIMIT);
+  for (let at = 0; at < BALL_LIMIT; at++) {
+    ballPool[at] = {
+      x: 0, y: 0, vx: 0, vy: 0, radius: .12,
+      stuck: true, alive: false,
       trailX: new Float32Array(7), trailY: new Float32Array(7),
       trailHead: 0, trailCount: 0,
     };
   }
+  const POWERUP_LIMIT = 4;
+  const powerupPool = new Array(POWERUP_LIMIT);
+  for (let at = 0; at < POWERUP_LIMIT; at++)
+    powerupPool[at] = { x: 0, y: 0, type: "wide", phase: 0 };
+  const SHOT_LIMIT = 8;
+  const shotPool = new Array(SHOT_LIMIT);
+  for (let at = 0; at < SHOT_LIMIT; at++) shotPool[at] = { x: 0, y: 0 };
+
+  function resetParticles() {
+    particleCount = 0;
+  }
+
+  function resetBall(ball, x = state.paddle.x, y = -2.45,
+                     vx = 1.8, vy = 3.2) {
+    ball.x = x; ball.y = y; ball.vx = vx; ball.vy = vy;
+    ball.radius = .12; ball.stuck = true; ball.alive = true;
+    ball.trailHead = ball.trailCount = 0;
+    return ball;
+  }
+
+  function makeBall(x = state.paddle.x, y = -2.45, vx = 1.8, vy = 3.2) {
+    for (let at = 0; at < BALL_LIMIT; at++) {
+      if (state.balls.indexOf(ballPool[at]) < 0)
+        return resetBall(ballPool[at], x, y, vx, vy);
+    }
+    return null;
+  }
+
+  function claimPowerup(x, y, type) {
+    for (let at = 0; at < POWERUP_LIMIT; at++) {
+      const power = powerupPool[at];
+      if (state.powerups.indexOf(power) >= 0) continue;
+      power.x = x; power.y = y; power.type = type; power.phase = 0;
+      return power;
+    }
+    return null;
+  }
+
+  function claimShot(x, y) {
+    for (let at = 0; at < SHOT_LIMIT; at++) {
+      const shot = shotPool[at];
+      if (state.shots.indexOf(shot) >= 0) continue;
+      shot.x = x; shot.y = y;
+      return shot;
+    }
+    return null;
+  }
+
+  function markBrickTintDirty(brick) {
+    staticDirty = true;
+    if (!boxInstanceProgram || !brick) return;
+    brickTintDirtyFirst = Math.min(brickTintDirtyFirst, brick.instance);
+    brickTintDirtyLast = Math.max(brickTintDirtyLast, brick.instance);
+  }
+
+  function markBrickMatrixDirty(brick) {
+    staticDirty = true;
+    if (!boxInstanceProgram || !brick) return;
+    brickMatrixDirtyFirst = Math.min(brickMatrixDirtyFirst, brick.instance);
+    brickMatrixDirtyLast = Math.max(brickMatrixDirtyLast, brick.instance);
+  }
+
+  function markAllBricksDirty() {
+    staticDirty = true;
+    brickInstanceCount = state.bricks.length;
+    if (!boxInstanceProgram || !brickInstanceCount) return;
+    brickMatrixDirtyFirst = brickTintDirtyFirst = 0;
+    brickMatrixDirtyLast = brickTintDirtyLast = brickInstanceCount - 1;
+  }
 
   function buildLevel(index) {
     state.bricks.length = 0;
+    brickGrid.fill(null);
     state.powerups.length = 0;
     state.shots.length = 0;
     const rows = LEVELS[index % LEVELS.length];
@@ -253,22 +792,26 @@
       for (let column = 0; column < rows[row].length; column++) {
         const hp = Number(rows[row][column]);
         if (!hp) continue;
-        state.bricks.push({
+        const brick = {
           x: (column - 3.5) * 1.08,
           y: 2.42 - row * .52,
           width: .98, height: .36,
           hp, maximum: hp, alive: true,
           color: PALETTE[Math.min(4, hp)],
-        });
+          instance: state.bricks.length,
+        };
+        state.bricks.push(brick);
+        brickGrid[row * BRICK_COLUMNS + column] = brick;
       }
     }
     state.balls.length = 0;
-    state.balls.push(makeBall());
+    const ball = makeBall();
+    if (ball) state.balls.push(ball);
     state.paddle.x = 0;
     state.paddle.width = state.time < state.wideUntil ? 2.35 : 1.55;
     state.combo = 0;
     state.transition = 0;
-    staticDirty = true;
+    markAllBricksDirty();
     hudDirty = true;
     showToast(`LEVEL ${index + 1}`, 1.2);
   }
@@ -282,7 +825,7 @@
     state.laser = 0;
     state.wideUntil = 0;
     state.slowUntil = 0;
-    state.particles.length = 0;
+    resetParticles();
     randomState = 0x51f15e1d;
     buildLevel(0);
     hudDirty = true;
@@ -298,8 +841,9 @@
   function hidePanel() { ui.panel.hidden = true; }
 
   function showToast(text, seconds = .8) {
-    ui.toast.textContent = text;
-    ui.toast.classList.add("visible");
+    hudToast = String(text).toUpperCase().slice(0, 20);
+    hudMeshDirty = true;
+    hudDirty = true;
     toastUntil = state.time + seconds;
   }
 
@@ -311,7 +855,7 @@
     else if (mode === "game-over")
       showPanel("GAME OVER", `Final score ${state.score}.`, "Play again");
     else if (mode === "victory")
-      showPanel("PRISM MASTER", `All levels clear · ${state.score} points.`, "Play again");
+      showPanel("PRISM MASTER", `All levels clear - ${state.score} points.`, "Play again");
   }
 
   class SoundBank {
@@ -332,7 +876,7 @@
             oscillator.type = at ? "triangle" : "square";
             oscillator.connect(gain).connect(this.context.destination);
             oscillator.start();
-            this.voices.push({ oscillator, gain, timer: 0 });
+            this.voices.push({ oscillator, gain, stopAt: 0 });
           }
         }).catch(() => {});
       } catch (_) { this.context = null; }
@@ -342,8 +886,16 @@
       const voice = this.voices[this.next++ % this.voices.length];
       voice.oscillator.frequency.value = frequency;
       voice.gain.gain.value = volume;
-      clearTimeout(voice.timer);
-      voice.timer = setTimeout(() => { voice.gain.gain.value = 0; }, duration * 1000);
+      voice.stopAt = state.time + duration;
+    }
+    tick(now) {
+      for (let at = 0; at < this.voices.length; at++) {
+        const voice = this.voices[at];
+        if (voice.stopAt && now >= voice.stopAt) {
+          voice.gain.gain.value = 0;
+          voice.stopAt = 0;
+        }
+      }
     }
   }
   const sounds = new SoundBank();
@@ -351,8 +903,11 @@
   function requestPresentation() {
     sounds.start();
     const shell = document.getElementById("game-shell");
-    if (shell && shell.requestFullscreen)
+    if (shell && navigator.tilefinch?.requestPageControls) {
+      navigator.tilefinch.requestPageControls(shell).catch(() => {});
+    } else if (shell && shell.requestFullscreen) {
       shell.requestFullscreen().catch(() => {});
+    }
     canvas.focus();
   }
 
@@ -373,24 +928,29 @@
   }
 
   function spawnParticles(x, y, color, count = 6) {
-    for (let at = 0; at < count && state.particles.length < 48; at++) {
-      const angle = random() * Math.PI * 2, speed = .7 + random() * 1.8;
-      state.particles.push({
-        x, y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
-        life: .35 + random() * .5, maximum: .85, color,
-      });
+    for (let at = 0; at < count && particleCount < PARTICLE_LIMIT; at++) {
+      const particle = particleCount++;
+      const direction = ((random() * 32) | 0) * 2;
+      const speed = .7 + random() * 1.8;
+      particleX[particle] = x;
+      particleY[particle] = y;
+      particleVx[particle] = particleDirections[direction] * speed;
+      particleVy[particle] = particleDirections[direction + 1] * speed;
+      particleLife[particle] = .35 + random() * .5;
+      particleColors[particle] = color;
     }
   }
 
   function maybeDropPower(brick) {
     if (state.powerups.length >= 4 || state.destroyed % 7 !== 0) return;
     const type = powerCycle[((state.destroyed / 7) | 0) % powerCycle.length];
-    state.powerups.push({ x: brick.x, y: brick.y, type, phase: 0 });
+    const power = claimPowerup(brick.x, brick.y, type);
+    if (power) state.powerups.push(power);
   }
 
   function destroyBrick(brick) {
     brick.alive = false;
-    staticDirty = true;
+    markBrickMatrixDirty(brick);
     state.destroyed++;
     state.combo = Math.min(12, state.combo + 1);
     state.score += 100 * state.combo * brick.maximum;
@@ -398,8 +958,6 @@
     const color = PALETTE[Math.min(4, brick.maximum)];
     spawnParticles(brick.x, brick.y, color, 7);
     maybeDropPower(brick);
-    state.shake = Math.min(.13, state.shake + .035);
-    state.flash = .09;
     sounds.play(240 + state.combo * 18, .035, .1);
     if (!state.bricks.some((candidate) => candidate.alive)) {
       state.mode = "level-clear";
@@ -412,13 +970,12 @@
   function hitBrick(brick) {
     if (!brick.alive) return;
     brick.hp--;
-    staticDirty = true;
     if (brick.hp <= 0) destroyBrick(brick);
     else {
+      markBrickTintDirty(brick);
       state.score += 35;
       hudDirty = true;
       spawnParticles(brick.x, brick.y, PALETTE[Math.min(4, brick.maximum)], 3);
-      state.shake = Math.min(.1, state.shake + .018);
       sounds.play(170 + brick.hp * 35, .025, .07);
     }
   }
@@ -434,13 +991,15 @@
     } else if (type === "shield") state.shield = 1;
     else if (type === "laser") state.laser = 12;
     else if (type === "multi" && state.balls.length < 3) {
-      const source = state.balls.find((ball) => ball.alive) || makeBall();
+      const source = state.balls.find((ball) => ball.alive)
+        || state.balls[0] || ballPool[0];
       while (state.balls.length < 3) {
         const direction = state.balls.length & 1 ? -1 : 1;
         const ball = makeBall(
           source.x, source.y,
           direction * Math.max(1.8, Math.abs(source.vx)),
           Math.max(2.5, Math.abs(source.vy)));
+        if (!ball) break;
         ball.stuck = false;
         state.balls.push(ball);
       }
@@ -462,8 +1021,12 @@
       return;
     }
     if (state.laser > 0 && state.shots.length <= 6) {
-      state.shots.push({ x: state.paddle.x - state.paddle.width * .34, y: -2.22 });
-      state.shots.push({ x: state.paddle.x + state.paddle.width * .34, y: -2.22 });
+      const left = claimShot(
+        state.paddle.x - state.paddle.width * .34, -2.22);
+      if (left) state.shots.push(left);
+      const right = claimShot(
+        state.paddle.x + state.paddle.width * .34, -2.22);
+      if (right) state.shots.push(right);
       state.laser--;
       hudDirty = true;
       sounds.play(760, .04, .08);
@@ -495,13 +1058,13 @@
     if (!ui.controls) return;
     if (pad) {
       ui.controls.textContent =
-        "Controller: stick/D-pad moves · A/X acts · Y/Triangle pauses";
+        "Controller: stick/D-pad moves | A/X acts | Y/Triangle pauses";
     } else if (navigator.platform === "PSP") {
       ui.controls.textContent =
-        "Hold Start+Select for page controls · Nub/D-pad moves · X acts · Triangle pauses";
+        "Press Play for game controls | START+SELECT exits | Nub/D-pad moves | X acts";
     } else {
       ui.controls.textContent =
-        "Keyboard: ←/→ or A/D moves · Space/Enter acts · P/Esc pauses";
+        "Keyboard: Left/Right or A/D moves | Space/Enter acts | P/Esc pauses";
     }
   }
 
@@ -619,7 +1182,6 @@
       state.shield = 0;
       ball.y = -3;
       ball.vy = Math.abs(ball.vy);
-      state.shake = .12;
       sounds.play(140, .1, .14);
       return;
     }
@@ -634,7 +1196,8 @@
       sounds.play(90, .3, .14);
     } else {
       state.balls.length = 0;
-      state.balls.push(makeBall());
+      const replacement = makeBall();
+      if (replacement) state.balls.push(replacement);
       showToast("BALL LOST", .9);
     }
   }
@@ -679,8 +1242,23 @@
       state.combo = 0;
       sounds.play(290, .035, .07);
     }
-    for (const brick of state.bricks) {
-      if (brick.alive && ballBrickCollision(ball, brick)) break;
+    /* Bricks occupy the authored 8x6 level lattice. Adjacent-cell probing
+       preserves boundary collisions (the ball can overlap two cells) while
+       replacing three full 40-48 brick scans in the multiball scene with at
+       most nine bounded checks per ball. */
+    const centerColumn = Math.floor(ball.x / 1.08 + 4);
+    const centerRow = Math.floor((2.42 - ball.y) / .52 + .5);
+    let brickHit = false;
+    for (let row = Math.max(0, centerRow - 1);
+         row <= Math.min(BRICK_ROWS - 1, centerRow + 1) && !brickHit; row++) {
+      for (let column = Math.max(0, centerColumn - 1);
+           column <= Math.min(BRICK_COLUMNS - 1, centerColumn + 1); column++) {
+        const brick = brickGrid[row * BRICK_COLUMNS + column];
+        if (brick?.alive && ballBrickCollision(ball, brick)) {
+          brickHit = true;
+          break;
+        }
+      }
     }
     if (ball.y < -3.38) loseBall(ball);
   }
@@ -694,8 +1272,12 @@
           && Math.abs(power.x - state.paddle.x)
              < state.paddle.width * .5 + .18) {
         applyPower(power.type);
-        state.powerups.splice(at, 1);
-      } else if (power.y < -3.35) state.powerups.splice(at, 1);
+        state.powerups[at] = state.powerups[state.powerups.length - 1];
+        state.powerups.pop();
+      } else if (power.y < -3.35) {
+        state.powerups[at] = state.powerups[state.powerups.length - 1];
+        state.powerups.pop();
+      }
     }
   }
 
@@ -705,35 +1287,56 @@
       shot.y += 5.6 * dt;
       let removed = shot.y > 3.3;
       if (!removed) {
-        for (const brick of state.bricks) {
-          if (brick.alive && Math.abs(shot.x - brick.x) < brick.width * .5
-              && Math.abs(shot.y - brick.y) < brick.height * .5 + .12) {
-            hitBrick(brick);
-            removed = true;
-            break;
+        const centerColumn = Math.floor(shot.x / 1.08 + 4);
+        const centerRow = Math.floor((2.42 - shot.y) / .52 + .5);
+        for (let row = Math.max(0, centerRow - 1);
+             row <= Math.min(BRICK_ROWS - 1, centerRow + 1) && !removed;
+             row++) {
+          for (let column = Math.max(0, centerColumn - 1);
+               column <= Math.min(BRICK_COLUMNS - 1, centerColumn + 1);
+               column++) {
+            const brick = brickGrid[row * BRICK_COLUMNS + column];
+            if (brick?.alive
+                && Math.abs(shot.x - brick.x) < brick.width * .5
+                && Math.abs(shot.y - brick.y) < brick.height * .5 + .12) {
+              hitBrick(brick);
+              removed = true;
+              break;
+            }
           }
         }
       }
-      if (removed) state.shots.splice(at, 1);
+      if (removed) {
+        state.shots[at] = state.shots[state.shots.length - 1];
+        state.shots.pop();
+      }
     }
   }
 
   function updateEffects(dt) {
-    state.shake = Math.max(0, state.shake - dt * .45);
-    state.flash = Math.max(0, state.flash - dt);
-    for (let at = state.particles.length - 1; at >= 0; at--) {
-      const particle = state.particles[at];
-      particle.life -= dt;
-      if (particle.life <= 0) {
-        state.particles.splice(at, 1);
+    sounds.tick(state.time);
+    for (let at = particleCount - 1; at >= 0; at--) {
+      particleLife[at] -= dt;
+      if (particleLife[at] <= 0) {
+        const last = --particleCount;
+        if (at != last) {
+          particleX[at] = particleX[last];
+          particleY[at] = particleY[last];
+          particleVx[at] = particleVx[last];
+          particleVy[at] = particleVy[last];
+          particleLife[at] = particleLife[last];
+          particleColors[at] = particleColors[last];
+        }
         continue;
       }
-      particle.x += particle.vx * dt;
-      particle.y += particle.vy * dt;
-      particle.vy -= 1.8 * dt;
+      particleX[at] += particleVx[at] * dt;
+      particleY[at] += particleVy[at] * dt;
+      particleVy[at] -= 1.8 * dt;
     }
     if (toastUntil && state.time >= toastUntil) {
-      ui.toast.classList.remove("visible");
+      hudToast = "";
+      hudMeshDirty = true;
+      hudDirty = true;
       toastUntil = 0;
     }
   }
@@ -742,6 +1345,13 @@
     state.time += dt;
     pollInput();
     updateEffects(dt);
+    /* Explicit query/debug qualification keeps the worst bounded effects
+       resident long enough for a real device cadence run. Normal gameplay
+       never enters this path. */
+    if (qualificationHeavy && state.time >= qualificationBurstAt) {
+      spawnParticles(0, 0, SCENE_COLORS.ball, 48);
+      qualificationBurstAt = state.time + .45;
+    }
     if (state.mode === "level-clear") {
       state.transition -= dt;
       if (state.transition <= 0) {
@@ -760,20 +1370,28 @@
     state.paddle.x = Math.max(
       -4.42 + state.paddle.width * .5,
       Math.min(4.42 - state.paddle.width * .5, state.paddle.x + movement));
-    for (const ball of state.balls) updateBall(ball, dt);
+    for (let ballAt = 0; ballAt < state.balls.length; ballAt++)
+      updateBall(state.balls[ballAt], dt);
     updatePowerups(dt);
     updateShots(dt);
   }
 
-  function buildStaticScene() {
+  function buildBackgroundScene() {
     vertexCount = indexCount = 0;
     for (const star of stars)
       addOctahedron(star.x, star.y, star.z, star.size,
         SCENE_COLORS.star, .48);
     addBox(0, -3.18, .16, 9.35, .08, .42, SCENE_COLORS.floor);
-    addBox(-4.58, 0, .06, .12, 6.35, .35, SCENE_COLORS.rail);
-    addBox(4.58, 0, .06, .12, 6.35, .35, SCENE_COLORS.rail);
+    addBox(-4.49, 0, .08, .18, 6.35, .42, SCENE_COLORS.rail);
+    addBox(4.49, 0, .08, .18, 6.35, .42, SCENE_COLORS.rail);
     addBox(0, 3.18, .06, 9.25, .12, .35, SCENE_COLORS.rail);
+
+    backgroundVertexCount = vertexCount;
+    backgroundIndexCount = indexCount;
+  }
+
+  function buildStaticScene() {
+    vertexCount = indexCount = 0;
 
     for (const brick of state.bricks) {
       if (!brick.alive) continue;
@@ -786,8 +1404,75 @@
     staticIndexCount = indexCount;
   }
 
+  function writeBrickMatrix(instance) {
+    const brick = state.bricks[instance], at = instance * 16;
+    brickInstanceMatrices.fill(0, at, at + 16);
+    if (brick?.alive) {
+      brickInstanceMatrices[at] = brick.width * .5;
+      brickInstanceMatrices[at + 5] = brick.height * .5;
+      brickInstanceMatrices[at + 10] = .17;
+      brickInstanceMatrices[at + 12] = brick.x;
+      brickInstanceMatrices[at + 13] = brick.y;
+      brickInstanceMatrices[at + 14] = 0;
+    } else {
+      /* Keep the retained slot structurally valid but wholly off-clip. */
+      brickInstanceMatrices[at + 12] = 32;
+      brickInstanceMatrices[at + 13] = 32;
+    }
+    brickInstanceMatrices[at + 15] = 1;
+  }
+
+  function writeBrickTint(instance) {
+    const brick = state.bricks[instance], at = instance * 4;
+    if (!brick) {
+      brickInstanceTints.fill(0, at, at + 4);
+      return;
+    }
+    const brightness = .58 + .42 * brick.hp / brick.maximum;
+    brickInstanceTints[at] = brick.color[0] * brightness;
+    brickInstanceTints[at + 1] = brick.color[1] * brightness;
+    brickInstanceTints[at + 2] = brick.color[2] * brightness;
+    brickInstanceTints[at + 3] = 1;
+  }
+
+  function uploadBrickInstances() {
+    if (!boxInstanceProgram) return;
+    let uploaded = 0;
+    if (brickMatrixDirtyLast >= brickMatrixDirtyFirst) {
+      const first = brickMatrixDirtyFirst, last = brickMatrixDirtyLast;
+      for (let instance = first; instance <= last; instance++)
+        writeBrickMatrix(instance);
+      const values = brickInstanceMatrices.subarray(
+        first * 16, (last + 1) * 16);
+      gl.bindBuffer(gl.ARRAY_BUFFER, brickInstanceMatrix);
+      gl.bufferSubData(gl.ARRAY_BUFFER, first * 64, values);
+      uploaded += values.length;
+    }
+    if (brickTintDirtyLast >= brickTintDirtyFirst) {
+      const first = brickTintDirtyFirst, last = brickTintDirtyLast;
+      for (let instance = first; instance <= last; instance++)
+        writeBrickTint(instance);
+      const values = brickInstanceTints.subarray(
+        first * 4, (last + 1) * 4);
+      gl.bindBuffer(gl.ARRAY_BUFFER, brickInstanceTint);
+      gl.bufferSubData(gl.ARRAY_BUFFER, first * 16, values);
+      uploaded += values.length;
+    }
+    brickMatrixDirtyFirst = brickTintDirtyFirst = MAX_BRICK_INSTANCES;
+    brickMatrixDirtyLast = brickTintDirtyLast = -1;
+    if (uploaded) {
+      brickInstanceUploads++;
+      brickInstanceFloatsUploaded += uploaded;
+    }
+    staticVertexCount = staticIndexCount = 0;
+  }
+
   function buildDynamicScene() {
     vertexCount = indexCount = 0;
+    resetOctaInstances();
+    boxInstanceCount = 0;
+    collectInstancedOcta = instanceProgram !== null;
+    collectInstancedBoxes = boxInstanceProgram !== null;
     const paddleColor = state.laser ? SCENE_COLORS.paddleLaser
       : state.time < state.wideUntil
         ? SCENE_COLORS.paddleWide : SCENE_COLORS.paddle;
@@ -796,7 +1481,8 @@
     if (state.shield)
       addBox(0, -3.02, .02, 8.6, .06, .16, SCENE_COLORS.shield, .8);
 
-    for (const ball of state.balls) {
+    for (let ballAt = 0; ballAt < state.balls.length; ballAt++) {
+      const ball = state.balls[ballAt];
       if (!ball.alive) continue;
       for (let at = ball.trailCount - 1; at >= 0; at--) {
         const slot = (ball.trailHead + at) % 7;
@@ -807,24 +1493,29 @@
       }
       addOctahedron(ball.x, ball.y, .1, ball.radius, SCENE_COLORS.ball);
     }
-    for (const power of state.powerups) {
+    for (let powerAt = 0; powerAt < state.powerups.length; powerAt++) {
+      const power = state.powerups[powerAt];
       const bob = Math.sin(power.phase) * .045;
       addOctahedron(power.x, power.y + bob, .14, .19,
         POWER_COLORS[power.type]);
     }
-    for (const shot of state.shots)
+    for (let shotAt = 0; shotAt < state.shots.length; shotAt++) {
+      const shot = state.shots[shotAt];
       addBox(shot.x, shot.y, .1, .055, .28, .09, SCENE_COLORS.shot);
-    for (const particle of state.particles) {
-      const alpha = Math.min(1, particle.life / particle.maximum);
-      addOctahedron(particle.x, particle.y, .22, .035 + .035 * alpha,
-        particle.color, alpha);
     }
-    if (state.flash > 0)
-      addBox(0, 0, .52, 9.05, 5.9, .015,
-             SCENE_COLORS.flash, state.flash * 2.2);
+    for (let particleAt = 0; particleAt < particleCount; particleAt++) {
+      let alpha = particleLife[particleAt] / .85;
+      if (alpha > 1) alpha = 1;
+      addOctahedron(
+        particleX[particleAt], particleY[particleAt], .22,
+        .035 + .035 * alpha, particleColors[particleAt], alpha);
+    }
+    collectInstancedOcta = false;
+    collectInstancedBoxes = false;
   }
 
   function uploadMesh(position, color, index) {
+    if (vertexArrays) vertexArrays.bindVertexArrayOES(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, position);
     gl.bufferSubData(gl.ARRAY_BUFFER, 0,
       positions.subarray(0, vertexCount * 3));
@@ -836,27 +1527,130 @@
       indices.subarray(0, indexCount));
   }
 
-  function drawMesh(position, color, index, count) {
+  function uploadImmutableMesh(position, color, index) {
+    if (vertexArrays) vertexArrays.bindVertexArrayOES(null);
     gl.bindBuffer(gl.ARRAY_BUFFER, position);
-    gl.vertexAttribPointer(positionLocation, 3, gl.FLOAT, false, 0, 0);
+    gl.bufferData(gl.ARRAY_BUFFER,
+      positions.slice(0, vertexCount * 3), gl.STATIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, color);
-    gl.vertexAttribPointer(colorLocation, 4, gl.FLOAT, false, 0, 0);
+    gl.bufferData(gl.ARRAY_BUFFER,
+      colors.slice(0, vertexCount * 4), gl.STATIC_DRAW);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, index);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,
+      indices.slice(0, indexCount), gl.STATIC_DRAW);
+  }
+
+  function drawMesh(vertexArray, position, color, index, count) {
+    if (vertexArrays) vertexArrays.bindVertexArrayOES(vertexArray);
+    else {
+      gl.bindBuffer(gl.ARRAY_BUFFER, position);
+      gl.vertexAttribPointer(positionLocation, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, color);
+      gl.vertexAttribPointer(colorLocation, 4, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, index);
+    }
     gl.drawElements(gl.TRIANGLES, count, gl.UNSIGNED_SHORT, 0);
   }
 
+  function uploadOctaInstances() {
+    if (!instanceProgram || !octaInstanceCount) return;
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceTransform);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0,
+      octaTransforms.subarray(0, octaInstanceCount * 4));
+    gl.bindBuffer(gl.ARRAY_BUFFER, instanceTint);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0,
+      octaTints.subarray(0, octaInstanceCount * 4));
+  }
+
+  function uploadBoxInstances() {
+    if (!boxInstanceProgram || !boxInstanceCount) return;
+    gl.bindBuffer(gl.ARRAY_BUFFER, boxInstanceMatrix);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0,
+      boxInstanceMatrices.subarray(0, boxInstanceCount * 16));
+    gl.bindBuffer(gl.ARRAY_BUFFER, boxInstanceTint);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0,
+      boxInstanceTints.subarray(0, boxInstanceCount * 4));
+  }
+
+  function drawBoxInstanceStream(vertexArray, matrixBuffer, tintBuffer,
+                                 count) {
+    if (!boxInstanceProgram || !count) return;
+    gl.useProgram(boxInstanceProgram);
+    gl.uniformMatrix4fv(boxInstanceModelLocation, false, model);
+    if (vertexArrays) vertexArrays.bindVertexArrayOES(vertexArray);
+    else {
+      gl.bindBuffer(gl.ARRAY_BUFFER, boxInstancePosition);
+      gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, boxInstanceShade);
+      gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, matrixBuffer);
+      for (let column = 0; column < 4; column++)
+        gl.vertexAttribPointer(boxInstanceMatrixLocation + column, 4,
+          gl.FLOAT, false, 64, column * 16);
+      gl.bindBuffer(gl.ARRAY_BUFFER, tintBuffer);
+      gl.vertexAttribPointer(boxInstanceTintLocation, 4,
+        gl.FLOAT, false, 16, 0);
+    }
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, boxInstanceIndex);
+    instancing.drawElementsInstancedANGLE(
+      gl.TRIANGLES, BOX_INDICES.length, gl.UNSIGNED_SHORT, 0,
+      count);
+  }
+
+  function drawBrickInstances() {
+    drawBoxInstanceStream(
+      brickInstanceVertexArray, brickInstanceMatrix, brickInstanceTint,
+      brickInstanceCount);
+    gl.useProgram(program);
+  }
+
+  function drawBoxInstances() {
+    drawBoxInstanceStream(
+      boxInstanceVertexArray, boxInstanceMatrix, boxInstanceTint,
+      boxInstanceCount);
+  }
+
+  function drawOctaInstances() {
+    if (!instanceProgram || !octaInstanceCount) return;
+    gl.useProgram(instanceProgram);
+    gl.uniformMatrix4fv(instanceModelLocation, false, model);
+    if (vertexArrays) vertexArrays.bindVertexArrayOES(instanceVertexArray);
+    else {
+      gl.bindBuffer(gl.ARRAY_BUFFER, instancePosition);
+      gl.vertexAttribPointer(
+        instancePositionLocation, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, instanceShade);
+      gl.vertexAttribPointer(
+        instanceShadeLocation, 4, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, instanceIndex);
+    }
+    for (let first = 0; first < octaInstanceCount;
+         first += MAX_INSTANCES_PER_DRAW) {
+      const count = Math.min(MAX_INSTANCES_PER_DRAW,
+        octaInstanceCount - first);
+      if (instancePointerStart !== first) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, instanceTransform);
+        gl.vertexAttribPointer(instanceTransformLocation, 4,
+          gl.FLOAT, false, 16, first * 16);
+        gl.bindBuffer(gl.ARRAY_BUFFER, instanceTint);
+        gl.vertexAttribPointer(instanceTintLocation, 4,
+          gl.FLOAT, false, 16, first * 16);
+        instancePointerStart = first;
+      }
+      instancing.drawElementsInstancedANGLE(
+        gl.TRIANGLES, OCTA_INDICES.length, gl.UNSIGNED_SHORT, 0, count);
+    }
+    gl.useProgram(program);
+  }
+
   function updateModel() {
-    const angle = state.time * 71;
-    const shakeX = Math.sin(angle) * state.shake;
-    const shakeY = Math.cos(angle * 1.31) * state.shake * .72;
     /* Keep the title field visibly alive without starting game physics. The
        same model-uniform path used by play animates the whole star/rail field,
        so the title adds no geometry uploads, particles, or DOM mutations. */
     const title = state.mode === "title" ? 1 : 0;
     const titleX = title * Math.sin(state.time * .72) * .075;
     const titleY = title * Math.cos(state.time * .54) * .045;
-    const roll = Math.sin(angle * .67) * state.shake * .022
-      + title * Math.sin(state.time * .38) * .012;
+    const roll = title * Math.sin(state.time * .38) * .012;
     const cosine = Math.cos(roll), sine = Math.sin(roll);
     model.fill(0);
     model[0] = cosine;
@@ -864,64 +1658,347 @@
     model[4] = -sine;
     model[5] = cosine;
     model[10] = 1;
-    model[12] = shakeX + titleX;
-    model[13] = shakeY + titleY;
+    model[12] = titleX;
+    model[13] = titleY;
     model[15] = 1;
     gl.uniformMatrix4fv(modelLocation, false, model);
   }
 
+  function writeHudVertex(pixelX, pixelY, tint) {
+    const at = hudVertexCount * 6;
+    hudVertices[at] = pixelX / 160 - 1;
+    hudVertices[at + 1] = 1 - pixelY / 90;
+    hudVertices[at + 2] = tint[0];
+    hudVertices[at + 3] = tint[1];
+    hudVertices[at + 4] = tint[2];
+    hudVertices[at + 5] = tint[3];
+    hudVertexCount++;
+  }
+
+  function addHudRect(pixelX, pixelY, width, height, tint) {
+    if (hudVertexCount / 4 >= HUD_RECT_LIMIT) return false;
+    const base = hudVertexCount;
+    writeHudVertex(pixelX, pixelY, tint);
+    writeHudVertex(pixelX + width, pixelY, tint);
+    writeHudVertex(pixelX + width, pixelY + height, tint);
+    writeHudVertex(pixelX, pixelY + height, tint);
+    hudIndices[hudIndexCount++] = base;
+    hudIndices[hudIndexCount++] = base + 1;
+    hudIndices[hudIndexCount++] = base + 2;
+    hudIndices[hudIndexCount++] = base;
+    hudIndices[hudIndexCount++] = base + 2;
+    hudIndices[hudIndexCount++] = base + 3;
+    return true;
+  }
+
+  function addHudGlyph(character, pixelX, pixelY, scale, tint) {
+    if (hudCharacterCount >= HUD_GLYPH_LIMIT
+        || hudVertexCount / 4 > HUD_RECT_LIMIT - 10) return false;
+    const pattern = HUD_PATTERNS[HUD_CHARS.indexOf(character) >= 0
+      ? character : " "];
+    hudCharacterCount++;
+    for (let row = 0; row < 5; row++) {
+      let column = 0;
+      while (column < 3) {
+        if (pattern[row * 3 + column] !== "1") { column++; continue; }
+        const first = column;
+        while (column < 3 && pattern[row * 3 + column] === "1") column++;
+        if (!addHudRect(pixelX + first * scale, pixelY + row * scale,
+                        (column - first) * scale, scale, tint)) return false;
+      }
+    }
+    return true;
+  }
+
+  function addHudText(text, pixelX, pixelY, scale, tint) {
+    text = String(text).toUpperCase();
+    for (let at = 0; at < text.length; at++) {
+      if (!addHudGlyph(text[at], pixelX, pixelY, scale, tint)) break;
+      pixelX += 4 * scale;
+    }
+  }
+
+  function rebuildHudMesh() {
+    hudVertexCount = hudIndexCount = hudCharacterCount = 0;
+    addHudText(hudScore || "000000", 7, 5, 2, HUD_SCORE_TINT);
+    if (hudPower)
+      addHudText(hudPower, 7, 164, 2, HUD_POWER_TINT);
+    if (hudToast) {
+      const width = hudToast.length * 8;
+      addHudText(hudToast, Math.max(7, (320 - width) * .5), 27, 2,
+        HUD_TOAST_TINT);
+    }
+    if (vertexArrays) vertexArrays.bindVertexArrayOES(hudVertexArray);
+    gl.bindBuffer(gl.ARRAY_BUFFER, hudVertexBuffer);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0,
+      hudVertices.subarray(0, hudVertexCount * 6));
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, hudIndexBuffer);
+    gl.bufferSubData(gl.ELEMENT_ARRAY_BUFFER, 0,
+      hudIndices.subarray(0, hudIndexCount));
+    if (vertexArrays) vertexArrays.bindVertexArrayOES(null);
+    hudMeshDirty = false;
+  }
+
+  function drawHud() {
+    if (!hudIndexCount) return;
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(hudProgram);
+    if (vertexArrays) vertexArrays.bindVertexArrayOES(hudVertexArray);
+    else {
+      gl.bindBuffer(gl.ARRAY_BUFFER, hudVertexBuffer);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 24, 0);
+      gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 24, 8);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, hudIndexBuffer);
+    }
+    gl.drawElements(gl.TRIANGLES, hudIndexCount, gl.UNSIGNED_SHORT, 0);
+    gl.enable(gl.DEPTH_TEST);
+    gl.useProgram(program);
+  }
+
   function updateHud() {
     const second = state.time | 0;
-    if (!hudDirty && second === hudSecond) return;
+    const scoreTick = (state.time * 4) | 0;
+    if (!hudDirty && second === hudSecond && scoreTick === hudTick
+        && !hudMeshDirty) return;
     hudDirty = false;
     hudSecond = second;
+    hudTick = scoreTick;
     let powerText = "";
     if (state.time < state.wideUntil) powerText = "WIDE";
     if (state.time < state.slowUntil)
-      powerText += `${powerText ? " · " : ""}SLOW`;
-    if (state.shield) powerText += `${powerText ? " · " : ""}SHIELD`;
+      powerText += `${powerText ? " " : ""}SLOW`;
+    if (state.shield) powerText += `${powerText ? " " : ""}SHIELD`;
     if (state.laser)
-      powerText += `${powerText ? " · " : ""}LASER ${state.laser}`;
+      powerText += `${powerText ? " " : ""}LASER`;
+    const scoreText = String(state.score).padStart(6, "0"),
+      levelText = `LEVEL ${Math.min(LEVELS.length, state.level + 1)}`,
+      livesText = `LIVES ${state.lives}`;
     const next = `${state.score}|${state.level}|${state.lives}|${powerText}`;
-    if (next === hudCache) return;
+    if (next === hudCache && scoreText === hudScore && !hudMeshDirty) return;
     hudCache = next;
-    ui.score.textContent = String(state.score).padStart(6, "0");
-    ui.level.textContent = `LEVEL ${Math.min(LEVELS.length, state.level + 1)}`;
-    ui.lives.textContent = `LIVES ${state.lives}`;
-    ui.power.textContent = powerText;
+    /* A score change is the common case. Avoid sending the other three
+       unchanged strings through the DOM bridge: on the PSP each authored
+       text mutation has to validate, journal and mark layout damage. */
+    if (scoreText !== hudScore
+        && (hudScore === "" || scoreTick !== hudScoreTick
+            || state.mode !== "playing")) {
+      hudScore = scoreText;
+      hudScoreTick = scoreTick;
+      hudMeshDirty = true;
+    }
+    if (levelText !== hudLevel) {
+      hudLevel = levelText;
+      ui.level.textContent = levelText;
+    }
+    if (livesText !== hudLives) {
+      hudLives = livesText;
+      ui.lives.textContent = livesText;
+    }
+    if (powerText !== hudPower) {
+      hudPower = powerText;
+      hudMeshDirty = true;
+    }
+    if (hudMeshDirty) rebuildHudMesh();
   }
 
-  function render() {
+  function render(profileFrame = false) {
+    const hudStarted = profileFrame ? performance.now() : 0;
+    updateHud();
+    if (profileFrame) {
+      const hudElapsed = performance.now() - hudStarted;
+      qualificationTiming.hud += hudElapsed;
+      qualificationTiming.maxHud = Math.max(
+        qualificationTiming.maxHud, hudElapsed);
+    }
+    if (backgroundDirty) {
+      buildBackgroundScene();
+      uploadImmutableMesh(
+        backgroundPositionBuffer, backgroundColorBuffer,
+        backgroundIndexBuffer);
+      backgroundDirty = false;
+    }
     if (staticDirty) {
-      buildStaticScene();
-      uploadMesh(staticPositionBuffer, staticColorBuffer, staticIndexBuffer);
+      if (boxInstanceProgram) uploadBrickInstances();
+      else {
+        buildStaticScene();
+        uploadMesh(staticPositionBuffer, staticColorBuffer, staticIndexBuffer);
+      }
       staticDirty = false;
     }
+    let phaseStarted = profileFrame ? performance.now() : 0;
     buildDynamicScene();
-    uploadMesh(positionBuffer, colorBuffer, indexBuffer);
+    if (profileFrame) {
+      const now = performance.now();
+      const elapsed = now - phaseStarted;
+      qualificationTiming.build += elapsed;
+      qualificationTiming.maxBuild = Math.max(
+        qualificationTiming.maxBuild, elapsed);
+      phaseStarted = now;
+    }
+    if (indexCount) uploadMesh(positionBuffer, colorBuffer, indexBuffer);
+    uploadBoxInstances();
+    uploadOctaInstances();
+    if (profileFrame) {
+      const now = performance.now();
+      const elapsed = now - phaseStarted;
+      qualificationTiming.upload += elapsed;
+      qualificationTiming.maxUpload = Math.max(
+        qualificationTiming.maxUpload, elapsed);
+      phaseStarted = now;
+    }
+    const commandsStarted = profileFrame ? phaseStarted : 0;
     updateModel();
-    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    if (profileFrame) {
+      const now = performance.now();
+      qualificationTiming.model += now - phaseStarted;
+      phaseStarted = now;
+    }
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    if (staticIndexCount)
-      drawMesh(staticPositionBuffer, staticColorBuffer,
+    if (profileFrame) {
+      const now = performance.now();
+      qualificationTiming.clear += now - phaseStarted;
+      phaseStarted = now;
+    }
+    if (backgroundIndexCount)
+      drawMesh(backgroundVertexArray, backgroundPositionBuffer,
+        backgroundColorBuffer, backgroundIndexBuffer,
+        backgroundIndexCount);
+    if (boxInstanceProgram) drawBrickInstances();
+    else if (staticIndexCount)
+      drawMesh(staticVertexArray, staticPositionBuffer, staticColorBuffer,
         staticIndexBuffer, staticIndexCount);
+    if (profileFrame) {
+      const now = performance.now();
+      qualificationTiming.staticDraw += now - phaseStarted;
+      phaseStarted = now;
+    }
     if (indexCount)
-      drawMesh(positionBuffer, colorBuffer, indexBuffer, indexCount);
+      drawMesh(dynamicVertexArray, positionBuffer, colorBuffer,
+        indexBuffer, indexCount);
+    drawBoxInstances();
+    if (profileFrame) {
+      const now = performance.now();
+      qualificationTiming.dynamicDraw += now - phaseStarted;
+      phaseStarted = now;
+    }
+    drawOctaInstances();
+    drawHud();
+    if (profileFrame) {
+      const now = performance.now();
+      const instanceElapsed = now - phaseStarted;
+      const commandElapsed = now - commandsStarted;
+      qualificationTiming.instanceDraw += instanceElapsed;
+      qualificationTiming.commands += commandElapsed;
+      qualificationTiming.maxCommands = Math.max(
+        qualificationTiming.maxCommands, commandElapsed);
+      phaseStarted = now;
+    }
     state.frames++;
-    updateHud();
+    if (profileFrame) {
+      qualificationTiming.samples++;
+      if (qualificationTiming.samples === 80) {
+        const count = qualificationTiming.samples;
+        const bridge = globalThis.__tilefinchWebGLDiagnostics,
+          bridgeDraws = Math.max(1, Number(bridge?.profileDraws) || 0);
+        const summary = [
+          "PRISM-JS-PROFILE",
+          `samples=${count}`,
+          `update=${(qualificationTiming.update / count).toFixed(3)}ms`,
+          `build=${(qualificationTiming.build / count).toFixed(3)}ms`,
+          `upload=${(qualificationTiming.upload / count).toFixed(3)}ms`,
+          `commands=${(qualificationTiming.commands / count).toFixed(3)}ms`,
+          `model=${(qualificationTiming.model / count).toFixed(3)}ms`,
+          `clear=${(qualificationTiming.clear / count).toFixed(3)}ms`,
+          `static=${(qualificationTiming.staticDraw / count).toFixed(3)}ms`,
+          `dynamic=${(qualificationTiming.dynamicDraw / count).toFixed(3)}ms`,
+          `instances=${(qualificationTiming.instanceDraw / count).toFixed(3)}ms`,
+          `hud=${(qualificationTiming.hud / count).toFixed(3)}ms`,
+          `max-update=${qualificationTiming.maxUpdate.toFixed(3)}ms`,
+          `max-build=${qualificationTiming.maxBuild.toFixed(3)}ms`,
+          `max-upload=${qualificationTiming.maxUpload.toFixed(3)}ms`,
+          `max-commands=${qualificationTiming.maxCommands.toFixed(3)}ms`,
+          `max-hud=${qualificationTiming.maxHud.toFixed(3)}ms`,
+          `max-frame=${qualificationTiming.maxFrame.toFixed(3)}ms`,
+          `bridge-draws=${bridgeDraws}`,
+          `bridge-basic=${(Number(bridge?.profileBasicMs || 0) / bridgeDraws).toFixed(3)}ms`,
+          `bridge-instance=${(Number(bridge?.profileInstancesMs || 0) / bridgeDraws).toFixed(3)}ms`,
+          `bridge-range=${(Number(bridge?.profileRangesMs || 0) / bridgeDraws).toFixed(3)}ms`,
+          `bridge-prepare=${(Number(bridge?.profilePrepareMs || 0) / bridgeDraws).toFixed(3)}ms`,
+          `bridge-enqueue=${(Number(bridge?.profileEnqueueMs || 0) / bridgeDraws).toFixed(3)}ms`,
+          `bridge-finish=${(Number(bridge?.profileFinishMs || 0) / bridgeDraws).toFixed(3)}ms`,
+          `bridge-admit=${(Number(bridge?.profileQueueAdmissionMs || 0) / bridgeDraws).toFixed(3)}ms`,
+          `bridge-pack=${(Number(bridge?.profileWirePackMs || 0) / bridgeDraws).toFixed(3)}ms`,
+          `wire-sources=${(Number(bridge?.profileWireSourcesMs || 0) / bridgeDraws).toFixed(3)}ms`,
+          `wire-state=${(Number(bridge?.profileWireStateMs || 0) / bridgeDraws).toFixed(3)}ms`,
+          `wire-instances=${(Number(bridge?.profileWireInstancesMs || 0) / bridgeDraws).toFixed(3)}ms`,
+          `wire-retain=${(Number(bridge?.profileWireRetainMs || 0) / bridgeDraws).toFixed(3)}ms`,
+        ].join(" ");
+        globalThis.pocSummary = summary;
+        console.log(summary);
+        if (bridge) bridge.profileDrawPhases = false;
+      }
+    }
   }
 
   function frame(timestamp) {
     if (!state.running) return;
-    const elapsed = lastTimestamp ? Math.min(.05, (timestamp - lastTimestamp) / 1000) : 0;
+    /* A catch-up accumulator makes a slow device perform two complete game
+       updates in an already late frame, which creates a self-sustaining
+       latency spike. The fastest authored objects move less than one brick
+       thickness in 1/30 s, so one capped variable step remains collision-safe
+       and lets a long stall degrade by slowing time instead of compounding. */
+    const elapsed = lastTimestamp
+      ? Math.min(1 / 30, (timestamp - lastTimestamp) / 1000) : 0;
     lastTimestamp = timestamp;
-    accumulator = Math.min(.08, accumulator + elapsed);
-    while (accumulator >= 1 / 60) {
-      update(1 / 60);
-      accumulator -= 1 / 60;
+    const profileFrame = qualificationProfile
+      && qualificationTiming.samples < 80 && state.frames >= 8;
+    const frameStarted = profileFrame ? performance.now() : 0;
+    const updateStarted = profileFrame ? performance.now() : 0;
+    if (elapsed > 0) update(elapsed);
+    if (profileFrame) {
+      const updateElapsed = performance.now() - updateStarted;
+      qualificationTiming.update += updateElapsed;
+      qualificationTiming.maxUpdate = Math.max(
+        qualificationTiming.maxUpdate, updateElapsed);
     }
-    render();
+    render(profileFrame);
+    if (profileFrame) {
+      const frameElapsed = performance.now() - frameStarted;
+      qualificationTiming.frame += frameElapsed;
+      qualificationTiming.maxFrame = Math.max(
+        qualificationTiming.maxFrame, frameElapsed);
+    }
     requestAnimationFrame(frame);
+  }
+
+  function beginQualification(mode) {
+    qualificationHeavy = mode === "heavy" || mode === "profile"
+      || mode === "tail";
+    qualificationProfile = mode === "profile" || mode === "tail";
+    qualificationBridgeProfile = mode === "profile";
+    for (const key of Object.keys(qualificationTiming))
+      qualificationTiming[key] = 0;
+    const bridge = globalThis.__tilefinchWebGLDiagnostics;
+    if (bridge) {
+      bridge.profileDrawPhases = qualificationBridgeProfile;
+      for (const key of ["profileDraws", "profileBasicMs",
+        "profileInstancesMs", "profileRangesMs", "profilePrepareMs",
+        "profileEnqueueMs", "profileFinishMs", "profileQueueAdmissionMs",
+        "profileWirePackMs", "profileWireSourcesMs", "profileWireStateMs",
+        "profileWireInstancesMs", "profileWireRetainMs"]) bridge[key] = 0;
+    }
+    qualificationBurstAt = 0;
+    resetGame();
+    setMode("playing");
+    launchOrFire();
+    if (qualificationHeavy) {
+      applyPower("multi");
+      applyPower("wide");
+      applyPower("shield");
+      applyPower("laser");
+      spawnParticles(0, 0, SCENE_COLORS.ball, 48);
+      qualificationBurstAt = .45;
+    }
   }
 
   const debug = Object.freeze({
@@ -932,30 +2009,49 @@
       render();
     },
     clearLevel() {
-      for (const brick of state.bricks) brick.alive = false;
+      for (const brick of state.bricks) {
+        brick.alive = false;
+        markBrickMatrixDirty(brick);
+      }
       state.mode = "level-clear";
       state.transition = 0;
-      staticDirty = true;
+    },
+    strikeBrick(index = 0) {
+      index = Math.max(0, Math.min(state.bricks.length - 1,
+        Number(index) | 0));
+      const brick = state.bricks[index];
+      if (brick?.alive) hitBrick(brick);
+      render();
+    },
+    setScore(value) {
+      state.score = Math.max(0, Number(value) | 0);
+      hudDirty = true;
+      hudScoreTick = -1;
+      updateHud();
     },
     injectPower(type) {
       if (Object.prototype.hasOwnProperty.call(POWER_NAMES, type)) applyPower(type);
     },
     burst() {
       spawnParticles(0, 0, SCENE_COLORS.ball, 48);
-      state.shake = .13;
-      state.flash = .09;
       render();
     },
     launch() { launchOrFire(); },
+    qualify(mode) { beginQualification(String(mode)); },
     snapshot() {
       return {
         mode: state.mode, score: state.score, lives: state.lives,
         level: state.level, bricks: state.bricks.filter((brick) => brick.alive).length,
         balls: state.balls.filter((ball) => ball.alive).length,
         movingBalls: state.balls.filter((ball) => ball.alive && !ball.stuck).length,
-        particles: state.particles.length, powerups: state.powerups.length,
+        particles: particleCount, powerups: state.powerups.length,
         shots: state.shots.length, vertices: vertexCount, indices: indexCount,
+        backgroundVertices: backgroundVertexCount,
+        backgroundIndices: backgroundIndexCount,
         staticVertices: staticVertexCount, staticIndices: staticIndexCount,
+        brickInstances: boxInstanceProgram ? brickInstanceCount : 0,
+        hudGlyphs: hudCharacterCount,
+        brickInstanceUploads, brickInstanceFloatsUploaded,
         paddleX: state.paddle.x, paddleWidth: state.paddle.width,
         shield: state.shield, laser: state.laser,
         meshDrops: state.meshDrops, frames: state.frames,
@@ -970,10 +2066,15 @@
     value: debug, configurable: false, writable: false,
   });
   globalThis.pocSummary = "PRISM-BREAK-READY";
-  if (location.search.includes("demo=1")) {
-    resetGame();
-    setMode("playing");
-    launchOrFire();
+  if (location.search.includes("qualification=profile")) {
+    beginQualification("profile");
+  } else if (location.search.includes("qualification=tail")) {
+    beginQualification("tail");
+  } else if (location.search.includes("qualification=heavy")) {
+    beginQualification("heavy");
+  } else if (location.search.includes("qualification=ordinary")
+             || location.search.includes("demo=1")) {
+    beginQualification("ordinary");
   } else {
     /* Offline installation serializes the live document. Re-establish the
        authored entry state in case the snapshot was taken while the game or

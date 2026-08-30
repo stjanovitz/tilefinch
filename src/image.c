@@ -16,6 +16,9 @@
 #include "tilefinch/integer_math.h"
 #include "tilefinch/layout.h"
 #include "tilefinch/platform.h"
+#if defined(__PSP__)
+#include "tilefinch/psp_display.h"
+#endif
 #include "tilefinch/url.h"
 #include "image_decode_internal.h"
 #include "image_svg_decode_internal.h"
@@ -71,6 +74,7 @@ static void image_trace(const char *reason, const char *source,
 #define IMAGE_DATA_URL_SOURCE_LIMIT (256u * 1024u)
 #define IMAGE_TRAVERSAL_PENDING_LIMIT 2048u
 #define IMAGE_TRAVERSAL_NODE_LIMIT 65536u
+#define IMAGE_EXISTING_ALIAS_VISIT_LIMIT 4096u
 
 typedef struct {
     lxb_dom_node_t *node;
@@ -627,6 +631,14 @@ static void image_canvas_copy_rect(unsigned char *destination,
     }
 }
 
+static void image_canvas_native_forget(ImageResource *resource)
+{
+    if (resource == NULL || resource->canvas_native_surface == NULL) return;
+    memset(resource->canvas_native_surface, 0,
+           sizeof(*resource->canvas_native_surface));
+    resource->canvas_native_surface = NULL;
+}
+
 ImageCanvasCommitResult images_prepare_canvas_surface(
     ImageResources *images, Budget *budget, lxb_dom_node_t *node,
     int width, int height, unsigned char **rgba_pixels)
@@ -719,6 +731,7 @@ ImageCanvasCommitResult images_prepare_canvas_surface(
     existing->width = width;
     existing->height = height;
     existing->owns_pixels = true;
+    image_canvas_native_forget(existing);
     if (old_bytes <= images->stats.decoded_bytes) {
         images->stats.decoded_bytes -= old_bytes;
     } else {
@@ -783,6 +796,7 @@ bool images_release_canvas(ImageResources *images, Budget *budget,
         }
         size_t bytes = resource->width > 0 && resource->height > 0
             ? (size_t) resource->width * (size_t) resource->height * 4u : 0u;
+        image_canvas_native_forget(resource);
         image_resource_release_owned_pixels(budget, resource);
         if (bytes <= images->stats.decoded_bytes)
             images->stats.decoded_bytes -= bytes;
@@ -829,10 +843,120 @@ ImageCanvasCommitResult images_commit_canvas_surface(
     if (prepared == IMAGE_CANVAS_COMMIT_REFUSED || destination == NULL) {
         return IMAGE_CANVAS_COMMIT_REFUSED;
     }
+    ImageResource *resource = NULL;
+    for (size_t i = 0; i < images->count; i++) {
+        if (images->items[i].node == node && images->items[i].is_canvas) {
+            resource = &images->items[i];
+            break;
+        }
+    }
+    if (resource != NULL) {
+        image_canvas_native_forget(resource);
+    }
     image_canvas_copy_rect(destination, rgba_pixels, width,
                            dirty_left, dirty_top,
                            dirty_right, dirty_bottom);
+    (void) images_set_canvas_opaque(images, node, false);
     return prepared;
+}
+
+bool images_set_canvas_opaque(ImageResources *images,
+                              lxb_dom_node_t *node, bool opaque)
+{
+    if (images == NULL || node == NULL) return false;
+    for (size_t i = 0; i < images->count; i++) {
+        ImageResource *resource = &images->items[i];
+        if (resource->node != node || !resource->is_canvas
+            || resource->is_mask || resource->is_background) continue;
+        resource->canvas_opaque = opaque;
+        return true;
+    }
+    return false;
+}
+
+bool image_resource_native_canvas_source(const ImageResource *image,
+                                         const unsigned char **pixels,
+                                         size_t *stride)
+{
+    if (pixels != NULL) *pixels = NULL;
+    if (stride != NULL) *stride = 0u;
+    if (image == NULL || pixels == NULL || stride == NULL
+        || !image->is_canvas || image->canvas_native_surface == NULL
+        || !image->canvas_native_surface->authoritative
+        || image->canvas_native_surface->pixels == NULL || image->width <= 0
+        || image->height <= 0
+        || image->canvas_native_surface->stride
+               < (size_t) image->width * 4u) {
+        return false;
+    }
+#if defined(__PSP__)
+    if (image->canvas_native_surface->epoch
+        != psp_display_edram_content_epoch())
+        return false;
+#endif
+    *pixels = image->canvas_native_surface->pixels;
+    *stride = image->canvas_native_surface->stride;
+    return true;
+}
+
+bool image_resource_materialize_native_canvas(ImageResource *image)
+{
+    const unsigned char *source = NULL;
+    size_t stride = 0u;
+    if (!image_resource_native_canvas_source(image, &source, &stride)
+        || image->pixels == NULL) return false;
+    size_t row_bytes = (size_t) image->width * 4u;
+    for (int y = 0; y < image->height; y++) memcpy(
+        image->pixels + (size_t) y * row_bytes,
+        source + (size_t) y * stride, row_bytes);
+    image_canvas_native_forget(image);
+    return true;
+}
+
+bool images_set_canvas_native_surface(ImageResources *images,
+                                      lxb_dom_node_t *node,
+                                      const unsigned char *pixels,
+                                      size_t stride, uint32_t epoch)
+{
+    if (images == NULL || node == NULL || pixels == NULL) return false;
+    for (size_t i = 0; i < images->count; i++) {
+        ImageResource *resource = &images->items[i];
+        if (resource->node != node || !resource->is_canvas
+            || resource->width <= 0
+            || stride < (size_t) resource->width * 4u) continue;
+        size_t slot = 2u;
+        for (size_t native = 0; native < 2u; native++) {
+            if (images->canvas_native[native].node == node) {
+                slot = native;
+                break;
+            }
+            if (slot == 2u && images->canvas_native[native].node == NULL)
+                slot = native;
+        }
+        if (slot == 2u) return false;
+        images->canvas_native[slot] = (ImageCanvasNativeSurface) {
+            .node = node,
+            .pixels = pixels,
+            .stride = stride,
+            .epoch = epoch,
+            .authoritative = true
+        };
+        resource->canvas_native_surface = &images->canvas_native[slot];
+        return true;
+    }
+    return false;
+}
+
+bool images_materialize_canvas_native_surface(ImageResources *images,
+                                              lxb_dom_node_t *node)
+{
+    if (images == NULL || node == NULL) return false;
+    for (size_t i = 0; i < images->count; i++) {
+        ImageResource *resource = &images->items[i];
+        if (resource->node == node && resource->is_canvas)
+            return image_resource_materialize_native_canvas(resource);
+    }
+    return false;
 }
 
 bool images_adopt_decoded_surface(ImageResources *images, Budget *budget,
@@ -916,14 +1040,17 @@ bool images_replace_with_decoded_surface(ImageResources *images,
         if (retired->owns_pixels && alias->pixels == retired->pixels) {
             alias->pixel_body = retired->pixel_body;
             alias->owns_pixels = true;
+            retired->owns_pixels = false;
             pixels_retained = true;
         }
         if (retired->owns_encoded
             && alias->encoded == retired->encoded
             && alias->encoded_body == retired->encoded_body) {
             alias->owns_encoded = true;
+            retired->owns_encoded = false;
             encoded_retained = true;
         }
+        if (!retired->owns_pixels && !retired->owns_encoded) break;
     }
     if (retired->owns_pixels && !pixels_retained) {
         size_t retired_bytes = 0;
@@ -949,6 +1076,7 @@ bool images_replace_with_decoded_surface(ImageResources *images,
             retired->encoded_length <= images->stats.encoded_bytes
             ? images->stats.encoded_bytes - retired->encoded_length : 0;
     }
+    image_canvas_native_forget(retired);
     *retired = (ImageResource) {
         .node = node,
         .pixels = rgba_pixels,
@@ -3177,6 +3305,163 @@ static bool image_rewrite_webp_sibling(char url[4096])
     return true;
 }
 
+static const ImageResource *image_find_document_hash(
+    const ImageResources *images, uint64_t hash)
+{
+    if (images == NULL) return NULL;
+    for (size_t i = 0; i < images->count; i++) {
+        const ImageResource *item = &images->items[i];
+        if (item->url_hash == hash && !item->is_mask
+            && !item->is_background && !item->is_canvas
+            && image_resource_available(item)) return item;
+    }
+    return NULL;
+}
+
+static lxb_dom_node_t *image_next_within_subtree(
+    lxb_dom_node_t *node, lxb_dom_node_t *root)
+{
+    if (node == NULL || root == NULL) return NULL;
+    if (node->first_child != NULL) return node->first_child;
+    while (node != NULL && node != root) {
+        if (node->next != NULL) return node->next;
+        node = node->parent;
+    }
+    return NULL;
+}
+
+static bool image_alias_add(ImageResources *images, ImageResource resource,
+                            ImageAliasResult *result)
+{
+    if (images->count >= MAX_TRACKED_IMAGE_NODES) {
+        images->stats.skipped_limit++;
+        return true;
+    }
+    if (images->count == images->capacity) {
+        size_t capacity = images->capacity == 0 ? 16u
+            : images->capacity * 2u;
+        if (capacity > MAX_TRACKED_IMAGE_NODES)
+            capacity = MAX_TRACKED_IMAGE_NODES;
+        ImageResource *items = NULL;
+        if (result->previous_items == NULL) {
+            items = budget_malloc(
+                images->budget, capacity * sizeof(*items));
+            if (items != NULL && images->count != 0) {
+                memcpy(items, images->items,
+                       images->count * sizeof(*items));
+            }
+            if (items != NULL) {
+                result->previous_items = images->items;
+            }
+        } else {
+            /* No retained layout can point into this intermediate table: its
+               pointers still target previous_items until the caller rebinds
+               them after aliasing completes. */
+            items = budget_realloc(
+                images->budget, images->items,
+                capacity * sizeof(*items));
+        }
+        if (items == NULL) return false;
+        images->items = items;
+        images->capacity = capacity;
+    }
+    images->items[images->count++] = resource;
+    return true;
+}
+
+ImageAliasResult images_alias_existing_document_subtree(
+    const Stylesheet *stylesheet, ImageResources *images,
+    lxb_dom_node_t *root, const char *base_url,
+    const char *document_url, const char *referrer_policy,
+    size_t maximum_aliases)
+{
+    ImageAliasResult result = {0};
+    if (images == NULL || images->budget == NULL || root == NULL
+        || base_url == NULL || document_url == NULL
+        || referrer_policy == NULL || maximum_aliases == 0) return result;
+    if (maximum_aliases > MAX_TRACKED_IMAGE_NODES)
+        maximum_aliases = MAX_TRACKED_IMAGE_NODES;
+    result.previous_count = images->count;
+
+    ImageRequestScratch *scratch = NULL;
+    lxb_dom_node_t *node = root;
+    for (size_t visited = 0;
+         node != NULL && visited < IMAGE_EXISTING_ALIAS_VISIT_LIMIT;
+         visited++, node = image_next_within_subtree(node, root)) {
+        if (result.aliased == maximum_aliases
+            || images->count == MAX_TRACKED_IMAGE_NODES) break;
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
+            || !image_name_is(node, "img")) {
+            continue;
+        }
+
+        size_t source_length = 0;
+        const char *source = image_select_source(
+            stylesheet, node, &source_length);
+        bool data_source = source != NULL && source_length > 5u
+            && strncasecmp(source, "data:", 5u) == 0;
+        if (source == NULL || source_length == 0
+            || (!data_source && source_length >= 2048u)
+            || (data_source
+                && source_length > IMAGE_DATA_URL_SOURCE_LIMIT)) {
+            continue;
+        }
+        uint64_t source_hash = image_hash_bytes(source, source_length);
+        if (image_node_already_tracked(
+                images, node, source_hash, false, false, PSEUDO_NONE)) {
+            continue;
+        }
+
+        uint64_t url_hash = 0;
+        if (data_source) {
+            url_hash = source_hash;
+        } else {
+            if (scratch == NULL) {
+                scratch = budget_malloc(images->budget, sizeof(*scratch));
+                if (scratch == NULL) break;
+            }
+            memcpy(scratch->reference, source, source_length);
+            scratch->reference[source_length] = '\0';
+            if (!fetch_resolve_url(base_url, scratch->reference,
+                                   scratch->resolved,
+                                   sizeof(scratch->resolved))) {
+                continue;
+            }
+            (void) image_rewrite_webp_sibling(scratch->resolved);
+            url_hash = image_hash_request(
+                scratch->resolved, document_url, referrer_policy);
+        }
+        const ImageResource *existing = image_find_document_hash(
+            images, url_hash);
+        if (existing == NULL) continue;
+
+        /* A successful image_add() may move the bounded resource table, so
+           snapshot the owner metadata before growing it. The alias never
+           retains `existing` or its DOM node. */
+        ImageResource alias = *existing;
+        alias.node = node;
+        alias.source_hash = source_hash;
+        alias.owns_pixels = false;
+        alias.owns_encoded = false;
+        size_t count_before = images->count;
+        if (!image_alias_add(images, alias, &result)) break;
+        if (images->count == count_before) break;
+        images->stats.duplicate++;
+        result.aliased++;
+    }
+    budget_free(images->budget, scratch);
+    return result;
+}
+
+void images_alias_result_release(ImageResources *images,
+                                 ImageAliasResult *result)
+{
+    if (images == NULL || result == NULL) return;
+    if (images->budget != NULL)
+        budget_free(images->budget, result->previous_items);
+    memset(result, 0, sizeof(*result));
+}
+
 static bool load_image_node_with_provenance_impl(
     ImageLoadContext *context, lxb_dom_node_t *node,
     const char *source, size_t source_length,
@@ -4038,6 +4323,7 @@ static void images_rollback_optional_suffix(
         || retained_count > images->count) return;
     for (size_t i = retained_count; i < images->count; i++) {
         ImageResource *item = &images->items[i];
+        image_canvas_native_forget(item);
         image_resource_release_owned_pixels(images->budget, item);
         if (item->owns_encoded) {
             if (item->encoded_body != NULL) {
@@ -4467,6 +4753,7 @@ bool images_refresh_external_nodes(
     for (size_t i = 0; i < images->count; i++) {
         ImageResource item = images->items[i];
         if (image_node_in_refresh_set(item.node, nodes, node_count)) {
+            image_canvas_native_forget(&item);
             image_resource_release_owned_pixels(budget, &item);
             if (item.owns_encoded) {
                 if (item.encoded_body != NULL) {
@@ -4879,6 +5166,7 @@ void images_destroy(ImageResources *images)
     if (images == NULL) return;
     if (images->budget != NULL) {
         for (size_t i = 0; i < images->count; i++) {
+            image_canvas_native_forget(&images->items[i]);
             image_resource_release_owned_pixels(
                 images->budget, &images->items[i]);
             if (images->items[i].owns_encoded) {

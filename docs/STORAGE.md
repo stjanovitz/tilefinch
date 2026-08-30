@@ -185,7 +185,7 @@ free-space helper.
 |---|---|---|---|---|
 | `library.bin` (+`.bak`) | `offline_library.c` | ≤ 32 KB | never (12-item index) | backup rotation; loader tries primary, `.tmp`, then `.bak` |
 | `<id>.article.html` (+`.bak`) | `offline_library.c` | ≤ 1 MB each | user delete; replaced when the same URL is saved again | backup rotation; length + FNV checksum verified on read |
-| `<id>.app.html`, `<id>.app.pack`, `<id>.app.icon` | `offline_library.c` | ≤ 1 MB markup + 1 MiB/32 same-origin responses + 1 KiB icon | user delete or reinstall | each generation has a fresh id; lengths and FNV checksums gate restore, and the index publishes before the prior generation is removed |
+| `<id>.app.html`, `<id>.app.pack`, `<id>.app.icon` | `offline_library.c` | ≤ 1 MB markup + 1 MiB/32 same-origin responses + 512 KiB optional source-bound classic-script bytecode + 160 KiB pack metadata + 1 KiB icon | user delete or reinstall | each generation has a fresh id; lengths and FNV checksums gate restore, compiler-ABI mismatch falls back to retained source, and the index publishes before the prior generation is removed |
 | `<id>.video.mp4`, `<id>.audio.mp4` | `offline_download.c` | ≤ 512 MB per stream | user delete | `.part` renamed into place after exact-length ranged download |
 | `<id>.video.part`, `<id>.audio.part` | `offline_download.c` | ≤ stream size | resumed, or reclaimed by the orphan sweep | append-only; size re-validated against the index on load |
 
