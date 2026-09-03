@@ -386,7 +386,7 @@ bool script_execution_policy_for_profile(
         return true;
     case SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC:
         /* The measured 5 MiB realistic realm admits one 384 KiB authored
-           Game Profile script. Strict remains at the smaller 256 KiB unit;
+           Game Profile script. Strict remains at the smaller 267 KiB unit;
            both retain a hard per-call bound and the same aggregate quotas. */
         policy->maximum_host_compile_source_bytes =
             SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES;

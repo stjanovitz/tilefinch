@@ -8,6 +8,15 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.15 — 2026-09-02
+
+- Added bounded WebAssembly and Web Worker support for more modern sites.
+- Improved complex-page reliability with better fallback, Reader, and history
+  recovery.
+- Added native playback cards for pages that declare playable video.
+- Improved JavaScript memory use and hardened browsing, media, and offline-game
+  lifecycles.
+
 ## 0.1.14 — 2026-08-30
 
 - Added Treadline Arena, an installable 3D tank game with Arcade and Classic

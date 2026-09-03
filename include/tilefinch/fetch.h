@@ -16,6 +16,11 @@ struct TilefinchContentSecurityPolicy;
 
 #define FETCH_SET_COOKIE_LIMIT 4096
 #define FETCH_RESPONSE_COOKIE_CAPACITY 32
+/* Page fetch/XHR bodies are retained once by the JavaScript value and once by
+   the bounded scheduler while a request is in flight. 96 KiB admits measured
+   standards-based challenge redemption payloads (about 87 KiB) without
+   allowing request memory to scale with author input. */
+#define FETCH_REQUEST_BODY_LIMIT (96u * 1024u)
 #define TILEFINCH_CA_BUNDLE_VERSION 2u
 #define TILEFINCH_CA_BUNDLE_SHA256_BYTES 32u
 #define TILEFINCH_TLS_PEER_ISSUER_LIMIT 96u
@@ -405,6 +410,10 @@ bool fetch_request_validate(
 bool fetch_accepted_critical_client_hints(
     const char *accept_ch, const char *critical_ch,
     char *output, size_t output_size);
+/* True when every valid token in required is already present in available.
+   Both lists use the bounded comma-separated Client Hints grammar. */
+bool fetch_client_hint_tokens_cover(
+    const char *available, const char *required);
 
 typedef bool (*FetchCancelCallback)(void *opaque);
 typedef bool (*FetchStreamHeadersCallback)(void *opaque,

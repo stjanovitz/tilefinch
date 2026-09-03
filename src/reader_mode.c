@@ -6,6 +6,7 @@
 #include <strings.h>
 
 #include "tilefinch/platform.h"
+#include "tilefinch/media_discovery.h"
 
 #include <lexbor/dom/interfaces/element.h>
 
@@ -76,6 +77,7 @@ typedef struct {
 } ReaderMutationJournal;
 
 typedef struct {
+    const PocDocument *document;
     char *data;
     size_t length;
     size_t capacity;
@@ -468,8 +470,16 @@ static bool reader_header_is_page_chrome(lxb_dom_node_t *node)
     return true;
 }
 
-static bool reader_excluded_region(lxb_dom_node_t *node)
+static bool reader_engine_media_marker(
+    const PocDocument *document, lxb_dom_node_t *node)
 {
+    return document_is_declared_video_card(document, node);
+}
+
+static bool reader_excluded_region(
+    const PocDocument *document, lxb_dom_node_t *node)
+{
+    if (reader_engine_media_marker(document, node)) return true;
     if (reader_name_is(node, "nav") || reader_name_is(node, "aside")
         || reader_name_is(node, "footer") || reader_name_is(node, "form")
         || reader_name_is(node, "menu")
@@ -479,6 +489,28 @@ static bool reader_excluded_region(lxb_dom_node_t *node)
     };
     return reader_attribute_has_any_token(
         node, "role", roles, sizeof(roles) / sizeof(roles[0]));
+}
+
+static bool reader_document_has_video_element(PocDocument *document)
+{
+    lxb_dom_node_t *body = document_body_node(document);
+    if (body == NULL) return false;
+    lxb_dom_node_t *node = body;
+    lxb_dom_node_t *boundary = body->parent;
+    size_t visited = 0u;
+    while (node != NULL && node != boundary && visited++ < READER_NODE_LIMIT) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT
+            && reader_name_is(node, "video")
+            && !document_is_declared_video_card(document, node)) return true;
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != NULL && node != boundary && node->next == NULL)
+            node = node->parent;
+        node = node == NULL || node == boundary ? NULL : node->next;
+    }
+    return false;
 }
 
 static bool reader_primary_media_element(lxb_dom_node_t *node)
@@ -653,6 +685,41 @@ static bool reader_extract_escaped(ReaderExtractBuffer *output,
         }
     }
     return true;
+}
+
+static bool reader_extract_declared_video(
+    ReaderExtractBuffer *output, const MediaDeclaredVideo *declared)
+{
+    if (output == NULL || declared == NULL
+        || declared->media_url[0] == '\0') return false;
+    if (!reader_extract_literal(
+            output,
+            "<video controls data-tilefinch-declared-media-card=reader "
+            "style=\"display:block;width:100%;height:135px;max-height:50vh;"
+            "box-sizing:border-box;margin:8px 0;border:2px solid #547696;"
+            "border-radius:8px;background:#162431\" aria-label=\""))
+        return false;
+    const char *label = declared->title[0] == '\0'
+        ? "Play declared video in Tilefinch" : declared->title;
+    if (!reader_extract_escaped(
+            output, label, strlen(label), true, NULL)
+        || !reader_extract_literal(output, "\"")) return false;
+    if (declared->thumbnail_url[0] != '\0') {
+        if (!reader_extract_literal(output, " poster=\"")
+            || !reader_extract_escaped(
+                output, declared->thumbnail_url,
+                strlen(declared->thumbnail_url), true, NULL)
+            || !reader_extract_literal(output, "\"")) return false;
+    }
+    if (declared->duration[0] != '\0') {
+        if (!reader_extract_literal(
+                output, " data-tilefinch-media-duration=\"")
+            || !reader_extract_escaped(
+                output, declared->duration, strlen(declared->duration),
+                true, NULL)
+            || !reader_extract_literal(output, "\"")) return false;
+    }
+    return reader_extract_literal(output, "></video>");
 }
 
 static bool reader_attribute_equals_ci_trimmed(
@@ -1149,7 +1216,9 @@ static bool reader_extract_node(ReaderExtractBuffer *output,
     }
     if (node->type != LXB_DOM_NODE_TYPE_ELEMENT
         || reader_hidden_element(node)
-        || (!output->basic_mode && reader_excluded_region(node)))
+        || reader_engine_media_marker(output->document, node)
+        || (!output->basic_mode
+            && reader_excluded_region(output->document, node)))
         return true;
     bool admitted_form = in_admitted_form;
     if (reader_name_is(node, "form")) {
@@ -1839,7 +1908,8 @@ static bool reader_prepare_article(const ReaderNodeStat *stats, size_t count,
                                    lxb_dom_node_t *body,
                                    ReaderDocumentAnalysis *analysis,
                                    uint16_t *article_root,
-                                   ReaderMutationJournal *journal)
+                                   ReaderMutationJournal *journal,
+                                   bool declared_media)
 {
     uint16_t winner = READER_INVALID_INDEX;
     uint32_t best_score = 0;
@@ -1872,8 +1942,8 @@ static bool reader_prepare_article(const ReaderNodeStat *stats, size_t count,
     uint32_t visible = analysis->visible_text_bytes;
     uint32_t threshold = (visible / 100u) * 35u
         + ((visible % 100u) * 35u + 99u) / 100u;
-    bool dominant = selected->text_bytes >= 600u
-        && selected->paragraphs >= 3u
+    bool dominant = selected->text_bytes >= (declared_media ? 256u : 600u)
+        && selected->paragraphs >= (declared_media ? 2u : 3u)
         && visible != 0 && selected->text_bytes >= threshold;
     if (!dominant) return true;
     if (!reader_set_marker(journal, selected->node,
@@ -1939,7 +2009,7 @@ static bool reader_prepare_watch(const ReaderNodeStat *stats, size_t count,
 static bool reader_commit_extracted_root(
     PocDocument *document, lxb_dom_node_t *body,
     const ReaderExtractBuffer *output, ReaderPageKind kind,
-    lxb_dom_node_t **installed_root)
+    bool connect_root, lxb_dom_node_t **installed_root)
 {
     if (installed_root != NULL) *installed_root = NULL;
     if (document == NULL || document->html == NULL || body == NULL
@@ -1967,7 +2037,7 @@ static bool reader_commit_extracted_root(
         (const lxb_char_t *) "hidden", 6u) != NULL;
     if (okay) okay = document_set_element_inner_html(
         document, root, output->data, output->length);
-    if (okay) okay = lxb_dom_node_append_child(body, root)
+    if (okay && connect_root) okay = lxb_dom_node_append_child(body, root)
         == LXB_DOM_EXCEPTION_OK;
     if (!okay && root != NULL) {
         if (root->parent != NULL) lxb_dom_node_remove(root);
@@ -1977,12 +2047,39 @@ static bool reader_commit_extracted_root(
     return okay;
 }
 
+/* This search runs only over a freshly parsed, native-authored Reader root,
+   before author script can run. It converts the diagnostic marker into exact
+   pointer provenance used by layout and activation. */
+static lxb_dom_node_t *reader_find_generated_media_card(
+    lxb_dom_node_t *root)
+{
+    if (root == NULL) return NULL;
+    for (lxb_dom_node_t *node = root->first_child;
+         node != NULL; node = node->next) {
+        size_t marker_length = 0u;
+        const char *marker = document_attribute(
+            node, "data-tilefinch-declared-media-card", &marker_length);
+        if (marker != NULL && marker_length == sizeof("reader") - 1u
+            && memcmp(marker, "reader", sizeof("reader") - 1u) == 0) {
+            return node;
+        }
+    }
+    return NULL;
+}
+
+static void reader_forget_generated_media_card(PocDocument *document)
+{
+    if (document != NULL) document->reader_declared_video_card_node = NULL;
+}
+
 static bool reader_install_extracted_tree(
     PocDocument *document, lxb_dom_node_t *body,
     const ReaderNodeStat *stats, size_t count,
     ReaderPageKind kind, uint16_t article_root, uint16_t listing_root,
+    const MediaDeclaredVideo *declared_video,
+    bool synthesize_declared_video,
     ReaderDocumentAnalysis *analysis, bool install,
-    bool require_complete,
+    bool require_complete, bool connect_root,
     bool *meaningful_output, lxb_dom_node_t **installed_root)
 {
     if (meaningful_output != NULL) *meaningful_output = false;
@@ -1994,6 +2091,7 @@ static bool reader_install_extracted_tree(
         document->budget, BUDGET_CATEGORY_DOM, READER_EXTRACT_BYTE_LIMIT);
     if (markup == NULL) return false;
     ReaderExtractBuffer output = {
+        .document = document,
         .data = markup,
         .capacity = READER_EXTRACT_BYTE_LIMIT,
         .content_limit = READER_EXTRACT_BYTE_LIMIT
@@ -2004,6 +2102,8 @@ static bool reader_install_extracted_tree(
     markup[0] = '\0';
     bool okay = reader_extract_literal(
         &output, "<header><strong>Reader</strong></header>");
+    if (okay && synthesize_declared_video)
+        okay = reader_extract_declared_video(&output, declared_video);
     bool article_meaningful = false;
     if (okay && article_root < count) {
         okay = reader_extract_node(
@@ -2059,7 +2159,9 @@ static bool reader_install_extracted_tree(
        and decline installation transactionally when the bounded result is
        incomplete. Explicit Reader mode continues to admit the labeled,
        shortened tree. */
-    if (require_complete && (output.truncated || output.bounded_out)) {
+    if (require_complete
+        && (output.truncated || output.bounded_out
+            || (analysis != NULL && analysis->bounded_out))) {
         budget_free(document->budget, markup);
         return true;
     }
@@ -2067,16 +2169,31 @@ static bool reader_install_extracted_tree(
         budget_free(document->budget, markup);
         return true;
     }
+    lxb_dom_node_t *root = NULL;
     okay = reader_commit_extracted_root(
-        document, body, &output, kind, installed_root);
+        document, body, &output, kind, connect_root, &root);
+    if (okay && synthesize_declared_video) {
+        lxb_dom_node_t *card = reader_find_generated_media_card(root);
+        if (card == NULL) {
+            if (root->parent != NULL) lxb_dom_node_remove(root);
+            lxb_dom_node_destroy_deep(root);
+            root = NULL;
+            okay = false;
+        } else {
+            document->reader_declared_video_card_node = card;
+        }
+    }
+    if (okay && installed_root != NULL) *installed_root = root;
     budget_free(document->budget, markup);
     return okay;
 }
 
 static bool reader_document_prepare_internal(
     PocDocument *document, const Stylesheet *stylesheet,
-    ReaderDocumentAnalysis *analysis, bool install, bool require_complete)
+    ReaderDocumentAnalysis *analysis, bool install, bool require_complete,
+    bool connect_root, lxb_dom_node_t **prepared_root)
 {
+    if (prepared_root != NULL) *prepared_root = NULL;
     if (analysis == NULL) return false;
     *analysis = (ReaderDocumentAnalysis) { .prepared = true };
     lxb_dom_node_t *body = document_body_node(document);
@@ -2109,6 +2226,12 @@ static bool reader_document_prepare_internal(
     size_t excluded_depth = 0;
     size_t link_depth = 0;
     bool primary_media = false;
+    const MediaDeclaredVideo *declared_video =
+        media_declared_video_cached(document);
+    bool declared_primary_media = declared_video != NULL;
+    bool declared_watch_evidence = declared_primary_media
+        && (declared_video->structured || declared_video->og_video
+            || declared_video->og_type_video);
     bool head_media_hint = reader_document_head_media_hint(document);
     uint16_t primary_media_index = READER_INVALID_INDEX;
     lxb_dom_node_t *node = body;
@@ -2151,7 +2274,7 @@ static bool reader_document_prepare_internal(
                     || style_stack[depth].visibility_hidden
                     || style_stack[depth].opacity == 0u);
             }
-            bool excluded = reader_excluded_region(node);
+            bool excluded = reader_excluded_region(document, node);
             bool link = reader_name_is(node, "a");
             if (hidden) hidden_depth++;
             if (style_hidden) style_hidden_depth++;
@@ -2356,19 +2479,25 @@ static bool reader_document_prepare_internal(
             document_allocation_owner_enter(document);
         if (okay && primary_media) okay = reader_prepare_watch(
             stats, count, primary_media_index, body, &article, &journal);
+        if (okay && !primary_media) okay = reader_prepare_article(
+            stats, count, body, analysis, &article, &journal,
+            declared_watch_evidence);
+        bool declared_watch_root = declared_watch_evidence
+            && article < count
+            && stats[article].paragraphs >= 2u
+            && stats[article].text_bytes >= 256u;
         /* A watch page's related rail is secondary only when a primary
            media/title subtree was actually preserved. With a head-only media
            hint and no trustworthy root, leave the page conservatively raw
            rather than exposing only the recommendations. */
         if (okay && (!primary_media || article != READER_INVALID_INDEX)
-            && !(head_media_hint && !primary_media))
+            && !(head_media_hint && !primary_media
+                 && !declared_watch_root))
             okay = reader_prepare_listing(
                 stats, count, entries, entry_count, body, analysis, &listing,
                 &journal);
-        if (okay && !primary_media) okay = reader_prepare_article(
-            stats, count, body, analysis, &article, &journal);
         if (okay) {
-            ReaderPageKind kind = primary_media
+            ReaderPageKind kind = (primary_media || declared_watch_root)
                     && article != READER_INVALID_INDEX ? READER_PAGE_WATCH
                 : analysis->listing_entries >= 8u ? READER_PAGE_LISTING
                 : article != READER_INVALID_INDEX
@@ -2381,7 +2510,9 @@ static bool reader_document_prepare_internal(
                     &journal, body, "data-tilefinch-reader-kind", kind_name);
                 if (okay) okay = reader_install_extracted_tree(
                     document, body, stats, count, kind, article, listing,
+                    declared_video, declared_watch_root && !primary_media,
                     analysis, install, require_complete,
+                    connect_root,
                     &extracted_meaningful,
                     &extracted_root);
                 if (okay && !extracted_meaningful) {
@@ -2408,7 +2539,7 @@ static bool reader_document_prepare_internal(
                     && (stats[article].flags & READER_STAT_HEADING) != 0);
             analysis->high_confidence = kind != READER_PAGE_RAW
                 && auto_article && !analysis->bounded_out;
-            if (okay && install && extracted_root != NULL
+            if (okay && install && connect_root && extracted_root != NULL
                 && kind != READER_PAGE_RAW
                 && !document_refresh(document)) {
                 /* Refresh allocates its replacement metadata before changing
@@ -2416,12 +2547,17 @@ static bool reader_document_prepare_internal(
                    refused, restore the exact pre-Reader DOM while the marker
                    journal and extracted root are still owned and reachable. */
                 if (extracted_root != NULL) {
+                    reader_forget_generated_media_card(document);
                     if (extracted_root->parent != NULL)
                         lxb_dom_node_remove(extracted_root);
                     lxb_dom_node_destroy_deep(extracted_root);
                 }
                 reader_rollback_markers(&journal);
                 okay = false;
+            }
+            if (okay && install && extracted_root != NULL
+                && kind != READER_PAGE_RAW && prepared_root != NULL) {
+                *prepared_root = extracted_root;
             }
         }
         if (!okay) reader_rollback_markers(&journal);
@@ -2449,7 +2585,15 @@ bool reader_document_prepare_with_stylesheet(
     ReaderDocumentAnalysis *analysis)
 {
     return reader_document_prepare_internal(
-        document, stylesheet, analysis, true, false);
+        document, stylesheet, analysis, true, false, true, NULL);
+}
+
+bool reader_document_prepare_detached_with_stylesheet(
+    PocDocument *document, const Stylesheet *stylesheet,
+    ReaderDocumentAnalysis *analysis, lxb_dom_node_t **prepared_root)
+{
+    return reader_document_prepare_internal(
+        document, stylesheet, analysis, true, false, false, prepared_root);
 }
 
 bool reader_document_analyze_with_stylesheet(
@@ -2457,7 +2601,7 @@ bool reader_document_analyze_with_stylesheet(
     ReaderDocumentAnalysis *analysis)
 {
     return reader_document_prepare_internal(
-        document, stylesheet, analysis, false, false);
+        document, stylesheet, analysis, false, false, false, NULL);
 }
 
 bool reader_document_prepare_complete_with_stylesheet(
@@ -2466,7 +2610,56 @@ bool reader_document_prepare_complete_with_stylesheet(
 {
     if (analysis == NULL) return false;
     return reader_document_prepare_internal(
-        document, stylesheet, analysis, true, true);
+        document, stylesheet, analysis, true, true, true, NULL);
+}
+
+static bool reader_exact_root_matches(
+    lxb_dom_node_t *root, ReaderPageKind kind)
+{
+    if (root == NULL || kind == READER_PAGE_RAW
+        || root->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
+    size_t marker_length = 0;
+    const char *marker = document_attribute(
+        root, "data-tilefinch-reader-root", &marker_length);
+    const char *expected = reader_page_kind_name(kind);
+    size_t expected_length = strlen(expected);
+    return marker != NULL && marker_length == expected_length
+        && memcmp(marker, expected, expected_length) == 0;
+}
+
+bool reader_document_connect_prepared_view(
+    PocDocument *document, lxb_dom_node_t *root, ReaderPageKind kind)
+{
+    if (document == NULL) return false;
+    lxb_dom_node_t *body = document_body_node(document);
+    if (body == NULL || root == NULL
+        || root->parent != NULL || !reader_exact_root_matches(root, kind)) {
+        return false;
+    }
+    if (lxb_dom_node_append_child(body, root) != LXB_DOM_EXCEPTION_OK)
+        return false;
+    if (document_refresh(document)) return true;
+    lxb_dom_node_remove(root);
+    return false;
+}
+
+void reader_document_discard_exact_prepared_view(
+    PocDocument *document, lxb_dom_node_t *root, ReaderPageKind kind)
+{
+    if (document == NULL || root == NULL
+        || !reader_exact_root_matches(root, kind)) return;
+    lxb_dom_node_t *body = document_body_node(document);
+    bool connected = root->parent != NULL;
+    if (connected) lxb_dom_node_remove(root);
+    reader_forget_generated_media_card(document);
+    lxb_dom_node_destroy_deep(root);
+    if (body != NULL) {
+        (void) lxb_dom_element_remove_attribute(
+            lxb_dom_interface_element(body),
+            (const lxb_char_t *) "data-tilefinch-reader-kind",
+            sizeof("data-tilefinch-reader-kind") - 1u);
+    }
+    if (connected) (void) document_refresh(document);
 }
 
 static bool reader_document_prepare_basic_internal(
@@ -2487,6 +2680,7 @@ static bool reader_document_prepare_basic_internal(
         return true;
     }
     ReaderExtractBuffer output = {
+        .document = document,
         .data = markup,
         .capacity = READER_EXTRACT_BYTE_LIMIT,
         .content_limit = READER_EXTRACT_BYTE_LIMIT
@@ -2496,9 +2690,15 @@ static bool reader_document_prepare_basic_internal(
         .basic_mode = true
     };
     markup[0] = '\0';
+    const MediaDeclaredVideo *declared_video =
+        media_declared_video_cached(document);
+    bool synthesize_declared_video = declared_video != NULL
+        && !reader_document_has_video_element(document);
     bool okay = reader_extract_literal(
         &output, "<header><strong>Basic view</strong></header>");
-    bool meaningful = false;
+    if (okay && synthesize_declared_video)
+        okay = reader_extract_declared_video(&output, declared_video);
+    bool meaningful = synthesize_declared_video;
     for (lxb_dom_node_t *child = body->first_child;
          okay && child != NULL && !output.truncated; child = child->next) {
         bool child_meaningful = false;
@@ -2552,10 +2752,19 @@ static bool reader_document_prepare_basic_internal(
     okay = reader_set_marker(
         &journal, body, "data-tilefinch-reader-kind", "basic");
     if (okay) okay = reader_commit_extracted_root(
-        document, body, &output, READER_PAGE_BASIC, &root);
+        document, body, &output, READER_PAGE_BASIC, true, &root);
+    if (okay && synthesize_declared_video) {
+        lxb_dom_node_t *card = reader_find_generated_media_card(root);
+        if (card == NULL) {
+            okay = false;
+        } else {
+            document->reader_declared_video_card_node = card;
+        }
+    }
     if (okay && !document_refresh(document)) okay = false;
     if (!okay) {
         if (root != NULL) {
+            reader_forget_generated_media_card(document);
             if (root->parent != NULL) lxb_dom_node_remove(root);
             lxb_dom_node_destroy_deep(root);
         }
@@ -2607,6 +2816,7 @@ bool reader_document_discard_prepared_view(
         || marker == NULL || marker_length != expected_length
         || memcmp(marker, expected, expected_length) != 0) return false;
     lxb_dom_node_remove(root);
+    reader_forget_generated_media_card(document);
     lxb_dom_node_destroy_deep(root);
     (void) lxb_dom_element_remove_attribute(
         lxb_dom_interface_element(body),

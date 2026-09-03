@@ -191,6 +191,11 @@ bool controller_focused_outline_style(
     BrowserController *controller, ControllerFocusOutline *outline);
 bool controller_activate(BrowserController *controller,
                          ControllerAction *action);
+/* User-activated playback for a page-level explicit declaration. This is the
+   same resolution/CSP/probe-bound action as a src-less <video>, but carries
+   no author media-node handle. */
+bool controller_build_document_media_action(
+    BrowserController *controller, ControllerAction *action);
 /* Build the HTML form default action. Set dispatch_submit_event only for a
    user activation; script requestSubmit() has already dispatched it. */
 bool controller_build_form_action(

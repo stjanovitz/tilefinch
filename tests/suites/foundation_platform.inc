@@ -1487,6 +1487,7 @@ static int test_foundation(void)
 
     puts("test: scripting-aware noscript parsing");
     CHECK(test_parser_scripting_noscript_model(&budget));
+    CHECK(test_parser_inert_script_payload_policy(&budget));
     CHECK(budget.current == 0);
 
     puts("test: visible text emits bounded glyph-script hints");

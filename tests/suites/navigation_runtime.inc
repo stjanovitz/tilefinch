@@ -1,3 +1,5 @@
+#define NAVIGATION_RUNTIME_JS_HEAP (2 * MIB + 256 * 1024u)
+
 static void script_frontier_probe(void *opaque, size_t script_index,
                                   bool active)
 {
@@ -30,7 +32,11 @@ static bool test_canvas_surface_survives_and_updates_without_relayout(void)
     NavigationSession navigation = {0};
     bool ready = installed && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        /* This is a canvas publication test, not the minimum-heap boundary;
+           allow the boot-captured Worker security intrinsics to coexist with
+           the timer/canvas graph. Device defaults use a 5 MiB heap. */
+        navigation_enable_scripts(
+            &navigation, NAVIGATION_RUNTIME_JS_HEAP, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
     }
@@ -116,7 +122,8 @@ static bool test_canvas_fallback_text_mutation_remains_replaced(void)
     NavigationSession navigation = {0};
     bool ready = installed && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(
+            &navigation, NAVIGATION_RUNTIME_JS_HEAP, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
     }
@@ -260,7 +267,10 @@ static bool test_canvas_draw_image_accepts_loaded_html_image(void)
     NavigationSession navigation = {0};
     bool ready = installed && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        /* Canvas plus a second author diagnostic evaluation intentionally
+           exercises two independently admitted script surfaces; keep this
+           compatibility test above the 2 MiB single-surface floor. */
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation_enable_external_resources(
@@ -317,7 +327,7 @@ static bool test_detached_canvas_publishes_when_inserted(void)
     NavigationSession navigation = {0};
     bool ready = installed && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, NAVIGATION_RUNTIME_JS_HEAP, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
     }
@@ -380,7 +390,7 @@ static bool test_navigation_keeps_server_dom_after_author_script_error(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, NAVIGATION_RUNTIME_JS_HEAP, 1000);
         navigation_enable_document_scripts(
             &navigation, 8, 64 * 1024, 32 * 1024, 1000);
     }
@@ -451,7 +461,7 @@ static bool test_script_frontier_snapshot_survives_author_mutation(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, NAVIGATION_RUNTIME_JS_HEAP, 1000);
         navigation_enable_document_scripts(
             &navigation, 8, 64 * 1024, 32 * 1024, 1000);
         navigation.defer_document_script_pipeline = true;
@@ -508,7 +518,7 @@ static bool test_script_frontier_skips_destroyed_snapshot_nodes(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(&navigation, NAVIGATION_RUNTIME_JS_HEAP, 1000);
         navigation_enable_document_scripts(
             &navigation, 8, 64 * 1024, 32 * 1024, 1000);
         navigation.defer_document_script_pipeline = true;
@@ -927,6 +937,62 @@ static bool install_module_loader_then_fail(NavigationSession *navigation)
     return !executed;
 }
 
+static bool test_document_script_refresh_failure_stops_following_scripts(void)
+{
+    static const char html[] =
+        "<!doctype html><body><script>"
+        "document.body.setAttribute('data-mutated','yes')"
+        "</script><script>globalThis.pocSummary='SECOND-RAN'</script></body>";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool browser_ready = lexbor_installed
+        && browser_session_init(&browser, &budget, 128 * 1024);
+    bool ready = browser_ready && navigation_init(&navigation, &budget, 4);
+    if (ready) {
+        navigation_attach_browser_session(&navigation, &browser);
+        navigation_enable_scripts(&navigation, NAVIGATION_RUNTIME_JS_HEAP, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation.defer_document_script_pipeline = true;
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://refresh-boundary.test/", html,
+        sizeof(html) - 1u, 480, NULL, NULL, true);
+    ExternalScriptMetrics metrics = {0};
+    ScriptResult result = {0};
+    script_runtime_test_refuse_next_document_refresh();
+    bool executed = committed && document_scripts_execute(
+        &navigation.page.document, navigation.page.runtime,
+        navigation.budget, navigation.browser_session,
+        navigation.page.resource_base_url,
+        "https://refresh-boundary.test/", navigation.page.referrer_policy,
+        4, 32 * 1024, 16 * 1024, 1000,
+        navigation.page.resource_scheduler, &metrics, &result);
+    bool ok = committed && !executed
+        && script_runtime_document_refresh_failed(navigation.page.runtime)
+        && strcmp(result.summary, "SECOND-RAN") != 0;
+    if (!ok) {
+        fprintf(stderr,
+                "script refresh boundary committed=%d executed=%d "
+                "sticky=%d summary=\"%s\"\n",
+                committed, executed,
+                committed && script_runtime_document_refresh_failed(
+                    navigation.page.runtime),
+                result.summary);
+    }
+    if (ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_delayed_import_after_module_pipeline_failure(void)
 {
     static const char html[] =
@@ -997,3 +1063,5 @@ static bool test_delayed_import_after_module_pipeline_failure(void)
     if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
     return ok && clean;
 }
+
+#undef NAVIGATION_RUNTIME_JS_HEAP

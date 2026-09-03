@@ -86,7 +86,21 @@ static int interrupt_handler(JSRuntime *runtime, void *opaque)
     watchdog->polls++;
     watchdog_add_work(watchdog, 1);
     if (watchdog->slice_work_units >= 4
-        && !watchdog_cooperate(watchdog)) return 1;
+        && !watchdog_cooperate(watchdog)) {
+#ifndef TILEFINCH_NO_TRACE
+        if (getenv("TILEFINCH_TRACE_JS_INTERRUPTS") != NULL) {
+            fprintf(stderr,
+                    "tilefinch-js-interrupt: reason=cooperate "
+                    "now-ms=%llu started-ms=%llu deadline-ms=%llu "
+                    "polls=%zu\n",
+                    (unsigned long long) now,
+                    (unsigned long long) watchdog->started_ms,
+                    (unsigned long long) watchdog->deadline_ms,
+                    watchdog->polls);
+        }
+#endif
+        return 1;
+    }
     /* Watchdog cadence is intentionally not page-visible. Deterministic
        replay time advances only at explicit Date/performance observations
        and event-loop elapsed_ms boundaries, which other engines can mirror. */
@@ -101,6 +115,18 @@ static int interrupt_handler(JSRuntime *runtime, void *opaque)
 #endif
     if (now >= watchdog->deadline_ms) {
         watchdog->interrupted = true;
+#ifndef TILEFINCH_NO_TRACE
+        if (getenv("TILEFINCH_TRACE_JS_INTERRUPTS") != NULL) {
+            fprintf(stderr,
+                    "tilefinch-js-interrupt: reason=deadline "
+                    "now-ms=%llu started-ms=%llu deadline-ms=%llu "
+                    "polls=%zu\n",
+                    (unsigned long long) now,
+                    (unsigned long long) watchdog->started_ms,
+                    (unsigned long long) watchdog->deadline_ms,
+                    watchdog->polls);
+        }
+#endif
         return 1;
     }
     return 0;

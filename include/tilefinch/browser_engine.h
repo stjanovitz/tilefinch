@@ -733,6 +733,18 @@ typedef enum {
    raw pixels; the frontend decides whether to switch presentations. */
 BrowserBasicViewRecovery browser_engine_prepare_basic_view_recovery(
     BrowserEngine *engine, ReaderDocumentAnalysis *analysis);
+typedef enum {
+    BROWSER_DECLARED_MEDIA_CARD_NONE = 0,
+    BROWSER_DECLARED_MEDIA_CARD_INSTALLED,
+    BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE,
+    BROWSER_DECLARED_MEDIA_CARD_DEFERRED
+} BrowserDeclaredMediaCard;
+/* Install at most one engine-owned play surface for explicit page video
+   metadata. Existing <video> elements are never mutated. DOM insertion is
+   admitted only after the same script-degradation and author-settle boundary
+   used by automatic Basic recovery, and is transactional on every refusal. */
+BrowserDeclaredMediaCard browser_engine_prepare_declared_media_card(
+    BrowserEngine *engine);
 void browser_engine_set_reader_candidate_mode(BrowserEngine *engine,
                                               bool enabled);
 bool browser_engine_reader_analysis(

@@ -185,6 +185,21 @@ class RedirectHandler(BaseHTTPRequestHandler):
         return expected and all(self.headers.get(name) is None
                                 for name in forbidden)
 
+    def high_hint_subset_is_arch_bitness_only(self):
+        expected = (
+            self.headers.get("Sec-CH-UA-Arch") == '"MIPS"'
+            and self.headers.get("Sec-CH-UA-Bitness") == '"32"'
+        )
+        forbidden = (
+            "Sec-CH-UA-Model", "Sec-CH-UA-Platform-Version",
+            "Sec-CH-UA-Full-Version", "Sec-CH-UA-Full-Version-List",
+            "UA", "UA-Arch", "UA-Bitness", "UA-Model",
+            "UA-Platform-Version", "UA-Full-Version",
+            "UA-Full-Version-List",
+        )
+        return expected and all(self.headers.get(name) is None
+                                for name in forbidden)
+
     def no_high_hints(self):
         names = (
             "Sec-CH-UA-Arch", "Sec-CH-UA-Bitness", "Sec-CH-UA-Model",
@@ -535,8 +550,21 @@ class RedirectHandler(BaseHTTPRequestHandler):
             bounce_clean = "bounce_clean=0" not in parsed.query
             no_high = self.no_high_hints()
             low = self.headers.get("Sec-CH-UA") is not None
+            low_identity = self.headers.get("Sec-CH-UA") == (
+                '"Tilefinch";v="0.1", "Not.A/Brand";v="99"')
             body = (f"subset={int(subset and bounce_clean)};terminal-high="
-                    f"{int(not no_high)};terminal-low={int(low)}").encode()
+                    f"{int(not no_high)};terminal-low={int(low)};"
+                    f"terminal-identity={int(low_identity)}").encode()
+            self.reply(200, body, (("Content-Type", "text/plain"),))
+        elif path == "/hint-identity":
+            names = (
+                "Sec-CH-UA", "Sec-CH-UA-Full-Version",
+                "Sec-CH-UA-Full-Version-List", "UA", "UA-Full-Version",
+                "UA-Full-Version-List",
+            )
+            body = "\n".join(
+                f"{name}={self.headers.get(name, '<none>')}"
+                for name in names).encode()
             self.reply(200, body, (("Content-Type", "text/plain"),))
         elif path == "/critical-chain-start":
             own_port = self.server.server_address[1]
@@ -559,13 +587,14 @@ class RedirectHandler(BaseHTTPRequestHandler):
                 )
                 self.reply(200, body, (
                     ("Content-Type", "text/html"),
-                    ("Accept-CH", "Sec-CH-UA-Arch, Sec-CH-UA-Bitness"),
-                    ("Critical-CH", "Sec-CH-UA-Arch"),
+                    ("Accept-CH", "Sec-CH-UA-Arch, Sec-CH-UA-Bitness, "
+                                  "UA, UA-Arch"),
+                    ("Critical-CH", "Sec-CH-UA-Arch, UA-Arch"),
                     ("Set-Cookie", "retry_path=seen; Path=/critical-chain"),
                 ))
             else:
                 expected_referrer = f"http://127.0.0.1:{source_port}/"
-                scoped = (self.high_hint_subset_is_arch_only()
+                scoped = (self.high_hint_subset_is_arch_bitness_only()
                           and parameters.get("start_clean") == "1"
                           and self.headers.get("Referer") == expected_referrer
                           # Ports do not split a schemeful site. Both hops use

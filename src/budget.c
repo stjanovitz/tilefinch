@@ -1762,6 +1762,31 @@ static size_t bellard_pool_reject_count;
 
 static void bellard_pool_note_request(void *opaque, size_t size);
 
+static void bellard_pool_update_malloc_census(BudgetQuickJSPool *pool,
+                                              int64_t malloc_size)
+{
+    if (pool == NULL || malloc_size < 0) return;
+    pool->js_malloc_current = (size_t) malloc_size;
+    if ((size_t) malloc_size > pool->js_malloc_peak) {
+        pool->js_malloc_peak = (size_t) malloc_size;
+        /* Peak-composition census: at each 8 MB high-water step, print the
+           live size-band census so transient realloc growth is represented
+           as faithfully as ordinary allocations. */
+        static int at_peak = -1;
+        if (at_peak < 0) {
+            at_peak = getenv("TILEFINCH_DUMP_JS_POOL_AT_PEAK") != NULL;
+        }
+        if (at_peak
+            && pool->js_malloc_peak
+                   >= pool->peak_dump_watermark + 8u * 1024u * 1024u) {
+            pool->peak_dump_watermark = pool->js_malloc_peak;
+            fprintf(stderr, "quickjs-pool high-water=%zu\n",
+                    pool->js_malloc_peak);
+            budget_quickjs_pool_report_classes(pool, stderr);
+        }
+    }
+}
+
 /* Host diagnostic: lets the JS runtime print its interpreter stack at
    the allocation-size trap (reentrant into the allocator, host-only). */
 static void (*budget_js_stack_dump_hook)(void *opaque);
@@ -1983,26 +2008,8 @@ static void *bellard_pool_malloc(JSMallocState *state, size_t size)
     if (pointer != NULL) {
         state->malloc_count++;
         state->malloc_size += quickjs_pool_usable_size(pointer);
-        BudgetQuickJSPool *pool = state->opaque;
-        pool->js_malloc_current = state->malloc_size;
-        if (state->malloc_size > pool->js_malloc_peak) {
-            pool->js_malloc_peak = state->malloc_size;
-            /* Peak-composition census: at each 8 MB high-water step,
-               print the live size-band census so the transient peak's
-               makeup is measurable, not inferred (TILEFINCH_DUMP_JS_POOL_AT_PEAK). */
-            static int at_peak = -1;
-            if (at_peak < 0) {
-                at_peak = getenv("TILEFINCH_DUMP_JS_POOL_AT_PEAK") != NULL;
-            }
-            if (at_peak
-                && (size_t) pool->js_malloc_peak
-                       >= pool->peak_dump_watermark + 8u * 1024u * 1024u) {
-                pool->peak_dump_watermark = (size_t) pool->js_malloc_peak;
-                fprintf(stderr, "quickjs-pool high-water=%lld\n",
-                        (long long) pool->js_malloc_peak);
-                budget_quickjs_pool_report_classes(pool, stderr);
-            }
-        }
+        bellard_pool_update_malloc_census(state->opaque,
+                                          state->malloc_size);
     }
     return pointer;
 }
@@ -2039,6 +2046,16 @@ static void *bellard_pool_realloc(JSMallocState *state, void *pointer,
     if (!bellard_growth_allowed(state, old_size, size)) {
         bellard_pool_record_reject(state, old_size, size);
         bellard_pool_capture_prefix(pointer, old_size, size);
+#if !defined(__PSP__)
+        if (getenv("TILEFINCH_TRACE_JS_REJECT_STACK") != NULL) {
+            void *frames[32];
+            int frame_count = backtrace(frames, 32);
+            fprintf(stderr,
+                    "js-heap-reject-stack old=%zu size=%zu live=%lld\n",
+                    old_size, size, (long long) state->malloc_size);
+            backtrace_symbols_fd(frames, frame_count, 2);
+        }
+#endif
         return NULL;
     }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -2053,9 +2070,22 @@ static void *bellard_pool_realloc(JSMallocState *state, void *pointer,
     if (resized == NULL) return NULL;
     state->malloc_size -= old_size;
     state->malloc_size += quickjs_pool_usable_size(resized);
-    ((BudgetQuickJSPool *) state->opaque)->js_malloc_current =
-        state->malloc_size;
+    bellard_pool_update_malloc_census(state->opaque, state->malloc_size);
     return resized;
+}
+#endif
+
+#if !defined(PSP_BROWSER_BELLARD_QUICKJS)
+void budget_quickjs_pool_set_stack_dump_hook(void (*hook)(void *opaque),
+                                             void *opaque)
+{
+    (void) hook;
+    (void) opaque;
+}
+
+void budget_quickjs_pool_report_rejects(FILE *stream)
+{
+    (void) stream;
 }
 #endif
 
@@ -2083,6 +2113,11 @@ const JSMallocFunctions *budget_quickjs_pool_allocator(void)
 size_t budget_quickjs_pool_reserved_peak(const BudgetQuickJSPool *pool)
 {
     return pool == NULL ? 0 : pool->reserved_peak;
+}
+
+size_t budget_quickjs_pool_reserved_current(const BudgetQuickJSPool *pool)
+{
+    return pool == NULL ? 0 : pool->reserved;
 }
 
 size_t budget_quickjs_pool_js_malloc_peak(const BudgetQuickJSPool *pool)

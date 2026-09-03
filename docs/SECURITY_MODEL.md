@@ -389,6 +389,18 @@ global before author script. Blob workers are then admitted by `worker-src`
 and compiled only through that retained host path, so they do not reopen a
 general dynamic-compilation primitive.
 
+The present Blob-worker compatibility layer is cooperatively scheduled in the
+page's charged QuickJS runtime. It provides a distinct worker-facing global
+object and hides direct Window/Document bindings, but it does not yet provide a
+separate QuickJS context with independent intrinsic prototypes. Treat it as
+same-author-origin page code, not as a privilege or origin-isolation boundary.
+The public constructor is backed by a first-use bootstrap. Its native compiler
+entry point is installed only for trusted module evaluation, captured by that
+module, and deleted before author execution resumes; the bounded Blob lookup and
+clone helpers are hardened against replacement during eager bootstrap.
+The dedicated-context milestone and its cross-context structured-clone mailbox
+are specified in [the lab qualification guide](engineering/LAB_USAGE.md#managed-challenges-as-a-standards-qualification).
+
 Users can also disable author JavaScript globally or for the current site.
 The per-site deny list is bounded to 16 sites and is consulted before a page
 runtime is admitted; changing either control cancels an in-flight navigation

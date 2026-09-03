@@ -1,0 +1,6 @@
+tick 100 100
+focus-next
+activate
+tick 600 100
+status
+quit

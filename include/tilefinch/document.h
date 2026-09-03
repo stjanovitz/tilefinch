@@ -12,6 +12,7 @@
 #include "tilefinch/content_security_policy.h"
 
 typedef struct DocumentControlState DocumentControlState;
+typedef struct MediaDeclaredVideoCache MediaDeclaredVideoCache;
 
 #define DOCUMENT_CONTROL_VALUE_LIMIT 512u
 
@@ -116,7 +117,27 @@ typedef struct {
     /* Aggregate authored focus intent. The engine carries one bounded
        post-layout autofocus obligation only for documents that need it. */
     bool autofocus_attribute_present;
+    /* Lazily populated, page-lifetime declaration cache. Keeping this on the
+       retained document gives layout, image discovery, Reader and activation
+       one immutable selection without rescanning large data scripts. */
+    MediaDeclaredVideoCache *declared_video_cache;
+    uint32_t declared_video_discovery_count;
+    bool declared_video_cache_scanned;
+    bool declared_video_cache_found;
+    /* Native recovery controls are identified by provenance, never by their
+       public diagnostic attributes. Author markup may use the same attribute
+       spelling without acquiring browser-chrome activation semantics. */
+    lxb_dom_node_t *declared_video_card_node;
+    lxb_dom_node_t *reader_declared_video_card_node;
 } PocDocument;
+
+static inline bool document_is_declared_video_card(
+    const PocDocument *document, const lxb_dom_node_t *node)
+{
+    return document != NULL && node != NULL
+        && (node == document->declared_video_card_node
+            || node == document->reader_declared_video_card_node);
+}
 
 typedef bool (*DocumentBodySnapshotReplaceCallback)(
     void *opaque, PocDocument *document,
@@ -152,6 +173,16 @@ typedef struct {
     void *original_token_context;
     DocumentElementClosedCallback element_closed;
     void *element_closed_opaque;
+    size_t retained_json_script_bytes;
+    size_t maximum_json_script_bytes;
+    size_t retained_current_script_bytes;
+    size_t maximum_inline_script_bytes;
+    lxb_dom_node_t *current_script_node;
+    lxb_dom_node_t *truncated_script_nodes[64];
+    size_t truncated_script_count;
+    bool truncated_script_overflow;
+    bool discard_inert_script_text;
+    bool scripting_enabled;
     bool active;
     bool failed;
 } DocumentParser;
@@ -162,6 +193,17 @@ bool document_parser_begin(DocumentParser *parser, Budget *budget);
    HTML tree builder instead of exposing its fallback elements to style and
    layout consumers. */
 bool document_parser_set_scripting(DocumentParser *parser, bool enabled);
+/* When author scripts are disabled, avoid materializing their potentially
+   multi-megabyte raw-text payloads in the DOM. A bounded amount of JSON-LD is
+   retained for semantic media and Reader discovery. */
+bool document_parser_set_inert_script_policy(
+    DocumentParser *parser, bool discard, size_t maximum_json_bytes,
+    size_t maximum_inline_script_bytes);
+bool document_parser_script_was_truncated(
+    const DocumentParser *parser, const lxb_dom_node_t *script);
+/* Preserve the active HTML tree-builder model while discarding only future
+   raw script payload text after navigation has shed optional author work. */
+bool document_parser_discard_remaining_script_text(DocumentParser *parser);
 bool document_parser_feed(DocumentParser *parser, const char *data,
                           size_t length);
 void document_parser_set_element_closed_callback(

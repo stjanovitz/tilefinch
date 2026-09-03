@@ -101,6 +101,12 @@ bool fetch_accepted_critical_client_hints(const char *accept_ch, const char *cri
     return false;
 }
 
+bool fetch_client_hint_tokens_cover(const char *available, const char *required)
+{
+    (void) available;
+    return required == NULL || required[0] == '\0';
+}
+
 /* fetch_inject_failure_once lives in fetch_fault.c and is shared by
    every transport backend. */
 

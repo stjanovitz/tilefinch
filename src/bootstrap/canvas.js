@@ -36,6 +36,7 @@
       imageBatches: 0,
       paintCommands: 0,
       paintBatches: 0,
+      clippedCommands: 0,
       shadowCommands: 0,
       surfaceCommits: 0,
     },
@@ -43,15 +44,20 @@
       if (!state.paintCommands.length || !state.pixels) return true;
       const payloads = state.paintCommands.map(
           (command) => [command.kind, ...command.args]),
-        failed = Number(__tilefinchCanvasRasterPaintBatch(
+        outcome = Number(__tilefinchCanvasRasterPaintBatch(
           state.pixels, state.width, state.height, payloads,
         ));
-      if (!Number.isSafeInteger(failed) || failed < 0) return false;
+      if (!Number.isSafeInteger(outcome) || outcome < 0) return false;
+      const failed = outcome & 0xffff,
+        clipped = (outcome >>> 16) & 0xffff;
       for (let index = 0; index < state.paintCommands.length; index++) {
         const command = state.paintCommands[index];
         if (failed & (1 << index)) fallbackPaintCommand(state, command);
-        else if (command.kind === 0) canvasDiagnostics.pathRasters++;
-        else canvasDiagnostics.textRasters++;
+        else {
+          if (clipped & (1 << index)) canvasDiagnostics.clippedCommands++;
+          if (command.kind === 0) canvasDiagnostics.pathRasters++;
+          else canvasDiagnostics.textRasters++;
+        }
       }
       canvasDiagnostics.paintBatches++;
       state.paintCommands.length = 0;
@@ -75,9 +81,11 @@
           ...command.transform, ...command.clip,
         ]) serialized[at++] = value;
       }
-      if (!__tilefinchCanvasRasterImageBatch(
+      const outcome = Number(__tilefinchCanvasRasterImageBatch(
         state.pixels, state.width, state.height, sources, serialized,
-      )) return false;
+      ));
+      if (!outcome) return false;
+      if (outcome === 2) canvasDiagnostics.clippedCommands++;
       canvasDiagnostics.imageBatches++;
       state.imageCommands.length = 0;
       state.imageCommandBytes = 0;
@@ -90,9 +98,11 @@
       let at = 0;
       for (const command of state.rectCommands)
         for (const value of command) serialized[at++] = value;
-      if (!__tilefinchCanvasRasterRectBatch(
+      const outcome = Number(__tilefinchCanvasRasterRectBatch(
         state.pixels, state.width, state.height, serialized,
-      )) return false;
+      ));
+      if (!outcome) return false;
+      if (outcome === 2) canvasDiagnostics.clippedCommands++;
       canvasDiagnostics.rectangleBatches++;
       state.rectCommands.length = 0;
       return true;
@@ -881,33 +891,154 @@
     }
   }
 
-  class DOMMatrix {
-    constructor(values = [1, 0, 0, 1, 0, 0]) {
+  const domMatrixNumber = (text, unit = "") => {
+      const match = String(text).trim().match(
+        /^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)([a-z%]*)$/i,
+      );
+      if (!match) return null;
+      const value = Number(match[1]), suffix = match[2].toLowerCase();
+      if (!Number.isFinite(value) || (suffix && suffix !== unit)) return null;
+      return value;
+    },
+    domMatrixAngle = (text) => {
+      const match = String(text).trim().match(
+        /^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)(deg|grad|rad|turn)?$/i,
+      );
+      if (!match) return null;
+      const value = Number(match[1]), unit = (match[2] || "deg").toLowerCase();
+      if (!Number.isFinite(value)) return null;
+      if (unit === "rad") return value;
+      if (unit === "grad") return value * Math.PI / 200;
+      if (unit === "turn") return value * Math.PI * 2;
+      return value * Math.PI / 180;
+    },
+    domMatrixMultiply = (left, right) => [
+      left[0] * right[0] + left[2] * right[1],
+      left[1] * right[0] + left[3] * right[1],
+      left[0] * right[2] + left[2] * right[3],
+      left[1] * right[2] + left[3] * right[3],
+      left[0] * right[4] + left[2] * right[5] + left[4],
+      left[1] * right[4] + left[3] * right[5] + left[5],
+    ],
+    parseDOMMatrixString = (source) => {
+      source = String(source).trim();
+      if (!source || source.toLowerCase() === "none") return [1, 0, 0, 1, 0, 0];
+      if (source.length > 1024)
+        throw new DOMException("Matrix string exceeds bounded size", "SyntaxError");
+      let matrix = [1, 0, 0, 1, 0, 0], at = 0, functions = 0;
+      const fail = () => {
+        throw new DOMException("Invalid matrix string", "SyntaxError");
+      };
+      while (at < source.length) {
+        while (at < source.length && /\s/.test(source[at])) at++;
+        const start = at;
+        while (at < source.length && /[a-z0-9]/i.test(source[at])) at++;
+        const name = source.slice(start, at).toLowerCase();
+        while (at < source.length && /\s/.test(source[at])) at++;
+        if (!name || source[at++] !== "(" || ++functions > 32) fail();
+        const argumentsStart = at;
+        while (at < source.length && source[at] !== ")") at++;
+        if (at >= source.length) fail();
+        const args = source.slice(argumentsStart, at++).split(/\s*,\s*|\s+/)
+          .filter((value) => value.length);
+        let next = null;
+        if (name === "matrix" && args.length === 6) {
+          const numbers = args.map((value) => domMatrixNumber(value));
+          if (numbers.every((value) => value !== null)) next = numbers;
+        } else if (name === "matrix3d" && args.length === 16) {
+          const numbers = args.map((value) => domMatrixNumber(value));
+          if (
+            numbers.every((value) => value !== null) &&
+            numbers[2] === 0 && numbers[3] === 0 && numbers[6] === 0 &&
+            numbers[7] === 0 && numbers[8] === 0 && numbers[9] === 0 &&
+            numbers[10] === 1 && numbers[11] === 0 && numbers[14] === 0 &&
+            numbers[15] === 1
+          ) next = [numbers[0], numbers[1], numbers[4], numbers[5],
+            numbers[12], numbers[13]];
+        } else if (name === "translate" && args.length >= 1 && args.length <= 2) {
+          const x = domMatrixNumber(args[0], "px"),
+            y = args.length === 2 ? domMatrixNumber(args[1], "px") : 0;
+          if (x !== null && y !== null) next = [1, 0, 0, 1, x, y];
+        } else if ((name === "translatex" || name === "translatey") && args.length === 1) {
+          const value = domMatrixNumber(args[0], "px");
+          if (value !== null) next = name === "translatex"
+            ? [1, 0, 0, 1, value, 0] : [1, 0, 0, 1, 0, value];
+        } else if (name === "scale" && args.length >= 1 && args.length <= 2) {
+          const x = domMatrixNumber(args[0]),
+            y = args.length === 2 ? domMatrixNumber(args[1]) : x;
+          if (x !== null && y !== null) next = [x, 0, 0, y, 0, 0];
+        } else if ((name === "scalex" || name === "scaley") && args.length === 1) {
+          const value = domMatrixNumber(args[0]);
+          if (value !== null) next = name === "scalex"
+            ? [value, 0, 0, 1, 0, 0] : [1, 0, 0, value, 0, 0];
+        } else if ((name === "rotate" || name === "rotatez") && args.length === 1) {
+          const angle = domMatrixAngle(args[0]);
+          if (angle !== null) {
+            const cosine = Math.cos(angle), sine = Math.sin(angle);
+            next = [cosine, sine, -sine, cosine, 0, 0];
+          }
+        } else if ((name === "skewx" || name === "skewy") && args.length === 1) {
+          const angle = domMatrixAngle(args[0]);
+          if (angle !== null) next = name === "skewx"
+            ? [1, 0, Math.tan(angle), 1, 0, 0]
+            : [1, Math.tan(angle), 0, 1, 0, 0];
+        }
+        if (!next || !next.every(Number.isFinite)) fail();
+        matrix = domMatrixMultiply(matrix, next);
+      }
+      return matrix;
+    },
+    domMatrixList = (values) => {
+      if (typeof values === "string") return parseDOMMatrixString(values);
       const list =
-        values &&
-        typeof values === "object" &&
-        !("length" in values) &&
+        values && typeof values === "object" && !("length" in values) &&
         !values[Symbol.iterator]
           ? [values.a, values.b, values.c, values.d, values.e, values.f]
-          : Array.from(values);
-      this.a = Number(list[0] ?? 1);
-      this.b = Number(list[1] ?? 0);
-      this.c = Number(list[2] ?? 0);
-      this.d = Number(list[3] ?? 1);
-      this.e = Number(list[4] ?? 0);
-      this.f = Number(list[5] ?? 0);
-      this.is2D = true;
+          : Array.from(values ?? [1, 0, 0, 1, 0, 0]);
+      if (list.length !== 6)
+        throw new TypeError("DOMMatrix requires six 2D values");
+      const numbers = list.map((value, index) =>
+        Number(value ?? (index === 0 || index === 3 ? 1 : 0)));
+      if (!numbers.every(Number.isFinite))
+        throw new TypeError("DOMMatrix values must be finite");
+      return numbers;
+    };
+
+  class DOMMatrixReadOnly {
+    constructor(values = [1, 0, 0, 1, 0, 0]) {
+      const list = domMatrixList(values);
+      Object.defineProperty(this, "_values", { value: list });
+    }
+    get a() { return this._values[0]; }
+    get b() { return this._values[1]; }
+    get c() { return this._values[2]; }
+    get d() { return this._values[3]; }
+    get e() { return this._values[4]; }
+    get f() { return this._values[5]; }
+    get m11() { return this.a; }
+    get m12() { return this.b; }
+    get m13() { return 0; }
+    get m14() { return 0; }
+    get m21() { return this.c; }
+    get m22() { return this.d; }
+    get m23() { return 0; }
+    get m24() { return 0; }
+    get m31() { return 0; }
+    get m32() { return 0; }
+    get m33() { return 1; }
+    get m34() { return 0; }
+    get m41() { return this.e; }
+    get m42() { return this.f; }
+    get m43() { return 0; }
+    get m44() { return 1; }
+    get is2D() { return true; }
+    get isIdentity() {
+      return this.a === 1 && this.b === 0 && this.c === 0 && this.d === 1 &&
+        this.e === 0 && this.f === 0;
     }
     multiply(other) {
-      other = other instanceof DOMMatrix ? other : new DOMMatrix(other);
-      return new DOMMatrix([
-        this.a * other.a + this.c * other.b,
-        this.b * other.a + this.d * other.b,
-        this.a * other.c + this.c * other.d,
-        this.b * other.c + this.d * other.d,
-        this.a * other.e + this.c * other.f + this.e,
-        this.b * other.e + this.d * other.f + this.f,
-      ]);
+      other = other instanceof DOMMatrixReadOnly ? other : new DOMMatrix(other);
+      return new DOMMatrix(domMatrixMultiply(this._values, other._values));
     }
     translate(x, y = 0) {
       return this.multiply([1, 0, 0, 1, Number(x), Number(y)]);
@@ -941,7 +1072,29 @@
         1,
       ]);
     }
+    toFloat32Array() { return new Float32Array(this.toFloat64Array()); }
+    toJSON() {
+      return {
+        a: this.a, b: this.b, c: this.c, d: this.d, e: this.e, f: this.f,
+        m11: this.m11, m12: this.m12, m13: 0, m14: 0,
+        m21: this.m21, m22: this.m22, m23: 0, m24: 0,
+        m31: 0, m32: 0, m33: 1, m34: 0,
+        m41: this.m41, m42: this.m42, m43: 0, m44: 1,
+        is2D: true, isIdentity: this.isIdentity,
+      };
+    }
+    toString() {
+      return `matrix(${this.a}, ${this.b}, ${this.c}, ${this.d}, ${this.e}, ${this.f})`;
+    }
   }
+
+  class DOMMatrix extends DOMMatrixReadOnly {}
+  Object.defineProperty(DOMMatrixReadOnly.prototype, Symbol.toStringTag, {
+    configurable: true, value: "DOMMatrixReadOnly",
+  });
+  Object.defineProperty(DOMMatrix.prototype, Symbol.toStringTag, {
+    configurable: true, value: "DOMMatrix",
+  });
 
   const pathCurrentPoint = (commands) => {
       for (let index = commands.length - 1; index >= 0; index--) {
@@ -2921,6 +3074,12 @@
     writable: false,
   });
   globalThis.__tilefinchCanvasConnected = (root) => {
+    /* DOMParser, createHTMLDocument, and ordinary detached construction use
+       the same Node wrappers as the live page.  They must remain inert: even
+       calling a page-visible querySelectorAll override here is observable and
+       can recursively enter author instrumentation while an inert tree is
+       being parsed.  Publication only has work once the subtree is connected. */
+    if (!root?.isConnected) return;
     const candidates = [];
     if (root instanceof HTMLCanvasElement) candidates.push(root);
     if (typeof root?.querySelectorAll === "function") {
@@ -2943,7 +3102,7 @@
     CanvasPattern,
     CanvasRenderingContext2D,
     DOMMatrix,
-    DOMMatrixReadOnly: DOMMatrix,
+    DOMMatrixReadOnly,
     ImageData,
     ImageBitmap,
     Path2D,

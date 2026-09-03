@@ -745,6 +745,68 @@ static lxb_dom_node_t *test_reader_find_id(lxb_dom_node_t *root,
                                            const char *id);
 static lxb_dom_node_t *test_reader_root_node(PocDocument *document);
 
+static int test_google_search_compatibility_adapter(void)
+{
+    static const char url[] =
+        "https://www.google.com/search?q=PSP%20%26%20games%22%3E";
+    CHECK(site_adapter_handles_navigation("GET", url)
+          && !site_adapter_navigation_requires_network("GET", url)
+          && !site_adapter_handles_navigation(
+                 "GET", "https://www.google.com/search?q=PSP&tilefinch_raw=1")
+          && !site_adapter_handles_navigation(
+                 "GET", "https://notgoogle.test/search?q=PSP"));
+
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.tile_capacity = 0u;
+    char error[128] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL
+          && browser_engine_begin_navigation_url(
+                 engine, url, 64u * 1024u, 1000, true));
+    BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+    for (size_t pumps = 0u;
+         pumps < 32u && status == BROWSER_NAVIGATION_JOB_PENDING; pumps++) {
+        status = browser_engine_pump_navigation(engine, NULL);
+    }
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    const char *body = navigation == NULL ? NULL
+        : document_body_text(&navigation->page.document);
+    lxb_dom_node_t *search = navigation == NULL ? NULL
+        : actionable_find_id(&navigation->page.document, "compat-search");
+    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+          && navigation != NULL
+          && strcmp(navigation->page.document.title, "Web search") == 0
+          && navigation->page.runtime == NULL
+          && body != NULL
+          && strstr(body, "Google needs JavaScript") != NULL
+          && strstr(body, "Search with DuckDuckGo") != NULL
+          && strstr(body, "PSP & games\">") == NULL
+          && search != NULL
+          && browser_engine_focus_node(engine, search));
+    ControllerAction action = {0};
+    bool activated = browser_engine_activate(engine, &action);
+    if (!activated || action.type != CONTROLLER_ACTION_FORM_SUBMIT
+        || strstr(action.url, "duckduckgo") == NULL) {
+        fprintf(stderr, "google compat activation=%d type=%d url=%s\n",
+                activated ? 1 : 0, (int) action.type, action.url);
+    }
+    CHECK(activated
+          && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+          && strncmp(action.url, "https://lite.duckduckgo.com/lite/?q=",
+                     sizeof("https://lite.duckduckgo.com/lite/?q=") - 1u) == 0
+          && strstr(action.url, "PSP") != NULL
+          && strstr(action.url, "games") != NULL);
+
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
 static const DrawCommand *test_reader_text_command(
     const LayoutDocument *layout, const char *text)
 {
@@ -1209,6 +1271,54 @@ static int test_blank_reader_frontend_recovery(void)
           && navigation->page.script_result.promise_rejections != 0u
           && browser_engine_content_blocker_configure(
                  engine, CONTENT_BLOCKER_OFF, NULL));
+
+    /* Commit-time Reader candidates remain private while delayed author work
+       settles. A public lookalike appended in that interval must never become
+       the native root; activation connects only the exact pre-author tree. */
+    static const char deferred_reader_lookalike[] =
+        "<!doctype html><style>article{opacity:0}</style><body><article>"
+        RECOVERY_PROSE "</article><script>"
+        "setTimeout(()=>{let fake=document.createElement('main');"
+        "fake.id='author-reader-fake';"
+        "fake.hidden=true;"
+        "fake.setAttribute('data-tilefinch-reader-root','article');"
+        "fake.textContent='AUTHOR LOOKALIKE';document.body.appendChild(fake)},0);"
+        "throw new Error('hydration failed')</script></body>";
+    browser_engine_set_reader_candidate_mode(engine, true);
+    static const char staged_reader_css[] =
+        "body[data-tilefinch-reader-kind=article]>"
+        "[data-tilefinch-reader-root=article]{display:block!important}";
+    CHECK(browser_engine_set_user_css(
+              engine, staged_reader_css, sizeof(staged_reader_css) - 1u)
+          && browser_engine_commit_html(
+              engine, "https://reader-provenance.test/",
+              deferred_reader_lookalike,
+              sizeof(deferred_reader_lookalike) - 1u, true));
+    navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *native_reader_root = navigation->page.reader_root;
+    CHECK(navigation->page.reader_analysis.prepared
+          && navigation->page.reader_analysis.kind == READER_PAGE_ARTICLE
+          && native_reader_root != NULL && native_reader_root->parent == NULL
+          && navigation->page.reader_root_handle != 0
+          && test_reader_root_node(&navigation->page.document) == NULL);
+    CHECK(navigation->page.script_result.pending_tasks != 0u
+          && browser_engine_advance_runtime(engine, 1u, 4u, NULL));
+    lxb_dom_node_t *author_fake = actionable_find_id(
+        &navigation->page.document, "author-reader-fake");
+    CHECK(author_fake != NULL && author_fake != native_reader_root);
+    navigation_retire_current_page_scripts(navigation);
+    CHECK(navigation->page.runtime == NULL
+          && navigation->page.reader_root == native_reader_root
+          && navigation->page.reader_root_handle == 0
+          && native_reader_root->parent == NULL);
+    analysis = (ReaderDocumentAnalysis) {0};
+    CHECK(browser_engine_prepare_reader(engine, &analysis)
+          && navigation->page.reader_root == native_reader_root
+          && native_reader_root->parent
+                 == document_body_node(&navigation->page.document)
+          && author_fake != navigation->page.reader_root);
+    browser_engine_set_reader_candidate_mode(engine, false);
+    CHECK(browser_engine_set_user_css(engine, "", 0u));
 
     /* A full-viewport gradient can share the resolved page-background base
        color while still being the page's entire visible presentation. */
@@ -1723,6 +1833,428 @@ static int test_blank_reader_frontend_recovery(void)
           && budget_active_allocations(budget, NULL) == 0u);
     browser_engine_test_set_recovery_time_us(0u);
     browser_engine_destroy(engine);
+    return 0;
+}
+
+static lxb_dom_node_t *test_declared_media_card_node(PocDocument *document)
+{
+    if (document == NULL || document->html == NULL) return NULL;
+    lxb_dom_node_t *root = lxb_dom_interface_node(document->html);
+    size_t visited = 0u;
+    for (lxb_dom_node_t *node = root;
+         node != NULL && visited++ < 16384u;) {
+        size_t length = 0u;
+        if (document_attribute(
+                node, "data-tilefinch-declared-media-card", &length)
+            != NULL) return node;
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != NULL && node != root && node->next == NULL)
+            node = node->parent;
+        node = node == NULL || node == root ? NULL : node->next;
+    }
+    return NULL;
+}
+
+static int test_declared_media_card_recovery(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.tile_capacity = 4u;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.javascript.heap_limit = 2u * MIB;
+    config.javascript.maximum_scripts = 8u;
+    config.javascript.maximum_total_bytes = 64u * 1024u;
+    config.javascript.maximum_file_bytes = 32u * 1024u;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    browser_engine_test_set_recovery_time_us(UINT64_MAX);
+
+    static const char healthy[] =
+        "<!doctype html><body><img width=320 height=180 src=/poster.jpg>"
+        "<script type=application/ld+json>"
+        "{\"@type\":\"VideoObject\",\"contentUrl\":\"/movie-240.mp4\","
+        "\"thumbnailUrl\":\"/poster.jpg\"}</script><script>0</script>";
+    CHECK(browser_engine_commit_html(
+              engine, "https://card.example.test/watch", healthy,
+              sizeof(healthy) - 1u, true)
+          && browser_engine_prepare_declared_media_card(engine)
+                 == BROWSER_DECLARED_MEDIA_CARD_NONE
+          && media_declared_video_discovery_count(
+                 &browser_engine_navigation(engine)->page.document) == 0u
+          && test_declared_media_card_node(
+                 &browser_engine_navigation(engine)->page.document) == NULL);
+
+    static const char exact[] =
+        "<!doctype html><style>img{display:block;width:320px;height:180px}"
+        "</style><body><img id=poster src='/poster.jpg?exact=1'>"
+        "<script type=application/ld+json>"
+        "{\"@type\":\"VideoObject\",\"name\":\"Fixture video\","
+        "\"duration\":\"PT1M\",\"thumbnailUrl\":"
+        "\"/poster.jpg?exact=1\",\"contentUrl\":\"/movie-240.mp4\"}"
+        "</script><script>document.body.addEventListener('click',function(e){"
+        "e.preventDefault()});throw new Error('bundle failed')</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/watch", exact,
+        sizeof(exact) - 1u, true));
+    BrowserDeclaredMediaCard card =
+        browser_engine_prepare_declared_media_card(engine);
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED
+          && media_declared_video_discovery_count(
+                 &browser_engine_navigation(engine)->page.document) == 0u);
+    for (size_t tick = 0u;
+         card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED && tick < 16u;
+         tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+        card = browser_engine_prepare_declared_media_card(engine);
+        if (card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED) {
+            CHECK(media_declared_video_discovery_count(
+                      &browser_engine_navigation(engine)->page.document)
+                  == 0u);
+        }
+    }
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *node = test_declared_media_card_node(
+        &navigation->page.document);
+    size_t marker_length = 0u;
+    const char *marker = node == NULL ? NULL : document_attribute(
+        node, "data-tilefinch-declared-media-card", &marker_length);
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_INSTALLED
+          && media_declared_video_discovery_count(
+                 &navigation->page.document) == 1u
+          && marker != NULL && marker_length == sizeof("thumbnail") - 1u
+          && memcmp(marker, "thumbnail", marker_length) == 0);
+    ControllerAction action = {0};
+    CHECK(browser_engine_focus_node(engine, node)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_MEDIA
+          && action.media_node_handle == 0
+          && strcmp(action.url,
+                    "https://card.example.test/movie-240.mp4") == 0);
+    BrowserFindSnapshot find = {0};
+    CHECK(browser_engine_find_begin(engine, "Fixture video", &find)
+          && find.match_count == 0u);
+    browser_engine_find_clear(engine);
+
+    static const char near_miss[] =
+        "<!doctype html><style>img{display:block;width:320px;height:180px}"
+        "</style><body><img src='/poster.jpg?exact=2'>"
+        "<meta property=og:video content=/movie-360.mp4>"
+        "<meta property=og:image content='/poster.jpg?exact=1'>"
+        "<script>throw new Error('bundle failed')</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/near", near_miss,
+        sizeof(near_miss) - 1u, true));
+    card = browser_engine_prepare_declared_media_card(engine);
+    for (size_t tick = 0u;
+         card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED && tick < 16u;
+         tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+        card = browser_engine_prepare_declared_media_card(engine);
+    }
+    navigation = browser_engine_navigation(engine);
+    node = test_declared_media_card_node(&navigation->page.document);
+    marker = node == NULL ? NULL : document_attribute(
+        node, "data-tilefinch-declared-media-card", &marker_length);
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_INSTALLED
+          && node == document_body_node(&navigation->page.document)->first_child
+          && marker != NULL && marker_length == sizeof("synthetic") - 1u
+          && memcmp(marker, "synthetic", marker_length) == 0);
+
+    static const char divergent[] =
+        "<!doctype html><meta property=og:video content=/declared-360.mp4>"
+        "<script type=application/json>"
+        "{\"download\":\"/unrelated-240.mp4\"}</script>"
+        "<script>throw new Error('bundle failed')</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/divergent", divergent,
+        sizeof(divergent) - 1u, true));
+    card = browser_engine_prepare_declared_media_card(engine);
+    for (size_t tick = 0u;
+         card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED && tick < 16u;
+         tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+        card = browser_engine_prepare_declared_media_card(engine);
+    }
+    navigation = browser_engine_navigation(engine);
+    node = test_declared_media_card_node(&navigation->page.document);
+    action = (ControllerAction) {0};
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_INSTALLED
+          && node != NULL
+          && browser_engine_focus_node(engine, node)
+          && browser_engine_activate(engine, &action)
+          && strcmp(action.url,
+                    "https://card.example.test/declared-360.mp4") == 0);
+
+    static const char thumbnail_rollback[] =
+        "<!doctype html><style>img{display:block;width:320px;height:180px}"
+        "</style><body><img src=/rollback-poster.jpg>"
+        "<script type=application/ld+json>"
+        "{\"@type\":\"VideoObject\","
+        "\"thumbnailUrl\":\"/rollback-poster.jpg\","
+        "\"contentUrl\":\"/rollback-240.mp4\"}</script>"
+        "<script>throw new Error('bundle failed')</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/thumbnail-rollback",
+        thumbnail_rollback, sizeof(thumbnail_rollback) - 1u, true));
+    navigation = browser_engine_navigation(engine);
+    PocDocument *thumbnail_document = &navigation->page.document;
+    lxb_dom_node_t *thumbnail_body = document_body_node(thumbnail_document);
+    lxb_dom_node_t *thumbnail_image = thumbnail_body->first_child;
+    size_t thumbnail_nodes = thumbnail_document->node_count;
+    size_t thumbnail_elements = thumbnail_document->element_count;
+    CHECK(browser_engine_prepare_declared_media_card(engine)
+              == BROWSER_DECLARED_MEDIA_CARD_DEFERRED);
+    for (size_t tick = 0u; tick < 12u; tick++)
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+    navigation_test_refuse_next_same_document_relayout();
+    CHECK(browser_engine_prepare_declared_media_card(engine)
+              == BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE
+          && test_declared_media_card_node(thumbnail_document) == NULL
+          && thumbnail_body->first_child == thumbnail_image
+          && thumbnail_image->parent == thumbnail_body
+          && thumbnail_document->node_count == thumbnail_nodes
+          && thumbnail_document->element_count == thumbnail_elements);
+
+    static const char rollback[] =
+        "<!doctype html><body><article id=original>Stable source</article>"
+        "<script type=application/ld+json>"
+        "{\"@type\":\"VideoObject\","
+        "\"contentUrl\":\"/movie-240.mp4\"}</script>"
+        "<script>throw new Error('bundle failed')</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/rollback", rollback,
+        sizeof(rollback) - 1u, true));
+    navigation = browser_engine_navigation(engine);
+    PocDocument *rollback_document = &navigation->page.document;
+    lxb_dom_node_t *rollback_body = document_body_node(rollback_document);
+    lxb_dom_node_t *original_first = rollback_body->first_child;
+    size_t original_nodes = rollback_document->node_count;
+    size_t original_elements = rollback_document->element_count;
+    size_t original_attributes = rollback_document->attribute_count;
+    size_t original_text = rollback_document->text_bytes;
+    CHECK(browser_engine_prepare_declared_media_card(engine)
+              == BROWSER_DECLARED_MEDIA_CARD_DEFERRED);
+    for (size_t tick = 0u; tick < 12u; tick++)
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+    navigation_test_refuse_next_same_document_relayout();
+    CHECK(browser_engine_prepare_declared_media_card(engine)
+              == BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE
+          && test_declared_media_card_node(rollback_document) == NULL
+          && navigation->page.loaded
+          && rollback_body->first_child == original_first
+          && rollback_document->node_count == original_nodes
+          && rollback_document->element_count == original_elements
+          && rollback_document->attribute_count == original_attributes
+          && rollback_document->text_bytes == original_text);
+
+    static const char independent_settle[] =
+        "<!doctype html><body><main><h1>Retained page</h1>"
+        "<p>Useful server text remains available when the application bundle "
+        "does not start on this device.</p></main>"
+        "<script type=application/ld+json>"
+        "{\"@type\":\"VideoObject\","
+        "\"contentUrl\":\"/settle-240.mp4\"}</script>"
+        "<script>setInterval(function(){},1000);"
+        "throw new Error('bundle failed')</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/independent-settle",
+        independent_settle, sizeof(independent_settle) - 1u, true));
+    ReaderDocumentAnalysis settle_analysis = {0};
+    CHECK(browser_engine_prepare_declared_media_card(engine)
+              == BROWSER_DECLARED_MEDIA_CARD_DEFERRED
+          && browser_engine_prepare_basic_view_recovery(
+                 engine, &settle_analysis)
+                 == BROWSER_BASIC_VIEW_RECOVERY_DEFERRED);
+    for (size_t tick = 0u; tick < 12u; tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+        if (tick + 1u < 12u) {
+            CHECK(browser_engine_prepare_declared_media_card(engine)
+                      == BROWSER_DECLARED_MEDIA_CARD_DEFERRED
+                  && browser_engine_prepare_basic_view_recovery(
+                         engine, &settle_analysis)
+                         == BROWSER_BASIC_VIEW_RECOVERY_DEFERRED);
+        }
+    }
+    navigation_test_refuse_next_same_document_relayout();
+    CHECK(browser_engine_prepare_declared_media_card(engine)
+              == BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE
+          && browser_engine_prepare_basic_view_recovery(
+                 engine, &settle_analysis)
+                 == BROWSER_BASIC_VIEW_RECOVERY_AVAILABLE);
+
+    static const char uncorroborated[] =
+        "<!doctype html><body><div data-src=/lazy-240.mp4>Lazy shell</div>"
+        "<script>throw new Error('bundle failed')</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/uncorroborated",
+        uncorroborated, sizeof(uncorroborated) - 1u, true));
+    card = browser_engine_prepare_declared_media_card(engine);
+    for (size_t tick = 0u;
+         card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED && tick < 16u;
+         tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+        card = browser_engine_prepare_declared_media_card(engine);
+    }
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_NONE
+          && test_declared_media_card_node(
+                 &browser_engine_navigation(engine)->page.document) == NULL);
+    PocDocument *uncorroborated_document =
+        &browser_engine_navigation(engine)->page.document;
+    size_t uncorroborated_scans =
+        media_declared_video_discovery_count(uncorroborated_document);
+    CHECK(uncorroborated_scans == 1u
+          && browser_engine_prepare_declared_media_card(engine)
+                 == BROWSER_DECLARED_MEDIA_CARD_NONE
+          && media_declared_video_discovery_count(uncorroborated_document)
+                 == uncorroborated_scans);
+
+    static const char spoofed_marker[] =
+        "<!doctype html><body><button "
+        "data-tilefinch-declared-media-card=synthetic>Author button</button>"
+        "<script>throw new Error('bundle failed')</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/spoof", spoofed_marker,
+        sizeof(spoofed_marker) - 1u, true));
+    card = browser_engine_prepare_declared_media_card(engine);
+    for (size_t tick = 0u;
+         card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED && tick < 16u;
+         tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+        card = browser_engine_prepare_declared_media_card(engine);
+    }
+    navigation = browser_engine_navigation(engine);
+    node = document_body_node(&navigation->page.document)->first_child;
+    action = (ControllerAction) {0};
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_NONE
+          && !document_is_declared_video_card(
+                 &navigation->page.document, node)
+          && browser_engine_focus_node(engine, node)
+          && browser_engine_activate(engine, &action)
+          && action.type != CONTROLLER_ACTION_MEDIA);
+
+    static const char author_video[] =
+        "<!doctype html><body><video controls></video>"
+        "<script type=application/ld+json>"
+        "{\"@type\":\"VideoObject\",\"name\":\"Fixture title\","
+        "\"duration\":\"PT1M\","
+        "\"contentUrl\":\"/movie-240.mp4\"}</script>"
+        "<script>throw new Error('bundle failed')</script>";
+    bool rung1_committed = browser_engine_commit_html(
+        engine, "https://card.example.test/rung1", author_video,
+        sizeof(author_video) - 1u, true);
+    BrowserDeclaredMediaCard rung1_card = rung1_committed
+        ? browser_engine_prepare_declared_media_card(engine)
+        : BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE;
+    for (size_t tick = 0u;
+         rung1_card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED && tick < 16u;
+         tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+        rung1_card = browser_engine_prepare_declared_media_card(engine);
+    }
+    CHECK(rung1_committed
+          && rung1_card == BROWSER_DECLARED_MEDIA_CARD_NONE
+          && test_declared_media_card_node(
+                 &browser_engine_navigation(engine)->page.document) == NULL);
+    navigation = browser_engine_navigation(engine);
+    CHECK(test_reader_text_command(
+              &navigation->page.layout, "Fixture title") != NULL
+          && test_reader_text_command(
+                 &navigation->page.layout, "PT1M") != NULL);
+    static const char blocked_csp[] =
+        "content-security-policy: media-src 'none'\n";
+    navigation = browser_engine_navigation(engine);
+    CHECK(tilefinch_csp_parse_response_headers(
+              &navigation->page.document.content_security_policy,
+              "https://card.example.test/rung1", blocked_csp,
+              sizeof(blocked_csp) - 1u, false));
+    action = (ControllerAction) {0};
+    CHECK(!controller_build_document_media_action(
+        browser_engine_controller(engine), &action));
+
+    static const char basic_video[] =
+        "<!doctype html><head><script type=application/ld+json>"
+        "{\"@context\":\"https://schema.org\","
+        "\"@type\":\"VideoObject\",\"name\":\"Basic fixture\","
+        "\"contentUrl\":\"/basic-240.mp4\"}</script></head><body>"
+        "<main><h1>Basic fixture</h1>"
+        "<p>Useful retained description for the declared video.</p>"
+        "<p>Another bounded paragraph remains available after scripts retire."
+        "</p></main></body>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/basic", basic_video,
+        sizeof(basic_video) - 1u, true));
+    ReaderDocumentAnalysis basic_analysis = {0};
+    CHECK(browser_engine_prepare_basic_view(engine, &basic_analysis)
+          && basic_analysis.kind == READER_PAGE_BASIC);
+    char basic_css[SITE_ADAPTER_READER_CSS_LIMIT];
+    char basic_adapter[32];
+    CHECK(site_adapter_reader_css(
+              "https://card.example.test/basic",
+              SITE_ADAPTER_READER_FONT_SANS, 100u,
+              basic_css, sizeof(basic_css), basic_adapter,
+              sizeof(basic_adapter))
+          && browser_engine_apply_user_css(
+                 engine, basic_css, strlen(basic_css))
+          && browser_engine_activate_basic_view(engine));
+    navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *basic_media = NULL;
+    for (size_t i = 0u; i < navigation->page.layout.control_count; i++) {
+        lxb_dom_node_t *candidate = navigation->page.layout.controls[i].node;
+        size_t candidate_marker_length = 0u;
+        if (document_attribute(
+                candidate, "data-tilefinch-declared-media-card",
+                &candidate_marker_length) != NULL) {
+            basic_media = candidate;
+            break;
+        }
+    }
+    action = (ControllerAction) {0};
+    CHECK(basic_media != NULL
+          && browser_engine_focus_node(engine, basic_media)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_MEDIA
+          && action.media_node_handle == 0
+          && strcmp(action.url,
+                    "https://card.example.test/basic-240.mp4") == 0);
+
+    static const char shell_refusal[] =
+        "<!doctype html><body><article>Stable source</article>"
+        "<script type=application/ld+json>"
+        "{\"@type\":\"VideoObject\","
+        "\"contentUrl\":\"/shell-refusal-240.mp4\"}</script>"
+        "<script>throw new Error('bundle failed')</script>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://card.example.test/shell-refusal", shell_refusal,
+        sizeof(shell_refusal) - 1u, true));
+    CHECK(browser_engine_prepare_declared_media_card(engine)
+              == BROWSER_DECLARED_MEDIA_CARD_DEFERRED);
+    for (size_t tick = 0u; tick < 12u; tick++) {
+        CHECK(browser_engine_advance_runtime(engine, 2u, 4u, NULL));
+    }
+    browser_engine_test_refuse_next_render_shell_init();
+    card = browser_engine_prepare_declared_media_card(engine);
+    navigation = browser_engine_navigation(engine);
+    CHECK(card == BROWSER_DECLARED_MEDIA_CARD_UNAVAILABLE
+          && !navigation->page.loaded
+          && navigation->page.layout.count == 0u
+          && browser_engine_render_metrics_view(engine) == NULL
+          && !browser_engine_render_frame(engine, 0));
+
+    Budget *budget = browser_engine_budget(engine);
+    CHECK(browser_engine_shutdown(engine)
+          && budget->current == 0u
+          && budget_active_allocations(budget, NULL) == 0u);
+    browser_engine_destroy(engine);
+    browser_engine_test_set_recovery_time_us(0u);
     return 0;
 }
 
@@ -2866,7 +3398,8 @@ static int test_reader_alias_relocation_rebinds_declined_auto_layout(void)
     fetch_trace_end();
     NavigationSession *navigation = browser_engine_navigation(engine);
     CHECK(navigation != NULL && navigation->page.images.count == 16u
-          && navigation->page.images.capacity == 16u);
+          && navigation->page.images.capacity
+                 == 16u + NAVIGATION_FRAME_LIMIT);
     TileCache *render = browser_engine_render_shell(engine);
     CHECK(render != NULL && render->owns_visual_layout
           && render->source_layout == &navigation->page.layout

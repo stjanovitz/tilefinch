@@ -189,7 +189,260 @@ static void youtube_destroy(void *implementation)
     youtube_lite_load_destroy(implementation);
 }
 
+typedef struct {
+    Budget *budget;
+    SiteAdapterDocument document;
+    SiteAdapterLoadStatus status;
+    char error[96];
+} GoogleSearchCompatibilityLoad;
+
+static bool google_search_query(
+    const char *url, const char **query, size_t *query_length)
+{
+    if (query != NULL) *query = NULL;
+    if (query_length != NULL) *query_length = 0u;
+    if (url == NULL || query == NULL || query_length == NULL) return false;
+    static const char www_prefix[] = "https://www.google.com/search?";
+    static const char bare_prefix[] = "https://google.com/search?";
+    const char *at = NULL;
+    if (strncasecmp(url, www_prefix, sizeof(www_prefix) - 1u) == 0)
+        at = url + sizeof(www_prefix) - 1u;
+    else if (strncasecmp(url, bare_prefix, sizeof(bare_prefix) - 1u) == 0)
+        at = url + sizeof(bare_prefix) - 1u;
+    else return false;
+    size_t left = strcspn(at, "#");
+    bool raw = false;
+    while (left != 0u) {
+        size_t span = 0u;
+        while (span < left && at[span] != '&') span++;
+        const char *equals = memchr(at, '=', span);
+        size_t name_length = equals == NULL
+            ? span : (size_t) (equals - at);
+        size_t value_length = equals == NULL
+            ? 0u : span - name_length - 1u;
+        const char *value = equals == NULL ? at + span : equals + 1;
+        if (name_length == sizeof("tilefinch_raw") - 1u
+            && memcmp(at, "tilefinch_raw", name_length) == 0
+            && value_length == 1u && value[0] == '1') raw = true;
+        if (name_length == 1u && at[0] == 'q' && value_length != 0u
+            && *query == NULL) {
+            *query = value;
+            *query_length = value_length;
+        }
+        if (span == left) break;
+        at += span + 1u;
+        left -= span + 1u;
+    }
+    return !raw && *query != NULL && *query_length <= 384u;
+}
+
+static bool google_search_matches(const char *url)
+{
+    const char *query = NULL;
+    size_t query_length = 0u;
+    return google_search_query(url, &query, &query_length);
+}
+
+static int google_hex(unsigned char byte)
+{
+    if (byte >= '0' && byte <= '9') return byte - '0';
+    if (byte >= 'A' && byte <= 'F') return byte - 'A' + 10;
+    if (byte >= 'a' && byte <= 'f') return byte - 'a' + 10;
+    return -1;
+}
+
+static bool google_query_html(
+    const char *query, size_t query_length, char *output, size_t capacity)
+{
+    size_t used = 0u;
+    for (size_t at = 0u; at < query_length; at++) {
+        unsigned char byte = (unsigned char) query[at];
+        if (byte == '+') byte = ' ';
+        else if (byte == '%' && at + 2u < query_length) {
+            int high = google_hex((unsigned char) query[at + 1u]);
+            int low = google_hex((unsigned char) query[at + 2u]);
+            if (high >= 0 && low >= 0) {
+                byte = (unsigned char) ((high << 4) | low);
+                at += 2u;
+            }
+        }
+        const char *entity = NULL;
+        if (byte == '&') entity = "&amp;";
+        else if (byte == '<') entity = "&lt;";
+        else if (byte == '>') entity = "&gt;";
+        else if (byte == '"') entity = "&quot;";
+        else if (byte == '\'') entity = "&#39;";
+        if (entity != NULL) {
+            size_t length = strlen(entity);
+            if (length >= capacity - used) return false;
+            memcpy(output + used, entity, length);
+            used += length;
+        } else {
+            if (used + 1u >= capacity) return false;
+            output[used++] = byte == 0u ? ' ' : (char) byte;
+        }
+    }
+    output[used] = '\0';
+    return true;
+}
+
+static void *google_search_begin(
+    Budget *budget, BrowserSession *session, const char *url,
+    const SiteAdapterPreferences *preferences,
+    size_t maximum_source_bytes, long timeout_ms,
+    char *error, size_t error_size)
+{
+    (void) session; (void) preferences; (void) maximum_source_bytes;
+    (void) timeout_ms;
+    const char *query = NULL;
+    size_t query_length = 0u;
+    if (!google_search_query(url, &query, &query_length)) return NULL;
+    GoogleSearchCompatibilityLoad *load = budget_calloc_category(
+        budget, BUDGET_CATEGORY_RESOURCE, 1u, sizeof(*load));
+    if (load == NULL) {
+        if (error != NULL && error_size != 0u)
+            snprintf(error, error_size, "%s",
+                     "Google compatibility page exceeded its memory bound");
+        return NULL;
+    }
+    load->budget = budget;
+    /* Two escaped copies are embedded in the bounded document. 384 encoded
+       bytes can expand to at most 2304 HTML-entity bytes per copy. */
+    char display[2305];
+    if (!google_query_html(query, query_length, display, sizeof(display))) {
+        snprintf(load->error, sizeof(load->error), "%s",
+                 "Google query exceeded compatibility bounds");
+        load->status = SITE_ADAPTER_LOAD_FAILED;
+        return load;
+    }
+    size_t capacity = 7168u;
+    char *html = budget_malloc_category(
+        budget, BUDGET_CATEGORY_RESOURCE, capacity);
+    if (html == NULL) {
+        budget_free(budget, load);
+        if (error != NULL && error_size != 0u)
+            snprintf(error, error_size, "%s",
+                     "Google compatibility page exceeded its memory bound");
+        return NULL;
+    }
+    int length = snprintf(
+        html, capacity,
+        "<!doctype html><html><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width'>"
+        "<title>Web search</title><style>"
+        "html{background:#07131d;color:#eef6ff;font:16px sans-serif}"
+        "body{margin:0;padding:18px;max-width:440px}h1{font-size:24px;"
+        "margin:0 0 10px;color:#78bfff}p{line-height:1.35}"
+        "form{margin:16px 0}input{box-sizing:border-box;width:100%%;"
+        "padding:9px;border:1px solid #4d799d;background:#10283a;"
+        "color:#fff}button,a{display:block;box-sizing:border-box;"
+        "margin-top:9px;padding:10px;border:1px solid #5f9dcc;"
+        "background:#173a54;color:#fff;text-decoration:none}"
+        "small{display:block;color:#a7bdcf;margin-top:14px}"
+        "</style></head><body><main><h1>Google needs JavaScript</h1>"
+        "<p>Google no longer sends search results in its basic HTML response."
+        " Tilefinch can open a script-light search instead.</p>"
+        "<form action='https://lite.duckduckgo.com/lite/' method=get>"
+        "<input id=compat-query name=q value=\"%s\" aria-label='Search query'>"
+        "<button id=compat-search type=submit autofocus>"
+        "Search with DuckDuckGo</button></form>"
+        "<form action='https://www.google.com/search' method=get>"
+        "<input type=hidden name=q value=\"%s\">"
+        "<input type=hidden name=tilefinch_raw value=1>"
+        "<button id=compat-google type=submit>Try Google anyway</button></form>"
+        "<small>Your query is sent to DuckDuckGo only after you choose the"
+        " first action.</small></main></body></html>", display, display);
+    if (length < 0 || (size_t) length >= capacity) {
+        budget_free(budget, html);
+        snprintf(load->error, sizeof(load->error), "%s",
+                 "Google compatibility page exceeded its bound");
+        load->status = SITE_ADAPTER_LOAD_FAILED;
+        return load;
+    }
+    load->document = (SiteAdapterDocument) {
+        .budget = budget,
+        .html = html,
+        .html_length = (size_t) length,
+        .status_code = 200
+    };
+    snprintf(load->document.adapter, sizeof(load->document.adapter), "%s",
+             "google-search-compat");
+    load->status = SITE_ADAPTER_LOAD_SUCCEEDED;
+    return load;
+}
+
+static SiteAdapterLoadStatus google_search_pump(
+    void *implementation, const FetchPumpQuota *quota)
+{
+    (void) quota;
+    GoogleSearchCompatibilityLoad *load = implementation;
+    return load == NULL ? SITE_ADAPTER_LOAD_FAILED : load->status;
+}
+
+static SiteAdapterLoadStatus google_search_status(const void *implementation)
+{
+    const GoogleSearchCompatibilityLoad *load = implementation;
+    return load == NULL ? SITE_ADAPTER_LOAD_FAILED : load->status;
+}
+
+static void google_search_cancel(void *implementation, const char *reason)
+{
+    (void) reason;
+    GoogleSearchCompatibilityLoad *load = implementation;
+    if (load != NULL) load->status = SITE_ADAPTER_LOAD_CANCELLED;
+}
+
+static bool google_search_take(
+    void *implementation, SiteAdapterDocument *document)
+{
+    GoogleSearchCompatibilityLoad *load = implementation;
+    if (load == NULL || document == NULL
+        || load->status != SITE_ADAPTER_LOAD_SUCCEEDED
+        || load->document.html == NULL) return false;
+    *document = load->document;
+    load->document = (SiteAdapterDocument) {0};
+    return true;
+}
+
+static bool google_search_metrics(
+    const void *implementation, SiteAdapterLoadMetrics *metrics)
+{
+    if (implementation == NULL || metrics == NULL) return false;
+    *metrics = (SiteAdapterLoadMetrics) {.build_slices = 1u};
+    return true;
+}
+
+static const char *google_search_error(const void *implementation)
+{
+    const GoogleSearchCompatibilityLoad *load = implementation;
+    return load == NULL ? "Google compatibility load is null" : load->error;
+}
+
+static void google_search_destroy(void *implementation)
+{
+    GoogleSearchCompatibilityLoad *load = implementation;
+    if (load == NULL) return;
+    Budget *budget = load->budget;
+    if (budget != NULL && load->document.html != NULL)
+        budget_free(budget, load->document.html);
+    if (budget != NULL) budget_free(budget, load);
+}
+
 static const SiteAdapterDefinition adapters[] = {
+    {
+        .name = "google-search-compat",
+        .requires_network = false,
+        .matches = google_search_matches,
+        .requires_stable_typography = NULL,
+        .begin = google_search_begin,
+        .pump = google_search_pump,
+        .status = google_search_status,
+        .cancel = google_search_cancel,
+        .take = google_search_take,
+        .metrics = google_search_metrics,
+        .error = google_search_error,
+        .destroy = google_search_destroy
+    },
     {
         .name = "youtube-lite",
         .requires_network = true,

@@ -83,7 +83,7 @@
       ? kind : String(kind).slice(0, 96);
     activeTaskSequence = nextTaskSequence++;
     try {
-      __tilefinchCallbackCheckpoint();
+      __tilefinchCallbackCheckpoint(activeTaskKind);
       return args === undefined
         ? callback.call(thisArg) : callback.apply(thisArg, args);
     } finally {
@@ -92,9 +92,11 @@
     }
   };
   const uncaughtErrors = [];
+  let uncaughtReportDepth = 0;
   globalThis.__tilefinchUncaughtErrors = uncaughtErrors;
   globalThis.__tilefinchLastUncaughtTask = "";
   globalThis.__tilefinchReportUncaught = (error, context = "callback") => {
+    uncaughtReportDepth++;
     try {
       const message = String(error),
         stack = String((error && error.stack) || ""),
@@ -122,7 +124,11 @@
        * original value even when diagnostic formatting later fails.
        */
       const onerror = globalThis.onerror;
-      if (typeof onerror === "function")
+      /* HTML's exception-reporting algorithm must not recursively report an
+         exception raised while it is already firing the Window error event.
+         Without this guard, one throwing `error` listener recursively creates
+         error events until Tilefinch's callback budget retires the realm. */
+      if (uncaughtReportDepth === 1 && typeof onerror === "function")
         try {
           onerror.call(
             globalThis,
@@ -134,6 +140,7 @@
           );
         } catch (_) {}
       if (
+        uncaughtReportDepth === 1 &&
         typeof globalThis.Event === "function" &&
         typeof globalThis.dispatchEvent === "function"
       )
@@ -162,6 +169,8 @@
         console.error("Uncaught " + String(context), detail, provenance);
     } catch (_) {
       /* Reporting must never turn an isolated callback exception into a failed host dispatch, including when the JS heap is exhausted. */
+    } finally {
+      uncaughtReportDepth--;
     }
   };
   const retentionStats = {
@@ -956,6 +965,7 @@
       return globalThis.__tilefinchNewDocument?.() || this;
     }
   }
+  class HTMLDocument extends Document {}
   class XMLDocument extends Document {}
   class NodeList extends Array {
     item(index) {
@@ -1012,10 +1022,23 @@
     DocumentFragment,
     ShadowRoot,
     Document,
+    HTMLDocument,
     XMLDocument,
     NodeList,
     HTMLCollection,
     Window,
+  });
+  Object.defineProperty(HTMLDocument.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "HTMLDocument",
+  });
+  Object.defineProperty(XMLDocument.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "XMLDocument",
+  });
+  Object.defineProperty(Window.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "Window",
   });
   if (!(globalThis instanceof Window))
     Object.setPrototypeOf(globalThis, Window.prototype);
@@ -2394,13 +2417,16 @@
       controlState = inputReset
         ? null
         : globalThis.__tilefinchBeginControlDefault?.(this) || null,
-      clickEvent = new MouseEvent("click", {
+      clickEvent = new PointerEvent("click", {
           bubbles: true,
           cancelable: true,
           composed: true,
           button: 0,
           buttons: 0,
-          detail: 1,
+          detail: 0,
+          pointerId: -1,
+          pointerType: "",
+          isPrimary: false,
         });
     clickEvent.__tilefinchControlDefaultPrepared = true;
     const proceed = this.dispatchEvent(clickEvent),
@@ -3620,15 +3646,20 @@
           return this.__tilefinchDetachedParent.nodeType === Node.ELEMENT_NODE
             ? this.__tilefinchDetachedParent
             : null;
-        return globalThis.__tilefinchCanonicalElement(
-          globalThis.__tilefinchIsVirtualRemote(this)
-            ? __tilefinchRemoteNodeRelation(
-                this.__tilefinchStableKey,
-                this.__tilefinchRemoteSection,
-                0,
-              )
-            : wrap(__tilefinchRelation(handle, 0)),
-        );
+        const parent = globalThis.__tilefinchIsVirtualRemote(this)
+          ? __tilefinchRemoteNodeRelation(
+              this.__tilefinchStableKey,
+              this.__tilefinchRemoteSection,
+              0,
+            )
+          : wrap(__tilefinchRelation(handle, 8));
+        /* The native shadow-root carrier is an internal element so layout can
+           flatten it, but its JavaScript identity is a DocumentFragment.
+           Deriving parentElement from the native "element parent" relation
+           leaked that carrier to children of a shadow root. */
+        return parent instanceof Element
+          ? globalThis.__tilefinchCanonicalElement(parent)
+          : null;
       },
       get parentNode() {
         if (this.__tilefinchDetachedParent) return this.__tilefinchDetachedParent;
@@ -4918,7 +4949,11 @@
         // Avoid rebuilding it with style and ancestor walks on the common
         // path; the fallback below remains for virtual or not-yet-laid-out
         // nodes.
-        if (g.authoritative)
+        const authoritativeAutoHeight =
+          g.authoritative &&
+          (Number(g.height) || 0) <= 0 &&
+          (this.firstChild || shadowRootForHost(this));
+        if (g.authoritative && !authoritativeAutoHeight)
           return new DOMRect(
             Number(g.x) || 0,
             Number(g.y) || 0,
@@ -5000,6 +5035,100 @@
           );
         if (Number.isFinite(cssWidth) && cssWidth > 0) width = cssWidth;
         if (Number.isFinite(cssHeight) && cssHeight > 0) height = cssHeight;
+        if (
+          height <= 0 &&
+          !Number.isFinite(cssHeight) &&
+          style.position !== "absolute" &&
+          style.position !== "fixed"
+        ) {
+          /* A shadow root is represented natively by a display:contents
+             carrier. Until native layout has consumed a dynamic shadow
+             mutation, derive the host's auto block size from its in-flow
+             descendants. Keep both traversal and nesting explicitly bounded:
+             geometry is observable author work and must not turn a deep
+             hostile tree into unbounded recursion on PSP. */
+          const state = { remaining: 128 },
+            measureAutoContentHeight = (container, depth) => {
+              if (depth >= 16 || state.remaining <= 0) return 0;
+              const shadow =
+                container instanceof Element
+                  ? shadowRootForHost(container)
+                  : null;
+              if (shadow)
+                return measureAutoContentHeight(shadow, depth + 1);
+              let blocks = 0,
+                line = 0,
+                child = container?.firstChild || null;
+              for (
+                let siblings = 0;
+                child && siblings < 128 && state.remaining > 0;
+                child = child.nextSibling, siblings++
+              ) {
+                state.remaining--;
+                if (
+                  !(child instanceof Element) &&
+                  !(child instanceof ShadowRoot)
+                )
+                  continue;
+                if (child instanceof ShadowRoot) {
+                  const contents = measureAutoContentHeight(child, depth + 1);
+                  line = Math.max(line, contents);
+                  continue;
+                }
+                const childStyle = getComputedStyle(child);
+                if (
+                  childStyle.display === "none" ||
+                  childStyle.position === "absolute" ||
+                  childStyle.position === "fixed"
+                )
+                  continue;
+                const childGeometry =
+                    child.__tilefinchGeometryValue?.() || {},
+                  authoredHeight = cssPixels(
+                    childStyle.height,
+                    containingRect.height,
+                    innerHeight,
+                  ),
+                  marginTop =
+                    parseFloat(childStyle.getPropertyValue("margin-top")) || 0,
+                  marginBottom =
+                    parseFloat(childStyle.getPropertyValue("margin-bottom")) ||
+                    0,
+                  padding =
+                    (parseFloat(
+                      childStyle.getPropertyValue("padding-top"),
+                    ) || 0) +
+                    (parseFloat(
+                      childStyle.getPropertyValue("padding-bottom"),
+                    ) || 0) +
+                    (parseFloat(
+                      childStyle.getPropertyValue("border-top-width"),
+                    ) || 0) +
+                    (parseFloat(
+                      childStyle.getPropertyValue("border-bottom-width"),
+                    ) || 0);
+                let childHeight = Number(childGeometry.height) || 0;
+                if (Number.isFinite(authoredHeight) && authoredHeight > 0)
+                  childHeight = authoredHeight + padding;
+                else if (childHeight <= 0)
+                  childHeight =
+                    measureAutoContentHeight(child, depth + 1) + padding;
+                const extent = marginTop + childHeight + marginBottom,
+                  inline =
+                    childStyle.display === "inline" ||
+                    childStyle.display === "inline-block" ||
+                    childStyle.display === "inline-flex" ||
+                    childStyle.display === "inline-grid";
+                if (inline) line = Math.max(line, extent);
+                else {
+                  blocks += line + extent;
+                  line = 0;
+                }
+              }
+              return blocks + line;
+            };
+          height = measureAutoContentHeight(this, 0);
+        }
         if (
           needsFlowFallback &&
           (this === document.documentElement || this === document.body)
@@ -6133,7 +6262,8 @@
   };
   globalThis.__tilefinchDocumentListeners = documentListeners;
   const mutationObservers = [],
-    pendingMutationObservers = new Set();
+    pendingMutationObservers = new Set(),
+    mutationObserverStates = new WeakMap();
   let mutationDeliveryPending = false,
     mutationDeliveryActive = false,
     parserTreeSnapshot = null;
@@ -6152,12 +6282,12 @@
       return snapshot;
     },
     observesParserTree = (observer) =>
-      observer.targets.some(
+      mutationObserverStates.get(observer)?.targets.some(
         (item) =>
           item.target === document &&
           item.options.childList &&
           item.options.subtree,
-      ),
+      ) || false,
     updateParserTreeSnapshot = (
       target,
       addedNodes,
@@ -6241,17 +6371,21 @@
       this.oldValue = init.oldValue ?? null;
     }
   };
-  globalThis.MutationObserver = class {
+  globalThis.MutationObserver = class MutationObserver {
     constructor(callback) {
-      this.callback = callback;
-      this.targets = [];
-      this.records = [];
-      this.transientRoots = [];
-      this.pending = false;
       if (typeof callback !== "function")
         throw new TypeError("callback required");
+      mutationObserverStates.set(this, {
+        callback,
+        targets: [],
+        records: [],
+        transientRoots: [],
+        pending: false,
+      });
     }
     observe(target, options = {}) {
+      const state = mutationObserverStates.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
       if (!(target instanceof Node)) throw new TypeError("Node required");
       options = Object(options);
       const normalized = {
@@ -6288,9 +6422,9 @@
         targetKey: String(target.__tilefinchStableKey || ""),
         options: normalized,
       };
-      const at = this.targets.findIndex((item) => item.target === target);
-      if (at >= 0) this.targets[at] = registration;
-      else this.targets.push(registration);
+      const at = state.targets.findIndex((item) => item.target === target);
+      if (at >= 0) state.targets[at] = registration;
+      else state.targets.push(registration);
       if (!mutationObservers.includes(this)) {
         /* Observer registrations retain callback closures and target
            wrappers. Sixty-four covers mature test/framework fan-out while
@@ -6302,10 +6436,12 @@
         parserTreeSnapshot = captureParserTree();
     }
     disconnect() {
-      this.targets = [];
-      this.records = [];
-      this.transientRoots = [];
-      this.pending = false;
+      const state = mutationObserverStates.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      state.targets = [];
+      state.records = [];
+      state.transientRoots = [];
+      state.pending = false;
       pendingMutationObservers.delete(this);
       const at = mutationObservers.indexOf(this);
       if (at >= 0) mutationObservers.splice(at, 1);
@@ -6313,10 +6449,16 @@
         parserTreeSnapshot = null;
     }
     takeRecords() {
-      const records = this.records.splice(0);
+      const state = mutationObserverStates.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      const records = state.records.splice(0);
       return records;
     }
   };
+  Object.defineProperty(globalThis.MutationObserver.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "MutationObserver",
+  });
   {
     const observers = new Set();
     let resizeRecheckPending = false,
@@ -7007,9 +7149,11 @@
         }
       }
     for (const observer of mutationObservers) {
+      const observerState = mutationObserverStates.get(observer);
+      if (!observerState) continue;
       let matched = false;
       let matchedRegistration = null;
-      for (const watched of observer.targets) {
+      for (const watched of observerState.targets) {
         const sameStable =
           watched.targetKey &&
           String(target?.__tilefinchStableKey || "") === watched.targetKey;
@@ -7052,7 +7196,7 @@
         }
       }
       if (!matched) {
-        for (const transient of observer.transientRoots) {
+        for (const transient of observerState.transientRoots) {
           let within = target === transient.root;
           if (!within) {
             for (
@@ -7091,20 +7235,20 @@
       ) {
         for (const root of removedNodes) {
           if (
-            observer.transientRoots.length < 64 &&
-            !observer.transientRoots.some((item) => item.root === root)
+            observerState.transientRoots.length < 64 &&
+            !observerState.transientRoots.some((item) => item.root === root)
           )
-            observer.transientRoots.push({
+            observerState.transientRoots.push({
               root,
               options: matchedRegistration.options,
             });
         }
       }
-      if (observer.records.length >= 64) {
+      if (observerState.records.length >= 64) {
         retentionStats.recordDrops++;
         continue;
       }
-      observer.records.push(new MutationRecord({
+      observerState.records.push(new MutationRecord({
         type,
         target,
         attributeName: attributeName || null,
@@ -7124,8 +7268,8 @@
                 : null
               : null,
       }));
-      if (!observer.pending) {
-        observer.pending = true;
+      if (!observerState.pending) {
+        observerState.pending = true;
         pendingMutationObservers.add(observer);
       }
       if (!mutationDeliveryPending) {
@@ -7136,20 +7280,22 @@
           pendingMutationObservers.clear();
           mutationDeliveryActive = true;
           for (const item of pending) {
-            item.pending = false;
+            const itemState = mutationObserverStates.get(item);
+            if (!itemState) continue;
+            itemState.pending = false;
             const records = item.takeRecords();
             if (records.length)
               try {
                 globalThis.__tilefinchRunTask(
                   "mutation-observer",
-                  item.callback,
+                  itemState.callback,
                   item,
                   [records, item],
                 );
               } catch (error) {
                 __tilefinchReportUncaught(error, "MutationObserver");
               }
-            item.transientRoots = [];
+            itemState.transientRoots = [];
           }
           mutationDeliveryActive = false;
           if (pendingSlotRoots.size)

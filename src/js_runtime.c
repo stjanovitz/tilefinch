@@ -20,6 +20,7 @@
 #include <strings.h>
 #include <time.h>
 #include <errno.h>
+#include <zlib.h>
 #if defined(__linux__)
 #endif
 

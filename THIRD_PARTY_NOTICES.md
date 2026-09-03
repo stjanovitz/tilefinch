@@ -84,6 +84,16 @@ runtime assets or immutable engine data.
   generated Unicode 17 bidi/bracket tables. The optional text-editing API is
   disabled; paragraph allocations are routed through Tilefinch's page budget.
   The complete license is at `third_party/notices/sheenbidi/LICENSE`.
+- **WebAssembly Micro Runtime (WAMR) 2.4.5**: Apache License 2.0. The PSP
+  build packages its bounded fast interpreter as `tilefinch-wasm.prx` and
+  loads it only when a page first requests the WebAssembly namespace. JIT,
+  AOT, WASI, threads, shared memory, reference types, and unbounded memories
+  are disabled. The complete Apache-2.0 text already distributed at
+  `NOTICES/mbedtls/LICENSE` applies to WAMR as well.
+- **SIMDe**, pinned through WAMR 2.4.5: MIT License. WAMR uses this portable
+  compatibility layer to interpret standard fixed-width WebAssembly SIMD on
+  the PSP's scalar Allegrex core. The complete license is at
+  `third_party/notices/simde/LICENSE`.
 - **OpenSSL** (host builds only): `OpenSSL::Crypto` is linked into host
   laboratory and test binaries. Apache License 2.0. Not part of the PSP
   EBOOT.
@@ -198,7 +208,7 @@ libwebp copyright license and patent grant;
 Public Suffix List MPL-2.0 and Chromium BSD-3-Clause texts with the source
 pointer; the complete PocketSphinx compound license; the DejaVu and both OFL
 font licenses alongside the font files; the
-curl, nghttp2, mbed TLS, and zlib texts for the PSP stack; the PSPDEV
+curl, nghttp2, mbed TLS, WAMR, SIMDe, and zlib texts for the PSP stack; the PSPDEV
 component notices; the FFmpeg LGPL-2.1 text when the software-decoder PRX is
 included; and the Danzeff BSD-3-Clause notice. Retain all applicable
 upstream notices whenever binaries are redistributed.

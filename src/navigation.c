@@ -4,6 +4,7 @@
 #include "tilefinch/frame_sandbox.h"
 #include "tilefinch/script_loader.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/pixel_math.h"
 #include "tilefinch/render.h"
 #include "tilefinch/request_context.h"
 #include "tilefinch/resource_integrity.h"

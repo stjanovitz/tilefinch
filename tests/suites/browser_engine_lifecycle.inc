@@ -345,6 +345,7 @@ static int test_engine_lifecycle(void)
                     + sizeof(((BrowserSession *) 0)->site_adapter_state)
                     + sizeof(((BrowserSession *) 0)
                                  ->site_adapter_document_cache)
+                    + sizeof(((BrowserSession *) 0)->client_hints)
           && metrics.budget_external_reserved
                  >= metrics.session_inline_accounting_bytes
           && metrics.budget_external_reserved_peak
@@ -1994,11 +1995,15 @@ static int test_same_document_event_mutations_settle_immediately(void)
         "#hash-space,#pop-space{height:0}.tail{height:900px}</style>"
         "<a id=jump href=#target>Jump</a>"
         "<a id=refused-link href=#refused>Refused settlement</a>"
+        "<div id=volatile><a href=#old>Borrowed text</a>"
+        "<input value=borrowed></div>"
         "<div id=hash-space></div><div id=pop-space></div>"
         "<a id=target>Target</a><a id=refused>Refused target</a>"
         "<div class=tail></div>"
         "<script>"
         "addEventListener('hashchange',()=>{"
+        "if(location.hash==='#refused')"
+        "document.getElementById('volatile').textContent='replacement';"
         "document.getElementById('hash-space').style.height="
         "location.hash==='#target'?'360px':"
         "location.hash==='#refused'?'480px':'120px';});"
@@ -2078,14 +2083,12 @@ static int test_same_document_event_mutations_settle_immediately(void)
           && navigation->loads_started == loads_before
           && navigation->generation == generation_before);
 
-    /* Once the callback has observed #refused, a real transactional layout
-       refusal leaves the old layout/render shell intact but must not roll the
-       authoritative URL/history cursor back or issue a request. */
+    /* Once the callback has destroyed text, link, and control nodes, a real
+       replacement refusal must retire the complete page and shell. Keeping
+       the incumbent pixels/layout would leave borrowed Lexbor pointers live. */
     size_t history_before_refusal = navigation->history_count;
     size_t relayouts_before_refusal = navigation->incremental_relayouts;
-    int retained_target_y = target_box->y;
     CHECK(browser_engine_focus_node(engine, refused));
-    int refusal_return_scroll = navigation_current(navigation)->scroll_y;
     navigation_test_refuse_next_same_document_relayout();
     CHECK(!browser_engine_activate(engine, &action)
           && strcmp(navigation_current(navigation)->url,
@@ -2094,32 +2097,330 @@ static int test_same_document_event_mutations_settle_immediately(void)
           && navigation->incremental_relayouts == relayouts_before_refusal
           && navigation->loads_started == loads_before
           && navigation->generation == generation_before);
-    hash_box = layout_box_for_node(&navigation->page.layout, hash_space);
-    target_box = layout_box_for_node(&navigation->page.layout, target);
-    CHECK(hash_box != NULL && hash_box->height == 360
-          && target_box != NULL && target_box->y == retained_target_y
+    CHECK(!navigation->page.loaded
+          && navigation->page.layout.count == 0u
+          && browser_engine_render_metrics_view(engine) == NULL
           && strstr(browser_engine_last_error(engine), "settled") != NULL);
-    bool recovered_back = browser_engine_history_move(engine, false);
-    if (!recovered_back
-        || strcmp(navigation_current(navigation)->url,
-                  "https://settle.test/page#target") != 0
-        || navigation_current(navigation)->scroll_y != refusal_return_scroll
-        || navigation->loads_started != loads_before) {
-        fprintf(stderr,
-                "same-document refused recovery back=%d url=%s scroll=%d/%d "
-                "loads=%zu/%zu relayouts=%zu error=%s nav-error=%s\n",
-                recovered_back, navigation_current(navigation)->url,
-                navigation_current(navigation)->scroll_y,
-                refusal_return_scroll,
-                navigation->loads_started, loads_before,
-                navigation->incremental_relayouts,
-                browser_engine_last_error(engine), navigation->last_error);
-    }
-    CHECK(recovered_back
-          && strcmp(navigation_current(navigation)->url,
-                    "https://settle.test/page#target") == 0
-          && navigation_current(navigation)->scroll_y == refusal_return_scroll
-          && navigation->loads_started == loads_before);
+    CHECK(!browser_engine_render_frame(engine, 0));
+    CHECK(!browser_engine_activate(engine, &action));
+
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_contenteditable_relayout_refusal_retires_shell(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+    static const char page[] =
+        "<!doctype html><body><div id=edit contenteditable=true>"
+        "Borrowed editable text</div><a href=/next>Next</a></body>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://editable.test/", page, sizeof(page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *editable = actionable_find_id(
+        &navigation->page.document, "edit");
+    CHECK(editable != NULL && browser_engine_focus_node(engine, editable));
+
+    navigation_test_refuse_next_relayout();
+    CHECK(!browser_engine_replace_text(
+              engine, "replacement", sizeof("replacement") - 1u)
+          && !navigation->page.loaded
+          && navigation->page.layout.count == 0u
+          && browser_engine_render_metrics_view(engine) == NULL
+          && !browser_engine_render_frame(engine, 0));
+
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_author_relayout_refusal_retires_shell(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+
+    static const char activation_page[] =
+        "<!doctype html><body><div id=volatile>Borrowed activation text</div>"
+        "<a id=go href=/next onclick=\"document.getElementById('volatile')"
+        ".textContent='replacement'\">Go</a></body>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://author-refusal.test/", activation_page,
+        sizeof(activation_page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *go = actionable_find_id(
+        &navigation->page.document, "go");
+    ControllerAction action = {0};
+    CHECK(go != NULL && browser_engine_focus_node(engine, go));
+    navigation_test_refuse_next_relayout();
+    CHECK(!browser_engine_activate(engine, &action)
+          && !navigation->page.loaded
+          && navigation->page.layout.count == 0u
+          && browser_engine_render_metrics_view(engine) == NULL
+          && !browser_engine_render_frame(engine, 0));
+
+    static const char timer_page[] =
+        "<!doctype html><body><div id=volatile>Borrowed timer text</div>"
+        "<script>setTimeout(()=>document.getElementById('volatile')"
+        ".textContent='replacement',0)</script></body>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://author-refusal.test/timer", timer_page,
+        sizeof(timer_page) - 1u, true));
+    navigation = browser_engine_navigation(engine);
+    CHECK(navigation->page.script_result.pending_tasks != 0u);
+    navigation_test_refuse_next_relayout();
+    CHECK(!browser_engine_advance_runtime(engine, 1u, 4u, NULL)
+          && !navigation->page.loaded
+          && navigation->page.layout.count == 0u
+          && browser_engine_render_metrics_view(engine) == NULL
+          && !browser_engine_render_frame(engine, 0));
+
+    static const char external_page[] =
+        "<!doctype html><body><script id=external></script>"
+        "<p>incumbent</p></body>";
+    static const char external_source[] =
+        "document.body.innerHTML='<p>replacement</p>'";
+    CHECK(browser_engine_commit_html(
+        engine, "https://refresh-refusal.test/external", external_page,
+        sizeof(external_page) - 1u, true));
+    navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *external = actionable_find_id(
+        &navigation->page.document, "external");
+    CHECK(external != NULL);
+    script_runtime_test_refuse_next_document_refresh();
+    CHECK(!navigation_evaluate_external_script(
+              navigation, external, external_source,
+              sizeof(external_source) - 1u,
+              "https://refresh-refusal.test/external.js")
+          && !navigation->page.loaded
+          && navigation->page.document.html == NULL
+          && navigation->page.runtime == NULL
+          && navigation->page.layout.count == 0u
+          && !browser_engine_render_frame(engine, 0));
+
+    static const char sticky_page[] =
+        "<!doctype html><body><p>sticky failure</p></body>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://refresh-refusal.test/sticky", sticky_page,
+        sizeof(sticky_page) - 1u, true));
+    navigation = browser_engine_navigation(engine);
+    script_runtime_test_mark_document_refresh_failed(
+        navigation->page.runtime);
+    /* Even an otherwise successful idle advance must honor the sticky fatal
+       boundary before frame/resource processing can reuse DOM state. */
+    CHECK(!browser_engine_advance_runtime(engine, 1u, 4u, NULL)
+          && !navigation->page.loaded
+          && navigation->page.document.html == NULL
+          && navigation->page.runtime == NULL
+          && navigation->page.layout.count == 0u);
+
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_history_restores_bounded_form_state(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+
+    static const char form_page[] =
+        "<!doctype html><body><input id=query value=initial>"
+        "<input id=secret type=password value=default></body>";
+    static const char second_page[] =
+        "<!doctype html><body><p>Second page</p></body>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://history-form.test/search", form_page,
+        sizeof(form_page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *query = actionable_find_id(
+        &navigation->page.document, "query");
+    lxb_dom_node_t *secret = actionable_find_id(
+        &navigation->page.document, "secret");
+    CHECK(query != NULL && secret != NULL);
+    CHECK(document_control_value_set(
+              &navigation->page.document, query, "portable", 8u));
+    CHECK(document_control_value_set(
+              &navigation->page.document, secret, "private", 7u));
+    /* Fragment entries retain the same document identity and must continue
+       storing/restoring non-sensitive controls. */
+    CHECK(navigation_commit_same_document_url(
+        navigation, "https://history-form.test/search#filters"));
+    CHECK(browser_engine_commit_html(
+        engine, "https://history-form.test/results", second_page,
+        sizeof(second_page) - 1u, true));
+    char replay_directory[128] = {0};
+    CHECK(write_history_form_replay(
+              replay_directory, form_page, sizeof(form_page) - 1u,
+              "https://history-form.test/search")
+          && fetch_trace_replay_begin(
+                 replay_directory, error, sizeof(error)));
+    CHECK(browser_engine_history_move(engine, false));
+    fetch_trace_end();
+    remove_large_youtube_replay(replay_directory);
+
+    navigation = browser_engine_navigation(engine);
+    query = actionable_find_id(&navigation->page.document, "query");
+    secret = actionable_find_id(&navigation->page.document, "secret");
+    size_t value_length = 0u;
+    const char *value = document_control_value(query, &value_length);
+    CHECK(value != NULL && value_length == 8u
+          && memcmp(value, "portable", 8u) == 0);
+    value = document_control_value(secret, &value_length);
+    CHECK(value == NULL || value_length != 7u
+          || memcmp(value, "private", 7u) != 0);
+
+    /* A history request can redirect to a new document whose form happens to
+       use the same bounded ordinal.  The old document's value must not cross
+       that validation/use boundary. */
+    static const char redirected_page[] =
+        "<!doctype html><body><input id=query value=destination></body>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://history-form.test/results", second_page,
+        sizeof(second_page) - 1u, true));
+    CHECK(write_history_form_replay(
+              replay_directory, redirected_page,
+              sizeof(redirected_page) - 1u,
+              "https://other-origin.test/landing")
+          && fetch_trace_replay_begin(
+                 replay_directory, error, sizeof(error)));
+    CHECK(browser_engine_history_move(engine, false));
+    fetch_trace_end();
+    remove_large_youtube_replay(replay_directory);
+    navigation = browser_engine_navigation(engine);
+    query = actionable_find_id(&navigation->page.document, "query");
+    value = document_control_value(query, &value_length);
+    size_t authored_length = 0u;
+    const char *authored = document_attribute(
+        query, "value", &authored_length);
+    CHECK(authored != NULL && authored_length == 11u
+          && memcmp(authored, "destination", 11u) == 0
+          && (value == NULL || value_length != 8u
+              || memcmp(value, "portable", 8u) != 0));
+    static const char redirected_url[] =
+        "https://other-origin.test/landing";
+    CHECK(strncmp(navigation->page.document_url, redirected_url,
+                  sizeof(redirected_url) - 1u) == 0
+          && (navigation->page.document_url[sizeof(redirected_url) - 1u]
+                  == '\0'
+              || navigation->page.document_url[sizeof(redirected_url) - 1u]
+                  == '#'));
+    CHECK(navigation_url_is_same_document(
+        navigation, "https://other-origin.test/landing#details"));
+    CHECK(!navigation_url_is_same_document(
+        navigation, "https://history-form.test/search#details"));
+    BrowserViewSnapshot redirected_view = {0};
+    CHECK(browser_engine_view_snapshot(engine, &redirected_view)
+          && strcmp(redirected_view.url,
+                    navigation->page.document_url) == 0
+          && redirected_view.secure);
+
+    /* Leaving the redirected document must not overwrite the original
+       history entry's saved controls, either. */
+    CHECK(document_control_value_set(
+        &navigation->page.document, query, "cross-origin", 12u));
+    CHECK(browser_engine_commit_html(
+        engine, "https://history-form.test/after-redirect", second_page,
+        sizeof(second_page) - 1u, true));
+    CHECK(write_history_form_replay(
+              replay_directory, form_page, sizeof(form_page) - 1u,
+              "https://history-form.test/search")
+          && fetch_trace_replay_begin(
+                 replay_directory, error, sizeof(error)));
+    CHECK(browser_engine_history_move(engine, false));
+    fetch_trace_end();
+    remove_large_youtube_replay(replay_directory);
+    navigation = browser_engine_navigation(engine);
+    query = actionable_find_id(&navigation->page.document, "query");
+    value = document_control_value(query, &value_length);
+    CHECK(value != NULL && value_length == 8u
+          && memcmp(value, "portable", 8u) == 0);
+
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_post_mutation_document_refresh_refusal_retires_shell(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 16u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(
+        &config, error, sizeof(error));
+    CHECK(engine != NULL);
+
+    static const char activation_page[] =
+        "<!doctype html><body><div id=volatile><a href=/borrowed>"
+        "Borrowed activation text</a><input value=borrowed></div>"
+        "<button id=replace onclick=\"document.getElementById('volatile')"
+        ".textContent='replacement'\">Replace</button></body>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://refresh-refusal.test/activation", activation_page,
+        sizeof(activation_page) - 1u, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *replace = actionable_find_id(
+        &navigation->page.document, "replace");
+    ControllerAction action = {0};
+    CHECK(replace != NULL && browser_engine_focus_node(engine, replace));
+    script_runtime_test_refuse_next_document_refresh();
+    bool activated = browser_engine_activate(engine, &action);
+    CHECK(!activated
+          && !navigation->page.loaded
+          && navigation->page.layout.count == 0u
+          && browser_engine_render_metrics_view(engine) == NULL
+          && strstr(navigation->last_error,
+                    "refresh mutated DOM") != NULL
+          && !browser_engine_render_frame(engine, 0)
+          && !browser_engine_activate(engine, &action));
+
+    static const char timer_page[] =
+        "<!doctype html><body><div id=volatile><a href=/borrowed>"
+        "Borrowed timer text</a><input value=borrowed></div>"
+        "<script>setTimeout(()=>document.getElementById('volatile')"
+        ".innerHTML='<p>replacement</p>',0)</script></body>";
+    CHECK(browser_engine_commit_html(
+        engine, "https://refresh-refusal.test/timer", timer_page,
+        sizeof(timer_page) - 1u, true));
+    navigation = browser_engine_navigation(engine);
+    CHECK(navigation->page.script_result.pending_tasks != 0u);
+    script_runtime_test_refuse_next_document_refresh();
+    CHECK(!browser_engine_advance_runtime(engine, 1u, 4u, NULL)
+          && !navigation->page.loaded
+          && navigation->page.layout.count == 0u
+          && browser_engine_render_metrics_view(engine) == NULL
+          && !browser_engine_render_frame(engine, 0));
 
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);

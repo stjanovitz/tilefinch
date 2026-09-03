@@ -287,6 +287,7 @@ struct LayoutReuseCache {
 
 typedef struct {
     LayoutDocument *layout;
+    const PocDocument *document;
     const Stylesheet *sheet;
     const FontSet *fonts;
     const WebFontSet *web_fonts;
@@ -377,6 +378,15 @@ typedef struct {
        the retained cache instead of repeatedly traversing and blurring it. */
     uint8_t backdrop_filter_count;
     bool backdrop_filter_disabled;
+    /* A declared-video label is discovered only if an authored <video>
+       actually reaches paint. The retained copies live in LayoutDocument's
+       bounded generated-text arena, so draw commands never point at this
+       ephemeral build context or a temporary discovery result. */
+    const char *declared_video_title;
+    const char *declared_video_duration;
+    size_t declared_video_title_length;
+    size_t declared_video_duration_length;
+    bool declared_video_scanned;
     bool document_bidi_text_present;
     bool document_bidi_markup_present;
     bool cancelled;
@@ -810,6 +820,9 @@ bool layout_paint_select_indicator(
     const ComputedStyle *style, int x, int y, int width, int height);
 bool layout_paint_audio_control(
     LayoutContext *context, const ComputedStyle *style,
+    int x, int y, int width, int height);
+bool layout_paint_video_control(
+    LayoutContext *context, lxb_dom_node_t *node,
     int x, int y, int width, int height);
 bool layout_add_link(LayoutDocument *layout, const DrawCommand *command,
                      size_t command_index, const char *url,

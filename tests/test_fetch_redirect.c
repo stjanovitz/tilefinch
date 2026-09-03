@@ -7,6 +7,7 @@
 #include "tilefinch/resources.h"
 #include "tilefinch/session.h"
 #include "tilefinch/style.h"
+#include "tilefinch/user_agent.h"
 
 #include "../src/fetch_redirect_abort.h"
 

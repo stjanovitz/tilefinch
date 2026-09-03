@@ -315,7 +315,8 @@ run_once() {
         config_path="$app_dir/data/boot-overrides.cfg"
         validation_log="$app_dir/data/tilefinch-validation.txt"
     else
-        cp "$build_dir/EBOOT.PBP" "$build_dir/roots.pem" "$app_dir/"
+        cp "$build_dir/EBOOT.PBP" "$build_dir/roots.pem" \
+            "$build_dir/tilefinch-wasm.prx" "$app_dir/"
         for asset_dir in fonts voice-model; do
             if [ -d "$build_dir/$asset_dir" ]; then
                 cp -R "$build_dir/$asset_dir" "$app_dir/$asset_dir"
@@ -513,7 +514,9 @@ if grep -Eq '^[[:space:]]*(tap|hold|press)-live([[:space:]]|$)' \
         exit 1
     }
 fi
-if grep -Eq '^[[:space:]]*mark-live([[:space:]]|$)' "$script_source"; then
+if grep -E '^[[:space:]]*mark-live([[:space:]]|$)' "$script_source" \
+        | grep -Ev '^[[:space:]]*mark-live[[:space:]]+(webgl-measure-start|webgl-measure-end|auto-controls|controls-exited)([[:space:]]|$)' \
+        >/dev/null; then
     grep -Eq 'tilefinch-input-script: capture=.* written=1' "$trace" || {
         printf 'FAIL: live script wrote no temporal frame.\n' >&2
         exit 1

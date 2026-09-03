@@ -231,7 +231,11 @@ static bool test_response_csp_gates_parser_and_resource_paths(void)
         && navigation_init(&navigation, &budget, 4);
     if (navigation_ready) {
         navigation_attach_browser_session(&navigation, &browser);
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        /* This fixture qualifies CSP/resource ordering, not the minimum-heap
+           pressure boundary. Leave room for the boot-captured Worker security
+           intrinsics; device defaults retain substantially more headroom. */
+        navigation_enable_scripts(
+            &navigation, 2 * MIB + 64 * 1024u, 1000);
         navigation_enable_document_scripts(
             &navigation, 8, 64 * 1024, 32 * 1024, 1000);
         navigation_enable_external_resources(
@@ -775,6 +779,38 @@ static bool test_critical_ch_body_is_not_page_visible(void)
     }
     navigation_load_destroy(load);
     fetch_trace_end();
+    /* Accept-CH persists for the browsing session. A later navigation to the
+       same origin must send the negotiated hint on its first request and
+       consume the hinted trace record directly, without another restart. */
+    size_t retries_after_first_navigation =
+        navigation.client_hint_retries;
+    bool repeat_trace_ready = ok && persisted_client_hint_replay_begin();
+    uint64_t repeat_generation = repeat_trace_ready
+        ? navigation_begin(&navigation) : 0;
+    bool repeated = repeat_trace_ready && navigation_load_url(
+        &navigation, repeat_generation,
+        "https://critical.test/document", 4096, 1000, 480,
+        NULL, NULL, true);
+    ok = ok && repeated
+        && navigation.client_hint_retries
+               == retries_after_first_navigation
+        && strcmp(navigation.page.document.title,
+                  "Critical-CH retry") == 0
+        && strcmp(navigation.page.script_result.summary,
+                  "retry-clean") == 0;
+    if (!ok) {
+        fprintf(stderr,
+                "cached Critical-CH navigation failed: trace=%d repeated=%d "
+                "retries=%zu expected=%zu title=%s summary=%s error=%s\n",
+                repeat_trace_ready ? 1 : 0, repeated ? 1 : 0,
+                navigation.client_hint_retries,
+                retries_after_first_navigation,
+                navigation.page.document.title == NULL
+                    ? "(null)" : navigation.page.document.title,
+                navigation.page.script_result.summary,
+                navigation.last_error);
+    }
+    if (repeat_trace_ready) fetch_trace_end();
     navigation_destroy(&navigation);
     browser_session_destroy(&browser);
     return ok && budget.current == 0;

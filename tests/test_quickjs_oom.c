@@ -1,11 +1,292 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "tilefinch/budget.h"
 #include "tilefinch/budget_quickjs.h"
 
 #define MIB (1024u * 1024u)
+
+static int run_reallocation_peak_census(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (pool == NULL) return 1;
+    const JSMallocFunctions *allocator = budget_quickjs_pool_allocator();
+    JSMallocState state = {
+        .malloc_limit = MIB,
+        .opaque = pool
+    };
+    void *allocation = allocator->js_malloc(&state, 1024u);
+    if (allocation == NULL) return 1;
+    allocation = allocator->js_realloc(&state, allocation, 256u * 1024u);
+    int okay = allocation != NULL
+        && budget_quickjs_pool_js_malloc_current(pool) == state.malloc_size
+        && budget_quickjs_pool_js_malloc_peak(pool) == state.malloc_size;
+    allocator->js_free(&state, allocation);
+    (void) budget_quickjs_pool_trim(pool, 0);
+    if (!budget_quickjs_pool_destroy(pool) || budget.current != 0)
+        return 1;
+    return okay ? 0 : 1;
+}
+
+static int run_large_repeat_eval(void)
+{
+    static const char memory_source[] =
+        "let local=40;eval(' '.repeat(1337331)+'local+2')";
+    static const char semantic_source[] =
+        "(()=>{let local=40;"
+        "const direct=eval(' '.repeat(1337331)+'local+2');"
+        "let column=0;try{eval(' '.repeat(1337331)+'!')}"
+        "catch(e){column=e.columnNumber}"
+        "const repeated='ab'.repeat(70000);"
+        "const newline=eval(' '.repeat(1337331)+'\\n7');"
+        "return [direct,repeated.length,repeated.charAt(139999),"
+        "newline,column].join(',')})()";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (pool == NULL) return 1;
+    JSRuntime *runtime = JS_NewRuntime2(
+        budget_quickjs_pool_allocator(), pool);
+    if (runtime == NULL) return 1;
+
+    /* The pre-fix implementation constructs and then linearizes a 1.3 MiB
+       flat repeat result and cannot run this under 2.5 MiB. A balanced repeat
+       rope plus prefix-aware eval stays well inside the same hard ceiling. */
+    JS_SetMemoryLimit(runtime, 2560u * 1024u);
+    JS_SetMaxStackSize(runtime, 256u * 1024u);
+    JSContext *context = JS_NewContext(runtime);
+    if (context == NULL) return 1;
+    JSValue value = JS_Eval(context, memory_source,
+                            sizeof(memory_source) - 1u,
+                            "<large-repeat-eval-memory>",
+                            JS_EVAL_TYPE_GLOBAL);
+    int32_t result = 0;
+    if (JS_IsException(value) || JS_ToInt32(context, &result, value)
+        || result != 42) {
+        if (JS_IsException(value)) {
+            JSValue exception = JS_GetException(context);
+            JS_FreeValue(context, exception);
+        } else {
+            JS_FreeValue(context, value);
+        }
+        return 1;
+    }
+    JS_FreeValue(context, value);
+
+    /* Large repeat remains an ordinary ECMAScript string. The compact eval
+       path preserves direct-eval scope, does not discard a newline, and keeps
+       the same one-based syntax-error column as the flat-string path. */
+    JS_SetMemoryLimit(runtime, 6u * MIB);
+    value = JS_Eval(context, semantic_source,
+                    sizeof(semantic_source) - 1u,
+                    "<large-repeat-eval-semantics>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(context);
+        JS_FreeValue(context, exception);
+        return 1;
+    }
+    const char *text = JS_ToCString(context, value);
+    int okay = text != NULL
+        && strcmp(text, "42,140000,b,7,1337333") == 0;
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+    if (!okay) return 1;
+
+    /* A hostile virtual prefix must not make native compaction scan toward
+       the one-billion-code-unit string limit. The rope stays virtual, the
+       bounded refusal is catchable, and the realm remains usable. */
+    static const char bounded_source[] =
+        "(()=>{let bounded=false;try{eval(' '.repeat(4194305))}"
+        "catch(error){bounded=error instanceof RangeError;}"
+        "return bounded&&eval('40+2')===42;})()";
+    value = JS_Eval(context, bounded_source,
+                    sizeof(bounded_source) - 1u,
+                    "<bounded-repeat-eval-scan>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value) || JS_ToBool(context, value) != 1) {
+        if (JS_IsException(value)) {
+            JSValue exception = JS_GetException(context);
+            JS_FreeValue(context, exception);
+        } else {
+            JS_FreeValue(context, value);
+        }
+        return 1;
+    }
+    JS_FreeValue(context, value);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    (void) budget_quickjs_pool_trim(pool, 0);
+    if (!budget_quickjs_pool_destroy(pool) || budget.current != 0)
+        return 1;
+    return okay ? 0 : 1;
+}
+
+static int run_compact_character_array(void)
+{
+    static const char memory_source[] =
+        "(()=>{const n=617000;const chars=[];"
+        "for(let i=0;i<n;i++)chars.push(String.fromCharCode((i*29+7)&255));"
+        "const joined=chars.join('');"
+        "return [joined.length,joined.charCodeAt(0),"
+        "joined.charCodeAt(12345),joined.charCodeAt(n-1)].join(':')})()";
+    static const char semantic_source[] =
+        "(()=>{const n=128;const chars=[];"
+        "for(let i=0;i<n;i++)chars.push(String.fromCharCode((i*29+7)&255));"
+        "const joined=chars.join('');"
+        "chars[3]='Z';if(chars[3]!=='Z')return 'set';"
+        "delete chars[n-1];chars[n-1]=String.fromCharCode(202);"
+        "if(chars.length!==n||chars[n-1].charCodeAt(0)!==202)return 'append';"
+        "chars.length=64;chars.copyWithin(8,0,8);"
+        "const copied=chars[8].charCodeAt(0)===7&&"
+        "chars[15].charCodeAt(0)===210;"
+        "const removed=chars.splice(4,2,'X','Y');"
+        "chars.reverse();"
+        "const applied=String.prototype.concat.apply('',chars.slice(0,4));"
+        "Object.defineProperty(chars,'1',{value:'K',writable:true,"
+        "enumerable:true,configurable:true});"
+        "chars.push('wide');"
+        "const preserved=joined.length===n&&joined.charCodeAt(3)===94;"
+        "return [preserved?1:0,copied?1:0,removed[0].charCodeAt(0),"
+        "removed[1].charCodeAt(0),applied.length,chars[1],"
+        "chars[64],chars.length].join(':')})()";
+    static const char ownership_source[] =
+        "(()=>{let atomChars=[];for(let i=0;i<96;i++)"
+        "atomChars.push(String.fromCharCode(65+i%26));"
+        "let atomString=atomChars.join('');const atomLength=atomString.length,"
+        "atomFirst=atomString.charCodeAt(0),holder={};"
+        "holder[atomString]=17;atomString=null;"
+        "for(let i=0;i<96;i++)atomChars.push(String.fromCharCode(97+i%26));"
+        "atomChars.length=40;atomChars.push('q');"
+        "const retainedKey=Object.keys(holder)[0],atomSafe="
+        "holder[retainedKey]===17&&retainedKey.length===atomLength"
+        "&&retainedKey.charCodeAt(0)===atomFirst;"
+        "let wide=[];for(let i=0;i<48;i++)wide.push('a');"
+        "wide[7]='Ā';const wideSafe=wide[7]==='Ā'&&wide.length===48;"
+        "let astral=[];for(let i=0;i<48;i++)astral.push('b');"
+        "astral[9]='😀';const astralSafe=astral[9]==='😀'&&astral.length===48;"
+        "let shared=[];for(let i=0;i<128;i++)shared.push('c');"
+        "const beforeGrowth=shared.join('');for(let i=0;i<160;i++)shared.push('d');"
+        "const afterGrowth=shared.join('');shared.length=8;"
+        "const cowSafe=beforeGrowth.length===128&&beforeGrowth[127]==='c'"
+        "&&afterGrowth.length===288&&afterGrowth[287]==='d'"
+        "&&shared.length===8&&shared.join('')==='cccccccc';"
+        "let arrayFirst=[];for(let i=0;i<32;i++)arrayFirst.push('e');"
+        "const survivesArray=arrayFirst.join('');arrayFirst=null;"
+        "const arrayFirstSafe=survivesArray==='e'.repeat(32);"
+        "let stringFirst=[];for(let i=0;i<32;i++)stringFirst.push('f');"
+        "let released=stringFirst.join('');released=null;stringFirst.push('g');"
+        "const stringFirstSafe=stringFirst.length===33"
+        "&&stringFirst[32]==='g';"
+        "return [atomSafe,wideSafe,astralSafe,cowSafe,arrayFirstSafe,"
+        "stringFirstSafe].map(Number).join(':')})()";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    if (setenv("TILEFINCH_JS_ARRAY_CAP_KB", "640", 1) != 0) return 1;
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (pool == NULL) {
+        unsetenv("TILEFINCH_JS_ARRAY_CAP_KB");
+        return 1;
+    }
+    JSRuntime *runtime = JS_NewRuntime2(
+        budget_quickjs_pool_allocator(), pool);
+    if (runtime == NULL) {
+        unsetenv("TILEFINCH_JS_ARRAY_CAP_KB");
+        return 1;
+    }
+
+    /* The response decoder used by large challenge scripts builds a dense
+       character array before joining it. Normal JSValue storage exceeds this
+       ceiling, while the bounded compact representation retains ordinary
+       Array semantics and deoptimizes before unsupported mutations. */
+    JS_SetMemoryLimit(runtime, 2u * MIB);
+    JS_SetMaxStackSize(runtime, 256u * 1024u);
+    JSContext *context = JS_NewContext(runtime);
+    if (context == NULL) {
+        unsetenv("TILEFINCH_JS_ARRAY_CAP_KB");
+        return 1;
+    }
+    int okay = 0;
+    JSValue value = JS_Eval(context, memory_source,
+                            sizeof(memory_source) - 1u,
+                            "<compact-character-array-memory>",
+                            JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(context);
+        const char *message = JS_ToCString(context, exception);
+        fprintf(stderr, "compact character-array memory exception: %s\n",
+                message != NULL ? message : "<unprintable>");
+        JS_FreeCString(context, message);
+        JS_FreeValue(context, exception);
+        goto cleanup;
+    }
+    const char *text = JS_ToCString(context, value);
+    if (text == NULL || strcmp(text, "617000:7:124:114") != 0) {
+        fprintf(stderr, "compact character-array memory result: %s\n",
+                text != NULL ? text : "<unprintable>");
+        JS_FreeCString(context, text);
+        JS_FreeValue(context, value);
+        goto cleanup;
+    }
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+
+    value = JS_Eval(context, semantic_source,
+                    sizeof(semantic_source) - 1u,
+                    "<compact-character-array-semantics>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(context);
+        const char *message = JS_ToCString(context, exception);
+        fprintf(stderr, "compact character-array semantic exception: %s\n",
+                message != NULL ? message : "<unprintable>");
+        JS_FreeCString(context, message);
+        JS_FreeValue(context, exception);
+        goto cleanup;
+    }
+    text = JS_ToCString(context, value);
+    okay = text != NULL
+        && strcmp(text, "1:1:123:152:4:K:wide:65") == 0;
+    if (!okay)
+        fprintf(stderr, "compact character-array semantic result: %s\n",
+                text != NULL ? text : "<unprintable>");
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+
+    value = JS_Eval(context, ownership_source,
+                    sizeof(ownership_source) - 1u,
+                    "<compact-character-array-ownership>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(context);
+        const char *message = JS_ToCString(context, exception);
+        fprintf(stderr, "compact character-array ownership exception: %s\n",
+                message != NULL ? message : "<unprintable>");
+        JS_FreeCString(context, message);
+        JS_FreeValue(context, exception);
+        goto cleanup;
+    }
+    text = JS_ToCString(context, value);
+    okay = text != NULL && strcmp(text, "1:1:1:1:1:1") == 0;
+    if (!okay)
+        fprintf(stderr, "compact character-array ownership result: %s\n",
+                text != NULL ? text : "<unprintable>");
+    JS_FreeCString(context, text);
+    JS_FreeValue(context, value);
+
+cleanup:
+    unsetenv("TILEFINCH_JS_ARRAY_CAP_KB");
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    (void) budget_quickjs_pool_trim(pool, 0);
+    if (!budget_quickjs_pool_destroy(pool) || budget.current != 0)
+        return 1;
+    return okay ? 0 : 1;
+}
 
 static int run_failure_boundary(size_t successful_allocations)
 {
@@ -96,6 +377,12 @@ int main(int argc, char **argv)
     }
     if (argc != 1) return 2;
 
+    if (run_reallocation_peak_census() != 0) {
+        fprintf(stderr, "QuickJS realloc peak census failed\n");
+        return 1;
+    }
+    puts("QuickJS realloc peak census: PASS");
+
     /* Exercise every host-allocation boundary around error-object creation,
        message attachment, backtrace construction, and stack-property growth.
        The pinned Bellard revision used to release current_exception during
@@ -121,5 +408,17 @@ int main(int argc, char **argv)
         }
     }
     puts("QuickJS parse OOM boundaries: PASS");
+
+    if (run_large_repeat_eval() != 0) {
+        fprintf(stderr, "QuickJS large repeat/eval bound failed\n");
+        return 1;
+    }
+    puts("QuickJS large repeat/eval bound: PASS");
+
+    if (run_compact_character_array() != 0) {
+        fprintf(stderr, "QuickJS compact character-array bound failed\n");
+        return 1;
+    }
+    puts("QuickJS compact character-array bound: PASS");
     return 0;
 }

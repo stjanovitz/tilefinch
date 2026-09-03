@@ -1,0 +1,16 @@
+--- a/core/iwasm/common/arch/invokeNative_mips.s
++++ b/core/iwasm/common/arch/invokeNative_mips.s
+@@ -55,8 +55,11 @@ done:
+     lw $5, 4($sp)
+     lw $6, 8($sp)
+     lw $7, 12($sp)
+-    ldc1 $f12, 0($sp) /* Load $f12, $f13, $f14, $f15 */
+-    ldc1 $f14, 8($sp)
++    /* Allegrex has paired 32-bit FPU registers but no ldc1 instruction. */
++    lwc1 $f12, 0($sp) /* Load $f12, $f13, $f14, $f15 */
++    lwc1 $f13, 4($sp)
++    lwc1 $f14, 8($sp)
++    lwc1 $f15, 12($sp)
+ 
+     jalr $25       /* call function */
+ 

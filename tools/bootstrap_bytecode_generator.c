@@ -174,8 +174,8 @@ static int emit_source_file(FILE *output)
         fprintf(output,
                 ";\nconst size_t %s_length = sizeof(%s) - 1;\n"
                 "_Static_assert(sizeof(%s) - 1 <= "
-                "SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES,\n"
-                "               \"%s exceeds PSP bootstrap source "
+                "SCRIPT_PSP_STRICT_MAXIMUM_HOST_COMPILE_BYTES,\n"
+                "               \"%s exceeds strict PSP bootstrap source "
                 "ceiling\");\n",
                 input->source_symbol, input->source_symbol,
                 input->source_symbol, input->source_symbol);
@@ -231,7 +231,9 @@ static int emit_bytecode_file(FILE *output)
     /* The authored source is embedded separately for the checked fallback
        path. Do not duplicate it inside every bytecode object; retain line
        tables so bootstrap exceptions still identify useful source lines. */
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
     if (runtime != NULL) JS_SetStripInfo(runtime, JS_STRIP_SOURCE);
+#endif
     JSContext *context = runtime == NULL ? NULL : JS_NewContext(runtime);
     if (context == NULL) {
         if (runtime != NULL) JS_FreeRuntime(runtime);

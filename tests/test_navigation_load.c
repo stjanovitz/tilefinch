@@ -2287,6 +2287,11 @@ static bool test_parser_script_stage_circuit_preserves_actions(void)
         && navigation.performance.optional_work_sheds == 0u
         && navigation.performance.parser_checkpoint_soft_refusals == 0u
         && navigation.performance.parser_script_stage_work == 97u
+        && navigation.performance.blocking_script_sample_count == 1u
+        && navigation.performance.blocking_script_samples[0].host_callback_us
+               != 0u
+        && navigation.performance.parser_script_stage_us
+               == navigation.performance.parser_script_execute_us
         && navigation.performance.parser_script_stage_breakers == 0u
         && strcmp(navigation.page.script_result.summary,
                   "checkpoint-script-ran") == 0;
@@ -2294,6 +2299,7 @@ static bool test_parser_script_stage_circuit_preserves_actions(void)
         fprintf(stderr,
                 "healthy parser hydration ready=%d loaded=%d page=%d "
                 "ran=%.*s runtime=%p degraded=%d sheds=%zu soft=%zu "
+                "stage-us=%llu execute-us=%llu callbacks=%zu/%llu "
                 "summary=\"%s\" error=\"%s\"\n",
                 ready ? 1 : 0, loaded ? 1 : 0,
                 navigation.page.loaded ? 1 : 0,
@@ -2302,6 +2308,14 @@ static bool test_parser_script_stage_circuit_preserves_actions(void)
                 navigation.page.script_degradation_observed ? 1 : 0,
                 navigation.performance.optional_work_sheds,
                 navigation.performance.parser_checkpoint_soft_refusals,
+                (unsigned long long)
+                    navigation.performance.parser_script_stage_us,
+                (unsigned long long)
+                    navigation.performance.parser_script_execute_us,
+                navigation.performance.blocking_script_sample_count,
+                (unsigned long long)
+                    navigation.performance.blocking_script_samples[0]
+                        .host_callback_us,
                 navigation.page.script_result.summary,
                 navigation.last_error);
     }
@@ -3422,6 +3436,14 @@ static bool critical_ch_replay_begin(void)
     return fetch_trace_replay_begin(
         TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-critical-ch", error,
         sizeof(error));
+}
+
+static bool persisted_client_hint_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-client-hint-persisted",
+        error, sizeof(error));
 }
 
 static bool redirected_critical_ch_replay_begin(void)

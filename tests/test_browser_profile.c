@@ -132,7 +132,7 @@ int main(void)
           && browser_profile_cookie_banner_hidden(
                  profile, "https://news.example/")
           && browser_profile_search_engine(profile)
-                 == BROWSER_SEARCH_GOOGLE
+                 == BROWSER_SEARCH_DUCKDUCKGO
           && browser_profile_color_mode(profile)
                  == BROWSER_COLOR_MODE_AUTO
           && browser_profile_chrome_theme(profile)
@@ -585,7 +585,7 @@ int main(void)
                  legacy_loaded, "https://problem.example/")
           && browser_profile_site_data_allowed(legacy_loaded)
           && browser_profile_search_engine(legacy_loaded)
-                 == BROWSER_SEARCH_GOOGLE
+                 == BROWSER_SEARCH_DUCKDUCKGO
           && browser_profile_color_mode(legacy_loaded)
                  == BROWSER_COLOR_MODE_AUTO
           && browser_profile_chrome_theme(legacy_loaded)

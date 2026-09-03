@@ -12,7 +12,7 @@ static const char *search_prefix(BrowserSearchEngine engine)
         case BROWSER_SEARCH_BING:
             return "https://www.bing.com/search?q=";
         case BROWSER_SEARCH_DUCKDUCKGO:
-            return "https://duckduckgo.com/?q=";
+            return "https://lite.duckduckgo.com/lite/?q=";
         case BROWSER_SEARCH_GOOGLE:
         default:
             return "https://www.google.com/search?q=";
@@ -24,7 +24,7 @@ const char *browser_search_engine_name(BrowserSearchEngine engine)
     switch (engine) {
         case BROWSER_SEARCH_GOOGLE: return "GOOGLE";
         case BROWSER_SEARCH_BING: return "BING";
-        case BROWSER_SEARCH_DUCKDUCKGO: return "DUCKDUCKGO";
+        case BROWSER_SEARCH_DUCKDUCKGO: return "DUCKDUCKGO LITE";
         default: return "GOOGLE";
     }
 }

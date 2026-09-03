@@ -15,6 +15,7 @@
 #include "tilefinch/fetch.h"
 #include "tilefinch/integer_math.h"
 #include "tilefinch/layout.h"
+#include "tilefinch/media_discovery.h"
 #include "tilefinch/platform.h"
 #if defined(__PSP__)
 #include "tilefinch/psp_display.h"
@@ -562,6 +563,24 @@ static bool image_add(ImageResources *images, ImageResource resource)
         images->capacity = capacity;
     }
     images->items[images->count++] = resource;
+    return true;
+}
+
+bool images_reserve_capacity(ImageResources *images, Budget *budget,
+                             size_t capacity)
+{
+    if (images == NULL || budget == NULL) return false;
+    if (capacity > MAX_TRACKED_IMAGE_NODES) {
+        capacity = MAX_TRACKED_IMAGE_NODES;
+    }
+    if (capacity <= images->capacity) return true;
+    if (images->budget != NULL && images->budget != budget) return false;
+    ImageResource *items = budget_realloc(
+        budget, images->items, capacity * sizeof(*items));
+    if (items == NULL) return false;
+    images->items = items;
+    images->capacity = capacity;
+    images->budget = budget;
     return true;
 }
 
@@ -3601,8 +3620,9 @@ static bool load_image_node_with_provenance_impl(
     uint64_t resolve_started = image_profile_enabled()
         ? image_profile_now_us() : 0;
     if (context->request_scratch == NULL) {
-        context->request_scratch = budget_malloc(
-            context->budget, sizeof(*context->request_scratch));
+        context->request_scratch = budget_calloc_category(
+            context->budget, BUDGET_CATEGORY_RESOURCE,
+            1u, sizeof(*context->request_scratch));
         if (context->request_scratch == NULL) return false;
     }
     char *reference = context->request_scratch->reference;
@@ -4010,6 +4030,12 @@ static bool image_process_node(
         size_t poster_length = 0;
         const char *poster = document_attribute(
             node, "poster", &poster_length);
+        if ((poster == NULL || poster_length == 0u)) {
+            const MediaDeclaredVideo *declared =
+                media_declared_video_cached(context->document);
+            poster = declared == NULL ? NULL : declared->thumbnail_url;
+            poster_length = poster == NULL ? 0u : strlen(poster);
+        }
         if (poster != NULL && poster_length != 0
             && !load_document_image_node(
                 context, node, poster, poster_length,
@@ -4169,6 +4195,13 @@ static bool image_process_priority_node(
     const char *source = image_name_is(node, "video")
         ? document_attribute(node, "poster", &source_length)
         : image_select_source(context->stylesheet, node, &source_length);
+    if (image_name_is(node, "video")
+        && (source == NULL || source_length == 0u)) {
+        const MediaDeclaredVideo *declared =
+            media_declared_video_cached(context->document);
+        source = declared == NULL ? NULL : declared->thumbnail_url;
+        source_length = source == NULL ? 0u : strlen(source);
+    }
     return load_document_image_node(
         context, node, source, source_length, false, false, PSEUDO_NONE);
 }
@@ -4673,6 +4706,47 @@ static void image_refresh_transfer_old_ownership(
         }
         if (!owner->owns_pixels && !owner->owns_encoded) break;
     }
+}
+
+void images_discard_nodes(
+    ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count)
+{
+    if (images == NULL || images->budget == NULL || nodes == NULL
+        || node_count == 0u) return;
+    size_t retired_encoded = image_refresh_owned_encoded_bytes(
+        images, nodes, node_count);
+    size_t retired_decoded = image_refresh_owned_decoded_bytes(
+        images, nodes, node_count);
+    for (size_t i = 0; i < images->count; i++) {
+        if (image_node_in_refresh_set(
+                images->items[i].node, nodes, node_count)) {
+            image_refresh_transfer_old_ownership(
+                images, i, nodes, node_count);
+        }
+    }
+    size_t write = 0u;
+    for (size_t i = 0; i < images->count; i++) {
+        ImageResource item = images->items[i];
+        if (!image_node_in_refresh_set(item.node, nodes, node_count)) {
+            images->items[write++] = item;
+            continue;
+        }
+        image_canvas_native_forget(&item);
+        image_resource_release_owned_pixels(images->budget, &item);
+        if (item.owns_encoded) {
+            if (item.encoded_body != NULL)
+                browser_shared_body_release(item.encoded_body);
+            else
+                budget_free(images->budget, item.encoded);
+        }
+    }
+    images->count = write;
+    images->stats.encoded_bytes = retired_encoded
+            <= images->stats.encoded_bytes
+        ? images->stats.encoded_bytes - retired_encoded : 0u;
+    images->stats.decoded_bytes = retired_decoded
+            <= images->stats.decoded_bytes
+        ? images->stats.decoded_bytes - retired_decoded : 0u;
 }
 
 bool images_refresh_external_nodes(

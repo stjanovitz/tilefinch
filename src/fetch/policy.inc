@@ -692,7 +692,7 @@ static bool fetch_request_validate_with_facts(
         REQUEST_INVALID(FETCH_REQUEST_VALIDATION_METHOD);
     }
     if ((request->body_length != 0 && request->body == NULL)
-        || request->body_length > FETCH_REQUEST_BODY_MAX) {
+        || request->body_length > FETCH_REQUEST_BODY_LIMIT) {
         REQUEST_INVALID(FETCH_REQUEST_VALIDATION_BODY);
     }
     if ((request->body != NULL || request->body_length != 0)

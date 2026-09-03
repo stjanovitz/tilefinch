@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>WebAssembly API probe</title>
+<pre id="result">WASM-PENDING</pre>
+<script>
+  const result = document.querySelector("#result");
+  const bytes = Uint8Array.from([
+    0, 97, 115, 109, 1, 0, 0, 0,
+    1, 6, 1, 96, 1, 127, 1, 127,
+    3, 2, 1, 0,
+    7, 7, 1, 3, 105, 110, 99, 0, 0,
+    10, 9, 1, 7, 0, 32, 0, 65, 1, 106, 11
+  ]);
+  const invalid = Uint8Array.from([0, 97, 115, 109, 0, 0, 0, 0]);
+  const syncModule = new WebAssembly.Module(bytes);
+  Promise.all([
+    WebAssembly.compile(bytes),
+    WebAssembly.instantiate(syncModule),
+    WebAssembly.instantiate(bytes),
+    WebAssembly.compile(invalid).then(
+      () => false,
+      error => error instanceof WebAssembly.CompileError
+    )
+  ]).then(values => {
+    const compiled = values[0], direct = values[1], pair = values[2];
+    const okay =
+      WebAssembly.validate(bytes) &&
+      !WebAssembly.validate(invalid) &&
+      syncModule instanceof WebAssembly.Module &&
+      compiled instanceof WebAssembly.Module &&
+      direct instanceof WebAssembly.Instance &&
+      pair.module instanceof WebAssembly.Module &&
+      pair.instance instanceof WebAssembly.Instance &&
+      direct.exports.inc(41) === 42 &&
+      pair.instance.exports.inc(8) === 9 &&
+      values[3];
+    result.textContent = okay ? "WASM-API-OK" : "WASM-API-BAD";
+  }, error => {
+    result.textContent = "WASM-API-ERROR:" + error;
+  });
+</script>

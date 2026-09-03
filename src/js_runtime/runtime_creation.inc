@@ -235,6 +235,8 @@ typedef enum {
     LAZY_BOOTSTRAP_STREAMS,
     LAZY_BOOTSTRAP_GAME_AUDIO,
     LAZY_BOOTSTRAP_WEBGL,
+    LAZY_BOOTSTRAP_WORKER,
+    LAZY_BOOTSTRAP_WASM,
     LAZY_BOOTSTRAP_COUNT
 } LazyBootstrapFeature;
 
@@ -293,6 +295,9 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
     {"TransformStream", LAZY_BOOTSTRAP_STREAMS, LAZY_BOOTSTRAP_GLOBAL},
     {"TextEncoderStream", LAZY_BOOTSTRAP_STREAMS, LAZY_BOOTSTRAP_GLOBAL},
     {"TextDecoderStream", LAZY_BOOTSTRAP_STREAMS, LAZY_BOOTSTRAP_GLOBAL},
+    {"CompressionStream", LAZY_BOOTSTRAP_STREAMS, LAZY_BOOTSTRAP_GLOBAL},
+    {"DecompressionStream", LAZY_BOOTSTRAP_STREAMS,
+     LAZY_BOOTSTRAP_GLOBAL},
     {"AudioContext", LAZY_BOOTSTRAP_GAME_AUDIO, LAZY_BOOTSTRAP_GLOBAL},
     {"webkitAudioContext", LAZY_BOOTSTRAP_GAME_AUDIO,
      LAZY_BOOTSTRAP_GLOBAL},
@@ -301,7 +306,9 @@ static const LazyBootstrapProperty lazy_bootstrap_properties[] = {
     {"AudioBuffer", LAZY_BOOTSTRAP_GAME_AUDIO, LAZY_BOOTSTRAP_GLOBAL},
     {"AudioBufferSourceNode", LAZY_BOOTSTRAP_GAME_AUDIO,
      LAZY_BOOTSTRAP_GLOBAL},
-    {"GainNode", LAZY_BOOTSTRAP_GAME_AUDIO, LAZY_BOOTSTRAP_GLOBAL}
+    {"GainNode", LAZY_BOOTSTRAP_GAME_AUDIO, LAZY_BOOTSTRAP_GLOBAL},
+    {"Worker", LAZY_BOOTSTRAP_WORKER, LAZY_BOOTSTRAP_GLOBAL},
+    {"WebAssembly", LAZY_BOOTSTRAP_WASM, LAZY_BOOTSTRAP_GLOBAL}
 };
 
 static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
@@ -313,9 +320,56 @@ static const char *runtime_lazy_bootstrap_name(LazyBootstrapFeature feature)
     case LAZY_BOOTSTRAP_STREAMS: return "Streams";
     case LAZY_BOOTSTRAP_GAME_AUDIO: return "Game audio";
     case LAZY_BOOTSTRAP_WEBGL: return "WebGL";
+    case LAZY_BOOTSTRAP_WORKER: return "Worker";
+    case LAZY_BOOTSTRAP_WASM: return "WebAssembly";
     default: return "Platform feature";
     }
 }
+
+static JSValue js_runtime_run_worker(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv);
+static JSValue js_runtime_trace_worker_message(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv);
+
+#ifndef TILEFINCH_NO_TRACE
+static JSValue js_runtime_trace_eval_source(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+    static unsigned sequence;
+    const char *directory = getenv("TILEFINCH_TRACE_EVAL_SOURCE_DIR");
+    if (directory == NULL || directory[0] == '\0' || argc < 1
+        || sequence >= 16u) {
+        return JS_UNDEFINED;
+    }
+    size_t length = 0;
+    const char *source = JS_ToCStringLen(context, &length, argv[0]);
+    if (source == NULL) return JS_EXCEPTION;
+    const size_t limit = 512u * 1024u;
+    size_t written_length = length < limit ? length : limit;
+    char path[512];
+    int path_length = snprintf(
+        path, sizeof(path), "%s/eval-%04u.js", directory, sequence++);
+    FILE *file = path_length > 0 && (size_t) path_length < sizeof(path)
+        ? fopen(path, "wb") : NULL;
+    bool okay = false;
+    if (file != NULL) {
+        okay = fwrite(source, 1u, written_length, file) == written_length;
+        okay = fclose(file) == 0 && okay;
+    }
+    fprintf(stderr,
+            "tilefinch-eval-source: path=\"%s\" bytes=%zu shown=%zu "
+            "written=%s\n",
+            path_length > 0 && (size_t) path_length < sizeof(path)
+                ? path : "<invalid>",
+            length, written_length, okay ? "yes" : "no");
+    JS_FreeCString(context, source);
+    return JS_UNDEFINED;
+}
+#endif
 
 static JSValue runtime_lazy_bootstrap_target(
     JSContext *context, uint8_t target)
@@ -418,6 +472,63 @@ static bool runtime_load_lazy_bootstrap(
                          browser_bootstrap_webgl,
                          browser_bootstrap_webgl_bytecode),
             "<browser-webgl-lazy>", &browser_bootstrap_webgl_bytecode,
+            false, trace, &total_us, &compile_us);
+    } else if (feature == LAZY_BOOTSTRAP_WORKER) {
+        JSValue global = JS_GetGlobalObject(runtime->context);
+        bool slot_ready = !JS_IsException(global)
+            && JS_DefinePropertyValueStr(
+                   runtime->context, global,
+                   "__tilefinchInstallWorker", JS_UNDEFINED,
+                   JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) >= 0;
+        if (slot_ready) {
+            evaluated = runtime_evaluate_bootstrap_profiled(
+                runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                             browser_bootstrap_worker,
+                             browser_bootstrap_worker_bytecode),
+                "<browser-worker-lazy>",
+                &browser_bootstrap_worker_bytecode, false, trace,
+                &total_us, &compile_us);
+        }
+        JSValue installer = evaluated
+            ? JS_GetPropertyStr(
+                  runtime->context, global,
+                  "__tilefinchInstallWorker")
+            : JS_UNDEFINED;
+        bool hidden = false;
+        if (slot_ready) {
+            hidden = JS_SetPropertyStr(
+                runtime->context, global,
+                "__tilefinchInstallWorker", JS_UNDEFINED) >= 0;
+        }
+        JSValue run_worker = JS_NewCFunction(
+            runtime->context, js_runtime_run_worker,
+            "__tilefinchRunWorker", 3);
+        JSValue trace_worker_message = JS_NewCFunction(
+            runtime->context, js_runtime_trace_worker_message,
+            "__tilefinchTraceWorkerMessage", 2);
+        bool installed = hidden
+            && JS_IsFunction(runtime->context, installer)
+            && !JS_IsException(run_worker)
+            && !JS_IsException(trace_worker_message);
+        if (installed) {
+            JSValue arguments[2] = {run_worker, trace_worker_message};
+            JSValue result = JS_Call(
+                runtime->context, installer, JS_UNDEFINED,
+                2, arguments);
+            installed = !JS_IsException(result);
+            JS_FreeValue(runtime->context, result);
+        }
+        JS_FreeValue(runtime->context, trace_worker_message);
+        JS_FreeValue(runtime->context, run_worker);
+        JS_FreeValue(runtime->context, installer);
+        JS_FreeValue(runtime->context, global);
+        evaluated = evaluated && installed;
+    } else if (feature == LAZY_BOOTSTRAP_WASM) {
+        evaluated = runtime_evaluate_bootstrap_profiled(
+            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                         browser_bootstrap_wasm,
+                         browser_bootstrap_wasm_bytecode),
+            "<browser-wasm-lazy>", &browser_bootstrap_wasm_bytecode,
             false, trace, &total_us, &compile_us);
     }
     if (evaluated && feature == LAZY_BOOTSTRAP_GAME_AUDIO) {
@@ -633,8 +744,60 @@ static JSValue js_runtime_run_worker(
             ? JS_ThrowRangeError(context, "worker source quota exceeded")
             : JS_ThrowTypeError(context, "worker blocked by Content Security Policy");
     }
-    static const char prefix[] = "(function(scope){const self=scope;const globalThis=scope;const postMessage=scope.postMessage;const addEventListener=scope.addEventListener;const removeEventListener=scope.removeEventListener;const importScripts=()=>{};const __tilefinchWorkerMeta=scope.__tilefinchWorkerMeta;const __tilefinchWorkerImport=u=>new Promise((resolve,reject)=>{let tries=0;const attempt=()=>{import(String(u)).then(resolve,err=>{if(++tries>=40)reject(err);else setTimeout(attempt,100);});};setTimeout(attempt,400);});\n";
-    static const char suffix[] = "\n})";
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_WORKER_SOURCE") != NULL) {
+        const size_t trace_limit = 16u * 1024u;
+        size_t trace_length = source_length < trace_limit
+            ? source_length : trace_limit;
+        fprintf(stderr, "tilefinch-worker-source: url=%s bytes=%zu shown=%zu\n",
+                url, source_length, trace_length);
+        if (trace_length != 0)
+            (void) fwrite(source, 1u, trace_length, stderr);
+        fprintf(stderr, "\ntilefinch-worker-source-end: truncated=%d\n",
+                source_length > trace_length ? 1 : 0);
+    }
+#endif
+    static const char prefix[] =
+        "(function(scope){"
+        "var self=scope,globalThis=scope,window=undefined,document=undefined,"
+        "parent=undefined,top=undefined,frames=undefined,history=undefined,"
+        "localStorage=undefined,sessionStorage=undefined,"
+        "customElements=undefined,screen=undefined,visualViewport=undefined,"
+        "opener=undefined,frameElement=undefined;"
+        "var navigator=scope.navigator,location=scope.location,"
+        "performance=scope.performance,Performance=scope.Performance,"
+        "WorkerGlobalScope=scope.WorkerGlobalScope,"
+        "DedicatedWorkerGlobalScope=scope.DedicatedWorkerGlobalScope,"
+        "WorkerNavigator=scope.WorkerNavigator,"
+        "WorkerLocation=scope.WorkerLocation;"
+        "var postMessage=scope.postMessage,"
+        "addEventListener=scope.addEventListener,"
+        "removeEventListener=scope.removeEventListener,"
+        "setTimeout=scope.setTimeout,clearTimeout=scope.clearTimeout,"
+        "setInterval=scope.setInterval,clearInterval=scope.clearInterval,"
+        "fetch=scope.fetch,Headers=scope.Headers,Request=scope.Request,"
+        "Response=scope.Response,URL=scope.URL,"
+        "URLSearchParams=scope.URLSearchParams,Blob=scope.Blob,"
+        "TextEncoder=scope.TextEncoder,TextDecoder=scope.TextDecoder,"
+        "atob=scope.atob,btoa=scope.btoa,"
+        "structuredClone=scope.structuredClone,"
+        "queueMicrotask=scope.queueMicrotask,importScripts=scope.importScripts,"
+        "__tilefinchWorkerMeta=scope.__tilefinchWorkerMeta,"
+        "__tilefinchWorkerImport=u=>new Promise((resolve,reject)=>{"
+        "let tries=0;const attempt=()=>{import(String(u)).then(resolve,err=>{"
+        "if(++tries>=40)reject(err);else setTimeout(attempt,100);});};"
+        "setTimeout(attempt,400);});"
+        "var __tilefinchInitialWorkerHandlers=[scope.onmessage,"
+        "scope.onmessageerror,scope.onerror],"
+        "onmessage=scope.onmessage,onmessageerror=scope.onmessageerror,"
+        "onerror=scope.onerror;{\n";
+    static const char suffix[] =
+        "\n}if(onmessage!==__tilefinchInitialWorkerHandlers[0])"
+        "scope.onmessage=typeof onmessage==='function'?onmessage:null;"
+        "if(onmessageerror!==__tilefinchInitialWorkerHandlers[1])"
+        "scope.onmessageerror=typeof onmessageerror==='function'"
+        "?onmessageerror:null;if(onerror!==__tilefinchInitialWorkerHandlers[2])"
+        "scope.onerror=typeof onerror==='function'?onerror:null;\n})";
     if (source_length > SIZE_MAX - sizeof(prefix) - sizeof(suffix)) {
         JS_FreeCString(context, source);
         JS_FreeCString(context, url);
@@ -662,6 +825,94 @@ static JSValue js_runtime_run_worker(
     JSValue result = JS_Call(context, function, JS_UNDEFINED, 1, argv);
     JS_FreeValue(context, function);
     return result;
+}
+
+static JSValue js_runtime_trace_worker_message(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_WORKER_MESSAGES") != NULL && argc >= 2) {
+        const char *direction = JS_ToCString(context, argv[0]);
+        if (direction != NULL) {
+            if (JS_IsString(argv[1])) {
+                size_t length = 0;
+                const char *message = JS_ToCStringLen(
+                    context, &length, argv[1]);
+                if (message != NULL) {
+                    const size_t trace_limit = 16u * 1024u;
+                    size_t shown = length < trace_limit
+                        ? length : trace_limit;
+                    fprintf(stderr,
+                            "tilefinch-worker-message: direction=%s "
+                            "type=string bytes=%zu shown=%zu\n",
+                            direction, length, shown);
+                    if (shown != 0)
+                        (void) fwrite(message, 1u, shown, stderr);
+                    fprintf(stderr,
+                            "\ntilefinch-worker-message-end: truncated=%d\n",
+                            length > shown ? 1 : 0);
+                    JS_FreeCString(context, message);
+                } else {
+                    JSValue exception = JS_GetException(context);
+                    JS_FreeValue(context, exception);
+                }
+            } else {
+                /* Validation-only tracing must expose the structured-clone
+                   payload, not merely its type: challenge workers commonly
+                   return small records whose field values identify the first
+                   standards mismatch.  Keep this bounded and fail-soft; a
+                   hostile toJSON/getter must never perturb ordinary builds. */
+                JSValue json = JS_JSONStringify(
+                    context, argv[1], JS_UNDEFINED, JS_UNDEFINED);
+                if (!JS_IsException(json) && JS_IsString(json)) {
+                    size_t length = 0;
+                    const char *message = JS_ToCStringLen(
+                        context, &length, json);
+                    if (message != NULL) {
+                        const size_t trace_limit = 16u * 1024u;
+                        size_t shown = length < trace_limit
+                            ? length : trace_limit;
+                        fprintf(stderr,
+                                "tilefinch-worker-message: direction=%s "
+                                "type=json bytes=%zu shown=%zu\n",
+                                direction, length, shown);
+                        if (shown != 0)
+                            (void) fwrite(message, 1u, shown, stderr);
+                        fprintf(stderr,
+                                "\ntilefinch-worker-message-end: "
+                                "truncated=%d\n",
+                                length > shown ? 1 : 0);
+                        JS_FreeCString(context, message);
+                    } else {
+                        JSValue exception = JS_GetException(context);
+                        JS_FreeValue(context, exception);
+                    }
+                } else {
+                    if (JS_IsException(json)) {
+                        JSValue exception = JS_GetException(context);
+                        JS_FreeValue(context, exception);
+                    }
+                    fprintf(stderr,
+                            "tilefinch-worker-message: direction=%s "
+                            "type=non-string\n",
+                            direction);
+                }
+                JS_FreeValue(context, json);
+            }
+            JS_FreeCString(context, direction);
+        } else {
+            JSValue exception = JS_GetException(context);
+            JS_FreeValue(context, exception);
+        }
+    }
+#else
+    (void) context;
+    (void) argc;
+    (void) argv;
+#endif
+    return JS_UNDEFINED;
 }
 
 static ScriptRuntime *script_runtime_create_internal(
@@ -930,6 +1181,15 @@ static ScriptRuntime *script_runtime_create_internal(
         budget_free(budget, host);
         return NULL;
     }
+    if (!js_wasm_runtime_init(host->runtime)) {
+        snprintf(result->error, sizeof(result->error),
+                 "could not initialize WebAssembly bindings");
+        JS_FreeContext(host->context);
+        JS_FreeRuntime(host->runtime);
+        (void) budget_quickjs_pool_destroy(host->quickjs_pool);
+        budget_free(budget, host);
+        return NULL;
+    }
     context_ready_ns = js_rt_monotonic_time_ns();
 
     host->bridge.document = document;
@@ -1060,19 +1320,6 @@ static ScriptRuntime *script_runtime_create_internal(
         }
     }
     if (setup_ok) {
-        JSValue run_worker = JS_NewCFunction(
-            host->context, js_runtime_run_worker,
-            "__tilefinchRunWorker", 3);
-        if (JS_IsException(run_worker)
-            || JS_DefinePropertyValueStr(
-                   host->context, global, "__tilefinchRunWorker",
-                   run_worker, JS_PROP_CONFIGURABLE) < 0) {
-            if (JS_IsException(run_worker))
-                JS_FreeValue(host->context, run_worker);
-            setup_ok = false;
-        }
-    }
-    if (setup_ok) {
         setup_ok = JS_DefinePropertyValueStr(
             host->context, global,
             "__tilefinchCspAllowsInlineEventHandlers",
@@ -1107,6 +1354,19 @@ static ScriptRuntime *script_runtime_create_internal(
         setup_ok = JS_SetPropertyStr(
             host->context, global, "__tilefinchBrowserUserAgent",
             JS_NewString(host->context, TILEFINCH_BROWSER_USER_AGENT)) >= 0;
+    }
+    if (setup_ok) {
+        setup_ok = JS_SetPropertyStr(
+            host->context, global, "__tilefinchBrowserBrand",
+            JS_NewString(host->context, TILEFINCH_BROWSER_BRAND)) >= 0
+            && JS_SetPropertyStr(
+                host->context, global, "__tilefinchBrowserBrandVersion",
+                JS_NewString(host->context,
+                             TILEFINCH_BROWSER_BRAND_VERSION)) >= 0
+            && JS_SetPropertyStr(
+                host->context, global, "__tilefinchBrowserFullVersion",
+                JS_NewString(host->context,
+                             TILEFINCH_BROWSER_FULL_VERSION)) >= 0;
     }
     if (setup_ok) {
         setup_ok = JS_SetPropertyStr(
@@ -1190,6 +1450,41 @@ static ScriptRuntime *script_runtime_create_internal(
                        host->context, global,
                        "__tilefinchStylesheetHasMotionKeyframes",
                        js_stylesheet_has_motion_keyframes, 0)
+                   && js_rt_install_function(
+                       host->context, global,
+                       "__tilefinchWasmAvailable", js_wasm_available, 0)
+                   && js_rt_install_function(
+                       host->context, global,
+                       "__tilefinchWasmInstantiate", js_wasm_instantiate, 2)
+                   && js_rt_install_function(
+                       host->context, global,
+                       "__tilefinchWasmCompile", js_wasm_compile, 1)
+                   && js_rt_install_function(
+                       host->context, global,
+                       "__tilefinchWasmValidate", js_wasm_validate, 1)
+                   && js_rt_install_function(
+                       host->context, global,
+                       "__tilefinchWasmModuleInfo", js_wasm_module_info, 3)
+                   && js_rt_install_function(
+                       host->context, global,
+                       "__tilefinchWasmMemoryGrow", js_wasm_memory_grow, 2)
+                   && js_rt_install_function(
+                       host->context, global,
+                       "__tilefinchWasmGlobalGet", js_wasm_global_get, 2)
+                   && js_rt_install_function(
+                       host->context, global,
+                       "__tilefinchWasmGlobalSet", js_wasm_global_set, 3)
+                   && js_rt_install_function(
+                       host->context, global,
+                       "__tilefinchWasmDetachBuffer", js_wasm_detach_buffer, 1)
+                   && js_rt_install_function(
+                       host->context, global,
+                       "__tilefinchWasmSnapshotSource",
+                       js_wasm_snapshot_source, 1)
+                   && (getenv("TILEFINCH_DISABLE_COMPRESSION_STREAMS") != NULL
+                       || js_rt_install_function(
+                           host->context, global,
+                           "__tilefinchCompressionRun", js_compression_run, 3))
                    && js_rt_install_function(host->context, global, "__tilefinchBody",
                                     js_dom_body, 0)
                    && js_rt_install_function(host->context, global,
@@ -1405,6 +1700,12 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchStorageAvailable",
                                        js_storage_available, 0)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchStorageEstimate",
+                                       js_storage_estimate, 0)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchHeapMemorySnapshot",
+                                       js_heap_memory_snapshot, 0)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchStorageSet",
                                        js_storage_set, 3)
                    && js_rt_install_function(host->context, global,
@@ -1437,6 +1738,9 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchCurrentDocumentURL",
                                        js_current_document_url, 0)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchSecureContext",
+                                       js_secure_context, 0)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchDocumentURLRevision",
                                        js_document_url_revision, 0)
@@ -1652,6 +1956,14 @@ static ScriptRuntime *script_runtime_create_internal(
                 host, LAZY_BOOTSTRAP_GAME_AUDIO);
         }
         if (evaluated) {
+            evaluated = runtime_install_lazy_bootstrap_feature(
+                host, LAZY_BOOTSTRAP_WORKER);
+        }
+        if (evaluated) {
+            evaluated = runtime_install_lazy_bootstrap_feature(
+                host, LAZY_BOOTSTRAP_WASM);
+        }
+        if (evaluated) {
             evaluated = runtime_evaluate_bootstrap_profiled(
                 host, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
                           browser_bootstrap_compat,
@@ -1787,18 +2099,34 @@ static ScriptRuntime *script_runtime_create_internal(
         }
 #if !defined(TILEFINCH_BOOTSTRAP_BYTECODE_ONLY)
         if (evaluated && getenv("TILEFINCH_TRACE_EVAL_SOURCE") != NULL) {
+#ifndef TILEFINCH_NO_TRACE
+            JSValue trace_eval_source = JS_NewCFunction(
+                host->context, js_runtime_trace_eval_source,
+                "__tilefinchTraceEvalSource", 1);
+            if (JS_IsException(trace_eval_source)
+                || JS_DefinePropertyValueStr(
+                       host->context, global,
+                       "__tilefinchTraceEvalSource", trace_eval_source,
+                       JS_PROP_CONFIGURABLE) < 0) {
+                if (JS_IsException(trace_eval_source)) {
+                    JS_FreeValue(host->context, trace_eval_source);
+                }
+                evaluated = false;
+            }
+#endif
+        }
+        if (evaluated && getenv("TILEFINCH_TRACE_EVAL_SOURCE") != NULL) {
             evaluated = runtime_evaluate_checkpointed(host,
                 browser_eval_source_diagnostic,
                 browser_eval_source_diagnostic_length,
                 "<eval-source-diagnostic>");
         }
 #endif
-        /* platform.js retained private worker and media-state helpers in
-           bootstrap closures. Remove the temporary bridges before author
-           code; native code has already captured their callable values. */
+        /* platform.js retained private media-state helpers in bootstrap
+           closures. Remove the temporary bridges before author code; native
+           code has already captured their callable values. Worker installs
+           and removes its compiler bridge inside the first-use loader. */
         if (evaluated) {
-            JSAtom run_worker_atom = JS_NewAtom(
-                host->context, "__tilefinchRunWorker");
             JSAtom media_state_atom = JS_NewAtom(
                 host->context, "__tilefinchMediaStateFor");
             JSAtom fullscreen_exit_atom = JS_NewAtom(
@@ -1807,13 +2135,10 @@ static ScriptRuntime *script_runtime_create_internal(
                 host->context, "__tilefinchApplyPageVisibility");
             JSAtom visibility_query_atom = JS_NewAtom(
                 host->context, "__tilefinchPageVisible");
-            if (run_worker_atom == JS_ATOM_NULL
-                || media_state_atom == JS_ATOM_NULL
+            if (media_state_atom == JS_ATOM_NULL
                 || fullscreen_exit_atom == JS_ATOM_NULL
                 || visibility_apply_atom == JS_ATOM_NULL
                 || visibility_query_atom == JS_ATOM_NULL
-                || JS_DeleteProperty(
-                       host->context, global, run_worker_atom, 0) < 0
                 || JS_DeleteProperty(
                        host->context, global, media_state_atom, 0) < 0
                 || JS_DeleteProperty(
@@ -1824,7 +2149,6 @@ static ScriptRuntime *script_runtime_create_internal(
                        host->context, global, visibility_query_atom, 0) <= 0) {
                 evaluated = false;
             }
-            JS_FreeAtom(host->context, run_worker_atom);
             JS_FreeAtom(host->context, media_state_atom);
             JS_FreeAtom(host->context, fullscreen_exit_atom);
             JS_FreeAtom(host->context, visibility_apply_atom);

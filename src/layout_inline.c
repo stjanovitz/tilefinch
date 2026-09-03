@@ -3495,6 +3495,8 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             && lxb_dom_element_has_attribute(
                 lxb_dom_interface_element(node),
                 (const lxb_char_t *) "controls", 8);
+        bool declared_media_card = document_is_declared_video_card(
+            context->document, node);
         size_t replaced_link_start = context->layout->link_count;
         size_t replaced_control_start = context->layout->control_count;
         const ImageResource *image = images_find_node(context->images, node);
@@ -3697,13 +3699,23 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
             && !layout_paint_audio_control(
                 context, &style, outer_x, outer_y,
                 outer_width, outer_height)) return false;
+        if ((layout_node_name_is(node, "video") || declared_media_card)
+            && !layout_paint_video_control(
+                context, node, outer_x, outer_y,
+                outer_width, outer_height)) {
+            return false;
+        }
         /* Page media is a single native-player activation target. It uses
            the existing retained control map so d-pad focus and pointer taps
            share the same DOM activation/cancellation path as buttons. */
-        if ((layout_node_name_is(node, "video") || audio_controls)
+        if ((layout_node_name_is(node, "video") || audio_controls
+             || declared_media_card || layout_node_name_is(node, "iframe"))
             && !layout_add_control(
                    context->layout, outer_x, outer_y,
-                   outer_width, outer_height, CONTROL_BUTTON, node)) {
+                   outer_width, outer_height,
+                   layout_node_name_is(node, "iframe")
+                       ? CONTROL_FRAME : CONTROL_BUTTON,
+                   node)) {
             return false;
         }
         /* Inline replaced elements need a queryable box: page scripts

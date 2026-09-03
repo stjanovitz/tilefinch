@@ -65,7 +65,7 @@ int main(void)
         "https://www.bing.com/search?q=portable%20%26%20fast"));
     CHECK(resolves(
         "PSP homebrew", BROWSER_SEARCH_DUCKDUCKGO,
-        "https://duckduckgo.com/?q=PSP%20homebrew"));
+        "https://lite.duckduckgo.com/lite/?q=PSP%20homebrew"));
     CHECK(resolves_kind(
         "http://bad host/path", BROWSER_SEARCH_GOOGLE,
         "https://www.google.com/search?q=http%3A%2F%2Fbad%20host%2Fpath",
@@ -88,7 +88,7 @@ int main(void)
         BROWSER_OMNIBOX_SEARCH));
     CHECK(strcmp(
         browser_search_engine_name(BROWSER_SEARCH_DUCKDUCKGO),
-        "DUCKDUCKGO") == 0);
+        "DUCKDUCKGO LITE") == 0);
 
     char tiny[8] = "dirty";
     CHECK(!browser_omnibox_resolve(

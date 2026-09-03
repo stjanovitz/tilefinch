@@ -47,6 +47,16 @@ bool reader_document_prepare(PocDocument *document,
 bool reader_document_prepare_with_stylesheet(
     PocDocument *document, const Stylesheet *stylesheet,
     ReaderDocumentAnalysis *analysis);
+/* Commit-time recovery keeps the native extracted tree private until author
+   work has settled. The returned root is detached, document-owned, and must
+   be connected or discarded through the exact-root helpers below. */
+bool reader_document_prepare_detached_with_stylesheet(
+    PocDocument *document, const Stylesheet *stylesheet,
+    ReaderDocumentAnalysis *analysis, lxb_dom_node_t **prepared_root);
+bool reader_document_connect_prepared_view(
+    PocDocument *document, lxb_dom_node_t *root, ReaderPageKind kind);
+void reader_document_discard_exact_prepared_view(
+    PocDocument *document, lxb_dom_node_t *root, ReaderPageKind kind);
 /* Analyze and extract into temporary bounded storage without mutating the
    document. Frontends use this to decide whether automatic Reader admission
    is warranted before consuming the document's one extracted-view slot. */

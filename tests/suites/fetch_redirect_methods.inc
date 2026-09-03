@@ -282,7 +282,8 @@ static bool test_client_hint_redirect_scope(Budget *budget,
               && result.status_code == 200
               && strstr(result.data, "subset=1") != NULL
               && strstr(result.data, "terminal-high=0") != NULL
-              && strstr(result.data, "terminal-low=1") != NULL);
+              && strstr(result.data, "terminal-low=1") != NULL
+              && strstr(result.data, "terminal-identity=1") != NULL);
         fetch_result_destroy(&result);
     }
 
@@ -300,7 +301,8 @@ static bool test_client_hint_redirect_scope(Budget *budget,
     CHECK(fetch_redirect(budget, url, &request, &result)
           && strstr(result.data, "subset=1") != NULL
           && strstr(result.data, "terminal-high=0") != NULL
-          && strstr(result.data, "terminal-low=1") != NULL);
+          && strstr(result.data, "terminal-low=1") != NULL
+          && strstr(result.data, "terminal-identity=1") != NULL);
     fetch_result_destroy(&result);
 
     snprintf(url, sizeof(url),
@@ -314,9 +316,42 @@ static bool test_client_hint_redirect_scope(Budget *budget,
               scheduler, url, &request, 64 * 1024, 5000, &result)
           && strstr(result.data, "subset=1") != NULL
           && strstr(result.data, "terminal-high=0") != NULL
-          && strstr(result.data, "terminal-low=1") != NULL);
+          && strstr(result.data, "terminal-low=1") != NULL
+          && strstr(result.data, "terminal-identity=1") != NULL);
     fetch_result_destroy(&result);
     fetch_scheduler_destroy(scheduler);
+
+    snprintf(url, sizeof(url),
+             "http://127.0.0.1:%u/hint-identity", source_port);
+    request = (FetchRequest) {
+        .method = "GET", .allow_http_errors = true,
+        .send_client_hints = true,
+        .client_hint_tokens =
+            "Sec-CH-UA-Full-Version, Sec-CH-UA-Full-Version-List, "
+            "UA, UA-Full-Version, UA-Full-Version-List",
+        .client_hint_origin = hint_origin,
+        .send_low_client_hints = true
+    };
+    result = (FetchResult) {.budget = budget};
+    char expected_identity[1024];
+    int expected_identity_length = snprintf(
+        expected_identity, sizeof(expected_identity),
+        "Sec-CH-UA=\"%s\";v=\"%s\", \"Not.A/Brand\";v=\"99\"\n"
+        "Sec-CH-UA-Full-Version=\"%s\"\n"
+        "Sec-CH-UA-Full-Version-List=\"%s\";v=\"%s\", "
+            "\"Not.A/Brand\";v=\"99.0.0.0\"\n"
+        "UA=<none>\n"
+        "UA-Full-Version=<none>\n"
+        "UA-Full-Version-List=<none>",
+        TILEFINCH_BROWSER_BRAND, TILEFINCH_BROWSER_BRAND_VERSION,
+        TILEFINCH_BROWSER_FULL_VERSION, TILEFINCH_BROWSER_BRAND,
+        TILEFINCH_BROWSER_FULL_VERSION);
+    CHECK(expected_identity_length > 0
+          && (size_t) expected_identity_length < sizeof(expected_identity));
+    CHECK(fetch_redirect(budget, url, &request, &result)
+          && result.status_code == 200
+          && strcmp(result.data, expected_identity) == 0);
+    fetch_result_destroy(&result);
     return true;
 }
 

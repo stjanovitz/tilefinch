@@ -11,6 +11,7 @@
 #include "tilefinch/update.h"
 
 #define PSP_DEFAULT_SCRIPT_HEAP_MB 5L
+#define PSP_DEFAULT_SCRIPT_BOOT_WINDOW_KB 4096L
 #define PSP_DEFAULT_SCRIPT_TOTAL_MB 2L
 #define PSP_DEFAULT_SCRIPT_FILE_KB 384L
 #define PSP_DEFAULT_CSS_WIDTH 480L
@@ -42,6 +43,14 @@ void psp_boot_config_defaults(PspBootConfig *config)
     config->validation_media_stability_seconds = 120;
     config->limit_mb = 32;
     config->heap_mb = PSP_DEFAULT_SCRIPT_HEAP_MB;
+    /* Modern bootstraps and managed challenges can require one large,
+       short-lived VM allocation even when their settled graph is much
+       smaller.  This window is an allocator ceiling, not a reservation: all
+       bytes remain charged to the 32 MiB page Budget, and the runtime returns
+       the allowance after its bounded post-boot collection or at teardown.
+       A live ChatGPT challenge qualified at a roughly 9.0 MiB QuickJS peak
+       and 24.9 MiB total page peak with this 5 MiB + 4 MiB shape. */
+    config->window_kb = PSP_DEFAULT_SCRIPT_BOOT_WINDOW_KB;
     config->total_mb = PSP_DEFAULT_SCRIPT_TOTAL_MB;
     config->file_kb = PSP_DEFAULT_SCRIPT_FILE_KB;
     config->count = 256;

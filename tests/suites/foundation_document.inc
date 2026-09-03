@@ -638,6 +638,662 @@
     document_destroy(&deterministic_clock_document);
     CHECK(budget.current == deterministic_clock_baseline);
 
+    puts("test: ordinary high-resolution time is reduced for non-isolated pages");
+    size_t reduced_clock_baseline = budget.current;
+    static const char reduced_clock_page[] =
+        "<!doctype html><html><body><script>"
+        "let aligned=true,monotonic=true,last=performance.now();"
+        "for(let i=0;i<512;i++){const value=performance.now(),units=value*10;"
+        "if(Math.abs(units-Math.round(units))>1e-7)aligned=false;"
+        "if(value<last)monotonic=false;last=value;}"
+        "globalThis.pocSummary=aligned&&monotonic"
+        "&&globalThis.crossOriginIsolated===false"
+        "?'REDUCED-CLOCK-OK':'REDUCED-CLOCK-FAILED';"
+        "</script></body></html>";
+    PocDocument reduced_clock_document;
+    CHECK(document_parse(&reduced_clock_document, &budget,
+                         reduced_clock_page,
+                         strlen(reduced_clock_page), 17));
+    ScriptResult reduced_clock_result;
+    CHECK(scripts_run_document_at(
+              &reduced_clock_document, &budget, 4 * MIB, 1000,
+              "https://clock-precision.test/", &reduced_clock_result)
+          && reduced_clock_result.success
+          && strcmp(reduced_clock_result.summary,
+                    "REDUCED-CLOCK-OK") == 0);
+    document_destroy(&reduced_clock_document);
+    CHECK(budget.current == reduced_clock_baseline);
+
+    puts("test: WebAssembly exported memory stays coherent across calls");
+    size_t wasm_memory_baseline = budget.current;
+    static const char wasm_memory_page[] =
+        "<!doctype html><html><body><script>"
+        "const bytes=Uint8Array.from(["
+        "0,97,115,109,1,0,0,0,1,11,2,96,1,127,1,127,96,2,127,127,0,"
+        "3,3,2,0,1,5,4,1,1,1,2,7,25,3,6,109,101,109,111,114,121,2,0,"
+        "4,108,111,97,100,0,0,5,115,116,111,114,101,0,1,10,19,2,7,0,"
+        "32,0,45,0,0,11,9,0,32,0,32,1,58,0,0,11]);"
+        "const invalid=Uint8Array.from([0,97,115,109,0,0,0,0]),"
+        "syncModule=new WebAssembly.Module(bytes),"
+        "shape=WebAssembly.validate(bytes)&&!WebAssembly.validate(invalid)"
+        "&&syncModule instanceof WebAssembly.Module"
+        "&&Object.prototype.toString.call(syncModule)==='[object WebAssembly.Module]'"
+        "&&Object.prototype.toString.call(WebAssembly)==='[object WebAssembly]';"
+        "Promise.all([WebAssembly.compile(bytes),"
+        "WebAssembly.instantiate(syncModule),WebAssembly.instantiate(bytes),"
+        "WebAssembly.compile(invalid).then(()=>false,"
+        "error=>error instanceof WebAssembly.CompileError)]).then(values=>{"
+        "const compiled=values[0],instance=values[1],pair=values[2],"
+        "memory=new Uint8Array(instance.exports.memory.buffer);"
+        "memory[9]=42;const fromScript=instance.exports.load(9);"
+        "instance.exports.store(10,77);"
+        "const storedBeforeGrow=memory[10];"
+        "const oldBuffer=instance.exports.memory.buffer,oldPages=instance.exports.memory.grow(1),"
+        "grown=instance.exports.memory.buffer;"
+        "const api=shape&&compiled instanceof WebAssembly.Module"
+        "&&instance instanceof WebAssembly.Instance"
+        "&&instance.exports.memory instanceof WebAssembly.Memory"
+        "&&oldPages===1&&oldBuffer.byteLength===0&&grown.byteLength===131072"
+        "&&pair.module instanceof WebAssembly.Module"
+        "&&pair.instance instanceof WebAssembly.Instance&&values[3];"
+        "globalThis.pocSummary=api&&fromScript===42&&storedBeforeGrow===77"
+        "?'WASM-MEMORY-COHERENT':'WASM-MEMORY-STALE';"
+        "},error=>{globalThis.pocSummary='WASM-MEMORY-ERROR:'+error;});"
+        "</script></body></html>";
+    PocDocument wasm_memory_document;
+    CHECK(document_parse(&wasm_memory_document, &budget,
+                         wasm_memory_page, strlen(wasm_memory_page), 17));
+    ScriptResult wasm_memory_result;
+    CHECK(scripts_run_document_at(
+              &wasm_memory_document, &budget, 8 * MIB, 2000,
+              "https://wasm-memory.test/", &wasm_memory_result)
+          && wasm_memory_result.success
+          && strcmp(wasm_memory_result.summary,
+                    "WASM-MEMORY-COHERENT") == 0);
+    document_destroy(&wasm_memory_document);
+    CHECK(budget.current == wasm_memory_baseline);
+
+    puts("test: exported WebAssembly memory is not charged to the realm heap");
+    size_t wasm_large_memory_baseline = budget.current;
+    static const char wasm_large_memory_page[] =
+        "<!doctype html><html><body><script>"
+        "const bytes=Uint8Array.from([0,97,115,109,1,0,0,0,"
+        "5,3,1,0,16,7,5,1,1,109,2,0]);"
+        "WebAssembly.instantiate(bytes).then(value=>{"
+        "const memory=value.instance.exports.m,view=new Uint8Array(memory.buffer);"
+        "view[0]=37;view[view.length-1]=91;"
+        "globalThis.pocSummary=memory instanceof WebAssembly.Memory"
+        "&&view.length===1048576&&view[0]===37&&view[view.length-1]===91"
+        "?'WASM-LARGE-MEMORY-OK':'WASM-LARGE-MEMORY-FAILED';"
+        "},error=>{globalThis.pocSummary='WASM-LARGE-MEMORY-ERROR:'+error;});"
+        "</script></body></html>";
+    PocDocument wasm_large_memory_document;
+    CHECK(document_parse(&wasm_large_memory_document, &budget,
+                         wasm_large_memory_page,
+                         strlen(wasm_large_memory_page), 17));
+    ScriptResult wasm_large_memory_result;
+    CHECK(scripts_run_document_at(
+              &wasm_large_memory_document, &budget, 2 * MIB, 2000,
+              "https://wasm-large-memory.test/", &wasm_large_memory_result)
+          && wasm_large_memory_result.success
+          && strcmp(wasm_large_memory_result.summary,
+                    "WASM-LARGE-MEMORY-OK") == 0);
+    document_destroy(&wasm_large_memory_document);
+    CHECK(budget.current == wasm_large_memory_baseline);
+
+    puts("test: fixed-width WebAssembly SIMD follows the standard binary format");
+    size_t wasm_simd_baseline = budget.current;
+    static const char wasm_simd_page[] =
+        "<!doctype html><html><body><script>"
+        "const bytes=Uint8Array.from(["
+        "0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,2,1,0,"
+        "7,8,1,4,115,105,109,100,0,0,10,25,1,23,0,253,12,"
+        "1,0,0,0,2,0,0,0,3,0,0,0,4,0,0,0,253,27,2,11]);"
+        "WebAssembly.instantiate(bytes).then(value=>{"
+        "globalThis.pocSummary=WebAssembly.validate(bytes)"
+        "&&value.instance.exports.simd()===3"
+        "?'WASM-SIMD-OK':'WASM-SIMD-FAILED';"
+        "},error=>{globalThis.pocSummary='WASM-SIMD-ERROR:'+error;});"
+        "</script></body></html>";
+    PocDocument wasm_simd_document;
+    CHECK(document_parse(&wasm_simd_document, &budget,
+                         wasm_simd_page, strlen(wasm_simd_page), 17));
+    ScriptResult wasm_simd_result;
+    CHECK(scripts_run_document_at(
+              &wasm_simd_document, &budget, 6 * MIB, 2000,
+              "https://wasm-simd.test/", &wasm_simd_result)
+          && wasm_simd_result.success
+          && strcmp(wasm_simd_result.summary, "WASM-SIMD-OK") == 0);
+    document_destroy(&wasm_simd_document);
+    CHECK(budget.current == wasm_simd_baseline);
+
+    puts("test: bounded WebAssembly surface follows standard module APIs");
+    size_t wasm_surface_baseline = budget.current;
+    static const char wasm_surface_page[] =
+        "<!doctype html><html><body><script>"
+        "const base=Uint8Array.from(["
+        "0,97,115,109,1,0,0,0,1,11,2,96,1,127,1,127,96,2,127,127,0,"
+        "3,3,2,0,1,5,4,1,1,1,2,7,25,3,6,109,101,109,111,114,121,2,0,"
+        "4,108,111,97,100,0,0,5,115,116,111,114,101,0,1,10,19,2,7,0,"
+        "32,0,45,0,0,11,9,0,32,0,32,1,58,0,0,11]),"
+        "custom=new Uint8Array(base.length+7);custom.set(base);"
+        "custom.set([0,5,1,120,1,2,3],base.length);"
+        "const module=new WebAssembly.Module(custom),"
+        "imports=WebAssembly.Module.imports(module),"
+        "exports=WebAssembly.Module.exports(module),"
+        "sections=WebAssembly.Module.customSections(module,'x'),"
+        "memory=new WebAssembly.Memory({initial:1,maximum:2}),"
+        "emptyMemory=new WebAssembly.Memory({initial:0,maximum:1}),"
+        "emptyOld=emptyMemory.buffer,emptyPages=emptyMemory.grow(1),"
+        "zeroOld=memory.buffer,zeroPages=memory.grow(0),zeroNew=memory.buffer,"
+        "old=zeroNew,oldPages=memory.grow(1),"
+        "table=new WebAssembly.Table({element:'externref',initial:1,maximum:2}),"
+        "global=new WebAssembly.Global({value:'i64',mutable:true},7n);"
+        "table.set(0,global);table.grow(1,null);global.value=9n;"
+        "const response=new Response(base,{headers:{'Content-Type':'application/wasm'}});"
+        "Promise.all([WebAssembly.compileStreaming(response),"
+        "WebAssembly.instantiateStreaming(new Response(base,{headers:{'Content-Type':'application/wasm; charset=binary'}})),"
+        "WebAssembly.compileStreaming(new Response(base,{headers:{'Content-Type':'text/plain'}})).then(()=>false,e=>e instanceof TypeError),"
+        "WebAssembly.compile(new Uint8Array()).then(()=>false,e=>e instanceof WebAssembly.CompileError),"
+        "WebAssembly.compileStreaming({ok:true,headers:{get(){return 'application/wasm';}},arrayBuffer(){return Promise.resolve(base);}}).then(()=>false,e=>e instanceof TypeError)]).then(values=>{"
+        "const section=new Uint8Array(sections[0]),"
+        "okay=imports.length===0&&exports.length===3"
+        "&&exports[0].name==='memory'&&exports[0].kind==='memory'"
+        "&&sections.length===1&&section.join(',')==='1,2,3'"
+        "&&emptyPages===0&&emptyOld.byteLength===0"
+        "&&emptyMemory.buffer.byteLength===65536"
+        "&&zeroPages===1&&zeroOld.byteLength===0&&zeroNew!==zeroOld"
+        "&&memory.buffer.byteLength===131072&&old.byteLength===0&&oldPages===1"
+        "&&table.length===2&&table.get(0)===global&&global.value===9n"
+        "&&values[0] instanceof WebAssembly.Module"
+        "&&values[1].instance instanceof WebAssembly.Instance"
+        "&&values[2]&&values[3]&&values[4];"
+        "globalThis.pocSummary=okay?'WASM-STANDARD-SURFACE-OK':'WASM-STANDARD-SURFACE-FAILED';"
+        "},e=>{globalThis.pocSummary='WASM-STANDARD-SURFACE-ERROR:'+e;});"
+        "</script></body></html>";
+    PocDocument wasm_surface_document;
+    CHECK(document_parse(&wasm_surface_document, &budget,
+                         wasm_surface_page, strlen(wasm_surface_page), 17));
+    ScriptResult wasm_surface_result;
+    CHECK(scripts_run_document_at(
+              &wasm_surface_document, &budget, 10 * MIB, 3000,
+              "https://wasm-surface.test/", &wasm_surface_result)
+          && wasm_surface_result.success
+          && strcmp(wasm_surface_result.summary,
+                    "WASM-STANDARD-SURFACE-OK") == 0);
+    document_destroy(&wasm_surface_document);
+    CHECK(budget.current == wasm_surface_baseline);
+
+    puts("test: exported WebAssembly globals preserve type and mutability");
+    size_t wasm_global_baseline = budget.current;
+    static const char wasm_global_page[] =
+        "<!doctype html><html><body><script>"
+        "const bytes=Uint8Array.from(["
+        "0,97,115,109,1,0,0,0,1,5,1,96,0,1,126,3,2,1,0,"
+        "6,11,2,127,0,65,7,11,126,1,66,9,11,"
+        "7,15,3,1,103,3,0,1,109,3,1,3,103,101,116,0,0,"
+        "10,6,1,4,0,35,1,11]);"
+        "WebAssembly.instantiate(bytes).then(value=>{"
+        "const g=value.instance.exports.g,m=value.instance.exports.m;"
+        "let immutable=false;try{g.value=8;}catch(error){immutable=error instanceof TypeError;}"
+        "m.value=11n;"
+        "globalThis.pocSummary=g instanceof WebAssembly.Global"
+        "&&m instanceof WebAssembly.Global&&g.value===7&&immutable"
+        "&&m.value===11n&&value.instance.exports.get()===11n"
+        "&&!Object.hasOwn(value.instance,'exports')"
+        "&&Object.getOwnPropertyDescriptor(WebAssembly.Instance.prototype,'exports').enumerable"
+        "&&Object.keys(WebAssembly).sort().join(',')==='compile,compileStreaming,instantiate,instantiateStreaming,validate'"
+        "?'WASM-GLOBAL-OK':'WASM-GLOBAL-FAILED';"
+        "},error=>{globalThis.pocSummary='WASM-GLOBAL-ERROR:'+error;});"
+        "</script></body></html>";
+    PocDocument wasm_global_document;
+    CHECK(document_parse(&wasm_global_document, &budget,
+                         wasm_global_page, strlen(wasm_global_page), 17));
+    ScriptResult wasm_global_result;
+    CHECK(scripts_run_document_at(
+              &wasm_global_document, &budget, 8 * MIB, 2000,
+              "https://wasm-global.test/", &wasm_global_result)
+          && wasm_global_result.success
+          && strcmp(wasm_global_result.summary, "WASM-GLOBAL-OK") == 0);
+    document_destroy(&wasm_global_document);
+    CHECK(budget.current == wasm_global_baseline);
+
+    puts("test: reentrant WebAssembly import getters retain the native runtime");
+    size_t wasm_reentrant_baseline = budget.current;
+    static const char wasm_reentrant_page[] =
+        "<!doctype html><html><body><script>"
+        "const empty=Uint8Array.from([0,97,115,109,1,0,0,0]),"
+        "imported=Uint8Array.from([0,97,115,109,1,0,0,0,"
+        "1,4,1,96,0,0,2,13,2,1,109,1,97,0,0,1,109,1,98,0,0]),"
+        "emptyModule=new WebAssembly.Module(empty);let reads=0;"
+        "function reenter(){reads++;WebAssembly.validate(empty);"
+        "new WebAssembly.Module(empty);new WebAssembly.Instance(emptyModule);}"
+        "const namespace={};for(const name of ['a','b'])"
+        "Object.defineProperty(namespace,name,{get(){reenter();return function(){};}});"
+        "const imports={get m(){reenter();return namespace;}};"
+        "const outer=new WebAssembly.Instance(new WebAssembly.Module(imported),imports);"
+        "globalThis.pocSummary=outer instanceof WebAssembly.Instance&&reads===4"
+        "?'WASM-REENTRANT-IMPORTS-OK':'WASM-REENTRANT-IMPORTS-FAILED:'+reads;"
+        "</script></body></html>";
+    PocDocument wasm_reentrant_document;
+    CHECK(document_parse(&wasm_reentrant_document, &budget,
+                         wasm_reentrant_page,
+                         strlen(wasm_reentrant_page), 17));
+    ScriptResult wasm_reentrant_result;
+    CHECK(scripts_run_document_at(
+              &wasm_reentrant_document, &budget, 8 * MIB, 2000,
+              "https://wasm-reentrant.test/", &wasm_reentrant_result)
+          && wasm_reentrant_result.success
+          && strcmp(wasm_reentrant_result.summary,
+                    "WASM-REENTRANT-IMPORTS-OK") == 0);
+    document_destroy(&wasm_reentrant_document);
+    CHECK(budget.current == wasm_reentrant_baseline);
+
+    puts("test: WebAssembly JS API coercions and function metadata match the standard");
+    size_t wasm_jsapi_baseline = budget.current;
+    static const char wasm_jsapi_page[] =
+        "<!doctype html><html><body><script>"
+        "const bytes=Uint8Array.from(["
+        "0,97,115,109,1,0,0,0,1,6,1,96,2,127,127,0,3,2,1,0,"
+        "7,9,2,1,97,0,0,1,98,0,0,10,4,1,2,0,11]),"
+        "instance=new WebAssembly.Instance(new WebAssembly.Module(bytes)),"
+        "a=instance.exports.a,b=instance.exports.b,"
+        "externTable=new WebAssembly.Table({element:'externref',initial:1}),"
+        "funcTable=new WebAssembly.Table({element:'anyfunc',initial:1}),"
+        "externGlobal=new WebAssembly.Global({value:'externref'}),"
+        "funcGlobal=new WebAssembly.Global({value:'anyfunc'}),"
+        "funcValueGlobal=new WebAssembly.Global({value:'anyfunc'},a),"
+        "called=WebAssembly.CompileError('x',{cause:7}),"
+        "built=new WebAssembly.CompileError('y'),"
+        "Derived=class extends WebAssembly.CompileError{},derived=new Derived('z'),"
+        "wrapped=new WebAssembly.Global({value:'i64'},'18446744073709551617');"
+        "const order=[],orderedTableDescriptor={"
+        "get element(){order.push('element');return 'externref';},"
+        "get initial(){order.push('initial');return 0;},"
+        "get maximum(){order.push('maximum');return 1;}},"
+        "orderedGlobalDescriptor={"
+        "get mutable(){order.push('mutable');return false;},"
+        "get value(){order.push('value');return 'i32';}};"
+        "new WebAssembly.Table(orderedTableDescriptor);"
+        "new WebAssembly.Global(orderedGlobalDescriptor);"
+        "funcTable.set(0,a);externTable.grow(1);"
+        "let bigintRefused=false,nanRefused=false,funcrefRefused=false,"
+        "i64NumberRefused=false,numericBigIntRefused=0,"
+        "emptyCompileError=false,reads=0;"
+        "new WebAssembly.Memory({get initial(){reads++;return 0;},"
+        "get maximum(){reads++;return 1;}});"
+        "try{new WebAssembly.Memory({initial:1n});}"
+        "catch(error){bigintRefused=error instanceof TypeError;}"
+        "try{new WebAssembly.Memory({initial:NaN});}"
+        "catch(error){nanRefused=error instanceof TypeError;}"
+        "try{new WebAssembly.Table({element:'funcref',initial:0});}"
+        "catch(error){funcrefRefused=error instanceof TypeError;}"
+        "try{new WebAssembly.Global({value:'i64'},1);}"
+        "catch(error){i64NumberRefused=error instanceof TypeError;}"
+        "for(const type of ['i32','f32','f64'])try{"
+        "new WebAssembly.Global({value:type},1n);}catch(error){"
+        "if(error instanceof TypeError)numericBigIntRefused++;}"
+        "try{new WebAssembly.Module(new Uint8Array());}"
+        "catch(error){emptyCompileError=error instanceof WebAssembly.CompileError;}"
+        "const nameDescriptor=Object.getOwnPropertyDescriptor("
+        "WebAssembly.CompileError.prototype,'name'),"
+        "prototypeDescriptor=Object.getOwnPropertyDescriptor("
+        "WebAssembly.CompileError,'prototype');"
+        "globalThis.pocSummary=a===b&&a.length===2&&a.name==='0'"
+        "&&externTable.get(0)===undefined&&externTable.get(1)===undefined"
+        "&&funcTable.get(0)===a&&externGlobal.value===undefined"
+        "&&funcGlobal.value===null&&funcValueGlobal.value===a"
+        "&&called instanceof WebAssembly.CompileError"
+        "&&built instanceof WebAssembly.CompileError"
+        "&&derived instanceof Derived&&derived instanceof WebAssembly.CompileError"
+        "&&Object.getPrototypeOf(derived)===Derived.prototype"
+        "&&called.message==='x'&&called.cause===7"
+        "&&!Object.hasOwn(called,'name')&&nameDescriptor"
+        "&&!nameDescriptor.enumerable&&WebAssembly.CompileError.length===1"
+        "&&prototypeDescriptor&&!prototypeDescriptor.writable"
+        "&&wrapped.value===1n&&bigintRefused&&nanRefused&&funcrefRefused"
+        "&&i64NumberRefused&&numericBigIntRefused===3"
+        "&&emptyCompileError&&reads===2"
+        "&&order.join(',')==='element,initial,maximum,mutable,value'"
+        "?'WASM-JSAPI-OK':'WASM-JSAPI-FAILED';"
+        "</script></body></html>";
+    PocDocument wasm_jsapi_document;
+    CHECK(document_parse(&wasm_jsapi_document, &budget,
+                         wasm_jsapi_page, strlen(wasm_jsapi_page), 17));
+    ScriptResult wasm_jsapi_result;
+    CHECK(scripts_run_document_at(
+              &wasm_jsapi_document, &budget, 8 * MIB, 2000,
+              "https://wasm-jsapi.test/", &wasm_jsapi_result)
+          && wasm_jsapi_result.success
+          && strcmp(wasm_jsapi_result.summary, "WASM-JSAPI-OK") == 0);
+    document_destroy(&wasm_jsapi_document);
+    CHECK(budget.current == wasm_jsapi_baseline);
+
+    puts("test: WebAssembly descriptor and Module-overload timing follow WPT");
+    size_t wasm_wpt_baseline = budget.current;
+    static const char wasm_wpt_page[] =
+        "<!doctype html><html><body><script>"
+        "const descriptorOrder=[],memoryDescriptor=function(){};"
+        "Object.defineProperties(memoryDescriptor,{"
+        "address:{get(){descriptorOrder.push('ma');return {toString(){descriptorOrder.push('mas');return 'i32';}};}},"
+        "initial:{get(){descriptorOrder.push('mi');return {valueOf(){descriptorOrder.push('miv');return 0;}};}},"
+        "maximum:{get(){descriptorOrder.push('mm');return {valueOf(){descriptorOrder.push('mmv');return 1;}};}},"
+        "shared:{get(){descriptorOrder.push('ms');return false;}}});"
+        "new WebAssembly.Memory(memoryDescriptor);"
+        "const tableDescriptor=function(){};Object.defineProperties(tableDescriptor,{"
+        "element:{get(){descriptorOrder.push('te');return {toString(){descriptorOrder.push('tes');return 'externref';}};}},"
+        "address:{get(){descriptorOrder.push('ta');return {toString(){descriptorOrder.push('tas');return 'i32';}};}},"
+        "initial:{get(){descriptorOrder.push('ti');return {valueOf(){descriptorOrder.push('tiv');return 0;}};}},"
+        "maximum:{get(){descriptorOrder.push('tm');return {valueOf(){descriptorOrder.push('tmv');return 1;}};}}});"
+        "new WebAssembly.Table(tableDescriptor);"
+        "const globalDescriptor=function(){};globalDescriptor.value='i32';"
+        "const global=new WebAssembly.Global(globalDescriptor);"
+        "let i64ObjectRefused=false,numberObjectRefused=false,symbolsRefused=0,addressRefused=0,tableUndefinedRefused=0;"
+        "try{new WebAssembly.Global({value:'i64'},{valueOf(){return 1;}});}catch(error){i64ObjectRefused=error instanceof TypeError;}"
+        "try{new WebAssembly.Global({value:'i32'},{valueOf(){return 1n;}});}catch(error){numberObjectRefused=error instanceof TypeError;}"
+        "try{new WebAssembly.CompileError(Symbol());}catch(error){if(error instanceof TypeError)symbolsRefused++;}"
+        "try{new WebAssembly.Table({element:Symbol(),initial:0});}catch(error){if(error instanceof TypeError)symbolsRefused++;}"
+        "try{new WebAssembly.Global({value:Symbol()});}catch(error){if(error instanceof TypeError)symbolsRefused++;}"
+        "const bytes=Uint8Array.from([0,97,115,109,1,0,0,0,1,7,1,96,2,127,127,1,127,2,11,1,3,101,110,118,3,97,100,100,0,0,3,2,1,0,7,8,1,4,99,97,108,108,0,1,10,10,1,8,0,32,0,32,1,16,0,11]),"
+        "module=new WebAssembly.Module(bytes),moduleOrder=[],byteOrder=[],"
+        "moduleImports={get env(){moduleOrder.push('env');return {get add(){moduleOrder.push('add');return (a,b)=>a+b;}};}},"
+        "byteImports={get env(){byteOrder.push('env');return {get add(){byteOrder.push('add');return (a,b)=>a+b;}};}};"
+        "const modulePromise=WebAssembly.instantiate(module,moduleImports),"
+        "moduleWasSynchronous=moduleOrder.join(',')==='env,add',"
+        "bytePromise=WebAssembly.instantiate(bytes,byteImports),"
+        "bytesStayedDeferred=byteOrder.length===0;"
+        "try{WebAssembly.Module.customSections(module,Symbol());}catch(error){if(error instanceof TypeError)symbolsRefused++;}"
+        "try{new WebAssembly.Memory({address:'i64',initial:0n});}catch(error){if(error instanceof TypeError)addressRefused++;}"
+        "try{new WebAssembly.Table({element:'anyfunc',address:'i64',initial:0n});}catch(error){if(error instanceof TypeError)addressRefused++;}"
+        "try{new WebAssembly.Table({element:'anyfunc',initial:0},undefined);}catch(error){if(error instanceof TypeError)tableUndefinedRefused++;}"
+        "const optionalTable=new WebAssembly.Table({element:'anyfunc',initial:1});"
+        "try{optionalTable.set(0,undefined);}catch(error){if(error instanceof TypeError)tableUndefinedRefused++;}"
+        "try{optionalTable.grow(0,undefined);}catch(error){if(error instanceof TypeError)tableUndefinedRefused++;}"
+        "optionalTable.set(0);const omittedTableValue=optionalTable.get(0);"
+        "Promise.all([modulePromise,bytePromise]).then(values=>{"
+        "const okay=Object.getPrototypeOf(WebAssembly)===Object.prototype"
+        "&&typeof WebAssembly.hasOwnProperty==='function'"
+        "&&descriptorOrder.join(',')==='ma,mas,mi,miv,mm,mmv,ms,te,tes,ta,tas,ti,tiv,tm,tmv'"
+        "&&global.value===0&&i64ObjectRefused&&numberObjectRefused&&symbolsRefused===4"
+        "&&addressRefused===2&&tableUndefinedRefused===3&&omittedTableValue===null"
+        "&&moduleWasSynchronous&&bytesStayedDeferred"
+        "&&byteOrder.join(',')==='env,add'"
+        "&&values[0].exports.call(19,23)===42"
+        "&&values[1].instance.exports.call(20,22)===42;"
+        "globalThis.pocSummary=okay?'WASM-WPT-ORDER-OK':'WASM-WPT-ORDER-FAILED';"
+        "},error=>{globalThis.pocSummary='WASM-WPT-ORDER-ERROR:'+error;});"
+        "</script></body></html>";
+    PocDocument wasm_wpt_document;
+    CHECK(document_parse(&wasm_wpt_document, &budget,
+                         wasm_wpt_page, strlen(wasm_wpt_page), 17));
+    ScriptResult wasm_wpt_result;
+    CHECK(scripts_run_document_at(
+              &wasm_wpt_document, &budget, 10 * MIB, 3000,
+              "https://wasm-wpt.test/", &wasm_wpt_result)
+          && wasm_wpt_result.success
+          && strcmp(wasm_wpt_result.summary, "WASM-WPT-ORDER-OK") == 0);
+    document_destroy(&wasm_wpt_document);
+    CHECK(budget.current == wasm_wpt_baseline);
+
+    puts("test: unsupported native WebAssembly tables fail explicitly");
+    size_t wasm_table_export_baseline = budget.current;
+    static const char wasm_table_export_page[] =
+        "<!doctype html><html><body><script>"
+        "const bytes=Uint8Array.from([0,97,115,109,1,0,0,0,"
+        "4,5,1,112,1,1,1,7,5,1,1,116,1,0]),"
+        "module=new WebAssembly.Module(bytes),"
+        "shape=WebAssembly.Module.exports(module);"
+        "WebAssembly.instantiate(module).then(()=>{"
+        "globalThis.pocSummary='WASM-TABLE-UNEXPECTED';"
+        "},error=>{globalThis.pocSummary=shape.length===1"
+        "&&shape[0].name==='t'&&shape[0].kind==='table'"
+        "&&error instanceof WebAssembly.LinkError"
+        "?'WASM-TABLE-BOUNDED':'WASM-TABLE-WRONG-ERROR';});"
+        "</script></body></html>";
+    PocDocument wasm_table_export_document;
+    CHECK(document_parse(&wasm_table_export_document, &budget,
+                         wasm_table_export_page,
+                         strlen(wasm_table_export_page), 17));
+    ScriptResult wasm_table_export_result;
+    CHECK(scripts_run_document_at(
+              &wasm_table_export_document, &budget, 8 * MIB, 2000,
+              "https://wasm-table-export.test/",
+              &wasm_table_export_result)
+          && wasm_table_export_result.success
+          && strcmp(wasm_table_export_result.summary,
+                    "WASM-TABLE-BOUNDED") == 0);
+    document_destroy(&wasm_table_export_document);
+    CHECK(budget.current == wasm_table_export_baseline);
+
+    puts("test: asynchronous WebAssembly APIs snapshot BufferSource bytes");
+    size_t wasm_snapshot_baseline = budget.current;
+    static const char wasm_snapshot_page[] =
+        "<!doctype html><html><body><script>"
+        "const original=Uint8Array.from([0,97,115,109,1,0,0,0]),"
+        "compileBytes=original.slice(),instantiateBytes=original.slice();"
+        "const compiled=WebAssembly.compile(compileBytes),"
+        "instantiated=WebAssembly.instantiate(instantiateBytes);"
+        "compileBytes.fill(0);instantiateBytes.fill(0);"
+        "Promise.all([compiled,instantiated]).then(values=>{"
+        "globalThis.pocSummary=values[0] instanceof WebAssembly.Module"
+        "&&values[1].module instanceof WebAssembly.Module"
+        "&&values[1].instance instanceof WebAssembly.Instance"
+        "?'WASM-SNAPSHOT-OK':'WASM-SNAPSHOT-BAD';"
+        "},e=>{globalThis.pocSummary='WASM-SNAPSHOT-ERROR:'+e;});"
+        "</script></body></html>";
+    PocDocument wasm_snapshot_document;
+    CHECK(document_parse(&wasm_snapshot_document, &budget,
+                         wasm_snapshot_page, strlen(wasm_snapshot_page), 17));
+    ScriptResult wasm_snapshot_result;
+    CHECK(scripts_run_document_at(
+              &wasm_snapshot_document, &budget, 10 * MIB, 3000,
+              "https://wasm-snapshot.test/", &wasm_snapshot_result)
+          && wasm_snapshot_result.success
+          && strcmp(wasm_snapshot_result.summary,
+                    "WASM-SNAPSHOT-OK") == 0);
+    document_destroy(&wasm_snapshot_document);
+    CHECK(budget.current == wasm_snapshot_baseline);
+
+    puts("test: WebAssembly i64 and bounded multi-value results are preserved");
+    size_t wasm_values_baseline = budget.current;
+    static const char wasm_values_page[] =
+        "<!doctype html><html><body><script>"
+        "const i64=Uint8Array.from([0,97,115,109,1,0,0,0,1,6,1,96,1,126,1,126,3,2,1,0,7,6,1,2,105,100,0,0,10,6,1,4,0,32,0,11]),"
+        "multi=Uint8Array.from([0,97,115,109,1,0,0,0,1,6,1,96,0,2,127,126,3,2,1,0,7,6,1,2,109,118,0,0,10,8,1,6,0,65,7,66,9,11]),"
+        "trap=Uint8Array.from([0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,7,8,1,4,98,111,111,109,0,0,10,5,1,3,0,0,11]);"
+        "Promise.all([WebAssembly.instantiate(i64),WebAssembly.instantiate(multi),WebAssembly.instantiate(trap)]).then(values=>{"
+        "const pair=values[1].instance.exports.mv();"
+        "let trapped=false;try{values[2].instance.exports.boom();}catch(e){trapped=e instanceof WebAssembly.RuntimeError;}"
+        "globalThis.pocSummary=values[0].instance.exports.id(922337203685477580n)===922337203685477580n"
+        "&&Array.isArray(pair)&&pair[0]===7&&pair[1]===9n&&trapped?'WASM-VALUES-OK':'WASM-VALUES-FAILED';"
+        "},e=>{globalThis.pocSummary='WASM-VALUES-ERROR:'+e;});"
+        "</script></body></html>";
+    PocDocument wasm_values_document;
+    CHECK(document_parse(&wasm_values_document, &budget,
+                         wasm_values_page, strlen(wasm_values_page), 17));
+    ScriptResult wasm_values_result;
+    CHECK(scripts_run_document_at(
+              &wasm_values_document, &budget, 8 * MIB, 2000,
+              "https://wasm-values.test/", &wasm_values_result)
+          && wasm_values_result.success
+          && strcmp(wasm_values_result.summary, "WASM-VALUES-OK") == 0);
+    document_destroy(&wasm_values_document);
+    CHECK(budget.current == wasm_values_baseline);
+
+    puts("test: bounded WebAssembly function imports preserve JavaScript behavior");
+    size_t wasm_import_baseline = budget.current;
+    static const char wasm_import_page[] =
+        "<!doctype html><html><body><script>"
+        "const bytes=Uint8Array.from([0,97,115,109,1,0,0,0,1,7,1,96,2,127,127,1,127,2,11,1,3,101,110,118,3,97,100,100,0,0,3,2,1,0,7,8,1,4,99,97,108,108,0,1,10,10,1,8,0,32,0,32,1,16,0,11]),"
+        "module=new WebAssembly.Module(bytes),descriptors=WebAssembly.Module.imports(module),"
+        "sentinel=new Error('sentinel');let shouldThrow=false;"
+        "const good=new WebAssembly.Instance(module,{env:{add:(a,b)=>{if(shouldThrow)throw sentinel;return a+b;}}}),"
+        "other=new WebAssembly.Instance(module,{env:{add:(a,b)=>a*b}}),"
+        "sum=good.exports.call(19,23),product=other.exports.call(6,7);shouldThrow=true;"
+        "let propagated=false;"
+        "try{good.exports.call(1,2);}"
+        "catch(e){propagated=e===sentinel;}"
+        "const getterError=new Error('getter'),hostile={};"
+        "Object.defineProperty(hostile,'env',{get(){throw getterError;}});"
+        "let getterPropagated=false,missingLinked=false;"
+        "try{new WebAssembly.Instance(module,hostile);}catch(e){getterPropagated=e===getterError;}"
+        "try{new WebAssembly.Instance(module,{});}catch(e){missingLinked=e instanceof WebAssembly.LinkError;}"
+        "globalThis.pocSummary=descriptors.length===1"
+        "&&descriptors[0].module==='env'&&descriptors[0].name==='add'"
+        "&&descriptors[0].kind==='function'&&sum===42&&product===42"
+        "&&propagated&&getterPropagated&&missingLinked?'WASM-IMPORT-OK':'WASM-IMPORT-FAILED';"
+        "</script></body></html>";
+    PocDocument wasm_import_document;
+    CHECK(document_parse(&wasm_import_document, &budget,
+                         wasm_import_page, strlen(wasm_import_page), 17));
+    ScriptResult wasm_import_result;
+    CHECK(scripts_run_document_at(
+              &wasm_import_document, &budget, 10 * MIB, 2000,
+              "https://wasm-import.test/", &wasm_import_result)
+          && wasm_import_result.success
+          && strcmp(wasm_import_result.summary, "WASM-IMPORT-OK") == 0);
+    document_destroy(&wasm_import_document);
+    CHECK(budget.current == wasm_import_baseline);
+
+    puts("test: WebAssembly instruction metering bounds hostile loops");
+    size_t wasm_meter_baseline = budget.current;
+    static const char wasm_meter_page[] =
+        "<!doctype html><html><body><script>"
+        "const loop=Uint8Array.from([0,97,115,109,1,0,0,0,"
+        "1,4,1,96,0,0,3,2,1,0,7,8,1,4,108,111,111,112,0,0,"
+        "10,9,1,7,0,3,64,12,0,11,11]);"
+        "const startLoop=Uint8Array.from([0,97,115,109,1,0,0,0,"
+        "1,4,1,96,0,0,3,2,1,0,8,1,0,"
+        "10,9,1,7,0,3,64,12,0,11,11]);"
+        "let startBounded=false;try{new WebAssembly.Instance("
+        "new WebAssembly.Module(startLoop));}catch(error){"
+        "startBounded=error instanceof WebAssembly.RuntimeError;}"
+        "WebAssembly.instantiate(loop).then(value=>{"
+        "let bounded=false;try{value.instance.exports.loop();}"
+        "catch(error){bounded=error instanceof WebAssembly.RuntimeError;}"
+        "globalThis.pocSummary=bounded&&startBounded&&1+1===2"
+        "?'WASM-METER-OK':'WASM-METER-FAILED';"
+        "},error=>{globalThis.pocSummary='WASM-METER-ERROR:'+error;});"
+        "</script></body></html>";
+    PocDocument wasm_meter_document;
+    CHECK(document_parse(&wasm_meter_document, &budget,
+                         wasm_meter_page, strlen(wasm_meter_page), 17));
+    ScriptResult wasm_meter_result;
+    CHECK(scripts_run_document_at(
+              &wasm_meter_document, &budget, 8 * MIB, 3000,
+              "https://wasm-meter.test/", &wasm_meter_result)
+          && wasm_meter_result.success
+          && strcmp(wasm_meter_result.summary, "WASM-METER-OK") == 0);
+    document_destroy(&wasm_meter_document);
+    CHECK(budget.current == wasm_meter_baseline);
+
+    puts("test: WebAssembly start-function traps use RuntimeError");
+    size_t wasm_start_trap_baseline = budget.current;
+    static const char wasm_start_trap_page[] =
+        "<!doctype html><html><body><script>"
+        "const bytes=Uint8Array.from([0,97,115,109,1,0,0,0,"
+        "1,4,1,96,0,0,3,2,1,0,8,1,0,10,5,1,3,0,0,11]);"
+        "const imported=Uint8Array.from([0,97,115,109,1,0,0,0,"
+        "1,4,1,96,0,0,2,7,1,1,109,1,102,0,0,8,1,0]),sentinel={};"
+        "let trapped=false,importCalled=0,importPropagated=false;try{new WebAssembly.Instance("
+        "new WebAssembly.Module(bytes));}catch(error){"
+        "trapped=error instanceof WebAssembly.RuntimeError;}"
+        "new WebAssembly.Instance(new WebAssembly.Module(imported),"
+        "{m:{f(){importCalled++;}}});try{new WebAssembly.Instance("
+        "new WebAssembly.Module(imported),{m:{f(){throw sentinel;}}});}"
+        "catch(error){importPropagated=error===sentinel;}"
+        "globalThis.pocSummary=trapped&&importCalled===1&&importPropagated"
+        "?'WASM-START-TRAP-OK':'WASM-START-TRAP-BAD';"
+        "</script></body></html>";
+    PocDocument wasm_start_trap_document;
+    CHECK(document_parse(&wasm_start_trap_document, &budget,
+                         wasm_start_trap_page,
+                         strlen(wasm_start_trap_page), 17));
+    ScriptResult wasm_start_trap_result;
+    CHECK(scripts_run_document_at(
+              &wasm_start_trap_document, &budget, 8 * MIB, 2000,
+              "https://wasm-start-trap.test/", &wasm_start_trap_result)
+          && wasm_start_trap_result.success
+          && strcmp(wasm_start_trap_result.summary,
+                    "WASM-START-TRAP-OK") == 0);
+    document_destroy(&wasm_start_trap_document);
+    CHECK(budget.current == wasm_start_trap_baseline);
+
+    puts("test: WebAssembly traps clear and toolchain helpers stay explicit");
+    size_t wasm_trap_recovery_baseline = budget.current;
+    static const char wasm_trap_recovery_page[] =
+        "<!doctype html><html><body><script>"
+        "const recovery=Uint8Array.from([0,97,115,109,1,0,0,0,"
+        "1,5,1,96,0,1,127,3,3,2,0,0,7,13,2,4,116,114,97,112,"
+        "0,0,2,111,107,0,1,10,10,2,3,0,0,11,4,0,65,42,11]),"
+        "ctors=Uint8Array.from([0,97,115,109,1,0,0,0,"
+        "1,4,1,96,0,0,3,2,1,0,7,21,1,17,95,95,119,97,115,109,"
+        "95,99,97,108,108,95,99,116,111,114,115,0,0,"
+        "10,5,1,3,0,0,11]);"
+        "const instance=new WebAssembly.Instance(new WebAssembly.Module(recovery));"
+        "let trapped=false;try{instance.exports.trap();}catch(error){"
+        "trapped=error instanceof WebAssembly.RuntimeError;}"
+        "const helperInstance=new WebAssembly.Instance(new WebAssembly.Module(ctors));"
+        "let helperExplicit=false;try{helperInstance.exports.__wasm_call_ctors();}"
+        "catch(error){helperExplicit=error instanceof WebAssembly.RuntimeError;}"
+        "globalThis.pocSummary=trapped&&instance.exports.ok()===42&&helperExplicit"
+        "?'WASM-TRAP-RECOVERY-OK':'WASM-TRAP-RECOVERY-BAD';"
+        "</script></body></html>";
+    PocDocument wasm_trap_recovery_document;
+    CHECK(document_parse(&wasm_trap_recovery_document, &budget,
+                         wasm_trap_recovery_page,
+                         strlen(wasm_trap_recovery_page), 17));
+    ScriptResult wasm_trap_recovery_result;
+    CHECK(scripts_run_document_at(
+              &wasm_trap_recovery_document, &budget, 8 * MIB, 3000,
+              "https://wasm-trap-recovery.test/",
+              &wasm_trap_recovery_result)
+          && wasm_trap_recovery_result.success
+          && strcmp(wasm_trap_recovery_result.summary,
+                    "WASM-TRAP-RECOVERY-OK") == 0);
+    document_destroy(&wasm_trap_recovery_document);
+    CHECK(budget.current == wasm_trap_recovery_baseline);
+
+    puts("test: bounded Worker scope can compile and execute WebAssembly");
+    size_t wasm_worker_baseline = budget.current;
+    static const char wasm_worker_page[] =
+        "<!doctype html><html><body></body></html>";
+    static const char wasm_worker_source[] =
+        "(()=>{const source=`const bytes=Uint8Array.from(["
+        "0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,2,1,0,"
+        "7,10,1,6,97,110,115,119,101,114,0,0,10,6,1,4,0,65,42,11]);"
+        "WebAssembly.instantiate(bytes).then(value=>postMessage("
+        "value.instance.exports.answer()),error=>postMessage(String(error)));"
+        "onmessage=event=>postMessage(event.data instanceof WebAssembly.Module)`,"
+        "url=URL.createObjectURL(new Blob([source])),worker=new Worker(url);"
+        "module=new WebAssembly.Module(Uint8Array.from(["
+        "0,97,115,109,1,0,0,0])),cloned=structuredClone(module);let phase=0;"
+        "worker.onmessage=event=>{if(phase++===0&&event.data===42){"
+        "worker.postMessage(module);return;}globalThis.pocSummary="
+        "event.data===true&&cloned instanceof WebAssembly.Module&&cloned!==module"
+        "?'WASM-WORKER-OK':'WASM-WORKER-BAD:'+event.data;"
+        "worker.terminate();URL.revokeObjectURL(url);};})()";
+    PocDocument wasm_worker_document;
+    CHECK(document_parse(&wasm_worker_document, &budget,
+                         wasm_worker_page, strlen(wasm_worker_page), 17));
+    ScriptResult wasm_worker_result;
+    ScriptRuntime *wasm_worker_runtime = script_runtime_create_deferred(
+        &wasm_worker_document, &budget, 10 * MIB, 3000,
+        "https://wasm-worker.test/", NULL, &wasm_worker_result);
+    CHECK(wasm_worker_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              wasm_worker_runtime, wasm_worker_source,
+              "<wasm-worker>", &wasm_worker_result));
+    for (size_t turn = 0; turn < 12; turn++) {
+        CHECK(script_runtime_advance(
+            wasm_worker_runtime, turn, 8, &wasm_worker_result));
+    }
+    CHECK(wasm_worker_result.success
+          && strcmp(wasm_worker_result.summary, "WASM-WORKER-OK") == 0);
+    script_runtime_destroy(wasm_worker_runtime);
+    document_destroy(&wasm_worker_document);
+    CHECK(budget.current == wasm_worker_baseline);
+
     puts("test: deterministic Date constructor, function, and Intl defaults");
     size_t deterministic_date_baseline = budget.current;
     static const char deterministic_date_page[] =
@@ -1778,7 +2434,9 @@
     static const char listener_page[] =
         "<!doctype html><html><head><title>Listener isolation</title></head>"
         "<body><script>"
-        "let sequence=[];"
+        "let sequence=[],errorEvents=0;"
+        "addEventListener('error',()=>{errorEvents++;"
+        "throw new Error('expected nested error-listener failure')});"
         "document.addEventListener('DOMContentLoaded',()=>{"
         "sequence.push('first');throw new Error('expected listener failure')});"
         "document.addEventListener('DOMContentLoaded',()=>sequence.push('second'));"
@@ -1786,7 +2444,7 @@
         "throw new Error('expected reporter failure')};"
         "throw new Error('expected load failure')});"
         "addEventListener('load',()=>{sequence.push('load');"
-        "globalThis.pocSummary=sequence.join(',')});"
+        "globalThis.pocSummary=sequence.join(',')+':'+errorEvents});"
         "</script></body></html>";
     PocDocument listener_document;
     CHECK(document_parse(&listener_document, &budget, listener_page,
@@ -1796,7 +2454,7 @@
                                &listener_result));
     CHECK(listener_result.success
           && listener_result.dom_content_loaded_dispatched
-          && strcmp(listener_result.summary, "first,second,load") == 0);
+          && strcmp(listener_result.summary, "first,second,load:2") == 0);
     document_destroy(&listener_document);
     CHECK(budget.current == listener_baseline);
 

@@ -46,6 +46,10 @@ BOOTSTRAP_SOURCE(browser_bootstrap_game_audio, "game-audio.js",
                  browser_bootstrap_game_audio_bytecode)
 BOOTSTRAP_SOURCE(browser_bootstrap_webgl, "webgl.js",
                  "<browser-webgl>", browser_bootstrap_webgl_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_worker, "worker.js",
+                 "<browser-worker>", browser_bootstrap_worker_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_wasm, "wasm.js",
+                 "<browser-wasm>", browser_bootstrap_wasm_bytecode)
 BOOTSTRAP_DIAGNOSTIC(browser_dpu_diagnostic, "dpu-diagnostic.js",
                      "<dpu-diagnostic>")
 BOOTSTRAP_DIAGNOSTIC(browser_eval_source_diagnostic,

@@ -530,6 +530,11 @@ bool images_refresh_external_nodes(
     size_t maximum_total_encoded_bytes,
     size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session);
+/* Allocation-free rollback for trusted native DOM transactions. Removes
+   resources owned by the exact nodes, transferring shared backing ownership
+   to retained aliases before releasing anything. */
+void images_discard_nodes(
+    ImageResources *images, lxb_dom_node_t *const *nodes, size_t node_count);
 bool images_load_external_priority_targets(
     const PocDocument *document, Stylesheet *stylesheet,
     ImageResources *images, const ImagePriorityTarget *targets,
@@ -637,6 +642,11 @@ bool images_replace_with_decoded_surface(ImageResources *images,
                                          lxb_dom_node_t *node,
                                          unsigned char *rgba_pixels,
                                          int width, int height);
+/* Reserve stable metadata slots before a committed layout borrows resource
+   pointers. Later frame/canvas publication can then append without moving
+   the table underneath that layout. */
+bool images_reserve_capacity(ImageResources *images, Budget *budget,
+                             size_t capacity);
 /* Copies a bounded dirty rectangle from one script-owned RGBA canvas into a
    native, budget-owned page surface. At most four surfaces and 1 MiB of
    native canvas pixels may be retained per page. The caller keeps ownership

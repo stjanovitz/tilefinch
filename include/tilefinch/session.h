@@ -291,6 +291,18 @@ typedef struct {
     const char *cf_mitigated;
 } BrowserSiteAdapterDocumentCacheView;
 
+/* Accept-CH is an origin-scoped user-agent preference retained for the
+   browsing session.  Keep only a tiny fixed LRU: this is transport identity,
+   not page data, and must never grow with the number of visited origins. */
+#define BROWSER_CLIENT_HINT_ORIGIN_LIMIT 4u
+#define BROWSER_CLIENT_HINT_TOKEN_LIMIT 1024u
+typedef struct {
+    char origin[BROWSER_ORIGIN_LIMIT];
+    char tokens[BROWSER_CLIENT_HINT_TOKEN_LIMIT];
+    size_t stamp;
+    bool valid;
+} BrowserClientHintEntry;
+
 typedef struct BrowserSession {
     Budget *budget;
     /* Non-owning engine-lifetime request policy. */
@@ -301,6 +313,7 @@ typedef struct BrowserSession {
     BrowserSiteAdapterState site_adapter_state;
     BrowserSiteAdapterDocumentCacheEntry site_adapter_document_cache[
         BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES];
+    BrowserClientHintEntry client_hints[BROWSER_CLIENT_HINT_ORIGIN_LIMIT];
     size_t storage_bytes;
     size_t cookie_bytes;
     size_t cookie_long_path_bytes;
@@ -317,6 +330,7 @@ typedef struct BrowserSession {
     size_t cache_misses;
     size_t cache_evictions;
     size_t site_adapter_document_clock;
+    size_t client_hint_clock;
     /* Global page policy. HTTP cache remains independently configurable. */
     bool site_data_allowed;
     /* Security compatibility grants are bounded. Mixed-content grants are
@@ -364,6 +378,14 @@ bool browser_session_init(BrowserSession *session, Budget *budget,
 void browser_session_set_site_data_allowed(
     BrowserSession *session, bool allowed);
 bool browser_session_site_data_allowed(const BrowserSession *session);
+/* Retains normalized, supported high-entropy Accept-CH tokens for a
+   trustworthy response origin. Captive-portal partitions neither consume nor
+   modify the ordinary browsing cache. */
+bool browser_session_client_hints_put(
+    BrowserSession *session, const char *url, const char *tokens);
+bool browser_session_client_hints_get(
+    BrowserSession *session, const char *url, char *tokens,
+    size_t tokens_capacity, char *origin, size_t origin_capacity);
 bool browser_session_set_mixed_content_site_allowed(
     BrowserSession *session, const char *url, bool allowed);
 bool browser_session_mixed_content_site_allowed(

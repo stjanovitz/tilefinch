@@ -35,6 +35,26 @@ static NavigationParserCheckpointOutcome navigation_stream_body(
         stream->session->performance.streaming_preview_layout_us
         + stream->session->performance.streaming_preview_paint_us
         + stream->session->performance.streaming_preview_style_refresh_us;
+    if (!stream->optional_work_shed
+        && budget_pressure_required(
+               stream->session->budget, length, 2u * 1024u * 1024u)) {
+        /* This early reservation check is also the authoritative decision
+           not to spend memory on a provisional frame. Keep the established
+           preview-pressure diagnostics coherent even though we never enter
+           the later layout estimator. */
+        stream->pre_eof_preview_attempted = true;
+        stream->session->performance.streaming_preview_pressure_skips++;
+        budget_record_pressure(
+            stream->session->budget, BUDGET_PRESSURE_SPECULATION,
+            length, 0u);
+        navigation_stream_shed_optional_work(
+            stream,
+            "Optional page work stopped to finish a large document",
+            true);
+        if (!document_parser_discard_remaining_script_text(stream->parser)) {
+            return NAVIGATION_PARSER_CHECKPOINT_HARD_FAILURE;
+        }
+    }
     /* The main parser must stop at an author script, but a browser preload
        scanner may inspect already-received bytes beyond that checkpoint.
        Start only fetches here; the normal DOM-derived stylesheet pipeline
@@ -264,16 +284,31 @@ static bool navigation_load_headers(void *opaque,
        sections, or produce progressive paint.  The completed response is
        still retained long enough to accept its cookies before the request
        is retried with the requested client hints. */
-    load->client_hint_tokens[0] = '\0';
+    char accepted_hints[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = {0};
+    char critical_hints[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = {0};
+    bool hints_valid = fetch_accepted_critical_client_hints(
+        metadata->accept_ch, metadata->accept_ch,
+        accepted_hints, sizeof(accepted_hints));
+    bool critical_valid = fetch_accepted_critical_client_hints(
+        metadata->accept_ch, metadata->critical_ch,
+        critical_hints, sizeof(critical_hints));
+    bool critical_missing = critical_valid && critical_hints[0] != '\0'
+        && !fetch_client_hint_tokens_cover(
+               load->client_hint_tokens, critical_hints);
     load->client_hint_retry_pending =
         tilefinch_url_potentially_trustworthy(effective)
         && strcasecmp(load->method, "GET") == 0
         && !load->client_hint_retried
-        && fetch_accepted_critical_client_hints(
-            metadata->accept_ch, metadata->critical_ch,
-            load->client_hint_tokens,
-            sizeof(load->client_hint_tokens))
-        && load->client_hint_tokens[0] != '\0';
+        && critical_missing;
+    if (hints_valid && accepted_hints[0] != '\0') {
+        (void) browser_session_client_hints_put(
+            load->session->browser_session, effective, accepted_hints);
+        if (load->client_hint_retry_pending) {
+            snprintf(load->client_hint_tokens,
+                     sizeof(load->client_hint_tokens), "%s",
+                     accepted_hints);
+        }
+    }
     if (load->client_hint_retry_pending) return true;
     if (!load->sectioned) {
         bool accepted = navigation_stream_headers(
@@ -502,6 +537,10 @@ static bool navigation_load_begin_parser(NavigationLoad *load)
             &load->parser, load->session->document_scripts_enabled)) {
         return false;
     }
+    if (!document_parser_set_inert_script_policy(
+            &load->parser, !load->session->document_scripts_enabled,
+            256u * 1024u,
+            load->session->maximum_script_file_bytes)) return false;
     return true;
 }
 
@@ -730,6 +769,10 @@ static bool navigation_load_reset_for_retry(NavigationLoad *load)
             &load->parser, load->session->document_scripts_enabled)) {
         return false;
     }
+    if (!document_parser_set_inert_script_policy(
+            &load->parser, !load->session->document_scripts_enabled,
+            256u * 1024u,
+            load->session->maximum_script_file_bytes)) return false;
     NavigationDocumentStream *stream = load->document_stream;
     return navigation_load_initialize_document_stream(load, stream);
 }
@@ -905,6 +948,10 @@ static NavigationLoad *navigation_load_begin_common(
              sizeof(load->effective_history_url), "%s",
              load->requested_url);
     snprintf(load->method, sizeof(load->method), "%s", actual_method);
+    (void) browser_session_client_hints_get(
+        session->browser_session, load->request_url,
+        load->client_hint_tokens, sizeof(load->client_hint_tokens),
+        load->client_hint_origin, sizeof(load->client_hint_origin));
     if (content_type != NULL) {
         if (strlen(content_type) >= sizeof(load->content_type)) {
             navigation_load_set_error(load, NAVIGATION_LOAD_FAILED,
@@ -1410,6 +1457,22 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
     bool built = true;
     if (candidate == NULL) {
         candidate = budget_malloc(session->budget, sizeof(*candidate));
+        if (candidate == NULL && !load->sectioned
+            && load->document_stream != NULL
+            && !load->document_stream->optional_work_shed) {
+            /* The parsed server DOM is authoritative and already complete.
+               If only the fixed transactional shell no longer fits beside
+               optional author/runtime resource state, shed that state and
+               retry once.  This preserves rollback and the PSP page ceiling
+               while allowing large server-rendered pages to commit as
+               navigable static documents. */
+            navigation_stream_shed_optional_work(
+                load->document_stream,
+                "Optional page work stopped to finish a large document",
+                true);
+            candidate = budget_malloc(
+                session->budget, sizeof(*candidate));
+        }
         if (candidate == NULL) {
             navigation_load_set_error(
                 load, NAVIGATION_LOAD_FAILED,

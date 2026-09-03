@@ -44,6 +44,14 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         JS_DumpExecutionProfile(runtime->runtime);
     }
 #endif
+    if (runtime->runtime != NULL &&
+        getenv("TILEFINCH_DUMP_JS_MEMORY") != NULL) {
+        /* Validation-only per-realm census.  The ordinary interactive report
+           sees the top-level realm after child frames have already retired;
+           reporting at the shared destruction boundary makes the transient
+           frame/worker representation visible without changing page code. */
+        script_runtime_report_memory(runtime, stderr);
+    }
     if (runtime->context != NULL) {
         js_lazy_webpack_bundles_destroy(runtime);
         JS_FreeValue(runtime->context,

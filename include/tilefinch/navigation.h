@@ -18,9 +18,12 @@
 
 #define NAVIGATION_URL_LIMIT 2048
 #define NAVIGATION_TITLE_LIMIT 256
-#define NAVIGATION_FRAME_LIMIT 2
+#define NAVIGATION_FRAME_LIMIT 4
 #define NAVIGATION_FRAME_DISCOVERY_LIMIT 8
-#define NAVIGATION_MESSAGE_LIMIT 16
+/* A single message task may enqueue replies while an earlier burst is still
+   pending.  Keep enough fixed metadata for one 16-message inbound burst plus
+   a bounded reply burst; payload bytes remain separately Budget-charged. */
+#define NAVIGATION_MESSAGE_LIMIT 32
 #define NAVIGATION_STYLESHEET_EVENT_LIMIT 32
 #define NAVIGATION_BLOCKING_SCRIPT_SAMPLE_LIMIT 24
 /* Resource, frame, and asynchronous page-runtime scheduler views share this
@@ -52,9 +55,20 @@ typedef enum {
     NAVIGATION_SLICE_COUNT
 } NavigationSlicePhase;
 
+typedef struct NavigationFramePresentation NavigationFramePresentation;
+
 typedef struct {
     PocDocument document;
+    ImageResources images;
     ScriptRuntime *runtime;
+    /* The iframe element and its handle belong to this immediate parent
+       realm.  Zero parent_frame_slot_plus_one denotes the top-level page;
+       otherwise the value names another entry in the fixed frame table.
+       Runtime identity is retained explicitly because node handles are only
+       unique within one realm. */
+    ScriptRuntime *parent_runtime;
+    size_t parent_frame_slot_plus_one;
+    NavigationFramePresentation *presentation;
     ScriptResult script_result;
     lxb_dom_node_t *element;
     long parent_handle;
@@ -75,6 +89,7 @@ typedef struct {
     bool loaded;
     bool retired;
     bool opaque_origin;
+    bool presentation_dirty;
 } NavigationFrame;
 
 typedef struct {
@@ -93,12 +108,22 @@ typedef void (*NavigationScriptFrontierCallback)(
     void *opaque, size_t script_index, bool active);
 
 typedef struct {
+    uint16_t control_index;
+    uint16_t value_length;
+    char value[128];
+} NavigationHistoryControl;
+
+#define NAVIGATION_HISTORY_CONTROL_LIMIT 8u
+
+typedef struct {
     char *url;
     char *title;
     int scroll_y;
     int focus_kind;
     /* Semantic ordinal within focus_kind; independent of inline fragments. */
     size_t focus_index;
+    NavigationHistoryControl controls[NAVIGATION_HISTORY_CONTROL_LIMIT];
+    size_t control_count;
 } NavigationEntry;
 
 typedef struct {
@@ -165,6 +190,8 @@ typedef struct {
     NavigationFrame frames[NAVIGATION_FRAME_LIMIT];
     size_t frame_count;
     long discovered_frame_handles[NAVIGATION_FRAME_DISCOVERY_LIMIT];
+    ScriptRuntime *discovered_frame_runtimes[
+        NAVIGATION_FRAME_DISCOVERY_LIMIT];
     size_t discovered_frame_element_count;
     NavigationStylesheetEventRecord stylesheet_events[
         NAVIGATION_STYLESHEET_EVENT_LIMIT];
@@ -918,6 +945,11 @@ bool navigation_back(NavigationSession *session, const NavigationEntry **entry);
 bool navigation_forward(NavigationSession *session,
                         const NavigationEntry **entry);
 const NavigationEntry *navigation_current(const NavigationSession *session);
+/* Returns the committed document's effective URL.  A session-history entry
+   retains the originally requested URL while a replayed redirect commits a
+   different document, so security and resource policy must use this value. */
+const char *navigation_active_document_url(
+    const NavigationSession *session);
 /*
  * Transactionally replaces only the bounded top-level history list. Every
  * string is copied before the incumbent list is changed, so OOM leaves the
@@ -926,7 +958,7 @@ const NavigationEntry *navigation_current(const NavigationSession *session);
 bool navigation_replace_history(
     NavigationSession *session, const NavigationHistoryRecord *records,
     size_t count, size_t current_index);
-/* True only when url differs from the active entry at most by fragment. */
+/* True only when url differs from the active document at most by fragment. */
 bool navigation_url_is_same_document(
     const NavigationSession *session, const char *url);
 bool navigation_commit_same_document_url(NavigationSession *session,
@@ -998,6 +1030,13 @@ void navigation_test_refuse_next_static_fallback_layout(void);
 /* Refuse the first layout allocation while settling the next synchronous
    hashchange/popstate mutation. */
 void navigation_test_refuse_next_same_document_relayout(void);
+/* Refuse the first allocation in the next general relayout build, after any
+   native or author DOM mutation has already committed. */
+void navigation_test_refuse_next_relayout(void);
+bool navigation_test_refresh_frame_presentation(
+    NavigationSession *session, NavigationFrame *frame);
+bool navigation_test_configure_frame_messaging(
+    NavigationSession *session, NavigationFrame *frame);
 #endif
 /* Pump exactly one deferred document-image continuation unit without also
    advancing webfonts, scripts, or other idle work. Frontends may use this
@@ -1023,6 +1062,11 @@ bool navigation_dispatch_node_event(NavigationSession *session,
                                     const char *event_type);
 bool navigation_dispatch_node_activation(NavigationSession *session,
                                          lxb_dom_node_t *node);
+/* Activate the first visible control in a loaded child browsing context.
+   Cross-origin DOM remains isolated: only the browser-owned frame record and
+   its retained layout are consulted. */
+bool navigation_activate_frame(NavigationSession *session,
+                               lxb_dom_node_t *frame_element);
 bool navigation_dispatch_node_pointer(
     NavigationSession *session, lxb_dom_node_t *node, unsigned phase,
     int client_x, int client_y, int offset_x, int offset_y,

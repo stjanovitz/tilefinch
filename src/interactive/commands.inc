@@ -1036,13 +1036,16 @@ static void loop_help(void)
          "page-up|page-down, top|bottom, section-walk COUNT, "
          "focus-next|focus-prev, "
          "focus-up|focus-down|focus-left|focus-right, "
-         "focus-id ID, anchor ID, node-text ID, node-attribute ID NAME, "
+         "focus-id ID, focus-url URL, link-urls, body-contains TEXT, "
+         "history-controls, "
+         "anchor ID, node-text ID, node-attribute ID NAME, "
          "tap X Y, cross|activate, "
          "type TEXT, backspace, "
          "click SELECTOR, tick [COUNT [MS]], "
          "drain [MAX-TURNS [SETTLE-MS]], "
          "media-status|media-play|media-pause|media-seek SECONDS|"
          "media-open|media-close|media-run [COUNT [MS]], "
+         "reader-on|reader-off, "
          "go URL, reload, "
          "back|circle, forward, mark-steady, help, quit");
     puts("PSP aliases: dpad-up/down scroll, dpad-left/right move focus, "
@@ -1262,6 +1265,7 @@ static bool run_command_loop(FILE *commands, bool interactive,
     }
     size_t frame_number = 0;
     bool steady = false;
+    bool reader_active = false;
     size_t steady_min = 0, steady_max = 0, steady_samples = 0;
     snprintf(scratch->path, sizeof(scratch->path),
              "%s/frame-%04zu.ppm", output_dir,
@@ -1444,6 +1448,61 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 lxb_dom_interface_node(navigation->page.document.html),
                 argument);
             ok = browser_engine_focus_node(engine, node);
+        } else if (strcmp(line, "focus-url") == 0 && argument != NULL) {
+            lxb_dom_node_t *node = NULL;
+            const NavigationEntry *entry = navigation_current(navigation);
+            const char *base = entry == NULL
+                ? navigation->page.document_url : entry->url;
+            for (size_t at = 0;
+                 at < navigation->page.layout.link_count && node == NULL;
+                 at++) {
+                const LinkRegion *link = &navigation->page.layout.links[at];
+                char resolved[NAVIGATION_URL_LIMIT];
+                if (link->url != NULL
+                    && fetch_resolve_url(base, link->url, resolved,
+                                         sizeof(resolved))
+                    && strcmp(resolved, argument) == 0) {
+                    node = link->node;
+                }
+            }
+            ok = browser_engine_focus_node(engine, node);
+        } else if (strcmp(line, "link-urls") == 0) {
+            const NavigationEntry *entry = navigation_current(navigation);
+            const char *base = entry == NULL
+                ? navigation->page.document_url : entry->url;
+            for (size_t at = 0; at < navigation->page.layout.link_count; at++) {
+                const LinkRegion *link = &navigation->page.layout.links[at];
+                char resolved[NAVIGATION_URL_LIMIT];
+                if (link->url != NULL
+                    && fetch_resolve_url(base, link->url, resolved,
+                                         sizeof(resolved))) {
+                    printf("loop-link index=%zu url=\"%s\"\n", at,
+                           resolved);
+                }
+            }
+            changed = false;
+        } else if (strcmp(line, "body-contains") == 0
+                   && argument != NULL) {
+            const char *body = document_body_text(
+                &navigation->page.document);
+            ok = body != NULL && strstr(body, argument) != NULL;
+            printf("loop-body-contains found=%s text=\"%s\"\n",
+                   ok ? "yes" : "no", argument);
+            changed = false;
+        } else if (strcmp(line, "history-controls") == 0) {
+            const NavigationEntry *entry = navigation_current(navigation);
+            printf("loop-history-controls count=%zu",
+                   entry == NULL ? 0u : entry->control_count);
+            if (entry != NULL) {
+                for (size_t at = 0; at < entry->control_count; at++) {
+                    printf(" index=%u value=\"%.*s\"",
+                           (unsigned) entry->controls[at].control_index,
+                           (int) entry->controls[at].value_length,
+                           entry->controls[at].value);
+                }
+            }
+            putchar('\n');
+            changed = false;
         } else if (strcmp(line, "control-value") == 0
                    && argument != NULL) {
             lxb_dom_node_t *node = find_element_id(
@@ -1681,6 +1740,52 @@ static bool run_command_loop(FILE *commands, bool interactive,
                    frame_number - first_media_frame, milliseconds);
             interactive_media_print_status(media);
             changed = false;
+        } else if (strcmp(line, "reader-on") == 0
+                   || strcmp(line, "reader-off") == 0) {
+            bool enable = strcmp(line, "reader-on") == 0;
+            char anchor_before[BROWSER_TEXT_ANCHOR_LIMIT + 1u];
+            char anchor_after[BROWSER_TEXT_ANCHOR_LIMIT + 1u];
+            int anchor_y = 0, ignored_y = 0;
+            const NavigationEntry *entry = navigation_current(navigation);
+            int scroll_before = entry == NULL ? 0 : entry->scroll_y;
+            bool have_anchor = browser_engine_capture_text_anchor(
+                engine, anchor_before, &anchor_y);
+            ReaderDocumentAnalysis analysis = {0};
+            if (enable) {
+                char reader_css[SITE_ADAPTER_READER_CSS_LIMIT];
+                char adapter[32];
+                const char *reader_url = entry == NULL
+                    ? navigation->page.document_url : entry->url;
+                ok = !reader_active
+                    && browser_engine_prepare_reader(engine, &analysis)
+                    && site_adapter_reader_css(
+                        reader_url, SITE_ADAPTER_READER_FONT_SANS, 100u,
+                        reader_css, sizeof(reader_css), adapter,
+                        sizeof(adapter))
+                    && browser_engine_apply_user_css(
+                        engine, reader_css, strlen(reader_css))
+                    && browser_engine_activate_reader_view(engine);
+            } else {
+                ok = reader_active && browser_engine_apply_user_css(
+                    engine, user_css, user_css == NULL ? 0 : strlen(user_css));
+            }
+            if (ok) {
+                reader_active = enable;
+                browser_engine_set_reader_candidate_mode(engine, enable);
+                if (have_anchor) {
+                    (void) browser_engine_restore_text_anchor(
+                        engine, anchor_before, anchor_y);
+                }
+                entry = navigation_current(navigation);
+                int scroll_after = entry == NULL ? 0 : entry->scroll_y;
+                bool after_anchor = browser_engine_capture_text_anchor(
+                    engine, anchor_after, &ignored_y);
+                printf("loop-reader mode=%s before-y=%d after-y=%d "
+                       "anchor-before=\"%s\" anchor-after=\"%s\"\n",
+                       enable ? "reader" : "raw", scroll_before,
+                       scroll_after, have_anchor ? anchor_before : "",
+                       after_anchor ? anchor_after : "");
+            }
         } else if (strcmp(line, "go") == 0 && argument != NULL) {
             bool handled = false;
             ok = experimental_anchor_reference(

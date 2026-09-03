@@ -16,6 +16,7 @@
 
 #include "tilefinch/platform.h"
 #include "tilefinch/font.h"
+#include "tilefinch/media_discovery.h"
 #include "tilefinch/url.h"
 
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_DOM, (s))
@@ -141,6 +142,63 @@ static lxb_html_token_t *document_parser_token(
 {
     DocumentParser *parser = opaque;
     lxb_html_tree_t *tree = parser->original_token_context;
+    if (tree != NULL && token->tag_id == LXB_TAG__TEXT) {
+        lxb_dom_node_t *current = lxb_html_tree_current_node(tree);
+        if (current != NULL && current->local_name == LXB_TAG_SCRIPT) {
+            size_t type_length = 0;
+            const char *type = document_attribute(
+                current, "type", &type_length);
+            bool json_ld = type != NULL && type_length == 19u
+                && strncasecmp(
+                       type, "application/ld+json", type_length) == 0;
+            size_t length = (size_t) (token->text_end - token->text_start);
+            if (parser->discard_inert_script_text) {
+                bool preserve = json_ld
+                    && length <= parser->maximum_json_script_bytes
+                    && parser->retained_json_script_bytes
+                           <= parser->maximum_json_script_bytes - length;
+                if (preserve) {
+                    parser->retained_json_script_bytes += length;
+                } else {
+                    token->text_start = token->text_end;
+                }
+            } else if (parser->scripting_enabled && !json_ld
+                       && parser->maximum_inline_script_bytes != 0u) {
+                if (parser->current_script_node != current) {
+                    parser->current_script_node = current;
+                    parser->retained_current_script_bytes = 0u;
+                }
+                bool truncated = false;
+                for (size_t at = 0; at < parser->truncated_script_count;
+                     at++) {
+                    if (parser->truncated_script_nodes[at] == current) {
+                        truncated = true;
+                        break;
+                    }
+                }
+                bool pressure = budget_pressure_required(
+                    parser->budget, length, 1024u * 1024u);
+                if (!truncated
+                    && (pressure
+                        || length > parser->maximum_inline_script_bytes
+                        || parser->retained_current_script_bytes
+                               > parser->maximum_inline_script_bytes
+                                     - length)) {
+                    if (parser->truncated_script_count
+                        < sizeof(parser->truncated_script_nodes)
+                              / sizeof(parser->truncated_script_nodes[0])) {
+                        parser->truncated_script_nodes[
+                            parser->truncated_script_count++] = current;
+                    } else {
+                        parser->truncated_script_overflow = true;
+                    }
+                    truncated = true;
+                }
+                if (truncated) token->text_start = token->text_end;
+                else parser->retained_current_script_bytes += length;
+            }
+        }
+    }
     bool record_form_owner = tree != NULL && tree->form != NULL
         && (token->type & LXB_HTML_TOKEN_TYPE_CLOSE) == 0
         && document_parser_form_associated_tag(token->tag_id);
@@ -544,6 +602,39 @@ bool document_parser_set_scripting(DocumentParser *parser, bool enabled)
     if (html_parser == NULL) return false;
     lxb_html_parser_scripting_set(html_parser, enabled);
     lxb_html_document_scripting_set(parser->document.html, enabled);
+    parser->scripting_enabled = enabled;
+    return true;
+}
+
+bool document_parser_set_inert_script_policy(
+    DocumentParser *parser, bool discard, size_t maximum_json_bytes,
+    size_t maximum_inline_script_bytes)
+{
+    if (parser == NULL || !parser->active || parser->bytes_fed != 0) {
+        return false;
+    }
+    parser->discard_inert_script_text = discard;
+    parser->maximum_json_script_bytes = maximum_json_bytes;
+    parser->maximum_inline_script_bytes = maximum_inline_script_bytes;
+    parser->retained_json_script_bytes = 0;
+    return true;
+}
+
+bool document_parser_script_was_truncated(
+    const DocumentParser *parser, const lxb_dom_node_t *script)
+{
+    if (parser == NULL || script == NULL) return false;
+    if (parser->truncated_script_overflow) return true;
+    for (size_t at = 0; at < parser->truncated_script_count; at++) {
+        if (parser->truncated_script_nodes[at] == script) return true;
+    }
+    return false;
+}
+
+bool document_parser_discard_remaining_script_text(DocumentParser *parser)
+{
+    if (parser == NULL || !parser->active) return false;
+    parser->discard_inert_script_text = true;
     return true;
 }
 
@@ -1815,6 +1906,7 @@ void document_destroy(PocDocument *document)
         return;
     }
     if (document->budget != NULL) {
+        media_declared_video_cache_destroy(document);
         DocumentControlState *state = document->control_states;
         while (state != NULL) {
             DocumentControlState *next = state->next;

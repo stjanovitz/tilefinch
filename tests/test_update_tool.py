@@ -51,6 +51,7 @@ class UpdateToolTests(unittest.TestCase):
             slot = work / "slot"
             (slot / "fonts").mkdir(parents=True)
             (slot / "EBOOT.PBP").write_bytes(b"test-eboot")
+            (slot / "tilefinch-wasm.prx").write_bytes(b"test-wamr")
             (slot / "fonts" / "ui.ttf").write_bytes(b"test-font")
             package = work / "tilefinch.tfup"
             self.command("pack", "--directory", slot, "--output", package)

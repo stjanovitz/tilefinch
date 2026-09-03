@@ -54,6 +54,21 @@ void js_rt_record_network_response(ScriptResult *result,
                              const FetchResult *fetched)
 {
     if (result == NULL || fetched == NULL) return;
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_NETWORK_RESPONSES") != NULL) {
+        size_t shown = fetched->length < 64u ? fetched->length : 64u;
+        fprintf(stderr,
+                "tilefinch-network-response: status=%ld bytes=%zu "
+                "url=\"%s\" body-prefix-hex=\"",
+                fetched->status_code, fetched->length,
+                fetched->effective_url);
+        for (size_t i = 0; i < shown; i++) {
+            fprintf(stderr, "%02x", (unsigned char) fetched->data[i]);
+        }
+        fprintf(stderr, "\" truncated=%d\n",
+                fetched->length > shown ? 1 : 0);
+    }
+#endif
     result->last_network_status = fetched->status_code;
     snprintf(result->last_network_url, sizeof(result->last_network_url), "%s",
              fetched->effective_url);
@@ -144,7 +159,7 @@ void js_rt_script_set_response_body(JSContext *context, JSValue response,
    timelines run to several megabytes.  The per-response cap scales with the
    configured script file budget so constrained profiles keep their
    small reservations while SPA-sized budgets admit real payloads. */
-#define JS_FETCH_MAXIMUM_BYTES (512u * 1024u)
+#define JS_FETCH_MAXIMUM_BYTES (1024u * 1024u)
 static size_t js_fetch_response_limit(const DomBridge *bridge)
 {
     size_t limit = JS_FETCH_MAXIMUM_BYTES;
@@ -154,7 +169,6 @@ static size_t js_fetch_response_limit(const DomBridge *bridge)
     }
     return limit;
 }
-#define JS_FETCH_MAXIMUM_BODY (64u * 1024u)
 #define JS_FETCH_MAXIMUM_HEADERS (8u * 1024u)
 
 typedef struct {
@@ -796,9 +810,9 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
     } else {
         request_valid = fetch_request_validate(&request, &validation);
     }
-    char url[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char url[TILEFINCH_URL_SERIALIZED_LIMIT] = {0};
     bool valid = valid_policy && request_valid && reference_exact
-                 && body_length <= JS_FETCH_MAXIMUM_BODY
+                 && body_length <= FETCH_REQUEST_BODY_LIMIT
                  && extra_headers_length <= JS_FETCH_MAXIMUM_HEADERS
                  && tilefinch_url_resolve(bridge->document_url, reference, url,
                                        sizeof(url));
@@ -999,9 +1013,9 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
     } else {
         request_valid = fetch_request_validate(&request, &validation);
     }
-    char url[TILEFINCH_URL_SERIALIZED_LIMIT];
+    char url[TILEFINCH_URL_SERIALIZED_LIMIT] = {0};
     bool valid = request_valid && reference_exact
-                 && body_length <= JS_FETCH_MAXIMUM_BODY
+                 && body_length <= FETCH_REQUEST_BODY_LIMIT
                  && extra_headers_length <= JS_FETCH_MAXIMUM_HEADERS
                  && tilefinch_url_resolve(bridge->document_url, reference, url,
                                        sizeof(url))
@@ -1059,6 +1073,16 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
             bridge->fetch_scheduler, url, &request,
             js_fetch_response_limit(bridge), scheduler_timeout_ms)
         : 0;
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_NETWORK_RESPONSES") != NULL) {
+        fprintf(stderr,
+                "tilefinch-network-request: id=%llu method=%.*s "
+                "mode=%d credentials=%d body-bytes=%zu url=\"%s\"\n",
+                (unsigned long long) id, (int) method_length, method,
+                (int) request_mode, (int) credentials, body_length,
+                url[0] == '\0' ? "<invalid>" : url);
+    }
+#endif
     JS_FreeCString(context, method);
     JS_FreeCString(context, reference);
     if (body_is_cstring && body != NULL) JS_FreeCString(context, body);
@@ -2336,6 +2360,12 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
         }
         task->state = SCRIPT_DYNAMIC_READY;
         task->success = accepted;
+        if (accepted) {
+            task->resource_timing.cache_hit = true;
+            task->resource_timing.decoded_body_bytes =
+                cached->length > UINT32_MAX
+                    ? UINT32_MAX : (uint32_t) cached->length;
+        }
         if (accepted && bridge->result != NULL) {
             js_rt_saturating_add_size(
                 &bridge->result->dynamic_scripts_cache_hits, 1);
@@ -2576,6 +2606,19 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
         js_rt_script_store_response_cookies(
             bridge, fetched, task->request_url, task->mode,
             task->credentials, TILEFINCH_DESTINATION_SCRIPT);
+        task->resource_timing.measured =
+            fetched->transport_timing.measured;
+        task->resource_timing.cache_hit = fetched->status_code == 304;
+        task->resource_timing.name_lookup_us =
+            fetched->transport_timing.name_lookup_us;
+        task->resource_timing.connect_us =
+            fetched->transport_timing.connect_us;
+        task->resource_timing.appconnect_us =
+            fetched->transport_timing.appconnect_us;
+        task->resource_timing.first_byte_us =
+            fetched->transport_timing.first_byte_us;
+        task->resource_timing.total_us =
+            fetched->transport_timing.total_us;
     }
     if (success && fetched->status_code != 304) {
         if (task->module) {
@@ -2618,6 +2661,10 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
     if (success) {
         success = dynamic_task_take_source(bridge, task, body, length);
         body = NULL;
+        if (success) {
+            task->resource_timing.decoded_body_bytes =
+                length > UINT32_MAX ? UINT32_MAX : (uint32_t) length;
+        }
     }
     if (!success) {
         js_rt_bridge_script_quota_abort(bridge, &task->quota_reservation);
@@ -2706,6 +2753,7 @@ static bool dynamic_runtime_failure_is_fatal(const ScriptRuntime *runtime,
 {
     if (runtime == NULL) return true;
     return runtime->watchdog.interrupted
+        || runtime->document_refresh_failed_after_mutation
         || runtime->budget->failure_count != failures_before;
 }
 
@@ -2821,6 +2869,12 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
                 ? "" : (const char *) selected->source_body->data;
             const char *source_url = selected->response_url == NULL
                 ? selected->request_url : selected->response_url;
+            if (!selected->resource_timing_recorded) {
+                selected->resource_timing_recorded = true;
+                (void) script_runtime_record_resource_timing_details(
+                    runtime, source_url, "script",
+                    &selected->resource_timing);
+            }
             ScriptLazyWebpackPlan lazy_plan;
             bool has_lazy_plan = !selected->module
                 && selected->source_body != NULL
@@ -2983,10 +3037,6 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
                 } else {
                     fatal = dynamic_runtime_failure_is_fatal(
                         runtime, failures_before);
-                }
-                if (!fatal) {
-                    (void) script_runtime_record_resource_timing(
-                        runtime, source_url, "script");
                 }
             }
         }

@@ -175,7 +175,8 @@ bool browser_session_init(BrowserSession *session, Budget *budget,
                                 + sizeof(session->cookies)
                                 + sizeof(session->cache)
                                 + sizeof(session->site_adapter_state)
-                                + sizeof(session->site_adapter_document_cache);
+                                + sizeof(session->site_adapter_document_cache)
+                                + sizeof(session->client_hints);
     if (!budget_reservation_acquire(
             &session->accounting_reservation, budget,
             BUDGET_CATEGORY_SESSION, session->accounting_bytes)) {
@@ -194,6 +195,82 @@ void browser_session_set_site_data_allowed(
 bool browser_session_site_data_allowed(const BrowserSession *session)
 {
     return session == NULL || session->site_data_allowed;
+}
+
+static size_t client_hint_next_stamp(BrowserSession *session)
+{
+    if (session->client_hint_clock != SIZE_MAX) {
+        return ++session->client_hint_clock;
+    }
+    size_t next = 1;
+    for (size_t i = 0; i < BROWSER_CLIENT_HINT_ORIGIN_LIMIT; i++) {
+        BrowserClientHintEntry *entry = &session->client_hints[i];
+        if (entry->valid) entry->stamp = next++;
+    }
+    session->client_hint_clock = next;
+    return next;
+}
+
+bool browser_session_client_hints_put(
+    BrowserSession *session, const char *url, const char *tokens)
+{
+    if (session == NULL || session->budget == NULL
+        || session->captive_portal_stash != NULL || url == NULL
+        || tokens == NULL || tokens[0] == '\0'
+        || strlen(tokens) >= BROWSER_CLIENT_HINT_TOKEN_LIMIT
+        || !tilefinch_url_potentially_trustworthy(url)) return false;
+    char origin[BROWSER_ORIGIN_LIMIT];
+    if (!copy_origin(url, origin)) return false;
+    BrowserClientHintEntry *entry = NULL;
+    BrowserClientHintEntry *victim = NULL;
+    for (size_t i = 0; i < BROWSER_CLIENT_HINT_ORIGIN_LIMIT; i++) {
+        BrowserClientHintEntry *candidate = &session->client_hints[i];
+        if (candidate->valid && strcmp(candidate->origin, origin) == 0) {
+            entry = candidate;
+            break;
+        }
+        if (!candidate->valid) {
+            if (victim == NULL || victim->valid) victim = candidate;
+        } else if (victim == NULL
+                   || (victim->valid && candidate->stamp < victim->stamp)) {
+            victim = candidate;
+        }
+    }
+    if (entry == NULL) entry = victim;
+    if (entry == NULL) return false;
+    snprintf(entry->origin, sizeof(entry->origin), "%s", origin);
+    snprintf(entry->tokens, sizeof(entry->tokens), "%s", tokens);
+    entry->stamp = client_hint_next_stamp(session);
+    entry->valid = true;
+    return true;
+}
+
+bool browser_session_client_hints_get(
+    BrowserSession *session, const char *url, char *tokens,
+    size_t tokens_capacity, char *origin, size_t origin_capacity)
+{
+    if (tokens != NULL && tokens_capacity != 0) tokens[0] = '\0';
+    if (origin != NULL && origin_capacity != 0) origin[0] = '\0';
+    if (session == NULL || session->budget == NULL
+        || session->captive_portal_stash != NULL || url == NULL
+        || tokens == NULL || tokens_capacity == 0
+        || origin == NULL || origin_capacity == 0
+        || !tilefinch_url_potentially_trustworthy(url)) return false;
+    char wanted[BROWSER_ORIGIN_LIMIT];
+    if (!copy_origin(url, wanted)) return false;
+    for (size_t i = 0; i < BROWSER_CLIENT_HINT_ORIGIN_LIMIT; i++) {
+        BrowserClientHintEntry *entry = &session->client_hints[i];
+        if (!entry->valid || strcmp(entry->origin, wanted) != 0) continue;
+        size_t token_length = strlen(entry->tokens);
+        size_t origin_length = strlen(entry->origin);
+        if (token_length >= tokens_capacity
+            || origin_length >= origin_capacity) return false;
+        memcpy(tokens, entry->tokens, token_length + 1u);
+        memcpy(origin, entry->origin, origin_length + 1u);
+        entry->stamp = client_hint_next_stamp(session);
+        return true;
+    }
+    return false;
 }
 
 bool browser_session_site_adapter_state_put(
@@ -1379,7 +1456,8 @@ static bool cookie_set(BrowserCookieStore *store,
         remove = true;
     }
     if (getenv("TILEFINCH_TRACE_COOKIE") != NULL) {
-        fprintf(stderr, "cookie-store name=%s remove=%d expires-valid=%d expires-delta=%lld max-age-valid=%d\n",
+        fprintf(stderr, "cookie-store host=%s domain=%s path=%.*s name=%s remove=%d expires-valid=%d expires-delta=%lld max-age-valid=%d\n",
+                parsed.host, domain, (int) path_length, path,
                 name, remove, expires_valid,
                 (long long) (expires_valid ? expires_at - now : 0),
                 max_age_valid);

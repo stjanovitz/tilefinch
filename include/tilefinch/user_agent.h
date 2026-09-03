@@ -1,6 +1,8 @@
 #ifndef TILEFINCH_USER_AGENT_H
 #define TILEFINCH_USER_AGENT_H
 
+#include "tilefinch/build_version.h"
+
 /*
  * Keep network and JavaScript identity aligned.  The iPhone/WebKit/Safari
  * fields are compatibility tokens, as in mainstream browser user agents;
@@ -15,6 +17,6 @@
 
 #define TILEFINCH_BROWSER_BRAND "Tilefinch"
 #define TILEFINCH_BROWSER_BRAND_VERSION "0.1"
-#define TILEFINCH_BROWSER_FULL_VERSION "0.1.2"
+#define TILEFINCH_BROWSER_FULL_VERSION TILEFINCH_VERSION_STRING
 
 #endif

@@ -1,0 +1,6 @@
+tick 420 100
+status
+reload
+tick 120 100
+status
+quit

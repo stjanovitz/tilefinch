@@ -471,6 +471,7 @@ static bool test_late_script_oom_frees_queued_frame_messages(void)
         frame->runtime = script_runtime_create(
             &frame->document, &budget, 2u * MIB, 1000,
             "https://queued-oom-child.test/", &frame->script_result);
+        frame->parent_runtime = navigation.page.runtime;
         frame->element = anchor;
         frame->parent_handle = anchor_handle;
         frame->lifecycle_generation = 1u;
@@ -515,8 +516,12 @@ static bool test_late_script_oom_frees_queued_frame_messages(void)
        frame-progress pump also drains messages when a scheduler is attached. */
     FetchScheduler *scheduler = navigation.page.resource_scheduler;
     navigation.page.resource_scheduler = NULL;
+    /* Do not advance the synthetic author's next timer before reaching the
+       delivery point this test owns.  A zero-time turn still drains queued
+       cross-frame messages, making the intended oversized-message OOM—not
+       unrelated timer scheduling—the deterministic retirement trigger. */
     bool retired = queued
-        && navigation_advance_runtime(&navigation, 2, 4);
+        && navigation_advance_runtime(&navigation, 0, 4);
     navigation.page.resource_scheduler = scheduler;
     bool freed = retired && navigation.page.runtime == NULL
         && navigation.page.message_count == 0u
@@ -812,7 +817,11 @@ static bool test_streaming_dynamic_stylesheets_are_not_adopted(void)
         && navigation_init(&navigation, &budget, 4);
     if (navigation_ready) {
         navigation_attach_browser_session(&navigation, &browser);
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        /* This fixture combines the full standards bootstrap, a mutating
+           inline script, and two stylesheet event checkpoints.  Preserve a
+           small test-only reserve so it remains a stylesheet-ordering test. */
+        navigation_enable_scripts(
+            &navigation, 2 * MIB + 64u * 1024u, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation_enable_external_resources(
@@ -901,7 +910,8 @@ static bool test_dynamic_stylesheet_event_rescan_is_reentrant_safe(void)
         && navigation_init(&navigation, &budget, 4);
     if (navigation_ready) {
         navigation_attach_browser_session(&navigation, &browser);
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(
+            &navigation, 2 * MIB + 64u * 1024u, 1000);
         navigation_enable_external_resources(
             &navigation, 4, 64 * 1024, 16 * 1024,
             1, 16 * 1024, 16 * 1024, 64 * 1024, 1000);
@@ -960,7 +970,8 @@ static bool test_stylesheet_event_microtask_exception_is_nonfatal(void)
         && navigation_init(&navigation, &budget, 4);
     if (navigation_ready) {
         navigation_attach_browser_session(&navigation, &browser);
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(
+            &navigation, 2 * MIB + 64u * 1024u, 1000);
         navigation_enable_external_resources(
             &navigation, 4, 64 * 1024, 16 * 1024,
             1, 16 * 1024, 16 * 1024, 64 * 1024, 1000);
@@ -1029,7 +1040,8 @@ static bool test_dynamic_stylesheet_href_base_and_reinsert_lifecycle(void)
         && navigation_init(&navigation, &budget, 4);
     if (navigation_ready) {
         navigation_attach_browser_session(&navigation, &browser);
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_scripts(
+            &navigation, 2 * MIB + 64u * 1024u, 1000);
         navigation_enable_external_resources(
             &navigation, 4, 64 * 1024, 16 * 1024,
             1, 16 * 1024, 16 * 1024, 64 * 1024, 1000);

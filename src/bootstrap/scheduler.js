@@ -630,12 +630,21 @@
         inputType: name === "input" ? "insertText" : "",
       });
     else if (name.startsWith("key")) event = new KeyboardEvent(name, options);
-    else if (name.startsWith("pointer"))
+    else if (name.startsWith("pointer") || name === "click") {
+      const clickFromPointer =
+        name === "click" && options.pointerId !== undefined;
       event = new PointerEvent(name, {
         ...options,
-        pointerType: "mouse",
-        isPrimary: true,
+        pointerType:
+          name === "click" && !clickFromPointer ? "" : "mouse",
+        pointerId: name === "click" && !clickFromPointer ? -1 : options.pointerId,
+        isPrimary: name !== "click" || clickFromPointer,
+        detail:
+          name === "click"
+            ? clickFromPointer ? 1 : 0
+            : 0,
       });
+    }
     else if (
       name === "focus" ||
       name === "blur" ||
@@ -646,10 +655,10 @@
     else if (name.startsWith("composition"))
       event = new CompositionEvent(name, options);
     else if (name === "submit") event = new SubmitEvent(name, options);
-    else if (name === "click" || name.startsWith("mouse"))
+    else if (name.startsWith("mouse"))
       event = new MouseEvent(name, {
         ...options,
-        detail: name === "click" ? 1 : 0,
+        detail: 0,
       });
     else event = new Event(name, options);
     return trusted(event);
@@ -914,6 +923,14 @@
       }
     };
     if (phase === 5) return clickDefault();
+    /* Controller activation is keyboard-like, not a fabricated pointer
+       gesture.  Pointer Events requires its click to use pointerId -1 and an
+       empty pointerType; low-level pointer/mouse events are reserved for the
+       actual pointer path above. */
+    if (phase === 0) {
+      if (typeof target.focus === "function") target.focus();
+      return clickDefault();
+    }
     const pointerAccepted = fire("pointerdown"),
       mouseAccepted = fire("mousedown");
     if (pointerAccepted && mouseAccepted && typeof target.focus === "function")

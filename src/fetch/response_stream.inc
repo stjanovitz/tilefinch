@@ -301,6 +301,20 @@ static bool curl_global_release(void)
         curl_global_cleanup();
         (void) budget_concurrent_pool_metrics(
             &curl_concurrent_pool, &curl_last_pool_metrics);
+#if !defined(__PSP__)
+        if (getenv("TILEFINCH_TRACE_CURL_POOL") != NULL) {
+            fprintf(stderr,
+                    "tilefinch-curl-pool: limit=%zu peak=%zu current=%zu "
+                    "active=%zu allocations=%zu frees=%zu failures=%zu\n",
+                    curl_last_pool_metrics.limit,
+                    curl_last_pool_metrics.peak,
+                    curl_last_pool_metrics.current,
+                    curl_last_pool_metrics.active_allocations,
+                    curl_last_pool_metrics.allocation_count,
+                    curl_last_pool_metrics.free_count,
+                    curl_last_pool_metrics.failure_count);
+        }
+#endif
         if (!budget_concurrent_pool_destroy(&curl_concurrent_pool)) {
             char cleanup_error[192];
             snprintf(

@@ -230,6 +230,7 @@ tree="$root/build-preset-psp/tilefinch-install/Tilefinch"
 for required in \
     "$tree/EBOOT.PBP" \
     "$tree/slot-a/EBOOT.PBP" \
+    "$tree/slot-a/tilefinch-wasm.prx" \
     "$tree/OPTIONAL/tilefinch_xmb.prx" \
     "$tree/slot-a/roots.pem" \
     "$tree/slot-a/boot-defaults.cfg"
@@ -271,6 +272,7 @@ step "Checking staged binaries for local build paths"
 for binary in \
     "$tree/EBOOT.PBP" \
     "$tree/slot-a/EBOOT.PBP" \
+    "$tree/slot-a/tilefinch-wasm.prx" \
     "$tree/OPTIONAL/tilefinch_xmb.prx"
 do
     if LC_ALL=C grep -aFq "$root/" "$binary"; then

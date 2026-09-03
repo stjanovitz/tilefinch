@@ -56,4 +56,4 @@ tilefinch-input-script: covered action=exit count=1
 tilefinch-input-script: covered setting=browser-ui-scale count=1
 tilefinch-input-script: covered setting=page-font-percent count=1
 tilefinch-input-script: covered setting=reader-font count=1
-tilefinch-input-script: outcome=exit-action steps=89/93 frames=390 held-frames=79 actions=16 settings=3
+tilefinch-input-script: outcome=exit-action steps=89/93 frames=390 held-frames=78 actions=16 settings=3

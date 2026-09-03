@@ -12,6 +12,75 @@ values are bytes, pixels, counts, or microseconds as named. Authors should use
 feature detection and queried WebGL limits at runtime; the JSON is for build
 tools, coding agents, and preflight checks, not page fingerprinting.
 
+## What compatibility means
+
+Game Profile v1 is a portable baseline, not a promise that every browser API
+Tilefinch exposes is suitable for a game. A game may call itself **Tilefinch
+Game Profile v1 compatible** when it:
+
+- remains playable at 480×272 using only the reliable or bounded features
+  documented here;
+- handles every documented refusal and resource ceiling without hanging,
+  retrying forever, or trapping browser controls;
+- has a keyboard or focusable-menu path before Page controls are captured;
+- can launch from an installed snapshot with networking unavailable; and
+- passes the host and physical-device checks in the qualification checklist.
+
+The words **reliable**, **bounded**, and **outside v1** are deliberate:
+
+| Label | Author expectation |
+|---|---|
+| Reliable | The ordinary path is supported and should be used directly after feature detection. |
+| Bounded | The API works only inside the stated count, byte, geometry, or lifetime ceiling; refusal is part of the contract. |
+| Outside v1 | Do not make it necessary for play. A future Tilefinch build may support it, but a v1 game needs a fallback today. |
+
+Tilefinch may add capabilities without changing this profile. Authors should
+not infer profile support from the user agent or a Tilefinch-specific version
+number. Detect the API, query WebGL limits, and keep the v1 fallback. A future
+incompatible profile revision will use a new profile identifier and machine
+file rather than silently changing these ceilings.
+
+## Quick-start recipe
+
+For a new game, this is the shortest path to a good PSP build:
+
+1. Design the complete interface at 480×272 and make the initial Play, Help,
+   and settings controls ordinary focusable HTML.
+2. Choose one primary renderer: Canvas 2D for sprite- or path-oriented games,
+   or WebGL for retained 3D geometry. Keep a static help fallback.
+3. Allocate entity pools, matrices, command records, particles, and audio
+   voices once. Reuse them for the whole session.
+4. Start audio, fullscreen, and Page controls only from the Play activation.
+   Keep Start+Select reserved for Tilefinch.
+5. Run one `requestAnimationFrame()` chain with at most one bounded simulation
+   step per callback. Never replay a backlog of missed steps.
+6. Keep steady WebGL frames structurally stable: upload static assets once,
+   update changed prefixes with `bufferSubData()`, and batch repeated actors.
+7. Put every install-critical asset on the same HTTPS origin, provide a Web
+   App Manifest, and test the saved package with Wi-Fi unavailable.
+8. Run the pressure profile and a physical-PSP action soak before describing
+   the game as compatible.
+
+As a safe first target, use a 320×180 backing surface, one texture atlas or no
+textures, fewer than 32 active actors/effects, three or fewer steady WebGL
+draws, short PCM effects, and no DOM mutation during gameplay. These are
+starting recommendations rather than new hard limits.
+
+### Choosing a renderer
+
+| Game shape | Recommended path | Avoid in the frame loop |
+|---|---|---|
+| Brick-breaker, board game, simple sprites | Canvas 2D or small WebGL scene | pixel readback, export, DOM HUD updates |
+| Charts, vector controls, drawing game | Canvas 2D retained paths/text | rebuilding long paths and shadows every frame |
+| Top-down or modest 3D action | WebGL retained meshes plus bounded instancing | per-actor draw calls, buffer replacement, changing render state |
+| Large maps, video processing, shader-heavy effects | Reduce the design or provide a static fallback | full-screen pixel processing, general GLSL, large streamed worlds |
+
+The included [Prism Break 3D](../examples/prism-break-3d/) example is the
+small-scene starting point. [Treadline Arena](../examples/treadline-arena/)
+shows the upper end of the intended profile: retained arena geometry, a fixed
+64-instance stream, an in-canvas HUD, pooled audio, installed-offline startup,
+and a measured physical-device soak.
+
 ## Target and budgets
 
 The target display is 480×272. The shipping PSP memory profile gives the whole
@@ -21,6 +90,12 @@ WebGL resources, layout, render data, and session state share the page budget.
 Reaching one subsystem's local limit does not imply that the remaining page
 budget is available, and a budget refusal is a normal result a game must
 survive.
+
+Keep each classic game script at or below the 384 KiB Game Profile admission
+ceiling. Installed apps may precompile at most eight classic scripts and 512
+KiB of admitted source in aggregate; the source remains packaged as the
+engine-version-independent fallback. Splitting code can improve maintenance,
+but it does not expand the aggregate JavaScript heap or installation budget.
 
 For animation, treat 16.67 ms as the aspirational 60 Hz frame time and 33.33 ms
 as the maximum steady 30 Hz frame time. Device qualification separately counts
@@ -204,6 +279,28 @@ Detached canvases remain valid offscreen drawing and readback sources, but they
 do not publish page damage until reconnected. A game must not poll or spin while
 waiting for publication, audio activation, Gamepad capture, or restoration.
 
+### Refusal and recovery contract
+
+Every constrained operation needs a finite failure path. In particular:
+
+- if WebGL creation, shader compilation, linking, allocation, or restoration
+  fails, stop issuing WebGL commands and switch to Canvas 2D or the static help
+  surface;
+- if an optional effect exceeds an instance, particle, voice, or command pool,
+  drop that effect before a player, projectile, input sample, or required UI;
+- if audio activation is refused, continue silently and offer a later
+  focusable **Enable audio** action rather than retrying every frame;
+- if Page-controls or fullscreen is refused, preserve keyboard/focus controls
+  and keep the browser escape instructions visible;
+- if an installed resource is unavailable, show which optional feature is
+  missing and keep the package launchable; and
+- after context loss, rebuild from retained CPU-side assets only once. A
+  failed restoration becomes the renderer fallback, not another loss loop.
+
+Use a single game-owned status surface for these messages. Do not replace the
+document with an error-only page: Play/Retry, Help, renderer fallback, and exit
+must remain reachable.
+
 ## Performance recipes
 
 - Prefer a 320×180 or 240×136 backing buffer scaled to the 480×272 display.
@@ -309,6 +406,25 @@ multiplayer action.
 
 See [Offline library](OFFLINE_LIBRARY.md) for the storage and integrity model.
 
+### Installation preflight
+
+Before shipping an installable package, verify all of the following from the
+installation preview rather than only from a live server:
+
+- the name, icon, display mode, theme color, start URL, and scope are correct;
+- every required HTML, CSS, script, image, font, and PCM effect is captured and
+  same-origin;
+- unavailable resources are genuinely optional and produce a useful in-game
+  explanation;
+- the estimated resource pack fits with headroom for compiled-script metadata;
+- launch reaches a responsive menu before optional audio or networking work;
+- Update and Reinstall preserve intended local preferences; and
+- uninstall removes the package while a subsequent fresh install still boots.
+
+Installed bytecode is an optimization, never the source of truth. Do not bind
+your own package format to a Tilefinch version: Tilefinch validates its stored
+compiler ABI and recompiles from the packaged source when necessary.
+
 ## Progressive fallback
 
 Use this order:
@@ -349,6 +465,19 @@ Before describing a game as Game Profile v1 compatible:
 - install from the preview, inspect missing resources and estimated size,
   launch with networking unavailable, update/reinstall, and uninstall;
 - confirm teardown returns page-owned `Budget` memory to its baseline.
+
+Record the tested Tilefinch commit or release, game package digest, memory
+profile, PSP model, CPU clock, soak duration, peak page/QuickJS ownership,
+median/p95/maximum presented-frame time, and every frame above 34 ms. A claim
+based only on average FPS or PPSSPP is incomplete. Re-run the device soak after
+changing renderer structure, asset size, collision/effects load, audio graph,
+or installed-package startup.
+
+Recommended compatibility statement for a game README:
+
+> Targets Tilefinch Game Profile v1 at 480×272. Qualified with the strict host
+> pressure profile and a physical-PSP action soak; see the project notes for
+> the tested release, package digest, memory high-water mark, and frame tail.
 
 The focused host lane and device procedure are in
 [Development](DEVELOPMENT.md#canvas-and-webgl-game-qualification). The

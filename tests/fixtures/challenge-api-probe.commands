@@ -1,0 +1,10 @@
+tick 20 100
+js JSON.stringify(challengeProbe.performance)
+js JSON.stringify(challengeProbe.screen)
+js JSON.stringify(challengeProbe.navigator)
+js JSON.stringify(challengeProbe.document)
+js JSON.stringify(challengeProbe.messageEvent)
+js JSON.stringify(challengeProbe.performanceObserver)
+js JSON.stringify(challengeProbe.worker)
+status
+quit

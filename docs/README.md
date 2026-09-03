@@ -40,6 +40,9 @@ Tilefinch's documentation has three layers:
   [JSON companion](tilefinch-game-profile-v1.json) is machine-readable.
 - [WebGL authoring](WEBGL.md): the PSP-efficient shader, resource, animation,
   input, and offline-packaging profile for small games and charts.
+- [Bounded WebAssembly](WEBASSEMBLY.md): the standards-facing JavaScript API,
+  PSP ceilings, lazy runtime component, and deliberately unsupported
+  proposals/import kinds.
 - [Direct multiplayer](MULTIPLAYER.md): the RTCDataChannel-shaped installed-game
   API, LAN discovery, numeric invites, UDP hole punching, bounds, and limits.
 - [Offline library](OFFLINE_LIBRARY.md): bounded Reader snapshots and

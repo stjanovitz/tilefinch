@@ -1566,7 +1566,7 @@ static bool script_execute_inline_admitted(
                 metrics->failed++;
                 metrics->execution_failures++;
                 (void) script_runtime_collect_and_trim(runtime);
-                return true;
+                return !script_runtime_document_refresh_failed(runtime);
             }
             /* The allocation-free scan is conservative, while JS_ParseJSON
                remains authoritative. An ambiguity receives normal script
@@ -1586,7 +1586,7 @@ static bool script_execute_inline_admitted(
             runtime, budget, node, module, false, metrics)) {
         metrics->failed++;
     }
-    return true;
+    return !script_runtime_document_refresh_failed(runtime);
 }
 
 static bool script_admit_inline_node(ScriptRuntime *runtime, Budget *budget,
@@ -2284,7 +2284,7 @@ static bool execute_external_node_live(
         live_base = base_url;
         script_runtime_invalidate_document_base(runtime);
     }
-    return execute_external_node(
+    bool executed = execute_external_node(
         runtime, budget, session, scheduler, node, live_base,
         live_document_url,
         referrer_policy,
@@ -2292,6 +2292,7 @@ static bool execute_external_node_live(
         module, executable_precounted,
         maximum_total_bytes, maximum_file_bytes,
         timeout_ms, metrics, NULL);
+    return executed && !script_runtime_document_refresh_failed(runtime);
 }
 
 typedef struct {
@@ -3415,6 +3416,9 @@ DocumentScriptProcessResult document_scripts_process_closed(
         ok = script_execute_inline_admitted(
             runtime, budget, element, false, false, true,
             content_security_policy, &state->early);
+    }
+    if (script_runtime_document_refresh_failed(runtime)) {
+        return DOCUMENT_SCRIPT_PROCESS_HARD_FAILURE;
     }
     return ok ? process_result : DOCUMENT_SCRIPT_PROCESS_HARD_FAILURE;
 }

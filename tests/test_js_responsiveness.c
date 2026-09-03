@@ -3,6 +3,7 @@
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/navigation.h"
 #include "tilefinch/sha256.h"
+#include "tilefinch/user_agent.h"
 #include "tilefinch/viewport.h"
 
 #include <stdio.h>
@@ -480,7 +481,7 @@ int main(void)
           && lab.modeled_compile_bytes_per_ms == 0);
     CHECK(script_execution_policy_for_profile(
               SCRIPT_EXECUTION_PROFILE_PSP_STRICT, &strict)
-          && strict.maximum_host_compile_source_bytes == 256u * 1024u
+          && strict.maximum_host_compile_source_bytes == 269u * 1024u
           && strict.maximum_host_compile_projected_us == 0
           && strict.modeled_compile_bytes_per_ms == 0);
     CHECK(script_execution_policy_for_profile(
@@ -702,6 +703,24 @@ int main(void)
                == strict.maximum_host_compile_source_bytes
           && result.nonpreemptible_compile_count == 0
           && result.nonpreemptible_callback_count == 0);
+
+    puts("test: large network delivery enters from the collected heap floor");
+    size_t response_heap_before = script_runtime_heap_remaining(runtime);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "(()=>{for(let i=0;i<256;i++){const cycle={"
+              "pad:'x'.repeat(1024)};cycle.self=cycle;}"
+              "globalThis.pocSummary='NETWORK-PRESSURE-READY'})()",
+              "<network-pressure-setup>", &result)
+          && strcmp(result.summary, "NETWORK-PRESSURE-READY") == 0);
+    size_t response_heap_with_cycles = script_runtime_heap_remaining(runtime);
+    CHECK(response_heap_with_cycles < response_heap_before
+          && js_rt_prepare_network_response_delivery(
+                 runtime, 512u * 1024u - 1u) == 0
+          && script_runtime_heap_remaining(runtime)
+                 == response_heap_with_cycles);
+    (void) js_rt_prepare_network_response_delivery(runtime, 512u * 1024u);
+    CHECK(script_runtime_heap_remaining(runtime) > response_heap_with_cycles);
 
     puts("test: bounded Gamepad API publishes one stable PSP controller");
     CHECK(script_runtime_evaluate_diagnostic(
@@ -2338,6 +2357,27 @@ int main(void)
               "<canvas-native-work-bound-probe>", &result)
           && strcmp(result.summary, "CANVAS-NATIVE-WORK-BOUND-OK") == 0);
 
+    /* A batch is one native call and therefore gets one allowance.  Resetting
+       the allowance for every command lets a bounded 64-command batch multiply
+       the browser-thread stall even though every individual rectangle fits. */
+    static const char canvas_native_batch_work_bound_probe[] =
+        "(()=>{const pixels=new Uint8ClampedArray(512*256*4),"
+        "commands=new Float64Array(64*10);"
+        "for(let i=0;i<64;i++)commands.set([0,0,512,256,i===63?255:0,"
+        "i===63?0:255,0,255,1,1],i*10);"
+        "const completed=__tilefinchCanvasRasterRectBatch(pixels,512,256,commands),"
+        "bounded=pixels[0]===0&&pixels[1]===255,"
+        "continued=__tilefinchCanvasRasterRect(pixels,512,256,0,0,1,1,"
+        "255,0,0,255,1,1);globalThis.pocSummary=completed===2&&bounded&&continued"
+        "&&pixels[0]===255&&pixels[3]===255"
+        "?'CANVAS-NATIVE-BATCH-WORK-BOUND-OK':"
+        "'CANVAS-NATIVE-BATCH-WORK-BOUND-FAILED';})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, canvas_native_batch_work_bound_probe,
+              "<canvas-native-batch-work-bound-probe>", &result)
+          && strcmp(result.summary,
+                    "CANVAS-NATIVE-BATCH-WORK-BOUND-OK") == 0);
+
     static const char class_list_probe[] =
         "(()=>{const node=document.createElement('div');"
         "node.className='one two';const removed=!node.classList.toggle('two'),"
@@ -2421,6 +2461,12 @@ int main(void)
         "quotaPromises.push(fetch('https://example.test/quota/'+i,{"
         "signal:controller.signal}).then(()=>'',error=>error.name));}"
         "await Promise.resolve();const countQuota=await quotaPromises[128];"
+        "let insideXhrSend=true,xhrQuotaError=false,xhrQuotaReentered=false;"
+        "const quotaXhr=new XMLHttpRequest;quotaXhr.open('GET',"
+        "'https://example.test/quota-xhr');quotaXhr.onerror=()=>{"
+        "xhrQuotaError=true;if(insideXhrSend)xhrQuotaReentered=true;};"
+        "quotaXhr.send();insideXhrSend=false;const xhrDeferred="
+        "!xhrQuotaError&&!xhrQuotaReentered;__tilefinchPumpTimers(0,4);"
         "for(const controller of controllers)controller.abort();"
         "await Promise.all(quotaPromises);const byteQuota=await fetch("
         "'https://example.test/byte-quota',{method:'POST',"
@@ -2433,16 +2479,37 @@ int main(void)
         "xhr.ontimeout=()=>{timeoutEvent=true;};xhr.send();"
         "const queuedBeforeTimeout=__tilefinchNetworkQueueStats.waiting===1;"
         "__tilefinchPumpTimers(5,16);for(const controller of blockers)"
-        "controller.abort();await Promise.resolve();const stats="
+        "controller.abort();await Promise.resolve();const uploadEvents=[],"
+        "uploadXhr=new XMLHttpRequest,recordUpload=label=>event=>uploadEvents."
+        "push([label,event.isTrusted,event instanceof ProgressEvent,"
+        "event.lengthComputable,event.loaded,event.total].join(':'));"
+        "for(const type of ['loadstart','progress','load','loadend'])"
+        "uploadXhr.upload.addEventListener(type,recordUpload('u-'+type));"
+        "uploadXhr.addEventListener('loadend',recordUpload('x-loadend'));"
+        "uploadXhr.open('POST','https://example.test/upload');"
+        "uploadXhr.send('abcde');const uploadNative=nextNative-1;"
+        "__tilefinchDeliverNetwork(uploadNative,true,raw);await Promise.resolve();"
+        "const progressShape=new ProgressEvent('shape',{lengthComputable:true,"
+        "loaded:3,total:5}),progressShapeOk=Object.getOwnPropertyNames("
+        "progressShape).join(',')==='isTrusted'&&Object.getOwnPropertyNames("
+        "ProgressEvent.prototype).join(',')==='lengthComputable,loaded,total,constructor'"
+        "&&progressShape.lengthComputable&&progressShape.loaded===3"
+        "&&progressShape.total===5;"
+        "const uploadOk=uploadEvents.join('|')==="
+        "'u-loadstart:true:true:true:0:5|u-progress:true:true:true:5:5|'"
+        "+'u-load:true:true:true:5:5|u-loadend:true:true:true:5:5|'"
+        "+'x-loadend:true:true:true:2:2';const stats="
         "__tilefinchNetworkQueueStats;globalThis.__tilefinchFetchAsync=nativeFetch;"
         "globalThis.__tilefinchCancelNetwork=nativeCancel;"
         "globalThis.pocSummary=fifo&&bodies.every(value=>value==='ok')"
         "&&cancelName==='AbortError'&&countQuota==='RangeError'"
+        "&&xhrDeferred&&xhrQuotaError&&!xhrQuotaReentered"
         "&&abortReleased&&byteQuota==='RangeError'&&queuedBeforeTimeout&&timeoutEvent"
+        "&&uploadOk&&progressShapeOk"
         "&&xhr.readyState===4&&xhr.status===0&&stats.peakCount===128"
-        "&&stats.rejected===2&&stats.rejectedBytes>=1"
+        "&&stats.rejected===3&&stats.rejectedBytes>=1"
         "&&stats.cancelled===139&&stats.timedOut===1"
-        "&&stats.completed===12&&stats.active===0&&stats.waiting===0"
+        "&&stats.completed===13&&stats.active===0&&stats.waiting===0"
         "&&stats.currentCount===0&&cancels.length===13"
         "?'NETWORK-QUEUE-OK':'NETWORK-QUEUE-FAILED:'+JSON.stringify(stats);"
         "})().catch(error=>{globalThis.pocSummary='NETWORK-QUEUE-ERROR:'+"
@@ -2472,15 +2539,91 @@ int main(void)
     }
     CHECK(network_queue_ok
           && strcmp(result.summary, "NETWORK-QUEUE-OK") == 0
-          && result.async_network_logical_admitted == 151
-          && result.async_network_logical_completed == 12
-          && result.async_network_logical_rejected == 2
+          && result.async_network_logical_admitted == 152
+          && result.async_network_logical_completed == 13
+          && result.async_network_logical_rejected == 3
           && result.async_network_logical_cancelled == 139
           && result.async_network_logical_timed_out == 1
           && result.async_network_logical_peak == 128
           && result.async_network_logical_peak_bytes <= 256u * 1024u
           && result.async_network_active_native == 0
           && result.async_network_pending_logical == 0);
+
+    static const char local_blob_network_probe[] =
+        "(()=>{globalThis.pocSummary='LOCAL-BLOB-PENDING';const stats="
+        "__tilefinchNetworkQueueStats,before=[stats.admitted,stats.launched,"
+        "stats.currentCount,stats.localBlobReads,stats.localBlobFailures],"
+        "checks=[],type='application/x-tilefinch-local';"
+        "const fetchBlob=new Blob([new Uint8Array([0,65,255])],{type}),"
+        "fetchURL=URL.createObjectURL(fetchBlob),fetchJob=fetch(fetchURL)"
+        ".then(response=>{checks.push(response.status===200,response.url==="
+        "fetchURL,response.headers.get('content-type')===type,response.body!=="
+        "null);return response.arrayBuffer()}).then(buffer=>checks.push("
+        "new Uint8Array(buffer).join(',')==='0,65,255'));"
+        "URL.revokeObjectURL(fetchURL);const order=[],xhrBlob="
+        "new Blob(['local-xhr'],{type:'text/plain'}),xhrURL="
+        "URL.createObjectURL(xhrBlob),xhrJob=new Promise(resolve=>{const xhr="
+        "new XMLHttpRequest;xhr.onreadystatechange=event=>{order.push(xhr.readyState);"
+        "checks.push(event.isTrusted,event.constructor===Event,"
+        "!(event instanceof ProgressEvent))};xhr.onload=event=>{order.push(5);"
+        "checks.push(event.isTrusted,event instanceof ProgressEvent)};"
+        "xhr.onloadend=event=>{order.push(6);checks.push(event.isTrusted,"
+        "event instanceof ProgressEvent,event.lengthComputable,"
+        "event.loaded===9,event.total===9);"
+        "checks.push(xhr.status===200,xhr.responseURL===xhrURL,"
+        "xhr.getResponseHeader('content-type')==='text/plain',"
+        "new TextDecoder().decode(xhr.response)==='local-xhr',"
+        "order.join(',')==='1,9,2,3,4,5,6');resolve()};xhr.open('GET',xhrURL);"
+        "xhr.responseType='arraybuffer';xhr.send();order.push(9);"
+        "URL.revokeObjectURL(xhrURL)});const stressBlob=new Blob(['local']),"
+        "stressURL=URL.createObjectURL(stressBlob),stress=[];"
+        "for(let i=0;i<8;i++)stress.push(new Promise(resolve=>{const xhr="
+        "new XMLHttpRequest;xhr.onload=()=>resolve(xhr.responseText==='local');"
+        "xhr.onerror=()=>resolve(false);xhr.open('GET',stressURL);xhr.send()}));"
+        "URL.revokeObjectURL(stressURL);const revokedJob=fetch(stressURL)"
+        ".then(()=>false,error=>error instanceof TypeError);Promise.all("
+        "[fetchJob,xhrJob,revokedJob,...stress]).then(values=>{checks.push("
+        "values[2]===true,values.slice(3).every(Boolean),"
+        "stats.admitted===before[0],stats.launched===before[1],"
+        "stats.currentCount===before[2],stats.localBlobReads-before[3]===10,"
+        "stats.localBlobFailures-before[4]===1);globalThis.pocSummary="
+        "checks.every(Boolean)?'LOCAL-BLOB-OK':'LOCAL-BLOB-FAILED:'+"
+        "checks.join(',')+':order='+order.join(',')}).catch(error=>"
+        "globalThis.pocSummary='LOCAL-BLOB-ERROR:'+String(error&&error.stack||"
+        "error));})()";
+    bool local_blob_network_ok = script_runtime_evaluate_diagnostic(
+        runtime, local_blob_network_probe, "<local-blob-network-probe>",
+        &result);
+    for (size_t tick = 0; local_blob_network_ok && tick < 32
+         && strncmp(result.summary, "LOCAL-BLOB-", 11) != 0; tick++) {
+        local_blob_network_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    if (!local_blob_network_ok
+        || strcmp(result.summary, "LOCAL-BLOB-OK") != 0) {
+        fprintf(stderr, "local blob network probe: ok=%d summary=%s error=%s\n",
+                local_blob_network_ok, result.summary, result.error);
+    }
+    CHECK(local_blob_network_ok
+          && strcmp(result.summary, "LOCAL-BLOB-OK") == 0
+          && result.async_network_active_native == 0
+          && result.async_network_pending_logical == 0);
+
+    static const char large_base64_probe[] =
+        "(()=>{const encoded='A'.repeat(823120),decoded=atob(encoded);"
+        "globalThis.pocSummary=decoded.length===617340"
+        "&&decoded.charCodeAt(0)===0"
+        "&&decoded.charCodeAt(decoded.length-1)===0"
+        "?'LARGE-BASE64-OK':'LARGE-BASE64-FAILED:'+decoded.length})()";
+    bool large_base64_ok = script_runtime_evaluate_diagnostic(
+        runtime, large_base64_probe, "<large-base64-probe>", &result);
+    if (!large_base64_ok
+        || strcmp(result.summary, "LARGE-BASE64-OK") != 0) {
+        fprintf(stderr, "large base64 probe: ok=%d summary=%s error=%s\n",
+                large_base64_ok, result.summary, result.error);
+    }
+    CHECK(large_base64_ok
+          && strcmp(result.summary, "LARGE-BASE64-OK") == 0);
 
     static const char indexeddb_probe[] =
         "(async()=>{const request=req=>new Promise((resolve,reject)=>{"
@@ -2897,9 +3040,9 @@ int main(void)
           && strcmp(result.summary, "FRAME-RETENTION-OK") == 0);
 
     static const char callback_task_probe[] =
-        "(()=>{const xhr=new XMLHttpRequest();xhr.readyState=3;"
+        "(()=>{const xhr=new XMLHttpRequest();"
         "xhr.addEventListener('readystatechange',()=>{"
-        "throw new Error('task-probe')});xhr.emit('readystatechange');"
+        "throw new Error('task-probe')});xhr.open('GET','data:text/plain,ok');"
         "globalThis.pocSummary='CALLBACK-TASK-PROBE-OK';})()";
     size_t callback_errors_before = result.uncaught_callback_errors;
     bool callback_task_ok = script_runtime_evaluate_diagnostic(
@@ -2908,9 +3051,11 @@ int main(void)
         && strcmp(result.summary, "CALLBACK-TASK-PROBE-OK") == 0
         && result.uncaught_callback_errors == callback_errors_before + 1
         && strstr(result.last_uncaught_callback_error, "task-probe") != NULL
+        && strstr(result.last_uncaught_callback_error, "<browser-") == NULL
+        && strstr(result.last_uncaught_callback_error, "call (native)") == NULL
         && strstr(result.last_uncaught_callback_task, "realm=top") != NULL
         && strstr(result.last_uncaught_callback_task,
-                  "task=xhr:readystatechange:state=3#") != NULL;
+                  "task=xhr:readystatechange:state=1#") != NULL;
     if (!callback_task_valid) {
         fprintf(stderr,
                 "callback task probe: ok=%d summary=%s count=%zu error=%s "
@@ -3719,6 +3864,25 @@ int main(void)
           && strcmp(result.summary, "TRACED-MODULE-EXECUTED") == 0
           && result.last_compile_source_kind
                == SCRIPT_COMPILE_SOURCE_MODULE);
+
+    puts("test: JavaScript browser identity matches native client hints");
+    static const char browser_identity_probe[] =
+        "const d=navigator.userAgentData,b=d.brands[0];"
+        "d.getHighEntropyValues(['uaFullVersion','fullVersionList'])"
+        ".then(v=>globalThis.pocSummary="
+        "b.brand+'|'+b.version+'|'+v.uaFullVersion+'|'"
+        "+v.fullVersionList[0].brand+'|'"
+        "+v.fullVersionList[0].version);";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, browser_identity_probe, "<browser-identity-probe>",
+              &result)
+          && script_runtime_advance(runtime, 0, 16, &result)
+          && strcmp(result.summary,
+                    TILEFINCH_BROWSER_BRAND "|"
+                    TILEFINCH_BROWSER_BRAND_VERSION "|"
+                    TILEFINCH_BROWSER_FULL_VERSION "|"
+                    TILEFINCH_BROWSER_BRAND "|"
+                    TILEFINCH_BROWSER_FULL_VERSION) == 0);
 
     puts("test: detached runtimes reject new network work");
     script_runtime_detach_document(runtime, &document);

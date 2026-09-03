@@ -1607,6 +1607,7 @@ static bool layout_job_init(LayoutBuildJob *job)
     if (job->body == NULL) return false;
 
     context->layout = layout;
+    context->document = job->document;
     context->sheet = job->stylesheet;
     context->fonts = job->fonts;
     context->web_fonts = layout->web_fonts;
@@ -2074,6 +2075,7 @@ static bool layout_build_context_internal(
     LayoutContext *context = budget_calloc(budget, 1, sizeof(*context));
     if (context == NULL) return false;
     context->layout = layout;
+    context->document = document;
     context->sheet = stylesheet;
     context->fonts = fonts;
     context->web_fonts = layout->web_fonts;

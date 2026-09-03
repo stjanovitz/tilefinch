@@ -25,7 +25,7 @@ agents are capable of. A web browser was a good test of all three.
 
 | Feature | Support |
 |---|---|
-| **Web browsing** | Real HTTPS pages with JavaScript, cookies, images, bounded WebSockets, mobile layout, and TrueType text; no proxy or companion computer. |
+| **Web browsing** | Real HTTPS pages with JavaScript, bounded WebAssembly and WebSockets, cookies, images, mobile layout, and TrueType text; no proxy or companion computer. |
 | **Native media** | YouTube's lightweight provider and compatible HTML `<video>`/`<audio>` elements open one native player. Official builds use PSP firmware for compatible 240p/360p Baseline/Main MP4 and 240p HLS with AAC-LC, including active YouTube live streams and premieres. A separately built optional decoder adds 240p H.264 High; seeking for finite media, preferred audio/subtitle languages, selectable tracks, buffering UI, resumable downloads, and audio-only playback are built in. |
 | **Tabs and navigation** | Five tabs, bookmarks, history, address/search suggestions, in-page find, optional session restore, and optional one-tab hibernation. |
 | **Ad blocking** | Conservative request blocking and cosmetic hiding are on by default; custom uBlock/EasyList-style rules and per-site exceptions are supported. |

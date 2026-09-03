@@ -196,6 +196,7 @@ class PspSdkContractTests(unittest.TestCase):
             "document_bytes": 1024 * 1024,
             "resource_count": 32,
             "resource_body_bytes_total": 1024 * 1024,
+            "classic_script_bytes_each": 384 * 1024,
             "classic_script_compile_count": 8,
             "classic_script_compile_source_bytes": 512 * 1024,
             "classic_script_bytecode_bytes": 512 * 1024,
@@ -6744,6 +6745,17 @@ class PspSdkContractTests(unittest.TestCase):
         manual = (ROOT / "scripts/launch-ppsspp-safe.sh").read_text(
             encoding="utf-8")
         self.assertIn("open -g -n -W", manual)
+
+    def test_input_harness_does_not_require_images_for_control_marks(self):
+        source = (ROOT / "scripts/run-ppsspp-input-script.sh").read_text(
+            encoding="utf-8")
+        capture_gate = source[
+            source.index("if grep -E '^[[:space:]]*mark-live"):
+            source.index("if [ \"$scenario\" = navigation-cancel-live ]")]
+        for mark in ("webgl-measure-start", "webgl-measure-end",
+                     "auto-controls", "controls-exited"):
+            self.assertIn(mark, capture_gate)
+        self.assertIn("grep -Ev", capture_gate)
 
     def test_ppsspp_live_network_harness_has_bounded_dns_alias_seam(self):
         source = (ROOT / "scripts/run-ppsspp-network.sh").read_text(

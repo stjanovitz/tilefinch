@@ -14,6 +14,7 @@
 #include "tilefinch/psp_voice_component_session.h"
 #include "tilefinch/update_history.h"
 #include "tilefinch/voice_component.h"
+#include "tilefinch/wasm_runtime.h"
 #include "tilefinch_compiler.h"
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
 #include "psp_multiplayer.h"
@@ -1716,6 +1717,26 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_reader_after_navigation_dirty(
     bool explicit_request = ui->reader_mode || site_requested;
     bool automatic = browser_profile_reader_auto_mode(profile);
     ReaderDocumentAnalysis analysis = {0};
+
+    BrowserDeclaredMediaCard media_card = explicit_request
+        ? BROWSER_DECLARED_MEDIA_CARD_NONE
+        : browser_engine_prepare_declared_media_card(engine);
+    if (media_card == BROWSER_DECLARED_MEDIA_CARD_DEFERRED) {
+        app->interactive->blank_reader_recovery_pending = true;
+        app->interactive->blank_reader_recovery_generation =
+            app->views->navigation->generation;
+        return;
+    }
+    if (media_card == BROWSER_DECLARED_MEDIA_CARD_INSTALLED) {
+        app->interactive->blank_reader_recovery_pending = false;
+        (void) psp_engine_views_refresh(app->views, engine);
+        if (page_dirty != NULL) *page_dirty = true;
+        /* The in-page control is the primary, least-destructive recovery.
+           Do not immediately hide it behind automatic Basic/Reader or spend
+           the one extracted-presentation slot. The user can still request
+           either view explicitly. */
+        return;
+    }
 
     /* Basic is the action-preserving recovery path. Try it before Reader so
        a degraded search/login shell cannot consume the single extracted-root
@@ -7026,6 +7047,7 @@ int main(int argc, char *argv[])
         startup_failure_screen = "STARTUP FAILED: BROWSER STATE";
         goto sleep_forever;
     }
+    js_wasm_component_configure(process.install_paths.program_dir);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (process.config.validation_media_fixture_auto != 0) {
         psp_present_boot_surface(

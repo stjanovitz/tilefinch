@@ -207,6 +207,14 @@ static bool fetch_hop_configure_cookie(CURL *easy, FetchHopState *hop,
             memcpy(hop->cookie_header, request->cookie, length + 1);
         }
     }
+    if (getenv("TILEFINCH_TRACE_COOKIE") != NULL) {
+        fprintf(stderr,
+                "cookie-send url=%.240s bytes=%zu cf-clearance=%s\n",
+                hop->url == NULL ? "" : hop->url,
+                strlen(hop->cookie_header),
+                strstr(hop->cookie_header, "cf_clearance=") != NULL
+                    ? "yes" : "no");
+    }
     /* Never enable libcurl's cookie engine. The owned PSP transport compiles
        it out entirely, so even CURLOPT_COOKIE=NULL is an unsupported option.
        The literal value is appended to the explicit hop header list below;
@@ -466,7 +474,9 @@ static bool hop_add_named_header(Budget *budget,
 }
 
 static const char *fetch_low_client_hint_headers[] = {
-    "Sec-CH-UA: \"PSP Browser\";v=\"0.3\", \"Not.A/Brand\";v=\"99\"",
+    "Sec-CH-UA: \"" TILEFINCH_BROWSER_BRAND "\";v=\""
+        TILEFINCH_BROWSER_BRAND_VERSION
+        "\", \"Not.A/Brand\";v=\"99\"",
     "Sec-CH-UA-Mobile: ?1",
     "Sec-CH-UA-Platform: \"PlayStation Portable\""
 };
@@ -477,21 +487,15 @@ typedef struct {
 } FetchHighClientHint;
 
 static const FetchHighClientHint fetch_high_client_hints[] = {
-    {"Sec-CH-UA-Full-Version", "Sec-CH-UA-Full-Version: \"0.3.0\""},
-    {"Sec-CH-UA-Full-Version-List", "Sec-CH-UA-Full-Version-List: \"PSP Browser\";v=\"0.3.0\", \"Not.A/Brand\";v=\"99.0.0.0\""},
+    {"Sec-CH-UA-Full-Version", "Sec-CH-UA-Full-Version: \""
+        TILEFINCH_BROWSER_FULL_VERSION "\""},
+    {"Sec-CH-UA-Full-Version-List", "Sec-CH-UA-Full-Version-List: \""
+        TILEFINCH_BROWSER_BRAND "\";v=\"" TILEFINCH_BROWSER_FULL_VERSION
+        "\", \"Not.A/Brand\";v=\"99.0.0.0\""},
     {"Sec-CH-UA-Arch", "Sec-CH-UA-Arch: \"MIPS\""},
     {"Sec-CH-UA-Bitness", "Sec-CH-UA-Bitness: \"32\""},
     {"Sec-CH-UA-Model", "Sec-CH-UA-Model: \"PSP-3000\""},
-    {"Sec-CH-UA-Platform-Version", "Sec-CH-UA-Platform-Version: \"6.61\""},
-    {"UA", "UA: \"PSP Browser\";v=\"0.3\""},
-    {"UA-Mobile", "UA-Mobile: ?1"},
-    {"UA-Platform", "UA-Platform: \"PlayStation Portable\""},
-    {"UA-Full-Version", "UA-Full-Version: \"0.3.0\""},
-    {"UA-Full-Version-List", "UA-Full-Version-List: \"PSP Browser\";v=\"0.3.0\""},
-    {"UA-Arch", "UA-Arch: \"MIPS\""},
-    {"UA-Bitness", "UA-Bitness: \"32\""},
-    {"UA-Model", "UA-Model: \"PSP-3000\""},
-    {"UA-Platform-Version", "UA-Platform-Version: \"6.61\""}
+    {"Sec-CH-UA-Platform-Version", "Sec-CH-UA-Platform-Version: \"6.61\""}
 };
 
 static bool client_hint_token_requested(const char *serialized,
@@ -593,6 +597,33 @@ bool fetch_accepted_critical_client_hints(
             output[0] = '\0';
             return true;
         }
+        at++;
+    }
+    return true;
+}
+
+bool fetch_client_hint_tokens_cover(
+    const char *available, const char *required)
+{
+    if (required == NULL || required[0] == '\0') return true;
+    if (available == NULL || available[0] == '\0'
+        || !client_hint_token_list_valid(available)
+        || !client_hint_token_list_valid(required)) return false;
+    const char *at = required;
+    while (*at != '\0') {
+        while (*at == ' ' || *at == '\t') at++;
+        const char *start = at;
+        while (*at != '\0'
+               && header_name_character((unsigned char) *at)) at++;
+        size_t length = (size_t) (at - start);
+        if (length == 0 || length >= 96u) return false;
+        char token[96];
+        memcpy(token, start, length);
+        token[length] = '\0';
+        if (!client_hint_token_requested(available, token)) return false;
+        while (*at == ' ' || *at == '\t') at++;
+        if (*at == '\0') break;
+        if (*at != ',') return false;
         at++;
     }
     return true;

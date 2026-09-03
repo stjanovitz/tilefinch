@@ -21,6 +21,21 @@
     });
   const trustedJSONParse = JSON.parse;
   const trustedJSONStringify = JSON.stringify;
+  const trustedString = String,
+    trustedStringFromCodePoint = Function.call.bind(String.fromCodePoint),
+    TrustedUint8Array = Uint8Array;
+  const trustedMapGet = Function.call.bind(Map.prototype.get),
+    trustedMapSet = Function.call.bind(Map.prototype.set),
+    trustedMapDelete = Function.call.bind(Map.prototype.delete),
+    trustedMapSize = Function.call.bind(
+      Object.getOwnPropertyDescriptor(Map.prototype, "size").get,
+    ),
+    trustedWeakMapGet = Function.call.bind(WeakMap.prototype.get),
+    trustedWeakMapSet = Function.call.bind(WeakMap.prototype.set),
+    trustedUint8ArraySet = Function.call.bind(Uint8Array.prototype.set),
+    trustedStringSplit = Function.call.bind(String.prototype.split),
+    trustedStringIndexOf = Function.call.bind(String.prototype.indexOf),
+    trustedArrayJoin = Function.call.bind(Array.prototype.join);
   const trustedStringLower = Function.call.bind(String.prototype.toLowerCase);
   const trustedStringSlice = Function.call.bind(String.prototype.slice);
   const trustedCharCodeAt = Function.call.bind(String.prototype.charCodeAt);
@@ -366,11 +381,91 @@
           : functionToString.call(this);
       };
     nativeMethodSet.add(nativeAwareToString);
+    globalThis.__tilefinchMarkNativeFunction = (value) => {
+      if (typeof value === "function") nativeMethodSet.add(value);
+      return value;
+    };
     Object.defineProperty(Function.prototype, "toString", {
       configurable: true,
       writable: true,
       value: nativeAwareToString,
     });
+    /*
+     * QuickJS records the JavaScript implementation of browser callbacks in
+     * Error.stack.  Those frames are an implementation detail: Chromium stops
+     * the public stack at the author callback, while exposing our
+     * <browser-compat>/<browser-bootstrap> frames both fingerprints Tilefinch
+     * and gives pages a non-standard view of the event machinery.
+     *
+     * Keep the engine's useful author frames, but interpose the public Error
+     * constructors so errors created by page script receive a bounded stack
+     * with browser-private and QuickJS call-adapter frames removed.  Native
+     * errors thrown by the engine retain their original stack.  The facades
+     * share the native prototypes and are marked native below, preserving
+     * instanceof, subclassing, constructor identity and function reflection.
+     */
+    const sanitizePublicStack = (value) => {
+        if (typeof value !== "string" || value.length > 65536) return value;
+        const lines = value.split("\n"), kept = [];
+        for (let index = 0; index < lines.length; index++) {
+          const line = lines[index];
+          if (
+            line.includes("<browser-") ||
+            /^\s*at (?:call|apply|construct) \(native\)\s*$/.test(line)
+          ) continue;
+          kept.push(line);
+        }
+        return kept.join("\n");
+      },
+      installPublicError = (name) => {
+        const NativeError = globalThis[name];
+        if (typeof NativeError !== "function" || !NativeError.prototype)
+          return;
+        const PublicError = {
+          [name]: function (...args) {
+            const value = new.target
+              ? Reflect.construct(
+                  NativeError,
+                  args,
+                  new.target === PublicError ? NativeError : new.target,
+                )
+              : Reflect.apply(NativeError, undefined, args);
+            const stack = value && value.stack;
+            if (typeof stack === "string")
+              Object.defineProperty(value, "stack", {
+                configurable: true,
+                writable: true,
+                value: sanitizePublicStack(stack),
+              });
+            return value;
+          },
+        }[name];
+        Object.defineProperty(PublicError, "length", {
+          configurable: true,
+          value: NativeError.length,
+        });
+        Object.defineProperty(PublicError, "prototype", {
+          writable: false,
+          value: NativeError.prototype,
+        });
+        Object.defineProperty(NativeError.prototype, "constructor", {
+          configurable: true,
+          writable: true,
+          value: PublicError,
+        });
+        for (const key of Reflect.ownKeys(NativeError)) {
+          if (key === "length" || key === "name" || key === "prototype")
+            continue;
+          const descriptor = Object.getOwnPropertyDescriptor(NativeError, key);
+          if (descriptor) Object.defineProperty(PublicError, key, descriptor);
+        }
+        nativeMethodSet.add(PublicError);
+        globalThis[name] = PublicError;
+      };
+    for (const name of [
+      "Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError",
+      "TypeError", "URIError", "AggregateError",
+    ]) installPublicError(name);
     const baseSupports = CSS.supports.bind(CSS);
     CSS.supports = function (property, value) {
       if (arguments.length === 1) {
@@ -642,8 +737,13 @@
     String(value).replace(/[^\x21-\x7e]/gu, (char) => encodeURIComponent(char));
   class TilefinchURL {
     constructor(input, base) {
+      const text = tilefinchURLInput(input);
+      if (/^blob:/i.test(text)) {
+        this._setBlob(text);
+        return;
+      }
       const resolved = __tilefinchResolveURL(
-        tilefinchURLInput(input),
+        text,
         base === undefined
           ? tilefinchURLInput(
               globalThis.__tilefinchLocationHref || "https://example.invalid/",
@@ -653,7 +753,38 @@
       if (!resolved) throw new TypeError("Invalid URL");
       this._set(resolved);
     }
+    _setBlob(href) {
+      const parsed = String(href).match(/^blob:([^?#]+)(\?[^#]*)?(#.*)?$/i);
+      if (!parsed) throw new TypeError("Invalid URL");
+      const pathname = parsed[1],
+        search = parsed[2] || "",
+        hash = parsed[3] || "",
+        embedded = pathname.match(
+          /^([A-Za-z][A-Za-z0-9+.-]*:)\/\/([^\/?#:]+)(?::([0-9]+))?/,
+        ),
+        origin = embedded
+          ? embedded[1].toLowerCase() + "//" + embedded[2] +
+            (embedded[3] ? ":" + embedded[3] : "")
+          : "null";
+      this.protocol = "blob:";
+      this.hostname = "";
+      this.port = "";
+      this.host = "";
+      this.pathname = pathname;
+      this.search = search;
+      this.hash = hash;
+      this.origin = origin;
+      this._href = "blob:" + pathname + search + hash;
+      this.searchParams = new TilefinchURLSearchParams(search, (value) => {
+        this.search = value ? "?" + value : "";
+        this._href = "blob:" + this.pathname + this.search + this.hash;
+      });
+    }
     _set(href) {
+      if (/^blob:/i.test(String(href))) {
+        this._setBlob(href);
+        return;
+      }
       const parsed = String(href).match(
         /^([^:]+:)\/\/([^\/?#:]+)(?::([0-9]+))?([^?#]*)(\?[^#]*)?(#.*)?$/,
       );
@@ -818,7 +949,7 @@
             this._bomSeen = false;
             throw new TypeError("invalid UTF-8");
           }
-          out += String.fromCodePoint(65533);
+          out += trustedStringFromCodePoint(null, 65533);
           this._bomSeen = true;
         };
         while (i < bytes.length) {
@@ -882,7 +1013,7 @@
             this._bomSeen = true;
             if (!this.ignoreBOM && cp === 65279) continue;
           }
-          out += String.fromCodePoint(cp);
+          out += trustedStringFromCodePoint(null, cp);
         }
         if (!stream) {
           if (this._pending.length) invalid();
@@ -892,51 +1023,87 @@
         return out;
       }
     };
-  const blobURLs = new Map();
+  const blobURLs = new Map(),
+    blobStates = new WeakMap(),
+    blobBytes = (blob) => {
+      const state = trustedWeakMapGet(blobStates, blob);
+      if (!state)
+        throw new TypeError("Blob method called on incompatible receiver");
+      return state.bytes;
+    },
+    blobBytesCopy = (blob) => {
+      const state = trustedWeakMapGet(blobStates, blob);
+      if (!state)
+        throw new TypeError("Blob method called on incompatible receiver");
+      const copy = new TrustedUint8Array(state.length);
+      trustedUint8ArraySet(copy, state.bytes);
+      return copy;
+    };
   let nextBlobURL = 1,
     blobURLBytes = 0;
   const blobURLLimit = 16,
     blobURLByteLimit = 512 * 1024;
-  class TilefinchBlob {
+  const TilefinchBlob = class Blob {
     constructor(parts = [], options = {}) {
       if (parts === null || parts === undefined || !parts[Symbol.iterator])
         throw new TypeError("Blob parts must be iterable");
       const chunks = [];
       let size = 0;
       for (const part of parts) {
-        let bytes;
-        if (part instanceof TilefinchBlob) bytes = part._bytes;
-        else if (part instanceof ArrayBuffer) bytes = new Uint8Array(part);
-        else if (ArrayBuffer.isView(part))
-          bytes = new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
-        else bytes = new TextEncoder().encode(String(part));
-        if (size + bytes.byteLength > 256 * 1024)
+        let bytes, byteLength;
+        const blobState = trustedWeakMapGet(blobStates, part);
+        if (blobState) {
+          bytes = blobState.bytes;
+          byteLength = blobState.length;
+        } else if (part instanceof ArrayBuffer) {
+          bytes = new Uint8Array(part);
+          byteLength = bytes.byteLength;
+        } else if (ArrayBuffer.isView(part)) {
+          bytes = new Uint8Array(
+            part.buffer, part.byteOffset, part.byteLength);
+          byteLength = bytes.byteLength;
+        } else {
+          bytes = new TextEncoder().encode(String(part));
+          byteLength = bytes.byteLength;
+        }
+        if (byteLength > 256 * 1024 - size)
           throw new RangeError("Blob exceeds bounded size");
-        chunks.push(bytes);
-        size += bytes.byteLength;
+        chunks[chunks.length] = { bytes, length: byteLength };
+        size += byteLength;
       }
-      this._bytes = new Uint8Array(size);
+      const retained = new TrustedUint8Array(size);
       let at = 0;
-      for (const bytes of chunks) {
-        this._bytes.set(bytes, at);
-        at += bytes.byteLength;
+      for (let i = 0; i < chunks.length; i++) {
+        trustedUint8ArraySet(retained, chunks[i].bytes, at);
+        at += chunks[i].length;
       }
-      this.size = size;
-      this.type = String(options.type || "")
-        .toLowerCase()
-        .replace(/[^ -~]/g, "");
+      trustedWeakMapSet(blobStates, this, {
+        bytes: retained,
+        length: size,
+        type: String(options.type || "")
+          .toLowerCase()
+          .replace(/[^ -~]/g, ""),
+      });
+    }
+    get size() {
+      return blobBytes(this).byteLength;
+    }
+    get type() {
+      const state = trustedWeakMapGet(blobStates, this);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state.type;
     }
     arrayBuffer() {
-      return Promise.resolve(this._bytes.slice().buffer);
+      return Promise.resolve(blobBytesCopy(this).buffer);
     }
     text() {
-      return Promise.resolve(new TextDecoder().decode(this._bytes));
+      return Promise.resolve(new TextDecoder().decode(blobBytesCopy(this)));
     }
     bytes() {
-      return Promise.resolve(this._bytes.slice());
+      return Promise.resolve(blobBytesCopy(this));
     }
     stream() {
-      const bytes = this._bytes;
+      const bytes = blobBytesCopy(this);
       let offset = 0;
       return new ReadableStream({
         pull(controller) {
@@ -967,10 +1134,11 @@
                 : Number(end) || 0,
           ),
         );
-      return new TilefinchBlob([this._bytes.slice(from, to)], { type });
+      return new TilefinchBlob([blobBytesCopy(this).slice(from, to)], { type });
     }
-  }
+  };
   globalThis.Blob = TilefinchBlob;
+  globalThis.__tilefinchBlobBytes = blobBytesCopy;
   globalThis.File = class File extends TilefinchBlob {
     constructor(parts, name, options = {}) {
       if (arguments.length < 2)
@@ -2503,27 +2671,85 @@
       url.hash;
     return true;
   };
-  TilefinchURL.createObjectURL = (blob) => {
-    if (!(blob instanceof Blob)) throw new TypeError("Blob required");
+  TilefinchURL.createObjectURL = function createObjectURL(blob) {
+    const state = trustedWeakMapGet(blobStates, blob);
+    if (!state) throw new TypeError("Blob required");
     if (
-      blobURLs.size >= blobURLLimit ||
-      blobURLBytes + blob.size > blobURLByteLimit
+      trustedMapSize(blobURLs) >= blobURLLimit ||
+      blobURLBytes + state.bytes.byteLength > blobURLByteLimit
     )
       throw new RangeError("blob URL quota exceeded");
     const url = "blob:" + location.origin + "/" + nextBlobURL++;
-    blobURLs.set(url, blob);
-    blobURLBytes += blob.size;
+    trustedMapSet(blobURLs, url, blob);
+    blobURLBytes += state.bytes.byteLength;
     return url;
   };
-  TilefinchURL.revokeObjectURL = (url) => {
-    url = String(url);
-    const blob = blobURLs.get(url);
+  TilefinchURL.revokeObjectURL = function revokeObjectURL(url) {
+    url = trustedString(url);
+    const blob = trustedMapGet(blobURLs, url);
     if (blob) {
-      blobURLBytes -= blob.size;
-      blobURLs.delete(url);
+      blobURLBytes -= blobBytes(blob).byteLength;
+      trustedMapDelete(blobURLs, url);
     }
   };
-  globalThis.__tilefinchBlobForURL = (url) => blobURLs.get(String(url)) || null;
+  /* Worker binds policy and retained source to one WebIDL conversion. Keep
+     the conversion intrinsic private and make lookup accept only its already
+     converted primitive so author String replacement cannot split identity. */
+  globalThis.__tilefinchTrustedString = (value) => trustedString(value);
+  globalThis.__tilefinchBlobForURL = (url) =>
+    typeof url === "string" ? trustedMapGet(blobURLs, url) || null : null;
+  const workerSourceForBlob = (blob) => {
+    const state = trustedWeakMapGet(blobStates, blob);
+    if (!state) throw new TypeError("Blob required");
+    const bytes = state.bytes, length = state.length;
+    let out = "", i = 0;
+    while (i < length) {
+      const a = bytes[i++];
+      let cp, need = 0, minimum = 0;
+      if (a <= 127) cp = a;
+      else if (a >= 194 && a <= 223) {
+        cp = a & 31; need = 1; minimum = 128;
+      } else if (a >= 224 && a <= 239) {
+        cp = a & 15; need = 2; minimum = 2048;
+      } else if (a >= 240 && a <= 244) {
+        cp = a & 7; need = 3; minimum = 65536;
+      } else {
+        out += trustedStringFromCodePoint(null, 65533);
+        continue;
+      }
+      if (i + need > length) {
+        out += trustedStringFromCodePoint(null, 65533);
+        break;
+      }
+      let valid = true;
+      for (let j = 0; j < need; j++) {
+        const b = bytes[i + j];
+        if ((b & 192) !== 128) { valid = false; break; }
+        cp = (cp << 6) | (b & 63);
+      }
+      if (!valid || cp < minimum || cp > 1114111
+          || (cp >= 55296 && cp <= 57343)) {
+        out += trustedStringFromCodePoint(null, 65533);
+        continue;
+      }
+      i += need;
+      out += trustedStringFromCodePoint(null, cp);
+    }
+    return out;
+  };
+  Object.defineProperty(globalThis, "__tilefinchWorkerIntrinsics", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: Object.freeze({
+      charCodeAt: trustedCharCodeAt,
+      indexOf: trustedStringIndexOf,
+      join: trustedArrayJoin,
+      slice: trustedStringSlice,
+      sourceForBlob: workerSourceForBlob,
+      split: trustedStringSplit,
+    }),
+  });
   const cloneWorkerValue = (value, depth = 0) => {
     if (depth > 8) throw new RangeError("worker message nesting limit");
     if (
@@ -2540,6 +2766,11 @@
       return new DataView(buffer, value.byteOffset, value.byteLength);
     }
     if (ArrayBuffer.isView(value)) return new value.constructor(value);
+    const cloneWasmModule = globalThis.__tilefinchCloneWasmModule;
+    if (typeof cloneWasmModule === "function") {
+      const module = cloneWasmModule(value);
+      if (module !== null) return module;
+    }
     if (Array.isArray(value)) {
       if (value.length > 1024)
         throw new RangeError("worker message item limit");
@@ -2555,155 +2786,9 @@
     }
     throw new TypeError("unsupported worker message value");
   };
+  globalThis.__tilefinchCloneWorkerValue = cloneWorkerValue;
   if (globalThis.structuredClone === undefined)
     globalThis.structuredClone = (value) => cloneWorkerValue(value);
-  /* Capture the native compiler in this trusted closure. Native code removes
-     its temporary global property before author script runs, so page code
-     cannot turn the worker compiler into an unsafe-eval bypass. */
-  const runWorkerNative = globalThis.__tilefinchRunWorker;
-  let activeWorkers = 0;
-  globalThis.Worker = class Worker {
-    constructor(url) {
-      const blob = blobURLs.get(String(url));
-      if (!blob) throw new TypeError("only retained blob URLs are supported");
-      if (activeWorkers >= 2) throw new RangeError("worker quota exceeded");
-      activeWorkers++;
-      this.active = true;
-      this.onmessage = null;
-      this.onerror = null;
-      this.listeners = new Map();
-      const owner = this,
-        scope = { onmessage: null, onerror: null };
-      scope.self = scope;
-      scope.globalThis = scope;
-      scope.postMessage = (value) => {
-        const copied = cloneWorkerValue(value);
-        setTimeout(() => owner.emit("message", { data: copied }), 0);
-      };
-      scope.addEventListener = (type, callback) => {
-        if (typeof callback !== "function") return;
-        const key = String(type);
-        if (!scope._listeners) scope._listeners = new Map();
-        if (!scope._listeners.has(key)) scope._listeners.set(key, []);
-        scope._listeners.get(key).push(callback);
-      };
-      scope.removeEventListener = (type, callback) => {
-        const list = scope._listeners?.get(String(type));
-        if (!list) return;
-        const at = list.indexOf(callback);
-        if (at >= 0) list.splice(at, 1);
-      };
-      scope.crypto = crypto;
-      scope.performance = performance;
-      scope.setTimeout = setTimeout;
-      scope.clearTimeout = clearTimeout;
-      scope.TextEncoder = TextEncoder;
-      scope.TextDecoder = TextDecoder;
-      scope.Uint8Array = Uint8Array;
-      scope.ArrayBuffer = ArrayBuffer;
-      scope.DataView = DataView;
-      scope.Blob = Blob;
-      const proxy = new Proxy(scope, {
-        has() {
-          return true;
-        },
-        get(target, key) {
-          return key in target ? target[key] : globalThis[key];
-        },
-        set(target, key, value) {
-          target[key] = value;
-          return true;
-        },
-      });
-      this.scope = proxy;
-      try {
-        let source = new TextDecoder().decode(blob._bytes);
-        source = source.split("import.meta").join("__tilefinchWorkerMeta");
-        source = source.replace(/\bimport\(/g, "__tilefinchWorkerImport(");
-        source = source.replace(/export\s*\{[^}]*\}\s*;?/g, ";");
-        scope.__tilefinchWorkerMeta = { url: String(url) };
-        runWorkerNative(proxy, source, String(url));
-      } catch (error) {
-        if (globalThis.console && console.log)
-          console.log(
-            "tilefinch-worker-error: " +
-              String(error) +
-              " || " +
-              String((error && error.stack) || ""),
-          );
-        /* Construction did not produce a live worker. Release its bounded
-           slot before surfacing the CSP/compile failure to the caller. */
-        this.active = false;
-        activeWorkers--;
-        this.listeners.clear();
-        this.scope = null;
-        throw error;
-      }
-    }
-    addEventListener(type, callback) {
-      if (typeof callback !== "function") return;
-      const key = String(type);
-      if (!this.listeners.has(key)) this.listeners.set(key, []);
-      this.listeners.get(key).push(callback);
-    }
-    removeEventListener(type, callback) {
-      const list = this.listeners.get(String(type));
-      if (!list) return;
-      const at = list.indexOf(callback);
-      if (at >= 0) list.splice(at, 1);
-    }
-    emit(type, event = {}) {
-      if (!this.active) return;
-      event.type = type;
-      event.target = this;
-      const handler = this["on" + type];
-      if (typeof handler === "function")
-        globalThis.__tilefinchRunTask(
-          "worker:" + String(type),
-          handler,
-          this,
-          [event],
-        );
-      for (const callback of this.listeners.get(type) || [])
-        globalThis.__tilefinchRunTask(
-          "worker-listener:" + String(type),
-          callback,
-          this,
-          [event],
-        );
-    }
-    postMessage(value) {
-      if (!this.active) throw new Error("Worker is terminated");
-      const copied = cloneWorkerValue(value);
-      setTimeout(() => {
-        if (!this.active) return;
-        const event = { type: "message", data: copied, target: this.scope };
-        const handler = this.scope.onmessage;
-        if (typeof handler === "function")
-          globalThis.__tilefinchRunTask(
-            "worker-scope-message",
-            handler,
-            this.scope,
-            [event],
-          );
-        for (const callback of this.scope._listeners?.get("message") || [])
-          globalThis.__tilefinchRunTask(
-            "worker-scope-listener",
-            callback,
-            this.scope,
-            [event],
-          );
-      }, 0);
-    }
-    terminate() {
-      if (this.active) {
-        this.active = false;
-        activeWorkers--;
-        this.listeners.clear();
-        this.scope = null;
-      }
-    }
-  };
   const tilefinchCurrentDocumentURL =
       globalThis.__tilefinchCurrentDocumentURL,
     tilefinchDocumentURLRevision =
@@ -3413,7 +3498,7 @@
       compatMode = "CSS1Compat",
     ) => {
       const doc = Object.create(
-          xml ? XMLDocument.prototype : Document.prototype,
+          xml ? XMLDocument.prototype : HTMLDocument.prototype,
         ),
         makeElement = (tag, namespace = htmlNamespace) => {
           tag = String(tag).toLowerCase();
@@ -4378,7 +4463,7 @@
     document.dispatchEvent(new Event("selectionchange"));
   document.createRange = () => new Range();
   document.getSelection = globalThis.getSelection = () => selection;
-  Object.setPrototypeOf(document, Document.prototype);
+  Object.setPrototypeOf(document, HTMLDocument.prototype);
   document.createElement = (tag) => {
     tag = String(tag);
     let node = wrap(__tilefinchCreate(tag, "http://www.w3.org/1999/xhtml"));
@@ -5078,7 +5163,15 @@
       )
     )
       return;
-    const item = { callback, capture, once, passive, signal, abort: null };
+    const item = {
+      callback,
+      capture,
+      once,
+      passive,
+      signal,
+      abort: null,
+      active: true,
+    };
     if (signal && typeof signal.addEventListener === "function") {
       item.abort = () =>
         globalThis.__tilefinchRemoveEventListener(map, key, callback, capture);
@@ -5101,6 +5194,11 @@
       );
     if (at < 0) return;
     const [item] = list.splice(at, 1);
+    /* The DOM dispatch algorithm marks a removed listener before continuing
+       the current event's cloned listener list.  Without this retained bit a
+       listener removed by an earlier callback still runs once from our
+       snapshot, which is observably wrong and can call stale teardown state. */
+    item.active = false;
     globalThis.__tilefinchEventObserverDelta(type, -1);
     if (item.signal && item.abort)
       try {
@@ -5110,7 +5208,7 @@
   globalThis.__tilefinchInvokeListenerList = (map, target, event, capture) => {
     const list = map.get(String(event.type)) || [];
     for (const item of [...list]) {
-      if (item.capture !== capture) continue;
+      if (!item.active || item.capture !== capture) continue;
       event.__passive = item.passive;
       try {
         if (typeof item.callback === "function") {
@@ -5159,26 +5257,6 @@
     event.defaultPrevented = !!event.defaultPrevented;
     event.__passive = false;
     event.__path = path;
-    event.composedPath = () =>
-      globalThis.__tilefinchVisibleShadowEventPath
-        ? globalThis.__tilefinchVisibleShadowEventPath(
-            path,
-            event.currentTarget,
-          )
-        : event.currentTarget
-          ? path.slice()
-          : [];
-    event.preventDefault = () => {
-      if (event.cancelable !== false && !event.__passive)
-        event.defaultPrevented = true;
-    };
-    event.stopPropagation = () => {
-      event.__stopped = true;
-    };
-    event.stopImmediatePropagation = () => {
-      event.__stopped = true;
-      event.__immediateStopped = true;
-    };
   };
   document.addEventListener = (type, callback, options = false) =>
     globalThis.__tilefinchAddEventListener(
@@ -5736,6 +5814,23 @@
       );
     },
   });
+  Object.defineProperty(globalThis, "__tilefinchPostTopMessage", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value(data, targetOrigin = "/") {
+      const normalizedTarget = normalizePostMessageTarget(
+        targetOrigin,
+        location.origin,
+      );
+      const json = trustedJSONStringify(data);
+      __tilefinchPostMessage(
+        -1,
+        json === undefined ? "null" : json,
+        normalizedTarget,
+      );
+    },
+  });
   const frameSandboxPolicy = (element) => {
       const value = element?.getAttribute?.("sandbox");
       if (value === null || value === undefined)
@@ -5770,11 +5865,15 @@
        script begins, so constructing it lazily during iframe setup would
        incorrectly break even script-disabled frames. The native wrapper
        still checks the page's non-writable CSP decision on every call. */
+    /* A call through an `execute` parameter is indirect eval and therefore
+       runs in the owner global. Keep a private scope facade whose `eval`
+       property is the captured intrinsic; the syntactic eval call below then
+       has direct-eval semantics while every other lookup resolves against the
+       child WindowProxy. */
+    trustedFrameDirectEval = eval,
     trustedFrameEvaluator = new Function(
-      "scope",
-      "source",
-      "with(scope){return eval(source)}",
-    ),
+      "return function(scope,source){with(scope){return eval(source)}}",
+    )(),
     frameWindows = new Map(),
     frameWindowLimit = 16,
     evictFrameWindow = () => {
@@ -5811,6 +5910,7 @@
         localSandboxScripts: false,
         localSandboxSameOrigin: false,
         proxy: null,
+        evalScope: null,
         scope,
       };
       scope.document = globalThis.__tilefinchCreateFrameDocument(true);
@@ -5822,7 +5922,7 @@
       let proxy;
       proxy = new Proxy(scope, {
         has(target, key) {
-          if (key === "source" || key === "eval") return false;
+          if (key === "source" || key === "execute") return false;
           if (state.sameOrigin) return true;
           return (
             key === "closed" ||
@@ -5845,9 +5945,12 @@
                 : globalThis[key]
               : undefined;
           if (key === "eval")
-            return state.sameOrigin && state.scriptsAllowed
-              ? target.eval
-              : undefined;
+            /* The sandboxed-scripts flag suppresses scripts owned by the
+               child document; it does not hide Window.eval from a
+               same-origin parent. Chromium exposes and permits this call
+               for sandbox="allow-same-origin". Opaque-origin frames remain
+               inaccessible through the same-origin gate below. */
+            return state.sameOrigin ? target.eval : undefined;
           if (!state.sameOrigin) {
             if (key === "window" || key === "self" || key === "frames")
               return proxy;
@@ -5871,6 +5974,21 @@
         },
       });
       state.proxy = proxy;
+      const evalScope = new Proxy(proxy, {
+        has(target, key) {
+          if (key === "source") return false;
+          if (key === "eval") return true;
+          return key in target;
+        },
+        get(target, key) {
+          return key === "eval" ? trustedFrameDirectEval : target[key];
+        },
+        set(target, key, value) {
+          target[key] = value;
+          return true;
+        },
+      });
+      state.evalScope = evalScope;
       Object.defineProperty(scope.document, "defaultView", {
         configurable: true,
         value: proxy,
@@ -5878,6 +5996,10 @@
       scope.window = proxy;
       scope.self = proxy;
       scope.globalThis = proxy;
+      Object.defineProperty(scope, Symbol.toStringTag, {
+        configurable: true,
+        value: "Window",
+      });
       scope.parent = globalThis;
       scope.top = globalThis;
       Object.defineProperty(scope, "opener", {
@@ -5888,7 +6010,9 @@
       });
       scope.frames = proxy;
       scope.length = 0;
-      scope.eval = __tilefinchCreateFrameEval(trustedFrameEvaluator, proxy);
+      scope.eval = __tilefinchCreateFrameEval(
+        trustedFrameEvaluator, evalScope,
+      );
       scope.postMessage = function (data, targetOrigin = "/") {
         const current = wrap(handle);
         if (!state.active || !current?.isConnected) return;
@@ -5967,7 +6091,7 @@
     state.sameOrigin = !state.opaqueOrigin;
     const text =
         normalizedSrcdoc !== null ? normalizedSrcdoc
-        : blob ? new TextDecoder().decode(blob._bytes) : "",
+        : blob ? new TextDecoder().decode(blobBytes(blob)) : "",
       standards = /^\s*<!doctype\s+html(?:\s|>)/i.test(text),
       frameDocument = text
         ? new DOMParser().parseFromString(text, "text/html")
@@ -6187,66 +6311,385 @@
     __tilefinchRecordEvent();
     return !value.defaultPrevented;
   };
-  globalThis.navigator = diagnosticMobileSafari
-    ? {
-        userAgent:
-          "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
-        language: "en-US",
-        languages: ["en-US"],
-        platform: "iPhone",
-        maxTouchPoints: 5,
-        cookieEnabled: true,
-        onLine: true,
-        hardwareConcurrency: 6,
+  {
+    /* Navigator is a platform object, not a mutable record. Keeping its
+       values in closures preserves Tilefinch's honest device identity while
+       matching the prototype/brand surface feature-detection code expects. */
+    const navigatorToken = {},
+      uaDataToken = {},
+      gpuToken = {},
+      wgslLanguageFeaturesToken = {},
+      pluginArrayToken = {},
+      mimeTypeArrayToken = {},
+      pluginToken = {},
+      mimeTypeToken = {},
+      languages = Object.freeze(["en-US"]),
+      brands = Object.freeze([
+        Object.freeze({
+          brand: String(globalThis.__tilefinchBrowserBrand),
+          version: String(globalThis.__tilefinchBrowserBrandVersion),
+        }),
+        Object.freeze({ brand: "Not.A/Brand", version: "99" }),
+      ]),
+      fullVersionList = Object.freeze([
+        Object.freeze({
+          brand: String(globalThis.__tilefinchBrowserBrand),
+          version: String(globalThis.__tilefinchBrowserFullVersion),
+        }),
+        Object.freeze({ brand: "Not.A/Brand", version: "99.0.0.0" }),
+      ]);
+    class WGSLLanguageFeatures {
+      constructor() {
+        if (arguments[0] !== wgslLanguageFeaturesToken)
+          throw new TypeError("Illegal constructor");
       }
-    : {
-        userAgent: String(globalThis.__tilefinchBrowserUserAgent),
-        language: "en-US",
-        languages: ["en-US"],
-        platform: "PSP",
-        maxTouchPoints: 0,
-        cookieEnabled: true,
-        onLine: true,
-        hardwareConcurrency: 1,
-        deviceMemory: 0.25,
-        userAgentData: {
-          brands: [
-            { brand: "Tilefinch", version: "0.1" },
-            { brand: "Not.A/Brand", version: "99" },
-          ],
-          mobile: true,
-          platform: "PlayStation Portable",
-          getHighEntropyValues(hints) {
-            const all = {
-              architecture: "MIPS",
-              bitness: "32",
-              model: "PSP-3000",
-              platform: "PlayStation Portable",
-              platformVersion: "6.61",
-              uaFullVersion: "0.1.2",
-              fullVersionList: [
-                { brand: "Tilefinch", version: "0.1.2" },
-                { brand: "Not.A/Brand", version: "99.0.0.0" },
-              ],
-            };
-            const value = {
-              brands: this.brands,
-              mobile: this.mobile,
-              platform: this.platform,
-            };
-            for (const hint of hints || [])
-              if (hint in all) value[hint] = all[hint];
-            return Promise.resolve(value);
+      get size() { return 0; }
+      has() { return false; }
+      entries() { return [][Symbol.iterator](); }
+      keys() { return [][Symbol.iterator](); }
+      values() { return [][Symbol.iterator](); }
+      forEach() {}
+      [Symbol.iterator]() { return this.values(); }
+    }
+    Object.defineProperty(
+      WGSLLanguageFeatures.prototype,
+      Symbol.toStringTag,
+      { configurable: true, value: "WGSLLanguageFeatures" },
+    );
+    class GPU {
+      constructor() {
+        if (arguments[0] !== gpuToken)
+          throw new TypeError("Illegal constructor");
+      }
+      get wgslLanguageFeatures() { return wgslLanguageFeatures; }
+      getPreferredCanvasFormat() { return "bgra8unorm"; }
+      requestAdapter() { return Promise.resolve(null); }
+    }
+    Object.defineProperty(GPU.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "GPU",
+    });
+    const wgslLanguageFeatures = new WGSLLanguageFeatures(
+        wgslLanguageFeaturesToken,
+      ),
+      gpu = new GPU(gpuToken);
+    class PluginArray {
+      constructor() {
+        if (arguments[0] !== pluginArrayToken)
+          throw new TypeError("Illegal constructor");
+      }
+      refresh() {}
+      get length() { return 0; }
+      item() { return null; }
+      namedItem() { return null; }
+    }
+    class MimeTypeArray {
+      constructor() {
+        if (arguments[0] !== mimeTypeArrayToken)
+          throw new TypeError("Illegal constructor");
+      }
+      get length() { return 0; }
+      item() { return null; }
+      namedItem() { return null; }
+    }
+    /* These constructors are required to exist even when the browser has no
+       plug-ins or PDF viewer, but no page-created instances are admitted. */
+    class Plugin {
+      constructor() {
+        if (arguments[0] !== pluginToken)
+          throw new TypeError("Illegal constructor");
+      }
+    }
+    class MimeType {
+      constructor() {
+        if (arguments[0] !== mimeTypeToken)
+          throw new TypeError("Illegal constructor");
+      }
+    }
+    for (const [constructor, tag] of [
+      [PluginArray, "PluginArray"],
+      [MimeTypeArray, "MimeTypeArray"],
+      [Plugin, "Plugin"],
+      [MimeType, "MimeType"],
+    ])
+      Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+        configurable: true,
+        value: tag,
+      });
+    const plugins = new PluginArray(pluginArrayToken),
+      mimeTypes = new MimeTypeArray(mimeTypeArrayToken);
+    class NavigatorUAData {
+      constructor() {
+        if (arguments[0] !== uaDataToken)
+          throw new TypeError("Illegal constructor");
+      }
+      get brands() { return brands; }
+      get mobile() { return true; }
+      get platform() { return "PlayStation Portable"; }
+      getHighEntropyValues(hints) {
+        const all = {
+            architecture: "MIPS",
+            bitness: "32",
+            model: "PSP-3000",
+            platform: "PlayStation Portable",
+            platformVersion: "6.61",
+            uaFullVersion: String(globalThis.__tilefinchBrowserFullVersion),
+            fullVersionList,
           },
-          toJSON() {
-            return {
-              brands: this.brands,
-              mobile: this.mobile,
-              platform: this.platform,
-            };
-          },
-        },
-      };
+          value = {
+            brands,
+            mobile: true,
+            platform: "PlayStation Portable",
+          };
+        for (const hint of hints || [])
+          if (hint in all) value[hint] = all[hint];
+        return Promise.resolve(value);
+      }
+      toJSON() {
+        return { brands, mobile: true, platform: "PlayStation Portable" };
+      }
+    }
+    Object.defineProperty(NavigatorUAData.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "NavigatorUAData",
+    });
+    const uaData = diagnosticMobileSafari
+      ? undefined
+      : new NavigatorUAData(uaDataToken),
+      values = diagnosticMobileSafari
+        ? {
+            userAgent:
+              "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.4 Mobile/15E148 Safari/604.1",
+            platform: "iPhone",
+            maxTouchPoints: 5,
+            hardwareConcurrency: 6,
+            deviceMemory: undefined,
+          }
+        : {
+            userAgent: String(globalThis.__tilefinchBrowserUserAgent),
+            platform: "PSP",
+            maxTouchPoints: 0,
+            hardwareConcurrency: 1,
+            deviceMemory: 0.25,
+          };
+    class Navigator {
+      constructor() {
+        if (arguments[0] !== navigatorToken)
+          throw new TypeError("Illegal constructor");
+      }
+      get userAgent() { return values.userAgent; }
+      get appCodeName() { return "Mozilla"; }
+      get appName() { return "Netscape"; }
+      get appVersion() {
+        return values.userAgent.startsWith("Mozilla/")
+          ? values.userAgent.slice(8)
+          : "";
+      }
+      get language() { return languages[0]; }
+      get languages() { return languages; }
+      get platform() { return values.platform; }
+      get product() { return "Gecko"; }
+      get productSub() { return "20030107"; }
+      get vendor() { return ""; }
+      get vendorSub() { return ""; }
+      get maxTouchPoints() { return values.maxTouchPoints; }
+      get cookieEnabled() { return true; }
+      get onLine() { return true; }
+      get hardwareConcurrency() { return values.hardwareConcurrency; }
+      get deviceMemory() { return values.deviceMemory; }
+      get userAgentData() { return uaData; }
+      get gpu() { return globalThis.isSecureContext ? gpu : undefined; }
+      get plugins() { return plugins; }
+      get mimeTypes() { return mimeTypes; }
+      get pdfViewerEnabled() { return false; }
+      get webdriver() { return false; }
+      javaEnabled() { return false; }
+    }
+    Object.defineProperty(Navigator.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "Navigator",
+    });
+    for (const constructor of [
+      Navigator,
+      NavigatorUAData,
+      GPU,
+      WGSLLanguageFeatures,
+      PluginArray,
+      MimeTypeArray,
+      Plugin,
+      MimeType,
+    ])
+      for (const key of Reflect.ownKeys(constructor.prototype)) {
+        const descriptor = Object.getOwnPropertyDescriptor(
+          constructor.prototype,
+          key,
+        );
+        if (descriptor && key !== "constructor" && key !== Symbol.toStringTag)
+          Object.defineProperty(constructor.prototype, key, {
+            ...descriptor,
+            enumerable: true,
+          });
+      }
+    globalThis.Navigator = Navigator;
+    globalThis.NavigatorUAData = NavigatorUAData;
+    globalThis.GPU = GPU;
+    globalThis.WGSLLanguageFeatures = WGSLLanguageFeatures;
+    globalThis.PluginArray = PluginArray;
+    globalThis.MimeTypeArray = MimeTypeArray;
+    globalThis.Plugin = Plugin;
+    globalThis.MimeType = MimeType;
+    globalThis.navigator = new Navigator(navigatorToken);
+    Object.defineProperty(globalThis, "clientInformation", {
+      configurable: true,
+      enumerable: true,
+      get() { return globalThis.navigator; },
+    });
+    const storageManagerToken = {};
+    class StorageManager {
+      constructor() {
+        if (arguments[0] !== storageManagerToken)
+          throw new TypeError("Illegal constructor");
+      }
+      estimate() {
+        if (!(this instanceof StorageManager))
+          throw new TypeError("Illegal invocation");
+        const values = globalThis.__tilefinchStorageEstimate();
+        if (!values)
+          return Promise.reject(
+            new DOMException(
+              "Storage is unavailable for this origin",
+              "SecurityError",
+            ),
+          );
+        return Promise.resolve({
+          usage: Math.max(0, Number(values[0]) || 0),
+          quota: Math.max(0, Number(values[1]) || 0),
+        });
+      }
+      persisted() {
+        if (!(this instanceof StorageManager))
+          throw new TypeError("Illegal invocation");
+        return Promise.resolve(false);
+      }
+      persist() {
+        if (!(this instanceof StorageManager))
+          throw new TypeError("Illegal invocation");
+        return Promise.resolve(false);
+      }
+    }
+    Object.defineProperty(StorageManager.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "StorageManager",
+    });
+    for (const key of ["estimate", "persisted", "persist"])
+      Object.defineProperty(StorageManager.prototype, key, {
+        ...Object.getOwnPropertyDescriptor(StorageManager.prototype, key),
+        enumerable: true,
+      });
+    const storageManager = new StorageManager(storageManagerToken);
+    Object.defineProperty(Navigator.prototype, "storage", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        if (!(this instanceof Navigator))
+          throw new TypeError("Illegal invocation");
+        return storageManager;
+      },
+    });
+    globalThis.StorageManager = StorageManager;
+
+    /* The Keyboard Map API is exposed by Chromium even when the platform
+       cannot disclose a layout: getLayoutMap() resolves to a stable empty
+       map.  That is also the honest PSP result.  Instantiate the two platform
+       objects only if a page asks for them so ordinary navigation pays no
+       object-allocation cost. */
+    const keyboardToken = {},
+      keyboardLayoutMapToken = {},
+      emptyKeyboardMap = new Map();
+    let keyboard = null,
+      keyboardLayoutMap = null;
+    class KeyboardLayoutMap {
+      constructor() {
+        if (arguments[0] !== keyboardLayoutMapToken)
+          throw new TypeError("Illegal constructor");
+      }
+      get size() { return 0; }
+      entries() { return emptyKeyboardMap.entries(); }
+      forEach(callback, thisArg) {
+        if (typeof callback !== "function")
+          throw new TypeError("callback must be a function");
+        emptyKeyboardMap.forEach(callback, thisArg);
+      }
+      get(key) { return emptyKeyboardMap.get(String(key)); }
+      has(key) { return emptyKeyboardMap.has(String(key)); }
+      keys() { return emptyKeyboardMap.keys(); }
+      values() { return emptyKeyboardMap.values(); }
+      [Symbol.iterator]() { return this.entries(); }
+    }
+    class Keyboard {
+      constructor() {
+        if (arguments[0] !== keyboardToken)
+          throw new TypeError("Illegal constructor");
+      }
+      getLayoutMap() {
+        if (!(this instanceof Keyboard))
+          throw new TypeError("Illegal invocation");
+        if (keyboardLayoutMap === null)
+          keyboardLayoutMap = new KeyboardLayoutMap(keyboardLayoutMapToken);
+        return Promise.resolve(keyboardLayoutMap);
+      }
+      lock() {
+        if (!(this instanceof Keyboard))
+          throw new TypeError("Illegal invocation");
+        if (!document.fullscreenElement)
+          return Promise.reject(
+            new DOMException(
+              "Keyboard lock requires fullscreen",
+              "InvalidStateError",
+            ),
+          );
+        return Promise.resolve();
+      }
+      unlock() {
+        if (!(this instanceof Keyboard))
+          throw new TypeError("Illegal invocation");
+      }
+    }
+    for (const [constructor, tag] of [
+      [Keyboard, "Keyboard"],
+      [KeyboardLayoutMap, "KeyboardLayoutMap"],
+    ]) {
+      Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+        configurable: true,
+        value: tag,
+      });
+      for (const key of Reflect.ownKeys(constructor.prototype)) {
+        if (key === "constructor" || key === Symbol.toStringTag) continue;
+        const descriptor = Object.getOwnPropertyDescriptor(
+          constructor.prototype,
+          key,
+        );
+        if (descriptor)
+          Object.defineProperty(constructor.prototype, key, {
+            ...descriptor,
+            enumerable: true,
+          });
+      }
+    }
+    Object.defineProperty(Navigator.prototype, "keyboard", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        if (!(this instanceof Navigator))
+          throw new TypeError("Illegal invocation");
+        if (keyboard === null) keyboard = new Keyboard(keyboardToken);
+        return keyboard;
+      },
+    });
+    globalThis.Keyboard = Keyboard;
+    globalThis.KeyboardLayoutMap = KeyboardLayoutMap;
+
+  }
   {
     /* One fixed built-in controller is exposed only while the user has
        explicitly handed page input to the document. Keep every public object
@@ -6321,8 +6764,16 @@
       }
     }
     globalThis.GamepadEvent = GamepadEvent;
-    navigator.getGamepads = () =>
-      connected ? connectedPads : disconnectedPads;
+    Object.defineProperty(Navigator.prototype, "getGamepads", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: function getGamepads() {
+        if (!(this instanceof Navigator))
+          throw new TypeError("Illegal invocation");
+        return connected ? connectedPads : disconnectedPads;
+      },
+    });
     globalThis.__tilefinchUpdateGamepad = (
       nextConnected,
       buttonBits,
@@ -6348,19 +6799,47 @@
       queueMicrotask(() => dispatchEvent(new GamepadEvent(type, { gamepad })));
     };
   }
-  navigator.clipboard = {
-    writeText(value) {
+  {
+    const clipboardToken = {};
+    class Clipboard extends EventTarget {
+      constructor() {
+        super();
+        if (arguments[0] !== clipboardToken)
+          throw new TypeError("Illegal constructor");
+      }
+      writeText(value) {
       try {
         globalThis.__tilefinchClipboardWrite(value);
         return Promise.resolve();
       } catch (error) {
         return Promise.reject(error);
       }
-    },
-    readText() {
-      return Promise.resolve(globalThis.__tilefinchClipboardStats.text);
-    },
-  };
+      }
+      readText() {
+        return Promise.resolve(globalThis.__tilefinchClipboardStats.text);
+      }
+    }
+    Object.defineProperty(Clipboard.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "Clipboard",
+    });
+    for (const key of ["writeText", "readText"])
+      Object.defineProperty(Clipboard.prototype, key, {
+        ...Object.getOwnPropertyDescriptor(Clipboard.prototype, key),
+        enumerable: true,
+      });
+    const clipboard = new Clipboard(clipboardToken);
+    Object.defineProperty(Navigator.prototype, "clipboard", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        if (!(this instanceof Navigator))
+          throw new TypeError("Illegal invocation");
+        return clipboard;
+      },
+    });
+    globalThis.Clipboard = Clipboard;
+  }
   {
     const invalidBase64 = (detail) => {
       detail = String(detail);
@@ -6387,24 +6866,27 @@
       return __tilefinchBase64EncodeBytes(bytes);
     };
     globalThis.atob = (input) => {
-      let text = String(input).replace(/[\t\n\f\r ]/g, "");
-      if (text.length > 768 * 1024)
+      const text = String(input);
+      if (text.length > 1024 * 1024)
         throw new RangeError("base64 input exceeds bounded size");
-      if (text.length % 4 === 0) text = text.replace(/==?$/, "");
-      const remainder = text.length % 4,
-        bad = text.search(/[^A-Za-z0-9+/]/);
-      if (remainder === 1 || bad >= 0)
+      try {
+        return __tilefinchBase64DecodeString(text);
+      } catch (error) {
+        if (
+          !(error instanceof TypeError) ||
+          String(error.message || error) !== "invalid base64 input"
+        )
+          throw error;
+        const bad = text.search(/[^A-Za-z0-9+/=\t\n\f\r ]/);
         invalidBase64(
           "atob length=" +
             text.length +
-            " remainder=" +
-            remainder +
             " bad-index=" +
             bad +
             " bad-code=" +
             (bad < 0 ? -1 : text.charCodeAt(bad)),
         );
-      return __tilefinchBase64DecodeString(text);
+      }
     };
   }
   {
@@ -6846,17 +7328,18 @@
       };
     class MediaQueryListEvent {
       constructor(type, init = {}) {
-        if (
-          globalThis.Event &&
-          Object.getPrototypeOf(MediaQueryListEvent.prototype) !==
-            globalThis.Event.prototype
-        )
+        if (typeof globalThis.Event === "function") {
+          const event = new globalThis.Event(type, init);
           Object.setPrototypeOf(
             MediaQueryListEvent.prototype,
             globalThis.Event.prototype,
           );
+          Object.setPrototypeOf(event, MediaQueryListEvent.prototype);
+          event.media = String(init.media ?? "");
+          event.matches = !!init.matches;
+          return event;
+        }
         this.type = String(type);
-        this.defaultPrevented = false;
         this.media = String(init.media ?? "");
         this.matches = !!init.matches;
       }
@@ -6983,10 +7466,12 @@
   }
   class PerformanceEntry {
     constructor(name, type, startTime = 0, duration = 0) {
-      this.name = String(name);
-      this.entryType = String(type);
-      this.startTime = Number(startTime);
-      this.duration = Number(duration);
+      Object.defineProperties(this, {
+        name: { configurable: true, value: String(name) },
+        entryType: { configurable: true, value: String(type) },
+        startTime: { configurable: true, value: Number(startTime) },
+        duration: { configurable: true, value: Number(duration) },
+      });
     }
     toJSON() {
       return {
@@ -6998,45 +7483,214 @@
     }
   }
   class PerformanceResourceTiming extends PerformanceEntry {
-    constructor(name, initiatorType = "other") {
-      super(name, "resource", 0, 0);
-      this.initiatorType = String(initiatorType);
-      this.nextHopProtocol = "h2";
-      this.transferSize = 0;
-      this.encodedBodySize = 0;
-      this.decodedBodySize = 0;
+    constructor(name, initiatorType = "other", timing = {}) {
+      const startTime = Number(timing.startTime) || 0,
+        responseEnd = Number(timing.responseEnd) || startTime;
+      super(name, "resource", startTime, Math.max(0, responseEnd - startTime));
+      Object.defineProperties(this, {
+        initiatorType: {
+          configurable: true,
+          value: String(initiatorType),
+        },
+        nextHopProtocol: { configurable: true, value: "h2" },
+        workerStart: { configurable: true, value: 0 },
+        redirectStart: { configurable: true, value: 0 },
+        redirectEnd: { configurable: true, value: 0 },
+        fetchStart: { configurable: true, value: startTime },
+        domainLookupStart: {
+          configurable: true,
+          value: Number(timing.domainLookupStart) || startTime,
+        },
+        domainLookupEnd: {
+          configurable: true,
+          value: Number(timing.domainLookupEnd) || startTime,
+        },
+        connectStart: {
+          configurable: true,
+          value: Number(timing.connectStart) || startTime,
+        },
+        secureConnectionStart: {
+          configurable: true,
+          value: Number(timing.secureConnectionStart) || 0,
+        },
+        connectEnd: {
+          configurable: true,
+          value: Number(timing.connectEnd) || startTime,
+        },
+        requestStart: {
+          configurable: true,
+          value: Number(timing.requestStart) || startTime,
+        },
+        responseStart: {
+          configurable: true,
+          value: Number(timing.responseStart) || startTime,
+        },
+        responseEnd: { configurable: true, value: responseEnd },
+        transferSize: {
+          configurable: true,
+          value: Number(timing.transferSize) || 0,
+        },
+        encodedBodySize: {
+          configurable: true,
+          value: Number(timing.encodedBodySize) || 0,
+        },
+        decodedBodySize: {
+          configurable: true,
+          value: Number(timing.decodedBodySize) || 0,
+        },
+      });
+    }
+    toJSON() {
+      return {
+        ...super.toJSON(),
+        initiatorType: this.initiatorType,
+        nextHopProtocol: this.nextHopProtocol,
+        workerStart: this.workerStart,
+        redirectStart: this.redirectStart,
+        redirectEnd: this.redirectEnd,
+        fetchStart: this.fetchStart,
+        domainLookupStart: this.domainLookupStart,
+        domainLookupEnd: this.domainLookupEnd,
+        connectStart: this.connectStart,
+        secureConnectionStart: this.secureConnectionStart,
+        connectEnd: this.connectEnd,
+        requestStart: this.requestStart,
+        responseStart: this.responseStart,
+        responseEnd: this.responseEnd,
+        transferSize: this.transferSize,
+        encodedBodySize: this.encodedBodySize,
+        decodedBodySize: this.decodedBodySize,
+      };
     }
   }
   class PerformanceNavigationTiming extends PerformanceResourceTiming {
     constructor(name) {
       super(name, "navigation");
-      this.entryType = "navigation";
-      this.type = "navigate";
-      this.redirectCount = 0;
-      this.domInteractive = 0;
-      this.domContentLoadedEventStart = 0;
-      this.domContentLoadedEventEnd = 0;
-      this.loadEventStart = 0;
-      this.loadEventEnd = 0;
+      Object.defineProperties(this, {
+        entryType: { configurable: true, value: "navigation" },
+        type: { configurable: true, value: "navigate" },
+        redirectCount: { configurable: true, value: 0 },
+        domInteractive: { configurable: true, value: 0 },
+        domContentLoadedEventStart: { configurable: true, value: 0 },
+        domContentLoadedEventEnd: { configurable: true, value: 0 },
+        loadEventStart: { configurable: true, value: 0 },
+        loadEventEnd: { configurable: true, value: 0 },
+      });
+    }
+    toJSON() {
+      return {
+        ...super.toJSON(),
+        type: this.type,
+        redirectCount: this.redirectCount,
+        domInteractive: this.domInteractive,
+        domContentLoadedEventStart: this.domContentLoadedEventStart,
+        domContentLoadedEventEnd: this.domContentLoadedEventEnd,
+        loadEventStart: this.loadEventStart,
+        loadEventEnd: this.loadEventEnd,
+      };
+    }
+  }
+  for (const [constructor, name] of [
+    [PerformanceEntry, "PerformanceEntry"],
+    [PerformanceResourceTiming, "PerformanceResourceTiming"],
+    [PerformanceNavigationTiming, "PerformanceNavigationTiming"],
+  ]) {
+    Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: name,
+    });
+  }
+  const performanceObserverEntryListState = new WeakMap();
+  class PerformanceObserverEntryList {
+    constructor(entries) {
+      performanceObserverEntryListState.set(this, entries.slice());
+    }
+    getEntries() {
+      const entries = performanceObserverEntryListState.get(this);
+      if (!entries) throw new TypeError("Illegal invocation");
+      return entries.slice();
+    }
+    getEntriesByType(type) {
+      const entries = performanceObserverEntryListState.get(this);
+      if (!entries) throw new TypeError("Illegal invocation");
+      type = String(type);
+      return entries.filter((entry) => entry.entryType === type);
+    }
+    getEntriesByName(name, type) {
+      const entries = performanceObserverEntryListState.get(this);
+      if (!entries) throw new TypeError("Illegal invocation");
+      name = String(name);
+      if (type !== undefined) type = String(type);
+      return entries.filter(
+        (entry) =>
+          entry.name === name &&
+          (type === undefined || entry.entryType === type),
+      );
     }
   }
   Object.assign(globalThis, {
     PerformanceEntry,
     PerformanceResourceTiming,
     PerformanceNavigationTiming,
+    PerformanceObserverEntryList,
   });
   if (globalThis.__tilefinchDeterministicDateFacade !== Date)
     Date.now = () => __tilefinchDateNow(0);
-  const performanceEntries = [new PerformanceNavigationTiming(location.href)],
+  const performanceObserverState = new WeakMap(),
+    performanceObservers = new Set(),
+    performanceObserverLimit = 16,
+    performanceObserverRecordLimit = 64,
+    supportedPerformanceEntryTypes = Object.freeze([
+      "mark",
+      "measure",
+      "resource",
+      "navigation",
+      "paint",
+    ]),
+    schedulePerformanceObserver = (observer, state) => {
+      if (state.pending || state.records.length === 0) return;
+      state.pending = true;
+      setTimeout(() => {
+        state.pending = false;
+        if (!performanceObservers.has(observer) || state.records.length === 0)
+          return;
+        const records = state.records.splice(0),
+          entries = new PerformanceObserverEntryList(records);
+        try {
+          state.callback(entries, observer, {
+            droppedEntriesCount: state.dropped,
+          });
+        } catch (error) {
+          globalThis.__tilefinchReportUncaught?.(
+            error,
+            "PerformanceObserver",
+          );
+        }
+        state.dropped = 0;
+      }, 0);
+    },
+    notifyPerformanceObservers = (entry) => {
+      for (const observer of performanceObservers) {
+        const state = performanceObserverState.get(observer);
+        if (!state || !state.types.has(entry.entryType)) continue;
+        if (state.records.length >= performanceObserverRecordLimit) {
+          state.records.shift();
+          state.dropped++;
+        }
+        state.records.push(entry);
+        schedulePerformanceObserver(observer, state);
+      }
+    },
+    performanceEntries = [new PerformanceNavigationTiming(location.href)],
     appendPerformanceEntry = (entry) => {
       if (performanceEntries.length >= 128) {
         const at = performanceEntries.findIndex(
           (value) => value.entryType !== "navigation",
         );
-        if (at < 0) return entry;
-        performanceEntries.splice(at, 1);
+        if (at >= 0) performanceEntries.splice(at, 1);
       }
-      performanceEntries.push(entry);
+      if (performanceEntries.length < 128) performanceEntries.push(entry);
+      notifyPerformanceObservers(entry);
       return entry;
     },
     performanceMarkTime = (name) => {
@@ -7053,15 +7707,68 @@
     },
     performanceTimestamp = (value) =>
       typeof value === "string" ? performanceMarkTime(value) : Number(value);
-  globalThis.__tilefinchRecordResourceTiming = (name, initiatorType) =>
-    appendPerformanceEntry(
+  globalThis.__tilefinchRecordResourceTiming = (
+    name,
+    initiatorType,
+    nameLookupUs = 0,
+    connectUs = 0,
+    appconnectUs = 0,
+    firstByteUs = 0,
+    totalUs = 0,
+    decodedBodyBytes = 0,
+    measured = false,
+    cacheHit = false,
+  ) => {
+    const end = __tilefinchPerformanceNow(6),
+      duration = measured ? Math.max(0, Number(totalUs) / 1000) : 0,
+      start = Math.max(0, end - duration),
+      at = (microseconds) =>
+        measured
+          ? Math.min(end, start + Math.max(0, Number(microseconds) / 1000))
+          : start,
+      bytes = Math.max(0, Number(decodedBodyBytes) || 0);
+    return appendPerformanceEntry(
       new PerformanceResourceTiming(
         String(name),
         String(initiatorType || "other"),
+        {
+          startTime: start,
+          domainLookupStart: start,
+          domainLookupEnd: at(nameLookupUs),
+          connectStart: at(nameLookupUs),
+          secureConnectionStart: at(connectUs),
+          connectEnd: at(appconnectUs || connectUs),
+          requestStart: at(appconnectUs || connectUs),
+          responseStart: at(firstByteUs),
+          responseEnd: end,
+          transferSize: cacheHit ? 0 : bytes,
+          encodedBodySize: bytes,
+          decodedBodySize: bytes,
+        },
       ),
     );
+  };
   const performanceTimeOrigin = Date.now();
-  globalThis.performance = {
+  class Performance {
+    constructor() {
+      throw new TypeError("Illegal constructor");
+    }
+  }
+  Object.defineProperty(Performance.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "Performance",
+  });
+  /* Tilefinch has no process-isolated browsing-context group and therefore
+     exposes the reduced-resolution timing surface.  Keep the capability fact
+     explicit instead of leaving feature detection to infer it from missing
+     SharedArrayBuffer APIs. */
+  Object.defineProperty(globalThis, "crossOriginIsolated", {
+    value: false,
+    writable: false,
+    enumerable: true,
+    configurable: true,
+  });
+  const performanceValue = Object.assign(Object.create(Performance.prototype), {
     timeOrigin: performanceTimeOrigin,
     /* Deprecated, but still read by bootstrap/telemetry code on major sites.
        Keep the bounded navigation-zero surface rather than forcing those
@@ -7176,26 +7883,153 @@
           performanceEntries.splice(i, 1);
     },
     setResourceTimingBufferSize() {},
+  });
+  globalThis.Performance = Performance;
+  globalThis.performance = performanceValue;
+  /* A dedicated worker has its own performance time origin and monotonic zero.
+     Keep the implementation bounded by sharing the immutable interface shape,
+     while rebasing now() for the worker lifetime.  The object itself must not
+     be the Window's Performance instance: identity, branding, and timeOrigin
+     are all standards-visible and are used by capability probes. */
+  globalThis.__tilefinchCreateWorkerPerformance = () => {
+    const monotonicOrigin = __tilefinchPerformanceNow(3),
+      value = Object.assign(
+        Object.create(Performance.prototype),
+        performanceValue,
+      );
+    Object.defineProperties(value, {
+      timeOrigin: {
+        configurable: true,
+        enumerable: true,
+        value: Date.now(),
+      },
+      now: {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value: () => Math.max(
+          0,
+          __tilefinchPerformanceNow(3) - monotonicOrigin,
+        ),
+      },
+    });
+    delete value.timing;
+    delete value.navigation;
+    return value;
   };
-  globalThis.PerformanceObserver = class {
-    static supportedEntryTypes = [
-      "mark",
-      "measure",
-      "resource",
-      "navigation",
-      "paint",
-    ];
+  const memoryInfoState = new WeakMap(),
+    memoryInfoPrototype = Object.create(Object.prototype),
+    memoryInfoValue = (object, index) => {
+      const values = memoryInfoState.get(object);
+      if (!values) throw new TypeError("Illegal invocation");
+      return values[index];
+    };
+  Object.defineProperties(memoryInfoPrototype, {
+    totalJSHeapSize: {
+      configurable: true,
+      enumerable: true,
+      get() { return memoryInfoValue(this, 1); },
+    },
+    usedJSHeapSize: {
+      configurable: true,
+      enumerable: true,
+      get() { return memoryInfoValue(this, 2); },
+    },
+    jsHeapSizeLimit: {
+      configurable: true,
+      enumerable: true,
+      get() { return memoryInfoValue(this, 0); },
+    },
+    [Symbol.toStringTag]: {
+      configurable: true,
+      value: "MemoryInfo",
+    },
+  });
+  Object.defineProperty(globalThis.performance, "memory", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      const values = globalThis.__tilefinchHeapMemorySnapshot();
+      const object = Object.create(memoryInfoPrototype);
+      memoryInfoState.set(object, [
+        Math.max(0, Number(values?.[0]) || 0),
+        Math.max(0, Number(values?.[1]) || 0),
+        Math.max(0, Number(values?.[2]) || 0),
+      ]);
+      return object;
+    },
+  });
+  globalThis.PerformanceObserver = class PerformanceObserver {
     constructor(callback) {
       if (typeof callback !== "function")
         throw new TypeError("callback required");
-      this.callback = callback;
+      performanceObserverState.set(this, {
+        callback,
+        types: new Set(),
+        records: [],
+        pending: false,
+        dropped: 0,
+      });
     }
-    observe() {}
-    disconnect() {}
+    observe(options = {}) {
+      const state = performanceObserverState.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      options = Object(options);
+      const hasEntryTypes = options.entryTypes !== undefined,
+        hasType = options.type !== undefined;
+      if (hasEntryTypes === hasType)
+        throw new TypeError("Specify entryTypes or type");
+      const requested = hasType
+          ? [String(options.type)]
+          : Array.from(options.entryTypes, String),
+        types = new Set(
+          requested.filter((type) =>
+            supportedPerformanceEntryTypes.includes(type),
+          ),
+        );
+      if (performanceObservers.size >= performanceObserverLimit &&
+          !performanceObservers.has(this))
+        throw new RangeError("PerformanceObserver quota exceeded");
+      state.types = types;
+      performanceObservers.add(this);
+      if (hasType && options.buffered && types.has(requested[0])) {
+        for (const entry of performanceEntries) {
+          if (entry.entryType !== requested[0]) continue;
+          if (state.records.length >= performanceObserverRecordLimit) {
+            state.records.shift();
+            state.dropped++;
+          }
+          state.records.push(entry);
+        }
+        schedulePerformanceObserver(this, state);
+      }
+    }
+    disconnect() {
+      const state = performanceObserverState.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      state.types.clear();
+      state.records.length = 0;
+      state.pending = false;
+      state.dropped = 0;
+      performanceObservers.delete(this);
+    }
     takeRecords() {
-      return [];
+      const state = performanceObserverState.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state.records.splice(0);
     }
   };
+  Object.defineProperty(
+    globalThis.PerformanceObserver.prototype,
+    Symbol.toStringTag,
+    { configurable: true, value: "PerformanceObserver" },
+  );
+  Object.defineProperty(PerformanceObserver, "supportedEntryTypes", {
+    value: supportedPerformanceEntryTypes,
+    writable: false,
+    enumerable: true,
+    configurable: true,
+  });
   globalThis.r = {
     config: {},
     setup(value) {

@@ -214,6 +214,7 @@
       "document_bytes": 1048576,
       "resource_count": 32,
       "resource_body_bytes_total": 1048576,
+      "classic_script_bytes_each": 393216,
       "classic_script_compile_count": 8,
       "classic_script_compile_source_bytes": 524288,
       "classic_script_bytecode_bytes": 524288,

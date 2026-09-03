@@ -471,7 +471,8 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
     item->method = scheduler_copy(scheduler->budget, method, 16);
     item->body = scheduler_copy_bytes(
         scheduler->budget, source == NULL ? NULL : source->body,
-        source == NULL ? 0 : source->body_length, 64u * 1024u);
+        source == NULL ? 0 : source->body_length,
+        FETCH_REQUEST_BODY_LIMIT);
     item->content_type = scheduler_copy(
         scheduler->budget, source == NULL ? NULL : source->content_type, 255);
     item->extra_headers = scheduler_copy(

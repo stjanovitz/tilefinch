@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turnstile interactive standards fixture</title>
+<style>
+  body { font: 16px sans-serif; margin: 20px; }
+  #widget { width: 300px; min-height: 150px; }
+</style>
+<h1>Turnstile interactive standards fixture</h1>
+<p id="status">loading</p>
+<div id="widget"></div>
+<script>
+  function fixtureTurnstileLoaded() {
+    document.getElementById("status").textContent = "rendering";
+    turnstile.render("#widget", {
+      sitekey: "3x00000000000000000000FF",
+      callback: function (token) {
+        document.getElementById("status").textContent =
+          token ? "complete" : "empty-token";
+      },
+      "error-callback": function (code) {
+        document.getElementById("status").textContent = "error:" + code;
+      },
+    });
+  }
+</script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&amp;onload=fixtureTurnstileLoaded" async defer></script>

@@ -1623,17 +1623,25 @@ int main(int argc, char **argv)
                    (unsigned) reader.listing_entries,
                    (unsigned) reader.visited_nodes,
                    reader.bounded_out ? "yes" : "no");
-        } else if (!reader_available
-                   || !site_adapter_reader_css(
-                          reader_url, SITE_ADAPTER_READER_FONT_SANS, 100u,
-                          reader_css, sizeof(reader_css), adapter,
-                          sizeof(adapter))
-                   || !browser_engine_apply_user_css(
-                          engine, reader_css, strlen(reader_css))
-                   || !browser_engine_activate_reader_view(engine)) {
-            fprintf(stderr, "interactive Reader mode failed\n");
-            goto cleanup;
         } else {
+            bool css_ready = reader_available && site_adapter_reader_css(
+                reader_url, SITE_ADAPTER_READER_FONT_SANS, 100u,
+                reader_css, sizeof(reader_css), adapter, sizeof(adapter));
+            bool css_applied = css_ready && browser_engine_apply_user_css(
+                engine, reader_css, strlen(reader_css));
+            bool activated = css_applied
+                && browser_engine_activate_reader_view(engine);
+            if (!activated) {
+                fprintf(stderr,
+                    "interactive Reader mode failed stage=%s kind=%s "
+                    "bounded=%s\n",
+                    !reader_available ? "prepare"
+                      : !css_ready ? "css-build"
+                      : !css_applied ? "css-apply" : "activate",
+                    reader_page_kind_name(reader.kind),
+                    reader.bounded_out ? "yes" : "no");
+                goto cleanup;
+            }
             printf("reader-mode kind=%s high-confidence=%s entries=%u "
                    "visited=%u bounded=%s adapter=%s available=yes\n",
                    reader_page_kind_name(reader.kind),
@@ -3074,6 +3082,10 @@ int main(int argc, char **argv)
                child->script_result.performance_now_last_ms,
                child->script_result.date_now_calls,
                child->script_result.date_now_last_ms);
+        printf("frame[%zu] timers callbacks=%zu pending=%zu roots=%zu\n", i,
+               child->script_result.timer_callbacks_run,
+               child->script_result.pending_tasks,
+               child->script_result.root_timers);
         printf("frame[%zu] network requests=%zu failures=%zu status=%ld "
                "async=%zu/%zu/%zu url=\"%s\"\n", i,
                child->script_result.network_requests,

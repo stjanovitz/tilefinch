@@ -8,6 +8,8 @@ visibility lifecycle events, and a small persistent Web Audio oscillator
 graph. It has four levels, multiball, wide-paddle, slow-ball, shield, and laser
 power-ups, plus trails, particles, and hit flashes.
 
+![Prism Break 3D running at the PSP viewport](screenshots/gameplay.jpg)
+
 Serve the repository over HTTPS, open `examples/prism-break-3d/index.html`,
 then use **Page tools → Install offline app**. Tilefinch snapshots the same-origin
 HTML, CSS, JavaScript, and manifest; no Service Worker or network access is

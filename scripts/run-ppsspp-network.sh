@@ -590,7 +590,8 @@ if [ "$launcher" -eq 1 ]; then
     config_path="$app_dir/data/boot-overrides.cfg"
     validation_log="$app_dir/data/tilefinch-validation.txt"
 else
-    cp "$build_dir/EBOOT.PBP" "$build_dir/roots.pem" "$app_dir/"
+    cp "$build_dir/EBOOT.PBP" "$build_dir/roots.pem" \
+        "$build_dir/tilefinch-wasm.prx" "$app_dir/"
     for asset_dir in fonts voice-model; do
         if [ -d "$build_dir/$asset_dir" ]; then
             cp -R "$build_dir/$asset_dir" "$app_dir/$asset_dir"

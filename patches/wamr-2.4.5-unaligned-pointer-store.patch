@@ -1,0 +1,71 @@
+--- a/core/iwasm/common/wasm_runtime_common.h
++++ b/core/iwasm/common/wasm_runtime_common.h
+@@ -88,9 +88,13 @@ STORE_V128(void *addr, V128 value)
+ #define LOAD_U16(addr) (*(uint16 *)(addr))
+ #define LOAD_V128(addr) (*(V128 *)(addr))
+ 
+-#define STORE_PTR(addr, ptr)          \
+-    do {                              \
+-        *(void **)addr = (void *)ptr; \
++/* Fast-interpreter bytecode is only byte-aligned.  AArch64 tolerates the
++ * hardware access, but forming a misaligned void ** is still undefined C and
++ * is rejected by alignment sanitizers. */
++#define STORE_PTR(addr, ptr)              \
++    do {                                  \
++        void *store_ptr_value = (void *)ptr; \
++        memcpy((addr), &store_ptr_value, sizeof(store_ptr_value)); \
+     } while (0)
+ 
+ #else /* WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS != 0 */
+--- a/core/iwasm/interpreter/wasm_interp.h
++++ b/core/iwasm/interpreter/wasm_interp.h
+@@ -99,9 +99,11 @@ wasm_interp_interp_frame_size(unsigned all_cell_num)
+         (uint32)offsetof(WASMInterpFrame, lp) + align_uint(all_cell_num * 5, 4);
+ #endif
+ #else
+     frame_size = (uint32)offsetof(WASMInterpFrame, operand) + all_cell_num * 4;
+ #endif
+-    return align_uint(frame_size, 4);
++    /* WASM cells are four bytes, but the frame header contains native
++     * pointers and must retain their alignment on 64-bit hosts. */
++    return align_uint(frame_size, (uint32)sizeof(void *));
+ }
+ 
+ void
+--- a/core/iwasm/interpreter/wasm_interp_fast.c
++++ b/core/iwasm/interpreter/wasm_interp_fast.c
+@@ -281,7 +281,13 @@ local_copysign(double x, double y)
+ 
+ #if WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS != 0
+ #define LOAD_U32_WITH_2U16S(addr) (*(uint32 *)(addr))
+-#define LOAD_PTR(addr) (*(void **)(addr))
++static inline void *
++LOAD_PTR(void *addr)
++{
++    void *value;
++    memcpy(&value, addr, sizeof(value));
++    return value;
++}
+ #else /* else of WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS */
+ static inline uint32
+ LOAD_U32_WITH_2U16S(void *addr)
+@@ -1439,13 +1445,13 @@ print_frame_ip(uint8 *frame_ip)
+ #else
+ #define HANDLE_OP(opcode) HANDLE_##opcode:
+ #endif
+ #if WASM_CPU_SUPPORTS_UNALIGNED_ADDR_ACCESS != 0
+-#define FETCH_OPCODE_AND_DISPATCH()                    \
+-    do {                                               \
+-        const void *p_label_addr = *(void **)frame_ip; \
+-        frame_ip += sizeof(void *);                    \
+-        CHECK_INSTRUCTION_LIMIT();                     \
+-        goto *p_label_addr;                            \
++#define FETCH_OPCODE_AND_DISPATCH()                           \
++    do {                                                      \
++        const void *p_label_addr = LOAD_PTR(frame_ip);        \
++        frame_ip += sizeof(void *);                           \
++        CHECK_INSTRUCTION_LIMIT();                            \
++        goto *p_label_addr;                                   \
+     } while (0)
+ #else
+ #define FETCH_OPCODE_AND_DISPATCH()             \

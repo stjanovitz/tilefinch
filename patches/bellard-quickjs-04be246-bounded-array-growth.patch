@@ -1,8 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
-index e16b491..b6afd48 100644
+index 3eef69f..016773e 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -339,6 +339,9 @@ struct JSRuntime {
+@@ -620,6 +620,9 @@ struct JSRuntime {
         binary string per character) with a catchable RangeError instead
         of an engine-wide out-of-memory storm.  TILEFINCH_JS_ARRAY_CAP_KB. */
      size_t fast_array_byte_limit;
@@ -12,12 +12,12 @@ index e16b491..b6afd48 100644
  
      int class_count;    /* size of class_array */
      JSClass *class_array;
-@@ -2091,11 +2094,19 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
+@@ -2653,11 +2656,19 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
      memset(rt, 0, sizeof(*rt));
      {
          const char *cap = getenv("TILEFINCH_JS_ARRAY_CAP_KB");
 +        const char *growth = getenv("TILEFINCH_JS_ARRAY_GROWTH_KB");
-+        rt->fast_array_growth_byte_limit = 512 * 1024;
++        rt->fast_array_growth_byte_limit = 128 * 1024;
          if (cap != NULL) {
              long cap_kb = atol(cap);
              if (cap_kb > 0)
@@ -32,22 +32,23 @@ index e16b491..b6afd48 100644
      }
      js_malloc_init(&rt->malloc_ctx);
      rt->malloc_ctx.mf = *mf;
-@@ -9582,6 +9593,7 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
+@@ -10764,6 +10775,8 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
  static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
  {
      uint32_t new_size;
 +    uint64_t current_bytes, growth_bytes, grown_size;
++    uint64_t minimum_bytes, requested_bytes, headroom;
      size_t slack;
      JSValue *new_array_prop;
      if (unlikely(ctx->rt->fast_array_byte_limit != 0)
-@@ -9590,8 +9602,20 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
+@@ -10772,8 +10785,48 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
          JS_ThrowRangeError(ctx, "array exceeds the device profile size");
          return -1;
      }
 -    /* XXX: potential arithmetic overflow */
 -    new_size = max_int(new_len, p->u.array.u1.size * 3 / 2);
 +    current_bytes = sizeof(JSValue) * (uint64_t)p->u.array.u1.size;
-+    if (current_bytes >= 1024 * 1024
++    if (current_bytes >= 512 * 1024
 +        && ctx->rt->fast_array_growth_byte_limit != 0) {
 +        growth_bytes = current_bytes / 4;
 +        if (growth_bytes > ctx->rt->fast_array_growth_byte_limit)
@@ -60,6 +61,34 @@ index e16b491..b6afd48 100644
 +    if (grown_size > UINT32_MAX)
 +        grown_size = UINT32_MAX;
 +    new_size = new_len > grown_size ? new_len : (uint32_t)grown_size;
++    minimum_bytes = sizeof(JSValue) * (uint64_t)new_len;
++    requested_bytes = sizeof(JSValue) * (uint64_t)new_size;
++    if (requested_bytes > current_bytes
++        && ctx->rt->malloc_ctx.malloc_state.malloc_size
++               <= ctx->rt->malloc_ctx.malloc_state.malloc_limit) {
++        headroom = ctx->rt->malloc_ctx.malloc_state.malloc_limit
++            - ctx->rt->malloc_ctx.malloc_state.malloc_size;
++        if (requested_bytes - current_bytes > headroom) {
++            /* Cyclic garbage is normally collected when a new object is
++               allocated, but a realloc-only append can reach the limit
++               without passing that trigger.  Collect once before dropping
++               optional array slack.  The array and pushed value remain
++               rooted by the active interpreter frame. */
++            JS_RunGC(ctx->rt);
++            headroom = ctx->rt->malloc_ctx.malloc_state.malloc_size
++                    <= ctx->rt->malloc_ctx.malloc_state.malloc_limit
++                ? ctx->rt->malloc_ctx.malloc_state.malloc_limit
++                    - ctx->rt->malloc_ctx.malloc_state.malloc_size
++                : 0;
++        }
++        if (requested_bytes - current_bytes > headroom
++            && minimum_bytes >= current_bytes
++            && minimum_bytes - current_bytes <= headroom) {
++            /* Lack of room for speculative capacity is not an OOM when the
++               requested element itself still fits. */
++            new_size = new_len;
++        }
++    }
      new_array_prop = js_realloc2(ctx, p->u.array.u.values, sizeof(JSValue) * new_size, &slack);
      if (!new_array_prop)
          return -1;

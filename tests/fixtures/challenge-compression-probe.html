@@ -1,0 +1,68 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Compression Streams compatibility probe</title>
+<pre id="result">pending</pre>
+<script>
+  const readAll = async (stream) => {
+    const reader = stream.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+      const item = await reader.read();
+      if (item.done) break;
+      chunks.push(item.value);
+      total += item.value.byteLength;
+    }
+    const joined = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      joined.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return joined;
+  };
+
+  (async () => {
+    const source = new Uint8Array(270000);
+    for (let index = 0; index < source.length; index++)
+      source[index] = (index * 29 + 7) & 255;
+    const sizes = {};
+    for (const format of ["deflate", "deflate-raw", "gzip"]) {
+      const compressor = new CompressionStream(format);
+      const writer = compressor.writable.getWriter();
+      await writer.write(source.subarray(0, 90000));
+      await writer.write(source.subarray(90000, 180000));
+      await writer.write(source.subarray(180000));
+      await writer.close();
+      const compressed = await readAll(compressor.readable);
+
+      const decompressor = new DecompressionStream(format);
+      const inflateWriter = decompressor.writable.getWriter();
+      await inflateWriter.write(compressed);
+      await inflateWriter.close();
+      const restored = await readAll(decompressor.readable);
+      if (restored.length !== source.length) throw new Error("length");
+      for (let index = 0; index < source.length; index += 997) {
+        if (restored[index] !== source[index]) throw new Error("content");
+      }
+      sizes[format] = compressed.length;
+    }
+    let malformed = false;
+    try {
+      const bad = new DecompressionStream("gzip");
+      const writer = bad.writable.getWriter();
+      await writer.write(new Uint8Array([1, 2, 3]));
+      await writer.close();
+    } catch (error) {
+      malformed = error instanceof TypeError;
+    }
+    if (!malformed) throw new Error("malformed input accepted");
+    const summary = "compression:ok:" + JSON.stringify(sizes);
+    document.querySelector("#result").textContent = summary;
+    globalThis.pocSummary = summary;
+  })().catch((error) => {
+    const summary = "compression:fail:" + String(error);
+    document.querySelector("#result").textContent = summary;
+    globalThis.pocSummary = summary;
+  });
+</script>

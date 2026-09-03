@@ -5,6 +5,8 @@ PSP. Drive with independent treads, aim the turret separately, break apart the
 arena, and fight through short matches designed for a 480×272 display. The
 entire game can be installed into Tilefinch's offline library.
 
+![Treadline Arena combat on a 480×272 game surface](screenshots/gameplay.jpg)
+
 ## Features
 
 - Four ways to play: Survival, Team Control, Convoy Escort, and the escalating

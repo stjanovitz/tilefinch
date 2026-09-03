@@ -12,5 +12,5 @@ tilefinch-input-script: covered action=show-offline count=1
 tilefinch-input-script: covered action=collection-activate count=1
 tilefinch-input-script: outcome=complete steps=16/17 frames=390 held-frames=8 actions=3 settings=0
 tilefinch-input-script: capture=deploy-pressed written=1 size=240x136
+tilefinch-input-script: capture=deploy-30 written=1 size=240x136
 tilefinch-input-script: capture=deploy-90 written=1 size=240x136
-tilefinch-input-script: capture=deploy-210 written=1 size=240x136

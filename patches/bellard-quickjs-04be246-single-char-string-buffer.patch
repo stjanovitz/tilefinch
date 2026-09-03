@@ -1,0 +1,22 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -4368,6 +4368,18 @@ static JSValue string_buffer_end(StringBuffer *s)
+     }
+     if (!s->is_wide_char)
+         str->u.str8[s->len] = 0;
++    /* StringBuffer is also the implementation path for APIs such as
++       String.fromCharCode().  Reuse the runtime's immutable Latin-1
++       singleton when that path produces one code unit; otherwise a loop
++       that pushes per-character strings into an array retains one separate
++       allocation per element until join().  The value remains an ordinary
++       ECMAScript string, and string primitive identity is unobservable. */
++    if (s->len == 1 && !s->is_wide_char) {
++        char c = (char)str->u.str8[0];
++        js_free(s->ctx, str);
++        s->str = NULL;
++        return js_new_string8_len(s->ctx, &c, 1);
++    }
+ #ifdef DUMP_LEAKS
+     list_add_tail(&str->link, &s->ctx->rt->string_list);
+ #endif

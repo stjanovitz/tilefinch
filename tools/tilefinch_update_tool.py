@@ -19,7 +19,9 @@ P256_ORDER = int(
 )
 MAX_PACKAGE = 32 * 1024 * 1024
 MAX_FILES = 64
-ALLOWED_EXACT = {"EBOOT.PBP", "roots.pem", "boot-defaults.cfg"}
+ALLOWED_EXACT = {
+    "EBOOT.PBP", "roots.pem", "boot-defaults.cfg", "tilefinch-wasm.prx"
+}
 ALLOWED_PREFIX = ("fonts/",)
 VOICE_ALLOWED_EXACT = {"model-info.tfv"}
 VOICE_ALLOWED_PREFIX = ("model/", "LICENSES/")

@@ -386,6 +386,10 @@ static bool test_accepted_critical_client_hints(void)
         || !fetch_accepted_critical_client_hints(
             "Sec-CH-UA-WoW64", "Sec-CH-UA-WoW64",
             accepted, sizeof(accepted))
+        || accepted[0] != '\0'
+        || !fetch_accepted_critical_client_hints(
+            "UA, UA-Arch", "UA, UA-Arch",
+            accepted, sizeof(accepted))
         || accepted[0] != '\0') return false;
 
     /* Preserve Critical-CH order while canonicalizing whitespace and removing
@@ -398,6 +402,16 @@ static bool test_accepted_critical_client_hints(void)
             accepted, sizeof(accepted))
         || strcmp(accepted,
                   "Sec-CH-UA-Arch, Sec-CH-UA-Model") != 0) return false;
+    if (!fetch_client_hint_tokens_cover(
+            "Sec-CH-UA-Model, Sec-CH-UA-Arch",
+            "sec-ch-ua-arch")
+        || !fetch_client_hint_tokens_cover(
+            "Sec-CH-UA-Arch, Sec-CH-UA-Model",
+            "Sec-CH-UA-Model, Sec-CH-UA-Arch")
+        || fetch_client_hint_tokens_cover(
+            "Sec-CH-UA-Arch", "Sec-CH-UA-Model")
+        || fetch_client_hint_tokens_cover(
+            "Sec-CH-UA-Arch,", "Sec-CH-UA-Arch")) return false;
 
     static const struct {
         const char *accept_ch;
@@ -476,7 +490,10 @@ static bool test_request_validation_before_replay(void)
     error = FETCH_REQUEST_VALIDATION_OK;
     if (fetch_request_validate(&candidate, &error)
         || error != FETCH_REQUEST_VALIDATION_BODY) return false;
-    candidate.body_length = 64u * 1024u + 1u;
+    candidate.method = "POST";
+    candidate.body_length = FETCH_REQUEST_BODY_LIMIT;
+    if (!fetch_request_validate(&candidate, NULL)) return false;
+    candidate.body_length = FETCH_REQUEST_BODY_LIMIT + 1u;
     if (fetch_request_validate(&candidate, NULL)) return false;
     candidate = request();
     candidate.body = "x";

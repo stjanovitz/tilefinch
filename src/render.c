@@ -687,6 +687,29 @@ static bool layout_has_unbounded_css_backdrop_filter(
     return false;
 }
 
+/* A single retained bitmap can preserve fixed-range stacking only when the
+   bounded and unbounded ranges form at most two contiguous groups. More
+   complex interleaving remains on the direct path rather than flattening a
+   bounded scene above an unbounded overlay which originally followed it. */
+static bool fixed_cache_composition_order(const LayoutDocument *layout,
+                                          bool *bounded_first)
+{
+    if (bounded_first != NULL) *bounded_first = false;
+    if (layout == NULL || layout->fixed_count == 0u) return true;
+    bool first_bounded = layout->fixed_ranges[0].scroll_end != INT_MAX;
+    bool previous_bounded = first_bounded;
+    size_t transitions = 0u;
+    for (size_t i = 1u; i < layout->fixed_count; i++) {
+        bool bounded = layout->fixed_ranges[i].scroll_end != INT_MAX;
+        if (bounded == previous_bounded) continue;
+        transitions++;
+        previous_bounded = bounded;
+        if (transitions > 1u) return false;
+    }
+    if (bounded_first != NULL) *bounded_first = first_bounded;
+    return true;
+}
+
 static bool build_fixed_cache(TileCache *cache, int viewport_width,
                               int viewport_height)
 {
@@ -698,6 +721,7 @@ static bool build_fixed_cache(TileCache *cache, int viewport_width,
        fixed cache is deliberately page-independent, so route only these rare
        bounded commands through the direct framebuffer path. */
     if (layout_has_unbounded_css_backdrop_filter(cache->layout)) return false;
+    if (!fixed_cache_composition_order(cache->layout, NULL)) return false;
     if (cache->layout->command_flags != NULL) {
         (void) overflow_cache_prepare(cache);
     }
@@ -2047,10 +2071,19 @@ RenderCanvasFrameResult tile_cache_render_canvas_frame_fast(
                           viewport_width, viewport_height);
     if (cache->layout->fixed_count != 0) {
         if (build_fixed_cache(cache, viewport_width, viewport_height)) {
+            bool bounded_first = false;
+            (void) fixed_cache_composition_order(
+                cache->layout, &bounded_first);
+            if (bounded_first) {
+                paint_fixed_overlays(cache, cache->frame, scroll_y,
+                                     viewport_width, viewport_height, true);
+            }
             paint_cached_fixed_overlays(cache, cache->frame,
                                         viewport_width, viewport_height);
-            paint_fixed_overlays(cache, cache->frame, scroll_y,
-                                 viewport_width, viewport_height, true);
+            if (!bounded_first) {
+                paint_fixed_overlays(cache, cache->frame, scroll_y,
+                                     viewport_width, viewport_height, true);
+            }
         } else {
             paint_fixed_overlays(cache, cache->frame, scroll_y,
                                  viewport_width, viewport_height, false);
@@ -2450,10 +2483,19 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
     phase_started = phase_finished;
     if (ok && cache->layout->fixed_count != 0) {
         if (build_fixed_cache(cache, viewport_width, viewport_height)) {
+            bool bounded_first = false;
+            (void) fixed_cache_composition_order(
+                cache->layout, &bounded_first);
+            if (bounded_first) {
+                paint_fixed_overlays(cache, frame, scroll_y, viewport_width,
+                                     viewport_height, true);
+            }
             paint_cached_fixed_overlays(cache, frame, viewport_width,
                                         viewport_height);
-            paint_fixed_overlays(cache, frame, scroll_y, viewport_width,
-                                 viewport_height, true);
+            if (!bounded_first) {
+                paint_fixed_overlays(cache, frame, scroll_y, viewport_width,
+                                     viewport_height, true);
+            }
         } else {
             paint_fixed_overlays(cache, frame, scroll_y, viewport_width,
                                  viewport_height, false);

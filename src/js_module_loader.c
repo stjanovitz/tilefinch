@@ -92,9 +92,11 @@ bool script_compile_classic_bytecode(
            on PSP.  Strip them only for the large-game class. Small scripts
            keep line metadata, while every package still retains source for a
            compiler-ABI miss or ordinary source recompile. */
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
         JS_SetStripInfo(runtime,
             source_length >= 128u * 1024u
                 ? JS_STRIP_DEBUG : JS_STRIP_SOURCE);
+#endif
         context = JS_NewContext(runtime);
     }
     if (context != NULL) {
@@ -102,9 +104,13 @@ bool script_compile_classic_bytecode(
             context, source, source_length, source_url,
             JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
         if (!JS_IsException(compiled)) {
+            int write_flags = JS_WRITE_OBJ_BYTECODE;
+#if !defined(PSP_BROWSER_BELLARD_QUICKJS)
+            write_flags |= source_length >= 128u * 1024u
+                ? JS_WRITE_OBJ_STRIP_DEBUG : JS_WRITE_OBJ_STRIP_SOURCE;
+#endif
             serialized = JS_WriteObject(
-                context, &serialized_length, compiled,
-                JS_WRITE_OBJ_BYTECODE);
+                context, &serialized_length, compiled, write_flags);
         }
         if (serialized != NULL && serialized_length != 0
             && serialized_length <= maximum_bytecode_length) {
@@ -820,7 +826,8 @@ static bool script_runtime_evaluate_external_typed_at(
         runtime->result.external_scripts_failed++;
         runtime->result.success = true;
         size_t slot = 0;
-        if (js_rt_bridge_node_slot_for_handle(
+        if (!script_runtime_document_refresh_failed(runtime)
+            && js_rt_bridge_node_slot_for_handle(
                 &runtime->bridge, script_handle, &slot)) {
             (void) script_runtime_dispatch_node(
                 runtime, runtime->bridge.nodes[slot], "error", NULL);

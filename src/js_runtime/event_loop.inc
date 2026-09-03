@@ -338,7 +338,7 @@ static bool runtime_call_captured(ScriptRuntime *runtime,
 
 bool script_runtime_configure_messaging(
     ScriptRuntime *runtime, bool child_context, bool parent_same_origin,
-    bool child_opaque_origin,
+    bool child_opaque_origin, bool top_is_parent,
     ScriptPostMessageCallback callback, void *opaque)
 {
     if (runtime == NULL || callback == NULL) return false;
@@ -363,21 +363,21 @@ bool script_runtime_configure_messaging(
     (void) script_runtime_rebind_remote_document(runtime, NULL);
     runtime->document_scope = SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME;
     static const char same_origin_child_setup[] =
-        "(()=>{globalThis.__tilefinchTaskRealm='child';"
+        "(()=>{globalThis.__tilefinchTaskRealm='child';const topIsParent=!!globalThis.__tilefinchTopIsParent;delete globalThis.__tilefinchTopIsParent;"
         "const parentWindow={postMessage(data,targetOrigin='/'){"
         "if(data&&data.event==='reject')globalThis.__tilefinchLastRejectStack=String(new Error('Turnstile reject').stack||'');"
         "__tilefinchPostParentMessage(data,targetOrigin);}};globalThis.parent=parentWindow;"
-        "globalThis.top=parentWindow;Object.defineProperty(globalThis,'opener',"
+        "globalThis.top=topIsParent?parentWindow:{postMessage(data,targetOrigin='/'){__tilefinchPostTopMessage(data,targetOrigin)}};Object.defineProperty(globalThis,'opener',"
         "{value:null,writable:false,configurable:false});})();";
     static const char cross_origin_child_setup[] =
-        "(()=>{globalThis.__tilefinchTaskRealm='child';"
+        "(()=>{globalThis.__tilefinchTaskRealm='child';const topIsParent=!!globalThis.__tilefinchTopIsParent;delete globalThis.__tilefinchTopIsParent;"
         "const send=function postMessage(data,targetOrigin='/'){"
         "if(data&&data.event==='reject')globalThis.__tilefinchLastRejectStack=String(new Error('Turnstile reject').stack||'');"
         "__tilefinchPostParentMessage(data,targetOrigin);};const parentWindow={};"
         "Object.defineProperty(parentWindow,'postMessage',{enumerable:true,"
         "configurable:false,get(){return send},set(){throw new DOMException("
         "'Blocked cross-origin Window assignment','SecurityError')}});"
-        "globalThis.parent=parentWindow;globalThis.top=parentWindow;"
+        "globalThis.parent=parentWindow;globalThis.top=topIsParent?parentWindow:Object.freeze({postMessage(data,targetOrigin='/'){__tilefinchPostTopMessage(data,targetOrigin)}});"
         "Object.defineProperty(globalThis,'opener',{value:null,writable:false,"
         "configurable:false});})();";
     const char *child_setup = parent_same_origin
@@ -385,6 +385,16 @@ bool script_runtime_configure_messaging(
     size_t child_setup_length = parent_same_origin
         ? sizeof(same_origin_child_setup) - 1
         : sizeof(cross_origin_child_setup) - 1;
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    bool top_state_ok = JS_SetPropertyStr(
+        runtime->context, global, "__tilefinchTopIsParent",
+        JS_NewBool(runtime->context, top_is_parent)) >= 0;
+    JS_FreeValue(runtime->context, global);
+    if (!top_state_ok) {
+        js_rt_record_exception(runtime->context, &runtime->result);
+        runtime->result.success = false;
+        return false;
+    }
     js_rt_runtime_arm_watchdog(runtime);
     bool ok = js_rt_evaluate_source(runtime->context, child_setup,
                               child_setup_length,
@@ -629,15 +639,34 @@ bool script_runtime_record_resource_timing(ScriptRuntime *runtime,
                                            const char *url,
                                            const char *initiator_type)
 {
+    return script_runtime_record_resource_timing_details(
+        runtime, url, initiator_type, NULL);
+}
+
+bool script_runtime_record_resource_timing_details(
+    ScriptRuntime *runtime, const char *url, const char *initiator_type,
+    const ScriptResourceTiming *timing)
+{
     if (runtime == NULL || url == NULL || initiator_type == NULL) return false;
-    JSValue arguments[2] = {
+    const ScriptResourceTiming empty = {0};
+    if (timing == NULL) timing = &empty;
+    JSValue arguments[10] = {
         JS_NewString(runtime->context, url),
-        JS_NewString(runtime->context, initiator_type)
+        JS_NewString(runtime->context, initiator_type),
+        JS_NewUint32(runtime->context, timing->name_lookup_us),
+        JS_NewUint32(runtime->context, timing->connect_us),
+        JS_NewUint32(runtime->context, timing->appconnect_us),
+        JS_NewUint32(runtime->context, timing->first_byte_us),
+        JS_NewUint32(runtime->context, timing->total_us),
+        JS_NewUint32(runtime->context, timing->decoded_body_bytes),
+        JS_NewBool(runtime->context, timing->measured),
+        JS_NewBool(runtime->context, timing->cache_hit)
     };
-    bool ok = runtime_call_host(runtime, SCRIPT_HOST_RECORD_RESOURCE_TIMING, 2,
+    bool ok = runtime_call_host(runtime, SCRIPT_HOST_RECORD_RESOURCE_TIMING, 10,
                            arguments, NULL);
-    JS_FreeValue(runtime->context, arguments[1]);
-    JS_FreeValue(runtime->context, arguments[0]);
+    for (size_t i = 0; i < 10; i++) {
+        JS_FreeValue(runtime->context, arguments[i]);
+    }
     return ok;
 }
 
@@ -741,10 +770,43 @@ void script_runtime_script_quota_abort(
     }
 }
 
+#if !defined(__PSP__)
+static bool js_rt_refuse_document_refresh_once;
+
+void script_runtime_test_refuse_next_document_refresh(void)
+{
+    js_rt_refuse_document_refresh_once = true;
+}
+
+void script_runtime_test_mark_document_refresh_failed(
+    ScriptRuntime *runtime)
+{
+    if (runtime != NULL)
+        runtime->document_refresh_failed_after_mutation = true;
+}
+#endif
+
+bool script_runtime_document_refresh_failed(const ScriptRuntime *runtime)
+{
+    return runtime != NULL
+        && runtime->document_refresh_failed_after_mutation;
+}
+
 bool js_rt_runtime_refresh(ScriptRuntime *runtime)
 {
     if (runtime->result.dom_mutations != runtime->refreshed_mutations) {
-        if (!document_refresh(runtime->document)) {
+        bool refreshed = true;
+#if !defined(__PSP__)
+        if (js_rt_refuse_document_refresh_once) {
+            js_rt_refuse_document_refresh_once = false;
+            refreshed = false;
+        } else
+#endif
+        {
+            refreshed = document_refresh(runtime->document);
+        }
+        if (!refreshed) {
+            runtime->document_refresh_failed_after_mutation = true;
             snprintf(runtime->result.error, sizeof(runtime->result.error),
                      "could not refresh mutated DOM");
             return false;
@@ -910,6 +972,16 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
         }
         JSValue payload;
         if (success) {
+            /* Large textual responses are commonly followed by an immediate
+               parser/compiler burst inside the fetch/XHR callback.  Enter
+               that burst from the post-GC retained floor rather than from
+               whatever cyclic event/DOM garbage the realm accumulated while
+               transport was in flight.  The threshold keeps ordinary API
+               responses off this comparatively expensive boundary; the
+               native response remains authoritative until the JavaScript
+               payload below has been created. */
+            (void) js_rt_prepare_network_response_delivery(
+                runtime, fetched->length);
             if (bridge->result != NULL) js_rt_record_network_response(
                 bridge->result, fetched);
             js_rt_script_store_response_cookies(
@@ -951,12 +1023,18 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
             JS_NewInt64(runtime->context, (int64_t) id),
             JS_NewBool(runtime->context, success), payload
         };
+        /* Every response field the page can observe now lives in the bounded
+           JavaScript payload.  Release the native transport copy before the
+           author callback runs: large XHR bodies otherwise occupy both the
+           native Budget and the QuickJS heap throughout parsing/dispatch,
+           exactly when a constrained realm most needs callback headroom. */
+        fetch_result_free(fetched);
+        fetched = NULL;
         bool delivered = runtime_call_host(runtime, SCRIPT_HOST_DELIVER_NETWORK, 3,
                                       arguments, NULL);
         for (size_t value = 0; value < 3; value++) {
             JS_FreeValue(runtime->context, arguments[value]);
         }
-        fetch_result_free(fetched);
         memmove(bridge->async_fetches + i,
                 bridge->async_fetches + i + 1,
                 (bridge->async_fetch_count - i - 1)

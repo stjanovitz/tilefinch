@@ -11,6 +11,7 @@
 #include "js_runtime_internal.h"
 
 #include "tilefinch/platform.h"
+#include "tilefinch/media_discovery.h"
 
 #include <lexbor/dom/interfaces/element.h>
 #include <lexbor/ns/ns.h>
@@ -596,9 +597,26 @@ static size_t bridge_discard_unretained_detached_subtree(
             mutations_retired = true;
         }
     }
-    if (!document_control_state_discard_subtree(bridge->document, root)) {
+    BridgeSubtreeSearchResult declared_marker =
+        bridge->document->declared_video_card_node == NULL
+            ? BRIDGE_SUBTREE_NOT_FOUND
+            : bridge_live_subtree_contains_node(
+                  root, bridge->document->declared_video_card_node, 0);
+    BridgeSubtreeSearchResult reader_marker =
+        bridge->document->reader_declared_video_card_node == NULL
+            ? BRIDGE_SUBTREE_NOT_FOUND
+            : bridge_live_subtree_contains_node(
+                  root, bridge->document->reader_declared_video_card_node, 0);
+    if (declared_marker == BRIDGE_SUBTREE_INDETERMINATE
+        || reader_marker == BRIDGE_SUBTREE_INDETERMINATE
+        || !document_control_state_discard_subtree(
+               bridge->document, root)) {
         return 0;
     }
+    if (declared_marker == BRIDGE_SUBTREE_FOUND)
+        bridge->document->declared_video_card_node = NULL;
+    if (reader_marker == BRIDGE_SUBTREE_FOUND)
+        bridge->document->reader_declared_video_card_node = NULL;
     /* A detached-node reclamation can retire a mutation target before the
        host consumes the journal. Preserve the conservative rebuild signal,
        but never let layout reuse dereference a retired raw pointer.
@@ -1429,6 +1447,11 @@ static void bridge_mutated_with_relational(
        wasted work, this keeps a framework assembling one card from
        overflowing the PSP's fixed mutation journal before it is appended. */
     if (node != NULL && !bridge_node_is_connected(node)) return;
+    /* A declaration miss is valid only for the DOM generation that was
+       scanned. Author mutation may hydrate metadata or a playable element;
+       native card insertion does not pass through this bridge and therefore
+       keeps its already-bound selection. */
+    media_declared_video_cache_destroy(bridge->document);
     document_note_connected_mutation(bridge->document);
     /* Attribute and tree mutations can change which connected <base href> is
        first. Invalidating conservatively keeps the mutation fast and avoids a

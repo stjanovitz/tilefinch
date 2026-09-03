@@ -2139,7 +2139,10 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
     bool block_label = layout_node_name_is(node, "label");
     bool block_summary = layout_node_name_is(node, "summary");
     bool block_video = layout_node_name_is(node, "video");
+    bool block_frame = layout_node_name_is(node, "iframe");
     bool block_audio = audio_controls;
+    bool block_declared_media_card = document_is_declared_video_card(
+        context->document, node);
     ControlType block_input_type = block_input
         ? layout_input_control_type(node) : CONTROL_INPUT;
     if ((block_input || block_textarea)
@@ -2227,15 +2230,25 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
         && !layout_paint_audio_control(
             context, style, outer_x, outer_y,
             outer_width, border_height)) return false;
+    if ((block_video || block_declared_media_card)
+        && !layout_paint_video_control(
+            context, node, outer_x, outer_y, outer_width, border_height)) {
+        return false;
+    }
     if (block_input || block_textarea || block_button || block_select
-        || block_label || block_summary || block_video || block_audio) {
+        || block_label || block_summary || block_video || block_audio
+        || block_declared_media_card || block_frame) {
         ControlType type = block_input ? block_input_type
                            : (block_textarea ? CONTROL_TEXTAREA
                               : (block_button || block_label || block_summary
-                                 || block_video || block_audio ? CONTROL_BUTTON
-                                              : CONTROL_SELECT));
+                                 || block_video || block_audio
+                                 || block_declared_media_card ? CONTROL_BUTTON
+                                 : (block_frame ? CONTROL_FRAME
+                                              : CONTROL_SELECT)));
         int minimum_control_height = block_summary ? 24
-            : (block_video || block_audio) ? border_height : 30;
+            : (block_video || block_audio || block_declared_media_card
+               || block_frame)
+                ? border_height : 30;
         int control_height = border_height < minimum_control_height
                              ? minimum_control_height : border_height;
         if (!layout_add_control(context->layout, outer_x, outer_y, outer_width,

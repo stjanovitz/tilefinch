@@ -484,6 +484,11 @@ JSValue js_canvas_raster_rect_batch(JSContext *context,
         return JS_FALSE;
     }
     bool rendered = true;
+    /* One JavaScript-to-native batch is one browser-thread call.  Share the
+       allowance across every command and degrade the unpainted tail instead
+       of multiplying the watchdog bound by the batch length. */
+    bool work_exhausted = false;
+    size_t work_remaining = CANVAS_RASTER_WORK_LIMIT;
     for (size_t command = 0; command < count / 10u; command++) {
         size_t base = command * 10u;
         int left = 0, top = 0, right = 0, bottom = 0;
@@ -521,17 +526,23 @@ JSValue js_canvas_raster_rect_batch(JSContext *context,
             || global_alpha > 1.0 || operation < 1 || operation > 11) {
             continue;
         }
-        for (int y = top; y < bottom; y++) {
+        for (int y = top; y < bottom && !work_exhausted; y++) {
             for (int x = left; x < right; x++) {
+                if (!canvas_work_take(&work_remaining, 1u)) {
+                    work_exhausted = true;
+                    break;
+                }
                 size_t at = ((size_t) y * (size_t) width + (size_t) x) * 4u;
                 canvas_blend_pixel(pixels, at, red, green, blue, alpha,
                                    global_alpha, operation, 1.0);
             }
         }
+        if (work_exhausted) break;
     }
     JS_FreeValue(context, command_buffer);
     JS_FreeValue(context, pixel_buffer);
-    return rendered ? JS_TRUE : JS_FALSE;
+    if (!rendered) return JS_FALSE;
+    return JS_NewInt32(context, work_exhausted ? 2 : 1);
 }
 
 JSValue js_canvas_measure_text(JSContext *context,
@@ -636,9 +647,10 @@ static void canvas_transform_point(const double transform[6],
     *output_y = transform[1] * x + transform[3] * y + transform[5];
 }
 
-JSValue js_canvas_raster_text(JSContext *context,
-                              JSValueConst this_value,
-                              int argc, JSValueConst *argv)
+static JSValue canvas_raster_text_with_work(
+    JSContext *context, JSValueConst this_value,
+    int argc, JSValueConst *argv, size_t *work_remaining,
+    bool *clipped_out)
 {
     (void) this_value;
     DomBridge *bridge = JS_GetContextOpaque(context);
@@ -735,7 +747,6 @@ JSValue js_canvas_raster_text(JSContext *context,
     }
     bool rendered = true;
     bool work_exhausted = false;
-    size_t work_remaining = CANVAS_RASTER_WORK_LIMIT;
     size_t sample_cost = clip_path_count / 2u + 1u;
     if (stroke) {
         size_t diameter = (size_t) (2 * stroke_radius + 1);
@@ -774,7 +785,7 @@ JSValue js_canvas_raster_text(JSContext *context,
              gy < glyph.height + stroke_radius && !work_exhausted; gy++) {
             for (int gx = -stroke_radius; gx < glyph.width + stroke_radius;
                  gx++) {
-                if (!canvas_work_take(&work_remaining, sample_cost)) {
+                if (!canvas_work_take(work_remaining, sample_cost)) {
                     work_exhausted = true;
                     break;
                 }
@@ -845,7 +856,18 @@ canvas_text_finished:
     JS_FreeValue(context, pixel_buffer);
     /* Work exhaustion is a bounded compatibility degradation, not a signal
        to replay the same expensive command through the JavaScript fallback. */
-    return (rendered || work_exhausted) ? JS_TRUE : JS_FALSE;
+    if (clipped_out != NULL) *clipped_out = work_exhausted;
+    if (!rendered) return JS_FALSE;
+    return JS_NewInt32(context, work_exhausted ? 2 : 1);
+}
+
+JSValue js_canvas_raster_text(JSContext *context,
+                              JSValueConst this_value,
+                              int argc, JSValueConst *argv)
+{
+    size_t work_remaining = CANVAS_RASTER_WORK_LIMIT;
+    return canvas_raster_text_with_work(
+        context, this_value, argc, argv, &work_remaining, NULL);
 }
 
 static bool canvas_path_inside(const uint8_t *points, size_t point_count,
@@ -1054,7 +1076,8 @@ static bool canvas_raster_path_fill(
     const uint8_t *points, size_t point_count, bool even_odd,
     const uint8_t *clip_paths, size_t clip_path_count,
     const uint8_t *gradient, size_t gradient_count,
-    const int fallback[4], double global_alpha, int operation)
+    const int fallback[4], double global_alpha, int operation,
+    size_t *work_remaining, bool *clipped_out)
 {
     size_t span = (size_t) (right - left);
     if (span == 0u || point_count == 0u
@@ -1069,7 +1092,6 @@ static bool canvas_raster_path_fill(
     }
     static const double sample[2] = {0.25, 0.75};
     bool valid = true, work_exhausted = false;
-    size_t work_remaining = CANVAS_RASTER_WORK_LIMIT;
     size_t sample_cost = point_count + clip_path_count / 2u + 1u;
     for (int y = top; y < bottom && valid && !work_exhausted; y++) {
         memset(coverage, 0, span);
@@ -1086,7 +1108,7 @@ static bool canvas_raster_path_fill(
             bool parity = false;
             for (int x = left; x < right && !work_exhausted; x++) {
                 for (size_t sx = 0; sx < 2u; sx++) {
-                    if (!canvas_work_take(&work_remaining, sample_cost)) {
+                    if (!canvas_work_take(work_remaining, sample_cost)) {
                         work_exhausted = true;
                         break;
                     }
@@ -1122,6 +1144,7 @@ static bool canvas_raster_path_fill(
     }
     js_free(context, crossings);
     js_free(context, coverage);
+    if (clipped_out != NULL) *clipped_out = work_exhausted;
     return valid;
 }
 
@@ -1162,7 +1185,8 @@ static bool canvas_raster_path_stroke(
     const uint8_t *dash, size_t dash_count, double dash_offset,
     int line_cap, int line_join, double miter_limit,
     const uint8_t *clip_paths, size_t clip_path_count,
-    const int color[4], double global_alpha, int operation)
+    const int color[4], double global_alpha, int operation,
+    size_t *work_remaining, bool *clipped_out)
 {
     size_t span = (size_t) (right - left);
     size_t rows = (size_t) (bottom - top);
@@ -1172,7 +1196,6 @@ static bool canvas_raster_path_stroke(
     if (coverage == NULL) return false;
     static const double sample[2] = {0.25, 0.75};
     size_t start = 0;
-    size_t work_remaining = CANVAS_RASTER_WORK_LIMIT;
     bool work_exhausted = false;
     size_t sample_cost = clip_path_count / 2u + dash_count + 1u;
     double radius_squared = radius * radius;
@@ -1224,7 +1247,7 @@ static bool canvas_raster_path_stroke(
                     for (size_t sy = 0; sy < 2u; sy++) {
                         for (size_t sx = 0; sx < 2u; sx++) {
                             if (!canvas_work_take(
-                                    &work_remaining, sample_cost)) {
+                                    work_remaining, sample_cost)) {
                                 work_exhausted = true;
                                 break;
                             }
@@ -1299,7 +1322,7 @@ static bool canvas_raster_path_stroke(
                     for (size_t sy = 0; sy < 2u; sy++) {
                         for (size_t sx = 0; sx < 2u; sx++) {
                             if (!canvas_work_take(
-                                    &work_remaining, sample_cost)) {
+                                    work_remaining, sample_cost)) {
                                 work_exhausted = true;
                                 break;
                             }
@@ -1337,12 +1360,14 @@ static bool canvas_raster_path_stroke(
         }
     }
     js_free(context, coverage);
+    if (clipped_out != NULL) *clipped_out = work_exhausted;
     return true;
 }
 
-JSValue js_canvas_raster_path(JSContext *context,
-                              JSValueConst this_value,
-                              int argc, JSValueConst *argv)
+static JSValue canvas_raster_path_with_work(
+    JSContext *context, JSValueConst this_value,
+    int argc, JSValueConst *argv, size_t *work_remaining,
+    bool *clipped_out)
 {
     (void) this_value;
     int32_t width = 0, height = 0, red = 0, green = 0, blue = 0, alpha = 0;
@@ -1471,30 +1496,46 @@ JSValue js_canvas_raster_path(JSContext *context,
     }
     int fallback[4] = {red, green, blue, alpha};
     if (fill) {
+        bool clipped = false;
         bool rendered = canvas_raster_path_fill(
             context, pixels, width, left, top, right, bottom,
             points, point_count, even_odd, clip_paths, clip_path_count,
-            gradient, gradient_count, fallback, global_alpha, operation);
+            gradient, gradient_count, fallback, global_alpha, operation,
+            work_remaining, &clipped);
         JS_FreeValue(context, clip_path_buffer);
         JS_FreeValue(context, gradient_buffer);
         JS_FreeValue(context, clip_buffer);
         JS_FreeValue(context, dash_buffer);
         JS_FreeValue(context, point_buffer);
         JS_FreeValue(context, pixel_buffer);
-        return rendered ? JS_TRUE : JS_FALSE;
+        if (clipped_out != NULL) *clipped_out = clipped;
+        if (!rendered) return JS_FALSE;
+        return JS_NewInt32(context, clipped ? 2 : 1);
     }
+    bool clipped = false;
     bool rendered = canvas_raster_path_stroke(
         context, pixels, width, left, top, right, bottom,
         points, point_count, radius, dash, dash_count, dash_offset,
         line_cap, line_join, miter_limit, clip_paths, clip_path_count,
-        fallback, global_alpha, operation);
+        fallback, global_alpha, operation, work_remaining, &clipped);
     JS_FreeValue(context, clip_path_buffer);
     JS_FreeValue(context, gradient_buffer);
     JS_FreeValue(context, clip_buffer);
     JS_FreeValue(context, dash_buffer);
     JS_FreeValue(context, point_buffer);
     JS_FreeValue(context, pixel_buffer);
-    return rendered ? JS_TRUE : JS_FALSE;
+    if (clipped_out != NULL) *clipped_out = clipped;
+    if (!rendered) return JS_FALSE;
+    return JS_NewInt32(context, clipped ? 2 : 1);
+}
+
+JSValue js_canvas_raster_path(JSContext *context,
+                              JSValueConst this_value,
+                              int argc, JSValueConst *argv)
+{
+    size_t work_remaining = CANVAS_RASTER_WORK_LIMIT;
+    return canvas_raster_path_with_work(
+        context, this_value, argc, argv, &work_remaining, NULL);
 }
 
 /* Path and text operations retain variable-sized geometry, clip and string
@@ -1518,7 +1559,8 @@ JSValue js_canvas_raster_paint_batch(JSContext *context,
     if (command_count == 0u || command_count > 16u)
         return JS_NewUint32(context, UINT32_MAX);
 
-    uint32_t failed = 0u;
+    uint32_t failed = 0u, clipped = 0u;
+    size_t work_remaining = CANVAS_RASTER_WORK_LIMIT;
     for (uint32_t command_index = 0; command_index < command_count;
          command_index++) {
         JSValue command = JS_GetPropertyUint32(
@@ -1546,12 +1588,15 @@ JSValue js_canvas_raster_paint_batch(JSContext *context,
             if (JS_IsException(call_args[acquired + 3])) payload_ok = false;
         }
         JSValue result = JS_FALSE;
+        bool command_clipped = false;
         if (payload_ok) {
             result = kind == 0
-                ? js_canvas_raster_path(
-                      context, JS_UNDEFINED, 21, call_args)
-                : js_canvas_raster_text(
-                      context, JS_UNDEFINED, 22, call_args);
+                ? canvas_raster_path_with_work(
+                      context, JS_UNDEFINED, 21, call_args, &work_remaining,
+                      &command_clipped)
+                : canvas_raster_text_with_work(
+                      context, JS_UNDEFINED, 22, call_args, &work_remaining,
+                      &command_clipped);
         }
         for (int at = 0; at < acquired; at++)
             JS_FreeValue(context, call_args[at + 3]);
@@ -1563,9 +1608,11 @@ JSValue js_canvas_raster_paint_batch(JSContext *context,
         if (JS_IsException(result)) return result;
         if (JS_ToBool(context, result) <= 0)
             failed |= UINT32_C(1) << command_index;
+        else if (command_clipped)
+            clipped |= UINT32_C(1) << command_index;
         JS_FreeValue(context, result);
     }
-    return JS_NewUint32(context, failed);
+    return JS_NewUint32(context, failed | (clipped << 16u));
 }
 
 static bool canvas_image_sample(const uint8_t *pixels, int width, int height,
@@ -1617,7 +1664,8 @@ static bool canvas_raster_image_pixels(
     double sx, double sy, double sw, double sh,
     double dx, double dy, double dw, double dh, bool smooth,
     double global_alpha, int operation, const double transform[6],
-    const int clip[4], const uint8_t *clip_paths, size_t clip_path_count)
+    const int clip[4], const uint8_t *clip_paths, size_t clip_path_count,
+    size_t *work_remaining, bool *clipped_out)
 {
     double determinant = transform[0] * transform[3]
         - transform[1] * transform[2];
@@ -1645,12 +1693,11 @@ static bool canvas_raster_image_pixels(
     if (top < clip[1]) top = clip[1];
     if (right > clip[2]) right = clip[2];
     if (bottom > clip[3]) bottom = clip[3];
-    size_t work_remaining = CANVAS_RASTER_WORK_LIMIT;
     size_t sample_cost = clip_path_count / 2u + (smooth ? 4u : 1u);
     bool work_exhausted = false;
     for (int y = top; y < bottom && !work_exhausted; y++) {
         for (int x = left; x < right; x++) {
-            if (!canvas_work_take(&work_remaining, sample_cost)) {
+            if (!canvas_work_take(work_remaining, sample_cost)) {
                 work_exhausted = true;
                 break;
             }
@@ -1680,6 +1727,7 @@ static bool canvas_raster_image_pixels(
                                color[3], global_alpha, operation, 1.0);
         }
     }
+    if (clipped_out != NULL) *clipped_out = work_exhausted;
     return true;
 }
 
@@ -1762,16 +1810,20 @@ JSValue js_canvas_raster_image(JSContext *context,
         return JS_FALSE;
     }
     bool smooth = JS_ToBool(context, argv[14]) > 0;
+    size_t work_remaining = CANVAS_RASTER_WORK_LIMIT;
+    bool clipped = false;
     bool rendered = canvas_raster_image_pixels(
         target, width, source, source_width, source_height,
         sx, sy, sw, sh, dx, dy, dw, dh, smooth, global_alpha, operation,
-        transform, clip, clip_paths, clip_path_count);
+        transform, clip, clip_paths, clip_path_count, &work_remaining,
+        &clipped);
     JS_FreeValue(context, clip_path_buffer);
     JS_FreeValue(context, clip_buffer);
     JS_FreeValue(context, transform_buffer);
     JS_FreeValue(context, source_buffer);
     JS_FreeValue(context, target_buffer);
-    return rendered ? JS_TRUE : JS_FALSE;
+    if (!rendered) return JS_FALSE;
+    return JS_NewInt32(context, clipped ? 2 : 1);
 }
 
 JSValue js_canvas_raster_image_batch(JSContext *context,
@@ -1803,7 +1855,8 @@ JSValue js_canvas_raster_image_batch(JSContext *context,
         JS_FreeValue(context, target_buffer);
         return JS_FALSE;
     }
-    bool rendered = true;
+    bool rendered = true, clipped = false;
+    size_t work_remaining = CANVAS_RASTER_WORK_LIMIT;
     for (size_t command = 0; command < command_values / 24u; command++) {
         size_t base = command * 24u;
         double raw_source_index = canvas_double_at(commands, base);
@@ -1890,12 +1943,14 @@ JSValue js_canvas_raster_image_batch(JSContext *context,
             || !canvas_raster_image_pixels(
                 target, width, source, source_width, source_height,
                 sx, sy, sw, sh, dx, dy, dw, dh, smooth, global_alpha,
-                operation, transform, clip, NULL, 0u)) rendered = false;
+                operation, transform, clip, NULL, 0u,
+                &work_remaining, &clipped)) rendered = false;
         JS_FreeValue(context, source_buffer);
         JS_FreeValue(context, source_value);
         if (!rendered) break;
     }
     JS_FreeValue(context, command_buffer);
     JS_FreeValue(context, target_buffer);
-    return rendered ? JS_TRUE : JS_FALSE;
+    if (!rendered) return JS_FALSE;
+    return JS_NewInt32(context, clipped ? 2 : 1);
 }

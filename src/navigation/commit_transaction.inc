@@ -826,11 +826,52 @@ static bool navigation_finish_authoritative_layout(
        scripts can then join the page resource table during that attach. */
     session->fonts = fonts;
     session->images = images;
+    bool attach_relayout_requested = false;
     if (session->page.runtime != NULL) {
         navigation_attach_layout(session);
-        (void) script_runtime_consume_relayout(session->page.runtime);
+        attach_relayout_requested = script_runtime_consume_relayout(
+            session->page.runtime);
     }
     session->page.loaded = true;
+    /* Runtime attachment publishes canvas surfaces queued by parser-time
+       scripts.  A newly created or resized surface is a structural layout
+       mutation: the authoritative layout built immediately above could only
+       reserve the fallback canvas box and does not yet contain DRAW_IMAGE.
+       Honor that exact pending mutation before exposing the committed page.
+       Same-size pixel updates retain the paint-only damage fast path. */
+    bool missing_canvas_surface = false;
+    if (attach_relayout_requested) {
+        for (size_t image_at = 0;
+             image_at < session->page.images.count; image_at++) {
+            const ImageResource *image =
+                &session->page.images.items[image_at];
+            if (!image->is_canvas || !image_resource_available(image)
+                || layout_box_for_node(
+                       &session->page.layout, image->node) == NULL) {
+                continue;
+            }
+            bool painted = false;
+            for (size_t command_at = 0;
+                 command_at < session->page.layout.count; command_at++) {
+                const DrawCommand *command =
+                    &session->page.layout.commands[command_at];
+                if (command->type == DRAW_IMAGE
+                    && command->image == image) {
+                    painted = true;
+                    break;
+                }
+            }
+            if (!painted) {
+                missing_canvas_surface = true;
+                break;
+            }
+        }
+    }
+    if (missing_canvas_surface && !navigation_relayout(session)) {
+        snprintf(session->last_error, sizeof(session->last_error),
+                 "runtime-attachment relayout failed");
+        return false;
+    }
     uint64_t phase_started = navigation_now_us();
     if (!navigation_resource_fingerprint(
             session, &session->page.document,
@@ -1309,6 +1350,7 @@ static bool navigation_commit_document(
             || navigation_document_requires_runtime(
                 session, &session->page.document));
     if (runtime_required) {
+        size_t runtime_failure_count = session->budget->failure_count;
         if (session->page.runtime == NULL) {
             session->page.runtime = navigation_create_runtime(
                 session, &session->page.document, url,
@@ -1322,23 +1364,44 @@ static bool navigation_commit_document(
                 &session->page.script_result);
         }
         if (session->page.runtime == NULL) {
-            snprintf(session->last_error, sizeof(session->last_error), "%s",
-                     session->page.script_result.error[0] == '\0'
-                       ? "JavaScript runtime startup failed"
-                       : session->page.script_result.error);
-            goto fail;
+            if (session->budget->failure_count == runtime_failure_count) {
+                snprintf(
+                    session->last_error, sizeof(session->last_error), "%s",
+                    session->page.script_result.error[0] == '\0'
+                      ? "JavaScript runtime startup failed"
+                      : session->page.script_result.error);
+                goto fail;
+            }
+            /* A realm used only for optional author behavior must not make a
+               complete server-rendered document disappear when its bounded
+               heap cannot be admitted beside that document. Keep genuine
+               bootstrap/contract failures fatal, but turn a measured Budget
+               refusal into a static-page degradation. */
+            session->page.script_degradation_observed = true;
+            session->page.script_result.success = false;
+            session->page.script_result.error[0] = '\0';
+            session->page.script_result.error_source_context[0] = '\0';
+            snprintf(
+                session->page.script_result.summary,
+                sizeof(session->page.script_result.summary), "%s",
+                "JavaScript stopped at the page memory limit; static content preserved");
+            if (session->page.resource_scheduler != NULL) {
+                fetch_scheduler_destroy(session->page.resource_scheduler);
+                session->page.resource_scheduler = NULL;
+            }
         }
-        script_runtime_set_stylesheet(session->page.runtime,
-                                      &session->page.stylesheet);
-        script_document_may_have_changed = true;
-        if (!page_capability_trace_setup(session)) {
-            snprintf(session->last_error, sizeof(session->last_error),
-                     "page capability trace setup failed: %.430s",
-                     session->page.script_result.error);
-            goto fail;
-        }
-        if (session->document_scripts_enabled
-            && !session->defer_document_script_pipeline) {
+        if (session->page.runtime != NULL) {
+            script_runtime_set_stylesheet(session->page.runtime,
+                                          &session->page.stylesheet);
+            script_document_may_have_changed = true;
+            if (!page_capability_trace_setup(session)) {
+                snprintf(session->last_error, sizeof(session->last_error),
+                         "page capability trace setup failed: %.430s",
+                         session->page.script_result.error);
+                goto fail;
+            }
+            if (session->document_scripts_enabled
+                && !session->defer_document_script_pipeline) {
             ExternalScriptMetrics metrics = {0};
             DocumentBodySnapshot server_snapshot = {0};
             const DocumentBodySnapshot *rollback_snapshot = NULL;
@@ -1372,6 +1435,13 @@ static bool navigation_commit_document(
                     session->script_timeout_ms,
                     session->page.resource_scheduler, &metrics,
                     &session->page.script_result);
+            if (script_runtime_document_refresh_failed(
+                    session->page.runtime)) {
+                snprintf(session->last_error, sizeof(session->last_error),
+                         "could not refresh mutated candidate DOM");
+                document_body_snapshot_destroy(&server_snapshot);
+                goto fail;
+            }
             if (!scripts_ok) {
                 snprintf(session->last_error, sizeof(session->last_error),
                          "%s",
@@ -1449,7 +1519,8 @@ static bool navigation_commit_document(
                 metrics.watchdog_classification_miss_flags;
             /* A rejected/throwing author script is diagnostic evidence, not
                a reason to discard the already parsed server-rendered page. */
-            navigation_record_soft_script_error(session, &metrics);
+                navigation_record_soft_script_error(session, &metrics);
+            }
         }
     }
     if (streaming != NULL && streaming->script_disabled_after_failure
@@ -1603,22 +1674,54 @@ static bool navigation_commit_document(
     if (session->prepare_reader_candidates
         && (static_script_fallback || optional_work_shed
             || session->user_css_length != 0u)) {
-        /* The extractor connects its native root atomically, and the
-           BrowserEngine must immediately retain that exact identity. Reserve
-           the fixed weak-handle slot before any DOM mutation so exhaustion
-           declines Reader without leaving an untracked public marker behind. */
+        /* Build the extracted root outside the author-visible tree and retain
+           that exact identity before any later author turn. Reserve the fixed
+           weak-handle slot first so exhaustion declines Reader without
+           leaving an untracked public marker behind. */
         if (!script_runtime_node_handle_capacity_available(
                 session->page.runtime)) {
             reader_analysis = (ReaderDocumentAnalysis) {
                 .prepared = true, .bounded_out = true
             };
-        } else if (!reader_document_prepare_with_stylesheet(
-                       &session->page.document, &session->page.stylesheet,
-                       &reader_analysis)) {
-            reader_analysis = (ReaderDocumentAnalysis) {
-                .prepared = true, .kind = READER_PAGE_RAW,
-                .bounded_out = true
-            };
+        } else {
+            lxb_dom_node_t *prepared_root = NULL;
+            bool prepared = reader_document_prepare_detached_with_stylesheet(
+                &session->page.document, &session->page.stylesheet,
+                &reader_analysis, &prepared_root);
+            if (!prepared) {
+                reader_analysis = (ReaderDocumentAnalysis) {
+                    .prepared = true, .kind = READER_PAGE_RAW,
+                    .bounded_out = true
+                };
+            } else if (prepared_root != NULL
+                       && reader_analysis.kind != READER_PAGE_RAW) {
+                long handle = session->page.runtime == NULL ? 0
+                    : script_runtime_node_weak_handle(
+                          session->page.runtime, prepared_root);
+                if (session->page.runtime != NULL && handle == 0) {
+                    reader_document_discard_exact_prepared_view(
+                        &session->page.document, prepared_root,
+                        reader_analysis.kind);
+                    reader_analysis = (ReaderDocumentAnalysis) {
+                        .prepared = true, .kind = READER_PAGE_RAW,
+                        .bounded_out = true
+                    };
+                } else {
+                    session->page.reader_root = prepared_root;
+                    session->page.reader_root_kind = reader_analysis.kind;
+                    session->page.reader_root_handle = handle;
+                    /* An explicit Reader stylesheet with no remaining author
+                       tasks can enter Reader in this same native commit. When
+                       work remains, keep the exact tree private until the
+                       BrowserEngine settle boundary connects it. */
+                    if (session->user_css_length != 0u
+                        && session->page.script_result.pending_tasks == 0u) {
+                        (void) reader_document_connect_prepared_view(
+                            &session->page.document, prepared_root,
+                            reader_analysis.kind);
+                    }
+                }
+            }
         }
         session->page.reader_analysis = reader_analysis;
     }
@@ -1675,6 +1778,24 @@ static bool navigation_commit_document(
         NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
     size_t image_priority_count = 0;
     bool static_image_plan = false;
+    /* A committed LayoutDocument borrows ImageResource pointers. Reserve the
+       bounded child-frame tail before the first preview/final layout so an
+       asynchronously completed iframe can append its snapshot without
+       moving that table underneath the visible page. */
+    size_t reserved_image_capacity = session->maximum_images;
+    if (reserved_image_capacity
+            <= SIZE_MAX - NAVIGATION_FRAME_LIMIT) {
+        reserved_image_capacity += NAVIGATION_FRAME_LIMIT;
+    } else {
+        reserved_image_capacity = SIZE_MAX;
+    }
+    if (!images_reserve_capacity(
+            &session->page.images, session->budget,
+            reserved_image_capacity)) {
+        snprintf(session->last_error, sizeof(session->last_error),
+                 "frame image metadata exceeded its budget");
+        goto fail;
+    }
     bool pre_image_preview_candidate =
         session->external_resources_enabled
         && navigation_document_may_have_images(
@@ -1848,10 +1969,26 @@ static bool navigation_commit_document(
             && deferred_layout_job != NULL
             && session->page.document.node_count >= 256) {
             navigation_ensure_layout_reuse(session);
+            size_t layout_failure_count = session->budget->failure_count;
             LayoutBuildJob *job = layout_build_job_begin(
                 session->budget, &session->page.document,
                 &session->page.stylesheet, fonts, images,
                 &session->viewport, session->page.layout_reuse);
+            if (job == NULL
+                && session->budget->failure_count > layout_failure_count
+                && navigation_install_minimal_stylesheet_fallback(session)) {
+                /* Author CSS is optional when it crowds a complete server
+                   document out of its first layout. Rebuild the cheap
+                   bounded stylesheet and retry once; invalid layout inputs
+                   still fail without taking this pressure-only path. */
+                layout_reuse_cache_destroy(session->page.layout_reuse);
+                session->page.layout_reuse = NULL;
+                navigation_ensure_layout_reuse(session);
+                job = layout_build_job_begin(
+                    session->budget, &session->page.document,
+                    &session->page.stylesheet, fonts, images,
+                    &session->viewport, session->page.layout_reuse);
+            }
             if (job == NULL) {
                 snprintf(session->last_error, sizeof(session->last_error),
                          "resumable layout startup failed");

@@ -36,6 +36,8 @@ void budget_quickjs_pool_set_cache_limits(BudgetQuickJSPool *pool,
                                           size_t large_class_limit);
 const JSMallocFunctions *budget_quickjs_pool_allocator(void);
 size_t budget_quickjs_pool_reserved_peak(const BudgetQuickJSPool *pool);
+/* Current allocator capacity, including bounded cached free blocks. */
+size_t budget_quickjs_pool_reserved_current(const BudgetQuickJSPool *pool);
 /* Current enforced QuickJS malloc_size (O(1), maintained at alloc/free). */
 size_t budget_quickjs_pool_js_malloc_current(const BudgetQuickJSPool *pool);
 /* Monotonic count of allocations refused by the realm's hard heap limit. */

@@ -1,0 +1,13 @@
+diff --git a/quickjs.c b/quickjs.c
+index 0000000..0000000 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2102,7 +2102,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
+     {
+         const char *cap = getenv("TILEFINCH_JS_ARRAY_CAP_KB");
+         const char *growth = getenv("TILEFINCH_JS_ARRAY_GROWTH_KB");
+-        rt->fast_array_growth_byte_limit = 512 * 1024;
++        rt->fast_array_growth_byte_limit = 128 * 1024;
+         if (cap != NULL) {
+             long cap_kb = atol(cap);
+             if (cap_kb > 0)

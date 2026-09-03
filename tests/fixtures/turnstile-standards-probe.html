@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Turnstile standards probe</title>
+<style>
+  body { font: 16px sans-serif; margin: 18px; }
+  #result { white-space: pre-wrap; }
+</style>
+<h1>Turnstile standards probe</h1>
+<div class="cf-turnstile"
+     data-sitekey="1x00000000000000000000AA"
+     data-callback="turnstilePassed"
+     data-error-callback="turnstileFailed"></div>
+<pre id="result">loading</pre>
+<script>
+  function turnstilePassed(token) {
+    document.getElementById("result").textContent =
+      "passed:" + token;
+  }
+  function turnstileFailed(code) {
+    document.getElementById("result").textContent =
+      "failed:" + code;
+  }
+</script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"
+        async defer></script>

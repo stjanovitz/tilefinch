@@ -130,6 +130,39 @@ static void remove_large_youtube_replay(const char *directory)
     (void) rmdir(directory);
 }
 
+static bool write_history_form_replay(
+    char directory[128], const char *html, size_t html_length,
+    const char *effective_url)
+{
+    snprintf(directory, 128, "/tmp/tilefinch-history-form-XXXXXX");
+    if (mkdtemp(directory) == NULL) return false;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/0000.body", directory);
+    FILE *body = fopen(path, "wb");
+    bool ok = body != NULL
+        && fwrite(html, 1, html_length, body) == html_length
+        && fclose(body) == 0;
+    snprintf(path, sizeof(path), "%s/0000.meta", directory);
+    FILE *meta = ok ? fopen(path, "wb") : NULL;
+    ok = meta != NULL && fprintf(
+        meta,
+        "psp-http-trace=1\nmethod=GET\n"
+        "url=https://history-form.test/search\n"
+        "success=1\nasync-delay-pumps=0\nexternal-cancel=0\n"
+        "transport-timeout=0\nerror=\nstatus=200\nlength=%zu\n"
+        "effective-url=%s\n"
+        "content-type=text/html; charset=utf-8\netag=\nlast-modified=\n"
+        "cf-mitigated=\naccept-ch=\ncritical-ch=\nserver=fixture\n"
+        "cf-ray=\nset-cookie-count=0\n",
+        html_length, effective_url) > 0 && fclose(meta) == 0;
+    snprintf(path, sizeof(path), "%s/trace.meta", directory);
+    FILE *trace = ok ? fopen(path, "wb") : NULL;
+    return trace != NULL && fprintf(
+        trace, "psp-http-trace-clock=1\norigin-ms=1700000000000\n"
+               "capture-complete=yes\nrecord-count=1\n") > 0
+        && fclose(trace) == 0;
+}
+
 typedef struct {
     size_t events;
     uint64_t last_sequence;
@@ -233,6 +266,10 @@ int main(void)
     CHECK(test_engine_lifecycle() == 0);
     CHECK(test_same_document_and_script_free_defaults() == 0);
     CHECK(test_same_document_event_mutations_settle_immediately() == 0);
+    CHECK(test_contenteditable_relayout_refusal_retires_shell() == 0);
+    CHECK(test_author_relayout_refusal_retires_shell() == 0);
+    CHECK(test_history_restores_bounded_form_state() == 0);
+    CHECK(test_post_mutation_document_refresh_refusal_retires_shell() == 0);
     CHECK(test_page_video_activation() == 0);
     CHECK(test_page_video_data_candidate_activation() == 0);
     CHECK(test_page_audio_activation() == 0);
@@ -247,8 +284,10 @@ int main(void)
     CHECK(test_youtube_localized_watch_metadata() == 0);
     CHECK(test_youtube_cooperative_build_convergence() == 0);
     CHECK(test_youtube_missing_initial_data_terminates() == 0);
+    CHECK(test_google_search_compatibility_adapter() == 0);
     CHECK(test_reader_presentation_adapter() == 0);
     CHECK(test_blank_reader_frontend_recovery() == 0);
+    CHECK(test_declared_media_card_recovery() == 0);
     CHECK(test_basic_view_admission_and_presentation() == 0);
     CHECK(test_basic_view_native_root_provenance() == 0);
     CHECK(test_basic_view_handle_capacity_is_transactional() == 0);

@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Native acceleration API probe</title>
+<pre id="result">pending</pre>
+<script>
+  const names = [
+    "CompressionStream",
+    "DecompressionStream",
+    "WebAssembly",
+    "TransformStream",
+    "ReadableStream",
+    "WritableStream"
+  ];
+  const result = {};
+  for (const name of names) result[name] = typeof self[name];
+  if (typeof CompressionStream === "function") {
+    for (const format of ["deflate", "deflate-raw", "gzip"]) {
+      try {
+        new CompressionStream(format);
+        result["CompressionStream:" + format] = "accepted";
+      } catch (error) {
+        result["CompressionStream:" + format] =
+          error && error.name ? error.name : String(error);
+      }
+    }
+  }
+  if (typeof WebAssembly === "object") {
+    result["WebAssembly.compile"] = typeof WebAssembly.compile;
+    result["WebAssembly.instantiate"] = typeof WebAssembly.instantiate;
+  }
+  document.querySelector("#result").textContent = JSON.stringify(result);
+</script>

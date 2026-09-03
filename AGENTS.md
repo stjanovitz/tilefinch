@@ -17,7 +17,7 @@ cmake --build build-preset-release -j8
 ctest --test-dir build-preset-release -j8 --output-on-failure
 ```
 
-Release currently registers **141 tests: 140 enabled plus the opt-in
+Release currently registers **148 tests: 147 enabled plus the opt-in
 `tilefinch-device-cost-tests`, which is registered but disabled by default**.
 All enabled tests must pass. The localhost
 redirect test may report `Skipped` in a sandbox that forbids loopback sockets;
@@ -59,7 +59,7 @@ not device targets, and the bare cross-build `all` target is not the PSP gate.
 
 Two things only this build enforces:
 
-- **A 4,435,000-byte ordinary `.text` ratchet** (4,460,000 bytes when
+- **A 4,480,000-byte ordinary `.text` ratchet** (4,500,000 bytes when
   validation logging is compiled in). `cmake/CheckPspTextSize.cmake` reads the
   actual ELF `.text` sections with `psp-objdump` after every link, reports
   `.rodata` separately, and fails the build above the appropriate limit.

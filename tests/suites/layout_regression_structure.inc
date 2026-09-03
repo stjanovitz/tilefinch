@@ -179,6 +179,54 @@
     tile_cache_destroy(&mixed_fixed_cache);
     budget_free(&budget, mixed_fixed_frame);
 
+    /* A bounded scene range which appears before an ordinary fixed header
+       must remain below that header. The retained unbounded cache is blitted
+       after the earlier direct range, preserving the original range order. */
+    DrawCommand bounded_before_commands[2] = {
+        {
+            .type = DRAW_FILL_RECT, .x = 5, .y = 5,
+            .width = 20, .height = 20, .color = 0xcc2200,
+            .opacity_scale = UINT8_MAX
+        },
+        {
+            .type = DRAW_FILL_RECT, .x = 5, .y = 5,
+            .width = 20, .height = 20, .color = 0x22cc00,
+            .opacity_scale = UINT8_MAX
+        }
+    };
+    FixedRange bounded_before_ranges[2] = {
+        {
+            .command_start = 0, .command_end = 1,
+            .origin_y = 5, .height = 20, .inset = 5,
+            .scroll_end = 100
+        },
+        {
+            .command_start = 1, .command_end = 2,
+            .origin_y = 5, .height = 20, .inset = 5,
+            .scroll_end = INT_MAX
+        }
+    };
+    LayoutDocument bounded_before_layout = {
+        .commands = bounded_before_commands, .count = 2,
+        .fixed_ranges = bounded_before_ranges, .fixed_count = 2,
+        .width = 80, .height = 300, .page_background = 0xffffff
+    };
+    TileCache bounded_before_cache;
+    uint16_t *bounded_before_frame = budget_malloc(
+        &budget, 80u * 60u * sizeof(*bounded_before_frame));
+    CHECK(bounded_before_frame != NULL
+          && tile_cache_init(
+                 &bounded_before_cache, &budget, &bounded_before_layout, 2)
+          && tile_cache_set_frame(
+                 &bounded_before_cache, bounded_before_frame, 80u * 60u)
+          && tile_cache_render_frame(
+                 &bounded_before_cache, 50, 80, 60, NULL)
+          && bounded_before_cache.fixed_cache_builds == 1u
+          && bounded_before_frame[10u * 80u + 10u]
+                 == test_rgb565(0x22cc00));
+    tile_cache_destroy(&bounded_before_cache);
+    budget_free(&budget, bounded_before_frame);
+
     puts("test: fixed percentage width uses viewport containing block");
     static const char fixed_percent_page[] =
         "<!doctype html><style>html,body{margin:0;padding:0}"

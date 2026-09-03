@@ -408,6 +408,20 @@ if(PSP)
             tilefinch_psp_media_scale
             tilefinch_psp_media_present
             tilefinch_psp_app_support tilefinch_diagnostic_qr)
+        if(TARGET tilefinch-wasm-component)
+            # This is a runtime asset, not a link input.  A POST_BUILD copy
+            # alone goes stale when only the component changes and the EBOOT
+            # is already current, so make staging an always-evaluated target
+            # in the browser's dependency chain.
+            add_custom_target(tilefinch-wasm-component-stage
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${TILEFINCH_WASM_COMPONENT_PRX}"
+                    "$<TARGET_FILE_DIR:psp-browser-script>/tilefinch-wasm.prx"
+                DEPENDS tilefinch-wasm-component
+                COMMENT "Staging the lazy WebAssembly component")
+            add_dependencies(
+                psp-browser-script tilefinch-wasm-component-stage)
+        endif()
         # src/psp_app/ holds this EBOOT's private seams. They include
         # src/media_backend_psp_policy.h and src/psp_media_pixels.h, which
         # tilefinch_core keeps PRIVATE, so the executable needs src itself.
@@ -547,7 +561,17 @@ if(PSP)
             # instrumentation to grow without code-golfing production paths.
             set(TILEFINCH_PSP_TEXT_LIMIT 4500000)
         else()
-            set(TILEFINCH_PSP_TEXT_LIMIT 4435000)
+            # Security-boundary retirement and private lazy Worker compiler
+            # installation are native fail-closed paths.  Their measured
+            # device cost is admitted explicitly rather than code-golfing
+            # ownership checks at the browser/runtime boundary.
+            # The bounded WebAssembly JavaScript adapter adds 14,148 bytes of
+            # resident bridge code.  The 230+ KiB interpreter remains in the
+            # lazy tilefinch-wasm.prx and therefore does not affect boot.
+            # Security hardening for active-document principals and bounded
+            # WebAssembly/QuickJS execution measured 4,470,576 bytes. Keep
+            # 9,424 bytes of the user-approved 10 KiB growth allowance.
+            set(TILEFINCH_PSP_TEXT_LIMIT 4480000)
         endif()
         add_custom_command(TARGET psp-browser-script POST_BUILD
             COMMAND ${CMAKE_COMMAND}
@@ -837,13 +861,14 @@ if(PSP)
             COMMAND ${CMAKE_COMMAND}
                 "-DLAUNCHER_EBOOT=${CMAKE_CURRENT_BINARY_DIR}/launcher/EBOOT.PBP"
                 "-DBROWSER_EBOOT=${CMAKE_CURRENT_BINARY_DIR}/EBOOT.PBP"
+                "-DWASM_COMPONENT_PRX=${TILEFINCH_WASM_COMPONENT_PRX}"
                 "-DXMB_REDIRECT_PRX=${CMAKE_CURRENT_BINARY_DIR}/xmb-redirect/tilefinch_xmb.prx"
                 "-DASSET_DIR=${CMAKE_CURRENT_BINARY_DIR}"
                 "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
                 "-DOUTPUT=${TILEFINCH_PSP_INSTALL_TREE}"
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StagePspInstall.cmake"
             DEPENDS tilefinch-launcher psp-browser-script
-                tilefinch-xmb-redirect
+                tilefinch-wasm-component tilefinch-xmb-redirect
             COMMENT
                 "Staging launcher + slot-a + optional XMB redirect"
             VERBATIM)

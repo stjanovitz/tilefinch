@@ -1,0 +1,142 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Challenge API probe</title>
+<pre id="out">pending</pre>
+<script>
+(async () => {
+  const out = document.getElementById("out");
+  const value = {};
+  const error = (name, reason) => {
+    value[name] = { error: String(reason && reason.stack || reason) };
+  };
+  try {
+    const nav = performance.getEntriesByType("navigation")[0];
+    value.performance = {
+      supportedEntryTypes: Array.from(PerformanceObserver.supportedEntryTypes),
+      navigation: nav ? {
+        prototype: Object.prototype.toString.call(nav),
+        keys: Object.keys(nav),
+        json: typeof nav.toJSON === "function" ? nav.toJSON() : null,
+      } : null,
+      timeOriginFinite: Number.isFinite(performance.timeOrigin),
+      nowMonotonic: performance.now() <= performance.now(),
+    };
+  } catch (reason) { error("performance", reason); }
+  try {
+    value.screen = {
+      width: screen.width,
+      height: screen.height,
+      availWidth: screen.availWidth,
+      availHeight: screen.availHeight,
+      colorDepth: screen.colorDepth,
+      pixelDepth: screen.pixelDepth,
+      innerWidth,
+      innerHeight,
+      outerWidth,
+      outerHeight,
+      devicePixelRatio,
+    };
+  } catch (reason) { error("screen", reason); }
+  try {
+    value.navigator = {
+      hardwareConcurrency: navigator.hardwareConcurrency,
+      deviceMemory: navigator.deviceMemory,
+      maxTouchPoints: navigator.maxTouchPoints,
+      webdriver: navigator.webdriver,
+      language: navigator.language,
+      languages: Array.from(navigator.languages || []),
+      platform: navigator.platform,
+      cookieEnabled: navigator.cookieEnabled,
+      userAgentData: navigator.userAgentData ? {
+        mobile: navigator.userAgentData.mobile,
+        platform: navigator.userAgentData.platform,
+        brands: Array.from(navigator.userAgentData.brands || []),
+      } : null,
+    };
+  } catch (reason) { error("navigator", reason); }
+  try {
+    value.document = {
+      visibilityState: document.visibilityState,
+      hidden: document.hidden,
+      hasFocus: document.hasFocus(),
+      readyState: document.readyState,
+      origin: location.origin,
+      secureContext: globalThis.isSecureContext,
+    };
+  } catch (reason) { error("document", reason); }
+  try {
+    const message = new MessageEvent("message", {
+      data: 7,
+      origin: "https://origin.invalid",
+      source: null,
+      ports: [],
+    });
+    value.messageEvent = {
+      tag: Object.prototype.toString.call(message),
+      own: Object.getOwnPropertyNames(message),
+      prototype: Object.getOwnPropertyNames(MessageEvent.prototype),
+      isTrusted: message.isTrusted,
+      origin: message.origin,
+      sourceNull: message.source === null,
+      portsLength: message.ports.length,
+    };
+  } catch (reason) { error("messageEvent", reason); }
+  try {
+    const order = [];
+    const observer = new PerformanceObserver((list, self, options) => {
+      order.push("observer");
+      value.performanceObserver = {
+        records: list.getEntries().map((entry) => ({
+          name: entry.name,
+          entryType: entry.entryType,
+          startTimeFinite: Number.isFinite(entry.startTime),
+          durationFinite: Number.isFinite(entry.duration),
+        })),
+        self: self === observer,
+        optionsPresent: options !== undefined,
+        droppedEntriesCount: options && options.droppedEntriesCount,
+        order: order.slice(),
+      };
+    });
+    observer.observe({ type: "mark", buffered: true });
+    performance.mark("challenge-probe");
+    Promise.resolve().then(() => order.push("microtask"));
+    setTimeout(() => order.push("timer"), 0);
+  } catch (reason) { error("performanceObserver", reason); }
+  try {
+    if (typeof Worker !== "function") throw new Error("Worker unavailable");
+    const source = "onmessage=e=>postMessage({instance:e instanceof MessageEvent,trusted:e.isTrusted,origin:e.origin,sourceNull:e.source===null,ports:e.ports.length,data:e.data})";
+    const blob = new Blob([source], { type: "text/javascript" });
+    const url = URL.createObjectURL(blob);
+    const worker = new Worker(url);
+    value.worker = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve({ error: "timeout" }), 1000);
+      worker.onmessage = (event) => {
+        clearTimeout(timer);
+        resolve({
+          ownerInstance: event instanceof MessageEvent,
+          ownerTrusted: event.isTrusted,
+          ownerOrigin: event.origin,
+          ownerSourceNull: event.source === null,
+          ownerPorts: event.ports.length,
+          data: event.data,
+        });
+      };
+      worker.onerror = (event) => {
+        clearTimeout(timer);
+        resolve({ error: String(event.message || "worker error") });
+      };
+      worker.postMessage(19);
+    });
+    worker.terminate();
+    URL.revokeObjectURL(url);
+  } catch (reason) { error("worker", reason); }
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  value.performanceObserverOrder = value.performanceObserver &&
+    value.performanceObserver.order;
+  globalThis.challengeProbe = value;
+  globalThis.pocSummary = JSON.stringify(value);
+  out.textContent = JSON.stringify(value, null, 2);
+  out.setAttribute("data-complete", "yes");
+})();
+</script>

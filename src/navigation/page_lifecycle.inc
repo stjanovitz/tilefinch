@@ -3,6 +3,69 @@ static uint64_t navigation_now_us(void)
     return tilefinch_platform_monotonic_time_us();
 }
 
+struct NavigationFramePresentation {
+    Stylesheet stylesheet;
+    LayoutDocument layout;
+    int width;
+    int height;
+};
+
+static bool navigation_refresh_frame_presentation(
+    NavigationSession *session, NavigationFrame *frame);
+
+static NavigationFrame *navigation_frame_parent(
+    NavigationSession *session, const NavigationFrame *frame)
+{
+    if (session == NULL || frame == NULL
+        || frame->parent_frame_slot_plus_one == 0) return NULL;
+    size_t slot = frame->parent_frame_slot_plus_one - 1u;
+    if (slot >= session->page.frame_count) return NULL;
+    NavigationFrame *parent = &session->page.frames[slot];
+    return parent->retired ? NULL : parent;
+}
+
+static ScriptResult *navigation_frame_parent_result(
+    NavigationSession *session, const NavigationFrame *frame)
+{
+    NavigationFrame *parent = navigation_frame_parent(session, frame);
+    return parent == NULL ? (session == NULL ? NULL
+                                             : &session->page.script_result)
+                          : &parent->script_result;
+}
+
+static const LayoutDocument *navigation_frame_parent_layout(
+    NavigationSession *session, const NavigationFrame *frame)
+{
+    NavigationFrame *parent = navigation_frame_parent(session, frame);
+    if (parent == NULL) return session == NULL ? NULL : &session->page.layout;
+    return parent->presentation == NULL ? NULL
+                                        : &parent->presentation->layout;
+}
+
+static ImageResources *navigation_frame_parent_images(
+    NavigationSession *session, const NavigationFrame *frame)
+{
+    NavigationFrame *parent = navigation_frame_parent(session, frame);
+    return parent == NULL ? (session == NULL ? NULL : &session->page.images)
+                          : &parent->images;
+}
+
+static void navigation_frame_presentation_destroy(
+    NavigationSession *session, NavigationFrame *frame)
+{
+    if (session == NULL || frame == NULL || frame->presentation == NULL) {
+        return;
+    }
+    if (frame->runtime != NULL) {
+        script_runtime_set_layout(frame->runtime, NULL, 0);
+        script_runtime_set_stylesheet(frame->runtime, NULL);
+    }
+    layout_destroy(&frame->presentation->layout);
+    stylesheet_destroy(&frame->presentation->stylesheet);
+    budget_free(session->budget, frame->presentation);
+    frame->presentation = NULL;
+}
+
 static const char *const navigation_slice_names[NAVIGATION_SLICE_COUNT] = {
     "network", "parser", "script", "style", "resource", "layout",
     "paint", "runtime", "teardown"
@@ -396,6 +459,27 @@ static bool navigation_install_usable_stylesheet_fallback(
         || !navigation_build_usable_stylesheet_fallback(
                &session->page.stylesheet, session->budget,
                &session->page.document, &session->viewport)) return false;
+    session->page.compiled_stylesheet_cacheable = false;
+    session->performance.stylesheet_pressure_fallbacks++;
+    return true;
+}
+
+/* Last-resort layout admission for a complete server-rendered document.
+   Unlike navigation_build_usable_stylesheet_fallback(), this deliberately
+   does not rescan author <style> payloads: that scan may succeed while
+   rebuilding the same multi-megabyte cascade which caused layout admission
+   to fail. Inline style attributes remain available through ordinary style
+   resolution; document rules are skipped so the DOM can still become a
+   readable, navigable static page inside the PSP ceiling. */
+static bool navigation_install_minimal_stylesheet_fallback(
+    NavigationSession *session)
+{
+    if (session == NULL) return false;
+    stylesheet_destroy(&session->page.stylesheet);
+    if (!stylesheet_build_context_deferred(
+            &session->page.stylesheet, session->budget,
+            &session->page.document, &session->viewport)) return false;
+    session->page.stylesheet.document_rules_deferred = false;
     session->page.compiled_stylesheet_cacheable = false;
     session->performance.stylesheet_pressure_fallbacks++;
     return true;
@@ -918,7 +1002,10 @@ static void page_destroy_value(NavigationSession *session,
     }
     navigation_clear_frame_messages(session, page, false);
     for (size_t i = 0; i < page->frame_count; i++) {
+        navigation_frame_presentation_destroy(
+            session, &page->frames[i]);
         script_runtime_destroy(page->frames[i].runtime);
+        images_destroy(&page->frames[i].images);
         document_destroy(&page->frames[i].document);
     }
     fonts_external_loader_cancel(
@@ -958,16 +1045,62 @@ static void page_destroy(NavigationSession *session)
     if (session != NULL) page_destroy_value(session, &session->page);
 }
 
+static bool navigation_retire_failed_document_refresh(
+    NavigationSession *session, ScriptRuntime *runtime)
+{
+    if (session == NULL || runtime == NULL
+        || !script_runtime_document_refresh_failed(runtime)) return false;
+    /* Every caller supplies either the selected top realm or a runtime read
+       from this page's bounded frame table; no pointer-derived identity is
+       accepted from author code. */
+    /* The mutation is already committed. The incumbent layout may borrow
+       storage from nodes it destroyed, so no static-content degradation is
+       safe: retire the complete page before returning to input or paint. */
+    page_destroy(session);
+    snprintf(session->last_error, sizeof(session->last_error),
+             "could not refresh mutated DOM");
+    return true;
+}
+
+static bool navigation_dispatch_frame_parent_event(
+    NavigationSession *session, ScriptRuntime *parent_runtime,
+    size_t parent_frame_slot_plus_one, lxb_dom_node_t *node,
+    const char *event_type)
+{
+    if (session == NULL || parent_runtime == NULL || node == NULL
+        || event_type == NULL) return false;
+    ScriptResult *result = &session->page.script_result;
+    NavigationFrame *parent = NULL;
+    if (parent_frame_slot_plus_one != 0) {
+        size_t slot = parent_frame_slot_plus_one - 1u;
+        if (slot >= session->page.frame_count) return false;
+        parent = &session->page.frames[slot];
+        if (parent->retired || parent->runtime != parent_runtime) return false;
+        result = &parent->script_result;
+    } else if (parent_runtime != session->page.runtime) {
+        return false;
+    }
+    bool dispatched = script_runtime_dispatch_node(
+        parent_runtime, node, event_type, result);
+    if (!dispatched && navigation_retire_failed_document_refresh(
+            session, parent_runtime)) return false;
+    if (!dispatched) return true;
+    if (!script_runtime_consume_relayout(parent_runtime)) return true;
+    return parent == NULL ? navigation_relayout(session)
+                          : navigation_refresh_frame_presentation(
+                                session, parent);
+}
+
 static void navigation_freeze_reader_root_provenance(NavigationPage *page)
 {
     if (page == NULL || page->runtime == NULL
         || page->reader_root_handle == 0) return;
-    lxb_dom_node_t *resolved = script_runtime_node_handle_resolve_connected(
+    lxb_dom_node_t *resolved = script_runtime_node_handle_resolve(
         page->runtime, page->reader_root_handle);
     if (resolved != NULL && resolved == page->reader_root) {
         /* No author turn can run after the caller destroys this realm. The
-           connected document-owned node is therefore a safe native pointer
-           until ordinary page teardown. */
+           exact document-owned node—connected or still-private—is therefore
+           a safe native pointer until activation or ordinary page teardown. */
         page->reader_root = resolved;
         page->reader_root_handle = 0;
         return;
@@ -1052,10 +1185,22 @@ static bool navigation_queue_frame_message(void *opaque,
 {
     NavigationSession *session = opaque;
     if (session == NULL || source == NULL || json == NULL
-        || target_origin == NULL
-        || session->page.message_count == NAVIGATION_MESSAGE_LIMIT) {
+        || target_origin == NULL) {
         return false;
     }
+#if !defined(TILEFINCH_NO_TRACE)
+    if (session->page.message_count == NAVIGATION_MESSAGE_LIMIT
+        && getenv("TILEFINCH_TRACE_FRAME_MESSAGES") != NULL) {
+        fprintf(stderr,
+                "frame-message-rejected reason=queue-full direction=%s "
+                "source=%ld target=%ld json=\"%.2048s\"\n",
+                source == session->page.runtime ? "parent-to-child"
+                                                : "child-to-parent",
+                source == session->page.runtime ? 0L : -1L,
+                target_frame_handle, json);
+    }
+#endif
+    if (session->page.message_count == NAVIGATION_MESSAGE_LIMIT) return false;
     NavigationMessage *message =
         &session->page.messages[session->page.message_count];
     size_t json_length = strlen(json), origin_length = strlen(target_origin);
@@ -1121,14 +1266,23 @@ static bool navigation_queue_frame_message(void *opaque,
         return false;
     }
     message->target_frame_handle = target_frame_handle;
-    if (source == session->page.runtime && target_frame_handle > 0) {
+    if (target_frame_handle > 0) {
+        bool target_found = false;
         for (size_t i = 0; i < session->page.frame_count; i++) {
             NavigationFrame *target = &session->page.frames[i];
             if (!target->retired
+                && target->parent_runtime == source
                 && target->parent_handle == target_frame_handle) {
                 message->target_generation = target->lifecycle_generation;
+                target_found = true;
                 break;
             }
+        }
+        if (!target_found) {
+            budget_free(session->budget, message->json);
+            budget_free(session->budget, message->target_origin);
+            memset(message, 0, sizeof(*message));
+            return false;
         }
     }
     session->page.message_count++;
@@ -1206,6 +1360,17 @@ static bool navigation_queue_frame_message(void *opaque,
     return true;
 }
 
+bool navigation_test_configure_frame_messaging(
+    NavigationSession *session, NavigationFrame *frame)
+{
+    if (session == NULL || frame == NULL || frame->runtime == NULL) {
+        return false;
+    }
+    return script_runtime_configure_messaging(
+        frame->runtime, true, true, false, true,
+        navigation_queue_frame_message, session);
+}
+
 static bool url_origin(const char *url, char *output, size_t capacity)
 {
     return tilefinch_url_origin(url, output, capacity);
@@ -1228,10 +1393,12 @@ static void navigation_accept_response_cookies(
 }
 
 static NavigationFrame *frame_for_handle(NavigationSession *session,
+                                         ScriptRuntime *parent_runtime,
                                          long handle)
 {
     for (size_t i = 0; i < session->page.frame_count; i++) {
         if (!session->page.frames[i].retired
+            && session->page.frames[i].parent_runtime == parent_runtime
             && session->page.frames[i].parent_handle == handle) {
             return &session->page.frames[i];
         }
@@ -1239,11 +1406,26 @@ static NavigationFrame *frame_for_handle(NavigationSession *session,
     return NULL;
 }
 
+static NavigationFrame *frame_for_runtime(NavigationSession *session,
+                                          ScriptRuntime *runtime)
+{
+    if (session == NULL || runtime == NULL) return NULL;
+    for (size_t i = 0; i < session->page.frame_count; i++) {
+        NavigationFrame *frame = &session->page.frames[i];
+        if (!frame->retired && frame->runtime == runtime) return frame;
+    }
+    return NULL;
+}
+
 static void navigation_drop_frame_messages(NavigationSession *session,
                                            const NavigationFrame *frame);
+static void navigation_retire_frame_descendants(
+    NavigationSession *session, size_t ancestor_slot,
+    const char *reason);
 
 static bool navigation_deliver_frame_messages(NavigationSession *session)
 {
+    enum { NAVIGATION_MESSAGE_TARGET_TOP = -1 };
     size_t delivered = 0;
     while (session->page.message_count != 0
            && delivered < NAVIGATION_MESSAGE_LIMIT) {
@@ -1256,85 +1438,159 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
                sizeof(*session->page.messages));
         ScriptRuntime *target = NULL;
         NavigationFrame *target_frame = NULL;
+        NavigationFrame *target_owner_frame = NULL;
+        NavigationFrame *source_frame = frame_for_runtime(
+            session, message.source);
         long source_handle = message.source_frame_handle;
         bool lifecycle_valid = true;
-        if (message.source == session->page.runtime) {
+        if (message.target_frame_handle > 0) {
             target_frame = frame_for_handle(
-                session, message.target_frame_handle);
+                session, message.source, message.target_frame_handle);
             if (target_frame != NULL
                 && target_frame->lifecycle_generation
                        == message.target_generation) {
                 target = target_frame->runtime;
+                target_owner_frame = target_frame;
             } else {
                 lifecycle_valid = false;
             }
-        } else {
-            target = session->page.runtime;
-            bool source_found = false;
-            for (size_t i = 0; i < session->page.frame_count; i++) {
-                NavigationFrame *source_frame = &session->page.frames[i];
-                if (!source_frame->retired
-                    && source_frame->runtime == message.source
-                    && source_frame->parent_handle
-                           == message.source_frame_handle
-                    && source_frame->lifecycle_generation
-                           == message.source_generation) {
-                    source_found = true;
-                    break;
-                }
+        } else if (source_frame != NULL) {
+            if (message.target_frame_handle
+                == NAVIGATION_MESSAGE_TARGET_TOP) {
+                target = session->page.runtime;
+                target_owner_frame = NULL;
+            } else {
+                target = source_frame->parent_runtime;
+                target_owner_frame = navigation_frame_parent(
+                    session, source_frame);
             }
-            lifecycle_valid = source_found;
+            lifecycle_valid = source_frame->parent_handle
+                                  == message.source_frame_handle
+                && source_frame->lifecycle_generation
+                       == message.source_generation;
+        } else {
+            lifecycle_valid = false;
         }
         bool target_allowed = lifecycle_valid && target != NULL;
+        const char *drop_reason = !lifecycle_valid
+            ? "lifecycle" : target == NULL ? "target-missing" : NULL;
         if (target_allowed && strcmp(message.target_origin, "*") != 0) {
             char receiver_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT] = {0};
-            if (target_frame != NULL && target_frame->opaque_origin) {
+            if (target_owner_frame != NULL
+                && target_owner_frame->opaque_origin) {
                 snprintf(receiver_origin, sizeof(receiver_origin), "null");
             } else {
                 const char *receiver_url = target == session->page.runtime
-                    ? session->page.document_url : target_frame->url;
+                    ? session->page.document_url : target_owner_frame->url;
                 (void) url_origin(receiver_url, receiver_origin,
                                   sizeof(receiver_origin));
             }
             target_allowed = strcmp(message.target_origin,
                                     receiver_origin) == 0;
+            if (!target_allowed) drop_reason = "origin";
         }
         session->last_frame_message_sequence = message.sequence;
         session->last_frame_message_source = source_handle;
         session->last_frame_message_target =
-            target == session->page.runtime ? 0 : message.target_frame_handle;
+            target == session->page.runtime ? 0
+                : (target_frame != NULL ? message.target_frame_handle
+                                        : (source_frame != NULL
+                                               ? source_frame->parent_handle
+                                               : 0));
+        bool nested_top_message = message.target_frame_handle
+                == NAVIGATION_MESSAGE_TARGET_TOP
+            && source_frame != NULL
+            && source_frame->parent_runtime != session->page.runtime;
+        /* The top realm does not own a DOM handle for a nested iframe. Until
+           the bounded WindowProxy table represents transitive descendants,
+           expose a standards-safe null source rather than aliasing the
+           nested parent's unrelated handle in the top document. */
+        long dispatch_source_handle = target_frame == NULL
+            ? (nested_top_message ? 0 : source_handle) : 0;
+#if !defined(TILEFINCH_NO_TRACE)
+        if (!target_allowed
+            && getenv("TILEFINCH_TRACE_FRAME_MESSAGES") != NULL) {
+            fprintf(stderr,
+                    "frame-message-dropped sequence=%llu reason=%s "
+                    "source=%ld target=%ld\n",
+                    (unsigned long long) message.sequence,
+                    drop_reason == NULL ? "policy" : drop_reason,
+                    source_handle, message.target_frame_handle);
+        }
+#endif
         bool ok = !target_allowed || script_runtime_dispatch_message(
-            target, message.json, message.source_origin, source_handle,
+            target, message.json, message.source_origin,
+            dispatch_source_handle,
             target == session->page.runtime
                 ? &session->page.script_result
-                : &target_frame->script_result);
+                : &target_owner_frame->script_result);
         budget_free(session->budget, message.target_origin);
         budget_free(session->budget, message.json);
-        if (!ok && target_frame != NULL) {
+        if (!ok && navigation_retire_failed_document_refresh(
+                session, target)) return false;
+        if (!ok && target_owner_frame != NULL) {
             /* A failed child browsing context is contained like a crashed
                renderer process. It must not turn a later postMessage into a
                top-level navigation failure or leave queued pointers to the
                realm which is about to be destroyed. */
-            navigation_drop_frame_messages(session, target_frame);
-            if (getenv("TILEFINCH_TRACE_JS_ROOTS") != NULL
-                && target_frame->runtime != NULL) {
-                script_runtime_report_roots(
-                    target_frame->runtime, stderr, "frame-failed", "child",
-                    target_frame->parent_handle);
+            size_t owner_slot = (size_t) (
+                target_owner_frame - session->page.frames);
+            navigation_retire_frame_descendants(
+                session, owner_slot, "ancestor iframe failed");
+            navigation_drop_frame_messages(session, target_owner_frame);
+            if (target_owner_frame->parent_runtime != NULL) {
+                (void) script_runtime_set_frame_window_state(
+                    target_owner_frame->parent_runtime,
+                    target_owner_frame->parent_handle, false, false, false,
+                    NULL, navigation_frame_parent_result(
+                              session, target_owner_frame));
             }
-            script_runtime_destroy(target_frame->runtime);
-            target_frame->runtime = NULL;
-            document_destroy(&target_frame->document);
-            target_frame->loaded = false;
+            if (getenv("TILEFINCH_TRACE_JS_ROOTS") != NULL
+                && target_owner_frame->runtime != NULL) {
+                script_runtime_report_roots(
+                    target_owner_frame->runtime, stderr, "frame-failed",
+                    "child", target_owner_frame->parent_handle);
+            }
+            navigation_frame_presentation_destroy(
+                session, target_owner_frame);
+            script_runtime_destroy(target_owner_frame->runtime);
+            target_owner_frame->runtime = NULL;
+            images_destroy(&target_owner_frame->images);
+            document_destroy(&target_owner_frame->document);
+            target_owner_frame->fetch_pending = false;
+            target_owner_frame->loaded = false;
+            target_owner_frame->retired = true;
             session->frames_failed++;
             session->frame_messages_dropped++;
             delivered++;
             continue;
         }
-        if (!ok) return false;
+        if (!ok) {
+            (void) navigation_retire_failed_document_refresh(
+                session, target);
+            return false;
+        }
         if (target_allowed) session->frame_messages_delivered++;
         else session->frame_messages_dropped++;
+        if (ok && target_allowed && target_owner_frame != NULL
+            && script_runtime_consume_relayout(target)) {
+            target_owner_frame->presentation_dirty = true;
+        }
         delivered++;
+    }
+    /* A mutating child message may rebuild at most one opaque child snapshot
+       per owner tick. Remaining dirty children retain their flag, preventing
+       an animation-heavy frame from forcing an unbounded raster cascade. */
+    for (size_t i = 0; i < session->page.frame_count; i++) {
+        NavigationFrame *frame = &session->page.frames[i];
+        if (frame->retired || !frame->loaded || frame->runtime == NULL
+            || !frame->presentation_dirty) continue;
+        frame->presentation_dirty = false;
+        if (!navigation_refresh_frame_presentation(session, frame)) {
+            frame->presentation_dirty = session->page.loaded;
+            if (!session->page.loaded) return false;
+        }
+        break;
     }
     return true;
 }
@@ -1342,10 +1598,10 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
 static bool navigation_frame_element_connected(
     const NavigationSession *session, const NavigationFrame *frame)
 {
-    if (session == NULL || frame == NULL || session->page.runtime == NULL
+    if (session == NULL || frame == NULL || frame->parent_runtime == NULL
         || frame->parent_handle <= 0) return false;
     lxb_dom_node_t *node = script_runtime_node_handle_resolve(
-        session->page.runtime, frame->parent_handle);
+        frame->parent_runtime, frame->parent_handle);
     for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
         if (at->type == LXB_DOM_NODE_TYPE_DOCUMENT) return true;
     }
@@ -1358,11 +1614,10 @@ static void navigation_drop_frame_messages(NavigationSession *session,
     size_t write = 0;
     for (size_t read = 0; read < session->page.message_count; read++) {
         NavigationMessage *message = &session->page.messages[read];
-        bool drop = (message->source_frame_handle == frame->parent_handle
+        bool drop = (message->source == frame->runtime
                      && message->source_generation
                             == frame->lifecycle_generation)
-            || (message->source == session->page.runtime
-                && message->target_frame_handle == frame->parent_handle
+            || (message->target_frame_handle == frame->parent_handle
                 && message->target_generation
                        == frame->lifecycle_generation);
         if (drop) {
@@ -1383,10 +1638,16 @@ static void navigation_drop_frame_messages(NavigationSession *session,
 
 static bool navigation_retire_detached_frames(NavigationSession *session)
 {
-    for (size_t i = 0; i < session->page.frame_count; i++) {
+    /* Parents are appended before descendants. Retire in reverse order so a
+       nested frame never resolves its element through an already-destroyed
+       parent runtime. */
+    for (size_t cursor = session->page.frame_count; cursor != 0; cursor--) {
+        size_t i = cursor - 1u;
         NavigationFrame *frame = &session->page.frames[i];
         if (frame->retired
             || navigation_frame_element_connected(session, frame)) continue;
+        navigation_retire_frame_descendants(
+            session, i, "ancestor iframe detached");
         if (frame->fetch_pending) {
             (void) fetch_scheduler_cancel(session->page.resource_scheduler,
                                           frame->fetch_request_id,
@@ -1396,19 +1657,22 @@ static bool navigation_retire_detached_frames(NavigationSession *session)
             frame->fetch_pending = false;
         }
         navigation_drop_frame_messages(session, frame);
-        if (session->page.runtime != NULL
+        if (frame->parent_runtime != NULL
             && !script_runtime_set_frame_window_state(
-                session->page.runtime, frame->parent_handle, false, false,
+                frame->parent_runtime, frame->parent_handle, false, false,
                 false,
-                NULL, &session->page.script_result)) return false;
+                NULL, navigation_frame_parent_result(
+                          session, frame))) return false;
         if (getenv("TILEFINCH_TRACE_JS_ROOTS") != NULL
             && frame->runtime != NULL) {
             script_runtime_report_roots(frame->runtime, stderr,
                                         "pre-detach", "child",
                                         frame->parent_handle);
         }
+        navigation_frame_presentation_destroy(session, frame);
         script_runtime_destroy(frame->runtime);
         frame->runtime = NULL;
+        images_destroy(&frame->images);
         document_destroy(&frame->document);
         frame->loaded = false;
         frame->retired = true;
@@ -1640,7 +1904,11 @@ static bool navigation_dispatch_stylesheet_events(
            other node pointer which existed at selection time. */
         if (!script_runtime_dispatch_node(
                 session->page.runtime, selected, event_type,
-                &session->page.script_result)) return false;
+                &session->page.script_result)) {
+            (void) navigation_retire_failed_document_refresh(
+                session, session->page.runtime);
+            return false;
+        }
     }
     return true;
 }
@@ -1805,36 +2073,38 @@ static bool collect_iframes(ScriptRuntime *runtime, lxb_dom_node_t *node,
 }
 
 static bool frame_element_was_discovered(const NavigationPage *page,
+                                         ScriptRuntime *runtime,
                                          long handle)
 {
     for (size_t i = 0; i < page->discovered_frame_element_count; i++) {
-        if (page->discovered_frame_handles[i] == handle) return true;
+        if (page->discovered_frame_runtimes[i] == runtime
+            && page->discovered_frame_handles[i] == handle) return true;
     }
     return false;
 }
 
 static bool remember_discovered_frame(NavigationPage *page,
+                                      ScriptRuntime *runtime,
                                       long handle)
 {
-    if (handle == 0 || frame_element_was_discovered(page, handle)) return false;
+    if (runtime == NULL || handle == 0
+        || frame_element_was_discovered(page, runtime, handle)) return false;
     if (page->discovered_frame_element_count
         >= NAVIGATION_FRAME_DISCOVERY_LIMIT) return false;
-    page->discovered_frame_handles[page->discovered_frame_element_count++] =
-        handle;
+    size_t slot = page->discovered_frame_element_count++;
+    page->discovered_frame_handles[slot] = handle;
+    page->discovered_frame_runtimes[slot] = runtime;
     return true;
 }
 
 static TilefinchRequestContext navigation_frame_request_context(
-    const NavigationFrame *frame)
+    const NavigationSession *session, const NavigationFrame *frame)
 {
     return (TilefinchRequestContext) {
         .target_url = frame == NULL ? NULL : frame->url,
         .initiator_url = frame == NULL ? NULL : frame->parent_url,
-        /* This implementation discovers only frames in the top-level
-           document, so parent_url is also the candidate top-level URL. Do
-           not consult history here: the candidate is not published until
-           frame setup and all other fallible commit work succeeds. */
-        .top_level_url = frame == NULL ? NULL : frame->parent_url,
+        .top_level_url = session == NULL ? NULL
+                                         : session->page.document_url,
         .method = "GET",
         .mode = TILEFINCH_REQUEST_MODE_NAVIGATE,
         .credentials = TILEFINCH_CREDENTIALS_INCLUDE,
@@ -1849,7 +2119,11 @@ static uint64_t navigation_enqueue_frame_fetch(
     if (session == NULL || frame == NULL
         || session->page.resource_scheduler == NULL) return 0;
     TilefinchRequestContext request_context =
-        navigation_frame_request_context(frame);
+        navigation_frame_request_context(session, frame);
+    NavigationFrame *parent = navigation_frame_parent(session, frame);
+    const TilefinchContentSecurityPolicy *parent_csp = parent == NULL
+        ? &session->page.document.content_security_policy
+        : &parent->document.content_security_policy;
     FetchRequest transport = {
         .allow_http_errors = true,
         .send_client_hints = client_hint_tokens != NULL,
@@ -1865,8 +2139,8 @@ static uint64_t navigation_enqueue_frame_fetch(
     FetchPreparedPageRequest prepared;
     if (!fetch_prepare_page_request_context(
             &request_context, frame->parent_url,
-            session->page.referrer_policy, session->browser_session,
-            &session->page.document.content_security_policy, NULL,
+            frame->referrer_policy, session->browser_session,
+            parent_csp, NULL,
             &transport, &prepared, NULL)) return 0;
     const FetchRequest *request = fetch_prepared_page_request(&prepared);
     if (request == NULL) return 0;
@@ -1875,29 +2149,89 @@ static uint64_t navigation_enqueue_frame_fetch(
         512 * 1024, 15000);
 }
 
-static bool navigation_load_frames(NavigationSession *session,
-                                   const char *parent_url)
+static bool navigation_frame_descends_from(
+    const NavigationSession *session, const NavigationFrame *candidate,
+    size_t ancestor_slot)
 {
-    if (session->page.runtime == NULL || parent_url == NULL) return true;
+    if (session == NULL || candidate == NULL) return false;
+    size_t parent_plus_one = candidate->parent_frame_slot_plus_one;
+    for (size_t depth = 0;
+         parent_plus_one != 0 && depth < NAVIGATION_FRAME_LIMIT; depth++) {
+        size_t slot = parent_plus_one - 1u;
+        if (slot == ancestor_slot) return true;
+        if (slot >= session->page.frame_count) return false;
+        parent_plus_one =
+            session->page.frames[slot].parent_frame_slot_plus_one;
+    }
+    return false;
+}
+
+static void navigation_retire_frame_descendants(
+    NavigationSession *session, size_t ancestor_slot,
+    const char *reason)
+{
+    if (session == NULL) return;
+    for (size_t cursor = session->page.frame_count; cursor != 0; cursor--) {
+        size_t slot = cursor - 1u;
+        NavigationFrame *candidate = &session->page.frames[slot];
+        if (candidate->retired || slot == ancestor_slot
+            || !navigation_frame_descends_from(
+                   session, candidate, ancestor_slot)) continue;
+        if (candidate->fetch_pending
+            && session->page.resource_scheduler != NULL) {
+            (void) fetch_scheduler_cancel(
+                session->page.resource_scheduler,
+                candidate->fetch_request_id,
+                reason == NULL ? "ancestor iframe retired" : reason);
+            (void) fetch_scheduler_discard(
+                session->page.resource_scheduler,
+                candidate->fetch_request_id);
+        }
+        navigation_drop_frame_messages(session, candidate);
+        navigation_frame_presentation_destroy(session, candidate);
+        script_runtime_destroy(candidate->runtime);
+        candidate->runtime = NULL;
+        images_destroy(&candidate->images);
+        document_destroy(&candidate->document);
+        candidate->fetch_pending = false;
+        candidate->loaded = false;
+        candidate->retired = true;
+    }
+}
+
+static bool navigation_load_frames_for_context(
+    NavigationSession *session, ScriptRuntime *parent_runtime,
+    const PocDocument *parent_document, const char *parent_url,
+    size_t parent_frame_slot_plus_one)
+{
+    if (session == NULL || parent_runtime == NULL
+        || parent_document == NULL || parent_document->html == NULL
+        || parent_url == NULL) return true;
     long handles[NAVIGATION_FRAME_DISCOVERY_LIMIT] = {0};
     size_t count = 0;
     if (!collect_iframes(
-            session->page.runtime,
-            lxb_dom_interface_node(session->page.document.html), handles,
+            parent_runtime,
+            lxb_dom_interface_node(parent_document->html), handles,
             NAVIGATION_FRAME_DISCOVERY_LIMIT, &count)) {
+        if (parent_frame_slot_plus_one != 0) {
+            /* One oversized child document may lose nested-frame discovery,
+               but it must not abort the otherwise healthy top document. */
+            session->frames_failed++;
+            return true;
+        }
         snprintf(session->last_error, sizeof(session->last_error),
                  "frame discovery exceeded %u nodes or handle capacity",
                  NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT);
         return false;
     }
     if (count == 0) return true;
-    if (!script_runtime_configure_messaging(
-            session->page.runtime, false, true, false,
-            navigation_queue_frame_message,
-            session)) return false;
+    if (parent_frame_slot_plus_one == 0
+        && !script_runtime_configure_messaging(
+            parent_runtime, false, true, false, true,
+            navigation_queue_frame_message, session)) return false;
     for (size_t i = 0; i < count; i++) {
         lxb_dom_node_t *node = script_runtime_node_handle_resolve_connected(
-            session->page.runtime, handles[i]);
+            parent_runtime, handles[i]);
         if (node == NULL) continue;
         size_t srcdoc_length = 0;
         const char *srcdoc = document_attribute(
@@ -1907,17 +2241,19 @@ static bool navigation_load_frames(NavigationSession *session,
            fetch or dispatch a second load/error event here. */
         if (srcdoc != NULL) continue;
         long parent_handle = script_runtime_node_handle(
-            session->page.runtime, node);
+            parent_runtime, node);
         NavigationFrame *frame = NULL;
         for (size_t slot = 0; slot < session->page.frame_count; slot++) {
             NavigationFrame *candidate = &session->page.frames[slot];
-            if (candidate->parent_handle == parent_handle) {
+            if (!candidate->retired
+                && candidate->parent_runtime == parent_runtime
+                && candidate->parent_handle == parent_handle) {
                 frame = candidate;
                 break;
             }
         }
         bool known = frame_element_was_discovered(
-            &session->page, handles[i]);
+            &session->page, parent_runtime, handles[i]);
         size_t source_length = 0;
         const char *source = document_attribute(node, "src",
                                                 &source_length);
@@ -1944,11 +2280,14 @@ static bool navigation_load_frames(NavigationSession *session,
             && strcmp(frame->url, resolved_url) == 0
             && frame->sandbox_flags == sandbox_flags) continue;
         if (!known && !remember_discovered_frame(
-                &session->page, handles[i])) {
+                &session->page, parent_runtime, handles[i])) {
             continue;
         }
         session->frames_discovered++;
         if (frame != NULL && !frame->retired) {
+            size_t frame_slot = (size_t) (frame - session->page.frames);
+            navigation_retire_frame_descendants(
+                session, frame_slot, "ancestor iframe source changed");
             if (frame->fetch_pending) {
                 (void) fetch_scheduler_cancel(
                     session->page.resource_scheduler,
@@ -1958,7 +2297,9 @@ static bool navigation_load_frames(NavigationSession *session,
                     frame->fetch_request_id);
             }
             navigation_drop_frame_messages(session, frame);
+            navigation_frame_presentation_destroy(session, frame);
             script_runtime_destroy(frame->runtime);
+            images_destroy(&frame->images);
             document_destroy(&frame->document);
             frame->runtime = NULL;
             frame->fetch_pending = false;
@@ -1977,8 +2318,11 @@ static bool navigation_load_frames(NavigationSession *session,
         if (append_frame) {
             if (session->page.frame_count >= NAVIGATION_FRAME_LIMIT) {
                 session->frames_failed++;
-                (void) navigation_dispatch_node_event(session, node,
-                                                       "error");
+                if (!navigation_dispatch_frame_parent_event(
+                        session, parent_runtime,
+                        parent_frame_slot_plus_one, node, "error")) {
+                    return false;
+                }
                 continue;
             }
             frame = &session->page.frames[session->page.frame_count];
@@ -1991,10 +2335,19 @@ static bool navigation_load_frames(NavigationSession *session,
         snprintf(frame->parent_url, sizeof(frame->parent_url), "%s",
                  parent_url);
         frame->element = node;
+        frame->parent_runtime = parent_runtime;
+        frame->parent_frame_slot_plus_one = parent_frame_slot_plus_one;
         frame->parent_handle = parent_handle;
         frame->sandbox_flags = sandbox_flags;
         frame->opaque_origin = !tilefinch_frame_sandbox_allows(
             sandbox_flags, TILEFINCH_SANDBOX_ALLOW_SAME_ORIGIN);
+        NavigationFrame *parent_frame = navigation_frame_parent(
+            session, frame);
+        const char *initiator_referrer_policy = parent_frame == NULL
+            ? session->page.referrer_policy
+            : parent_frame->referrer_policy;
+        snprintf(frame->referrer_policy, sizeof(frame->referrer_policy),
+                 "%s", initiator_referrer_policy);
         if (session->next_frame_lifecycle_generation != UINT64_MAX) {
             session->next_frame_lifecycle_generation++;
         }
@@ -2002,12 +2355,23 @@ static bool navigation_load_frames(NavigationSession *session,
             session->next_frame_lifecycle_generation;
         if (session->page.resource_scheduler == NULL) {
             session->frames_failed++;
-            (void) navigation_dispatch_node_event(session, node,
-                                                  "error");
+            if (!navigation_dispatch_frame_parent_event(
+                    session, parent_runtime,
+                    parent_frame_slot_plus_one, node, "error")) {
+                return false;
+            }
             continue;
         }
+        char cached_hint_tokens[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = {0};
+        char cached_hint_origin[BROWSER_ORIGIN_LIMIT] = {0};
+        (void) browser_session_client_hints_get(
+            session->browser_session, frame->url,
+            cached_hint_tokens, sizeof(cached_hint_tokens),
+            cached_hint_origin, sizeof(cached_hint_origin));
         frame->fetch_request_id = navigation_enqueue_frame_fetch(
-            session, frame, NULL, NULL);
+            session, frame,
+            cached_hint_tokens[0] == '\0' ? NULL : cached_hint_tokens,
+            cached_hint_origin[0] == '\0' ? NULL : cached_hint_origin);
         frame->fetch_pending = frame->fetch_request_id != 0;
         if (append_frame) session->page.frame_count++;
         char parent_origin[NAVIGATION_URL_LIMIT] = {0};
@@ -2018,17 +2382,195 @@ static bool navigation_load_frames(NavigationSession *session,
             && strcmp(parent_origin, child_origin) == 0
             && !frame->opaque_origin;
         if (!script_runtime_set_frame_window_state(
-                session->page.runtime, frame->parent_handle, true,
+                parent_runtime, frame->parent_handle, true,
                 same_origin, frame->opaque_origin, frame->url,
-                &session->page.script_result)) return false;
+                navigation_frame_parent_result(session, frame))) return false;
         if (!frame->fetch_pending) {
             session->frames_failed++;
-            (void) navigation_dispatch_node_event(session, node,
-                                                  "error");
+            if (!navigation_dispatch_frame_parent_event(
+                    session, parent_runtime,
+                    parent_frame_slot_plus_one, node, "error")) {
+                return false;
+            }
         }
     }
     return navigation_deliver_frame_messages(session);
 }
+
+static bool navigation_load_frames(NavigationSession *session,
+                                   const char *parent_url)
+{
+    if (session == NULL || session->page.runtime == NULL
+        || parent_url == NULL) return true;
+    if (!navigation_load_frames_for_context(
+            session, session->page.runtime, &session->page.document,
+            parent_url, 0)) return false;
+    /* frame_count may grow while walking. Each newly completed child is
+       considered exactly once per outer runtime tick, and the fixed table
+       supplies the nesting/depth bound. */
+    for (size_t i = 0; i < session->page.frame_count; i++) {
+        NavigationFrame *frame = &session->page.frames[i];
+        if (frame->retired || !frame->loaded || frame->runtime == NULL) {
+            continue;
+        }
+        if (!navigation_load_frames_for_context(
+                session, frame->runtime, &frame->document, frame->url,
+                i + 1u)) return false;
+    }
+    return true;
+}
+
+static bool navigation_frame_presentation_dimensions(
+    const NavigationSession *session, const NavigationFrame *frame,
+    int *width, int *height)
+{
+    if (session == NULL || frame == NULL || frame->element == NULL
+        || width == NULL || height == NULL) return false;
+    int frame_width = 300;
+    int frame_height = 150;
+    const LayoutDocument *parent_layout = navigation_frame_parent_layout(
+        (NavigationSession *) session, frame);
+    const LayoutNodeBox *box = parent_layout == NULL ? NULL
+        : layout_box_for_node(parent_layout, frame->element);
+    if (box != NULL) {
+        if (box->client_width > 0) frame_width = box->client_width;
+        else if (box->content_width > 0) frame_width = box->content_width;
+        else if (box->width > 0) frame_width = box->width;
+        if (box->client_height > 0) frame_height = box->client_height;
+        else if (box->content_height > 0) frame_height = box->content_height;
+        else if (box->height > 0) frame_height = box->height;
+    }
+    int maximum_width = session->viewport.css_width > 0
+        ? session->viewport.css_width : 480;
+    int maximum_height = session->viewport.css_height > 0
+        ? session->viewport.css_height : 272;
+    if (frame_width > maximum_width) frame_width = maximum_width;
+    if (frame_height > maximum_height) frame_height = maximum_height;
+    if (frame_width < 1 || frame_height < 1) return false;
+    *width = frame_width;
+    *height = frame_height;
+    return true;
+}
+
+/* Build one bounded visual snapshot of a child browsing context. The child
+   DOM and its control nodes stay inside NavigationFrame; the parent receives
+   only opaque pixels attached to the iframe element. This is deliberately a
+   mutation-triggered operation rather than a heartbeat repaint. */
+static bool navigation_refresh_frame_presentation(
+    NavigationSession *session, NavigationFrame *frame)
+{
+    if (session == NULL || frame == NULL || frame->runtime == NULL
+        || frame->document.html == NULL || frame->element == NULL
+        || session->images != &session->page.images) return false;
+    int width = 0, height = 0;
+    if (!navigation_frame_presentation_dimensions(
+            session, frame, &width, &height)) return false;
+    if ((size_t) width > SIZE_MAX / (size_t) height) return false;
+    size_t pixels = (size_t) width * (size_t) height;
+    if (pixels > SIZE_MAX / 4u) return false;
+
+    NavigationFramePresentation *fresh = budget_calloc(
+        session->budget, 1u, sizeof(*fresh));
+    if (fresh == NULL) return false;
+    fresh->width = width;
+    fresh->height = height;
+    ViewportContext viewport;
+    /* Nested browsing-context snapshots may be attached after this layout is
+       committed. Reserve the complete bounded frame capacity first so the
+       ImageResource table cannot relocate underneath retained paint data. */
+    bool okay = images_reserve_capacity(
+            &frame->images, session->budget, NAVIGATION_FRAME_LIMIT)
+        && viewport_context_init(
+        &viewport, width, height, width, height)
+        && stylesheet_build_context(
+            &fresh->stylesheet, session->budget, &frame->document,
+            &viewport)
+        && layout_build_context(
+            &fresh->layout, session->budget, &frame->document,
+            &fresh->stylesheet, session->fonts, &frame->images, &viewport);
+
+    uint16_t *rgb565 = NULL;
+    unsigned char *rgba = NULL;
+    TileCache cache = {0};
+    if (okay) {
+        rgb565 = budget_malloc_category(
+            session->budget, BUDGET_CATEGORY_RENDER,
+            pixels * sizeof(*rgb565));
+        rgba = budget_malloc_category(
+            session->budget, BUDGET_CATEGORY_RESOURCE, pixels * 4u);
+        okay = rgb565 != NULL && rgba != NULL
+            && tile_cache_init(&cache, session->budget, &fresh->layout, 2u)
+            && tile_cache_set_frame(&cache, rgb565, pixels)
+            && tile_cache_render_frame(
+                &cache, 0, width, height, NULL);
+    }
+    if (okay) {
+        for (size_t i = 0; i < pixels; i++) {
+            unsigned red = tilefinch_rgb565_red_code(rgb565[i]);
+            unsigned green = tilefinch_rgb565_green_code(rgb565[i]);
+            unsigned blue = tilefinch_rgb565_blue_code(rgb565[i]);
+            rgba[i * 4u] = (unsigned char) ((red << 3) | (red >> 2));
+            rgba[i * 4u + 1u] =
+                (unsigned char) ((green << 2) | (green >> 4));
+            rgba[i * 4u + 2u] =
+                (unsigned char) ((blue << 3) | (blue >> 2));
+            rgba[i * 4u + 3u] = 255u;
+        }
+        ImageResources *parent_images = navigation_frame_parent_images(
+            session, frame);
+        okay = parent_images != NULL && images_replace_with_decoded_surface(
+            parent_images, session->budget, frame->element,
+            rgba, width, height);
+    }
+    tile_cache_destroy(&cache);
+    budget_free(session->budget, rgb565);
+    if (!okay) {
+        budget_free(session->budget, rgba);
+        layout_destroy(&fresh->layout);
+        stylesheet_destroy(&fresh->stylesheet);
+        budget_free(session->budget, fresh);
+        return false;
+    }
+    /* Ownership of rgba transferred to ImageResources. Mark the opaque
+       browsing-context snapshot as cross-origin defensively even though the
+       canvas bridge does not admit iframe elements as image sources. */
+    ImageResources *parent_images = navigation_frame_parent_images(
+        session, frame);
+    for (size_t i = 0; parent_images != NULL
+                       && i < parent_images->count; i++) {
+        ImageResource *resource = &parent_images->items[i];
+        if (resource->node == frame->element && !resource->is_mask
+            && !resource->is_background) resource->cross_origin = true;
+    }
+
+    NavigationFramePresentation *retired = frame->presentation;
+    frame->presentation = fresh;
+    script_runtime_set_stylesheet(
+        frame->runtime, &frame->presentation->stylesheet);
+    script_runtime_set_layout(
+        frame->runtime, &frame->presentation->layout, height);
+    (void) script_runtime_consume_relayout(frame->runtime);
+    if (retired != NULL) {
+        layout_destroy(&retired->layout);
+        stylesheet_destroy(&retired->stylesheet);
+        budget_free(session->budget, retired);
+    }
+    /* The immediate parent layout must acquire the new DRAW_IMAGE command.
+       A nested snapshot is then propagated outward one bounded frame at a
+       time; the top-level page alone publishes final damage. */
+    NavigationFrame *parent = navigation_frame_parent(session, frame);
+    return parent == NULL ? navigation_relayout(session)
+                          : navigation_refresh_frame_presentation(
+                                session, parent);
+}
+
+#if !defined(__PSP__)
+bool navigation_test_refresh_frame_presentation(
+    NavigationSession *session, NavigationFrame *frame)
+{
+    return navigation_refresh_frame_presentation(session, frame);
+}
+#endif
 
 static bool navigation_complete_frame(NavigationSession *session,
                                       NavigationFrame *frame,
@@ -2049,7 +2591,7 @@ static bool navigation_complete_frame(NavigationSession *session,
         frame->referrer_policy[0] = '\0';
     }
     TilefinchRequestContext request_context =
-        navigation_frame_request_context(frame);
+        navigation_frame_request_context(session, frame);
     if (fetched_ok) {
         navigation_accept_response_cookies(
             session->browser_session, &request_context, fetch,
@@ -2058,32 +2600,52 @@ static bool navigation_complete_frame(NavigationSession *session,
     }
     const char *effective = fetch->effective_url[0] == '\0'
         ? frame->url : fetch->effective_url;
-    char accepted_critical[1024] = {0};
+    char prior_hints[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = {0};
+    char prior_hint_origin[BROWSER_ORIGIN_LIMIT] = {0};
+    char accepted_hints[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = {0};
+    char accepted_critical[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = {0};
+    (void) browser_session_client_hints_get(
+        session->browser_session, effective,
+        prior_hints, sizeof(prior_hints),
+        prior_hint_origin, sizeof(prior_hint_origin));
+    bool hints_valid = fetched_ok
+        && fetch_accepted_critical_client_hints(
+               fetch->accept_ch, fetch->accept_ch,
+               accepted_hints, sizeof(accepted_hints));
+    bool critical_valid = fetched_ok
+        && fetch_accepted_critical_client_hints(
+               fetch->accept_ch, fetch->critical_ch,
+               accepted_critical, sizeof(accepted_critical));
     bool retry_client_hints = fetched_ok
         && !frame->client_hint_retried
         && tilefinch_url_potentially_trustworthy(effective)
-        && fetch_accepted_critical_client_hints(
-            fetch->accept_ch, fetch->critical_ch,
-            accepted_critical, sizeof(accepted_critical))
-        && accepted_critical[0] != '\0';
+        && critical_valid && accepted_critical[0] != '\0'
+        && !fetch_client_hint_tokens_cover(
+               prior_hints, accepted_critical);
+    if (hints_valid && accepted_hints[0] != '\0') {
+        (void) browser_session_client_hints_put(
+            session->browser_session, effective, accepted_hints);
+    }
     if (retry_client_hints) {
         char retry_url[NAVIGATION_URL_LIMIT];
         if (!tilefinch_url_request_key(effective, retry_url,
                                     sizeof(retry_url))) {
             fetch_result_destroy(fetch);
             session->frames_failed++;
-            (void) navigation_dispatch_node_event(
-                session, frame->element, "error");
-            return true;
+            return navigation_dispatch_frame_parent_event(
+                session, frame->parent_runtime,
+                frame->parent_frame_slot_plus_one,
+                frame->element, "error");
         }
         char hint_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
         if (!tilefinch_url_origin(retry_url, hint_origin,
                               sizeof(hint_origin))) {
             fetch_result_destroy(fetch);
             session->frames_failed++;
-            (void) navigation_dispatch_node_event(
-                session, frame->element, "error");
-            return true;
+            return navigation_dispatch_frame_parent_event(
+                session, frame->parent_runtime,
+                frame->parent_frame_slot_plus_one,
+                frame->element, "error");
         }
         /* Critical-CH belongs to the final response origin, not to an earlier
            redirector.  Restart that canonical URL directly so high-entropy
@@ -2094,13 +2656,17 @@ static bool navigation_complete_frame(NavigationSession *session,
         frame->client_hint_retried = true;
         session->client_hint_retries++;
         frame->fetch_request_id = navigation_enqueue_frame_fetch(
-            session, frame, accepted_critical, hint_origin);
+            session, frame,
+            accepted_hints[0] == '\0' ? accepted_critical : accepted_hints,
+            hint_origin);
         fetch_result_destroy(fetch);
         frame->fetch_pending = frame->fetch_request_id != 0;
         if (!frame->fetch_pending) {
             session->frames_failed++;
-            (void) navigation_dispatch_node_event(
-                session, frame->element, "error");
+            if (!navigation_dispatch_frame_parent_event(
+                    session, frame->parent_runtime,
+                    frame->parent_frame_slot_plus_one,
+                    frame->element, "error")) return false;
         }
         return true;
     }
@@ -2141,9 +2707,9 @@ static bool navigation_complete_frame(NavigationSession *session,
            origin boundary. Do not retain the requested URL's permissions. */
         snprintf(frame->url, sizeof(frame->url), "%s", final_url);
         ok = script_runtime_set_frame_window_state(
-            session->page.runtime, frame->parent_handle, true,
+            frame->parent_runtime, frame->parent_handle, true,
             exposed_same_origin, frame->opaque_origin, final_url,
-            &session->page.script_result);
+            navigation_frame_parent_result(session, frame));
     }
     if (ok && scripts_allowed) {
         frame->runtime = navigation_create_runtime(
@@ -2157,18 +2723,26 @@ static bool navigation_complete_frame(NavigationSession *session,
             && script_runtime_configure_messaging(
                 frame->runtime, true, exposed_same_origin,
                 frame->opaque_origin,
+                frame->parent_frame_slot_plus_one == 0,
                 navigation_queue_frame_message,
                 session);
+        if (ok) script_runtime_set_images(frame->runtime, &frame->images);
     }
     if (ok && frame->runtime != NULL && session->trace_frame_capabilities) {
         static const char trace_setup[] =
             "(()=>{const seen=new Map(),missing=new Set();"
             "globalThis.__tilefinchCapabilityTrace={seen,missing};"
-            "globalThis.__tilefinchTraceObject=(target,label)=>new Proxy(target,{"
+            "const traceObject=(target,label)=>new Proxy(target,{"
             "get(object,key,receiver){if(typeof key!=='symbol'){const name=label+'.'+String(key);seen.set(name,(seen.get(name)||0)+1);if(!(key in object))missing.add(name);}return Reflect.get(object,key,receiver);},"
             "set(object,key,value,receiver){if(typeof key!=='symbol'){const name=label+'.'+String(key)+'=';seen.set(name,(seen.get(name)||0)+1);if(!(key in object))missing.add(name);}return Reflect.set(object,key,value,receiver);}});"
-            "for(const name of ['document','navigator','performance','crypto','screen','history'])if(globalThis[name])globalThis[name]=__tilefinchTraceObject(globalThis[name],name);"
-            "for(const name of ['XMLHttpRequest','PerformanceObserver','Blob','URL','Worker','MutationObserver'])if(typeof globalThis[name]==='function')globalThis[name]=__tilefinchTraceObject(globalThis[name],name);})();";
+            /* Do not proxy document here. DOM bootstrap bookkeeping performs
+               thousands of private-property probes while a challenge builds
+               its shadow tree; tracing those probes both hides the useful
+               browser-capability signal and can make the validation run hit
+               its heap ceiling. The objects below are the standards surfaces
+               this diagnostic is intended to inventory. */
+            "for(const name of ['navigator','performance','crypto','screen','history'])if(globalThis[name])globalThis[name]=traceObject(globalThis[name],name);"
+            "for(const name of ['XMLHttpRequest','PerformanceObserver','Blob','URL','Worker','MutationObserver'])if(typeof globalThis[name]==='function')globalThis[name]=traceObject(globalThis[name],name);})();";
         ok = script_runtime_evaluate_diagnostic(
             frame->runtime, trace_setup, "<frame-capability-trace>",
             &frame->script_result);
@@ -2189,20 +2763,28 @@ static bool navigation_complete_frame(NavigationSession *session,
                                                  &frame->script_result);
         }
     }
+    if (!ok && navigation_retire_failed_document_refresh(
+            session, frame->runtime)) return false;
     if (!ok) {
         session->frames_failed++;
-        (void) navigation_dispatch_node_event(session, frame->element,
-                                              "error");
-        return true;
+        return navigation_dispatch_frame_parent_event(
+            session, frame->parent_runtime,
+            frame->parent_frame_slot_plus_one,
+            frame->element, "error");
     }
     frame->loaded = true;
     session->frames_loaded++;
+    bool frame_presented = navigation_refresh_frame_presentation(
+        session, frame);
+    if (!frame_presented && !session->page.loaded) return false;
     if (getenv("TILEFINCH_TRACE_JS_ROOTS") != NULL) {
         script_runtime_report_roots(frame->runtime, stderr, "frame-loaded",
                                     "child", frame->parent_handle);
     }
-    (void) navigation_dispatch_node_event(session, frame->element, "load");
-    return true;
+    return navigation_dispatch_frame_parent_event(
+        session, frame->parent_runtime,
+        frame->parent_frame_slot_plus_one,
+        frame->element, "load");
 }
 
 static bool navigation_progress_frames(NavigationSession *session)
@@ -2243,7 +2825,10 @@ bool navigation_collect_frame_capability_trace(NavigationSession *session)
         "seen=trace?[...trace.seen.entries()].sort((a,b)=>"
         "b[1]-a[1]||a[0].localeCompare(b[0])).slice(0,64):[];"
         "globalThis.pocSummary='missing='+missing.join(',')+'|seen='+"
-        "seen.map(item=>item[0]+'*'+item[1]).join(',');}";
+        "seen.map(item=>item[0]+'*'+item[1]).join(',')+'|evals='+"
+        "(Array.isArray(globalThis.__tilefinchEvalSources)?"
+        "globalThis.__tilefinchEvalSources.map(source=>source.length).join(','):"
+        "'unavailable');}";
     for (size_t i = 0; i < session->page.frame_count; i++) {
         NavigationFrame *frame = &session->page.frames[i];
         char function_name[64] = {0};

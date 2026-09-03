@@ -1,12 +1,100 @@
 (() => {
   const streamQueueLimit = 64,
     streamByteLimit = 256 * 1024,
+    compressionByteLimit = 1024 * 1024,
+    compressionNative = globalThis.__tilefinchCompressionRun,
+    largeStreamEndpoints = new WeakSet(),
+    readableStreamStates = new WeakMap(),
+    readableState = (stream) => {
+      const state = readableStreamStates.get(stream);
+      if (!state) throw new TypeError("invalid readable stream");
+      return state;
+    },
     chunkBytes = (value) => {
       if (value instanceof ArrayBuffer) return value.byteLength;
       if (ArrayBuffer.isView(value)) return value.byteLength;
       if (typeof value === "string")
         return Math.min(streamByteLimit + 1, value.length * 2);
       return 64;
+    },
+    closeReadableStream = (stream) => {
+      const state = readableState(stream);
+      if (state.status !== "readable") return;
+      state.status = "closed";
+      while (state.reads.length)
+        state.reads.shift().resolve({ done: true, value: undefined });
+      state.closeResolve();
+    },
+    failReadableStream = (stream, reason) => {
+      const state = readableState(stream);
+      if (state.status !== "readable") return;
+      state.status = "errored";
+      state.error = reason;
+      state.queue.length = 0;
+      state.queueBytes = 0;
+      while (state.reads.length) state.reads.shift().reject(reason);
+      state.closeReject(reason);
+    },
+    requestReadableStreamPull = (stream) => {
+      const state = readableState(stream);
+      if (
+        state.status !== "readable" ||
+        state.pulling ||
+        typeof state.source.pull !== "function" ||
+        (!state.reads.length && state.queue.length)
+      )
+        return;
+      state.pulling = true;
+      try {
+        Promise.resolve(state.source.pull(state.controller)).then(
+          () => {
+            state.pulling = false;
+          },
+          (reason) => {
+            state.pulling = false;
+            failReadableStream(stream, reason);
+          },
+        );
+      } catch (reason) {
+        state.pulling = false;
+        failReadableStream(stream, reason);
+      }
+    },
+    readReadableStream = (stream) => {
+      const state = readableState(stream);
+      if (state.queue.length) {
+        const entry = state.queue.shift();
+        state.queueBytes -= entry.bytes;
+        requestReadableStreamPull(stream);
+        return Promise.resolve({ done: false, value: entry.value });
+      }
+      if (state.status === "closed")
+        return Promise.resolve({ done: true, value: undefined });
+      if (state.status === "errored") return Promise.reject(state.error);
+      if (state.reads.length >= streamQueueLimit)
+        return Promise.reject(new RangeError("pending read limit exceeded"));
+      const promise = new Promise((resolve, reject) => {
+        state.reads.push({ resolve, reject });
+      });
+      requestReadableStreamPull(stream);
+      return promise;
+    },
+    cancelReadableStream = (stream, reason) => {
+      const state = readableState(stream);
+      if (state.status === "closed") return Promise.resolve();
+      if (state.status === "errored") return Promise.reject(state.error);
+      state.queue.length = 0;
+      state.queueBytes = 0;
+      closeReadableStream(stream);
+      try {
+        return Promise.resolve(
+          typeof state.source.cancel === "function"
+            ? state.source.cancel(reason)
+            : undefined,
+        );
+      } catch (error) {
+        return Promise.reject(error);
+      }
     };
   class ReadableStreamDefaultReader {
     constructor(stream) {
@@ -14,166 +102,106 @@
         throw new TypeError("invalid readable stream");
       if (stream.locked) throw new TypeError("stream is locked");
       this._stream = stream;
-      stream.locked = true;
-      this.closed = stream._closedPromise;
+      const state = readableState(stream);
+      state.locked = true;
+      this.closed = state.closedPromise;
     }
     read() {
       if (!this._stream)
         return Promise.reject(new TypeError("reader has no stream"));
-      return this._stream._read();
+      return readReadableStream(this._stream);
     }
     cancel(reason) {
       if (!this._stream)
         return Promise.reject(new TypeError("reader has no stream"));
-      return this._stream._cancel(reason);
+      return cancelReadableStream(this._stream, reason);
     }
     releaseLock() {
       if (!this._stream) return;
-      if (this._stream._reads.length) {
+      const state = readableState(this._stream);
+      if (state.reads.length) {
         const error = new TypeError("reader lock released");
-        for (const read of this._stream._reads.splice(0)) read.reject(error);
+        for (const read of state.reads.splice(0)) read.reject(error);
       }
-      this._stream.locked = false;
+      state.locked = false;
       this._stream = null;
     }
   }
   class ReadableStream {
     constructor(source = {}) {
-      this._queue = [];
-      this._queueBytes = 0;
-      this._reads = [];
-      this._state = "readable";
-      this._error = null;
-      this._source = source || {};
-      this._pulling = false;
-      this.locked = false;
       let closeResolve, closeReject;
-      this._closedPromise = new Promise((resolve, reject) => {
+      const closedPromise = new Promise((resolve, reject) => {
         closeResolve = resolve;
         closeReject = reject;
       });
-      this._closeResolve = closeResolve;
-      this._closeReject = closeReject;
-      const stream = this;
-      this._controller = {
+      const stream = this,
+        state = {
+          closeReject,
+          closeResolve,
+          closedPromise,
+          controller: null,
+          error: null,
+          locked: false,
+          pulling: false,
+          queue: [],
+          queueBytes: 0,
+          reads: [],
+          source: source || {},
+          status: "readable",
+        };
+      readableStreamStates.set(this, state);
+      state.controller = {
         get desiredSize() {
-          return streamByteLimit - stream._queueBytes;
+          const limit = largeStreamEndpoints.has(state.source)
+            ? compressionByteLimit : streamByteLimit;
+          return limit - state.queueBytes;
         },
         enqueue(value) {
-          if (stream._state !== "readable")
+          if (state.status !== "readable")
             throw new TypeError("stream is not readable");
           const bytes = chunkBytes(value);
-          if (stream._reads.length) {
-            const read = stream._reads.shift();
+          if (state.reads.length) {
+            const read = state.reads.shift();
             read.resolve({ done: false, value });
             return;
           }
           if (
-            stream._queue.length >= streamQueueLimit ||
-            stream._queueBytes + bytes > streamByteLimit
+            state.queue.length >= streamQueueLimit ||
+            state.queueBytes + bytes >
+              (largeStreamEndpoints.has(state.source)
+                ? compressionByteLimit : streamByteLimit)
           )
             throw new RangeError("stream queue limit exceeded");
-          stream._queue.push({ value, bytes });
-          stream._queueBytes += bytes;
+          state.queue.push({ value, bytes });
+          state.queueBytes += bytes;
         },
         close() {
-          stream._close();
+          closeReadableStream(stream);
         },
         error(reason) {
-          stream._fail(reason);
+          failReadableStream(stream, reason);
         },
       };
       try {
         const started =
-          typeof this._source.start === "function"
-            ? this._source.start(this._controller)
+          typeof state.source.start === "function"
+            ? state.source.start(state.controller)
             : undefined;
         Promise.resolve(started).then(
-          () => this._requestPull(),
-          (reason) => this._fail(reason),
+          () => requestReadableStreamPull(this),
+          (reason) => failReadableStream(this, reason),
         );
         if (
-          typeof this._source.start !== "function" &&
-          typeof this._source.pull !== "function"
+          typeof state.source.start !== "function" &&
+          typeof state.source.pull !== "function"
         )
-          this._close();
+          closeReadableStream(this);
       } catch (reason) {
-        this._fail(reason);
+        failReadableStream(this, reason);
       }
     }
-    _close() {
-      if (this._state !== "readable") return;
-      this._state = "closed";
-      while (this._reads.length)
-        this._reads.shift().resolve({ done: true, value: undefined });
-      this._closeResolve();
-    }
-    _fail(reason) {
-      if (this._state !== "readable") return;
-      this._state = "errored";
-      this._error = reason;
-      this._queue = [];
-      this._queueBytes = 0;
-      while (this._reads.length) this._reads.shift().reject(reason);
-      this._closeReject(reason);
-    }
-    _requestPull() {
-      if (
-        this._state !== "readable" ||
-        this._pulling ||
-        typeof this._source.pull !== "function" ||
-        (!this._reads.length && this._queue.length)
-      )
-        return;
-      this._pulling = true;
-      try {
-        Promise.resolve(this._source.pull(this._controller)).then(
-          () => {
-            this._pulling = false;
-          },
-          (reason) => {
-            this._pulling = false;
-            this._fail(reason);
-          },
-        );
-      } catch (reason) {
-        this._pulling = false;
-        this._fail(reason);
-      }
-    }
-    _read() {
-      if (this._queue.length) {
-        const entry = this._queue.shift();
-        this._queueBytes -= entry.bytes;
-        this._requestPull();
-        return Promise.resolve({ done: false, value: entry.value });
-      }
-      if (this._state === "closed")
-        return Promise.resolve({ done: true, value: undefined });
-      if (this._state === "errored") return Promise.reject(this._error);
-      if (this._reads.length >= streamQueueLimit)
-        return Promise.reject(new RangeError("pending read limit exceeded"));
-      const promise = new Promise((resolve, reject) => {
-        this._reads.push({ resolve, reject });
-      });
-      this._requestPull();
-      return promise;
-    }
-    _cancel(reason) {
-      if (this._state === "closed") return Promise.resolve();
-      if (this._state === "errored") return Promise.reject(this._error);
-      this._queue = [];
-      this._queueBytes = 0;
-      this._close();
-      try {
-        return Promise.resolve(
-          typeof this._source.cancel === "function"
-            ? this._source.cancel(reason)
-            : undefined,
-        );
-      } catch (error) {
-        return Promise.reject(error);
-      }
+    get locked() {
+      return readableState(this).locked;
     }
     pipeThrough(transform, options) {
       if (!transform || !transform.readable || !transform.writable)
@@ -216,7 +244,7 @@
     cancel(reason) {
       if (this.locked)
         return Promise.reject(new TypeError("stream is locked"));
-      return this._cancel(reason);
+      return cancelReadableStream(this, reason);
     }
     tee() {
       if (this.locked) throw new TypeError("stream is locked");
@@ -330,7 +358,9 @@
       const bytes = chunkBytes(value);
       if (
         this._queuedCount >= streamQueueLimit ||
-        this._queuedBytes + bytes > streamByteLimit
+        this._queuedBytes + bytes >
+          (largeStreamEndpoints.has(this._sink)
+            ? compressionByteLimit : streamByteLimit)
       )
         return Promise.reject(new RangeError("write queue limit exceeded"));
       this._queuedCount++;
@@ -408,14 +438,13 @@
   class TransformStream {
     constructor(transformer = {}) {
       let readableController;
-      this.readable = new ReadableStream({
+      const source = {
         start(controller) {
           readableController = controller;
           if (typeof transformer.start === "function")
             return transformer.start(controller);
         },
-      });
-      this.writable = new WritableStream({
+      }, sink = {
         write(value) {
           if (typeof transformer.transform === "function")
             return transformer.transform(value, readableController);
@@ -431,9 +460,19 @@
         abort(reason) {
           readableController.error(reason);
         },
-      });
+      };
+      if (largeStreamEndpoints.has(transformer)) {
+        largeStreamEndpoints.add(source);
+        largeStreamEndpoints.add(sink);
+      }
+      this.readable = new ReadableStream(source);
+      this.writable = new WritableStream(sink);
     }
   }
+  Object.defineProperty(ReadableStream.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "ReadableStream",
+  });
   globalThis.ReadableStream = ReadableStream;
   globalThis.ReadableStreamDefaultReader = ReadableStreamDefaultReader;
   globalThis.WritableStream = WritableStream;
@@ -466,4 +505,137 @@
       this.ignoreBOM = decoder.ignoreBOM;
     }
   };
+  const compressionStates = new WeakMap(),
+    compressionChunk = (value) => {
+      let source;
+      if (value instanceof ArrayBuffer) {
+        source = new Uint8Array(value);
+      } else if (ArrayBuffer.isView(value)) {
+        source = new Uint8Array(
+          value.buffer, value.byteOffset, value.byteLength);
+      } else {
+        throw new TypeError("compression input must be a BufferSource");
+      }
+      const copy = new Uint8Array(source.byteLength);
+      copy.set(source);
+      return copy;
+    },
+    compressionFormat = (value) => {
+      const format = String(value);
+      if (format !== "deflate" && format !== "deflate-raw" &&
+          format !== "gzip")
+        throw new TypeError("unsupported compression format");
+      return format;
+    },
+    compressionTransform = (format, decompress) => {
+      const chunks = [];
+      let bytes = 0;
+      const transformer = {
+        transform(value) {
+          const chunk = compressionChunk(value);
+          if (chunks.length >= streamQueueLimit ||
+              chunk.byteLength > compressionByteLimit - bytes)
+            throw new RangeError("compression input exceeds bounded size");
+          chunks.push(chunk);
+          bytes += chunk.byteLength;
+        },
+        flush(controller) {
+          let input;
+          if (chunks.length === 1) {
+            input = chunks[0];
+          } else {
+            input = new Uint8Array(bytes);
+            let offset = 0;
+            for (const chunk of chunks) {
+              input.set(chunk, offset);
+              offset += chunk.byteLength;
+            }
+          }
+          chunks.length = 0;
+          bytes = 0;
+          const output = compressionNative(decompress ? 1 : 0, format, input);
+          controller.enqueue(new Uint8Array(output));
+        },
+      };
+      largeStreamEndpoints.add(transformer);
+      return new TransformStream(transformer);
+    };
+  class CompressionStream {
+    constructor(format) {
+      if (typeof compressionNative !== "function")
+        throw new TypeError("CompressionStream is unavailable");
+      const transform = compressionTransform(
+        compressionFormat(format), false);
+      compressionStates.set(this, transform);
+    }
+    get readable() {
+      const state = compressionStates.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state.readable;
+    }
+    get writable() {
+      const state = compressionStates.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state.writable;
+    }
+  }
+  class DecompressionStream {
+    constructor(format) {
+      if (typeof compressionNative !== "function")
+        throw new TypeError("DecompressionStream is unavailable");
+      const transform = compressionTransform(
+        compressionFormat(format), true);
+      compressionStates.set(this, transform);
+    }
+    get readable() {
+      const state = compressionStates.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state.readable;
+    }
+    get writable() {
+      const state = compressionStates.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state.writable;
+    }
+  }
+  Object.defineProperty(CompressionStream.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "CompressionStream",
+  });
+  Object.defineProperty(DecompressionStream.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "DecompressionStream",
+  });
+  if (typeof compressionNative === "function") {
+    globalThis.CompressionStream = CompressionStream;
+    globalThis.DecompressionStream = DecompressionStream;
+  }
+  /* This module is lazy and therefore runs after hardening.js has taken its
+     eager-interface snapshot. Mark each standards-visible interface here so
+     function reflection matches native browser interfaces without forcing the
+     Streams module into every page realm during startup. */
+  const markNative = globalThis.__tilefinchMarkNativeFunction;
+  const nativeStreamConstructors = [
+    ReadableStream,
+    ReadableStreamDefaultReader,
+    WritableStream,
+    WritableStreamDefaultWriter,
+    TransformStream,
+    globalThis.TextEncoderStream,
+    globalThis.TextDecoderStream,
+  ];
+  if (typeof compressionNative === "function")
+    nativeStreamConstructors.push(CompressionStream, DecompressionStream);
+  for (const constructor of nativeStreamConstructors) {
+    markNative(constructor);
+    for (const key of Reflect.ownKeys(constructor.prototype)) {
+      const descriptor = Object.getOwnPropertyDescriptor(
+        constructor.prototype,
+        key,
+      );
+      markNative(descriptor?.value);
+      markNative(descriptor?.get);
+      markNative(descriptor?.set);
+    }
+  }
 })();

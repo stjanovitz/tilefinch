@@ -30,6 +30,7 @@ set(TILEFINCH_CORE_SOURCES
     src/js_dom_bindings.c
     src/js_canvas_bridge.c
     src/js_webgl_bridge.c
+    src/js_wasm_bridge.c
     src/js_fetch_cors.c
     src/js_lazy_webpack.c
     src/js_module_loader.c
@@ -206,6 +207,10 @@ else()
         include src)
     target_link_libraries(tilefinch_bootstrap_bytecode_generator PRIVATE
         qjs)
+    if(PSP_BROWSER_USE_BELLARD_QUICKJS)
+        target_compile_definitions(tilefinch_bootstrap_bytecode_generator
+            PRIVATE PSP_BROWSER_BELLARD_QUICKJS=1)
+    endif()
     add_custom_target(regenerate_tilefinch_bootstrap
         COMMAND tilefinch_bootstrap_bytecode_generator
             "${TILEFINCH_BOOTSTRAP_SOURCE_DIR}"
@@ -242,6 +247,21 @@ target_include_directories(tilefinch_core PUBLIC include PRIVATE
     "${stb_SOURCE_DIR}" "${nanosvg_SOURCE_DIR}/src"
     "${libwebp_SOURCE_DIR}/src")
 target_link_libraries(tilefinch_core PUBLIC webpdecoder tilefinch_sheenbidi)
+if(PSP)
+    target_link_libraries(tilefinch_core PUBLIC z)
+else()
+    find_package(ZLIB REQUIRED)
+    target_link_libraries(tilefinch_core PUBLIC ZLIB::ZLIB)
+endif()
+if(TARGET tilefinch_wamr)
+    target_compile_definitions(tilefinch_core PRIVATE TILEFINCH_HAVE_WAMR=1)
+    target_link_libraries(tilefinch_core PRIVATE tilefinch_wamr)
+elseif(TARGET tilefinch-wasm-component)
+    target_compile_definitions(
+        tilefinch_core PRIVATE TILEFINCH_HAVE_WAMR_COMPONENT=1)
+    target_include_directories(tilefinch_core PRIVATE
+        "${TILEFINCH_WAMR_SOURCE_DIR}/core/iwasm/include")
+endif()
 if(NOT PSP_BROWSER_ENABLE_GIF)
     # Consumers need the same advertised image capability set as tilefinch_core;
     # tests and frontends must not assume GIF appears in Accept when its

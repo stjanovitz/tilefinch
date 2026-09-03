@@ -61,7 +61,8 @@ static bool find_text_command(const DrawCommand *command)
 {
     return command != NULL && command->type == DRAW_TEXT
         && command->text != NULL && command->text_length != 0
-        && !draw_command_is_text_shadow(command);
+        && !draw_command_is_text_shadow(command)
+        && !draw_command_text_find_excluded(command);
 }
 
 static void find_match_vertical_bounds(const LayoutDocument *layout,

@@ -292,6 +292,15 @@ bytecode beside the retained source. The artifact is bound to that source and
 a dedicated QuickJS bytecode ABI—not the Tilefinch release version—and launch
 falls back to source compilation whenever restoration is unavailable or fails.
 
+Small WebAssembly modules use the standard JavaScript API through the
+[bounded WebAssembly profile](WEBASSEMBLY.md). Host labs link the pinned
+interpreter directly; the PSP EBOOT keeps only a versioned adapter and lazily
+loads the interpreter from the active signed slot on first namespace access.
+The module, runtime pool, memory, imports, exports, stack, and native
+instruction work all have fixed ceilings. Unsupported proposals and import
+kinds fail through the API without weakening the surrounding page's Budget,
+origin, CSP, or transport policy.
+
 DOM mutations are journaled and coalesced before they trigger style/layout.
 The journal is bounded, and exhaustion selects a safe broader invalidation
 instead of growing without limit.

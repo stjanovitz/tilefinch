@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -109,6 +110,99 @@ class StagePspGameTests(unittest.TestCase):
         lines = self.boot.read_text(encoding="utf-8").splitlines()
         self.assertEqual(1, lines.count("file_kb=384"))
         self.assertNotIn("file_kb=256", lines)
+
+    def test_absolute_symlink_is_refused_without_publishing(self):
+        secret = self.root / "secret.js"
+        secret.write_text("private\n", encoding="utf-8")
+        (self.source / "escape.js").symlink_to(secret)
+
+        failed = self.stage_once(check=False)
+
+        self.assertNotEqual(0, failed.returncode)
+        self.assertIn("non-regular entry", failed.stderr)
+        self.assertFalse(self.stage.exists())
+        self.assertEqual(
+            "trace=none\nurl=https://old.invalid/\n",
+            self.boot.read_text(encoding="utf-8"))
+
+    def test_parent_relative_symlink_is_refused_without_publishing(self):
+        secret = self.root / "secret.js"
+        secret.write_text("private\n", encoding="utf-8")
+        (self.source / "escape.js").symlink_to("../secret.js")
+
+        failed = self.stage_once(check=False)
+
+        self.assertNotEqual(0, failed.returncode)
+        self.assertIn("non-regular entry", failed.stderr)
+        self.assertFalse(self.stage.exists())
+        self.assertEqual(
+            "trace=none\nurl=https://old.invalid/\n",
+            self.boot.read_text(encoding="utf-8"))
+
+    def test_nested_digest_marker_symlink_is_refused_without_publishing(self):
+        secret = self.root / "secret.txt"
+        secret.write_text("private staging-user data\n", encoding="utf-8")
+        assets = self.source / "assets"
+        assets.mkdir()
+        (assets / ".tilefinch-stage-digest").symlink_to(secret)
+
+        failed = self.stage_once(check=False)
+
+        self.assertNotEqual(0, failed.returncode)
+        self.assertIn("non-regular entry", failed.stderr)
+        self.assertFalse(self.stage.exists())
+        self.assertEqual(
+            "trace=none\nurl=https://old.invalid/\n",
+            self.boot.read_text(encoding="utf-8"))
+
+    def test_root_digest_marker_symlink_cannot_overwrite_target(self):
+        victim = self.root / "developer-file.txt"
+        original = b"developer-owned contents remain intact\n"
+        victim.write_bytes(original)
+        (self.source / ".tilefinch-stage-digest").symlink_to(victim)
+
+        failed = self.stage_once(check=False)
+
+        self.assertNotEqual(0, failed.returncode)
+        self.assertIn("unsafe root stage marker", failed.stderr)
+        self.assertEqual(original, victim.read_bytes())
+        self.assertFalse(self.stage.exists())
+        self.assertEqual(
+            "trace=none\nurl=https://old.invalid/\n",
+            self.boot.read_text(encoding="utf-8"))
+
+    def test_newline_filename_is_hashed_without_aliasing(self):
+        unusual = self.source / "line\nbreak.txt"
+        unusual.write_text("first\n", encoding="utf-8")
+        self.stage_once()
+        first_url = self.current_url()
+        first_directory = pathlib.Path(first_url.split(
+            "/index.html", 1)[0].split(":8770/", 1)[1])
+
+        unusual.write_text("second\n", encoding="utf-8")
+        self.stage_once()
+        second_url = self.current_url()
+        second_directory = pathlib.Path(second_url.split(
+            "/index.html", 1)[0].split(":8770/", 1)[1])
+
+        self.assertNotEqual(first_directory, second_directory)
+        self.assertEqual(
+            "second\n", (self.stage / second_directory
+                          / "line\nbreak.txt").read_text(encoding="utf-8"))
+
+    def test_hardlinked_resource_is_refused_without_publishing(self):
+        outside = self.root / "outside.js"
+        outside.write_text("mutable elsewhere\n", encoding="utf-8")
+        os.link(outside, self.source / "shared.js")
+
+        failed = self.stage_once(check=False)
+
+        self.assertNotEqual(0, failed.returncode)
+        self.assertIn("hardlinked entry", failed.stderr)
+        self.assertFalse(self.stage.exists())
+        self.assertEqual(
+            "trace=none\nurl=https://old.invalid/\n",
+            self.boot.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

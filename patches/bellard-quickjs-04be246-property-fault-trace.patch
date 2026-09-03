@@ -30,7 +30,7 @@ diff --git a/quickjs.c b/quickjs.c
  void JS_SetMemoryLimit(JSRuntime *rt, size_t limit)
  {
      rt->malloc_ctx.malloc_state.malloc_limit = limit;
-@@ -7560,6 +7576,116 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
+@@ -7560,6 +7576,173 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
      return 0;
  }
  
@@ -142,11 +142,86 @@ diff --git a/quickjs.c b/quickjs.c
 +    }
 +    fprintf(stderr, "\n");
 +}
++
++static void trace_call_fault(JSContext *ctx, JSFunctionBytecode *b,
++                             const uint8_t *pc, int opcode,
++                             JSValueConst callee, JSValueConst receiver,
++                             int call_argc, const JSValue *stack_base,
++                             const JSValue *sp)
++{
++    JSRuntime *rt = ctx->rt;
++    char filename_buf[192], function_buf[96];
++    const char *filename = "<stripped>";
++    const char *function = "<anonymous>";
++    uint32_t pc_offset = (uint32_t)(pc - b->byte_code_buf);
++    int col = 0, line = find_line_num(ctx, b, pc_offset, &col);
++    int i, depth = (int)(sp - stack_base);
++
++    if (rt->property_fault_trace_limit == 0
++        || rt->property_fault_trace_count >= rt->property_fault_trace_limit)
++        return;
++    rt->property_fault_trace_count++;
++    if (b->has_debug && b->debug.filename != JS_ATOM_NULL)
++        filename = JS_AtomGetStr(ctx, filename_buf, sizeof(filename_buf),
++                                 b->debug.filename);
++    if (b->func_name != JS_ATOM_NULL)
++        function = JS_AtomGetStr(ctx, function_buf, sizeof(function_buf),
++                                 b->func_name);
++    fprintf(stderr,
++            "quickjs-call-fault seq=%u source=\"%.*s\" line=%d col=%d "
++            "function=\"%.*s\" pc=%u opcode=%d callee=%s receiver=%s "
++            "argc=%d depth=%d top-tags=",
++            rt->property_fault_trace_count, 180, filename, line, col,
++            84, function, pc_offset, opcode,
++            property_fault_tag_name(JS_VALUE_GET_TAG(callee)),
++            property_fault_tag_name(JS_VALUE_GET_TAG(receiver)),
++            call_argc, depth);
++    for (i = 0; i < 8 && i < depth; i++)
++        fprintf(stderr, "%s%s", i == 0 ? "" : ",",
++                property_fault_tag_name(JS_VALUE_GET_TAG(sp[-1 - i])));
++    if (JS_VALUE_GET_TAG(callee) == JS_TAG_STRING) {
++        JSString *string = JS_VALUE_GET_STRING(callee);
++        uint32_t at, limit = string->len < 64 ? string->len : 64;
++        fprintf(stderr, " callee-string=\"");
++        for (at = 0; at < limit; at++) {
++            int ch = string_get(string, at);
++            fputc(ch >= 0x20 && ch < 0x7f && ch != '"' && ch != '\\'
++                      ? ch : '?', stderr);
++        }
++        fprintf(stderr, "\" callee-length=%u", string->len);
++    }
++    fprintf(stderr, " code=");
++    for (i = -8; i < 8; i++) {
++        int offset = (int)pc_offset + i;
++        if (offset >= 0 && offset < b->byte_code_len)
++            fprintf(stderr, "%s%02x", i == -8 ? "" : ":",
++                    b->byte_code_buf[offset]);
++    }
++    fprintf(stderr, "\n");
++}
 +#endif
 +
  /* return a string property without executing arbitrary JS code (used
     when dumping the stack trace or in debug print). */
  static const char *get_prop_string(JSContext *ctx, JSValueConst obj,
+@@ -18296,3 +18466,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++#ifdef CONFIG_PROPERTY_FAULT_TRACE
++                if (unlikely(!JS_IsFunction(ctx, call_argv[-1])))
++                    trace_call_fault(ctx, b, pc, opcode, call_argv[-1],
++                                     JS_UNDEFINED, call_argc, stack_buf, sp);
++#endif
+                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
+@@ -18335,3 +18511,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++#ifdef CONFIG_PROPERTY_FAULT_TRACE
++                if (unlikely(!JS_IsFunction(ctx, call_argv[-1])))
++                    trace_call_fault(ctx, b, pc, opcode, call_argv[-1],
++                                     call_argv[-2], call_argc, stack_buf, sp);
++#endif
+                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
 @@ -19235,6 +19360,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                  } else {                                                \
                  name ## _slow_path:                                     \

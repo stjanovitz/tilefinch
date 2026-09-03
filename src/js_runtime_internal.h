@@ -25,9 +25,13 @@ void JS_SetPropertyFaultTraceLimit(JSRuntime *runtime, uint32_t limit);
 #endif
 
 /* The realistic PSP profile admits the Game Profile's bounded first-party
-   package while strict keeps the older, smaller non-preemptible unit. The
-   bootstrap arrays below are bounded by the larger public ceiling. */
-#define SCRIPT_PSP_STRICT_MAXIMUM_HOST_COMPILE_BYTES (256u * 1024u)
+   package while strict keeps the older, smaller non-preemptible unit. Every
+   trusted bootstrap source is independently pinned below the strict ceiling;
+   the larger public ceiling remains available only to admitted page code. */
+/* The standards platform bootstrap now sits just above 268 KiB.  This remains
+   a bounded, internal fallback-compile unit; the user-approved bootstrap
+   headroom does not change authored page-script admission. */
+#define SCRIPT_PSP_STRICT_MAXIMUM_HOST_COMPILE_BYTES (269u * 1024u)
 #define SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES (384u * 1024u)
 
 typedef struct {
@@ -109,7 +113,7 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_REALM_MAXIMUM_TOTAL_BYTES (128u * 1024u * 1024u)
 #define SCRIPT_DYNAMIC_EXECUTION_RESERVE_BYTES (512u * 1024u)
 #define SCRIPT_DYNAMIC_LAZY_MINIMUM_BYTES (128u * 1024u)
-#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 6u
+#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 8u
 /* A fully hydrated long article exceeds 4096 nodes several times
    over; a truncated walk silently drops querySelectorAll matches (the
    mobile section transform only saw the first few sections).
@@ -229,6 +233,7 @@ typedef struct {
     size_t source_length;
     size_t resource_loader_preflight_statement;
     size_t resource_loader_statement;
+    ScriptResourceTiming resource_timing;
     TilefinchRequestMode mode;
     TilefinchCredentialsMode credentials;
     uint8_t incoming_referrer_policy;
@@ -239,6 +244,7 @@ typedef struct {
     bool success;
     bool stale_module_validated;
     bool stale_resource_grant_valid;
+    bool resource_timing_recorded;
     TilefinchResourceGrant stale_resource_grant;
 } ScriptDynamicTask;
 
@@ -471,6 +477,11 @@ struct ScriptRuntime {
        smaller per-call timeout alone cannot enforce a cumulative deadline. */
     uint64_t execution_deadline_cap_ms;
     size_t refreshed_mutations;
+    /* A connected author mutation may already have destroyed storage borrowed
+       by the incumbent layout before document_refresh() is asked to rebuild
+       the document indices. Embedders must retire that page if the refresh is
+       refused; ordinary script failures may still preserve static content. */
+    bool document_refresh_failed_after_mutation;
     bool relayout_dirty;
     /* A blank-page recovery needs to distinguish finite author work that can
        still reveal the initial document from ambient duplex transports. The
@@ -589,6 +600,8 @@ bool js_rt_current_script_scope_end(JSContext *context,
                                     ScriptResult *result);
 void js_rt_runtime_arm_watchdog(ScriptRuntime *runtime);
 bool js_rt_runtime_run_jobs(ScriptRuntime *runtime);
+size_t js_rt_prepare_network_response_delivery(ScriptRuntime *runtime,
+                                               size_t response_bytes);
 bool js_rt_runtime_refresh(ScriptRuntime *runtime);
 void js_rt_runtime_update_result(ScriptRuntime *runtime,
                                  ScriptResult *result);
@@ -824,6 +837,30 @@ JSValue js_webgl_release_surface(JSContext *context,
                                  int argc, JSValueConst *argv);
 bool js_webgl_realm_epoch_advance(DomBridge *bridge);
 void js_webgl_realm_epoch_release(DomBridge *bridge);
+bool js_wasm_runtime_init(JSRuntime *runtime);
+#if defined(TILEFINCH_HAVE_WAMR_COMPONENT)
+void js_wasm_component_configure(const char *program_directory);
+#endif
+JSValue js_wasm_available(JSContext *context, JSValueConst this_value,
+                          int argc, JSValueConst *argv);
+JSValue js_wasm_compile(JSContext *context, JSValueConst this_value,
+                        int argc, JSValueConst *argv);
+JSValue js_wasm_validate(JSContext *context, JSValueConst this_value,
+                         int argc, JSValueConst *argv);
+JSValue js_wasm_instantiate(JSContext *context, JSValueConst this_value,
+                            int argc, JSValueConst *argv);
+JSValue js_wasm_module_info(JSContext *context, JSValueConst this_value,
+                            int argc, JSValueConst *argv);
+JSValue js_wasm_memory_grow(JSContext *context, JSValueConst this_value,
+                            int argc, JSValueConst *argv);
+JSValue js_wasm_global_get(JSContext *context, JSValueConst this_value,
+                           int argc, JSValueConst *argv);
+JSValue js_wasm_global_set(JSContext *context, JSValueConst this_value,
+                           int argc, JSValueConst *argv);
+JSValue js_wasm_detach_buffer(JSContext *context, JSValueConst this_value,
+                              int argc, JSValueConst *argv);
+JSValue js_wasm_snapshot_source(JSContext *context, JSValueConst this_value,
+                                int argc, JSValueConst *argv);
 JSValue js_dom_set_fullscreen(JSContext *context,
                               JSValueConst this_value,
                               int argc, JSValueConst *argv);

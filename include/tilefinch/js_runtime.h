@@ -1085,13 +1085,16 @@ void script_runtime_set_module_loader_owned(
 /* child_context irreversibly changes the realm to child scope before its
    fallible global setup. parent_same_origin controls whether that child may
    replace the exposed parent.postMessage property; a cross-origin child gets
-   the callable cross-origin surface but assignment raises SecurityError. The
-   transition clears top-level remote bindings and queues; callback/opaque
-   become callable only after setup succeeds. A child realm rejects a later
-   child_context=false configuration. */
+   the callable cross-origin surface but assignment raises SecurityError.
+   top_is_parent is true only for a direct child of the top-level document;
+   nested children receive distinct parent/top WindowProxy surfaces and route
+   top.postMessage to the actual top realm. The transition clears top-level
+   remote bindings and queues; callback/opaque become callable only after
+   setup succeeds. A child realm rejects a later child_context=false
+   configuration. */
 bool script_runtime_configure_messaging(
     ScriptRuntime *runtime, bool child_context, bool parent_same_origin,
-    bool child_opaque_origin,
+    bool child_opaque_origin, bool top_is_parent,
     ScriptPostMessageCallback callback, void *opaque);
 /* Native loaders use this immutable realm property when deriving credentials
    and CORS origins for parser-inserted and module scripts. */
@@ -1105,6 +1108,15 @@ bool script_runtime_dispatch_message(ScriptRuntime *runtime,
                                      const char *source_origin,
                                      long source_frame_handle,
                                      ScriptResult *result);
+/* True only after a connected author mutation committed but the native
+   document-index refresh failed. The incumbent layout may then contain stale
+   DOM pointers and must not remain published. */
+bool script_runtime_document_refresh_failed(const ScriptRuntime *runtime);
+#if !defined(__PSP__)
+void script_runtime_test_refuse_next_document_refresh(void);
+void script_runtime_test_mark_document_refresh_failed(
+    ScriptRuntime *runtime);
+#endif
 bool script_runtime_set_frame_window_state(ScriptRuntime *runtime,
                                            long frame_handle, bool active,
                                            bool same_origin,
@@ -1129,9 +1141,22 @@ bool script_runtime_evaluate_diagnostic(ScriptRuntime *runtime,
                                         const char *source,
                                         const char *source_url,
                                         ScriptResult *result);
+typedef struct {
+    bool measured;
+    bool cache_hit;
+    uint32_t name_lookup_us;
+    uint32_t connect_us;
+    uint32_t appconnect_us;
+    uint32_t first_byte_us;
+    uint32_t total_us;
+    uint32_t decoded_body_bytes;
+} ScriptResourceTiming;
 bool script_runtime_record_resource_timing(ScriptRuntime *runtime,
                                            const char *url,
                                            const char *initiator_type);
+bool script_runtime_record_resource_timing_details(
+    ScriptRuntime *runtime, const char *url, const char *initiator_type,
+    const ScriptResourceTiming *timing);
 long script_runtime_node_handle(ScriptRuntime *runtime,
                                 lxb_dom_node_t *node);
 /* Weak snapshots are generation-safe but do not retain a detached subtree.

@@ -2,6 +2,7 @@
    Text editing and activation remain controller/runtime responsibilities. */
 
 #include "layout_internal.h"
+#include "tilefinch/media_discovery.h"
 
 #include <math.h>
 #include <limits.h>
@@ -330,6 +331,113 @@ bool layout_paint_audio_control(
             .color = 0xa3a8af, .radius = 1, .opacity_scale = 256
         };
         if (layout_add_command(context->layout, track) == NULL) return false;
+    }
+    return true;
+}
+
+bool layout_paint_video_control(
+    LayoutContext *context, lxb_dom_node_t *node,
+    int x, int y, int width, int height)
+{
+    if (context == NULL) return false;
+    if (width < 32 || height < 24) return true;
+    int button = width < height ? width : height;
+    button /= 3;
+    if (button < 24) button = 24;
+    if (button > 42) button = 42;
+    int button_x = x + (width - button) / 2;
+    int button_y = y + (height - button) / 2;
+    DrawCommand face = {
+        .type = DRAW_FILL_RECT, .x = button_x, .y = button_y,
+        .width = button, .height = button,
+        .color = 0x162431, .radius = button / 2,
+        .opacity_scale = 224
+    };
+    if (layout_add_command(context->layout, face) == NULL) return false;
+    int triangle_height = button / 2;
+    int triangle_x = button_x + button / 2 - 2;
+    int triangle_y = button_y + (button - triangle_height) / 2;
+    for (int row = 0; row < triangle_height; row++) {
+        int half = row < triangle_height / 2
+            ? row : triangle_height - row - 1;
+        DrawCommand mark = {
+            .type = DRAW_FILL_RECT,
+            .x = triangle_x, .y = triangle_y + row,
+            .width = 2 + half, .height = 1,
+            .color = 0xffffff, .opacity_scale = 256
+        };
+        if (layout_add_command(context->layout, mark) == NULL) return false;
+    }
+    bool engine_card = document_is_declared_video_card(
+        context->document, node);
+    size_t title_length = 0u, duration_length = 0u;
+    const char *title = NULL;
+    const char *duration = NULL;
+    if (engine_card) {
+        title = document_attribute(node, "title", &title_length);
+        duration = document_attribute(
+            node, "data-tilefinch-media-duration", &duration_length);
+    } else if (node != NULL && !context->declared_video_scanned) {
+        context->declared_video_scanned = true;
+        const MediaDeclaredVideo *declared =
+            media_declared_video_cached(context->document);
+        if (declared != NULL) {
+            size_t length = strlen(declared->title);
+            context->declared_video_title = layout_retain_generated_text(
+                context->layout, declared->title, length);
+            if (context->declared_video_title != NULL)
+                context->declared_video_title_length = length;
+            length = strlen(declared->duration);
+            context->declared_video_duration = layout_retain_generated_text(
+                context->layout, declared->duration, length);
+            if (context->declared_video_duration != NULL)
+                context->declared_video_duration_length = length;
+        }
+    }
+    if (!engine_card) {
+        title = context->declared_video_title;
+        title_length = context->declared_video_title_length;
+        duration = context->declared_video_duration;
+        duration_length = context->declared_video_duration_length;
+    }
+    if ((title_length != 0u || duration_length != 0u) && height >= 52) {
+        DrawCommand bar = {
+            .type = DRAW_FILL_RECT, .x = x, .y = y + height - 28,
+            .width = width, .height = 28, .color = 0x162431,
+            .opacity_scale = 232
+        };
+        if (layout_add_command(context->layout, bar) == NULL) return false;
+        if (title != NULL && title_length != 0u) {
+            if (title_length > MEDIA_DECLARED_VIDEO_TITLE_CAPACITY - 1u)
+                title_length = MEDIA_DECLARED_VIDEO_TITLE_CAPACITY - 1u;
+            DrawCommand label = {
+                .type = DRAW_TEXT, .text = title,
+                .text_length = (uint32_t) title_length,
+                .x = x + 8, .y = y + height - 22,
+                .width = width > 80 ? width - 80 : width - 16,
+                .height = 16, .color = 0xffffff,
+                .font_size = 12, .font_family = FONT_SANS,
+                .font_weight = 70, .opacity_scale = 256
+            };
+            if (engine_card) label.radius |= LAYOUT_TEXT_FIND_EXCLUDED;
+            if (layout_add_command(context->layout, label) == NULL)
+                return false;
+        }
+        if (duration != NULL && duration_length != 0u) {
+            if (duration_length > MEDIA_DECLARED_VIDEO_DURATION_CAPACITY - 1u)
+                duration_length = MEDIA_DECLARED_VIDEO_DURATION_CAPACITY - 1u;
+            DrawCommand time = {
+                .type = DRAW_TEXT, .text = duration,
+                .text_length = (uint32_t) duration_length,
+                .x = x + (width > 68 ? width - 64 : 4),
+                .y = y + height - 22, .width = 60, .height = 16,
+                .color = 0xdce8f3, .font_size = 11,
+                .font_family = FONT_SANS, .opacity_scale = 256
+            };
+            if (engine_card) time.radius |= LAYOUT_TEXT_FIND_EXCLUDED;
+            if (layout_add_command(context->layout, time) == NULL)
+                return false;
+        }
     }
     return true;
 }

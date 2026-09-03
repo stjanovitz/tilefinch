@@ -1,0 +1,52 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -5006,6 +5006,30 @@ JSValue JS_NewStringLenLatin1(JSContext *ctx, const uint8_t *buf,
+     return js_new_string8_len(ctx, (const char *)buf, (int)buf_len);
+ }
+
++JSValue JS_NewStringLenLatin1Portable(JSContext *ctx, const uint8_t *buf,
++                                      size_t buf_len)
++{
++    return JS_NewStringLenLatin1(ctx, buf, buf_len);
++}
++
++JSValue JS_NewStringLenLatin1UninitializedPortable(JSContext *ctx,
++                                                    size_t len,
++                                                    uint8_t **storage)
++{
++    JSString *str;
++    *storage = NULL;
++    if (len > JS_STRING_LEN_MAX || len > INT_MAX)
++        return JS_ThrowInternalError(ctx, "string too long");
++    if (len == 0)
++        return JS_AtomToString(ctx, JS_ATOM_empty_string);
++    str = js_alloc_string(ctx, (int)len, 0);
++    if (str == NULL)
++        return JS_EXCEPTION;
++    str->u.str8[len] = '\0';
++    *storage = str->u.str8;
++    return JS_MKPTR(JS_TAG_STRING, str);
++}
++
+ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
+ {
+     const uint8_t *p, *p_end, *p_start, *p_next;
+diff --git a/quickjs.h b/quickjs.h
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -750,6 +750,14 @@ JSValue JS_NewStringLen(JSContext *ctx, const char *str1, size_t len1);
+ /* Create a string whose code units are the supplied 8-bit values. */
+ JSValue JS_NewStringLenLatin1(JSContext *ctx, const uint8_t *str1,
+                               size_t len1);
++/* Stable Tilefinch names shared with the portable Bellard baseline. */
++JSValue JS_NewStringLenLatin1Portable(JSContext *ctx, const uint8_t *str1,
++                                      size_t len1);
++/* Allocate an unpublished 8-bit string and expose its storage to a native
++   producer. The caller must initialize every byte before returning it to JS. */
++JSValue JS_NewStringLenLatin1UninitializedPortable(JSContext *ctx,
++                                                   size_t len,
++                                                   uint8_t **storage);
+ static inline JSValue JS_NewString(JSContext *ctx, const char *str)
+ {
+     return JS_NewStringLen(ctx, str, strlen(str));

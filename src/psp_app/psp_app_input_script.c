@@ -40,8 +40,9 @@ static bool psp_input_gamepad_was_connected;
 
 /* Coverage tally. Indexed by enum value; both spaces are small and closed,
    and the summary prints only the entries a run actually reached. */
-#define PSP_INPUT_SCRIPT_ACTION_SLOTS 64u
-#define PSP_INPUT_SCRIPT_SETTING_SLOTS 32u
+#define PSP_INPUT_SCRIPT_ACTION_SLOTS ((unsigned) PSP_UI_ACTION_EXIT + 1u)
+#define PSP_INPUT_SCRIPT_SETTING_SLOTS \
+    ((unsigned) PSP_UI_SETTING_GAMEPAD_FACE_MAPPING + 1u)
 static uint16_t psp_input_script_action_hits[PSP_INPUT_SCRIPT_ACTION_SLOTS];
 static uint16_t psp_input_script_setting_hits[PSP_INPUT_SCRIPT_SETTING_SLOTS];
 
@@ -59,6 +60,12 @@ typedef struct {
 static PspInputScriptCapture
     psp_input_script_captures[PSP_INPUT_SCRIPT_CAPTURE_LIMIT];
 static size_t psp_input_script_capture_count;
+/* A live mark lasts for one scripted advance, but cooperative work can run a
+   second advance before the browser thread reaches its end-of-frame capture.
+   Retain that checkpoint until one presentation owner consumes it. */
+static char psp_input_script_pending_capture_mark[
+    PSP_INPUT_SCRIPT_MARK_CAPACITY];
+static bool psp_input_script_pending_capture_valid;
 static TilefinchInstallPaths psp_input_script_install_paths;
 static const char *psp_input_script_argv0;
 
@@ -139,6 +146,8 @@ bool psp_input_script_begin(
     psp_input_gamepad_axis_y_max = 0;
     psp_input_gamepad_was_connected = false;
     psp_input_script_capture_count = 0;
+    psp_input_script_pending_capture_mark[0] = '\0';
+    psp_input_script_pending_capture_valid = false;
     psp_subtitle_burst_count = 0;
     psp_subtitle_burst_remaining = 0;
     psp_subtitle_previous_valid = false;
@@ -179,6 +188,24 @@ bool psp_input_script_begin(
     return true;
 }
 
+static void psp_input_script_latch_live_capture_mark(void)
+{
+    const char *mark = psp_input_script_mark(&psp_input_script);
+    if (mark == NULL || psp_input_script_pending_capture_valid
+        || psp_input_script.step >= psp_input_script.step_count
+        || !psp_input_script.steps[psp_input_script.step].advance_while_busy)
+        return;
+    /* Measurement delimiters and the Page-controls state transition are
+       control records, not visual checkpoints. */
+    if (strcmp(mark, "webgl-measure-start") == 0
+        || strcmp(mark, "webgl-measure-end") == 0
+        || strcmp(mark, "auto-controls") == 0
+        || strcmp(mark, "controls-exited") == 0) return;
+    snprintf(psp_input_script_pending_capture_mark,
+             sizeof(psp_input_script_pending_capture_mark), "%s", mark);
+    psp_input_script_pending_capture_valid = true;
+}
+
 bool psp_input_script_running(void)
 {
     return psp_input_script_armed(&psp_input_script)
@@ -212,6 +239,7 @@ bool psp_input_script_frame(
     }
     psp_webgl_measurement_mark(
         psp_input_script_mark(&psp_input_script));
+    psp_input_script_latch_live_capture_mark();
     return driving;
 }
 
@@ -234,6 +262,7 @@ bool psp_input_script_busy_frame(PspUiInput *input)
     }
     psp_webgl_measurement_mark(
         psp_input_script_mark(&psp_input_script));
+    psp_input_script_latch_live_capture_mark();
     return driving;
 }
 
@@ -441,20 +470,11 @@ void psp_input_script_capture_named(
 void psp_input_script_capture_live_mark(
     const uint16_t *frame, size_t pixels, size_t stride_pixels)
 {
-    const char *mark = psp_input_script_mark(&psp_input_script);
-    if (mark == NULL || psp_input_script.step >= psp_input_script.step_count
-        || !psp_input_script.steps[psp_input_script.step].advance_while_busy)
-        return;
-    /* Measurement delimiters and the Page-controls state transition are
-       control records, not visual checkpoints. Keeping them out of the
-       three-frame capture ring makes the installed-game input trace
-       deterministic even when the supervisor observes a marker between two
-       display publications. The game-input-end image proves captured play. */
-    if (strcmp(mark, "webgl-measure-start") == 0
-        || strcmp(mark, "webgl-measure-end") == 0
-        || strcmp(mark, "auto-controls") == 0
-        || strcmp(mark, "controls-exited") == 0) return;
-    psp_input_script_capture_named(mark, frame, pixels, stride_pixels);
+    if (!psp_input_script_pending_capture_valid) return;
+    psp_input_script_capture_named(
+        psp_input_script_pending_capture_mark, frame, pixels, stride_pixels);
+    psp_input_script_pending_capture_mark[0] = '\0';
+    psp_input_script_pending_capture_valid = false;
 }
 
 static uint32_t psp_subtitle_burst_hash_string(const char *text)

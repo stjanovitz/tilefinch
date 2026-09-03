@@ -1,6 +1,12 @@
 (() => {
   const boundedAncestorPath = globalThis.__tilefinchBoundedAncestorPath,
-    ancestorLimit = globalThis.__tilefinchAncestorLimit;
+    ancestorLimit = globalThis.__tilefinchAncestorLimit,
+    tilefinchBlobBytes = globalThis.__tilefinchBlobBytes,
+    tilefinchBlobForURL = globalThis.__tilefinchBlobForURL,
+    tilefinchBlobType = Object.getOwnPropertyDescriptor(
+      Blob.prototype,
+      "type",
+    ).get;
   /* See dom.js: hardening.js only sees the globals that exist when it runs,
      so anything created on first write is declared here instead. */
   for (const [name, initial] of [
@@ -648,8 +654,6 @@
     };
     document.onDOMContentLoaded = null;
     document.exitPointerLock = function () {};
-    navigator.product = "Gecko";
-    navigator.vendor = "";
   }
   {
     const reflect = (name) => ({
@@ -903,30 +907,52 @@
       __tilefinchCookieSet(String(value));
     },
   });
+  Object.defineProperty(globalThis, "isSecureContext", {
+    configurable: true,
+    enumerable: true,
+    value: !!globalThis.__tilefinchSecureContext(),
+    writable: false,
+  });
+  /* WebIDL event attributes live on the prototype in browsers.  Keeping the
+     dispatcher state in a private table avoids exposing Tilefinch's mutable
+     bookkeeping as enumerable/own page properties while still allowing the
+     DOM bridge to update one event during propagation. */
+  const eventStates = new WeakMap(),
+    eventStateGet = eventStates.get.bind(eventStates),
+    eventStateSet = eventStates.set.bind(eventStates),
+    eventState = (event) => {
+      const state = eventStateGet(event);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state;
+    };
   globalThis.Event = class Event {
     constructor(type, options = {}) {
       if (arguments.length < 1)
         throw new TypeError("Event type is required");
-      this.type = String(type);
-      this.bubbles = !!options.bubbles;
-      this.cancelable = !!options.cancelable;
-      this.composed = !!options.composed;
-      this.defaultPrevented = false;
-      this.eventPhase = 0;
-      this.currentTarget = null;
-      this.target = null;
-      this.timeStamp = __tilefinchPerformanceSample(9);
-      this.__initialized = true;
-      this.__dispatching = false;
-      this.__stopped = false;
-      this.__immediateStopped = false;
+      eventStateSet(this, {
+        type: String(type),
+        bubbles: !!options.bubbles,
+        cancelable: !!options.cancelable,
+        composed: !!options.composed,
+        defaultPrevented: false,
+        eventPhase: 0,
+        currentTarget: null,
+        target: null,
+        timeStamp: __tilefinchPerformanceSample(9),
+        initialized: true,
+        dispatching: false,
+        stopped: false,
+        immediateStopped: false,
+        passive: false,
+        path: null,
+      });
       Object.defineProperty(this, "isTrusted", {
         value: false,
         configurable: true,
       });
     }
     preventDefault() {
-      if (this.cancelable) this.defaultPrevented = true;
+      if (this.cancelable && !this.__passive) this.defaultPrevented = true;
     }
     stopPropagation() {
       this.__stopped = true;
@@ -936,7 +962,13 @@
       this.__immediateStopped = true;
     }
     composedPath() {
-      return this.__path?.slice() || [];
+      const path = this.__path;
+      if (!path) return [];
+      return globalThis.__tilefinchVisibleShadowEventPath
+        ? globalThis.__tilefinchVisibleShadowEventPath(path, this.currentTarget)
+        : this.currentTarget
+          ? path.slice()
+          : [];
     }
     initEvent(type, bubbles = false, cancelable = false) {
       if (arguments.length < 1)
@@ -951,7 +983,54 @@
       this.__immediateStopped = false;
     }
   };
+  const eventField = (name, convert, writable = true) => ({
+    configurable: true,
+    enumerable: true,
+    get() { return eventState(this)[name]; },
+    set: writable ? function (value) {
+      eventState(this)[name] = convert(value);
+    } : undefined,
+  });
   Object.defineProperties(Event.prototype, {
+    type: eventField("type", String),
+    bubbles: eventField("bubbles", Boolean),
+    cancelable: eventField("cancelable", Boolean),
+    composed: eventField("composed", Boolean),
+    defaultPrevented: eventField("defaultPrevented", Boolean),
+    eventPhase: eventField("eventPhase", (value) => Number(value) || 0),
+    currentTarget: eventField("currentTarget", (value) => value ?? null),
+    target: eventField("target", (value) => value ?? null),
+    timeStamp: eventField("timeStamp", Number, false),
+    __initialized: {
+      configurable: true,
+      get() { return eventState(this).initialized; },
+      set(value) { eventState(this).initialized = !!value; },
+    },
+    __dispatching: {
+      configurable: true,
+      get() { return eventState(this).dispatching; },
+      set(value) { eventState(this).dispatching = !!value; },
+    },
+    __stopped: {
+      configurable: true,
+      get() { return eventState(this).stopped; },
+      set(value) { eventState(this).stopped = !!value; },
+    },
+    __immediateStopped: {
+      configurable: true,
+      get() { return eventState(this).immediateStopped; },
+      set(value) { eventState(this).immediateStopped = !!value; },
+    },
+    __passive: {
+      configurable: true,
+      get() { return eventState(this).passive; },
+      set(value) { eventState(this).passive = !!value; },
+    },
+    __path: {
+      configurable: true,
+      get() { return eventState(this).path; },
+      set(value) { eventState(this).path = value; },
+    },
     returnValue: {
       configurable: true,
       get() {
@@ -976,6 +1055,10 @@
         return this.target;
       },
     },
+    [Symbol.toStringTag]: {
+      configurable: true,
+      value: "Event",
+    },
   });
   for (const [name, value] of Object.entries({
     NONE: 0,
@@ -991,6 +1074,8 @@
       Constructor =
         name === "CustomEvent"
           ? CustomEvent
+          : name === "ErrorEvent"
+            ? ErrorEvent
           : name === "CompositionEvent"
             ? CompositionEvent
             : name === "FocusEvent"
@@ -1085,7 +1170,7 @@
     constructor(type, options = {}) {
       super(type, options);
       this.pointerId = Number(
-        options.pointerId === undefined ? 1 : options.pointerId,
+        options.pointerId === undefined ? 0 : options.pointerId,
       );
       this.width = Number(options.width === undefined ? 1 : options.width);
       this.height = Number(options.height === undefined ? 1 : options.height);
@@ -1094,8 +1179,9 @@
       this.tiltX = Number(options.tiltX) || 0;
       this.tiltY = Number(options.tiltY) || 0;
       this.twist = Number(options.twist) || 0;
-      this.pointerType = String(options.pointerType || "mouse");
-      this.isPrimary = options.isPrimary !== false;
+      this.pointerType =
+        options.pointerType === undefined ? "" : String(options.pointerType);
+      this.isPrimary = !!options.isPrimary;
     }
   };
   globalThis.KeyboardEvent = class KeyboardEvent extends UIEvent {
@@ -1162,21 +1248,162 @@
   globalThis.ProgressEvent = class ProgressEvent extends Event {
     constructor(type, options = {}) {
       super(type, options);
-      this.lengthComputable = !!options.lengthComputable;
-      this.loaded = Math.max(0, Number(options.loaded) || 0);
-      this.total = Math.max(0, Number(options.total) || 0);
+      const state = eventState(this);
+      state.lengthComputable = !!options.lengthComputable;
+      state.loaded = Math.max(0, Number(options.loaded) || 0);
+      state.total = Math.max(0, Number(options.total) || 0);
     }
+    get [Symbol.toStringTag]() { return "ProgressEvent"; }
   };
+  /* ProgressEvent's Web IDL attributes are readonly prototype accessors in
+     browsers.  Reuse Event's private state instead of adding another WeakMap
+     or exposing three mutable own properties on every network event. */
+  const progressEventConstructor = ProgressEvent.prototype.constructor;
+  delete ProgressEvent.prototype.constructor;
+  Object.defineProperties(ProgressEvent.prototype, {
+    lengthComputable: {
+      configurable: true,
+      enumerable: true,
+      get() { return eventState(this).lengthComputable; },
+    },
+    loaded: {
+      configurable: true,
+      enumerable: true,
+      get() { return eventState(this).loaded; },
+    },
+    total: {
+      configurable: true,
+      enumerable: true,
+      get() { return eventState(this).total; },
+    },
+    constructor: {
+      configurable: true,
+      writable: true,
+      value: progressEventConstructor,
+    },
+  });
+  const errorEventStates = new WeakMap(),
+    errorEventState = (event) => {
+      const state = errorEventStates.get(event);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state;
+    };
+  globalThis.ErrorEvent = class ErrorEvent extends Event {
+    constructor(type, options = {}) {
+      super(type, options);
+      errorEventStates.set(this, {
+        message: String(options.message || ""),
+        filename: String(options.filename || ""),
+        lineno: Math.max(0, Math.trunc(Number(options.lineno) || 0)),
+        colno: Math.max(0, Math.trunc(Number(options.colno) || 0)),
+        error: options.error === undefined ? null : options.error,
+      });
+    }
+    get [Symbol.toStringTag]() { return "ErrorEvent"; }
+  };
+  const errorEventConstructor = ErrorEvent.prototype.constructor;
+  delete ErrorEvent.prototype.constructor;
+  const errorEventField = (name) => ({
+    configurable: true,
+    enumerable: true,
+    get() { return errorEventState(this)[name]; },
+  });
+  Object.defineProperties(ErrorEvent.prototype, {
+    message: errorEventField("message"),
+    filename: errorEventField("filename"),
+    lineno: errorEventField("lineno"),
+    colno: errorEventField("colno"),
+    error: errorEventField("error"),
+    constructor: {
+      configurable: true,
+      writable: true,
+      value: errorEventConstructor,
+    },
+  });
+  const messageEventStates = new WeakMap(),
+    messageEventStateGet = messageEventStates.get.bind(messageEventStates),
+    messageEventStateSet = messageEventStates.set.bind(messageEventStates),
+    messageEventPorts = (ports) => {
+      const result = [];
+      if (ports != null)
+        for (const port of ports) {
+          if (result.length >= 16) break;
+          result.push(port);
+        }
+      return Object.freeze(result);
+    },
+    messageEventState = (event) => {
+      const state = messageEventStateGet(event);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state;
+    };
   globalThis.MessageEvent = class MessageEvent extends Event {
     constructor(type, options = {}) {
       super(type, options);
-      this.data = options.data === undefined ? null : options.data;
-      this.origin = String(options.origin || "");
-      this.lastEventId = String(options.lastEventId || "");
-      this.source = options.source ?? null;
-      this.ports = Array.from(options.ports || []);
+      messageEventStateSet(this, {
+        data: options.data === undefined ? null : options.data,
+        origin: String(options.origin || ""),
+        lastEventId: String(options.lastEventId || ""),
+        source: options.source ?? null,
+        ports: messageEventPorts(options.ports),
+      });
+    }
+    initMessageEvent(type, bubbles = false, cancelable = false, data = null,
+                     origin = "", lastEventId = "", source = null,
+                     ports = []) {
+      if (this.__dispatching) return;
+      this.initEvent(type, bubbles, cancelable);
+      messageEventStateSet(this, {
+        data,
+        origin: String(origin),
+        lastEventId: String(lastEventId),
+        source: source ?? null,
+        ports: messageEventPorts(ports),
+      });
     }
   };
+  /* Web IDL installs attributes before operations and leaves the interface
+     object's constructor property last.  Class syntax creates constructor and
+     methods first, which is observably unlike browser MessageEvent and is used
+     by compatibility probes.  Re-seat the two class-created properties once;
+     this changes no per-event storage. */
+  const messageEventConstructor = MessageEvent.prototype.constructor,
+    messageEventInit = MessageEvent.prototype.initMessageEvent;
+  delete MessageEvent.prototype.constructor;
+  delete MessageEvent.prototype.initMessageEvent;
+  const messageEventField = (name) => ({
+    configurable: true,
+    enumerable: true,
+    get() { return messageEventState(this)[name]; },
+  });
+  Object.defineProperties(MessageEvent.prototype, {
+    data: messageEventField("data"),
+    origin: messageEventField("origin"),
+    lastEventId: messageEventField("lastEventId"),
+    source: messageEventField("source"),
+    ports: messageEventField("ports"),
+    userActivation: {
+      configurable: true,
+      enumerable: true,
+      get() { return null; },
+    },
+    [Symbol.toStringTag]: {
+      configurable: true,
+      value: "MessageEvent",
+    },
+  });
+  Object.defineProperties(MessageEvent.prototype, {
+    initMessageEvent: {
+      configurable: true,
+      writable: true,
+      value: messageEventInit,
+    },
+    constructor: {
+      configurable: true,
+      writable: true,
+      value: messageEventConstructor,
+    },
+  });
   globalThis.CloseEvent = class CloseEvent extends Event {
     constructor(type, options = {}) {
       super(type, options);
@@ -1203,11 +1430,13 @@
         this[name] = null;
     }
     _emit(type, loaded = 0, total = 0) {
-      const event = new ProgressEvent(type, {
-        lengthComputable: true,
-        loaded,
-        total,
-      });
+      const event = __tilefinchTrustedEvent(
+        new ProgressEvent(type, {
+          lengthComputable: true,
+          loaded,
+          total,
+        }),
+      );
       this.dispatchEvent(event);
       const handler = this["on" + type];
       if (typeof handler === "function")
@@ -1230,7 +1459,7 @@
       this._task = setTimeout(() => {
         if (this.readyState !== 1) return;
         try {
-          this.result = convert(blob._bytes);
+          this.result = convert(tilefinchBlobBytes(blob));
           this.readyState = 2;
           this._task = 0;
           this._emit("progress", blob.size, blob.size);
@@ -2694,8 +2923,6 @@
       return open.call(this, normalizeXhrMethod(method), ...args);
     };
     XHR.prototype.setRequestHeader = function (name, value) {
-      if (this.readyState !== 1 || this._sent || !this._done)
-        throw new DOMException("Request is not open", "InvalidStateError");
       [name, value] = normalizeXhrHeader(name, value);
       return setRequestHeader.call(this, name, value);
     };
@@ -2795,7 +3022,7 @@
       this._bodyBytes = () => {
         const body = this._bodySource;
         if (body === null || body === undefined) return new Uint8Array();
-        if (body instanceof Blob) return body._bytes.slice();
+        if (body instanceof Blob) return tilefinchBlobBytes(body).slice();
         if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
         if (ArrayBuffer.isView(body))
           return new Uint8Array(
@@ -3145,7 +3372,7 @@
         if (value instanceof Blob && value.type)
           append("Content-Type: " + value.type + "\r\n");
         append("\r\n");
-        append(value instanceof Blob ? value._bytes : String(value));
+        append(value instanceof Blob ? tilefinchBlobBytes(value) : String(value));
         append("\r\n");
       }
       append("--" + boundary + "--\r\n");
@@ -3164,9 +3391,10 @@
     if (source instanceof Blob) {
       if (source.type && !request.headers.has("content-type"))
         request.headers.set("content-type", source.type);
-      return source._bytes.buffer.slice(
-        source._bytes.byteOffset,
-        source._bytes.byteOffset + source._bytes.byteLength,
+      const sourceBytes = tilefinchBlobBytes(source);
+      return sourceBytes.buffer.slice(
+        sourceBytes.byteOffset,
+        sourceBytes.byteOffset + sourceBytes.byteLength,
       );
     }
     if (source instanceof ArrayBuffer) return source;
@@ -3194,6 +3422,8 @@
       rejected: 0,
       rejectedBytes: 0,
       launchFailed: 0,
+      localBlobReads: 0,
+      localBlobFailures: 0,
       currentCount: 0,
       peakCount: 0,
       currentBytes: 0,
@@ -3381,6 +3611,32 @@
     writable: false,
     configurable: false,
   });
+  const snapshotLocalBlobRequest = (method, inputURL) => {
+    const url = new URL(inputURL, location.href).href;
+    if (!url.startsWith("blob:")) return null;
+    if (method !== "GET" && method !== "HEAD") {
+      networkQueueStats.localBlobFailures++;
+      throw new TypeError("Blob URLs support only GET and HEAD");
+    }
+    const blob = tilefinchBlobForURL(url);
+    if (!blob) {
+      networkQueueStats.localBlobFailures++;
+      throw new TypeError("Blob URL is no longer available");
+    }
+    const bytes = tilefinchBlobBytes(blob),
+      type = tilefinchBlobType.call(blob);
+    networkQueueStats.localBlobReads++;
+    return {
+      bodyBytes: method === "HEAD" ? new ArrayBuffer() : bytes.buffer,
+      bodyLength: method === "HEAD" ? 0 : bytes.byteLength,
+      contentType: type,
+      headers:
+        "content-length: " + String(bytes.byteLength) + "\n" +
+        (type ? "content-type: " + type + "\n" : ""),
+      status: 200,
+      url,
+    };
+  };
   globalThis.__tilefinchXHRSendCalls = 0;
   globalThis.__tilefinchXHRLastError = "";
   Response = class Response {
@@ -3388,7 +3644,7 @@
       const streamBody = body instanceof ReadableStream ? body : null;
       let supplied = init.bodyBytes;
       if (supplied === undefined && body instanceof Blob)
-        supplied = body._bytes.slice().buffer;
+        supplied = tilefinchBlobBytes(body).slice().buffer;
       else if (supplied === undefined && body instanceof ArrayBuffer)
         supplied = body.slice(0);
       else if (supplied === undefined && ArrayBuffer.isView(body))
@@ -3674,6 +3930,46 @@
         url = request.url,
         mode = request.mode,
         credentials = request.credentials;
+      let local;
+      try {
+        local = snapshotLocalBlobRequest(method, url);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      if (local) {
+        return new Promise((resolve, reject) => {
+          let settled = false;
+          const abort = () => {
+            if (settled) return;
+            settled = true;
+            reject(
+              signal.reason ||
+                new DOMException("This operation was aborted", "AbortError"),
+            );
+          };
+          signal.addEventListener("abort", abort, { once: true });
+          queueMicrotask(() => {
+            if (settled) return;
+            settled = true;
+            signal.removeEventListener("abort", abort);
+            if (signal.aborted) {
+              reject(
+                signal.reason ||
+                  new DOMException("This operation was aborted", "AbortError"),
+              );
+              return;
+            }
+            resolve(
+              new Response(method === "HEAD" ? null : local.bodyBytes, {
+                status: local.status,
+                url: local.url,
+                headers: new Headers(local.headers),
+                bodyBytes: local.bodyBytes,
+              }),
+            );
+          });
+        });
+      }
       return new Promise((resolve, reject) => {
         let id = 0;
         const abort = () =>
@@ -3734,36 +4030,43 @@
       return Promise.reject(error);
     }
   };
-  navigator.sendBeacon = (url, data = null) => {
-    try {
-      const target = new URL(String(url), location.href);
-      if (target.protocol !== "http:" && target.protocol !== "https:")
+  Object.defineProperty(Navigator.prototype, "sendBeacon", {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value: function sendBeacon(url, data = null) {
+      if (!(this instanceof Navigator))
+        throw new TypeError("Illegal invocation");
+      try {
+        const target = new URL(String(url), location.href);
+        if (target.protocol !== "http:" && target.protocol !== "https:")
+          return false;
+        const request = new Request(target.href, {
+            method: "POST",
+            body: data,
+            credentials: "include",
+            keepalive: true,
+          }),
+          serialized = serializeRequestBody(request),
+          bytes =
+            serialized === undefined
+              ? 0
+              : typeof serialized === "string"
+                ? new TextEncoder().encode(serialized).byteLength
+                : serialized.byteLength;
+        if (
+          bytes > 64 * 1024 ||
+          networkQueueStats.currentCount >= networkQueueLimit ||
+          networkQueueStats.currentBytes + bytes > networkQueueByteLimit
+        )
+          return false;
+        fetch(request).catch(() => {});
+        return true;
+      } catch (_) {
         return false;
-      const request = new Request(target.href, {
-          method: "POST",
-          body: data,
-          credentials: "include",
-          keepalive: true,
-        }),
-        serialized = serializeRequestBody(request),
-        bytes =
-          serialized === undefined
-            ? 0
-            : typeof serialized === "string"
-              ? new TextEncoder().encode(serialized).byteLength
-              : serialized.byteLength;
-      if (
-        bytes > 64 * 1024 ||
-        networkQueueStats.currentCount >= networkQueueLimit ||
-        networkQueueStats.currentBytes + bytes > networkQueueByteLimit
-      )
-        return false;
-      fetch(request).catch(() => {});
-      return true;
-    } catch (_) {
-      return false;
-    }
-  };
+      }
+    },
+  });
   {
     const eventSources = new Map(),
       eventSourceLimit = 2;
@@ -4108,7 +4411,7 @@
             data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength),
           );
         } else if (typeof Blob !== "undefined" && data instanceof Blob) {
-          bytes = new Uint8Array(data._bytes);
+          bytes = new Uint8Array(tilefinchBlobBytes(data));
         } else {
           throw new TypeError("Unsupported WebSocket message type");
         }
@@ -4415,40 +4718,124 @@
       return true;
     };
   }
-  class TilefinchXMLHttpRequest {
+  const xhrEventTargetStates = new WeakMap(),
+    xhrPublicStates = new WeakMap(),
+    xhrPrivateStates = new WeakMap(),
+    xhrEventHandlerTypes = [
+      "abort",
+      "error",
+      "load",
+      "loadend",
+      "loadstart",
+      "progress",
+      "timeout",
+    ];
+  class XMLHttpRequestEventTarget extends EventTarget {
     constructor() {
+      super();
+      xhrEventTargetStates.set(this, { handlers: new Map(), listeners: new Map() });
+      xhrPublicStates.set(this, Object.create(null));
+    }
+    addEventListener(type, callback) {
+      if (typeof callback !== "function") return;
+      const listeners = xhrEventTargetStates.get(this)?.listeners;
+      if (!listeners) throw new TypeError("Illegal invocation");
+      type = String(type);
+      if (!listeners.has(type)) listeners.set(type, []);
+      const callbacks = listeners.get(type);
+      if (!callbacks.includes(callback)) callbacks.push(callback);
+    }
+    removeEventListener(type, callback) {
+      const listeners = xhrEventTargetStates.get(this)?.listeners;
+      if (!listeners) throw new TypeError("Illegal invocation");
+      const callbacks = listeners.get(String(type));
+      if (!callbacks) return;
+      const at = callbacks.indexOf(callback);
+      if (at >= 0) callbacks.splice(at, 1);
+    }
+    dispatchEvent(event) {
+      if (!(event instanceof Event)) throw new TypeError("Event required");
+      const state = xhrEventTargetStates.get(this);
+      if (!state) throw new TypeError("Illegal invocation");
+      event.target = this;
+      event.currentTarget = this;
+      const invoke = (callback) =>
+        globalThis.__tilefinchRunTask(
+          "xhr:" + String(event.type) + ":state=" + String(this.readyState || 0),
+          () => {
+            try {
+              callback.call(this, event);
+            } catch (error) {
+              __tilefinchReportUncaught(error, "XMLHttpRequest " + event.type);
+            }
+          },
+        );
+      const handler = state.handlers.get(String(event.type));
+      if (typeof handler === "function") invoke(handler);
+      for (const callback of [...(state.listeners.get(String(event.type)) || [])])
+        invoke(callback);
+      return !event.defaultPrevented;
+    }
+  }
+  for (const type of xhrEventHandlerTypes)
+    Object.defineProperty(XMLHttpRequestEventTarget.prototype, "on" + type, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return xhrEventTargetStates.get(this)?.handlers.get(type) || null;
+      },
+      set(value) {
+        const state = xhrEventTargetStates.get(this);
+        if (!state) throw new TypeError("Illegal invocation");
+        state.handlers.set(type, typeof value === "function" ? value : null);
+      },
+    });
+  Object.defineProperty(
+    XMLHttpRequestEventTarget.prototype,
+    Symbol.toStringTag,
+    { configurable: true, value: "XMLHttpRequestEventTarget" },
+  );
+  class XMLHttpRequestUpload extends XMLHttpRequestEventTarget {}
+  Object.defineProperty(XMLHttpRequestUpload.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "XMLHttpRequestUpload",
+  });
+  class TilefinchXMLHttpRequest extends XMLHttpRequestEventTarget {
+    constructor() {
+      super();
       this.readyState = 0;
       this.status = 0;
       this.statusText = "";
       this.response = null;
       this.responseURL = "";
       this.responseXML = null;
-      this.responseHeaders = new Headers();
       this.onreadystatechange = null;
-      this.onloadstart = null;
-      this.onprogress = null;
-      this.onload = null;
-      this.onerror = null;
-      this.onabort = null;
-      this.onloadend = null;
-      this.ontimeout = null;
       this.timeout = 0;
       this.withCredentials = false;
-      this.upload = { addEventListener() {}, removeEventListener() {} };
-      this.method = "GET";
-      this.url = "";
-      this.async = true;
-      this.headers = new Headers();
-      this.listeners = new Map();
-      this._responseType = "";
-      this._responseText = "";
-      this._requestId = 0;
-      this._timeoutId = 0;
-      this._done = true;
-      this._sent = false;
+      this.upload = new XMLHttpRequestUpload();
+      xhrPrivateStates.set(this, {
+        async: true,
+        done: true,
+        headers: new Headers(),
+        method: "GET",
+        mimeType: "",
+        requestId: 0,
+        responseBytes: 0,
+        responseLengthComputable: false,
+        responseHeaders: new Headers(),
+        responseText: "",
+        responseType: "",
+        sent: false,
+        stateTrace: [],
+        timeoutId: 0,
+        uploadBytes: 0,
+        uploadComplete: false,
+        uploadStarted: false,
+        url: "",
+      });
     }
     get responseType() {
-      return this._responseType;
+      return xhrPrivateStates.get(this).responseType;
     }
     set responseType(value) {
       value = String(value || "");
@@ -4461,61 +4848,58 @@
           "Response type cannot change now",
           "InvalidStateError",
         );
-      this._responseType = value;
+      xhrPrivateStates.get(this).responseType = value;
     }
     get responseText() {
-      if (this._responseType !== "" && this._responseType !== "text")
+      const state = xhrPrivateStates.get(this);
+      if (state.responseType !== "" && state.responseType !== "text")
         throw new DOMException(
           "responseText is unavailable for this response type",
           "InvalidStateError",
         );
-      return this._responseText;
+      return state.responseText;
     }
     open(method, url, async = true) {
-      if (!this._done && this._requestId)
+      const state = xhrPrivateStates.get(this);
+      if (!state.done && state.requestId)
         cancelNetwork(
-          this._requestId,
+          state.requestId,
           new DOMException("Request reopened", "AbortError"),
           false,
         );
-      this.method = String(method).toUpperCase();
-      this.url = String(url);
-      this.async = !!async;
+      state.method = String(method).toUpperCase();
+      state.url = String(url);
+      state.async = !!async;
       this.status = 0;
       this.statusText = "";
       this.response = null;
       this.responseURL = "";
       this.responseXML = null;
-      this.responseHeaders = new Headers();
-      this.headers = new Headers();
-      this._responseText = "";
-      this._requestId = 0;
-      this._done = true;
-      this._sent = false;
+      state.responseHeaders = new Headers();
+      state.headers = new Headers();
+      state.responseText = "";
+      state.requestId = 0;
+      state.responseBytes = 0;
+      state.responseLengthComputable = false;
+      state.done = true;
+      state.sent = false;
+      state.uploadBytes = 0;
+      state.uploadComplete = false;
+      state.uploadStarted = false;
       this.readyState = 1;
-      this.emit("readystatechange");
+      state.stateTrace = [1];
+      xhrEmit(this, "readystatechange");
     }
     setRequestHeader(name, value) {
-      if (this.readyState !== 1 || this._sent)
+      const state = xhrPrivateStates.get(this);
+      if (this.readyState !== 1 || state.sent)
         throw new DOMException("Request is not open", "InvalidStateError");
-      this.headers.append(name, value);
+      state.headers.append(name, value);
     }
     overrideMimeType(type) {
       if (this.readyState === 3 || this.readyState === 4)
         throw new DOMException("Response is loading", "InvalidStateError");
-      this._mimeType = String(type);
-    }
-    addEventListener(type, callback) {
-      if (typeof callback !== "function") return;
-      const key = String(type);
-      if (!this.listeners.has(key)) this.listeners.set(key, []);
-      this.listeners.get(key).push(callback);
-    }
-    removeEventListener(type, callback) {
-      const list = this.listeners.get(String(type));
-      if (!list) return;
-      const at = list.indexOf(callback);
-      if (at >= 0) list.splice(at, 1);
+      xhrPrivateStates.get(this).mimeType = String(type);
     }
     emit(type, loaded = 0, total = 0) {
       const event = new Event(type);
@@ -4530,135 +4914,173 @@
     }
     _state(value) {
       this.readyState = value;
-      this.emit("readystatechange");
+      xhrEmit(this, "readystatechange");
     }
     _finish(type) {
-      if (this._done) return;
-      this._done = true;
-      if (this._timeoutId) clearTimeout(this._timeoutId);
-      this._timeoutId = 0;
-      this._requestId = 0;
-      this.emit(type);
-      this.emit("loadend");
+      const state = xhrPrivateStates.get(this);
+      if (state.done) return;
+      state.done = true;
+      if (state.timeoutId) clearTimeout(state.timeoutId);
+      state.timeoutId = 0;
+      state.requestId = 0;
+      const loaded = state.responseBytes,
+        total = state.responseLengthComputable ? loaded : 0;
+      xhrEmit(this, type, loaded, total);
+      xhrEmit(this, "loadend", loaded, total);
     }
     _apply(raw) {
-      if (this._done) return;
+      const state = xhrPrivateStates.get(this);
+      if (state.done) return;
+      xhrUploadFinish(this, "load");
       this.status = Number(raw.status) || 0;
-      this.responseURL = raw.url || this.url;
-      this.responseHeaders = new Headers(
+      this.responseURL = raw.url || state.url;
+      state.responseHeaders = new Headers(
         raw.headers || "content-type: " + raw.contentType + "\n",
       );
-      this._state(2);
+      xhrState(this, 2);
       const supplied =
           raw.bodyBytes instanceof ArrayBuffer
             ? new Uint8Array(raw.bodyBytes)
             : null,
         needsText =
-          this._responseType === "" ||
-          this._responseType === "text" ||
-          this._responseType === "json" ||
-          this._responseType === "document" ||
+          state.responseType === "" ||
+          state.responseType === "text" ||
+          state.responseType === "json" ||
+          state.responseType === "document" ||
           /(?:xml|html)/i.test(
-            this._mimeType ||
-              this.responseHeaders.get("content-type") ||
+            state.mimeType ||
+              state.responseHeaders.get("content-type") ||
               "",
           );
-      this._responseText = needsText
+      state.responseText = needsText
         ? raw.body !== undefined
           ? String(raw.body)
           : new TextDecoder().decode(supplied || new Uint8Array())
         : "";
-      this._state(3);
+      xhrState(this, 3);
       const fallbackBody = raw.body === undefined ? "" : String(raw.body),
         byteLength = Number.isFinite(Number(raw.bodyLength))
           ? Math.max(0, Number(raw.bodyLength))
           : supplied
             ? supplied.byteLength
             : new TextEncoder().encode(fallbackBody).byteLength;
-      this.emit("progress", byteLength, byteLength);
-      if (this._responseType === "" || this._responseType === "text")
-        this.response = this._responseText;
-      else if (this._responseType === "json") {
+      state.responseBytes = byteLength;
+      state.responseLengthComputable = true;
+      xhrEmit(this, "progress", byteLength, byteLength);
+      if (state.responseType === "" || state.responseType === "text")
+        this.response = state.responseText;
+      else if (state.responseType === "json") {
         try {
-          this.response = JSON.parse(this._responseText);
+          this.response = JSON.parse(state.responseText);
         } catch (_) {
           this.response = null;
         }
-      } else if (this._responseType === "arraybuffer") {
+      } else if (state.responseType === "arraybuffer") {
         const bytes = supplied || new TextEncoder().encode(fallbackBody);
         this.response =
           bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
             ? bytes.buffer
             : bytes.slice().buffer;
-      } else if (this._responseType === "blob") {
+      } else if (state.responseType === "blob") {
         const bytes = supplied || new TextEncoder().encode(fallbackBody);
         this.response = new Blob([bytes], {
-          type: this.responseHeaders.get("content-type") || "",
+          type: state.responseHeaders.get("content-type") || "",
         });
-      } else if (this._responseType === "document") {
+      } else if (state.responseType === "document") {
         const mime =
           /xml/i.test(
-            this._mimeType ||
-              this.responseHeaders.get("content-type") ||
+            state.mimeType ||
+              state.responseHeaders.get("content-type") ||
               "",
           )
             ? "text/xml"
             : "text/html";
         this.response = new DOMParser().parseFromString(
-          this._responseText,
+          state.responseText,
           mime,
         );
       } else this.response = null;
       if (
-        this._responseType === "" &&
+        state.responseType === "" &&
         /(?:xml|html)/i.test(
-          this._mimeType ||
-            this.responseHeaders.get("content-type") ||
+          state.mimeType ||
+            state.responseHeaders.get("content-type") ||
             "",
         )
       ) {
-        const mime = /xml/i.test(this._mimeType || "") ? "text/xml" : "text/html";
+        const mime = /xml/i.test(state.mimeType || "") ? "text/xml" : "text/html";
         this.responseXML = new DOMParser().parseFromString(
-          this._responseText,
+          state.responseText,
           mime,
         );
-      } else if (this._responseType === "document") {
+      } else if (state.responseType === "document") {
         this.responseXML = this.response;
       }
-      this._state(4);
-      this._finish("load");
+      xhrState(this, 4);
+      xhrFinish(this, "load");
     }
     _fail(error, type = "error") {
-      if (this._done) return;
+      const state = xhrPrivateStates.get(this);
+      if (state.done) return;
+      xhrUploadFinish(this, type);
       globalThis.__tilefinchXHRLastError = String(
         (error && error.stack) || error || type,
       );
       this.status = 0;
       this.response = null;
-      this._responseText = "";
-      this._state(4);
-      this._finish(type);
+      state.responseText = "";
+      xhrState(this, 4);
+      xhrFinish(this, type);
     }
     send(body = null) {
-      if (this.readyState !== 1 || this._sent)
+      const state = xhrPrivateStates.get(this);
+      if (this.readyState !== 1 || state.sent)
         throw new DOMException("Request is not open", "InvalidStateError");
       globalThis.__tilefinchXHRSendCalls++;
-      this._sent = true;
-      this._done = false;
-      this.emit("loadstart");
+      state.sent = true;
+      state.done = false;
+      xhrEmit(this, "loadstart");
       try {
-        const request = { _bodySource: body, headers: this.headers },
+        const request = { _bodySource: body, headers: state.headers },
           serialized = serializeRequestBody(request),
-          method = this.method || "GET",
-          url = this.url,
-          contentType = this.headers.get("content-type") || "",
-          headerBlock = nativeHeaderBlock(this.headers),
+          method = state.method || "GET",
+          url = state.url,
+          contentType = state.headers.get("content-type") || "",
+          headerBlock = nativeHeaderBlock(state.headers),
           credentials = this.withCredentials ? "include" : "same-origin",
           timeout = Math.max(0, Number(this.timeout) || 0);
-        if (this.async) {
-          const id = queueNetwork(
-            () =>
-              __tilefinchFetchAsync(
+        xhrUploadStart(this, method, serialized);
+        let local;
+        try {
+          local = snapshotLocalBlobRequest(method, url);
+        } catch (error) {
+          if (state.async) {
+            queueMicrotask(() => xhrFail(this, error));
+            return;
+          }
+          throw error;
+        }
+        if (local) {
+          if (state.async) queueMicrotask(() => xhrApply(this, local));
+          else xhrApply(this, local);
+          return;
+        }
+        if (state.async) {
+          let id;
+          try {
+            id = queueNetwork(
+              () =>
+                __tilefinchFetchAsync(
+                  method,
+                  url,
+                  serialized,
+                  contentType,
+                  headerBlock,
+                  "cors",
+                  credentials,
+                  timeout,
+                ),
+              networkRetainedBytes(
                 method,
                 url,
                 serialized,
@@ -4666,41 +5088,40 @@
                 headerBlock,
                 "cors",
                 credentials,
-                timeout,
               ),
-            networkRetainedBytes(
-              method,
-              url,
-              serialized,
-              contentType,
-              headerBlock,
-              "cors",
-              credentials,
-            ),
-            (raw) => this._apply(raw),
-            (error) => {
-              const timedOut =
-                timeout > 0 && /timeout|timed out/i.test(String(error));
-              this._fail(error, timedOut ? "timeout" : "error");
-            },
-          );
-          this._requestId = pendingNetwork.has(id) ? Number(id) : 0;
-          if (!this._done && timeout > 0)
-            this._timeoutId = setTimeout(() => {
-              if (this._done) return;
+              (raw) => xhrApply(this, raw),
+              (error) => {
+                const timedOut =
+                  timeout > 0 && /timeout|timed out/i.test(String(error));
+                xhrFail(this, error, timedOut ? "timeout" : "error");
+              },
+            );
+          } catch (error) {
+            /* An async XHR reports transport/admission failure from a later
+               task.  Dispatching it inside send() makes an ordinary retry
+               handler recurse in one JavaScript turn when the bounded queue
+               is full, unlike the browser networking model and without an
+               opportunity for completed requests to release pressure. */
+            setTimeout(() => xhrFail(this, error), 0);
+            return;
+          }
+          state.requestId = pendingNetwork.has(id) ? Number(id) : 0;
+          if (!state.done && timeout > 0)
+            state.timeoutId = setTimeout(() => {
+              if (state.done) return;
               cancelNetwork(
-                this._requestId,
+                state.requestId,
                 new DOMException("The operation timed out", "TimeoutError"),
                 false,
               );
               this.status = 0;
               this.readyState = 4;
-              this.emit("readystatechange");
-              this._finish("timeout");
+              xhrEmit(this, "readystatechange");
+              xhrUploadFinish(this, "timeout");
+              xhrFinish(this, "timeout");
             }, timeout);
-        } else
-          this._apply(
-            __tilefinchFetchSync(
+        } else {
+          const raw = __tilefinchFetchSync(
               method,
               url,
               serialized,
@@ -4708,56 +5129,152 @@
               headerBlock,
               "cors",
               credentials,
-            ),
-          );
+            );
+          xhrUploadFinish(this, "load");
+          xhrApply(this, raw);
+        }
       } catch (error) {
-        this._fail(error);
+        xhrFail(this, error);
       }
     }
     abort() {
-      if (this._done) return;
-      if (this._requestId)
+      const state = xhrPrivateStates.get(this);
+      if (state.done) return;
+      if (state.requestId)
         cancelNetwork(
-          this._requestId,
+          state.requestId,
           new DOMException("This operation was aborted", "AbortError"),
           false,
         );
       this.status = 0;
       this.readyState = 0;
-      this._finish("abort");
+      xhrUploadFinish(this, "abort");
+      xhrFinish(this, "abort");
     }
     getResponseHeader(name) {
-      return this.readyState < 2 ? null : this.responseHeaders.get(name);
+      return this.readyState < 2
+        ? null
+        : xhrPrivateStates.get(this).responseHeaders.get(name);
     }
     getAllResponseHeaders() {
       if (this.readyState < 2) return "";
       let output = "";
-      this.responseHeaders.forEach(
+      xhrPrivateStates.get(this).responseHeaders.forEach(
         (value, name) => (output += name + ": " + value + "\r\n"),
       );
       return output;
     }
   }
-  installXhrValidation(TilefinchXMLHttpRequest);
+  Object.defineProperty(TilefinchXMLHttpRequest, "name", {
+    configurable: true,
+    value: "XMLHttpRequest",
+  });
   globalThis.__tilefinchXHRResponseCount = 0;
   globalThis.__tilefinchXHRLastStatus = 0;
   globalThis.__tilefinchXHRLastResponseType = "";
   globalThis.__tilefinchXHRLastTextLength = 0;
   globalThis.__tilefinchXHRLastByteLength = 0;
   globalThis.__tilefinchXHRLastStates = "";
-  {
-    const open = TilefinchXMLHttpRequest.prototype.open,
-      state = TilefinchXMLHttpRequest.prototype._state,
-      apply = TilefinchXMLHttpRequest.prototype._apply;
-    TilefinchXMLHttpRequest.prototype.open = function (...args) {
-      this._stateTrace = [1];
-      return open.apply(this, args);
-    };
-    TilefinchXMLHttpRequest.prototype._state = function (value) {
-      this._stateTrace.push(value);
-      return state.call(this, value);
-    };
-    TilefinchXMLHttpRequest.prototype._apply = function (raw) {
+  for (const name of [
+    "readyState",
+    "status",
+    "statusText",
+    "response",
+    "responseURL",
+    "responseXML",
+    "timeout",
+    "upload",
+    "withCredentials",
+  ])
+    Object.defineProperty(TilefinchXMLHttpRequest.prototype, name, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        const state = xhrPublicStates.get(this);
+        if (!state) throw new TypeError("Illegal invocation");
+        return state[name];
+      },
+      set(value) {
+        const state = xhrPublicStates.get(this);
+        if (!state) throw new TypeError("Illegal invocation");
+        state[name] = value;
+      },
+    });
+  Object.defineProperty(
+    TilefinchXMLHttpRequest.prototype,
+    "onreadystatechange",
+    {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return xhrEventTargetStates
+          .get(this)
+          ?.handlers.get("readystatechange") || null;
+      },
+      set(value) {
+        const state = xhrEventTargetStates.get(this);
+        if (!state) throw new TypeError("Illegal invocation");
+        state.handlers.set(
+          "readystatechange",
+          typeof value === "function" ? value : null,
+        );
+      },
+    },
+  );
+  const xhrStateImpl = TilefinchXMLHttpRequest.prototype._state,
+    xhrFinishImpl = TilefinchXMLHttpRequest.prototype._finish,
+    xhrApplyImpl = TilefinchXMLHttpRequest.prototype._apply,
+    xhrFailImpl = TilefinchXMLHttpRequest.prototype._fail,
+    xhrEmitTarget = (target, type, loaded = 0, total = 0,
+                     lengthComputable = total > 0) => {
+      /* XMLHttpRequest is the user agent, not author script.  Its progress
+         events are trusted ProgressEvents in browsers; readystatechange is
+         the one plain Event in this sequence.  Challenge runtimes inspect
+         both distinctions when deciding whether a response callback came
+         from the transport or from an authored redispatch. */
+      const event = __tilefinchTrustedEvent(
+        type === "readystatechange"
+          ? new Event(type)
+          : new ProgressEvent(type, {
+              lengthComputable,
+              loaded,
+              total,
+            }),
+      );
+      target.dispatchEvent(event);
+    },
+    xhrEmit = (xhr, type, loaded = 0, total = 0) =>
+      xhrEmitTarget(xhr, type, loaded, total),
+    xhrUploadStart = (xhr, method, serialized) => {
+      const state = xhrPrivateStates.get(xhr);
+      if (method === "GET" || method === "HEAD" || serialized === undefined)
+        return;
+      const bytes = typeof serialized === "string"
+        ? new TextEncoder().encode(serialized).byteLength
+        : serialized.byteLength;
+      state.uploadBytes = bytes;
+      state.uploadStarted = true;
+      state.uploadComplete = false;
+      xhrEmitTarget(xhr.upload, "loadstart", 0, bytes, true);
+    },
+    xhrUploadFinish = (xhr, type) => {
+      const state = xhrPrivateStates.get(xhr);
+      if (!state.uploadStarted || state.uploadComplete) return;
+      state.uploadComplete = true;
+      const bytes = state.uploadBytes;
+      if (type === "load")
+        xhrEmitTarget(xhr.upload, "progress", bytes, bytes, true);
+      xhrEmitTarget(xhr.upload, type, type === "load" ? bytes : 0, bytes, true);
+      xhrEmitTarget(
+        xhr.upload, "loadend", type === "load" ? bytes : 0, bytes, true,
+      );
+    },
+    xhrState = (xhr, value) => {
+      xhrPrivateStates.get(xhr).stateTrace.push(value);
+      xhrStateImpl.call(xhr, value);
+    },
+    xhrFinish = (xhr, type) => xhrFinishImpl.call(xhr, type),
+    xhrApply = (xhr, raw) => {
       const supplied =
           raw.bodyBytes instanceof ArrayBuffer
             ? raw.bodyBytes.byteLength
@@ -4768,47 +5285,33 @@
           : supplied !== null
             ? supplied
             : new TextEncoder().encode(String(raw.body || "")).byteLength;
-      apply.call(this, raw);
-      if (this.readyState === 4 && this.status !== 0) {
+      xhrApplyImpl.call(xhr, raw);
+      if (xhr.readyState === 4 && xhr.status !== 0) {
+        const state = xhrPrivateStates.get(xhr);
         globalThis.__tilefinchXHRResponseCount++;
-        globalThis.__tilefinchXHRLastStatus = this.status;
-        globalThis.__tilefinchXHRLastResponseType = this._responseType;
-        globalThis.__tilefinchXHRLastTextLength = this._responseText.length;
+        globalThis.__tilefinchXHRLastStatus = xhr.status;
+        globalThis.__tilefinchXHRLastResponseType = state.responseType;
+        globalThis.__tilefinchXHRLastTextLength = state.responseText.length;
         globalThis.__tilefinchXHRLastByteLength = byteLength;
-        globalThis.__tilefinchXHRLastStates = this._stateTrace.join(".");
+        globalThis.__tilefinchXHRLastStates = state.stateTrace.join(".");
       }
-    };
-  }
-  {
-    const fail = TilefinchXMLHttpRequest.prototype._fail;
-    TilefinchXMLHttpRequest.prototype._fail = function (error, type = "error") {
+    },
+    xhrFail = (xhr, error, type = "error") => {
       const previous = globalThis.__tilefinchXHRLastError;
-      fail.call(this, error, type);
+      xhrFailImpl.call(xhr, error, type);
       if (type !== "error") globalThis.__tilefinchXHRLastError = previous;
     };
-  }
-  TilefinchXMLHttpRequest.prototype.emit = function (type, loaded = 0, total = 0) {
-    const event = new Event(type);
-    event.target = this;
-    event.loaded = loaded;
-    event.total = total;
-    event.lengthComputable = total > 0;
-    const invoke = (callback) =>
-      globalThis.__tilefinchRunTask(
-        "xhr:" + String(type) + ":state=" + String(this.readyState),
-        () => {
-          try {
-            callback.call(this, event);
-          } catch (error) {
-            __tilefinchReportUncaught(error, "XMLHttpRequest " + type);
-          }
-        },
-      );
-    const handler = this["on" + type];
-    if (typeof handler === "function") invoke(handler);
-    for (const callback of [...(this.listeners.get(type) || [])])
-      invoke(callback);
-  };
+  delete TilefinchXMLHttpRequest.prototype.emit;
+  delete TilefinchXMLHttpRequest.prototype._state;
+  delete TilefinchXMLHttpRequest.prototype._finish;
+  delete TilefinchXMLHttpRequest.prototype._apply;
+  delete TilefinchXMLHttpRequest.prototype._fail;
+  Object.defineProperty(
+    TilefinchXMLHttpRequest.prototype,
+    Symbol.toStringTag,
+    { configurable: true, value: "XMLHttpRequest" },
+  );
+  installXhrValidation(TilefinchXMLHttpRequest);
   for (const [name, value] of Object.entries({
     UNSENT: 0,
     OPENED: 1,
@@ -4819,8 +5322,186 @@
     Object.defineProperty(TilefinchXMLHttpRequest, name, { value });
     Object.defineProperty(TilefinchXMLHttpRequest.prototype, name, { value });
   }
+  globalThis.XMLHttpRequestEventTarget = XMLHttpRequestEventTarget;
+  globalThis.XMLHttpRequestUpload = XMLHttpRequestUpload;
   globalThis.XMLHttpRequest = TilefinchXMLHttpRequest;
+  const markXhrNative = globalThis.__tilefinchMarkNativeFunction;
+  for (const constructor of [
+    XMLHttpRequestEventTarget,
+    XMLHttpRequestUpload,
+    TilefinchXMLHttpRequest,
+  ]) {
+    markXhrNative(constructor);
+    for (const key of Reflect.ownKeys(constructor.prototype)) {
+      const descriptor = Object.getOwnPropertyDescriptor(
+        constructor.prototype,
+        key,
+      );
+      if (
+        key !== "constructor" &&
+        typeof key === "string" &&
+        typeof descriptor?.value === "function" &&
+        descriptor.value.name === ""
+      )
+        Object.defineProperty(descriptor.value, "name", {
+          configurable: true,
+          value: key,
+        });
+      markXhrNative(descriptor?.value);
+      markXhrNative(descriptor?.get);
+      markXhrNative(descriptor?.set);
+    }
+  }
   Object.defineProperty(globalThis.__tilefinchRootCensus, "pendingNetwork", {
     get: () => pendingNetwork.size,
   });
+
+  /* Small device-state APIs live with the compatibility layer so platform.js
+     remains below the source-fallback admission ceiling. Public objects are
+     still allocated only when author code first asks for each capability. */
+  const platformStatusToken = {},
+    permissionNames = new Set([
+      "camera",
+      "clipboard-read",
+      "clipboard-write",
+      "geolocation",
+      "microphone",
+      "notifications",
+      "persistent-storage",
+    ]);
+  let networkInformation = null,
+    batteryManager = null,
+    permissions = null;
+  class NetworkInformation extends EventTarget {
+    constructor() {
+      if (arguments[0] !== platformStatusToken)
+        throw new TypeError("Illegal constructor");
+      super();
+      this._onchange = null;
+    }
+    get onchange() { return this._onchange; }
+    set onchange(value) {
+      this._onchange = typeof value === "function" ? value : null;
+    }
+    get effectiveType() { return "3g"; }
+    get rtt() { return 300; }
+    get downlink() { return 1.5; }
+    get saveData() { return false; }
+  }
+  class BatteryManager extends EventTarget {
+    constructor() {
+      if (arguments[0] !== platformStatusToken)
+        throw new TypeError("Illegal constructor");
+      super();
+    }
+    get charging() { return true; }
+    get chargingTime() { return 0; }
+    get dischargingTime() { return Infinity; }
+    get level() { return 1; }
+    get onchargingchange() { return null; }
+    set onchargingchange(_) {}
+    get onchargingtimechange() { return null; }
+    set onchargingtimechange(_) {}
+    get ondischargingtimechange() { return null; }
+    set ondischargingtimechange(_) {}
+    get onlevelchange() { return null; }
+    set onlevelchange(_) {}
+  }
+  class PermissionStatus extends EventTarget {
+    constructor(token, name) {
+      if (token !== platformStatusToken)
+        throw new TypeError("Illegal constructor");
+      super();
+      this._name = name;
+      this._onchange = null;
+    }
+    get name() { return this._name; }
+    get state() { return "denied"; }
+    get onchange() { return this._onchange; }
+    set onchange(value) {
+      this._onchange = typeof value === "function" ? value : null;
+    }
+  }
+  const permissionStatuses = new Map();
+  class Permissions {
+    constructor() {
+      if (arguments[0] !== platformStatusToken)
+        throw new TypeError("Illegal constructor");
+    }
+    query(descriptor) {
+      if (!(this instanceof Permissions))
+        throw new TypeError("Illegal invocation");
+      const name = String(descriptor?.name || "");
+      if (!permissionNames.has(name))
+        return Promise.reject(new TypeError("Unsupported permission name"));
+      let status = permissionStatuses.get(name);
+      if (!status) {
+        status = new PermissionStatus(platformStatusToken, name);
+        permissionStatuses.set(name, status);
+      }
+      return Promise.resolve(status);
+    }
+  }
+  for (const [constructor, tag] of [
+    [NetworkInformation, "NetworkInformation"],
+    [BatteryManager, "BatteryManager"],
+    [Permissions, "Permissions"],
+    [PermissionStatus, "PermissionStatus"],
+  ]) {
+    Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: tag,
+    });
+    for (const key of Reflect.ownKeys(constructor.prototype)) {
+      if (key === "constructor" || key === Symbol.toStringTag) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(
+        constructor.prototype,
+        key,
+      );
+      if (descriptor)
+        Object.defineProperty(constructor.prototype, key, {
+          ...descriptor,
+          enumerable: true,
+        });
+    }
+  }
+  Object.defineProperties(Navigator.prototype, {
+    connection: {
+      configurable: true,
+      enumerable: true,
+      get() {
+        if (!(this instanceof Navigator))
+          throw new TypeError("Illegal invocation");
+        if (networkInformation === null)
+          networkInformation = new NetworkInformation(platformStatusToken);
+        return networkInformation;
+      },
+    },
+    getBattery: {
+      configurable: true,
+      enumerable: true,
+      value() {
+        if (!(this instanceof Navigator))
+          throw new TypeError("Illegal invocation");
+        if (batteryManager === null)
+          batteryManager = new BatteryManager(platformStatusToken);
+        return Promise.resolve(batteryManager);
+      },
+    },
+    permissions: {
+      configurable: true,
+      enumerable: true,
+      get() {
+        if (!(this instanceof Navigator))
+          throw new TypeError("Illegal invocation");
+        if (permissions === null)
+          permissions = new Permissions(platformStatusToken);
+        return permissions;
+      },
+    },
+  });
+  globalThis.NetworkInformation = NetworkInformation;
+  globalThis.BatteryManager = BatteryManager;
+  globalThis.Permissions = Permissions;
+  globalThis.PermissionStatus = PermissionStatus;
 })();

@@ -19,6 +19,11 @@ void navigation_test_refuse_next_same_document_relayout(void)
     navigation_refuse_same_document_relayout_once = true;
 }
 
+void navigation_test_refuse_next_relayout(void)
+{
+    navigation_refuse_same_document_relayout_once = true;
+}
+
 static bool navigation_test_consume_same_document_relayout_refusal(void)
 {
     bool pending = navigation_refuse_same_document_relayout_once;
@@ -53,16 +58,17 @@ const NavigationEntry *navigation_current(const NavigationSession *session)
     return &session->history[session->history_index];
 }
 
-static bool navigation_urls_are_distinct_same_request(const char *left,
-                                                       const char *right)
+static bool navigation_urls_share_document(const char *left,
+                                            const char *right)
 {
     char current_url[NAVIGATION_URL_LIMIT];
     char target_url[NAVIGATION_URL_LIMIT];
     if (left == NULL || right == NULL
         || !tilefinch_url_normalize(
                left, current_url, sizeof(current_url))
-        || !tilefinch_url_normalize(right, target_url, sizeof(target_url))
-        || strcmp(current_url, target_url) == 0) return false;
+        || !tilefinch_url_normalize(right, target_url, sizeof(target_url))) {
+        return false;
+    }
     char *current_fragment = strchr(current_url, '#');
     char *target_fragment = strchr(target_url, '#');
     if (current_fragment != NULL) *current_fragment = '\0';
@@ -70,12 +76,42 @@ static bool navigation_urls_are_distinct_same_request(const char *left,
     return strcmp(current_url, target_url) == 0;
 }
 
+const char *navigation_active_document_url(
+    const NavigationSession *session)
+{
+    if (session == NULL) return NULL;
+    const NavigationEntry *current = navigation_current(session);
+    if (!session->page.loaded || session->page.document_url[0] == '\0')
+        return current == NULL ? NULL : current->url;
+    /* Same-document history entries are the active URL, including their
+       fragment. A cross-document redirect keeps the requested entry URL for
+       traversal, but the committed effective URL is the principal. */
+    if (current != NULL
+        && navigation_urls_share_document(
+               current->url, session->page.document_url)) {
+        return current->url;
+    }
+    return session->page.document_url;
+}
+
+static bool navigation_urls_are_distinct_same_request(const char *left,
+                                                       const char *right)
+{
+    char current_url[NAVIGATION_URL_LIMIT];
+    char target_url[NAVIGATION_URL_LIMIT];
+    return left != NULL && right != NULL
+        && tilefinch_url_normalize(left, current_url, sizeof(current_url))
+        && tilefinch_url_normalize(right, target_url, sizeof(target_url))
+        && strcmp(current_url, target_url) != 0
+        && navigation_urls_share_document(current_url, target_url);
+}
+
 bool navigation_url_is_same_document(
     const NavigationSession *session, const char *url)
 {
-    const NavigationEntry *current = navigation_current(session);
-    return current != NULL && url != NULL
-        && navigation_urls_are_distinct_same_request(current->url, url);
+    const char *current_url = navigation_active_document_url(session);
+    return current_url != NULL && url != NULL
+        && navigation_urls_are_distinct_same_request(current_url, url);
 }
 
 bool navigation_replace_history(
@@ -131,7 +167,9 @@ bool navigation_commit_same_document_url(NavigationSession *session,
         || strlen(url) >= NAVIGATION_URL_LIMIT
         || !navigation_url_is_same_document(session, url)) return false;
     char old_url[NAVIGATION_URL_LIMIT];
-    snprintf(old_url, sizeof(old_url), "%s", current->url);
+    const char *active_url = navigation_active_document_url(session);
+    if (active_url == NULL) return false;
+    snprintf(old_url, sizeof(old_url), "%s", active_url);
     char observed_old_base[NAVIGATION_URL_LIMIT];
     if (!navigation_document_resource_base(
             &session->page.document, old_url, observed_old_base)) {
@@ -215,17 +253,7 @@ bool navigation_settle_same_document_events(NavigationSession *session)
         runtime, &requested_scroll);
     bool relayout_requested = script_runtime_consume_relayout(runtime);
     if (relayout_requested) {
-#if !defined(__PSP__)
-        bool injected_refusal =
-            navigation_test_consume_same_document_relayout_refusal();
-        if (injected_refusal)
-            budget_inject_failure_after(session->budget, 0u);
-#endif
         bool relaid_out = navigation_relayout(session);
-#if !defined(__PSP__)
-        if (injected_refusal)
-            budget_clear_failure_injection(session->budget);
-#endif
         if (!relaid_out) return false;
     }
     if (has_requested_scroll) {
@@ -856,6 +884,21 @@ static bool navigation_mutations_are_canvas_paint_only(
     return true;
 }
 
+static bool navigation_relayout_failed(
+    NavigationSession *session, bool must_retire_page)
+{
+    if (must_retire_page) {
+        /* Author mutation has already committed and its journal has been
+           consumed. The incumbent layout borrows text and node pointers from
+           that pre-mutation DOM, so retaining any part of the page graph on a
+           replacement refusal would publish dangling native references.
+           Retire the page atomically; BrowserEngine retires its shell before
+           returning the failure to the frontend. */
+        page_destroy(session);
+    }
+    return false;
+}
+
 bool navigation_relayout(NavigationSession *session)
 {
     if (session == NULL || !session->page.loaded) return false;
@@ -918,7 +961,7 @@ bool navigation_relayout(NavigationSession *session)
         || image_resource_refresh) {
         if (!navigation_resource_fingerprint(
                 session, &session->page.document, &fingerprint)) {
-            return false;
+            return navigation_relayout_failed(session, mutation_driven);
         }
         if (!full_rebuild && conservative_scan) {
             full_rebuild = fingerprint != session->resource_fingerprint;
@@ -1004,9 +1047,20 @@ bool navigation_relayout(NavigationSession *session)
         navigation_prepare_layout_reuse(session, &mutations, false);
         navigation_evict_layout_reuse_under_pressure(session);
         LayoutDocument next = {0};
-        if (!navigation_build_layout(session, &next, session->fonts,
-                                     session->images)) {
-            return false;
+#if !defined(__PSP__)
+        bool injected_refusal =
+            navigation_test_consume_same_document_relayout_refusal();
+        if (injected_refusal)
+            budget_inject_failure_after(session->budget, 0u);
+#endif
+        bool built = navigation_build_layout(
+            session, &next, session->fonts, session->images);
+#if !defined(__PSP__)
+        if (injected_refusal)
+            budget_clear_failure_injection(session->budget);
+#endif
+        if (!built) {
+            return navigation_relayout_failed(session, mutation_driven);
         }
         layout_transfer_scroll_state(&session->page.layout, &next);
         navigation_measure_damage(session, &session->page.layout, &next);
@@ -1035,7 +1089,7 @@ bool navigation_relayout(NavigationSession *session)
     stylesheet_destroy(&session->page.stylesheet);
     if (!navigation_build_stylesheet(session)) {
         session->page.loaded = false;
-        return false;
+        return navigation_relayout_failed(session, true);
     }
     /* Source the document URL from the committed page, not the history
        entry: a resource-driven rebuild must re-request external CSS even
@@ -1050,7 +1104,7 @@ bool navigation_relayout(NavigationSession *session)
                 &session->page.document, rebuild_url,
                 session->page.resource_base_url)) {
             session->page.loaded = false;
-            return false;
+            return navigation_relayout_failed(session, true);
         }
         images_destroy(&session->page.images);
         if (!stylesheets_load_external_tracked_with_context(
@@ -1066,13 +1120,13 @@ bool navigation_relayout(NavigationSession *session)
                 &session->page.stylesheet_resources,
                 &session->page.external_stylesheets)) {
             session->page.loaded = false;
-            return false;
+            return navigation_relayout_failed(session, true);
         }
         if (!navigation_dispatch_stylesheet_events(
                 session, session->page.resource_base_url)
             && !navigation_retire_exhausted_script_realms(session, false)) {
             session->page.loaded = false;
-            return false;
+            return navigation_relayout_failed(session, true);
         }
         navigation_ensure_layout_reuse(session);
         if (!images_load_external_reusing_layout_styles(
@@ -1088,7 +1142,7 @@ bool navigation_relayout(NavigationSession *session)
                 session->browser_session, session->page.layout_reuse,
                 session->fonts, session->viewport.css_width)) {
             session->page.loaded = false;
-            return false;
+            return navigation_relayout_failed(session, true);
         }
         session->images = &session->page.images;
     }
@@ -1097,17 +1151,28 @@ bool navigation_relayout(NavigationSession *session)
                                     session->user_css,
                                     session->user_css_length)) {
         session->page.loaded = false;
-        return false;
+        return navigation_relayout_failed(session, true);
     }
     if (session->web_fonts_enabled && rebuild_url != NULL
         && !navigation_load_web_fonts(session, rebuild_url)) {
         session->page.loaded = false;
-        return false;
+        return navigation_relayout_failed(session, true);
     }
-    if (!navigation_build_layout(session, &session->page.layout,
-                                 session->fonts, session->images)) {
+#if !defined(__PSP__)
+    bool injected_refusal =
+        navigation_test_consume_same_document_relayout_refusal();
+    if (injected_refusal)
+        budget_inject_failure_after(session->budget, 0u);
+#endif
+    bool built = navigation_build_layout(
+        session, &session->page.layout, session->fonts, session->images);
+#if !defined(__PSP__)
+    if (injected_refusal)
+        budget_clear_failure_injection(session->budget);
+#endif
+    if (!built) {
         session->page.loaded = false;
-        return false;
+        return navigation_relayout_failed(session, true);
     }
     session->resource_fingerprint = fingerprint;
     session->style_rebuild_required = false;
@@ -1303,6 +1368,20 @@ NavigationUserCssTransaction *navigation_apply_user_css_begin(
                 session->resource_timeout_ms,
                 session->page.resource_scheduler,
                 session->browser_session, &next_resources, &next_external);
+        if (!okay) {
+            /* Presentation overrides such as Reader mode must remain
+               available when optional author CSS was unavailable during the
+               original navigation (or has since fallen out of cache). Match
+               commit-time degradation instead of making the toggle depend
+               on re-fetching every author sheet. */
+            stylesheet_document_resources_destroy(&next_resources);
+            memset(&next_resources, 0, sizeof(next_resources));
+            memset(&next_external, 0, sizeof(next_external));
+            okay = navigation_build_usable_stylesheet_fallback(
+                &next_sheet, session->budget, &session->page.document,
+                &session->viewport);
+            if (okay) session->performance.stylesheet_pressure_fallbacks++;
+        }
     }
     if (okay && length != 0)
         okay = stylesheet_add_user_css(&next_sheet, copy, length);
@@ -2023,7 +2102,7 @@ static void navigation_accumulate_script_metrics(
 typedef struct {
     NavigationSession *session;
     PocDocument *document;
-    const NavigationEntry *entry;
+    const char *document_url;
     StreamingScriptState *state;
     NavigationScriptFrontierCallback frontier;
     void *frontier_opaque;
@@ -2152,7 +2231,7 @@ static void navigation_frontier_script_execute(
                            walk->script_index, true);
         }
         if (!navigation_document_resource_base(
-                walk->document, walk->entry->url,
+                walk->document, walk->document_url,
                 walk->session->page.resource_base_url)) {
             walk->failed = true;
             break;
@@ -2163,7 +2242,7 @@ static void navigation_frontier_script_execute(
                 walk->session->page.runtime, walk->session->budget,
                 walk->session->browser_session,
                 walk->session->page.resource_base_url,
-                walk->entry->url, walk->session->page.referrer_policy,
+                walk->document_url, walk->session->page.referrer_policy,
                 &walk->session->page.document.content_security_policy,
                 walk->maximum_scripts, walk->maximum_bytes,
                 walk->session->maximum_script_file_bytes,
@@ -2184,9 +2263,10 @@ bool navigation_execute_document_scripts_streaming_from(
 {
     if (session == NULL || document == NULL
         || !session->document_scripts_enabled) return true;
-    const NavigationEntry *entry = navigation_current(session);
+    const char *document_url = navigation_active_document_url(session);
     if (!session->page.loaded || session->page.runtime == NULL
-        || session->page.resource_scheduler == NULL || entry == NULL) {
+        || session->page.resource_scheduler == NULL
+        || document_url == NULL) {
         return false;
     }
     size_t remaining_scripts = session->script_discovered
@@ -2199,7 +2279,7 @@ bool navigation_execute_document_scripts_streaming_from(
     NavigationFrontierScriptWalk walk = {
         .session = session,
         .document = document,
-        .entry = entry,
+        .document_url = document_url,
         .state = &state,
         .frontier = frontier,
         .frontier_opaque = frontier_opaque,
@@ -2215,14 +2295,14 @@ bool navigation_execute_document_scripts_streaming_from(
     walk.script_handles = NULL;
     ExternalScriptMetrics metrics = {0};
     if (!navigation_document_resource_base(
-            document, entry->url, session->page.resource_base_url)) {
+            document, document_url, session->page.resource_base_url)) {
         return false;
     }
     script_runtime_invalidate_document_base(session->page.runtime);
     bool ok = snapshot_ok && !walk.failed && document_scripts_finish_streaming(
         document, session->page.runtime, session->budget,
         session->browser_session, session->page.resource_base_url,
-        entry->url,
+        document_url,
         session->page.referrer_policy, remaining_scripts, remaining_bytes,
         session->maximum_script_file_bytes, session->script_timeout_ms,
         session->page.resource_scheduler, &state, &metrics,
@@ -2230,6 +2310,8 @@ bool navigation_execute_document_scripts_streaming_from(
     session->performance.script_us += navigation_record_script_slices(
         session, started, &session->page.script_result,
         metrics.attempted + session->page.script_result.scripts_evaluated);
+    if (navigation_retire_failed_document_refresh(
+            session, session->page.runtime)) return false;
     if (!ok) {
         if (snapshot_ok) {
             snprintf(session->last_error, sizeof(session->last_error), "%s",
@@ -2253,7 +2335,7 @@ bool navigation_execute_document_scripts_streaming_from(
         session->page.runtime);
     bool relayout = static_shell_changed || runtime_relayout;
     return (!relayout || navigation_relayout(session))
-        && navigation_load_frames(session, entry->url);
+        && navigation_load_frames(session, document_url);
 }
 
 bool navigation_execute_document_scripts_from(
@@ -2261,9 +2343,10 @@ bool navigation_execute_document_scripts_from(
 {
     if (session == NULL || document == NULL
         || !session->document_scripts_enabled) return true;
-    const NavigationEntry *entry = navigation_current(session);
+    const char *document_url = navigation_active_document_url(session);
     if (!session->page.loaded || session->page.runtime == NULL
-        || session->page.resource_scheduler == NULL || entry == NULL) {
+        || session->page.resource_scheduler == NULL
+        || document_url == NULL) {
         return false;
     }
     size_t remaining_scripts = session->script_discovered
@@ -2275,14 +2358,14 @@ bool navigation_execute_document_scripts_from(
     ExternalScriptMetrics metrics = {0};
     uint64_t started = navigation_now_us();
     if (!navigation_document_resource_base(
-            document, entry->url, session->page.resource_base_url)) {
+            document, document_url, session->page.resource_base_url)) {
         return false;
     }
     script_runtime_invalidate_document_base(session->page.runtime);
     bool ok = document_scripts_execute(
         document, session->page.runtime, session->budget,
         session->browser_session, session->page.resource_base_url,
-        entry->url, session->page.referrer_policy,
+        document_url, session->page.referrer_policy,
         remaining_scripts, remaining_bytes,
         session->maximum_script_file_bytes, session->script_timeout_ms,
         session->page.resource_scheduler, &metrics,
@@ -2290,6 +2373,8 @@ bool navigation_execute_document_scripts_from(
     session->performance.script_us += navigation_record_script_slices(
         session, started, &session->page.script_result,
         metrics.attempted + session->page.script_result.scripts_evaluated);
+    if (navigation_retire_failed_document_refresh(
+            session, session->page.runtime)) return false;
     if (!ok) {
         snprintf(session->last_error, sizeof(session->last_error), "%s",
                  session->page.script_result.error[0] == '\0'
@@ -2311,16 +2396,17 @@ bool navigation_execute_document_scripts_from(
         session->page.runtime);
     bool relayout = static_shell_changed || runtime_relayout;
     if ((relayout && !navigation_relayout(session))
-        || !navigation_load_frames(session, entry->url)) return false;
+        || !navigation_load_frames(session, document_url)) return false;
     return true;
 }
 
 bool navigation_execute_current_body_scripts(NavigationSession *session)
 {
     if (session == NULL || !session->document_scripts_enabled) return true;
-    const NavigationEntry *entry = navigation_current(session);
+    const char *document_url = navigation_active_document_url(session);
     if (!session->page.loaded || session->page.runtime == NULL
-        || session->page.resource_scheduler == NULL || entry == NULL) {
+        || session->page.resource_scheduler == NULL
+        || document_url == NULL) {
         return false;
     }
     size_t remaining_scripts = session->script_discovered
@@ -2332,13 +2418,13 @@ bool navigation_execute_current_body_scripts(NavigationSession *session)
     ExternalScriptMetrics metrics = {0};
     uint64_t started = navigation_now_us();
     if (!navigation_document_resource_base(
-            &session->page.document, entry->url,
+            &session->page.document, document_url,
             session->page.resource_base_url)) return false;
     script_runtime_invalidate_document_base(session->page.runtime);
     bool ok = document_body_scripts_execute(
         &session->page.document, session->page.runtime, session->budget,
         session->browser_session, session->page.resource_base_url,
-        entry->url, session->page.referrer_policy,
+        document_url, session->page.referrer_policy,
         remaining_scripts, remaining_bytes,
         session->maximum_script_file_bytes, session->script_timeout_ms,
         session->page.resource_scheduler, &metrics,
@@ -2346,6 +2432,8 @@ bool navigation_execute_current_body_scripts(NavigationSession *session)
     session->performance.script_us += navigation_record_script_slices(
         session, started, &session->page.script_result,
         metrics.attempted + session->page.script_result.scripts_evaluated);
+    if (navigation_retire_failed_document_refresh(
+            session, session->page.runtime)) return false;
     if (!ok) {
         snprintf(session->last_error, sizeof(session->last_error), "%s",
                  session->page.script_result.error[0] == '\0'
@@ -2551,9 +2639,12 @@ bool navigation_advance_runtime(NavigationSession *session,
     uint64_t runtime_started = navigation_now_us();
     size_t heap_rejections_before = script_runtime_heap_rejections(
         session->page.runtime);
-    if (!script_runtime_advance(session->page.runtime, elapsed_ms,
-                                callback_budget,
-                                &session->page.script_result)) {
+    bool advanced = script_runtime_advance(
+        session->page.runtime, elapsed_ms, callback_budget,
+        &session->page.script_result);
+    if (navigation_retire_failed_document_refresh(
+            session, session->page.runtime)) return false;
+    if (!advanced) {
         capture_cached_script_error(session,
                                     session->page.script_result.error);
         /*
@@ -2649,9 +2740,9 @@ bool navigation_advance_runtime(NavigationSession *session,
                    : session->page.script_result.error);
         return false;
     }
-    const NavigationEntry *current_entry = navigation_current(session);
-    if (session->document_scripts_enabled && current_entry != NULL
-        && !navigation_load_frames(session, current_entry->url)) {
+    const char *current_url = navigation_active_document_url(session);
+    if (session->document_scripts_enabled && current_url != NULL
+        && !navigation_load_frames(session, current_url)) {
         snprintf(session->last_error, sizeof(session->last_error),
                  "dynamic frame loading failed: %.440s",
                  session->page.script_result.error);
@@ -2670,9 +2761,12 @@ bool navigation_advance_runtime(NavigationSession *session,
     for (size_t i = 0; i < session->page.frame_count; i++) {
         NavigationFrame *frame = &session->page.frames[i];
         if (!frame->loaded || frame->runtime == NULL) continue;
-        if (!script_runtime_advance(frame->runtime, elapsed_ms,
-                                    callback_budget,
-                                    &frame->script_result)) {
+        bool frame_advanced = script_runtime_advance(
+            frame->runtime, elapsed_ms, callback_budget,
+            &frame->script_result);
+        if (navigation_retire_failed_document_refresh(
+                session, frame->runtime)) return false;
+        if (!frame_advanced) {
             collect_stack_source_context(frame, frame->script_result.error);
             if (session->trace_frame_capabilities) {
                 char name[64] = {0};
@@ -2697,6 +2791,11 @@ bool navigation_advance_runtime(NavigationSession *session,
                      "frame scheduler failed: %.470s",
                      frame->script_result.error);
             return false;
+        }
+        if (script_runtime_consume_relayout(frame->runtime)) {
+            bool frame_presented = navigation_refresh_frame_presentation(
+                session, frame);
+            if (!frame_presented && !session->page.loaded) return false;
         }
         if (getenv("TILEFINCH_TRACE_CALLBACK_SOURCE") != NULL
             && frame->callback_error_source_context[0] == '\0'
@@ -2736,13 +2835,13 @@ bool navigation_advance_runtime(NavigationSession *session,
                      sizeof(session->previous_page_trace), "%s",
                      session->last_page_trace);
         }
-        const NavigationEntry *current = navigation_current(session);
-        if (current != NULL) {
+        const char *current_url = navigation_active_document_url(session);
+        if (current_url != NULL) {
             snprintf(session->pending_navigation_referer,
                      sizeof(session->pending_navigation_referer), "%s",
-                     current->url);
+                     current_url);
             session->pending_navigation_same_origin =
-                navigation_same_origin(current->url, navigation_url);
+                navigation_same_origin(current_url, navigation_url);
         }
         uint64_t generation = navigation_begin(session);
         session->performance.runtime_us += navigation_record_slice(
@@ -2805,7 +2904,11 @@ bool navigation_dispatch_event(NavigationSession *session,
     if (session == NULL || session->page.runtime == NULL
         || !session->page.loaded) return false;
     if (!script_runtime_dispatch(session->page.runtime, selector, event_type,
-                                 &session->page.script_result)) return false;
+                                 &session->page.script_result)) {
+        (void) navigation_retire_failed_document_refresh(
+            session, session->page.runtime);
+        return false;
+    }
     int scroll_y = 0;
     if (script_runtime_consume_scroll(session->page.runtime, &scroll_y)) {
         int maximum = navigation_max_scroll(session);
@@ -2823,6 +2926,8 @@ bool navigation_dispatch_node_event(NavigationSession *session,
         || !session->page.loaded || node == NULL) return false;
     if (!script_runtime_dispatch_node(session->page.runtime, node, event_type,
                                       &session->page.script_result)) {
+        (void) navigation_retire_failed_document_refresh(
+            session, session->page.runtime);
         return false;
     }
     int scroll_y = 0;
@@ -2841,6 +2946,8 @@ bool navigation_dispatch_node_activation(NavigationSession *session,
         || !session->page.loaded || node == NULL) return false;
     if (!script_runtime_dispatch_activation_node(
             session->page.runtime, node, &session->page.script_result)) {
+        (void) navigation_retire_failed_document_refresh(
+            session, session->page.runtime);
         return false;
     }
     int scroll_y = 0;
@@ -2850,6 +2957,109 @@ bool navigation_dispatch_node_activation(NavigationSession *session,
     }
     return !script_runtime_consume_relayout(session->page.runtime)
            || navigation_relayout(session);
+}
+
+bool navigation_activate_frame(NavigationSession *session,
+                               lxb_dom_node_t *frame_element)
+{
+    if (session == NULL || frame_element == NULL
+        || !session->page.loaded) return false;
+    NavigationFrame *frame = NULL;
+    for (size_t i = 0; i < session->page.frame_count; i++) {
+        NavigationFrame *candidate = &session->page.frames[i];
+        if (!candidate->retired && candidate->loaded
+            && candidate->runtime != NULL
+            && candidate->presentation != NULL
+            && candidate->element == frame_element) {
+            frame = candidate;
+            break;
+        }
+    }
+    if (frame == NULL) return false;
+    bool trace_frame_controls =
+        getenv("TILEFINCH_TRACE_FRAME_MESSAGES") != NULL;
+    lxb_dom_node_t *target = NULL;
+    for (size_t depth = 0; depth < NAVIGATION_FRAME_LIMIT; depth++) {
+        const LayoutDocument *layout = &frame->presentation->layout;
+        const ControlRegion *nested_region = NULL;
+        uint64_t nested_area = 0;
+        if (trace_frame_controls) {
+            fprintf(stderr,
+                    "frame-activation-controls frame=%zu depth=%zu "
+                    "controls=%zu links=%zu\n",
+                    (size_t) (frame - session->page.frames), depth,
+                    layout->control_count, layout->link_count);
+        }
+        for (size_t i = 0; i < layout->control_count; i++) {
+            const ControlRegion *control = &layout->controls[i];
+            if (trace_frame_controls) {
+                size_t name_length = 0, type_length = 0, role_length = 0,
+                       id_length = 0;
+                const char *name = document_element_name(
+                    control->node, &name_length);
+                const char *type = document_attribute(
+                    control->node, "type", &type_length);
+                const char *role = document_attribute(
+                    control->node, "role", &role_length);
+                const char *id = document_attribute(
+                    control->node, "id", &id_length);
+                fprintf(stderr,
+                        "frame-activation-control index=%zu kind=%u "
+                        "rect=%d,%d,%d,%d tag=\"%.*s\" type=\"%.*s\" "
+                        "role=\"%.*s\" id=\"%.*s\"\n",
+                        i, (unsigned) control->type, control->x, control->y,
+                        control->width, control->height,
+                        (int) name_length, name == NULL ? "" : name,
+                        (int) type_length, type == NULL ? "" : type,
+                        (int) role_length, role == NULL ? "" : role,
+                        (int) id_length, id == NULL ? "" : id);
+            }
+            if (control->node == NULL || control->width <= 0
+                || control->height <= 0
+                || control->type == CONTROL_RESIZE) continue;
+            if (control->type == CONTROL_FRAME) {
+                uint64_t area = (uint64_t) (unsigned) control->width
+                              * (uint64_t) (unsigned) control->height;
+                if (area > nested_area) {
+                    nested_area = area;
+                    nested_region = control;
+                }
+                continue;
+            }
+            target = control->node;
+            if (control->type == CONTROL_TOGGLE) break;
+        }
+        if (target != NULL) break;
+        if (nested_region == NULL) return false;
+        NavigationFrame *nested = NULL;
+        for (size_t i = 0; i < session->page.frame_count; i++) {
+            NavigationFrame *candidate = &session->page.frames[i];
+            if (!candidate->retired && candidate->loaded
+                && candidate->runtime != NULL
+                && candidate->presentation != NULL
+                && candidate->parent_runtime == frame->runtime
+                && candidate->element == nested_region->node) {
+                nested = candidate;
+                break;
+            }
+        }
+        if (nested == NULL) return false;
+        frame = nested;
+    }
+    if (target == NULL) return false;
+    if (!script_runtime_dispatch_activation_node(
+            frame->runtime, target, &frame->script_result)) {
+        (void) navigation_retire_failed_document_refresh(
+            session, frame->runtime);
+        return false;
+    }
+    bool relayout = script_runtime_consume_relayout(frame->runtime);
+    if (relayout) {
+        bool frame_presented = navigation_refresh_frame_presentation(
+            session, frame);
+        if (!frame_presented && !session->page.loaded) return false;
+    }
+    return navigation_deliver_frame_messages(session);
 }
 
 bool navigation_dispatch_node_pointer(
@@ -2862,6 +3072,8 @@ bool navigation_dispatch_node_pointer(
     if (!script_runtime_dispatch_pointer_node(
         session->page.runtime, node, phase, client_x, client_y,
             offset_x, offset_y, buttons, &session->page.script_result)) {
+        (void) navigation_retire_failed_document_refresh(
+            session, session->page.runtime);
         return false;
     }
     int scroll_y = 0;
@@ -2885,7 +3097,11 @@ bool navigation_dispatch_node_input_event(NavigationSession *session,
     if (!script_runtime_dispatch_input_node(
             session->page.runtime, node, event_type, data, input_type,
             current_value,
-            &session->page.script_result)) return false;
+            &session->page.script_result)) {
+        (void) navigation_retire_failed_document_refresh(
+            session, session->page.runtime);
+        return false;
+    }
     return !script_runtime_consume_relayout(session->page.runtime)
            || navigation_relayout(session);
 }
@@ -2900,7 +3116,11 @@ bool navigation_dispatch_node_submit_event(NavigationSession *session,
     }
     if (!script_runtime_dispatch_submit_node(
             session->page.runtime, form, submitter,
-            &session->page.script_result)) return false;
+            &session->page.script_result)) {
+        (void) navigation_retire_failed_document_refresh(
+            session, session->page.runtime);
+        return false;
+    }
     return !script_runtime_consume_relayout(session->page.runtime)
            || navigation_relayout(session);
 }
@@ -2928,6 +3148,8 @@ bool navigation_evaluate_external_script(NavigationSession *session,
     bool evaluated = script_runtime_evaluate_external(
         session->page.runtime, script_node, source, source_length,
         source_url, &session->page.script_result);
+    if (navigation_retire_failed_document_refresh(
+            session, session->page.runtime)) return false;
     bool relayout_ok = !script_runtime_consume_relayout(session->page.runtime)
                        || navigation_relayout(session);
     return evaluated && relayout_ok;

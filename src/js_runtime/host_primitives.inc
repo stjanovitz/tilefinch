@@ -75,15 +75,24 @@ static JSValue js_stylesheet_has_motion_keyframes(
 static double performance_clock_value(DomBridge *bridge, bool advance,
                                       ScriptDeterministicClockSource source)
 {
+    /* High Resolution Time deliberately coarsens non-isolated realms to a
+       100us clock.  Tilefinch does not expose cross-origin isolation, so
+       publishing the host/PSP nanosecond clock here both fingerprints the
+       device and gives page code a stronger timing side channel than a
+       normal browser.  Do the reduction in integer space so repeated reads
+       stay monotonic and never round up beyond the sampled host time.  The
+       deterministic replay clock is an explicit test/capture contract and
+       retains its one-millisecond call quantum. */
+    static const uint64_t performance_quantum_ns = UINT64_C(100000);
     bool deterministic = bridge != NULL && bridge->deterministic_clock;
     uint64_t current = deterministic
         ? bridge->clock_monotonic_elapsed_ms : js_rt_monotonic_time_ns();
-    double elapsed = deterministic
-        ? (double) current
-        : (bridge == NULL || current < bridge->performance_origin_ns
-           ? 0.0
-           : (double) (current - bridge->performance_origin_ns)
-             / 1000000.0);
+    double elapsed = 0.0;
+    if (deterministic) elapsed = (double) current;
+    else if (bridge != NULL && current >= bridge->performance_origin_ns) {
+        uint64_t elapsed_ns = current - bridge->performance_origin_ns;
+        elapsed = (double) (elapsed_ns / performance_quantum_ns) / 10.0;
+    }
     if (deterministic) {
         clock_increment(&bridge->clock_source_counts[source]);
         if (advance
@@ -279,6 +288,14 @@ static JSValue js_request_navigation(JSContext *context,
     bridge->navigation_requested = true;
     bridge->navigation_replace = argc > 1
                                  && JS_ToBool(context, argv[1]) > 0;
+#if !defined(TILEFINCH_NO_TRACE)
+    if (getenv("TILEFINCH_TRACE_NAVIGATION_REQUESTS") != NULL) {
+        fprintf(stderr,
+                "tilefinch-script-navigation: replace=%d url=\"%s\"\n",
+                bridge->navigation_replace ? 1 : 0,
+                bridge->navigation_url);
+    }
+#endif
     JS_FreeCString(context, url);
     return JS_UNDEFINED;
 }
@@ -724,6 +741,74 @@ static JSValue js_storage_available(JSContext *context,
                                && !bridge->opaque_origin);
 }
 
+static JSValue js_storage_estimate(JSContext *context,
+                                   JSValueConst this_value,
+                                   int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    BrowserSiteDataUsage usage = {0};
+    if (bridge == NULL || bridge->session == NULL || bridge->opaque_origin
+        || !browser_session_site_data_usage(
+               bridge->session, bridge->document_url, &usage)) {
+        return JS_NULL;
+    }
+    size_t quota = bridge->session->maximum_storage_bytes;
+    if (quota < usage.storage_bytes) quota = usage.storage_bytes;
+    JSValue values = JS_NewArray(context);
+    if (JS_IsException(values)) return values;
+    if (JS_SetPropertyUint32(
+            context, values, 0,
+            JS_NewInt64(context, (int64_t) usage.storage_bytes)) < 0
+        || JS_SetPropertyUint32(
+               context, values, 1,
+               JS_NewInt64(context, (int64_t) quota)) < 0) {
+        JS_FreeValue(context, values);
+        return JS_EXCEPTION;
+    }
+    return values;
+}
+
+static JSValue js_heap_memory_snapshot(JSContext *context,
+                                       JSValueConst this_value,
+                                       int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *runtime = bridge == NULL ? NULL : bridge->host;
+    if (runtime == NULL || runtime->quickjs_pool == NULL) return JS_NULL;
+    size_t limit = runtime->base_memory_limit;
+    if (runtime->boot_window_active) {
+        limit = runtime->boot_window_bytes > SIZE_MAX - limit
+            ? SIZE_MAX : limit + runtime->boot_window_bytes;
+    }
+    size_t used = budget_quickjs_pool_js_malloc_current(
+        runtime->quickjs_pool);
+    size_t total = budget_quickjs_pool_reserved_current(
+        runtime->quickjs_pool);
+    if (total < used) total = used;
+    if (limit < total) limit = total;
+    JSValue values = JS_NewArray(context);
+    if (JS_IsException(values)) return values;
+    if (JS_SetPropertyUint32(
+            context, values, 0,
+            JS_NewInt64(context, (int64_t) limit)) < 0
+        || JS_SetPropertyUint32(
+               context, values, 1,
+               JS_NewInt64(context, (int64_t) total)) < 0
+        || JS_SetPropertyUint32(
+               context, values, 2,
+               JS_NewInt64(context, (int64_t) used)) < 0) {
+        JS_FreeValue(context, values);
+        return JS_EXCEPTION;
+    }
+    return values;
+}
+
 static JSValue js_storage_set(JSContext *context, JSValueConst this_value,
                               int argc, JSValueConst *argv)
 {
@@ -977,6 +1062,21 @@ static JSValue js_current_document_url(JSContext *context,
     return JS_NewString(context, bridge->document_url);
 }
 
+static JSValue js_secure_context(JSContext *context,
+                                 JSValueConst this_value,
+                                 int argc, JSValueConst *argv)
+{
+    (void) this_value; (void) argc; (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    /* Bind the answer to the native document identity.  Page script can
+       replace or poison Location accessors, but it cannot promote an
+       untrustworthy transport into a secure context. */
+    return JS_NewBool(context,
+                      bridge != NULL && bridge->document_url != NULL
+                      && tilefinch_url_potentially_trustworthy(
+                             bridge->document_url));
+}
+
 static JSValue js_document_url_revision(JSContext *context,
                                         JSValueConst this_value,
                                         int argc, JSValueConst *argv)
@@ -1101,6 +1201,199 @@ static JSValue js_crypto_digest_sha256(JSContext *context,
     return JS_NewArrayBufferCopy(context, digest, sizeof(digest));
 }
 
+#define SCRIPT_COMPRESSION_INPUT_LIMIT (1024u * 1024u)
+#define SCRIPT_COMPRESSION_OUTPUT_LIMIT \
+    (SCRIPT_COMPRESSION_INPUT_LIMIT + 64u * 1024u)
+
+static voidpf js_compression_allocate(voidpf opaque, uInt items, uInt size)
+{
+    Budget *budget = opaque;
+    if (budget == NULL || (size != 0u && items > SIZE_MAX / size)) return NULL;
+    return budget_calloc_category(
+        budget, BUDGET_CATEGORY_JAVASCRIPT, items, size);
+}
+
+static void js_compression_free(voidpf opaque, voidpf address)
+{
+    if (opaque != NULL) budget_free(opaque, address);
+}
+
+static bool js_compression_buffer_source(
+    JSContext *context, JSValueConst value, const uint8_t **bytes,
+    size_t *length, JSValue *owner)
+{
+    *owner = JS_UNDEFINED;
+    *length = 0;
+    *bytes = JS_GetArrayBuffer(context, length, value);
+    if (*bytes != NULL) return true;
+    JSValue exception = JS_GetException(context);
+    JS_FreeValue(context, exception);
+    size_t offset = 0, view_length = 0, element_bytes = 0;
+    JSValue buffer = JS_GetTypedArrayBuffer(
+        context, value, &offset, &view_length, &element_bytes);
+    (void) element_bytes;
+    if (JS_IsException(buffer)) return false;
+    size_t buffer_length = 0;
+    uint8_t *buffer_bytes = JS_GetArrayBuffer(
+        context, &buffer_length, buffer);
+    if ((buffer_bytes == NULL && buffer_length != 0)
+        || offset > buffer_length || view_length > buffer_length - offset) {
+        JS_FreeValue(context, buffer);
+        return false;
+    }
+    *bytes = buffer_bytes == NULL ? NULL : buffer_bytes + offset;
+    *length = view_length;
+    *owner = buffer;
+    return true;
+}
+
+static int js_compression_window_bits(const char *format, size_t length)
+{
+    if (length == 7 && memcmp(format, "deflate", 7) == 0)
+        return MAX_WBITS;
+    if (length == 11 && memcmp(format, "deflate-raw", 11) == 0)
+        return -MAX_WBITS;
+    if (length == 4 && memcmp(format, "gzip", 4) == 0)
+        return MAX_WBITS + 16;
+    return 0;
+}
+
+/* CompressionStream is installed lazily by streams.js.  This native seam is
+   deliberately one-shot: the JavaScript facade owns a bounded list of input
+   chunks and calls here only from flush().  That keeps zlib state out of the
+   page lifecycle while replacing multi-million-opcode JavaScript codec
+   fallbacks with a charged, bounded native operation. */
+static JSValue js_compression_run(JSContext *context,
+                                  JSValueConst this_value,
+                                  int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    int32_t decompress = 0;
+    if (argc < 3 || JS_ToInt32(context, &decompress, argv[0]) < 0)
+        return JS_ThrowTypeError(context, "compression operation is required");
+    size_t format_length = 0;
+    const char *format = JS_ToCStringLen(
+        context, &format_length, argv[1]);
+    if (format == NULL) return JS_EXCEPTION;
+    int window_bits = js_compression_window_bits(format, format_length);
+    JS_FreeCString(context, format);
+    if (window_bits == 0 || (decompress != 0 && decompress != 1))
+        return JS_ThrowTypeError(context, "unsupported compression format");
+
+    const uint8_t *input = NULL;
+    size_t input_length = 0;
+    JSValue input_owner = JS_UNDEFINED;
+    if (!js_compression_buffer_source(
+            context, argv[2], &input, &input_length, &input_owner)) {
+        return JS_ThrowTypeError(context,
+                                 "compression input must be a BufferSource");
+    }
+    if (input_length > SCRIPT_COMPRESSION_INPUT_LIMIT) {
+        JS_FreeValue(context, input_owner);
+        return JS_ThrowRangeError(context,
+                                  "compression input exceeds bounded size");
+    }
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->budget == NULL) {
+        JS_FreeValue(context, input_owner);
+        return JS_ThrowInternalError(context,
+                                     "compression runtime is detached");
+    }
+
+    z_stream stream;
+    memset(&stream, 0, sizeof(stream));
+    stream.zalloc = js_compression_allocate;
+    stream.zfree = js_compression_free;
+    stream.opaque = bridge->budget;
+    int status = decompress
+        ? inflateInit2(&stream, window_bits)
+        : deflateInit2(&stream, Z_BEST_SPEED, Z_DEFLATED, window_bits,
+                       MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY);
+    if (status != Z_OK) {
+        JS_FreeValue(context, input_owner);
+        return status == Z_MEM_ERROR ? JS_ThrowOutOfMemory(context)
+                                     : JS_ThrowInternalError(
+                                           context,
+                                           "could not initialize compression");
+    }
+
+    size_t capacity = 0;
+    if (decompress) {
+        capacity = input_length > 16u * 1024u
+            ? input_length : 16u * 1024u;
+        if (capacity > SCRIPT_COMPRESSION_OUTPUT_LIMIT)
+            capacity = SCRIPT_COMPRESSION_OUTPUT_LIMIT;
+    } else {
+        uLong bound = deflateBound(&stream, (uLong) input_length);
+        capacity = (size_t) bound;
+        if (capacity < 64u) capacity = 64u;
+    }
+    uint8_t *output = capacity <= SCRIPT_COMPRESSION_OUTPUT_LIMIT
+        ? budget_malloc_category(bridge->budget,
+                                 BUDGET_CATEGORY_JAVASCRIPT, capacity)
+        : NULL;
+    if (output == NULL) {
+        if (decompress) (void) inflateEnd(&stream);
+        else (void) deflateEnd(&stream);
+        JS_FreeValue(context, input_owner);
+        return capacity > SCRIPT_COMPRESSION_OUTPUT_LIMIT
+            ? JS_ThrowRangeError(context,
+                                 "compressed output exceeds bounded size")
+            : JS_ThrowOutOfMemory(context);
+    }
+
+    stream.next_in = (Bytef *) input;
+    stream.avail_in = (uInt) input_length;
+    stream.next_out = output;
+    stream.avail_out = (uInt) capacity;
+    size_t used = 0;
+    bool complete = false;
+    bool refused = false;
+    for (size_t turn = 0; turn < 32u; turn++) {
+        status = decompress ? inflate(&stream, Z_NO_FLUSH)
+                            : deflate(&stream, Z_FINISH);
+        used = capacity - stream.avail_out;
+        if (status == Z_STREAM_END) {
+            complete = stream.avail_in == 0;
+            break;
+        }
+        if (status != Z_OK || !decompress || stream.avail_out != 0) break;
+        if (capacity == SCRIPT_COMPRESSION_OUTPUT_LIMIT) {
+            refused = true;
+            break;
+        }
+        size_t grown = capacity > SCRIPT_COMPRESSION_OUTPUT_LIMIT / 2u
+            ? SCRIPT_COMPRESSION_OUTPUT_LIMIT : capacity * 2u;
+        uint8_t *replacement = budget_realloc_category(
+            bridge->budget, BUDGET_CATEGORY_JAVASCRIPT, output, grown);
+        if (replacement == NULL) {
+            refused = true;
+            break;
+        }
+        output = replacement;
+        capacity = grown;
+        stream.next_out = output + used;
+        stream.avail_out = (uInt) (capacity - used);
+    }
+    if (decompress) (void) inflateEnd(&stream);
+    else (void) deflateEnd(&stream);
+    JS_FreeValue(context, input_owner);
+
+    JSValue result = JS_EXCEPTION;
+    if (complete) {
+        result = JS_NewArrayBufferCopy(context, output, used);
+    } else if (refused || status == Z_MEM_ERROR) {
+        result = refused
+            ? JS_ThrowRangeError(context,
+                                 "decompressed output exceeds bounded size")
+            : JS_ThrowOutOfMemory(context);
+    } else {
+        result = JS_ThrowTypeError(context, "invalid compressed data");
+    }
+    budget_free(bridge->budget, output);
+    return result;
+}
+
 static JSValue js_base64_encode_bytes(JSContext *context,
                                       JSValueConst this_value,
                                       int argc, JSValueConst *argv)
@@ -1156,26 +1449,10 @@ static int base64_digit(unsigned char value)
     return -1;
 }
 
-static JSValue new_latin1_string(JSContext *context, const uint8_t *input,
-                                 size_t length)
+static bool base64_whitespace(unsigned char value)
 {
-    if (length > SIZE_MAX / 2u) return JS_EXCEPTION;
-    size_t capacity = length * 2u;
-    char *utf8 = js_malloc(context, capacity == 0 ? 1 : capacity);
-    if (utf8 == NULL) return JS_EXCEPTION;
-    size_t output = 0;
-    for (size_t index = 0; index < length; index++) {
-        uint8_t value = input[index];
-        if (value < 0x80u) {
-            utf8[output++] = (char) value;
-        } else {
-            utf8[output++] = (char) (0xc0u | (value >> 6));
-            utf8[output++] = (char) (0x80u | (value & 0x3fu));
-        }
-    }
-    JSValue result = JS_NewStringLen(context, utf8, output);
-    js_free(context, utf8);
-    return result;
+    return value == '\t' || value == '\n' || value == '\f'
+        || value == '\r' || value == ' ';
 }
 
 static JSValue js_base64_decode_string(JSContext *context,
@@ -1187,46 +1464,93 @@ static JSValue js_base64_decode_string(JSContext *context,
     size_t length = 0;
     const char *input = JS_ToCStringLen(context, &length, argv[0]);
     if (input == NULL) return JS_EXCEPTION;
-    if (length > 768u * 1024u || length % 4u == 1u) {
+    if (length > 1024u * 1024u) {
         JS_FreeCString(context, input);
         return JS_ThrowRangeError(context,
                                   "base64 input exceeds bounded size");
     }
-    size_t output_capacity = (length / 4u) * 3u
-                             + (length % 4u == 0 ? 0u
-                                : length % 4u - 1u);
-    uint8_t *output = js_malloc(context, output_capacity == 0
-                                         ? 1 : output_capacity);
-    if (output == NULL) {
+    size_t digit_count = 0, padding = 0;
+    bool padding_started = false, valid = true;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char value = (unsigned char) input[i];
+        if (base64_whitespace(value)) continue;
+        if (value == '=') {
+            padding_started = true;
+            if (++padding > 2u) valid = false;
+        } else if (base64_digit(value) < 0 || padding_started) {
+            valid = false;
+        } else {
+            digit_count++;
+        }
+    }
+    size_t remainder = digit_count % 4u;
+    if ((padding == 0 && remainder == 1u)
+        || (padding != 0
+            && ((digit_count + padding) % 4u != 0u
+                || (padding == 1u && remainder != 3u)
+                || (padding == 2u && remainder != 2u)))) {
+        valid = false;
+    }
+    if (!valid) {
+        JS_FreeCString(context, input);
+        return JS_ThrowTypeError(context, "invalid base64 input");
+    }
+    size_t output_capacity = (digit_count / 4u) * 3u
+                             + (remainder == 0u ? 0u : remainder - 1u);
+    uint8_t *output = NULL;
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    JSValue result = JS_NewStringLenLatin1UninitializedPortable(
+        context, output_capacity, &output);
+    if (JS_IsException(result)) {
         JS_FreeCString(context, input);
         return JS_EXCEPTION;
     }
-    size_t source = 0, destination = 0;
-    bool valid = true;
-    while (source < length) {
-        int a = base64_digit((unsigned char) input[source++]);
-        int b = source < length
-              ? base64_digit((unsigned char) input[source++]) : -1;
-        bool has_c = source < length;
-        int c = has_c ? base64_digit((unsigned char) input[source++]) : -1;
-        bool has_d = source < length;
-        int d = has_d ? base64_digit((unsigned char) input[source++]) : -1;
-        if (a < 0 || b < 0 || (has_c && c < 0) || (has_d && d < 0)) {
-            valid = false;
-            break;
+#else
+    JSValue result = JS_UNDEFINED;
+    if (output_capacity != 0) {
+        output = js_malloc(context, output_capacity);
+        if (output == NULL) {
+            JS_FreeCString(context, input);
+            return JS_EXCEPTION;
         }
-        uint32_t packed = ((uint32_t) a << 18)
-                        | ((uint32_t) b << 12)
-                        | ((uint32_t) (c < 0 ? 0 : c) << 6)
-                        | (uint32_t) (d < 0 ? 0 : d);
-        output[destination++] = (uint8_t) (packed >> 16);
-        if (c >= 0) output[destination++] = (uint8_t) (packed >> 8);
-        if (d >= 0) output[destination++] = (uint8_t) packed;
     }
-    JSValue result = valid
-        ? new_latin1_string(context, output, destination)
-        : JS_ThrowTypeError(context, "invalid base64 input");
-    js_free(context, output);
+#endif
+    size_t destination = 0;
+    uint32_t packed = 0;
+    unsigned group = 0;
+    for (size_t source = 0; source < length; source++) {
+        unsigned char value = (unsigned char) input[source];
+        if (base64_whitespace(value) || value == '=') continue;
+        packed = (packed << 6) | (uint32_t) base64_digit(value);
+        if (++group == 4u) {
+            output[destination++] = (uint8_t) (packed >> 16);
+            output[destination++] = (uint8_t) (packed >> 8);
+            output[destination++] = (uint8_t) packed;
+            packed = 0;
+            group = 0;
+        }
+    }
+    if (group == 2u) {
+        output[destination++] = (uint8_t) (packed >> 4);
+    } else if (group == 3u) {
+        output[destination++] = (uint8_t) (packed >> 10);
+        output[destination++] = (uint8_t) (packed >> 2);
+    }
+    if (destination != output_capacity) {
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+        JS_FreeValue(context, result);
+#else
+        js_free(context, output);
+#endif
+        result = JS_ThrowTypeError(context, "invalid base64 input");
+#if !defined(PSP_BROWSER_BELLARD_QUICKJS)
+    } else {
+        result = JS_NewStringLen(
+            context, output_capacity == 0 ? "" : (const char *) output,
+            output_capacity);
+        js_free(context, output);
+#endif
+    }
     JS_FreeCString(context, input);
     return result;
 }
@@ -1260,17 +1584,39 @@ static JSValue js_callback_checkpoint(JSContext *context,
                                       int argc, JSValueConst *argv)
 {
     (void) this_value;
-    (void) argc;
-    (void) argv;
     DomBridge *bridge = JS_GetContextOpaque(context);
     if (bridge == NULL || bridge->host == NULL)
         return JS_ThrowInternalError(context, "callback runtime unavailable");
     if (js_rt_runtime_callback_checkpoint(bridge->host))
         return JS_UNDEFINED;
-    JSValue exception = JS_ThrowInternalError(
-        context, "callback interrupted at task boundary");
+    char task[97] = {0};
+    if (argc > 0 && JS_IsString(argv[0])) {
+        size_t length = 0;
+        const char *value = JS_ToCStringLen(context, &length, argv[0]);
+        if (value != NULL) {
+            if (length >= sizeof(task)) length = sizeof(task) - 1u;
+            memcpy(task, value, length);
+            task[length] = '\0';
+            JS_FreeCString(context, value);
+        } else {
+            JSValue secondary = JS_GetException(context);
+            JS_FreeValue(context, secondary);
+        }
+    }
+    char message[160];
+    snprintf(message, sizeof(message),
+             "callback interrupted at task boundary%s%s",
+             task[0] == '\0' ? "" : ": ", task);
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    JSValue exception = JS_ThrowInternalError(context, "%s", message);
     JS_SetUncatchableException(context, true);
     return exception;
+#else
+    JSValue exception = JS_NewInternalError(context, "%s", message);
+    if (JS_IsException(exception)) return exception;
+    JS_SetUncatchableError(context, exception);
+    return JS_Throw(context, exception);
+#endif
 }
 
 /* Event-handler attributes are script, but they are not eval().  Compile the

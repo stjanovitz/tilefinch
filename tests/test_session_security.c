@@ -33,6 +33,25 @@ static int test_security_site_state(Budget *budget)
     BrowserSession session;
     char output[TILEFINCH_URL_SERIALIZED_LIMIT];
     CHECK(browser_session_init(&session, budget, 32u * 1024u));
+    char hint_tokens[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = "stale";
+    char hint_origin[BROWSER_ORIGIN_LIMIT] = "stale";
+    CHECK(!browser_session_client_hints_get(
+              &session, "https://hints.test/first",
+              hint_tokens, sizeof(hint_tokens),
+              hint_origin, sizeof(hint_origin))
+          && hint_tokens[0] == '\0' && hint_origin[0] == '\0'
+          && browser_session_client_hints_put(
+              &session, "https://hints.test/first",
+              "Sec-CH-UA-Arch, Sec-CH-UA-Bitness")
+          && browser_session_client_hints_get(
+              &session, "https://hints.test/another/path",
+              hint_tokens, sizeof(hint_tokens),
+              hint_origin, sizeof(hint_origin))
+          && strcmp(hint_tokens,
+                    "Sec-CH-UA-Arch, Sec-CH-UA-Bitness") == 0
+          && strcmp(hint_origin, "https://hints.test") == 0
+          && !browser_session_client_hints_put(
+              &session, "http://untrustworthy.test/", "Sec-CH-UA-Arch"));
     CHECK(!browser_session_mixed_content_site_allowed(
               &session, "https://page.test/")
           && browser_session_set_mixed_content_site_allowed(
@@ -1560,6 +1579,7 @@ int main(void)
                     + sizeof(expiry_session.cache)
                     + sizeof(expiry_session.site_adapter_state)
                     + sizeof(expiry_session.site_adapter_document_cache)
+                    + sizeof(expiry_session.client_hints)
           && budget.external_reserved == expiry_session.accounting_bytes
           && budget_categories_reconcile(&budget));
     for (size_t i = 0; i < BROWSER_COOKIE_ENTRIES; i++) {

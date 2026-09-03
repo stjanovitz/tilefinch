@@ -514,7 +514,7 @@ static const char *ui_search_engine_name(BrowserSearchEngine engine)
 {
     switch (engine) {
         case BROWSER_SEARCH_BING: return "Bing";
-        case BROWSER_SEARCH_DUCKDUCKGO: return "DuckDuckGo";
+        case BROWSER_SEARCH_DUCKDUCKGO: return "DuckDuckGo Lite";
         case BROWSER_SEARCH_GOOGLE:
         default: return "Google";
     }

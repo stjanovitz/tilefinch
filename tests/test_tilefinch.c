@@ -382,6 +382,75 @@ static bool test_parser_scripting_noscript_model(Budget *budget)
     return ok;
 }
 
+static bool test_parser_inert_script_payload_policy(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><body>"
+        "<script id=author>0123456789abcdef</script>"
+        "<script id=semantic type='application/ld+json'>{\"name\":\"PSP\"}</script>"
+        "<script id=oversize type='application/ld+json'>0123456789abcdef</script>"
+        "<p id=visible>retained text</p></body>";
+    DocumentParser parser = {0};
+    PocDocument document = {0};
+    bool ok = document_parser_begin(&parser, budget)
+        && document_parser_set_scripting(&parser, false)
+        && document_parser_set_inert_script_policy(
+               &parser, true, 14u, 32u)
+        && document_parser_feed(&parser, html, sizeof(html) - 1u)
+        && document_parser_finish(&parser, &document);
+    lxb_dom_node_t *author = ok ? find_id(
+        lxb_dom_interface_node(document.html), "author") : NULL;
+    lxb_dom_node_t *semantic = ok ? find_id(
+        lxb_dom_interface_node(document.html), "semantic") : NULL;
+    lxb_dom_node_t *oversize = ok ? find_id(
+        lxb_dom_interface_node(document.html), "oversize") : NULL;
+    size_t author_length = 0, semantic_length = 0, oversize_length = 0;
+    lxb_char_t *author_text = author == NULL ? NULL
+        : lxb_dom_node_text_content(author, &author_length);
+    lxb_char_t *semantic_text = semantic == NULL ? NULL
+        : lxb_dom_node_text_content(semantic, &semantic_length);
+    lxb_char_t *oversize_text = oversize == NULL ? NULL
+        : lxb_dom_node_text_content(oversize, &oversize_length);
+    ok = ok && author != NULL && semantic != NULL && oversize != NULL
+        && author_length == 0u && oversize_length == 0u
+        && semantic_length == 14u
+        && memcmp(semantic_text, "{\"name\":\"PSP\"}", 14u) == 0;
+    if (author_text != NULL)
+        lxb_dom_document_destroy_text(author->owner_document, author_text);
+    if (semantic_text != NULL)
+        lxb_dom_document_destroy_text(semantic->owner_document, semantic_text);
+    if (oversize_text != NULL)
+        lxb_dom_document_destroy_text(oversize->owner_document, oversize_text);
+    document_parser_abort(&parser);
+    document_destroy(&document);
+
+    static const char executable_html[] =
+        "<!doctype html><body><script id=large>0123456789abcdef</script>"
+        "<p>server content</p></body>";
+    memset(&parser, 0, sizeof(parser));
+    memset(&document, 0, sizeof(document));
+    ok = ok && document_parser_begin(&parser, budget)
+        && document_parser_set_scripting(&parser, true)
+        && document_parser_set_inert_script_policy(
+               &parser, false, 32u, 8u)
+        && document_parser_feed(
+               &parser, executable_html, sizeof(executable_html) - 1u);
+    lxb_dom_node_t *large = ok ? find_id(
+        lxb_dom_interface_node(parser.document.html), "large") : NULL;
+    ok = ok && large != NULL
+        && document_parser_script_was_truncated(&parser, large)
+        && document_parser_finish(&parser, &document);
+    size_t large_length = 0u;
+    lxb_char_t *large_text = large == NULL ? NULL
+        : lxb_dom_node_text_content(large, &large_length);
+    ok = ok && large_length == 0u;
+    if (large_text != NULL)
+        lxb_dom_document_destroy_text(large->owner_document, large_text);
+    document_parser_abort(&parser);
+    document_destroy(&document);
+    return ok;
+}
+
 static bool test_visible_text_glyph_script_hints(Budget *budget)
 {
     static const char html[] =
@@ -1264,7 +1333,12 @@ static bool test_streaming_stylesheet_checkpoint_reuse(Budget *budget)
         && navigation_init(&navigation, budget, 2);
     if (initialized) {
         navigation_attach_browser_session(&navigation, &browser);
-        navigation_enable_scripts(&navigation, 2u * MIB, 1000);
+        /* This combined streaming fixture loads the full standards bootstrap
+           plus three parser-blocking checkpoints.  Keep a small fixture-only
+           reserve so the assertion measures stylesheet checkpoint reuse,
+           rather than failing when unrelated bootstrap coverage grows. */
+        navigation_enable_scripts(
+            &navigation, 2u * MIB + 64u * 1024u, 1000);
         navigation_enable_document_scripts(
             &navigation, 8, 32u * 1024u, 16u * 1024u, 1000);
     }
@@ -1488,7 +1562,7 @@ static bool test_streaming_navigation_optional_work_shed(Budget *main_budget)
     bool ok = loaded && navigation.page.loaded
         && strcmp(navigation.page.document.title, "Stream & split") == 0
         && navigation.page.runtime == NULL
-        && navigation.page.resource_scheduler != NULL
+        && navigation.page.resource_scheduler == NULL
         && navigation.performance.optional_work_sheds == 1;
     if (!ok) {
         fprintf(stderr,
@@ -3072,6 +3146,7 @@ typedef struct {
 
 typedef struct {
     size_t calls;
+    long last_target;
 } MessageOpaqueProbe;
 
 static bool count_test_message(void *opaque, ScriptRuntime *source,
@@ -3079,11 +3154,12 @@ static bool count_test_message(void *opaque, ScriptRuntime *source,
                                const char *json,
                                const char *target_origin)
 {
-    (void) source; (void) target_frame_handle;
+    (void) source;
     (void) json; (void) target_origin;
     MessageOpaqueProbe *probe = opaque;
     if (probe == NULL) return false;
     probe->calls++;
+    probe->last_target = target_frame_handle;
     return true;
 }
 

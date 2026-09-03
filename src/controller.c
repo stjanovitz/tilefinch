@@ -103,6 +103,14 @@ static bool has_attribute(lxb_dom_node_t *node, const char *name)
                (const lxb_char_t *) name, strlen(name));
 }
 
+static bool controller_is_declared_media_card(
+    const BrowserController *controller, const lxb_dom_node_t *node)
+{
+    return controller != NULL && controller->navigation != NULL
+        && document_is_declared_video_card(
+            &controller->navigation->page.document, node);
+}
+
 static bool node_descends_from(lxb_dom_node_t *node, lxb_dom_node_t *ancestor)
 {
     for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
@@ -476,25 +484,36 @@ static bool controller_build_media_action(
     BrowserController *controller, lxb_dom_node_t *media,
     ControllerAction *action)
 {
-    if (controller == NULL || media == NULL || action == NULL) return false;
-    bool audio_only = node_name_is(media, "audio");
-    if (!audio_only && !node_name_is(media, "video")) return false;
+    if (controller == NULL || action == NULL) return false;
+    bool audio_only = media != NULL && node_name_is(media, "audio");
+    if (media != NULL && !audio_only && !node_name_is(media, "video"))
+        return false;
     size_t source_length = 0;
-    const char *source = media_source_reference(
+    const char *source = media == NULL ? NULL : media_source_reference(
         controller, media, &source_length, audio_only);
     bool discovered = false;
     MediaDiscoveryKind discovered_kind = MEDIA_DISCOVERY_NONE;
     if (!audio_only && (source == NULL || source_length == 0)) {
-        MediaDiscoveryResult discovery = {0};
-        if (!media_discover_document_candidate(
-                &controller->navigation->page.document,
-                action->body, sizeof(action->body), &discovery)) {
-            return false;
+        const MediaDeclaredVideo *declared = media_declared_video_cached(
+            &controller->navigation->page.document);
+        if (declared != NULL) {
+            source_length = strlen(declared->media_url);
+            if (source_length == 0u || source_length >= sizeof(action->body))
+                return false;
+            memcpy(action->body, declared->media_url, source_length + 1u);
+            discovered_kind = declared->kind;
+        } else {
+            MediaDiscoveryResult discovery = {0};
+            if (!media_discover_document_candidate(
+                    &controller->navigation->page.document,
+                    action->body, sizeof(action->body), &discovery)) {
+                return false;
+            }
+            source_length = strlen(action->body);
+            discovered_kind = discovery.kind;
         }
         source = action->body;
-        source_length = strlen(action->body);
         discovered = true;
-        discovered_kind = discovery.kind;
     }
     if (source_length == 0 || source_length >= NAVIGATION_URL_LIMIT) {
         return false;
@@ -519,14 +538,18 @@ static bool controller_build_media_action(
     if (!tilefinch_csp_allows_request(
             &controller->navigation->page.document.content_security_policy,
             TILEFINCH_DESTINATION_MEDIA, action->url)) return false;
-    media_credentials_policy(
-        media, &action->media_mode, &action->media_credentials);
+    action->media_mode = TILEFINCH_REQUEST_MODE_NO_CORS;
+    action->media_credentials = TILEFINCH_CREDENTIALS_INCLUDE;
+    if (media != NULL) {
+        media_credentials_policy(
+            media, &action->media_mode, &action->media_credentials);
+    }
     ScriptRuntime *runtime = controller->navigation->page.runtime;
     /* Playback and its asynchronous DOM state reports may outlive a page
        wrapper. Pin the handle just as HTMLMediaElement.play() does; terminal
        state delivery releases it, while document teardown remains the bound
        if the user closes the native player first. */
-    action->media_node_handle = runtime == NULL ? 0
+    action->media_node_handle = runtime == NULL || media == NULL ? 0
         : script_runtime_node_handle(runtime, media);
     action->media_audio_only = audio_only;
     action->media_kind = discovered_kind;
@@ -534,6 +557,12 @@ static bool controller_build_media_action(
     action->body_length = 0;
     action->type = CONTROLLER_ACTION_MEDIA;
     return true;
+}
+
+bool controller_build_document_media_action(
+    BrowserController *controller, ControllerAction *action)
+{
+    return controller_build_media_action(controller, NULL, action);
 }
 
 static size_t controller_normalize_label(
@@ -1969,6 +1998,13 @@ static ControllerActivationOutcome controller_dispatch_activation(
     bool click_only = controller->pointer_click_pending;
     controller->pointer_click_pending = false;
     if (node == NULL) return CONTROLLER_ACTIVATION_NOT_DISPATCHED;
+    if (node_name_is(node, "iframe")) {
+        if (navigation_activate_frame(navigation, node))
+            return CONTROLLER_ACTIVATION_DELIVERED;
+        return navigation->page.loaded
+            ? CONTROLLER_ACTIVATION_RUNTIME_REFUSED
+            : CONTROLLER_ACTIVATION_RUNTIME_FAILED;
+    }
     /* Basic is a native, action-preserving projection of the raw document.
        It must not be intercepted by delegated handlers left in the author
        realm, nor should those handlers be able to mutate a GET clone into a
@@ -1985,6 +2021,8 @@ static ControllerActivationOutcome controller_dispatch_activation(
               controller->pointer_click_offset_y, 0)
         : navigation_dispatch_node_activation(navigation, node);
     if (!dispatched) {
+        if (!navigation->page.loaded)
+            return CONTROLLER_ACTIVATION_RUNTIME_FAILED;
         return !navigation->page.script_result.event_dispatch_entered
             ? CONTROLLER_ACTIVATION_RUNTIME_REFUSED
             : CONTROLLER_ACTIVATION_RUNTIME_FAILED;
@@ -2976,6 +3014,15 @@ bool controller_activate(BrowserController *controller,
     if (controller->focus_kind == CONTROLLER_FOCUS_CONTROL
         && controller->focus_index < layout->control_count) {
         lxb_dom_node_t *node = layout->controls[controller->focus_index].node;
+        /* Engine-marked recovery controls are browser chrome embedded in the
+           page flow, not author controls. Dispatching their activation into
+           a degraded realm would let the failed page cancel or remove the
+           only recovery surface before the native action is built. */
+        if (controller_is_declared_media_card(controller, node)) {
+            controller->activations++;
+            return controller_build_document_media_action(
+                controller, action);
+        }
         ControllerChoiceSnapshot choice_snapshots[128];
         size_t choice_snapshot_count = 0;
         if (!controller_choice_snapshot(
@@ -3044,6 +3091,11 @@ bool controller_activate(BrowserController *controller,
     if (controller->focus_kind == CONTROLLER_FOCUS_POINTER
         && retained_focus_node(controller) != NULL) {
         lxb_dom_node_t *node = retained_focus_node(controller);
+        if (controller_is_declared_media_card(controller, node)) {
+            controller->activations++;
+            return controller_build_document_media_action(
+                controller, action);
+        }
         ControllerChoiceSnapshot choice_snapshots[128];
         size_t choice_snapshot_count = 0;
         if (!controller_choice_snapshot(
@@ -3178,6 +3230,11 @@ static bool set_control_value(BrowserController *controller,
                 &navigation->page.document, control.node, &value_snapshot);
             (void) document_refresh(&navigation->page.document);
             (void) navigation_relayout(navigation);
+        } else {
+            /* contenteditable mutates Lexbor text storage in place. Once its
+               replacement layout is refused, no incumbent DOM-backed shell
+               can remain safely published. */
+            navigation_discard_current_page(navigation);
         }
         return false;
     }

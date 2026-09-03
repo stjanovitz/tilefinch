@@ -1,0 +1,78 @@
+--- a/core/iwasm/interpreter/wasm_runtime.c
++++ b/core/iwasm/interpreter/wasm_runtime.c
+@@ -1640,8 +1640,6 @@
+ {
+     WASMFunctionInstance *start_func = module_inst->e->start_function;
+     WASMFunctionInstance *initialize_func = NULL;
+-    WASMFunctionInstance *post_inst_func = NULL;
+-    WASMFunctionInstance *call_ctors_func = NULL;
+ #if WASM_ENABLE_LIBC_WASI != 0
+     WASMModule *module = module_inst->module;
+ #endif
+@@ -1661,31 +1659,13 @@
+     if (!is_sub_inst && module->import_wasi_api) {
+         initialize_func =
+             lookup_post_instantiate_func(module_inst, "_initialize");
+-    }
+-#endif
+-
+-    /* Execute possible "__post_instantiate" function if wasm app is
+-       compiled by emsdk's early version */
+-    if (!is_sub_inst) {
+-        post_inst_func =
+-            lookup_post_instantiate_func(module_inst, "__post_instantiate");
+-    }
+-
+-#if WASM_ENABLE_BULK_MEMORY != 0
+-    /* Only execute the memory init function for main instance since
+-       the data segments will be dropped once initialized */
+-    if (!is_sub_inst
+-#if WASM_ENABLE_LIBC_WASI != 0
+-        && !module->import_wasi_api
+-#endif
+-    ) {
+-        call_ctors_func =
+-            lookup_post_instantiate_func(module_inst, "__wasm_call_ctors");
+     }
+ #endif
+ 
+-    if (!start_func && !initialize_func && !post_inst_func
+-        && !call_ctors_func) {
++    /* Browser instantiation automatically invokes only the standard start
++       section. Toolchain helper exports remain ordinary exports for their
++       JavaScript glue to call explicitly. */
++    if (!start_func && !initialize_func) {
+         /* No post instantiation functions to call */
+         return true;
+     }
+@@ -1737,6 +1717,13 @@
+                 exec_env, (WASMModuleInstanceCommon *)module_inst);
+         }
+     }
++
++#if WASM_ENABLE_INSTRUCTION_METERING != 0
++    /* Instantiation uses a temporary exec env which the embedder cannot
++       reach. Apply the same bounded instruction allowance used for later
++       exported calls before invoking the standard start function. */
++    wasm_runtime_set_instruction_count_limit(exec_env, 50000000);
++#endif
+ 
+     /* Execute start function for both main instance and sub instance */
+     if (start_func && !wasm_call_function(exec_env, start_func, 0, NULL)) {
+@@ -1751,16 +1738,6 @@
+ #else
+     (void)initialize_func;
+ #endif
+-
+-    if (post_inst_func
+-        && !wasm_call_function(exec_env, post_inst_func, 0, NULL)) {
+-        goto fail;
+-    }
+-
+-    if (call_ctors_func
+-        && !wasm_call_function(exec_env, call_ctors_func, 0, NULL)) {
+-        goto fail;
+-    }
+ 
+     ret = true;
+ 

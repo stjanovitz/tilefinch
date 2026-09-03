@@ -1,0 +1,298 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -210,6 +210,13 @@
+ #define JS_MAX_LOCAL_VARS 65534
+ #define JS_STACK_SIZE_MAX 65534
+ #define JS_STRING_LEN_MAX ((1 << 30) - 1)
++
++/* Large repeated strings are cheaper as balanced ropes. In particular,
++   generated evaluators frequently use a long horizontal-space prefix; keep
++   that prefix virtual until the parser has skipped it. */
++#define JS_STRING_REPEAT_ROPE_THRESHOLD (128 * 1024)
++#define JS_STRING_REPEAT_EVAL_SCAN_MAX (4 * 1024 * 1024)
++#define JS_STRING_REPEAT_EVAL_POLL_INTERVAL 4096
+
+ /* strings <= this length are not concatenated using ropes. if too
+    small, the rope memory overhead becomes high. */
+@@ -22278,6 +22285,7 @@
+     GetLineColCache get_line_col_cache;
+     /* Tokens until the next embedder interrupt poll during parsing; see
+        next_token().  Zero or negative forces a poll on the next token. */
++    uint32_t first_line_column;
+     int interrupt_countdown;
+ } JSParseState;
+
+@@ -22470,6 +22478,8 @@
+     JSContext *ctx = s->ctx;
+     int line_num, col_num;
+     line_num = get_line_col(&col_num, s->buf_start, ptr - s->buf_start);
++    if (line_num == 0)
++        col_num += s->first_line_column;
+     JS_ThrowError2(ctx, JS_SYNTAX_ERROR, fmt, ap, FALSE);
+     build_backtrace(ctx, ctx->rt->current_exception, s->filename,
+                     line_num + 1, col_num + 1, 0);
+@@ -27042,6 +27052,8 @@
+                 /* add the line number info */
+                 int line_num, col_num;
+                 line_num = get_line_col(&col_num, s->buf_start, s->token.ptr - s->buf_start);
++                if (line_num == 0)
++                    col_num += s->first_line_column;
+                 build_backtrace(s->ctx, s->ctx->rt->current_exception,
+                                 s->filename, line_num + 1, col_num + 1, 0);
+                 return -1;
+@@ -37275,7 +37287,8 @@
+
+ static void js_parse_init(JSContext *ctx, JSParseState *s,
+                           const char *input, size_t input_len,
+-                          const char *filename)
++                          const char *filename,
++                          uint32_t first_line_column)
+ {
+     memset(s, 0, sizeof(*s));
+     s->ctx = ctx;
+@@ -37288,7 +37301,8 @@
+     s->get_line_col_cache.ptr = s->buf_start;
+     s->get_line_col_cache.buf_start = s->buf_start;
+     s->get_line_col_cache.line_num = 0;
+-    s->get_line_col_cache.col_num = 0;
++    s->get_line_col_cache.col_num = first_line_column;
++    s->first_line_column = first_line_column;
+     s->interrupt_countdown = JS_PARSE_INTERRUPT_INTERVAL;
+ }
+
+@@ -37332,9 +37346,11 @@
+ }
+
+ /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
+-static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+-                                 const char *input, size_t input_len,
+-                                 const char *filename, int flags, int scope_idx)
++static JSValue __JS_EvalInternalWithColumn(
++    JSContext *ctx, JSValueConst this_obj,
++    const char *input, size_t input_len,
++    const char *filename, int flags, int scope_idx,
++    uint32_t first_line_column)
+ {
+     JSParseState s1, *s = &s1;
+     int err, js_mode, eval_type;
+@@ -37345,7 +37361,8 @@
+     JSFunctionDef *fd;
+     JSModuleDef *m;
+
+-    js_parse_init(ctx, s, input, input_len, filename);
++    js_parse_init(ctx, s, input, input_len, filename,
++                  first_line_column);
+     skip_shebang(&s->buf_ptr, s->buf_end);
+
+     eval_type = flags & JS_EVAL_TYPE_MASK;
+@@ -37447,6 +37464,14 @@
+     return JS_EXCEPTION;
+ }
+
++static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
++                                 const char *input, size_t input_len,
++                                 const char *filename, int flags, int scope_idx)
++{
++    return __JS_EvalInternalWithColumn(ctx, this_obj, input, input_len,
++                                       filename, flags, scope_idx, 0);
++}
++
+ /* the indirection is needed to make 'eval' optional */
+ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+                                const char *input, size_t input_len,
+@@ -37470,20 +37495,141 @@
+     return ret;
+ }
+
++static JSValue JS_EvalInternalWithColumn(
++    JSContext *ctx, JSValueConst this_obj,
++    const char *input, size_t input_len,
++    const char *filename, int flags, int scope_idx,
++    uint32_t first_line_column)
++{
++    BOOL backtrace_barrier = ((flags & JS_EVAL_FLAG_BACKTRACE_BARRIER) != 0);
++    int saved_js_mode = 0;
++    JSValue ret;
++
++    if (first_line_column == 0 || ctx->eval_internal != __JS_EvalInternal)
++        return JS_EvalInternal(ctx, this_obj, input, input_len, filename,
++                               flags, scope_idx);
++    if (backtrace_barrier && ctx->rt->current_stack_frame) {
++        saved_js_mode = ctx->rt->current_stack_frame->js_mode;
++        ctx->rt->current_stack_frame->js_mode |= JS_MODE_BACKTRACE_BARRIER;
++    }
++    ret = __JS_EvalInternalWithColumn(ctx, this_obj, input, input_len,
++                                      filename, flags, scope_idx,
++                                      first_line_column);
++    if (backtrace_barrier && ctx->rt->current_stack_frame)
++        ctx->rt->current_stack_frame->js_mode = saved_js_mode;
++    return ret;
++}
++
++/* Return an ordinary string containing the suffix after a very large
++   horizontal-space prefix. Undefined means that the input should follow the
++   normal path; an exception means allocation failed. Only horizontal trivia
++   is elided, so line numbering is unchanged, and the parser receives the
++   original first-line column separately. */
++static JSValue tilefinch_compact_eval_rope(JSContext *ctx,
++                                           JSValueConst value,
++                                           uint32_t *first_line_column)
++{
++    JSStringRopeIter iterator;
++    JSString *part;
++    uint32_t skipped = 0;
++    uint32_t work_since_poll = 0;
++    BOOL prefix_only = TRUE;
++    JSStringRope *rope = JS_VALUE_GET_STRING_ROPE(value);
++
++    *first_line_column = 0;
++    if (rope->len > JS_STRING_REPEAT_EVAL_SCAN_MAX)
++        return JS_ThrowRangeError(
++            ctx, "eval source exceeds bounded repeated-string scan limit");
++    string_rope_iter_init(&iterator, value);
++    while ((part = string_rope_iter_next(&iterator)) != NULL) {
++        uint32_t at = 0;
++        while (at < part->len) {
++            int c = string_get(part, at);
++            if (c != ' ' && c != '\t') {
++                prefix_only = FALSE;
++                break;
++            }
++            at++;
++            if (++work_since_poll == JS_STRING_REPEAT_EVAL_POLL_INTERVAL) {
++                work_since_poll = 0;
++                if (__js_poll_interrupts(ctx))
++                    return JS_EXCEPTION;
++            }
++        }
++        skipped += at;
++        if (!prefix_only)
++            break;
++    }
++    if (skipped < JS_STRING_REPEAT_ROPE_THRESHOLD)
++        return JS_UNDEFINED;
++    *first_line_column = skipped;
++    if (skipped == rope->len)
++        return JS_AtomToString(ctx, JS_ATOM_empty_string);
++    {
++        StringBuffer storage, *buffer = &storage;
++        uint32_t discard = skipped;
++        uint32_t remaining = rope->len - skipped;
++        if (string_buffer_init2(ctx, buffer, remaining,
++                                rope->is_wide_char))
++            return JS_EXCEPTION;
++        string_rope_iter_init(&iterator, value);
++        while ((part = string_rope_iter_next(&iterator)) != NULL) {
++            uint32_t start = min_uint32(discard, part->len);
++            discard -= start;
++            while (start < part->len) {
++                uint32_t available = part->len - start;
++                uint32_t until_poll =
++                    JS_STRING_REPEAT_EVAL_POLL_INTERVAL - work_since_poll;
++                uint32_t count = min_uint32(available, until_poll);
++                if (string_buffer_concat(buffer, part, start, count)) {
++                    string_buffer_free(buffer);
++                    return JS_EXCEPTION;
++                }
++                start += count;
++                work_since_poll += count;
++                if (work_since_poll ==
++                        JS_STRING_REPEAT_EVAL_POLL_INTERVAL) {
++                    work_since_poll = 0;
++                    if (__js_poll_interrupts(ctx)) {
++                        string_buffer_free(buffer);
++                        return JS_EXCEPTION;
++                    }
++                }
++            }
++        }
++        return string_buffer_end(buffer);
++    }
++}
++
+ static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
+                              JSValueConst val, int flags, int scope_idx)
+ {
+-    JSValue ret;
++    JSValue ret, compact = JS_UNDEFINED;
+     const char *str;
+     size_t len;
++    uint32_t first_line_column = 0;
+
+     if (!JS_IsString(val))
+         return JS_DupValue(ctx, val);
+-    str = JS_ToCStringLen(ctx, &len, val);
+-    if (!str)
+-        return JS_EXCEPTION;
+-    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", flags, scope_idx);
++    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING_ROPE
++        && JS_VALUE_GET_STRING_ROPE(val)->len
++               >= JS_STRING_REPEAT_ROPE_THRESHOLD
++        && ctx->eval_internal == __JS_EvalInternal) {
++        compact = tilefinch_compact_eval_rope(ctx, val,
++                                               &first_line_column);
++        if (JS_IsException(compact))
++            return compact;
++    }
++    str = JS_ToCStringLen(ctx, &len,
++                          JS_IsUndefined(compact) ? val : compact);
++    if (!str) {
++        JS_FreeValue(ctx, compact);
++        return JS_EXCEPTION;
++    }
++    ret = JS_EvalInternalWithColumn(ctx, this_obj, str, len, "<input>",
++                                    flags, scope_idx, first_line_column);
+     JS_FreeCString(ctx, str);
++    JS_FreeValue(ctx, compact);
+     return ret;
+ }
+
+@@ -46543,6 +46689,39 @@
+         JS_ThrowRangeError(ctx, "invalid string length");
+         goto fail;
+     }
++    if (val * len >= JS_STRING_REPEAT_ROPE_THRESHOLD) {
++        JSValue result = JS_UNDEFINED;
++        JSValue power = JS_DupValue(ctx, str);
++        uint32_t count = (uint32_t)n;
++        while (count != 0) {
++            if (count & 1u) {
++                JSValue part = JS_DupValue(ctx, power);
++                if (JS_IsUndefined(result)) {
++                    result = part;
++                } else {
++                    result = js_new_string_rope(ctx, result, part);
++                    if (JS_IsException(result)) {
++                        JS_FreeValue(ctx, power);
++                        JS_FreeValue(ctx, str);
++                        return result;
++                    }
++                }
++            }
++            count >>= 1u;
++            if (count != 0) {
++                JSValue duplicate = JS_DupValue(ctx, power);
++                power = js_new_string_rope(ctx, power, duplicate);
++                if (JS_IsException(power)) {
++                    JS_FreeValue(ctx, result);
++                    JS_FreeValue(ctx, str);
++                    return power;
++                }
++            }
++        }
++        JS_FreeValue(ctx, power);
++        JS_FreeValue(ctx, str);
++        return result;
++    }
+     if (string_buffer_init2(ctx, b, n * len, p->is_wide_char))
+         goto fail;
+     if (len == 1) {
+@@ -49828,7 +50007,7 @@
+     JSParseState s1, *s = &s1;
+     JSValue val = JS_UNDEFINED;
+
+-    js_parse_init(ctx, s, buf, buf_len, filename);
++    js_parse_init(ctx, s, buf, buf_len, filename, 0);
+     s->ext_json = ((flags & JS_PARSE_JSON_EXT) != 0);
+     if (json_next_token(s))
+         goto fail;

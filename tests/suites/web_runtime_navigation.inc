@@ -150,7 +150,7 @@
         "edit.addEventListener('beforeinput',event=>{status.setAttribute('data-before',event.constructor.name+':'+event.inputType+':'+event.data+':'+edit.value+':'+event.isTrusted);if(event.data==='X')event.preventDefault();});"
         "edit.addEventListener('input',event=>{status.setAttribute('data-value',edit.value);status.setAttribute('data-input',event.constructor.name+':'+event.inputType+':'+event.data+':'+edit.value+':'+event.isTrusted);});"
         "document.getElementById('prompt').addEventListener('input',()=>status.setAttribute('data-prompt','yes'));"
-        "const go=document.getElementById('go'),activation=[];for(const type of ['pointerdown','mousedown','pointerup','mouseup','click'])go.addEventListener(type,event=>activation.push(type+':'+event.constructor.name+':'+event.isTrusted));go.addEventListener('click',()=>{status.textContent='CLICKED';status.setAttribute('data-activation',activation.join('|'));});edit.closest('form').addEventListener('submit',event=>status.setAttribute('data-submit',event.constructor.name+':'+(event.submitter===go)+':'+event.isTrusted));"
+        "const go=document.getElementById('go'),activation=[];for(const type of ['pointerdown','mousedown','pointerup','mouseup','click'])go.addEventListener(type,event=>activation.push(type+':'+event.constructor.name+':'+event.isTrusted+(type==='click'?':'+event.detail+':'+event.pointerType:'')));go.addEventListener('click',()=>{status.textContent='CLICKED';status.setAttribute('data-activation',activation.join('|'));});edit.closest('form').addEventListener('submit',event=>status.setAttribute('data-submit',event.constructor.name+':'+(event.submitter===go)+':'+event.isTrusted));"
         "document.getElementById('search-form').addEventListener('submit',event=>status.setAttribute('data-search-submit',event.constructor.name+':'+(event.submitter===null)+':'+event.isTrusted));"
         "document.getElementById('external').addEventListener('load',()=>status.setAttribute('data-external','loaded'));"
         "setTimeout(()=>{ticks++;status.textContent='TIMER '+ticks;},10);"
@@ -686,6 +686,17 @@
                               button_region->y));
     size_t activation_relayouts = interactive.incremental_relayouts;
     CHECK(controller_activate(&controller, &controller_action));
+    size_t activation_length = 0;
+    const char *activation_value = document_attribute(
+        runtime_status, "data-activation", &activation_length);
+    if (activation_value == NULL
+        || activation_length != sizeof(
+            "click:PointerEvent:true:0:") - 1u) {
+        fprintf(stderr, "activation value=%.*s action=%u\n",
+                (int) activation_length,
+                activation_value == NULL ? "" : activation_value,
+                (unsigned) controller_action.type);
+    }
     CHECK(controller_action.type == CONTROLLER_ACTION_FORM_SUBMIT
           && strcmp(controller_action.method, "POST") == 0
           && strcmp(controller_action.url,
@@ -695,9 +706,7 @@
                               "SubmitEvent:true:true")
           && attribute_equals(
               runtime_status, "data-activation",
-              "pointerdown:PointerEvent:true|mousedown:MouseEvent:true|"
-              "pointerup:PointerEvent:true|mouseup:MouseEvent:true|"
-              "click:MouseEvent:true"));
+              "click:PointerEvent:true:0:"));
     /* One relayout for the five-event activation transaction and one for the
        separately cancelable submit default action. */
     CHECK(interactive.incremental_relayouts == activation_relayouts + 2
@@ -2215,6 +2224,77 @@
           && attribute_equals(labeled_choice_node,
                               "data-tilefinch-focus", ""));
     navigation_destroy(&label_navigation);
+    CHECK(budget.current == 0);
+
+    puts("test: page capability tracing preserves behavior and freezes failures");
+    static const char capability_trace_page[] =
+        "<!doctype html><body><script id=trace-script></script></body>";
+    static const char capability_trace_source[] =
+        "const missing='tilefinchMissingProbe' in navigator,"
+        "bytes=new Uint8Array(4);crypto.getRandomValues(bytes);"
+        "Math.max(1,2);"
+        "setTimeout(()=>{Math.min(3,4);throw new Error('trace-freeze')},0);"
+        "setTimeout(()=>{JSON.stringify({after:true})},0);"
+        "globalThis.pocSummary=!missing&&bytes instanceof Uint8Array"
+        "&&document.documentElement.querySelectorAll('body').length===1"
+        "?'TRACE-SEMANTICS-OK':'TRACE-SEMANTICS-BAD'";
+    NavigationSession capability_trace_navigation;
+    CHECK(navigation_init(&capability_trace_navigation, &budget, 2));
+    navigation_enable_scripts(&capability_trace_navigation, 4 * MIB, 1000);
+    navigation_enable_page_capability_trace(
+        &capability_trace_navigation, true);
+    uint64_t capability_trace_generation =
+        navigation_begin(&capability_trace_navigation);
+    bool capability_trace_committed = navigation_commit_html(
+        &capability_trace_navigation, capability_trace_generation,
+        "https://trace.test/", capability_trace_page,
+        strlen(capability_trace_page), 480, NULL, NULL, true);
+    lxb_dom_node_t *capability_trace_script = capability_trace_committed
+        ? find_id(lxb_dom_interface_node(
+                      capability_trace_navigation.page.document.html),
+                  "trace-script")
+        : NULL;
+    bool capability_trace_evaluated = capability_trace_script != NULL
+        && script_runtime_evaluate_external_typed(
+            capability_trace_navigation.page.runtime,
+            capability_trace_script, capability_trace_source,
+            strlen(capability_trace_source),
+            "https://trace.test/probe.js", false,
+            &capability_trace_navigation.page.script_result);
+    bool capability_trace_advanced = capability_trace_evaluated
+        && navigation_advance_runtime(&capability_trace_navigation, 1, 8);
+    bool capability_trace_collected = capability_trace_advanced
+        && navigation_collect_page_capability_trace(
+            &capability_trace_navigation);
+    bool capability_trace_has_missing = strstr(
+        capability_trace_navigation.last_page_trace,
+        "has:navigator.tilefinchMissingProbe") != NULL;
+    bool capability_trace_has_failure_call = strstr(
+        capability_trace_navigation.last_page_trace,
+        "call:global.Math.min") != NULL;
+    bool capability_trace_has_late_call = strstr(
+        capability_trace_navigation.last_page_trace,
+        "call:global.JSON.stringify") != NULL;
+    if (!capability_trace_collected || !capability_trace_has_missing
+        || !capability_trace_has_failure_call || capability_trace_has_late_call
+        || strcmp(capability_trace_navigation.page.script_result.summary,
+                  "TRACE-SEMANTICS-OK") != 0) {
+        fprintf(stderr, "capability trace committed=%d advanced=%d "
+                "evaluated=%d collected=%d missing=%d failure=%d late=%d "
+                "summary=\"%s\" error=\"%s\" trace=\"%s\"\n",
+                capability_trace_committed, capability_trace_advanced,
+                capability_trace_evaluated, capability_trace_collected,
+                capability_trace_has_missing,
+                capability_trace_has_failure_call, capability_trace_has_late_call,
+                capability_trace_navigation.page.script_result.summary,
+                capability_trace_navigation.page.script_result.error,
+                capability_trace_navigation.last_page_trace);
+    }
+    CHECK(capability_trace_collected && capability_trace_has_missing
+          && capability_trace_has_failure_call && !capability_trace_has_late_call
+          && strcmp(capability_trace_navigation.page.script_result.summary,
+                    "TRACE-SEMANTICS-OK") == 0);
+    navigation_destroy(&capability_trace_navigation);
     CHECK(budget.current == 0);
 
     puts("test: reduced motion freezes stylesheet animation without relayouts");

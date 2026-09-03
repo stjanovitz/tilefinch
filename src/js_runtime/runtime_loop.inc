@@ -104,6 +104,7 @@ static bool runtime_pump_timers(ScriptRuntime *runtime,
 /* Every check costs a full collection, so space them out; the window only
    needs to return once, shortly after the hydration transient dies. */
 #define BOOT_WINDOW_CHECK_INTERVAL 256u
+#define BOOT_WINDOW_MAX_DEFER_ADVANCES 4096u
 
 static void runtime_boot_window_step(ScriptRuntime *runtime)
 {
@@ -113,6 +114,19 @@ static void runtime_boot_window_step(ScriptRuntime *runtime)
     }
     runtime->boot_window_advances++;
     if (runtime->boot_window_advances % BOOT_WINDOW_CHECK_INTERVAL != 0) {
+        return;
+    }
+    /* A temporarily small live heap is not proof that startup has settled.
+       Delayed hydration commonly waits on a timer or network response and
+       can need the donated space in its next callback. Returning the window
+       in that gap makes a bounded, otherwise-admitted callback fail (and has
+       exposed allocator bugs in dependencies which assume ordinary OOM is
+       not injected midway through their own response decoder). Keep the
+       window while finite author startup work remains, with a hard lifetime
+       so an ambient timer cannot permanently turn the boot allowance into a
+       larger steady-state heap. */
+    if (runtime->boot_window_advances < BOOT_WINDOW_MAX_DEFER_ADVANCES
+        && script_runtime_has_pending_author_work(runtime)) {
         return;
     }
     JS_RunGC(runtime->runtime);
@@ -203,7 +217,12 @@ static void runtime_apply_gc_slack(ScriptRuntime *runtime)
         slack_kb = value == NULL ? 0 : atol(value);
         if (slack_kb < 0) slack_kb = 0;
         value = getenv("TILEFINCH_JS_GC_GROWTH_PCT");
-        growth_pct = value == NULL ? 0 : atol(value);
+        /* QuickJS's unconstrained threshold growth can reach a realm's hard
+           ceiling before collecting dead cyclic browser state.  A 125% live
+           heap threshold remains logarithmic while there is room, then the
+           reserve clamp below leaves ordinary event construction headroom.
+           Tests and deterministic replay may still override this explicitly. */
+        growth_pct = value == NULL ? 125 : atol(value);
         if (growth_pct < 0) growth_pct = 0;
         value = getenv("TILEFINCH_JS_GC_MIN_SLACK_KB");
         min_slack_kb = value == NULL ? 512 : atol(value);

@@ -213,6 +213,30 @@ size_t script_runtime_collect_and_trim(ScriptRuntime *runtime)
         runtime, SCRIPT_RUNTIME_COLLECT_TRIM);
 }
 
+size_t js_rt_prepare_network_response_delivery(ScriptRuntime *runtime,
+                                               size_t response_bytes)
+{
+    /* Below this size the collection cost is more likely to dominate the
+       callback than the response's temporary parser/compiler expansion. */
+    if (response_bytes < 512u * 1024u) return 0;
+    size_t reclaimed = script_runtime_collect_and_trim(runtime);
+    /* A large author response is already leased by the completion which is
+       about to receive it.  Older HTTP and provider entries are optional at
+       this boundary and otherwise compete with the transient JS string,
+       decoder, and compiler expansion of this response.  Eviction is safe:
+       shared bodies which still have a live lease remain alive, and the
+       session helper reports only bytes physically returned to the common
+       page Budget. */
+    if (runtime != NULL && runtime->session != NULL
+        && runtime->session->budget == runtime->budget) {
+        size_t cache_reclaimed = browser_session_cache_reclaim(
+            runtime->session, response_bytes);
+        reclaimed = cache_reclaimed > SIZE_MAX - reclaimed
+            ? SIZE_MAX : reclaimed + cache_reclaimed;
+    }
+    return reclaimed;
+}
+
 size_t script_runtime_heap_remaining(const ScriptRuntime *runtime)
 {
     if (runtime == NULL || runtime->runtime == NULL

@@ -16,6 +16,10 @@ EXPECTED_SUMMARY = 'javascript summary="FAST-ARRAY-OK:300000:2052427040"'
 
 def run(lab: Path, fixture: Path, growth_kb) -> int:
     environment = os.environ.copy()
+    # Isolate dense-array capacity from the independent adaptive-GC policy.
+    # The latter deliberately changes collection timing and can otherwise
+    # dominate the peak this test is intended to compare.
+    environment["TILEFINCH_JS_GC_GROWTH_PCT"] = "0"
     if growth_kb is None:
         environment.pop("TILEFINCH_JS_ARRAY_GROWTH_KB", None)
     else:

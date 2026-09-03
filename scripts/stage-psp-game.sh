@@ -112,23 +112,107 @@ fi
 
 tree_digest() {
     directory=$1
-    (
-        CDPATH= cd -- "$directory"
-        find . -type f ! -name .tilefinch-stage-digest -print \
-            | LC_ALL=C sort \
-            | while IFS= read -r path; do
-                printf '%s\n' "$path"
-                sha256 "$path"
-            done
-    ) | sha256 | awk '{print $1}'
+    python3 - "$directory" <<'PY'
+import hashlib
+import os
+import stat
+import struct
+import sys
+
+root = sys.argv[1]
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+file_flags = os.O_RDONLY | nofollow
+tree = hashlib.sha256()
+
+
+def framed(kind, relative):
+    encoded = os.fsencode(relative)
+    tree.update(kind)
+    tree.update(struct.pack(">I", len(encoded)))
+    tree.update(encoded)
+
+
+def walk(directory_fd, prefix):
+    names = sorted(os.listdir(directory_fd), key=os.fsencode)
+    for name in names:
+        relative = name if not prefix else prefix + "/" + name
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not prefix and name == ".tilefinch-stage-digest":
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise RuntimeError("unsafe root stage marker")
+            # Only the generated root marker is metadata. A nested entry with
+            # this basename is authored content and must pass normal checks.
+            continue
+        if stat.S_ISDIR(before.st_mode):
+            child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                    raise RuntimeError("directory changed during staging")
+                framed(b"D", relative)
+                walk(child_fd, relative)
+            finally:
+                os.close(child_fd)
+            continue
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError("non-regular entry: " + relative)
+        if before.st_nlink != 1:
+            raise RuntimeError("hardlinked entry: " + relative)
+        file_fd = os.open(name, file_flags, dir_fd=directory_fd)
+        try:
+            opened = os.fstat(file_fd)
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise RuntimeError("file changed during staging")
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise RuntimeError("non-private regular entry: " + relative)
+            framed(b"F", relative)
+            tree.update(struct.pack(">Q", opened.st_size))
+            while True:
+                chunk = os.read(file_fd, 65536)
+                if not chunk:
+                    break
+                tree.update(chunk)
+            after = os.fstat(file_fd)
+            stable = (opened.st_dev, opened.st_ino, opened.st_size,
+                      opened.st_mtime_ns, opened.st_ctime_ns)
+            final = (after.st_dev, after.st_ino, after.st_size,
+                     after.st_mtime_ns, after.st_ctime_ns)
+            if stable != final:
+                raise RuntimeError("file changed while hashing: " + relative)
+        finally:
+            os.close(file_fd)
+
+
+try:
+    root_fd = os.open(root, directory_flags)
+    try:
+        walk(root_fd, "")
+    finally:
+        os.close(root_fd)
+except (OSError, RuntimeError) as error:
+    raise SystemExit("game stage tree is unsafe: " + str(error))
+
+print(tree.hexdigest())
+PY
 }
 
+validate_stage_tree() {
+    directory=$1
+    tree_digest "$directory" >/dev/null
+}
+
+validate_stage_tree "$source_dir"
 digest=$(tree_digest "$source_dir")
 short_digest=$(printf '%s' "$digest" | cut -c1-16)
 mkdir -p "$stage_root"
 target=$stage_root/$stage_name-$short_digest
 marker=$target/.tilefinch-stage-digest
-if [ -d "$target" ]; then
+if [ -L "$target" ]; then
+    echo "refusing symlinked immutable game stage: $target" >&2
+    exit 1
+elif [ -d "$target" ]; then
+    validate_stage_tree "$target"
     [ -f "$marker" ] && [ "$(cat "$marker")" = "$digest" ] \
         && [ "$(tree_digest "$target")" = "$digest" ] || {
         echo "refusing corrupt immutable game stage: $target" >&2
@@ -139,10 +223,15 @@ else
     cleanup() { rm -rf "$temporary"; }
     trap cleanup EXIT HUP INT TERM
     rsync -a "$source_dir/" "$temporary/"
+    validate_stage_tree "$temporary"
     [ "$(tree_digest "$temporary")" = "$digest" ] || {
         echo "staged game digest changed during copy" >&2
         exit 1
     }
+    # A source tree may contain a prior private root marker. Remove that
+    # ordinary temporary file before publishing the freshly computed value;
+    # validation above guarantees this cannot follow a symlink or hardlink.
+    rm -f "$temporary/.tilefinch-stage-digest"
     printf '%s\n' "$digest" >"$temporary/.tilefinch-stage-digest"
     mv "$temporary" "$target"
     trap - EXIT HUP INT TERM

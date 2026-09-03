@@ -1295,6 +1295,69 @@ static bool test_bounded_page_keeps_manual_article(void)
     return true;
 }
 
+static bool test_complete_bounded_walk_is_transactional(void)
+{
+    const size_t capacity = 512u * 1024u;
+    char *html = malloc(capacity);
+    CHECK(html != NULL);
+    size_t used = 0u;
+    CHECK(append_text(
+        html, capacity, &used,
+        "<!doctype html><body><main><article><h1>Complete article</h1>"
+        "<p>This meaningful server-rendered article has enough readable "
+        "prose to remain the preferred Reader candidate. Strict automatic "
+        "recovery must nevertheless stay raw when the later document walk "
+        "reaches its fixed node ceiling.</p>"));
+    static const char supporting_paragraph[] =
+        "<p>The extracted article itself remains compact and serializes "
+        "cleanly. Semantic paragraphs, headings, and readable prose make "
+        "this an unambiguous article while the unrelated suffix exercises "
+        "only the classifier traversal bound.</p>";
+    for (size_t i = 0u; i < 12u; i++)
+        CHECK(append_text(html, capacity, &used, supporting_paragraph));
+    CHECK(append_text(html, capacity, &used, "</article></main>"));
+    for (size_t i = 0u; i < 8300u; i++)
+        CHECK(append_text(html, capacity, &used, "<script></script>"));
+    CHECK(append_text(html, capacity, &used, "</body>"));
+
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    CHECK(document_parse(&document, &budget, html, used, 4096u));
+    size_t nodes_before = document.node_count;
+    size_t attributes_before = document.attribute_count;
+    lxb_dom_node_t *body = document_body_node(&document);
+    ReaderDocumentAnalysis analysis = {0};
+    bool prepared = reader_document_prepare_complete_with_stylesheet(
+        &document, NULL, &analysis);
+    lxb_dom_node_t *root = find_direct_reader_root(&document);
+    bool marked = has_attribute(body, "data-tilefinch-reader-kind");
+    bool okay = prepared && analysis.kind == READER_PAGE_ARTICLE
+        && analysis.bounded_out && !analysis.extraction_truncated
+        && root == NULL && !marked
+        && document.node_count == nodes_before
+        && document.attribute_count == attributes_before;
+    if (!okay) {
+        fprintf(stderr,
+                "reader-complete-bound prepared=%d kind=%d bounded=%d "
+                "truncated=%d visited=%u root=%p marker=%d nodes=%zu/%zu "
+                "attributes=%zu/%zu\n",
+                prepared ? 1 : 0, (int) analysis.kind,
+                analysis.bounded_out ? 1 : 0,
+                analysis.extraction_truncated ? 1 : 0,
+                analysis.visited_nodes, (void *) root, marked ? 1 : 0,
+                document.node_count, nodes_before,
+                document.attribute_count, attributes_before);
+    }
+    CHECK(okay);
+    document_destroy(&document);
+    free(html);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
+          && budget_categories_reconcile(&budget));
+    return true;
+}
+
 static bool test_basic_view_preserves_actions_without_guessing(void)
 {
     static const char html[] =
@@ -1739,6 +1802,80 @@ static bool test_basic_structural_extraction_is_cooperative_once(void)
     return true;
 }
 
+static bool test_declared_video_synthesizes_watch_surface(void)
+{
+    static const char html[] =
+        "<!doctype html><head><script type=application/ld+json>"
+        "{\"@type\":\"VideoObject\",\"name\":\"Declared feature\","
+        "\"thumbnailUrl\":\"/poster.jpg\","
+        "\"contentUrl\":\"/feature-240.mp4\"}</script></head><body>"
+        "<div data-tilefinch-declared-media-card=synthetic>"
+        "Engine card must not be copied</div><article>"
+        "<h1>Declared feature</h1>"
+        "<p>This complete paragraph introduces the declared feature and its "
+        "important context for a compact reader presentation.</p>"
+        "<p>The second paragraph preserves useful server rendered details "
+        "without depending on author hydration.</p>"
+        "<p>The third paragraph gives the viewer enough information to decide "
+        "whether to play the media.</p>"
+        "<p>The fourth paragraph retains meaningful article evidence in the "
+        "original source order.</p>"
+        "<p>The fifth paragraph keeps this fixture above the bounded article "
+        "confidence threshold.</p>"
+        "<p>The final paragraph closes the description with a useful next "
+        "step for the viewer.</p></article></body>";
+    Budget budget;
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet stylesheet = {0};
+    CHECK(document_parse(
+              &document, &budget, html, sizeof(html) - 1u, 113u)
+          && stylesheet_build(&stylesheet, &budget, &document, 480));
+    /* This fixture represents the exact native recovery node. A matching
+       authored attribute alone is deliberately not trusted. */
+    document.declared_video_card_node =
+        document_body_node(&document)->first_child;
+    ReaderDocumentAnalysis analysis = {0};
+    CHECK(reader_document_prepare_with_stylesheet(
+              &document, &stylesheet, &analysis)
+          && analysis.kind == READER_PAGE_WATCH);
+    lxb_dom_node_t *root = find_direct_reader_root(&document);
+    lxb_dom_node_t *video = find_named_within(root, "video");
+    CHECK(root != NULL && video != NULL
+          && has_attribute(video, "controls")
+          && has_attribute(video, "data-tilefinch-declared-media-card")
+          && !subtree_contains_text(root, "Engine card must not be copied"));
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
+          && budget_categories_reconcile(&budget));
+
+    budget_init(&budget, 32u * 1024u * 1024u);
+    CHECK(budget_install_lexbor(&budget));
+    memset(&document, 0, sizeof(document));
+    memset(&stylesheet, 0, sizeof(stylesheet));
+    CHECK(document_parse(
+              &document, &budget, html, sizeof(html) - 1u, 115u)
+          && stylesheet_build(&stylesheet, &budget, &document, 480));
+    document.declared_video_card_node =
+        document_body_node(&document)->first_child;
+    analysis = (ReaderDocumentAnalysis) {0};
+    CHECK(reader_document_prepare_basic_complete_with_stylesheet(
+              &document, &stylesheet, &analysis)
+          && analysis.kind == READER_PAGE_BASIC);
+    root = find_direct_reader_root(&document);
+    video = find_named_within(root, "video");
+    CHECK(video != NULL
+          && has_attribute(video, "data-tilefinch-declared-media-card")
+          && !subtree_contains_text(root, "Engine card must not be copied"));
+    stylesheet_destroy(&stylesheet);
+    document_destroy(&document);
+    CHECK(budget_uninstall_lexbor(&budget) && budget.current == 0u
+          && budget_categories_reconcile(&budget));
+    return true;
+}
+
 int main(void)
 {
     if (!test_article()
@@ -1761,13 +1898,15 @@ int main(void)
         || !test_extraction_truncation_is_explicit()
         || !test_large_page_bound()
         || !test_bounded_page_keeps_manual_article()
+        || !test_complete_bounded_walk_is_transactional()
         || !test_basic_view_preserves_actions_without_guessing()
         || !test_extracted_fragment_markers_preserve_empty_targets()
         || !test_basic_anchor_bounds_are_transactional()
         || !test_basic_view_complete_bound_is_transactional()
         || !test_basic_view_form_scan_bound_is_transactional()
         || !test_basic_select_option_bound_is_transactional()
-        || !test_basic_structural_extraction_is_cooperative_once())
+        || !test_basic_structural_extraction_is_cooperative_once()
+        || !test_declared_video_synthesizes_watch_surface())
         return EXIT_FAILURE;
     puts("reader-mode-tests: ok");
     return EXIT_SUCCESS;

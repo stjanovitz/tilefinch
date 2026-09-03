@@ -417,6 +417,7 @@ static int test_envelope(void)
 static int test_package(void)
 {
     CHECK(tilefinch_update_package_path_allowed("EBOOT.PBP")
+          && tilefinch_update_package_path_allowed("tilefinch-wasm.prx")
           && tilefinch_update_package_path_allowed("fonts/ui.ttf")
           && !tilefinch_update_package_path_allowed(
                  "voice-model/en-us/mdef")

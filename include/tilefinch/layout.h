@@ -74,6 +74,10 @@
 /* font-kerning:none is a text-only paint/measurement flag in the remaining
    radius bits; it does not consume the compositing bits in font_italic. */
 #define LAYOUT_TEXT_KERNING_NONE (1 << 25)
+/* Engine-owned presentation labels remain paintable but are not page text.
+   In particular, Find-in-page must not expose a declared-media recovery
+   card that Reader/Basic extraction and history serialization omit. */
+#define LAYOUT_TEXT_FIND_EXCLUDED (1 << 26)
 /* Authored font-weight is retained divided by ten and is bounded at 100.
    Its spare high bit carries the positioned paint phase without growing the
    PSP display list. */
@@ -487,6 +491,13 @@ static inline bool draw_command_text_find_block_start(
         && (command->radius & LAYOUT_TEXT_FIND_BLOCK_START) != 0;
 }
 
+static inline bool draw_command_text_find_excluded(
+    const DrawCommand *command)
+{
+    return command != NULL && command->type == DRAW_TEXT
+        && (command->radius & LAYOUT_TEXT_FIND_EXCLUDED) != 0;
+}
+
 static inline int draw_command_text_shadow_blur(
     const DrawCommand *command)
 {
@@ -618,7 +629,10 @@ typedef enum {
     CONTROL_SELECT,
     CONTROL_TOGGLE,
     CONTROL_RANGE,
-    CONTROL_RESIZE
+    CONTROL_RESIZE,
+    /* Browser-owned activation surface for an embedded browsing context.
+       The parent never receives a pointer to the child control. */
+    CONTROL_FRAME
 } ControlType;
 
 typedef struct {

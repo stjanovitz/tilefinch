@@ -311,6 +311,10 @@ BrowserProfile *browser_profile_create(Budget *budget)
     profile->budget = budget;
     profile->ui_scale = 1;
     profile->page_font_percent = 100;
+    /* The default search path must return useful server-rendered results on
+       the PSP. Google remains an explicit persisted choice, but no longer
+       provides a basic-HTML results document to non-JavaScript clients. */
+    profile->search_engine = BROWSER_SEARCH_DUCKDUCKGO;
     profile->analog_cursor_enabled = true;
     profile->live_cache_kib = BROWSER_PROFILE_TRANSIENT_CACHE_KIB;
     profile->youtube_quality = BROWSER_YOUTUBE_QUALITY_360P;
@@ -784,6 +788,7 @@ static bool profile_load_internal(
         .budget = profile->budget,
         .ui_scale = 1,
         .page_font_percent = 100,
+        .search_engine = BROWSER_SEARCH_DUCKDUCKGO,
         .analog_cursor_enabled = true,
         .live_cache_kib = BROWSER_PROFILE_TRANSIENT_CACHE_KIB,
         .youtube_quality = BROWSER_YOUTUBE_QUALITY_360P,
@@ -1358,7 +1363,7 @@ BrowserSearchEngine browser_profile_search_engine(
     const BrowserProfile *profile)
 {
     return profile == NULL
-        ? BROWSER_SEARCH_GOOGLE : profile->search_engine;
+        ? BROWSER_SEARCH_DUCKDUCKGO : profile->search_engine;
 }
 
 BrowserColorMode browser_profile_color_mode(

@@ -246,6 +246,147 @@ int main(void)
           && strcmp(copied, "/audio/0.m4a") == 0);
     document_destroy(&bounded_document);
 
+    static const char video_declaration_html[] =
+        "<!doctype html><html><head>"
+        "<meta property=og:video content='/loose-360.mp4'>"
+        "<script type=application/ld+json>"
+        "{\"@context\":\"https://schema.org\","
+        "\"@type\":\"VideoObject\",\"name\":\"Fixture movie\","
+        "\"thumbnailUrl\":\"/poster.jpg?exact=1\","
+        "\"duration\":\"PT1M30S\","
+        "\"embedUrl\":\"/player/embed.mp4\","
+        "\"contentUrl\":\"/structured-240.mp4\"}"
+        "</script></head><body>Watch</body></html>";
+    PocDocument video_declaration_document;
+    CHECK(document_parse(
+        &video_declaration_document, &budget,
+        video_declaration_html, sizeof(video_declaration_html) - 1u, 35));
+    MediaStructuredVideoIndex videos = {0};
+    CHECK(media_discover_structured_video(
+              &video_declaration_document, &videos)
+          && videos.candidate_count == 1u);
+    CHECK(media_structured_video_copy_url(
+              &videos.candidates[0], copied, sizeof(copied))
+          && strcmp(copied, "/structured-240.mp4") == 0);
+    CHECK(media_structured_video_copy_name(
+              &videos.candidates[0], copied, sizeof(copied))
+          && strcmp(copied, "Fixture movie") == 0);
+    CHECK(media_structured_video_copy_thumbnail(
+              &videos.candidates[0], copied, sizeof(copied))
+          && strcmp(copied, "/poster.jpg?exact=1") == 0);
+    CHECK(media_structured_video_copy_duration(
+              &videos.candidates[0], copied, sizeof(copied))
+          && strcmp(copied, "PT1M30S") == 0);
+    MediaDeclaredVideo declared = {0};
+    CHECK(media_discover_declared_video(
+              &video_declaration_document, &declared)
+          && declared.structured
+          && strcmp(declared.media_url, "/structured-240.mp4") == 0
+          && strcmp(declared.thumbnail_url,
+                    "/poster.jpg?exact=1") == 0
+          && strcmp(declared.title, "Fixture movie") == 0);
+    MediaDiscoveryResult discovery = {0};
+    CHECK(media_discover_document_candidate(
+              &video_declaration_document, copied, sizeof(copied),
+              &discovery)
+          && strcmp(copied, "/structured-240.mp4") == 0);
+    document_destroy(&video_declaration_document);
+
+    static const char embed_only_html[] =
+        "<!doctype html><script type=application/ld+json>"
+        "{\"@context\":\"https://schema.org\","
+        "\"@type\":\"VideoObject\","
+        "\"embedUrl\":\"/player/embed.mp4\"}</script>";
+    PocDocument embed_only_document;
+    CHECK(document_parse(
+        &embed_only_document, &budget,
+        embed_only_html, sizeof(embed_only_html) - 1u, 37));
+    memset(&videos, 0, sizeof(videos));
+    CHECK(!media_discover_structured_video(&embed_only_document, &videos)
+          && videos.candidate_count == 0u);
+    memset(&declared, 0, sizeof(declared));
+    CHECK(!media_discover_declared_video(&embed_only_document, &declared));
+    CHECK(!media_discover_document_candidate(
+        &embed_only_document, copied, sizeof(copied), &discovery));
+    document_destroy(&embed_only_document);
+
+    static const char video_quality_html[] =
+        "<!doctype html><script type=application/ld+json>["
+        "{\"@type\":\"VideoObject\","
+        "\"contentUrl\":\"/feature-1080.mp4\"},"
+        "{\"@type\":\"VideoObject\","
+        "\"contentUrl\":\"/feature-240.mp4\"},"
+        "{\"@type\":\"VideoObject\","
+        "\"contentUrl\":\"/feature-live.m3u8\"}]</script>";
+    PocDocument video_quality_document;
+    CHECK(document_parse(
+              &video_quality_document, &budget,
+              video_quality_html, sizeof(video_quality_html) - 1u, 39)
+          && media_discover_declared_video(
+              &video_quality_document, &declared)
+          && declared.kind == MEDIA_DISCOVERY_MP4
+          && declared.quality == 240u
+          && strcmp(declared.media_url, "/feature-240.mp4") == 0);
+    document_destroy(&video_quality_document);
+
+    static const char hls_declaration_html[] =
+        "<!doctype html><meta property=og:video "
+        "content='https://media.example.test/live.m3u8'>";
+    PocDocument hls_declaration_document;
+    CHECK(document_parse(
+              &hls_declaration_document, &budget,
+              hls_declaration_html, sizeof(hls_declaration_html) - 1u, 41)
+          && media_discover_declared_video(
+              &hls_declaration_document, &declared)
+          && declared.kind == MEDIA_DISCOVERY_HLS
+          && strcmp(declared.media_url,
+                    "https://media.example.test/live.m3u8") == 0);
+    document_destroy(&hls_declaration_document);
+
+    static const char data_attribute_html[] =
+        "<!doctype html><body><div data-src='/lazy-240.mp4'></div></body>";
+    PocDocument data_attribute_document;
+    CHECK(document_parse(
+              &data_attribute_document, &budget,
+              data_attribute_html, sizeof(data_attribute_html) - 1u, 42)
+          && !media_discover_declared_video(
+              &data_attribute_document, &declared)
+          && media_discover_document_candidate(
+              &data_attribute_document, copied, sizeof(copied), &discovery)
+          && strcmp(copied, "/lazy-240.mp4") == 0);
+    document_destroy(&data_attribute_document);
+
+    static const char transactional_candidate_html[] =
+        "<!doctype html><script type=application/ld+json>["
+        "{\"@type\":\"VideoObject\","
+        "\"contentUrl\":\"/retained-1080.mp4\"},"
+        "{\"@type\":\"VideoObject\","
+        "\"contentUrl\":\"/corrupt-\\u0041-240.mp4\"}]</script>";
+    PocDocument transactional_candidate_document;
+    CHECK(document_parse(
+              &transactional_candidate_document, &budget,
+              transactional_candidate_html,
+              sizeof(transactional_candidate_html) - 1u, 42)
+          && media_discover_declared_video(
+              &transactional_candidate_document, &declared)
+          && strcmp(declared.media_url, "/retained-1080.mp4") == 0
+          && media_discover_document_candidate(
+              &transactional_candidate_document,
+              copied, sizeof(copied), &discovery)
+          && strcmp(copied, "/retained-1080.mp4") == 0);
+    document_destroy(&transactional_candidate_document);
+
+    static const char false_og_type_html[] =
+        "<!doctype html><meta property=og:type content=videobad>"
+        "<meta name=download content='/not-a-declared-watch-240.mp4'>";
+    PocDocument false_og_type_document;
+    CHECK(document_parse(
+              &false_og_type_document, &budget,
+              false_og_type_html, sizeof(false_og_type_html) - 1u, 43)
+          && !media_discover_declared_video(
+              &false_og_type_document, &declared));
+    document_destroy(&false_og_type_document);
+
     static const char large_prefix[] =
         "<!doctype html><script type=application/ld+json>";
     static const char large_suffix[] =

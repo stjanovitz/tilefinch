@@ -1,0 +1,301 @@
+diff --git a/quickjs.c b/quickjs.c
+index 10eaaaed..56d16c59 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -6306,8 +6306,10 @@ static void js_array_finalizer(JSRuntime *rt, JSValue val)
+         for(i = 0; i < p->u.array.count; i++) {
+             JS_FreeValueRT(rt, p->u.array.u.values[i]);
+         }
++        js_free_rt(rt, p->u.array.u.values);
++    } else {
++        js_free_string(rt, (JSString *)p->u.array.u.ptr);
+     }
+-    js_free_rt(rt, p->u.array.u.ptr);
+ }
+ 
+ static void js_array_mark(JSRuntime *rt, JSValueConst val,
+@@ -7150,8 +7152,8 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
+                 if (p->u.array.u.values) {
+                     s->memory_used_count++;
+                     s->memory_used_size += p->compact_char_array ?
+-                        p->u.array.count : p->u.array.count *
+-                            sizeof(*p->u.array.u.values);
++                        sizeof(JSString) + p->u.array.u1.size + 1 :
++                        p->u.array.count * sizeof(*p->u.array.u.values);
+                     s->fast_array_elements += p->u.array.count;
+                     if (!p->compact_char_array) {
+                         for (i = 0; i < p->u.array.count; i++) {
+@@ -9173,7 +9175,7 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
+             if (unlikely(idx >= p->u.array.count)) goto slow_path;
+             if (p->class_id == JS_CLASS_ARRAY && p->compact_char_array)
+                 return js_new_string8_len(
+-                    ctx, (const char *)&p->u.array.u.uint8_ptr[idx], 1);
++                    ctx, (const char *)&((JSString *)p->u.array.u.ptr)->u.str8[idx], 1);
+             return JS_DupValue(ctx, p->u.array.u.values[idx]);
+         case JS_CLASS_MAPPED_ARGUMENTS:
+             if (unlikely(idx >= p->u.array.count)) goto slow_path;
+@@ -9388,40 +9390,98 @@ static force_inline BOOL js_value_is_latin1_char(JSValueConst val,
+ /* Compact arrays are an internal representation for ordinary dense Arrays
+    built entirely from one-character Latin-1 string primitives. Unsupported
+    operations expand the bytes back into normal JSValue elements. */
++static force_inline JSString *compact_char_array_string(JSObject *p)
++{
++    return (JSString *)p->u.array.u.ptr;
++}
++
++static force_inline uint8_t *compact_char_array_bytes(JSObject *p)
++{
++    return compact_char_array_string(p)->u.str8;
++}
++
+ static int expand_compact_char_array(JSContext *ctx, JSObject *p,
+                                      uint32_t new_len)
+ {
+     uint32_t new_size;
+     uint64_t logical_bytes, grown_size;
+     size_t slack;
+-    uint8_t *new_chars;
++    JSString *old_string, *new_string;
+ 
+     if (!p->compact_char_array && p->u.array.count == 0) {
+         /* Normal dense-array capacity counts JSValue slots; compact capacity
+            counts bytes. Discard an empty reserve before changing units. */
+         js_free(ctx, p->u.array.u.values);
+-        p->u.array.u.uint8_ptr = NULL;
++        p->u.array.u.ptr = NULL;
+         p->u.array.u1.size = 0;
+     }
+-    logical_bytes = sizeof(JSValue) * (uint64_t)new_len;
++    logical_bytes = sizeof(JSString) + (uint64_t)new_len + 1u;
++    if (unlikely(new_len > JS_STRING_LEN_MAX)) {
++        JS_ThrowRangeError(ctx, "array exceeds the maximum string size");
++        return -1;
++    }
+     if (unlikely(ctx->rt->fast_array_byte_limit != 0) &&
+         logical_bytes > ctx->rt->fast_array_byte_limit) {
+         JS_ThrowRangeError(ctx, "array exceeds the device profile size");
+         return -1;
+     }
+-    if (new_len <= p->u.array.u1.size)
++    old_string = p->compact_char_array
++        ? compact_char_array_string(p) : NULL;
++    if (old_string != NULL && old_string->atom_type == 0 &&
++        js_rc(old_string)->ref_count == 1 &&
++        new_len <= p->u.array.u1.size)
+         return 0;
+-    grown_size = (uint64_t)p->u.array.u1.size * 3 / 2;
+-    if (grown_size < 64)
+-        grown_size = 64;
+-    if (grown_size > UINT32_MAX)
+-        grown_size = UINT32_MAX;
+-    new_size = new_len > grown_size ? new_len : (uint32_t)grown_size;
+-    new_chars = js_realloc2(ctx, p->u.array.u.uint8_ptr, new_size, &slack);
+-    if (!new_chars)
+-        return -1;
+-    new_size += slack;
+-    p->u.array.u.uint8_ptr = new_chars;
++    if (new_len <= p->u.array.u1.size) {
++        new_size = p->u.array.u1.size;
++    } else if (p->u.array.u1.size >= 256 * 1024) {
++        /* Large character decoders are both latency and peak-memory
++           sensitive. Grow in bounded 64 KiB pages instead of retaining the
++           50% slack used by tiny arrays. */
++        grown_size = ((uint64_t)new_len + 65535u) & ~(uint64_t)65535u;
++        new_size = grown_size > JS_STRING_LEN_MAX
++            ? JS_STRING_LEN_MAX : (uint32_t)grown_size;
++    } else {
++        grown_size = (uint64_t)p->u.array.u1.size * 3 / 2;
++        if (grown_size < 64)
++            grown_size = 64;
++        if (grown_size > JS_STRING_LEN_MAX)
++            grown_size = JS_STRING_LEN_MAX;
++        new_size = new_len > grown_size ? new_len : (uint32_t)grown_size;
++    }
++    if (old_string != NULL && old_string->atom_type == 0
++        && js_rc(old_string)->ref_count == 1) {
++#ifdef DUMP_LEAKS
++        list_del(&old_string->link);
++#endif
++        new_string = js_realloc2(ctx, old_string,
++                                 sizeof(JSString) + (size_t)new_size + 1,
++                                 &slack);
++        if (!new_string) {
++#ifdef DUMP_LEAKS
++            list_add_tail(&old_string->link, &ctx->rt->string_list);
++#endif
++            return -1;
++        }
++#ifdef DUMP_LEAKS
++        list_add_tail(&new_string->link, &ctx->rt->string_list);
++#endif
++        if (slack < (size_t)JS_STRING_LEN_MAX - new_size)
++            new_size += slack;
++        else
++            new_size = JS_STRING_LEN_MAX;
++    } else {
++        new_string = js_alloc_string(ctx, new_size, 0);
++        if (new_string == NULL)
++            return -1;
++        if (old_string != NULL && p->u.array.count != 0)
++            memcpy(new_string->u.str8, old_string->u.str8,
++                   p->u.array.count);
++        if (old_string != NULL)
++            js_free_string(ctx->rt, old_string);
++    }
++    new_string->len = p->u.array.count;
++    new_string->u.str8[p->u.array.count] = '\0';
++    p->u.array.u.ptr = new_string;
+     p->u.array.u1.size = new_size;
+     return 0;
+ }
+@@ -9440,7 +9500,7 @@ static int convert_compact_char_array_to_values(JSContext *ctx, JSObject *p)
+             return -1;
+         for (i = 0; i < count; i++) {
+             values[i] = js_new_string8_len(
+-                ctx, (const char *)&p->u.array.u.uint8_ptr[i], 1);
++                ctx, (const char *)&compact_char_array_bytes(p)[i], 1);
+             if (unlikely(JS_IsException(values[i]))) {
+                 while (i != 0)
+                     JS_FreeValue(ctx, values[--i]);
+@@ -9449,7 +9509,7 @@ static int convert_compact_char_array_to_values(JSContext *ctx, JSObject *p)
+             }
+         }
+     }
+-    js_free(ctx, p->u.array.u.uint8_ptr);
++    js_free_string(ctx->rt, compact_char_array_string(p));
+     p->u.array.u.values = values;
+     p->u.array.u1.size = count;
+     p->compact_char_array = 0;
+@@ -9597,10 +9657,19 @@ static int delete_property(JSContext *ctx, JSObject *p, JSAtom atom)
+                     if (idx == p->u.array.count - 1) {
+                         if (p->class_id == JS_CLASS_MAPPED_ARGUMENTS) {
+                             free_var_ref(ctx->rt, p->u.array.u.var_refs[idx]);
++                        } else if (p->compact_char_array) {
++                            if (expand_compact_char_array(
++                                    ctx, p, p->u.array.count))
++                                return -1;
+                         } else if (!p->compact_char_array) {
+                             JS_FreeValue(ctx, p->u.array.u.values[idx]);
+                         }
+                         p->u.array.count = idx;
++                        if (p->compact_char_array) {
++                            JSString *str = compact_char_array_string(p);
++                            str->len = idx;
++                            str->u.str8[idx] = '\0';
++                        }
+                         return TRUE;
+                     }
+                     if (convert_fast_array_to_array(ctx, p))
+@@ -9664,12 +9733,20 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
+     if (likely(p->fast_array)) {
+         uint32_t old_len = p->u.array.count;
+         if (len < old_len) {
+-            if (!p->compact_char_array) {
++            if (p->compact_char_array) {
++                if (expand_compact_char_array(ctx, p, old_len))
++                    return -1;
++            } else {
+                 for(i = len; i < old_len; i++) {
+                     JS_FreeValue(ctx, p->u.array.u.values[i]);
+                 }
+             }
+             p->u.array.count = len;
++            if (p->compact_char_array) {
++                JSString *str = compact_char_array_string(p);
++                str->len = len;
++                str->u.str8[len] = '\0';
++            }
+         }
+         p->prop[0].u.value = JS_NewUint32(ctx, len);
+     } else {
+@@ -9833,8 +9910,10 @@ static inline int add_fast_array_element(JSContext *ctx, JSObject *p,
+             return -1;
+         }
+         p->compact_char_array = 1;
+-        p->u.array.u.uint8_ptr[new_len - 1] = ch;
++        compact_char_array_bytes(p)[new_len - 1] = ch;
+         p->u.array.count = new_len;
++        compact_char_array_string(p)->len = new_len;
++        compact_char_array_bytes(p)[new_len] = '\0';
+         JS_FreeValue(ctx, val);
+         return TRUE;
+     }
+@@ -10257,7 +10336,12 @@ static int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
+             if (p->compact_char_array) {
+                 uint8_t ch;
+                 if (js_value_is_latin1_char(val, &ch)) {
+-                    p->u.array.u.uint8_ptr[idx] = ch;
++                    if (expand_compact_char_array(
++                            ctx, p, p->u.array.count)) {
++                        JS_FreeValue(ctx, val);
++                        return -1;
++                    }
++                    compact_char_array_bytes(p)[idx] = ch;
+                     JS_FreeValue(ctx, val);
+                     break;
+                 }
+@@ -14352,7 +14436,7 @@ static void js_print_object(JSPrintValueState *s, JSObject *p)
+                 if (p->compact_char_array) {
+                     JSValue value = js_new_string8_len(
+                         s->ctx,
+-                        (const char *)&p->u.array.u.uint8_ptr[i], 1);
++                        (const char *)&compact_char_array_bytes(p)[i], 1);
+                     js_print_value(s, value);
+                     JS_FreeValue(s->ctx, value);
+                 } else {
+@@ -19740,7 +19824,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                         goto name ## _slow_path;                        \
+                     if (p->compact_char_array)                         \
+                         val = js_new_string8_len(                      \
+-                            ctx, (const char *)&p->u.array.u.uint8_ptr[idx], 1); \
++                            ctx, (const char *)&compact_char_array_bytes(p)[idx], 1); \
+                     else                                               \
+                         val = JS_DupValue(ctx, p->u.array.u.values[idx]); \
+                     if (unlikely(JS_IsException(val))) {              \
+@@ -19796,7 +19880,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     if (p->compact_char_array)
+                         val = js_new_string8_len(
+                             ctx,
+-                            (const char *)&p->u.array.u.uint8_ptr[idx], 1);
++                            (const char *)&compact_char_array_bytes(p)[idx], 1);
+                     else
+                         val = JS_DupValue(ctx, p->u.array.u.values[idx]);
+                     if (unlikely(JS_IsException(val)))
+@@ -38475,7 +38559,7 @@ static int JS_WriteArray(BCWriterState *s, JSValueConst obj)
+         for(i = 0; i < p->u.array.count; i++) {
+             if (p->compact_char_array) {
+                 JSValue value = js_new_string8_len(
+-                    ctx, (const char *)&p->u.array.u.uint8_ptr[i], 1);
++                    ctx, (const char *)&compact_char_array_bytes(p)[i], 1);
+                 if (JS_IsException(value))
+                     goto fail;
+                 ret = JS_WriteObjectRec(s, value);
+@@ -43178,9 +43262,11 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
+         if (array->class_id == JS_CLASS_ARRAY && array->fast_array &&
+             array->compact_char_array && n == array->u.array.count &&
+             empty_separator) {
+-            JSValue result = js_new_string8_len(
+-                ctx, (const char *)array->u.array.u.uint8_ptr,
+-                array->u.array.count);
++            JSString *joined = compact_char_array_string(array);
++            joined->len = array->u.array.count;
++            joined->u.str8[joined->len] = '\0';
++            js_rc(joined)->ref_count++;
++            JSValue result = JS_MKPTR(JS_TAG_STRING, joined);
+             JS_FreeValue(ctx, sep);
+             JS_FreeValue(ctx, obj);
+             return result;
+@@ -43312,10 +43398,12 @@ static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
+                             return JS_EXCEPTION;
+                         p->compact_char_array = 1;
+                         for (i = 0; i < argc; i++)
+-                            p->u.array.u.uint8_ptr[p->u.array.count + i] =
++                            compact_char_array_bytes(p)[p->u.array.count + i] =
+                                 chars[i];
+                         p->prop[0].u.value = JS_NewInt32(ctx, new_len);
+                         p->u.array.count = new_len;
++                        compact_char_array_string(p)->len = new_len;
++                        compact_char_array_bytes(p)[new_len] = '\0';
+                         return JS_NewInt32(ctx, new_len);
+                     }
+                     if (p->compact_char_array &&

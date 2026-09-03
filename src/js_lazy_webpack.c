@@ -810,7 +810,12 @@ static JSValue js_lazy_function_to_string(JSContext *context,
         for (size_t i = 0; i < bundle->factory_count; i++) {
             ScriptLazyRuntimeFactory *factory = &bundle->factories[i];
             if (!JS_IsUndefined(factory->wrapper)
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
                 && JS_StrictEq(context, this_value, factory->wrapper) == 1) {
+#else
+                && JS_IsStrictEqual(
+                       context, this_value, factory->wrapper)) {
+#endif
                 if (!JS_IsUndefined(factory->compiled)) {
                     return JS_Call(context, runtime->function_to_string,
                                    factory->compiled, 0, NULL);
@@ -1279,7 +1284,8 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack(
         runtime->result.external_scripts_failed++;
         runtime->result.success = true;
         size_t slot = 0;
-        if (js_rt_bridge_node_slot_for_handle(
+        if (!script_runtime_document_refresh_failed(runtime)
+            && js_rt_bridge_node_slot_for_handle(
                 &runtime->bridge, script_handle, &slot)) {
             (void) script_runtime_dispatch_node(
                 runtime, runtime->bridge.nodes[slot], "error", NULL);

@@ -97,6 +97,58 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
     }
     CHECK(binary_valid);
 
+    static const char local_blob_probe[] =
+        "(()=>{globalThis.pocSummary='pending';const stats="
+        "__tilefinchNetworkQueueStats,before=[stats.admitted,stats.launched,"
+        "stats.currentCount,stats.localBlobReads,stats.localBlobFailures],"
+        "checks=[],type='application/x-tilefinch-local';"
+        "const fetchBlob=new Blob([new Uint8Array([0,65,255])],{type}),"
+        "fetchURL=URL.createObjectURL(fetchBlob),fetchJob=fetch(fetchURL)"
+        ".then(response=>{checks.push(response.status===200,response.url==="
+        "fetchURL,response.headers.get('content-type')===type,response.body!=="
+        "null);return response.arrayBuffer()}).then(buffer=>checks.push("
+        "new Uint8Array(buffer).join(',')==='0,65,255'));"
+        "URL.revokeObjectURL(fetchURL);"
+        "const order=[],xhrBlob=new Blob(['local-xhr'],{type:'text/plain'}),"
+        "xhrURL=URL.createObjectURL(xhrBlob),xhrJob=new Promise(resolve=>{"
+        "const xhr=new XMLHttpRequest;xhr.onreadystatechange=()=>order.push("
+        "xhr.readyState);xhr.onload=()=>order.push(5);xhr.onloadend=()=>{"
+        "order.push(6);checks.push(xhr.status===200,xhr.responseURL===xhrURL,"
+        "xhr.getResponseHeader('content-type')==='text/plain',"
+        "new TextDecoder().decode(xhr.response)==='local-xhr',"
+        "order.join(',')==='1,9,2,3,4,5,6');resolve()};xhr.open('GET',xhrURL);"
+        "xhr.responseType='arraybuffer';xhr.send();order.push(9);"
+        "URL.revokeObjectURL(xhrURL)});"
+        "const stressBlob=new Blob(['local']),stressURL="
+        "URL.createObjectURL(stressBlob),stress=[];for(let i=0;i<8;i++)"
+        "stress.push(new Promise(resolve=>{const xhr=new XMLHttpRequest;"
+        "xhr.onload=()=>resolve(xhr.responseText==='local');xhr.onerror=()=>"
+        "resolve(false);xhr.open('GET',stressURL);xhr.send()}));"
+        "URL.revokeObjectURL(stressURL);const revokedJob=fetch(stressURL)"
+        ".then(()=>false,error=>error instanceof TypeError);"
+        "Promise.all([fetchJob,xhrJob,revokedJob,...stress]).then(values=>{"
+        "checks.push(values[2]===true,values.slice(3).every(Boolean),"
+        "stats.admitted===before[0],stats.launched===before[1],"
+        "stats.currentCount===before[2],stats.localBlobReads-before[3]===10,"
+        "stats.localBlobFailures-before[4]===1);globalThis.pocSummary="
+        "checks.every(Boolean)?'local-blob-ok':'local-blob-failed:'+"
+        "checks.join(',')+':order='+order.join(',')}).catch(error=>"
+        "globalThis.pocSummary='local-blob-error:'+error);})()";
+    bool local_blob_evaluated = script_runtime_evaluate_diagnostic(
+        runtime, local_blob_probe, "<local-blob-probe>", &result);
+    bool local_blob_pumped = local_blob_evaluated
+        && pump_script_network(runtime, &result);
+    bool local_blob_valid = local_blob_pumped
+        && strcmp(result.summary, "local-blob-ok") == 0;
+    if (!local_blob_valid) {
+        fprintf(stderr,
+                "local-blob evaluated=%d pumped=%d summary=\"%s\" "
+                "error=\"%s\"\n",
+                local_blob_evaluated, local_blob_pumped, result.summary,
+                result.error);
+    }
+    CHECK(local_blob_valid);
+
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget->current == baseline);

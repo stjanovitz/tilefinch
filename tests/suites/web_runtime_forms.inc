@@ -171,6 +171,31 @@
         "return l1.value==='one'&&r1.value==='one'"
         "&&transformedValue.value==='PSP'&&transformedEnd.done"
         "&&data.get('a')==='1'&&data.get('b')==='two';})();"
+        "const readAll=async stream=>{const reader=stream.getReader(),chunks=[];"
+        "let total=0;for(;;){const item=await reader.read();if(item.done)break;"
+        "chunks.push(item.value);total+=item.value.byteLength;}const joined=new "
+        "Uint8Array(total);let at=0;for(const chunk of chunks){joined.set(chunk,"
+        "at);at+=chunk.byteLength;}return joined;};"
+        "const compressionResult=(async()=>{let invalidFormat=false,malformed=false;"
+        "try{new CompressionStream('br');}catch(error){invalidFormat=error instanceof "
+        "TypeError;}const source=new Uint8Array(270000);for(let i=0;i<source.length;"
+        "i++)source[i]=(i*29+7)&255;for(const format of ['deflate','deflate-raw',"
+        "'gzip']){const compressor=new CompressionStream(format),writer=compressor."
+        "writable.getWriter();await writer.write(source.subarray(0,90000));await "
+        "writer.write(source.subarray(90000,180000));await writer.write(source."
+        "subarray(180000));await writer.close();const packed=await readAll(compressor."
+        "readable),decompressor=new DecompressionStream(format),inflateWriter="
+        "decompressor.writable.getWriter();await inflateWriter.write(packed);await "
+        "inflateWriter.close();const restored=await readAll(decompressor.readable);"
+        "if(restored.length!==source.length) return false;for(let i=0;i<source.length;"
+        "i+=997)if(restored[i]!==source[i])return false;}try{const broken=new "
+        "DecompressionStream('gzip'),writer=broken.writable.getWriter();await writer."
+        "write(new Uint8Array([1,2,3]));await writer.close();}catch(error){malformed="
+        "error instanceof TypeError;}return invalidFormat&&malformed&&Object.prototype."
+        "toString.call(new CompressionStream('gzip'))==='[object CompressionStream]'"
+        "&&Object.prototype.toString.call(new DecompressionStream('gzip'))==="
+        "'[object DecompressionStream]'&&Function.prototype.toString.call("
+        "CompressionStream).includes('[native code]');})();"
         "const request=new Request('/submit',{method:'POST',"
         "body:new URLSearchParams({q:'bird'}),cache:'no-store',"
         "redirect:'manual',keepalive:true}),clone=request.clone(),"
@@ -184,10 +209,10 @@
         "&&redirect.headers.get('location').endsWith('/next');"
         "const beaconShape=typeof navigator.sendBeacon==='function'"
         "&&!navigator.sendBeacon('/too-large',new Blob([new Uint8Array(65537)]));"
-        "Promise.all([readerResult,streamResult,response.json(),"
+        "Promise.all([readerResult,streamResult,compressionResult,response.json(),"
         "clone.text()]).then(values=>{globalThis.pocSummary="
         "fileShape&&bodyShape&&beaconShape&&values[0]&&values[1]"
-        "&&values[2].ok&&values[3]==='q=bird'?'browser-io:ok':"
+        "&&values[2]&&values[3].ok&&values[4]==='q=bird'?'browser-io:ok':"
         "'browser-io:fail';}).catch(error=>globalThis.pocSummary="
         "'browser-io:error:'+error);"
         "</script></body>";
@@ -254,6 +279,14 @@
         "dataURL=canvas.toDataURL(),png=atob(dataURL.split(',')[1]),"
         "syncOk=context.canvas===canvas&&matrix.a===1&&matrix.e===0"
         "&&new DOMMatrix({a:2,b:0,c:0,d:3,e:4,f:5}).f===5"
+        "&&(()=>{const css=new DOMMatrixReadOnly('matrix(1, 0, 0, 1, 12, -4)'),"
+        "list=new DOMMatrixReadOnly('translate(8px, -3px) scale(2)'),"
+        "three=new DOMMatrixReadOnly('matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,7,9,0,1)');"
+        "let invalid=false;try{new DOMMatrixReadOnly('translate(20%)')}catch(error)"
+        "{invalid=error.name==='SyntaxError'}return css.e===12&&css.f===-4"
+        "&&list.a===2&&list.d===2&&list.e===8&&list.f===-3&&three.e===7"
+        "&&three.f===9&&css.is2D&&Object.prototype.toString.call(css)==="
+        "'[object DOMMatrixReadOnly]'&&invalid})()"
         "&&context.getLineDash().join(',')==='2,1'&&inside&&metrics.width>0"
         "&&gradient instanceof CanvasGradient"
         "&&gradientRight.data[0]>gradientLeft.data[0]"
@@ -642,7 +675,12 @@
     static const unsigned char ordered_dynamic_css[] =
         "#probe{font-weight:700}";
     static const unsigned char ordered_dynamic_script[] =
-        "order.push('dynamic-external')";
+        "const selfTiming=performance.getEntriesByName("
+        "'https://order.test/dynamic.js','resource')[0];"
+        "order.push(selfTiming&&Object.prototype.toString.call(selfTiming)==="
+        "'[object PerformanceResourceTiming]'&&Object.keys(selfTiming).length===0"
+        "&&selfTiming.initiatorType==='script'&&selfTiming.decodedBodySize>0"
+        "?'dynamic-external':'dynamic-timing-missing')";
     BrowserSession ordered_browser_session;
     CHECK(browser_session_init(&ordered_browser_session, &budget,
                                128 * 1024)
@@ -747,8 +785,10 @@
         "<!doctype html><body><iframe id='owned' src='/child.html'>"
         "</iframe></body>";
     static const char owned_child_page[] =
-        "<!doctype html><body><script>globalThis.pocSummary='child-ready'"
-        "</script></body>";
+        "<!doctype html><body><input id='frame-check' type='checkbox'>"
+        "<script>globalThis.pocSummary='child-ready';"
+        "document.getElementById('frame-check').addEventListener('click',"
+        "()=>globalThis.pocSummary='frame-clicked')</script></body>";
     BrowserSession frame_owner_session;
     NavigationSession frame_owner_navigation;
     CHECK(browser_session_init(&frame_owner_session, &budget, 64 * 1024)
@@ -775,7 +815,6 @@
           && frame_owner_navigation.frames_failed == 1
           && frame_owner_navigation.page.frame_count == 1);
     NavigationFrame *owned_frame = &frame_owner_navigation.page.frames[0];
-    MessageOpaqueProbe owned_frame_probe = {0};
     CHECK(document_parse(&owned_frame->document, &budget,
                          owned_child_page, sizeof(owned_child_page) - 1, 16));
     owned_frame->runtime = script_runtime_create_deferred(
@@ -783,9 +822,8 @@
         "https://frame-owner.test/child.html", NULL,
         &owned_frame->script_result);
     CHECK(owned_frame->runtime != NULL
-          && script_runtime_configure_messaging(
-              owned_frame->runtime, true, true, false, count_test_message,
-              &owned_frame_probe));
+          && navigation_test_configure_frame_messaging(
+              &frame_owner_navigation, owned_frame));
     CHECK(script_runtime_evaluate_diagnostic(
               owned_frame->runtime,
               "const original=parent.postMessage;parent.postMessage=()=>{};"
@@ -795,7 +833,63 @@
               &owned_frame->script_result)
           && strcmp(owned_frame->script_result.summary,
                     "same-origin-writable") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+              owned_frame->runtime,
+              "document.getElementById('frame-check').addEventListener("
+              "'click',()=>globalThis.pocSummary='frame-clicked')",
+              "https://frame-owner.test/frame-activation.js",
+              &owned_frame->script_result));
     owned_frame->loaded = true;
+    frame_owner_navigation.images = &frame_owner_navigation.page.images;
+    CHECK(navigation_test_refresh_frame_presentation(
+        &frame_owner_navigation, owned_frame));
+    CHECK(owned_frame->presentation != NULL);
+    CHECK(images_find_node(
+        &frame_owner_navigation.page.images,
+        owned_frame->element) != NULL);
+    CHECK(navigation_activate_frame(
+        &frame_owner_navigation, owned_frame->element));
+    CHECK(strcmp(owned_frame->script_result.summary,
+                 "frame-clicked") == 0);
+    /* Queue one complete legacy-capacity burst before delivery.  The first
+       child task replies three times while fifteen messages remain queued.
+       postMessage must queue all three replies rather than exposing the
+       bounded native queue as an author-visible InternalError. */
+    size_t posted_before = frame_owner_navigation.frame_messages_posted;
+    size_t delivered_before = frame_owner_navigation.frame_messages_delivered;
+    size_t dropped_burst_before = frame_owner_navigation.frame_messages_dropped;
+    CHECK(navigation_test_configure_frame_messaging(
+              &frame_owner_navigation, owned_frame)
+          && script_runtime_evaluate_diagnostic(
+              owned_frame->runtime,
+              "addEventListener('message',event=>{if(event.data.trigger){"
+              "parent.postMessage({reply:1},'*');"
+              "parent.postMessage({reply:2},'*');"
+              "parent.postMessage({reply:3},'*')}})",
+              "https://frame-owner.test/reply-burst.js",
+              &owned_frame->script_result)
+          && script_runtime_evaluate_diagnostic(
+              frame_owner_navigation.page.runtime,
+              "globalThis.replyBurst=0;"
+              "addEventListener('message',event=>{if(event.data.reply)"
+              "replyBurst++;globalThis.pocSummary=String(replyBurst)});"
+              "const target=document.getElementById('owned').contentWindow;"
+              "target.postMessage({trigger:true},'*');"
+              "for(let i=0;i<15;i++)target.postMessage({filler:i},'*')",
+              "https://frame-owner.test/queue-burst.js",
+              &frame_owner_navigation.page.script_result)
+          && frame_owner_navigation.page.message_count == 16u
+          && navigation_advance_runtime(&frame_owner_navigation, 1, 64)
+          && frame_owner_navigation.page.message_count == 0u
+          && frame_owner_navigation.frame_messages_posted
+                 == posted_before + 19u
+          && frame_owner_navigation.frame_messages_delivered
+                 == delivered_before + 19u
+          && frame_owner_navigation.frame_messages_dropped
+                 == dropped_burst_before
+          && owned_frame->script_result.uncaught_callback_errors == 0u
+          && strcmp(frame_owner_navigation.page.script_result.summary,
+                    "3") == 0);
     static const char failed_child_json[] = "{\"event\":\"failed-child\"}";
     static const char queued_origin[] = "*";
     CHECK(script_runtime_evaluate_diagnostic(
@@ -845,9 +939,8 @@
         "https://frame-owner.test/replacement-child.html", NULL,
         &owned_frame->script_result);
     CHECK(owned_frame->runtime != NULL
-          && script_runtime_configure_messaging(
-              owned_frame->runtime, true, true, false, count_test_message,
-              &owned_frame_probe));
+          && navigation_test_configure_frame_messaging(
+              &frame_owner_navigation, owned_frame));
     owned_frame->loaded = true;
     static const char queued_json[] = "{\"event\":\"queued-before-detach\"}";
     NavigationMessage *queued = &frame_owner_navigation.page.messages[0];
@@ -881,10 +974,12 @@
           && owned_frame->document.html == NULL
           && script_runtime_evaluate_diagnostic(
               frame_owner_navigation.page.runtime,
+              "savedOwnedWindow.postMessage({late:true},'*');"
               "globalThis.pocSummary=savedOwnedWindow.closed?"
               "'FRAME-DETACHED-OK':'FRAME-DETACHED-FAILED'",
               "https://frame-owner.test/check-frame.js",
               &frame_owner_navigation.page.script_result)
+          && frame_owner_navigation.page.message_count == 0
           && strcmp(frame_owner_navigation.page.script_result.summary,
                     "FRAME-DETACHED-OK") == 0);
     CHECK(script_runtime_evaluate_diagnostic(
@@ -905,8 +1000,147 @@
               &frame_owner_navigation.page.script_result)
           && strcmp(frame_owner_navigation.page.script_result.summary,
                     "FRAME-REATTACHED-OK") == 0);
+
+    /* A child realm mutates its owned document before the bounded refresh
+       fails.  The parent page must be retired too: its frame tables and
+       controller/layout state otherwise retain pointers into that poisoned
+       child graph. */
+    script_runtime_destroy(owned_frame->runtime);
+    owned_frame->runtime = NULL;
+    document_destroy(&owned_frame->document);
+    CHECK(document_parse(&owned_frame->document, &budget,
+                         owned_child_page, sizeof(owned_child_page) - 1, 16));
+    owned_frame->runtime = script_runtime_create_deferred(
+        &owned_frame->document, &budget, 2 * MIB, 1000,
+        "https://frame-owner.test/refresh-child.html", NULL,
+        &owned_frame->script_result);
+    CHECK(owned_frame->runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              owned_frame->runtime,
+              "setTimeout(()=>document.body.innerHTML='<p>changed</p>',0)",
+              "https://frame-owner.test/refresh-failure.js",
+              &owned_frame->script_result));
+    owned_frame->loaded = true;
+    script_runtime_test_refuse_next_document_refresh();
+    CHECK(!navigation_advance_runtime(&frame_owner_navigation, 1, 8)
+          && !frame_owner_navigation.page.loaded
+          && frame_owner_navigation.page.document.html == NULL
+          && frame_owner_navigation.page.runtime == NULL
+          && frame_owner_navigation.page.layout.count == 0u
+          && strstr(frame_owner_navigation.last_error,
+                    "refresh mutated DOM") != NULL);
     navigation_destroy(&frame_owner_navigation);
     browser_session_destroy(&frame_owner_session);
+    CHECK(budget.current == 0);
+
+    puts("test: nested iframe presentation and activation recurse by realm");
+    static const char nested_frame_page[] =
+        "<!doctype html><body><iframe id='outer' src='/outer.html'>"
+        "</iframe></body>";
+    static const char nested_outer_page[] =
+        "<!doctype html><body><iframe id='inner' src='/inner.html'>"
+        "</iframe></body>";
+    static const char nested_inner_page[] =
+        "<!doctype html><body><input id='nested-check' type='checkbox'>"
+        "<script>document.getElementById('nested-check').addEventListener("
+        "'click',()=>globalThis.pocSummary='nested-clicked')</script></body>";
+    BrowserSession nested_frame_session;
+    NavigationSession nested_frame_navigation;
+    MessageOpaqueProbe nested_frame_probe = {0};
+    CHECK(browser_session_init(&nested_frame_session, &budget, 64 * 1024)
+          && navigation_init(&nested_frame_navigation, &budget, 4));
+    navigation_attach_browser_session(&nested_frame_navigation,
+                                      &nested_frame_session);
+    navigation_enable_scripts(&nested_frame_navigation, 6 * MIB, 1000);
+    navigation_enable_document_scripts(&nested_frame_navigation, 8,
+                                       128 * 1024, 128 * 1024, 1000);
+    uint64_t nested_frame_generation = navigation_begin(
+        &nested_frame_navigation);
+    CHECK(navigation_commit_html(
+              &nested_frame_navigation, nested_frame_generation,
+              "https://nested-frame.test/", nested_frame_page,
+              strlen(nested_frame_page), 480, NULL, NULL, true)
+          && navigation_advance_runtime(&nested_frame_navigation, 1, 8)
+          && nested_frame_navigation.page.frame_count == 1);
+    NavigationFrame *outer_frame =
+        &nested_frame_navigation.page.frames[0];
+    CHECK(outer_frame->parent_runtime
+              == nested_frame_navigation.page.runtime
+          && outer_frame->parent_frame_slot_plus_one == 0
+          && document_parse(&outer_frame->document, &budget,
+                            nested_outer_page,
+                            sizeof(nested_outer_page) - 1, 16));
+    outer_frame->runtime = script_runtime_create_deferred(
+        &outer_frame->document, &budget, 2 * MIB, 1000,
+        "https://nested-frame.test/outer.html", NULL,
+        &outer_frame->script_result);
+    CHECK(outer_frame->runtime != NULL
+          && script_runtime_configure_messaging(
+              outer_frame->runtime, true, true, false, true,
+              count_test_message, &nested_frame_probe));
+    script_runtime_set_images(outer_frame->runtime, &outer_frame->images);
+    outer_frame->loaded = true;
+    nested_frame_navigation.images = &nested_frame_navigation.page.images;
+    CHECK(navigation_test_refresh_frame_presentation(
+              &nested_frame_navigation, outer_frame)
+          && navigation_advance_runtime(&nested_frame_navigation, 1, 8)
+          && nested_frame_navigation.page.frame_count == 2);
+    NavigationFrame *inner_frame =
+        &nested_frame_navigation.page.frames[1];
+    CHECK(inner_frame->parent_runtime == outer_frame->runtime
+          && inner_frame->parent_frame_slot_plus_one == 1
+          && document_parse(&inner_frame->document, &budget,
+                            nested_inner_page,
+                            sizeof(nested_inner_page) - 1, 16));
+    inner_frame->runtime = script_runtime_create_deferred(
+        &inner_frame->document, &budget, 2 * MIB, 1000,
+        "https://nested-frame.test/inner.html", NULL,
+        &inner_frame->script_result);
+    CHECK(inner_frame->runtime != NULL
+          && script_runtime_configure_messaging(
+              inner_frame->runtime, true, true, false, false,
+              count_test_message, &nested_frame_probe)
+          && script_runtime_evaluate_diagnostic(
+              inner_frame->runtime,
+              "top.postMessage({event:'nested-top'},'*');"
+              "globalThis.pocSummary=top!==parent?'nested-top-distinct':"
+              "'nested-top-aliased'",
+              "https://nested-frame.test/nested-top.js",
+              &inner_frame->script_result)
+          && strcmp(inner_frame->script_result.summary,
+                    "nested-top-distinct") == 0
+          && nested_frame_probe.calls == 1
+          && nested_frame_probe.last_target == -1
+          && script_runtime_evaluate_diagnostic(
+              inner_frame->runtime,
+              "document.getElementById('nested-check').addEventListener("
+              "'click',()=>globalThis.pocSummary='nested-clicked')",
+              "https://nested-frame.test/nested-activation.js",
+              &inner_frame->script_result));
+    script_runtime_set_images(inner_frame->runtime, &inner_frame->images);
+    inner_frame->loaded = true;
+    CHECK(navigation_test_refresh_frame_presentation(
+              &nested_frame_navigation, inner_frame)
+          && images_find_node(&outer_frame->images,
+                              inner_frame->element) != NULL
+          && images_find_node(&nested_frame_navigation.page.images,
+                              outer_frame->element) != NULL
+          && navigation_activate_frame(
+              &nested_frame_navigation, outer_frame->element)
+          && strcmp(inner_frame->script_result.summary,
+                    "nested-clicked") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+              nested_frame_navigation.page.runtime,
+              "document.getElementById('outer').remove()",
+              "https://nested-frame.test/remove-ancestor.js",
+              &nested_frame_navigation.page.script_result)
+          && navigation_advance_runtime(&nested_frame_navigation, 1, 8)
+          && outer_frame->retired && outer_frame->runtime == NULL
+          && outer_frame->document.html == NULL
+          && inner_frame->retired && inner_frame->runtime == NULL
+          && inner_frame->document.html == NULL);
+    navigation_destroy(&nested_frame_navigation);
+    browser_session_destroy(&nested_frame_session);
     CHECK(budget.current == 0);
 
     puts("test: script pressure admission skips before allocator failure");
@@ -1595,10 +1829,13 @@
         "<body><div id=root class=outer>OLD</div><script>"
         "const stream=new ReadableStream({start(controller){controller.close();}});"
         "stream.pipeThrough(new TextEncoderStream());"
-        "const streamOk=typeof ReadableStream.prototype.pipeTo==='function';"
+        "const streamNames=Reflect.ownKeys(ReadableStream.prototype).map(String).sort().join(','),streamOk=typeof ReadableStream.prototype.pipeTo==='function'&&streamNames==='Symbol(Symbol.asyncIterator),Symbol(Symbol.toStringTag),cancel,constructor,getReader,locked,pipeThrough,pipeTo,tee,values'&&Object.prototype.toString.call(new ReadableStream({start(c){c.close()}}))==='[object ReadableStream]'&&Function.prototype.toString.call(ReadableStream).includes('[native code]')&&Function.prototype.toString.call(ReadableStream.prototype.getReader).includes('[native code]');"
         "const lockStream=new ReadableStream({start(controller){controller.close();}}),lockReader=lockStream.getReader();let secondReaderError='';try{lockStream.getReader();}catch(error){secondReaderError=error.name;}lockReader.releaseLock();const cancelResponse=new Response('cancel');cancelResponse.body.cancel();const streamStateOk=secondReaderError==='TypeError'&&!lockStream.locked&&cancelResponse.bodyUsed;"
         "localStorage.setItem('theme','dark');"
         "localStorage.alpha='one';localStorage.setItem('beta','two');"
+        "Promise.all([navigator.storage.estimate(),navigator.storage.persisted(),navigator.storage.persist()]).then(values=>{const estimate=values[0],ok=Number.isFinite(estimate.usage)&&estimate.usage>0&&Number.isFinite(estimate.quota)&&estimate.quota>=estimate.usage&&values[1]===false&&values[2]===false;document.body.setAttribute('data-storage-manager',ok?'site':'bad');},error=>{document.body.setAttribute('data-storage-manager',error&&error.name==='SecurityError'?'opaque':'bad');});"
+        "navigator.keyboard.getLayoutMap().then(map=>{const ok=map instanceof KeyboardLayoutMap&&Object.prototype.toString.call(map)==='[object KeyboardLayoutMap]'&&map.size===0&&map.get('KeyA')===undefined&&!map.has('KeyA')&&[...map].length===0&&navigator.keyboard===navigator.keyboard&&Object.prototype.toString.call(navigator.keyboard)==='[object Keyboard]';document.body.setAttribute('data-keyboard',ok?'empty':'bad');});"
+        "Promise.all([navigator.getBattery(),navigator.permissions.query({name:'geolocation'}),isSecureContext?navigator.gpu.requestAdapter():Promise.resolve(null)]).then(values=>{const battery=values[0],permission=values[1],ok=battery instanceof BatteryManager&&battery instanceof EventTarget&&battery.charging===true&&battery.chargingTime===0&&battery.dischargingTime===Infinity&&battery.level===1&&permission instanceof PermissionStatus&&permission instanceof EventTarget&&permission.name==='geolocation'&&permission.state==='denied'&&values[2]===null&&navigator.connection instanceof NetworkInformation&&navigator.connection instanceof EventTarget&&navigator.connection.effectiveType==='3g'&&navigator.connection.rtt===300&&navigator.connection.downlink===1.5&&navigator.connection.saveData===false;document.body.setAttribute('data-platform-status',ok?'honest':'bad');});"
         "const storageKeys=[];for(let i=0;i<localStorage.length;i++)"
         "storageKeys.push(localStorage.key(i));"
         "const storageEnumerable=Object.keys(localStorage),storageOk="
@@ -1612,21 +1849,22 @@
         "localStorage.removeItem('beta');"
         "const startupOk=matchMedia('(max-width:480px)').matches&&matchMedia('(orientation:landscape) and (hover:none) and (pointer:coarse)').matches&&!matchMedia('(min-width:481px)').matches&&screen.orientation.type==='landscape-primary'&&screen.orientation.angle===90&&'oninput' in document&&'onclick' in document.createElement('button')&&document.hasFocus()===true;"
         "const randomBytes=crypto.getRandomValues(new Uint8Array(32));"
-        "performance.mark('startup');const perfOk=performance.getEntriesByName('startup').length===1&&PerformanceObserver.supportedEntryTypes.includes('resource');"
+        "performance.mark('startup');const heapMemory=performance.memory,heapMemoryProto=Object.getPrototypeOf(heapMemory),perfOk=performance.getEntriesByName('startup').length===1&&PerformanceObserver.supportedEntryTypes.includes('resource')&&Object.prototype.toString.call(heapMemory)==='[object MemoryInfo]'&&heapMemory!==performance.memory&&Object.getOwnPropertyNames(heapMemory).length===0&&Object.getOwnPropertyNames(heapMemoryProto).join(',')==='totalJSHeapSize,usedJSHeapSize,jsHeapSizeLimit'&&heapMemory.constructor===Object&&Number.isFinite(heapMemory.jsHeapSizeLimit)&&Number.isFinite(heapMemory.totalJSHeapSize)&&Number.isFinite(heapMemory.usedJSHeapSize)&&heapMemory.jsHeapSizeLimit>=heapMemory.totalJSHeapSize&&heapMemory.totalJSHeapSize>=heapMemory.usedJSHeapSize&&heapMemory.usedJSHeapSize>0;"
         "const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');"
-        "const blob=new Blob(['PSP'],{type:'text/plain'});const blobURL=URL.createObjectURL(blob);const workerBlob=new Blob(['self.ready=true;'],{type:'text/javascript'});const workerURL=URL.createObjectURL(workerBlob);const worker=new Worker(workerURL);const blobOk=blob.size===3&&blob.type==='text/plain'&&blobURL.startsWith('blob:https://')&&worker instanceof Worker;worker.terminate();URL.revokeObjectURL(workerURL);URL.revokeObjectURL(blobURL);"
-        "const interfaceHost=document.createElement('div');document.body.appendChild(interfaceHost);const shadow=interfaceHost.attachShadow({mode:'closed'});const frame=document.createElement('iframe');frame.id='shadow-frame';shadow.appendChild(frame);const iterator=document.createNodeIterator(interfaceHost,NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT);const nativeSource=Function.prototype.toString;const prototypeQueriesOk=[Document.prototype,DocumentFragment.prototype,Element.prototype].every(proto=>typeof proto.querySelector==='function'&&typeof proto.querySelectorAll==='function'&&nativeSource.call(proto.querySelector).includes('[native code]')&&nativeSource.call(proto.querySelectorAll).includes('[native code]'));const frameEval=frame.contentWindow.eval,staleFrame=document.createElement('iframe'),staleWindow=staleFrame.contentWindow;let stalePostOk=true;try{staleWindow.postMessage({probe:true},'*');}catch(_){stalePostOk=false;}const interfaceBits=[interfaceHost instanceof HTMLDivElement,interfaceHost.nodeType===Node.ELEMENT_NODE,frame instanceof HTMLIFrameElement,shadow instanceof ShadowRoot,shadow.getElementById('shadow-frame')===frame,frame.isConnected,frame.contentDocument instanceof Document&&frame.contentDocument!==document,staleFrame.contentDocument===null,frameEval('21*2')===42,stalePostOk,nativeSource.call(frameEval).includes('[native code]'),prototypeQueriesOk,interfaceHost.shadowRoot===null,iterator.nextNode()!==null,interfaceHost.isConnected,interfaceHost.getBoundingClientRect().width>0,document.scripts.length>0,document.styleSheets.length>0],interfaceOk=interfaceBits.every(Boolean);"
+        "const blob=new Blob(['PSP'],{type:'text/plain'});const blobURL=URL.createObjectURL(blob);const workerBlob=new Blob(['self.ready=true;'],{type:'text/javascript'});const workerURL=URL.createObjectURL(workerBlob);const worker=new Worker(workerURL);const builtinSource=Function.prototype.toString;const blobOk=blob.size===3&&blob.type==='text/plain'&&Object.getOwnPropertyNames(blob).length===0&&blob._bytes===undefined&&blobURL.startsWith('blob:https://')&&worker instanceof Worker&&worker instanceof EventTarget&&Object.prototype.toString.call(worker)==='[object Worker]'&&Object.getPrototypeOf(Worker.prototype)===EventTarget.prototype&&Object.getOwnPropertyNames(worker).length===0&&Blob.name==='Blob'&&URL.createObjectURL.name==='createObjectURL'&&URL.revokeObjectURL.name==='revokeObjectURL'&&builtinSource.call(Blob).includes('[native code]')&&builtinSource.call(Blob.prototype.slice).includes('[native code]')&&builtinSource.call(MutationObserver).includes('[native code]')&&builtinSource.call(PerformanceObserver.prototype.observe).includes('[native code]')&&builtinSource.call(Worker).includes('[native code]')&&builtinSource.call(Worker.prototype.postMessage).includes('[native code]');worker.terminate();URL.revokeObjectURL(workerURL);URL.revokeObjectURL(blobURL);"
+        "const interfaceHost=document.createElement('div');document.body.appendChild(interfaceHost);const shadow=interfaceHost.attachShadow({mode:'closed'});const frame=document.createElement('iframe');frame.id='shadow-frame';frame.style.cssText='width:300px;height:65px';frame.setAttribute('sandbox','allow-same-origin');shadow.appendChild(frame);const shadowFrameRect=frame.getBoundingClientRect(),shadowHostRect=interfaceHost.getBoundingClientRect();const iterator=document.createNodeIterator(interfaceHost,NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT);const nativeSource=Function.prototype.toString;const prototypeQueriesOk=[Document.prototype,DocumentFragment.prototype,Element.prototype].every(proto=>typeof proto.querySelector==='function'&&typeof proto.querySelectorAll==='function'&&nativeSource.call(proto.querySelector).includes('[native code]')&&nativeSource.call(proto.querySelectorAll).includes('[native code]'));const frameEval=frame.contentWindow.eval;frame.contentWindow.frameOnly=40;delete globalThis.frameEvalLeak;const directFrameEval=frameEval('frameOnly+2')===42;frameEval('frameEvalLeak=7');const isolatedFrameEval=frame.contentWindow.frameEvalLeak===7&&globalThis.frameEvalLeak===undefined;const staleFrame=document.createElement('iframe'),staleWindow=staleFrame.contentWindow,eventShape=new Event('tilefinch-shape');let stalePostOk=true;try{staleWindow.postMessage({probe:true},'*');}catch(_){stalePostOk=false;}dispatchEvent(eventShape);const eventPrototypeOk=['composedPath','preventDefault','stopPropagation','stopImmediatePropagation'].every(name=>typeof Event.prototype[name]==='function'&&!Object.prototype.hasOwnProperty.call(eventShape,name));const interfaceBits=[interfaceHost instanceof HTMLDivElement,interfaceHost.nodeType===Node.ELEMENT_NODE,frame instanceof HTMLIFrameElement,shadow instanceof ShadowRoot,shadow.getElementById('shadow-frame')===frame,frame.parentNode===shadow,frame.parentElement===null,shadowFrameRect.width===300,shadowFrameRect.height===65,shadowHostRect.height>=65,frame.isConnected,frame.contentDocument instanceof Document&&frame.contentDocument!==document,Object.prototype.toString.call(frame.contentWindow)==='[object Window]',Object.prototype.toString.call(frame.contentDocument)==='[object HTMLDocument]','eval' in frame.contentWindow,typeof frameEval==='function',frameEval('21*2')===42,directFrameEval,isolatedFrameEval,stalePostOk,nativeSource.call(frameEval).includes('[native code]'),prototypeQueriesOk,eventPrototypeOk,interfaceHost.shadowRoot===null,iterator.nextNode()!==null,interfaceHost.isConnected,interfaceHost.getBoundingClientRect().width>0,document.scripts.length>0,document.styleSheets.length>0],interfaceOk=interfaceBits.every(Boolean);"
         "const positionFirst=document.createElement('i'),positionSecond=document.createElement('i'),positionDetached=document.createElement('i');interfaceHost.append(positionFirst,positionSecond);const disconnectedForward=positionFirst.compareDocumentPosition(positionDetached),disconnectedReverse=positionDetached.compareDocumentPosition(positionFirst);let invalidPositionThrew=false;try{positionFirst.compareDocumentPosition({});}catch(error){invalidPositionThrew=error instanceof TypeError;}const positionOk=Node.DOCUMENT_POSITION_DISCONNECTED===1&&Node.prototype.DOCUMENT_POSITION_CONTAINED_BY===16&&positionFirst.compareDocumentPosition(positionFirst)===0&&interfaceHost.compareDocumentPosition(positionFirst)===(Node.DOCUMENT_POSITION_FOLLOWING|Node.DOCUMENT_POSITION_CONTAINED_BY)&&positionFirst.compareDocumentPosition(interfaceHost)===(Node.DOCUMENT_POSITION_PRECEDING|Node.DOCUMENT_POSITION_CONTAINS)&&positionFirst.compareDocumentPosition(positionSecond)===Node.DOCUMENT_POSITION_FOLLOWING&&positionSecond.compareDocumentPosition(positionFirst)===Node.DOCUMENT_POSITION_PRECEDING&&(disconnectedForward&(Node.DOCUMENT_POSITION_DISCONNECTED|Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC))===(Node.DOCUMENT_POSITION_DISCONNECTED|Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC)&&(disconnectedForward&6)!==0&&(disconnectedReverse&6)!==0&&(disconnectedForward&6)!==(disconnectedReverse&6)&&invalidPositionThrew;"
         "interfaceHost.style.setProperty('--CaseSensitive','kept');interfaceHost.style.cssFloat='left';interfaceHost.style.placeItems='center end';interfaceHost.style.placeSelf='start end';interfaceHost.style.placeContent='end center';const cssomNameOk=interfaceHost.style.getPropertyValue('--CaseSensitive')==='kept'&&interfaceHost.style.getPropertyValue('float')==='left'&&interfaceHost.style.alignItems==='center'&&interfaceHost.style.justifyItems==='end'&&interfaceHost.style.placeItems==='center end'&&interfaceHost.style.alignSelf==='start'&&interfaceHost.style.justifySelf==='end'&&interfaceHost.style.placeSelf==='start end'&&interfaceHost.style.alignContent==='end'&&interfaceHost.style.justifyContent==='center'&&interfaceHost.style.placeContent==='end center';"
-        "const capabilitiesOk=navigator.gpu===undefined&&typeof GPU==='undefined'&&typeof RTCPeerConnection==='undefined'&&typeof RTCDataChannel==='undefined';"
+        "const mutationShapeObserver=new MutationObserver(()=>{}),mutationShapeOk=Object.getOwnPropertyNames(mutationShapeObserver).length===0&&Object.prototype.toString.call(mutationShapeObserver)==='[object MutationObserver]'&&Object.prototype.toString.call(new PerformanceObserver(()=>{}))==='[object PerformanceObserver]';const xhrProbe=new XMLHttpRequest,xhrPrototypeNames=Object.getOwnPropertyNames(XMLHttpRequest.prototype),xhrShapeOk=XMLHttpRequest.name==='XMLHttpRequest'&&Object.prototype.toString.call(xhrProbe)==='[object XMLHttpRequest]'&&xhrProbe instanceof EventTarget&&Object.getPrototypeOf(XMLHttpRequest.prototype)===XMLHttpRequestEventTarget.prototype&&xhrProbe.upload instanceof XMLHttpRequestUpload&&xhrProbe.upload instanceof EventTarget&&['readyState','response','responseText','responseType','responseURL','responseXML','status','statusText','timeout','upload','withCredentials','onreadystatechange'].every(name=>xhrPrototypeNames.includes(name))&&!xhrPrototypeNames.some(name=>name[0]==='_'||name==='emit')&&Function.prototype.toString.call(XMLHttpRequest).includes('[native code]')&&Function.prototype.toString.call(XMLHttpRequest.prototype.open).includes('[native code]')&&Function.prototype.toString.call(XMLHttpRequestEventTarget.prototype.addEventListener).includes('[native code]');"
+        "let navigatorConstructed=false,uaDataConstructed=false,gpuConstructed=false,wgslConstructed=false,pluginsConstructed=false,mimeTypesConstructed=false,clipboardConstructed=false,storageManagerConstructed=false,keyboardConstructed=false,keyboardMapConstructed=false;try{new Navigator}catch(_){navigatorConstructed=true}try{new NavigatorUAData}catch(_){uaDataConstructed=true}try{new GPU}catch(_){gpuConstructed=true}try{new WGSLLanguageFeatures}catch(_){wgslConstructed=true}try{new PluginArray}catch(_){pluginsConstructed=true}try{new MimeTypeArray}catch(_){mimeTypesConstructed=true}try{new Clipboard}catch(_){clipboardConstructed=true}try{new StorageManager}catch(_){storageManagerConstructed=true}try{new Keyboard}catch(_){keyboardConstructed=true}try{new KeyboardLayoutMap}catch(_){keyboardMapConstructed=true}const navigatorIdentityOwn=Object.getOwnPropertyNames(navigator).some(name=>['userAgent','appCodeName','appName','appVersion','language','languages','platform','product','productSub','vendor','vendorSub','maxTouchPoints','cookieEnabled','onLine','hardwareConcurrency','deviceMemory','userAgentData','gpu','plugins','mimeTypes','pdfViewerEnabled','webdriver','javaEnabled','getGamepads','clipboard','storage','keyboard','connection','getBattery','permissions','sendBeacon'].includes(name)),navigatorShapeOk=navigator instanceof Navigator&&Object.prototype.toString.call(navigator)==='[object Navigator]'&&!navigatorIdentityOwn&&Object.getPrototypeOf(navigator)===Navigator.prototype&&clientInformation===navigator&&navigator.appCodeName==='Mozilla'&&navigator.appName==='Netscape'&&navigator.product==='Gecko'&&navigator.vendor===''&&navigator.webdriver===false&&navigator.pdfViewerEnabled===false&&navigator.javaEnabled()===false&&navigator.plugins instanceof PluginArray&&navigator.mimeTypes instanceof MimeTypeArray&&navigator.plugins.length===0&&navigator.mimeTypes.length===0&&navigator.plugins.item(0)===null&&navigator.mimeTypes.namedItem('application/pdf')===null&&Object.prototype.toString.call(navigator.plugins)==='[object PluginArray]'&&Object.prototype.toString.call(navigator.mimeTypes)==='[object MimeTypeArray]'&&navigator.clipboard instanceof Clipboard&&Object.prototype.toString.call(navigator.clipboard)==='[object Clipboard]'&&navigator.storage instanceof StorageManager&&navigator.storage===navigator.storage&&Object.prototype.toString.call(navigator.storage)==='[object StorageManager]'&&navigator.keyboard instanceof Keyboard&&navigator.keyboard===navigator.keyboard&&Object.prototype.toString.call(navigator.keyboard)==='[object Keyboard]'&&navigator.userAgentData instanceof NavigatorUAData&&Object.prototype.toString.call(navigator.userAgentData)==='[object NavigatorUAData]'&&navigatorConstructed&&uaDataConstructed&&pluginsConstructed&&mimeTypesConstructed&&clipboardConstructed&&storageManagerConstructed&&keyboardConstructed&&keyboardMapConstructed;const platformStatusShapeOk=navigator.connection===navigator.connection&&navigator.connection instanceof NetworkInformation&&Object.prototype.toString.call(navigator.connection)==='[object NetworkInformation]'&&navigator.permissions===navigator.permissions&&navigator.permissions instanceof Permissions&&Object.prototype.toString.call(navigator.permissions)==='[object Permissions]'&&typeof navigator.getBattery==='function';const gpuEntryOk=!isSecureContext?navigator.gpu===undefined:navigator.gpu===navigator.gpu&&navigator.gpu instanceof GPU&&Object.prototype.toString.call(navigator.gpu)==='[object GPU]'&&Object.getOwnPropertyNames(navigator.gpu).length===0&&navigator.gpu.wgslLanguageFeatures instanceof WGSLLanguageFeatures&&Object.prototype.toString.call(navigator.gpu.wgslLanguageFeatures)==='[object WGSLLanguageFeatures]'&&navigator.gpu.wgslLanguageFeatures.size===0&&[...navigator.gpu.wgslLanguageFeatures].length===0&&navigator.gpu.getPreferredCanvasFormat()==='bgra8unorm'&&gpuConstructed&&wgslConstructed;const capabilitiesOk=navigatorShapeOk&&platformStatusShapeOk&&gpuEntryOk&&typeof RTCPeerConnection==='undefined'&&typeof RTCDataChannel==='undefined';"
         "const encoder=new TextEncoder,encodedReplacement=encoder.encode(String.fromCharCode(0xd800)),intoTarget=new Uint8Array(4),intoResult=encoder.encodeInto('A€B',intoTarget);const streamingDecoder=new TextDecoder,streamFirst=streamingDecoder.decode(new Uint8Array([0xe2,0x82]),{stream:true}),streamSecond=streamingDecoder.decode(new Uint8Array([0xac]));let fatalEncoding='';try{new TextDecoder('utf-8',{fatal:true}).decode(new Uint8Array([0xc0]));}catch(error){fatalEncoding=error.name;}const encodingOk=encodedReplacement.join(',')==='239,191,189'&&intoResult.read===2&&intoResult.written===4&&intoTarget.join(',')==='65,226,130,172'&&streamFirst===''&&streamSecond==='€'&&new TextDecoder().decode(new Uint8Array([0xef,0xbb,0xbf,65]))==='A'&&new TextDecoder('utf8',{ignoreBOM:true}).decode(new Uint8Array([0xef,0xbb,0xbf,65]))==='﻿A'&&new TextDecoder().decode(new Uint8Array([0xc0,0xaf])).length===2&&fatalEncoding==='TypeError';"
         "let invalidBase64Name='';try{atob('!');}catch(error){invalidBase64Name=error.name;}const base64Ok=atob(btoa('PSP\\0'))==='PSP\\0'&&atob('UFM')==='PS'&&atob('UFM=')==='PS'&&invalidBase64Name==='InvalidCharacterError';"
         "const abortController=new AbortController,abortSignal=abortController.signal;let abortSeen=false;abortSignal.addEventListener('abort',()=>abortSeen=true,{once:true});abortController.abort();const abortOk=abortSignal.aborted&&abortSeen&&abortSignal.reason instanceof DOMException&&abortSignal.reason.name==='AbortError';"
         "const template=document.createElement('template');template.innerHTML='<template for=target><b>update</b></template><template data-assistant-presentation-flush></template>';const templateClone=template.cloneNode(true),clonedTarget=templateClone.content.querySelector('template[for=target]'),flushTemplate=template.content.querySelector('template[data-assistant-presentation-flush]'),fragmentProbe=document.createDocumentFragment(),fragmentText=document.createTextNode('fragment');fragmentProbe.appendChild(fragmentText);const fragmentHost=document.createElement('div');fragmentHost.appendChild(fragmentProbe);const equalProbe=document.createElement('p');equalProbe.textContent='equal';const templateOk=template.children.length===0&&template.content.querySelector('template[for=target]')!==null&&template.content.querySelectorAll('template[for],template[data-assistant-presentation-flush]').length===2&&flushTemplate.matches('template[data-assistant-presentation-flush]')&&clonedTarget.content.querySelector('b').textContent==='update'&&equalProbe.isEqualNode(equalProbe.cloneNode(true))&&fragmentProbe.childNodes.length===0&&fragmentHost.textContent==='fragment';"
-        "const parsedDocument=new DOMParser().parseFromString('<p id=parsed>One &amp; <b>two</b></p>','text/html'),xmlDocument=new DOMParser().parseFromString('<x/>','application/xml'),parsedElement=parsedDocument.getElementById('parsed'),domParserBits=[parsedDocument instanceof Document,parsedDocument.nodeType===Node.DOCUMENT_NODE,parsedDocument.defaultView===null,parsedDocument.contentType==='text/html',parsedDocument.documentElement.textContent==='One & two',parsedElement?.querySelector('b').textContent==='two',xmlDocument instanceof Document&&xmlDocument.documentElement?.localName==='x'],domParserOk=domParserBits.every(Boolean);"
+        "let detachedCanvasScans=0;const savedQuerySelectorAll=Element.prototype.querySelectorAll;Element.prototype.querySelectorAll=function(...args){detachedCanvasScans++;return savedQuerySelectorAll.apply(this,args);};const parsedDocument=new DOMParser().parseFromString('<p id=parsed>One &amp; <b>two</b></p>','text/html'),xmlDocument=new DOMParser().parseFromString('<x/>','application/xml');Element.prototype.querySelectorAll=savedQuerySelectorAll;const parsedElement=parsedDocument.getElementById('parsed'),domParserBits=[detachedCanvasScans===0,parsedDocument instanceof Document,parsedDocument.nodeType===Node.DOCUMENT_NODE,parsedDocument.defaultView===null,parsedDocument.contentType==='text/html',parsedDocument.documentElement.textContent==='One & two',parsedElement?.querySelector('b').textContent==='two',xmlDocument instanceof Document&&xmlDocument.documentElement?.localName==='x'],domParserOk=domParserBits.every(Boolean);"
         "const workDocument=document.implementation.createHTMLDocument('');workDocument.documentElement.innerHTML='<style id=\"adopted-style\">#adopted-probe{color:rgb(1,2,3)}</style>';const adoptedStyle=workDocument.getElementById('adopted-style');document.head.appendChild(adoptedStyle);const createdDocumentOk=adoptedStyle instanceof HTMLStyleElement&&adoptedStyle.ownerDocument===document&&adoptedStyle.parentElement===document.head&&adoptedStyle.textContent.includes('#adopted-probe');"
         "const moveA=document.createElement('div'),moveB=document.createElement('div'),moveOne=document.createElement('i'),moveTwo=document.createElement('i'),moveThree=document.createElement('i');moveOne.id='move-one';moveTwo.id='move-two';moveThree.id='move-three';moveA.appendChild(moveOne);moveA.appendChild(moveTwo);moveB.appendChild(moveOne);const crossAppendOk=moveA.firstChild===moveTwo&&moveB.firstChild===moveOne;moveA.insertBefore(moveTwo,moveTwo);moveA.appendChild(moveThree);moveA.appendChild(moveTwo);const reorderOk=moveA.firstChild===moveThree&&moveA.lastChild===moveTwo;const orphanReference=document.createElement('i');let invalidInsertThrew=false;try{moveA.insertBefore(moveOne,orphanReference);}catch(_){invalidInsertThrew=true;}const invalidInsertPreserved=moveOne.parentElement===moveB&&moveA.firstChild===moveThree;moveA.insertBefore(moveOne,moveTwo);const crossInsertOk=moveB.childNodes.length===0&&moveA.childNodes.length===3&&moveA.childNodes[0]===moveThree&&moveA.childNodes[1]===moveOne&&moveA.childNodes[2]===moveTwo;const preinsertOk=crossAppendOk&&reorderOk&&invalidInsertThrew&&invalidInsertPreserved&&crossInsertOk;"
-        "const platformOk=streamOk&&streamStateOk&&storageOk&&localStorage.length===1&&capabilitiesOk&&cssomNameOk&&encodingOk&&base64Ok&&abortOk&&templateOk&&domParserOk&&createdDocumentOk&&preinsertOk&&positionOk&&randomBytes.some(value=>value!==0)&&crypto.randomUUID().length===36&&svg.namespaceURI.includes('svg')&&perfOk&&blobOk&&interfaceOk&&top===window&&parent===window;"
+        "const platformOk=streamOk&&streamStateOk&&storageOk&&localStorage.length===1&&capabilitiesOk&&mutationShapeOk&&xhrShapeOk&&cssomNameOk&&encodingOk&&base64Ok&&abortOk&&templateOk&&domParserOk&&createdDocumentOk&&preinsertOk&&positionOk&&randomBytes.some(value=>value!==0)&&crypto.randomUUID().length===36&&svg.namespaceURI.includes('svg')&&perfOk&&blobOk&&interfaceOk&&top===window&&parent===window;"
         "const url=new URL('../next?q=one+two#part','https://example.test/a/b');url.searchParams.set('extra','yes');"
         "const recordParams=new URLSearchParams({conversationState:'{\\\"messages\\\":[]}',count:0});const sequenceParams=new URLSearchParams([['first','one'],['first','two']]);"
         "const urlOk=url.pathname==='/next'&&url.searchParams.get('q')==='one two'&&url.search.includes('extra=yes')&&String(new URL('.',url))==='https://example.test/'&&recordParams.toString()==='conversationState=%7B%22messages%22%3A%5B%5D%7D&count=0'&&sequenceParams.getAll('first').join(',')==='one,two';"
@@ -1649,7 +1887,11 @@
     CHECK(document_parse(&mutated, &budget, mutation_page,
                          strlen(mutation_page), 29));
     ScriptResult mutation_scripts;
-    bool mutation_ok = scripts_run_document(&mutated, &budget, 4 * MIB,
+    /* The combined standards fixture intentionally exercises the entire
+       bootstrap in one realm.  This small test-only reserve keeps additions
+       from turning unrelated API assertions into a hard heap-boundary test. */
+    bool mutation_ok = scripts_run_document(&mutated, &budget,
+                                            4 * MIB + 80 * 1024,
                                             1000, &mutation_scripts);
     if (!mutation_ok) {
         fprintf(stderr, "mutation runtime failed: %s\n",
@@ -1669,11 +1911,31 @@
                 mutation_scripts.error);
     }
     CHECK(mutation_ok);
+    size_t storage_manager_state_length = 0;
+    const char *storage_manager_state = document_attribute(
+        document_body_node(&mutated), "data-storage-manager",
+        &storage_manager_state_length);
+    CHECK(storage_manager_state != NULL
+          && storage_manager_state_length == 6
+          && memcmp(storage_manager_state, "opaque", 6) == 0);
+    size_t keyboard_state_length = 0;
+    const char *keyboard_state = document_attribute(
+        document_body_node(&mutated), "data-keyboard",
+        &keyboard_state_length);
+    CHECK(keyboard_state != NULL && keyboard_state_length == 5
+          && memcmp(keyboard_state, "empty", 5) == 0);
+    size_t platform_status_length = 0;
+    const char *platform_status = document_attribute(
+        document_body_node(&mutated), "data-platform-status",
+        &platform_status_length);
+    CHECK(platform_status != NULL && platform_status_length == 6
+          && memcmp(platform_status, "honest", 6) == 0);
     CHECK(mutation_scripts.success && mutation_scripts.relayout_required
           && mutation_scripts.dom_mutations >= 4
           && mutation_scripts.events_dispatched >= 2
           && mutation_scripts.performance_now_calls >= 1
-          && mutation_scripts.bootstrap_lazy_module_loads == 1
+          /* Canvas and Worker are both admitted on first use. */
+          && mutation_scripts.bootstrap_lazy_module_loads == 2
           && mutation_scripts.bootstrap_lazy_module_failures == 0
           && mutated.body_text == NULL
           && strcmp(mutation_scripts.summary,
@@ -1733,6 +1995,437 @@
     document_destroy(&mutated);
     CHECK(budget.current == 0);
 
+    puts("test: Worker bootstrap keeps compiler private and binds one policy URL");
+    static const char worker_boundary_page[] =
+        "<!doctype html><body></body>";
+    PocDocument worker_boundary_document;
+    CHECK(document_parse(
+        &worker_boundary_document, &budget, worker_boundary_page,
+        strlen(worker_boundary_page), 8));
+    static const char worker_boundary_csp[] =
+        "content-security-policy: worker-src https://worker-boundary.test\n";
+    CHECK(tilefinch_csp_parse_response_headers(
+        &worker_boundary_document.content_security_policy,
+        "https://worker-boundary.test/", worker_boundary_csp,
+        sizeof(worker_boundary_csp) - 1u, false));
+    ScriptResult worker_boundary_result = {0};
+    ScriptRuntime *worker_boundary_runtime = script_runtime_create_deferred(
+        &worker_boundary_document, &budget, 4 * MIB, 1000,
+        "https://worker-boundary.test/", NULL, &worker_boundary_result);
+    bool worker_boundary_evaluated = worker_boundary_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_boundary_runtime,
+              "(()=>{const NativeWeakMap=WeakMap,NativeString=String,"
+              "nativeMapGet=Map.prototype.get,nativeWeakMapGet="
+              "WeakMap.prototype.get,NativeDecoder=TextDecoder,"
+              "nativeDecode=TextDecoder.prototype.decode,nativeFromCodePoint="
+              "String.fromCodePoint;"
+              "let poisonCalls=0,sensitiveCalls=0,mapCalls=0,weakCalls=0,"
+              "decoderCalls=0,fromCodePointCalls=0,leaked,coercions=0;"
+              "globalThis.WeakMap=function(){poisonCalls++;leaked="
+              "globalThis.__tilefinchRunWorker;return new NativeWeakMap()};"
+              "const blob=new Blob([new Uint8Array([255])]);"
+              "const blobURL=URL.createObjectURL(blob),copy="
+              "__tilefinchBlobBytes(blob),first=copy[0];copy[0]=0;"
+              "const copySafe=__tilefinchBlobBytes(blob)[0]===first;"
+              "const changingURL={toString(){coercions++;return blobURL}};"
+              "const poisonObject={toString(){return "
+              "'https://worker-boundary.test/allowed.js'},"
+              "startsWith(){return true},slice(){return ''}};"
+              "globalThis.String=value=>{"
+              "if(value===changingURL){sensitiveCalls++;return poisonObject}"
+              "if(value===poisonObject){sensitiveCalls++;return blobURL}"
+              "return NativeString(value)};"
+              "Map.prototype.get=function(){mapCalls++;return null};"
+              "WeakMap.prototype.get=function(){weakCalls++;return null};"
+              "TextDecoder.prototype.decode=function(){decoderCalls++;"
+              "return \"postMessage('POLICY-BYPASS')\"};"
+              "globalThis.TextDecoder=class{decode(){decoderCalls++;return "
+              "\"postMessage('POLICY-BYPASS')\"}};"
+              "String.fromCodePoint=function(){fromCodePointCalls++;return "
+              "\"postMessage('POLICY-BYPASS')\"};"
+              "const worker=new Worker(changingURL);globalThis.WeakMap="
+              "NativeWeakMap;globalThis.String=NativeString;"
+              "Map.prototype.get=nativeMapGet;WeakMap.prototype.get="
+              "nativeWeakMapGet;globalThis.TextDecoder=NativeDecoder;"
+              "TextDecoder.prototype.decode=nativeDecode;"
+              "String.fromCodePoint=nativeFromCodePoint;"
+              "const done=kind=>{pocSummary=kind+':' +coercions+':'"
+              "+poisonCalls+':'+sensitiveCalls+':'+mapCalls+':'"
+              "+weakCalls+':'+decoderCalls+':'+fromCodePointCalls+':'"
+              "+copySafe+':'+typeof leaked;"
+              "worker.terminate();URL.revokeObjectURL(blobURL)};"
+              "worker.onmessage=event=>done(event.data);"
+              "worker.onerror=()=>done('POLICY-BLOCKED')})()",
+              "<worker-boundary>", &worker_boundary_result);
+    if (!worker_boundary_evaluated) {
+        fprintf(stderr, "worker boundary error=\"%s\" context=\"%s\"\n",
+                worker_boundary_result.error,
+                worker_boundary_result.error_source_context);
+    }
+    CHECK(worker_boundary_evaluated);
+    for (size_t worker_turn = 0; worker_turn < 12; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_boundary_runtime, worker_turn, 8,
+            &worker_boundary_result));
+    }
+    if (strcmp(worker_boundary_result.summary,
+               "POLICY-BLOCKED:1:0:0:0:0:0:0:true:undefined") != 0) {
+        fprintf(stderr, "worker boundary summary=\"%s\" error=\"%s\"\n",
+                worker_boundary_result.summary, worker_boundary_result.error);
+    }
+    CHECK(strcmp(worker_boundary_result.summary,
+                 "POLICY-BLOCKED:1:0:0:0:0:0:0:true:undefined") == 0
+          && worker_boundary_result.bootstrap_lazy_module_loads == 1
+          && worker_boundary_result.bootstrap_lazy_module_failures == 0);
+    script_runtime_destroy(worker_boundary_runtime);
+    document_destroy(&worker_boundary_document);
+    CHECK(budget.current == 0);
+
+    puts("test: bounded Worker startup is asynchronous and hides page globals");
+    static const char worker_lifecycle_page[] =
+        "<!doctype html><body></body>";
+    PocDocument worker_lifecycle_document;
+    CHECK(document_parse(
+        &worker_lifecycle_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    ScriptResult worker_lifecycle_result = {0};
+    ScriptRuntime *worker_lifecycle_runtime = script_runtime_create_deferred(
+        &worker_lifecycle_document, &budget, 4 * MIB, 1000,
+        "https://worker-lifecycle.test/", NULL, &worker_lifecycle_result);
+    bool worker_lifecycle_evaluated = worker_lifecycle_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_lifecycle_runtime,
+              "(()=>{let reports=[];const finish=value=>{reports.push(value);"
+              "if(reports.length===3)pocSummary=reports.sort().join(':')};"
+              "const terminatedURL=URL.createObjectURL(new Blob(["
+              "\"postMessage('terminated-ran')\"]));const terminated="
+              "new Worker(terminatedURL);terminated.onmessage=event=>"
+              "finish(event.data);terminated.terminate();"
+              "URL.revokeObjectURL(terminatedURL);"
+              "const behaviorURL=URL.createObjectURL(new Blob(["
+              "\"postMessage([typeof document,typeof window,'document' in self,'window' in self,typeof __tilefinchRunWorker,typeof navigator,typeof location,typeof navigator.userAgent,location.href.startsWith('blob:'),Object.prototype.toString.call(navigator),Object.prototype.toString.call(location),Object.prototype.toString.call(self),self instanceof DedicatedWorkerGlobalScope,self instanceof WorkerGlobalScope,navigator instanceof WorkerNavigator,location instanceof WorkerLocation,navigator.constructor.name,location.constructor.name])\"]));"
+              "const messageURL=URL.createObjectURL(new Blob(["
+              "\"onmessage=e=>postMessage([e instanceof MessageEvent,e.isTrusted,e.origin,e.source===null,e.ports.length,e.data])\"]));"
+              "const behavior=new Worker(behaviorURL);behavior.onmessage="
+              "event=>{finish(event.data.join(','));behavior.terminate();"
+              "const messaging=new Worker(messageURL);messaging.onmessage="
+              "message=>{finish(['message-shape',message instanceof MessageEvent,"
+              "message.isTrusted,message.currentTarget===messaging,"
+              "message.target===messaging,message.eventPhase===Event.AT_TARGET,"
+              "message.origin,message.source===null,message.ports.length,"
+              "message.data.join(',')].join(','));messaging.terminate()};"
+              "messaging.postMessage('payload');URL.revokeObjectURL(messageURL)};"
+              "URL.revokeObjectURL(behaviorURL);const errorURL="
+              "URL.createObjectURL(new Blob([\"throw new Error('boom')\"]));"
+              "let synchronous=false;try{const failing=new Worker(errorURL);"
+              "failing.onerror=event=>{const shape=event instanceof ErrorEvent"
+              "&&event.currentTarget===failing&&event.target===failing"
+              "&&event.eventPhase===Event.AT_TARGET&&event.cancelable"
+              "&&event.error===null&&event.message==='boom';"
+              "event.preventDefault();finish('async-error,'+shape);"
+              "failing.terminate()}}"
+              "catch(_){synchronous=true}URL.revokeObjectURL(errorURL);"
+              "const lookup=Object.getOwnPropertyDescriptor(globalThis,"
+              "'__tilefinchBlobForURL'),clone=Object.getOwnPropertyDescriptor("
+              "globalThis,'__tilefinchCloneWorkerValue'),constructed="
+              "new MessageEvent('message',{data:7,origin:'https://origin.test'}),"
+              "boundedPorts=new MessageEvent('message',{ports:Array(20)}).ports;"
+              "let messageShape=Object.prototype.toString.call(constructed)==="
+              "'[object MessageEvent]'&&Object.getOwnPropertyNames(constructed)"
+              ".join(',')==='isTrusted'&&Object.getOwnPropertyNames("
+              "MessageEvent.prototype).join(',')==='data,origin,lastEventId,source,ports,userActivation,initMessageEvent,constructor'&&constructed.data===7"
+              "&&constructed.origin==='https://origin.test'&&"
+              "constructed.source===null&&constructed.ports.length===0;"
+              "messageShape=messageShape&&Object.isFrozen(constructed.ports)"
+              "&&boundedPorts.length===16&&Object.isFrozen(boundedPorts);"
+              "pocSummary=synchronous?'sync-error':typeof "
+              "__tilefinchRunWorker==='undefined'&&lookup&&!lookup.writable&&"
+              "!lookup.configurable&&clone&&!clone.writable&&!clone.configurable&&"
+              "Object.getOwnPropertyNames(behavior).length===0&&messageShape&&"
+              "globalThis.isSecureContext===true"
+              "?'pending':'bridge-leaked'})()",
+              "<worker-lifecycle>", &worker_lifecycle_result);
+    if (!worker_lifecycle_evaluated) {
+        fprintf(stderr, "worker lifecycle evaluation error=\"%s\"\n",
+                worker_lifecycle_result.error);
+    }
+    CHECK(worker_lifecycle_evaluated);
+    for (size_t worker_turn = 0; worker_turn < 4; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_lifecycle_runtime, worker_turn, 8,
+            &worker_lifecycle_result));
+    }
+    const char *expected_worker_lifecycle =
+        "async-error,true:message-shape,true,true,true,true,true,,true,0,"
+        "true,true,,true,0,payload:"
+        "undefined,undefined,false,false,undefined,object,object,string,true,"
+        "[object WorkerNavigator],[object WorkerLocation],"
+        "[object DedicatedWorkerGlobalScope],true,true,true,true,"
+        "WorkerNavigator,WorkerLocation";
+    bool worker_lifecycle_valid = strcmp(
+            worker_lifecycle_result.summary, expected_worker_lifecycle) == 0
+        && worker_lifecycle_result.bootstrap_lazy_module_loads == 1
+        && worker_lifecycle_result.bootstrap_lazy_module_failures == 0;
+    if (!worker_lifecycle_valid)
+        fprintf(stderr, "worker lifecycle summary=%s error=%s lazy=%zu/%zu\n",
+                worker_lifecycle_result.summary,
+                worker_lifecycle_result.error,
+                worker_lifecycle_result.bootstrap_lazy_module_loads,
+                worker_lifecycle_result.bootstrap_lazy_module_failures);
+    CHECK(worker_lifecycle_valid);
+    script_runtime_destroy(worker_lifecycle_runtime);
+    document_destroy(&worker_lifecycle_document);
+    CHECK(budget.current == 0);
+
+    puts("test: Worker preserves self and globalThis event handlers");
+    PocDocument worker_handler_document;
+    CHECK(document_parse(
+        &worker_handler_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    ScriptResult worker_handler_result = {0};
+    ScriptRuntime *worker_handler_runtime = script_runtime_create_deferred(
+        &worker_handler_document, &budget, 4 * MIB, 1000,
+        "https://worker-handlers.test/", NULL, &worker_handler_result);
+    CHECK(worker_handler_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_handler_runtime,
+              "(()=>{pocSummary='pending';let replies=[];"
+              "const done=value=>{replies.push(value);if(replies.length===2)"
+              "pocSummary=replies.sort().join(':')};"
+              "const selfURL=URL.createObjectURL(new Blob(["
+              "\"var URL=self.URL;const TextDecoder=self.TextDecoder;"
+              "self.onmessage=e=>self.postMessage('self-'+e.data)\"])),"
+              "globalURL=URL.createObjectURL(new Blob(["
+              "\"var Blob=globalThis.Blob;let Headers=globalThis.Headers;"
+              "globalThis.onmessage=e=>globalThis.postMessage('global-'+e.data)\"])),"
+              "a=new Worker(selfURL),b=new Worker(globalURL);"
+              "a.onmessage=e=>done(e.data);b.onmessage=e=>done(e.data);"
+              "a.postMessage(1);b.postMessage(2);"
+              "setTimeout(()=>{a.terminate();b.terminate();"
+              "URL.revokeObjectURL(selfURL);URL.revokeObjectURL(globalURL)},20)})()",
+              "<worker-handler-bindings>", &worker_handler_result));
+    for (size_t worker_turn = 0; worker_turn < 8; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_handler_runtime, worker_turn * 10u, 8,
+            &worker_handler_result));
+    }
+    if (strcmp(worker_handler_result.summary, "global-2:self-1") != 0)
+        fprintf(stderr, "worker handler summary=%s error=%s\n",
+                worker_handler_result.summary, worker_handler_result.error);
+    CHECK(strcmp(worker_handler_result.summary, "global-2:self-1") == 0);
+    script_runtime_destroy(worker_handler_runtime);
+    document_destroy(&worker_handler_document);
+    CHECK(budget.current == 0);
+
+    puts("test: Worker importScripts is synchronous and fails visibly");
+    PocDocument worker_import_document;
+    CHECK(document_parse(
+        &worker_import_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    ScriptResult worker_import_result = {0};
+    ScriptRuntime *worker_import_runtime = script_runtime_create_deferred(
+        &worker_import_document, &budget, 4 * MIB, 1000,
+        "https://worker-import.test/", NULL, &worker_import_result);
+    CHECK(worker_import_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_import_runtime,
+              "(()=>{pocSummary='pending';const dependency="
+              "URL.createObjectURL(new Blob([\"globalThis.imported='loaded'\"])),"
+              "missing=URL.createObjectURL(new Blob(['0']));"
+              "URL.revokeObjectURL(missing);const source='importScripts('+"
+              "JSON.stringify(dependency)+');let failure=\\\"none\\\";try{'"
+              "+'importScripts('+JSON.stringify(missing)+')}catch(error){'"
+              "+'failure=error.name}postMessage(globalThis.imported+\\\":\\\"+failure)',"
+              "url=URL.createObjectURL(new Blob([source])),worker=new Worker(url);"
+              "worker.onmessage=event=>{pocSummary=event.data;worker.terminate();"
+              "URL.revokeObjectURL(url);URL.revokeObjectURL(dependency)}})()",
+              "<worker-import-scripts>", &worker_import_result));
+    for (size_t worker_turn = 0; worker_turn < 8; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_import_runtime, worker_turn, 8,
+            &worker_import_result));
+    }
+    if (strcmp(worker_import_result.summary, "loaded:NetworkError") != 0)
+        fprintf(stderr, "worker import summary=%s error=%s\n",
+                worker_import_result.summary, worker_import_result.error);
+    CHECK(strcmp(worker_import_result.summary, "loaded:NetworkError") == 0);
+    script_runtime_destroy(worker_import_runtime);
+    document_destroy(&worker_import_document);
+    CHECK(budget.current == 0);
+
+    puts("test: Worker owns a branded Performance timeline");
+    PocDocument worker_performance_document;
+    CHECK(document_parse(
+        &worker_performance_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    ScriptResult worker_performance_result = {0};
+    ScriptRuntime *worker_performance_runtime = script_runtime_create_deferred(
+        &worker_performance_document, &budget, 4 * MIB, 1000,
+        "https://worker-performance.test/", NULL,
+        &worker_performance_result);
+    CHECK(worker_performance_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_performance_runtime,
+              "(()=>{pocSummary='pending';const ownerOrigin=performance.timeOrigin,"
+              "source=\"performance.probe=1;postMessage({tag:Object.prototype.toString.call(performance),instance:performance instanceof Performance,constructorName:Performance.name,origin:performance.timeOrigin,now:performance.now()})\","
+              "url=URL.createObjectURL(new Blob([source])),worker=new Worker(url);"
+              "worker.onmessage=event=>{const value=event.data;"
+              "pocSummary=performance instanceof Performance"
+              "&&Object.prototype.toString.call(performance)==='[object Performance]'"
+              "&&performance.probe===undefined&&value.tag==='[object Performance]'"
+              "&&value.instance&&value.constructorName==='Performance'"
+              "&&Number.isFinite(value.origin)&&value.origin>=ownerOrigin"
+              "&&Number.isFinite(value.now)&&value.now>=0"
+              "?'WORKER-PERFORMANCE-OK':'WORKER-PERFORMANCE-FAILED:'"
+              "+JSON.stringify({ownerInstance:performance instanceof Performance,"
+              "ownerTag:Object.prototype.toString.call(performance),"
+              "ownerProbe:performance.probe,value,ownerOrigin});"
+              "worker.terminate();URL.revokeObjectURL(url)}})()",
+              "<worker-performance>", &worker_performance_result));
+    for (size_t worker_turn = 0; worker_turn < 4; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_performance_runtime, worker_turn, 8,
+            &worker_performance_result));
+    }
+    if (strcmp(worker_performance_result.summary,
+               "WORKER-PERFORMANCE-OK") != 0) {
+        fprintf(stderr, "worker performance summary=%s error=%s\n",
+                worker_performance_result.summary,
+                worker_performance_result.error);
+    }
+    CHECK(strcmp(worker_performance_result.summary,
+                 "WORKER-PERFORMANCE-OK") == 0);
+    script_runtime_destroy(worker_performance_runtime);
+    document_destroy(&worker_performance_document);
+    CHECK(budget.current == 0);
+
+    puts("test: Worker listener removal takes effect during dispatch");
+    static const char worker_listener_removal_page[] =
+        "<!doctype html><body></body>";
+    PocDocument worker_listener_removal_document;
+    CHECK(document_parse(
+        &worker_listener_removal_document, &budget,
+        worker_listener_removal_page,
+        strlen(worker_listener_removal_page), 8));
+    ScriptResult worker_listener_removal_result = {0};
+    ScriptRuntime *worker_listener_removal_runtime =
+        script_runtime_create_deferred(
+            &worker_listener_removal_document, &budget, 4 * MIB, 1000,
+            "https://worker-listener-removal.test/", NULL,
+            &worker_listener_removal_result);
+    CHECK(worker_listener_removal_runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(
+        worker_listener_removal_runtime,
+        "(()=>{pocSummary='pending';const url=URL.createObjectURL(new Blob(["
+        "\"postMessage('ready')\"]));const worker=new Worker(url);"
+        "const stale=()=>{pocSummary='stale-listener-ran'};"
+        "worker.addEventListener('message',()=>{"
+        "worker.removeEventListener('message',stale);"
+        "pocSummary='removed';worker.terminate();URL.revokeObjectURL(url)});"
+        "worker.addEventListener('message',stale)})()",
+        "<worker-listener-removal>", &worker_listener_removal_result));
+    for (size_t worker_turn = 0; worker_turn < 4; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_listener_removal_runtime, worker_turn, 8,
+            &worker_listener_removal_result));
+    }
+    CHECK(strcmp(worker_listener_removal_result.summary, "removed") == 0);
+    script_runtime_destroy(worker_listener_removal_runtime);
+    document_destroy(&worker_listener_removal_document);
+    CHECK(budget.current == 0);
+
+    puts("test: secure-context status follows the native document URL");
+    PocDocument insecure_context_document;
+    CHECK(document_parse(
+        &insecure_context_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    ScriptResult insecure_context_result = {0};
+    ScriptRuntime *insecure_context_runtime = script_runtime_create_deferred(
+        &insecure_context_document, &budget, 2 * MIB, 1000,
+        "http://insecure-context.test/", NULL, &insecure_context_result);
+    CHECK(insecure_context_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              insecure_context_runtime,
+              "pocSummary=globalThis.isSecureContext===false?"
+              "'INSECURE-CONTEXT-OK':'INSECURE-CONTEXT-FAILED'",
+              "<insecure-context>", &insecure_context_result)
+          && strcmp(insecure_context_result.summary,
+                    "INSECURE-CONTEXT-OK") == 0);
+    script_runtime_destroy(insecure_context_runtime);
+    document_destroy(&insecure_context_document);
+    CHECK(budget.current == 0);
+
+    puts("test: PerformanceObserver delivers bounded asynchronous records");
+    static const char performance_observer_page[] =
+        "<!doctype html><body></body>";
+    PocDocument performance_observer_document;
+    CHECK(document_parse(
+        &performance_observer_document, &budget, performance_observer_page,
+        strlen(performance_observer_page), 8));
+    ScriptResult performance_observer_result = {0};
+    ScriptRuntime *performance_observer_runtime =
+        script_runtime_create_deferred(
+            &performance_observer_document, &budget, 4 * MIB, 1000,
+            "https://performance-observer.test/", NULL,
+            &performance_observer_result);
+    CHECK(performance_observer_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              performance_observer_runtime,
+              "(()=>{__tilefinchRecordResourceTiming("
+              "'https://performance-observer.test/api.js','script',2000,"
+              "5000,7000,9000,12000,1234,true,false);const resource="
+              "performance.getEntriesByName("
+              "'https://performance-observer.test/api.js','resource')[0],"
+              "resourceJSON=resource&&resource.toJSON(),resourceShape="
+              "Object.prototype.toString.call(resource)==="
+              "'[object PerformanceResourceTiming]'&&"
+              "Object.keys(resource).length===0&&resource.initiatorType==="
+              "'script'&&resource.startTime<=resource.requestStart&&"
+              "resource.requestStart<=resource.responseStart&&"
+              "resource.responseStart<=resource.responseEnd&&"
+              "resource.duration===resource.responseEnd-resource.startTime&&"
+              "resource.transferSize===1234&&resource.encodedBodySize===1234&&"
+              "resource.decodedBodySize===1234&&resourceJSON.transferSize===1234;"
+              "let synchronous=true;const observer=new "
+              "PerformanceObserver((list,self,options)=>{const all="
+              "list.getEntries(),named=list.getEntriesByName('observed',"
+              "'mark'),marks=list.getEntriesByType('mark');pocSummary="
+              "!synchronous&&self===observer&&list instanceof "
+              "PerformanceObserverEntryList&&all.length===2&&named.length===1"
+              "&&marks.length===1&&options.droppedEntriesCount===0&&"
+              "observer.takeRecords().length===0?'PERFORMANCE-OBSERVER-OK':"
+              "'PERFORMANCE-OBSERVER-FAILED';observer.disconnect()});"
+              "const hidden=Object.getOwnPropertyNames(observer).length===0;"
+              "observer.observe({entryTypes:['mark','measure','unsupported']});"
+              "performance.mark('observed',{startTime:3});"
+              "performance.measure('span','observed');synchronous=false;"
+              "pocSummary=hidden&&resourceShape?'pending':['state-leaked',hidden,"
+              "Object.prototype.toString.call(resource),Object.keys(resource).length,"
+              "resource&&resource.initiatorType,resource&&resource.startTime,"
+              "resource&&resource.requestStart,resource&&resource.responseStart,"
+              "resource&&resource.responseEnd,resource&&resource.duration,"
+              "resource&&resource.transferSize,resource&&resource.encodedBodySize,"
+              "resource&&resource.decodedBodySize,resourceJSON&&"
+              "resourceJSON.transferSize].join(':')})()",
+              "<performance-observer>", &performance_observer_result));
+    if (strcmp(performance_observer_result.summary, "pending") != 0) {
+        fprintf(stderr, "performance resource summary=%s error=%s\n",
+                performance_observer_result.summary,
+                performance_observer_result.error);
+    }
+    CHECK(strcmp(performance_observer_result.summary, "pending") == 0);
+    for (size_t observer_turn = 0; observer_turn < 3; observer_turn++) {
+        CHECK(script_runtime_advance(
+            performance_observer_runtime, observer_turn, 8,
+            &performance_observer_result));
+    }
+    CHECK(strcmp(performance_observer_result.summary,
+                 "PERFORMANCE-OBSERVER-OK") == 0);
+    script_runtime_destroy(performance_observer_runtime);
+    document_destroy(&performance_observer_document);
+    CHECK(budget.current == 0);
+
     puts("test: isolated frame messaging and trusted delivery");
     static const char parent_message_page[] =
         "<!doctype html><body><script>window.addEventListener('message',"
@@ -1785,7 +2478,7 @@
                  child_message_runtime, "document.querySelector('aside')",
                  "<legacy-child-pending-scope>", &child_message_result)
           && script_runtime_configure_messaging(
-              child_message_runtime, true, false, false,
+              child_message_runtime, true, false, false, true,
               forward_test_message,
               &message_target)
           && !script_runtime_take_remote_element_request(
@@ -1804,7 +2497,7 @@
           && strcmp(child_message_result.summary, "child-isolated") == 0
           && legacy_child_backing_probe.calls == legacy_child_calls
           && !script_runtime_configure_messaging(
-                 child_message_runtime, false, true, false,
+                 child_message_runtime, false, true, false, true,
                  forward_test_message,
                  &message_target));
     CHECK(script_runtime_evaluate_diagnostic(
@@ -1858,7 +2551,7 @@
         opaque_url, &opaque_message_session, &opaque_message_result);
     CHECK(opaque_message_runtime != NULL
           && script_runtime_configure_messaging(
-              opaque_message_runtime, true, false, true,
+              opaque_message_runtime, true, false, true, true,
               count_test_message, &opaque_message_probe)
           && script_runtime_evaluate_diagnostic(
               opaque_message_runtime,
@@ -1903,7 +2596,8 @@
     (void) script_runtime_collect_and_trim(failed_message_runtime);
     budget_inject_failure_after(&budget, 0);
     bool failed_message_configured = script_runtime_configure_messaging(
-        failed_message_runtime, true, false, false, count_test_message,
+        failed_message_runtime, true, false, false, true,
+        count_test_message,
         failed_message_opaque);
     budget_clear_failure_injection(&budget);
     CHECK(!failed_message_configured);
@@ -1914,7 +2608,7 @@
           && !script_runtime_set_section_identity(
                  failed_message_runtime, 2)
           && !script_runtime_configure_messaging(
-                 failed_message_runtime, false, true, false,
+                 failed_message_runtime, false, true, false, true,
                  count_test_message, NULL)
           && script_runtime_evaluate_diagnostic(
                  failed_message_runtime,

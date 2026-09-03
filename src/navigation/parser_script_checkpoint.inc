@@ -611,6 +611,10 @@ static bool navigation_stream_element_closed(void *opaque,
     if (name == NULL || name_length != 6
         || memcmp(name, "script", 6) != 0) return true;
     if (stream->session == NULL) return true;
+    if (document_parser_script_was_truncated(stream->parser, element)) {
+        navigation_stream_record_skipped_parser_script(stream);
+        return true;
+    }
     NavigationParserScriptShape script_shape =
         navigation_parser_script_shape(element);
     bool parser_blocking = script_shape.parser_blocking;
@@ -723,6 +727,9 @@ static bool navigation_stream_element_closed(void *opaque,
         bool processed =
             process_result == DOCUMENT_SCRIPT_PROCESS_COMPLETE;
         navigation_stream_finish_parser_script_allowance(limited_runtime);
+        if (process_result == DOCUMENT_SCRIPT_PROCESS_HARD_FAILURE) {
+            return false;
+        }
         bool parser_refusal_pending =
             stream->pending_parser_refusal != NAVIGATION_PARSER_REFUSAL_NONE;
         if (parser_refusal_pending) processed = false;
@@ -754,9 +761,6 @@ static bool navigation_stream_element_closed(void *opaque,
         uint64_t execution_us = stream->scripts.early.execution_us
                 >= execution_us_before
             ? stream->scripts.early.execution_us - execution_us_before : 0;
-        uint64_t author_script_us = host_callback_us
-                > UINT64_MAX - execution_us
-            ? UINT64_MAX : execution_us + host_callback_us;
         NavigationBlockingScriptSample sample = {
             .ordinal = script_ordinal,
             .node_count = document == NULL ? 0 : document->node_count,
@@ -795,7 +799,7 @@ static bool navigation_stream_element_closed(void *opaque,
             && stream->scripts.early.skipped_pressure
                    == skipped_pressure_before;
         if (!navigation_stream_account_parser_script(
-                stream, author_script_us, source_bytes, execution_failed,
+                stream, execution_us, source_bytes, execution_failed,
                 completed_cleanly)) {
             return false;
         }
@@ -1020,6 +1024,7 @@ static bool navigation_stream_element_closed(void *opaque,
             stream->scheduler, element, &stream->scripts);
     bool processed = process_result == DOCUMENT_SCRIPT_PROCESS_COMPLETE;
     navigation_stream_finish_parser_script_allowance(limited_runtime);
+    if (process_result == DOCUMENT_SCRIPT_PROCESS_HARD_FAILURE) return false;
     bool parser_refusal_pending =
         stream->pending_parser_refusal != NAVIGATION_PARSER_REFUSAL_NONE;
     if (parser_refusal_pending) processed = false;
@@ -1064,8 +1069,6 @@ static bool navigation_stream_element_closed(void *opaque,
             >= telemetry_before.host_callback_total_us
         ? telemetry_after.host_callback_total_us
             - telemetry_before.host_callback_total_us : 0;
-    uint64_t author_script_us = host_callback_us > UINT64_MAX - execution_us
-        ? UINT64_MAX : execution_us + host_callback_us;
     NavigationBlockingScriptSample sample = {
         .ordinal = script_ordinal,
         .node_count = document == NULL ? 0 : document->node_count,
@@ -1113,7 +1116,7 @@ static bool navigation_stream_element_closed(void *opaque,
         && stream->scripts.early.skipped_quota == skipped_quota_before
         && stream->scripts.early.skipped_pressure == skipped_pressure_before;
     if (!navigation_stream_account_parser_script(
-            stream, author_script_us, source_bytes, execution_failed,
+            stream, execution_us, source_bytes, execution_failed,
             completed_cleanly)) {
         return false;
     }

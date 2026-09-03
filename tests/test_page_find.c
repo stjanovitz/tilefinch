@@ -70,6 +70,20 @@ int main(void)
     CHECK(page_find_move(&find, 1) && find.selected == 0 && find.wrapped);
     CHECK(page_find_move(&find, -1) && find.selected == 1 && find.wrapped);
 
+    DrawCommand engine_label = {
+        .type = DRAW_TEXT, .text = "Browser player", .text_length = 14,
+        .x = 10, .y = 80, .width = 100, .height = 18,
+        .radius = LAYOUT_TEXT_FIND_EXCLUDED
+    };
+    DrawCommand *ordinary_commands = layout.commands;
+    size_t ordinary_count = layout.count;
+    layout.commands = &engine_label;
+    layout.count = 1u;
+    CHECK(page_find_build(&find, &budget, &layout, "Browser")
+          && find.match_count == 0u);
+    layout.commands = ordinary_commands;
+    layout.count = ordinary_count;
+
     /* A block boundary resets KMP: concatenated words must not match across
        paragraphs, while an authored collapsed space does match phrases. */
     CHECK(page_find_build(&find, &budget, &layout, "foxbanana"));

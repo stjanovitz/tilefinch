@@ -1,0 +1,13 @@
+focus-id lst-ib
+type PlayStation Portable
+control-value lst-ib
+activate
+tick 4 100
+status
+body-contains Google needs JavaScript
+back
+tick 2 100
+control-value lst-ib
+history-controls
+status
+quit

@@ -22,6 +22,100 @@ Use `--skip-js` to measure HTML/CSS/layout/rendering independently when a real p
 
 The interactive lab can make a legitimate managed-challenge attempt with `--url ... --fetch-scripts`. It retains secure/HttpOnly response cookies, retries a safe GET once when `Critical-CH` requests truthful PSP client hints, and sends only the named high-entropy hints to the origin that requested them. A cross-origin retry redirect suppresses those hints for the rest of that redirect chain while truthful low-entropy hints continue normally. The lab loads scripts inserted by the bootstrap under normal quotas and reports challenge/network/clearance state without cookie values. It never copies clearance from another browser. The ordinary compatibility User-Agent carries iPhone/WebKit/Safari routing tokens so large sites choose their bounded mobile document, while also naming `PlayStation Portable` and `Tilefinch`; `navigator.platform` and low-entropy Client Hints remain explicitly PSP/Tilefinch rather than claiming the capabilities of Safari or Chrome.
 
+### Managed challenges as a standards qualification
+
+A production managed challenge is an external compatibility observation, not a
+fixture whose changing program or answer belongs in Tilefinch. Diagnostic runs
+may record API lookups, task failures, network shape, cookie names, and the
+eventual clearance state; they must not patch the challenge, synthesize its
+payload, import clearance from another browser, or add a site-specific client.
+
+The current qualification establishes these boundaries:
+
+- Browser/API comparison found and fixed a real same-origin iframe difference:
+  a parent may read and call the child `Window.eval` when the frame has
+  `sandbox="allow-same-origin"` without `allow-scripts`. The sandbox suppresses
+  child-owned script execution; it does not hide that same-origin Window
+  property. The managed program now completes without JavaScript or callback
+  errors, posts its verification response with HTTP 200, receives a Secure,
+  HttpOnly `cf_clearance` cookie, and automatically navigates again with that
+  cookie present.
+- The edge nevertheless returns another managed challenge. A redacted request
+  trace proves the follow-up document request carries the clearance cookie and
+  stable request identity, while the challenge child eventually reports its
+  own `fail` event. A coherent Mobile-Safari diagnostic identity has the same
+  result. This rules out Tilefinch cookie persistence, navigation handoff, the
+  immediate ECMAScript exception, and the hybrid compatibility User-Agent as
+  the remaining cause; it does not prove which server-side risk signal or
+  custom-engine policy declined the session.
+- Chromium controlled through the browser lab reaches the ordinary ChatGPT
+  application without being assigned this challenge, so it cannot provide an
+  instruction-by-instruction control run. It remains useful for focused Web API
+  comparisons, which is how the iframe `eval`, Window/HTMLDocument branding,
+  XHR inheritance, Streams surface, and built-in reflection differences were
+  isolated.
+- The challenge has a roughly 9.1 MiB transient QuickJS peak but settles near
+  6.1 MiB. Under the exact PSP script quotas, a 5 MiB steady heap plus the
+  existing Budget-charged 4 MiB boot window completes verification within a
+  roughly 24.9 MiB total page peak. The window is an allocation ceiling rather
+  than a reservation and is returned after a bounded post-boot collection or
+  realm teardown. Physical-device timing and memory remain a separate gate.
+- Removing `Worker` selects the page's unsupported-browser branch, so the
+  constructor and lifecycle still need to be standards-shaped. The observed
+  challenge constructs one Blob worker and immediately terminates it before its
+  queued startup task. Its tiny `"you" === "bot"` body is consequently never
+  evaluated and is not a verdict delivered to Tilefinch. A separate worker
+  realm would be valuable general compatibility work, but cannot change this
+  particular probe. The cooperative Blob-worker shim has asynchronous
+  startup/error delivery, stable Blob-URL lifetime, browser-compatible public
+  names, and no direct `document`/`window` bindings. Its implementation remains
+  a first-use bootstrap so ordinary pages do not compile worker machinery.
+- A normal HTTP fixture loads Cloudflare's public Turnstile API, invokes its
+  named global `onload` callback, and exposes `render`, `execute`, `getResponse`,
+  `remove`, and `reset` as functions. The verification POST also completes with
+  HTTP 200. External-script loading and Turnstile's loader callback are therefore
+  not the missing step.
+- The failure-adjacent API trace constructs `MutationObserver`,
+  `PerformanceObserver`, `Blob`, and `Worker`; calls the crypto, history, and
+  performance surfaces; inspects `ReadableStream.prototype` and
+  `navigator.cookieEnabled`; and reads `navigator.gpu`. It never calls a WebGPU
+  method. The last access is therefore a fingerprint observation, not evidence
+  that this challenge requires WebGPU execution. Do not manufacture a GPU
+  object or expose WebGPU until Tilefinch has an honest bounded implementation.
+
+`--trace-page` reports three complementary views: `first=` is the bounded
+first-use order with routine intrinsic noise removed, `tail=` preserves the
+operations immediately before the first callback failure, and `types=` records
+coarse return shapes without serializing page objects. The trace freezes at the
+first failure so later recovery work cannot overwrite the causal window.
+
+If broader site evidence justifies it, a future standards milestone can add a
+bounded `DedicatedWorkerGlobalScope`, not a challenge adapter. Use a separate
+QuickJS context sharing the page's charged runtime, with its own global object
+and intrinsic prototypes, one or two worker slots, asynchronous startup, an
+independent bounded task/microtask queue, and deterministic teardown on
+`terminate()` or navigation. Cross-context messages need the existing bounded
+structured-clone subset carried through a fixed-size, Budget-owned mailbox;
+JavaScript values must never be shared directly between contexts. The worker
+global needs truthful `WorkerNavigator` and `WorkerLocation` views plus bounded
+timers, `fetch`, URL/Blob, encoding, streams, crypto, performance, and classic
+`importScripts`, all using the document's immutable origin/CSP/network policy.
+Module workers can remain a separate later milestone, but an unsupported type
+must fail through the normal asynchronous worker error lifecycle rather than
+silently running as classic.
+
+Qualification for that milestone is generic: curated Worker/Blob Web Platform
+Tests for realm and prototype isolation, constructor/error ordering, immediate
+URL revocation, task-versus-microtask ordering, messaging, termination, CSP,
+network cancellation, quota recovery, and navigation teardown; reflected
+built-in names/descriptors for the APIs the runtime exposes; and a synthetic
+server proof that any legitimately issued Secure/HttpOnly clearance-style
+cookie survives the response and accompanies the following navigation. Only
+after those pass should the production challenge be observed again. Success is
+not promised: Cloudflare documents custom engines and embedded browsers as
+having limited support, so a standards-correct Tilefinch may still be declined
+by server policy.
+
 Live document loads use the same hard allocation budget as parsing and rendering:
 
 ```sh

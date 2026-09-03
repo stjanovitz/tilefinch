@@ -88,6 +88,7 @@ int main(void)
     RUN_TEST(test_detached_canvas_publishes_when_inserted);
     RUN_TEST(test_script_frontier_snapshot_survives_author_mutation);
     RUN_TEST(test_navigation_keeps_server_dom_after_author_script_error);
+    RUN_TEST(test_document_script_refresh_failure_stops_following_scripts);
     RUN_TEST(test_script_frontier_skips_destroyed_snapshot_nodes);
     RUN_TEST(test_script_frontier_snapshot_capacity_is_explicit);
     RUN_TEST(test_preserved_runtime_retires_replaced_document);
