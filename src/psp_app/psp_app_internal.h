@@ -102,9 +102,13 @@
 #define PSP_MEDIA_PREVIEW_WIDTH 128
 #define PSP_MEDIA_PREVIEW_HEIGHT 72
 #define PSP_RENDER_JOB_BUDGET_US 2000u
-#define PSP_RENDER_JOB_MAXIMUM_TILES 1u
+/* The deadline remains authoritative. A one-tile ceiling left spare time in
+   each slice and stretched ordinary focus repaints across extra vblanks. */
+#define PSP_RENDER_JOB_MAXIMUM_TILES 4u
 #define PSP_RENDER_JOB_TIMEOUT_US UINT64_C(2000000)
-#define PSP_NAVIGATION_JOB_TIMEOUT_US UINT64_C(35000000)
+/* Large valid documents may finish layout after the old 35-second ceiling.
+   Keep one bounded minute; cooperative input/cancellation remain independent. */
+#define PSP_NAVIGATION_JOB_TIMEOUT_US UINT64_C(60000000)
 #define PSP_NETWORK_CONNECT_TIMEOUT_US UINT64_C(45000000)
 /* A HOME tile must hold focus this long (think-time) before its host earns a
    speculative background TCP+TLS connect (docs/engineering/
@@ -277,6 +281,11 @@ typedef struct {
 typedef struct {
     PspUiState *ui;
     PspUiState supervisor_ui;
+    PspUiScreen original_screen;
+    bool original_chrome_visible;
+    /* Session-local: cancellation only retains input when this very scope
+       yielded a rollback-safe font transaction. */
+    bool input_yield;
     PspUiMediaState supervisor_media_ui;
     BrowserEngine *engine;
     const uint16_t *frame;
@@ -296,6 +305,10 @@ typedef struct {
     uint32_t fallback_previous_buttons;
     const char *cancel_status;
     bool periodic_present;
+    /* Runtime checkpoints own presentation on the browser thread only;
+       the callback thread must never enter while author code can use GE. */
+    bool owner_thread_only;
+    bool cursor_feedback;
     bool acknowledge_non_cancel_busy;
     bool log_session;
     bool media_surface;
@@ -343,10 +356,13 @@ TilefinchDateFormat psp_preferred_date_format(void *context);
 void psp_log_message(void *context, const char *message);
 bool psp_present_internal(
     const uint16_t *frame, const PspUiState *ui, bool include_media);
-void psp_present(const uint16_t *frame, const PspUiState *ui);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+void psp_focus_feedback_begin(BrowserEngine *engine, int action, uint64_t started_us);
+#endif
+bool psp_present(const uint16_t *frame, const PspUiState *ui);
 bool psp_present_cursor_feedback(
     const uint16_t *frame, const PspUiState *ui);
-void psp_present_supervisor_ui(const uint16_t *frame, const PspUiState *ui);
+bool psp_present_supervisor_ui(const uint16_t *frame, const PspUiState *ui);
 void psp_present_boot_surface(
     PspUiStartupView view, const char *status, int progress_per_mille);
 void psp_present_boot_entrance(
@@ -367,6 +383,9 @@ void psp_work_cooperate_begin(
     BrowserEngine *engine, const PspUiMediaState *media_ui);
 void psp_navigation_cooperate_begin(
     PspUiState *ui, const uint16_t *frame, BrowserEngine *engine);
+void psp_runtime_cooperate_begin(PspUiState *ui, const uint16_t *frame,
+                                 PspUiToolbarInputState *toolbar);
+bool psp_runtime_cooperate_end(uint32_t *observed_buttons);
 void psp_work_cooperate_refresh_media(const PspUiMediaState *media_ui);
 void psp_work_cooperate_begin_media_open(
     PspUiState *ui, const uint16_t *engine_frame,
@@ -542,6 +561,9 @@ PspUiInput psp_ui_input(const SceCtrlData *pad, uint32_t previous_buttons,
                         unsigned elapsed_ms);
 const char *psp_ui_action_name(PspUiAction action);
 const char *psp_ui_action_acknowledgement(PspUiAction action);
+bool psp_present_action_ack(const uint16_t *frame, PspUiState *ui,
+                           PspUiAction action, const char *message,
+                           uint64_t input_started_us);
 bool psp_screenshot_space_short(const char *directory);
 PspScreenshotDestination psp_screenshot_destination(
     const char *data_directory,
@@ -870,6 +892,7 @@ typedef struct PspCaptivePortal PspCaptivePortal;
    operation records and counters, not parallel media/network control state. */
 typedef struct {
     uint32_t previous_buttons;
+    PspUiToolbarInputState toolbar_input;
     TilefinchGamepadCapture gamepad_capture;
     TilefinchGamepadState gamepad_state;
     uint64_t navigation_job_started_us;
@@ -1034,13 +1057,14 @@ bool psp_input_script_begin(
 bool psp_input_script_running(void);
 void psp_input_script_interrupt_by_user(void);
 bool psp_input_script_frame(
-    PspUiInput *input, bool ready);
+    PspUiInput *input, bool ready, bool page_ready);
 void psp_webgl_measurement_mark(const char *mark);
 bool psp_input_script_busy_frame(PspUiInput *input);
+bool psp_input_script_text_frame(PspUiInput *input);
 void psp_input_script_observe(
     const PspUiIntent *intent, const PspUiState *ui);
 void psp_input_script_observe_page(
-    const NavigationSession *navigation);
+    const PspEngineViews *views);
 void psp_input_script_observe_media(
     const PspUiMediaIntent *intent, const PspUiMediaState *media);
 void psp_input_script_observe_gamepad(

@@ -1587,7 +1587,7 @@ static bool lite_html_watch_intro(
               "<span class=play-icon aria-hidden=true></span>"
               "<span class=play-glyph aria-hidden=true>&#9658;</span>"
               "<img class=watch src=\"https://i.ytimg.com/vi/%s/"
-              "hqdefault.jpg\" alt=\"\"></a>"
+              "hqdefault.jpg\" loading=lazy alt=\"\"></a>"
               "<div class=watch-copy><h1>",
         autofocus ? " autofocus" : "", watch->video.id,
         watch->video.id)
@@ -2950,7 +2950,13 @@ static bool lite_load_identity_pump(YoutubeLiteLoadJob *job)
         }
     }
     job->fact_scan_offset = stop;
-    if (stop == job->source.length) lite_load_after_identity(job);
+    /* Each field already keeps its first valid value. Once all are present,
+       scanning the remaining HTML cannot change the result. Keep the same
+       bounded scan when any field is absent or malformed. */
+    if (stop == job->source.length
+        || (job->identity.api_key[0] != '\0'
+            && job->identity.client_version[0] != '\0'
+            && job->identity.visitor[0] != '\0')) lite_load_after_identity(job);
     return true;
 }
 
@@ -3865,6 +3871,18 @@ const char *youtube_lite_load_error(const YoutubeLiteLoadJob *job)
 void youtube_lite_load_destroy(YoutubeLiteLoadJob *job)
 {
     if (job == NULL) return;
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_PROVIDER") != NULL) {
+        fprintf(stderr, "youtube-provider: route=%d status=%d request-us=%llu "
+                "build-us=%llu slices=%zu max-transform-us=%llu bytes=%zu\n",
+                (int) job->route, (int) job->status,
+                (unsigned long long) job->metrics.request_wall_us,
+                (unsigned long long) job->metrics.build_us,
+                job->metrics.build_slices,
+                (unsigned long long) job->metrics.maximum_transform_slice_us,
+                job->metrics.body_bytes);
+    }
+#endif
     Budget *budget = job->budget;
     if (job->status == YOUTUBE_LITE_LOAD_PENDING)
         youtube_lite_load_cancel(job, "YouTube lightweight load destroyed");

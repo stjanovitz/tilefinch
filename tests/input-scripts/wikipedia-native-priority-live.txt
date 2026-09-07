@@ -1,0 +1,17 @@
+# Native input must update on the retained frame during early page work.
+wait-page 2
+wait-live 12
+tap-live select
+mark-live busy-menu
+press-live 4 down
+tap-live cross
+mark-live busy-settings
+press-live 2 down
+mark-live busy-setting-row
+tap-live select
+tap-live triangle
+mark-live toolbar-hidden
+stick-live 12 right
+mark-live busy-cursor
+wait-page 30
+end

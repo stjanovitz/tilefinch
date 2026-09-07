@@ -1,0 +1,9 @@
+# Same bounded fixture as runtime-input-live, but Circle must cancel the VM
+# work at a cooperative checkpoint and then unwind through the normal loop.
+wait 2
+tap down
+wait-live 10
+tap-live circle
+wait 4
+mark-live stopped
+end

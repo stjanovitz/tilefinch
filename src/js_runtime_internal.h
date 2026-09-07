@@ -5,6 +5,8 @@
 #define TILEFINCH_JS_RUNTIME_INTERNAL_H
 
 #include <stddef.h>
+#include "diagnostic_trace.h"
+#include "tilefinch_test_faults.h"
 
 #include "tilefinch/js_runtime.h"
 #include "tilefinch/budget_quickjs.h"
@@ -24,14 +26,12 @@
 void JS_SetPropertyFaultTraceLimit(JSRuntime *runtime, uint32_t limit);
 #endif
 
-/* The realistic PSP profile admits the Game Profile's bounded first-party
-   package while strict keeps the older, smaller non-preemptible unit. Every
-   trusted bootstrap source is independently pinned below the strict ceiling;
-   the larger public ceiling remains available only to admitted page code. */
-/* The standards platform bootstrap now sits just above 268 KiB.  This remains
-   a bounded, internal fallback-compile unit; the user-approved bootstrap
-   headroom does not change authored page-script admission. */
-#define SCRIPT_PSP_STRICT_MAXIMUM_HOST_COMPILE_BYTES (269u * 1024u)
+/* Trusted bootstrap sources and authored page scripts have deliberately
+   separate ceilings. Standards shims may consume the user-approved 3 KiB of
+   internal headroom without silently widening a page's longest
+   non-preemptible compile unit. */
+#define SCRIPT_BOOTSTRAP_STRICT_MAXIMUM_HOST_COMPILE_BYTES (275u * 1024u)
+#define SCRIPT_PSP_STRICT_MAXIMUM_HOST_COMPILE_BYTES (256u * 1024u)
 #define SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES (384u * 1024u)
 
 typedef struct {
@@ -113,7 +113,7 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_REALM_MAXIMUM_TOTAL_BYTES (128u * 1024u * 1024u)
 #define SCRIPT_DYNAMIC_EXECUTION_RESERVE_BYTES (512u * 1024u)
 #define SCRIPT_DYNAMIC_LAZY_MINIMUM_BYTES (128u * 1024u)
-#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 8u
+#define SCRIPT_LAZY_BOOTSTRAP_FEATURE_COUNT 10u
 /* A fully hydrated long article exceeds 4096 nodes several times
    over; a truncated walk silently drops querySelectorAll matches (the
    mobile section transform only saw the first few sections).
@@ -445,6 +445,9 @@ typedef enum {
     SCRIPT_HOST_CALLBACK_COUNT
 } ScriptHostCallback;
 
+#define SCRIPT_WORKER_REALM_LIMIT 4
+#define SCRIPT_FRAME_REALM_LIMIT 16
+
 struct ScriptRuntime {
     Budget *budget;
     PocDocument *document;
@@ -452,6 +455,21 @@ struct ScriptRuntime {
     JSRuntime *runtime;
     JSContext *context;
     BudgetQuickJSPool *quickjs_pool;
+    /* Dedicated workers run in their own QuickJS contexts (realms) inside
+       this runtime: a real global object, genuine top-level `this`, and
+       importScripts that evaluates into that global. Slots are freed when
+       the worker terminates or closes, and at runtime teardown. */
+    struct {
+        JSContext *context;
+        JSValue global;
+    } worker_realms[SCRIPT_WORKER_REALM_LIMIT];
+    struct {
+        JSContext *context;
+        JSValue global;
+        /* Core context owns the permanent global; other intrinsics are lazy.
+           0 core-only, 1 initializing, 2 ready, 3 failed/retired. */
+        uint8_t intrinsic_state;
+    } frame_realms[SCRIPT_FRAME_REALM_LIMIT];
     /* Boot-window donation experiment (TILEFINCH_JS_BOOT_WINDOW_KB): the page
        heap opens at base_memory_limit plus the donated window; once the
        hydration transient collects back under the base, the limit shrinks
@@ -612,6 +630,7 @@ void js_rt_trace_script_quota_rejection(DomBridge *bridge,
 bool js_rt_runtime_script_checkpoint(ScriptRuntime *runtime,
                                      size_t work_units);
 bool js_rt_runtime_callback_checkpoint(ScriptRuntime *runtime);
+bool js_rt_runtime_native_checkpoint(ScriptRuntime *runtime);
 JSValue js_rt_compile_source_type(JSContext *context, const char *source,
                                    size_t length, const char *name,
                                    int evaluation_type,
@@ -792,9 +811,6 @@ ScriptElementState *js_rt_script_element_state_find(
     DomBridge *bridge, const lxb_dom_node_t *node);
 ScriptElementState *js_rt_script_element_state_register(
     DomBridge *bridge, lxb_dom_node_t *node, bool html);
-void js_rt_script_element_states_mark_descendants(
-    const DomBridge *bridge, const lxb_dom_node_t *ancestor,
-    unsigned char marked[SCRIPT_DYNAMIC_NODE_LIMIT]);
 void js_rt_script_element_states_purge_marked(
     DomBridge *bridge,
     const unsigned char marked[SCRIPT_DYNAMIC_NODE_LIMIT]);
@@ -838,6 +854,7 @@ JSValue js_webgl_release_surface(JSContext *context,
 bool js_webgl_realm_epoch_advance(DomBridge *bridge);
 void js_webgl_realm_epoch_release(DomBridge *bridge);
 bool js_wasm_runtime_init(JSRuntime *runtime);
+void js_wasm_release_idle_runtime(void);
 #if defined(TILEFINCH_HAVE_WAMR_COMPONENT)
 void js_wasm_component_configure(const char *program_directory);
 #endif

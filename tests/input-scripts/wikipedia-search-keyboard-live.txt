@@ -1,0 +1,21 @@
+# Main Page -> cursor click -> real Danzeff ps p -> R+Start -> form action.
+wait-page 2
+tap-page triangle
+wait-page 2
+stick-page 18 right
+stick-page 16 up
+mark-page search-field
+tap-page cross
+wait 4
+stick 1 right cross
+wait 1
+stick 1 down-left cross
+wait 1
+stick 1 right cross
+wait 1
+tap rtrigger+start
+wait-page 2
+mark-page search-submitted
+wait-page 60
+mark-page search-loaded
+end

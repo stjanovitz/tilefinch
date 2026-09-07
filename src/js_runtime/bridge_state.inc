@@ -151,18 +151,6 @@ bool js_rt_node_is_strict_descendant(const lxb_dom_node_t *node,
     return false;
 }
 
-void js_rt_script_element_states_mark_descendants(
-    const DomBridge *bridge, const lxb_dom_node_t *ancestor,
-    unsigned char marked[SCRIPT_DYNAMIC_NODE_LIMIT])
-{
-    memset(marked, 0, SCRIPT_DYNAMIC_NODE_LIMIT);
-    if (bridge == NULL || ancestor == NULL) return;
-    for (size_t i = 0; i < bridge->script_element_count; i++) {
-        marked[i] = js_rt_node_is_strict_descendant(
-            bridge->script_elements[i].node, ancestor);
-    }
-}
-
 void js_rt_script_element_states_purge_marked(
     DomBridge *bridge,
     const unsigned char marked[SCRIPT_DYNAMIC_NODE_LIMIT])
@@ -386,7 +374,7 @@ bool script_execution_policy_for_profile(
         return true;
     case SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC:
         /* The measured 5 MiB realistic realm admits one 384 KiB authored
-           Game Profile script. Strict remains at the smaller 267 KiB unit;
+           Game Profile script. Strict remains at the smaller 256 KiB unit;
            both retain a hard per-call bound and the same aggregate quotas. */
         policy->maximum_host_compile_source_bytes =
             SCRIPT_PSP_MAXIMUM_HOST_COMPILE_BYTES;

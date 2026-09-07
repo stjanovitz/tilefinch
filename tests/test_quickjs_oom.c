@@ -8,6 +8,20 @@
 
 #define MIB (1024u * 1024u)
 
+/* Match the browser's instrumented-host C-stack guard. ASan inflates native
+   parser frames; this does not change any heap or virtual-string ceiling. */
+static size_t test_stack_limit(void)
+{
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    return 4u * MIB;
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+    return 4u * MIB;
+#endif
+    return 256u * 1024u;
+}
+
 static int run_reallocation_peak_census(void)
 {
     Budget budget;
@@ -43,8 +57,12 @@ static int run_large_repeat_eval(void)
         "catch(e){column=e.columnNumber}"
         "const repeated='ab'.repeat(70000);"
         "const newline=eval(' '.repeat(1337331)+'\\n7');"
+        "const longLeaf='/*'.padEnd(9002,'x')+'*/21*2';"
+        "const pollLeaf='/*'.padEnd(5002,'y')+'*/6*7';"
+        "const longResult=eval(' '.repeat(1337331)+longLeaf);"
+        "const pollResult=eval(' '.repeat(1337331)+pollLeaf);"
         "return [direct,repeated.length,repeated.charAt(139999),"
-        "newline,column].join(',')})()";
+        "newline,column,longResult,pollResult].join(',')})()";
     Budget budget;
     budget_init(&budget, 8u * MIB);
     BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
@@ -57,7 +75,7 @@ static int run_large_repeat_eval(void)
        flat repeat result and cannot run this under 2.5 MiB. A balanced repeat
        rope plus prefix-aware eval stays well inside the same hard ceiling. */
     JS_SetMemoryLimit(runtime, 2560u * 1024u);
-    JS_SetMaxStackSize(runtime, 256u * 1024u);
+    JS_SetMaxStackSize(runtime, test_stack_limit());
     JSContext *context = JS_NewContext(runtime);
     if (context == NULL) return 1;
     JSValue value = JS_Eval(context, memory_source,
@@ -69,6 +87,9 @@ static int run_large_repeat_eval(void)
         || result != 42) {
         if (JS_IsException(value)) {
             JSValue exception = JS_GetException(context);
+            const char *message = JS_ToCString(context, exception);
+            fprintf(stderr, "repeat memory check: %s\n", message ? message : "exception");
+            JS_FreeCString(context, message);
             JS_FreeValue(context, exception);
         } else {
             JS_FreeValue(context, value);
@@ -87,12 +108,16 @@ static int run_large_repeat_eval(void)
                     JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(value)) {
         JSValue exception = JS_GetException(context);
+        const char *message = JS_ToCString(context, exception);
+        fprintf(stderr, "repeat semantics check: %s\n", message ? message : "exception");
+        JS_FreeCString(context, message);
         JS_FreeValue(context, exception);
         return 1;
     }
     const char *text = JS_ToCString(context, value);
     int okay = text != NULL
-        && strcmp(text, "42,140000,b,7,1337333") == 0;
+        && strcmp(text, "42,140000,b,7,1337333,42,42") == 0;
+    if (!okay) fprintf(stderr, "repeat semantics result: %s\n", text ? text : "null");
     JS_FreeCString(context, text);
     JS_FreeValue(context, value);
     if (!okay) return 1;
@@ -204,7 +229,7 @@ static int run_compact_character_array(void)
        ceiling, while the bounded compact representation retains ordinary
        Array semantics and deoptimizes before unsupported mutations. */
     JS_SetMemoryLimit(runtime, 2u * MIB);
-    JS_SetMaxStackSize(runtime, 256u * 1024u);
+    JS_SetMaxStackSize(runtime, test_stack_limit());
     JSContext *context = JS_NewContext(runtime);
     if (context == NULL) {
         unsetenv("TILEFINCH_JS_ARRAY_CAP_KB");
@@ -302,7 +327,7 @@ static int run_failure_boundary(size_t successful_allocations)
         budget_quickjs_pool_allocator(), pool);
     if (runtime == NULL) return 1;
     JS_SetMemoryLimit(runtime, 4u * MIB);
-    JS_SetMaxStackSize(runtime, 256u * 1024u);
+    JS_SetMaxStackSize(runtime, test_stack_limit());
     JSContext *context = JS_NewContext(runtime);
     if (context == NULL) return 1;
 
@@ -326,6 +351,45 @@ static int run_failure_boundary(size_t successful_allocations)
     return 0;
 }
 
+static int run_scope_resolution_memory_limit(size_t allowance)
+{
+    char source[8192];
+    size_t used = (size_t) snprintf(source, sizeof(source),
+                                  "function labels(){return function(){return function(){return ");
+    for (unsigned i = 0; i < 256; i++) {
+        used += (size_t) snprintf(source + used, sizeof(source) - used,
+                                 "%slabel%u", i ? "+" : "", i);
+    }
+    used += (size_t) snprintf(source + used, sizeof(source) - used, ";};};}labels;");
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (pool == NULL) return 1;
+    JSRuntime *runtime = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+    if (runtime == NULL) return 1;
+    JSContext *context = JS_NewContext(runtime);
+    if (context == NULL) { JS_FreeRuntime(runtime); return 1; }
+    JSMemoryUsage usage;
+    JS_ComputeMemoryUsage(runtime, &usage);
+    JS_SetMemoryLimit(runtime, usage.malloc_size + allowance);
+    JSValue compiled = JS_Eval(context, source, used, "<scope-memory-limit>",
+                              JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    JS_SetMemoryLimit(runtime, (size_t) -1);
+    if (JS_IsException(compiled)) {
+        JSValue exception = JS_GetException(context);
+        JS_FreeValue(context, exception);
+    } else JS_FreeValue(context, compiled);
+    JSValue next = JS_Eval(context, "6*7", 3, "<after-refusal>", JS_EVAL_TYPE_GLOBAL);
+    int32_t value = 0;
+    int failed = JS_IsException(next) || JS_ToInt32(context, &value, next) || value != 42;
+    JS_FreeValue(context, next);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    (void) budget_quickjs_pool_trim(pool, 0);
+    if (!budget_quickjs_pool_destroy(pool) || budget.current != 0) failed = 1;
+    return failed;
+}
+
 static int run_parse_failure_boundary(size_t successful_allocations)
 {
     /* Enough functions, literals, and containers that parsing itself
@@ -343,7 +407,7 @@ static int run_parse_failure_boundary(size_t successful_allocations)
         budget_quickjs_pool_allocator(), pool);
     if (runtime == NULL) return 1;
     JS_SetMemoryLimit(runtime, 4u * MIB);
-    JS_SetMaxStackSize(runtime, 256u * 1024u);
+    JS_SetMaxStackSize(runtime, test_stack_limit());
     JSContext *context = JS_NewContext(runtime);
     if (context == NULL) return 1;
 
@@ -367,6 +431,73 @@ static int run_parse_failure_boundary(size_t successful_allocations)
     return 0;
 }
 
+static int run_retired_callable_contract(void)
+{
+    static const char *sources[] = {
+        "(async function task(value){return value})",
+        "(function* task(value){yield value})",
+        "(async function* task(value){yield value})"
+    };
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (!pool) return 1;
+    JSRuntime *rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+    if (!rt) return 1;
+    JS_SetMaxStackSize(rt, test_stack_limit());
+    JSContext *caller = JS_NewContext(rt);
+    int failed = caller == NULL;
+    for (unsigned i = 0; !failed && i < 3; ++i) {
+        JSContext *realm = JS_NewContext(rt);
+        if (!realm) { failed = 1; break; }
+        JSValue fn = JS_Eval(realm, sources[i], strlen(sources[i]),
+                             "<callable-lifecycle>", JS_EVAL_TYPE_GLOBAL);
+        JSValue arg = JS_NewInt32(caller, 42);
+        JSValue live = JS_Call(caller, fn, JS_UNDEFINED, 1, &arg);
+        failed |= JS_IsException(live);
+        JSValue next = JS_UNDEFINED;
+        if (i == 1) {
+            const char *get_next = "Object.getPrototypeOf((function*(){})()).next";
+            next = JS_Eval(caller, get_next, strlen(get_next),
+                           "<live-generator-method>", JS_EVAL_TYPE_GLOBAL);
+            JSValue yielded = JS_Call(caller, next, live, 0, NULL);
+            JSValue value = JS_GetPropertyStr(caller, yielded, "value");
+            int32_t number = 0;
+            failed |= JS_IsException(yielded)
+                || JS_ToInt32(caller, &number, value) != 0 || number != 42;
+            JS_FreeValue(caller, value);
+            JS_FreeValue(caller, yielded);
+        }
+        JS_RetireContext(realm);
+        if (i == 1) {
+            JSValue stopped = JS_Call(caller, next, live, 0, NULL);
+            failed |= !JS_IsException(stopped);
+            JS_FreeValue(caller, stopped);
+            JS_FreeValue(caller, JS_GetException(caller));
+        }
+        JS_FreeValue(caller, next);
+        JS_FreeValue(caller, live);
+        JSValue retired = JS_Call(caller, fn, JS_UNDEFINED, 1, &arg);
+        failed |= !JS_IsException(retired);
+        JS_FreeValue(caller, retired);
+        JSValue exception = JS_GetException(caller);
+        failed |= JS_IsNull(exception);
+        JS_FreeValue(caller, exception);
+        JS_FreeValue(caller, fn);
+        JS_FreeContext(realm);
+    }
+    if (caller) {
+        JSValue check = JS_Eval(caller, "6*7", 3, "<live-control>", JS_EVAL_TYPE_GLOBAL);
+        int32_t value = 0;
+        failed |= JS_ToInt32(caller, &value, check) != 0 || value != 42;
+        JS_FreeValue(caller, check);
+        JS_FreeContext(caller);
+    }
+    JS_FreeRuntime(rt);
+    failed |= !budget_quickjs_pool_destroy(pool) || budget.current != 0;
+    return failed;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2) {
@@ -376,6 +507,10 @@ int main(int argc, char **argv)
         return run_failure_boundary((size_t) requested);
     }
     if (argc != 1) return 2;
+    if (run_retired_callable_contract() != 0) {
+        fprintf(stderr, "QuickJS retired callable lifecycle failed\n");
+        return 1;
+    }
 
     if (run_reallocation_peak_census() != 0) {
         fprintf(stderr, "QuickJS realloc peak census failed\n");
@@ -408,6 +543,14 @@ int main(int argc, char **argv)
         }
     }
     puts("QuickJS parse OOM boundaries: PASS");
+
+    for (size_t allowance = 0; allowance <= 65536; allowance += 64) {
+        if (run_scope_resolution_memory_limit(allowance) != 0) {
+            fprintf(stderr, "QuickJS scope OOM failed at %zu bytes\n", allowance);
+            return 1;
+        }
+    }
+    puts("QuickJS scope-resolution OOM boundaries: PASS");
 
     if (run_large_repeat_eval() != 0) {
         fprintf(stderr, "QuickJS large repeat/eval bound failed\n");

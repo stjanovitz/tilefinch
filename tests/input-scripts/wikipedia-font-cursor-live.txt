@@ -1,0 +1,33 @@
+# Keep sampling real nub intent while optional typography is being published.
+# Live input continues at owner-thread layout checkpoints, not only after
+# the idle transaction has already finished.
+wait-page 2
+mark-page font-cursor-start
+wait-live 12
+stick-live 12 left
+wait-live 12
+stick-live 12 right
+wait-live 12
+stick-live 12 left
+wait-live 12
+stick-live 12 right
+wait-live 12
+stick-live 12 left
+wait-live 12
+stick-live 12 right
+wait-live 12
+stick-live 12 left
+wait-live 12
+stick-live 12 right
+wait-live 12
+stick-live 12 left
+wait-live 12
+stick-live 12 right
+wait-live 12
+stick-live 12 left
+wait-live 12
+stick-live 12 right
+mark-page font-cursor-end
+wait-page 180
+mark-page font-cursor-settled
+end

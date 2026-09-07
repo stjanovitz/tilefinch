@@ -82,13 +82,20 @@ static int interrupt_handler(JSRuntime *runtime, void *opaque)
     (void) runtime;
 #endif
     Watchdog *watchdog = opaque;
-    uint64_t now = monotonic_time_ms();
+    uint64_t now_ns = js_rt_monotonic_time_ns();
+    uint64_t now = now_ns / UINT64_C(1000000);
     watchdog->polls++;
     watchdog_add_work(watchdog, 1);
-    if (watchdog->slice_work_units >= 4
+    /* Four polls amortize cheap calls, but are not a time bound: on Allegrex
+       a single VM/native unit can take tens of milliseconds. Service input
+       at the next safe poll once the slice has used eight milliseconds. */
+    bool slice_expired = watchdog->slice_started_ns != 0
+        && now_ns >= watchdog->slice_started_ns
+        && now_ns - watchdog->slice_started_ns >= UINT64_C(8000000);
+    if ((watchdog->slice_work_units >= 4 || slice_expired)
         && !watchdog_cooperate(watchdog)) {
 #ifndef TILEFINCH_NO_TRACE
-        if (getenv("TILEFINCH_TRACE_JS_INTERRUPTS") != NULL) {
+        if (tilefinch_trace_js_interrupts()) {
             fprintf(stderr,
                     "tilefinch-js-interrupt: reason=cooperate "
                     "now-ms=%llu started-ms=%llu deadline-ms=%llu "
@@ -116,7 +123,7 @@ static int interrupt_handler(JSRuntime *runtime, void *opaque)
     if (now >= watchdog->deadline_ms) {
         watchdog->interrupted = true;
 #ifndef TILEFINCH_NO_TRACE
-        if (getenv("TILEFINCH_TRACE_JS_INTERRUPTS") != NULL) {
+        if (tilefinch_trace_js_interrupts()) {
             fprintf(stderr,
                     "tilefinch-js-interrupt: reason=deadline "
                     "now-ms=%llu started-ms=%llu deadline-ms=%llu "
@@ -130,6 +137,15 @@ static int interrupt_handler(JSRuntime *runtime, void *opaque)
         return 1;
     }
     return 0;
+}
+
+bool js_rt_runtime_native_checkpoint(ScriptRuntime *runtime)
+{
+    /* A native import/export is work inside the current task, not a new
+       asynchronous callback. Share the VM's work/time cooperative cadence;
+       interrupt_handler still checks the wall deadline on every boundary. */
+    return runtime != NULL && !runtime->watchdog.interrupted
+        && interrupt_handler(runtime->runtime, &runtime->watchdog) == 0;
 }
 
 bool js_rt_runtime_callback_checkpoint(ScriptRuntime *runtime)
@@ -315,7 +331,7 @@ static void promise_rejection_tracker(JSContext *context,
         }
         JS_FreeCString(context, stack);
     }
-    if (getenv("TILEFINCH_TRACE_PROMISE_REJECTIONS") != NULL) {
+    if (tilefinch_trace_promise_rejections()) {
         fprintf(stderr, "promise-rejection source=\"%s\" reason=\"%s\" "
                 "created=%zu handled=%zu live=%zu undefined=%zu\n",
                 state->active_source == NULL ? "<event-loop>"
@@ -496,13 +512,20 @@ static bool js_rt_compile_source_admitted(
     bool count_compile_attempt)
 {
     DomBridge *bridge = JS_GetContextOpaque(context);
-    size_t maximum = bridge == NULL ? 0
+    size_t policy_maximum = bridge == NULL ? 0
         : bridge->execution_policy.maximum_host_compile_source_bytes;
+    /* Internal (trusted bootstrap) sources are pinned at build time to the
+       bootstrap ceiling; the authored-script strict unit governs only
+       page code. The policy value stays the reported limit. */
+    size_t maximum = policy_maximum;
+    if (source_kind == SCRIPT_COMPILE_SOURCE_INTERNAL
+        && maximum == SCRIPT_PSP_STRICT_MAXIMUM_HOST_COMPILE_BYTES)
+        maximum = SCRIPT_BOOTSTRAP_STRICT_MAXIMUM_HOST_COMPILE_BYTES;
     if (result != NULL) {
         if (count_compile_attempt) {
             js_rt_saturating_add_size(&result->host_compile_attempts, 1);
         }
-        result->host_compile_source_limit_bytes = maximum;
+        result->host_compile_source_limit_bytes = policy_maximum;
         result->last_compile_source_kind = source_kind;
         result->last_compile_source_bytes = length;
         snprintf(result->last_compile_source_name,
@@ -1006,7 +1029,7 @@ static bool evaluate_script_node(JSContext *context, lxb_dom_node_t *node,
                 budget_record_pressure(
                     bridge->budget, BUDGET_PRESSURE_JAVASCRIPT,
                     source_length, reclaimed);
-                if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+                if (tilefinch_trace_script_failures()) {
                     fprintf(stderr,
                             "inline-script-admission bytes=%zu "
                             "heap-remaining=%zu reserve=%zu admitted=no\n",

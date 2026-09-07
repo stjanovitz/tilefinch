@@ -387,6 +387,12 @@ void psp_media_telemetry_report_feed(
     media_playback_job_stats(media->playback, &stats);
     bool backend_ready =
         psp_media_backend_stats_snapshot(media, &backend_stats);
+    /* Pair the audio cursor with the video snapshot before any host0 writes.
+       Audio can keep draining while the multi-line report blocks the browser
+       thread; sampling it afterward falsely charges report I/O as A/V skew. */
+    uint64_t audio_cursor_us = 0;
+    bool have_audio_cursor = media_playback_audio_cursor_us(
+        media->playback, &audio_cursor_us);
     (void) media_http_range_stats(media->range, &video_range);
     (void) media_http_range_stats(media->audio_range, &audio_range);
     bool hls_ready = psp_media_hls_stats(media->hls, &hls);
@@ -581,9 +587,6 @@ void psp_media_telemetry_report_feed(
            any claim the means make against the pictures they were made from. */
         media_psp_backend_dump_picture_trace(phase);
     }
-    uint64_t audio_cursor_us = 0;
-    bool have_audio_cursor = media_playback_audio_cursor_us(
-        media->playback, &audio_cursor_us);
     uint64_t video_cursor_us = backend_ready
         ? backend_stats.presented_video_us : 0;
     int64_t av_skew_us = !backend_ready || !have_audio_cursor

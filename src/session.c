@@ -273,6 +273,28 @@ bool browser_session_client_hints_get(
     return false;
 }
 
+bool browser_session_client_hints_peek(
+    const BrowserSession *session, const char *url,
+    const char **tokens, const char **origin)
+{
+    if (tokens != NULL) *tokens = NULL;
+    if (origin != NULL) *origin = NULL;
+    if (session == NULL || session->budget == NULL
+        || session->captive_portal_stash != NULL || url == NULL
+        || tokens == NULL || origin == NULL
+        || !tilefinch_url_potentially_trustworthy(url)) return false;
+    char wanted[BROWSER_ORIGIN_LIMIT];
+    if (!copy_origin(url, wanted)) return false;
+    for (size_t i = 0; i < BROWSER_CLIENT_HINT_ORIGIN_LIMIT; i++) {
+        const BrowserClientHintEntry *entry = &session->client_hints[i];
+        if (!entry->valid || strcmp(entry->origin, wanted) != 0) continue;
+        *tokens = entry->tokens;
+        *origin = entry->origin;
+        return true;
+    }
+    return false;
+}
+
 bool browser_session_site_adapter_state_put(
     BrowserSession *session, const char *key, const void *data,
     size_t data_length, uint64_t now_ns)
@@ -1874,6 +1896,11 @@ bool browser_session_clear_site_data(
             session->storage_bytes = 0;
         budget_free(session->budget, entry->value);
         memset(entry, 0, sizeof(*entry));
+    }
+    for (size_t at = 0; at < BROWSER_CLIENT_HINT_ORIGIN_LIMIT; at++) {
+        BrowserClientHintEntry *entry = &session->client_hints[at];
+        if (entry->valid && strcmp(entry->origin, origin) == 0)
+            memset(entry, 0, sizeof(*entry));
     }
     /* Provider documents may reflect authenticated/session state.  A site
        clear must not leave one available from the bounded generated-page

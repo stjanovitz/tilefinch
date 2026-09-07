@@ -1913,6 +1913,7 @@ typedef struct {
     StyleRuleFilter *rule_filters;
     size_t rule_index_bucket_count;
     size_t rule_index_universal_count;
+    uint32_t rule_index_universal_ends[3];
     size_t rule_index_bytes;
     StyleSelectorInstruction *selector_program;
     uint16_t *selector_program_offsets;
@@ -1972,9 +1973,11 @@ typedef struct {
     uint64_t selector_match_calls;
     uint64_t selector_match_successes;
     uint64_t selector_match_characters;
+    uint64_t head_script_selector_scans;
     uint64_t selector_compound_calls;
     uint64_t selector_attribute_checks;
     uint64_t selector_pseudo_checks;
+    uint64_t selector_pseudo_state_checks;
     uint64_t selector_ancestor_visits;
     uint64_t selector_sibling_visits;
     uint64_t selector_descendant_visits;
@@ -2221,10 +2224,12 @@ typedef enum {
     STYLE_FOCUS_CHANGE_OUTLINE_ONLY,
     /*
      * Geometry and every inherited/descendant-visible computed field are
-     * unchanged. Only outline and a uniformly painted rounded border differ;
-     * all other paint commands, including inset shadows, are identical.
+     * unchanged. Only outline, a uniformly painted rounded border and at most
+     * one zero-offset unblurred inset ring differ. Layout must also prove a
+     * retained slot exists before changing the ring.
      */
-    STYLE_FOCUS_CHANGE_BORDER_PAINT_ONLY
+    STYLE_FOCUS_CHANGE_BORDER_PAINT_ONLY,
+    STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY
 } StyleFocusChange;
 StyleFocusChange style_focus_change_classify(
     const Stylesheet *sheet, lxb_dom_node_t *node,
@@ -2303,7 +2308,6 @@ bool style_container_layout_state_add(Stylesheet *sheet,
                                       int content_height,
                                       int padding_horizontal,
                                       int padding_vertical);
-void style_container_layout_state_finish(Stylesheet *sheet);
 void style_container_layout_state_clear(Stylesheet *sheet);
 uint64_t style_container_layout_state_signature(const Stylesheet *sheet);
 bool computed_style_has_text_underline(const ComputedStyle *style);
@@ -2318,6 +2322,9 @@ bool computed_style_effective_text_underline_offset(
     const ComputedStyle *style, int *pixels);
 bool style_selector_matches(lxb_dom_node_t *node, const char *selector,
                             size_t selector_length);
+/* Conservative lexical dependency cache; checks live head/html subjects. */
+bool stylesheet_head_scripts_affect_ancestors(
+    const Stylesheet *sheet, lxb_dom_node_t *head);
 bool style_selector_matches_scoped(lxb_dom_node_t *node,
                                    const char *selector,
                                    size_t selector_length,

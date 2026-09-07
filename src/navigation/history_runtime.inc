@@ -1,33 +1,30 @@
 #if !defined(__PSP__)
-static bool navigation_refuse_static_fallback_layout_once;
-static bool navigation_refuse_same_document_relayout_once;
-
 void navigation_test_refuse_next_static_fallback_layout(void)
 {
-    navigation_refuse_static_fallback_layout_once = true;
+    tilefinch_test_faults()->refuse_next_static_fallback_layout = true;
 }
 
 static bool navigation_test_consume_static_fallback_layout_refusal(void)
 {
-    bool pending = navigation_refuse_static_fallback_layout_once;
-    navigation_refuse_static_fallback_layout_once = false;
+    bool pending = tilefinch_test_faults()->refuse_next_static_fallback_layout;
+    tilefinch_test_faults()->refuse_next_static_fallback_layout = false;
     return pending;
 }
 
 void navigation_test_refuse_next_same_document_relayout(void)
 {
-    navigation_refuse_same_document_relayout_once = true;
+    tilefinch_test_faults()->refuse_next_same_document_relayout = true;
 }
 
 void navigation_test_refuse_next_relayout(void)
 {
-    navigation_refuse_same_document_relayout_once = true;
+    tilefinch_test_faults()->refuse_next_same_document_relayout = true;
 }
 
 static bool navigation_test_consume_same_document_relayout_refusal(void)
 {
-    bool pending = navigation_refuse_same_document_relayout_once;
-    navigation_refuse_same_document_relayout_once = false;
+    bool pending = tilefinch_test_faults()->refuse_next_same_document_relayout;
+    tilefinch_test_faults()->refuse_next_same_document_relayout = false;
     return pending;
 }
 #endif
@@ -429,6 +426,11 @@ bool navigation_set_scroll(NavigationSession *session, int scroll_y)
            prevents the advisory JS reflection, never the viewport movement. */
         (void) script_runtime_set_page_scroll(session->page.runtime, next);
     }
+    if (entry != NULL && entry->scroll_y != next
+        && session->page.deferred_image_targets != NULL) {
+        session->page.image_continuation_pending = true;
+        session->page.deferred_image_rank_valid = false;
+    }
     if (entry != NULL) entry->scroll_y = next;
     return entry != NULL;
 }
@@ -514,6 +516,28 @@ static bool navigation_selector_mentions_attribute(
     return false;
 }
 
+static bool navigation_head_scripts_are_nonvisual(const NavigationPage *page)
+{
+    if (page == NULL || page->document.html == NULL) return false;
+    lxb_dom_node_t *head = lxb_dom_interface_node(
+        lxb_html_document_head_element(page->document.html));
+    if (head == NULL || head->parent == NULL
+        || head->parent->local_name != LXB_TAG_HTML) return false;
+    lxb_dom_node_t *previous = head->prev;
+    for (unsigned i = 0; previous != NULL && i < 64;
+         i++, previous = previous->prev) {
+        if (previous->type == LXB_DOM_NODE_TYPE_ELEMENT) return false;
+    }
+    if (previous != NULL) return false;
+    const Stylesheet *sheet = &page->stylesheet;
+    /* The sheet caches only lexical dependencies, never live DOM matches.
+       Only head/html can observe this hidden subtree from outside it. */
+    if (stylesheet_head_scripts_affect_ancestors(sheet, head)) return false;
+    ComputedStyle root = style_for_node(sheet, head->parent, NULL);
+    ComputedStyle style = style_for_node(sheet, head, &root);
+    return style.display == DISPLAY_NONE;
+}
+
 static bool navigation_mutations_are_semantic_only(
     const NavigationSession *session, const ScriptMutationJournal *mutations)
 {
@@ -523,8 +547,16 @@ static bool navigation_mutations_are_semantic_only(
         || mutations->image_resource_refresh_required) {
         return false;
     }
+    bool head_checked = false;
     for (size_t i = 0; i < mutations->count; i++) {
         const ScriptMutationRecord *record = &mutations->records[i];
+        if (record->kind == SCRIPT_MUTATION_HEAD_SCRIPT) {
+            if (!head_checked
+                && !navigation_head_scripts_are_nonvisual(&session->page))
+                return false;
+            head_checked = true;
+            continue;
+        }
         if (record->kind != SCRIPT_MUTATION_ATTRIBUTE
             || strncmp(record->attribute, "aria-", 5) != 0
             || navigation_selector_mentions_attribute(
@@ -553,6 +585,9 @@ static bool navigation_focus_parent_style(
     while (count != 0) {
         *parent = style_for_node(
             sheet, ancestors[--count], *has_parent ? parent : NULL);
+        /* Retained colour writes must not undo ancestor compositing. */
+        if (parent->opacity != 255 || parent->has_transform || parent->has_filter)
+            return false;
         *has_parent = true;
     }
     return true;
@@ -607,12 +642,14 @@ static bool navigation_mutations_are_paint_only_focus(
         size_t focus_length = 0;
         candidates[i].focused_now = document_attribute(
             record->node, "data-tilefinch-focus", &focus_length) != NULL;
-        if (candidates[i].change == STYLE_FOCUS_CHANGE_BORDER_PAINT_ONLY) {
+        if (candidates[i].change == STYLE_FOCUS_CHANGE_BORDER_PAINT_ONLY
+            || candidates[i].change == STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY) {
             const ComputedStyle *target = candidates[i].focused_now
                 ? &candidates[i].focused : &candidates[i].normal;
             if (!layout_apply_focus_border_paint(
                     &session->page.layout, &session->page.stylesheet,
-                    candidates[i].node, target, true,
+                    candidates[i].node, target,
+                    candidates[i].change == STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY, true,
                     NULL, NULL, NULL, NULL)) return false;
             has_border_paint = true;
         }
@@ -625,14 +662,15 @@ static bool navigation_mutations_are_paint_only_focus(
         bool damage_valid = false;
         int damage_left = 0, damage_top = 0, damage_right = 0, damage_bottom = 0;
         for (size_t i = 0; i < mutations->count; i++) {
-            if (candidates[i].change
-                    != STYLE_FOCUS_CHANGE_BORDER_PAINT_ONLY) continue;
+            if (candidates[i].change != STYLE_FOCUS_CHANGE_BORDER_PAINT_ONLY
+                && candidates[i].change != STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY) continue;
             const ComputedStyle *target = candidates[i].focused_now
                 ? &candidates[i].focused : &candidates[i].normal;
             int left = 0, top = 0, right = 0, bottom = 0;
             if (!layout_apply_focus_border_paint(
                     &session->page.layout, &session->page.stylesheet,
-                    candidates[i].node, target, false,
+                    candidates[i].node, target,
+                    candidates[i].change == STYLE_FOCUS_CHANGE_INSET_PAINT_ONLY, false,
                     &left, &top, &right, &bottom)) return false;
             if (!damage_valid) {
                 damage_left = left;
@@ -696,6 +734,7 @@ static void navigation_prepare_layout_reuse(
             ScriptMutationKind kind = mutations->records[i].kind;
             if (kind == SCRIPT_MUTATION_INNER_HTML
                 || kind == SCRIPT_MUTATION_CHILD_LIST
+                || kind == SCRIPT_MUTATION_HEAD_SCRIPT
                 || kind == SCRIPT_MUTATION_UNKNOWN) {
                 destructive = true;
                 break;
@@ -769,27 +808,33 @@ static lxb_dom_node_t *navigation_inline_svg_root(lxb_dom_node_t *node)
     return NULL;
 }
 
-static bool navigation_collect_inline_svg_descendants(
+static bool navigation_collect_image_descendants(
     lxb_dom_node_t *root, lxb_dom_node_t **nodes,
-    size_t *count, size_t capacity)
+    size_t *count, size_t capacity, size_t *work, bool *cancelled)
 {
-    enum { MAXIMUM_WORK = 256, MAXIMUM_DEPTH = 48 };
     if (root == NULL) return true;
     lxb_dom_node_t *node = root;
-    size_t work = 0, depth = 0;
+    /* The bridge's cheap 256-node test means "unknown", not "rebuild all
+       resources". Resolve that uncertainty once here with a shared bounded,
+       constant-stack walk. In particular a large text section need not lose
+       its stylesheet and decoded images merely because its class changed. */
     for (;;) {
-        if (++work > MAXIMUM_WORK) return false;
-        if (node_name_is(node, "svg")
+        if (*work == NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT) return false;
+        ++*work;
+        if ((*work & 31u) == 0
+            && !tilefinch_platform_cooperate("resource", *work)) {
+            *cancelled = true;
+            return false;
+        }
+        if ((node_name_is(node, "svg") || node_name_is(node, "img"))
             && !navigation_image_refresh_add(
                 nodes, count, capacity, node)) return false;
-        if (node->first_child != NULL && depth < MAXIMUM_DEPTH) {
+        if (node->first_child != NULL) {
             node = node->first_child;
-            depth++;
             continue;
         }
         while (node != root && node->next == NULL) {
             node = node->parent;
-            if (depth != 0) depth--;
         }
         if (node == root) break;
         node = node->next;
@@ -799,11 +844,12 @@ static bool navigation_collect_inline_svg_descendants(
 
 static size_t navigation_mutation_image_refresh_nodes(
     const ScriptMutationJournal *mutations, lxb_dom_node_t **nodes,
-    size_t capacity, bool *bounded_out)
+    size_t capacity, bool *bounded_out, bool *cancelled)
 {
     if (bounded_out != NULL) *bounded_out = false;
+    *cancelled = false;
     if (mutations == NULL || nodes == NULL || capacity == 0) return 0;
-    size_t count = 0;
+    size_t count = 0, work = 0;
     for (size_t i = 0; i < mutations->count; i++) {
         const ScriptMutationRecord *record = &mutations->records[i];
         if (record->node == NULL) continue;
@@ -830,10 +876,11 @@ static size_t navigation_mutation_image_refresh_nodes(
                 && (strcmp(record->attribute, "class") == 0
                     || strcmp(record->attribute, "id") == 0
                     || strcmp(record->attribute, "style") == 0
-                    || strcmp(record->attribute, "color") == 0));
+                    || strcmp(record->attribute, "color") == 0
+                    || strcmp(record->attribute, "hidden") == 0));
         if (ancestor_style_change
-            && !navigation_collect_inline_svg_descendants(
-                record->node, nodes, &count, capacity)) {
+            && !navigation_collect_image_descendants(
+                record->node, nodes, &count, capacity, &work, cancelled)) {
             if (bounded_out != NULL) *bounded_out = true;
             return count;
         }
@@ -899,6 +946,27 @@ static bool navigation_relayout_failed(
     return false;
 }
 
+/* Pending targets the ordinary image loader must leave alone. A target that
+   already holds a committed resource is the batch currently being published:
+   a rebuild that drops the image table must reload it like every eager image,
+   or the publication relayout would present the page without it and the
+   prefix accounting would then skip or refetch the batch. */
+static size_t navigation_live_deferred_nodes(
+    const NavigationPage *page, lxb_dom_node_t **nodes)
+{
+    size_t count = 0;
+    for (size_t at = page->deferred_image_cursor;
+         at < page->deferred_image_count && count < NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT; at++) {
+        const ImagePriorityTarget *target = &page->deferred_image_targets[at];
+        if (target->weak_handle != 0 && (page->runtime == NULL
+            || script_runtime_node_handle_resolve_connected(page->runtime,
+                target->weak_handle) != target->node)) continue;
+        if (images_find_node(&page->images, target->node) != NULL) continue;
+        nodes[count++] = target->node;
+    }
+    return count;
+}
+
 bool navigation_relayout(NavigationSession *session)
 {
     if (session == NULL || !session->page.loaded) return false;
@@ -906,6 +974,12 @@ bool navigation_relayout(NavigationSession *session)
     session->focus_outline_cache_node = NULL;
     uint64_t started = navigation_now_us();
     const NavigationEntry *entry = navigation_current(session);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (session->page.document.node_count > 8192) {
+        printf("tilefinch-large-page-relayout: begin nodes=%zu\n",
+                       session->page.document.node_count);
+    }
+#endif
     ScriptMutationJournal mutations = {0};
     bool mutation_driven = session->page.runtime != NULL
         && script_runtime_consume_mutations(session->page.runtime,
@@ -967,6 +1041,10 @@ bool navigation_relayout(NavigationSession *session)
             full_rebuild = fingerprint != session->resource_fingerprint;
         }
     }
+    /* Image discovery below reuses computed styles too. Invalidate the old
+       hidden ancestry before that traversal, not only before final layout. */
+    if (!full_rebuild)
+        navigation_prepare_layout_reuse(session, &mutations, false);
     if (!full_rebuild && session->external_resources_enabled
         && (image_resource_scan || image_resource_refresh)) {
         const char *document_url =
@@ -978,12 +1056,14 @@ bool navigation_relayout(NavigationSession *session)
         if (images_loaded && image_resource_refresh) {
             lxb_dom_node_t *candidates[SCRIPT_MUTATION_JOURNAL_LIMIT];
             lxb_dom_node_t *refresh[SCRIPT_MUTATION_JOURNAL_LIMIT];
-            bool refresh_bounded_out = false;
+            bool refresh_bounded_out = false, refresh_cancelled = false;
             size_t candidate_count =
                 navigation_mutation_image_refresh_nodes(
                     &mutations, candidates,
                     sizeof(candidates) / sizeof(candidates[0]),
-                    &refresh_bounded_out);
+                    &refresh_bounded_out, &refresh_cancelled);
+            if (refresh_cancelled)
+                return navigation_relayout_failed(session, true);
             if (refresh_bounded_out) {
                 full_rebuild = true;
                 images_loaded = false;
@@ -993,13 +1073,38 @@ bool navigation_relayout(NavigationSession *session)
                  !refresh_bounded_out && i < candidate_count; i++) {
                 if (images_find_node(
                         &session->page.images, candidates[i]) == NULL) {
+                    bool queued = false;
+                    for (size_t at = session->page.deferred_image_cursor;
+                         at < session->page.deferred_image_count; at++) {
+                        const ImagePriorityTarget *target =
+                            &session->page.deferred_image_targets[at];
+                        if (target->node == candidates[i]
+                            && (target->weak_handle == 0
+                                || (session->page.runtime != NULL
+                                    && script_runtime_node_handle_resolve_connected(
+                                        session->page.runtime, target->weak_handle)
+                                           == candidates[i]))) {
+                            queued = true;
+                            break;
+                        }
+                    }
+                    /* Revealing a queued image is not new resource
+                       discovery. Let attach_layout re-rank/re-arm it; do
+                       not turn a disclosure input into synchronous fetch. */
+                    if (queued) continue;
                     /* Frameworks commonly connect a lazy <img> before
                        assigning src. There is no stale surface to retire;
                        let the deduplicating additive traversal discover it
                        alongside any CSS image in the new subtree. */
                     scan_for_additions = true;
                 } else {
-                    refresh[refresh_count++] = candidates[i];
+                    /* Ancestor visibility/color changes need not discard a
+                       decoded photograph. Only a direct image mutation can
+                       change its source; inline SVG still needs repainting. */
+                    bool direct_image_change = !node_name_is(candidates[i], "img");
+                    for (size_t m = 0; !direct_image_change && m < mutations.count; ++m)
+                        direct_image_change = mutations.records[m].node == candidates[i];
+                    if (direct_image_change) refresh[refresh_count++] = candidates[i];
                 }
             }
             if (!refresh_bounded_out) {
@@ -1021,7 +1126,9 @@ bool navigation_relayout(NavigationSession *session)
         }
         if (images_loaded && scan_for_additions) {
             navigation_ensure_layout_reuse(session);
-            images_loaded = images_load_external_reusing_layout_styles(
+            lxb_dom_node_t *deferred[NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
+            size_t deferred_count = navigation_live_deferred_nodes(&session->page, deferred);
+            images_loaded = images_load_external_reusing_layout_styles_excluding(
                 &session->page.document, &session->page.stylesheet,
                 &session->page.images, session->budget,
                 session->page.resource_base_url, document_url,
@@ -1032,7 +1139,7 @@ bool navigation_relayout(NavigationSession *session)
                 session->resource_timeout_ms,
                 session->page.resource_scheduler,
                 session->browser_session, session->page.layout_reuse,
-                session->fonts, session->viewport.css_width);
+                session->fonts, session->viewport.css_width, deferred, deferred_count);
         }
         session->images = &session->page.images;
         layout_reuse_cache_update_images(
@@ -1044,7 +1151,6 @@ bool navigation_relayout(NavigationSession *session)
         if (image_resource_scan || image_resource_refresh) {
             session->resource_fingerprint = fingerprint;
         }
-        navigation_prepare_layout_reuse(session, &mutations, false);
         navigation_evict_layout_reuse_under_pressure(session);
         LayoutDocument next = {0};
 #if !defined(__PSP__)
@@ -1053,8 +1159,24 @@ bool navigation_relayout(NavigationSession *session)
         if (injected_refusal)
             budget_inject_failure_after(session->budget, 0u);
 #endif
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        uint64_t relayout_prepared = navigation_now_us();
+#endif
         bool built = navigation_build_layout(
             session, &next, session->fonts, session->images);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        uint64_t relayout_built = navigation_now_us();
+#endif
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if (session->page.document.node_count > 8192) {
+            printf("tilefinch-large-page-relayout: built=%d elapsed=%lluus "
+                "flow=%lluus spatial=%lluus commands=%zu\n", built,
+                (unsigned long long) (navigation_now_us() - started),
+                (unsigned long long) next.performance.flow_us,
+                (unsigned long long) next.performance.spatial_index_us,
+                next.count);
+        }
+#endif
 #if !defined(__PSP__)
         if (injected_refusal)
             budget_clear_failure_injection(session->budget);
@@ -1063,8 +1185,17 @@ bool navigation_relayout(NavigationSession *session)
             return navigation_relayout_failed(session, mutation_driven);
         }
         layout_transfer_scroll_state(&session->page.layout, &next);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        uint64_t relayout_transferred = navigation_now_us();
+#endif
         navigation_measure_damage(session, &session->page.layout, &next);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        uint64_t relayout_damaged = navigation_now_us();
+#endif
         layout_destroy(&session->page.layout);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        uint64_t relayout_destroyed = navigation_now_us();
+#endif
         session->page.layout = next;
         session->incremental_relayouts++;
         session->performance.fast_relayouts++;
@@ -1077,6 +1208,18 @@ bool navigation_relayout(NavigationSession *session)
         session->performance.relayout_us += elapsed;
         navigation_attach_layout(session);
         navigation_clamp_scroll_to_layout(session);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        char relayout_phases[256];
+        snprintf(relayout_phases, sizeof(relayout_phases),
+            "tilefinch-relayout-phases: prepare=%lluus build=%lluus transfer=%lluus damage=%lluus destroy=%lluus attach=%lluus",
+            (unsigned long long) (relayout_prepared - started),
+            (unsigned long long) (relayout_built - relayout_prepared),
+            (unsigned long long) (relayout_transferred - relayout_built),
+            (unsigned long long) (relayout_damaged - relayout_transferred),
+            (unsigned long long) (relayout_destroyed - relayout_damaged),
+            (unsigned long long) (navigation_now_us() - relayout_destroyed));
+        tilefinch_platform_log_message(relayout_phases);
+#endif
         return true;
     }
     int old_height = session->page.layout.height;
@@ -1106,6 +1249,15 @@ bool navigation_relayout(NavigationSession *session)
             session->page.loaded = false;
             return navigation_relayout_failed(session, true);
         }
+        /* The job borrows this image table. Retire it before a full
+           resource rebuild replaces the table; the pending targets remain
+           weak and will be re-admitted against the rebuilt stylesheet. */
+        images_priority_load_destroy(session->page.deferred_image_job);
+        session->page.deferred_image_job = NULL;
+        session->page.deferred_image_batch_count = 0;
+        session->page.deferred_image_publication_age = 0;
+        lxb_dom_node_t *deferred[NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
+        size_t deferred_count = navigation_live_deferred_nodes(&session->page, deferred);
         images_destroy(&session->page.images);
         if (!stylesheets_load_external_tracked_with_context(
                 &session->page.document, &session->page.stylesheet,
@@ -1129,7 +1281,7 @@ bool navigation_relayout(NavigationSession *session)
             return navigation_relayout_failed(session, true);
         }
         navigation_ensure_layout_reuse(session);
-        if (!images_load_external_reusing_layout_styles(
+        if (!images_load_external_reusing_layout_styles_excluding(
                 &session->page.document, &session->page.stylesheet,
                 &session->page.images, session->budget,
                 session->page.resource_base_url,
@@ -1140,7 +1292,7 @@ bool navigation_relayout(NavigationSession *session)
                 session->resource_timeout_ms,
                 session->page.resource_scheduler,
                 session->browser_session, session->page.layout_reuse,
-                session->fonts, session->viewport.css_width)) {
+                session->fonts, session->viewport.css_width, deferred, deferred_count)) {
             session->page.loaded = false;
             return navigation_relayout_failed(session, true);
         }
@@ -1515,16 +1667,6 @@ bool navigation_apply_user_css_rollback(
     return true;
 }
 
-bool navigation_apply_user_css(NavigationSession *session, const char *css,
-                               size_t length)
-{
-    NavigationUserCssTransaction *transaction =
-        navigation_apply_user_css_begin(session, css, length);
-    if (transaction == NULL) return false;
-    navigation_apply_user_css_commit(session, transaction);
-    return true;
-}
-
 bool navigation_background_resources_pending(
     const NavigationSession *session)
 {
@@ -1558,6 +1700,7 @@ static void navigation_deferred_images_finish(NavigationSession *session)
     images_priority_load_destroy(session->page.deferred_image_job);
     session->page.deferred_image_job = NULL;
     session->page.deferred_image_batch_count = 0;
+    session->page.deferred_image_publication_age = 0;
     budget_free(session->budget, session->page.deferred_image_targets);
     session->page.deferred_image_targets = NULL;
     session->page.deferred_image_count = 0;
@@ -1620,6 +1763,8 @@ bool navigation_prioritize_deferred_image(
         }
     }
     if (found == page->deferred_image_count) return false;
+    if (page->deferred_image_rank_valid
+        && found >= page->deferred_image_eligible_end) return false;
     if (page->deferred_image_job != NULL
         && images_priority_load_contains_node(
                page->deferred_image_job, node)) {
@@ -1655,7 +1800,6 @@ bool navigation_prioritize_deferred_image(
         }
         const NavigationEntry *entry = navigation_current(session);
         page->deferred_image_rank_scroll_y = entry == NULL ? 0 : entry->scroll_y;
-        page->deferred_image_rank_valid = true;
         return true;
     }
     if (found != page->deferred_image_cursor) {
@@ -1678,7 +1822,6 @@ bool navigation_prioritize_deferred_image(
        all-visible result list can immediately swap the old first row back. */
     const NavigationEntry *entry = navigation_current(session);
     page->deferred_image_rank_scroll_y = entry == NULL ? 0 : entry->scroll_y;
-    page->deferred_image_rank_valid = true;
     return true;
 }
 
@@ -1690,10 +1833,8 @@ static uint64_t navigation_deferred_image_distance(
     if (display_height != NULL) *display_height = target->display_height;
     int64_t top = scroll_y;
     int64_t bottom = top + session->viewport.css_height;
-    for (size_t i = 0; i < session->page.layout.node_box_count; i++) {
-        const LayoutNodeBox *box = &session->page.layout.node_boxes[i];
-        if (box->node != target->node || box->width <= 0
-            || box->height <= 0) continue;
+    const LayoutNodeBox *box = layout_box_for_node(&session->page.layout, target->node);
+    if (box != NULL && box->width > 0 && box->height > 0) {
         int width = layout_css_to_visual(&session->page.layout, box->width);
         int height = layout_css_to_visual(&session->page.layout, box->height);
         if (display_width != NULL && width > 0 && width <= UINT16_MAX) {
@@ -1711,6 +1852,139 @@ static uint64_t navigation_deferred_image_distance(
     return UINT64_MAX;
 }
 
+static bool navigation_deferred_target_live(
+    NavigationPage *page, const ImagePriorityTarget *target)
+{
+    return target->weak_handle == 0
+        || (page->runtime != NULL
+            && script_runtime_node_handle_resolve_connected(
+                   page->runtime, target->weak_handle) == target->node);
+}
+
+/* A missing node box is not a visibility test (inline replaced elements
+   need not have one). Resolve the bounded ancestor chain using the layout
+   style cache instead, and never inspect a retired weak target. */
+static bool navigation_deferred_image_visible(
+    NavigationSession *session, const ImagePriorityTarget *target)
+{
+    if (!navigation_deferred_target_live(&session->page, target)) return false;
+    lxb_dom_node_t *ancestors[64];
+    size_t count = 0;
+    for (lxb_dom_node_t *node = target->node; node != NULL; node = node->parent) {
+        if (node->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        if (count == sizeof(ancestors) / sizeof(ancestors[0])) return false;
+        ancestors[count++] = node;
+    }
+    ComputedStyle style = layout_initial_root_style();
+    while (count != 0) {
+        ComputedStyle next;
+        layout_reuse_cache_resolve_style(session->page.layout_reuse,
+            &session->page.stylesheet, session->fonts, ancestors[--count],
+            &style, &next);
+        if (next.display == DISPLAY_NONE || next.hidden) return false;
+        style = next;
+    }
+    return true;
+}
+
+/* Reader retains raw resource ownership while presenting a native extracted
+   copy. Match only inside the engine-owned root, never a public DOM marker.
+   The original source/weak handle remains the fetch authority. */
+static lxb_dom_node_t *navigation_deferred_reader_image(
+    NavigationPage *page, const ImagePriorityTarget *target)
+{
+    lxb_dom_node_t *root = page->reader_root;
+    if (root == NULL || (page->reader_root_handle != 0
+        && (page->runtime == NULL || script_runtime_node_handle_resolve_connected(
+            page->runtime, page->reader_root_handle) != root))) return NULL;
+    if (!navigation_deferred_target_live(page, target)) return NULL;
+    size_t length = 0;
+    const char *source = document_attribute(target->node, "src", &length);
+    if (source == NULL || length == 0) return NULL;
+    size_t visited = 0;
+    for (lxb_dom_node_t *node = root; node != NULL && visited++ < 8192u;) {
+        if (node_name_is(node, "img")) {
+            size_t candidate_length = 0;
+            const char *candidate = document_attribute(node, "src", &candidate_length);
+            if (candidate != NULL && length == candidate_length
+                && memcmp(source, candidate, length) == 0) return node;
+        }
+        if (node->first_child != NULL) { node = node->first_child; continue; }
+        while (node != root && node->next == NULL) node = node->parent;
+        if (node == root) break;
+        node = node->next;
+    }
+    return NULL;
+}
+
+static void navigation_rank_deferred_images(NavigationSession *session, int scroll_y)
+{
+    NavigationPage *page = &session->page;
+    uint64_t distances[NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT];
+    size_t start = page->deferred_image_cursor;
+    for (size_t i = start; i < page->deferred_image_count; i++) {
+        ImagePriorityTarget *target = &page->deferred_image_targets[i];
+        ImagePriorityTarget presentation = *target;
+        bool visible = navigation_deferred_image_visible(session, target);
+        if (!visible) {
+            lxb_dom_node_t *reader = navigation_deferred_reader_image(page, target);
+            if (reader != NULL) {
+                presentation.node = reader;
+                presentation.weak_handle = 0;
+                visible = navigation_deferred_image_visible(session, &presentation);
+            }
+        }
+        uint64_t distance = UINT64_MAX;
+        if (visible) {
+            distance = navigation_deferred_image_distance(session, &presentation,
+                scroll_y, &target->display_width, &target->display_height);
+            /* Unknown inline geometry remains admissible for eager images.
+               Explicit lazy images wait for positive viewport evidence. */
+            if (navigation_attribute_equals(target->node, "loading", "lazy")) {
+                if (distance != 0) distance = UINT64_MAX;
+            } else if (distance == UINT64_MAX) distance--;
+        }
+        distances[i] = distance;
+    }
+    /* Stable bounded insertion sort: compute geometry/styles once per
+       target, not once per comparison or once per downloaded image. */
+    for (size_t i = start + 1; i < page->deferred_image_count; i++) {
+        ImagePriorityTarget target = page->deferred_image_targets[i];
+        uint64_t distance = distances[i];
+        size_t at = i;
+        while (at > start && distance < distances[at - 1]) {
+            page->deferred_image_targets[at] = page->deferred_image_targets[at - 1];
+            distances[at] = distances[at - 1];
+            at--;
+        }
+        page->deferred_image_targets[at] = target;
+        distances[at] = distance;
+    }
+    page->deferred_image_rank_scroll_y = scroll_y;
+    page->deferred_image_rank_valid = true;
+    page->deferred_image_eligible_end = start;
+    while (page->deferred_image_eligible_end < page->deferred_image_count
+           && distances[page->deferred_image_eligible_end] != UINT64_MAX)
+        page->deferred_image_eligible_end++;
+    if (distances[start] == UINT64_MAX) page->image_continuation_pending = false;
+}
+
+static bool navigation_publish_deferred_images(NavigationSession *session)
+{
+    NavigationPage *page = &session->page;
+    if (page->deferred_image_publication_age == 0) return true;
+    page->deferred_image_publication_age = 0;
+    if (session->deferred_image_ready != NULL)
+        session->deferred_image_ready(session->deferred_image_ready_opaque, session);
+    if (!navigation_relayout(session)) {
+        session->performance.background_image_failures++;
+        navigation_deferred_images_finish(session);
+        return false;
+    }
+    session->performance.background_image_relayouts++;
+    return true;
+}
+
 static bool navigation_run_deferred_image(NavigationSession *session)
 {
     NavigationPage *page = &session->page;
@@ -1719,59 +1993,61 @@ static bool navigation_run_deferred_image(NavigationSession *session)
         navigation_deferred_images_finish(session);
         return true;
     }
+    if (page->deferred_image_job != NULL) {
+        size_t count = images_priority_load_target_count(page->deferred_image_job);
+        bool current = count <= page->deferred_image_count - page->deferred_image_cursor;
+        for (size_t at = 0; current && at < count; at++)
+            current = navigation_deferred_target_live(page,
+                &page->deferred_image_targets[page->deferred_image_cursor + at]);
+        /* Resolve weak identities before the source check can inspect DOM.
+           Already-published resources belong to the page, including any
+           table changes made by author script between idle pumps. */
+        if (!current || !images_priority_load_sources_current(page->deferred_image_job)) {
+            images_priority_load_commit_progress(page->deferred_image_job);
+            images_priority_load_destroy(page->deferred_image_job);
+            page->deferred_image_job = NULL;
+            page->deferred_image_batch_count = 0;
+            page->deferred_image_rank_valid = false;
+            (void) navigation_publish_deferred_images(session);
+            return true;
+        }
+    }
     if (page->deferred_image_job == NULL) {
         ImagePriorityTarget *current =
             &page->deferred_image_targets[page->deferred_image_cursor];
+        if (!navigation_deferred_target_live(page, current)) {
+            page->deferred_image_cursor++;
+            return true;
+        }
         if (current->retry_delay != 0) {
             current->retry_delay--;
             return true;
         }
         const NavigationEntry *entry = navigation_current(session);
         int scroll_y = entry == NULL ? 0 : entry->scroll_y;
-        uint16_t best_width = current->display_width;
-        uint16_t best_height = current->display_height;
-        /* The committed plan is already viewport ordered. Scan the remaining
-           layout boxes only when scrolling changes that order; doing this at
-           every request start made a long thumbnail queue O(targets*boxes)
-           once per image. A failed target is pinned until its retry resolves
-           so a scroll cannot transfer or bypass that target's retry. */
+        /* Both static and mutable plans need a complete stable ranking.
+           Recompute after scrolling or layout changes, not per request. */
         if (current->retry_count == 0
             && (!page->deferred_image_rank_valid
                 || page->deferred_image_rank_scroll_y != scroll_y)) {
             session->performance.background_image_rank_scans++;
-            size_t best = page->deferred_image_cursor;
-            uint64_t best_distance = navigation_deferred_image_distance(
-                session, &page->deferred_image_targets[best], scroll_y,
-                &best_width, &best_height);
-            for (size_t i = best + 1; i < page->deferred_image_count; i++) {
-                uint64_t distance = navigation_deferred_image_distance(
-                    session, &page->deferred_image_targets[i], scroll_y,
-                    NULL, NULL);
-                if (distance < best_distance) {
-                    best = i;
-                    best_distance = distance;
-                }
-            }
-            if (best != page->deferred_image_cursor) {
-                ImagePriorityTarget swap =
-                    page->deferred_image_targets[page->deferred_image_cursor];
-                page->deferred_image_targets[page->deferred_image_cursor] =
-                    page->deferred_image_targets[best];
-                page->deferred_image_targets[best] = swap;
-                (void) navigation_deferred_image_distance(
-                    session,
-                    &page->deferred_image_targets[
-                        page->deferred_image_cursor],
-                    scroll_y, &best_width, &best_height);
-            }
-            page->deferred_image_rank_scroll_y = scroll_y;
-            page->deferred_image_rank_valid = true;
+            navigation_rank_deferred_images(session, scroll_y);
             current = &page->deferred_image_targets[
                 page->deferred_image_cursor];
         }
+        if (page->deferred_image_rank_valid
+            && page->deferred_image_cursor >= page->deferred_image_eligible_end) {
+            page->image_continuation_pending = false;
+            return true;
+        }
         ImagePriorityTarget *target = current;
-        target->display_width = best_width;
-        target->display_height = best_height;
+        /* An inline image can be represented by display commands without
+           its own node-box entry. Missing geometry lowers priority; it is
+           not proof that the image is hidden or should be dropped. */
+        if (!navigation_deferred_target_live(page, target)) {
+            page->deferred_image_cursor++;
+            return true;
+        }
         /* The ordinary image count remains the successful-page budget. Add
            back only attempts already lost to failure, so a failed visible
            prefix does not crowd an offscreen thumbnail out while a large
@@ -1786,7 +2062,7 @@ static bool navigation_run_deferred_image(NavigationSession *session)
         size_t batch_count = 1u;
         if (target->retry_count == 0
             && page->deferred_image_cursor + 1u
-                   < page->deferred_image_count) {
+                   < page->deferred_image_eligible_end) {
             ImagePriorityTarget *next = &page->deferred_image_targets[
                 page->deferred_image_cursor + 1u];
             uint16_t next_width = next->display_width;
@@ -1795,7 +2071,12 @@ static bool navigation_run_deferred_image(NavigationSession *session)
                 session, target, scroll_y, NULL, NULL);
             uint64_t next_distance = navigation_deferred_image_distance(
                 session, next, scroll_y, &next_width, &next_height);
-            if (current_distance == 0 && next_distance == 0
+            /* Pair within the visible/offscreen priority class. Offscreen
+               eager images otherwise force a separate page flow each, even
+               though the existing two-response transaction can publish them
+               together. Never hold a visible image for an offscreen peer. */
+            if ((current_distance == 0) == (next_distance == 0)
+                && navigation_deferred_target_live(page, next)
                 && next->retry_count == 0) {
                 next->display_width = next_width;
                 next->display_height = next_height;
@@ -1841,20 +2122,19 @@ static bool navigation_run_deferred_image(NavigationSession *session)
     navigation_ensure_layout_reuse(session);
     layout_reuse_cache_update_images(page->layout_reuse, &page->images);
     if (added != 0) {
-        if (session->deferred_image_ready != NULL) {
-            session->deferred_image_ready(
-                session->deferred_image_ready_opaque, session);
-        }
-        if (!navigation_relayout(session)) {
-            /* Optional pixels must never retire an already usable display
-               list under pressure. The transactional relayout left it
-               intact; stop the queue and keep browsing. */
-            session->performance.background_image_failures++;
-            navigation_deferred_images_finish(session);
-            return true;
-        }
-        session->performance.background_image_relayouts++;
+        if (page->deferred_image_publication_age == 0)
+            page->deferred_image_publication_age = 1;
+        /* Decoded resources are page-owned even while layout publication
+           waits briefly for the other member of this two-image batch. */
         images_priority_load_commit_progress(page->deferred_image_job);
+    }
+    if (page->deferred_image_publication_age != 0) {
+        /* At most three further owner pumps: a slow second response cannot
+           hold the first image until its network timeout. No bigger queue,
+           retained DOM cursor, or unbounded settle delay. */
+        if (status == IMAGE_PRIORITY_LOAD_PENDING
+            && page->deferred_image_publication_age++ < 4) return true;
+        if (!navigation_publish_deferred_images(session)) return true;
     }
     if (status == IMAGE_PRIORITY_LOAD_PENDING) return true;
     images_priority_load_destroy(page->deferred_image_job);
@@ -1903,11 +2183,10 @@ bool navigation_run_deferred_image_work(NavigationSession *session)
 }
 
 #if !defined(__PSP__)
-static bool navigation_refuse_background_font_relayout_once;
 
 void navigation_test_refuse_next_background_font_relayout(void)
 {
-    navigation_refuse_background_font_relayout_once = true;
+    tilefinch_test_faults()->refuse_next_background_font_relayout = true;
 }
 #endif
 
@@ -1970,8 +2249,8 @@ NavigationBackgroundWorkOutcome navigation_run_background_resources(
             session->performance.layout_reuse_retained_bytes = 0;
             bool relaid_out = false;
 #if !defined(__PSP__)
-            if (navigation_refuse_background_font_relayout_once) {
-                navigation_refuse_background_font_relayout_once = false;
+            if (tilefinch_test_faults()->refuse_next_background_font_relayout) {
+                tilefinch_test_faults()->refuse_next_background_font_relayout = false;
             } else
 #endif
             {
@@ -2217,7 +2496,7 @@ static void navigation_frontier_script_execute(
            snapshot. */
         bool connected =
             navigation_frontier_script_is_connected(walk, script);
-        if (getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+        if (tilefinch_trace_script_failures()) {
             fprintf(stderr,
                     "frontier-script index=%zu handle=%ld resolved=%s "
                     "connected=%s\n",
@@ -2642,6 +2921,12 @@ bool navigation_advance_runtime(NavigationSession *session,
     bool advanced = script_runtime_advance(
         session->page.runtime, elapsed_ms, callback_budget,
         &session->page.script_result);
+    /* A top-level realm owns the document transition once it requests one.
+       Do not let refresh retirement or stale child-frame work from the
+       outgoing document veto that committed replacement in the same tick. */
+    if (script_runtime_has_pending_navigation(session->page.runtime)) {
+        goto consume_script_navigation;
+    }
     if (navigation_retire_failed_document_refresh(
             session, session->page.runtime)) return false;
     if (!advanced) {
@@ -2667,7 +2952,7 @@ bool navigation_advance_runtime(NavigationSession *session,
         }
         unsigned long generated_line = 0, generated_column = 0;
         bool captured_generated_source = false;
-        if (getenv("TILEFINCH_TRACE_EVAL_SOURCE") != NULL
+        if (tilefinch_trace_eval_source()
             && stack_generated_location(session->page.script_result.error,
                                         &generated_line,
                                         &generated_column)) {
@@ -2764,6 +3049,12 @@ bool navigation_advance_runtime(NavigationSession *session,
         bool frame_advanced = script_runtime_advance(
             frame->runtime, elapsed_ms, callback_budget,
             &frame->script_result);
+        /* A child callback may fail after the top realm requested a reload.
+           The child belongs to the page being replaced and must not suppress
+           that already-published top-level navigation. */
+        if (script_runtime_has_pending_navigation(session->page.runtime)) {
+            goto consume_script_navigation;
+        }
         if (navigation_retire_failed_document_refresh(
                 session, frame->runtime)) return false;
         if (!frame_advanced) {
@@ -2797,7 +3088,7 @@ bool navigation_advance_runtime(NavigationSession *session,
                 session, frame);
             if (!frame_presented && !session->page.loaded) return false;
         }
-        if (getenv("TILEFINCH_TRACE_CALLBACK_SOURCE") != NULL
+        if (tilefinch_trace_callback_source()
             && frame->callback_error_source_context[0] == '\0'
             && frame->script_result.last_uncaught_callback_error[0] != '\0') {
             collect_stack_source_context_into(
@@ -2820,6 +3111,8 @@ bool navigation_advance_runtime(NavigationSession *session,
                  session->page.script_result.error);
         return false;
     }
+consume_script_navigation:
+    ;
     char navigation_url[NAVIGATION_URL_LIMIT];
     bool replace = false;
     if (script_runtime_consume_navigation(session->page.runtime,
@@ -2959,25 +3252,107 @@ bool navigation_dispatch_node_activation(NavigationSession *session,
            || navigation_relayout(session);
 }
 
-bool navigation_activate_frame(NavigationSession *session,
-                               lxb_dom_node_t *frame_element)
+static NavigationFrame *navigation_loaded_frame_for_element(
+    NavigationSession *session, ScriptRuntime *parent_runtime,
+    lxb_dom_node_t *frame_element)
 {
     if (session == NULL || frame_element == NULL
-        || !session->page.loaded) return false;
-    NavigationFrame *frame = NULL;
+        || !session->page.loaded) return NULL;
     for (size_t i = 0; i < session->page.frame_count; i++) {
         NavigationFrame *candidate = &session->page.frames[i];
         if (!candidate->retired && candidate->loaded
             && candidate->runtime != NULL
             && candidate->presentation != NULL
+            && candidate->parent_runtime == parent_runtime
             && candidate->element == frame_element) {
-            frame = candidate;
-            break;
+            return candidate;
         }
     }
+    return NULL;
+}
+
+static bool navigation_finish_frame_activation(
+    NavigationSession *session, NavigationFrame *frame,
+    lxb_dom_node_t *target)
+{
+    if (session == NULL || frame == NULL || target == NULL) return false;
+    if (!script_runtime_dispatch_activation_node(
+            frame->runtime, target, &frame->script_result)) {
+        (void) navigation_retire_failed_document_refresh(
+            session, frame->runtime);
+        return false;
+    }
+    bool relayout = script_runtime_consume_relayout(frame->runtime);
+    if (relayout) {
+        bool frame_presented = navigation_refresh_frame_presentation(
+            session, frame);
+        if (!frame_presented && !session->page.loaded) return false;
+    }
+    return navigation_deliver_frame_messages(session);
+}
+
+static bool navigation_finish_frame_pointer_click(
+    NavigationSession *session, NavigationFrame *frame,
+    lxb_dom_node_t *target, int client_x, int client_y,
+    int offset_x, int offset_y)
+{
+    if (session == NULL || frame == NULL || target == NULL) return false;
+    long target_handle = script_runtime_node_handle(
+        frame->runtime, target);
+    if (target_handle == 0) return false;
+    static const unsigned phases[] = {2u, 3u, 5u};
+    static const unsigned buttons[] = {1u, 0u, 0u};
+    bool trace = tilefinch_trace_frame_controls();
+    for (size_t i = 0; i < sizeof(phases) / sizeof(phases[0]); i++) {
+        lxb_dom_node_t *live_target =
+            script_runtime_node_handle_resolve_connected(
+                frame->runtime, target_handle);
+        if (live_target == NULL) {
+            if (trace)
+                fprintf(stderr, "frame-pointer-phase=%u failure=resolve\n",
+                        phases[i]);
+            script_runtime_node_handle_release(frame->runtime, target_handle);
+            return false;
+        }
+        if (!script_runtime_dispatch_pointer_node(
+                frame->runtime, live_target, phases[i],
+                client_x, client_y, offset_x, offset_y, buttons[i],
+                &frame->script_result)) {
+            if (trace)
+                fprintf(stderr,
+                        "frame-pointer-phase=%u failure=dispatch error=\"%s\"\n",
+                        phases[i], frame->script_result.error);
+            script_runtime_node_handle_release(frame->runtime, target_handle);
+            (void) navigation_retire_failed_document_refresh(
+                session, frame->runtime);
+            return false;
+        }
+        if (trace)
+            fprintf(stderr, "frame-pointer-phase=%u success\n", phases[i]);
+    }
+    script_runtime_node_handle_release(frame->runtime, target_handle);
+    bool relayout = script_runtime_consume_relayout(frame->runtime);
+    if (relayout) {
+        bool frame_presented = navigation_refresh_frame_presentation(
+            session, frame);
+        if (!frame_presented && !session->page.loaded) return false;
+    }
+    bool delivered = navigation_deliver_frame_messages(session);
+    if (trace && !delivered)
+        fprintf(stderr, "frame-pointer-failure=message-delivery\n");
+    return delivered;
+}
+
+bool navigation_activate_frame(NavigationSession *session,
+                               lxb_dom_node_t *frame_element)
+{
+    NavigationFrame *frame = navigation_loaded_frame_for_element(
+        session, session == NULL ? NULL : session->page.runtime,
+        frame_element);
     if (frame == NULL) return false;
     bool trace_frame_controls =
-        getenv("TILEFINCH_TRACE_FRAME_MESSAGES") != NULL;
+        tilefinch_trace_frame_messages()
+        || tilefinch_trace_frame_controls();
     lxb_dom_node_t *target = NULL;
     for (size_t depth = 0; depth < NAVIGATION_FRAME_LIMIT; depth++) {
         const LayoutDocument *layout = &frame->presentation->layout;
@@ -2986,9 +3361,10 @@ bool navigation_activate_frame(NavigationSession *session,
         if (trace_frame_controls) {
             fprintf(stderr,
                     "frame-activation-controls frame=%zu depth=%zu "
-                    "controls=%zu links=%zu\n",
+                    "controls=%zu links=%zu boxes=%zu\n",
                     (size_t) (frame - session->page.frames), depth,
-                    layout->control_count, layout->link_count);
+                    layout->control_count, layout->link_count,
+                    layout->node_box_count);
         }
         for (size_t i = 0; i < layout->control_count; i++) {
             const ControlRegion *control = &layout->controls[i];
@@ -3031,35 +3407,81 @@ bool navigation_activate_frame(NavigationSession *session,
         }
         if (target != NULL) break;
         if (nested_region == NULL) return false;
-        NavigationFrame *nested = NULL;
-        for (size_t i = 0; i < session->page.frame_count; i++) {
-            NavigationFrame *candidate = &session->page.frames[i];
-            if (!candidate->retired && candidate->loaded
-                && candidate->runtime != NULL
-                && candidate->presentation != NULL
-                && candidate->parent_runtime == frame->runtime
-                && candidate->element == nested_region->node) {
-                nested = candidate;
-                break;
-            }
-        }
+        NavigationFrame *nested = navigation_loaded_frame_for_element(
+            session, frame->runtime, nested_region->node);
         if (nested == NULL) return false;
         frame = nested;
     }
     if (target == NULL) return false;
-    if (!script_runtime_dispatch_activation_node(
-            frame->runtime, target, &frame->script_result)) {
-        (void) navigation_retire_failed_document_refresh(
-            session, frame->runtime);
-        return false;
+    return navigation_finish_frame_activation(session, frame, target);
+}
+
+bool navigation_activate_frame_at(NavigationSession *session,
+                                  lxb_dom_node_t *frame_element,
+                                  int offset_x, int offset_y)
+{
+    NavigationFrame *frame = navigation_loaded_frame_for_element(
+        session, session == NULL ? NULL : session->page.runtime,
+        frame_element);
+    if (frame == NULL || offset_x < 0 || offset_y < 0) return false;
+    for (size_t depth = 0; depth < NAVIGATION_FRAME_LIMIT; depth++) {
+        const LayoutDocument *layout = &frame->presentation->layout;
+        bool trace_frame_controls =
+            tilefinch_trace_frame_controls();
+        if (trace_frame_controls) {
+            fprintf(stderr,
+                    "frame-pointer-hit depth=%zu point=%d,%d controls=%zu "
+                    "links=%zu boxes=%zu\n",
+                    depth, offset_x, offset_y, layout->control_count,
+                    layout->link_count, layout->node_box_count);
+        }
+        const ControlRegion *control = layout_control_at(
+            layout, offset_x, offset_y);
+        if (control != NULL && control->type == CONTROL_FRAME) {
+            NavigationFrame *nested = navigation_loaded_frame_for_element(
+                session, frame->runtime, control->node);
+            if (nested == NULL) return false;
+            offset_x -= control->x;
+            offset_y -= control->y;
+            if (offset_x < 0 || offset_y < 0) return false;
+            frame = nested;
+            continue;
+        }
+        lxb_dom_node_t *target = control == NULL ? NULL : control->node;
+        int target_x = control == NULL ? 0 : control->x;
+        int target_y = control == NULL ? 0 : control->y;
+        if (target == NULL) {
+            const LinkRegion *link = layout_link_at(
+                layout, offset_x, offset_y);
+            if (link != NULL) {
+                target = link->node;
+                target_x = link->x;
+                target_y = link->y;
+            }
+        }
+        if (target == NULL) {
+            /* Layout stores the deepest painted containing box first, which
+               is the pointer target used by the top-level controller too. */
+            for (size_t i = 0; i < layout->node_box_count; i++) {
+                const LayoutNodeBox *box = &layout->node_boxes[i];
+                if (box->node != NULL && box->width > 0 && box->height > 0
+                    && offset_x >= box->x
+                    && offset_x < box->x + box->width
+                    && offset_y >= box->y
+                    && offset_y < box->y + box->height) {
+                    target = box->node;
+                    target_x = box->x;
+                    target_y = box->y;
+                    break;
+                }
+            }
+        }
+        return target != NULL
+            && navigation_finish_frame_pointer_click(
+                session, frame, target, offset_x, offset_y,
+                offset_x - target_x, offset_y - target_y);
     }
-    bool relayout = script_runtime_consume_relayout(frame->runtime);
-    if (relayout) {
-        bool frame_presented = navigation_refresh_frame_presentation(
-            session, frame);
-        if (!frame_presented && !session->page.loaded) return false;
-    }
-    return navigation_deliver_frame_messages(session);
+    return false;
 }
 
 bool navigation_dispatch_node_pointer(
@@ -3069,6 +3491,9 @@ bool navigation_dispatch_node_pointer(
 {
     if (session == NULL || session->page.runtime == NULL
         || !session->page.loaded || (node == NULL && phase != 1u)) return false;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t pointer_started = navigation_now_us();
+#endif
     if (!script_runtime_dispatch_pointer_node(
         session->page.runtime, node, phase, client_x, client_y,
             offset_x, offset_y, buttons, &session->page.script_result)) {
@@ -3076,13 +3501,27 @@ bool navigation_dispatch_node_pointer(
             session, session->page.runtime);
         return false;
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t pointer_dispatched = navigation_now_us();
+#endif
     int scroll_y = 0;
     if (script_runtime_consume_scroll(session->page.runtime, &scroll_y)) {
         int maximum = navigation_max_scroll(session);
         navigation_set_scroll(session, scroll_y < maximum ? scroll_y : maximum);
     }
-    return !script_runtime_consume_relayout(session->page.runtime)
-           || navigation_relayout(session);
+    bool finished = !script_runtime_consume_relayout(session->page.runtime)
+        || navigation_relayout(session);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (phase == 5u) {
+        char pointer_phases[160];
+        snprintf(pointer_phases, sizeof(pointer_phases),
+            "tilefinch-pointer-phases: script=%lluus settle=%lluus",
+            (unsigned long long) (pointer_dispatched - pointer_started),
+            (unsigned long long) (navigation_now_us() - pointer_dispatched));
+        tilefinch_platform_log_message(pointer_phases);
+    }
+#endif
+    return finished;
 }
 
 bool navigation_dispatch_node_input_event(NavigationSession *session,

@@ -1,0 +1,14 @@
+# Serve tests/fixtures over loopback; open cooperative-runtime-input.html.
+# No post-paint resource/layout work: busy presses must cross VM checkpoints.
+wait 2
+mark opened
+tap down
+wait-live 10
+tap-live down
+wait-live 10
+tap-live down
+mark-live focused
+wait-live 90
+tap-live up
+mark-live returned
+end

@@ -237,7 +237,7 @@ redirects then fail closed without cookies.
 
 Cookie Domain admission, SameSite comparison, and partition keys share one
 bundled Public Suffix List snapshot. Its immutable ASCII/punycode DAFSA is
-52,676 bytes in the linked image, uses no heap, and includes both ICANN and
+53,292 bytes in the linked image, uses no heap, and includes both ICANN and
 PRIVATE rules. Parent-domain cookies are accepted only when the request host
 domain-matches the attribute and the attribute is not a public suffix. Invalid
 or unclassifiable parent scopes fail closed. An attribute exactly matching a

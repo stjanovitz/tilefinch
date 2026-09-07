@@ -1,0 +1,14 @@
+# Exercise the ordinary results input path, including returning to a cached row.
+wait-page 90
+hold-live 90 down
+mark-live results-down
+hold-live 90 up
+mark-live results-returned
+tap-live cross
+wait-live 900
+mark-live played
+wait-live 900
+mark-live progressed
+tap-live circle
+wait-live 180
+end

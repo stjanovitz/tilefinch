@@ -5,7 +5,7 @@
 #include <wasm_export.h>
 
 #define TILEFINCH_WASM_COMPONENT_MAGIC UINT32_C(0x5446574d)
-#define TILEFINCH_WASM_COMPONENT_ABI_VERSION 4u
+#define TILEFINCH_WASM_COMPONENT_ABI_VERSION 7u
 
 uint32_t tilefinch_wasm_export_function_index(
     wasm_module_t module, const char *name);
@@ -69,6 +69,13 @@ typedef struct TilefinchWasmComponentApi {
     uint64_t (*memory_get_cur_page_count)(const wasm_memory_inst_t);
     uint64_t (*memory_get_max_page_count)(const wasm_memory_inst_t);
     bool (*memory_enlarge)(wasm_memory_inst_t, uint64_t);
+    /* ABI 5: link a module loaded with LoadArgs::no_resolve. */
+    bool (*runtime_resolve_symbols)(wasm_module_t);
+    /* ABI 6: whether a module loaded with wasm_binary_freeable no longer
+       references its binary, so the caller may free it. */
+    bool (*runtime_is_underlying_binary_freeable)(const wasm_module_t);
+    /* ABI 7: trap a start-function import before Instance publication. */
+    wasm_module_inst_t (*runtime_get_module_inst)(wasm_exec_env_t);
 } TilefinchWasmComponentApi;
 
 typedef struct {

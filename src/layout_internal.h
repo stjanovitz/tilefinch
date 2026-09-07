@@ -9,6 +9,7 @@
 #include "tilefinch/layout.h"
 #include "tilefinch/integer_math.h"
 #include "style_paint_internal.h"
+#include "style_cache_internal.h"
 
 #include <limits.h>
 
@@ -90,7 +91,9 @@ typedef struct {
     || LAYOUT_INTRINSIC_CACHE_PROBE_LIMIT > LAYOUT_INTRINSIC_CACHE_CAPACITY
 #error "layout intrinsic cache must be a power of two and cover its probe window"
 #endif
-#define LAYOUT_WORK_QUOTA 16
+/* Four expensive block/style units bound the interval before native input
+   gets another safe point; the frontend still throttles cheap pad polls. */
+#define LAYOUT_WORK_QUOTA 4
 /* Auto-table sizing normally inspects every row before placing the first
    one. The ephemeral first-paint pass needs only a representative bounded
    prefix; the authoritative pass still measures every row. */
@@ -276,6 +279,8 @@ struct LayoutReuseCache {
     int viewport_width;
     uint64_t clock;
     LayoutReuseStyleEntry styles[LAYOUT_REUSE_STYLE_CAPACITY];
+    uint8_t font_dependent[(LAYOUT_REUSE_STYLE_CAPACITY + 7u) / 8u];
+    bool font_publication_active;
     LayoutIntrinsicCacheEntry intrinsic[LAYOUT_REUSE_INTRINSIC_CAPACITY];
     LayoutReuseTableRowEntry *table_rows;
     LayoutReuseStats stats;
@@ -285,6 +290,13 @@ struct LayoutReuseCache {
     bool selector_has_structure;
 };
 
+/* Layout-lifetime counter analysis: only operations and DOM depth, not a
+   second full computed-style table. Lazily allocated for counter() pages. */
+typedef struct {
+    lxb_dom_node_t *node;
+    uint8_t reset_id, set_id, increment_id, depth;
+} LayoutCounterEntry;
+
 typedef struct {
     LayoutDocument *layout;
     const PocDocument *document;
@@ -292,10 +304,19 @@ typedef struct {
     const FontSet *fonts;
     const WebFontSet *web_fonts;
     const ImageResources *images;
+    LayoutCounterEntry *counter_entries;
+    struct LayoutCounterCursor *counter_cursor;
+    size_t counter_entry_count;
+    size_t counter_entry_capacity;
+    bool counter_entries_bounded_out;
+    bool counter_entries_prepared;
     size_t trace_paint_lines;
     size_t trace_flex_translate_lines;
     size_t trace_flex_sizing_lines;
     uint64_t style_resolutions;
+    uint64_t flow_profile_last_us;
+    LayoutFlowPhase flow_profile_phase;
+    bool flow_profile_active;
     uint64_t style_cache_hits;
     uint64_t style_cache_misses;
     uint64_t style_resolve_us;
@@ -310,6 +331,7 @@ typedef struct {
     size_t style_variable_cache_bytes;
     bool style_variable_cache_owned;
     bool style_selector_cooperation_owned;
+    StyleAncestorBloomCache ancestor_bloom_cache;
     uint64_t style_deferred_rule_applications_at_start;
     uint64_t style_deferred_rule_us_at_start;
     uint64_t style_cache_clock;
@@ -377,6 +399,7 @@ typedef struct {
        the cosmetic effect for the whole layout so fixed chrome can return to
        the retained cache instead of repeatedly traversing and blurring it. */
     uint8_t backdrop_filter_count;
+    uint8_t focus_inset_slot_count;
     bool backdrop_filter_disabled;
     /* A declared-video label is discovered only if an authored <video>
        actually reaches paint. The retained copies live in LayoutDocument's
@@ -391,7 +414,51 @@ typedef struct {
     bool document_bidi_markup_present;
     bool cancelled;
     LayoutReuseCache *reuse;
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PROFILE_LAYOUT_FLOW)
+    size_t pseudo_resolutions, pseudo_generated, pseudo_absence_hits;
+#endif
 } LayoutContext;
+
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PROFILE_LAYOUT_FLOW)
+typedef struct {
+    LayoutContext *context;
+    LayoutFlowPhase previous;
+    bool changed;
+} LayoutFlowScope;
+void layout_flow_profile_begin(LayoutContext *context);
+void layout_flow_profile_end(LayoutContext *context);
+void layout_flow_profile_report(LayoutContext *context);
+LayoutFlowScope layout_flow_scope_enter(LayoutContext *context,
+                                        LayoutFlowPhase phase);
+void layout_flow_scope_leave(LayoutFlowScope *scope);
+/* Cleanup covers early returns as well as recursive calls. Equal nested
+   phases do not read the clock, and each interval is charged exactly once. */
+#define LAYOUT_FLOW_SCOPE(context, phase) \
+    LayoutFlowScope flow_scope __attribute__((cleanup(layout_flow_scope_leave))) \
+        = layout_flow_scope_enter((context), (phase))
+static inline ComputedStyle layout_style_for_pseudo(
+    LayoutContext *context, lxb_dom_node_t *node, PseudoElement pseudo,
+    const ComputedStyle *parent)
+{
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_PSEUDO);
+    context->pseudo_resolutions++;
+    ComputedStyle result = style_for_layout_pseudo(context->sheet, node, pseudo, parent);
+    context->pseudo_absence_hits += !result.generated_content && result.font_size == 0;
+    context->pseudo_generated += result.generated_content;
+    return result;
+}
+#else
+#define LAYOUT_FLOW_SCOPE(context, phase) ((void) 0)
+#define layout_flow_profile_begin(context) ((void) 0)
+#define layout_flow_profile_end(context) ((void) 0)
+#define layout_flow_profile_report(context) ((void) 0)
+static inline ComputedStyle layout_style_for_pseudo(
+    LayoutContext *context, lxb_dom_node_t *node, PseudoElement pseudo,
+    const ComputedStyle *parent)
+{
+    return style_for_layout_pseudo(context->sheet, node, pseudo, parent);
+}
+#endif
 
 void layout_note_unresolved_external_visual(
     LayoutContext *context, lxb_dom_node_t *node, const char *source,
@@ -869,7 +936,6 @@ int table_intrinsic_width(LayoutContext *context, lxb_dom_node_t *table,
                           const ComputedStyle *table_style,
                           int available_width);
 const char *first_text_data(lxb_dom_node_t *node, size_t *length);
-const char *ordered_list_marker(unsigned position, size_t *length);
 int distribute_flex_rows(LayoutContext *context, lxb_dom_node_t *container, const ComputedStyle *style, const FlexOrderPlan *order_plan, int declared, int *stretch_free, size_t *stretch_lines);
 int flex_child_basis(LayoutContext *context, const FlatItem *item, int content_width);
 int flex_child_row_minimum(LayoutContext *context, const FlatItem *item, int content_width, bool css_table_row);
@@ -940,7 +1006,6 @@ void grid_placement_init(GridPlacementState *state, int columns, int rows,
                          const ComputedStyle *container);
 bool grid_place_item(GridPlacementState *state, const ComputedStyle *style,
                      GridItemPlacement *placement);
-int grid_required_columns(const ComputedStyle *style, int current_columns);
 void layout_finish_work_slice(LayoutContext *context);
 void layout_flush_line(LineState *line);
 void layout_scale_range(LayoutDocument *layout, size_t command_start, size_t link_start, size_t control_start, size_t node_box_start, int origin_x_twice, int origin_y_twice, uint8_t scale_q6, lxb_dom_node_t *source);

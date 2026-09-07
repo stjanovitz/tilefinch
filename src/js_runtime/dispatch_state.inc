@@ -31,7 +31,7 @@ bool script_runtime_dispatch_node(ScriptRuntime *runtime,
     bool trace_failure = false;
 #ifndef TILEFINCH_NO_TRACE
     trace_failure =
-        getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL;
+        tilefinch_trace_script_failures();
 #endif
     if (runtime == NULL || node == NULL || event_type == NULL) {
         if (trace_failure) {
@@ -117,6 +117,9 @@ bool script_runtime_dispatch_pointer_node(
     if (result != NULL) result->event_dispatch_entered = true;
     js_rt_saturating_add_size(
         &runtime->result.event_dispatches_entered, 1u);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t pointer_begin_us = tilefinch_platform_monotonic_time_us();
+#endif
     bool ok = runtime_call_captured(
         runtime, runtime->dispatch_activation_handle,
         "__tilefinchDispatchActivationHandle", 7, arguments, &returned);
@@ -126,8 +129,25 @@ bool script_runtime_dispatch_pointer_node(
     if (ok) runtime->result.last_event_cancelled =
         JS_ToBool(runtime->context, returned) <= 0;
     JS_FreeValue(runtime->context, returned);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t pointer_call_us = tilefinch_platform_monotonic_time_us();
+#endif
     if (ok) ok = js_rt_runtime_run_jobs(runtime);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t pointer_jobs_us = tilefinch_platform_monotonic_time_us();
+#endif
     if (ok) ok = js_rt_runtime_refresh(runtime);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (phase == 5u) {
+        char message[192];
+        snprintf(message, sizeof(message),
+            "tilefinch-pointer-runtime: handler=%lluus jobs=%lluus refresh=%lluus",
+            (unsigned long long) (pointer_call_us - pointer_begin_us),
+            (unsigned long long) (pointer_jobs_us - pointer_call_us),
+            (unsigned long long) (tilefinch_platform_monotonic_time_us() - pointer_jobs_us));
+        tilefinch_platform_log_message(message);
+    }
+#endif
     runtime->result.success = ok;
     js_rt_runtime_update_result(runtime, result);
     return ok;
@@ -308,6 +328,13 @@ bool script_runtime_consume_relayout(ScriptRuntime *runtime)
     return needed;
 }
 
+bool script_runtime_has_pending_mutations(const ScriptRuntime *runtime)
+{
+    return runtime != NULL && (runtime->relayout_dirty
+        || runtime->bridge.mutations.count != 0
+        || runtime->bridge.mutations.overflowed);
+}
+
 bool script_runtime_consume_mutations(ScriptRuntime *runtime,
                                       ScriptMutationJournal *result)
 {
@@ -387,8 +414,6 @@ static const char media_update_bootstrap[] =
     "state.networkState=HTMLMediaElement.NETWORK_NO_SOURCE;state.readyState="
     "HTMLMediaElement.HAVE_NOTHING;state.paused=true;"
     "if(previousNative!==4)node.dispatchEvent(new Event('error'));"
-    "delete globalThis."
-    "__tilefinchActiveMediaNode;delete globalThis.__tilefinchActiveMediaState;"
     "return true}else{"
     "state.networkState=HTMLMediaElement.NETWORK_IDLE;state.readyState="
     "HTMLMediaElement.HAVE_CURRENT_DATA}if(previousReady==="
@@ -406,8 +431,7 @@ static const char media_update_bootstrap[] =
     "node.dispatchEvent(new Event('ended'))}}else{state.paused=true;"
     "state.ended=false;if(!previousPaused)"
     "node.dispatchEvent(new Event('pause'))}if(previousSeeking)"
-    "node.dispatchEvent(new Event('seeked'));if(nativeState===3){delete globalThis."
-    "__tilefinchActiveMediaNode;delete globalThis.__tilefinchActiveMediaState;}"
+    "node.dispatchEvent(new Event('seeked'));"
     "return true}})";
 
 bool script_runtime_update_media_state(
@@ -472,7 +496,7 @@ bool script_runtime_consume_scroll(ScriptRuntime *runtime, int *scroll_y)
     if (runtime == NULL || scroll_y == NULL
         || !runtime->bridge.scroll_requested) return false;
     *scroll_y = runtime->bridge.scroll_y;
-    if (getenv("TILEFINCH_TRACE_SCROLL") != NULL) {
+    if (tilefinch_trace_scroll()) {
         fprintf(stderr, "javascript-scroll requested-y=%d\n", *scroll_y);
     }
     runtime->bridge.scroll_requested = false;

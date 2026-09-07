@@ -133,4 +133,4 @@ for argument do
 done
 # `-g` keeps qualification from activating PPSSPP over the user's current
 # application. The emulator still owns a normal LaunchServices/Cocoa context.
-xargs -0 open -g -n -W -a "$launch_bundle" --args <"$launch_args_file"
+xargs -0 open -g -n -W --env "HOME=$HOME" -a "$launch_bundle" --args <"$launch_args_file"

@@ -16,15 +16,26 @@ static void psp_app_finish_focus_action(
     if (app == NULL || app->process == NULL || app->browser == NULL
         || app->views == NULL || intent == NULL || !frame->page_dirty
         || psp_navigation_cooperate_supervised()) return;
-    /* browser_engine_finish_input() has already applied the bounded focus
-       damage to the current framebuffer. Publish that tiny response before
-       rAF, media, resource and full-raster work consume the rest of the turn.
-       The expanded accessibility hit target remains separate from the visual
-       focus box. */
+    /* Input updates retained paint/scroll state, not the composed framebuffer.
+       In particular an authored outline is painted during composition, and
+       focus may scroll into uncached rows. Never publish the old frame and
+       clear page_dirty as though those changes had reached the screen.
+       Spend one bounded input-priority slice; unfinished work stays dirty for
+       the normal render scheduler, ahead of optional resource work. */
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_focus_feedback_begin(app->browser->engine, (int) intent->action,
+                             frame->ui_sample_us);
+#endif
+    BrowserRenderJobStatus rendered = browser_engine_render_frame_bounded(
+        app->browser->engine, PSP_RENDER_JOB_BUDGET_US, 4u);
+    if (rendered != BROWSER_RENDER_JOB_COMPLETE
+        || !psp_engine_views_refresh(app->views, app->browser->engine)) return;
     psp_sync_ui(
         &app->process->presentation.ui, app->browser->engine,
         app->browser->profile);
-    psp_present(app->views->frame, &app->process->presentation.ui);
+    bool shown = psp_present_internal(
+        app->views->frame, &app->process->presentation.ui, true);
+    if (!shown) return;
     frame->page_dirty = false;
     intent->visual_changed = false;
 }
@@ -540,7 +551,60 @@ static void psp_app_dispatch_heavy_action(
             ControllerAction action;
             size_t activations_before =
                 app->views->controller->activations;
-            if (browser_engine_activate(engine, &action)) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            uint64_t activation_started_us = sceKernelGetSystemTimeWide();
+            size_t activation_relayouts = app->views->navigation->incremental_relayouts;
+#endif
+            /* Author activation can synchronously relayout. Keep only the
+               last completed framebuffer visible at owner-thread safe
+               points, and retain presses for replay after this transaction. */
+            bool activation_scope = !psp_navigation_cooperate_active()
+                && engine_frame != NULL
+                && !app->process->presentation.ui.page_gamepad_capture;
+            if (activation_scope)
+                psp_runtime_cooperate_begin(
+                    &app->process->presentation.ui, engine_frame,
+                    &app->interactive->toolbar_input);
+            bool activated = browser_engine_activate(engine, &action);
+            uint32_t activation_buttons = 0;
+            if (activation_scope
+                && psp_runtime_cooperate_end(&activation_buttons))
+                app->interactive->previous_buttons =
+                    psp_ui_buttons(activation_buttons);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            printf("tilefinch-control-activation: ok=%u kind=%d elapsed=%lluus relayouts=%zu\n",
+                   activated ? 1u : 0u, activated ? (int) action.type : -1,
+                   (unsigned long long) (sceKernelGetSystemTimeWide() - activation_started_us),
+                   app->views->navigation->incremental_relayouts - activation_relayouts);
+            if (activated && app->views->navigation->incremental_relayouts != activation_relayouts) {
+                const LayoutPerformance *cost = &app->views->navigation->page.layout.performance;
+                printf("tilefinch-control-layout: flow=%lluus styles=%lluus spatial=%lluus full=%zu fast=%zu\n",
+                       (unsigned long long) cost->flow_us,
+                       (unsigned long long) cost->style_resolve_us,
+                       (unsigned long long) cost->spatial_index_us,
+                       app->views->navigation->performance.full_relayouts,
+                       app->views->navigation->performance.fast_relayouts);
+                printf("tilefinch-control-layout-phases: total=%lluus root=%lluus compact=%lluus focus=%lluus paint=%lluus spatial=%lluus finalize=%lluus\n",
+                    (unsigned long long) cost->total_us,
+                    (unsigned long long) cost->root_style_us,
+                    (unsigned long long) cost->compact_us,
+                    (unsigned long long) cost->focus_index_us,
+                    (unsigned long long) cost->paint_order_us,
+                    (unsigned long long) cost->spatial_index_us,
+                    (unsigned long long) cost->finalize_us);
+                if (cost->flow_phase_transitions != 0)
+                    printf("tilefinch-control-flow: other=%lluus style=%lluus pseudo=%lluus intrinsic=%lluus margin=%lluus inline=%lluus cooperate=%lluus switches=%u\n",
+                        (unsigned long long) cost->flow_phase_us[LAYOUT_FLOW_OTHER],
+                        (unsigned long long) cost->flow_phase_us[LAYOUT_FLOW_STYLE],
+                        (unsigned long long) cost->flow_phase_us[LAYOUT_FLOW_PSEUDO],
+                        (unsigned long long) cost->flow_phase_us[LAYOUT_FLOW_INTRINSIC],
+                        (unsigned long long) cost->flow_phase_us[LAYOUT_FLOW_MARGIN],
+                        (unsigned long long) cost->flow_phase_us[LAYOUT_FLOW_INLINE],
+                        (unsigned long long) cost->flow_phase_us[LAYOUT_FLOW_COOPERATE],
+                        (unsigned) cost->flow_phase_transitions);
+            }
+#endif
+            if (activated) {
                 bool navigates =
                     action.type == CONTROLLER_ACTION_NAVIGATE
                     || action.type

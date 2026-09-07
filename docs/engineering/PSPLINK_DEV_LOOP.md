@@ -62,6 +62,15 @@ not escape it (error 0x80010002). To land a pulled file elsewhere, pull to
 
 ## Link health
 
+**Do not issue stock `scrshot`/`ss` while media is active.** PSPLink v3.2.1
+uses partition 4 (`0x88300000`) for its bitmap scratch buffer, overlapping
+Media Engine firmware. This caused delayed AVC/AAC watchdog timeouts in
+otherwise healthy playback tests. The wrapper now requests `scrshot-user`,
+which fails closed on old device builds. Build/install the
+[media-safe HOME-exit PSPLink](../../tools/psplink-home-exit/README.md) before
+using it. Until then, use Tilefinch's own input-script captures, not raw
+`pspsh scrshot`. Do not attribute a capture-corrupted run to browser decoding.
+
 ```
 PSPDEV=/path/to/pspdev scripts/psplink-shell.sh exec 'ver'
 ```
@@ -132,11 +141,35 @@ It is unnecessary wear and timing noise for media iteration.
    After any source change, rebuild before flashing. When a change adds
    telemetry, verify it is really in
    the binary: `strings build-preset-psp-validation/EBOOT.PBP | grep <field>`.
-   The development-only `tfdeploy.prx` reads the EBOOT from `host0:` in 1 MiB
-   units, writes `EBOOT.PBP.new` in at most eight Memory Stick payload writes,
-   verifies its length, and only then promotes it over slot A. The previous
-   EBOOT survives any incomplete copy. This avoids PSPLink's 2 KiB `cp` loop
-   and its in-place partial-file failure mode. It never ships in a release.
+   The host preflights the EBOOT, `tilefinch-wasm.prx`, and, when enabled in
+   that build's CMake cache, `tilefinch-voice.prx`. It stages that exact set,
+   deploys the components first, and promotes the EBOOT last. Do not copy only
+   the EBOOT after a component ABI change: wasm and voice correctly fail closed
+   when paired with an incompatible PRX. A stale voice file in a voice-disabled
+   validation build is not deployed merely because it exists.
+
+   The development-only `tfdeploy.prx` accepts only `wasm`, `voice`, or `eboot`
+   artifact names, never arbitrary paths. It reads each file from `host0:` in
+   1 MiB units, writes its `.new` file in at most eight Memory Stick payload
+   writes **per artifact**, checks its header and length, and then promotes it
+   over slot A with `.previous` recovery. The running browser and component
+   modules must be absent. This avoids PSPLink's 2 KiB `cp` loop and its in-place
+   partial-file failure mode. The helper never ships in a release.
+
+   Promotion is per-file, **not an atomic multi-file bundle**. After any error
+   or interrupted deployment, do not launch the slot: rerun the complete
+   command to reconcile all components and the EBOOT. Successful component
+   promotions are not rolled back if a later artifact fails. No bootloader,
+   voice-model data, settings, or offline-library files are changed by this
+   command; install those separately when their contents change.
+   The helper reserves only 64 KiB of newlib heap in addition to its fixed
+   1 MiB transfer buffer, and retires the runtime before self-unloading.
+   A helper that bypasses runtime cleanup can strand most of user RAM even
+   after its module disappears; `meminfo` then shows a small maximum free
+   block and the next load fails with `0x800200D9`. Restart PSPLink to recover
+   an already-stranded allocation; never force-unload a running browser.
+   Module-list checks normalize PSPLink's CRLF output so a resident helper
+   cannot be missed by an end-of-line name match.
    Launch the deployed build normally from the XMB. Do not chain a shipping
    EBOOT through `tfexec.prx`: its ordinary `sceKernelExitGame` return can
    leave the XMB in a transient invalid state because it was not entered by
@@ -211,6 +244,18 @@ validation_latch_probe=0                  # invasive full-frame flicker hashes; 
 An `input_script=` key arms the scripted-input harness instead; note its
 stall detector treats media playback as not-ready — do not use plain `wait`
 around video (see INPUT_SCRIPT_HARNESS.md).
+Use `mark-live` and `tap-live circle` as well: a readiness-gated marker or
+close action can strand the harness while the player is legitimately busy.
+Archive the selected URL from `tilefinch-input-focus-target`; live search
+ordering can change between runs, so an identical query/input sequence does
+not prove an identical video was replayed.
+
+An `event=codec-watchdog` line means a firmware job did not return within the
+bounded window, not that firmware returned the following synthetic BUSY
+status. Validation builds record the worker status, wait type/ID and run
+clocks at that verdict. Keep those fields and the later quarantine outcome
+together; do not weaken quarantine to turn a stalled firmware owner into a
+successful retry.
 
 `validation_media_lifecycle_auto=1` publishes a paired suspend/resume notice
 and lets the production main-loop state machine order quiesce before recovery.

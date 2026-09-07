@@ -55,6 +55,12 @@ endif()
 
 set(TILEFINCH_PSP_TRANSPORT_IS_OWNED ON)
 set(_transport_prefix "${CMAKE_CURRENT_BINARY_DIR}/psp-transport/prefix")
+set(_transport_mbedtls_config
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/psp_transport/mbedtls_user_config.h")
+# SSL role selection changes public struct layouts. External libcurl and
+# native consumers must see the same user config as the Mbed TLS libraries.
+set(_transport_mbedtls_consumer_flags
+    " -DMBEDTLS_USER_CONFIG_FILE=\\\"${_transport_mbedtls_config}\\\"")
 set(_transport_lock
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/psp_transport/dependencies.lock")
 set(_mbedtls_archive "${TILEFINCH_PSP_TRANSPORT_CACHE}/mbedtls-3.6.7.tar.bz2")
@@ -92,6 +98,7 @@ endif()
 file(MAKE_DIRECTORY "${_transport_prefix}/include")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${_transport_lock}"
+    "${_transport_mbedtls_config}"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/mbedtls-3.6.6-psp.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/mbedtls-3.6.6-psp-bnmul.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.21.0-psp.patch")
@@ -158,13 +165,17 @@ ExternalProject_Add(tilefinch_psp_mbedtls
         "-DCMAKE_C_FLAGS=-G0 -D_DEFAULT_SOURCE -ffunction-sections -fdata-sections${_transport_prefix_map_flags}${_mbedtls_bignum_flags}${_mbedtls_everest_flags}"
         "-DENABLE_PROGRAMS=OFF"
         "-DENABLE_TESTING=OFF"
-        "-DMBEDTLS_USER_CONFIG_FILE=${CMAKE_CURRENT_SOURCE_DIR}/cmake/psp_transport/mbedtls_user_config.h"
+        "-DMBEDTLS_USER_CONFIG_FILE=${_transport_mbedtls_config}"
     BUILD_BYPRODUCTS
         "${_transport_prefix}/lib/libmbedcrypto.a"
         "${_transport_prefix}/lib/libmbedtls.a"
         "${_transport_prefix}/lib/libmbedx509.a"
         "${_transport_prefix}/lib/libeverest.a"
         "${_transport_prefix}/lib/libp256m.a")
+ExternalProject_Add_Step(tilefinch_psp_mbedtls user-config
+    COMMAND "${CMAKE_COMMAND}" -E true
+    DEPENDS "${_transport_mbedtls_config}"
+    DEPENDERS configure)
 
 set(_nghttp2_dependency "")
 set(_nghttp2_library "")
@@ -219,7 +230,7 @@ ExternalProject_Add(tilefinch_psp_curl
         "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
         "-DCMAKE_INSTALL_PREFIX=${_transport_prefix}"
         "-DCMAKE_BUILD_TYPE=MinSizeRel"
-        "-DCMAKE_C_FLAGS=-G0 -D_DEFAULT_SOURCE -ffunction-sections -fdata-sections${_transport_prefix_map_flags}"
+        "-DCMAKE_C_FLAGS=-G0 -D_DEFAULT_SOURCE -ffunction-sections -fdata-sections${_transport_prefix_map_flags}${_transport_mbedtls_consumer_flags}"
         "-DCMAKE_PREFIX_PATH=${_transport_prefix}"
         "-DCURL_USE_CMAKECONFIG=OFF"
         "-DCURL_USE_PKGCONFIG=OFF"
@@ -273,15 +284,30 @@ ExternalProject_Add(tilefinch_psp_curl
         "-DCURL_DISABLE_NETRC=ON"
         "-DCURL_DISABLE_DOH=ON"
         "-DCURL_DISABLE_SOCKETPAIR=ON"
+        # Browser-owned request bodies and UI progress do not use curl's
+        # multipart builder or terminal meter. Direct sockets are required
+        # for PSP private-network policy; no proxy configuration is exposed.
+        "-DCURL_DISABLE_PROXY=ON"
+        "-DCURL_DISABLE_AWS=ON"
+        "-DCURL_DISABLE_MIME=ON"
+        "-DCURL_DISABLE_FORM_API=ON"
+        "-DCURL_DISABLE_PROGRESS_METER=ON"
+        "-DCURL_DISABLE_GETOPTIONS=ON"
         ${_curl_nghttp2_args}
     BUILD_BYPRODUCTS "${_transport_prefix}/lib/libcurl.a")
+ExternalProject_Add_Step(tilefinch_psp_curl user-config
+    COMMAND "${CMAKE_COMMAND}" -E true
+    DEPENDS "${_transport_mbedtls_config}"
+    DEPENDERS configure)
 
 add_library(tilefinch_psp_transport INTERFACE)
 add_dependencies(tilefinch_psp_transport tilefinch_psp_curl)
 target_include_directories(tilefinch_psp_transport INTERFACE
     "${_transport_prefix}/include")
 target_compile_definitions(tilefinch_psp_transport INTERFACE
+    MBEDTLS_USER_CONFIG_FILE="${_transport_mbedtls_config}"
     TILEFINCH_PSP_OWNED_TRANSPORT=1
+    TILEFINCH_PSP_CURL_NO_PROXY=1
     TILEFINCH_PSP_CURL_VERSION="8.21.0"
     TILEFINCH_PSP_MBEDTLS_VERSION="3.6.7"
     TILEFINCH_PSP_NGHTTP2_VERSION="1.69.0")
@@ -305,6 +331,8 @@ add_library(tilefinch_psp_crypto INTERFACE)
 add_dependencies(tilefinch_psp_crypto tilefinch_psp_mbedtls)
 target_include_directories(tilefinch_psp_crypto INTERFACE
     "${_transport_prefix}/include")
+target_compile_definitions(tilefinch_psp_crypto INTERFACE
+    MBEDTLS_USER_CONFIG_FILE="${_transport_mbedtls_config}")
 target_link_libraries(tilefinch_psp_crypto INTERFACE
     "${_transport_prefix}/lib/libmbedcrypto.a"
     "${_transport_prefix}/lib/libeverest.a"

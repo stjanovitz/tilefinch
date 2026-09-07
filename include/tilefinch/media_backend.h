@@ -674,6 +674,11 @@ typedef struct {
      * A backend that leaves this NULL gets exactly the behaviour it had.
      */
     bool (*wants_paired_submit)(const void *opaque, int track_kind);
+    /* Optional backpressure policy for bypassing a refused split-track head.
+       NULL permits the bounded alternate attempt. A shared codec may reserve
+       bypass for full video surfaces, rather than letting queued audio work
+       repeatedly overtake an ordinary in-flight video job. */
+    bool (*allow_submit_bypass)(const void *opaque, int blocked_track_kind);
 } MediaBackend;
 
 /*
@@ -692,6 +697,9 @@ typedef struct {
      * audio output. Zero preserves the ordinary initial-playback schedule.
      */
     uint64_t audio_start_us;
+    /* Per-source packet ceiling. Split playback retains at most two packets;
+       its secondary buffer grows lazily under Budget, not to this maximum
+       during construction. */
     size_t maximum_packet_bytes;
     /*
      * Lazy fragmented demuxers discover later sample sizes window by window.
@@ -749,29 +757,12 @@ typedef struct {
        Bounded by MEDIA_PLAYBACK_MAXIMUM_PAIRED_SUBMITS per visit. */
     size_t paired_submits;
     /*
-     * Head-of-line blocking, measured and not yet acted on.
-     *
-     * The scheduler picks the earliest-PTS sample across sources and, when
-     * that one cannot go in -- its payload is not buffered, or the backend
-     * refuses it -- ends the visit. It never offers the other source. If the
-     * usual shape is a video access unit at the head with an audio one five
-     * milliseconds behind it, buffered and due, then audio admission is
-     * starved by a rule about ordering rather than by supply or by the
-     * decoder, and the fix is in the scheduler.
-     *
-     * That is a hypothesis about a counterfactual, so these count the
-     * counterfactual directly: at each such block, what the OTHER source was
-     * holding at that instant. They narrow, so they read as a funnel --
-     * head_blocks >= alt_pending >= alt_in_horizon >= alt_resident -- and the
-     * last is the number that matters: a sample that existed, was due, and
-     * whose bytes were already in memory, that the visit went home without
-     * offering.
-     *
-     * It is an upper bound on "would have succeeded", not a proof of it: the
-     * backend might have refused the alternate too. Asking it would mean a
-     * speculative submit, which is a scheduling change and not a measurement.
-     * Split by the blocked track's kind so the hypothesis above is read
-     * directly rather than inferred from an aggregate.
+     * Head-of-line blocking observations before the bounded bypass decision:
+     * what the other source held when the earliest-DTS head was refused.
+     * The counters narrow as a funnel:
+     * head_blocks >= alt_pending >= alt_in_horizon >= alt_resident.
+     * Residency is not proof of backend acceptance; actual alternate attempts
+     * and accepted packets are counted separately below.
      *
      * Adaptive streams only: a progressive MP4 carries both tracks in one
      * source, where there is no other source to have offered.
@@ -790,8 +781,10 @@ typedef struct {
     size_t head_alt_lead_samples;
     size_t head_alt_behind;
     /*
-     * Action taken after the proof funnel above showed that the alternate was
-     * safe to offer without fetching. A bypass is one bounded pump-call
+     * Action taken when the alternate is inside the clock horizon. A source
+     * read hold bypasses only to resident bytes; a backend hold also permits
+     * a nonblocking alternate read to demand/install its refill. A bypass is
+     * one bounded pump-call
      * decision: the blocked source remains pending, and only the other split
      * source may advance for the rest of that call. `submitted` counts units
      * the backend actually accepted from that source; `blocked` means it
@@ -804,8 +797,8 @@ typedef struct {
 
 /*
  * Portable orchestration shared by the host probes and PSP backend. It owns
- * neither demux nor backend, but owns one bounded packet buffer so range reads
- * never require retaining the MP4 or an unbounded packet queue.
+ * neither demux nor backend, but owns one bounded packet per source so range
+ * reads never require retaining the MP4 or an unbounded packet queue.
  */
 MediaPlayback *media_playback_create(
     Budget *budget, MediaMp4Demux *demux, const MediaBackend *backend,
@@ -813,7 +806,8 @@ MediaPlayback *media_playback_create(
 /*
  * Two-source form for an adaptive MP4 video stream plus an adaptive MP4
  * audio stream. Samples are merged by normalized decode timestamp while
- * retaining the same one-packet-at-a-time memory bound.
+ * retaining at most one packet for each source. Backend refusal may let the
+ * independent other source advance, without reordering within either track.
  */
 MediaPlayback *media_playback_create_split(
     Budget *budget, MediaMp4Demux *video_demux,

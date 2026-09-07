@@ -254,11 +254,73 @@ platform bootstrap is generated as uncompressed QuickJS bytecode and restored
 directly from read-only program data with `JS_READ_OBJ_ROM_DATA`; there is no
 per-navigation inflate buffer or duplicate bytecode copy.
 
+Post-load PSP runtime work arms a lazy, **owner-thread-only** cooperative UI
+scope. At a checkpoint after 8 ms, it retains the last completed engine frame
+and copies UI state; it then samples input at most once per 16 ms. Direction
+and activation edges enter the existing four-entry queue for replay once the
+task returns, with visible queued-input feedback; Circle requests cancellation.
+The callback-thread presenter cannot enter this scope, and resource-worker
+hooks cannot borrow its state. Native WebGL finishes and synchronizes its GE
+list before returning to these checkpoints. No controller/DOM action is run
+inside a suspended mutation and no framebuffer ownership is transferred.
+Page-controls capture bypasses this path, preserving the game input/frame loop.
+
+This is cooperation, not arbitrary preemption: a native call without checkpoints
+can still block feedback, and page actions wait for a safe task boundary.
+Validation reports the first checkpoint gap as well as sample-to-successful-
+presentation latency; calls of at least 100 ms with no serviced checkpoint are
+reported explicitly. Neither a queued press nor a completed receiver trace is
+by itself a time-to-interactive pass.
+
+Simple focus decorations use retained paint where geometry is unchanged.
+Up to 64 rounded controls can reserve one zero-offset, unblurred inset-ring
+command during layout. Focus updates its colour, opacity and thickness in
+place with bounded damage, after a dry run proves every old/new focus target.
+Scaled visual copies retain the correct ring thickness. Complex shadows,
+background clipping changes, inherited/relational effects and unavailable
+slots fall back to authoritative layout; section expansion is still a layout
+operation, not an outline update.
+
 Bootstrap features are split into modules with bounded lazy activation.
 Core DOM and event semantics are available immediately; larger facilities are
 installed when the page first reaches their surface. Lazy factories and
 resident bundles have fixed caps, and a generated manifest proves the authored
-sources and committed bytecode agree.
+sources and committed bytecode agree. The embedded copy of every bootstrap
+source is compacted by the generator (indentation, trailing whitespace and
+comments removed, newlines kept), and the generator refuses to emit unless
+bytecode compiled from that copy is identical to bytecode compiled from the
+authored file; the bootstrap source ceiling therefore measures code, not
+prose, and is separate from the authored-script admission ceiling. The
+committed bytecode is emitted without source, line tables, or local-variable
+names: QuickJS copies line tables and variable definitions out of ROM into
+the realm heap on restore, and stripping them returned about 217 KiB of
+resident heap on the device realm. Bootstrap exceptions still name the module
+and function; `TILEFINCH_DISABLE_BOOTSTRAP_BYTECODE=1` compiles the embedded
+source with full debug information when line numbers are needed on the host.
+`TILEFINCH_TRACE_JS_STARTUP=1` prints, per module, the heap the evaluation
+retained broken down by QuickJS category (functions, objects, properties,
+shapes, atoms, strings), which is how growth is attributed before the
+footprint guard test trips. The `Intl` polyfill is one of the lazy modules,
+installed on first access to the `Intl` global.
+
+Nested frames live in `frames.js`, an eager module that only defines an
+installer; `platform.js` invokes it with its private helpers and deletes the
+installer. Same-origin frame evaluation uses a persistent QuickJS context
+(at most 16 per parent runtime), with the child WindowProxy as global
+`this`, including sloppy functions and the child's Function constructor.
+QuickJS owns global and lexical bindings: closures and later scripts
+observe the same variables, comma-separated declarations remain intact, and
+lexical declarations do not become Window properties. Context allocations
+share the page's heap/Budget; failed setup releases its slot, and eviction
+retires the realm before releasing its native reference. Retained functions
+keep storage alive but cannot execute after retirement.
+No source scanning or declaration-copying pass is performed per evaluation.
+
+Worker termination uses the same native retirement boundary: pending jobs are
+discarded during normal bounded draining, and retained callbacks cannot run
+in a retired realm. Worker construction failures return their quota slot;
+settled fetches remove both lifetime and author-signal abort listeners.
+Microtasks and delayed import retries also check the worker's active state.
 
 Page scripts have source, count, heap, time, and callback-work admission.
 Interrupt checks cover QuickJS execution and native callback boundaries.
@@ -747,6 +809,31 @@ committed with JavaScript disabled, so it owns no otherwise-unused QuickJS
 realm; the configured global and per-site policy is applied at the boundary of
 the first real navigation. Profile settings, bookmarks, and HOME destinations
 are still loaded before the first frame because they define that native UI.
+
+Ordinary boot retains one early static splash until HOME is ready, rather
+than inserting additional scanout waits for intermediate startup messages.
+The timing markers `platform-ready` and `runtime-ready` describe native
+callbacks, input/clocks and service setup, **not** a page JavaScript runtime.
+The Media Engine pool still reserves its addressable memory before the
+browser heap grows; this is an ownership requirement, not deferrable page
+work. Synthetic clock benchmarking is restricted to the explicit validation
+`validation_power_test_auto` mode. Ordinary validation boots do not run it.
+HOME's first input sample skips the redundant post-presentation vblank wait;
+later frames keep their established cadence. Activating a HOME tile publishes
+`OPENING...` through the shared acknowledgement path before network or page
+preparation. Navigation therefore never needs to hide input receipt while
+background warm-up finishes.
+
+September 4 PPSSPP ordinary-launcher validation measured browser-main to HOME
+at 362.6 ms and interactive-ready at 396.3 ms, versus 735.6/769.3 ms before
+these changes. About 319.6 ms of that difference is the removed synthetic
+clock probe; roughly 53 ms is the remaining reduction, including splash
+presentation waits. This does not establish physical PSP release boot time:
+validation logging and asset diagnostics remain, and emulator storage is not
+a Memory Stick. The validation-only `tilefinch-boot-input` line separately
+records the first actual controller sample and its delay from interactive
+loop entry (30.2 ms without an input script in the final run). Input-script
+file loading adds harness overhead and must not be treated as shipping work.
 
 Page fonts follow the same staged boundary, with one presentation invariant:
 the regular sans face used by native HOME is loaded before HOME's first frame,

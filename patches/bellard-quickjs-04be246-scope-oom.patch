@@ -1,0 +1,28 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -34758,4 +34758,7 @@
+             pos_next = resolve_scope_var(ctx, s, var_name, scope, op, &bc_out,
+                                          NULL, NULL, pos_next);
++            /* A failed scope resolution is not a bytecode cursor. */
++            if (pos_next < 0)
++                goto fail;
+             JS_FreeAtom(ctx, var_name);
+             break;
+@@ -34771,4 +34774,6 @@
+                 pos_next = resolve_scope_var(ctx, s, var_name, scope, op, &bc_out,
+                                              bc_buf, ls, pos_next);
++                if (pos_next < 0)
++                    goto fail;
+                 JS_FreeAtom(ctx, var_name);
+             }
+@@ -36520,3 +36525,9 @@
+     BOOL strip_var_debug;
+     
++    /* Parsing may have stopped between an opcode and its operands. */
++    if (dbuf_error(&fd->byte_code)) {
++        JS_ThrowOutOfMemory(ctx);
++        goto fail;
++    }
++
+     /* recompute scope linkage */

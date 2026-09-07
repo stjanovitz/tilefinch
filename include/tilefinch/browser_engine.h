@@ -422,7 +422,6 @@ bool browser_engine_pointer_event(BrowserEngine *engine,
                                   ControllerPointerPhase phase,
                                   int x, int y, bool *activate,
                                   bool *page_changed);
-void browser_engine_pointer_discard_click(BrowserEngine *engine);
 bool browser_engine_pointer_commit_click(BrowserEngine *engine);
 bool browser_engine_focus_node(BrowserEngine *engine, lxb_dom_node_t *node);
 bool browser_engine_scroll_by(BrowserEngine *engine, int delta_y);
@@ -587,6 +586,8 @@ bool browser_engine_run_idle_work(
 bool browser_engine_run_deferred_image_work(
     BrowserEngine *engine, bool *visual_changed);
 void browser_engine_cancel_idle_work(BrowserEngine *engine);
+/* Changes whenever the facade replaces its render shell, even within one navigation. */
+uint64_t browser_engine_render_shell_serial(const BrowserEngine *engine);
 /*
  * Make room for a short-lived device service such as voice recognition.
  * This preserves the committed document, layout, script realm, controller,

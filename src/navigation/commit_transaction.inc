@@ -490,9 +490,10 @@ static bool navigation_document_images_are_defer_safe(
 static bool navigation_plan_static_image_geometry(
     NavigationSession *session, const FontSet *fonts,
     const ImageResources *images, ImagePriorityTarget *targets,
-    size_t capacity, size_t *count)
+    size_t capacity, size_t *count, bool *layout_ready)
 {
     if (count != NULL) *count = 0;
+    if (layout_ready != NULL) *layout_ready = false;
     if (session == NULL || count == NULL
         || session->page.document.node_count > 512u) return false;
     size_t estimate = navigation_progressive_preview_estimate(
@@ -542,9 +543,67 @@ static bool navigation_plan_static_image_geometry(
             session->page.deferred_image_count = deferred_count;
         }
     }
+    /* With no eager visible images and no other image-producing content,
+       the complete plan is already the final no-image layout. The caller
+       defers this entire image queue and cannot run author script. Move the
+       layout into the candidate page so its ordinary abort/commit owner
+       handles every later failure; never retain a second layout allocation.
+       Nonempty external image tables keep the existing rebuild path. */
+    if (collected && total_count != 0 && *count == 0
+        && layout_ready != NULL && session->page.layout.commands == NULL
+        && session->page.images.count == 0
+        && (images == NULL || images->count == 0)
+        && navigation_document_images_are_defer_safe(
+               &session->page.document, &session->page.stylesheet)) {
+        session->page.layout = probe;
+        memset(&probe, 0, sizeof(probe));
+        *layout_ready = true;
+        session->performance.static_image_layout_adoptions++;
+        session->performance.final_layout_us += elapsed;
+    }
     layout_destroy(&probe);
     if (!collected) *count = 0;
     return collected;
+}
+
+/* Network documents can commit useful layout before their ordinary images.
+   Do not keep a DOM traversal cursor across author turns. The entire small
+   plan is bounded and every mutable target carries a native weak handle;
+   CSS images, posters and inline SVG retain the authoritative loader path. */
+static bool navigation_plan_mutable_document_images(NavigationSession *session)
+{
+    NavigationPage *page = &session->page;
+    if (page->runtime == NULL || page->deferred_image_targets != NULL
+        || page->document.html == NULL) return false;
+    ImagePriorityTarget *targets = budget_calloc_category(
+        session->budget, BUDGET_CATEGORY_RESOURCE,
+        NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT, sizeof(*targets));
+    if (targets == NULL) return false;
+    lxb_dom_node_t *root = lxb_dom_interface_node(page->document.html);
+    size_t visited = 0, count = 0;
+    for (lxb_dom_node_t *node = root; node != NULL;) {
+        if (++visited > NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT) goto decline;
+        if (node_name_is(node, "img")) {
+            if (count == NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT) goto decline;
+            long handle = script_runtime_node_weak_handle(page->runtime, node);
+            if (handle == 0) goto decline;
+            targets[count++] = (ImagePriorityTarget) {
+                .node = node, .weak_handle = handle,
+                .kind = IMAGE_PRIORITY_KIND_DOCUMENT
+            };
+        }
+        if (node->first_child != NULL) { node = node->first_child; continue; }
+        while (node != root && node->next == NULL) node = node->parent;
+        if (node == root) break;
+        node = node->next;
+    }
+    if (count == 0) goto decline;
+    page->deferred_image_targets = targets;
+    page->deferred_image_count = count;
+    return true;
+decline:
+    budget_free(session->budget, targets);
+    return false;
 }
 
 static bool navigation_try_progressive_preview(
@@ -1817,7 +1876,7 @@ static bool navigation_commit_document(
             static_image_plan = navigation_plan_static_image_geometry(
                 session, fonts, images, image_priority_targets,
                 NAVIGATION_VISIBLE_IMAGE_PRIORITY_LIMIT,
-                &image_priority_count);
+                &image_priority_count, &final_layout_ready);
             session->performance.progressive_image_priority_nodes =
                 image_priority_count;
         }
@@ -1853,6 +1912,20 @@ static bool navigation_commit_document(
     }
     session->performance.markup_image_priority_nodes =
         markup_priority_added;
+
+    bool defer_mutable_document_images = session->external_resources_enabled
+        && streaming != NULL && allow_runtime && session->progressive_paint != NULL
+        && navigation_plan_mutable_document_images(session);
+    if (defer_mutable_document_images) {
+        size_t retained = 0;
+        for (size_t i = 0; i < image_priority_count; i++) {
+            const ImagePriorityTarget *target = &image_priority_targets[i];
+            if (target->kind == IMAGE_PRIORITY_KIND_DOCUMENT
+                && node_name_is(target->node, "img")) continue;
+            image_priority_targets[retained++] = *target;
+        }
+        image_priority_count = retained;
+    }
 
     if (session->external_resources_enabled) {
         phase_started = navigation_now_us();
@@ -1898,17 +1971,21 @@ static bool navigation_commit_document(
             && !allow_runtime && streaming == NULL
             && navigation_document_images_are_defer_safe(
                    &session->page.document, &session->page.stylesheet);
-        if (continue_images_after_paint || defer_static_document_images) {
+        if ((continue_images_after_paint && !defer_mutable_document_images)
+            || defer_static_document_images) {
             session->page.image_continuation_pending = true;
         } else {
-            budget_free(session->budget,
-                        session->page.deferred_image_targets);
-            session->page.deferred_image_targets = NULL;
-            session->page.deferred_image_count = 0;
+            if (!defer_mutable_document_images) {
+                budget_free(session->budget,
+                            session->page.deferred_image_targets);
+                session->page.deferred_image_targets = NULL;
+                session->page.deferred_image_count = 0;
+            }
             navigation_ensure_layout_reuse(session);
             size_t retained_before = session->page.images.stats
                 .priority_retained_on_failure;
-            if (!images_load_external_reusing_layout_styles(
+            session->page.image_continuation_pending = defer_mutable_document_images;
+            if (!images_load_external_reusing_layout_styles_deferred(
                     &session->page.document, &session->page.stylesheet,
                     &session->page.images, session->budget,
                     session->page.resource_base_url, url,
@@ -1919,12 +1996,16 @@ static bool navigation_commit_document(
                     session->resource_timeout_ms,
                     session->page.resource_scheduler,
                     session->browser_session, session->page.layout_reuse,
-                    fonts, session->viewport.css_width)) {
+                    fonts, session->viewport.css_width,
+                    defer_mutable_document_images)) {
                 if (session->page.images.stats.priority_retained_on_failure
                         > retained_before
                     && session->page.images.count != 0) {
                     session->performance.image_pressure_fallbacks++;
                     session->page.image_continuation_pending = false;
+                    budget_free(session->budget, session->page.deferred_image_targets);
+                    session->page.deferred_image_targets = NULL;
+                    session->page.deferred_image_count = 0;
                 } else {
                     snprintf(session->last_error,
                              sizeof(session->last_error),

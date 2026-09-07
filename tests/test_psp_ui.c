@@ -54,6 +54,139 @@ static bool test_menu_blit(
     return true;
 }
 
+static bool test_page_activation_activity(void)
+{
+    enum { WIDTH = 480, HEIGHT = 272 };
+    static uint16_t normal[WIDTH * HEIGHT], busy[WIDTH * HEIGHT];
+    PspUiState ui;
+    psp_ui_init(&ui);
+    ui.chrome_visible = false;
+    ui.loading_phase = 30;
+    ui.toast_frames = 0;
+    psp_ui_composite(&ui, normal, WIDTH, HEIGHT, WIDTH);
+    CHECK(psp_ui_set_page_activation(&ui, true)
+          && !ui.loading && ui.page_activation_busy);
+    psp_ui_composite(&ui, busy, WIDTH, HEIGHT, WIDTH);
+    CHECK(memcmp(normal, busy, sizeof(normal)) != 0);
+    /* Activity changes only the top two rows, never page pixels beneath it. */
+    CHECK(memcmp(normal + 2 * WIDTH, busy + 2 * WIDTH,
+                 sizeof(normal) - 2 * WIDTH * sizeof(uint16_t)) == 0);
+    CHECK(psp_ui_set_page_activation(&ui, false));
+    memset(busy, 0, sizeof(busy));
+    psp_ui_composite(&ui, busy, WIDTH, HEIGHT, WIDTH);
+    CHECK(memcmp(normal, busy, sizeof(normal)) == 0);
+    ui.page_gamepad_capture = true;
+    CHECK(!psp_ui_set_page_activation(&ui, true)
+          && !ui.page_activation_busy);
+    ui.page_gamepad_capture = false;
+    ui.screen = PSP_UI_SCREEN_HOME;
+    CHECK(!psp_ui_set_page_activation(&ui, true));
+    ui.screen = PSP_UI_SCREEN_PAGE;
+    psp_ui_set_loading(&ui, true, 700);
+    CHECK(psp_ui_set_page_activation(&ui, true)
+          && psp_ui_set_page_activation(&ui, false)
+          && ui.loading && ui.progress_per_mille == 700);
+    return true;
+}
+
+static bool test_priority_menu_during_page_work(void)
+{
+    PspUiState live;
+    psp_ui_init(&live);
+    psp_ui_set_page(&live, "Old page", "https://page.test/old", true);
+    PspUiState snapshot = live;
+    /* Cursor-only supervision must not undo a concurrent loading reveal,
+       nor a lifecycle transition to another native surface. */
+    live.chrome_visible = false;
+    snapshot = live;
+    psp_ui_set_loading(&live, true, 100);
+    psp_ui_adopt_priority(&live, &snapshot, PSP_UI_SCREEN_PAGE, false);
+    CHECK(live.chrome_visible && live.loading);
+    live.screen = PSP_UI_SCREEN_HOME;
+    psp_ui_adopt_priority(&live, &snapshot, PSP_UI_SCREEN_PAGE, false);
+    CHECK(live.screen == PSP_UI_SCREEN_HOME);
+    live.screen = PSP_UI_SCREEN_PAGE;
+    live.chrome_visible = false;
+    psp_ui_set_navigation_target(&live, "https://page.test/next");
+    CHECK(live.loading && live.chrome_visible && live.progress_per_mille == -1);
+    live.chrome_visible = false;
+    psp_ui_set_loading(&live, true, 200);
+    CHECK(!live.chrome_visible); /* Continuation still respects Triangle. */
+    live.chrome_visible = true;
+    snapshot = live;
+    PspUiInput input = { .pressed = PSP_UI_BUTTON_MENU,
+        .analog_x = 128, .analog_y = 128, .elapsed_ms = 16 };
+    CHECK(psp_ui_update_priority(&snapshot, &input)
+          && snapshot.screen == PSP_UI_SCREEN_MENU
+          && psp_ui_page_work_paused(&snapshot));
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    for (unsigned at = 0; at < 4; at++)
+        CHECK(psp_ui_update_priority(&snapshot, &input));
+    CHECK(snapshot.menu_selection == 4u);
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(psp_ui_update_priority(&snapshot, &input)
+          && snapshot.screen == PSP_UI_SCREEN_OPTIONS);
+    input.pressed = PSP_UI_BUTTON_DOWN;
+    CHECK(psp_ui_update_priority(&snapshot, &input)
+          && snapshot.options_group_selection == 1u);
+    input.pressed = PSP_UI_BUTTON_CANCEL;
+    CHECK(psp_ui_update_priority(&snapshot, &input)
+          && snapshot.screen == PSP_UI_SCREEN_MENU);
+    /* A page transaction may have replaced metadata while the menu was up. */
+    psp_ui_set_page(&live, "New page", "https://page.test/new", true);
+    live.scroll_y = 123;
+    psp_ui_adopt_priority(&live, &snapshot, PSP_UI_SCREEN_PAGE, true);
+    CHECK(live.screen == PSP_UI_SCREEN_MENU && live.menu_selection == 4u
+          && strcmp(live.url, "https://page.test/new") == 0
+          && live.scroll_y == 123);
+    input.pressed = PSP_UI_BUTTON_MENU;
+    CHECK(psp_ui_update_priority(&live, &input)
+          && live.screen == PSP_UI_SCREEN_PAGE
+          && !psp_ui_page_work_paused(&live));
+    input.pressed = PSP_UI_BUTTON_TOOLBAR;
+    bool chrome = live.chrome_visible;
+    PspUiToolbarInputState toolbar = {0};
+    input.held = PSP_UI_BUTTON_TOOLBAR;
+    CHECK(!psp_ui_filter_toolbar_input(&toolbar, &input, true, 1000));
+    CHECK(!psp_ui_update_priority(&live, &input) && live.chrome_visible == chrome);
+    snapshot = live; /* The supervisor owns the release. */
+    input.pressed = input.held = 0;
+    CHECK(!psp_ui_filter_toolbar_input(&toolbar, &input, true, 1100));
+    CHECK(psp_ui_update_priority(&snapshot, &input));
+    psp_ui_adopt_priority(&live, &snapshot, PSP_UI_SCREEN_PAGE, chrome);
+    input.pressed = 0;
+    CHECK(!psp_ui_filter_toolbar_input(&toolbar, &input, true, 1116));
+    CHECK(input.pressed == 0 && live.chrome_visible != chrome);
+    chrome = live.chrome_visible;
+    input.pressed = input.held = PSP_UI_BUTTON_TOOLBAR;
+    CHECK(!psp_ui_filter_toolbar_input(&toolbar, &input, true, 1200));
+    CHECK(psp_ui_filter_toolbar_input(&toolbar, &input, true, 1900));
+    CHECK(input.pressed == 0 && live.chrome_visible == chrome);
+    input.pressed = input.held = 0;
+    CHECK(!psp_ui_filter_toolbar_input(&toolbar, &input, true, 2000));
+    CHECK(input.pressed == 0 && live.chrome_visible == chrome);
+    live.analog_cursor_enabled = true;
+    input.pressed = 0;
+    input.analog_x = 255;
+    int x = live.cursor_x_milli;
+    CHECK(psp_ui_update_priority(&live, &input) && live.cursor_x_milli > x);
+    input.analog_x = 128;
+    input.pressed = PSP_UI_BUTTON_MENU;
+    CHECK(psp_ui_update_priority(&live, &input));
+    live.menu_selection = 0u; /* Home requires ordinary lifecycle dispatch. */
+    snapshot = live;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    CHECK(!psp_ui_update_priority(&live, &input)
+          && memcmp(&live, &snapshot, sizeof(live)) == 0);
+    input.pressed = PSP_UI_BUTTON_MENU | PSP_UI_BUTTON_CONFIRM;
+    CHECK(!psp_ui_update_priority(&live, &input)
+          && memcmp(&live, &snapshot, sizeof(live)) == 0);
+    live.page_gamepad_capture = true;
+    input.pressed = PSP_UI_BUTTON_MENU;
+    CHECK(!psp_ui_update_priority(&live, &input));
+    return true;
+}
+
 static bool test_input_mapping_and_menu(void)
 {
     PspUiState ui;
@@ -1745,6 +1878,22 @@ static bool test_analog_cursor_and_drag(void)
 
 static bool test_autohide_and_loading(void)
 {
+    PspUiToolbarGesture gesture = {0};
+    /* A slow layout BEFORE the first held sample is not button-hold time. */
+    CHECK(psp_ui_toolbar_gesture_update(&gesture, true, true, 1000u)
+          == PSP_UI_TOOLBAR_GESTURE_NONE);
+    CHECK(psp_ui_toolbar_gesture_update(&gesture, false, true, 1000u)
+          == PSP_UI_TOOLBAR_GESTURE_TAP);
+    CHECK(psp_ui_toolbar_gesture_update(&gesture, true, true, 16u)
+          == PSP_UI_TOOLBAR_GESTURE_NONE);
+    CHECK(psp_ui_toolbar_gesture_update(&gesture, true, true, 699u)
+          == PSP_UI_TOOLBAR_GESTURE_NONE);
+    CHECK(psp_ui_toolbar_gesture_update(&gesture, true, true, 1u)
+          == PSP_UI_TOOLBAR_GESTURE_READER);
+    CHECK(psp_ui_toolbar_gesture_update(&gesture, true, true, 1000u)
+          == PSP_UI_TOOLBAR_GESTURE_NONE);
+    CHECK(psp_ui_toolbar_gesture_update(&gesture, false, true, 16u)
+          == PSP_UI_TOOLBAR_GESTURE_NONE);
     PspUiState ui;
     psp_ui_init(&ui);
     PspUiInput idle = { .analog_x = 128, .analog_y = 128 };
@@ -1759,7 +1908,16 @@ static bool test_autohide_and_loading(void)
     CHECK(ui.progress_per_mille == 735);
     for (unsigned at = 0; at < 300; at++) (void) psp_ui_update(&ui, &idle);
     CHECK(ui.chrome_visible);
+    PspUiInput triangle = idle;
+    triangle.pressed = PSP_UI_BUTTON_TOOLBAR;
+    CHECK(psp_ui_update(&ui, &triangle).visual_changed);
+    CHECK(!ui.chrome_visible);
+    psp_ui_set_loading(&ui, true, 800);
+    CHECK(!ui.chrome_visible);
     psp_ui_set_loading(&ui, false, 1000);
+    CHECK(!ui.chrome_visible);
+    psp_ui_set_loading(&ui, true, 0);
+    CHECK(ui.chrome_visible);
     return true;
 }
 
@@ -4938,7 +5096,9 @@ static bool test_media_committed_seek_keeps_timeline_stable(void)
 
 int main(void)
 {
-    if (!test_input_mapping_and_menu()
+    if (!test_page_activation_activity()
+        || !test_priority_menu_during_page_work()
+        || !test_input_mapping_and_menu()
         || !test_wifi_sign_in_suggestion_is_actionable()
         || !test_contextual_failure_recovery_actions()
         || !test_site_information_actions_are_scoped_and_confirmed()

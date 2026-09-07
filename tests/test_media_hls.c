@@ -128,7 +128,13 @@ typedef struct {
 
 typedef struct {
     unsigned submits;
-    bool block_first;
+    bool wait_for_audio;
+    bool bypass_allowed;
+    unsigned audio_attempts;
+    unsigned audio_accepted;
+    unsigned video_accepted;
+    size_t video_bytes;
+    unsigned char video_copy[128];
 } PlaybackBackend;
 
 static MediaBackendResult playback_submit(
@@ -142,9 +148,25 @@ static MediaBackendResult playback_submit(
     if (backend == NULL || sample == NULL || bytes == NULL
         || length != sample->size) return MEDIA_BACKEND_ERROR;
     backend->submits++;
-    if (backend->block_first) {
-        backend->block_first = false;
-        return MEDIA_BACKEND_WOULD_BLOCK;
+    if (backend->wait_for_audio) {
+        if (sample->kind == MEDIA_MP4_TRACK_VIDEO) {
+            if (length > sizeof(backend->video_copy))
+                return MEDIA_BACKEND_ERROR;
+            if (backend->video_bytes == 0) {
+                memcpy(backend->video_copy, bytes, length);
+                backend->video_bytes = length;
+            } else if (length != backend->video_bytes
+                       || memcmp(backend->video_copy, bytes, length) != 0) {
+                return MEDIA_BACKEND_ERROR;
+            }
+            if (backend->audio_accepted == 0)
+                return MEDIA_BACKEND_WOULD_BLOCK;
+            backend->video_accepted++;
+        } else {
+            if (backend->audio_attempts++ == 0)
+                return MEDIA_BACKEND_WOULD_BLOCK;
+            backend->audio_accepted++;
+        }
     }
     return MEDIA_BACKEND_ACCEPTED;
 }
@@ -171,6 +193,20 @@ static bool playback_advance(
 static void playback_destroy(void *opaque)
 {
     (void) opaque;
+}
+
+static bool playback_not_resident(const void *opaque, const MediaMp4Sample *sample)
+{
+    (void) opaque;
+    (void) sample;
+    /* A completed HTTP successor can still need a read to install it. */
+    return false;
+}
+
+static bool playback_allow_bypass(const void *opaque, int kind)
+{
+    const PlaybackBackend *backend = opaque;
+    return backend->bypass_allowed && kind == MEDIA_MP4_TRACK_VIDEO;
 }
 
 static void build_segment(MockTransport *mock, size_t segment, uint64_t pts)
@@ -865,16 +901,23 @@ static int test_demuxed_track_sources_prime_independently(void)
           && sample.kind == MEDIA_MP4_TRACK_VIDEO
           && audio_samples.ops->next_sample(audio_samples.opaque, &sample)
           && sample.kind == MEDIA_MP4_TRACK_AUDIO);
+    MediaSampleSourceOps audio_sample_ops = *audio_samples.ops;
+    audio_sample_ops.sample_resident = playback_not_resident;
+    audio_samples.ops = &audio_sample_ops;
     /* HLS reads retire their queue head.  A firmware backend can transiently
        refuse that copied packet, so playback must retry the retained bytes,
        not ask the streaming source to recreate an already-consumed AU. */
-    PlaybackBackend playback_fixture = {.block_first = true};
+    /* Model the post-seek cycle: the video slots cannot retire until audio
+       advances the clock. Also refuse audio once, proving that BOTH consumed
+       source payloads survive a pending visit without being re-read. */
+    PlaybackBackend playback_fixture = {.wait_for_audio = true};
     MediaBackend backend = {
         .opaque = &playback_fixture,
         .submit = playback_submit,
         .drain = playback_drain,
         .advance = playback_advance,
-        .destroy = playback_destroy
+        .destroy = playback_destroy,
+        .allow_submit_bypass = playback_allow_bypass
     };
     MediaPlaybackOptions options = {
         .decode_lead_us = UINT64_C(2000000),
@@ -883,15 +926,37 @@ static int test_demuxed_track_sources_prime_independently(void)
     MediaPlayback *playback = media_playback_create_sources(
         &budget, &video_samples, &audio_samples, &backend, &options,
         error, sizeof(error));
+    CHECK(playback != NULL);
+    CHECK(media_playback_advance_bounded(
+              playback, UINT64_C(1000000), 1u, error, sizeof(error))
+              == MEDIA_PLAYBACK_ADVANCE_PENDING
+          && playback_fixture.audio_attempts == 0u);
+    playback_fixture.bypass_allowed = true;
+    size_t owned_before_audio = budget.current;
+    size_t saved_limit = budget.limit;
+    budget.limit = budget.current;
+    CHECK(media_playback_advance_bounded(
+              playback, UINT64_C(1000000), 1u, error, sizeof(error))
+              == MEDIA_PLAYBACK_ADVANCE_PENDING
+          && error[0] == '\0'
+          && budget.current == owned_before_audio
+          && playback_fixture.audio_attempts == 0u);
+    budget.limit = saved_limit;
+    error[0] = '\0';
     CHECK(playback != NULL
           && media_playback_advance_bounded(
                  playback, UINT64_C(1000000), 1u, error, sizeof(error))
                == MEDIA_PLAYBACK_ADVANCE_PENDING
-          && playback_fixture.submits == 1u
+          && playback_fixture.audio_attempts == 1u
           && media_playback_advance_bounded(
                  playback, UINT64_C(1000000), 1u, error, sizeof(error))
                != MEDIA_PLAYBACK_ADVANCE_ERROR
-          && playback_fixture.submits == 2u);
+          && playback_fixture.audio_accepted == 1u
+          && playback_fixture.video_accepted == 0u
+          && media_playback_advance_bounded(
+                 playback, UINT64_C(1000000), 1u, error, sizeof(error))
+               != MEDIA_PLAYBACK_ADVANCE_ERROR
+          && playback_fixture.video_accepted == 1u);
     media_playback_destroy(playback);
     media_hls_source_destroy(video);
     media_hls_source_destroy(audio);

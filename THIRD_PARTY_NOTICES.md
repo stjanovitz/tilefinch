@@ -17,9 +17,11 @@ runtime assets or immutable engine data.
   distributions.
 - **Bellard QuickJS**, commit `04be246001599f5995fa2f2d8c91a0f198d3f34c`
   (upstream VERSION 2026-06-04): MIT License. This is the backend used by
-  every checked-in preset, including the PSP build; the build applies the
-  repository's bounded-lifetime and responsiveness patches (`patches/`) to the
-  hash-pinned source. The checkout contains the complete `LICENSE` file.
+  every checked-in preset, including the PSP build. The engine is vendored
+  under `third_party/quickjs` with the repository's bounded-lifetime and
+  responsiveness changes applied (listed in `third_party/quickjs/README.md`;
+  the original patch files under `patches/` are retained as history). The
+  vendored tree contains upstream's complete `LICENSE` file.
 - **QuickJS-NG 0.15.0**, commit `433941b99fb3c5e7f98b7ebd78727972bcf467ee`:
   MIT License (per upstream). Selectable via
   `PSP_BROWSER_USE_BELLARD_QUICKJS=OFF`; no checked-in preset uses it, so it
@@ -47,7 +49,7 @@ runtime assets or immutable engine data.
   zlib-licensed gzip code and Old-MIT HarfBuzz-derived autofit sources; carry
   those notices too. Complete texts are in the checkout's `LICENSE.TXT` and
   `docs/FTL.TXT`.
-- **Public Suffix List** snapshot `b9a86cf0cd115f1e60b5815533f3fcfd2f9e8f4b`:
+- **Public Suffix List** snapshot `f540a06159213b6e8ed9c87d2dd3a52373637e92`:
   MPL-2.0 data encoded as a checked-in DAFSA. The fixed-set decoder in
   `src/public_suffix.c` was adapted from libpsl/Chromium under its
   BSD-3-Clause license. Source, generation details, hashes, and both license

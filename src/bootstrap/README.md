@@ -44,14 +44,16 @@ The current files intentionally retain the bootstrap's established logical
 boundaries. Moving APIs between modules or changing runtime order should be a
 separate, behavior-reviewed change.
 
-Canvas, IndexedDB, CSS motion, and bounded Streams are ROM-backed on-demand
-modules. Their standards-visible globals and Canvas prototype entries begin
+Canvas, IndexedDB, CSS motion, bounded Streams, and bounded capability probes
+are ROM-backed on-demand modules. The capability module exposes the Web Speech
+shape with an empty engine and a Media Source shape that advertises no
+supported byte-stream types; it does not pretend the PSP implements either
+pipeline. Their standards-visible globals and Canvas prototype entries begin
 as configurable accessors; the first read, write, Canvas dimension operation,
 or bounded CSS animation hint synchronously evaluates the corresponding
-bytecode, replaces the accessors with the normal implementation, and
-continues the original operation. This keeps feature detection honest without
-charging every page realm for uncommon stateful APIs or the CSS-keyframe
-scanner.
+bytecode, replaces the accessors with the normal implementation, and continues
+the original operation. This keeps feature detection honest without charging
+every page realm for uncommon stateful APIs or the CSS-keyframe scanner.
 `TILEFINCH_TRACE_JS_STARTUP=1` reports heap bytes after each eager or lazy
 module. Regression tests require an ordinary realm to start with zero lazy
 module loads, then verify that each first-use boundary activates only its

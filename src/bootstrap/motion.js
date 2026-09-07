@@ -22,12 +22,14 @@
   let pending = false,
     observer = null,
     scans = 0,
+    declarationParses = 0,
     retainedKeyframes = 0,
     retainedRules = 0,
     matchedElements = 0;
   if (globalThis.__tilefinchRootCensus)
     Object.defineProperties(globalThis.__tilefinchRootCensus, {
       motionScans: { get: () => scans },
+      motionDeclarationParses: { get: () => declarationParses },
       motionKeyframes: { get: () => retainedKeyframes },
       motionRules: { get: () => retainedRules },
       motionElements: { get: () => matchedElements },
@@ -87,7 +89,7 @@
     },
     styleTextPrefix = (style, maximumBytes, maximumNodes) => {
       if (!style || maximumBytes <= 0 || maximumNodes <= 0)
-        return { text: "", nodes: 0 };
+        return { text: "", nodes: 0, bytes: 0 };
       try {
         const result = globalThis.__tilefinchGetTextPrefix?.(
             style.__handle,
@@ -98,10 +100,19 @@
           ? {
               text: String(result.text || ""),
               nodes: Math.max(0, Math.min(maximumNodes, result.nodes | 0)),
+              bytes: Math.max(
+                0,
+                Math.min(
+                  maximumBytes,
+                  typeof result.bytes === "number"
+                    ? result.bytes | 0
+                    : boundedUtf8Length(String(result.text || "")),
+                ),
+              ),
             }
-          : { text: "", nodes: 0 };
+          : { text: "", nodes: 0, bytes: 0 };
       } catch {
-        return { text: "", nodes: 0 };
+        return { text: "", nodes: 0, bytes: 0 };
       }
     },
     styleAttributePrefix = (element, maximumBytes) => {
@@ -118,6 +129,7 @@
       }
     },
     declarationMap = (text) => {
+      declarationParses++;
       const declarations = new Map();
       for (let at = 0; at < text.length; ) {
         let end = at,
@@ -402,11 +414,15 @@
           depth + 1,
         );
       } else if (!header.startsWith("@")) {
-        const declarations = declarationMap(
-            text.slice(delimiter + 1, close),
-          ),
-          config = animationConfig(declarations);
-        if (config) rules.push({ selector: header, config });
+        const body = text.slice(delimiter + 1, close);
+        /* Conservative native-string rejection only: animationConfig reads
+           animation* declarations. Unrelated colors/layout need no JS token
+           map. False positives (strings/comments/custom properties) still
+           take the complete parser; no CSS matching or cascade is skipped. */
+        if (/animation/i.test(body)) {
+          const config = animationConfig(declarationMap(body));
+          if (config) rules.push({ selector: header, config });
+        }
       }
       at = close + 1;
     }
@@ -480,9 +496,10 @@
           availableNodes = STYLE_NODE_LIMIT - retainedNodes;
         if (available <= 0 || availableNodes <= 0) break;
         const retained = styleTextPrefix(style, available, availableNodes);
-        retainedBytes += boundedUtf8Length(retained.text);
+        retainedBytes += retained.bytes;
         retainedNodes += retained.nodes;
-        parseRules(retained.text, 0, retained.text.length, keyframes, rules);
+        if (/(?:animation|keyframes)/i.test(retained.text))
+          parseRules(retained.text, 0, retained.text.length, keyframes, rules);
       }
       const candidates = new Map();
       for (const rule of rules) {
@@ -517,9 +534,8 @@
         );
         retainedBytes += boundedUtf8Length(retained);
         retainedNodes++;
-        const config = animationConfig(
-          declarationMap(retained),
-        );
+        const config = /animation/i.test(retained)
+          ? animationConfig(declarationMap(retained)) : null;
         if (config) candidates.set(element, config);
       }
       for (const element of Array.from(active)) {
@@ -613,11 +629,12 @@
               );
               text = retained.text;
               inspectedNodes += retained.nodes;
+              inspectedBytes += retained.bytes;
             } else {
               text = styleAttributePrefix(node, available);
               inspectedNodes++;
+              inspectedBytes += boundedUtf8Length(text);
             }
-            inspectedBytes += boundedUtf8Length(text);
             if (
               /@(?:-webkit-)?keyframes\b|\banimation(?:-name)?\s*:/i.test(
                 text,

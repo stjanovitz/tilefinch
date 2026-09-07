@@ -972,6 +972,27 @@ static int test_resumable_authoritative_layout(Budget *budget)
     layout_build_job_destroy(job);
     CHECK(budget->current == warm_baseline);
 
+    /* Preview and tiny synchronous builds share cancellation ownership with
+       the explicit continuation; a refused preview must never look complete. */
+    tilefinch_test_faults()->cancel_next_layout_cooperate = true;
+    truncated = false;
+    CHECK(!layout_build_context_preview(
+        &resumed, budget, &document, &sheet, NULL, NULL, &viewport,
+        NULL, INT_MAX, &truncated));
+    CHECK(resumed.performance.cancelled
+          && !tilefinch_test_faults()->cancel_next_layout_cooperate
+          && resumed.commands == NULL && budget->current == warm_baseline);
+    layout_destroy(&resumed);
+    for (size_t failure = 0; failure < 4; failure++) {
+        budget_inject_failure_after(budget, failure);
+        (void) layout_build_context_preview(
+            &resumed, budget, &document, &sheet, NULL, NULL, &viewport,
+            NULL, 16, &truncated);
+        budget_clear_failure_injection(budget);
+        layout_destroy(&resumed);
+        CHECK(budget->current == warm_baseline);
+    }
+
     layout_destroy(&monolithic);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -1206,6 +1227,141 @@ static int test_generated_content_counters_and_markers(Budget *budget)
           && multi_box != NULL && count_box != NULL
           && multi_box->height > 0
           && count_box->y >= multi_box->y + multi_box->height);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_overflow_index_uses_nearby_bands(Budget *budget)
+{
+    enum { PAIRS = 1000 };
+    LayoutDocument layout = {0};
+    layout.budget = budget;
+    layout.height = PAIRS * 100;
+    layout.count = layout.paint_order_count = PAIRS * 2;
+    layout.node_box_count = PAIRS;
+    layout.commands = budget_calloc(budget, layout.count, sizeof(*layout.commands));
+    layout.paint_order = budget_calloc(budget, layout.count, sizeof(*layout.paint_order));
+    layout.node_boxes = budget_calloc(budget, PAIRS, sizeof(*layout.node_boxes));
+    layout.fixed_ranges = budget_calloc(budget, 1, sizeof(*layout.fixed_ranges));
+    LayoutContext *context = budget_calloc(budget, 1, sizeof(*context));
+    CHECK(layout.commands && layout.paint_order && layout.node_boxes
+          && layout.fixed_ranges && context);
+    context->layout = &layout;
+    for (size_t i = 0; i < PAIRS; i++) {
+        DrawCommand *overflow = &layout.commands[2 * i];
+        overflow->type = DRAW_FILL_RECT;
+        overflow->y = (int) i * 100;
+        overflow->width = overflow->height = 10;
+        layout.commands[2 * i + 1] = *overflow;
+        layout.commands[2 * i + 1].x = i < 3 ? 0 : 20;
+        layout.commands[2 * i + 1].z_index = 1;
+        layout.paint_order[2 * i] = (uint32_t) (2 * i);
+        layout.paint_order[2 * i + 1] = (uint32_t) (2 * i + 1);
+        layout.node_boxes[i].clips_x = true;
+        layout.node_boxes[i].scroll_command_start = (uint32_t) (2 * i);
+        layout.node_boxes[i].scroll_command_end = (uint32_t) (2 * i + 1);
+    }
+    /* Exercise local, globally indexed and fixed/unindexed overflow. */
+    layout.commands[2].height = 4096;
+    layout.fixed_count = 1;
+    layout.fixed_ranges[0].command_start = 4;
+    layout.fixed_ranges[0].command_end = 5;
+    CHECK(build_spatial_index(&layout, context));
+    CHECK(layout.late_positioned_order_count == 3);
+    for (size_t i = 0; i < 3; i++) {
+        CHECK(layout.late_positioned_orders[i] == 2 * i + 1);
+    }
+    CHECK(layout.layout_work_units < 100000);
+    budget_free(budget, context);
+    layout_destroy(&layout);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_generated_counter_analysis_is_shared(Budget *budget)
+{
+    char page[48000];
+    size_t used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>body{counter-reset:item}"
+        "span{counter-increment:item}span::before{content:counter(item) ':'}"
+        "</style><body>");
+    for (unsigned i = 0; i < 180; i++) {
+        used += (size_t) snprintf(page + used, sizeof(page) - used,
+                                 "<span>entry</span>");
+    }
+    used += (size_t) snprintf(page + used, sizeof(page) - used,
+        "<div style='counter-reset:item 10'><span>nested</span></div>"
+        "<div style='display:none'><span>not counted</span></div>"
+        "<span>outer</span>");
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, page, used, 19)
+          && stylesheet_build(&sheet, budget, &document, 480));
+    uint64_t before = sheet.rule_index_queries;
+    CHECK(layout_build(&layout, budget, &document, &sheet, NULL, NULL, 480));
+    CHECK(text_command(&layout, "1:") != NULL
+          && text_command(&layout, "180:") != NULL
+          && text_command(&layout, "11:") != NULL
+          && text_command(&layout, "181:") != NULL);
+    /* Each counter must not resolve the styles of its entire DOM prefix.
+       Count work instead of wall time so this holds on host and Allegrex. */
+    CHECK(sheet.rule_index_queries - before < 10000);
+    /* Sequential labels must reuse the analyzed prefix, not replay it for
+       every measurement and emission. Includes nested-scope restoration. */
+    CHECK(layout.layout_work_units < 10000u);
+    layout_destroy(&layout);
+    size_t parsed_count = document.element_count;
+    BudgetAllocationOwner owner = document_allocation_owner_enter(&document);
+    for (unsigned i = 0; i < 32; ++i) {
+        lxb_dom_element_t *element = lxb_dom_document_create_element(
+            &document.html->dom_document, (const lxb_char_t *) "span", 4, NULL);
+        CHECK(element != NULL
+              && lxb_dom_node_append_child(document_body_node(&document),
+                   lxb_dom_interface_node(element)) == LXB_DOM_EXCEPTION_OK);
+    }
+    document_allocation_owner_leave(&document, owner);
+    CHECK(document.element_count == parsed_count);
+    CHECK(layout_build(&layout, budget, &document, &sheet, NULL, NULL, 480));
+    CHECK(text_command(&layout, "213:") != NULL);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>body{counter-reset:a 0 b 100}"
+        "span{counter-increment:a b}"
+        "span::before{counter-increment:a 10;content:counter(a) ':' counter(b)}"
+        "</style><body><span>first</span><span>second</span>");
+    CHECK(document_parse(&document, budget, page, used, 19)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet, NULL, NULL, 480));
+    /* Alternating names cannot share state; pseudo increments must not
+       persist into either the next measurement or the next sibling. */
+    CHECK(text_command(&layout, "11:101") != NULL
+          && text_command(&layout, "12:102") != NULL);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    used = (size_t) snprintf(page, sizeof(page),
+        "<!doctype html><style>body{counter-reset:item}"
+        "span::before{content:counter(item) ':'}</style><body>");
+    for (unsigned i = 0; i < 4300; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used, "<i></i>");
+    for (unsigned i = 0; i < 96; i++)
+        used += (size_t) snprintf(page + used, sizeof(page) - used, "<span>tail</span>");
+    CHECK(used < sizeof(page)
+          && document_parse(&document, budget, page, used, 19)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet, NULL, NULL, 480));
+    CHECK(text_command(&layout, "0:") != NULL);
+    /* Unindexed tail labels must not replay 4096 counter operations each.
+       This measures structural work, independently of machine speed. */
+    CHECK(layout.layout_work_units < 50000u);
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);

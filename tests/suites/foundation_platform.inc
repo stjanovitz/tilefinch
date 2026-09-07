@@ -1398,7 +1398,8 @@ static bool test_youtube_lite_document_builder(Budget *layout_budget)
         && strstr(document.html,
                   "background:#f00;border:2px solid #fff") == NULL
         && strstr(document.html,
-                  "i.ytimg.com/vi/TFTEST00001/hqdefault.jpg") != NULL;
+                  "i.ytimg.com/vi/TFTEST00001/hqdefault.jpg\" "
+                  "loading=lazy alt=\"\"") != NULL;
     youtube_lite_document_destroy(&document);
     if (!watch_ok || budget.current != 0) return false;
 
@@ -1555,6 +1556,7 @@ static int test_foundation(void)
     CHECK(test_stylesheet_transient_retry_cap(&budget));
     CHECK(test_script_shared_cache_lifetimes(&budget));
     CHECK(test_image_virtual_cancel_bound(&budget));
+    CHECK(test_image_style_scope(&budget) == 0);
     CHECK(test_image_request_no_progress_bound(&budget));
     CHECK(test_image_request_policy_and_cookies(&budget));
     CHECK(test_decoded_image_cache_partition_and_lifetime(&budget));

@@ -1,4 +1,5 @@
-#include "tilefinch/browser_engine.h"
+#include "browser_engine_test_support.h"
+#include "../src/tilefinch_test_faults.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/platform.h"
 #include "tilefinch/site_adapter.h"
@@ -9,19 +10,6 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-#ifndef TILEFINCH_TEST_SOURCE_DIR
-#define TILEFINCH_TEST_SOURCE_DIR "."
-#endif
-
-#define MIB (1024u * 1024u)
-#define CHECK(condition) do {                                                \
-    if (!(condition)) {                                                      \
-        fprintf(stderr, "ENGINE CHECK failed at %s:%d: %s\n",             \
-                __FILE__, __LINE__, #condition);                             \
-        return 1;                                                            \
-    }                                                                        \
-} while (0)
 
 typedef struct {
     size_t selector_calls;
@@ -60,9 +48,14 @@ static char *read_test_file(const char *path, size_t *length)
     return data;
 }
 
-static bool write_large_youtube_replay(
-    char directory[128], size_t *body_length)
+static bool write_large_youtube_replay_configured(
+    char directory[128], size_t *body_length, const char *url,
+    bool include_identity)
 {
+    static const char identity[] =
+        "<script>ytcfg.set({\"INNERTUBE_API_KEY\":\"fixture-key\","
+        "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"fixture-version\","
+        "\"VISITOR_DATA\":\"fixture-visitor\"});</script>";
     static const char prefix[] =
         "<!doctype html><script>var ytInitialData = '"
         "{\"contents\":[{\"videoRenderer\":{\"title\":{\"runs\":[{\"text\":"
@@ -77,13 +70,15 @@ static bool write_large_youtube_replay(
     snprintf(path, sizeof(path), "%s/0000.body", directory);
     FILE *body = fopen(path, "wb");
     size_t target = 768u * 1024u;
+    size_t identity_length = include_identity ? sizeof(identity) - 1u : 0;
     bool ok = body != NULL
+        && fwrite(identity, 1, identity_length, body) == identity_length
         && fwrite(prefix, 1, sizeof(prefix) - 1u, body)
                == sizeof(prefix) - 1u;
     char padding[4096];
     memset(padding, 'a', sizeof(padding));
     size_t padding_length =
-        target - (sizeof(prefix) - 1u) - (sizeof(suffix) - 1u);
+        target - identity_length - (sizeof(prefix) - 1u) - (sizeof(suffix) - 1u);
     for (size_t written = 0; ok && written < padding_length;) {
         size_t amount = padding_length - written;
         if (amount > sizeof(padding)) amount = sizeof(padding);
@@ -101,20 +96,26 @@ static bool write_large_youtube_replay(
     ok = meta != NULL && fprintf(
         meta,
         "psp-http-trace=1\nmethod=GET\n"
-        "url=https://m.youtube.com/results?search_query=ratchet\n"
+        "url=%s\n"
         "success=1\nasync-delay-pumps=0\nexternal-cancel=0\n"
         "transport-timeout=0\nerror=\nstatus=200\nlength=%zu\n"
-        "effective-url=https://m.youtube.com/results?search_query=ratchet\n"
+        "effective-url=%s\n"
         "content-type=text/html; charset=utf-8\netag=\nlast-modified=\n"
         "cf-mitigated=\naccept-ch=\ncritical-ch=\nserver=fixture-youtube\n"
         "cf-ray=\nset-cookie-count=0\n",
-        target) > 0 && fclose(meta) == 0;
+        url, target, url) > 0 && fclose(meta) == 0;
     snprintf(path, sizeof(path), "%s/trace.meta", directory);
     FILE *trace = ok ? fopen(path, "wb") : NULL;
     return trace != NULL && fprintf(
         trace, "psp-http-trace-clock=1\norigin-ms=1700000000000\n"
                "capture-complete=yes\nrecord-count=1\n") > 0
         && fclose(trace) == 0;
+}
+
+static bool write_large_youtube_replay(char directory[128], size_t *body_length)
+{
+    return write_large_youtube_replay_configured(directory, body_length,
+        "https://m.youtube.com/results?search_query=ratchet", false);
 }
 
 static void remove_large_youtube_replay(const char *directory)
@@ -183,7 +184,7 @@ static void capture_diagnostic(void *opaque,
     snprintf(probe->last_name, sizeof(probe->last_name), "%s", event->name);
 }
 
-static uint64_t frame_checksum(const uint16_t *pixels, size_t pixel_count)
+uint64_t frame_checksum(const uint16_t *pixels, size_t pixel_count)
 {
     uint64_t hash = UINT64_C(1469598103934665603);
     for (size_t i = 0; i < pixel_count; i++) {
@@ -261,9 +262,36 @@ static bool backing_node_write(
 #include "suites/browser_engine_adapters.inc"
 #include "suites/browser_engine_teardown.inc"
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc == 4 && strcmp(argv[1], "--font-staging-replay") == 0)
+        return profile_staged_font_replay(argv[2], argv[3], 0, false);
+    if (argc == 4 && strcmp(argv[1], "--navigation-staging-replay") == 0)
+        return profile_staged_font_replay(argv[2], argv[3], 0, true);
+    if (argc == 5 && strcmp(argv[1], "--font-interrupt-replay") == 0) {
+        char *end = NULL;
+        unsigned long delay = strtoul(argv[4], &end, 10);
+        if (end == argv[4] || *end != '\0' || delay == 0 || delay > 1000000u)
+            return 1;
+        return profile_staged_font_replay(argv[2], argv[3], delay, false);
+    }
+    if (argc == 2 && strcmp(argv[1], "--font-staging-only") == 0)
+        return test_staged_optional_fonts_relayout_before_repaint();
+    if (argc == 2 && strcmp(argv[1], "--native-text-sync-only") == 0)
+        return test_native_text_sync_does_not_relayout_twice();
+    if (argc == 2 && strcmp(argv[1], "--computed-style-layout-only") == 0)
+        return test_computed_paint_style_does_not_force_layout();
+    if (argc == 2 && strcmp(argv[1], "--deferred-startup-only") == 0)
+        return test_deferred_startup_journey();
+    if (argc == 2 && strcmp(argv[1], "--interaction-journey-only") == 0)
+        return test_loading_interaction_journey();
+    if (argc == 2 && strcmp(argv[1], "--provider-navigation-only") == 0) {
+        return test_cooperative_site_adapter_navigation();
+    }
     CHECK(test_engine_lifecycle() == 0);
+    CHECK(test_loading_interaction_journey() == 0);
+    CHECK(test_deferred_startup_journey() == 0);
+    CHECK(test_deferred_image_publication_survives_rebuild() == 0);
     CHECK(test_same_document_and_script_free_defaults() == 0);
     CHECK(test_same_document_event_mutations_settle_immediately() == 0);
     CHECK(test_contenteditable_relayout_refusal_retires_shell() == 0);
@@ -276,6 +304,8 @@ int main(void)
     CHECK(test_structured_audio_preview_activation() == 0);
     CHECK(test_nomodule_capability_suppression() == 0);
     CHECK(test_staged_optional_fonts_relayout_before_repaint() == 0);
+    CHECK(test_native_text_sync_does_not_relayout_twice() == 0);
+    CHECK(test_computed_paint_style_does_not_force_layout() == 0);
     CHECK(test_deferred_image_relayout_requests_repaint() == 0);
     CHECK(test_committed_document_glyph_script_hints() == 0);
     CHECK(test_responsive_navigation_convergence() == 0);

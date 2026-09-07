@@ -1506,6 +1506,32 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
             load->sectioned ? session->page.fetch_domain : NULL,
             true, true, &load->layout_job,
             &load->layout_preview_candidate);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        char phase_message[320];
+        snprintf(phase_message, sizeof(phase_message),
+            "tilefinch-candidate-phases: built=%d layout-pending=%d "
+            "script=%lluus style=%lluus resource=%lluus layout=%lluus "
+            "runtime=%lluus counter-rules=%zu nodes=%zu\n",
+            built, load->layout_job != NULL,
+            (unsigned long long) candidate->performance.script_us,
+            (unsigned long long) candidate->performance.style_us,
+            (unsigned long long) candidate->performance.resource_us,
+            (unsigned long long) candidate->performance.layout_us,
+            (unsigned long long) candidate->performance.runtime_us,
+            candidate->page.stylesheet.count,
+            candidate->page.document.node_count);
+        tilefinch_platform_log_message(phase_message);
+        snprintf(phase_message, sizeof(phase_message),
+            "tilefinch-candidate-images: deferred=%zu runtime=%d attempted=%zu loaded=%zu "
+            "traverse=%lluus node-style=%lluus pseudo-style=%lluus drain=%lluus",
+            candidate->page.deferred_image_count, candidate->page.runtime != NULL,
+            candidate->page.images.stats.attempted, candidate->page.images.stats.loaded,
+            (unsigned long long) candidate->page.images.stats.traversal_us,
+            (unsigned long long) candidate->page.images.stats.node_style_resolve_us,
+            (unsigned long long) candidate->page.images.stats.pseudo_style_resolve_us,
+            (unsigned long long) candidate->page.images.stats.drain_us);
+        tilefinch_platform_log_message(phase_message);
+#endif
         if (built && load->layout_job != NULL) return true;
     } else if (load->layout_job != NULL) {
         LayoutBuildStatus layout_status =
@@ -1679,6 +1705,11 @@ static bool navigation_load_finalize_commit(NavigationLoad *load)
     page_destroy_value(candidate, &session->page);
     Budget *budget = session->budget;
     memcpy(session, candidate, sizeof(*session));
+    /* The stylesheet allocation and generation survive this move. Preserve
+       style reuse across the first resource/font relayout after adoption. */
+    layout_reuse_cache_rebind_stylesheet(
+        session->page.layout_reuse, &candidate->page.stylesheet,
+        &session->page.stylesheet);
     session->history = history;
     session->history_capacity = history_capacity;
     session->history_count = history_count;
@@ -1750,6 +1781,16 @@ bool navigation_load_finish(NavigationLoad *load,
         size_t before_work = load->metrics.finalize_work_units;
         bool advanced = navigation_load_finish_step(load);
         uint64_t elapsed = navigation_now_us() - started;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if (elapsed >= UINT64_C(100000)) {
+            char message[160];
+            snprintf(message, sizeof(message),
+                "tilefinch-finalize-step: next=%u elapsed=%lluus layout-pending=%d",
+                (unsigned) load->finalize_phase, (unsigned long long) elapsed,
+                load->layout_job != NULL);
+            tilefinch_platform_log_message(message);
+        }
+#endif
         load->metrics.finalize_us += elapsed;
         load->metrics.finalize_slices++;
         load->metrics.finalize_phase = (size_t) load->finalize_phase;

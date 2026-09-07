@@ -3883,88 +3883,6 @@ static bool fetch_background_result_reserve(
     return true;
 }
 
-bool fetch_background_request_cancelable(
-    Budget *budget, const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms, FetchCancelCallback cancel,
-    void *cancel_opaque, FetchResult *result)
-{
-    if (budget == NULL || result == NULL
-        || !fetch_background_transport_initialize(budget)) return false;
-    memset(result, 0, sizeof(*result));
-    result->budget = budget;
-    uint64_t id = fetch_background_transport_enqueue_stream(
-        url, request, maximum_bytes, timeout_ms);
-    if (id == 0) {
-        snprintf(result->error, sizeof(result->error), "%s",
-                 "background request was not admitted");
-        return false;
-    }
-    for (;;) {
-        if (cancel != NULL && cancel(cancel_opaque)) {
-            (void) fetch_background_transport_cancel(id, "request cancelled");
-            snprintf(result->error, sizeof(result->error), "%s",
-                     "request cancelled");
-            budget_free(budget, result->data);
-            result->data = NULL;
-            result->capacity = 0;
-            result->length = 0;
-            return false;
-        }
-        FetchBackgroundProgress progress = {0};
-        if (!fetch_background_transport_progress(id, &progress)) {
-            snprintf(result->error, sizeof(result->error), "%s",
-                     "background request retired unexpectedly");
-            budget_free(budget, result->data);
-            result->data = NULL;
-            result->capacity = 0;
-            result->length = 0;
-            return false;
-        }
-        if (progress.available_body_bytes != 0) {
-            if (progress.available_body_bytes
-                    > maximum_bytes - result->length
-                || !fetch_background_result_reserve(
-                       budget, result,
-                       result->length + progress.available_body_bytes,
-                       maximum_bytes)) {
-                (void) fetch_background_transport_cancel(
-                    id, "response exceeded shared memory budget");
-                snprintf(result->error, sizeof(result->error), "%s",
-                         "response exceeded shared memory budget");
-                budget_free(budget, result->data);
-                result->data = NULL;
-                result->capacity = 0;
-                result->length = 0;
-                return false;
-            }
-            size_t taken = 0;
-            if (!fetch_background_transport_take_chunk(
-                    id, (unsigned char *) result->data + result->length,
-                    result->capacity - result->length, &taken)) {
-                continue;
-            }
-            result->length += taken;
-            result->data[result->length] = '\0';
-            continue;
-        }
-        if (progress.complete) {
-            if (result->data == NULL
-                && !fetch_background_result_reserve(
-                       budget, result, 0, maximum_bytes)) {
-                (void) fetch_background_transport_cancel(
-                    id, "empty response allocation failed");
-                snprintf(result->error, sizeof(result->error), "%s",
-                         "empty response allocation failed");
-                return false;
-            }
-            result->data[result->length] = '\0';
-            return fetch_background_transport_take_fetch_result(
-                id, budget, result);
-        }
-        fetch_background_transport_wait(1u);
-    }
-}
-
 bool fetch_background_transport_cancel(
     uint64_t request_id, const char *reason)
 {
@@ -4656,15 +4574,6 @@ bool fetch_background_transport_take(
     size_t capacity, FetchBackgroundResult *result)
 {
     (void) request_id; (void) destination; (void) capacity; (void) result;
-    return false;
-}
-bool fetch_background_request_cancelable(
-    Budget *budget, const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms, FetchCancelCallback cancel,
-    void *cancel_opaque, FetchResult *result)
-{
-    (void) budget; (void) url; (void) request; (void) maximum_bytes;
-    (void) timeout_ms; (void) cancel; (void) cancel_opaque; (void) result;
     return false;
 }
 bool fetch_background_transport_cancel(

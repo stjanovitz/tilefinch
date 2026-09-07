@@ -654,9 +654,30 @@ bool layout_node_within(const lxb_dom_node_t *node,
     return false;
 }
 
-bool layout_positioned_command_escapes_clip(
+void layout_positioned_clip_index_prepare(
+    const LayoutDocument *layout, LayoutPositionedClipIndex *index)
+{
+    if (index == NULL) return;
+    *index = (LayoutPositionedClipIndex) {
+        .layout = layout,
+        .node_box_count = layout == NULL ? 0 : layout->node_box_count,
+        .complete = true
+    };
+    if (layout == NULL) return;
+    for (size_t i = 0; i < layout->node_box_count; i++) {
+        if (layout->node_boxes[i].positioned_ancestor_distance == 0) continue;
+        if (index->count == LAYOUT_POSITIONED_CLIP_INDEX_LIMIT
+            || i > UINT32_MAX) {
+            index->complete = false;
+            return;
+        }
+        index->boxes[index->count++] = (uint32_t) i;
+    }
+}
+
+bool layout_positioned_command_escapes_clip_indexed(
     const LayoutDocument *layout, size_t command_index,
-    const LayoutNodeBox *clip_box)
+    const LayoutNodeBox *clip_box, LayoutPositionedClipIndex *index)
 {
     if (layout == NULL || clip_box == NULL || clip_box->node == NULL) {
         return false;
@@ -670,8 +691,17 @@ bool layout_positioned_command_escapes_clip(
        deferred subtree that made the numeric intervals overlap. */
     const LayoutNodeBox *positioned_owner = NULL;
     size_t positioned_span = SIZE_MAX;
-    for (size_t i = 0; i < layout->node_box_count; i++) {
-        const LayoutNodeBox *candidate = &layout->node_boxes[i];
+    bool indexed = index != NULL && index->complete
+        && index->count <= LAYOUT_POSITIONED_CLIP_INDEX_LIMIT
+        && index->layout == layout
+        && index->node_box_count == layout->node_box_count;
+    size_t count = indexed ? index->count : layout->node_box_count;
+    for (size_t i = 0; i < count; i++) {
+#ifndef TILEFINCH_NO_TRACE
+        if (index != NULL) index->candidates_visited++;
+#endif
+        const LayoutNodeBox *candidate = &layout->node_boxes[
+            indexed ? index->boxes[i] : i];
         if (candidate->positioned_ancestor_distance == 0
             || command_index < candidate->command_start
             || command_index >= candidate->command_end) continue;
@@ -701,6 +731,14 @@ bool layout_positioned_command_escapes_clip(
         }
     }
     return false;
+}
+
+bool layout_positioned_command_escapes_clip(
+    const LayoutDocument *layout, size_t command_index,
+    const LayoutNodeBox *clip_box)
+{
+    return layout_positioned_command_escapes_clip_indexed(
+        layout, command_index, clip_box, NULL);
 }
 
 void translate_node_subtree(LayoutDocument *layout,
@@ -1236,6 +1274,8 @@ bool build_spatial_index(LayoutDocument *layout,
     layout->command_flags = budget_calloc(layout->budget, layout->count,
                                            sizeof(*layout->command_flags));
     if (layout->command_flags == NULL) return false;
+    LayoutPositionedClipIndex positioned;
+    bool positioned_prepared = false;
     for (size_t range = 0; range < layout->fixed_count; range++) {
         size_t end = layout->fixed_ranges[range].command_end;
         if (end > layout->count) end = layout->count;
@@ -1248,6 +1288,10 @@ bool build_spatial_index(LayoutDocument *layout,
          box_index++) {
         const LayoutNodeBox *box = &layout->node_boxes[box_index];
         if (!box->clips_x && !box->clips_y) continue;
+        if (!positioned_prepared) {
+            layout_positioned_clip_index_prepare(layout, &positioned);
+            positioned_prepared = true;
+        }
         /* Horizontal scrolling changes x but leaves the command's vertical
          * band stable. Only a vertically scrollable clip must bypass the
          * document-y index. */
@@ -1258,7 +1302,8 @@ bool build_spatial_index(LayoutDocument *layout,
         size_t end = box->scroll_command_end;
         if (end > layout->count) end = layout->count;
         for (size_t i = box->scroll_command_start; i < end; i++) {
-            if (layout_positioned_command_escapes_clip(layout, i, box)) {
+            if (layout_positioned_command_escapes_clip_indexed(
+                    layout, i, box, &positioned)) {
                 continue;
             }
             layout->command_flags[i] |= flags;
@@ -1409,6 +1454,38 @@ bool build_spatial_index(LayoutDocument *layout,
         return false;
     }
     if (has_overflow) {
+        /* For small overflow sets, the unique list is cheaper than visiting
+           dense bands of unrelated commands. Keep that bounded fast path. */
+        bool scan_all_overflow = all_overflow_at <= 128;
+        /* The normal bands already index local overflow commands. Retain
+           only exceptions in the temporary list: fixed, global and commands
+           omitted from the bands. These must still participate in the old
+           ink-intersection semantics (including unusual shadow bounds). */
+        size_t unbanded_overflow_at = 0;
+        checkpoint = 4096;
+        for (size_t at = 0; at < all_overflow_at; at++) {
+            if (!layout_batch_checkpoint(context, at, all_overflow_at,
+                                         &checkpoint)) {
+                budget_free(layout->budget, counts);
+                budget_free(layout->budget, all_overflow_orders);
+                return false;
+            }
+            size_t order = all_overflow_orders[at];
+            size_t index = layout->paint_order[order];
+            const DrawCommand *command = &layout->commands[index];
+            int64_t top = 0, bottom = 0;
+            draw_command_vertical_ink_bounds(layout, command, &top, &bottom);
+            int64_t first = top <= 0 ? 0 : top / LAYOUT_SPATIAL_BAND_HEIGHT;
+            int64_t last = bottom > layout->height
+                ? (int64_t) layout->spatial_band_count - 1
+                : (bottom - 1) / LAYOUT_SPATIAL_BAND_HEIGHT;
+            if (scan_all_overflow
+                || (layout->command_flags[index] & LAYOUT_COMMAND_FIXED) != 0
+                || command->height <= 0 || top >= layout->height
+                || bottom <= 0 || last - first + 1 > 8) {
+                all_overflow_orders[unbanded_overflow_at++] = (uint32_t) order;
+            }
+        }
         checkpoint = 4096;
         size_t late_work = 0;
         for (size_t order = 0; order < layout->paint_order_count; order++) {
@@ -1441,27 +1518,34 @@ bool build_spatial_index(LayoutDocument *layout,
                 : (int) (last_y / LAYOUT_SPATIAL_BAND_HEIGHT);
             bool overlaps_prior_overflow = false;
             if (last - first + 1 <= 8) {
-                /* Overflow commands are normally a tiny subset of a page.
-                   Scanning that unique paint-ordered subset avoids revisiting
-                   ordinary commands (and the same overflow command through
-                   several spatial bands) for every positioned candidate. */
-                for (size_t at = 0;
-                     at < all_overflow_at
-                     && !overlaps_prior_overflow; at++) {
-                    size_t prior_order = all_overflow_orders[at];
-                    if (prior_order >= order) break;
-                    size_t prior_index = layout->paint_order[prior_order];
-                    if (draw_commands_intersect(
-                            layout, candidate,
-                            &layout->commands[prior_index])) {
-                        overlaps_prior_overflow = true;
-                    }
-                    if (!paint_order_work(
-                            context, &late_work)) {
-                        budget_free(layout->budget, counts);
-                        budget_free(
-                            layout->budget, all_overflow_orders);
-                        return false;
+                /* Long articles can contain thousands of clipped commands.
+                   Compare only nearby bands plus unindexed exceptions, not
+                   every clipped command in the document prefix. Lists remain
+                   paint ordered; this changes search cost, never paint order. */
+                for (int band = scan_all_overflow ? last + 1 : first;
+                     band <= last + 1 && !overlaps_prior_overflow; band++) {
+                    bool exceptions = band == last + 1;
+                    const uint32_t *orders = exceptions ? all_overflow_orders
+                        : layout->spatial_band_orders;
+                    size_t at = exceptions ? 0 : layout->spatial_band_offsets[band];
+                    size_t end = exceptions ? unbanded_overflow_at
+                        : layout->spatial_band_offsets[band + 1];
+                    for (; at < end && !overlaps_prior_overflow; at++) {
+                        size_t prior_order = orders[at];
+                        if (prior_order >= order) break;
+                        size_t prior_index = layout->paint_order[prior_order];
+                        if ((layout->command_flags[prior_index]
+                             & LAYOUT_COMMAND_OVERFLOW) != 0
+                            && draw_commands_intersect(
+                                layout, candidate,
+                                &layout->commands[prior_index])) {
+                            overlaps_prior_overflow = true;
+                        }
+                        if (!paint_order_work(context, &late_work)) {
+                            budget_free(layout->budget, counts);
+                            budget_free(layout->budget, all_overflow_orders);
+                            return false;
+                        }
                     }
                 }
             }

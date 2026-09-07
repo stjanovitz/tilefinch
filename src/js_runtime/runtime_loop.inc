@@ -137,7 +137,7 @@ static void runtime_boot_window_step(ScriptRuntime *runtime)
     if ((size_t) usage.malloc_size > runtime->boot_window_peak) {
         runtime->boot_window_peak = (size_t) usage.malloc_size;
     }
-    if (getenv("TILEFINCH_DUMP_JS_MEMORY") != NULL) {
+    if (tilefinch_dump_js_memory()) {
         fprintf(stderr, "tilefinch: boot-window census advance=%llu live=%lld\n",
                 (unsigned long long) runtime->boot_window_advances,
                 (long long) usage.malloc_size);
@@ -360,7 +360,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
     runtime->timing_metrics.prelude_us +=
         (js_rt_monotonic_time_ns() - prelude_started_ns) / UINT64_C(1000);
 #endif
-    bool trace_steps = getenv("TILEFINCH_TRACE_RUNTIME_STEPS") != NULL;
+    bool trace_steps = tilefinch_trace_runtime_steps();
     uint64_t network_elapsed_ns = 0;
     uint64_t timer_elapsed_ns = 0;
     uint64_t microtask_elapsed_ns = 0;

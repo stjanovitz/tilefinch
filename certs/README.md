@@ -1,11 +1,12 @@
 # PSP TLS trust bundle
 
 `roots.pem` is the deliberately compact trust bundle staged beside the live
-PSP EBOOT. It contains twenty-three public root certificates:
+PSP EBOOT. It contains twenty-five public root certificates:
 
 - Amazon Root CA 1 (expires 2038-01-17)
 - DigiCert Global Root G2 (expires 2038-01-15)
 - DigiCert Global Root G3 (expires 2038-01-15)
+- DigiCert TLS RSA4096 Root G5 (expires 2046-01-14)
 - GlobalSign ECC Root CA - R5 (expires 2038-01-19)
 - GlobalSign ECC Root CA - R4 (expires 2038-01-19)
 - GlobalSign Root CA R1 (expires 2028-01-28)
@@ -20,6 +21,7 @@ PSP EBOOT. It contains twenty-three public root certificates:
 - IdenTrust Commercial Root CA 1 (expires 2034-01-16)
 - ISRG Root X1 (expires 2035-06-04)
 - Microsoft TLS RSA Root G2 (expires 2040-04-10)
+- QuoVadis Root CA 2 G3 (expires 2042-01-12)
 - Sectigo Public Server Authentication Root R46 (expires 2046-03-21)
 - SSL.com Root Certification Authority ECC (expires 2041-02-12)
 - SSL.com TLS ECC Root CA 2022 (expires 2046-08-19)
@@ -64,6 +66,17 @@ authoritative CA repositories, check their expiry/revocation status, and rerun
 the acceptance-site TLS probe. Adding roots is a security decision as well as
 a compatibility decision, so keep this file curated instead of silently
 copying the host's full store into the PSP package.
+
+The 0.1.16 refresh adds two self-signed anchors after the native-Mbed-TLS
+census exposed missing trust: QuoVadis Root CA 2 G3 and DigiCert TLS RSA4096
+Root G5. Both match the current Mozilla bundle and their authoritative
+[QuoVadis](https://knowledge.digicert.com/quovadis/download-roots-crl) and
+[DigiCert](https://knowledge.digicert.com/general-information/digicert-trusted-root-authority-certificates)
+repository downloads. Their SHA-256 fingerprints are pinned in the test above.
+The G5 anchor avoids an unnecessary legacy cross-chain; no weak-hash policy,
+hostname verification, leaf trust, or intermediate trust is relaxed. Existing
+compatibility roots were checked against the current public bundle and the
+GTS, Microsoft, and GlobalSign repositories; their bytes remain unchanged.
 
 After the PSP dependency build has unpacked Mbed TLS, build its native client
 and run the live qualification against a current top-300 list, the

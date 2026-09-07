@@ -1561,6 +1561,54 @@ static void copy_string(char *destination, size_t capacity, const char *source)
     snprintf(destination, capacity, "%s", source == NULL ? "" : source);
 }
 
+PspUiToolbarGestureResult psp_ui_toolbar_gesture_update(
+    PspUiToolbarGesture *gesture, bool held, bool page_eligible,
+    unsigned elapsed_ms)
+{
+    if (gesture == NULL) return PSP_UI_TOOLBAR_GESTURE_NONE;
+    PspUiToolbarGestureResult result = PSP_UI_TOOLBAR_GESTURE_NONE;
+    if (held && !gesture->held) {
+        /* elapsed_ms precedes this first observation: charging it can turn
+           a tap after a slow layout into an immediate Reader hold. */
+        gesture->hold_ms = 0;
+        gesture->triggered = false;
+        gesture->started_on_page = page_eligible;
+    }
+    else if (held && gesture->started_on_page) {
+        unsigned remaining = 700u - gesture->hold_ms;
+        gesture->hold_ms += elapsed_ms < remaining ? elapsed_ms : remaining;
+        if (gesture->hold_ms == 700u && !gesture->triggered) {
+            gesture->triggered = true;
+            result = PSP_UI_TOOLBAR_GESTURE_READER;
+        }
+    } else if (!held && gesture->held) {
+        if (gesture->started_on_page && !gesture->triggered)
+            result = PSP_UI_TOOLBAR_GESTURE_TAP;
+        gesture->hold_ms = 0;
+        gesture->triggered = false;
+        gesture->started_on_page = false;
+    }
+    gesture->held = held;
+    return result;
+}
+
+bool psp_ui_filter_toolbar_input(PspUiToolbarInputState *state, PspUiInput *input,
+                                bool page_eligible, uint64_t now_ms)
+{
+    if (state == NULL || input == NULL) return false;
+    uint64_t delta = now_ms >= state->sample_ms ? now_ms - state->sample_ms : 0;
+    state->sample_ms = now_ms;
+    bool held = (input->held & PSP_UI_BUTTON_TOOLBAR) != 0;
+    PspUiToolbarGestureResult result = psp_ui_toolbar_gesture_update(
+        &state->gesture, held, page_eligible,
+        (unsigned) (delta > 700u ? 700u : delta));
+    if (held && state->gesture.started_on_page)
+        input->pressed &= ~PSP_UI_BUTTON_TOOLBAR;
+    else if (result == PSP_UI_TOOLBAR_GESTURE_TAP)
+        input->pressed |= PSP_UI_BUTTON_TOOLBAR;
+    return result == PSP_UI_TOOLBAR_GESTURE_READER;
+}
+
 void psp_ui_init(PspUiState *ui)
 {
     if (ui == NULL) return;
@@ -1630,6 +1678,10 @@ void psp_ui_set_navigation_target(PspUiState *ui, const char *url)
     copy_string(ui->title, sizeof(ui->title), "Opening page");
     copy_string(ui->url, sizeof(ui->url), url);
     ui->secure = strncmp(url, "https://", 8u) == 0;
+    /* This is a new accepted destination, not a progress notification for
+       the incumbent load. Announce it even when that load was still active. */
+    ui->loading = false;
+    psp_ui_set_loading(ui, true, -1);
 }
 
 void psp_ui_set_history(PspUiState *ui, bool can_go_back,
@@ -1644,6 +1696,7 @@ void psp_ui_set_loading(PspUiState *ui, bool loading,
                         int progress_per_mille)
 {
     if (ui == NULL) return;
+    bool started = loading && !ui->loading;
     if (progress_per_mille < -1) progress_per_mille = -1;
     if (progress_per_mille > 1000) progress_per_mille = 1000;
     if (loading && ui->loading
@@ -1654,9 +1707,20 @@ void psp_ui_set_loading(PspUiState *ui, bool loading,
     ui->loading = loading;
     ui->progress_per_mille = progress_per_mille;
     if (loading) {
-        ui->chrome_visible = true;
+        /* Announce a new load, but respect Triangle during its continuation. */
+        if (started) ui->chrome_visible = true;
         ui->activity_frames = UI_AUTOHIDE_FRAMES;
     }
+}
+
+bool psp_ui_set_page_activation(PspUiState *ui, bool active)
+{
+    if (ui == NULL) return false;
+    active = active && ui->screen == PSP_UI_SCREEN_PAGE
+        && !ui->page_gamepad_capture;
+    bool changed = ui->page_activation_busy != (unsigned) active;
+    ui->page_activation_busy = active;
+    return changed;
 }
 
 void psp_ui_set_scroll(PspUiState *ui, int scroll_y, int maximum_scroll_y)
@@ -6389,7 +6453,7 @@ static void fill_accent_ramp(uint16_t *pixels, int width, int height,
 static void draw_loading(const PspUiState *ui, uint16_t *pixels, int width,
                          int height, int stride, uint16_t accent)
 {
-    if (!ui->loading) return;
+    if (!ui->loading && !ui->page_activation_busy) return;
     /* The upper activity line always moves, so a stalled/unknown-length
        request never looks frozen. The lower line is monotonic overall
        completion; both occupy the original three-pixel loading strip. */
@@ -6403,7 +6467,7 @@ static void draw_loading(const PspUiState *ui, uint16_t *pixels, int width,
     fill_accent_ramp(pixels, width, height, stride,
                      (UiRect) { position - segment, y, segment, 2 },
                      ramp.accent, ramp.accent_high);
-    if (ui->progress_per_mille >= 0) {
+    if (ui->loading && ui->progress_per_mille >= 0) {
         int filled = width * ui->progress_per_mille / 1000;
         fill_rect(pixels, width, height, stride,
                   (UiRect) { 0, y + 2, width, 1 }, PSP_THEME_LINE, 4);
@@ -8939,6 +9003,27 @@ void psp_ui_media_composite_controls(
         return;
     }
     draw_media_control_bar(media, pixels, width, height, stride);
+}
+
+void psp_ui_media_composite_supervisor_565(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride)
+{
+    if (media != NULL && media->visible && media->resolving
+        && !media->seek_in_progress && pixels != NULL
+        && width > 0 && height > 0 && stride >= width) {
+        /* Fresh opens remain on the 565 loading stage until a picture exists.
+           The supervisor owns presentation throughout asynchronous resolve;
+           updating only the footer copied the original central "0%" forever.
+           Rebuild on a clean stage, not already blended panel edges. The
+           active 8888 path and picture-preserving seek path remain unchanged. */
+        for (int y = 0; y < height; y++)
+            memset(pixels + (size_t) y * (size_t) stride, 0,
+                   (size_t) width * sizeof(*pixels));
+        psp_ui_media_composite(media, pixels, width, height, stride);
+        return;
+    }
+    psp_ui_media_composite_controls(media, pixels, width, height, stride);
 }
 
 bool psp_ui_media_overlay_paints(const PspUiMediaState *media)

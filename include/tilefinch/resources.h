@@ -320,6 +320,9 @@ typedef struct {
 typedef struct {
     lxb_dom_node_t *node;
     const char *source;
+    /* Optional native weak handle for a mutable page's retained idle queue.
+       Zero denotes the existing immutable/static-layout contract. */
+    long weak_handle;
     /* Authoritative visual-pixel box from a bounded layout. Zero means the
        loader must retain its ordinary viewport/source policy. */
     uint16_t display_width;
@@ -334,8 +337,8 @@ typedef struct {
 } ImagePriorityTarget;
 
 _Static_assert(
-    sizeof(ImagePriorityTarget) == 2u * sizeof(void *) + 8u,
-    "deferred image retry state must not grow priority targets");
+    sizeof(ImagePriorityTarget) == 2u * sizeof(void *) + sizeof(long) + 8u,
+    "deferred image targets retain one bounded native weak identity");
 
 typedef enum {
     IMAGE_PRIORITY_LOAD_PENDING = 0,
@@ -503,6 +506,29 @@ bool images_load_external_reusing_layout_styles(
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
     struct LayoutReuseCache *style_cache, const FontSet *fonts,
     int viewport_width);
+/* Same complete CSS/SVG traversal, optionally leaving ordinary <img> loads
+   to an owner-supplied weak-handle queue. Does not defer stylesheet images. */
+bool images_load_external_reusing_layout_styles_deferred(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, Budget *budget, const char *base_url,
+    const char *document_url, const char *referrer_policy,
+    size_t maximum_count, size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    struct LayoutReuseCache *style_cache, const FontSet *fonts,
+    int viewport_width, bool defer_document_images);
+/* Additive discovery excludes at most 128 live deferred targets. New nodes,
+   CSS and SVG retain the authoritative traversal. Exclusion pointers are
+   borrowed for this synchronous call and never dereferenced by the filter. */
+bool images_load_external_reusing_layout_styles_excluding(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, Budget *budget, const char *base_url,
+    const char *document_url, const char *referrer_policy,
+    size_t maximum_count, size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    struct LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width,
+    lxb_dom_node_t *const *deferred_nodes, size_t deferred_node_count);
 /* Loads a bounded set of nodes already proven visible by provisional layout.
    A subsequent images_load_external() call remains authoritative and
    deduplicates these retained resources while discovering the rest of the
@@ -568,6 +594,9 @@ ImagePriorityLoadJob *images_priority_load_begin_batch(
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session);
 ImagePriorityLoadStatus images_priority_load_pump(
     ImagePriorityLoadJob *job);
+/* Caller must first prove target node liveness. Checks src/srcset selection
+   only after the document mutation generation changes. */
+bool images_priority_load_sources_current(ImagePriorityLoadJob *job);
 /* Advance the job's rollback boundary after the owner has successfully
    rebuilt layout around newly decoded pixels. */
 void images_priority_load_commit_progress(ImagePriorityLoadJob *job);

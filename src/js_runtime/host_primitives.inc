@@ -637,6 +637,98 @@ static bool set_frame_eval_telemetry(JSContext *context, uint64_t count,
     return result >= 0;
 }
 
+static bool frame_realm_prepare(JSContext *caller, ScriptRuntime *host,
+                                size_t slot)
+{
+    if (host->frame_realms[slot].intrinsic_state == 2) return true;
+    JSContext *realm = host->frame_realms[slot].context;
+    if (realm == NULL || host->frame_realms[slot].intrinsic_state != 0) {
+        JS_ThrowTypeError(caller, "frame realm unavailable");
+        return false;
+    }
+    host->frame_realms[slot].intrinsic_state = 1;
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    /* Same order as JS_NewContext, on the original raw global object. These
+       native initializers do not execute author code. A partial failure is
+       terminal: retrying would replace prototypes under retained values. */
+    if (JS_AddIntrinsicDate(realm) || JS_AddIntrinsicStringNormalize(realm)
+        || JS_AddIntrinsicRegExp(realm) || JS_AddIntrinsicJSON(realm)
+        || JS_AddIntrinsicProxy(realm) || JS_AddIntrinsicMapSet(realm)
+        || JS_AddIntrinsicTypedArrays(realm) || JS_AddIntrinsicPromise(realm)
+        || JS_AddIntrinsicWeakRef(realm)) {
+        host->frame_realms[slot].intrinsic_state = 3;
+        JS_RetireContext(realm);
+        JS_Throw(caller, JS_GetException(realm));
+        return false;
+    }
+#endif
+    host->frame_realms[slot].intrinsic_state = 2;
+    return true;
+}
+
+static JSValue js_frame_scope(JSContext *context, JSValueConst this_value,
+                             int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->host == NULL)
+        return JS_ThrowInternalError(context, "frame runtime unavailable");
+    ScriptRuntime *host = bridge->host;
+    for (size_t i = 0; i < SCRIPT_FRAME_REALM_LIMIT; i++) {
+        if (argc != 0) {
+            if (!JS_IsObject(argv[0]) || !host->frame_realms[i].context
+                || JS_VALUE_GET_PTR(argv[0]) !=
+                   JS_VALUE_GET_PTR(host->frame_realms[i].global)) continue;
+            if (argc > 1 && JS_ToBool(context, argv[1]))
+                return frame_realm_prepare(context, host, i)
+                    ? JS_UNDEFINED : JS_EXCEPTION;
+#if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
+            JS_RetireContext(host->frame_realms[i].context);
+#endif
+            JS_FreeValue(host->frame_realms[i].context,
+                         host->frame_realms[i].global);
+            JS_FreeContext(host->frame_realms[i].context);
+            host->frame_realms[i].context = NULL;
+            host->frame_realms[i].global = JS_UNDEFINED;
+            host->frame_realms[i].intrinsic_state = 0;
+            return JS_UNDEFINED;
+        }
+        if (host->frame_realms[i].context != NULL) continue;
+        JSContext *realm =
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+            JS_NewContextRaw(host->runtime);
+#else
+            JS_NewContext(host->runtime);
+#endif
+        if (realm == NULL) return JS_ThrowOutOfMemory(context);
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+        /* BaseObjects defines eval/globalThis and autoinit properties that
+           cannot be installed over the Window bindings. Install this core
+           before exposing the global; defer the remaining intrinsic groups. */
+        if (JS_AddIntrinsicBaseObjects(realm) || JS_AddIntrinsicEval(realm)) {
+            JSValue exception = JS_GetException(realm);
+            JS_FreeContext(realm);
+            return JS_Throw(context, exception);
+        }
+#endif
+        JS_SetContextOpaque(realm, bridge);
+#if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
+        JS_SetDynamicCodeEnabled(realm, bridge->dynamic_code_allowed);
+#endif
+        JSValue global = JS_GetGlobalObject(realm);
+        host->frame_realms[i].context = realm;
+        host->frame_realms[i].global = JS_DupValue(realm, global);
+#if !defined(PSP_BROWSER_BELLARD_QUICKJS)
+        host->frame_realms[i].intrinsic_state = 2;
+#endif
+        return global;
+    }
+    if (argc > 1 && JS_ToBool(context, argv[1]))
+        return JS_ThrowTypeError(context, "frame realm is retired");
+    return argc != 0 ? JS_UNDEFINED
+        : JS_ThrowRangeError(context, "frame realm quota exceeded");
+}
+
 static JSValue js_frame_eval(JSContext *context, JSValueConst this_value,
                              int argc, JSValueConst *argv, int magic,
                              JSValue *function_data)
@@ -673,9 +765,34 @@ static JSValue js_frame_eval(JSContext *context, JSValueConst this_value,
         JS_FreeValue(context, source);
         return JS_EXCEPTION;
     }
-    JSValue arguments[2] = { function_data[1], source };
-    JSValue value = JS_Call(context, function_data[0], JS_UNDEFINED,
-                            2, arguments);
+    JSContext *realm = NULL;
+    for (size_t i = 0; i < SCRIPT_FRAME_REALM_LIMIT; i++) {
+        if (bridge->host->frame_realms[i].context != NULL
+            && JS_VALUE_GET_PTR(bridge->host->frame_realms[i].global)
+                   == JS_VALUE_GET_PTR(function_data[0])) {
+            if (!frame_realm_prepare(context, bridge->host, i)) {
+                JS_FreeValue(context, source);
+                return JS_EXCEPTION;
+            }
+            realm = bridge->host->frame_realms[i].context;
+            break;
+        }
+    }
+    size_t bytes = 0;
+    const char *text = JS_ToCStringLen(context, &bytes, source);
+    JSValue value;
+    if (text == NULL) value = JS_EXCEPTION;
+    else if (realm == NULL)
+        value = JS_ThrowTypeError(context, "frame realm is retired");
+    else {
+        /* A genuine persistent global environment retains live var/lexical
+           bindings and closures. The WindowProxy remains top-level this. */
+        value = JS_EvalThis(realm, function_data[1], text, bytes,
+                            "<frame-eval>", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(value))
+            value = JS_Throw(context, JS_GetException(realm));
+    }
+    if (text != NULL) JS_FreeCString(context, text);
     JS_FreeValue(context, source);
     if (JS_IsException(value)) return value;
     if (!set_frame_eval_telemetry(context, count, source_length,
@@ -692,11 +809,24 @@ static JSValue js_create_frame_eval(JSContext *context,
                                     int argc, JSValueConst *argv)
 {
     (void) this_value;
-    if (argc < 2 || !JS_IsFunction(context, argv[0])
+    if (argc < 2 || !JS_IsObject(argv[0])
         || !JS_IsObject(argv[1])) {
         return JS_ThrowTypeError(context,
                                  "frame eval requires evaluator and scope");
     }
+#if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->host == NULL)
+        return JS_ThrowInternalError(context, "frame runtime unavailable");
+    for (size_t i = 0; i < SCRIPT_FRAME_REALM_LIMIT; i++) {
+        if (bridge->host->frame_realms[i].context != NULL
+            && JS_VALUE_GET_PTR(bridge->host->frame_realms[i].global)
+                   == JS_VALUE_GET_PTR(argv[0])) {
+            JS_SetGlobalThis(bridge->host->frame_realms[i].context, argv[1]);
+            break;
+        }
+    }
+#endif
     JSValue function_data[2] = { argv[0], argv[1] };
     JSValue function = JS_NewCFunctionData(context, js_frame_eval, 1, 0,
                                            2, function_data);

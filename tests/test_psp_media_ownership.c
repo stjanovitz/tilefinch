@@ -225,10 +225,22 @@ int main(void)
     psp_media_slot_publish(&ordered[1], PSP_MEDIA_SLOT_READY);
     CHECK(psp_media_slot_take_index(
               ordered, PSP_MEDIA_SURFACE_SLOTS, PSP_MEDIA_EPOCH_FIRST) == -1);
+    CHECK(!psp_media_slots_wait_for_audio(
+              ordered, PSP_MEDIA_SURFACE_SLOTS, PSP_MEDIA_EPOCH_FIRST, 0u));
     psp_media_slot_publish(&ordered[0], PSP_MEDIA_SLOT_READY);
     CHECK(psp_media_slot_take_index(
               ordered, PSP_MEDIA_SURFACE_SLOTS, PSP_MEDIA_EPOCH_FIRST) == 0);
+    CHECK(psp_media_slots_wait_for_audio(
+              ordered, PSP_MEDIA_SURFACE_SLOTS, PSP_MEDIA_EPOCH_FIRST, 39999u));
+    CHECK(!psp_media_slots_wait_for_audio(
+              ordered, PSP_MEDIA_SURFACE_SLOTS, PSP_MEDIA_EPOCH_FIRST, 40000u));
+    CHECK(!psp_media_slots_wait_for_audio(
+              ordered, PSP_MEDIA_SURFACE_SLOTS, PSP_MEDIA_EPOCH_FIRST, 80000u));
+    CHECK(!psp_media_slots_wait_for_audio(
+              ordered, PSP_MEDIA_SURFACE_SLOTS, PSP_MEDIA_EPOCH_FIRST + 1u, 0u));
     psp_media_slot_publish(&ordered[0], PSP_MEDIA_SLOT_FREE);
+    CHECK(!psp_media_slots_wait_for_audio(
+              ordered, PSP_MEDIA_SURFACE_SLOTS, PSP_MEDIA_EPOCH_FIRST, 0u));
     psp_media_slot_publish(&ordered[1], PSP_MEDIA_SLOT_FREE);
     ordered[0].sequence = 3u;
     ordered[0].pts_us = 120000u;
@@ -238,6 +250,10 @@ int main(void)
     psp_media_slot_publish(&ordered[1], PSP_MEDIA_SLOT_ME_WRITING);
     CHECK(psp_media_slot_take_index(
               ordered, PSP_MEDIA_SURFACE_SLOTS, PSP_MEDIA_EPOCH_FIRST) == 0);
+    ordered[0].epoch = UINT64_C(0x100000001);
+    ordered[1].epoch = UINT64_C(0x100000001);
+    CHECK(psp_media_slots_wait_for_audio(
+              ordered, PSP_MEDIA_SURFACE_SLOTS, UINT64_C(0x100000001), 0u));
 
     SlotStress slots = {0};
     for (unsigned at = 0; at < PSP_MEDIA_SURFACE_SLOTS; at++)

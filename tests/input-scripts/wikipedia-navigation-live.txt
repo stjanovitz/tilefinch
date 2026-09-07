@@ -1,0 +1,17 @@
+# Do not wait for background resources: qualify actual post-paint focus and
+# activation through the normal receiver, not a queued-input acknowledgement.
+wait-page 1
+tap-page down
+tap-page left
+wait-page 1
+mark-page focus-one
+tap-page right
+wait-page 1
+mark-page focus-two
+tap-page left
+wait-page 1
+tap-page cross
+wait-page 2
+mark-page activated
+wait-page 60
+end

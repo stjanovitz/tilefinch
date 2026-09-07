@@ -528,12 +528,14 @@ static bool navigation_build_layout(NavigationSession *session,
     navigation_ensure_layout_reuse(session);
     LayoutReuseStats before = {0}, after = {0};
     layout_reuse_cache_stats(session->page.layout_reuse, &before);
+    layout->performance.cancelled = false;
     bool built = layout_build_context_reuse(
         layout, session->budget, &session->page.document,
         &session->page.stylesheet, fonts, images, &session->viewport,
         session->page.layout_reuse);
     layout_reuse_cache_stats(session->page.layout_reuse, &after);
     navigation_record_layout_reuse(session, &before, &after);
+    session->layout_build_cancelled = !built && layout->performance.cancelled;
     if (built && session->page.layout_reuse != NULL
         && !layout_reuse_cache_can_reuse_mutations(
                session->page.layout_reuse)) {
@@ -633,6 +635,14 @@ static ScriptRuntime *navigation_create_runtime(
 
 static void navigation_attach_layout(NavigationSession *session)
 {
+    if (session != NULL && session->page.deferred_image_targets != NULL) {
+        /* Every adopted layout moves boxes, including the relayout that
+           publishes a batch, so the viewport distances behind the rank are
+           stale after each one. Re-ranking costs one pass over the pending
+           targets plus a sort; it is not amortised to once per scroll. */
+        session->page.deferred_image_rank_valid = false;
+        session->page.image_continuation_pending = true;
+    }
     if (session != NULL && session->page.runtime != NULL) {
         script_runtime_set_layout(session->page.runtime,
                                   &session->page.layout,
@@ -1190,14 +1200,15 @@ static bool navigation_queue_frame_message(void *opaque,
     }
 #if !defined(TILEFINCH_NO_TRACE)
     if (session->page.message_count == NAVIGATION_MESSAGE_LIMIT
-        && getenv("TILEFINCH_TRACE_FRAME_MESSAGES") != NULL) {
+        && (getenv("TILEFINCH_TRACE_FRAME_MESSAGES") != NULL
+            || getenv("TILEFINCH_TRACE_FRAME_MESSAGE_DROPS") != NULL)) {
         fprintf(stderr,
                 "frame-message-rejected reason=queue-full direction=%s "
-                "source=%ld target=%ld json=\"%.2048s\"\n",
+                "source=%ld target=%ld\n",
                 source == session->page.runtime ? "parent-to-child"
                                                 : "child-to-parent",
                 source == session->page.runtime ? 0L : -1L,
-                target_frame_handle, json);
+                target_frame_handle);
     }
 #endif
     if (session->page.message_count == NAVIGATION_MESSAGE_LIMIT) return false;
@@ -1282,7 +1293,12 @@ static bool navigation_queue_frame_message(void *opaque,
             budget_free(session->budget, message->json);
             budget_free(session->budget, message->target_origin);
             memset(message, 0, sizeof(*message));
-            return false;
+            /* WindowProxy creation can precede native iframe discovery by a
+               turn.  Posting to that not-yet-known browsing context is a
+               silent drop, not an internal engine failure exposed to page
+               script. */
+            session->frame_messages_dropped++;
+            return true;
         }
     }
     session->page.message_count++;
@@ -1471,6 +1487,25 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
         } else {
             lifecycle_valid = false;
         }
+        /* A WindowProxy exists before its remote document has finished
+           creating a ScriptRuntime.  postMessage queues a task against that
+           stable browsing-context identity; it must not be mistaken for a
+           message to a vanished target merely because frame loading has not
+           reached runtime creation yet.  Preserve FIFO order by returning
+           the head message to the bounded queue and retrying on a later
+           frame-progress turn.  A loaded frame with no runtime is a genuine
+           non-script target and continues through the ordinary drop path. */
+        if (lifecycle_valid && target_frame != NULL && target == NULL
+            && !target_frame->retired && !target_frame->loaded
+            && target_frame->fetch_pending) {
+            memmove(session->page.messages + 1,
+                    session->page.messages,
+                    session->page.message_count
+                        * sizeof(*session->page.messages));
+            session->page.messages[0] = message;
+            session->page.message_count++;
+            break;
+        }
         bool target_allowed = lifecycle_valid && target != NULL;
         const char *drop_reason = !lifecycle_valid
             ? "lifecycle" : target == NULL ? "target-missing" : NULL;
@@ -1507,9 +1542,13 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
            nested parent's unrelated handle in the top document. */
         long dispatch_source_handle = target_frame == NULL
             ? (nested_top_message ? 0 : source_handle) : 0;
+#if defined(TILEFINCH_NO_TRACE)
+        (void) drop_reason;
+#endif
 #if !defined(TILEFINCH_NO_TRACE)
         if (!target_allowed
-            && getenv("TILEFINCH_TRACE_FRAME_MESSAGES") != NULL) {
+            && (getenv("TILEFINCH_TRACE_FRAME_MESSAGES") != NULL
+                || getenv("TILEFINCH_TRACE_FRAME_MESSAGE_DROPS") != NULL)) {
             fprintf(stderr,
                     "frame-message-dropped sequence=%llu reason=%s "
                     "source=%ld target=%ld\n",
@@ -2213,16 +2252,13 @@ static bool navigation_load_frames_for_context(
             parent_runtime,
             lxb_dom_interface_node(parent_document->html), handles,
             NAVIGATION_FRAME_DISCOVERY_LIMIT, &count)) {
-        if (parent_frame_slot_plus_one != 0) {
-            /* One oversized child document may lose nested-frame discovery,
-               but it must not abort the otherwise healthy top document. */
-            session->frames_failed++;
-            return true;
-        }
-        snprintf(session->last_error, sizeof(session->last_error),
-                 "frame discovery exceeded %u nodes or handle capacity",
-                 NAVIGATION_DOM_TRAVERSAL_NODE_LIMIT);
-        return false;
+        /* An oversized document loses frame discovery for this pass, but a
+           bounded scan overflow must not abort an otherwise healthy runtime
+           advance: the page keeps rendering, and a later mutation retries
+           discovery. This holds for the top document as well as for a
+           nested child. */
+        session->frames_failed++;
+        return true;
     }
     if (count == 0) return true;
     if (parent_frame_slot_plus_one == 0
@@ -2364,10 +2400,21 @@ static bool navigation_load_frames_for_context(
         }
         char cached_hint_tokens[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = {0};
         char cached_hint_origin[BROWSER_ORIGIN_LIMIT] = {0};
-        (void) browser_session_client_hints_get(
-            session->browser_session, frame->url,
-            cached_hint_tokens, sizeof(cached_hint_tokens),
-            cached_hint_origin, sizeof(cached_hint_origin));
+        TilefinchRequestContext frame_hint_context = {
+            .target_url = frame->url,
+            .initiator_url = session->page.document_url,
+            .top_level_url = session->page.document_url,
+            .method = "GET",
+            .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+            .credentials = TILEFINCH_CREDENTIALS_OMIT,
+            .destination = TILEFINCH_DESTINATION_FRAME
+        };
+        if (tilefinch_request_same_site(&frame_hint_context)) {
+            (void) browser_session_client_hints_get(
+                session->browser_session, frame->url,
+                cached_hint_tokens, sizeof(cached_hint_tokens),
+                cached_hint_origin, sizeof(cached_hint_origin));
+        }
         frame->fetch_request_id = navigation_enqueue_frame_fetch(
             session, frame,
             cached_hint_tokens[0] == '\0' ? NULL : cached_hint_tokens,
@@ -2402,9 +2449,23 @@ static bool navigation_load_frames(NavigationSession *session,
 {
     if (session == NULL || session->page.runtime == NULL
         || parent_url == NULL) return true;
-    if (!navigation_load_frames_for_context(
-            session, session->page.runtime, &session->page.document,
-            parent_url, 0)) return false;
+    /* Discovery walks a whole document. Gate each context on its
+       connected-mutation generation so a steady runtime tick that mutated
+       nothing pays one comparison instead of a bounded DOM traversal per
+       context. The stored value is generation + 1: zero means "never
+       walked", so the first pass after commit always runs; a src change or a
+       script-inserted iframe bumps the generation, and parser-appended frames
+       change the node count, either of which re-runs it. */
+    uint64_t observed = session->page.document.content_generation + 1u;
+    size_t observed_nodes = session->page.document.node_count;
+    if (session->page.frame_discovery_generation != observed
+        || session->page.frame_discovery_node_count != observed_nodes) {
+        if (!navigation_load_frames_for_context(
+                session, session->page.runtime, &session->page.document,
+                parent_url, 0)) return false;
+        session->page.frame_discovery_generation = observed;
+        session->page.frame_discovery_node_count = observed_nodes;
+    }
     /* frame_count may grow while walking. Each newly completed child is
        considered exactly once per outer runtime tick, and the fixed table
        supplies the nesting/depth bound. */
@@ -2413,9 +2474,15 @@ static bool navigation_load_frames(NavigationSession *session,
         if (frame->retired || !frame->loaded || frame->runtime == NULL) {
             continue;
         }
+        uint64_t frame_observed = frame->document.content_generation + 1u;
+        size_t frame_observed_nodes = frame->document.node_count;
+        if (frame->discovery_generation == frame_observed
+            && frame->discovery_node_count == frame_observed_nodes) continue;
         if (!navigation_load_frames_for_context(
                 session, frame->runtime, &frame->document, frame->url,
                 i + 1u)) return false;
+        frame->discovery_generation = frame_observed;
+        frame->discovery_node_count = frame_observed_nodes;
     }
     return true;
 }
@@ -2580,15 +2647,18 @@ static bool navigation_complete_frame(NavigationSession *session,
     frame->http_status = fetch->status_code;
     snprintf(frame->server, sizeof(frame->server), "%s", fetch->server);
     snprintf(frame->cf_ray, sizeof(frame->cf_ray), "%s", fetch->cf_ray);
+    char response_referrer_policy[sizeof(frame->referrer_policy)];
+    snprintf(response_referrer_policy, sizeof(response_referrer_policy),
+             "%s", frame->referrer_policy);
     bool referrer_policy_header_present = false;
     if (!fetch_response_referrer_policy(
             fetch, &referrer_policy_header_present,
-            frame->referrer_policy)) {
+            response_referrer_policy)) {
         /* A live/v9 result carries this policy outside the bounded ordinary
            header snapshot. Corrupt direct metadata is a response failure,
            not permission to fall back to a possibly truncated field list. */
         fetched_ok = false;
-        frame->referrer_policy[0] = '\0';
+        response_referrer_policy[0] = '\0';
     }
     TilefinchRequestContext request_context =
         navigation_frame_request_context(session, frame);
@@ -2600,19 +2670,32 @@ static bool navigation_complete_frame(NavigationSession *session,
     }
     const char *effective = fetch->effective_url[0] == '\0'
         ? frame->url : fetch->effective_url;
+    TilefinchRequestContext top_hint_context = {
+        .target_url = effective,
+        .initiator_url = session->page.document_url,
+        .top_level_url = session->page.document_url,
+        .method = "GET",
+        .mode = TILEFINCH_REQUEST_MODE_NO_CORS,
+        .credentials = TILEFINCH_CREDENTIALS_OMIT,
+        .destination = TILEFINCH_DESTINATION_FRAME
+    };
+    bool top_level_hint_eligible =
+        tilefinch_request_same_site(&top_hint_context);
     char prior_hints[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = {0};
     char prior_hint_origin[BROWSER_ORIGIN_LIMIT] = {0};
     char accepted_hints[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = {0};
     char accepted_critical[BROWSER_CLIENT_HINT_TOKEN_LIMIT] = {0};
-    (void) browser_session_client_hints_get(
-        session->browser_session, effective,
-        prior_hints, sizeof(prior_hints),
-        prior_hint_origin, sizeof(prior_hint_origin));
-    bool hints_valid = fetched_ok
+    if (top_level_hint_eligible) {
+        (void) browser_session_client_hints_get(
+            session->browser_session, effective,
+            prior_hints, sizeof(prior_hints),
+            prior_hint_origin, sizeof(prior_hint_origin));
+    }
+    bool hints_valid = fetched_ok && top_level_hint_eligible
         && fetch_accepted_critical_client_hints(
                fetch->accept_ch, fetch->accept_ch,
                accepted_hints, sizeof(accepted_hints));
-    bool critical_valid = fetched_ok
+    bool critical_valid = fetched_ok && top_level_hint_eligible
         && fetch_accepted_critical_client_hints(
                fetch->accept_ch, fetch->critical_ch,
                accepted_critical, sizeof(accepted_critical));
@@ -2670,6 +2753,8 @@ static bool navigation_complete_frame(NavigationSession *session,
         }
         return true;
     }
+    snprintf(frame->referrer_policy, sizeof(frame->referrer_policy), "%s",
+             response_referrer_policy);
     char final_url[NAVIGATION_URL_LIMIT];
     snprintf(final_url, sizeof(final_url), "%s", effective);
     bool final_same_origin = tilefinch_url_same_origin(
@@ -2767,10 +2852,23 @@ static bool navigation_complete_frame(NavigationSession *session,
             session, frame->runtime)) return false;
     if (!ok) {
         session->frames_failed++;
-        return navigation_dispatch_frame_parent_event(
+        navigation_drop_frame_messages(session, frame);
+        frame->fetch_pending = false;
+        frame->loaded = false;
+        frame->retired = true;
+        bool state_ok = script_runtime_set_frame_window_state(
+            frame->parent_runtime, frame->parent_handle, false, false, false,
+            NULL, navigation_frame_parent_result(session, frame));
+        bool event_ok = navigation_dispatch_frame_parent_event(
             session, frame->parent_runtime,
             frame->parent_frame_slot_plus_one,
             frame->element, "error");
+        navigation_frame_presentation_destroy(session, frame);
+        script_runtime_destroy(frame->runtime);
+        frame->runtime = NULL;
+        images_destroy(&frame->images);
+        document_destroy(&frame->document);
+        return state_ok && event_ok;
     }
     frame->loaded = true;
     session->frames_loaded++;

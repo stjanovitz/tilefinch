@@ -187,7 +187,7 @@ static void supervisor_present(const PspUiMediaState *snapshot,
     const uint16_t *front = psp_display_front_buffer(&display);
     memcpy(vram, front,
            PSP_DISPLAY_BUFFER_PIXELS * sizeof(uint16_t));
-    psp_ui_media_composite_controls(
+    psp_ui_media_composite_supervisor_565(
         snapshot, vram, SCREEN_WIDTH, SCREEN_HEIGHT, PSP_DISPLAY_STRIDE);
     /* No decoder frame was acquired during this cooperative acknowledgement;
        the expected picture is the last one actually latched for scanout. */
@@ -403,6 +403,39 @@ int main(void)
             ordinary_present(&ui, identity, (uint16_t) (0x2000u + identity));
     }
     check_window("S4-supervisor-snapshot-interleave", begin);
+
+    /* An open is pumped under supervisor ownership: copying the initial
+       loading frame and repainting only the footer leaves its central 0%
+       unchanged throughout resolution. Compare against the normal painter. */
+    static uint16_t loading[PSP_DISPLAY_BUFFER_PIXELS];
+    static uint16_t expected_loading[PSP_DISPLAY_BUFFER_PIXELS];
+    memset(loading, 0, sizeof(loading));
+    memset(expected_loading, 0, sizeof(expected_loading));
+    psp_ui_media_set_resolving(&ui, "Synthetic video");
+    psp_ui_media_composite(&ui, loading, SCREEN_WIDTH, SCREEN_HEIGHT,
+                           PSP_DISPLAY_STRIDE);
+    psp_ui_media_set_resolving_progress(&ui, "Loading...", 530u);
+    psp_ui_media_composite(&ui, expected_loading, SCREEN_WIDTH, SCREEN_HEIGHT,
+                           PSP_DISPLAY_STRIDE);
+    psp_ui_media_composite_supervisor_565(
+        &ui, loading, SCREEN_WIDTH, SCREEN_HEIGHT, PSP_DISPLAY_STRIDE);
+    if (memcmp(loading, expected_loading, sizeof(loading)) != 0) {
+        fprintf(stderr, "S5-supervisor-loading: progress panel stayed stale\n");
+        failures++;
+    }
+    /* Seeking must still update only the footer, preserving every picture
+       and caption pixel exactly as the flicker fix requires. */
+    memset(loading, 0x65, sizeof(loading));
+    memcpy(expected_loading, loading, sizeof(loading));
+    ui.seek_in_progress = true;
+    psp_ui_media_composite_controls(&ui, expected_loading,
+        SCREEN_WIDTH, SCREEN_HEIGHT, PSP_DISPLAY_STRIDE);
+    psp_ui_media_composite_supervisor_565(&ui, loading,
+        SCREEN_WIDTH, SCREEN_HEIGHT, PSP_DISPLAY_STRIDE);
+    if (memcmp(loading, expected_loading, sizeof(loading)) != 0) {
+        fprintf(stderr, "S6-supervisor-seek: frozen picture changed\n");
+        failures++;
+    }
 
     if (capture_count > CAPTURE_LIMIT) {
         fprintf(stderr, "capture overflow: %zu\n", capture_count);

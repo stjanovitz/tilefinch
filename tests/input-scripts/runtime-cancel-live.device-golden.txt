@@ -1,0 +1,7 @@
+tilefinch-input-script: text-entry=danzeff
+tilefinch-input-script: armed script=input-script.txt steps=7 stall-limit=1800
+tilefinch-input-script: action=focus-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: covered action=focus-down count=1
+tilefinch-input-script: outcome=complete steps=6/7 frames=21 held-frames=2 actions=1 settings=0
+tilefinch-input-script: capture=cancel-ack written=1 size=240x136
+tilefinch-input-script: capture=stopped written=1 size=240x136

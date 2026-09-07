@@ -72,13 +72,10 @@ def checkpoints_for(row: dict) -> list[tuple[str, str, str | None]]:
 
 def checkpoint_commands(kind: str, target: str | None,
                         hydration_selector: str | None = None) -> str:
-    # Scripted references wait for their hydration predicate while allowing
-    # the browser to drain ready work without advancing the replay clock.
-    # The lab command protocol has no predicate-wait primitive, so use a
-    # bounded zero-time settle only for scenarios that declare hydration.
-    # This preserves Date/timer observations while preventing an exact-clock
-    # replay from capturing the pre-hydration shell.
-    settle = "tick 1000 0\n" if hydration_selector else ""
+    # Image work now intentionally continues after interactive commit. All
+    # fidelity checkpoints compare settled content, including top/bottom;
+    # the configured initial tick count alone is not a completion signal.
+    settle = f"drain 2048 {SETTLE_MS}\n"
     if kind == "top" and hydration_selector:
         # The hydration gate rides the top-checkpoint run: the page must
         # produce at least one match for the selector, or the scenario
@@ -87,7 +84,7 @@ def checkpoint_commands(kind: str, target: str | None,
                 f"js document.querySelectorAll({json.dumps(hydration_selector)}).length\n"
                 "status\nquit\n")
     if kind == "top":
-        return "status\nquit\n"
+        return settle + "status\nquit\n"
     if kind == "bottom":
         # Position after the configured replay clock and all initial resource
         # work have completed.  --scroll-bottom runs before that work, so a

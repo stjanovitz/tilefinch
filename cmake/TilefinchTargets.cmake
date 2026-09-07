@@ -494,13 +494,30 @@ if(PSP)
         if(PSP_BROWSER_ENABLE_PSP_VOICE)
             target_sources(psp-browser-script PRIVATE
                 src/psp_voice_input.c
-                src/stt/stt_engine.c)
+                src/stt/stt_component_loader.c)
             target_include_directories(psp-browser-script PRIVATE src/stt)
             target_compile_definitions(
                 psp-browser-script PRIVATE TILEFINCH_HAVE_PSP_VOICE=1)
             target_link_libraries(
                 psp-browser-script PRIVATE
-                tilefinch_voice_frontend tilefinch_pocketsphinx pspaudio)
+                tilefinch_voice_frontend pspaudio)
+            add_custom_target(tilefinch-voice-component-stage
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${TILEFINCH_VOICE_COMPONENT_PRX}"
+                    "$<TARGET_FILE_DIR:psp-browser-script>/tilefinch-voice.prx"
+                DEPENDS tilefinch-voice-component
+                COMMENT "Staging the lazy speech component")
+            add_dependencies(psp-browser-script tilefinch-voice-component-stage)
+            add_executable(psp-voice-component-probe EXCLUDE_FROM_ALL
+                src/stt/stt_component_probe.c src/stt/stt_component_loader.c)
+            target_include_directories(psp-voice-component-probe PRIVATE src/stt)
+            target_link_libraries(psp-voice-component-probe PRIVATE
+                tilefinch_core pspuser pspsdk m)
+            set_target_properties(psp-voice-component-probe PROPERTIES
+                RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/voice-probe")
+            create_pbp_file(TARGET psp-voice-component-probe
+                TITLE "Tilefinch Voice Component Probe")
+            add_dependencies(psp-voice-component-probe tilefinch-voice-component)
         endif()
         if(NOT PSP_BROWSER_CURL_STUB)
             target_sources(psp-browser-script PRIVATE
@@ -803,7 +820,7 @@ if(PSP)
                 tilefinch_psp_app_support tilefinch_diagnostic_qr)
             if(PSP_BROWSER_ENABLE_PSP_VOICE)
                 target_link_libraries(psp-browser-script-dev-prx PRIVATE
-                    tilefinch_voice_frontend tilefinch_pocketsphinx pspaudio)
+                    tilefinch_voice_frontend pspaudio)
             endif()
             if(NOT PSP_BROWSER_CURL_STUB)
                 target_link_libraries(psp-browser-script-dev-prx PRIVATE
@@ -862,6 +879,7 @@ if(PSP)
                 "-DLAUNCHER_EBOOT=${CMAKE_CURRENT_BINARY_DIR}/launcher/EBOOT.PBP"
                 "-DBROWSER_EBOOT=${CMAKE_CURRENT_BINARY_DIR}/EBOOT.PBP"
                 "-DWASM_COMPONENT_PRX=${TILEFINCH_WASM_COMPONENT_PRX}"
+                "-DVOICE_COMPONENT_PRX=${TILEFINCH_VOICE_COMPONENT_PRX}"
                 "-DXMB_REDIRECT_PRX=${CMAKE_CURRENT_BINARY_DIR}/xmb-redirect/tilefinch_xmb.prx"
                 "-DASSET_DIR=${CMAKE_CURRENT_BINARY_DIR}"
                 "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"

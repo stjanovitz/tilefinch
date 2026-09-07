@@ -101,8 +101,10 @@
       const outcome = Number(__tilefinchCanvasRasterRectBatch(
         state.pixels, state.width, state.height, serialized,
       ));
-      if (!outcome) return false;
-      if (outcome === 2) canvasDiagnostics.clippedCommands++;
+      if (outcome !== 1) {
+        if (outcome === 2) canvasDiagnostics.clippedCommands++;
+        return false;
+      }
       canvasDiagnostics.rectangleBatches++;
       state.rectCommands.length = 0;
       return true;
@@ -2018,7 +2020,10 @@
           compositeOperations.indexOf(state.globalCompositeOperation),
         ]);
         canvasDiagnostics.rectangleCommands++;
-        if (state.rectCommands.length >= 64 && !flushRectCommands(state)) return;
+        /* Thirty-two maximum-sized PSP surfaces remain below the native call's
+           all-or-nothing work allowance. This keeps status 2 exceptional and
+           prevents a retained batch from replaying already-blended rects. */
+        if (state.rectCommands.length >= 32 && !flushRectCommands(state)) return;
       }
       scheduleCanvasCommit(state, rect);
     }
@@ -3065,8 +3070,6 @@
     node.setAttribute(name, String(Number(value) >>> 0));
   globalThis.__tilefinchFlushCanvasSurfaces = flushCanvasSurfaces;
   globalThis.__tilefinchCanvasReadbackState = canvasReadbackState;
-  globalThis.__tilefinchCanvasContextKind = (node) =>
-    contextKinds.get(node) || "";
   Object.defineProperty(globalThis, "__tilefinchCanvasDiagnostics", {
     configurable: false,
     enumerable: false,

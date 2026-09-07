@@ -20,8 +20,13 @@ typedef struct {
     const char *file_name;
     const char *source_name;
     const char *bytecode_symbol;
+    /* `source` is the compact text that is embedded and compiled; `original`
+       is the authored file, kept only to verify that compaction preserved
+       the program (see compact_source). */
     char *source;
     size_t source_length;
+    char *original;
+    size_t original_length;
 } BootstrapInput;
 
 #define BOOTSTRAP_SOURCE(source_symbol, file_name, source_name,              \
@@ -61,6 +66,261 @@ static int make_suffix_path(char *output, size_t capacity, const char *path,
     return length > 0 && (size_t) length < capacity;
 }
 
+/*
+ * Compact an authored bootstrap source for embedding.
+ *
+ * The embedded text is consumed by exactly one thing: the source-fallback
+ * compile when bytecode restore is unavailable. Leading indentation, trailing
+ * whitespace and comments cost EBOOT bytes and lexing time there and nothing
+ * else, so they are dropped. Every newline is preserved, which keeps the
+ * line numbers in bootstrap stack traces correct. Strings, template
+ * literals (including their nested `${}` code) and regular-expression
+ * literals are copied byte for byte.
+ *
+ * The scanner is deliberately simple; its regular-expression heuristic
+ * (a `/` after an operator, punctuator or expression keyword starts a
+ * literal) is the classic one. It is safe because the generator refuses to
+ * emit anything unless the bytecode compiled from the compact text is
+ * identical to the bytecode compiled from the authored text once debug
+ * information is stripped from both.
+ */
+typedef enum {
+    SCAN_CODE,
+    SCAN_LINE_COMMENT,
+    SCAN_BLOCK_COMMENT,
+    SCAN_SINGLE_QUOTE,
+    SCAN_DOUBLE_QUOTE,
+    SCAN_TEMPLATE,
+    SCAN_REGEX
+} ScanState;
+
+#define TEMPLATE_NESTING_LIMIT 32
+
+static int is_identifier_byte(unsigned char byte)
+{
+    return (byte >= '0' && byte <= '9') || (byte >= 'A' && byte <= 'Z')
+        || (byte >= 'a' && byte <= 'z') || byte == '_' || byte == '$'
+        || byte >= 0x80;
+}
+
+static int regex_allowed_after(const char *output, size_t length)
+{
+    size_t at = length;
+    while (at > 0 && (output[at - 1] == ' ' || output[at - 1] == '\t'
+                      || output[at - 1] == '\n' || output[at - 1] == '\r'))
+        at--;
+    if (at == 0) return 1;
+    unsigned char previous = (unsigned char) output[at - 1];
+    if (is_identifier_byte(previous)) {
+        size_t start = at;
+        while (start > 0 && is_identifier_byte((unsigned char) output[start - 1]))
+            start--;
+        static const char *const keywords[] = {
+            "return", "typeof", "case", "do", "else", "in", "of", "new",
+            "delete", "void", "throw", "instanceof", "yield", "await"
+        };
+        size_t word_length = at - start;
+        for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+            if (word_length == strlen(keywords[i])
+                && memcmp(output + start, keywords[i], word_length) == 0)
+                return 1;
+        }
+        return 0;
+    }
+    if (previous == ')' || previous == ']' || previous == '}') return 0;
+    return 1;
+}
+
+static void trim_trailing_blanks(char *output, size_t *length)
+{
+    while (*length > 0
+           && (output[*length - 1] == ' ' || output[*length - 1] == '\t'))
+        (*length)--;
+}
+
+static int compact_source(const char *input, size_t length, char **output,
+                          size_t *output_length, const char *name)
+{
+    char *out = malloc(length + 1);
+    if (out == NULL) return 0;
+    size_t used = 0;
+    ScanState state = SCAN_CODE;
+    int at_line_start = 1;
+    int template_depth[TEMPLATE_NESTING_LIMIT];
+    size_t template_nesting = 0;
+    int brace_depth = 0;
+    int regex_in_class = 0;
+    for (size_t i = 0; i < length; i++) {
+        char c = input[i];
+        char next = i + 1 < length ? input[i + 1] : '\0';
+        switch (state) {
+        case SCAN_CODE:
+            if (at_line_start && (c == ' ' || c == '\t')) continue;
+            at_line_start = 0;
+            if (c == '\n') {
+                trim_trailing_blanks(out, &used);
+                out[used++] = c;
+                at_line_start = 1;
+                continue;
+            }
+            if (c == '/' && next == '/') {
+                state = SCAN_LINE_COMMENT;
+                i++;
+                continue;
+            }
+            if (c == '/' && next == '*') {
+                state = SCAN_BLOCK_COMMENT;
+                i++;
+                continue;
+            }
+            if (c == '\'') state = SCAN_SINGLE_QUOTE;
+            else if (c == '"') state = SCAN_DOUBLE_QUOTE;
+            else if (c == '`') state = SCAN_TEMPLATE;
+            else if (c == '/' && regex_allowed_after(out, used)) {
+                state = SCAN_REGEX;
+                regex_in_class = 0;
+            } else if (c == '{') brace_depth++;
+            else if (c == '}') {
+                if (template_nesting != 0
+                    && brace_depth == template_depth[template_nesting - 1]) {
+                    template_nesting--;
+                    state = SCAN_TEMPLATE;
+                } else if (brace_depth > 0) brace_depth--;
+            }
+            out[used++] = c;
+            continue;
+        case SCAN_LINE_COMMENT:
+            if (c == '\n') {
+                trim_trailing_blanks(out, &used);
+                out[used++] = c;
+                at_line_start = 1;
+                state = SCAN_CODE;
+            }
+            continue;
+        case SCAN_BLOCK_COMMENT:
+            if (c == '\n') out[used++] = c;
+            else if (c == '*' && next == '/') {
+                state = SCAN_CODE;
+                i++;
+            }
+            continue;
+        case SCAN_SINGLE_QUOTE:
+        case SCAN_DOUBLE_QUOTE:
+            out[used++] = c;
+            if (c == '\\' && i + 1 < length) {
+                out[used++] = input[++i];
+            } else if ((state == SCAN_SINGLE_QUOTE && c == '\'')
+                       || (state == SCAN_DOUBLE_QUOTE && c == '"')) {
+                state = SCAN_CODE;
+            }
+            continue;
+        case SCAN_TEMPLATE:
+            out[used++] = c;
+            if (c == '\\' && i + 1 < length) {
+                out[used++] = input[++i];
+            } else if (c == '`') {
+                state = SCAN_CODE;
+            } else if (c == '$' && next == '{') {
+                if (template_nesting == TEMPLATE_NESTING_LIMIT) {
+                    fprintf(stderr, "%s: template literal nesting exceeds %d\n",
+                            name, TEMPLATE_NESTING_LIMIT);
+                    free(out);
+                    return 0;
+                }
+                out[used++] = input[++i];
+                template_depth[template_nesting++] = brace_depth;
+                state = SCAN_CODE;
+            }
+            continue;
+        case SCAN_REGEX:
+            out[used++] = c;
+            if (c == '\\' && i + 1 < length) {
+                out[used++] = input[++i];
+            } else if (c == '[') regex_in_class = 1;
+            else if (c == ']') regex_in_class = 0;
+            else if (c == '/' && !regex_in_class) {
+                while (i + 1 < length
+                       && is_identifier_byte((unsigned char) input[i + 1]))
+                    out[used++] = input[++i];
+                state = SCAN_CODE;
+            } else if (c == '\n') {
+                fprintf(stderr, "%s: unterminated regular expression\n", name);
+                free(out);
+                return 0;
+            }
+            continue;
+        }
+    }
+    if (state != SCAN_CODE && state != SCAN_LINE_COMMENT) {
+        fprintf(stderr, "%s: source ends inside a literal or comment\n", name);
+        free(out);
+        return 0;
+    }
+    trim_trailing_blanks(out, &used);
+    out[used] = '\0';
+    *output = out;
+    *output_length = used;
+    return 1;
+}
+
+/* Compile one text without debug information and return its bytecode so two
+   texts can be compared for program identity. */
+static uint8_t *compile_for_identity(JSContext *context, const char *source,
+                                     size_t length, const char *name,
+                                     size_t *bytecode_length)
+{
+    JSValue function = JS_Eval(
+        context, source, length, name,
+        JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(function)) {
+        JSValue exception = JS_GetException(context);
+        const char *message = JS_ToCString(context, exception);
+        fprintf(stderr, "could not compile %s%s%s\n", name,
+                message == NULL ? "" : ": ",
+                message == NULL ? "" : message);
+        if (message != NULL) JS_FreeCString(context, message);
+        JS_FreeValue(context, exception);
+        return NULL;
+    }
+    uint8_t *bytecode = JS_WriteObject(
+        context, bytecode_length, function, JS_WRITE_OBJ_BYTECODE);
+    JS_FreeValue(context, function);
+    return bytecode;
+}
+
+static int verify_compaction(const BootstrapInput *input)
+{
+    JSRuntime *runtime = JS_NewRuntime();
+    if (runtime == NULL) return 0;
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    JS_SetStripInfo(runtime, JS_STRIP_SOURCE | JS_STRIP_DEBUG);
+#endif
+    JSContext *context = JS_NewContext(runtime);
+    int equal = 0;
+    if (context != NULL) {
+        size_t original_length = 0, compact_length = 0;
+        uint8_t *original = compile_for_identity(
+            context, input->original, input->original_length,
+            input->source_name, &original_length);
+        uint8_t *compact = original == NULL ? NULL : compile_for_identity(
+            context, input->source, input->source_length,
+            input->source_name, &compact_length);
+        equal = original != NULL && compact != NULL
+            && original_length == compact_length
+            && memcmp(original, compact, original_length) == 0;
+        if (original != NULL) js_free(context, original);
+        if (compact != NULL) js_free(context, compact);
+        JS_FreeContext(context);
+    }
+    JS_FreeRuntime(runtime);
+    if (!equal) {
+        fprintf(stderr,
+                "compact %s diverges from the authored program; the scanner "
+                "mis-read a literal or comment\n", input->source_name);
+    }
+    return equal;
+}
+
 static int read_source(BootstrapInput *input, const char *source_directory)
 {
     char path[PATH_MAX];
@@ -97,6 +357,24 @@ static int read_source(BootstrapInput *input, const char *source_directory)
         return 0;
     }
     input->source[input->source_length] = '\0';
+    /* Keep the authored text for the identity check and embed the compact
+       form. */
+    input->original = input->source;
+    input->original_length = input->source_length;
+    input->source = NULL;
+    input->source_length = 0;
+    if (!compact_source(input->original, input->original_length,
+                        &input->source, &input->source_length,
+                        input->source_name)
+        || !verify_compaction(input)) {
+        free(input->original);
+        free(input->source);
+        input->original = NULL;
+        input->source = NULL;
+        input->original_length = 0;
+        input->source_length = 0;
+        return 0;
+    }
     return 1;
 }
 
@@ -112,8 +390,11 @@ static void free_sources(void)
 {
     for (size_t i = 0; i < input_count; i++) {
         free(inputs[i].source);
+        free(inputs[i].original);
         inputs[i].source = NULL;
+        inputs[i].original = NULL;
         inputs[i].source_length = 0;
+        inputs[i].original_length = 0;
     }
 }
 
@@ -174,7 +455,7 @@ static int emit_source_file(FILE *output)
         fprintf(output,
                 ";\nconst size_t %s_length = sizeof(%s) - 1;\n"
                 "_Static_assert(sizeof(%s) - 1 <= "
-                "SCRIPT_PSP_STRICT_MAXIMUM_HOST_COMPILE_BYTES,\n"
+                "SCRIPT_BOOTSTRAP_STRICT_MAXIMUM_HOST_COMPILE_BYTES,\n"
                 "               \"%s exceeds strict PSP bootstrap source "
                 "ceiling\");\n",
                 input->source_symbol, input->source_symbol,
@@ -229,10 +510,17 @@ static int emit_bytecode_file(FILE *output)
 {
     JSRuntime *runtime = JS_NewRuntime();
     /* The authored source is embedded separately for the checked fallback
-       path. Do not duplicate it inside every bytecode object; retain line
-       tables so bootstrap exceptions still identify useful source lines. */
+       path, so it is not duplicated inside every bytecode object. Line
+       tables and local-variable names are stripped as well: QuickJS copies
+       both out of ROM into the realm heap on restore, and keeping them cost
+       about 217 KiB of resident bootstrap heap on the 5 MiB device realm
+       (measured 2026-09). Bootstrap exceptions still name the module and the
+       function; for line numbers, run the host with
+       TILEFINCH_DISABLE_BOOTSTRAP_BYTECODE=1, which compiles the embedded
+       source with full debug information. */
 #if defined(PSP_BROWSER_BELLARD_QUICKJS)
-    if (runtime != NULL) JS_SetStripInfo(runtime, JS_STRIP_SOURCE);
+    if (runtime != NULL)
+        JS_SetStripInfo(runtime, JS_STRIP_SOURCE | JS_STRIP_DEBUG);
 #endif
     JSContext *context = runtime == NULL ? NULL : JS_NewContext(runtime);
     if (context == NULL) {

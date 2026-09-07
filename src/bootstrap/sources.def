@@ -50,6 +50,13 @@ BOOTSTRAP_SOURCE(browser_bootstrap_worker, "worker.js",
                  "<browser-worker>", browser_bootstrap_worker_bytecode)
 BOOTSTRAP_SOURCE(browser_bootstrap_wasm, "wasm.js",
                  "<browser-wasm>", browser_bootstrap_wasm_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_capabilities, "capabilities.js",
+                 "<browser-capabilities>",
+                 browser_bootstrap_capabilities_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_frames, "frames.js",
+                 "<browser-frames>", browser_bootstrap_frames_bytecode)
+BOOTSTRAP_SOURCE(browser_bootstrap_intl, "intl.js",
+                 "<browser-intl>", browser_bootstrap_intl_bytecode)
 BOOTSTRAP_DIAGNOSTIC(browser_dpu_diagnostic, "dpu-diagnostic.js",
                      "<dpu-diagnostic>")
 BOOTSTRAP_DIAGNOSTIC(browser_eval_source_diagnostic,

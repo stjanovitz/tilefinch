@@ -41,6 +41,8 @@
 #define LAYOUT_STROKE_SOLID UINT8_C(0)
 #define LAYOUT_STROKE_DASHED UINT8_C(1)
 #define LAYOUT_STROKE_DOTTED UINT8_C(2)
+/* Solid stroke with stable identity for one retained, simple inset shadow. */
+#define LAYOUT_STROKE_FOCUS_INSET UINT8_C(3)
 /* image_fit is otherwise unused by text commands, so the retained underline
    bit costs no display-list bytes on the PSP. */
 #define LAYOUT_TEXT_DECORATION_UNDERLINE UINT8_C(4)
@@ -773,6 +775,9 @@ typedef struct {
     size_t retained_bytes;
     size_t style_hits;
     size_t style_misses;
+    /* Attribution only; zero in ordinary TILEFINCH_NO_TRACE builds. */
+    size_t style_parent_misses;
+    size_t style_evictions;
     size_t intrinsic_hits;
     size_t intrinsic_misses;
     size_t table_row_hits;
@@ -780,6 +785,19 @@ typedef struct {
     size_t scoped_invalidations;
     size_t full_resets;
 } LayoutReuseStats;
+
+/* Exclusive flow attribution; native placement includes unclassified flow
+   work. Timers are compiled out of ordinary PSP builds. */
+typedef enum {
+    LAYOUT_FLOW_OTHER,
+    LAYOUT_FLOW_STYLE,
+    LAYOUT_FLOW_PSEUDO,
+    LAYOUT_FLOW_INTRINSIC,
+    LAYOUT_FLOW_MARGIN,
+    LAYOUT_FLOW_INLINE,
+    LAYOUT_FLOW_COOPERATE,
+    LAYOUT_FLOW_PHASE_COUNT
+} LayoutFlowPhase;
 
 typedef struct {
     uint64_t total_us;
@@ -793,6 +811,8 @@ typedef struct {
     uint64_t style_resolutions;
     uint64_t style_cache_hits;
     uint64_t style_cache_misses;
+    /* Segment proofs reused by inline flow; validation/host builds only. */
+    uint64_t ascii_text_segments;
     uint64_t style_resolve_us;
     uint64_t style_rule_queries;
     uint64_t style_rule_candidates;
@@ -832,6 +852,12 @@ typedef struct {
     size_t resumable_phases;
     size_t resumable_passes;
     uint64_t maximum_resumable_phase_us;
+    uint64_t flow_phase_us[LAYOUT_FLOW_PHASE_COUNT];
+    uint32_t flow_phase_transitions;
+    /* The build stopped because the platform's cooperate hook declined to
+       continue (or a job was cancelled), not because a resource was refused.
+       Owners can retry such a build; a refused build must not be retried. */
+    bool cancelled;
 } LayoutPerformance;
 
 #if UINTPTR_MAX == UINT32_MAX
@@ -1021,6 +1047,11 @@ void layout_build_job_destroy(LayoutBuildJob *job);
 LayoutReuseCache *layout_reuse_cache_create(Budget *budget);
 void layout_reuse_cache_destroy(LayoutReuseCache *cache);
 void layout_reuse_cache_reset(LayoutReuseCache *cache);
+/* Font faces changed in place. Discard all sizing and ch-dependent styles,
+   retain font-independent styles without walk-order eviction until end.
+   Call end after either success or refusal; rollback must then reset cache. */
+void layout_reuse_cache_begin_font_publication(LayoutReuseCache *cache);
+void layout_reuse_cache_end_font_publication(LayoutReuseCache *cache);
 /* Bind retained styles to one immutable stylesheet/font/viewport state.
    Image discovery uses the same binding before resolving nodes, allowing its
    complete document walk to seed the subsequent authoritative layout. */
@@ -1100,14 +1131,14 @@ bool layout_focus_for_node(const LayoutDocument *layout,
                            const lxb_dom_node_t *node,
                            bool *control, size_t *index);
 /*
- * Recolour the one rounded-border display-list command retained for node.
+ * Recolour a rounded border and its optional retained simple inset-shadow slot.
  * This is deliberately narrower than arbitrary paint mutation: callers must
  * first pass style_focus_change_classify(), and dry_run lets a multi-node
  * focus transition prove every patch before changing any command.
  */
 bool layout_apply_focus_border_paint(
     LayoutDocument *layout, const Stylesheet *stylesheet,
-    lxb_dom_node_t *node, const ComputedStyle *style, bool dry_run,
+    lxb_dom_node_t *node, const ComputedStyle *style, bool inset_changed, bool dry_run,
     int *left, int *top, int *right, int *bottom);
 bool layout_scroll_node(LayoutDocument *layout, lxb_dom_node_t *node,
                         int scroll_x, int scroll_y);
@@ -1133,6 +1164,24 @@ void layout_transfer_scroll_state(const LayoutDocument *previous,
 bool layout_positioned_command_escapes_clip(
     const LayoutDocument *layout, size_t command_index,
     const LayoutNodeBox *clip_box);
+/* Stack-owned snapshot for one immutable layout/overflow preparation pass.
+   Excess positioned boxes use the exhaustive path, never a partial index. */
+#define LAYOUT_POSITIONED_CLIP_INDEX_LIMIT 64u
+typedef struct {
+    const LayoutDocument *layout;
+    size_t node_box_count;
+    size_t count;
+    size_t candidates_visited; /* trace-only hot-loop writes */
+    uint32_t boxes[LAYOUT_POSITIONED_CLIP_INDEX_LIMIT];
+    bool complete;
+} LayoutPositionedClipIndex;
+_Static_assert(sizeof(LayoutPositionedClipIndex) <= 320u,
+               "positioned clip lookup must keep its bounded stack footprint");
+void layout_positioned_clip_index_prepare(
+    const LayoutDocument *layout, LayoutPositionedClipIndex *index);
+bool layout_positioned_command_escapes_clip_indexed(
+    const LayoutDocument *layout, size_t command_index,
+    const LayoutNodeBox *clip_box, LayoutPositionedClipIndex *index);
 int layout_node_box_clip_radius_code(
     const LayoutDocument *layout, const LayoutNodeBox *box);
 int layout_node_box_effective_clip_radius_code(

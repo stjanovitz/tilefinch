@@ -131,6 +131,39 @@ bool fetch_prepare_page_request(
     }
 
     storage->request = descriptor->transport;
+    /* Accept-CH is an origin-scoped browsing-session policy, not merely a
+       navigation-retry detail.  Once accepted, matching script, image,
+       stylesheet, frame, and Fetch/XHR requests carry the same bounded hints
+       as the retried navigation.  This also keeps a challenge submission and
+       its post-clearance navigation on one stable request identity. */
+    TilefinchRequestContext top_hint_context = storage->context;
+    top_hint_context.initiator_url = security_context->top_level_url;
+    top_hint_context.initiator_opaque = false;
+    bool top_level_hint_eligible = descriptor->top_level_navigation
+        || (security_context->top_level_url != NULL
+            && tilefinch_request_same_site(&top_hint_context));
+    /* High-entropy hints are derived authority, not a caller-controlled
+       transport option. A cross-site child or subresource must not inherit
+       an explicit hint envelope prepared for another browsing context. */
+    if (!top_level_hint_eligible) {
+        storage->request.send_client_hints = false;
+        storage->request.client_hint_tokens = NULL;
+        storage->request.client_hint_origin = NULL;
+    }
+    if (storage->request.send_low_client_hints
+        && !storage->request.send_client_hints
+        && security_context->session != NULL
+        && top_level_hint_eligible) {
+        const char *hint_tokens = NULL;
+        const char *hint_origin = NULL;
+        if (browser_session_client_hints_peek(
+                security_context->session, descriptor->target_url,
+                &hint_tokens, &hint_origin)) {
+            storage->request.send_client_hints = true;
+            storage->request.client_hint_tokens = hint_tokens;
+            storage->request.client_hint_origin = hint_origin;
+        }
+    }
     storage->request.method = method;
     storage->request.cookie = storage->cookie[0] == '\0'
         ? NULL : storage->cookie;

@@ -38,7 +38,8 @@ typedef struct {
 struct TextBidiParagraph {
     Budget *budget;
     SBAlgorithmRef algorithm;
-    SBParagraphRef paragraph;
+    SBParagraphRef paragraphs[TEXT_BIDI_SEGMENT_LIMIT];
+    size_t paragraph_count;
     TextBidiUnit *units;
     uint32_t *codepoints;
     size_t count;
@@ -374,27 +375,37 @@ TextBidiParagraph *text_bidi_paragraph_create(
         : (base == TEXT_BIDI_BASE_RTL ? 1
            : (base == TEXT_BIDI_BASE_AUTO_RTL
               ? SBLevelDefaultRTL : SBLevelDefaultLTR));
-    if (result->algorithm != NULL) {
-        result->paragraph = SBAlgorithmCreateParagraph(
-            result->algorithm, 0, count, level);
-    }
-    if (result->paragraph != NULL) {
-        const SBLevel *levels = SBParagraphGetLevelsPtr(result->paragraph);
-        for (size_t at = 0; at < count; at++) {
-            result->units[at].level = levels[at];
-            if ((levels[at] & 1u) != 0u) {
+    size_t resolved = 0;
+    while (result->algorithm != NULL && resolved < count
+           && result->paragraph_count < TEXT_BIDI_SEGMENT_LIMIT) {
+        SBParagraphRef segment = SBAlgorithmCreateParagraph(
+            result->algorithm, resolved, count - resolved, level);
+        if (segment == NULL) break;
+        result->paragraphs[result->paragraph_count++] = segment;
+        size_t segment_count = SBParagraphGetLength(segment);
+        if (SBParagraphGetOffset(segment) != resolved || segment_count == 0
+            || segment_count > count - resolved) break;
+        const SBLevel *levels = SBParagraphGetLevelsPtr(segment);
+        for (size_t local = 0; local < segment_count; local++) {
+            size_t at = resolved + local;
+            result->units[at].level = levels[local];
+            if ((levels[local] & 1u) != 0u) {
                 SBCodepoint mirrored = SBCodepointGetMirror(
                     result->units[at].codepoint);
                 if (mirrored != 0)
                     result->units[at].shaped_codepoint = mirrored;
             }
         }
-        arabic_shape(result);
+        resolved += segment_count;
     }
+    bool segment_limit = resolved < count
+        && result->paragraph_count == TEXT_BIDI_SEGMENT_LIMIT;
+    if (resolved == count) arabic_shape(result);
     bidi_allocator_leave(previous);
-    if (result->paragraph == NULL) {
+    if (resolved != count) {
         text_bidi_paragraph_destroy(result);
-        if (status != NULL) *status = TEXT_BIDI_OUT_OF_MEMORY;
+        if (status != NULL) *status = segment_limit
+            ? TEXT_BIDI_LIMIT_EXCEEDED : TEXT_BIDI_OUT_OF_MEMORY;
         return NULL;
     }
     if (status != NULL) *status = TEXT_BIDI_OK;
@@ -406,8 +417,8 @@ void text_bidi_paragraph_destroy(TextBidiParagraph *paragraph)
     if (paragraph == NULL) return;
     SBAllocatorRef previous = bidi_allocator_enter(&paragraph->allocator);
     if (previous == NULL && active_allocator != &paragraph->allocator) return;
-    if (paragraph->paragraph != NULL)
-        SBParagraphRelease(paragraph->paragraph);
+    for (size_t i = 0; i < paragraph->paragraph_count; i++)
+        SBParagraphRelease(paragraph->paragraphs[i]);
     if (paragraph->algorithm != NULL)
         SBAlgorithmRelease(paragraph->algorithm);
     bidi_allocator_leave(previous);
@@ -421,8 +432,8 @@ size_t text_bidi_paragraph_count(const TextBidiParagraph *paragraph)
 
 unsigned text_bidi_paragraph_level(const TextBidiParagraph *paragraph)
 {
-    return paragraph == NULL || paragraph->paragraph == NULL ? 0
-        : SBParagraphGetBaseLevel(paragraph->paragraph);
+    return paragraph == NULL || paragraph->paragraph_count == 0 ? 0
+        : SBParagraphGetBaseLevel(paragraph->paragraphs[0]);
 }
 
 const TextBidiUnit *text_bidi_paragraph_units(
@@ -445,22 +456,35 @@ bool text_bidi_line_visual_order(
     SBAllocatorRef previous = bidi_allocator_enter(&paragraph->allocator);
     if (previous == NULL && active_allocator != &paragraph->allocator)
         return false;
-    SBLineRef line = SBParagraphCreateLine(
-        paragraph->paragraph, line_start, line_count);
-    if (line == NULL) {
-        bidi_allocator_leave(previous);
-        return false;
-    }
     size_t output = 0;
-    size_t runs = SBLineGetRunCount(line);
-    if (runs <= TEXT_BIDI_RUN_LIMIT) {
+    size_t runs = 0;
+    bool okay = true;
+    for (size_t segment = 0; segment < paragraph->paragraph_count; segment++) {
+        SBParagraphRef part = paragraph->paragraphs[segment];
+        size_t start = SBParagraphGetOffset(part);
+        size_t end = start + SBParagraphGetLength(part);
+        if (end <= line_start) continue;
+        if (start >= line_start + line_count) break;
+        if (start < line_start) start = line_start;
+        if (end > line_start + line_count) end = line_start + line_count;
+        SBLineRef line = SBParagraphCreateLine(part, start, end - start);
+        if (line == NULL) { okay = false; break; }
+        size_t part_runs = SBLineGetRunCount(line);
+        if (part_runs > TEXT_BIDI_RUN_LIMIT - runs) {
+            SBLineRelease(line);
+            runs = TEXT_BIDI_RUN_LIMIT + 1u;
+            okay = false;
+            break;
+        }
+        runs += part_runs;
         const SBRun *run_data = SBLineGetRunsPtr(line);
-        for (size_t run = 0; run < runs; run++) {
+        for (size_t run = 0; run < part_runs; run++) {
             size_t start = run_data[run].offset;
             size_t count = run_data[run].length;
             if (start < line_start || count > line_count
-                || start - line_start > line_count - count) {
-                output = 0;
+                || start - line_start > line_count - count
+                || count > line_count - output) {
+                okay = false;
                 break;
             }
             if ((run_data[run].level & 1u) != 0u) {
@@ -484,9 +508,10 @@ bool text_bidi_line_visual_order(
                     visual_to_logical[output++] = (uint16_t) (start + at);
             }
         }
+        SBLineRelease(line);
+        if (!okay) break;
     }
-    SBLineRelease(line);
     bidi_allocator_leave(previous);
     if (run_count != NULL) *run_count = runs;
-    return output == line_count && runs <= TEXT_BIDI_RUN_LIMIT;
+    return okay && output == line_count && runs <= TEXT_BIDI_RUN_LIMIT;
 }

@@ -108,11 +108,18 @@ generated tree. Never edit `generated.sha256` by hand.
 
 Both host and PSP builds make `tilefinch_core` depend on
 `check_tilefinch_bootstrap_generated`, so a stale artifact fails the *next* core
-build either way. The difference is what each can check: a host build re-runs
-the bytecode generator in `--check` mode *and* verifies the manifest, while the
+build either way. The difference is what each can check: a host build checks
+bytecode through the generator's `--check` mode (with content-keyed reuse as
+described below) *and* verifies the manifest, while the
 PSP build cannot run a host QuickJS generator through the cross toolchain and
 therefore verifies the manifest only. A hand-edited manifest would pass the
 PSP gate and is exactly what the host gate exists to catch.
+
+The host build hashes the complete source/artifact set on every invocation.
+It may reuse a successful bytecode comparison only when the manifest contents,
+generator executable, and verification implementation are unchanged. The
+`tilefinch-bootstrap-generated-check` CTest remains an unconditional regeneration
+and comparison. Never replace this content identity with timestamp-only stamps.
 
 ## The fidelity scoreboard and its floors
 

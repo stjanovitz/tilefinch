@@ -209,8 +209,11 @@ size_t script_runtime_collect_and_trim(ScriptRuntime *runtime)
        1.5x heuristic from post-collection live usage, retaining at least the
        dependency's default 256 KiB growth window and a bounded pre-limit
        reserve. */
-    return script_runtime_collect_and_trim_phase(
+    size_t reclaimed = script_runtime_collect_and_trim_phase(
         runtime, SCRIPT_RUNTIME_COLLECT_TRIM);
+    /* The collection above may have finalized the last instance. */
+    js_wasm_release_idle_runtime();
+    return reclaimed;
 }
 
 size_t js_rt_prepare_network_response_delivery(ScriptRuntime *runtime,

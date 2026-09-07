@@ -431,6 +431,43 @@ static int test_web_runtime(void)
     CHECK(budget.current == 0);
 
     puts("test: opaque viewport canvas publishes without viewport tile rebuild");
+    {
+        puts("test: retained inset ring paint synchronizes scaled visual commands");
+        DrawCommand ring = {.type = DRAW_STROKE_RECT, .x = 0, .y = 0,
+            .width = 16, .height = 16, .radius = 2, .scale = 1,
+            .opacity_scale = 0, .image_fit = LAYOUT_STROKE_FOCUS_INSET};
+        LayoutDocument layout = {.budget = &budget, .commands = &ring,
+            .count = 1, .width = 16, .scroll_width = 16, .height = 16,
+            .page_background = 0xffffff};
+        CHECK(viewport_context_init(&layout.viewport, 16, 16, 8, 8));
+        TileCache retained = {0}, fresh = {0};
+        uint16_t retained_pixels[64] = {0}, fresh_pixels[64] = {0};
+        CHECK(tile_cache_init(&retained, &budget, &layout, 1)
+              && retained.owns_visual_layout
+              && tile_cache_set_frame(&retained, retained_pixels, 64)
+              && tile_cache_render_frame(&retained, 0, 8, 8, NULL));
+        ring.color = 0x3366cc;
+        ring.opacity_scale = 256;
+        ring.scale = 3;
+        CHECK(tile_cache_sync_layout_paint(&retained, 0, 0, 16, 16)
+              && retained.layout->commands[0].scale == 2
+              && tile_cache_render_frame(&retained, 0, 8, 8, NULL)
+              && tile_cache_init(&fresh, &budget, &layout, 1)
+              && tile_cache_set_frame(&fresh, fresh_pixels, 64)
+              && tile_cache_render_frame(&fresh, 0, 8, 8, NULL)
+              && memcmp(retained_pixels, fresh_pixels, sizeof(fresh_pixels)) == 0);
+        tile_cache_destroy(&fresh);
+        ring.opacity_scale = 0;
+        CHECK(tile_cache_sync_layout_paint(&retained, 0, 0, 16, 16)
+              && tile_cache_render_frame(&retained, 0, 8, 8, NULL)
+              && tile_cache_init(&fresh, &budget, &layout, 1)
+              && tile_cache_set_frame(&fresh, fresh_pixels, 64)
+              && tile_cache_render_frame(&fresh, 0, 8, 8, NULL)
+              && memcmp(retained_pixels, fresh_pixels, sizeof(fresh_pixels)) == 0);
+        tile_cache_destroy(&fresh);
+        tile_cache_destroy(&retained);
+        CHECK(budget.current == 0);
+    }
     static unsigned char canvas_fast_pixels[2 * 2 * 4];
     for (size_t pixel = 0; pixel < 2u * 2u; pixel++) {
         canvas_fast_pixels[pixel * 4u] = 0x18;
@@ -1286,7 +1323,7 @@ static int test_web_runtime(void)
         "<div id=sibling-clip-row><div id=sibling-clip>FIELD</div>"
         "<div id=sibling-positioned><input id=sibling-hit type=submit>"
         "<span id=sibling-mark></span></div></div></body>";
-    NavigationSession geometry_navigation;
+    static NavigationSession geometry_navigation;
     CHECK(navigation_init(&geometry_navigation, &budget, 4));
     navigation_enable_scripts(&geometry_navigation, 3 * MIB, 1000);
     uint64_t geometry_generation = navigation_begin(&geometry_navigation);
@@ -1404,6 +1441,57 @@ static int test_web_runtime(void)
             &geometry_navigation.page.layout, i, sibling_clip_box);
     }
     CHECK(sibling_command_count != 0 && sibling_escapes_clip);
+    LayoutPositionedClipIndex clip_index;
+    layout_positioned_clip_index_prepare(
+        &geometry_navigation.page.layout, &clip_index);
+    CHECK(clip_index.complete && clip_index.count != 0
+          && clip_index.count < geometry_navigation.page.layout.node_box_count);
+    const LayoutNodeBox *clip_probes[] = {
+        non_containing_clip_box, clip_root_box, sibling_clip_box
+    };
+    for (size_t i = 0; i < geometry_navigation.page.layout.count; i++) {
+        for (size_t p = 0; p < sizeof(clip_probes) / sizeof(clip_probes[0]); p++) {
+            CHECK(layout_positioned_command_escapes_clip_indexed(
+                      &geometry_navigation.page.layout, i, clip_probes[p],
+                      &clip_index)
+                  == layout_positioned_command_escapes_clip(
+                      &geometry_navigation.page.layout, i, clip_probes[p]));
+        }
+    }
+    /* Deterministic work ceiling: do not scan every ordinary box for each
+       command/clip pair. Reverting to the exhaustive path fails this. */
+    CHECK(clip_index.candidates_visited
+          == clip_index.count * geometry_navigation.page.layout.count * 3u);
+    LayoutNodeBox excess_positioned[LAYOUT_POSITIONED_CLIP_INDEX_LIMIT + 1u];
+    for (size_t i = 0; i < LAYOUT_POSITIONED_CLIP_INDEX_LIMIT + 1u; i++) {
+        excess_positioned[i] = (LayoutNodeBox) {
+            .node = sibling_clip_box->node, .command_start = 0,
+            .command_end = 4, .positioned_ancestor_distance = 1
+        };
+    }
+    /* The winning disjoint owner is beyond the index cap. A partial index
+       would incorrectly clip it; overflow must preserve exhaustive lookup. */
+    excess_positioned[LAYOUT_POSITIONED_CLIP_INDEX_LIMIT] = (LayoutNodeBox) {
+        .node = sibling_positioned_box->node, .command_start = 0,
+        .command_end = 1, .positioned_ancestor_distance = 1
+    };
+    LayoutDocument excess_layout = {
+        .node_boxes = excess_positioned,
+        .node_box_count = LAYOUT_POSITIONED_CLIP_INDEX_LIMIT + 1u
+    };
+    layout_positioned_clip_index_prepare(&excess_layout, &clip_index);
+    CHECK(!clip_index.complete
+          && layout_positioned_command_escapes_clip_indexed(
+              &excess_layout, 0, sibling_clip_box, &clip_index));
+    excess_layout.node_box_count--;
+    layout_positioned_clip_index_prepare(&excess_layout, &clip_index);
+    CHECK(clip_index.complete
+          && clip_index.count == LAYOUT_POSITIONED_CLIP_INDEX_LIMIT
+          && !layout_positioned_command_escapes_clip_indexed(
+              &excess_layout, 0, sibling_clip_box, &clip_index));
+    excess_layout.node_box_count++;
+    CHECK(layout_positioned_command_escapes_clip_indexed(
+        &excess_layout, 0, sibling_clip_box, &clip_index));
     CHECK(shell_box != NULL && second_box != NULL
           && shell_box->width == 248 && shell_box->height >= 90
           && shell_box->content_height > shell_box->height

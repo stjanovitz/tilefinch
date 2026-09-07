@@ -1,0 +1,18 @@
+# Live page qualification: use --url https://en.wikipedia.org/wiki/Main_Page.
+# Readiness-gated first input, then taps through ordinary runtime work.
+# Capture page/focus state; network content is not a pixel golden.
+# Busy-frame counts do not distinguish runtime from navigation/raster work.
+# wait-live counts sampled frames, not wall-clock time. Use runtime-input-live
+# for deterministic post-load runtime coverage, not this network smoke alone.
+wait 2
+mark opened
+tap down
+wait-live 30
+tap-live down
+wait-live 30
+tap-live down
+mark-live focused
+wait-live 90
+tap-live up
+mark-live returned
+end

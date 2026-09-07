@@ -2,6 +2,15 @@
     budget_init(&budget, 16 * MIB);
     budget_install_lexbor(&budget);
 
+    CHECK(test_flow_profile_exclusive_scopes(&budget) == 0);
+    CHECK(test_layout_elapsed_input_checkpoint(&budget) == 0);
+    CHECK(test_font_publication_style_reuse(&budget) == 0);
+    CHECK(test_font_publication_preserves_retained_tail(&budget) == 0);
+    CHECK(test_text_run_scan_reuse(&budget) == 0);
+
+    puts("test: complete node-box indexes prove absence without a scan");
+    CHECK(test_node_box_index_absence(&budget) == 0);
+
     puts("test: bounded deep block, inline, and intrinsic layout stacks");
     CHECK(test_reuse_rejects_same_address_stylesheet_rebuild(&budget) == 0);
     CHECK(test_reuse_preserves_generation_across_stylesheet_move(&budget)
@@ -171,6 +180,8 @@
 
     puts("test: generated content counters and list markers");
     CHECK(test_generated_content_counters_and_markers(&budget) == 0);
+    CHECK(test_generated_counter_analysis_is_shared(&budget) == 0);
+    CHECK(test_overflow_index_uses_nearby_bands(&budget) == 0);
 
     puts("test: font math uses inherited em and computed root rem bases");
     CHECK(test_font_relative_math_bases(&budget) == 0);

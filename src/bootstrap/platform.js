@@ -35,7 +35,8 @@
     trustedUint8ArraySet = Function.call.bind(Uint8Array.prototype.set),
     trustedStringSplit = Function.call.bind(String.prototype.split),
     trustedStringIndexOf = Function.call.bind(String.prototype.indexOf),
-    trustedArrayJoin = Function.call.bind(Array.prototype.join);
+    trustedArrayJoin = Function.call.bind(Array.prototype.join),
+    trustedFunctionApply = Function.call.bind(Function.prototype.apply);
   const trustedStringLower = Function.call.bind(String.prototype.toLowerCase);
   const trustedStringSlice = Function.call.bind(String.prototype.slice);
   const trustedCharCodeAt = Function.call.bind(String.prototype.charCodeAt);
@@ -2742,6 +2743,7 @@
     enumerable: false,
     writable: false,
     value: Object.freeze({
+      apply: trustedFunctionApply,
       charCodeAt: trustedCharCodeAt,
       indexOf: trustedStringIndexOf,
       join: trustedArrayJoin,
@@ -2750,42 +2752,121 @@
       split: trustedStringSplit,
     }),
   });
-  const cloneWorkerValue = (value, depth = 0) => {
-    if (depth > 8) throw new RangeError("worker message nesting limit");
+  /* Structured clone with a memory map: shared references stay shared,
+     cycles are preserved, and every unsupported value is a DataCloneError.
+     Bounds are on the total number of values and the number of distinct
+     objects, so a wide shallow message and a deep narrow one both fail
+     predictably instead of exhausting the 5 MiB realm. */
+  const cloneError = (message) => {
+    const DOMExceptionType = globalThis.DOMException;
+    return typeof DOMExceptionType === "function"
+      ? new DOMExceptionType(message, "DataCloneError")
+      : new TypeError(message);
+  };
+  const cloneErrorTypes = () => ({
+    EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError,
+  });
+  const cloneWorkerValueInternal = (value, state, depth) => {
+    if (state.remaining-- <= 0)
+      throw cloneError("worker message value limit");
     if (
       value === null ||
       typeof value === "string" ||
       typeof value === "number" ||
       typeof value === "boolean" ||
-      typeof value === "undefined"
+      typeof value === "undefined" ||
+      typeof value === "bigint"
     )
       return value;
-    if (value instanceof ArrayBuffer) return value.slice(0);
-    if (value instanceof DataView) {
-      const buffer = value.buffer.slice(0);
-      return new DataView(buffer, value.byteOffset, value.byteLength);
+    if (typeof value === "function" || typeof value === "symbol")
+      throw cloneError("value could not be cloned");
+    const memory = state.memory;
+    if (memory.has(value)) return memory.get(value);
+    /* Worker realms have their own intrinsics, so classify by the internal
+       tag rather than instanceof against this realm's constructors. */
+    const tag = Object.prototype.toString.call(value);
+    if (depth > 64) throw cloneError("worker message nesting limit");
+    if (memory.size >= 16384) throw cloneError("worker message object limit");
+    const remember = (copy) => {
+      memory.set(value, copy);
+      return copy;
+    };
+    const clone = (item) => cloneWorkerValueInternal(item, state, depth + 1);
+    if (tag === "[object ArrayBuffer]") return remember(value.slice(0));
+    if (tag === "[object DataView]") {
+      const buffer = clone(value.buffer);
+      return remember(new DataView(buffer, value.byteOffset, value.byteLength));
     }
-    if (ArrayBuffer.isView(value)) return new value.constructor(value);
+    if (ArrayBuffer.isView(value)) {
+      /* Views over one buffer keep sharing the cloned buffer. */
+      const buffer = clone(value.buffer);
+      return remember(
+        new value.constructor(buffer, value.byteOffset, value.length),
+      );
+    }
     const cloneWasmModule = globalThis.__tilefinchCloneWasmModule;
     if (typeof cloneWasmModule === "function") {
       const module = cloneWasmModule(value);
-      if (module !== null) return module;
+      if (module !== null) return remember(module);
     }
-    if (Array.isArray(value)) {
-      if (value.length > 1024)
-        throw new RangeError("worker message item limit");
-      return value.map((item) => cloneWorkerValue(item, depth + 1));
+    if (tag === "[object Date]") return remember(new Date(value.getTime()));
+    if (tag === "[object RegExp]")
+      return remember(new RegExp(value.source, value.flags));
+    if (
+      tag === "[object Boolean]" ||
+      tag === "[object Number]" ||
+      tag === "[object String]"
+    )
+      return remember(Object(value.valueOf()));
+    if (tag === "[object Error]") {
+      const ErrorType = cloneErrorTypes()[String(value.name)] || Error;
+      const copy = new ErrorType(String(value.message));
+      try {
+        if (typeof value.stack === "string") copy.stack = value.stack;
+      } catch (_) {}
+      return remember(copy);
     }
-    if (Object.getPrototypeOf(value) === Object.prototype) {
-      const copy = {};
-      const keys = Object.keys(value);
-      if (keys.length > 128) throw new RangeError("worker message key limit");
-      for (const key of keys)
-        copy[key] = cloneWorkerValue(value[key], depth + 1);
+    if (tag === "[object Map]" && typeof value.entries === "function") {
+      const copy = remember(new Map());
+      let count = 0;
+      for (const [key, item] of value) {
+        if (++count > 1024) throw cloneError("worker message item limit");
+        copy.set(clone(key), clone(item));
+      }
       return copy;
     }
-    throw new TypeError("unsupported worker message value");
+    if (tag === "[object Set]" && typeof value.values === "function") {
+      const copy = remember(new Set());
+      let count = 0;
+      for (const item of value) {
+        if (++count > 1024) throw cloneError("worker message item limit");
+        copy.add(clone(item));
+      }
+      return copy;
+    }
+    if (Array.isArray(value)) {
+      if (value.length > 1024) throw cloneError("worker message item limit");
+      const copy = remember(new Array(value.length));
+      for (let index = 0; index < value.length; index++)
+        if (index in value) copy[index] = clone(value[index]);
+      return copy;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (
+      tag === "[object Object]" &&
+      (prototype === null || Object.getPrototypeOf(prototype) === null)
+    ) {
+      const copy = remember({});
+      const keys = Object.keys(value);
+      if (keys.length > 128) throw cloneError("worker message key limit");
+      for (const key of keys) copy[key] = clone(value[key]);
+      return copy;
+    }
+    throw cloneError("unsupported worker message value");
   };
+  const cloneWorkerValue = (value) =>
+    cloneWorkerValueInternal(
+      value, { memory: new Map(), remaining: 262144 }, 0);
   globalThis.__tilefinchCloneWorkerValue = cloneWorkerValue;
   if (globalThis.structuredClone === undefined)
     globalThis.structuredClone = (value) => cloneWorkerValue(value);
@@ -3321,6 +3402,8 @@
               this.__detachedAttributeNodes.push(attribute);
             }
             attribute.__tilefinchAttributeValue = String(value);
+            if (name === "style")
+              globalThis.__tilefinchInvalidateDetachedStyle?.(this);
             globalThis.__tilefinchCustomElementAttributeChanged?.(
               this,
               name,
@@ -3371,6 +3454,8 @@
             attribute.__tilefinchAttributeLocalName = localName;
             attribute.__tilefinchAttributePrefix = prefix;
             attribute.__tilefinchAttributeValue = String(value);
+            if (namespace === null && localName === "style")
+              globalThis.__tilefinchInvalidateDetachedStyle?.(this);
             globalThis.__tilefinchCustomElementAttributeChanged?.(
               this,
               localName,
@@ -3398,6 +3483,8 @@
             if (at >= 0) {
               const [attribute] = this.__detachedAttributeNodes.splice(at, 1);
               attribute.__tilefinchAttributeOwner = null;
+              if (name === "style")
+                globalThis.__tilefinchInvalidateDetachedStyle?.(this);
               globalThis.__tilefinchCustomElementAttributeChanged?.(
                 this,
                 attribute.localName,
@@ -3421,6 +3508,8 @@
             if (at >= 0) {
               const [attribute] = this.__detachedAttributeNodes.splice(at, 1);
               attribute.__tilefinchAttributeOwner = null;
+              if (namespace === null && localName === "style")
+                globalThis.__tilefinchInvalidateDetachedStyle?.(this);
               globalThis.__tilefinchCustomElementAttributeChanged?.(
                 this,
                 attribute.localName,
@@ -3540,7 +3629,6 @@
             __detachedParent: { value: null, writable: true },
             __detachedAttributes: { value: new Map() },
             __detachedAttributeNodes: { value: [], writable: true },
-            style: { value: {} },
           });
           return node;
         },
@@ -4723,9 +4811,6 @@
           ) {
             state.seeking = false;
             this.dispatchEvent(new Event("seeked"));
-          } else {
-            globalThis.__tilefinchActiveMediaNode = this;
-            globalThis.__tilefinchActiveMediaState = state;
           }
         },
       },
@@ -4875,8 +4960,6 @@
       const source = this.currentSrc;
       if (source && __tilefinchRequestMedia(this.__handle, 0, source, 0)) {
         state.networkState = HTMLMediaElement.NETWORK_LOADING;
-        globalThis.__tilefinchActiveMediaNode = this;
-        globalThis.__tilefinchActiveMediaState = state;
       } else {
         state.networkState = source
           ? HTMLMediaElement.NETWORK_NO_SOURCE
@@ -4902,16 +4985,11 @@
         this.dispatchEvent(new Event("play"));
         this.dispatchEvent(new Event("waiting"));
       }
-      globalThis.__tilefinchActiveMediaNode = this;
-      globalThis.__tilefinchActiveMediaState = state;
       return Promise.resolve();
     };
     HTMLMediaElement.prototype.pause = function () {
       const state = stateFor(this);
-      if (__tilefinchRequestMedia(this.__handle, 2, this.currentSrc, 0)) {
-        globalThis.__tilefinchActiveMediaNode = this;
-        globalThis.__tilefinchActiveMediaState = state;
-      }
+      __tilefinchRequestMedia(this.__handle, 2, this.currentSrc, 0);
       if (!state.paused) {
         state.paused = true;
         this.dispatchEvent(new Event("pause"));
@@ -5205,7 +5283,13 @@
         item.signal.removeEventListener("abort", item.abort);
       } catch (_) {}
   };
-  globalThis.__tilefinchInvokeListenerList = (map, target, event, capture) => {
+  globalThis.__tilefinchInvokeListenerList = (
+    map,
+    target,
+    event,
+    capture,
+    errorObserver = null,
+  ) => {
     const list = map.get(String(event.type)) || [];
     for (const item of [...list]) {
       if (!item.active || item.capture !== capture) continue;
@@ -5229,6 +5313,8 @@
           );
         }
       } catch (error) {
+        if (typeof errorObserver === "function")
+          try { errorObserver(error, item, list); } catch (_) {}
         __tilefinchReportUncaught(error, "event " + event.type);
       } finally {
         event.__passive = false;
@@ -5655,9 +5741,31 @@
       return document.querySelectorAll("script");
     },
   });
+  let cachedDocumentStyleSheets = null,
+    cachedDocumentStyleSheetsGeneration = -1;
   Object.defineProperty(document, "styleSheets", {
     get() {
-      return document.querySelectorAll("style,link[rel=stylesheet]");
+      const generation = Number(
+        globalThis.__tilefinchStyleSheetGeneration?.() || 0,
+      );
+      if (
+        cachedDocumentStyleSheets &&
+        cachedDocumentStyleSheetsGeneration === generation
+      )
+        return cachedDocumentStyleSheets;
+      const nodes = document.querySelectorAll("style,link"),
+        sheets = [];
+      for (let index = 0; index < nodes.length; index++) {
+        if (nodes[index].hasAttribute("data-tilefinch-constructed")) continue;
+        const sheet = nodes[index].sheet;
+        if (sheet) sheets.push(sheet);
+      }
+      Object.defineProperty(sheets, "item", {
+        value(index) { return this[index] || null; },
+      });
+      cachedDocumentStyleSheets = sheets;
+      cachedDocumentStyleSheetsGeneration = generation;
+      return cachedDocumentStyleSheets;
     },
   });
   document.referrer = "";
@@ -5791,12 +5899,6 @@
         throw new DOMException("Invalid target origin", "SyntaxError");
       return parsed.origin;
     };
-  Object.defineProperty(globalThis, "__tilefinchNormalizeTargetOrigin", {
-    configurable: false,
-    enumerable: false,
-    writable: false,
-    value: normalizePostMessageTarget,
-  });
   Object.defineProperty(globalThis, "__tilefinchPostParentMessage", {
     configurable: false,
     enumerable: false,
@@ -5831,371 +5933,23 @@
       );
     },
   });
-  const frameSandboxPolicy = (element) => {
-      const value = element?.getAttribute?.("sandbox");
-      if (value === null || value === undefined)
-        return { present: false, scripts: true, sameOrigin: true };
-      const raw = String(value);
-      if (raw.length > 1024)
-        return { present: true, scripts: false, sameOrigin: false };
-      const text = trustedStringLower(raw);
-      let scripts = false,
-        sameOrigin = false,
-        at = 0;
-      const whitespace = (index) => {
-        const code = trustedCharCodeAt(text, index);
-        return code === 9 || code === 10 || code === 12 || code === 13 || code === 32;
-      };
-      while (at < text.length) {
-        while (at < text.length && whitespace(at)) at++;
-        const start = at;
-        while (at < text.length && !whitespace(at)) at++;
-        const token = trustedStringSlice(text, start, at);
-        if (token === "allow-scripts") scripts = true;
-        else if (token === "allow-same-origin") sameOrigin = true;
-      }
-      return {
-        present: true,
-        scripts,
-        sameOrigin,
-      };
-    },
-    /* Compile this trusted scope evaluator while the bootstrap is being
-       installed. CSP arms QuickJS's native dynamic-code gate before author
-       script begins, so constructing it lazily during iframe setup would
-       incorrectly break even script-disabled frames. The native wrapper
-       still checks the page's non-writable CSP decision on every call. */
-    /* A call through an `execute` parameter is indirect eval and therefore
-       runs in the owner global. Keep a private scope facade whose `eval`
-       property is the captured intrinsic; the syntactic eval call below then
-       has direct-eval semantics while every other lookup resolves against the
-       child WindowProxy. */
-    trustedFrameDirectEval = eval,
-    trustedFrameEvaluator = new Function(
-      "return function(scope,source){with(scope){return eval(source)}}",
-    )(),
-    frameWindows = new Map(),
-    frameWindowLimit = 16,
-    evictFrameWindow = () => {
-      let candidate = null;
-      for (const entry of frameWindows) {
-        if (candidate === null) candidate = entry;
-        if (!entry[1].active) {
-          candidate = entry;
-          break;
-        }
-      }
-      if (candidate === null) return;
-      candidate[1].active = false;
-      candidate[1].scope.document = null;
-      candidate[1].scope.location = null;
-      frameWindows.delete(candidate[0]);
-    };
-  globalThis.__tilefinchFrameWindow = (handle) => {
-    handle = Number(handle);
-    let state = frameWindows.get(handle);
-    const element = wrap(handle);
-    if (!state) {
-      if (frameWindows.size >= frameWindowLimit) evictFrameWindow();
-      const scope = {};
-      state = {
-        active: !!element?.isConnected,
-        sameOrigin: true,
-        opaqueOrigin: false,
-        scriptsAllowed: true,
-        managed: false,
-        loadGeneration: 0,
-        localSource: null,
-        localSrcdoc: null,
-        localSandboxScripts: false,
-        localSandboxSameOrigin: false,
-        proxy: null,
-        evalScope: null,
-        scope,
-      };
-      scope.document = globalThis.__tilefinchCreateFrameDocument(true);
-      scope.location = {
-        href: "about:blank",
-        protocol: "about:",
-        origin: location.origin,
-      };
-      let proxy;
-      proxy = new Proxy(scope, {
-        has(target, key) {
-          if (key === "source" || key === "execute") return false;
-          if (state.sameOrigin) return true;
-          return (
-            key === "closed" ||
-            key === "window" ||
-            key === "self" ||
-            key === "frames" ||
-            key === "postMessage" ||
-            key === "parent" ||
-            key === "top" ||
-            key === "opener" ||
-            key === "length"
-          );
-        },
-        get(target, key) {
-          if (key === "closed") return !state.active;
-          if (key === "document" || key === "location")
-            return state.sameOrigin
-              ? key in target
-                ? target[key]
-                : globalThis[key]
-              : undefined;
-          if (key === "eval")
-            /* The sandboxed-scripts flag suppresses scripts owned by the
-               child document; it does not hide Window.eval from a
-               same-origin parent. Chromium exposes and permits this call
-               for sandbox="allow-same-origin". Opaque-origin frames remain
-               inaccessible through the same-origin gate below. */
-            return state.sameOrigin ? target.eval : undefined;
-          if (!state.sameOrigin) {
-            if (key === "window" || key === "self" || key === "frames")
-              return proxy;
-            if (
-              key === "postMessage" ||
-              key === "parent" ||
-              key === "top" ||
-              key === "opener" ||
-              key === "length"
-            )
-              return target[key];
-            return undefined;
-          }
-          if (key in target) return target[key];
-          return state.sameOrigin ? globalThis[key] : undefined;
-        },
-        set(target, key, value) {
-          if (!state.sameOrigin) return false;
-          target[key] = value;
-          return true;
-        },
-      });
-      state.proxy = proxy;
-      const evalScope = new Proxy(proxy, {
-        has(target, key) {
-          if (key === "source") return false;
-          if (key === "eval") return true;
-          return key in target;
-        },
-        get(target, key) {
-          return key === "eval" ? trustedFrameDirectEval : target[key];
-        },
-        set(target, key, value) {
-          target[key] = value;
-          return true;
-        },
-      });
-      state.evalScope = evalScope;
-      Object.defineProperty(scope.document, "defaultView", {
-        configurable: true,
-        value: proxy,
-      });
-      scope.window = proxy;
-      scope.self = proxy;
-      scope.globalThis = proxy;
-      Object.defineProperty(scope, Symbol.toStringTag, {
-        configurable: true,
-        value: "Window",
-      });
-      scope.parent = globalThis;
-      scope.top = globalThis;
-      Object.defineProperty(scope, "opener", {
-        configurable: false,
-        enumerable: true,
-        writable: false,
-        value: null,
-      });
-      scope.frames = proxy;
-      scope.length = 0;
-      scope.eval = __tilefinchCreateFrameEval(
-        trustedFrameEvaluator, evalScope,
-      );
-      scope.postMessage = function (data, targetOrigin = "/") {
-        const current = wrap(handle);
-        if (!state.active || !current?.isConnected) return;
-        const normalizedTarget = normalizePostMessageTarget(
-          targetOrigin,
-          location.origin,
-        );
-        const json = trustedJSONStringify(data),
-          ancestors = [];
-        for (
-          let at = current;
-          at && ancestors.length < 8;
-          at = at.parentElement
-        )
-          ancestors.push(
-            String(at.tagName || at.nodeName || "") +
-              ":" +
-              String(at.__handle || 0),
-          );
-        globalThis.__tilefinchLastFramePost = {
-          handle,
-          connected: true,
-          ancestors,
-          src: String(current.src || ""),
-          targetOrigin: normalizedTarget,
-        };
-        __tilefinchPostMessage(
-          handle,
-          json === undefined ? "null" : json,
-          normalizedTarget,
-        );
-      };
-      frameWindows.set(handle, state);
-    } else if (!state.managed) state.active = !!element?.isConnected;
-    return state.proxy;
-  };
-  globalThis.__tilefinchLoadLocalFrame = (element) => {
-    if (
-      !(element instanceof HTMLIFrameElement) ||
-      !element.isConnected
-    )
-      return;
-    const srcdoc = element.getAttribute("srcdoc"),
-      source = String(element.src || ""),
-      blob = blobURLs.get(source),
-      local =
-        srcdoc !== null ||
-        source === "" ||
-        source === "about:blank" ||
-        source.startsWith("blob:");
-    const proxy = globalThis.__tilefinchFrameWindow(element.__handle),
-      state = frameWindows.get(Number(element.__handle));
-    if (!local || (source.startsWith("blob:") && !blob)) {
-      /* A queued initial about:blank load must not win a race with a
-         synchronous navigation assigned before its microtask runs. */
-      state.localSource = null;
-      state.localSrcdoc = null;
-      state.loadGeneration++;
-      return;
-    }
-    const sandboxPolicy = frameSandboxPolicy(element),
-      normalizedSrcdoc = srcdoc === null ? null : String(srcdoc);
-    if (
-      state.localSource === source &&
-      state.localSrcdoc === normalizedSrcdoc &&
-      state.localSandboxScripts === sandboxPolicy.scripts &&
-      state.localSandboxSameOrigin === sandboxPolicy.sameOrigin
-    )
-      return;
-    state.localSource = source;
-    state.localSrcdoc = normalizedSrcdoc;
-    state.localSandboxScripts = sandboxPolicy.scripts;
-    state.localSandboxSameOrigin = sandboxPolicy.sameOrigin;
-    state.scriptsAllowed = sandboxPolicy.scripts;
-    state.opaqueOrigin = sandboxPolicy.present && !sandboxPolicy.sameOrigin;
-    state.sameOrigin = !state.opaqueOrigin;
-    const text =
-        normalizedSrcdoc !== null ? normalizedSrcdoc
-        : blob ? new TextDecoder().decode(blobBytes(blob)) : "",
-      standards = /^\s*<!doctype\s+html(?:\s|>)/i.test(text),
-      frameDocument = text
-        ? new DOMParser().parseFromString(text, "text/html")
-        : globalThis.__tilefinchCreateFrameDocument(standards),
-      generation = ++state.loadGeneration;
-    state.scope.document = frameDocument;
-    const frameHref =
-        srcdoc !== null ? "about:srcdoc" : source || "about:blank",
-      protocolMatch = frameHref.match(/^([A-Za-z][A-Za-z0-9+.-]*:)/);
-    state.scope.location = {
-      href: frameHref,
-      protocol: protocolMatch ? protocolMatch[1].toLowerCase() : "",
-      origin: state.opaqueOrigin ? "null" : location.origin,
-    };
-    frameDocument.location = state.scope.location;
-    Object.defineProperty(frameDocument, "defaultView", {
-      configurable: true,
-      value: proxy,
-    });
-    queueMicrotask(() => {
-      if (element.isConnected && state.loadGeneration === generation)
-        element.dispatchEvent(__tilefinchTrustedEvent(new Event("load")));
-    });
-  };
-  globalThis.__tilefinchSetFrameWindowState = (
-    handle,
-    active,
-    sameOrigin,
-    opaqueOrigin,
-    committedURL = null,
-  ) => {
-    handle = Number(handle);
-    const proxy = globalThis.__tilefinchFrameWindow(handle),
-      state = frameWindows.get(handle);
-    state.active = !!active;
-    state.sameOrigin = !!sameOrigin;
-    state.opaqueOrigin = !!opaqueOrigin;
-    state.managed = true;
-    if (!state.active) {
-      state.scope.document = null;
-      state.scope.location = null;
-      state.localSource = null;
-      state.localSrcdoc = null;
-      state.loadGeneration++;
-      return proxy;
-    }
-    if (state.active && state.sameOrigin && committedURL !== null) {
-      try {
-        const parsed = new URL(String(committedURL), location.href);
-        state.scope.location = {
-          href: parsed.href,
-          protocol: parsed.protocol,
-          origin: state.opaqueOrigin ? "null" : parsed.origin,
-          host: parsed.host,
-          hostname: parsed.hostname,
-          port: parsed.port,
-          pathname: parsed.pathname,
-          search: parsed.search,
-          hash: parsed.hash,
-        };
-        if (state.scope.document)
-          state.scope.document.location = state.scope.location;
-      } catch (_) {}
-    }
-    return proxy;
-  };
-  globalThis.__tilefinchReceiveMessage = (json, origin, sourceHandle) =>
-    globalThis.__tilefinchRunTask(
-      "window-message:source=" + String(sourceHandle),
-      () => {
-        const event = new Event("message");
-        Object.defineProperty(event, "isTrusted", { value: true });
-        event.data = trustedJSONParse(String(json));
-        event.origin = String(origin);
-        event.source =
-          Number(sourceHandle) === -1
-            ? globalThis
-            : Number(sourceHandle) === 0
-            ? globalThis.parent
-            : __tilefinchFrameWindow(Number(sourceHandle));
-        globalThis.dispatchEvent(event);
-      },
-    );
-  globalThis.postMessage = (data, targetOrigin = "/") => {
-    const normalizedTarget = normalizePostMessageTarget(
-      targetOrigin,
-      location.origin,
-    );
-    if (
-      normalizedTarget !== "*" &&
-      normalizedTarget !== String(location.origin)
-    )
-      return;
-    const json = trustedJSONStringify(data);
-    setTimeout(
-      () =>
-        __tilefinchReceiveMessage(
-          json === undefined ? "null" : json,
-          location.origin,
-          -1,
-        ),
-      0,
-    );
-  };
+  /* The nested-frame WindowProxy subsystem lives in frames.js. It is a
+     first-use-free eager module installed here with this module's private
+     helpers; the installer is removed so no privileged bridge remains on
+     the global object. */
+  const frames = globalThis.__tilefinchInstallFrames({
+    wrap,
+    trustedJSONParse,
+    trustedJSONStringify,
+    trustedStringLower,
+    trustedCharCodeAt,
+    trustedStringSlice,
+    blobForURL: (url) => blobURLs.get(url),
+    blobBytes,
+    normalizePostMessageTarget,
+    location,
+  });
+  delete globalThis.__tilefinchInstallFrames;
   location.replace = (value) => {
     const next = new TilefinchURL(value, location.href);
     location._set(next.href);
@@ -6323,7 +6077,7 @@
       mimeTypeArrayToken = {},
       pluginToken = {},
       mimeTypeToken = {},
-      languages = Object.freeze(["en-US"]),
+      languages = Object.freeze(["en-US", "en"]),
       brands = Object.freeze([
         Object.freeze({
           brand: String(globalThis.__tilefinchBrowserBrand),
@@ -7058,6 +6812,7 @@
     };
   globalThis.getComputedStyle = (node, pseudo = null) => {
     if (!node || !node.style) return {};
+    const connected = Number.isInteger(node.__handle) && node.__handle > 0;
     const defaults = {
       display: "block",
       visibility: "visible",
@@ -7075,11 +6830,13 @@
         getPropertyValue(name) {
           name = __tilefinchCssName(name);
           const inline = node.style.getPropertyValue(name),
-            computed = __tilefinchComputedStyleGet(
-              node.__handle,
-              name,
-              pseudo === null ? "" : String(pseudo),
-            );
+            computed = connected
+              ? __tilefinchComputedStyleGet(
+                  node.__handle,
+                  name,
+                  pseudo === null ? "" : String(pseudo),
+                )
+              : "";
           // The host resolves custom properties across inline declarations,
           // the author cascade, inheritance, and var() substitution.  An
           // empty result is meaningful here: it is also the computed
@@ -7888,9 +7645,8 @@
   globalThis.performance = performanceValue;
   /* A dedicated worker has its own performance time origin and monotonic zero.
      Keep the implementation bounded by sharing the immutable interface shape,
-     while rebasing now() for the worker lifetime.  The object itself must not
-     be the Window's Performance instance: identity, branding, and timeOrigin
-     are all standards-visible and are used by capability probes. */
+     while rebasing now() for the worker lifetime.  The lazy Worker bootstrap
+     wraps this timing source in its own Worker-realm Performance prototype. */
   globalThis.__tilefinchCreateWorkerPerformance = () => {
     const monotonicOrigin = __tilefinchPerformanceNow(3),
       value = Object.assign(
@@ -8069,6 +7825,6 @@
     globalThis.dispatchEvent(loadEvent);
   };
   Object.defineProperty(globalThis.__tilefinchRootCensus, "frameWindows", {
-    get: () => frameWindows.size,
+    get: () => frames.frameWindowCount(),
   });
 })();

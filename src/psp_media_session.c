@@ -2965,6 +2965,9 @@ bool psp_media_advance(
            false cadence outlier. All source counters remain cumulative, so
            the teardown report loses no information. */
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    bool indicator_was_buffering = media->ui.buffering;
+#endif
     if (first_frame_pending) {
         /* Time the browser spent blocked inside the bounded pump. The codec
            worker is asynchronous, so seconds here mean an HTTP range read. */
@@ -3537,6 +3540,16 @@ bool psp_media_advance(
         || media->buffering_service_active
         || (media->ui.playing && media->no_frame_ms >= 500u
             && buffered <= media->clock_us + UINT64_C(50000));
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (buffering && !indicator_was_buffering)
+        printf("tilefinch-media-buffer: event=indicator no-frame=%ums "
+               "pause=%d service=%d clock=%lluus video=%lluus buffered=%lluus\n",
+               media->no_frame_ms, media->pause_boundary_pending ? 1 : 0,
+               media->buffering_service_active ? 1 : 0,
+               (unsigned long long) media->clock_us,
+               (unsigned long long) media->frame.pts_us,
+               (unsigned long long) buffered);
+#endif
     psp_ui_media_set_buffering(&media->ui, buffering, buffered);
     psp_ui_media_tick(&media->ui, elapsed_ms);
     /* Captions are optional background work. The old ordering parsed as much

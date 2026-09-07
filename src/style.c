@@ -9,6 +9,81 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+
+static const char *style_head_selector(const Stylesheet *sheet, size_t index)
+{
+    return index < sheet->count ? sheet->rules[index].selector
+        : sheet->custom_rules[index - sheet->count].selector;
+}
+
+bool stylesheet_head_scripts_affect_ancestors(
+    const Stylesheet *sheet, lxb_dom_node_t *head)
+{
+    if (sheet == NULL || head == NULL || head->parent == NULL
+        || sheet->resolve_scratch == NULL) return true;
+    StyleResolveScratch *cache = sheet->resolve_scratch;
+    if (cache->head_script_summary == 0
+        || cache->head_script_generation != sheet->build_generation) {
+        cache->head_script_generation = sheet->build_generation;
+        cache->head_script_subject_count = 0;
+        cache->head_script_summary = 2; /* Any refusal stays conservative. */
+        size_t count = sheet->count + sheet->custom_rule_count;
+        for (size_t i = 0; i < count; i++) {
+            const char *selector = style_head_selector(sheet, i);
+            if (selector == NULL) continue;
+#ifndef TILEFINCH_NO_TRACE
+            ((Stylesheet *) sheet)->head_script_selector_scans++;
+#endif
+            size_t length = strlen(selector);
+            if (strchr(selector, '\\') != NULL) return true;
+            unsigned depth = 0;
+            char quote = 0;
+            for (size_t at = 0; at < length; at++) {
+                char c = selector[at];
+                if (quote != 0) { if (c == quote) quote = 0; continue; }
+                if (c == '\'' || c == '"') { quote = c; continue; }
+                if (c == '(' || c == '[') depth++;
+                else if (c == ')' || c == ']') { if (depth != 0) depth--; }
+                else if (c == ',' && depth == 0) return true;
+            }
+            size_t has_at = SIZE_MAX;
+            bool complex_prefix = false;
+            for (size_t at = 0; at < length; at++) {
+                if (has_at == SIZE_MAX
+                    && (selector[at] == '(' || selector[at] == ','))
+                    complex_prefix = true;
+                if (selector[at] != ':') continue;
+                size_t remaining = length - at;
+                if (remaining >= 4 && strncasecmp(selector + at, ":dir", 4) == 0)
+                    return true;
+                if (remaining >= 5 && strncasecmp(selector + at, ":has(", 5) == 0) {
+                    if (complex_prefix || at == 0
+                        || isspace((unsigned char) selector[at - 1])
+                        || strchr(">+~|", selector[at - 1]) != NULL) return true;
+                    has_at = at;
+                    break;
+                }
+            }
+            if (has_at != SIZE_MAX) {
+                if (cache->head_script_subject_count == 16u) return true;
+                unsigned slot = cache->head_script_subject_count++;
+                cache->head_script_subjects[slot].selector_index = (uint32_t) i;
+                cache->head_script_subjects[slot].prefix_length = (uint32_t) has_at;
+            }
+        }
+        cache->head_script_summary = 1;
+    }
+    if (cache->head_script_summary != 1) return true;
+    for (unsigned i = 0; i < cache->head_script_subject_count; i++) {
+        const char *selector = style_head_selector(
+            sheet, cache->head_script_subjects[i].selector_index);
+        size_t length = cache->head_script_subjects[i].prefix_length;
+        if (style_selector_matches(head, selector, length)
+            || style_selector_matches(head->parent, selector, length)) return true;
+    }
+    return false;
+}
 
 const StyleDeclaration *stylesheet_rule_declaration(
     const Stylesheet *sheet, const StyleRule *rule)
@@ -90,6 +165,7 @@ size_t stylesheet_retained_bytes(const Stylesheet *sheet)
 void stylesheet_prepare_for_document_reuse(Stylesheet *sheet)
 {
     if (sheet == NULL) return;
+    style_selector_cooperation_end(sheet);
     sheet->selector_cooperate = NULL;
     sheet->selector_cooperate_opaque = NULL;
     sheet->selector_cooperate_visits = 0;
@@ -107,9 +183,6 @@ void stylesheet_prepare_for_document_reuse(Stylesheet *sheet)
            sizeof(sheet->relative_selector_cache));
 }
 
-bool style_resolve_value(const Stylesheet *sheet, const char *text,
-                          size_t length, char *output, size_t output_size,
-                          unsigned depth);
 bool computed_style_has_text_underline(const ComputedStyle *style)
 {
     return style != NULL

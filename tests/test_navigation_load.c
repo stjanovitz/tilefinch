@@ -9,6 +9,7 @@
 #include "tilefinch/style.h"
 #include "tilefinch/user_agent.h"
 #include "../src/image_decode_internal.h"
+#include "../src/tilefinch_test_faults.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -244,6 +245,17 @@ static bool deferred_document_images_replay_begin(void)
         error, sizeof(error));
 }
 
+static bool canvas_taint_replay_begin(void)
+{
+    char error[256] = {0};
+    /* Response-keyed replay: this test is about canvas policy, not the
+       request-header shape of an image fetch, and it must not go stale when
+       that shape changes. */
+    return fetch_trace_replay_begin_response_keyed(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-canvas-taint",
+        error, sizeof(error));
+}
+
 static bool deferred_document_images_partial_failure_replay_begin(void)
 {
     char error[256] = {0};
@@ -347,8 +359,10 @@ static bool capture_progressive_preview(
             probe->tail_visible = true;
         }
     }
+    /* Optional resource caches may be the next allocation. Refuse the
+       authoritative layout itself, not whichever allocation happens first. */
     if (probe->fail_after_paint)
-        budget_inject_failure_after(candidate->budget, 0);
+        tilefinch_test_faults()->cancel_next_layout_cooperate = true;
     return layout->count != 0;
 }
 
@@ -432,6 +446,7 @@ static bool test_failed_candidate_rolls_back_presented_preview(void)
         &navigation, generation, "https://progressive.test/document",
         4096, 1000, 480, NULL, NULL, true);
     budget_clear_failure_injection(&budget);
+    tilefinch_test_faults()->cancel_next_layout_cooperate = false;
     bool ok = !loaded && probe.calls == 1 && probe.rollbacks == 1
         && !navigation.page.loaded;
     if (!ok) {
@@ -694,6 +709,7 @@ static bool test_static_images_retry_after_transient_idle_failure(void)
     size_t relayouts_before = navigation.performance.fast_relayouts
         + navigation.performance.full_relayouts;
     bool first_frame = committed && navigation.page.loaded
+        && navigation.performance.static_image_layout_adoptions == 0
         && navigation.page.images.stats.loaded == 1
         && navigation.page.deferred_image_count == 2
         && navigation.page.deferred_image_job == NULL
@@ -772,7 +788,8 @@ static bool test_visible_lazy_static_image_waits_until_idle(void)
     static const char html[] =
         "<!doctype html><title>Lazy image</title>"
         "<style>html,body{margin:0}img{display:block;width:24px;height:24px}"
-        "</style><body><img loading=lazy src=/hero.svg></body>";
+        "</style><body><h1>Results</h1><a href=/play>"
+        "<img loading=lazy src=/hero.svg>Play this result</a></body>";
     Budget budget;
     budget_init(&budget, 16 * MIB);
     bool installed = budget_install_lexbor(&budget);
@@ -791,8 +808,35 @@ static bool test_visible_lazy_static_image_waits_until_idle(void)
     bool ok = committed && navigation.page.loaded
         && navigation.page.images.stats.loaded == 0
         && navigation.page.deferred_image_count == 1
+        && navigation.performance.static_image_layout_adoptions == 1
         && navigation.page.deferred_image_cursor == 0
         && navigation_background_resources_pending(&navigation);
+    /* Moving the planning layout must preserve final pixels and geometry,
+       not merely save a counted build. Compare against a fresh full build. */
+    LayoutDocument reference = {0};
+    TileCache planned_cache = {0}, reference_cache = {0};
+    size_t frame_bytes = 480u * 272u * sizeof(uint16_t);
+    uint16_t *planned_frame = budget_malloc(&budget, frame_bytes);
+    uint16_t *reference_frame = budget_malloc(&budget, frame_bytes);
+    ok = ok && planned_frame != NULL && reference_frame != NULL
+        && layout_build_context_reuse(
+            &reference, &budget, &navigation.page.document,
+            &navigation.page.stylesheet, NULL, &navigation.page.images,
+            &navigation.viewport, NULL)
+        && reference.height == navigation.page.layout.height
+        && reference.link_count == navigation.page.layout.link_count
+        && tile_cache_init(&planned_cache, &budget, &navigation.page.layout, 8)
+        && tile_cache_init(&reference_cache, &budget, &reference, 8)
+        && tile_cache_set_frame(&planned_cache, planned_frame, 480u * 272u)
+        && tile_cache_set_frame(&reference_cache, reference_frame, 480u * 272u)
+        && tile_cache_render_frame(&planned_cache, 0, 480, 272, NULL)
+        && tile_cache_render_frame(&reference_cache, 0, 480, 272, NULL)
+        && memcmp(planned_frame, reference_frame, frame_bytes) == 0;
+    tile_cache_destroy(&planned_cache);
+    tile_cache_destroy(&reference_cache);
+    layout_destroy(&reference);
+    budget_free(&budget, planned_frame);
+    budget_free(&budget, reference_frame);
     if (!ok) {
         fprintf(stderr,
                 "visible-lazy ready=%d committed=%d loaded=%zu "
@@ -851,7 +895,8 @@ static bool test_visible_lazy_pair_overlaps_transport_and_decode(void)
         && navigation.page.deferred_image_batch_count == 2
         && navigation.page.images.stats.loaded == 1
         && navigation.performance.background_images_loaded == 1
-        && navigation.performance.background_image_relayouts == 1;
+        && navigation.performance.background_image_relayouts == 0
+        && navigation.page.deferred_image_publication_age != 0;
     lxb_dom_node_t *root = ready
         ? lxb_dom_interface_node(navigation.page.document.html) : NULL;
     lxb_dom_node_t *first = root == NULL
@@ -873,7 +918,82 @@ static bool test_visible_lazy_pair_overlaps_transport_and_decode(void)
         && !navigation_background_resources_pending(&navigation)
         && navigation.page.images.stats.loaded == 2
         && navigation.performance.background_images_loaded == 2
-        && navigation.performance.background_image_relayouts == 2;
+        && navigation.performance.background_image_relayouts == 1;
+    if (ready) fetch_trace_end();
+    if (installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+/* Same-origin policy for canvas readback: pixels from a cross-origin image
+   must never reach script. Drawing such an image makes the canvas
+   origin-unclean, readback and export then throw SecurityError, and the
+   taint follows the pixels into any canvas they are drawn onto. A same-origin
+   image leaves every readback available. */
+static bool test_cross_origin_image_taints_canvas(void)
+{
+    static const char html[] =
+        "<!doctype html><title>Canvas taint</title>"
+        "<style>img{display:block;width:2px;height:2px}</style><body>"
+        "<img id=same src=/same.svg>"
+        "<img id=cross src=https://taint-other.test/cross.svg>"
+        "<script>globalThis.pageReady=1</script></body>";
+    static const char probe[] =
+        "const probe=(id)=>{const c=document.createElement('canvas');"
+        "c.width=2;c.height=2;const g=c.getContext('2d');"
+        "g.drawImage(document.getElementById(id),0,0);"
+        "let read='ok';try{g.getImageData(0,0,1,1)}catch(e){read=e.name}"
+        "let url='ok';try{c.toDataURL()}catch(e){url=e.name}"
+        "const copy=document.createElement('canvas');copy.width=2;copy.height=2;"
+        "const cg=copy.getContext('2d');cg.drawImage(c,0,0);"
+        "let copied='ok';try{cg.getImageData(0,0,1,1)}catch(e){copied=e.name}"
+        "return read+'/'+url+'/'+copied};"
+        "globalThis.pocSummary=probe('same')+'|'+probe('cross')";
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = installed && navigation_init(&navigation, &budget, 4)
+        && canvas_taint_replay_begin();
+    if (ready) {
+        navigation_enable_scripts(&navigation, 4 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 64 * 1024, 32 * 1024, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    bool committed = ready && navigation_commit_html(
+        &navigation, generation, "https://taint-page.test/page",
+        html, sizeof(html) - 1u, 480, NULL, NULL, true);
+    size_t pumps = 0;
+    while (committed && navigation_background_resources_pending(&navigation)
+           && pumps++ < 16u) {
+        if (!navigation_run_background_resources(&navigation)) break;
+    }
+    bool loaded = committed
+        && navigation.page.images.stats.loaded == 2
+        && navigation.page.runtime != NULL;
+    ScriptResult probe_result;
+    memset(&probe_result, 0, sizeof(probe_result));
+    bool probed = loaded && script_runtime_evaluate_diagnostic(
+        navigation.page.runtime, probe, "<canvas-taint>", &probe_result);
+    bool ok = probed
+        && strcmp(probe_result.summary,
+                  "ok/ok/ok|SecurityError/SecurityError/SecurityError") == 0;
+    if (!ok) {
+        fprintf(stderr,
+                "canvas-taint ready=%d committed=%d loaded=%zu runtime=%d "
+                "probed=%d summary=\"%s\" error=\"%s\" last=\"%s\"\n",
+                ready, committed, navigation.page.images.stats.loaded,
+                navigation.page.runtime != NULL, probed,
+                probe_result.summary, probe_result.error,
+                navigation.last_error);
+    }
     if (ready) fetch_trace_end();
     if (installed) navigation_destroy(&navigation);
     bool clean = budget.current == 0

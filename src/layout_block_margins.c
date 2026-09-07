@@ -209,6 +209,7 @@ int layout_block_collapsed_block_top_margin(LayoutContext *context,
                                             const ComputedStyle *style,
                                             size_t depth)
 {
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_MARGIN);
     if (context != NULL) context->margin_collapse_visits++;
     if (style == NULL) return 0;
     int cached = 0;
@@ -236,8 +237,8 @@ int layout_block_collapsed_block_top_margin(LayoutContext *context,
         return value;
     }
     ComputedStyle *before = &scratch->traversal.collapse.pseudo;
-    *before = style_for_pseudo(
-        context->sheet, node, PSEUDO_BEFORE, style);
+    *before = layout_style_for_pseudo(
+        context, node, PSEUDO_BEFORE, style);
     if (generated_pseudo_is_flow_block(before)) {
         (void) collapsed_margin_add(&collapsed, before->margin.top);
         int value = collapsed_margin_value(&collapsed);
@@ -341,6 +342,7 @@ int layout_block_collapsed_block_bottom_margin(LayoutContext *context,
                                                const ComputedStyle *style,
                                                size_t depth)
 {
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_MARGIN);
     if (context != NULL) context->margin_collapse_visits++;
     if (style == NULL) return 0;
     int cached = 0;
@@ -366,7 +368,7 @@ int layout_block_collapsed_block_bottom_margin(LayoutContext *context,
         return value;
     }
     ComputedStyle *after = &scratch->traversal.collapse.pseudo;
-    *after = style_for_pseudo(context->sheet, node, PSEUDO_AFTER, style);
+    *after = layout_style_for_pseudo(context, node, PSEUDO_AFTER, style);
     if (generated_pseudo_is_flow_block(after)) {
         (void) collapsed_margin_add(&collapsed, after->margin.bottom);
         int value = collapsed_margin_value(&collapsed);

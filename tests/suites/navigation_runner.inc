@@ -1,4 +1,4 @@
-int main(void)
+int main(int argc, char **argv)
 {
 #define RUN_TEST(test) do {                                                  \
     if (!(test)()) {                                                         \
@@ -6,6 +6,14 @@ int main(void)
         return 1;                                                            \
     }                                                                        \
 } while (0)
+    if (argc == 2 && strcmp(argv[1], "--static-image-layout-only") == 0) {
+        RUN_TEST(test_static_images_retry_after_transient_idle_failure);
+        RUN_TEST(test_visible_lazy_static_image_waits_until_idle);
+        RUN_TEST(test_visible_lazy_pair_overlaps_transport_and_decode);
+        RUN_TEST(test_visible_lazy_queue_continues_after_first_pair);
+        puts("static image layout tests passed");
+        return 0;
+    }
     RUN_TEST(test_pump_and_cancel);
     RUN_TEST(test_progressive_preview_is_bounded_and_transient);
     RUN_TEST(test_failed_candidate_rolls_back_presented_preview);
@@ -56,6 +64,7 @@ int main(void)
     RUN_TEST(test_caught_allocation_keeps_bounded_reader_runtime);
     RUN_TEST(test_caught_large_allocation_does_not_reveal_raw_app_shell);
     RUN_TEST(test_late_script_oom_frees_queued_frame_messages);
+    RUN_TEST(test_cross_origin_image_taints_canvas);
     RUN_TEST(test_authored_oom_text_does_not_trigger_static_recovery);
     RUN_TEST(test_late_oom_static_relayout_refusal_is_transactional);
     RUN_TEST(test_low_memory_replacement_success);

@@ -13,6 +13,19 @@ PSPSH=${PSPSH:-}
 USBHOSTFS=${USBHOSTFS:-}
 LINK_TIMEOUT_SECONDS=${LINK_TIMEOUT_SECONDS:-8}
 BRIDGE_START_TIMEOUT_SECONDS=${BRIDGE_START_TIMEOUT_SECONDS:-12}
+# Polling granularity for the wait loops below. The timeouts stay in whole
+# seconds; a higher rate only shortens how long a loop overshoots the moment
+# its condition becomes true (tests use 10 so a mocked bridge settles in a
+# tenth of a second instead of a second).
+POLLS_PER_SECOND=${PSPLINK_POLLS_PER_SECOND:-1}
+case $POLLS_PER_SECOND in
+    ''|*[!0-9]*|0) POLLS_PER_SECOND=1 ;;
+esac
+if [ "$POLLS_PER_SECOND" -eq 1 ]; then
+    POLL_SLEEP=1
+else
+    POLL_SLEEP=$(awk -v n="$POLLS_PER_SECOND" 'BEGIN { printf "%.3f", 1 / n }')
+fi
 STATE_DIR=${PSPLINK_STATE_DIR:-${TMPDIR:-/tmp}/tilefinch-psplink}
 
 if [ -z "$PSPSH" ]; then
@@ -61,7 +74,7 @@ run_pspsh() {
     process=$!
     elapsed=0
     while kill -0 "$process" 2>/dev/null; do
-        if [ "$elapsed" -ge "$timeout" ]; then
+        if [ "$elapsed" -ge $((timeout * POLLS_PER_SECOND)) ]; then
             kill "$process" 2>/dev/null || true
             wait "$process" 2>/dev/null || true
             cat "$output" >&2
@@ -69,7 +82,7 @@ run_pspsh() {
             echo "PSPLink command timed out: $command_text" >&2
             return 124
         fi
-        sleep 1
+        sleep "$POLL_SLEEP"
         elapsed=$((elapsed + 1))
     done
     result=0
@@ -113,8 +126,8 @@ stop_recorded_bridge() {
     pid=$(sed -n '1p' "$BRIDGE_PID")
     kill "$pid" 2>/dev/null || true
     elapsed=0
-    while kill -0 "$pid" 2>/dev/null && [ "$elapsed" -lt 3 ]; do
-        sleep 1
+    while kill -0 "$pid" 2>/dev/null && [ "$elapsed" -lt $((3 * POLLS_PER_SECOND)) ]; do
+        sleep "$POLL_SLEEP"
         elapsed=$((elapsed + 1))
     done
     if kill -0 "$pid" 2>/dev/null; then
@@ -149,7 +162,7 @@ ensure_ready() {
     fi
 
     elapsed=0
-    while [ "$elapsed" -lt "$BRIDGE_START_TIMEOUT_SECONDS" ]; do
+    while [ "$elapsed" -lt $((BRIDGE_START_TIMEOUT_SECONDS * POLLS_PER_SECOND)) ]; do
         if probe_ready; then return 0; fi
         if grep -q '^bind: Operation not permitted' "$BRIDGE_LOG" \
                 2>/dev/null; then
@@ -160,7 +173,7 @@ ensure_ready() {
                 "PSPLink on the device does not need to be relaunched." >&2
             return 1
         fi
-        sleep 1
+        sleep "$POLL_SLEEP"
         elapsed=$((elapsed + 1))
     done
 
@@ -185,8 +198,17 @@ case "$mode" in
         ;;
     exec)
         [ "$#" -eq 1 ] || usage
+        # Stock scrshot/ss writes its bitmap into Media Engine firmware RAM.
+        # The explicit capability name exists only in our safe development
+        # build; an older PSPLink refuses it rather than corrupting playback.
+        command_text=$1
+        case "$command_text" in
+            scrshot\ *) command_text="scrshot-user ${command_text#scrshot }" ;;
+            ss\ *) command_text="scrshot-user ${command_text#ss }" ;;
+            scrshot|ss) command_text=scrshot-user ;;
+        esac
         ensure_ready
-        run_pspsh "$1" "$LINK_TIMEOUT_SECONDS"
+        run_pspsh "$command_text" "$LINK_TIMEOUT_SECONDS"
         ;;
     *) usage ;;
 esac

@@ -1,4 +1,6 @@
 #include "tilefinch/navigation.h"
+#include "diagnostic_trace.h"
+#include "tilefinch_test_faults.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/frame_sandbox.h"

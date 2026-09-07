@@ -483,7 +483,7 @@ static void stylesheet_prepare_custom_rule_index(Stylesheet *sheet)
     sheet->custom_rule_index_ready = true;
 }
 
-static uint64_t style_rule_key_hash(SelectorType type, const char *text,
+static uint32_t style_rule_key_hash(SelectorType type, const char *text,
                                     size_t length)
 {
     /* The open-addressed table consumes only the low log2(capacity) bits
@@ -494,7 +494,7 @@ static uint64_t style_rule_key_hash(SelectorType type, const char *text,
     for (size_t i = 0; i < length; i++) {
         hash = (hash ^ (unsigned char) text[i]) * UINT32_C(16777619);
     }
-    return hash == 0 ? UINT64_C(1) : (uint64_t) hash;
+    return hash == 0 ? UINT32_C(1) : hash;
 }
 
 const char *style_rule_fast_key(const StyleRule *rule)
@@ -508,25 +508,27 @@ const char *style_rule_fast_key(const StyleRule *rule)
 
 static bool style_rule_bucket_key_matches(
     const Stylesheet *sheet, const StyleRuleIndexBucket *bucket,
-    SelectorType type, const char *text, size_t length, uint64_t hash)
+    SelectorType type, const char *text, size_t length, uint32_t hash,
+    PseudoElement pseudo)
 {
     if (bucket->representative == STYLE_RULE_INDEX_EMPTY
         || bucket->hash != hash
         || bucket->representative >= sheet->count) return false;
     const StyleRule *rule = &sheet->rules[bucket->representative];
     const char *fast_key = style_rule_fast_key(rule);
-    return rule->has_fast_key && rule->type == type
+    return rule->has_fast_key && rule->type == type && rule->pseudo == pseudo
         && fast_key != NULL && rule->fast_key_length == length
         && memcmp(fast_key, text, length) == 0;
 }
 
 StyleRuleIndexBucket *style_rule_find_bucket(
     const Stylesheet *sheet, SelectorType type, const char *text,
-    size_t length, bool create)
+    size_t length, bool create, PseudoElement pseudo)
 {
     if (sheet == NULL || sheet->rule_index_buckets == NULL
         || sheet->rule_index_bucket_count == 0 || text == NULL) return NULL;
-    uint64_t hash = style_rule_key_hash(type, text, length);
+    uint32_t hash = style_rule_key_hash(type, text, length)
+        ^ ((uint32_t) pseudo * UINT32_C(0x9e3779b9));
     size_t mask = sheet->rule_index_bucket_count - 1;
     size_t slot = (size_t) hash & mask;
     for (size_t probes = 0; probes < sheet->rule_index_bucket_count;
@@ -538,7 +540,7 @@ StyleRuleIndexBucket *style_rule_find_bucket(
             return bucket;
         }
         if (style_rule_bucket_key_matches(sheet, bucket, type, text, length,
-                                          hash)) return bucket;
+                                          hash, pseudo)) return bucket;
     }
     return NULL;
 }
@@ -612,10 +614,19 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
     sheet->rule_index_bucket_count = bucket_count;
 
     size_t universal_count = 0;
+    uint32_t universal_counts[3] = {0};
+    _Static_assert(PSEUDO_NONE == 0 && PSEUDO_BEFORE == 1 && PSEUDO_AFTER == 2,
+                   "rule-index partitions must cover every pseudo element");
     for (size_t i = 0; i < sheet->count; i++) {
         const StyleRule *rule = &sheet->rules[i];
+        if (rule->pseudo > PSEUDO_AFTER) {
+            stylesheet_drop_rule_index(sheet);
+            sheet->rule_index_attempted = true;
+            return;
+        }
         if (!rule->has_fast_key) {
             universal_count++;
+            universal_counts[rule->pseudo]++;
             continue;
         }
         const char *fast_key = style_rule_fast_key(rule);
@@ -626,7 +637,8 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
         }
         size_t length = rule->fast_key_length;
         StyleRuleIndexBucket *bucket = style_rule_find_bucket(
-            sheet, (SelectorType) rule->type, fast_key, length, true);
+            sheet, (SelectorType) rule->type, fast_key, length, true,
+            (PseudoElement) rule->pseudo);
         if (bucket == NULL) {
             stylesheet_drop_rule_index(sheet);
             sheet->rule_index_attempted = true;
@@ -649,11 +661,16 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
         sheet->rule_index_attempted = true;
         return;
     }
-    size_t universal_at = 0;
+    uint32_t universal_at[3] = {
+        0, universal_counts[0], universal_counts[0] + universal_counts[1]
+    };
+    for (size_t i = 0; i < 3; i++) {
+        sheet->rule_index_universal_ends[i] = universal_at[i] + universal_counts[i];
+    }
     for (size_t i = 0; i < sheet->count; i++) {
         const StyleRule *rule = &sheet->rules[i];
         if (!rule->has_fast_key) {
-            entries[universal_at++] = (uint32_t) i;
+            entries[universal_at[rule->pseudo]++] = (uint32_t) i;
             continue;
         }
         const char *fast_key = style_rule_fast_key(rule);
@@ -664,7 +681,7 @@ void stylesheet_prepare_rule_index(Stylesheet *sheet)
         }
         StyleRuleIndexBucket *bucket = style_rule_find_bucket(
             sheet, (SelectorType) rule->type, fast_key,
-            rule->fast_key_length, false);
+            rule->fast_key_length, false, (PseudoElement) rule->pseudo);
         if (bucket == NULL || bucket->fill >= bucket->count) {
             stylesheet_drop_rule_index(sheet);
             sheet->rule_index_attempted = true;
@@ -797,7 +814,6 @@ bool stylesheet_build_context(Stylesheet *sheet, Budget *budget,
         return false;
     }
     stylesheet_finalize_rule_order(sheet);
-    update_cascade_ranges(sheet);
     return true;
 }
 
@@ -893,6 +909,108 @@ bool stylesheet_add_css_from(Stylesheet *sheet, const char *css,
         sheet, css, length, source_base_url, NULL);
 }
 
+typedef bool (*StylesheetParseBody)(StyleCssParseContext *, const void *);
+
+/* One parse scope owns scratch/origin restoration and suffix-index lifetime.
+   As before, a rejected suffix may retain valid preceding rules: this is not
+   an atomic rollback of authored declarations. */
+static bool stylesheet_run_parse_transaction(
+    Stylesheet *sheet, const char *base, const char *policy, unsigned origin,
+    bool discover_font_faces, StyleParsedIrBuilder *parsed_ir,
+    StylesheetParseBody body, const void *input)
+{
+    StyleResolveScratch saved_scratch = *sheet->resolve_scratch;
+    unsigned saved_origin = sheet->current_origin;
+    bool own_suffix_state = !sheet->rule_batch_active;
+    if (own_suffix_state) stylesheet_suffix_state_begin(sheet);
+    sheet->current_origin = origin;
+    sheet->resolve_scratch->current_image_source_base = base;
+    sheet->resolve_scratch->current_image_source_referrer_policy = policy;
+    sheet->resolve_scratch->current_image_source_slot = 0;
+    StyleCssParseContext parse = {
+        .sheet = sheet, .parsed_ir = parsed_ir,
+        .discover_font_faces = discover_font_faces
+    };
+    bool parsed = body(&parse, input);
+    parsed = parsed && style_css_parse_context_finish(&parse);
+    if (!parsed) style_css_parse_context_dispose(&parse);
+    sheet->current_origin = saved_origin;
+    *sheet->resolve_scratch = saved_scratch;
+    if (parsed) {
+        sheet->rule_batch_dirty = true;
+        if (!sheet->rule_batch_active) stylesheet_finalize_rule_order(sheet);
+    }
+    if (own_suffix_state) stylesheet_suffix_state_finish(sheet, parsed);
+    return parsed;
+}
+
+typedef struct { const char *css; size_t length; } StyleCssTextInput;
+
+static bool stylesheet_parse_text_body(StyleCssParseContext *parse,
+                                       const void *opaque)
+{
+    const StyleCssTextInput *input = opaque;
+    return parse_css_range(parse, input->css, 0, input->length);
+}
+
+typedef struct {
+    const unsigned char *data;
+    size_t operation_count;
+} StyleParsedIrInput;
+
+static bool stylesheet_parse_ir_body(StyleCssParseContext *parse,
+                                     const void *opaque)
+{
+    const StyleParsedIrInput *input = opaque;
+    size_t at = sizeof(StyleParsedIrHeader);
+    bool parsed = true;
+    for (size_t i = 0; parsed && i < input->operation_count; i++) {
+        StyleParsedIrOperation operation;
+        memcpy(&operation, input->data + at, sizeof(operation));
+        at += sizeof(operation);
+        const char *selectors = (const char *) input->data + at;
+        at += operation.selector_length;
+        const char *declarations = (const char *) input->data + at;
+        at += operation.declaration_length;
+        parsed = selector_list_to_rules(
+            parse, selectors, operation.selector_length,
+            declarations, operation.declaration_length);
+    }
+    return parsed;
+}
+
+typedef struct {
+    lxb_dom_node_t *const *elements;
+    size_t count;
+    const TilefinchContentSecurityPolicy *policy;
+} StyleElementsInput;
+
+static bool stylesheet_parse_elements_body(StyleCssParseContext *parse,
+                                           const void *opaque)
+{
+    const StyleElementsInput *input = opaque;
+    bool parsed = true;
+    for (size_t i = 0; parsed && i < input->count; i++) {
+        lxb_dom_node_t *element = input->elements[i];
+        size_t name_length = 0;
+        const char *name = document_element_name(element, &name_length);
+        if (name == NULL || !span_equal(name, name_length, "style")) {
+            parsed = false;
+            break;
+        }
+        if (!tilefinch_csp_allows_inline_style(
+                input->policy, element)) continue;
+        for (lxb_dom_node_t *child = element->first_child;
+             parsed && child != NULL; child = child->next) {
+            size_t length = 0;
+            const char *css = document_text_data(child, &length);
+            if (css == NULL) continue;
+            parsed = parse_css_range(parse, css, 0, length);
+        }
+    }
+    return parsed;
+}
+
 static bool stylesheet_add_css_from_context_internal(
     Stylesheet *sheet, const char *css, size_t length,
     const char *source_base_url, const char *source_referrer_policy,
@@ -916,29 +1034,10 @@ static bool stylesheet_add_css_from_context_internal(
                 source_referrer_policy, normalized_policy)) return false;
         retained_policy = normalized_policy;
     }
-    StyleResolveScratch saved_scratch = *sheet->resolve_scratch;
-    sheet->resolve_scratch->current_image_source_base = source_base_url;
-    sheet->resolve_scratch->current_image_source_referrer_policy = retained_policy;
-    sheet->resolve_scratch->current_image_source_slot = 0;
-    bool own_suffix_state = !sheet->rule_batch_active;
-    if (own_suffix_state) stylesheet_suffix_state_begin(sheet);
-    StyleCssParseContext parse = {
-        .sheet = sheet,
-        .parsed_ir = parsed_ir,
-        .discover_font_faces = true
-    };
-    bool parsed = parse_css_range(&parse, css, 0, length);
-    parsed = parsed && style_css_parse_context_finish(&parse);
-    if (!parsed) style_css_parse_context_dispose(&parse);
-    *sheet->resolve_scratch = saved_scratch;
-    if (!parsed) {
-        if (own_suffix_state) stylesheet_suffix_state_finish(sheet, false);
-        return false;
-    }
-    sheet->rule_batch_dirty = true;
-    if (!sheet->rule_batch_active) stylesheet_finalize_rule_order(sheet);
-    if (own_suffix_state) stylesheet_suffix_state_finish(sheet, true);
-    return true;
+    StyleCssTextInput input = {css, length};
+    return stylesheet_run_parse_transaction(sheet, source_base_url,
+        retained_policy, sheet->current_origin, true, parsed_ir,
+        stylesheet_parse_text_body, &input);
 }
 
 bool stylesheet_add_css_from_context(
@@ -1094,41 +1193,10 @@ StyleParsedIrApplyResult stylesheet_add_parsed_ir_from_context(
     if ((header.flags & STYLE_PARSED_IR_HAS_MOTION_KEYFRAMES) != 0) {
         sheet->has_motion_keyframes = true;
     }
-    StyleResolveScratch saved_scratch = *sheet->resolve_scratch;
-    sheet->resolve_scratch->current_image_source_base = source_base_url;
-    sheet->resolve_scratch->current_image_source_referrer_policy =
-        retained_policy;
-    sheet->resolve_scratch->current_image_source_slot = 0;
-    bool own_suffix_state = !sheet->rule_batch_active;
-    if (own_suffix_state) stylesheet_suffix_state_begin(sheet);
-    StyleCssParseContext parse = {
-        .sheet = sheet,
-        .discover_font_faces = true
-    };
-    size_t at = sizeof(header);
-    bool parsed = true;
-    for (size_t i = 0; parsed && i < header.operation_count; i++) {
-        StyleParsedIrOperation operation;
-        memcpy(&operation, ir_data + at, sizeof(operation));
-        at += sizeof(operation);
-        const char *selectors = (const char *) ir_data + at;
-        at += operation.selector_length;
-        const char *declarations = (const char *) ir_data + at;
-        at += operation.declaration_length;
-        parsed = selector_list_to_rules(
-            &parse, selectors, operation.selector_length,
-            declarations, operation.declaration_length);
-    }
-    parsed = parsed && style_css_parse_context_finish(&parse);
-    if (!parsed) style_css_parse_context_dispose(&parse);
-    *sheet->resolve_scratch = saved_scratch;
-    if (!parsed) {
-        if (own_suffix_state) stylesheet_suffix_state_finish(sheet, false);
-        return STYLE_PARSED_IR_FAILED;
-    }
-    sheet->rule_batch_dirty = true;
-    if (!sheet->rule_batch_active) stylesheet_finalize_rule_order(sheet);
-    if (own_suffix_state) stylesheet_suffix_state_finish(sheet, true);
+    StyleParsedIrInput input = {ir_data, header.operation_count};
+    if (!stylesheet_run_parse_transaction(sheet, source_base_url,
+            retained_policy, sheet->current_origin, true, NULL,
+            stylesheet_parse_ir_body, &input)) return STYLE_PARSED_IR_FAILED;
     if (operation_count != NULL) *operation_count = header.operation_count;
     return STYLE_PARSED_IR_APPLIED;
 }
@@ -1141,46 +1209,10 @@ bool stylesheet_append_style_elements(
         || (elements == NULL && count != 0)) return false;
     if (count == 0) return true;
     sheet->build_generation = stylesheet_next_generation();
-    bool own_suffix_state = !sheet->rule_batch_active;
-    if (own_suffix_state) stylesheet_suffix_state_begin(sheet);
-    StyleResolveScratch saved_scratch = *sheet->resolve_scratch;
-    sheet->resolve_scratch->current_image_source_base = NULL;
-    sheet->resolve_scratch->current_image_source_referrer_policy = NULL;
-    sheet->resolve_scratch->current_image_source_slot = 0;
-    StyleCssParseContext parse = {
-        .sheet = sheet,
-        .discover_font_faces = true
-    };
-    bool parsed = true;
-    for (size_t i = 0; parsed && i < count; i++) {
-        lxb_dom_node_t *element = elements[i];
-        size_t name_length = 0;
-        const char *name = document_element_name(element, &name_length);
-        if (name == NULL || !span_equal(name, name_length, "style")) {
-            parsed = false;
-            break;
-        }
-        if (!tilefinch_csp_allows_inline_style(
-                content_security_policy, element)) continue;
-        for (lxb_dom_node_t *child = element->first_child;
-             parsed && child != NULL; child = child->next) {
-            size_t length = 0;
-            const char *css = document_text_data(child, &length);
-            if (css == NULL) continue;
-            parsed = parse_css_range(&parse, css, 0, length);
-        }
-    }
-    parsed = parsed && style_css_parse_context_finish(&parse);
-    if (!parsed) style_css_parse_context_dispose(&parse);
-    *sheet->resolve_scratch = saved_scratch;
-    if (!parsed) {
-        if (own_suffix_state) stylesheet_suffix_state_finish(sheet, false);
-        return false;
-    }
-    sheet->rule_batch_dirty = true;
-    if (!sheet->rule_batch_active) stylesheet_finalize_rule_order(sheet);
-    if (own_suffix_state) stylesheet_suffix_state_finish(sheet, true);
-    return true;
+    StyleElementsInput input = {elements, count, content_security_policy};
+    return stylesheet_run_parse_transaction(sheet, NULL, NULL,
+        sheet->current_origin, true, NULL, stylesheet_parse_elements_body,
+        &input);
 }
 
 bool stylesheet_add_style_element(
@@ -1315,31 +1347,9 @@ bool stylesheet_add_user_css(Stylesheet *sheet, const char *css, size_t length)
         || (css == NULL && length != 0)) return false;
     if (length == 0) return true;
     sheet->build_generation = stylesheet_next_generation();
-    bool own_suffix_state = !sheet->rule_batch_active;
-    if (own_suffix_state) stylesheet_suffix_state_begin(sheet);
-    unsigned previous_origin = sheet->current_origin;
-    StyleResolveScratch saved_scratch = *sheet->resolve_scratch;
-    sheet->current_origin = 1;
-    sheet->resolve_scratch->current_image_source_base = NULL;
-    sheet->resolve_scratch->current_image_source_referrer_policy = NULL;
-    sheet->resolve_scratch->current_image_source_slot = 0;
-    StyleCssParseContext parse = {
-        .sheet = sheet,
-        .discover_font_faces = false
-    };
-    bool parsed = parse_css_range(&parse, css, 0, length);
-    parsed = parsed && style_css_parse_context_finish(&parse);
-    if (!parsed) style_css_parse_context_dispose(&parse);
-    sheet->current_origin = previous_origin;
-    *sheet->resolve_scratch = saved_scratch;
-    if (!parsed) {
-        if (own_suffix_state) stylesheet_suffix_state_finish(sheet, false);
-        return false;
-    }
-    sheet->rule_batch_dirty = true;
-    if (!sheet->rule_batch_active) stylesheet_finalize_rule_order(sheet);
-    if (own_suffix_state) stylesheet_suffix_state_finish(sheet, true);
-    return true;
+    StyleCssTextInput input = {css, length};
+    return stylesheet_run_parse_transaction(sheet, NULL, NULL, 1, false,
+        NULL, stylesheet_parse_text_body, &input);
 }
 
 size_t stylesheet_layout_island_selectors(const Stylesheet *sheet,
@@ -1455,6 +1465,7 @@ bool stylesheet_web_font_stats(const Stylesheet *sheet,
 void stylesheet_destroy(Stylesheet *sheet)
 {
     if (sheet == NULL) return;
+    style_selector_cooperation_end(sheet);
     style_variable_cache_end(sheet);
     style_container_layout_state_clear(sheet);
     if (sheet->budget != NULL) {

@@ -16,6 +16,41 @@ provenance against the versions compiled into Tilefinch.
 
 ## Build modes
 
+### Client-only footprint
+
+The owned PSP stack disables Mbed TLS's server role, and curl's proxy, AWS
+SigV4, MIME/form API, terminal progress meter and option-name reflection API.
+Mbed TLS debug formatters and its unused feature-name table are also omitted;
+numeric version reporting and certificate diagnostics remain available.
+It retains TLS 1.2/1.3
+clients, certificate verification, HTTP/2, WebSockets, and transfer callbacks
+used for cancellation and the browser's progress UI. Tilefinch serializes its
+own request bodies. Private-network socket/prerequisite checks remain active;
+only the unavailable proxy setter is omitted in this configuration.
+
+The same `MBEDTLS_USER_CONFIG_FILE` reaches the TLS library, curl and native
+consumers because role switches can change public structure layouts. Both
+external projects track that header as a configure dependency.
+
+September 4, 2026 ordinary EBOOT measurements (actual `.text`, unchanged
+4,480,000-byte ceiling): original 4,482,252 bytes; client-only TLS 4,446,228;
+unused curl subsystems removed 4,380,568. These are linked measurements, not
+archive-size estimates. Speech extraction is a separate runtime-component
+change, described in the development guide.
+
+After speech extraction, removing those unused debug/reflection facilities
+reduced ordinary `.text` from 4,127,224 to 4,091,068 bytes and `.rodata` from
+1,932,060 to 1,904,756 bytes (including the small counter-index layout fix).
+Both ordinary and validation named cross-build targets and all 149 enabled
+host tests passed. These are linked ELF measurements, not estimates of
+archive members that may already have been discarded by the linker.
+
+Post-change PPSSPP qualification passed a small public HTTPS page (HTTP 200,
+verified TLS, page load and clean teardown). The live Wikipedia article run
+received HTTPS data but exceeded its timeout in CSS selector matching; it is
+not counted as a passing page qualification or attributed to DNS. Physical
+PSP networking/media checks remain separate release gates.
+
 The shipping `psp` preset selects the owned stack with HTTP/2 enabled:
 
 ```text

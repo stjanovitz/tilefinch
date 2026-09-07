@@ -1,3 +1,158 @@
+static void test_flow_profile_nested_return(LayoutContext *context)
+{
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_STYLE);
+    return;
+}
+
+static void test_flow_profile_outer_return(LayoutContext *context)
+{
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_INTRINSIC);
+    LayoutFlowScope same = layout_flow_scope_enter(
+        context, LAYOUT_FLOW_INTRINSIC);
+    layout_flow_scope_leave(&same);
+    test_flow_profile_nested_return(context);
+    return;
+}
+
+static int test_flow_profile_exclusive_scopes(Budget *budget)
+{
+    size_t baseline = budget->current;
+    LayoutDocument layout = {.trace_flags = LAYOUT_TRACE_LAYOUT_PROFILE};
+    LayoutContext *context = budget_calloc(budget, 1, sizeof(*context));
+    CHECK(context != NULL);
+    context->layout = &layout;
+    layout_flow_profile_begin(context);
+    CHECK(context->flow_profile_active);
+    test_flow_profile_outer_return(context);
+    CHECK(context->flow_profile_phase == LAYOUT_FLOW_OTHER
+          && layout.performance.flow_phase_transitions == 4);
+    layout_flow_profile_end(context);
+    CHECK(!context->flow_profile_active
+          && layout.performance.flow_phase_transitions == 5);
+    test_flow_profile_outer_return(context);
+    CHECK(layout.performance.flow_phase_transitions == 5);
+    budget_free(budget, context);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+typedef struct {
+    uint64_t now_ns;
+    size_t polls;
+    bool cancel;
+} LayoutDeadlineProbe;
+
+static uint64_t layout_deadline_clock(void *opaque)
+{
+    return ((LayoutDeadlineProbe *) opaque)->now_ns;
+}
+
+static bool layout_deadline_poll(void *opaque, const char *phase, size_t work)
+{
+    (void) work;
+    LayoutDeadlineProbe *probe = opaque;
+    if (strcmp(phase, "layout") != 0) return true;
+    probe->polls++;
+    return !probe->cancel;
+}
+
+static int test_layout_elapsed_input_checkpoint(Budget *budget)
+{
+    size_t baseline = budget->current;
+    LayoutDocument layout = {0};
+    LayoutContext *context = budget_calloc(budget, 1, sizeof(*context));
+    CHECK(context != NULL);
+    context->layout = &layout;
+    LayoutDeadlineProbe probe = { .now_ns = UINT64_C(1000000000) };
+    context->slice_started_ns = probe.now_ns;
+    TilefinchPlatformServices services = { .context = &probe,
+        .monotonic_time_ns = layout_deadline_clock,
+        .cooperate = layout_deadline_poll };
+    tilefinch_platform_set_services(&services);
+    CHECK(layout_cooperate(context, NULL) && probe.polls == 0);
+    probe.now_ns += UINT64_C(8000000);
+    /* Two expensive nodes must service input without waiting for node four. */
+    CHECK(layout_cooperate(context, NULL) && probe.polls == 1
+          && context->slice_units == 0);
+    for (unsigned i = 0; i < LAYOUT_WORK_QUOTA; i++)
+        CHECK(layout_cooperate(context, NULL));
+    CHECK(probe.polls == 2); /* Cheap nodes keep their existing quota. */
+    probe.cancel = true;
+    probe.now_ns += UINT64_C(8000000);
+    CHECK(!layout_cooperate(context, NULL) && probe.polls == 3
+          && context->cancelled && layout.performance.cancelled);
+    tilefinch_platform_set_services(NULL);
+    budget_free(budget, context);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
+static int test_node_box_index_absence(Budget *budget)
+{
+    size_t baseline = budget->current;
+    static const char page[] =
+        "<!doctype html><style>#hidden{display:none}</style>"
+        "<div id=first>First</div><div id=second>Second</div>"
+        "<div id=hidden>Hidden</div>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0}, visual = {0};
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1, 31)
+          && stylesheet_build(&sheet, budget, &document, 480)
+          && layout_build(&layout, budget, &document, &sheet,
+                          NULL, NULL, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *present = find_id(root, "second");
+    lxb_dom_node_t *absent = find_id(root, "hidden");
+    CHECK(present != NULL && absent != NULL
+          && layout.node_index_count == layout.node_box_count
+          && layout.node_index_count > 1);
+    tilefinch_test_faults()->layout_node_box_scans = 0;
+    const LayoutNodeBox *expected = layout_box_for_node(&layout, present);
+    for (unsigned i = 0; i < 100; i++) {
+        CHECK(layout_box_for_node(&layout, absent) == NULL);
+    }
+    CHECK(expected != NULL
+          && tilefinch_test_faults()->layout_node_box_scans == 0);
+
+    /* Simulate a growth refusal before the last entry was inserted. The
+       existing index still answers hits; an unindexed box needs the scan. */
+    size_t slot = 0;
+    while (slot < layout.node_index_capacity
+           && layout.node_index[slot].node != present) slot++;
+    CHECK(slot < layout.node_index_capacity);
+    LayoutNodeIndexEntry saved = layout.node_index[slot];
+    layout.node_index[slot] = (LayoutNodeIndexEntry) {0};
+    layout.node_index_count--;
+    layout.node_index_growth_disabled = true;
+    tilefinch_test_faults()->layout_node_box_scans = 0;
+    CHECK(layout_box_for_node(&layout, present) == expected
+          && layout_box_for_node(&layout, absent) == NULL
+          && tilefinch_test_faults()->layout_node_box_scans == 2);
+    layout.node_index[slot] = saved;
+    layout.node_index_count++;
+    layout.node_index_growth_disabled = false;
+
+    CHECK(layout_clone_visual(&visual, &layout));
+    tilefinch_test_faults()->layout_node_box_scans = 0;
+    CHECK(layout_box_for_node(&visual, present) != NULL
+          && layout_box_for_node(&visual, absent) == NULL
+          && tilefinch_test_faults()->layout_node_box_scans == 0);
+    /* A wholly unavailable index also retains correct hit/miss behavior. */
+    LayoutNodeIndexEntry *saved_index = visual.node_index;
+    visual.node_index = NULL;
+    CHECK(layout_box_for_node(&visual, present) != NULL
+          && layout_box_for_node(&visual, absent) == NULL
+          && tilefinch_test_faults()->layout_node_box_scans == 2);
+    visual.node_index = saved_index;
+    layout_destroy(&visual);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
 static int test_modern_conditional_cascade(Budget *budget)
 {
     static const char page[] =
@@ -705,6 +860,161 @@ static int test_international_line_flow(Budget *budget)
               || !draw_command_text_rtl(&layout.commands[i]));
     }
     layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_text_run_scan_reuse(Budget *budget)
+{
+    static const struct {
+        const char *text;
+        bool keep, hyphens_none;
+        size_t expected;
+        bool discard;
+    } cases[] = {
+        {"ASCII words", false, false, 5, false},
+        {"abc\xe4\xb8\xad", false, false, 3, false},
+        {"abc\xe4\xb8\xad", true, false, 6, false},
+        {"\xe4\xb8\xad" "abc", false, false, 3, false},
+        {"\xe4\xb8\xad" "abc", true, false, 6, false},
+        {"\xe3\x80\x88" "AB", false, false, 4, false},
+        {"\xe4\xb8\xad\xef\xbc\x89" "A", false, false, 6, false},
+        {"a\xcc\x81" "b", false, false, 4, false},
+        {"\xe2\x80\x8b" "abc", false, false, 3, true},
+        {"\xc2\xad" "abc", false, false, 2, true},
+        {"\xc2\xad" "abc", false, true, 5, false},
+        {"abc\xe2", false, false, 4, false},
+        {"\xe2" "abc", false, false, 4, false},
+        {"abc\xd7\x90", false, false, 5, false}
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        bool discard = false;
+        size_t got = utf8_line_segment_length(cases[i].text, strlen(cases[i].text),
+            cases[i].keep, cases[i].hyphens_none, &discard);
+        if (got != cases[i].expected || discard != cases[i].discard)
+            fprintf(stderr, "segment case %zu: length=%zu discard=%d\n", i, got, discard);
+        CHECK(got == cases[i].expected && discard == cases[i].discard);
+    }
+    FontSet fonts = {0};
+    CHECK(font_set_load_selected(&fonts, budget, TILEFINCH_TEST_SANS_FONT,
+        NULL, NULL, NULL, NULL, NULL, NULL, 4 * MIB, FONT_SET_FACE_SANS));
+    static const char *runs[] = {"AVATAR", "a\xcc\x81", "\xe2\x80\x8b",
+        "\xd7\x90\xd7\x91", "bad\xff", ""};
+    for (size_t i = 0; i < sizeof(runs) / sizeof(runs[0]); i++) {
+        size_t length = strlen(runs[i]);
+        for (int kerning = 0; kerning < 2; kerning++) {
+            int raw = font_text_width_for_family_at_size_fixed_mode(
+                &fonts.sans, FONT_SANS, runs[i], length, 16 * 64 + 32,
+                false, false, kerning);
+            CHECK(raw >= 0 && measured_text_width_fixed_mode(&fonts.sans,
+                FONT_SANS, runs[i], length, 16 * 64 + 32, false, false,
+                2, 0, kerning) == raw);
+        }
+    }
+    int raw = font_text_width_for_family_at_size_fixed_mode(&fonts.sans,
+        FONT_SANS, "AAAA", 4, 16 * 64, false, false, true);
+    CHECK(raw > 0 && measured_text_width_fixed_mode(&fonts.sans, FONT_SANS,
+        "AAAA", 4, 16 * 64, false, false, 2, -100, true) == raw / 4);
+    CHECK(measured_text_width_fixed_mode(&fonts.sans, FONT_SANS,
+        "AAAA", 4, 16 * 64, false, false, 2, 2, true) == raw + 3 * 2 * 64);
+    CHECK(measured_text_width_fixed_mode(NULL, FONT_SANS, "AAAA", 4,
+        16 * 64, false, false, 2, 0, true) == 4 * 6 * 2 * 64);
+    static const char html[] = "<!doctype html><body><p>ASCII words wrap safely</p>"
+        "<p dir=rtl>ASCII words still honor authored direction</p></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, html, sizeof(html) - 1, 31)
+        && stylesheet_build(&sheet, budget, &document, 480)
+        && layout_build(&layout, budget, &document, &sheet, &fonts, NULL, 480)
+        && layout.performance.ascii_text_segments >= 4);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    font_set_destroy(&fonts);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_font_publication_style_reuse(Budget *budget)
+{
+    static const char page[] = "<!doctype html><style>"
+        "#plain{color:#123456;width:50px}"
+        "#metric{font:20px serif;width:20ch}"
+        "#child{width:inherit}</style><body><div id=plain>Plain</div>"
+        "<div id=metric><span id=child>Metric</span></div></body>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    FontSet fonts = {0};
+    CHECK(document_parse(&document, budget, page, sizeof(page) - 1, 17)
+          && stylesheet_build(&sheet, budget, &document, 480));
+    LayoutReuseCache *cache = layout_reuse_cache_create(budget);
+    CHECK(cache != NULL);
+    layout_reuse_cache_prepare(cache, &sheet, &fonts, NULL, 480);
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *plain = find_id(root, "plain");
+    lxb_dom_node_t *metric = find_id(root, "metric");
+    lxb_dom_node_t *child = find_id(root, "child");
+    ComputedStyle parent = layout_initial_root_style(), a, b, c, fresh;
+    CHECK(plain != NULL && metric != NULL && child != NULL);
+    CHECK(!layout_reuse_cache_resolve_style(cache, &sheet, &fonts, plain, &parent, &a));
+    CHECK(!layout_reuse_cache_resolve_style(cache, &sheet, &fonts, metric, &parent, &b));
+    CHECK(!layout_reuse_cache_resolve_style(cache, &sheet, &fonts, child, &b, &c));
+    int old_width = b.width;
+    CHECK(font_set_load_selected(&fonts, budget,
+        TILEFINCH_TEST_SANS_FONT, TILEFINCH_TEST_SERIF_FONT,
+        NULL, NULL, NULL, NULL, NULL, 4 * MIB, FONT_SET_FACE_SERIF));
+    layout_reuse_cache_begin_font_publication(cache);
+    CHECK(layout_reuse_cache_resolve_style(cache, &sheet, &fonts, plain, &parent, &fresh)
+          && memcmp(&a, &fresh, sizeof(a)) == 0);
+    CHECK(!layout_reuse_cache_resolve_style(cache, &sheet, &fonts, metric, &parent, &b)
+          && b.width != old_width);
+    CHECK(!layout_reuse_cache_resolve_style(cache, &sheet, &fonts, child, &b, &c));
+    (void) layout_reuse_cache_resolve_style(NULL, &sheet, &fonts, child, &b, &fresh);
+    CHECK(memcmp(&c, &fresh, sizeof(c)) == 0);
+    (void) layout_reuse_cache_resolve_style(NULL, &sheet, &fonts, metric, &parent, &fresh);
+    CHECK(memcmp(&b, &fresh, sizeof(b)) == 0);
+    layout_reuse_cache_end_font_publication(cache);
+    layout_reuse_cache_destroy(cache);
+    font_set_destroy(&fonts);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_font_publication_preserves_retained_tail(Budget *budget)
+{
+    char html[20000];
+    size_t used = (size_t) snprintf(html, sizeof(html), "<!doctype html><body>");
+    for (size_t i = 0; i < LAYOUT_REUSE_STYLE_CAPACITY + 256u; i++) {
+        CHECK(used + 8u < sizeof(html));
+        memcpy(html + used, "<p>x</p>", 8u);
+        used += 8u;
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, budget, html, used, 31)
+          && stylesheet_build(&sheet, budget, &document, 480));
+    LayoutReuseCache *cache = layout_reuse_cache_create(budget);
+    CHECK(cache != NULL);
+    layout_reuse_cache_prepare(cache, &sheet, NULL, NULL, 480);
+    lxb_dom_node_t *body = lxb_dom_interface_node(document.html->body);
+    ComputedStyle parent = layout_initial_root_style(), result;
+    for (lxb_dom_node_t *node = body->first_child; node != NULL; node = node->next)
+        (void) layout_reuse_cache_resolve_style(cache, &sheet, NULL, node, &parent, &result);
+    CHECK(body->last_child != NULL && layout_reuse_cache_resolve_style(
+        cache, &sheet, NULL, body->last_child, &parent, &result));
+    layout_reuse_cache_begin_font_publication(cache);
+    bool tail_hit = false;
+    for (lxb_dom_node_t *node = body->first_child; node != NULL; node = node->next)
+        tail_hit = layout_reuse_cache_resolve_style(cache, &sheet, NULL, node, &parent, &result);
+    CHECK(tail_hit);
+    layout_reuse_cache_end_font_publication(cache);
+    CHECK(!cache->font_publication_active);
+    layout_reuse_cache_destroy(cache);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
     CHECK(budget->current == 0);

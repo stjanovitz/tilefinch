@@ -107,6 +107,8 @@ option(PSP_BROWSER_USE_COMPILER_CACHE
        "Use ccache or sccache when one is available" ON)
 option(PSP_BROWSER_USE_BELLARD_QUICKJS
        "Use pinned upstream QuickJS instead of QuickJS-NG" OFF)
+option(TILEFINCH_PROFILE_LAYOUT_FLOW
+    "Enable intrusive exclusive layout-flow timers in PSP validation builds" OFF)
 option(TILEFINCH_PSP_VALIDATION_LOG
        "Enable PSP stdout validation, Memory Stick logs/crash journal, and the logging watchdog (slow; intended only for diagnostic builds)" OFF)
 option(TILEFINCH_PSP_MEDIA_PICTURE_TRACE
@@ -199,34 +201,6 @@ set(PSP_BROWSER_TRANSPORT_SOURCE
     "Transport backend implementing the bounded tilefinch/fetch.h contract")
 set(PSP_BROWSER_QUICKJS_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/quickjs-ng-v0.15.0-closure-shape-cache.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-vm-profile.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_OOM_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-oom-backtrace.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_INTERRUPT_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-compile-interrupt.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_ARRAY_GROWTH_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-bounded-array-growth.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_ARRAY_GROWTH_MIGRATION_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-array-growth-128k-migration.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_CAPTURE_GETTER_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-capture-getter-fastpath.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_PROPERTY_FAULT_TRACE_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-property-fault-trace.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_DYNAMIC_CODE_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-dynamic-code-policy.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_LATIN1_STRING_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-latin1-string.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_LATIN1_STRING_VM_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-latin1-string-vm.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_REPEAT_ROPE_EVAL_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-repeat-rope-eval.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_SINGLE_CHAR_BUFFER_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-single-char-string-buffer.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_COMPACT_CHAR_ARRAY_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-compact-char-array.patch")
-set(PSP_BROWSER_BELLARD_QUICKJS_COMPACT_CHAR_ARRAY_COW_PATCH
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-compact-char-array-cow.patch")
 set(PSP_BROWSER_LEXBOR_PATCH
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/lexbor-v3.0.0-partial-document-destroy.patch")
 set(PSP_BROWSER_NANOSVG_PATCH
@@ -243,20 +217,6 @@ set(PSP_BROWSER_APPLY_PATCH_SCRIPT
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${PSP_BROWSER_QUICKJS_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_OOM_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_INTERRUPT_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_ARRAY_GROWTH_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_ARRAY_GROWTH_MIGRATION_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_CAPTURE_GETTER_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_PROPERTY_FAULT_TRACE_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_DYNAMIC_CODE_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_LATIN1_STRING_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_LATIN1_STRING_VM_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_REPEAT_ROPE_EVAL_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_SINGLE_CHAR_BUFFER_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_COMPACT_CHAR_ARRAY_PATCH}"
-    "${PSP_BROWSER_BELLARD_QUICKJS_COMPACT_CHAR_ARRAY_COW_PATCH}"
     "${PSP_BROWSER_LEXBOR_PATCH}"
     "${PSP_BROWSER_NANOSVG_PATCH}"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/pocketsphinx/pocketsphinx-5.1.1-psp-int32.patch"
@@ -391,659 +351,158 @@ if(PSP AND TARGET lexbor_static)
 endif()
 
 if(PSP_BROWSER_USE_BELLARD_QUICKJS)
-    FetchContent_Declare(
-        quickjs
-        URL https://github.com/bellard/quickjs/archive/04be246001599f5995fa2f2d8c91a0f198d3f34c.tar.gz
-        URL_HASH SHA256=2a87ffcca6c870f764ce70a7736351bd7cff3dc1fb95a8fb059c260979f1e01a
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    )
-    FetchContent_MakeAvailable(quickjs)
-    # These are exact accepted states for the pinned 04be246 source.  Checking
-    # the complete files is stronger than treating a successful reverse patch
-    # dry-run as proof that a patch was already applied: BSD patch cannot
-    # reverse-check the OOM patch's adjacent minimal-context hunks reliably,
-    # and a later VM patch legitimately changes the same files again.
-    set(bellard_quickjs_oom_c_sha256
-        "3a1c22544909d0f1f59124945de4980141b4bb27ee10f4b1d7fb1c09068ddb9b")
-    set(bellard_quickjs_oom_h_sha256
-        "2165f47772af9faee1798999a599fa9de850d1bf0259502dade1c25d4a588316")
-    # The compile-interrupt patch stacks on the OOM fix and is applied in
-    # every Bellard configuration; the resulting pair is the portable
-    # baseline.  quickjs.h is untouched by both patches.
-    set(bellard_quickjs_interrupt_c_sha256
-        "77faf57435f09f283a5194af760c4f224d90c1247367e45079db947bedd03377")
-    set(bellard_quickjs_bounded_c_sha256
-        "c8ce8fb2d67622bc9055480fe811438f0fe497a0e1662521ec53b6ad564fdf8e")
-    set(bellard_quickjs_capture_getter_c_sha256
-        "5eb59a027db4ac201e8a5b14bf34b01398f34e3870c98d7791e301959e46fa59")
-    set(bellard_quickjs_property_fault_trace_c_sha256
-        "e24221177e2e658adb19ce83442bd3ecf172cb1d6a9fe975e8089d1cd073c755")
-    set(bellard_quickjs_capture_getter_property_fault_trace_c_sha256
-        "792a155c4032bb6bbb02c1d832347f2644c74d0bbd5111727d30858eeb5e612d")
-    # The vm-profile patch is regenerated against the compile-interrupt
-    # baseline; older vm-patched trees (813b15d4... / 1c341fc3...) are no
-    # longer recognized and need a fresh binary directory.
-    set(bellard_quickjs_vm_c_sha256
-        "f27a21c4edd18dd9d28fde050e0dead3597a83c610155333be50c828b03fefbe")
-    set(bellard_quickjs_vm_h_sha256
-        "0acf0b53accb016cd7bc5605b9e4f8eb3761a9d2117f3bdf064d84d20b13feeb")
-    set(bellard_quickjs_bounded_vm_c_sha256
-        "965c0f1001b5dd7cb98fb7876ad60e12b376234b58791e0423b04db2e24a7121")
-    set(bellard_quickjs_pristine_c_sha256
-        "a68622cecb806f39bf24738c376a0a73032ea8913478cad702e0265c46f7999f")
-    set(bellard_quickjs_pristine_h_sha256
-        "2165f47772af9faee1798999a599fa9de850d1bf0259502dade1c25d4a588316")
-    # The compact character-array copy-on-write layer stacks on the compact
-    # representation. Remove it first so that the base optimization can be
-    # reversed and the exact underlying source state can be fingerprinted.
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.c"
-         bellard_compact_char_array_cow_preexisting
-         REGEX "Large character decoders are both latency")
-    if(bellard_compact_char_array_cow_preexisting)
-        execute_process(
-            COMMAND "${PATCH_EXECUTABLE}" --silent -R -p1
-                -i "${PSP_BROWSER_BELLARD_QUICKJS_COMPACT_CHAR_ARRAY_COW_PATCH}"
-            WORKING_DIRECTORY "${quickjs_SOURCE_DIR}"
-            RESULT_VARIABLE bellard_compact_char_array_cow_reverse_result)
-        if(NOT bellard_compact_char_array_cow_reverse_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not remove the Bellard QuickJS compact character-array copy-on-write layer before fingerprint validation")
-        endif()
-    endif()
-    # Portable Bellard builds may pack dense arrays of one-character Latin-1
-    # strings. Remove the final optimization before identifying the underlying
-    # source state, then restore it after the portable patch stack.
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.c"
-         bellard_compact_char_array_preexisting
-         REGEX "compact_char_array")
-    if(bellard_compact_char_array_preexisting)
-        execute_process(
-            COMMAND "${PATCH_EXECUTABLE}" --silent -R -p1
-                -i "${PSP_BROWSER_BELLARD_QUICKJS_COMPACT_CHAR_ARRAY_PATCH}"
-            WORKING_DIRECTORY "${quickjs_SOURCE_DIR}"
-            RESULT_VARIABLE bellard_compact_char_array_reverse_result)
-        if(NOT bellard_compact_char_array_reverse_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not remove the Bellard QuickJS compact character-array hook before fingerprint validation")
-        endif()
-    endif()
-    # FetchContent reuses its source tree. Remove our final, variant-agnostic
-    # CSP hook before identifying the underlying pinned/optional patch state;
-    # it is re-applied after that state has been fully validated below.
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.h"
-         bellard_dynamic_code_preexisting
-         REGEX "JS_SetDynamicCodeEnabled")
-    if(bellard_dynamic_code_preexisting)
-        execute_process(
-            COMMAND "${PATCH_EXECUTABLE}" --silent -R -p1
-                -i "${PSP_BROWSER_BELLARD_QUICKJS_DYNAMIC_CODE_PATCH}"
-            WORKING_DIRECTORY "${quickjs_SOURCE_DIR}"
-            RESULT_VARIABLE bellard_dynamic_code_reverse_result)
-        if(NOT bellard_dynamic_code_reverse_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not remove the Bellard QuickJS CSP hook before fingerprint validation")
-        endif()
-    endif()
-    # The bounded Latin-1 constructor is a final, variant-agnostic host hook.
-    # Remove it before identifying the underlying portable/experimental state,
-    # then reapply it after all variant patches below.
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.h"
-         bellard_latin1_string_preexisting
-         REGEX "JS_NewStringLenLatin1Portable")
-    if(bellard_latin1_string_preexisting)
-        file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.h"
-             bellard_latin1_string_vm_preexisting
-             REGEX "JSValue JS_NewStringLenLatin1\\(")
-        if(bellard_latin1_string_vm_preexisting)
-            set(bellard_latin1_reverse_patch
-                "${PSP_BROWSER_BELLARD_QUICKJS_LATIN1_STRING_VM_PATCH}")
-        else()
-            set(bellard_latin1_reverse_patch
-                "${PSP_BROWSER_BELLARD_QUICKJS_LATIN1_STRING_PATCH}")
-        endif()
-        execute_process(
-            COMMAND "${PATCH_EXECUTABLE}" --silent -R -p1
-                -i "${bellard_latin1_reverse_patch}"
-            WORKING_DIRECTORY "${quickjs_SOURCE_DIR}"
-            RESULT_VARIABLE bellard_latin1_string_reverse_result)
-        if(NOT bellard_latin1_string_reverse_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not remove the Bellard QuickJS Latin-1 hook before fingerprint validation")
-        endif()
-    endif()
-    # Large String.prototype.repeat() results and eval's rope-aware prefix
-    # compaction are a final, variant-agnostic optimization. Remove the hook
-    # before exact fingerprint validation, then restore it after all optional
-    # VM and diagnostics patches have reached a known state.
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.c"
-         bellard_repeat_rope_eval_preexisting
-         REGEX "tilefinch_compact_eval_rope")
-    if(bellard_repeat_rope_eval_preexisting)
-        execute_process(
-            COMMAND "${PATCH_EXECUTABLE}" --silent -R -p1
-                -i "${PSP_BROWSER_BELLARD_QUICKJS_REPEAT_ROPE_EVAL_PATCH}"
-            WORKING_DIRECTORY "${quickjs_SOURCE_DIR}"
-            RESULT_VARIABLE bellard_repeat_rope_eval_reverse_result)
-        if(NOT bellard_repeat_rope_eval_reverse_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not remove the Bellard QuickJS repeat/eval hook before fingerprint validation")
-        endif()
-    endif()
-    # Single-code-unit StringBuffer results share the same immutable runtime
-    # cache as the direct string constructor. Remove the final hook before
-    # identifying the underlying Bellard source variant.
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.c"
-         bellard_single_char_buffer_preexisting
-         REGEX "string primitive identity is unobservable")
-    if(bellard_single_char_buffer_preexisting)
-        execute_process(
-            COMMAND "${PATCH_EXECUTABLE}" --silent -R -p1
-                -i "${PSP_BROWSER_BELLARD_QUICKJS_SINGLE_CHAR_BUFFER_PATCH}"
-            WORKING_DIRECTORY "${quickjs_SOURCE_DIR}"
-            RESULT_VARIABLE bellard_single_char_buffer_reverse_result)
-        if(NOT bellard_single_char_buffer_reverse_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not remove the Bellard QuickJS single-character buffer hook before fingerprint validation")
-        endif()
-    endif()
-    file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.c"
-         bellard_quickjs_c_sha256)
-    file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.h"
-         bellard_quickjs_h_sha256)
-    # Existing binary trees may still contain the previously admitted
-    # 512-KiB array-growth variant.  Migrate only those exact complete-file
-    # fingerprints before normal admission; arbitrary or partially patched
-    # dependency sources remain rejected below.
-    set(bellard_quickjs_legacy_growth_hashes
-        "9935855e83fe1de272228e9006bf77fb8a1a4060fcc5314fd167a2dae2e3f030"
-        "dbc79c52c67ba62b6821fc2b527cb0970aec62781e15b24d0de4fd69d5a3986f"
-        "c5e3fc39e6dc8fd4285370a20476815d3720147bf379d54dc73a1af32ebf6440"
-        "a2545fef70a7987c3c8bd01f8bb17789bfadb1e45028ef80cc27217c87046228"
-        "e142c161fa8a42b7ccf8349eccd6d3bd5a6a1a6bdb5c3bf20cbd63c5e303627d")
-    if(bellard_quickjs_c_sha256 IN_LIST
-       bellard_quickjs_legacy_growth_hashes)
-        execute_process(
-            COMMAND "${PATCH_EXECUTABLE}" --forward --silent -p1
-                -i "${PSP_BROWSER_BELLARD_QUICKJS_ARRAY_GROWTH_MIGRATION_PATCH}"
-            WORKING_DIRECTORY "${quickjs_SOURCE_DIR}"
-            RESULT_VARIABLE bellard_quickjs_growth_migration_result
-            OUTPUT_VARIABLE bellard_quickjs_growth_migration_output
-            ERROR_VARIABLE bellard_quickjs_growth_migration_error)
-        if(NOT bellard_quickjs_growth_migration_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not migrate recognized Bellard QuickJS array-growth source: ${bellard_quickjs_growth_migration_output}${bellard_quickjs_growth_migration_error}")
-        endif()
-        file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.c"
-             bellard_quickjs_c_sha256)
-    endif()
-    set(bellard_quickjs_oom_ready OFF)
-    set(bellard_quickjs_interrupt_ready OFF)
-    set(bellard_quickjs_vm_ready OFF)
-    set(bellard_quickjs_bounded_ready OFF)
-    set(bellard_quickjs_capture_getter_ready OFF)
-    set(bellard_quickjs_property_fault_trace_ready OFF)
-    set(bellard_quickjs_oom_preimage "")
-    if(bellard_quickjs_c_sha256 STREQUAL
-           bellard_quickjs_interrupt_c_sha256
-       AND bellard_quickjs_h_sha256 STREQUAL
-           bellard_quickjs_oom_h_sha256)
-        set(bellard_quickjs_oom_ready ON)
-        set(bellard_quickjs_interrupt_ready ON)
-    elseif(bellard_quickjs_c_sha256 STREQUAL
-               bellard_quickjs_bounded_c_sha256
-           AND bellard_quickjs_h_sha256 STREQUAL
-               bellard_quickjs_oom_h_sha256)
-        set(bellard_quickjs_oom_ready ON)
-        set(bellard_quickjs_interrupt_ready ON)
-        set(bellard_quickjs_bounded_ready ON)
-    elseif(PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
-           AND bellard_quickjs_c_sha256 STREQUAL
-               bellard_quickjs_capture_getter_c_sha256
-           AND bellard_quickjs_h_sha256 STREQUAL
-               bellard_quickjs_oom_h_sha256)
-        set(bellard_quickjs_oom_ready ON)
-        set(bellard_quickjs_interrupt_ready ON)
-        set(bellard_quickjs_bounded_ready ON)
-        set(bellard_quickjs_capture_getter_ready ON)
-    elseif(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE
-           AND bellard_quickjs_c_sha256 STREQUAL
-               bellard_quickjs_property_fault_trace_c_sha256
-           AND bellard_quickjs_h_sha256 STREQUAL
-               bellard_quickjs_oom_h_sha256)
-        set(bellard_quickjs_oom_ready ON)
-        set(bellard_quickjs_interrupt_ready ON)
-        set(bellard_quickjs_bounded_ready ON)
-        set(bellard_quickjs_property_fault_trace_ready ON)
-    elseif(PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
-           AND PSP_BROWSER_JS_PROPERTY_FAULT_TRACE
-           AND bellard_quickjs_c_sha256 STREQUAL
-               bellard_quickjs_capture_getter_property_fault_trace_c_sha256
-           AND bellard_quickjs_h_sha256 STREQUAL
-               bellard_quickjs_oom_h_sha256)
-        set(bellard_quickjs_oom_ready ON)
-        set(bellard_quickjs_interrupt_ready ON)
-        set(bellard_quickjs_bounded_ready ON)
-        set(bellard_quickjs_capture_getter_ready ON)
-        set(bellard_quickjs_property_fault_trace_ready ON)
-    elseif(bellard_quickjs_c_sha256 STREQUAL
-           bellard_quickjs_oom_c_sha256
-       AND bellard_quickjs_h_sha256 STREQUAL
-           bellard_quickjs_oom_h_sha256)
-        set(bellard_quickjs_oom_ready ON)
-    elseif(bellard_quickjs_c_sha256 STREQUAL
-               bellard_quickjs_vm_c_sha256
-           AND bellard_quickjs_h_sha256 STREQUAL
-               bellard_quickjs_vm_h_sha256)
-        set(bellard_quickjs_oom_ready ON)
-        set(bellard_quickjs_interrupt_ready ON)
-        set(bellard_quickjs_vm_ready ON)
-        set(bellard_quickjs_capture_getter_ready ON)
-    elseif(bellard_quickjs_c_sha256 STREQUAL
-               bellard_quickjs_bounded_vm_c_sha256
-           AND bellard_quickjs_h_sha256 STREQUAL
-               bellard_quickjs_vm_h_sha256)
-        set(bellard_quickjs_oom_ready ON)
-        set(bellard_quickjs_interrupt_ready ON)
-        set(bellard_quickjs_vm_ready ON)
-        set(bellard_quickjs_bounded_ready ON)
-        set(bellard_quickjs_capture_getter_ready ON)
-    elseif(bellard_quickjs_c_sha256 STREQUAL
-               bellard_quickjs_pristine_c_sha256
-           AND bellard_quickjs_h_sha256 STREQUAL
-               bellard_quickjs_pristine_h_sha256)
-        set(bellard_quickjs_oom_preimage "pristine")
-    else()
+    # The engine is vendored: third_party/quickjs is upstream Bellard QuickJS
+    # at commit 04be246 with this repository's patch stack already applied
+    # (see third_party/quickjs/README.md for the list). Nothing is fetched
+    # and nothing is patched for an ordinary build. One gate remains: the
+    # vendored quickjs.c/quickjs.h must match the pinned fingerprints below,
+    # so an accidental edit, a stale copy, or a half-merged change fails
+    # configure loudly instead of shipping. An intentional engine change
+    # updates the two pins in the same commit.
+    set(tilefinch_quickjs_vendor_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
+    set(tilefinch_quickjs_vendor_c_sha256
+        "cf74e1791ba97e8f21ed938bc2f9daa6e451969152645ebcb6f1590f92547b1e")
+    set(tilefinch_quickjs_vendor_h_sha256
+        "11e8276bbfc72fac921cb4daf0ce3735bc6f831184b85753a7465a7c2bfe69f0")
+    file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.c" tilefinch_quickjs_c_sha256)
+    file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.h" tilefinch_quickjs_h_sha256)
+    if(NOT tilefinch_quickjs_c_sha256 STREQUAL tilefinch_quickjs_vendor_c_sha256
+       OR NOT tilefinch_quickjs_h_sha256 STREQUAL tilefinch_quickjs_vendor_h_sha256)
         message(FATAL_ERROR
-            "Bellard QuickJS source has an unrecognized fingerprint "
-            "(possibly a tree patched before the compile-interrupt "
-            "baseline); configure in a fresh binary directory or remove "
-            "that binary directory's _deps/quickjs-src")
+            "third_party/quickjs does not match its pinned fingerprint "
+            "(quickjs.c ${tilefinch_quickjs_c_sha256}, quickjs.h "
+            "${tilefinch_quickjs_h_sha256}). If this engine change is "
+            "intentional, update tilefinch_quickjs_vendor_c_sha256 and "
+            "tilefinch_quickjs_vendor_h_sha256 in cmake/TilefinchDependencies.cmake "
+            "in the same commit; otherwise restore the vendored files.")
     endif()
-    # build_backtrace() receives the runtime's current exception as a borrowed
-    # value. If adding its stack property exhausts the heap, QuickJS replaces
-    # current_exception and can free that object while build_backtrace() is
-    # still using it. QuickJS-NG roots the error for the same reason; carry the
-    # minimal lifetime fix against our pinned Bellard revision.
-    if(NOT bellard_quickjs_oom_ready)
-        # One hunk intentionally ends immediately after its added line.  BSD
-        # patch 2.0 rejects that valid zero-trailing-context hunk both forward
-        # and in reverse.  Git's explicit unidiff-zero mode handles it without
-        # guessing; the exact complete-file fingerprints below remain the
-        # authority for admitting the result.
-        find_program(PSP_BROWSER_GIT_EXECUTABLE git REQUIRED)
-        file(REAL_PATH "${quickjs_SOURCE_DIR}"
-            bellard_quickjs_work_dir)
-        get_filename_component(bellard_quickjs_source_parent
-            "${bellard_quickjs_work_dir}" DIRECTORY)
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}" -E env
-                "GIT_CEILING_DIRECTORIES=${bellard_quickjs_source_parent}"
-                "${PSP_BROWSER_GIT_EXECUTABLE}" apply --check
-                --no-index --unidiff-zero
-                "${PSP_BROWSER_BELLARD_QUICKJS_OOM_PATCH}"
-            WORKING_DIRECTORY "${bellard_quickjs_work_dir}"
-            RESULT_VARIABLE bellard_quickjs_oom_check_result
-            OUTPUT_VARIABLE bellard_quickjs_oom_check_output
-            ERROR_VARIABLE bellard_quickjs_oom_check_error)
-        if(NOT bellard_quickjs_oom_check_result EQUAL 0)
-            message(FATAL_ERROR
-                "Bellard QuickJS OOM patch does not apply to the pinned "
-                "source: ${bellard_quickjs_oom_check_output}"
-                "${bellard_quickjs_oom_check_error}")
-        endif()
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}" -E env
-                "GIT_CEILING_DIRECTORIES=${bellard_quickjs_source_parent}"
-                "${PSP_BROWSER_GIT_EXECUTABLE}" apply
-                --no-index --unidiff-zero
-                "${PSP_BROWSER_BELLARD_QUICKJS_OOM_PATCH}"
-            WORKING_DIRECTORY "${bellard_quickjs_work_dir}"
-            RESULT_VARIABLE bellard_quickjs_oom_patch_result
-            OUTPUT_VARIABLE bellard_quickjs_oom_patch_output
-            ERROR_VARIABLE bellard_quickjs_oom_patch_error)
-        if(NOT bellard_quickjs_oom_patch_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not apply the Bellard QuickJS OOM backtrace fix: "
-                "${bellard_quickjs_oom_patch_output}"
-                "${bellard_quickjs_oom_patch_error}")
-        endif()
-        file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.c"
-             bellard_quickjs_c_sha256)
-        file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.h"
-             bellard_quickjs_h_sha256)
-        if(bellard_quickjs_oom_preimage STREQUAL "pristine"
-           AND bellard_quickjs_c_sha256 STREQUAL
-               bellard_quickjs_oom_c_sha256
-           AND bellard_quickjs_h_sha256 STREQUAL
-               bellard_quickjs_oom_h_sha256)
-            set(bellard_quickjs_oom_ready ON)
-        else()
-            message(FATAL_ERROR
-                "Bellard QuickJS OOM patch produced an unrecognized source "
-                "fingerprint; refusing a partial or stale patch result")
-        endif()
-    endif()
-    # The compile-interrupt patch is part of every Bellard configuration: it
-    # lets the ordinary watchdog interrupt handler abort oversized compiles
-    # at a bounded token cadence instead of running one uninterruptible
-    # JS_Eval parse.  It stacks directly on the OOM baseline.
-    if(NOT bellard_quickjs_interrupt_ready)
-        find_program(PSP_BROWSER_GIT_EXECUTABLE git REQUIRED)
-        file(REAL_PATH "${quickjs_SOURCE_DIR}"
-            bellard_quickjs_work_dir)
-        get_filename_component(bellard_quickjs_source_parent
-            "${bellard_quickjs_work_dir}" DIRECTORY)
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}" -E env
-                "GIT_CEILING_DIRECTORIES=${bellard_quickjs_source_parent}"
-                "${PSP_BROWSER_GIT_EXECUTABLE}" apply
-                --no-index --unidiff-zero
-                "${PSP_BROWSER_BELLARD_QUICKJS_INTERRUPT_PATCH}"
-            WORKING_DIRECTORY "${bellard_quickjs_work_dir}"
-            RESULT_VARIABLE bellard_quickjs_interrupt_result
-            OUTPUT_VARIABLE bellard_quickjs_interrupt_output
-            ERROR_VARIABLE bellard_quickjs_interrupt_error)
-        if(NOT bellard_quickjs_interrupt_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not apply the Bellard QuickJS compile-interrupt "
-                "patch: ${bellard_quickjs_interrupt_output}"
-                "${bellard_quickjs_interrupt_error}")
-        endif()
-        file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.c"
-             bellard_quickjs_c_sha256)
-        file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.h"
-             bellard_quickjs_h_sha256)
-        if(NOT bellard_quickjs_c_sha256 STREQUAL
-               bellard_quickjs_interrupt_c_sha256
-           OR NOT bellard_quickjs_h_sha256 STREQUAL
-               bellard_quickjs_oom_h_sha256)
-            message(FATAL_ERROR
-                "Bellard QuickJS compile-interrupt patch produced an "
-                "unrecognized source fingerprint; refusing a partial or "
-                "stale patch result")
-        endif()
-        set(bellard_quickjs_interrupt_ready ON)
-    endif()
-    if(NOT PSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH)
-        # FetchContent deliberately reuses its populated source directory.
-        # A binary tree that was configured once with the experimental VM
-        # patch therefore stays patched even after the option is turned off.
-        # Refuse that misleading configuration instead of silently labelling
-        # experimental QuickJS as the pristine control.
-        if((NOT bellard_quickjs_c_sha256 STREQUAL
-                bellard_quickjs_interrupt_c_sha256
-            AND NOT bellard_quickjs_c_sha256 STREQUAL
-                bellard_quickjs_bounded_c_sha256
-            AND NOT (PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
-                     AND bellard_quickjs_c_sha256 STREQUAL
-                         bellard_quickjs_capture_getter_c_sha256)
-            AND NOT (PSP_BROWSER_JS_PROPERTY_FAULT_TRACE
-                     AND bellard_quickjs_c_sha256 STREQUAL
-                         bellard_quickjs_property_fault_trace_c_sha256)
-            AND NOT (PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
-                     AND PSP_BROWSER_JS_PROPERTY_FAULT_TRACE
-                     AND bellard_quickjs_c_sha256 STREQUAL
-                         bellard_quickjs_capture_getter_property_fault_trace_c_sha256))
-           OR NOT bellard_quickjs_h_sha256 STREQUAL
-               bellard_quickjs_oom_h_sha256)
-            message(FATAL_ERROR
-                "PSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH is OFF, but the "
-                "Bellard QuickJS source does not match the pinned portable "
-                "04be246 baseline (OOM + compile-interrupt) fingerprints: "
-                "${quickjs_SOURCE_DIR}. Configure in a fresh "
-                "binary directory (or remove only that binary directory's "
-                "_deps/quickjs-src) to obtain a truthful baseline build.")
-        endif()
-    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${tilefinch_quickjs_vendor_dir}/quickjs.c"
+        "${tilefinch_quickjs_vendor_dir}/quickjs.h")
     if(PSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH)
-        if(bellard_quickjs_bounded_ready AND NOT bellard_quickjs_vm_ready)
-            message(FATAL_ERROR
-                "The experimental Bellard VM patch must precede the bounded "
-                "array-growth patch. Configure its first use in a fresh "
-                "binary directory; normal portable builds reuse bounded "
-                "QuickJS sources without this restriction.")
-        endif()
-        if(NOT bellard_quickjs_vm_ready)
-            execute_process(
-                COMMAND "${CMAKE_COMMAND}"
-                    -DPATCH_SOURCE_DIR=${quickjs_SOURCE_DIR}
-                    -DPATCH_FILE=${PSP_BROWSER_BELLARD_QUICKJS_PATCH}
-                    -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-                    -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-                RESULT_VARIABLE bellard_quickjs_patch_result)
-            if(NOT bellard_quickjs_patch_result EQUAL 0)
-                message(FATAL_ERROR
-                    "Could not prepare the fetched Bellard QuickJS source")
-            endif()
-            file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.c"
-                 bellard_quickjs_c_sha256)
-            file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.h"
-                 bellard_quickjs_h_sha256)
-            if(NOT bellard_quickjs_c_sha256 STREQUAL
-                   bellard_quickjs_vm_c_sha256
-               OR NOT bellard_quickjs_h_sha256 STREQUAL
-                   bellard_quickjs_vm_h_sha256)
-                message(FATAL_ERROR
-                    "Bellard QuickJS VM patch produced an unrecognized "
-                    "source fingerprint; refusing a partial or stale patch "
-                    "result")
-            endif()
-            set(bellard_quickjs_vm_ready ON)
-        endif()
-    endif()
-    # Dense arrays use 1.5x geometric growth upstream. Once the value buffer
-    # is at least 512 KiB, cap spare-capacity growth at 128 KiB. This is an
-    # architecture-neutral byte policy, so the same source naturally holds
-    # fewer unused JSValue slots on a 32-bit PSP than on a 64-bit host.
-    if(NOT bellard_quickjs_bounded_ready)
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}"
-                -DPATCH_SOURCE_DIR=${quickjs_SOURCE_DIR}
-                -DPATCH_FILE=${PSP_BROWSER_BELLARD_QUICKJS_ARRAY_GROWTH_PATCH}
-                -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-                -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-            RESULT_VARIABLE bellard_quickjs_bounded_patch_result)
-        if(NOT bellard_quickjs_bounded_patch_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not apply the Bellard QuickJS bounded array-growth patch")
-        endif()
-        file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.c"
-             bellard_quickjs_c_sha256)
-        if(bellard_quickjs_vm_ready)
-            set(bellard_quickjs_bounded_expected_sha256
-                "${bellard_quickjs_bounded_vm_c_sha256}")
-        else()
-            set(bellard_quickjs_bounded_expected_sha256
-                "${bellard_quickjs_bounded_c_sha256}")
-        endif()
-        if(NOT bellard_quickjs_c_sha256 STREQUAL
-               bellard_quickjs_bounded_expected_sha256)
-            message(FATAL_ERROR
-                "Bellard QuickJS bounded array-growth patch produced an "
-                "unrecognized source fingerprint; refusing a partial or "
-                "stale patch result")
-        endif()
-        set(bellard_quickjs_bounded_ready ON)
-    endif()
-    if(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE
-       AND NOT bellard_quickjs_property_fault_trace_ready)
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}"
-                -DPATCH_SOURCE_DIR=${quickjs_SOURCE_DIR}
-                -DPATCH_FILE=${PSP_BROWSER_BELLARD_QUICKJS_PROPERTY_FAULT_TRACE_PATCH}
-                -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-                -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-            RESULT_VARIABLE bellard_quickjs_property_fault_trace_patch_result)
-        if(NOT bellard_quickjs_property_fault_trace_patch_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not apply the Bellard QuickJS property-fault trace patch")
-        endif()
-        file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.c"
-             bellard_quickjs_c_sha256)
-        if(NOT bellard_quickjs_c_sha256 STREQUAL
-               bellard_quickjs_property_fault_trace_c_sha256)
-            message(FATAL_ERROR
-                "Bellard QuickJS property-fault trace patch produced an unrecognized source fingerprint")
-        endif()
-        set(bellard_quickjs_property_fault_trace_ready ON)
-    endif()
-    # A bytecode function consisting solely of get_var_ref0 + return is a
-    # general closure getter. It cannot observe an interpreter frame, receiver,
-    # argument handling, or allocation, so returning the captured value
-    # directly preserves semantics while removing the dominant dispatch cost
-    # in closure-heavy JavaScript. Keep it independently switchable so the lab
-    # can retain a truthful upstream-interpreter control. The experimental VM
-    # patch already contains the same shortcut.
-    if(PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
-       AND NOT bellard_quickjs_vm_ready
-       AND NOT bellard_quickjs_capture_getter_ready)
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}"
-                -DPATCH_SOURCE_DIR=${quickjs_SOURCE_DIR}
-                -DPATCH_FILE=${PSP_BROWSER_BELLARD_QUICKJS_CAPTURE_GETTER_PATCH}
-                -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-                -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-            RESULT_VARIABLE bellard_quickjs_capture_getter_patch_result)
-        if(NOT bellard_quickjs_capture_getter_patch_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not apply the Bellard QuickJS capture-getter fast path")
-        endif()
-        file(SHA256 "${quickjs_SOURCE_DIR}/quickjs.c"
-             bellard_quickjs_c_sha256)
-        if(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE)
-            set(bellard_quickjs_capture_getter_expected_sha256
-                "${bellard_quickjs_capture_getter_property_fault_trace_c_sha256}")
-        else()
-            set(bellard_quickjs_capture_getter_expected_sha256
-                "${bellard_quickjs_capture_getter_c_sha256}")
-        endif()
-        if(NOT bellard_quickjs_c_sha256 STREQUAL
-               bellard_quickjs_capture_getter_expected_sha256)
-            message(FATAL_ERROR
-                "Bellard QuickJS capture-getter patch produced an "
-                "unrecognized source fingerprint; refusing a partial or "
-                "stale patch result")
-        endif()
-        set(bellard_quickjs_capture_getter_ready ON)
-    endif()
-    # CSP's unsafe-eval policy must live below page JavaScript. Apply one
-    # small engine hook after all optional QuickJS patches; its semantic
-    # markers make repeated configurations idempotent across valid variants.
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.h"
-         bellard_dynamic_code_marker
-         REGEX "JS_SetDynamicCodeEnabled")
-    if(NOT bellard_dynamic_code_marker)
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}"
-                -DPATCH_SOURCE_DIR=${quickjs_SOURCE_DIR}
-                -DPATCH_FILE=${PSP_BROWSER_BELLARD_QUICKJS_DYNAMIC_CODE_PATCH}
-                -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-                -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-            RESULT_VARIABLE bellard_dynamic_code_patch_result)
-        if(NOT bellard_dynamic_code_patch_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not apply the Bellard QuickJS dynamic-code policy patch")
-        endif()
-    endif()
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.c"
-         bellard_dynamic_code_checks
-         REGEX "dynamic code compilation disabled by Content Security Policy")
-    list(LENGTH bellard_dynamic_code_checks bellard_dynamic_code_check_count)
-    if(bellard_dynamic_code_check_count LESS 4)
         message(FATAL_ERROR
-            "Bellard QuickJS dynamic-code policy hook is incomplete")
+            "The experimental Bellard VM patch is no longer applied at "
+            "configure time. Its patch files remain under patches/ as "
+            "history; build it from a branch that applies them to "
+            "third_party/quickjs, or from a commit before the engine was "
+            "vendored.")
     endif()
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.h"
-         bellard_latin1_string_marker
-         REGEX "JS_NewStringLenLatin1Portable")
-    if(NOT bellard_latin1_string_marker)
-        if(bellard_quickjs_vm_ready)
-            set(bellard_latin1_apply_patch
-                "${PSP_BROWSER_BELLARD_QUICKJS_LATIN1_STRING_VM_PATCH}")
-        else()
-            set(bellard_latin1_apply_patch
-                "${PSP_BROWSER_BELLARD_QUICKJS_LATIN1_STRING_PATCH}")
-        endif()
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}"
-                -DPATCH_SOURCE_DIR=${quickjs_SOURCE_DIR}
-                -DPATCH_FILE=${bellard_latin1_apply_patch}
-                -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-                -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-            RESULT_VARIABLE bellard_latin1_string_patch_result)
-        if(NOT bellard_latin1_string_patch_result EQUAL 0)
+    set(quickjs_SOURCE_DIR "${tilefinch_quickjs_vendor_dir}")
+    # Lab variants (a capture-getter control, a compact character-array
+    # control, the property-fault trace) are the only remaining patch users.
+    # They never touch the vendored tree: the two engine files are copied
+    # into the binary directory, the default stack above the shared bounded
+    # baseline is reversed and re-applied with the variant's choices, and the
+    # result must match a pinned fingerprint computed for that combination.
+    if(NOT PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH
+       OR NOT PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY
+       OR PSP_BROWSER_JS_PROPERTY_FAULT_TRACE)
+        set(tilefinch_quickjs_variant_dir "${CMAKE_CURRENT_BINARY_DIR}/quickjs-variant")
+        set(tilefinch_quickjs_patches "${CMAKE_CURRENT_SOURCE_DIR}/patches")
+        set(tilefinch_quickjs_variant_key
+            "${PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH}-${PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY}-${PSP_BROWSER_JS_PROPERTY_FAULT_TRACE}")
+        # capture-getter, compact-char-array, property-fault-trace -> quickjs.c
+        set(tilefinch_quickjs_variant_ON-OFF-OFF
+            "4cf191dc7634602e702939f3da6404fdeacff4471fcb670bc64e45dca31866ce")
+        set(tilefinch_quickjs_variant_ON-ON-ON
+            "db55e1f7889ba60004db787784ebf3e72da9745504f12a81ebe2b52a8edbb25d")
+        set(tilefinch_quickjs_variant_ON-OFF-ON
+            "a41bbfd7a58901de357ff9973f599a8579873d7963641bda3c89eedfb66f9beb")
+        set(tilefinch_quickjs_variant_OFF-ON-OFF
+            "6f8fede0a52bc2233d0b3fa7f03d0f3d9ed7d51f96b6445c559e098d8e5999eb")
+        set(tilefinch_quickjs_variant_OFF-ON-ON
+            "0402f0e7fe0b160b33300899ed08c8131b1c257703ad511a93b0d40cd2c7c63d")
+        set(tilefinch_quickjs_variant_OFF-OFF-OFF
+            "ba9a8b3d2a4c5661636c643ad2d63efeed108fd16e7da481bc930d5cda1fc017")
+        set(tilefinch_quickjs_variant_OFF-OFF-ON
+            "6bebf6724e287b0e67d11d4826a9ddc1ad476f73165d2bda3ea938823450c2e2")
+        if(NOT DEFINED tilefinch_quickjs_variant_${tilefinch_quickjs_variant_key})
             message(FATAL_ERROR
-                "Could not apply the Bellard QuickJS bounded Latin-1 string patch")
+                "No pinned QuickJS variant for capture-getter/compact/property-fault "
+                "= ${tilefinch_quickjs_variant_key}")
         endif()
-    endif()
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.c"
-         bellard_repeat_rope_eval_marker
-         REGEX "tilefinch_compact_eval_rope")
-    if(NOT bellard_repeat_rope_eval_marker)
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}"
-                -DPATCH_SOURCE_DIR=${quickjs_SOURCE_DIR}
-                -DPATCH_FILE=${PSP_BROWSER_BELLARD_QUICKJS_REPEAT_ROPE_EVAL_PATCH}
-                -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-                -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-            RESULT_VARIABLE bellard_repeat_rope_eval_patch_result)
-        if(NOT bellard_repeat_rope_eval_patch_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not apply the Bellard QuickJS repeat/eval memory patch")
+        set(tilefinch_quickjs_variant_expected
+            "${tilefinch_quickjs_variant_${tilefinch_quickjs_variant_key}}")
+        set(tilefinch_quickjs_variant_ready OFF)
+        if(EXISTS "${tilefinch_quickjs_variant_dir}/quickjs.c"
+           AND EXISTS "${tilefinch_quickjs_variant_dir}/quickjs.h")
+            file(SHA256 "${tilefinch_quickjs_variant_dir}/quickjs.c"
+                 tilefinch_quickjs_variant_present)
+            file(SHA256 "${tilefinch_quickjs_variant_dir}/quickjs.h"
+                 tilefinch_quickjs_variant_header)
+            if(tilefinch_quickjs_variant_present STREQUAL tilefinch_quickjs_variant_expected
+               AND tilefinch_quickjs_variant_header STREQUAL tilefinch_quickjs_vendor_h_sha256)
+                set(tilefinch_quickjs_variant_ready ON)
+            endif()
         endif()
-    endif()
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.c"
-         bellard_single_char_buffer_marker
-         REGEX "string primitive identity is unobservable")
-    if(NOT bellard_single_char_buffer_marker)
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}"
-                -DPATCH_SOURCE_DIR=${quickjs_SOURCE_DIR}
-                -DPATCH_FILE=${PSP_BROWSER_BELLARD_QUICKJS_SINGLE_CHAR_BUFFER_PATCH}
-                -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-                -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-            RESULT_VARIABLE bellard_single_char_buffer_patch_result)
-        if(NOT bellard_single_char_buffer_patch_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not apply the Bellard QuickJS single-character buffer hook")
+        if(NOT tilefinch_quickjs_variant_ready)
+            file(REMOVE_RECURSE "${tilefinch_quickjs_variant_dir}")
+            file(MAKE_DIRECTORY "${tilefinch_quickjs_variant_dir}")
+            foreach(source quickjs.c quickjs.h)
+                file(COPY_FILE "${tilefinch_quickjs_vendor_dir}/${source}"
+                     "${tilefinch_quickjs_variant_dir}/${source}")
+            endforeach()
+            # Reverse the default stack above the shared bounded baseline.
+            foreach(layer
+                    compact-char-array-cow compact-char-array
+                    single-char-string-buffer repeat-rope-eval latin1-string
+                    scope-oom retired-async-state realm-retirement
+                    dynamic-code-policy capture-getter-fastpath)
+                execute_process(COMMAND "${PATCH_EXECUTABLE}" --silent -R -p1
+                    -i "${tilefinch_quickjs_patches}/bellard-quickjs-04be246-${layer}.patch"
+                    WORKING_DIRECTORY "${tilefinch_quickjs_variant_dir}"
+                    COMMAND_ERROR_IS_FATAL ANY)
+            endforeach()
+            file(SHA256 "${tilefinch_quickjs_variant_dir}/quickjs.c"
+                 tilefinch_quickjs_variant_baseline)
+            if(NOT tilefinch_quickjs_variant_baseline STREQUAL
+                   "c8ce8fb2d67622bc9055480fe811438f0fe497a0e1662521ec53b6ad564fdf8e")
+                message(FATAL_ERROR
+                    "Reversing the QuickJS default stack did not reach the bounded baseline")
+            endif()
+            set(tilefinch_quickjs_forward)
+            if(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE)
+                list(APPEND tilefinch_quickjs_forward property-fault-trace)
+            endif()
+            if(PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH)
+                list(APPEND tilefinch_quickjs_forward capture-getter-fastpath)
+            endif()
+            list(APPEND tilefinch_quickjs_forward
+                dynamic-code-policy realm-retirement retired-async-state scope-oom
+                latin1-string repeat-rope-eval single-char-string-buffer)
+            if(PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY)
+                list(APPEND tilefinch_quickjs_forward
+                    compact-char-array compact-char-array-cow)
+            endif()
+            foreach(layer IN LISTS tilefinch_quickjs_forward)
+                execute_process(COMMAND "${PATCH_EXECUTABLE}" --forward --silent -p1
+                    -i "${tilefinch_quickjs_patches}/bellard-quickjs-04be246-${layer}.patch"
+                    WORKING_DIRECTORY "${tilefinch_quickjs_variant_dir}"
+                    COMMAND_ERROR_IS_FATAL ANY)
+            endforeach()
+            file(SHA256 "${tilefinch_quickjs_variant_dir}/quickjs.c"
+                 tilefinch_quickjs_variant_result)
+            if(NOT tilefinch_quickjs_variant_result STREQUAL tilefinch_quickjs_variant_expected)
+                message(FATAL_ERROR
+                    "QuickJS variant ${tilefinch_quickjs_variant_key} produced "
+                    "${tilefinch_quickjs_variant_result}, not the pinned "
+                    "${tilefinch_quickjs_variant_expected}")
+            endif()
         endif()
+        foreach(source quickjs-atom.h quickjs-opcode.h cutils.c cutils.h dtoa.c dtoa.h
+                libregexp.c libregexp.h libregexp-opcode.h libunicode.c libunicode.h
+                libunicode-table.h list.h)
+            # Compilers see the binary-directory copy, so a vendor edit must
+            # first trigger configure to refresh it before dependency checks.
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                "${tilefinch_quickjs_vendor_dir}/${source}")
+            file(COPY_FILE "${tilefinch_quickjs_vendor_dir}/${source}"
+                 "${tilefinch_quickjs_variant_dir}/${source}" ONLY_IF_DIFFERENT)
+        endforeach()
+        set(quickjs_SOURCE_DIR "${tilefinch_quickjs_variant_dir}")
     endif()
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.c"
-         bellard_compact_char_array_marker
-         REGEX "compact_char_array")
-    if(PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY AND
-       NOT PSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH AND
-       NOT bellard_compact_char_array_marker)
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}"
-                -DPATCH_SOURCE_DIR=${quickjs_SOURCE_DIR}
-                -DPATCH_FILE=${PSP_BROWSER_BELLARD_QUICKJS_COMPACT_CHAR_ARRAY_PATCH}
-                -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-                -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-            RESULT_VARIABLE bellard_compact_char_array_patch_result)
-        if(NOT bellard_compact_char_array_patch_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not apply the Bellard QuickJS compact character-array hook")
-        endif()
-    endif()
-    file(STRINGS "${quickjs_SOURCE_DIR}/quickjs.c"
-         bellard_compact_char_array_cow_marker
-         REGEX "Large character decoders are both latency")
-    if(PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY AND
-       NOT PSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH AND
-       NOT bellard_compact_char_array_cow_marker)
-        execute_process(
-            COMMAND "${CMAKE_COMMAND}"
-                -DPATCH_SOURCE_DIR=${quickjs_SOURCE_DIR}
-                -DPATCH_FILE=${PSP_BROWSER_BELLARD_QUICKJS_COMPACT_CHAR_ARRAY_COW_PATCH}
-                -DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}
-                -P ${PSP_BROWSER_APPLY_PATCH_SCRIPT}
-            RESULT_VARIABLE bellard_compact_char_array_cow_patch_result)
-        if(NOT bellard_compact_char_array_cow_patch_result EQUAL 0)
-            message(FATAL_ERROR
-                "Could not apply the Bellard QuickJS compact character-array copy-on-write layer")
-        endif()
-    endif()
+    set(TILEFINCH_QUICKJS_COMPILE_SOURCE_DIR "${quickjs_SOURCE_DIR}"
+        CACHE INTERNAL "Actual Bellard engine source selected for this build" FORCE)
     add_library(qjs STATIC
         "${quickjs_SOURCE_DIR}/quickjs.c"
         "${quickjs_SOURCE_DIR}/dtoa.c"

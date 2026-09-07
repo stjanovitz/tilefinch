@@ -73,6 +73,33 @@ requires an actual `Response` object, a successful status, and a MIME essence
 of `application/wasm`. A lookalike object cannot enter the streaming path.
 Tilefinch does not expose a second, less constrained streaming loader.
 
+## Loading and calling
+
+A `Module` is validated by one interpreter load, and that load also records
+the module's import and export descriptors, so `Module.imports()` and
+`Module.exports()` answer from the `Module` without loading again. Each
+`Instance` costs exactly one further load: the module is loaded unlinked,
+its function imports are bound from the import object, and the same loaded
+module is then linked in place and instantiated. The interpreter's load is
+the expensive step on the PSP (it validates and pre-decodes every function
+body), so a `compile()`/`instantiate()` pair performs two loads and
+`instantiate(bytes)` performs two, never three or four.
+
+Every function export is resolved once at instantiation into an
+instance-owned table holding the interpreter function handle and its
+signature; an export call indexes that table rather than looking the function
+up by name and re-reading its types. The interpreter's contract is that a
+module's byte buffer is writable and referenced until unload, so every load
+works on a private copy rather than sharing bytes between instances or
+borrowing a JavaScript `ArrayBuffer`; an instantiated module releases that
+copy as soon as the interpreter confirms it no longer references it (the
+fast interpreter pre-decodes function bodies and the loader clones data
+segments), so a live instance does not hold its binary for its lifetime.
+Exported memory is aliased, not copied:
+`Memory.buffer` is an external `ArrayBuffer` over the interpreter's linear
+memory, refreshed at every wasm/JavaScript transition so growth (which moves
+the memory) detaches the stale buffer as the standard requires.
+
 ## PSP ceilings
 
 | Resource | Limit |
@@ -97,12 +124,14 @@ remains usable. Fixed-width SIMD is scalar-emulated on Allegrex. It is useful
 for compatibility and bounded feature probes, but large throughput benchmarks
 can be much slower than on desktop SIMD hardware.
 
-Exported linear-memory views are page-Budget-owned ArrayBuffer backings rather
-than QuickJS-heap allocations. Tilefinch currently mirrors WAMR's relocatable
-memory and synchronizes it at every exported call and grow boundary; this keeps
-the standard JavaScript buffer lifetime and detachment behavior while ensuring
-a bounded one-page-to-sixteen-page module cannot exhaust an otherwise healthy
-realm merely by exposing its memory.
+Exported ArrayBuffers directly alias WAMR's Budget-owned linear memory; no
+per-call memory copies are made. Growth detaches old views before allocating
+a replacement, including on allocation refusal. Retained views keep their
+native owner alive, and detach/finalization release each alias exactly once.
+The host task watchdog is shared across instances and calls, rather than
+granting a new wall-clock allowance to each export. Instantiation, imports,
+and export entry/return check that shared deadline. The interpreter's finite
+instruction ceiling still bounds individual native calls.
 
 ## Deliberate omissions
 
@@ -125,7 +154,10 @@ activation it loads `tilefinch-wasm.prx` from the active signed slot and
 verifies the component ABI before publishing `WebAssembly`. A missing,
 incompatible, or refused component leaves the namespace unavailable rather
 than partially installing it. The runtime pool is allocated lazily through
-`Budget` and released when no module or instance remains.
+`Budget`. It is released once no module operation or instance remains, at
+the next task boundary, memory-pressure collection, or realm teardown rather
+than immediately after each operation, so a `validate()`, `compile()`, and
+`instantiate()` sequence within one task initializes the runtime once.
 
 Host builds link the same pinned WAMR interpreter directly for sanitizer and
 conformance testing. The PSP acceptance fixture

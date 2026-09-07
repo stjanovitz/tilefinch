@@ -369,11 +369,6 @@ bool style_container_layout_state_add(Stylesheet *sheet,
     return true;
 }
 
-void style_container_layout_state_finish(Stylesheet *sheet)
-{
-    (void) sheet;
-}
-
 void style_container_layout_state_clear(Stylesheet *sheet)
 {
     if (sheet == NULL || sheet->resolve_scratch == NULL) return;

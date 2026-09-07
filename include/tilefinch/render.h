@@ -310,6 +310,8 @@ typedef struct {
     uint64_t max_startup_visual_slice_us;
     uint64_t max_startup_visual_unit_us;
     int last_frame_scroll_y;
+    int last_frame_viewport_width;
+    int last_frame_viewport_height;
     bool last_frame_scroll_valid;
     bool forced_dark;
 } TileCache;
@@ -348,6 +350,8 @@ RenderCanvasFrameResult tile_cache_render_canvas_frame_fast(
 bool tile_cache_canvas_frame_fast_eligible(
     const TileCache *cache, int scroll_y,
     int viewport_width, int viewport_height);
+/* maximum_units limits newly rasterized tiles, not resident cache hits.
+   Cached-tile checks remain deadline- and viewport-bounded. */
 RenderFrameWorkResult tile_cache_prepare_frame_bounded(
     TileCache *cache, int scroll_y, int viewport_width, int viewport_height,
     uint64_t budget_us, size_t maximum_units);

@@ -71,6 +71,7 @@ typedef struct LayoutBlockPaintPlan {
     uint32_t border_colors[STYLE_BORDER_SIDE_COUNT];
     uint8_t border_alphas[STYLE_BORDER_SIDE_COUNT];
     bool rounded_border;
+    bool focus_inset_slot;
 } LayoutBlockPaintPlan;
 
 /* --- Block layout frame -------------------------------------------------- */

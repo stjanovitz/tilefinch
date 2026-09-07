@@ -9,6 +9,7 @@
 #undef budget_calloc
 #undef budget_realloc
 #include "../src/style_internal.h"
+#include "../src/tilefinch_test_faults.h"
 
 typedef enum {
     DEEP_LAYOUT_BLOCK,

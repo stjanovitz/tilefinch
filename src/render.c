@@ -7,7 +7,6 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 
 #define budget_malloc(b, s) budget_malloc_category((b), BUDGET_CATEGORY_RENDER, (s))
 #define budget_calloc(b, n, s) budget_calloc_category((b), BUDGET_CATEGORY_RENDER, (n), (s))
@@ -2092,6 +2091,8 @@ RenderCanvasFrameResult tile_cache_render_canvas_frame_fast(
     paint_scroll_indicator(cache, cache->frame, scroll_y,
                            viewport_width, viewport_height);
     cache->last_frame_scroll_y = scroll_y;
+    cache->last_frame_viewport_width = viewport_width;
+    cache->last_frame_viewport_height = viewport_height;
     cache->last_frame_scroll_valid = true;
     cache->canvas_paint_pending = false;
     memset(&cache->frame_work, 0, sizeof(cache->frame_work));
@@ -2254,19 +2255,32 @@ RenderFrameWorkResult tile_cache_prepare_frame_bounded_cancelable(
 
     uint64_t started = render_now_us();
     size_t units = 0;
+    size_t visits = 0;
     cache->frame_job_slices++;
-    while (work->next_ordinal < work->end_ordinal
-           && units < maximum_units) {
+    while (work->next_ordinal < work->end_ordinal) {
         if (tilefinch_cancellation_requested(cancellation)) {
             tile_cache_cancel_frame_work(cache);
             return RENDER_FRAME_WORK_CANCELLED;
         }
-        if (units != 0 && render_now_us() - started >= budget_us) break;
-        size_t ordinal = work->next_ordinal++;
+        if (visits != 0 && render_now_us() - started >= budget_us) break;
+        size_t ordinal = work->next_ordinal;
         int tx = work->first_tx + (int) (ordinal % work->columns);
         int ty = work->first_ty + (int) (ordinal / work->columns);
+        RenderTile *resident = find_tile(cache, tx, ty);
+        visits++;
+        if (resident != NULL) {
+            /* A warm viewport must not wait one frame per cached tile.
+               Only raster misses consume the expensive-unit allowance;
+               resident checks still obey the deadline and bounded range. */
+            cache->hits++;
+            resident->last_used = ++cache->clock;
+            work->next_ordinal++;
+            continue;
+        }
+        if (units == maximum_units) break;
+        work->next_ordinal++;
         uint64_t unit_started = render_now_us();
-        if (ensure_tile(cache, tx, ty) == NULL) {
+        if (render_tile_miss(cache, tx, ty, NULL, true) == NULL) {
             tile_cache_cancel_frame_work(cache);
             return tilefinch_cancellation_requested(cancellation)
                 ? RENDER_FRAME_WORK_CANCELLED
@@ -2514,6 +2528,8 @@ bool tile_cache_render_frame(TileCache *cache, int scroll_y,
     cache->frame_indicator_us += phase_finished - phase_started;
     if (ok) {
         cache->last_frame_scroll_y = scroll_y;
+        cache->last_frame_viewport_width = viewport_width;
+        cache->last_frame_viewport_height = viewport_height;
         cache->last_frame_scroll_valid = true;
     }
     if (ok && output_path != NULL) {
@@ -2732,13 +2748,31 @@ void tile_cache_schedule_prefetch_row(TileCache *cache, int world_y,
     if (cache->idle_work.pending
         && cache->idle_work.tile_y == tile_y
         && cache->idle_work.viewport_width == viewport_width) return;
+    /* tile_cache_prefetch_tile never evicts a viewport-resident tile. A
+       cache that cannot hold one presented screen plus one speculative row
+       (the PSP's eight tiles against twelve to sixteen on screen) has no
+       victim to offer, so the row stage would only walk the tiles and
+       count misses. Skip straight to the overlay/glyph stages instead. */
+    int last_tile_x = (viewport_width - 1) / TILEFINCH_TILE_SIZE;
+    int next_tile_x = 0;
+    if (cache->last_frame_scroll_valid) {
+        int first_y = cache->last_frame_scroll_y / TILEFINCH_TILE_SIZE;
+        int last_y = (int) (((int64_t) cache->last_frame_scroll_y
+                             + cache->last_frame_viewport_height - 1)
+                            / TILEFINCH_TILE_SIZE);
+        int columns = (cache->last_frame_viewport_width - 1)
+                      / TILEFINCH_TILE_SIZE + 1;
+        size_t resident = (size_t) (last_y - first_y + 1) * (size_t) columns;
+        if (cache->tile_capacity <= resident) next_tile_x = last_tile_x + 1;
+    }
     tile_cache_cancel_idle_work(cache);
     uint64_t generation = cache->idle_work.generation + 1u;
     cache->idle_work = (RenderIdleWork) {
         .stage = RENDER_IDLE_WORK_TILES,
         .tile_y = tile_y,
         .viewport_width = viewport_width,
-        .last_tile_x = (viewport_width - 1) / TILEFINCH_TILE_SIZE,
+        .next_tile_x = next_tile_x,
+        .last_tile_x = last_tile_x,
         .generation = generation,
         .pending = true
     };
@@ -2989,6 +3023,35 @@ static void tile_cache_run_glyph_unit(TileCache *cache)
     }
 }
 
+static void tile_cache_prefetch_tile(TileCache *cache, int tx, int ty)
+{
+    /* Speculation may use free/stale/offscreen slots, never evict a tile
+       retained for the presented viewport. A small cache cannot hold even
+       one screen: prefetching into it just repeats that work next frame. */
+    if (!cache->last_frame_scroll_valid) {
+        (void) ensure_tile(cache, tx, ty);
+        return;
+    }
+    if (find_tile(cache, tx, ty) != NULL) {
+        cache->hits++;
+        return;
+    }
+    int first_y = cache->last_frame_scroll_y / TILEFINCH_TILE_SIZE;
+    int last_y = (int) (((int64_t) cache->last_frame_scroll_y
+                         + cache->last_frame_viewport_height - 1)
+                        / TILEFINCH_TILE_SIZE);
+    int last_x = (cache->last_frame_viewport_width - 1) / TILEFINCH_TILE_SIZE;
+    RenderTile *victim = NULL;
+    for (size_t i = 0; i < cache->tile_capacity; i++) {
+        RenderTile *tile = &cache->tiles[i];
+        if (!tile->valid) { victim = tile; break; }
+        if (tile->tile_x >= 0 && tile->tile_x <= last_x
+            && tile->tile_y >= first_y && tile->tile_y <= last_y) continue;
+        if (victim == NULL || tile->last_used < victim->last_used) victim = tile;
+    }
+    if (victim != NULL) (void) render_tile_miss(cache, tx, ty, victim, true);
+}
+
 static void tile_cache_run_idle_unit(TileCache *cache)
 {
     RenderIdleWork *work = &cache->idle_work;
@@ -3005,7 +3068,7 @@ static void tile_cache_run_idle_unit(TileCache *cache)
         tile_cache_run_glyph_unit(cache);
     } else if (work->stage == RENDER_IDLE_WORK_TILES) {
         if (work->next_tile_x <= work->last_tile_x) {
-            (void) ensure_tile(cache, work->next_tile_x++, work->tile_y);
+            tile_cache_prefetch_tile(cache, work->next_tile_x++, work->tile_y);
         }
         if (work->next_tile_x > work->last_tile_x) {
             if (!cache->overlay_images_prewarm_complete) {
@@ -3150,6 +3213,13 @@ bool tile_cache_sync_layout_paint(TileCache *cache, int left, int top,
                 cache->source_layout->commands[i].color;
             cache->visual_layout.commands[i].opacity_scale =
                 cache->source_layout->commands[i].opacity_scale;
+            const DrawCommand *source = &cache->source_layout->commands[i];
+            if (source->type == DRAW_STROKE_RECT
+                && source->image_fit == LAYOUT_STROKE_FOCUS_INSET) {
+                cache->visual_layout.commands[i].scale = viewport_scale_ceil(
+                    source->scale, cache->source_layout->viewport.scale_numerator,
+                    cache->source_layout->viewport.scale_denominator);
+            }
         }
     }
     int visual_left = viewport_css_to_device(
@@ -3394,6 +3464,8 @@ bool tile_cache_replace_layout_damage(TileCache *cache,
     tile_cache_commit_layout(cache, layout, &visual);
     if (preserve_canvas_overlay) {
         cache->last_frame_scroll_y = cache->canvas_overlay_scroll_y;
+        cache->last_frame_viewport_width = cache->canvas_overlay_viewport_width;
+        cache->last_frame_viewport_height = cache->canvas_overlay_viewport_height;
         cache->last_frame_scroll_valid = true;
         CanvasFastFrameCandidate new_canvas;
         if (!canvas_fast_frame_candidate_impl(

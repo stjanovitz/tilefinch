@@ -1,0 +1,17 @@
+# Live PSP article. Follow the page-down route from the initial top viewport,
+# then move the ordinary nub onto History's text and use the Cross receiver.
+# The runner checks the native target id; a moved live heading must fail,
+# not silently qualify another disclosure. Capture the revealed prose too.
+wait-page 2
+press-page 15 rtrigger
+wait-page 2
+mark-page section-before
+stick-page 15 down
+stick-page 22 left
+tap-page cross
+wait-page 2
+mark-page section-after
+tap-page rtrigger
+wait-page 2
+mark-page section-content
+end

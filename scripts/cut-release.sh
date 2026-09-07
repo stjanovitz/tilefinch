@@ -231,6 +231,7 @@ for required in \
     "$tree/EBOOT.PBP" \
     "$tree/slot-a/EBOOT.PBP" \
     "$tree/slot-a/tilefinch-wasm.prx" \
+    "$tree/slot-a/tilefinch-voice.prx" \
     "$tree/OPTIONAL/tilefinch_xmb.prx" \
     "$tree/slot-a/roots.pem" \
     "$tree/slot-a/boot-defaults.cfg"
@@ -273,6 +274,7 @@ for binary in \
     "$tree/EBOOT.PBP" \
     "$tree/slot-a/EBOOT.PBP" \
     "$tree/slot-a/tilefinch-wasm.prx" \
+    "$tree/slot-a/tilefinch-voice.prx" \
     "$tree/OPTIONAL/tilefinch_xmb.prx"
 do
     if LC_ALL=C grep -aFq "$root/" "$binary"; then

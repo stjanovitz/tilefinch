@@ -1,0 +1,24 @@
+# Wait for the page, then exercise nub motion with late script/resource work.
+# Keep stick legs contiguous, without diagnostic marks or idle input between
+# them. Short legs avoid edge scrolling, which intentionally stops emitting
+# cursor-move samples and belongs in a separate scroll-latency measurement.
+wait-page 900
+mark-page settled-page
+stick-live 20 right
+stick-live 20 left
+stick-live 20 right
+stick-live 20 left
+stick-live 20 right
+stick-live 20 left
+stick-live 20 right
+stick-live 20 left
+stick-live 20 right
+stick-live 20 left
+stick-live 20 right
+stick-live 20 left
+tap-live select
+mark-live cursor-menu
+wait-live 30
+tap-live select
+wait-page 10
+end

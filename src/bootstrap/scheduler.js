@@ -10,7 +10,8 @@
   const trustedWrap = globalThis.__tilefinchWrap,
     pageVisible = globalThis.__tilefinchPageVisible,
     diagnosticString = String,
-    diagnosticOwnDescriptor = Object.getOwnPropertyDescriptor;
+    diagnosticOwnDescriptor = Object.getOwnPropertyDescriptor,
+    timerApply = Reflect.apply;
   Object.defineProperty(globalThis, "__tilefinchDiagnosticLookup", {
     enumerable: false,
     configurable: false,
@@ -86,7 +87,12 @@
          replaying a backlog of synthetic 16 ms frames. Visual timers
          remain queued while the owning document is hidden. */
       if (this.kind === "animation-frame") callback(now);
-      else callback(...this.args);
+      /* HTML timers invoke callable handlers with the owning Window as their
+         callback this-value.  A plain call only happens to work for sloppy
+         functions; strict functions observe undefined and real-world state
+         machines use that distinction.  Keep animation-frame's existing
+         callback contract separate. */
+      else timerApply(callback, globalThis, this.args);
     } catch (error) {
       __tilefinchReportUncaught(error, "timer callback");
     }
@@ -590,36 +596,31 @@
           name: String(timer.callback.name || ""),
         })),
     });
-  const trusted = globalThis.__tilefinchTrustedEvent;
+  const trusted = globalThis.__tilefinchTrustedEvent,
+    nonBubblingEventTypes = new Set([
+      "focus", "blur", "load", "error", "scroll", "mouseenter",
+      "mouseleave", "pointerenter", "pointerleave",
+    ]),
+    composedEventTypes = new Set([
+      "beforeinput", "click", "input", "keydown", "keypress", "keyup",
+      "pointerdown", "pointermove", "pointerup", "mousedown", "mousemove",
+      "mouseup",
+    ]),
+    cancelableEventTypes = new Set([
+      "beforeinput", "click", "keydown", "keypress", "keyup",
+      "pointerdown", "pointermove", "pointerup", "mousedown", "mousemove",
+      "mouseup", "submit",
+    ]);
   const tilefinchEvent = (name, overrides = null) => {
     name = String(name);
-    const bubbles = ![
-        "focus",
-        "blur",
-        "load",
-        "error",
-        "scroll",
-        "mouseenter",
-        "mouseleave",
-        "pointerenter",
-        "pointerleave",
-      ].includes(name),
+    const bubbles = !nonBubblingEventTypes.has(name),
       options = {
         bubbles,
-        cancelable: [
-          "beforeinput",
-          "click",
-          "keydown",
-          "keypress",
-          "keyup",
-          "pointerdown",
-          "pointermove",
-          "pointerup",
-          "mousedown",
-          "mousemove",
-          "mouseup",
-          "submit",
-        ].includes(name),
+        /* User-agent-dispatched UI events cross open and closed shadow
+           boundaries. Without composed=true a visually hit shadow child can
+           receive pointer events while the host/controller never sees them. */
+        composed: composedEventTypes.has(name),
+        cancelable: cancelableEventTypes.has(name),
         ...(overrides || {}),
       };
     let event;

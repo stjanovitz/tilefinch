@@ -680,6 +680,12 @@ bool style_apply_deferred_program(
                 sizeof(resolved_value), 0)) {
             value = initial_value;
             value_length = sizeof(initial_value) - 1u;
+        } else {
+            /* Use the bounded expansion we just computed. Passing the
+               original var() text made property/shorthand handlers repeat
+               the same ancestor-scoped lookups, often once per component. */
+            value = resolved_value;
+            value_length = strlen(resolved_value);
         }
         StylePropertyParse parse = {
             .sheet = sheet,

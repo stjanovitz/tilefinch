@@ -32,7 +32,7 @@ demo	tiles.candidates	2694
 demo	tiles.evictions	16
 demo	tiles.glyph-evictions	0
 demo	tiles.glyph-misses	89
-demo	tiles.hits	24
+demo	tiles.hits	16
 demo	tiles.misses	32
 demo	tiles.rasterized	32
 demo	tiles.spatial-bands	9
@@ -68,7 +68,7 @@ float-article	tiles.candidates	2232
 float-article	tiles.evictions	20
 float-article	tiles.glyph-evictions	6
 float-article	tiles.glyph-misses	166
-float-article	tiles.hits	48
+float-article	tiles.hits	32
 float-article	tiles.misses	40
 float-article	tiles.rasterized	40
 float-article	tiles.spatial-bands	6
@@ -104,7 +104,7 @@ grid-tracks	tiles.candidates	567
 grid-tracks	tiles.evictions	4
 grid-tracks	tiles.glyph-evictions	0
 grid-tracks	tiles.glyph-misses	69
-grid-tracks	tiles.hits	20
+grid-tracks	tiles.hits	16
 grid-tracks	tiles.misses	20
 grid-tracks	tiles.rasterized	20
 grid-tracks	tiles.spatial-bands	3

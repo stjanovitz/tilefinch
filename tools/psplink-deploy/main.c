@@ -1,4 +1,4 @@
-/* tfdeploy -- a development-only, low-wear EBOOT deployer for PSPLink.
+/* tfdeploy -- a development-only, low-wear fixed-artifact deployer for PSPLink.
  *
  * PSPLink's built-in `cp` copies through a 2 KiB shell buffer. For the
  * roughly 6 MiB Tilefinch EBOOT that means thousands of USB round trips.
@@ -17,6 +17,11 @@
 
 PSP_MODULE_INFO("tfdeploy", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(PSP_THREAD_ATTR_USER);
+/* Never let a short-lived transfer helper reserve all remaining user RAM. */
+PSP_HEAP_SIZE_KB(64);
+
+/* The custom self-unload below bypasses crt0's ordinary _exit teardown. */
+extern void __libcglue_deinit(void);
 
 #define TF_DEPLOY_CHUNK_BYTES (1024u * 1024u)
 #define TF_DEPLOY_MAX_BYTES (8u * 1024u * 1024u)
@@ -73,10 +78,13 @@ static int finish(const char *status,
                   int exit_status)
 {
     publish_result(status, phase, native_result, bytes, writes);
-    /* Release the 1 MiB static transfer buffer before another browser PRX is
-       loaded into the same PSPLink session. This call does not return on
-       success; returning exit_status remains the safe firmware fallback. */
+    /* Match crt0's runtime teardown before self-unload; otherwise newlib's
+       partition allocation outlives the module. No libc call follows. */
+    __libcglue_deinit();
     (void) sceKernelSelfStopUnloadModule(1, 0, NULL);
+    /* A refused self-unload leaves a stopped module for the host to unload,
+       never a return through crt0 that would deinitialize libc twice. */
+    (void) sceKernelExitDeleteThread(exit_status);
     return exit_status;
 }
 
@@ -130,8 +138,18 @@ int main(int argc, char *argv[])
     int destination_existed = 0;
     const char *phase = "arguments";
 
-    (void) argc;
-    (void) argv;
+    int is_prx = 0;
+    if (argc == 2 && strcmp(argv[1], "wasm") == 0) {
+        source = "host0:/tilefinch-wasm-device-latest.prx";
+        destination = "ms0:/PSP/GAME/TILEFINCH/slot-a/tilefinch-wasm.prx";
+        is_prx = 1;
+    } else if (argc == 2 && strcmp(argv[1], "voice") == 0) {
+        source = "host0:/tilefinch-voice-device-latest.prx";
+        destination = "ms0:/PSP/GAME/TILEFINCH/slot-a/tilefinch-voice.prx";
+        is_prx = 1;
+    } else if (argc > 1 && (argc != 2 || strcmp(argv[1], "eboot") != 0)) {
+        return finish("error", phase, -1, 0, 0, 1);
+    }
 
     /* Fixed paths keep this from becoming a general-purpose remote overwrite
        primitive. */
@@ -187,14 +205,11 @@ int main(int argc, char *argv[])
             ? remaining : TF_DEPLOY_CHUNK_BYTES;
         native_result = read_unit(source_file, transfer_buffer, request);
         if (native_result < 0) goto fail;
-        if (copied == 0 &&
-            (request < 4u ||
-             transfer_buffer[0] != 0 ||
-             transfer_buffer[1] != 'P' ||
-             transfer_buffer[2] != 'B' ||
-             transfer_buffer[3] != 'P')) {
+        if (copied == 0 && (request < 4u ||
+            (is_prx ? memcmp(transfer_buffer, "\177ELF", 4u) != 0
+                    : memcmp(transfer_buffer, "\0PBP", 4u) != 0))) {
             native_result = -1;
-            phase = "pbp-header";
+            phase = "artifact-header";
             goto fail;
         }
         native_result = write_unit(destination_file,

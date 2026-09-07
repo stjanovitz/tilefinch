@@ -92,6 +92,16 @@ void style_variable_cache_end(Stylesheet *sheet)
 void style_variable_cache_invalidate_node(
     Stylesheet *sheet, const lxb_dom_node_t *node)
 {
+    /* Focus classification temporarily edits a live attribute even inside a
+       layout build. Exact selector answers must not cross either edit. */
+    if (sheet != NULL && sheet->resolve_scratch != NULL
+        && sheet->resolve_scratch->ancestor_bloom_cache != NULL) {
+        StyleAncestorBloomCache *cache = sheet->resolve_scratch->ancestor_bloom_cache;
+        memset(cache->entries, 0, sizeof(cache->entries));
+        memset(cache->matched_ranges, 0, sizeof(cache->matched_ranges));
+        if (cache->results != NULL) memset(cache->results, 0,
+            STYLE_SELECTOR_RESULT_CACHE_CAPACITY * sizeof(*cache->results));
+    }
     if (sheet == NULL || node == NULL || sheet->resolve_scratch == NULL
         || sheet->resolve_scratch->variable_cache == NULL) return;
     StyleVariableCache *cache = sheet->resolve_scratch->variable_cache;
@@ -113,14 +123,17 @@ size_t style_variable_cache_bytes(const Stylesheet *sheet)
 }
 
 bool style_selector_cooperation_begin(
-    Stylesheet *sheet, StyleSelectorCooperate cooperate, void *opaque)
+    Stylesheet *sheet, StyleSelectorCooperate cooperate, void *opaque,
+    StyleAncestorBloomCache *ancestor_cache)
 {
     if (sheet == NULL || cooperate == NULL
         || sheet->selector_cooperate != NULL) return false;
     sheet->selector_cooperate = cooperate;
     sheet->selector_cooperate_opaque = opaque;
     sheet->selector_cooperate_visits = 0;
-    sheet->selector_cooperate_quota = 8192u;
+    /* A large rule set can spend >100ms in 8192 ancestor visits on Allegrex.
+       Input is serviced by the owner at these allocation-free safe points. */
+    sheet->selector_cooperate_quota = 1024u;
 #ifndef TILEFINCH_NO_TRACE
     const char *configured = getenv("TILEFINCH_SELECTOR_COOPERATE_VISITS");
     if (configured != NULL && configured[0] != '\0') {
@@ -134,12 +147,33 @@ bool style_selector_cooperation_begin(
 #endif
     sheet->selector_cooperate_next = sheet->selector_cooperate_quota;
     sheet->selector_cooperate_cancelled = false;
+    if (sheet->resolve_scratch != NULL) {
+        if (ancestor_cache != NULL) memset(ancestor_cache, 0, sizeof(*ancestor_cache));
+#ifndef TILEFINCH_NO_TRACE
+        if (getenv("TILEFINCH_DISABLE_ANCESTOR_CACHE") != NULL) ancestor_cache = NULL;
+#endif
+        sheet->resolve_scratch->ancestor_bloom_cache = ancestor_cache;
+        if (ancestor_cache != NULL && sheet->count >= 64u) {
+            ancestor_cache->results = budget_calloc_category(
+                sheet->budget, BUDGET_CATEGORY_LAYOUT,
+                STYLE_SELECTOR_RESULT_CACHE_CAPACITY,
+                sizeof(*ancestor_cache->results));
+        }
+    }
     return true;
 }
 
 void style_selector_cooperation_end(Stylesheet *sheet)
 {
     if (sheet == NULL) return;
+    if (sheet->resolve_scratch != NULL) {
+        StyleAncestorBloomCache *cache = sheet->resolve_scratch->ancestor_bloom_cache;
+        if (cache != NULL) {
+            budget_free(sheet->budget, cache->results);
+            cache->results = NULL;
+        }
+        sheet->resolve_scratch->ancestor_bloom_cache = NULL;
+    }
     sheet->selector_cooperate = NULL;
     sheet->selector_cooperate_opaque = NULL;
     sheet->selector_cooperate_visits = 0;
@@ -1933,6 +1967,16 @@ static bool selector_has_direct_never_match_pseudo(
     return false;
 }
 
+/* Retention and deferred analysis share ordinary CSS string/comment bounds. */
+static bool declaration_span(const char *text, size_t length,
+                             size_t *at, size_t *end)
+{
+    *at = skip_css_space_and_comments(text, length, *at);
+    if (*at >= length) return false;
+    *end = find_declaration_end(text, length, *at);
+    return true;
+}
+
 static bool collect_custom_rules(Stylesheet *sheet, const char *selector,
                                  size_t selector_length,
                                  const char *declarations, size_t length,
@@ -1974,29 +2018,8 @@ static bool collect_custom_rules(Stylesheet *sheet, const char *selector,
     };
     unsigned declaration_order = 0;
     for (size_t at = 0; at < length; declaration_order++) {
-        /* Comments are whitespace in a declaration list. */
-        while (at < length) {
-            while (at < length
-                   && isspace((unsigned char) declarations[at])) at++;
-            if (at + 1 >= length || declarations[at] != '/'
-                || declarations[at + 1] != '*') break;
-            at += 2;
-            while (at + 1 < length
-                   && !(declarations[at] == '*'
-                        && declarations[at + 1] == '/')) at++;
-            if (at + 1 >= length) return true;
-            at += 2;
-        }
-        size_t end = at;
-        int parentheses = 0;
-        while (end < length) {
-            if (declarations[end] == '(') parentheses++;
-            else if (declarations[end] == ')' && parentheses > 0) {
-                parentheses--;
-            }
-            if (declarations[end] == ';' && parentheses == 0) break;
-            end++;
-        }
+        size_t end;
+        if (!declaration_span(declarations, length, &at, &end)) break;
         size_t colon = at;
         while (colon < end && declarations[colon] != ':') colon++;
         if (colon < end) {
@@ -2238,14 +2261,8 @@ static void declarations_analyze_deferred_resolution(
 {
     if (text == NULL || analysis == NULL) return;
     for (size_t at = 0; at < length;) {
-        size_t end = at;
-        int parentheses = 0;
-        while (end < length) {
-            if (text[end] == '(') parentheses++;
-            else if (text[end] == ')' && parentheses > 0) parentheses--;
-            if (text[end] == ';' && parentheses == 0) break;
-            end++;
-        }
+        size_t end;
+        if (!declaration_span(text, length, &at, &end)) break;
         size_t colon = at;
         while (colon < end && text[colon] != ':') colon++;
         if (colon < end) {

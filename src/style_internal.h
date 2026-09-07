@@ -455,7 +455,7 @@ enum {
 #define STYLE_RULE_INDEX_MAX_SOURCES 34
 
 struct StyleRuleIndexBucket {
-    uint64_t hash;
+    uint32_t hash;
     uint32_t representative;
     uint32_t first;
     uint32_t count;
@@ -607,6 +607,12 @@ bool style_rule_selector_matches_subject(
     const StyleMatchSubject *subject);
 
 struct StyleResolveScratch {
+    /* Lexical-only summary. Never cache a DOM match or computed display:
+       head/html attributes can change without a stylesheet generation. */
+    uint64_t head_script_generation;
+    struct { uint32_t selector_index, prefix_length; } head_script_subjects[16];
+    uint8_t head_script_subject_count;
+    uint8_t head_script_summary; /* 0 unknown, 1 bounded subjects, 2 unsafe */
     /* Image-source provenance for the declarations currently being
        parsed (external stylesheet base URL / referrer policy / slot). */
     const char *current_image_source_base;
@@ -632,6 +638,7 @@ struct StyleResolveScratch {
     uint8_t logical_axes;
     /* Transient and owned by one layout build, never by the retained sheet. */
     struct StyleVariableCache *variable_cache;
+    struct StyleAncestorBloomCache *ancestor_bloom_cache;
     struct StyleContainerState *container_states;
     struct StyleContainerMatchCacheEntry *container_match_cache;
     size_t container_state_capacity;
@@ -1072,7 +1079,7 @@ const char *style_rule_fast_key(const StyleRule *rule);
 StyleRuleIndexBucket *style_rule_find_bucket(const Stylesheet *sheet,
                                              SelectorType type,
                                              const char *text, size_t length,
-                                             bool create);
+                                             bool create, PseudoElement pseudo);
 void stylesheet_prepare_rule_index(Stylesheet *sheet);
 
 /* style_selector_program.c */

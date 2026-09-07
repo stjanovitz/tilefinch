@@ -1,0 +1,15 @@
+tilefinch-input-script: text-entry=danzeff
+tilefinch-input-script: armed script=input-script.txt steps=8 stall-limit=1800
+tilefinch-input-script: action=focus-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=result-next step=2 screen=page
+tilefinch-input-script: action=focus-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=focus-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=focus-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=focus-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=result-below-fold step=4 screen=page
+tilefinch-input-script: mark=results-filled step=6 screen=page
+tilefinch-input-script: covered action=focus-down count=5
+tilefinch-input-script: outcome=complete steps=7/8 frames=254 held-frames=5 actions=1 settings=0
+tilefinch-input-script: capture=result-next written=1 size=240x136
+tilefinch-input-script: capture=result-below-fold written=1 size=240x136
+tilefinch-input-script: capture=results-filled written=1 size=240x136

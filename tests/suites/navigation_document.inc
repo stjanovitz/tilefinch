@@ -352,7 +352,11 @@ static bool test_streamed_candidate_remote_binding_isolation(void)
     bool navigation_ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (navigation_ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        /* The preserved-runtime rebind below allocates transiently; at
+           2 MiB this test passed with well under 8 KiB to spare, so any
+           bootstrap layout change made it fail spuriously. The heap size
+           is not what this test qualifies. */
+        navigation_enable_scripts(&navigation, 3 * MIB, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation_enable_external_resources(

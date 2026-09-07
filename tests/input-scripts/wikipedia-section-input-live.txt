@@ -1,0 +1,18 @@
+# Use the same live History target as the section latency qualification.
+# The live Down press must reach the busy supervisor inside activation,
+# then be replayed by the normal page receiver after the layout transaction.
+wait-page 2
+press-page 15 rtrigger
+wait-page 2
+stick-page 15 down
+stick-page 22 left
+tap-page cross
+wait-live 2
+mark-live expansion-busy
+tap-live down
+wait-page 2
+mark-page section-after
+tap-page rtrigger
+wait-page 2
+mark-page section-content
+end

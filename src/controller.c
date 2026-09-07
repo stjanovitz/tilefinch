@@ -1520,8 +1520,21 @@ static bool controller_focus_relative(BrowserController *controller,
         candidate = forward
             ? (candidate + 1u == count ? 0u : candidate + 1u)
             : (candidate == 0 ? count - 1u : candidate - 1u);
+        const LayoutDocument *layout = &controller->navigation->page.layout;
+        /* Hidden regions retain identity for later CSS/DOM updates, but are
+           not usable tab stops. Match the directional path's area admission;
+           do not reject ordinary off-viewport targets, which reveal/scroll.
+           A clipped skip link with real geometry can still reveal on focus. */
+        if (candidate < layout->link_count) {
+            const LinkRegion *region = &layout->links[candidate];
+            if (region->width <= 0 || region->height <= 0) continue;
+        } else {
+            const ControlRegion *region =
+                &layout->controls[candidate - layout->link_count];
+            if (region->width <= 0 || region->height <= 0) continue;
+        }
         lxb_dom_node_t *node = flat_focus_node(
-            &controller->navigation->page.layout, candidate);
+            layout, candidate);
         if (node == NULL || (current != NULL && node == current)) continue;
         return select_flat_focus(controller, candidate);
     }
@@ -1999,7 +2012,12 @@ static ControllerActivationOutcome controller_dispatch_activation(
     controller->pointer_click_pending = false;
     if (node == NULL) return CONTROLLER_ACTIVATION_NOT_DISPATCHED;
     if (node_name_is(node, "iframe")) {
-        if (navigation_activate_frame(navigation, node))
+        bool frame_activated = click_only
+            ? navigation_activate_frame_at(
+                  navigation, node, controller->pointer_click_offset_x,
+                  controller->pointer_click_offset_y)
+            : navigation_activate_frame(navigation, node);
+        if (frame_activated)
             return CONTROLLER_ACTIVATION_DELIVERED;
         return navigation->page.loaded
             ? CONTROLLER_ACTIVATION_RUNTIME_REFUSED
@@ -3023,6 +3041,16 @@ bool controller_activate(BrowserController *controller,
             return controller_build_document_media_action(
                 controller, action);
         }
+        /* Completing native text entry is implicit submission, not another
+           click on the input. Pointer entry already dispatched its click;
+           only the form's default submitter receives a synthetic click. */
+        if (input_blocks_implicit_submission(node)
+            && form_ancestor(node) != NULL) {
+            controller->pointer_click_pending = false;
+            controller->activations++;
+            return controller_build_implicit_form_action(
+                controller, node, CONTROLLER_ACTIVATION_NOT_DISPATCHED, action);
+        }
         ControllerChoiceSnapshot choice_snapshots[128];
         size_t choice_snapshot_count = 0;
         if (!controller_choice_snapshot(
@@ -3078,11 +3106,6 @@ bool controller_activate(BrowserController *controller,
             return controller_build_form_action_with_outcome(
                 controller, form_ancestor(node), node, true,
                 action->activation_outcome, action);
-        }
-        if (input_blocks_implicit_submission(node)
-            && form_ancestor(node) != NULL) {
-            return controller_build_implicit_form_action(
-                controller, node, action->activation_outcome, action);
         }
         (void) controller_try_structured_audio_fallback(
             controller, node, handlers_before, action);

@@ -250,31 +250,60 @@ if len(sys.argv) > 1 and Path(sys.argv[1]).name == "verify-trace-acquisition.js"
 '''
 
 
+def _stub_cache_root() -> Path | None:
+    """A per-user directory that outlives one test run, for the constant
+    stub executables.
+
+    The first execution of a newly written executable is authorized by one
+    system-wide macOS scanner whose latency is unbounded under load: about
+    0.2 s idle, seconds when other first executions are queued, and past the
+    tooling's 120 s subprocess cap when a parallel ctest run has many tests
+    writing executables at once.  Keeping each stub at a content-addressed
+    path means a given stub text is written, and therefore assessed, once per
+    machine rather than once per run.  The scanner itself is untouched.
+
+    The directory is private to this user (0700, owned by us); anything else
+    at that path is ignored in favour of a per-run temporary directory."""
+    override = os.environ.get("TILEFINCH_TEST_STUB_CACHE")
+    root = Path(override) if override else (
+        Path(tempfile.gettempdir()) / f"tilefinch-test-stubs-{os.getuid()}"
+    )
+    try:
+        root.mkdir(mode=0o700, exist_ok=True)
+        info = root.lstat()
+        if (
+            not root.is_dir() or root.is_symlink()
+            or info.st_uid != os.getuid() or info.st_mode & 0o077
+        ):
+            return None
+    except OSError:
+        return None
+    return root
+
+
 class TraceAcquisitionTests(unittest.TestCase):
-    # The stub executables are constant read-only fixtures, so they are
-    # written once per class rather than once per test method.  The first
-    # execution of a newly written file is authorized by one system-wide
-    # macOS scanner whose latency is unbounded under load (~0.2 s idle,
-    # ~4 s when other first executions are queued), so writing them per
-    # method made this test's wall clock a multiple of that cost instead of
-    # a function of its own work.  Isolation is unchanged: every trace,
-    # output, and marker still lives under a private per-test directory.
+    # The stub executables are constant read-only fixtures.  They live at
+    # content-addressed paths in a per-user cache that survives the run (see
+    # _stub_cache_root) so a stub is first-executed once per machine, with a
+    # per-class temporary directory as the fallback.  Isolation is unchanged:
+    # every trace, output, and marker still lives under a private per-test
+    # directory, and a cached stub is reused only when its bytes match.
     @classmethod
     def setUpClass(cls) -> None:
         cls.tools = tempfile.TemporaryDirectory(
             prefix="tilefinch-trace-acquisition-tools-"
         )
-        tools = Path(cls.tools.name)
-        cls.recorder = cls._stub(tools / "fake-recorder.py", FAKE_RECORDER)
+        cls.stub_cache = _stub_cache_root()
+        cls.recorder = cls._stub("fake-recorder.py", FAKE_RECORDER)
         cls.mutating_inventory = cls._stub(
-            tools / "mutating-native-inventory.py", MUTATING_NATIVE_INVENTORY
+            "mutating-native-inventory.py", MUTATING_NATIVE_INVENTORY
         )
-        cls.mutating_node_directory = tools / "mutating-node-bin"
-        cls.mutating_node_directory.mkdir()
-        cls._stub(cls.mutating_node_directory / "node", MUTATING_CLOSURE_NODE)
+        cls.mutating_node_directory = cls._stub(
+            "mutating-node-bin/node", MUTATING_CLOSURE_NODE
+        ).parent
         if NATIVE_INVENTORY_BINARY is None:
             cls.native_inventory = cls._stub(
-                tools / "fake-native-inventory.py", FAKE_NATIVE_INVENTORY
+                "fake-native-inventory.py", FAKE_NATIVE_INVENTORY
             )
         else:
             cls.native_inventory = NATIVE_INVENTORY_BINARY
@@ -283,9 +312,41 @@ class TraceAcquisitionTests(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.tools.cleanup()
 
-    @staticmethod
-    def _stub(path: Path, source: str) -> Path:
-        path.write_text(source, encoding="utf-8")
+    @classmethod
+    def _stub(cls, relative: str, source: str) -> Path:
+        data = source.encode("utf-8")
+        digest = hashlib.sha256(data).hexdigest()[:24]
+        if cls.stub_cache is not None:
+            path = cls.stub_cache / digest / relative
+            try:
+                if path.is_file() and not path.is_symlink():
+                    info = path.lstat()
+                    if (
+                        info.st_uid == os.getuid()
+                        and not info.st_mode & 0o077
+                        and path.read_bytes() == data
+                    ):
+                        return path
+                # mkdir(parents=True) applies the mode to the leaf only, so
+                # create each level explicitly to keep the whole tree 0700.
+                directory = cls.stub_cache / digest
+                directory.mkdir(mode=0o700, exist_ok=True)
+                for part in Path(relative).parts[:-1]:
+                    directory = directory / part
+                    directory.mkdir(mode=0o700, exist_ok=True)
+                # Publish atomically so a concurrent run never executes a
+                # partially written stub; the last writer wins with identical
+                # bytes.
+                staging = path.with_name(f".{path.name}.{os.getpid()}")
+                staging.write_bytes(data)
+                staging.chmod(0o700)
+                os.replace(staging, path)
+                return path
+            except OSError:
+                pass
+        path = Path(cls.tools.name) / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
         path.chmod(0o700)
         return path
 

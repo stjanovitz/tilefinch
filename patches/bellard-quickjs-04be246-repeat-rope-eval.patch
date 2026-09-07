@@ -100,7 +100,7 @@
  /* the indirection is needed to make 'eval' optional */
  static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                 const char *input, size_t input_len,
-@@ -37470,20 +37495,141 @@
+@@ -37470,20 +37495,143 @@
      return ret;
  }
 
@@ -146,13 +146,14 @@
 +    JSStringRope *rope = JS_VALUE_GET_STRING_ROPE(value);
 +
 +    *first_line_column = 0;
-+    if (rope->len > JS_STRING_REPEAT_EVAL_SCAN_MAX)
-+        return JS_ThrowRangeError(
-+            ctx, "eval source exceeds bounded repeated-string scan limit");
 +    string_rope_iter_init(&iterator, value);
 +    while ((part = string_rope_iter_next(&iterator)) != NULL) {
 +        uint32_t at = 0;
 +        while (at < part->len) {
++            if (skipped + at == JS_STRING_REPEAT_EVAL_SCAN_MAX)
++                return JS_ThrowRangeError(
++                    ctx,
++                    "eval source exceeds bounded repeated-string scan limit");
 +            int c = string_get(part, at);
 +            if (c != ' ' && c != '\t') {
 +                prefix_only = FALSE;
@@ -190,7 +191,8 @@
 +                uint32_t until_poll =
 +                    JS_STRING_REPEAT_EVAL_POLL_INTERVAL - work_since_poll;
 +                uint32_t count = min_uint32(available, until_poll);
-+                if (string_buffer_concat(buffer, part, start, count)) {
++                if (string_buffer_concat(buffer, part, start,
++                                         start + count)) {
 +                    string_buffer_free(buffer);
 +                    return JS_EXCEPTION;
 +                }

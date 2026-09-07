@@ -95,6 +95,10 @@ bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
      */
     size_t jobs = 0;
     while (jobs < 64 && JS_IsJobPending(runtime->runtime)) {
+        /* Short promise jobs may never hit the VM instruction interrupt.
+           Keep their bounded drain cooperative too, without a new task or
+           resetting the existing execution deadline. */
+        if (!js_rt_runtime_native_checkpoint(runtime)) return false;
         JSContext *job_context = NULL;
         uint64_t started_ns = js_rt_monotonic_time_ns();
         size_t polls_before = runtime->watchdog.polls;
@@ -120,6 +124,9 @@ bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
         }
         jobs++;
     }
+    /* Task boundary: a WebAssembly runtime left idle by this task's
+       operations is released here (see wasm_runtime_leave). */
+    js_wasm_release_idle_runtime();
     return true;
 }
 
@@ -513,10 +520,10 @@ void script_runtime_report_memory(ScriptRuntime *runtime, FILE *output)
     JS_RunGC(runtime->runtime);
     JSMemoryUsage usage;
     JS_ComputeMemoryUsage(runtime->runtime, &usage);
-    if (getenv("TILEFINCH_DUMP_JS_MEMORY") != NULL) {
+    if (tilefinch_dump_js_memory()) {
         JS_DumpMemoryUsage(stderr, &usage, runtime->runtime);
     }
-    if (getenv("TILEFINCH_DUMP_JS_POOL") != NULL) {
+    if (tilefinch_dump_js_pool()) {
         budget_quickjs_pool_report_classes(runtime->quickjs_pool, stderr);
     }
     fprintf(output, "script-js-malloc-peak bytes=%zu largest-request=%zu\n",
@@ -613,7 +620,7 @@ bool script_runtime_evaluate_diagnostic(ScriptRuntime *runtime,
         ok = false;
         failed_stage = "document-refresh";
     }
-    if (!ok && getenv("TILEFINCH_TRACE_SCRIPT_FAILURES") != NULL) {
+    if (!ok && tilefinch_trace_script_failures()) {
         fprintf(stderr,
                 "diagnostic-script-failure source=\"%s\" stage=%s "
                 "error=\"%s\"\n",
@@ -690,6 +697,12 @@ long script_runtime_node_weak_handle(ScriptRuntime *runtime,
 {
     return runtime == NULL
         ? 0 : (long) js_rt_bridge_register_node(&runtime->bridge, node);
+}
+
+void script_runtime_node_handle_release(ScriptRuntime *runtime, long handle)
+{
+    if (runtime != NULL && handle != 0)
+        bridge_release_native_node_pin(&runtime->bridge, (int64_t) handle);
 }
 
 bool script_runtime_node_handle_capacity_available(
@@ -771,11 +784,9 @@ void script_runtime_script_quota_abort(
 }
 
 #if !defined(__PSP__)
-static bool js_rt_refuse_document_refresh_once;
-
 void script_runtime_test_refuse_next_document_refresh(void)
 {
-    js_rt_refuse_document_refresh_once = true;
+    tilefinch_test_faults()->refuse_next_document_refresh = true;
 }
 
 void script_runtime_test_mark_document_refresh_failed(
@@ -797,8 +808,8 @@ bool js_rt_runtime_refresh(ScriptRuntime *runtime)
     if (runtime->result.dom_mutations != runtime->refreshed_mutations) {
         bool refreshed = true;
 #if !defined(__PSP__)
-        if (js_rt_refuse_document_refresh_once) {
-            js_rt_refuse_document_refresh_once = false;
+        if (tilefinch_test_faults()->refuse_next_document_refresh) {
+            tilefinch_test_faults()->refuse_next_document_refresh = false;
             refreshed = false;
         } else
 #endif

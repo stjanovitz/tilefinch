@@ -718,17 +718,6 @@ bool fetch_background_transport_take_media(
 bool fetch_background_transport_take(
     uint64_t request_id, unsigned char *destination,
     size_t capacity, FetchBackgroundResult *result);
-/*
- * Native-service streaming form. The request is deep-copied before enqueue;
- * DNS/TCP/TLS and response production stay on the PSP worker, while body
- * ownership, Budget growth, cookies and cancellation callbacks remain on the
- * calling browser thread. Host/replay callers continue to use the ordinary
- * deterministic transport.
- */
-bool fetch_background_request_cancelable(
-    Budget *budget, const char *url, const FetchRequest *request,
-    size_t maximum_bytes, long timeout_ms, FetchCancelCallback cancel,
-    void *cancel_opaque, FetchResult *result);
 bool fetch_background_transport_cancel(
     uint64_t request_id, const char *reason);
 /* Browser-thread snapshot of operations that still own worker/curl state.

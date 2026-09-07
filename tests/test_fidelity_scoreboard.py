@@ -20,16 +20,19 @@ class FidelityScoreboardTests(unittest.TestCase):
     def test_bottom_is_positioned_after_replay_settle(self) -> None:
         self.assertEqual(
             scoreboard.checkpoint_commands("bottom", None),
-            "bottom\nstatus\nquit\n",
+            f"drain 2048 {scoreboard.SETTLE_MS}\nbottom\nstatus\nquit\n",
         )
         self.assertEqual(
             scoreboard.checkpoint_commands("bottom", None, "article"),
-            "tick 1000 0\nbottom\nstatus\nquit\n",
+            f"drain 2048 {scoreboard.SETTLE_MS}\nbottom\nstatus\nquit\n",
         )
 
-    def test_hydration_settle_does_not_advance_replay_clock(self) -> None:
+    def test_top_and_hydration_use_bounded_resource_settle(self) -> None:
         commands = scoreboard.checkpoint_commands("top", None, "article")
-        self.assertTrue(commands.startswith("tick 1000 0\n"))
+        drain = f"drain 2048 {scoreboard.SETTLE_MS}\n"
+        self.assertTrue(commands.startswith(drain))
+        self.assertEqual(scoreboard.checkpoint_commands("top", None),
+                         drain + "status\nquit\n")
         self.assertIn(
             'js document.querySelectorAll("article").length\n', commands
         )

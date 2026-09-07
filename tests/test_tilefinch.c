@@ -1,5 +1,7 @@
 #include "tilefinch_test_common.h"
 #include "../src/psp_network_policy.h"
+#include "../src/tilefinch_test_faults.h"
+#include "../src/style_cache_internal.h"
 
 #include <stdarg.h>
 
@@ -1338,7 +1340,7 @@ static bool test_streaming_stylesheet_checkpoint_reuse(Budget *budget)
            reserve so the assertion measures stylesheet checkpoint reuse,
            rather than failing when unrelated bootstrap coverage grows. */
         navigation_enable_scripts(
-            &navigation, 2u * MIB + 64u * 1024u, 1000);
+            &navigation, 2u * MIB + 192u * 1024u, 1000);
         navigation_enable_document_scripts(
             &navigation, 8, 32u * 1024u, 16u * 1024u, 1000);
     }
@@ -2881,6 +2883,65 @@ static bool test_script_shared_cache_lifetimes(Budget *budget)
     if (navigation_ready) navigation_destroy(&navigation);
     if (session_ready) browser_session_destroy(&session);
     return ok && budget->current == 0;
+}
+
+typedef struct { unsigned calls; bool cancel; } ImageStyleProbe;
+
+static bool image_style_probe_cooperate(void *opaque, const char *phase, size_t units)
+{
+    (void) units;
+    ImageStyleProbe *probe = opaque;
+    if (strcmp(phase, "image-style") != 0) return true;
+    probe->calls++;
+    return !probe->cancel;
+}
+
+static int test_image_style_scope(Budget *budget)
+{
+    char html[16000];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>.root{--ink:red}");
+    for (unsigned i = 0; i < 64; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+            ".root .branch .leaf:not(.unused%u){color:var(--ink);padding:%upx}",
+            i, i % 3);
+    used += (size_t) snprintf(html + used, sizeof(html) - used,
+        "</style><body class=root><div class=branch>");
+    for (unsigned i = 0; i < 150; i++)
+        used += (size_t) snprintf(html + used, sizeof(html) - used,
+            "<span class=leaf>text</span>");
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, budget, html, used, 17)
+        && stylesheet_build(&sheet, budget, &document, 480));
+    CHECK(sheet.count >= 64u);
+    for (unsigned mode = 0; mode < 4; mode++) {
+        ImageStyleProbe probe = { .cancel = mode == 1 };
+        ImageResources images = {0};
+        bool outer = mode == 2 && style_variable_cache_begin(&sheet, budget);
+        CHECK(mode != 2 || outer);
+        FetchScheduler *scheduler = fetch_scheduler_create(budget, 3, 12288);
+        CHECK(scheduler != NULL);
+        TilefinchPlatformServices services = { .context = &probe,
+            .cooperate = image_style_probe_cooperate };
+        tilefinch_platform_set_services(&services);
+        if (mode == 3) budget_inject_failure_after(budget, 0);
+        bool loaded = images_load_external(&document, &sheet, &images, budget,
+            "https://resource.test/", "https://resource.test/", NULL,
+            1, 4096, 4096, 4096, 1000, scheduler, NULL);
+        tilefinch_platform_set_services(NULL);
+        budget_clear_failure_injection(budget);
+        fetch_scheduler_destroy(scheduler);
+        CHECK(loaded == !probe.cancel && probe.calls != 0
+            && sheet.selector_cooperate == NULL
+            && sheet.variable_cache_peak_bytes != 0);
+        CHECK((style_variable_cache_bytes(&sheet) != 0) == outer);
+        if (outer) style_variable_cache_end(&sheet);
+        images_destroy(&images);
+    }
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    return budget->current != 0;
 }
 
 static bool test_image_virtual_cancel_bound(Budget *budget)
