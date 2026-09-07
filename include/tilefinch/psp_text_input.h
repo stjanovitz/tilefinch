@@ -38,6 +38,10 @@ typedef struct {
     void *cancel_user;
     const BrowserProfile *profile;
     bool danzeff_enabled;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Replaces samples only during a scripted modal-keyboard qualification. */
+    bool (*validation_poll)(PspUiInput *input);
+#endif
 #ifdef TILEFINCH_HAVE_PSP_VOICE
     PspVoiceInput voice;
 #endif

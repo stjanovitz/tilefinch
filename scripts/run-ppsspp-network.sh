@@ -592,6 +592,9 @@ if [ "$launcher" -eq 1 ]; then
 else
     cp "$build_dir/EBOOT.PBP" "$build_dir/roots.pem" \
         "$build_dir/tilefinch-wasm.prx" "$app_dir/"
+    if [ -f "$build_dir/tilefinch-voice.prx" ]; then
+        cp "$build_dir/tilefinch-voice.prx" "$app_dir/"
+    fi
     for asset_dir in fonts voice-model; do
         if [ -d "$build_dir/$asset_dir" ]; then
             cp -R "$build_dir/$asset_dir" "$app_dir/$asset_dir"

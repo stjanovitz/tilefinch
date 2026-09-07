@@ -1,0 +1,11 @@
+# Serve tests/fixtures/cooperative-disclosure.html. Inspect all three marks.
+wait-page 1
+tap-page down
+mark-page before
+tap-page cross
+wait-page 1
+mark-page expanded
+tap-page cross
+wait-page 1
+mark-page collapsed
+end

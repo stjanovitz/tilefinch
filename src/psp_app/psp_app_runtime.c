@@ -1381,6 +1381,72 @@ static bool psp_media_seek_holds_scanout(const PspMediaSession *media)
     }
 }
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+/* One outstanding input measurement, no DOM retention. The engine is the
+   process-owned facade; a navigation generation change abandons the sample.
+   In particular a supervisor publishing the old framebuffer is not success. */
+static struct {
+    BrowserEngine *engine;
+    uint64_t generation, started_us, shell_serial;
+    size_t rendered_frames;
+    int action;
+} psp_focus_feedback;
+
+void psp_focus_feedback_begin(BrowserEngine *engine, int action, uint64_t started_us)
+{
+    if (engine == NULL) {
+        psp_focus_feedback.engine = NULL;
+        return;
+    }
+    const NavigationSession *navigation = browser_engine_navigation(engine);
+    const TileCache *render = browser_engine_render_metrics_view(engine);
+    if (navigation == NULL || render == NULL) return;
+    if (psp_focus_feedback.engine != NULL)
+        printf("tilefinch-focus-feedback-incomplete: action=%d reason=superseded\n",
+               psp_focus_feedback.action);
+    psp_focus_feedback.engine = engine;
+    psp_focus_feedback.generation = navigation->generation;
+    psp_focus_feedback.started_us = started_us;
+    psp_focus_feedback.rendered_frames = render->frames_rendered;
+    psp_focus_feedback.shell_serial = browser_engine_render_shell_serial(engine);
+    psp_focus_feedback.action = action;
+}
+
+static void psp_focus_feedback_published(const uint16_t *frame, const PspUiState *ui)
+{
+    BrowserEngine *engine = psp_focus_feedback.engine;
+    if (engine == NULL) return;
+    const NavigationSession *navigation = browser_engine_navigation(engine);
+    if (navigation == NULL || !navigation->page.loaded
+        || navigation->generation != psp_focus_feedback.generation) {
+        printf("tilefinch-focus-feedback-incomplete: action=%d reason=navigation\n",
+               psp_focus_feedback.action);
+        psp_focus_feedback.engine = NULL;
+        return;
+    }
+    const TileCache *render = browser_engine_render_metrics_view(engine);
+    if (ui == NULL || ui->screen != PSP_UI_SCREEN_PAGE || render == NULL
+        || render->frames_rendered == 0
+        || (browser_engine_render_shell_serial(engine) == psp_focus_feedback.shell_serial
+            && render->frames_rendered <= psp_focus_feedback.rendered_frames)
+        || browser_engine_render_frame_pending(engine)
+        || frame != browser_engine_framebuffer(engine, NULL)) return;
+    printf("tilefinch-focus-feedback: action=%d shown=1 visible=%u elapsed=%lluus "
+           "rect=%d,%d,%d,%d relayouts=%zu layout-total=%lluus "
+           "fixed=%zu/%zu/%zu fixed-us=%lluus tile-us=%lluus\n",
+           psp_focus_feedback.action, ui->has_focus ? 1u : 0u,
+           (unsigned long long) (sceKernelGetSystemTimeWide() - psp_focus_feedback.started_us),
+           ui->focus_x, ui->focus_y, ui->focus_width, ui->focus_height,
+           navigation->incremental_relayouts,
+           (unsigned long long) navigation->performance.layout_us,
+           navigation->page.layout.fixed_count, render->fixed_cache_builds,
+           render->fixed_cache_blits,
+           (unsigned long long) render->frame_fixed_us,
+           (unsigned long long) render->frame_tile_us);
+    psp_focus_feedback.engine = NULL;
+}
+#endif
+
 bool psp_present_internal(
     const uint16_t *frame, const PspUiState *ui, bool include_media)
 {
@@ -1519,6 +1585,7 @@ bool psp_present_internal(
         .sequence = sequence
     };
     psp_cadence_published(published);
+    if (published && !media_visible) psp_focus_feedback_published(frame, ui);
     if (published && media_visible) {
         psp_input_script_capture_media_present(
             &psp_active_media->ui, vram, NULL, PSP_VRAM_STRIDE,
@@ -2000,9 +2067,9 @@ bool psp_power_auto_start(
 }
 #endif
 
-void psp_present(const uint16_t *frame, const PspUiState *ui)
+bool psp_present(const uint16_t *frame, const PspUiState *ui)
 {
-    (void) psp_present_internal(frame, ui, true);
+    return psp_present_internal(frame, ui, true);
 }
 
 bool psp_present_cursor_feedback(
@@ -2011,7 +2078,7 @@ bool psp_present_cursor_feedback(
     return psp_present_internal(frame, ui, true);
 }
 
-void psp_present_supervisor_ui(const uint16_t *frame,
+bool psp_present_supervisor_ui(const uint16_t *frame,
                                       const PspUiState *ui)
 {
     /*
@@ -2021,8 +2088,8 @@ void psp_present_supervisor_ui(const uint16_t *frame,
      * pixels and then blend the next status bar over them, which accumulates
      * lines and flicker during rapid input.
      */
-    if (frame == NULL || ui == NULL) return;
-    (void) psp_present_internal(frame, ui, false);
+    if (frame == NULL || ui == NULL) return false;
+    return psp_present_internal(frame, ui, false);
 }
 
 static void psp_present_supervisor_media(const PspUiMediaState *media)
@@ -2084,10 +2151,12 @@ static void psp_present_supervisor_media(const PspUiMediaState *media)
        rule as the 32-bit surface above. Clearing this buffer and drawing all
        snapshot chrome briefly published black video; copying the last
        complete scanout preserves the picture and any current caption while
-       the cooperative unit updates only the input-acknowledgement controls. */
+       the cooperative unit updates only the input-acknowledgement controls.
+       Before a first picture, however, the 565 surface is a loading stage:
+       its central progress panel must advance under supervisor ownership. */
     memcpy(vram, front,
            PSP_DISPLAY_BUFFER_PIXELS * sizeof(*vram));
-    psp_ui_media_composite_controls(
+    psp_ui_media_composite_supervisor_565(
         media, vram, PSP_SCREEN_WIDTH, PSP_SCREEN_HEIGHT,
         PSP_VRAM_STRIDE);
     unsigned published_index = psp_display.back_buffer;
@@ -2178,17 +2247,23 @@ bool psp_platform_present(
     return shown;
 }
 
-void psp_work_cooperate_begin(
+static void psp_work_cooperate_begin_internal(
     PspUiState *ui, const uint16_t *frame,
     bool periodic_present, bool acknowledge_non_cancel_busy,
     bool log_session, const char *cancel_status, const char *phase,
-    BrowserEngine *engine, const PspUiMediaState *media_ui)
+    BrowserEngine *engine, const PspUiMediaState *media_ui,
+    bool owner_thread_only)
 {
     /* Publish an immutable page-frame pointer and a private UI copy before
        making the job visible to the callback-thread supervisor. The engine
        does not paint this framebuffer while candidate navigation is active. */
     psp_navigation_cooperate.ui = ui;
-    if (ui != NULL) psp_navigation_cooperate.supervisor_ui = *ui;
+    if (ui != NULL) {
+        psp_navigation_cooperate.supervisor_ui = *ui;
+        psp_navigation_cooperate.original_screen = ui->screen;
+        psp_navigation_cooperate.original_chrome_visible = ui->chrome_visible;
+    }
+    psp_navigation_cooperate.input_yield = false;
     psp_navigation_cooperate.media_surface = media_ui != NULL;
     psp_navigation_cooperate.media_detached = false;
     if (media_ui != NULL)
@@ -2221,6 +2296,7 @@ void psp_work_cooperate_begin(
         cancel_status == NULL
             ? "STOPPING..." : cancel_status;
     psp_navigation_cooperate.periodic_present = periodic_present;
+    psp_navigation_cooperate.owner_thread_only = owner_thread_only;
     psp_navigation_cooperate.acknowledge_non_cancel_busy =
         acknowledge_non_cancel_busy;
     psp_navigation_cooperate.log_session = log_session;
@@ -2238,6 +2314,71 @@ void psp_work_cooperate_begin(
     __sync_synchronize();
     psp_navigation_cooperate.active =
         ui != NULL && frame != NULL ? 1u : 0u;
+}
+
+void psp_work_cooperate_begin(
+    PspUiState *ui, const uint16_t *frame,
+    bool periodic_present, bool acknowledge_non_cancel_busy,
+    bool log_session, const char *cancel_status, const char *phase,
+    BrowserEngine *engine, const PspUiMediaState *media_ui)
+{
+    psp_work_cooperate_begin_internal(
+        ui, frame, periodic_present, acknowledge_non_cancel_busy,
+        log_session, cancel_status, phase, engine, media_ui, false);
+}
+
+/* Arm cheaply: ordinary short tasks must not copy the large UI snapshot or
+   sample the pad. Activation occurs only at a same-thread cooperative safe
+   point, never inside an outstanding GE list or from the callback thread. */
+static struct {
+    _Atomic unsigned armed;
+    _Atomic int owner_thread;
+    PspUiState *ui;
+    const uint16_t *frame;
+    uint64_t started_us;
+    uint64_t last_poll_us;
+    bool optional_font_publication;
+    PspUiToolbarInputState *toolbar;
+} psp_runtime_cooperate;
+
+void psp_runtime_cooperate_begin(PspUiState *ui, const uint16_t *frame,
+                                 PspUiToolbarInputState *toolbar)
+{
+    if (psp_navigation_cooperate.active || ui == NULL || frame == NULL
+        || ui->page_gamepad_capture) return;
+    psp_runtime_cooperate.ui = ui;
+    psp_runtime_cooperate.frame = frame;
+    psp_runtime_cooperate.toolbar = toolbar;
+    psp_runtime_cooperate.started_us = sceKernelGetSystemTimeWide();
+    psp_runtime_cooperate.last_poll_us = 0;
+    psp_runtime_cooperate.optional_font_publication = false;
+    atomic_store_explicit(&psp_runtime_cooperate.owner_thread,
+                          sceKernelGetThreadId(), memory_order_relaxed);
+    atomic_store_explicit(&psp_runtime_cooperate.armed, 1u, memory_order_release);
+}
+
+bool psp_runtime_cooperate_end(uint32_t *observed_buttons)
+{
+    if (!atomic_load_explicit(&psp_runtime_cooperate.armed,
+                              memory_order_acquire)) return false;
+    if (!psp_navigation_cooperate.active
+        || !psp_navigation_cooperate.owner_thread_only) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        uint64_t elapsed = sceKernelGetSystemTimeWide()
+            - psp_runtime_cooperate.started_us;
+        if (elapsed >= UINT64_C(100000))
+            printf("tilefinch-runtime-cooperation: unserviced=%lluus\n",
+                   (unsigned long long) elapsed);
+#endif
+        atomic_store_explicit(&psp_runtime_cooperate.armed, 0u,
+                              memory_order_release);
+        return false;
+    }
+    if (observed_buttons != NULL)
+        *observed_buttons = psp_navigation_observed_buttons();
+    psp_navigation_cooperate_end("page-runtime");
+    atomic_store_explicit(&psp_runtime_cooperate.armed, 0u, memory_order_release);
+    return true;
 }
 
 void psp_navigation_cooperate_begin(
@@ -2385,6 +2526,14 @@ void psp_navigation_cooperate_end(const char *scope)
                    "100ms; retaining shared state until release\n");
         }
     }
+    if (psp_navigation_cooperate.owner_thread_only
+        && psp_navigation_cooperate.cursor_feedback
+        && psp_navigation_cooperate.ui != NULL) {
+        psp_ui_adopt_priority(psp_navigation_cooperate.ui,
+                             &psp_navigation_cooperate.supervisor_ui,
+                             psp_navigation_cooperate.original_screen,
+                             psp_navigation_cooperate.original_chrome_visible);
+    }
     if (psp_navigation_cooperate.pending_media_intent.action
             != PSP_UI_MEDIA_ACTION_NONE) {
         /* The presentation fence above also fences the callback's 64-bit
@@ -2393,7 +2542,9 @@ void psp_navigation_cooperate_end(const char *scope)
         psp_completed_supervisor_media_intent =
             psp_navigation_cooperate.pending_media_intent;
     }
-    if (!psp_navigation_cancel_requested()
+    if ((!psp_navigation_cancel_requested()
+         || (psp_navigation_cooperate.owner_thread_only
+             && psp_navigation_cooperate.input_yield))
         && !psp_navigation_cooperate.media_surface
         && !psp_navigation_cooperate.media_detached) {
         for (uint8_t at = 0;
@@ -2426,6 +2577,8 @@ void psp_navigation_cooperate_end(const char *scope)
     bool cancelled = psp_navigation_cancel_requested();
     bool report =
         psp_navigation_cooperate.log_session || cancelled
+        || psp_navigation_cooperate.presentations != 0
+        || psp_navigation_cooperate.input_acknowledgements != 0
         || psp_navigation_cooperate.maximum_checkpoint_gap_us
                >= UINT64_C(100000);
     if (psp_navigation_cooperate.ui != NULL && report) {
@@ -2516,10 +2669,19 @@ bool psp_navigation_cooperate_take_page_input(uint32_t *pressed)
     return true;
 }
 
+static void psp_work_ui_tick(bool owner_thread);
+
 void psp_background_ui_tick(void)
 {
+    psp_work_ui_tick(false);
+}
+
+static void psp_work_ui_tick(bool owner_thread)
+{
     PspNavigationCooperate *cooperate = &psp_navigation_cooperate;
-    if (cooperate->supervised == 0 || cooperate->active == 0) return;
+    if (cooperate->active == 0
+        || cooperate->owner_thread_only != owner_thread
+        || (!owner_thread && cooperate->supervised == 0)) return;
     if (!__sync_bool_compare_and_swap(
             &cooperate->presenting, 0u, 1u)) return;
     __sync_synchronize();
@@ -2527,16 +2689,16 @@ void psp_background_ui_tick(void)
         cooperate->presenting = 0;
         return;
     }
-    SceCtrlData pad = {0};
+    SceCtrlData pad = { .Lx = 128, .Ly = 128 };
     bool urgent_present = false;
     uint64_t acknowledgement_started_us = 0;
     uint32_t ui_pressed = 0;
     PspUiMediaIntent supervisor_media_intent = {0};
-#ifdef TILEFINCH_PSP_VALIDATION_LOG
     PspUiInput scripted_input = {
         .analog_x = 128,
         .analog_y = 128
     };
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
     bool scripted = psp_input_script_running()
         && psp_input_script_busy_frame(&scripted_input);
     if (scripted) ui_pressed = scripted_input.pressed;
@@ -2578,7 +2740,64 @@ void psp_background_ui_tick(void)
         ui_pressed = psp_ui_buttons(physical_pressed)
             | psp_controller_take_latched_pressed();
     }
-    if ((ui_pressed & PSP_UI_BUTTON_CANCEL) != 0
+    /* Only the rollback-safe optional face transaction is preemptible here.
+       Never interrupt author mutations this way or dispatch DOM input while
+       layout is borrowing its state. Button edges use the existing mailbox;
+       held nub movement resumes through the ordinary next-frame receiver. */
+    int analog_x = scripted ? scripted_input.analog_x : pad.Lx;
+    int analog_y = scripted ? scripted_input.analog_y : pad.Ly;
+    bool analog_active = analog_x < 104 || analog_x > 152
+        || analog_y < 104 || analog_y > 152;
+    bool priority_handled = false;
+    if (owner_thread && cooperate->engine == NULL
+        && !cooperate->media_surface && !cooperate->media_detached
+        && cooperate->pending_page_input_count == 0) {
+        /* Native menus and cursor movement do not call the document. Keep
+           their visual state on the completed frame while page work runs. */
+        PspUiInput native_input = { .pressed = ui_pressed,
+            .held = scripted ? scripted_input.held : psp_ui_buttons(pad.Buttons),
+            .analog_x = analog_x, .analog_y = analog_y, .elapsed_ms = 16 };
+        PspUiToolbarInputState *toolbar = psp_runtime_cooperate.toolbar;
+        bool toolbar_tracking = toolbar != NULL && (toolbar->gesture.held
+            || ((native_input.held & PSP_UI_BUTTON_TOOLBAR) != 0
+                && cooperate->supervisor_ui.screen == PSP_UI_SCREEN_PAGE));
+        if (psp_ui_filter_toolbar_input(toolbar, &native_input,
+                cooperate->supervisor_ui.screen == PSP_UI_SCREEN_PAGE,
+                scripted && toolbar != NULL ? toolbar->sample_ms + 16u : now_us / 1000u))
+            toolbar->reader_pending = true;
+        priority_handled = psp_ui_update_priority(
+            &cooperate->supervisor_ui, &native_input);
+        /* A held Triangle is consumed by the gesture, not replayed as a
+           fresh press on return to the main loop. Reader dispatch waits for
+           the page's borrowed state to be released. */
+        priority_handled |= toolbar_tracking;
+        if (priority_handled) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            /* Include owner-checkpoint cursor samples, not just the main
+               loop: omitting these makes a responsive supervised interval
+               look like one long gap in the cursor cadence report. */
+            if (ui_pressed == 0 && analog_active)
+                psp_cursor_latency_sample(now_us);
+#endif
+            cooperate->cursor_feedback = true;
+            cooperate->input_acknowledgements++;
+            acknowledgement_started_us = sceKernelGetSystemTimeWide();
+            urgent_present = true;
+        }
+    }
+    bool yield_for_input = owner_thread
+        && psp_runtime_cooperate.optional_font_publication
+        && (ui_pressed != 0 || analog_active);
+    if (yield_for_input) {
+        cooperate->input_yield = true;
+        tilefinch_cancellation_request(&cooperate->cancellation);
+        cooperate->cancellation_requested_us = sceKernelGetSystemTimeWide();
+        if (ui_pressed != 0 && !priority_handled
+            && cooperate->pending_page_input_count < PSP_SUPERVISOR_PAGE_INPUT_LIMIT)
+            cooperate->pending_page_input[cooperate->pending_page_input_count++] = ui_pressed;
+    } else if (priority_handled) {
+        /* Already applied; replaying Select would immediately close the menu. */
+    } else if ((ui_pressed & PSP_UI_BUTTON_CANCEL) != 0
         && !tilefinch_cancellation_requested(
             &cooperate->cancellation)) {
         tilefinch_cancellation_request(&cooperate->cancellation);
@@ -2675,6 +2894,11 @@ void psp_background_ui_tick(void)
             cooperate->pending_page_input_count++] = ui_pressed;
         cooperate->input_acknowledgements++;
         acknowledgement_started_us = sceKernelGetSystemTimeWide();
+        if (owner_thread) {
+            psp_ui_show_status(&cooperate->supervisor_ui,
+                              "PAGE UPDATE - INPUT QUEUED", 120);
+            urgent_present = true;
+        }
     } else if (ui_pressed != 0
                && cooperate->acknowledge_non_cancel_busy) {
         cooperate->input_acknowledgements++;
@@ -2719,9 +2943,13 @@ void psp_background_ui_tick(void)
            decoder, resolver, or raster unit is running. */
         if (cooperate->media_surface)
             psp_present_supervisor_media(&cooperate->supervisor_media_ui);
-        else
-            psp_present_supervisor_ui(
-                cooperate->frame, &cooperate->supervisor_ui);
+        else if (!psp_present_supervisor_ui(
+                     cooperate->frame, &cooperate->supervisor_ui)) {
+            /* Input remains queued, but a refused latch is not visible
+               feedback and must not produce a successful latency sample. */
+            cooperate->presenting = 0;
+            return;
+        }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         if (scripted
             && !cooperate->supervisor_ui.page_gamepad_capture
@@ -2750,6 +2978,36 @@ bool psp_platform_cooperate(
     void *context, const char *phase, size_t completed_work_units)
 {
     PspNavigationCooperate *cooperate = context;
+    if (cooperate == &psp_navigation_cooperate
+        && atomic_load_explicit(&psp_runtime_cooperate.armed,
+                                memory_order_acquire)) {
+        /* Reject worker hooks before reading any owner-only borrowed state. */
+        if (sceKernelGetThreadId() != atomic_load_explicit(
+                &psp_runtime_cooperate.owner_thread, memory_order_relaxed))
+            return true;
+        if (phase != NULL && strcmp(phase, "optional-font-publication") == 0) {
+            psp_runtime_cooperate.optional_font_publication = completed_work_units != 0;
+            if (completed_work_units == 0) return true;
+        }
+        uint64_t now = sceKernelGetSystemTimeWide();
+        if (!cooperate->active
+            && now - psp_runtime_cooperate.started_us >= UINT64_C(8000)) {
+            psp_work_cooperate_begin_internal(
+                psp_runtime_cooperate.ui, psp_runtime_cooperate.frame,
+                psp_runtime_cooperate.ui->page_activation_busy,
+                true, false, "STOPPING PAGE UPDATE...",
+                "page-runtime", NULL, NULL, true);
+            /* Include work before the first checkpoint in gap accounting. */
+            cooperate->started_us = psp_runtime_cooperate.started_us;
+            cooperate->last_checkpoint_us = psp_runtime_cooperate.started_us;
+        }
+        if (cooperate->active && cooperate->owner_thread_only
+            && (psp_runtime_cooperate.last_poll_us == 0
+                || now - psp_runtime_cooperate.last_poll_us >= UINT64_C(16000))) {
+            psp_runtime_cooperate.last_poll_us = now;
+            psp_work_ui_tick(true);
+        }
+    }
     if (cooperate == NULL || !cooperate->active) return true;
     if (psp_home_exit_pending()
         && !tilefinch_cancellation_requested(&cooperate->cancellation)) {
@@ -2764,6 +3022,13 @@ bool psp_platform_cooperate(
         now_us >= cooperate->last_checkpoint_us
             ? now_us - cooperate->last_checkpoint_us : 0;
     if (checkpoint_gap_us > cooperate->maximum_checkpoint_gap_us) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if (checkpoint_gap_us > UINT64_C(33000))
+            printf("tilefinch-cooperate-slow-gap: elapsed=%lluus from=%s to=%s work=%zu\n",
+                   (unsigned long long) checkpoint_gap_us,
+                   cooperate->last_phase == NULL ? "unknown" : cooperate->last_phase,
+                   phase == NULL ? "unknown" : phase, completed_work_units);
+#endif
         cooperate->maximum_checkpoint_gap_us = checkpoint_gap_us;
         cooperate->maximum_checkpoint_gap_phase = phase;
     }
@@ -2828,7 +3093,7 @@ bool psp_platform_cooperate(
     }
     bool urgent_present = false;
     uint64_t acknowledgement_started_us = 0;
-    if (cooperate->supervised == 0) {
+    if (cooperate->supervised == 0 && !cooperate->owner_thread_only) {
         SceCtrlData pad = {0};
         if (sceCtrlPeekBufferPositive(&pad, 1) > 0) {
             uint32_t pressed =
@@ -2870,7 +3135,7 @@ bool psp_platform_cooperate(
                 cooperate->ui, "STOPPING PAGE LOAD...", 600);
         }
     }
-    if (cooperate->supervised == 0
+    if (cooperate->supervised == 0 && !cooperate->owner_thread_only
         && (urgent_present || cooperate->last_present_us == 0
         || now_us - cooperate->last_present_us
                >= PSP_NAVIGATION_PRESENT_INTERVAL_US)) {

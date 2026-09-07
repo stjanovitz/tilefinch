@@ -576,11 +576,7 @@ void stylesheet_prepare_selector_program(Stylesheet *sheet)
         (STYLE_SELECTOR_PROGRAM_BUDGET - offset_bytes)
         / sizeof(StyleSelectorInstruction);
     if (instruction_limit >= UINT16_MAX) instruction_limit = UINT16_MAX - 1u;
-#ifndef TILEFINCH_NO_TRACE
     bool complex_compounds = style_selector_complex_compounds_enabled();
-#else
-    bool complex_compounds = style_selector_complex_compounds_enabled();
-#endif
     uint16_t *offsets = budget_malloc(sheet->budget, offset_bytes);
     if (offsets == NULL) {
         stylesheet_release_fragment_seeds(sheet);
@@ -683,11 +679,7 @@ bool stylesheet_extend_selector_program(
     if (sheet->selector_program_instruction_count > instruction_limit) {
         return false;
     }
-#ifndef TILEFINCH_NO_TRACE
     bool complex_compounds = style_selector_complex_compounds_enabled();
-#else
-    bool complex_compounds = style_selector_complex_compounds_enabled();
-#endif
     uint16_t *offsets = budget_malloc(sheet->budget, offset_bytes);
     if (offsets == NULL) return false;
     size_t wanted = 0;

@@ -3,6 +3,7 @@
    point.  Split out of style.c. */
 
 #include "style_internal.h"
+#include "style_cache_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -221,6 +222,22 @@ static bool decode_css_identifier(const char *text, size_t length,
     output[written] = '\0';
     *output_length = written;
     return true;
+}
+
+/* Most selectors contain no escapes. Borrow their bounded span rather than
+   copying it into a temporary buffer for every candidate element. Keep the
+   exact same decoded-identifier limit and escape semantics. */
+static const char *style_identifier_span(const char *text, size_t length,
+                                         char *scratch, size_t capacity,
+                                         size_t *decoded_length)
+{
+    if (memchr(text, '\\', length) == NULL) {
+        if (length >= capacity) return NULL;
+        *decoded_length = length;
+        return text;
+    }
+    return decode_css_identifier(text, length, scratch, capacity, decoded_length)
+        ? scratch : NULL;
 }
 
 static bool attribute_span_equal_case(const char *actual,
@@ -471,17 +488,119 @@ static bool custom_element_navigation_fallback_is_authoritative(
     return false;
 }
 
+typedef enum {
+    STYLE_PSEUDO_UNKNOWN,
+    STYLE_PSEUDO_INTERACTIVE,
+    STYLE_PSEUDO_FOCUS,
+    STYLE_PSEUDO_FOCUS_WITHIN,
+    STYLE_PSEUDO_FULLSCREEN,
+    STYLE_PSEUDO_ROOT,
+    STYLE_PSEUDO_SCOPE,
+    STYLE_PSEUDO_DEFINED,
+    STYLE_PSEUDO_FIRST,
+    STYLE_PSEUDO_LAST,
+    STYLE_PSEUDO_FIRST_TYPE,
+    STYLE_PSEUDO_LAST_TYPE,
+    STYLE_PSEUDO_ONLY_CHILD,
+    STYLE_PSEUDO_ONLY_TYPE,
+    STYLE_PSEUDO_EMPTY,
+    STYLE_PSEUDO_NOT,
+    STYLE_PSEUDO_IS,
+    STYLE_PSEUDO_HAS,
+    STYLE_PSEUDO_DISABLED,
+    STYLE_PSEUDO_ENABLED,
+    STYLE_PSEUDO_CHECKED,
+    STYLE_PSEUDO_REQUIRED,
+    STYLE_PSEUDO_OPTIONAL,
+    STYLE_PSEUDO_LINK,
+    STYLE_PSEUDO_OPEN,
+    STYLE_PSEUDO_MODAL,
+    STYLE_PSEUDO_POPOVER_OPEN,
+    STYLE_PSEUDO_NTH_CHILD,
+    STYLE_PSEUDO_NTH_TYPE,
+    STYLE_PSEUDO_NTH_LAST_CHILD,
+    STYLE_PSEUDO_NTH_LAST_TYPE,
+} StylePseudoKind;
+
+/* Classify once, testing only names of the same length. Candidate matching
+   must not run every pseudo-class's string comparisons and state queries. */
+static StylePseudoKind style_pseudo_kind(const char *text, size_t length)
+{
+    switch (length) {
+    case 2:
+        if (memcmp(text, "is", 2) == 0) return STYLE_PSEUDO_IS;
+        break;
+    case 3:
+        if (memcmp(text, "not", 3) == 0) return STYLE_PSEUDO_NOT;
+        if (memcmp(text, "has", 3) == 0) return STYLE_PSEUDO_HAS;
+        break;
+    case 4:
+        if (memcmp(text, "root", 4) == 0) return STYLE_PSEUDO_ROOT;
+        if (memcmp(text, "link", 4) == 0) return STYLE_PSEUDO_LINK;
+        if (memcmp(text, "open", 4) == 0) return STYLE_PSEUDO_OPEN;
+        break;
+    case 5:
+        if (memcmp(text, "hover", 5) == 0) return STYLE_PSEUDO_INTERACTIVE;
+        if (memcmp(text, "focus", 5) == 0) return STYLE_PSEUDO_FOCUS;
+        if (memcmp(text, "scope", 5) == 0) return STYLE_PSEUDO_SCOPE;
+        if (memcmp(text, "empty", 5) == 0) return STYLE_PSEUDO_EMPTY;
+        if (memcmp(text, "where", 5) == 0) return STYLE_PSEUDO_IS;
+        if (memcmp(text, "modal", 5) == 0) return STYLE_PSEUDO_MODAL;
+        break;
+    case 6:
+        if (memcmp(text, "active", 6) == 0) return STYLE_PSEUDO_INTERACTIVE;
+        break;
+    case 7:
+        if (memcmp(text, "visited", 7) == 0) return STYLE_PSEUDO_INTERACTIVE;
+        if (memcmp(text, "defined", 7) == 0) return STYLE_PSEUDO_DEFINED;
+        if (memcmp(text, "enabled", 7) == 0) return STYLE_PSEUDO_ENABLED;
+        if (memcmp(text, "checked", 7) == 0) return STYLE_PSEUDO_CHECKED;
+        break;
+    case 8:
+        if (memcmp(text, "-moz-any", 8) == 0) return STYLE_PSEUDO_IS;
+        if (memcmp(text, "disabled", 8) == 0) return STYLE_PSEUDO_DISABLED;
+        if (memcmp(text, "required", 8) == 0) return STYLE_PSEUDO_REQUIRED;
+        if (memcmp(text, "optional", 8) == 0) return STYLE_PSEUDO_OPTIONAL;
+        if (memcmp(text, "any-link", 8) == 0) return STYLE_PSEUDO_LINK;
+        break;
+    case 9:
+        if (memcmp(text, "nth-child", 9) == 0) return STYLE_PSEUDO_NTH_CHILD;
+        break;
+    case 10:
+        if (memcmp(text, "fullscreen", 10) == 0) return STYLE_PSEUDO_FULLSCREEN;
+        if (memcmp(text, "last-child", 10) == 0) return STYLE_PSEUDO_LAST;
+        if (memcmp(text, "only-child", 10) == 0) return STYLE_PSEUDO_ONLY_CHILD;
+        break;
+    case 11:
+        if (memcmp(text, "first-child", 11) == 0) return STYLE_PSEUDO_FIRST;
+        if (memcmp(text, "-webkit-any", 11) == 0) return STYLE_PSEUDO_IS;
+        if (memcmp(text, "nth-of-type", 11) == 0) return STYLE_PSEUDO_NTH_TYPE;
+        break;
+    case 12:
+        if (memcmp(text, "focus-within", 12) == 0) return STYLE_PSEUDO_FOCUS_WITHIN;
+        if (memcmp(text, "last-of-type", 12) == 0) return STYLE_PSEUDO_LAST_TYPE;
+        if (memcmp(text, "only-of-type", 12) == 0) return STYLE_PSEUDO_ONLY_TYPE;
+        if (memcmp(text, "popover-open", 12) == 0) return STYLE_PSEUDO_POPOVER_OPEN;
+        break;
+    case 13:
+        if (memcmp(text, "focus-visible", 13) == 0) return STYLE_PSEUDO_FOCUS;
+        if (memcmp(text, "first-of-type", 13) == 0) return STYLE_PSEUDO_FIRST_TYPE;
+        break;
+    case 14:
+        if (memcmp(text, "nth-last-child", 14) == 0) return STYLE_PSEUDO_NTH_LAST_CHILD;
+        break;
+    case 16:
+        if (memcmp(text, "nth-last-of-type", 16) == 0) return STYLE_PSEUDO_NTH_LAST_TYPE;
+        break;
+    default: break;
+    }
+    return STYLE_PSEUDO_UNKNOWN;
+}
+
 static bool compound_matches_depth(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const char *text, size_t length, unsigned functional_depth,
-    const lxb_dom_node_t *scope);
-
-static bool compound_matches(const Stylesheet *sheet,
-                             lxb_dom_node_t *node, const char *text,
-                             size_t length)
-{
-    return compound_matches_depth(sheet, node, text, length, 0, NULL);
-}
+    const lxb_dom_node_t *scope, const StyleMatchSubject *subject);
 
 static bool node_or_descendant_has_focus(lxb_dom_node_t *node)
 {
@@ -704,7 +823,7 @@ static bool relative_candidate_matches(
     if (candidate->type != LXB_DOM_NODE_TYPE_ELEMENT
         || !compound_matches_depth(
             sheet, candidate, compound, compound_length,
-            functional_depth, scope)) return false;
+            functional_depth, scope, NULL)) return false;
     if (remainder_length == 0) return true;
     return relative_selector_matches_from(
         sheet, candidate, remainder, remainder_length,
@@ -942,23 +1061,29 @@ static size_t filtered_sibling_index(
 static bool compound_matches_depth(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const char *text, size_t length, unsigned functional_depth,
-    const lxb_dom_node_t *scope)
+    const lxb_dom_node_t *scope, const StyleMatchSubject *subject)
 {
     STYLE_SELECTOR_COUNT(sheet, selector_compound_calls, 1);
     trim(&text, &length);
     if (functional_depth >= 8 || length == 0 || node == NULL
         || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return false;
+    /* The compiled caller already prepared this exact element. General
+       functional selectors prepare it lazily only for tag/ID/class tests;
+       pseudo-only compounds need neither class nor ID attribute reads. */
     StyleMatchSubject local_subject = {0};
-    style_match_subject_prepare(node, &local_subject);
-    const StyleMatchSubject *subject = &local_subject;
     size_t at = 0;
     if (text[at] == '*') at++;
     else if (name_character(text[at]) || text[at] == '\\') {
+        if (subject == NULL) {
+            style_match_subject_prepare(node, &local_subject);
+            subject = &local_subject;
+        }
         size_t end = skip_selector_identifier(text, length, at);
-        char wanted[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
+        char scratch[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
         size_t wanted_length = 0;
-        if (!decode_css_identifier(text + at, end - at, wanted,
-                                   sizeof(wanted), &wanted_length)
+        const char *wanted = style_identifier_span(text + at, end - at,
+            scratch, sizeof(scratch), &wanted_length);
+        if (wanted == NULL
             || subject->tag == NULL
             || subject->tag_length != wanted_length
             || memcmp(subject->tag, wanted, wanted_length) != 0) {
@@ -967,14 +1092,19 @@ static bool compound_matches_depth(
         at = end;
     }
     while (at < length) {
+        if (subject == NULL && (text[at] == '.' || text[at] == '#')) {
+            style_match_subject_prepare(node, &local_subject);
+            subject = &local_subject;
+        }
         if (text[at] == '.') {
             at++;
             size_t end = skip_selector_identifier(text, length, at);
-            char wanted[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
+            if (end == at) return false;
+            char scratch[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
             size_t wanted_length = 0;
-            if (end == at
-                || !decode_css_identifier(text + at, end - at, wanted,
-                                          sizeof(wanted), &wanted_length)
+            const char *wanted = style_identifier_span(text + at, end - at,
+                scratch, sizeof(scratch), &wanted_length);
+            if (wanted == NULL
                 || wanted_length == 0 || subject->classes == NULL
                 || !class_contains_length(
                     subject->classes, subject->classes_length,
@@ -983,11 +1113,12 @@ static bool compound_matches_depth(
         } else if (text[at] == '#') {
             at++;
             size_t end = skip_selector_identifier(text, length, at);
-            char wanted[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
+            if (end == at) return false;
+            char scratch[STYLE_SELECTOR_IDENTIFIER_CAPACITY];
             size_t wanted_length = 0;
-            if (end == at
-                || !decode_css_identifier(text + at, end - at, wanted,
-                                          sizeof(wanted), &wanted_length)
+            const char *wanted = style_identifier_span(text + at, end - at,
+                scratch, sizeof(scratch), &wanted_length);
+            if (wanted == NULL
                 || subject->id == NULL
                 || subject->id_length != wanted_length
                 || memcmp(subject->id, wanted, wanted_length) != 0) {
@@ -1012,82 +1143,39 @@ static bool compound_matches_depth(
             if (at + 1 < length && text[at + 1] == ':') return false;
             size_t end = ++at;
             while (end < length && name_character(text[end])) end++;
-            size_t pseudo_length = end - at;
-            bool interactive = span_equal(text + at, pseudo_length, "hover")
-                               || span_equal(text + at, pseudo_length, "active")
-                               || span_equal(text + at, pseudo_length, "visited");
-            if (interactive) return false;
-            bool focus_pseudo = span_equal(text + at, pseudo_length, "focus")
-                                || span_equal(text + at, pseudo_length,
-                                              "focus-visible");
-            bool focus_within_pseudo = span_equal(
-                text + at, pseudo_length, "focus-within");
-            bool fullscreen_pseudo = span_equal(
-                text + at, pseudo_length, "fullscreen");
-            bool root_pseudo = span_equal(text + at, pseudo_length, "root");
-            bool scope_pseudo = span_equal(text + at, pseudo_length, "scope");
-            bool defined_pseudo = span_equal(text + at, pseudo_length,
-                                              "defined");
-            bool first_pseudo = span_equal(text + at, pseudo_length,
-                                           "first-child");
-            bool last_pseudo = span_equal(text + at, pseudo_length,
-                                          "last-child");
-            bool first_type_pseudo = span_equal(text + at, pseudo_length,
-                                                "first-of-type");
-            bool last_type_pseudo = span_equal(text + at, pseudo_length,
-                                               "last-of-type");
-            bool only_child_pseudo = span_equal(text + at, pseudo_length,
-                                                "only-child");
-            bool only_type_pseudo = span_equal(text + at, pseudo_length,
-                                               "only-of-type");
-            bool empty_pseudo = span_equal(text + at, pseudo_length, "empty");
-            bool not_pseudo = span_equal(text + at, pseudo_length, "not");
-            bool is_pseudo = span_equal(text + at, pseudo_length, "is")
-                             || span_equal(text + at, pseudo_length, "where")
-                             || span_equal(text + at, pseudo_length,
-                                           "-webkit-any")
-                             || span_equal(text + at, pseudo_length,
-                                           "-moz-any");
-            bool has_pseudo = span_equal(text + at, pseudo_length, "has");
-            bool disabled_pseudo = span_equal(text + at, pseudo_length,
-                                              "disabled");
-            bool enabled_pseudo = span_equal(text + at, pseudo_length,
-                                             "enabled");
-            bool checked_pseudo = span_equal(text + at, pseudo_length,
-                                             "checked");
-            bool required_pseudo = span_equal(text + at, pseudo_length,
-                                              "required");
-            bool optional_pseudo = span_equal(text + at, pseudo_length,
-                                              "optional");
-            bool link_pseudo = span_equal(text + at, pseudo_length, "link")
-                               || span_equal(text + at, pseudo_length,
-                                             "any-link");
-            bool open_pseudo = span_equal(text + at, pseudo_length, "open");
-            bool modal_pseudo = span_equal(text + at, pseudo_length,
-                                            "modal");
-            bool popover_open_pseudo = span_equal(
-                text + at, pseudo_length, "popover-open");
-            bool nth_child_pseudo = span_equal(text + at, pseudo_length,
-                                                "nth-child");
-            bool nth_type_pseudo = span_equal(text + at, pseudo_length,
-                                               "nth-of-type");
-            bool nth_last_child_pseudo = span_equal(text + at, pseudo_length,
-                                                    "nth-last-child");
-            bool nth_last_type_pseudo = span_equal(text + at, pseudo_length,
-                                                   "nth-last-of-type");
-            if (!root_pseudo && !scope_pseudo && !defined_pseudo
-                && !focus_pseudo && !focus_within_pseudo
-                && !fullscreen_pseudo
-                && !first_pseudo && !last_pseudo && !empty_pseudo
-                && !not_pseudo && !is_pseudo && !has_pseudo
-                && !first_type_pseudo && !last_type_pseudo
-                && !only_child_pseudo && !only_type_pseudo
-                && !disabled_pseudo && !enabled_pseudo && !checked_pseudo
-                && !required_pseudo && !optional_pseudo && !link_pseudo
-                && !open_pseudo && !modal_pseudo && !popover_open_pseudo
-                && !nth_child_pseudo && !nth_type_pseudo
-                && !nth_last_child_pseudo
-                && !nth_last_type_pseudo) return false;
+            StylePseudoKind kind = style_pseudo_kind(text + at, end - at);
+            if (kind == STYLE_PSEUDO_UNKNOWN || kind == STYLE_PSEUDO_INTERACTIVE) {
+                return false;
+            }
+            bool focus_pseudo = kind == STYLE_PSEUDO_FOCUS;
+            bool focus_within_pseudo = kind == STYLE_PSEUDO_FOCUS_WITHIN;
+            bool fullscreen_pseudo = kind == STYLE_PSEUDO_FULLSCREEN;
+            bool root_pseudo = kind == STYLE_PSEUDO_ROOT;
+            bool scope_pseudo = kind == STYLE_PSEUDO_SCOPE;
+            bool defined_pseudo = kind == STYLE_PSEUDO_DEFINED;
+            bool first_pseudo = kind == STYLE_PSEUDO_FIRST;
+            bool last_pseudo = kind == STYLE_PSEUDO_LAST;
+            bool first_type_pseudo = kind == STYLE_PSEUDO_FIRST_TYPE;
+            bool last_type_pseudo = kind == STYLE_PSEUDO_LAST_TYPE;
+            bool only_child_pseudo = kind == STYLE_PSEUDO_ONLY_CHILD;
+            bool only_type_pseudo = kind == STYLE_PSEUDO_ONLY_TYPE;
+            bool empty_pseudo = kind == STYLE_PSEUDO_EMPTY;
+            bool not_pseudo = kind == STYLE_PSEUDO_NOT;
+            bool is_pseudo = kind == STYLE_PSEUDO_IS;
+            bool has_pseudo = kind == STYLE_PSEUDO_HAS;
+            bool disabled_pseudo = kind == STYLE_PSEUDO_DISABLED;
+            bool enabled_pseudo = kind == STYLE_PSEUDO_ENABLED;
+            bool checked_pseudo = kind == STYLE_PSEUDO_CHECKED;
+            bool required_pseudo = kind == STYLE_PSEUDO_REQUIRED;
+            bool optional_pseudo = kind == STYLE_PSEUDO_OPTIONAL;
+            bool link_pseudo = kind == STYLE_PSEUDO_LINK;
+            bool open_pseudo = kind == STYLE_PSEUDO_OPEN;
+            bool modal_pseudo = kind == STYLE_PSEUDO_MODAL;
+            bool popover_open_pseudo = kind == STYLE_PSEUDO_POPOVER_OPEN;
+            bool nth_child_pseudo = kind == STYLE_PSEUDO_NTH_CHILD;
+            bool nth_type_pseudo = kind == STYLE_PSEUDO_NTH_TYPE;
+            bool nth_last_child_pseudo = kind == STYLE_PSEUDO_NTH_LAST_CHILD;
+            bool nth_last_type_pseudo = kind == STYLE_PSEUDO_NTH_LAST_TYPE;
             if (focus_pseudo
                 && !lxb_dom_element_has_attribute(
                     lxb_dom_interface_element(node),
@@ -1149,22 +1237,32 @@ static bool compound_matches_depth(
                     || element_sibling_index(node, false, true) != 1)) {
                 return false;
             }
-            bool form_control = style_tag_is(node, "button") || style_tag_is(node, "input")
-                                || style_tag_is(node, "select")
-                                || style_tag_is(node, "textarea")
-                                || style_tag_is(node, "option")
-                                || style_tag_is(node, "optgroup")
-                                || style_tag_is(node, "fieldset");
-            bool disableable = form_control
-                               && style_node_effectively_disabled(node);
-            bool requireable = style_tag_is(node, "input") || style_tag_is(node, "select")
-                               || style_tag_is(node, "textarea");
-            bool required = requireable
-                && lxb_dom_element_has_attribute(
-                       lxb_dom_interface_element(node),
-                       (const lxb_char_t *) "required", 8);
-            if (disabled_pseudo && !disableable) return false;
-            if (enabled_pseudo && (!form_control || disableable)) return false;
+            if (disabled_pseudo || enabled_pseudo) {
+                STYLE_SELECTOR_COUNT(sheet, selector_pseudo_state_checks, 1);
+                bool form_control = style_tag_is(node, "button")
+                    || style_tag_is(node, "input")
+                    || style_tag_is(node, "select")
+                    || style_tag_is(node, "textarea")
+                    || style_tag_is(node, "option")
+                    || style_tag_is(node, "optgroup")
+                    || style_tag_is(node, "fieldset");
+                bool disableable = form_control
+                                   && style_node_effectively_disabled(node);
+                if (disabled_pseudo && !disableable) return false;
+                if (enabled_pseudo && (!form_control || disableable)) return false;
+            }
+            if (required_pseudo || optional_pseudo) {
+                STYLE_SELECTOR_COUNT(sheet, selector_pseudo_state_checks, 1);
+                bool requireable = style_tag_is(node, "input")
+                    || style_tag_is(node, "select")
+                    || style_tag_is(node, "textarea");
+                bool required = requireable
+                    && lxb_dom_element_has_attribute(
+                           lxb_dom_interface_element(node),
+                           (const lxb_char_t *) "required", 8);
+                if (required_pseudo && !required) return false;
+                if (optional_pseudo && (!requireable || required)) return false;
+            }
             if (checked_pseudo
                 && !((style_tag_is(node, "input")
                       && lxb_dom_element_has_attribute(
@@ -1176,28 +1274,29 @@ static bool compound_matches_depth(
                                 (const lxb_char_t *) "selected", 8)))) {
                 return false;
             }
-            if (required_pseudo && !required) return false;
-            if (optional_pseudo && (!requireable || required)) return false;
             if (link_pseudo
                 && (!(style_tag_is(node, "a") || style_tag_is(node, "area"))
                     || !lxb_dom_element_has_attribute(
                            lxb_dom_interface_element(node),
                            (const lxb_char_t *) "href", 4))) return false;
-            bool has_open = lxb_dom_element_has_attribute(
-                lxb_dom_interface_element(node),
-                (const lxb_char_t *) "open", 4);
-            bool has_modal = lxb_dom_element_has_attribute(
-                lxb_dom_interface_element(node),
-                (const lxb_char_t *) "data-tilefinch-modal",
-                sizeof("data-tilefinch-modal") - 1);
-            bool has_popover_open = lxb_dom_element_has_attribute(
-                lxb_dom_interface_element(node),
-                (const lxb_char_t *) "data-tilefinch-popover-open",
-                sizeof("data-tilefinch-popover-open") - 1);
-            if (open_pseudo && !(has_open || has_popover_open)) return false;
-            if (modal_pseudo && !(style_tag_is(node, "dialog") && has_open
-                                  && has_modal)) return false;
-            if (popover_open_pseudo && !has_popover_open) return false;
+            if (open_pseudo || modal_pseudo || popover_open_pseudo) {
+                STYLE_SELECTOR_COUNT(sheet, selector_pseudo_state_checks, 1);
+                bool has_open = lxb_dom_element_has_attribute(
+                    lxb_dom_interface_element(node),
+                    (const lxb_char_t *) "open", 4);
+                bool has_modal = lxb_dom_element_has_attribute(
+                    lxb_dom_interface_element(node),
+                    (const lxb_char_t *) "data-tilefinch-modal",
+                    sizeof("data-tilefinch-modal") - 1);
+                bool has_popover_open = lxb_dom_element_has_attribute(
+                    lxb_dom_interface_element(node),
+                    (const lxb_char_t *) "data-tilefinch-popover-open",
+                    sizeof("data-tilefinch-popover-open") - 1);
+                if (open_pseudo && !(has_open || has_popover_open)) return false;
+                if (modal_pseudo && !(style_tag_is(node, "dialog") && has_open
+                                      && has_modal)) return false;
+                if (popover_open_pseudo && !has_popover_open) return false;
+            }
             if (empty_pseudo) {
                 for (lxb_dom_node_t *child = node->first_child;
                      child != NULL; child = child->next) {
@@ -1379,7 +1478,7 @@ static bool style_selector_matches_internal(const Stylesheet *sheet,
     trim(&compound, &compound_length);
     if (!compound_matches_depth(
             sheet, node, compound, compound_length,
-            functional_depth, scope)) {
+            functional_depth, scope, NULL)) {
         return false;
     }
     if (combinator == 0) return true;
@@ -1473,6 +1572,11 @@ bool style_selector_matches_prepared(const Stylesheet *sheet,
 static bool style_selector_program_matches_at(
     const Stylesheet *sheet, const StyleRule *rule, lxb_dom_node_t *node,
     size_t instruction, unsigned depth,
+    const StyleMatchSubject *known_subject);
+
+static bool style_selector_program_matches_uncached(
+    const Stylesheet *sheet, const StyleRule *rule, lxb_dom_node_t *node,
+    size_t instruction, unsigned depth,
     const StyleMatchSubject *known_subject)
 {
     if (sheet == NULL || rule == NULL || node == NULL
@@ -1523,7 +1627,8 @@ static bool style_selector_program_matches_at(
             continue;
         }
         if (op->opcode == STYLE_SELECTOR_COMPOUND) {
-            if (!compound_matches(sheet, node, wanted, wanted_length)) {
+            if (!compound_matches_depth(
+                    sheet, node, wanted, wanted_length, 0, NULL, subject)) {
                 return false;
             }
             continue;
@@ -1594,6 +1699,43 @@ static bool style_selector_program_matches_at(
         return false;
     }
     return false;
+}
+
+static bool style_selector_program_matches_at(
+    const Stylesheet *sheet, const StyleRule *rule, lxb_dom_node_t *node,
+    size_t instruction, unsigned depth,
+    const StyleMatchSubject *known_subject)
+{
+    if (sheet == NULL || rule == NULL || node == NULL
+        || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || depth > STYLE_SELECTOR_PROGRAM_DEPTH_LIMIT
+        || sheet->selector_cooperate_cancelled) return false;
+    StyleAncestorBloomCache *cache = sheet->resolve_scratch == NULL
+        ? NULL : sheet->resolve_scratch->ancestor_bloom_cache;
+    /* Compiled instructions are bounded by the uint16 offset format. Keep
+       the conservative path if that representation ever grows. */
+    if (cache != NULL && (cache->results == NULL || instruction > UINT16_MAX))
+        cache = NULL;
+    uint32_t rule_index = (uint32_t) (rule - sheet->rules);
+    uintptr_t key = ((uintptr_t) node >> 4) ^ ((uintptr_t) rule >> 4)
+        ^ (instruction * 2654435761u) ^ (depth * 97u);
+    size_t slot = key & (STYLE_SELECTOR_RESULT_CACHE_CAPACITY - 1u);
+    if (cache != NULL && cache->results[slot].node == node
+        && cache->results[slot].rule_index == rule_index
+        && cache->results[slot].instruction == instruction
+        && cache->results[slot].depth == depth) {
+        return cache->results[slot].matched;
+    }
+    bool matched = style_selector_program_matches_uncached(
+        sheet, rule, node, instruction, depth, known_subject);
+    if (cache != NULL && !sheet->selector_cooperate_cancelled) {
+        cache->results[slot].node = node;
+        cache->results[slot].rule_index = rule_index;
+        cache->results[slot].instruction = (uint16_t) instruction;
+        cache->results[slot].depth = (uint8_t) depth;
+        cache->results[slot].matched = matched;
+    }
+    return matched;
 }
 
 bool style_rule_selector_matches_subject(

@@ -10,7 +10,7 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     runtime->bridge.fullscreen_node_handle = 0;
     tilefinch_game_audio_destroy(runtime->game_audio);
     runtime->game_audio = NULL;
-    if (getenv("TILEFINCH_TRACE_TASKS") != NULL) {
+    if (tilefinch_trace_tasks()) {
         /* Teardown must never invoke author-overridable JavaScript. Apart from
            reentrancy, a detached incumbent runtime may no longer point at its
            own live document. Retain bounded native counters for diagnostics. */
@@ -39,13 +39,13 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     js_rt_runtime_module_metadata_clear(runtime);
 #if defined(CONFIG_EXECUTION_PROFILE)
     if (runtime->runtime != NULL &&
-        getenv("TILEFINCH_DUMP_JS_PROFILE") != NULL &&
+        tilefinch_dump_js_profile() &&
         !runtime->result.interrupted) {
         JS_DumpExecutionProfile(runtime->runtime);
     }
 #endif
     if (runtime->runtime != NULL &&
-        getenv("TILEFINCH_DUMP_JS_MEMORY") != NULL) {
+        tilefinch_dump_js_memory()) {
         /* Validation-only per-realm census.  The ordinary interactive report
            sees the top-level realm after child frames have already retired;
            reporting at the shared destruction boundary makes the transient
@@ -105,9 +105,26 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         runtime->bridge.trusted_retire_native_node_state = JS_UNDEFINED;
         runtime->bridge.trusted_node_wrap = JS_UNDEFINED;
         runtime->bridge.current_script = JS_NULL;
+        for (size_t slot = 0; slot < SCRIPT_WORKER_REALM_LIMIT; slot++) {
+            if (runtime->worker_realms[slot].context == NULL) continue;
+            JS_FreeValue(runtime->worker_realms[slot].context,
+                         runtime->worker_realms[slot].global);
+            JS_FreeContext(runtime->worker_realms[slot].context);
+            runtime->worker_realms[slot].context = NULL;
+            runtime->worker_realms[slot].global = JS_UNDEFINED;
+        }
+        for (size_t slot = 0; slot < SCRIPT_FRAME_REALM_LIMIT; slot++) {
+            if (runtime->frame_realms[slot].context == NULL) continue;
+            JS_FreeValue(runtime->frame_realms[slot].context,
+                         runtime->frame_realms[slot].global);
+            JS_FreeContext(runtime->frame_realms[slot].context);
+        }
         JS_FreeContext(runtime->context);
     }
     if (runtime->runtime != NULL) JS_FreeRuntime(runtime->runtime);
+    /* Instance finalizers ran above; the idle WebAssembly runtime and its
+       pool are released at this boundary, not after each operation. */
+    js_wasm_release_idle_runtime();
     if (!budget_quickjs_pool_destroy(runtime->quickjs_pool)) {
         budget->failure_count++;
     }

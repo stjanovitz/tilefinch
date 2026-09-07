@@ -57,6 +57,7 @@ typedef enum {
 typedef struct {
     uint8_t kind;
     bool advance_while_busy;
+    bool advance_when_painted;
     uint16_t buttons;
     uint16_t ticks;
     uint8_t analog_x;
@@ -120,6 +121,12 @@ void psp_input_script_interrupt(PspInputScript *script);
 bool psp_input_script_advance(
     PspInputScript *script, PspUiInput *input, uint32_t previous_buttons,
     bool ready);
+
+/* -page commands wait for a committed, painted page, but not completion of
+   background resources. Cooperative callbacks must pass page_ready=false. */
+bool psp_input_script_advance_with_page(
+    PspInputScript *script, PspUiInput *input, uint32_t previous_buttons,
+    bool ready, bool page_ready);
 
 /* Non-NULL only on the frame a `mark` step fires. */
 const char *psp_input_script_mark(const PspInputScript *script);

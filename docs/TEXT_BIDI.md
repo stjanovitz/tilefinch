@@ -48,6 +48,7 @@ build.
 |---|---:|---|
 | paragraph UTF-8 | 8,192 bytes | use readable logical-order layout |
 | paragraph analysis units | 2,048 | use readable logical-order layout |
+| Unicode paragraph segments in one inline flow | 32 | use readable logical-order layout |
 | UAX #9 visual runs per line | 256 | keep that line in logical order |
 | inline source spans | 512 | keep the formatting context in logical order |
 | mapped text commands | 1,024 | unmatched commands retain logical rendering |

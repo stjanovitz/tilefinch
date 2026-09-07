@@ -846,8 +846,12 @@ static bool fetch_configure_private_network(
     /* A proxy resolves the destination out of process, where this browser
        cannot inspect the peer address. Page-originated PNA requests therefore
        bypass ambient proxy variables instead of turning them into a hole. */
-    if (curl_easy_setopt(easy, CURLOPT_PROXY, "") != CURLE_OK
-        || curl_easy_setopt(easy, CURLOPT_OPENSOCKETFUNCTION,
+#if !defined(TILEFINCH_PSP_CURL_NO_PROXY)
+    if (curl_easy_setopt(easy, CURLOPT_PROXY, "") != CURLE_OK) return false;
+#endif
+    /* The owned PSP curl has no proxy implementation. Do not send it an
+       unavailable setopt, but keep both socket/address admission hooks. */
+    if (curl_easy_setopt(easy, CURLOPT_OPENSOCKETFUNCTION,
                          fetch_private_network_open_socket) != CURLE_OK
         || curl_easy_setopt(easy, CURLOPT_OPENSOCKETDATA, guard) != CURLE_OK)
         return false;

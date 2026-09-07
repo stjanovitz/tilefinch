@@ -127,7 +127,10 @@ static bool test_late_script_oom_reveals_staged_page_shell(void)
     bool ready = lexbor_installed
         && navigation_init(&navigation, &budget, 4);
     if (ready) {
-        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        /* The test still drives a much larger author allocation through the
+           late-OOM path; this reserve only admits bounded bootstrap growth. */
+        navigation_enable_scripts(
+            &navigation, 2 * MIB + 8 * 1024, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 64 * 1024, 32 * 1024, 1000);
     }
@@ -433,7 +436,16 @@ static bool test_late_script_oom_frees_queued_frame_messages(void)
         "<h1>Queued message retirement</h1><p>"
         "This server-rendered page remains available after the bounded script "
         "realm exhausts its heap while a frame message is waiting for delivery."
-        "</p><div id=message-anchor></div></main><script>setTimeout(()=>{"
+        "</p><div id=message-anchor></div></main><script>"
+        /* Fill the realm to a fixed 80 KiB of headroom synchronously (the
+           author's timers deliberately do not run before the delivery point
+           below). The refused oversized delivery then finds an exhausted
+           realm whatever the trusted bootstrap happens to leave free; the
+           retirement trigger must not depend on the bootstrap's size. */
+        "{const m=performance.memory;globalThis.filler=[];"
+        "let room=m.jsHeapSizeLimit-m.usedJSHeapSize-80*1024;"
+        "while(room>=65536){filler.push(new ArrayBuffer(65536));room-=65536}}"
+        "setTimeout(()=>{"
         "document.body.className='staged';"
         "setTimeout("
         "()=>{globalThis.retained=[];for(let i=0;i<64;i++)retained.push("
@@ -485,16 +497,21 @@ static bool test_late_script_oom_frees_queued_frame_messages(void)
     if (child_ready) {
         NavigationMessage *first = &navigation.page.messages[0];
         NavigationMessage *second = &navigation.page.messages[1];
-        first->json = budget_malloc(&budget, 65537u);
+        /* Oversized by construction: one byte over the 64 KiB dispatch limit,
+           so delivery is refused. The author script filled the realm to
+           80 KiB of headroom, so the refused delivery retires an exhausted
+           realm and frees the queue. */
+        const size_t oversized_json = 64u * 1024u + 1u;
+        first->json = budget_malloc(&budget, oversized_json);
         first->target_origin = budget_malloc(&budget, 2u);
         second->json = budget_malloc(&budget, 8u);
         second->target_origin = budget_malloc(&budget, 2u);
         if (first->json != NULL && first->target_origin != NULL
             && second->json != NULL && second->target_origin != NULL) {
             first->json[0] = '"';
-            memset(first->json + 1u, 'x', 65534u);
-            first->json[65535] = '"';
-            first->json[65536] = '\0';
+            memset(first->json + 1u, 'x', oversized_json - 3u);
+            first->json[oversized_json - 2u] = '"';
+            first->json[oversized_json - 1u] = '\0';
             memcpy(first->target_origin, "*", 2u);
             memcpy(second->json, "\"later\"", 8u);
             memcpy(second->target_origin, "*", 2u);
@@ -821,7 +838,7 @@ static bool test_streaming_dynamic_stylesheets_are_not_adopted(void)
            inline script, and two stylesheet event checkpoints.  Preserve a
            small test-only reserve so it remains a stylesheet-ordering test. */
         navigation_enable_scripts(
-            &navigation, 2 * MIB + 64u * 1024u, 1000);
+            &navigation, 2 * MIB + 192u * 1024u, 1000);
         navigation_enable_document_scripts(
             &navigation, 4, 32 * 1024, 16 * 1024, 1000);
         navigation_enable_external_resources(
@@ -911,7 +928,7 @@ static bool test_dynamic_stylesheet_event_rescan_is_reentrant_safe(void)
     if (navigation_ready) {
         navigation_attach_browser_session(&navigation, &browser);
         navigation_enable_scripts(
-            &navigation, 2 * MIB + 64u * 1024u, 1000);
+            &navigation, 2 * MIB + 192u * 1024u, 1000);
         navigation_enable_external_resources(
             &navigation, 4, 64 * 1024, 16 * 1024,
             1, 16 * 1024, 16 * 1024, 64 * 1024, 1000);
@@ -971,7 +988,7 @@ static bool test_stylesheet_event_microtask_exception_is_nonfatal(void)
     if (navigation_ready) {
         navigation_attach_browser_session(&navigation, &browser);
         navigation_enable_scripts(
-            &navigation, 2 * MIB + 64u * 1024u, 1000);
+            &navigation, 2 * MIB + 192u * 1024u, 1000);
         navigation_enable_external_resources(
             &navigation, 4, 64 * 1024, 16 * 1024,
             1, 16 * 1024, 16 * 1024, 64 * 1024, 1000);
@@ -1041,7 +1058,7 @@ static bool test_dynamic_stylesheet_href_base_and_reinsert_lifecycle(void)
     if (navigation_ready) {
         navigation_attach_browser_session(&navigation, &browser);
         navigation_enable_scripts(
-            &navigation, 2 * MIB + 64u * 1024u, 1000);
+            &navigation, 2 * MIB + 192u * 1024u, 1000);
         navigation_enable_external_resources(
             &navigation, 4, 64 * 1024, 16 * 1024,
             1, 16 * 1024, 16 * 1024, 64 * 1024, 1000);

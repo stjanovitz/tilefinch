@@ -193,7 +193,8 @@ static void psp_input_script_latch_live_capture_mark(void)
     const char *mark = psp_input_script_mark(&psp_input_script);
     if (mark == NULL || psp_input_script_pending_capture_valid
         || psp_input_script.step >= psp_input_script.step_count
-        || !psp_input_script.steps[psp_input_script.step].advance_while_busy)
+        || (!psp_input_script.steps[psp_input_script.step].advance_while_busy
+            && !psp_input_script.steps[psp_input_script.step].advance_when_painted))
         return;
     /* Measurement delimiters and the Page-controls state transition are
        control records, not visual checkpoints. */
@@ -221,20 +222,22 @@ void psp_input_script_interrupt_by_user(void)
 }
 
 bool psp_input_script_frame(
-    PspUiInput *input, bool ready)
+    PspUiInput *input, bool ready, bool page_ready)
 {
     if (ready) psp_input_script_ever_ready = true;
     uint16_t frame_step = psp_input_script.step;
-    bool driving = psp_input_script_advance(
-        &psp_input_script, input, psp_input_script_previous_buttons, ready);
+    bool driving = psp_input_script_advance_with_page(
+        &psp_input_script, input, psp_input_script_previous_buttons,
+        ready, page_ready);
     if (input != NULL) {
         psp_input_script_previous_buttons = input->held;
         if (input->pressed != 0) {
             psp_input_script_last_press_step = frame_step;
             printf("tilefinch-input-script-edge: step=%u buttons=0x%04x "
-                   "receiver=main ready=%d\n",
+                   "receiver=main ready=%d at-us=%llu\n",
                    (unsigned) frame_step, (unsigned) input->pressed,
-                   ready ? 1 : 0);
+                   ready ? 1 : 0,
+                   (unsigned long long) sceKernelGetSystemTimeWide());
         }
     }
     psp_webgl_measurement_mark(
@@ -256,14 +259,26 @@ bool psp_input_script_busy_frame(PspUiInput *input)
         if (input->pressed != 0) {
             psp_input_script_last_press_step = frame_step;
             printf("tilefinch-input-script-edge: step=%u buttons=0x%04x "
-                   "receiver=supervisor ready=0\n",
-                   (unsigned) frame_step, (unsigned) input->pressed);
+                   "receiver=supervisor ready=0 at-us=%llu\n",
+                   (unsigned) frame_step, (unsigned) input->pressed,
+                   (unsigned long long) sceKernelGetSystemTimeWide());
         }
     }
     psp_webgl_measurement_mark(
         psp_input_script_mark(&psp_input_script));
     psp_input_script_latch_live_capture_mark();
     return driving;
+}
+
+bool psp_input_script_text_frame(PspUiInput *input)
+{
+    if (!psp_input_script_running()) return false;
+    SceCtrlData pad = {0};
+    if (sceCtrlPeekBufferPositive(&pad, 1) > 0 && pad.Buttons != 0) {
+        psp_input_script_interrupt_by_user();
+        return false;
+    }
+    return psp_input_script_frame(input, true, true);
 }
 
 /*
@@ -280,12 +295,19 @@ void psp_input_script_observe(const PspUiIntent *intent, const PspUiState *ui)
     if (mark != NULL) {
         printf("tilefinch-input-script: mark=%s step=%u screen=%s\n",
                mark, (unsigned) psp_input_script.step, screen);
-        printf("tilefinch-focus-probe: mark=%s visible=%d rect=%d,%d,%d,%d\n",
+        if (ui != NULL)
+            printf("tilefinch-input-chrome: mark=%s visible=%u loading=%u "
+                   "reader=%u basic=%u status=\"%s\"\n",
+                   mark, ui->chrome_visible ? 1u : 0u,
+                   ui->loading ? 1u : 0u, ui->reader_mode ? 1u : 0u,
+                   ui->basic_mode ? 1u : 0u, ui->status);
+        printf("tilefinch-focus-probe: mark=%s visible=%d rect=%d,%d,%d,%d at-us=%llu\n",
                mark, ui != NULL && ui->has_focus ? 1 : 0,
                ui == NULL ? 0 : ui->focus_x,
                ui == NULL ? 0 : ui->focus_y,
                ui == NULL ? 0 : ui->focus_width,
-               ui == NULL ? 0 : ui->focus_height);
+               ui == NULL ? 0 : ui->focus_height,
+               (unsigned long long) sceKernelGetSystemTimeWide());
     }
     if (intent == NULL) return;
     PspUiAction action = intent->action;
@@ -309,12 +331,45 @@ void psp_input_script_observe(const PspUiIntent *intent, const PspUiState *ui)
 }
 
 void psp_input_script_observe_page(
-    const NavigationSession *navigation)
+    const PspEngineViews *views)
 {
+    const NavigationSession *navigation = views == NULL ? NULL : views->navigation;
     const char *mark = psp_input_script_mark(&psp_input_script);
     if (mark == NULL || navigation == NULL) return;
     const NavigationPage *page = &navigation->page;
+    const BrowserController *controller = views->controller;
+    lxb_dom_node_t *focus = NULL;
+    if (controller != NULL && controller->focus_kind == CONTROLLER_FOCUS_LINK
+        && controller->focus_index < page->layout.link_count)
+        focus = page->layout.links[controller->focus_index].node;
+    else if (controller != NULL && controller->focus_kind == CONTROLLER_FOCUS_CONTROL
+             && controller->focus_index < page->layout.control_count)
+        focus = page->layout.controls[controller->focus_index].node;
+    else if (controller != NULL && controller->focus_kind == CONTROLLER_FOCUS_POINTER)
+        focus = controller->pointer_node;
+    if (focus != NULL) {
+        int focus_width = 0, focus_height = 0;
+        bool has_area = controller_focused_rect(
+            controller, NULL, NULL, &focus_width, &focus_height)
+            && focus_width > 0 && focus_height > 0;
+        size_t id_length = 0, class_length = 0;
+        const char *id = document_attribute(focus, "id", &id_length);
+        const char *class_name = document_attribute(focus, "class", &class_length);
+        printf("tilefinch-input-focus-target: mark=%s kind=%d index=%zu indicator=%s id=%.*s class=%.*s url=%.256s\n",
+               mark, (int) controller->focus_kind, controller->focus_index,
+               !has_area ? "none" : controller->has_authored_focus_outline
+                    ? "authored" : "browser",
+               (int) (id_length < 96 ? id_length : 96), id == NULL ? "" : id,
+               (int) (class_length < 128 ? class_length : 128),
+               class_name == NULL ? "" : class_name, controller->focus_link_url);
+    }
     const ExternalImageStats *images = &page->images.stats;
+    const char *page_url = navigation_active_document_url(navigation);
+    printf("tilefinch-input-page: mark=%s generation=%llu loaded=%u "
+           "resources-pending=%u url=%.512s\n", mark,
+           (unsigned long long) navigation->generation, page->loaded ? 1u : 0u,
+           navigation_background_resources_pending(navigation) ? 1u : 0u,
+           page_url == NULL ? "" : page_url);
     printf("tilefinch-input-script-js: mark=%s discovered=%zu attempted=%zu "
            "loaded=%zu failed=%zu bytecode=%zu/%zu/%zu "
            "dynamic=%zu/%zu/%zu/%zu/%zu/%zu/%zu pending=%zu summary=\"%.96s\" "

@@ -3,6 +3,8 @@
 #include "tilefinch/layout.h"
 #include "tilefinch/render.h"
 #include "tilefinch/style.h"
+#include "../src/style_cache_internal.h"
+#include "../src/style_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -107,8 +109,359 @@ static uint64_t frame_hash(const uint16_t *pixels, size_t count)
     return hash;
 }
 
+static bool cache_test_cooperate(void *opaque, lxb_dom_node_t *node, size_t visits)
+{
+    (void) opaque;
+    (void) node;
+    (void) visits;
+    return true;
+}
+
+static int test_pseudo_state_work(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<fieldset disabled><legend><input id=exempt>"
+        "</legend><input id=disabled required checked></fieldset>"
+        "<input id=optional><dialog id=modal open data-tilefinch-modal></dialog>"
+        "<div id=plain class='a:b hot' data-tilefinch-popover-open></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    static const struct { const char *id; const char *selector; bool matches; } cases[] = {
+        {"disabled", ":disabled:required:checked", true},
+        {"disabled", ":enabled", false},
+        {"exempt", ":enabled:optional", true},
+        {"optional", ":enabled:optional", true},
+        {"optional", ":required", false},
+        {"plain", ":enabled", false},
+        {"plain", ":optional", false},
+        {"plain", ":open:popover-open", true},
+        {"plain", ":modal", false},
+        {"modal", ":open:modal", true},
+        {"modal", ":popover-open", false},
+        {"plain", ".a\\:b:is(.hot):not(.cold):empty", true},
+        {"plain", ".a\\00003ab:not(.cold)", true},
+        {"plain", ":unknown", false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), cases[i].id);
+        CHECK(node != NULL);
+        bool matched = style_selector_matches_profiled(&sheet, node,
+            cases[i].selector, strlen(cases[i].selector));
+        if (matched != cases[i].matches) {
+            fprintf(stderr, "pseudo fixture %s %s: got %d expected %d\n",
+                cases[i].id, cases[i].selector, matched, cases[i].matches);
+        }
+        CHECK(matched == cases[i].matches);
+    }
+    CHECK(sheet.selector_pseudo_state_checks != 0);
+    uint64_t state_checks = sheet.selector_pseudo_state_checks;
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), "plain");
+    static const char unrelated[] = ".hot:is(div):not(.cold):empty";
+    for (unsigned i = 0; i < 100; i++) {
+        CHECK(style_selector_matches_profiled(&sheet, node, unrelated,
+            sizeof(unrelated) - 1u));
+    }
+    /* Structural/functional predicates must never inspect unrelated form or
+       open state. This work assertion is deterministic, unlike a timer floor. */
+    CHECK(sheet.selector_pseudo_state_checks == state_checks);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_layout_scoped_selector_work(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    static const char html[] = "<section class=outer><div class=inner>"
+        "<a id=probe>link</a></div></section>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), "probe");
+    Stylesheet sheet = {0};
+    CHECK(node != NULL && stylesheet_build(&sheet, &budget, &document, 480));
+    for (unsigned i = 0; i < 80; i++) {
+        char css[128];
+        int length = snprintf(css, sizeof(css),
+            ".outer .inner a{color:#%06x}", i + 1u);
+        CHECK(length > 0 && stylesheet_add_css(&sheet, css, (size_t) length));
+    }
+    static const char pseudo_css[] = "*::before{content:'A';color:red}"
+        "a::before{color:blue;font-size:2em}*::after{content:'Z';color:green}"
+        "a:focus::before{color:white}"
+        ".outer .inner a:focus{color:white}";
+    CHECK(stylesheet_add_css(&sheet, pseudo_css, sizeof(pseudo_css) - 1u));
+    ComputedStyle parent = style_for_node(&sheet, node->parent, NULL);
+    uint64_t candidates = sheet.rule_index_candidates;
+    ComputedStyle before = style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &parent);
+    ComputedStyle after = style_for_pseudo(&sheet, node, PSEUDO_AFTER, &parent);
+    CHECK(before.color == 0x0000ff && after.color == 0x008000);
+    CHECK(sheet.rule_index_candidates - candidates <= 4u);
+    StyleAncestorBloomCache *cache = budget_calloc(&budget, 1, sizeof(*cache));
+    size_t before_cache = budget.current;
+    CHECK(cache != NULL && style_selector_cooperation_begin(
+        &sheet, cache_test_cooperate, NULL, cache));
+    size_t cache_bytes = budget.current - before_cache;
+    CHECK(sizeof(StyleSelectorResultCacheEntry) <= 16u);
+    CHECK(cache_bytes <= 64u * 1024u + 128u); /* Budget allocation header. */
+    printf("selector cache: entries=%u bytes=%zu\n",
+        STYLE_SELECTOR_RESULT_CACHE_CAPACITY, cache_bytes);
+    before = style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &parent);
+    candidates = sheet.rule_index_candidates;
+    ComputedStyle changed_parent = parent;
+    changed_parent.font_size = 23;
+    changed_parent.font_size_fraction = 0;
+    ComputedStyle repeated = style_for_pseudo(
+        &sheet, node, PSEUDO_BEFORE, &changed_parent);
+    /* Reuse matching rules, not their values: font-relative values must be
+       evaluated again, without another indexed candidate scan. */
+    CHECK(repeated.color == before.color && repeated.font_size == 46);
+    CHECK(sheet.rule_index_candidates == candidates);
+    after = style_for_pseudo(&sheet, node, PSEUDO_AFTER, &parent);
+    CHECK(after.color == 0x008000);
+    ComputedStyle cold = style_for_node(&sheet, node, &parent);
+    uint64_t visits = sheet.selector_compound_calls;
+    ComputedStyle warm = style_for_node(&sheet, node, &parent);
+    CHECK(cold.color == 80u && memcmp(&cold, &warm, sizeof(cold)) == 0);
+    CHECK(visits != 0 && sheet.selector_compound_calls - visits < visits / 2u);
+    /* Temporary focus edits must invalidate exact answers even if the sheet
+       has no custom properties / variable-cache allocation. */
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(node),
+        (const lxb_char_t *) "data-tilefinch-focus", 20,
+        (const lxb_char_t *) "", 0) != NULL);
+    style_variable_cache_invalidate_node(&sheet, node);
+    ComputedStyle focused = style_for_node(&sheet, node, &parent);
+    CHECK(focused.color == 0xffffff);
+    repeated = style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &parent);
+    CHECK(repeated.color == 0xffffff);
+    CHECK(lxb_dom_element_remove_attribute(lxb_dom_interface_element(node),
+        (const lxb_char_t *) "data-tilefinch-focus", 20) == LXB_STATUS_OK);
+    style_variable_cache_invalidate_node(&sheet, node);
+    warm = style_for_node(&sheet, node, &parent);
+    CHECK(warm.color == cold.color);
+    repeated = style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &parent);
+    CHECK(repeated.color == 0x0000ff);
+    style_selector_cooperation_end(&sheet);
+    CHECK(budget.current == before_cache);
+    /* A fresh scope must not reuse answers after an ancestor class edit. */
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(node->parent),
+        (const lxb_char_t *) "class", 5,
+        (const lxb_char_t *) "other", 5) != NULL);
+    CHECK(style_selector_cooperation_begin(&sheet, cache_test_cooperate, NULL, cache));
+    warm = style_for_node(&sheet, node, &parent);
+    CHECK(warm.color != cold.color);
+    style_selector_cooperation_end(&sheet);
+    size_t limit = budget.limit;
+    budget.limit = budget.current;
+    CHECK(style_selector_cooperation_begin(&sheet, cache_test_cooperate, NULL, cache));
+    CHECK(cache->results == NULL);
+    budget.limit = limit;
+    ComputedStyle refused = style_for_node(&sheet, node, &parent);
+    CHECK(refused.color == warm.color);
+    style_selector_cooperation_end(&sheet);
+    /* Exceed the tiny matched-list bound: never retain a truncated cascade. */
+    for (unsigned i = 1; i <= 9; i++) {
+        char css[64];
+        int length = snprintf(css, sizeof(css), "a::after{color:#%06x}", i);
+        CHECK(length > 0 && stylesheet_add_css(&sheet, css, (size_t) length));
+    }
+    CHECK(style_selector_cooperation_begin(&sheet, cache_test_cooperate, NULL, cache));
+    after = style_for_pseudo(&sheet, node, PSEUDO_AFTER, &parent);
+    candidates = sheet.rule_index_candidates;
+    repeated = style_for_pseudo(&sheet, node, PSEUDO_AFTER, &parent);
+    CHECK(after.color == 9 && repeated.color == 9
+        && sheet.rule_index_candidates > candidates);
+    style_selector_cooperation_end(&sheet);
+    budget_free(&budget, cache);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_pseudo_absence_proof(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    static const char html[] = "<p id=absent>prose</p><span id=empty></span>"
+        "<b id=none></b><i id=variable></i>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    static const char css[] = "p::before{color:red;background:blue}"
+        "span::before{content:'';display:block;height:10px;background:red}"
+        "b::before{content:none}i::before{--mark:'V';content:var(--mark)}"
+        "p:focus::before{content:'F'}";
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    lxb_dom_node_t *p = find_id(lxb_dom_interface_node(document.html), "absent");
+    lxb_dom_node_t *span = find_id(lxb_dom_interface_node(document.html), "empty");
+    CHECK(p != NULL && span != NULL && !style_pseudo_known_absent(&sheet, p, PSEUDO_BEFORE));
+    StyleAncestorBloomCache *cache = budget_calloc(&budget, 1, sizeof(*cache));
+    CHECK(cache != NULL && style_selector_cooperation_begin(
+        &sheet, cache_test_cooperate, NULL, cache));
+    ComputedStyle parent = style_for_node(&sheet, p, NULL);
+    ComputedStyle absent = style_for_pseudo(&sheet, p, PSEUDO_BEFORE, &parent);
+    CHECK(!absent.generated_content && style_pseudo_known_absent(&sheet, p, PSEUDO_BEFORE));
+    ComputedStyle omitted = style_for_layout_pseudo(&sheet, p, PSEUDO_BEFORE, &parent);
+    CHECK(!omitted.generated_content && omitted.font_size == 0);
+    /* Public computed-style reads retain defaults/inheritance even when the
+       layout-only path can omit an absent box, including on a cold lookup. */
+    CHECK(absent.color == 0xff0000 && absent.font_size == parent.font_size);
+    omitted = style_for_layout_pseudo(&sheet, span, PSEUDO_AFTER, &parent);
+    CHECK(!omitted.generated_content && omitted.font_size == 0);
+    ComputedStyle public_after = style_for_pseudo(&sheet, span, PSEUDO_AFTER, &parent);
+    CHECK(!public_after.generated_content && public_after.font_size == parent.font_size);
+    ComputedStyle empty = style_for_pseudo(&sheet, span, PSEUDO_BEFORE, &parent);
+    ComputedStyle laid_out = style_for_layout_pseudo(&sheet, span, PSEUDO_BEFORE, &parent);
+    CHECK(empty.generated_content && empty.height == 10
+        && !style_pseudo_known_absent(&sheet, span, PSEUDO_BEFORE)
+        && memcmp(&empty, &laid_out, sizeof(empty)) == 0);
+    lxb_dom_node_t *none = find_id(lxb_dom_interface_node(document.html), "none");
+    lxb_dom_node_t *variable = find_id(lxb_dom_interface_node(document.html), "variable");
+    CHECK(none != NULL && variable != NULL);
+    ComputedStyle no_content = style_for_pseudo(&sheet, none, PSEUDO_BEFORE, &parent);
+    CHECK(!no_content.generated_content && style_pseudo_known_absent(&sheet, none, PSEUDO_BEFORE));
+    ComputedStyle deferred = style_for_layout_pseudo(&sheet, variable, PSEUDO_BEFORE, &parent);
+    CHECK(deferred.generated_content && !style_pseudo_known_absent(&sheet, variable, PSEUDO_BEFORE));
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(p),
+        (const lxb_char_t *) "data-tilefinch-focus", 20,
+        (const lxb_char_t *) "", 0) != NULL);
+    style_variable_cache_invalidate_node(&sheet, p);
+    CHECK(!style_pseudo_known_absent(&sheet, p, PSEUDO_BEFORE));
+    ComputedStyle focused = style_for_pseudo(&sheet, p, PSEUDO_BEFORE, &parent);
+    CHECK(focused.generated_content && !style_pseudo_known_absent(&sheet, p, PSEUDO_BEFORE));
+    style_selector_cooperation_end(&sheet);
+    CHECK(!style_pseudo_known_absent(&sheet, p, PSEUDO_BEFORE));
+    budget_free(&budget, cache);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_deferred_expansion_reuse(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<style>:root{--gap:17px}"
+        "#probe{margin-inline-start:var(--gap)}"
+        "#axes{margin-inline-start:var(--gap);direction:rtl;margin-left:0}"
+        "</style><div id=probe></div><div id=axes></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *probe = find_id(root, "probe");
+    lxb_dom_node_t *axes = find_id(root, "axes");
+    CHECK(probe != NULL && axes != NULL);
+    ComputedStyle parent = layout_initial_root_style();
+    uint64_t lookups = sheet.variable_lookup_calls;
+    ComputedStyle result = style_for_node(&sheet, probe, &parent);
+    CHECK(result.margin.left == 17 && result.margin.right == 0);
+    printf("logical declaration: variable lookups=%llu\n",
+        (unsigned long long) (sheet.variable_lookup_calls - lookups));
+    /* One expansion in each of the existing logical correction passes,
+       not three identical ancestor lookups per pass. */
+    CHECK(sheet.variable_lookup_calls - lookups == 2u);
+    /* Axes-changing blocks still correct earlier logical mappings. */
+    result = style_for_node(&sheet, axes, &parent);
+    CHECK(computed_style_direction_rtl(&result)
+        && result.margin.right == 17 && result.margin.left == 0);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_head_script_dependency_cache(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<!doctype html><title>Cache</title><p>body</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    static const char css[] = ".observer:has(script) p{color:red}";
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    lxb_dom_node_t *head = lxb_dom_interface_node(
+        lxb_html_document_head_element(document.html));
+    CHECK(!stylesheet_head_scripts_affect_ancestors(&sheet, head));
+    uint64_t scans = sheet.head_script_selector_scans;
+    CHECK(scans != 0);
+    for (unsigned i = 0; i < 100; i++)
+        CHECK(!stylesheet_head_scripts_affect_ancestors(&sheet, head));
+    CHECK(sheet.head_script_selector_scans == scans);
+    /* A DOM-only change must still recheck the cached :has subject. */
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(head),
+        (const lxb_char_t *) "class", 5,
+        (const lxb_char_t *) "observer", 8) != NULL);
+    CHECK(stylesheet_head_scripts_affect_ancestors(&sheet, head));
+    CHECK(sheet.head_script_selector_scans == scans);
+    CHECK(lxb_dom_element_remove_attribute(lxb_dom_interface_element(head),
+        (const lxb_char_t *) "class", 5) == LXB_STATUS_OK);
+    CHECK(!stylesheet_head_scripts_affect_ancestors(&sheet, head));
+    /* New stylesheet contents invalidate the lexical summary. */
+    static const char changed[] = "html:has(script){color:blue}";
+    CHECK(stylesheet_add_css(&sheet, changed, sizeof(changed) - 1u));
+    CHECK(stylesheet_head_scripts_affect_ancestors(&sheet, head));
+    CHECK(sheet.head_script_selector_scans > scans);
+    scans = sheet.head_script_selector_scans;
+    CHECK(stylesheet_head_scripts_affect_ancestors(&sheet, head));
+    CHECK(sheet.head_script_selector_scans == scans);
+    printf("head selector cache: repeated scans=0 across 100 checks\n");
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+static int test_quoted_declaration_boundaries(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    static const char html[] = "<style>"
+        "#probe{--label:'a;b'; /* ; ignored */ --size:37px;"
+        "width:var(--size);font-family:'A;B',serif}"
+        "</style><div id=probe>text</div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    const StyleCustomRule *label = find_custom_rule(&sheet, "#probe", "--label");
+    CHECK(label != NULL && strcmp(label->value, "'a;b'") == 0);
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), "probe");
+    ComputedStyle parent = layout_initial_root_style();
+    ComputedStyle computed = style_for_node(&sheet, node, &parent);
+    CHECK(computed.width == 37);
+    const StyleCustomRule *size = find_custom_rule(&sheet, "#probe", "--size");
+    CHECK(size != NULL && strcmp(size->value, "37px") == 0);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 int main(void)
 {
+    CHECK(test_quoted_declaration_boundaries() == 0);
+    CHECK(test_pseudo_state_work() == 0);
+    CHECK(test_layout_scoped_selector_work() == 0);
+    CHECK(test_pseudo_absence_proof() == 0);
+    CHECK(test_deferred_expansion_reuse() == 0);
+    CHECK(test_head_script_dependency_cache() == 0);
     Budget budget;
     budget_init(&budget, 8u * MIB);
     budget_install_lexbor(&budget);

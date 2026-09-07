@@ -1,0 +1,5 @@
+# A real provider detail page should paint its playable card before its
+# poster, then fill the reserved image without requiring user navigation.
+wait-page 240
+mark-page poster-ready
+end

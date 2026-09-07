@@ -10,6 +10,7 @@ endfunction()
 
 function(tilefinch_configure_psp_voice)
     if(NOT PSP OR NOT PSP_BROWSER_ENABLE_PSP_VOICE)
+        unset(TILEFINCH_VOICE_COMPONENT_PRX CACHE)
         return()
     endif()
 
@@ -98,6 +99,32 @@ function(tilefinch_configure_psp_voice)
     endif()
     add_library(tilefinch_pocketsphinx INTERFACE)
     target_link_libraries(tilefinch_pocketsphinx INTERFACE pocketsphinx)
+
+    # Runtime code belongs to a lazy, slot-owned PRX, never the EBOOT link.
+    add_prx_module(tilefinch-voice-component
+        "${CMAKE_SOURCE_DIR}/src/stt/stt_exports.exp"
+        "${CMAKE_SOURCE_DIR}/src/stt/stt_component_psp.c"
+        "${CMAKE_SOURCE_DIR}/src/stt/stt_engine.c"
+        "${CMAKE_SOURCE_DIR}/src/stt/audio_gate.c"
+        "${CMAKE_SOURCE_DIR}/src/stt/resampler.c")
+    target_include_directories(tilefinch-voice-component PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/stt")
+    target_compile_options(tilefinch-voice-component PRIVATE
+        -Os -G0 -fno-pic -ffunction-sections -fdata-sections)
+    target_link_options(tilefinch-voice-component PRIVATE -Wl,--gc-sections)
+    foreach(_allocator IN ITEMS malloc calloc realloc free memalign
+            _malloc_r _calloc_r _realloc_r _free_r _memalign_r)
+        target_link_options(tilefinch-voice-component PRIVATE
+            "-Wl,--wrap=${_allocator}")
+    endforeach()
+    target_link_libraries(tilefinch-voice-component PRIVATE
+        tilefinch_pocketsphinx m pspuser pspsdk)
+    set_target_properties(tilefinch-voice-component PROPERTIES
+        OUTPUT_NAME tilefinch-voice
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/voice-component")
+    set(TILEFINCH_VOICE_COMPONENT_PRX
+        "${CMAKE_BINARY_DIR}/voice-component/tilefinch-voice.prx"
+        CACHE INTERNAL "")
 
     foreach(_name IN LISTS _voice_cache_names)
         tilefinch_restore_cache_variable(

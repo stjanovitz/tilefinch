@@ -24,6 +24,7 @@
 #include "image_decode_internal.h"
 #include "image_svg_decode_internal.h"
 #include "style_internal.h"
+#include "style_cache_internal.h"
 
 #include <lexbor/html/serialize.h>
 
@@ -158,6 +159,9 @@ typedef struct {
     uint16_t current_display_width;
     uint16_t current_display_height;
     bool preserve_staged_document_images;
+    bool defer_document_images;
+    lxb_dom_node_t *const *deferred_nodes;
+    size_t deferred_node_count;
     PendingImageFetch pending[IMAGE_FETCH_CONCURRENCY];
     ImageOriginHealth unhealthy_origins[
         IMAGE_FETCH_UNHEALTHY_ORIGIN_LIMIT];
@@ -197,6 +201,8 @@ static bool image_response_cross_origin(const char *document_url,
 struct ImagePriorityLoadJob {
     ImageLoadContext context;
     ImagePriorityTarget targets[IMAGE_PRIORITY_LOAD_BATCH_LIMIT];
+    uint64_t source_hashes[IMAGE_PRIORITY_LOAD_BATCH_LIMIT];
+    uint64_t document_generation;
     size_t target_count;
     ExternalImageStats retained_stats;
     size_t retained_count;
@@ -424,13 +430,32 @@ static void image_note_request_finished(ImageLoadContext *context,
     }
 }
 
+typedef struct {
+    Stylesheet *sheet;
+    Budget *budget;
+    StyleAncestorBloomCache *ancestors;
+    bool owned;
+    bool selector_owned;
+} ImageStyleCacheScope;
+
+static void image_style_cache_scope_end(ImageStyleCacheScope *scope)
+{
+    if (scope->selector_owned) style_selector_cooperation_end(scope->sheet);
+    if (scope->owned) style_variable_cache_end(scope->sheet);
+    budget_free(scope->budget, scope->ancestors);
+}
+
 static bool image_profile_enabled(void)
 {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    return true;
+#else
     static int enabled = -1;
     if (enabled < 0) {
         enabled = getenv("TILEFINCH_TRACE_IMAGE_PROFILE") != NULL;
     }
     return enabled != 0;
+#endif
 }
 
 static uint64_t image_profile_now_us(void)
@@ -481,6 +506,14 @@ static bool image_work(ImageLoadContext *context, size_t units,
     }
     return (!force_yield && context->slice_work_units < 32)
            || image_cooperate(context, phase);
+}
+
+static bool image_selector_cooperate(void *opaque, lxb_dom_node_t *node,
+                                     size_t visits)
+{
+    (void) node;
+    (void) visits;
+    return image_work(opaque, 0, true, "image-style");
 }
 
 static bool image_stage_expired(const ImageLoadContext *context)
@@ -4017,7 +4050,12 @@ static bool image_process_node(
     }
     *traverse = style->display != DISPLAY_NONE && !style->hidden;
     bool atomic_inline_svg = *traverse && image_name_is(node, "svg");
-    if (*traverse && image_name_is(node, "img")
+    bool deferred = context->defer_document_images;
+    if (image_name_is(node, "img")) {
+        for (size_t i = 0; !deferred && i < context->deferred_node_count; i++)
+            deferred = context->deferred_nodes[i] == node;
+    }
+    if (*traverse && !deferred && image_name_is(node, "img")
         && (!context->preserve_staged_document_images
             || images_find_node(context->images, node) == NULL)) {
         size_t source_length = 0;
@@ -4383,8 +4421,12 @@ static bool images_load_external_impl(
     size_t maximum_total_encoded_bytes,
     size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
-    LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width)
+    LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width,
+    bool defer_document_images, lxb_dom_node_t *const *deferred_nodes,
+    size_t deferred_node_count)
 {
+    if (deferred_node_count > 128u
+        || (deferred_node_count != 0 && deferred_nodes == NULL)) return false;
     if (document == NULL || document->html == NULL || stylesheet == NULL
         || images == NULL
         || budget == NULL || base_url == NULL || document_url == NULL
@@ -4456,6 +4498,9 @@ static bool images_load_external_impl(
         .priority_target_count = priority_target_count,
         .preserve_staged_document_images =
             full_traversal && images->priority_staged,
+        .defer_document_images = defer_document_images,
+        .deferred_nodes = deferred_nodes,
+        .deferred_node_count = deferred_node_count,
         .deadline_ms = image_now_ms() + (double) timeout_ms,
         .slice_started_us = tilefinch_platform_monotonic_time_us(),
         .eager_decode_rasters = !full_traversal
@@ -4463,6 +4508,22 @@ static bool images_load_external_impl(
     };
     uint64_t traversal_started = image_profile_enabled()
         ? image_profile_now_us() : 0;
+    /* Large immutable resource walks use layout's bounded variable/selector
+       memos. Small sheets and priority batches keep the allocation-free path.
+       Refusal preserves uncached matching; nested owners keep their cache,
+       and cleanup covers cancellation and every early return. */
+    bool cache_styles = full_traversal && stylesheet->count >= 64u;
+    ImageStyleCacheScope style_scope
+        __attribute__((cleanup(image_style_cache_scope_end))) = {
+            .sheet = stylesheet, .budget = budget,
+            .owned = cache_styles && style_variable_cache_begin(stylesheet, budget)
+        };
+    if (cache_styles) {
+        style_scope.ancestors = budget_calloc_category(budget,
+            BUDGET_CATEGORY_RESOURCE, 1, sizeof(*style_scope.ancestors));
+        style_scope.selector_owned = style_selector_cooperation_begin(
+            stylesheet, image_selector_cooperate, &context, style_scope.ancestors);
+    }
     bool traversed = true;
     if (full_traversal) {
         /* Match layout's exact html/body inheritance roots. Starting at the
@@ -4502,6 +4563,7 @@ static bool images_load_external_impl(
                 &context, &priority_targets[i]);
         }
     }
+    if (style_selector_cooperation_cancelled(stylesheet)) traversed = false;
     if (!traversed) {
         cancel_pending(&context);
         if (retained_count != 0) {
@@ -4567,7 +4629,7 @@ bool images_load_external(const PocDocument *document, Stylesheet *stylesheet,
         budget, base_url, document_url, referrer_policy, maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
-        NULL, NULL, 0);
+        NULL, NULL, 0, false, NULL, 0);
     if (images != NULL) images->priority_staged = false;
     return loaded;
 }
@@ -4581,12 +4643,49 @@ bool images_load_external_reusing_layout_styles(
     long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
     LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width)
 {
+    return images_load_external_reusing_layout_styles_deferred(
+        document, stylesheet, images, budget, base_url, document_url,
+        referrer_policy, maximum_count, maximum_total_encoded_bytes,
+        maximum_single_encoded_bytes, maximum_decoded_bytes, timeout_ms,
+        scheduler, session, style_cache, fonts, viewport_width, false);
+}
+
+bool images_load_external_reusing_layout_styles_deferred(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, Budget *budget, const char *base_url,
+    const char *document_url, const char *referrer_policy,
+    size_t maximum_count, size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width,
+    bool defer_document_images)
+{
     bool loaded = images_load_external_impl(
         document, stylesheet, images, NULL, 0, NULL, 0, true, false,
         budget, base_url, document_url, referrer_policy, maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
-        style_cache, fonts, viewport_width);
+        style_cache, fonts, viewport_width, defer_document_images, NULL, 0);
+    if (images != NULL) images->priority_staged = false;
+    return loaded;
+}
+
+bool images_load_external_reusing_layout_styles_excluding(
+    const PocDocument *document, Stylesheet *stylesheet,
+    ImageResources *images, Budget *budget, const char *base_url,
+    const char *document_url, const char *referrer_policy,
+    size_t maximum_count, size_t maximum_total_encoded_bytes,
+    size_t maximum_single_encoded_bytes, size_t maximum_decoded_bytes,
+    long timeout_ms, FetchScheduler *scheduler, BrowserSession *session,
+    LayoutReuseCache *style_cache, const FontSet *fonts, int viewport_width,
+    lxb_dom_node_t *const *deferred_nodes, size_t deferred_node_count)
+{
+    bool loaded = images_load_external_impl(
+        document, stylesheet, images, NULL, 0, NULL, 0, true, false,
+        budget, base_url, document_url, referrer_policy, maximum_count,
+        maximum_total_encoded_bytes, maximum_single_encoded_bytes,
+        maximum_decoded_bytes, timeout_ms, scheduler, session,
+        style_cache, fonts, viewport_width, false, deferred_nodes, deferred_node_count);
     if (images != NULL) images->priority_staged = false;
     return loaded;
 }
@@ -4608,7 +4707,7 @@ bool images_load_external_priority_nodes(
         maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
-        NULL, NULL, 0);
+        NULL, NULL, 0, false, NULL, 0);
     if (loaded && images != NULL) images->priority_staged = true;
     return loaded;
 }
@@ -4783,7 +4882,7 @@ bool images_refresh_external_nodes(
             false, true, budget, base_url, document_url, referrer_policy,
             maximum_count, maximum_total_encoded_bytes,
             maximum_single_encoded_bytes, maximum_decoded_bytes, timeout_ms,
-            scheduler, session, NULL, NULL, 0)) {
+            scheduler, session, NULL, NULL, 0, false, NULL, 0)) {
         images_destroy(&replacement);
         return false;
     }
@@ -4871,7 +4970,7 @@ bool images_load_external_priority_targets(
         maximum_count,
         maximum_total_encoded_bytes, maximum_single_encoded_bytes,
         maximum_decoded_bytes, timeout_ms, scheduler, session,
-        NULL, NULL, 0);
+        NULL, NULL, 0, false, NULL, 0);
     if (loaded && images != NULL) images->priority_staged = true;
     return loaded;
 }
@@ -4942,6 +5041,14 @@ ImagePriorityLoadJob *images_priority_load_begin_batch(
     ImagePriorityLoadJob *job = budget_calloc(budget, 1, sizeof(*job));
     if (job == NULL) return NULL;
     memcpy(job->targets, targets, target_count * sizeof(*targets));
+    job->document_generation = document->content_generation;
+    for (size_t at = 0; at < target_count; at++) {
+        if (targets[at].weak_handle == 0) continue;
+        size_t length = 0;
+        const char *source = image_select_source_for_width(
+            stylesheet, targets[at].node, targets[at].display_width, &length);
+        job->source_hashes[at] = source == NULL ? 0 : image_hash_bytes(source, length);
+    }
     job->target_count = target_count;
     job->retained_count = images->count;
     job->retained_stats = images->stats;
@@ -4971,6 +5078,24 @@ ImagePriorityLoadJob *images_priority_load_begin_batch(
         .externally_pumped = true
     };
     return job;
+}
+
+bool images_priority_load_sources_current(ImagePriorityLoadJob *job)
+{
+    if (job == NULL || job->context.document == NULL) return false;
+    uint64_t generation = job->context.document->content_generation;
+    if (generation == job->document_generation) return true;
+    for (size_t at = 0; at < job->target_count; at++) {
+        const ImagePriorityTarget *target = &job->targets[at];
+        if (target->weak_handle == 0) continue;
+        size_t length = 0;
+        const char *source = image_select_source_for_width(
+            job->context.stylesheet, target->node, target->display_width, &length);
+        uint64_t hash = source == NULL ? 0 : image_hash_bytes(source, length);
+        if (hash != job->source_hashes[at]) return false;
+    }
+    job->document_generation = generation;
+    return true;
 }
 
 ImagePriorityLoadStatus images_priority_load_pump(

@@ -435,21 +435,12 @@
     }
     return state || null;
   };
-  globalThis.__tilefinchRemoteHasContentMutation = (node) =>
-    !!remoteMutationState(node, false)?.contentMode;
   globalThis.__tilefinchRememberRemoteContent = (node, mode, value) => {
     const state = remoteMutationState(node, true);
     if (state) {
       state.contentMode = String(mode);
       state.contentValue = String(value);
     }
-  };
-  globalThis.__tilefinchRemoteAttributeValue = (node, name) => {
-    const state = remoteMutationState(node, false),
-      key = String(name).toLowerCase();
-    return state && state.attributes.has(key)
-      ? { found: true, value: state.attributes.get(key) }
-      : { found: false, value: null };
   };
   globalThis.__tilefinchRememberRemoteAttribute = (node, name, value) => {
     const state = remoteMutationState(node, true);
@@ -811,7 +802,28 @@
       },
     });
   }
-  class SVGElement extends Element {}
+  class SVGElement extends Element {
+    getBBox() {
+      const rect = this.getBoundingClientRect(),
+        number = (name, fallback = 0) => {
+          const value = Number.parseFloat(this.getAttribute(name));
+          return Number.isFinite(value) ? value : fallback;
+        };
+      return new DOMRect(
+        number("x"),
+        number("y"),
+        Math.max(0, number("width", rect.width)),
+        Math.max(0, number("height", rect.height)),
+      );
+    }
+    getComputedTextLength() {
+      const name = String(this.localName || "").toLowerCase();
+      if (name !== "text" && name !== "tspan" && name !== "textpath")
+        throw new TypeError("SVG text element required");
+      const width = Number(this.getBoundingClientRect().width);
+      return Number.isFinite(width) && width > 0 ? width : 0;
+    }
+  }
   Object.defineProperties(SVGElement.prototype, {
     ownerSVGElement: {
       configurable: true,
@@ -838,6 +850,13 @@
       },
     },
   });
+  /* The bounded profile shares the SVG element wrapper while exposing the
+     standard constructor names.  This avoids three per-realm prototype
+     objects on PSP; instanceof and the graphics API remain available. */
+  const SVGGraphicsElement = SVGElement,
+    SVGGeometryElement = SVGElement,
+    SVGTextContentElement = SVGElement,
+    SVGSVGElement = SVGElement;
   class HTMLDivElement extends HTMLElement {}
   class HTMLBodyElement extends HTMLElement {}
   class HTMLFrameSetElement extends HTMLElement {}
@@ -907,7 +926,6 @@
   class HTMLVideoElement extends HTMLMediaElement {}
   class HTMLSourceElement extends HTMLElement {}
   class HTMLSlotElement extends HTMLElement {}
-  globalThis.__tilefinchMaybeScheduleDynamicScript = () => {};
   class DocumentFragment extends Node {
     constructor() {
       super();
@@ -989,6 +1007,10 @@
     HTMLElement,
     HTMLUnknownElement,
     SVGElement,
+    SVGGraphicsElement,
+    SVGGeometryElement,
+    SVGTextContentElement,
+    SVGSVGElement,
     HTMLDivElement,
     HTMLBodyElement,
     HTMLFrameSetElement,
@@ -2514,9 +2536,8 @@
     if (nodeType === Node.DOCUMENT_TYPE_NODE) return DocumentType.prototype;
     if (nodeType === Node.DOCUMENT_FRAGMENT_NODE)
       return DocumentFragment.prototype;
-    if (namespaceURI === "http://www.w3.org/2000/svg") {
+    if (namespaceURI === "http://www.w3.org/2000/svg")
       return SVGElement.prototype;
-    }
     if (
       nodeType === Node.ELEMENT_NODE &&
       namespaceURI !== undefined &&
@@ -2736,6 +2757,31 @@
       },
     });
   };
+  const detachedStyles = new WeakMap();
+  Object.defineProperty(globalThis, "__tilefinchInvalidateDetachedStyle", {
+    value(node) {
+      detachedStyles.delete(node);
+    },
+    writable: false,
+    configurable: false,
+  });
+  Object.defineProperty(Element.prototype, "style", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (!this.__detachedOwner) return undefined;
+      let value = detachedStyles.get(this);
+      if (!value) {
+        value = globalThis.__tilefinchMakeDetachedStyle(this);
+        detachedStyles.set(this, value);
+      }
+      return value;
+    },
+    set(value) {
+      const style = this.style;
+      if (style) style.cssText = String(value);
+    },
+  });
   const namedNodeMapFor = (owner, read) => {
     let map = namedNodeMaps.get(owner);
     if (map) return map;
@@ -4144,6 +4190,8 @@
           rekeyStableWrapper(this, idKey || sourceKey);
         }
         if (lowerName === "id") globalThis.__tilefinchExposeNamedProperty(value);
+        if (lowerName === "style" && this.__detachedOwner)
+          detachedStyles.delete(this);
         invalidateInlineEventHandler(this, lowerName);
         globalThis.__tilefinchCustomElementAttributeChanged?.(
           this,
@@ -4399,6 +4447,8 @@
                  && lowerName === "id")
           rekeyStableWrapper(this, String(__tilefinchStableNodeKey(handle) || ""));
         if (oldValue !== null) {
+          if (lowerName === "style" && this.__detachedOwner)
+            detachedStyles.delete(this);
           invalidateInlineEventHandler(this, lowerName);
           globalThis.__tilefinchCanvasAttributeChanged?.(this, lowerName);
           if (
@@ -6985,9 +7035,23 @@
     };
   }
   let motionInlineHintGeneration = 1,
+    styleSheetGeneration = 1,
     motionInlineHintCheckedGeneration = 0,
     motionInlineHintCached = false,
     motionInlineHintScans = 0;
+  Object.defineProperty(globalThis, "__tilefinchStyleSheetGeneration", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: () => styleSheetGeneration,
+  });
+  const mutationListHasStyleSheetNode = (nodes) => {
+    for (let index = 0; index < nodes.length; index++) {
+      const name = String(nodes[index]?.localName || "").toLowerCase();
+      if (name === "style" || name === "link") return true;
+    }
+    return false;
+  };
   const motionHintUtf8Length = (text) => {
     let bytes = 0;
     for (let at = 0; at < text.length; at++) {
@@ -7018,10 +7082,11 @@
         ? {
             text: String(result.text || ""),
             nodes: Math.max(0, Math.min(maximumNodes, result.nodes | 0)),
+            bytes: Math.max(0, Math.min(maximumBytes, result.bytes | 0)),
           }
-        : { text: "", nodes: 0 };
+        : { text: "", nodes: 0, bytes: 0 };
     } catch {
-      return { text: "", nodes: 0 };
+      return { text: "", nodes: 0, bytes: 0 };
     }
   };
   const motionStyleAttributePrefix = (node, maximumBytes) => {
@@ -7077,11 +7142,12 @@
               );
               text = retained.text;
               inspectedNodes += retained.nodes;
+              inspectedBytes += retained.bytes;
             } else {
               text = motionStyleAttributePrefix(node, available);
               inspectedNodes++;
+              inspectedBytes += motionHintUtf8Length(text);
             }
-            inspectedBytes += motionHintUtf8Length(text);
             if (
               /@(?:-webkit-)?keyframes\b|\banimation(?:-name)?\s*:/i.test(
                 text,
@@ -7306,6 +7372,17 @@
     globalThis.__tilefinchResizeRecheck?.();
     const targetName = String(target?.localName || "").toLowerCase(),
       parentName = String(target?.parentElement?.localName || "").toLowerCase(),
+      styleSheetMutation =
+        (type === "childList" &&
+          (targetName === "style" ||
+            mutationListHasStyleSheetNode(addedNodes) ||
+            mutationListHasStyleSheetNode(removedNodes))) ||
+        (type === "characterData" && parentName === "style") ||
+        (type === "attributes" &&
+          (targetName === "style" || targetName === "link") &&
+          ["disabled", "href", "media", "rel", "type"].includes(
+            String(attributeName || "").toLowerCase(),
+          )),
       motionStyleMutation =
         (type === "childList" &&
           (targetName === "style" ||
@@ -7316,6 +7393,10 @@
             ))) ||
         (type === "characterData" && parentName === "style") ||
         (type === "attributes" && attributeName === "style");
+    if (styleSheetMutation) {
+      styleSheetGeneration++;
+      if (!styleSheetGeneration) styleSheetGeneration = 1;
+    }
     if (motionStyleMutation) {
       motionInlineHintGeneration++;
       if (!motionInlineHintGeneration) motionInlineHintGeneration = 1;

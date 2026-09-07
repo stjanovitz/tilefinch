@@ -55,6 +55,31 @@ int main(void)
     CHECK(permutation_once(order, 11) && runs >= 3);
     text_bidi_paragraph_destroy(paragraph);
 
+    /* A layout text flow can contain paragraph separators. SheenBidi returns
+       levels only for the first paragraph, not the requested full span. */
+    static const char paragraphs[] =
+        "\xd7\x90\xd7\x91\nabc\xe2\x80\xa9\xd7\x92\xd7\x93";
+    paragraph = text_bidi_paragraph_create(
+        &budget, paragraphs, sizeof(paragraphs) - 1u,
+        TEXT_BIDI_BASE_AUTO_LTR, &status);
+    CHECK(paragraph != NULL && text_bidi_paragraph_count(paragraph) == 9);
+    CHECK(text_bidi_paragraph_units(paragraph)[0].level == 1
+          && text_bidi_paragraph_units(paragraph)[3].level == 0
+          && text_bidi_paragraph_units(paragraph)[7].level == 1);
+    CHECK(text_bidi_line_visual_order(paragraph, 0, 9, order, 9, &runs));
+    CHECK(permutation_once(order, 9));
+    CHECK(text_bidi_line_visual_order(paragraph, 3, 3, order, 3, &runs));
+    CHECK(order[0] == 3 && order[1] == 4 && order[2] == 5);
+    text_bidi_paragraph_destroy(paragraph);
+    CHECK(budget.current == 0);
+    char excess_paragraphs[33u * 3u];
+    for (size_t i = 0; i < 33u; i++)
+        memcpy(excess_paragraphs + i * 3u, "\xd7\x90\n", 3u);
+    CHECK(text_bidi_paragraph_create(
+        &budget, excess_paragraphs, sizeof(excess_paragraphs),
+        TEXT_BIDI_BASE_AUTO_LTR, &status) == NULL);
+    CHECK(status == TEXT_BIDI_LIMIT_EXCEEDED && budget.current == 0);
+
     /* Excess explicit-depth controls are malformed author input, not a reason
        to escape the bounded UAX #9 implementation. The algorithm ignores
        embeddings beyond its specified depth and still emits a permutation. */

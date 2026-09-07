@@ -868,6 +868,9 @@ static bool overflow_cache_prepare(TileCache *cache)
         }
     }
     if (!changed) return true;
+    LayoutPositionedClipIndex positioned = {0};
+    if (overflow->clip_count != 0 && overflow->geometry_count != 0)
+        layout_positioned_clip_index_prepare(layout, &positioned);
     /* Fixed descendants participate in the same scroll/clip geometry.  A
        cached fixed layer therefore becomes stale whenever an internal
        overflow offset changes, even though the viewport itself did not. */
@@ -911,8 +914,8 @@ static bool overflow_cache_prepare(TileCache *cache)
                && overflow->geometry[at].command_index
                   < box->scroll_command_end) {
             OverflowGeometry *geometry = &overflow->geometry[at++];
-            if (layout_positioned_command_escapes_clip(
-                    layout, geometry->command_index, box)) {
+            if (layout_positioned_command_escapes_clip_indexed(
+                    layout, geometry->command_index, box, &positioned)) {
                 continue;
             }
             geometry->found = true;

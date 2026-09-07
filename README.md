@@ -37,7 +37,7 @@ agents are capable of. A web browser was a good test of all three.
 | **Native PSP UI** | First-frame home screen, Collections, clock, battery/Wi-Fi status, contextual controls, PNG screenshots, and photographed QR diagnostics. |
 | **Optional XMB redirect** | ARK-4 can make Sony's Internet Browser icon launch Tilefinch, with a hold-L bypass back to the original browser. |
 | **Updates** | Signed in-app updates use A/B slots, a trial boot, automatic rollback, explicit approval, and an optional signed previous-version picker. |
-| **Experimental voice search** | Optional separate download; off by default and currently slow and inaccurate. |
+| **Experimental voice search** | Optional model download and on-demand speech engine; off by default and currently slow and inaccurate. |
 
 ### At a glance
 

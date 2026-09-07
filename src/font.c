@@ -952,6 +952,17 @@ static bool builtin_bitmap_table_lookup(
     const unsigned char *compressed,
     BuiltinBitmap *result)
 {
+    /* Most text lies outside both fallback tables. Reject it before the
+       binary search; derive the bounds from the generated sorted data so
+       additions to a pack cannot silently become unreachable. */
+    if (count == 0) return false;
+    unsigned first = codepoints_are_16_bit
+        ? ((const uint16_t *) codepoints)[0]
+        : ((const uint32_t *) codepoints)[0];
+    unsigned last = codepoints_are_16_bit
+        ? ((const uint16_t *) codepoints)[count - 1u]
+        : ((const uint32_t *) codepoints)[count - 1u];
+    if (codepoint < first || codepoint > last) return false;
     size_t low = 0;
     size_t high = count;
     while (low < high) {
@@ -1640,6 +1651,7 @@ int font_text_width_at_size_fixed_mode(
     int64_t denominator = (int64_t) units_per_em * 5;
     int64_t numerator = 0;
     unsigned previous = 0;
+    int previous_glyph = 0;
     for (size_t at = 0; at < length;) {
         size_t sequence_used = 0;
         int sequence_advance = 0;
@@ -1678,9 +1690,13 @@ int font_text_width_at_size_fixed_mode(
             at += used;
             continue;
         }
+        /* Resolve the cmap once: both kerning and advance use this glyph,
+           and the next pair can reuse it. Keep the codepoint sentinel:
+           U+0000 and fallback sequences intentionally break kerning. */
+        int glyph = stbtt_FindGlyphIndex(info, (int) codepoint);
         if (kerning && previous != 0) {
-            int kerning = stbtt_GetCodepointKernAdvance(
-                info, (int) previous, (int) codepoint);
+            int kerning = stbtt_GetGlyphKernAdvance(
+                info, previous_glyph, glyph);
             if (!font_width_accumulate(
                     &numerator,
                     (int64_t) kerning * pixel_height_fixed * 5)) {
@@ -1688,13 +1704,14 @@ int font_text_width_at_size_fixed_mode(
             }
         }
         int advance = 0;
-        stbtt_GetCodepointHMetrics(info, (int) codepoint, &advance, NULL);
+        stbtt_GetGlyphHMetrics(info, glyph, &advance, NULL);
         int64_t delta = (int64_t) advance * pixel_height_fixed * 5
                         + (bold ? (int64_t) 112 * units_per_em : 0);
         if (!font_width_accumulate(&numerator, delta)) {
             return numerator < 0 ? INT_MIN : INT_MAX;
         }
         previous = codepoint;
+        previous_glyph = glyph;
         at += used;
     }
     return font_width_round_ratio(numerator, denominator);

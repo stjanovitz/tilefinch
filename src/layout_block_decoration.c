@@ -4,6 +4,7 @@
    communicate through LayoutBlockPaintPlan. Split out of layout_block.c. */
 
 #include "layout_block_internal.h"
+#include "style_internal.h"
 
 #include <stdio.h>
 
@@ -519,6 +520,20 @@ bool layout_block_emit_decoration(
         plan->border_alphas[side] = border_alphas[side];
     }
     plan->rounded_border = rounded_border;
+    /* One extra command per eligible control, at most 64 per layout. Keeping
+       its geometry even when transparent preserves spatial-index membership
+       and command order across focus changes, without insertion at input time. */
+    plan->focus_inset_slot = rounded_border
+        && context->focus_inset_slot_count < 64u
+        && (node->local_name == LXB_TAG_BUTTON || node->local_name == LXB_TAG_A
+            || node->local_name == LXB_TAG_LABEL || node->local_name == LXB_TAG_INPUT
+            || node->local_name == LXB_TAG_SELECT || node->local_name == LXB_TAG_TEXTAREA
+            || node->local_name == LXB_TAG_SUMMARY
+            || document_attribute(node, "tabindex", NULL) != NULL)
+        && stylesheet_prepare_focus_rule_index((Stylesheet *) context->sheet)
+        && context->sheet->focus_rule_count != 0
+        && stylesheet_box_shadow_count(context->sheet, style) <= 1;
+    if (plan->focus_inset_slot) context->focus_inset_slot_count++;
     return true;
 }
 
@@ -799,10 +814,18 @@ bool layout_block_patch_decoration(
         context->layout->commands[rounded_border_index].height =
             content_bottom - outer_y;
     }
-    DrawCommand decoration_strokes[STYLE_BOX_SHADOW_LIMIT + 4u];
+    DrawCommand decoration_strokes[STYLE_BOX_SHADOW_LIMIT + 5u];
     size_t decoration_stroke_count = 0;
     size_t box_shadow_count = stylesheet_box_shadow_count(
         context->sheet, style);
+    if (plan->focus_inset_slot) {
+        decoration_strokes[decoration_stroke_count++] = (DrawCommand) {
+            .type = DRAW_STROKE_RECT, .x = outer_x, .y = outer_y,
+            .width = outer_width, .height = content_bottom - outer_y,
+            .scale = 1, .radius = plan->border_radius_code,
+            .opacity_scale = UINT16_MAX, .image_fit = LAYOUT_STROKE_FOCUS_INSET
+        };
+    }
     for (size_t i = box_shadow_count; i-- > 0;) {
         const StyleBoxShadow *shadow = stylesheet_box_shadow(
             context->sheet, style, i);
@@ -817,13 +840,15 @@ bool layout_block_patch_decoration(
             alpha = style->color_alpha;
         }
         if (alpha == 0) continue;
-        decoration_strokes[decoration_stroke_count++] = (DrawCommand) {
+        size_t slot = plan->focus_inset_slot ? 0 : decoration_stroke_count++;
+        decoration_strokes[slot] = (DrawCommand) {
             .type = DRAW_STROKE_RECT,
             .x = outer_x, .y = outer_y,
             .width = outer_width, .height = content_bottom - outer_y,
             .color = color, .scale = shadow->spread,
             .radius = plan->border_radius_code,
-            .opacity_scale = alpha_opacity_scale(alpha)
+            .opacity_scale = alpha_opacity_scale(alpha),
+            .image_fit = plan->focus_inset_slot ? LAYOUT_STROKE_FOCUS_INSET : LAYOUT_STROKE_SOLID
         };
     }
     if (!rounded_border && style->border.top > 0
@@ -905,7 +930,15 @@ bool layout_block_patch_decoration(
     if (!layout_insert_commands(context, before_insertion_index,
                                 decoration_strokes,
                                 decoration_stroke_count)) {
-        return false;
+        /* Reserving an invisible optimization must not make otherwise
+           admissible author decoration fail. Insertion is transactional;
+           retry without only the transparent placeholder, never a shadow. */
+        if (!plan->focus_inset_slot || decoration_stroke_count == 0
+            || decoration_strokes[0].opacity_scale != UINT16_MAX
+            || !layout_insert_commands(context, before_insertion_index,
+                                        decoration_strokes + 1,
+                                        decoration_stroke_count - 1)) return false;
+        decoration_stroke_count--;
     }
     before_insertion_index += decoration_stroke_count;
     scroll_command_start += decoration_stroke_count;

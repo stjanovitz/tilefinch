@@ -236,6 +236,29 @@ typedef struct {
     unsigned elapsed_ms;
 } PspUiInput;
 
+typedef struct {
+    unsigned hold_ms;
+    bool held;
+    bool triggered;
+    bool started_on_page;
+} PspUiToolbarGesture;
+
+typedef struct {
+    PspUiToolbarGesture gesture;
+    uint64_t sample_ms;
+    bool reader_pending;
+} PspUiToolbarInputState;
+
+typedef enum {
+    PSP_UI_TOOLBAR_GESTURE_NONE,
+    PSP_UI_TOOLBAR_GESTURE_TAP,
+    PSP_UI_TOOLBAR_GESTURE_READER
+} PspUiToolbarGestureResult;
+
+PspUiToolbarGestureResult psp_ui_toolbar_gesture_update(
+    PspUiToolbarGesture *gesture, bool held, bool page_eligible,
+    unsigned elapsed_ms);
+
 typedef enum {
     PSP_UI_POINTER_NONE = 0,
     PSP_UI_POINTER_MOVE,
@@ -582,7 +605,9 @@ typedef struct {
     /* All three are frame counters bounded below 1024 by their producers. */
     uint16_t activity_frames;
     uint16_t toast_frames;
-    uint16_t loading_phase;
+    uint16_t loading_phase : 10;
+    /* Uses a spare bit in the bounded phase counter, not another UI byte. */
+    uint16_t page_activation_busy : 1;
     uint8_t overlay_animation_frames;
     uint8_t toast_entry_frames;
     /* Focus-settle budget from the theme sheet; drives the focus ring only. */
@@ -858,6 +883,15 @@ void psp_ui_boot_entrance_composite(
     uint16_t *pixels, int width, int height, int stride);
 
 void psp_ui_init(PspUiState *ui);
+/* Presentation-only input during page work. Never emits a page, storage or
+   settings action; false leaves ui unchanged for ordinary queued dispatch. */
+bool psp_ui_update_priority(PspUiState *ui, const PspUiInput *input);
+bool psp_ui_filter_toolbar_input(PspUiToolbarInputState *state, PspUiInput *input,
+                                bool page_eligible, uint64_t now_ms);
+/* Merge only native interaction state after the worker/presentation fence. */
+void psp_ui_adopt_priority(PspUiState *ui, const PspUiState *snapshot,
+                           PspUiScreen original_screen, bool original_chrome_visible);
+bool psp_ui_page_work_paused(const PspUiState *ui);
 /*
  * The device chrome uses the already-loaded application sans face after the
  * engine becomes available.  Glyphs are retained in one bounded process-wide
@@ -891,6 +925,8 @@ void psp_ui_set_history(PspUiState *ui, bool can_go_back,
                         bool can_go_forward);
 void psp_ui_set_loading(PspUiState *ui, bool loading,
                         int progress_per_mille);
+/* Presentation-only activity, distinct from navigation loading. */
+bool psp_ui_set_page_activation(PspUiState *ui, bool active);
 /* Scale a bounded 64-bit progress value onto a small UI extent without
    pulling software 64-bit division into a PSP frame. The result is clamped
    to [0, extent]; shifting both operands retains sub-pixel precision for
@@ -1135,6 +1171,11 @@ size_t psp_ui_media_overlay_regions_without_track_menu(
  * cooperative seek supervisor while the last complete video frame remains
  * frozen on the 32-bit scanout surface. */
 void psp_ui_media_composite_controls(
+    const PspUiMediaState *media, uint16_t *pixels,
+    int width, int height, int stride);
+/* Cooperative 565 scanout refresh. Pixels initially contain the last latched
+   surface; a fresh open owns a loading stage, while a seek retains its picture. */
+void psp_ui_media_composite_supervisor_565(
     const PspUiMediaState *media, uint16_t *pixels,
     int width, int height, int stride);
 

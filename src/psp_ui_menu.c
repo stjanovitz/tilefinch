@@ -29,6 +29,92 @@ static void menu_close(PspUiState *ui)
     if (ui != NULL) ui->screen = (PspUiScreen) ui->base_screen;
 }
 
+bool psp_ui_update_priority(PspUiState *ui, const PspUiInput *input)
+{
+    if (ui == NULL || input == NULL || ui->page_gamepad_capture) return false;
+    uint32_t buttons = input->pressed;
+    bool admitted = false;
+    switch (ui->screen) {
+        case PSP_UI_SCREEN_PAGE:
+            admitted = (buttons & (PSP_UI_BUTTON_MENU | PSP_UI_BUTTON_TOOLBAR)) != 0
+                || (buttons == 0 && ui->analog_cursor_enabled
+                    && (input->analog_x < 104 || input->analog_x > 152
+                        || input->analog_y < 104 || input->analog_y > 152));
+            break;
+        case PSP_UI_SCREEN_MENU:
+            admitted = (buttons & (PSP_UI_BUTTON_MENU | PSP_UI_BUTTON_TOOLBAR
+                | PSP_UI_BUTTON_CANCEL | PSP_UI_BUTTON_UP | PSP_UI_BUTTON_DOWN
+                | PSP_UI_BUTTON_LEFT | PSP_UI_BUTTON_RIGHT)) != 0
+                || ((buttons & PSP_UI_BUTTON_CONFIRM) != 0
+                    && (ui->menu_selection == UI_MENU_ROW_TABS
+                        || ui->menu_selection == UI_MENU_ROW_PAGE_TOOLS
+                        || ui->menu_selection == UI_MENU_ROW_SETTINGS
+                        || ui->menu_selection == UI_MENU_ROW_HELP));
+            break;
+        case PSP_UI_SCREEN_OPTIONS:
+            admitted = (buttons & (PSP_UI_BUTTON_MENU | PSP_UI_BUTTON_CANCEL
+                | PSP_UI_BUTTON_UP | PSP_UI_BUTTON_DOWN
+                | PSP_UI_BUTTON_PAGE_UP | PSP_UI_BUTTON_PAGE_DOWN)) != 0
+                || ((buttons & PSP_UI_BUTTON_CONFIRM) != 0
+                    && ui->options_group_selection != 6u);
+            break;
+        case PSP_UI_SCREEN_OPTION_ITEMS:
+            admitted = (buttons & (PSP_UI_BUTTON_MENU | PSP_UI_BUTTON_UP
+                | PSP_UI_BUTTON_DOWN)) != 0;
+            break;
+        case PSP_UI_SCREEN_PAGE_TOOLS:
+        case PSP_UI_SCREEN_HELP:
+        case PSP_UI_SCREEN_TABS:
+            admitted = (buttons & (PSP_UI_BUTTON_MENU | PSP_UI_BUTTON_UP
+                | PSP_UI_BUTTON_DOWN | PSP_UI_BUTTON_CANCEL)) != 0;
+            break;
+        default:
+            break;
+    }
+    if (!admitted) return false;
+    /* Chords can request page-control capture or another lifecycle action
+       before ordinary menu routing. Leave all chords to the main receiver. */
+    if (buttons != 0 && (buttons & (buttons - 1u)) != 0) return false;
+    PspUiIntent intent = psp_ui_update(ui, input);
+    (void) intent; /* Admission above contains only presentation transitions. */
+    return true;
+}
+
+bool psp_ui_page_work_paused(const PspUiState *ui)
+{
+    return ui != NULL && ui->screen != PSP_UI_SCREEN_PAGE
+        && ui->screen != PSP_UI_SCREEN_FIND
+        && !psp_ui_screen_is_native_surface(ui->screen);
+}
+
+void psp_ui_adopt_priority(PspUiState *ui, const PspUiState *snapshot,
+                           PspUiScreen original_screen, bool original_chrome_visible)
+{
+    if (ui == NULL || snapshot == NULL) return;
+    /* Never copy URL, title, document geometry, borrowed views, or settings
+       over a concurrently completed page transaction. */
+    /* Apply interaction deltas, not stale state. A loading reveal made by
+       page work must survive cursor-only/menu snapshots. On a conflicting
+       screen transition the live lifecycle owner wins. */
+    if (ui->screen != original_screen && ui->screen != snapshot->screen) return;
+    if (snapshot->screen != original_screen) ui->screen = snapshot->screen;
+    if (snapshot->chrome_visible != original_chrome_visible
+        && ui->chrome_visible == original_chrome_visible)
+        ui->chrome_visible = snapshot->chrome_visible;
+    ui->menu_selection = snapshot->menu_selection;
+    ui->options_selection = snapshot->options_selection;
+    ui->options_group_selection = snapshot->options_group_selection;
+    ui->tab_selection = snapshot->tab_selection;
+    ui->overlay_animation_frames = snapshot->overlay_animation_frames;
+    ui->overlay_motion = snapshot->overlay_motion;
+    ui->activity_frames = snapshot->activity_frames;
+    ui->cursor_x_milli = snapshot->cursor_x_milli;
+    ui->cursor_y_milli = snapshot->cursor_y_milli;
+    ui->cursor_visible = snapshot->cursor_visible;
+    ui->cursor_fade = snapshot->cursor_fade;
+    ui->cursor_idle_ms = snapshot->cursor_idle_ms;
+}
+
 static bool menu_site_available(const PspUiState *ui)
 {
     char site[CONTENT_BLOCKER_HOST_LIMIT];

@@ -29,6 +29,7 @@ int module_start(SceSize argument_size, void *argument_data)
         .runtime_create_exec_env = wasm_runtime_create_exec_env,
         .runtime_destroy_exec_env = wasm_runtime_destroy_exec_env,
         .runtime_set_instruction_count_limit = wasm_runtime_set_instruction_count_limit,
+        .runtime_get_module_inst = wasm_runtime_get_module_inst,
         .runtime_get_import_count = wasm_runtime_get_import_count,
         .runtime_get_import_type = wasm_runtime_get_import_type,
         .runtime_get_export_count = wasm_runtime_get_export_count,
@@ -59,7 +60,10 @@ int module_start(SceSize argument_size, void *argument_data)
         .memory_get_bytes_per_page = wasm_memory_get_bytes_per_page,
         .memory_get_cur_page_count = wasm_memory_get_cur_page_count,
         .memory_get_max_page_count = wasm_memory_get_max_page_count,
-        .memory_enlarge = wasm_memory_enlarge
+        .memory_enlarge = wasm_memory_enlarge,
+        .runtime_resolve_symbols = wasm_runtime_resolve_symbols,
+        .runtime_is_underlying_binary_freeable =
+            wasm_runtime_is_underlying_binary_freeable
     };
     memcpy(start->api, &api, sizeof(api));
     return 0;

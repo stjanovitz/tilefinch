@@ -2,7 +2,12 @@
    and only then passes the privileged compiler as an argument.  Author code
    can poison ordinary constructors before this lazy module runs, but no such
    constructor can observe a compiler bridge on the global object. */
-globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
+globalThis.__tilefinchInstallWorker = (
+  runWorkerNative,
+  traceWorkerNative,
+  createWorkerRealmNative,
+  destroyWorkerRealmNative,
+) => {
   /* Worker is intentionally a first-use module. Ordinary pages should not pay
      to compile its message/lifecycle machinery merely because the constructor
      is standards-visible. */
@@ -15,13 +20,17 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
     trustedEvent = globalThis.__tilefinchTrustedEvent,
     markNative = globalThis.__tilefinchMarkNativeFunction,
     ownerNavigator = globalThis.navigator,
-    ownerLocation = globalThis.location;
+    ownerLocation = globalThis.location,
+    ownerPerformance = globalThis.performance;
   if (
     typeof runWorkerNative !== "function" ||
     typeof traceWorkerNative !== "function" ||
+    typeof createWorkerRealmNative !== "function" ||
+    typeof destroyWorkerRealmNative !== "function" ||
     typeof blobForURL !== "function" ||
     typeof trustedString !== "function" ||
     !workerIntrinsics || typeof workerIntrinsics.sourceForBlob !== "function" ||
+    typeof workerIntrinsics.apply !== "function" ||
     typeof cloneWorkerValue !== "function" ||
     typeof createPrivateWeakMap !== "function" ||
     typeof createWorkerPerformance !== "function" ||
@@ -93,30 +102,73 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
       traceWorkerNative(direction, value);
     },
     workerStates = createPrivateWeakMap(),
+    newHandlerSlots = () => ({
+      message: { value: null, wrapper: null },
+      error: { value: null, wrapper: null },
+      messageerror: { value: null, wrapper: null },
+    }),
+    setEventHandler = (map, target, slots, type, value) => {
+      const slot = slots[type],
+        callback = typeof value === "function" ? value : null;
+      if (callback === slot.value) return;
+      slot.value = callback;
+      if (callback !== null && slot.wrapper === null) {
+        /* Event-handler attributes occupy one stable position in the event
+           listener list. Replacing a non-null handler preserves that position;
+           clearing and later restoring it registers a new position. */
+        slot.wrapper = function (event) {
+          const current = slot.value;
+          if (typeof current === "function")
+            return workerIntrinsics.apply(current, target, [event]);
+        };
+        globalThis.__tilefinchAddEventListener(
+          map, type, slot.wrapper, false);
+      } else if (callback === null && slot.wrapper !== null) {
+        globalThis.__tilefinchRemoveEventListener(
+          map, type, slot.wrapper, false);
+        slot.wrapper = null;
+      }
+    },
+    reportOwnerListenerError = (state, type, error, item, list) => {
+      const handler = state.handlers[type]?.wrapper;
+      traceWorkerMessage("owner-listener-error", {
+        type: String(type),
+        handler: item?.callback === handler,
+        ordinal: list.indexOf(item),
+        listeners: list.length,
+        once: !!item?.once,
+        active: !!item?.active,
+        signal: !!item?.signal,
+        message: String((error && error.message) || error),
+        stack: workerIntrinsics.slice(
+          trustedString((error && error.stack) || ""), 0, 4096),
+        /* Validation tracing is a no-op in ordinary builds.  Retain a bounded
+           copy of the actual failing callback here: challenge and framework
+           bundles routinely install several anonymous listeners, so an
+           ordinal and a minified exception alone cannot identify the missing
+           platform contract.  Use captured intrinsics because page code may
+           replace Function.prototype.toString or String.prototype.slice. */
+        source: workerIntrinsics.slice(
+          trustedString(item?.callback), 0, 4096),
+      });
+    },
     emitWorker = (owner, type, event = {}) => {
       const state = workerStates.get(owner);
       if (!state || !state.active) return;
       if (!(event instanceof Event)) event = new Event(type);
+      if (type === "message")
+        traceWorkerMessage("deliver-to-owner", event.data);
       globalThis.__tilefinchPrepareEvent(event, owner, [owner]);
       event.currentTarget = owner;
       event.eventPhase = Event.AT_TARGET;
+      state.dispatchType = type;
       try {
-        const handler = state.handlers[type];
-        if (typeof handler === "function")
-          try {
-            globalThis.__tilefinchRecordEventHandler();
-            globalThis.__tilefinchRunTask(
-              "worker:" + String(type), handler, owner, [event]);
-          } catch (error) {
-            globalThis.__tilefinchReportUncaught(
-              error, "worker " + String(type));
-          }
         if (!event.__stopped) {
           globalThis.__tilefinchInvokeListenerList(
-            state.listeners, owner, event, true);
+            state.listeners, owner, event, true, state.errorObserver);
           if (!event.__immediateStopped)
             globalThis.__tilefinchInvokeListenerList(
-              state.listeners, owner, event, false);
+              state.listeners, owner, event, false, state.errorObserver);
         }
       } finally {
         event.currentTarget = null;
@@ -136,9 +188,79 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
       error: null,
     })),
     reportWorkerError = (owner, error, url) => {
+      /* The owner's error listener may itself throw and replace the useful
+         diagnostic.  Reuse the validation-only native trace seam to retain
+         the originating Worker exception without exposing it to page code. */
+      traceWorkerMessage("worker-error", {
+        message: String((error && error.message) || error),
+        stack: String((error && error.stack) || "").slice(0, 4096),
+      });
       if (emitWorker(owner, "error", workerErrorEvent(error, url)))
         globalThis.__tilefinchReportUncaught(error, "worker");
+    },
+    workerPerformanceStates = createPrivateWeakMap(),
+    workerPerformanceEntryTypes = Object.freeze([
+      "mark", "measure", "resource",
+    ]),
+    WorkerPerformance = class Performance {
+      constructor() { throw new TypeError("Illegal constructor"); }
+      get timeOrigin() {
+        const state = workerPerformanceStates.get(this);
+        if (!state) throw new TypeError("Illegal invocation");
+        return state.timeOrigin;
+      }
+      now() {
+        const state = workerPerformanceStates.get(this);
+        if (!state) throw new TypeError("Illegal invocation");
+        return Math.max(0, ownerPerformance.now() - state.monotonicOrigin);
+      }
+      mark(name, options) { return ownerPerformance.mark(name, options); }
+      measure(name, start, end) {
+        return ownerPerformance.measure(name, start, end);
+      }
+      getEntries() {
+        return ownerPerformance.getEntries().filter((entry) =>
+          workerPerformanceEntryTypes.includes(entry.entryType));
+      }
+      getEntriesByType(type) {
+        type = String(type);
+        return workerPerformanceEntryTypes.includes(type)
+          ? ownerPerformance.getEntriesByType(type) : [];
+      }
+      getEntriesByName(name, type) {
+        const entries = ownerPerformance.getEntriesByName(name, type);
+        return entries.filter((entry) =>
+          workerPerformanceEntryTypes.includes(entry.entryType));
+      }
+      clearMarks(name) { return ownerPerformance.clearMarks(name); }
+      clearMeasures(name) { return ownerPerformance.clearMeasures(name); }
+      clearResourceTimings() { return ownerPerformance.clearResourceTimings(); }
+      setResourceTimingBufferSize(size) {
+        return ownerPerformance.setResourceTimingBufferSize(size);
+      }
+      toJSON() { return { timeOrigin: this.timeOrigin }; }
+    },
+    createDedicatedWorkerPerformance = () => {
+      const value = Object.create(WorkerPerformance.prototype);
+      workerPerformanceStates.set(value, {
+        timeOrigin: Date.now(),
+        monotonicOrigin: ownerPerformance.now(),
+      });
+      return value;
     };
+  Object.defineProperty(WorkerPerformance.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "Performance",
+  });
+  markNative(WorkerPerformance);
+  for (const key of Reflect.ownKeys(WorkerPerformance.prototype)) {
+    const descriptor = Object.getOwnPropertyDescriptor(
+      WorkerPerformance.prototype, key,
+    );
+    markNative(descriptor?.value);
+    markNative(descriptor?.get);
+    markNative(descriptor?.set);
+  }
   let activeWorkers = 0;
   globalThis.Worker = class Worker extends EventTarget {
     constructor(url) {
@@ -152,6 +274,8 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
       if (!blob) throw new TypeError("only retained blob URLs are supported");
       if (activeWorkers >= 2) throw new RangeError("worker quota exceeded");
       activeWorkers++;
+      let state = null;
+      try {
       const owner = this,
         WorkerGlobalScope = class WorkerGlobalScope extends EventTarget {
           constructor() {
@@ -179,6 +303,10 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
             return Number(ownerNavigator.deviceMemory) || 0.25;
           }
           get userAgentData() { return ownerNavigator.userAgentData; }
+          get connection() { return ownerNavigator.connection; }
+          get permissions() { return ownerNavigator.permissions; }
+          get storage() { return ownerNavigator.storage; }
+          get gpu() { return ownerNavigator.gpu; }
         },
         WorkerLocation = class WorkerLocation {
           constructor() { throw new TypeError("Illegal constructor"); }
@@ -195,16 +323,22 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
           get hash() { return ""; }
           toString() { return this.href; }
         },
-        scope = Object.create(DedicatedWorkerGlobalScope.prototype),
+        scope = Object.create(DedicatedWorkerGlobalScope.prototype);
         state = {
           active: true,
           startTimer: 0,
-          handlers: { message: null, error: null, messageerror: null },
+          handlers: newHandlerSlots(),
+          scopeHandlers: newHandlerSlots(),
           listeners: new Map(),
           scopeListeners: new Map(),
           timers: new Set(),
           scope: null,
+          dispatchType: "",
+          errorObserver: null,
       };
+      state.errorObserver = (error, item, list) =>
+        reportOwnerListenerError(
+          state, state.dispatchType, error, item, list);
       Object.defineProperty(WorkerGlobalScope.prototype, Symbol.toStringTag, {
         configurable: true,
         value: "WorkerGlobalScope",
@@ -240,8 +374,6 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
         }
       }
       workerStates.set(this, state);
-      scope.self = scope;
-      scope.globalThis = scope;
       scope.WorkerGlobalScope = WorkerGlobalScope;
       scope.DedicatedWorkerGlobalScope = DedicatedWorkerGlobalScope;
       scope.WorkerNavigator = WorkerNavigator;
@@ -250,16 +382,24 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
       scope.postMessage = (value) => {
         traceWorkerMessage("worker-to-owner", value);
         const copied = cloneWorkerValue(value);
-        setTimeout(() => emitWorker(
-          owner,
-          "message",
-          trustedEvent(new MessageEvent("message", {
-            data: copied,
-            origin: "",
-            source: null,
-            ports: [],
-          })),
-        ), 0);
+        state.outboundPending = (state.outboundPending || 0) + 1;
+        setTimeout(() => {
+          try {
+            emitWorker(
+              owner,
+              "message",
+              trustedEvent(new MessageEvent("message", {
+                data: copied,
+                origin: "",
+                source: null,
+                ports: [],
+              })),
+            );
+          } finally {
+            state.outboundPending--;
+            finishWorkerClose(state);
+          }
+        }, 0);
       };
       scope.addEventListener = (type, callback, options = false) =>
         globalThis.__tilefinchAddEventListener(
@@ -267,15 +407,55 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
       scope.removeEventListener = (type, callback, options = false) =>
         globalThis.__tilefinchRemoveEventListener(
           state.scopeListeners, type, callback, options);
+      Object.defineProperties(scope, {
+        onmessage: {
+          configurable: true,
+          get() { return state.scopeHandlers.message.value; },
+          set(value) {
+            setEventHandler(
+              state.scopeListeners, state.scope || scope,
+              state.scopeHandlers, "message", value);
+          },
+        },
+        onmessageerror: {
+          configurable: true,
+          get() { return state.scopeHandlers.messageerror.value; },
+          set(value) {
+            setEventHandler(
+              state.scopeListeners, state.scope || scope,
+              state.scopeHandlers, "messageerror", value);
+          },
+        },
+        onerror: {
+          configurable: true,
+          get() { return state.scopeHandlers.error.value; },
+          set(value) {
+            setEventHandler(
+              state.scopeListeners, state.scope || scope,
+              state.scopeHandlers, "error", value);
+          },
+        },
+      });
       scope.crypto = crypto;
-      scope.performance = createWorkerPerformance();
+      scope.performance = createDedicatedWorkerPerformance();
+      scope.Performance = WorkerPerformance;
+      /* Navigation and paint entries belong to Window, not a dedicated
+         worker.  Reuse the bounded observer implementation but expose only
+         the entry kinds present in Chromium workers. */
+      const OwnerPerformanceObserver = globalThis.PerformanceObserver;
+      scope.PerformanceObserver = class PerformanceObserver
+        extends OwnerPerformanceObserver {};
+      Object.defineProperty(
+        scope.PerformanceObserver, "supportedEntryTypes",
+        { value: workerPerformanceEntryTypes, enumerable: true },
+      );
       scope.crossOriginIsolated = false;
       const scheduleWorkerTimer = (callback, delay, repeat, args) => {
           if (typeof callback !== "function") return 0;
           let id = 0;
           const invoke = () => {
             if (!repeat) state.timers.delete(id);
-            if (!state.active) return;
+            if (!state.active || state.closing) return;
             try {
               callback.apply(state.scope, args);
             } catch (error) {
@@ -309,11 +489,56 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
       scope.Headers = Headers;
       scope.Request = Request;
       scope.Response = Response;
-      scope.fetch = fetch;
+      /* Every worker fetch is tied to the worker's lifetime: terminate() and
+         close() abort it. An author-supplied signal still aborts it too. */
+      state.abortController = new AbortController();
+      scope.fetch = (input, init) => {
+        if (!state.active || !state.abortController)
+          return Promise.reject(
+            new DOMException("Worker is terminated", "InvalidStateError"),
+          );
+        const options = Object.assign({}, init || {}),
+          authorSignal = options.signal,
+          controller = new AbortController(),
+          abort = () =>
+            controller.abort(
+              authorSignal && authorSignal.aborted
+                ? authorSignal.reason
+                : state.abortController
+                  ? state.abortController.signal.reason
+                  : undefined,
+            );
+        options.signal = controller.signal;
+        if (authorSignal) {
+          if (authorSignal.aborted) abort();
+          else authorSignal.addEventListener("abort", abort, { once: true });
+        }
+        state.abortController.signal.addEventListener(
+          "abort", abort, { once: true },
+        );
+        const lifetimeSignal = state.abortController.signal,
+          cleanup = () => {
+            lifetimeSignal.removeEventListener("abort", abort);
+            if (authorSignal)
+              authorSignal.removeEventListener("abort", abort);
+          };
+        try {
+          return fetch(input, options).then(
+            value => { cleanup(); return value; },
+            error => { cleanup(); throw error; },
+          );
+        } catch (error) { cleanup(); throw error; }
+      };
       scope.atob = atob;
       scope.btoa = btoa;
       scope.structuredClone = structuredClone;
-      scope.queueMicrotask = queueMicrotask;
+      scope.queueMicrotask = callback => {
+        if (typeof callback !== "function")
+          throw new TypeError("microtask callback must be callable");
+        queueMicrotask(() => {
+          if (state.active && !state.closing) callback();
+        });
+      };
       const workerLanguages = Object.freeze(
           Array.from(ownerNavigator.languages || []).slice(0, 8),
         ),
@@ -333,28 +558,64 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
         "localStorage",
         "sessionStorage",
         "customElements",
+        "Window",
         "screen",
         "visualViewport",
         "opener",
         "frameElement",
+        "speechSynthesis",
+        "SpeechSynthesis",
+        "SpeechSynthesisVoice",
+        "SpeechSynthesisEvent",
+        "SpeechSynthesisErrorEvent",
+        "SpeechSynthesisUtterance",
       ]);
-      const proxy = new Proxy(scope, {
+      /* The worker runs in its own realm (see createWorkerRealmNative).
+         Names it does not define resolve, read-only, to the owner's
+         globals through this fallback deep in the prototype chain — never
+         to window-only surfaces — so `console`, `crypto`, `Event` and the
+         lazily installed constructors keep working while `this`,
+         `self` and `globalThis` are one genuine worker global. */
+      const fallback = new Proxy(Object.create(EventTarget.prototype), {
         has(target, key) {
           return (
             key in target ||
-            (!windowOnlyGlobals.has(key) && key in globalThis)
+            (typeof key === "string" && !windowOnlyGlobals.has(key) &&
+              key in globalThis)
           );
         },
-        get(target, key) {
-          if (key in target) return target[key];
-          return windowOnlyGlobals.has(key) ? undefined : globalThis[key];
+        get(target, key, receiver) {
+          if (key in target) return Reflect.get(target, key, receiver);
+          return typeof key === "string" && !windowOnlyGlobals.has(key)
+            ? globalThis[key]
+            : undefined;
         },
-        set(target, key, value) {
-          target[key] = value;
-          return true;
+        set(target, key, value, receiver) {
+          return Reflect.defineProperty(receiver, key, {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
         },
       });
-      state.scope = proxy;
+      Object.setPrototypeOf(WorkerGlobalScope.prototype, fallback);
+      /* DedicatedWorkerGlobalScope.close(): messages the worker already
+         posted in this task still reach the owner, further tasks queued to
+         the worker (timers, owner messages) are discarded, and the shutdown
+         itself runs once every task-0 timer queued before it has drained. */
+      scope.close = () => {
+        if (!state.active || state.closing) return;
+        state.closing = true;
+        /* Shut down once the closing task has ended and every message
+           the worker posted (before or after close()) has reached the
+           owner. Timer order alone cannot express that: a zero-delay
+           timer scheduled during a drain may run in the same pass. */
+        setTimeout(() => {
+          state.closeTaskEnded = true;
+          finishWorkerClose(state);
+        }, 0);
+      };
       scope.importScripts = (...urls) => {
         if (!state.active)
           throw new DOMException("Worker is terminated", "InvalidStateError");
@@ -368,63 +629,83 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
               "Worker script could not be loaded", "NetworkError",
             );
           const importedSource = workerSourceForBlob(importedBlob);
-          runWorkerNative(proxy, importedSource, importedURL);
+          runWorkerNative(state.realm, importedSource, importedURL);
         }
       };
-      try {
+      scope.__tilefinchWorkerMeta = { url: workerURL };
+      scope.__tilefinchWorkerImport = (specifier) =>
+        new Promise((resolve, reject) => {
+          let tries = 0;
+          const attempt = () => {
+            if (!state.active || state.closing) return;
+            import(String(specifier)).then(resolve, (error) => {
+              if (!state.active || state.closing) return;
+              if (++tries >= 40) reject(error);
+              else scope.setTimeout(attempt, 100);
+            });
+          };
+          scope.setTimeout(attempt, 400);
+        });
+      state.realm = createWorkerRealmNative(
+        scope, DedicatedWorkerGlobalScope.prototype);
+      /* A fresh QuickJS global stringifies as [object global]; the worker
+         global must present as its scope interface. */
+      Object.defineProperty(state.realm, Symbol.toStringTag, {
+        value: "DedicatedWorkerGlobalScope",
+        configurable: true,
+      });
+      state.scope = state.realm;
         const source = workerSourceForBlob(blob);
-        scope.__tilefinchWorkerMeta = { url: workerURL };
         /* Snapshot the retained Blob before revokeObjectURL can remove its URL,
            then compile/evaluate on the next task turn. */
         state.startTimer = setTimeout(() => {
           state.startTimer = 0;
           if (!state.active) return;
           try {
-            runWorkerNative(proxy, source, workerURL);
+            runWorkerNative(state.realm, source, workerURL);
           } catch (error) {
-            if (globalThis.console && console.log)
-              console.log(
-                "tilefinch-worker-error: " +
-                  String(error) +
-                  " || " +
-                  String((error && error.stack) || ""),
-              );
             reportWorkerError(this, error, workerURL);
           }
         }, 0);
       } catch (error) {
-        state.active = false;
         activeWorkers--;
-        state.listeners.clear();
-        state.scope = null;
+        if (state) state.active = false;
+        if (state?.realm) {
+          try {
+            destroyWorkerRealmNative(state.realm);
+          } catch (_) {}
+          state.realm = null;
+        }
+        state?.listeners.clear();
+        if (state) state.scope = null;
         workerStates.delete(this);
         throw error;
       }
     }
     get onmessage() {
-      return workerStates.get(this)?.handlers.message || null;
+      return workerStates.get(this)?.handlers.message.value || null;
     }
     set onmessage(value) {
       const state = workerStates.get(this);
       if (!state) throw new TypeError("Illegal invocation");
-      state.handlers.message = typeof value === "function" ? value : null;
+      setEventHandler(state.listeners, this, state.handlers, "message", value);
     }
     get onerror() {
-      return workerStates.get(this)?.handlers.error || null;
+      return workerStates.get(this)?.handlers.error.value || null;
     }
     set onerror(value) {
       const state = workerStates.get(this);
       if (!state) throw new TypeError("Illegal invocation");
-      state.handlers.error = typeof value === "function" ? value : null;
+      setEventHandler(state.listeners, this, state.handlers, "error", value);
     }
     get onmessageerror() {
-      return workerStates.get(this)?.handlers.messageerror || null;
+      return workerStates.get(this)?.handlers.messageerror.value || null;
     }
     set onmessageerror(value) {
       const state = workerStates.get(this);
       if (!state) throw new TypeError("Illegal invocation");
-      state.handlers.messageerror =
-        typeof value === "function" ? value : null;
+      setEventHandler(
+        state.listeners, this, state.handlers, "messageerror", value);
     }
     addEventListener(type, callback, options = false) {
       const state = workerStates.get(this);
@@ -445,7 +726,7 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
       traceWorkerMessage("owner-to-worker", value);
       const copied = cloneWorkerValue(value);
       setTimeout(() => {
-        if (!state.active) return;
+        if (!state.active || state.closing) return;
         const event = trustedEvent(new MessageEvent("message", {
           data: copied,
           origin: "",
@@ -457,14 +738,6 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
         event.currentTarget = state.scope;
         event.eventPhase = Event.AT_TARGET;
         try {
-          const handler = state.scope.onmessage;
-          if (typeof handler === "function")
-            try {
-              globalThis.__tilefinchRunTask(
-                "worker-scope-message", handler, state.scope, [event]);
-            } catch (error) {
-              reportWorkerError(this, error, workerURL);
-            }
           if (!event.__stopped) {
             globalThis.__tilefinchInvokeListenerList(
               state.scopeListeners, state.scope, event, true);
@@ -483,20 +756,45 @@ globalThis.__tilefinchInstallWorker = (runWorkerNative, traceWorkerNative) => {
     terminate() {
       const state = workerStates.get(this);
       if (!state) throw new TypeError("Illegal invocation");
-      if (!state.active) return;
-      state.active = false;
-      activeWorkers--;
-      if (state.startTimer) {
-        clearTimeout(state.startTimer);
-        state.startTimer = 0;
-      }
-      for (const id of state.timers) clearTimeout(id);
-      state.timers.clear();
-      state.listeners.clear();
-      state.scopeListeners.clear();
-      state.scope = null;
+      shutdownWorkerState(state);
     }
   };
+  /* Shared by Worker.terminate() and DedicatedWorkerGlobalScope.close().
+     Besides timers and listeners, abort every fetch the worker started so
+     its continuations stop consuming the page's callback and network
+     budgets after termination. */
+  function finishWorkerClose(state) {
+    if (state.closing && state.closeTaskEnded && !(state.outboundPending > 0))
+      shutdownWorkerState(state);
+  }
+  function shutdownWorkerState(state) {
+    if (!state.active) return;
+    state.active = false;
+    activeWorkers--;
+    if (state.realm) {
+      try {
+        destroyWorkerRealmNative(state.realm);
+      } catch (_) {}
+      state.realm = null;
+    }
+    if (state.startTimer) {
+      clearTimeout(state.startTimer);
+      state.startTimer = 0;
+    }
+    for (const id of state.timers) clearTimeout(id);
+    state.timers.clear();
+    state.listeners.clear();
+    state.scopeListeners.clear();
+    if (state.abortController) {
+      try {
+        state.abortController.abort(
+          new DOMException("Worker is terminated", "AbortError"),
+        );
+      } catch (_) {}
+      state.abortController = null;
+    }
+    state.scope = null;
+  }
   Object.defineProperty(globalThis.Worker.prototype, Symbol.toStringTag, {
     configurable: true,
     value: "Worker",

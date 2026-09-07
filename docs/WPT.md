@@ -44,7 +44,7 @@ be updated deliberately rather than hidden by a permissive runner.
 | Lane | Runner | Main surface |
 |---|---|---|
 | compact report card | `run-web-platform-correctness.sh` | small repository-owned HTML/CSS/DOM gate |
-| selected upstream | `run-upstream-wpt.py` with `selected.tsv` | core HTML, cascade, layout, and rendering |
+| selected upstream | `run_upstream_wpt.py` with `selected.tsv` | core HTML, cascade, layout, and rendering |
 | expanded | `run-upstream-wpt-expanded.sh` | broad CSS and HTML correctness |
 | DOM interaction | `run-upstream-wpt-dom-interaction.sh` | focus, forms, selection, events, navigation |
 | text flow | `run-upstream-wpt-text-flow.sh` | inline layout, wrapping, decoration, writing behavior |

@@ -1,0 +1,25 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width">
+<title>Section interaction qualification</title>
+<style>
+/* Keep the disclosure label below native chrome in validation captures. */
+body { margin: 48px 8px 8px; font: 16px sans-serif; }
+summary { padding: 6px; border: 1px solid #777; }
+summary:focus { outline: 2px solid #3366cc; }
+p { margin: 8px 0; }
+</style>
+<details id="section"><summary>Open article section</summary><div id="content"></div></details>
+<p>Content after the section</p>
+<script>
+// Bounded setup before first committed paint, not timed input work. This
+// qualifies real disclosure layout on a long section, not a hidden no-op.
+const content = document.getElementById('content');
+for (let i = 0; i < 200; i++) {
+  const paragraph = document.createElement('p');
+  paragraph.textContent = 'Article paragraph ' + i + '. This section expands in normal document flow, moving the following content down the page.';
+  content.appendChild(paragraph);
+}
+let ticks = 0;
+function pendingWork() { if (++ticks < 80) setTimeout(pendingWork, 100); }
+setTimeout(pendingWork, 100);
+</script>

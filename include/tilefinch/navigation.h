@@ -88,6 +88,12 @@ typedef struct {
     bool client_hint_retried;
     bool loaded;
     bool retired;
+    /* content_generation + 1 and node_count of this frame's document when
+       nested-frame discovery last walked it; a zero generation means never
+       walked. Node count catches parser-appended frames, which do not
+       bump the script-mutation generation. */
+    uint64_t discovery_generation;
+    size_t discovery_node_count;
     bool opaque_origin;
     bool presentation_dirty;
 } NavigationFrame;
@@ -172,16 +178,20 @@ typedef struct {
     FetchScheduler *resource_scheduler;
     /* Optional visual resources continue only from owner idle ticks. The
        legacy full-document continuation is stateless; simple static pages
-       additionally retain a bounded viewport-ordered document-image queue
-       whose one active request is externally pumped. */
+       additionally retain a bounded viewport-ordered document-image queue.
+       Streaming mutable pages use that queue for ordinary img elements,
+       with weak handles and source-generation checks across author turns.
+       Its one active, at-most-two-target job is externally pumped. */
     bool image_continuation_pending;
     ImagePriorityTarget *deferred_image_targets;
     size_t deferred_image_count;
     size_t deferred_image_cursor;
     ImagePriorityLoadJob *deferred_image_job;
     uint8_t deferred_image_batch_count;
+    uint8_t deferred_image_publication_age;
     int deferred_image_rank_scroll_y;
     bool deferred_image_rank_valid;
+    size_t deferred_image_eligible_end;
     bool loaded;
     /* Monotonic successful-commit boundary. Recovery settle windows begin
        here rather than at request start, so a slow fetch cannot consume the
@@ -189,6 +199,11 @@ typedef struct {
     uint64_t committed_us;
     NavigationFrame frames[NAVIGATION_FRAME_LIMIT];
     size_t frame_count;
+    /* document.content_generation + 1 and node_count when top-level frame
+       discovery last walked the page; a zero generation means never
+       walked. Node count catches parser-appended frames. */
+    uint64_t frame_discovery_generation;
+    size_t frame_discovery_node_count;
     long discovered_frame_handles[NAVIGATION_FRAME_DISCOVERY_LIMIT];
     ScriptRuntime *discovered_frame_runtimes[
         NAVIGATION_FRAME_DISCOVERY_LIMIT];
@@ -386,6 +401,7 @@ typedef struct {
     size_t progressive_layout_skips;
     size_t progressive_layout_failures;
     size_t progressive_layout_adoptions;
+    size_t static_image_layout_adoptions;
     size_t progressive_visual_readiness_skips;
     size_t streaming_preview_checks;
     size_t streaming_preview_attempts;
@@ -493,6 +509,10 @@ struct NavigationSession {
     bool compiled_stylesheet_cache_ready;
     uint64_t generation;
     bool cancelled;
+    /* The most recent layout build stopped at a cooperate checkpoint rather
+       than being refused. Owners of optional work (web fonts) retry such a
+       build later instead of marking the work failed. */
+    bool layout_build_cancelled;
     size_t loads_started;
     size_t loads_committed;
     size_t loads_cancelled;
@@ -796,26 +816,8 @@ bool navigation_set_replacement_hooks(
 bool navigation_rebind_top_level_remote_document(
     NavigationSession *session,
     const ScriptRemoteDocumentBinding *binding);
-void navigation_set_remote_element_lookup(
-    NavigationSession *session, ScriptRemoteElementLookupCallback callback,
-    void *opaque);
 void navigation_set_remote_selector_lookup(
     NavigationSession *session, ScriptRemoteSelectorLookupCallback callback,
-    void *opaque);
-void navigation_set_remote_selector_collect(
-    NavigationSession *session, ScriptRemoteSelectorCollectCallback callback,
-    void *opaque);
-void navigation_set_remote_descendant_collect(
-    NavigationSession *session,
-    ScriptRemoteDescendantCollectCallback callback, void *opaque);
-void navigation_set_remote_node_read(
-    NavigationSession *session, ScriptRemoteNodeReadCallback callback,
-    void *opaque);
-void navigation_set_remote_node_write(
-    NavigationSession *session, ScriptRemoteNodeWriteCallback callback,
-    void *opaque);
-void navigation_set_node_visibility(
-    NavigationSession *session, ScriptNodeVisibilityCallback callback,
     void *opaque);
 bool navigation_set_runtime_section_identity(NavigationSession *session,
                                              size_t section_identity);
@@ -852,8 +854,6 @@ void navigation_apply_user_css_commit(
     NavigationSession *session, NavigationUserCssTransaction *transaction);
 bool navigation_apply_user_css_rollback(
     NavigationSession *session, NavigationUserCssTransaction *transaction);
-bool navigation_apply_user_css(NavigationSession *session, const char *css,
-                               size_t length);
 /* Accept resource-bearing DOM installed by a trusted native transform (for
    example the bounded Reader clone). Author JavaScript must never call this:
    it deliberately advances the mutation fingerprint without fetching. */
@@ -1067,6 +1067,12 @@ bool navigation_dispatch_node_activation(NavigationSession *session,
    its retained layout are consulted. */
 bool navigation_activate_frame(NavigationSession *session,
                                lxb_dom_node_t *frame_element);
+/* Route a browser-owned pointer click into a loaded child browsing context.
+   Coordinates are CSS pixels relative to the iframe content box. Cross-origin
+   DOM remains opaque to the page; hit testing and dispatch stay native. */
+bool navigation_activate_frame_at(NavigationSession *session,
+                                  lxb_dom_node_t *frame_element,
+                                  int offset_x, int offset_y);
 bool navigation_dispatch_node_pointer(
     NavigationSession *session, lxb_dom_node_t *node, unsigned phase,
     int client_x, int client_y, int offset_x, int offset_y,

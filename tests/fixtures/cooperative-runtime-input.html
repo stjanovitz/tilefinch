@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Cooperative runtime input</title>
+<style>body{background:#eef3f8;color:#152637;font:18px sans-serif}a{display:block;margin:8px;color:#164b8e}</style>
+<h1>Runtime work, live input</h1>
+<p>The links remain available while bounded timer tasks run.</p>
+<a href="#one">First link</a><a href="#two">Second link</a>
+<a href="#three">Third link</a><a href="#four">Fourth link</a>
+<script>
+// Deterministic bounded VM work, without network, DOM mutations or raster
+// work after initial paint. Busy input can only qualify the runtime scope.
+var runtimeInputTasks = 0, runtimeInputChecksum = 1;
+function runtimeInputWork() {
+  var checksum = runtimeInputChecksum;
+  for (var i = 0; i < 120000; ++i)
+    checksum = ((checksum * 33) ^ i) | 0;
+  runtimeInputChecksum = checksum;
+  if (++runtimeInputTasks < 80) setTimeout(runtimeInputWork, 1);
+}
+setTimeout(runtimeInputWork, 1);
+</script>

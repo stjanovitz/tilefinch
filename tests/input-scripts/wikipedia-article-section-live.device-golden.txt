@@ -1,0 +1,28 @@
+tilefinch-input-script: text-entry=danzeff
+tilefinch-input-script: armed script=input-script.txt steps=13 stall-limit=1800
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=section-before step=3 screen=page
+tilefinch-input-script: action=activate setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=section-after step=8 screen=page
+tilefinch-input-script: action=page-down setting=none screen=page list=0 tab=0
+tilefinch-input-script: mark=section-content step=11 screen=page
+tilefinch-input-script: covered action=activate count=1
+tilefinch-input-script: covered action=page-down count=16
+tilefinch-input-script: outcome=complete steps=12/13 frames=82 held-frames=17 actions=2 settings=0
+tilefinch-input-script: capture=section-before written=1 size=240x136
+tilefinch-input-script: capture=section-after written=1 size=240x136
+tilefinch-input-script: capture=section-content written=1 size=240x136

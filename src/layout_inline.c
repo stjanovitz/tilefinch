@@ -77,16 +77,22 @@ typedef struct {
 
 typedef struct {
     const Stylesheet *sheet;
-    lxb_dom_node_t *target;
-    PseudoElement pseudo;
     const char *name;
     GeneratedCounter stack[GENERATED_COUNTER_STACK_LIMIT];
     size_t count;
-    size_t visits;
-    int values[GENERATED_COUNTER_STACK_LIMIT];
-    size_t value_count;
-    bool found;
 } GeneratedCounterWalk;
+
+/* One optional layout-owned cursor, not one cache per name or DOM node.
+   It snapshots the prefix BEFORE pseudo operations. Repeated measurements,
+   reverse-order layout and alternating names must never inherit a pseudo's
+   increment/reset or a different counter's stack. */
+typedef struct LayoutCounterCursor {
+    GeneratedCounterWalk walk;
+    char name[32];
+    size_t entry_counts[64];
+    size_t next;
+    unsigned previous_depth;
+} LayoutCounterCursor;
 
 static bool counter_name_equal(const char *left, const char *right)
 {
@@ -147,67 +153,131 @@ static void generated_counter_apply(
     }
 }
 
-static bool generated_counter_visit(
-    GeneratedCounterWalk *walk, lxb_dom_node_t *node,
+static void generated_counter_index_visit(
+    LayoutContext *context, lxb_dom_node_t *node,
     const ComputedStyle *parent, unsigned depth)
 {
-    if (walk->found || node == NULL || depth >= 64
-        || ++walk->visits > GENERATED_COUNTER_NODE_LIMIT) return walk->found;
-    ComputedStyle style = style_for_node(walk->sheet, node, parent);
-    size_t entry_count = walk->count;
-    if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-        generated_counter_apply(
-            walk, style.counter_reset_id, style.counter_set_id,
-            style.counter_increment_id);
-        if (node == walk->target) {
-            ComputedStyle pseudo = style_for_pseudo(
-                walk->sheet, node, walk->pseudo, &style);
-            generated_counter_apply(
-                walk, pseudo.counter_reset_id, pseudo.counter_set_id,
-                pseudo.counter_increment_id);
-            walk->value_count = 0;
-            for (size_t i = 0; i < walk->count; i++) {
-                if (counter_name_equal(walk->stack[i].name, walk->name)) {
-                    walk->values[walk->value_count++] =
-                        walk->stack[i].value;
-                }
-            }
-            walk->found = true;
-            walk->count = entry_count;
-            return true;
+    if (node == NULL || depth >= 64 || context->cancelled
+        || context->counter_entries_bounded_out
+        || !layout_cooperate(context, node)) return;
+    ComputedStyle style = style_for_node(context->sheet, node, parent);
+    /* display:none creates no counters, including in its descendants.
+       In particular, collapsed article sections are not counter prefixes. */
+    if (style.display == DISPLAY_NONE) return;
+    if (context->counter_entry_count == context->counter_entry_capacity) {
+        size_t capacity = context->counter_entry_capacity;
+        size_t next = capacity > GENERATED_COUNTER_NODE_LIMIT / 2u
+            ? GENERATED_COUNTER_NODE_LIMIT : capacity * 2u;
+        LayoutCounterEntry *grown = next > capacity
+            ? budget_realloc(context->layout->budget, context->counter_entries,
+                             next * sizeof(*grown)) : NULL;
+        if (grown == NULL) {
+            context->counter_entries_bounded_out = true;
+            return;
         }
+        context->counter_entries = grown;
+        context->counter_entry_capacity = next;
     }
+    LayoutCounterEntry *entry =
+        &context->counter_entries[context->counter_entry_count++];
+    *entry = (LayoutCounterEntry) {
+        .node = node, .depth = (uint8_t) depth,
+        .reset_id = style.counter_reset_id,
+        .set_id = style.counter_set_id,
+        .increment_id = style.counter_increment_id
+    };
     for (lxb_dom_node_t *child = node->first_child;
-         child != NULL && !walk->found; child = child->next) {
+         child != NULL && !context->cancelled
+             && !context->counter_entries_bounded_out;
+         child = child->next) {
         if (child->type == LXB_DOM_NODE_TYPE_ELEMENT) {
-            (void) generated_counter_visit(walk, child, &style, depth + 1);
+            generated_counter_index_visit(context, child, &style, depth + 1);
         }
     }
-    walk->count = entry_count;
-    return walk->found;
 }
 
 static size_t generated_counter_values(
-    const Stylesheet *sheet, lxb_dom_node_t *node, PseudoElement pseudo,
+    LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *pseudo,
     const char *name, int *values, size_t capacity)
 {
-    if (sheet == NULL || node == NULL || name == NULL || name[0] == '\0'
+    const Stylesheet *sheet = context->sheet;
+    if (context->cancelled || sheet == NULL || node == NULL || name == NULL || name[0] == '\0'
         || values == NULL || capacity == 0) return 0;
-    lxb_dom_node_t *root = node;
-    while (root->parent != NULL) root = root->parent;
-    GeneratedCounterWalk walk = {
-        .sheet = sheet,
-        .target = node,
-        .pseudo = pseudo,
-        .name = name,
-        .stack = {{.name = name, .value = 0}},
-        .count = 1
+    if (!context->counter_entries_prepared) {
+        context->counter_entries_prepared = true;
+        /* Parse-time count is only a starting estimate: script mutations
+           grow this index geometrically under the same 4096-node ceiling. */
+        size_t count = context->document->element_count;
+        count = count < GENERATED_COUNTER_NODE_LIMIT
+            ? count + 1u : GENERATED_COUNTER_NODE_LIMIT;
+        context->counter_entries = budget_calloc(
+            context->layout->budget, count, sizeof(LayoutCounterEntry));
+        if (context->counter_entries != NULL) {
+            context->counter_entry_capacity = count;
+            lxb_dom_node_t *root = lxb_dom_interface_node(
+                context->document->html);
+            generated_counter_index_visit(context, root, NULL, 0);
+            context->counter_cursor = budget_calloc(context->layout->budget,
+                1, sizeof(*context->counter_cursor));
+        }
+        /* Refusal or a bounded-out target degrades its generated number to
+           zero, once, rather than retrying an expensive tree walk per label. */
+    }
+    /* The index deliberately stops at its admitted node limit. A generated
+       label outside it has no counter prefix: reject that lookup before
+       replaying thousands of operations/cooperation calls to discover the
+       same miss. The pointer-only scan is bounded by the index ceiling and
+       cannot execute page code or allocate. */
+    size_t target = 0;
+    while (target < context->counter_entry_count
+           && context->counter_entries[target].node != node) target++;
+    if (target == context->counter_entry_count) {
+        values[0] = 0;
+        return 1;
+    }
+    LayoutCounterCursor cursor = {
+        .walk = {
+            .sheet = sheet, .name = name,
+            .stack = {{.name = name, .value = 0}}, .count = 1
+        }
     };
-    (void) generated_counter_visit(&walk, root, NULL, 0);
-    size_t count = walk.found ? walk.value_count : 1;
-    if (count > capacity) count = capacity;
-    if (walk.found) memcpy(values, walk.values, count * sizeof(*values));
-    else values[0] = 0;
+    if (context->counter_cursor != NULL
+        && context->counter_cursor->next <= target + 1u
+        && counter_name_equal(context->counter_cursor->walk.name, name)) {
+        cursor = *context->counter_cursor;
+    }
+    GeneratedCounterWalk *walk = &cursor.walk;
+    /* name comes from the generated-expression parser's stack. Only the
+       cursor's owned copy (and stylesheet operation names) may outlive us. */
+    walk->name = name;
+    walk->stack[0].name = name;
+    for (size_t i = cursor.next; i <= target; i++) {
+        const LayoutCounterEntry *entry = &context->counter_entries[i];
+        if (!layout_cooperate(context, entry->node)) {
+            values[0] = 0;
+            return 1;
+        }
+        if (i != 0 && entry->depth <= cursor.previous_depth) {
+            walk->count = cursor.entry_counts[entry->depth];
+        }
+        cursor.entry_counts[entry->depth] = walk->count;
+        cursor.previous_depth = entry->depth;
+        generated_counter_apply(
+            walk, entry->reset_id, entry->set_id, entry->increment_id);
+    }
+    cursor.next = target + 1u;
+    if (context->counter_cursor != NULL && strlen(name) < sizeof(cursor.name)) {
+        *context->counter_cursor = cursor;
+        LayoutCounterCursor *saved = context->counter_cursor;
+        memcpy(saved->name, name, strlen(name) + 1u);
+        saved->walk.name = saved->name;
+        saved->walk.stack[0].name = saved->name;
+    }
+    generated_counter_apply(walk, pseudo->counter_reset_id,
+                            pseudo->counter_set_id,
+                            pseudo->counter_increment_id);
+    size_t count = walk->count < capacity ? walk->count : capacity;
+    for (size_t j = 0; j < count; j++) values[j] = walk->stack[j].value;
     return count;
 }
 
@@ -356,12 +426,11 @@ static ListStyleType generated_counter_style(
 }
 
 static void resolve_generated_expression(
-    LayoutContext *context, lxb_dom_node_t *node, PseudoElement pseudo,
+    LayoutContext *context, lxb_dom_node_t *node,
     ComputedStyle *style, char *output, size_t capacity)
 {
     if (context == NULL || style == NULL || !style->generated_expression
         || style->generated_text == NULL || capacity == 0) return;
-    const Stylesheet *sheet = context->sheet;
     const char *at = style->generated_text;
     size_t written = 0;
     output[0] = '\0';
@@ -435,7 +504,7 @@ static void resolve_generated_expression(
                     name[name_length] = '\0';
                     int values[GENERATED_COUNTER_STACK_LIMIT];
                     size_t count = generated_counter_values(
-                        sheet, node, pseudo, name, values,
+                        context, node, style, name, values,
                         GENERATED_COUNTER_STACK_LIMIT);
                     const char *style_text = NULL;
                     size_t style_length = 0;
@@ -451,8 +520,6 @@ static void resolve_generated_expression(
                                        || *argument == '"')) {
                             separator_length = style_decode_generated_text(
                                 argument, separator, sizeof(separator));
-                            const char *separator_end =
-                                generated_function_end(argument);
                             char quote = *argument++;
                             while (argument < end) {
                                 if (*argument == '\\'
@@ -468,7 +535,6 @@ static void resolve_generated_expression(
                                 style_length = (size_t) (
                                     end - 1 - style_text);
                             }
-                            (void) separator_end;
                         } else {
                             style_text = argument;
                             style_length = (size_t) (end - 1 - argument);
@@ -541,11 +607,12 @@ GeneratedPseudoFlow generated_pseudo_flow(
     const ComputedStyle *parent, PseudoElement pseudo,
     int width, int containing_height)
 {
-    ComputedStyle style = style_for_pseudo(context->sheet, node, pseudo,
+    ComputedStyle style = layout_style_for_pseudo(context, node, pseudo,
                                            parent);
+    if (!style.generated_content) return (GeneratedPseudoFlow) {0};
     char generated_text[STYLE_GENERATED_TEXT_CAPACITY];
     resolve_generated_expression(
-        context, node, pseudo, &style,
+        context, node, &style,
         generated_text, sizeof(generated_text));
     resolve_padding(context->sheet, &style, width);
     const char *trace_class = context->layout->trace_pseudo_class;
@@ -684,11 +751,12 @@ int generated_inline_pseudo_width(LayoutContext *context,
                                   const ComputedStyle *parent,
                                   PseudoElement pseudo)
 {
-    ComputedStyle style = style_for_pseudo(context->sheet, node, pseudo,
+    ComputedStyle style = layout_style_for_pseudo(context, node, pseudo,
                                            parent);
+    if (!style.generated_content) return 0;
     char generated_text[STYLE_GENERATED_TEXT_CAPACITY];
     resolve_generated_expression(
-        context, node, pseudo, &style,
+        context, node, &style,
         generated_text, sizeof(generated_text));
     if (!style.generated_content || style.display == DISPLAY_NONE
         || style.hidden || style.out_of_flow || style.fixed_position
@@ -738,11 +806,12 @@ bool flow_generated_inline_pseudo(LayoutContext *context,
                                   lxb_dom_node_t *link_node, bool *flowed)
 {
     if (flowed != NULL) *flowed = false;
-    ComputedStyle style = style_for_pseudo(context->sheet, node, pseudo,
+    ComputedStyle style = layout_style_for_pseudo(context, node, pseudo,
                                            parent);
+    if (!style.generated_content) return true;
     char generated_text[STYLE_GENERATED_TEXT_CAPACITY];
     resolve_generated_expression(
-        context, node, pseudo, &style,
+        context, node, &style,
         generated_text, sizeof(generated_text));
     if (!style.generated_content || style.display == DISPLAY_NONE
         || style.hidden) return true;
@@ -825,13 +894,14 @@ bool paint_pseudo(LayoutContext *context, lxb_dom_node_t *node,
                          int x, int y, int width, int height,
                          size_t insertion_index, int forced_border_height)
 {
-    ComputedStyle style = style_for_pseudo(context->sheet, node, pseudo,
+    ComputedStyle style = layout_style_for_pseudo(context, node, pseudo,
                                            parent);
+    if (!style.generated_content) return true;
     int border_radius_code = stylesheet_border_radius_code(
         context->sheet, &style);
     char generated_text[STYLE_GENERATED_TEXT_CAPACITY];
     resolve_generated_expression(
-        context, node, pseudo, &style,
+        context, node, &style,
         generated_text, sizeof(generated_text));
     resolve_padding(context->sheet, &style, width);
     if (!style.generated_content || style.display == DISPLAY_NONE
@@ -1815,11 +1885,12 @@ static bool unicode_line_break_opening(unsigned codepoint)
     }
 }
 
-size_t utf8_line_segment_length(const char *text, size_t available,
-                                bool keep_cjk_together, bool hyphens_none,
-                                bool *discard)
+static size_t line_segment_length(const char *text, size_t available,
+                                 bool keep_cjk_together, bool hyphens_none,
+                                 bool *discard, bool *ascii)
 {
     if (discard != NULL) *discard = false;
+    if (ascii != NULL) *ascii = false;
     if (text == NULL || available == 0) return 0;
     unsigned first = 0;
     size_t first_length = font_utf8_next(text, available, &first);
@@ -1832,9 +1903,16 @@ size_t utf8_line_segment_length(const char *text, size_t available,
         return first_length;
     }
     bool ideographic = unicode_line_break_ideograph(first);
+    bool all_ascii = first >= 0x21u && first <= 0x7eu;
     size_t used = first_length;
     bool keep_next = ideographic && unicode_line_break_opening(first);
     while (used < available) {
+        unsigned char byte = (unsigned char) text[used];
+        if (byte >= 0x21u && byte <= 0x7eu
+            && (!ideographic || keep_cjk_together)) {
+            used++;
+            continue;
+        }
         unsigned next = 0;
         size_t next_length = font_utf8_next(
             text + used, available - used, &next);
@@ -1844,20 +1922,32 @@ size_t utf8_line_segment_length(const char *text, size_t available,
             || (next == 0x00adu && !hyphens_none)) break;
         if (unicode_line_break_extender(next)
             || (ideographic && unicode_line_break_closing(next))) {
+            all_ascii = false;
             used += next_length;
             continue;
         }
         if (ideographic && !keep_cjk_together) {
             if (!keep_next) break;
+            all_ascii = false;
             used += next_length;
             keep_next = unicode_line_break_opening(next);
             continue;
         }
         if (!keep_cjk_together
             && unicode_line_break_ideograph(next)) break;
+        all_ascii = all_ascii && next >= 0x21u && next <= 0x7eu;
         used += next_length;
     }
+    if (ascii != NULL) *ascii = all_ascii;
     return used;
+}
+
+size_t utf8_line_segment_length(const char *text, size_t available,
+                               bool keep_cjk_together, bool hyphens_none,
+                               bool *discard)
+{
+    return line_segment_length(text, available, keep_cjk_together,
+                               hyphens_none, discard, NULL);
 }
 
 static bool text_span_has_strong_rtl(const char *text, size_t length)
@@ -1899,6 +1989,9 @@ int measured_text_width_fixed_mode(const FontFace *face,
     int width = font_text_width_for_family_at_size_fixed_mode(
         face, metric_family, text, length, font_size_fixed,
         synthetic_bold, metric_bold, kerning);
+    /* With valid nonnegative advances and no tracking, the character-based
+       minimum cannot exceed width. No second grapheme walk is needed. */
+    if (width >= 0 && letter_spacing == 0) return width;
     /* CSS letter-spacing is inserted between typographic character units,
        not around default-ignorable formatting controls such as bidi marks,
        joiners, or a zero-width break opportunity. The font path already
@@ -2109,6 +2202,7 @@ bool flow_text(LayoutContext *context, LineState *line,
                       const char *link_url, size_t link_url_length,
                       lxb_dom_node_t *link_node)
 {
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_INLINE);
     if (line->text_overflow_ended) return true;
     if (line->clamp_pending) {
         bool visible = false;
@@ -2351,18 +2445,21 @@ bool flow_text(LayoutContext *context, LineState *line,
             line->pending_space = true;
             line->pending_space_letter_spacing = style->letter_spacing;
         }
-        bool discard = false;
-        size_t segment = utf8_line_segment_length(
+        bool discard = false, ascii = false;
+        size_t segment = line_segment_length(
             text + at, length - at,
             computed_style_word_break(style) == WORD_BREAK_KEEP_ALL,
-            computed_style_hyphens_none(style), &discard);
+            computed_style_hyphens_none(style), &discard, &ascii);
         if (segment == 0) break;
         if (discard) {
             at += segment;
             continue;
         }
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PROFILE_LAYOUT_FLOW)
+        context->layout->performance.ascii_text_segments += ascii;
+#endif
         size_t end = at + segment;
-        if (utf8_codepoints(text + at, segment) == 0) {
+        if (!ascii && utf8_codepoints(text + at, segment) == 0) {
             at = end;
             continue;
         }
@@ -2599,7 +2696,7 @@ bool flow_text(LayoutContext *context, LineState *line,
                        << LAYOUT_TEXT_TRANSFORM_SHIFT)
                     | ((computed_style_direction_rtl(style)
                         || (!computed_style_bidi_override(style)
-                            && text_span_has_strong_rtl(
+                            && !ascii && text_span_has_strong_rtl(
                                 text + piece_at,
                                 piece_end - piece_at)))
                        ? LAYOUT_TEXT_RTL : 0),
@@ -2949,17 +3046,6 @@ static bool flow_inline_impl(LayoutContext *context, lxb_dom_node_t *node,
                 style.opacity,
                 (int) id_length, id == NULL ? "" : id,
                 (int) class_length, class_name == NULL ? "" : class_name);
-    }
-    if (LAYOUT_TRACE(context->layout, LAYOUT)) {
-        size_t class_length = 0;
-        const char *class_name = document_attribute(node, "class",
-                                                     &class_length);
-        if (class_name != NULL && strstr(class_name, "wm-") != NULL) {
-            fprintf(stderr, "layout-node class=%.*s display=%d hidden=%d out=%d fixed=%d x=%d y=%d width=%d\n",
-                    (int) class_length, class_name, style.display,
-                    style.hidden, style.out_of_flow, style.fixed_position,
-                    line->x, line->y, line->right - line->start_x);
-        }
     }
     if (style.display == DISPLAY_NONE
         || style.display == DISPLAY_TABLE_COLUMN || style.hidden) return true;

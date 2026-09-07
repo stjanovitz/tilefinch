@@ -365,8 +365,8 @@ static bool test_javascript_credentials(Budget *budget, unsigned port)
                  runtime, cross_redirect_source,
                  "<cross-origin-redirect>", &result)
           && pump_script_network(runtime, &result)
-          && strstr(result.summary, "blocked:TypeError:") != NULL
-          && strstr(result.summary, "redirect") != NULL);
+          && strstr(result.summary, "blocked:TypeError: Failed to fetch")
+                 != NULL);
     script_runtime_destroy(runtime);
     browser_session_destroy(&session);
     document_destroy(&document);
@@ -585,7 +585,7 @@ static bool test_javascript_cors(Budget *budget, unsigned document_port,
           && script_runtime_evaluate_diagnostic(
                  runtime, source, "<cors-preflight-denied>", &result)
           && pump_script_network(runtime, &result)
-          && strstr(result.summary, "blocked:TypeError: CORS preflight failed")
+          && strstr(result.summary, "blocked:TypeError: Failed to fetch")
                  != NULL
           && strstr(result.summary, "exposed:") == NULL);
 

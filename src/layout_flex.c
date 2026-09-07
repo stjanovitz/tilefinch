@@ -449,6 +449,7 @@ static int intrinsic_replaced_width(
 int intrinsic_text_width(LayoutContext *context, lxb_dom_node_t *node,
                                 const ComputedStyle *parent, int limit)
 {
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_INTRINSIC);
     int cached = 0;
     if (context != NULL && node != NULL && limit > 0
         && intrinsic_cache_get(
@@ -971,6 +972,7 @@ static int intrinsic_min_text_width_internal(LayoutContext *context,
                                              int limit,
                                              bool ignore_own_width)
 {
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_INTRINSIC);
     if (context == NULL) return 0;
     int cached = 0;
     if (node != NULL && limit > 0
@@ -1180,28 +1182,6 @@ void intrinsic_text_widths(
     *maximum = intrinsic_text_width(context, node, parent, limit);
     *minimum = intrinsic_min_text_width(context, node, parent, limit);
     if (context != NULL) context->intrinsic_pair_mode = previous;
-}
-
-int grid_required_columns(const ComputedStyle *style, int current_columns)
-{
-    int required = current_columns < 1 ? 1 : current_columns;
-    int start = computed_style_grid_column_start(style);
-    int end = computed_style_grid_column_end(style);
-    int span = computed_style_grid_column_span(style);
-    if (start > 0 && !computed_style_grid_line_is_negative(start)) {
-        int last = start - 1 + (span > 0 ? span : 1);
-        if (end > start && !computed_style_grid_line_is_negative(end)) {
-            last = end - 1;
-        }
-        if (last > required) required = last;
-    } else if (end > 1 && !computed_style_grid_line_is_negative(end)) {
-        int last = end - 1;
-        if (last > required) required = last;
-    } else if (span > required) {
-        required = span;
-    }
-    if (required > GRID_TRACK_LIMIT) required = GRID_TRACK_LIMIT;
-    return required;
 }
 
 void grid_placement_init(GridPlacementState *state, int columns, int rows,

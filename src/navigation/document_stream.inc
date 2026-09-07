@@ -1,17 +1,15 @@
 #define NAVIGATION_SPECULATIVE_RESOURCE_TIMEOUT_MS 5000L
 
 #if !defined(__PSP__)
-static bool navigation_test_stream_scheduler_refusal_pending;
-
 void navigation_test_refuse_next_stream_scheduler_creation(void)
 {
-    navigation_test_stream_scheduler_refusal_pending = true;
+    tilefinch_test_faults()->refuse_next_stream_scheduler = true;
 }
 
 static bool navigation_test_consume_stream_scheduler_refusal(void)
 {
-    bool pending = navigation_test_stream_scheduler_refusal_pending;
-    navigation_test_stream_scheduler_refusal_pending = false;
+    bool pending = tilefinch_test_faults()->refuse_next_stream_scheduler;
+    tilefinch_test_faults()->refuse_next_stream_scheduler = false;
     return pending;
 }
 #endif

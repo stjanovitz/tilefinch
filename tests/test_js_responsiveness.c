@@ -58,6 +58,71 @@ static bool compile_abort_cooperate(void *context, const char *phase,
     }                                                                        \
 } while (0)
 
+typedef struct {
+    uint64_t now_ns;
+    size_t calls;
+} TimedCooperate;
+
+static uint64_t timed_cooperate_clock(void *opaque)
+{
+    return ((TimedCooperate *) opaque)->now_ns;
+}
+
+static bool timed_cooperate_poll(void *opaque, const char *phase, size_t work)
+{
+    (void) phase;
+    (void) work;
+    ((TimedCooperate *) opaque)->calls++;
+    return true;
+}
+
+static JSValue timed_promise_job(JSContext *context, int argc,
+                                 JSValueConst *argv)
+{
+    (void) argc;
+    (void) argv;
+    TimedCooperate *probe = JS_GetContextOpaque(context);
+    probe->now_ns += UINT64_C(10000000);
+    return JS_UNDEFINED;
+}
+
+static int test_watchdog_elapsed_cooperation(void)
+{
+    TimedCooperate probe = { .now_ns = UINT64_C(1000000000) };
+    TilefinchPlatformServices services = { .context = &probe,
+        .monotonic_time_ns = timed_cooperate_clock,
+        .cooperate = timed_cooperate_poll };
+    ScriptRuntime runtime = {0};
+    runtime.runtime = JS_NewRuntime();
+    CHECK(runtime.runtime != NULL);
+    runtime.watchdog.deadline_ms = 100000;
+    runtime.watchdog.slice_started_ns = probe.now_ns;
+    tilefinch_platform_set_services(&services);
+    CHECK(js_rt_runtime_native_checkpoint(&runtime) && probe.calls == 0);
+    probe.now_ns += UINT64_C(8000000);
+    /* Two expensive units must yield without waiting for four polls. */
+    CHECK(js_rt_runtime_native_checkpoint(&runtime) && probe.calls == 1);
+    CHECK(runtime.watchdog.deadline_ms == 100000);
+    for (unsigned at = 0; at < 4; at++)
+        CHECK(js_rt_runtime_native_checkpoint(&runtime));
+    CHECK(probe.calls == 2); /* Cheap units retain the four-poll bound. */
+    Budget budget = {0};
+    runtime.budget = &budget;
+    runtime.context = JS_NewContext(runtime.runtime);
+    CHECK(runtime.context != NULL);
+    JS_SetContextOpaque(runtime.context, &probe);
+    for (unsigned at = 0; at < 3; at++)
+        CHECK(JS_EnqueueJob(runtime.context, timed_promise_job, 0, NULL) == 0);
+    /* Jobs without any VM instruction polls must also service native input. */
+    CHECK(js_rt_runtime_run_jobs(&runtime));
+    CHECK(probe.calls == 4 && !JS_IsJobPending(runtime.runtime));
+    CHECK(runtime.watchdog.deadline_ms == 100000);
+    tilefinch_platform_set_services(NULL);
+    JS_FreeContext(runtime.context);
+    JS_FreeRuntime(runtime.runtime);
+    return 0;
+}
+
 static int test_reduced_dom_event_counter(void)
 {
     JSRuntime *runtime = JS_NewRuntime();
@@ -316,6 +381,58 @@ static bool test_delayed_module_request_contexts(
     return ok;
 }
 
+static int test_computed_style_native_cooperation(void)
+{
+    Budget budget;
+    budget_init(&budget, 12u * MIB);
+    budget_install_lexbor(&budget);
+    static const char html[] =
+        "<!doctype html><style>div{color:red}</style><body>"
+        "<div><div><div><div><div><div><div><div id=probe>Text";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1, 31)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    ViewportContext viewport;
+    ScriptExecutionPolicy policy;
+    CHECK(viewport_context_init(&viewport, 480, 272, 480, 272)
+          && script_execution_policy_for_profile(SCRIPT_EXECUTION_PROFILE_LAB, &policy));
+    ScriptRuntimeOptions options = { .viewport = viewport,
+        .execution_policy = policy, .defer_document_scripts = true };
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_configured(
+        &document, &budget, 6u*MIB, 4000, "https://style.test/", &options, &result);
+    CHECK(runtime != NULL);
+    script_runtime_set_stylesheet(runtime, &sheet);
+    lxb_dom_node_t *node = find_element_id(lxb_dom_interface_node(document.html), "probe");
+    CHECK(node != NULL);
+    JSValue args[2] = {
+        JS_NewInt64(runtime->context, script_runtime_node_handle(runtime, node)),
+        JS_NewString(runtime->context, "color")
+    };
+    CallbackAbortCooperate probe = {0};
+    TilefinchPlatformServices services = { .context = &probe,
+        .cooperate = callback_abort_cooperate };
+    js_rt_runtime_arm_watchdog(runtime);
+    tilefinch_platform_set_services(&services);
+    JSValue value = js_computed_style_get(runtime->context, JS_UNDEFINED, 2, args);
+    tilefinch_platform_set_services(NULL);
+    CHECK(probe.calls == 1 && JS_IsException(value));
+    JSValue exception = JS_GetException(runtime->context);
+    JS_FreeValue(runtime->context, exception);
+    JS_FreeValue(runtime->context, args[0]);
+    JS_FreeValue(runtime->context, args[1]);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.pocSummary=getComputedStyle(document.getElementById('probe')).color",
+        "<style-after-cancel>", &result)
+        && strcmp(result.summary, "rgb(255, 0, 0)") == 0);
+    script_runtime_destroy(runtime);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static int test_native_dynamic_code_policy(void)
 {
 #if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
@@ -412,6 +529,8 @@ static int test_native_dynamic_code_policy(void)
 
 int main(void)
 {
+    CHECK(test_computed_style_native_cooperation() == 0);
+    CHECK(test_watchdog_elapsed_cooperation() == 0);
     CHECK(test_reduced_dom_event_counter() == 0);
     CHECK(test_blank_recovery_author_work_census() == 0);
     CHECK(test_native_dynamic_code_policy() == 0);
@@ -481,7 +600,7 @@ int main(void)
           && lab.modeled_compile_bytes_per_ms == 0);
     CHECK(script_execution_policy_for_profile(
               SCRIPT_EXECUTION_PROFILE_PSP_STRICT, &strict)
-          && strict.maximum_host_compile_source_bytes == 269u * 1024u
+          && strict.maximum_host_compile_source_bytes == 256u * 1024u
           && strict.maximum_host_compile_projected_us == 0
           && strict.modeled_compile_bytes_per_ms == 0);
     CHECK(script_execution_policy_for_profile(
@@ -939,6 +1058,36 @@ int main(void)
         "const cloned=structuredClone(view),dataViewOk="
         "cloned instanceof DataView&&cloned.byteOffset===2"
         "&&cloned.byteLength===3&&cloned.getUint8(0)===41;"
+        "const shared={v:1},graph={left:shared,right:shared,list:[shared]};"
+        "graph.self=graph;const clonedGraph=structuredClone(graph),"
+        "graphOk=clonedGraph.self===clonedGraph&&clonedGraph.left"
+        "===clonedGraph.right&&clonedGraph.list[0]===clonedGraph.left"
+        "&&clonedGraph.left!==shared&&clonedGraph.left.v===1;"
+        "const clonedMap=structuredClone(new Map([['when',new Date(5)],"
+        "['set',new Set([1,2])],['re',/a+/gi]])),mapOk="
+        "clonedMap.get('when').getTime()===5&&clonedMap.get('set').has(2)"
+        "&&clonedMap.get('re').flags==='gi'&&clonedMap.get('re').source"
+        "==='a+';let cloneErrorName='';try{structuredClone({f(){}});}"
+        "catch(error){cloneErrorName=error.name;}"
+        "const sharedBuffer=new ArrayBuffer(4),viewA=new Uint8Array("
+        "sharedBuffer),viewB=new Uint8Array(sharedBuffer,2),clonedViews="
+        "structuredClone({a:viewA,b:viewB});clonedViews.a[3]=9;"
+        "const clonedErr=structuredClone(new RangeError('bounded')),"
+        "cloneOk=graphOk&&mapOk&&cloneErrorName==='DataCloneError'"
+        "&&clonedViews.b[1]===9&&clonedViews.a.buffer!==sharedBuffer"
+        "&&clonedErr instanceof RangeError&&clonedErr.message==='bounded';"
+        "const closingURL=URL.createObjectURL(new Blob([\"postMessage('before')"
+        ";close();postMessage('after');setTimeout(()=>postMessage('late'),0);"
+        "\"])),closing=new Worker(closingURL),closeMessages=[];"
+        "closing.onmessage=event=>closeMessages.push(event.data);"
+        "const libURL=URL.createObjectURL(new Blob([\"function libValue(){return 41}\"])),"
+        "isoURL=URL.createObjectURL(new Blob([\"importScripts(\"+JSON.stringify(libURL)+\");"
+        "const bare=(function(){return this})();"
+        "postMessage([this===self,self===globalThis,typeof window,bare===self,"
+        "typeof document,libValue()+1,typeof console,"
+        "Object.getPrototypeOf(self)===DedicatedWorkerGlobalScope.prototype,"
+        "typeof onmessage])\"])),iso=new Worker(isoURL),isoMessages=[];"
+        "iso.onmessage=event=>isoMessages.push(event.data);"
         "const form=document.createElement('form'),"
         "select=document.createElement('select'),"
         "first=document.createElement('option'),"
@@ -956,14 +1105,22 @@ int main(void)
         "let releaseThrew=false;try{reader.releaseLock()}catch(_){"
         "releaseThrew=true}const pendingName=await pending,streamOk="
         "!releaseThrew&&pendingName==='TypeError'&&!stream.locked;"
-        "globalThis.pocSummary=dataViewOk&&selectOk&&flexOk&&streamOk"
-        "?'COMPATIBILITY-REGRESSIONS-OK':'COMPATIBILITY-REGRESSIONS-FAILED:'"
-        "+JSON.stringify({dataViewOk,selectOk,flexOk,streamOk,flexValue});"
+        "for(let hop=0;hop<8&&(closeMessages.length<2||isoMessages.length<1);hop++)"
+        "await new Promise(resolve=>setTimeout(resolve,0));"
+        "await new Promise(resolve=>setTimeout(resolve,0));"
+        "const closeOk=closeMessages.join(',')==='before,after';"
+        "const isoOk=JSON.stringify(isoMessages[0])===JSON.stringify([true,true,'undefined',true,'undefined',42,'object',true,'object']);"
+        "iso.terminate();URL.revokeObjectURL(closingURL);URL.revokeObjectURL(isoURL);URL.revokeObjectURL(libURL);"
+        "globalThis.pocSummary=dataViewOk&&cloneOk&&closeOk&&isoOk&&selectOk&&flexOk"
+        "&&streamOk?'COMPATIBILITY-REGRESSIONS-OK'"
+        ":'COMPATIBILITY-REGRESSIONS-FAILED:'"
+        "+JSON.stringify({dataViewOk,cloneOk,graphOk,mapOk,cloneErrorName,"
+        "closeOk,closeMessages,isoOk,isoMessages,selectOk,flexOk,streamOk,flexValue});"
         "})().catch(error=>{"
         "globalThis.pocSummary='COMPATIBILITY-REGRESSIONS-ERROR:'+error});";
     bool compatibility_ok = script_runtime_evaluate_diagnostic(
         runtime, compatibility_probe, "<compatibility-regressions>", &result);
-    for (size_t tick = 0; compatibility_ok && tick < 8
+    for (size_t tick = 0; compatibility_ok && tick < 24
          && strncmp(result.summary, "COMPATIBILITY-REGRESSIONS-", 26) != 0;
          tick++) {
         compatibility_ok = script_runtime_advance(runtime, 0, 64, &result);
@@ -1808,8 +1965,20 @@ int main(void)
         "group=document.getElementById('parsed-group'),"
         "made=document.createElementNS(svgNS,'svg'),"
         "path=document.createElementNS(svgNS,'path'),"
+        "rect=document.createElementNS(svgNS,'rect'),"
         "html=document.createElementNS(htmlNS,'div'),"
         "plain=document.createElementNS(null,'widget');made.appendChild(path);"
+        "rect.setAttribute('x','3');rect.setAttribute('y','4');"
+        "rect.setAttribute('width','12');rect.setAttribute('height','7');"
+        "rect.style.cssText='color: red; width: 12px';"
+        "rect.style.setProperty('height','7px');"
+        "const detachedComputed=getComputedStyle(rect);"
+        "made.appendChild(rect);const box=rect.getBBox();"
+        "const text=document.createElementNS(svgNS,'text');"
+        "text.textContent='metric';made.appendChild(text);"
+        "const textLength=text.getComputedTextLength();"
+        "let nonTextRejected=false;try{rect.getComputedTextLength()}"
+        "catch(error){nonTextRejected=error instanceof TypeError}"
         "let namespaceError=false,characterError=false;"
         "try{document.createElementNS(null,'x:item')}catch(error){"
         "namespaceError=error instanceof DOMException"
@@ -1820,17 +1989,31 @@ int main(void)
         "const detached=document.implementation.createDocument(svgNS,'svg'),"
         "detachedRoot=detached.documentElement;"
         "const ok=typeof SVGElement==='function'"
+        "&&typeof SVGGraphicsElement==='function'"
+        "&&typeof SVGGeometryElement==='function'"
+        "&&typeof SVGTextContentElement==='function'"
+        "&&typeof SVGSVGElement==='function'"
         "&&Object.getPrototypeOf(SVGElement.prototype)===Element.prototype"
-        "&&parsed instanceof SVGElement"
+        "&&SVGGraphicsElement.prototype===SVGElement.prototype"
+        "&&SVGTextContentElement.prototype===SVGElement.prototype"
+        "&&parsed instanceof SVGSVGElement"
         "&&parsed instanceof Element&&!(parsed instanceof HTMLElement)"
         "&&parsed.namespaceURI===svgNS&&parsed.tagName==='svg'"
-        "&&group instanceof SVGElement&&group.ownerSVGElement===parsed"
-        "&&made instanceof SVGElement&&path instanceof SVGElement"
+        "&&group instanceof SVGGraphicsElement&&group.ownerSVGElement===parsed"
+        "&&made instanceof SVGSVGElement&&path instanceof SVGGeometryElement"
         "&&path.ownerSVGElement===made&&path.viewportElement===made"
+        "&&rect instanceof SVGGeometryElement&&box instanceof DOMRect"
+        "&&text instanceof SVGTextContentElement"
+        "&&Number.isFinite(textLength)&&textLength>=0&&nonTextRejected"
+        "&&box.x===3&&box.y===4&&box.width===12&&box.height===7"
+        "&&rect.style.getPropertyValue('color')==='red'"
+        "&&rect.style.width==='12px'&&rect.style.height==='7px'"
+        "&&detachedComputed.getPropertyValue('width')==='12px'"
+        "&&detachedComputed.display==='block'"
         "&&html instanceof HTMLDivElement&&!(html instanceof SVGElement)"
         "&&plain instanceof Element&&!(plain instanceof HTMLElement)"
         "&&!(plain instanceof SVGElement)&&plain.namespaceURI===null"
-        "&&detachedRoot instanceof SVGElement"
+        "&&detachedRoot instanceof SVGSVGElement"
         "&&detachedRoot.namespaceURI===svgNS"
         "&&namespaceError&&characterError;"
         "globalThis.pocSummary=ok?'SVG-ELEMENT-OK':'SVG-ELEMENT-FAILED';})()";
@@ -2363,10 +2546,13 @@ int main(void)
     static const char canvas_native_batch_work_bound_probe[] =
         "(()=>{const pixels=new Uint8ClampedArray(512*256*4),"
         "commands=new Float64Array(64*10);"
-        "for(let i=0;i<64;i++)commands.set([0,0,512,256,i===63?255:0,"
-        "i===63?0:255,0,255,1,1],i*10);"
+        "for(let i=0;i<31;i++)commands.set([0,0,512,256,0,255,0,255,1,1],i*10);"
+        "commands.set([0,0,512,255,0,255,0,255,1,1],31*10);"
+        "commands.set([0,0,512,2,255,0,0,255,1,1],32*10);"
+        "for(let i=33;i<64;i++)commands.set([0,0,1,1,255,0,0,255,1,1],i*10);"
         "const completed=__tilefinchCanvasRasterRectBatch(pixels,512,256,commands),"
-        "bounded=pixels[0]===0&&pixels[1]===255,"
+        "bounded=pixels[0]===0&&pixels[1]===255"
+        "&&pixels[512*4]===0&&pixels[512*4+1]===255,"
         "continued=__tilefinchCanvasRasterRect(pixels,512,256,0,0,1,1,"
         "255,0,0,255,1,1);globalThis.pocSummary=completed===2&&bounded&&continued"
         "&&pixels[0]===255&&pixels[3]===255"
@@ -2432,8 +2618,10 @@ int main(void)
     static const char network_queue_probe[] =
         "(async()=>{const nativeFetch=globalThis.__tilefinchFetchAsync,"
         "nativeCancel=globalThis.__tilefinchCancelNetwork,starts=[],cancels=[];"
-        "let nextNative=1000;globalThis.__tilefinchFetchAsync=(method,url)=>{"
-        "starts.push(String(url));return nextNative++;};"
+        "let nextNative=1000,deferNativeOnce=true;"
+        "globalThis.__tilefinchFetchAsync=(method,url)=>{url=String(url);"
+        "if(url.endsWith('/native-defer')&&deferNativeOnce){"
+        "deferNativeOnce=false;return 0;}starts.push(url);return nextNative++;};"
         "globalThis.__tilefinchCancelNetwork=id=>{cancels.push(Number(id));"
         "return true;};const raw={status:200,url:'https://example.test/ok',"
         "contentType:'text/plain',headers:'content-type: text/plain\\n',"
@@ -2489,6 +2677,12 @@ int main(void)
         "uploadXhr.open('POST','https://example.test/upload');"
         "uploadXhr.send('abcde');const uploadNative=nextNative-1;"
         "__tilefinchDeliverNetwork(uploadNative,true,raw);await Promise.resolve();"
+        "const deferredPromise=fetch('https://example.test/native-defer')"
+        ".then(value=>value.text());const nativeDeferred="
+        "__tilefinchNetworkQueueStats.waiting===1;"
+        "__tilefinchPumpTimers(20,16);const deferredNative=nextNative-1;"
+        "__tilefinchDeliverNetwork(deferredNative,true,raw);"
+        "const deferredBody=await deferredPromise;"
         "const progressShape=new ProgressEvent('shape',{lengthComputable:true,"
         "loaded:3,total:5}),progressShapeOk=Object.getOwnPropertyNames("
         "progressShape).join(',')==='isTrusted'&&Object.getOwnPropertyNames("
@@ -2505,11 +2699,12 @@ int main(void)
         "&&cancelName==='AbortError'&&countQuota==='RangeError'"
         "&&xhrDeferred&&xhrQuotaError&&!xhrQuotaReentered"
         "&&abortReleased&&byteQuota==='RangeError'&&queuedBeforeTimeout&&timeoutEvent"
-        "&&uploadOk&&progressShapeOk"
+        "&&uploadOk&&progressShapeOk&&nativeDeferred&&deferredBody==='ok'"
         "&&xhr.readyState===4&&xhr.status===0&&stats.peakCount===128"
         "&&stats.rejected===3&&stats.rejectedBytes>=1"
         "&&stats.cancelled===139&&stats.timedOut===1"
-        "&&stats.completed===13&&stats.active===0&&stats.waiting===0"
+        "&&stats.completed===14&&stats.launchFailed===0"
+        "&&stats.active===0&&stats.waiting===0"
         "&&stats.currentCount===0&&cancels.length===13"
         "?'NETWORK-QUEUE-OK':'NETWORK-QUEUE-FAILED:'+JSON.stringify(stats);"
         "})().catch(error=>{globalThis.pocSummary='NETWORK-QUEUE-ERROR:'+"
@@ -2539,8 +2734,8 @@ int main(void)
     }
     CHECK(network_queue_ok
           && strcmp(result.summary, "NETWORK-QUEUE-OK") == 0
-          && result.async_network_logical_admitted == 152
-          && result.async_network_logical_completed == 13
+          && result.async_network_logical_admitted == 153
+          && result.async_network_logical_completed == 14
           && result.async_network_logical_rejected == 3
           && result.async_network_logical_cancelled == 139
           && result.async_network_logical_timed_out == 1
@@ -2548,6 +2743,27 @@ int main(void)
           && result.async_network_logical_peak_bytes <= 256u * 1024u
           && result.async_network_active_native == 0
           && result.async_network_pending_logical == 0);
+
+    static const char fetch_network_error_surface_probe[] =
+        "(async()=>{const nativeFetch=globalThis.__tilefinchFetchAsync;"
+        "globalThis.__tilefinchFetchAsync=()=>777;const pending=fetch("
+        "'https://example.test/native-failure').then(()=>'',error=>"
+        "error.name+':'+error.message);__tilefinchDeliverNetwork(777,false,"
+        "'Failed to connect to private.example:443');const text=await pending;"
+        "globalThis.__tilefinchFetchAsync=nativeFetch;globalThis.pocSummary="
+        "text==='TypeError:Failed to fetch'?'FETCH-NETWORK-ERROR-OK':"
+        "'FETCH-NETWORK-ERROR-FAILED:'+text})().catch(error=>{"
+        "globalThis.pocSummary='FETCH-NETWORK-ERROR-FAILED:'+String(error)});";
+    bool fetch_network_error_surface_ok = script_runtime_evaluate_diagnostic(
+        runtime, fetch_network_error_surface_probe,
+        "<fetch-network-error-surface-probe>", &result);
+    for (size_t tick = 0; fetch_network_error_surface_ok && tick < 8
+         && strcmp(result.summary, "FETCH-NETWORK-ERROR-OK") != 0; tick++) {
+        fetch_network_error_surface_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    CHECK(fetch_network_error_surface_ok
+          && strcmp(result.summary, "FETCH-NETWORK-ERROR-OK") == 0);
 
     static const char local_blob_network_probe[] =
         "(()=>{globalThis.pocSummary='LOCAL-BLOB-PENDING';const stats="
@@ -2687,7 +2903,10 @@ int main(void)
           && result.indexed_db_quota_errors == 0
           /* The same realm loaded Game Audio, Canvas, and Streams earlier;
              IndexedDB is the fourth deferred standards module admitted. */
-          && result.bootstrap_lazy_module_loads == 5
+          /* Cumulative for this runtime: the compatibility probe above also
+             loads the Worker module for its close() check, and the Intl
+             probes load the lazy Intl module. */
+          && result.bootstrap_lazy_module_loads == 7
           && result.bootstrap_lazy_module_failures == 0);
 
     static const char indexeddb_failure_probe[] =
@@ -2968,8 +3187,8 @@ int main(void)
         "(()=>{const frame=document.createElement('iframe'),"
         "child=frame.contentWindow;globalThis.pocSummary=child"
         "&&child.window===child&&child.self===child&&child.globalThis===child"
-        "&&child.parent===globalThis&&child.String===String"
-        "&&child.String.prototype===String.prototype"
+        "&&child.parent===globalThis&&child.String!==String"
+        "&&child.String.prototype!==String.prototype"
         "&&typeof child.eval==='function'&&typeof child.postMessage==='function'"
         "&&child.eval('String===globalThis.String')"
         "?'FRAME-WINDOW-GLOBALS-OK':'FRAME-WINDOW-GLOBALS-FAILED';})()";
@@ -3313,18 +3532,56 @@ int main(void)
         "catch(error){ordinary=error.name==='NotAllowedError'}"
         "try{first.replaceSync('.broken{')}catch(error){"
         "syntax=error.name==='SyntaxError'}"
+        "const author=document.createElement('style');"
+        "author.textContent='.author-a{color:red}@media (min-width:1px){"
+        ".author-b{display:block}}';document.head.appendChild(author);"
+        "const listedSheets=document.styleSheets,authorSheet=author.sheet,"
+        "authorRules=authorSheet.cssRules,authorListed="
+        "listedSheets.includes(authorSheet)"
+        "&&document.styleSheets===listedSheets"
+        "&&document.styleSheets.item(999)===null"
+        "&&authorSheet instanceof CSSStyleSheet"
+        "&&authorSheet.ownerNode===author&&authorSheet.href===null"
+        "&&authorSheet.cssRules===authorRules"
+        "&&authorSheet.cssRules.length===2"
+        "&&authorSheet.cssRules[0].selectorText==='.author-a'"
+        "&&authorSheet.cssRules[0].parentStyleSheet===authorSheet;"
+        "authorSheet.insertRule('.author-inserted{height:7px}',2);"
+        "const authorInserted=author.textContent.includes('author-inserted')"
+        "&&authorRules.length===3;authorSheet.deleteRule(2);"
+        "const authorDeleted=!author.textContent.includes('author-inserted')"
+        "&&authorRules.length===2;"
+        "author.textContent='.author-live{width:4px}';"
+        "const authorRefreshed=author.sheet===authorSheet"
+        "&&authorSheet.cssRules.length===1"
+        "&&authorSheet.cssRules[0].selectorText==='.author-live';"
         "document.adoptedStyleSheets=[second];"
         "const removed=!nodes[0].isConnected"
         "&&document.adoptedStyleSheets.length===1"
         "&&document.adoptedStyleSheets[0]===second;"
-        "globalThis.pocSummary=importRemoved&&inserted&&ordered&&live"
+        "const detachedDoc=document.implementation.createHTMLDocument(''),"
+        "detached=detachedDoc.createElement('div'),oldStyle=detached.style;"
+        "oldStyle.width='1px';detached.setAttribute('style','height:2px');"
+        "const detachedStyleInvalidated=detached.style!==oldStyle"
+        "&&detached.style.cssText.includes('height');"
+        "author.remove();globalThis.pocSummary=importRemoved&&inserted"
+        "&&ordered&&live&&authorListed&&authorRefreshed"
+        "&&authorInserted&&authorDeleted&&detachedStyleInvalidated"
         "&&duplicate&&ordinary&&syntax&&removed"
         "?'CONSTRUCTED-STYLESHEET-OK':'CONSTRUCTED-STYLESHEET-FAILED:'"
         "+JSON.stringify({importRemoved,inserted,ordered,live,duplicate,"
-        "ordinary,syntax,removed,count:nodes.length});})()";
-    CHECK(script_runtime_evaluate_diagnostic(
-              runtime, constructed_stylesheet_probe,
-              "<constructed-stylesheet-probe>", &result)
+        "ordinary,syntax,removed,authorListed,authorRefreshed,authorInserted,"
+        "authorDeleted,detachedStyleInvalidated,"
+        "count:nodes.length});})()";
+    bool constructed_stylesheet_ok = script_runtime_evaluate_diagnostic(
+        runtime, constructed_stylesheet_probe,
+        "<constructed-stylesheet-probe>", &result);
+    if (!constructed_stylesheet_ok
+        || strcmp(result.summary, "CONSTRUCTED-STYLESHEET-OK") != 0) {
+        fprintf(stderr, "constructed stylesheet probe: ok=%d summary=%s error=%s\n",
+                constructed_stylesheet_ok, result.summary, result.error);
+    }
+    CHECK(constructed_stylesheet_ok
           && strcmp(result.summary, "CONSTRUCTED-STYLESHEET-OK") == 0);
 
     static const char observer_reobserve_and_select_probe[] =
@@ -3872,7 +4129,8 @@ int main(void)
         ".then(v=>globalThis.pocSummary="
         "b.brand+'|'+b.version+'|'+v.uaFullVersion+'|'"
         "+v.fullVersionList[0].brand+'|'"
-        "+v.fullVersionList[0].version);";
+        "+v.fullVersionList[0].version+'|'+navigator.language+'|'"
+        "+navigator.languages.join(','));";
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, browser_identity_probe, "<browser-identity-probe>",
               &result)
@@ -3882,7 +4140,52 @@ int main(void)
                     TILEFINCH_BROWSER_BRAND_VERSION "|"
                     TILEFINCH_BROWSER_FULL_VERSION "|"
                     TILEFINCH_BROWSER_BRAND "|"
-                    TILEFINCH_BROWSER_FULL_VERSION) == 0);
+                    TILEFINCH_BROWSER_FULL_VERSION "|en-US|en-US,en") == 0);
+
+    puts("test: speech synthesis degrades through a bounded empty engine");
+    static const char speech_synthesis_probe[] =
+        "(()=>{const synth=speechSynthesis,u=new SpeechSynthesisUtterance("
+        "'hello');let error='',illegal=false;u.onerror=event=>{error="
+        "event.error};try{new SpeechSynthesis}catch(_){illegal=true}"
+        "synth.speak(u);setTimeout(()=>{globalThis.pocSummary=["
+        "synth instanceof SpeechSynthesis,Object.prototype.toString.call("
+        "synth)==='[object SpeechSynthesis]',synth.getVoices().length===0,"
+        "!synth.pending,!synth.speaking,!synth.paused,u instanceof "
+        "EventTarget,u.text==='hello',error==='synthesis-unavailable',"
+        "illegal].every(Boolean)?'SPEECH-EMPTY-OK':'SPEECH-EMPTY-FAILED'"
+        "},0)})()";
+    bool speech_synthesis_ok = script_runtime_evaluate_diagnostic(
+        runtime, speech_synthesis_probe, "<speech-synthesis-probe>", &result);
+    for (size_t tick = 0; speech_synthesis_ok && tick < 8
+         && strcmp(result.summary, "SPEECH-EMPTY-OK") != 0; tick++) {
+        speech_synthesis_ok = script_runtime_advance(
+            runtime, 0, 64, &result);
+    }
+    CHECK(speech_synthesis_ok
+          && strcmp(result.summary, "SPEECH-EMPTY-OK") == 0);
+
+    puts("test: MediaSource probes do not advertise an absent byte stream");
+    static const char media_source_probe[] =
+        "(()=>{const source=new MediaSource;let state='';try{"
+        "source.addSourceBuffer('video/mp4; codecs=\"avc1.42E01E\"')}"
+        "catch(error){state=error.name}globalThis.pocSummary=["
+        "MediaSource.isTypeSupported('video/mp4')===false,"
+        "MediaSource.canConstructInDedicatedWorker===false,"
+        "source.readyState==='closed',Number.isNaN(source.duration),"
+        "source.sourceBuffers===source.activeSourceBuffers,"
+        "source.sourceBuffers.length===0,state==='InvalidStateError',"
+        "Object.prototype.toString.call(source)==='[object MediaSource]'"
+        "].every(Boolean)?'MEDIA-SOURCE-EMPTY-OK':'MEDIA-SOURCE-EMPTY-FAILED'"
+        "})()";
+    bool media_source_ok = script_runtime_evaluate_diagnostic(
+        runtime, media_source_probe, "<media-source-probe>", &result);
+    if (!media_source_ok
+        || strcmp(result.summary, "MEDIA-SOURCE-EMPTY-OK") != 0) {
+        fprintf(stderr, "MediaSource probe: ok=%d summary=%s error=%s\n",
+                media_source_ok, result.summary, result.error);
+    }
+    CHECK(media_source_ok
+          && strcmp(result.summary, "MEDIA-SOURCE-EMPTY-OK") == 0);
 
     puts("test: detached runtimes reject new network work");
     script_runtime_detach_document(runtime, &document);

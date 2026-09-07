@@ -8,6 +8,14 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.16 — 2026-09-06
+
+- Faster startup and more responsive page loading, scrolling, and focus navigation.
+- Improved video loading and playback.
+- Improved compatibility and reliability for Workers, WebAssembly, embedded frames,
+  and dynamic styles.
+- Additional memory and stability fixes.
+
 ## 0.1.15 — 2026-09-02
 
 - Added bounded WebAssembly and Web Worker support for more modern sites.

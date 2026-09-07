@@ -1,0 +1,5 @@
+tilefinch-input-script: text-entry=danzeff
+tilefinch-input-script: armed script=input-script.txt steps=3 stall-limit=1800
+tilefinch-input-script: mark=poster-ready step=1 screen=page
+tilefinch-input-script: outcome=complete steps=2/3 frames=241 held-frames=0 actions=0 settings=0
+tilefinch-input-script: capture=poster-ready written=1 size=240x136

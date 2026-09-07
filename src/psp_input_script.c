@@ -297,6 +297,10 @@ static bool script_analog_direction(
     else if (strcmp(name, "right") == 0) *x = 255u;
     else if (strcmp(name, "up") == 0) *y = 0u;
     else if (strcmp(name, "down") == 0) *y = 255u;
+    else if (strcmp(name, "up-left") == 0) { *x = 0u; *y = 0u; }
+    else if (strcmp(name, "up-right") == 0) { *x = 255u; *y = 0u; }
+    else if (strcmp(name, "down-left") == 0) { *x = 0u; *y = 255u; }
+    else if (strcmp(name, "down-right") == 0) { *x = 255u; *y = 255u; }
     else return false;
     return true;
 }
@@ -312,11 +316,11 @@ static PspInputScriptStep *script_push(PspInputScript *script)
 static bool script_parse_line(
     PspInputScript *script, char *line, const char **reason)
 {
-    /* command, then at most two operands; every form is fixed-arity. */
+    /* At most three operands; only stick accepts an optional button chord. */
     char *cursor = line;
-    char *fields[3] = {NULL, NULL, NULL};
+    char *fields[4] = {NULL, NULL, NULL, NULL};
     size_t field_count = 0;
-    while (*cursor != '\0' && field_count < 3u) {
+    while (*cursor != '\0' && field_count < 4u) {
         while (*cursor == ' ' || *cursor == '\t') cursor++;
         if (*cursor == '\0') break;
         fields[field_count++] = cursor;
@@ -334,7 +338,10 @@ static bool script_parse_line(
     size_t command_length = strlen(command);
     bool advance_while_busy = command_length > 5u
         && strcmp(command + command_length - 5u, "-live") == 0;
-    if (advance_while_busy) command[command_length - 5u] = '\0';
+    bool advance_when_painted = command_length > 5u
+        && strcmp(command + command_length - 5u, "-page") == 0;
+    if (advance_while_busy || advance_when_painted)
+        command[command_length - 5u] = '\0';
     unsigned long count = 0;
     uint32_t buttons = 0;
     PspInputScriptStep *step = NULL;
@@ -348,6 +355,7 @@ static bool script_parse_line(
         if (step == NULL) { *reason = "too many steps"; return false; }
         step->kind = (uint8_t) PSP_INPUT_SCRIPT_STEP_WAIT;
         step->advance_while_busy = advance_while_busy;
+        step->advance_when_painted = advance_when_painted;
         step->ticks = (uint16_t) count;
         return true;
     }
@@ -373,6 +381,7 @@ static bool script_parse_line(
         step->kind = (uint8_t) (is_hold ? PSP_INPUT_SCRIPT_STEP_HOLD
                                        : PSP_INPUT_SCRIPT_STEP_PRESS);
         step->advance_while_busy = advance_while_busy;
+        step->advance_when_painted = advance_when_painted;
         /* A tap includes its release frame.  Without it, adjacent taps of the
            same button collapse into one edge because previous_buttons stays
            held across the step boundary. */
@@ -392,6 +401,7 @@ static bool script_parse_line(
         if (step == NULL) { *reason = "too many steps"; return false; }
         step->kind = (uint8_t) PSP_INPUT_SCRIPT_STEP_PRESS;
         step->advance_while_busy = advance_while_busy;
+        step->advance_when_painted = advance_when_painted;
         /* Held frame then released frame, so every pair is one press edge. */
         step->ticks = (uint16_t) (count * 2ul);
         step->buttons = (uint16_t) buttons;
@@ -399,10 +409,11 @@ static bool script_parse_line(
     }
     if (strcmp(command, "stick") == 0) {
         uint8_t analog_x = 128u, analog_y = 128u;
-        if (field_count != 3u
+        if ((field_count != 3u && field_count != 4u)
             || !script_positive_count(fields[1], &count)
             || !script_analog_direction(
-                   fields[2], &analog_x, &analog_y)) {
+                   fields[2], &analog_x, &analog_y)
+            || (field_count == 4u && !script_parse_buttons(fields[3], &buttons))) {
             *reason = "stick needs a frame count and direction";
             return false;
         }
@@ -410,9 +421,11 @@ static bool script_parse_line(
         if (step == NULL) { *reason = "too many steps"; return false; }
         step->kind = (uint8_t) PSP_INPUT_SCRIPT_STEP_ANALOG;
         step->advance_while_busy = advance_while_busy;
+        step->advance_when_painted = advance_when_painted;
         step->ticks = (uint16_t) count;
         step->analog_x = analog_x;
         step->analog_y = analog_y;
+        step->buttons = (uint16_t) buttons;
         return true;
     }
     if (strcmp(command, "mark") == 0) {
@@ -425,12 +438,13 @@ static bool script_parse_line(
         if (step == NULL) { *reason = "too many steps"; return false; }
         step->kind = (uint8_t) PSP_INPUT_SCRIPT_STEP_MARK;
         step->advance_while_busy = advance_while_busy;
+        step->advance_when_painted = advance_when_painted;
         step->ticks = 1u;
         snprintf(step->mark, sizeof(step->mark), "%s", fields[1]);
         return true;
     }
     if (strcmp(command, "end") == 0) {
-        if (field_count != 1u || advance_while_busy) {
+        if (field_count != 1u || advance_while_busy || advance_when_painted) {
             *reason = "end takes no operands";
             return false;
         }
@@ -575,6 +589,14 @@ bool psp_input_script_advance(
     PspInputScript *script, PspUiInput *input, uint32_t previous_buttons,
     bool ready)
 {
+    return psp_input_script_advance_with_page(
+        script, input, previous_buttons, ready, false);
+}
+
+bool psp_input_script_advance_with_page(
+    PspInputScript *script, PspUiInput *input, uint32_t previous_buttons,
+    bool ready, bool page_ready)
+{
     if (input != NULL) {
         input->held = 0;
         input->pressed = 0;
@@ -599,6 +621,7 @@ bool psp_input_script_advance(
         return false;
     }
     const PspInputScriptStep *step = &script->steps[script->step];
+    ready = ready || (page_ready && step->advance_when_painted);
     /* A tap can synchronously enter a long operation on its held half. Its
        following half is a neutral release, not a second user action. Drain
        only that release while busy so an explicit `-live` step after the tap
@@ -627,7 +650,9 @@ bool psp_input_script_advance(
     if (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_MARK
         && script->step_remaining == step->ticks)
         script->mark = step->mark;
-    bool holding = step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_HOLD;
+    bool holding = step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_HOLD
+        || (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_ANALOG
+            && step->buttons != 0);
     if (step->kind == (uint8_t) PSP_INPUT_SCRIPT_STEP_PRESS) {
         /* Frames run down from an even total, so an even remainder is the
            held half and the following odd remainder releases it. */

@@ -1403,6 +1403,18 @@ static inline unsigned psp_media_slot_free_count(
     return free_slots;
 }
 
+/* A full surface pool needs alternate audio only if its next publishable
+   picture is in the future. Due pictures and unfinished conversions need
+   presentation/worker progress instead. This read-only test grants no lease. */
+static inline bool psp_media_slots_wait_for_audio(
+    const PspMediaSurfaceSlot *slots, unsigned count,
+    uint64_t epoch, uint64_t clock_us)
+{
+    if (psp_media_slot_free_count(slots, count) != 0u) return false;
+    int next = psp_media_slot_take_index(slots, count, epoch);
+    return next >= 0 && slots[next].pts_us > clock_us;
+}
+
 /* Slots holding a converted picture nobody has claimed, of this epoch or any
    other. The drain policy asks this rather than the single frame_ready flag it
    used to, and a stale-epoch picture is still occupancy. */

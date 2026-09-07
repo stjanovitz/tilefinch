@@ -318,10 +318,6 @@
     }
     return node;
   };
-  const upgradeTree = (root) => {
-    for (const node of descendants(root)) upgradeOne(node);
-    return root;
-  };
   class CustomElementRegistry {
     define(name, constructor, options = undefined) {
       const scoped = scopedRegistryStates.get(this),
@@ -860,6 +856,7 @@
     constructor() {
       this.__text = "";
       this.__rules = [];
+      this.__cssRules = [];
       this.__constructed = true;
       this.__adoptedNodes = new WeakMap();
       this.__adoptedTargets = [];
@@ -879,6 +876,24 @@
     }
     __sync() {
       this.__text = this.__rules.join("\n");
+      this.__cssRules.length = 0;
+      for (const cssText of this.__rules) {
+        const atRule = cssText.trimStart().startsWith("@"),
+          open = cssText.indexOf("{");
+        this.__cssRules.push({
+          cssText,
+          parentStyleSheet: this,
+          type: atRule ? 4 : 1,
+          selectorText: !atRule && open >= 0
+            ? cssText.slice(0, open).trim()
+            : undefined,
+        });
+      }
+      if (!this.__constructed && this.ownerNode) {
+        this.__authorSource = this.__text;
+        if (this.ownerNode.textContent !== this.__text)
+          this.ownerNode.textContent = this.__text;
+      }
       const retained = [];
       for (const reference of this.__adoptedTargets) {
         const target = reference.deref();
@@ -960,11 +975,7 @@
       });
     }
     get cssRules() {
-      return this.__rules.map((cssText) => ({
-        cssText,
-        parentStyleSheet: this,
-        type: cssText.trimStart().startsWith("@") ? 4 : 1,
-      }));
+      return this.__cssRules;
     }
     insertRule(rule, index = 0) {
       rule = String(rule);
@@ -1004,6 +1015,56 @@
     }
   }
   globalThis.CSSStyleSheet = CSSStyleSheet;
+  {
+    /* Author sheets are reflected lazily because native style parsing owns
+       page rendering.  Keep the script-visible CSSOM bounded and avoid doing
+       this work unless a page actually inspects it. */
+    const authorSheets = new WeakMap(),
+      authorSheet = (node, source, href) => {
+        let sheet = authorSheets.get(node);
+        if (!sheet) {
+          sheet = new CSSStyleSheet();
+          sheet.__constructed = false;
+          sheet.ownerNode = node;
+          sheet.href = href;
+          sheet.__authorSource = null;
+          authorSheets.set(node, sheet);
+        }
+        source = String(source || "");
+        if (sheet.__authorSource !== source) {
+          sheet.__constructed = true;
+          try {
+            sheet.replaceSync(source);
+          } catch (_) {
+            sheet.__rules = [];
+            sheet.__text = source.slice(0, 256 * 1024);
+            sheet.__cssRules.length = 0;
+          }
+          sheet.__constructed = false;
+          sheet.__authorSource = source;
+        }
+        return sheet;
+      };
+    Object.defineProperty(HTMLStyleElement.prototype, "sheet", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return this.isConnected
+          ? authorSheet(this, this.textContent, null)
+          : null;
+      },
+    });
+    Object.defineProperty(HTMLLinkElement.prototype, "sheet", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        const rel = String(this.getAttribute("rel") || "").toLowerCase();
+        return this.isConnected && rel.split(/\s+/).includes("stylesheet")
+          ? authorSheet(this, "", this.href || null)
+          : null;
+      },
+    });
+  }
   {
     const adoptedByTarget = new WeakMap(),
       setAdopted = (target, value) => {
@@ -1071,7 +1132,6 @@
         },
       });
   }
-  globalThis.__tilefinchUpgradeCustomElement = (node) => upgradeOne(node);
   globalThis.__tilefinchCustomElementIsDefined = (node) => {
     if (
       node?.namespaceURI !== "http://www.w3.org/1999/xhtml"

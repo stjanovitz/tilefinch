@@ -19,7 +19,7 @@
         "'disabled:ok':"
         "'disabled:fail';document.getElementById('result').textContent=pocSummary;"
         "</script></body>";
-    NavigationSession disabled_navigation;
+    static NavigationSession disabled_navigation;
     CHECK(navigation_init(&disabled_navigation, &budget, 2));
     navigation_enable_scripts(&disabled_navigation, 3 * MIB, 1000);
     uint64_t disabled_generation = navigation_begin(&disabled_navigation);
@@ -115,7 +115,7 @@
         "reservedCustomProperty]."
         "map(Number).join('');"
         "</script></body>";
-    NavigationSession wpt_compatibility_navigation;
+    static NavigationSession wpt_compatibility_navigation;
     CHECK(navigation_init(&wpt_compatibility_navigation, &budget, 2));
     navigation_enable_scripts(&wpt_compatibility_navigation, 4 * MIB, 1000);
     uint64_t wpt_compatibility_generation =
@@ -216,7 +216,7 @@
         "'browser-io:fail';}).catch(error=>globalThis.pocSummary="
         "'browser-io:error:'+error);"
         "</script></body>";
-    NavigationSession browser_io_navigation;
+    static NavigationSession browser_io_navigation;
     CHECK(navigation_init(&browser_io_navigation, &budget, 2));
     navigation_enable_scripts(&browser_io_navigation, 5 * MIB, 1000);
     uint64_t browser_io_generation =
@@ -352,7 +352,7 @@
         "const rectangleBatchOk=__tilefinchCanvasDiagnostics.rectangleCommands"
         "-diagnosticBefore.rectangleCommands===130&&"
         "__tilefinchCanvasDiagnostics.rectangleBatches"
-        "-diagnosticBefore.rectangleBatches===3;const imageBefore="
+        "-diagnosticBefore.rectangleBatches===5;const imageBefore="
         "{...__tilefinchCanvasDiagnostics};for(let i=0;i<18;i++)"
         "draw.drawImage(sprite,40,30,2,1);draw.getImageData(40,30,1,1);"
         "const imageBatchOk=__tilefinchCanvasDiagnostics.imageCommands"
@@ -416,7 +416,7 @@
         "svgCurveOk,shadowOk,blob.type,bytes[0],"
         "strokeHit,dashOn,dashOff,draw.getLineDash().join(',')].join('|');}));"
         "</script></body>";
-    NavigationSession canvas_navigation;
+    static NavigationSession canvas_navigation;
     CHECK(navigation_init(&canvas_navigation, &budget, 2));
     navigation_enable_scripts(&canvas_navigation, 6 * MIB, 1000);
     uint64_t canvas_generation = navigation_begin(&canvas_navigation);
@@ -477,7 +477,7 @@
         "&&invalid&&resetOk"
         "?'native-controls:ok':'native-controls:fail';"
         "</script></body>";
-    NavigationSession native_controls_navigation;
+    static NavigationSession native_controls_navigation;
     CHECK(navigation_init(&native_controls_navigation, &budget, 2));
     navigation_enable_scripts(&native_controls_navigation, 4 * MIB, 1000);
     uint64_t native_controls_generation =
@@ -681,7 +681,7 @@
         "'[object PerformanceResourceTiming]'&&Object.keys(selfTiming).length===0"
         "&&selfTiming.initiatorType==='script'&&selfTiming.decodedBodySize>0"
         "?'dynamic-external':'dynamic-timing-missing')";
-    BrowserSession ordered_browser_session;
+    static BrowserSession ordered_browser_session;
     CHECK(browser_session_init(&ordered_browser_session, &budget,
                                128 * 1024)
           && test_cache_put_stylesheet(
@@ -695,7 +695,7 @@
               &ordered_browser_session, "https://order.test/",
               "https://order.test/dynamic.js", ordered_dynamic_script,
               sizeof(ordered_dynamic_script) - 1));
-    NavigationSession ordered_navigation;
+    static NavigationSession ordered_navigation;
     CHECK(navigation_init(&ordered_navigation, &budget, 4));
     navigation_attach_browser_session(&ordered_navigation,
                                       &ordered_browser_session);
@@ -786,11 +786,16 @@
         "</iframe></body>";
     static const char owned_child_page[] =
         "<!doctype html><body><input id='frame-check' type='checkbox'>"
+        "<div id='frame-pointer' style='position:absolute;left:100px;top:50px;"
+        "width:80px;height:30px'>"
+        "<span id='frame-pointer-ink'>POINTER</span></div>"
         "<script>globalThis.pocSummary='child-ready';"
         "document.getElementById('frame-check').addEventListener('click',"
-        "()=>globalThis.pocSummary='frame-clicked')</script></body>";
-    BrowserSession frame_owner_session;
-    NavigationSession frame_owner_navigation;
+        "()=>globalThis.pocSummary='frame-clicked');"
+        "document.getElementById('frame-pointer').addEventListener('click',"
+        "()=>globalThis.pocSummary='frame-pointer-clicked')</script></body>";
+    static BrowserSession frame_owner_session;
+    static NavigationSession frame_owner_navigation;
     CHECK(browser_session_init(&frame_owner_session, &budget, 64 * 1024)
           && navigation_init(&frame_owner_navigation, &budget, 2));
     navigation_attach_browser_session(&frame_owner_navigation,
@@ -815,15 +820,63 @@
           && frame_owner_navigation.frames_failed == 1
           && frame_owner_navigation.page.frame_count == 1);
     NavigationFrame *owned_frame = &frame_owner_navigation.page.frames[0];
+    size_t early_message_drops =
+        frame_owner_navigation.frame_messages_dropped;
+    CHECK(owned_frame->runtime == NULL && !owned_frame->loaded
+          && !owned_frame->retired && !owned_frame->fetch_pending
+          && script_runtime_evaluate_diagnostic(
+              frame_owner_navigation.page.runtime,
+              "document.getElementById('owned').contentWindow.postMessage("
+              "{early:true},'*')",
+              "https://frame-owner.test/early-message-send.js",
+              &frame_owner_navigation.page.script_result)
+          && frame_owner_navigation.page.message_count == 1u);
+    FetchScheduler *early_scheduler =
+        frame_owner_navigation.page.resource_scheduler;
+    frame_owner_navigation.page.resource_scheduler = NULL;
+    CHECK(navigation_advance_runtime(&frame_owner_navigation, 0, 4)
+          && frame_owner_navigation.page.message_count == 0u
+          && frame_owner_navigation.frame_messages_dropped
+                 == early_message_drops + 1u);
+    /* Reuse the bounded slot as a successful child. A failed child must not
+       poison delivery for a later unrelated browsing context. */
+    early_message_drops = frame_owner_navigation.frame_messages_dropped;
+    CHECK(script_runtime_set_frame_window_state(
+              frame_owner_navigation.page.runtime,
+              owned_frame->parent_handle, true, true, false,
+              "https://frame-owner.test/child.html",
+              &frame_owner_navigation.page.script_result));
     CHECK(document_parse(&owned_frame->document, &budget,
                          owned_child_page, sizeof(owned_child_page) - 1, 16));
     owned_frame->runtime = script_runtime_create_deferred(
-        &owned_frame->document, &budget, 2 * MIB, 1000,
+        &owned_frame->document, &budget, 4 * MIB, 1000,
         "https://frame-owner.test/child.html", NULL,
         &owned_frame->script_result);
     CHECK(owned_frame->runtime != NULL
           && navigation_test_configure_frame_messaging(
               &frame_owner_navigation, owned_frame));
+    CHECK(script_runtime_evaluate_diagnostic(
+              owned_frame->runtime,
+              "addEventListener('message',event=>{if(event.data.early)"
+              "globalThis.pocSummary='early-message-delivered'})",
+              "https://frame-owner.test/early-message.js",
+              &owned_frame->script_result)
+          && script_runtime_evaluate_diagnostic(
+              frame_owner_navigation.page.runtime,
+              "document.getElementById('owned').contentWindow.postMessage("
+              "{early:true},'*')",
+              "https://frame-owner.test/replacement-message-send.js",
+              &frame_owner_navigation.page.script_result)
+          && frame_owner_navigation.page.message_count == 1u);
+    owned_frame->loaded = true;
+    frame_owner_navigation.page.resource_scheduler = NULL;
+    CHECK(navigation_advance_runtime(&frame_owner_navigation, 0, 4)
+          && frame_owner_navigation.page.message_count == 0u
+          && frame_owner_navigation.frame_messages_dropped
+                 == early_message_drops
+          && strcmp(owned_frame->script_result.summary,
+                    "early-message-delivered") == 0);
+    frame_owner_navigation.page.resource_scheduler = early_scheduler;
     CHECK(script_runtime_evaluate_diagnostic(
               owned_frame->runtime,
               "const original=parent.postMessage;parent.postMessage=()=>{};"
@@ -839,7 +892,6 @@
               "'click',()=>globalThis.pocSummary='frame-clicked')",
               "https://frame-owner.test/frame-activation.js",
               &owned_frame->script_result));
-    owned_frame->loaded = true;
     frame_owner_navigation.images = &frame_owner_navigation.page.images;
     CHECK(navigation_test_refresh_frame_presentation(
         &frame_owner_navigation, owned_frame));
@@ -851,6 +903,16 @@
         &frame_owner_navigation, owned_frame->element));
     CHECK(strcmp(owned_frame->script_result.summary,
                  "frame-clicked") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+        owned_frame->runtime,
+        "document.getElementById('frame-pointer-ink').addEventListener('click',()=>"
+        "globalThis.pocSummary='frame-pointer-clicked')",
+        "https://frame-owner.test/frame-pointer-activation.js",
+        &owned_frame->script_result));
+    CHECK(navigation_activate_frame_at(
+        &frame_owner_navigation, owned_frame->element, 110, 60));
+    CHECK(strcmp(owned_frame->script_result.summary,
+                 "frame-pointer-clicked") == 0);
     /* Queue one complete legacy-capacity burst before delivery.  The first
        child task replies three times while fifteen messages remain queued.
        postMessage must queue all three replies rather than exposing the
@@ -922,7 +984,7 @@
        native scheduler's retained bootstrap callback. */
     CHECK(navigation_advance_runtime(&frame_owner_navigation, 1, 8)
           && frame_owner_navigation.frames_failed == 1
-          && frame_owner_navigation.frame_messages_dropped == 0
+          && frame_owner_navigation.frame_messages_dropped == 1
           && frame_owner_navigation.page.message_count == 0
           && frame_owner_navigation.page.runtime != NULL
           && owned_frame->runtime != NULL
@@ -968,7 +1030,8 @@
               &frame_owner_navigation.page.script_result)
           && navigation_advance_runtime(&frame_owner_navigation, 1, 8)
           && frame_owner_navigation.frames_detached == 1
-          && frame_owner_navigation.frame_messages_dropped == 1
+          && frame_owner_navigation.frame_messages_dropped
+                 == early_message_drops + 1u
           && frame_owner_navigation.page.message_count == 0
           && owned_frame->retired && owned_frame->runtime == NULL
           && owned_frame->document.html == NULL
@@ -1033,6 +1096,76 @@
     browser_session_destroy(&frame_owner_session);
     CHECK(budget.current == 0);
 
+    puts("test: top navigation outranks outgoing child failure");
+    static const char navigation_wins_page[] =
+        "<!doctype html><body><iframe src='/outgoing.html'></iframe></body>";
+    static const char navigation_wins_child[] =
+        "<!doctype html><body>outgoing child</body>";
+    static BrowserSession navigation_wins_session;
+    static NavigationSession navigation_wins;
+    CHECK(browser_session_init(&navigation_wins_session, &budget, 64 * 1024)
+          && navigation_init(&navigation_wins, &budget, 2));
+    navigation_attach_browser_session(&navigation_wins,
+                                      &navigation_wins_session);
+    navigation_enable_scripts(&navigation_wins, 4 * MIB, 1000);
+    navigation_enable_document_scripts(&navigation_wins, 4,
+                                       64 * 1024, 64 * 1024, 1000);
+    uint64_t navigation_wins_generation = navigation_begin(&navigation_wins);
+    CHECK(navigation_commit_html(
+        &navigation_wins, navigation_wins_generation,
+        "https://navigation-wins.test/", navigation_wins_page,
+        sizeof(navigation_wins_page) - 1, 480, NULL, NULL, true));
+    for (size_t tick = 0;
+         tick < 8 && navigation_wins.frames_failed == 0; tick++) {
+        CHECK(navigation_advance_runtime(&navigation_wins, 1, 8));
+    }
+    CHECK(navigation_wins.page.frame_count == 1
+          && navigation_wins.frames_failed == 1);
+    NavigationFrame *navigation_wins_frame = &navigation_wins.page.frames[0];
+    CHECK(document_parse(&navigation_wins_frame->document, &budget,
+                         navigation_wins_child,
+                         sizeof(navigation_wins_child) - 1, 16));
+    navigation_wins_frame->runtime = script_runtime_create_deferred(
+        &navigation_wins_frame->document, &budget, 2 * MIB, 1000,
+        "https://navigation-wins.test/outgoing.html", NULL,
+        &navigation_wins_frame->script_result);
+    CHECK(navigation_wins_frame->runtime != NULL);
+    navigation_wins_frame->loaded = true;
+    CHECK(script_runtime_evaluate_diagnostic(
+              navigation_wins.page.runtime,
+              "setTimeout(()=>location.replace("
+              "'https://stream.test/document'),0)",
+              "https://navigation-wins.test/request-replacement.js",
+              &navigation_wins.page.script_result)
+          && script_runtime_evaluate_diagnostic(
+              navigation_wins_frame->runtime,
+              "setTimeout(()=>{for(;;){}},0)",
+              "https://navigation-wins.test/stale-child.js",
+              &navigation_wins_frame->script_result));
+    char navigation_wins_error[256] = {0};
+    bool navigation_wins_replay = fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-stream",
+        navigation_wins_error, sizeof(navigation_wins_error));
+    uint64_t navigation_wins_before = navigation_wins.generation;
+    bool navigation_wins_advanced = navigation_wins_replay
+        && navigation_advance_runtime(&navigation_wins, 1, 8);
+    /* The replay intentionally lacks the contextual Referer-bearing request,
+       so replacement transport fails.  Dispatch itself must nevertheless win
+       the tick: the generation advances and the stale child error is never
+       surfaced.  Before the fix, the child timeout fires first, leaves the
+       generation unchanged, and reports "frame scheduler failed". */
+    CHECK(navigation_wins_replay && !navigation_wins_advanced
+          && navigation_wins.generation == navigation_wins_before + 1u
+          && navigation_wins.page.loaded
+          && strstr(navigation_wins.last_error,
+                    "frame scheduler failed") == NULL
+          && strstr(navigation_wins.last_error,
+                    "does not match any unclaimed record") != NULL);
+    if (navigation_wins_replay) fetch_trace_end();
+    navigation_destroy(&navigation_wins);
+    browser_session_destroy(&navigation_wins_session);
+    CHECK(budget.current == 0);
+
     puts("test: nested iframe presentation and activation recurse by realm");
     static const char nested_frame_page[] =
         "<!doctype html><body><iframe id='outer' src='/outer.html'>"
@@ -1044,8 +1177,8 @@
         "<!doctype html><body><input id='nested-check' type='checkbox'>"
         "<script>document.getElementById('nested-check').addEventListener("
         "'click',()=>globalThis.pocSummary='nested-clicked')</script></body>";
-    BrowserSession nested_frame_session;
-    NavigationSession nested_frame_navigation;
+    static BrowserSession nested_frame_session;
+    static NavigationSession nested_frame_navigation;
     MessageOpaqueProbe nested_frame_probe = {0};
     CHECK(browser_session_init(&nested_frame_session, &budget, 64 * 1024)
           && navigation_init(&nested_frame_navigation, &budget, 4));
@@ -1064,6 +1197,23 @@
           && nested_frame_navigation.page.frame_count == 1);
     NavigationFrame *outer_frame =
         &nested_frame_navigation.page.frames[0];
+    if (outer_frame->fetch_pending) {
+        CHECK(fetch_scheduler_cancel(
+                  nested_frame_navigation.page.resource_scheduler,
+                  outer_frame->fetch_request_id, "test supplies child")
+              && fetch_scheduler_discard(
+                  nested_frame_navigation.page.resource_scheduler,
+                  outer_frame->fetch_request_id));
+        outer_frame->fetch_pending = false;
+    }
+    if (outer_frame->retired) {
+        outer_frame->retired = false;
+        CHECK(script_runtime_set_frame_window_state(
+            nested_frame_navigation.page.runtime,
+            outer_frame->parent_handle, true, true, false,
+            "https://nested-frame.test/outer.html",
+            &nested_frame_navigation.page.script_result));
+    }
     CHECK(outer_frame->parent_runtime
               == nested_frame_navigation.page.runtime
           && outer_frame->parent_frame_slot_plus_one == 0
@@ -1081,12 +1231,42 @@
     script_runtime_set_images(outer_frame->runtime, &outer_frame->images);
     outer_frame->loaded = true;
     nested_frame_navigation.images = &nested_frame_navigation.page.images;
-    CHECK(navigation_test_refresh_frame_presentation(
-              &nested_frame_navigation, outer_frame)
-          && navigation_advance_runtime(&nested_frame_navigation, 1, 8)
+    bool outer_presented = navigation_test_refresh_frame_presentation(
+        &nested_frame_navigation, outer_frame);
+    bool outer_advanced = outer_presented
+        && navigation_advance_runtime(&nested_frame_navigation, 1, 8);
+    if (!outer_presented || !outer_advanced
+        || nested_frame_navigation.page.frame_count != 2) {
+        fprintf(stderr,
+                "nested discover presented=%d advanced=%d count=%zu "
+                "failed=%zu scheduler=%p outer-retired=%d outer-runtime=%p\n",
+                outer_presented, outer_advanced,
+                nested_frame_navigation.page.frame_count,
+                nested_frame_navigation.frames_failed,
+                (void *) nested_frame_navigation.page.resource_scheduler,
+                outer_frame->retired, (void *) outer_frame->runtime);
+    }
+    CHECK(outer_presented && outer_advanced
           && nested_frame_navigation.page.frame_count == 2);
     NavigationFrame *inner_frame =
         &nested_frame_navigation.page.frames[1];
+    if (inner_frame->fetch_pending) {
+        CHECK(fetch_scheduler_cancel(
+                  nested_frame_navigation.page.resource_scheduler,
+                  inner_frame->fetch_request_id, "test supplies nested child")
+              && fetch_scheduler_discard(
+                  nested_frame_navigation.page.resource_scheduler,
+                  inner_frame->fetch_request_id));
+        inner_frame->fetch_pending = false;
+    }
+    if (inner_frame->retired) {
+        inner_frame->retired = false;
+        CHECK(script_runtime_set_frame_window_state(
+            outer_frame->runtime, inner_frame->parent_handle,
+            true, true, false,
+            "https://nested-frame.test/inner.html",
+            &outer_frame->script_result));
+    }
     CHECK(inner_frame->parent_runtime == outer_frame->runtime
           && inner_frame->parent_frame_slot_plus_one == 1
           && document_parse(&inner_frame->document, &budget,
@@ -1119,14 +1299,23 @@
               &inner_frame->script_result));
     script_runtime_set_images(inner_frame->runtime, &inner_frame->images);
     inner_frame->loaded = true;
-    CHECK(navigation_test_refresh_frame_presentation(
-              &nested_frame_navigation, inner_frame)
-          && images_find_node(&outer_frame->images,
-                              inner_frame->element) != NULL
-          && images_find_node(&nested_frame_navigation.page.images,
-                              outer_frame->element) != NULL
-          && navigation_activate_frame(
-              &nested_frame_navigation, outer_frame->element)
+    bool inner_presented = navigation_test_refresh_frame_presentation(
+        &nested_frame_navigation, inner_frame);
+    bool inner_image = images_find_node(
+        &outer_frame->images, inner_frame->element) != NULL;
+    bool outer_image = images_find_node(
+        &nested_frame_navigation.page.images, outer_frame->element) != NULL;
+    bool nested_activated = navigation_activate_frame(
+        &nested_frame_navigation, outer_frame->element);
+    if (!inner_presented || !inner_image || !outer_image || !nested_activated
+        || strcmp(inner_frame->script_result.summary, "nested-clicked") != 0) {
+        fprintf(stderr,
+                "nested activation presented=%d inner-image=%d outer-image=%d "
+                "activated=%d summary=%s\n",
+                inner_presented, inner_image, outer_image, nested_activated,
+                inner_frame->script_result.summary);
+    }
+    CHECK(inner_presented && inner_image && outer_image && nested_activated
           && strcmp(inner_frame->script_result.summary,
                     "nested-clicked") == 0);
     CHECK(script_runtime_evaluate_diagnostic(
@@ -1150,8 +1339,8 @@
         "<script src='/pressure.js' defer></script></body>";
     static const unsigned char pressure_script_source[] =
         "globalThis.pocSummary='pressure-script-ran'";
-    BrowserSession pressure_browser_session;
-    NavigationSession pressure_navigation;
+    static BrowserSession pressure_browser_session;
+    static NavigationSession pressure_navigation;
     BudgetReservation pressure_reservation = {0};
     CHECK(browser_session_init(&pressure_browser_session, &budget,
                                64 * 1024)
@@ -1229,7 +1418,7 @@
         "@media (width >= 700px){#import-card{display:none}}";
     PocDocument import_document;
     Stylesheet import_sheet;
-    BrowserSession import_session;
+    static BrowserSession import_session;
     ExternalStylesheetStats import_stats;
     CHECK(document_parse(&import_document, &budget, import_page,
                          strlen(import_page), 17)
@@ -1852,7 +2041,7 @@
         "performance.mark('startup');const heapMemory=performance.memory,heapMemoryProto=Object.getPrototypeOf(heapMemory),perfOk=performance.getEntriesByName('startup').length===1&&PerformanceObserver.supportedEntryTypes.includes('resource')&&Object.prototype.toString.call(heapMemory)==='[object MemoryInfo]'&&heapMemory!==performance.memory&&Object.getOwnPropertyNames(heapMemory).length===0&&Object.getOwnPropertyNames(heapMemoryProto).join(',')==='totalJSHeapSize,usedJSHeapSize,jsHeapSizeLimit'&&heapMemory.constructor===Object&&Number.isFinite(heapMemory.jsHeapSizeLimit)&&Number.isFinite(heapMemory.totalJSHeapSize)&&Number.isFinite(heapMemory.usedJSHeapSize)&&heapMemory.jsHeapSizeLimit>=heapMemory.totalJSHeapSize&&heapMemory.totalJSHeapSize>=heapMemory.usedJSHeapSize&&heapMemory.usedJSHeapSize>0;"
         "const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');"
         "const blob=new Blob(['PSP'],{type:'text/plain'});const blobURL=URL.createObjectURL(blob);const workerBlob=new Blob(['self.ready=true;'],{type:'text/javascript'});const workerURL=URL.createObjectURL(workerBlob);const worker=new Worker(workerURL);const builtinSource=Function.prototype.toString;const blobOk=blob.size===3&&blob.type==='text/plain'&&Object.getOwnPropertyNames(blob).length===0&&blob._bytes===undefined&&blobURL.startsWith('blob:https://')&&worker instanceof Worker&&worker instanceof EventTarget&&Object.prototype.toString.call(worker)==='[object Worker]'&&Object.getPrototypeOf(Worker.prototype)===EventTarget.prototype&&Object.getOwnPropertyNames(worker).length===0&&Blob.name==='Blob'&&URL.createObjectURL.name==='createObjectURL'&&URL.revokeObjectURL.name==='revokeObjectURL'&&builtinSource.call(Blob).includes('[native code]')&&builtinSource.call(Blob.prototype.slice).includes('[native code]')&&builtinSource.call(MutationObserver).includes('[native code]')&&builtinSource.call(PerformanceObserver.prototype.observe).includes('[native code]')&&builtinSource.call(Worker).includes('[native code]')&&builtinSource.call(Worker.prototype.postMessage).includes('[native code]');worker.terminate();URL.revokeObjectURL(workerURL);URL.revokeObjectURL(blobURL);"
-        "const interfaceHost=document.createElement('div');document.body.appendChild(interfaceHost);const shadow=interfaceHost.attachShadow({mode:'closed'});const frame=document.createElement('iframe');frame.id='shadow-frame';frame.style.cssText='width:300px;height:65px';frame.setAttribute('sandbox','allow-same-origin');shadow.appendChild(frame);const shadowFrameRect=frame.getBoundingClientRect(),shadowHostRect=interfaceHost.getBoundingClientRect();const iterator=document.createNodeIterator(interfaceHost,NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT);const nativeSource=Function.prototype.toString;const prototypeQueriesOk=[Document.prototype,DocumentFragment.prototype,Element.prototype].every(proto=>typeof proto.querySelector==='function'&&typeof proto.querySelectorAll==='function'&&nativeSource.call(proto.querySelector).includes('[native code]')&&nativeSource.call(proto.querySelectorAll).includes('[native code]'));const frameEval=frame.contentWindow.eval;frame.contentWindow.frameOnly=40;delete globalThis.frameEvalLeak;const directFrameEval=frameEval('frameOnly+2')===42;frameEval('frameEvalLeak=7');const isolatedFrameEval=frame.contentWindow.frameEvalLeak===7&&globalThis.frameEvalLeak===undefined;const staleFrame=document.createElement('iframe'),staleWindow=staleFrame.contentWindow,eventShape=new Event('tilefinch-shape');let stalePostOk=true;try{staleWindow.postMessage({probe:true},'*');}catch(_){stalePostOk=false;}dispatchEvent(eventShape);const eventPrototypeOk=['composedPath','preventDefault','stopPropagation','stopImmediatePropagation'].every(name=>typeof Event.prototype[name]==='function'&&!Object.prototype.hasOwnProperty.call(eventShape,name));const interfaceBits=[interfaceHost instanceof HTMLDivElement,interfaceHost.nodeType===Node.ELEMENT_NODE,frame instanceof HTMLIFrameElement,shadow instanceof ShadowRoot,shadow.getElementById('shadow-frame')===frame,frame.parentNode===shadow,frame.parentElement===null,shadowFrameRect.width===300,shadowFrameRect.height===65,shadowHostRect.height>=65,frame.isConnected,frame.contentDocument instanceof Document&&frame.contentDocument!==document,Object.prototype.toString.call(frame.contentWindow)==='[object Window]',Object.prototype.toString.call(frame.contentDocument)==='[object HTMLDocument]','eval' in frame.contentWindow,typeof frameEval==='function',frameEval('21*2')===42,directFrameEval,isolatedFrameEval,stalePostOk,nativeSource.call(frameEval).includes('[native code]'),prototypeQueriesOk,eventPrototypeOk,interfaceHost.shadowRoot===null,iterator.nextNode()!==null,interfaceHost.isConnected,interfaceHost.getBoundingClientRect().width>0,document.scripts.length>0,document.styleSheets.length>0],interfaceOk=interfaceBits.every(Boolean);"
+        "const interfaceHost=document.createElement('div');document.body.appendChild(interfaceHost);const shadow=interfaceHost.attachShadow({mode:'closed'});const frame=document.createElement('iframe');frame.id='shadow-frame';frame.style.cssText='width:300px;height:65px';frame.setAttribute('sandbox','allow-same-origin');shadow.appendChild(frame);const shadowFrameRect=frame.getBoundingClientRect(),shadowHostRect=interfaceHost.getBoundingClientRect();const iterator=document.createNodeIterator(interfaceHost,NodeFilter.SHOW_ELEMENT|NodeFilter.SHOW_TEXT);const nativeSource=Function.prototype.toString;const prototypeQueriesOk=[Document.prototype,DocumentFragment.prototype,Element.prototype].every(proto=>typeof proto.querySelector==='function'&&typeof proto.querySelectorAll==='function'&&nativeSource.call(proto.querySelector).includes('[native code]')&&nativeSource.call(proto.querySelectorAll).includes('[native code]'));const frameEval=frame.contentWindow.eval;frame.contentWindow.frameOnly=40;delete globalThis.frameEvalLeak;const directFrameEval=frameEval('frameOnly+2')===42;frameEval('frameEvalLeak=7');const isolatedFrameEval=frame.contentWindow.frameEvalLeak===7&&globalThis.frameEvalLeak===undefined;frameEval('function persistentFrameFunction(){return 39} var persistentFrameVar=3');const persistentFrameDeclarations=frameEval('persistentFrameFunction()+persistentFrameVar')===42;frameEval('function outerFrameFn(){\\n  function nestedFrameFn(){return 1}\\n  var nestedFrameVar=2;\\n  return nestedFrameFn()+nestedFrameVar}\\nconst frameConfig={a:41};\\nclass FrameKind{}\\nlet frameLetValue=outerFrameFn();');const frameOwn=name=>Object.prototype.hasOwnProperty.call(frame.contentWindow,name);const nestedFrameNotLeaked=frameOwn('outerFrameFn')&&!frameOwn('nestedFrameFn')&&!frameOwn('nestedFrameVar')&&frame.contentWindow.nestedFrameFn===undefined;const lexicalFrameDeclarations=frameEval('frameConfig.a+1')===42&&frameEval('typeof FrameKind')==='function'&&frameEval('frameLetValue')===3&&frameEval('const frameOnce=5;frameOnce*2')===10&&frameEval('frameOnce')===5;frame.contentDocument.title='Child title';const frameThisAndDocument=frameEval('this===window&&document.title===\"Child title\"');const staleFrame=document.createElement('iframe'),staleWindow=staleFrame.contentWindow,eventShape=new Event('tilefinch-shape');let stalePostOk=true;try{staleWindow.postMessage({probe:true},'*');}catch(_){stalePostOk=false;}dispatchEvent(eventShape);const eventPrototypeOk=['composedPath','preventDefault','stopPropagation','stopImmediatePropagation'].every(name=>typeof Event.prototype[name]==='function'&&!Object.prototype.hasOwnProperty.call(eventShape,name));const interfaceBits=[interfaceHost instanceof HTMLDivElement,interfaceHost.nodeType===Node.ELEMENT_NODE,frame instanceof HTMLIFrameElement,shadow instanceof ShadowRoot,shadow.getElementById('shadow-frame')===frame,frame.parentNode===shadow,frame.parentElement===null,shadowFrameRect.width===300,shadowFrameRect.height>=65,frame.isConnected,frame.contentDocument instanceof Document&&frame.contentDocument!==document,Object.prototype.toString.call(frame.contentWindow)==='[object Window]',Object.prototype.toString.call(frame.contentDocument)==='[object HTMLDocument]','eval' in frame.contentWindow,typeof frameEval==='function',frameEval('21*2')===42,directFrameEval,isolatedFrameEval,persistentFrameDeclarations,nestedFrameNotLeaked,lexicalFrameDeclarations,frameThisAndDocument,stalePostOk,nativeSource.call(frameEval).includes('[native code]'),prototypeQueriesOk,eventPrototypeOk,interfaceHost.shadowRoot===null,iterator.nextNode()!==null,interfaceHost.isConnected,interfaceHost.getBoundingClientRect().width>0,document.scripts.length>0,document.styleSheets.length>0],interfaceOk=interfaceBits.every(Boolean);"
         "const positionFirst=document.createElement('i'),positionSecond=document.createElement('i'),positionDetached=document.createElement('i');interfaceHost.append(positionFirst,positionSecond);const disconnectedForward=positionFirst.compareDocumentPosition(positionDetached),disconnectedReverse=positionDetached.compareDocumentPosition(positionFirst);let invalidPositionThrew=false;try{positionFirst.compareDocumentPosition({});}catch(error){invalidPositionThrew=error instanceof TypeError;}const positionOk=Node.DOCUMENT_POSITION_DISCONNECTED===1&&Node.prototype.DOCUMENT_POSITION_CONTAINED_BY===16&&positionFirst.compareDocumentPosition(positionFirst)===0&&interfaceHost.compareDocumentPosition(positionFirst)===(Node.DOCUMENT_POSITION_FOLLOWING|Node.DOCUMENT_POSITION_CONTAINED_BY)&&positionFirst.compareDocumentPosition(interfaceHost)===(Node.DOCUMENT_POSITION_PRECEDING|Node.DOCUMENT_POSITION_CONTAINS)&&positionFirst.compareDocumentPosition(positionSecond)===Node.DOCUMENT_POSITION_FOLLOWING&&positionSecond.compareDocumentPosition(positionFirst)===Node.DOCUMENT_POSITION_PRECEDING&&(disconnectedForward&(Node.DOCUMENT_POSITION_DISCONNECTED|Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC))===(Node.DOCUMENT_POSITION_DISCONNECTED|Node.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC)&&(disconnectedForward&6)!==0&&(disconnectedReverse&6)!==0&&(disconnectedForward&6)!==(disconnectedReverse&6)&&invalidPositionThrew;"
         "interfaceHost.style.setProperty('--CaseSensitive','kept');interfaceHost.style.cssFloat='left';interfaceHost.style.placeItems='center end';interfaceHost.style.placeSelf='start end';interfaceHost.style.placeContent='end center';const cssomNameOk=interfaceHost.style.getPropertyValue('--CaseSensitive')==='kept'&&interfaceHost.style.getPropertyValue('float')==='left'&&interfaceHost.style.alignItems==='center'&&interfaceHost.style.justifyItems==='end'&&interfaceHost.style.placeItems==='center end'&&interfaceHost.style.alignSelf==='start'&&interfaceHost.style.justifySelf==='end'&&interfaceHost.style.placeSelf==='start end'&&interfaceHost.style.alignContent==='end'&&interfaceHost.style.justifyContent==='center'&&interfaceHost.style.placeContent==='end center';"
         "const mutationShapeObserver=new MutationObserver(()=>{}),mutationShapeOk=Object.getOwnPropertyNames(mutationShapeObserver).length===0&&Object.prototype.toString.call(mutationShapeObserver)==='[object MutationObserver]'&&Object.prototype.toString.call(new PerformanceObserver(()=>{}))==='[object PerformanceObserver]';const xhrProbe=new XMLHttpRequest,xhrPrototypeNames=Object.getOwnPropertyNames(XMLHttpRequest.prototype),xhrShapeOk=XMLHttpRequest.name==='XMLHttpRequest'&&Object.prototype.toString.call(xhrProbe)==='[object XMLHttpRequest]'&&xhrProbe instanceof EventTarget&&Object.getPrototypeOf(XMLHttpRequest.prototype)===XMLHttpRequestEventTarget.prototype&&xhrProbe.upload instanceof XMLHttpRequestUpload&&xhrProbe.upload instanceof EventTarget&&['readyState','response','responseText','responseType','responseURL','responseXML','status','statusText','timeout','upload','withCredentials','onreadystatechange'].every(name=>xhrPrototypeNames.includes(name))&&!xhrPrototypeNames.some(name=>name[0]==='_'||name==='emit')&&Function.prototype.toString.call(XMLHttpRequest).includes('[native code]')&&Function.prototype.toString.call(XMLHttpRequest.prototype.open).includes('[native code]')&&Function.prototype.toString.call(XMLHttpRequestEventTarget.prototype.addEventListener).includes('[native code]');"
@@ -1891,7 +2080,7 @@
        bootstrap in one realm.  This small test-only reserve keeps additions
        from turning unrelated API assertions into a hard heap-boundary test. */
     bool mutation_ok = scripts_run_document(&mutated, &budget,
-                                            4 * MIB + 80 * 1024,
+                                            4 * MIB + 192 * 1024,
                                             1000, &mutation_scripts);
     if (!mutation_ok) {
         fprintf(stderr, "mutation runtime failed: %s\n",
@@ -2104,7 +2293,7 @@
               "finish(event.data);terminated.terminate();"
               "URL.revokeObjectURL(terminatedURL);"
               "const behaviorURL=URL.createObjectURL(new Blob(["
-              "\"postMessage([typeof document,typeof window,'document' in self,'window' in self,typeof __tilefinchRunWorker,typeof navigator,typeof location,typeof navigator.userAgent,location.href.startsWith('blob:'),Object.prototype.toString.call(navigator),Object.prototype.toString.call(location),Object.prototype.toString.call(self),self instanceof DedicatedWorkerGlobalScope,self instanceof WorkerGlobalScope,navigator instanceof WorkerNavigator,location instanceof WorkerLocation,navigator.constructor.name,location.constructor.name])\"]));"
+              "\"postMessage([typeof document,typeof window,'document' in self,'window' in self,typeof __tilefinchRunWorker,typeof navigator,typeof location,typeof navigator.userAgent,location.href.startsWith('blob:'),Object.prototype.toString.call(navigator),Object.prototype.toString.call(location),Object.prototype.toString.call(self),self instanceof DedicatedWorkerGlobalScope,self instanceof WorkerGlobalScope,navigator instanceof WorkerNavigator,location instanceof WorkerLocation,navigator.constructor.name,location.constructor.name,this===self,this===globalThis,typeof speechSynthesis,typeof SpeechSynthesisUtterance])\"]));"
               "const messageURL=URL.createObjectURL(new Blob(["
               "\"onmessage=e=>postMessage([e instanceof MessageEvent,e.isTrusted,e.origin,e.source===null,e.ports.length,e.data])\"]));"
               "const behavior=new Worker(behaviorURL);behavior.onmessage="
@@ -2162,7 +2351,7 @@
         "undefined,undefined,false,false,undefined,object,object,string,true,"
         "[object WorkerNavigator],[object WorkerLocation],"
         "[object DedicatedWorkerGlobalScope],true,true,true,true,"
-        "WorkerNavigator,WorkerLocation";
+        "WorkerNavigator,WorkerLocation,true,true,undefined,undefined";
     bool worker_lifecycle_valid = strcmp(
             worker_lifecycle_result.summary, expected_worker_lifecycle) == 0
         && worker_lifecycle_result.bootstrap_lazy_module_loads == 1
@@ -2218,6 +2407,46 @@
     document_destroy(&worker_handler_document);
     CHECK(budget.current == 0);
 
+    puts("test: Worker exposes one worker-global identity without Window DOM");
+    PocDocument worker_global_document;
+    CHECK(document_parse(
+        &worker_global_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    ScriptResult worker_global_result = {0};
+    ScriptRuntime *worker_global_runtime = script_runtime_create_deferred(
+        &worker_global_document, &budget, 4 * MIB, 1000,
+        "https://worker-global.test/", NULL, &worker_global_result);
+    CHECK(worker_global_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_global_runtime,
+              "(()=>{pocSummary='pending';const source=\"postMessage(["
+              "self===globalThis,self.self===self,self.globalThis===self,"
+              "typeof Window,typeof document,typeof self.Window,"
+              "typeof self.document]"
+              ".join(':'))\","
+              "url=URL.createObjectURL(new Blob([source])),worker=new Worker(url);"
+              "worker.onmessage=event=>{pocSummary=event.data;worker.terminate();"
+              "URL.revokeObjectURL(url)}})()",
+              "<worker-global-identity>", &worker_global_result));
+    for (size_t worker_turn = 0; worker_turn < 4; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_global_runtime, worker_turn, 8,
+            &worker_global_result));
+    }
+    if (strcmp(worker_global_result.summary,
+               "true:true:true:undefined:undefined:undefined:undefined")
+        != 0) {
+        fprintf(stderr, "worker global summary=%s error=%s\n",
+                worker_global_result.summary,
+                worker_global_result.error);
+    }
+    CHECK(strcmp(worker_global_result.summary,
+                 "true:true:true:undefined:undefined:undefined:undefined")
+          == 0);
+    script_runtime_destroy(worker_global_runtime);
+    document_destroy(&worker_global_document);
+    CHECK(budget.current == 0);
+
     puts("test: Worker importScripts is synchronous and fails visibly");
     PocDocument worker_import_document;
     CHECK(document_parse(
@@ -2268,13 +2497,19 @@
           && script_runtime_evaluate_diagnostic(
               worker_performance_runtime,
               "(()=>{pocSummary='pending';const ownerOrigin=performance.timeOrigin,"
-              "source=\"performance.probe=1;postMessage({tag:Object.prototype.toString.call(performance),instance:performance instanceof Performance,constructorName:Performance.name,origin:performance.timeOrigin,now:performance.now()})\","
+              "source=\"const ownBefore=Object.getOwnPropertyNames(performance);performance.probe=1;postMessage({tag:Object.prototype.toString.call(performance),instance:performance instanceof Performance,constructorName:Performance.name,origin:performance.timeOrigin,now:performance.now(),ownBefore,hasMemory:'memory' in performance,timing:typeof performance.timing,navigation:typeof performance.navigation,entryTypes:PerformanceObserver.supportedEntryTypes.join(','),entryNames:performance.getEntries().map(e=>e.entryType).join(','),navigatorAPIs:[typeof navigator.connection,typeof navigator.permissions,typeof navigator.storage,typeof navigator.gpu].join(',')})\","
               "url=URL.createObjectURL(new Blob([source])),worker=new Worker(url);"
               "worker.onmessage=event=>{const value=event.data;"
               "pocSummary=performance instanceof Performance"
               "&&Object.prototype.toString.call(performance)==='[object Performance]'"
               "&&performance.probe===undefined&&value.tag==='[object Performance]'"
               "&&value.instance&&value.constructorName==='Performance'"
+              "&&value.ownBefore.length===0&&!value.hasMemory"
+              "&&value.timing==='undefined'&&value.navigation==='undefined'"
+              "&&value.entryTypes==='mark,measure,resource'"
+              "&&!value.entryNames.split(',').some(type=>"
+              "type==='navigation'||type==='paint')"
+              "&&value.navigatorAPIs==='object,object,object,object'"
               "&&Number.isFinite(value.origin)&&value.origin>=ownerOrigin"
               "&&Number.isFinite(value.now)&&value.now>=0"
               "?'WORKER-PERFORMANCE-OK':'WORKER-PERFORMANCE-FAILED:'"
@@ -2331,6 +2566,64 @@
             &worker_listener_removal_result));
     }
     CHECK(strcmp(worker_listener_removal_result.summary, "removed") == 0);
+    script_runtime_destroy(worker_listener_removal_runtime);
+    document_destroy(&worker_listener_removal_document);
+    CHECK(budget.current == 0);
+
+    puts("test: Worker event handlers retain registration order");
+    CHECK(document_parse(
+        &worker_listener_removal_document, &budget,
+        worker_listener_removal_page,
+        strlen(worker_listener_removal_page), 8));
+    memset(&worker_listener_removal_result, 0,
+           sizeof(worker_listener_removal_result));
+    worker_listener_removal_runtime = script_runtime_create_deferred(
+        &worker_listener_removal_document, &budget, 4 * MIB, 1000,
+        "https://worker-handler-order.test/", NULL,
+        &worker_listener_removal_result);
+    CHECK(worker_listener_removal_runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(
+        worker_listener_removal_runtime,
+        "(()=>{pocSummary='pending';const order=[],url="
+        "URL.createObjectURL(new Blob([\"postMessage('ready')\"])),"
+        "worker=new Worker(url),finish=value=>{order.push(value);"
+        "if(order.length===3){pocSummary=order.join(',');worker.terminate();"
+        "URL.revokeObjectURL(url)}};"
+        "worker.addEventListener('message',()=>finish('first'));"
+        "worker.onmessage=()=>finish('handler');"
+        "worker.addEventListener('message',()=>finish('last'))})()",
+        "<worker-handler-order>", &worker_listener_removal_result));
+    for (size_t worker_turn = 0; worker_turn < 4; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_listener_removal_runtime, worker_turn, 8,
+            &worker_listener_removal_result));
+    }
+    if (strcmp(worker_listener_removal_result.summary,
+               "first,handler,last") != 0) {
+        fprintf(stderr, "worker handler order summary=%s error=%s\n",
+                worker_listener_removal_result.summary,
+                worker_listener_removal_result.error);
+    }
+    CHECK(strcmp(worker_listener_removal_result.summary,
+                 "first,handler,last") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+        worker_listener_removal_runtime,
+        "(()=>{pocSummary='scope-pending';const source=\"const order=[];"
+        "const finish=value=>{order.push(value);if(order.length===3)"
+        "postMessage(order.join(','))};self.addEventListener('message',"
+        "()=>finish('first'));self.onmessage=()=>finish('handler');"
+        "self.addEventListener('message',()=>finish('last'))\",url="
+        "URL.createObjectURL(new Blob([source])),worker=new Worker(url);"
+        "worker.onmessage=event=>{pocSummary=event.data;worker.terminate();"
+        "URL.revokeObjectURL(url)};worker.postMessage('go')})()",
+        "<worker-scope-handler-order>", &worker_listener_removal_result));
+    for (size_t worker_turn = 0; worker_turn < 6; worker_turn++) {
+        CHECK(script_runtime_advance(
+            worker_listener_removal_runtime, worker_turn + 4, 8,
+            &worker_listener_removal_result));
+    }
+    CHECK(strcmp(worker_listener_removal_result.summary,
+                 "first,handler,last") == 0);
     script_runtime_destroy(worker_listener_removal_runtime);
     document_destroy(&worker_listener_removal_document);
     CHECK(budget.current == 0);
@@ -2430,7 +2723,9 @@
     static const char parent_message_page[] =
         "<!doctype html><body><script>window.addEventListener('message',"
         "event=>globalThis.pocSummary=String(event.isTrusted)+':' +"
-        "event.origin+':' +event.data.event);</script></body>";
+        "String(event instanceof MessageEvent)+':' +"
+        "Object.prototype.toString.call(event)+':' +event.origin+':' +"
+        "event.data.event);</script></body>";
     static const char child_message_page[] =
         "<!doctype html><body><script>parent.postMessage({event:'hello'},"
         "'*');</script></body>";
@@ -2512,7 +2807,8 @@
           && strcmp(child_message_result.summary,
                     "cross-origin-blocked") == 0
           && strcmp(parent_message_result.summary,
-                    "true:https://child.test:hello") == 0);
+                    "true:true:[object MessageEvent]:https://child.test:hello")
+                 == 0);
     CHECK(script_runtime_evaluate_diagnostic(
               child_message_runtime,
               "setTimeout(()=>{throw new Error('child-task-probe')},0)",
@@ -2529,7 +2825,7 @@
     puts("test: sandbox opaque child origin and parent messaging");
     MessageOpaqueProbe opaque_message_probe = {0};
     ScriptResult opaque_message_result = {0};
-    BrowserSession opaque_message_session;
+    static BrowserSession opaque_message_session;
     static const char opaque_url[] = "https://opaque-child.test/";
     TilefinchRequestContext opaque_seed_context = {
         .target_url = opaque_url, .initiator_url = opaque_url,

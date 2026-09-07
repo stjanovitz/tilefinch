@@ -63,6 +63,12 @@ start_url=
 offline_library=
 heap_mb=
 script_file_kb=
+graphics=${TILEFINCH_PPSSPP_GRAPHICS:-opengl}
+case "$graphics" in
+    opengl) graphics_backend='0 (OPENGL)' ;;
+    vulkan) graphics_backend='3 (VULKAN)' ;;
+    *) printf 'TILEFINCH_PPSSPP_GRAPHICS must be opengl or vulkan\n' >&2; exit 2 ;;
+esac
 ppsspp_cpu_mhz=${TILEFINCH_PPSSPP_CPU_MHZ:-${TREADLINE_CPU_MHZ:-0}}
 
 while [ "$#" -gt 0 ]; do
@@ -89,6 +95,16 @@ while [ "$#" -gt 0 ]; do
         *) printf 'unknown option: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
+
+if [ "$scenario" = wikipedia-article-section-live ] || [ "$scenario" = wikipedia-section-input-live ]; then
+    # This receiver trace starts at History; an unfragmented article is a
+    # different layout/input journey and cannot be compared to its golden.
+    case "$start_url" in
+        *'#History') ;;
+        *) printf '%s\n' 'wikipedia-article-section-live requires a #History start URL' >&2
+           exit 2 ;;
+    esac
+fi
 
 case "$runs:$timeout_seconds" in
     *[!0-9:]*|0:*|*:0) printf 'runs and timeout must be positive integers\n' >&2; exit 2 ;;
@@ -317,6 +333,9 @@ run_once() {
     else
         cp "$build_dir/EBOOT.PBP" "$build_dir/roots.pem" \
             "$build_dir/tilefinch-wasm.prx" "$app_dir/"
+        if [ -f "$build_dir/tilefinch-voice.prx" ]; then
+            cp "$build_dir/tilefinch-voice.prx" "$app_dir/"
+        fi
         for asset_dir in fonts voice-model; do
             if [ -d "$build_dir/$asset_dir" ]; then
                 cp -R "$build_dir/$asset_dir" "$app_dir/$asset_dir"
@@ -365,10 +384,25 @@ run_once() {
             "EnableWlan = True" \
             "InfrastructureAutoDNS = True" \
             "[Graphics]" \
-            "GraphicsBackend = 0 (OPENGL)" \
+            "GraphicsBackend = $graphics_backend" \
             "[SystemParam]" \
             "PSPModel = 1" \
             "PSPFirmwareVersion = 660"
+        # Keep the emulated mixer/syscalls running, but never play background
+        # Treadline test audio on the host. Only this disposable run is muted.
+        # PPSSPP 1.20 uses GameVolume; GlobalVolume covers older installations.
+        case "$scenario" in
+            treadline-*)
+                printf '%s\n' \
+                    "[Sound]" \
+                    "Enable = True" \
+                    "GameVolume = 0" \
+                    "GlobalVolume = 0" \
+                    "UIVolume = 0" \
+                    "GamePreviewVolume = 0" \
+                    "AchievementVolume = 0"
+                ;;
+        esac
     } >"$run_dir/script.ini"
     cp "$run_dir/script.ini" \
         "$home_dir/.config/ppsspp/PSP/SYSTEM/ppsspp.ini"
@@ -388,14 +422,14 @@ run_once() {
             --stderr "$emulator_stderr" \
             -a "$ppsspp_bundle" \
             --args \
-            --windowed --escape-exit $debug_flag \
+            --windowed --escape-exit "--graphics=$graphics" $debug_flag \
             "--log=$emulator_log" \
             "--appendconfig=$run_dir/script.ini" \
             "$app_dir/EBOOT.PBP" &
     else
         # shellcheck disable=SC2086
         HOME="$home_dir" "$ppsspp" \
-            --windowed --escape-exit $debug_flag \
+            --windowed --escape-exit "--graphics=$graphics" $debug_flag \
             "--log=$emulator_log" \
             "--appendconfig=$run_dir/script.ini" \
             "$app_dir/EBOOT.PBP" >"$emulator_console" 2>&1 &
@@ -433,7 +467,7 @@ run_once() {
              "$emulator_stderr" "$validation_log"; do
         [ -f "$f" ] && cp "$f" "$run_result/" 2>/dev/null || true
     done
-    for f in "$app_dir"/frame-mark-*.ppm; do
+    for f in "$app_dir"/frame-mark-*.ppm "$app_dir"/data/frame-mark-*.ppm; do
         [ -f "$f" ] && cp "$f" "$run_result/" 2>/dev/null || true
     done
     # The harness's own lines, in order. Nothing here is wall-clock derived,
@@ -470,6 +504,37 @@ while [ "$run_index" -le "$runs" ]; do
 done
 
 trace="$result_dir/run-1/trace.txt"
+# Runtime input is deliberately replayed after the VM task returns. The
+# script cursor can advance at intervening checkpoints, so its current step
+# number (and re-observation of a live mark) is not the input's identity.
+# Keep the raw trace; compare ordered receiver actions, exact action counts,
+# completion and captures without these asynchronous cursor annotations.
+if [ "$scenario" = runtime-input-live ] || [ "$scenario" = runtime-cancel-live ]; then
+    run_index=1
+    while [ "$run_index" -le "$runs" ]; do
+        sed -E '/tilefinch-input-script: mark=/d; s/tilefinch-input-script: step=[0-9]+ action=/tilefinch-input-script: action=/' \
+            "$result_dir/run-$run_index/trace.txt" \
+            > "$result_dir/run-$run_index/semantic-trace.txt"
+        run_index=$((run_index + 1))
+    done
+    trace="$result_dir/run-1/semantic-trace.txt"
+fi
+if [ "$scenario" = wikipedia-navigation-live ] || [ "$scenario" = wikipedia-article-section-live ] \
+    || [ "$scenario" = wikipedia-section-input-live ] \
+    || [ "$scenario" = youtube-results-focus-live ]; then
+    # Faster paint changes which sampled cursor is current when a pending
+    # page press is reported. Preserve marks and exact receiver order/counts.
+    run_index=1
+    while [ "$run_index" -le "$runs" ]; do
+        # Live marks can fall between periodic supervisor presentations;
+        # their latched capture is required below, not this optional observer.
+        sed -E '/tilefinch-input-script: mark=expansion-busy /d; s/tilefinch-input-script: step=[0-9]+ action=/tilefinch-input-script: action=/' \
+            "$result_dir/run-$run_index/trace.txt" \
+            > "$result_dir/run-$run_index/semantic-trace.txt"
+        run_index=$((run_index + 1))
+    done
+    trace="$result_dir/run-1/semantic-trace.txt"
+fi
 [ -s "$trace" ] || {
     printf 'FAIL: the run produced no tilefinch-input-script lines.\n' >&2
     printf 'The EBOOT probably could not read input-script.txt.\n' >&2
@@ -521,6 +586,159 @@ if grep -E '^[[:space:]]*mark-live([[:space:]]|$)' "$script_source" \
         printf 'FAIL: live script wrote no temporal frame.\n' >&2
         exit 1
     }
+fi
+if [ "$scenario" = runtime-input-live ]; then
+    # Raster-time input alone cannot qualify post-load runtime cooperation.
+    grep -Eq 'tilefinch-ui-supervisor-input: scope=page-runtime queued=[1-4] dropped=0' \
+        "$telemetry_log" || {
+        printf 'FAIL: no lossless input queue during page runtime.\n' >&2
+        exit 1
+    }
+    grep -Eq 'tilefinch-ui-supervisor: scope=page-runtime .*presentations=[1-9][0-9]* .*input-acks=[1-9][0-9]* .*max-ack=[1-9][0-9]*us' \
+        "$telemetry_log" || {
+        printf 'FAIL: runtime input had no measured visible acknowledgement.\n' >&2
+        exit 1
+    }
+fi
+if [ "$scenario" = runtime-cancel-live ]; then
+    grep -Eq 'tilefinch-ui-supervisor: scope=page-runtime .*presentations=[1-9][0-9]* .*cancelled=1 .*input-acks=[1-9][0-9]* .*max-ack=[1-9][0-9]*us .*drained=1' \
+        "$telemetry_log" || {
+        printf 'FAIL: Circle did not cancel and drain post-load runtime work with visible feedback.\n' >&2
+        exit 1
+    }
+fi
+if [ "$scenario" = wikipedia-navigation-live ] || [ "$scenario" = youtube-results-focus-live ]; then
+    focus_samples=4
+    focus_budget=150000
+    if [ "$scenario" = youtube-results-focus-live ]; then
+        focus_samples=5
+        focus_budget=200000
+    fi
+    awk -v expected="$focus_samples" -v budget="$focus_budget" '
+    /tilefinch-focus-feedback:/ {
+        count++;
+        for (i=1;i<=NF;i++) if ($i ~ /^elapsed=/) {
+            value=$i; sub(/^elapsed=/,"",value); sub(/us$/,"",value);
+            samples++; if (value !~ /^[0-9]+$/) bad=1;
+            if (value+0 > budget) slow=1;
+        }
+    } END {
+        if (count != expected || samples != expected || bad) {
+            print "FAIL: missing or malformed focus-publication samples." > "/dev/stderr";
+            exit 1;
+        }
+        if (slow) {
+            print "FAIL: focus publication exceeded the " budget " us emulator budget." > "/dev/stderr";
+            exit 1;
+        }
+    }' "$telemetry_log" || exit 1
+fi
+if [ "$scenario" = wikipedia-navigation-live ]; then
+    for mark in focus-one focus-two; do
+        grep -Eq "tilefinch-input-focus-target: mark=$mark .*indicator=(authored|browser) " \
+            "$telemetry_log" || {
+            printf 'FAIL: Wikipedia %s has no visible focus.\n' "$mark" >&2
+            exit 1
+        }
+    done
+    grep -Eq 'tilefinch-control-activation: ok=1 .*elapsed=[1-9][0-9]*us' \
+        "$telemetry_log" || {
+        printf 'FAIL: Wikipedia menu activation was not measured successfully.\n' >&2
+        exit 1
+    }
+    first_rect=$(sed -n 's/.*focus-probe: mark=focus-one visible=[01] rect=\([^ ]*\).*/\1/p' "$telemetry_log" | head -1)
+    second_rect=$(sed -n 's/.*focus-probe: mark=focus-two visible=[01] rect=\([^ ]*\).*/\1/p' "$telemetry_log" | head -1)
+    [ "$first_rect" != "$second_rect" ] || {
+        printf 'FAIL: Wikipedia focus did not move to another element.\n' >&2
+        exit 1
+    }
+    grep -Eq 'tilefinch-input-script-js: mark=focus-(one|two) .*pending=[1-9][0-9]* ' \
+        "$telemetry_log" || {
+        printf 'FAIL: Wikipedia focus was tested only after runtime work finished.\n' >&2
+        exit 1
+    }
+    for mark in focus-one focus-two activated; do
+        [ -s "$result_dir/run-1/frame-mark-$mark.ppm" ] || {
+            printf 'FAIL: missing Wikipedia %s visual evidence.\n' "$mark" >&2
+            exit 1
+        }
+    done
+fi
+if [ "$scenario" = wikipedia-section-input-live ]; then
+    grep -Eq 'tilefinch-control-activation: ok=1 kind=2 .*relayouts=1$' "$telemetry_log" || exit 1
+    grep -Eq 'tilefinch-ui-supervisor-input: scope=page-runtime queued=1 dropped=0' "$telemetry_log" || exit 1
+    grep -Eq 'tilefinch-ui-supervisor-input: replay=0x[0-9a-f]+ remaining=0' "$telemetry_log" || exit 1
+    grep -Eq 'tilefinch-activation-feedback: shown=1 elapsed=[0-9]+us' "$telemetry_log" || exit 1
+    grep -Eq 'tilefinch-input-focus-target: mark=section-after .* id=History ' "$telemetry_log" || exit 1
+    # A live press serviced by a later idle task is not expansion feedback.
+    # Require the sampled button edge and queue publication inside activation,
+    # with ordinary input replay strictly after the transaction completes.
+    awk '/tilefinch-activation-feedback: shown=1 / {ack=NR}
+         /tilefinch-input-script-edge: .*receiver=supervisor ready=0 / {busy=NR}
+         /tilefinch-ui-supervisor-input: scope=page-runtime queued=1 dropped=0/ {queued=NR}
+         /tilefinch-control-activation: ok=1 kind=2 / {done=NR}
+         /tilefinch-ui-supervisor-input: replay=/ {replay=NR}
+         END {exit(!(ack && ack < busy && busy < queued &&
+                     queued < done && done < replay))}' "$telemetry_log" || exit 1
+    awk '/tilefinch-ui-supervisor: scope=page-runtime/ && /input-acks=1 / {
+        seen++;
+        for(i=1;i<=NF;i++) if($i ~ /^max-ack=/) {
+            value=$i; sub(/^max-ack=/,"",value); sub(/us$/,"",value);
+            if(value !~ /^[0-9]+$/ || value+0 > 100000) bad=1;
+        }
+    } END {exit(seen != 1 || bad)}' "$telemetry_log" || exit 1
+    for mark in expansion-busy section-after section-content; do
+        [ -s "$result_dir/run-1/frame-mark-$mark.ppm" ] || exit 1
+    done
+fi
+if [ "$scenario" = wikipedia-article-section-live ]; then
+    grep -Eq 'tilefinch-control-activation: ok=1 kind=2 .*relayouts=1$' "$telemetry_log" || {
+        printf 'FAIL: article section activation did not complete its layout.\n' >&2
+        exit 1
+    }
+    grep -Eq 'tilefinch-input-focus-target: mark=section-after .* id=History ' "$telemetry_log" || {
+        printf 'FAIL: article route did not activate History; inspect the captures.\n' >&2
+        exit 1
+    }
+    grep -Eq 'tilefinch-focus-probe: mark=section-after visible=1 ' "$telemetry_log" || exit 1
+    awk '/tilefinch-control-activation:/ {
+        for (i=1;i<=NF;i++) if ($i ~ /^elapsed=/) {
+            value=$i; sub(/^elapsed=/,"",value); sub(/us$/,"",value);
+            samples++; if (value !~ /^[0-9]+$/ || value+0 > 1250000) bad=1;
+        }
+    } /tilefinch-control-layout:/ && /full=0 / {
+        retained++;
+        for (i=1;i<=NF;i++) if ($i ~ /^flow=/) {
+            value=$i; sub(/^flow=/,"",value); sub(/us$/,"",value);
+            flows++;
+            if (value !~ /^[0-9]+$/ || value+0 > 750000) bad=1;
+        }
+    }
+    END {exit(samples != 1 || retained != 1 || flows != 1 || bad)}' "$telemetry_log" || {
+        printf 'FAIL: article expansion rebuilt resources, exceeded 1.25 s, or flow exceeded 750 ms in PPSSPP.\n' >&2
+        exit 1
+    }
+    for mark in section-before section-after section-content; do
+        [ -s "$result_dir/run-1/frame-mark-$mark.ppm" ] || exit 1
+    done
+    if cmp -s "$result_dir/run-1/frame-mark-section-before.ppm" \
+              "$result_dir/run-1/frame-mark-section-after.ppm"; then
+        printf 'FAIL: section activation did not change the captured page.\n' >&2
+        exit 1
+    fi
+fi
+if [ "$scenario" = section-disclosure-live ]; then
+    [ "$(grep -Ec 'tilefinch-control-activation: ok=1 .*relayouts=1$' "$telemetry_log")" -eq 2 ] || {
+        printf 'FAIL: section expand/collapse did not complete two layout actions.\n' >&2
+        exit 1
+    }
+    grep -Eq 'tilefinch-input-script-js: mark=expanded .*pending=[1-9][0-9]* ' "$telemetry_log" || {
+        printf 'FAIL: section expansion was tested only after runtime work finished.\n' >&2
+        exit 1
+    }
+    for mark in before expanded collapsed; do
+        [ -s "$result_dir/run-1/frame-mark-$mark.ppm" ] || exit 1
+    done
 fi
 if [ "$scenario" = navigation-cancel-live ]; then
     validation_log="$result_dir/run-1/tilefinch-validation.txt"
@@ -611,10 +829,18 @@ fi
 # make a golden meaningless whichever way it compares.
 run_index=2
 while [ "$run_index" -le "$runs" ]; do
-    if ! cmp -s "$trace" "$result_dir/run-$run_index/trace.txt"; then
+    compared_trace="$result_dir/run-$run_index/trace.txt"
+    if [ "$scenario" = runtime-input-live ] || [ "$scenario" = runtime-cancel-live ] \
+        || [ "$scenario" = wikipedia-navigation-live ] \
+        || [ "$scenario" = wikipedia-article-section-live ] \
+        || [ "$scenario" = wikipedia-section-input-live ] \
+        || [ "$scenario" = youtube-results-focus-live ]; then
+        compared_trace="$result_dir/run-$run_index/semantic-trace.txt"
+    fi
+    if ! cmp -s "$trace" "$compared_trace"; then
         printf 'FAIL: run 1 and run %s produced different traces.\n' \
             "$run_index" >&2
-        diff -u "$trace" "$result_dir/run-$run_index/trace.txt" >&2 || true
+        diff -u "$trace" "$compared_trace" >&2 || true
         exit 1
     fi
     run_index=$((run_index + 1))

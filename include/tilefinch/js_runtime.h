@@ -503,7 +503,12 @@ typedef enum {
     SCRIPT_MUTATION_CHILD_LIST,
     /* Pixel-only canvas publication. The DOM and computed style are
        unchanged; navigation may invalidate just the canvas box. */
-    SCRIPT_MUTATION_CANVAS
+    SCRIPT_MUTATION_CANVAS,
+    /* A script inserted from a detached tree into the real HTML head, or
+       removed/reordered within that head, with another element preserving
+       head nonemptiness. Captured before detach: navigation need not
+       dereference a retired node to classify the layout effect. */
+    SCRIPT_MUTATION_HEAD_SCRIPT
 } ScriptMutationKind;
 
 typedef struct {
@@ -1163,6 +1168,7 @@ long script_runtime_node_handle(ScriptRuntime *runtime,
    Use them for controller/layout and script-discovery frontiers. */
 long script_runtime_node_weak_handle(ScriptRuntime *runtime,
                                      lxb_dom_node_t *node);
+void script_runtime_node_handle_release(ScriptRuntime *runtime, long handle);
 /* O(fixed handle-table capacity), allocation-free admission check used before
    a native DOM transaction that will require one new provenance handle. No
    author code runs between this check and registration. */
@@ -1306,6 +1312,8 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack(
     void *source_lease, ScriptSourceLeaseReleaseCallback release_source,
     ScriptResult *result);
 bool script_runtime_consume_relayout(ScriptRuntime *runtime);
+/* Read-only admission check for rollback-safe optional layout work. */
+bool script_runtime_has_pending_mutations(const ScriptRuntime *runtime);
 void script_runtime_telemetry(const ScriptRuntime *runtime,
                               ScriptRuntimeTelemetry *telemetry);
 /* Preserve the first author/runtime failure before a bounded parser stage

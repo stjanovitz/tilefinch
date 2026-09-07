@@ -1,5 +1,6 @@
 #include "tilefinch/xmb_redirect_policy.h"
 
+#undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 

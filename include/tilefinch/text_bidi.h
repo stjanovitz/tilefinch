@@ -13,6 +13,8 @@
 #define TEXT_BIDI_PARAGRAPH_BYTE_LIMIT 8192u
 #define TEXT_BIDI_CODEPOINT_LIMIT 2048u
 #define TEXT_BIDI_RUN_LIMIT 256u
+/* One inline flow may cross explicit Unicode paragraph separators. */
+#define TEXT_BIDI_SEGMENT_LIMIT 32u
 
 typedef enum {
     TEXT_BIDI_BASE_AUTO_LTR = 0,

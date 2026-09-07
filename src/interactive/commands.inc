@@ -1034,7 +1034,7 @@ static void loop_help(void)
 {
     puts("loop commands: status, render [FILE], up|down [HELD], "
          "page-up|page-down, top|bottom, section-walk COUNT, "
-         "focus-next|focus-prev, "
+         "focus-next|focus-prev, tap X Y, click TARGET|X Y, "
          "focus-up|focus-down|focus-left|focus-right, "
          "focus-id ID, focus-url URL, link-urls, body-contains TEXT, "
          "history-controls, "
@@ -1578,13 +1578,33 @@ static bool run_command_loop(FILE *commands, bool interactive,
                 ok = x >= 0 && y >= 0
                     && browser_engine_focus_at(engine, (int) x, (int) y);
             }
+        } else if (strcmp(line, "click") == 0 && argument != NULL) {
+            char *end = NULL;
+            long x = strtol(argument, &end, 10);
+            if (end != argument) {
+                char *y_end = NULL;
+                long y = strtol(end, &y_end, 10);
+                while (y_end != NULL && *y_end == ' ') y_end++;
+                bool activate_pointer = false, page_changed = false;
+                ok = y_end != end && y_end != NULL && *y_end == '\0'
+                    && x >= 0 && y >= 0
+                    && browser_engine_pointer_event(
+                        engine, CONTROLLER_POINTER_DOWN, (int) x, (int) y,
+                        &activate_pointer, &page_changed)
+                    && browser_engine_pointer_event(
+                        engine, CONTROLLER_POINTER_UP, (int) x, (int) y,
+                        &activate_pointer, &page_changed)
+                    && (!activate_pointer
+                        || browser_engine_pointer_commit_click(engine));
+            } else {
+                ok = navigation_dispatch_event(
+                    navigation, argument, "click");
+            }
         } else if (strcmp(line, "type") == 0 && argument != NULL) {
             ok = browser_engine_insert_text(
                 engine, argument, strlen(argument));
         } else if (strcmp(line, "backspace") == 0) {
             ok = browser_engine_backspace(engine);
-        } else if (strcmp(line, "click") == 0 && argument != NULL) {
-            ok = navigation_dispatch_event(navigation, argument, "click");
         } else if (strcmp(line, "js") == 0 && argument != NULL) {
             /* Lab diagnostic: evaluate an expression in the page realm and
                print its completion value (or error), so command scripts can
@@ -1616,6 +1636,14 @@ static bool run_command_loop(FILE *commands, bool interactive,
             }
             if (count > 10000) count = 10000;
             for (unsigned i = 0; ok && i < count; i++) {
+                if (pace_real_time && milliseconds != 0) {
+                    struct timespec delay = {
+                        .tv_sec = (time_t) (milliseconds / 1000u),
+                        .tv_nsec = (long) (
+                            (milliseconds % 1000u) * 1000000u)
+                    };
+                    nanosleep(&delay, NULL);
+                }
                 ok = browser_engine_advance_runtime(
                     engine, milliseconds, 8, NULL);
                 bool media_changed = false;

@@ -34,16 +34,22 @@ wait COUNT
 tap BUTTONS
 hold COUNT BUTTONS
 press COUNT BUTTONS
-stick COUNT DIRECTION
+stick COUNT DIRECTION [BUTTONS]
 mark NAME
 end
 ```
 
 Append `-live` to `wait`, `tap`, `hold`, `press`, `stick`, or `mark` when
 that step must continue while the application reports asynchronous work. For
-example, `wait-live 30` advances for 30 presented frames during a navigation
+example, `wait-live 30` advances for 30 sampled frames during a navigation
 or sustained media session. Without the suffix, a step pauses until the
 ordinary browser loop is ready to accept scripted input.
+
+Use `-page` on the same commands to wait for a committed, painted page but
+not for background resources to finish. These steps run only in the main
+input loop, never inside a runtime cooperation callback. They are useful for
+checking focus and disclosure controls during page startup. Neither suffix
+turns the earlier provisional navigation preview into an interactive document.
 
 `BUTTONS` joins names with `+`: `up`, `down`, `left`, `right`, `cross`,
 `circle`, `triangle`, `square`, `ltrigger`, `rtrigger`, `start`, and `select`.
@@ -52,12 +58,32 @@ file. The boot key accepts only a leaf filename—no separators or `..`.
 
 `hold` holds one chord continuously for the requested frame count. `press`
 emits that many distinct press/release pairs. `stick` accepts `up`, `down`,
-`left`, or `right`. Counts are frame-counted, not time-counted; avoid using
+`left`, `right`, `up-left`, `up-right`, `down-left`, or `down-right`.
+An optional button chord combines nub position and face buttons for Danzeff
+entry. Validation builds feed the same script into the modal Danzeff input
+loop, including its initial release gate; ordinary builds still read only
+the physical controller. For example, `stick 1 right cross`, `wait 1`,
+`stick 1 down-left cross` types `ps`. Finish with `tap rtrigger+start` to
+exercise real form submission rather than injecting a URL.
+Counts are frame-counted, not time-counted; avoid using
 them to qualify shortcuts whose meaning is intentionally millisecond-based.
 
+`wikipedia-native-priority-live.txt` exercises Select, Settings navigation,
+Triangle, and nub motion during a committed page's reflow. Require
+`busy-menu` to show `screen=menu`, `busy-settings` to show `screen=options`,
+and `toolbar-hidden` to report `visible=0`; a completed script alone is not
+success. The old queued path completed while dropping six of these inputs.
+Presentation-only navigation runs on the owner thread's retained-frame
+supervisor; page-changing actions and chords remain with the main receiver.
+Native menus defer new page runtime/resource/raster work. An in-flight
+operation still reaches a safe checkpoint before input can be serviced.
+Correlate `max-ack` with `max-gap` and `tilefinch-cooperate-slow-gap`: the
+former measures presentation after sampling, not physical press-to-display
+latency. Live script steps are themselves checkpoint-driven.
+
 The script does not infer semantic readiness from pixels. Use ordinary steps
-when input must wait for the browser's ready boundary, `-live` steps when the
-scenario deliberately overlaps ongoing work, and correlate `mark` records
+when input must wait for the browser's ready boundary, `-page` for a painted
+document with pending work, `-live` for input within ongoing work, and correlate `mark` records
 with the operation journal to prove the state the scenario reached.
 
 ## Arming a run
@@ -154,6 +180,29 @@ chrome theme, and video scaling.
 Text-entry modals, live navigation, site data, screenshots, and seeded
 collection deletion use separate scenarios because they need external state or
 clock-derived output.
+
+`runtime-input-live` and `runtime-cancel-live` use the bounded cooperative
+runtime fixture. Their goldens preserve action order/counts and captures but
+omit asynchronous cursor positions; the raw trace remains available. Separate
+gates require runtime-specific queue, successful presentation, and cancellation
+evidence. `wikipedia-navigation-live` uses `-page` input and additionally checks
+distinct focus geometry, an authored or browser focus indicator, pending tasks,
+and captures for visual inspection. Menu focus now has a separate 150 ms
+emulator gate; menu activation is timed but still requires full relayout.
+Its golden ignores asynchronous action-cursor annotations, not receiver
+order or captures. A passing action golden alone is not a latency budget.
+See [the fidelity evidence limits](../FIDELITY.md#known-evidence-limits).
+
+`wikipedia-search-keyboard-live` starts at `https://en.wikipedia.org/`, hides
+the toolbar, moves the nub to the search input, enters `psp` through Danzeff,
+and submits with R+Start. Check that `search-loaded` names the newly loaded
+document with `resources-pending=0`; a keyboard-close or action acknowledgement
+alone is not success. This is a live smoke, not a stable page-layout golden.
+`wikipedia-font-cursor-live` alternates nub movement and idle time during
+optional-font publication. Check the font adoption/rollback and owner-thread
+input-acknowledgement records together with the captures. The old fallback
+layout must survive preemption, and font adoption must remain retryable.
+Both scenarios use the normal receiver; neither injects a search-result URL.
 
 ## Reading the trace
 

@@ -27,7 +27,7 @@ static void lazy_trace_memory(ScriptRuntime *runtime, const char *phase,
                               size_t factory_count)
 {
     if (runtime == NULL
-        || getenv("TILEFINCH_TRACE_LAZY_SCRIPTS") == NULL) return;
+        || !tilefinch_trace_lazy_scripts()) return;
     fprintf(stderr,
             "lazy-webpack-memory phase=%s url=\"%s\" source=%zu "
             "factories=%zu current=%zu remaining=%zu javascript=%zu "
@@ -468,7 +468,7 @@ static bool lazy_factory_prepare_compile_working_set(
         &runtime->result.lazy_webpack_compile_admission_rejections, 1);
     budget_record_pressure(runtime->budget, BUDGET_PRESSURE_JAVASCRIPT,
                            program_bytes + heap_working_bytes, reclaimed);
-    if (getenv("TILEFINCH_TRACE_LAZY_SCRIPTS") != NULL) {
+    if (tilefinch_trace_lazy_scripts()) {
         fprintf(stderr,
                 "lazy-webpack-factory-failed bundle=%u factory=%zu "
                 "bytes=%zu page-required=%zu page-remaining=%zu "
@@ -520,7 +520,7 @@ static JSValue lazy_factory_compile(JSContext *context,
         SCRIPT_COMPILE_SOURCE_LAZY_FACTORY, &runtime->result, &admitted);
     budget_free(runtime->budget, program);
     if (!admitted || JS_IsException(compiled)) {
-        if (getenv("TILEFINCH_TRACE_LAZY_SCRIPTS") != NULL) {
+        if (tilefinch_trace_lazy_scripts()) {
             fprintf(stderr,
                     "lazy-webpack-factory-failed bundle=%u factory=%zu "
                     "bytes=%zu admitted=%s stage=compile\n",
@@ -536,7 +536,7 @@ static JSValue lazy_factory_compile(JSContext *context,
     }
     js_rt_saturating_add_size(&runtime->result.lazy_webpack_source_compiles, 1);
     if (!js_rt_runtime_script_checkpoint(runtime, 1)) {
-        if (getenv("TILEFINCH_TRACE_LAZY_SCRIPTS") != NULL) {
+        if (tilefinch_trace_lazy_scripts()) {
             fprintf(stderr,
                     "lazy-webpack-factory-failed bundle=%u factory=%zu "
                     "bytes=%zu stage=checkpoint\n",
@@ -551,7 +551,7 @@ static JSValue lazy_factory_compile(JSContext *context,
     }
     JSValue value = JS_EvalFunction(context, compiled);
     if (JS_IsException(value) || !JS_IsFunction(context, value)) {
-        if (getenv("TILEFINCH_TRACE_LAZY_SCRIPTS") != NULL) {
+        if (tilefinch_trace_lazy_scripts()) {
             fprintf(stderr,
                     "lazy-webpack-factory-failed bundle=%u factory=%zu "
                     "bytes=%zu stage=evaluate\n",
@@ -570,7 +570,7 @@ static JSValue lazy_factory_compile(JSContext *context,
     factory->compiled = JS_DupValue(context, value);
     bundle->compiled_count++;
     js_rt_saturating_add_size(&runtime->result.lazy_webpack_factories_compiled, 1);
-    if (getenv("TILEFINCH_TRACE_LAZY_SCRIPTS") != NULL
+    if (tilefinch_trace_lazy_scripts()
         && (bundle->compiled_count <= 8
             || (bundle->compiled_count & 63u) == 0
             || factory->source_length >= 64u * 1024u)) {
@@ -941,7 +941,7 @@ static bool lazy_preflight_factory_syntax(
         }
         js_rt_saturating_add_size(
             &runtime->result.lazy_webpack_syntax_preflight_failures, 1);
-        if (getenv("TILEFINCH_TRACE_LAZY_SCRIPTS") != NULL) {
+        if (tilefinch_trace_lazy_scripts()) {
             fprintf(stderr,
                     "lazy-webpack-preflight-failed bundle=%u factory=%zu "
                     "bytes=%zu admitted=%s\n",
@@ -1031,7 +1031,7 @@ failed_without_table:
     if (bounds_rejected) {
         js_rt_saturating_add_size(
             &runtime->result.lazy_webpack_residency_rejections, 1);
-        if (getenv("TILEFINCH_TRACE_LAZY_SCRIPTS") != NULL) {
+        if (tilefinch_trace_lazy_scripts()) {
             fprintf(stderr,
                     "lazy-webpack-residency-rejected bundle=%u "
                     "resident-source=%zu candidate-source=%zu limit=%zu "
@@ -1131,7 +1131,7 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack(
         return SCRIPT_LAZY_EVALUATION_FALLBACK;
     }
     js_rt_runtime_arm_watchdog(runtime);
-    if (getenv("TILEFINCH_TRACE_LAZY_SCRIPTS") != NULL) {
+    if (tilefinch_trace_lazy_scripts()) {
         fprintf(stderr,
                 "lazy-webpack-candidate url=\"%s\" bytes=%zu factories=%zu "
                 "factory-bytes=%zu largest=%zu strict=%s\n",
@@ -1157,7 +1157,7 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack(
         /* Registration retains only exact, independently-compressed factory
            source. Grammar preflight compiler objects have already been freed;
            a callable is compiled again only when its stable wrapper is used. */
-        if (getenv("TILEFINCH_TRACE_LAZY_SCRIPTS") != NULL) {
+        if (tilefinch_trace_lazy_scripts()) {
             fprintf(stderr,
                     "lazy-webpack-preflight bundle=%u attempts=%zu "
                     "source-bytes=%zu total-us=%llu\n",
@@ -1202,7 +1202,7 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack(
         js_rt_saturating_add_size(&runtime->result.lazy_webpack_fallbacks, 1);
         JS_RunGC(runtime->runtime);
         (void) budget_quickjs_pool_trim(runtime->quickjs_pool, 0);
-        if (getenv("TILEFINCH_TRACE_LAZY_SCRIPTS") != NULL) {
+        if (tilefinch_trace_lazy_scripts()) {
             fprintf(stderr,
                     "lazy-webpack-fallback url=\"%s\" factories=%zu\n",
                     source_url == NULL ? "" : source_url,
@@ -1241,7 +1241,7 @@ ScriptLazyEvaluation script_runtime_evaluate_external_lazy_webpack(
                         plan->factory_source_bytes);
     js_rt_saturating_add_size(&runtime->result.lazy_webpack_compressed_source_bytes,
                         bundle->compressed_source_length);
-    if (getenv("TILEFINCH_TRACE_LAZY_SCRIPTS") != NULL) {
+    if (tilefinch_trace_lazy_scripts()) {
         fprintf(stderr,
                 "lazy-webpack-applied url=\"%s\" bundle=%u "
                 "source-bytes=%zu transformed-bytes=%zu factories=%zu "

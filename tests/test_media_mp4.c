@@ -2283,6 +2283,28 @@ int main(void)
     media_playback_destroy(playback);
     CHECK(backend_fixture.destroyed == 1);
 
+    CHECK(media_mp4_seek_us(split_video, 0, NULL)
+          && media_mp4_seek_us(split_audio, 0, NULL));
+    backend_fixture = (BackendFixture) {0};
+    playback = media_playback_create_split(
+        &budget, split_video, split_audio, &backend, &playback_options,
+        error, sizeof(error));
+    CHECK(playback != NULL);
+    budget_inject_failure_after(&budget, 0);
+    CHECK(media_playback_advance_bounded(playback, UINT64_C(2000000), 8,
+              error, sizeof(error)) == MEDIA_PLAYBACK_ADVANCE_PENDING);
+    CHECK(error[0] == '\0' && !media_playback_ended(playback));
+    size_t submitted_before_retry = backend_fixture.submitted;
+    budget_inject_failure_after(&budget, 0);
+    CHECK(media_playback_advance_bounded(playback, UINT64_C(2000000), 8,
+              error, sizeof(error)) == MEDIA_PLAYBACK_ADVANCE_PENDING
+          && backend_fixture.submitted == submitted_before_retry);
+    budget_clear_failure_injection(&budget);
+    CHECK(media_playback_advance_bounded(playback, UINT64_C(2000000), 8,
+              error, sizeof(error)) == MEDIA_PLAYBACK_ADVANCE_COMPLETE
+          && backend_fixture.submitted == 4);
+    media_playback_destroy(playback);
+
     /*
      * A blocked split-track head may not strand the independent other track
      * when its sample is already resident and inside the same clock horizon.

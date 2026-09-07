@@ -1,0 +1,9 @@
+# Exercise normal page D-pad input without waiting for deferred thumbnails.
+wait-page 1
+tap-page down
+mark-page result-next
+press-page 4 down
+mark-page result-below-fold
+wait-page 240
+mark-page results-filled
+end

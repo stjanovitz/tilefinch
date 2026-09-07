@@ -1068,11 +1068,20 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
         && requested_timeout_ms < scheduler_timeout_ms) {
         scheduler_timeout_ms = (long) requested_timeout_ms;
     }
+    size_t response_limit = js_fetch_response_limit(bridge);
     uint64_t id = valid && bridge->fetch_scheduler != NULL
         ? fetch_scheduler_enqueue(
             bridge->fetch_scheduler, url, &request,
-            js_fetch_response_limit(bridge), scheduler_timeout_ms)
+            response_limit, scheduler_timeout_ms)
         : 0;
+    /* The JavaScript layer already owns a bounded FIFO in front of this
+       scheduler.  A full shared page domain is therefore backpressure, not a
+       failed Fetch: return the reserved zero sentinel so it can retain the
+       logical request and retry after another native completion.  All policy,
+       URL and request-shape failures continue to throw below. */
+    bool scheduler_deferred = id == 0 && valid
+        && fetch_scheduler_enqueue_would_block(
+               bridge->fetch_scheduler, response_limit);
 #ifndef TILEFINCH_NO_TRACE
     if (getenv("TILEFINCH_TRACE_NETWORK_RESPONSES") != NULL) {
         fprintf(stderr,
@@ -1089,6 +1098,7 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
     if (content_type != NULL) JS_FreeCString(context, content_type);
     if (extra_headers != NULL) JS_FreeCString(context, extra_headers);
     if (id == 0) {
+        if (scheduler_deferred) return JS_NewInt32(context, 0);
         if (!request_valid) {
             return script_throw_request_validation(context, validation);
         }

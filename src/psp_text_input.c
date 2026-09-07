@@ -30,6 +30,35 @@ static unsigned int psp_text_input_gu_list[PSP_GU_LIST_WORDS]
 static bool text_input_cancel_requested(
     const PspTextInputService *service);
 
+static int text_input_poll(const PspTextInputService *service, SceCtrlData *pad)
+{
+    int result = sceCtrlPeekBufferPositive(pad, 1);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    PspUiInput input = { .analog_x = 128, .analog_y = 128 };
+    if (service->validation_poll != NULL && service->validation_poll(&input)) {
+        static const unsigned physical[] = {
+            PSP_CTRL_UP, PSP_CTRL_DOWN, PSP_CTRL_LEFT, PSP_CTRL_RIGHT,
+            PSP_CTRL_CROSS, PSP_CTRL_CIRCLE, PSP_CTRL_TRIANGLE, PSP_CTRL_SQUARE,
+            PSP_CTRL_LTRIGGER, PSP_CTRL_RTRIGGER, PSP_CTRL_START, PSP_CTRL_SELECT
+        };
+        static const unsigned logical[] = {
+            PSP_UI_BUTTON_UP, PSP_UI_BUTTON_DOWN, PSP_UI_BUTTON_LEFT, PSP_UI_BUTTON_RIGHT,
+            PSP_UI_BUTTON_CONFIRM, PSP_UI_BUTTON_CANCEL, PSP_UI_BUTTON_TOOLBAR, PSP_UI_BUTTON_RELOAD,
+            PSP_UI_BUTTON_PAGE_UP, PSP_UI_BUTTON_PAGE_DOWN, PSP_UI_BUTTON_ADDRESS, PSP_UI_BUTTON_MENU
+        };
+        pad->Buttons = 0;
+        for (size_t at = 0; at < sizeof(physical) / sizeof(physical[0]); at++)
+            if ((input.held & logical[at]) != 0) pad->Buttons |= physical[at];
+        pad->Lx = input.analog_x;
+        pad->Ly = input.analog_y;
+        return 1;
+    }
+#else
+    (void) service;
+#endif
+    return result;
+}
+
 /* A modal keyboard samples the controller directly for many frames. Face
    buttons used as Danzeff characters therefore remain accumulated in the
    process-wide controller latch even though the keyboard already consumed
@@ -320,7 +349,7 @@ static bool open_danzeff_keyboard(
         if (text_input_cancel_requested(service)) goto cancelled;
         psp_log_heartbeat();
         sceDisplayWaitVblankStart();
-        if (sceCtrlPeekBufferPositive(&pad, 1) <= 0)
+        if (text_input_poll(service, &pad) <= 0)
             memset(&pad, 0, sizeof(pad));
     } while ((pad.Buttons & input_buttons) != 0);
 
@@ -330,7 +359,7 @@ static bool open_danzeff_keyboard(
         if (text_input_cancel_requested(service)) goto cancelled;
         psp_log_heartbeat();
         sceDisplayWaitVblankStart();
-        if (sceCtrlPeekBufferPositive(&pad, 1) <= 0) continue;
+        if (text_input_poll(service, &pad) <= 0) continue;
         unsigned pressed = pad.Buttons & ~previous_buttons;
         previous_buttons = pad.Buttons;
         unsigned next_cell = danzeff_input_cell(pad.Lx, pad.Ly);

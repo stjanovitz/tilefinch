@@ -1332,4 +1332,65 @@
       },
     });
   };
+  globalThis.__tilefinchMakeDetachedStyle = (node) => {
+    let text = "", values = Object.create(null), count = 0;
+    const limit = 128,
+      parse = (source) => {
+        text = String(source).slice(0, 16 * 1024);
+        values = Object.create(null);
+        count = 0;
+        for (const part of text.split(";")) {
+          const at = part.indexOf(":"), name = cssName(part.slice(0, at).trim());
+          if (at > 0 && name && !(name in values) && count < limit) {
+            values[name] = part.slice(at + 1).trim();
+            count++;
+          }
+        }
+      },
+      publish = () => {
+        text = Object.keys(values).slice(0, limit)
+          .map((name) => name + ": " + values[name]).join("; ");
+        if (text) node.setAttribute("style", text);
+        else node.removeAttribute("style");
+      },
+      base = {
+        get cssText() { return text; },
+        set cssText(value) { parse(value); publish(); },
+        setProperty(name, value) {
+          name = cssName(name);
+          const present = name in values;
+          if (!name || (!present && count >= limit)) return;
+          if (String(value) === "") {
+            if (present) count--;
+            delete values[name];
+          } else {
+            if (!present) count++;
+            values[name] = String(value);
+          }
+          publish();
+        },
+        getPropertyValue(name) { return values[cssName(name)] || ""; },
+        removeProperty(name) {
+          name = cssName(name);
+          const old = values[name] || "";
+          if (name in values) {
+            delete values[name];
+            count--;
+          }
+          publish();
+          return old;
+        },
+      };
+    parse(node.getAttribute("style") || "");
+    return new Proxy(base, {
+      get(target, name) {
+        return name in target ? target[name] : target.getPropertyValue(name);
+      },
+      set(target, name, value) {
+        if (name === "cssText") target.cssText = value;
+        else target.setProperty(name, value);
+        return true;
+      },
+    });
+  };
 })();

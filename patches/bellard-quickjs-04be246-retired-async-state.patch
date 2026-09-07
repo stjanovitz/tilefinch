@@ -1,0 +1,18 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -18217,3 +18217,5 @@
+             ctx = b->realm;
+-            if (ctx->host_retired) return JS_UNDEFINED;
++            /* A retired resume has not produced an interpreter return slot. */
++            if (ctx->host_retired)
++                return JS_ThrowTypeError(caller_ctx, "script realm retired");
+             var_refs = p->u.func.var_refs;
+@@ -21367,3 +21369,7 @@
+     b = p->u.func.function_bytecode;
++    if (b->realm->host_retired) {
++        JS_ThrowTypeError(ctx, "script realm retired");
++        return NULL;
++    }
+     arg_buf_len = max_int(b->arg_count, argc);
+     s = js_malloc(ctx, sizeof(*s) + sizeof(JSValue) * (arg_buf_len + b->var_count + b->stack_size) + sizeof(JSVarRef *) * b->var_ref_count);

@@ -386,6 +386,12 @@ bool browser_session_client_hints_put(
 bool browser_session_client_hints_get(
     BrowserSession *session, const char *url, char *tokens,
     size_t tokens_capacity, char *origin, size_t origin_capacity);
+/* Read-only view used while constructing a request envelope.  The returned
+   pointers remain owned by the session and are valid until the next client
+   hint policy update; transports snapshot them before enqueue returns. */
+bool browser_session_client_hints_peek(
+    const BrowserSession *session, const char *url,
+    const char **tokens, const char **origin);
 bool browser_session_set_mixed_content_site_allowed(
     BrowserSession *session, const char *url, bool allowed);
 bool browser_session_mixed_content_site_allowed(

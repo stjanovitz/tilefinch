@@ -15,6 +15,9 @@
 #include "tilefinch/update_history.h"
 #include "tilefinch/voice_component.h"
 #include "tilefinch/wasm_runtime.h"
+#ifdef TILEFINCH_HAVE_PSP_VOICE
+#include "stt_component_loader.h"
+#endif
 #include "tilefinch_compiler.h"
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
 #include "psp_multiplayer.h"
@@ -1440,6 +1443,7 @@ static TILEFINCH_OUT_OF_LINE bool psp_site_data_restore_idle_pump(
 #endif
     uint32_t active_download = 0;
     if (input->held != 0 || input->pressed != 0
+        || psp_ui_page_work_paused(&app->process->presentation.ui)
         || !cache_restore_may_run || page_dirty || render_job_pending
         || browser_engine_navigation_pending(app->browser->engine)
         || app->browser->media.ui.visible
@@ -1918,6 +1922,7 @@ static TILEFINCH_OUT_OF_LINE bool psp_deferred_image_after_present(
         ? NULL : browser_engine_navigation(app->browser->engine);
     if (app == NULL || app->browser == NULL || app->process == NULL
         || page_idle_pumped
+        || psp_ui_page_work_paused(&app->process->presentation.ui)
         || render_job_pending || site_data_restore_work || input_active
         || app->browser->media.ui.visible
         || psp_media_open_work_pending(&app->browser->media)
@@ -1931,8 +1936,15 @@ static TILEFINCH_OUT_OF_LINE bool psp_deferred_image_after_present(
                app->process->presentation.ui.screen)
         || psp_navigation_cooperate_active()) return false;
     bool visual_changed = false;
+    if (app->views != NULL)
+        psp_runtime_cooperate_begin(
+            &app->process->presentation.ui, app->views->frame,
+            &app->interactive->toolbar_input);
     (void) browser_engine_run_deferred_image_work(
         app->browser->engine, &visual_changed);
+    uint32_t observed_buttons = 0;
+    if (psp_runtime_cooperate_end(&observed_buttons))
+        app->interactive->previous_buttons = psp_ui_buttons(observed_buttons);
     return visual_changed;
 }
 
@@ -1966,6 +1978,7 @@ static TILEFINCH_OUT_OF_LINE bool psp_schedule_page_render_work(
         frame->page_dirty = false;
         return false;
     }
+    if (psp_ui_page_work_paused(&app->process->presentation.ui)) return false;
     if (frame->page_dirty) {
         if (!*render_job_pending) {
             *render_job_last_progress_us =
@@ -1982,7 +1995,18 @@ static TILEFINCH_OUT_OF_LINE bool psp_schedule_page_render_work(
         return false;
     }
     bool idle_visual_changed = false;
+    /* Font/image completion may rebuild a large article. Reuse the lazy,
+       owner-thread-only safe-point supervisor used for runtime mutations:
+       small slices stay cheap, while long layout keeps input acknowledgement
+       and cancellation alive without a concurrent scanout writer. */
+    if (app->views != NULL)
+        psp_runtime_cooperate_begin(
+            &app->process->presentation.ui, app->views->frame,
+            &app->interactive->toolbar_input);
     (void) browser_engine_run_idle_work(engine, &idle_visual_changed);
+    uint32_t idle_observed_buttons = 0;
+    if (psp_runtime_cooperate_end(&idle_observed_buttons))
+        app->interactive->previous_buttons = psp_ui_buttons(idle_observed_buttons);
     if (idle_visual_changed) {
         psp_presentation_bind_chrome_fonts(
             &app->process->presentation, engine);
@@ -2637,6 +2661,34 @@ void psp_webgl_measurement_mark(const char *mark)
 }
 #endif
 
+static TILEFINCH_OUT_OF_LINE bool psp_dispatch_page_pointer(
+    PspApp *app, const PspUiIntent *intent, bool *activate, bool *changed)
+{
+    /* Hover can execute author listeners and relayout just like a timer.
+       Keep native input alive on the retained frame throughout that work. */
+    bool supervise = !psp_navigation_cooperate_active();
+    if (supervise)
+        psp_runtime_cooperate_begin(&app->process->presentation.ui,
+                                    app->views->frame, &app->interactive->toolbar_input);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t started = sceKernelGetSystemTimeWide();
+#endif
+    bool okay = browser_engine_pointer_event(
+        app->browser->engine, (ControllerPointerPhase) intent->pointer_phase,
+        intent->pointer_x, intent->pointer_y, activate, changed);
+    uint32_t observed_buttons = 0;
+    if (supervise && psp_runtime_cooperate_end(&observed_buttons))
+        app->interactive->previous_buttons = psp_ui_buttons(observed_buttons);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    uint64_t elapsed = sceKernelGetSystemTimeWide() - started;
+    if (elapsed > UINT64_C(33000))
+        printf("tilefinch-pointer-dispatch: phase=%u elapsed=%lluus changed=%d\n",
+               (unsigned) intent->pointer_phase, (unsigned long long) elapsed,
+               *changed ? 1 : 0);
+#endif
+    return okay;
+}
+
 static TILEFINCH_OUT_OF_LINE bool psp_advance_page_runtime(
     PspApp *app, bool *layout_changed)
 {
@@ -2652,6 +2704,9 @@ static TILEFINCH_OUT_OF_LINE bool psp_advance_page_runtime(
         && !app->browser->media.ui.visible;
     (void) browser_engine_set_page_visibility(
         app->browser->engine, page_visible);
+    /* Native menus own the input turn. Keep page state retained, but do not
+       start another author task/reflow between successive menu presses. */
+    if (psp_ui_page_work_paused(&app->process->presentation.ui)) return true;
     if (app->interactive->provider_handoff_present_pending) {
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         psp_runtime_handoff_deferrals++;
@@ -2685,14 +2740,32 @@ static TILEFINCH_OUT_OF_LINE bool psp_advance_page_runtime(
     ScriptRuntime *timed_runtime = timed_navigation == NULL
         ? NULL : timed_navigation->page.runtime;
     (void) script_runtime_timing_metrics(timed_runtime, &timing_before);
+    uint64_t layout_before = timed_navigation == NULL ? 0
+        : timed_navigation->performance.layout_us;
+    uint64_t resource_before = timed_navigation == NULL ? 0
+        : timed_navigation->performance.resource_us;
 #endif
+    /* The engine framebuffer remains the last completed page during runtime
+       mutation/layout. Only the owner thread may present it at cooperative
+       checkpoints: arbitrary author tasks can also submit synchronous GE
+       work, so the callback-thread presenter must remain excluded. */
+    if (page_visible && app->views != NULL)
+        psp_runtime_cooperate_begin(
+            &app->process->presentation.ui, app->views->frame,
+            &app->interactive->toolbar_input);
     bool advanced = browser_engine_advance_runtime(
         app->browser->engine, (unsigned) app->process->config.tick_ms, 2,
         layout_changed);
+    uint32_t runtime_observed_buttons = 0;
+    if (psp_runtime_cooperate_end(&runtime_observed_buttons))
+        app->interactive->previous_buttons = psp_ui_buttons(runtime_observed_buttons);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t elapsed_us =
         (uint64_t) sceKernelGetSystemTimeWide() - started_us;
     ScriptRuntimeTimingMetrics timing_after = {0};
+    /* Cancellation/allocation refusal can retire the runtime in this call. */
+    timed_runtime = timed_navigation == NULL ? NULL
+        : timed_navigation->page.runtime;
     (void) script_runtime_timing_metrics(timed_runtime, &timing_after);
     uint64_t callback_us = timing_after.timer_callback_us
             >= timing_before.timer_callback_us
@@ -2731,6 +2804,17 @@ static TILEFINCH_OUT_OF_LINE bool psp_advance_page_runtime(
             - navigation_runtime_before : 0;
     uint64_t damage_apply_us = elapsed_us > navigation_runtime_us
         ? elapsed_us - navigation_runtime_us : 0;
+    if (elapsed_us > UINT64_C(100000)) {
+        printf("tilefinch-page-slow-advance: call=%zu elapsed=%lluus "
+               "script=%lluus layout=%lluus resource=%lluus damage=%lluus\n",
+               psp_runtime_advance_calls, (unsigned long long) elapsed_us,
+               (unsigned long long) script_runtime_us,
+               (unsigned long long) (timed_navigation == NULL ? 0
+                   : timed_navigation->performance.layout_us - layout_before),
+               (unsigned long long) (timed_navigation == NULL ? 0
+                   : timed_navigation->performance.resource_us - resource_before),
+               (unsigned long long) damage_apply_us);
+    }
     psp_runtime_advance_calls++;
     psp_runtime_advance_total_us += elapsed_us;
     if (elapsed_us > psp_runtime_advance_maximum_us)
@@ -2785,7 +2869,7 @@ static TILEFINCH_OUT_OF_LINE void psp_log_parser_checkpoint_refusals(
            performance->parser_script_stage_work_breakers);
 }
 
-/* Ordinary page changes retain the one-tile/2 ms input-latency discipline.
+/* Ordinary page changes retain the four-tile/2 ms input-latency discipline.
    A canvas animation has already spent its JavaScript turn producing a whole
    coherent frame, so finish as many visible tiles as fit in one 12 ms slice.
    This keeps the compositor slice below one 60 Hz interval while preventing
@@ -3063,6 +3147,21 @@ static TILEFINCH_OUT_OF_LINE void psp_apply_storage_and_site_intent(
         240);
 }
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static TILEFINCH_OUT_OF_LINE void psp_boot_input_probe(uint64_t sample_us)
+{
+    static uint64_t started_us;
+    if (sample_us == 0) {
+        started_us = (uint64_t) sceKernelGetSystemTimeWide();
+    } else if (started_us != 0) {
+        printf("tilefinch-boot-input: first-sample=%lluus entry-wait=%lluus\n",
+               (unsigned long long) sample_us,
+               (unsigned long long) (sample_us - started_us));
+        started_us = 0;
+    }
+}
+#endif
+
 /* The resident frame loop. It borrows physical owners and returns only
    cleanup telemetry; lifecycle authority remains in the media and network
    machines reached through PspApp. */
@@ -3219,7 +3318,10 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
     bool media_stability_lifecycle_injected = false;
     uint64_t previous_ui_sample_us =
         (uint64_t) sceKernelGetSystemTimeWide();
-    bool fast_page_followup = false;
+    /* HOME has just been latched. Sample its first input without another
+       vblank wait; the flag is consumed once below, and later frames retain
+       the ordinary presentation/cadence rules. */
+    bool fast_page_followup = native_home_boot;
     uint64_t next_color_mode_check_us =
         previous_ui_sample_us + UINT64_C(60000000);
     unsigned power_worker_completions = 0;
@@ -3228,10 +3330,6 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
     uint64_t power_idle_ms = 0;
     uint64_t power_transition_ms = 0;
     size_t lifecycle_network_requests_cancelled = 0;
-    unsigned reader_shortcut_hold_ms = 0;
-    bool reader_shortcut_held = false;
-    bool reader_shortcut_triggered = false;
-    bool reader_shortcut_started_on_page = false;
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
     bool lifecycle_network_was_started = false;
     bool lifecycle_network_was_ready = false;
@@ -3628,6 +3726,9 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         PspAppFrameState frame;
         frame.ui_sample_us =
             (uint64_t) sceKernelGetSystemTimeWide();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        psp_boot_input_probe(frame.ui_sample_us);
+#endif
         bool color_mode_visual_changed = false;
         if (frame.ui_sample_us >= next_color_mode_check_us) {
             bool was_dark = process->presentation.ui.page_dark;
@@ -3718,12 +3819,17 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     && !browser->media.ui.resolving
                     && !browser->media.ui.failed
                     && browser->media.playback != NULL;
-                bool scripted_ready =
+                bool scripted_surface_ready =
                     scripted_background_idle
                     && !process->presentation.ui.loading
                     && !render_job_pending
                     && (!browser->media.ui.visible || scripted_media_ready)
-                    && !browser_engine_navigation_pending(browser->engine)
+                    && !browser_engine_navigation_pending(browser->engine);
+                bool scripted_page_ready = scripted_surface_ready
+                    && process->presentation.ui.base_screen == PSP_UI_SCREEN_PAGE
+                    && engine_views->navigation != NULL
+                    && engine_views->navigation->page.loaded;
+                bool scripted_ready = scripted_surface_ready
                     && !navigation_background_resources_pending(
                            engine_views->navigation);
                 if (supervisor_owns_script) {
@@ -3731,7 +3837,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     input.analog_x = 128;
                     input.analog_y = 128;
                 } else if (!psp_input_script_frame(
-                               &input, scripted_ready)) {
+                               &input, scripted_ready, scripted_page_ready)) {
                     psp_exit_plan_request(
                         &interactive->exit, PSP_EXIT_VALIDATION_COMPLETE);
                     continue;
@@ -3753,33 +3859,17 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         interactive->previous_buttons = input.held;
         bool gamepad_visual_changed = psp_update_page_gamepad(
             &app, &input, ui_elapsed_ms, frame.ui_sample_us);
-        bool reader_shortcut = false;
-        bool toolbar_held =
-            (input.held & PSP_UI_BUTTON_TOOLBAR) != 0;
-        if (toolbar_held && !reader_shortcut_held) {
-            reader_shortcut_hold_ms = 0;
-            reader_shortcut_triggered = false;
-            reader_shortcut_started_on_page =
-                process->presentation.ui.screen == PSP_UI_SCREEN_PAGE && !browser->media.ui.visible;
-        }
-        if (toolbar_held && reader_shortcut_started_on_page) {
-            input.pressed &= ~PSP_UI_BUTTON_TOOLBAR;
-            if (reader_shortcut_hold_ms < 1000u)
-                reader_shortcut_hold_ms += ui_elapsed_ms;
-            if (reader_shortcut_hold_ms >= 700u
-                && !reader_shortcut_triggered) {
-                reader_shortcut = true;
-                reader_shortcut_triggered = true;
-            }
-        } else if (!toolbar_held && reader_shortcut_held) {
-            if (reader_shortcut_started_on_page
-                && !reader_shortcut_triggered)
-                input.pressed |= PSP_UI_BUTTON_TOOLBAR;
-            reader_shortcut_hold_ms = 0;
-            reader_shortcut_triggered = false;
-            reader_shortcut_started_on_page = false;
-        }
-        reader_shortcut_held = toolbar_held;
+        uint64_t toolbar_sample_ms = frame.ui_sample_us / 1000u;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if (psp_input_script_running())
+            toolbar_sample_ms = interactive->toolbar_input.sample_ms + ui_elapsed_ms;
+#endif
+        bool reader_shortcut = psp_ui_filter_toolbar_input(
+            &interactive->toolbar_input, &input,
+            process->presentation.ui.screen == PSP_UI_SCREEN_PAGE
+                && !browser->media.ui.visible, toolbar_sample_ms);
+        reader_shortcut |= interactive->toolbar_input.reader_pending;
+        interactive->toolbar_input.reader_pending = false;
         bool power_auto_started_visual = false;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         bool power_auto_start_ready =
@@ -4446,10 +4536,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         if (!navigation_pending
             && intent.pointer_phase != PSP_UI_POINTER_NONE) {
             bool pointer_page_changed = false;
-            if (!browser_engine_pointer_event(
-                browser->engine,
-                (ControllerPointerPhase) intent.pointer_phase,
-                intent.pointer_x, intent.pointer_y,
+            if (!psp_dispatch_page_pointer(
+                &app, &intent,
                 &frame.pointer_activation, &pointer_page_changed)) {
                 frame.pointer_activation = false;
             }
@@ -4480,13 +4568,12 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         bool predispatch_complete = cursor_feedback_presented;
         if (action_ack != NULL
             && !psp_navigation_cooperate_supervised()) {
-            psp_ui_show_status(&process->presentation.ui, action_ack, 90);
             /* Input receipt and operation completion are separate visual
                events. Publish this one before dispatching the action. */
-            psp_present(engine_views->frame, &process->presentation.ui);
-            predispatch_presented = true;
-            printf("tilefinch-input-ack: action=%s immediate=yes\n",
-                   discrete_action);
+            predispatch_presented = psp_present_action_ack(
+                engine_views->frame, &process->presentation.ui,
+                intent.action, action_ack, frame.ui_sample_us)
+                || predispatch_presented;
         } else if (psp_ui_intent_has_predispatch_visual(&intent)
                    && input.pressed != 0
                    && !psp_navigation_cooperate_supervised()) {
@@ -4502,6 +4589,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
            frame; the receiver lives out of line in another translation unit. */
         if (intent.action != PSP_UI_ACTION_NONE)
             psp_app_dispatch_action(&app, &frame, &intent);
+        if (psp_ui_set_page_activation(&process->presentation.ui, false))
+            intent.visual_changed = true;
         if (discrete_operation != 0) {
             psp_log_set_phase(PSP_LOG_PHASE_INTERACTIVE);
             psp_log_operation_end(
@@ -4590,7 +4679,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         /* After both receivers, so the line records a screen the
            dispatch has already moved to rather than the one it left. */
         psp_input_script_observe(&intent, &process->presentation.ui);
-        psp_input_script_observe_page(engine_views->navigation);
+        psp_input_script_observe_page(engine_views);
 #endif
         if (intent.load_content_blocker_allowlist_requested) {
             BrowserProfileAllowlistImport imported = {0};
@@ -4746,7 +4835,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 (uint64_t) sceKernelGetSystemTimeWide();
             if (site_data_waiting) {
                 /* Deferred localStorage is part of boot recovery, not network
-                   progress. Start the 35-second navigation watchdog only once
+                   progress. Start the one-minute navigation watchdog only once
                    the candidate is actually allowed to pump. */
                 interactive->navigation_job_started_us = now_us;
             }
@@ -5540,7 +5629,13 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         psp_reconcile_page_render_before_raster(
             &app, &frame, &render_job_pending,
             &render_job_last_progress_us);
-        if (render_job_pending) {
+        /* Time spent serving a native menu is not a stalled raster job. */
+        if (render_job_pending
+            && psp_ui_page_work_paused(&process->presentation.ui))
+            render_job_last_progress_us =
+                (uint64_t) sceKernelGetSystemTimeWide();
+        if (render_job_pending
+            && !psp_ui_page_work_paused(&process->presentation.ui)) {
             psp_log_set_phase(PSP_LOG_PHASE_RENDER);
             psp_log_heartbeat();
             bool canvas_render =
@@ -5680,7 +5775,11 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             && profile_flush_attempted) {
             printf("tilefinch-profile: deferred save failed\n");
         }
+        /* A page-render cancellation may consume page_dirty, but cannot
+           consume the native player's first-presentation obligation. Keep
+           retrying it independently until scanout publication succeeds. */
         if (frame.page_dirty || render_visual_state != 0
+            || interactive->provider_handoff_present_pending
             || (intent.visual_changed
                 && !(predispatch_presented && predispatch_complete))
             || media_visual_changed
@@ -5694,7 +5793,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                 uint64_t canvas_present_started_us =
                     (uint64_t) sceKernelGetSystemTimeWide();
 #endif
-                psp_present(engine_views->frame, &process->presentation.ui);
+                bool published = psp_present(
+                    engine_views->frame, &process->presentation.ui);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
                 uint64_t canvas_present_finished_us =
                     (uint64_t) sceKernelGetSystemTimeWide();
@@ -5709,7 +5809,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                    page-memory trim. Resolver work was held above for this
                    presentation, so the trim cannot race decoder admission. */
                 psp_app_pump_provider_handoff_reclaim(
-                    &app, frame.ui_sample_us, true);
+                    &app, frame.ui_sample_us, published);
             }
         }
         /* The current input response is already visible. A newly decoded
@@ -6255,6 +6355,9 @@ static TILEFINCH_COLD_PATH PspShutdownReport psp_browser_close(
     browser_tabs_destroy(browser->tabs);
     browser->tabs = NULL;
     psp_presentation_unbind_chrome_fonts(&process->presentation);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    psp_focus_feedback_begin(NULL, 0, 0);
+#endif
     browser_engine_destroy(browser->engine);
     browser->engine = NULL;
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
@@ -6488,12 +6591,6 @@ int main(int argc, char *argv[])
         fflush(stdout);
     }
     psp_display_set_validation_logger(psp_log_printf);
-    psp_present_boot_entrance(
-        1u,
-        persistent_log_started
-            ? "DIAGNOSTIC LOG: TILEFINCH/DATA"
-            : "DIAGNOSTIC LOG UNAVAILABLE",
-        false, NULL);
 #else
     bool persistent_log_started = false;
 #endif
@@ -6581,9 +6678,10 @@ int main(int argc, char *argv[])
            scePowerGetCpuClockFrequencyInt(),
            scePowerGetBusClockFrequencyInt(),
            sceKernelTotalFreeMemSize(), sceKernelMaxFreeMemSize());
+    /* This marks native services, not a JavaScript realm. Native HOME never
+       initializes author-script execution. */
     PSP_BOOT_TIMING_MARK("runtime-ready");
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
-    psp_clock_validation_probe();
     psp_power_log_battery("boot", PSP_POWER_TEST_OFF, 0);
     uint64_t validation_free_space = 0;
     bool validation_free_space_ok =
@@ -6603,8 +6701,8 @@ int main(int argc, char *argv[])
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     psp_report_heap_capacity_lower_bound();
 #endif
-    /* Separate release-relevant startup from deliberately expensive
-       validation-only power and heap probes in the timing trace. */
+    /* Cheap diagnostic reporting only. Synthetic clock work is opt-in after
+       config parsing; ordinary validation boots must not benchmark clocks. */
     PSP_BOOT_TIMING_MARK("validation-probes-complete");
     /* The boot surface was painted before the log existed, so report the
        scanout outcome here.  A browser nobody can see must not look like a
@@ -6620,7 +6718,9 @@ int main(int argc, char *argv[])
            psp_display.rejections,
            (unsigned) psp_display.first_error);
     psp_log_checkpoint("boot-ready");
-    psp_present_boot_entrance(3u, "READING SETTINGS", false, NULL);
+    /* Keep the already-visible first frame until native HOME is ready.
+       Intermediate splash repaints each impose a scanout wait but provide
+       neither a new usable surface nor an input acknowledgement. */
 
     psp_log_set_phase(PSP_LOG_PHASE_CONFIG);
     psp_boot_config_defaults(&process.config);
@@ -6769,6 +6869,12 @@ int main(int argc, char *argv[])
 #endif
     psp_log_checkpoint("config-accepted");
     PSP_BOOT_TIMING_MARK("config-accepted");
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (process.config.validation_power_test_auto != 0) {
+        psp_clock_validation_probe();
+        PSP_BOOT_TIMING_MARK("power-probe-complete");
+    }
+#endif
     /* The bypass is restricted to probes that require an initial document.
        Passive automation must observe the shipping entrance and native HOME
        or it cannot validate what users actually run. */
@@ -6782,8 +6888,6 @@ int main(int argc, char *argv[])
     if (deterministic_boot) {
         psp_present_boot_surface(
             PSP_UI_STARTUP_HOMEPAGE, "LOADING BROWSER", 420);
-    } else {
-        psp_present_boot_entrance(6u, "LOADING BROWSER", false, NULL);
     }
     if (strcmp(process.config.trace, "none") == 0) {
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
@@ -7034,8 +7138,6 @@ int main(int argc, char *argv[])
     if (deterministic_boot) {
         psp_present_boot_surface(
             PSP_UI_STARTUP_HOMEPAGE, "OPENING HOME", 760);
-    } else {
-        psp_present_boot_entrance(9u, "OPENING HOME", false, NULL);
     }
     browser.budget = browser_engine_budget(browser.engine);
     browser.session = browser_engine_session(browser.engine);
@@ -7048,6 +7150,9 @@ int main(int argc, char *argv[])
         goto sleep_forever;
     }
     js_wasm_component_configure(process.install_paths.program_dir);
+#ifdef TILEFINCH_HAVE_PSP_VOICE
+    psp_voice_component_configure(process.install_paths.program_dir);
+#endif
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     if (process.config.validation_media_fixture_auto != 0) {
         psp_present_boot_surface(
@@ -7331,6 +7436,9 @@ int main(int argc, char *argv[])
     psp_text_input_init(
         &process.text_input, browser.budget, "",
         psp_text_input_present, NULL);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    process.text_input.validation_poll = psp_input_script_text_frame;
+#endif
     psp_text_input_set_profile(&process.text_input, browser.profile);
     psp_text_input_set_danzeff_enabled(
         &process.text_input,
@@ -8136,6 +8244,9 @@ report:
            installed game opens a multiplayer channel. */
         (void) psp_multiplayer_bind(
             &process, &browser, &network, &network_lifecycle);
+#endif
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        psp_boot_input_probe(0);
 #endif
         PspInteractiveResult interactive_result =
             psp_app_run_interactive(

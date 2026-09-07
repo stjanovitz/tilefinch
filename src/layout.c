@@ -3,6 +3,7 @@
 
 #include "layout_internal.h"
 #include "style_cache_internal.h"
+#include "tilefinch_test_faults.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -15,6 +16,85 @@ static uint64_t layout_performance_now_us(void)
 {
     return tilefinch_platform_monotonic_time_us();
 }
+
+#if !defined(TILEFINCH_NO_TRACE) || defined(TILEFINCH_PROFILE_LAYOUT_FLOW)
+static void layout_flow_profile_switch(LayoutContext *context,
+                                       LayoutFlowPhase phase)
+{
+    uint64_t now = layout_performance_now_us();
+    context->layout->performance.flow_phase_us[context->flow_profile_phase]
+        += now >= context->flow_profile_last_us
+            ? now - context->flow_profile_last_us : 0;
+    context->flow_profile_last_us = now;
+    context->flow_profile_phase = phase;
+    context->layout->performance.flow_phase_transitions++;
+}
+
+void layout_flow_profile_begin(LayoutContext *context)
+{
+    if (context == NULL) return;
+#ifndef TILEFINCH_PSP_VALIDATION_LOG
+    if (!LAYOUT_TRACE(context->layout, LAYOUT_PROFILE)) return;
+#endif
+    memset(context->layout->performance.flow_phase_us, 0,
+           sizeof(context->layout->performance.flow_phase_us));
+    context->layout->performance.flow_phase_transitions = 0;
+    context->flow_profile_phase = LAYOUT_FLOW_OTHER;
+    context->flow_profile_last_us = layout_performance_now_us();
+    context->flow_profile_active = true;
+}
+
+void layout_flow_profile_end(LayoutContext *context)
+{
+    if (context == NULL || !context->flow_profile_active) return;
+    layout_flow_profile_switch(context, LAYOUT_FLOW_OTHER);
+    context->flow_profile_active = false;
+}
+
+void layout_flow_profile_report(LayoutContext *context)
+{
+    if (context == NULL
+        || context->layout->performance.flow_phase_transitions == 0) return;
+    const LayoutPerformance *p = &context->layout->performance;
+#ifndef __PSP__
+    printf("tilefinch-layout-flow: other=%lluus style=%lluus pseudo=%lluus "
+            "intrinsic=%lluus margin=%lluus inline=%lluus cooperate=%lluus "
+            "switches=%u\n",
+            (unsigned long long) p->flow_phase_us[LAYOUT_FLOW_OTHER],
+            (unsigned long long) p->flow_phase_us[LAYOUT_FLOW_STYLE],
+            (unsigned long long) p->flow_phase_us[LAYOUT_FLOW_PSEUDO],
+            (unsigned long long) p->flow_phase_us[LAYOUT_FLOW_INTRINSIC],
+            (unsigned long long) p->flow_phase_us[LAYOUT_FLOW_MARGIN],
+            (unsigned long long) p->flow_phase_us[LAYOUT_FLOW_INLINE],
+            (unsigned long long) p->flow_phase_us[LAYOUT_FLOW_COOPERATE],
+            (unsigned) p->flow_phase_transitions);
+    printf("tilefinch-layout-pseudos: resolutions=%zu generated=%zu absence-hits=%zu\n",
+           context->pseudo_resolutions, context->pseudo_generated,
+           context->pseudo_absence_hits);
+#else
+    (void) p; /* The activation receiver reports these retained counters. */
+#endif
+}
+
+LayoutFlowScope layout_flow_scope_enter(LayoutContext *context,
+                                        LayoutFlowPhase phase)
+{
+    LayoutFlowScope scope = {.context = context};
+    if (context != NULL && context->flow_profile_active
+        && context->flow_profile_phase != phase) {
+        scope.previous = context->flow_profile_phase;
+        scope.changed = true;
+        layout_flow_profile_switch(context, phase);
+    }
+    return scope;
+}
+
+void layout_flow_scope_leave(LayoutFlowScope *scope)
+{
+    if (scope->changed)
+        layout_flow_profile_switch(scope->context, scope->previous);
+}
+#endif
 
 static void layout_read_trace_environment(LayoutDocument *layout)
 {
@@ -67,6 +147,8 @@ static void layout_release_context(LayoutContext *context, Budget *budget)
     }
     budget_free(budget, context->stacking_contexts);
     budget_free(budget, context->visibility_ranges);
+    budget_free(budget, context->counter_entries);
+    budget_free(budget, context->counter_cursor);
     budget_free(budget, context);
 }
 
@@ -188,6 +270,23 @@ void layout_finish_work_slice(LayoutContext *context)
     uint64_t elapsed_us = finished_ns >= context->slice_started_ns
         ? (finished_ns - context->slice_started_ns) / UINT64_C(1000) : 0;
     if (elapsed_us > context->layout->max_work_slice_us) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if (elapsed_us > UINT64_C(33000)) {
+            size_t name_length = 0, id_length = 0;
+            const char *name = document_element_name(context->slice_last_node,
+                                                      &name_length);
+            const char *id = document_attribute(context->slice_last_node,
+                                                "id", &id_length);
+            char message[192];
+            snprintf(message, sizeof(message),
+                "tilefinch-layout-slow-slice: elapsed=%lluus units=%zu total=%zu node=%.*s id=%.*s",
+                (unsigned long long) elapsed_us, context->slice_units,
+                context->layout->layout_work_units,
+                (int) (name_length > 24u ? 24u : name_length), name == NULL ? "" : name,
+                (int) (id_length > 40u ? 40u : id_length), id == NULL ? "" : id);
+            tilefinch_platform_log_message(message);
+        }
+#endif
         context->layout->max_work_slice_us = elapsed_us;
         context->layout->max_work_slice_units = context->slice_units;
         context->layout->max_work_slice_node = context->slice_last_node;
@@ -214,17 +313,41 @@ void layout_finish_work_slice(LayoutContext *context)
     context->slice_started_ns = finished_ns;
 }
 
+/* Every cooperative refusal funnels through here so the owner can tell a
+   cancelled build from a refused one after the context is gone. */
+static void layout_context_cancel(LayoutContext *context)
+{
+    context->cancelled = true;
+    if (context->layout != NULL) context->layout->performance.cancelled = true;
+}
+
 bool layout_cooperate(LayoutContext *context, lxb_dom_node_t *node)
 {
     context->layout->layout_work_units++;
     context->slice_units++;
     context->slice_last_node = node;
-    if (context->slice_units < LAYOUT_WORK_QUOTA) return true;
+#ifndef __PSP__
+    if (tilefinch_test_faults()->cancel_next_layout_cooperate) {
+        tilefinch_test_faults()->cancel_next_layout_cooperate = false;
+        layout_context_cancel(context);
+        return false;
+    }
+#endif
+    if (context->slice_units < LAYOUT_WORK_QUOTA) {
+        /* A node is not a time bound: native style/intrinsic work can make
+           one node expensive on Allegrex. Keep the four-node amortization
+           for cheap work, but service input at the next safe boundary after
+           eight milliseconds, just like the script watchdog. */
+        uint64_t now = tilefinch_platform_monotonic_time_ns();
+        if (now < context->slice_started_ns
+            || now - context->slice_started_ns < UINT64_C(8000000)) return true;
+    }
     size_t completed = context->layout->layout_work_units;
     layout_finish_work_slice(context);
     context->layout->cooperative_yields++;
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_COOPERATE);
     bool keep_going = tilefinch_platform_cooperate("layout", completed);
-    if (!keep_going) context->cancelled = true;
+    if (!keep_going) layout_context_cancel(context);
     return keep_going;
 }
 
@@ -239,9 +362,10 @@ static bool layout_selector_cooperate(
     context->slice_last_node = node;
     layout_finish_work_slice(context);
     context->layout->cooperative_yields++;
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_COOPERATE);
     bool keep_going = tilefinch_platform_cooperate(
         "layout-style", completed_visits);
-    if (!keep_going) context->cancelled = true;
+    if (!keep_going) layout_context_cancel(context);
     return keep_going;
 }
 
@@ -278,6 +402,8 @@ static void layout_reuse_clear_entries(LayoutReuseCache *cache)
 {
     if (cache == NULL) return;
     memset(cache->styles, 0, sizeof(cache->styles));
+    memset(cache->font_dependent, 0, sizeof(cache->font_dependent));
+    cache->font_publication_active = false;
     memset(cache->intrinsic, 0, sizeof(cache->intrinsic));
     if (cache->table_rows != NULL) {
         memset(cache->table_rows, 0,
@@ -333,6 +459,25 @@ void layout_reuse_cache_reset(LayoutReuseCache *cache)
     cache->selector_focus_has_sibling = false;
     cache->selector_has_structure = false;
     cache->stats.full_resets++;
+}
+
+void layout_reuse_cache_begin_font_publication(LayoutReuseCache *cache)
+{
+    if (cache == NULL) return;
+    layout_reuse_clear_sizing_entries(cache);
+    for (size_t i = 0; i < LAYOUT_REUSE_STYLE_CAPACITY; i++) {
+        if ((cache->font_dependent[i / 8u] & (1u << (i % 8u))) != 0)
+            cache->styles[i].node = NULL;
+    }
+    /* A document-order walk would otherwise evict the previous build's
+       retained tail before reaching it. Keep those bounded entries through
+       this transaction; ordinary per-build caches still serve new nodes. */
+    cache->font_publication_active = true;
+}
+
+void layout_reuse_cache_end_font_publication(LayoutReuseCache *cache)
+{
+    if (cache != NULL) cache->font_publication_active = false;
 }
 
 static bool layout_node_is_within(lxb_dom_node_t *node,
@@ -623,6 +768,9 @@ static bool layout_reuse_style_get_hashed(LayoutReuseCache *cache,
     if (cache == NULL || node == NULL || style == NULL) return false;
     size_t home = layout_pointer_hash(node)
                   & (LAYOUT_REUSE_STYLE_CAPACITY - 1u);
+#ifndef TILEFINCH_NO_TRACE
+    bool parent_miss = false;
+#endif
     for (size_t probe = 0; probe < 8; probe++) {
         LayoutReuseStyleEntry *entry = &cache->styles[
             (home + probe) & (LAYOUT_REUSE_STYLE_CAPACITY - 1u)];
@@ -632,15 +780,22 @@ static bool layout_reuse_style_get_hashed(LayoutReuseCache *cache,
             *style = entry->style;
             return true;
         }
+#ifndef TILEFINCH_NO_TRACE
+        if (entry->node == node) parent_miss = true;
+#endif
     }
     cache->stats.style_misses++;
+#ifndef TILEFINCH_NO_TRACE
+    if (parent_miss) cache->stats.style_parent_misses++;
+#endif
     return false;
 }
 
 static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
                                           lxb_dom_node_t *node,
                                           uint64_t parent_hash,
-                                          const ComputedStyle *style)
+                                          const ComputedStyle *style,
+                                          bool font_dependent)
 {
     if (cache == NULL || node == NULL || style == NULL) return;
     size_t home = layout_pointer_hash(node)
@@ -659,6 +814,16 @@ static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
             replacement = slot;
         }
     }
+    if (cache->styles[replacement].node != NULL
+        && cache->styles[replacement].node != node) {
+        if (cache->font_publication_active) return;
+#ifndef TILEFINCH_NO_TRACE
+        cache->stats.style_evictions++;
+#endif
+    }
+    uint8_t bit = (uint8_t) (1u << (replacement % 8u));
+    cache->font_dependent[replacement / 8u] &= (uint8_t) ~bit;
+    if (font_dependent) cache->font_dependent[replacement / 8u] |= bit;
     cache->styles[replacement] = (LayoutReuseStyleEntry) {
         .node = node,
         .parent_hash = parent_hash,
@@ -670,9 +835,11 @@ static void layout_reuse_style_put_hashed(LayoutReuseCache *cache,
 static void layout_resolve_canonical_style(
     const Stylesheet *sheet, const FontSet *fonts,
     const WebFontSet *web_fonts, lxb_dom_node_t *node,
-    const ComputedStyle *parent, ComputedStyle *result)
+    const ComputedStyle *parent, ComputedStyle *result,
+    bool *font_dependent)
 {
     *result = style_for_node(sheet, node, parent);
+    *font_dependent = (result->filter_code & STYLE_FONT_CH_PENDING) != 0;
     if ((result->filter_code & STYLE_FONT_CH_PENDING) != 0
         && sheet != NULL && sheet->resolve_scratch != NULL) {
         const FontFace *face = font_context_face_variant(
@@ -725,11 +892,12 @@ bool layout_reuse_cache_resolve_style(LayoutReuseCache *cache,
         ? 0 : layout_style_parent_hash(parent);
     if (layout_reuse_style_get_hashed(
             cache, node, parent_hash, result)) return true;
+    bool font_dependent = false;
     layout_resolve_canonical_style(
         sheet, fonts, stylesheet_web_font_set(sheet),
-        node, parent, result);
+        node, parent, result, &font_dependent);
     layout_reuse_style_put_hashed(
-        cache, node, parent_hash, result);
+        cache, node, parent_hash, result, font_dependent);
     return false;
 }
 
@@ -787,6 +955,7 @@ void layout_style_for_node_into(LayoutContext *context,
             replacement = slot;
         }
     }
+    LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_STYLE);
 #ifndef TILEFINCH_NO_TRACE
     bool reused = false;
     uint64_t style_started_us = layout_performance_now_us();
@@ -804,7 +973,7 @@ void layout_style_for_node_into(LayoutContext *context,
 #endif
     LayoutStyleCacheEntry *entry = &context->style_cache[replacement];
     if (style_selector_cooperation_cancelled(context->sheet)) {
-        context->cancelled = true;
+        layout_context_cancel(context);
         return;
     }
     entry->node = node;
@@ -1013,6 +1182,13 @@ static size_t layout_node_box_index(const LayoutDocument *layout,
 {
     size_t index = 0;
     if (layout_node_index_lookup(layout, node, &index)) return index;
+    /* A complete index proves absence too. Partial indexes (allocation
+       refusal, or a visual clone still being populated) retain the scan. */
+    if (layout->node_index != NULL
+        && layout->node_index_count == layout->node_box_count) return SIZE_MAX;
+#ifndef __PSP__
+    tilefinch_test_faults()->layout_node_box_scans++;
+#endif
     for (size_t i = 0; i < layout->node_box_count; i++) {
         if (layout->node_boxes[i].node == node) return i;
     }
@@ -1506,7 +1682,7 @@ bool layout_batch_cooperate(LayoutContext *context,
     context->layout->cooperative_yields++;
     bool keep_going = tilefinch_platform_cooperate(
         "layout-index", context->layout->layout_work_units);
-    if (!keep_going) context->cancelled = true;
+    if (!keep_going) layout_context_cancel(context);
     return keep_going;
 }
 
@@ -1560,6 +1736,7 @@ struct LayoutBuildJob {
     int viewport_height;
     int html_height;
     int bottom;
+    int preview_y_limit;
     size_t fingerprint_at;
     uint64_t text_fingerprint;
     uint64_t build_active_us;
@@ -1571,6 +1748,7 @@ struct LayoutBuildJob {
     uint64_t container_previous_signature;
     bool probe_pass;
     bool retain_container_padding;
+    bool preview_truncated;
     bool taken;
 };
 
@@ -1613,6 +1791,7 @@ static bool layout_job_init(LayoutBuildJob *job)
     context->web_fonts = layout->web_fonts;
     context->images = job->images;
     context->reuse = job->reuse;
+    context->preview_y_limit = job->preview_y_limit;
     context->document_bidi_text_present = job->document->bidi_text_present;
     context->document_bidi_markup_present =
         job->document->bidi_markup_present;
@@ -1649,7 +1828,8 @@ static bool layout_job_init(LayoutBuildJob *job)
         context->style_selector_cooperation_owned =
             style_selector_cooperation_begin(
                 (Stylesheet *) job->stylesheet,
-                layout_selector_cooperate, context);
+                layout_selector_cooperate, context,
+                &context->ancestor_bloom_cache);
     }
 
     ComputedStyle root = layout_initial_root_style();
@@ -1682,6 +1862,37 @@ static bool layout_job_init(LayoutBuildJob *job)
     return !context->cancelled;
 }
 
+static void layout_trace_root_bounds(LayoutDocument *layout,
+    const LayoutNodeBox *body_box, const ComputedStyle *html_style,
+    const ComputedStyle *body_style, int bottom, int html_height)
+{
+    if (LAYOUT_TRACE(layout, LAYOUT)) {
+        fprintf(stderr,
+                "layout-root bottom=%d html-height=%d "
+                "html-overflow=%d/%d html-clip-only=%d/%d "
+                "body-overflow=%d/%d body-clip-only=%d/%d "
+                "body-box=%d,%d,%dx%d client=%dx%d content=%dx%d "
+                "clips=%d/%d\n",
+                bottom, html_height,
+                html_style->overflow_x_scroll, html_style->overflow_y_scroll,
+                html_style->overflow_x_clip_only,
+                html_style->overflow_y_clip_only,
+                body_style->overflow_x_scroll, body_style->overflow_y_scroll,
+                body_style->overflow_x_clip_only,
+                body_style->overflow_y_clip_only,
+                body_box == NULL ? 0 : body_box->x,
+                body_box == NULL ? 0 : body_box->y,
+                body_box == NULL ? 0 : body_box->width,
+                body_box == NULL ? 0 : body_box->height,
+                body_box == NULL ? 0 : body_box->client_width,
+                body_box == NULL ? 0 : body_box->client_height,
+                body_box == NULL ? 0 : body_box->content_width,
+                body_box == NULL ? 0 : body_box->content_height,
+                body_box != NULL && body_box->clips_x,
+                body_box != NULL && body_box->clips_y);
+    }
+}
+
 static bool layout_job_flow(LayoutBuildJob *job)
 {
     LayoutDocument *layout = &job->layout;
@@ -1700,6 +1911,8 @@ static bool layout_job_flow(LayoutBuildJob *job)
 
     int document_bottom = job->bottom;
     const LayoutNodeBox *body_box = layout_box_for_node(layout, job->body);
+    layout_trace_root_bounds(layout, body_box, &job->html_style,
+        &job->body_style, job->bottom, job->html_height);
     if (body_box != NULL && !body_box->clips_y) {
         int overflow_bottom = layout_add_coordinate(
             layout_add_coordinate(body_box->y, body_box->content_height),
@@ -1751,11 +1964,75 @@ static void layout_job_fingerprint_commands(LayoutBuildJob *job)
     layout->text_fingerprint = job->text_fingerprint;
 }
 
+static void layout_job_trace_finished(LayoutBuildJob *job)
+{
+    LayoutDocument *layout = &job->layout;
+    LayoutContext *context = job->context;
+    if (LAYOUT_TRACE(layout, PAINT)) {
+        size_t limit = layout->count < 24 ? layout->count : 24;
+        for (size_t i = 0; i < limit; i++) {
+            const DrawCommand *command = &layout->commands[i];
+            fprintf(stderr, "layout-paint index=%zu type=%d box=%d,%d,%dx%d "
+                    "opacity=%u z=%d flags=%u\n", i, command->type,
+                    command->x, command->y, command->width, command->height,
+                    command->opacity_scale, command->z_index,
+                    layout->command_flags == NULL ? 0
+                    : layout->command_flags[i]);
+        }
+    }
+    if (LAYOUT_TRACE(layout, LAYOUT_PROFILE)) {
+        fprintf(stderr,
+                "layout-profile styles=%llu style-cache-hits=%llu "
+                "style-cache-misses=%llu intrinsic-width-visits=%llu "
+                "intrinsic-min-visits=%llu intrinsic-cache-hits=%llu "
+                "intrinsic-cache-misses=%llu flex-basis=%llu flex-minimum=%llu "
+                "tree-depth=%zu/%u depth-fallbacks=%zu fallback-visits=%zu "
+                "block-scratch-pages=%zu block-scratch-bytes=%zu "
+                "block-scratch-allocation-failures=%zu "
+                "bidi-paragraphs=%llu bidi-fallbacks=%llu "
+                "bidi-limit-degradations=%llu bidi-us=%llu "
+                "bidi-peak-transient=%zu\n",
+                (unsigned long long) context->style_resolutions,
+                (unsigned long long) context->style_cache_hits,
+                (unsigned long long) context->style_cache_misses,
+                (unsigned long long) context->intrinsic_width_visits,
+                (unsigned long long) context->intrinsic_min_visits,
+                (unsigned long long) context->intrinsic_cache_hits,
+                (unsigned long long) context->intrinsic_cache_misses,
+                (unsigned long long) context->flex_basis_resolutions,
+                (unsigned long long) context->flex_minimum_resolutions,
+                context->max_tree_call_depth,
+                (unsigned) LAYOUT_TREE_CALL_DEPTH_LIMIT,
+                context->depth_fallback_count,
+                context->fallback_visits,
+                context->block_scratch_page_count,
+                context->block_scratch_page_count
+                    * LAYOUT_BLOCK_SCRATCH_PAGE_DEPTH
+                    * sizeof(LayoutBlockScratch),
+                context->block_scratch_allocation_failures,
+                (unsigned long long) layout->performance.bidi_paragraphs,
+                (unsigned long long) layout->performance.bidi_line_fallbacks,
+                (unsigned long long)
+                    layout->performance.bidi_limit_degradations,
+                (unsigned long long) layout->performance.bidi_us,
+                layout->performance.bidi_peak_transient_bytes);
+    }
+}
+
 static void layout_job_capture_performance(LayoutBuildJob *job)
 {
     LayoutDocument *layout = &job->layout;
     LayoutContext *context = job->context;
     const Stylesheet *stylesheet = job->stylesheet;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    printf("tilefinch-layout-cost: total=%lluus flow=%lluus "
+        "styles=%llu/%llu counters=%zu commands=%zu\n",
+        (unsigned long long) job->build_active_us,
+        (unsigned long long) layout->performance.flow_us,
+        (unsigned long long) context->style_cache_hits,
+        (unsigned long long) context->style_cache_misses,
+        context->counter_entry_count, layout->count);
+#endif
     layout->performance.style_resolutions = context->style_resolutions;
     layout->performance.style_cache_hits = context->style_cache_hits;
     layout->performance.style_cache_misses = context->style_cache_misses;
@@ -1828,6 +2105,35 @@ static void layout_job_record_phase(LayoutBuildJob *job,
     uint64_t finished_us = layout_performance_now_us();
     uint64_t elapsed_us = finished_us >= started_us
         ? finished_us - started_us : 0;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (elapsed_us >= UINT64_C(100000)) {
+        char message[256];
+        snprintf(message, sizeof(message),
+            "tilefinch-layout-phase: next=%d elapsed=%lluus "
+            "commands=%zu counters=%zu work=%zu yields=%zu styles=%llu bidi=%lluus",
+            (int) job->phase,
+            (unsigned long long) elapsed_us, job->layout.count,
+            job->context == NULL ? 0 : job->context->counter_entry_count,
+            job->layout.layout_work_units, job->layout.cooperative_yields,
+            (unsigned long long) (job->context == NULL ? 0 : job->context->style_cache_misses),
+            (unsigned long long) job->layout.performance.bidi_us);
+        tilefinch_platform_log_message(message);
+        if (job->layout.performance.flow_phase_transitions != 0) {
+            const uint64_t *flow = job->layout.performance.flow_phase_us;
+            snprintf(message, sizeof(message),
+                "tilefinch-layout-phase-flow: other=%lluus style=%lluus pseudo=%lluus "
+                "intrinsic=%lluus margin=%lluus inline=%lluus cooperate=%lluus",
+                (unsigned long long) flow[LAYOUT_FLOW_OTHER],
+                (unsigned long long) flow[LAYOUT_FLOW_STYLE],
+                (unsigned long long) flow[LAYOUT_FLOW_PSEUDO],
+                (unsigned long long) flow[LAYOUT_FLOW_INTRINSIC],
+                (unsigned long long) flow[LAYOUT_FLOW_MARGIN],
+                (unsigned long long) flow[LAYOUT_FLOW_INLINE],
+                (unsigned long long) flow[LAYOUT_FLOW_COOPERATE]);
+            tilefinch_platform_log_message(message);
+        }
+    }
+#endif
     job->build_active_us += elapsed_us;
     job->resumable_phases++;
     if (elapsed_us > job->maximum_resumable_phase_us) {
@@ -1889,10 +2195,13 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
         }
         break;
     case LAYOUT_JOB_FLOW:
+        layout_flow_profile_begin(job->context);
         okay = layout_job_flow(job);
+        layout_flow_profile_end(job->context);
         if (okay) {
             job->layout.performance.flow_us =
                 layout_performance_now_us() - started_us;
+            layout_flow_profile_report(job->context);
             job->phase = LAYOUT_JOB_COMPACT;
         }
         break;
@@ -1937,6 +2246,8 @@ LayoutBuildStatus layout_build_job_pump(LayoutBuildJob *job)
         layout_finish_work_slice(job->context);
         job->layout.scroll_width = root_scroll_width_after_clipping(
             &job->layout, job->viewport_width);
+        job->preview_truncated = job->context->preview_truncated;
+        layout_job_trace_finished(job);
         job->layout.performance.finalize_us =
             layout_performance_now_us() - started_us;
         layout_job_record_phase(job, started_us);
@@ -2010,7 +2321,7 @@ bool layout_build_job_take(LayoutBuildJob *job, LayoutDocument *layout)
 void layout_build_job_cancel(LayoutBuildJob *job)
 {
     if (job == NULL || job->status != LAYOUT_BUILD_PENDING) return;
-    if (job->context != NULL) job->context->cancelled = true;
+    if (job->context != NULL) layout_context_cancel(job->context);
     layout_job_fail(job, LAYOUT_BUILD_CANCELLED);
 }
 
@@ -2031,407 +2342,26 @@ static bool layout_build_context_resumable_sync(
     LayoutDocument *layout, Budget *budget, const PocDocument *document,
     const Stylesheet *stylesheet, const FontSet *fonts,
     const ImageResources *images, const ViewportContext *viewport,
-    LayoutReuseCache *reuse)
+    LayoutReuseCache *reuse, int preview_y_limit, bool *preview_truncated)
 {
+    if (layout == NULL) return false;
     LayoutBuildJob *job = layout_build_job_begin(
         budget, document, stylesheet, fonts, images, viewport, reuse);
     if (job == NULL) return false;
+    job->preview_y_limit = preview_y_limit;
     LayoutBuildStatus status = LAYOUT_BUILD_PENDING;
     while (status == LAYOUT_BUILD_PENDING) {
         status = layout_build_job_pump(job);
     }
     bool okay = status == LAYOUT_BUILD_COMPLETE
                 && layout_build_job_take(job, layout);
+    /* The job's own document is gone by now; keep the one bit an owner
+       needs to decide between retrying and giving up. */
+    if (!okay) layout->performance.cancelled = status == LAYOUT_BUILD_CANCELLED;
+    if (okay && preview_truncated != NULL)
+        *preview_truncated = job->preview_truncated;
     layout_build_job_destroy(job);
     return okay;
-}
-
-static bool layout_build_context_internal(
-    LayoutDocument *layout, Budget *budget, const PocDocument *document,
-    const Stylesheet *stylesheet, const FontSet *fonts,
-    const ImageResources *images, const ViewportContext *viewport,
-    LayoutReuseCache *reuse, int preview_y_limit, bool *preview_truncated,
-    bool retain_container_padding)
-{
-    if (layout == NULL || budget == NULL || document == NULL
-        || viewport == NULL || viewport->css_width <= 0
-        || viewport->css_height <= 0 || viewport->device_width <= 0
-        || viewport->device_height <= 0) return false;
-    uint64_t build_started_us = layout_performance_now_us();
-    int viewport_width = viewport->css_width;
-    int viewport_height = viewport->css_height;
-    memset(layout, 0, sizeof(*layout));
-    layout->retain_container_padding = retain_container_padding;
-    layout_read_trace_environment(layout);
-    layout->budget = budget;
-    layout->width = viewport_width;
-    layout->scroll_width = viewport_width;
-    layout->viewport = *viewport;
-    layout->fonts = fonts;
-    layout->web_fonts = stylesheet_web_font_set(stylesheet);
-    layout->page_background = 0xffffff;
-    lxb_dom_node_t *body = document_body_node(document);
-    if (body == NULL) return false;
-    LayoutContext *context = budget_calloc(budget, 1, sizeof(*context));
-    if (context == NULL) return false;
-    context->layout = layout;
-    context->document = document;
-    context->sheet = stylesheet;
-    context->fonts = fonts;
-    context->web_fonts = layout->web_fonts;
-    context->images = images;
-    context->reuse = reuse;
-    context->document_bidi_text_present = document->bidi_text_present;
-    context->document_bidi_markup_present = document->bidi_markup_present;
-    context->preview_y_limit = preview_y_limit;
-    if (stylesheet != NULL) {
-        context->style_variable_cache_owned = style_variable_cache_begin(
-            (Stylesheet *) stylesheet, budget);
-        context->style_variable_cache_bytes =
-            style_variable_cache_bytes(stylesheet);
-        context->style_rule_queries_at_start =
-            stylesheet->rule_index_queries;
-        context->style_rule_candidates_at_start =
-            stylesheet->rule_index_candidates;
-        context->style_variable_lookups_at_start =
-            stylesheet->variable_lookup_calls;
-        context->style_variable_rule_candidates_at_start =
-            stylesheet->variable_rule_candidates;
-        context->style_variable_cache_hits_at_start =
-            stylesheet->variable_cache_hits;
-        context->style_variable_cache_misses_at_start =
-            stylesheet->variable_cache_misses;
-        context->style_variable_cache_negative_hits_at_start =
-            stylesheet->variable_cache_negative_hits;
-        context->style_variable_cache_evictions_at_start =
-            stylesheet->variable_cache_evictions;
-        context->style_deferred_rule_applications_at_start =
-            stylesheet->deferred_rule_applications;
-        context->style_deferred_rule_us_at_start =
-            stylesheet->deferred_rule_us;
-    }
-    layout_reuse_cache_prepare(
-        reuse, stylesheet, fonts, images, viewport_width);
-    context->slice_started_ns = tilefinch_platform_monotonic_time_ns();
-    if (stylesheet != NULL) {
-        context->style_selector_cooperation_owned =
-            style_selector_cooperation_begin(
-                (Stylesheet *) stylesheet, layout_selector_cooperate,
-                context);
-    }
-    if (LAYOUT_TRACE(layout, LAYOUT) && stylesheet != NULL) {
-        fprintf(stderr, "layout-styles rules=%zu variables=%zu\n",
-                stylesheet->count, stylesheet->variable_count);
-        for (size_t i = 0; i < stylesheet->count; i++) {
-            const StyleRule *rule = &stylesheet->rules[i];
-            const StyleDeclaration *declaration =
-                stylesheet_rule_declaration(stylesheet, rule);
-            if (declaration == NULL) continue;
-            if (strstr(rule->selector, "wm-fallback-layout") != NULL
-                || strstr(rule->selector, "wm-composer-textarea") != NULL) {
-                fprintf(stderr, "layout-rule selector=%s mask=%llu origin=%u pseudo=%d out=%d relative=%d sticky=%d fixed=%d\n",
-                        rule->selector,
-                        (unsigned long long) declaration->mask,
-                        rule->origin, rule->pseudo,
-                        declaration->values.out_of_flow,
-                        declaration->values.relative_position,
-                        declaration->values.sticky_position,
-                        declaration->values.fixed_position);
-            }
-        }
-    }
-    uint64_t phase_started_us = layout_performance_now_us();
-    ComputedStyle root = layout_initial_root_style();
-    lxb_dom_node_t *html = body->parent;
-    bool have_html = html != NULL
-                     && html->type == LXB_DOM_NODE_TYPE_ELEMENT
-                     && layout_node_name_is(html, "html");
-    ComputedStyle html_style = have_html
-        ? layout_style_for_node(context, html, &root) : root;
-    resolve_padding(context->sheet, &html_style, viewport_width);
-    int html_height = style_content_height(
-        context->sheet, &html_style, viewport_width, viewport_height);
-    if (!(html_style.has_height
-          && (!html_style.height_percent || html_height > 0))) {
-        html_height = viewport_height;
-    }
-    if (html_style.has_background) {
-        layout->page_background = blend_color_over(
-            html_style.background, html_style.background_alpha,
-            layout->page_background);
-    }
-    ComputedStyle body_style = layout_style_for_node(
-        context, body, &html_style);
-    if (body_style.has_background) {
-        layout->page_background = blend_color_over(
-            body_style.background, body_style.background_alpha,
-            layout->page_background);
-    }
-    int bottom = 0;
-    PositionedBox initial_positioned_box = {
-        .node = NULL,
-        .x = 0, .y = 0, .width = viewport_width, .height = html_height,
-        .fixed_node = NULL, .fixed_x = 0, .fixed_y = 0,
-        .fixed_width = viewport_width, .fixed_height = html_height
-    };
-    layout->performance.root_style_us =
-        layout_performance_now_us() - phase_started_us;
-    phase_started_us = layout_performance_now_us();
-    if (!layout_block(context, body, &html_style, 0, 0, viewport_width,
-                      html_height, false, &initial_positioned_box, &bottom)
-        || context->cancelled) {
-        layout_release_context(context, budget);
-        layout_destroy(layout);
-        return false;
-    }
-    /* A definite root-body height fixes its border box, not the document's
-       scrollable overflow area. Visible body overflow still extends the root
-       scroller; an actual body scroll/clip container keeps that overflow
-       local instead. */
-    int document_bottom = bottom;
-    const LayoutNodeBox *body_box = layout_box_for_node(layout, body);
-    if (LAYOUT_TRACE(layout, LAYOUT)) {
-        fprintf(stderr,
-                "layout-root bottom=%d html-height=%d "
-                "html-overflow=%d/%d html-clip-only=%d/%d "
-                "body-overflow=%d/%d body-clip-only=%d/%d "
-                "body-box=%d,%d,%dx%d client=%dx%d content=%dx%d "
-                "clips=%d/%d\n",
-                bottom, html_height,
-                html_style.overflow_x_scroll, html_style.overflow_y_scroll,
-                html_style.overflow_x_clip_only,
-                html_style.overflow_y_clip_only,
-                body_style.overflow_x_scroll, body_style.overflow_y_scroll,
-                body_style.overflow_x_clip_only,
-                body_style.overflow_y_clip_only,
-                body_box == NULL ? 0 : body_box->x,
-                body_box == NULL ? 0 : body_box->y,
-                body_box == NULL ? 0 : body_box->width,
-                body_box == NULL ? 0 : body_box->height,
-                body_box == NULL ? 0 : body_box->client_width,
-                body_box == NULL ? 0 : body_box->client_height,
-                body_box == NULL ? 0 : body_box->content_width,
-                body_box == NULL ? 0 : body_box->content_height,
-                body_box != NULL && body_box->clips_x,
-                body_box != NULL && body_box->clips_y);
-    }
-    if (body_box != NULL && !body_box->clips_y) {
-        int overflow_bottom = layout_add_coordinate(
-            layout_add_coordinate(body_box->y, body_box->content_height),
-            body_style.margin.bottom);
-        if (overflow_bottom > document_bottom) {
-            document_bottom = overflow_bottom;
-        }
-    }
-    if (body_box != NULL && !body_box->clips_x) {
-        int overflow_right = layout_add_coordinate(
-            layout_add_coordinate(body_box->x, body_box->content_width),
-            body_style.margin.right);
-        if (overflow_right > layout->scroll_width) {
-            layout->scroll_width = overflow_right;
-        }
-    }
-    layout->height = document_bottom < viewport_height
-                     ? viewport_height
-                     : layout_clamp_coordinate(document_bottom);
-    layout->performance.flow_us =
-        layout_performance_now_us() - phase_started_us;
-    phase_started_us = layout_performance_now_us();
-    compact_layout_storage(layout);
-    uint64_t text_fingerprint = UINT64_C(1469598103934665603);
-    for (size_t i = 0; i < layout->count; i++) {
-        const DrawCommand *command = &layout->commands[i];
-        if (command->type != DRAW_TEXT || command->text == NULL
-            || draw_command_is_text_shadow(command)) continue;
-        uint64_t structure[] = {
-            i, command->text_length,
-            (uint32_t) command->radius
-                & (LAYOUT_TEXT_FIND_SPACE_BEFORE
-                   | LAYOUT_TEXT_FIND_BLOCK_START)
-        };
-        for (size_t field = 0;
-             field < sizeof(structure) / sizeof(structure[0]); field++) {
-            for (size_t byte = 0; byte < sizeof(structure[field]); byte++) {
-                text_fingerprint ^= (unsigned char) (
-                    structure[field] >> (byte * 8u));
-                text_fingerprint *= UINT64_C(1099511628211);
-            }
-        }
-        for (size_t byte = 0; byte < command->text_length; byte++) {
-            text_fingerprint ^= (unsigned char) command->text[byte];
-            text_fingerprint *= UINT64_C(1099511628211);
-        }
-    }
-    layout->text_fingerprint = text_fingerprint;
-    layout->performance.compact_us =
-        layout_performance_now_us() - phase_started_us;
-    phase_started_us = layout_performance_now_us();
-    if (!layout_resolve_visibility(context)) {
-        if (LAYOUT_TRACE(layout, LAYOUT)) {
-            fprintf(stderr, "layout-failure phase=visibility\n");
-        }
-        layout_release_context(context, budget);
-        layout_destroy(layout);
-        return false;
-    }
-    layout_build_focus_index(layout);
-    layout->performance.focus_index_us =
-        layout_performance_now_us() - phase_started_us;
-    phase_started_us = layout_performance_now_us();
-    if (!build_paint_order(layout, context)) {
-        if (LAYOUT_TRACE(layout, LAYOUT)) {
-            fprintf(stderr, "layout-failure phase=paint-order\n");
-        }
-        layout_release_context(context, budget);
-        layout_destroy(layout);
-        return false;
-    }
-    layout->performance.paint_order_us =
-        layout_performance_now_us() - phase_started_us;
-    phase_started_us = layout_performance_now_us();
-    if (!build_spatial_index(layout, context)) {
-        if (LAYOUT_TRACE(layout, LAYOUT)) {
-            fprintf(stderr, "layout-failure phase=spatial-index\n");
-        }
-        layout_release_context(context, budget);
-        layout_destroy(layout);
-        return false;
-    }
-    layout->performance.spatial_index_us =
-        layout_performance_now_us() - phase_started_us;
-    phase_started_us = layout_performance_now_us();
-    if (!layout_build_scroll_metadata(layout, stylesheet)) {
-        if (LAYOUT_TRACE(layout, LAYOUT)) {
-            fprintf(stderr, "layout-failure phase=scroll-metadata\n");
-        }
-        layout_release_context(context, budget);
-        layout_destroy(layout);
-        return false;
-    }
-    layout_finish_work_slice(context);
-    layout->scroll_width = root_scroll_width_after_clipping(
-        layout, viewport_width);
-    if (LAYOUT_TRACE(layout, PAINT)) {
-        size_t limit = layout->count < 24 ? layout->count : 24;
-        for (size_t i = 0; i < limit; i++) {
-            const DrawCommand *command = &layout->commands[i];
-            fprintf(stderr, "layout-paint index=%zu type=%d box=%d,%d,%dx%d "
-                    "opacity=%u z=%d flags=%u\n", i, command->type,
-                    command->x, command->y, command->width, command->height,
-                    command->opacity_scale, command->z_index,
-                    layout->command_flags == NULL ? 0
-                    : layout->command_flags[i]);
-        }
-    }
-    if (LAYOUT_TRACE(layout, LAYOUT_PROFILE)) {
-        fprintf(stderr,
-                "layout-profile styles=%llu style-cache-hits=%llu "
-                "style-cache-misses=%llu intrinsic-width-visits=%llu "
-                "intrinsic-min-visits=%llu intrinsic-cache-hits=%llu "
-                "intrinsic-cache-misses=%llu flex-basis=%llu flex-minimum=%llu "
-                "tree-depth=%zu/%u depth-fallbacks=%zu fallback-visits=%zu "
-                "block-scratch-pages=%zu block-scratch-bytes=%zu "
-                "block-scratch-allocation-failures=%zu "
-                "bidi-paragraphs=%llu bidi-fallbacks=%llu "
-                "bidi-limit-degradations=%llu bidi-us=%llu "
-                "bidi-peak-transient=%zu\n",
-                (unsigned long long) context->style_resolutions,
-                (unsigned long long) context->style_cache_hits,
-                (unsigned long long) context->style_cache_misses,
-                (unsigned long long) context->intrinsic_width_visits,
-                (unsigned long long) context->intrinsic_min_visits,
-                (unsigned long long) context->intrinsic_cache_hits,
-                (unsigned long long) context->intrinsic_cache_misses,
-                (unsigned long long) context->flex_basis_resolutions,
-                (unsigned long long) context->flex_minimum_resolutions,
-                context->max_tree_call_depth,
-                (unsigned) LAYOUT_TREE_CALL_DEPTH_LIMIT,
-                context->depth_fallback_count,
-                context->fallback_visits,
-                context->block_scratch_page_count,
-                context->block_scratch_page_count
-                    * LAYOUT_BLOCK_SCRATCH_PAGE_DEPTH
-                    * sizeof(LayoutBlockScratch),
-                context->block_scratch_allocation_failures,
-                (unsigned long long) layout->performance.bidi_paragraphs,
-                (unsigned long long) layout->performance.bidi_line_fallbacks,
-                (unsigned long long)
-                    layout->performance.bidi_limit_degradations,
-                (unsigned long long) layout->performance.bidi_us,
-                layout->performance.bidi_peak_transient_bytes);
-    }
-    layout->performance.finalize_us =
-        layout_performance_now_us() - phase_started_us;
-    layout->performance.style_resolutions = context->style_resolutions;
-    layout->performance.style_cache_hits = context->style_cache_hits;
-    layout->performance.style_cache_misses = context->style_cache_misses;
-    layout->performance.style_resolve_us = context->style_resolve_us;
-    if (stylesheet != NULL) {
-        layout->performance.style_rule_queries =
-            stylesheet->rule_index_queries
-            - context->style_rule_queries_at_start;
-        layout->performance.style_rule_candidates =
-            stylesheet->rule_index_candidates
-            - context->style_rule_candidates_at_start;
-        layout->performance.style_variable_lookups =
-            stylesheet->variable_lookup_calls
-            - context->style_variable_lookups_at_start;
-        layout->performance.style_variable_rule_candidates =
-            stylesheet->variable_rule_candidates
-            - context->style_variable_rule_candidates_at_start;
-        layout->performance.style_variable_cache_hits =
-            stylesheet->variable_cache_hits
-            - context->style_variable_cache_hits_at_start;
-        layout->performance.style_variable_cache_misses =
-            stylesheet->variable_cache_misses
-            - context->style_variable_cache_misses_at_start;
-        layout->performance.style_variable_cache_negative_hits =
-            stylesheet->variable_cache_negative_hits
-            - context->style_variable_cache_negative_hits_at_start;
-        layout->performance.style_variable_cache_evictions =
-            stylesheet->variable_cache_evictions
-            - context->style_variable_cache_evictions_at_start;
-        layout->performance.style_variable_cache_bytes =
-            context->style_variable_cache_bytes;
-        layout->performance.style_deferred_rule_applications =
-            stylesheet->deferred_rule_applications
-            - context->style_deferred_rule_applications_at_start;
-        layout->performance.style_deferred_rule_us =
-            stylesheet->deferred_rule_us
-            - context->style_deferred_rule_us_at_start;
-    }
-    layout->performance.intrinsic_width_visits =
-        context->intrinsic_width_visits;
-    layout->performance.intrinsic_min_visits = context->intrinsic_min_visits;
-    layout->performance.intrinsic_cache_hits = context->intrinsic_cache_hits;
-    layout->performance.intrinsic_cache_misses =
-        context->intrinsic_cache_misses;
-    layout->performance.intrinsic_paired_text_measurements =
-        context->intrinsic_paired_text_measurements;
-    layout->performance.margin_collapse_visits =
-        context->margin_collapse_visits;
-    layout->performance.margin_cache_hits = context->margin_cache_hits;
-    layout->performance.margin_cache_misses =
-        context->margin_cache_misses;
-    layout->performance.flat_iterator_passes =
-        context->flat_iterator_passes;
-    layout->performance.flat_iterator_yields =
-        context->flat_iterator_yields;
-    layout->performance.flex_iterator_passes =
-        context->flex_iterator_passes;
-    layout->performance.flex_iterator_yields =
-        context->flex_iterator_yields;
-    layout->performance.flex_basis_requests =
-        context->flex_basis_resolutions;
-    layout->performance.flex_minimum_requests =
-        context->flex_minimum_resolutions;
-    layout->performance.total_us =
-        layout_performance_now_us() - build_started_us;
-    if (preview_truncated != NULL) {
-        *preview_truncated = context->preview_truncated;
-    }
-    layout_release_context(context, budget);
-    return true;
 }
 
 static bool layout_collect_container_state(Stylesheet *stylesheet,
@@ -2460,7 +2390,6 @@ static bool layout_collect_container_state(Stylesheet *stylesheet,
             return false;
         }
     }
-    style_container_layout_state_finish(stylesheet);
     return true;
 }
 
@@ -2529,72 +2458,6 @@ static bool layout_document_has_inline_container_units(
     return false;
 }
 
-static bool layout_build_context_container_queries(
-    LayoutDocument *layout, Budget *budget, const PocDocument *document,
-    const Stylesheet *stylesheet, const FontSet *fonts,
-    const ImageResources *images, const ViewportContext *viewport,
-    LayoutReuseCache *reuse, int preview_y_limit, bool *preview_truncated)
-{
-    if (preview_y_limit == 0 && preview_truncated == NULL) {
-        /* The continuation object buys responsiveness only once the page is
-           large enough to span meaningful work slices.  Keep tiny pages on
-           the direct path: one fewer allocation and no phase-dispatch tax. */
-        if (document != NULL && document->node_count < 256
-            && !stylesheet_has_container_queries(stylesheet)
-            && !layout_document_has_inline_container_units(
-                   document, stylesheet)) {
-            return layout_build_context_internal(
-                layout, budget, document, stylesheet, fonts, images,
-                viewport, reuse, 0, NULL, false);
-        }
-        return layout_build_context_resumable_sync(
-            layout, budget, document, stylesheet, fonts, images,
-            viewport, reuse);
-    }
-    if (!stylesheet_has_container_queries(stylesheet)
-        && !layout_document_has_inline_container_units(
-               document, stylesheet)) {
-        return layout_build_context_internal(
-            layout, budget, document, stylesheet, fonts, images, viewport,
-            reuse, preview_y_limit, preview_truncated, false);
-    }
-
-    Stylesheet *mutable_sheet = (Stylesheet *) stylesheet;
-    uint64_t previous_signature =
-        style_container_layout_state_signature(stylesheet);
-    LayoutDocument probe = {0};
-    bool probe_truncated = false;
-    if (!layout_build_context_internal(
-            &probe, budget, document, stylesheet, fonts, images, viewport,
-            reuse, preview_y_limit,
-            preview_truncated == NULL ? NULL : &probe_truncated, true)) {
-        return false;
-    }
-    uint64_t probe_us = probe.performance.total_us;
-    if (!layout_collect_container_state(mutable_sheet, budget, &probe)) {
-        layout_destroy(&probe);
-        return false;
-    }
-    uint64_t measured_signature =
-        style_container_layout_state_signature(stylesheet);
-    if (measured_signature == previous_signature) {
-        *layout = probe;
-        if (preview_truncated != NULL) *preview_truncated = probe_truncated;
-        return true;
-    }
-
-    /* The probe is never presented. Size containment makes the measured
-       container geometry independent of descendant query results, so one
-       authoritative continuation pass is sufficient and bounded. */
-    layout_destroy(&probe);
-    layout_reuse_cache_reset(reuse);
-    bool built = layout_build_context_internal(
-        layout, budget, document, stylesheet, fonts, images, viewport,
-        reuse, preview_y_limit, preview_truncated, false);
-    if (built) layout->performance.total_us += probe_us;
-    return built;
-}
-
 bool layout_build_context_reuse(LayoutDocument *layout, Budget *budget,
                                 const PocDocument *document,
                                 const Stylesheet *stylesheet,
@@ -2603,7 +2466,7 @@ bool layout_build_context_reuse(LayoutDocument *layout, Budget *budget,
                                 const ViewportContext *viewport,
                                 LayoutReuseCache *reuse)
 {
-    return layout_build_context_container_queries(
+    return layout_build_context_resumable_sync(
         layout, budget, document, stylesheet, fonts, images, viewport, reuse,
         0, NULL);
 }
@@ -2619,7 +2482,7 @@ bool layout_build_context_preview(LayoutDocument *layout, Budget *budget,
 {
     if (truncated == NULL || y_limit <= 0) return false;
     *truncated = false;
-    return layout_build_context_container_queries(
+    return layout_build_context_resumable_sync(
         layout, budget, document, stylesheet, fonts, images, viewport, reuse,
         y_limit, truncated);
 }
@@ -3031,7 +2894,11 @@ void layout_destroy(LayoutDocument *layout)
         budget_free(layout->budget, layout->overflow_orders);
         budget_free(layout->budget, layout->late_positioned_orders);
     }
+    /* A failed build destroys its partial document on the way out; the
+       owner still needs to know whether that build was cancelled. */
+    bool cancelled = layout->performance.cancelled;
     memset(layout, 0, sizeof(*layout));
+    layout->performance.cancelled = cancelled;
 }
 
 const char *layout_retain_generated_text(
@@ -3257,7 +3124,7 @@ bool layout_focus_for_node(const LayoutDocument *layout,
 
 bool layout_apply_focus_border_paint(
     LayoutDocument *layout, const Stylesheet *stylesheet,
-    lxb_dom_node_t *node, const ComputedStyle *style, bool dry_run,
+    lxb_dom_node_t *node, const ComputedStyle *style, bool inset_changed, bool dry_run,
     int *left, int *top, int *right, int *bottom)
 {
     int border_radius_code = stylesheet_border_radius_code(
@@ -3287,9 +3154,18 @@ bool layout_apply_focus_border_paint(
         }
     }
 
-    size_t match = SIZE_MAX;
+    size_t match = SIZE_MAX, inset = SIZE_MAX;
     for (size_t i = box->command_start; i < box->command_end; i++) {
         const DrawCommand *command = &layout->commands[i];
+        if (command->type == DRAW_STROKE_RECT
+            && command->image_fit == LAYOUT_STROKE_FOCUS_INSET
+            && command->x == box->x && command->y == box->y
+            && command->width == box->width && command->height == box->height
+            && command->radius == border_radius_code) {
+            if (inset != SIZE_MAX) return false;
+            inset = i;
+            continue;
+        }
         if (command->type != DRAW_STROKE_RECT
             || command->x != box->x || command->y != box->y
             || command->width != box->width || command->height != box->height
@@ -3300,9 +3176,36 @@ bool layout_apply_focus_border_paint(
         match = i;
     }
     if (match == SIZE_MAX) return false;
+    uint32_t inset_color = 0;
+    uint8_t inset_alpha = 0;
+    int inset_width = 1;
+    if (inset_changed) {
+        if (inset == SIZE_MAX) return false;
+        size_t count = stylesheet_box_shadow_count(stylesheet, style);
+        if (count > 1) return false;
+        if (count == 1) {
+            const StyleBoxShadow *shadow = stylesheet_box_shadow(stylesheet, style, 0);
+            if (shadow == NULL || !style_box_shadow_is_inset(shadow)
+                || style_box_shadow_blur(shadow) != 0 || shadow->offset_x != 0
+                || shadow->offset_y != 0 || shadow->spread <= 0) return false;
+            inset_color = style_box_shadow_uses_current_color(shadow)
+                ? style->color : shadow->argb & UINT32_C(0x00ffffff);
+            inset_alpha = style_box_shadow_uses_current_color(shadow)
+                ? style->color_alpha : (uint8_t) (shadow->argb >> 24);
+            inset_width = shadow->spread;
+        }
+    }
     if (!dry_run) {
         layout->commands[match].color = color;
-        layout->commands[match].opacity_scale = alpha_opacity_scale(alpha);
+        /* Commands in the retained list are already normalized; UINT16_MAX
+           is only an insertion-time transparent sentinel. */
+        layout->commands[match].opacity_scale = alpha == 0 ? 0 : alpha_opacity_scale(alpha);
+        if (inset_changed) {
+            layout->commands[inset].color = inset_color;
+            layout->commands[inset].scale = inset_width;
+            layout->commands[inset].opacity_scale = inset_alpha == 0
+                ? 0 : alpha_opacity_scale(inset_alpha);
+        }
     }
     if (left != NULL) *left = box->x - style->border.top;
     if (top != NULL) *top = box->y - style->border.top;

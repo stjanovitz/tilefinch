@@ -7,6 +7,16 @@
 
 #define CANVAS_BRIDGE_PIXEL_BYTE_LIMIT (512u * 1024u)
 #define CANVAS_RASTER_WORK_LIMIT (4u * 1024u * 1024u)
+/* canvas.js keeps every surface at or below 512 KiB of RGBA pixels and
+   flushes rectangle batches of at most 32 commands. The facade retains a
+   batch whose native call reports status 2 (clipped), so a batch of 32
+   full-surface rectangles must always fit one call's allowance; otherwise a
+   retained batch could replay rectangles that were already blended. */
+#define CANVAS_SURFACE_PIXEL_LIMIT ((512u * 1024u) / 4u)
+#define CANVAS_RECT_BATCH_LIMIT 32u
+_Static_assert(CANVAS_RECT_BATCH_LIMIT * CANVAS_SURFACE_PIXEL_LIMIT
+                   <= CANVAS_RASTER_WORK_LIMIT,
+               "canvas rectangle batch must fit the raster work allowance");
 
 static bool canvas_work_take(size_t *remaining, size_t cost)
 {
@@ -526,18 +536,23 @@ JSValue js_canvas_raster_rect_batch(JSContext *context,
             || global_alpha > 1.0 || operation < 1 || operation > 11) {
             continue;
         }
-        for (int y = top; y < bottom && !work_exhausted; y++) {
+        size_t rect_width = (size_t) (right - left);
+        size_t rect_height = (size_t) (bottom - top);
+        if (rect_width > SIZE_MAX / rect_height
+            || !canvas_work_take(
+                &work_remaining, rect_width * rect_height)) {
+            /* Never leave a valid rectangle half-painted. Status 2 tells the
+               facade that the untouched tail was clipped by the call bound. */
+            work_exhausted = true;
+            break;
+        }
+        for (int y = top; y < bottom; y++) {
             for (int x = left; x < right; x++) {
-                if (!canvas_work_take(&work_remaining, 1u)) {
-                    work_exhausted = true;
-                    break;
-                }
                 size_t at = ((size_t) y * (size_t) width + (size_t) x) * 4u;
                 canvas_blend_pixel(pixels, at, red, green, blue, alpha,
                                    global_alpha, operation, 1.0);
             }
         }
-        if (work_exhausted) break;
     }
     JS_FreeValue(context, command_buffer);
     JS_FreeValue(context, pixel_buffer);

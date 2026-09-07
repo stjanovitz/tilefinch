@@ -7,7 +7,7 @@ by [Device qualification](DEVICE_QUALIFICATION.md).
 ## Static renderer (`psp-browser-lab`)
 
 ```sh
-./build/psp-browser-lab \
+./build-preset-release/psp-browser-lab \
   --fixture fixtures/demo.html \
   --output-dir frames \
   --limit-mb 48 \
@@ -119,7 +119,7 @@ by server policy.
 Live document loads use the same hard allocation budget as parsing and rendering:
 
 ```sh
-./build/psp-browser-lab \
+./build-preset-release/psp-browser-lab \
   --url https://en.wikipedia.org/wiki/PlayStation_Portable \
   --output-dir frames/wikipedia \
   --limit-mb 13 \
@@ -151,7 +151,7 @@ capture's presentation source unambiguous.
 A bounded mobile-CSS run is:
 
 ```sh
-./build/psp-browser-lab \
+./build-preset-release/psp-browser-lab \
   --url https://en.wikipedia.org/wiki/PlayStation_Portable \
   --reader-profile auto \
   --fetch-css \
@@ -178,7 +178,7 @@ pressure thresholds. `--experimental-section N` forces sectional mode for
 diagnostics and arbitrary-section selection:
 
 ```sh
-./build/psp-browser-lab \
+./build-preset-release/psp-browser-lab \
   --url https://html.spec.whatwg.org/ \
   --max-download-kb 32768 \
   --psp-profile strict \
@@ -304,7 +304,7 @@ handles and retained response buffers. Synchronous
 XHR remains available only when a page explicitly requests `async=false`.
 
 ```sh
-./build/psp-browser-interactive-lab \
+./build-preset-release/psp-browser-interactive-lab \
   --url http://127.0.0.1:8765/interactive.html \
   --fetch-scripts --reload 3 \
   --ticks 2 --tick-ms 10 \
@@ -327,13 +327,13 @@ page, JavaScript runtime, cookies, history, tile cache, focus, and scroll state
 alive while commands are read from a file or standard input:
 
 ```sh
-./build/psp-browser-interactive-lab \
+./build-preset-release/psp-browser-interactive-lab \
   --fixture fixtures/interactive.html \
   --commands fixtures/lab-loop.commands \
   --loop-output-dir interactive-frames \
   --output interactive-final.ppm
 
-./build/psp-browser-interactive-lab \
+./build-preset-release/psp-browser-interactive-lab \
   --url https://news.ycombinator.com/ \
   --user-css profiles/hacker-news.css \
   --interactive --loop-output-dir hn-session
@@ -436,7 +436,7 @@ run:
 
 ```sh
 python3 fixtures/server.py
-./build/psp-browser-interactive-lab \
+./build-preset-release/psp-browser-interactive-lab \
   --url http://127.0.0.1:8765/turnstile.html \
   --fetch-scripts --ticks 140 --tick-ms 100 \
   --focus-next 1 --activate --follow-action \

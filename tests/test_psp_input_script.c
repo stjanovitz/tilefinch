@@ -165,6 +165,18 @@ static bool test_stepper(void)
     CHECK(!psp_input_script_advance(&script, &input, 0, true));
 
     CHECK(psp_input_script_parse(
+        &script, "stick 1 right cross\nwait 1\nstick 1 down-left cross\nend\n",
+        "inline", record_warning, NULL));
+    CHECK(psp_input_script_advance(&script, &input, 0, true)
+          && input.analog_x == 255 && input.analog_y == 128
+          && input.pressed == PSP_UI_BUTTON_CONFIRM);
+    CHECK(psp_input_script_advance(&script, &input, input.held, true)
+          && input.held == 0);
+    CHECK(psp_input_script_advance(&script, &input, 0, true)
+          && input.analog_x == 0 && input.analog_y == 255
+          && input.pressed == PSP_UI_BUTTON_CONFIRM);
+
+    CHECK(psp_input_script_parse(
         &script, "stick 2 right\nstick 1 up\nend\n", "inline",
         record_warning, NULL));
     CHECK(psp_input_script_advance(&script, &input, 0, true)
@@ -186,6 +198,26 @@ static bool test_stepper(void)
     CHECK(script.ticks == 0 && script.step == 0);
     CHECK(psp_input_script_advance(&script, &input, 0, true));
     CHECK(input.pressed == PSP_UI_BUTTON_CONFIRM);
+
+    /* A painted-page input does not wait for background resources, but can
+       never enter from a VM/supervisor checkpoint or an unpainted page. */
+    CHECK(psp_input_script_parse(
+        &script, "tap-page down\nmark-page moved\nend\n",
+        "inline", record_warning, NULL));
+    CHECK(script.steps[0].advance_when_painted);
+    CHECK(!script.steps[0].advance_while_busy);
+    CHECK(psp_input_script_advance_with_page(&script, &input, 0, false, false));
+    CHECK(input.pressed == 0 && script.ticks == 0);
+    CHECK(psp_input_script_advance_with_page(&script, &input, 0, false, true));
+    CHECK(input.pressed == PSP_UI_BUTTON_DOWN && script.ticks == 1);
+    CHECK(psp_input_script_advance(&script, &input, input.held, false));
+    CHECK(input.pressed == 0 && script.ticks == 2);
+    CHECK(psp_input_script_advance(&script, &input, 0, false));
+    CHECK(psp_input_script_mark(&script) == NULL && script.ticks == 2);
+    CHECK(psp_input_script_advance_with_page(&script, &input, 0, false, true));
+    CHECK(strcmp(psp_input_script_mark(&script), "moved") == 0);
+    CHECK(!psp_input_script_parse(
+        &script, "end-page\n", "inline", record_warning, NULL));
 
     /* When that held edge synchronously starts work, only its neutral release
        may drain before the explicitly-live sequence. */

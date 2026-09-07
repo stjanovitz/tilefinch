@@ -3,6 +3,7 @@ set(TILEFINCH_CORE_SOURCES
     src/browser_profile.c
     src/browser_tabs.c
     src/budget.c
+    src/tilefinch_test_faults.c
     src/captive_portal.c
     src/content_blocker.c
     src/content_security_policy.c
@@ -224,15 +225,12 @@ else()
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
         COMMENT "Regenerating embedded browser bootstrap sources and bytecode")
     add_custom_target(check_tilefinch_bootstrap_generated
-        COMMAND tilefinch_bootstrap_bytecode_generator --check
-            "${TILEFINCH_BOOTSTRAP_SOURCE_DIR}"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/generated/js_bootstrap.c"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/generated/js_bootstrap_bytecode.c"
-            "${CMAKE_CURRENT_BINARY_DIR}"
         COMMAND ${CMAKE_COMMAND}
             -DTILEFINCH_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
             -DTILEFINCH_BOOTSTRAP_MANIFEST=${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap/generated.sha256
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/VerifyBootstrapManifest.cmake"
+            -DTILEFINCH_BOOTSTRAP_GENERATOR=$<TARGET_FILE:tilefinch_bootstrap_bytecode_generator>
+            -DTILEFINCH_BOOTSTRAP_SCRATCH=${CMAKE_CURRENT_BINARY_DIR}
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckBootstrapGenerated.cmake"
         DEPENDS tilefinch_bootstrap_bytecode_generator
             ${TILEFINCH_BOOTSTRAP_INPUTS}
             "${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap/generated.sha256"
@@ -270,6 +268,12 @@ if(NOT PSP_BROWSER_ENABLE_GIF)
 endif()
 if(PSP_BROWSER_DISABLE_TRACE)
     target_compile_definitions(tilefinch_core PRIVATE TILEFINCH_NO_TRACE=1)
+endif()
+if(TILEFINCH_PROFILE_LAYOUT_FLOW)
+    if(NOT PSP OR NOT TILEFINCH_PSP_VALIDATION_LOG)
+        message(FATAL_ERROR "Layout flow profiling requires PSP validation logging")
+    endif()
+    target_compile_definitions(tilefinch_core PRIVATE TILEFINCH_PROFILE_LAYOUT_FLOW=1)
 endif()
 if(PSP AND TILEFINCH_PSP_VALIDATION_LOG)
     # Device-library diagnostics must use the same explicit opt-in as the

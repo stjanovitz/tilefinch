@@ -373,18 +373,6 @@ static bool layout_block_impl(LayoutContext *context, lxb_dom_node_t *node,
                 (int) id_length, id == NULL ? "" : id,
                 (int) class_length, class_name == NULL ? "" : class_name);
     }
-    if (LAYOUT_TRACE(context->layout, LAYOUT)) {
-        size_t class_length = 0;
-        const char *class_name = document_attribute(node, "class",
-                                                     &class_length);
-        if (class_name != NULL && strstr(class_name, "wm-") != NULL) {
-            fprintf(stderr, "layout-block class=%.*s display=%d hidden=%d out=%d fixed=%d simple-match=%d x=%d y=%d width=%d\n",
-                    (int) class_length, class_name, style->display,
-                    style->hidden, style->out_of_flow, style->fixed_position,
-                    style_selector_matches(node, ".wm-fallback-layout", 19),
-                    x, y, width);
-        }
-    }
     if (style->display == DISPLAY_NONE
         || style->display == DISPLAY_TABLE_COLUMN || style->hidden) {
         *bottom = y;

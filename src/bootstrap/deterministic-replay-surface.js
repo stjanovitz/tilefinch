@@ -77,7 +77,20 @@
   };
   DateTimeFormat.prototype = ReplayDateTimeFormat.prototype;
   Object.setPrototypeOf(DateTimeFormat, ReplayDateTimeFormat);
-  Intl.DateTimeFormat = DateTimeFormat;
+  /* Intl is a lazy module. While its global is still the lazy accessor,
+     hand the facade to intl.js instead of forcing every deterministic realm
+     to load the module at bootstrap; intl.js installs it on load. */
+  const intlSlot = Object.getOwnPropertyDescriptor(globalThis, "Intl");
+  if (intlSlot && typeof intlSlot.get === "function") {
+    Object.defineProperty(globalThis, "__tilefinchDeterministicDateTimeFormat", {
+      value: DateTimeFormat,
+      configurable: true,
+      enumerable: false,
+      writable: false,
+    });
+  } else {
+    Intl.DateTimeFormat = DateTimeFormat;
+  }
   const empty = () => [];
   Object.defineProperties(performance, {
     getEntries: {

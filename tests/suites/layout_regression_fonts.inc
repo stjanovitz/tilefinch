@@ -846,6 +846,34 @@
                         2 * MIB));
     const FontFace *sans = font_set_face(&fonts, FONT_SANS);
     CHECK(sans != NULL);
+    /* Pin run-level rounding and kerning across glyph-index reuse. Include
+       embedded NUL, ignored characters, fallback glyphs and malformed UTF-8:
+       these do not all have the same previous-glyph semantics. */
+    static const char *const metric_runs[] = {
+        "AVATAR To WA", "A\0V", "A\xe2\x80\x8bV", "A\xcc\x81V",
+        "A\xe4\xb8\xadV", "1\xef\xb8\x8f\xe2\x83\xa3V",
+        "A\xf0\x9f\x98\x80V", "A\xffV", "A\xe2\x82", ""
+    };
+    static const size_t metric_lengths[] = {12, 3, 5, 4, 5, 8, 6, 3, 3, 0};
+    static const int metric_sizes[] = {1, 12 * 64, 16 * 64 + 32, 73 * 64 + 17};
+    const FontFace *const metric_faces[] = {
+        &fonts.sans, &fonts.serif, &fonts.sans_bold, &fonts.sans_italic
+    };
+    uint64_t metric_digest = UINT64_C(1469598103934665603);
+    for (size_t f = 0; f < 4; f++) {
+        for (size_t r = 0; r < 10; r++) {
+            for (size_t s = 0; s < 4; s++) {
+                for (unsigned flags = 0; flags < 4; flags++) {
+                    int width = font_text_width_at_size_fixed_mode(
+                        metric_faces[f], metric_runs[r], metric_lengths[r],
+                        metric_sizes[s], (flags & 1u) != 0, (flags & 2u) != 0);
+                    metric_digest ^= (uint32_t) width;
+                    metric_digest *= UINT64_C(1099511628211);
+                }
+            }
+        }
+    }
+    CHECK(metric_digest == UINT64_C(16510425944139442387));
     FontFamily web_humanist = FONT_SANS;
     WebFontSet metric_web_fonts = {0};
     CHECK(font_family_web(1, FONT_HUMANIST_SANS, &web_humanist)
@@ -947,6 +975,26 @@
         0x4e2du, /* Chinese middle */
         0x1f600u /* grinning face */
     };
+    /* An unloaded face isolates built-in coverage from the font's cmap.
+       Check inclusive endpoints of both generated tables, a hole inside,
+       and nearby misses. In particular the emoji table uses 32-bit keys. */
+    FontFace fallback_only_face = {0};
+    static const struct {
+        unsigned codepoint;
+        bool present;
+    } fallback_boundaries[] = {
+        {0x20u, false}, {0x25ffu, false}, {0x2600u, true},
+        {0x2fffu, false}, {0x3000u, true}, {0x3004u, false},
+        {0xffe5u, true}, {0xffe6u, false},
+        {0x1faffu, true}, {0x1fb00u, false}, {0x10ffffu, false}
+    };
+    for (size_t probe = 0;
+         probe < sizeof(fallback_boundaries) / sizeof(fallback_boundaries[0]);
+         probe++) {
+        CHECK(font_face_has_codepoint(
+                  &fallback_only_face, fallback_boundaries[probe].codepoint)
+              == fallback_boundaries[probe].present);
+    }
     for (size_t probe = 0;
          probe < sizeof(fallback_probes) / sizeof(fallback_probes[0]);
          probe++) {

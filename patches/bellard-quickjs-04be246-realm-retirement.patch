@@ -1,0 +1,115 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -540,3 +540,4 @@
+     BOOL dynamic_code_enabled;
++    BOOL host_retired;
+
+     uint16_t binary_object_count;
+@@ -564,2 +565,3 @@
+     JSValue global_obj; /* global object */
++    JSValue host_global_this; /* optional WindowProxy, not the binding object */
+     JSValue global_var_obj; /* contains the global let/const definitions */
+@@ -2307,4 +2309,5 @@
+     JSJobEntry *e;
+     int i;
+
++    if (ctx->host_retired) return 0;
+     if (no_exception)
+@@ -2359,3 +2361,4 @@
+     ctx = e->realm;
+-    res = e->job_func(ctx, e->argc, (JSValueConst *)e->argv);
++    res = ctx->host_retired ? JS_UNDEFINED
++        : e->job_func(ctx, e->argc, (JSValueConst *)e->argv);
+     for(i = 0; i < e->argc; i++)
+@@ -2650,2 +2654,3 @@
+     ctx->dynamic_code_enabled = TRUE;
++    ctx->host_global_this = JS_UNDEFINED;
+     js_rc(ctx)->ref_count = 1;
+@@ -2712,4 +2717,22 @@
+     ctx->dynamic_code_enabled = enabled != 0;
+ }
++
++void JS_RetireContext(JSContext *ctx)
++{
++    ctx->host_retired = TRUE;
++}
++
++void JS_SetGlobalThis(JSContext *ctx, JSValueConst value)
++{
++    JSValue previous = ctx->host_global_this;
++    ctx->host_global_this = JS_DupValue(ctx, value);
++    JS_FreeValue(ctx, previous);
++}
++
++static JSValueConst js_global_this(JSContext *ctx)
++{
++    return JS_IsUndefined(ctx->host_global_this)
++        ? ctx->global_obj : ctx->host_global_this;
++}
+
+ /* set the new value and free the old value after (freeing the value
+@@ -2784,2 +2807,3 @@
+     JS_MarkValue(rt, ctx->global_obj, mark_func);
++    JS_MarkValue(rt, ctx->host_global_this, mark_func);
+     JS_MarkValue(rt, ctx->global_var_obj, mark_func);
+@@ -2859,2 +2883,3 @@
+     JS_FreeValue(ctx, ctx->global_obj);
++    JS_FreeValue(ctx, ctx->host_global_this);
+     JS_FreeValue(ctx, ctx->global_var_obj);
+@@ -17971,3 +17979,4 @@
+     p = JS_VALUE_GET_OBJ(func_obj);
++    if (p->u.cfunc.realm->host_retired) return JS_UNDEFINED;
+     cproto = p->u.cfunc.cproto;
+     arg_count = p->u.cfunc.length;
+@@ -18192,3 +18201,4 @@
+             b = p->u.func.function_bytecode;
+             ctx = b->realm;
++            if (ctx->host_retired) return JS_UNDEFINED;
+             var_refs = p->u.func.var_refs;
+@@ -18219,4 +18229,6 @@
+         return call_func(caller_ctx, func_obj, this_obj, argc,
+                          (JSValueConst *)argv, flags);
+     }
++    if (p->u.func.function_bytecode->realm->host_retired)
++        return JS_UNDEFINED;
+     b = p->u.func.function_bytecode;
+@@ -18339,3 +18375,3 @@
+                     if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
+-                        val = JS_DupValue(ctx, ctx->global_obj);
++                        val = JS_DupValue(ctx, js_global_this(ctx));
+                     } else {
+@@ -37643,4 +37679,4 @@
+ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
+ {
+-    return JS_EvalFunctionInternal(ctx, fun_obj, ctx->global_obj, NULL, NULL);
++    return JS_EvalFunctionInternal(ctx, fun_obj, js_global_this(ctx), NULL, NULL);
+ }
+@@ -37954,4 +37990,4 @@
+ {
+-    return JS_EvalThis(ctx, ctx->global_obj, input, input_len, filename,
++    return JS_EvalThis(ctx, js_global_this(ctx), input, input_len, filename,
+                        eval_flags);
+ }
+@@ -40487,4 +40523,4 @@
+     if (unlikely(!ctx->dynamic_code_enabled))
+         return JS_ThrowTypeError(ctx, "dynamic code compilation disabled by Content Security Policy");
+-    return JS_EvalObject(ctx, ctx->global_obj, argv[0], JS_EVAL_TYPE_INDIRECT, -1);
++    return JS_EvalObject(ctx, js_global_this(ctx), argv[0], JS_EVAL_TYPE_INDIRECT, -1);
+ }
+@@ -41702,4 +41738,4 @@
+
+-    obj = JS_EvalObject(ctx, ctx->global_obj, s, JS_EVAL_TYPE_INDIRECT, -1);
++    obj = JS_EvalObject(ctx, js_global_this(ctx), s, JS_EVAL_TYPE_INDIRECT, -1);
+     JS_FreeValue(ctx, s);
+     if (JS_IsException(obj))
+diff --git a/quickjs.h b/quickjs.h
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -394,2 +394,6 @@
+ void JS_SetDynamicCodeEnabled(JSContext *ctx, JS_BOOL enabled);
++/* Stop future jobs/calls without freeing storage under retained functions. */
++void JS_RetireContext(JSContext *ctx);
++/* Keep global bindings on their real object, but use this receiver. */
++void JS_SetGlobalThis(JSContext *ctx, JSValueConst value);
+ JSRuntime *JS_GetRuntime(JSContext *ctx);

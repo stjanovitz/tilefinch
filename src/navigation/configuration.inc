@@ -197,17 +197,6 @@ bool navigation_rebind_top_level_remote_document(
     return true;
 }
 
-void navigation_set_remote_element_lookup(
-    NavigationSession *session, ScriptRemoteElementLookupCallback callback,
-    void *opaque)
-{
-    ScriptRemoteDocumentBinding binding =
-        navigation_remote_document_binding(session);
-    binding.element_lookup = callback;
-    binding.element_opaque = opaque;
-    (void) navigation_rebind_top_level_remote_document(session, &binding);
-}
-
 void navigation_set_remote_selector_lookup(
     NavigationSession *session, ScriptRemoteSelectorLookupCallback callback,
     void *opaque)
@@ -216,61 +205,6 @@ void navigation_set_remote_selector_lookup(
         navigation_remote_document_binding(session);
     binding.selector_lookup = callback;
     binding.selector_opaque = opaque;
-    (void) navigation_rebind_top_level_remote_document(session, &binding);
-}
-
-void navigation_set_remote_selector_collect(
-    NavigationSession *session, ScriptRemoteSelectorCollectCallback callback,
-    void *opaque)
-{
-    ScriptRemoteDocumentBinding binding =
-        navigation_remote_document_binding(session);
-    binding.selector_collect = callback;
-    binding.selector_collect_opaque = opaque;
-    (void) navigation_rebind_top_level_remote_document(session, &binding);
-}
-
-void navigation_set_remote_descendant_collect(
-    NavigationSession *session,
-    ScriptRemoteDescendantCollectCallback callback, void *opaque)
-{
-    ScriptRemoteDocumentBinding binding =
-        navigation_remote_document_binding(session);
-    binding.descendant_collect = callback;
-    binding.descendant_collect_opaque = opaque;
-    (void) navigation_rebind_top_level_remote_document(session, &binding);
-}
-
-void navigation_set_remote_node_read(
-    NavigationSession *session, ScriptRemoteNodeReadCallback callback,
-    void *opaque)
-{
-    ScriptRemoteDocumentBinding binding =
-        navigation_remote_document_binding(session);
-    binding.node_read = callback;
-    binding.node_read_opaque = opaque;
-    (void) navigation_rebind_top_level_remote_document(session, &binding);
-}
-
-void navigation_set_remote_node_write(
-    NavigationSession *session, ScriptRemoteNodeWriteCallback callback,
-    void *opaque)
-{
-    ScriptRemoteDocumentBinding binding =
-        navigation_remote_document_binding(session);
-    binding.node_write = callback;
-    binding.node_write_opaque = opaque;
-    (void) navigation_rebind_top_level_remote_document(session, &binding);
-}
-
-void navigation_set_node_visibility(
-    NavigationSession *session, ScriptNodeVisibilityCallback callback,
-    void *opaque)
-{
-    ScriptRemoteDocumentBinding binding =
-        navigation_remote_document_binding(session);
-    binding.node_visibility = callback;
-    binding.node_visibility_opaque = opaque;
     (void) navigation_rebind_top_level_remote_document(session, &binding);
 }
 

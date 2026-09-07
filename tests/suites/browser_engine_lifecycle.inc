@@ -309,9 +309,10 @@ static int test_engine_lifecycle(void)
               pointer_device_x, pointer_device_y,
               &pointer_activate, &pointer_page_changed)
           && !pointer_activate);
-    CHECK(browser_engine_render_frame_bounded(engine, 10000, 1)
-              == BROWSER_RENDER_JOB_PENDING);
-    BrowserRenderJobStatus frame_job = BROWSER_RENDER_JOB_PENDING;
+    BrowserRenderJobStatus frame_job = browser_engine_render_frame_bounded(
+        engine, 10000, 1);
+    CHECK(frame_job == BROWSER_RENDER_JOB_PENDING
+          || frame_job == BROWSER_RENDER_JOB_COMPLETE);
     while (frame_job == BROWSER_RENDER_JOB_PENDING) {
         frame_job = browser_engine_render_frame_bounded(
             engine, 10000, 2);
@@ -925,8 +926,364 @@ static int test_nomodule_capability_suppression(void)
     return 0;
 }
 
+static bool computed_style_test_flush(void *opaque)
+{
+    return navigation_relayout(opaque);
+}
+
+static int test_computed_paint_style_does_not_force_layout(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    static const char page[] =
+        "<!doctype html><style>body{margin:0}#target{width:100px}</style>"
+        "<div id=target>Paint-only style reads during hydration</div>";
+    CHECK(engine != NULL && browser_engine_commit_html(engine,
+        "https://style-read.test/", page, sizeof(page) - 1, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    script_runtime_set_synchronous_layout_callback(navigation->page.runtime,
+        computed_style_test_flush, navigation);
+    size_t before = navigation->incremental_relayouts;
+    ScriptResult result = {0};
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "var target=document.getElementById('target');"
+        "for(var i=0;i<8;i++){target.style.color='rgb('+i+', 0, 0)';"
+        "if(getComputedStyle(target).color!=='rgb('+i+', 0, 0)')throw Error('color');}"
+        "target.style.visibility='hidden';"
+        "if(getComputedStyle(target).visibility!=='hidden')throw Error('visibility');"
+        "target.style.visibility='visible';target.style.width='123px';",
+        "<computed-paint-read>", &result) && result.success);
+    CHECK(navigation->incremental_relayouts == before);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "if(getComputedStyle(target).width!=='123px')throw Error('width');",
+        "<computed-geometry-read>", &result) && result.success
+        && navigation->incremental_relayouts == before + 1);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "var sheet=document.createElement('style');"
+        "sheet.textContent='#target{color:rgb(22, 33, 44)!important}';"
+        "document.head.appendChild(sheet);"
+        "if(getComputedStyle(target).color!=='rgb(22, 33, 44)')throw Error('sheet');",
+        "<computed-new-sheet>", &result) && result.success
+        && navigation->incremental_relayouts == before + 2);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+static int test_native_text_sync_does_not_relayout_twice(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    static const char page[] =
+        "<!doctype html><form action='/find'><input name=q type=search "
+        "onclick='event.preventDefault()'>"
+        "</form><script>let seen='';document.querySelector('input')"
+        ".addEventListener('input',e=>{seen=e.target.value});</script>";
+    CHECK(browser_engine_commit_html(engine, "https://search.test/", page,
+              sizeof(page) - 1u, true) && browser_engine_focus_move(engine, true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    size_t before = navigation->incremental_relayouts;
+    CHECK(browser_engine_replace_text(engine, "psp", 3));
+    CHECK(navigation->incremental_relayouts == before + 1u);
+    ControllerAction action = {0};
+    CHECK(browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+          && strcmp(action.url, "https://search.test/find?q=psp") == 0);
+    /* Implicit submission still honors the default button's click and the
+       form's submit cancellation; only the input's duplicate click is gone. */
+    static const char cancelled_button[] =
+        "<!doctype html><form action='/find'><input name=q type=search>"
+        "<button onclick='event.preventDefault()'>Find</button></form>";
+    CHECK(browser_engine_commit_html(engine, "https://search.test/", cancelled_button,
+              sizeof(cancelled_button) - 1u, true)
+          && browser_engine_focus_move(engine, true)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_NONE
+          && action.activation_outcome == CONTROLLER_ACTIVATION_CANCELLED);
+    static const char cancelled_form[] =
+        "<!doctype html><form action='/find' onsubmit='event.preventDefault()'>"
+        "<input name=q type=search></form>";
+    CHECK(browser_engine_commit_html(engine, "https://search.test/", cancelled_form,
+              sizeof(cancelled_form) - 1u, true)
+          && browser_engine_focus_move(engine, true)
+          && browser_engine_activate(engine, &action)
+          && action.type == CONTROLLER_ACTION_NONE
+          && action.activation_outcome == CONTROLLER_ACTIVATION_CANCELLED);
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+typedef struct {
+    uint64_t now_us;
+    unsigned publications;
+    unsigned ends;
+} OptionalFontInputProbe;
+
+typedef struct {
+    uint64_t last_us, maximum_gap_us;
+    uint64_t interrupt_delay_us, requested_us, acknowledged_us;
+    size_t checkpoints;
+    char maximum_gap_phase[48];
+} FontPublicationTiming;
+
+static bool font_publication_timing(void *opaque, const char *phase, size_t work)
+{
+    FontPublicationTiming *timing = opaque;
+    uint64_t now = tilefinch_platform_monotonic_time_us();
+    if (timing->interrupt_delay_us != 0
+        && strcmp(phase, "optional-font-publication") == 0 && work != 0)
+        timing->requested_us = now + timing->interrupt_delay_us;
+    uint64_t gap = now - timing->last_us;
+    if (gap > timing->maximum_gap_us) {
+        timing->maximum_gap_us = gap;
+        snprintf(timing->maximum_gap_phase, sizeof(timing->maximum_gap_phase),
+                 "%s", phase == NULL ? "unknown" : phase);
+    }
+    timing->last_us = now;
+    timing->checkpoints++;
+    if (timing->requested_us != 0 && now >= timing->requested_us
+        && strncmp(phase, "layout", 6) == 0) {
+        if (timing->acknowledged_us == 0) timing->acknowledged_us = now;
+        return false;
+    }
+    return true;
+}
+
+/* Opt-in host profiler: replay real page CSS/DOM through the ordinary engine
+   with device-style staged fonts. This is not a live-site CTest dependency. */
+static int profile_staged_font_replay(const char *trace, const char *url,
+                                     uint64_t interrupt_delay_us, bool incremental)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    if (incremental) {
+        config.memory_limit = 32u * MIB;
+        config.javascript.enabled = true;
+        config.javascript.document_scripts_enabled = true;
+        config.javascript.heap_limit = 7u * MIB;
+        config.resources.enabled = true;
+        config.resources.maximum_stylesheets = 24;
+        config.resources.maximum_stylesheet_bytes = 2112u * 1024u;
+        config.resources.maximum_stylesheet_file_bytes = 768u * 1024u;
+    }
+    CHECK(browser_config_set_font_paths(&config,
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Latin.ttf",
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSerif-Latin.ttf",
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Oblique-Latin.ttf",
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Bold-Latin.ttf",
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSerif-Bold-Latin.ttf",
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/TilefinchSans-Regular.ttf",
+        TILEFINCH_TEST_SOURCE_DIR "/fonts/TilefinchSans-Bold.ttf",
+        1536u * 1024u));
+    browser_config_set_staged_font_loading(&config, true);
+    char error[256] = {0};
+    CHECK(fetch_trace_replay_begin_response_keyed(trace, error, sizeof(error)));
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_prepare_navigation_fonts(engine, "GET", url));
+    if (incremental) {
+        CHECK(browser_engine_begin_navigation_url(engine, url, 2u * MIB, 20000, true));
+        BrowserNavigationJobQuota quota = { .load = {
+            .fetch = { .maximum_body_bytes = 16u * 1024u,
+                .maximum_body_callbacks = 1, .maximum_time_us = 2000 },
+            .maximum_parser_body_bytes = 2048, .maximum_parser_time_us = 2000,
+            .maximum_finalize_work_units = 2048, .maximum_finalize_time_us = 2000 } };
+        BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+        for (size_t i = 0; i < 100000 && status == BROWSER_NAVIGATION_JOB_PENDING; i++)
+            status = browser_engine_pump_navigation(engine, &quota);
+        CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+    } else CHECK(browser_engine_load_url(engine, url, true));
+    CHECK(browser_engine_render_frame(engine, NULL));
+    const NavigationSession *navigation = browser_engine_navigation(engine);
+    printf("font-profile initial-bytes=%zu commands=%zu\n",
+           font_set_loaded_bytes(browser_engine_fonts(engine)), navigation->page.layout.count);
+    if (incremental) {
+        const ExternalImageStats *stats = &navigation->page.images.stats;
+        printf("navigation-images deferred=%zu loaded=%zu traversal=%lluus node=%lluus pseudo=%lluus drain=%lluus\n",
+            navigation->page.deferred_image_count, stats->loaded,
+            (unsigned long long) stats->traversal_us,
+            (unsigned long long) stats->node_style_resolve_us,
+            (unsigned long long) stats->pseudo_style_resolve_us,
+            (unsigned long long) stats->drain_us);
+    }
+    LayoutReuseStats before = {0}, after = {0};
+    FontPublicationTiming timing = { .interrupt_delay_us = interrupt_delay_us };
+    TilefinchPlatformServices services = { .context = &timing,
+        .cooperate = font_publication_timing };
+    size_t publications = 0;
+    for (size_t i = 0; i < 128 && publications == 0; i++) {
+        CHECK(browser_engine_advance_runtime(engine, 16, 4, NULL));
+        /* Borrow face identities only; the engine remains their sole owner.
+           Count the old display list because publication replaces that list. */
+        FontSet previous_fonts = *browser_engine_fonts(engine);
+        size_t font_requests[32][4] = {{0}};
+        for (size_t at = 0; at < navigation->page.layout.count; at++) {
+            const DrawCommand *command = &navigation->page.layout.commands[at];
+            if (command->type != DRAW_TEXT || command->font_family >= 32) continue;
+            unsigned variant = (draw_command_font_italic(command) ? 1u : 0u)
+                | (draw_command_font_weight_code(command) >= 65 ? 2u : 0u);
+            font_requests[command->font_family][variant]++;
+        }
+        size_t loaded_bytes = font_set_loaded_bytes(browser_engine_fonts(engine));
+        size_t relayouts = navigation->incremental_relayouts;
+        layout_reuse_cache_stats(navigation->page.layout_reuse, &before);
+        timing.maximum_gap_us = 0;
+        timing.checkpoints = 0;
+        timing.last_us = tilefinch_platform_monotonic_time_us();
+        uint64_t start = timing.last_us;
+        tilefinch_platform_set_services(&services);
+        bool changed = false;
+        (void) browser_engine_run_idle_work(engine, &changed);
+        uint64_t returned_us = tilefinch_platform_monotonic_time_us();
+        (void) font_publication_timing(&timing, "idle-return", 0);
+        tilefinch_platform_set_services(NULL);
+        if (timing.acknowledged_us != 0) {
+            CHECK(navigation->page.loaded && navigation->layout_build_cancelled
+                && font_set_loaded_bytes(browser_engine_fonts(engine)) == loaded_bytes
+                && navigation->incremental_relayouts == relayouts && !changed);
+            printf("font-interruption requested-after-us=%llu acknowledgement-us=%llu "
+                   "drain-us=%llu total-response-us=%llu retained-page=1\n",
+                (unsigned long long) interrupt_delay_us,
+                (unsigned long long) (timing.acknowledged_us - timing.requested_us),
+                (unsigned long long) (returned_us - timing.acknowledged_us),
+                (unsigned long long) (returned_us - timing.requested_us));
+            publications++;
+            break;
+        }
+        if (font_set_loaded_bytes(browser_engine_fonts(engine)) > loaded_bytes
+            && navigation->incremental_relayouts != relayouts) {
+            publications++;
+            layout_reuse_cache_stats(navigation->page.layout_reuse, &after);
+            size_t text_commands = 0, changed_faces = 0;
+            const WebFontSet *web_fonts = stylesheet_web_font_set(
+                &navigation->page.stylesheet);
+            for (unsigned family = 0; family < 32; family++) {
+                for (unsigned variant = 0; variant < 4; variant++) {
+                    size_t count = font_requests[family][variant];
+                    if (count == 0) continue;
+                    const FontFace *old_face = font_context_face_variant(
+                        &previous_fonts, web_fonts, (FontFamily) family,
+                        (variant & 1u) != 0, (variant & 2u) != 0);
+                    const FontFace *new_face = font_context_face_variant(
+                        browser_engine_fonts(engine), web_fonts, (FontFamily) family,
+                        (variant & 1u) != 0, (variant & 2u) != 0);
+                    bool changed_face = (old_face == NULL ? NULL : old_face->data)
+                        != (new_face == NULL ? NULL : new_face->data);
+                    text_commands += count;
+                    if (changed_face) changed_faces += count;
+                }
+            }
+            printf("font-usage text-commands=%zu changed-face-commands=%zu\n",
+                   text_commands, changed_faces);
+            printf("font-publication elapsed-us=%llu max-gap-us=%llu gap-ending-at=%s checkpoints=%zu "
+                   "style-hits=%zu style-misses=%zu parent-misses=%zu evictions=%zu resets=%zu flow-us=%llu "
+                   "ascii-segments=%llu fingerprint=%llu height=%d\n",
+                (unsigned long long) (returned_us - start),
+                (unsigned long long) timing.maximum_gap_us, timing.maximum_gap_phase,
+                timing.checkpoints,
+                after.style_hits - before.style_hits,
+                after.style_misses - before.style_misses,
+                after.style_parent_misses - before.style_parent_misses,
+                after.style_evictions - before.style_evictions,
+                after.full_resets - before.full_resets,
+                (unsigned long long) navigation->page.layout.performance.flow_us,
+                (unsigned long long) navigation->page.layout.performance.ascii_text_segments,
+                (unsigned long long) navigation->page.layout.text_fingerprint,
+                navigation->page.layout.height);
+        }
+    }
+    if (publications != 1) fprintf(stderr,
+        "font-profile final-bytes=%zu dirty=%d loaded=%d error=%s\n",
+        font_set_loaded_bytes(browser_engine_fonts(engine)),
+        script_runtime_has_pending_mutations(navigation->page.runtime),
+        navigation->page.loaded, browser_engine_last_error(engine));
+    CHECK(publications == 1 && navigation->page.loaded);
+    CHECK(interrupt_delay_us == 0 || timing.acknowledged_us != 0);
+    if (interrupt_delay_us == 0) {
+        /* Raster comparison is deliberately outside the publication timer. */
+        for (unsigned view = 0; view < 3; view++) {
+            if (view == 0) (void) browser_engine_scroll_to_edge(engine, false);
+            else if (view == 1) (void) browser_engine_scroll_by(
+                engine, navigation->page.layout.height / 2);
+            else (void) browser_engine_scroll_to_edge(engine, true);
+            CHECK(browser_engine_render_frame(engine, NULL));
+            size_t pixel_count = 0;
+            const uint16_t *pixels = browser_engine_framebuffer(engine, &pixel_count);
+            CHECK(pixels != NULL && pixel_count == 480u * 272u);
+            printf("font-raster view=%u checksum=%llu\n", view,
+                (unsigned long long) frame_checksum(pixels, pixel_count));
+        }
+    }
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    fetch_trace_end();
+    return 0;
+}
+
+static uint64_t optional_font_probe_clock(void *opaque)
+{
+    return ((OptionalFontInputProbe *) opaque)->now_us;
+}
+
+static bool optional_font_probe_cooperate(void *opaque, const char *phase,
+                                          size_t work)
+{
+    OptionalFontInputProbe *probe = opaque;
+    if (strcmp(phase, "optional-font-publication") != 0) return true;
+    if (work == 0) { probe->ends++; return true; }
+    /* A new cursor/input sample wins before any metrics are changed. */
+    return ++probe->publications != 1;
+}
+
+static int test_promoted_page_preserves_style_reuse(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-font-promotion",
+        error, sizeof(error)) && browser_engine_load_url(engine,
+        "https://font-promotion.test/page", true));
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    LayoutReuseCache *cache = navigation->page.layout_reuse;
+    lxb_dom_node_t *node = lxb_dom_interface_node(navigation->page.document.html->body);
+    ComputedStyle style;
+    CHECK(cache != NULL && node != NULL);
+    (void) layout_reuse_cache_resolve_style(cache, &navigation->page.stylesheet,
+        navigation->fonts, node, NULL, &style);
+    CHECK(layout_reuse_cache_resolve_style(cache, &navigation->page.stylesheet,
+        navigation->fonts, node, NULL, &style));
+    layout_reuse_cache_prepare(cache, &navigation->page.stylesheet,
+        navigation->fonts, navigation->images, navigation->viewport.css_width);
+    CHECK(layout_reuse_cache_resolve_style(cache, &navigation->page.stylesheet,
+        navigation->fonts, node, NULL, &style));
+    CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    fetch_trace_end();
+    return 0;
+}
+
 static int test_staged_optional_fonts_relayout_before_repaint(void)
 {
+    CHECK(test_promoted_page_preserves_style_reuse() == 0);
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
     BrowserConfig config;
@@ -980,7 +1337,9 @@ static int test_staged_optional_fonts_relayout_before_repaint(void)
         "<a id=probe autofocus data-tilefinch-provider-media "
         "href='https://www.youtube.com/watch?v=TFTEST00001'>"
         "Metric-sensitive text wraps across this bounded box</a>"
-        "<input value='Search'>";
+        "<input value='Search'>"
+        "<p style='font:italic 16px sans-serif'>Italic face</p>"
+        "<p style='font:bold 16px sans-serif'>Bold face</p>";
     CHECK(browser_engine_commit_html(
         engine, "https://font.test/", page, sizeof(page) - 1u, true)
           && browser_engine_focus_move(engine, true));
@@ -989,7 +1348,8 @@ static int test_staged_optional_fonts_relayout_before_repaint(void)
     size_t visual_changes = 0;
     size_t pending_slices = 0;
     bool interrupted_staging = false;
-    for (size_t i = 0; i < 32; i++) {
+    size_t baseline_font_bytes = font_set_loaded_bytes(browser_engine_fonts(engine));
+    for (size_t i = 0; i < 64; i++) {
         bool visual_changed = false;
         bool pending = browser_engine_run_idle_work(
             engine, &visual_changed);
@@ -998,11 +1358,16 @@ static int test_staged_optional_fonts_relayout_before_repaint(void)
             CHECK(browser_engine_render_frame(engine, NULL));
         }
         if (pending) pending_slices++;
-        if (pending && !interrupted_staging) {
+        if (visual_changes == 0) {
+            CHECK(font_set_loaded_bytes(browser_engine_fonts(engine)) == baseline_font_bytes
+                  && browser_engine_navigation(engine)->incremental_relayouts == relayouts_before);
+        }
+        /* Reclaim both a completed private face and the next partial read. */
+        if (pending && i == 6 && !interrupted_staging) {
             BrowserOptionalMemoryReclaim font_reclaim = {0};
             CHECK(browser_engine_reclaim_optional_memory(
                       engine, &font_reclaim)
-                  && font_reclaim.font_staging_bytes != 0
+                  && font_reclaim.font_staging_bytes > 128u * 1024u
                   && font_reclaim.total_bytes
                          >= font_reclaim.font_staging_bytes);
             interrupted_staging = true;
@@ -1012,9 +1377,9 @@ static int test_staged_optional_fonts_relayout_before_repaint(void)
         if (font_set_face_is_bold(
                 browser_engine_fonts(engine), serif_face)) break;
     }
-    CHECK(interrupted_staging && pending_slices >= 2 && visual_changes == 2
+    CHECK(interrupted_staging && pending_slices >= 2 && visual_changes == 1
           && browser_engine_navigation(engine)->incremental_relayouts
-                 >= relayouts_before + 2u
+                 == relayouts_before + 1u
           && font_set_face_is_bold(
                  browser_engine_fonts(engine),
                  browser_engine_font_face_variant(
@@ -1026,6 +1391,96 @@ static int test_staged_optional_fonts_relayout_before_repaint(void)
           && strcmp(action.url,
                     "https://www.youtube.com/watch?v=TFTEST00001") == 0);
     CHECK(browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+
+    /* A failed combined publication must retain the fallback layout, refuse
+       the optional batch once, and release every private font allocation. */
+    engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && browser_engine_commit_html(
+        engine, "https://font.test/", page, sizeof(page) - 1u, true));
+    baseline_font_bytes = font_set_loaded_bytes(browser_engine_fonts(engine));
+    int fallback_height = browser_engine_navigation(engine)->page.layout.height;
+    relayouts_before = browser_engine_navigation(engine)->incremental_relayouts;
+    navigation_test_refuse_next_same_document_relayout();
+    for (size_t i = 0; i < 64; i++) {
+        bool changed = false;
+        (void) browser_engine_run_idle_work(engine, &changed);
+    }
+    CHECK(browser_engine_navigation(engine)->page.loaded
+          && browser_engine_navigation(engine)->page.layout.height == fallback_height
+          && browser_engine_navigation(engine)->incremental_relayouts == relayouts_before
+          && font_set_loaded_bytes(browser_engine_fonts(engine)) == baseline_font_bytes
+          && browser_engine_last_error(engine)[0] == '\0'
+          && browser_engine_render_frame(engine, NULL)
+          && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+
+    /* A supervisor cancel at a cooperate checkpoint (Circle pressed while
+       the idle pump publishes the batch) is not a refusal: the faces return
+       to staging with the fallback layout intact and publish on a later
+       pump instead of being marked failed for the rest of the page. */
+    engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL);
+    for (size_t i = 0;
+         i < 4 && !browser_engine_baseline_fonts_ready(engine); i++) {
+        CHECK(browser_engine_pump_baseline_fonts(engine));
+    }
+    CHECK(browser_engine_baseline_fonts_ready(engine)
+          && browser_engine_commit_html(
+              engine, "https://font.test/", page, sizeof(page) - 1u, true)
+          && browser_engine_focus_move(engine, true));
+    baseline_font_bytes = font_set_loaded_bytes(browser_engine_fonts(engine));
+    fallback_height = browser_engine_navigation(engine)->page.layout.height;
+    relayouts_before = browser_engine_navigation(engine)->incremental_relayouts;
+    tilefinch_test_faults()->cancel_next_layout_cooperate = true;
+    OptionalFontInputProbe input_probe = { .now_us = 1000000 };
+    TilefinchPlatformServices input_services = {
+        .context = &input_probe,
+        .monotonic_time_us = optional_font_probe_clock,
+        .cooperate = optional_font_probe_cooperate
+    };
+    tilefinch_platform_set_services(&input_services);
+    bool cancelled_once = false;
+    visual_changes = 0;
+    for (size_t i = 0; i < 64; i++) {
+        input_probe.now_us += 50000;
+        bool changed = false;
+        (void) browser_engine_run_idle_work(engine, &changed);
+        if (changed) {
+            visual_changes++;
+            CHECK(browser_engine_render_frame(engine, NULL));
+        }
+        CHECK(browser_engine_navigation(engine)->page.loaded
+              && browser_engine_last_error(engine)[0] == '\0');
+        if (!cancelled_once
+            && !tilefinch_test_faults()->cancel_next_layout_cooperate) {
+            cancelled_once = true;
+            CHECK(!changed
+                  && browser_engine_navigation(engine)->page.layout.height
+                         == fallback_height
+                  && browser_engine_navigation(engine)->incremental_relayouts
+                         == relayouts_before
+                  && font_set_loaded_bytes(browser_engine_fonts(engine))
+                         == baseline_font_bytes);
+        }
+        if (font_set_face_is_bold(
+                browser_engine_fonts(engine),
+                browser_engine_font_face_variant(
+                    engine, FONT_SERIF, false, true))) break;
+    }
+    tilefinch_platform_set_services(NULL);
+    CHECK(input_probe.publications == 3 && input_probe.ends == 3
+          && cancelled_once && visual_changes == 1
+          && browser_engine_navigation(engine)->incremental_relayouts
+                 == relayouts_before + 1u
+          && font_set_loaded_bytes(browser_engine_fonts(engine))
+                 > baseline_font_bytes
+          && font_set_face_is_bold(
+                 browser_engine_fonts(engine),
+                 browser_engine_font_face_variant(
+                     engine, FONT_SERIF, false, true))
+          && browser_engine_render_frame(engine, NULL)
+          && browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
 
     /* A built-in provider has a known typography contract: its bold faces
@@ -1173,7 +1628,7 @@ static int test_deferred_image_relayout_requests_repaint(void)
     }
     frame = browser_engine_framebuffer(engine, &pixels);
     uint64_t painted = frame == NULL ? 0 : frame_checksum(frame, pixels);
-    if (visual_changes != 2u
+    if (visual_changes != 1u
         || browser_engine_navigation(engine)->page.images.stats.loaded != 2u
         || painted == placeholder) {
         fprintf(stderr,
@@ -1191,7 +1646,7 @@ static int test_deferred_image_relayout_requests_repaint(void)
                 browser_engine_navigation(engine)->performance
                     .background_image_relayouts);
     }
-    CHECK(visual_changes == 2u
+    CHECK(visual_changes == 1u
           && input_during_relayout
           && browser_engine_navigation(engine)->page.images.stats.loaded
                  == 2u
@@ -2343,6 +2798,17 @@ static int test_history_restores_bounded_form_state(void)
 
     /* Leaving the redirected document must not overwrite the original
        history entry's saved controls, either. */
+    NavigationEntry *original_entry =
+        &navigation->history[navigation->history_index];
+    int original_focus_kind = original_entry->focus_kind;
+    size_t original_focus_index = original_entry->focus_index;
+    /* An out-of-layout ordinal is a legal stale restoration hint; an input
+       on the redirected document must not replace it with its own ordinal. */
+    original_entry->focus_index = NAVIGATION_HISTORY_CONTROL_LIMIT;
+    CHECK(browser_engine_focus_move(engine, true));
+    CHECK(original_entry->focus_kind == original_focus_kind
+          && original_entry->focus_index == NAVIGATION_HISTORY_CONTROL_LIMIT);
+    original_entry->focus_index = original_focus_index;
     CHECK(document_control_value_set(
         &navigation->page.document, query, "cross-origin", 12u));
     CHECK(browser_engine_commit_html(

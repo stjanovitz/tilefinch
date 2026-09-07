@@ -56,7 +56,7 @@ bool tilefinch_update_package_path_allowed(const char *path)
 {
     static const char *const exact[] = {
         "EBOOT.PBP", "roots.pem", "boot-defaults.cfg",
-        "tilefinch-wasm.prx"
+        "tilefinch-wasm.prx", "tilefinch-voice.prx"
     };
     if (!package_path_safe(path)) return false;
     for (size_t index = 0; index < sizeof(exact) / sizeof(exact[0]); index++)

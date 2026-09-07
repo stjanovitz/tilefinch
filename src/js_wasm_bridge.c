@@ -7,7 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "tilefinch/platform.h"
 #include "tilefinch/wasm_runtime.h"
+#include "tilefinch_test_faults.h"
 
 #if defined(TILEFINCH_HAVE_WAMR) || defined(TILEFINCH_HAVE_WAMR_COMPONENT)
 #include <wasm_export.h>
@@ -77,6 +79,9 @@ static bool wasm_component_load(void)
 #define wasm_runtime_load(...) wasm_component_api.runtime_load(__VA_ARGS__)
 #define wasm_runtime_load_ex(...) wasm_component_api.runtime_load_ex(__VA_ARGS__)
 #define wasm_runtime_unload(...) wasm_component_api.runtime_unload(__VA_ARGS__)
+#define wasm_runtime_get_module_inst(...) wasm_component_api.runtime_get_module_inst(__VA_ARGS__)
+#define wasm_runtime_resolve_symbols(...) wasm_component_api.runtime_resolve_symbols(__VA_ARGS__)
+#define wasm_runtime_is_underlying_binary_freeable(...) wasm_component_api.runtime_is_underlying_binary_freeable(__VA_ARGS__)
 #define wasm_runtime_instantiate_ex(...) wasm_component_api.runtime_instantiate_ex(__VA_ARGS__)
 #define wasm_runtime_deinstantiate(...) wasm_component_api.runtime_deinstantiate(__VA_ARGS__)
 #define wasm_runtime_create_exec_env(...) wasm_component_api.runtime_create_exec_env(__VA_ARGS__)
@@ -167,6 +172,19 @@ typedef struct {
     char signature[TILEFINCH_WASM_MAX_ARGUMENTS + 4u];
 } TilefinchWasmImport;
 
+/* One function export, resolved once at instantiation. Export calls index
+   this table instead of looking the function up by name and re-reading its
+   signature on every call. The name points into the loaded module's export
+   table, which outlives every export function (they retain the instance). */
+typedef struct {
+    wasm_function_inst_t function;
+    const char *name;
+    uint8_t parameter_count;
+    uint8_t result_count;
+    wasm_valkind_t parameter_types[TILEFINCH_WASM_MAX_ARGUMENTS];
+    wasm_valkind_t result_types[TILEFINCH_WASM_MAX_RESULTS];
+} TilefinchWasmExport;
+
 struct TilefinchWasmInstance {
     Budget *budget;
     uint8_t *module_bytes;
@@ -181,15 +199,48 @@ struct TilefinchWasmInstance {
     TilefinchWasmImport *imports;
     char *import_names;
     uint32_t import_count;
+    TilefinchWasmExport *exports;
+    uint32_t export_count;
+    /* memory.buffer aliases WAMR's linear memory directly; no copy exists.
+       The cached base/extent detect growth (which moves the memory) at every
+       wasm<->JavaScript transition, where the stale buffer is detached and a
+       fresh alias published. alias_buffers counts aliasing ArrayBuffers that
+       JavaScript may still reference; while any exist after the instance
+       object dies, the native instance is kept as a zombie so the memory they
+       alias stays mapped until the last one is freed or detached. */
+    uint8_t *memory_base;
     size_t memory_bytes;
+    size_t alias_buffers;
+    uint8_t empty_memory_sentinel;
+    bool memory_needs_refresh;
+    bool zombie;
     bool counted_live;
     bool owns_runtime_operation;
+    /* The finite interpreter ceiling bounds a single call; the host realm's
+       existing watchdog bounds aggregate task time across calls/instances. */
+    uint32_t call_depth;
 };
+
+typedef struct {
+    const char *module_name;
+    const char *name;
+    uint8_t kind;
+} TilefinchWasmDescriptor;
 
 typedef struct {
     Budget *budget;
     uint8_t *bytes;
     size_t length;
+    /* Import and export descriptors captured from the validating load, so
+       Module.imports/exports reflect without loading the module again.
+       Imports come first, then exports. Left unset when the module exceeds
+       the descriptor limits; reflection then takes the loading path, which
+       reports the limit. */
+    TilefinchWasmDescriptor *descriptors;
+    char *descriptor_names;
+    uint32_t import_count;
+    uint32_t export_count;
+    bool descriptors_ready;
 } TilefinchWasmModule;
 
 typedef struct {
@@ -200,62 +251,15 @@ typedef struct {
     bool initialized;
 } TilefinchWasmRuntime;
 
-/* QuickJS's ordinary ArrayBuffer allocator is constrained by the realm heap.
-   Linear memory is already charged to the page by WAMR, and a coherent script
-   view can be as large as one MiB. Charging the mirror to the QuickJS heap as
-   well makes a perfectly valid bounded module fail merely because the realm
-   has compiled a large application. Keep the mirror Budget-owned instead;
-   the ArrayBuffer finalizer returns its combined header/data allocation to
-   the same page budget.
-   The mirror remains intentional for now because WAMR may relocate its memory
-   during grow. */
-typedef struct {
-    Budget *budget;
-    uint8_t bytes[];
-} TilefinchWasmArrayBufferBacking;
-
+/* memory.buffer aliases WAMR's linear memory (Budget-charged by WAMR itself)
+   through an external ArrayBuffer; nothing is copied into the realm heap.
+   Growth relocates the memory, so every wasm<->JavaScript transition
+   refreshes the alias (see wasm_memory_refresh), and an instance whose
+   object died while views still alias its memory is kept as a zombie
+   until the last alias is freed (see wasm_memory_alias_free). */
 static TilefinchWasmRuntime wasm_runtime_state;
 static JSClassID wasm_instance_class_id;
 static JSClassID wasm_module_class_id;
-
-static void wasm_array_buffer_free(
-    JSRuntime *runtime, void *opaque, void *pointer)
-{
-    (void) runtime;
-    (void) opaque;
-    /* Bellard QuickJS invokes an external ArrayBuffer's free callback once
-       with its data while detaching and again with NULL when the detached
-       object is finalized. Derive ownership only from a live data pointer;
-       retaining an opaque allocation across the first call would either leak
-       on ordinary finalization or become stale on the second call. */
-    if (pointer == NULL) return;
-    TilefinchWasmArrayBufferBacking *backing =
-        (TilefinchWasmArrayBufferBacking *)
-            ((uint8_t *) pointer
-             - offsetof(TilefinchWasmArrayBufferBacking, bytes));
-    budget_free(backing->budget, backing);
-}
-
-static JSValue wasm_new_array_buffer_copy(
-    JSContext *context, Budget *budget, const uint8_t *source, size_t length)
-{
-    if (budget == NULL || (length != 0 && source == NULL))
-        return JS_ThrowInternalError(context, "invalid WebAssembly memory");
-    if (length > SIZE_MAX - sizeof(TilefinchWasmArrayBufferBacking))
-        return JS_ThrowOutOfMemory(context);
-    TilefinchWasmArrayBufferBacking *backing = budget_malloc_category(
-        budget, BUDGET_CATEGORY_JAVASCRIPT, sizeof(*backing) + length);
-    if (backing == NULL) return JS_ThrowOutOfMemory(context);
-    backing->budget = budget;
-    if (length != 0)
-        memcpy(backing->bytes, source, length);
-    JSValue value = JS_NewArrayBuffer(
-        context, backing->bytes, length, wasm_array_buffer_free,
-        NULL, false);
-    if (JS_IsException(value))
-        budget_free(budget, backing);
-    return value;
-}
 
 static bool wasm_read_u32_leb(
     const uint8_t *bytes, size_t length, size_t *cursor, uint32_t *value)
@@ -288,13 +292,22 @@ static const char *wasm_external_kind_name(wasm_import_export_kind_t kind)
 
 /* Compilation and reflection validate module structure without linking its
    imports. Linking belongs to Instance construction; otherwise a valid
-   `new WebAssembly.Module(bytes)` would incorrectly require an import object. */
+   `new WebAssembly.Module(bytes)` would incorrectly require an import object.
+
+   WAMR's contract is that a module's byte buffer is writable and referenced
+   until unload, so every load works on a private Budget copy; the copy is
+   neither shared between instances nor borrowed from a JavaScript
+   ArrayBuffer. wasm_binary_freeable asks the loader to clone what it would
+   otherwise reference (data segments, names), so an instantiated module can
+   release its copy instead of holding up to TILEFINCH_WASM_MODULE_BYTES
+   for its whole lifetime (see js_wasm_instantiate). */
 static wasm_module_t wasm_load_for_inspection(
     uint8_t *bytes, size_t length, char *error, size_t error_capacity)
 {
     LoadArgs arguments;
     memset(&arguments, 0, sizeof(arguments));
     arguments.no_resolve = true;
+    arguments.wasm_binary_freeable = true;
     return wasm_runtime_load_ex(
         bytes, (uint32_t) length, &arguments,
         error, (uint32_t) error_capacity);
@@ -323,6 +336,31 @@ static void wasm_import_fail(
         wasm_runtime_set_exception(owner->instance, message);
 }
 
+static bool wasm_task_checkpoint(JSContext *context)
+{
+    DomBridge *bridge = JS_GetContextOpaque(context);
+#ifndef __PSP__
+    {
+        TilefinchTestFaults *faults = tilefinch_test_faults();
+        if (faults->wasm_task_checkpoints != 0
+            && --faults->wasm_task_checkpoints == 0
+            && bridge != NULL && bridge->host != NULL)
+            bridge->host->watchdog.deadline_ms = 0;
+    }
+#endif
+    if (bridge != NULL && bridge->host != NULL
+        && !bridge->host->watchdog.interrupted
+        && js_rt_runtime_native_checkpoint(bridge->host)) return true;
+    JS_ThrowInternalError(context, "WebAssembly task deadline exceeded");
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    JS_SetUncatchableException(context, true);
+#endif
+    return false;
+}
+
+static bool wasm_memory_refresh(
+    JSContext *context, TilefinchWasmInstance *instance, bool force);
+
 static void wasm_import_raw_callback(
     wasm_exec_env_t execution, uint64_t *raw_arguments)
 {
@@ -330,7 +368,28 @@ static void wasm_import_raw_callback(
         execution);
     if (imported == NULL || imported->context == NULL
         || imported->owner == NULL || raw_arguments == NULL) return;
+    /* Every import callback is a point where a wasm->JS->wasm trampoline
+       could earn another instruction allowance. Trap the whole task once
+       the outermost export call's deadline has passed. */
+    if (!wasm_task_checkpoint(imported->context)) {
+        wasm_import_fail(imported, JS_GetException(imported->context),
+                         "WebAssembly task deadline exceeded");
+        wasm_runtime_set_exception(wasm_runtime_get_module_inst(execution),
+                                   "WebAssembly task deadline exceeded");
+        return;
+    }
     JSContext *context = imported->context;
+    /* The wasm frame calling this import may have grown its memory; refresh
+       the alias so the callback observes the live memory, never a detached
+       or stale buffer. */
+    if (!wasm_memory_refresh(context, imported->owner, false)) {
+        JS_FreeValue(context, JS_GetException(context));
+        if (imported->owner->instance != NULL)
+            wasm_runtime_set_exception(
+                imported->owner->instance,
+                "WebAssembly memory growth exceeds Tilefinch limits");
+        return;
+    }
     JSValue arguments[TILEFINCH_WASM_MAX_ARGUMENTS];
     memset(arguments, 0, sizeof(arguments));
     uint64_t *raw_at = raw_arguments;
@@ -377,6 +436,14 @@ static void wasm_import_raw_callback(
         wasm_import_fail(
             imported, JS_GetException(context),
             "JavaScript WebAssembly import threw");
+        return;
+    }
+    if (!wasm_task_checkpoint(context)) {
+        JS_FreeValue(context, result);
+        wasm_import_fail(imported, JS_GetException(context),
+                         "WebAssembly task deadline exceeded");
+        wasm_runtime_set_exception(wasm_runtime_get_module_inst(execution),
+                                   "WebAssembly task deadline exceeded");
         return;
     }
     if (imported->result_count != 0) {
@@ -446,9 +513,14 @@ static void wasm_runtime_release_if_idle(void)
 static bool wasm_runtime_enter(Budget *budget)
 {
     if (budget == NULL) return false;
-    if (wasm_runtime_state.initialized) {
-        if (wasm_runtime_state.budget != budget) return false;
-    } else {
+    if (wasm_runtime_state.initialized
+        && wasm_runtime_state.budget != budget) {
+        /* The runtime was kept warm for another realm's Budget. Hand it
+           over only once nothing of that realm remains live. */
+        wasm_runtime_release_if_idle();
+        if (wasm_runtime_state.initialized) return false;
+    }
+    if (!wasm_runtime_state.initialized) {
         void *pool = budget_malloc_category(
             budget, BUDGET_CATEGORY_JAVASCRIPT, TILEFINCH_WASM_POOL_BYTES);
         if (pool == NULL) return false;
@@ -475,11 +547,44 @@ static bool wasm_runtime_enter(Budget *budget)
     return true;
 }
 
+/* Operations and instance finalizers do not release an idle runtime
+   themselves: a validate/compile/instantiate sequence within one task would
+   otherwise initialize the runtime and its pool once per step. The realm
+   releases it at task boundaries and teardown (js_wasm_release_idle_runtime). */
 static void wasm_runtime_leave(void)
 {
     if (wasm_runtime_state.active_operations != 0)
         wasm_runtime_state.active_operations--;
+}
+
+void js_wasm_release_idle_runtime(void)
+{
     wasm_runtime_release_if_idle();
+}
+
+/* Release the native half of an instance: the WAMR instance (and with it the
+   linear memory), its module, exec env, and the struct itself. Runs either
+   from wasm_instance_destroy or, for a zombie, from the last aliasing
+   buffer's free hook. */
+static void wasm_instance_release_native(TilefinchWasmInstance *instance)
+{
+    if (instance->execution != NULL)
+        wasm_runtime_destroy_exec_env(instance->execution);
+    if (instance->instance != NULL)
+        wasm_runtime_deinstantiate(instance->instance);
+    if (instance->module != NULL)
+        wasm_runtime_unload(instance->module);
+    budget_free(instance->budget, instance->module_bytes);
+    Budget *budget = instance->budget;
+    bool counted_live = instance->counted_live;
+    bool owns_runtime_operation = instance->owns_runtime_operation;
+    budget_free(budget, instance);
+    if (counted_live && wasm_runtime_state.live_instances != 0)
+        wasm_runtime_state.live_instances--;
+    if (owns_runtime_operation
+        && wasm_runtime_state.active_operations != 0) {
+        wasm_runtime_state.active_operations--;
+    }
 }
 
 static void wasm_instance_destroy(
@@ -488,16 +593,13 @@ static void wasm_instance_destroy(
     if (instance == NULL) return;
     if (runtime != NULL)
         JS_FreeValueRT(runtime, instance->memory_buffer);
+    instance->memory_buffer = JS_UNDEFINED;
     if (runtime != NULL)
         JS_FreeValueRT(runtime, instance->memory_object);
+    instance->memory_object = JS_UNDEFINED;
     if (runtime != NULL)
         JS_FreeValueRT(runtime, instance->pending_import_exception);
-    if (instance->execution != NULL)
-        wasm_runtime_destroy_exec_env(instance->execution);
-    if (instance->instance != NULL)
-        wasm_runtime_deinstantiate(instance->instance);
-    if (instance->module != NULL)
-        wasm_runtime_unload(instance->module);
+    instance->pending_import_exception = JS_UNDEFINED;
     for (uint32_t i = 0; i < instance->import_count; i++) {
         TilefinchWasmImport *imported = &instance->imports[i];
         if (imported->registered) {
@@ -510,19 +612,52 @@ static void wasm_instance_destroy(
     }
     budget_free(instance->budget, instance->imports);
     budget_free(instance->budget, instance->import_names);
-    budget_free(instance->budget, instance->module_bytes);
-    Budget *budget = instance->budget;
-    bool counted_live = instance->counted_live;
-    bool owns_runtime_operation = instance->owns_runtime_operation;
-    budget_free(budget, instance);
-    if (counted_live && wasm_runtime_state.live_instances != 0)
-        wasm_runtime_state.live_instances--;
-    if (owns_runtime_operation
-        && wasm_runtime_state.active_operations != 0) {
-        wasm_runtime_state.active_operations--;
+    instance->imports = NULL;
+    instance->import_names = NULL;
+    instance->import_count = 0;
+    budget_free(instance->budget, instance->exports);
+    instance->exports = NULL;
+    instance->export_count = 0;
+    if (instance->alias_buffers != 0) {
+        /* JavaScript still holds a view over the linear memory. No export
+           can be reached any more (they retained this object), so only the
+           memory must survive: keep the native instance until the last
+           aliasing buffer is freed or detached. */
+        instance->zombie = true;
+        return;
     }
-    wasm_runtime_release_if_idle();
+    wasm_instance_release_native(instance);
 }
+
+/* Free hook of every ArrayBuffer aliasing linear memory. QuickJS calls it
+   when the buffer is garbage collected or detached; a zombie instance is
+   released once no alias remains. */
+static void wasm_memory_alias_free(JSRuntime *runtime, void *opaque, void *ptr)
+{
+    (void) runtime;
+    /* QuickJS calls this again with NULL when a detached buffer is finally
+       collected. Its opaque owner may already be gone at that point. */
+    if (ptr == NULL) return;
+    TilefinchWasmInstance *instance = opaque;
+    if (instance == NULL) return;
+    if (instance->alias_buffers != 0) instance->alias_buffers--;
+    if (instance->zombie && instance->alias_buffers == 0)
+        wasm_instance_release_native(instance);
+}
+
+#ifndef __PSP__
+/* Host-only probe of the static free hook; it holds no state. Fault
+   switches live in tilefinch_test_faults(). */
+bool js_wasm_test_alias_release_accounting(void)
+{
+    TilefinchWasmInstance owner;
+    memset(&owner, 0, sizeof(owner));
+    owner.alias_buffers = 2;
+    wasm_memory_alias_free(NULL, &owner, &owner.empty_memory_sentinel);
+    wasm_memory_alias_free(NULL, &owner, NULL);
+    return owner.alias_buffers == 1;
+}
+#endif
 
 static void wasm_instance_finalizer(JSRuntime *runtime, JSValue value)
 {
@@ -559,6 +694,8 @@ static void wasm_module_finalizer(JSRuntime *runtime, JSValue value)
     (void) runtime;
     TilefinchWasmModule *module = JS_GetOpaque(value, wasm_module_class_id);
     if (module == NULL) return;
+    budget_free(module->budget, module->descriptors);
+    budget_free(module->budget, module->descriptor_names);
     budget_free(module->budget, module->bytes);
     budget_free(module->budget, module);
 }
@@ -709,72 +846,78 @@ static bool wasm_memory_extent(
     return true;
 }
 
-/* WAMR owns its bounded linear memory while QuickJS owns the page-visible
-   ArrayBuffer.  Synchronize at the WebAssembly call boundary so JavaScript
-   stores made before a call and WebAssembly stores made during it remain
-   coherent without exposing a WAMR pointer whose address may change on grow. */
-static bool wasm_memory_sync_to_runtime(
-    JSContext *context, TilefinchWasmInstance *instance)
+/* memory.buffer is an ArrayBuffer that aliases WAMR's linear memory: no copy
+   is made in either direction, so JavaScript stores are visible to the next
+   wasm instruction and wasm stores are visible to JavaScript immediately,
+   including inside import callbacks. Growth moves the memory; every
+   wasm<->JavaScript transition therefore refreshes the alias, detaching the
+   stale buffer (its views become empty, as the specification requires after
+   grow) and publishing a fresh one on the memory object. */
+static JSValue wasm_memory_alias_buffer(
+    JSContext *context, TilefinchWasmInstance *instance,
+    uint8_t *base, size_t bytes)
 {
-    if (instance->exported_memory == NULL) return true;
-    size_t native_bytes = 0;
-    size_t script_bytes = 0;
-    uint8_t *script = JS_GetArrayBuffer(
-        context, &script_bytes, instance->memory_buffer);
-    if (!wasm_memory_extent(instance->exported_memory, &native_bytes)
-        || script == NULL || native_bytes != instance->memory_bytes
-        || script_bytes != native_bytes) {
-        JS_ThrowRangeError(
-            context, "WebAssembly memory growth exceeds Tilefinch limits");
-        return false;
+#ifndef __PSP__
+    if (tilefinch_test_faults()->refuse_next_wasm_alias) {
+        tilefinch_test_faults()->refuse_next_wasm_alias = false;
+        return JS_ThrowOutOfMemory(context);
     }
-    if (native_bytes != 0) {
-        memcpy(wasm_memory_get_base_address(instance->exported_memory),
-               script, native_bytes);
-    }
-    return true;
+#endif
+    if ((base == NULL && bytes != 0) || instance->alias_buffers == SIZE_MAX)
+        return JS_ThrowInternalError(context, "WebAssembly memory aliases");
+    JSValue buffer = JS_NewArrayBuffer(
+        context, base != NULL ? base : &instance->empty_memory_sentinel,
+        bytes, wasm_memory_alias_free, instance, false);
+    if (JS_IsException(buffer)) return buffer;
+    instance->alias_buffers++;
+    instance->memory_base = base;
+    instance->memory_bytes = bytes;
+    instance->memory_needs_refresh = false;
+    return buffer;
 }
 
-static bool wasm_memory_sync_to_script(
-    JSContext *context, TilefinchWasmInstance *instance,
-    bool force_replacement)
+static bool wasm_memory_refresh(
+    JSContext *context, TilefinchWasmInstance *instance, bool force)
 {
     if (instance->exported_memory == NULL) return true;
     size_t native_bytes = 0;
-    size_t script_bytes = 0;
-    uint8_t *script = JS_GetArrayBuffer(
-        context, &script_bytes, instance->memory_buffer);
-    if (!wasm_memory_extent(instance->exported_memory, &native_bytes)
-        || script == NULL || script_bytes != instance->memory_bytes) {
+    if (!wasm_memory_extent(instance->exported_memory, &native_bytes)) {
+        if (!JS_IsUndefined(instance->memory_buffer))
+            JS_DetachArrayBuffer(context, instance->memory_buffer);
+        instance->memory_needs_refresh = true;
         JS_ThrowRangeError(
             context, "WebAssembly memory growth exceeds Tilefinch limits");
         return false;
     }
-    if (force_replacement || native_bytes != instance->memory_bytes) {
-        JSValue replacement = wasm_new_array_buffer_copy(
-            context, instance->budget,
-            wasm_memory_get_base_address(instance->exported_memory),
-            native_bytes);
-        if (JS_IsException(replacement)) return false;
-        JS_DetachArrayBuffer(context, instance->memory_buffer);
-        JS_FreeValue(context, instance->memory_buffer);
-        instance->memory_buffer = JS_DupValue(context, replacement);
+    uint8_t *base = wasm_memory_get_base_address(instance->exported_memory);
+    if (JS_IsUndefined(instance->memory_buffer)) {
+        instance->memory_base = base;
         instance->memory_bytes = native_bytes;
-        if (!JS_IsUndefined(instance->memory_object)
-            && JS_SetPropertyStr(
-                   context, instance->memory_object, "buffer",
-                   JS_DupValue(context, replacement)) < 0) {
-            JS_FreeValue(context, replacement);
-            return false;
-        }
-        JS_FreeValue(context, replacement);
         return true;
     }
-    if (native_bytes != 0) {
-        memcpy(script,
-               wasm_memory_get_base_address(instance->exported_memory),
-               native_bytes);
+    /* memory.grow() always publishes a new buffer, even when the memory did
+       not move; wasm-initiated growth is detected by the moved base/extent. */
+    if (!force && !instance->memory_needs_refresh
+        && base == instance->memory_base
+        && native_bytes == instance->memory_bytes)
+        return true;
+    /* Native growth has already invalidated the old address. Detachment
+       cannot depend on successfully allocating its replacement. */
+    JS_DetachArrayBuffer(context, instance->memory_buffer);
+    instance->memory_needs_refresh = true;
+    JSValue replacement = wasm_memory_alias_buffer(
+        context, instance, base, native_bytes);
+    if (JS_IsException(replacement)) return false;
+    JS_FreeValue(context, instance->memory_buffer);
+    instance->memory_buffer = JS_DupValue(context, replacement);
+    if (!JS_IsUndefined(instance->memory_object)
+        && JS_SetPropertyStr(
+               context, instance->memory_object, "buffer",
+               JS_DupValue(context, replacement)) < 0) {
+        JS_FreeValue(context, replacement);
+        return false;
     }
+    JS_FreeValue(context, replacement);
     return true;
 }
 
@@ -787,38 +930,35 @@ static JSValue js_wasm_call_export(
     TilefinchWasmInstance *instance = JS_GetOpaque2(
         context, function_data[0], wasm_instance_class_id);
     if (instance == NULL) return JS_EXCEPTION;
-    const char *name = JS_ToCString(context, function_data[1]);
-    if (name == NULL) return JS_EXCEPTION;
-    wasm_function_inst_t function = wasm_runtime_lookup_function(
-        instance->instance, name);
-    if (wasm_trace_enabled()) {
-        fprintf(stderr, "tilefinch-wasm: call export=%s argc=%d\n",
-                name, argc);
-    }
-    JS_FreeCString(context, name);
-    if (function == NULL)
+    int32_t export_index = -1;
+    if (JS_ToInt32(context, &export_index, function_data[1]) < 0)
+        return JS_EXCEPTION;
+    if (instance->exports == NULL || export_index < 0
+        || (uint32_t) export_index >= instance->export_count
+        || instance->exports[export_index].function == NULL) {
         return wasm_throw_execution_runtime(
             context, "missing WebAssembly export", NULL);
-    if (!wasm_memory_sync_to_runtime(context, instance))
+    }
+    const TilefinchWasmExport *exported = &instance->exports[export_index];
+    wasm_function_inst_t function = exported->function;
+    if (wasm_trace_enabled()) {
+        fprintf(stderr, "tilefinch-wasm: call export=%s argc=%d\n",
+                exported->name, argc);
+    }
+    if (!wasm_task_checkpoint(context)) return JS_EXCEPTION;
+    /* No copy in either direction: the alias only needs to follow a memory
+       that wasm grew (and therefore moved) since the last transition. */
+    if (!wasm_memory_refresh(context, instance, false))
         return JS_EXCEPTION;
 
-    uint32_t parameter_count = wasm_func_get_param_count(
-        function, instance->instance);
-    uint32_t result_count = wasm_func_get_result_count(
-        function, instance->instance);
-    if (parameter_count > TILEFINCH_WASM_MAX_ARGUMENTS
-        || result_count > TILEFINCH_WASM_MAX_RESULTS) {
-        return JS_ThrowRangeError(
-            context, "WebAssembly function signature exceeds Tilefinch limits");
-    }
-    wasm_valkind_t parameter_types[TILEFINCH_WASM_MAX_ARGUMENTS];
-    wasm_valkind_t result_types[TILEFINCH_WASM_MAX_RESULTS];
+    uint32_t parameter_count = exported->parameter_count;
+    uint32_t result_count = exported->result_count;
+    const wasm_valkind_t *parameter_types = exported->parameter_types;
+    const wasm_valkind_t *result_types = exported->result_types;
     wasm_val_t arguments[TILEFINCH_WASM_MAX_ARGUMENTS];
     wasm_val_t results[TILEFINCH_WASM_MAX_RESULTS];
     memset(arguments, 0, sizeof(arguments));
     memset(results, 0, sizeof(results));
-    wasm_func_get_param_types(function, instance->instance, parameter_types);
-    wasm_func_get_result_types(function, instance->instance, result_types);
     for (uint32_t i = 0; i < parameter_count; i++) {
         JSValueConst input = i < (uint32_t) argc ? argv[i] : JS_UNDEFINED;
         arguments[i].kind = parameter_types[i];
@@ -843,15 +983,27 @@ static JSValue js_wasm_call_export(
     }
     for (uint32_t i = 0; i < result_count; i++)
         results[i].kind = result_types[i];
+    if (!wasm_task_checkpoint(context)) return JS_EXCEPTION;
     /* WAMR stores a trap on the instance. It is state for the just-finished
        invocation, not a permanent poison bit for every later export call. */
     wasm_runtime_set_exception(instance->instance, NULL);
-    wasm_runtime_set_instruction_count_limit(
-        instance->execution, TILEFINCH_WASM_INSTRUCTION_LIMIT);
+    if (instance->call_depth == 0) {
+        wasm_runtime_set_instruction_count_limit(
+            instance->execution, TILEFINCH_WASM_INSTRUCTION_LIMIT);
+    }
+    if (instance->call_depth == UINT32_MAX)
+        return wasm_throw_execution_runtime(
+            context, "WebAssembly re-entrancy limit", NULL);
+    instance->call_depth++;
     bool called = wasm_runtime_call_wasm_a(
             instance->execution, function, result_count, results,
             parameter_count, arguments);
-    if (!wasm_memory_sync_to_script(context, instance, false)) {
+    instance->call_depth--;
+    if (!wasm_memory_refresh(context, instance, false)) {
+        wasm_runtime_set_exception(instance->instance, NULL);
+        return JS_EXCEPTION;
+    }
+    if (!wasm_task_checkpoint(context)) {
         wasm_runtime_set_exception(instance->instance, NULL);
         return JS_EXCEPTION;
     }
@@ -931,9 +1083,8 @@ static JSValue wasm_memory_export(
     }
     JSValue memory_object = JS_NewObject(context);
     JSValue buffer = JS_IsUndefined(instance->memory_buffer)
-        ? wasm_new_array_buffer_copy(
-              context, instance->budget,
-              wasm_memory_get_base_address(memory), bytes)
+        ? wasm_memory_alias_buffer(
+              context, instance, wasm_memory_get_base_address(memory), bytes)
         : JS_DupValue(context, instance->memory_buffer);
     JSValue retained = instance->exported_memory == NULL
         ? JS_DupValue(context, buffer) : JS_UNDEFINED;
@@ -1176,8 +1327,6 @@ JSValue js_wasm_memory_grow(
     }
     if (delta > TILEFINCH_WASM_MAX_MEMORY_PAGES - old_pages)
         return JS_ThrowRangeError(context, "WebAssembly memory limit exceeded");
-    if (!wasm_memory_sync_to_runtime(context, instance))
-        return JS_EXCEPTION;
     if (delta != 0
         && !wasm_memory_enlarge(instance->exported_memory, delta)) {
         const char *detail = wasm_runtime_get_exception(instance->instance);
@@ -1186,7 +1335,7 @@ JSValue js_wasm_memory_grow(
             detail != NULL && detail[0] != '\0' ? ": " : "",
             detail == NULL ? "" : detail);
     }
-    if (!wasm_memory_sync_to_script(context, instance, true))
+    if (!wasm_memory_refresh(context, instance, true))
         return JS_EXCEPTION;
     return JS_NewUint32(context, old_pages);
 }
@@ -1210,10 +1359,86 @@ JSValue js_wasm_available(
    validate a private Budget-owned copy, then discard it before returning to
    author code.  This also makes ArrayBuffer mutation during later module use
    irrelevant and keeps the validation allocation explicitly bounded. */
+/* Capture the module's import/export descriptors from an inspection load.
+   Returns false only on allocation failure; a module beyond the descriptor
+   limits leaves the cache unset so reflection reports the limit. */
+static bool wasm_module_cache_descriptors(
+    TilefinchWasmModule *module, wasm_module_t loaded)
+{
+    int32_t import_count = wasm_runtime_get_import_count(loaded);
+    int32_t export_count = wasm_runtime_get_export_count(loaded);
+    if (import_count < 0 || export_count < 0
+        || import_count > (int32_t) TILEFINCH_WASM_MAX_IMPORTS
+        || export_count > (int32_t) TILEFINCH_WASM_MAX_EXPORTS) return true;
+    size_t total = (size_t) import_count + (size_t) export_count;
+    size_t name_bytes = 1u;
+    for (int32_t i = 0; i < import_count; i++) {
+        wasm_import_t imported;
+        memset(&imported, 0, sizeof(imported));
+        wasm_runtime_get_import_type(loaded, i, &imported);
+        if (imported.module_name == NULL || imported.name == NULL) return true;
+        name_bytes += strlen(imported.module_name) + 1u
+            + strlen(imported.name) + 1u;
+    }
+    for (int32_t i = 0; i < export_count; i++) {
+        wasm_export_t exported;
+        memset(&exported, 0, sizeof(exported));
+        wasm_runtime_get_export_type(loaded, i, &exported);
+        if (exported.name == NULL) return true;
+        name_bytes += strlen(exported.name) + 1u;
+    }
+    if (name_bytes > 2u * TILEFINCH_WASM_MAX_IMPORT_NAME_BYTES) return true;
+    TilefinchWasmDescriptor *descriptors = total == 0 ? NULL
+        : budget_calloc_category(
+              module->budget, BUDGET_CATEGORY_JAVASCRIPT, total,
+              sizeof(*descriptors));
+    char *names = budget_malloc_category(
+        module->budget, BUDGET_CATEGORY_JAVASCRIPT, name_bytes);
+    if ((total != 0 && descriptors == NULL) || names == NULL) {
+        budget_free(module->budget, descriptors);
+        budget_free(module->budget, names);
+        return false;
+    }
+    char *at = names;
+    for (int32_t i = 0; i < import_count; i++) {
+        wasm_import_t imported;
+        memset(&imported, 0, sizeof(imported));
+        wasm_runtime_get_import_type(loaded, i, &imported);
+        size_t module_length = strlen(imported.module_name) + 1u;
+        size_t length = strlen(imported.name) + 1u;
+        memcpy(at, imported.module_name, module_length);
+        descriptors[i].module_name = at;
+        at += module_length;
+        memcpy(at, imported.name, length);
+        descriptors[i].name = at;
+        at += length;
+        descriptors[i].kind = (uint8_t) imported.kind;
+    }
+    for (int32_t i = 0; i < export_count; i++) {
+        wasm_export_t exported;
+        memset(&exported, 0, sizeof(exported));
+        wasm_runtime_get_export_type(loaded, i, &exported);
+        size_t length = strlen(exported.name) + 1u;
+        memcpy(at, exported.name, length);
+        descriptors[import_count + i].name = at;
+        at += length;
+        descriptors[import_count + i].kind = (uint8_t) exported.kind;
+    }
+    module->descriptors = descriptors;
+    module->descriptor_names = names;
+    module->import_count = (uint32_t) import_count;
+    module->export_count = (uint32_t) export_count;
+    module->descriptors_ready = true;
+    return true;
+}
+
+/* Validate a BufferSource. With `cache` set, the validating load also
+   records the module's descriptors for later reflection. */
 static int wasm_validate_source(
     JSContext *context, JSValueConst source_value, bool oversize_is_error,
     const uint8_t **source_out, size_t *source_length_out,
-    JSValue *source_owner_out, char *error, size_t error_capacity)
+    JSValue *source_owner_out, char *error, size_t error_capacity,
+    TilefinchWasmModule *cache)
 {
     const uint8_t *source = NULL;
     size_t source_length = 0;
@@ -1259,9 +1484,16 @@ static int wasm_validate_source(
     wasm_module_t candidate = wasm_load_for_inspection(
         validation_copy, source_length, error, error_capacity);
     bool valid = candidate != NULL;
+    bool cached = candidate == NULL || cache == NULL
+        || wasm_module_cache_descriptors(cache, candidate);
     if (candidate != NULL) wasm_runtime_unload(candidate);
     budget_free(bridge->budget, validation_copy);
     wasm_runtime_leave();
+    if (!cached) {
+        JS_FreeValue(context, source_owner);
+        JS_ThrowOutOfMemory(context);
+        return -1;
+    }
     if (!valid) {
         JS_FreeValue(context, source_owner);
         return 0;
@@ -1282,33 +1514,41 @@ JSValue js_wasm_compile(
     const uint8_t *source = NULL;
     size_t source_length = 0;
     JSValue source_owner = JS_UNDEFINED;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->budget == NULL)
+        return JS_ThrowInternalError(context, "WebAssembly runtime is detached");
+    TilefinchWasmModule *module = budget_calloc_category(
+        bridge->budget, BUDGET_CATEGORY_JAVASCRIPT, 1u, sizeof(*module));
+    if (module == NULL) return JS_ThrowOutOfMemory(context);
+    module->budget = bridge->budget;
     char error[192] = {0};
     int valid = wasm_validate_source(
         context, argv[0], true, &source, &source_length, &source_owner,
-        error, sizeof(error));
-    if (valid < 0) return JS_EXCEPTION;
-    if (valid == 0)
+        error, sizeof(error), module);
+    if (valid <= 0) {
+        budget_free(module->budget, module->descriptors);
+        budget_free(module->budget, module->descriptor_names);
+        budget_free(module->budget, module);
+        if (valid < 0) return JS_EXCEPTION;
         return wasm_throw_runtime(context, "WebAssembly compile failed", error);
-
-    DomBridge *bridge = JS_GetContextOpaque(context);
-    TilefinchWasmModule *module = budget_calloc_category(
-        bridge->budget, BUDGET_CATEGORY_JAVASCRIPT, 1u, sizeof(*module));
-    if (module != NULL) {
-        module->bytes = budget_malloc_category(
-            bridge->budget, BUDGET_CATEGORY_JAVASCRIPT, source_length);
     }
-    if (module == NULL || module->bytes == NULL) {
-        if (module != NULL) budget_free(bridge->budget, module);
+    module->bytes = budget_malloc_category(
+        bridge->budget, BUDGET_CATEGORY_JAVASCRIPT, source_length);
+    if (module->bytes == NULL) {
+        budget_free(module->budget, module->descriptors);
+        budget_free(module->budget, module->descriptor_names);
+        budget_free(module->budget, module);
         JS_FreeValue(context, source_owner);
         return JS_ThrowOutOfMemory(context);
     }
-    module->budget = bridge->budget;
     module->length = source_length;
     memcpy(module->bytes, source, source_length);
     JS_FreeValue(context, source_owner);
 
     JSValue handle = JS_NewObjectClass(context, wasm_module_class_id);
     if (JS_IsException(handle)) {
+        budget_free(module->budget, module->descriptors);
+        budget_free(module->budget, module->descriptor_names);
         budget_free(module->budget, module->bytes);
         budget_free(module->budget, module);
         return JS_EXCEPTION;
@@ -1330,10 +1570,35 @@ JSValue js_wasm_validate(
     char error[192] = {0};
     int valid = wasm_validate_source(
         context, argv[0], false, &source, &source_length, &source_owner,
-        error, sizeof(error));
+        error, sizeof(error), NULL);
     if (valid < 0) return JS_EXCEPTION;
     if (valid > 0) JS_FreeValue(context, source_owner);
     return JS_NewBool(context, valid > 0);
+}
+
+/* One Module.imports()/exports() descriptor; module_name NULL for exports. */
+static JSValue wasm_descriptor_object(
+    JSContext *context, const char *module_name, const char *name,
+    const char *kind_name)
+{
+    if (name == NULL || kind_name == NULL)
+        return JS_ThrowInternalError(context, "invalid WebAssembly descriptor");
+    JSValue descriptor = JS_NewObject(context);
+    if (JS_IsException(descriptor)) return JS_EXCEPTION;
+    bool ready = (module_name == NULL
+            || JS_SetPropertyStr(
+                   context, descriptor, "module",
+                   JS_NewString(context, module_name)) >= 0)
+        && JS_SetPropertyStr(
+               context, descriptor, "name", JS_NewString(context, name)) >= 0
+        && JS_SetPropertyStr(
+               context, descriptor, "kind",
+               JS_NewString(context, kind_name)) >= 0;
+    if (!ready) {
+        JS_FreeValue(context, descriptor);
+        return JS_EXCEPTION;
+    }
+    return descriptor;
 }
 
 static JSValue wasm_module_custom_sections(
@@ -1431,6 +1696,28 @@ JSValue js_wasm_module_info(
     }
     if (mode != 0 && mode != 1)
         return JS_ThrowRangeError(context, "invalid WebAssembly module query");
+    if (module->descriptors_ready) {
+        uint32_t first = mode == 0 ? 0u : module->import_count;
+        uint32_t count = mode == 0 ? module->import_count
+                                   : module->export_count;
+        JSValue result = JS_NewArray(context);
+        for (uint32_t i = 0; i < count && !JS_IsException(result); i++) {
+            const TilefinchWasmDescriptor *descriptor =
+                &module->descriptors[first + i];
+            JSValue descriptor_object = wasm_descriptor_object(
+                context, mode == 0 ? descriptor->module_name : NULL,
+                descriptor->name,
+                wasm_external_kind_name(
+                    (wasm_import_export_kind_t) descriptor->kind));
+            if (JS_IsException(descriptor_object)
+                || JS_SetPropertyUint32(
+                       context, result, i, descriptor_object) < 0) {
+                JS_FreeValue(context, result);
+                result = JS_EXCEPTION;
+            }
+        }
+        return result;
+    }
     if (!wasm_runtime_enter(module->budget))
         return JS_ThrowOutOfMemory(context);
     uint8_t *copy = budget_malloc_category(
@@ -1478,32 +1765,10 @@ JSValue js_wasm_module_info(
             name = exported.name;
             kind = exported.kind;
         }
-        const char *kind_name = wasm_external_kind_name(kind);
-        if (name == NULL || kind_name == NULL
-            || (mode == 0 && module_name == NULL)) {
-            JS_FreeValue(context, result);
-            result = JS_ThrowInternalError(
-                context, "invalid WebAssembly descriptor");
-            break;
-        }
-        JSValue descriptor = JS_NewObject(context);
+        JSValue descriptor = wasm_descriptor_object(
+            context, mode == 0 ? module_name : NULL, name,
+            wasm_external_kind_name(kind));
         if (JS_IsException(descriptor)) {
-            JS_FreeValue(context, result);
-            result = JS_EXCEPTION;
-            break;
-        }
-        bool descriptor_ready = (mode != 0
-                || JS_SetPropertyStr(
-                       context, descriptor, "module",
-                       JS_NewString(context, module_name)) >= 0)
-            && JS_SetPropertyStr(
-                   context, descriptor, "name",
-                   JS_NewString(context, name)) >= 0
-            && JS_SetPropertyStr(
-                   context, descriptor, "kind",
-                   JS_NewString(context, kind_name)) >= 0;
-        if (!descriptor_ready) {
-            JS_FreeValue(context, descriptor);
             JS_FreeValue(context, result);
             result = JS_EXCEPTION;
             break;
@@ -1723,37 +1988,26 @@ JSValue js_wasm_instantiate(
     memcpy(instance->module_bytes, source, source_length);
     JS_FreeValue(context, source_owner);
 
-    uint8_t *inspection_bytes = budget_malloc_category(
-        bridge->budget, BUDGET_CATEGORY_JAVASCRIPT, source_length);
-    if (inspection_bytes == NULL) {
-        wasm_instance_destroy(JS_GetRuntime(context), instance);
-        return JS_ThrowOutOfMemory(context);
-    }
-    memcpy(inspection_bytes, instance->module_bytes, source_length);
+    /* One load per instantiation: the module is loaded unlinked, its
+       imports are bound from the import object, and the same module is then
+       linked in place instead of being loaded a second time. */
     char error[192] = {0};
-    wasm_module_t inspected = wasm_load_for_inspection(
-        inspection_bytes, source_length, error, sizeof(error));
-    if (inspected == NULL) {
-        budget_free(bridge->budget, inspection_bytes);
+    instance->module = wasm_load_for_inspection(
+        instance->module_bytes, source_length, error, sizeof(error));
+    if (instance->module == NULL) {
         wasm_instance_destroy(JS_GetRuntime(context), instance);
         return wasm_throw_link(context, "WebAssembly link failed", error);
     }
     JSValueConst import_object = argc >= 2 ? argv[1] : JS_UNDEFINED;
-    bool imports_ready = wasm_prepare_function_imports(
-        context, instance, inspected, import_object);
-    wasm_runtime_unload(inspected);
-    budget_free(bridge->budget, inspection_bytes);
-    if (!imports_ready) {
+    if (!wasm_prepare_function_imports(
+            context, instance, instance->module, import_object)) {
         wasm_instance_destroy(JS_GetRuntime(context), instance);
         return JS_EXCEPTION;
     }
-    memset(error, 0, sizeof(error));
-    instance->module = wasm_runtime_load(
-        instance->module_bytes, (uint32_t) source_length,
-        error, sizeof(error));
-    if (instance->module == NULL) {
+    if (!wasm_runtime_resolve_symbols(instance->module)) {
         wasm_instance_destroy(JS_GetRuntime(context), instance);
-        return wasm_throw_link(context, "WebAssembly link failed", error);
+        return wasm_throw_link(
+            context, "WebAssembly link failed", "unresolved import");
     }
     uint32_t imported_start =
         tilefinch_wasm_imported_start_function_index(instance->module);
@@ -1779,12 +2033,33 @@ JSValue js_wasm_instantiate(
         .host_managed_heap_size = 0,
         .max_memory_pages = TILEFINCH_WASM_MAX_MEMORY_PAGES
     };
+    if (!wasm_task_checkpoint(context)) {
+        wasm_instance_destroy(JS_GetRuntime(context), instance);
+        return JS_EXCEPTION;
+    }
     instance->instance = wasm_runtime_instantiate_ex(
         instance->module, &instantiate, error, sizeof(error));
     if (instance->instance == NULL) {
+        /* An import invoked by the start function may have thrown. Surface
+           that author exception rather than a LinkError built from WAMR's
+           summary of it. */
+        JSValue pending = instance->pending_import_exception;
+        instance->pending_import_exception = JS_UNDEFINED;
         wasm_instance_destroy(JS_GetRuntime(context), instance);
+        if (!JS_IsUndefined(pending)) return JS_Throw(context, pending);
         return wasm_throw_link(
             context, "WebAssembly instantiation failed", error);
+    }
+    if (!wasm_task_checkpoint(context)) {
+        wasm_instance_destroy(JS_GetRuntime(context), instance);
+        return JS_EXCEPTION;
+    }
+    /* The fast interpreter pre-decoded every function body and the loader
+       cloned the data segments and names, so the binary copy is dead weight
+       now. Release it; the interpreter confirms it holds no reference. */
+    if (wasm_runtime_is_underlying_binary_freeable(instance->module)) {
+        budget_free(instance->budget, instance->module_bytes);
+        instance->module_bytes = NULL;
     }
     if (imported_start != UINT32_MAX) {
         JSValue started = JS_Call(
@@ -1795,6 +2070,10 @@ JSValue js_wasm_instantiate(
             return JS_EXCEPTION;
         }
         JS_FreeValue(context, started);
+        if (!wasm_task_checkpoint(context)) {
+            wasm_instance_destroy(JS_GetRuntime(context), instance);
+            return JS_EXCEPTION;
+        }
     }
     instance->execution = wasm_runtime_create_exec_env(
         instance->instance, TILEFINCH_WASM_STACK_BYTES);
@@ -1809,6 +2088,16 @@ JSValue js_wasm_instantiate(
         wasm_instance_destroy(JS_GetRuntime(context), instance);
         return JS_ThrowRangeError(
             context, "WebAssembly export count exceeds Tilefinch limits");
+    }
+    if (export_count > 0) {
+        instance->exports = budget_calloc_category(
+            bridge->budget, BUDGET_CATEGORY_JAVASCRIPT,
+            (size_t) export_count, sizeof(*instance->exports));
+        if (instance->exports == NULL) {
+            wasm_instance_destroy(JS_GetRuntime(context), instance);
+            return JS_ThrowOutOfMemory(context);
+        }
+        instance->export_count = (uint32_t) export_count;
     }
     JSValue instance_object = JS_NewObjectClass(
         context, wasm_instance_class_id);
@@ -1839,14 +2128,28 @@ JSValue js_wasm_instantiate(
             } else {
                 uint32_t parameter_count = wasm_func_get_param_count(
                     function, instance->instance);
-                if (parameter_count > TILEFINCH_WASM_MAX_ARGUMENTS) {
+                uint32_t result_count = wasm_func_get_result_count(
+                    function, instance->instance);
+                if (parameter_count > TILEFINCH_WASM_MAX_ARGUMENTS
+                    || result_count > TILEFINCH_WASM_MAX_RESULTS) {
                     value = JS_ThrowRangeError(
                         context,
                         "WebAssembly function signature exceeds Tilefinch limits");
+                } else {
+                    TilefinchWasmExport *record = &instance->exports[i];
+                    record->function = function;
+                    record->name = exported.name;
+                    record->parameter_count = (uint8_t) parameter_count;
+                    record->result_count = (uint8_t) result_count;
+                    wasm_func_get_param_types(
+                        function, instance->instance,
+                        record->parameter_types);
+                    wasm_func_get_result_types(
+                        function, instance->instance, record->result_types);
                 }
                 JSValue data[2] = {
                     JS_DupValue(context, instance_object),
-                    JS_NewString(context, exported.name)
+                    JS_NewInt32(context, i)
                 };
                 if (JS_IsUndefined(value) && JS_IsException(data[1]))
                     value = JS_EXCEPTION;
@@ -1906,6 +2209,10 @@ JSValue js_wasm_instantiate(
 }
 
 #else
+
+void js_wasm_release_idle_runtime(void)
+{
+}
 
 bool js_wasm_runtime_init(JSRuntime *runtime)
 {

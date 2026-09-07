@@ -30,6 +30,12 @@ file(COPY_FILE "${LAUNCHER_EBOOT}" "${OUTPUT}/EBOOT.PBP")
 file(COPY_FILE "${BROWSER_EBOOT}" "${OUTPUT}/slot-a/EBOOT.PBP")
 file(COPY_FILE "${WASM_COMPONENT_PRX}"
     "${OUTPUT}/slot-a/tilefinch-wasm.prx")
+# Voice-disabled validation/replay builds have no speech component. Ordinary
+# builds always stage the PRX with the signed browser slot, not with models.
+if(VOICE_COMPONENT_PRX)
+    file(COPY_FILE "${VOICE_COMPONENT_PRX}"
+        "${OUTPUT}/slot-a/tilefinch-voice.prx")
+endif()
 file(COPY_FILE "${XMB_REDIRECT_PRX}"
     "${OUTPUT}/OPTIONAL/tilefinch_xmb.prx")
 file(COPY

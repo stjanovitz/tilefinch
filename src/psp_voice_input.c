@@ -17,6 +17,7 @@
 #include "psp_module_policy.h"
 #include "psp_thread_contract.h"
 #include "stt_engine.h"
+#include "stt_component_loader.h"
 
 #define printf psp_log_printf
 
@@ -336,11 +337,15 @@ bool psp_voice_input_set_enabled(PspVoiceInput *voice, bool enabled)
     if (voice == NULL) return false;
     if (!enabled) {
         psp_voice_input_evict(voice);
-        budget_reservation_release(&voice->voice_external);
-        voice->voice_reserved_bytes = 0;
+        psp_voice_component_unload();
+        if (!psp_voice_component_is_quarantined()) {
+            budget_reservation_release(&voice->voice_external);
+            voice->voice_reserved_bytes = 0;
+        }
         voice->enabled = false;
         return true;
     }
+    if (psp_voice_component_is_quarantined()) return false;
     if (voice->enabled) return true;
     size_t protected_bytes =
         voice_model_tier_working_bytes_for_cache(
@@ -507,9 +512,15 @@ bool psp_voice_input_transcribe(
     }
     if (voice->voice_reserved_bytes < required_reservation)
         voice->voice_reserved_bytes = required_reservation;
+    /* Trim may unload an idle engine. Establish the callable API afterward. */
+    psp_voice_input_trim(voice);
+    if (!psp_voice_component_load(voice->budget)) {
+        voice_progress(progress, progress_user,
+                       "VOICE ENGINE UNAVAILABLE - REINSTALL TILEFINCH");
+        return false;
+    }
     psp_log_set_phase(PSP_LOG_PHASE_VOICE);
     psp_log_heartbeat();
-    psp_voice_input_trim(voice);
     uint32_t attempt = ++voice->attempts;
     uint64_t attempt_started = sceKernelGetSystemTimeWide();
     PspVoiceMemory before_memory = voice_memory_snapshot(voice);
@@ -855,11 +866,18 @@ bool psp_voice_input_transcribe(
            process restarts. This trades memory for process integrity only on
            an already-fatal worker path. */
         voice->disabled_after_timeout = true;
-        if (voice->engine == job->engine) {
-            voice->engine = NULL;
-            voice->tier = VOICE_MODEL_NONE;
-        }
+        psp_voice_component_quarantine();
+        voice->engine = NULL;
+        voice->tier = VOICE_MODEL_NONE;
         job->engine = NULL;
+        /* Even status/destroy(NULL) helpers live in the quarantined PRX.
+           Return before the ordinary completion and diagnostic callbacks. */
+        memset(capture, 0,
+               STT_ENGINE_DEFAULT_MAX_CAPTURE_SAMPLES * sizeof(*capture));
+        free(capture);
+        free(job);
+        voice_progress(progress, progress_user, "VOICE UNAVAILABLE UNTIL RESTART");
+        return false;
     }
 
     if (job->create_engine) {
@@ -954,12 +972,17 @@ bool psp_voice_input_transcribe(
 
 void psp_voice_input_evict(PspVoiceInput *voice)
 {
-    if (voice == NULL || voice->engine == NULL) return;
+    if (voice == NULL || psp_voice_component_is_quarantined()) return;
+    if (voice->engine == NULL) {
+        psp_voice_component_unload();
+        return;
+    }
     VoiceModelTier tier = voice->tier;
     stt_engine_destroy((SttEngine *) voice->engine);
     voice->engine = NULL;
     voice->tier = VOICE_MODEL_NONE;
     voice->cache_rows = VOICE_CACHE_FULL_ROWS;
+    psp_voice_component_unload();
     PspVoiceMemory memory = voice_memory_snapshot(voice);
     printf(
         "tilefinch-voice: evicted tier=%s heap-free=%zu "

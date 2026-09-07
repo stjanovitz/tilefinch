@@ -1,0 +1,23 @@
+diff --git a/psplink/shell.c b/psplink/shell.c
+--- a/psplink/shell.c
++++ b/psplink/shell.c
+@@ -3156,7 +3156,10 @@ static int scrshot_cmd(int argc, char **argv, unsigned int *vRet)
+ 		return CMD_ERROR;
+ 	}
+ 
+-	block_id = sceKernelAllocPartitionMemory(4, "scrshot", PSP_SMEM_Low, 512*1024, NULL);
++	/* Partition 4 aliases the Media Engine firmware image at 0x88300000.
++	 * A screenshot must never overwrite it while a target decodes media.
++	 * Use charged user-partition storage, and fail if it is unavailable. */
++	block_id = sceKernelAllocPartitionMemory(2, "scrshot", PSP_SMEM_Low, 512*1024, NULL);
+ 	if(block_id < 0)
+ 	{
+ 		SHELL_PRINT("Error could not allocate memory buffer 0x%08X\n", block_id);
+diff --git a/psplink/shellcmd.h b/psplink/shellcmd.h
+--- a/psplink/shellcmd.h
++++ b/psplink/shellcmd.h
+@@ -247,3 +247,4 @@
+ 	SHELL_CMD_PCTERM("close", NULL, close_cmd, 0, "Close the shell (leave PSP running)", "", "") \
+ 	SHELL_CMD("scrshot", "ss", scrshot_cmd, 1, "Take a screen shot", "", "file [pri]") \
++	SHELL_CMD("scrshot-user", "ssu", scrshot_cmd, 1, "Take a user-partition screen shot", "", "file [pri]") \
+ 	SHELL_CMD("calc", NULL, calc_cmd, 1, "Do a simple address calculation", "", "addr [d|o|x]") \

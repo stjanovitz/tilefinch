@@ -1,0 +1,15 @@
+# Boot at native Home with its default cards. Exercise the same Wikipedia
+# entry and Triangle tap as a manual user, then allow fonts/images to settle.
+wait 30
+tap down
+tap right
+tap cross
+wait 2
+wait-live 120
+mark-live wiki-shown
+tap-live triangle
+wait-live 30
+mark-live wiki-hidden
+wait-live 900
+mark-live wiki-late
+end

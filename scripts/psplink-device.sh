@@ -66,6 +66,7 @@ run_pspsh() {
 
 unload_named_modules() {
     modules=$(run_pspsh "modlist" "$LINK_TIMEOUT_SECONDS")
+    modules=$(printf '%s\n' "$modules" | tr -d '\r')
     for module_name in "$@"; do
         if printf '%s\n' "$modules" | grep -q "Name: $module_name\$"; then
             run_pspsh "modstun @$module_name" "$LINK_TIMEOUT_SECONDS"
@@ -76,6 +77,7 @@ unload_named_modules() {
 require_module_absent() {
     module_name=$1
     modules=$(run_pspsh "modlist" "$LINK_TIMEOUT_SECONDS")
+    modules=$(printf '%s\n' "$modules" | tr -d '\r')
     if printf '%s\n' "$modules" | grep -q "Name: $module_name\$"; then
         echo "$module_name is still running on the PSP." >&2
         echo "Exit it normally with HOME before reloading; force-unloading " \
@@ -128,6 +130,7 @@ case "$MODE" in
         # owns them even when no link was necessary this invocation.
         for required in \
             "$BUILD_DIR/psp-browser-script-dev.prx" \
+            "$BUILD_DIR/tilefinch-wasm.prx" \
             "$BUILD_DIR/boot-defaults.cfg" \
             "$BUILD_DIR/roots.pem" \
             "$BUILD_DIR/fonts/TilefinchSans-Regular.ttf"; do
@@ -136,6 +139,12 @@ case "$MODE" in
                 exit 1
             }
         done
+        if grep -q '^PSP_BROWSER_ENABLE_PSP_VOICE:BOOL=ON$' "$BUILD_DIR/CMakeCache.txt"; then
+            [ -s "$BUILD_DIR/tilefinch-voice.prx" ] || {
+                echo "PSPLink voice component missing: $BUILD_DIR/tilefinch-voice.prx" >&2
+                exit 1
+            }
+        fi
         require_module_absent Tilefinch
         unload_named_modules tfdeploy
         load_output=$(run_pspsh \
@@ -153,28 +162,41 @@ case "$MODE" in
             --refresh-managed "$BUILD_DIR/boot.cfg"
         cmake --build "$BUILD_DIR" --target psp-browser-script -j"$JOBS"
         make -C "$ROOT/tools/psplink-deploy"
-        cp "$BUILD_DIR/EBOOT.PBP" "$HOST_ROOT/EBOOT-device-latest.PBP"
+        artifacts=$(sh "$ROOT/scripts/stage-psplink-slot.sh" "$BUILD_DIR" "$HOST_ROOT")
         cp "$ROOT/tools/psplink-deploy/tfdeploy.prx" "$HOST_ROOT/tfdeploy.prx"
-        rm -f "$HOST_ROOT/tfdeploy.result"
+        require_module_absent Tilefinch
+        require_module_absent tilefinch_wasm
+        require_module_absent tilefinch_voice
 
         # Loading is asynchronous. The PRX publishes its result on host0 so
         # the host can distinguish a completed, promoted copy from a module
         # that merely started successfully.
-        unload_named_modules tfdeploy
-        run_pspsh "ld host0:/tfdeploy.prx" "$LINK_TIMEOUT_SECONDS"
-        elapsed=0
-        while [ ! -f "$HOST_ROOT/tfdeploy.result" ]; do
-            if [ "$elapsed" -ge "$DEPLOY_TIMEOUT_SECONDS" ]; then
-                echo "tfdeploy did not publish a result" >&2
+        # Components first, EBOOT last. Each artifact is transactional, but
+        # this is not an atomic multi-file update. Do not launch after any
+        # failure; rerun the complete plan to reconcile the slot.
+        for artifact in $artifacts; do
+            rm -f "$HOST_ROOT/tfdeploy.result"
+            unload_named_modules tfdeploy
+            load_output=$(run_pspsh "ld host0:/tfdeploy.prx $artifact" "$LINK_TIMEOUT_SECONDS")
+            printf '%s\n' "$load_output"
+            if printf '%s\n' "$load_output" | grep -q 'Failed to Load/Start module'; then
                 exit 1
             fi
-            sleep 1
-            elapsed=$((elapsed + 1))
+            elapsed=0
+            while [ ! -f "$HOST_ROOT/tfdeploy.result" ]; do
+                if [ "$elapsed" -ge "$DEPLOY_TIMEOUT_SECONDS" ]; then
+                    echo "tfdeploy did not publish a result for $artifact" >&2
+                    exit 1
+                fi
+                sleep 1
+                elapsed=$((elapsed + 1))
+            done
+            cat "$HOST_ROOT/tfdeploy.result"
+            deploy_ok=0
+            grep -q '^status=ok ' "$HOST_ROOT/tfdeploy.result" || deploy_ok=$?
+            [ "$deploy_ok" -eq 0 ] || exit 1
+            printf 'deployed artifact=%s\n' "$artifact"
         done
-        cat "$HOST_ROOT/tfdeploy.result"
-        deploy_ok=0
-        grep -q '^status=ok ' "$HOST_ROOT/tfdeploy.result" || deploy_ok=$?
-        [ "$deploy_ok" -eq 0 ] || exit 1
 
         ;;
     *) usage ;;

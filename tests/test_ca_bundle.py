@@ -8,8 +8,11 @@ import re
 import sys
 
 
-EXPECTED_CERTIFICATE_COUNT = 23
+EXPECTED_CERTIFICATE_COUNT = 25
 REQUIRED_SHA256_FINGERPRINTS = {
+    # September 2026 native-Mbed-TLS census: public modern trust anchors.
+    "8fe4fb0af93a4d0d67db0bebb23e37c71bf325dcbcdd240ea04daf58b47e1840",
+    "371a00dc0533b3721a7eeb40e8419e70799d2b0a0f2c1d80693165f7cec4ad75",
     # GitHub's current Sectigo chain.
     "4ff460d54b9c86dabfbcfc5712e0400d2bed3fbc4d4fbdaa86e06adcd2a9ad7a",
     # Certainly-backed resource CDNs observed in the top-site census.

@@ -713,6 +713,205 @@
     document_destroy(&wasm_memory_document);
     CHECK(budget.current == wasm_memory_baseline);
 
+    puts("test: WebAssembly links each Instance from one load and reflects from the Module");
+    size_t wasm_link_baseline = budget.current;
+    /* Hand-assembled: import env.f: () -> i32; export call: () -> i32 which
+       returns f(). Two instances of one Module bind different imports, and
+       Module.imports/exports answer from the descriptors captured at
+       compile time (no load), so they must agree before and after
+       instantiation. */
+    static const char wasm_link_page[] =
+        "<!doctype html><html><body><script>"
+        "const bytes=Uint8Array.from([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,"
+        "2,9,1,3,101,110,118,1,102,0,0,3,2,1,0,7,8,1,4,99,97,108,108,0,1,"
+        "10,6,1,4,0,16,0,11]);"
+        "const module=new WebAssembly.Module(bytes),"
+        "imports=WebAssembly.Module.imports(module),"
+        "exports=WebAssembly.Module.exports(module);"
+        "const a=new WebAssembly.Instance(module,{env:{f:()=>7}}),"
+        "b=new WebAssembly.Instance(module,{env:{f:()=>42}});"
+        "const again=WebAssembly.Module.imports(module);"
+        "let missing='none';"
+        "try{new WebAssembly.Instance(module,{});}catch(e){missing=e.constructor.name;}"
+        "globalThis.pocSummary=[imports.length===1&&imports[0].module==='env'"
+        "&&imports[0].name==='f'&&imports[0].kind==='function',"
+        "exports.length===1&&exports[0].name==='call'&&exports[0].kind==='function',"
+        "a.exports.call(),b.exports.call(),a.exports.call(),"
+        "again.length===1&&again[0].name==='f',missing].join(',');"
+        "</script></body></html>";
+    PocDocument wasm_link_document;
+    CHECK(document_parse(&wasm_link_document, &budget,
+                         wasm_link_page, strlen(wasm_link_page), 17));
+    ScriptResult wasm_link_result;
+    CHECK(scripts_run_document_at(
+              &wasm_link_document, &budget, 6 * MIB, 2000,
+              "https://wasm-link.test/", &wasm_link_result)
+          && wasm_link_result.success
+          && strcmp(wasm_link_result.summary,
+                    "true,true,7,42,7,true,LinkError") == 0);
+    document_destroy(&wasm_link_document);
+    CHECK(budget.current == wasm_link_baseline);
+
+    puts("test: frame scripts share live bindings, not copied values");
+    const size_t frame_binding_baseline = budget.current;
+    const char frame_binding_page[] =
+        "<!doctype html><html><body><script>"
+        "const bindingFrame=document.createElement('iframe');"
+        "const originalSetPrototype=Object.setPrototypeOf;let refusedFrames=0;"
+        "Object.setPrototypeOf=function(){throw Error('setup refusal');};"
+        "try{for(let i=0;i<20;i++){try{bindingFrame.contentWindow;}"
+        "catch(error){refusedFrames++;}}}finally{Object.setPrototypeOf=originalSetPrototype;}"
+        "document.body.appendChild(bindingFrame);"
+        "const frameEval=bindingFrame.contentWindow.eval;"
+        "const descriptorFrame=document.createElement('iframe').contentWindow;"
+        "const descriptor=Object.getOwnPropertyDescriptor(descriptorFrame,'Promise');"
+        "const reflected=descriptor&&typeof descriptor.value==='function'"
+        "&&descriptor.value!==Promise&&Reflect.ownKeys(descriptorFrame).includes('Date');"
+        "const assignedFrame=document.createElement('iframe').contentWindow;"
+        "assignedFrame.Promise=17;assignedFrame.eval('var ready=1');"
+        "const preserved=assignedFrame.Promise===17&&assignedFrame.ready===1;"
+        "frameEval('var count=0, second=2; function increment(){return ++count;}');"
+        "const closure=frameEval('increment()')===1&&frameEval('count')===1"
+        "&&bindingFrame.contentWindow.count===1&&frameEval('second')===2;"
+        "frameEval('let lexical=3; function changeLexical(){return ++lexical;}');"
+        "const lexical=frameEval('changeLexical()')===4&&frameEval('lexical')===4"
+        "&&bindingFrame.contentWindow.lexical===undefined;"
+        "globalThis.pocSummary=refusedFrames===20&&reflected&&preserved"
+        "&&closure&&lexical&&frameEval('this===window')"
+        "&&frameEval('(function(){return this===window;})()')"
+        "&&frameEval('Function(\"return this===window\")()')"
+        "?'FRAME-BINDINGS-OK':'FRAME-BINDINGS-BAD';"
+        "</script></body></html>";
+    PocDocument frame_binding_document;
+    CHECK(document_parse(&frame_binding_document, &budget, frame_binding_page,
+                         strlen(frame_binding_page), 17));
+    ScriptResult frame_binding_result;
+    CHECK(scripts_run_document_at(&frame_binding_document, &budget, 8 * MIB,
+        2000, "https://frame.test/", &frame_binding_result));
+    CHECK(strcmp(frame_binding_result.summary, "FRAME-BINDINGS-OK") == 0);
+    document_destroy(&frame_binding_document);
+    CHECK(budget.current == frame_binding_baseline);
+
+    puts("test: WebAssembly memory.buffer aliases linear memory without copies");
+    size_t wasm_alias_baseline = budget.current;
+    /* (type () -> ()), (type (i32 i32) -> ()); import env.probe: type 0;
+       memory 1..2 pages exported as "memory"; poke(addr, val): store8 val at
+       addr, call probe, store8 val+1 at addr+1. */
+    static const char wasm_alias_page[] =
+        "<!doctype html><html><body><script>"
+        "const bytes=Uint8Array.from([0,97,115,109,1,0,0,0,"
+        "1,9,2,96,0,0,96,2,127,127,0,"
+        "2,13,1,3,101,110,118,5,112,114,111,98,101,0,0,"
+        "3,2,1,1,5,4,1,1,1,2,"
+        "7,17,2,6,109,101,109,111,114,121,2,0,4,112,111,107,101,0,1,"
+        "10,26,1,24,0,32,0,32,1,58,0,0,16,0,32,0,65,1,106,32,1,65,1,106,58,0,0,11]);"
+        "let seenInImport=-1,seenAt100=-1,bufferInImport=null;"
+        "const instance=new WebAssembly.Instance(new WebAssembly.Module(bytes),"
+        "{env:{probe(){const live=new Uint8Array(instance.exports.memory.buffer);"
+        "seenInImport=live[20];seenAt100=live[100];"
+        "bufferInImport=instance.exports.memory.buffer;}}});"
+        "const view=new Uint8Array(instance.exports.memory.buffer);"
+        "instance.exports.poke(20,5);"
+        "const liveInImport=seenInImport===5,"
+        "afterCall=view[20]===5&&view[21]===6,"
+        "sameBuffer=bufferInImport===instance.exports.memory.buffer;"
+        "view[30]=9;instance.exports.poke(31,1);"
+        "const jsStoreKept=view[30]===9&&view[31]===1&&view[32]===2;"
+        "const before=instance.exports.memory.buffer,"
+        "zeroPages=instance.exports.memory.grow(0),"
+        "after=instance.exports.memory.buffer;"
+        "const zeroGrow=zeroPages===1&&before!==after&&before.byteLength===0"
+        "&&after.byteLength===65536&&view.byteLength===0;"
+        "const grownPages=instance.exports.memory.grow(1),"
+        "big=instance.exports.memory.buffer;"
+        "const grew=grownPages===1&&after.byteLength===0"
+        "&&big.byteLength===131072&&new Uint8Array(big)[20]===5"
+        "&&new Uint8Array(big)[32]===2;"
+        "let refused=false;try{instance.exports.memory.grow(1);}"
+        "catch(error){refused=error instanceof RangeError;}"
+        "instance.exports.poke(100,7);"
+        "const afterGrow=new Uint8Array(big)[100]===7&&seenAt100===7;"
+        "globalThis.pocSummary=liveInImport&&afterCall&&sameBuffer&&jsStoreKept"
+        "&&zeroGrow&&grew&&refused&&afterGrow?'WASM-ALIAS-OK'"
+        ":'WASM-ALIAS-FAILED:'+JSON.stringify({liveInImport,afterCall,"
+        "sameBuffer,jsStoreKept,zeroGrow,grew,refused,afterGrow,seenInImport,seenAt100});"
+        "</script></body></html>";
+    PocDocument wasm_alias_document;
+    CHECK(document_parse(&wasm_alias_document, &budget,
+                         wasm_alias_page, strlen(wasm_alias_page), 17));
+    ScriptResult wasm_alias_result;
+    CHECK(scripts_run_document_at(
+              &wasm_alias_document, &budget, 8 * MIB, 2000,
+              "https://wasm-alias.test/", &wasm_alias_result)
+          && wasm_alias_result.success
+          && strcmp(wasm_alias_result.summary, "WASM-ALIAS-OK") == 0);
+    document_destroy(&wasm_alias_document);
+    CHECK(budget.current == wasm_alias_baseline);
+
+    puts("test: wasm alias detach accounting and allocation refusal");
+    extern bool js_wasm_test_alias_release_accounting(void);
+    CHECK(js_wasm_test_alias_release_accounting());
+    PocDocument alias_pressure_document;
+    const char alias_pressure_page[] = "<!doctype html><html><body></body></html>";
+    CHECK(document_parse(&alias_pressure_document, &budget,
+                         alias_pressure_page, strlen(alias_pressure_page), 17));
+    ScriptResult alias_pressure_result;
+    ScriptRuntime *alias_pressure_runtime = script_runtime_create_deferred(
+        &alias_pressure_document, &budget, 8 * MIB, 2000,
+        "https://memory.test/", NULL, &alias_pressure_result);
+    CHECK(alias_pressure_runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(alias_pressure_runtime,
+        "const aliasOwner=new WebAssembly.Instance(new WebAssembly.Module("
+        "Uint8Array.from([0,97,115,109,1,0,0,0,5,4,1,1,0,1,"
+        "7,10,1,6,109,101,109,111,114,121,2,0])));"
+        "let oldAlias=aliasOwner.exports.memory.buffer;"
+        "aliasOwner.exports.memory.grow(0);"
+        "oldAlias=aliasOwner.exports.memory.buffer;",
+        "<alias-setup>", &alias_pressure_result));
+    tilefinch_test_faults()->refuse_next_wasm_alias = true;
+    CHECK(script_runtime_evaluate_diagnostic(alias_pressure_runtime,
+        "try{aliasOwner.exports.memory.grow(1);}catch(_){}"
+        "const safelyDetached=oldAlias.byteLength===0;"
+        "aliasOwner.exports.memory.grow(0);"
+        "globalThis.pocSummary=safelyDetached&&"
+        "aliasOwner.exports.memory.buffer.byteLength===65536"
+        "?'ALIAS-PRESSURE-OK':'ALIAS-PRESSURE-BAD';",
+        "<alias-pressure>", &alias_pressure_result));
+    CHECK(strcmp(alias_pressure_result.summary, "ALIAS-PRESSURE-OK") == 0);
+    puts("test: tiny Wasm exports share the VM cooperative cadence");
+    CHECK(script_runtime_evaluate_diagnostic(alias_pressure_runtime,
+        "const checkpointFn=new WebAssembly.Instance(new WebAssembly.Module("
+        "Uint8Array.from([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,"
+        "3,2,1,0,7,5,1,1,102,0,0,10,6,1,4,0,65,42,11]))).exports.f;",
+        "<native-checkpoint-setup>", &alias_pressure_result));
+    size_t before_native_yields = alias_pressure_result.script_cooperative_yields;
+    CHECK(script_runtime_evaluate_diagnostic(alias_pressure_runtime,
+        "let checkpointSum=0;for(let i=0;i<100;i++)checkpointSum+=checkpointFn();"
+        "globalThis.pocSummary=checkpointSum===4200?'NATIVE-CADENCE-OK':'BAD';",
+        "<native-checkpoint-cadence>", &alias_pressure_result));
+    size_t native_yields = alias_pressure_result.script_cooperative_yields
+        - before_native_yields;
+    printf("native checkpoints: 100 tiny exports, %zu cooperative yields\n", native_yields);
+    CHECK(strcmp(alias_pressure_result.summary, "NATIVE-CADENCE-OK") == 0
+          && native_yields > 0 && native_yields < 100);
+    puts("test: WebAssembly instantiation observes the existing task deadline");
+    CHECK(script_runtime_evaluate_diagnostic(alias_pressure_runtime,
+        "const emptyTaskModule=new WebAssembly.Module("
+        "Uint8Array.from([0,97,115,109,1,0,0,0]));",
+        "<task-module>", &alias_pressure_result));
+    tilefinch_test_faults()->wasm_task_checkpoints = 2;
+    CHECK(!script_runtime_evaluate_diagnostic(alias_pressure_runtime,
+        "new WebAssembly.Instance(emptyTaskModule);",
+        "<task-expired>", &alias_pressure_result));
+    CHECK(script_runtime_evaluate_diagnostic(alias_pressure_runtime,
+        "new WebAssembly.Instance(emptyTaskModule);"
+        "globalThis.pocSummary='TASK-RECOVERED';",
+        "<fresh-task>", &alias_pressure_result));
+    CHECK(strcmp(alias_pressure_result.summary, "TASK-RECOVERED") == 0);
+    script_runtime_destroy(alias_pressure_runtime);
+    document_destroy(&alias_pressure_document);
+    CHECK(budget.current == wasm_alias_baseline);
+
     puts("test: exported WebAssembly memory is not charged to the realm heap");
     size_t wasm_large_memory_baseline = budget.current;
     static const char wasm_large_memory_page[] =
@@ -1254,6 +1453,61 @@
     document_destroy(&wasm_trap_recovery_document);
     CHECK(budget.current == wasm_trap_recovery_baseline);
 
+    puts("test: failed Worker creation restores quota and termination stops jobs");
+    const size_t worker_lifecycle_baseline = budget.current;
+    PocDocument worker_lifecycle_document;
+    CHECK(document_parse(&worker_lifecycle_document, &budget,
+                         alias_pressure_page, strlen(alias_pressure_page), 17));
+    ScriptResult worker_lifecycle_result;
+    ScriptRuntime *worker_lifecycle_runtime = script_runtime_create_deferred(
+        &worker_lifecycle_document, &budget, 10 * MIB, 2000,
+        "https://worker.test/", NULL, &worker_lifecycle_result);
+    CHECK(worker_lifecycle_runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(worker_lifecycle_runtime,
+        "globalThis.workerProbeCalls=0;"
+        "globalThis.workerProbe=()=>{workerProbeCalls++;};"
+        "const workerSource=URL.createObjectURL(new Blob(["
+        "'globalThis.retireOwner(); Promise.resolve().then(()=>workerProbe());'"
+        "+'queueMicrotask(()=>workerProbe());'"
+        "],{type:'text/javascript'}));void Worker;",
+        "<worker-lifecycle-setup>", &worker_lifecycle_result));
+    tilefinch_test_faults()->refuse_next_worker_realm = true;
+    CHECK(script_runtime_evaluate_diagnostic(worker_lifecycle_runtime,
+        "let refused=false;try{new Worker(workerSource);}catch(_){refused=true;}"
+        "const workerA=new Worker(workerSource),workerB=new Worker(workerSource);"
+        "globalThis.retireOwner=()=>{workerA.terminate();workerB.terminate();};"
+        "globalThis.pocSummary=refused?'WORKER-QUOTA-OK':'WORKER-QUOTA-BAD';",
+        "<worker-lifecycle-create>", &worker_lifecycle_result));
+    CHECK(strcmp(worker_lifecycle_result.summary, "WORKER-QUOTA-OK") == 0);
+    for (size_t turn = 0; turn < 8; turn++)
+        CHECK(script_runtime_advance(worker_lifecycle_runtime, turn, 8,
+                                     &worker_lifecycle_result));
+    CHECK(script_runtime_evaluate_diagnostic(worker_lifecycle_runtime,
+        "globalThis.pocSummary=workerProbeCalls===0?'WORKER-STOP-OK':"
+        "'WORKER-STOP-BAD:'+workerProbeCalls;",
+        "<worker-lifecycle-check>", &worker_lifecycle_result));
+    CHECK(strcmp(worker_lifecycle_result.summary, "WORKER-STOP-OK") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(worker_lifecycle_runtime,
+        "const originalFetch=globalThis.fetch;"
+        "globalThis.fetch=()=>Promise.resolve('complete');"
+        "const cleanupURL=URL.createObjectURL(new Blob(["
+        "'let listeners=0;const signal={aborted:false,'"
+        "+'addEventListener(){listeners++},removeEventListener(){listeners--}};'"
+        "+'fetch(\"https://resource.test/\",{signal}).then(()=>postMessage(listeners));'"
+        "],{type:'text/javascript'}));"
+        "const cleanupWorker=new Worker(cleanupURL);"
+        "cleanupWorker.onmessage=e=>{globalThis.pocSummary=e.data===0?"
+        "'WORKER-FETCH-CLEAN':'WORKER-FETCH-LEAK';cleanupWorker.terminate();"
+        "globalThis.fetch=originalFetch;};",
+        "<worker-fetch-cleanup>", &worker_lifecycle_result));
+    for (size_t turn = 0; turn < 12; turn++)
+        CHECK(script_runtime_advance(worker_lifecycle_runtime, turn, 8,
+                                     &worker_lifecycle_result));
+    CHECK(strcmp(worker_lifecycle_result.summary, "WORKER-FETCH-CLEAN") == 0);
+    script_runtime_destroy(worker_lifecycle_runtime);
+    document_destroy(&worker_lifecycle_document);
+    CHECK(budget.current == worker_lifecycle_baseline);
+
     puts("test: bounded Worker scope can compile and execute WebAssembly");
     size_t wasm_worker_baseline = budget.current;
     static const char wasm_worker_page[] =
@@ -1451,6 +1705,19 @@
           && strcmp(deterministic_tick_result.summary,
                     "t1,m1,t2,m2") == 0);
 
+    static const char timer_this_source[] =
+        "(()=>{const expected=globalThis;setTimeout(function(first,second){"
+        "'use strict';globalThis.pocSummary=this===expected&&first===17"
+        "&&second==='ok'?'TIMER-THIS-OK':'TIMER-THIS-FAILED';},0,17,'ok');})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              deterministic_tick_runtime, timer_this_source,
+              "<timer-this-value>", &deterministic_tick_result)
+          && script_runtime_advance(
+              deterministic_tick_runtime, 0, 2,
+              &deterministic_tick_result)
+          && strcmp(deterministic_tick_result.summary,
+                    "TIMER-THIS-OK") == 0);
+
     static const char deterministic_raf_surface_source[] =
         "(()=>{let immediate=false,cancelled=false,observed=false;"
         "try{requestAnimationFrame(null)}catch(error){immediate=error instanceof TypeError;}"
@@ -1489,7 +1756,7 @@
           && script_runtime_advance(
               deterministic_tick_runtime, 16, 4,
               &deterministic_tick_result)
-          && deterministic_tick_result.timer_callbacks_run == 5
+          && deterministic_tick_result.timer_callbacks_run == 6
           && strcmp(deterministic_tick_result.summary,
                     "RAF-REPLAY-OK") == 0);
     ScriptDeterministicReplayDiagnostics deterministic_diagnostics;
@@ -1655,14 +1922,17 @@
     static const char stylesheet_animation_source[] =
         "(()=>{const style=document.createElement('style'),"
         "box=document.createElement('div');"
-        "style.textContent='@keyframes pulse{from{opacity:0;transform:translateY(800px)}'"
+        "style.textContent='.unrelated{color:red;margin:2px}'.repeat(32)"
+        "+'@keyframes pulse{from{opacity:0;transform:translateY(800px)}'"
         "+'to{opacity:1;transform:translateY(20px)}}.motion-probe{'"
-        "+'animation:pulse 32ms linear;animation-timeline:scroll()}';"
+        "+'AnImAtIoN:pulse 32ms linear;animation-timeline:scroll()}';"
         "box.className='motion-probe';"
+        "box.setAttribute('style','color:blue;margin:1px');"
         "document.head.appendChild(style);document.body.appendChild(box);"
         "queueMicrotask(()=>{globalThis.pocSummary="
         "matchMedia('(prefers-reduced-motion:reduce)').matches"
         "&&__tilefinchRootCensus.motionScans===1&&box.style.opacity==='1'"
+        "&&__tilefinchRootCensus.motionDeclarationParses<=8"
         "&&box.style.transform==='none'"
         "?'STYLESHEET-MOTION-STATIC':'STYLESHEET-MOTION-BAD:'+"
         "[__tilefinchRootCensus.motionScans,box.style.opacity,"
@@ -1705,11 +1975,19 @@
         "box.setAttribute('style','\\u00e9abc');"
         "document.body.appendChild(box);"
         "const attr=__tilefinchGetStyleAttributePrefix(box.__handle,3);"
+        "const astral=document.createElement('style');"
+        "astral.textContent='\\u{1f600}X';"
+        "const short=__tilefinchGetTextPrefix(astral.__handle,3,16),"
+        "whole=__tilefinchGetTextPrefix(astral.__handle,4,16),"
+        "empty=__tilefinchGetTextPrefix(astral.__handle,0,16);"
         "globalThis.pocSummary=complete==='\\u00e9abc'"
-        "&&prefix.text==='\\u00e9a'&&prefix.nodes===2"
-        "&&oneNode.text==='\\u00e9a'&&oneNode.nodes===2"
-        "&&allNodes.text==='\\u00e9abc'&&allNodes.nodes===3"
+        "&&prefix.text==='\\u00e9a'&&prefix.nodes===2&&prefix.bytes===3"
+        "&&oneNode.text==='\\u00e9a'&&oneNode.nodes===2&&oneNode.bytes===3"
+        "&&allNodes.text==='\\u00e9abc'&&allNodes.nodes===3&&allNodes.bytes===5"
         "&&attr==='\\u00e9a'&&box.getAttribute('style')==='\\u00e9abc'"
+        "&&short.text===''&&short.bytes===0"
+        "&&whole.text==='\\u{1f600}'&&whole.bytes===4"
+        "&&empty.text===''&&empty.bytes===0&&empty.nodes===0"
         "?'BOUNDED-TEXT-PREFIX-OK':'BOUNDED-TEXT-PREFIX-BAD:'"
         "+[complete,prefix.text,prefix.nodes,oneNode.text,oneNode.nodes,"
         "allNodes.text,allNodes.nodes,attr].join('|')})()";
@@ -2429,6 +2707,27 @@
     document_destroy(&deterministic_entropy_document);
     CHECK(budget.current == deterministic_entropy_baseline);
 
+    puts("test: Console exposes the standard diagnostic method surface");
+    size_t console_baseline = budget.current;
+    static const char console_surface_page[] =
+        "<!doctype html><html><body><script>"
+        "const methods=['assert','clear','count','countReset','dir','dirxml',"
+        "'group','groupCollapsed','groupEnd','table','time','timeEnd','timeLog'];"
+        "globalThis.pocSummary=methods.every(name=>typeof console[name]==='function')"
+        "&&console.groupCollapsed.call(console,'probe')===undefined"
+        "&&console.groupEnd.call(console)===undefined?'CONSOLE-SURFACE-OK':'bad'"
+        "</script></body></html>";
+    PocDocument console_document;
+    CHECK(document_parse(&console_document, &budget, console_surface_page,
+                         strlen(console_surface_page), 17));
+    ScriptResult console_result;
+    CHECK(scripts_run_document(&console_document, &budget, 4 * MIB, 1000,
+                               &console_result));
+    CHECK(console_result.success
+          && strcmp(console_result.summary, "CONSOLE-SURFACE-OK") == 0);
+    document_destroy(&console_document);
+    CHECK(budget.current == console_baseline);
+
     puts("test: uncaught event listener isolation");
     size_t listener_baseline = budget.current;
     static const char listener_page[] =
@@ -2781,6 +3080,21 @@
                     480u * 200u * sizeof(*stable_frame)) == 0
           && cache.max_frame_job_unit_us
                  <= cache.max_frame_job_slice_us);
+    puts("test: cached viewport tiles do not spend raster-work slots");
+    size_t warm_units = cache.frame_job_units;
+    size_t warm_rasterized = cache.rasterized;
+    CHECK(tile_cache_prepare_frame_bounded(
+              &cache, 0, 480, 200, UINT64_MAX / 2u, 1)
+              == RENDER_FRAME_WORK_READY
+          && cache.frame_job_units == warm_units
+          && cache.rasterized == warm_rasterized);
+    tile_cache_cancel_frame_work(&cache);
+    tile_cache_invalidate_rect(&cache, 1, 1, 2, 2);
+    CHECK(tile_cache_prepare_frame_bounded(
+              &cache, 0, 480, 200, UINT64_MAX / 2u, 1)
+              == RENDER_FRAME_WORK_READY
+          && cache.frame_job_units == warm_units + 1u
+          && cache.rasterized == warm_rasterized + 1u);
     budget_free(&budget, stable_frame);
     tile_cache_destroy(&cache);
     budget_free(&budget, frame);

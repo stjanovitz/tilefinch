@@ -23,6 +23,8 @@ trap cleanup EXIT HUP INT TERM
 rsync -a --exclude .git "$psplink_source/" "$work/"
 patch -s -d "$work" -p1 \
     < "$root/tools/psplink-home-exit/psplink-v3.2.1-home-exit.patch"
+patch -s -d "$work" -p1 \
+    < "$root/tools/psplink-home-exit/psplink-v3.2.1-safe-screenshot.patch"
 
 PATH=$PSPDEV/bin:$PATH
 export PSPDEV PATH

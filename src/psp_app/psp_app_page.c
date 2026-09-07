@@ -376,12 +376,14 @@ bool psp_run_initial_page_load(
     BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
     bool provisional_dump_attempted = false;
     bool provisional_dumped = false;
+    bool user_cancelled = false;
     size_t pump_boundaries = 0;
     while (status == BROWSER_NAVIGATION_JOB_PENDING) {
         psp_log_heartbeat();
         SceCtrlData pad = {0};
         if (sceCtrlPeekBufferPositive(&pad, 1) > 0
             && (pad.Buttons & PSP_CTRL_CIRCLE) != 0) {
+            user_cancelled = true;
             browser_engine_cancel_navigation(
                 engine, "cancelled from PSP browser UI");
             status = BROWSER_NAVIGATION_JOB_CANCELLED;
@@ -403,11 +405,13 @@ bool psp_run_initial_page_load(
             if (!tilefinch_platform_cooperate(
                     "navigation-pump", pump_boundaries)
                 && status == BROWSER_NAVIGATION_JOB_PENDING) {
+                user_cancelled = true;
                 browser_engine_cancel_navigation(
                     engine, "cancelled from PSP browser UI");
                 status = BROWSER_NAVIGATION_JOB_CANCELLED;
             }
             if (psp_navigation_cancel_requested()) {
+                user_cancelled = true;
                 if (status == BROWSER_NAVIGATION_JOB_PENDING) {
                     browser_engine_cancel_navigation(
                         engine, "cancelled from PSP browser UI");
@@ -453,6 +457,19 @@ bool psp_run_initial_page_load(
     (void) browser_engine_metrics(engine, &engine_metrics);
     const NavigationPerformance *performance =
         &engine_metrics.navigation;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    printf("tilefinch-navigation-phases: network=%lluus parse=%lluus "
+           "script=%lluus style=%lluus resource=%lluus layout=%lluus "
+           "runtime=%lluus error=\"%.200s\"\n",
+           (unsigned long long) performance->network_us,
+           (unsigned long long) performance->parse_us,
+           (unsigned long long) performance->script_us,
+           (unsigned long long) performance->style_us,
+           (unsigned long long) performance->resource_us,
+           (unsigned long long) performance->layout_us,
+           (unsigned long long) performance->runtime_us,
+           browser_engine_last_error(engine));
+#endif
     printf("tilefinch-navigation-job: initial status=%d pumps=%zu "
            "body=%zuB yields=%zu max-pump=%lluus parser-max=%lluus "
            "preview=%zu/%zu nav-start=%lluus capture=%lluus first=%lluus "
@@ -602,7 +619,7 @@ bool psp_run_initial_page_load(
                 ui, visible_detail, tls_guidance, 300);
     }
     if (stopped != NULL)
-        *stopped = status == BROWSER_NAVIGATION_JOB_CANCELLED;
+        *stopped = user_cancelled;
     psp_navigation_cooperate_end("initial");
     return status == BROWSER_NAVIGATION_JOB_SUCCEEDED;
 }

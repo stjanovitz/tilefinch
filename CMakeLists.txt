@@ -1,8 +1,54 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(psp_browser_tilefinch VERSION 0.1.15 LANGUAGES C)
+project(psp_browser_tilefinch VERSION 0.1.16 LANGUAGES C)
 
-set(TILEFINCH_RELEASE_SEQUENCE "16" CACHE STRING
+# Build directories inside the source tree must be named in CMakePresets.json
+# or in the short allowlist below. Sixty-one ad hoc trees (12 GB) accumulated
+# in two months, and one of them ran stale binaries under ctest while
+# reporting green. The check runs only on a fresh configure (no generated
+# build files yet), so existing trees keep working; pass
+# -DTILEFINCH_ALLOW_BUILD_DIR=ON for a deliberate experiment.
+option(TILEFINCH_ALLOW_BUILD_DIR
+    "Admit a build directory that CMakePresets.json does not name" OFF)
+if(NOT TILEFINCH_ALLOW_BUILD_DIR
+   AND NOT EXISTS "${CMAKE_BINARY_DIR}/Makefile"
+   AND NOT EXISTS "${CMAKE_BINARY_DIR}/build.ninja")
+    file(RELATIVE_PATH tilefinch_build_relative
+         "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
+    if(NOT tilefinch_build_relative MATCHES "^\.\./"
+       AND NOT IS_ABSOLUTE "${tilefinch_build_relative}")
+        file(READ "${CMAKE_SOURCE_DIR}/CMakePresets.json" tilefinch_presets)
+        string(REGEX MATCHALL "\"binaryDir\": \"[^\"]*\""
+               tilefinch_preset_dirs "${tilefinch_presets}")
+        set(tilefinch_allowed_build_dirs
+            # Device validation and update/e2e trees the scripts default to.
+            build-preset-psp-validation
+            build-psp-update-proof
+            build-preset-psp-update-e2e
+            # scripts/dev.sh and the lab scripts' default trees.
+            build-dev
+            build-release
+            build-dev-sanitize
+            build-bellard-current
+            build-bellard-clean-impersonate
+            # Hosts the fetched WAMR source the other trees reference.
+            build-challenge-compression)
+        foreach(entry IN LISTS tilefinch_preset_dirs)
+            string(REGEX REPLACE ".*/([^/\"]+)\"$" "\\1" entry "${entry}")
+            list(APPEND tilefinch_allowed_build_dirs "${entry}")
+        endforeach()
+        get_filename_component(tilefinch_build_name "${CMAKE_BINARY_DIR}" NAME)
+        if(NOT tilefinch_build_name IN_LIST tilefinch_allowed_build_dirs)
+            message(FATAL_ERROR
+                "Build directory '${tilefinch_build_name}' is not a preset "
+                "binaryDir (see CMakePresets.json). Configure through a preset, "
+                "or pass -DTILEFINCH_ALLOW_BUILD_DIR=ON for a deliberate "
+                "experiment and delete the tree when it is done.")
+        endif()
+    endif()
+endif()
+
+set(TILEFINCH_RELEASE_SEQUENCE "17" CACHE STRING
     "Monotonic signed release sequence compiled into this build")
 set(TILEFINCH_UPDATE_ROOT_V1 "" CACHE FILEPATH
     "Public binary Tilefinch root-v1 metadata embedded into updater builds")

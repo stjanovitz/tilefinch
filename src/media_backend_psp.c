@@ -4956,6 +4956,31 @@ static int psp_media_collect_codec_job(
                     &backend->codec_native_stage, memory_order_acquire);
                 const char *wedged_name =
                     psp_media_codec_stage_name(wedged_stage);
+#if defined(TILEFINCH_PSP_VALIDATION_LOG)
+                /* This is a watchdog verdict, not a firmware return code.
+                   Preserve the wait owner and scheduler evidence before
+                   teardown so intermittent ME waits can be distinguished
+                   from a ready worker which is not getting CPU time. No
+                   extra sampling or formatting on the successful hot path. */
+                SceKernelThreadInfo thread_info;
+                int snapshot = psp_thread_snapshot(
+                    backend->codec_thread, &thread_info);
+                psp_media_log(
+                    "tilefinch-media-decoder: event=codec-watchdog "
+                    "stage=%s elapsed=%uus thread=0x%08X "
+                    "snapshot=0x%08X status=0x%X wait-type=%d "
+                    "wait-id=0x%08X priority=%d run-clocks=%u:%u "
+                    "preemptions=%u/%u releases=%u",
+                    wedged_name, (unsigned) running_us,
+                    (unsigned) backend->codec_thread, (unsigned) snapshot,
+                    (unsigned) thread_info.status, thread_info.waitType,
+                    (unsigned) thread_info.waitId, thread_info.currentPriority,
+                    (unsigned) thread_info.runClocks.hi,
+                    (unsigned) thread_info.runClocks.low,
+                    (unsigned) thread_info.intrPreemptCount,
+                    (unsigned) thread_info.threadPreemptCount,
+                    (unsigned) thread_info.releaseCount);
+#endif
                 backend->stats.last_native_error =
                     (int) PSP_MEDIA_ERROR_BUSY;
                 psp_media_log_failure(
@@ -5315,6 +5340,27 @@ static void psp_media_promote_pending_audio(PspMediaBackend *backend)
     backend->audio_staged_count = promote;
     if (psp_media_audio_pending_count(backend) == 0u)
         backend->audio_pending_since_us = 0u;
+}
+
+static bool psp_media_allow_submit_bypass(const void *opaque, int track_kind)
+{
+    const PspMediaBackend *backend = opaque;
+    if (backend == NULL || track_kind != MEDIA_MP4_TRACK_VIDEO
+        || !backend->have_audio) return false;
+    /* Only a future ready picture can hold the surface/clock dependency.
+       A due picture needs presentation, and an in-flight job needs to finish,
+       not to be overtaken by AAC jobs. Inspect, but never release, the slots.
+       The browser already samples this queue-capped cursor each pump; do not
+       advance or re-anchor its clock from admission. */
+    uint64_t clock_us = backend->audio_cursor_elapsed_us;
+    if (atomic_load_explicit(
+            &backend->audio_origin_initialized, memory_order_acquire)) {
+        if (backend->audio_origin_us > UINT64_MAX - clock_us) return false;
+        clock_us += backend->audio_origin_us;
+    }
+    return psp_media_slots_wait_for_audio(
+        backend->slots, PSP_MEDIA_SURFACE_SLOTS,
+        backend->session_epoch, clock_us);
 }
 
 /*
@@ -8539,7 +8585,8 @@ static bool psp_media_backend_create_track_info(
         .destroy = psp_media_destroy,
         .emit_pending_video = psp_media_emit_pending_video,
         .release_video_slot = psp_media_release_video_slot,
-        .wants_paired_submit = psp_media_wants_paired_submit
+        .wants_paired_submit = psp_media_wants_paired_submit,
+        .allow_submit_bypass = psp_media_allow_submit_bypass
     };
     return true;
 

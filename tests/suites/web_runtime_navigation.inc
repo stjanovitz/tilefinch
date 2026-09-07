@@ -5,7 +5,7 @@
     static const char nav_b[] =
         "<!doctype html><title>B</title><style>p{color:#445566}</style>"
         "<body><p>BETA PAGE</p></body>";
-    NavigationSession navigation;
+    static NavigationSession navigation;
     CHECK(navigation_init(&navigation, &budget, 8));
     uint64_t cancelled_generation = navigation_begin(&navigation);
     navigation_cancel(&navigation, cancelled_generation);
@@ -57,7 +57,7 @@
         "event.oldURL+'>'+event.newURL))</script></body>";
     static const char realm_b[] =
         "<!doctype html><title>Realm B</title><body><p id=new>NEW</p></body>";
-    NavigationSession realm_navigation;
+    static NavigationSession realm_navigation;
     CHECK(navigation_init(&realm_navigation, &budget, 4));
     navigation_enable_scripts(&realm_navigation, 4 * MIB, 1000);
     uint64_t realm_generation = navigation_begin(&realm_navigation);
@@ -113,6 +113,67 @@
     navigation_destroy(&realm_navigation);
     CHECK(budget.current == 0);
 
+    puts("test: nonvisual head scripts preserve observable DOM without body layout");
+    static const char *head_script_pages[] = {
+        "<!doctype html><title>Head</title><style>p:empty{color:red}"
+        ".card:has(script) p{color:blue}</style><body><p>PAGE</p>",
+        "<!doctype html><title>Head</title><style>"
+        "html:has(head>script) p{color:blue}</style><body><p>PAGE</p>",
+        "<!doctype html><title>Head</title><style>head{display:block}"
+        "script{display:block}</style><body><p>PAGE</p>",
+        "<!doctype html><html><head></head><body><style>"
+        "head:empty+body{color:blue}</style><p>PAGE</p>",
+        "<!doctype html><title>Head</title><style>"
+        ":is(html,body):has(script) p{color:blue}</style><body><p>PAGE</p>"
+    };
+    for (size_t head_case = 0; head_case < 5; head_case++) {
+        static NavigationSession head_navigation;
+        CHECK(navigation_init(&head_navigation, &budget, 2));
+        navigation_enable_scripts(&head_navigation, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(
+            &head_navigation, navigation_begin(&head_navigation),
+            "https://example.test/head", head_script_pages[head_case],
+            strlen(head_script_pages[head_case]), 480, NULL, NULL, true));
+        CHECK(script_runtime_evaluate_diagnostic(
+            head_navigation.page.runtime,
+            "globalThis.headScript=document.createElement('script');"
+            "headScript.type='application/json';headScript.textContent='{}';"
+            "globalThis.headObserver=new MutationObserver(()=>{});"
+            "headObserver.observe(document.head,{childList:true});"
+            "document.head.appendChild(headScript);"
+            "pocSummary=headObserver.takeRecords().length===1?'observed':'bad'",
+            "<head-script-add>", &head_navigation.page.script_result)
+            && strcmp(head_navigation.page.script_result.summary, "observed") == 0
+            && script_runtime_consume_relayout(head_navigation.page.runtime)
+            && navigation_relayout(&head_navigation)
+            && head_navigation.incremental_relayouts == (head_case == 0 ? 0 : 1)
+            && command_x(&head_navigation.page.layout, "PAGE") >= 0);
+        CHECK(script_runtime_evaluate_diagnostic(
+            head_navigation.page.runtime,
+            "headScript.remove();"
+            "pocSummary=headObserver.takeRecords().length===1?'observed':'bad';"
+            "headObserver.disconnect();headScript=null;headObserver=null",
+            "<head-script-remove>", &head_navigation.page.script_result)
+            && strcmp(head_navigation.page.script_result.summary, "observed") == 0
+            && script_runtime_consume_relayout(head_navigation.page.runtime)
+            && navigation_relayout(&head_navigation)
+            && head_navigation.incremental_relayouts == (head_case == 0 ? 0 : 2));
+        if (head_case == 0) {
+            CHECK(script_runtime_evaluate_diagnostic(
+                head_navigation.page.runtime,
+                "const mixed=document.createElement('script');"
+                "mixed.type='application/json';document.head.appendChild(mixed);"
+                "document.querySelector('p').textContent='CHANGED'",
+                "<head-and-body-mutation>", &head_navigation.page.script_result)
+                && script_runtime_consume_relayout(head_navigation.page.runtime)
+                && navigation_relayout(&head_navigation)
+                && head_navigation.incremental_relayouts == 1
+                && command_x(&head_navigation.page.layout, "CHANGED") >= 0);
+        }
+        navigation_destroy(&head_navigation);
+        CHECK(budget.current == 0);
+    }
+
     puts("test: persistent runtime and incremental relayout");
     static const char runtime_page[] =
         "<!doctype html><meta name=viewport content='width=device-width'>"
@@ -121,7 +182,7 @@
         "#draw,#remove-on-down{display:block;width:120px;height:40px}"
         "[data-unrelated]{color:#654321}</style>"
         "<body onload=\"document.body.setAttribute('data-body-load',event.type)\">"
-        "<p id=status>WAITING</p><div id=inline "
+        "<p id=status class=ready>WAITING</p><div id=inline "
         "onclick=\"this.setAttribute('data-first',event.type);return false\"></div>"
         "<div id=draw tabindex=0></div>"
         "<div id=remove-on-down></div><a href='/next'>NEXT PAGE</a>"
@@ -155,8 +216,8 @@
         "document.getElementById('external').addEventListener('load',()=>status.setAttribute('data-external','loaded'));"
         "setTimeout(()=>{ticks++;status.textContent='TIMER '+ticks;},10);"
         "</script></body>";
-    NavigationSession interactive;
-    BrowserSession browser_session;
+    static NavigationSession interactive;
+    static BrowserSession browser_session;
     CHECK(browser_session_init(&browser_session, &budget, 256 * 1024));
     CHECK(navigation_init(&interactive, &budget, 4));
     navigation_attach_browser_session(&interactive, &browser_session);
@@ -278,6 +339,22 @@
           && interactive.incremental_relayouts == 1
           && interactive.performance.fast_relayouts == 1
           && interactive.performance.semantic_relayout_skips == 1);
+    CHECK(script_runtime_evaluate_diagnostic(
+              interactive.page.runtime,
+              "(()=>{const n=document.getElementById('status');"
+              "const o=new MutationObserver(()=>{});"
+              "o.observe(n,{attributes:true,attributeOldValue:true});"
+              "for(let i=0;i<20;i++){n.setAttribute('id','status');"
+              "n.setAttribute('class','ready');}"
+              "const r=o.takeRecords();o.disconnect();"
+              "pocSummary=r.length===40&&r.every(x=>x.oldValue==="
+              "(x.attributeName==='id'?'status':'ready'))"
+              "?'same-attribute-observed':'bad-observers';})()",
+              "<unchanged-selector-attribute>",
+              &interactive.page.script_result)
+          && !script_runtime_consume_relayout(interactive.page.runtime)
+          && strcmp(interactive.page.script_result.summary,
+                    "same-attribute-observed") == 0);
     CHECK(navigation_advance_runtime(&interactive, 5, 4)
           && interactive.page.script_result.timer_callbacks_run == 1
           && interactive.page.script_result.runtime_ticks == 2
@@ -1083,6 +1160,32 @@
     CHECK(attribute_equals(
         scaled_result, "data-point", scaled_expected));
 
+    puts("test: native pointer clicks cross shadow boundaries");
+    static const char shadow_pointer_page[] =
+        "<!doctype html><body><div id=shadow-host></div><script>"
+        "const host=document.getElementById('shadow-host'),"
+        "root=host.attachShadow({mode:'closed'}),"
+        "target=document.createElement('span');target.id='shadow-target';"
+        "root.appendChild(target);let seen=[];"
+        "target.addEventListener('click',()=>seen.push('target'));"
+        "host.addEventListener('click',()=>seen.push('host'));"
+        "document.addEventListener('click',()=>{seen.push('document');"
+        "pocSummary=seen.join(',')})</script></body>";
+    uint64_t shadow_pointer_generation = navigation_begin(&interactive);
+    CHECK(navigation_commit_html(
+        &interactive, shadow_pointer_generation,
+        "https://example.test/shadow-pointer", shadow_pointer_page,
+        strlen(shadow_pointer_page), 480, NULL, NULL, true));
+    lxb_dom_node_t *shadow_pointer_target = find_id(
+        lxb_dom_interface_node(interactive.page.document.html),
+        "shadow-target");
+    CHECK(shadow_pointer_target != NULL
+          && navigation_dispatch_node_pointer(
+              &interactive, shadow_pointer_target, 5u,
+              12, 12, 1, 1, 0u)
+          && strcmp(interactive.page.script_result.summary,
+                    "target,host,document") == 0);
+
     puts("test: dynamically installed inline pointer handlers reopen dispatch");
     static const char dynamic_pointer_page[] =
         "<!doctype html><style>#dynamic-pointer{width:80px;height:30px}"
@@ -1144,7 +1247,7 @@
         "</style><body><svg id=icon width=8 height=8 viewBox='0 0 8 8' "
         "xmlns='http://www.w3.org/2000/svg'><path fill='currentColor' "
         "d='M0 0h8v8H0z'/></svg></body>";
-    NavigationSession svg_refresh_navigation;
+    static NavigationSession svg_refresh_navigation;
     CHECK(navigation_init(&svg_refresh_navigation, &budget, 2));
     navigation_enable_scripts(&svg_refresh_navigation, 3 * MIB, 1000);
     navigation_enable_external_resources(
@@ -1205,13 +1308,95 @@
     navigation_destroy(&svg_refresh_navigation);
     CHECK(budget.current == 0);
 
+    puts("test: large section class changes retain resources and find late images");
+    for (unsigned variant = 0; variant < 5; variant++) {
+        char html[16384];
+        size_t used = (size_t) snprintf(html, sizeof(html),
+            "<!doctype html><style>#section{color:red}.open{color:blue!important}"
+            ".extra{display:none}.open .extra{display:block}</style>"
+            "<body><div id=section>");
+        for (unsigned i = 0; i < (variant == 4 ? 4u : 400u); i++) {
+            int written = snprintf(html + used, sizeof(html) - used,
+                                   "<span>TEXT</span>");
+            CHECK(written > 0 && (size_t) written < sizeof(html) - used);
+            used += (size_t) written;
+        }
+        int written = snprintf(html + used, sizeof(html) - used,
+            "%s<p class=extra>REVEALED</p></div>", variant == 1
+            ? "<svg id=late width=8 height=8 viewBox='0 0 8 8' xmlns='http://www.w3.org/2000/svg'><path fill='currentColor' d='M0 0h8v8H0z'/></svg>"
+            : variant >= 3
+            ? "<div class=extra><img id=late width=8 height=8></div>" : "");
+        CHECK(written > 0 && (size_t) written < sizeof(html) - used);
+        used += (size_t) written;
+        static NavigationSession section;
+        CHECK(navigation_init(&section, &budget, 2));
+        navigation_enable_scripts(&section, 3 * MIB, 1000);
+        navigation_enable_external_resources(&section, 2, 32768, 32768,
+                                            4, 65536, 32768, 65536, 1000);
+        uint64_t generation = navigation_begin(&section);
+        CHECK(navigation_commit_html(&section, generation,
+            "https://section.test/", html, used, 480, NULL, NULL, true));
+        CHECK(command_x(&section.page.layout, "REVEALED") < 0);
+        if (variant >= 3) {
+            CHECK(script_runtime_evaluate_diagnostic(section.page.runtime,
+                "document.getElementById('late').src='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='",
+                "<hidden-image-source>", &section.page.script_result)
+                && script_runtime_consume_relayout(section.page.runtime)
+                && navigation_relayout(&section));
+            lxb_dom_node_t *late = find_id(
+                lxb_dom_interface_node(section.page.document.html), "late");
+            CHECK(late != NULL && images_find_node(&section.page.images, late) == NULL);
+        }
+        CHECK(script_runtime_evaluate_diagnostic(section.page.runtime,
+            "document.getElementById('section').className='open'",
+            "<section-reveal>", &section.page.script_result)
+            && script_runtime_consume_relayout(section.page.runtime));
+        LayoutCooperateProbe probe = {.cancel_resource_at = variant == 2 ? 1 : 0};
+        TilefinchPlatformServices services = {
+            .context = &probe, .cooperate = test_layout_cooperate
+        };
+        tilefinch_platform_set_services(&services);
+        bool expanded = navigation_relayout(&section);
+        tilefinch_platform_set_services(NULL);
+        if (variant == 2) {
+            CHECK(!expanded && !section.page.loaded && probe.resource_calls == 1);
+        } else {
+            CHECK(expanded && (variant == 4 || probe.resource_calls >= 25)
+                  && section.performance.full_relayouts == 0
+                  && section.performance.fast_relayouts == (variant >= 3 ? 2u : 1u)
+                  && command_x(&section.page.layout, "REVEALED") >= 0);
+            if (variant == 1 || variant >= 3) {
+                lxb_dom_node_t *svg = find_id(
+                    lxb_dom_interface_node(section.page.document.html), "late");
+                const ImageResource *image = images_find_node(&section.page.images, svg);
+                if (!image_resource_available(image))
+                    fprintf(stderr, "section image variant=%u resource=%p scans=%zu refresh=%zu error=%s\n",
+                            variant, (void *) image,
+                            section.performance.mutation_image_resource_scans,
+                            section.performance.resource_fingerprint_scans,
+                            section.last_error);
+                CHECK(image_resource_available(image));
+                if (variant == 1) {
+                    CHECK(image->pixels[0] < 16 && image->pixels[2] > 240);
+                } else {
+                    unsigned char *decoded = NULL;
+                    CHECK(image_resource_decode_checked(image, &budget, &decoded)
+                          == IMAGE_DECODE_SUCCEEDED && decoded != NULL);
+                    image_resource_free_decoded(&budget, decoded);
+                }
+            }
+        }
+        navigation_destroy(&section);
+        CHECK(budget.current == 0);
+    }
+
     puts("test: revealing a hidden inline background discovers its image");
     static const char revealed_background_page[] =
         "<!doctype html><body><div id=hero style=\"display:none;opacity:0;"
         "background-image:url(data:image/png;base64,"
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
         "+A8AAQUBAScY42YAAAAASUVORK5CYII=)\"></div></body>";
-    NavigationSession revealed_background_navigation;
+    static NavigationSession revealed_background_navigation;
     CHECK(navigation_init(&revealed_background_navigation, &budget, 2));
     navigation_enable_scripts(
         &revealed_background_navigation, 3 * MIB, 1000);
@@ -1261,7 +1446,7 @@
         "&&!deadline.didTimeout&&visualViewport.width===480"
         "&&visualViewport.height===272&&visualViewport.scale===1;finish();});"
         "</script></body>";
-    NavigationSession cooperative_scheduler;
+    static NavigationSession cooperative_scheduler;
     CHECK(navigation_init(&cooperative_scheduler, &budget, 2));
     navigation_enable_scripts(&cooperative_scheduler, 3 * MIB, 1000);
     uint64_t cooperative_generation = navigation_begin(
@@ -1315,7 +1500,7 @@
         "textContent=ok?'MODERN-API':'FAILED';globalThis.pocSummary="
         "ok?'modern-api:ok':'modern-api:failed';source.close();target.close();};"
         "source.postMessage(payload);payload.value=0;</script>";
-    NavigationSession modern_component_api;
+    static NavigationSession modern_component_api;
     CHECK(navigation_init(&modern_component_api, &budget, 2));
     navigation_enable_scripts(&modern_component_api, 3 * MIB, 1000);
     uint64_t modern_component_generation = navigation_begin(
@@ -1422,7 +1607,7 @@
         "document.activeElement?.tagName||'none')+':'+"
         "order.join('|');document.getElementById('result')"
         ".textContent=pocSummary;</script></body>";
-    NavigationSession event_propagation;
+    static NavigationSession event_propagation;
     CHECK(navigation_init(&event_propagation, &budget, 2));
     navigation_enable_scripts(&event_propagation, 3 * MIB, 1000);
     uint64_t event_generation = navigation_begin(&event_propagation);
@@ -1459,7 +1644,7 @@
         "<button id=right>RIGHT</button><button id=down>DOWN</button>"
         "<button id=center>CENTER</button><button id=up>UP</button>"
         "<button id=left>LEFT</button><input id=zero type=text></body>";
-    NavigationSession spatial_focus_navigation;
+    static NavigationSession spatial_focus_navigation;
     CHECK(navigation_init(&spatial_focus_navigation, &budget, 2));
     uint64_t spatial_focus_generation =
         navigation_begin(&spatial_focus_navigation);
@@ -1529,7 +1714,7 @@
         "<a id=multi href=/same><span>ONE</span><span>TWO</span>"
         "<span>THREE</span></a><br>"
         "<a id=duplicate href=/same><span>NEXT</span></a>";
-    NavigationSession fragment_focus_navigation;
+    static NavigationSession fragment_focus_navigation;
     CHECK(navigation_init(&fragment_focus_navigation, &budget, 2));
     navigation_enable_scripts(&fragment_focus_navigation, 4 * MIB, 1000);
     uint64_t fragment_focus_generation =
@@ -1584,6 +1769,52 @@
     CHECK(budget.current == 0);
 
     puts("test: focus outline skips layout but geometry and relations do not");
+    {
+        puts("test: sequential focus skips retained invisible menu links");
+        static const char page[] =
+            "<!doctype html><style>.closed{visibility:hidden}</style><body>"
+            "<nav class=closed><a href=/hidden>Hidden menu entry</a></nav>"
+            "<button id=menu>Open menu</button><p>Visible content</p>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        uint64_t generation = navigation_begin(&session);
+        CHECK(navigation_commit_html(&session, generation,
+            "https://focus.test/hidden", page, strlen(page), 480, NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        CHECK(controller_focus_next(&controller));
+        CHECK(controller.focus_kind == CONTROLLER_FOCUS_CONTROL);
+        int width = 0, height = 0;
+        CHECK(controller_focused_rect(&controller, NULL, NULL, &width, &height)
+              && width > 0 && height > 0);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+    {
+        puts("test: a clipped skip link becomes visible on first controller focus");
+        static const char page[] =
+            "<!doctype html><style>"
+            ".skip:not(:focus){display:block;position:absolute!important;"
+            "clip:rect(1px,1px,1px,1px);width:1px;height:1px;margin:-1px;"
+            "border:0;padding:0;overflow:hidden}"
+            "</style><body><a class=skip id=skip href=#content>Skip to content</a>"
+            "<button id=menu>Menu</button><h1 id=content>Content</h1>";
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        uint64_t generation = navigation_begin(&session);
+        CHECK(navigation_commit_html(&session, generation,
+            "https://focus.test/skip", page, strlen(page), 480, NULL, NULL, true));
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        CHECK(controller_focus_next(&controller));
+        int x = 0, y = 0, width = 0, height = 0;
+        CHECK(controller_focused_rect(&controller, &x, &y, &width, &height)
+              && x >= 0 && width > 1 && height > 1);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
     static const char focus_invalidation_page[] =
         "<!doctype html><style>"
         "a{display:block;width:80px;height:20px}"
@@ -1591,14 +1822,14 @@
         "button{display:block;width:60px;height:20px}"
         "button:focus{width:120px}"
         "input:focus+span{color:#ff0000}"
-        ".paint{width:80px;border:1px solid #72777d;border-radius:2px}"
+        ".paint{width:80px;background:transparent;border:1px solid transparent;border-radius:2px}"
         ".paint:focus{width:80px;border-color:#3366cc;"
         "box-shadow:inset 0 0 0 1px #3366cc;outline:1px solid transparent}"
         "</style><body><a id=fast1 href=/1>ONE</a>"
         "<a id=fast2 href=/2>TWO</a><button id=wide>WIDE</button>"
         "<button class=paint id=paint>PAINT</button>"
         "<input id=related><span>STATE</span>";
-    NavigationSession focus_invalidation_navigation;
+    static NavigationSession focus_invalidation_navigation;
     CHECK(navigation_init(&focus_invalidation_navigation, &budget, 2));
     navigation_enable_scripts(&focus_invalidation_navigation, 4 * MIB, 1000);
     uint64_t focus_invalidation_generation =
@@ -1665,11 +1896,11 @@
                  .focus_outline_relayout_skips == 2);
     CHECK(controller_focus_node(&focus_invalidation_controller, paint)
           && focus_invalidation_navigation.incremental_relayouts
-                 == ++focus_invalidation_relayouts
+                 == focus_invalidation_relayouts
           && focus_invalidation_navigation.performance
-                 .focus_paint_relayout_skips == 0
-          && focus_invalidation_navigation.focus_paint_generation == 0
-          && !focus_invalidation_navigation.focus_paint_damage_valid);
+                 .focus_paint_relayout_skips == 1
+          && focus_invalidation_navigation.focus_paint_generation == 1
+          && focus_invalidation_navigation.focus_paint_damage_valid);
     const LayoutNodeBox *paint_box = layout_box_for_node(
         &focus_invalidation_navigation.page.layout, paint);
     int paint_focus_width = 0, paint_focus_height = 0;
@@ -1715,6 +1946,31 @@
               focus_frame_pixels * sizeof(*fast_focus_frame)) == 0);
     tile_cache_destroy(&full_focus_cache);
     tile_cache_destroy(&fast_focus_cache);
+    /* Removal and re-application must restore transparent border/shadow
+       pixels too, not merely make the focused frame look right. */
+    for (unsigned round = 0; round < 2; round++) {
+        CHECK(controller_focus_node(&focus_invalidation_controller,
+                                    round == 0 ? fast1 : paint)
+              && focus_invalidation_navigation.incremental_relayouts
+                     == focus_invalidation_relayouts);
+        CHECK(tile_cache_init(&fast_focus_cache, &budget,
+                  &focus_invalidation_navigation.page.layout, 8)
+              && tile_cache_set_frame(&fast_focus_cache, fast_focus_frame, focus_frame_pixels)
+              && tile_cache_render_frame(&fast_focus_cache, 0,
+                  FOCUS_FRAME_WIDTH, FOCUS_FRAME_HEIGHT, NULL));
+        focus_invalidation_navigation.style_rebuild_required = true;
+        CHECK(navigation_relayout(&focus_invalidation_navigation)
+              && focus_invalidation_navigation.incremental_relayouts == ++focus_invalidation_relayouts
+              && tile_cache_init(&full_focus_cache, &budget,
+                  &focus_invalidation_navigation.page.layout, 8)
+              && tile_cache_set_frame(&full_focus_cache, full_focus_frame, focus_frame_pixels)
+              && tile_cache_render_frame(&full_focus_cache, 0,
+                  FOCUS_FRAME_WIDTH, FOCUS_FRAME_HEIGHT, NULL)
+              && memcmp(fast_focus_frame, full_focus_frame,
+                        focus_frame_pixels * sizeof(*fast_focus_frame)) == 0);
+        tile_cache_destroy(&full_focus_cache);
+        tile_cache_destroy(&fast_focus_cache);
+    }
     budget_free(&budget, full_focus_frame);
     budget_free(&budget, fast_focus_frame);
 
@@ -1730,7 +1986,70 @@
     navigation_destroy(&focus_invalidation_navigation);
     CHECK(budget.current == 0);
 
+    {
+        puts("test: inset focus reservation is capped and excess falls back to layout");
+        char page[8192];
+        size_t used = (size_t) snprintf(page, sizeof(page),
+            "<!doctype html><style>button{border:1px solid #777;border-radius:2px}"
+            "button:focus{box-shadow:inset 0 0 0 2px #36c}</style><body>");
+        for (unsigned i = 0; i < 65; i++) {
+            int written = snprintf(page + used, sizeof(page) - used,
+                "<button id=b%u>Button</button>", i);
+            CHECK(written > 0 && (size_t) written < sizeof(page) - used);
+            used += (size_t) written;
+        }
+        static NavigationSession session;
+        CHECK(navigation_init(&session, &budget, 2));
+        navigation_enable_scripts(&session, 4 * MIB, 1000);
+        uint64_t generation = navigation_begin(&session);
+        CHECK(navigation_commit_html(&session, generation, "https://focus.test/cap",
+                                    page, used, 480, NULL, NULL, true));
+        size_t slots = 0;
+        for (size_t i = 0; i < session.page.layout.count; i++)
+            if (session.page.layout.commands[i].type == DRAW_STROKE_RECT
+                && session.page.layout.commands[i].image_fit == LAYOUT_STROKE_FOCUS_INSET)
+                slots++;
+        CHECK(slots == 64);
+        BrowserController controller;
+        CHECK(controller_init(&controller, &session));
+        lxb_dom_node_t *last = find_id(lxb_dom_interface_node(session.page.document.html), "b64");
+        size_t relayouts = session.incremental_relayouts;
+        CHECK(controller_focus_node(&controller, last)
+              && session.incremental_relayouts == relayouts + 1);
+        navigation_destroy(&session);
+        CHECK(budget.current == 0);
+    }
+
     puts("test: relational and inherited focus dependencies force layout");
+    {
+        static const char *const refusals[] = {
+            "button:focus{box-shadow:inset 1px 0 0 2px #36c}",
+            "button:focus{box-shadow:inset 0 0 2px 2px #36c}",
+            "button:focus{box-shadow:inset 0 0 0 1px #36c,inset 0 0 0 2px #fff}",
+            "body{opacity:.5}button:focus{box-shadow:inset 0 0 0 1px #36c}",
+            "button{background:red;border-color:transparent}button:focus{border-color:blue}"
+        };
+        for (size_t i = 0; i < sizeof(refusals) / sizeof(refusals[0]); i++) {
+            char page[1024];
+            int length = snprintf(page, sizeof(page),
+                "<!doctype html><style>button{border:1px solid #777;border-radius:2px}%s"
+                "</style><body><button id=b>Button</button>", refusals[i]);
+            CHECK(length > 0 && (size_t) length < sizeof(page));
+            static NavigationSession session;
+            CHECK(navigation_init(&session, &budget, 2));
+            navigation_enable_scripts(&session, 4 * MIB, 1000);
+            uint64_t generation = navigation_begin(&session);
+            CHECK(navigation_commit_html(&session, generation, "https://focus.test/complex",
+                                        page, (size_t) length, 480, NULL, NULL, true));
+            BrowserController controller;
+            CHECK(controller_init(&controller, &session));
+            size_t relayouts = session.incremental_relayouts;
+            CHECK(controller_focus_next(&controller)
+                  && session.incremental_relayouts == relayouts + 1);
+            navigation_destroy(&session);
+            CHECK(budget.current == 0);
+        }
+    }
     static const char focus_dependency_page[] =
         "<!doctype html><style>"
         "body:has(.has-source:focus-visible) .has-target{color:#ff0000}"
@@ -1742,7 +2061,7 @@
         "<span class=has-target>REMOTE</span>"
         "<div class=within><input id=within><span class=within-target>WITHIN</span></div>"
         "<button class=custom id=custom>CUSTOM<span>CHILD</span></button>";
-    NavigationSession focus_dependency_navigation;
+    static NavigationSession focus_dependency_navigation;
     CHECK(navigation_init(&focus_dependency_navigation, &budget, 2));
     navigation_enable_scripts(&focus_dependency_navigation, 4 * MIB, 1000);
     uint64_t focus_dependency_generation =
@@ -1796,7 +2115,7 @@
                      < sizeof(focus_page) - focus_page_length);
         focus_page_length += (size_t) written;
     }
-    NavigationSession bounded_focus_navigation;
+    static NavigationSession bounded_focus_navigation;
     CHECK(navigation_init(&bounded_focus_navigation, &budget, 2));
     navigation_enable_scripts(&bounded_focus_navigation, 4 * MIB, 1000);
     uint64_t bounded_focus_generation =
@@ -1880,7 +2199,7 @@
         "events.includes('close:true')&&events.includes('toggle:closed>open:true')"
         "?'modal-popover:ok':'modal-popover:'+events.join('|');document.getElementById('result')."
         "textContent=pocSummary;</script></body>";
-    NavigationSession modal_navigation;
+    static NavigationSession modal_navigation;
     CHECK(navigation_init(&modal_navigation, &budget, 2));
     navigation_enable_scripts(&modal_navigation, 3 * MIB, 1000);
     uint64_t modal_generation = navigation_begin(&modal_navigation);
@@ -1922,7 +2241,7 @@
     navigation_destroy(&modal_navigation);
     CHECK(budget.current == 0);
 
-    puts("test: details disclosure activation");
+    puts("test: details disclosure activation while background work is pending");
     static const char details_page[] =
         "<!doctype html><body><details id=disclosure><summary id=summary>More"
         " information</summary><p id=secret>DISCLOSED CONTENT</p></details>"
@@ -1934,8 +2253,11 @@
         "globalThis.pocSummary=opened&&!details.open&&summary instanceof "
         "HTMLSummaryElement&&details instanceof HTMLDetailsElement&&details."
         "getAttribute('data-toggle')==='open>closed:true'?'details:ok':'details:fail';"
-        "document.getElementById('result').textContent=pocSummary;</script></body>";
-    NavigationSession details_navigation;
+        "document.getElementById('result').textContent=pocSummary;"
+        "let backgroundSteps=0;function backgroundStep(){backgroundSteps++;"
+        "if(backgroundSteps<8)setTimeout(backgroundStep,0);}"
+        "setTimeout(backgroundStep,0);</script></body>";
+    static NavigationSession details_navigation;
     CHECK(navigation_init(&details_navigation, &budget, 2));
     navigation_enable_scripts(&details_navigation, 3 * MIB, 1000);
     uint64_t details_generation = navigation_begin(&details_navigation);
@@ -1943,6 +2265,9 @@
               &details_navigation, details_generation,
               "https://details.test/", details_page, strlen(details_page),
               480, NULL, NULL, true)
+          && details_navigation.page.script_result.pending_tasks > 0
+          && navigation_advance_runtime(&details_navigation, 1, 1)
+          && details_navigation.page.script_result.pending_tasks > 0
           && strcmp(details_navigation.page.script_result.summary,
                     "details:ok") == 0
           && command_x(&details_navigation.page.layout,
@@ -1963,7 +2288,8 @@
           && attribute_equals(details_node, "data-toggle",
                               "closed>open:true")
           && command_x(&details_navigation.page.layout,
-                       "DISCLOSED") >= 0);
+                       "DISCLOSED") >= 0
+          && details_navigation.page.script_result.pending_tasks > 0);
     CHECK(controller_focus_node(&details_controller, summary_node)
           && controller_activate(&details_controller, &details_action)
           && !lxb_dom_element_has_attribute(
@@ -1972,7 +2298,8 @@
           && attribute_equals(details_node, "data-toggle",
                               "open>closed:true")
           && command_x(&details_navigation.page.layout,
-                       "DISCLOSED") < 0);
+                       "DISCLOSED") < 0
+          && details_navigation.page.script_result.pending_tasks > 0);
     navigation_destroy(&details_navigation);
     CHECK(budget.current == 0);
 
@@ -1996,7 +2323,7 @@
         "cancel-sees:true|radio-click:false:true'?'choices:ok':'choices:'+events."
         "join('|');document.getElementById('result').textContent=pocSummary;"
         "</script></body>";
-    NavigationSession choice_navigation;
+    static NavigationSession choice_navigation;
     CHECK(navigation_init(&choice_navigation, &budget, 2));
     navigation_enable_scripts(&choice_navigation, 3 * MIB, 1000);
     uint64_t choice_generation = navigation_begin(&choice_navigation);
@@ -2088,7 +2415,7 @@
         "getAll('many').join(',')==='x,y';globalThis.pocSummary=initial&&changed&&"
         "multiple?'select:ok':'select:fail';document.getElementById('result')."
         "textContent=pocSummary;</script></body>";
-    NavigationSession select_navigation;
+    static NavigationSession select_navigation;
     CHECK(navigation_init(&select_navigation, &budget, 2));
     navigation_enable_scripts(&select_navigation, 3 * MIB, 1000);
     uint64_t select_generation = navigation_begin(&select_navigation);
@@ -2155,7 +2482,7 @@
         "kind:true|field:true:false|field:true:false'?'validation:ok':'validation:'"
         "+invalid.join('|');document.getElementById('result').textContent=pocSummary;"
         "</script></body>";
-    NavigationSession validation_navigation;
+    static NavigationSession validation_navigation;
     CHECK(navigation_init(&validation_navigation, &budget, 2));
     navigation_enable_scripts(&validation_navigation, 3 * MIB, 1000);
     uint64_t validation_generation = navigation_begin(&validation_navigation);
@@ -2198,7 +2525,7 @@
         "events.join('|')==='click:true:false|input:true:true|change:true:true'"
         "?'label:ok':'label:'+events.join('|');document.getElementById('result')."
         "textContent=pocSummary;</script></body>";
-    NavigationSession label_navigation;
+    static NavigationSession label_navigation;
     CHECK(navigation_init(&label_navigation, &budget, 2));
     navigation_enable_scripts(&label_navigation, 3 * MIB, 1000);
     uint64_t label_generation = navigation_begin(&label_navigation);
@@ -2238,7 +2565,7 @@
         "globalThis.pocSummary=!missing&&bytes instanceof Uint8Array"
         "&&document.documentElement.querySelectorAll('body').length===1"
         "?'TRACE-SEMANTICS-OK':'TRACE-SEMANTICS-BAD'";
-    NavigationSession capability_trace_navigation;
+    static NavigationSession capability_trace_navigation;
     CHECK(navigation_init(&capability_trace_navigation, &budget, 2));
     navigation_enable_scripts(&capability_trace_navigation, 4 * MIB, 1000);
     navigation_enable_page_capability_trace(
@@ -2304,7 +2631,7 @@
         "animation:spin 1s linear infinite}</style><body>"
         "<div id=spinner></div><script>globalThis.motionReady=true</script>"
         "</body>";
-    NavigationSession motion_navigation;
+    static NavigationSession motion_navigation;
     CHECK(navigation_init(&motion_navigation, &budget, 2));
     navigation_enable_scripts(&motion_navigation, 4 * MIB, 1000);
     uint64_t motion_generation = navigation_begin(&motion_navigation);
@@ -2343,7 +2670,7 @@
         "shell.scrollTo({top:100,behavior:'smooth'});"
         "setTimeout(()=>{globalThis.pocSummary+='|'+shell.scrollTop},240)"
         "</script></body>";
-    NavigationSession smooth_scroll_navigation;
+    static NavigationSession smooth_scroll_navigation;
     CHECK(navigation_init(&smooth_scroll_navigation, &budget, 2));
     navigation_enable_scripts(&smooth_scroll_navigation, 4 * MIB, 1000);
     uint64_t smooth_scroll_generation =

@@ -89,22 +89,20 @@ static void navigation_record_blocking_script_sample(
 }
 
 #if !defined(__PSP__)
-static NavigationParserCheckpointTestFault
-    navigation_parser_checkpoint_test_fault;
-
 void navigation_test_refuse_next_parser_checkpoint(
     NavigationParserCheckpointTestFault fault)
 {
-    navigation_parser_checkpoint_test_fault = fault;
+    tilefinch_test_faults()->parser_checkpoint_fault = (unsigned) fault;
 }
 
 static bool navigation_test_consume_parser_checkpoint_fault(
     NavigationParserCheckpointTestFault fault)
 {
+    TilefinchTestFaults *faults = tilefinch_test_faults();
     if (fault == NAVIGATION_TEST_PARSER_CHECKPOINT_NONE
-        || navigation_parser_checkpoint_test_fault != fault) return false;
-    navigation_parser_checkpoint_test_fault =
-        NAVIGATION_TEST_PARSER_CHECKPOINT_NONE;
+        || faults->parser_checkpoint_fault != (unsigned) fault) return false;
+    faults->parser_checkpoint_fault =
+        (unsigned) NAVIGATION_TEST_PARSER_CHECKPOINT_NONE;
     return true;
 }
 #else

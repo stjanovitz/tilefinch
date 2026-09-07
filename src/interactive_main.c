@@ -1533,6 +1533,15 @@ int main(int argc, char **argv)
     }
     if (navigation.page.runtime != NULL) {
         script_runtime_report_memory(navigation.page.runtime, stdout);
+        if (getenv("TILEFINCH_DUMP_FRAME_MEMORY") != NULL) {
+            for (size_t i = 0; i < navigation.page.frame_count; i++) {
+                NavigationFrame *frame = &navigation.page.frames[i];
+                if (frame->runtime == NULL) continue;
+                printf("script-memory-frame realm=child handle=%ld\n",
+                       frame->parent_handle);
+                script_runtime_report_memory(frame->runtime, stdout);
+            }
+        }
         if (getenv("TILEFINCH_TRACE_JS_ROOTS") != NULL) {
             script_runtime_report_roots(navigation.page.runtime, stdout,
                                         "post-ticks", "top", 0);
@@ -1899,6 +1908,24 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     budget_mark_phase(budget, "render");
+
+    BrowserNavigationJobMetrics job_metrics = {0};
+    if (browser_engine_navigation_job_metrics(engine, &job_metrics)
+        && job_metrics.adapter_commit_us != 0) {
+        printf("provider-load-us elapsed=%llu request=%llu transport=%llu "
+               "commit=%llu parse=%llu style=%llu resources=%llu layout=%llu "
+               "transform-slices=%zu max-transform=%llu\n",
+               (unsigned long long) job_metrics.elapsed_us,
+               (unsigned long long) job_metrics.adapter_request_wall_us,
+               (unsigned long long) job_metrics.adapter_transport_total_us,
+               (unsigned long long) job_metrics.adapter_commit_us,
+               (unsigned long long) job_metrics.adapter_parse_us,
+               (unsigned long long) job_metrics.adapter_style_us,
+               (unsigned long long) job_metrics.adapter_resource_us,
+               (unsigned long long) job_metrics.adapter_layout_us,
+               job_metrics.transform_slices,
+               (unsigned long long) job_metrics.maximum_transform_slice_us);
+    }
 
     printf("interactive status=ok title=\"%s\" height=%d scroll-y=%d links=%zu controls=%zu "
            "ticks=%zu callbacks=%zu pending=%zu relayouts=%zu\n",
@@ -3346,6 +3373,19 @@ cleanup:
     interactive_media_destroy(&media);
 #endif
     if (!success && navigation_ready) {
+        if (getenv("TILEFINCH_DUMP_FRAME_MEMORY") != NULL) {
+            if (navigation.page.runtime != NULL) {
+                fprintf(stderr, "script-memory-frame realm=top handle=0\n");
+                script_runtime_report_memory(navigation.page.runtime, stderr);
+            }
+            for (size_t i = 0; i < navigation.page.frame_count; i++) {
+                NavigationFrame *frame = &navigation.page.frames[i];
+                if (frame->runtime == NULL) continue;
+                fprintf(stderr, "script-memory-frame realm=child handle=%ld\n",
+                        frame->parent_handle);
+                script_runtime_report_memory(frame->runtime, stderr);
+            }
+        }
         if (trace_frames) {
             (void) navigation_collect_frame_capability_trace(&navigation);
         }

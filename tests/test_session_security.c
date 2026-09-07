@@ -1253,6 +1253,49 @@ static int test_typed_response_security_and_request_authority(Budget *budget)
           && request->enforce_cors
           && fetch_request_validate(request, NULL));
 
+    /* A cross-site frame or subresource cannot cause high-entropy hints to
+       follow it away from the top-level site. */
+    CHECK(browser_session_client_hints_put(
+        &session, context.target_url,
+        "Sec-CH-UA-Arch, Sec-CH-UA-Bitness"));
+    transport.send_low_client_hints = true;
+    transport.send_client_hints = true;
+    transport.client_hint_tokens = "Sec-CH-UA-Arch";
+    transport.client_hint_origin = "https://api.other.test";
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, "strict-origin-when-cross-origin",
+        &session, NULL, NULL, &transport, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    CHECK(request != NULL && !request->send_client_hints
+          && request->client_hint_origin == NULL
+          && request->client_hint_tokens == NULL);
+    transport.send_client_hints = false;
+    transport.client_hint_tokens = NULL;
+    transport.client_hint_origin = NULL;
+    context.target_url = "https://assets.page.test/data";
+    CHECK(browser_session_client_hints_put(
+              &session, context.target_url,
+              "Sec-CH-UA-Arch, Sec-CH-UA-Bitness")
+          && fetch_prepare_page_request_context(
+              &context, context.initiator_url,
+              "strict-origin-when-cross-origin", &session, NULL, NULL,
+              &transport, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    CHECK(request != NULL && request->send_client_hints
+          && strcmp(request->client_hint_origin,
+                    "https://assets.page.test") == 0
+          && strcmp(request->client_hint_tokens,
+                    "Sec-CH-UA-Arch, Sec-CH-UA-Bitness") == 0);
+    context.target_url = "https://unhinted.test/data";
+    CHECK(fetch_prepare_page_request_context(
+        &context, context.initiator_url, "strict-origin-when-cross-origin",
+        &session, NULL, NULL, &transport, &prepared, NULL));
+    request = fetch_prepared_page_request(&prepared);
+    CHECK(request != NULL && !request->send_client_hints
+          && request->client_hint_tokens == NULL
+          && request->client_hint_origin == NULL);
+    context.target_url = "https://api.other.test/data";
+
     FetchRequest forged = *request;
     forged.prepared_page_version = 0;
     CHECK(!fetch_request_validate(&forged, NULL));
@@ -1286,6 +1329,11 @@ static int test_site_data_inspection_and_clear(Budget *budget)
           && browser_session_storage_set(
               &session, "https://www.example.test/page", false,
               "session", "value", 5));
+    CHECK(browser_session_client_hints_put(
+              &session, "https://www.example.test/page",
+              "Sec-CH-UA-Arch")
+          && browser_session_client_hints_put(
+              &session, "https://other.test/", "Sec-CH-UA-Bitness"));
     BrowserSiteDataUsage usage = {0};
     CHECK(browser_session_site_data_usage(
               &session, "https://www.example.test/elsewhere", &usage)
@@ -1300,6 +1348,13 @@ static int test_site_data_inspection_and_clear(Budget *budget)
           && usage.cookie_count == 0
           && usage.local_storage_count == 0
           && usage.session_storage_count == 0);
+    char hint_tokens[64], hint_origin[128];
+    CHECK(!browser_session_client_hints_get(
+              &session, "https://www.example.test/", hint_tokens,
+              sizeof(hint_tokens), hint_origin, sizeof(hint_origin))
+          && browser_session_client_hints_get(
+              &session, "https://other.test/", hint_tokens,
+              sizeof(hint_tokens), hint_origin, sizeof(hint_origin)));
     char cookies[64];
     CHECK(browser_session_cookie_header(
               &session, "https://other.test/", cookies, sizeof(cookies))

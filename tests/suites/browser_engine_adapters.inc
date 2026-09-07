@@ -1,5 +1,46 @@
 static int test_cooperative_site_adapter_navigation(void)
 {
+    /* Identity facts at the front of a large response must not make Home
+       scan irrelevant trailing content. Missing facts still use the bounded
+       complete scan. This isolates identity work from result JSON parsing. */
+    for (unsigned has_identity = 0; has_identity < 2; has_identity++) {
+        Budget identity_budget;
+        budget_init(&identity_budget, 8u * MIB);
+        BrowserSession identity_session;
+        char fixture_path[128], identity_error[256] = {0};
+        size_t source_bytes = 0;
+        CHECK(write_large_youtube_replay_configured(fixture_path, &source_bytes,
+            "https://m.youtube.com/", has_identity != 0));
+        CHECK(browser_session_init(&identity_session, &identity_budget, 512u * 1024u)
+            && fetch_trace_replay_begin(fixture_path, identity_error, sizeof(identity_error)));
+        YoutubeLiteLoadJob *job = youtube_lite_load_begin(&identity_budget,
+            &identity_session, "https://m.youtube.com/", 1u * MIB, 2000,
+            identity_error, sizeof(identity_error));
+        CHECK(job != NULL);
+        YoutubeLiteLoadStatus job_status = YOUTUBE_LITE_LOAD_PENDING;
+        for (size_t i = 0; i < 512 && job_status == YOUTUBE_LITE_LOAD_PENDING; i++) {
+            job_status = youtube_lite_load_pump(job, NULL);
+        }
+        YoutubeLiteLoadMetrics identity_metrics = {0};
+        YoutubeLiteDocument home = {0};
+        CHECK(job_status == YOUTUBE_LITE_LOAD_SUCCEEDED
+            && youtube_lite_load_metrics(job, &identity_metrics)
+            && youtube_lite_load_take_document(job, &home)
+            && strstr(home.html, "yt-search") != NULL);
+        CHECK(has_identity ? identity_metrics.build_slices < 20u
+                           : identity_metrics.build_slices >= 48u);
+        YoutubeLiteResolverIdentity identity_result = {0};
+        if (has_identity) CHECK(youtube_lite_resolver_identity_get(
+            &identity_session, &identity_result)
+            && strcmp(identity_result.api_key, "fixture-key") == 0
+            && strcmp(identity_result.visitor, "fixture-visitor") == 0);
+        youtube_lite_document_destroy(&home);
+        youtube_lite_load_destroy(job);
+        fetch_trace_end();
+        browser_session_destroy(&identity_session);
+        remove_large_youtube_replay(fixture_path);
+        CHECK(identity_budget.current == 0 && identity_budget.external_reserved == 0);
+    }
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
     BrowserConfig config;
@@ -8,6 +49,8 @@ static int test_cooperative_site_adapter_navigation(void)
     config.session_cache_limit = 512u * 1024u;
     config.maximum_document_bytes = 1u * MIB;
     config.tile_capacity = 0;
+    config.resources.enabled = true;
+    config.resources.web_fonts_enabled = false;
     char error[256] = {0};
     BrowserEngine *engine = browser_engine_create(
         &config, error, sizeof(error));
@@ -189,6 +232,10 @@ static int test_cooperative_site_adapter_navigation(void)
           && strstr(body_text, "View full description") != NULL
           && strstr(body_text, "View comments") != NULL
           && strstr(body_text, "Cooperative comment") == NULL);
+    /* The play card is usable before its nonessential poster is fetched. */
+    CHECK(browser_engine_navigation(engine)->page.deferred_image_count > 0
+          && browser_engine_navigation(engine)->performance.progressive_image_priority_nodes == 0
+          && browser_engine_navigation(engine)->performance.progressive_image_priority_loaded == 0);
     ControllerAction watch_play = {0};
     CHECK(browser_engine_activate(engine, &watch_play)
           && watch_play.type == CONTROLLER_ACTION_NAVIGATE
@@ -741,8 +788,6 @@ static int test_cooperative_site_adapter_navigation(void)
     return 0;
 }
 
-static lxb_dom_node_t *test_reader_find_id(lxb_dom_node_t *root,
-                                           const char *id);
 static lxb_dom_node_t *test_reader_root_node(PocDocument *document);
 
 static int test_google_search_compatibility_adapter(void)
@@ -3129,7 +3174,7 @@ static lxb_dom_node_t *test_reader_first_image(lxb_dom_node_t *root)
     return NULL;
 }
 
-static lxb_dom_node_t *test_reader_find_id(lxb_dom_node_t *root,
+lxb_dom_node_t *test_reader_find_id(lxb_dom_node_t *root,
                                            const char *wanted)
 {
     lxb_dom_node_t *node = root;

@@ -335,6 +335,7 @@ const char *psp_ui_action_acknowledgement(PspUiAction action)
         case PSP_UI_ACTION_VOICE_FOCUSED_TEXT:
             return "STARTING EXPERIMENTAL VOICE INPUT...";
         case PSP_UI_ACTION_HOME: return "OPENING HOME...";
+        case PSP_UI_ACTION_HOME_ACTIVATE: return "OPENING...";
         case PSP_UI_ACTION_SAVE_FOR_LATER: return "SAVING ARTICLE...";
         case PSP_UI_ACTION_INSTALL_OFFLINE_APP:
             return "PREPARING INSTALL PREVIEW...";
@@ -385,6 +386,28 @@ const char *psp_ui_action_acknowledgement(PspUiAction action)
         default:
             return NULL;
     }
+}
+
+bool psp_present_action_ack(const uint16_t *frame, PspUiState *ui,
+                           PspUiAction action, const char *message,
+                           uint64_t input_started_us)
+{
+    (void) input_started_us;
+    if (frame == NULL || ui == NULL || message == NULL) return false;
+    (void) psp_ui_set_page_activation(ui, action == PSP_UI_ACTION_ACTIVATE);
+    psp_ui_show_status(ui, message, 90);
+    bool shown = psp_present_internal(frame, ui, true);
+    if (!shown) return false;
+    printf("tilefinch-input-ack: action=%s immediate=yes\n",
+           psp_ui_action_name(action));
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (ui->page_activation_busy) {
+        printf("tilefinch-activation-feedback: shown=1 elapsed=%lluus\n",
+               (unsigned long long) (sceKernelGetSystemTimeWide()
+                   - input_started_us));
+    }
+#endif
+    return true;
 }
 
 #define PSP_SCREENSHOT_LIST_LIMIT 32u

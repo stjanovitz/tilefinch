@@ -15,15 +15,23 @@ typedef struct {
 /* ReferThreadStatus is the firmware-supported nonblocking observation. Keep
    the required size initialization here so a new caller cannot reproduce the
    PPSSPP-green/PSP-illegal-argument class of failure. */
+static inline int psp_thread_snapshot(
+    SceUID thread, SceKernelThreadInfo *info)
+{
+    if (info == NULL)
+        return (int) SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
+    memset(info, 0, sizeof(*info));
+    info->size = sizeof(*info);
+    return sceKernelReferThreadStatus(thread, info);
+}
+
 static inline int psp_thread_observe(
     SceUID thread, PspThreadObservation *observation)
 {
     if (observation == NULL)
         return (int) SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
     SceKernelThreadInfo info;
-    memset(&info, 0, sizeof(info));
-    info.size = sizeof(info);
-    int result = sceKernelReferThreadStatus(thread, &info);
+    int result = psp_thread_snapshot(thread, &info);
     if (result >= 0) {
         observation->status = (uint32_t) info.status;
         observation->exit_status = info.exitStatus;

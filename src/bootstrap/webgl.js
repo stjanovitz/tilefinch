@@ -243,17 +243,6 @@
       if (current !== output) output.set(current);
       return output;
     },
-    finiteArray = (value, count) => {
-      if (!ArrayBuffer.isView(value) && !Array.isArray(value)) return null;
-      if (value.length < count) return null;
-      const output = new Float32Array(count);
-      for (let i = 0; i < count; i++) {
-        const number = Number(value[i]);
-        if (!Number.isFinite(number)) return null;
-        output[i] = number;
-      }
-      return output;
-    },
     shaderText = (source) => String(source).replace(
       /\/\*[\s\S]*?\*\/|\/\/[^\n\r]*/g, " ",
     ),
@@ -374,17 +363,6 @@
       wireU32[base + slot + 3] = attribute?.normalized ? 1 : 0;
       wireU32[base + slot + 4] = attribute?.stride || 0;
       wireU32[base + slot + 5] = attribute?.offset || 0;
-    },
-    writeLiveCommandAttribute = (context, wireI32, wireU32, base, slot,
-                                 attribute, sources, sourceMap) => {
-      const buffer = attribute?.enabled ? attribute.buffer : null;
-      wireI32[base + slot] = context._sourceIndex(
-        sources, sourceMap, buffer?._data);
-      wireI32[base + slot + 1] = buffer ? attribute.size : 0;
-      wireI32[base + slot + 2] = buffer ? attribute.type : 0;
-      wireU32[base + slot + 3] = buffer && attribute.normalized ? 1 : 0;
-      wireU32[base + slot + 4] = buffer ? attribute.stride : 0;
-      wireU32[base + slot + 5] = buffer ? attribute.offset : 0;
     },
     writeLiveSourceIdentity = (wire, base, slot, attribute) => {
       const buffer = attribute?.enabled ? attribute.buffer : null;
