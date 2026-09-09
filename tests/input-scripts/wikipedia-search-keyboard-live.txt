@@ -1,9 +1,16 @@
-# Main Page -> cursor click -> real Danzeff ps p -> R+Start -> form action.
+# Main Page search icon -> search form -> Danzeff psp -> R+Start.
+# The 480px layout exposes the icon, not the old wide-layout text field.
 wait-page 2
 tap-page triangle
 wait-page 2
-stick-page 18 right
+stick-page 26 right
 stick-page 16 up
+tap-page cross
+wait-page 2
+# The separate form is near the left edge, below the page heading.
+stick-page 70 left
+stick-page 6 right
+stick-page 20 down
 mark-page search-field
 tap-page cross
 wait 4

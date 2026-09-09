@@ -1427,6 +1427,9 @@ struct BudgetQuickJSPool {
     size_t largest_request;
     size_t peak_dump_watermark;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+    size_t rejected_old_bytes;
+    size_t rejected_new_bytes;
+    size_t rejected_live_bytes;
     uint64_t allocation_calls;
     uint64_t free_calls;
     uint64_t reallocation_calls;
@@ -1806,6 +1809,13 @@ static void bellard_pool_record_reject(const JSMallocState *state,
     if (pool != NULL && pool->rejection_count != SIZE_MAX) {
         pool->rejection_count++;
     }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (pool != NULL) {
+        pool->rejected_old_bytes = old_size;
+        pool->rejected_new_bytes = size;
+        pool->rejected_live_bytes = state->malloc_size;
+    }
+#endif
     if (bellard_pool_reject_count
         >= sizeof(bellard_pool_rejects) / sizeof(bellard_pool_rejects[0])) {
         return;
@@ -1816,6 +1826,18 @@ static void bellard_pool_record_reject(const JSMallocState *state,
     reject->size = size;
     reject->live = state->malloc_size;
     reject->limit = state->malloc_limit;
+#if !defined(__PSP__) && !defined(TILEFINCH_NO_TRACE)
+    static int trace_stack = -1;
+    if (trace_stack < 0)
+        trace_stack = getenv("TILEFINCH_TRACE_JS_REJECT_STACK") != NULL;
+    if (trace_stack) {
+        void *frames[32];
+        int frame_count = backtrace(frames, 32);
+        fprintf(stderr, "js-heap-reject-stack old=%zu size=%zu live=%lld\n",
+                old_size, size, (long long) state->malloc_size);
+        backtrace_symbols_fd(frames, frame_count, 2);
+    }
+#endif
 }
 
 /* Big-request forensics: a lone exact-size malloc is a rope
@@ -2046,16 +2068,6 @@ static void *bellard_pool_realloc(JSMallocState *state, void *pointer,
     if (!bellard_growth_allowed(state, old_size, size)) {
         bellard_pool_record_reject(state, old_size, size);
         bellard_pool_capture_prefix(pointer, old_size, size);
-#if !defined(__PSP__)
-        if (getenv("TILEFINCH_TRACE_JS_REJECT_STACK") != NULL) {
-            void *frames[32];
-            int frame_count = backtrace(frames, 32);
-            fprintf(stderr,
-                    "js-heap-reject-stack old=%zu size=%zu live=%lld\n",
-                    old_size, size, (long long) state->malloc_size);
-            backtrace_symbols_fd(frames, frame_count, 2);
-        }
-#endif
         return NULL;
     }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
@@ -2177,6 +2189,9 @@ void budget_quickjs_pool_activity(const BudgetQuickJSPool *pool,
     activity->live_bytes = pool->js_malloc_current;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     activity->allocation_calls = pool->allocation_calls;
+    activity->rejected_old_bytes = pool->rejected_old_bytes;
+    activity->rejected_new_bytes = pool->rejected_new_bytes;
+    activity->rejected_live_bytes = pool->rejected_live_bytes;
     activity->free_calls = pool->free_calls;
     activity->reallocation_calls = pool->reallocation_calls;
     activity->allocated_bytes = pool->allocated_bytes;

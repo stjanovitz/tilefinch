@@ -7,6 +7,8 @@
 #include "tilefinch/session.h"
 #include "tilefinch/url.h"
 #include "tilefinch/user_agent.h"
+#include "../src/js_runtime_internal.h"
+#include "tilefinch/budget_quickjs.h"
 
 #include <stdbool.h>
 #include <stdint.h>

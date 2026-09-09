@@ -1413,13 +1413,35 @@ static bool bridge_mutation_record_equal(
 
 static void bridge_mutation_journal_append(
     DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
-    const char *attribute, size_t attribute_length)
+    const char *attribute, size_t attribute_length,
+    const uint32_t *changed_tokens, size_t changed_token_count)
 {
     ScriptMutationJournal *journal = &bridge->mutations;
     for (size_t reverse = journal->count; reverse != 0; reverse--) {
+        ScriptMutationRecord *record = &journal->records[reverse - 1];
         if (bridge_mutation_record_equal(
-                &journal->records[reverse - 1], kind, node, attribute,
-                attribute_length)) return;
+                record, kind, node, attribute, attribute_length)) {
+            /* Coalescing the node/attribute must retain every dependency
+               changed during this turn, not just the first write's tokens. */
+            if (changed_tokens == NULL
+                || changed_token_count > SCRIPT_MUTATION_TOKEN_LIMIT) {
+                record->changed_tokens_exact = false;
+            } else if (record->changed_tokens_exact) {
+                for (size_t i = 0; i < changed_token_count; i++) {
+                    size_t at = 0;
+                    while (at < record->changed_token_count
+                           && record->changed_tokens[at] != changed_tokens[i]) at++;
+                    if (at < record->changed_token_count) continue;
+                    if (at == SCRIPT_MUTATION_TOKEN_LIMIT) {
+                        record->changed_tokens_exact = false;
+                        break;
+                    }
+                    record->changed_tokens[record->changed_token_count++] = changed_tokens[i];
+                }
+            }
+            if (!record->changed_tokens_exact) record->changed_token_count = 0;
+            return;
+        }
     }
     if (journal->count >= SCRIPT_MUTATION_JOURNAL_LIMIT) {
         journal->overflowed = true;
@@ -1431,6 +1453,7 @@ static void bridge_mutation_journal_append(
     ScriptMutationRecord *record = &journal->records[journal->count++];
     record->kind = kind;
     record->node = node;
+    record->inserted_from_detached = false;
     record->owner_document_identity = js_rt_node_owner_identity(node);
     size_t copy_length = attribute == NULL ? 0 : attribute_length;
     if (copy_length >= sizeof(record->attribute)) {
@@ -1441,12 +1464,22 @@ static void bridge_mutation_journal_append(
             (unsigned char) attribute[i]);
     }
     record->attribute[copy_length] = '\0';
+    record->changed_tokens_exact = changed_tokens != NULL
+        && changed_token_count <= SCRIPT_MUTATION_TOKEN_LIMIT;
+    record->changed_token_count = 0;
+    if (record->changed_tokens_exact) {
+        record->changed_token_count = (uint8_t) changed_token_count;
+        for (size_t i = 0; i < changed_token_count; i++) {
+            record->changed_tokens[i] = changed_tokens[i];
+        }
+    }
 }
 
 static void bridge_mutated_with_relational(
     DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
     const char *attribute, size_t attribute_length,
-    bool relational_selector_sensitive)
+    bool relational_selector_sensitive, const uint32_t *changed_tokens,
+    size_t changed_token_count)
 {
     if (bridge == NULL) return;
     /* Mutating a detached construction tree cannot affect layout or the
@@ -1473,7 +1506,8 @@ static void bridge_mutated_with_relational(
 
     ScriptMutationJournal *journal = &bridge->mutations;
     bridge_mutation_journal_append(
-        bridge, kind, node, attribute, attribute_length);
+        bridge, kind, node, attribute, attribute_length, changed_tokens,
+        changed_token_count);
 
     bool resource_rebuild = false;
     bool image_resource_scan = false;
@@ -1569,8 +1603,19 @@ static void bridge_mutated_with_relational(
         conservative_scan = true;
         break;
     }
+    /* A class/id change whose tokens no rule able to affect display,
+       visibility or an image depends on cannot reveal or hide an image. */
+    bool identity_bounded = kind == SCRIPT_MUTATION_ATTRIBUTE
+        && changed_tokens != NULL && bridge->stylesheet != NULL
+#ifndef TILEFINCH_NO_TRACE
+        && getenv("TILEFINCH_DISABLE_DISCOVERY_GATE") == NULL
+#endif
+        && (bridge_mutation_name_equal(attribute, attribute_length, "class")
+            || bridge_mutation_name_equal(attribute, attribute_length, "id"))
+        && !stylesheet_tokens_may_affect_discovery(
+               bridge->stylesheet, changed_tokens, changed_token_count);
     bool descendant_image_sensitive =
-        node != NULL
+        node != NULL && !identity_bounded
         && (bridge_mutation_inside_svg(node)
             || ((kind == SCRIPT_MUTATION_ATTRIBUTE
                  || kind == SCRIPT_MUTATION_INLINE_STYLE)
@@ -1644,13 +1689,13 @@ void js_rt_bridge_note_canvas_mutation(DomBridge *bridge,
         if (bridge->relayout_dirty != NULL) *bridge->relayout_dirty = true;
         bridge_mutation_journal_append(
             bridge, SCRIPT_MUTATION_CANVAS, node,
-            paint, sizeof(paint) - 1u);
+            paint, sizeof(paint) - 1u, NULL, 0);
         return;
     }
     bridge_mutated_with_relational(
         bridge, SCRIPT_MUTATION_CANVAS, node,
         structure, sizeof(structure) - 1u,
-        false);
+        false, NULL, 0);
 }
 
 static void bridge_mutated(DomBridge *bridge, ScriptMutationKind kind,
@@ -1660,7 +1705,7 @@ static void bridge_mutated(DomBridge *bridge, ScriptMutationKind kind,
 {
     /* Callers without exact pre-mutation state remain conservative. */
     bridge_mutated_with_relational(
-        bridge, kind, node, attribute, attribute_length, true);
+        bridge, kind, node, attribute, attribute_length, true, NULL, 0);
 }
 
 JSValue js_dom_body(JSContext *context, JSValueConst this_value,
@@ -2212,6 +2257,53 @@ JSValue js_dom_relation(JSContext *context,
     }
     if (related != NULL && !bridge_node_visible(bridge, related)) related = NULL;
     return JS_NewInt64(context, js_rt_bridge_register_node(bridge, related));
+}
+
+/* DOM order needs no wrapper for ancestors or siblings. Keep this constant
+   stack and bounded even for detached trees; JS handles virtual/shadow trees. */
+JSValue js_dom_compare_position(JSContext *context,
+                                JSValueConst this_value,
+                                int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t handles[2];
+    size_t slots[2];
+    if (argc < 2 || bridge == NULL) return JS_UNDEFINED;
+    /* Coercions can run author code: resolve neither pointer until both end. */
+    if (JS_ToInt64(context, &handles[0], argv[0]) < 0
+        || JS_ToInt64(context, &handles[1], argv[1]) < 0)
+        return JS_EXCEPTION;
+    if (!js_rt_bridge_node_slot_for_handle(bridge, handles[0], &slots[0])
+        || !js_rt_bridge_node_slot_for_handle(bridge, handles[1], &slots[1]))
+        return JS_UNDEFINED;
+    lxb_dom_node_t *left = bridge->nodes[slots[0]];
+    lxb_dom_node_t *right = bridge->nodes[slots[1]];
+    if (left == right) return JS_NewInt32(context, 0);
+    lxb_dom_node_t *roots[2] = {left, right};
+    size_t depths[2] = {0, 0};
+    for (unsigned i = 0; i < 2; ++i) {
+        while (roots[i]->parent != NULL && depths[i] < 512u) {
+            roots[i] = roots[i]->parent;
+            depths[i]++;
+        }
+        if (roots[i]->parent != NULL) return JS_UNDEFINED;
+    }
+    /* Disconnected ordering stays in the JS WeakMap, never pointer order. */
+    if (roots[0] != roots[1]) return JS_UNDEFINED;
+    while (depths[0] > depths[1]) { left = left->parent; depths[0]--; }
+    if (left == right) return JS_NewInt32(context, 2 | 8);
+    while (depths[1] > depths[0]) { right = right->parent; depths[1]--; }
+    if (left == right) return JS_NewInt32(context, 4 | 16);
+    while (left->parent != right->parent) {
+        left = left->parent;
+        right = right->parent;
+    }
+    for (size_t i = 0; right->prev != NULL && i < 16384u; ++i) {
+        right = right->prev;
+        if (right == left) return JS_NewInt32(context, 4);
+    }
+    return right->prev == NULL ? JS_NewInt32(context, 2) : JS_UNDEFINED;
 }
 
 JSValue js_dom_is_connected(JSContext *context,
@@ -3317,6 +3409,16 @@ JSValue js_dom_set_attribute(JSContext *context,
                         : NULL,
             old_present ? old_value_length : 0,
             value, value_length);
+    uint32_t changed_tokens[SCRIPT_MUTATION_TOKEN_LIMIT];
+    size_t changed_token_count = 0;
+    bool changed_tokens_exact = !unchanged_selector_identity
+        && stylesheet_attribute_change_tokens(
+            name, name_length,
+            old_present ? (old_value == NULL ? "" : (const char *) old_value)
+                        : NULL,
+            old_present ? old_value_length : 0,
+            value, value_length, changed_tokens,
+            SCRIPT_MUTATION_TOKEN_LIMIT, &changed_token_count);
     lxb_dom_attr_t *attribute = lxb_dom_element_set_attribute(
         lxb_dom_interface_element(node), (const lxb_char_t *) name,
         name_length, (const lxb_char_t *) value, value_length);
@@ -3331,7 +3433,9 @@ JSValue js_dom_set_attribute(JSContext *context,
         if (!unchanged_selector_identity) {
             bridge_mutated_with_relational(
                 bridge, SCRIPT_MUTATION_ATTRIBUTE, node,
-                name, name_length, relational_selector_sensitive);
+                name, name_length, relational_selector_sensitive,
+                changed_tokens_exact ? changed_tokens : NULL,
+                changed_token_count);
         }
         ScriptElementState *state = js_rt_script_element_state_find(bridge, node);
         if (async_attribute && state != NULL && state->programmatic
@@ -3468,13 +3572,22 @@ JSValue js_dom_remove_attribute(JSContext *context,
             existed ? (old_value == NULL ? "" : (const char *) old_value)
                     : NULL,
             existed ? old_value_length : 0, NULL, 0);
+    uint32_t changed_tokens[SCRIPT_MUTATION_TOKEN_LIMIT];
+    size_t changed_token_count = 0;
+    bool changed_tokens_exact = stylesheet_attribute_change_tokens(
+        name, name_length,
+        existed ? (old_value == NULL ? "" : (const char *) old_value) : NULL,
+        existed ? old_value_length : 0, NULL, 0, changed_tokens,
+        SCRIPT_MUTATION_TOKEN_LIMIT, &changed_token_count);
     lxb_status_t status = lxb_dom_element_remove_attribute(
         lxb_dom_interface_element(node), (const lxb_char_t *) name,
         name_length);
     if (existed && status == LXB_STATUS_OK) {
         bridge_mutated_with_relational(
             bridge, SCRIPT_MUTATION_ATTRIBUTE, node,
-            name, name_length, relational_selector_sensitive);
+            name, name_length, relational_selector_sensitive,
+            changed_tokens_exact ? changed_tokens : NULL,
+            changed_token_count);
     }
     JS_FreeCString(context, name);
     return JS_NewBool(context, status == LXB_STATUS_OK);
@@ -3959,7 +4072,7 @@ JSValue js_computed_style_get(JSContext *context,
     ComputedStyle style;
     if (!bridge_computed_style(bridge, node, &style)) {
         JS_FreeCString(context, name);
-        return JS_ThrowInternalError(context, "computed style interrupted");
+        return js_rt_throw_task_interruption(context, "computed style interrupted");
     }
     PseudoElement pseudo = PSEUDO_NONE;
     if (argc > 2) {
@@ -5107,6 +5220,26 @@ static ScriptMutationKind bridge_child_mutation_kind(
     return SCRIPT_MUTATION_CHILD_LIST;
 }
 
+static void bridge_child_inserted(
+    DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
+    bool was_detached, lxb_dom_node_t *old_parent)
+{
+    /* A successful move into a detached construction tree still removes
+       content from the live page. Journal its old owner after success. */
+    if (!was_detached && !bridge_node_is_connected(node)) {
+        bridge_mutated(bridge, SCRIPT_MUTATION_UNKNOWN, old_parent, NULL, 0);
+        return;
+    }
+    size_t before = bridge->mutations.count;
+    bridge_mutated(bridge, kind, node, NULL, 0);
+    /* A prior removal/move of this node must win over a later re-insertion.
+       Only a newly recorded child mutation can start a transient probe. */
+    if ((kind == SCRIPT_MUTATION_CHILD_LIST || kind == SCRIPT_MUTATION_HEAD_SCRIPT)
+        && bridge->mutations.count > before) {
+        bridge->mutations.records[before].inserted_from_detached = was_detached;
+    }
+}
+
 JSValue js_dom_append(JSContext *context, JSValueConst this_value,
                       int argc, JSValueConst *argv)
 {
@@ -5118,9 +5251,11 @@ JSValue js_dom_append(JSContext *context, JSValueConst this_value,
         ? js_rt_bridge_node_arg(context, bridge, argv[1]) : NULL;
     if (parent == NULL || child == NULL || parent == child) return JS_FALSE;
     ScriptMutationKind kind = bridge_child_mutation_kind(bridge, parent, child);
+    bool was_detached = !bridge_node_is_connected(child);
+    lxb_dom_node_t *old_parent = child->parent;
     lxb_dom_exception_code_t status = lxb_dom_node_append_child(parent, child);
     if (status == LXB_DOM_EXCEPTION_OK) {
-        bridge_mutated(bridge, kind, child, NULL, 0);
+        bridge_child_inserted(bridge, kind, child, was_detached, old_parent);
     }
     return JS_NewBool(context, status == LXB_DOM_EXCEPTION_OK);
 }
@@ -5179,13 +5314,16 @@ JSValue js_dom_append_many(JSContext *context,
        already-normalized list supplied by Element.append: establish every
        connection first, then run post-connection steps in argument order. */
     for (uint32_t index = 0; index < count; index++) {
+        bool was_detached = !bridge_node_is_connected(nodes[index]);
+        lxb_dom_node_t *old_parent = nodes[index]->parent;
         if (lxb_dom_node_append_child(parent, nodes[index])
             != LXB_DOM_EXCEPTION_OK) {
             budget_free(bridge->budget, nodes);
             return JS_FALSE;
         }
-        bridge_mutated(
-            bridge, SCRIPT_MUTATION_CHILD_LIST, nodes[index], NULL, 0);
+        bridge_child_inserted(
+            bridge, SCRIPT_MUTATION_CHILD_LIST, nodes[index], was_detached,
+            old_parent);
     }
     if (js_rt_dynamic_prepare_subtree(context, parent) < 0) {
         budget_free(bridge->budget, nodes);
@@ -5215,10 +5353,12 @@ JSValue js_dom_insert_before(JSContext *context,
        it could corrupt a tree for ancestor cycles, and it rejected the
        standards-defined insertBefore(node, node) no-op. */
     ScriptMutationKind kind = bridge_child_mutation_kind(bridge, parent, node);
+    bool was_detached = !bridge_node_is_connected(node);
+    lxb_dom_node_t *old_parent = node->parent;
     lxb_dom_exception_code_t status = lxb_dom_node_insert_before_spec(
         parent, node, child);
     if (status == LXB_DOM_EXCEPTION_OK) {
-        bridge_mutated(bridge, kind, node, NULL, 0);
+        bridge_child_inserted(bridge, kind, node, was_detached, old_parent);
     }
     return JS_NewBool(context, status == LXB_DOM_EXCEPTION_OK);
 }

@@ -126,6 +126,20 @@ avoids `sceIoSync("ms0:")` when its derived paths are on `host0:`. Loading the
 module and its assets over USB changes startup timing, so compare host0 runs
 only with host0 runs.
 
+### A script ending inside the keyboard is a failed run
+
+Modal text entry advances the input script outside the browser's frame loop.
+If its submit/cancel sequence misses, it can consume the remaining steps while
+the keyboard is still open. Validation now cancels that modal and reports
+`event=keyboard-input-exhausted` with a `stalled` outcome, then uses normal
+cleanup. Completion in a cooperative receiver likewise reaches the main-loop
+report path. A physical-input handoff still leaves control with the user.
+
+Do not count `interactive-ready` or an exhausted script cursor as a search
+pass: require the expected destination URL, a completed scenario, and clean
+exit. The validation-only `tilefinch-text-input:` records identify keyboard
+readiness and submit/cancel key handling without logging the entered text.
+
 `psp-browser-script-dev-prx` uses PSPSDK's PRX link/fixup recipe and reuses the
 EBOOT object files verbatim. It deliberately has no `PARAM.SFO`, package step,
 install entry, or shipping ELF ratchet. Those gates remain attached to the

@@ -1512,9 +1512,7 @@
       if (arguments.length < 2)
         throw new TypeError("insertBefore requires two arguments");
       validatePreInsert(this, node, child);
-      const own = Object.prototype.hasOwnProperty.call(this, "insertBefore")
-        ? this.insertBefore
-        : null;
+      const own = this.insertBefore;
       if (typeof own === "function" && own !== genericInsertBefore)
         return own.call(this, node, child);
       throw new DOMException(
@@ -1545,7 +1543,7 @@
       if (
         !prepend &&
         parent.__handle !== undefined &&
-        Object.prototype.hasOwnProperty.call(parent, "append")
+        typeof parent.append === "function" && parent.append !== append
       ) {
         const batch =
           insertion.nodeType === Node.DOCUMENT_FRAGMENT_NODE

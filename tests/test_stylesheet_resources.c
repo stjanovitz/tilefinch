@@ -2339,6 +2339,124 @@ static bool test_parsed_ir_is_viewport_bound_and_fails_closed(void)
     return ok && clean;
 }
 
+static bool measure_ir_capture(const char *css, bool capture,
+                               size_t *allocations, size_t *peak)
+{
+    static const char html[] = "<!doctype html><div class=wide>probe</div>";
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    bool installed = budget_install_lexbor(&budget);
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    unsigned char *ir = NULL;
+    size_t ir_length = 0;
+    bool ok = installed
+        && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+        && stylesheet_build(&sheet, &budget, &document, 480);
+    size_t before = budget.allocation_count;
+    budget.peak = budget.current;
+    if (ok) {
+        ok = capture ? stylesheet_add_css_from_context_capture_ir(
+            &sheet, css, strlen(css), "https://fixture.test/a.css", "",
+            &ir, &ir_length) : stylesheet_add_css_from_context(
+            &sheet, css, strlen(css), "https://fixture.test/a.css", "");
+    }
+    *allocations = budget.allocation_count - before;
+    *peak = budget.peak;
+    budget_free(&budget, ir);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    bool clean = budget.current == 0;
+    if (installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
+static bool test_ir_capture_bounds_transient_storage(void)
+{
+    static const char compact[] = ".wide{color:red}";
+    static const char eligible[] =
+        "/* Enough source padding to make this small structural artifact "
+        "worth retaining, but not worth a 4096-byte scratch allocation. */"
+        ".wide{display:flex;color:red}";
+    size_t plain_allocations = 0, captured_allocations = 0;
+    size_t plain_peak = 0, captured_peak = 0;
+    bool ok = measure_ir_capture(compact, false, &plain_allocations, &plain_peak)
+        && measure_ir_capture(compact, true, &captured_allocations, &captured_peak);
+    printf("ir-compact allocations=%zu/%zu peak=%zu/%zu\n",
+        plain_allocations, captured_allocations, plain_peak, captured_peak);
+    ok = ok && plain_allocations == captured_allocations
+        && plain_peak == captured_peak;
+    bool measured = measure_ir_capture(eligible, false, &plain_allocations, &plain_peak)
+        && measure_ir_capture(eligible, true, &captured_allocations, &captured_peak);
+    printf("ir-eligible allocations=%zu/%zu peak=%zu/%zu\n",
+        plain_allocations, captured_allocations, plain_peak, captured_peak);
+    return ok && measured && captured_peak <= plain_peak + sizeof(eligible) + 128u;
+}
+
+static bool test_uncacheable_retained_css_skips_ir_capture(void)
+{
+    static const char page[] = "https://fixture.test/page";
+    static const char url[] = "https://fixture.test/theme.css";
+    static const char html[] = "<!doctype html><link rel=stylesheet href='/theme.css'>"
+        "<div id=target class=wide>probe</div>";
+    /* One simple rule with a large inert declaration makes IR copying
+       observable independently of the compiled selector fragment. */
+    char css[12000];
+    const char *prefix = "/* compressible source padding */.wide{unknown:";
+    size_t at = strlen(prefix);
+    memcpy(css, prefix, at);
+    memset(css + at, 'a', 10000);
+    at += 10000;
+    strcpy(css + at, ";display:flex;color:#123456}");
+    size_t peaks[2] = {0};
+    bool ok = true;
+    for (unsigned with_session = 0; with_session < 2; with_session++) {
+        Budget budget;
+        budget_init(&budget, 8u * MIB);
+        bool installed = budget_install_lexbor(&budget);
+        BrowserSession session = {0};
+        PocDocument document = {0};
+        Stylesheet sheet = {0};
+        StylesheetDocumentResources resources = {.budget = &budget};
+        ExternalStylesheetStats stats = {0};
+        unsigned char *bytes = budget_malloc(&budget, strlen(css));
+        if (bytes != NULL) memcpy(bytes, css, strlen(css));
+        BrowserSharedBody *body = browser_shared_body_take(&budget, bytes, strlen(css));
+        if (body == NULL) budget_free(&budget, bytes);
+        bool ready = installed && body != NULL
+            && browser_session_init(&session, &budget, MIB)
+            && stylesheet_document_resources_retain(&resources, url, url, "", body,
+                strlen(css), false, TILEFINCH_CREDENTIALS_INCLUDE)
+            && document_parse(&document, &budget, html, sizeof(html) - 1u, 17)
+            && stylesheet_build(&sheet, &budget, &document, 480);
+        size_t before = budget.current;
+        budget.peak = before;
+        ready = ready && stylesheets_load_external_tracked_with_context(
+            &document, &sheet, &budget, page, page, "", 4, sizeof(css),
+            sizeof(css), 1000, NULL, with_session ? &session : NULL,
+            &resources, &stats);
+        peaks[with_session] = budget.peak - before;
+        lxb_dom_node_t *target = ready ? find_element_id(
+            lxb_dom_interface_node(document.html), "target") : NULL;
+        ComputedStyle style = target ? style_for_node(&sheet, target, NULL)
+            : (ComputedStyle) {0};
+        ok = ok && ready && stats.loaded == 1 && stats.retained_body_hits == 1
+            && stats.parsed_ir_stores == 0 && style.display == DISPLAY_FLEX
+            && style.color == 0x123456;
+        browser_shared_body_release(body);
+        stylesheet_document_resources_destroy(&resources);
+        stylesheet_destroy(&sheet);
+        document_destroy(&document);
+        browser_session_destroy(&session);
+        ok = budget.current == 0 && ok;
+        if (installed) ok = budget_uninstall_lexbor(&budget) && ok;
+    }
+    printf("uncacheable-css peak-overhead=%zu/%zu\n", peaks[0], peaks[1]);
+    /* A small first-parse selector fragment remains useful without storage;
+       an additional source-sized IR buffer does not. */
+    return ok && peaks[1] <= peaks[0] + 2048u;
+}
+
 static bool test_complete_selector_census_reopens_retained_sources_once(void)
 {
     BrowserSharedBody retained = {0};
@@ -2398,6 +2516,8 @@ int main(void)
     RUN_TEST(test_pressure_skipped_sheet_preserves_later_byte_quota);
     RUN_TEST(test_compiled_fragment_reuses_external_css_with_new_inline_css);
     RUN_TEST(test_parsed_ir_is_viewport_bound_and_fails_closed);
+    RUN_TEST(test_ir_capture_bounds_transient_storage);
+    RUN_TEST(test_uncacheable_retained_css_skips_ir_capture);
     RUN_TEST(test_complete_selector_census_reopens_retained_sources_once);
 #undef RUN_TEST
     puts("stylesheet resource tests passed");

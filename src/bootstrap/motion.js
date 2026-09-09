@@ -92,7 +92,7 @@
         return { text: "", nodes: 0, bytes: 0 };
       try {
         const result = globalThis.__tilefinchGetTextPrefix?.(
-            style.__handle,
+            typeof style === "number" ? style : style.__handle,
             Math.min(STYLE_BYTES_LIMIT, maximumBytes),
             Math.min(STYLE_NODE_LIMIT, maximumNodes),
           );
@@ -120,7 +120,7 @@
       try {
         return String(
           globalThis.__tilefinchGetStyleAttributePrefix?.(
-            element.__handle,
+            typeof element === "number" ? element : element.__handle,
             Math.min(STYLE_BYTES_LIMIT, maximumBytes),
           ) ?? "",
         );
@@ -488,7 +488,11 @@
         rules = [];
       let retainedBytes = 0,
         retainedNodes = 0;
-      const styleNodes = document.querySelectorAll("style"),
+      const nativeInline = typeof globalThis.__tilefinchQueryAll === "function"
+        && !globalThis.__tilefinchHasRemoteNodeWriter;
+      const styleNodes = nativeInline
+          ? globalThis.__tilefinchQueryAll("style", 0, STYLE_LIMIT)
+          : document.querySelectorAll("style"),
         styleCount = Math.min(STYLE_LIMIT, styleNodes.length);
       for (let styleIndex = 0; styleIndex < styleCount; styleIndex++) {
         const style = styleNodes[styleIndex];
@@ -518,7 +522,12 @@
       }
       let inlineElements = [];
       try {
-        inlineElements = document.querySelectorAll("[style]");
+        // Inspect bounded native attribute prefixes before creating wrappers.
+        // Most inline styles are geometry/color, not motion; wrapping all of
+        // them first can exhaust a tight realm even when no animation applies.
+        inlineElements = nativeInline
+          ? globalThis.__tilefinchQueryAll("[style]", 0, ELEMENT_LIMIT)
+          : document.querySelectorAll("[style]");
       } catch {}
       for (const element of inlineElements) {
         if (
@@ -526,8 +535,8 @@
           retainedNodes >= STYLE_NODE_LIMIT
         )
           break;
-        if (!candidates.has(element) && candidates.size >= ELEMENT_LIMIT)
-          break;
+        if (!nativeInline && !candidates.has(element)
+          && candidates.size >= ELEMENT_LIMIT) break;
         const retained = styleAttributePrefix(
           element,
           STYLE_BYTES_LIMIT - retainedBytes,
@@ -536,7 +545,12 @@
         retainedNodes++;
         const config = /animation/i.test(retained)
           ? animationConfig(declarationMap(retained)) : null;
-        if (config) candidates.set(element, config);
+        if (config) {
+          const target = nativeInline ? globalThis.__tilefinchWrap(element) : element;
+          if (!(target instanceof Element)) continue;
+          if (!candidates.has(target) && candidates.size >= ELEMENT_LIMIT) break;
+          candidates.set(target, config);
+        }
       }
       for (const element of Array.from(active)) {
         if (!candidates.has(element)) {

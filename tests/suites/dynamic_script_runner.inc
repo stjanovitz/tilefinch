@@ -8,6 +8,8 @@ int main(void)
     }
 
     size_t failures = 0;
+    if (!test_small_late_script_reserve(&budget)) failures++;
+    if (!test_classic_continuation_uses_admitted_reserve(&budget)) failures++;
     if (!test_dynamic_classic_and_error(&budget)) failures++;
     if (!test_dynamic_classic_ordering(&budget)) failures++;
     if (!test_dynamic_module_ordering(&budget)) failures++;

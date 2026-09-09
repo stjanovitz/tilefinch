@@ -350,6 +350,9 @@ typedef struct {
     uint64_t compiled_stylesheet_cache_last_observed_fingerprint;
     size_t blocking_stylesheet_continuations;
     size_t blocking_stylesheet_continuation_fallbacks;
+    /* Continuations refused because the layout viewport moved after the
+       streaming sheet was compiled; the sheet is rebuilt at the new width. */
+    size_t blocking_stylesheet_viewport_rebuilds;
     size_t blocking_stylesheet_continuation_rules;
     size_t blocking_stylesheet_continuation_prefix_inputs;
     size_t blocking_stylesheet_continuation_suffix_inputs;
@@ -361,6 +364,10 @@ typedef struct {
     uint64_t blocking_stylesheet_fingerprint_us;
     size_t mutation_fast_relayouts;
     size_t mutation_resource_rebuilds;
+    /* Inserted <style> elements appended to the page sheet in place instead
+       of rebuilding it, and attempts that had to fall back. */
+    size_t mutation_style_appends;
+    size_t mutation_style_append_fallbacks;
     size_t mutation_image_resource_scans;
     size_t mutation_conservative_scans;
     size_t mutation_journal_overflows;
@@ -377,6 +384,12 @@ typedef struct {
     size_t layout_reuse_full_resets;
     size_t layout_reuse_pressure_evictions;
     size_t layout_reuse_retained_bytes;
+    size_t layout_reuse_matched_hits;
+    size_t layout_reuse_matched_misses;
+    size_t layout_reuse_matched_stores;
+    size_t layout_reuse_matched_token_invalidations;
+    size_t layout_reuse_matched_token_fallbacks;
+    size_t layout_reuse_matched_token_dropped;
     uint64_t response_headers_us;
     uint64_t first_body_byte_us;
     size_t stylesheet_preload_timeout_bytes;
@@ -545,6 +558,9 @@ struct NavigationSession {
     size_t maximum_image_file_bytes;
     size_t maximum_decoded_image_bytes;
     long resource_timeout_ms;
+    /* Deferred image batches are not published on pages whose layout
+       needed more work units than this (0 = no limit). */
+    size_t maximum_publication_work_units;
     size_t incremental_relayouts;
     NavigationPerformance performance;
     FetchStreamMetrics last_stream;

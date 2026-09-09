@@ -175,6 +175,19 @@ static bool navigation_stream_try_continue_stylesheet(
         || !stream->blocking_stylesheet_ready
         || !stream->blocking_stylesheet_user_context_neutral
         || stream->stylesheet_input_overflow) return false;
+    /* Media queries are evaluated at parse against the sheet's viewport. A
+       later metadata scan (a <meta name=viewport> after the first blocking
+       stylesheet, or after a parser-blocking script) can move the layout
+       viewport; the compiled prefix then answers the wrong width and no
+       suffix append can repair it.  Rebuild instead of continuing. */
+    if (stream->blocking_stylesheet.viewport_width
+            != stream->viewport.css_width
+        || stream->blocking_stylesheet.viewport_height
+            != stream->viewport.css_height) {
+        stream->session->performance
+            .blocking_stylesheet_viewport_rebuilds++;
+        return false;
+    }
     uint64_t discovery_started = navigation_now_us();
     NavigationStylesheetInput *current = NULL;
     size_t current_count = 0;

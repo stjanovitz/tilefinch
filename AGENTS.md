@@ -178,6 +178,10 @@ ceiling on a 32-bit in-order MIPS core with no virtual memory. In engine code:
 
 These rules keep verification evidence trustworthy:
 
+- Before a memory experiment, read
+  [the experiment ledger](docs/engineering/MEMORY_EXPERIMENTS.md). Do not retry
+  a rejected approach without its stated premise changing; record the new
+  evidence and update the outcome, including rejected experiments.
 - **`cmake --build ... | tail -1` hides whether anything recompiled.** A
   truncated build log looks identical whether the compiler ran or the tree was
   already up to date, so it can "prove" a fix that was never built. Read enough

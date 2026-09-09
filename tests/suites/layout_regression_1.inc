@@ -4,6 +4,7 @@
 
     CHECK(test_flow_profile_exclusive_scopes(&budget) == 0);
     CHECK(test_layout_elapsed_input_checkpoint(&budget) == 0);
+    CHECK(test_long_text_input_checkpoint(&budget) == 0);
     CHECK(test_font_publication_style_reuse(&budget) == 0);
     CHECK(test_font_publication_preserves_retained_tail(&budget) == 0);
     CHECK(test_text_run_scan_reuse(&budget) == 0);
@@ -181,6 +182,10 @@
     puts("test: generated content counters and list markers");
     CHECK(test_generated_content_counters_and_markers(&budget) == 0);
     CHECK(test_generated_counter_analysis_is_shared(&budget) == 0);
+    CHECK(test_generated_counter_resource_reuse(&budget) == 0);
+    CHECK(test_generated_counter_lookup_work(&budget) == 0);
+    CHECK(test_retained_matches_reuse(&budget) == 0);
+    CHECK(test_stylesheet_append_matches_rebuild(&budget) == 0);
     CHECK(test_overflow_index_uses_nearby_bands(&budget) == 0);
 
     puts("test: font math uses inherited em and computed root rem bases");

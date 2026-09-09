@@ -3307,6 +3307,18 @@ typedef struct {
     size_t cancel_style_at;
 } LayoutCooperateProbe;
 
+static uint32_t late_init_text_color(const LayoutDocument *layout,
+                                     const char *text)
+{
+    size_t length = strlen(text);
+    for (size_t i = 0; i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type == DRAW_TEXT && command->text_length == length
+            && memcmp(command->text, text, length) == 0) return command->color;
+    }
+    return UINT32_MAX;
+}
+
 static bool test_layout_cooperate(void *context, const char *phase,
                                   size_t completed_work_units)
 {

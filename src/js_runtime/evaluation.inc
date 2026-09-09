@@ -191,6 +191,49 @@ static const char *js_rt_exception_to_cstring(
     return text;
 }
 
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+static void runtime_report_heap_failure(ScriptRuntime *runtime)
+{
+    if (runtime == NULL || runtime->heap_failure_census_reported
+        || script_runtime_heap_rejections(runtime) == 0) return;
+    /* One diagnostic heap walk after refusal, never a forced collection.
+       Include caught timer failures as well as exceptions escaping eval. */
+    runtime->heap_failure_census_reported = true;
+    JSMemoryUsage usage;
+    uint64_t started_ns = js_rt_monotonic_time_ns();
+    JS_ComputeMemoryUsage(runtime->runtime, &usage);
+    BudgetQuickJSActivity activity;
+    budget_quickjs_pool_activity(runtime->quickjs_pool, &activity);
+    char diagnostic[768];
+    snprintf(diagnostic, sizeof(diagnostic),
+        "tilefinch-heap-failure: malloc=%lld retained=%lld "
+        "objects=%lld/%lld properties=%lld shapes=%lld/%lld "
+        "functions=%lld/%lld code=%lld strings=%lld/%lld atoms=%lld/%lld "
+        "arrays=%lld elements=%lld binaries=%lld/%lld handles=%zu census-us=%llu "
+        "reject-old=%zu reject-new=%zu reject-live=%zu arenas=%lld/%lld/%lld",
+        (long long) usage.malloc_size, (long long) usage.memory_used_size,
+        (long long) usage.obj_count, (long long) usage.obj_size,
+        (long long) usage.prop_size,
+        (long long) usage.shape_count, (long long) usage.shape_size,
+        (long long) usage.js_func_count, (long long) usage.js_func_size,
+        (long long) usage.js_func_code_size,
+        (long long) usage.str_count, (long long) usage.str_size,
+        (long long) usage.atom_count, (long long) usage.atom_size,
+        (long long) usage.fast_array_count,
+        (long long) usage.fast_array_elements,
+        (long long) usage.binary_object_count,
+        (long long) usage.binary_object_size, runtime->bridge.node_count,
+        (unsigned long long) ((js_rt_monotonic_time_ns() - started_ns)
+                              / UINT64_C(1000)),
+        activity.rejected_old_bytes, activity.rejected_new_bytes,
+        activity.rejected_live_bytes,
+        (long long)usage.malloc_arena_count,
+        (long long)usage.malloc_arena_capacity,
+        (long long)usage.malloc_arena_used);
+    tilefinch_platform_log_message(diagnostic);
+}
+#endif
+
 void js_rt_record_exception(JSContext *context, ScriptResult *result)
 {
     JSValue exception = JS_GetException(context);
@@ -261,6 +304,21 @@ void js_rt_record_exception(JSContext *context, ScriptResult *result)
     JS_FreeValue(context, frame_eval_value);
     JS_FreeValue(context, global);
     JS_FreeValue(context, exception);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    char diagnostic[768];
+    snprintf(diagnostic, sizeof(diagnostic),
+        "tilefinch-script-exception: interrupted=%d heap-remaining=%zu "
+        "heap-rejections=%zu error=\"%.600s\"",
+        bridge != NULL && bridge->host != NULL
+            && bridge->host->watchdog.interrupted,
+        bridge == NULL || bridge->host == NULL ? 0u
+            : script_runtime_heap_remaining(bridge->host),
+        bridge == NULL || bridge->host == NULL ? 0u
+            : script_runtime_heap_rejections(bridge->host), result->error);
+    tilefinch_platform_log_message(diagnostic);
+    runtime_report_heap_failure(bridge == NULL ? NULL : bridge->host);
+#endif
 }
 
 static void promise_rejection_tracker(JSContext *context,
@@ -654,6 +712,38 @@ JSValue js_rt_compile_source_type(JSContext *context, const char *source,
     }
     if (admitted != NULL) *admitted = true;
     uint64_t compile_started = js_rt_monotonic_time_ns();
+    /* QuickJS's automatic cycle collection is triggered by object creation,
+       not every compiler allocation. External loader segments can therefore
+       hit the hard heap limit with dead cycles still occupying their compile
+       reserve. Scale the pressure watermark with the upcoming source instead
+       of collecting before tiny loader segments with hundreds of KiB free.
+       This is a collection heuristic, not an admission guarantee: the hard
+       heap limit still governs every allocation. Keep a 64 KiB minimum for
+       parser overhead and the existing 1 MiB maximum; saturate before size
+       multiplication. Do not retry an already executed script. */
+    const size_t gc_minimum = 64u * 1024u;
+    const size_t gc_maximum = 1024u * 1024u;
+    size_t gc_reserve = length >= (gc_maximum - gc_minimum) / 16u
+        ? gc_maximum : gc_minimum + length * 16u;
+    if (source_kind == SCRIPT_COMPILE_SOURCE_EXTERNAL && bridge != NULL
+        && bridge->host != NULL
+        && script_runtime_heap_remaining(bridge->host) < gc_reserve) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        uint64_t gc_started = js_rt_monotonic_time_ns();
+        size_t remaining_before = script_runtime_heap_remaining(bridge->host);
+#endif
+        JS_RunGC(js_runtime);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        uint64_t gc_finished = js_rt_monotonic_time_ns();
+        char gc_message[192];
+        snprintf(gc_message, sizeof(gc_message),
+            "tilefinch-compile-pressure-gc: elapsed=%lluus remaining=%zu->%zu "
+            "source-bytes=%zu",
+            (unsigned long long) ((gc_finished - gc_started) / UINT64_C(1000)),
+            remaining_before, script_runtime_heap_remaining(bridge->host), length);
+        tilefinch_platform_log_message(gc_message);
+#endif
+    }
     JSValue value = JS_Eval(
         context, source, length, name == NULL ? "<script>" : name,
         evaluation_type | JS_EVAL_FLAG_COMPILE_ONLY);

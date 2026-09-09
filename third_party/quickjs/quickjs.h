@@ -448,6 +448,9 @@ typedef struct JSMemoryUsage {
     int64_t c_func_count, array_count;
     int64_t fast_array_count, fast_array_elements;
     int64_t binary_object_count, binary_object_size;
+    /* Exact small-allocation arena capacity and occupied block bytes,
+       including block headers; diagnostic only, not another heap ledger. */
+    int64_t malloc_arena_count, malloc_arena_capacity, malloc_arena_used;
 } JSMemoryUsage;
 
 void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s);

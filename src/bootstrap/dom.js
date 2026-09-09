@@ -93,11 +93,18 @@
   };
   const uncaughtErrors = [];
   let uncaughtReportDepth = 0;
+  let uncaughtReportCount = 0;
   globalThis.__tilefinchUncaughtErrors = uncaughtErrors;
+  globalThis.__tilefinchUncaughtErrorCount = 0;
   globalThis.__tilefinchLastUncaughtTask = "";
   globalThis.__tilefinchReportUncaught = (error, context = "callback") => {
     uncaughtReportDepth++;
     try {
+      /* Count before any string/stack allocation: an OOM must not disappear
+         merely because formatting its diagnostic also fails. Existing own
+         property + int32 value keep this publication allocation-free. */
+      if (uncaughtReportCount < 2147483647) uncaughtReportCount++;
+      globalThis.__tilefinchUncaughtErrorCount = uncaughtReportCount;
       const message = String(error),
         stack = String((error && error.stack) || ""),
         detail =
@@ -219,6 +226,10 @@
         __tilefinchReleaseNodeWrapper(held.handle, held.lease);
       })
     : null;
+  /* Held records are private cache bookkeeping. Do not expose them through
+     an author replacement of FinalizationRegistry's prototype methods. */
+  const registerNodeWrapper = nodeFinalizer?.register.bind(nodeFinalizer),
+    unregisterNodeWrapper = nodeFinalizer?.unregister.bind(nodeFinalizer);
   const cachedNode = (handle) => {
     const entry = nodeCache.get(Number(handle));
     if (!entry) return null;
@@ -237,8 +248,7 @@
         ? entry.reference.deref()
         : entry.wrapper;
     if (current !== wrapper) return 0;
-    if (weakNodeCache && entry.token)
-      nodeFinalizer.unregister(entry.token);
+    if (weakNodeCache) unregisterNodeWrapper(entry);
     nodeCache.delete(handle);
     return Number(entry.lease) || 0;
   };
@@ -255,9 +265,12 @@
       wrapper.__tilefinchHandleLease = 0;
       return wrapper;
     }
-    const token = {};
-    nodeCache.set(handle, { reference: new WeakRef(wrapper), token, lease });
-    nodeFinalizer.register(wrapper, { handle, lease }, token);
+    /* The same private record is the cache entry, held value and unregister
+       token. It contains only a WeakRef to the wrapper: sharing it must not
+       turn finalizer bookkeeping into a strong target-retention cycle. */
+    const entry = { reference: new WeakRef(wrapper), handle, lease };
+    nodeCache.set(handle, entry);
+    registerNodeWrapper(wrapper, entry, entry);
     wrapper.__tilefinchHandleLease = lease;
     return wrapper;
   };
@@ -781,6 +794,7 @@
       const stack = globalThis.__tilefinchCustomElementConstructionStack;
       if (stack?.length) {
         const element = stack[stack.length - 1];
+        globalThis.__tilefinchPrepareNativePrototype?.(element);
         Object.setPrototypeOf(element, new.target.prototype);
         return element;
       }
@@ -1395,6 +1409,7 @@
           replaceChild: root.replaceChild,
         }
       : null;
+    globalThis.__tilefinchPrepareNativePrototype?.(root);
     Object.setPrototypeOf(root, ShadowRoot.prototype);
     if (detachedOperations)
       for (const [name, operation] of Object.entries(detachedOperations))
@@ -1665,6 +1680,7 @@
     return true;
   };
   {
+    const nativeComparePosition = globalThis.__tilefinchComparePosition;
     const disconnectedOrder = new WeakMap();
     let nextDisconnectedOrder = 1;
     const order = (node) => {
@@ -1688,6 +1704,14 @@
     Node.prototype.compareDocumentPosition = function (other) {
       if (!(other instanceof Node)) throw new TypeError("Node required");
       if (this === other) return 0;
+      if (typeof nativeComparePosition === "function"
+          && !globalThis.__tilefinchHasRemoteNodeWriter
+          && !shadowRootCreated
+          && !this.__tilefinchDetachedParent && !other.__tilefinchDetachedParent
+          && this.__handle > 0 && other.__handle > 0) {
+        const position = nativeComparePosition(this.__handle, other.__handle);
+        if (position !== undefined) return position;
+      }
       const left = path(this),
         right = path(other);
       if (left.length === 0 || right.length === 0 || left[0] !== right[0])
@@ -2610,16 +2634,21 @@
     }
   };
   globalThis.__tilefinchElementPrototype = elementPrototype;
-  function makeClassList(node) {
-    const tokens = () =>
+  const classListOwner = Symbol("classList owner");
+  const classListNode = (list) => {
+    const node = list?.[classListOwner];
+    if (!node) throw new TypeError("Invalid classList receiver");
+    return node;
+  };
+  const classListTokens = (list) =>
         [
           ...new Set(
-            String(node.getAttribute("class") || "")
+            String(classListNode(list).getAttribute("class") || "")
               .split(/\s+/)
               .filter(Boolean),
           ),
-        ],
-      validate = (token) => {
+        ];
+  const validateClassToken = (token) => {
         token = String(token);
         if (!token)
           throw new DOMException("Token must not be empty", "SyntaxError");
@@ -2629,26 +2658,28 @@
             "InvalidCharacterError",
           );
         return token;
-      },
-      write = (values) => node.setAttribute("class", values.join(" ")),
-      list = {
+      };
+  const writeClassTokens = (list, values) =>
+    classListNode(list).setAttribute("class", values.join(" "));
+  const classListDescriptors = Object.getOwnPropertyDescriptors({
       contains(token) {
-        return tokens().includes(String(token));
+        return classListTokens(this).includes(String(token));
       },
       add(...values) {
-        values = values.map(validate);
-        const set = new Set(tokens());
+        values = values.map(validateClassToken);
+        const set = new Set(classListTokens(this));
         for (const value of values) set.add(value);
-        write([...set]);
+        writeClassTokens(this, [...set]);
       },
       remove(...values) {
-        const removed = new Set(values.map(validate));
-        const before = tokens(),
+        const removed = new Set(values.map(validateClassToken));
+        const before = classListTokens(this),
           after = before.filter((value) => !removed.has(value));
-        if (node.getAttribute("class") !== null) write(after);
+        if (classListNode(this).getAttribute("class") !== null)
+          writeClassTokens(this, after);
       },
       toggle(token, force) {
-        token = validate(token);
+        token = validateClassToken(token);
         const present = this.contains(token),
           next = force === undefined ? !present : !!force;
         if (next && !present) this.add(token);
@@ -2668,42 +2699,42 @@
             "Token must not contain ASCII whitespace",
             "InvalidCharacterError",
           );
-        const values = tokens(),
+        const values = classListTokens(this),
           at = values.indexOf(oldToken);
         if (at < 0) return false;
         if (oldToken === newToken) {
-          write(values);
+          writeClassTokens(this, values);
           return true;
         }
         values[at] = newToken;
-        write([...new Set(values)]);
+        writeClassTokens(this, [...new Set(values)]);
         return true;
       },
       item(index) {
-        return tokens()[Number(index)] ?? null;
+        return classListTokens(this)[Number(index)] ?? null;
       },
       get length() {
-        return tokens().length;
+        return classListTokens(this).length;
       },
       get value() {
-        return node.getAttribute("class") || "";
+        return classListNode(this).getAttribute("class") || "";
       },
       set value(value) {
-        node.setAttribute("class", String(value));
+        classListNode(this).setAttribute("class", String(value));
       },
       values() {
-        return tokens()[Symbol.iterator]();
+        return classListTokens(this)[Symbol.iterator]();
       },
       keys() {
-        return tokens()
+        return classListTokens(this)
           .map((_, index) => index)
           [Symbol.iterator]();
       },
       entries() {
-        return tokens().entries();
+        return classListTokens(this).entries();
       },
       forEach(callback, thisArg) {
-        tokens().forEach((value, index) =>
+        classListTokens(this).forEach((value, index) =>
           callback.call(thisArg, value, index, this),
         );
       },
@@ -2716,46 +2747,67 @@
       supports() {
         throw new TypeError("classList does not define supported tokens");
       },
-    };
-    return new Proxy(list, {
+    });
+  const classListProxyHandler = {
       get(target, key, receiver) {
         if (typeof key === "string" && /^\d+$/.test(key))
-          return tokens()[Number(key)];
+          return classListTokens(target)[Number(key)];
         return Reflect.get(target, key, receiver);
       },
       has(target, key) {
         if (typeof key === "string" && /^\d+$/.test(key))
-          return Number(key) < tokens().length;
+          return Number(key) < classListTokens(target).length;
         return key in target;
       },
-    });
+    };
+  function makeClassList(node) {
+    // Share executable state, but retain the same per-list own properties
+    // and strong owner relationship used by native wrapper leases.
+    const list = Object.defineProperties({}, classListDescriptors);
+    Object.defineProperty(list, classListOwner, { value: node });
+    return new Proxy(list, classListProxyHandler);
   }
+  const classListValue = Symbol("classList value");
+  const classListDescriptor = {
+    configurable: true,
+    enumerable: true,
+    get() {
+      let value = this[classListValue];
+      if (value === this) {
+        value = makeClassList(this);
+        this[classListValue] = value;
+      }
+      return value;
+    },
+    set() {},
+  };
   const installClassList = (node) => {
     if (Object.prototype.hasOwnProperty.call(node, "classList")) return;
-    let value = null;
-    Object.defineProperty(node, "classList", {
-      configurable: true,
-      enumerable: true,
-      get() {
-        return value || (value = makeClassList(node));
-      },
-      set() {},
-    });
+    // Preserve the old lazy closure's owner cycle until collection: native
+    // wrapper leases must not become immediate refcount releases merely
+    // because nobody has read classList yet. Replace it with the token-list
+    // owner relationship on first use, without two new functions per node.
+    Object.defineProperty(node, classListValue, { value: node, writable: true });
+    Object.defineProperty(node, "classList", classListDescriptor);
+  };
+  const nativeStyles = new WeakMap();
+  const nativeStyleFor = (node) => {
+    let value = nativeStyles.get(node);
+    if (!value) {
+      value = globalThis.__tilefinchMakeStyle(node.__handle);
+      nativeStyles.set(node, value);
+    }
+    return value;
+  };
+  const nativeStyleDescriptor = {
+    configurable: true,
+    enumerable: true,
+    get() { return nativeStyleFor(this); },
+    set(cssText) { nativeStyleFor(this).cssText = String(cssText); },
   };
   const installStyle = (node, handle) => {
-    let value = null;
-    const style = () =>
-      value || (value = globalThis.__tilefinchMakeStyle(handle));
-    Object.defineProperty(node, "style", {
-      configurable: true,
-      enumerable: true,
-      get() {
-        return style();
-      },
-      set(cssText) {
-        style().cssText = String(cssText);
-      },
-    });
+    nativeStyles.delete(node);
+    Object.defineProperty(node, "style", nativeStyleDescriptor);
   };
   const detachedStyles = new WeakMap();
   Object.defineProperty(globalThis, "__tilefinchInvalidateDetachedStyle", {
@@ -3082,6 +3134,2912 @@
       },
     };
   }
+  // Receiver-only operations share function objects across native wrappers.
+  // Keep handle/rebinding and listener closures per node, and copy descriptors
+  // (not values) so own-property accessors and subclass overrides are preserved.
+  const nativeNodeReceiverDescriptors = Object.getOwnPropertyDescriptors({
+    get nodeValue() {
+      return this.nodeType === Node.TEXT_NODE ||
+        this.nodeType === Node.COMMENT_NODE
+        ? this.textContent
+        : null;
+    },
+    set nodeValue(value) {
+      if (
+        this.nodeType === Node.TEXT_NODE ||
+        this.nodeType === Node.COMMENT_NODE
+      )
+        this.textContent = value == null ? "" : String(value);
+    },
+    get innerText() {
+      return this.textContent;
+    },
+    set innerText(value) {
+      this.textContent = value;
+    },
+    get id() {
+      return this.getAttribute("id") || "";
+    },
+    set id(value) {
+      this.setAttribute("id", value);
+    },
+    get className() {
+      return this.getAttribute("class") || "";
+    },
+    set className(value) {
+      this.setAttribute("class", value);
+    },
+    get role() {
+      return this.getAttribute("role");
+    },
+    set role(value) {
+      value === null
+        ? this.removeAttribute("role")
+        : this.setAttribute("role", value);
+    },
+    get contentEditable() {
+      const value = this.getAttribute("contenteditable");
+      return value === null ? "inherit" : value;
+    },
+    set contentEditable(value) {
+      this.setAttribute("contenteditable", String(value));
+    },
+    get isContentEditable() {
+      for (
+        let at = this, steps = 0;
+        at && steps < ancestorLimit;
+        at = at.parentElement, steps++
+      ) {
+        const value = at.getAttribute("contenteditable");
+        if (value !== null) return String(value).toLowerCase() !== "false";
+      }
+      return false;
+    },
+    get hidden() {
+      return this.hasAttribute("hidden");
+    },
+    set hidden(value) {
+      this.toggleAttribute("hidden", !!value);
+    },
+    get disabled() {
+      if (this.hasAttribute("disabled")) return true;
+      const tag = String(this.tagName).toLowerCase();
+      if (tag === "option") {
+        for (
+          let at = this.parentElement, steps = 0;
+          at && steps < ancestorLimit;
+          at = at.parentElement, steps++
+        ) {
+          const parentTag = String(at.tagName).toLowerCase();
+          if (
+            (parentTag === "optgroup" || parentTag === "select") &&
+            at.hasAttribute("disabled")
+          )
+            return true;
+          if (parentTag === "select") break;
+        }
+      }
+      for (
+        let at = this.parentElement, steps = 0;
+        at && steps < ancestorLimit;
+        at = at.parentElement, steps++
+      ) {
+        if (
+          String(at.tagName).toLowerCase() !== "fieldset" ||
+          !at.hasAttribute("disabled")
+        )
+          continue;
+        const legend = at.children.find(
+          (child) => String(child.tagName).toLowerCase() === "legend",
+        );
+        if (legend && legend.contains(this)) continue;
+        return true;
+      }
+      return false;
+    },
+    set disabled(value) {
+      this.toggleAttribute("disabled", !!value);
+    },
+    get value() {
+      const tag = String(this.tagName).toLowerCase();
+      if (tag === "textarea")
+        return globalThis.__tilefinchTextAreaValue?.(this) ?? this.textContent;
+      if (tag === "select")
+        return globalThis.__tilefinchSelectValue?.(this) || "";
+      if (tag === "option") {
+        const value = this.getAttributeNS(null, "value");
+        return value === null
+          ? String(this.textContent).replace(/\s+/g, " ").trim()
+          : value;
+      }
+      if (tag === "input" && globalThis.__tilefinchInputValue)
+        return globalThis.__tilefinchInputValue(this);
+      return this.getAttribute("value") || "";
+    },
+    set value(value) {
+      const tag = String(this.tagName).toLowerCase();
+      if (tag === "textarea" && globalThis.__tilefinchSetTextAreaValue)
+        globalThis.__tilefinchSetTextAreaValue(this, value);
+      else if (tag === "textarea") this.textContent = String(value);
+      else if (tag === "select")
+        globalThis.__tilefinchSetSelectValue?.(this, String(value));
+      else if (tag === "input" && globalThis.__tilefinchSetInputValue)
+        globalThis.__tilefinchSetInputValue(this, value);
+      else this.setAttribute("value", String(value));
+    },
+    get name() {
+      return this.getAttribute("name") || "";
+    },
+    set name(value) {
+      this.setAttribute("name", String(value));
+    },
+    get type() {
+      const tag = String(this.tagName).toLowerCase();
+      return globalThis.__tilefinchControlType &&
+        (tag === "input" || tag === "button")
+        ? globalThis.__tilefinchControlType(this)
+        : this.getAttribute("type") || "";
+    },
+    set type(value) {
+      this.setAttribute("type", String(value));
+    },
+    get action() {
+      const value = this.getAttribute("action") || "";
+      try {
+        return new URL(value || location.href, location.href).href;
+      } catch {
+        return value;
+      }
+    },
+    set action(value) {
+      this.setAttribute("action", String(value));
+    },
+    get checked() {
+      return this.hasAttribute("checked");
+    },
+    set checked(value) {
+      if (globalThis.__tilefinchSetChecked)
+        globalThis.__tilefinchSetChecked(this, !!value);
+      else this.toggleAttribute("checked", !!value);
+    },
+    get selected() {
+      return String(this.tagName).toLowerCase() === "option" &&
+        globalThis.__tilefinchOptionSelected
+        ? globalThis.__tilefinchOptionSelected(this)
+        : this.hasAttribute("selected");
+    },
+    set selected(value) {
+      if (
+        String(this.tagName).toLowerCase() === "option" &&
+        globalThis.__tilefinchSetOptionSelected
+      )
+        globalThis.__tilefinchSetOptionSelected(this, !!value);
+      else this.toggleAttribute("selected", !!value);
+    },
+    get placeholder() {
+      return this.getAttribute("placeholder") || "";
+    },
+    set placeholder(value) {
+      this.setAttribute("placeholder", String(value));
+    },
+    get selectionStart() {
+      const tag = String(this.tagName).toLowerCase();
+      return tag === "input" || tag === "textarea"
+        ? this.__selectionStart === undefined
+          ? 0
+          : this.__selectionStart
+        : null;
+    },
+    set selectionStart(value) {
+      if (this.selectionStart !== null)
+        this.setSelectionRange(value, this.selectionEnd);
+    },
+    get selectionEnd() {
+      const tag = String(this.tagName).toLowerCase();
+      return tag === "input" || tag === "textarea"
+        ? this.__selectionEnd === undefined
+          ? 0
+          : this.__selectionEnd
+        : null;
+    },
+    set selectionEnd(value) {
+      if (this.selectionEnd !== null)
+        this.setSelectionRange(this.selectionStart, value);
+    },
+    get selectionDirection() {
+      return this.selectionStart === null
+        ? null
+        : this.__selectionDirection || "none";
+    },
+    setSelectionRange(start, end, direction = "none") {
+      if (this.selectionStart === null)
+        throw new DOMException(
+          "Selection is unavailable",
+          "InvalidStateError",
+        );
+      const length = this.value.length;
+      start = Math.max(0, Math.min(length, Number(start) || 0));
+      end = Math.max(0, Math.min(length, Number(end) || 0));
+      if (end < start) start = end;
+      this.__selectionStart = start;
+      this.__selectionEnd = end;
+      this.__selectionDirection = ["forward", "backward"].includes(direction)
+        ? direction
+        : "none";
+      document.__tilefinchSelectionChanged?.();
+    },
+    select() {
+      if (this.selectionStart !== null) {
+        this.setSelectionRange(0, this.value.length);
+        globalThis.__tilefinchSelectedControl = this;
+      }
+    },
+    get tabIndex() {
+      const value = parseInt(this.getAttribute("tabindex"), 10);
+      return Number.isFinite(value) ? value : this.isContentEditable ? 0 : -1;
+    },
+    set tabIndex(value) {
+      this.setAttribute("tabindex", String(Number(value) || 0));
+    },
+    get localName() {
+      return String(this.tagName || "").toLowerCase();
+    },
+    get nodeName() {
+      return this.nodeType === Node.TEXT_NODE
+        ? "#text"
+        : this.nodeType === Node.COMMENT_NODE
+          ? "#comment"
+          : this.nodeType === Node.DOCUMENT_FRAGMENT_NODE
+            ? "#document-fragment"
+            : this.tagName;
+    },
+    get ownerDocument() {
+      return this.__tilefinchAdoptedOwner || document;
+    },
+    get namespaceURI() {
+      return this.__namespaceURI !== undefined
+        ? this.__namespaceURI
+        : this.nodeType === Node.ELEMENT_NODE
+          ? "http://www.w3.org/1999/xhtml"
+          : null;
+    },
+    get lastElementChild() {
+      const values = this.children;
+      return values.length ? values[values.length - 1] : null;
+    },
+    get src() {
+      return this.getAttribute("src") || "";
+    },
+    set src(value) {
+      this.setAttribute("src", value);
+      if (
+        String(this.tagName).toLowerCase() === "iframe" &&
+        this.isConnected
+      )
+        globalThis.__tilefinchLoadLocalFrame?.(this);
+    },
+    get href() {
+      const value = this.getAttribute("href") || "";
+      try {
+        return value ? new URL(value, location.href).href : "";
+      } catch {
+        return value;
+      }
+    },
+    set href(value) {
+      this.setAttribute("href", value);
+    },
+    get hreflang() {
+      return this.getAttribute("hreflang") || "";
+    },
+    set hreflang(value) {
+      this.setAttribute("hreflang", value);
+    },
+    get rel() {
+      return this.getAttribute("rel") || "";
+    },
+    set rel(value) {
+      this.setAttribute("rel", value);
+    },
+    get target() {
+      return this.getAttribute("target") || "";
+    },
+    set target(value) {
+      this.setAttribute("target", value);
+    },
+    get width() {
+      if (this instanceof HTMLCanvasElement) {
+        globalThis.__tilefinchEnsureCanvasBootstrap?.();
+        if (globalThis.__tilefinchCanvasDimension)
+          return globalThis.__tilefinchCanvasDimension(this, "width");
+      }
+      return this.getAttribute("width") || "";
+    },
+    set width(value) {
+      if (this instanceof HTMLCanvasElement) {
+        globalThis.__tilefinchEnsureCanvasBootstrap?.();
+        if (globalThis.__tilefinchSetCanvasDimension) {
+          globalThis.__tilefinchSetCanvasDimension(this, "width", value);
+          return;
+        }
+      }
+      this.setAttribute("width", value);
+    },
+    get height() {
+      if (this instanceof HTMLCanvasElement) {
+        globalThis.__tilefinchEnsureCanvasBootstrap?.();
+        if (globalThis.__tilefinchCanvasDimension)
+          return globalThis.__tilefinchCanvasDimension(this, "height");
+      }
+      return this.getAttribute("height") || "";
+    },
+    set height(value) {
+      if (this instanceof HTMLCanvasElement) {
+        globalThis.__tilefinchEnsureCanvasBootstrap?.();
+        if (globalThis.__tilefinchSetCanvasDimension) {
+          globalThis.__tilefinchSetCanvasDimension(this, "height", value);
+          return;
+        }
+      }
+      this.setAttribute("height", value);
+    },
+    get sandbox() {
+      return makeTokenList(this, "sandbox");
+    },
+    set sandbox(value) {
+      this.setAttribute("sandbox", String(value));
+    },
+    get ariaAtomic() {
+      return this.getAttribute("aria-atomic");
+    },
+    set ariaAtomic(value) {
+      value === null
+        ? this.removeAttribute("aria-atomic")
+        : this.setAttribute("aria-atomic", value);
+    },
+    get ariaLive() {
+      return this.getAttribute("aria-live");
+    },
+    set ariaLive(value) {
+      value === null
+        ? this.removeAttribute("aria-live")
+        : this.setAttribute("aria-live", value);
+    },
+    get defer() {
+      return this.hasAttribute("defer");
+    },
+    set defer(value) {
+      value ? this.setAttribute("defer", "") : this.removeAttribute("defer");
+    },
+    hasAttribute(name) {
+      return this.getAttribute(name) !== null;
+    },
+    hasAttributeNS(namespace, name) {
+      return this.getAttributeNS(namespace, name) !== null;
+    },
+    getAttributeNode(name) {
+      return this.attributes.getNamedItem(String(name));
+    },
+    getAttributeNodeNS(namespace, localName) {
+      return this.attributes.getNamedItemNS(
+        normalizeNamespace(namespace),
+        String(localName),
+      );
+    },
+    setAttributeNode(attribute) {
+      return this.attributes.setNamedItem(attribute);
+    },
+    setAttributeNodeNS(attribute) {
+      return this.attributes.setNamedItemNS(attribute);
+    },
+    getAttributeNames() {
+      return this.attributes.map((attribute) => attribute.name);
+    },
+    getElementById(id) {
+      return this.querySelector("#" + String(id));
+    },
+    matches(selector) {
+      selector = String(selector);
+      const compact = selector.replace(/\s+/g, "").toLowerCase();
+      if (
+        compact === ":defined" ||
+        compact === ":not(:defined)"
+      ) {
+        const defined =
+          globalThis.__tilefinchCustomElementIsDefined?.(this) ?? true;
+        return compact === ":defined" ? defined : !defined;
+      }
+      return globalThis.__tilefinchElementMatches
+        ? globalThis.__tilefinchElementMatches(this, selector)
+        : globalThis.__tilefinchIsVirtualRemote(this)
+          ? __tilefinchRemoteNodeRead(
+              this.__tilefinchStableKey,
+              this.__tilefinchRemoteSection,
+              4,
+              selector,
+            ) === "1"
+          : __tilefinchMatches(this.__handle, selector);
+    },
+    closest(selector) {
+      return globalThis.__tilefinchElementClosest
+        ? globalThis.__tilefinchElementClosest(this, selector)
+        : (() => {
+            for (
+              let at = this, steps = 0;
+              at && steps < ancestorLimit;
+              at = at.parentElement, steps++
+            )
+              if (at.matches(selector)) return at;
+            return null;
+          })();
+    },
+    contains(other) {
+      for (
+        let at = other, steps = 0;
+        at && steps < ancestorLimit;
+        at = at.parentElement, steps++
+      )
+        if (at === this) return true;
+      return false;
+    },
+    get clientWidth() {
+      if (this === document.documentElement) return innerWidth;
+      const style = getComputedStyle(this),
+        width = parseFloat(style.width),
+        left =
+          parseFloat(style.getPropertyValue("padding-left")) ||
+          parseFloat(style.padding) ||
+          0,
+        right =
+          parseFloat(style.getPropertyValue("padding-right")) ||
+          parseFloat(style.padding) ||
+          0;
+      if (Number.isFinite(width) && width > 0)
+        return Math.round(
+          width +
+            (String(this.tagName).toLowerCase() === "input"
+              ? 0
+              : left + right),
+        );
+      return this.__tilefinchGeometryValue().clientWidth;
+    },
+    get clientHeight() {
+      if (this === document.documentElement) return innerHeight;
+      const style = getComputedStyle(this),
+        height = parseFloat(style.height),
+        top =
+          parseFloat(style.getPropertyValue("padding-top")) ||
+          parseFloat(style.padding) ||
+          0,
+        bottom =
+          parseFloat(style.getPropertyValue("padding-bottom")) ||
+          parseFloat(style.padding) ||
+          0;
+      if (Number.isFinite(height) && height > 0)
+        return Math.round(height + top + bottom);
+      return this.__tilefinchGeometryValue().clientHeight;
+    },
+    get clientTop() {
+      if (this === document.documentElement) return 0;
+      const style = getComputedStyle(this);
+      return Math.round(
+        parseFloat(style.getPropertyValue("border-top-width")) ||
+        parseFloat(style.borderWidth) ||
+        0,
+      );
+    },
+    get clientLeft() {
+      if (this === document.documentElement) return 0;
+      const style = getComputedStyle(this);
+      return Math.round(
+        (parseFloat(style.getPropertyValue("border-left-width")) ||
+          parseFloat(style.borderWidth) ||
+          0) +
+          (String(this.tagName).toLowerCase() === "input"
+            ? parseFloat(style.getPropertyValue("padding-left")) ||
+              parseFloat(style.padding) ||
+              0
+            : 0),
+      );
+    },
+    get offsetWidth() {
+      return this.getBoundingClientRect().width;
+    },
+    get offsetHeight() {
+      return this.getBoundingClientRect().height;
+    },
+    get offsetParent() {
+      const position = getComputedStyle(this).position;
+      if (position === "fixed") {
+        for (
+          let at = this.parentElement, steps = 0;
+          at && steps < ancestorLimit;
+          at = at.parentElement, steps++
+        ) {
+          const style = getComputedStyle(at);
+          if (
+            (style.getPropertyValue("transform") &&
+              style.getPropertyValue("transform") !== "none") ||
+            String(style.getPropertyValue("will-change"))
+              .split(/\s*,\s*/)
+              .includes("transform") ||
+            (style.getPropertyValue("perspective") &&
+              style.getPropertyValue("perspective") !== "none") ||
+            (style.getPropertyValue("filter") &&
+              style.getPropertyValue("filter") !== "none") ||
+            String(style.contain).split(/\s+/).includes("paint")
+          )
+            return at;
+        }
+        return null;
+      }
+      for (
+        let at = this.parentElement, steps = 0;
+        at && steps < ancestorLimit;
+        at = at.parentElement, steps++
+      )
+        if (getComputedStyle(at).position !== "static") return at;
+      return document.body;
+    },
+    get scrollWidth() {
+      return this.__tilefinchGeometryValue().scrollWidth;
+    },
+    get scrollHeight() {
+      return this.__tilefinchGeometryValue().scrollHeight;
+    },
+    scroll(...args) {
+      return this.scrollTo(...args);
+    },
+    scrollBy(xOrOptions, y) {
+      if (
+        arguments.length === 1 &&
+        (xOrOptions === null || typeof xOrOptions !== "object")
+      )
+        return Promise.reject(
+          new TypeError("Single scroll argument must be a dictionary"),
+        );
+      if (typeof xOrOptions === "object" && xOrOptions !== null)
+        return this.scrollTo({
+          left: this.scrollLeft + (Number(xOrOptions.left) || 0),
+          top: this.scrollTop + (Number(xOrOptions.top) || 0),
+          behavior: xOrOptions.behavior,
+        });
+      else
+        return this.scrollTo(
+          this.scrollLeft + (Number(xOrOptions) || 0),
+          this.scrollTop + (Number(y) || 0),
+        );
+    },
+    getClientRects() {
+      const rect = this.getBoundingClientRect();
+      return rect.width && rect.height ? [rect] : [];
+    },
+    prepend(...values) {
+      if (globalThis.__tilefinchParentAppend)
+        return globalThis.__tilefinchParentAppend(this, values, true);
+      for (let at = values.length - 1; at >= 0; at--) {
+        const value =
+          values[at] instanceof Node
+            ? values[at]
+            : document.createTextNode(String(values[at]));
+        this.insertBefore(value, this.firstChild);
+      }
+    },
+    removeChild(child) {
+      const parent = child && child.parentNode;
+      if (
+        !child ||
+        !parent ||
+        (parent !== this && parent.__handle !== this.__handle)
+      )
+        throw new Error("removeChild failed");
+      child.remove();
+      return child;
+    },
+    get dataset() {
+      const node = this,
+        toAttribute = (name) =>
+          "data-" +
+          String(name).replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()),
+        validate = (name) => {
+          name = String(name);
+          if (/-[a-z]/.test(name))
+            throw new DOMException("Invalid dataset property", "SyntaxError");
+          return name;
+        };
+      return new Proxy(
+        {},
+        {
+          get(target, name) {
+            if (typeof name === "symbol") return target[name];
+            const value = node.getAttributeNS(null, toAttribute(name));
+            return value === null ? undefined : value;
+          },
+          set(target, name, value) {
+            node.setAttributeNS(
+              null,
+              toAttribute(validate(name)),
+              String(value),
+            );
+            return true;
+          },
+          deleteProperty(target, name) {
+            node.removeAttributeNS(null, toAttribute(validate(name)));
+            return true;
+          },
+          has(target, name) {
+            return node.hasAttributeNS(null, toAttribute(name));
+          },
+        },
+      );
+    },
+    getAttributeNS(namespace, name) {
+      namespace = normalizeNamespace(namespace);
+      name = String(name);
+      const found = [...this.attributes].find(
+        (attribute) =>
+          attribute.namespaceURI === namespace &&
+          attribute.localName === name,
+      );
+      if (found) return found.value;
+      const prefix =
+        namespace === "http://www.w3.org/1999/xlink"
+          ? "xlink:"
+          : namespace === "http://www.w3.org/XML/1998/namespace"
+            ? "xml:"
+            : "";
+      return prefix ? this.getAttribute(prefix + name) : null;
+    },
+    removeAttributeNode(attribute) {
+      if (!(attribute instanceof Attr))
+        throw new TypeError("removeAttributeNode requires an Attr");
+      if (attribute.ownerElement !== this)
+        throw new DOMException("Attribute was not found", "NotFoundError");
+      this.removeAttributeNS(attribute.namespaceURI, attribute.localName);
+      return attribute;
+    },
+    toggleAttribute(name, force) {
+      name = String(name);
+      if (!name)
+        throw new DOMException(
+          "Invalid attribute name",
+          "InvalidCharacterError",
+        );
+      if (this.namespaceURI === "http://www.w3.org/1999/xhtml")
+        name = name.toLowerCase();
+      const present = this.hasAttribute(name),
+        next = force === undefined ? !present : !!force;
+      if (next && !present) this.setAttribute(name, "");
+      else if (!next && present) this.removeAttribute(name);
+      return next;
+    },
+    get offsetTop() {
+      const parent = this.offsetParent,
+        rect = this.getBoundingClientRect(),
+        geometry = this.__tilefinchGeometryValue();
+      let value =
+        rect.top - (parent ? parent.getBoundingClientRect().top : 0);
+      if (
+        !geometry.retained &&
+        value <= 0 &&
+        getComputedStyle(this).position === "static"
+      ) {
+        value = 0;
+        for (const sibling of parent?.childNodes || []) {
+          if (sibling === this) break;
+          if (!(sibling instanceof Element)) continue;
+          const display = getComputedStyle(sibling).display;
+          if (display === "block") value += sibling.offsetHeight;
+        }
+      }
+      return value;
+    },
+    get offsetLeft() {
+      const parent = this.offsetParent,
+        rect = this.getBoundingClientRect(),
+        geometry = this.__tilefinchGeometryValue();
+      let value =
+        rect.left - (parent ? parent.getBoundingClientRect().left : 0);
+      if (
+        !geometry.retained &&
+        value <= 0 &&
+        getComputedStyle(this).position === "static"
+      ) {
+        value = 0;
+        for (const sibling of parent?.childNodes || []) {
+          if (sibling === this) break;
+          if (!(sibling instanceof Element)) continue;
+          if (getComputedStyle(sibling).display !== "block")
+            value += sibling.offsetWidth;
+        }
+      }
+      return value;
+    },
+    scrollIntoView(options = {}) {
+      const dictionary = options && typeof options === "object" ? options : {},
+        behavior = dictionary.behavior || "auto",
+        block =
+          options === false ? "end" : dictionary.block || "start",
+        inline = dictionary.inline || "nearest",
+        targetStyle = getComputedStyle(this),
+        marginTop =
+          parseFloat(targetStyle.getPropertyValue("scroll-margin-top")) || 0,
+        marginBottom =
+          parseFloat(targetStyle.getPropertyValue("scroll-margin-bottom")) ||
+          0,
+        marginLeft =
+          parseFloat(targetStyle.getPropertyValue("scroll-margin-left")) || 0,
+        marginRight =
+          parseFloat(targetStyle.getPropertyValue("scroll-margin-right")) ||
+          0;
+      for (const at of boundedAncestorPath(
+        this.parentElement,
+        (node) => node.parentElement,
+      )) {
+        if (at === document.scrollingElement) continue;
+        const style = getComputedStyle(at);
+        const scrollsX = ["auto", "scroll", "hidden"].includes(
+            style.overflowX,
+          ),
+          scrollsY = ["auto", "scroll", "hidden"].includes(style.overflowY);
+        if (!scrollsX && !scrollsY)
+          continue;
+        const targetRect = this.getBoundingClientRect(),
+          containerRect = at.getBoundingClientRect(),
+          paddingTop =
+            parseFloat(style.getPropertyValue("scroll-padding-top")) || 0,
+          paddingBottom =
+            parseFloat(style.getPropertyValue("scroll-padding-bottom")) || 0,
+          paddingLeft =
+            parseFloat(style.getPropertyValue("scroll-padding-left")) || 0,
+          paddingRight =
+            parseFloat(style.getPropertyValue("scroll-padding-right")) || 0,
+          start =
+            at.scrollTop +
+            targetRect.top -
+            containerRect.top -
+            paddingTop -
+            marginTop,
+          end =
+            at.scrollTop +
+            targetRect.bottom -
+            containerRect.bottom +
+            paddingBottom +
+            marginBottom,
+          startX =
+            at.scrollLeft +
+            targetRect.left -
+            containerRect.left -
+            paddingLeft -
+            marginLeft,
+          endX =
+            at.scrollLeft +
+            targetRect.right -
+            containerRect.right +
+            paddingRight +
+            marginRight;
+        let top = at.scrollTop,
+          left = at.scrollLeft;
+        if (block === "end") top = end;
+        else if (block === "center") top = (start + end) / 2;
+        else if (block === "start") top = start;
+        else if (block === "nearest")
+          top =
+            targetRect.top < containerRect.top
+              ? start
+              : targetRect.bottom > containerRect.bottom
+                ? end
+                : at.scrollTop;
+        if (inline === "end") left = endX;
+        else if (inline === "center") left = (startX + endX) / 2;
+        else if (inline === "start") left = startX;
+        else if (inline === "nearest")
+          left =
+            targetRect.left < containerRect.left
+              ? startX
+              : targetRect.right > containerRect.right
+                ? endX
+                : at.scrollLeft;
+        at.scrollTo({
+          left: scrollsX ? left : at.scrollLeft,
+          top: scrollsY ? top : at.scrollTop,
+          behavior,
+        });
+      }
+      const root = document.scrollingElement;
+      if (root && typeof globalThis.scrollTo === "function") {
+        const rootStyle = getComputedStyle(root),
+          rect = this.getBoundingClientRect(),
+          paddingTop =
+            parseFloat(rootStyle.getPropertyValue("scroll-padding-top")) || 0,
+          paddingBottom =
+            parseFloat(rootStyle.getPropertyValue("scroll-padding-bottom")) ||
+            0,
+          viewportHeight =
+            Number(globalThis.innerHeight) ||
+            Number(globalThis.visualViewport?.height) ||
+            0,
+          start = globalThis.scrollY + rect.top - paddingTop - marginTop,
+          end =
+            globalThis.scrollY +
+            rect.bottom -
+            viewportHeight +
+            paddingBottom +
+            marginBottom;
+        let top = start;
+        if (block === "end") top = end;
+        else if (block === "center") top = (start + end) / 2;
+        else if (block === "nearest")
+          top =
+            rect.top < paddingTop
+              ? start
+              : rect.bottom > viewportHeight - paddingBottom
+                ? end
+                : globalThis.scrollY;
+        globalThis.scrollTo({ top, behavior });
+      }
+    },
+    getBoundingClientRect() {
+      if (!this.isConnected) return new DOMRect(0, 0, 0, 0);
+      const g = this.__tilefinchGeometryValue();
+      // Retained layout geometry already includes positioned layout,
+      // transforms, ancestor/page scrolling and fixed-position adjustment.
+      // Avoid rebuilding it with style and ancestor walks on the common
+      // path; the fallback below remains for virtual or not-yet-laid-out
+      // nodes.
+      const authoritativeAutoHeight =
+        g.authoritative &&
+        (Number(g.height) || 0) <= 0 &&
+        (this.firstChild || shadowRootForHost(this));
+      if (g.authoritative && !authoritativeAutoHeight)
+        return new DOMRect(
+          Number(g.x) || 0,
+          Number(g.y) || 0,
+          Number(g.width) || 0,
+          Number(g.height) || 0,
+        );
+      const style = getComputedStyle(this);
+      if (style.display === "none") return new DOMRect();
+      const retainedWidth = Number(g.width) || 0,
+        retainedHeight = Number(g.height) || 0,
+        parentElement = this.parentElement,
+        /* A retained box at (0, 0) is a valid authoritative position,
+           especially for the first node in a materialized section. Only
+           synthesize flow when the native layout supplied no dimensions;
+           otherwise a previous remote sibling can shift a correct box by
+           its own height. */
+        needsFlowFallback =
+          retainedWidth <= 0 && retainedHeight <= 0,
+        positionedContainingElement =
+          style.position === "absolute" || style.position === "fixed"
+            ? boundedAncestorPath(
+                this.parentElement,
+                (node) => node.parentElement,
+              ).find((at) => {
+                const candidate = getComputedStyle(at),
+                  transformed =
+                    (candidate.getPropertyValue("transform") &&
+                      candidate.getPropertyValue("transform") !== "none") ||
+                    String(candidate.getPropertyValue("will-change"))
+                      .split(/\s*,\s*/)
+                      .includes("transform") ||
+                    (candidate.getPropertyValue("perspective") &&
+                      candidate.getPropertyValue("perspective") !== "none") ||
+                    (candidate.getPropertyValue("filter") &&
+                      candidate.getPropertyValue("filter") !== "none") ||
+                    String(candidate.contain).split(/\s+/).includes("paint");
+                return transformed ||
+                  (style.position === "absolute" &&
+                    candidate.position !== "static");
+              }) || null
+            : null,
+        containingElement =
+          style.position === "absolute" || style.position === "fixed"
+            ? positionedContainingElement
+            : parentElement,
+        containingGeometry =
+          containingElement?.__tilefinchGeometryValue?.() || null,
+        containingRect = containingGeometry
+          ? new DOMRect(
+              Number(containingGeometry.x) || 0,
+              Number(containingGeometry.y) || 0,
+              Number(containingGeometry.width) || 0,
+              Number(containingGeometry.height) || 0,
+            )
+          : new DOMRect(0, 0, innerWidth, innerHeight),
+        cssPixels = (value, reference, viewportFallback) => {
+          value = String(value || "").trim();
+          const number = parseFloat(value);
+          if (!Number.isFinite(number)) return NaN;
+          if (value.endsWith("%"))
+            return ((reference || viewportFallback) * number) / 100;
+          if (value.endsWith("em") || value.endsWith("rem"))
+            return number * 16;
+          return number;
+        };
+      let x = Number(g.x) || 0,
+        y = Number(g.y) || 0,
+        width = retainedWidth,
+        height = retainedHeight;
+      const cssWidth = cssPixels(
+          style.width,
+          containingRect.width,
+          innerWidth,
+        ),
+        cssHeight = cssPixels(
+          style.height,
+          containingRect.height,
+          innerHeight,
+        );
+      if (Number.isFinite(cssWidth) && cssWidth > 0) width = cssWidth;
+      if (Number.isFinite(cssHeight) && cssHeight > 0) height = cssHeight;
+      if (
+        height <= 0 &&
+        !Number.isFinite(cssHeight) &&
+        style.position !== "absolute" &&
+        style.position !== "fixed"
+      ) {
+        /* A shadow root is represented natively by a display:contents
+           carrier. Until native layout has consumed a dynamic shadow
+           mutation, derive the host's auto block size from its in-flow
+           descendants. Keep both traversal and nesting explicitly bounded:
+           geometry is observable author work and must not turn a deep
+           hostile tree into unbounded recursion on PSP. */
+        const state = { remaining: 128 },
+          measureAutoContentHeight = (container, depth) => {
+            if (depth >= 16 || state.remaining <= 0) return 0;
+            const shadow =
+              container instanceof Element
+                ? shadowRootForHost(container)
+                : null;
+            if (shadow)
+              return measureAutoContentHeight(shadow, depth + 1);
+            let blocks = 0,
+              line = 0,
+              child = container?.firstChild || null;
+            for (
+              let siblings = 0;
+              child && siblings < 128 && state.remaining > 0;
+              child = child.nextSibling, siblings++
+            ) {
+              state.remaining--;
+              if (
+                !(child instanceof Element) &&
+                !(child instanceof ShadowRoot)
+              )
+                continue;
+              if (child instanceof ShadowRoot) {
+                const contents = measureAutoContentHeight(child, depth + 1);
+                line = Math.max(line, contents);
+                continue;
+              }
+              const childStyle = getComputedStyle(child);
+              if (
+                childStyle.display === "none" ||
+                childStyle.position === "absolute" ||
+                childStyle.position === "fixed"
+              )
+                continue;
+              const childGeometry =
+                  child.__tilefinchGeometryValue?.() || {},
+                authoredHeight = cssPixels(
+                  childStyle.height,
+                  containingRect.height,
+                  innerHeight,
+                ),
+                marginTop =
+                  parseFloat(childStyle.getPropertyValue("margin-top")) || 0,
+                marginBottom =
+                  parseFloat(childStyle.getPropertyValue("margin-bottom")) ||
+                  0,
+                padding =
+                  (parseFloat(
+                    childStyle.getPropertyValue("padding-top"),
+                  ) || 0) +
+                  (parseFloat(
+                    childStyle.getPropertyValue("padding-bottom"),
+                  ) || 0) +
+                  (parseFloat(
+                    childStyle.getPropertyValue("border-top-width"),
+                  ) || 0) +
+                  (parseFloat(
+                    childStyle.getPropertyValue("border-bottom-width"),
+                  ) || 0);
+              let childHeight = Number(childGeometry.height) || 0;
+              if (Number.isFinite(authoredHeight) && authoredHeight > 0)
+                childHeight = authoredHeight + padding;
+              else if (childHeight <= 0)
+                childHeight =
+                  measureAutoContentHeight(child, depth + 1) + padding;
+              const extent = marginTop + childHeight + marginBottom,
+                inline =
+                  childStyle.display === "inline" ||
+                  childStyle.display === "inline-block" ||
+                  childStyle.display === "inline-flex" ||
+                  childStyle.display === "inline-grid";
+              if (inline) line = Math.max(line, extent);
+              else {
+                blocks += line + extent;
+                line = 0;
+              }
+            }
+            return blocks + line;
+          };
+        height = measureAutoContentHeight(this, 0);
+      }
+      if (
+        needsFlowFallback &&
+        (this === document.documentElement || this === document.body)
+      ) {
+        x = 0;
+        y = 0;
+        if (width <= 0) width = innerWidth;
+        if (height <= 0)
+          height =
+            this === document.documentElement
+              ? innerHeight
+              : parseFloat(style.height) || innerHeight;
+      } else if (
+        needsFlowFallback &&
+        style.position !== "absolute" &&
+        style.position !== "fixed"
+      ) {
+        const parentRect = containingRect,
+          marginLeft =
+            parseFloat(style.getPropertyValue("margin-left")) || 0,
+          marginTop =
+            parseFloat(style.getPropertyValue("margin-top")) || 0;
+        let lineX = parentRect.left,
+          lineY = parentRect.top,
+          lineHeight = 0,
+          blockBottom = parentRect.top;
+        for (const sibling of this.parentElement?.childNodes || []) {
+          if (sibling === this) break;
+          if (!(sibling instanceof Element)) continue;
+          const siblingStyle = getComputedStyle(sibling);
+          if (
+            siblingStyle.display === "none" ||
+            siblingStyle.position === "absolute" ||
+            siblingStyle.position === "fixed"
+          )
+            continue;
+          const siblingGeometry =
+              sibling.__tilefinchGeometryValue?.() || null,
+            siblingRect = siblingGeometry
+              ? new DOMRect(
+                  Number(siblingGeometry.x) || 0,
+                  Number(siblingGeometry.y) || 0,
+                  Number(siblingGeometry.width) || 0,
+                  Number(siblingGeometry.height) || 0,
+                )
+              : new DOMRect(),
+            siblingBottom =
+              parseFloat(
+                siblingStyle.getPropertyValue("margin-bottom"),
+              ) || 0,
+            siblingRight =
+              parseFloat(
+                siblingStyle.getPropertyValue("margin-right"),
+              ) || 0,
+            inline =
+              siblingStyle.display === "inline" ||
+              siblingStyle.display === "inline-block";
+          if (inline) {
+            lineY = Math.max(lineY, blockBottom);
+            lineX += siblingRect.width + siblingRight;
+            lineHeight = Math.max(
+              lineHeight,
+              siblingRect.height + siblingBottom,
+            );
+          } else {
+            if (lineHeight > 0) {
+              blockBottom = Math.max(
+                blockBottom,
+                lineY + lineHeight,
+              );
+              lineX = parentRect.left;
+              lineHeight = 0;
+            }
+            blockBottom = Math.max(
+              blockBottom,
+              siblingRect.bottom + siblingBottom,
+            );
+            lineY = blockBottom;
+          }
+        }
+        const inline =
+          style.display === "inline" || style.display === "inline-block";
+        x = (inline ? lineX : parentRect.left) + marginLeft;
+        y =
+          (inline
+            ? Math.max(lineY, blockBottom)
+            : Math.max(blockBottom, lineY + lineHeight)) + marginTop;
+        if (style.float === "right")
+          x =
+            parentRect.right -
+            width -
+            (parseFloat(style.getPropertyValue("margin-right")) || 0);
+      }
+      if (style.position === "absolute" || style.position === "fixed") {
+        const left = cssPixels(
+            style.left,
+            containingRect.width,
+            innerWidth,
+          ),
+          top = cssPixels(
+            style.top,
+            containingRect.height,
+            innerHeight,
+          ),
+          origin =
+            style.position === "fixed" && !this.offsetParent
+              ? new DOMRect()
+              : containingRect;
+        if (Number.isFinite(left))
+          x =
+            origin.left +
+            left +
+            (parseFloat(style.getPropertyValue("margin-left")) || 0);
+        else if (x === 0)
+          x =
+            origin.left +
+            (parseFloat(style.getPropertyValue("margin-left")) || 0);
+        if (Number.isFinite(top))
+          y =
+            origin.top +
+            top +
+            (parseFloat(style.getPropertyValue("margin-top")) || 0);
+        else if (y === 0)
+          y =
+            origin.top +
+            (parseFloat(style.getPropertyValue("margin-top")) || 0);
+        /* Native retained geometry subtracts every scrolled DOM ancestor.
+           CSS positioned descendants escape scroll containers between
+           themselves and their containing block. Restore only those
+           intervening scroll offsets; the containing block and its
+           ancestors continue to move normally. */
+        for (
+          let at = this.parentElement, steps = 0;
+          at && at !== positionedContainingElement && steps < ancestorLimit;
+          at = at.parentElement, steps++
+        ) {
+          x += Number(at.scrollLeft) || 0;
+          y += Number(at.scrollTop) || 0;
+        }
+      }
+      const transform = String(style.transform || ""),
+        pair = transform.match(
+          /translate(?:3d)?\(\s*(-?[\d.]+)px(?:\s*,\s*(-?[\d.]+)px)?/,
+        ),
+        translateX = transform.match(
+          /translateX\(\s*(-?[\d.]+)px/,
+        ),
+        translateY = transform.match(
+          /translateY\(\s*(-?[\d.]+)px/,
+        );
+      x += Number(pair?.[1] || translateX?.[1]) || 0;
+      y += Number(pair?.[2] || translateY?.[1]) || 0;
+      if (needsFlowFallback) {
+        const scrollAncestor =
+          style.position === "absolute" || style.position === "fixed"
+            ? this.offsetParent
+            : this.parentElement;
+        x -= Number(scrollAncestor?.scrollLeft) || 0;
+        y -= Number(scrollAncestor?.scrollTop) || 0;
+      }
+      return new DOMRect(x, y, width, height);
+    },
+    append(...values) {
+      if (
+        globalThis.__tilefinchParentAppend &&
+        !globalThis.__tilefinchParentAppendBypass
+      )
+        return globalThis.__tilefinchParentAppend(this, values, false);
+      const nodes = [];
+      for (const value of values) {
+        const node =
+          value instanceof Node
+            ? value
+            : document.createTextNode(String(value));
+        if (node instanceof DocumentFragment) nodes.push(...node.childNodes);
+        else nodes.push(node);
+      }
+      const fragment = document.createDocumentFragment();
+      for (const node of nodes) fragment.appendChild(node);
+      this.appendChild(fragment);
+    },
+    replaceChildren(...values) {
+      const owner = this.ownerDocument || this,
+        nodes = values.map((value) =>
+          value instanceof Node ? value : owner.createTextNode(String(value)),
+        ),
+        moved = [];
+      for (const node of nodes) {
+        const candidates =
+          node instanceof DocumentFragment ? [...node.childNodes] : [node];
+        for (const candidate of candidates)
+          if (candidate.parentNode)
+            moved.push({
+              node: candidate,
+              parent: candidate.parentNode,
+              previousSibling: candidate.previousSibling,
+              nextSibling: candidate.nextSibling,
+            });
+      }
+      const
+        insertion =
+          nodes.length === 1
+            ? nodes[0]
+            : owner.createDocumentFragment();
+      globalThis.__tilefinchMutationSuppressed =
+        (globalThis.__tilefinchMutationSuppressed || 0) + 1;
+      let removed;
+      try {
+        if (nodes.length !== 1)
+          for (const node of nodes) insertion.appendChild(node);
+        globalThis.__tilefinchValidatePreInsert?.(
+          this,
+          insertion,
+          null,
+          true,
+        );
+        removed = [...this.childNodes];
+        for (const child of removed) this.removeChild(child);
+        if (nodes.length) this.appendChild(insertion);
+      } finally {
+        globalThis.__tilefinchMutationSuppressed--;
+      }
+      for (const move of moved)
+        globalThis.__tilefinchNotifyMutation?.(
+          move.parent,
+          "childList",
+          null,
+          [],
+          [move.node],
+          null,
+          move.previousSibling,
+          move.nextSibling,
+        );
+      if (removed.length || nodes.length)
+        globalThis.__tilefinchNotifyMutation?.(
+          this,
+          "childList",
+          null,
+          nodes,
+          removed,
+        );
+    },
+    before(...values) {
+      const parent = this.parentNode;
+      if (!parent) return;
+      const owner = this.ownerDocument || document,
+        nodes = values.map((value) =>
+          value instanceof Node ? value : owner.createTextNode(String(value)),
+        ),
+        moving = new Set(nodes);
+      let previous = this.previousSibling;
+      while (previous && moving.has(previous))
+        previous = previous.previousSibling;
+      const insertion =
+          nodes.length === 1
+            ? nodes[0]
+            : owner.createDocumentFragment();
+      if (nodes.length !== 1)
+        for (const node of nodes) insertion.appendChild(node);
+      const reference = previous ? previous.nextSibling : parent.firstChild;
+      if (nodes.length) parent.insertBefore(insertion, reference);
+    },
+    after(...values) {
+      const parent = this.parentNode;
+      if (!parent) return;
+      const owner = this.ownerDocument || document,
+        nodes = values.map((value) =>
+          value instanceof Node ? value : owner.createTextNode(String(value)),
+        ),
+        moving = new Set(nodes);
+      let reference = this.nextSibling;
+      while (reference && moving.has(reference))
+        reference = reference.nextSibling;
+      const insertion =
+        nodes.length === 1
+          ? nodes[0]
+          : owner.createDocumentFragment();
+      if (nodes.length !== 1)
+        for (const node of nodes) insertion.appendChild(node);
+      if (reference && reference.parentNode !== parent) reference = null;
+      if (nodes.length) parent.insertBefore(insertion, reference);
+    },
+    replaceWith(...values) {
+      const parent = this.parentNode;
+      if (!parent) return;
+      const nodes = values.map((value) =>
+          value instanceof Node
+            ? value
+            : document.createTextNode(String(value)),
+        ),
+        moving = new Set(nodes);
+      let reference = this.nextSibling;
+      while (reference && moving.has(reference))
+        reference = reference.nextSibling;
+      for (const node of nodes) parent.insertBefore(node, reference);
+      if (!moving.has(this) && this.parentNode === parent)
+        parent.removeChild(this);
+    },
+    replaceChild(node, child) {
+      const parent = child && child.parentNode;
+      if (
+        !node ||
+        !child ||
+        !parent ||
+        (parent !== this && parent.__handle !== this.__handle)
+      )
+        throw new Error("replaceChild failed");
+      if (node === child) {
+        const previousSibling = child.previousSibling,
+          nextSibling = child.nextSibling;
+        globalThis.__tilefinchNotifyMutation?.(
+          this,
+          "childList",
+          null,
+          [],
+          [child],
+          null,
+          previousSibling,
+          nextSibling,
+        );
+        globalThis.__tilefinchNotifyMutation?.(
+          this,
+          "childList",
+          null,
+          [child],
+          [],
+          null,
+          previousSibling,
+          nextSibling,
+        );
+        return child;
+      }
+      const oldParent = node.parentNode,
+        oldPrevious = node.previousSibling,
+        oldNext = node.nextSibling,
+        previousSibling =
+          child.previousSibling === node
+            ? node.previousSibling
+            : child.previousSibling,
+        nextSibling =
+          child.nextSibling === node ? node.nextSibling : child.nextSibling;
+      globalThis.__tilefinchMutationSuppressed =
+        (globalThis.__tilefinchMutationSuppressed || 0) + 1;
+      try {
+        this.insertBefore(node, child);
+        this.removeChild(child);
+      } finally {
+        globalThis.__tilefinchMutationSuppressed--;
+      }
+      if (oldParent)
+        globalThis.__tilefinchNotifyMutation?.(
+          oldParent,
+          "childList",
+          null,
+          [],
+          [node],
+          null,
+          oldPrevious,
+          oldNext,
+        );
+      globalThis.__tilefinchNotifyMutation?.(
+        this,
+        "childList",
+        null,
+        [node],
+        [child],
+        null,
+        previousSibling,
+        nextSibling,
+      );
+      return child;
+    },
+    dispatchEvent(event) {
+      const value = event;
+      const controlState =
+        value instanceof Event &&
+        value.type === "click" &&
+        !value.__tilefinchControlDefaultPrepared
+          ? globalThis.__tilefinchBeginControlDefault?.(this) || null
+          : null;
+      const path = shadowEventPath(this, !!value.composed);
+      /*
+       * The composed path itself is authoritative for connection.  In
+       * particular, descendants of the internal element used to represent
+       * a shadow root can observe a stale native connected bit during the
+       * same task in which their host is inserted.  Never discard the
+       * Document already reached by the bounded ancestor walk.
+       */
+      const reachesDocument =
+        path[path.length - 1] instanceof Document ||
+        path.some(
+          (node) =>
+            node === document.documentElement || node === document.body,
+        );
+      if (reachesDocument) {
+        if (!(path[path.length - 1] instanceof Document))
+          path.push(document);
+        path.push(globalThis);
+      }
+      const invoke = (target, capture, phase) => {
+        value.target = retargetShadowEvent(this, target);
+        if (target === globalThis)
+          globalThis.__tilefinchInvokeWindowEvent(value, capture);
+        else if (target === document)
+          globalThis.__tilefinchInvokeDocumentEvent(value, capture);
+        else if (typeof target?.__invokeEvent === "function")
+          target.__invokeEvent(value, capture);
+        else
+          globalThis.__tilefinchInvokeEventTarget?.(
+            target,
+            value,
+            capture,
+            phase,
+          );
+      };
+      globalThis.__tilefinchPrepareEvent(value, this, path);
+      for (let i = path.length - 1; i >= 1 && !value.__stopped; i--)
+        invoke(path[i], true, 1);
+      if (!value.__stopped) {
+        invoke(path[0], true, 2);
+        if (!value.__immediateStopped)
+          invoke(path[0], false, 2);
+      }
+      if (value.bubbles && !value.__stopped)
+        for (let i = 1; i < path.length && !value.__stopped; i++)
+          invoke(path[i], false, 3);
+      value.currentTarget = null;
+      value.eventPhase = 0;
+      value.__dispatching = false;
+      value.target = retargetShadowEvent(
+        this,
+        path[path.length - 1] || this,
+      );
+      __tilefinchRecordEvent();
+      const accepted = !value.defaultPrevented;
+      if (controlState)
+        globalThis.__tilefinchFinishControlDefault?.(controlState, accepted);
+      return accepted;
+    },
+    __tilefinchGeometryValue() {
+      const nativeReceiver = this;
+      return globalThis.__tilefinchIsVirtualRemote(this)
+        ? __tilefinchRemoteNodeGeometry(
+            this.__tilefinchStableKey,
+            this.__tilefinchRemoteSection,
+          )
+        : __tilefinchGeometry(nativeReceiver.__handle);
+    },
+    get textContent() {
+      const nativeReceiver = this;
+      if (globalThis.__tilefinchIsVirtualRemote(this))
+        return __tilefinchRemoteNodeRead(
+          this.__tilefinchStableKey,
+          this.__tilefinchRemoteSection,
+          0,
+          "",
+        );
+      if (shadowRootForHost(this))
+        return shadowLightChildren(this)
+          .map((child) => child.textContent ?? "")
+          .join("");
+      return __tilefinchGetText(nativeReceiver.__handle) || "";
+    },
+    set textContent(value) {
+      const nativeReceiver = this;
+      value = String(value);
+      const type = this.nodeType,
+        character =
+          type === Node.TEXT_NODE ||
+          type === Node.CDATA_SECTION_NODE ||
+          type === Node.PROCESSING_INSTRUCTION_NODE ||
+          type === Node.COMMENT_NODE,
+        oldValue = character ? this.textContent : null,
+        removedNodes = character ? [] : mutationChildSnapshot(this),
+        remote = globalThis.__tilefinchIsVirtualRemote(this),
+        rootKey =
+          this === document.body
+            ? "d:body"
+            : this === document.documentElement
+              ? "d:html"
+              : this === document.head
+                ? "d:head"
+                : "",
+        root =
+          !!rootKey &&
+          globalThis.__tilefinchHasRemoteNodeWriter &&
+          !globalThis.__tilefinchRestoringSection;
+      if (remote || root)
+        __tilefinchRemoteNodeWrite(
+          root ? rootKey : this.__tilefinchStableKey,
+          root
+            ? Number(__tilefinchSectionIdentity())
+            : this.__tilefinchRemoteSection,
+          0,
+          value,
+        );
+      let result = false;
+      if (shadowRootForHost(this) && !character && !remote) {
+        globalThis.__tilefinchMutationSuppressed =
+          (globalThis.__tilefinchMutationSuppressed || 0) + 1;
+        dynamicPreparationSuppressed++;
+        try {
+          for (const child of shadowLightChildren(this))
+            this.removeChild(child);
+          if (value)
+            this.appendChild(this.ownerDocument.createTextNode(value));
+          result = true;
+        } finally {
+          dynamicPreparationSuppressed--;
+          globalThis.__tilefinchMutationSuppressed--;
+        }
+      } else {
+        result = __tilefinchSetText(nativeReceiver.__handle, value);
+      }
+      if ((result || remote) && remote)
+        globalThis.__tilefinchRememberRemoteContent?.(this, "text", value);
+      if (character)
+        globalThis.__tilefinchNotifyMutation?.(
+          this,
+          "characterData",
+          null,
+          [],
+          [],
+          oldValue,
+        );
+      else if (removedNodes.length || value)
+        globalThis.__tilefinchNotifyMutation?.(
+          this,
+          "childList",
+          null,
+          value ? mutationChildSnapshot(this) : [],
+          removedNodes,
+        );
+    },
+    get innerHTML() {
+      const nativeReceiver = this;
+      if (globalThis.__tilefinchIsVirtualRemote(this))
+        return __tilefinchRemoteNodeRead(
+          this.__tilefinchStableKey,
+          this.__tilefinchRemoteSection,
+          1,
+          "",
+        );
+      const shadow = shadowRootForHost(this);
+      if (
+        shadow &&
+        String(this.tagName).toLowerCase() !== "template"
+      ) {
+        /* The native shadow backing node is an implementation detail, not
+           part of the host's light-DOM serialization. Serialize clones in
+           a detached container so this read cannot expose or mutate it. */
+        const container = this.ownerDocument.createElement("div");
+        dynamicPreparationSuppressed++;
+        try {
+          for (const child of shadowLightChildren(this))
+            container.appendChild(child.cloneNode(true));
+        } finally {
+          dynamicPreparationSuppressed--;
+        }
+        return __tilefinchGetInnerHTML(container.__handle) || "";
+      }
+      const target =
+        String(this.tagName).toLowerCase() === "template"
+          ? __tilefinchContent(nativeReceiver.__handle)
+          : nativeReceiver.__handle;
+      return __tilefinchGetInnerHTML(target) || "";
+    },
+    set innerHTML(value) {
+      const nativeReceiver = this;
+      value = String(value);
+      const shadow = shadowRootForHost(this),
+        customLifecycle =
+          globalThis.__tilefinchCustomElementLifecycleNeeded?.(this) ||
+          false,
+        removedNodes = customLifecycle
+          ? Array.from(this.childNodes).slice(0, 256)
+          : mutationChildSnapshot(this),
+        remote = globalThis.__tilefinchIsVirtualRemote(this),
+        rootKey =
+          this === document.body
+            ? "d:body"
+            : this === document.documentElement
+              ? "d:html"
+              : this === document.head
+                ? "d:head"
+                : "",
+        root =
+          !!rootKey &&
+          globalThis.__tilefinchHasRemoteNodeWriter &&
+          !globalThis.__tilefinchRestoringSection,
+        target =
+          String(this.tagName).toLowerCase() === "template"
+            ? __tilefinchContent(nativeReceiver.__handle)
+            : nativeReceiver.__handle;
+      let shadowMutation = false;
+      if (remote || root)
+        __tilefinchRemoteNodeWrite(
+          root ? rootKey : this.__tilefinchStableKey,
+          root
+            ? Number(__tilefinchSectionIdentity())
+            : this.__tilefinchRemoteSection,
+          1,
+          value,
+        );
+      if (
+        !remote &&
+        shadow &&
+        String(this.tagName).toLowerCase() !== "template"
+      ) {
+        /* Parsing directly into the host would delete the internal node
+           which owns its ShadowRoot. Parse elsewhere and replace only the
+           light children. Dynamic script preparation stays suppressed,
+           matching native innerHTML's inert-script semantics. */
+        const container = this.ownerDocument.createElement("div");
+        if (!__tilefinchSetInnerHTML(container.__handle, value))
+          throw new Error("innerHTML mutation failed");
+        const replacements = Array.from(container.childNodes);
+        globalThis.__tilefinchMutationSuppressed =
+          (globalThis.__tilefinchMutationSuppressed || 0) + 1;
+        dynamicPreparationSuppressed++;
+        try {
+          for (const child of shadowLightChildren(this))
+            this.removeChild(child);
+          for (const child of replacements) this.appendChild(child);
+        } finally {
+          dynamicPreparationSuppressed--;
+          globalThis.__tilefinchMutationSuppressed--;
+        }
+        shadowMutation = true;
+      } else if (!remote && !__tilefinchSetInnerHTML(target, value)) {
+        throw new Error("innerHTML mutation failed");
+      }
+      if (remote) {
+        __tilefinchSetInnerHTML(target, value);
+        globalThis.__tilefinchRememberRemoteContent?.(this, "html", value);
+      }
+      const addedNodes = customLifecycle
+        ? Array.from(this.childNodes).slice(0, 256)
+        : mutationChildSnapshot(this);
+      if (
+        customLifecycle &&
+        !shadowMutation &&
+        String(this.tagName).toLowerCase() !== "template"
+      ) {
+        for (const node of removedNodes)
+          globalThis.__tilefinchCustomElementDisconnected?.(node);
+        for (const node of addedNodes)
+          globalThis.__tilefinchCustomElementConnected?.(node, true);
+      }
+      globalThis.__tilefinchNotifyMutation?.(
+        this,
+        "childList",
+        null,
+        addedNodes,
+        removedNodes,
+      );
+    },
+    get tagName() {
+      const nativeReceiver = this;
+      return globalThis.__tilefinchIsVirtualRemote(this)
+        ? this.__tilefinchRemoteTagName
+        : __tilefinchTagName(nativeReceiver.__handle) || "";
+    },
+    get nodeType() {
+      const nativeReceiver = this;
+      return globalThis.__tilefinchIsVirtualRemote(this)
+        ? this.__tilefinchRemoteNodeType
+        : __tilefinchNodeType(nativeReceiver.__handle);
+    },
+    get parentElement() {
+      const nativeReceiver = this;
+      if (this.__tilefinchDetachedParent)
+        return this.__tilefinchDetachedParent.nodeType === Node.ELEMENT_NODE
+          ? this.__tilefinchDetachedParent
+          : null;
+      const parent = globalThis.__tilefinchIsVirtualRemote(this)
+        ? __tilefinchRemoteNodeRelation(
+            this.__tilefinchStableKey,
+            this.__tilefinchRemoteSection,
+            0,
+          )
+        : wrap(__tilefinchRelation(nativeReceiver.__handle, 8));
+      /* The native shadow-root carrier is an internal element so layout can
+         flatten it, but its JavaScript identity is a DocumentFragment.
+         Deriving parentElement from the native "element parent" relation
+         leaked that carrier to children of a shadow root. */
+      return parent instanceof Element
+        ? globalThis.__tilefinchCanonicalElement(parent)
+        : null;
+    },
+    get parentNode() {
+      const nativeReceiver = this;
+      if (this.__tilefinchDetachedParent) return this.__tilefinchDetachedParent;
+      if (this === document.documentElement) return document;
+      if (globalThis.__tilefinchIsVirtualRemote(this)) return this.parentElement;
+      const parent = wrap(__tilefinchRelation(nativeReceiver.__handle, 8));
+      return parent || this.parentElement;
+    },
+    get firstElementChild() {
+      const nativeReceiver = this;
+      if (globalThis.__tilefinchHasRemoteNodeWriter && this === document.body)
+        return document.querySelector("body > *");
+      return globalThis.__tilefinchCanonicalElement(
+        globalThis.__tilefinchIsVirtualRemote(this)
+          ? __tilefinchRemoteNodeRelation(
+              this.__tilefinchStableKey,
+              this.__tilefinchRemoteSection,
+              1,
+            )
+          : wrap(__tilefinchRelation(nativeReceiver.__handle, 1)),
+      );
+    },
+    get firstChild() {
+      const nativeReceiver = this;
+      if (globalThis.__tilefinchHasRemoteNodeWriter && this === document.body) {
+        let child = document.querySelector("body > *");
+        if (!child) return null;
+        for (
+          let previous = child.previousSibling;
+          previous;
+          previous = child.previousSibling
+        )
+          child = previous;
+        return child;
+      }
+      const remote = globalThis.__tilefinchIsVirtualRemote(this),
+        local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 4));
+      return remote
+        ? __tilefinchRemoteNodeRelation(
+            this.__tilefinchStableKey,
+            this.__tilefinchRemoteSection,
+            4,
+          )
+        : local ||
+            (canReadRemoteRelation(this)
+              ? __tilefinchRemoteNodeRelation(
+                  this.__tilefinchStableKey,
+                  this.__tilefinchRemoteSection,
+                  4,
+                )
+              : null);
+    },
+    get lastChild() {
+      const nativeReceiver = this;
+      if (globalThis.__tilefinchHasRemoteNodeWriter && this === document.body) {
+        const values = this.childNodes;
+        return values.length ? values[values.length - 1] : null;
+      }
+      const remote = globalThis.__tilefinchIsVirtualRemote(this),
+        local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 7));
+      return remote
+        ? __tilefinchRemoteNodeRelation(
+            this.__tilefinchStableKey,
+            this.__tilefinchRemoteSection,
+            7,
+          )
+        : local ||
+            (canReadRemoteRelation(this)
+              ? __tilefinchRemoteNodeRelation(
+                  this.__tilefinchStableKey,
+                  this.__tilefinchRemoteSection,
+                  7,
+                )
+              : null);
+    },
+    get nextElementSibling() {
+      const nativeReceiver = this;
+      const remote = globalThis.__tilefinchIsVirtualRemote(this),
+        local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 2)),
+        related = shadowAdjustedSibling(
+          this,
+          local ||
+            (!remote && canReadRemoteRelation(this)
+              ? __tilefinchRemoteNodeRelation(
+                  this.__tilefinchStableKey,
+                  this.__tilefinchRemoteSection,
+                  2,
+                )
+              : null),
+          2,
+        );
+      return globalThis.__tilefinchCanonicalElement(
+        remote
+          ? __tilefinchRemoteNodeRelation(
+              this.__tilefinchStableKey,
+              this.__tilefinchRemoteSection,
+              2,
+            )
+          : related,
+      );
+    },
+    get nextSibling() {
+      const nativeReceiver = this;
+      const remote = globalThis.__tilefinchIsVirtualRemote(this),
+        local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 5));
+      return remote
+        ? __tilefinchRemoteNodeRelation(
+            this.__tilefinchStableKey,
+            this.__tilefinchRemoteSection,
+            5,
+          )
+        : shadowAdjustedSibling(
+            this,
+            local ||
+              (canReadRemoteRelation(this)
+                ? __tilefinchRemoteNodeRelation(
+                    this.__tilefinchStableKey,
+                    this.__tilefinchRemoteSection,
+                    5,
+                  )
+                : null),
+            5,
+          );
+    },
+    get previousElementSibling() {
+      const nativeReceiver = this;
+      const remote = globalThis.__tilefinchIsVirtualRemote(this),
+        local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 3)),
+        related = shadowAdjustedSibling(
+          this,
+          local ||
+            (!remote && canReadRemoteRelation(this)
+              ? __tilefinchRemoteNodeRelation(
+                  this.__tilefinchStableKey,
+                  this.__tilefinchRemoteSection,
+                  3,
+                )
+              : null),
+          3,
+        );
+      return globalThis.__tilefinchCanonicalElement(
+        remote
+          ? __tilefinchRemoteNodeRelation(
+              this.__tilefinchStableKey,
+              this.__tilefinchRemoteSection,
+              3,
+            )
+          : related,
+      );
+    },
+    get previousSibling() {
+      const nativeReceiver = this;
+      const remote = globalThis.__tilefinchIsVirtualRemote(this),
+        local = remote ? null : wrap(__tilefinchRelation(nativeReceiver.__handle, 6));
+      return remote
+        ? __tilefinchRemoteNodeRelation(
+            this.__tilefinchStableKey,
+            this.__tilefinchRemoteSection,
+            6,
+          )
+        : shadowAdjustedSibling(
+            this,
+            local ||
+              (canReadRemoteRelation(this)
+                ? __tilefinchRemoteNodeRelation(
+                    this.__tilefinchStableKey,
+                    this.__tilefinchRemoteSection,
+                    6,
+                  )
+                : null),
+            6,
+          );
+    },
+    get isConnected() {
+      const nativeReceiver = this;
+      for (const at of boundedAncestorPath(
+        this.__tilefinchDetachedParent,
+        (node) => node.__tilefinchDetachedParent || node.parentNode,
+      ))
+        if (at instanceof Document) return true;
+      return (
+        globalThis.__tilefinchIsVirtualRemote(this) ||
+        __tilefinchIsConnected(nativeReceiver.__handle)
+      );
+    },
+    get children() {
+      const nativeReceiver = this;
+      if (!this.__tilefinchChildrenCollection)
+        Object.defineProperty(this, "__tilefinchChildrenCollection", {
+          configurable: true,
+          value: globalThis.__tilefinchLiveHTMLCollection(() => {
+            if (
+              !globalThis.__tilefinchHasRemoteNodeWriter &&
+              !globalThis.__tilefinchIsVirtualRemote(this)
+            )
+              return __tilefinchChildren(nativeReceiver.__handle).map(wrap);
+            const values = [];
+            for (
+              let child = this.firstElementChild;
+              child && values.length < 128;
+              child = child.nextElementSibling
+            )
+              values.push(child);
+            return values;
+          }),
+        });
+      return this.__tilefinchChildrenCollection;
+    },
+    get childNodes() {
+      const nativeReceiver = this;
+      if (
+        !globalThis.__tilefinchHasRemoteNodeWriter &&
+        !globalThis.__tilefinchIsVirtualRemote(this)
+      )
+        return __tilefinchChildNodes(nativeReceiver.__handle).map(wrap);
+      const values = [];
+      for (
+        let child = this.firstChild;
+        child && values.length < 128;
+        child = child.nextSibling
+      )
+        values.push(child);
+      return nodeList(values);
+    },
+    get content() {
+      const nativeReceiver = this;
+      const content = wrap(__tilefinchContent(nativeReceiver.__handle));
+      if (
+        content &&
+        String(this.localName).toLowerCase() === "template" &&
+        typeof globalThis.__tilefinchNewDocument === "function"
+      ) {
+        if (!templateContentsOwnerDocument)
+          templateContentsOwnerDocument =
+            globalThis.__tilefinchNewDocument();
+        globalThis.__tilefinchAdoptNodeOwner?.(
+          content,
+          templateContentsOwnerDocument,
+        );
+      }
+      return content;
+    },
+    get contentWindow() {
+      const nativeReceiver = this;
+      return String(this.tagName).toLowerCase() === "iframe"
+        ? globalThis.__tilefinchFrameWindow?.(nativeReceiver.__handle) || null
+        : null;
+    },
+    get contentDocument() {
+      const nativeReceiver = this;
+      if (
+        String(this.tagName).toLowerCase() !== "iframe" ||
+        !this.isConnected
+      )
+        return null;
+      globalThis.__tilefinchLoadLocalFrame?.(this);
+      const view = globalThis.__tilefinchFrameWindow?.(nativeReceiver.__handle),
+        value = view?.document;
+      return value instanceof Document ? value : null;
+    },
+    get attributes() {
+      const nativeReceiver = this;
+      return namedNodeMapFor(this, () => {
+        const raw = globalThis.__tilefinchIsVirtualRemote(this)
+            ? globalThis.__tilefinchMergeRemoteAttributes(
+                this,
+                __tilefinchRemoteNodeAttributes(
+                  this.__tilefinchStableKey,
+                  this.__tilefinchRemoteSection,
+                ),
+              )
+            : __tilefinchAttributes(nativeReceiver.__handle),
+          shadow = namespaceAttributes(this),
+          /* Namespace-aware attributes are written through to the host
+             DOM so layout and style can see them, and mirrored here to
+             keep the qualified name the author wrote.  The host folds the
+             name to lower case, so hide its copy behind the mirror. */
+          shadowed = new Set(
+            shadow.map((attribute) => String(attribute.name).toLowerCase()),
+          ),
+          ordinary = raw
+            .filter(
+              (attribute) =>
+                !shadowed.has(String(attribute.name).toLowerCase()),
+            )
+            .map((attribute) =>
+              attributeRecord(
+                this,
+                String(attribute.name),
+                String(attribute.value),
+              ),
+            ),
+          current = [...ordinary, ...shadow],
+          order = attributeOrder.get(this) || [];
+        return [
+          ...order.filter((attribute) => current.includes(attribute)),
+          ...current.filter((attribute) => !order.includes(attribute)),
+        ];
+      });
+    },
+    get async() {
+      const nativeReceiver = this;
+      return (
+        this instanceof HTMLScriptElement &&
+        (scriptForceAsync(nativeReceiver.__handle) || this.hasAttribute("async"))
+      );
+    },
+    set async(value) {
+      const nativeReceiver = this;
+      if (this instanceof HTMLScriptElement) scriptAsyncAssigned(nativeReceiver.__handle);
+      value ? this.setAttribute("async", "") : this.removeAttribute("async");
+    },
+    setAttribute(name, value) {
+      const nativeReceiver = this;
+      name = String(name);
+      if (!name || /[\u0000\t\n\f\r ]/.test(name))
+        throw new DOMException(
+          "Invalid attribute name",
+          "InvalidCharacterError",
+        );
+      const html =
+        this.namespaceURI === "http://www.w3.org/1999/xhtml";
+      if (html)
+        name = name.toLowerCase();
+      value = String(value);
+      const cachedAttributes = attributeObjects.get(this),
+        matching = html
+          ? cachedAttributes?.get(attributeKey(null, name))
+          : [...this.attributes].find(
+              (attribute) => attribute.name === name,
+            ),
+        oldValue = html
+          ? __tilefinchGetAttribute(nativeReceiver.__handle, name)
+          : matching?.value ?? null,
+        lowerName = name.toLowerCase(),
+        remote = globalThis.__tilefinchIsVirtualRemote(this),
+        rootKey =
+          this === document.body
+            ? "d:body"
+            : this === document.documentElement
+              ? "d:html"
+              : this === document.head
+                ? "d:head"
+                : "",
+        root =
+          !!rootKey &&
+          globalThis.__tilefinchHasRemoteNodeWriter &&
+          !globalThis.__tilefinchRestoringSection;
+      if (remote || root)
+        __tilefinchRemoteNodeWrite(
+          root ? rootKey : this.__tilefinchStableKey,
+          root
+            ? Number(__tilefinchSectionIdentity())
+            : this.__tilefinchRemoteSection,
+          2,
+          name,
+          value,
+        );
+      let result = false;
+      /* Attributes on non-HTML elements keep the qualified name the author
+         wrote, which the host DOM cannot store, so they are mirrored in a
+         namespace-aware list.  They must still be written through: layout,
+         style and the inline-SVG rasterizer read the host DOM only, and a
+         scripted <svg> whose width/height/viewBox/d never arrive there
+         measures as an empty box. */
+      if (!html && matching && namespaceAttributes(this).includes(matching)) {
+        matching.__tilefinchAttributeValue = value;
+        result = __tilefinchSetAttribute(nativeReceiver.__handle, matching.name, value) || true;
+      } else if (
+        !matching &&
+        this.namespaceURI !== "http://www.w3.org/1999/xhtml"
+      ) {
+        const record = attributeRecord(this, name, value);
+        namespaceAttributes(this).push(record);
+        result = __tilefinchSetAttribute(nativeReceiver.__handle, name, value) || true;
+      } else {
+        result = __tilefinchSetAttribute(nativeReceiver.__handle, name, value);
+        /*
+         * Keep an already-observed NamedNodeMap live without constructing
+         * one for ordinary setAttribute calls that never expose it.
+         */
+        if (!html || cachedAttributes)
+          attributeRecord(this, name, value);
+      }
+      if (remote)
+        globalThis.__tilefinchRememberRemoteAttribute?.(this, name, value);
+      else if (globalThis.__tilefinchHasRemoteNodeWriter
+               && lowerName === "id") {
+        const sourceKey = String(__tilefinchStableNodeKey(nativeReceiver.__handle) || ""),
+          idKey = value && value.length <= 128 ? "i:" + value : "";
+        rekeyStableWrapper(this, idKey || sourceKey);
+      }
+      if (lowerName === "id") globalThis.__tilefinchExposeNamedProperty(value);
+      if (lowerName === "style" && this.__detachedOwner)
+        detachedStyles.delete(this);
+      invalidateInlineEventHandler(this, lowerName);
+      globalThis.__tilefinchCustomElementAttributeChanged?.(
+        this,
+        lowerName,
+        oldValue,
+        value,
+      );
+      globalThis.__tilefinchCanvasAttributeChanged?.(this, lowerName);
+      if (
+        this instanceof HTMLIFrameElement &&
+        (lowerName === "src" || lowerName === "srcdoc") &&
+        this.isConnected
+      )
+        globalThis.__tilefinchLoadLocalFrame?.(this);
+      globalThis.__tilefinchNotifyMutation?.(
+        this,
+        "attributes",
+        name,
+        [],
+        [],
+        oldValue,
+      );
+      return result || remote || root;
+    },
+    setAttributeNS(namespace, name, value) {
+      const nativeReceiver = this;
+      namespace = normalizeNamespace(namespace);
+      name = String(name);
+      const colon = name.indexOf(":");
+      if (
+        !name ||
+        /[\u0000-\u0020]/.test(name) ||
+        colon === name.length - 1 ||
+        (colon >= 0 && name.indexOf(":", colon + 1) >= 0)
+      )
+        throw new DOMException(
+          "Invalid qualified name",
+          "InvalidCharacterError",
+        );
+      const prefixAt = name.indexOf(":"),
+        prefix = prefixAt < 0 ? null : name.slice(0, prefixAt),
+        localName = prefixAt < 0 ? name : name.slice(prefixAt + 1),
+        xml = "http://www.w3.org/XML/1998/namespace",
+        xmlns = "http://www.w3.org/2000/xmlns/";
+      if (
+        (prefix !== null && namespace === null) ||
+        (prefix === "xml" && namespace !== xml) ||
+        ((name === "xmlns" || prefix === "xmlns") &&
+          namespace !== xmlns) ||
+        (namespace === xmlns &&
+          name !== "xmlns" &&
+          prefix !== "xmlns")
+      )
+        throw new DOMException("Invalid namespace", "NamespaceError");
+      const
+        values = namespaceAttributes(this),
+        existing = [...this.attributes].find(
+          (attribute) =>
+            attribute.namespaceURI === namespace &&
+            attribute.localName === localName,
+        ),
+        at = existing ? values.indexOf(existing) : -1,
+        oldValue = existing?.value ?? null;
+      if (existing && at < 0) {
+        __tilefinchSetAttribute(nativeReceiver.__handle, existing.name, String(value));
+        existing.__tilefinchAttributeValue = String(value);
+      } else if (existing) {
+        existing.__tilefinchAttributeValue = String(value);
+        __tilefinchSetAttribute(nativeReceiver.__handle, existing.name, String(value));
+      } else if (at < 0) {
+        if (values.length >= 64)
+          throw new RangeError("attribute limit exceeded");
+        const record = attributeRecord(
+          this,
+          name,
+          String(value),
+          namespace,
+          prefix,
+        );
+        values.push(record);
+        __tilefinchSetAttribute(nativeReceiver.__handle, name, String(value));
+      }
+      globalThis.__tilefinchCustomElementAttributeChanged?.(
+        this,
+        localName,
+        oldValue,
+        String(value),
+        namespace,
+      );
+      globalThis.__tilefinchNotifyMutation?.(
+        this,
+        "attributes",
+        localName,
+        [],
+        [],
+        oldValue,
+        null,
+        null,
+        namespace,
+      );
+    },
+    getAttribute(name) {
+      const nativeReceiver = this;
+      name = String(name);
+      if (this.namespaceURI === "http://www.w3.org/1999/xhtml")
+        name = name.toLowerCase();
+      if (globalThis.__tilefinchIsVirtualRemote(this))
+        return __tilefinchRemoteNodeRead(
+          this.__tilefinchStableKey,
+          this.__tilefinchRemoteSection,
+          2,
+          name,
+        );
+      /*
+       * The host DOM is authoritative for ordinary HTML attributes.
+       * Going through `this.attributes` constructs a NamedNodeMap plus an
+       * Attr wrapper graph for every first read.  Focusability checks make
+       * several such reads per new link, which retained enough wrapper
+       * machinery to exhaust a 4 MiB realm after roughly thirty moves.
+       */
+      if (this.namespaceURI === "http://www.w3.org/1999/xhtml")
+        return __tilefinchGetAttribute(nativeReceiver.__handle, name);
+      const found = namespaceAttributes(this).find(
+        (attribute) => attribute.name === name,
+      );
+      return found ? found.value : __tilefinchGetAttribute(nativeReceiver.__handle, name);
+    },
+    removeAttribute(name) {
+      const nativeReceiver = this;
+      name = String(name);
+      const html =
+        this.namespaceURI === "http://www.w3.org/1999/xhtml";
+      if (html)
+        name = name.toLowerCase();
+      const cachedAttributes = attributeObjects.get(this),
+        matching = html
+          ? cachedAttributes?.get(attributeKey(null, name))
+          : [...this.attributes].find(
+              (attribute) => attribute.name === name,
+            ),
+        oldValue = html
+          ? __tilefinchGetAttribute(nativeReceiver.__handle, name)
+          : matching?.value ?? null,
+        lowerName = name.toLowerCase(),
+        remote = globalThis.__tilefinchIsVirtualRemote(this),
+        rootKey =
+          this === document.body
+            ? "d:body"
+            : this === document.documentElement
+              ? "d:html"
+              : this === document.head
+                ? "d:head"
+                : "",
+        root =
+          !!rootKey &&
+          globalThis.__tilefinchHasRemoteNodeWriter &&
+          !globalThis.__tilefinchRestoringSection;
+      if (remote || root)
+        __tilefinchRemoteNodeWrite(
+          root ? rootKey : this.__tilefinchStableKey,
+          root
+            ? Number(__tilefinchSectionIdentity())
+            : this.__tilefinchRemoteSection,
+          3,
+          name,
+        );
+      let result = false;
+      if (
+        !html &&
+        matching !== undefined &&
+        namespaceAttributes(this).includes(matching)
+      ) {
+        const values = namespaceAttributes(this),
+          at = values.indexOf(matching);
+        if (at >= 0) {
+          values.splice(at, 1);
+          /* The mirror hid a written-through host attribute; drop both. */
+          result = __tilefinchRemoveAttribute(nativeReceiver.__handle, matching.name) || true;
+        }
+      } else {
+        result = __tilefinchRemoveAttribute(nativeReceiver.__handle, name);
+      }
+      if (matching) {
+        matching.__tilefinchAttributeOwner = null;
+        cachedAttributes?.delete(
+          attributeKey(matching.namespaceURI, matching.localName),
+        );
+      }
+      if (remote)
+        globalThis.__tilefinchRememberRemoteAttribute?.(this, name, null);
+      else if (globalThis.__tilefinchHasRemoteNodeWriter
+               && lowerName === "id")
+        rekeyStableWrapper(this, String(__tilefinchStableNodeKey(nativeReceiver.__handle) || ""));
+      if (oldValue !== null) {
+        if (lowerName === "style" && this.__detachedOwner)
+          detachedStyles.delete(this);
+        invalidateInlineEventHandler(this, lowerName);
+        globalThis.__tilefinchCanvasAttributeChanged?.(this, lowerName);
+        if (
+          this instanceof HTMLIFrameElement &&
+          (lowerName === "src" || lowerName === "srcdoc") &&
+          this.isConnected
+        )
+          globalThis.__tilefinchLoadLocalFrame?.(this);
+        globalThis.__tilefinchCustomElementAttributeChanged?.(
+          this,
+          lowerName,
+          oldValue,
+          null,
+        );
+        globalThis.__tilefinchNotifyMutation?.(
+          this,
+          "attributes",
+          matching?.localName || name,
+          [],
+          [],
+          oldValue,
+          null,
+          null,
+          matching?.namespaceURI ?? null,
+        );
+      }
+      return result || remote || root;
+    },
+    removeAttributeNS(namespace, name) {
+      const nativeReceiver = this;
+      namespace = normalizeNamespace(namespace);
+      name = String(name);
+      const values = namespaceAttributes(this),
+        removed = [...this.attributes].find(
+          (attribute) =>
+            attribute.namespaceURI === namespace &&
+            attribute.localName === name,
+        );
+      if (removed) {
+        const at = values.indexOf(removed);
+        if (at >= 0) values.splice(at, 1);
+        __tilefinchRemoveAttribute(nativeReceiver.__handle, removed.name);
+        removed.__tilefinchAttributeOwner = null;
+        attributeObjects
+          .get(this)
+          ?.delete(attributeKey(namespace, removed.localName));
+        globalThis.__tilefinchCustomElementAttributeChanged?.(
+          this,
+          removed.localName,
+          removed.value,
+          null,
+          namespace,
+        );
+        globalThis.__tilefinchNotifyMutation?.(
+          this,
+          "attributes",
+          removed.localName,
+          [],
+          [],
+          removed.value,
+          null,
+          null,
+          namespace,
+        );
+        return;
+      }
+      const prefix =
+        namespace === "http://www.w3.org/1999/xlink"
+          ? "xlink:"
+          : namespace === "http://www.w3.org/XML/1998/namespace"
+            ? "xml:"
+            : "";
+      if (prefix) this.removeAttribute(prefix + name);
+    },
+    get scrollTop() {
+      return this.__tilefinchGeometryValue().scrollTop;
+    },
+    set scrollTop(value) {
+      const nativeReceiver = this;
+      smoothElementScrolls.delete(this);
+      const g = this.__tilefinchGeometryValue();
+      const overflow = getComputedStyle(this).overflow;
+      __tilefinchSetElementScroll(
+        nativeReceiver.__handle,
+        g.scrollLeft,
+        overflow === "visible"
+          ? 0
+          : Number(value) || 0,
+      );
+    },
+    get scrollLeft() {
+      return this.__tilefinchGeometryValue().scrollLeft;
+    },
+    set scrollLeft(value) {
+      const nativeReceiver = this;
+      smoothElementScrolls.delete(this);
+      const g = this.__tilefinchGeometryValue();
+      const overflow = getComputedStyle(this).overflow;
+      __tilefinchSetElementScroll(
+        nativeReceiver.__handle,
+        overflow === "visible"
+          ? 0
+          : Number(value) || 0,
+        g.scrollTop,
+      );
+    },
+    scrollTo(xOrOptions, y) {
+      const nativeReceiver = this;
+      if (
+        arguments.length === 1 &&
+        (xOrOptions === null || typeof xOrOptions !== "object")
+      )
+        return Promise.reject(
+          new TypeError("Single scroll argument must be a dictionary"),
+        );
+      if (
+        xOrOptions &&
+        typeof xOrOptions === "object" &&
+        xOrOptions.behavior !== undefined &&
+        !["auto", "instant", "smooth"].includes(
+          String(xOrOptions.behavior),
+        )
+      )
+        return Promise.reject(new TypeError("Invalid scroll behavior"));
+      let left = this.scrollLeft,
+        top = this.scrollTop;
+      if (typeof xOrOptions === "object" && xOrOptions !== null) {
+        left = xOrOptions.left ?? left;
+        top = xOrOptions.top ?? top;
+      } else {
+        left = xOrOptions;
+        top = y;
+      }
+      left = Number(left) || 0;
+      top = Number(top) || 0;
+      const scrollStyle = getComputedStyle(this),
+        requestedBehavior =
+          typeof xOrOptions === "object" && xOrOptions !== null
+            ? String(xOrOptions.behavior || "auto")
+            : "auto",
+        behavior =
+          requestedBehavior === "auto" &&
+          scrollStyle.scrollBehavior === "smooth"
+            ? "smooth"
+            : requestedBehavior,
+        startLeft = this.scrollLeft,
+        startTop = this.scrollTop,
+        acceptsX = scrollStyle.overflowX !== "visible",
+        acceptsY = scrollStyle.overflowY !== "visible",
+        apply = (nextLeft, nextTop) => {
+          __tilefinchSetElementScroll(
+            nativeReceiver.__handle,
+            acceptsX ? nextLeft : 0,
+            acceptsY ? nextTop : 0,
+          );
+          this.dispatchEvent(new Event("scroll"));
+        };
+      smoothElementScrolls.delete(this);
+      if (
+        behavior !== "smooth" ||
+        (left === startLeft && top === startTop)
+      ) {
+        apply(left, top);
+        return Promise.resolve();
+      }
+      const state = {
+        frame: 0,
+        lastLeft: startLeft,
+        lastTop: startTop,
+      };
+      smoothElementScrolls.set(this, state);
+      return new Promise((resolve) => {
+        const step = () => {
+          if (smoothElementScrolls.get(this) !== state || !this.isConnected) {
+            resolve();
+            return;
+          }
+          if (
+            state.frame > 0 &&
+            (this.scrollLeft !== state.lastLeft ||
+              this.scrollTop !== state.lastTop)
+          ) {
+            smoothElementScrolls.delete(this);
+            resolve();
+            return;
+          }
+          state.frame++;
+          const elapsed = state.frame / 12,
+            progress = 1 - (1 - elapsed) * (1 - elapsed);
+          apply(
+            startLeft + (left - startLeft) * progress,
+            startTop + (top - startTop) * progress,
+          );
+          state.lastLeft = this.scrollLeft;
+          state.lastTop = this.scrollTop;
+          if (state.frame < 12) {
+            requestAnimationFrame(step);
+          } else {
+            smoothElementScrolls.delete(this);
+            resolve();
+          }
+        };
+        requestAnimationFrame(step);
+      });
+    },
+    appendChild(child) {
+      const nativeReceiver = this;
+      const oldParent = child?.parentNode || null,
+        oldPrevious = child?.previousSibling || null,
+        oldNext = child?.nextSibling || null,
+        oldOwner = child?.ownerDocument || null,
+        wasConnected = !!child?.isConnected;
+      // Nodes from createHTMLDocument/createDocument are detached shim
+      // objects until adopted into the live document.  Materialize the
+      // element before validation so Web IDL sees the adopted native Node,
+      // rather than rejecting a standards-valid cross-document insertion.
+      if (
+        child &&
+        child.__handle === undefined &&
+        !(child instanceof DocumentFragment)
+      )
+        child = globalThis.__tilefinchMaterializeDetachedNode?.(child) || child;
+      globalThis.__tilefinchValidatePreInsert?.(this, child, null);
+      if (child instanceof DocumentFragment) {
+        const nodes = [...child.childNodes],
+          removals = nodes.map((node) => ({
+            node,
+            parent: node.parentNode,
+            previousSibling: node.previousSibling,
+            nextSibling: node.nextSibling,
+          }));
+        globalThis.__tilefinchMutationSuppressed =
+          (globalThis.__tilefinchMutationSuppressed || 0) + 1;
+        dynamicPreparationSuppressed++;
+        try {
+          for (const node of nodes) this.appendChild(node);
+        } finally {
+          dynamicPreparationSuppressed--;
+          globalThis.__tilefinchMutationSuppressed--;
+        }
+        prepareDynamicSubtree?.(nativeReceiver.__handle);
+        const removalParents = new Set(
+          removals.map((removal) => removal.parent).filter(Boolean),
+        );
+        for (const parent of removalParents) {
+          const group = removals.filter(
+            (removal) => removal.parent === parent,
+          );
+          globalThis.__tilefinchNotifyMutation?.(
+            parent,
+            "childList",
+            null,
+            [],
+            group.map((removal) => removal.node),
+            null,
+            group[0].previousSibling,
+            group[group.length - 1].nextSibling,
+          );
+        }
+        if (nodes.length)
+          globalThis.__tilefinchNotifyMutation?.(
+            this,
+            "childList",
+            null,
+            nodes,
+            [],
+            null,
+            nodes[0].previousSibling,
+            null,
+          );
+        return child;
+      }
+      if (!child || !__tilefinchAppend(nativeReceiver.__handle, child.__handle))
+        throw new Error("appendChild failed");
+      if (
+        wasConnected &&
+        !globalThis.__tilefinchCustomElementMovePreserved
+      )
+        globalThis.__tilefinchCustomElementDisconnected?.(child);
+      const targetOwner = this.ownerDocument || document;
+      if (oldOwner && targetOwner && oldOwner !== targetOwner)
+        globalThis.__tilefinchAdoptNodeOwner?.(child, targetOwner);
+      if (
+        globalThis.__tilefinchTraceTasksEnabled &&
+        child instanceof HTMLIFrameElement
+      ) {
+        const log =
+          globalThis.__tilefinchFrameLifecycle ||
+          (globalThis.__tilefinchFrameLifecycle = []);
+        if (log.length < 16)
+          log.push({
+            action: "append",
+            handle: child.__handle,
+            parent: String(this.tagName || this.nodeName || ""),
+            connected: !!child.isConnected,
+            src: String(child.src || ""),
+          });
+      }
+      if (!globalThis.__tilefinchCustomElementMovePreserved)
+        globalThis.__tilefinchCustomElementConnected?.(child);
+      globalThis.__tilefinchCanvasConnected?.(child);
+      if (oldParent)
+        globalThis.__tilefinchNotifyMutation?.(
+          oldParent,
+          "childList",
+          null,
+          [],
+          [child],
+          null,
+          oldPrevious,
+          oldNext,
+        );
+      globalThis.__tilefinchNotifyMutation?.(
+        this,
+        "childList",
+        null,
+        [child],
+        [],
+        null,
+        child.previousSibling,
+        null,
+      );
+      if (child instanceof HTMLIFrameElement)
+        globalThis.__tilefinchLoadLocalFrame?.(child);
+      if (!dynamicPreparationSuppressed) prepareDynamicSubtree?.(nativeReceiver.__handle);
+      return child;
+    },
+    cloneNode(deep = false) {
+      const nativeReceiver = this;
+      if (++cloneCallDepth > cloneDepthLimit) {
+        cloneCallDepth--;
+        throw new DOMException(
+          "DOM clone exceeds the bounded depth limit",
+          "NotSupportedError",
+        );
+      }
+      try {
+        if (!!deep && String(this.tagName).toLowerCase() === "template") {
+          const clone = wrap(__tilefinchClone(nativeReceiver.__handle, false));
+          for (const child of this.content.childNodes)
+            clone.content.appendChild(child.cloneNode(true));
+          globalThis.__tilefinchCopyFormCloneState?.(this, clone, true);
+          return clone;
+        }
+        const clone = wrap(__tilefinchClone(nativeReceiver.__handle, !!deep));
+        if (deep && clone) {
+          const stack = [{ source: this, node: clone, depth: 0 }];
+          while (stack.length) {
+            const entry = stack.pop();
+            if (entry.depth >= cloneDepthLimit)
+              throw new DOMException(
+                "DOM clone exceeds the bounded depth limit",
+                "NotSupportedError",
+              );
+            if (
+              String(entry.source?.tagName || "").toLowerCase() ===
+                "template" &&
+              entry.source.content &&
+              entry.node.content &&
+              entry.node.content.childNodes.length === 0
+            )
+              for (const child of entry.source.content.childNodes)
+                entry.node.content.appendChild(child.cloneNode(true));
+            const children = entry.node.childNodes || [];
+            const sourceChildren = entry.source?.childNodes || [];
+            for (let index = children.length - 1; index >= 0; index--) {
+              const child = children[index];
+              if (child.__handle === undefined)
+                Object.defineProperty(child, "__tilefinchDetachedParent", {
+                  configurable: true,
+                  writable: true,
+                  value: entry.node,
+                });
+              if (
+                child.childNodes?.length ||
+                String(child.tagName || "").toLowerCase() === "template"
+              )
+                stack.push({
+                  source: sourceChildren[index],
+                  node: child,
+                  depth: entry.depth + 1,
+                });
+            }
+          }
+        }
+        globalThis.__tilefinchCopyFormCloneState?.(this, clone, !!deep);
+        return clone;
+      } finally {
+        cloneCallDepth--;
+      }
+    },
+    insertBefore(node, child) {
+      const nativeReceiver = this;
+      if (arguments.length < 2)
+        throw new TypeError("insertBefore requires two arguments");
+      const oldParent = node?.parentNode || null,
+        oldPrevious = node?.previousSibling || null,
+        oldNext = node?.nextSibling || null,
+        oldOwner = node?.ownerDocument || null,
+        wasConnected = !!node?.isConnected;
+      if (
+        node &&
+        node.__handle === undefined &&
+        !(node instanceof DocumentFragment)
+      )
+        node = globalThis.__tilefinchMaterializeDetachedNode?.(node) || node;
+      globalThis.__tilefinchValidatePreInsert?.(this, node, child);
+      if (node instanceof DocumentFragment) {
+        const nodes = [...node.childNodes],
+          previousSibling = child ? child.previousSibling : this.lastChild;
+        globalThis.__tilefinchFragmentInsertCount =
+          (globalThis.__tilefinchFragmentInsertCount || 0) + 1;
+        globalThis.__tilefinchFragmentInsertText =
+          (globalThis.__tilefinchFragmentInsertText || "") +
+          String(node.textContent || "").slice(0, 80);
+        globalThis.__tilefinchMutationSuppressed =
+          (globalThis.__tilefinchMutationSuppressed || 0) + 1;
+        try {
+          for (const item of nodes) this.insertBefore(item, child);
+        } finally {
+          globalThis.__tilefinchMutationSuppressed--;
+        }
+        if (nodes.length) {
+          globalThis.__tilefinchNotifyMutation?.(
+            node,
+            "childList",
+            null,
+            [],
+            nodes,
+          );
+          globalThis.__tilefinchNotifyMutation?.(
+            this,
+            "childList",
+            null,
+            nodes,
+            [],
+            null,
+            previousSibling,
+            child,
+          );
+        }
+        return node;
+      }
+      if (!child) return this.appendChild(node);
+      const previousSibling = child.previousSibling;
+      if (!__tilefinchInsertBefore(nativeReceiver.__handle, node.__handle, child.__handle))
+        throw new Error("insertBefore failed");
+      if (
+        wasConnected &&
+        !globalThis.__tilefinchCustomElementMovePreserved
+      )
+        globalThis.__tilefinchCustomElementDisconnected?.(node);
+      const targetOwner = this.ownerDocument || document;
+      if (oldOwner && targetOwner && oldOwner !== targetOwner)
+        globalThis.__tilefinchAdoptNodeOwner?.(node, targetOwner);
+      if (!globalThis.__tilefinchCustomElementMovePreserved)
+        globalThis.__tilefinchCustomElementConnected?.(node);
+      globalThis.__tilefinchCanvasConnected?.(node);
+      if (oldParent)
+        globalThis.__tilefinchNotifyMutation?.(
+          oldParent,
+          "childList",
+          null,
+          [],
+          [node],
+          null,
+          oldPrevious,
+          oldNext,
+        );
+      globalThis.__tilefinchNotifyMutation?.(
+        this,
+        "childList",
+        null,
+        [node],
+        [],
+        null,
+        previousSibling,
+        child,
+      );
+      prepareDynamicSubtree?.(nativeReceiver.__handle);
+      return node;
+    },
+    remove() {
+      const nativeReceiver = this;
+      const parent = this.parentNode,
+        previousSibling = this.previousSibling,
+        nextSibling = this.nextSibling;
+      if (this.__tilefinchDetachedParent) {
+        this.__tilefinchDetachedParent.removeChild(this);
+        return;
+      }
+      if (
+        document.__activeElement === this ||
+        this.contains(document.__activeElement) ||
+        shadowEventPath(document.__activeElement, true).includes(this)
+      )
+        document.__activeElement = document.body;
+      if (
+        globalThis.__tilefinchTraceTasksEnabled &&
+        this instanceof HTMLIFrameElement
+      ) {
+        const log =
+          globalThis.__tilefinchFrameLifecycle ||
+          (globalThis.__tilefinchFrameLifecycle = []);
+        if (log.length < 16)
+          log.push({
+            action: "remove",
+            handle: this.__handle,
+            parent: String(parent?.tagName || parent?.nodeName || ""),
+            src: String(this.src || ""),
+          });
+      }
+      const result = __tilefinchRemove(nativeReceiver.__handle);
+      if (result) globalThis.__tilefinchCustomElementDisconnected?.(this);
+      if (parent)
+        globalThis.__tilefinchNotifyMutation?.(
+          parent,
+          "childList",
+          null,
+          [],
+          [this],
+          null,
+          previousSibling,
+          nextSibling,
+        );
+      return undefined;
+    },
+  });
+  const wrapperListeners = Symbol("wrapper listeners");
+  const nativeNodeEventDescriptors = Object.getOwnPropertyDescriptors({
+    addEventListener(type, callback, options = false) {
+      const retained = listenerMap(this, true);
+      const listeners = retained || this[wrapperListeners] || new Map();
+      this[wrapperListeners] = listeners;
+      return globalThis.__tilefinchAddEventListener?.(
+        listeners, type, callback, options,
+      );
+    },
+    removeEventListener(type, callback, options = false) {
+      const listeners = this[wrapperListeners];
+      if (listeners)
+        return globalThis.__tilefinchRemoveEventListener?.(
+          listeners, type, callback, options,
+        );
+    },
+    __invokeEvent(value, capture) {
+      value.currentTarget = this;
+      value.eventPhase = this === value.target ? 2 : capture ? 1 : 3;
+      if (!capture) {
+        const propertyName = "on" + value.type,
+          handler = propertyName in this
+            ? this[propertyName]
+            : inlineEventHandler(this, value.type, propertyName);
+        if (typeof handler === "function")
+          try {
+            globalThis.__tilefinchRecordEventHandler();
+            const returned = globalThis.__tilefinchRunTask(
+              "element-handler:" + String(value.type), handler, this, [value],
+            );
+            if (returned === false) value.preventDefault();
+          } catch (error) {
+            __tilefinchReportUncaught(error, "event " + value.type);
+          }
+      }
+      const listeners = this[wrapperListeners];
+      if (listeners)
+        globalThis.__tilefinchInvokeListenerList?.(
+          listeners, this, value, capture,
+        );
+    },
+  });
+  const nativePrototypes = new WeakMap();
+  function nativeElementPrototype(tag, type, namespace) {
+    const base = elementPrototype(tag, type, namespace);
+    let prototype = nativePrototypes.get(base);
+    if (!prototype) {
+      prototype = Object.create(base);
+      Object.defineProperties(prototype, nativeNodeEventDescriptors);
+      Object.defineProperties(prototype, nativeNodeReceiverDescriptors);
+      nativePrototypes.set(base, prototype);
+    }
+    return prototype;
+  }
+  Object.defineProperty(globalThis, "__tilefinchPrepareNativePrototype", {
+    value(node) {
+      if (!(node?.__handle > 0)) return;
+      for (const descriptors of [nativeNodeEventDescriptors, nativeNodeReceiverDescriptors])
+        for (const name of Object.keys(descriptors))
+          if (!Object.prototype.hasOwnProperty.call(node, name))
+            Object.defineProperty(node, name, descriptors[name]);
+    },
+  });
   function wrap(handle) {
     if (!handle) return null;
     const cached = cachedNode(handle);
@@ -3098,9 +6056,8 @@
       rememberStableWrapper(stableKey, retained);
       return retained;
     }
-    let listeners = new Map();
     const namespaceURI = __tilefinchNamespaceURI(handle);
-    const node = {
+    const own = {
       __namespaceURI: namespaceURI,
       __tilefinchStableKey: stableKey,
       __tilefinchRemoteSection: Number(__tilefinchSectionIdentity()),
@@ -3141,7 +6098,7 @@
         this.__namespaceURI = __tilefinchNamespaceURI(handle);
         Object.setPrototypeOf(
           this,
-          elementPrototype(
+          nativeElementPrototype(
             this.__tilefinchRemoteTagName,
             this.__tilefinchRemoteNodeType,
             this.__namespaceURI,
@@ -3162,2873 +6119,34 @@
         cacheNode(handle, this);
         return this;
       },
-      __tilefinchGeometryValue() {
-        return globalThis.__tilefinchIsVirtualRemote(this)
-          ? __tilefinchRemoteNodeGeometry(
-              this.__tilefinchStableKey,
-              this.__tilefinchRemoteSection,
-            )
-          : __tilefinchGeometry(handle);
-      },
-      get textContent() {
-        if (globalThis.__tilefinchIsVirtualRemote(this))
-          return __tilefinchRemoteNodeRead(
-            this.__tilefinchStableKey,
-            this.__tilefinchRemoteSection,
-            0,
-            "",
-          );
-        if (shadowRootForHost(this))
-          return shadowLightChildren(this)
-            .map((child) => child.textContent ?? "")
-            .join("");
-        return __tilefinchGetText(handle) || "";
-      },
-      set textContent(value) {
-        value = String(value);
-        const type = this.nodeType,
-          character =
-            type === Node.TEXT_NODE ||
-            type === Node.CDATA_SECTION_NODE ||
-            type === Node.PROCESSING_INSTRUCTION_NODE ||
-            type === Node.COMMENT_NODE,
-          oldValue = character ? this.textContent : null,
-          removedNodes = character ? [] : mutationChildSnapshot(this),
-          remote = globalThis.__tilefinchIsVirtualRemote(this),
-          rootKey =
-            this === document.body
-              ? "d:body"
-              : this === document.documentElement
-                ? "d:html"
-                : this === document.head
-                  ? "d:head"
-                  : "",
-          root =
-            !!rootKey &&
-            globalThis.__tilefinchHasRemoteNodeWriter &&
-            !globalThis.__tilefinchRestoringSection;
-        if (remote || root)
-          __tilefinchRemoteNodeWrite(
-            root ? rootKey : this.__tilefinchStableKey,
-            root
-              ? Number(__tilefinchSectionIdentity())
-              : this.__tilefinchRemoteSection,
-            0,
-            value,
-          );
-        let result = false;
-        if (shadowRootForHost(this) && !character && !remote) {
-          globalThis.__tilefinchMutationSuppressed =
-            (globalThis.__tilefinchMutationSuppressed || 0) + 1;
-          dynamicPreparationSuppressed++;
-          try {
-            for (const child of shadowLightChildren(this))
-              this.removeChild(child);
-            if (value)
-              this.appendChild(this.ownerDocument.createTextNode(value));
-            result = true;
-          } finally {
-            dynamicPreparationSuppressed--;
-            globalThis.__tilefinchMutationSuppressed--;
-          }
-        } else {
-          result = __tilefinchSetText(handle, value);
-        }
-        if ((result || remote) && remote)
-          globalThis.__tilefinchRememberRemoteContent?.(this, "text", value);
-        if (character)
-          globalThis.__tilefinchNotifyMutation?.(
-            this,
-            "characterData",
-            null,
-            [],
-            [],
-            oldValue,
-          );
-        else if (removedNodes.length || value)
-          globalThis.__tilefinchNotifyMutation?.(
-            this,
-            "childList",
-            null,
-            value ? mutationChildSnapshot(this) : [],
-            removedNodes,
-          );
-      },
-      get nodeValue() {
-        return this.nodeType === Node.TEXT_NODE ||
-          this.nodeType === Node.COMMENT_NODE
-          ? this.textContent
-          : null;
-      },
-      set nodeValue(value) {
-        if (
-          this.nodeType === Node.TEXT_NODE ||
-          this.nodeType === Node.COMMENT_NODE
-        )
-          this.textContent = value == null ? "" : String(value);
-      },
-      get innerText() {
-        return this.textContent;
-      },
-      set innerText(value) {
-        this.textContent = value;
-      },
-      get innerHTML() {
-        if (globalThis.__tilefinchIsVirtualRemote(this))
-          return __tilefinchRemoteNodeRead(
-            this.__tilefinchStableKey,
-            this.__tilefinchRemoteSection,
-            1,
-            "",
-          );
-        const shadow = shadowRootForHost(this);
-        if (
-          shadow &&
-          String(this.tagName).toLowerCase() !== "template"
-        ) {
-          /* The native shadow backing node is an implementation detail, not
-             part of the host's light-DOM serialization. Serialize clones in
-             a detached container so this read cannot expose or mutate it. */
-          const container = this.ownerDocument.createElement("div");
-          dynamicPreparationSuppressed++;
-          try {
-            for (const child of shadowLightChildren(this))
-              container.appendChild(child.cloneNode(true));
-          } finally {
-            dynamicPreparationSuppressed--;
-          }
-          return __tilefinchGetInnerHTML(container.__handle) || "";
-        }
-        const target =
-          String(this.tagName).toLowerCase() === "template"
-            ? __tilefinchContent(handle)
-            : handle;
-        return __tilefinchGetInnerHTML(target) || "";
-      },
-      set innerHTML(value) {
-        value = String(value);
-        const shadow = shadowRootForHost(this),
-          customLifecycle =
-            globalThis.__tilefinchCustomElementLifecycleNeeded?.(this) ||
-            false,
-          removedNodes = customLifecycle
-            ? Array.from(this.childNodes).slice(0, 256)
-            : mutationChildSnapshot(this),
-          remote = globalThis.__tilefinchIsVirtualRemote(this),
-          rootKey =
-            this === document.body
-              ? "d:body"
-              : this === document.documentElement
-                ? "d:html"
-                : this === document.head
-                  ? "d:head"
-                  : "",
-          root =
-            !!rootKey &&
-            globalThis.__tilefinchHasRemoteNodeWriter &&
-            !globalThis.__tilefinchRestoringSection,
-          target =
-            String(this.tagName).toLowerCase() === "template"
-              ? __tilefinchContent(handle)
-              : handle;
-        let shadowMutation = false;
-        if (remote || root)
-          __tilefinchRemoteNodeWrite(
-            root ? rootKey : this.__tilefinchStableKey,
-            root
-              ? Number(__tilefinchSectionIdentity())
-              : this.__tilefinchRemoteSection,
-            1,
-            value,
-          );
-        if (
-          !remote &&
-          shadow &&
-          String(this.tagName).toLowerCase() !== "template"
-        ) {
-          /* Parsing directly into the host would delete the internal node
-             which owns its ShadowRoot. Parse elsewhere and replace only the
-             light children. Dynamic script preparation stays suppressed,
-             matching native innerHTML's inert-script semantics. */
-          const container = this.ownerDocument.createElement("div");
-          if (!__tilefinchSetInnerHTML(container.__handle, value))
-            throw new Error("innerHTML mutation failed");
-          const replacements = Array.from(container.childNodes);
-          globalThis.__tilefinchMutationSuppressed =
-            (globalThis.__tilefinchMutationSuppressed || 0) + 1;
-          dynamicPreparationSuppressed++;
-          try {
-            for (const child of shadowLightChildren(this))
-              this.removeChild(child);
-            for (const child of replacements) this.appendChild(child);
-          } finally {
-            dynamicPreparationSuppressed--;
-            globalThis.__tilefinchMutationSuppressed--;
-          }
-          shadowMutation = true;
-        } else if (!remote && !__tilefinchSetInnerHTML(target, value)) {
-          throw new Error("innerHTML mutation failed");
-        }
-        if (remote) {
-          __tilefinchSetInnerHTML(target, value);
-          globalThis.__tilefinchRememberRemoteContent?.(this, "html", value);
-        }
-        const addedNodes = customLifecycle
-          ? Array.from(this.childNodes).slice(0, 256)
-          : mutationChildSnapshot(this);
-        if (
-          customLifecycle &&
-          !shadowMutation &&
-          String(this.tagName).toLowerCase() !== "template"
-        ) {
-          for (const node of removedNodes)
-            globalThis.__tilefinchCustomElementDisconnected?.(node);
-          for (const node of addedNodes)
-            globalThis.__tilefinchCustomElementConnected?.(node, true);
-        }
-        globalThis.__tilefinchNotifyMutation?.(
-          this,
-          "childList",
-          null,
-          addedNodes,
-          removedNodes,
-        );
-      },
-      get id() {
-        return this.getAttribute("id") || "";
-      },
-      set id(value) {
-        this.setAttribute("id", value);
-      },
-      get className() {
-        return this.getAttribute("class") || "";
-      },
-      set className(value) {
-        this.setAttribute("class", value);
-      },
-      get dataset() {
-        const node = this,
-          toAttribute = (name) =>
-            "data-" +
-            String(name).replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()),
-          validate = (name) => {
-            name = String(name);
-            if (/-[a-z]/.test(name))
-              throw new DOMException("Invalid dataset property", "SyntaxError");
-            return name;
-          };
-        return new Proxy(
-          {},
-          {
-            get(target, name) {
-              if (typeof name === "symbol") return target[name];
-              const value = node.getAttributeNS(null, toAttribute(name));
-              return value === null ? undefined : value;
-            },
-            set(target, name, value) {
-              node.setAttributeNS(
-                null,
-                toAttribute(validate(name)),
-                String(value),
-              );
-              return true;
-            },
-            deleteProperty(target, name) {
-              node.removeAttributeNS(null, toAttribute(validate(name)));
-              return true;
-            },
-            has(target, name) {
-              return node.hasAttributeNS(null, toAttribute(name));
-            },
-          },
-        );
-      },
-      get role() {
-        return this.getAttribute("role");
-      },
-      set role(value) {
-        value === null
-          ? this.removeAttribute("role")
-          : this.setAttribute("role", value);
-      },
-      get contentEditable() {
-        const value = this.getAttribute("contenteditable");
-        return value === null ? "inherit" : value;
-      },
-      set contentEditable(value) {
-        this.setAttribute("contenteditable", String(value));
-      },
-      get isContentEditable() {
-        for (
-          let at = this, steps = 0;
-          at && steps < ancestorLimit;
-          at = at.parentElement, steps++
-        ) {
-          const value = at.getAttribute("contenteditable");
-          if (value !== null) return String(value).toLowerCase() !== "false";
-        }
-        return false;
-      },
-      get hidden() {
-        return this.hasAttribute("hidden");
-      },
-      set hidden(value) {
-        this.toggleAttribute("hidden", !!value);
-      },
-      get disabled() {
-        if (this.hasAttribute("disabled")) return true;
-        const tag = String(this.tagName).toLowerCase();
-        if (tag === "option") {
-          for (
-            let at = this.parentElement, steps = 0;
-            at && steps < ancestorLimit;
-            at = at.parentElement, steps++
-          ) {
-            const parentTag = String(at.tagName).toLowerCase();
-            if (
-              (parentTag === "optgroup" || parentTag === "select") &&
-              at.hasAttribute("disabled")
-            )
-              return true;
-            if (parentTag === "select") break;
-          }
-        }
-        for (
-          let at = this.parentElement, steps = 0;
-          at && steps < ancestorLimit;
-          at = at.parentElement, steps++
-        ) {
-          if (
-            String(at.tagName).toLowerCase() !== "fieldset" ||
-            !at.hasAttribute("disabled")
-          )
-            continue;
-          const legend = at.children.find(
-            (child) => String(child.tagName).toLowerCase() === "legend",
-          );
-          if (legend && legend.contains(this)) continue;
-          return true;
-        }
-        return false;
-      },
-      set disabled(value) {
-        this.toggleAttribute("disabled", !!value);
-      },
-      get value() {
-        const tag = String(this.tagName).toLowerCase();
-        if (tag === "textarea")
-          return globalThis.__tilefinchTextAreaValue?.(this) ?? this.textContent;
-        if (tag === "select")
-          return globalThis.__tilefinchSelectValue?.(this) || "";
-        if (tag === "option") {
-          const value = this.getAttributeNS(null, "value");
-          return value === null
-            ? String(this.textContent).replace(/\s+/g, " ").trim()
-            : value;
-        }
-        if (tag === "input" && globalThis.__tilefinchInputValue)
-          return globalThis.__tilefinchInputValue(this);
-        return this.getAttribute("value") || "";
-      },
-      set value(value) {
-        const tag = String(this.tagName).toLowerCase();
-        if (tag === "textarea" && globalThis.__tilefinchSetTextAreaValue)
-          globalThis.__tilefinchSetTextAreaValue(this, value);
-        else if (tag === "textarea") this.textContent = String(value);
-        else if (tag === "select")
-          globalThis.__tilefinchSetSelectValue?.(this, String(value));
-        else if (tag === "input" && globalThis.__tilefinchSetInputValue)
-          globalThis.__tilefinchSetInputValue(this, value);
-        else this.setAttribute("value", String(value));
-      },
-      get name() {
-        return this.getAttribute("name") || "";
-      },
-      set name(value) {
-        this.setAttribute("name", String(value));
-      },
-      get type() {
-        const tag = String(this.tagName).toLowerCase();
-        return globalThis.__tilefinchControlType &&
-          (tag === "input" || tag === "button")
-          ? globalThis.__tilefinchControlType(this)
-          : this.getAttribute("type") || "";
-      },
-      set type(value) {
-        this.setAttribute("type", String(value));
-      },
-      get action() {
-        const value = this.getAttribute("action") || "";
-        try {
-          return new URL(value || location.href, location.href).href;
-        } catch {
-          return value;
-        }
-      },
-      set action(value) {
-        this.setAttribute("action", String(value));
-      },
-      get checked() {
-        return this.hasAttribute("checked");
-      },
-      set checked(value) {
-        if (globalThis.__tilefinchSetChecked)
-          globalThis.__tilefinchSetChecked(this, !!value);
-        else this.toggleAttribute("checked", !!value);
-      },
-      get selected() {
-        return String(this.tagName).toLowerCase() === "option" &&
-          globalThis.__tilefinchOptionSelected
-          ? globalThis.__tilefinchOptionSelected(this)
-          : this.hasAttribute("selected");
-      },
-      set selected(value) {
-        if (
-          String(this.tagName).toLowerCase() === "option" &&
-          globalThis.__tilefinchSetOptionSelected
-        )
-          globalThis.__tilefinchSetOptionSelected(this, !!value);
-        else this.toggleAttribute("selected", !!value);
-      },
-      get placeholder() {
-        return this.getAttribute("placeholder") || "";
-      },
-      set placeholder(value) {
-        this.setAttribute("placeholder", String(value));
-      },
-      get selectionStart() {
-        const tag = String(this.tagName).toLowerCase();
-        return tag === "input" || tag === "textarea"
-          ? this.__selectionStart === undefined
-            ? 0
-            : this.__selectionStart
-          : null;
-      },
-      set selectionStart(value) {
-        if (this.selectionStart !== null)
-          this.setSelectionRange(value, this.selectionEnd);
-      },
-      get selectionEnd() {
-        const tag = String(this.tagName).toLowerCase();
-        return tag === "input" || tag === "textarea"
-          ? this.__selectionEnd === undefined
-            ? 0
-            : this.__selectionEnd
-          : null;
-      },
-      set selectionEnd(value) {
-        if (this.selectionEnd !== null)
-          this.setSelectionRange(this.selectionStart, value);
-      },
-      get selectionDirection() {
-        return this.selectionStart === null
-          ? null
-          : this.__selectionDirection || "none";
-      },
-      setSelectionRange(start, end, direction = "none") {
-        if (this.selectionStart === null)
-          throw new DOMException(
-            "Selection is unavailable",
-            "InvalidStateError",
-          );
-        const length = this.value.length;
-        start = Math.max(0, Math.min(length, Number(start) || 0));
-        end = Math.max(0, Math.min(length, Number(end) || 0));
-        if (end < start) start = end;
-        this.__selectionStart = start;
-        this.__selectionEnd = end;
-        this.__selectionDirection = ["forward", "backward"].includes(direction)
-          ? direction
-          : "none";
-        document.__tilefinchSelectionChanged?.();
-      },
-      select() {
-        if (this.selectionStart !== null) {
-          this.setSelectionRange(0, this.value.length);
-          globalThis.__tilefinchSelectedControl = this;
-        }
-      },
-      get tabIndex() {
-        const value = parseInt(this.getAttribute("tabindex"), 10);
-        return Number.isFinite(value) ? value : this.isContentEditable ? 0 : -1;
-      },
-      set tabIndex(value) {
-        this.setAttribute("tabindex", String(Number(value) || 0));
-      },
-      get tagName() {
-        return globalThis.__tilefinchIsVirtualRemote(this)
-          ? this.__tilefinchRemoteTagName
-          : __tilefinchTagName(handle) || "";
-      },
-      get localName() {
-        return String(this.tagName || "").toLowerCase();
-      },
-      get nodeType() {
-        return globalThis.__tilefinchIsVirtualRemote(this)
-          ? this.__tilefinchRemoteNodeType
-          : __tilefinchNodeType(handle);
-      },
-      get nodeName() {
-        return this.nodeType === Node.TEXT_NODE
-          ? "#text"
-          : this.nodeType === Node.COMMENT_NODE
-            ? "#comment"
-            : this.nodeType === Node.DOCUMENT_FRAGMENT_NODE
-              ? "#document-fragment"
-              : this.tagName;
-      },
-      get ownerDocument() {
-        return this.__tilefinchAdoptedOwner || document;
-      },
-      get namespaceURI() {
-        return this.__namespaceURI !== undefined
-          ? this.__namespaceURI
-          : this.nodeType === Node.ELEMENT_NODE
-            ? "http://www.w3.org/1999/xhtml"
-            : null;
-      },
-      get parentElement() {
-        if (this.__tilefinchDetachedParent)
-          return this.__tilefinchDetachedParent.nodeType === Node.ELEMENT_NODE
-            ? this.__tilefinchDetachedParent
-            : null;
-        const parent = globalThis.__tilefinchIsVirtualRemote(this)
-          ? __tilefinchRemoteNodeRelation(
-              this.__tilefinchStableKey,
-              this.__tilefinchRemoteSection,
-              0,
-            )
-          : wrap(__tilefinchRelation(handle, 8));
-        /* The native shadow-root carrier is an internal element so layout can
-           flatten it, but its JavaScript identity is a DocumentFragment.
-           Deriving parentElement from the native "element parent" relation
-           leaked that carrier to children of a shadow root. */
-        return parent instanceof Element
-          ? globalThis.__tilefinchCanonicalElement(parent)
-          : null;
-      },
-      get parentNode() {
-        if (this.__tilefinchDetachedParent) return this.__tilefinchDetachedParent;
-        if (this === document.documentElement) return document;
-        if (globalThis.__tilefinchIsVirtualRemote(this)) return this.parentElement;
-        const parent = wrap(__tilefinchRelation(handle, 8));
-        return parent || this.parentElement;
-      },
-      get firstElementChild() {
-        if (globalThis.__tilefinchHasRemoteNodeWriter && this === document.body)
-          return document.querySelector("body > *");
-        return globalThis.__tilefinchCanonicalElement(
-          globalThis.__tilefinchIsVirtualRemote(this)
-            ? __tilefinchRemoteNodeRelation(
-                this.__tilefinchStableKey,
-                this.__tilefinchRemoteSection,
-                1,
-              )
-            : wrap(__tilefinchRelation(handle, 1)),
-        );
-      },
-      get firstChild() {
-        if (globalThis.__tilefinchHasRemoteNodeWriter && this === document.body) {
-          let child = document.querySelector("body > *");
-          if (!child) return null;
-          for (
-            let previous = child.previousSibling;
-            previous;
-            previous = child.previousSibling
-          )
-            child = previous;
-          return child;
-        }
-        const remote = globalThis.__tilefinchIsVirtualRemote(this),
-          local = remote ? null : wrap(__tilefinchRelation(handle, 4));
-        return remote
-          ? __tilefinchRemoteNodeRelation(
-              this.__tilefinchStableKey,
-              this.__tilefinchRemoteSection,
-              4,
-            )
-          : local ||
-              (canReadRemoteRelation(this)
-                ? __tilefinchRemoteNodeRelation(
-                    this.__tilefinchStableKey,
-                    this.__tilefinchRemoteSection,
-                    4,
-                  )
-                : null);
-      },
-      get lastElementChild() {
-        const values = this.children;
-        return values.length ? values[values.length - 1] : null;
-      },
-      get lastChild() {
-        if (globalThis.__tilefinchHasRemoteNodeWriter && this === document.body) {
-          const values = this.childNodes;
-          return values.length ? values[values.length - 1] : null;
-        }
-        const remote = globalThis.__tilefinchIsVirtualRemote(this),
-          local = remote ? null : wrap(__tilefinchRelation(handle, 7));
-        return remote
-          ? __tilefinchRemoteNodeRelation(
-              this.__tilefinchStableKey,
-              this.__tilefinchRemoteSection,
-              7,
-            )
-          : local ||
-              (canReadRemoteRelation(this)
-                ? __tilefinchRemoteNodeRelation(
-                    this.__tilefinchStableKey,
-                    this.__tilefinchRemoteSection,
-                    7,
-                  )
-                : null);
-      },
-      get nextElementSibling() {
-        const remote = globalThis.__tilefinchIsVirtualRemote(this),
-          local = remote ? null : wrap(__tilefinchRelation(handle, 2)),
-          related = shadowAdjustedSibling(
-            this,
-            local ||
-              (!remote && canReadRemoteRelation(this)
-                ? __tilefinchRemoteNodeRelation(
-                    this.__tilefinchStableKey,
-                    this.__tilefinchRemoteSection,
-                    2,
-                  )
-                : null),
-            2,
-          );
-        return globalThis.__tilefinchCanonicalElement(
-          remote
-            ? __tilefinchRemoteNodeRelation(
-                this.__tilefinchStableKey,
-                this.__tilefinchRemoteSection,
-                2,
-              )
-            : related,
-        );
-      },
-      get nextSibling() {
-        const remote = globalThis.__tilefinchIsVirtualRemote(this),
-          local = remote ? null : wrap(__tilefinchRelation(handle, 5));
-        return remote
-          ? __tilefinchRemoteNodeRelation(
-              this.__tilefinchStableKey,
-              this.__tilefinchRemoteSection,
-              5,
-            )
-          : shadowAdjustedSibling(
-              this,
-              local ||
-                (canReadRemoteRelation(this)
-                  ? __tilefinchRemoteNodeRelation(
-                      this.__tilefinchStableKey,
-                      this.__tilefinchRemoteSection,
-                      5,
-                    )
-                  : null),
-              5,
-            );
-      },
-      get previousElementSibling() {
-        const remote = globalThis.__tilefinchIsVirtualRemote(this),
-          local = remote ? null : wrap(__tilefinchRelation(handle, 3)),
-          related = shadowAdjustedSibling(
-            this,
-            local ||
-              (!remote && canReadRemoteRelation(this)
-                ? __tilefinchRemoteNodeRelation(
-                    this.__tilefinchStableKey,
-                    this.__tilefinchRemoteSection,
-                    3,
-                  )
-                : null),
-            3,
-          );
-        return globalThis.__tilefinchCanonicalElement(
-          remote
-            ? __tilefinchRemoteNodeRelation(
-                this.__tilefinchStableKey,
-                this.__tilefinchRemoteSection,
-                3,
-              )
-            : related,
-        );
-      },
-      get previousSibling() {
-        const remote = globalThis.__tilefinchIsVirtualRemote(this),
-          local = remote ? null : wrap(__tilefinchRelation(handle, 6));
-        return remote
-          ? __tilefinchRemoteNodeRelation(
-              this.__tilefinchStableKey,
-              this.__tilefinchRemoteSection,
-              6,
-            )
-          : shadowAdjustedSibling(
-              this,
-              local ||
-                (canReadRemoteRelation(this)
-                  ? __tilefinchRemoteNodeRelation(
-                      this.__tilefinchStableKey,
-                      this.__tilefinchRemoteSection,
-                      6,
-                    )
-                  : null),
-              6,
-            );
-      },
-      get isConnected() {
-        for (const at of boundedAncestorPath(
-          this.__tilefinchDetachedParent,
-          (node) => node.__tilefinchDetachedParent || node.parentNode,
-        ))
-          if (at instanceof Document) return true;
-        return (
-          globalThis.__tilefinchIsVirtualRemote(this) ||
-          __tilefinchIsConnected(handle)
-        );
-      },
-      get children() {
-        if (!this.__tilefinchChildrenCollection)
-          Object.defineProperty(this, "__tilefinchChildrenCollection", {
-            configurable: true,
-            value: globalThis.__tilefinchLiveHTMLCollection(() => {
-              if (
-                !globalThis.__tilefinchHasRemoteNodeWriter &&
-                !globalThis.__tilefinchIsVirtualRemote(this)
-              )
-                return __tilefinchChildren(handle).map(wrap);
-              const values = [];
-              for (
-                let child = this.firstElementChild;
-                child && values.length < 128;
-                child = child.nextElementSibling
-              )
-                values.push(child);
-              return values;
-            }),
-          });
-        return this.__tilefinchChildrenCollection;
-      },
-      get childNodes() {
-        if (
-          !globalThis.__tilefinchHasRemoteNodeWriter &&
-          !globalThis.__tilefinchIsVirtualRemote(this)
-        )
-          return __tilefinchChildNodes(handle).map(wrap);
-        const values = [];
-        for (
-          let child = this.firstChild;
-          child && values.length < 128;
-          child = child.nextSibling
-        )
-          values.push(child);
-        return nodeList(values);
-      },
-      get content() {
-        const content = wrap(__tilefinchContent(handle));
-        if (
-          content &&
-          String(this.localName).toLowerCase() === "template" &&
-          typeof globalThis.__tilefinchNewDocument === "function"
-        ) {
-          if (!templateContentsOwnerDocument)
-            templateContentsOwnerDocument =
-              globalThis.__tilefinchNewDocument();
-          globalThis.__tilefinchAdoptNodeOwner?.(
-            content,
-            templateContentsOwnerDocument,
-          );
-        }
-        return content;
-      },
-      get contentWindow() {
-        return String(this.tagName).toLowerCase() === "iframe"
-          ? globalThis.__tilefinchFrameWindow?.(handle) || null
-          : null;
-      },
-      get contentDocument() {
-        if (
-          String(this.tagName).toLowerCase() !== "iframe" ||
-          !this.isConnected
-        )
-          return null;
-        globalThis.__tilefinchLoadLocalFrame?.(this);
-        const view = globalThis.__tilefinchFrameWindow?.(handle),
-          value = view?.document;
-        return value instanceof Document ? value : null;
-      },
-      get attributes() {
-        return namedNodeMapFor(this, () => {
-          const raw = globalThis.__tilefinchIsVirtualRemote(this)
-              ? globalThis.__tilefinchMergeRemoteAttributes(
-                  this,
-                  __tilefinchRemoteNodeAttributes(
-                    this.__tilefinchStableKey,
-                    this.__tilefinchRemoteSection,
-                  ),
-                )
-              : __tilefinchAttributes(handle),
-            shadow = namespaceAttributes(this),
-            /* Namespace-aware attributes are written through to the host
-               DOM so layout and style can see them, and mirrored here to
-               keep the qualified name the author wrote.  The host folds the
-               name to lower case, so hide its copy behind the mirror. */
-            shadowed = new Set(
-              shadow.map((attribute) => String(attribute.name).toLowerCase()),
-            ),
-            ordinary = raw
-              .filter(
-                (attribute) =>
-                  !shadowed.has(String(attribute.name).toLowerCase()),
-              )
-              .map((attribute) =>
-                attributeRecord(
-                  this,
-                  String(attribute.name),
-                  String(attribute.value),
-                ),
-              ),
-            current = [...ordinary, ...shadow],
-            order = attributeOrder.get(this) || [];
-          return [
-            ...order.filter((attribute) => current.includes(attribute)),
-            ...current.filter((attribute) => !order.includes(attribute)),
-          ];
-        });
-      },
-      get src() {
-        return this.getAttribute("src") || "";
-      },
-      set src(value) {
-        this.setAttribute("src", value);
-        if (
-          String(this.tagName).toLowerCase() === "iframe" &&
-          this.isConnected
-        )
-          globalThis.__tilefinchLoadLocalFrame?.(this);
-      },
-      get href() {
-        const value = this.getAttribute("href") || "";
-        try {
-          return value ? new URL(value, location.href).href : "";
-        } catch {
-          return value;
-        }
-      },
-      set href(value) {
-        this.setAttribute("href", value);
-      },
-      get hreflang() {
-        return this.getAttribute("hreflang") || "";
-      },
-      set hreflang(value) {
-        this.setAttribute("hreflang", value);
-      },
-      get rel() {
-        return this.getAttribute("rel") || "";
-      },
-      set rel(value) {
-        this.setAttribute("rel", value);
-      },
-      get target() {
-        return this.getAttribute("target") || "";
-      },
-      set target(value) {
-        this.setAttribute("target", value);
-      },
-      get width() {
-        if (this instanceof HTMLCanvasElement) {
-          globalThis.__tilefinchEnsureCanvasBootstrap?.();
-          if (globalThis.__tilefinchCanvasDimension)
-            return globalThis.__tilefinchCanvasDimension(this, "width");
-        }
-        return this.getAttribute("width") || "";
-      },
-      set width(value) {
-        if (this instanceof HTMLCanvasElement) {
-          globalThis.__tilefinchEnsureCanvasBootstrap?.();
-          if (globalThis.__tilefinchSetCanvasDimension) {
-            globalThis.__tilefinchSetCanvasDimension(this, "width", value);
-            return;
-          }
-        }
-        this.setAttribute("width", value);
-      },
-      get height() {
-        if (this instanceof HTMLCanvasElement) {
-          globalThis.__tilefinchEnsureCanvasBootstrap?.();
-          if (globalThis.__tilefinchCanvasDimension)
-            return globalThis.__tilefinchCanvasDimension(this, "height");
-        }
-        return this.getAttribute("height") || "";
-      },
-      set height(value) {
-        if (this instanceof HTMLCanvasElement) {
-          globalThis.__tilefinchEnsureCanvasBootstrap?.();
-          if (globalThis.__tilefinchSetCanvasDimension) {
-            globalThis.__tilefinchSetCanvasDimension(this, "height", value);
-            return;
-          }
-        }
-        this.setAttribute("height", value);
-      },
-      get sandbox() {
-        return makeTokenList(this, "sandbox");
-      },
-      set sandbox(value) {
-        this.setAttribute("sandbox", String(value));
-      },
-      get ariaAtomic() {
-        return this.getAttribute("aria-atomic");
-      },
-      set ariaAtomic(value) {
-        value === null
-          ? this.removeAttribute("aria-atomic")
-          : this.setAttribute("aria-atomic", value);
-      },
-      get ariaLive() {
-        return this.getAttribute("aria-live");
-      },
-      set ariaLive(value) {
-        value === null
-          ? this.removeAttribute("aria-live")
-          : this.setAttribute("aria-live", value);
-      },
-      get async() {
-        return (
-          this instanceof HTMLScriptElement &&
-          (scriptForceAsync(handle) || this.hasAttribute("async"))
-        );
-      },
-      set async(value) {
-        if (this instanceof HTMLScriptElement) scriptAsyncAssigned(handle);
-        value ? this.setAttribute("async", "") : this.removeAttribute("async");
-      },
-      get defer() {
-        return this.hasAttribute("defer");
-      },
-      set defer(value) {
-        value ? this.setAttribute("defer", "") : this.removeAttribute("defer");
-      },
-      setAttribute(name, value) {
-        name = String(name);
-        if (!name || /[\u0000\t\n\f\r ]/.test(name))
-          throw new DOMException(
-            "Invalid attribute name",
-            "InvalidCharacterError",
-          );
-        const html =
-          this.namespaceURI === "http://www.w3.org/1999/xhtml";
-        if (html)
-          name = name.toLowerCase();
-        value = String(value);
-        const cachedAttributes = attributeObjects.get(this),
-          matching = html
-            ? cachedAttributes?.get(attributeKey(null, name))
-            : [...this.attributes].find(
-                (attribute) => attribute.name === name,
-              ),
-          oldValue = html
-            ? __tilefinchGetAttribute(handle, name)
-            : matching?.value ?? null,
-          lowerName = name.toLowerCase(),
-          remote = globalThis.__tilefinchIsVirtualRemote(this),
-          rootKey =
-            this === document.body
-              ? "d:body"
-              : this === document.documentElement
-                ? "d:html"
-                : this === document.head
-                  ? "d:head"
-                  : "",
-          root =
-            !!rootKey &&
-            globalThis.__tilefinchHasRemoteNodeWriter &&
-            !globalThis.__tilefinchRestoringSection;
-        if (remote || root)
-          __tilefinchRemoteNodeWrite(
-            root ? rootKey : this.__tilefinchStableKey,
-            root
-              ? Number(__tilefinchSectionIdentity())
-              : this.__tilefinchRemoteSection,
-            2,
-            name,
-            value,
-          );
-        let result = false;
-        /* Attributes on non-HTML elements keep the qualified name the author
-           wrote, which the host DOM cannot store, so they are mirrored in a
-           namespace-aware list.  They must still be written through: layout,
-           style and the inline-SVG rasterizer read the host DOM only, and a
-           scripted <svg> whose width/height/viewBox/d never arrive there
-           measures as an empty box. */
-        if (!html && matching && namespaceAttributes(this).includes(matching)) {
-          matching.__tilefinchAttributeValue = value;
-          result = __tilefinchSetAttribute(handle, matching.name, value) || true;
-        } else if (
-          !matching &&
-          this.namespaceURI !== "http://www.w3.org/1999/xhtml"
-        ) {
-          const record = attributeRecord(this, name, value);
-          namespaceAttributes(this).push(record);
-          result = __tilefinchSetAttribute(handle, name, value) || true;
-        } else {
-          result = __tilefinchSetAttribute(handle, name, value);
-          /*
-           * Keep an already-observed NamedNodeMap live without constructing
-           * one for ordinary setAttribute calls that never expose it.
-           */
-          if (!html || cachedAttributes)
-            attributeRecord(this, name, value);
-        }
-        if (remote)
-          globalThis.__tilefinchRememberRemoteAttribute?.(this, name, value);
-        else if (globalThis.__tilefinchHasRemoteNodeWriter
-                 && lowerName === "id") {
-          const sourceKey = String(__tilefinchStableNodeKey(handle) || ""),
-            idKey = value && value.length <= 128 ? "i:" + value : "";
-          rekeyStableWrapper(this, idKey || sourceKey);
-        }
-        if (lowerName === "id") globalThis.__tilefinchExposeNamedProperty(value);
-        if (lowerName === "style" && this.__detachedOwner)
-          detachedStyles.delete(this);
-        invalidateInlineEventHandler(this, lowerName);
-        globalThis.__tilefinchCustomElementAttributeChanged?.(
-          this,
-          lowerName,
-          oldValue,
-          value,
-        );
-        globalThis.__tilefinchCanvasAttributeChanged?.(this, lowerName);
-        if (
-          this instanceof HTMLIFrameElement &&
-          (lowerName === "src" || lowerName === "srcdoc") &&
-          this.isConnected
-        )
-          globalThis.__tilefinchLoadLocalFrame?.(this);
-        globalThis.__tilefinchNotifyMutation?.(
-          this,
-          "attributes",
-          name,
-          [],
-          [],
-          oldValue,
-        );
-        return result || remote || root;
-      },
-      setAttributeNS(namespace, name, value) {
-        namespace = normalizeNamespace(namespace);
-        name = String(name);
-        const colon = name.indexOf(":");
-        if (
-          !name ||
-          /[\u0000-\u0020]/.test(name) ||
-          colon === name.length - 1 ||
-          (colon >= 0 && name.indexOf(":", colon + 1) >= 0)
-        )
-          throw new DOMException(
-            "Invalid qualified name",
-            "InvalidCharacterError",
-          );
-        const prefixAt = name.indexOf(":"),
-          prefix = prefixAt < 0 ? null : name.slice(0, prefixAt),
-          localName = prefixAt < 0 ? name : name.slice(prefixAt + 1),
-          xml = "http://www.w3.org/XML/1998/namespace",
-          xmlns = "http://www.w3.org/2000/xmlns/";
-        if (
-          (prefix !== null && namespace === null) ||
-          (prefix === "xml" && namespace !== xml) ||
-          ((name === "xmlns" || prefix === "xmlns") &&
-            namespace !== xmlns) ||
-          (namespace === xmlns &&
-            name !== "xmlns" &&
-            prefix !== "xmlns")
-        )
-          throw new DOMException("Invalid namespace", "NamespaceError");
-        const
-          values = namespaceAttributes(this),
-          existing = [...this.attributes].find(
-            (attribute) =>
-              attribute.namespaceURI === namespace &&
-              attribute.localName === localName,
-          ),
-          at = existing ? values.indexOf(existing) : -1,
-          oldValue = existing?.value ?? null;
-        if (existing && at < 0) {
-          __tilefinchSetAttribute(handle, existing.name, String(value));
-          existing.__tilefinchAttributeValue = String(value);
-        } else if (existing) {
-          existing.__tilefinchAttributeValue = String(value);
-          __tilefinchSetAttribute(handle, existing.name, String(value));
-        } else if (at < 0) {
-          if (values.length >= 64)
-            throw new RangeError("attribute limit exceeded");
-          const record = attributeRecord(
-            this,
-            name,
-            String(value),
-            namespace,
-            prefix,
-          );
-          values.push(record);
-          __tilefinchSetAttribute(handle, name, String(value));
-        }
-        globalThis.__tilefinchCustomElementAttributeChanged?.(
-          this,
-          localName,
-          oldValue,
-          String(value),
-          namespace,
-        );
-        globalThis.__tilefinchNotifyMutation?.(
-          this,
-          "attributes",
-          localName,
-          [],
-          [],
-          oldValue,
-          null,
-          null,
-          namespace,
-        );
-      },
-      getAttribute(name) {
-        name = String(name);
-        if (this.namespaceURI === "http://www.w3.org/1999/xhtml")
-          name = name.toLowerCase();
-        if (globalThis.__tilefinchIsVirtualRemote(this))
-          return __tilefinchRemoteNodeRead(
-            this.__tilefinchStableKey,
-            this.__tilefinchRemoteSection,
-            2,
-            name,
-          );
-        /*
-         * The host DOM is authoritative for ordinary HTML attributes.
-         * Going through `this.attributes` constructs a NamedNodeMap plus an
-         * Attr wrapper graph for every first read.  Focusability checks make
-         * several such reads per new link, which retained enough wrapper
-         * machinery to exhaust a 4 MiB realm after roughly thirty moves.
-         */
-        if (this.namespaceURI === "http://www.w3.org/1999/xhtml")
-          return __tilefinchGetAttribute(handle, name);
-        const found = namespaceAttributes(this).find(
-          (attribute) => attribute.name === name,
-        );
-        return found ? found.value : __tilefinchGetAttribute(handle, name);
-      },
-      getAttributeNS(namespace, name) {
-        namespace = normalizeNamespace(namespace);
-        name = String(name);
-        const found = [...this.attributes].find(
-          (attribute) =>
-            attribute.namespaceURI === namespace &&
-            attribute.localName === name,
-        );
-        if (found) return found.value;
-        const prefix =
-          namespace === "http://www.w3.org/1999/xlink"
-            ? "xlink:"
-            : namespace === "http://www.w3.org/XML/1998/namespace"
-              ? "xml:"
-              : "";
-        return prefix ? this.getAttribute(prefix + name) : null;
-      },
-      hasAttribute(name) {
-        return this.getAttribute(name) !== null;
-      },
-      hasAttributeNS(namespace, name) {
-        return this.getAttributeNS(namespace, name) !== null;
-      },
-      getAttributeNode(name) {
-        return this.attributes.getNamedItem(String(name));
-      },
-      getAttributeNodeNS(namespace, localName) {
-        return this.attributes.getNamedItemNS(
-          normalizeNamespace(namespace),
-          String(localName),
-        );
-      },
-      setAttributeNode(attribute) {
-        return this.attributes.setNamedItem(attribute);
-      },
-      setAttributeNodeNS(attribute) {
-        return this.attributes.setNamedItemNS(attribute);
-      },
-      removeAttributeNode(attribute) {
-        if (!(attribute instanceof Attr))
-          throw new TypeError("removeAttributeNode requires an Attr");
-        if (attribute.ownerElement !== this)
-          throw new DOMException("Attribute was not found", "NotFoundError");
-        this.removeAttributeNS(attribute.namespaceURI, attribute.localName);
-        return attribute;
-      },
-      toggleAttribute(name, force) {
-        name = String(name);
-        if (!name)
-          throw new DOMException(
-            "Invalid attribute name",
-            "InvalidCharacterError",
-          );
-        if (this.namespaceURI === "http://www.w3.org/1999/xhtml")
-          name = name.toLowerCase();
-        const present = this.hasAttribute(name),
-          next = force === undefined ? !present : !!force;
-        if (next && !present) this.setAttribute(name, "");
-        else if (!next && present) this.removeAttribute(name);
-        return next;
-      },
-      getAttributeNames() {
-        return this.attributes.map((attribute) => attribute.name);
-      },
-      removeAttribute(name) {
-        name = String(name);
-        const html =
-          this.namespaceURI === "http://www.w3.org/1999/xhtml";
-        if (html)
-          name = name.toLowerCase();
-        const cachedAttributes = attributeObjects.get(this),
-          matching = html
-            ? cachedAttributes?.get(attributeKey(null, name))
-            : [...this.attributes].find(
-                (attribute) => attribute.name === name,
-              ),
-          oldValue = html
-            ? __tilefinchGetAttribute(handle, name)
-            : matching?.value ?? null,
-          lowerName = name.toLowerCase(),
-          remote = globalThis.__tilefinchIsVirtualRemote(this),
-          rootKey =
-            this === document.body
-              ? "d:body"
-              : this === document.documentElement
-                ? "d:html"
-                : this === document.head
-                  ? "d:head"
-                  : "",
-          root =
-            !!rootKey &&
-            globalThis.__tilefinchHasRemoteNodeWriter &&
-            !globalThis.__tilefinchRestoringSection;
-        if (remote || root)
-          __tilefinchRemoteNodeWrite(
-            root ? rootKey : this.__tilefinchStableKey,
-            root
-              ? Number(__tilefinchSectionIdentity())
-              : this.__tilefinchRemoteSection,
-            3,
-            name,
-          );
-        let result = false;
-        if (
-          !html &&
-          matching !== undefined &&
-          namespaceAttributes(this).includes(matching)
-        ) {
-          const values = namespaceAttributes(this),
-            at = values.indexOf(matching);
-          if (at >= 0) {
-            values.splice(at, 1);
-            /* The mirror hid a written-through host attribute; drop both. */
-            result = __tilefinchRemoveAttribute(handle, matching.name) || true;
-          }
-        } else {
-          result = __tilefinchRemoveAttribute(handle, name);
-        }
-        if (matching) {
-          matching.__tilefinchAttributeOwner = null;
-          cachedAttributes?.delete(
-            attributeKey(matching.namespaceURI, matching.localName),
-          );
-        }
-        if (remote)
-          globalThis.__tilefinchRememberRemoteAttribute?.(this, name, null);
-        else if (globalThis.__tilefinchHasRemoteNodeWriter
-                 && lowerName === "id")
-          rekeyStableWrapper(this, String(__tilefinchStableNodeKey(handle) || ""));
-        if (oldValue !== null) {
-          if (lowerName === "style" && this.__detachedOwner)
-            detachedStyles.delete(this);
-          invalidateInlineEventHandler(this, lowerName);
-          globalThis.__tilefinchCanvasAttributeChanged?.(this, lowerName);
-          if (
-            this instanceof HTMLIFrameElement &&
-            (lowerName === "src" || lowerName === "srcdoc") &&
-            this.isConnected
-          )
-            globalThis.__tilefinchLoadLocalFrame?.(this);
-          globalThis.__tilefinchCustomElementAttributeChanged?.(
-            this,
-            lowerName,
-            oldValue,
-            null,
-          );
-          globalThis.__tilefinchNotifyMutation?.(
-            this,
-            "attributes",
-            matching?.localName || name,
-            [],
-            [],
-            oldValue,
-            null,
-            null,
-            matching?.namespaceURI ?? null,
-          );
-        }
-        return result || remote || root;
-      },
-      removeAttributeNS(namespace, name) {
-        namespace = normalizeNamespace(namespace);
-        name = String(name);
-        const values = namespaceAttributes(this),
-          removed = [...this.attributes].find(
-            (attribute) =>
-              attribute.namespaceURI === namespace &&
-              attribute.localName === name,
-          );
-        if (removed) {
-          const at = values.indexOf(removed);
-          if (at >= 0) values.splice(at, 1);
-          __tilefinchRemoveAttribute(handle, removed.name);
-          removed.__tilefinchAttributeOwner = null;
-          attributeObjects
-            .get(this)
-            ?.delete(attributeKey(namespace, removed.localName));
-          globalThis.__tilefinchCustomElementAttributeChanged?.(
-            this,
-            removed.localName,
-            removed.value,
-            null,
-            namespace,
-          );
-          globalThis.__tilefinchNotifyMutation?.(
-            this,
-            "attributes",
-            removed.localName,
-            [],
-            [],
-            removed.value,
-            null,
-            null,
-            namespace,
-          );
-          return;
-        }
-        const prefix =
-          namespace === "http://www.w3.org/1999/xlink"
-            ? "xlink:"
-            : namespace === "http://www.w3.org/XML/1998/namespace"
-              ? "xml:"
-              : "";
-        if (prefix) this.removeAttribute(prefix + name);
-      },
-      getElementById(id) {
-        return this.querySelector("#" + String(id));
-      },
-      matches(selector) {
-        selector = String(selector);
-        const compact = selector.replace(/\s+/g, "").toLowerCase();
-        if (
-          compact === ":defined" ||
-          compact === ":not(:defined)"
-        ) {
-          const defined =
-            globalThis.__tilefinchCustomElementIsDefined?.(this) ?? true;
-          return compact === ":defined" ? defined : !defined;
-        }
-        return globalThis.__tilefinchElementMatches
-          ? globalThis.__tilefinchElementMatches(this, selector)
-          : globalThis.__tilefinchIsVirtualRemote(this)
-            ? __tilefinchRemoteNodeRead(
-                this.__tilefinchStableKey,
-                this.__tilefinchRemoteSection,
-                4,
-                selector,
-              ) === "1"
-            : __tilefinchMatches(this.__handle, selector);
-      },
-      closest(selector) {
-        return globalThis.__tilefinchElementClosest
-          ? globalThis.__tilefinchElementClosest(this, selector)
-          : (() => {
-              for (
-                let at = this, steps = 0;
-                at && steps < ancestorLimit;
-                at = at.parentElement, steps++
-              )
-                if (at.matches(selector)) return at;
-              return null;
-            })();
-      },
-      contains(other) {
-        for (
-          let at = other, steps = 0;
-          at && steps < ancestorLimit;
-          at = at.parentElement, steps++
-        )
-          if (at === this) return true;
-        return false;
-      },
-      get scrollTop() {
-        return this.__tilefinchGeometryValue().scrollTop;
-      },
-      set scrollTop(value) {
-        smoothElementScrolls.delete(this);
-        const g = this.__tilefinchGeometryValue();
-        const overflow = getComputedStyle(this).overflow;
-        __tilefinchSetElementScroll(
-          handle,
-          g.scrollLeft,
-          overflow === "visible"
-            ? 0
-            : Number(value) || 0,
-        );
-      },
-      get scrollLeft() {
-        return this.__tilefinchGeometryValue().scrollLeft;
-      },
-      set scrollLeft(value) {
-        smoothElementScrolls.delete(this);
-        const g = this.__tilefinchGeometryValue();
-        const overflow = getComputedStyle(this).overflow;
-        __tilefinchSetElementScroll(
-          handle,
-          overflow === "visible"
-            ? 0
-            : Number(value) || 0,
-          g.scrollTop,
-        );
-      },
-      get clientWidth() {
-        if (this === document.documentElement) return innerWidth;
-        const style = getComputedStyle(this),
-          width = parseFloat(style.width),
-          left =
-            parseFloat(style.getPropertyValue("padding-left")) ||
-            parseFloat(style.padding) ||
-            0,
-          right =
-            parseFloat(style.getPropertyValue("padding-right")) ||
-            parseFloat(style.padding) ||
-            0;
-        if (Number.isFinite(width) && width > 0)
-          return Math.round(
-            width +
-              (String(this.tagName).toLowerCase() === "input"
-                ? 0
-                : left + right),
-          );
-        return this.__tilefinchGeometryValue().clientWidth;
-      },
-      get clientHeight() {
-        if (this === document.documentElement) return innerHeight;
-        const style = getComputedStyle(this),
-          height = parseFloat(style.height),
-          top =
-            parseFloat(style.getPropertyValue("padding-top")) ||
-            parseFloat(style.padding) ||
-            0,
-          bottom =
-            parseFloat(style.getPropertyValue("padding-bottom")) ||
-            parseFloat(style.padding) ||
-            0;
-        if (Number.isFinite(height) && height > 0)
-          return Math.round(height + top + bottom);
-        return this.__tilefinchGeometryValue().clientHeight;
-      },
-      get clientTop() {
-        if (this === document.documentElement) return 0;
-        const style = getComputedStyle(this);
-        return Math.round(
-          parseFloat(style.getPropertyValue("border-top-width")) ||
-          parseFloat(style.borderWidth) ||
-          0,
-        );
-      },
-      get clientLeft() {
-        if (this === document.documentElement) return 0;
-        const style = getComputedStyle(this);
-        return Math.round(
-          (parseFloat(style.getPropertyValue("border-left-width")) ||
-            parseFloat(style.borderWidth) ||
-            0) +
-            (String(this.tagName).toLowerCase() === "input"
-              ? parseFloat(style.getPropertyValue("padding-left")) ||
-                parseFloat(style.padding) ||
-                0
-              : 0),
-        );
-      },
-      get offsetWidth() {
-        return this.getBoundingClientRect().width;
-      },
-      get offsetHeight() {
-        return this.getBoundingClientRect().height;
-      },
-      get offsetTop() {
-        const parent = this.offsetParent,
-          rect = this.getBoundingClientRect(),
-          geometry = this.__tilefinchGeometryValue();
-        let value =
-          rect.top - (parent ? parent.getBoundingClientRect().top : 0);
-        if (
-          !geometry.retained &&
-          value <= 0 &&
-          getComputedStyle(this).position === "static"
-        ) {
-          value = 0;
-          for (const sibling of parent?.childNodes || []) {
-            if (sibling === this) break;
-            if (!(sibling instanceof Element)) continue;
-            const display = getComputedStyle(sibling).display;
-            if (display === "block") value += sibling.offsetHeight;
-          }
-        }
-        return value;
-      },
-      get offsetLeft() {
-        const parent = this.offsetParent,
-          rect = this.getBoundingClientRect(),
-          geometry = this.__tilefinchGeometryValue();
-        let value =
-          rect.left - (parent ? parent.getBoundingClientRect().left : 0);
-        if (
-          !geometry.retained &&
-          value <= 0 &&
-          getComputedStyle(this).position === "static"
-        ) {
-          value = 0;
-          for (const sibling of parent?.childNodes || []) {
-            if (sibling === this) break;
-            if (!(sibling instanceof Element)) continue;
-            if (getComputedStyle(sibling).display !== "block")
-              value += sibling.offsetWidth;
-          }
-        }
-        return value;
-      },
-      get offsetParent() {
-        const position = getComputedStyle(this).position;
-        if (position === "fixed") {
-          for (
-            let at = this.parentElement, steps = 0;
-            at && steps < ancestorLimit;
-            at = at.parentElement, steps++
-          ) {
-            const style = getComputedStyle(at);
-            if (
-              (style.getPropertyValue("transform") &&
-                style.getPropertyValue("transform") !== "none") ||
-              String(style.getPropertyValue("will-change"))
-                .split(/\s*,\s*/)
-                .includes("transform") ||
-              (style.getPropertyValue("perspective") &&
-                style.getPropertyValue("perspective") !== "none") ||
-              (style.getPropertyValue("filter") &&
-                style.getPropertyValue("filter") !== "none") ||
-              String(style.contain).split(/\s+/).includes("paint")
-            )
-              return at;
-          }
-          return null;
-        }
-        for (
-          let at = this.parentElement, steps = 0;
-          at && steps < ancestorLimit;
-          at = at.parentElement, steps++
-        )
-          if (getComputedStyle(at).position !== "static") return at;
-        return document.body;
-      },
-      get scrollWidth() {
-        return this.__tilefinchGeometryValue().scrollWidth;
-      },
-      get scrollHeight() {
-        return this.__tilefinchGeometryValue().scrollHeight;
-      },
-      scrollTo(xOrOptions, y) {
-        if (
-          arguments.length === 1 &&
-          (xOrOptions === null || typeof xOrOptions !== "object")
-        )
-          return Promise.reject(
-            new TypeError("Single scroll argument must be a dictionary"),
-          );
-        if (
-          xOrOptions &&
-          typeof xOrOptions === "object" &&
-          xOrOptions.behavior !== undefined &&
-          !["auto", "instant", "smooth"].includes(
-            String(xOrOptions.behavior),
-          )
-        )
-          return Promise.reject(new TypeError("Invalid scroll behavior"));
-        let left = this.scrollLeft,
-          top = this.scrollTop;
-        if (typeof xOrOptions === "object" && xOrOptions !== null) {
-          left = xOrOptions.left ?? left;
-          top = xOrOptions.top ?? top;
-        } else {
-          left = xOrOptions;
-          top = y;
-        }
-        left = Number(left) || 0;
-        top = Number(top) || 0;
-        const scrollStyle = getComputedStyle(this),
-          requestedBehavior =
-            typeof xOrOptions === "object" && xOrOptions !== null
-              ? String(xOrOptions.behavior || "auto")
-              : "auto",
-          behavior =
-            requestedBehavior === "auto" &&
-            scrollStyle.scrollBehavior === "smooth"
-              ? "smooth"
-              : requestedBehavior,
-          startLeft = this.scrollLeft,
-          startTop = this.scrollTop,
-          acceptsX = scrollStyle.overflowX !== "visible",
-          acceptsY = scrollStyle.overflowY !== "visible",
-          apply = (nextLeft, nextTop) => {
-            __tilefinchSetElementScroll(
-              handle,
-              acceptsX ? nextLeft : 0,
-              acceptsY ? nextTop : 0,
-            );
-            this.dispatchEvent(new Event("scroll"));
-          };
-        smoothElementScrolls.delete(this);
-        if (
-          behavior !== "smooth" ||
-          (left === startLeft && top === startTop)
-        ) {
-          apply(left, top);
-          return Promise.resolve();
-        }
-        const state = {
-          frame: 0,
-          lastLeft: startLeft,
-          lastTop: startTop,
-        };
-        smoothElementScrolls.set(this, state);
-        return new Promise((resolve) => {
-          const step = () => {
-            if (smoothElementScrolls.get(this) !== state || !this.isConnected) {
-              resolve();
-              return;
-            }
-            if (
-              state.frame > 0 &&
-              (this.scrollLeft !== state.lastLeft ||
-                this.scrollTop !== state.lastTop)
-            ) {
-              smoothElementScrolls.delete(this);
-              resolve();
-              return;
-            }
-            state.frame++;
-            const elapsed = state.frame / 12,
-              progress = 1 - (1 - elapsed) * (1 - elapsed);
-            apply(
-              startLeft + (left - startLeft) * progress,
-              startTop + (top - startTop) * progress,
-            );
-            state.lastLeft = this.scrollLeft;
-            state.lastTop = this.scrollTop;
-            if (state.frame < 12) {
-              requestAnimationFrame(step);
-            } else {
-              smoothElementScrolls.delete(this);
-              resolve();
-            }
-          };
-          requestAnimationFrame(step);
-        });
-      },
-      scroll(...args) {
-        return this.scrollTo(...args);
-      },
-      scrollBy(xOrOptions, y) {
-        if (
-          arguments.length === 1 &&
-          (xOrOptions === null || typeof xOrOptions !== "object")
-        )
-          return Promise.reject(
-            new TypeError("Single scroll argument must be a dictionary"),
-          );
-        if (typeof xOrOptions === "object" && xOrOptions !== null)
-          return this.scrollTo({
-            left: this.scrollLeft + (Number(xOrOptions.left) || 0),
-            top: this.scrollTop + (Number(xOrOptions.top) || 0),
-            behavior: xOrOptions.behavior,
-          });
-        else
-          return this.scrollTo(
-            this.scrollLeft + (Number(xOrOptions) || 0),
-            this.scrollTop + (Number(y) || 0),
-          );
-      },
-      scrollIntoView(options = {}) {
-        const dictionary = options && typeof options === "object" ? options : {},
-          behavior = dictionary.behavior || "auto",
-          block =
-            options === false ? "end" : dictionary.block || "start",
-          inline = dictionary.inline || "nearest",
-          targetStyle = getComputedStyle(this),
-          marginTop =
-            parseFloat(targetStyle.getPropertyValue("scroll-margin-top")) || 0,
-          marginBottom =
-            parseFloat(targetStyle.getPropertyValue("scroll-margin-bottom")) ||
-            0,
-          marginLeft =
-            parseFloat(targetStyle.getPropertyValue("scroll-margin-left")) || 0,
-          marginRight =
-            parseFloat(targetStyle.getPropertyValue("scroll-margin-right")) ||
-            0;
-        for (const at of boundedAncestorPath(
-          this.parentElement,
-          (node) => node.parentElement,
-        )) {
-          if (at === document.scrollingElement) continue;
-          const style = getComputedStyle(at);
-          const scrollsX = ["auto", "scroll", "hidden"].includes(
-              style.overflowX,
-            ),
-            scrollsY = ["auto", "scroll", "hidden"].includes(style.overflowY);
-          if (!scrollsX && !scrollsY)
-            continue;
-          const targetRect = this.getBoundingClientRect(),
-            containerRect = at.getBoundingClientRect(),
-            paddingTop =
-              parseFloat(style.getPropertyValue("scroll-padding-top")) || 0,
-            paddingBottom =
-              parseFloat(style.getPropertyValue("scroll-padding-bottom")) || 0,
-            paddingLeft =
-              parseFloat(style.getPropertyValue("scroll-padding-left")) || 0,
-            paddingRight =
-              parseFloat(style.getPropertyValue("scroll-padding-right")) || 0,
-            start =
-              at.scrollTop +
-              targetRect.top -
-              containerRect.top -
-              paddingTop -
-              marginTop,
-            end =
-              at.scrollTop +
-              targetRect.bottom -
-              containerRect.bottom +
-              paddingBottom +
-              marginBottom,
-            startX =
-              at.scrollLeft +
-              targetRect.left -
-              containerRect.left -
-              paddingLeft -
-              marginLeft,
-            endX =
-              at.scrollLeft +
-              targetRect.right -
-              containerRect.right +
-              paddingRight +
-              marginRight;
-          let top = at.scrollTop,
-            left = at.scrollLeft;
-          if (block === "end") top = end;
-          else if (block === "center") top = (start + end) / 2;
-          else if (block === "start") top = start;
-          else if (block === "nearest")
-            top =
-              targetRect.top < containerRect.top
-                ? start
-                : targetRect.bottom > containerRect.bottom
-                  ? end
-                  : at.scrollTop;
-          if (inline === "end") left = endX;
-          else if (inline === "center") left = (startX + endX) / 2;
-          else if (inline === "start") left = startX;
-          else if (inline === "nearest")
-            left =
-              targetRect.left < containerRect.left
-                ? startX
-                : targetRect.right > containerRect.right
-                  ? endX
-                  : at.scrollLeft;
-          at.scrollTo({
-            left: scrollsX ? left : at.scrollLeft,
-            top: scrollsY ? top : at.scrollTop,
-            behavior,
-          });
-        }
-        const root = document.scrollingElement;
-        if (root && typeof globalThis.scrollTo === "function") {
-          const rootStyle = getComputedStyle(root),
-            rect = this.getBoundingClientRect(),
-            paddingTop =
-              parseFloat(rootStyle.getPropertyValue("scroll-padding-top")) || 0,
-            paddingBottom =
-              parseFloat(rootStyle.getPropertyValue("scroll-padding-bottom")) ||
-              0,
-            viewportHeight =
-              Number(globalThis.innerHeight) ||
-              Number(globalThis.visualViewport?.height) ||
-              0,
-            start = globalThis.scrollY + rect.top - paddingTop - marginTop,
-            end =
-              globalThis.scrollY +
-              rect.bottom -
-              viewportHeight +
-              paddingBottom +
-              marginBottom;
-          let top = start;
-          if (block === "end") top = end;
-          else if (block === "center") top = (start + end) / 2;
-          else if (block === "nearest")
-            top =
-              rect.top < paddingTop
-                ? start
-                : rect.bottom > viewportHeight - paddingBottom
-                  ? end
-                  : globalThis.scrollY;
-          globalThis.scrollTo({ top, behavior });
-        }
-      },
-      getBoundingClientRect() {
-        if (!this.isConnected) return new DOMRect(0, 0, 0, 0);
-        const g = this.__tilefinchGeometryValue();
-        // Retained layout geometry already includes positioned layout,
-        // transforms, ancestor/page scrolling and fixed-position adjustment.
-        // Avoid rebuilding it with style and ancestor walks on the common
-        // path; the fallback below remains for virtual or not-yet-laid-out
-        // nodes.
-        const authoritativeAutoHeight =
-          g.authoritative &&
-          (Number(g.height) || 0) <= 0 &&
-          (this.firstChild || shadowRootForHost(this));
-        if (g.authoritative && !authoritativeAutoHeight)
-          return new DOMRect(
-            Number(g.x) || 0,
-            Number(g.y) || 0,
-            Number(g.width) || 0,
-            Number(g.height) || 0,
-          );
-        const style = getComputedStyle(this);
-        if (style.display === "none") return new DOMRect();
-        const retainedWidth = Number(g.width) || 0,
-          retainedHeight = Number(g.height) || 0,
-          parentElement = this.parentElement,
-          /* A retained box at (0, 0) is a valid authoritative position,
-             especially for the first node in a materialized section. Only
-             synthesize flow when the native layout supplied no dimensions;
-             otherwise a previous remote sibling can shift a correct box by
-             its own height. */
-          needsFlowFallback =
-            retainedWidth <= 0 && retainedHeight <= 0,
-          positionedContainingElement =
-            style.position === "absolute" || style.position === "fixed"
-              ? boundedAncestorPath(
-                  this.parentElement,
-                  (node) => node.parentElement,
-                ).find((at) => {
-                  const candidate = getComputedStyle(at),
-                    transformed =
-                      (candidate.getPropertyValue("transform") &&
-                        candidate.getPropertyValue("transform") !== "none") ||
-                      String(candidate.getPropertyValue("will-change"))
-                        .split(/\s*,\s*/)
-                        .includes("transform") ||
-                      (candidate.getPropertyValue("perspective") &&
-                        candidate.getPropertyValue("perspective") !== "none") ||
-                      (candidate.getPropertyValue("filter") &&
-                        candidate.getPropertyValue("filter") !== "none") ||
-                      String(candidate.contain).split(/\s+/).includes("paint");
-                  return transformed ||
-                    (style.position === "absolute" &&
-                      candidate.position !== "static");
-                }) || null
-              : null,
-          containingElement =
-            style.position === "absolute" || style.position === "fixed"
-              ? positionedContainingElement
-              : parentElement,
-          containingGeometry =
-            containingElement?.__tilefinchGeometryValue?.() || null,
-          containingRect = containingGeometry
-            ? new DOMRect(
-                Number(containingGeometry.x) || 0,
-                Number(containingGeometry.y) || 0,
-                Number(containingGeometry.width) || 0,
-                Number(containingGeometry.height) || 0,
-              )
-            : new DOMRect(0, 0, innerWidth, innerHeight),
-          cssPixels = (value, reference, viewportFallback) => {
-            value = String(value || "").trim();
-            const number = parseFloat(value);
-            if (!Number.isFinite(number)) return NaN;
-            if (value.endsWith("%"))
-              return ((reference || viewportFallback) * number) / 100;
-            if (value.endsWith("em") || value.endsWith("rem"))
-              return number * 16;
-            return number;
-          };
-        let x = Number(g.x) || 0,
-          y = Number(g.y) || 0,
-          width = retainedWidth,
-          height = retainedHeight;
-        const cssWidth = cssPixels(
-            style.width,
-            containingRect.width,
-            innerWidth,
-          ),
-          cssHeight = cssPixels(
-            style.height,
-            containingRect.height,
-            innerHeight,
-          );
-        if (Number.isFinite(cssWidth) && cssWidth > 0) width = cssWidth;
-        if (Number.isFinite(cssHeight) && cssHeight > 0) height = cssHeight;
-        if (
-          height <= 0 &&
-          !Number.isFinite(cssHeight) &&
-          style.position !== "absolute" &&
-          style.position !== "fixed"
-        ) {
-          /* A shadow root is represented natively by a display:contents
-             carrier. Until native layout has consumed a dynamic shadow
-             mutation, derive the host's auto block size from its in-flow
-             descendants. Keep both traversal and nesting explicitly bounded:
-             geometry is observable author work and must not turn a deep
-             hostile tree into unbounded recursion on PSP. */
-          const state = { remaining: 128 },
-            measureAutoContentHeight = (container, depth) => {
-              if (depth >= 16 || state.remaining <= 0) return 0;
-              const shadow =
-                container instanceof Element
-                  ? shadowRootForHost(container)
-                  : null;
-              if (shadow)
-                return measureAutoContentHeight(shadow, depth + 1);
-              let blocks = 0,
-                line = 0,
-                child = container?.firstChild || null;
-              for (
-                let siblings = 0;
-                child && siblings < 128 && state.remaining > 0;
-                child = child.nextSibling, siblings++
-              ) {
-                state.remaining--;
-                if (
-                  !(child instanceof Element) &&
-                  !(child instanceof ShadowRoot)
-                )
-                  continue;
-                if (child instanceof ShadowRoot) {
-                  const contents = measureAutoContentHeight(child, depth + 1);
-                  line = Math.max(line, contents);
-                  continue;
-                }
-                const childStyle = getComputedStyle(child);
-                if (
-                  childStyle.display === "none" ||
-                  childStyle.position === "absolute" ||
-                  childStyle.position === "fixed"
-                )
-                  continue;
-                const childGeometry =
-                    child.__tilefinchGeometryValue?.() || {},
-                  authoredHeight = cssPixels(
-                    childStyle.height,
-                    containingRect.height,
-                    innerHeight,
-                  ),
-                  marginTop =
-                    parseFloat(childStyle.getPropertyValue("margin-top")) || 0,
-                  marginBottom =
-                    parseFloat(childStyle.getPropertyValue("margin-bottom")) ||
-                    0,
-                  padding =
-                    (parseFloat(
-                      childStyle.getPropertyValue("padding-top"),
-                    ) || 0) +
-                    (parseFloat(
-                      childStyle.getPropertyValue("padding-bottom"),
-                    ) || 0) +
-                    (parseFloat(
-                      childStyle.getPropertyValue("border-top-width"),
-                    ) || 0) +
-                    (parseFloat(
-                      childStyle.getPropertyValue("border-bottom-width"),
-                    ) || 0);
-                let childHeight = Number(childGeometry.height) || 0;
-                if (Number.isFinite(authoredHeight) && authoredHeight > 0)
-                  childHeight = authoredHeight + padding;
-                else if (childHeight <= 0)
-                  childHeight =
-                    measureAutoContentHeight(child, depth + 1) + padding;
-                const extent = marginTop + childHeight + marginBottom,
-                  inline =
-                    childStyle.display === "inline" ||
-                    childStyle.display === "inline-block" ||
-                    childStyle.display === "inline-flex" ||
-                    childStyle.display === "inline-grid";
-                if (inline) line = Math.max(line, extent);
-                else {
-                  blocks += line + extent;
-                  line = 0;
-                }
-              }
-              return blocks + line;
-            };
-          height = measureAutoContentHeight(this, 0);
-        }
-        if (
-          needsFlowFallback &&
-          (this === document.documentElement || this === document.body)
-        ) {
-          x = 0;
-          y = 0;
-          if (width <= 0) width = innerWidth;
-          if (height <= 0)
-            height =
-              this === document.documentElement
-                ? innerHeight
-                : parseFloat(style.height) || innerHeight;
-        } else if (
-          needsFlowFallback &&
-          style.position !== "absolute" &&
-          style.position !== "fixed"
-        ) {
-          const parentRect = containingRect,
-            marginLeft =
-              parseFloat(style.getPropertyValue("margin-left")) || 0,
-            marginTop =
-              parseFloat(style.getPropertyValue("margin-top")) || 0;
-          let lineX = parentRect.left,
-            lineY = parentRect.top,
-            lineHeight = 0,
-            blockBottom = parentRect.top;
-          for (const sibling of this.parentElement?.childNodes || []) {
-            if (sibling === this) break;
-            if (!(sibling instanceof Element)) continue;
-            const siblingStyle = getComputedStyle(sibling);
-            if (
-              siblingStyle.display === "none" ||
-              siblingStyle.position === "absolute" ||
-              siblingStyle.position === "fixed"
-            )
-              continue;
-            const siblingGeometry =
-                sibling.__tilefinchGeometryValue?.() || null,
-              siblingRect = siblingGeometry
-                ? new DOMRect(
-                    Number(siblingGeometry.x) || 0,
-                    Number(siblingGeometry.y) || 0,
-                    Number(siblingGeometry.width) || 0,
-                    Number(siblingGeometry.height) || 0,
-                  )
-                : new DOMRect(),
-              siblingBottom =
-                parseFloat(
-                  siblingStyle.getPropertyValue("margin-bottom"),
-                ) || 0,
-              siblingRight =
-                parseFloat(
-                  siblingStyle.getPropertyValue("margin-right"),
-                ) || 0,
-              inline =
-                siblingStyle.display === "inline" ||
-                siblingStyle.display === "inline-block";
-            if (inline) {
-              lineY = Math.max(lineY, blockBottom);
-              lineX += siblingRect.width + siblingRight;
-              lineHeight = Math.max(
-                lineHeight,
-                siblingRect.height + siblingBottom,
-              );
-            } else {
-              if (lineHeight > 0) {
-                blockBottom = Math.max(
-                  blockBottom,
-                  lineY + lineHeight,
-                );
-                lineX = parentRect.left;
-                lineHeight = 0;
-              }
-              blockBottom = Math.max(
-                blockBottom,
-                siblingRect.bottom + siblingBottom,
-              );
-              lineY = blockBottom;
-            }
-          }
-          const inline =
-            style.display === "inline" || style.display === "inline-block";
-          x = (inline ? lineX : parentRect.left) + marginLeft;
-          y =
-            (inline
-              ? Math.max(lineY, blockBottom)
-              : Math.max(blockBottom, lineY + lineHeight)) + marginTop;
-          if (style.float === "right")
-            x =
-              parentRect.right -
-              width -
-              (parseFloat(style.getPropertyValue("margin-right")) || 0);
-        }
-        if (style.position === "absolute" || style.position === "fixed") {
-          const left = cssPixels(
-              style.left,
-              containingRect.width,
-              innerWidth,
-            ),
-            top = cssPixels(
-              style.top,
-              containingRect.height,
-              innerHeight,
-            ),
-            origin =
-              style.position === "fixed" && !this.offsetParent
-                ? new DOMRect()
-                : containingRect;
-          if (Number.isFinite(left))
-            x =
-              origin.left +
-              left +
-              (parseFloat(style.getPropertyValue("margin-left")) || 0);
-          else if (x === 0)
-            x =
-              origin.left +
-              (parseFloat(style.getPropertyValue("margin-left")) || 0);
-          if (Number.isFinite(top))
-            y =
-              origin.top +
-              top +
-              (parseFloat(style.getPropertyValue("margin-top")) || 0);
-          else if (y === 0)
-            y =
-              origin.top +
-              (parseFloat(style.getPropertyValue("margin-top")) || 0);
-          /* Native retained geometry subtracts every scrolled DOM ancestor.
-             CSS positioned descendants escape scroll containers between
-             themselves and their containing block. Restore only those
-             intervening scroll offsets; the containing block and its
-             ancestors continue to move normally. */
-          for (
-            let at = this.parentElement, steps = 0;
-            at && at !== positionedContainingElement && steps < ancestorLimit;
-            at = at.parentElement, steps++
-          ) {
-            x += Number(at.scrollLeft) || 0;
-            y += Number(at.scrollTop) || 0;
-          }
-        }
-        const transform = String(style.transform || ""),
-          pair = transform.match(
-            /translate(?:3d)?\(\s*(-?[\d.]+)px(?:\s*,\s*(-?[\d.]+)px)?/,
-          ),
-          translateX = transform.match(
-            /translateX\(\s*(-?[\d.]+)px/,
-          ),
-          translateY = transform.match(
-            /translateY\(\s*(-?[\d.]+)px/,
-          );
-        x += Number(pair?.[1] || translateX?.[1]) || 0;
-        y += Number(pair?.[2] || translateY?.[1]) || 0;
-        if (needsFlowFallback) {
-          const scrollAncestor =
-            style.position === "absolute" || style.position === "fixed"
-              ? this.offsetParent
-              : this.parentElement;
-          x -= Number(scrollAncestor?.scrollLeft) || 0;
-          y -= Number(scrollAncestor?.scrollTop) || 0;
-        }
-        return new DOMRect(x, y, width, height);
-      },
-      getClientRects() {
-        const rect = this.getBoundingClientRect();
-        return rect.width && rect.height ? [rect] : [];
-      },
-      appendChild(child) {
-        const oldParent = child?.parentNode || null,
-          oldPrevious = child?.previousSibling || null,
-          oldNext = child?.nextSibling || null,
-          oldOwner = child?.ownerDocument || null,
-          wasConnected = !!child?.isConnected;
-        // Nodes from createHTMLDocument/createDocument are detached shim
-        // objects until adopted into the live document.  Materialize the
-        // element before validation so Web IDL sees the adopted native Node,
-        // rather than rejecting a standards-valid cross-document insertion.
-        if (
-          child &&
-          child.__handle === undefined &&
-          !(child instanceof DocumentFragment)
-        )
-          child = globalThis.__tilefinchMaterializeDetachedNode?.(child) || child;
-        globalThis.__tilefinchValidatePreInsert?.(this, child, null);
-        if (child instanceof DocumentFragment) {
-          const nodes = [...child.childNodes],
-            removals = nodes.map((node) => ({
-              node,
-              parent: node.parentNode,
-              previousSibling: node.previousSibling,
-              nextSibling: node.nextSibling,
-            }));
-          globalThis.__tilefinchMutationSuppressed =
-            (globalThis.__tilefinchMutationSuppressed || 0) + 1;
-          dynamicPreparationSuppressed++;
-          try {
-            for (const node of nodes) this.appendChild(node);
-          } finally {
-            dynamicPreparationSuppressed--;
-            globalThis.__tilefinchMutationSuppressed--;
-          }
-          prepareDynamicSubtree?.(handle);
-          const removalParents = new Set(
-            removals.map((removal) => removal.parent).filter(Boolean),
-          );
-          for (const parent of removalParents) {
-            const group = removals.filter(
-              (removal) => removal.parent === parent,
-            );
-            globalThis.__tilefinchNotifyMutation?.(
-              parent,
-              "childList",
-              null,
-              [],
-              group.map((removal) => removal.node),
-              null,
-              group[0].previousSibling,
-              group[group.length - 1].nextSibling,
-            );
-          }
-          if (nodes.length)
-            globalThis.__tilefinchNotifyMutation?.(
-              this,
-              "childList",
-              null,
-              nodes,
-              [],
-              null,
-              nodes[0].previousSibling,
-              null,
-            );
-          return child;
-        }
-        if (!child || !__tilefinchAppend(handle, child.__handle))
-          throw new Error("appendChild failed");
-        if (
-          wasConnected &&
-          !globalThis.__tilefinchCustomElementMovePreserved
-        )
-          globalThis.__tilefinchCustomElementDisconnected?.(child);
-        const targetOwner = this.ownerDocument || document;
-        if (oldOwner && targetOwner && oldOwner !== targetOwner)
-          globalThis.__tilefinchAdoptNodeOwner?.(child, targetOwner);
-        if (
-          globalThis.__tilefinchTraceTasksEnabled &&
-          child instanceof HTMLIFrameElement
-        ) {
-          const log =
-            globalThis.__tilefinchFrameLifecycle ||
-            (globalThis.__tilefinchFrameLifecycle = []);
-          if (log.length < 16)
-            log.push({
-              action: "append",
-              handle: child.__handle,
-              parent: String(this.tagName || this.nodeName || ""),
-              connected: !!child.isConnected,
-              src: String(child.src || ""),
-            });
-        }
-        if (!globalThis.__tilefinchCustomElementMovePreserved)
-          globalThis.__tilefinchCustomElementConnected?.(child);
-        globalThis.__tilefinchCanvasConnected?.(child);
-        if (oldParent)
-          globalThis.__tilefinchNotifyMutation?.(
-            oldParent,
-            "childList",
-            null,
-            [],
-            [child],
-            null,
-            oldPrevious,
-            oldNext,
-          );
-        globalThis.__tilefinchNotifyMutation?.(
-          this,
-          "childList",
-          null,
-          [child],
-          [],
-          null,
-          child.previousSibling,
-          null,
-        );
-        if (child instanceof HTMLIFrameElement)
-          globalThis.__tilefinchLoadLocalFrame?.(child);
-        if (!dynamicPreparationSuppressed) prepareDynamicSubtree?.(handle);
-        return child;
-      },
-      append(...values) {
-        if (
-          globalThis.__tilefinchParentAppend &&
-          !globalThis.__tilefinchParentAppendBypass
-        )
-          return globalThis.__tilefinchParentAppend(this, values, false);
-        const nodes = [];
-        for (const value of values) {
-          const node =
-            value instanceof Node
-              ? value
-              : document.createTextNode(String(value));
-          if (node instanceof DocumentFragment) nodes.push(...node.childNodes);
-          else nodes.push(node);
-        }
-        const fragment = document.createDocumentFragment();
-        for (const node of nodes) fragment.appendChild(node);
-        this.appendChild(fragment);
-      },
-      prepend(...values) {
-        if (globalThis.__tilefinchParentAppend)
-          return globalThis.__tilefinchParentAppend(this, values, true);
-        for (let at = values.length - 1; at >= 0; at--) {
-          const value =
-            values[at] instanceof Node
-              ? values[at]
-              : document.createTextNode(String(values[at]));
-          this.insertBefore(value, this.firstChild);
-        }
-      },
-      replaceChildren(...values) {
-        const owner = this.ownerDocument || this,
-          nodes = values.map((value) =>
-            value instanceof Node ? value : owner.createTextNode(String(value)),
-          ),
-          moved = [];
-        for (const node of nodes) {
-          const candidates =
-            node instanceof DocumentFragment ? [...node.childNodes] : [node];
-          for (const candidate of candidates)
-            if (candidate.parentNode)
-              moved.push({
-                node: candidate,
-                parent: candidate.parentNode,
-                previousSibling: candidate.previousSibling,
-                nextSibling: candidate.nextSibling,
-              });
-        }
-        const
-          insertion =
-            nodes.length === 1
-              ? nodes[0]
-              : owner.createDocumentFragment();
-        globalThis.__tilefinchMutationSuppressed =
-          (globalThis.__tilefinchMutationSuppressed || 0) + 1;
-        let removed;
-        try {
-          if (nodes.length !== 1)
-            for (const node of nodes) insertion.appendChild(node);
-          globalThis.__tilefinchValidatePreInsert?.(
-            this,
-            insertion,
-            null,
-            true,
-          );
-          removed = [...this.childNodes];
-          for (const child of removed) this.removeChild(child);
-          if (nodes.length) this.appendChild(insertion);
-        } finally {
-          globalThis.__tilefinchMutationSuppressed--;
-        }
-        for (const move of moved)
-          globalThis.__tilefinchNotifyMutation?.(
-            move.parent,
-            "childList",
-            null,
-            [],
-            [move.node],
-            null,
-            move.previousSibling,
-            move.nextSibling,
-          );
-        if (removed.length || nodes.length)
-          globalThis.__tilefinchNotifyMutation?.(
-            this,
-            "childList",
-            null,
-            nodes,
-            removed,
-          );
-      },
-      before(...values) {
-        const parent = this.parentNode;
-        if (!parent) return;
-        const owner = this.ownerDocument || document,
-          nodes = values.map((value) =>
-            value instanceof Node ? value : owner.createTextNode(String(value)),
-          ),
-          moving = new Set(nodes);
-        let previous = this.previousSibling;
-        while (previous && moving.has(previous))
-          previous = previous.previousSibling;
-        const insertion =
-            nodes.length === 1
-              ? nodes[0]
-              : owner.createDocumentFragment();
-        if (nodes.length !== 1)
-          for (const node of nodes) insertion.appendChild(node);
-        const reference = previous ? previous.nextSibling : parent.firstChild;
-        if (nodes.length) parent.insertBefore(insertion, reference);
-      },
-      after(...values) {
-        const parent = this.parentNode;
-        if (!parent) return;
-        const owner = this.ownerDocument || document,
-          nodes = values.map((value) =>
-            value instanceof Node ? value : owner.createTextNode(String(value)),
-          ),
-          moving = new Set(nodes);
-        let reference = this.nextSibling;
-        while (reference && moving.has(reference))
-          reference = reference.nextSibling;
-        const insertion =
-          nodes.length === 1
-            ? nodes[0]
-            : owner.createDocumentFragment();
-        if (nodes.length !== 1)
-          for (const node of nodes) insertion.appendChild(node);
-        if (reference && reference.parentNode !== parent) reference = null;
-        if (nodes.length) parent.insertBefore(insertion, reference);
-      },
-      replaceWith(...values) {
-        const parent = this.parentNode;
-        if (!parent) return;
-        const nodes = values.map((value) =>
-            value instanceof Node
-              ? value
-              : document.createTextNode(String(value)),
-          ),
-          moving = new Set(nodes);
-        let reference = this.nextSibling;
-        while (reference && moving.has(reference))
-          reference = reference.nextSibling;
-        for (const node of nodes) parent.insertBefore(node, reference);
-        if (!moving.has(this) && this.parentNode === parent)
-          parent.removeChild(this);
-      },
-      cloneNode(deep = false) {
-        if (++cloneCallDepth > cloneDepthLimit) {
-          cloneCallDepth--;
-          throw new DOMException(
-            "DOM clone exceeds the bounded depth limit",
-            "NotSupportedError",
-          );
-        }
-        try {
-          if (!!deep && String(this.tagName).toLowerCase() === "template") {
-            const clone = wrap(__tilefinchClone(handle, false));
-            for (const child of this.content.childNodes)
-              clone.content.appendChild(child.cloneNode(true));
-            globalThis.__tilefinchCopyFormCloneState?.(this, clone, true);
-            return clone;
-          }
-          const clone = wrap(__tilefinchClone(handle, !!deep));
-          if (deep && clone) {
-            const stack = [{ source: this, node: clone, depth: 0 }];
-            while (stack.length) {
-              const entry = stack.pop();
-              if (entry.depth >= cloneDepthLimit)
-                throw new DOMException(
-                  "DOM clone exceeds the bounded depth limit",
-                  "NotSupportedError",
-                );
-              if (
-                String(entry.source?.tagName || "").toLowerCase() ===
-                  "template" &&
-                entry.source.content &&
-                entry.node.content &&
-                entry.node.content.childNodes.length === 0
-              )
-                for (const child of entry.source.content.childNodes)
-                  entry.node.content.appendChild(child.cloneNode(true));
-              const children = entry.node.childNodes || [];
-              const sourceChildren = entry.source?.childNodes || [];
-              for (let index = children.length - 1; index >= 0; index--) {
-                const child = children[index];
-                if (child.__handle === undefined)
-                  Object.defineProperty(child, "__tilefinchDetachedParent", {
-                    configurable: true,
-                    writable: true,
-                    value: entry.node,
-                  });
-                if (
-                  child.childNodes?.length ||
-                  String(child.tagName || "").toLowerCase() === "template"
-                )
-                  stack.push({
-                    source: sourceChildren[index],
-                    node: child,
-                    depth: entry.depth + 1,
-                  });
-              }
-            }
-          }
-          globalThis.__tilefinchCopyFormCloneState?.(this, clone, !!deep);
-          return clone;
-        } finally {
-          cloneCallDepth--;
-        }
-      },
-      insertBefore(node, child) {
-        if (arguments.length < 2)
-          throw new TypeError("insertBefore requires two arguments");
-        const oldParent = node?.parentNode || null,
-          oldPrevious = node?.previousSibling || null,
-          oldNext = node?.nextSibling || null,
-          oldOwner = node?.ownerDocument || null,
-          wasConnected = !!node?.isConnected;
-        if (
-          node &&
-          node.__handle === undefined &&
-          !(node instanceof DocumentFragment)
-        )
-          node = globalThis.__tilefinchMaterializeDetachedNode?.(node) || node;
-        globalThis.__tilefinchValidatePreInsert?.(this, node, child);
-        if (node instanceof DocumentFragment) {
-          const nodes = [...node.childNodes],
-            previousSibling = child ? child.previousSibling : this.lastChild;
-          globalThis.__tilefinchFragmentInsertCount =
-            (globalThis.__tilefinchFragmentInsertCount || 0) + 1;
-          globalThis.__tilefinchFragmentInsertText =
-            (globalThis.__tilefinchFragmentInsertText || "") +
-            String(node.textContent || "").slice(0, 80);
-          globalThis.__tilefinchMutationSuppressed =
-            (globalThis.__tilefinchMutationSuppressed || 0) + 1;
-          try {
-            for (const item of nodes) this.insertBefore(item, child);
-          } finally {
-            globalThis.__tilefinchMutationSuppressed--;
-          }
-          if (nodes.length) {
-            globalThis.__tilefinchNotifyMutation?.(
-              node,
-              "childList",
-              null,
-              [],
-              nodes,
-            );
-            globalThis.__tilefinchNotifyMutation?.(
-              this,
-              "childList",
-              null,
-              nodes,
-              [],
-              null,
-              previousSibling,
-              child,
-            );
-          }
-          return node;
-        }
-        if (!child) return this.appendChild(node);
-        const previousSibling = child.previousSibling;
-        if (!__tilefinchInsertBefore(handle, node.__handle, child.__handle))
-          throw new Error("insertBefore failed");
-        if (
-          wasConnected &&
-          !globalThis.__tilefinchCustomElementMovePreserved
-        )
-          globalThis.__tilefinchCustomElementDisconnected?.(node);
-        const targetOwner = this.ownerDocument || document;
-        if (oldOwner && targetOwner && oldOwner !== targetOwner)
-          globalThis.__tilefinchAdoptNodeOwner?.(node, targetOwner);
-        if (!globalThis.__tilefinchCustomElementMovePreserved)
-          globalThis.__tilefinchCustomElementConnected?.(node);
-        globalThis.__tilefinchCanvasConnected?.(node);
-        if (oldParent)
-          globalThis.__tilefinchNotifyMutation?.(
-            oldParent,
-            "childList",
-            null,
-            [],
-            [node],
-            null,
-            oldPrevious,
-            oldNext,
-          );
-        globalThis.__tilefinchNotifyMutation?.(
-          this,
-          "childList",
-          null,
-          [node],
-          [],
-          null,
-          previousSibling,
-          child,
-        );
-        prepareDynamicSubtree?.(handle);
-        return node;
-      },
-      replaceChild(node, child) {
-        const parent = child && child.parentNode;
-        if (
-          !node ||
-          !child ||
-          !parent ||
-          (parent !== this && parent.__handle !== this.__handle)
-        )
-          throw new Error("replaceChild failed");
-        if (node === child) {
-          const previousSibling = child.previousSibling,
-            nextSibling = child.nextSibling;
-          globalThis.__tilefinchNotifyMutation?.(
-            this,
-            "childList",
-            null,
-            [],
-            [child],
-            null,
-            previousSibling,
-            nextSibling,
-          );
-          globalThis.__tilefinchNotifyMutation?.(
-            this,
-            "childList",
-            null,
-            [child],
-            [],
-            null,
-            previousSibling,
-            nextSibling,
-          );
-          return child;
-        }
-        const oldParent = node.parentNode,
-          oldPrevious = node.previousSibling,
-          oldNext = node.nextSibling,
-          previousSibling =
-            child.previousSibling === node
-              ? node.previousSibling
-              : child.previousSibling,
-          nextSibling =
-            child.nextSibling === node ? node.nextSibling : child.nextSibling;
-        globalThis.__tilefinchMutationSuppressed =
-          (globalThis.__tilefinchMutationSuppressed || 0) + 1;
-        try {
-          this.insertBefore(node, child);
-          this.removeChild(child);
-        } finally {
-          globalThis.__tilefinchMutationSuppressed--;
-        }
-        if (oldParent)
-          globalThis.__tilefinchNotifyMutation?.(
-            oldParent,
-            "childList",
-            null,
-            [],
-            [node],
-            null,
-            oldPrevious,
-            oldNext,
-          );
-        globalThis.__tilefinchNotifyMutation?.(
-          this,
-          "childList",
-          null,
-          [node],
-          [child],
-          null,
-          previousSibling,
-          nextSibling,
-        );
-        return child;
-      },
-      removeChild(child) {
-        const parent = child && child.parentNode;
-        if (
-          !child ||
-          !parent ||
-          (parent !== this && parent.__handle !== this.__handle)
-        )
-          throw new Error("removeChild failed");
-        child.remove();
-        return child;
-      },
-      remove() {
-        const parent = this.parentNode,
-          previousSibling = this.previousSibling,
-          nextSibling = this.nextSibling;
-        if (this.__tilefinchDetachedParent) {
-          this.__tilefinchDetachedParent.removeChild(this);
-          return;
-        }
-        if (
-          document.__activeElement === this ||
-          this.contains(document.__activeElement) ||
-          shadowEventPath(document.__activeElement, true).includes(this)
-        )
-          document.__activeElement = document.body;
-        if (
-          globalThis.__tilefinchTraceTasksEnabled &&
-          this instanceof HTMLIFrameElement
-        ) {
-          const log =
-            globalThis.__tilefinchFrameLifecycle ||
-            (globalThis.__tilefinchFrameLifecycle = []);
-          if (log.length < 16)
-            log.push({
-              action: "remove",
-              handle: this.__handle,
-              parent: String(parent?.tagName || parent?.nodeName || ""),
-              src: String(this.src || ""),
-            });
-        }
-        const result = __tilefinchRemove(handle);
-        if (result) globalThis.__tilefinchCustomElementDisconnected?.(this);
-        if (parent)
-          globalThis.__tilefinchNotifyMutation?.(
-            parent,
-            "childList",
-            null,
-            [],
-            [this],
-            null,
-            previousSibling,
-            nextSibling,
-          );
-        return undefined;
-      },
-      addEventListener(type, callback, options = false) {
-        const retained = listenerMap(this, true);
-        if (retained) listeners = retained;
-        return globalThis.__tilefinchAddEventListener?.(
-          listeners,
-          type,
-          callback,
-          options,
-        );
-      },
-      removeEventListener(type, callback, options = false) {
-        return globalThis.__tilefinchRemoveEventListener?.(
-          listeners,
-          type,
-          callback,
-          options,
-        );
-      },
-      __invokeEvent(value, capture) {
-        value.currentTarget = this;
-        value.eventPhase = this === value.target ? 2 : capture ? 1 : 3;
-        if (!capture) {
-          const propertyName = "on" + value.type,
-            handler = propertyName in this
-              ? this[propertyName]
-              : inlineEventHandler(this, value.type, propertyName);
-          if (typeof handler === "function")
-            try {
-              globalThis.__tilefinchRecordEventHandler();
-              const returned = globalThis.__tilefinchRunTask(
-                "element-handler:" + String(value.type),
-                handler,
-                this,
-                [value],
-              );
-              if (returned === false) value.preventDefault();
-            } catch (error) {
-              __tilefinchReportUncaught(error, "event " + value.type);
-            }
-        }
-        globalThis.__tilefinchInvokeListenerList?.(
-          listeners,
-          this,
-          value,
-          capture,
-        );
-      },
-      dispatchEvent(event) {
-        const value = event;
-        const controlState =
-          value instanceof Event &&
-          value.type === "click" &&
-          !value.__tilefinchControlDefaultPrepared
-            ? globalThis.__tilefinchBeginControlDefault?.(this) || null
-            : null;
-        const path = shadowEventPath(this, !!value.composed);
-        /*
-         * The composed path itself is authoritative for connection.  In
-         * particular, descendants of the internal element used to represent
-         * a shadow root can observe a stale native connected bit during the
-         * same task in which their host is inserted.  Never discard the
-         * Document already reached by the bounded ancestor walk.
-         */
-        const reachesDocument =
-          path[path.length - 1] instanceof Document ||
-          path.some(
-            (node) =>
-              node === document.documentElement || node === document.body,
-          );
-        if (reachesDocument) {
-          if (!(path[path.length - 1] instanceof Document))
-            path.push(document);
-          path.push(globalThis);
-        }
-        const invoke = (target, capture, phase) => {
-          value.target = retargetShadowEvent(this, target);
-          if (target === globalThis)
-            globalThis.__tilefinchInvokeWindowEvent(value, capture);
-          else if (target === document)
-            globalThis.__tilefinchInvokeDocumentEvent(value, capture);
-          else if (typeof target?.__invokeEvent === "function")
-            target.__invokeEvent(value, capture);
-          else
-            globalThis.__tilefinchInvokeEventTarget?.(
-              target,
-              value,
-              capture,
-              phase,
-            );
-        };
-        globalThis.__tilefinchPrepareEvent(value, this, path);
-        for (let i = path.length - 1; i >= 1 && !value.__stopped; i--)
-          invoke(path[i], true, 1);
-        if (!value.__stopped) {
-          invoke(path[0], true, 2);
-          if (!value.__immediateStopped)
-            invoke(path[0], false, 2);
-        }
-        if (value.bubbles && !value.__stopped)
-          for (let i = 1; i < path.length && !value.__stopped; i++)
-            invoke(path[i], false, 3);
-        value.currentTarget = null;
-        value.eventPhase = 0;
-        value.__dispatching = false;
-        value.target = retargetShadowEvent(
-          this,
-          path[path.length - 1] || this,
-        );
-        __tilefinchRecordEvent();
-        const accepted = !value.defaultPrevented;
-        if (controlState)
-          globalThis.__tilefinchFinishControlDefault?.(controlState, accepted);
-        return accepted;
-      },
     };
+    // Start with the final prototype and final descriptor flags. Changing
+    // either after filling the wrapper de-interns QuickJS's large property
+    // shape, leaving a separate shape allocation for every visited element.
+    const node = Object.create(nativeElementPrototype(
+      own.__tilefinchRemoteTagName, own.__tilefinchRemoteNodeType, namespaceURI,
+    ));
+    Object.defineProperty(node, "__tilefinchRebindHandle", {
+      enumerable: false,
+      configurable: false,
+      writable: false,
+      value: own.__tilefinchRebindHandle,
+    });
+    delete own.__tilefinchRebindHandle;
+    Object.assign(node, own);
     Object.defineProperty(node, "__handle", {
       enumerable: false,
       configurable: false,
       get: () => handle,
     });
-    Object.defineProperty(node, "__tilefinchRebindHandle", {
-      enumerable: false,
-      configurable: false,
-      writable: false,
-      value: node.__tilefinchRebindHandle,
-    });
-    Object.setPrototypeOf(
-      node,
-      elementPrototype(node.tagName, node.nodeType, node.namespaceURI),
-    );
     installStyle(node, handle);
     installClassList(node);
-    const retainedListeners = listenerMap(node, false);
-    if (retainedListeners) listeners = retainedListeners;
+    // Reserve the slot up front to keep wrapper shapes shared, but allocate
+    // a listener map only on registration. Existing retained listeners survive
+    // wrapper recreation; overflow maps remain owned by their live wrapper.
+    Object.defineProperty(node, wrapperListeners, {
+      value: listenerMap(node, false), writable: true,
+    });
     const exposed =
       typeof globalThis.__tilefinchTraceObject === "function"
         ? globalThis.__tilefinchTraceObject(
@@ -6098,7 +6216,7 @@
       retained.__tilefinchRemote = true;
       retained.__tilefinchRemoteSection = section;
       retained.__tilefinchRemoteNodeType = nodeType;
-      Object.setPrototypeOf(retained, elementPrototype(tag, nodeType));
+      Object.setPrototypeOf(retained, nativeElementPrototype(tag, nodeType));
       return retained;
     }
     const handle =
@@ -6115,7 +6233,7 @@
     node.__tilefinchStableKey = key;
     node.__tilefinchRemote = true;
     node.__tilefinchRemoteNodeType = nodeType;
-    Object.setPrototypeOf(node, elementPrototype(tag, nodeType));
+    Object.setPrototypeOf(node, nativeElementPrototype(tag, nodeType));
     rememberStableWrapper(key, node);
     return node;
   };

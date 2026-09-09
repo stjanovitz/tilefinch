@@ -24,6 +24,9 @@ typedef struct {
     uint64_t freed_bytes;
     uint64_t reallocated_bytes;
     size_t live_bytes;
+    size_t rejected_old_bytes;
+    size_t rejected_new_bytes;
+    size_t rejected_live_bytes;
 } BudgetQuickJSActivity;
 
 const JSMallocFunctions *budget_quickjs_allocator(void);

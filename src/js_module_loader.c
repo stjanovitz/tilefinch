@@ -742,8 +742,18 @@ static bool script_runtime_evaluate_external_typed_at(
                     evaluated = false;
                 } else if (!JS_IsException(compiled)) {
                     size_t bytecode_length = 0;
+                    /* Serialization is an optional accelerator beside a
+                       freshly compiled program. Do not consume the remaining
+                       execution headroom to grow its temporary output buffer.
+                       This is a conservative pressure heuristic, not a size
+                       guarantee; ordinary serialization refusal still unwinds
+                       below without discarding the compiled script. */
+                    const size_t cache_floor = 64u * 1024u;
+                    size_t cache_reserve = evaluated_length > (SIZE_MAX - cache_floor) / 4u
+                        ? SIZE_MAX : cache_floor + evaluated_length * 4u;
                     bool may_fit =
-                        browser_session_classic_script_bytecode_may_fit(
+                        script_runtime_heap_remaining(runtime) >= cache_reserve
+                        && browser_session_classic_script_bytecode_may_fit(
                             runtime->session, classic_cache_url,
                             (const unsigned char *) evaluated_source,
                             evaluated_length,

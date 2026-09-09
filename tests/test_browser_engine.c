@@ -2,6 +2,7 @@
 #include "../src/tilefinch_test_faults.h"
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/budget_quickjs.h"
 #include "tilefinch/site_adapter.h"
 #include "tilefinch/youtube_lite.h"
 
@@ -265,15 +266,32 @@ static bool backing_node_write(
 int main(int argc, char **argv)
 {
     if (argc == 4 && strcmp(argv[1], "--font-staging-replay") == 0)
-        return profile_staged_font_replay(argv[2], argv[3], 0, false);
+        return profile_staged_font_replay(argv[2], argv[3], 0, false, NULL, false);
     if (argc == 4 && strcmp(argv[1], "--navigation-staging-replay") == 0)
-        return profile_staged_font_replay(argv[2], argv[3], 0, true);
-    if (argc == 5 && strcmp(argv[1], "--font-interrupt-replay") == 0) {
+        return profile_staged_font_replay(argv[2], argv[3], 0, true, NULL, false);
+    if (argc == 4 && strcmp(argv[1], "--navigation-settle-replay") == 0)
+        return profile_staged_font_replay(argv[2], argv[3], 0, true, NULL, true);
+    if (argc == 5 && strcmp(argv[1], "--navigation-settle-replay") == 0) {
+        char *end = NULL;
+        unsigned long ticks = strtoul(argv[4], &end, 10);
+        if (end == argv[4] || *end != '\0' || ticks < 2 || ticks > 4096)
+            return 1;
+        script_runtime_configure_deterministic_replay(true, 7);
+        int status = profile_staged_font_replay(
+            argv[2], argv[3], 0, true, NULL, (unsigned) ticks);
+        script_runtime_configure_deterministic_replay(false, 7);
+        return status;
+    }
+    if (argc == 4 && strcmp(argv[1], "--search-journey-replay") == 0)
+        return profile_staged_font_replay(argv[2], argv[3], 0, true, "psp", false);
+    if (argc == 5 && (strcmp(argv[1], "--font-interrupt-replay") == 0
+            || strcmp(argv[1], "--navigation-interrupt-replay") == 0)) {
         char *end = NULL;
         unsigned long delay = strtoul(argv[4], &end, 10);
         if (end == argv[4] || *end != '\0' || delay == 0 || delay > 1000000u)
             return 1;
-        return profile_staged_font_replay(argv[2], argv[3], delay, false);
+        return profile_staged_font_replay(argv[2], argv[3], delay,
+            strcmp(argv[1], "--navigation-interrupt-replay") == 0, NULL, false);
     }
     if (argc == 2 && strcmp(argv[1], "--font-staging-only") == 0)
         return test_staged_optional_fonts_relayout_before_repaint();
@@ -288,10 +306,18 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--provider-navigation-only") == 0) {
         return test_cooperative_site_adapter_navigation();
     }
+    if (argc == 2 && strcmp(argv[1], "--pointer-search-only") == 0)
+        return profile_staged_font_replay(TILEFINCH_TEST_SOURCE_DIR
+            "/tests/fixtures/http-pointer-search", "https://search-journey.test/",
+            0, true, "psp", false);
     CHECK(test_engine_lifecycle() == 0);
+    CHECK(profile_staged_font_replay(TILEFINCH_TEST_SOURCE_DIR
+        "/tests/fixtures/http-pointer-search", "https://search-journey.test/",
+        0, true, "psp", false) == 0);
     CHECK(test_loading_interaction_journey() == 0);
     CHECK(test_deferred_startup_journey() == 0);
     CHECK(test_deferred_image_publication_survives_rebuild() == 0);
+    CHECK(test_deferred_images_skip_oversized_pages() == 0);
     CHECK(test_same_document_and_script_free_defaults() == 0);
     CHECK(test_same_document_event_mutations_settle_immediately() == 0);
     CHECK(test_contenteditable_relayout_refusal_retires_shell() == 0);

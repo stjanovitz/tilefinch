@@ -241,6 +241,8 @@ typedef struct {
 } LayoutAssignedGridTracks;
 
 #define LAYOUT_REUSE_STYLE_CAPACITY 1024u
+#define LAYOUT_REUSE_PENDING_NODE_LIMIT 32u
+#define LAYOUT_REUSE_PENDING_TOKEN_LIMIT 32u
 #define LAYOUT_REUSE_INTRINSIC_CAPACITY 128u
 #define LAYOUT_REUSE_TABLE_ROW_CAPACITY 32u
 #define LAYOUT_REUSE_TABLE_ROW_PROBE_LIMIT 8u
@@ -270,6 +272,16 @@ typedef struct {
     uint64_t stamp;
 } LayoutReuseTableRowEntry;
 
+/* Only operations and DOM depth, not a second computed-style table. The
+   optional index is transferred to/from one build; cursors are never reused. */
+#define LAYOUT_COUNTER_NODE_LIMIT 4096u
+typedef struct {
+    lxb_dom_node_t *node;
+    uint8_t reset_id, set_id, increment_id, depth;
+} LayoutCounterEntry;
+_Static_assert(sizeof(LayoutCounterEntry) * LAYOUT_COUNTER_NODE_LIMIT <= 65536u,
+    "counter prefix must remain at most 64 KiB (32 KiB on the PSP)");
+
 struct LayoutReuseCache {
     Budget *budget;
     const Stylesheet *sheet;
@@ -284,18 +296,32 @@ struct LayoutReuseCache {
     LayoutIntrinsicCacheEntry intrinsic[LAYOUT_REUSE_INTRINSIC_CAPACITY];
     LayoutReuseTableRowEntry *table_rows;
     LayoutReuseStats stats;
+    /* Font/image arrivals do not change CSS counter operations. Transfer the
+       existing bounded index between builds rather than keeping a second
+       copy. Any DOM/style invalidation discards the whole ordered prefix. */
+    LayoutCounterEntry *counter_entries;
+    const lxb_dom_node_t *counter_root;
+    size_t counter_count, counter_capacity;
+    bool counter_bounded_out;
     bool selector_has_has;
     bool selector_has_focus_within;
     bool selector_focus_has_sibling;
     bool selector_has_structure;
+    /* Exact matched-rule lists for whole documents; page caches only, so the
+       streaming preview cache never retains matches across parser appends. */
+    struct StyleRetainedMatches *matches;
+    bool matches_enabled;
+    bool matches_attempted;
+    /* Class/id changes queued for one token-aware pass over the matched
+       lists (layout_reuse_cache_flush_invalidations). */
+    uint32_t pending_tokens[LAYOUT_REUSE_PENDING_TOKEN_LIMIT];
+    size_t pending_token_count;
+    const lxb_dom_node_t *pending_nodes[LAYOUT_REUSE_PENDING_NODE_LIMIT];
+    size_t pending_node_count;
+    bool pending_active;
+    bool pending_overflow;
+    bool pending_parent_scope;
 };
-
-/* Layout-lifetime counter analysis: only operations and DOM depth, not a
-   second full computed-style table. Lazily allocated for counter() pages. */
-typedef struct {
-    lxb_dom_node_t *node;
-    uint8_t reset_id, set_id, increment_id, depth;
-} LayoutCounterEntry;
 
 typedef struct {
     LayoutDocument *layout;
@@ -310,6 +336,7 @@ typedef struct {
     size_t counter_entry_capacity;
     bool counter_entries_bounded_out;
     bool counter_entries_prepared;
+    bool counter_entries_allocation_failed;
     size_t trace_paint_lines;
     size_t trace_flex_translate_lines;
     size_t trace_flex_sizing_lines;
@@ -378,6 +405,10 @@ typedef struct {
     size_t visibility_range_capacity;
     uint64_t slice_started_ns;
     size_t slice_units;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    size_t safe_point_clock_checks;
+    size_t safe_point_time_yields;
+#endif
     lxb_dom_node_t *slice_last_node;
     /* Nonzero only for the ephemeral first-paint pass. Work whose normal-flow
        origin reaches this CSS y coordinate can be deferred to the
@@ -442,7 +473,12 @@ static inline ComputedStyle layout_style_for_pseudo(
 {
     LAYOUT_FLOW_SCOPE(context, LAYOUT_FLOW_PSEUDO);
     context->pseudo_resolutions++;
+    StyleRetainedMatches *previous_matches = style_retained_matches_attach(
+        context->sheet,
+        context->reuse != NULL && context->reuse->sheet == context->sheet
+            ? context->reuse->matches : NULL);
     ComputedStyle result = style_for_layout_pseudo(context->sheet, node, pseudo, parent);
+    (void) style_retained_matches_attach(context->sheet, previous_matches);
     context->pseudo_absence_hits += !result.generated_content && result.font_size == 0;
     context->pseudo_generated += result.generated_content;
     return result;
@@ -897,6 +933,7 @@ bool layout_add_link(LayoutDocument *layout, const DrawCommand *command,
 bool layout_anonymous_text(LayoutContext *context, const FlatItem *item, lxb_dom_node_t *container, int x, int y, int width, int *bottom);
 bool layout_batch_checkpoint(LayoutContext *context, size_t at, size_t count, size_t *checkpoint_at);
 bool layout_batch_cooperate(LayoutContext *context, size_t work_units);
+bool layout_text_cooperate(LayoutContext *context, size_t work_units);
 bool layout_block(LayoutContext *context, lxb_dom_node_t *node, const ComputedStyle *parent, int x, int y, int width, int containing_height, bool assigned_width, const PositionedBox *positioned_box, int *bottom);
 bool layout_place_float(LayoutContext *context, lxb_dom_node_t *node,
                         const ComputedStyle *parent,

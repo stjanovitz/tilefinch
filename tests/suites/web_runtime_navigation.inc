@@ -174,6 +174,62 @@
         CHECK(budget.current == 0);
     }
 
+    puts("test: transient feature probes do not rebuild the connected page");
+    static const char *transient_mutations[] = {
+        "const f=document.createElement('fieldset');document.body.appendChild(f);"
+        "f.id='probe';f.innerHTML='<input name=q>';f.setAttribute('disabled','');"
+        "f.remove();const s=document.createElement('script');"
+        "s.type='application/json';s.textContent='{}';"
+        "document.head.appendChild(s);s.remove();",
+        "document.getElementById('old').remove();",
+        "const f=document.createElement('fieldset');document.body.appendChild(f);"
+        "f.appendChild(document.getElementById('old'));f.remove();",
+        "const f=document.createElement('fieldset');document.body.appendChild(f);",
+        "const f=document.createElement('fieldset');document.body.appendChild(f);"
+        "f.remove();document.getElementById('keep').textContent='CHANGED';",
+        "const f=document.createElement('fieldset');"
+        "f.appendChild(document.getElementById('old'));",
+        "const f=document.createElement('fieldset');"
+        "f.appendChild(document.getElementById('old'));"
+        "document.body.appendChild(f);f.remove();"
+    };
+    for (size_t probe_case = 0; probe_case < 7; probe_case++) {
+        static NavigationSession probe_navigation;
+        static const char probe_page[] =
+            "<!doctype html><title>Probe</title><style>"
+            "html:has(fieldset) p{color:red}</style>"
+            "<body><p id=keep>KEEP</p><p id=old>OLD</p>";
+        CHECK(navigation_init(&probe_navigation, &budget, 2));
+        navigation_enable_scripts(&probe_navigation, 4 * MIB, 1000);
+        CHECK(navigation_commit_html(
+            &probe_navigation, navigation_begin(&probe_navigation),
+            "https://example.test/probe", probe_page, strlen(probe_page),
+            480, NULL, NULL, true));
+        CHECK(script_runtime_evaluate_diagnostic(
+            probe_navigation.page.runtime,
+            "globalThis.probeObserved=false;"
+            "globalThis.probeObserver=new MutationObserver(()=>{probeObserved=true});"
+            "probeObserver.observe(document.body,{childList:true,subtree:true});",
+            "<observe-probe>", &probe_navigation.page.script_result));
+        CHECK(script_runtime_evaluate_diagnostic(
+            probe_navigation.page.runtime, transient_mutations[probe_case],
+            "<transient-probe>", &probe_navigation.page.script_result));
+        CHECK(script_runtime_evaluate_diagnostic(
+            probe_navigation.page.runtime,
+            "pocSummary=probeObserved||probeObserver.takeRecords().length>0?'observed':'lost'",
+            "<probe-observed>", &probe_navigation.page.script_result));
+        CHECK(strcmp(probe_navigation.page.script_result.summary,"observed")==0);
+        CHECK(script_runtime_consume_relayout(probe_navigation.page.runtime));
+        CHECK(navigation_relayout(&probe_navigation));
+        CHECK(probe_navigation.incremental_relayouts == (probe_case == 0 ? 0 : 1));
+        CHECK(command_x(&probe_navigation.page.layout,
+                        probe_case == 4 ? "CHANGED" : "KEEP") >= 0);
+        if (probe_case == 1 || probe_case == 2 || probe_case >= 5)
+            CHECK(command_x(&probe_navigation.page.layout, "OLD") < 0);
+        navigation_destroy(&probe_navigation);
+        CHECK(budget.current == 0);
+    }
+
     puts("test: persistent runtime and incremental relayout");
     static const char runtime_page[] =
         "<!doctype html><meta name=viewport content='width=device-width'>"
@@ -440,10 +496,13 @@
         && script_runtime_consume_relayout(interactive.page.runtime);
     bool adopted_relayout = adopted_relayout_pending
         && navigation_relayout(&interactive);
+    /* The adopted sheet is a script-inserted <style>: it is appended to the
+       page sheet in place rather than rebuilding it. */
     if (!adopted_relayout
-        || interactive.performance.fast_relayouts != 4
-        || interactive.performance.full_relayouts != 2
-        || interactive.performance.mutation_resource_rebuilds != 2
+        || interactive.performance.fast_relayouts != 5
+        || interactive.performance.full_relayouts != 1
+        || interactive.performance.mutation_resource_rebuilds != 1
+        || interactive.performance.mutation_style_appends != 1
         || interactive.performance.resource_fingerprint_scans != 3) {
         fprintf(stderr,
                 "constructed stylesheet native probe: eval=%d pending=%d "
@@ -457,9 +516,10 @@
                 interactive.page.script_result.error);
     }
     CHECK(adopted_relayout
-          && interactive.performance.fast_relayouts == 4
-          && interactive.performance.full_relayouts == 2
-          && interactive.performance.mutation_resource_rebuilds == 2
+          && interactive.performance.fast_relayouts == 5
+          && interactive.performance.full_relayouts == 1
+          && interactive.performance.mutation_resource_rebuilds == 1
+          && interactive.performance.mutation_style_appends == 1
           && interactive.performance.resource_fingerprint_scans == 3);
     uint32_t adopted_text_color = UINT32_MAX;
     for (size_t command_at = 0;
@@ -519,8 +579,8 @@
                 interactive.page.script_result.error);
     }
     CHECK(detached_image_relayout
-          && interactive.performance.fast_relayouts == 6
-          && interactive.performance.full_relayouts == 2
+          && interactive.performance.fast_relayouts == 7
+          && interactive.performance.full_relayouts == 1
           && interactive.performance.mutation_image_resource_scans == 0
           && interactive.performance.mutation_journal_overflows == 0
           && interactive.performance.resource_fingerprint_scans == 4);
@@ -534,8 +594,8 @@
               &interactive.page.script_result)
           && script_runtime_consume_relayout(interactive.page.runtime)
           && navigation_relayout(&interactive)
-          && interactive.performance.fast_relayouts == 7
-          && interactive.performance.full_relayouts == 2
+          && interactive.performance.fast_relayouts == 8
+          && interactive.performance.full_relayouts == 1
           && interactive.performance.mutation_image_resource_scans == 0
           && interactive.performance.resource_fingerprint_scans == 4);
     CHECK(script_runtime_evaluate_diagnostic(
@@ -546,9 +606,9 @@
               &interactive.page.script_result)
           && script_runtime_consume_relayout(interactive.page.runtime)
           && navigation_relayout(&interactive)
-          && interactive.performance.fast_relayouts == 8
-          && interactive.performance.full_relayouts == 2
-          && interactive.performance.mutation_resource_rebuilds == 2
+          && interactive.performance.fast_relayouts == 9
+          && interactive.performance.full_relayouts == 1
+          && interactive.performance.mutation_resource_rebuilds == 1
           && interactive.performance.resource_fingerprint_scans == 5);
     CHECK(script_runtime_evaluate_diagnostic(
               interactive.page.runtime,
@@ -573,6 +633,13 @@
     CHECK(interactive.page.script_result.uncaught_callback_errors == 2);
     CHECK(strstr(interactive.page.script_result.last_uncaught_callback_error,
                  "XMLHttpRequest readystatechange") != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(
+              interactive.page.runtime,
+              "setTimeout(()=>{throw {toString(){throw Error('format refused')}}},0)",
+              "https://example.test/unprintable-callback.js",
+              &interactive.page.script_result)
+          && navigation_advance_runtime(&interactive, 0, 4)
+          && interactive.page.script_result.uncaught_callback_errors == 3);
 
     puts("test: controller focus, editing, and activation");
     BrowserController controller;
@@ -1240,6 +1307,150 @@
     navigation_destroy(&interactive);
     browser_session_destroy(&browser_session);
     CHECK(budget.current == 0);
+
+    puts("test: late initialization keeps retained style answers");
+    {
+        /* Enough elements for a page reuse cache and enough rules for its
+           retained matched-rule table. */
+        static char late_page[32768];
+        static const char late_head[] =
+            "<!doctype html><meta name=viewport content='width=device-width'>"
+            "<title>Late</title><style>"
+            ".a{color:#111111}.b{color:#222222}.k .a{color:#333333}"
+            "#host>.a:first-child{color:#444444}";
+        size_t late_length = sizeof(late_head) - 1u;
+        memcpy(late_page, late_head, late_length);
+        for (unsigned i = 0; i < 64; i++) {
+            char rule[32];
+            int written = snprintf(rule, sizeof(rule), ".pad%u{margin:0}", i);
+            CHECK(written > 0 && (size_t) written < sizeof(late_page) - late_length);
+            memcpy(late_page + late_length, rule, (size_t) written);
+            late_length += (size_t) written;
+        }
+        static const char late_body[] =
+            "</style><body><div id=host><p class=a>first</p>";
+        CHECK(sizeof(late_body) - 1u < sizeof(late_page) - late_length);
+        memcpy(late_page + late_length, late_body, sizeof(late_body) - 1u);
+        late_length += sizeof(late_body) - 1u;
+        for (unsigned i = 0; i < 300; i++) {
+            char item[40];
+            int written = snprintf(item, sizeof(item), "<p class=a>m%u</p>", i);
+            CHECK(written > 0 && (size_t) written < sizeof(late_page) - late_length);
+            memcpy(late_page + late_length, item, (size_t) written);
+            late_length += (size_t) written;
+        }
+        static const char late_tail[] = "<p class=a>middle</p></div></body>";
+        CHECK(sizeof(late_tail) - 1u < sizeof(late_page) - late_length);
+        memcpy(late_page + late_length, late_tail, sizeof(late_tail) - 1u);
+        late_length += sizeof(late_tail) - 1u;
+        CHECK(browser_session_init(&browser_session, &budget, 256 * 1024));
+        CHECK(navigation_init(&interactive, &budget, 4));
+        navigation_attach_browser_session(&interactive, &browser_session);
+        navigation_enable_scripts(&interactive, 4 * MIB, 1000);
+        uint64_t late_generation = navigation_begin(&interactive);
+        CHECK(navigation_commit_html(&interactive, late_generation,
+                                     "https://example.test/late", late_page,
+                                     late_length, 480, NULL, NULL, true));
+        CHECK(interactive.page.layout_reuse != NULL
+              && late_init_text_color(&interactive.page.layout, "first") == 0x444444
+              && late_init_text_color(&interactive.page.layout, "middle") == 0x111111);
+        /* A subtree inserted from a detached tree scopes the invalidation to
+           its parent instead of resetting the cache. */
+        size_t resets = interactive.performance.layout_reuse_full_resets;
+        size_t scans = interactive.performance.mutation_image_resource_scans;
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+                  "const p=document.createElement('p');p.className='b';"
+                  "p.textContent='late';document.getElementById('host').appendChild(p)",
+                  "<late-insert>", &interactive.page.script_result)
+              && script_runtime_consume_relayout(interactive.page.runtime)
+              && navigation_relayout(&interactive));
+        CHECK(interactive.performance.layout_reuse_full_resets == resets
+              && late_init_text_color(&interactive.page.layout, "late") == 0x222222
+              && late_init_text_color(&interactive.page.layout, "first") == 0x444444);
+        /* A body class no rule depends on neither rescans images nor drops
+           retained lists beyond the body's own. */
+        size_t token_invalidations =
+            interactive.performance.layout_reuse_matched_token_invalidations;
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+                  "document.body.className='zz'", "<late-body-class>",
+                  &interactive.page.script_result)
+              && script_runtime_consume_relayout(interactive.page.runtime)
+              && navigation_relayout(&interactive));
+        CHECK(interactive.performance.layout_reuse_full_resets == resets
+              && interactive.performance.mutation_image_resource_scans == scans
+              && interactive.performance.layout_reuse_matched_token_invalidations
+                     == token_invalidations + 1
+              && interactive.performance.layout_reuse_matched_token_dropped <= 8);
+        /* A class a relational rule depends on restyles what that rule can
+           select, exactly. */
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+                  "document.getElementById('host').className='k'",
+                  "<late-host-class>", &interactive.page.script_result)
+              && script_runtime_consume_relayout(interactive.page.runtime)
+              && navigation_relayout(&interactive));
+        CHECK(interactive.performance.layout_reuse_full_resets == resets
+              && late_init_text_color(&interactive.page.layout, "middle") == 0x333333
+              && late_init_text_color(&interactive.page.layout, "first") == 0x444444);
+        /* A script-inserted <style> is appended in place, not rebuilt. */
+        size_t rebuilds = interactive.performance.mutation_resource_rebuilds;
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+                  "const s=document.createElement('style');"
+                  "s.appendChild(document.createTextNode('.k .a{color:#555555}'));"
+                  "document.head.appendChild(s)", "<late-style>",
+                  &interactive.page.script_result)
+              && script_runtime_consume_relayout(interactive.page.runtime)
+              && navigation_relayout(&interactive));
+        CHECK(interactive.performance.mutation_resource_rebuilds == rebuilds
+              && interactive.performance.mutation_style_appends == 1
+              && interactive.performance.layout_reuse_full_resets == resets
+              && late_init_text_color(&interactive.page.layout, "middle") == 0x555555
+              && late_init_text_color(&interactive.page.layout, "first") == 0x444444
+              && late_init_text_color(&interactive.page.layout, "late") == 0x222222);
+        /* A stylesheet link still rebuilds. */
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+                  "const l=document.createElement('link');l.rel='stylesheet';"
+                  "l.href='/late.css';document.head.appendChild(l)",
+                  "<late-link>", &interactive.page.script_result)
+              && script_runtime_consume_relayout(interactive.page.runtime)
+              && navigation_relayout(&interactive));
+        CHECK(interactive.performance.mutation_resource_rebuilds == rebuilds + 1
+              && interactive.performance.mutation_style_appends == 1
+              && late_init_text_color(&interactive.page.layout, "middle") == 0x555555);
+        navigation_destroy(&interactive);
+        browser_session_destroy(&browser_session);
+        CHECK(budget.current == 0);
+    }
+
+    puts("test: destructive style mutation cannot use append-only rebuild");
+    {
+        static const char html[] =
+            "<!doctype html><style>p{color:#334455}</style><body>"
+            "<div id=holder><style>p{color:#ff0000}</style></div>"
+            "<p>removed-style-probe</p>";
+        CHECK(navigation_init(&interactive, &budget, 4));
+        navigation_enable_scripts(&interactive, 4 * MIB, 1000);
+        uint64_t generation = navigation_begin(&interactive);
+        CHECK(navigation_commit_html(&interactive, generation,
+            "https://example.test/removed-style", html, sizeof(html) - 1,
+            480, NULL, NULL, true));
+        CHECK(late_init_text_color(&interactive.page.layout,
+            "removed-style-probe") == 0xff0000);
+        /* Allocate before removal: reusing the retired style's address can
+           accidentally trigger the known-source fallback and mask the bug. */
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+            "var added=document.createElement('style');"
+            "added.textContent='p{padding:0}';"
+            "document.getElementById('holder').innerHTML='';"
+            "document.head.appendChild(added);", "<removed-style>",
+            &interactive.page.script_result)
+            && script_runtime_consume_relayout(interactive.page.runtime)
+            && navigation_relayout(&interactive));
+        CHECK(late_init_text_color(&interactive.page.layout,
+            "removed-style-probe") == 0x334455);
+        CHECK(interactive.performance.mutation_style_appends == 0);
+        navigation_destroy(&interactive);
+        CHECK(budget.current == 0);
+    }
 
     puts("test: inline SVG mutations refresh retained raster resources");
     static const char svg_refresh_page[] =

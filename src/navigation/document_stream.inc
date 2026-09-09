@@ -671,6 +671,12 @@ static bool navigation_stream_scan_metadata(NavigationDocumentStream *stream)
        matchMedia(), and viewport units observe the physical display while
        the committed document is laid out at the declared CSS width. */
     stream->viewport = stream->session->viewport;
+    if (stream->runtime != NULL) {
+        script_runtime_set_viewport(
+            stream->runtime, stream->viewport.css_width,
+            stream->viewport.css_height, stream->viewport.device_width,
+            stream->viewport.device_height);
+    }
     return true;
 }
 

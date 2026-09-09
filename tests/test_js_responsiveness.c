@@ -14,6 +14,7 @@
 
 #include "tilefinch/platform.h"
 #include "../src/js_runtime_internal.h"
+#include "tilefinch/budget_quickjs.h"
 
 #define MIB (1024u * 1024u)
 
@@ -145,6 +146,357 @@ static int test_reduced_dom_event_counter(void)
     JS_SetContextOpaque(context, NULL);
     JS_FreeContext(context);
     JS_FreeRuntime(runtime);
+    return 0;
+}
+
+static int check_external_compile_cycles(size_t source_bytes,
+                                         size_t target_remaining,
+                                         bool expect_collection)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://compile-pressure.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    JS_RunGC(runtime->runtime);
+    size_t live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    /* Reserve only a fixed 768 KiB above bootstrap, then fill it with
+       unreachable cycles. No site payload, timing assumptions, or heap raise
+       in the production path: reference counting alone cannot free these. */
+    runtime->base_memory_limit = live + 768u * 1024u;
+    runtime->boot_window_active = false;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    JS_SetGCThreshold(runtime->runtime, SIZE_MAX);
+    static const uint8_t bytes[4096] = {0};
+    for (unsigned i = 0; i < 256
+         && script_runtime_heap_remaining(runtime) > target_remaining; i++) {
+        JSValue cycle = JS_NewObject(runtime->context);
+        CHECK(!JS_IsException(cycle));
+        CHECK(JS_SetPropertyStr(runtime->context, cycle, "self",
+                  JS_DupValue(runtime->context, cycle)) >= 0);
+        CHECK(JS_SetPropertyStr(runtime->context, cycle, "payload",
+                  JS_NewArrayBufferCopy(runtime->context, bytes, sizeof(bytes))) >= 0);
+        JS_FreeValue(runtime->context, cycle);
+    }
+    CHECK(script_runtime_heap_remaining(runtime) <= target_remaining);
+    char source[32769];
+    for (size_t i = 0; i < sizeof(source) - 1u; i += 8u)
+        memcpy(source + i, "void 0; ", 8u);
+    CHECK(source_bytes <= sizeof(source) - 1u && source_bytes % 8u == 0u);
+    source[source_bytes] = '\0';
+    bool admitted = false;
+    size_t rejections = script_runtime_heap_rejections(runtime);
+    size_t before = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    JSValue compiled = js_rt_compile_source_type(runtime->context, source,
+        source_bytes, "https://compile-pressure.test/loader.js",
+        JS_EVAL_TYPE_GLOBAL, SCRIPT_COMPILE_SOURCE_EXTERNAL, &result, &admitted);
+    CHECK(admitted && !JS_IsException(compiled));
+    CHECK(script_runtime_heap_rejections(runtime) == rejections);
+    size_t after = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    printf("external-compile-pressure source=%zu headroom=%zu collect=%d "
+           "owned-before=%zu owned-after=%zu\n", source_bytes,
+           target_remaining, expect_collection, before, after);
+    /* Dead cycles occupy at least 256 KiB. The small compilation must not
+       collect them when it has ample room; the tight-heap case must reclaim
+       them before parsing, without a failed allocation/retry. */
+    CHECK(expect_collection ? after < before - 128u * 1024u : after >= before);
+    JSValue evaluated = JS_EvalFunction(runtime->context, compiled);
+    CHECK(!JS_IsException(evaluated));
+    JS_FreeValue(runtime->context, evaluated);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_external_compile_reclaims_cycles(void)
+{
+    CHECK(check_external_compile_cycles(32768, 16384, true) == 0);
+    CHECK(check_external_compile_cycles(256, 16384, true) == 0);
+    CHECK(check_external_compile_cycles(256, 512u * 1024u, false) == 0);
+    CHECK(check_external_compile_cycles(1424, 512u * 1024u, false) == 0);
+    return 0;
+}
+
+static int test_gc_pacing_requires_heap_growth(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://compile-pressure.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_advance(runtime, 16, 4, &result));
+    JS_RunGC(runtime->runtime);
+    size_t live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    runtime->base_memory_limit = live + 768u * 1024u;
+    runtime->boot_window_active = false;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    JS_SetGCThreshold(runtime->runtime, SIZE_MAX);
+    static const uint8_t payload[600u * 1024u] = {0};
+    JSValue retained = JS_NewArrayBufferCopy(runtime->context, payload, sizeof(payload));
+    CHECK(!JS_IsException(retained));
+    JSValue cycle = JS_NewObject(runtime->context);
+    CHECK(!JS_IsException(cycle));
+    CHECK(JS_SetPropertyStr(runtime->context, cycle, "self",
+              JS_DupValue(runtime->context, cycle)) >= 0);
+    CHECK(JS_SetPropertyStr(runtime->context, cycle, "payload",
+              JS_NewArrayBufferCopy(runtime->context, payload, 64u * 1024u)) >= 0);
+    JS_FreeValue(runtime->context, cycle);
+    size_t before = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    CHECK(script_runtime_heap_remaining(runtime) < 128u * 1024u);
+    /* The reserve is already occupied. Three almost idle advances must not
+       lower the automatic threshold below the live graph and collect the
+       same graph again on their first small object allocation. */
+    for (unsigned i = 0; i < 3; i++) {
+        CHECK(script_runtime_advance(runtime, 16, 4, &result));
+        JSValue small = JS_NewObject(runtime->context);
+        CHECK(!JS_IsException(small));
+        JS_FreeValue(runtime->context, small);
+    }
+    size_t after = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    CHECK(after >= before - 16u * 1024u);
+    /* Growth still crosses the paced threshold and reclaims the dead cycle;
+       the fix must not disable automatic collection under real pressure. */
+    JSValue growth = JS_NewArrayBufferCopy(runtime->context, payload, 64u * 1024u);
+    CHECK(!JS_IsException(growth));
+    JSValue trigger = JS_NewObject(runtime->context);
+    CHECK(!JS_IsException(trigger));
+    JS_FreeValue(runtime->context, trigger);
+    CHECK(budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool)
+          < before + 16u * 1024u);
+    JS_FreeValue(runtime->context, growth);
+    JS_FreeValue(runtime->context, retained);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_dom_wrapper_receiver_sharing(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    char html[4096] = "<!doctype html><body>";
+    size_t length = strlen(html);
+    for (unsigned i = 0; i < 48; i++)
+        length += (size_t) snprintf(html + length, sizeof(html) - length,
+                                   "<p id=p%u>Item</p>", i);
+    CHECK(document_parse(&document, &budget, html, length, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://wrapper-pressure.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    size_t before = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    JSMemoryUsage wrapper_before, wrapper_after;
+    JS_ComputeMemoryUsage(runtime->runtime, &wrapper_before);
+    static const char script[] =
+        "(()=>{const register=FinalizationRegistry.prototype.register,"
+        "unregister=FinalizationRegistry.prototype.unregister;"
+        "FinalizationRegistry.prototype.register=function(){"
+        "throw Error('private wrapper record exposed')};"
+        "FinalizationRegistry.prototype.unregister=function(){"
+        "throw Error('private wrapper token exposed')};try{"
+        "globalThis.finalizerPrivacyProbe=document.createElement('i');"
+        "if(!finalizerPrivacyProbe)throw Error('missing fresh wrapper');"
+        "globalThis.wrapperProbe=document.querySelectorAll('p');"
+        "for(const n of wrapperProbe)void n.classList;"
+        "(()=>{const a=wrapperProbe[0],b=wrapperProbe[1];"
+        "const x=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(a),'id'),"
+        "y=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(b),'id');"
+        "if(Object.getPrototypeOf(a)!==Object.getPrototypeOf(b)||"
+        "Object.prototype.hasOwnProperty.call(a,'id'))throw Error('unshared prototype');"
+        "if(wrapperProbe.length!==48||x.get!==y.get||x.set!==y.set||"
+        "!x.enumerable||!x.configurable||a.hasAttribute!==b.hasAttribute)"
+        "throw Error('unshared receiver-only descriptors');"
+        "const ca=Object.getOwnPropertyDescriptor(a,'classList'),"
+        "cb=Object.getOwnPropertyDescriptor(b,'classList');"
+        "if(ca.get!==cb.get||ca.set!==cb.set)throw Error('unshared classList');"
+        "if(a.classList.add!==b.classList.add||a.classList.item!==b.classList.item)"
+        "throw Error('unshared token-list methods');"
+        "a.classList.add.call(b.classList,'borrowed');"
+        "if(!b.classList.contains('borrowed')||a.classList.contains('borrowed'))"
+        "throw Error('token-list receiver');"
+        "b.classList.remove('borrowed');"
+        "var badReceiver=false;try{a.classList.add.call({},'bad')}"
+        "catch(e){badReceiver=e instanceof TypeError}"
+        "if(!badReceiver)throw Error('token-list brand');"
+        "for(let i=0;i<wrapperProbe.length;i++){const t=wrapperProbe[i].classList;"
+        "t.add('stable');if(t[0]!=='stable'||!(0 in t)||t.item(1)!==null"
+        "||Array.from(t).join(' ')!=='stable')throw Error('token-list indexing');"
+        "try{t.add('must-not-write','bad token')}catch(e){}"
+        "if(t.contains('must-not-write'))throw Error('token-list atomic validation');"
+        "t.remove('stable')}"
+        "const list=a.classList;list.add('one');b.classList.add('two');"
+        "if(a.classList!==list||!list.contains('one')||list.contains('two')"
+        "||ca.get.call(b)!==b.classList)throw Error('classList receiver identity');"
+        "a.id='first';b.id='second';a.hidden=true;"
+        "if(a.id!=='first'||b.id!=='second'||!a.hidden||b.hidden)"
+        "throw Error('cross-wrapper attribute state');"
+        "let aa=0,bb=0;a.addEventListener('x',()=>aa++);"
+        "if(a.addEventListener!==b.addEventListener||"
+        "a.removeEventListener!==b.removeEventListener)throw Error('event methods');"
+        "b.addEventListener('x',()=>bb++);a.dispatchEvent(new Event('x'));"
+        "if(aa!==1||bb!==0)throw Error('cross-wrapper listeners');"
+        "b.remove();if(!a.isConnected||b.isConnected||b.id!=='second')"
+        "throw Error('detached wrapper state');"
+        "Object.defineProperty(a,'id',{value:'own',configurable:true});"
+        "if(a.id!=='own'||b.id!=='second')throw Error('shared override');"
+        "globalThis.pocSummary='DOM-WRAPPERS-SHARED';})()"
+        "}finally{FinalizationRegistry.prototype.register=register;"
+        "FinalizationRegistry.prototype.unregister=unregister}})()";
+    bool evaluated = script_runtime_evaluate_diagnostic(runtime, script,
+        "<wrapper-pressure>", &result);
+    size_t after = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    JS_ComputeMemoryUsage(runtime->runtime, &wrapper_after);
+    printf("dom-wrapper-pressure wrappers=48 owned-before=%zu owned-after=%zu objects=%lld\n",
+        before, after, (long long)(wrapper_after.obj_count - wrapper_before.obj_count));
+    if (!evaluated) fprintf(stderr, "wrapper-pressure error=%s\n", result.error);
+    CHECK(evaluated && strcmp(result.summary, "DOM-WRAPPERS-SHARED") == 0);
+    CHECK(after >= before && after - before < 512u * 1024u);
+    /* Parsed nodes can already have wrappers from bootstrap discovery. Use
+       fresh strongly retained nodes to isolate cache bookkeeping growth. */
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.wrapperCachePressure=[document.createElement('i')];",
+        "<wrapper-cache-warmup>", &result));
+    JS_ComputeMemoryUsage(runtime->runtime, &wrapper_before);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "for(let i=0;i<48;i++)wrapperCachePressure.push(document.createElement('i'));",
+        "<wrapper-cache-growth>", &result));
+    JS_ComputeMemoryUsage(runtime->runtime, &wrapper_after);
+    printf("dom-wrapper-cache fresh=48 objects=%lld bytes=%lld\n",
+        (long long)(wrapper_after.obj_count - wrapper_before.obj_count),
+        (long long)(wrapper_after.malloc_size - wrapper_before.malloc_size));
+    /* Five objects per fresh wrapper with the shared record, versus seven
+       before; leave one object's margin for unrelated receiver metadata. */
+    CHECK(wrapper_after.obj_count - wrapper_before.obj_count <= 6 * 48);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_dom_order_without_sibling_wrappers(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    char html[16384] = "<!doctype html><body><div id=order>";
+    size_t length = strlen(html);
+    for (unsigned i = 0; i < 400; ++i)
+        length += (size_t) snprintf(html + length, sizeof(html) - length,
+                                   "<p id=n%u>Text</p>", i);
+    CHECK(document_parse(&document, &budget, html, length, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://node-order.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.orderParent=document.getElementById('order');"
+        "globalThis.orderFirst=document.getElementById('n0');"
+        "globalThis.orderLast=document.getElementById('n399');",
+        "<order-setup>", &result));
+    size_t slots = runtime->bridge.node_count;
+    size_t before = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "for(let i=0;i<32;i++){"
+        "if(orderFirst.compareDocumentPosition(orderLast)!==4||"
+        "orderLast.compareDocumentPosition(orderFirst)!==2||"
+        "orderParent.compareDocumentPosition(orderLast)!==20||"
+        "orderLast.compareDocumentPosition(orderParent)!==10)"
+        "throw Error('native tree order');}"
+        "pocSummary='NATIVE-ORDER-OK'",
+        "<native-order>", &result));
+    size_t after = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    printf("dom-order slots=%zu->%zu heap=%zu->%zu\n", slots,
+        runtime->bridge.node_count, before, after);
+    CHECK(strcmp(result.summary, "NATIVE-ORDER-OK") == 0
+          && runtime->bridge.node_count == slots
+          && after < before + 32u * 1024u);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "orderParent.insertBefore(orderLast,orderFirst);"
+        "if(orderFirst.compareDocumentPosition(orderLast)!==2||"
+        "orderLast.compareDocumentPosition(orderFirst)!==4)throw Error('stale order');"
+        "const detached=document.createElement('div');detached.append(orderFirst);"
+        "const a=orderFirst.compareDocumentPosition(orderLast),"
+        "b=orderLast.compareDocumentPosition(orderFirst);"
+        "if((a&33)!==33||(b&33)!==33||(a&6)===(b&6))throw Error('disconnected order');",
+        "<mutated-order>", &result));
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static TimedCooperate *task_slice_clock;
+
+static JSValue consume_task_slice(JSContext *context, JSValueConst this_value,
+                                  int argc, JSValueConst *argv)
+{
+    (void) context; (void) this_value; (void) argc; (void) argv;
+    task_slice_clock->now_ns += UINT64_C(10000000);
+    return JS_UNDEFINED;
+}
+
+static int test_runtime_task_time_slice(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://task-slice.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    runtime->bridge.execution_policy.maximum_advance_time_us = 8000;
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    CHECK(JS_SetPropertyStr(runtime->context, global, "consumeTaskSlice",
+        JS_NewCFunction(runtime->context, consume_task_slice, "consumeTaskSlice", 0)) >= 0);
+    JS_FreeValue(runtime->context, global);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "globalThis.taskOrder='';for(let i=0;i<3;i++)setTimeout(()=>{"
+        "consumeTaskSlice();taskOrder+=i;Promise.resolve().then(()=>taskOrder+='m');},0)",
+        "<task-slice>", &result));
+    TimedCooperate clock = { .now_ns = UINT64_C(1000000000) };
+    task_slice_clock = &clock;
+    TilefinchPlatformServices services = {
+        .context = &clock, .monotonic_time_ns = timed_cooperate_clock,
+        .cooperate = timed_cooperate_poll
+    };
+    tilefinch_platform_set_services(&services);
+    for (unsigned i = 0; i < 3; i++) {
+        CHECK(script_runtime_advance(runtime, 16, 16, &result));
+        JSValue value = JS_Eval(runtime->context, "taskOrder", 9, "<check>", 0);
+        const char *order = JS_ToCString(runtime->context, value);
+        static const char *expected[] = { "0m", "0m1m", "0m1m2m" };
+        CHECK(order != NULL && strcmp(order, expected[i]) == 0);
+        JS_FreeCString(runtime->context, order);
+        JS_FreeValue(runtime->context, value);
+    }
+    tilefinch_platform_set_services(NULL);
+    task_slice_clock = NULL;
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
     return 0;
 }
 
@@ -410,16 +762,49 @@ static int test_computed_style_native_cooperation(void)
         JS_NewInt64(runtime->context, script_runtime_node_handle(runtime, node)),
         JS_NewString(runtime->context, "color")
     };
+    static const char guarded_source[] =
+        "(function(read,handle,property){try{return read(handle,property)}"
+        "catch(error){return 'caught'}})";
+    JSValue guarded = JS_Eval(runtime->context, guarded_source,
+        sizeof(guarded_source) - 1u, "<guarded-style-read>", JS_EVAL_TYPE_GLOBAL);
+    JSValue reader = JS_NewCFunction(runtime->context, js_computed_style_get,
+        "readStyle", 2);
+    CHECK(JS_IsFunction(runtime->context, guarded)
+        && JS_IsFunction(runtime->context, reader));
+    JSValue call_args[3] = { reader, args[0], args[1] };
     CallbackAbortCooperate probe = {0};
     TilefinchPlatformServices services = { .context = &probe,
         .cooperate = callback_abort_cooperate };
     js_rt_runtime_arm_watchdog(runtime);
     tilefinch_platform_set_services(&services);
-    JSValue value = js_computed_style_get(runtime->context, JS_UNDEFINED, 2, args);
+    JSValue value = JS_Call(runtime->context, guarded, JS_UNDEFINED, 3, call_args);
     tilefinch_platform_set_services(NULL);
     CHECK(probe.calls == 1 && JS_IsException(value));
     JSValue exception = JS_GetException(runtime->context);
     JS_FreeValue(runtime->context, exception);
+    /* Ordinary author conversion failures remain catchable. Cancellation is
+       task control flow, not a blanket change to computed-style errors. */
+    js_rt_runtime_arm_watchdog(runtime);
+    static const char conversion_source[] =
+        "({toString(){throw new Error('conversion')}})";
+    JSValue conversion = JS_Eval(runtime->context, conversion_source,
+        sizeof(conversion_source) - 1u, "<style-conversion>", JS_EVAL_TYPE_GLOBAL);
+    CHECK(!JS_IsException(conversion));
+    call_args[2] = conversion;
+    value = JS_Call(runtime->context, guarded, JS_UNDEFINED, 3, call_args);
+    const char *caught = JS_ToCString(runtime->context, value);
+    CHECK(caught != NULL && strcmp(caught, "caught") == 0);
+    JS_FreeCString(runtime->context, caught);
+    JS_FreeValue(runtime->context, value);
+    JS_FreeValue(runtime->context, conversion);
+    js_rt_runtime_arm_watchdog(runtime);
+    runtime->watchdog.deadline_ms = 0;
+    value = js_computed_style_get(runtime->context, JS_UNDEFINED, 2, args);
+    CHECK(JS_IsException(value) && runtime->watchdog.interrupted);
+    exception = JS_GetException(runtime->context);
+    JS_FreeValue(runtime->context, exception);
+    JS_FreeValue(runtime->context, guarded);
+    JS_FreeValue(runtime->context, reader);
     JS_FreeValue(runtime->context, args[0]);
     JS_FreeValue(runtime->context, args[1]);
     CHECK(script_runtime_evaluate_diagnostic(runtime,
@@ -527,8 +912,76 @@ static int test_native_dynamic_code_policy(void)
     return 0;
 }
 
-int main(void)
+static int test_coalesced_attribute_tokens(void)
 {
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body><p id=p>Text</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000, "https://mutation.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    ScriptMutationJournal journal;
+    (void) script_runtime_consume_mutations(runtime, &journal);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "var p=document.getElementById('p');p.className='first';p.className='second';",
+        "<coalesced-attributes>", &result));
+    CHECK(script_runtime_consume_mutations(runtime, &journal));
+    const ScriptMutationRecord *record = NULL;
+    for (size_t i = 0; i < journal.count; i++)
+        if (strcmp(journal.records[i].attribute, "class") == 0) record = &journal.records[i];
+    CHECK(record != NULL && record->changed_tokens_exact);
+    bool first = false, second = false;
+    for (size_t i = 0; i < record->changed_token_count; i++) {
+        first |= record->changed_tokens[i] == stylesheet_identity_token_hash(false, "first", 5);
+        second |= record->changed_tokens[i] == stylesheet_identity_token_hash(false, "second", 6);
+    }
+    CHECK(first && second);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "p.className='small';p.className='a b c d e f g h i j k l m n o p q r s t';",
+        "<coalesced-token-overflow>", &result));
+    CHECK(script_runtime_consume_mutations(runtime, &journal));
+    for (size_t i = 0; i < journal.count; i++)
+        if (strcmp(journal.records[i].attribute, "class") == 0)
+            CHECK(!journal.records[i].changed_tokens_exact);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "p.className='';", "<reset-token-probe>", &result));
+    (void) script_runtime_consume_mutations(runtime, &journal);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "for(let i=0;i<12;i++)p.className='token'+i;",
+        "<coalesced-union-overflow>", &result));
+    CHECK(script_runtime_consume_mutations(runtime, &journal));
+    record = NULL;
+    for (size_t i = 0; i < journal.count; i++)
+        if (strcmp(journal.records[i].attribute, "class") == 0) record = &journal.records[i];
+    CHECK(record != NULL && !record->changed_tokens_exact
+          && record->changed_token_count == 0);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "--coalesced-tokens-only") == 0)
+        return test_coalesced_attribute_tokens();
+    CHECK(test_coalesced_attribute_tokens() == 0);
+    if (argc == 2 && strcmp(argv[1], "--external-compile-pressure-only") == 0)
+        return test_external_compile_reclaims_cycles()
+            || test_gc_pacing_requires_heap_growth()
+            || test_dom_wrapper_receiver_sharing()
+            || test_dom_order_without_sibling_wrappers();
+    if (argc == 2 && strcmp(argv[1], "--task-time-slice-only") == 0)
+        return test_runtime_task_time_slice();
+    CHECK(test_external_compile_reclaims_cycles() == 0);
+    CHECK(test_gc_pacing_requires_heap_growth() == 0);
+    CHECK(test_dom_wrapper_receiver_sharing() == 0);
+    CHECK(test_dom_order_without_sibling_wrappers() == 0);
+    CHECK(test_runtime_task_time_slice() == 0);
     CHECK(test_computed_style_native_cooperation() == 0);
     CHECK(test_watchdog_elapsed_cooperation() == 0);
     CHECK(test_reduced_dom_event_counter() == 0);
@@ -601,12 +1054,14 @@ int main(void)
     CHECK(script_execution_policy_for_profile(
               SCRIPT_EXECUTION_PROFILE_PSP_STRICT, &strict)
           && strict.maximum_host_compile_source_bytes == 256u * 1024u
+          && strict.maximum_advance_time_us == 16000
           && strict.maximum_host_compile_projected_us == 0
           && strict.modeled_compile_bytes_per_ms == 0);
     CHECK(script_execution_policy_for_profile(
               SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC, &realistic)
           && realistic.maximum_host_compile_source_bytes
                == 384u * 1024u
+          && realistic.maximum_advance_time_us == 16000
           && realistic.maximum_host_compile_source_bytes
                > strict.maximum_host_compile_source_bytes);
     invalid.maximum_host_compile_source_bytes = 7;

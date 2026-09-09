@@ -45,6 +45,7 @@ the code and its strings ship).
 | `TILEFINCH_TRACE_LAYOUT_SLICES` | 1 | `src/layout.c` | host | Resumable layout slice boundaries. |
 | `TILEFINCH_TRACE_LAZY_SCRIPTS` | 1 | `src/diagnostic_trace.h` | host | Lazy webpack plan memory and factory events. |
 | `TILEFINCH_TRACE_MODULE_ORDER` | 1 | `src/js_module_loader.c` | always | ES module load order. |
+| `TILEFINCH_TRACE_MUTATION_JOURNAL` | 2 | `src/navigation/history_runtime.inc` | host | Print each script mutation journal record (kind, element, attribute, exact changed-token count) as layout reuse invalidation consumes it. |
 | `TILEFINCH_TRACE_MUTATION_POLICY` | 1 | `src/diagnostic_trace.h` | host | Mutation classification (resource rebuild, image scan) per DOM change. |
 | `TILEFINCH_TRACE_NAVIGATION_REQUESTS` | 1 | `src/js_runtime/host_primitives.inc` | host | Script-initiated navigations. |
 | `TILEFINCH_TRACE_NETWORK_RESPONSES` | 2 | `src/js_fetch_cors.c` | host | Page network responses (first 64 bytes). |
@@ -96,9 +97,14 @@ the code and its strings ship).
 | `TILEFINCH_DISABLE_COMPILED_SELECTORS` | 1 | `src/style_selector_program.c` | host | Never build the compiled selector program for a stylesheet. |
 | `TILEFINCH_DISABLE_COMPILED_STYLESHEET_CACHE` | 2 | `src/navigation/page_lifecycle.inc` | host | Do not reuse a compiled stylesheet across navigations. |
 | `TILEFINCH_DISABLE_COMPRESSION_STREAMS` | 1 | `src/js_runtime/runtime_creation.inc` | always | Do not install the native CompressionStream/DecompressionStream primitive. |
+| `TILEFINCH_DISABLE_DISCOVERY_GATE` | 1 | `src/js_dom_bindings.c` | host | Refresh image discovery for every class/id change instead of only those a display/visibility/image rule depends on. |
 | `TILEFINCH_DISABLE_FIXED_CACHE` | 1 | `src/render.c` | host | Disable the fixed-position paint cache in the tile renderer. |
+| `TILEFINCH_DISABLE_IMAGE_PREFILTER` | 1 | `src/image.c` | host | Resolve every element's ::before/::after styles during image discovery instead of skipping elements whose pseudo candidates cannot supply an image. |
+| `TILEFINCH_DISABLE_INSERT_SCOPED_REUSE` | 1 | `src/navigation/history_runtime.inc` | host | Reset the layout reuse cache for every child-list insertion instead of scoping detached-subtree insertions to their parent. |
 | `TILEFINCH_DISABLE_LAZY_WEBPACK` | 2 | `src/js_fetch_cors.c` | always | Load large webpack bundles eagerly instead of through the lazy factory plan. |
+| `TILEFINCH_DISABLE_RETAINED_MATCHES` | 1 | `src/layout.c` | host | Disable the page layout reuse cache's retained per-element matched-rule lists for timing and equivalence comparison. |
 | `TILEFINCH_DISABLE_SELECTOR_APPEND_REUSE` | 1 | `src/style_sheet.c` | host | Rebuild the selector program on every stylesheet append instead of preserving it. |
+| `TILEFINCH_DISABLE_STYLE_APPEND` | 1 | `src/navigation/history_runtime.inc` | host | Rebuild the page stylesheet for every script-inserted `<style>` element instead of appending it in place. |
 | `TILEFINCH_DISABLE_STYLESHEET_CONTINUATION` | 1 | `src/navigation/stylesheet_checkpoint.inc` | host | Disable resumable stylesheet parsing across checkpoints. |
 | `TILEFINCH_DISABLE_STYLESHEET_FRAGMENT_CACHE` | 1 | `src/resources.c` | host | Do not cache compiled stylesheet fragments in the shared body store. |
 | `TILEFINCH_DISABLE_STYLESHEET_PARSED_IR` | 1 | `src/resources.c` | host | Do not cache the parsed stylesheet IR in the shared body store. |

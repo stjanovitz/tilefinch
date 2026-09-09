@@ -45,6 +45,7 @@ int main(int argc, char **argv)
     RUN_TEST(test_streaming_preview_pressure_preserves_final_commit);
     RUN_TEST(test_streaming_stylesheet_continuation_converges);
     RUN_TEST(test_streaming_preview_rejects_incomplete_external_css);
+    RUN_TEST(test_streaming_stylesheet_follows_late_viewport);
     RUN_TEST(test_streaming_preview_cancel_is_transient);
     RUN_TEST(test_parser_blocking_script_classification);
     RUN_TEST(test_valid_meta_referrer_overrides_response_policy);

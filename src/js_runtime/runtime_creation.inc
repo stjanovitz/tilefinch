@@ -1706,6 +1706,9 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchRelation",
                                        js_dom_relation, 2)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchComparePosition",
+                                       js_dom_compare_position, 2)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchIsConnected",
                                        js_dom_is_connected, 1)
                    && js_rt_install_function(host->context, global,

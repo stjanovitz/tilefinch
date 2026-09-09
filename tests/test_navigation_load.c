@@ -3397,6 +3397,107 @@ static bool test_streaming_stylesheet_continuation_converges(void)
     return equivalent;
 }
 
+static bool viewport_after_stylesheet_replay_begin(void)
+{
+    char error[256] = {0};
+    return fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-viewport-after-stylesheet",
+        error, sizeof(error));
+}
+
+static uint32_t layout_text_color(const LayoutDocument *layout,
+                                  const char *text)
+{
+    size_t length = strlen(text);
+    for (size_t i = 0; layout != NULL && i < layout->count; i++) {
+        const DrawCommand *command = &layout->commands[i];
+        if (command->type == DRAW_TEXT && command->text_length == length
+            && memcmp(command->text, text, length) == 0) {
+            return command->color;
+        }
+    }
+    return UINT32_MAX;
+}
+
+/* A parser-blocking script before the first stylesheet compiles the
+   streaming sheet against the legacy layout width; a <meta name=viewport>
+   parsed later moves the viewport to the device width.  The committed
+   page must answer media queries for the committed viewport rather than
+   continue the stale prefix. */
+static bool test_streaming_stylesheet_follows_late_viewport(void)
+{
+    Budget budget;
+    budget_init(&budget, 16 * MIB);
+    bool lexbor_installed = budget_install_lexbor(&budget);
+    NavigationSession navigation = {0};
+    bool ready = lexbor_installed
+        && navigation_init(&navigation, &budget, 4)
+        && viewport_after_stylesheet_replay_begin();
+    if (ready) {
+        navigation_enable_scripts(&navigation, 2 * MIB, 1000);
+        navigation_enable_document_scripts(
+            &navigation, 4, 32 * 1024, 16 * 1024, 1000);
+        navigation_enable_external_resources(
+            &navigation, 2, 32 * 1024, 16 * 1024,
+            2, 32 * 1024, 16 * 1024, 64 * 1024, 1000);
+        navigation_set_stream_delivery(
+            &navigation, 64, 0, 0, 0, 0, 0);
+    }
+    uint64_t generation = ready ? navigation_begin(&navigation) : 0;
+    NavigationLoad *load = ready ? navigation_load_begin_url(
+        &navigation, generation,
+        "https://viewport-order.test/document",
+        4096, 1000, 480, NULL, NULL, true) : NULL;
+    NavigationLoadQuota quota = {
+        .fetch = {
+            .maximum_body_callbacks = 1,
+            .maximum_body_bytes = 64,
+            .maximum_time_us = 10000
+        },
+        .maximum_parser_body_bytes = 64,
+        .maximum_parser_time_us = 10000
+    };
+    for (size_t i = 0; load != NULL && i < 128; i++) {
+        NavigationLoadStatus status = navigation_load_status(load);
+        if (status != NAVIGATION_LOAD_PENDING) break;
+        (void) navigation_load_pump(load, &quota);
+    }
+    bool loaded = load != NULL && finish_bounded(load, &quota);
+    uint32_t color = loaded
+        ? layout_text_color(&navigation.page.layout, "viewport")
+        : UINT32_MAX;
+    bool ok = loaded && navigation.page.loaded
+        && navigation.viewport.css_width == 480
+        && navigation.page.stylesheet.viewport_width == 480
+        && navigation.performance.blocking_stylesheet_viewport_rebuilds == 1
+        && navigation.performance.blocking_script_sample_count >= 1
+        && color == 0x112233u
+        && strcmp(navigation.page.script_result.summary, "viewport:480") == 0;
+    if (!ok) {
+        fprintf(stderr,
+                "viewport-after-stylesheet loaded=%d page=%d viewport=%d "
+                "sheet=%dx%d rebuilds=%zu samples=%zu color=%06x "
+                "summary=\"%s\" status=%d error=\"%s\"\n",
+                loaded, navigation.page.loaded,
+                navigation.viewport.css_width,
+                navigation.page.stylesheet.viewport_width,
+                navigation.page.stylesheet.viewport_height,
+                navigation.performance.blocking_stylesheet_viewport_rebuilds,
+                navigation.performance.blocking_script_sample_count,
+                (unsigned) color, navigation.page.script_result.summary,
+                load == NULL ? -1 : (int) navigation_load_status(load),
+                navigation.last_error);
+    }
+    navigation_load_destroy(load);
+    if (ready) fetch_trace_end();
+    if (lexbor_installed) navigation_destroy(&navigation);
+    bool clean = budget.current == 0
+        && budget_active_allocations(&budget, NULL) == 0
+        && budget_categories_reconcile(&budget);
+    if (lexbor_installed) clean = budget_uninstall_lexbor(&budget) && clean;
+    return ok && clean;
+}
+
 static bool test_streaming_preview_rejects_incomplete_external_css(void)
 {
     Budget budget;

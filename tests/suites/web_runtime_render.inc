@@ -41,6 +41,43 @@ static int test_web_runtime(void)
     }
     CHECK(section_long_ok && section_save_ok && saved_section_state == 1
           && section_short_ok);
+    CHECK(script_runtime_evaluate_diagnostic(section_state_runtime,
+        "(()=>{const a=document.createElement('div'),b=document.createElement('div');"
+        "if(a.getBoundingClientRect!==b.getBoundingClientRect||"
+        "a.scrollIntoView!==b.scrollIntoView||a.dispatchEvent!==b.dispatchEvent||"
+        "Object.getOwnPropertyDescriptor(Object.getPrototypeOf(a),'dataset').get!=="
+        "Object.getOwnPropertyDescriptor(Object.getPrototypeOf(b),'dataset').get)throw Error('wrapper closures');"
+        "if(Object.getOwnPropertyDescriptor(a,'style').get!=="
+        "Object.getOwnPropertyDescriptor(b,'style').get)throw Error('style closures');"
+        "const savedStyle=a.style;a.style='color:red';b.style='color:blue';"
+        "if(a.style!==savedStyle||a.style===b.style||a.style.color!=='red'||"
+        "b.style.color!=='blue')throw Error('style identity');"
+        "a.append.call(b,'receiver');b.dataset.label='second';"
+        "if(a.textContent!==''||b.textContent!=='receiver'||a.dataset.label!==undefined||"
+        "b.getAttribute('data-label')!=='second')throw Error('wrapper receiver');"
+        "let calls=0;a.addEventListener('probe',()=>calls++);"
+        "a.dispatchEvent.call(b,new Event('probe'));"
+        "if(calls!==0)throw Error('listener isolation');a.dispatchEvent(new Event('probe'));"
+        "if(calls!==1)throw Error('listener dispatch')})()",
+        "<shared-native-wrapper-methods>", &section_state_result));
+    (void) script_runtime_collect_and_trim(section_state_runtime);
+    size_t wrapper_headroom_before = script_runtime_heap_remaining(section_state_runtime);
+    bool wrapper_memory_ok = script_runtime_evaluate_diagnostic(section_state_runtime,
+        "globalThis.wrapperMemoryProbe=[];for(let i=0;i<64;i++)"
+        "wrapperMemoryProbe.push(document.createElement('div'))",
+        "<wrapper-memory>", &section_state_result);
+    if (!wrapper_memory_ok) fprintf(stderr,"wrapper headroom=%zu error=%s\n",
+        wrapper_headroom_before, section_state_result.error);
+    CHECK(wrapper_memory_ok);
+    (void) script_runtime_collect_and_trim(section_state_runtime);
+    size_t wrapper_headroom_after = script_runtime_heap_remaining(section_state_runtime);
+    printf("native wrapper memory: 64 nodes=%zu bytes\n",
+           wrapper_headroom_before - wrapper_headroom_after);
+    CHECK(wrapper_headroom_before >= wrapper_headroom_after
+          && wrapper_headroom_before - wrapper_headroom_after < 384u * 1024u);
+    CHECK(script_runtime_evaluate_diagnostic(section_state_runtime,
+        "delete globalThis.wrapperMemoryProbe", "<wrapper-memory-release>",
+        &section_state_result));
     const char *short_section_body = document_body_text(
         &section_state_document);
     size_t short_section_bytes = section_state_document.text_bytes;

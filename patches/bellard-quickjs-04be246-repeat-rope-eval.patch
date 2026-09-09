@@ -100,7 +100,7 @@
  /* the indirection is needed to make 'eval' optional */
  static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                 const char *input, size_t input_len,
-@@ -37470,20 +37495,143 @@
+@@ -37470,20 +37495,144 @@
      return ret;
  }
 
@@ -148,13 +148,13 @@
 +    *first_line_column = 0;
 +    string_rope_iter_init(&iterator, value);
 +    while ((part = string_rope_iter_next(&iterator)) != NULL) {
-+        uint32_t at = 0;
-+        while (at < part->len) {
++        uint32_t at = 0, length = iterator.end - iterator.start;
++        while (at < length) {
 +            if (skipped + at == JS_STRING_REPEAT_EVAL_SCAN_MAX)
 +                return JS_ThrowRangeError(
 +                    ctx,
 +                    "eval source exceeds bounded repeated-string scan limit");
-+            int c = string_get(part, at);
++            int c = string_get(part, iterator.start + at);
 +            if (c != ' ' && c != '\t') {
 +                prefix_only = FALSE;
 +                break;
@@ -184,10 +184,11 @@
 +            return JS_EXCEPTION;
 +        string_rope_iter_init(&iterator, value);
 +        while ((part = string_rope_iter_next(&iterator)) != NULL) {
-+            uint32_t start = min_uint32(discard, part->len);
++            uint32_t start = min_uint32(discard, iterator.end - iterator.start);
 +            discard -= start;
-+            while (start < part->len) {
-+                uint32_t available = part->len - start;
++            start += iterator.start;
++            while (start < iterator.end) {
++                uint32_t available = iterator.end - start;
 +                uint32_t until_poll =
 +                    JS_STRING_REPEAT_EVAL_POLL_INTERVAL - work_since_poll;
 +                uint32_t count = min_uint32(available, until_poll);

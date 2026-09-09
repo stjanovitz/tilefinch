@@ -5009,7 +5009,6 @@
   }
   document.createDocumentFragment = () => {
     const node = wrap(__tilefinchCreateFragment());
-    if (node) Object.setPrototypeOf(node, DocumentFragment.prototype);
     return node;
   };
   document.createTextNode = (value) => {
@@ -5038,14 +5037,6 @@
     if (node) {
       node.__tilefinchProgrammatic = true;
       node.__namespaceURI = qualified.namespaceURI;
-      Object.setPrototypeOf(
-        node,
-        globalThis.__tilefinchElementPrototype(
-          node.tagName,
-          node.nodeType,
-          qualified.namespaceURI,
-        ),
-      );
     }
     return node;
   };
@@ -5085,6 +5076,9 @@
         connected.appendChild(__tilefinchMaterializeDetachedNode(child));
     }
     if (parent?.removeChild) parent.removeChild(node);
+    // Detached shim nodes have own accessors. Materialize the native receiver
+    // descriptors before copying so those accessors cannot shadow native state.
+    globalThis.__tilefinchPrepareNativePrototype?.(connected);
     for (const [key, descriptor] of Object.entries(
       Object.getOwnPropertyDescriptors(connected),
     )) {

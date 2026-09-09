@@ -104,6 +104,14 @@ bool psp_input_script_load(
 
 bool psp_input_script_armed(const PspInputScript *script);
 
+/* Completion can occur in a cooperative or modal receiver, not just the
+   main loop. A physical-input handoff is deliberately not an exit request. */
+bool psp_input_script_exit_pending(const PspInputScript *script);
+/* End-of-script while a keyboard is open is a failed run. Emit its Select
+   cancellation once so the modal receiver can unwind and report the failure. */
+bool psp_input_script_cancel_exhausted_modal(
+    PspInputScript *script, PspUiInput *input);
+
 /* End a run without marking its scripted `end` step as reached. */
 void psp_input_script_interrupt(PspInputScript *script);
 

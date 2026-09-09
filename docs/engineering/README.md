@@ -10,6 +10,7 @@ remain authoritative when a focused manual is narrower.
 - [PSPLINK_DEV_LOOP.md](PSPLINK_DEV_LOOP.md) — bounded build/flash/run/log workflow for a real PSP.
 - [DEVICE_QUALIFICATION.md](DEVICE_QUALIFICATION.md) — which claims host, PPSSPP, and hardware can prove.
 - [PSP_ENVELOPE.md](PSP_ENVELOPE.md) — memory, CPU-slice, executable-size, and storage budgets.
+- [MEMORY_EXPERIMENTS.md](MEMORY_EXPERIMENTS.md) — accepted and rejected memory experiments, with explicit conditions for revisiting them.
 
 ## Labs and acceptance
 

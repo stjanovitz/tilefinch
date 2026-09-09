@@ -8,6 +8,7 @@
    tilefinch/style.h only. */
 
 #include "tilefinch/style.h"
+#include "style_cache_internal.h"
 
 enum {
     STYLE_MODERN_USER_SELECT = 1u << 0,
@@ -463,12 +464,36 @@ struct StyleRuleIndexBucket {
 };
 
 #define STYLE_TOKEN_BLOOM_WORDS 2u
+#define STYLE_RELATIONAL_TOKEN_LIMIT 8u
 
 struct StyleRuleFilter {
     struct StyleTokenBloom {
         uint32_t words[STYLE_TOKEN_BLOOM_WORDS];
     } compound, ancestors;
+    /* Hashes of every class/id token outside the rightmost compound
+       (including inside :not()/:is()), so a class or id change whose tokens
+       miss this list cannot change which elements this rule matches other
+       than the changed element itself. `relational_opaque` marks rules whose
+       dependency on other elements' classes or ids cannot be listed (:has(),
+       `of S` nth forms, escaped identifiers, [class]/[id] attribute
+       selectors, more tokens than fit). */
+    uint32_t relational_tokens[STYLE_RELATIONAL_TOKEN_LIMIT];
+    uint8_t relational_count;
+    bool relational_opaque;
+    /* The rule can change display/visibility or supply an image (background,
+       mask, generated content) or carries deferred declarations that might.
+       Image discovery resolves an element's rules only when one of its
+       candidate rules has this set. */
+    bool discovery;
 };
+void stylesheet_note_style_source(Stylesheet *sheet,
+                                  const lxb_dom_node_t *element);
+/* Rules whose match on some element could change when the class/id tokens
+   with the given hashes change on another element. Returns SIZE_MAX when the
+   filters are unavailable or more than `capacity` rules qualify. */
+size_t stylesheet_rules_affected_by_tokens(
+    const Stylesheet *sheet, const uint32_t *hashes, size_t hash_count,
+    uint32_t *out, size_t capacity);
 
 typedef struct {
     uint32_t at;
@@ -485,8 +510,63 @@ typedef enum {
     STYLE_SELECTOR_PARENT,
     STYLE_SELECTOR_ANCESTOR,
     STYLE_SELECTOR_ADJACENT,
-    STYLE_SELECTOR_GENERAL_SIBLING
+    STYLE_SELECTOR_GENERAL_SIBLING,
+    /* Compiled attribute tests. PRESENT carries the lowercase attribute
+       name. NAME loads that attribute's value for the single compare
+       instruction that follows it, whose text is the wanted value with
+       quotes removed; the compare opcodes are ordered like the string
+       matcher's operators (exact, word, prefix, suffix, substring, dash)
+       and are case-sensitive, as an unflagged attribute selector is. */
+    STYLE_SELECTOR_ATTRIBUTE_PRESENT,
+    STYLE_SELECTOR_ATTRIBUTE_NAME,
+    STYLE_SELECTOR_ATTRIBUTE_EXACT,
+    STYLE_SELECTOR_ATTRIBUTE_WORD,
+    STYLE_SELECTOR_ATTRIBUTE_PREFIX,
+    STYLE_SELECTOR_ATTRIBUTE_SUFFIX,
+    STYLE_SELECTOR_ATTRIBUTE_SUBSTRING,
+    STYLE_SELECTOR_ATTRIBUTE_DASH,
+    /* An argument-less pseudo-class; text_offset holds its StylePseudoKind
+       and text_length is zero. */
+    STYLE_SELECTOR_PSEUDO
 } StyleSelectorOpcode;
+
+/* Pseudo-class classification shared by the string matcher and the
+   selector compiler. */
+typedef enum {
+    STYLE_PSEUDO_UNKNOWN,
+    STYLE_PSEUDO_INTERACTIVE,
+    STYLE_PSEUDO_FOCUS,
+    STYLE_PSEUDO_FOCUS_WITHIN,
+    STYLE_PSEUDO_FULLSCREEN,
+    STYLE_PSEUDO_ROOT,
+    STYLE_PSEUDO_SCOPE,
+    STYLE_PSEUDO_DEFINED,
+    STYLE_PSEUDO_FIRST,
+    STYLE_PSEUDO_LAST,
+    STYLE_PSEUDO_FIRST_TYPE,
+    STYLE_PSEUDO_LAST_TYPE,
+    STYLE_PSEUDO_ONLY_CHILD,
+    STYLE_PSEUDO_ONLY_TYPE,
+    STYLE_PSEUDO_EMPTY,
+    STYLE_PSEUDO_NOT,
+    STYLE_PSEUDO_IS,
+    STYLE_PSEUDO_HAS,
+    STYLE_PSEUDO_DISABLED,
+    STYLE_PSEUDO_ENABLED,
+    STYLE_PSEUDO_CHECKED,
+    STYLE_PSEUDO_REQUIRED,
+    STYLE_PSEUDO_OPTIONAL,
+    STYLE_PSEUDO_LINK,
+    STYLE_PSEUDO_OPEN,
+    STYLE_PSEUDO_MODAL,
+    STYLE_PSEUDO_POPOVER_OPEN,
+    STYLE_PSEUDO_NTH_CHILD,
+    STYLE_PSEUDO_NTH_TYPE,
+    STYLE_PSEUDO_NTH_LAST_CHILD,
+    STYLE_PSEUDO_NTH_LAST_TYPE,
+} StylePseudoKind;
+
+StylePseudoKind style_pseudo_kind(const char *text, size_t length);
 
 #define STYLE_SELECTOR_PROGRAM_DEPTH_LIMIT 32u
 #define STYLE_SELECTOR_IDENTIFIER_CAPACITY 192u
@@ -543,21 +623,6 @@ static inline StyleTokenBloom style_compound_token_bloom(
         mixed ^= mixed >> 16;
         mixed *= UINT32_C(0x7feb352d);
         mixed ^= mixed >> 15;
-        bloom.words[word] = UINT32_C(1) << (mixed & 31u);
-    }
-    return bloom;
-}
-
-static inline StyleTokenBloom style_compound_tag_id_bloom(uintptr_t tag_id)
-{
-    uint32_t value = (uint32_t) tag_id ^ UINT32_C(0x9e3779b9);
-    value ^= value >> 16;
-    value *= UINT32_C(0x7feb352d);
-    value ^= value >> 15;
-    StyleTokenBloom bloom = style_token_bloom_empty();
-    for (size_t word = 0; word < STYLE_TOKEN_BLOOM_WORDS; word++) {
-        uint32_t mixed = value + UINT32_C(0x85ebca6b) * (uint32_t) word;
-        mixed ^= mixed >> 13;
         bloom.words[word] = UINT32_C(1) << (mixed & 31u);
     }
     return bloom;
@@ -647,6 +712,13 @@ struct StyleResolveScratch {
     int container_inline_basis;
     int container_block_basis;
     bool container_basis_active;
+    /* Retained matched-rule table attached by the layout reuse owner for one
+       element resolution, plus the element currently being recorded. */
+    struct StyleRetainedMatches *retained_matches;
+    uint16_t retained_pending_rules[STYLE_RETAINED_MATCH_RULE_LIMIT];
+    uint8_t retained_pending_count;
+    bool retained_pending_active;
+    bool retained_pending_valid;
 };
 
 #define STYLE_CONTAINER_QUERY_LIMIT 63u

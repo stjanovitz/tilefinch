@@ -1113,6 +1113,39 @@ static bool selector_to_rule(
         length -= 7;
         trim(&selector, &length);
     }
+    /* Only ::before and ::after generate boxes here. A selector that still
+       names another pseudo-element (::-moz-focus-inner, ::marker, ...) can
+       never match, yet each candidate element would still evaluate its
+       attribute and class tests before the matcher reached the "::". */
+    char pseudo_quote = 0;
+    unsigned pseudo_brackets = 0, pseudo_parentheses = 0;
+    for (size_t at = 0; at < length; at++) {
+        char value = selector[at];
+        if (value == '\\' && at + 1u < length) { at++; continue; }
+        if (pseudo_quote != 0) {
+            if (value == pseudo_quote) pseudo_quote = 0;
+            continue;
+        }
+        if (value == '\'' || value == '"') { pseudo_quote = value; continue; }
+        if (value == '[') { pseudo_brackets++; continue; }
+        if (value == ']') {
+            if (pseudo_brackets != 0) pseudo_brackets--;
+            continue;
+        }
+        if (pseudo_brackets != 0) continue;
+        if (value == '(') { pseudo_parentheses++; continue; }
+        if (value == ')') {
+            if (pseudo_parentheses != 0) pseudo_parentheses--;
+            continue;
+        }
+        /* Functional selectors retain their own forgiving-list behavior;
+           quoted attribute values and escaped colons are not syntax. */
+        if (pseudo_parentheses == 0 && value == ':' && at + 1u < length
+            && selector[at + 1u] == ':') {
+            diagnostic_saturating_add(&sheet->diagnostic_selector_drops, 1);
+            return true;
+        }
+    }
     unsigned specificity = selector_specificity_depth(selector, length, 0);
     StyleRule base;
     memset(&base, 0, sizeof(base));

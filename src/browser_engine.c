@@ -75,6 +75,10 @@ struct BrowserEngine {
     bool session_ready;
     bool navigation_ready;
     bool fonts_ready;
+    uint64_t startup_deferral_started_us;
+    const void *startup_deferral_runtime;
+    uint64_t startup_deferral_generation;
+    bool font_publication_guarded;
     FontSetFaceMask font_requested_faces;
     FontSetFaceMask font_failed_faces;
     bool controller_ready;
@@ -278,7 +282,12 @@ void browser_config_init(BrowserConfig *config,
             .maximum_file_bytes = 384u * KIB,
             .network_timeout_ms = 10000
         },
+        /* About 22 us per layout work unit on the PSP-3000: a page above
+           200,000 units would spend more than four seconds reflowing for an
+           optional font or image batch. */
+        .startup_resource_deferral_us = 3000000u,
         .resources = {
+            .maximum_publication_work_units = 200000u,
             .enabled = false,
             .web_fonts_enabled = true,
             .maximum_stylesheets = 16,
@@ -295,6 +304,7 @@ void browser_config_init(BrowserConfig *config,
             .timeout_ms = 10000
         },
         .fonts = {
+            .maximum_publication_work_units = 200000u,
             .enabled = false,
             .maximum_total_bytes = 1536u * KIB
         }
@@ -1401,6 +1411,8 @@ static bool browser_engine_configure_navigation(BrowserEngine *engine)
             resources->maximum_images, resources->maximum_image_bytes,
             resources->maximum_image_file_bytes,
             resources->maximum_decoded_image_bytes, resources->timeout_ms);
+        navigation->maximum_publication_work_units =
+            resources->maximum_publication_work_units;
         if (resources->web_fonts_enabled) {
             navigation_enable_web_fonts(
                 navigation, resources->maximum_font_attempts,
@@ -4509,6 +4521,44 @@ bool browser_engine_run_idle_work(
     if (visual_changed != NULL) *visual_changed = false;
     if (engine == NULL || engine->state != BROWSER_ENGINE_ACTIVE
         || !engine->render_ready) return false;
+    /* Startup script tasks can still change the whole document's geometry.
+       Do not compete with them by reading/publishing optional fonts and
+       images only to reflow the same page again immediately. The committed
+       baseline frame and input remain usable, and tile preparation can run.
+       Timers and unrelated fetches do not delay resources. After 128 runtime
+       turns even continuously appended scripts stop deferring idle work. */
+    bool defer_for_startup = engine->navigation.page.runtime != NULL
+        && engine->navigation.page.script_result.runtime_ticks < 128u
+        && (engine->font_load != NULL
+            || (engine->font_requested_faces & (FontSetFaceMask)
+                ~(BROWSER_BASELINE_FONT_FACES | engine->font_failed_faces)) != 0
+            || navigation_background_resources_pending(&engine->navigation))
+        && script_runtime_has_pending_startup_scripts(engine->navigation.page.runtime);
+    if (defer_for_startup) {
+        /* Turns are not time: a device advancing 100 ms scripts reaches 128
+           turns only after a quarter of a minute, while an in-flight external
+           script keeps the predicate true the whole time. Bound the wait by
+           the wall clock as well, per runtime. */
+        uint64_t now = tilefinch_platform_monotonic_time_us();
+        const void *runtime = engine->navigation.page.runtime;
+        if (engine->startup_deferral_runtime != runtime
+            || engine->startup_deferral_generation != engine->navigation.generation) {
+            engine->startup_deferral_runtime = runtime;
+            engine->startup_deferral_generation = engine->navigation.generation;
+            engine->startup_deferral_started_us = now;
+        }
+        uint64_t limit = engine->config.startup_resource_deferral_us;
+        if (limit != 0 && now >= engine->startup_deferral_started_us
+            && now - engine->startup_deferral_started_us >= limit) {
+            defer_for_startup = false;
+        }
+    }
+    if (defer_for_startup) {
+        (void) tile_cache_run_idle_work(&engine->render,
+            engine->config.idle_work_budget_us,
+            engine->config.idle_work_maximum_units);
+        return true;
+    }
     size_t focus_relayout_generation =
         engine->navigation.incremental_relayouts;
     size_t relayouts_before =
@@ -4519,6 +4569,33 @@ bool browser_engine_run_idle_work(
     FontSetFaceMask optional = engine->font_requested_faces
         & (FontSetFaceMask) ~(BROWSER_BASELINE_FONT_FACES
                              | engine->font_failed_faces);
+    size_t publication_limit =
+        engine->config.fonts.maximum_publication_work_units;
+    bool font_guarded = optional != 0 && publication_limit != 0
+        && engine->navigation.page.loaded
+        && engine->navigation.page.layout.layout_work_units
+               > publication_limit;
+    if (font_guarded) {
+        /* Publishing the batch reflows the whole page at roughly its initial
+           layout cost. On a page this large that is seconds of blocked
+           input for a font change, and each cancelled attempt would only be
+           retried; keep the fallback faces for this page instead. */
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "tilefinch-font-batch: skipped faces=0x%02x work=%zu limit=%zu",
+                 (unsigned) optional,
+                 engine->navigation.page.layout.layout_work_units,
+                 publication_limit);
+        if (!engine->font_publication_guarded)
+            tilefinch_platform_log_message(message);
+#endif
+        /* Policy refusal applies to this layout, not to the font file for
+           the engine's lifetime. Later small/provider pages can load it. */
+        browser_engine_discard_staged_fonts(engine);
+        optional = 0;
+    }
+    engine->font_publication_guarded = font_guarded;
     const struct {
         FontSetFaceMask bit;
         FontFace *face;

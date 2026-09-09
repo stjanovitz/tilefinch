@@ -1701,14 +1701,26 @@ static JSValue js_replay_math_random(JSContext *context,
                          (1.0 / 9007199254740992.0));
 }
 
-/*
- * Asynchronous page callbacks can be very short in QuickJS bytecode while
- * spending most of their time in bounded native DOM helpers.  Such a callback
- * may finish before the VM's ordinary interrupt-counter cadence reaches the
- * embedder.  The bootstrap calls this at the single task-entry boundary so
- * cancellation and the UI cooperate hook are observed before author code,
- * without adding a poll to every ordinary JavaScript function call.
- */
+/* A refused task checkpoint is host control flow, not an author-catchable
+   API error. Set the flag after throwing: Bellard's throw clears it first. */
+JSValue js_rt_throw_task_interruption(JSContext *context, const char *message)
+{
+#if defined(PSP_BROWSER_BELLARD_QUICKJS)
+    JSValue exception = JS_ThrowInternalError(context, "%s", message);
+    JS_SetUncatchableException(context, true);
+    return exception;
+#else
+    JSValue exception = JS_NewInternalError(context, "%s", message);
+    /* Error construction can itself fail. Preserve and mark the pending
+       exception too, rather than turning cancellation into a catchable OOM. */
+    if (JS_IsException(exception)) exception = JS_GetException(context);
+    JS_SetUncatchableError(context, exception);
+    return JS_Throw(context, exception);
+#endif
+}
+
+/* Short callbacks can finish before VM polls. The bootstrap checks the
+   single task-entry boundary so native work still observes cancellation. */
 static JSValue js_callback_checkpoint(JSContext *context,
                                       JSValueConst this_value,
                                       int argc, JSValueConst *argv)
@@ -1737,16 +1749,7 @@ static JSValue js_callback_checkpoint(JSContext *context,
     snprintf(message, sizeof(message),
              "callback interrupted at task boundary%s%s",
              task[0] == '\0' ? "" : ": ", task);
-#if defined(PSP_BROWSER_BELLARD_QUICKJS)
-    JSValue exception = JS_ThrowInternalError(context, "%s", message);
-    JS_SetUncatchableException(context, true);
-    return exception;
-#else
-    JSValue exception = JS_NewInternalError(context, "%s", message);
-    if (JS_IsException(exception)) return exception;
-    JS_SetUncatchableError(context, exception);
-    return JS_Throw(context, exception);
-#endif
+    return js_rt_throw_task_interruption(context, message);
 }
 
 /* Event-handler attributes are script, but they are not eval().  Compile the

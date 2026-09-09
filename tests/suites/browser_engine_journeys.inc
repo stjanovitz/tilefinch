@@ -42,6 +42,24 @@ int test_deferred_startup_journey(void)
             && nav->page.layout.height > collapsed_height
             && browser_engine_render_frame(engine, NULL)
             && nav->page.image_continuation_pending);
+        if (mutation == 0) {
+            CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+                "globalThis.startupTimer=setInterval(()=>{},1)",
+                "<startup-idle-priority>", &nav->page.script_result));
+            CHECK(browser_engine_advance_runtime(engine, 16, 4, NULL));
+            CHECK(script_runtime_has_pending_author_work(nav->page.runtime)
+                && !script_runtime_has_pending_startup_scripts(nav->page.runtime)
+                && nav->page.script_result.runtime_ticks < 128u);
+            CHECK(browser_engine_focus_move(engine, true)
+                && browser_engine_render_frame(engine, NULL));
+            /* An endless timer must not impose a 128-turn resource delay. */
+            bool changed = false;
+            CHECK(browser_engine_run_idle_work(engine, &changed)
+                && nav->page.deferred_image_job != NULL);
+            CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
+                "clearInterval(startupTimer)", "<startup-idle-finished>",
+                &nav->page.script_result));
+        }
         if (mutation >= 5) {
             /* All eager images are outside this viewport. The nearest two
                still share the bounded batch; hidden/lazy targets do not
@@ -222,6 +240,51 @@ int test_deferred_image_publication_survives_rebuild(void)
         && image_resource_available(images_find_node(&nav->page.images, hero))
         && image_resource_available(images_find_node(&nav->page.images, tail))
         && image_resource_available(images_find_node(&nav->page.images, last))
+        && browser_engine_render_frame(engine, NULL));
+    fetch_trace_end();
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics metrics = {0};
+    CHECK(browser_engine_metrics(engine, &metrics)
+        && metrics.budget_current == 0 && metrics.budget_active_allocations == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+/* A page whose layout cost more than the publication limit keeps its
+   deferred images unloaded: the queue finishes without a batch job and
+   without a relayout, and the page stays usable. */
+int test_deferred_images_skip_oversized_pages(void)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = 24u * MIB;
+    config.javascript.enabled = true;
+    config.javascript.document_scripts_enabled = true;
+    config.resources.enabled = true;
+    config.resources.maximum_images = 12;
+    config.resources.maximum_publication_work_units = 1u;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && fetch_trace_replay_begin(
+        TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-images",
+        error, sizeof(error)));
+    CHECK(browser_engine_load_url(engine, "https://interactive-images.test/page", true));
+    NavigationSession *nav = browser_engine_navigation(engine);
+    CHECK(nav->page.loaded && nav->page.image_continuation_pending
+        && nav->page.deferred_image_count == 3u
+        && nav->page.layout.layout_work_units > 1u
+        && browser_engine_render_frame(engine, NULL));
+    size_t relayouts = nav->performance.background_image_relayouts;
+    bool changed = false;
+    CHECK(!browser_engine_run_deferred_image_work(engine, &changed) && !changed);
+    CHECK(!nav->page.image_continuation_pending
+        && nav->page.deferred_image_job == NULL
+        && nav->performance.background_image_relayouts == relayouts
+        && nav->performance.background_image_failures == 0
+        && nav->page.images.stats.loaded == 1
+        && browser_engine_last_error(engine)[0] == '\0'
         && browser_engine_render_frame(engine, NULL));
     fetch_trace_end();
     CHECK(browser_engine_shutdown(engine));

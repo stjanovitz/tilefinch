@@ -1037,7 +1037,31 @@ typedef struct {
     uint64_t interrupt_delay_us, requested_us, acknowledged_us;
     size_t checkpoints;
     char maximum_gap_phase[48];
+    char last_phase[48], maximum_gap_from[48];
 } FontPublicationTiming;
+
+/* The engine paints authored focus only. Native focus is composited by the
+   frontend; use the same bounded overlay as the interactive host lab. */
+static bool paint_host_focus(BrowserEngine *engine)
+{
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    const NavigationEntry *entry = navigation_current(navigation);
+    int x, y, width, height;
+    if (entry == NULL || !controller_focused_rect(browser_engine_controller(engine),
+            &x, &y, &width, &height)) return false;
+    const ViewportContext *viewport = &navigation->page.layout.viewport;
+    int left = viewport_css_to_device(viewport, x);
+    int top = viewport_css_to_device(viewport, y - entry->scroll_y);
+    int right = viewport_css_to_device(viewport, x + width);
+    int bottom = viewport_css_to_device(viewport, y - entry->scroll_y + height);
+    if (right <= left || bottom <= top || right <= 0 || bottom <= 0
+        || left >= 480 || top >= 272) return false;
+    size_t count = 0;
+    uint16_t *pixels = browser_engine_framebuffer(engine, &count);
+    render_paint_focus_outline(pixels, count, 480, 272, left, top,
+                              right - left, bottom - top);
+    return true;
+}
 
 static bool font_publication_timing(void *opaque, const char *phase, size_t work)
 {
@@ -1051,8 +1075,11 @@ static bool font_publication_timing(void *opaque, const char *phase, size_t work
         timing->maximum_gap_us = gap;
         snprintf(timing->maximum_gap_phase, sizeof(timing->maximum_gap_phase),
                  "%s", phase == NULL ? "unknown" : phase);
+        snprintf(timing->maximum_gap_from, sizeof(timing->maximum_gap_from),
+                 "%s", timing->last_phase);
     }
     timing->last_us = now;
+    snprintf(timing->last_phase, sizeof(timing->last_phase), "%s", phase);
     timing->checkpoints++;
     if (timing->requested_us != 0 && now >= timing->requested_us
         && strncmp(phase, "layout", 6) == 0) {
@@ -1064,8 +1091,27 @@ static bool font_publication_timing(void *opaque, const char *phase, size_t work
 
 /* Opt-in host profiler: replay real page CSS/DOM through the ordinary engine
    with device-style staged fonts. This is not a live-site CTest dependency. */
+static int profile_replay_rasters(BrowserEngine *engine)
+{
+    const NavigationSession *navigation = browser_engine_navigation(engine);
+    for (unsigned view = 0; view < 3; view++) {
+        if (view == 0) (void) browser_engine_scroll_to_edge(engine, false);
+        else if (view == 1) (void) browser_engine_scroll_by(
+            engine, navigation->page.layout.height / 2);
+        else (void) browser_engine_scroll_to_edge(engine, true);
+        CHECK(browser_engine_render_frame(engine, NULL));
+        size_t pixel_count = 0;
+        const uint16_t *pixels = browser_engine_framebuffer(engine, &pixel_count);
+        CHECK(pixels != NULL && pixel_count == 480u * 272u);
+        printf("font-raster view=%u checksum=%llu\n", view,
+            (unsigned long long) frame_checksum(pixels, pixel_count));
+    }
+    return 0;
+}
+
 static int profile_staged_font_replay(const char *trace, const char *url,
-                                     uint64_t interrupt_delay_us, bool incremental)
+                                     uint64_t interrupt_delay_us, bool incremental,
+                                     const char *search_query, unsigned settle_runtime)
 {
     BrowserDeviceProfile profile;
     browser_device_profile_psp3000(&profile);
@@ -1082,6 +1128,21 @@ static int profile_staged_font_replay(const char *trace, const char *url,
         config.resources.maximum_stylesheet_bytes = 2112u * 1024u;
         config.resources.maximum_stylesheet_file_bytes = 768u * 1024u;
     }
+    if (search_query != NULL || settle_runtime) {
+        /* Match installed-app admission, not the roomier profiling heap. */
+        config.history_capacity = 4;
+        config.session_cache_limit = 640u * 1024u;
+        config.javascript.heap_limit = 5u * MIB;
+        config.javascript.maximum_scripts = 256;
+        config.javascript.maximum_total_bytes = 2u * MIB;
+        config.javascript.runtime_timeout_ms = 60000;
+        config.javascript.network_timeout_ms = 15000;
+        config.resources.maximum_images = 24;
+        config.resources.maximum_image_bytes = 1536u * 1024u;
+        config.resources.maximum_image_file_bytes = 512u * 1024u;
+        config.resources.maximum_decoded_image_bytes = 3u * MIB;
+        config.resources.timeout_ms = 15000;
+    }
     CHECK(browser_config_set_font_paths(&config,
         TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Latin.ttf",
         TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSerif-Latin.ttf",
@@ -1097,6 +1158,14 @@ static int profile_staged_font_replay(const char *trace, const char *url,
     BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
     CHECK(engine != NULL && browser_engine_prepare_navigation_fonts(engine, "GET", url));
     if (incremental) {
+        FontPublicationTiming load_timing = {
+            .last_us = tilefinch_platform_monotonic_time_us()
+        };
+        TilefinchPlatformServices load_services = {
+            .context = &load_timing, .cooperate = font_publication_timing
+        };
+        tilefinch_platform_set_services(&load_services);
+        uint64_t load_started = load_timing.last_us, maximum_pump_us = 0;
         CHECK(browser_engine_begin_navigation_url(engine, url, 2u * MIB, 20000, true));
         BrowserNavigationJobQuota quota = { .load = {
             .fetch = { .maximum_body_bytes = 16u * 1024u,
@@ -1104,12 +1173,209 @@ static int profile_staged_font_replay(const char *trace, const char *url,
             .maximum_parser_body_bytes = 2048, .maximum_parser_time_us = 2000,
             .maximum_finalize_work_units = 2048, .maximum_finalize_time_us = 2000 } };
         BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
-        for (size_t i = 0; i < 100000 && status == BROWSER_NAVIGATION_JOB_PENDING; i++)
+        for (size_t i = 0; i < 100000 && status == BROWSER_NAVIGATION_JOB_PENDING; i++) {
+            uint64_t pump_started = tilefinch_platform_monotonic_time_us();
             status = browser_engine_pump_navigation(engine, &quota);
+            uint64_t pump_us = tilefinch_platform_monotonic_time_us() - pump_started;
+            if (pump_us > maximum_pump_us) maximum_pump_us = pump_us;
+            (void) font_publication_timing(&load_timing, "navigation-pump-return", 0);
+        }
+        tilefinch_platform_set_services(NULL);
+        printf("navigation-responsiveness elapsed-us=%llu max-pump-us=%llu "
+               "max-gap-us=%llu gap-ending-at=%s gap-starting-at=%s checkpoints=%zu\n",
+            (unsigned long long) (tilefinch_platform_monotonic_time_us() - load_started),
+            (unsigned long long) maximum_pump_us,
+            (unsigned long long) load_timing.maximum_gap_us,
+            load_timing.maximum_gap_phase, load_timing.maximum_gap_from,
+            load_timing.checkpoints);
         CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED);
     } else CHECK(browser_engine_load_url(engine, url, true));
+    if (interrupt_delay_us != 0) CHECK(browser_engine_focus_move(engine, true));
     CHECK(browser_engine_render_frame(engine, NULL));
+    if (interrupt_delay_us != 0) CHECK(paint_host_focus(engine));
     const NavigationSession *navigation = browser_engine_navigation(engine);
+    if (settle_runtime) {
+        size_t initial_loaded = navigation->page.images.stats.loaded;
+        size_t initial_deferred = navigation->page.deferred_image_count;
+        size_t initial_heap_rejections = script_runtime_heap_rejections(navigation->page.runtime);
+        CHECK(browser_engine_focus_move(engine, true)
+            && browser_engine_render_frame(engine, NULL) && paint_host_focus(engine));
+        uint64_t runtime_us = 0, maximum_runtime_us = 0;
+        uint64_t idle_us = 0, maximum_idle_us = 0;
+        uint64_t font_publication_us = 0, image_publication_us = 0;
+        uint64_t startup_done_us = 0, startup_idle_us = 0;
+        size_t completed_dynamic = 0;
+        uint64_t settle_started = tilefinch_platform_monotonic_time_us();
+        unsigned settle_ticks = settle_runtime == 1u ? 240u : settle_runtime;
+        for (unsigned tick = 0; tick < settle_ticks; tick++) {
+            size_t previous_failed = navigation->page.script_result.dynamic_scripts_failed;
+            size_t previous_uncaught = navigation->page.script_result.uncaught_callback_errors;
+            uint64_t start = tilefinch_platform_monotonic_time_us();
+            bool advanced = browser_engine_advance_runtime(engine, 16, 4, NULL);
+            if (!advanced)
+                fprintf(stderr, "settle-advance-failure tick=%u error=%s\n",
+                    tick, browser_engine_last_error(engine));
+            CHECK(advanced);
+            if (navigation->page.script_result.dynamic_scripts_failed != previous_failed
+                || navigation->page.script_result.uncaught_callback_errors != previous_uncaught)
+                fprintf(stderr, "settle-exception tick=%u failed=%zu uncaught=%zu error=%s callback=%s\n",
+                    tick, navigation->page.script_result.dynamic_scripts_failed,
+                    navigation->page.script_result.uncaught_callback_errors,
+                    navigation->page.script_result.error,
+                    navigation->page.script_result.last_uncaught_callback_error);
+            uint64_t elapsed = tilefinch_platform_monotonic_time_us() - start;
+            runtime_us += elapsed;
+            if (elapsed > maximum_runtime_us) maximum_runtime_us = elapsed;
+            const ScriptResult *current_result = &navigation->page.script_result;
+            if (current_result->dynamic_scripts_completed > completed_dynamic) {
+                completed_dynamic = current_result->dynamic_scripts_completed;
+                startup_done_us = tilefinch_platform_monotonic_time_us() - settle_started;
+                startup_idle_us = idle_us;
+            }
+            bool changed = false;
+            size_t font_bytes = font_set_loaded_bytes(browser_engine_fonts(engine));
+            size_t image_relayouts = navigation->performance.background_image_relayouts;
+            start = tilefinch_platform_monotonic_time_us();
+            (void) browser_engine_run_idle_work(engine, &changed);
+            elapsed = tilefinch_platform_monotonic_time_us() - start;
+            idle_us += elapsed;
+            if (elapsed > maximum_idle_us) maximum_idle_us = elapsed;
+            if (font_set_loaded_bytes(browser_engine_fonts(engine)) != font_bytes)
+                font_publication_us += elapsed;
+            if (navigation->performance.background_image_relayouts != image_relayouts)
+                image_publication_us += elapsed;
+            CHECK(navigation->page.loaded && browser_engine_last_error(engine)[0] == '\0');
+        }
+        const ScriptResult *result = &navigation->page.script_result;
+        printf("navigation-settle initial-loaded=%zu initial-deferred=%zu "
+            "runtime-us=%llu max-runtime-us=%llu idle-us=%llu max-idle-us=%llu "
+            "dynamic-started=%zu completed=%zu failed=%zu error=\"%s\" "
+            "final-loaded=%zu image-relayouts=%zu heap-rejections=%zu "
+            "resource-us=%llu image-us=%llu relayout-us=%llu\n",
+            initial_loaded, initial_deferred,
+            (unsigned long long) runtime_us, (unsigned long long) maximum_runtime_us,
+            (unsigned long long) idle_us, (unsigned long long) maximum_idle_us,
+            result->dynamic_scripts_started, result->dynamic_scripts_completed,
+            result->dynamic_scripts_failed, result->error,
+            navigation->page.images.stats.loaded,
+            navigation->performance.background_image_relayouts,
+            script_runtime_heap_rejections(navigation->page.runtime) - initial_heap_rejections,
+            (unsigned long long) navigation->performance.resource_us,
+            (unsigned long long) navigation->performance.image_resource_us,
+            (unsigned long long) navigation->performance.relayout_us);
+        printf("navigation-startup last-dynamic-completion-us=%llu preceding-idle-us=%llu\n",
+            (unsigned long long) startup_done_us, (unsigned long long) startup_idle_us);
+        LayoutReuseStats reuse_stats;
+        layout_reuse_cache_stats(navigation->page.layout_reuse, &reuse_stats);
+        printf("navigation-publication font-us=%llu image-us=%llu counter-builds=%zu "
+            "counter-hits=%zu cache-bytes=%zu fingerprint=%llu height=%d\n",
+            (unsigned long long) font_publication_us,
+            (unsigned long long) image_publication_us,
+            reuse_stats.counter_index_builds, reuse_stats.counter_index_hits,
+            reuse_stats.retained_bytes,
+            (unsigned long long) navigation->page.layout.text_fingerprint,
+            navigation->page.layout.height);
+        if (result->error[0] != '\0') {
+            script_runtime_report_memory(navigation->page.runtime, stderr);
+            budget_quickjs_pool_report_rejects(stderr);
+            fprintf(stderr, "navigation-startup-error callback=\"%s\" task=\"%s\"\n",
+                result->last_uncaught_callback_error, result->last_uncaught_callback_task);
+        }
+        CHECK(result->error[0] == '\0' && result->uncaught_callback_errors == 0
+            && result->dynamic_scripts_failed == 0
+            && result->dynamic_scripts_started == result->dynamic_scripts_completed
+            && browser_engine_focus_move(engine, true)
+            && browser_engine_render_frame(engine, NULL) && paint_host_focus(engine));
+        printf("navigation-selectors compounds=%llu candidates=%llu ancestor-rejections=%llu\n",
+            (unsigned long long) navigation->page.stylesheet.selector_compound_calls,
+            (unsigned long long) navigation->page.stylesheet.rule_index_candidates,
+            (unsigned long long) navigation->page.stylesheet.rule_ancestor_filter_rejections);
+        CHECK(profile_replay_rasters(engine) == 0);
+        /* A rendered focus ring alone does not prove that its author handler
+           ran. Refresh the result after dispatch and require allocation-free
+           failure accounting across repeated post-initialization interaction.
+           Previously the final focus callback could OOM after the last result
+           check while this replay still returned success. */
+        size_t interaction_rejections = script_runtime_heap_rejections(navigation->page.runtime);
+        for (unsigned interaction = 0; interaction < 8; ++interaction) {
+            CHECK(browser_engine_focus_move(engine, (interaction & 1u) == 0u)
+                && browser_engine_render_frame(engine, NULL) && paint_host_focus(engine));
+            CHECK(browser_engine_advance_runtime(engine, 16, 4, NULL));
+            CHECK(navigation->page.script_result.error[0] == '\0'
+                && navigation->page.script_result.uncaught_callback_errors == 0);
+        }
+        CHECK(script_runtime_heap_rejections(navigation->page.runtime) == interaction_rejections);
+        printf("navigation-post-settle interactions=8 uncaught=0 heap-rejections=0\n");
+        const Budget *load_budget = browser_engine_budget(engine);
+        printf("navigation-memory current=%zu peak=%zu allocations=%zu frees=%zu\n",
+            load_budget->current, load_budget->peak,
+            load_budget->allocation_count, load_budget->free_count);
+        for (size_t category = 0; category < BUDGET_CATEGORY_COUNT; category++) {
+            const BudgetCategoryStats *stats = &load_budget->categories[category];
+            printf("navigation-memory-category id=%zu current=%zu peak=%zu allocations=%zu frees=%zu\n",
+                category, stats->current, stats->peak,
+                stats->allocation_count, stats->free_count);
+        }
+        CHECK(browser_engine_shutdown(engine));
+        browser_engine_destroy(engine);
+        fetch_trace_end();
+        return 0;
+    }
+    if (search_query != NULL) {
+        lxb_dom_node_t *input = test_reader_find_id(
+            lxb_dom_interface_node(navigation->page.document.html), "searchInput");
+        CHECK(input != NULL && browser_engine_focus_node(engine, input));
+        int x, y, width, height;
+        CHECK(controller_focused_rect(browser_engine_controller(engine),
+              &x, &y, &width, &height));
+        x = viewport_css_to_device(&navigation->page.layout.viewport, x + 8);
+        y = viewport_css_to_device(&navigation->page.layout.viewport,
+            y - navigation_current(navigation)->scroll_y + height / 2);
+        bool activate = false, changed = false;
+        CHECK(browser_engine_pointer_event(engine, CONTROLLER_POINTER_DOWN,
+                  x, y, &activate, &changed)
+              && browser_engine_pointer_event(engine, CONTROLLER_POINTER_UP,
+                  x, y, &activate, &changed)
+              && activate && browser_engine_pointer_commit_click(engine));
+        ControllerTextInputInfo input_info = {0};
+        CHECK(browser_engine_text_input_info(engine, &input_info) && input_info.editable
+              && browser_engine_replace_text(engine, search_query, strlen(search_query)));
+        ControllerAction action = {0};
+        CHECK(browser_engine_activate(engine, &action));
+        printf("search-journey action=%d outcome=%d url=%s\n",
+               action.type, action.activation_outcome, action.url);
+        CHECK(action.type == CONTROLLER_ACTION_FORM_SUBMIT
+              && strstr(action.url, "search=psp") != NULL
+              && browser_engine_begin_navigation_action(engine, &action, 2u * MIB, 60000));
+        BrowserNavigationJobQuota quota = { .load = {
+            .fetch = { .maximum_body_bytes = 16384, .maximum_body_callbacks = 1,
+                .maximum_time_us = 2000 }, .maximum_parser_body_bytes = 2048,
+            .maximum_parser_time_us = 2000, .maximum_finalize_work_units = 2048,
+            .maximum_finalize_time_us = 2000 } };
+        BrowserNavigationJobStatus status = BROWSER_NAVIGATION_JOB_PENDING;
+        for (unsigned pump = 0; pump < 100000 && status == BROWSER_NAVIGATION_JOB_PENDING; pump++)
+            status = browser_engine_pump_navigation(engine, &quota);
+        printf("search-journey status=%d title=%s error=%s\n", status,
+               navigation->page.document.title, browser_engine_last_error(engine));
+        CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED && navigation->page.loaded
+              && strstr(navigation->page.document.title, "PSP") != NULL
+              && browser_engine_render_frame(engine, NULL));
+        bool found = false;
+        for (size_t i = 0; i < navigation->page.layout.link_count; i++) {
+            const LinkRegion *link = &navigation->page.layout.links[i];
+            if (strstr(link->url, "/wiki/PlayStation_Portable") == NULL) continue;
+            CHECK(browser_engine_focus_node(engine, link->node)
+                  && browser_engine_render_frame(engine, NULL) && paint_host_focus(engine));
+            found = true;
+            break;
+        }
+        CHECK(found);
+        puts("search-journey result-link-visible=1");
+        CHECK(browser_engine_shutdown(engine));
+        browser_engine_destroy(engine);
+        fetch_trace_end();
+        return 0;
+    }
     printf("font-profile initial-bytes=%zu commands=%zu\n",
            font_set_loaded_bytes(browser_engine_fonts(engine)), navigation->page.layout.count);
     if (incremental) {
@@ -1126,7 +1392,7 @@ static int profile_staged_font_replay(const char *trace, const char *url,
     TilefinchPlatformServices services = { .context = &timing,
         .cooperate = font_publication_timing };
     size_t publications = 0;
-    for (size_t i = 0; i < 128 && publications == 0; i++) {
+    for (size_t i = 0; i < 512 && publications == 0; i++) {
         CHECK(browser_engine_advance_runtime(engine, 16, 4, NULL));
         /* Borrow face identities only; the engine remains their sole owner.
            Count the old display list because publication replaces that list. */
@@ -1141,6 +1407,9 @@ static int profile_staged_font_replay(const char *trace, const char *url,
         }
         size_t loaded_bytes = font_set_loaded_bytes(browser_engine_fonts(engine));
         size_t relayouts = navigation->incremental_relayouts;
+        size_t before_pixel_count = 0;
+        const uint16_t *before_pixels = browser_engine_framebuffer(engine, &before_pixel_count);
+        uint64_t before_checksum = frame_checksum(before_pixels, before_pixel_count);
         layout_reuse_cache_stats(navigation->page.layout_reuse, &before);
         timing.maximum_gap_us = 0;
         timing.checkpoints = 0;
@@ -1162,6 +1431,27 @@ static int profile_staged_font_replay(const char *trace, const char *url,
                 (unsigned long long) (timing.acknowledged_us - timing.requested_us),
                 (unsigned long long) (returned_us - timing.acknowledged_us),
                 (unsigned long long) (returned_us - timing.requested_us));
+            /* Dispatch only after rollback releases the private layout.
+               A selected node is not enough: require new framebuffer pixels. */
+            CHECK(browser_engine_focus_move(engine, true));
+            BrowserRenderJobStatus render_status = BROWSER_RENDER_JOB_PENDING;
+            unsigned render_slices = 0;
+            while (render_status == BROWSER_RENDER_JOB_PENDING && render_slices < 128) {
+                render_status = browser_engine_render_frame_bounded(engine, 1000, 1);
+                render_slices++;
+            }
+            CHECK(paint_host_focus(engine));
+            uint64_t rendered_us = tilefinch_platform_monotonic_time_us();
+            size_t pixel_count = 0;
+            const uint16_t *pixels = browser_engine_framebuffer(engine, &pixel_count);
+            CHECK(render_status == BROWSER_RENDER_JOB_COMPLETE
+                  && pixel_count == before_pixel_count
+                  && frame_checksum(pixels, pixel_count) != before_checksum
+                  && font_set_loaded_bytes(browser_engine_fonts(engine)) == loaded_bytes);
+            printf("font-input-feedback render-us=%llu request-to-pixels-us=%llu "
+                   "render-slices=%u pixels-changed=1\n",
+                (unsigned long long) (rendered_us - returned_us),
+                (unsigned long long) (rendered_us - timing.requested_us), render_slices);
             publications++;
             break;
         }
@@ -1216,18 +1506,7 @@ static int profile_staged_font_replay(const char *trace, const char *url,
     CHECK(interrupt_delay_us == 0 || timing.acknowledged_us != 0);
     if (interrupt_delay_us == 0) {
         /* Raster comparison is deliberately outside the publication timer. */
-        for (unsigned view = 0; view < 3; view++) {
-            if (view == 0) (void) browser_engine_scroll_to_edge(engine, false);
-            else if (view == 1) (void) browser_engine_scroll_by(
-                engine, navigation->page.layout.height / 2);
-            else (void) browser_engine_scroll_to_edge(engine, true);
-            CHECK(browser_engine_render_frame(engine, NULL));
-            size_t pixel_count = 0;
-            const uint16_t *pixels = browser_engine_framebuffer(engine, &pixel_count);
-            CHECK(pixels != NULL && pixel_count == 480u * 272u);
-            printf("font-raster view=%u checksum=%llu\n", view,
-                (unsigned long long) frame_checksum(pixels, pixel_count));
-        }
+        CHECK(profile_replay_rasters(engine) == 0);
     }
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
@@ -1462,6 +1741,16 @@ static int test_staged_optional_fonts_relayout_before_repaint(void)
                          == relayouts_before
                   && font_set_loaded_bytes(browser_engine_fonts(engine))
                          == baseline_font_bytes);
+            CHECK(browser_engine_render_frame(engine, NULL) && paint_host_focus(engine));
+            size_t count = 0;
+            const uint16_t *pixels = browser_engine_framebuffer(engine, &count);
+            uint64_t before = frame_checksum(pixels, count);
+            CHECK(browser_engine_focus_move(engine, true)
+                  && browser_engine_render_frame(engine, NULL) && paint_host_focus(engine));
+            pixels = browser_engine_framebuffer(engine, &count);
+            CHECK(frame_checksum(pixels, count) != before
+                  && font_set_loaded_bytes(browser_engine_fonts(engine))
+                         == baseline_font_bytes);
         }
         if (font_set_face_is_bold(
                 browser_engine_fonts(engine),
@@ -1482,6 +1771,123 @@ static int test_staged_optional_fonts_relayout_before_repaint(void)
           && browser_engine_render_frame(engine, NULL)
           && browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
+
+    /* A page whose layout cost more than the publication limit keeps its
+       fallback faces: no staging reads, no batch relayout, no error. */
+    /* The device entry point uses only browser_config_init; the guards
+       must be on by default there, not only in the memory-profile helper. */
+    CHECK(config.fonts.maximum_publication_work_units == 200000u
+          && config.resources.maximum_publication_work_units == 200000u
+          && config.startup_resource_deferral_us == 3000000u);
+    BrowserConfig guarded = config;
+    guarded.fonts.maximum_publication_work_units = 1u;
+    engine = browser_engine_create(&guarded, error, sizeof(error));
+    CHECK(engine != NULL);
+    for (size_t i = 0;
+         i < 4 && !browser_engine_baseline_fonts_ready(engine); i++) {
+        CHECK(browser_engine_pump_baseline_fonts(engine));
+    }
+    CHECK(browser_engine_baseline_fonts_ready(engine)
+          && browser_engine_commit_html(
+              engine, "https://font.test/", page, sizeof(page) - 1u, true)
+          && browser_engine_focus_move(engine, true));
+    baseline_font_bytes = font_set_loaded_bytes(browser_engine_fonts(engine));
+    fallback_height = browser_engine_navigation(engine)->page.layout.height;
+    relayouts_before = browser_engine_navigation(engine)->incremental_relayouts;
+    CHECK(browser_engine_navigation(engine)->page.layout.layout_work_units > 1u);
+    for (size_t i = 0; i < 64; i++) {
+        bool changed = false;
+        (void) browser_engine_run_idle_work(engine, &changed);
+        CHECK(!changed);
+    }
+    BrowserOptionalMemoryReclaim guard_reclaim = {0};
+    CHECK(browser_engine_navigation(engine)->page.loaded
+          && browser_engine_navigation(engine)->page.layout.height == fallback_height
+          && browser_engine_navigation(engine)->incremental_relayouts == relayouts_before
+          && font_set_loaded_bytes(browser_engine_fonts(engine)) == baseline_font_bytes
+          && browser_engine_reclaim_optional_memory(engine, &guard_reclaim)
+          && guard_reclaim.font_staging_bytes == 0
+          && browser_engine_last_error(engine)[0] == '\0'
+          && browser_engine_render_frame(engine, NULL));
+    /* A per-page publication refusal is not a permanent failed font file.
+       The following provider navigation must still admit its bold faces. */
+    CHECK(browser_engine_prepare_navigation_fonts(engine, "GET",
+              "https://www.youtube.com/results?search_query=fixture")
+          && font_set_face_is_bold(browser_engine_fonts(engine),
+              browser_engine_font_face_variant(engine, FONT_SANS, false, true))
+          && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+
+    /* Queued startup scripts defer optional faces, but only for the
+       configured wall-clock window: an external script that never arrives
+       must not hold the batch until the runtime turn cap. */
+    BrowserConfig deferred = config;
+    deferred.javascript.enabled = true;
+    deferred.javascript.document_scripts_enabled = true;
+    deferred.startup_resource_deferral_us = 2000000u;
+    static const char deferred_page[] =
+        "<!doctype html><style>body{margin:0}#probe{display:block;"
+        "font:700 22px serif;width:180px}</style><body>"
+        "<p id=probe>Metric-sensitive text wraps across this bounded box</p>"
+        "<p style='font:italic 16px sans-serif'>Italic face</p>"
+        "<p style='font:bold 16px sans-serif'>Bold face</p>"
+        "<script>var late=document.createElement('script');"
+        "late.src='/late.js';document.head.appendChild(late);</script>";
+    engine = browser_engine_create(&deferred, error, sizeof(error));
+    CHECK(engine != NULL);
+    for (size_t i = 0;
+         i < 4 && !browser_engine_baseline_fonts_ready(engine); i++) {
+        CHECK(browser_engine_pump_baseline_fonts(engine));
+    }
+    OptionalFontInputProbe deferral_clock = { .now_us = 5000000 };
+    TilefinchPlatformServices deferral_services = {
+        .context = &deferral_clock,
+        .monotonic_time_us = optional_font_probe_clock
+    };
+    tilefinch_platform_set_services(&deferral_services);
+    CHECK(browser_engine_baseline_fonts_ready(engine));
+    bool deferred_committed = browser_engine_commit_html(
+        engine, "https://font.test/", deferred_page,
+        sizeof(deferred_page) - 1u, true);
+    if (!deferred_committed)
+        fprintf(stderr, "deferred commit failed: %s\n",
+                browser_engine_last_error(engine));
+    CHECK(deferred_committed && browser_engine_render_frame(engine, NULL));
+    CHECK(browser_engine_navigation(engine)->page.runtime != NULL
+          && script_runtime_has_pending_startup_scripts(
+                 browser_engine_navigation(engine)->page.runtime));
+    relayouts_before = browser_engine_navigation(engine)->incremental_relayouts;
+    for (size_t i = 0; i < 32; i++) {
+        deferral_clock.now_us += 50000;
+        bool changed = false;
+        CHECK(browser_engine_run_idle_work(engine, &changed) && !changed);
+    }
+    BrowserOptionalMemoryReclaim deferred_reclaim = {0};
+    CHECK(browser_engine_navigation(engine)->incremental_relayouts == relayouts_before
+          && browser_engine_reclaim_optional_memory(engine, &deferred_reclaim)
+          && deferred_reclaim.font_staging_bytes == 0);
+    deferral_clock.now_us += 2000000;
+    visual_changes = 0;
+    for (size_t i = 0; i < 64; i++) {
+        bool changed = false;
+        (void) browser_engine_run_idle_work(engine, &changed);
+        if (changed) {
+            visual_changes++;
+            CHECK(browser_engine_render_frame(engine, NULL));
+        }
+        if (font_set_face_is_bold(
+                browser_engine_fonts(engine),
+                browser_engine_font_face_variant(
+                    engine, FONT_SERIF, false, true))) break;
+    }
+    CHECK(visual_changes == 1
+          && browser_engine_navigation(engine)->incremental_relayouts
+                 == relayouts_before + 1u
+          && script_runtime_has_pending_startup_scripts(
+                 browser_engine_navigation(engine)->page.runtime)
+          && browser_engine_shutdown(engine));
+    browser_engine_destroy(engine);
+    tilefinch_platform_set_services(NULL);
 
     /* A built-in provider has a known typography contract: its bold faces
        must be ready before the candidate can perform its first layout. A
@@ -1707,7 +2113,10 @@ static int test_same_document_and_script_free_defaults(void)
     config.memory_limit = 24u * MIB;
     config.javascript.enabled = true;
     config.javascript.document_scripts_enabled = true;
-    config.javascript.runtime_timeout_ms = 20u;
+    /* This fixture checks recovery from deliberately endless handlers, not
+       a 20 ms deadline. Leave setup enough room under ASan/UBSan too: the
+       old wrapper implementation also times out during its inline script. */
+    config.javascript.runtime_timeout_ms = 200u;
     char error[256] = {0};
     BrowserEngine *engine = browser_engine_create(
         &config, error, sizeof(error));
@@ -1764,9 +2173,13 @@ static int test_same_document_and_script_free_defaults(void)
         "throw new Error('hostile checkValidity');};</script>"
         "<main id=native-reader data-tilefinch-reader-root=article>"
         "<a name=tilefinch-extracted-legacy>Legacy anchor</a></main>";
-    CHECK(browser_engine_commit_html(
+    bool fragment_committed = browser_engine_commit_html(
         engine, "https://actions.test/page", fragment_page,
-        sizeof(fragment_page) - 1u, true));
+        sizeof(fragment_page) - 1u, true);
+    if (!fragment_committed)
+        fprintf(stderr, "fragment setup failed: %s\n",
+                browser_engine_last_error(engine));
+    CHECK(fragment_committed);
     NavigationSession *navigation = browser_engine_navigation(engine);
     PocDocument *document = &navigation->page.document;
     lxb_dom_node_t *jump = actionable_find_id(document, "jump");

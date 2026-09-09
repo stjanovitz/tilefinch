@@ -477,6 +477,9 @@ struct ScriptRuntime {
     size_t base_memory_limit;
     size_t boot_window_bytes;
     bool boot_window_active;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    bool heap_failure_census_reported;
+#endif
     size_t boot_window_peak;
     uint64_t boot_window_advances;
     uint64_t boot_window_returned_advance;
@@ -631,6 +634,7 @@ bool js_rt_runtime_script_checkpoint(ScriptRuntime *runtime,
                                      size_t work_units);
 bool js_rt_runtime_callback_checkpoint(ScriptRuntime *runtime);
 bool js_rt_runtime_native_checkpoint(ScriptRuntime *runtime);
+JSValue js_rt_throw_task_interruption(JSContext *context, const char *message);
 JSValue js_rt_compile_source_type(JSContext *context, const char *source,
                                    size_t length, const char *name,
                                    int evaluation_type,
@@ -1019,6 +1023,9 @@ JSValue js_dom_record_event_handler(JSContext *context,
 JSValue js_dom_relation(JSContext *context,
                         JSValueConst this_value,
                         int argc, JSValueConst *argv);
+JSValue js_dom_compare_position(JSContext *context,
+                                JSValueConst this_value,
+                                int argc, JSValueConst *argv);
 JSValue js_dom_release_node_wrapper(JSContext *context,
                                     JSValueConst this_value,
                                     int argc, JSValueConst *argv);

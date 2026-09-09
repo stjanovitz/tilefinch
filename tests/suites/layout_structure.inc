@@ -87,6 +87,71 @@ static int test_layout_elapsed_input_checkpoint(Budget *budget)
     return 0;
 }
 
+typedef struct {
+    bool cancel;
+    size_t polls;
+    uint64_t last_us, maximum_gap_us;
+} TextInputProbe;
+
+static bool text_input_poll(void *opaque, const char *phase, size_t work)
+{
+    (void) work;
+    TextInputProbe *probe = opaque;
+    uint64_t now = tilefinch_platform_monotonic_time_us();
+    uint64_t gap = now - probe->last_us;
+    if (gap > probe->maximum_gap_us) probe->maximum_gap_us = gap;
+    probe->last_us = now;
+    if (strcmp(phase, "layout-text") != 0) return true;
+    probe->polls++;
+    return !probe->cancel;
+}
+
+static int test_long_text_input_checkpoint(Budget *budget)
+{
+    size_t baseline = budget->current;
+    /* One text node: the ordinary four-node checkpoint cannot help until
+       all its words have been measured and emitted. */
+    char text[32769];
+    for (size_t i = 0; i < sizeof(text) - 1; i++) text[i] = "word "[i % 5];
+    text[sizeof(text) - 1] = '\0';
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    CHECK(document_parse(&document, budget, text, sizeof(text) - 1, 31)
+          && stylesheet_build(&sheet, budget, &document, 480));
+    size_t loaded = budget->current;
+    TextInputProbe probe = { .last_us = tilefinch_platform_monotonic_time_us() };
+    TilefinchPlatformServices services = {
+        .context = &probe, .cooperate = text_input_poll
+    };
+    tilefinch_platform_set_services(&services);
+    uint64_t started = probe.last_us;
+    CHECK(layout_build(&layout, budget, &document, &sheet, NULL, NULL, 480)
+          && layout.count > 100 && !layout.performance.cancelled);
+    (void) text_input_poll(&probe, "layout-return", 0);
+    printf("text-checkpoint elapsed-us=%llu max-gap-us=%llu text-polls=%zu "
+           "fingerprint=%llu height=%d commands=%zu\n",
+        (unsigned long long) (probe.last_us - started),
+        (unsigned long long) probe.maximum_gap_us, probe.polls,
+        (unsigned long long) layout.text_fingerprint, layout.height, layout.count);
+    layout_destroy(&layout);
+    probe.cancel = true;
+    probe.polls = 0;
+    bool built = layout_build(&layout, budget, &document, &sheet,
+                              NULL, NULL, 480);
+    tilefinch_platform_set_services(NULL);
+    CHECK(!built && probe.polls == 1 && layout.performance.cancelled
+          && layout.commands == NULL && budget->current == loaded);
+    layout_destroy(&layout);
+    CHECK(layout_build(&layout, budget, &document, &sheet, NULL, NULL, 480)
+          && layout.count > 100 && !layout.performance.cancelled);
+    layout_destroy(&layout);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == baseline);
+    return 0;
+}
+
 static int test_node_box_index_absence(Budget *budget)
 {
     size_t baseline = budget->current;

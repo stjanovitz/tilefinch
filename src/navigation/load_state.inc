@@ -1523,13 +1523,16 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
         tilefinch_platform_log_message(phase_message);
         snprintf(phase_message, sizeof(phase_message),
             "tilefinch-candidate-images: deferred=%zu runtime=%d attempted=%zu loaded=%zu "
-            "traverse=%lluus node-style=%lluus pseudo-style=%lluus drain=%lluus",
+            "traverse=%lluus node-style=%lluus pseudo-style=%lluus drain=%lluus "
+            "prefilter=%zu/%zu",
             candidate->page.deferred_image_count, candidate->page.runtime != NULL,
             candidate->page.images.stats.attempted, candidate->page.images.stats.loaded,
             (unsigned long long) candidate->page.images.stats.traversal_us,
             (unsigned long long) candidate->page.images.stats.node_style_resolve_us,
             (unsigned long long) candidate->page.images.stats.pseudo_style_resolve_us,
-            (unsigned long long) candidate->page.images.stats.drain_us);
+            (unsigned long long) candidate->page.images.stats.drain_us,
+            candidate->page.images.stats.discovery_prefilter_skips,
+            candidate->page.images.stats.discovery_prefilter_checks);
         tilefinch_platform_log_message(phase_message);
 #endif
         if (built && load->layout_job != NULL) return true;

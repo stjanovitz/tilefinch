@@ -27,7 +27,7 @@ void stylesheet_drop_selector_program(Stylesheet *sheet)
 
 #define STYLE_SELECTOR_PROGRAM_BUDGET (256u * 1024u)
 #define STYLE_COMPILED_FRAGMENT_MAGIC UINT32_C(0x54465346)
-#define STYLE_COMPILED_FRAGMENT_VERSION UINT16_C(1)
+#define STYLE_COMPILED_FRAGMENT_VERSION UINT16_C(2)
 #define STYLE_COMPILED_FRAGMENT_MAX_BYTES (256u * 1024u)
 
 typedef struct {
@@ -172,6 +172,209 @@ static bool style_selector_compile_simple_compound(
     return true;
 }
 
+static bool style_selector_builder_emit_raw(StyleSelectorBuilder *builder,
+                                            StyleSelectorOpcode opcode,
+                                            uint16_t value)
+{
+    if (builder == NULL) return false;
+    if (builder->instructions != NULL) {
+        if (builder->count >= builder->capacity) return false;
+        builder->instructions[builder->count] = (StyleSelectorInstruction) {
+            .text_offset = value, .text_length = 0, .opcode = (uint8_t) opcode
+        };
+    }
+    builder->count++;
+    return true;
+}
+
+static bool compile_attribute_name_character(unsigned char value)
+{
+    /* The string matcher lowercases the decoded name; only compile names
+       the lowercasing leaves unchanged. */
+    return (value >= 'a' && value <= 'z') || (value >= '0' && value <= '9')
+        || value == '-' || value == '_' || value >= 0x80;
+}
+
+/* Compile one bracketed attribute test starting at text[0] == '['. Returns
+   the bytes consumed through the closing bracket, or 0 to leave the test
+   (and the rest of the compound) to the string matcher. Only the exact
+   forms whose decoding is the identity are compiled: an escape-free
+   lowercase name, an optional operator, and an escape-free value with no
+   case flag, so the compiled comparison equals attribute_matches(). */
+static size_t style_selector_compile_attribute(StyleSelectorBuilder *builder,
+                                               const char *text, size_t length)
+{
+    if (length < 2 || text[0] != '[') return 0;
+    size_t close = 1;
+    char quote = 0;
+    while (close < length) {
+        char value = text[close];
+        if (value == '\\') return 0;
+        if (quote != 0) {
+            if (value == quote) quote = 0;
+        } else if (value == '\'' || value == '"') {
+            quote = value;
+        } else if (value == ']') {
+            break;
+        }
+        close++;
+    }
+    if (close >= length) return 0;
+    size_t at = 1;
+    while (at < close && isspace((unsigned char) text[at])) at++;
+    size_t name_begin = at;
+    while (at < close && name_character(text[at])) at++;
+    size_t name_length = at - name_begin;
+    if (name_length == 0 || name_length >= 63) return 0;
+    for (size_t i = name_begin; i < at; i++) {
+        if (!compile_attribute_name_character((unsigned char) text[i]))
+            return 0;
+    }
+    while (at < close && isspace((unsigned char) text[at])) at++;
+    if (at == close) {
+        return style_selector_builder_emit(
+                   builder, STYLE_SELECTOR_ATTRIBUTE_PRESENT,
+                   text + name_begin, name_length) ? close + 1 : 0;
+    }
+    StyleSelectorOpcode compare;
+    if (text[at] == '=') {
+        compare = STYLE_SELECTOR_ATTRIBUTE_EXACT;
+        at++;
+    } else if (at + 1 < close && text[at + 1] == '=') {
+        switch (text[at]) {
+        case '~': compare = STYLE_SELECTOR_ATTRIBUTE_WORD; break;
+        case '^': compare = STYLE_SELECTOR_ATTRIBUTE_PREFIX; break;
+        case '$': compare = STYLE_SELECTOR_ATTRIBUTE_SUFFIX; break;
+        case '*': compare = STYLE_SELECTOR_ATTRIBUTE_SUBSTRING; break;
+        case '|': compare = STYLE_SELECTOR_ATTRIBUTE_DASH; break;
+        default: return 0;
+        }
+        at += 2;
+    } else {
+        return 0;
+    }
+    while (at < close && isspace((unsigned char) text[at])) at++;
+    if (at == close) return 0;
+    size_t value_begin, value_end;
+    if (text[at] == '\'' || text[at] == '"') {
+        char delimiter = text[at++];
+        value_begin = at;
+        while (at < close && text[at] != delimiter) at++;
+        if (at == close) return 0;
+        value_end = at++;
+    } else {
+        value_begin = at;
+        while (at < close && !isspace((unsigned char) text[at])) at++;
+        value_end = at;
+    }
+    while (at < close && isspace((unsigned char) text[at])) at++;
+    /* A trailing case flag or anything else keeps the string matcher. */
+    if (at != close || value_end - value_begin > 128) return 0;
+    if (!style_selector_builder_emit(
+            builder, STYLE_SELECTOR_ATTRIBUTE_NAME, text + name_begin,
+            name_length)
+        || !style_selector_builder_emit(
+            builder, compare, text + value_begin, value_end - value_begin)) {
+        return 0;
+    }
+    return close + 1;
+}
+
+/* Compile one argument-less pseudo-class starting at text[0] == ':'.
+   Returns the bytes consumed, or 0 for pseudo-elements and functional
+   pseudo-classes, which stay with the string matcher. Unknown and
+   interactive kinds compile too: the instruction rejects them exactly as
+   the string matcher does, without re-reading the selector text. */
+static size_t style_selector_compile_pseudo(StyleSelectorBuilder *builder,
+                                            const char *text, size_t length)
+{
+    if (length < 2 || text[0] != ':' || text[1] == ':') return 0;
+    size_t end = 1;
+    while (end < length && name_character(text[end])) end++;
+    if (end == 1 || (end < length && text[end] == '(')) return 0;
+    StylePseudoKind kind = style_pseudo_kind(text + 1, end - 1);
+    switch (kind) {
+    case STYLE_PSEUDO_NOT:
+    case STYLE_PSEUDO_IS:
+    case STYLE_PSEUDO_HAS:
+    case STYLE_PSEUDO_NTH_CHILD:
+    case STYLE_PSEUDO_NTH_TYPE:
+    case STYLE_PSEUDO_NTH_LAST_CHILD:
+    case STYLE_PSEUDO_NTH_LAST_TYPE:
+        /* Without their parenthesised argument these are rejected by the
+           string matcher after it scans them; keep that path. */
+        return 0;
+    default:
+        break;
+    }
+    if ((unsigned) kind > UINT16_MAX) return 0;
+    return style_selector_builder_emit_raw(
+               builder, STYLE_SELECTOR_PSEUDO, (uint16_t) kind) ? end : 0;
+}
+
+/* Compile the leading tag/class/id tokens of a compound and stop at the
+   first attribute or pseudo-class test. *split receives the offset where
+   the uncompiled suffix begins (0 when no prefix token was emitted). Only
+   escape-free tokens are compiled; anything else fails so the caller keeps
+   the established whole-text matcher. */
+static bool style_selector_compile_compound_prefix(
+    StyleSelectorBuilder *builder, const char *text, size_t length,
+    size_t *split)
+{
+    *split = 0;
+    size_t at = 0;
+    bool emitted = false;
+    if (text[at] == '*') {
+        at++;
+    } else if (name_character(text[at])) {
+        size_t end = skip_selector_identifier(text, length, at);
+        if (end == at || memchr(text + at, '\\', end - at) != NULL
+            || !style_selector_builder_emit_tag(
+                builder, text + at, end - at)) {
+            return false;
+        }
+        at = end;
+        emitted = true;
+    }
+    while (at < length) {
+        if (text[at] == '.' || text[at] == '#') {
+            char marker = text[at++];
+            size_t end = skip_selector_identifier(text, length, at);
+            if (end == at || memchr(text + at, '\\', end - at) != NULL
+                || !style_selector_builder_emit(
+                    builder,
+                    marker == '.' ? STYLE_SELECTOR_CLASS
+                                  : STYLE_SELECTOR_ID,
+                    text + at, end - at)) {
+                return false;
+            }
+            at = end;
+            emitted = true;
+        } else if (text[at] == '[') {
+            size_t consumed = style_selector_compile_attribute(
+                builder, text + at, length - at);
+            if (consumed == 0) break;
+            at += consumed;
+            emitted = true;
+        } else if (text[at] == ':') {
+            size_t consumed = style_selector_compile_pseudo(
+                builder, text + at, length - at);
+            if (consumed == 0) break;
+            at += consumed;
+            emitted = true;
+        } else if (isspace((unsigned char) text[at])) {
+            /* Trailing whitespace inside a trimmed compound cannot occur;
+               interior whitespace is not a compound. */
+            return false;
+        } else {
+            return false;
+        }
+    }
+    if (!emitted) return false;
+    *split = at;
+    return true;
+}
+
 static bool style_selector_compile_compound(StyleSelectorBuilder *builder,
                                             const char *text, size_t length)
 {
@@ -187,6 +390,23 @@ static bool style_selector_compile_compound(StyleSelectorBuilder *builder,
        selector and its combinator prefixes on every candidate node. */
     builder->count = checkpoint;
     if (!builder->complex_compounds) return false;
+    /* Most complex compounds are a simple tag/class/id prefix followed by
+       attribute or pseudo-class tests (a[href], li.item:first-child). Emit
+       the prefix as ordinary tag/class/id instructions so the per-node
+       string matcher only re-scans the suffix it must interpret. The
+       suffix begins at the first '[' or ':' and is matched by the same
+       string matcher against the same prepared subject, so the result is
+       unchanged; escaped or unusual prefixes keep the whole-text opcode. */
+    size_t split = 0;
+    if (style_selector_compile_compound_prefix(builder, text, length, &split)
+        && split != 0
+        && (split == length
+            || style_selector_builder_emit(
+                   builder, STYLE_SELECTOR_COMPOUND, text + split,
+                   length - split))) {
+        return true;
+    }
+    builder->count = checkpoint;
     return style_selector_builder_emit(
         builder, STYLE_SELECTOR_COMPOUND, text, length);
 }

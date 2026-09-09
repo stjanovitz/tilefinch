@@ -8,6 +8,13 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.17 — 2026-09-08
+
+- Faster, more responsive page loading and navigation.
+- Reduced memory use and improved reliability on complex pages.
+- Fixed dynamic styling, embedded-frame, and viewport handling.
+- Additional playback and stability fixes.
+
 ## 0.1.16 — 2026-09-06
 
 - Faster startup and more responsive page loading, scrolling, and focus navigation.

@@ -1055,6 +1055,7 @@ bool psp_input_script_begin(
     const TilefinchInstallPaths *install_paths, const char *argv0,
     const char *name);
 bool psp_input_script_running(void);
+bool psp_input_script_report_pending(void);
 void psp_input_script_interrupt_by_user(void);
 bool psp_input_script_frame(
     PspUiInput *input, bool ready, bool page_ready);

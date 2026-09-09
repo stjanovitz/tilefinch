@@ -278,6 +278,16 @@ static void runtime_apply_gc_slack(ScriptRuntime *runtime)
         }
         threshold = limit > reserve ? limit - reserve : limit;
     }
+    /* Once live state occupies the desired reserve, reapplying a threshold
+       below live makes the first tiny object allocation collect on EVERY
+       advance, even when the preceding collection reclaimed nothing. Allow
+       half the remaining headroom to be allocated before the next automatic
+       collection. This never raises the allocator's hard limit, and the
+       exhausted-heap case still collects before object creation. */
+    if (threshold <= live && live < effective_limit) {
+        uint64_t headroom = effective_limit - live;
+        threshold = live + headroom / 2u + headroom % 2u;
+    }
     JS_SetGCThreshold(runtime->runtime,
                       threshold > SIZE_MAX ? SIZE_MAX : (size_t) threshold);
 }
@@ -319,10 +329,24 @@ static bool runtime_dispatch_game_audio_completion(ScriptRuntime *runtime,
     return ok;
 }
 
+static bool runtime_task_slice_available(const ScriptRuntime *runtime,
+                                         uint64_t started_ns,
+                                         size_t remaining, size_t budget)
+{
+    uint64_t limit = runtime->bridge.execution_policy.maximum_advance_time_us;
+    /* Make at least one task's progress even when preparation itself is
+       expensive. Subsequent tasks wait for another host turn, leaving input
+       and presentation an opportunity without changing task/job ordering. */
+    if (limit == 0 || remaining == budget) return true;
+    uint64_t now = js_rt_monotonic_time_ns();
+    return now < started_ns || (now - started_ns) / UINT64_C(1000) < limit;
+}
+
 bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
                             size_t callback_budget, ScriptResult *result)
 {
     if (runtime == NULL || callback_budget > 1024) return false;
+    uint64_t task_slice_started_ns = js_rt_monotonic_time_ns();
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     uint64_t advance_started_ns = js_rt_monotonic_time_ns();
     uint64_t prelude_started_ns = advance_started_ns;
@@ -428,7 +452,9 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         if (ok) ok = js_rt_runtime_run_jobs(runtime);
     }
     while (ok && !classic_continuation
-           && !JS_IsJobPending(runtime->runtime) && remaining != 0) {
+           && !JS_IsJobPending(runtime->runtime) && remaining != 0
+           && runtime_task_slice_available(runtime, task_slice_started_ns,
+                                           remaining, callback_budget)) {
         bool dispatched = false;
         ok = runtime_dispatch_game_audio_completion(runtime, &dispatched);
         if (!ok || !dispatched) break;
@@ -437,6 +463,8 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
     }
     size_t callbacks = 0;
     while (ok && remaining != 0
+           && runtime_task_slice_available(runtime, task_slice_started_ns,
+                                           remaining, callback_budget)
            && (classic_continuation
                || !JS_IsJobPending(runtime->runtime))) {
         size_t network_tasks = 0;
@@ -581,6 +609,9 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
 #endif
     runtime->result.success = ok;
     js_rt_runtime_update_result(runtime, result);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    runtime_report_heap_failure(runtime);
+#endif
     return ok;
 }
 

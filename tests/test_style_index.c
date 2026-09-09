@@ -117,6 +117,162 @@ static bool cache_test_cooperate(void *opaque, lxb_dom_node_t *node, size_t visi
     return true;
 }
 
+static int test_ancestor_filter_canonical_tokens(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<div class=root><aside class=guard></aside>"
+        "<section class=branch><i></i><span id=probe class=leaf></span>"
+        "</section></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    static const char css[] = "section .leaf{color:#123456}"
+        ".root .guard + .branch .leaf{padding-top:7px}"
+        ".root .guard ~ .branch > i + .leaf{margin-top:9px}"
+        ".missing .branch > i + .leaf{color:red}"
+        ".root .absent + .branch .leaf{color:red}";
+    CHECK(stylesheet_add_css(&sheet, css, sizeof(css) - 1u));
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), "probe");
+    CHECK(node != NULL);
+    ComputedStyle actual = style_for_node(&sheet, node, NULL);
+    CHECK(actual.color == 0x123456 && actual.padding.top == 7
+        && actual.margin.top == 9 && sheet.rule_filters != NULL);
+    const StyleRule *tag = find_rule(&sheet, "section .leaf");
+    const StyleRule *sibling = find_rule(&sheet, ".root .guard + .branch .leaf");
+    const StyleRule *mixed = find_rule(&sheet, ".root .guard ~ .branch > i + .leaf");
+    CHECK(tag != NULL && sibling != NULL && mixed != NULL);
+    StyleTokenBloom expected_tag = style_compound_token_bloom(
+        STYLE_SELECTOR_TAG, "section", 7);
+    StyleTokenBloom expected_classes = style_compound_token_bloom(
+        STYLE_SELECTOR_CLASS, "root", 4);
+    style_token_bloom_merge(&expected_classes, style_compound_token_bloom(
+        STYLE_SELECTOR_CLASS, "branch", 6));
+    /* Numeric compiled tags and generic tag predicates must reserve the same
+       bits. Sibling tokens are excluded, but their shared ancestors survive. */
+    CHECK(memcmp(&sheet.rule_filters[tag - sheet.rules].ancestors,
+        &expected_tag, sizeof(expected_tag)) == 0);
+    CHECK(memcmp(&sheet.rule_filters[sibling - sheet.rules].ancestors,
+        &expected_classes, sizeof(expected_classes)) == 0);
+    CHECK(memcmp(&sheet.rule_filters[mixed - sheet.rules].ancestors,
+        &expected_classes, sizeof(expected_classes)) == 0);
+    uint64_t rejected = sheet.rule_ancestor_filter_rejections;
+    CHECK(rejected != 0);
+    /* Disabling only admission must leave every resolved value identical. */
+    sheet.rule_ancestor_filter_active = false;
+    ComputedStyle unfiltered = style_for_node(&sheet, node, NULL);
+    CHECK(memcmp(&actual, &unfiltered, sizeof(actual)) == 0);
+    CHECK(sheet.rule_ancestor_filter_rejections == rejected);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
+
+/* Attribute tests and argument-less pseudo-classes compile to instructions
+   that must agree with the string matcher on every node, and rules naming
+   an unimplemented pseudo-element must not survive to matching. */
+static int test_compiled_attribute_and_pseudo_instructions(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    static const char html[] = "<style>"
+        "a[href]{color:#111111}"
+        "a[rel~='mw:referencedBy']{color:#222222}"
+        "[type=\"submit\"]{color:#333333}"
+        "p:last-child{color:#444444}"
+        "a.k:not(.other)[href]{color:#555555}"
+        "a:hover{color:#666666}"
+        "[data-kind^=note]{margin-top:3px}"
+        "input:disabled{color:#777777}"
+        "[title i]{color:#888888}"
+        "[title=title i]{color:#999999}"
+        "[lang|=en]{color:#aaaaaa}"
+        "[type='submit']::-moz-focus-inner{color:#bbbbbb}"
+        "a:first-child{padding-top:2px}"
+        "p:first-child{padding-top:9px}"
+        "</style><div id=root data-kind=\"note book\">"
+        "<a id=a1 href=/x rel=\"nofollow mw:referencedBy\" class=k>a</a>"
+        "<a id=a2 class=\"k other\" title=Title>b</a>"
+        "<input id=i1 type=submit disabled><p id=p1 lang=en-US>t</p></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    Stylesheet sheet = {0};
+    CHECK(stylesheet_build(&sheet, &budget, &document, 480));
+    size_t before = 0;
+    (void) unsetenv("TILEFINCH_DISABLE_COMPILED_SELECTORS");
+    (void) unsetenv("TILEFINCH_DISABLE_COMPILED_COMPLEX_SELECTORS");
+    stylesheet_prepare_selector_program(&sheet);
+    /* Thirteen matchable rules; the vendor pseudo-element rule is dropped. */
+    CHECK(sheet.count == 13u && sheet.selector_program_ready
+          && sheet.selector_program_offsets != NULL
+          && find_rule(&sheet, "[type='submit']::-moz-focus-inner") == NULL);
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *nodes[5] = {
+        find_id(root, "root"), find_id(root, "a1"), find_id(root, "a2"),
+        find_id(root, "i1"), find_id(root, "p1") };
+    for (size_t i = 0; i < 5; i++) CHECK(nodes[i] != NULL);
+    for (size_t r = before; r < sheet.count; r++) {
+        const StyleRule *rule = &sheet.rules[r];
+        for (size_t i = 0; i < 5; i++) {
+            bool compiled = style_rule_selector_matches(&sheet, r, nodes[i]);
+            bool textual = style_selector_matches_profiled(
+                &sheet, nodes[i], rule->selector, rule->selector_length);
+            if (compiled != textual)
+                fprintf(stderr, "mismatch rule=%.*s node=%zu compiled=%d text=%d\n",
+                        (int) rule->selector_length, rule->selector, i,
+                        compiled, textual);
+            CHECK(compiled == textual);
+        }
+    }
+    ComputedStyle a1 = style_for_node(&sheet, nodes[1], NULL);
+    ComputedStyle a2 = style_for_node(&sheet, nodes[2], NULL);
+    ComputedStyle i1 = style_for_node(&sheet, nodes[3], NULL);
+    ComputedStyle p1 = style_for_node(&sheet, nodes[4], NULL);
+    ComputedStyle rootstyle = style_for_node(&sheet, nodes[0], NULL);
+    CHECK(a1.color == 0x555555 && a1.padding.top == 2
+          && a2.color == 0x999999 && a2.padding.top == 0
+          && i1.color == 0x777777 && p1.color == 0x444444
+          && p1.padding.top == 0 && rootstyle.margin.top == 3);
+    /* The compiled forms: presence, name+word, tag+class then a text
+       suffix, and a pseudo instruction carrying its kind. */
+    const StyleRule *href = find_rule(&sheet, "a[href]");
+    const StyleRule *word = find_rule(&sheet, "a[rel~='mw:referencedBy']");
+    const StyleRule *suffix = find_rule(&sheet, "a.k:not(.other)[href]");
+    const StyleRule *last = find_rule(&sheet, "p:last-child");
+    CHECK(href != NULL && word != NULL && suffix != NULL && last != NULL);
+    const StyleSelectorInstruction *ops = sheet.selector_program;
+    uint16_t at = sheet.selector_program_offsets[href - sheet.rules];
+    CHECK(ops[at].opcode == STYLE_SELECTOR_TAG_ID
+          && ops[at + 1].opcode == STYLE_SELECTOR_ATTRIBUTE_PRESENT
+          && ops[at + 1].text_length == 4
+          && ops[at + 2].opcode == STYLE_SELECTOR_END);
+    at = sheet.selector_program_offsets[word - sheet.rules];
+    CHECK(ops[at + 1].opcode == STYLE_SELECTOR_ATTRIBUTE_NAME
+          && ops[at + 2].opcode == STYLE_SELECTOR_ATTRIBUTE_WORD
+          && ops[at + 2].text_length == sizeof("mw:referencedBy") - 1u
+          && ops[at + 3].opcode == STYLE_SELECTOR_END);
+    at = sheet.selector_program_offsets[suffix - sheet.rules];
+    CHECK(ops[at].opcode == STYLE_SELECTOR_TAG_ID
+          && ops[at + 1].opcode == STYLE_SELECTOR_CLASS
+          && ops[at + 2].opcode == STYLE_SELECTOR_COMPOUND
+          && memcmp(suffix->selector + ops[at + 2].text_offset,
+                    ":not(.other)[href]", ops[at + 2].text_length) == 0
+          && ops[at + 3].opcode == STYLE_SELECTOR_END);
+    at = sheet.selector_program_offsets[last - sheet.rules];
+    CHECK(ops[at + 1].opcode == STYLE_SELECTOR_PSEUDO
+          && ops[at + 1].text_offset == STYLE_PSEUDO_LAST
+          && ops[at + 2].opcode == STYLE_SELECTOR_END);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static int test_pseudo_state_work(void)
 {
     Budget budget;
@@ -454,8 +610,157 @@ static int test_quoted_declaration_boundaries(void)
     return 0;
 }
 
-int main(void)
+static int test_retained_range_cache_handoff(void)
 {
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<style>p{color:#123456}"
+        "p::before{content:'x';color:#654321}</style><p id=p>Text</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), "p");
+    StyleAncestorBloomCache *local = budget_calloc(&budget, 1, sizeof(*local));
+    StyleRetainedMatches *retained = style_retained_matches_create(&budget);
+    CHECK(node != NULL && local != NULL && retained != NULL
+          && style_selector_cooperation_begin(&sheet, cache_test_cooperate, NULL, local));
+    ComputedStyle warm = style_for_node(&sheet, node, NULL);
+    ComputedStyle warm_pseudo = style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &warm);
+    (void) style_retained_matches_attach(&sheet, retained);
+    (void) style_for_node(&sheet, node, NULL);
+    (void) style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &warm);
+    ComputedStyle replay = style_for_node(&sheet, node, NULL);
+    ComputedStyle replay_pseudo = style_for_pseudo(&sheet, node, PSEUDO_BEFORE, &warm);
+    CHECK(retained->hits >= 2 && replay.color == warm.color
+          && replay_pseudo.color == warm_pseudo.color
+          && replay_pseudo.generated_content == warm_pseudo.generated_content);
+    (void) style_retained_matches_attach(&sheet, NULL);
+    style_selector_cooperation_end(&sheet);
+    style_retained_matches_destroy(retained);
+    budget_free(&budget, local);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_retained_nested_selector_invalidation(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<style>p{color:#123456}"
+        "p:is(.active p){color:#654321}</style><div id=group><p id=p>Text</p></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *node = find_id(root, "p"), *group = find_id(root, "group");
+    StyleRetainedMatches *retained = style_retained_matches_create(&budget);
+    CHECK(node != NULL && group != NULL && retained != NULL);
+    (void) style_retained_matches_attach(&sheet, retained);
+    CHECK(style_for_node(&sheet, node, NULL).color == 0x123456);
+    BudgetAllocationOwner owner = document_allocation_owner_enter(&document);
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(group),
+        (const lxb_char_t *) "class", 5, (const lxb_char_t *) "active", 6) != NULL);
+    document_allocation_owner_leave(&document, owner);
+    uint32_t token = stylesheet_identity_token_hash(false, "active", 6);
+    const lxb_dom_node_t *nodes[] = {group};
+    style_retained_matches_invalidate_tokens(retained, &sheet, nodes, 1, &token, 1, false);
+    ComputedStyle replay = style_for_node(&sheet, node, NULL);
+    (void) style_retained_matches_attach(&sheet, NULL);
+    ComputedStyle exact = style_for_node(&sheet, node, NULL);
+    CHECK(exact.color == 0x654321 && replay.color == exact.color);
+    style_retained_matches_destroy(retained);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_retained_focus_descendants(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<style>.group{color:#123456}"
+        ".group:focus-within{color:#654321}.group:focus-within p{padding-left:7px}"
+        "</style><div class=group id=group><input id=input><p id=p>Text</p></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    for (unsigned i = 0; i < 64; i++) {
+        char css[48];
+        int length = snprintf(css, sizeof(css), ".pad%u{color:red}", i);
+        CHECK(length > 0 && stylesheet_add_css(&sheet, css, (size_t) length));
+    }
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *group = find_id(root, "group"), *node = find_id(root, "p");
+    lxb_dom_node_t *input = find_id(root, "input");
+    LayoutReuseCache *reuse = layout_reuse_cache_create(&budget);
+    CHECK(group != NULL && node != NULL && input != NULL && reuse != NULL);
+    layout_reuse_cache_enable_retained_matches(reuse);
+    layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+    ComputedStyle parent, child;
+    (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, group, NULL, &parent);
+    (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, node, &parent, &child);
+    CHECK(child.padding.left == 0);
+    BudgetAllocationOwner owner = document_allocation_owner_enter(&document);
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(input),
+        (const lxb_char_t *) "data-tilefinch-focus", 20, (const lxb_char_t *) "", 0) != NULL);
+    document_allocation_owner_leave(&document, owner);
+    layout_reuse_cache_invalidate_focus(reuse, input);
+    layout_reuse_cache_prepare(reuse, &sheet, NULL, NULL, 480);
+    (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, group, NULL, &parent);
+    (void) layout_reuse_cache_resolve_style(reuse, &sheet, NULL, node, &parent, &child);
+    CHECK(parent.color == 0x654321 && child.padding.left == 7);
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+static int test_quoted_pseudo_element_punctuation(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<style>[data-value='::']{color:#123456}"
+        "p::unsupported{color:red}</style><p id=p data-value='::'>Text</p>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *node = find_id(lxb_dom_interface_node(document.html), "p");
+    CHECK(node != NULL && sheet.count == 1
+          && style_for_node(&sheet, node, NULL).color == 0x123456);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "--retained-handoff-only") == 0)
+        return test_retained_range_cache_handoff();
+    if (argc == 2 && strcmp(argv[1], "--retained-nested-only") == 0)
+        return test_retained_nested_selector_invalidation();
+    if (argc == 2 && strcmp(argv[1], "--quoted-punctuation-only") == 0)
+        return test_quoted_pseudo_element_punctuation();
+    if (argc == 2 && strcmp(argv[1], "--retained-focus-only") == 0)
+        return test_retained_focus_descendants();
+    CHECK(test_retained_range_cache_handoff() == 0);
+    CHECK(test_retained_nested_selector_invalidation() == 0);
+    CHECK(test_quoted_pseudo_element_punctuation() == 0);
+    CHECK(test_retained_focus_descendants() == 0);
+    CHECK(test_ancestor_filter_canonical_tokens() == 0);
+    CHECK(test_compiled_attribute_and_pseudo_instructions() == 0);
     CHECK(test_quoted_declaration_boundaries() == 0);
     CHECK(test_pseudo_state_work() == 0);
     CHECK(test_layout_scoped_selector_work() == 0);

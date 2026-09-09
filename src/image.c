@@ -4025,6 +4025,15 @@ static bool image_traversal_push(
     return true;
 }
 
+static bool image_discovery_prefilter_disabled(void)
+{
+#ifndef TILEFINCH_NO_TRACE
+    return getenv("TILEFINCH_DISABLE_IMAGE_PREFILTER") != NULL;
+#else
+    return false;
+#endif
+}
+
 static bool image_process_node(
     ImageLoadContext *context, lxb_dom_node_t *node,
     const ComputedStyle *parent, ComputedStyle *style, bool *traverse)
@@ -4139,12 +4148,28 @@ static bool image_process_node(
                       strlen(style->mask_image), true, false,
                       PSEUDO_NONE)) return false;
     if (!*traverse) return true;
+    /* Generated-content images can only come from ::before/::after rules.
+       When no such rule that can supply one matches this element, both
+       pseudo resolutions are skipped; the exact test on the few flagged
+       candidates is far cheaper than two resolutions. */
+    if (!image_discovery_prefilter_disabled()) {
+        context->images->stats.discovery_prefilter_checks++;
+        if (!style_node_pseudo_rules_may_affect_discovery(
+                context->stylesheet, node)) {
+            context->images->stats.discovery_prefilter_skips++;
+            return true;
+        }
+    }
     for (PseudoElement pseudo = PSEUDO_BEFORE;
          pseudo <= PSEUDO_AFTER; pseudo++) {
         style_started = image_profile_enabled()
             ? image_profile_now_us() : 0;
+        void *previous_matches = layout_reuse_cache_attach_matches(
+            context->style_cache, context->stylesheet);
         ComputedStyle generated = style_for_pseudo(
             context->stylesheet, node, pseudo, style);
+        layout_reuse_cache_detach_matches(
+            context->stylesheet, previous_matches);
         if (style_started != 0) {
             uint64_t elapsed = image_profile_now_us() - style_started;
             context->images->stats.style_resolve_us += elapsed;
