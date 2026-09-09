@@ -3371,6 +3371,13 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
 #endif
     while (!psp_exit_plan_requested(&interactive->exit)
            && !psp_home_exit_pending()) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if (psp_input_script_report_pending()) {
+            psp_exit_plan_request(
+                &interactive->exit, PSP_EXIT_VALIDATION_COMPLETE);
+            break;
+        }
+#endif
         if ((process->presentation.ui.screen == PSP_UI_SCREEN_OPTIONS
              || process->presentation.ui.screen
                     == PSP_UI_SCREEN_OPTION_ITEMS)
@@ -4979,6 +4986,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                        "first-dom=%lluus source=%zu nodes=%zu "
                        "style-refresh=%lluus "
                        "style-builds=%zu continuation=%zu/%zu/%lluus "
+                       "viewport-rebuilds=%zu "
                        "rules=%zu+%zu discovery=%lluus "
                        "context=%lluus append=%lluus "
                        "refresh-failures=%zu "
@@ -5030,6 +5038,8 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                        (unsigned long long)
                            engine_views->navigation->performance
                                .blocking_stylesheet_continuation_us,
+                       engine_views->navigation->performance
+                           .blocking_stylesheet_viewport_rebuilds,
                        engine_views->navigation->performance
                            .blocking_stylesheet_continuation_rules_before,
                        engine_views->navigation->performance
@@ -7438,6 +7448,7 @@ int main(int argc, char *argv[])
         psp_text_input_present, NULL);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     process.text_input.validation_poll = psp_input_script_text_frame;
+    process.text_input.validation_finished = psp_input_script_report_pending;
 #endif
     psp_text_input_set_profile(&process.text_input, browser.profile);
     psp_text_input_set_danzeff_enabled(

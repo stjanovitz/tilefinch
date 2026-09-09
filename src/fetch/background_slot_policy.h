@@ -11,6 +11,38 @@
 #define FETCH_BACKGROUND_RESPONSE_COOKIE_BYTES (16u * 1024u)
 #define FETCH_BACKGROUND_STREAM_PUBLICATION_MAX (48u * 1024u)
 
+/* Credit only the idle-progress clock while another connection monopolizes
+   the shared worker. The absolute request deadline remains unchanged. */
+static inline uint64_t fetch_background_progress_after_setup(
+    uint64_t last_progress, uint64_t setup_start, uint64_t setup_end)
+{
+    if (setup_end <= setup_start || last_progress >= setup_end)
+        return last_progress;
+    if (last_progress > setup_start) return setup_end;
+    return setup_end - (setup_start - last_progress);
+}
+
+/* Only transport-owned time is eligible for a transport timeout. A published
+   chunk belongs to the consumer, even before curl asks to write again. */
+static inline bool fetch_background_deadline_eligible(
+    bool transfer_done, bool curl_paused, uint64_t pause_started_us)
+{
+    return !transfer_done && !curl_paused && pause_started_us == 0;
+}
+
+static inline void fetch_background_end_consumer_pause(
+    uint64_t now_us, uint64_t *pause_started_us,
+    uint64_t *deadline_us, uint64_t *last_progress_us)
+{
+    if (*pause_started_us == 0) return;
+    uint64_t elapsed = now_us >= *pause_started_us
+        ? now_us - *pause_started_us : 0;
+    *deadline_us = elapsed > UINT64_MAX - *deadline_us
+        ? UINT64_MAX : *deadline_us + elapsed;
+    *last_progress_us = now_us;
+    *pause_started_us = 0;
+}
+
 typedef enum {
     FETCH_BACKGROUND_COOKIE_CAPTURED = 0,
     FETCH_BACKGROUND_COOKIE_TRUNCATED,

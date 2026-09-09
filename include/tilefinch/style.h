@@ -2033,6 +2033,14 @@ typedef struct {
     uint32_t relative_selector_cache_epoch;
     StyleRelativeSelectorCacheEntry relative_selector_cache[
         STYLE_RELATIVE_SELECTOR_CACHE_CAPACITY];
+    /* Inline <style> elements this sheet has ingested, in cascade order, so
+       navigation can append a later-inserted <style> without a rebuild.
+       Bounded-out means "unknown": every later insertion rebuilds. */
+#define STYLE_SOURCE_NODE_LIMIT 48u
+    const lxb_dom_node_t *style_source_nodes[STYLE_SOURCE_NODE_LIMIT];
+    unsigned style_source_first_order[STYLE_SOURCE_NODE_LIMIT];
+    uint8_t style_source_count;
+    bool style_sources_bounded_out;
 } Stylesheet;
 
 bool stylesheet_build(Stylesheet *sheet, Budget *budget,
@@ -2106,6 +2114,40 @@ bool stylesheet_parsed_ir_matches(
 bool stylesheet_append_style_elements(
     Stylesheet *sheet, lxb_dom_node_t *const *elements, size_t count,
     const TilefinchContentSecurityPolicy *content_security_policy);
+/* stylesheet_append_style_elements plus the bookkeeping a retained layout
+   needs to survive the append in place: `remap` translates every prior rule
+   index to its index after the cascade re-sort (NULL when that could not be
+   established), `appended` lists the new rules' indices (bounded; a
+   bounded-out result means "unknown"), and `context_changed` reports a
+   parse-context signature move (variables, layers, fonts). */
+#define STYLESHEET_APPEND_RULE_LIMIT 64u
+typedef struct {
+    uint16_t *remap;
+    size_t old_count;
+    uint32_t appended[STYLESHEET_APPEND_RULE_LIMIT];
+    size_t appended_count;
+    bool appended_bounded_out;
+    bool context_changed;
+} StylesheetAppendResult;
+/* `after_source` is the number of already ingested inline sources that
+   precede `elements` in document order: the new rules take their cascade
+   position there, later rules move up, and the retained lists are told
+   the translation. */
+bool stylesheet_append_style_elements_tracked(
+    Stylesheet *sheet, lxb_dom_node_t *const *elements, size_t count,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    size_t after_source, StylesheetAppendResult *result);
+size_t stylesheet_style_source_count(const Stylesheet *sheet);
+void stylesheet_append_result_release(Stylesheet *sheet,
+                                      StylesheetAppendResult *result);
+bool stylesheet_style_source_known(const Stylesheet *sheet,
+                                   const lxb_dom_node_t *element);
+const lxb_dom_node_t *stylesheet_last_style_source(const Stylesheet *sheet);
+/* Whether a class/id change with these token hashes could change which
+   elements match a rule able to affect display/visibility or supply an
+   image; true whenever the rule filters cannot bound that. */
+bool stylesheet_tokens_may_affect_discovery(
+    const Stylesheet *sheet, const uint32_t *hashes, size_t count);
 /* State which can change how a subsequently parsed stylesheet compiles.
    Incremental appenders compare this before/after their suffix and discard
    the fast path if variables, layer ordering, or web-font namespaces moved. */
@@ -2199,6 +2241,13 @@ bool stylesheet_serialize_grid_template_tracks(
 uint32_t stylesheet_border_color(
     const Stylesheet *sheet, const ComputedStyle *style,
     StyleBorderSide side, uint8_t *alpha);
+/* Image discovery support: whether a ::before/::after rule that can change
+   display/visibility or supply an image (background, mask, generated
+   content, deferred declarations) matches `node`. Returns true (resolve the
+   pseudo-elements normally) whenever the rule index cannot bound the
+   candidates. */
+bool style_node_pseudo_rules_may_affect_discovery(const Stylesheet *sheet,
+                                                  lxb_dom_node_t *node);
 ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
                              const ComputedStyle *parent);
 /*
@@ -2215,6 +2264,19 @@ bool style_focus_change_is_outline_only(
    :has(), including a changed class/id token outside the relative selector.
    The caller supplies both values before mutating the DOM so removals are
    classified as precisely as additions. */
+/* Hash of one class (`id` false) or id (`id` true) token, as used by the
+   relational rule filters and by journaled attribute changes. */
+uint32_t stylesheet_identity_token_hash(bool id, const char *text,
+                                        size_t length);
+/* For a class or id attribute change with exact before/after values, write
+   the hashes of the classes/ids that changed (absent and empty values are
+   equivalent) and return true. Returns false for other attributes and when
+   more than `capacity` tokens changed: those stay conservative. */
+bool stylesheet_attribute_change_tokens(
+    const char *name, size_t name_length,
+    const char *old_value, size_t old_length,
+    const char *new_value, size_t new_length, uint32_t *hashes,
+    size_t capacity, size_t *count);
 bool stylesheet_attribute_change_may_affect_has(
     const Stylesheet *sheet, const char *name, size_t name_length,
     const char *old_value, size_t old_length,

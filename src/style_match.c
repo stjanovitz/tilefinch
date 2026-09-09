@@ -256,17 +256,75 @@ static bool attribute_span_equal_case(const char *actual,
     return true;
 }
 
+typedef enum {
+    ATTRIBUTE_EXACT,
+    ATTRIBUTE_WORD,
+    ATTRIBUTE_PREFIX,
+    ATTRIBUTE_SUFFIX,
+    ATTRIBUTE_SUBSTRING,
+    ATTRIBUTE_DASH
+} AttributeOperator;
+
+/* The one attribute-value comparison shared by the string matcher and the
+   compiled attribute instructions. `wanted` is the decoded selector value. */
+static bool attribute_value_matches(AttributeOperator operator,
+                                    const char *actual, size_t value_length,
+                                    const char *wanted, size_t wanted_length,
+                                    bool case_insensitive)
+{
+#define ATTRIBUTE_SPAN_EQUAL(actual_at, wanted_at, count) \
+    attribute_span_equal_case((actual_at), (wanted_at), (count), \
+                              case_insensitive)
+    if (operator == ATTRIBUTE_WORD) {
+        if (wanted_length == 0) return false;
+        for (size_t word = 0; word < value_length;) {
+            while (word < value_length
+                   && isspace((unsigned char) actual[word])) word++;
+            size_t end = word;
+            while (end < value_length
+                   && !isspace((unsigned char) actual[end])) end++;
+            if (end - word == wanted_length
+                && ATTRIBUTE_SPAN_EQUAL(
+                    actual + word, wanted, wanted_length)) return true;
+            word = end;
+        }
+        return false;
+    }
+    switch (operator) {
+    case ATTRIBUTE_EXACT:
+        return value_length == wanted_length
+               && ATTRIBUTE_SPAN_EQUAL(actual, wanted, wanted_length);
+    case ATTRIBUTE_PREFIX:
+        return wanted_length != 0 && value_length >= wanted_length
+               && ATTRIBUTE_SPAN_EQUAL(actual, wanted, wanted_length);
+    case ATTRIBUTE_SUFFIX:
+        return wanted_length != 0 && value_length >= wanted_length
+               && ATTRIBUTE_SPAN_EQUAL(
+                   actual + value_length - wanted_length,
+                   wanted, wanted_length);
+    case ATTRIBUTE_SUBSTRING:
+        if (wanted_length == 0 || value_length < wanted_length) return false;
+        for (size_t i = 0; i <= value_length - wanted_length; i++) {
+            if (ATTRIBUTE_SPAN_EQUAL(
+                    actual + i, wanted, wanted_length)) return true;
+        }
+        return false;
+    case ATTRIBUTE_DASH:
+        return wanted_length != 0 && value_length >= wanted_length
+               && ATTRIBUTE_SPAN_EQUAL(actual, wanted, wanted_length)
+               && (value_length == wanted_length
+                   || actual[wanted_length] == '-');
+    case ATTRIBUTE_WORD:
+        return false;
+    }
+    return false;
+#undef ATTRIBUTE_SPAN_EQUAL
+}
+
 static bool attribute_matches(lxb_dom_node_t *node, const char *text,
                               size_t length)
 {
-    enum AttributeOperator {
-        ATTRIBUTE_EXACT,
-        ATTRIBUTE_WORD,
-        ATTRIBUTE_PREFIX,
-        ATTRIBUTE_SUFFIX,
-        ATTRIBUTE_SUBSTRING,
-        ATTRIBUTE_DASH
-    } operator = ATTRIBUTE_EXACT;
+    AttributeOperator operator = ATTRIBUTE_EXACT;
     trim(&text, &length);
     size_t name_end = skip_selector_identifier(text, length, 0);
     if (name_end == 0) return false;
@@ -336,54 +394,8 @@ static bool attribute_matches(lxb_dom_node_t *node, const char *text,
             text + wanted_start, wanted_source_length,
             wanted, sizeof(wanted), &wanted_length)) return false;
 
-#define ATTRIBUTE_SPAN_EQUAL(actual_at, wanted_at, count) \
-    attribute_span_equal_case((actual_at), (wanted_at), (count), \
-                              case_insensitive)
-
-    if (operator == ATTRIBUTE_WORD) {
-        if (wanted_length == 0) return false;
-        for (size_t word = 0; word < value_length;) {
-            while (word < value_length
-                   && isspace((unsigned char) actual[word])) word++;
-            size_t end = word;
-            while (end < value_length
-                   && !isspace((unsigned char) actual[end])) end++;
-            if (end - word == wanted_length
-                && ATTRIBUTE_SPAN_EQUAL(
-                    actual + word, wanted, wanted_length)) return true;
-            word = end;
-        }
-        return false;
-    }
-    switch (operator) {
-    case ATTRIBUTE_EXACT:
-        return value_length == wanted_length
-               && ATTRIBUTE_SPAN_EQUAL(actual, wanted, wanted_length);
-    case ATTRIBUTE_PREFIX:
-        return wanted_length != 0 && value_length >= wanted_length
-               && ATTRIBUTE_SPAN_EQUAL(actual, wanted, wanted_length);
-    case ATTRIBUTE_SUFFIX:
-        return wanted_length != 0 && value_length >= wanted_length
-               && ATTRIBUTE_SPAN_EQUAL(
-                   actual + value_length - wanted_length,
-                   wanted, wanted_length);
-    case ATTRIBUTE_SUBSTRING:
-        if (wanted_length == 0 || value_length < wanted_length) return false;
-        for (size_t i = 0; i <= value_length - wanted_length; i++) {
-            if (ATTRIBUTE_SPAN_EQUAL(
-                    actual + i, wanted, wanted_length)) return true;
-        }
-        return false;
-    case ATTRIBUTE_DASH:
-        return wanted_length != 0 && value_length >= wanted_length
-               && ATTRIBUTE_SPAN_EQUAL(actual, wanted, wanted_length)
-               && (value_length == wanted_length
-                   || actual[wanted_length] == '-');
-    case ATTRIBUTE_WORD:
-        return false;
-    }
-#undef ATTRIBUTE_SPAN_EQUAL
-    return false;
+    return attribute_value_matches(operator, actual, value_length,
+                                   wanted, wanted_length, case_insensitive);
 }
 
 static bool style_selector_matches_internal(
@@ -488,43 +500,11 @@ static bool custom_element_navigation_fallback_is_authoritative(
     return false;
 }
 
-typedef enum {
-    STYLE_PSEUDO_UNKNOWN,
-    STYLE_PSEUDO_INTERACTIVE,
-    STYLE_PSEUDO_FOCUS,
-    STYLE_PSEUDO_FOCUS_WITHIN,
-    STYLE_PSEUDO_FULLSCREEN,
-    STYLE_PSEUDO_ROOT,
-    STYLE_PSEUDO_SCOPE,
-    STYLE_PSEUDO_DEFINED,
-    STYLE_PSEUDO_FIRST,
-    STYLE_PSEUDO_LAST,
-    STYLE_PSEUDO_FIRST_TYPE,
-    STYLE_PSEUDO_LAST_TYPE,
-    STYLE_PSEUDO_ONLY_CHILD,
-    STYLE_PSEUDO_ONLY_TYPE,
-    STYLE_PSEUDO_EMPTY,
-    STYLE_PSEUDO_NOT,
-    STYLE_PSEUDO_IS,
-    STYLE_PSEUDO_HAS,
-    STYLE_PSEUDO_DISABLED,
-    STYLE_PSEUDO_ENABLED,
-    STYLE_PSEUDO_CHECKED,
-    STYLE_PSEUDO_REQUIRED,
-    STYLE_PSEUDO_OPTIONAL,
-    STYLE_PSEUDO_LINK,
-    STYLE_PSEUDO_OPEN,
-    STYLE_PSEUDO_MODAL,
-    STYLE_PSEUDO_POPOVER_OPEN,
-    STYLE_PSEUDO_NTH_CHILD,
-    STYLE_PSEUDO_NTH_TYPE,
-    STYLE_PSEUDO_NTH_LAST_CHILD,
-    STYLE_PSEUDO_NTH_LAST_TYPE,
-} StylePseudoKind;
+
 
 /* Classify once, testing only names of the same length. Candidate matching
    must not run every pseudo-class's string comparisons and state queries. */
-static StylePseudoKind style_pseudo_kind(const char *text, size_t length)
+StylePseudoKind style_pseudo_kind(const char *text, size_t length)
 {
     switch (length) {
     case 2:
@@ -1058,6 +1038,171 @@ static size_t filtered_sibling_index(
     return index;
 }
 
+/* Pseudo-classes that take no argument, evaluated identically by the
+   string matcher and the compiled STYLE_SELECTOR_PSEUDO instruction. The
+   caller has already rejected unknown and interactive kinds. */
+static bool simple_pseudo_matches(const Stylesheet *sheet,
+                                  lxb_dom_node_t *node, StylePseudoKind kind,
+                                  const lxb_dom_node_t *scope)
+{
+    bool focus_pseudo = kind == STYLE_PSEUDO_FOCUS;
+    bool focus_within_pseudo = kind == STYLE_PSEUDO_FOCUS_WITHIN;
+    bool fullscreen_pseudo = kind == STYLE_PSEUDO_FULLSCREEN;
+    bool root_pseudo = kind == STYLE_PSEUDO_ROOT;
+    bool scope_pseudo = kind == STYLE_PSEUDO_SCOPE;
+    bool defined_pseudo = kind == STYLE_PSEUDO_DEFINED;
+    bool first_pseudo = kind == STYLE_PSEUDO_FIRST;
+    bool last_pseudo = kind == STYLE_PSEUDO_LAST;
+    bool first_type_pseudo = kind == STYLE_PSEUDO_FIRST_TYPE;
+    bool last_type_pseudo = kind == STYLE_PSEUDO_LAST_TYPE;
+    bool only_child_pseudo = kind == STYLE_PSEUDO_ONLY_CHILD;
+    bool only_type_pseudo = kind == STYLE_PSEUDO_ONLY_TYPE;
+    bool empty_pseudo = kind == STYLE_PSEUDO_EMPTY;
+    bool disabled_pseudo = kind == STYLE_PSEUDO_DISABLED;
+    bool enabled_pseudo = kind == STYLE_PSEUDO_ENABLED;
+    bool checked_pseudo = kind == STYLE_PSEUDO_CHECKED;
+    bool required_pseudo = kind == STYLE_PSEUDO_REQUIRED;
+    bool optional_pseudo = kind == STYLE_PSEUDO_OPTIONAL;
+    bool link_pseudo = kind == STYLE_PSEUDO_LINK;
+    bool open_pseudo = kind == STYLE_PSEUDO_OPEN;
+    bool modal_pseudo = kind == STYLE_PSEUDO_MODAL;
+    bool popover_open_pseudo = kind == STYLE_PSEUDO_POPOVER_OPEN;
+    if (focus_pseudo
+        && !lxb_dom_element_has_attribute(
+            lxb_dom_interface_element(node),
+            (const lxb_char_t *) "data-tilefinch-focus",
+            sizeof("data-tilefinch-focus") - 1)) {
+        return false;
+    }
+    if (focus_within_pseudo
+        && !node_or_descendant_has_focus(node)) return false;
+    if (fullscreen_pseudo
+        && (sheet == NULL || sheet->fullscreen_node != node)) {
+        return false;
+    }
+    if (root_pseudo) {
+        size_t node_length = 0;
+        const char *node_name = document_element_name(node, &node_length);
+        if (node_name == NULL || !span_equal(node_name, node_length, "html")) return false;
+    }
+    if (scope_pseudo) {
+        if (scope != NULL) {
+            if (node != scope) return false;
+        } else {
+            size_t node_length = 0;
+            const char *node_name =
+                document_element_name(node, &node_length);
+            if (node_name == NULL
+                || !span_equal(node_name, node_length, "html")) {
+                return false;
+            }
+        }
+    }
+    if (defined_pseudo) {
+        lxb_dom_element_t *element = lxb_dom_interface_element(node);
+        bool built_in = node->local_name >= LXB_TAG__BEGIN
+                        && node->local_name < LXB_TAG__LAST_ENTRY;
+        if (!built_in && element->custom_state
+                   != LXB_DOM_ELEMENT_CUSTOM_STATE_CUSTOM) {
+            return false;
+        }
+    }
+    if (first_pseudo) {
+        for (lxb_dom_node_t *sibling = node->prev; sibling != NULL;
+             sibling = sibling->prev) {
+            if (sibling->type == LXB_DOM_NODE_TYPE_ELEMENT) return false;
+        }
+    }
+    if (last_pseudo) {
+        for (lxb_dom_node_t *sibling = node->next; sibling != NULL;
+             sibling = sibling->next) {
+            if (sibling->type == LXB_DOM_NODE_TYPE_ELEMENT) return false;
+        }
+    }
+    if ((first_type_pseudo || only_type_pseudo)
+        && element_sibling_index(node, true, false) != 1) return false;
+    if ((last_type_pseudo || only_type_pseudo)
+        && element_sibling_index(node, true, true) != 1) return false;
+    if (only_child_pseudo
+        && (element_sibling_index(node, false, false) != 1
+            || element_sibling_index(node, false, true) != 1)) {
+        return false;
+    }
+    if (disabled_pseudo || enabled_pseudo) {
+        STYLE_SELECTOR_COUNT(sheet, selector_pseudo_state_checks, 1);
+        bool form_control = style_tag_is(node, "button")
+            || style_tag_is(node, "input")
+            || style_tag_is(node, "select")
+            || style_tag_is(node, "textarea")
+            || style_tag_is(node, "option")
+            || style_tag_is(node, "optgroup")
+            || style_tag_is(node, "fieldset");
+        bool disableable = form_control
+                           && style_node_effectively_disabled(node);
+        if (disabled_pseudo && !disableable) return false;
+        if (enabled_pseudo && (!form_control || disableable)) return false;
+    }
+    if (required_pseudo || optional_pseudo) {
+        STYLE_SELECTOR_COUNT(sheet, selector_pseudo_state_checks, 1);
+        bool requireable = style_tag_is(node, "input")
+            || style_tag_is(node, "select")
+            || style_tag_is(node, "textarea");
+        bool required = requireable
+            && lxb_dom_element_has_attribute(
+                   lxb_dom_interface_element(node),
+                   (const lxb_char_t *) "required", 8);
+        if (required_pseudo && !required) return false;
+        if (optional_pseudo && (!requireable || required)) return false;
+    }
+    if (checked_pseudo
+        && !((style_tag_is(node, "input")
+              && lxb_dom_element_has_attribute(
+                     lxb_dom_interface_element(node),
+                     (const lxb_char_t *) "checked", 7))
+             || (style_tag_is(node, "option")
+                 && lxb_dom_element_has_attribute(
+                        lxb_dom_interface_element(node),
+                        (const lxb_char_t *) "selected", 8)))) {
+        return false;
+    }
+    if (link_pseudo
+        && (!(style_tag_is(node, "a") || style_tag_is(node, "area"))
+            || !lxb_dom_element_has_attribute(
+                   lxb_dom_interface_element(node),
+                   (const lxb_char_t *) "href", 4))) return false;
+    if (open_pseudo || modal_pseudo || popover_open_pseudo) {
+        STYLE_SELECTOR_COUNT(sheet, selector_pseudo_state_checks, 1);
+        bool has_open = lxb_dom_element_has_attribute(
+            lxb_dom_interface_element(node),
+            (const lxb_char_t *) "open", 4);
+        bool has_modal = lxb_dom_element_has_attribute(
+            lxb_dom_interface_element(node),
+            (const lxb_char_t *) "data-tilefinch-modal",
+            sizeof("data-tilefinch-modal") - 1);
+        bool has_popover_open = lxb_dom_element_has_attribute(
+            lxb_dom_interface_element(node),
+            (const lxb_char_t *) "data-tilefinch-popover-open",
+            sizeof("data-tilefinch-popover-open") - 1);
+        if (open_pseudo && !(has_open || has_popover_open)) return false;
+        if (modal_pseudo && !(style_tag_is(node, "dialog") && has_open
+                              && has_modal)) return false;
+        if (popover_open_pseudo && !has_popover_open) return false;
+    }
+    if (empty_pseudo) {
+        for (lxb_dom_node_t *child = node->first_child;
+             child != NULL; child = child->next) {
+            if (child->type == LXB_DOM_NODE_TYPE_ELEMENT) return false;
+            if (child->type == LXB_DOM_NODE_TYPE_TEXT) {
+                size_t child_length = 0;
+                const char *child_text = document_text_data(
+                    child, &child_length);
+                if (child_text != NULL && child_length != 0) return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool compound_matches_depth(
     const Stylesheet *sheet, lxb_dom_node_t *node,
     const char *text, size_t length, unsigned functional_depth,
@@ -1147,168 +1292,14 @@ static bool compound_matches_depth(
             if (kind == STYLE_PSEUDO_UNKNOWN || kind == STYLE_PSEUDO_INTERACTIVE) {
                 return false;
             }
-            bool focus_pseudo = kind == STYLE_PSEUDO_FOCUS;
-            bool focus_within_pseudo = kind == STYLE_PSEUDO_FOCUS_WITHIN;
-            bool fullscreen_pseudo = kind == STYLE_PSEUDO_FULLSCREEN;
-            bool root_pseudo = kind == STYLE_PSEUDO_ROOT;
-            bool scope_pseudo = kind == STYLE_PSEUDO_SCOPE;
-            bool defined_pseudo = kind == STYLE_PSEUDO_DEFINED;
-            bool first_pseudo = kind == STYLE_PSEUDO_FIRST;
-            bool last_pseudo = kind == STYLE_PSEUDO_LAST;
-            bool first_type_pseudo = kind == STYLE_PSEUDO_FIRST_TYPE;
-            bool last_type_pseudo = kind == STYLE_PSEUDO_LAST_TYPE;
-            bool only_child_pseudo = kind == STYLE_PSEUDO_ONLY_CHILD;
-            bool only_type_pseudo = kind == STYLE_PSEUDO_ONLY_TYPE;
-            bool empty_pseudo = kind == STYLE_PSEUDO_EMPTY;
+            if (!simple_pseudo_matches(sheet, node, kind, scope)) return false;
             bool not_pseudo = kind == STYLE_PSEUDO_NOT;
             bool is_pseudo = kind == STYLE_PSEUDO_IS;
             bool has_pseudo = kind == STYLE_PSEUDO_HAS;
-            bool disabled_pseudo = kind == STYLE_PSEUDO_DISABLED;
-            bool enabled_pseudo = kind == STYLE_PSEUDO_ENABLED;
-            bool checked_pseudo = kind == STYLE_PSEUDO_CHECKED;
-            bool required_pseudo = kind == STYLE_PSEUDO_REQUIRED;
-            bool optional_pseudo = kind == STYLE_PSEUDO_OPTIONAL;
-            bool link_pseudo = kind == STYLE_PSEUDO_LINK;
-            bool open_pseudo = kind == STYLE_PSEUDO_OPEN;
-            bool modal_pseudo = kind == STYLE_PSEUDO_MODAL;
-            bool popover_open_pseudo = kind == STYLE_PSEUDO_POPOVER_OPEN;
             bool nth_child_pseudo = kind == STYLE_PSEUDO_NTH_CHILD;
             bool nth_type_pseudo = kind == STYLE_PSEUDO_NTH_TYPE;
             bool nth_last_child_pseudo = kind == STYLE_PSEUDO_NTH_LAST_CHILD;
             bool nth_last_type_pseudo = kind == STYLE_PSEUDO_NTH_LAST_TYPE;
-            if (focus_pseudo
-                && !lxb_dom_element_has_attribute(
-                    lxb_dom_interface_element(node),
-                    (const lxb_char_t *) "data-tilefinch-focus",
-                    sizeof("data-tilefinch-focus") - 1)) {
-                return false;
-            }
-            if (focus_within_pseudo
-                && !node_or_descendant_has_focus(node)) return false;
-            if (fullscreen_pseudo
-                && (sheet == NULL || sheet->fullscreen_node != node)) {
-                return false;
-            }
-            if (root_pseudo) {
-                size_t node_length = 0;
-                const char *node_name = document_element_name(node, &node_length);
-                if (node_name == NULL || !span_equal(node_name, node_length, "html")) return false;
-            }
-            if (scope_pseudo) {
-                if (scope != NULL) {
-                    if (node != scope) return false;
-                } else {
-                    size_t node_length = 0;
-                    const char *node_name =
-                        document_element_name(node, &node_length);
-                    if (node_name == NULL
-                        || !span_equal(node_name, node_length, "html")) {
-                        return false;
-                    }
-                }
-            }
-            if (defined_pseudo) {
-                lxb_dom_element_t *element = lxb_dom_interface_element(node);
-                bool built_in = node->local_name >= LXB_TAG__BEGIN
-                                && node->local_name < LXB_TAG__LAST_ENTRY;
-                if (!built_in && element->custom_state
-                           != LXB_DOM_ELEMENT_CUSTOM_STATE_CUSTOM) {
-                    return false;
-                }
-            }
-            if (first_pseudo) {
-                for (lxb_dom_node_t *sibling = node->prev; sibling != NULL;
-                     sibling = sibling->prev) {
-                    if (sibling->type == LXB_DOM_NODE_TYPE_ELEMENT) return false;
-                }
-            }
-            if (last_pseudo) {
-                for (lxb_dom_node_t *sibling = node->next; sibling != NULL;
-                     sibling = sibling->next) {
-                    if (sibling->type == LXB_DOM_NODE_TYPE_ELEMENT) return false;
-                }
-            }
-            if ((first_type_pseudo || only_type_pseudo)
-                && element_sibling_index(node, true, false) != 1) return false;
-            if ((last_type_pseudo || only_type_pseudo)
-                && element_sibling_index(node, true, true) != 1) return false;
-            if (only_child_pseudo
-                && (element_sibling_index(node, false, false) != 1
-                    || element_sibling_index(node, false, true) != 1)) {
-                return false;
-            }
-            if (disabled_pseudo || enabled_pseudo) {
-                STYLE_SELECTOR_COUNT(sheet, selector_pseudo_state_checks, 1);
-                bool form_control = style_tag_is(node, "button")
-                    || style_tag_is(node, "input")
-                    || style_tag_is(node, "select")
-                    || style_tag_is(node, "textarea")
-                    || style_tag_is(node, "option")
-                    || style_tag_is(node, "optgroup")
-                    || style_tag_is(node, "fieldset");
-                bool disableable = form_control
-                                   && style_node_effectively_disabled(node);
-                if (disabled_pseudo && !disableable) return false;
-                if (enabled_pseudo && (!form_control || disableable)) return false;
-            }
-            if (required_pseudo || optional_pseudo) {
-                STYLE_SELECTOR_COUNT(sheet, selector_pseudo_state_checks, 1);
-                bool requireable = style_tag_is(node, "input")
-                    || style_tag_is(node, "select")
-                    || style_tag_is(node, "textarea");
-                bool required = requireable
-                    && lxb_dom_element_has_attribute(
-                           lxb_dom_interface_element(node),
-                           (const lxb_char_t *) "required", 8);
-                if (required_pseudo && !required) return false;
-                if (optional_pseudo && (!requireable || required)) return false;
-            }
-            if (checked_pseudo
-                && !((style_tag_is(node, "input")
-                      && lxb_dom_element_has_attribute(
-                             lxb_dom_interface_element(node),
-                             (const lxb_char_t *) "checked", 7))
-                     || (style_tag_is(node, "option")
-                         && lxb_dom_element_has_attribute(
-                                lxb_dom_interface_element(node),
-                                (const lxb_char_t *) "selected", 8)))) {
-                return false;
-            }
-            if (link_pseudo
-                && (!(style_tag_is(node, "a") || style_tag_is(node, "area"))
-                    || !lxb_dom_element_has_attribute(
-                           lxb_dom_interface_element(node),
-                           (const lxb_char_t *) "href", 4))) return false;
-            if (open_pseudo || modal_pseudo || popover_open_pseudo) {
-                STYLE_SELECTOR_COUNT(sheet, selector_pseudo_state_checks, 1);
-                bool has_open = lxb_dom_element_has_attribute(
-                    lxb_dom_interface_element(node),
-                    (const lxb_char_t *) "open", 4);
-                bool has_modal = lxb_dom_element_has_attribute(
-                    lxb_dom_interface_element(node),
-                    (const lxb_char_t *) "data-tilefinch-modal",
-                    sizeof("data-tilefinch-modal") - 1);
-                bool has_popover_open = lxb_dom_element_has_attribute(
-                    lxb_dom_interface_element(node),
-                    (const lxb_char_t *) "data-tilefinch-popover-open",
-                    sizeof("data-tilefinch-popover-open") - 1);
-                if (open_pseudo && !(has_open || has_popover_open)) return false;
-                if (modal_pseudo && !(style_tag_is(node, "dialog") && has_open
-                                      && has_modal)) return false;
-                if (popover_open_pseudo && !has_popover_open) return false;
-            }
-            if (empty_pseudo) {
-                for (lxb_dom_node_t *child = node->first_child;
-                     child != NULL; child = child->next) {
-                    if (child->type == LXB_DOM_NODE_TYPE_ELEMENT) return false;
-                    if (child->type == LXB_DOM_NODE_TYPE_TEXT) {
-                        size_t child_length = 0;
-                        const char *child_text = document_text_data(
-                            child, &child_length);
-                        if (child_text != NULL && child_length != 0) return false;
-                    }
-                }
-            }
             at = end;
             bool nth_pseudo = nth_child_pseudo || nth_type_pseudo
                               || nth_last_child_pseudo
@@ -1593,12 +1584,25 @@ static bool style_selector_program_matches_uncached(
         style_match_subject_prepare(node, &local_subject);
         subject = &local_subject;
     }
+    const char *attribute_value = "";
+    size_t attribute_value_length = 0;
+    bool attribute_loaded = false;
     while (instruction < sheet->selector_program_instruction_count) {
         const StyleSelectorInstruction *op =
             &sheet->selector_program[instruction++];
         if (op->opcode == STYLE_SELECTOR_TAG_ID) {
             STYLE_SELECTOR_COUNT(sheet, selector_tag_id_checks, 1);
             if (subject->tag_id != (uintptr_t) op->text_offset) return false;
+            continue;
+        }
+        /* Pseudo instructions hold an enum, not a selector byte offset.
+           Handle it before forming any pointer into the selector string. */
+        if (op->opcode == STYLE_SELECTOR_PSEUDO) {
+            STYLE_SELECTOR_COUNT(sheet, selector_pseudo_checks, 1);
+            StylePseudoKind kind = (StylePseudoKind) op->text_offset;
+            if (kind == STYLE_PSEUDO_UNKNOWN
+                || kind == STYLE_PSEUDO_INTERACTIVE
+                || !simple_pseudo_matches(sheet, node, kind, NULL)) return false;
             continue;
         }
         const char *wanted = rule->selector + op->text_offset;
@@ -1624,6 +1628,39 @@ static bool style_selector_program_matches_uncached(
                 || memcmp(subject->id, wanted, wanted_length) != 0) {
                 return false;
             }
+            continue;
+        }
+        if (op->opcode == STYLE_SELECTOR_ATTRIBUTE_PRESENT) {
+            if (!lxb_dom_element_has_attribute(
+                    lxb_dom_interface_element(node),
+                    (const lxb_char_t *) wanted, wanted_length)) return false;
+            continue;
+        }
+        if (op->opcode == STYLE_SELECTOR_ATTRIBUTE_NAME) {
+            char name[64];
+            if (wanted_length >= sizeof(name)
+                || !lxb_dom_element_has_attribute(
+                       lxb_dom_interface_element(node),
+                       (const lxb_char_t *) wanted, wanted_length)) {
+                return false;
+            }
+            memcpy(name, wanted, wanted_length);
+            name[wanted_length] = '\0';
+            attribute_value_length = 0;
+            attribute_value = document_attribute(
+                node, name, &attribute_value_length);
+            if (attribute_value == NULL) attribute_value = "";
+            attribute_loaded = true;
+            continue;
+        }
+        if (op->opcode >= STYLE_SELECTOR_ATTRIBUTE_EXACT
+            && op->opcode <= STYLE_SELECTOR_ATTRIBUTE_DASH) {
+            if (!attribute_loaded
+                || !attribute_value_matches(
+                       (AttributeOperator) (op->opcode
+                                            - STYLE_SELECTOR_ATTRIBUTE_EXACT),
+                       attribute_value, attribute_value_length,
+                       wanted, wanted_length, false)) return false;
             continue;
         }
         if (op->opcode == STYLE_SELECTOR_COMPOUND) {

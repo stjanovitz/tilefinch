@@ -11,6 +11,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <lexbor/tag/tag.h>
+
 #include "tilefinch/platform.h"
 
 #define STYLE_VARIABLE_CACHE_DEFAULT_ENTRIES 256u
@@ -44,6 +46,7 @@ typedef struct {
     unsigned char *data;
     size_t length;
     size_t capacity;
+    size_t maximum_length;
     size_t operation_count;
     bool eligible;
     bool has_motion_keyframes;
@@ -79,10 +82,18 @@ typedef struct {
 static void selector_assign_fast_key(StyleRule *rule, const char *text,
                                      size_t length);
 
+static void style_parsed_ir_builder_discard(StyleParsedIrBuilder *builder)
+{
+    builder->eligible = false;
+    budget_free(builder->budget, builder->data);
+    builder->data = NULL;
+    builder->capacity = 0;
+}
+
 static void style_parsed_ir_builder_disqualify(StyleCssParseContext *context)
 {
     if (context != NULL && context->parsed_ir != NULL) {
-        context->parsed_ir->eligible = false;
+        style_parsed_ir_builder_discard(context->parsed_ir);
     }
 }
 
@@ -100,24 +111,28 @@ static bool style_parsed_ir_builder_record(
         || sizeof(StyleParsedIrOperation) > SIZE_MAX - selector_length
         || sizeof(StyleParsedIrOperation) + selector_length
                > SIZE_MAX - declaration_length) {
-        builder->eligible = false;
+        style_parsed_ir_builder_discard(builder);
         return true;
     }
     size_t added = sizeof(StyleParsedIrOperation) + selector_length
         + declaration_length;
-    if (added > STYLE_PARSED_IR_MAX_BYTES - builder->length) {
-        builder->eligible = false;
+    if (builder->length > builder->maximum_length
+        || added > builder->maximum_length - builder->length) {
+        style_parsed_ir_builder_discard(builder);
         return true;
     }
     size_t required = builder->length + added;
     if (required > builder->capacity) {
         size_t capacity = builder->capacity == 0 ? 4096u
             : builder->capacity;
+        if (capacity > builder->maximum_length) {
+            capacity = builder->maximum_length;
+        }
         while (capacity < required) {
-            size_t next = capacity > STYLE_PARSED_IR_MAX_BYTES / 2u
-                ? STYLE_PARSED_IR_MAX_BYTES : capacity * 2u;
+            size_t next = capacity > builder->maximum_length / 2u
+                ? builder->maximum_length : capacity * 2u;
             if (next <= capacity) {
-                builder->eligible = false;
+                style_parsed_ir_builder_discard(builder);
                 return true;
             }
             capacity = next;
@@ -125,7 +140,7 @@ static bool style_parsed_ir_builder_record(
         unsigned char *grown = budget_realloc(
             builder->budget, builder->data, capacity);
         if (grown == NULL) {
-            builder->eligible = false;
+            style_parsed_ir_builder_discard(builder);
             return true;
         }
         builder->data = grown;
@@ -285,13 +300,19 @@ static StyleTokenBloom style_rule_ancestor_bloom(
             break;
         case STYLE_SELECTOR_ADJACENT:
         case STYLE_SELECTOR_GENERAL_SIBLING:
-            /* The remaining left side is not necessarily in the candidate
-               node's ancestor chain, so it cannot safely participate. */
-            return style_token_bloom_empty();
+            /* A sibling itself is not an ancestor, but its parent chain is
+               shared with the node we moved from. Keep already-proven tokens
+               and resume collecting after the next parent/ancestor step. */
+            in_ancestor = false;
+            break;
         case STYLE_SELECTOR_TAG_ID:
             if (in_ancestor) {
-                style_token_bloom_merge(
-                    &bloom, style_compound_tag_id_bloom(op->text_offset));
+                size_t length = 0;
+                const char *name = (const char *) lxb_tag_name_by_id(
+                    op->text_offset, &length);
+                if (name == NULL) return style_token_bloom_empty();
+                style_token_bloom_merge(&bloom, style_compound_token_bloom(
+                    STYLE_SELECTOR_TAG, name, length));
             }
             break;
         case STYLE_SELECTOR_TAG:
@@ -319,6 +340,18 @@ static StyleTokenBloom style_rule_ancestor_bloom(
                 &bloom, style_selector_compound_bloom(
                     rule->selector + op->text_offset, op->text_length));
             break;
+        case STYLE_SELECTOR_ATTRIBUTE_PRESENT:
+        case STYLE_SELECTOR_ATTRIBUTE_NAME:
+        case STYLE_SELECTOR_ATTRIBUTE_EXACT:
+        case STYLE_SELECTOR_ATTRIBUTE_WORD:
+        case STYLE_SELECTOR_ATTRIBUTE_PREFIX:
+        case STYLE_SELECTOR_ATTRIBUTE_SUFFIX:
+        case STYLE_SELECTOR_ATTRIBUTE_SUBSTRING:
+        case STYLE_SELECTOR_ATTRIBUTE_DASH:
+        case STYLE_SELECTOR_PSEUDO:
+            /* Attribute and pseudo-class tests carry no ancestor token,
+               exactly as their text form contributed none. */
+            break;
         case STYLE_SELECTOR_END:
             return bloom;
         default:
@@ -326,6 +359,225 @@ static StyleTokenBloom style_rule_ancestor_bloom(
         }
     }
     return style_token_bloom_empty();
+}
+
+static bool selector_text_has_ci(const char *text, size_t length,
+                                 const char *needle)
+{
+    size_t needle_length = strlen(needle);
+    if (needle_length == 0 || length < needle_length) return false;
+    for (size_t at = 0; at + needle_length <= length; at++) {
+        size_t i = 0;
+        while (i < needle_length
+               && tolower((unsigned char) text[at + i]) == needle[i]) i++;
+        if (i == needle_length) return true;
+    }
+    return false;
+}
+
+static bool attribute_selector_targets_identity(const char *text,
+                                                size_t length)
+{
+    size_t at = 0;
+    while (at < length && isspace((unsigned char) text[at])) at++;
+    size_t begin = at;
+    while (at < length && (isalnum((unsigned char) text[at])
+                           || text[at] == '-' || text[at] == '_')) at++;
+    size_t name_length = at - begin;
+    return (name_length == 5 && strncasecmp(text + begin, "class", 5) == 0)
+           || (name_length == 2 && strncasecmp(text + begin, "id", 2) == 0);
+}
+
+uint32_t stylesheet_identity_token_hash(bool id, const char *text,
+                                        size_t length)
+{
+    uint32_t hash = UINT32_C(2166136261) ^ (id ? UINT32_C(0x23) : UINT32_C(0x2e));
+    hash *= UINT32_C(16777619);
+    for (size_t i = 0; i < length; i++) {
+        hash ^= (unsigned char) text[i];
+        hash *= UINT32_C(16777619);
+    }
+    return hash;
+}
+
+static void relational_tokens_add(StyleRuleFilter *filter, uint32_t hash)
+{
+    for (size_t i = 0; i < filter->relational_count; i++) {
+        if (filter->relational_tokens[i] == hash) return;
+    }
+    if (filter->relational_count == STYLE_RELATIONAL_TOKEN_LIMIT) {
+        filter->relational_opaque = true;
+        return;
+    }
+    filter->relational_tokens[filter->relational_count++] = hash;
+}
+
+static void style_rule_relational_filter(const StyleRule *rule,
+                                         StyleRuleFilter *filter)
+{
+    filter->relational_count = 0;
+    filter->relational_opaque = true;
+    if (rule == NULL || rule->selector == NULL) return;
+    const char *text = rule->selector;
+    size_t length = rule->selector_length;
+    size_t split = rule->rightmost_compound_offset;
+    if (split > length) return;
+    /* :has() makes an element's match depend on its descendants, `of S`
+       nth forms on its siblings' classes, and escaped identifiers cannot be
+       hashed like the live class list. */
+    if (selector_text_has_ci(text, length, ":has(")
+        || memchr(text, '\\', length) != NULL
+        || (selector_text_has_ci(text, length, ":nth-")
+            && selector_text_has_ci(text, length, " of "))) return;
+    filter->relational_opaque = false;
+    unsigned square = 0;
+    unsigned parentheses = 0;
+    char quote = 0;
+    for (size_t at = 0; at < length; at++) {
+        char value = text[at];
+        if (quote != 0) {
+            if (value == quote) quote = 0;
+            continue;
+        }
+        if (square != 0) {
+            if (value == '"' || value == '\'') quote = value;
+            else if (value == ']') square--;
+            continue;
+        }
+        if (value == '[') {
+            square++;
+            if ((at < split || parentheses != 0)
+                && attribute_selector_targets_identity(
+                    text + at + 1u, length - at - 1u)) {
+                filter->relational_opaque = true;
+            }
+            continue;
+        }
+        if (value == '(') { parentheses++; continue; }
+        if (value == ')') {
+            if (parentheses != 0) parentheses--;
+            continue;
+        }
+        /* A rightmost :is()/:where()/:not() can itself contain an ancestor
+           or sibling selector. Its tokens are not local to this element. */
+        if ((value == '.' || value == '#')
+            && (at < split || parentheses != 0)) {
+            size_t begin = at + 1u;
+            size_t end = skip_selector_identifier(text, length, begin);
+            if (end != begin) {
+                relational_tokens_add(filter, stylesheet_identity_token_hash(
+                    value == '#', text + begin, end - begin));
+                at = end - 1u;
+            }
+        }
+    }
+}
+
+size_t stylesheet_rules_affected_by_tokens(
+    const Stylesheet *sheet, const uint32_t *hashes, size_t hash_count,
+    uint32_t *out, size_t capacity)
+{
+    if (sheet == NULL || sheet->rule_filters == NULL || hashes == NULL
+        || out == NULL) return SIZE_MAX;
+    size_t count = 0;
+    for (size_t i = 0; i < sheet->count; i++) {
+        const StyleRuleFilter *filter = &sheet->rule_filters[i];
+        bool affected = filter->relational_opaque;
+        for (size_t r = 0; !affected && r < filter->relational_count; r++) {
+            for (size_t h = 0; !affected && h < hash_count; h++) {
+                affected = filter->relational_tokens[r] == hashes[h];
+            }
+        }
+        if (!affected) continue;
+        if (count == capacity || i > UINT32_MAX) return SIZE_MAX;
+        out[count++] = (uint32_t) i;
+    }
+    return count;
+}
+
+static bool class_list_has_token(const char *list, size_t length,
+                                 const char *token, size_t token_length)
+{
+    size_t at = 0;
+    while (at < length) {
+        while (at < length && isspace((unsigned char) list[at])) at++;
+        size_t begin = at;
+        while (at < length && !isspace((unsigned char) list[at])) at++;
+        if (at - begin == token_length
+            && memcmp(list + begin, token, token_length) == 0) return true;
+    }
+    return false;
+}
+
+static bool change_tokens_add(uint32_t *hashes, size_t capacity,
+                              size_t *count, uint32_t hash)
+{
+    for (size_t i = 0; i < *count; i++) {
+        if (hashes[i] == hash) return true;
+    }
+    if (*count == capacity) return false;
+    hashes[(*count)++] = hash;
+    return true;
+}
+
+static bool class_list_difference_tokens(const char *from, size_t from_length,
+                                         const char *against,
+                                         size_t against_length,
+                                         uint32_t *hashes, size_t capacity,
+                                         size_t *count)
+{
+    size_t at = 0;
+    while (at < from_length) {
+        while (at < from_length && isspace((unsigned char) from[at])) at++;
+        size_t begin = at;
+        while (at < from_length && !isspace((unsigned char) from[at])) at++;
+        if (at != begin
+            && !class_list_has_token(against, against_length,
+                                     from + begin, at - begin)
+            && !change_tokens_add(hashes, capacity, count,
+                                  stylesheet_identity_token_hash(
+                                      false, from + begin, at - begin))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool stylesheet_attribute_change_tokens(
+    const char *name, size_t name_length,
+    const char *old_value, size_t old_length,
+    const char *new_value, size_t new_length, uint32_t *hashes,
+    size_t capacity, size_t *count)
+{
+    if (name == NULL || hashes == NULL || count == NULL) return false;
+    *count = 0;
+    if (old_value == NULL) old_length = 0;
+    if (new_value == NULL) new_length = 0;
+    if (old_length > 4096u || new_length > 4096u) return false;
+    if (name_length == 5 && strncasecmp(name, "class", 5) == 0) {
+        return class_list_difference_tokens(
+                   old_value, old_length, new_value, new_length,
+                   hashes, capacity, count)
+               && class_list_difference_tokens(
+                   new_value, new_length, old_value, old_length,
+                   hashes, capacity, count);
+    }
+    if (name_length == 2 && strncasecmp(name, "id", 2) == 0) {
+        if (old_length != 0
+            && !change_tokens_add(hashes, capacity, count,
+                                  stylesheet_identity_token_hash(
+                                      true, old_value, old_length))) {
+            return false;
+        }
+        if (new_length != 0
+            && !change_tokens_add(hashes, capacity, count,
+                                  stylesheet_identity_token_hash(
+                                      true, new_value, new_length))) {
+            return false;
+        }
+        return true;
+    }
+    return false;
 }
 
 static void stylesheet_prepare_rule_filters(Stylesheet *sheet)
@@ -345,6 +597,26 @@ static void stylesheet_prepare_rule_filters(Stylesheet *sheet)
             .compound = style_rule_compound_bloom(sheet, i),
             .ancestors = style_rule_ancestor_bloom(sheet, i)
         };
+        style_rule_relational_filter(&sheet->rules[i], &filters[i]);
+        const StyleDeclaration *declaration = stylesheet_rule_declaration(
+            sheet, &sheet->rules[i]);
+        const uint64_t discovery_mask = S_DISPLAY | S_VISIBILITY
+            | S_BACKGROUND_IMAGE | S_MASK_IMAGE | S_CONTENT;
+        uint8_t stack_id = declaration == NULL
+            ? 0 : computed_style_paint_stack_id(&declaration->values);
+        const StylePaintStack *stack = stack_id == 0
+            ? NULL : stylesheet_paint_stack(sheet, stack_id);
+        bool stack_images = stack_id != 0
+            && (stack == NULL
+                || (stack->components
+                    & (STYLE_PAINT_COMPONENT_BACKGROUND_IMAGE
+                       | STYLE_PAINT_COMPONENT_MASK_IMAGE)) != 0);
+        filters[i].discovery = declaration == NULL
+            || (declaration->mask & discovery_mask) != 0
+            || (declaration->inherit_mask & discovery_mask) != 0
+            || declaration->deferred_declarations != NULL
+            || declaration->deferred_program_count != 0
+            || stack_images;
         useful = useful || !style_token_bloom_empty_value(filters[i].compound)
             || !style_token_bloom_empty_value(filters[i].ancestors);
         ancestors_useful = ancestors_useful
@@ -998,6 +1270,7 @@ static bool stylesheet_parse_elements_body(StyleCssParseContext *parse,
             parsed = false;
             break;
         }
+        stylesheet_note_style_source(parse->sheet, element);
         if (!tilefinch_csp_allows_inline_style(
                 input->policy, element)) continue;
         for (lxb_dom_node_t *child = element->first_child;
@@ -1095,7 +1368,11 @@ bool stylesheet_add_css_from_context_capture_ir(
     StyleParsedIrBuilder builder = {
         .budget = sheet->budget,
         .length = sizeof(StyleParsedIrHeader),
-        .eligible = true
+        /* Finish retains only IR smaller than the source. Stop growing as
+           soon as that is impossible; later operations cannot shrink it. */
+        .maximum_length = length > STYLE_PARSED_IR_MAX_BYTES
+            ? STYLE_PARSED_IR_MAX_BYTES : (length != 0 ? length - 1u : 0),
+        .eligible = length > sizeof(StyleParsedIrHeader)
     };
     bool parsed = stylesheet_add_css_from_context_internal(
         sheet, css, length, source_base_url, source_referrer_policy,
@@ -1199,6 +1476,249 @@ StyleParsedIrApplyResult stylesheet_add_parsed_ir_from_context(
             stylesheet_parse_ir_body, &input)) return STYLE_PARSED_IR_FAILED;
     if (operation_count != NULL) *operation_count = header.operation_count;
     return STYLE_PARSED_IR_APPLIED;
+}
+
+void stylesheet_note_style_source(Stylesheet *sheet,
+                                  const lxb_dom_node_t *element)
+{
+    if (sheet == NULL || element == NULL || sheet->style_sources_bounded_out)
+        return;
+    for (size_t i = 0; i < sheet->style_source_count; i++) {
+        if (sheet->style_source_nodes[i] == element) return;
+    }
+    if (sheet->style_source_count == STYLE_SOURCE_NODE_LIMIT) {
+        sheet->style_sources_bounded_out = true;
+        return;
+    }
+    sheet->style_source_first_order[sheet->style_source_count] =
+        sheet->next_order;
+    sheet->style_source_nodes[sheet->style_source_count++] = element;
+}
+
+size_t stylesheet_style_source_count(const Stylesheet *sheet)
+{
+    return sheet == NULL ? 0 : sheet->style_source_count;
+}
+
+bool stylesheet_style_source_known(const Stylesheet *sheet,
+                                   const lxb_dom_node_t *element)
+{
+    if (sheet == NULL || element == NULL) return false;
+    for (size_t i = 0; i < sheet->style_source_count; i++) {
+        if (sheet->style_source_nodes[i] == element) return true;
+    }
+    return false;
+}
+
+const lxb_dom_node_t *stylesheet_last_style_source(const Stylesheet *sheet)
+{
+    if (sheet == NULL || sheet->style_source_count == 0) return NULL;
+    return sheet->style_source_nodes[sheet->style_source_count - 1];
+}
+
+bool stylesheet_tokens_may_affect_discovery(
+    const Stylesheet *sheet, const uint32_t *hashes, size_t count)
+{
+    if (sheet == NULL || hashes == NULL || count == 0) return true;
+    if (sheet->rule_filters == NULL || !sheet->rule_index_ready) return true;
+    for (size_t i = 0; i < sheet->count; i++) {
+        const StyleRuleFilter *filter = &sheet->rule_filters[i];
+        if (!filter->discovery) continue;
+        const StyleRule *rule = &sheet->rules[i];
+        if (filter->relational_opaque || !rule->has_fast_key) return true;
+        for (size_t r = 0; r < filter->relational_count; r++) {
+            for (size_t h = 0; h < count; h++) {
+                if (filter->relational_tokens[r] == hashes[h]) return true;
+            }
+        }
+        if (rule->type == SELECTOR_CLASS || rule->type == SELECTOR_ID) {
+            const char *key = style_rule_fast_key(rule);
+            if (key == NULL) return true;
+            uint32_t hash = stylesheet_identity_token_hash(
+                rule->type == SELECTOR_ID, key, rule->fast_key_length);
+            for (size_t h = 0; h < count; h++) {
+                if (hash == hashes[h]) return true;
+            }
+        }
+    }
+    return false;
+}
+
+void stylesheet_append_result_release(Stylesheet *sheet,
+                                      StylesheetAppendResult *result)
+{
+    if (sheet == NULL || result == NULL) return;
+    budget_free(sheet->budget, result->remap);
+    result->remap = NULL;
+}
+
+static unsigned stylesheet_inserted_rule_order(
+    unsigned order, unsigned tail_start, unsigned boundary, unsigned count)
+{
+    if (order == UINT_MAX) return order;
+    if (order >= tail_start) return order - tail_start + boundary;
+    return order >= boundary ? order + count : order;
+}
+
+static int stylesheet_compare_revert_order(const void *a, const void *b)
+{
+    unsigned left = ((const StyleRevertRuleMask *) a)->order;
+    unsigned right = ((const StyleRevertRuleMask *) b)->order;
+    return (left > right) - (left < right);
+}
+
+bool stylesheet_append_style_elements_tracked(
+    Stylesheet *sheet, lxb_dom_node_t *const *elements, size_t count,
+    const TilefinchContentSecurityPolicy *content_security_policy,
+    size_t after_source, StylesheetAppendResult *result)
+{
+    if (result == NULL) return false;
+    memset(result, 0, sizeof(*result));
+    if (sheet == NULL || sheet->budget == NULL) return false;
+    size_t old_count = sheet->count;
+    size_t old_sources = sheet->style_source_count;
+    if (old_count > UINT16_MAX || after_source > old_sources) return false;
+    unsigned *old_orders = old_count == 0 ? NULL
+        : budget_malloc(sheet->budget, old_count * sizeof(*old_orders));
+    if (old_count != 0 && old_orders == NULL) return false;
+    for (size_t i = 0; i < old_count; i++) {
+        old_orders[i] = sheet->rules[i].order;
+    }
+    uint64_t signature_before = stylesheet_parse_context_signature(sheet);
+    unsigned tail_start = sheet->next_order;
+    bool ok = stylesheet_append_style_elements(
+        sheet, elements, count, content_security_policy);
+    if (!ok) {
+        budget_free(sheet->budget, old_orders);
+        return false;
+    }
+    result->old_count = old_count;
+    result->context_changed =
+        stylesheet_parse_context_signature(sheet) != signature_before;
+    /* Rule identity survives the cascade re-sort through the unique `order`
+       assigned at parse. The appended rules were numbered after every
+       existing rule; move them to their document position by shifting the
+       later rules up, then re-sort. Both the selector program and the rule
+       index key on rule positions or orders, so they rebuild lazily. */
+    unsigned appended_orders = sheet->next_order - tail_start;
+    unsigned boundary = after_source < old_sources
+        ? sheet->style_source_first_order[after_source] : tail_start;
+    bool shifted = boundary != tail_start && appended_orders != 0;
+    if (shifted) {
+        for (size_t j = 0; j < sheet->count; j++) {
+            sheet->rules[j].order = stylesheet_inserted_rule_order(
+                sheet->rules[j].order, tail_start, boundary, appended_orders);
+        }
+        /* Custom/retained declarations and rollback masks share source-order
+           identity with ordinary rules. Index invalidation alone cannot
+           repair their cascade precedence after a non-tail insertion. */
+        for (size_t j = 0; j < sheet->custom_rule_count; j++) {
+            /* Retained rules pack declaration order in the low eight bits. */
+            unsigned packed = sheet->custom_rules[j].order;
+            unsigned order = stylesheet_inserted_rule_order(
+                packed >> 8, tail_start, boundary, appended_orders);
+            sheet->custom_rules[j].order =
+                (order <= (UINT_MAX >> 8) ? order << 8
+                                         : UINT_MAX - UINT8_MAX)
+                | (packed & UINT8_MAX);
+        }
+        for (size_t j = 0; j < sheet->revert_rule_mask_count; j++) {
+            sheet->revert_rule_masks[j].order = stylesheet_inserted_rule_order(
+                sheet->revert_rule_masks[j].order, tail_start, boundary,
+                appended_orders);
+        }
+        if (sheet->revert_rule_mask_count > 1) {
+            qsort(sheet->revert_rule_masks, sheet->revert_rule_mask_count,
+                  sizeof(*sheet->revert_rule_masks),
+                  stylesheet_compare_revert_order);
+        }
+        for (size_t s = 0; s < sheet->style_source_count; s++) {
+            unsigned order = sheet->style_source_first_order[s];
+            if (s >= old_sources) {
+                sheet->style_source_first_order[s] =
+                    order - tail_start + boundary;
+            } else if (order >= boundary) {
+                sheet->style_source_first_order[s] = order + appended_orders;
+            }
+        }
+        stylesheet_drop_selector_program(sheet);
+        stylesheet_drop_rule_index(sheet);
+        stylesheet_drop_custom_rule_index(sheet);
+        stylesheet_finalize_rule_order(sheet);
+        /* Keep the source list in document order as well. */
+        size_t new_sources = sheet->style_source_count - old_sources;
+        if (new_sources != 0 && after_source < old_sources) {
+            const lxb_dom_node_t *nodes[STYLE_SOURCE_NODE_LIMIT];
+            unsigned firsts[STYLE_SOURCE_NODE_LIMIT];
+            memcpy(nodes, sheet->style_source_nodes, sizeof(nodes));
+            memcpy(firsts, sheet->style_source_first_order, sizeof(firsts));
+            size_t at = 0;
+            for (size_t s = 0; s < after_source; s++, at++) {
+                sheet->style_source_nodes[at] = nodes[s];
+                sheet->style_source_first_order[at] = firsts[s];
+            }
+            for (size_t s = old_sources; s < old_sources + new_sources; s++, at++) {
+                sheet->style_source_nodes[at] = nodes[s];
+                sheet->style_source_first_order[at] = firsts[s];
+            }
+            for (size_t s = after_source; s < old_sources; s++, at++) {
+                sheet->style_source_nodes[at] = nodes[s];
+                sheet->style_source_first_order[at] = firsts[s];
+            }
+        }
+    }
+    size_t order_span = (size_t) sheet->next_order + 1u;
+    uint16_t *by_order = sheet->count <= UINT16_MAX
+        ? budget_malloc(sheet->budget, order_span * sizeof(*by_order)) : NULL;
+    uint8_t *old_present = by_order == NULL ? NULL
+        : budget_calloc(sheet->budget, order_span, sizeof(*old_present));
+    if (by_order == NULL || old_present == NULL) {
+        budget_free(sheet->budget, by_order);
+        budget_free(sheet->budget, old_present);
+        budget_free(sheet->budget, old_orders);
+        result->appended_bounded_out = true;
+        return true;
+    }
+    memset(by_order, 0xff, order_span * sizeof(*by_order));
+    for (size_t j = 0; j < sheet->count; j++) {
+        unsigned order = sheet->rules[j].order;
+        if ((size_t) order < order_span) by_order[order] = (uint16_t) j;
+    }
+    bool remap_valid = true;
+    uint16_t *remap = old_count == 0 ? NULL
+        : budget_malloc(sheet->budget, old_count * sizeof(*remap));
+    if (old_count != 0 && remap == NULL) remap_valid = false;
+    for (size_t i = 0; remap_valid && i < old_count; i++) {
+        unsigned order = old_orders[i];
+        if (shifted && order != UINT_MAX && order >= boundary) {
+            order += appended_orders;
+        }
+        if ((size_t) order >= order_span || by_order[order] == UINT16_MAX) {
+            remap_valid = false;
+            break;
+        }
+        remap[i] = by_order[order];
+        old_present[order] = 1;
+    }
+    if (remap_valid) {
+        for (size_t j = 0; j < sheet->count; j++) {
+            unsigned order = sheet->rules[j].order;
+            if ((size_t) order < order_span && old_present[order]) continue;
+            if (result->appended_count == STYLESHEET_APPEND_RULE_LIMIT) {
+                result->appended_bounded_out = true;
+                break;
+            }
+            result->appended[result->appended_count++] = (uint32_t) j;
+        }
+        result->remap = remap;
+    } else {
+        budget_free(sheet->budget, remap);
+        result->appended_bounded_out = true;
+    }
+    budget_free(sheet->budget, by_order);
+    budget_free(sheet->budget, old_present);
+    budget_free(sheet->budget, old_orders);
+    return true;
 }
 
 bool stylesheet_append_style_elements(

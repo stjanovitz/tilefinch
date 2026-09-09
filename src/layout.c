@@ -131,6 +131,20 @@ static void layout_free_block_scratch(LayoutContext *context)
     context->block_scratch_page_count = 0;
 }
 
+static void layout_reuse_clear_counters(LayoutReuseCache *cache)
+{
+    if (cache == NULL) return;
+    if (cache->counter_entries != NULL) {
+        cache->stats.retained_bytes -=
+            cache->counter_capacity * sizeof(*cache->counter_entries);
+        budget_free(cache->budget, cache->counter_entries);
+    }
+    cache->counter_entries = NULL;
+    cache->counter_root = NULL;
+    cache->counter_count = cache->counter_capacity = 0;
+    cache->counter_bounded_out = false;
+}
+
 static void layout_release_context(LayoutContext *context, Budget *budget)
 {
     if (context == NULL) return;
@@ -147,6 +161,23 @@ static void layout_release_context(LayoutContext *context, Budget *budget)
     }
     budget_free(budget, context->stacking_contexts);
     budget_free(budget, context->visibility_ranges);
+    LayoutReuseCache *reuse = context->reuse;
+    if (reuse != NULL && context->counter_entries != NULL
+        && !context->cancelled && !context->counter_entries_allocation_failed
+        && context->sheet != NULL
+        && reuse->sheet == context->sheet
+        && reuse->sheet_generation == context->sheet->build_generation
+        && !stylesheet_has_container_queries(context->sheet)) {
+        layout_reuse_clear_counters(reuse);
+        reuse->counter_entries = context->counter_entries;
+        reuse->counter_count = context->counter_entry_count;
+        reuse->counter_capacity = context->counter_entry_capacity;
+        reuse->counter_bounded_out = context->counter_entries_bounded_out;
+        reuse->counter_root = lxb_dom_interface_node(context->document->html);
+        reuse->stats.retained_bytes += reuse->counter_capacity
+            * sizeof(*reuse->counter_entries);
+        context->counter_entries = NULL;
+    }
     budget_free(budget, context->counter_entries);
     budget_free(budget, context->counter_cursor);
     budget_free(budget, context);
@@ -339,8 +370,14 @@ bool layout_cooperate(LayoutContext *context, lxb_dom_node_t *node)
            for cheap work, but service input at the next safe boundary after
            eight milliseconds, just like the script watchdog. */
         uint64_t now = tilefinch_platform_monotonic_time_ns();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        context->safe_point_clock_checks++;
+#endif
         if (now < context->slice_started_ns
             || now - context->slice_started_ns < UINT64_C(8000000)) return true;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        context->safe_point_time_yields++;
+#endif
     }
     size_t completed = context->layout->layout_work_units;
     layout_finish_work_slice(context);
@@ -401,8 +438,15 @@ static uint64_t layout_style_parent_hash(const ComputedStyle *style)
 static void layout_reuse_clear_entries(LayoutReuseCache *cache)
 {
     if (cache == NULL) return;
+    layout_reuse_clear_counters(cache);
     memset(cache->styles, 0, sizeof(cache->styles));
     memset(cache->font_dependent, 0, sizeof(cache->font_dependent));
+    style_retained_matches_clear(cache->matches);
+    cache->pending_active = false;
+    cache->pending_overflow = false;
+    cache->pending_parent_scope = false;
+    cache->pending_node_count = 0;
+    cache->pending_token_count = 0;
     cache->font_publication_active = false;
     memset(cache->intrinsic, 0, sizeof(cache->intrinsic));
     if (cache->table_rows != NULL) {
@@ -438,9 +482,11 @@ void layout_reuse_cache_destroy(LayoutReuseCache *cache)
 {
     if (cache == NULL) return;
     Budget *budget = cache->budget;
+    layout_reuse_clear_counters(cache);
     if (cache->table_rows != NULL) {
         budget_free(budget, cache->table_rows);
     }
+    style_retained_matches_destroy(cache->matches);
     memset(cache, 0, sizeof(*cache));
     budget_free(budget, cache);
 }
@@ -459,6 +505,55 @@ void layout_reuse_cache_reset(LayoutReuseCache *cache)
     cache->selector_focus_has_sibling = false;
     cache->selector_has_structure = false;
     cache->stats.full_resets++;
+}
+
+static void layout_reuse_note_selector_dependencies(
+    LayoutReuseCache *cache, const char *selector);
+
+void layout_reuse_cache_enable_retained_matches(LayoutReuseCache *cache)
+{
+    if (cache != NULL) cache->matches_enabled = true;
+}
+
+void layout_reuse_cache_note_stylesheet_appended(
+    LayoutReuseCache *cache, const Stylesheet *sheet, const uint16_t *remap,
+    size_t old_count, const uint32_t *appended, size_t appended_count,
+    bool lists_valid)
+{
+    if (cache == NULL) return;
+    if (sheet == NULL || cache->sheet != sheet) {
+        layout_reuse_cache_reset(cache);
+        return;
+    }
+    layout_reuse_cache_flush_invalidations(cache);
+    /* Values may change everywhere (a new rule can restyle any element the
+       lists still cover), so only the exact selector answers are kept. */
+    layout_reuse_clear_counters(cache);
+    memset(cache->styles, 0, sizeof(cache->styles));
+    memset(cache->font_dependent, 0, sizeof(cache->font_dependent));
+    layout_reuse_clear_sizing_entries(cache);
+    cache->clock = 0;
+    if (cache->matches != NULL) {
+        if (!lists_valid || remap == NULL) {
+            style_retained_matches_clear(cache->matches);
+        } else {
+            style_retained_matches_remap(cache->matches, remap, old_count);
+            style_retained_matches_invalidate_rules(
+                cache->matches, sheet, appended, appended_count);
+        }
+    }
+    bool had_has = cache->selector_has_has;
+    for (size_t i = 0; i < appended_count; i++) {
+        if (appended[i] < sheet->count) {
+            layout_reuse_note_selector_dependencies(
+                cache, sheet->rules[appended[i]].selector);
+        }
+    }
+    if (cache->selector_has_has && !had_has && cache->matches != NULL) {
+        style_retained_matches_clear(cache->matches);
+    }
+    cache->sheet_generation = sheet->build_generation;
+    cache->stats.stylesheet_appends++;
 }
 
 void layout_reuse_cache_begin_font_publication(LayoutReuseCache *cache)
@@ -604,14 +699,11 @@ void layout_reuse_cache_rebind_stylesheet(
     cache->sheet = replacement;
 }
 
-void layout_reuse_cache_invalidate_node_scoped(
+static void layout_reuse_invalidate_scoped_internal(
     LayoutReuseCache *cache, lxb_dom_node_t *node,
-    bool text_or_structure_sensitive)
+    bool text_or_structure_sensitive, bool include_matches)
 {
-    if (cache == NULL || node == NULL) {
-        layout_reuse_cache_reset(cache);
-        return;
-    }
+    layout_reuse_clear_counters(cache);
     lxb_dom_node_t *style_scope = node;
     if ((text_or_structure_sensitive || cache->selector_has_structure)
         && node->parent != NULL) style_scope = node->parent;
@@ -621,6 +713,9 @@ void layout_reuse_cache_invalidate_node_scoped(
             && layout_node_is_within(entry->node, style_scope)) {
             memset(entry, 0, sizeof(*entry));
         }
+    }
+    if (include_matches) {
+        style_retained_matches_invalidate_within(cache->matches, style_scope);
     }
     for (size_t i = 0; i < LAYOUT_REUSE_INTRINSIC_CAPACITY; i++) {
         LayoutIntrinsicCacheEntry *entry = &cache->intrinsic[i];
@@ -642,6 +737,94 @@ void layout_reuse_cache_invalidate_node_scoped(
     cache->stats.scoped_invalidations++;
 }
 
+void layout_reuse_cache_invalidate_node_scoped(
+    LayoutReuseCache *cache, lxb_dom_node_t *node,
+    bool text_or_structure_sensitive)
+{
+    if (cache == NULL || node == NULL) {
+        layout_reuse_cache_reset(cache);
+        return;
+    }
+    layout_reuse_invalidate_scoped_internal(
+        cache, node, text_or_structure_sensitive, true);
+}
+
+void layout_reuse_cache_invalidate_attribute(
+    LayoutReuseCache *cache, lxb_dom_node_t *node,
+    const uint32_t *changed_tokens, size_t changed_token_count,
+    bool text_or_structure_sensitive, bool relational_selector_sensitive)
+{
+    if (cache == NULL || node == NULL) {
+        layout_reuse_cache_reset(cache);
+        return;
+    }
+    if (relational_selector_sensitive && cache->selector_has_has) {
+        layout_reuse_cache_reset(cache);
+        return;
+    }
+    if (changed_tokens == NULL || cache->matches == NULL) {
+        layout_reuse_invalidate_scoped_internal(
+            cache, node, text_or_structure_sensitive, true);
+        return;
+    }
+    layout_reuse_invalidate_scoped_internal(
+        cache, node, text_or_structure_sensitive, false);
+    if (cache->pending_node_count == LAYOUT_REUSE_PENDING_NODE_LIMIT) {
+        cache->pending_overflow = true;
+    } else {
+        cache->pending_nodes[cache->pending_node_count++] = node;
+    }
+    for (size_t i = 0; i < changed_token_count; i++) {
+        bool present = false;
+        for (size_t p = 0; !present && p < cache->pending_token_count; p++) {
+            present = cache->pending_tokens[p] == changed_tokens[i];
+        }
+        if (present) continue;
+        if (cache->pending_token_count == LAYOUT_REUSE_PENDING_TOKEN_LIMIT) {
+            cache->pending_overflow = true;
+            break;
+        }
+        cache->pending_tokens[cache->pending_token_count++] =
+            changed_tokens[i];
+    }
+    cache->pending_parent_scope = cache->pending_parent_scope
+        || text_or_structure_sensitive || cache->selector_has_structure;
+    cache->pending_active = true;
+}
+
+void layout_reuse_cache_flush_invalidations(LayoutReuseCache *cache)
+{
+    if (cache == NULL || !cache->pending_active) return;
+    if (cache->matches != NULL) {
+        if (cache->pending_overflow || cache->sheet == NULL) {
+            style_retained_matches_clear(cache->matches);
+        } else {
+            style_retained_matches_invalidate_tokens(
+                cache->matches, cache->sheet, cache->pending_nodes,
+                cache->pending_node_count, cache->pending_tokens,
+                cache->pending_token_count, cache->pending_parent_scope);
+        }
+    }
+    cache->pending_active = false;
+    cache->pending_overflow = false;
+    cache->pending_parent_scope = false;
+    cache->pending_node_count = 0;
+    cache->pending_token_count = 0;
+}
+
+void *layout_reuse_cache_attach_matches(LayoutReuseCache *cache,
+                                        const Stylesheet *sheet)
+{
+    return style_retained_matches_attach(
+        sheet, cache != NULL && cache->sheet == sheet ? cache->matches : NULL);
+}
+
+void layout_reuse_cache_detach_matches(const Stylesheet *sheet,
+                                       void *previous)
+{
+    (void) style_retained_matches_attach(sheet, previous);
+}
+
 void layout_reuse_cache_invalidate_node(LayoutReuseCache *cache,
                                         lxb_dom_node_t *node,
                                         bool text_or_structure_sensitive)
@@ -661,7 +844,12 @@ void layout_reuse_cache_invalidate_focus(
         layout_reuse_cache_reset(cache);
         return;
     }
-    if (cache->selector_focus_has_sibling) {
+    if (cache->selector_focus_has_sibling || cache->selector_has_focus_within
+        || cache->selector_has_has) {
+        /* An ancestor's :focus-within / :has(:focus) can change rules on
+           another descendant even without a sibling combinator. Parent
+           style hashes cannot invalidate exact matched-rule lists, and may
+           not change at all when only that descendant is styled. */
         layout_reuse_cache_reset(cache);
         return;
     }
@@ -679,14 +867,29 @@ void layout_reuse_cache_invalidate_focus(
             memset(entry, 0, sizeof(*entry));
         }
     }
+    style_retained_matches_invalidate_ancestors(cache->matches, node);
 }
 
 void layout_reuse_cache_stats(const LayoutReuseCache *cache,
                               LayoutReuseStats *stats)
 {
     if (stats == NULL) return;
-    if (cache == NULL) memset(stats, 0, sizeof(*stats));
-    else *stats = cache->stats;
+    if (cache == NULL) {
+        memset(stats, 0, sizeof(*stats));
+        return;
+    }
+    *stats = cache->stats;
+    if (cache->matches != NULL) {
+        stats->matched_hits = cache->matches->hits;
+        stats->matched_misses = cache->matches->misses;
+        stats->matched_stores = cache->matches->stores;
+        stats->matched_token_invalidations =
+            cache->matches->token_invalidations;
+        stats->matched_token_fallbacks = cache->matches->token_fallbacks;
+        stats->matched_token_dropped = cache->matches->token_dropped;
+        stats->matched_token_affected_rules =
+            cache->matches->token_affected_rules;
+    }
 }
 
 bool layout_reuse_cache_can_reuse_mutations(const LayoutReuseCache *cache)
@@ -728,8 +931,21 @@ void layout_reuse_cache_prepare(LayoutReuseCache *cache,
                                 int viewport_width)
 {
     if (cache == NULL) return;
+    layout_reuse_cache_flush_invalidations(cache);
     uint64_t sheet_generation =
         sheet == NULL ? 0 : sheet->build_generation;
+    if (sheet != NULL && cache->matches_enabled && cache->matches == NULL
+        && !cache->matches_attempted && sheet->count >= 64u) {
+        cache->matches_attempted = true;
+#ifndef TILEFINCH_NO_TRACE
+        if (getenv("TILEFINCH_DISABLE_RETAINED_MATCHES") == NULL)
+#endif
+        cache->matches = style_retained_matches_create(cache->budget);
+        if (cache->matches != NULL) {
+            cache->stats.retained_bytes +=
+                style_retained_matches_bytes(cache->matches);
+        }
+    }
     if (cache->sheet == sheet
         && cache->sheet_generation == sheet_generation
         && cache->fonts == fonts
@@ -836,8 +1052,12 @@ static void layout_resolve_canonical_style(
     const Stylesheet *sheet, const FontSet *fonts,
     const WebFontSet *web_fonts, lxb_dom_node_t *node,
     const ComputedStyle *parent, ComputedStyle *result,
-    bool *font_dependent)
+    bool *font_dependent, StyleRetainedMatches *matches)
 {
+    StyleRetainedMatches *previous_matches = NULL;
+    if (matches != NULL) {
+        previous_matches = style_retained_matches_attach(sheet, matches);
+    }
     *result = style_for_node(sheet, node, parent);
     *font_dependent = (result->filter_code & STYLE_FONT_CH_PENDING) != 0;
     if ((result->filter_code & STYLE_FONT_CH_PENDING) != 0
@@ -860,6 +1080,11 @@ static void layout_resolve_canonical_style(
             : (result->font_size + 1) / 2;
         *result = style_for_node_with_ch_basis(
             sheet, node, parent, ch_basis);
+    }
+    /* The focus probe below toggles a live marker attribute; exact lists
+       recorded under either state must not be consulted or stored there. */
+    if (matches != NULL) {
+        (void) style_retained_matches_attach(sheet, previous_matches);
     }
     size_t focus_length = 0;
     if (document_attribute(
@@ -895,7 +1120,8 @@ bool layout_reuse_cache_resolve_style(LayoutReuseCache *cache,
     bool font_dependent = false;
     layout_resolve_canonical_style(
         sheet, fonts, stylesheet_web_font_set(sheet),
-        node, parent, result, &font_dependent);
+        node, parent, result, &font_dependent,
+        cache != NULL && cache->sheet == sheet ? cache->matches : NULL);
     layout_reuse_style_put_hashed(
         cache, node, parent_hash, result, font_dependent);
     return false;
@@ -1667,8 +1893,8 @@ void trace_flex_sizing(LayoutContext *context, const char *phase,
             item_style == NULL ? 0 : item_style->max_width);
 }
 
-bool layout_batch_cooperate(LayoutContext *context,
-                                   size_t work_units)
+static bool layout_work_cooperate(LayoutContext *context,
+                                  size_t work_units, const char *phase)
 {
     if (context == NULL || work_units == 0) return true;
     if (work_units <= SIZE_MAX - context->layout->layout_work_units) {
@@ -1681,9 +1907,19 @@ bool layout_batch_cooperate(LayoutContext *context,
     layout_finish_work_slice(context);
     context->layout->cooperative_yields++;
     bool keep_going = tilefinch_platform_cooperate(
-        "layout-index", context->layout->layout_work_units);
+        phase, context->layout->layout_work_units);
     if (!keep_going) layout_context_cancel(context);
     return keep_going;
+}
+
+bool layout_batch_cooperate(LayoutContext *context, size_t work_units)
+{
+    return layout_work_cooperate(context, work_units, "layout-index");
+}
+
+bool layout_text_cooperate(LayoutContext *context, size_t work_units)
+{
+    return layout_work_cooperate(context, work_units, "layout-text");
 }
 
 bool layout_batch_checkpoint(LayoutContext *context, size_t at,
@@ -2025,6 +2261,27 @@ static void layout_job_capture_performance(LayoutBuildJob *job)
     LayoutContext *context = job->context;
     const Stylesheet *stylesheet = job->stylesheet;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
+    char checkpoint_message[256];
+    static bool clock_calibrated;
+    if (!clock_calibrated) {
+        clock_calibrated = true;
+        uint64_t start = layout_performance_now_us();
+        for (unsigned i = 0; i < 1024; i++)
+            (void) tilefinch_platform_monotonic_time_ns();
+        snprintf(checkpoint_message, sizeof(checkpoint_message),
+            "tilefinch-layout-clock: calls=1024 elapsed=%lluus",
+            (unsigned long long) (layout_performance_now_us() - start));
+        tilefinch_platform_log_message(checkpoint_message);
+    }
+    snprintf(checkpoint_message, sizeof(checkpoint_message),
+        "tilefinch-layout-checkpoints: work=%zu yields=%zu clock-checks=%zu "
+        "time-yields=%zu profiled=%u cooperate=%lluus max-slice=%lluus",
+        layout->layout_work_units, layout->cooperative_yields,
+        context->safe_point_clock_checks, context->safe_point_time_yields,
+        layout->performance.flow_phase_transitions != 0 ? 1u : 0u,
+        (unsigned long long) layout->performance.flow_phase_us[LAYOUT_FLOW_COOPERATE],
+        (unsigned long long) layout->max_work_slice_us);
+    tilefinch_platform_log_message(checkpoint_message);
     printf("tilefinch-layout-cost: total=%lluus flow=%lluus "
         "styles=%llu/%llu counters=%zu commands=%zu\n",
         (unsigned long long) job->build_active_us,

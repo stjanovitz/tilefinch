@@ -634,6 +634,95 @@ cleanup:
     return ok;
 }
 
+static bool test_small_late_script_reserve(Budget *budget)
+{
+    const char *test_name = "small late script scales its execution reserve";
+    ScriptReplayRecord record = {
+        .url = "https://late-script.test/ready.js",
+        .source = "globalThis.pocSummary='late:ready';"
+    };
+    char directory[128] = {0}, error[256] = {0};
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool fixture_ready = false, replaying = false;
+    bool browser_ready = false, navigation_ready = false, ok = true;
+    REQUIRE(write_replay_fixture(directory, &record, 1));
+    fixture_ready = true;
+    REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
+    replaying = true;
+    REQUIRE(browser_session_init(&browser, budget, 16384));
+    browser_ready = true;
+    REQUIRE(start_runtime_page(&navigation, budget, &browser, "https://late-script.test/"));
+    navigation_ready = true;
+    REQUIRE(evaluate(&navigation,
+        "const s=document.createElement('script');s.src='/ready.js';"
+        "document.head.appendChild(s);globalThis.pocSummary='pending'", "<late-script>"));
+    ScriptRuntime *runtime = navigation.page.runtime;
+    JS_RunGC(runtime->runtime);
+    runtime->base_memory_limit = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool)
+        + 256u * 1024u;
+    runtime->boot_window_active = false;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    REQUIRE(advance_until(&navigation, "late:ready", 32, NULL));
+    REQUIRE(navigation.page.script_result.dynamic_scripts_completed == 1
+        && navigation.page.script_result.dynamic_scripts_failed == 0
+        && script_runtime_heap_rejections(runtime) == 0);
+cleanup:
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (replaying) fetch_trace_end();
+    if (fixture_ready) remove_replay_fixture(directory, 1);
+    return ok;
+}
+
+static bool test_classic_continuation_uses_admitted_reserve(Budget *budget)
+{
+    const char *test_name = "continued classic script retains its admitted reserve";
+    static const char source[] =
+        "mw.loader.impl(function(){return ['first',function(){"
+        "globalThis.retainedRegistration=new ArrayBuffer(320*1024);"
+        "},{}];});"
+        "mw.loader.impl(function(){return ['last',function(){"
+        "globalThis.pocSummary='continued:complete';},{}];});";
+    ScriptReplayRecord record = {
+        .url = "https://continued-loader.test/loader.js", .source = source
+    };
+    char directory[128] = {0}, error[256] = {0};
+    BrowserSession browser = {0};
+    NavigationSession navigation = {0};
+    bool fixture_ready = false, replaying = false;
+    bool browser_ready = false, navigation_ready = false, ok = true;
+    REQUIRE(write_replay_fixture(directory, &record, 1));
+    fixture_ready = true;
+    REQUIRE(fetch_trace_replay_begin(directory, error, sizeof(error)));
+    replaying = true;
+    REQUIRE(browser_session_init(&browser, budget, 16384));
+    browser_ready = true;
+    REQUIRE(start_custom_runtime_page(&navigation, budget, &browser,
+        "https://continued-loader.test/", "<!doctype html><body></body>",
+        4, 4096, 160));
+    navigation_ready = true;
+    REQUIRE(evaluate(&navigation,
+        "globalThis.mw={loader:{impl:f=>f()[1]()}};"
+        "const s=document.createElement('script');s.src='/loader.js';"
+        "document.head.appendChild(s);globalThis.pocSummary='pending'",
+        "<continued-loader>"));
+    ScriptRuntime *runtime = navigation.page.runtime;
+    JS_RunGC(runtime->runtime);
+    runtime->base_memory_limit = budget_quickjs_pool_js_malloc_current(
+        runtime->quickjs_pool) + 768u * 1024u;
+    runtime->boot_window_active = false;
+    JS_SetMemoryLimit(runtime->runtime, runtime->base_memory_limit);
+    REQUIRE(advance_until(&navigation, "continued:complete", 32, NULL));
+    REQUIRE(navigation.page.script_result.dynamic_scripts_failed == 0);
+cleanup:
+    if (navigation_ready) navigation_destroy(&navigation);
+    if (browser_ready) browser_session_destroy(&browser);
+    if (replaying) fetch_trace_end();
+    if (fixture_ready) remove_replay_fixture(directory, 1);
+    return ok;
+}
+
 static bool test_concurrent_dynamic_module_quota_progress(Budget *budget)
 {
     const char *test_name =

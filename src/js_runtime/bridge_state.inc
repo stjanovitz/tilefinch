@@ -369,10 +369,12 @@ bool script_execution_policy_for_profile(
     case SCRIPT_EXECUTION_PROFILE_LAB:
         return true;
     case SCRIPT_EXECUTION_PROFILE_PSP_STRICT:
+        policy->maximum_advance_time_us = 16000;
         policy->maximum_host_compile_source_bytes =
             SCRIPT_PSP_STRICT_MAXIMUM_HOST_COMPILE_BYTES;
         return true;
     case SCRIPT_EXECUTION_PROFILE_PSP_REALISTIC:
+        policy->maximum_advance_time_us = 16000;
         /* The measured 5 MiB realistic realm admits one 384 KiB authored
            Game Profile script. Strict remains at the smaller 256 KiB unit;
            both retain a hard per-call bound and the same aggregate quotas. */

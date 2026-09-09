@@ -65,12 +65,24 @@ typedef struct {
     size_t maximum_image_file_bytes;
     size_t maximum_decoded_image_bytes;
     long timeout_ms;
+    /* Each deferred image batch is published through a full relayout that
+       costs about what the committed page's layout cost. When that layout
+       needed more work units than this, the deferred queue is finished
+       unloaded instead of reflowing the page for seconds per batch. Zero
+       disables the guard. */
+    size_t maximum_publication_work_units;
 } BrowserResourceConfig;
 
 typedef struct {
     bool enabled;
     bool staged_loading;
     size_t maximum_total_bytes;
+    /* Optional faces are published through a full relayout that costs about
+       what the committed page's layout cost. When that layout needed more
+       work units than this, keep the fallback faces for the page instead of
+       staging a batch whose publication would block for seconds. Zero
+       disables the guard. */
+    size_t maximum_publication_work_units;
     char sans_path[BROWSER_ENGINE_PATH_LIMIT];
     char serif_path[BROWSER_ENGINE_PATH_LIMIT];
     char sans_italic_path[BROWSER_ENGINE_PATH_LIMIT];
@@ -107,6 +119,10 @@ typedef struct {
        cache, that raster work is promoted into the committed renderer. */
     bool progressive_first_paint;
     size_t tile_capacity;
+    /* Optional fonts and deferred images wait for queued startup scripts
+       for at most this long after the page's runtime appears; the runtime
+       turn cap applies as well. Zero keeps only the turn cap. */
+    uint64_t startup_resource_deferral_us;
     uint64_t idle_work_budget_us;
     size_t idle_work_maximum_units;
     BrowserJavaScriptConfig javascript;

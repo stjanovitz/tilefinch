@@ -68,7 +68,7 @@ static int line_cursor_fixed(LineState *line)
 
 
 #define GENERATED_COUNTER_STACK_LIMIT 32
-#define GENERATED_COUNTER_NODE_LIMIT 4096
+#define GENERATED_COUNTER_NODE_LIMIT LAYOUT_COUNTER_NODE_LIMIT
 
 typedef struct {
     const char *name;
@@ -172,6 +172,7 @@ static void generated_counter_index_visit(
             ? budget_realloc(context->layout->budget, context->counter_entries,
                              next * sizeof(*grown)) : NULL;
         if (grown == NULL) {
+            if (next > capacity) context->counter_entries_allocation_failed = true;
             context->counter_entries_bounded_out = true;
             return;
         }
@@ -205,18 +206,38 @@ static size_t generated_counter_values(
         || values == NULL || capacity == 0) return 0;
     if (!context->counter_entries_prepared) {
         context->counter_entries_prepared = true;
+        lxb_dom_node_t *root = lxb_dom_interface_node(context->document->html);
+        LayoutReuseCache *reuse = context->reuse;
+        if (reuse != NULL && reuse->counter_entries != NULL
+            && reuse->counter_root == root
+            && !stylesheet_has_container_queries(sheet)) {
+            context->counter_entries = reuse->counter_entries;
+            context->counter_entry_count = reuse->counter_count;
+            context->counter_entry_capacity = reuse->counter_capacity;
+            context->counter_entries_bounded_out = reuse->counter_bounded_out;
+            reuse->stats.retained_bytes -= reuse->counter_capacity
+                * sizeof(*reuse->counter_entries);
+            reuse->counter_entries = NULL;
+            reuse->counter_root = NULL;
+            reuse->counter_count = reuse->counter_capacity = 0;
+            reuse->counter_bounded_out = false;
+            reuse->stats.counter_index_hits++;
+        }
         /* Parse-time count is only a starting estimate: script mutations
            grow this index geometrically under the same 4096-node ceiling. */
         size_t count = context->document->element_count;
         count = count < GENERATED_COUNTER_NODE_LIMIT
             ? count + 1u : GENERATED_COUNTER_NODE_LIMIT;
-        context->counter_entries = budget_calloc(
-            context->layout->budget, count, sizeof(LayoutCounterEntry));
+        if (context->counter_entries == NULL) {
+            if (reuse != NULL) reuse->stats.counter_index_builds++;
+            context->counter_entries = budget_calloc(
+                context->layout->budget, count, sizeof(LayoutCounterEntry));
+            if (context->counter_entries != NULL) {
+                context->counter_entry_capacity = count;
+                generated_counter_index_visit(context, root, NULL, 0);
+            }
+        }
         if (context->counter_entries != NULL) {
-            context->counter_entry_capacity = count;
-            lxb_dom_node_t *root = lxb_dom_interface_node(
-                context->document->html);
-            generated_counter_index_visit(context, root, NULL, 0);
             context->counter_cursor = budget_calloc(context->layout->budget,
                 1, sizeof(*context->counter_cursor));
         }
@@ -226,11 +247,28 @@ static size_t generated_counter_values(
     /* The index deliberately stops at its admitted node limit. A generated
        label outside it has no counter prefix: reject that lookup before
        replaying thousands of operations/cooperation calls to discover the
-       same miss. The pointer-only scan is bounded by the index ceiling and
-       cannot execute page code or allocate. */
-    size_t target = 0;
+       same miss. Start at the cursor's last target: ordinary document-order
+       labels then scan the index once, rather than once per label. Wrap for
+       backward/out-of-order queries; the two disjoint spans still inspect
+       at most the admitted index count and cannot run page code or allocate. */
+    size_t start = context->counter_cursor != NULL
+        && context->counter_cursor->next != 0
+        && context->counter_cursor->next <= context->counter_entry_count
+        ? context->counter_cursor->next - 1u : 0;
+    size_t target = start;
     while (target < context->counter_entry_count
            && context->counter_entries[target].node != node) target++;
+    size_t visits = target - start + (target < context->counter_entry_count);
+    if (target == context->counter_entry_count && start != 0) {
+        target = 0;
+        while (target < start && context->counter_entries[target].node != node) target++;
+        visits += target + (target < start);
+        if (target == start) target = context->counter_entry_count;
+    }
+    if (context->reuse != NULL) {
+        size_t *total = &context->reuse->stats.counter_lookup_visits;
+        *total = visits > SIZE_MAX - *total ? SIZE_MAX : *total + visits;
+    }
     if (target == context->counter_entry_count) {
         values[0] = 0;
         return 1;
@@ -2196,6 +2234,16 @@ bool layout_add_replaced_alt_text(
     return layout_add_command(context->layout, fallback) != NULL;
 }
 
+/* A DOM-node quota does not bound work inside a single long text run.
+   Count loop progress, not byte offsets (break-spaces can rewind), and keep
+   clock/syscall work off the ordinary short-word path. Cancellation discards
+   the private layout through the same owner as every other layout poll. */
+static bool layout_text_work(LayoutContext *context, unsigned *work)
+{
+    *work += 1;
+    return (*work & 255u) != 0 || layout_text_cooperate(context, 256);
+}
+
 bool flow_text(LayoutContext *context, LineState *line,
                       const char *text, size_t length,
                       const ComputedStyle *style,
@@ -2220,6 +2268,7 @@ bool flow_text(LayoutContext *context, LineState *line,
                 style->color_alpha, (int) (length < 48 ? length : 48), text);
     }
     size_t at = 0;
+    unsigned text_work = 0;
     size_t previous_decorated_command = SIZE_MAX;
     size_t previous_decorated_link = SIZE_MAX;
     int scale = style->font_scale;
@@ -2304,13 +2353,13 @@ bool flow_text(LayoutContext *context, LineState *line,
      * and the one rewind -- the break-spaces rollback -- disarms itself, so
      * twice the run's length is already unreachable.  It is a ceiling rather
      * than an assertion because the alternative to a wrong line break is a
-     * navigation pump that owns the CPU forever: neither loop reaches a
-     * cooperate checkpoint, so a line that stopped advancing would take
-     * cancel, the HOME exit, and the supervisor's frames down with it.
+     * navigation pump that never completes. Progress checkpoints below keep
+     * input serviceable even before this defensive ceiling is reached.
      */
     size_t flow_guard = length <= (SIZE_MAX - 64u) / 2u
         ? length * 2u + 64u : SIZE_MAX;
     while (at < length) {
+        if (!layout_text_work(context, &text_work)) return false;
         if (line->clamp_pending) return layout_line_clamp_overflow(line);
         if (layout_preview_limit_reached(context, line->y)) break;
         if (flow_guard == 0) {
@@ -2322,10 +2371,12 @@ bool flow_text(LayoutContext *context, LineState *line,
         bool separated = false;
         size_t preserved_space_count = 0;
         while (at < length && isspace((unsigned char) text[at])) {
+            if (!layout_text_work(context, &text_work)) return false;
             bool newline = text[at] == '\n' || text[at] == '\r'
                            || text[at] == '\f';
             if (newline && preserve_newlines) {
                 while (preserved_space_count != 0) {
+                    if (!layout_text_work(context, &text_work)) return false;
                     int cursor_fixed = line_cursor_fixed(line);
                     if (wrap_preserved_spaces
                         && cursor_fixed
@@ -2380,6 +2431,7 @@ bool flow_text(LayoutContext *context, LineState *line,
         bool had_preserved_spaces = preserved_space_count != 0;
         bool previous_preserved_space = false;
         while (preserved_space_count != 0) {
+            if (!layout_text_work(context, &text_work)) return false;
             int cursor_fixed = line_cursor_fixed(line);
             if (wrap_preserved_spaces
                 && (cursor_fixed
@@ -2533,6 +2585,7 @@ bool flow_text(LayoutContext *context, LineState *line,
         bool first_piece = true;
         bool authored_space_before = line->pending_space;
         while (piece_at < end) {
+            if (!layout_text_work(context, &text_work)) return false;
             if (line->clamp_pending) return layout_line_clamp_overflow(line);
             if (layout_preview_limit_reached(context, line->y)) break;
             if (flow_guard == 0) {

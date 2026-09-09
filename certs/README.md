@@ -78,6 +78,12 @@ hostname verification, leaf trust, or intermediate trust is relaxed. Existing
 compatibility roots were checked against the current public bundle and the
 GTS, Microsoft, and GlobalSign repositories; their bytes remain unchanged.
 
+The 0.1.17 refresh revalidated all 25 retained anchors without changing their
+bytes. GTS still publishes the retained legacy R1 as
+[`oldr1.pem`](https://i.pki.goog/oldr1.pem). The native-Mbed-TLS census verified
+334 of 426 tested origins, with 84 unreachable service/apex hosts, eight apex
+hostname mismatches, and no certificate-policy or missing-trust failures.
+
 After the PSP dependency build has unpacked Mbed TLS, build its native client
 and run the live qualification against a current top-300 list, the
 signed-update hosts, and any locally available resource traces. The ranking is

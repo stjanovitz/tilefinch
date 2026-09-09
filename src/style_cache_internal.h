@@ -52,6 +52,66 @@ typedef struct StyleAncestorBloomCache {
     StyleMatchedRangeCacheEntry matched_ranges[STYLE_MATCHED_RANGE_CACHE_CAPACITY];
 } StyleAncestorBloomCache;
 
+/* Exact matched-rule lists retained across layout builds, keyed by element.
+   Only rule indices are stored, never computed values, so one bounded table
+   covers a whole large document where the computed-style reuse cache cannot.
+   The owner (the layout reuse cache) applies the same DOM, stylesheet and
+   focus invalidation it applies to retained computed styles, and entries
+   are consulted only while that owner attaches the table to the sheet's
+   resolve scratch for one element resolution. */
+#define STYLE_RETAINED_MATCH_RULE_LIMIT 12u
+/* Elements plus their ::before/::after lists (absence is a zero-count
+   entry), so about three keys per element. */
+#define STYLE_RETAINED_MATCH_CAPACITY 32768u
+#define STYLE_RETAINED_MATCH_PROBE_LIMIT 8u
+#define STYLE_RETAINED_AFFECTED_RULE_LIMIT 64u
+typedef struct {
+    const lxb_dom_node_t *node;
+    uint16_t rules[STYLE_RETAINED_MATCH_RULE_LIMIT];
+    uint8_t count;
+    uint8_t pseudo;
+} StyleRetainedMatchEntry;
+typedef struct StyleRetainedMatches {
+    Budget *budget;
+    StyleRetainedMatchEntry *entries;
+    size_t occupied;
+    size_t hits, misses, stores;
+    size_t token_invalidations, token_fallbacks, token_dropped,
+        token_affected_rules;
+} StyleRetainedMatches;
+/* A class/id change on `nodes` whose changed tokens are `words`: drop the
+   changed elements' lists and every list of an element that could match a
+   rule depending on those tokens. Falls back to dropping the changed
+   elements' subtrees (their parents' when `parent_scope`) when the rule
+   filters cannot bound the dependency. */
+void style_retained_matches_invalidate_tokens(
+    StyleRetainedMatches *table, const Stylesheet *sheet,
+    const lxb_dom_node_t *const *nodes, size_t node_count,
+    const uint32_t *hashes, size_t hash_count, bool parent_scope);
+/* Translate every stored rule index through `remap` (old index -> new
+   index); entries holding an index outside the map are dropped. */
+void style_retained_matches_remap(StyleRetainedMatches *table,
+                                  const uint16_t *remap, size_t old_count);
+/* Drop every list whose element could be selected by one of `rules`
+   (their rightmost fast key matches); a universal rule clears the table. */
+void style_retained_matches_invalidate_rules(
+    StyleRetainedMatches *table, const Stylesheet *sheet,
+    const uint32_t *rules, size_t count);
+StyleRetainedMatches *style_retained_matches_create(Budget *budget);
+void style_retained_matches_destroy(StyleRetainedMatches *table);
+void style_retained_matches_clear(StyleRetainedMatches *table);
+/* Drop every entry whose element lies inside `scope` (inclusive). */
+void style_retained_matches_invalidate_within(
+    StyleRetainedMatches *table, const lxb_dom_node_t *scope);
+/* Drop every entry whose element is an ancestor of `node` (inclusive). */
+void style_retained_matches_invalidate_ancestors(
+    StyleRetainedMatches *table, const lxb_dom_node_t *node);
+size_t style_retained_matches_bytes(const StyleRetainedMatches *table);
+/* Attach `table` to the sheet's resolve scratch for the caller's element
+   resolutions; returns the previously attached table so it can be restored. */
+StyleRetainedMatches *style_retained_matches_attach(
+    const Stylesheet *sheet, StyleRetainedMatches *table);
+
 bool style_selector_cooperation_begin(
     Stylesheet *sheet, StyleSelectorCooperate cooperate, void *opaque,
     StyleAncestorBloomCache *ancestor_cache);

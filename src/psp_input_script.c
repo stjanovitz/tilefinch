@@ -585,6 +585,23 @@ const char *psp_input_script_mark(const PspInputScript *script)
     return script == NULL ? NULL : script->mark;
 }
 
+bool psp_input_script_exit_pending(const PspInputScript *script)
+{
+    return script != NULL && script->armed && script->finished
+        && (script->reached_end || script->stalled);
+}
+
+bool psp_input_script_cancel_exhausted_modal(
+    PspInputScript *script, PspUiInput *input)
+{
+    if (input == NULL || !psp_input_script_exit_pending(script)) return false;
+    script->stalled = true;
+    memset(input, 0, sizeof(*input));
+    input->held = input->pressed = PSP_UI_BUTTON_MENU;
+    input->analog_x = input->analog_y = 128;
+    return true;
+}
+
 bool psp_input_script_advance(
     PspInputScript *script, PspUiInput *input, uint32_t previous_buttons,
     bool ready)

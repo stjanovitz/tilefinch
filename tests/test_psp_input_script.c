@@ -56,6 +56,25 @@ static bool parse_rejects(const char *text)
     return !parsed && warning_count > 0 && !psp_input_script_armed(&script);
 }
 
+static bool test_modal_exhaustion(void)
+{
+    PspInputScript script;
+    PspUiInput input = {0};
+    CHECK(psp_input_script_parse(&script, "end\n", "modal", NULL, NULL));
+    CHECK(!psp_input_script_exit_pending(&script));
+    CHECK(!psp_input_script_advance(&script, &input, 0, true));
+    CHECK(psp_input_script_exit_pending(&script));
+    CHECK(psp_input_script_cancel_exhausted_modal(&script, &input));
+    CHECK(script.stalled && input.pressed == PSP_UI_BUTTON_MENU
+        && input.held == PSP_UI_BUTTON_MENU);
+    /* A person taking control is not an automation failure or forced exit. */
+    CHECK(psp_input_script_parse(&script, "wait 10\n", "modal", NULL, NULL));
+    psp_input_script_interrupt(&script);
+    CHECK(!psp_input_script_exit_pending(&script));
+    CHECK(!psp_input_script_cancel_exhausted_modal(&script, &input));
+    return true;
+}
+
 static bool test_parser(void)
 {
     PspInputScript script;
@@ -590,7 +609,7 @@ int main(int argc, char **argv)
     snprintf(trace_path, sizeof(trace_path), "menu-tour.host-trace.produced");
 
     if (!test_parser() || !test_file_capacity_boundary()
-        || !test_stepper() || !test_names()
+        || !test_stepper() || !test_names() || !test_modal_exhaustion()
         || !test_live_media_scenario(directory)
         || !test_treadline_long_soak_scenario(directory)
         || !test_treadline_offline_controls_scenario(directory)) return 1;

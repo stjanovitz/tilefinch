@@ -121,12 +121,23 @@ void js_rt_runtime_update_result(ScriptRuntime *runtime,
     JSValue uncaught_length = JS_GetPropertyStr(runtime->context, uncaught,
                                                 "length");
     int64_t uncaught_count = 0;
-    if (JS_ToInt64(runtime->context, &uncaught_count, uncaught_length) == 0
-        && uncaught_count > 0) {
-        runtime->result.uncaught_callback_errors = (size_t) uncaught_count;
-        JSValue last = JS_GetPropertyUint32(
-            runtime->context, uncaught, (uint32_t) (uncaught_count - 1));
-        const char *text = JS_ToCString(runtime->context, last);
+    (void)JS_ToInt64(runtime->context, &uncaught_count, uncaught_length);
+    int64_t reported_count = 0;
+    JSValue reports = JS_GetPropertyStr(runtime->context, global,
+                                        "__tilefinchUncaughtErrorCount");
+    if (JS_ToInt64(runtime->context, &reported_count, reports) != 0)
+        reported_count = 0;
+    JS_FreeValue(runtime->context, reports);
+    if (reported_count < uncaught_count) reported_count = uncaught_count;
+    if (reported_count > 0) {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        bool newly_uncaught = (size_t) reported_count
+            != runtime->result.uncaught_callback_errors;
+#endif
+        runtime->result.uncaught_callback_errors = (size_t) reported_count;
+        JSValue last = uncaught_count > 0 ? JS_GetPropertyUint32(
+            runtime->context, uncaught, (uint32_t) (uncaught_count - 1)) : JS_UNDEFINED;
+        const char *text = uncaught_count > 0 ? JS_ToCString(runtime->context, last) : NULL;
         if (text != NULL) {
             snprintf(runtime->result.last_uncaught_callback_error,
                      sizeof(runtime->result.last_uncaught_callback_error),
@@ -135,7 +146,22 @@ void js_rt_runtime_update_result(ScriptRuntime *runtime,
                 snprintf(runtime->result.error,
                          sizeof(runtime->result.error), "%s", text);
             }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+            if (newly_uncaught) {
+                char diagnostic[768];
+                snprintf(diagnostic, sizeof(diagnostic),
+                    "tilefinch-script-callback-error: count=%lld "
+                    "heap-remaining=%zu heap-rejections=%zu error=\"%.600s\"",
+                    (long long) uncaught_count,
+                    script_runtime_heap_remaining(runtime),
+                    script_runtime_heap_rejections(runtime), text);
+                tilefinch_platform_log_message(diagnostic);
+            }
+#endif
             JS_FreeCString(runtime->context, text);
+        } else if (runtime->result.error[0] == '\0') {
+            snprintf(runtime->result.error, sizeof(runtime->result.error),
+                "callback exception (details unavailable)");
         }
         JS_FreeValue(runtime->context, last);
     }

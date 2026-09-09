@@ -213,6 +213,11 @@ bool psp_input_script_running(void)
         && !psp_input_script.finished;
 }
 
+bool psp_input_script_report_pending(void)
+{
+    return psp_input_script_exit_pending(&psp_input_script);
+}
+
 void psp_input_script_interrupt_by_user(void)
 {
     if (!psp_input_script_running()) return;
@@ -278,7 +283,12 @@ bool psp_input_script_text_frame(PspUiInput *input)
         psp_input_script_interrupt_by_user();
         return false;
     }
-    return psp_input_script_frame(input, true, true);
+    if (psp_input_script_frame(input, true, true)) return true;
+    if (!psp_input_script_cancel_exhausted_modal(&psp_input_script, input))
+        return false;
+    printf("tilefinch-input-script: event=keyboard-input-exhausted step=%u\n",
+           (unsigned) psp_input_script.step);
+    return true;
 }
 
 /*

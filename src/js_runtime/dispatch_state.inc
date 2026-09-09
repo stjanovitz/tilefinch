@@ -520,6 +520,41 @@ void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
     }
 }
 
+void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,
+                                 int css_height, int device_width,
+                                 int device_height)
+{
+    if (runtime == NULL || runtime->context == NULL || css_width <= 0
+        || css_height <= 0 || device_width <= 0 || device_height <= 0) return;
+    /* The bootstrap copies the viewport globals into innerWidth/innerHeight
+       once at realm creation. A realm created at a parser-blocking script
+       before <meta name=viewport> was scanned therefore keeps the legacy
+       layout width unless the resolved viewport is republished here. */
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    (void) JS_SetPropertyStr(runtime->context, global,
+                             "__tilefinchViewportWidth",
+                             JS_NewInt32(runtime->context, css_width));
+    (void) JS_SetPropertyStr(runtime->context, global,
+                             "__tilefinchViewportHeight",
+                             JS_NewInt32(runtime->context, css_height));
+    (void) JS_SetPropertyStr(runtime->context, global,
+                             "__tilefinchDeviceWidth",
+                             JS_NewInt32(runtime->context, device_width));
+    (void) JS_SetPropertyStr(runtime->context, global,
+                             "__tilefinchDeviceHeight",
+                             JS_NewInt32(runtime->context, device_height));
+    (void) JS_SetPropertyStr(runtime->context, global,
+                             "__tilefinchViewportScale",
+                             JS_NewFloat64(runtime->context,
+                                           (double) device_width
+                                           / (double) css_width));
+    (void) JS_SetPropertyStr(runtime->context, global, "innerWidth",
+                             JS_NewInt32(runtime->context, css_width));
+    (void) JS_SetPropertyStr(runtime->context, global, "innerHeight",
+                             JS_NewInt32(runtime->context, css_height));
+    JS_FreeValue(runtime->context, global);
+}
+
 void script_runtime_set_images(ScriptRuntime *runtime,
                                ImageResources *images)
 {

@@ -493,6 +493,7 @@ static void navigation_ensure_layout_reuse(NavigationSession *session)
                session->budget, 96u * 1024u, 512u * 1024u)) return;
     session->page.layout_reuse =
         layout_reuse_cache_create(session->budget);
+    layout_reuse_cache_enable_retained_matches(session->page.layout_reuse);
 }
 
 static void navigation_record_layout_reuse(
@@ -514,9 +515,28 @@ static void navigation_record_layout_reuse(
     ADD_REUSE_DELTA(scoped_invalidations,
                     layout_reuse_scoped_invalidations);
     ADD_REUSE_DELTA(full_resets, layout_reuse_full_resets);
+    ADD_REUSE_DELTA(matched_hits, layout_reuse_matched_hits);
+    ADD_REUSE_DELTA(matched_misses, layout_reuse_matched_misses);
+    ADD_REUSE_DELTA(matched_stores, layout_reuse_matched_stores);
 #undef ADD_REUSE_DELTA
     session->performance.layout_reuse_retained_bytes =
         after->retained_bytes;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (after->matched_hits != before->matched_hits
+        || after->matched_stores != before->matched_stores) {
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "tilefinch-layout-reuse: styles=%zu/%zu matched=%zu/%zu/%zu "
+                 "retained=%zu",
+                 after->style_hits - before->style_hits,
+                 after->style_misses - before->style_misses,
+                 after->matched_hits - before->matched_hits,
+                 after->matched_misses - before->matched_misses,
+                 after->matched_stores - before->matched_stores,
+                 after->retained_bytes);
+        tilefinch_platform_log_message(message);
+    }
+#endif
 }
 
 static bool navigation_build_layout(NavigationSession *session,

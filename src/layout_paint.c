@@ -1633,6 +1633,20 @@ bool build_spatial_index(LayoutDocument *layout,
     return true;
 }
 
+typedef struct {
+    const lxb_dom_node_t *node;
+    const LayoutNodeBox *box;
+    bool shared;
+} ScrollClipEntry;
+
+static size_t scroll_clip_slot(const lxb_dom_node_t *node, size_t capacity)
+{
+    uintptr_t value = (uintptr_t) node >> 4;
+    value ^= value >> 17;
+    value *= (uintptr_t) 0x9e3779b1u;
+    return (size_t) (value & (capacity - 1u));
+}
+
 int root_scroll_width_after_clipping(LayoutDocument *layout,
                                             int viewport_width)
 {
@@ -1643,18 +1657,38 @@ int root_scroll_width_after_clipping(LayoutDocument *layout,
     for (size_t i = 0; i < layout->node_box_count; i++) {
         if (layout->node_boxes[i].clips_x) clip_count++;
     }
-    const LayoutNodeBox **clip_boxes = NULL;
+    /* A candidate is clipped when any other clipping box's node is on its
+       ancestor chain (its own node included, for a second box of the same
+       node). Testing every candidate against every clipping box walked the
+       chain once per pair; a large article has thousands of boxes and dozens
+       of clippers. Hash the clipping nodes once and walk each chain once,
+       keeping the pairwise scan only when that small table is refused. */
+    ScrollClipEntry *clip_set = NULL;
+    size_t clip_capacity = 0;
     if (clip_count != 0) {
-        size_t clip_bytes = clip_count * sizeof(*clip_boxes);
+        clip_capacity = 16;
+        while (clip_capacity < clip_count * 2u
+               && clip_capacity < SIZE_MAX / 2u) clip_capacity *= 2u;
+        size_t clip_bytes = clip_capacity * sizeof(*clip_set);
         size_t remaining = budget_remaining(layout->budget);
         if (clip_bytes < remaining && remaining - clip_bytes >= 128) {
-            clip_boxes = budget_malloc(layout->budget, clip_bytes);
+            clip_set = budget_calloc(layout->budget, clip_capacity,
+                                     sizeof(*clip_set));
         }
-        if (clip_boxes != NULL) {
-            size_t at = 0;
+        if (clip_set != NULL) {
             for (size_t i = 0; i < layout->node_box_count; i++) {
-                if (layout->node_boxes[i].clips_x) {
-                    clip_boxes[at++] = &layout->node_boxes[i];
+                const LayoutNodeBox *box = &layout->node_boxes[i];
+                if (!box->clips_x) continue;
+                size_t slot = scroll_clip_slot(box->node, clip_capacity);
+                while (clip_set[slot].node != NULL
+                       && clip_set[slot].node != box->node) {
+                    slot = (slot + 1u) & (clip_capacity - 1u);
+                }
+                if (clip_set[slot].node == NULL) {
+                    clip_set[slot].node = box->node;
+                    clip_set[slot].box = box;
+                } else {
+                    clip_set[slot].shared = true;
                 }
             }
         }
@@ -1662,15 +1696,24 @@ int root_scroll_width_after_clipping(LayoutDocument *layout,
     for (size_t i = 0; i < layout->node_box_count; i++) {
         const LayoutNodeBox *candidate = &layout->node_boxes[i];
         bool clipped = false;
-        size_t ancestor_count = clip_boxes == NULL
-                                ? layout->node_box_count : clip_count;
-        for (size_t j = 0; j < ancestor_count; j++) {
-            const LayoutNodeBox *ancestor = clip_boxes == NULL
-                ? &layout->node_boxes[j] : clip_boxes[j];
-            if (ancestor == candidate || !ancestor->clips_x) continue;
-            if (layout_node_within(candidate->node, ancestor->node)) {
-                clipped = true;
-                break;
+        if (clip_set != NULL) {
+            for (const lxb_dom_node_t *at = candidate->node;
+                 at != NULL && !clipped; at = at->parent) {
+                size_t slot = scroll_clip_slot(at, clip_capacity);
+                while (clip_set[slot].node != NULL) {
+                    if (clip_set[slot].node == at) {
+                        clipped = clip_set[slot].shared
+                                  || clip_set[slot].box != candidate;
+                        break;
+                    }
+                    slot = (slot + 1u) & (clip_capacity - 1u);
+                }
+            }
+        } else {
+            for (size_t j = 0; j < layout->node_box_count && !clipped; j++) {
+                const LayoutNodeBox *ancestor = &layout->node_boxes[j];
+                if (ancestor == candidate || !ancestor->clips_x) continue;
+                clipped = layout_node_within(candidate->node, ancestor->node);
             }
         }
         if (clipped) continue;
@@ -1715,7 +1758,7 @@ int root_scroll_width_after_clipping(LayoutDocument *layout,
             }
         }
     }
-    budget_free(layout->budget, clip_boxes);
+    budget_free(layout->budget, clip_set);
     for (size_t i = 0; i < layout->count; i++) {
         if ((layout->command_flags[i]
              & (LAYOUT_COMMAND_CLIPPED_X | LAYOUT_COMMAND_FIXED)) != 0) {

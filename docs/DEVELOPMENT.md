@@ -77,9 +77,29 @@ Useful narrow host test modes (not replacements for the complete suite):
   publication starts. Reports request-to-cooperative-acknowledgement,
   acknowledgement-to-idle-return (rollback drain), and their total. Asserts
   that cancellation keeps the loaded fallback page, font bytes and relayout
-  count unchanged. This measures safe cancellation, not input sampling or
-  pixels reaching the display. Choose a delay shorter than the measured
+  count unchanged. It then moves focus and finishes bounded raster slices,
+  composites the interactive host lab's native focus outline, and requires
+  different pixels. `font-input-feedback` reports request-to-framebuffer time,
+  including rollback and rendering, not physical sampling or scanout latency.
+  Choose a delay shorter than the measured
   publication; the probe fails if publication finishes without interruption.
+- `--navigation-interrupt-replay TRACE URL DELAY_US` uses the same feedback
+  check after incremental navigation with external stylesheets and scripts.
+  Prefer this over the smaller font-only probe for realistic page costs.
+  `navigation-responsiveness` distinguishes the longest pump from the longest
+  cooperative gap inside it, naming both ends of the gap. A long pump can
+  still service native controls; it does not make arbitrary DOM edits safe
+  while the layout transaction owns its scratch state.
+- `--pointer-search-only` checks pointer down/up, committed click, native text
+  replacement, implicit form submission, sliced navigation and a rendered
+  result link using a hostname-neutral fixture. `--search-journey-replay TRACE URL`
+  applies that journey to a captured Wikipedia homepage and the query `psp`.
+  Its admission settings mirror the installed v0.1.16 configuration; the
+  qualification runner also supplies the 4 MiB temporary startup window.
+  Wikipedia may legitimately redirect an exact query to a disambiguation page;
+  the check requires its actionable article link, not a particular results CSS
+  class. Capture actual device behavior before diagnosing a host-only pass as
+  a fix for an unobserved device failure.
 - `build-preset-release/tilefinch-script-lazy-tests path/to/script.js [...]`
   inspects the supplied script files instead of running the default fixtures.
 - `build-preset-release/tilefinch-quickjs-oom-tests N` runs the allocation
@@ -93,6 +113,550 @@ Layout likewise keeps its four-node quota for cheap work but cooperates at
 the next node boundary after eight milliseconds. A single node can still
 overrun that interval; this is a safe-point rule, not a hard frame deadline.
 Do not infer physical-PSP responsiveness from host elapsed times alone.
+
+### Host browsing responsiveness qualification
+
+```sh
+python3 benchmarks/run-host-browsing-responsiveness.py \
+  --wikipedia-home-trace /private/path/to/home-capture \
+  --wikipedia-article-trace /private/path/to/article-capture \
+  --search-trace /private/path/to/home-search-capture
+```
+
+The runner builds the optimized host first, then runs font rollback/retry,
+visible focus and held scrolling, disclosure expansion, deferred images,
+provider navigation, pointer search, native UI/supervisor, and media
+presentation/state regressions. These are composable host checks, not a
+single end-to-end hardware playback claim. It never builds for PSP, launches
+an emulator, plays audio, or contacts a live site. Captures are optional;
+without them the synthetic gates still run. Keep capture bodies and raw
+journey logs outside public source control. Output defaults to the ignored
+build tree and includes raw logs, raster checksums, and `summary.json`.
+
+To cover delayed script initialization rather than stopping at the first
+optional font publication, also supply `--startup-trace /private/path/to/capture`
+and `--startup-url https://example.test/article`. This runs 1,800 logical 16 ms
+runtime/idle turns (28.8 seconds of timer time, configurable with
+`--startup-ticks 2..4096`) with installed-app admission (5 MiB base JavaScript heap plus the existing
+4 MiB boot window), checks focus rendering before and after settling, and
+requires completed dynamic scripts without uncaught errors. It reports caught
+heap refusals separately: an allocation refusal is not itself evidence of an
+uncaught initialization failure. The last dynamic-script completion time is
+measured from navigation commit, not from the initial request; it does not
+prove future timers cannot start additional work beyond that window. The old
+240-turn wall-clock-only replay could finish before delayed initialization
+timers became due. It remains available by invoking
+`tilefinch-browser-engine-tests --navigation-settle-replay TRACE URL` directly;
+append the bounded turn count to select logical-clock replay. Do not compare
+the two as equivalent amounts of initialization work.
+
+Focused synthetic checks are available as
+`tilefinch-js-responsiveness-tests --external-compile-pressure-only` and
+`--task-time-slice-only`. The dynamic-script suite additionally pins tail
+continuation admission after the script has consumed its initial reserve.
+
+PSP execution policies now stop starting additional author tasks after a
+16 ms runtime-turn target. A task and its microtask checkpoint retain their
+ordering, and one expensive task can exceed that target. This is not a hard
+frame deadline. Optional font/image idle work yields to queued dynamic scripts,
+classic-script continuations and runnable microtasks for at most 128 runtime
+turns; the baseline page, input, and tile work remain available. Pending timers
+and ordinary in-flight fetches do not impose that resource delay. Recovery's
+broader pending-author-work predicate is unchanged.
+External compilation under heap pressure collects dead cycles before parsing.
+Its collection watermark is 64 KiB plus 16 times the upcoming source length,
+saturating at 1 MiB before multiplication. This is a GC heuristic, not an
+admission guarantee: the allocator still enforces the unchanged heap limit.
+Tiny loader segments with ample headroom therefore avoid a full collection;
+even tiny segments still collect when less than 64 KiB remains. Collection
+time is included in compile attribution. The focused pressure test covers
+both small and large compilations against unreachable cycles, including a
+negative control that fails with the former unconditional 1 MiB watermark.
+Automatic GC pacing likewise must not reset its threshold below the live
+heap on every advance. When the desired reserve is already occupied, the
+next threshold allows allocation of half the remaining headroom before
+collection. A synthetic regression checks that nearly idle turns do not
+collect repeatedly, while real subsequent heap growth still collects cycles.
+
+Two bounds keep that yield and the optional font batch from starving a
+device page. `BrowserConfig.startup_resource_deferral_us` (3 s by default)
+caps the startup deferral by wall clock per runtime, because a device that
+advances 100 ms script tasks reaches the 128-turn cap only after a quarter
+of a minute while an in-flight external script keeps the predicate true.
+`BrowserFontConfig.maximum_publication_work_units` (200,000 by default, about
+4.4 s of layout on the PSP-3000) keeps the fallback faces on pages whose
+initial layout needed more work than that: publishing the batch reflows the
+whole page at roughly the same cost, and a cancelled attempt would only be
+retried. Both are pinned by the staged-font lifecycle scenarios.
+
+The logical-clock startup replay exposed an allocation failure while a DOM
+selector result constructed native wrappers. Receiver-only wrapper methods
+and accessors now share a native prototype layer; private handle/rebinding
+closures remain per wrapper. Listener methods are shared and listener maps
+are created only on registration. Lazily created `classList` objects also
+share their method functions, accessors and numeric-index proxy handler. Each
+list retains its own descriptors and strong owner link: do not replace this
+with an unrooted handle or change native wrapper retirement timing. Borrowed
+methods use the receiving list's owner, and invalid receivers throw. The
+regression exercises all 48 lists, indexed access, iteration, atomic token
+validation, independent mutations, and final Budget restoration.
+Descriptors are copied, not evaluated. Receiver-only descriptors are inherited
+from the shared native layer with their existing flags; individual overrides
+remain independent. Custom-element/shadow promotion materializes the descriptors
+before replacing that layer. Detached shim adoption likewise replaces its own
+virtual accessors with native descriptors, preserving parent/text/owner state.
+The original 48-wrapper regression used 428,624
+bytes on the optimized host and pins a 512 KiB ceiling; it also checks independent
+attributes/listeners and detached-node behavior. The previously failing
+28.8-second replay now finishes without uncaught errors or failed dynamic
+scripts, with unchanged final rasters. Four caught allocation refusals remain
+visible; this is not a claim of unlimited memory or zero allocation pressure.
+Five fresh-process logical-clock replays recorded 300.7 ms median total
+runtime work (302.5 ms maximum), with a 114.2 ms maximum individual advance;
+the final dynamic completion was 285.5 ms median after commit. These are
+captured host workloads, not live-network or physical-PSP startup timings.
+The sanitizer lifecycle fixture allows 200 ms per task because its former
+20 ms deadline also interrupted setup with the old DOM wrappers. Its endless
+handler interruption and recovery assertions remain enabled.
+
+The larger, fresh September 8 capture exercises **six** dynamic scripts, not
+the three in the earlier timing capture below. Its late initialization failure
+required additional generic fixes: native constant-stack document-order queries
+avoid constructing sibling wrappers; motion inspection wraps only actual
+animation candidates; small late scripts use a source-scaled execution reserve;
+optional bytecode serialization preserves execution headroom; and function-source
+snapshots/joins retain shared strings rather than repeatedly flattening copies.
+The 1,800-tick optimized host replay completes all six scripts with zero failed
+scripts and an empty final `ScriptResult.error`, then moves focus and renders
+three viewports. This is not sufficient to certify callback success: subsequent
+console tracing found an uncaught focus-handler OOM which that final summary
+misses. Three allocation refusals were counted during settle; do not classify
+them all as harmless optional work. The 5 MiB base heap plus existing 4 MiB startup donation and overall Budget
+are unchanged. Do not claim physical-PSP validation from this host result.
+Focused negative controls restore the old source-snapshot implementation,
+fixed script reserve, and wrapper-based document-order path; all three new
+regressions must fail before accepting the restored fixes.
+
+The September 8 transient-allocation follow-up keeps that same six-script
+workload. Stylesheet structural-IR capture now stops when its monotonically
+growing output cannot be smaller than the source, caps geometric growth by
+that useful-output bound, and releases disqualified scratch immediately.
+Rebuilds from document-retained CSS also skip new IR when the exact backing
+HTTP-cache entry no longer exists. Fresh responses still capture IR, valid
+artifacts still replay, and compiled selector fragments still seed the first
+parse even when they cannot be retained for the next navigation.
+
+In the captured article, this removes three discarded 137,841-byte artifacts
+(each previously grew a 262,144-byte scratch buffer). The first useful large
+capture's capacity falls from 262,144 to 170,212 bytes. Total Budget allocation
+count falls from 11,826 to 11,823; realloc growth is not counted in that metric.
+The global peak remains **28,624,466 bytes**, and final ownership and all three
+raster checksums are unchanged: the page's largest peak is elsewhere. Three
+serial optimized-host samples give median aggregate runtime work of 1,577 ms
+before and 1,524 ms after; treat this small difference as no observed slowdown,
+not a hardware speedup claim. All six scripts still complete and the same three
+settle-phase heap refusals remain.
+
+The stylesheet-resource tests pin small-capture allocation/peak bounds and
+retained-response rebuilds without cache ownership; restoring either old path
+must fail its regression. The navigation-settle replay prints global/category
+current, peak, allocation, and free counts after its final rasters. Those are
+Budget-ledger metrics, not physical allocator RSS or a sum of temporary bytes.
+No heap limit, timeout, cache format, or device setting changes in this batch.
+
+The allocation-refusal follow-up fixes two QuickJS ownership/serialization
+paths without raising those ceilings. Failed Latin-1/UTF-16 CString conversion
+now releases its duplicated input reference. Bytecode serialization indexes
+only atoms encountered by that write instead of allocating a dense array up
+to the runtime's highest atom ID. A late-script regression with 20,000 unrelated
+interned names succeeds with 16 KiB of remaining heap; the old writer refuses.
+Output bytes and encounter-order indices remain unchanged. Buffer or atom-table
+refusal also stops serialization rather than returning a partial cache artifact.
+The fault sweep reproduced a 9,137-byte partial result where 18,137 bytes were
+required before this fix. Negative controls fail for each of these three cases;
+the restored tests check complete teardown ownership as well as results.
+
+The six-script captured replay no longer shows its original 48,711-to-73,062-byte
+cache-buffer growth refusal. It still ends near the same 9 MiB heap ceiling
+(9,434,295 bytes allocated), and the focus-handler OOM remains reproducible.
+All three raster checksums are unchanged. Allocation-rejection deltas printed
+at settle omit earlier and later operations; inspect the full rejection and
+console log, not that delta or an empty final error alone. This is a partial
+fix, not a clean Wikipedia interaction qualification. Optimized host and focused
+ASan/UBSan verification passed; physical PSP validation remains outstanding.
+
+The subsequent heap fix completes that host interaction qualification without
+raising either ceiling. Function-source snapshots now share immutable ASCII
+spans in their existing UTF-8 source backing; only short Unicode runs are
+decoded into new strings. Standalone functions adopt their source on first
+snapshot too. Rope hashing, comparison, indexing, flattening, rebalancing,
+printing and repeated-prefix evaluation honor the span boundaries. The span
+uses the rope's existing right-hand value for its offset, so ordinary ropes
+do not grow. Source ownership never retains a function or its realm, and
+the 16-KiB-headroom tests cover both release orders, mixed Unicode, joins,
+atomization, JSON, evaluation and standalone functions. Empty objects also
+start with one property slot instead of reserving an unused second slot;
+shared-shape capacities and normal admitted growth are unchanged.
+
+The replay now advances and checks errors after eight post-settle focus
+interactions, including their heap-rejection delta. A saturating callback-error
+count is published before diagnostic formatting, so failure to stringify an
+exception cannot make the qualification pass silently. Restoring the pre-fix
+engine fails the source-span test and the strengthened replay with a focus
+handler OOM; suppressing the early counter fails the unprintable-error test.
+The fixed six-script replay has no uncaught callbacks, no failed scripts and
+no allocation refusals during those eight interactions; all three raster
+checksums remain byte-identical. One caught allocation refusal remains in
+the page's optional JSON cache serialization, confirmed by the allocator
+stack, rather than being inferred from an empty error message. The live heap
+is still close to its bound: this is not a promise that every future module
+or action will fit. Device qualification remains required before release.
+Three fresh serial host runs retain 9,387,156 JS-allocated bytes after the
+interaction sequence versus 9,434,295 before the fix, with unchanged 9,437,184
+admission. Median aggregate runtime work is 1,480,790 us and the largest
+advance across those samples is 286,583 us; the rebuilt negative control is
+1,481,001 us / 285,074 us, so this is a correctness/headroom improvement,
+not a demonstrated throughput win. Global Budget peak is 28,531,869 bytes;
+final ownership is 26,735,713 bytes, including the additional interactions.
+The full optimized suite (151 tests) and focused QuickJS ASan/UBSan gate pass;
+the update-root proof still skips for its unavailable external prerequisite.
+
+Before attempting further memory reductions, consult the
+[memory experiment ledger](engineering/MEMORY_EXPERIMENTS.md). It records the
+cached-function-source improvement, earlier rejected allocator changes, and
+the evidence required before retrying them. Do not repeat blanket arena-size,
+allocation-order or GC experiments without a changed premise.
+
+Five fresh-process article replay samples on 2026-09-07 compared scheduling
+against a rebuilt control that already included the memory fixes (so both
+executed all three dynamic scripts). Median last-dynamic-completion time after
+commit fell from 370.5 to 181.7 ms; preceding optional idle work fell from
+202.6 ms to 0.011 ms. Median worst runtime advance fell from 33.0 to 30.4 ms
+(maximum across samples: 33.3 to 30.9 ms). The final run had no uncaught errors
+or failed dynamic scripts; three caught heap refusals remained observable.
+Initial resources were unchanged: 14 loaded and 37 ordinary images deferred.
+This prioritizes interaction/initialization; it does not eliminate the later
+font/image work or the roughly 100–114 ms cooperative layout/publication calls.
+
+An 8 ms task target produced extra intermediate reflows in this replay and
+was not adopted. A separate CSS-image deferral experiment reduced eager
+loads but multiplied relayout cost; it too was reverted. Keep the 60-second
+navigation watchdog until physical-PSP timing and remaining indivisible work
+justify changing it. These host measurements are not hardware claims.
+
+The next full-resource replay profile found that each late reflow also built
+the same CSS-counter prefix, resolving up to 4,096 element styles outside
+the ordinary style-cache path. Layout now transfers that compact index to
+its existing reuse cache between unchanged builds; no second copy is made.
+The index payload is at most 32 KiB on the PSP (64 KiB on a 64-bit host),
+with allocator overhead also Budget-charged. It remains pressure-evictable
+and is included in retained-byte
+accounting. Every DOM/focus/style invalidation clears it. Container-query
+sheets remain uncached because resource-driven geometry can change their
+counter/display conditions. Counter cursors are freshly constructed each
+build; canceled builds and allocation-refused prefixes are not retained.
+
+The page reuse cache also retains each element's exact matched author-rule
+list (`StyleRetainedMatches`, at most 12 rule indices per element in a
+32,768-slot table: 1 MiB on the PSP, plus bounded table metadata, allocated
+from the layout budget once
+a committed page has at least 64 rules). The 1,024-entry computed-style
+cache cannot cover a large article, so the candidate-image traversal and the
+first layout each resolved every element from scratch, and the selector
+work is the memory-bound part of style resolution on the device. A retained
+list skips subject preparation, index planning and every candidate
+evaluation; the rules are replayed per cascade range, so the computed style
+is identical by construction. Lists are recorded only for complete,
+uncancelled resolutions and never for container-query sheets or nested
+resolutions. They are consulted only while the reuse cache attaches the
+table for one canonical resolution, never across the focus-marker probe,
+and they follow the same invalidation as retained computed styles: scoped
+attribute/text mutations drop the changed subtree (the parent's subtree when
+structural selectors exist), simple focus changes also drop the ancestor chain,
+and focus with `:focus-within`, `:has()` or sibling dependencies resets the
+cache because other branches can change without a parent-style hash change. Also,
+child-list, innerHTML, head-script, unknown or overflowed journals reset the
+cache. The streaming preview cache never opts in, because parser appends
+are not journaled. `TILEFINCH_DISABLE_RETAINED_MATCHES=1` disables the table
+on the host for A/B comparison; the lab's `layout-reuse` line and the device
+`tilefinch-layout-reuse:` line report hits/misses/stores.
+
+Three refinements build on that table. First, class and id attribute
+mutations are journaled with the hashes of the tokens that changed
+(`stylesheet_attribute_change_tokens`, up to eight per record), and each rule
+filter lists the class/id tokens outside its rightmost compound
+(`relational_tokens`, including functional arguments in the rightmost compound,
+such as `p:is(.active p)`). Coalesced writes union all changed tokens; any
+inexact write or token overflow keeps conservative invalidation. A journaled change
+whose tokens no relational list mentions drops only the changed element's
+own lists; otherwise the affected rules (capped at 64, else the old subtree
+drop) select the lists to drop by their rightmost fast key
+(`layout_reuse_cache_invalidate_attribute`, settled once per journal by
+`layout_reuse_cache_flush_invalidations`). Rules whose dependency cannot be
+listed (`:has()`, `of S` nth forms, escaped identifiers, `[class]`/`[id]`
+attribute selectors) count as always affected. A body class toggle that no
+rule references therefore keeps every retained list; the lab's
+`layout-reuse ... token=` triple and the device `tilefinch-layout-invalidate:`
+line count invalidations, fallbacks and dropped lists. Second, the table also
+keys `::before`/`::after` lists (an empty list records absence), so pseudo
+resolution replays or skips across builds; the layout and the image traversal
+attach the table around their pseudo resolutions. Third, image discovery no
+longer resolves every element's `::before`/`::after` styles:
+`style_node_pseudo_rules_may_affect_discovery` runs the exact selector test
+only for pseudo candidates flagged as able to change display/visibility or
+supply an image (background, mask, generated content, deferred
+declarations), and an element with no such match skips both pseudo
+resolutions. Elements themselves are still resolved in full, because the
+device measurement showed that skipping them costs more in the first layout
+(their retained lists are no longer seeded) than it saves in the traversal.
+`TILEFINCH_DISABLE_IMAGE_PREFILTER=1` restores the pseudo resolutions on the
+host; the `image-attribution-us ... prefilter=` and device
+`tilefinch-candidate-images: ... prefilter=` fields report skipped/checked
+elements.
+
+Late page initialization on large articles used to pay three full costs per
+event. A script-inserted `<style>` element forced a stylesheet rebuild (about
+8 s on the device) plus a full relayout with every retained style answer
+reset; a subtree inserted from a detached tree reset the reuse cache as a
+removal would; and a class toggle on a high element re-ran image discovery
+over the whole document. Now: (1) `navigation_try_append_inserted_styles`
+appends newly inserted `<style>` elements to the page sheet in place
+(`stylesheet_append_style_elements_tracked`): the sheet records the inline
+`<style>` elements it ingested (`style_source_nodes`), the new rules take
+their document position by renumbering the later rules' `order` and
+re-sorting (selector program and rule index rebuild lazily), and the reuse
+cache receives an old-to-new rule index map so the retained matched-rule
+lists survive, dropping only the lists a new rule's fast key can select
+(`layout_reuse_cache_note_stylesheet_appended`). A `<link>` insertion, a
+change inside an already ingested `<style>`, an innerHTML replacement that
+carried stylesheet sources, or a source list the sheet could not bound still
+rebuilds. (2) A child-list record whose node was inserted from a
+detached tree removed nothing, so reuse invalidation scopes it to the parent
+(structural selectors) instead of resetting, and head-script records
+invalidate nothing; moves, removals, innerHTML and unknown records stay
+destructive because freed elements may still be named by retained lists.
+(3) A class/id change whose tokens no display, visibility or image rule
+depends on (`stylesheet_tokens_may_affect_discovery`) no longer marks
+descendants image-sensitive, so no discovery rescan follows. Host switches:
+`TILEFINCH_DISABLE_STYLE_APPEND`, `TILEFINCH_DISABLE_INSERT_SCOPED_REUSE`,
+`TILEFINCH_DISABLE_DISCOVERY_GATE`; the lab's `layout-reuse ...
+style-appends=` pair and the device `tilefinch-style-append:` line count
+appends and fallbacks, and the device `tilefinch-mutation-journal:` line
+lists each consumed journal's records.
+
+Media queries are evaluated when a sheet is parsed, against the viewport the
+sheet was built for (`Stylesheet.viewport_width/height`). The streaming
+blocking stylesheet is first compiled at the parser-blocking script
+checkpoint that needs it, and the stream's metadata scan runs at those
+checkpoints and at `</head>`; a page whose `<meta name=viewport>` follows its
+first stylesheet `<link>` or a head script therefore compiles the early sheet
+for the 980 px legacy viewport and only later learns the device width. The
+stream fingerprint includes the current viewport, so the next checkpoint sees
+a stale fingerprint, but the continuation path
+(`navigation_stream_try_continue_stylesheet`) used to append the suffix
+sources onto the stale prefix and adopt the moved fingerprint, and the commit
+then adopted the sheet because it compared the stream's current viewport,
+not the sheet's. The reference article rendered every `min-width: 640px`
+rule and none of the `max-width: 639px` rules at 480 px, which is what kept
+its section bodies visible and every layout at 8,600 elements. Now a
+continuation is refused when the sheet's viewport differs from the stream's
+(`blocking_stylesheet_viewport_rebuilds`, printed as `viewport-rebuilds=` on
+the lab's `blocking-stylesheets` line and the device's navigation job line),
+so the checkpoint rebuilds the sheet at the resolved width, and commit
+adoption also requires the sheet's own viewport to match. Regression:
+`test_streaming_stylesheet_follows_late_viewport`
+(`fixtures/http-viewport-after-stylesheet`). The same late viewport reached
+scripts: the bootstrap copies `__tilefinchViewportWidth` into `innerWidth`
+once when the realm is created, and a realm created at a parser-blocking
+script before the meta scan kept answering 980 to `innerWidth`,
+`matchMedia` and `documentElement.clientWidth` after the page committed at
+480 (the article's section toggler treats `innerWidth >= 720` as a tablet
+and expanded every section). `script_runtime_set_viewport` republishes the
+viewport globals and `innerWidth`/`innerHeight`; the stream's metadata scan
+and the commit call it after resolving the viewport, and the regression
+above also asserts the script-visible width. Device effect on the article:
+load 27.4 s to 10.4 s, initial layout 11.5 s to 0.7 s, script relayouts 16-25 s
+to 0.7-1.9 s; with the sections collapsed the page stays at about 1,000
+elements through its whole initialization.
+
+The retained-cache review regressions cover handoff from the per-build
+matched-range cache, nested-selector dependencies, coalesced attribute writes
+and focus effects on another descendant. A warm range-cache hit must record
+its rules into a newly attached retained list, just like a fresh match scan.
+Selector admission treats quoted/escaped `::` as data and leaves functional
+selector lists to their established matcher. Optional-font publication refusal
+is local to the current layout and must not mark a font file permanently failed
+for later provider navigations. Focused review modes are
+`tilefinch-style-index-tests --retained-handoff-only`,
+`--retained-nested-only`, `--retained-focus-only`, and
+`--quoted-punctuation-only`, plus
+`tilefinch-js-responsiveness-tests --coalesced-tokens-only` and the existing
+`tilefinch-browser-engine-tests --font-staging-only`.
+
+One warm-up plus five matched fresh-process article replays on 2026-09-07
+reduced median font-publication idle calls from 106.7 to 77.7 ms and
+image-publication calls from 114.7 to 85.2 ms. Maximum idle call fell from
+116.1 to 87.0 ms; total optional idle work fell from 227.8 to 168.5 ms.
+All three raster checksums, text fingerprint, page height and script outcomes
+were identical. Initial navigation and script time were not materially changed.
+`navigation-publication` now reports font/image call times, counter-index
+builds/hits and cache bytes separately in the startup replay; the benchmark
+also checks deterministic startup rasters.
+
+The counter reuse regression fails with reuse disabled, and covers scoped
+display mutations, stylesheet changes, container queries, cancellation after
+ownership transfer, and retry/teardown Budget restoration. Host input probes
+at 0.5, 2 and 4 ms into font publication still acknowledged and rolled back
+within 0.264 ms, with visible focus feedback within 2.015 ms. This does not
+promise a device latency or a sub-frame full rebuild: element-style matching
+remains the largest remaining cost. A transient bidi-absence cache was also
+measured and reverted because it did not improve this workload.
+
+The subsequent element-matching profile found avoidable saturation in the
+ancestor filter: each tag occupied both a name token and a numeric-ID token.
+Rules and subjects now use the same canonical tag-name token. Sibling steps
+exclude the sibling's own tokens but preserve already-proven ancestor tokens
+and resume at its shared parent chain. Both are rejection-filter changes;
+the exact selector matcher, cascade and memory ceilings are unchanged.
+One warm-up plus five isolated, matched article replays reduced median compound
+checks from 3,192,751 to 2,384,142 (25.3%). Exclusive style time in the two
+resource reflows fell from 51.0 to 43.1 ms and 44.7 to 39.8 ms in three profiled
+runs. End-to-end publication medians improved more modestly: font 76.4 to
+74.0 ms, image 83.8 to 76.9 ms, total optional idle 166.0 to 156.4 ms.
+All three raster checksums, text fingerprint and page height were unchanged.
+This is not a claim that CSS time or total loading time was halved.
+
+Counter lookup now starts at its existing traversal cursor and wraps for
+out-of-order requests. The 96-label regression reduces index visits from
+9,888 to 290, including a repeated font-publication build; reordered flex
+labels still get DOM-order values. No lookup table or per-node allocation is
+added. A backward lookup can still scan the bounded index, so this is not a
+universal constant-time lookup guarantee.
+
+With the narrower resource guard and counter hint also applied, five final
+article samples completed all three dynamic scripts in a median 181.5 ms
+after commit (30.1 ms median worst runtime advance), without uncaught errors.
+Font/image publication medians were 72.4/78.8 ms and total optional idle was
+155.9 ms. Three caught heap refusals remained; resource counts and raster
+checksums were unchanged. Fifteen full-resource interruption samples at
+0.5/2/4 ms into publication retained the page, acknowledged and unwound within
+0.182 ms, and displayed changed focus pixels within 2.156 ms.
+
+Computed-style checkpoint refusal now uses the shared uncatchable task-error
+handoff, matching callback cancellation. The regression exercises an author
+try/catch around the native style read, a deadline refusal, a catchable ordinary
+property-conversion error, and successful evaluation afterward. Selector,
+timer-deferral, cancellation and counter-work negative controls each failed
+against their pre-fix implementation. The final optimized host suite and
+focused ASan/UBSan gates cover these changes. The per-node safe-point clock
+sampling and pressure-triggered external-compile collection remain unchanged:
+their PSP cost needs measurement before weakening input responsiveness or the
+compile-reserve fix. Runtime verification used the shipping Bellard engine;
+the alternate QuickJS-NG exception branch was reviewed but not executed.
+No device timing or shorter navigation timeout is claimed.
+
+Physical PSP follow-up on 2026-09-07 used the 333 MHz device, the in-memory
+`host0:` validation PRX and the existing `TILEFINCH_PROFILE_LAYOUT_FLOW` option.
+One 1,024-call monotonic-clock calibration took 1,054 us. The large initial
+layout performed 12,377 sub-quota clock checks and 5,216 cooperative yields;
+exclusive cooperation time was 53.2 ms versus 7.48 s in style work. Two late
+reflows recorded 59.4/60.2 ms of cooperation versus 7.18/6.63 s in style work.
+Thus the extra checks were not the dominant cost in this run. Do not trade
+away their input-service boundaries to recover that small fraction of layout.
+These are instrumented observations, not an uninstrumented latency floor or
+a cross-run network benchmark; detailed flow profiling itself adds overhead.
+
+The validation-only `tilefinch-layout-checkpoints` line separates sub-quota
+clock checks, time-triggered yields and total yields. Its `cooperate` time is
+meaningful only with `profiled=1`. `tilefinch-compile-pressure-gc` measures only
+collections actually triggered at the external-compile pressure boundary and
+reports heap headroom before/after. None occurred in the short article control.
+The existing end-of-run forced GC probe took 119.9 ms; that demonstrates a
+potential pause, not that GC caused the observed 1.78 s runtime advance.
+Saved probes use the engine logger because library `printf` output is not
+automatically included in the PSP validation file. All new counters and
+calibration work compile out of ordinary builds.
+The extended control did trigger two external-compile collections: 125.6 ms
+reclaimed 365,768 bytes before a 1,421-byte segment; 98.8 ms reclaimed only
+3,336 bytes before a 254-byte segment. This identifies a concrete low-value
+collection to optimize. The source-sized watermark above preserves the
+tight-heap compile regression while avoiding these small-source collections
+at the recorded headroom. Validation-only `tilefinch-script-exception` and
+`tilefinch-dynamic-fetch-failure` lines distinguish runtime exceptions from
+transport/status/resource-admission failures during longer startup runs;
+they do not log response bodies or add release-build telemetry.
+
+The subsequent in-memory device tests exposed a second GC cost: resetting
+the automatic threshold below the live graph produced a repeating roughly
+108 ms near-idle advance tail. Growth-sensitive pacing removed that tail in
+the next run. This does not establish a clean live initialization pass:
+after wrapper sharing, the final run still reached the unchanged 9 MiB
+startup heap ceiling (215 bytes remaining, 15 refused allocations), with
+three of five dynamic scripts completed. One runtime advance included a
+16.6 s full relayout. The page remained loaded and the scripted run exited
+cleanly, but those remaining initialization and relayout costs are open.
+The captured host replay does not reproduce the device's entire live task
+sequence; do not use its green result to certify the live page or increase
+the heap ceiling without attributing the additional retained state.
+
+The next device acceptance again reproduced that initialization failure. Its
+17.78 s worst advance included 15.40 s of layout after temporary form probes.
+The mutation journal now records whether a node's first child-list change
+inserted previously detached content. If the entire batch is proven to have
+returned such content to a detached tree, navigation can retain its existing
+layout. This is not a general "detached nodes are harmless" rule: removals of
+existing nodes, connected-node moves into the probe, retired targets, journal
+overflow, resource changes, and visible edits retain conservative handling.
+MutationObserver delivery is unchanged. The bounded regression removes one
+unnecessary relayout per transient batch; it does not establish a clean live
+initialization pass or resolve the separate 9 MiB script-heap exhaustion.
+Moving an existing connected node into an already-detached container also
+journals its old parent, after the DOM operation succeeds. Otherwise the
+detached-construction fast path would hide a real removal, including when
+that container is subsequently attached and removed in the same batch.
+
+Validation builds report `tilefinch-heap-failure` once per runtime after its
+first allocator refusal, including failures caught inside timer callbacks.
+The snapshot separates function data, bytecode, objects, properties, shapes,
+strings, atoms, arrays and binary storage; it records its own walk duration.
+It does not trigger garbage collection, log author source, or change heap
+admission. Keep transport-incomplete startup runs separate from full script
+initialization: a run that never downloads the large script cannot certify
+that the later memory failure has been resolved.
+
+An experimental 500 ms deferral-cap run opened the native menu during reflow and published
+the optional font batch while external initialization remained pending. Its
+earlier font reflow took 16.4 s versus 12.0 s for the later control publication;
+moving work earlier is not an overall throughput improvement. Improving the
+remaining style and script work remains separate from bounding resource
+starvation. An extended capped run failed a large external-script fetch, while
+the extended control reached more initialization work but ended with a
+microtask error. Neither is a clean full-initialization pass. The cap and its
+experimental test were removed rather than adopting an unproven scheduling
+tradeoff. A wall-clock starvation bound remains open. The unchanged
+cancellation-cache reset and non-behavioral cleanup
+items are not justified as device bottlenecks by these measurements.
+
+One warm-up plus five navigation samples and fifteen interrupted font
+publications per page on 2026-09-07 measured full-resource request-to-host-pixels
+medians of 1.10–1.18 ms for the homepage and 1.45–1.48 ms for the article;
+maxima were 1.27 and 1.75 ms respectively. Article requests included a point
+50 ms into the reflow. All retained the fallback page and changed focus pixels.
+The ordinary article navigation still had a median longest pump of 100 ms
+with cooperation inside it (123 ms maximum). A separate feedback-preparation
+run recorded a 27 ms cooperative gap, so the host measurements do not prove
+a universal frame deadline. This is not a total-load-time fix and does not
+justify shortening the shipping 60-second watchdog.
+
+Text layout now polls within long runs after 256 loop-progress units, including
+preserved-space and split-word emission. Short runs keep their existing node
+checkpoints. In a 32 KiB single-text-node regression, five rebuilt control/fix
+samples reduced the median largest cooperative gap from 1.418 to 0.184 ms;
+the command count, text fingerprint and height were identical. The old path
+made no intra-text polls and fails the new cancellation assertion; the fixed
+path makes 76 polls, cancels cleanly, and rebuilds with Budget ownership back
+at baseline. This bounds loop progress, not elapsed time inside one indivisible
+font measurement or shaping call, and is not a physical-PSP timing guarantee.
 
 Pseudo-element matching uses a 64-entry, eight-rule-per-range memo only inside
 the immutable layout/selector-cooperation scope (under 4 KiB, Budget-owned as

@@ -1082,6 +1082,9 @@ static bool collect_styles(
     for (; node != NULL; node = node->next) {
         size_t name_length = 0;
         const char *name = document_element_name(node, &name_length);
+        if (name != NULL && span_equal(name, name_length, "style")) {
+            stylesheet_note_style_source(context->sheet, node);
+        }
         if (name != NULL && span_equal(name, name_length, "style")
             && tilefinch_csp_allows_inline_style(
                    content_security_policy, node)) {

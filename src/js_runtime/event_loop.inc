@@ -130,6 +130,14 @@ bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
     return true;
 }
 
+bool script_runtime_has_pending_startup_scripts(ScriptRuntime *runtime)
+{
+    return runtime != NULL
+        && (runtime->bridge.dynamic_script_count != 0u
+            || JS_IsJobPending(runtime->runtime)
+            || js_rt_dynamic_classic_continuation_pending(runtime));
+}
+
 bool script_runtime_has_pending_author_work(ScriptRuntime *runtime)
 {
     /* Do not use result.pending_tasks here. That diagnostic also counts an
@@ -140,9 +148,7 @@ bool script_runtime_has_pending_author_work(ScriptRuntime *runtime)
         && (runtime->pending_timer_tasks != 0u
             || runtime->pending_network_tasks != 0u
             || runtime->bridge.async_fetch_count != 0u
-            || runtime->bridge.dynamic_script_count != 0u
-            || JS_IsJobPending(runtime->runtime)
-            || js_rt_dynamic_classic_continuation_pending(runtime)
+            || script_runtime_has_pending_startup_scripts(runtime)
             || runtime->page_visibility_queue_count != 0u);
 }
 
@@ -522,6 +528,10 @@ void script_runtime_report_memory(ScriptRuntime *runtime, FILE *output)
     JS_ComputeMemoryUsage(runtime->runtime, &usage);
     if (tilefinch_dump_js_memory()) {
         JS_DumpMemoryUsage(stderr, &usage, runtime->runtime);
+        fprintf(stderr, "script-arenas count=%lld capacity=%lld used=%lld\n",
+            (long long)usage.malloc_arena_count,
+            (long long)usage.malloc_arena_capacity,
+            (long long)usage.malloc_arena_used);
     }
     if (tilefinch_dump_js_pool()) {
         budget_quickjs_pool_report_classes(runtime->quickjs_pool, stderr);

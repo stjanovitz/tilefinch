@@ -223,7 +223,7 @@ typedef enum {
    configuration, or local compiler patches change incompatibly. Offline apps
    keep their source response and simply recompile when this does not match. */
 #if defined(PSP_BROWSER_BELLARD_QUICKJS)
-#define TILEFINCH_QUICKJS_BYTECODE_ABI UINT32_C(0x514a5301)
+#define TILEFINCH_QUICKJS_BYTECODE_ABI UINT32_C(0x514a5302)
 #else
 #define TILEFINCH_QUICKJS_BYTECODE_ABI UINT32_C(0x514a4e01)
 #endif
@@ -604,8 +604,10 @@ void browser_session_classic_script_bytecode_invalidate(
     BrowserSession *session, const char *request_url,
     const unsigned char *source, size_t source_length);
 /* Resolves the exact authorized response once and retains either requested
-   RAM-only compiler artifact. A NULL output skips that artifact. */
-void browser_session_stylesheet_artifacts_acquire(
+   RAM-only compiler artifact. A NULL output skips that artifact. Returns
+   whether the exact backing response exists and leaves room for an artifact;
+   this is an admission hint, not a reservation or a guarantee of storage. */
+bool browser_session_stylesheet_artifacts_acquire(
     BrowserSession *session, const char *request_url,
     const TilefinchRequestContext *request_context,
     const unsigned char *source, size_t source_length,

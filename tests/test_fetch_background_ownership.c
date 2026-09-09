@@ -468,8 +468,34 @@ static void test_randomized_route_churn(void)
     CHECK(model_claim(slots, true, false) != 0);
 }
 
+static void test_stream_consumer_deadline(void)
+{
+    uint64_t pause = 100, deadline = 1000, progress = 100;
+    /* Publication, a long consumer turn, then drain without a second curl
+       callback: no CURL_WRITEFUNC_PAUSE occurred, but this is backpressure. */
+    CHECK(!fetch_background_deadline_eligible(false, false, pause));
+    fetch_background_end_consumer_pause(10100, &pause, &deadline, &progress);
+    CHECK(pause == 0 && deadline == 11000 && progress == 10100);
+    CHECK(fetch_background_deadline_eligible(false, false, pause));
+    fetch_background_end_consumer_pause(10200, &pause, &deadline, &progress);
+    CHECK(deadline == 11000 && progress == 10100);
+    CHECK(!fetch_background_deadline_eligible(true, false, 0));
+    CHECK(!fetch_background_deadline_eligible(false, true, 0));
+    pause = 10;
+    deadline = UINT64_MAX - 5;
+    fetch_background_end_consumer_pause(20, &pause, &deadline, &progress);
+    CHECK(deadline == UINT64_MAX && pause == 0);
+}
+
 int main(void)
 {
+    CHECK(fetch_background_progress_after_setup(9, 10, 24) == 23);
+    CHECK(fetch_background_progress_after_setup(23, 10, 24) == 24);
+    CHECK(fetch_background_progress_after_setup(25, 10, 24) == 25);
+    CHECK(fetch_background_progress_after_setup(9, 10, 8) == 9);
+    CHECK(fetch_background_progress_after_setup(UINT64_MAX - 8,
+        UINT64_MAX - 4, UINT64_MAX) == UINT64_MAX - 4);
+    test_stream_consumer_deadline();
     test_redirect_cookie_overflow_policy();
     test_reserved_eventual_admission();
     test_running_cancellation_releases_admission_on_worker_turn();

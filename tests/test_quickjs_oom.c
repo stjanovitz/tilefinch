@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "tilefinch/budget.h"
 #include "tilefinch/budget_quickjs.h"
@@ -43,6 +44,514 @@ static int run_reallocation_peak_census(void)
     (void) budget_quickjs_pool_trim(pool, 0);
     if (!budget_quickjs_pool_destroy(pool) || budget.current != 0)
         return 1;
+    return okay ? 0 : 1;
+}
+
+static int run_shared_function_source(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (!pool) return 1;
+    JSRuntime *rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+    if (!rt) return 1;
+    JS_SetMaxStackSize(rt, test_stack_limit());
+    JSContext *ctx = JS_NewContext(rt);
+    if (!ctx) return 1;
+    const char prefix[] = "function outer(){function middle(){function inner(){/*";
+    const char suffix[] = "*/return 42}return inner}return middle}"
+        "globalThis.saved=outer()();outer=null;";
+    size_t length = sizeof(prefix) - 1 + 65536 + sizeof(suffix) - 1;
+    char *source = malloc(length + 1);
+    if (!source) return 1;
+    memcpy(source, prefix, sizeof(prefix) - 1);
+    memset(source + sizeof(prefix) - 1, 'x', 65536);
+    memcpy(source + sizeof(prefix) - 1 + 65536, suffix, sizeof(suffix));
+    JSMemoryUsage before, after;
+    JS_ComputeMemoryUsage(rt, &before);
+    JSValue compiled = JS_Eval(ctx, source, length, "<shared-source>",
+                              JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    JS_ComputeMemoryUsage(rt, &after);
+    int okay = !JS_IsException(compiled)
+        && after.malloc_size - before.malloc_size < (int64_t)(length * 2)
+        && before.malloc_arena_used <= before.malloc_arena_capacity
+        && after.malloc_arena_used <= after.malloc_arena_capacity
+        && after.malloc_arena_capacity <= after.malloc_size;
+    fprintf(stderr, "shared source: input=%zu retained-delta=%lld\n", length,
+            (long long)(after.malloc_size - before.malloc_size));
+    /* Cached bytecode must preserve sharing, not serialize each nested copy.
+       The retained child and its toString() must outlive the parent/read buffer. */
+    size_t byte_count = 0;
+    uint8_t *bytes = JS_IsException(compiled) ? NULL
+        : JS_WriteObject(ctx, &byte_count, compiled, JS_WRITE_OBJ_BYTECODE);
+    JSValue result = JS_IsException(compiled) ? JS_UNDEFINED
+        : JS_EvalFunction(ctx, compiled);
+    okay = okay && !JS_IsException(result) && bytes != NULL;
+    JS_FreeValue(ctx, result);
+    JS_RunGC(rt);
+    const char check[] = "saved()===42&&saved.toString()==="
+        "'function inner(){/*'+'x'.repeat(65536)+'*/return 42}'";
+    result = JS_Eval(ctx, check, sizeof(check)-1, "<source-lifetime>", 0);
+    okay = okay && JS_ToBool(ctx, result) == 1;
+    JS_FreeValue(ctx, result);
+    const char kinds[] =
+        "(()=>{function factory(){const a=x=>x+1;"
+        "class C {m(){return 7}} async function f(){return 8}"
+        "function* g(){yield 9}return [a,C,f,g]}"
+        "const v=factory();factory=null;"
+        "return v[0].toString()==='x=>x+1'&&"
+        "v[1].toString()==='class C {m(){return 7}}'&&"
+        "v[1].prototype.m.toString()==='m(){return 7}'&&"
+        "v[2].toString()==='async function f(){return 8}'&&"
+        "v[3].toString()==='function* g(){yield 9}'})()";
+    result = JS_Eval(ctx, kinds, sizeof(kinds)-1, "<source-kinds>", 0);
+    okay = okay && !JS_IsException(result) && JS_ToBool(ctx, result) == 1;
+    JS_FreeValue(ctx, result);
+    const char unicode_source[] =
+        "(()=>{for(const text of ['\\u00e9','\\u20ac','\\ud83d\\ude80',"
+        "'a\\u00e9b\\u20acc\\ud83d\\ude80']){"
+        "const source='function exact(){/*'+text+'*/return 42}';"
+        "const f=eval('('+source+')');"
+        "if(f.toString()!==source||f()!==42)return false;}return true})()";
+    result = JS_Eval(ctx, unicode_source, sizeof(unicode_source)-1,
+                     "<unicode-function-source>", 0);
+    okay = okay && !JS_IsException(result) && JS_ToBool(ctx, result) == 1;
+    JS_FreeValue(ctx, result);
+    const char *malformed[] = {
+        "function bad(){/*\x80*/}", "function bad(){/*\xe2\x82*/}",
+        "function bad(){/*\xf5\x80\x80\x80*/}",
+    };
+    for (size_t i = 0; i < sizeof(malformed)/sizeof(malformed[0]); ++i) {
+        result = JS_Eval(ctx, malformed[i], strlen(malformed[i]),
+                         "<source-comment-bytes>", 0);
+        okay = okay && !JS_IsException(result);
+        JS_FreeValue(ctx, result);
+        result = JS_Eval(ctx, "bad.toString()", 14, "<source-replacement>", 0);
+        JSValue expected = JS_NewStringLen(ctx, malformed[i], strlen(malformed[i]));
+        const char *actual_text = JS_ToCString(ctx, result);
+        const char *expected_text = JS_ToCString(ctx, expected);
+        okay = okay && actual_text && expected_text
+            && strcmp(actual_text, expected_text) == 0;
+        JS_FreeCString(ctx, actual_text);
+        JS_FreeCString(ctx, expected_text);
+        JS_FreeValue(ctx, result);
+        JS_FreeValue(ctx, expected);
+    }
+    if (bytes) {
+        clock_t read_started = clock();
+        for (unsigned iteration = 0; iteration < 128; ++iteration) {
+            JSValue cached = JS_ReadObject(ctx, bytes, byte_count,
+                                           JS_READ_OBJ_BYTECODE);
+            okay = okay && !JS_IsException(cached);
+            JS_FreeValue(ctx, cached);
+        }
+        fprintf(stderr, "cached shared source: 128 reads cpu-us=%.0f\n",
+                (double)(clock() - read_started) * 1000000.0 / CLOCKS_PER_SEC);
+        JSValue roundtrip = JS_ReadObject(ctx, bytes, byte_count,
+                                          JS_READ_OBJ_BYTECODE);
+        size_t rewritten_length = 0;
+        uint8_t *rewritten = JS_IsException(roundtrip) ? NULL
+            : JS_WriteObject(ctx, &rewritten_length, roundtrip, JS_WRITE_OBJ_BYTECODE);
+        okay = okay && rewritten && rewritten_length == byte_count
+            && memcmp(rewritten, bytes, byte_count) == 0;
+        js_free(ctx, rewritten);
+        JS_FreeValue(ctx, roundtrip);
+        /* Old serialized caches are declined, not interpreted with new spans. */
+        uint8_t version = bytes[0];
+        bytes[0] = (uint8_t)(version - 1);
+        roundtrip = JS_ReadObject(ctx, bytes, byte_count, JS_READ_OBJ_BYTECODE);
+        okay = okay && JS_IsException(roundtrip);
+        JS_FreeValue(ctx, roundtrip);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        bytes[0] = version;
+        static const size_t headroom[] = {0, 32768, 65536, 69632, 73728};
+        unsigned refused_reads = 0;
+        for (size_t limit = 0; limit < sizeof(headroom)/sizeof(headroom[0]); ++limit) {
+            JS_ComputeMemoryUsage(rt, &before);
+            JS_SetMemoryLimit(rt, (size_t)before.malloc_size + headroom[limit]);
+            roundtrip = JS_ReadObject(ctx, bytes, byte_count, JS_READ_OBJ_BYTECODE);
+            if (JS_IsException(roundtrip)) {
+                ++refused_reads;
+                JS_FreeValue(ctx, JS_GetException(ctx));
+            }
+            JS_FreeValue(ctx, roundtrip);
+            JS_SetMemoryLimit(rt, 4u * MIB);
+        }
+        okay = okay && refused_reads != 0;
+        /* Truncation after parent adoption must unwind all child-owner refs.
+           The next complete read still succeeds in this same runtime. */
+        for (size_t missing = 1; missing <= 24 && missing < byte_count; ++missing) {
+            JSValue partial = JS_ReadObject(ctx, bytes, byte_count - missing,
+                                            JS_READ_OBJ_BYTECODE);
+            okay = okay && JS_IsException(partial);
+            JS_FreeValue(ctx, partial);
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        }
+        JS_ComputeMemoryUsage(rt, &before);
+        compiled = JS_ReadObject(ctx, bytes, byte_count, JS_READ_OBJ_BYTECODE);
+        JS_ComputeMemoryUsage(rt, &after);
+        fprintf(stderr, "cached shared source: input=%zu serialized=%zu retained-delta=%lld\n",
+                length, byte_count, (long long)(after.malloc_size - before.malloc_size));
+        okay = okay && byte_count < length * 2
+            && after.malloc_size - before.malloc_size < (int64_t)(length * 2);
+        js_free(ctx, bytes);
+        result = JS_IsException(compiled) ? compiled : JS_EvalFunction(ctx, compiled);
+        okay = okay && !JS_IsException(result);
+        JS_FreeValue(ctx, result);
+        result = JS_Eval(ctx, check, sizeof(check)-1, "<source-roundtrip>", 0);
+        okay = okay && JS_ToBool(ctx, result) == 1;
+        JS_FreeValue(ctx, result);
+    }
+    /* Siblings must restore the enclosing source scope; Unicode keeps exact
+       UTF-8 byte offsets rather than decoded character indexes. */
+    static const char sibling_source[] =
+        "(()=>{function parent(){function a(){/*\xe2\x82\xac*/return 1}"
+        "function b(){function c(){/*\xf0\x9f\x9a\x80*/return 2}return c}"
+        "return [a,b()]}const pair=parent();parent=null;"
+        "const a=pair[0].toString(),c=pair[1].toString();"
+        "return pair[0]()===1&&pair[1]()===2&&"
+        "a==='function a(){/*\xe2\x82\xac*/return 1}'&&"
+        "c==='function c(){/*\xf0\x9f\x9a\x80*/return 2}'})()";
+    compiled = JS_Eval(ctx, sibling_source, sizeof(sibling_source) - 1,
+        "<cached-source-siblings>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    bytes = JS_IsException(compiled) ? NULL
+        : JS_WriteObject(ctx, &byte_count, compiled, JS_WRITE_OBJ_BYTECODE);
+    JS_FreeValue(ctx, compiled);
+    okay = okay && bytes != NULL;
+    if (bytes) {
+        compiled = JS_ReadObject(ctx, bytes, byte_count, JS_READ_OBJ_BYTECODE);
+        js_free(ctx, bytes);
+        result = JS_IsException(compiled) ? compiled : JS_EvalFunction(ctx, compiled);
+        okay = okay && !JS_IsException(result) && JS_ToBool(ctx, result) == 1;
+        JS_FreeValue(ctx, result);
+    }
+    free(source);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
+    return okay ? 0 : 1;
+}
+
+static int run_automatic_gc_near_limit(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (!pool) return 1;
+    JSRuntime *rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+    if (!rt) return 1;
+    JS_SetMemoryLimit(rt, 512u * 1024u);
+    JSContext *ctx = JS_NewContext(rt);
+    if (!ctx) return 1;
+    /* A live graph above two thirds of the hard limit used to make the
+       automatic post-GC threshold exceed that limit. One long callback then
+       failed on collectible cycles before the embedder's next safe point. */
+    const char source[] = "globalThis.retained=new Uint8Array(350000);"
+        "(()=>{for(let i=0;i<10000;i++){const c={value:i};c.self=c;}return 42})()";
+    JSValue result = JS_Eval(ctx, source, sizeof(source)-1, "<gc-headroom>", 0);
+    int32_t number = 0;
+    int okay = !JS_IsException(result) && !JS_ToInt32(ctx, &number, result)
+        && number == 42;
+    if (JS_IsException(result)) {
+        JSValue exception = JS_GetException(ctx);
+        const char *message = JS_ToCString(ctx, exception);
+        fprintf(stderr, "automatic GC headroom: %s\n", message ? message : "exception");
+        JS_FreeCString(ctx, message);
+        JS_FreeValue(ctx, exception);
+    }
+    JS_FreeValue(ctx, result);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
+    return okay ? 0 : 1;
+}
+
+static int run_dense_join_pressure(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (!pool) return 1;
+    JSRuntime *rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+    JSContext *ctx = rt ? JS_NewContext(rt) : NULL;
+    if (!ctx) return 1;
+    char *text = malloc(90000);
+    if (!text) return 1;
+    memset(text, 'x', 90000);
+    JSValue parts = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, parts, 0, JS_NewString(ctx, "prefix"));
+    JS_SetPropertyUint32(ctx, parts, 1, JS_NewStringLen(ctx, text, 90000));
+    JS_SetPropertyUint32(ctx, parts, 2, JS_NewString(ctx, "suffix"));
+    free(text);
+    JSValue global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "parts", parts);
+    JS_FreeValue(ctx, global);
+    const char contracts[] =
+        "(()=>{const big=parts[1];"
+        "if([big,'\\u20ac'].join('|')!==big+'|\\u20ac')return false;"
+        "let order='';const a=[big,'tail'];"
+        "Object.defineProperty(a,1,{get(){order+='g';return 'tail'}});"
+        "const sep={toString(){order+='s';return '|'}};"
+        "if(a.join(sep)!==big+'|tail'||order!=='sg')return false;"
+        "const b=[big,'old'];const changed=b.join({toString(){b[1]='new';return ''}});"
+        "if(changed!==big+'new')return false;"
+        "const many=Array(65).fill(big.slice(0,512));"
+        "many[32]='\\u20ac'+many[32].slice(1);"
+        "const joined=many.join('|');"
+        "if(joined.length!==33344||joined[16416]!=='\\u20ac')return false;"
+        "let rope=big+'\\ud83d\\ude00';let source=['head',rope,'tail'];"
+        "globalThis.joinRetained=source.join('');source[1]='changed';"
+        "rope=null;source=null;"
+        "return b[1]==='new'&&Array(4097).fill('').join('')===''})()";
+    JSValue check = JS_Eval(ctx, contracts, sizeof(contracts)-1,
+                            "<join-contracts>", 0);
+    bool contract_ok = !JS_IsException(check) && JS_ToBool(ctx, check) == 1;
+    JS_FreeValue(ctx, check);
+    JS_RunGC(rt);
+    const char lifetime[] =
+        "joinRetained.length===90010&&joinRetained.slice(90004)==='\\ud83d\\ude00tail'"
+        "&&joinRetained.slice(0,4)==='head'";
+    check = JS_Eval(ctx, lifetime, sizeof(lifetime)-1, "<join-lifetime>", 0);
+    contract_ok = contract_ok && !JS_IsException(check) && JS_ToBool(ctx, check) == 1;
+    JS_FreeValue(ctx, check);
+    global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "joinRetained", JS_UNDEFINED);
+    JS_FreeValue(ctx, global);
+    JS_RunGC(rt);
+    JSMemoryUsage usage;
+    JS_ComputeMemoryUsage(rt, &usage);
+    JS_SetMemoryLimit(rt, usage.malloc_size + 200000);
+    JS_SetGCThreshold(rt, usage.malloc_size + 190000);
+    const char source[] =
+        "for(let i=0;i<600;i++){const cycle={};cycle.self=cycle;}parts.join('').length";
+    JSValue result = JS_Eval(ctx, source, sizeof(source)-1, "<join-pressure>", 0);
+    int32_t length = 0;
+    int okay = contract_ok && !JS_IsException(result) && !JS_ToInt32(ctx, &length, result)
+        && length == 90012;
+    if (!okay) fprintf(stderr, "dense join pressure: exception=%d length=%d\n",
+                       JS_IsException(result), length);
+    if (JS_IsException(result)) JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, result);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
+    return okay ? 0 : 1;
+}
+
+static int run_function_source_allocation_pressure(bool wide)
+{
+    Budget budget;
+    budget_init(&budget, 2u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (!pool) return 1;
+    JSRuntime *rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+    if (!rt) return 1;
+    JS_SetMemoryLimit(rt, 1024u * 1024u);
+    JSContext *ctx = JS_NewContext(rt);
+    if (!ctx) return 1;
+    const char prefix[] = "function sourceCopy(){/*";
+    const char suffix[] = "*/return 42}";
+    size_t length = sizeof(prefix)-1 + 180000 + sizeof(suffix)-1;
+    char *source = malloc(length+1);
+    if (!source) return 1;
+    memcpy(source, prefix, sizeof(prefix)-1);
+    memset(source+sizeof(prefix)-1, 'x', 180000);
+    if (wide) memcpy(source+sizeof(prefix)-1, "\xe2\x82\xac", 3);
+    memcpy(source+sizeof(prefix)-1+180000, suffix, sizeof(suffix));
+    JSValue value = JS_Eval(ctx, source, length, "<source-copy-pressure>", 0);
+    if (JS_IsException(value)) return 1;
+    JS_FreeValue(ctx, value);
+    JS_RunGC(rt);
+    JSMemoryUsage usage;
+    JS_ComputeMemoryUsage(rt, &usage);
+    JS_SetMemoryLimit(rt, usage.malloc_size + 240000);
+    JS_SetGCThreshold(rt, usage.malloc_size + 230000);
+    const char copy[] =
+        "for(let i=0;i<600;i++){const cycle={};cycle.self=cycle;}"
+        "String(sourceCopy).length";
+    value = JS_Eval(ctx, copy, sizeof(copy)-1, "<source-copy-call>", 0);
+    int32_t number = 0;
+    int okay = !JS_IsException(value) && !JS_ToInt32(ctx, &number, value)
+        && number == (int32_t)(sizeof(prefix)-1+180000+strlen("*/return 42}")
+                              - (wide ? 2 : 0));
+    if (!okay) fprintf(stderr,"function source pressure: exception=%d length=%d\n",
+                       JS_IsException(value), number);
+    if (JS_IsException(value)) {
+        JSValue exception = JS_GetException(ctx);
+        JS_FreeValue(ctx, exception);
+    }
+    JS_FreeValue(ctx, value);
+    free(source);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
+    return okay ? 0 : 1;
+}
+
+static int run_source_snapshot_sharing(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (!pool) return 1;
+    JSRuntime *rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+    if (!rt) return 1;
+    JS_SetMaxStackSize(rt, test_stack_limit());
+    JSContext *ctx = JS_NewContext(rt);
+    if (!ctx) return 1;
+    const char prefix[] = "function snapshotOwner(){function child(){return 42}/*";
+    const char suffix[] = "*/return child}";
+    size_t length = sizeof(prefix)-1 + 65536 + sizeof(suffix)-1;
+    char *source = malloc(length + 1);
+    if (!source) return 1;
+    memcpy(source, prefix, sizeof(prefix)-1);
+    memset(source + sizeof(prefix)-1, 'x', 65536);
+    memcpy(source + sizeof(prefix)-1 + 65536, suffix, sizeof(suffix));
+    int okay = 1;
+    for (unsigned order = 0; order < 2 && okay; ++order) {
+        JS_SetMemoryLimit(rt, 2u * MIB);
+        JSValue value = JS_Eval(ctx, source, length, "<snapshot-owner>", 0);
+        okay = !JS_IsException(value);
+        JS_FreeValue(ctx, value);
+        JS_RunGC(rt);
+        JSMemoryUsage usage;
+        JS_ComputeMemoryUsage(rt, &usage);
+        JS_SetMemoryLimit(rt, usage.malloc_size + 16u * 1024u);
+        const char snapshot[] = "String(snapshotOwner)";
+        value = JS_Eval(ctx, snapshot, sizeof(snapshot)-1, "<shared-snapshot>", 0);
+        okay = okay && !JS_IsException(value);
+        JS_SetMemoryLimit(rt, 2u * MIB);
+        /* Atomization must not allow concatenation or source teardown to
+           modify/free the backing registered in the runtime's atom table. */
+        JSAtom atom = okay ? JS_ValueToAtom(ctx, value) : JS_ATOM_NULL;
+        JSValue global = JS_GetGlobalObject(ctx);
+        if (order == 0)
+            JS_SetPropertyStr(ctx, global, "snapshotOwner", JS_UNDEFINED);
+        JS_RunGC(rt);
+        const char *text = okay ? JS_ToCString(ctx, value) : NULL;
+        okay = okay && atom != JS_ATOM_NULL && text && strcmp(text, source) == 0;
+        JS_FreeCString(ctx, text);
+        JS_FreeValue(ctx, value);
+        JS_FreeAtom(ctx, atom);
+        if (order == 1) {
+            const char call[] = "snapshotOwner()()===42";
+            value = JS_Eval(ctx, call, sizeof(call)-1, "<source-after-snapshot>", 0);
+            okay = okay && !JS_IsException(value) && JS_ToBool(ctx, value) == 1;
+            JS_FreeValue(ctx, value);
+            JS_SetPropertyStr(ctx, global, "snapshotOwner", JS_UNDEFINED);
+        }
+        JS_FreeValue(ctx, global);
+        JS_RunGC(rt);
+    }
+    const char semantics[] =
+        "(()=>{let calls=0;const o={[Symbol.toPrimitive](hint){"
+        "if(hint!=='string')throw Error('hint');calls++;return 'x'.repeat(12000)}};"
+        "if(String(o).length!==12000||calls!==1||new String(o).valueOf().length!==12000"
+        "||calls!==2||String(Symbol('x'))!=='Symbol(x)')return false;"
+        "try{String({[Symbol.toPrimitive](){return Symbol()}});return false}catch(e){"
+        "return e instanceof TypeError}})()";
+    JSValue value = JS_Eval(ctx, semantics, sizeof(semantics)-1, "<string-coercion>", 0);
+    okay = okay && !JS_IsException(value) && JS_ToBool(ctx, value) == 1;
+    JS_FreeValue(ctx, value);
+    const char unicode_chunks[] =
+        "(()=>{const text='function chunked(){/*'+'x'.repeat(4070)+'\\u20ac'"
+        "+'y'.repeat(4094)+'\\ud83d\\ude80'+'z'.repeat(8192)+'*/return 7}';"
+        "const f=eval('('+text+')');return String(f)===text&&f()===7})()";
+    value = JS_Eval(ctx, unicode_chunks, sizeof(unicode_chunks)-1, "<source-chunks>", 0);
+    okay = okay && !JS_IsException(value) && JS_ToBool(ctx, value) == 1;
+    JS_FreeValue(ctx, value);
+    free(source);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
+    if (!okay) fprintf(stderr, "shared source snapshot failed\n");
+    return okay ? 0 : 1;
+}
+
+static int run_source_span_snapshot(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (!pool) return 1;
+    JSRuntime *rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+    if (!rt) return 1;
+    JS_SetMaxStackSize(rt, test_stack_limit());
+    JSContext *ctx = JS_NewContext(rt);
+    if (!ctx) return 1;
+    int okay = 1;
+    for (unsigned order = 0; order < 4 && okay; ++order) {
+        const char setup[] =
+            "globalThis.expected='function child(){/*'+'x'.repeat(32768)"
+            "+'\\u20ac\\ud83d\\ude80'+'y'.repeat(32768)+'*/return 42}';"
+            "globalThis.factory=eval('(function outer(){/*\\u20ac*/'+expected+';return child})');"
+            "globalThis.child=factory();globalThis.snap=null;";
+        JSValue value = JS_Eval(ctx, setup, sizeof(setup)-1, "<source-span-setup>", 0);
+        okay = !JS_IsException(value);
+        JS_FreeValue(ctx, value);
+        if (order >= 2) {
+            /* No nested functions: the source has no shared owner until its
+               first toString call, which must adopt rather than duplicate it. */
+            const char standalone[] =
+                "child=eval('('+expected+')');factory=()=>child";
+            value = JS_Eval(ctx, standalone, sizeof(standalone)-1,
+                "<standalone-source>", 0);
+            okay = okay && !JS_IsException(value);
+            JS_FreeValue(ctx, value);
+        }
+        JS_RunGC(rt);
+        JSMemoryUsage usage;
+        JS_ComputeMemoryUsage(rt, &usage);
+        JS_SetMemoryLimit(rt, usage.malloc_size + 16u * 1024u);
+        const char capture[] = "snap=String(child);snap.length===expected.length";
+        value = JS_Eval(ctx, capture, sizeof(capture)-1, "<source-span-snapshot>", 0);
+        okay = okay && !JS_IsException(value) && JS_ToBool(ctx, value) == 1;
+        JS_FreeValue(ctx, value);
+        JS_SetMemoryLimit(rt, 6u * MIB);
+        const char release_first[] = "factory=null;child=null";
+        if ((order & 1u) == 0) {
+            value = JS_Eval(ctx, release_first, sizeof(release_first)-1, "<source-span-release>", 0);
+            JS_FreeValue(ctx, value);
+            JS_RunGC(rt);
+        }
+        const char check[] =
+            "(()=>{if(snap!==expected||snap[9]!=='c'||snap.charCodeAt(9)!==99)return false;"
+            "if(new Map([[snap,42]]).get(expected)!==42)return false;"
+            "let joined=['(',snap,')'].join('');if(eval(joined)()!==42)return false;"
+            "let rope=snap;const tail='z'.repeat(1024);for(let i=0;i<100;i++)rope=rope+tail;"
+            "if(rope.length!==snap.length+102400)return false;"
+            "if(rope.slice(0,snap.length)!==expected)return false;"
+            "const o={[snap]:42};if(o[expected]!==42)return false;"
+            "if(JSON.parse(JSON.stringify([snap]))[0]!==expected)return false;"
+            "if(!/return 42/.test(snap)||String(snap).indexOf('child')!==9)return false;"
+            "return eval(' '.repeat(140000)+'('+snap+')')()===42})()";
+        value = JS_Eval(ctx, check, sizeof(check)-1, "<source-span-semantics>", 0);
+        okay = okay && !JS_IsException(value) && JS_ToBool(ctx, value) == 1;
+        JS_FreeValue(ctx, value);
+        const char release[] = "snap=null;expected=null";
+        value = JS_Eval(ctx, release, sizeof(release)-1, "<source-span-drop>", 0);
+        JS_FreeValue(ctx, value);
+        JS_RunGC(rt);
+        if ((order & 1u) != 0) {
+            const char call[] = "child()===42&&factory()()===42";
+            value = JS_Eval(ctx, call, sizeof(call)-1, "<source-span-survives>", 0);
+            okay = okay && !JS_IsException(value) && JS_ToBool(ctx, value) == 1;
+            JS_FreeValue(ctx, value);
+        }
+        value = JS_Eval(ctx, release_first, sizeof(release_first)-1, "<source-span-final>", 0);
+        JS_FreeValue(ctx, value);
+        JS_RunGC(rt);
+    }
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay = budget_quickjs_pool_destroy(pool) && budget.current == 0 && okay;
+    if (!okay) fprintf(stderr, "source span snapshot failed\n");
     return okay ? 0 : 1;
 }
 
@@ -498,6 +1007,172 @@ static int run_retired_callable_contract(void)
     return failed;
 }
 
+static int run_cstring_refusal_lifetime(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (!pool) return 1;
+    JSRuntime *rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+    if (!rt) return 1;
+    JSContext *ctx = JS_NewContext(rt);
+    if (!ctx) return 1;
+    int okay = 1;
+    /* Both Latin-1 expansion and UTF-16 conversion duplicate the input
+       before allocating output. Refusal must release that duplicate. */
+    for (unsigned wide = 0; wide < 2; ++wide) {
+        char bytes[16384];
+        for (size_t i = 0; i < sizeof(bytes); i += 2) {
+            bytes[i] = wide ? (char)0xc4 : (char)0xc3;
+            bytes[i + 1] = (char)0xa9;
+        }
+        JSValue input = JS_NewStringLen(ctx, bytes, sizeof(bytes));
+        okay &= !JS_IsException(input);
+        JSMemoryUsage usage;
+        JS_ComputeMemoryUsage(rt, &usage);
+        JS_SetMemoryLimit(rt, (size_t)usage.malloc_size);
+        for (unsigned attempt = 0; attempt < 3; ++attempt) {
+            size_t length = 1;
+            const char *text = JS_ToCStringLen(ctx, &length, input);
+            okay &= text == NULL && length == 0;
+            JS_FreeCString(ctx, text);
+            JSValue exception = JS_GetException(ctx);
+            okay &= !JS_IsNull(exception);
+            JS_FreeValue(ctx, exception);
+        }
+        JS_SetMemoryLimit(rt, 2u * MIB);
+        const char *text = JS_ToCString(ctx, input);
+        okay &= text != NULL && memcmp(text, bytes, sizeof(bytes)) == 0;
+        JS_FreeCString(ctx, text);
+        JS_FreeValue(ctx, input);
+    }
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay &= budget_quickjs_pool_destroy(pool) && budget.current == 0;
+    if (!okay) fprintf(stderr, "CString refusal leaked its source\n");
+    return okay ? 0 : 1;
+}
+
+static int run_bytecode_refusal_atomicity(void)
+{
+    Budget budget;
+    budget_init(&budget, 4u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (!pool) return 1;
+    JSRuntime *rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+    if (!rt) return 1;
+    JSContext *ctx = JS_NewContext(rt);
+    if (!ctx) return 1;
+    char source[10000];
+    const char prefix[] = "function retained(){return '";
+    const char suffix[] = "'};retained()";
+    memcpy(source, prefix, sizeof(prefix)-1);
+    memset(source + sizeof(prefix)-1, 'x', 9000);
+    memcpy(source + sizeof(prefix)-1 + 9000, suffix, sizeof(suffix));
+    size_t source_length = sizeof(prefix)-1 + 9000 + sizeof(suffix)-1;
+    JSValue compiled = JS_Eval(ctx, source, source_length, "<writer-refusal>",
+        JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    int okay = !JS_IsException(compiled);
+    if (!okay) {
+        JSValue exception = JS_GetException(ctx);
+        const char *message = JS_ToCString(ctx, exception);
+        fprintf(stderr, "writer compile: %s\n", message ? message : "no message");
+        JS_FreeCString(ctx, message);
+        JS_FreeValue(ctx, exception);
+    }
+    size_t expected_length = 0;
+    uint8_t *expected = okay ? JS_WriteObject(ctx, &expected_length, compiled,
+        JS_WRITE_OBJ_BYTECODE) : NULL;
+    okay &= expected != NULL;
+    unsigned refused = 0, accepted = 0;
+    for (size_t allowance = 0; okay && allowance <= 65536; allowance += 512) {
+        JSMemoryUsage usage;
+        JS_ComputeMemoryUsage(rt, &usage);
+        JS_SetMemoryLimit(rt, (size_t)usage.malloc_size + allowance);
+        size_t length = 1;
+        uint8_t *bytes = JS_WriteObject(ctx, &length, compiled, JS_WRITE_OBJ_BYTECODE);
+        JS_SetMemoryLimit(rt, 4u * MIB);
+        if (bytes) {
+            accepted++;
+            if (length != expected_length || memcmp(bytes, expected, length) != 0)
+                fprintf(stderr, "writer allowance=%zu got=%zu expected=%zu\n",
+                    allowance, length, expected_length);
+            okay &= length == expected_length && memcmp(bytes, expected, length) == 0;
+        } else {
+            refused++;
+            okay &= length == 0;
+            JSValue exception = JS_GetException(ctx);
+            JS_FreeValue(ctx, exception);
+        }
+        js_free(ctx, bytes);
+    }
+    okay &= refused != 0 && accepted != 0;
+    js_free(ctx, expected);
+    JS_FreeValue(ctx, compiled);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay &= budget_quickjs_pool_destroy(pool) && budget.current == 0;
+    if (!okay) fprintf(stderr, "Bytecode writer published a partial artifact (accepted=%u refused=%u expected=%zu)\n", accepted, refused, expected_length);
+    return okay ? 0 : 1;
+}
+
+static int run_sparse_bytecode_atoms(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (!pool) return 1;
+    JSRuntime *rt = JS_NewRuntime2(budget_quickjs_pool_allocator(), pool);
+    if (!rt) return 1;
+    JSContext *ctx = JS_NewContext(rt);
+    if (!ctx) return 1;
+    enum { COUNT = 20000 };
+    JSAtom *atoms = malloc(COUNT * sizeof(*atoms));
+    if (!atoms) return 1;
+    int okay = 1;
+    for (unsigned i = 0; i < COUNT; ++i) {
+        char name[40];
+        snprintf(name, sizeof(name), "earlier_page_property_%u", i);
+        atoms[i] = JS_NewAtom(ctx, name);
+        okay &= atoms[i] != JS_ATOM_NULL;
+    }
+    const char source[] = "(()=>{const lateValue=40;return {lateResult:lateValue+2}})()";
+    JSValue compiled = JS_Eval(ctx, source, sizeof(source)-1,
+        "<late-small-script>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+    okay &= !JS_IsException(compiled);
+    JSMemoryUsage usage;
+    JS_ComputeMemoryUsage(rt, &usage);
+    JS_SetMemoryLimit(rt, (size_t)usage.malloc_size + 16u * 1024u);
+    size_t rejects = budget_quickjs_pool_rejection_count(pool), length = 0;
+    uint8_t *bytes = JS_IsException(compiled) ? NULL
+        : JS_WriteObject(ctx, &length, compiled, JS_WRITE_OBJ_BYTECODE);
+    okay &= bytes != NULL && length != 0
+        && budget_quickjs_pool_rejection_count(pool) == rejects;
+    JS_SetMemoryLimit(rt, 8u * MIB);
+    if (bytes) {
+        JSValue restored = JS_ReadObject(ctx, bytes, length, JS_READ_OBJ_BYTECODE);
+        JSValue result = JS_IsException(restored) ? restored : JS_EvalFunction(ctx, restored);
+        JSValue field = JS_IsException(result) ? JS_UNDEFINED
+            : JS_GetPropertyStr(ctx, result, "lateResult");
+        int32_t answer = 0;
+        okay &= !JS_IsException(result) && JS_ToInt32(ctx, &answer, field) == 0 && answer == 42;
+        JS_FreeValue(ctx, field);
+        JS_FreeValue(ctx, result);
+    }
+    js_free(ctx, bytes);
+    JS_FreeValue(ctx, compiled);
+    for (unsigned i = 0; i < COUNT; ++i) JS_FreeAtom(ctx, atoms[i]);
+    free(atoms);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay &= budget_quickjs_pool_destroy(pool) && budget.current == 0;
+    if (!okay) fprintf(stderr, "Bytecode cache scaled with unrelated page atoms\n");
+    return okay ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2) {
@@ -507,6 +1182,22 @@ int main(int argc, char **argv)
         return run_failure_boundary((size_t) requested);
     }
     if (argc != 1) return 2;
+    if (run_bytecode_refusal_atomicity() != 0) return 1;
+    if (run_sparse_bytecode_atoms() != 0) return 1;
+    if (run_cstring_refusal_lifetime() != 0) return 1;
+    if (run_source_snapshot_sharing() != 0) return 1;
+    if (run_source_span_snapshot() != 0) return 1;
+    if (run_dense_join_pressure() != 0) return 1;
+    if (run_function_source_allocation_pressure(false) != 0
+        || run_function_source_allocation_pressure(true) != 0) return 1;
+    if (run_automatic_gc_near_limit() != 0) {
+        fprintf(stderr, "QuickJS automatic GC headroom failed\n");
+        return 1;
+    }
+    if (run_shared_function_source() != 0) {
+        fprintf(stderr, "QuickJS shared function source failed\n");
+        return 1;
+    }
     if (run_retired_callable_contract() != 0) {
         fprintf(stderr, "QuickJS retired callable lifecycle failed\n");
         return 1;
@@ -534,7 +1225,7 @@ int main(int argc, char **argv)
 
     /* Allocation failure inside JS_Eval's parse/bytecode phase must unwind
        as cleanly as the execution-time boundaries above. */
-    for (size_t boundary = 0; boundary <= 96; boundary++) {
+    for (size_t boundary = 0; boundary <= 512; boundary++) {
         if (run_parse_failure_boundary(boundary) != 0) {
             fprintf(stderr,
                     "QuickJS parse OOM failed after %zu allocations\n",
