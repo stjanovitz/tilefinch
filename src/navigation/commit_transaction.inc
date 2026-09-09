@@ -1171,6 +1171,12 @@ static bool navigation_commit_document(
         goto fail;
     }
     navigation_apply_declared_viewport(session, viewport_width, 272);
+    if (session->page.runtime != NULL) {
+        script_runtime_set_viewport(
+            session->page.runtime, session->viewport.css_width,
+            session->viewport.css_height, session->viewport.device_width,
+            session->viewport.device_height);
+    }
     if (streaming != NULL
         && streaming->preview_layout_reuse != NULL) {
         if (streaming->viewport.css_width == session->viewport.css_width
@@ -1235,6 +1241,10 @@ static bool navigation_commit_document(
         && streaming->blocking_stylesheet_fingerprint_valid
         && streaming->viewport.css_width == session->viewport.css_width
         && streaming->viewport.css_height == session->viewport.css_height
+        && streaming->blocking_stylesheet.viewport_width
+            == session->viewport.css_width
+        && streaming->blocking_stylesheet.viewport_height
+            == session->viewport.css_height
         && strcmp(streaming->resource_base_url,
                   session->page.resource_base_url) == 0
         && strcmp(streaming->referrer_policy,

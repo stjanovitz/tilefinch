@@ -1386,11 +1386,11 @@ static StyleTokenBloom style_match_subject_bloom(
     if (subject == NULL) return style_token_bloom_empty();
     StyleTokenBloom bloom = style_token_bloom_empty();
     if (subject->tag != NULL) {
+        /* One token per tag: compiled numeric tags use this same canonical
+           name in rule filters. Duplicating IDs saturates ancestor summaries. */
         style_token_bloom_merge(
             &bloom, style_compound_token_bloom(
                 STYLE_SELECTOR_TAG, subject->tag, subject->tag_length));
-        style_token_bloom_merge(
-            &bloom, style_compound_tag_id_bloom(subject->tag_id));
     }
     if (subject->id != NULL) {
         style_token_bloom_merge(
@@ -1707,6 +1707,319 @@ static void style_trace_position_match(const Stylesheet *sheet,
             declaration->values.relative_position);
 }
 
+/* ---- Retained matched-rule table (see style_internal.h). ---------------- */
+
+StyleRetainedMatches *style_retained_matches_create(Budget *budget)
+{
+    if (budget == NULL) return NULL;
+    StyleRetainedMatches *table = budget_calloc_category(
+        budget, BUDGET_CATEGORY_LAYOUT, 1, sizeof(*table));
+    if (table == NULL) return NULL;
+    table->entries = budget_calloc_category(
+        budget, BUDGET_CATEGORY_LAYOUT, STYLE_RETAINED_MATCH_CAPACITY,
+        sizeof(*table->entries));
+    if (table->entries == NULL) {
+        budget_free(budget, table);
+        return NULL;
+    }
+    table->budget = budget;
+    return table;
+}
+
+void style_retained_matches_destroy(StyleRetainedMatches *table)
+{
+    if (table == NULL) return;
+    Budget *budget = table->budget;
+    budget_free(budget, table->entries);
+    memset(table, 0, sizeof(*table));
+    budget_free(budget, table);
+}
+
+size_t style_retained_matches_bytes(const StyleRetainedMatches *table)
+{
+    if (table == NULL) return 0;
+    return sizeof(*table)
+           + STYLE_RETAINED_MATCH_CAPACITY * sizeof(*table->entries);
+}
+
+void style_retained_matches_clear(StyleRetainedMatches *table)
+{
+    if (table == NULL || table->entries == NULL || table->occupied == 0) return;
+    memset(table->entries, 0,
+           STYLE_RETAINED_MATCH_CAPACITY * sizeof(*table->entries));
+    table->occupied = 0;
+}
+
+StyleRetainedMatches *style_retained_matches_attach(
+    const Stylesheet *sheet, StyleRetainedMatches *table)
+{
+    if (sheet == NULL || sheet->resolve_scratch == NULL) return NULL;
+    StyleRetainedMatches *previous = sheet->resolve_scratch->retained_matches;
+    sheet->resolve_scratch->retained_matches = table;
+    return previous;
+}
+
+static bool style_retained_node_within(const lxb_dom_node_t *node,
+                                       const lxb_dom_node_t *ancestor)
+{
+    for (const lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+        if (at == ancestor) return true;
+    }
+    return false;
+}
+
+void style_retained_matches_invalidate_within(
+    StyleRetainedMatches *table, const lxb_dom_node_t *scope)
+{
+    if (table == NULL || table->entries == NULL || table->occupied == 0) return;
+    if (scope == NULL) {
+        style_retained_matches_clear(table);
+        return;
+    }
+    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
+        StyleRetainedMatchEntry *entry = &table->entries[i];
+        if (entry->node != NULL
+            && style_retained_node_within(entry->node, scope)) {
+            memset(entry, 0, sizeof(*entry));
+            table->occupied--;
+        }
+    }
+}
+
+void style_retained_matches_invalidate_ancestors(
+    StyleRetainedMatches *table, const lxb_dom_node_t *node)
+{
+    if (table == NULL || table->entries == NULL || table->occupied == 0) return;
+    if (node == NULL) {
+        style_retained_matches_clear(table);
+        return;
+    }
+    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
+        StyleRetainedMatchEntry *entry = &table->entries[i];
+        if (entry->node != NULL
+            && style_retained_node_within(node, entry->node)) {
+            memset(entry, 0, sizeof(*entry));
+            table->occupied--;
+        }
+    }
+}
+
+static size_t style_retained_home(const lxb_dom_node_t *node,
+                                  PseudoElement pseudo)
+{
+    uintptr_t bits = ((uintptr_t) node >> 4)
+                     + (uintptr_t) pseudo * (uintptr_t) UINT32_C(0x9e3779b1);
+    bits *= (uintptr_t) UINT32_C(2654435761);
+    return (size_t) (bits ^ (bits >> 15))
+           & (STYLE_RETAINED_MATCH_CAPACITY - 1u);
+}
+
+static bool style_retained_usable(const Stylesheet *sheet)
+{
+    return sheet != NULL && sheet->resolve_scratch != NULL
+           && sheet->resolve_scratch->retained_matches != NULL
+           && sheet->resolve_scratch->retained_matches->entries != NULL
+           && sheet->count <= UINT16_MAX
+           && !stylesheet_has_container_queries(sheet);
+}
+
+static const StyleRetainedMatchEntry *style_retained_lookup(
+    const Stylesheet *sheet, const lxb_dom_node_t *node,
+    PseudoElement pseudo)
+{
+    if (node == NULL || !style_retained_usable(sheet)) return NULL;
+    StyleRetainedMatches *table = sheet->resolve_scratch->retained_matches;
+    size_t home = style_retained_home(node, pseudo);
+    for (size_t probe = 0; probe < STYLE_RETAINED_MATCH_PROBE_LIMIT; probe++) {
+        const StyleRetainedMatchEntry *entry = &table->entries[
+            (home + probe) & (STYLE_RETAINED_MATCH_CAPACITY - 1u)];
+        if (entry->node == node && entry->pseudo == (uint8_t) pseudo) {
+            table->hits++;
+            return entry;
+        }
+        if (entry->node == NULL) break;
+    }
+    table->misses++;
+    return NULL;
+}
+
+/* A retained pseudo-element list generates no box when no matched rule can
+   supply `content` (mirrors style_pseudo_known_absent). */
+static bool style_retained_pseudo_absent(const Stylesheet *sheet,
+                                         const StyleRetainedMatchEntry *entry)
+{
+    for (size_t i = 0; i < entry->count; i++) {
+        size_t index = entry->rules[i];
+        if (index >= sheet->count) return false;
+        const StyleDeclaration *declaration = stylesheet_rule_declaration(
+            sheet, &sheet->rules[index]);
+        if (declaration != NULL
+            && ((declaration->inherit_mask & S_CONTENT) != 0
+                || ((declaration->mask & S_CONTENT) != 0
+                    && declaration->values.generated_content)
+                || declaration->deferred_declarations != NULL)) return false;
+    }
+    return true;
+}
+
+void style_retained_matches_invalidate_tokens(
+    StyleRetainedMatches *table, const Stylesheet *sheet,
+    const lxb_dom_node_t *const *nodes, size_t node_count,
+    const uint32_t *hashes, size_t hash_count, bool parent_scope)
+{
+    if (table == NULL || table->entries == NULL || table->occupied == 0) return;
+    uint32_t affected[STYLE_RETAINED_AFFECTED_RULE_LIMIT];
+    size_t affected_count = sheet == NULL || sheet->count > UINT16_MAX
+        ? SIZE_MAX
+        : stylesheet_rules_affected_by_tokens(
+              sheet, hashes, hash_count, affected,
+              STYLE_RETAINED_AFFECTED_RULE_LIMIT);
+    if (affected_count == SIZE_MAX) {
+        table->token_fallbacks++;
+        for (size_t i = 0; i < node_count; i++) {
+            const lxb_dom_node_t *scope = nodes[i];
+            if (scope == NULL) continue;
+            if (parent_scope && scope->parent != NULL) scope = scope->parent;
+            style_retained_matches_invalidate_within(table, scope);
+        }
+        return;
+    }
+    table->token_invalidations++;
+    table->token_affected_rules += affected_count;
+    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
+        StyleRetainedMatchEntry *entry = &table->entries[i];
+        if (entry->node == NULL) continue;
+        bool drop = false;
+        for (size_t n = 0; !drop && n < node_count; n++) {
+            drop = entry->node == nodes[n];
+        }
+        if (drop) {
+            memset(entry, 0, sizeof(*entry));
+            table->occupied--;
+            table->token_dropped++;
+        }
+    }
+    style_retained_matches_invalidate_rules(
+        table, sheet, affected, affected_count);
+}
+
+void style_retained_matches_invalidate_rules(
+    StyleRetainedMatches *table, const Stylesheet *sheet,
+    const uint32_t *rules, size_t count)
+{
+    if (table == NULL || table->entries == NULL || table->occupied == 0
+        || sheet == NULL || count == 0) return;
+    for (size_t a = 0; a < count; a++) {
+        if (rules[a] >= sheet->count || !sheet->rules[rules[a]].has_fast_key) {
+            /* A universal rule can gain or lose any element. */
+            table->token_dropped += table->occupied;
+            style_retained_matches_clear(table);
+            return;
+        }
+    }
+    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
+        StyleRetainedMatchEntry *entry = &table->entries[i];
+        if (entry->node == NULL) continue;
+        StyleMatchSubject subject = {0};
+        style_match_subject_prepare((lxb_dom_node_t *) entry->node, &subject);
+        bool drop = false;
+        for (size_t a = 0; !drop && a < count; a++) {
+            drop = rule_fast_matches(&sheet->rules[rules[a]], &subject);
+        }
+        if (drop) {
+            memset(entry, 0, sizeof(*entry));
+            table->occupied--;
+            table->token_dropped++;
+        }
+    }
+}
+
+void style_retained_matches_remap(StyleRetainedMatches *table,
+                                  const uint16_t *remap, size_t old_count)
+{
+    if (table == NULL || table->entries == NULL || table->occupied == 0) return;
+    for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++) {
+        StyleRetainedMatchEntry *entry = &table->entries[i];
+        if (entry->node == NULL) continue;
+        bool valid = remap != NULL;
+        for (size_t k = 0; valid && k < entry->count; k++) {
+            valid = entry->rules[k] < old_count
+                    && remap[entry->rules[k]] != UINT16_MAX;
+        }
+        if (!valid) {
+            memset(entry, 0, sizeof(*entry));
+            table->occupied--;
+            continue;
+        }
+        for (size_t k = 0; k < entry->count; k++) {
+            entry->rules[k] = remap[entry->rules[k]];
+        }
+    }
+}
+
+static bool style_retained_begin(const Stylesheet *sheet)
+{
+    if (!style_retained_usable(sheet)) return false;
+    StyleResolveScratch *scratch = sheet->resolve_scratch;
+    if (scratch->retained_pending_active) {
+        /* A nested element resolution would interleave its matches with
+           the outer element's list. Record neither. */
+        scratch->retained_pending_valid = false;
+        return false;
+    }
+    scratch->retained_pending_active = true;
+    scratch->retained_pending_valid = true;
+    scratch->retained_pending_count = 0;
+    return true;
+}
+
+static void style_retained_note(const Stylesheet *sheet, size_t rule_index)
+{
+    StyleResolveScratch *scratch = sheet->resolve_scratch;
+    if (scratch == NULL || !scratch->retained_pending_valid) return;
+    if (scratch->retained_pending_count >= STYLE_RETAINED_MATCH_RULE_LIMIT
+        || rule_index > UINT16_MAX) {
+        scratch->retained_pending_valid = false;
+        return;
+    }
+    scratch->retained_pending_rules[scratch->retained_pending_count++] =
+        (uint16_t) rule_index;
+}
+
+static void style_retained_commit(const Stylesheet *sheet,
+                                  const lxb_dom_node_t *node,
+                                  PseudoElement pseudo)
+{
+    StyleResolveScratch *scratch = sheet->resolve_scratch;
+    if (scratch == NULL) return;
+    bool valid = scratch->retained_pending_active
+                 && scratch->retained_pending_valid
+                 && !sheet->selector_cooperate_cancelled;
+    scratch->retained_pending_active = false;
+    scratch->retained_pending_valid = false;
+    StyleRetainedMatches *table = scratch->retained_matches;
+    if (!valid || node == NULL || table == NULL || table->entries == NULL) return;
+    size_t home = style_retained_home(node, pseudo);
+    size_t slot = home;
+    for (size_t probe = 0; probe < STYLE_RETAINED_MATCH_PROBE_LIMIT; probe++) {
+        slot = (home + probe) & (STYLE_RETAINED_MATCH_CAPACITY - 1u);
+        const StyleRetainedMatchEntry *entry = &table->entries[slot];
+        if (entry->node == NULL
+            || (entry->node == node && entry->pseudo == (uint8_t) pseudo))
+            break;
+    }
+    /* A full probe window replaces its last slot; every surviving entry is
+       still exact for its own element, so a displaced one only misses. */
+    StyleRetainedMatchEntry *entry = &table->entries[slot];
+    if (entry->node == NULL) table->occupied++;
+    entry->node = node;
+    entry->pseudo = (uint8_t) pseudo;
+    entry->count = scratch->retained_pending_count;
+    memcpy(entry->rules, scratch->retained_pending_rules,
+           entry->count * sizeof(entry->rules[0]));
+    table->stores++;
+}
+
 static void style_apply_matching_range(const Stylesheet *sheet,
                                        const ComputedStyle *parent,
                                        lxb_dom_node_t *node,
@@ -1715,10 +2028,24 @@ static void style_apply_matching_range(const Stylesheet *sheet,
                                        PseudoElement pseudo,
                                        size_t start, size_t end,
                                        ComputedStyle *style,
-                                       bool trace_position)
+                                       bool trace_position,
+                                       const StyleRetainedMatchEntry *retained_entry,
+                                       bool record)
 {
-    if (sheet == NULL || start >= end
-        || (plan != NULL && plan->ready && plan->count == 0)) return;
+    if (sheet == NULL || start >= end) return;
+    if (retained_entry != NULL) {
+        /* Exact list recorded by an earlier resolution of this element
+           under the same document and stylesheet state. */
+        for (size_t i = 0; i < retained_entry->count; i++) {
+            size_t index = retained_entry->rules[i];
+            if (index < start || index >= end || index >= sheet->count) continue;
+            const StyleRule *rule = &sheet->rules[index];
+            if (trace_position) style_trace_position_match(sheet, rule, node);
+            apply_style_rule(sheet, rule, style, parent);
+        }
+        return;
+    }
+    if (plan != NULL && plan->ready && plan->count == 0) return;
     /* Diagnostics counters only; the match result never depends on them. */
     Stylesheet *mutable_sheet = (Stylesheet *) sheet;
     /* Container geometry can change during a build. Do not memoize its
@@ -1733,6 +2060,7 @@ static void style_apply_matching_range(const Stylesheet *sheet,
                 const StyleRule *rule = &sheet->rules[matches.rules[i]];
                 if (trace_position) style_trace_position_match(sheet, rule, node);
                 apply_style_rule(sheet, rule, style, parent);
+                if (record) style_retained_note(sheet, matches.rules[i]);
             }
             return;
         }
@@ -1755,6 +2083,7 @@ static void style_apply_matching_range(const Stylesheet *sheet,
             }
             if (trace_position) style_trace_position_match(sheet, rule, node);
             apply_style_rule(sheet, rule, style, parent);
+            if (record) style_retained_note(sheet, i);
             if (retained != NULL) {
                 if (matches.count < STYLE_MATCHED_RANGE_RULE_LIMIT)
                     matches.rules[matches.count++] = (uint32_t) i;
@@ -1831,6 +2160,7 @@ static void style_apply_matching_range(const Stylesheet *sheet,
         }
         if (trace_position) style_trace_position_match(sheet, rule, node);
         apply_style_rule(sheet, rule, style, parent);
+        if (record) style_retained_note(sheet, candidate);
         if (retained != NULL) {
             if (matches.count < STYLE_MATCHED_RANGE_RULE_LIMIT)
                 matches.rules[matches.count++] = candidate;
@@ -3056,12 +3386,22 @@ static ComputedStyle style_apply_node_cascade(
     if (sheet == NULL || node == NULL
         || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return style;
 
-    StyleMatchSubject subject = style_match_subject(sheet, node);
-    StyleRuleIndexPlan index_plan = style_rule_index_plan(sheet, &subject, PSEUDO_NONE);
+    /* A retained exact match list skips subject preparation, index planning
+       and every candidate evaluation; the rules are replayed per range. */
+    const StyleRetainedMatchEntry *retained =
+        style_retained_lookup(sheet, node, PSEUDO_NONE);
+    bool record = retained == NULL && style_retained_begin(sheet);
+    StyleMatchSubject subject = {0};
+    StyleRuleIndexPlan index_plan = {0};
+    if (retained == NULL) {
+        subject = style_match_subject(sheet, node);
+        index_plan = style_rule_index_plan(sheet, &subject, PSEUDO_NONE);
+    }
     style_apply_matching_range(
         sheet, parent, node, &subject, &index_plan, PSEUDO_NONE,
         sheet->cascade_starts[CASCADE_AUTHOR_NORMAL],
-        sheet->cascade_ends[CASCADE_AUTHOR_NORMAL], &style, trace_position);
+        sheet->cascade_ends[CASCADE_AUTHOR_NORMAL], &style, trace_position,
+        retained, record);
     size_t length = 0;
     const char *inline_css = sheet->block_inline_style_attributes
             && !document_style_attribute_cssom_authorized(node)
@@ -3130,11 +3470,13 @@ static ComputedStyle style_apply_node_cascade(
     style_apply_matching_range(
         sheet, parent, node, &subject, &index_plan, PSEUDO_NONE,
         sheet->cascade_starts[CASCADE_USER_NORMAL],
-        sheet->cascade_ends[CASCADE_USER_NORMAL], &style, false);
+        sheet->cascade_ends[CASCADE_USER_NORMAL], &style, false,
+        retained, record);
     style_apply_matching_range(
         sheet, parent, node, &subject, &index_plan, PSEUDO_NONE,
         sheet->cascade_starts[CASCADE_AUTHOR_IMPORTANT],
-        sheet->cascade_ends[CASCADE_AUTHOR_IMPORTANT], &style, false);
+        sheet->cascade_ends[CASCADE_AUTHOR_IMPORTANT], &style, false,
+        retained, record);
     if (inline_css != NULL) {
         apply_values((Stylesheet *) sheet, &style,
                      &inline_important_values,
@@ -3146,7 +3488,9 @@ static ComputedStyle style_apply_node_cascade(
     style_apply_matching_range(
         sheet, parent, node, &subject, &index_plan, PSEUDO_NONE,
         sheet->cascade_starts[CASCADE_USER_IMPORTANT],
-        sheet->cascade_ends[CASCADE_USER_IMPORTANT], &style, false);
+        sheet->cascade_ends[CASCADE_USER_IMPORTANT], &style, false,
+        retained, record);
+    if (record) style_retained_commit(sheet, node, PSEUDO_NONE);
     if (sheet->fullscreen_node == node) {
         /* The PSP has no compositor top layer. Apply the bounded equivalent
            after the author cascade so a fullscreen request always owns the
@@ -3177,6 +3521,55 @@ static ComputedStyle style_apply_node_cascade(
         style.opacity = UINT8_MAX;
     }
     return style;
+}
+
+/* True when a candidate rule that can affect discovery actually matches
+   `node` for `pseudo`. Flagged candidates are few, so the exact selector
+   test is cheaper than resolving the element. */
+static bool style_plan_has_discovery_rule(const Stylesheet *sheet,
+                                          lxb_dom_node_t *node,
+                                          const StyleMatchSubject *subject,
+                                          const StyleRuleIndexPlan *plan,
+                                          PseudoElement pseudo)
+{
+    if (!plan->ready) return true;
+    for (size_t i = 0; i < plan->count; i++) {
+        for (uint32_t at = plan->ranges[i].begin; at < plan->ranges[i].end; at++) {
+            uint32_t index = sheet->rule_index_entries[at];
+            if (index >= sheet->count) return true;
+            if (!sheet->rule_filters[index].discovery) continue;
+            const StyleRule *rule = &sheet->rules[index];
+            if (rule->pseudo != pseudo) continue;
+            if (style_token_bloom_missing(
+                    sheet->rule_filters[index].compound, plan->compound_bloom))
+                continue;
+            if (plan->ancestor_bloom_ready
+                && style_token_bloom_missing(
+                    sheet->rule_filters[index].ancestors, plan->ancestor_bloom))
+                continue;
+            if (style_rule_selector_matches_subject(sheet, index, node, subject))
+                return true;
+        }
+    }
+    return false;
+}
+
+bool style_node_pseudo_rules_may_affect_discovery(const Stylesheet *sheet,
+                                                  lxb_dom_node_t *node)
+{
+    if (sheet == NULL || node == NULL
+        || node->type != LXB_DOM_NODE_TYPE_ELEMENT) return true;
+    stylesheet_prepare_rule_index((Stylesheet *) sheet);
+    if (!sheet->rule_index_ready || sheet->rule_index_entries == NULL
+        || sheet->rule_filters == NULL
+        || stylesheet_has_container_queries(sheet)) return true;
+    StyleMatchSubject subject = style_match_subject(sheet, node);
+    for (PseudoElement p = PSEUDO_BEFORE; p <= PSEUDO_AFTER; p++) {
+        StyleRuleIndexPlan plan = style_rule_index_plan(sheet, &subject, p);
+        if (style_plan_has_discovery_rule(sheet, node, &subject, &plan, p))
+            return true;
+    }
+    return false;
 }
 
 ComputedStyle style_for_node(const Stylesheet *sheet, lxb_dom_node_t *node,
@@ -3940,16 +4333,31 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
 {
     StyleMatchSubject subject = {0};
     StyleRuleIndexPlan index_plan = {0};
+    const StyleRetainedMatchEntry *retained = NULL;
+    if (sheet != NULL && node != NULL && pseudo != PSEUDO_NONE) {
+        retained = style_retained_lookup(sheet, node, pseudo);
+    }
     if (layout_only && sheet != NULL && node != NULL && pseudo != PSEUDO_NONE) {
         stylesheet_prepare_rule_index((Stylesheet *) sheet);
-        if (style_pseudo_known_absent(sheet, node, pseudo))
-            return (ComputedStyle) {0};
-        subject = style_match_subject(sheet, node);
-        index_plan = style_rule_index_plan(sheet, &subject, pseudo);
-        /* This early exit belongs only to layout. Computed-style callers
-           still receive inherited/default values for an absent pseudo. */
-        if (index_plan.ready && index_plan.count == 0)
-            return (ComputedStyle) {0};
+        if (retained != NULL) {
+            if (style_retained_pseudo_absent(sheet, retained))
+                return (ComputedStyle) {0};
+        } else {
+            if (style_pseudo_known_absent(sheet, node, pseudo))
+                return (ComputedStyle) {0};
+            subject = style_match_subject(sheet, node);
+            index_plan = style_rule_index_plan(sheet, &subject, pseudo);
+            /* This early exit belongs only to layout. Computed-style callers
+               still receive inherited/default values for an absent pseudo.
+               No candidate rule exists, so the exact retained list is
+               empty: keep that answer across builds. */
+            if (index_plan.ready && index_plan.count == 0) {
+                if (style_retained_begin(sheet)) {
+                    style_retained_commit(sheet, node, pseudo);
+                }
+                return (ComputedStyle) {0};
+            }
+        }
     }
     ComputedStyle style = {.display = DISPLAY_INLINE,
                            .color = parent != NULL ? parent->color : 0x000000,
@@ -4027,16 +4435,18 @@ static ComputedStyle style_resolve_pseudo(const Stylesheet *sheet, lxb_dom_node_
     sheet->resolve_scratch->current_image_source_base = NULL;
     sheet->resolve_scratch->current_image_source_referrer_policy = NULL;
     sheet->resolve_scratch->current_image_source_slot = 0;
-    if (!layout_only) {
+    if (!layout_only && retained == NULL) {
         subject = style_match_subject(sheet, node);
         index_plan = style_rule_index_plan(sheet, &subject, pseudo);
     }
+    bool record = retained == NULL && style_retained_begin(sheet);
     for (size_t phase = 0; phase < 4; phase++) {
         style_apply_matching_range(
             sheet, parent, node, &subject, &index_plan, pseudo,
             sheet->cascade_starts[phase],
-            sheet->cascade_ends[phase], &style, false);
+            sheet->cascade_ends[phase], &style, false, retained, record);
     }
+    if (record) style_retained_commit(sheet, node, pseudo);
     resolve_font_size(&style, parent, false);
     resolve_sizing_em_lengths(&style);
     resolve_overflow_clip_margin(&style);

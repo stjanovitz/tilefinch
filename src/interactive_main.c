@@ -2176,7 +2176,7 @@ int main(int argc, char **argv)
     printf("image-attribution-us traversal=%llu styles=%llu admission=%llu "
            "node-styles=%llu pseudo-styles=%llu style-cache=%zu/%zu "
            "resolve=%llu cache=%llu context=%llu enqueue=%llu "
-           "scheduler=%llu finish=%llu drain=%llu\n",
+           "scheduler=%llu finish=%llu drain=%llu prefilter=%zu/%zu\n",
            (unsigned long long)
              navigation.page.images.stats.traversal_us,
            (unsigned long long)
@@ -2200,7 +2200,9 @@ int main(int argc, char **argv)
            (unsigned long long)
              navigation.page.images.stats.scheduler_us,
            (unsigned long long) navigation.page.images.stats.finish_us,
-           (unsigned long long) navigation.page.images.stats.drain_us);
+           (unsigned long long) navigation.page.images.stats.drain_us,
+           navigation.page.images.stats.discovery_prefilter_skips,
+           navigation.page.images.stats.discovery_prefilter_checks);
     printf("stylesheet rules=%zu important-rules=%zu layers=%zu variables=%zu scoped-variables=%zu "
            "generated-text=%zu/%zu deferred-bytes=%zu\n",
            navigation.page.stylesheet.count,
@@ -2330,7 +2332,7 @@ int main(int argc, char **argv)
            "evictions=%zu retained=%zu skips=%zu/%zu/%zu/%zu "
            "signatures=%016llx/%016llx "
            "compiled-fingerprints=%016llx/%016llx "
-           "fingerprint-us=%llu\n",
+           "fingerprint-us=%llu viewport-rebuilds=%zu\n",
            navigation.performance.blocking_stylesheet_builds,
            navigation.performance.blocking_stylesheet_reuses,
            navigation.performance.blocking_stylesheet_adoptions,
@@ -2365,7 +2367,8 @@ int main(int argc, char **argv)
            (unsigned long long) navigation.performance
              .compiled_stylesheet_cache_last_observed_fingerprint,
            (unsigned long long)
-             navigation.performance.blocking_stylesheet_fingerprint_us);
+             navigation.performance.blocking_stylesheet_fingerprint_us,
+           navigation.performance.blocking_stylesheet_viewport_rebuilds);
     uint64_t parser_native_us =
         navigation.performance.parser_feed_us
             >= navigation.performance.parser_callback_us
@@ -2614,7 +2617,8 @@ int main(int argc, char **argv)
     printf("layout-reuse retained=%zu style-hits=%zu style-misses=%zu "
            "intrinsic-hits=%zu intrinsic-misses=%zu "
            "table-row-hits=%zu table-row-misses=%zu scoped-invalidations=%zu "
-           "full-resets=%zu pressure-evictions=%zu\n",
+           "full-resets=%zu pressure-evictions=%zu matched=%zu/%zu/%zu "
+           "token=%zu/%zu/%zu style-appends=%zu/%zu\n",
            navigation.performance.layout_reuse_retained_bytes,
            navigation.performance.layout_reuse_style_hits,
            navigation.performance.layout_reuse_style_misses,
@@ -2624,7 +2628,15 @@ int main(int argc, char **argv)
            navigation.performance.layout_reuse_table_row_misses,
            navigation.performance.layout_reuse_scoped_invalidations,
            navigation.performance.layout_reuse_full_resets,
-           navigation.performance.layout_reuse_pressure_evictions);
+           navigation.performance.layout_reuse_pressure_evictions,
+           navigation.performance.layout_reuse_matched_hits,
+           navigation.performance.layout_reuse_matched_misses,
+           navigation.performance.layout_reuse_matched_stores,
+           navigation.performance.layout_reuse_matched_token_invalidations,
+           navigation.performance.layout_reuse_matched_token_fallbacks,
+           navigation.performance.layout_reuse_matched_token_dropped,
+           navigation.performance.mutation_style_appends,
+           navigation.performance.mutation_style_append_fallbacks);
     printf("progressive-paint attempts=%zu skips=%zu failures=%zu "
            "adoptions=%zu "
            "layouts=%zu paints=%zu layout-us=%llu paint-us=%llu "

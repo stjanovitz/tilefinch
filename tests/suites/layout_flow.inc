@@ -1281,6 +1281,190 @@ static int test_overflow_index_uses_nearby_bands(Budget *budget)
     return 0;
 }
 
+typedef struct {
+    LayoutReuseCache *reuse;
+    uint64_t now;
+    bool cancelled;
+} CounterReuseCancel;
+
+static uint64_t counter_reuse_cancel_clock(void *opaque)
+{
+    CounterReuseCancel *probe = opaque;
+    probe->now += UINT64_C(8000000);
+    return probe->now;
+}
+
+static bool counter_reuse_cancel_poll(void *opaque, const char *phase, size_t work)
+{
+    (void) phase;
+    (void) work;
+    CounterReuseCancel *probe = opaque;
+    if (probe->reuse->counter_entries == NULL) probe->cancelled = true;
+    return !probe->cancelled;
+}
+
+static int test_generated_counter_lookup_work(Budget *budget)
+{
+    char html[8192];
+    static const char prefix[] = "<!doctype html><style>body{counter-reset:n}"
+        "span{counter-increment:n}span::before{content:counter(n) ':'}"
+        "</style><body>";
+    size_t length = sizeof(prefix) - 1u;
+    memcpy(html, prefix, length);
+    static const char label[] = "<span>x</span>";
+    for (unsigned i = 0; i < 96; i++) {
+        CHECK(sizeof(label) - 1u < sizeof(html) - length);
+        memcpy(html + length, label, sizeof(label) - 1u);
+        length += sizeof(label) - 1u;
+    }
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, length, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, budget, &document, &viewport));
+    LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+    CHECK(reuse != NULL && layout_build_context_reuse(&layout, budget,
+        &document, &sheet, NULL, NULL, &viewport, reuse));
+    LayoutReuseStats stats;
+    layout_reuse_cache_stats(reuse, &stats);
+    printf("counter lookup: entries=%zu visits=%zu\n", reuse->counter_count,
+        stats.counter_lookup_visits);
+    CHECK(text_command(&layout, "96:") != NULL && stats.counter_lookup_visits != 0
+        && stats.counter_lookup_visits <= 8u * reuse->counter_count);
+    uint64_t fingerprint = layout.text_fingerprint;
+    size_t visits = stats.counter_lookup_visits;
+    layout_destroy(&layout);
+    layout_reuse_cache_begin_font_publication(reuse);
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    layout_reuse_cache_end_font_publication(reuse);
+    layout_reuse_cache_stats(reuse, &stats);
+    CHECK(layout.text_fingerprint == fingerprint
+        && stats.counter_lookup_visits - visits <= 8u * reuse->counter_count);
+    layout_destroy(&layout);
+    /* Reordered flow must wrap the hint without changing DOM-order counter
+       values. Moving the first label last forces a backward lookup. */
+    static const char reordered[] = "body{display:flex;flex-wrap:wrap}"
+        "span:first-child{order:1}";
+    CHECK(stylesheet_add_css(&sheet, reordered, sizeof(reordered) - 1u)
+        && layout_build_context_reuse(&layout, budget, &document, &sheet,
+            NULL, NULL, &viewport, reuse));
+    const DrawCommand *first = text_command(&layout, "1:");
+    const DrawCommand *last = text_command(&layout, "96:");
+    CHECK(first != NULL && last != NULL && first > last);
+    layout_destroy(&layout);
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_generated_counter_resource_reuse(Budget *budget)
+{
+    static const char html[] =
+        "<!doctype html><style>body{counter-reset:n}"
+        "span{counter-increment:n}span::before{content:counter(n) ':'}"
+        ".gone{display:none}</style><body>"
+        "<span>first</span><div><span>second</span></div><span>third</span>";
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, sizeof(html) - 1, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, budget, &document, &viewport));
+    LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+    CHECK(reuse != NULL && layout_build_context_reuse(&layout, budget,
+        &document, &sheet, NULL, NULL, &viewport, reuse));
+    CHECK(text_command(&layout, "3:") != NULL);
+    uint64_t fingerprint = layout.text_fingerprint;
+    LayoutReuseStats initial, after;
+    layout_reuse_cache_stats(reuse, &initial);
+    CHECK(initial.counter_index_builds == 1 && initial.counter_index_hits == 0);
+    layout_destroy(&layout);
+    layout_reuse_cache_begin_font_publication(reuse);
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    layout_reuse_cache_end_font_publication(reuse);
+    layout_reuse_cache_stats(reuse, &after);
+    CHECK(after.counter_index_builds == 1 && after.counter_index_hits == 1
+        && after.retained_bytes == initial.retained_bytes
+        && layout.text_fingerprint == fingerprint);
+    layout_destroy(&layout);
+    ImageResources images = {0};
+    layout_reuse_cache_update_images(reuse, &images);
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, &images, &viewport, reuse));
+    layout_reuse_cache_stats(reuse, &after);
+    CHECK(after.counter_index_hits == 2 && layout.text_fingerprint == fingerprint);
+    layout_destroy(&layout);
+
+    size_t before_cancel = budget->current;
+    size_t counter_bytes = reuse->counter_capacity * sizeof(LayoutCounterEntry);
+    CounterReuseCancel cancel = {.reuse = reuse};
+    TilefinchPlatformServices services = {.context = &cancel,
+        .monotonic_time_ns = counter_reuse_cancel_clock,
+        .cooperate = counter_reuse_cancel_poll};
+    tilefinch_platform_set_services(&services);
+    bool built = layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, &images, &viewport, reuse);
+    tilefinch_platform_set_services(NULL);
+    CHECK(!built && cancel.cancelled && layout.performance.cancelled);
+    layout_destroy(&layout);
+    CHECK(reuse->counter_entries == NULL
+        && budget->current <= before_cancel - counter_bytes);
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, &images, &viewport, reuse)
+        && layout.text_fingerprint == fingerprint);
+    layout_destroy(&layout);
+    CHECK(budget->current == before_cancel);
+
+    /* A scoped display mutation changes the ordered prefix, not only the
+       changed node's own value. Rebuild before numbering later siblings. */
+    lxb_dom_node_t *group = document_body_node(&document)->first_child->next;
+    CHECK(group != NULL);
+    BudgetAllocationOwner owner = document_allocation_owner_enter(&document);
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(group),
+        (const lxb_char_t *) "class", 5, (const lxb_char_t *) "gone", 4) != NULL);
+    document_allocation_owner_leave(&document, owner);
+    layout_reuse_cache_invalidate_node_scoped(reuse, group, false);
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, &images, &viewport, reuse));
+    layout_reuse_cache_stats(reuse, &after);
+    CHECK(after.counter_index_builds == 3 && text_command(&layout, "3:") == NULL
+        && text_command(&layout, "2:") != NULL);
+    layout_destroy(&layout);
+    static const char reset[] = "body{counter-reset:n 10}";
+    CHECK(stylesheet_add_css(&sheet, reset, sizeof(reset) - 1));
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, &images, &viewport, reuse));
+    CHECK(text_command(&layout, "12:") != NULL);
+    layout_destroy(&layout);
+    /* Container-query conditions can change when font/image geometry does.
+       Such sheets deliberately rebuild instead of retaining this proof. */
+    static const char query[] = "@container (min-width:1px){span{counter-increment:n 2}}";
+    CHECK(stylesheet_add_css(&sheet, query, sizeof(query) - 1)
+        && stylesheet_has_container_queries(&sheet));
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, &images, &viewport, reuse));
+    layout_reuse_cache_stats(reuse, &initial);
+    layout_destroy(&layout);
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, &images, &viewport, reuse));
+    layout_reuse_cache_stats(reuse, &after);
+    CHECK(after.counter_index_builds == initial.counter_index_builds + 1
+        && after.counter_index_hits == initial.counter_index_hits);
+    layout_destroy(&layout);
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
 static int test_generated_counter_analysis_is_shared(Budget *budget)
 {
     char page[48000];
@@ -2008,6 +2192,361 @@ static int test_mobile_overflow_intrinsic_minimums(Budget *budget)
           && audio_without_controls->width <= 8);
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static int test_retained_matches_reuse(Budget *budget)
+{
+    /* More elements than the computed-style reuse cache holds, so a rebuild
+       reaches the retained matched-rule table for most of them. */
+    static char html[96 * 1024];
+    static const char prefix[] = "<!doctype html><style>"
+        ".a{color:#112233}.b{color:#445566}div>span{font-weight:bold}"
+        "span:last-child{color:#778899}[data-k=v]{color:#aabbcc}"
+        "span.b::before{content:'*'}.q span{color:#00ff00}";
+    size_t length = sizeof(prefix) - 1u;
+    memcpy(html, prefix, length);
+    /* The table is only allocated for stylesheets large enough to make
+       candidate matching the dominant cost; pad past that threshold. */
+    for (unsigned i = 0; i < 64; i++) {
+        char rule[32];
+        int written = snprintf(rule, sizeof(rule), ".pad%u{margin:0}", i);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        memcpy(html + length, rule, (size_t) written);
+        length += (size_t) written;
+    }
+    static const char open[] = "</style><body><div>";
+    CHECK(sizeof(open) - 1u < sizeof(html) - length);
+    memcpy(html + length, open, sizeof(open) - 1u);
+    length += sizeof(open) - 1u;
+    for (unsigned i = 0; i < 1400; i++) {
+        char item[64];
+        int written = snprintf(item, sizeof(item),
+            "<span class=%s%s>t%04u</span>", i % 7 == 0 ? "b" : "a",
+            i % 11 == 0 ? " data-k=v" : "", i);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        memcpy(html + length, item, (size_t) written);
+        length += (size_t) written;
+    }
+    static const char suffix[] = "</div>";
+    CHECK(sizeof(suffix) - 1u < sizeof(html) - length);
+    memcpy(html + length, suffix, sizeof(suffix) - 1u);
+    length += sizeof(suffix) - 1u;
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    LayoutDocument layout = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, length, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&sheet, budget, &document, &viewport));
+    LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_enable_retained_matches(reuse);
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    LayoutReuseStats stats, again;
+    layout_reuse_cache_stats(reuse, &stats);
+    printf("retained matches: stores=%zu hits=%zu misses=%zu\n",
+           stats.matched_stores, stats.matched_hits, stats.matched_misses);
+    /* Within one build the bidi pre-scan and the flow both resolve these
+       spans; only the stores are meaningful here. */
+    CHECK(stats.matched_stores >= 1400);
+    uint64_t fingerprint = layout.text_fingerprint;
+    const DrawCommand *first = text_command(&layout, "t0001");
+    const DrawCommand *last = text_command(&layout, "t1399");
+    const DrawCommand *keyed = text_command(&layout, "t0011");
+    CHECK(first != NULL && first->color == 0x112233
+        && last != NULL && last->color == 0x778899
+        && keyed != NULL && keyed->color == 0xaabbcc);
+    layout_destroy(&layout);
+
+    /* Replayed lists reproduce the identical layout. */
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    layout_reuse_cache_stats(reuse, &again);
+    CHECK(again.matched_hits > stats.matched_hits
+        && layout.text_fingerprint == fingerprint);
+    first = text_command(&layout, "t0001");
+    last = text_command(&layout, "t1399");
+    keyed = text_command(&layout, "t0011");
+    CHECK(first != NULL && first->color == 0x112233
+        && last != NULL && last->color == 0x778899
+        && keyed != NULL && keyed->color == 0xaabbcc);
+    layout_destroy(&layout);
+
+    /* A journaled class change drops the changed element's list only. */
+    lxb_dom_node_t *group = document_body_node(&document)->first_child;
+    lxb_dom_node_t *span = group == NULL || group->first_child == NULL
+        ? NULL : group->first_child->next;
+    CHECK(span != NULL);
+    BudgetAllocationOwner owner = document_allocation_owner_enter(&document);
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(span),
+        (const lxb_char_t *) "class", 5, (const lxb_char_t *) "b", 1) != NULL);
+    document_allocation_owner_leave(&document, owner);
+    layout_reuse_cache_invalidate_node_scoped(reuse, span, false);
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    first = text_command(&layout, "t0001");
+    const DrawCommand *third = text_command(&layout, "t0002");
+    last = text_command(&layout, "t1399");
+    CHECK(first != NULL && first->color == 0x445566
+        && third != NULL && third->color == 0x112233
+        && last != NULL && last->color == 0x778899);
+    layout_destroy(&layout);
+
+    /* A class change whose tokens no rule depends on drops only the changed
+       element's own lists (element plus its two pseudo slots). */
+    lxb_dom_node_t *third_span = span->next;
+    CHECK(third_span != NULL);
+    uint32_t tokens[8];
+    size_t token_count = 0;
+    CHECK(stylesheet_attribute_change_tokens("class", 5, "a", 1, "zz", 2,
+                                             tokens, 8, &token_count)
+        && token_count == 2);
+    owner = document_allocation_owner_enter(&document);
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(third_span),
+        (const lxb_char_t *) "class", 5, (const lxb_char_t *) "zz", 2) != NULL);
+    document_allocation_owner_leave(&document, owner);
+    layout_reuse_cache_stats(reuse, &stats);
+    layout_reuse_cache_invalidate_attribute(
+        reuse, third_span, tokens, token_count, false, false);
+    layout_reuse_cache_flush_invalidations(reuse);
+    layout_reuse_cache_stats(reuse, &again);
+    CHECK(again.matched_token_invalidations == stats.matched_token_invalidations + 1
+        && again.matched_token_fallbacks == stats.matched_token_fallbacks
+        && again.matched_token_dropped >= stats.matched_token_dropped + 1
+        && again.matched_token_dropped <= stats.matched_token_dropped + 3);
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    third = text_command(&layout, "t0002");
+    const DrawCommand *fourth = text_command(&layout, "t0003");
+    CHECK(third != NULL && third->color == 0x000000
+        && fourth != NULL && fourth->color == 0x112233);
+    layout_destroy(&layout);
+
+    /* A class change that a relational rule depends on drops every list
+       that rule's rightmost compound could select. */
+    CHECK(stylesheet_attribute_change_tokens("class", 5, NULL, 0, "q", 1,
+                                             tokens, 8, &token_count)
+        && token_count == 1);
+    owner = document_allocation_owner_enter(&document);
+    CHECK(lxb_dom_element_set_attribute(lxb_dom_interface_element(group),
+        (const lxb_char_t *) "class", 5, (const lxb_char_t *) "q", 1) != NULL);
+    document_allocation_owner_leave(&document, owner);
+    layout_reuse_cache_stats(reuse, &stats);
+    layout_reuse_cache_invalidate_attribute(
+        reuse, group, tokens, token_count, false, false);
+    layout_reuse_cache_flush_invalidations(reuse);
+    layout_reuse_cache_stats(reuse, &again);
+    CHECK(again.matched_token_invalidations == stats.matched_token_invalidations + 1
+        && again.matched_token_fallbacks == stats.matched_token_fallbacks
+        && again.matched_token_dropped >= stats.matched_token_dropped + 1400);
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    fourth = text_command(&layout, "t0003");
+    last = text_command(&layout, "t1399");
+    CHECK(fourth != NULL && fourth->color == 0x00ff00
+        && last != NULL && last->color == 0x00ff00);
+    layout_destroy(&layout);
+
+    /* A full reset discards every list. */
+    layout_reuse_cache_stats(reuse, &stats);
+    layout_reuse_cache_reset(reuse);
+    CHECK(layout_build_context_reuse(&layout, budget, &document, &sheet,
+        NULL, NULL, &viewport, reuse));
+    layout_reuse_cache_stats(reuse, &again);
+    /* Every element had to be recorded again. */
+    CHECK(again.matched_stores - stats.matched_stores >= 1400);
+    layout_destroy(&layout);
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget->current == 0);
+    return 0;
+}
+
+static bool commands_equal(const LayoutDocument *a, const LayoutDocument *b)
+{
+    if (a->count != b->count) {
+        printf("command count %zu vs %zu\n", a->count, b->count);
+        return false;
+    }
+    for (size_t i = 0; i < a->count; i++) {
+        const DrawCommand *x = &a->commands[i], *y = &b->commands[i];
+        if (x->type != y->type || x->x != y->x || x->y != y->y
+            || x->width != y->width || x->height != y->height
+            || x->color != y->color || x->text_length != y->text_length) {
+            printf("command %zu differs: type=%u/%u rect=%d,%d,%d,%d/%d,%d,%d,%d "
+                   "color=%06x/%06x\n", i, x->type, y->type, x->x, x->y,
+                   x->width, x->height, y->x, y->y, y->width, y->height,
+                   x->color, y->color);
+            return false;
+        }
+    }
+    return true;
+}
+
+static lxb_dom_node_t *insert_style_element(PocDocument *document,
+                                            lxb_dom_node_t *parent,
+                                            lxb_dom_node_t *before,
+                                            const char *css)
+{
+    static const char style_tag[] = "style";
+    BudgetAllocationOwner previous = document_allocation_owner_enter(document);
+    lxb_dom_element_t *element = lxb_dom_document_create_element(
+        &document->html->dom_document, (const lxb_char_t *) style_tag,
+        sizeof(style_tag) - 1u, NULL);
+    lxb_dom_text_t *text = element == NULL ? NULL
+        : lxb_dom_document_create_text_node(
+              &document->html->dom_document, (const lxb_char_t *) css,
+              strlen(css));
+    lxb_dom_node_t *node = NULL;
+    if (element != NULL && text != NULL
+        && lxb_dom_node_append_child(lxb_dom_interface_node(element),
+                                     lxb_dom_interface_node(text))
+               == LXB_DOM_EXCEPTION_OK) {
+        node = lxb_dom_interface_node(element);
+        if (before != NULL) {
+            lxb_dom_node_insert_before(before, node);
+        } else if (lxb_dom_node_append_child(parent, node)
+                   != LXB_DOM_EXCEPTION_OK) {
+            node = NULL;
+        }
+    }
+    document_allocation_owner_leave(document, previous);
+    return node;
+}
+
+/* A <style> inserted into the head after load must yield the same styles as
+   a sheet rebuilt from the final document: its rules take their document
+   position (before the body's inline styles), earlier rule indices remap,
+   and retained matched-rule lists survive except where the new rules can
+   select. */
+static int test_stylesheet_append_matches_rebuild(Budget *budget)
+{
+    static char html[8192];
+    static const char head_css[] =
+        "<!doctype html><style>p{color:#111111}.x{color:#222222 !important}"
+        "p.q{font-weight:bold}";
+    static const char rest[] =
+        "</style><body><div id=host>"
+        "<style>.y{color:#333333}p.z{--tone:#444444;color:var(--tone)}</style>"
+        "<p class=x>one</p><p class=y>two</p><p class=z>three</p>"
+        "<p class=w>four</p><p class=q>five</p><span class=w>six</span></div>";
+    size_t length = sizeof(head_css) - 1u;
+    memcpy(html, head_css, length);
+    /* Enough rules for the retained matched-rule table to be allocated. */
+    for (unsigned i = 0; i < 64; i++) {
+        char rule[32];
+        int written = snprintf(rule, sizeof(rule), ".pad%u{margin:0}", i);
+        CHECK(written > 0 && (size_t) written < sizeof(html) - length);
+        memcpy(html + length, rule, (size_t) written);
+        length += (size_t) written;
+    }
+    CHECK(sizeof(rest) - 1u < sizeof(html) - length);
+    memcpy(html + length, rest, sizeof(rest) - 1u);
+    length += sizeof(rest) - 1u;
+    static const char late_css[] =
+        "p.z{--tone:#555555;color:var(--tone)}.w{color:#666666}.x{color:#777777}"
+        "span.w{color:#888888}";
+    PocDocument document = {0};
+    Stylesheet appended = {0};
+    ViewportContext viewport;
+    CHECK(document_parse(&document, budget, html, length, 19)
+        && viewport_context_init(&viewport, 480, 272, 480, 272)
+        && stylesheet_build_context(&appended, budget, &document, &viewport));
+    CHECK(stylesheet_style_source_count(&appended) == 2);
+    /* Retained lists filled by a first layout. */
+    LayoutReuseCache *reuse = layout_reuse_cache_create(budget);
+    CHECK(reuse != NULL);
+    layout_reuse_cache_enable_retained_matches(reuse);
+    LayoutDocument before = {0};
+    CHECK(layout_build_context_reuse(&before, budget, &document, &appended,
+        NULL, NULL, &viewport, reuse));
+    LayoutReuseStats stats;
+    layout_reuse_cache_stats(reuse, &stats);
+    CHECK(stats.matched_stores > 0);
+    layout_destroy(&before);
+    /* Snapshot the old selectors so the remap can be checked exactly. */
+    size_t old_count = appended.count;
+    char old_selectors[128][64];
+    CHECK(old_count <= 128);
+    for (size_t i = 0; i < old_count; i++) {
+        snprintf(old_selectors[i], sizeof(old_selectors[i]), "%s",
+                 appended.rules[i].selector);
+    }
+    lxb_dom_node_t *head = lxb_dom_interface_node(
+        lxb_html_document_head_element(document.html));
+    CHECK(head != NULL);
+    lxb_dom_node_t *late = insert_style_element(&document, head, NULL, late_css);
+    CHECK(late != NULL);
+    StylesheetAppendResult result;
+    CHECK(stylesheet_append_style_elements_tracked(
+        &appended, &late, 1, &document.content_security_policy, 1, &result));
+    CHECK(result.remap != NULL && !result.appended_bounded_out
+        && result.appended_count == 4 && result.old_count == old_count
+        && stylesheet_style_source_count(&appended) == 3
+        && appended.style_source_nodes[1] == late);
+    for (size_t i = 0; i < old_count; i++) {
+        CHECK(result.remap[i] < appended.count
+            && strcmp(appended.rules[result.remap[i]].selector,
+                      old_selectors[i]) == 0);
+    }
+    layout_reuse_cache_note_stylesheet_appended(
+        reuse, &appended, result.remap, result.old_count, result.appended,
+        result.appended_count, true);
+    stylesheet_append_result_release(&appended, &result);
+    /* Reference: a sheet built from the final document, no reuse. */
+    Stylesheet rebuilt = {0};
+    CHECK(stylesheet_build_context(&rebuilt, budget, &document, &viewport));
+    LayoutDocument reference = {0}, retained = {0}, fresh = {0};
+    CHECK(layout_build_context(&reference, budget, &document, &rebuilt,
+        NULL, NULL, &viewport));
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &appended,
+        NULL, NULL, &viewport, reuse));
+    CHECK(layout_build_context(&fresh, budget, &document, &appended,
+        NULL, NULL, &viewport));
+    const DrawCommand *one = text_command(&reference, "one");
+    const DrawCommand *three = text_command(&reference, "three");
+    const DrawCommand *four = text_command(&reference, "four");
+    const DrawCommand *six = text_command(&reference, "six");
+    CHECK(one != NULL && one->color == 0x222222
+        && three != NULL && three->color == 0x444444
+        && four != NULL && four->color == 0x666666
+        && six != NULL && six->color == 0x888888);
+    CHECK(commands_equal(&fresh, &reference));
+    CHECK(commands_equal(&retained, &reference));
+    layout_reuse_cache_stats(reuse, &stats);
+    CHECK(stats.stylesheet_appends == 1 && stats.full_resets == 0);
+    layout_destroy(&reference);
+    layout_destroy(&retained);
+    layout_destroy(&fresh);
+    /* A second append at the very end (after the body style) as well. */
+    lxb_dom_node_t *body = document_body_node(&document);
+    lxb_dom_node_t *tail = insert_style_element(
+        &document, body, NULL, "p.z{color:#999999}");
+    CHECK(tail != NULL && stylesheet_append_style_elements_tracked(
+        &appended, &tail, 1, &document.content_security_policy, 3, &result));
+    layout_reuse_cache_note_stylesheet_appended(
+        reuse, &appended, result.remap, result.old_count, result.appended,
+        result.appended_count, result.remap != NULL);
+    stylesheet_append_result_release(&appended, &result);
+    stylesheet_destroy(&rebuilt);
+    CHECK(stylesheet_build_context(&rebuilt, budget, &document, &viewport));
+    CHECK(layout_build_context(&reference, budget, &document, &rebuilt,
+        NULL, NULL, &viewport));
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &appended,
+        NULL, NULL, &viewport, reuse));
+    three = text_command(&reference, "three");
+    CHECK(three != NULL && three->color == 0x999999);
+    CHECK(commands_equal(&retained, &reference));
+    layout_destroy(&reference);
+    layout_destroy(&retained);
+    layout_reuse_cache_destroy(reuse);
+    stylesheet_destroy(&rebuilt);
+    stylesheet_destroy(&appended);
     document_destroy(&document);
     CHECK(budget->current == 0);
     return 0;

@@ -13,11 +13,10 @@
 #include "tilefinch/style.h"
 #include "tilefinch/remote_selector.h"
 
-/* QuickJS parsing/bytecode generation is a dependency call which cannot be
-   interrupted by the runtime watchdog.  This policy therefore places a hard,
-   truthful byte ceiling on every source submitted by the C host before that
-   call begins.  It does not claim to bound strings which author JavaScript
-   later constructs and passes to eval/Function inside QuickJS. */
+/* QuickJS parsing/bytecode generation is a dependency call. The vendored
+   parser polls the watchdog, but admission still needs a hard byte ceiling
+   before that call begins. This policy does not claim to bound strings which
+   author JavaScript later constructs and passes to eval/Function inside QuickJS. */
 typedef enum {
     SCRIPT_EXECUTION_PROFILE_LAB = 0,
     SCRIPT_EXECUTION_PROFILE_PSP_STRICT,
@@ -40,6 +39,10 @@ typedef struct {
        and observable as the byte ceiling above. */
     uint64_t maximum_host_compile_projected_us;
     size_t modeled_compile_bytes_per_ms;
+    /* Voluntary yield between complete author tasks (including their job
+       checkpoint). Zero is unbounded. A single task may exceed this target;
+       it is never interrupted/replayed to meet a scheduling deadline. */
+    uint64_t maximum_advance_time_us;
 } ScriptExecutionPolicy;
 
 typedef enum {
@@ -493,6 +496,7 @@ typedef struct {
    limit (0.021% of the realistic 24 MiB engine ceiling). */
 #define SCRIPT_MUTATION_JOURNAL_LIMIT 128u
 #define SCRIPT_MUTATION_ATTRIBUTE_LIMIT 32u
+#define SCRIPT_MUTATION_TOKEN_LIMIT 8u
 
 typedef enum {
     SCRIPT_MUTATION_UNKNOWN = 0,
@@ -519,6 +523,17 @@ typedef struct {
        the same author turn may already have destroyed. */
     uintptr_t owner_document_identity;
     char attribute[SCRIPT_MUTATION_ATTRIBUTE_LIMIT];
+    /* For class/id attribute mutations captured with exact before/after
+       values: hashes of the classes or ids that changed, so layout can keep
+       retained selector answers that no rule can depend on. Other mutations,
+       and changes of more tokens than fit, leave `changed_tokens_exact`
+       false and stay conservative. */
+    uint32_t changed_tokens[SCRIPT_MUTATION_TOKEN_LIMIT];
+    uint8_t changed_token_count;
+    bool changed_tokens_exact;
+    /* First child-list record was an insertion from a detached tree. Only
+       valid within this journal; never inferred from the final DOM alone. */
+    bool inserted_from_detached;
 } ScriptMutationRecord;
 
 typedef struct {
@@ -1065,6 +1080,9 @@ bool script_runtime_finish_loading(ScriptRuntime *runtime,
    queued. This includes bounded timers/network/script tasks, a partially
    drained QuickJS job checkpoint, and a continued classic-script slice. */
 bool script_runtime_has_pending_author_work(ScriptRuntime *runtime);
+/* Queued startup script work that should precede optional resource reflows.
+   Timers and ordinary in-flight fetches are deliberately excluded. */
+bool script_runtime_has_pending_startup_scripts(ScriptRuntime *runtime);
 /* Parser and native DOM owners call this after mutations which bypass the JS
    bridge so the next baseURI/resource preparation observes the live tree. */
 void script_runtime_invalidate_document_base(ScriptRuntime *runtime);
@@ -1343,6 +1361,12 @@ bool script_runtime_take_form_submission(
 bool script_runtime_consume_scroll(ScriptRuntime *runtime, int *scroll_y);
 void script_runtime_set_layout(ScriptRuntime *runtime, LayoutDocument *layout,
                                int viewport_height);
+/* Republishes the layout viewport to a realm created before the document's
+   viewport metadata was scanned: the viewport globals, innerWidth and
+   innerHeight follow the resolved CSS size. */
+void script_runtime_set_viewport(ScriptRuntime *runtime, int css_width,
+                                 int css_height, int device_width,
+                                 int device_height);
 void script_runtime_set_images(ScriptRuntime *runtime,
                                ImageResources *images);
 void script_runtime_set_stylesheet(ScriptRuntime *runtime,

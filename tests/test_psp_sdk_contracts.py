@@ -6054,6 +6054,15 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("FETCH_BACKGROUND_STREAM_CHUNK_TARGET", source)
         self.assertIn("FETCH_BACKGROUND_CHUNK_READY", source)
         self.assertIn("CURL_WRITEFUNC_PAUSE", source)
+        expire = source[source.index("static void fetch_background_expire_active_deadlines("):
+                        source.index("static bool fetch_background_has_worker_work(")]
+        self.assertIn("fetch_background_deadline_eligible(", expire)
+        self.assertIn("slot->transfer_done, slot->curl_paused", expire)
+        receive = source[source.index("static size_t fetch_background_receive_body("):
+                         source.index("static int fetch_background_transfer_progress(")]
+        self.assertLess(receive.index("slot->pause_started_us = slot->last_progress_us;",
+                                      receive.index("slot->length >= slot->stream_chunk_target")),
+                        receive.index("FETCH_BACKGROUND_CHUNK_READY"))
         take = source[
             source.index("bool fetch_background_transport_take_chunk("):
             source.index("static void fetch_background_release_slot(")]

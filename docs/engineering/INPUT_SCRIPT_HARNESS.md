@@ -193,11 +193,15 @@ Its golden ignores asynchronous action-cursor annotations, not receiver
 order or captures. A passing action golden alone is not a latency budget.
 See [the fidelity evidence limits](../FIDELITY.md#known-evidence-limits).
 
-`wikipedia-search-keyboard-live` starts at `https://en.wikipedia.org/`, hides
-the toolbar, moves the nub to the search input, enters `psp` through Danzeff,
-and submits with R+Start. Check that `search-loaded` names the newly loaded
-document with `resources-pending=0`; a keyboard-close or action acknowledgement
-alone is not success. This is a live smoke, not a stable page-layout golden.
+`wikipedia-search-keyboard-live` starts at the English Main Page, hides
+the toolbar, opens its responsive search icon, then moves the nub to the
+separate form's input, enters `psp` through Danzeff, and submits with R+Start.
+Check that `search-loaded` is loaded, its URL contains the nonempty `search=psp`
+query, and its capture shows search results. Optional resources may still be
+pending; a keyboard-close, empty-query page, or action acknowledgement alone
+is not success. Coordinates are tied to the live 480px layout: inspect the
+`search-field` capture and focus-target log when the site changes. This is a
+live smoke, not a stable page-layout golden.
 `wikipedia-font-cursor-live` alternates nub movement and idle time during
 optional-font publication. Check the font adoption/rollback and owner-thread
 input-acknowledgement records together with the captures. The old fallback

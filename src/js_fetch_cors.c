@@ -2688,6 +2688,18 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
     }
     task->state = SCRIPT_DYNAMIC_READY;
     task->success = success;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (!success) {
+        char diagnostic[512];
+        snprintf(diagnostic, sizeof(diagnostic),
+            "tilefinch-dynamic-fetch-failure: sequence=%llu transport=%d "
+            "status=%ld grant=%d bytes=%zu heap-remaining=%zu error=\"%.240s\"",
+            (unsigned long long) task->sequence, transport_success,
+            fetched->status_code, resource_grant_valid, fetched->length,
+            script_runtime_heap_remaining(runtime), fetched->error);
+        tilefinch_platform_log_message(diagnostic);
+    }
+#endif
     fetch_result_free(fetched);
     return true;
 }
@@ -2729,10 +2741,24 @@ ScriptQuotaProgressResult script_runtime_script_quota_progress(
 }
 
 static bool dynamic_admit_compile(ScriptRuntime *runtime,
-                                  size_t working_bytes)
+                                  size_t working_bytes, bool continuing_classic)
 {
-    size_t reserve = working_bytes > SCRIPT_DYNAMIC_EXECUTION_RESERVE_BYTES
-        ? working_bytes : SCRIPT_DYNAMIC_EXECUTION_RESERVE_BYTES;
+    /* Scale the initial reserve with the source, up to the existing 512 KiB
+       ceiling. A tiny late registration does not require half a MiB merely
+       because earlier scripts legitimately retained their initialized state.
+       A continued
+       classic script has already passed that admission and may legitimately
+       retain registrations in it. Re-demanding the entire startup reserve
+       at every tail statement can discard an otherwise runnable remainder.
+       Keep a bounded compiler/dispatch floor plus the segment's source size;
+       the unchanged hard heap/Budget limits remain authoritative. */
+    size_t floor = 64u * 1024u;
+    if (!continuing_classic) {
+        const size_t maximum = SCRIPT_DYNAMIC_EXECUTION_RESERVE_BYTES;
+        floor = working_bytes >= (maximum - floor) / 8u
+            ? maximum : floor + working_bytes * 8u;
+    }
+    size_t reserve = working_bytes > floor ? working_bytes : floor;
     bool budget_pressure = budget_pressure_required(
         runtime->budget, working_bytes, reserve);
     size_t heap = script_runtime_heap_remaining(runtime);
@@ -2919,7 +2945,8 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
                     : (has_lazy_plan
                         ? lazy_plan.largest_factory_bytes
                         : selected->source_length);
-            if (!dynamic_admit_compile(runtime, working_bytes)) {
+            if (!dynamic_admit_compile(runtime, working_bytes,
+                    selected->resource_loader_statement != 0)) {
                 if (has_lazy_plan) {
                     script_lazy_webpack_plan_destroy(&lazy_plan);
                 }

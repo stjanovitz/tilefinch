@@ -41,6 +41,7 @@ typedef struct {
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     /* Replaces samples only during a scripted modal-keyboard qualification. */
     bool (*validation_poll)(PspUiInput *input);
+    bool (*validation_finished)(void);
 #endif
 #ifdef TILEFINCH_HAVE_PSP_VOICE
     PspVoiceInput voice;

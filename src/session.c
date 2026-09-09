@@ -2723,7 +2723,7 @@ bool browser_session_classic_script_bytecode_put(
     return true;
 }
 
-void browser_session_stylesheet_artifacts_acquire(
+bool browser_session_stylesheet_artifacts_acquire(
     BrowserSession *session, const char *request_url,
     const TilefinchRequestContext *request_context,
     const unsigned char *source, size_t source_length,
@@ -2733,10 +2733,10 @@ void browser_session_stylesheet_artifacts_acquire(
     if (parsed_ir != NULL) *parsed_ir = NULL;
     if (session == NULL || request_url == NULL || source == NULL
         || source_length == 0
-        || (compiled_fragment == NULL && parsed_ir == NULL)) return;
+        || (compiled_fragment == NULL && parsed_ir == NULL)) return false;
     BrowserCacheEntry *entry = cache_stylesheet_response_entry(
         session, request_url, request_context, source, source_length);
-    if (entry == NULL) return;
+    if (entry == NULL) return false;
     bool retained = false;
     if (compiled_fragment != NULL
         && entry->stylesheet_compiled_fragment != NULL) {
@@ -2750,6 +2750,7 @@ void browser_session_stylesheet_artifacts_acquire(
         retained = retained || *parsed_ir != NULL;
     }
     if (retained) entry->stamp = ++session->clock;
+    return entry->length < session->maximum_cache_bytes;
 }
 
 static void cache_stylesheet_fragment_invalidate_entry(

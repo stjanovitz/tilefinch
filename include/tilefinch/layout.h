@@ -784,6 +784,18 @@ typedef struct {
     size_t table_row_misses;
     size_t scoped_invalidations;
     size_t full_resets;
+    size_t counter_index_builds;
+    size_t counter_index_hits;
+    size_t counter_lookup_visits;
+    /* Retained exact matched-rule lists (page caches only). */
+    size_t matched_hits;
+    size_t matched_misses;
+    size_t matched_stores;
+    size_t matched_token_invalidations;
+    size_t matched_token_fallbacks;
+    size_t matched_token_dropped;
+    size_t matched_token_affected_rules;
+    size_t stylesheet_appends;
 } LayoutReuseStats;
 
 /* Exclusive flow attribution; native placement includes unclassified flow
@@ -1047,6 +1059,39 @@ void layout_build_job_destroy(LayoutBuildJob *job);
 LayoutReuseCache *layout_reuse_cache_create(Budget *budget);
 void layout_reuse_cache_destroy(LayoutReuseCache *cache);
 void layout_reuse_cache_reset(LayoutReuseCache *cache);
+/* Allow the cache to retain each element's exact matched author rules across
+   builds (and across the image traversal), sized for a whole document. Only
+   the committed page cache opts in: its DOM mutations are journaled, so the
+   invalidation applied to retained computed styles also covers the lists. */
+void layout_reuse_cache_enable_retained_matches(LayoutReuseCache *cache);
+/* A journaled class/id attribute change on `node` whose changed tokens are
+   `changed_tokens` (from stylesheet_attribute_change_tokens; NULL keeps the
+   conservative subtree path). Retained computed styles are invalidated as
+   for layout_reuse_cache_invalidate_node_scoped; the retained matched-rule
+   lists are queued and settled by layout_reuse_cache_flush_invalidations,
+   which drops only the lists that a token-dependent rule could change. */
+void layout_reuse_cache_invalidate_attribute(
+    LayoutReuseCache *cache, lxb_dom_node_t *node,
+    const uint32_t *changed_tokens, size_t changed_token_count,
+    bool text_or_structure_sensitive, bool relational_selector_sensitive);
+void layout_reuse_cache_flush_invalidations(LayoutReuseCache *cache);
+/* The page stylesheet gained rules in place (see
+   stylesheet_append_style_elements_tracked). Retained computed styles and
+   sizing entries are discarded because values may change; the retained
+   matched-rule lists survive, remapped, except for elements the new rules
+   can select. `lists_valid` false discards the lists too. The cache then
+   accepts the sheet's new generation. */
+void layout_reuse_cache_note_stylesheet_appended(
+    LayoutReuseCache *cache, const Stylesheet *sheet, const uint16_t *remap,
+    size_t old_count, const uint32_t *appended, size_t appended_count,
+    bool lists_valid);
+/* Attach the cache's retained matched-rule table to `sheet` for the caller's
+   own style resolutions (pseudo-element styles resolved outside
+   layout_reuse_cache_resolve_style); returns the previous attachment. */
+void *layout_reuse_cache_attach_matches(LayoutReuseCache *cache,
+                                        const Stylesheet *sheet);
+void layout_reuse_cache_detach_matches(const Stylesheet *sheet,
+                                       void *previous);
 /* Font faces changed in place. Discard all sizing and ch-dependent styles,
    retain font-independent styles without walk-order eviction until end.
    Call end after either success or refusal; rollback must then reset cache. */

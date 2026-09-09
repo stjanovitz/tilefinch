@@ -355,6 +355,10 @@ static bool open_danzeff_keyboard(
 
     unsigned previous_buttons = 0;
     unsigned backspace_hold_frames = 0;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    printf("tilefinch-text-input: event=ready kind=danzeff submit=%u\n",
+           request->allow_submit ? 1u : 0u);
+#endif
     for (;;) {
         if (text_input_cancel_requested(service)) goto cancelled;
         psp_log_heartbeat();
@@ -388,6 +392,12 @@ static bool open_danzeff_keyboard(
             (pressed & PSP_CTRL_SELECT) != 0,
             request->allow_submit,
             (pad.Buttons & PSP_CTRL_RTRIGGER) != 0);
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        if ((pressed & (PSP_CTRL_START | PSP_CTRL_SELECT)) != 0) {
+            printf("tilefinch-text-input: event=finish-key buttons=0x%04x "
+                   "finish=%u\n", pad.Buttons, (unsigned) finish);
+        }
+#endif
         if (finish == DANZEFF_INPUT_CANCEL) goto cancelled;
         if (finish == DANZEFF_INPUT_DONE
             || finish == DANZEFF_INPUT_SUBMIT) {
@@ -509,6 +519,12 @@ cancelled:
 static bool text_input_cancel_requested(
     const PspTextInputService *service)
 {
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    /* Also unwind if exhaustion occurred during the initial held-button
+       drain, where an injected Select edge would itself be drained. */
+    if (service != NULL && service->validation_finished != NULL
+        && service->validation_finished()) return true;
+#endif
     return service != NULL && service->cancel_requested != NULL
         && service->cancel_requested(service->cancel_user);
 }

@@ -270,6 +270,10 @@ typedef struct {
     uint64_t pseudo_style_resolve_us;
     size_t node_style_cache_hits;
     size_t node_style_cache_misses;
+    /* Elements whose ::before/::after candidates cannot supply an image and
+       whose pseudo-element styles were therefore not resolved. */
+    size_t discovery_prefilter_skips;
+    size_t discovery_prefilter_checks;
     uint64_t admission_us;
     uint64_t admission_resolve_us;
     uint64_t admission_cache_us;

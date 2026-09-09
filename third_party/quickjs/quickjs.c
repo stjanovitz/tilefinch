@@ -630,7 +630,10 @@ typedef struct JSStringRope {
     /* XXX: could reduce memory usage by using a direct pointer with
        bit 0 to select rope or string */
     JSValue left;
-    JSValue right; /* might be the empty string */
+    /* A nonnegative int32 denotes an ASCII source-span offset in left's
+       backing, avoiding another field on every ordinary concatenation rope.
+       Otherwise right is a string/rope (possibly the empty string). */
+    JSValue right;
 } JSStringRope;
 
 typedef enum {
@@ -707,6 +710,29 @@ typedef enum JSFunctionKindEnum {
     JS_FUNC_ASYNC_GENERATOR = (JS_FUNC_GENERATOR | JS_FUNC_ASYNC),
 } JSFunctionKindEnum;
 
+/* Immutable UTF-8 source backing shared by nested functions. This is not a
+   bytecode reference: retaining a child must not retain its parent/realm. */
+typedef struct JSFunctionSource {
+    uint32_t ref_count;
+    size_t length;
+    char *bytes;
+    JSString *string;
+} JSFunctionSource;
+
+static void js_free_function_source(JSRuntime *rt, char *source,
+                                    JSFunctionSource *owner)
+{
+    if (!owner) {
+        js_free_rt(rt, source);
+    } else if (--owner->ref_count == 0) {
+        if (owner->string)
+            JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, owner->string));
+        else
+            js_free_rt(rt, owner->bytes);
+        js_free_rt(rt, owner);
+    }
+}
+
 typedef struct JSFunctionBytecode {
     JSGCObjectHeader header; /* must come first */
     uint8_t js_mode;
@@ -745,6 +771,7 @@ typedef struct JSFunctionBytecode {
         int pc2line_len;
         uint8_t *pc2line_buf;
         char *source;
+        JSFunctionSource *source_owner;
     } debug;
 } JSFunctionBytecode;
 
@@ -987,7 +1014,9 @@ typedef struct JSProperty {
     } u;
 } JSProperty;
 
-#define JS_PROP_INITIAL_SIZE 2
+/* Empty objects need no speculative second property slot. Shared shapes still
+   carry their actual capacity, and ordinary growth admits additional slots. */
+#define JS_PROP_INITIAL_SIZE 1
 #define JS_PROP_INITIAL_HASH_SIZE 4 /* must be a power of two */
 
 typedef struct JSShapeProperty {
@@ -1809,8 +1838,8 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
 #ifdef FORCE_GC_AT_MALLOC
     force_gc = TRUE;
 #else
-    force_gc = ((rt->malloc_ctx.malloc_state.malloc_size + size) >
-                rt->malloc_gc_threshold);
+    force_gc = size > rt->malloc_gc_threshold ||
+        rt->malloc_ctx.malloc_state.malloc_size > rt->malloc_gc_threshold - size;
 #endif
     if (force_gc) {
 #ifdef DUMP_GC
@@ -1818,8 +1847,22 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
                (uint64_t)rt->malloc_ctx.malloc_state.malloc_size);
 #endif
         JS_RunGC(rt);
-        rt->malloc_gc_threshold = rt->malloc_ctx.malloc_state.malloc_size +
-            (rt->malloc_ctx.malloc_state.malloc_size >> 1);
+        /* The embedding's next safe point may be after a long author task.
+           Do not let automatic collection re-arm beyond its hard heap limit:
+           dead cycles would then cause OOM before another collection. Retain
+           geometric spacing, halving remaining headroom only near the cap. */
+        size_t live = rt->malloc_ctx.malloc_state.malloc_size;
+        size_t limit = rt->malloc_ctx.malloc_state.malloc_limit;
+        size_t growth = live >> 1;
+        if (live < limit) {
+            size_t remaining = limit - live;
+            if (growth >= remaining)
+                growth = remaining / 2;
+        } else {
+            growth = 0;
+        }
+        rt->malloc_gc_threshold = growth > SIZE_MAX - live
+            ? SIZE_MAX : live + growth;
     }
 }
 
@@ -3051,6 +3094,9 @@ static uint32_t hash_string_rope(JSValueConst val, uint32_t h)
         return hash_string(JS_VALUE_GET_STRING(val), h);
     } else {
         JSStringRope *r = JS_VALUE_GET_STRING_ROPE(val);
+        if (JS_VALUE_GET_TAG(r->right) == JS_TAG_INT)
+            return hash_string8(JS_VALUE_GET_STRING(r->left)->u.str8
+                                + JS_VALUE_GET_INT(r->right), r->len, h);
         h = hash_string_rope(r->left, h);
         return hash_string_rope(r->right, h);
     }
@@ -4366,6 +4412,9 @@ static int string_buffer_concat_value(StringBuffer *s, JSValueConst v)
     if (unlikely(JS_VALUE_GET_TAG(v) != JS_TAG_STRING)) {
         if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING_ROPE) {
             JSStringRope *r = JS_VALUE_GET_STRING_ROPE(v);
+            if (JS_VALUE_GET_TAG(r->right) == JS_TAG_INT)
+                return string_buffer_concat(s, JS_VALUE_GET_STRING(r->left),
+                    JS_VALUE_GET_INT(r->right), JS_VALUE_GET_INT(r->right) + r->len);
             /* recursion is acceptable because the rope depth is bounded */
             if (string_buffer_concat_value(s, r->left))
                 return -1;
@@ -4547,6 +4596,102 @@ JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
     return JS_EXCEPTION;
 }
 
+/* Match JS_NewStringLen's malformed UTF-8 replacement/consumption policy. */
+static uint32_t js_source_codepoint(const uint8_t **cursor, const uint8_t *end)
+{
+    const uint8_t *p = *cursor, *next;
+    uint32_t c;
+    if (*p < 128) {
+        *cursor = p + 1;
+        return *p;
+    }
+    c = unicode_from_utf8(p, end - p, &next);
+    if (c <= 0x10ffff) {
+        *cursor = next;
+        return c;
+    }
+    while (p < end && *p >= 0x80 && *p < 0xc0) p++;
+    if (p < end) {
+        p++;
+        while (p < end && *p >= 0x80 && *p < 0xc0) p++;
+    }
+    *cursor = p;
+    return 0xfffd;
+}
+
+/* Function source is rooted by the caller. Size rare source snapshots before
+   allocating: widening a nearly complete UTF-8 buffer otherwise temporarily
+   retains both narrow and wide copies. Ordinary text construction stays on
+   the single-pass path above. */
+static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2);
+static JSValue js_new_function_source_flat(JSContext *ctx, const char *source,
+                                          size_t length);
+
+static JSValue js_new_function_source(JSContext *ctx, const char *source,
+                                     size_t length)
+{
+    const uint8_t *begin = (const uint8_t *)source, *end = begin + length;
+    const uint8_t *p = begin;
+    if (length >= 8192 && count_ascii(begin, length) != length) {
+        JSValue result = JS_AtomToString(ctx, JS_ATOM_empty_string);
+        while (p < end) {
+            const uint8_t *start = p;
+            do {
+                (void)js_source_codepoint(&p, end);
+            } while (p < end && (size_t)(p - start) < 4096);
+            JSValue part = js_new_function_source_flat(ctx, (const char *)start, p - start);
+            if (JS_IsException(part)) {
+                JS_FreeValue(ctx, result);
+                return part;
+            }
+            result = JS_ConcatString(ctx, result, part);
+            if (JS_IsException(result))
+                return result;
+        }
+        return result;
+    }
+    return js_new_function_source_flat(ctx, source, length);
+}
+
+static JSValue js_new_function_source_flat(JSContext *ctx, const char *source,
+                                          size_t length)
+{
+    const uint8_t *begin = (const uint8_t *)source, *end = begin + length;
+    const uint8_t *p = begin;
+    size_t units = 0;
+    BOOL wide = FALSE;
+    if (count_ascii(begin, length) == length) {
+        js_trigger_gc(ctx->rt, sizeof(JSString) + length + 1);
+        return js_new_string8_len(ctx, source, length);
+    }
+    while (p < end) {
+        uint32_t c = js_source_codepoint(&p, end);
+        units += c > 0xffff ? 2 : 1;
+        wide |= c > 255;
+        if (units > JS_STRING_LEN_MAX)
+            return JS_ThrowInternalError(ctx, "string too long");
+    }
+    js_trigger_gc(ctx->rt, sizeof(JSString) + (units << wide) + 1);
+    JSString *str = js_alloc_string(ctx, (int)units, wide);
+    if (!str) return JS_EXCEPTION;
+    p = begin;
+    size_t at = 0;
+    while (p < end) {
+        uint32_t c = js_source_codepoint(&p, end);
+        if (wide) {
+            if (c > 0xffff) {
+                str->u.str16[at++] = get_hi_surrogate(c);
+                c = get_lo_surrogate(c);
+            }
+            str->u.str16[at++] = c;
+        } else {
+            str->u.str8[at++] = c;
+        }
+    }
+    if (!wide) str->u.str8[units] = '\0';
+    return JS_MKPTR(JS_TAG_STRING, str);
+}
+
 static JSValue JS_ConcatString3(JSContext *ctx, const char *str1,
                                 JSValue str2, const char *str3)
 {
@@ -4682,6 +4827,7 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1, BO
         *plen = str_new->len;
     return (const char *)str_new->u.str8;
  fail:
+    JS_FreeValue(ctx, val);
     if (plen)
         *plen = 0;
     return NULL;
@@ -4864,6 +5010,8 @@ static int string_rope_get(JSValueConst val, uint32_t idx)
     } else {
         JSStringRope *r = JS_VALUE_GET_STRING_ROPE(val);
         uint32_t len;
+        if (JS_VALUE_GET_TAG(r->right) == JS_TAG_INT)
+            return string_get(JS_VALUE_GET_STRING(r->left), JS_VALUE_GET_INT(r->right) + idx);
         if (JS_VALUE_GET_TAG(r->left) == JS_TAG_STRING)
             len = JS_VALUE_GET_STRING(r->left)->len;
         else
@@ -4878,6 +5026,7 @@ static int string_rope_get(JSValueConst val, uint32_t idx)
 typedef struct {
     JSValueConst stack[JS_STRING_ROPE_MAX_DEPTH];
     int stack_len;
+    uint32_t start, end;
 } JSStringRopeIter;
 
 static void string_rope_iter_init(JSStringRopeIter *s, JSValueConst val)
@@ -4896,9 +5045,17 @@ static JSString *string_rope_iter_next(JSStringRopeIter *s)
         return NULL;
     val = s->stack[--s->stack_len];
     for(;;) {
-        if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING)
+        if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING) {
+            s->start = 0;
+            s->end = JS_VALUE_GET_STRING(val)->len;
             return JS_VALUE_GET_STRING(val);
+        }
         r = JS_VALUE_GET_STRING_ROPE(val);
+        if (JS_VALUE_GET_TAG(r->right) == JS_TAG_INT) {
+            s->start = JS_VALUE_GET_INT(r->right);
+            s->end = s->start + r->len;
+            return JS_VALUE_GET_STRING(r->left);
+        }
         assert(s->stack_len < JS_STRING_ROPE_MAX_DEPTH);
         s->stack[s->stack_len++] = r->right;
         val = r->left;
@@ -4932,24 +5089,24 @@ static int js_string_rope_compare(JSContext *ctx, JSValueConst op1,
     string_rope_iter_init(&it2, op2);
     p1 = string_rope_iter_next(&it1);
     p2 = string_rope_iter_next(&it2);
-    pos1 = 0;
-    pos2 = 0;
+    pos1 = it1.start;
+    pos2 = it2.start;
     while (len != 0) {
-        l = min_uint32(p1->len - pos1, p2->len - pos2);
+        l = min_uint32(it1.end - pos1, it2.end - pos2);
         l = min_uint32(l, len);
         res = js_string_memcmp(p1, pos1, p2, pos2, l);
         if (res != 0)
             return res;
         len -= l;
         pos1 += l;
-        if (pos1 >= p1->len) {
+        if (pos1 >= it1.end) {
             p1 = string_rope_iter_next(&it1);
-            pos1 = 0;
+            pos1 = it1.start;
         }
         pos2 += l;
-        if (pos2 >= p2->len) {
+        if (pos2 >= it2.end) {
             p2 = string_rope_iter_next(&it2);
-            pos2 = 0;
+            pos2 = it2.start;
         }
     }
 
@@ -5085,12 +5242,12 @@ static const uint32_t rope_bucket_len[ROPE_N_BUCKETS] = {
 static int js_rebalancee_string_rope_rec(JSContext *ctx, JSValue *buckets,
                                           JSValueConst val)
 {
-    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING) {
-        JSString *p = JS_VALUE_GET_STRING(val);
+    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING
+        || JS_VALUE_GET_TAG(JS_VALUE_GET_STRING_ROPE(val)->right) == JS_TAG_INT) {
         uint32_t len, i;
         JSValue a, b;
         
-        len = p->len;
+        len = string_rope_get_len(val);
         if (len == 0)
             return 0; /* nothing to do */
         /* find the bucket i so that rope_bucket_len[i] <= len <
@@ -5240,7 +5397,7 @@ static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
             return op2;
         }
         r2 = JS_VALUE_GET_STRING_ROPE(op2);
-        if (JS_VALUE_GET_TAG(r2->left) == JS_TAG_STRING &&
+        if (JS_VALUE_GET_TAG(r2->right) != JS_TAG_INT && JS_VALUE_GET_TAG(r2->left) == JS_TAG_STRING &&
             JS_VALUE_GET_STRING(r2->left)->len <= JS_STRING_ROPE_SHORT_LEN) {
             JSValue val, ret;
             val = JS_ConcatString2(ctx, op1, JS_DupValue(ctx, r2->left));
@@ -7046,8 +7203,15 @@ static void compute_bytecode_size(JSFunctionBytecode *b, JSMemoryUsage_helper *h
     if (b->has_debug) {
         js_func_size += sizeof(*b) - offsetof(JSFunctionBytecode, debug);
         if (b->debug.source) {
-            memory_used_count++;
-            js_func_size += b->debug.source_len + 1;
+            JSFunctionSource *owner = b->debug.source_owner;
+            if (owner) {
+                hp->memory_used_count += 2.0 / owner->ref_count;
+                hp->js_func_size += (double)(sizeof(*owner) + owner->length + 1)
+                    / owner->ref_count;
+            } else {
+                memory_used_count++;
+                js_func_size += b->debug.source_len + 1;
+            }
         }
         if (b->debug.pc2line_len) {
             memory_used_count++;
@@ -7082,6 +7246,17 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
     s->malloc_count = rt->malloc_ctx.malloc_state.malloc_count;
     s->malloc_size = rt->malloc_ctx.malloc_state.malloc_size;
     s->malloc_limit = rt->malloc_ctx.malloc_state.malloc_limit;
+
+    for (i = 0; i < JS_MALLOC_BLOCK_SIZE_COUNT; ++i) {
+        list_for_each(el, &rt->malloc_ctx.arena_list[i]) {
+            JSMallocArena *arena = list_entry(el, JSMallocArena, link);
+            s->malloc_arena_count++;
+            s->malloc_arena_capacity +=
+                (int64_t)arena->n_blocks * js_malloc_block_sizes[i];
+            s->malloc_arena_used +=
+                (int64_t)arena->n_used_blocks * js_malloc_block_sizes[i];
+        }
+    }
 
     s->memory_used_count = 2; /* rt + rt->class_array */
     s->memory_used_size = sizeof(JSRuntime) + sizeof(JSValue) * rt->class_count;
@@ -7373,6 +7548,30 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
 
 void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt)
 {
+#ifndef __PSP__
+    /* Diagnostic-only census: no allocation or per-allocation bookkeeping.
+       Empty arenas are already freed; distinguish sparsely occupied classes
+       before proposing another blanket arena-size change. */
+    if (rt) {
+        for (int i = 0; i < JS_MALLOC_BLOCK_SIZE_COUNT; ++i) {
+            struct list_head *el;
+            size_t count = 0, capacity = 0, used = 0, sparse = 0;
+            list_for_each(el, &rt->malloc_ctx.arena_list[i]) {
+                JSMallocArena *arena = list_entry(el, JSMallocArena, link);
+                ++count;
+                capacity += arena->n_blocks;
+                used += arena->n_used_blocks;
+                if (arena->n_used_blocks * 4 <= arena->n_blocks)
+                    ++sparse;
+            }
+            if (count)
+                fprintf(fp, "script-arena-class size=%u arenas=%zu blocks=%zu "
+                        "used=%zu unused-bytes=%zu sparse=%zu\n",
+                        js_malloc_block_sizes[i], count, capacity, used,
+                        (capacity - used) * js_malloc_block_sizes[i], sparse);
+        }
+    }
+#endif
     fprintf(fp, "QuickJS memory usage -- " CONFIG_VERSION " version, %d-bit, malloc limit: %"PRId64"\n\n",
             (int)sizeof(void *) * 8, s->malloc_limit);
 #if 1
@@ -14145,12 +14344,12 @@ static uint32_t js_string_get_length(JSValueConst val)
 }
 
 /* pretty print the first 'len' characters of 'p' */
-static void js_print_string1(JSPrintValueState *s, JSString *p, int len, int sep)
+static void js_print_string1(JSPrintValueState *s, JSString *p, int start, int len, int sep)
 {
     uint8_t buf[UTF8_CHAR_LEN_MAX];
     int l, i, c, c1;
 
-    for(i = 0; i < len; i++) {
+    for(i = start, len += start; i < len; i++) {
         c = string_get(p, i);
         switch(c) {
         case '\t':
@@ -14210,10 +14409,16 @@ static void js_print_string_rec(JSPrintValueState *s, JSValueConst val,
         uint32_t len;
         if (pos < s->options.max_string_length) {
             len = min_uint32(p->len, s->options.max_string_length - pos);
-            js_print_string1(s, p, len, sep);
+            js_print_string1(s, p, 0, len, sep);
         }
     } else if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING_ROPE) {
         JSStringRope *r = JS_VALUE_GET_PTR(val);
+        if (JS_VALUE_GET_TAG(r->right) == JS_TAG_INT) {
+            if (pos < s->options.max_string_length)
+                js_print_string1(s, JS_VALUE_GET_STRING(r->left), JS_VALUE_GET_INT(r->right),
+                    min_uint32(r->len, s->options.max_string_length - pos), sep);
+            return;
+        }
         js_print_string_rec(s, r->left, sep, pos);
         js_print_string_rec(s, r->right, sep, pos + js_string_get_length(r->left));
     } else {
@@ -14283,7 +14488,7 @@ static void js_print_atom(JSPrintValueState *s, JSAtom atom)
             }
         } else {
             js_putc(s, '"');
-            js_print_string1(s, p, p->len, '\"');
+            js_print_string1(s, p, 0, p->len, '\"');
             js_putc(s, '"');
         }
     }
@@ -22572,6 +22777,8 @@ typedef struct JSFunctionDef {
 
     char *source;  /* raw source, utf-8 encoded */
     int source_len;
+    uint32_t source_start; /* exact copied span in get_line_col_cache->buf_start */
+    JSFunctionSource *source_owner;
 
     JSModuleDef *module; /* != NULL when parsing a module */
     BOOL has_await; /* TRUE if await is used (used in module eval) */
@@ -26157,6 +26364,7 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
     if (!fd->strip_source) {
         js_free(ctx, ctor_fd->source);
         ctor_fd->source_len = s->buf_ptr - class_start_ptr;
+        ctor_fd->source_start = class_start_ptr - ctor_fd->get_line_col_cache->buf_start;
         ctor_fd->source = js_strndup(ctx, (const char *)class_start_ptr,
                                      ctor_fd->source_len);
         if (!ctor_fd->source)
@@ -32704,7 +32912,7 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
     JS_FreeAtom(ctx, fd->filename);
     dbuf_free(&fd->pc2line);
 
-    js_free(ctx, fd->source);
+    js_free_function_source(ctx->rt, fd->source, fd->source_owner);
 
     if (fd->parent) {
         /* remove in parent list */
@@ -36516,9 +36724,69 @@ static int add_global_variables(JSContext *ctx, JSFunctionDef *fd)
     return 0;
 }
 
-/* create a function object from a function definition. The function
-   definition is freed. All the child functions are also created. It
-   must be done this way to resolve all the variables. */
+/* Optional source compaction. Refusal keeps the original owned allocation and
+   does not leave a pending exception. Adopt before publishing child offsets;
+   standalone/bytecode-read functions can also adopt on their first snapshot. */
+static JSFunctionSource *js_adopt_function_source(JSContext *ctx, char **source,
+                                                  size_t length)
+{
+    JSFunctionSource *owner = js_malloc_rt(ctx->rt, sizeof(*owner));
+    if (!owner)
+        return NULL;
+    owner->ref_count = 1;
+    owner->length = length;
+    owner->bytes = *source;
+    owner->string = NULL;
+    /* This string privately holds UTF-8 bytes. Only ASCII spans may be exposed
+       without decoding. It has no reference back to the function or realm. */
+    if (length >= 1024 && length <= JS_STRING_LEN_MAX) {
+        JSString *str = js_realloc_rt(ctx->rt, *source,
+            sizeof(JSString) + length + 1);
+        if (str) {
+            memmove(str->u.str8, str, length);
+            str->u.str8[length] = '\0';
+            js_rc(str)->ref_count = 1;
+            str->is_wide_char = 0;
+            str->len = length;
+            str->atom_type = 0;
+            str->hash = 0;
+            str->hash_next = 0;
+#ifdef DUMP_LEAKS
+            list_add_tail(&str->link, &ctx->rt->string_list);
+#endif
+            owner->string = str;
+            owner->bytes = *source = (char *)str->u.str8;
+        }
+    }
+    return owner;
+}
+
+static void js_share_child_function_source(JSContext *ctx,
+                                           JSFunctionDef *parent,
+                                           JSFunctionDef *child)
+{
+    size_t offset;
+    if (!parent->source || !child->source || child->source_owner
+        || parent->get_line_col_cache != child->get_line_col_cache
+        || child->source_start < parent->source_start)
+        return;
+    offset = child->source_start - parent->source_start;
+    if (offset > (size_t)parent->source_len
+        || (size_t)child->source_len > (size_t)parent->source_len - offset)
+        return;
+    if (!parent->source_owner)
+        parent->source_owner = js_adopt_function_source(ctx, &parent->source, parent->source_len);
+    JSFunctionSource *owner = parent->source_owner;
+    if (!owner) return;
+    if (owner->ref_count == UINT32_MAX)
+        return;
+    js_free(ctx, child->source);
+    child->source = parent->source + offset;
+    child->source_owner = owner;
+    owner->ref_count++;
+}
+
+/* Create children first to resolve variables, then release the definition. */
 static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 {
     JSValue func_obj;
@@ -36581,6 +36849,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
 
         fd1 = list_entry(el, JSFunctionDef, link);
         cpool_idx = fd1->parent_cpool_idx;
+        js_share_child_function_source(ctx, fd, fd1);
         func_obj = js_create_function(ctx, fd1);
         if (JS_IsException(func_obj))
             goto fail;
@@ -36723,6 +36992,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         b->debug.pc2line_len = fd->pc2line.size;
         b->debug.source = fd->source;
         b->debug.source_len = fd->source_len;
+        b->debug.source_owner = fd->source_owner;
     }
     if (fd->scopes != fd->def_scope_array)
         js_free(ctx, fd->scopes);
@@ -36817,7 +37087,7 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
     if (b->has_debug) {
         JS_FreeAtomRT(rt, b->debug.filename);
         js_free_rt(rt, b->debug.pc2line_buf);
-        js_free_rt(rt, b->debug.source);
+        js_free_function_source(rt, b->debug.source, b->debug.source_owner);
     }
 
     remove_gc_object(&b->header);
@@ -37409,6 +37679,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                 /* the end of the function source code is after the last
                    token of the function source stored into s->last_ptr */
                 fd->source_len = s->last_ptr - ptr;
+                fd->source_start = ptr - fd->get_line_col_cache->buf_start;
                 fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
                 if (!fd->source)
                     goto fail;
@@ -37436,6 +37707,7 @@ static __exception int js_parse_function_decl2(JSParseState *s,
     if (!fd->strip_source) {
         /* save the function source code */
         fd->source_len = s->buf_ptr - ptr;
+        fd->source_start = ptr - fd->get_line_col_cache->buf_start;
         fd->source = js_strndup(ctx, (const char *)ptr, fd->source_len);
         if (!fd->source)
             goto fail;
@@ -37885,13 +38157,13 @@ static JSValue tilefinch_compact_eval_rope(JSContext *ctx,
     *first_line_column = 0;
     string_rope_iter_init(&iterator, value);
     while ((part = string_rope_iter_next(&iterator)) != NULL) {
-        uint32_t at = 0;
-        while (at < part->len) {
+        uint32_t at = 0, length = iterator.end - iterator.start;
+        while (at < length) {
             if (skipped + at == JS_STRING_REPEAT_EVAL_SCAN_MAX)
                 return JS_ThrowRangeError(
                     ctx,
                     "eval source exceeds bounded repeated-string scan limit");
-            int c = string_get(part, at);
+            int c = string_get(part, iterator.start + at);
             if (c != ' ' && c != '\t') {
                 prefix_only = FALSE;
                 break;
@@ -37921,10 +38193,11 @@ static JSValue tilefinch_compact_eval_rope(JSContext *ctx,
             return JS_EXCEPTION;
         string_rope_iter_init(&iterator, value);
         while ((part = string_rope_iter_next(&iterator)) != NULL) {
-            uint32_t start = min_uint32(discard, part->len);
+            uint32_t start = min_uint32(discard, iterator.end - iterator.start);
             discard -= start;
-            while (start < part->len) {
-                uint32_t available = part->len - start;
+            start += iterator.start;
+            while (start < iterator.end) {
+                uint32_t available = iterator.end - start;
                 uint32_t until_poll =
                     JS_STRING_REPEAT_EVAL_POLL_INTERVAL - work_since_poll;
                 uint32_t count = min_uint32(available, until_poll);
@@ -38143,10 +38416,12 @@ typedef enum BCTagEnum {
     BC_TAG_OBJECT_REFERENCE,
 } BCTagEnum;
 
-#define BC_VERSION 5
+/* Version 6 preserves nested debug-source spans across cache round trips. */
+#define BC_VERSION 6
 
 typedef struct BCWriterState {
     JSContext *ctx;
+    const JSFunctionBytecode *source_parent;
     DynBuf dbuf;
     BOOL allow_bytecode : 8;
     BOOL allow_sab : 8;
@@ -38242,27 +38517,40 @@ static void bc_set_flags(uint32_t *pflags, int *pidx, uint32_t val, int n)
 
 static int bc_atom_to_idx(BCWriterState *s, uint32_t *pres, JSAtom atom)
 {
-    uint32_t v;
+    uint32_t v, slot;
 
     if (atom < s->first_atom || __JS_AtomIsTaggedInt(atom)) {
         *pres = atom;
         return 0;
     }
-    atom -= s->first_atom;
-    if (atom < s->atom_to_idx_size && s->atom_to_idx[atom] != 0) {
-        *pres = s->atom_to_idx[atom];
-        return 0;
+    /* Index only atoms used by this serialization, not every preceding
+       runtime atom. A tiny late script otherwise allocates a large sparse
+       array just because the page already interned many unrelated names.
+       Slots hold index + 1; serialized indices retain encounter order. */
+    if (s->atom_to_idx_size) {
+        slot = atom * UINT32_C(0x9e3779b1) & (s->atom_to_idx_size - 1);
+        while ((v = s->atom_to_idx[slot]) != 0) {
+            if (s->idx_to_atom[v - 1] == atom) {
+                *pres = v - 1 + s->first_atom;
+                return 0;
+            }
+            slot = (slot + 1) & (s->atom_to_idx_size - 1);
+        }
     }
-    if (atom >= s->atom_to_idx_size) {
-        int old_size, i;
-        old_size = s->atom_to_idx_size;
-        if (js_resize_array(s->ctx, (void **)&s->atom_to_idx,
-                            sizeof(s->atom_to_idx[0]), &s->atom_to_idx_size,
-                            atom + 1))
-            return -1;
-        /* XXX: could add a specific js_resize_array() function to do it */
-        for(i = old_size; i < s->atom_to_idx_size; i++)
-            s->atom_to_idx[i] = 0;
+    if (s->idx_to_atom_count >= s->atom_to_idx_size / 2) {
+        if (s->atom_to_idx_size > INT_MAX / 2 / (int)sizeof(uint32_t))
+            goto fail;
+        int size = s->atom_to_idx_size ? s->atom_to_idx_size * 2 : 32;
+        uint32_t *table = js_mallocz(s->ctx, (size_t)size * sizeof(*table));
+        if (!table) goto fail;
+        for (int i = 0; i < s->idx_to_atom_count; ++i) {
+            slot = s->idx_to_atom[i] * UINT32_C(0x9e3779b1) & (size - 1);
+            while (table[slot]) slot = (slot + 1) & (size - 1);
+            table[slot] = i + 1;
+        }
+        js_free(s->ctx, s->atom_to_idx);
+        s->atom_to_idx = table;
+        s->atom_to_idx_size = size;
     }
     if (js_resize_array(s->ctx, (void **)&s->idx_to_atom,
                         sizeof(s->idx_to_atom[0]),
@@ -38270,9 +38558,11 @@ static int bc_atom_to_idx(BCWriterState *s, uint32_t *pres, JSAtom atom)
         goto fail;
 
     v = s->idx_to_atom_count++;
-    s->idx_to_atom[v] = atom + s->first_atom;
+    s->idx_to_atom[v] = atom;
+    slot = atom * UINT32_C(0x9e3779b1) & (s->atom_to_idx_size - 1);
+    while (s->atom_to_idx[slot]) slot = (slot + 1) & (s->atom_to_idx_size - 1);
+    s->atom_to_idx[slot] = v + 1;
     v += s->first_atom;
-    s->atom_to_idx[atom] = v;
     *pres = v;
     return 0;
  fail:
@@ -38287,8 +38577,10 @@ static int bc_put_atom(BCWriterState *s, JSAtom atom)
     if (__JS_AtomIsTaggedInt(atom)) {
         v = (__JS_AtomToUInt32(atom) << 1) | 1;
     } else {
-        if (bc_atom_to_idx(s, &v, atom))
+        if (bc_atom_to_idx(s, &v, atom)) {
+            dbuf_set_error(&s->dbuf);
             return -1;
+        }
         v <<= 1;
     }
     bc_put_leb128(s, v);
@@ -38467,6 +38759,7 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj);
 static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
 {
     JSFunctionBytecode *b = JS_VALUE_GET_PTR(obj);
+    const JSFunctionBytecode *parent = s->source_parent;
     uint32_t flags;
     int idx, i;
 
@@ -38538,18 +38831,39 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         dbuf_put(&s->dbuf, b->debug.pc2line_buf, b->debug.pc2line_len);
         if (b->debug.source) {
             bc_put_leb128(s, b->debug.source_len);
-            dbuf_put(&s->dbuf, (uint8_t *)b->debug.source, b->debug.source_len);
+            if (b->debug.source_len) {
+                size_t offset = 0;
+                BOOL shared = parent && parent->has_debug
+                    && b->debug.source_owner
+                    && parent->debug.source_owner == b->debug.source_owner
+                    && b->debug.source >= parent->debug.source;
+                if (shared) {
+                    offset = b->debug.source - parent->debug.source;
+                    shared = offset <= (size_t)parent->debug.source_len
+                        && (size_t)b->debug.source_len <=
+                            (size_t)parent->debug.source_len - offset;
+                }
+                bc_put_u8(s, shared ? 1 : 0);
+                if (shared)
+                    bc_put_leb128(s, offset);
+                else
+                    dbuf_put(&s->dbuf, (uint8_t *)b->debug.source,
+                             b->debug.source_len);
+            }
         } else {
             bc_put_leb128(s, 0);
         }
     }
 
+    s->source_parent = b;
     for(i = 0; i < b->cpool_count; i++) {
         if (JS_WriteObjectRec(s, b->cpool[i]))
             goto fail;
     }
+    s->source_parent = parent;
     return 0;
  fail:
+    s->source_parent = parent;
     return -1;
 }
 
@@ -38938,8 +39252,8 @@ static int JS_WriteObjectAtoms(BCWriterState *s)
         JSAtomStruct *p = rt->atom_array[s->idx_to_atom[i]];
         JS_WriteString(s, p);
     }
-    /* XXX: should check for OOM in above phase */
-
+    if (dbuf_error(&s->dbuf))
+        goto fail;
     /* move the atoms at the start */
     /* XXX: could just append dbuf1 data, but it uses more memory if
        dbuf1 is larger than dbuf */
@@ -38977,6 +39291,10 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
 
     if (JS_WriteObjectRec(s, obj))
         goto fail;
+    /* Leaf writers use void dbuf operations. A failed growth must not be
+       published as a shorter, apparently successful cache artifact. */
+    if (dbuf_error(&s->dbuf))
+        goto fail;
     if (JS_WriteObjectAtoms(s))
         goto fail;
     js_object_list_end(ctx, &s->object_list);
@@ -39009,6 +39327,7 @@ uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj,
 
 typedef struct BCReaderState {
     JSContext *ctx;
+    JSFunctionBytecode *source_parent;
     const uint8_t *buf_start, *ptr, *buf_end;
     uint32_t first_atom;
     uint32_t idx_to_atom_count;
@@ -39394,6 +39713,7 @@ static int BC_add_object_ref(BCReaderState *s, JSValueConst obj)
 static JSValue JS_ReadFunctionTag(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
+    JSFunctionBytecode *parent = s->source_parent;
     JSFunctionBytecode bc, *b;
     JSValue obj = JS_UNDEFINED;
     uint16_t v16;
@@ -39566,17 +39886,55 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         if (bc_get_leb128_int(s, &b->debug.source_len))
             goto fail;
         if (b->debug.source_len) {
-            bc_read_trace(s, "source: %d bytes\n", b->source_len);
-            b->debug.source = js_mallocz(ctx, b->debug.source_len);
-            if (!b->debug.source)
+            uint8_t kind;
+            bc_read_trace(s, "source: %d bytes\n", b->debug.source_len);
+            if (bc_get_u8(s, &kind))
                 goto fail;
-            if (bc_get_buf(s, (uint8_t *)b->debug.source, b->debug.source_len))
+            if (kind == 1) {
+                uint32_t offset;
+                if (bc_get_leb128(s, &offset))
+                    goto fail;
+                if (!parent || !parent->has_debug || !parent->debug.source
+                    || offset > (uint32_t)parent->debug.source_len
+                    || (uint32_t)b->debug.source_len >
+                        (uint32_t)parent->debug.source_len - offset) {
+                    JS_ThrowSyntaxError(ctx, "invalid function source span");
+                    goto fail;
+                }
+                /* Adopt before publishing the first child pointer: adoption
+                   may move the backing. Children own only a source ref, not
+                   a parent function/context or the serialized input buffer. */
+                if (!parent->debug.source_owner)
+                    parent->debug.source_owner = js_adopt_function_source(ctx,
+                        &parent->debug.source, parent->debug.source_len);
+                JSFunctionSource *owner = parent->debug.source_owner;
+                if (owner && owner->ref_count != UINT32_MAX) {
+                    owner->ref_count++;
+                    b->debug.source_owner = owner;
+                    b->debug.source = parent->debug.source + offset;
+                } else {
+                    b->debug.source = js_malloc(ctx, b->debug.source_len);
+                    if (!b->debug.source)
+                        goto fail;
+                    memcpy(b->debug.source, parent->debug.source + offset,
+                           b->debug.source_len);
+                }
+            } else if (kind == 0) {
+                b->debug.source = js_malloc(ctx, b->debug.source_len);
+                if (!b->debug.source)
+                    goto fail;
+                if (bc_get_buf(s, (uint8_t *)b->debug.source, b->debug.source_len))
+                    goto fail;
+            } else {
+                JS_ThrowSyntaxError(ctx, "invalid function source encoding");
                 goto fail;
+            }
         }
         bc_read_trace(s, "}\n");
     }
     if (b->cpool_count != 0) {
         bc_read_trace(s, "cpool {\n");
+        s->source_parent = b;
         for(i = 0; i < b->cpool_count; i++) {
             JSValue val;
             val = JS_ReadObjectRec(s);
@@ -39586,9 +39944,11 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         }
         bc_read_trace(s, "}\n");
     }
+    s->source_parent = parent;
     b->realm = JS_DupContext(ctx);
     return obj;
  fail:
+    s->source_parent = parent;
     JS_FreeValue(ctx, obj);
     return JS_EXCEPTION;
 }
@@ -41988,6 +42348,41 @@ static JSValue js_function_bind(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+/* Share ASCII runs, decoding only short Unicode runs. The backing contains
+   UTF-8 bytes, never exposed directly as a Latin-1 string unless all ASCII.
+   Leaves own the backing string, not a function, context or source-owner. */
+static JSValue js_function_source_snapshot(JSContext *ctx, JSFunctionSource *owner,
+                                            const char *source, size_t length)
+{
+    const uint8_t *at = (const uint8_t *)source, *end = at + length;
+    JSValue result = JS_AtomToString(ctx, JS_ATOM_empty_string);
+    while (at < end) {
+        const uint8_t *start = at;
+        size_t ascii = count_ascii(at, end - at);
+        JSValue part;
+        if (ascii >= 1024) {
+            JSStringRope *view = js_malloc(ctx, sizeof(*view));
+            if (!view) { JS_FreeValue(ctx, result); return JS_EXCEPTION; }
+            js_rc(view)->ref_count = 1;
+            view->len = ascii;
+            view->is_wide_char = 0;
+            view->depth = 0;
+            view->left = JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, owner->string));
+            view->right = JS_NewInt32(ctx, (const char *)at - owner->bytes);
+            part = JS_MKPTR(JS_TAG_STRING_ROPE, view);
+            at += ascii;
+        } else {
+            do { (void)js_source_codepoint(&at, end); }
+            while (at < end && (size_t)(at - start) < 1024);
+            part = js_new_function_source_flat(ctx, (const char *)start, at - start);
+            if (JS_IsException(part)) { JS_FreeValue(ctx, result); return part; }
+        }
+        result = JS_ConcatString(ctx, result, part);
+        if (JS_IsException(result)) return result;
+    }
+    return result;
+}
+
 static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
@@ -42001,7 +42396,24 @@ static JSValue js_function_toString(JSContext *ctx, JSValueConst this_val,
     if (js_class_has_bytecode(p->class_id)) {
         JSFunctionBytecode *b = p->u.func.function_bytecode;
         if (b->has_debug && b->debug.source) {
-            return JS_NewStringLen(ctx, b->debug.source, b->debug.source_len);
+            if (!b->debug.source_owner && b->debug.source_len >= 1024)
+                b->debug.source_owner = js_adopt_function_source(ctx,
+                    &b->debug.source, b->debug.source_len);
+            JSFunctionSource *owner = b->debug.source_owner;
+            if (owner && owner->string && b->debug.source_len >= 1024) {
+                if (b->debug.source == owner->bytes
+                    && (size_t)b->debug.source_len == owner->length
+                    && count_ascii((const uint8_t *)b->debug.source,
+                        b->debug.source_len) == (size_t)b->debug.source_len)
+                    return JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, owner->string));
+                return js_function_source_snapshot(ctx, owner, b->debug.source,
+                    b->debug.source_len);
+            }
+            /* A source snapshot can be much larger than an object allocation.
+               This native call roots the function (and its backing), so it is
+               a safe place to reclaim cycles before the potentially large
+               copy. Never collect from arbitrary low-level malloc sites. */
+            return js_new_function_source(ctx, b->debug.source, b->debug.source_len);
         }
         func_kind = b->func_kind;
     }
@@ -43305,6 +43717,67 @@ static JSValue js_array_toString(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
+/* Undefined means the ordinary coercion/getter path is required. Only inspect
+   bounded complete dense arrays of flat strings, without invoking author code. */
+static JSValue js_array_join_sized(JSContext *ctx, JSValueConst obj,
+                                  int64_t n, JSString *separator)
+{
+    JSValue *values;
+    uint32_t count;
+    size_t total = 0, separator_len = separator ? separator->len : 1;
+    int wide = separator && separator->is_wide_char;
+    if (n <= 0 || n > 4096 || !js_get_fast_array(ctx, obj, &values, &count)
+        || n != count) return JS_UNDEFINED;
+    for (uint32_t i = 0; i < count; ++i) {
+        int tag = JS_VALUE_GET_TAG(values[i]);
+        size_t extra;
+        if (tag == JS_TAG_STRING) {
+            JSString *part = JS_VALUE_GET_STRING(values[i]);
+            extra = part->len;
+            wide |= part->is_wide_char;
+        } else if (tag == JS_TAG_STRING_ROPE && count <= 64) {
+            JSStringRope *part = JS_VALUE_GET_STRING_ROPE(values[i]);
+            extra = part->len;
+            wide |= part->is_wide_char;
+        } else return JS_UNDEFINED;
+        if (i) extra += separator_len;
+        if (extra > JS_STRING_LEN_MAX - total) return JS_UNDEFINED;
+        total += extra;
+    }
+    if (total < 8192) return JS_UNDEFINED;
+    /* obj and separator remain rooted by join throughout collection. */
+    js_trigger_gc(ctx->rt, sizeof(JSString) + (total << wide) + 1);
+    if (count <= 64) {
+        JSValue join_separator = separator
+            ? JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, separator))
+            : JS_NewString(ctx, ",");
+        if (JS_IsException(join_separator)) return JS_EXCEPTION;
+        JSValue result = JS_DupValue(ctx, values[0]);
+        for (uint32_t i = 1; i < count; ++i) {
+            if (separator_len) {
+                result = JS_ConcatString(ctx, result, JS_DupValue(ctx, join_separator));
+                if (JS_IsException(result)) break;
+            }
+            result = JS_ConcatString(ctx, result, JS_DupValue(ctx, values[i]));
+            if (JS_IsException(result)) break;
+        }
+        JS_FreeValue(ctx, join_separator);
+        return result;
+    }
+    StringBuffer buffer;
+    if (string_buffer_init2(ctx, &buffer, (int)total, wide))
+        return JS_EXCEPTION;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (i) {
+            if (separator) string_buffer_concat(&buffer, separator, 0, separator->len);
+            else string_buffer_putc8(&buffer, ',');
+        }
+        JSString *part = JS_VALUE_GET_STRING(values[i]);
+        string_buffer_concat(&buffer, part, 0, part->len);
+    }
+    return string_buffer_end(&buffer);
+}
+
 static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv, int toLocaleString)
 {
@@ -43354,6 +43827,15 @@ static JSValue js_array_join(JSContext *ctx, JSValueConst this_val,
                 string_buffer_putc8(b, c);
             } else {
                 string_buffer_concat(b, p, 0, p->len);
+            }
+        }
+        if (i == 0 && !toLocaleString && !b->error_status) {
+            JSValue sized = js_array_join_sized(ctx, obj, n, p);
+            if (!JS_IsUndefined(sized)) {
+                string_buffer_free(b);
+                JS_FreeValue(ctx, sep);
+                JS_FreeValue(ctx, obj);
+                return sized;
             }
         }
         el = JS_GetPropertyUint32(ctx, obj, i);
@@ -45982,6 +46464,13 @@ static JSValue js_string_constructor(JSContext *ctx, JSValueConst new_target,
         if (JS_IsUndefined(new_target) && JS_IsSymbol(argv[0])) {
             JSAtomStruct *p = JS_VALUE_GET_PTR(argv[0]);
             val = JS_ConcatString3(ctx, "Symbol(", JS_AtomToString(ctx, js_get_atom_index(ctx->rt, p)), ")");
+        } else if (JS_IsUndefined(new_target)) {
+            /* String(value) needs a primitive string, not contiguous storage.
+               Keep ropes from user toString/Symbol.toPrimitive methods intact;
+               the boxed constructor below still requires a flat backing. */
+            val = JS_ToPrimitive(ctx, argv[0], HINT_STRING);
+            if (!JS_IsException(val) && !JS_IsString(val))
+                val = JS_ToStringFree(ctx, val);
         } else {
             val = JS_ToString(ctx, argv[0]);
         }

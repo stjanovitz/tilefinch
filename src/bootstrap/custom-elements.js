@@ -207,8 +207,10 @@
   const failUpgrade = (node, definition, error) => {
     node.__tilefinchCustomElementState = "failed";
     if (node.__handle !== undefined) __tilefinchSetCustomState(node.__handle, -1);
-    if (globalThis.HTMLUnknownElement)
+    if (globalThis.HTMLUnknownElement) {
+      globalThis.__tilefinchPrepareNativePrototype?.(node);
       Object.setPrototypeOf(node, HTMLUnknownElement.prototype);
+    }
     report(error, "custom element " + definition.name);
     return node;
   };
@@ -1155,6 +1157,7 @@
     const definition = definitionFor(node),
       state = __tilefinchGetCustomState(node.__handle);
     if (state === 3 && definition) {
+      globalThis.__tilefinchPrepareNativePrototype?.(node);
       Object.setPrototypeOf(node, definition.constructor.prototype);
       node.__tilefinchCustomElementState = "custom";
       node.__tilefinchCustomElementConnectedState = connected(node);
@@ -1182,8 +1185,10 @@
         node.__tilefinchCustomElementState === "custom" &&
         definition &&
         Object.getPrototypeOf(node) !== definition.prototype
-      )
+      ) {
+        globalThis.__tilefinchPrepareNativePrototype?.(node);
         Object.setPrototypeOf(node, definition.prototype);
+      }
       if (
         node.__tilefinchCustomElementState === "custom" &&
         !node.__tilefinchCustomElementConnectedState &&
@@ -1408,6 +1413,7 @@
     );
     if (definition.localName !== definition.name)
       node.setAttribute("is", definition.name);
+    globalThis.__tilefinchPrepareNativePrototype?.(node);
     Object.setPrototypeOf(node, definition.prototype);
     node.__tilefinchCustomElementState = "custom";
     if (node.__handle !== undefined) __tilefinchSetCustomState(node.__handle, 1);

@@ -1,0 +1,14 @@
+psp-http-trace=1
+method=GET
+url=https://search-journey.test/
+success=1
+async-delay-pumps=4
+external-cancel=0
+transport-timeout=0
+error=
+status=200
+length=390
+effective-url=https://search-journey.test/
+content-type=text/html; charset=utf-8
+server=fixture
+set-cookie-count=0

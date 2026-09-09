@@ -1148,8 +1148,9 @@ static bool apply_stylesheet_data(ResourceContext *context,
 #endif
     BrowserSharedBody *compiled_fragment = NULL;
     BrowserSharedBody *parsed_ir = NULL;
+    bool artifact_backing_available = false;
     if (fragment_eligible) {
-        browser_session_stylesheet_artifacts_acquire(
+        artifact_backing_available = browser_session_stylesheet_artifacts_acquire(
             context->session, resolved, request_context,
             css_data, css_length, &compiled_fragment,
             ir_eligible ? &parsed_ir : NULL);
@@ -1182,7 +1183,13 @@ static bool apply_stylesheet_data(ResourceContext *context,
     }
     if (parsed && ir_result == STYLE_PARSED_IR_REJECTED) {
         if (ir_eligible) context->stats->parsed_ir_misses++;
-        parsed = ir_eligible
+        /* Retained document CSS can outlive its HTTP-cache entry. Unlike
+           compiled selector fragments, IR does no useful first-parse work;
+           do not allocate it when put_take cannot possibly find its owner.
+           Fresh responses are stored below, so keep capturing those. */
+        bool capture_ir = ir_eligible && (artifact_backing_available
+            || (!use_cached && fetched != NULL));
+        parsed = capture_ir
             ? stylesheet_add_css_from_context_capture_ir(
                   context->sheet, (const char *) css_data, css_length,
                   source_base, stable_provenance.referrer_policy,

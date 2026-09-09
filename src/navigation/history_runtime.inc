@@ -538,6 +538,40 @@ static bool navigation_head_scripts_are_nonvisual(const NavigationPage *page)
     return style.display == DISPLAY_NONE;
 }
 
+static bool navigation_mutation_is_transient(
+    const ScriptMutationJournal *mutations, size_t index)
+{
+    const ScriptMutationRecord *record = &mutations->records[index];
+    if (record->node == NULL) return false; /* retired/unknown, stay conservative */
+    if ((record->kind == SCRIPT_MUTATION_CHILD_LIST
+         || record->kind == SCRIPT_MUTATION_HEAD_SCRIPT)
+        && !record->inserted_from_detached) return false;
+    if (record->kind != SCRIPT_MUTATION_CHILD_LIST
+        && record->kind != SCRIPT_MUTATION_HEAD_SCRIPT
+        && record->kind != SCRIPT_MUTATION_ATTRIBUTE
+        && record->kind != SCRIPT_MUTATION_INLINE_STYLE
+        && record->kind != SCRIPT_MUTATION_TEXT
+        && record->kind != SCRIPT_MUTATION_INNER_HTML) return false;
+    const lxb_dom_node_t *ancestors[64];
+    size_t depth = 0;
+    for (const lxb_dom_node_t *at = record->node; at != NULL; at = at->parent) {
+        if (at->type == LXB_DOM_NODE_TYPE_DOCUMENT || depth == 64) return false;
+        ancestors[depth++] = at;
+    }
+    /* Every accepted record is inside a now-detached root whose *earlier*
+       first child mutation inserted detached content. Connected-node moves
+       and pre-existing removals remain observable changes even if their final
+       parent happens to be a transient probe. No allocation or DOM rewrite. */
+    for (size_t i = 0; i <= index; i++) {
+        const ScriptMutationRecord *first = &mutations->records[i];
+        if (!first->inserted_from_detached) continue;
+        for (size_t ancestor = 0; ancestor < depth; ancestor++) {
+            if (ancestors[ancestor] == first->node) return true;
+        }
+    }
+    return false;
+}
+
 static bool navigation_mutations_are_semantic_only(
     const NavigationSession *session, const ScriptMutationJournal *mutations)
 {
@@ -550,6 +584,7 @@ static bool navigation_mutations_are_semantic_only(
     bool head_checked = false;
     for (size_t i = 0; i < mutations->count; i++) {
         const ScriptMutationRecord *record = &mutations->records[i];
+        if (navigation_mutation_is_transient(mutations, i)) continue;
         if (record->kind == SCRIPT_MUTATION_HEAD_SCRIPT) {
             if (!head_checked
                 && !navigation_head_scripts_are_nonvisual(&session->page))
@@ -720,6 +755,228 @@ static bool navigation_mutations_are_paint_only_focus(
     return true;
 }
 
+static bool navigation_node_connected(const lxb_dom_node_t *node)
+{
+    for (const lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+        if (at->type == LXB_DOM_NODE_TYPE_DOCUMENT) return true;
+    }
+    return false;
+}
+
+static lxb_dom_node_t *navigation_style_owner(lxb_dom_node_t *node)
+{
+    for (lxb_dom_node_t *at = node; at != NULL; at = at->parent) {
+        if (at->type == LXB_DOM_NODE_TYPE_ELEMENT && node_name_is(at, "style"))
+            return at;
+    }
+    return NULL;
+}
+
+static bool navigation_link_is_stylesheet(lxb_dom_node_t *node)
+{
+    if (node == NULL || node->type != LXB_DOM_NODE_TYPE_ELEMENT
+        || !node_name_is(node, "link")) return false;
+    size_t length = 0;
+    const char *rel = document_attribute(node, "rel", &length);
+    if (rel == NULL) return false;
+    size_t at = 0;
+    while (at < length) {
+        while (at < length && isspace((unsigned char) rel[at])) at++;
+        size_t begin = at;
+        while (at < length && !isspace((unsigned char) rel[at])) at++;
+        if (at - begin == 10 && strncasecmp(rel + begin, "stylesheet", 10) == 0)
+            return true;
+    }
+    return false;
+}
+
+static lxb_dom_node_t *navigation_document_order_next(
+    lxb_dom_node_t *node, const lxb_dom_node_t *root)
+{
+    if (node == NULL) return NULL;
+    if (node->first_child != NULL) return node->first_child;
+    for (lxb_dom_node_t *at = node; at != NULL && at != root; at = at->parent) {
+        if (at->next != NULL) return at->next;
+    }
+    return NULL;
+}
+
+/* An inserted subtree's <style>/<link> stylesheet sources. Returns false
+   when the subtree is too large to inspect or holds a stylesheet source
+   that cannot be appended (a <link>, or a <style> the sheet already knows). */
+static bool navigation_collect_inserted_styles(
+    const Stylesheet *sheet, lxb_dom_node_t *root,
+    lxb_dom_node_t **candidates, size_t *count, size_t capacity)
+{
+    enum { MAXIMUM_SUBTREE_WORK = 256 };
+    size_t work = 0;
+    for (lxb_dom_node_t *at = root; at != NULL;
+         at = navigation_document_order_next(at, root)) {
+        if (++work > MAXIMUM_SUBTREE_WORK) return false;
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        if (navigation_link_is_stylesheet(at)) return false;
+        if (!node_name_is(at, "style")) continue;
+        if (stylesheet_style_source_known(sheet, at)) return false;
+        bool present = false;
+        for (size_t i = 0; !present && i < *count; i++) {
+            present = candidates[i] == at;
+        }
+        if (present) continue;
+        if (*count == capacity) return false;
+        candidates[(*count)++] = at;
+    }
+    return true;
+}
+
+/* A page's late initialization commonly inserts small <style> elements one
+   after another. Rebuilding the whole sheet for each costs seconds on the
+   device and resets every retained style answer. When the journal proves
+   the only stylesheet change is newly inserted <style> elements that follow
+   every source the sheet already ingested, append them in place and keep
+   the retained matched-rule lists for elements the new rules cannot select. */
+static bool navigation_style_append_refused(const char *reason)
+{
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_MUTATION_JOURNAL") != NULL) {
+        fprintf(stderr, "style-append refused: %s\n", reason);
+    }
+#endif
+    (void) reason;
+    return false;
+}
+
+static bool navigation_try_append_inserted_styles(
+    NavigationSession *session, const ScriptMutationJournal *mutations)
+{
+    enum { CANDIDATE_LIMIT = 8, ORDER_WALK_LIMIT = 16384 };
+    if (session == NULL || mutations == NULL || mutations->overflowed
+        || mutations->count == 0) return navigation_style_append_refused("journal");
+    Stylesheet *sheet = &session->page.stylesheet;
+    if (sheet->style_sources_bounded_out || sheet->count == 0)
+        return navigation_style_append_refused("sources unknown");
+    lxb_dom_node_t *candidates[CANDIDATE_LIMIT];
+    size_t count = 0;
+    for (size_t i = 0; i < mutations->count; i++) {
+        const ScriptMutationRecord *record = &mutations->records[i];
+        lxb_dom_node_t *node = record->node;
+        if (record->kind == SCRIPT_MUTATION_HEAD_SCRIPT
+            || record->kind == SCRIPT_MUTATION_CANVAS) continue;
+        if (node == NULL) return navigation_style_append_refused("retired node");
+        lxb_dom_node_t *owner = navigation_style_owner(node);
+        if (owner != NULL) {
+            /* Content of an already ingested <style> changed. */
+            if (stylesheet_style_source_known(sheet, owner))
+                return navigation_style_append_refused("known style changed");
+            if (!navigation_node_connected(owner))
+                return navigation_style_append_refused("style detached");
+            bool present = false;
+            for (size_t k = 0; !present && k < count; k++) {
+                present = candidates[k] == owner;
+            }
+            if (!present) {
+                if (count == CANDIDATE_LIMIT) return false;
+                candidates[count++] = owner;
+            }
+            continue;
+        }
+        switch (record->kind) {
+        case SCRIPT_MUTATION_CHILD_LIST:
+            if (!record->inserted_from_detached
+                || !navigation_node_connected(node))
+                return navigation_style_append_refused("child list not an insertion");
+            if (!navigation_collect_inserted_styles(
+                    sheet, node, candidates, &count, CANDIDATE_LIMIT))
+                return navigation_style_append_refused("inserted subtree");
+            break;
+        case SCRIPT_MUTATION_INNER_HTML:
+            /* The live replacement cannot tell us whether the destroyed
+               subtree contained a stylesheet. Without removal provenance,
+               rebuild rather than retain possibly deleted rules. */
+            return navigation_style_append_refused("innerHTML replacement");
+        case SCRIPT_MUTATION_ATTRIBUTE:
+        case SCRIPT_MUTATION_INLINE_STYLE:
+        case SCRIPT_MUTATION_TEXT:
+            if (node_name_is(node, "link"))
+                return navigation_style_append_refused("link mutation");
+            break;
+        default:
+            return navigation_style_append_refused("record kind");
+        }
+    }
+    if (count == 0) return navigation_style_append_refused("no candidates");
+    /* Cascade order is document order. One walk positions every candidate
+       among the sources the sheet already holds. */
+    lxb_dom_node_t *root = lxb_dom_interface_node(session->page.document.html);
+    lxb_dom_node_t *ordered[CANDIDATE_LIMIT];
+    size_t after[CANDIDATE_LIMIT];
+    size_t found = 0;
+    size_t seen_sources = 0;
+    size_t steps = 0;
+    for (lxb_dom_node_t *at = root; at != NULL && found < count
+                                      && steps < ORDER_WALK_LIMIT;
+         at = navigation_document_order_next(at, root), steps++) {
+        if (at->type != LXB_DOM_NODE_TYPE_ELEMENT) continue;
+        bool candidate = false;
+        for (size_t k = 0; !candidate && k < count; k++) {
+            candidate = candidates[k] == at;
+        }
+        if (candidate) {
+            ordered[found] = at;
+            after[found] = seen_sources;
+            found++;
+        } else if (stylesheet_style_source_known(sheet, at)) {
+            seen_sources++;
+        }
+    }
+    if (found != count) return navigation_style_append_refused("document order");
+    StylesheetAppendResult result;
+    bool lists_valid = true;
+    size_t appended_total = 0;
+    for (size_t k = 0; k < count; k++) {
+        StylesheetAppendResult step;
+        if (!stylesheet_append_style_elements_tracked(
+                sheet, &ordered[k], 1,
+                &session->page.document.content_security_policy,
+                after[k] + k, &step)) {
+            session->performance.mutation_style_append_fallbacks++;
+            return false;
+        }
+        bool step_valid = step.remap != NULL && !step.appended_bounded_out
+                          && !step.context_changed;
+        layout_reuse_cache_note_stylesheet_appended(
+            session->page.layout_reuse, sheet, step.remap, step.old_count,
+            step.appended, step.appended_count, step_valid);
+        lists_valid = lists_valid && step_valid;
+        appended_total += step.appended_count;
+        result = step;
+        stylesheet_append_result_release(sheet, &step);
+    }
+    result.remap = NULL;
+    result.appended_count = appended_total;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    {
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "tilefinch-style-append: elements=%zu rules=%zu/%zu lists=%d "
+                 "context-changed=%d",
+                 count, result.appended_count, sheet->count,
+                 (int) lists_valid, (int) result.context_changed);
+        tilefinch_platform_log_message(message);
+    }
+#endif
+    session->page.compiled_stylesheet_cacheable = false;
+    if (session->page.runtime != NULL) {
+        script_runtime_set_stylesheet(session->page.runtime, sheet);
+    }
+    uint64_t fingerprint = 0;
+    if (navigation_resource_fingerprint(
+            session, &session->page.document, &fingerprint)) {
+        session->resource_fingerprint = fingerprint;
+    }
+    session->performance.mutation_style_appends++;
+    return true;
+}
+
 static void navigation_prepare_layout_reuse(
     NavigationSession *session, const ScriptMutationJournal *mutations,
     bool full_rebuild)
@@ -729,12 +986,65 @@ static void navigation_prepare_layout_reuse(
     layout_reuse_cache_stats(session->page.layout_reuse, &before);
     bool destructive = full_rebuild || mutations == NULL
         || mutations->overflowed;
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_TRACE_MUTATION_JOURNAL") != NULL) {
+        fprintf(stderr, "mutation-journal full-rebuild=%d records=%zu "
+                "overflowed=%d relational=%d\n", (int) full_rebuild,
+                mutations == NULL ? 0 : mutations->count,
+                mutations != NULL && mutations->overflowed,
+                mutations != NULL && mutations->relational_selector_sensitive);
+        for (size_t i = 0; mutations != NULL && i < mutations->count; i++) {
+            const ScriptMutationRecord *record = &mutations->records[i];
+            size_t name_length = 0;
+            const char *name = record->node == NULL ? NULL
+                : document_element_name(record->node, &name_length);
+            fprintf(stderr, "mutation-record kind=%d node=%.*s attribute=%s "
+                    "exact=%d tokens=%u detached=%d\n", (int) record->kind,
+                    (int) name_length, name == NULL ? "" : name,
+                    record->attribute, (int) record->changed_tokens_exact,
+                    (unsigned) record->changed_token_count,
+                    (int) record->inserted_from_detached);
+        }
+    }
+#endif
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (mutations != NULL && mutations->count != 0) {
+        char message[240];
+        size_t used = (size_t) snprintf(message, sizeof(message),
+            "tilefinch-mutation-journal: full=%d records=%zu overflow=%d",
+            (int) full_rebuild, mutations->count, (int) mutations->overflowed);
+        for (size_t i = 0; i < mutations->count && used < sizeof(message) - 40u; i++) {
+            const ScriptMutationRecord *record = &mutations->records[i];
+            size_t name_length = 0;
+            const char *name = record->node == NULL ? NULL
+                : document_element_name(record->node, &name_length);
+            used += (size_t) snprintf(message + used, sizeof(message) - used,
+                " %d:%.*s:%s:%d/%u", (int) record->kind, (int) (name_length > 8 ? 8 : name_length),
+                name == NULL ? "" : name, record->attribute,
+                (int) record->changed_tokens_exact, (unsigned) record->changed_token_count);
+        }
+        tilefinch_platform_log_message(message);
+    }
+#endif
     if (!destructive) {
         for (size_t i = 0; i < mutations->count; i++) {
-            ScriptMutationKind kind = mutations->records[i].kind;
+            const ScriptMutationRecord *record = &mutations->records[i];
+            ScriptMutationKind kind = record->kind;
+            /* A subtree inserted from a detached tree removed nothing: the
+               retained answers of existing elements can only change through
+               structural selectors, which the scoped path bounds to the
+               parent. Head scripts render nothing. Moves, removals and
+               innerHTML replacements may have freed elements the lists still
+               name, so they stay destructive. */
+            if (kind == SCRIPT_MUTATION_CHILD_LIST
+                && record->inserted_from_detached && record->node != NULL
+                && navigation_node_connected(record->node)
+#ifndef TILEFINCH_NO_TRACE
+                && getenv("TILEFINCH_DISABLE_INSERT_SCOPED_REUSE") == NULL
+#endif
+                ) continue;
             if (kind == SCRIPT_MUTATION_INNER_HTML
                 || kind == SCRIPT_MUTATION_CHILD_LIST
-                || kind == SCRIPT_MUTATION_HEAD_SCRIPT
                 || kind == SCRIPT_MUTATION_UNKNOWN) {
                 destructive = true;
                 break;
@@ -746,11 +1056,28 @@ static void navigation_prepare_layout_reuse(
     } else {
         for (size_t i = 0; i < mutations->count; i++) {
             const ScriptMutationRecord *record = &mutations->records[i];
+            if (record->kind == SCRIPT_MUTATION_HEAD_SCRIPT
+                || record->kind == SCRIPT_MUTATION_CANVAS
+                || record->node == NULL) continue;
+            /* <style> content is not rendered; an appended sheet has already
+               told the cache which lists the new rules can change. */
+            if (navigation_style_owner(record->node) != NULL) continue;
+            if (record->kind == SCRIPT_MUTATION_CHILD_LIST) {
+                layout_reuse_cache_invalidate_node(
+                    session->page.layout_reuse, record->node, true);
+                continue;
+            }
             if (record->kind == SCRIPT_MUTATION_ATTRIBUTE
                 && strcmp(
                     record->attribute, "data-tilefinch-focus") == 0) {
                 layout_reuse_cache_invalidate_focus(
                     session->page.layout_reuse, record->node);
+            } else if (record->kind == SCRIPT_MUTATION_ATTRIBUTE
+                       && record->changed_tokens_exact) {
+                layout_reuse_cache_invalidate_attribute(
+                    session->page.layout_reuse, record->node,
+                    record->changed_tokens, record->changed_token_count,
+                    false, mutations->relational_selector_sensitive);
             } else if (mutations->relational_selector_sensitive) {
                 layout_reuse_cache_invalidate_node(
                     session->page.layout_reuse, record->node,
@@ -761,6 +1088,7 @@ static void navigation_prepare_layout_reuse(
                     record->kind == SCRIPT_MUTATION_TEXT);
             }
         }
+        layout_reuse_cache_flush_invalidations(session->page.layout_reuse);
     }
     layout_reuse_cache_stats(session->page.layout_reuse, &after);
     if (after.scoped_invalidations >= before.scoped_invalidations) {
@@ -771,6 +1099,34 @@ static void navigation_prepare_layout_reuse(
         session->performance.layout_reuse_full_resets +=
             after.full_resets - before.full_resets;
     }
+    if (after.matched_token_invalidations >= before.matched_token_invalidations) {
+        session->performance.layout_reuse_matched_token_invalidations +=
+            after.matched_token_invalidations - before.matched_token_invalidations;
+    }
+    if (after.matched_token_fallbacks >= before.matched_token_fallbacks) {
+        session->performance.layout_reuse_matched_token_fallbacks +=
+            after.matched_token_fallbacks - before.matched_token_fallbacks;
+    }
+    if (after.matched_token_dropped >= before.matched_token_dropped) {
+        session->performance.layout_reuse_matched_token_dropped +=
+            after.matched_token_dropped - before.matched_token_dropped;
+    }
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (after.matched_token_invalidations != before.matched_token_invalidations
+        || after.matched_token_fallbacks != before.matched_token_fallbacks) {
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "tilefinch-layout-invalidate: token=%zu/%zu dropped=%zu "
+                 "affected=%zu",
+                 after.matched_token_invalidations
+                     - before.matched_token_invalidations,
+                 after.matched_token_fallbacks - before.matched_token_fallbacks,
+                 after.matched_token_dropped - before.matched_token_dropped,
+                 after.matched_token_affected_rules
+                     - before.matched_token_affected_rules);
+        tilefinch_platform_log_message(message);
+    }
+#endif
 }
 
 static void navigation_evict_layout_reuse_under_pressure(
@@ -1004,6 +1360,14 @@ bool navigation_relayout(NavigationSession *session)
         || mutations.conservative_resource_scan;
     bool full_rebuild = session->style_rebuild_required
         || mutations.resource_rebuild_required;
+    if (mutation_driven && !session->style_rebuild_required
+        && mutations.resource_rebuild_required
+#ifndef TILEFINCH_NO_TRACE
+        && getenv("TILEFINCH_DISABLE_STYLE_APPEND") == NULL
+#endif
+        && navigation_try_append_inserted_styles(session, &mutations)) {
+        full_rebuild = false;
+    }
     bool image_resource_scan = mutation_driven
         && mutations.image_resource_scan_required;
     bool image_resource_refresh = mutation_driven
@@ -2179,6 +2543,25 @@ bool navigation_run_deferred_image_work(NavigationSession *session)
     if (session == NULL || !session->page.loaded) return false;
     if (!session->page.image_continuation_pending
         || session->page.deferred_image_targets == NULL) return true;
+    if (session->maximum_publication_work_units != 0
+        && session->page.layout.layout_work_units
+               > session->maximum_publication_work_units) {
+        /* Every batch is published through a full relayout costing about
+           what the committed layout cost. On a page this large that is
+           seconds of blocked input per pair of images; keep the fallback
+           boxes and finish the queue instead. */
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "tilefinch-deferred-images: skipped targets=%zu work=%zu limit=%zu",
+                 session->page.deferred_image_count,
+                 session->page.layout.layout_work_units,
+                 session->maximum_publication_work_units);
+        tilefinch_platform_log_message(message);
+#endif
+        navigation_deferred_images_finish(session);
+        return true;
+    }
     return navigation_run_deferred_image(session);
 }
 

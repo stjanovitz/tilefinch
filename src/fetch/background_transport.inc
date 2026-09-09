@@ -790,9 +790,15 @@ static size_t fetch_background_receive_body(
                &slot->chunk_state, memory_order_acquire)
                != FETCH_BACKGROUND_CHUNK_EMPTY) {
         slot->curl_paused = true;
-        slot->pause_started_us = fetch_background_now_us();
+        if (slot->pause_started_us == 0)
+            slot->pause_started_us = slot->last_progress_us;
         return CURL_WRITEFUNC_PAUSE;
     }
+    /* The consumer may drain a chunk during the same curl_multi_perform.
+       Account for that pause before accepting another callback's bytes. */
+    fetch_background_end_consumer_pause(
+        slot->last_progress_us, &slot->pause_started_us,
+        &slot->deadline_us, &slot->last_progress_us);
     size_t buffer_capacity = fetch_background_buffer_capacity(slot);
     bool response_limit_exceeded =
         slot->total_length > slot->maximum_bytes
@@ -820,6 +826,7 @@ static size_t fetch_background_receive_body(
         memory_order_release);
     if (slot->streaming
         && slot->length >= slot->stream_chunk_target) {
+        slot->pause_started_us = slot->last_progress_us;
         atomic_store_explicit(
             &slot->chunk_bytes, (unsigned) slot->length,
             memory_order_release);
@@ -1248,6 +1255,8 @@ static void fetch_background_publish_stream_chunk(
     FetchBackgroundSlot *slot)
 {
     if (slot == NULL || !slot->streaming || slot->length == 0) return;
+    if (slot->pause_started_us == 0)
+        slot->pause_started_us = fetch_background_now_us();
     atomic_store_explicit(
         &slot->chunk_bytes, (unsigned) slot->length,
         memory_order_release);
@@ -1688,14 +1697,10 @@ static void fetch_background_resume_streams(void)
             fetch_background_finish_stream_if_drained(slot);
             continue;
         }
+        fetch_background_end_consumer_pause(
+            fetch_background_now_us(), &slot->pause_started_us,
+            &slot->deadline_us, &slot->last_progress_us);
         if (slot->curl_paused && slot->easy != NULL) {
-            uint64_t now_us = fetch_background_now_us();
-            uint64_t paused_us = now_us >= slot->pause_started_us
-                ? now_us - slot->pause_started_us : 0;
-            slot->deadline_us = paused_us > UINT64_MAX - slot->deadline_us
-                ? UINT64_MAX : slot->deadline_us + paused_us;
-            slot->last_progress_us = now_us;
-            slot->pause_started_us = 0;
             /* curl_easy_pause(CONT) may synchronously replay buffered body
                data and that callback may pause the handle again. Clear the
                old pause before the call so a synchronous re-pause wins. */
@@ -1722,7 +1727,9 @@ static void fetch_background_expire_active_deadlines(void)
         if (atomic_load_explicit(
                 &slot->state, memory_order_acquire)
                 != FETCH_BACKGROUND_SLOT_RUNNING
-            || slot->curl_paused) continue;
+            || !fetch_background_deadline_eligible(
+                slot->transfer_done, slot->curl_paused,
+                slot->pause_started_us)) continue;
         bool deadline_expired = now_us >= slot->deadline_us;
         bool response_stalled = slot->header_status != 0
             && now_us >= slot->last_progress_us
@@ -1735,6 +1742,17 @@ static void fetch_background_expire_active_deadlines(void)
             deadline_expired
                 ? "background active transport deadline expired"
                 : "background response made no progress for six seconds");
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+        size_t diagnostic_length = strlen(slot->result.error);
+        snprintf(slot->result.error + diagnostic_length,
+                 sizeof(slot->result.error) - diagnostic_length,
+                 " [idle-us=%llu bytes=%zu chunk=%d done=%d]",
+                 (unsigned long long)(now_us >= slot->last_progress_us
+                     ? now_us - slot->last_progress_us : 0),
+                 slot->total_length,
+                 atomic_load_explicit(&slot->chunk_state, memory_order_acquire),
+                 slot->transfer_done);
+#endif
         fetch_background_slot_release_curl(slot);
         slot->result.success = false;
         slot->result.timed_out = true;
@@ -2433,9 +2451,27 @@ static int fetch_background_worker_main(SceSize args, void *argp)
 #endif
         int running = 0;
         bool setup_perform = fetch_background_perform_has_setup_work();
+        uint32_t setup_body_mask = 0;
+        uint64_t setup_started_us = 0;
         SceUID worker_id = -1;
         bool setup_priority_active = false;
         if (setup_perform) {
+            _Static_assert(FETCH_BACKGROUND_REQUEST_LIMIT <= 32u,
+                           "setup body snapshot fits its bounded mask");
+            for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++) {
+                FetchBackgroundSlot *slot = &fetch_background.slots[i];
+                if (atomic_load_explicit(&slot->state, memory_order_acquire)
+                        == FETCH_BACKGROUND_SLOT_RUNNING
+                    && slot->header_status != 0 && !slot->curl_paused
+                    && slot->pause_started_us == 0
+                    && !slot->transfer_done) {
+                    setup_body_mask |= UINT32_C(1) << i;
+                }
+            }
+            /* Include descheduling after lowering priority. Existing body
+               transfers cannot progress while this shared worker is inside
+               another connection's synchronous DNS/TCP/TLS setup. */
+            setup_started_us = fetch_background_now_us();
             worker_id = sceKernelGetThreadId();
             int priority_result = sceKernelChangeThreadPriority(
                 worker_id, TILEFINCH_PSP_THREAD_PRIORITY_TRANSPORT_SETUP);
@@ -2466,6 +2502,21 @@ static int fetch_background_worker_main(SceSize args, void *argp)
             (void) atomic_fetch_add_explicit(
                 &fetch_background.worker_priority_failures, 1u,
                 memory_order_relaxed);
+        }
+        if (setup_body_mask != 0) {
+            uint64_t setup_finished_us = fetch_background_now_us();
+            for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++) {
+                if ((setup_body_mask & (UINT32_C(1) << i)) == 0) continue;
+                FetchBackgroundSlot *slot = &fetch_background.slots[i];
+                if (atomic_load_explicit(&slot->state, memory_order_acquire)
+                        != FETCH_BACKGROUND_SLOT_RUNNING
+                    || slot->curl_paused || slot->pause_started_us != 0
+                    || slot->transfer_done) continue;
+                slot->last_progress_us = fetch_background_progress_after_setup(
+                    slot->last_progress_us, setup_started_us, setup_finished_us);
+                /* Do not extend deadline_us: repeated setup work must never
+                   make the overall request lifetime unbounded. */
+            }
         }
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
         fetch_background_atomic_max(
