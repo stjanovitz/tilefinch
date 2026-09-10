@@ -931,6 +931,14 @@ if(PSP_BROWSER_BUILD_TESTS)
         set_tests_properties(tilefinch-visual-scenario-tests PROPERTIES
             LABELS "tilefinch;unit;acceptance;tooling"
             TIMEOUT 10)
+        add_test(NAME tilefinch-search-form-visual-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_search_form_visual.py
+                $<TARGET_FILE:psp-browser-lab>
+                ${CMAKE_CURRENT_BINARY_DIR}/search-form-visual)
+        set_tests_properties(tilefinch-search-form-visual-tests PROPERTIES
+            LABELS "tilefinch;acceptance;visual;layout"
+            TIMEOUT 30)
         add_test(NAME tilefinch-fidelity-scoreboard-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fidelity_scoreboard.py)

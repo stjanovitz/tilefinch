@@ -1114,6 +1114,24 @@ void psp_app_apply_setting(
                     : "VIDEO START IMMEDIATE",
             180);
     }
+    if (intent->setting.id == PSP_UI_SETTING_SAVE_PLAYBACK_POSITIONS
+        || intent->setting.id == PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS) {
+        bool clear = intent->setting.id == PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS;
+        if (clear) browser_profile_clear_playback_positions(profile);
+        else browser_profile_set_save_playback_positions(
+            profile, intent->setting.value.boolean);
+        /* No stale in-memory dirty flag should resurrect a cleared record.
+           Continued playback may record a new position only when opted in. */
+        app->browser->media.resume_profile_dirty = false;
+        app->browser->media.last_resume_saved_us = app->browser->media.clock_us;
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(&app->process->presentation.ui,
+            clear ? "PLAYBACK POSITIONS CLEARED"
+                : (intent->setting.value.boolean
+                    ? "SAVE PLAYBACK POSITIONS ON" : "PLAYBACK POSITIONS OFF - CLEARED"),
+            180);
+    }
     if (intent->setting.id
         == PSP_UI_SETTING_RESUME_OFFLINE_DOWNLOADS) {
         bool enabled = intent->setting.value.boolean;

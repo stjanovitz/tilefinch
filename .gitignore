@@ -9,6 +9,11 @@
 .DS_Store
 *.ppm
 *.png
+!tests/visual/search-form/search.png
+!tests/visual/search-form/results.png
+!tests/visual/search-form/results-middle.png
+!tests/visual/search-form/results-lower.png
+!tests/visual/search-form/results-end.png
 !docs/wikipedia-on-psp.png
 !docs/big-buck-bunny-player.png
 !docs/psp-validation-frame.png

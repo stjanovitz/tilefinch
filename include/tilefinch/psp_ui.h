@@ -315,7 +315,9 @@ typedef enum {
     PSP_UI_SETTING_TLS_SESSION_PERSISTENCE,
     PSP_UI_SETTING_NETWORK_PROFILE,
     PSP_UI_SETTING_UPDATE_CHANNEL,
-    PSP_UI_SETTING_GAMEPAD_FACE_MAPPING
+    PSP_UI_SETTING_GAMEPAD_FACE_MAPPING,
+    PSP_UI_SETTING_SAVE_PLAYBACK_POSITIONS,
+    PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS
 } PspUiSettingId;
 
 typedef union {
@@ -677,6 +679,8 @@ typedef struct {
     /* One of the four direction bits, or zero. */
     uint16_t focus_repeat_direction;
     int8_t analog_scroll_direction;
+    /* Uses alignment padding before the cursor coordinates. */
+    bool save_playback_positions;
     int cursor_x_milli;
     int cursor_y_milli;
     char url[PSP_UI_URL_CAPACITY];

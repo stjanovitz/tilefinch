@@ -253,6 +253,10 @@ int main(void)
     browser_profile_set_ui_scale(profile, 2);
     browser_profile_set_page_font_percent(profile, 125);
     browser_profile_set_history_enabled(profile, true);
+    CHECK(!browser_profile_save_playback_positions(profile));
+    CHECK(!browser_profile_record_resume(
+        profile, "TFTEST00001", UINT64_C(8000000), UINT64_C(19000000)));
+    browser_profile_set_save_playback_positions(profile, true);
     browser_profile_set_restore_last_page(profile, true);
     browser_profile_set_tab_hibernation_enabled(profile, true);
     browser_profile_set_custom_homepage_enabled(profile, true);
@@ -496,6 +500,7 @@ int main(void)
     CHECK(browser_profile_save(profile, path));
     BrowserProfile *loaded = browser_profile_create(&budget);
     CHECK(loaded != NULL && browser_profile_load(loaded, path));
+    CHECK(browser_profile_save_playback_positions(loaded));
     CHECK(browser_profile_ui_scale(loaded) == 2
           && browser_profile_page_font_percent(loaded) == 125
           && browser_profile_history_enabled(loaded)
@@ -585,6 +590,14 @@ int main(void)
           && browser_profile_history_count(loaded) == 100
           && browser_profile_history(loaded, 0)->visits == 3
           && browser_profile_resume(loaded, "TFTEST00001", &resume));
+    CHECK(browser_profile_clear_playback_positions(loaded));
+    CHECK(!browser_profile_resume(loaded, "TFTEST00001", &resume));
+    CHECK(!browser_profile_clear_playback_positions(loaded));
+    CHECK(browser_profile_save_playback_positions(loaded));
+    CHECK(browser_profile_record_resume(loaded, "TFTEST00001", 8000000, 19000000));
+    browser_profile_set_save_playback_positions(loaded, false);
+    browser_profile_set_save_playback_positions(loaded, true);
+    CHECK(!browser_profile_resume(loaded, "TFTEST00001", &resume));
     BrowserProfile *startup_loaded = browser_profile_create(&budget);
     BrowserProfileAllowlistImport deferred_import = {0};
     CHECK(startup_loaded != NULL
@@ -620,6 +633,7 @@ int main(void)
     CHECK(fputs(
         "TILEFINCH_PROFILE\t1\n"
         "UI\t2\t150\t1\n"
+        "R\tTFTEST00001\t8000000\t19000000\n"
         "MIXED\tcompat.example\n"
         "TPC\tcookies.example\n",
         legacy) >= 0);
@@ -658,6 +672,7 @@ int main(void)
                  == BROWSER_YOUTUBE_QUALITY_360P
           && !browser_profile_youtube_compact_results(legacy_loaded)
           && !browser_profile_youtube_audio_only(legacy_loaded)
+          && !browser_profile_save_playback_positions(legacy_loaded)
           && browser_profile_video_language(legacy_loaded)
                  == BROWSER_VIDEO_LANGUAGE_SYSTEM
           && browser_profile_subtitle_language(legacy_loaded)
@@ -702,7 +717,13 @@ int main(void)
        compatibility settings such as the third-party-cookie exception. */
     CHECK(!browser_profile_site_javascript_enabled(legacy_loaded,
               "https://en.wikipedia.org/"));
+    CHECK(!browser_profile_resume(legacy_loaded, "TFTEST00001", &resume));
+    browser_profile_set_save_playback_positions(legacy_loaded, true);
+    CHECK(!browser_profile_resume(legacy_loaded, "TFTEST00001", &resume));
+    browser_profile_set_save_playback_positions(legacy_loaded, false);
     CHECK(browser_profile_save(legacy_loaded, path)
+          && !file_contains(path, "R\tTFTEST00001")
+          && file_contains(path, "RESUME\t0\n")
           && !file_contains(path, "MIXED\t")
           && file_contains(path, "TPC\tcookies.example"));
     browser_profile_destroy(legacy_loaded);

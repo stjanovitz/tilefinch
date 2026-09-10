@@ -7605,6 +7605,8 @@ int main(int argc, char *argv[])
         browser_profile_video_startup_buffering(browser.profile);
     process.presentation.ui.resume_offline_downloads =
         browser_profile_resume_offline_downloads(browser.profile);
+    process.presentation.ui.save_playback_positions =
+        browser_profile_save_playback_positions(browser.profile);
     process.presentation.ui.content_blocker_mode = (uint8_t) content_blocker_mode;
     process.presentation.ui.content_blocker_cosmetic_hiding =
         browser_profile_content_blocker_cosmetic_hiding(browser.profile);

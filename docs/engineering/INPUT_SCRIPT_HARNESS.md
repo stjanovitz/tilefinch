@@ -86,6 +86,20 @@ when input must wait for the browser's ready boundary, `-page` for a painted
 document with pending work, `-live` for input within ongoing work, and correlate `mark` records
 with the operation journal to prove the state the scenario reached.
 
+`youtube-comments-play-live.txt` starts on a provider watch URL, expands
+Comments with D-pad input, returns focus to the video card, and activates it.
+It is a live diagnostic, not a network-dependent golden. Check that
+`comments-link` targets `tilefinch_view=comments`, `comments-open` reports that
+committed URL, and `play-target` identifies `class=watch-target` with the
+canonical watch URL. The `played` and `progressed` marks alone do not prove
+playback: require decoded frames and an advancing media clock in the media
+log, with zero state-machine mismatches. PPSSPP can reach the known missing
+`flash0:/kd/mpeg_vsh.prx` boundary; this qualifies the input/handoff only,
+not firmware playback. Do not bless that failure as a playback golden.
+The hermetic `--provider-navigation-only` host test independently covers
+Play from both expanded Description and Comments documents, including the
+canonical URL, native-player action, and unchanged backing generation.
+
 ## Arming a run
 
 Validation builds read a script beside the executable:
