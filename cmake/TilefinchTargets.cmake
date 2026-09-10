@@ -402,6 +402,13 @@ if(PSP)
             src/psp_atomic_shims.c)
         if(TILEFINCH_PSP_VALIDATION_LOG AND NOT PSP_BROWSER_CURL_STUB)
             target_sources(psp-browser-script PRIVATE src/psp_update_e2e.c)
+            target_sources(psp-browser-script PRIVATE src/psp_transport_probe.c)
+            set(_transport_probe_link_options)
+            foreach(_symbol curl_multi_perform curl_multi_poll curlx_nonblock gethostbyname connect select recv send
+                            sceKernelWaitSema sceKernelDelayThread sceNetInetSelect)
+                list(APPEND _transport_probe_link_options "LINKER:--wrap=${_symbol}")
+            endforeach()
+            target_link_options(psp-browser-script PRIVATE ${_transport_probe_link_options})
         endif()
         target_link_libraries(psp-browser-script PRIVATE tilefinch_core
             tilefinch_psp_ui tilefinch_psp_display
@@ -762,6 +769,9 @@ if(PSP)
         # packaged or copied into the install tree.
         add_executable(psp-browser-script-dev-prx
                 $<TARGET_OBJECTS:psp-browser-script>)
+        if(TILEFINCH_PSP_VALIDATION_LOG AND NOT PSP_BROWSER_CURL_STUB)
+            target_link_options(psp-browser-script-dev-prx PRIVATE ${_transport_probe_link_options})
+        endif()
             # A target whose only sources are prebuilt objects has no language
             # to infer a linker from. The .elf name keeps this intermediate
             # from ever colliding with the EBOOT's own ELF, which every script

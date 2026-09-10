@@ -1,0 +1,14 @@
+psp-http-trace=1
+method=GET
+url=https://search-journey.test/unavailable
+success=0
+async-delay-pumps=12
+external-cancel=0
+transport-timeout=1
+error=synthetic delayed transport timeout
+status=0
+length=0
+effective-url=https://search-journey.test/unavailable
+content-type=text/html
+server=fixture
+set-cookie-count=0

@@ -796,6 +796,7 @@ typedef struct {
     size_t matched_token_dropped;
     size_t matched_token_affected_rules;
     size_t stylesheet_appends;
+    size_t retired_subtrees;
 } LayoutReuseStats;
 
 /* Exclusive flow attribution; native placement includes unclassified flow
@@ -1122,6 +1123,21 @@ ComputedStyle layout_initial_root_style(void);
 void layout_reuse_cache_invalidate_node(LayoutReuseCache *cache,
                                         lxb_dom_node_t *node,
                                         bool text_or_structure_sensitive);
+/* Node retirement: once the runtime promises to call retire_subtree for
+   every subtree it frees, removals, moves and innerHTML replacements no
+   longer have to reset the cache. */
+void layout_reuse_cache_enable_node_retirement(LayoutReuseCache *cache);
+bool layout_reuse_cache_node_retirement(const LayoutReuseCache *cache);
+/* Drops every entry naming a node inside `root` (inclusive) while those
+   nodes are still valid. Structural effects on the surrounding tree are the
+   caller's, through the ordinary scoped invalidation. */
+void layout_reuse_cache_retire_subtree(LayoutReuseCache *cache,
+                                       const lxb_dom_node_t *root);
+/* A child list changed under `node` and every freed node already left the
+   cache: invalidate the parent scope, plus the ancestor chain when the sheet
+   has :has(); resets only for :has() with sibling combinators. */
+void layout_reuse_cache_invalidate_structure(LayoutReuseCache *cache,
+                                             lxb_dom_node_t *node);
 /* Mutation journal proved that this change cannot affect a :has() selector;
    invalidate the ordinary subtree/sizing scope without discarding the cache
    merely because unrelated relational rules exist elsewhere in the sheet. */

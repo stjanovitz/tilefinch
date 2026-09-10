@@ -559,7 +559,8 @@ static bool lite_json_key_string_at(
 
 /* Large provider responses are retained only after the bounded transport has
    finished, but walking them is still device work. Keep every subsequent
-   lexical search resumable too: one provider pump examines at most 16 KiB.
+   lexical search resumable too: one search step examines at most 16 KiB of
+   candidate positions.
    The helper deliberately matches lite_json_key's quoted-key contract while
    accepting only bounded string values, so a hostile megabyte string cannot
    turn a successful key match into another unbounded unit. */
@@ -600,13 +601,18 @@ static YoutubeLiteScanStatus lite_bytes_scan_pump(
     size_t needle_length = strlen(needle);
     size_t stop = *offset + SCAN_BYTES_PER_PUMP;
     if (stop < *offset || stop > scan_limit) stop = scan_limit;
-    for (size_t at = *offset; at < stop; at++) {
-        if (source[at] == needle[0] && needle_length <= source_length - at
+    size_t at = *offset;
+    while (at < stop) {
+        const char *candidate = memchr(source + at, needle[0], stop - at);
+        if (candidate == NULL) break;
+        at = (size_t) (candidate - source);
+        if (needle_length <= source_length - at
             && memcmp(source + at, needle, needle_length) == 0) {
             if (found_offset != NULL) *found_offset = at;
             *offset = at + needle_length;
             return YOUTUBE_LITE_SCAN_FOUND;
         }
+        at++;
     }
     *offset = stop;
     return stop == scan_limit
@@ -1672,7 +1678,9 @@ static bool lite_build_document_with_comments_decoded(
                 budget, source, source_length, &decoded_length);
         }
     }
-    size_t result_count = decoded == NULL ? 0 : lite_parse_videos(
+    bool description_requested = route == YOUTUBE_LITE_ROUTE_WATCH
+        && lite_description_view_requested(url);
+    size_t result_count = decoded == NULL || description_requested ? 0 : lite_parse_videos(
         decoded, decoded_length, videos, YOUTUBE_LITE_MAXIMUM_RESULTS);
     size_t display_count = route == YOUTUBE_LITE_ROUTE_WATCH
         && result_count > 6 ? 6 : result_count;
@@ -1703,8 +1711,6 @@ static bool lite_build_document_with_comments_decoded(
     }
     bool comments_requested = route == YOUTUBE_LITE_ROUTE_WATCH
         && lite_comments_view_requested(url);
-    bool description_requested = route == YOUTUBE_LITE_ROUTE_WATCH
-        && lite_description_view_requested(url);
     YoutubeLiteComment *comments = NULL;
     size_t comment_count = 0;
     char comments_count[YOUTUBE_LITE_METADATA_LIMIT] = {0};
@@ -2011,7 +2017,7 @@ static YoutubeLiteBuildWork *lite_build_work_create(
     Budget *budget, const char *url, const char *source,
     size_t source_length, size_t source_bytes, const char *supplemental,
     size_t supplemental_length, const char *decoded,
-    size_t decoded_length, bool compact_results,
+    size_t decoded_length, bool compact_results, bool parsed_watch,
     char *error, size_t error_size)
 {
     YoutubeLiteRoute route =
@@ -2019,7 +2025,7 @@ static YoutubeLiteBuildWork *lite_build_work_create(
     bool direct_search_continuation =
         route == YOUTUBE_LITE_ROUTE_SEARCH
         && supplemental != NULL && supplemental_length != 0;
-    bool raw_source_required = route == YOUTUBE_LITE_ROUTE_WATCH;
+    bool raw_source_required = route == YOUTUBE_LITE_ROUTE_WATCH && !parsed_watch;
     if (budget == NULL || url == NULL || route == YOUTUBE_LITE_ROUTE_NONE
         || (raw_source_required && (source == NULL || source_length == 0))
         || source_length > YOUTUBE_LITE_MAXIMUM_SOURCE_BYTES
@@ -2137,12 +2143,20 @@ static void lite_build_video_pump(YoutubeLiteBuildWork *work)
         if (kind == YOUTUBE_LITE_RENDERER_DESCRIPTION_HEADER) {
             lite_watch_description_header(&renderer, &work->watch);
             work->watch_description_header_found = true;
+            /* Description has no recommendation cards. Once its localized
+               metadata is known, the remaining initial-data tail cannot
+               contribute visible content; retain the ordinary bounded
+               player-metadata phases, but stop this renderer walk. */
+            if (work->description_requested) {
+                lite_build_after_videos(work);
+                return;
+            }
             work->scan_offset =
                 (size_t) (renderer.end - work->decoded);
             return;
         }
         YoutubeLiteVideo parsed;
-        if (lite_parse_video(
+        if (!work->description_requested && lite_parse_video(
                 &renderer,
                 kind == YOUTUBE_LITE_RENDERER_VIDEO_WITH_CONTEXT,
                 &parsed)
@@ -2712,6 +2726,29 @@ typedef struct {
     FetchRequest request;
 } YoutubeLiteSupplementalRequest;
 
+typedef struct {
+    YoutubeLiteJobPhase phase;
+    size_t offset;
+    size_t limit;
+    char token[YOUTUBE_LITE_CONTINUATION_LIMIT];
+} YoutubeLiteCommentsScan;
+
+/* Parsed facts only, never a retained HTML/JSON response. Shares the existing
+   two-entry, Budget-owned adapter cache and its cookie/portal/expiry rules. */
+#define YOUTUBE_LITE_WATCH_CACHE_ADAPTER "youtube-watch-facts-v1"
+typedef struct {
+    YoutubeLiteWatch watch;
+    YoutubeLiteVideo videos[6];
+    size_t video_count;
+    YoutubeLiteIdentity identity;
+    char token[YOUTUBE_LITE_CONTINUATION_LIMIT];
+    char language[YOUTUBE_LITE_LANGUAGE_LIMIT];
+    bool comments_ready;
+    TilefinchDateFormat date_format;
+} YoutubeLiteWatchFacts;
+_Static_assert(sizeof(YoutubeLiteWatchFacts) <= 16u * 1024u,
+               "watch facts must stay within 16 KiB");
+
 struct YoutubeLiteLoadJob {
     Budget *budget;
     BrowserSession *session;
@@ -2731,6 +2768,7 @@ struct YoutubeLiteLoadJob {
     bool identity_available;
     bool document_taken;
     bool compact_results;
+    bool watch_facts_reused;
     char url[TILEFINCH_URL_SERIALIZED_LIMIT];
     char fetch_url[1024];
     char language[YOUTUBE_LITE_LANGUAGE_LIMIT];
@@ -2753,7 +2791,7 @@ struct YoutubeLiteLoadJob {
     char decode_quote;
     size_t fact_scan_offset;
     size_t fact_scan_limit;
-    char continuation_token[YOUTUBE_LITE_CONTINUATION_LIMIT];
+    YoutubeLiteCommentsScan comments_scan;
     YoutubeLiteIdentity identity;
     YoutubeLiteBuildWork *build;
     YoutubeLiteDocument document;
@@ -2964,75 +3002,79 @@ static void lite_load_after_decode(YoutubeLiteLoadJob *job)
 {
     job->fact_scan_offset = 0;
     job->fact_scan_limit = job->decoded_length;
+    job->comments_scan = (YoutubeLiteCommentsScan) {
+        .phase = YOUTUBE_LITE_JOB_COMMENTS_PANEL,
+        .limit = job->decoded_length
+    };
     job->phase = job->supplemental_requested
             && job->route == YOUTUBE_LITE_ROUTE_WATCH
             && job->decoded != NULL
         ? YOUTUBE_LITE_JOB_COMMENTS_PANEL : YOUTUBE_LITE_JOB_PREPARE;
 }
 
-static bool lite_load_comments_scan_pump(YoutubeLiteLoadJob *job)
+static bool lite_comments_scan_pump(
+    const char *decoded, size_t decoded_length, YoutubeLiteCommentsScan *scan)
 {
     enum {
         COMMENTS_COMMAND_WINDOW = 256u * 1024u,
         COMMENTS_TOKEN_WINDOW = 16u * 1024u
     };
-    if (job == NULL || job->decoded == NULL) return false;
+    if (scan == NULL || decoded == NULL) return false;
     YoutubeLiteScanStatus status = YOUTUBE_LITE_SCAN_EXHAUSTED;
     size_t found = 0;
-    switch (job->phase) {
+    switch (scan->phase) {
     case YOUTUBE_LITE_JOB_COMMENTS_PANEL:
         status = lite_bytes_scan_pump(
-            job->decoded, job->decoded_length, job->fact_scan_limit,
-            "\"engagementPanels\"", &job->fact_scan_offset, &found);
+            decoded, decoded_length, scan->limit,
+            "\"engagementPanels\"", &scan->offset, &found);
         if (status == YOUTUBE_LITE_SCAN_FOUND) {
-            job->phase = YOUTUBE_LITE_JOB_COMMENTS_MARKER;
-            job->fact_scan_limit = job->decoded_length;
+            scan->phase = YOUTUBE_LITE_JOB_COMMENTS_MARKER;
+            scan->limit = decoded_length;
         }
         break;
     case YOUTUBE_LITE_JOB_COMMENTS_MARKER:
         status = lite_bytes_scan_pump(
-            job->decoded, job->decoded_length, job->fact_scan_limit,
+            decoded, decoded_length, scan->limit,
             "engagement-panel-comments-section",
-            &job->fact_scan_offset, &found);
+            &scan->offset, &found);
         if (status == YOUTUBE_LITE_SCAN_FOUND) {
-            job->phase = YOUTUBE_LITE_JOB_COMMENTS_COMMAND;
-            job->fact_scan_limit = job->fact_scan_offset
+            scan->phase = YOUTUBE_LITE_JOB_COMMENTS_COMMAND;
+            scan->limit = scan->offset
                     > SIZE_MAX - COMMENTS_COMMAND_WINDOW
-                ? job->decoded_length
-                : job->fact_scan_offset + COMMENTS_COMMAND_WINDOW;
-            if (job->fact_scan_limit > job->decoded_length)
-                job->fact_scan_limit = job->decoded_length;
+                ? decoded_length
+                : scan->offset + COMMENTS_COMMAND_WINDOW;
+            if (scan->limit > decoded_length)
+                scan->limit = decoded_length;
         }
         break;
     case YOUTUBE_LITE_JOB_COMMENTS_COMMAND:
         status = lite_bytes_scan_pump(
-            job->decoded, job->decoded_length, job->fact_scan_limit,
+            decoded, decoded_length, scan->limit,
             "\"continuationCommand\"",
-            &job->fact_scan_offset, &found);
+            &scan->offset, &found);
         if (status == YOUTUBE_LITE_SCAN_FOUND) {
-            job->phase = YOUTUBE_LITE_JOB_COMMENTS_TOKEN;
-            job->fact_scan_limit = job->fact_scan_offset
+            scan->phase = YOUTUBE_LITE_JOB_COMMENTS_TOKEN;
+            scan->limit = scan->offset
                     > SIZE_MAX - COMMENTS_TOKEN_WINDOW
-                ? job->decoded_length
-                : job->fact_scan_offset + COMMENTS_TOKEN_WINDOW;
-            if (job->fact_scan_limit > job->decoded_length)
-                job->fact_scan_limit = job->decoded_length;
+                ? decoded_length
+                : scan->offset + COMMENTS_TOKEN_WINDOW;
+            if (scan->limit > decoded_length)
+                scan->limit = decoded_length;
         }
         break;
     case YOUTUBE_LITE_JOB_COMMENTS_TOKEN:
         status = lite_json_key_string_scan_pump(
-            job->decoded, job->decoded_length, job->fact_scan_limit,
-            "token", &job->fact_scan_offset, job->continuation_token,
-            sizeof(job->continuation_token));
+            decoded, decoded_length, scan->limit,
+            "token", &scan->offset, scan->token, sizeof(scan->token));
         if (status == YOUTUBE_LITE_SCAN_FOUND) {
-            job->phase = YOUTUBE_LITE_JOB_PREPARE;
+            scan->phase = YOUTUBE_LITE_JOB_PREPARE;
         }
         break;
     default:
         return false;
     }
     if (status == YOUTUBE_LITE_SCAN_EXHAUSTED)
-        job->phase = YOUTUBE_LITE_JOB_PREPARE;
+        scan->phase = YOUTUBE_LITE_JOB_PREPARE;
     return true;
 }
 
@@ -3285,6 +3327,84 @@ static void lite_document_cache_store(YoutubeLiteLoadJob *job)
     }
 }
 
+static bool lite_watch_facts_get(YoutubeLiteLoadJob *job)
+{
+    if (job->route != YOUTUBE_LITE_ROUTE_WATCH
+        || (!lite_description_view_requested(job->url)
+            && !lite_comments_view_requested(job->url))) return false;
+    BrowserSiteAdapterDocumentCacheView cached = {0};
+    TilefinchRequestContext authority =
+        lite_primary_context(job->url, job->fetch_url);
+    if (!browser_session_site_adapter_document_cache_get(
+            job->session, YOUTUBE_LITE_WATCH_CACHE_ADAPTER, job->fetch_url,
+            0, &authority, tilefinch_platform_monotonic_time_ns(),
+            YOUTUBE_LITE_DOCUMENT_CACHE_MAX_AGE_NS, &cached)
+        || cached.length != sizeof(YoutubeLiteWatchFacts)
+        || cached.source_bytes > job->maximum_source_bytes) return false;
+    const YoutubeLiteWatchFacts *facts = (const void *) cached.data;
+    if (facts->video_count > 6u
+        || strcmp(facts->language, job->language) != 0
+        || facts->date_format != tilefinch_platform_preferred_date_format()
+        || (job->supplemental_requested && !facts->comments_ready)) return false;
+    job->build = lite_build_work_create(job->budget, job->url, NULL, 0,
+        cached.source_bytes, NULL, 0, NULL, 0, job->compact_results, true,
+        job->error, sizeof(job->error));
+    if (job->build == NULL) {
+        job->error[0] = '\0';
+        return false;
+    }
+    job->build->watch = facts->watch;
+    if (!job->build->description_requested) {
+        memcpy(job->build->videos, facts->videos, sizeof(facts->videos));
+        job->build->video_count = facts->video_count;
+    }
+    job->identity = facts->identity;
+    job->identity_available = lite_identity_valid(&job->identity);
+    memcpy(job->comments_scan.token, facts->token, sizeof(facts->token));
+    job->primary_source_bytes = cached.source_bytes;
+    job->primary_status_code = cached.status_code;
+    snprintf(job->primary_server, sizeof(job->primary_server), "%s", cached.server);
+    snprintf(job->primary_cf_mitigated, sizeof(job->primary_cf_mitigated),
+             "%s", cached.cf_mitigated);
+    job->watch_facts_reused = true;
+    job->metrics.document_cache_hits++;
+    job->phase = job->supplemental_requested
+        ? YOUTUBE_LITE_JOB_PREPARE : YOUTUBE_LITE_JOB_BUILD;
+    lite_build_begin_emission(job->build);
+    return true;
+}
+
+static void lite_watch_facts_store(YoutubeLiteLoadJob *job)
+{
+    if (job->route != YOUTUBE_LITE_ROUTE_WATCH || job->watch_facts_reused
+        || job->build == NULL || job->build->description_requested
+        || !job->build->watch_details_found
+        || job->primary_status_code < 200 || job->primary_status_code >= 300
+        || job->primary_cf_mitigated[0] != '\0') return;
+    YoutubeLiteWatchFacts *facts = budget_calloc_category(
+        job->budget, BUDGET_CATEGORY_RESOURCE, 1, sizeof(*facts));
+    if (facts == NULL) return; /* Optional reuse must never prevent opening. */
+    facts->watch = job->build->watch;
+    facts->video_count = job->build->video_count > 6u
+        ? 6u : job->build->video_count;
+    memcpy(facts->videos, job->build->videos,
+           facts->video_count * sizeof(facts->videos[0]));
+    facts->identity = job->identity;
+    facts->date_format = tilefinch_platform_preferred_date_format();
+    facts->comments_ready = job->comments_scan.phase == YOUTUBE_LITE_JOB_PREPARE;
+    memcpy(facts->token, job->comments_scan.token, sizeof(facts->token));
+    memcpy(facts->language, job->language, sizeof(facts->language));
+    lite_apply_preference_cookies(job);
+    TilefinchRequestContext authority = lite_primary_context(job->url, job->fetch_url);
+    if (browser_session_site_adapter_document_cache_put(job->session,
+            YOUTUBE_LITE_WATCH_CACHE_ADAPTER, job->fetch_url, 0, &authority,
+            facts, sizeof(*facts), job->primary_source_bytes, facts->video_count,
+            job->primary_status_code, job->primary_server, job->primary_cf_mitigated,
+            tilefinch_platform_monotonic_time_ns()))
+        job->metrics.document_cache_stores++;
+    budget_free(job->budget, facts);
+}
+
 YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
     Budget *budget, BrowserSession *session, const char *url,
     bool compact_results, size_t maximum_source_bytes, long timeout_ms,
@@ -3337,6 +3457,8 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
          && lite_query_value(
              url, "tilefinch_token", search_token, sizeof(search_token)));
     if (lite_document_cache_get(job)) return job;
+    bool reused_watch = lite_watch_facts_get(job);
+    if (reused_watch && !job->supplemental_requested) return job;
     size_t reservation = maximum_source_bytes;
     if (reservation < YOUTUBE_LITE_MAXIMUM_COMMENTS_BYTES)
         reservation = YOUTUBE_LITE_MAXIMUM_COMMENTS_BYTES;
@@ -3357,6 +3479,12 @@ YoutubeLiteLoadJob *youtube_lite_load_begin_configured(
        hop's DNS/TLS/body production moves to the bounded transport worker. */
     (void) fetch_scheduler_enable_background_transport(
         job->scheduler, true);
+    if (reused_watch) {
+        /* Use the existing one-retry recovery if a cached continuation has
+           expired. A missing token still renders the ordinary empty state. */
+        job->direct_continuation = true;
+        return job;
+    }
     bool can_skip_primary =
         route == YOUTUBE_LITE_ROUTE_SEARCH && search_token[0] != '\0'
         && lite_identity_cache_get(session, &job->identity);
@@ -3452,7 +3580,7 @@ static bool lite_load_enqueue_supplemental(YoutubeLiteLoadJob *job)
     if (!lite_prepare_supplemental_request(
             job->session, job->url,
             job->identity_available ? &job->identity : NULL,
-            job->language, comments, job->continuation_token, prepared)) {
+            job->language, comments, job->comments_scan.token, prepared)) {
         budget_free(job->budget, prepared);
         return false;
     }
@@ -3493,6 +3621,9 @@ static bool lite_load_fallback_to_primary(YoutubeLiteLoadJob *job)
 {
     if (job == NULL || !job->direct_continuation
         || job->fallback_attempted) return false;
+    if (job->watch_facts_reused)
+        browser_session_site_adapter_document_cache_remove(job->session,
+            YOUTUBE_LITE_WATCH_CACHE_ADAPTER, job->fetch_url);
     if (job->supplemental != NULL) {
         fetch_result_destroy(job->supplemental);
         budget_free(job->budget, job->supplemental);
@@ -3505,12 +3636,13 @@ static bool lite_load_fallback_to_primary(YoutubeLiteLoadJob *job)
         job->session, YOUTUBE_LITE_IDENTITY_CACHE_KEY);
     job->fallback_attempted = true;
     job->direct_continuation = false;
+    job->watch_facts_reused = false;
     job->supplemental_fetched = false;
     job->identity_available = false;
     job->identity = (YoutubeLiteIdentity) {0};
     job->fact_scan_offset = 0;
     job->fact_scan_limit = 0;
-    job->continuation_token[0] = '\0';
+    job->comments_scan = (YoutubeLiteCommentsScan) {0};
     if (!lite_load_enqueue_primary(job)) {
         lite_load_job_fail(
             job, "YouTube continuation fallback request could not start");
@@ -3536,7 +3668,9 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
         job->metrics.build_slices++;
         bool advanced = identity_scan
             ? lite_load_identity_pump(job)
-            : lite_load_comments_scan_pump(job);
+            : lite_comments_scan_pump(job->decoded, job->decoded_length,
+                                      &job->comments_scan);
+        if (comments_scan) job->phase = job->comments_scan.phase;
         uint64_t finished_us = tilefinch_platform_monotonic_time_us();
         uint64_t elapsed_us = finished_us >= started_us
             ? finished_us - started_us : 0;
@@ -3555,6 +3689,15 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
     if (job->phase == YOUTUBE_LITE_JOB_BUILD) {
         uint64_t started_us = tilefinch_platform_monotonic_time_us();
         job->metrics.build_slices++;
+        /* Discover the small comments token alongside already-required build
+           steps, not by retaining the response or adding a second load later.
+           One bounded scan per pump; optional prefetch never delays emission. */
+        if (!job->watch_facts_reused && job->route == YOUTUBE_LITE_ROUTE_WATCH
+            && !job->supplemental_requested && job->decoded != NULL
+            && !lite_description_view_requested(job->url)
+            && job->comments_scan.phase != YOUTUBE_LITE_JOB_PREPARE)
+            (void) lite_comments_scan_pump(job->decoded, job->decoded_length,
+                                           &job->comments_scan);
         if (job->build == NULL) {
             job->build = lite_build_work_create(
                 job->budget, job->url,
@@ -3565,7 +3708,7 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
                 job->supplemental_fetched
                     ? job->supplemental->length : 0,
                 job->decoded, job->decoded_length,
-                job->compact_results,
+                job->compact_results, false,
                 job->error, sizeof(job->error));
         } else {
             lite_build_work_pump(job->build);
@@ -3603,6 +3746,7 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
                 metadata != NULL
                     ? metadata->cf_mitigated : job->primary_cf_mitigated);
             lite_document_cache_store(job);
+            lite_watch_facts_store(job);
             job->status = YOUTUBE_LITE_LOAD_SUCCEEDED;
         } else if (job->direct_continuation
                    && lite_load_fallback_to_primary(job)) {
@@ -3652,6 +3796,8 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
         if (supplemental_enqueued) {
             job->phase = YOUTUBE_LITE_JOB_SUPPLEMENTAL;
         } else {
+            if (job->watch_facts_reused && job->comments_scan.token[0] != '\0'
+                && lite_load_fallback_to_primary(job)) return job->status;
             if (job->supplemental_requested) {
                 fprintf(
                     stderr, "youtube-lite supplemental data unavailable: "
@@ -3754,6 +3900,11 @@ YoutubeLiteLoadStatus youtube_lite_load_pump(
         job->supplemental_url);
     if (job->identity_available)
         (void) lite_identity_cache_put(job->session, &job->identity);
+    if (job->watch_facts_reused) {
+        job->build->supplemental = job->supplemental->data;
+        job->build->supplemental_length = job->supplemental->length;
+        lite_build_after_watch(job->build);
+    }
     job->phase = YOUTUBE_LITE_JOB_BUILD;
     lite_load_release_unused_primary(job);
     return YOUTUBE_LITE_LOAD_PENDING;

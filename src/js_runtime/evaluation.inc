@@ -812,9 +812,14 @@ bool js_rt_evaluate_source_type_at(JSContext *context, const char *source,
                 runtime, name, SCRIPT_MODULE_MAP_LOADING)) return false;
     }
     bool admitted = false;
+    uint64_t compile_started_us = tilefinch_platform_monotonic_time_us();
     JSValue value = js_rt_compile_source_type(
         context, source, length, name, evaluation_type, source_kind,
         result, &admitted);
+    if (result != NULL && (unsigned) source_kind < 6u) {
+        result->compile_us[source_kind] +=
+            tilefinch_platform_monotonic_time_us() - compile_started_us;
+    }
     if (!admitted) {
         if (module) {
             (void) js_rt_runtime_module_root_state_set(
@@ -842,7 +847,12 @@ bool js_rt_evaluate_source_type_at(JSContext *context, const char *source,
     }
     BudgetAllocationOwner previous_owner =
         bridge_document_owner_enter(bridge);
+    uint64_t execute_started_us = tilefinch_platform_monotonic_time_us();
     if (!JS_IsException(value)) value = JS_EvalFunction(context, value);
+    if (result != NULL && (unsigned) source_kind < 6u) {
+        result->execute_us[source_kind] +=
+            tilefinch_platform_monotonic_time_us() - execute_started_us;
+    }
     bridge_document_owner_leave(bridge, previous_owner);
     if (JS_IsException(value)) {
         JS_FreeValue(context, value);

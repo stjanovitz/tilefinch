@@ -152,6 +152,11 @@ typedef struct {
     size_t dynamic_scripts_nomodule_skipped;
     size_t dynamic_script_bytes;
     size_t dynamic_scripts_quota_rejected;
+    /* Compile (parse to bytecode, or bytecode restore) and top-level
+       execution time by source kind, so a page whose scripts dominate
+       its runtime can be read as compile-bound or execution-bound. */
+    uint64_t compile_us[6];
+    uint64_t execute_us[6];
     size_t indexed_db_opens;
     size_t indexed_db_deletes;
     size_t indexed_db_transactions;
@@ -534,6 +539,11 @@ typedef struct {
     /* First child-list record was an insertion from a detached tree. Only
        valid within this journal; never inferred from the final DOM alone. */
     bool inserted_from_detached;
+    /* For a removal or move: the connected parent the child left, captured
+       while live, so layout can scope the structural change after the child
+       has been detached (its own parent pointer is gone) or destroyed (the
+       record's node is then NULL). Cleared when that parent is destroyed. */
+    lxb_dom_node_t *scope;
 } ScriptMutationRecord;
 
 typedef struct {
@@ -1373,6 +1383,15 @@ void script_runtime_set_stylesheet(ScriptRuntime *runtime,
                                    const Stylesheet *stylesheet);
 void script_runtime_set_synchronous_layout_callback(
     ScriptRuntime *runtime, ScriptSynchronousLayoutCallback callback,
+    void *opaque);
+/* Called with a detached subtree root immediately before the runtime frees
+   it, while every node in it is still valid. A layout reuse cache that keys
+   entries by node pointer evicts the subtree here, which lets removals and
+   innerHTML replacements invalidate their scope instead of resetting. */
+typedef void (*ScriptNodeRetirementCallback)(void *opaque,
+                                             const lxb_dom_node_t *root);
+void script_runtime_set_node_retirement_callback(
+    ScriptRuntime *runtime, ScriptNodeRetirementCallback callback,
     void *opaque);
 /* Updates the host-backed page viewport without compiling source or walking
    element scroll containers.  A changed position queues one coalesced window

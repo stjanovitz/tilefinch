@@ -254,7 +254,7 @@ loading or playing, the user has been idle for the house autohide interval,
 and Wi-Fi is already connected — the check never initiates a network join
 of its own. It contacts only the fixed release-metadata URL
 (`tilefinch-update-v1.tfum`); the package is never downloaded in the
-background. Completed checks are at least 3.5 days apart (at most twice a
+background. Completed checks are at least seven days apart (at most once a
 week), timed by the persisted profile record; a check that fails, is
 cancelled, or cannot run does not advance that cadence and produces no UI.
 A stored last-check time in the future (a wrong RTC) resets the cadence

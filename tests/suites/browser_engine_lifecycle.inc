@@ -1109,8 +1109,13 @@ static int profile_replay_rasters(BrowserEngine *engine)
     return 0;
 }
 
+typedef enum {
+    PROFILE_REPLAY_SYNC, PROFILE_REPLAY_SCRIPTED,
+    PROFILE_REPLAY_NATIVE, PROFILE_REPLAY_NATIVE_STRICT
+} ProfileReplayMode;
+
 static int profile_staged_font_replay(const char *trace, const char *url,
-                                     uint64_t interrupt_delay_us, bool incremental,
+                                     uint64_t interrupt_delay_us, ProfileReplayMode incremental,
                                      const char *search_query, unsigned settle_runtime)
 {
     BrowserDeviceProfile profile;
@@ -1143,6 +1148,18 @@ static int profile_staged_font_replay(const char *trace, const char *url,
         config.resources.maximum_decoded_image_bytes = 3u * MIB;
         config.resources.timeout_ms = 15000;
     }
+    bool native = incremental == PROFILE_REPLAY_NATIVE
+        || incremental == PROFILE_REPLAY_NATIVE_STRICT;
+    if (native) {
+        config.memory_limit = (incremental == PROFILE_REPLAY_NATIVE_STRICT ? 16u : 24u) * MIB;
+        config.javascript.enabled = false;
+        config.javascript.document_scripts_enabled = false;
+        config.history_capacity = 4;
+        config.session_cache_limit = 640u * 1024u;
+        config.resources.maximum_images = 24;
+        config.resources.maximum_image_bytes = 1536u * 1024u;
+        config.resources.maximum_decoded_image_bytes = 3u * MIB;
+    }
     CHECK(browser_config_set_font_paths(&config,
         TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSans-Latin.ttf",
         TILEFINCH_TEST_SOURCE_DIR "/fonts/DejaVuSerif-Latin.ttf",
@@ -1157,6 +1174,7 @@ static int profile_staged_font_replay(const char *trace, const char *url,
     CHECK(fetch_trace_replay_begin_response_keyed(trace, error, sizeof(error)));
     BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
     CHECK(engine != NULL && browser_engine_prepare_navigation_fonts(engine, "GET", url));
+    uint64_t load_started = tilefinch_platform_monotonic_time_us(), first_preview_us = 0;
     if (incremental) {
         FontPublicationTiming load_timing = {
             .last_us = tilefinch_platform_monotonic_time_us()
@@ -1165,8 +1183,20 @@ static int profile_staged_font_replay(const char *trace, const char *url,
             .context = &load_timing, .cooperate = font_publication_timing
         };
         tilefinch_platform_set_services(&load_services);
-        uint64_t load_started = load_timing.last_us, maximum_pump_us = 0;
+        load_started = load_timing.last_us;
+        uint64_t maximum_pump_us = 0;
         CHECK(browser_engine_begin_navigation_url(engine, url, 2u * MIB, 20000, true));
+        (void) font_publication_timing(&load_timing, "navigation-begin-return", 0);
+        if (native) {
+            /* Replay opening verifies the captured body and may initialize
+               host curl/proxy services. Report it, but do not confuse that
+               host-only cost with an uninterrupted parser/layout slice. */
+            printf("navigation-request request-begin-us=%llu\n",
+                (unsigned long long) (load_timing.last_us - load_started));
+            load_timing.maximum_gap_us = 0;
+            load_timing.maximum_gap_phase[0] = '\0';
+            load_timing.maximum_gap_from[0] = '\0';
+        }
         BrowserNavigationJobQuota quota = { .load = {
             .fetch = { .maximum_body_bytes = 16u * 1024u,
                 .maximum_body_callbacks = 1, .maximum_time_us = 2000 },
@@ -1179,6 +1209,9 @@ static int profile_staged_font_replay(const char *trace, const char *url,
             uint64_t pump_us = tilefinch_platform_monotonic_time_us() - pump_started;
             if (pump_us > maximum_pump_us) maximum_pump_us = pump_us;
             (void) font_publication_timing(&load_timing, "navigation-pump-return", 0);
+            BrowserProvisionalViewport preview = {0};
+            if (!first_preview_us && browser_engine_provisional_viewport(engine, &preview))
+                first_preview_us = tilefinch_platform_monotonic_time_us() - load_started;
         }
         tilefinch_platform_set_services(NULL);
         printf("navigation-responsiveness elapsed-us=%llu max-pump-us=%llu "
@@ -1192,8 +1225,45 @@ static int profile_staged_font_replay(const char *trace, const char *url,
     } else CHECK(browser_engine_load_url(engine, url, true));
     if (interrupt_delay_us != 0) CHECK(browser_engine_focus_move(engine, true));
     CHECK(browser_engine_render_frame(engine, NULL));
+    if (native) printf("navigation-preview available=%u first-preview-us=%llu first-frame-us=%llu\n",
+        first_preview_us != 0, (unsigned long long) first_preview_us,
+        (unsigned long long) (tilefinch_platform_monotonic_time_us() - load_started));
     if (interrupt_delay_us != 0) CHECK(paint_host_focus(engine));
     const NavigationSession *navigation = browser_engine_navigation(engine);
+    if (native) {
+        FontPublicationTiming idle = { .last_us = tilefinch_platform_monotonic_time_us() };
+        TilefinchPlatformServices services = { .context = &idle, .cooperate = font_publication_timing };
+        uint64_t maximum_idle = 0;
+        for (unsigned tick = 0; tick < 128; tick++) {
+            bool changed = false;
+            idle.last_us = tilefinch_platform_monotonic_time_us();
+            uint64_t start = idle.last_us;
+            tilefinch_platform_set_services(&services);
+            (void) browser_engine_run_idle_work(engine, &changed);
+            (void) font_publication_timing(&idle, "idle-return", 0);
+            tilefinch_platform_set_services(NULL);
+            uint64_t elapsed = tilefinch_platform_monotonic_time_us() - start;
+            if (elapsed > maximum_idle) maximum_idle = elapsed;
+            CHECK(navigation->page.loaded && browser_engine_last_error(engine)[0] == '\0');
+            if (changed) CHECK(browser_engine_render_frame(engine, NULL));
+        }
+        BrowserEngineMetrics metrics = {0};
+        /* Include the top/middle/bottom renders in the peak, rather than
+           reporting an artificially low pre-raster memory watermark. */
+        CHECK(profile_replay_rasters(engine) == 0
+            && browser_engine_metrics(engine, &metrics));
+        printf("navigation-native limit-bytes=%zu peak-bytes=%zu retained-bytes=%zu "
+            "max-idle-us=%llu max-gap-us=%llu gap-ending-at=%s gap-starting-at=%s\n",
+            config.memory_limit, metrics.budget_peak, metrics.budget_current,
+            (unsigned long long) maximum_idle, (unsigned long long) idle.maximum_gap_us,
+            idle.maximum_gap_phase, idle.maximum_gap_from);
+        CHECK(browser_engine_shutdown(engine)
+            && browser_engine_metrics(engine, &metrics)
+            && metrics.budget_current == 0 && metrics.budget_active_allocations == 0);
+        browser_engine_destroy(engine);
+        fetch_trace_end();
+        return 0;
+    }
     if (settle_runtime) {
         size_t initial_loaded = navigation->page.images.stats.loaded;
         size_t initial_deferred = navigation->page.deferred_image_count;

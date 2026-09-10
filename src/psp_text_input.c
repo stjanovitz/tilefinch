@@ -348,6 +348,7 @@ static bool open_danzeff_keyboard(
     do {
         if (text_input_cancel_requested(service)) goto cancelled;
         psp_log_heartbeat();
+        psp_log_set_stage("text-entry");
         sceDisplayWaitVblankStart();
         if (text_input_poll(service, &pad) <= 0)
             memset(&pad, 0, sizeof(pad));
@@ -362,6 +363,7 @@ static bool open_danzeff_keyboard(
     for (;;) {
         if (text_input_cancel_requested(service)) goto cancelled;
         psp_log_heartbeat();
+        psp_log_set_stage("text-entry");
         sceDisplayWaitVblankStart();
         if (text_input_poll(service, &pad) <= 0) continue;
         unsigned pressed = pad.Buttons & ~previous_buttons;

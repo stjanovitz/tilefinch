@@ -586,6 +586,18 @@ static size_t bridge_discard_unretained_detached_subtree(
     unsigned char mutation_slots[
         (SCRIPT_MUTATION_JOURNAL_LIMIT + 7u) / 8u] = {0};
     bool mutations_retired = false;
+    unsigned char scope_slots[
+        (SCRIPT_MUTATION_JOURNAL_LIMIT + 7u) / 8u] = {0};
+    for (size_t i = 0; i < mutation_count; i++) {
+        lxb_dom_node_t *scope = bridge->mutations.records[i].scope;
+        if (scope == NULL) continue;
+        BridgeSubtreeSearchResult result =
+            bridge_live_subtree_contains_node(root, scope, 0);
+        if (result == BRIDGE_SUBTREE_INDETERMINATE) return 0;
+        if (result == BRIDGE_SUBTREE_FOUND) {
+            scope_slots[i / 8u] |= (unsigned char) (1u << (i % 8u));
+        }
+    }
     for (size_t i = 0; i < mutation_count; i++) {
         lxb_dom_node_t *target = bridge->mutations.records[i].node;
         if (target == NULL) continue;
@@ -627,6 +639,11 @@ static size_t bridge_discard_unretained_detached_subtree(
        reset plus a full-document resource scan; since assigning to
        textContent discards one detached child at a time, every such
        assignment paid for both. */
+    for (size_t i = 0; i < mutation_count; i++) {
+        if ((scope_slots[i / 8u]
+             & (unsigned char) (1u << (i % 8u))) == 0) continue;
+        bridge->mutations.records[i].scope = NULL;
+    }
     if (mutations_retired) {
         for (size_t i = 0; i < mutation_count; i++) {
             if ((mutation_slots[i / 8u]
@@ -634,7 +651,13 @@ static size_t bridge_discard_unretained_detached_subtree(
             bridge->mutations.records[i].node = NULL;
         }
         bridge->mutations.conservative_resource_scan = true;
-        bridge->mutations.overflowed = true;
+        /* Without a retirement listener the host cannot know which cached
+           node pointers die here; with one, the retired records are simply
+           skipped and the surviving removal scopes carry the structural
+           change. */
+        if (bridge->node_retirement == NULL) {
+            bridge->mutations.overflowed = true;
+        }
     }
     js_rt_script_element_states_purge_marked(bridge, script_states);
     size_t released = 0;
@@ -654,6 +677,9 @@ static size_t bridge_discard_unretained_detached_subtree(
             (void) bridge_invalidate_node_slot_impl(bridge, i, false);
             released++;
         }
+    }
+    if (bridge->node_retirement != NULL) {
+        bridge->node_retirement(bridge->node_retirement_opaque, root);
     }
     lxb_dom_node_destroy_deep(root);
     /* Cleanup callbacks are JavaScript. Run them only after native teardown
@@ -1454,6 +1480,7 @@ static void bridge_mutation_journal_append(
     record->kind = kind;
     record->node = node;
     record->inserted_from_detached = false;
+    record->scope = NULL;
     record->owner_document_identity = js_rt_node_owner_identity(node);
     size_t copy_length = attribute == NULL ? 0 : attribute_length;
     if (copy_length >= sizeof(record->attribute)) {
@@ -5220,6 +5247,22 @@ static ScriptMutationKind bridge_child_mutation_kind(
     return SCRIPT_MUTATION_CHILD_LIST;
 }
 
+/* Record the connected parent a removed or moved child left, on the most
+   recent record for (kind, node) whether it was new or coalesced. */
+static void bridge_mutation_note_scope(
+    DomBridge *bridge, ScriptMutationKind kind, const lxb_dom_node_t *node,
+    lxb_dom_node_t *scope)
+{
+    if (scope == NULL || scope->type == LXB_DOM_NODE_TYPE_DOCUMENT) return;
+    ScriptMutationJournal *journal = &bridge->mutations;
+    for (size_t reverse = journal->count; reverse != 0; reverse--) {
+        ScriptMutationRecord *record = &journal->records[reverse - 1];
+        if (record->kind != kind || record->node != node) continue;
+        if (record->scope == NULL) record->scope = scope;
+        return;
+    }
+}
+
 static void bridge_child_inserted(
     DomBridge *bridge, ScriptMutationKind kind, lxb_dom_node_t *node,
     bool was_detached, lxb_dom_node_t *old_parent)
@@ -5238,6 +5281,7 @@ static void bridge_child_inserted(
         && bridge->mutations.count > before) {
         bridge->mutations.records[before].inserted_from_detached = was_detached;
     }
+    if (!was_detached) bridge_mutation_note_scope(bridge, kind, node, old_parent);
 }
 
 JSValue js_dom_append(JSContext *context, JSValueConst this_value,
@@ -5375,8 +5419,10 @@ JSValue js_dom_remove(JSContext *context, JSValueConst this_value,
        deliberately ignores detached construction trees. */
     BridgeMutationResourceFlags removed_resources =
         bridge_mutation_resource_subtree(node);
-    bridge_mutated(bridge, bridge_child_mutation_kind(bridge, node->parent, node),
-                   node, NULL, 0);
+    ScriptMutationKind removal_kind =
+        bridge_child_mutation_kind(bridge, node->parent, node);
+    bridge_mutated(bridge, removal_kind, node, NULL, 0);
+    bridge_mutation_note_scope(bridge, removal_kind, node, node->parent);
     if ((removed_resources & (BRIDGE_MUTATION_RESOURCE_IMAGE
                               | BRIDGE_MUTATION_RESOURCE_STYLESHEET)) != 0) {
         bridge->mutations.resource_rebuild_required = true;

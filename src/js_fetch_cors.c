@@ -15,6 +15,10 @@
 #include <strings.h>
 #include <ctype.h>
 
+/* Connect budget for optional dynamic script requests (see the request
+   literal in the dynamic task fetch). */
+#define JS_DYNAMIC_SCRIPT_CONNECT_TIMEOUT_MS 8000L
+
 static void copy_response_header_value(const FetchResult *fetched,
                                        const char *wanted, char *output,
                                        size_t capacity)
@@ -2419,6 +2423,12 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
     FetchRequest request = {
         .method = "GET", .allow_http_errors = true,
         .send_low_client_hints = true, .accept = "*/*",
+        /* A dynamic script is optional page work. The transport worker
+           performs a connection's DNS/TCP/TLS setup synchronously, so an
+           unreachable script host otherwise holds the worker for half the
+           request deadline (18-21 s on the reference article) and every
+           other transfer with it. */
+        .connect_timeout_ms = JS_DYNAMIC_SCRIPT_CONNECT_TIMEOUT_MS,
         .if_none_match = cached == NULL ? NULL : cached->etag,
         .if_modified_since = cached == NULL ? NULL : cached->last_modified,
         .cors_cached_response_validated = task->module && cached != NULL
@@ -2442,6 +2452,13 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
         const FetchRequest *authorized = script_request_policy_apply(
             &policy, bridge->session, &request, &prepared);
         if (authorized != NULL) request = *authorized;
+        /* The policy copy carries no connect budget; restore the optional
+           script bound on the request that is actually enqueued. */
+        if (request.connect_timeout_ms <= 0
+            || request.connect_timeout_ms
+                   > JS_DYNAMIC_SCRIPT_CONNECT_TIMEOUT_MS) {
+            request.connect_timeout_ms = JS_DYNAMIC_SCRIPT_CONNECT_TIMEOUT_MS;
+        }
         FetchRequestValidationError validation =
             FETCH_REQUEST_VALIDATION_OK;
         valid = authorized != NULL
@@ -2693,10 +2710,12 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
         char diagnostic[512];
         snprintf(diagnostic, sizeof(diagnostic),
             "tilefinch-dynamic-fetch-failure: sequence=%llu transport=%d "
-            "status=%ld grant=%d bytes=%zu heap-remaining=%zu error=\"%.240s\"",
+            "status=%ld grant=%d bytes=%zu heap-remaining=%zu error=\"%.160s\" "
+            "url=%.160s",
             (unsigned long long) task->sequence, transport_success,
             fetched->status_code, resource_grant_valid, fetched->length,
-            script_runtime_heap_remaining(runtime), fetched->error);
+            script_runtime_heap_remaining(runtime), fetched->error,
+            task->request_url == NULL ? "" : task->request_url);
         tilefinch_platform_log_message(diagnostic);
     }
 #endif

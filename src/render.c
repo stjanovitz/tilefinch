@@ -441,11 +441,11 @@ static void paint_overflow_commands(TileCache *cache, uint16_t *frame,
             cache->layout->overflow_orders, 0,
             cache->layout->overflow_order_count};
     }
-    if (cache->layout->late_positioned_order_count != 0) {
-        cursors[cursor_count++] = (PaintOrderCursor) {
-            cache->layout->late_positioned_orders, 0,
-            cache->layout->late_positioned_order_count};
-    }
+    /* Late-positioned commands are indexed before they are hoisted into
+       the overlay pass. Unlike vertically scrolled overflow, their y/ink
+       bounds do not move: the bands/global cursor already include every
+       visible command in paint order. Re-merging the full late list makes
+       a viewport repaint linear in an arbitrarily large offscreen context. */
     while (true) {
         uint32_t next = UINT32_MAX;
         for (size_t cursor = 0; cursor < cursor_count; cursor++) {

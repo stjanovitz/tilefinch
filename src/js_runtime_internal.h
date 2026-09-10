@@ -359,6 +359,8 @@ typedef struct DomBridge {
     ImageResources *images;
     ScriptSynchronousLayoutCallback synchronous_layout;
     void *synchronous_layout_opaque;
+    ScriptNodeRetirementCallback node_retirement;
+    void *node_retirement_opaque;
     ElementScrollIntent scroll_intents[DOM_SCROLL_INTENT_LIMIT];
     size_t scroll_intent_count;
     uint32_t scroll_intent_sequence;

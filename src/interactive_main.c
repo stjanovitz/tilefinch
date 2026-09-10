@@ -301,6 +301,7 @@ int main(int argc, char **argv)
     bool script_file_explicit = false, script_count_explicit = false;
     size_t reloads = 0;
     bool fetch_scripts = false, activate = false, follow_action = false;
+    bool no_javascript = false;
     bool trace_frames = false, trace_page = false;
     bool probe_usability = false;
     bool diagnostic_frame_safari = false;
@@ -319,6 +320,7 @@ int main(int argc, char **argv)
     size_t experimental_section = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--fetch-scripts") == 0) fetch_scripts = true;
+        else if (strcmp(argv[i], "--no-javascript") == 0) no_javascript = true;
         else if (strcmp(argv[i], "--pace-real-time") == 0) {
             pace_real_time = true;
         }
@@ -695,9 +697,9 @@ int main(int argc, char **argv)
         engine_config->declared_css_height = viewport_css_height;
     }
     engine_config->tile_capacity = tile_capacity;
-    engine_config->javascript.enabled = true;
+    engine_config->javascript.enabled = !no_javascript;
     engine_config->javascript.document_scripts_enabled =
-        fetch_scripts && url != NULL;
+        !no_javascript && fetch_scripts && url != NULL;
     engine_config->javascript.heap_limit = script_heap_mb * MIB;
     engine_config->javascript.runtime_timeout_ms =
         (unsigned) script_timeout_ms;
@@ -2614,11 +2616,15 @@ int main(int argc, char **argv)
            navigation.performance.semantic_relayout_skips,
            navigation.performance.focus_outline_relayout_skips,
            navigation.performance.focus_paint_relayout_skips);
+    LayoutReuseStats reuse_stats = {0};
+    if (navigation.page.layout_reuse != NULL) {
+        layout_reuse_cache_stats(navigation.page.layout_reuse, &reuse_stats);
+    }
     printf("layout-reuse retained=%zu style-hits=%zu style-misses=%zu "
            "intrinsic-hits=%zu intrinsic-misses=%zu "
            "table-row-hits=%zu table-row-misses=%zu scoped-invalidations=%zu "
            "full-resets=%zu pressure-evictions=%zu matched=%zu/%zu/%zu "
-           "token=%zu/%zu/%zu style-appends=%zu/%zu\n",
+           "token=%zu/%zu/%zu style-appends=%zu/%zu retired=%zu\n",
            navigation.performance.layout_reuse_retained_bytes,
            navigation.performance.layout_reuse_style_hits,
            navigation.performance.layout_reuse_style_misses,
@@ -2636,7 +2642,8 @@ int main(int argc, char **argv)
            navigation.performance.layout_reuse_matched_token_fallbacks,
            navigation.performance.layout_reuse_matched_token_dropped,
            navigation.performance.mutation_style_appends,
-           navigation.performance.mutation_style_append_fallbacks);
+           navigation.performance.mutation_style_append_fallbacks,
+           reuse_stats.retired_subtrees);
     printf("progressive-paint attempts=%zu skips=%zu failures=%zu "
            "adoptions=%zu "
            "layouts=%zu paints=%zu layout-us=%llu paint-us=%llu "
@@ -2818,6 +2825,16 @@ int main(int argc, char **argv)
            navigation.page.script_result.dynamic_scripts_peak_pending,
            navigation.page.script_result.dynamic_scripts_nomodule_skipped,
            navigation.page.script_result.dynamic_script_bytes);
+    printf("javascript-compile-execute inline=%llu/%llu external=%llu/%llu "
+           "module=%llu/%llu internal=%llu/%llu us\n",
+           (unsigned long long) navigation.page.script_result.compile_us[1],
+           (unsigned long long) navigation.page.script_result.execute_us[1],
+           (unsigned long long) navigation.page.script_result.compile_us[2],
+           (unsigned long long) navigation.page.script_result.execute_us[2],
+           (unsigned long long) navigation.page.script_result.compile_us[3],
+           (unsigned long long) navigation.page.script_result.execute_us[3],
+           (unsigned long long) navigation.page.script_result.compile_us[0],
+           (unsigned long long) navigation.page.script_result.execute_us[0]);
     printf("javascript-network-logical admitted=%zu completed=%zu "
            "rejected=%zu cancelled=%zu timed-out=%zu peak=%zu "
            "peak-bytes=%zu active-native=%zu pending-logical=%zu\n",

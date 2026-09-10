@@ -2,6 +2,7 @@
 
 #include "tilefinch/fetch.h"
 #include "tilefinch/media_discovery.h"
+#include "tilefinch/platform.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -1360,7 +1361,7 @@ static bool current_focus_region(const BrowserController *controller,
     return false;
 }
 
-static void controller_refresh_authored_focus_outline(
+static void controller_refresh_authored_focus_outline_impl(
     BrowserController *controller, lxb_dom_node_t *node)
 {
     if (controller == NULL || controller->navigation == NULL) return;
@@ -1397,18 +1398,24 @@ static void controller_refresh_authored_focus_outline(
         if (count == sizeof(ancestors) / sizeof(ancestors[0])) return;
         ancestors[count++] = at;
     }
-    ComputedStyle parent = {0};
-    bool has_parent = false;
+    /* Match layout's inheritance seed and canonical ancestor styles. Rewalking
+       body :has() selectors on every d-pad press can dominate input dispatch.
+       The existing cache owns mutation/font/stylesheet invalidation; never
+       retain a second controller-side DOM/style cache. The focused node itself
+       is still resolved afresh below on both sides of its temporary marker. */
+    ComputedStyle parent = layout_initial_root_style();
+    const Stylesheet *sheet = &controller->navigation->page.stylesheet;
     while (count != 0) {
-        parent = style_for_node(
-            &controller->navigation->page.stylesheet,
-            ancestors[--count], has_parent ? &parent : NULL);
-        has_parent = true;
+        ComputedStyle next;
+        (void) layout_reuse_cache_resolve_style(
+            controller->navigation->page.layout_reuse, sheet,
+            controller->navigation->fonts, ancestors[--count], &parent, &next);
+        parent = next;
     }
     ComputedStyle normal = {0}, focused = {0};
     if (!style_focus_change_is_outline_only(
             &controller->navigation->page.stylesheet, node,
-            has_parent ? &parent : NULL, &normal, &focused)) return;
+            &parent, &normal, &focused)) return;
     unsigned width = computed_style_outline_width(&focused);
     unsigned line_style = computed_style_outline_style(&focused);
     if (width == 0 || width > UINT8_MAX
@@ -1425,6 +1432,23 @@ static void controller_refresh_authored_focus_outline(
     };
     controller->has_authored_focus_outline =
         controller->authored_focus_outline.alpha != 0;
+}
+
+static void controller_refresh_authored_focus_outline(
+    BrowserController *controller, lxb_dom_node_t *node)
+{
+#ifndef TILEFINCH_NO_TRACE
+    uint64_t started = tilefinch_platform_monotonic_time_us();
+#endif
+    controller_refresh_authored_focus_outline_impl(controller, node);
+#ifndef TILEFINCH_NO_TRACE
+    uint64_t finished = tilefinch_platform_monotonic_time_us();
+    if (controller != NULL && finished >= started) {
+        uint64_t elapsed = finished - started;
+        controller->focus_outline_us = elapsed > UINT64_MAX - controller->focus_outline_us
+            ? UINT64_MAX : controller->focus_outline_us + elapsed;
+    }
+#endif
 }
 
 static bool synchronize_dom_focus(BrowserController *controller,
@@ -2071,11 +2095,26 @@ typedef enum {
     CONTROLLER_NATIVE_DEFAULT_FAILED
 } ControllerNativeDefaultResult;
 
+static bool controller_native_default_refresh_changed(
+    BrowserController *controller, lxb_dom_node_t *changed)
+{
+    if (controller == NULL
+        || !document_refresh(&controller->navigation->page.document)) return false;
+    /* Native control defaults mutate attributes without a script journal.
+       An empty journal is not evidence that cached styles remain valid:
+       details/open also changes the UA display of every non-summary child,
+       and author selectors can observe checked/selected/value changes. */
+    if (changed != NULL) {
+        layout_reuse_cache_invalidate_node(
+            controller->navigation->page.layout_reuse, changed, false);
+        layout_reuse_cache_flush_invalidations(controller->navigation->page.layout_reuse);
+    } else layout_reuse_cache_reset(controller->navigation->page.layout_reuse);
+    return navigation_relayout(controller->navigation);
+}
+
 static bool controller_native_default_refresh(BrowserController *controller)
 {
-    return controller != NULL
-        && document_refresh(&controller->navigation->page.document)
-        && navigation_relayout(controller->navigation);
+    return controller_native_default_refresh_changed(controller, NULL);
 }
 
 static lxb_dom_node_t *controller_next_node(lxb_dom_node_t *node,
@@ -2756,12 +2795,12 @@ static ControllerNativeDefaultResult controller_native_default(
                 ? controller_attribute_remove(node->parent, "open")
                 : controller_attribute_set(node->parent, "open", "");
             if (!changed) return CONTROLLER_NATIVE_DEFAULT_FAILED;
-            if (controller_native_default_refresh(controller))
+            if (controller_native_default_refresh_changed(controller, node->parent))
                 return CONTROLLER_NATIVE_DEFAULT_CHANGED;
             (void) (open
                 ? controller_attribute_set(node->parent, "open", "")
                 : controller_attribute_remove(node->parent, "open"));
-            (void) controller_native_default_refresh(controller);
+            (void) controller_native_default_refresh_changed(controller, node->parent);
             return CONTROLLER_NATIVE_DEFAULT_FAILED;
         }
     } else if (node_name_is(node, "label")) {

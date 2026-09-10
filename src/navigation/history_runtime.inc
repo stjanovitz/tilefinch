@@ -538,6 +538,29 @@ static bool navigation_head_scripts_are_nonvisual(const NavigationPage *page)
     return style.display == DISPLAY_NONE;
 }
 
+static void navigation_retire_subtree(void *opaque,
+                                      const lxb_dom_node_t *root)
+{
+    NavigationSession *session = opaque;
+    if (session == NULL || session->page.layout_reuse == NULL) return;
+    layout_reuse_cache_retire_subtree(session->page.layout_reuse, root);
+}
+
+/* Idempotent: the page runtime reports every freed subtree to the page
+   cache from the first journal consumption on; earlier frees stayed
+   conservative through the journal's overflow signal. */
+static void navigation_bind_node_retirement(NavigationSession *session)
+{
+    if (session == NULL || session->page.runtime == NULL
+        || session->page.layout_reuse == NULL) return;
+#ifndef TILEFINCH_NO_TRACE
+    if (getenv("TILEFINCH_DISABLE_NODE_RETIREMENT") != NULL) return;
+#endif
+    script_runtime_set_node_retirement_callback(
+        session->page.runtime, navigation_retire_subtree, session);
+    layout_reuse_cache_enable_node_retirement(session->page.layout_reuse);
+}
+
 static bool navigation_mutation_is_transient(
     const ScriptMutationJournal *mutations, size_t index)
 {
@@ -941,8 +964,9 @@ static bool navigation_try_append_inserted_styles(
             session->performance.mutation_style_append_fallbacks++;
             return false;
         }
-        bool step_valid = step.remap != NULL && !step.appended_bounded_out
-                          && !step.context_changed;
+        /* A parse-context move changes declaration values, which the note
+           below already discards; the exact selector answers survive it. */
+        bool step_valid = step.remap != NULL && !step.appended_bounded_out;
         layout_reuse_cache_note_stylesheet_appended(
             session->page.layout_reuse, sheet, step.remap, step.old_count,
             step.appended, step.appended_count, step_valid);
@@ -952,6 +976,7 @@ static bool navigation_try_append_inserted_styles(
         stylesheet_append_result_release(sheet, &step);
     }
     result.remap = NULL;
+    result.appended = NULL; /* released with the last step above */
     result.appended_count = appended_total;
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     {
@@ -982,6 +1007,8 @@ static void navigation_prepare_layout_reuse(
     bool full_rebuild)
 {
     if (session == NULL || session->page.layout_reuse == NULL) return;
+    navigation_bind_node_retirement(session);
+    bool retire = layout_reuse_cache_node_retirement(session->page.layout_reuse);
     LayoutReuseStats before = {0}, after = {0};
     layout_reuse_cache_stats(session->page.layout_reuse, &before);
     bool destructive = full_rebuild || mutations == NULL
@@ -1046,6 +1073,10 @@ static void navigation_prepare_layout_reuse(
             if (kind == SCRIPT_MUTATION_INNER_HTML
                 || kind == SCRIPT_MUTATION_CHILD_LIST
                 || kind == SCRIPT_MUTATION_UNKNOWN) {
+                /* With node retirement every freed subtree already left the
+                   cache, so these reduce to structural changes under their
+                   recorded scope. */
+                if (retire) continue;
                 destructive = true;
                 break;
             }
@@ -1057,14 +1088,27 @@ static void navigation_prepare_layout_reuse(
         for (size_t i = 0; i < mutations->count; i++) {
             const ScriptMutationRecord *record = &mutations->records[i];
             if (record->kind == SCRIPT_MUTATION_HEAD_SCRIPT
-                || record->kind == SCRIPT_MUTATION_CANVAS
-                || record->node == NULL) continue;
+                || record->kind == SCRIPT_MUTATION_CANVAS) continue;
+            /* The parent a removed or moved child left: its remaining
+               children's structural answers changed. */
+            if (record->scope != NULL) {
+                layout_reuse_cache_invalidate_structure(
+                    session->page.layout_reuse, record->scope);
+            }
+            if (record->node == NULL) continue;
             /* <style> content is not rendered; an appended sheet has already
                told the cache which lists the new rules can change. */
             if (navigation_style_owner(record->node) != NULL) continue;
-            if (record->kind == SCRIPT_MUTATION_CHILD_LIST) {
-                layout_reuse_cache_invalidate_node(
-                    session->page.layout_reuse, record->node, true);
+            if (record->kind == SCRIPT_MUTATION_CHILD_LIST
+                || record->kind == SCRIPT_MUTATION_INNER_HTML
+                || record->kind == SCRIPT_MUTATION_UNKNOWN) {
+                if (retire) {
+                    layout_reuse_cache_invalidate_structure(
+                        session->page.layout_reuse, record->node);
+                } else {
+                    layout_reuse_cache_invalidate_node(
+                        session->page.layout_reuse, record->node, true);
+                }
                 continue;
             }
             if (record->kind == SCRIPT_MUTATION_ATTRIBUTE

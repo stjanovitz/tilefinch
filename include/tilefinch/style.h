@@ -2117,14 +2117,16 @@ bool stylesheet_append_style_elements(
 /* stylesheet_append_style_elements plus the bookkeeping a retained layout
    needs to survive the append in place: `remap` translates every prior rule
    index to its index after the cascade re-sort (NULL when that could not be
-   established), `appended` lists the new rules' indices (bounded; a
-   bounded-out result means "unknown"), and `context_changed` reports a
-   parse-context signature move (variables, layers, fonts). */
-#define STYLESHEET_APPEND_RULE_LIMIT 64u
+   established), `appended` lists the new rules' indices (budget-owned,
+   released with the result; a bounded-out result means "unknown"), and
+   `context_changed` reports a parse-context signature move (variables,
+   layers, fonts): declaration values may differ from a clean rebuild, which
+   the retained computed styles already discard, but selector answers do not
+   depend on it. */
 typedef struct {
     uint16_t *remap;
     size_t old_count;
-    uint32_t appended[STYLESHEET_APPEND_RULE_LIMIT];
+    uint32_t *appended;
     size_t appended_count;
     bool appended_bounded_out;
     bool context_changed;

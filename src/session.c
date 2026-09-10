@@ -363,6 +363,19 @@ void browser_session_site_adapter_document_cache_clear(
     session->site_adapter_document_clock = 0;
 }
 
+void browser_session_site_adapter_document_cache_remove(
+    BrowserSession *session, const char *adapter, const char *key)
+{
+    if (session == NULL || session->budget == NULL || adapter == NULL || key == NULL)
+        return;
+    for (size_t i = 0; i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++) {
+        BrowserSiteAdapterDocumentCacheEntry *entry = &session->site_adapter_document_cache[i];
+        if (entry->valid && strcmp(entry->adapter, adapter) == 0
+            && strcmp(entry->key, key) == 0)
+            site_adapter_document_cache_remove(session, entry);
+    }
+}
+
 bool browser_session_site_adapter_document_cache_put(
     BrowserSession *session, const char *adapter, const char *key,
     uint32_t variant, const TilefinchRequestContext *authority_context,

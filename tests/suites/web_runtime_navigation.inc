@@ -1406,6 +1406,38 @@
               && late_init_text_color(&interactive.page.layout, "middle") == 0x555555
               && late_init_text_color(&interactive.page.layout, "first") == 0x444444
               && late_init_text_color(&interactive.page.layout, "late") == 0x222222);
+        /* A module-sized sheet (well past the old 64-rule tracking cap) that
+           also moves the parse context with a :root custom property keeps
+           the retained lists: only the elements its fast keys can select
+           lose theirs, and nothing matches .pad*. */
+        {
+            LayoutReuseStats before = {0}, after = {0};
+            layout_reuse_cache_stats(interactive.page.layout_reuse, &before);
+            CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+                      "const big=document.createElement('style');"
+                      "let css=':root{--late:1}';"
+                      "for(let i=0;i<120;i++)css+='.pad'+i+'{color:#0'+(i%10)+'0000}';"
+                      "big.appendChild(document.createTextNode(css));"
+                      "document.head.appendChild(big)", "<late-big-style>",
+                      &interactive.page.script_result)
+                  && script_runtime_consume_relayout(interactive.page.runtime)
+                  && navigation_relayout(&interactive));
+            layout_reuse_cache_stats(interactive.page.layout_reuse, &after);
+            CHECK(interactive.performance.mutation_resource_rebuilds == rebuilds
+                  && interactive.performance.mutation_style_appends == 2
+                  && interactive.performance.layout_reuse_full_resets == resets
+                  && after.stylesheet_appends == before.stylesheet_appends + 1
+                  && after.matched_misses - before.matched_misses <= 2
+                  && after.matched_hits > before.matched_hits + 200
+                  && late_init_text_color(&interactive.page.layout, "middle") == 0x555555
+                  && late_init_text_color(&interactive.page.layout, "late") == 0x222222);
+            if (after.matched_misses - before.matched_misses > 2) {
+                fprintf(stderr, "big-append matched hits=%zu/%zu misses=%zu/%zu "
+                        "appends=%zu\n", before.matched_hits, after.matched_hits,
+                        before.matched_misses, after.matched_misses,
+                        after.stylesheet_appends);
+            }
+        }
         /* A stylesheet link still rebuilds. */
         CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
                   "const l=document.createElement('link');l.rel='stylesheet';"
@@ -1414,7 +1446,7 @@
               && script_runtime_consume_relayout(interactive.page.runtime)
               && navigation_relayout(&interactive));
         CHECK(interactive.performance.mutation_resource_rebuilds == rebuilds + 1
-              && interactive.performance.mutation_style_appends == 1
+              && interactive.performance.mutation_style_appends == 2
               && late_init_text_color(&interactive.page.layout, "middle") == 0x555555);
         navigation_destroy(&interactive);
         browser_session_destroy(&browser_session);
@@ -1449,6 +1481,129 @@
             "removed-style-probe") == 0x334455);
         CHECK(interactive.performance.mutation_style_appends == 0);
         navigation_destroy(&interactive);
+        CHECK(budget.current == 0);
+    }
+
+    puts("test: node retirement scopes removals and innerHTML replacements");
+    {
+        /* Enough elements and rules for a page reuse cache with retained
+           lists, plus a :has() reached through a sibling combinator, which
+           used to make every child-list change a full reset. */
+        static char retire_page[32768];
+        static const char retire_head[] =
+            "<!doctype html><meta name=viewport content='width=device-width'>"
+            "<title>Retire</title><style>"
+            ".a{color:#111111}.b{color:#222222}#h p:first-child{color:#333333}"
+            ".flag:has(.inner) ~ [id=after]{color:#444444}";
+        size_t retire_length = sizeof(retire_head) - 1u;
+        memcpy(retire_page, retire_head, retire_length);
+        for (unsigned i = 0; i < 64; i++) {
+            char rule[32];
+            int written = snprintf(rule, sizeof(rule), ".pad%u{margin:0}", i);
+            CHECK(written > 0 && (size_t) written < sizeof(retire_page) - retire_length);
+            memcpy(retire_page + retire_length, rule, (size_t) written);
+            retire_length += (size_t) written;
+        }
+        static const char retire_body[] =
+            "</style><body><div id=h><p class=a>one</p><p class=b>two</p>"
+            "<p class=a>three</p></div><div class=flag id=flag></div>"
+            "<p class='b after' id=after>after</p><p id=probe class=b>probe</p>"
+            "<div id=fill>";
+        CHECK(sizeof(retire_body) - 1u < sizeof(retire_page) - retire_length);
+        memcpy(retire_page + retire_length, retire_body, sizeof(retire_body) - 1u);
+        retire_length += sizeof(retire_body) - 1u;
+        for (unsigned i = 0; i < 300; i++) {
+            char item[40];
+            int written = snprintf(item, sizeof(item), "<p class=a>m%u</p>", i);
+            CHECK(written > 0 && (size_t) written < sizeof(retire_page) - retire_length);
+            memcpy(retire_page + retire_length, item, (size_t) written);
+            retire_length += (size_t) written;
+        }
+        static const char retire_tail[] = "</div></body>";
+        CHECK(sizeof(retire_tail) - 1u < sizeof(retire_page) - retire_length);
+        memcpy(retire_page + retire_length, retire_tail, sizeof(retire_tail) - 1u);
+        retire_length += sizeof(retire_tail) - 1u;
+        CHECK(browser_session_init(&browser_session, &budget, 256 * 1024));
+        CHECK(navigation_init(&interactive, &budget, 4));
+        navigation_attach_browser_session(&interactive, &browser_session);
+        navigation_enable_scripts(&interactive, 4 * MIB, 1000);
+        uint64_t generation = navigation_begin(&interactive);
+        CHECK(navigation_commit_html(&interactive, generation,
+            "https://example.test/node-retirement", retire_page, retire_length,
+            480, NULL, NULL, true));
+        CHECK(interactive.page.layout_reuse != NULL
+              && late_init_text_color(&interactive.page.layout, "one") == 0x333333
+              && late_init_text_color(&interactive.page.layout, "two") == 0x222222
+              && late_init_text_color(&interactive.page.layout, "after") == 0x222222);
+        /* The first consumed journal binds retirement; make it harmless. */
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+            "document.getElementById('probe').setAttribute('data-x','1')",
+            "<retire-bind>", &interactive.page.script_result)
+            && script_runtime_consume_relayout(interactive.page.runtime)
+            && navigation_relayout(&interactive));
+        size_t resets = interactive.performance.layout_reuse_full_resets;
+        LayoutReuseStats before = {0}, after = {0};
+        layout_reuse_cache_stats(interactive.page.layout_reuse, &before);
+        /* Remove the first child: "two" becomes :first-child. */
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+            "const h=document.getElementById('h');"
+            "h.removeChild(h.firstElementChild);", "<retire-remove>",
+            &interactive.page.script_result)
+            && script_runtime_consume_relayout(interactive.page.runtime)
+            && navigation_relayout(&interactive));
+        layout_reuse_cache_stats(interactive.page.layout_reuse, &after);
+        if (interactive.performance.layout_reuse_full_resets != resets
+            || after.scoped_invalidations <= before.scoped_invalidations) {
+            fprintf(stderr, "retire-remove resets=%zu/%zu scoped=%zu/%zu "
+                    "two=%06x\n", resets,
+                    interactive.performance.layout_reuse_full_resets,
+                    before.scoped_invalidations, after.scoped_invalidations,
+                    late_init_text_color(&interactive.page.layout, "two"));
+        }
+        CHECK(interactive.performance.layout_reuse_full_resets == resets
+              && after.scoped_invalidations > before.scoped_invalidations
+              && late_init_text_color(&interactive.page.layout, "two") == 0x333333
+              && late_init_text_color(&interactive.page.layout, "three") == 0x111111);
+        /* innerHTML replacement plus a fresh element that may reuse a freed
+           address; the :has() sibling subject gains a match at the same
+           time, so "after" must change without a reset. */
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+            "const h2=document.getElementById('h');"
+            "h2.innerHTML='<p class=b>four</p>';"
+            "const n=document.createElement('p');n.className='a';"
+            "n.textContent='five';h2.appendChild(n);"
+            "const in1=document.createElement('span');in1.className='inner';"
+            "document.getElementById('flag').appendChild(in1);",
+            "<retire-inner>", &interactive.page.script_result)
+            && script_runtime_consume_relayout(interactive.page.runtime)
+            && navigation_relayout(&interactive));
+        CHECK(interactive.performance.layout_reuse_full_resets == resets
+              && late_init_text_color(&interactive.page.layout, "four") == 0x333333
+              && late_init_text_color(&interactive.page.layout, "five") == 0x111111
+              && late_init_text_color(&interactive.page.layout, "after") == 0x444444
+              && late_init_text_color(&interactive.page.layout, "probe") == 0x222222);
+        /* A keyless subject must also lose a cached match after its sibling
+           stops satisfying :has(), without clearing the whole table. */
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+            "document.getElementById('flag').innerHTML='';",
+            "<retire-lost-match>", &interactive.page.script_result)
+            && script_runtime_consume_relayout(interactive.page.runtime)
+            && navigation_relayout(&interactive));
+        CHECK(late_init_text_color(&interactive.page.layout, "after") == 0x222222);
+        /* A move keeps the node: its old parent's structure and its own
+           ancestor-dependent answers both change. */
+        CHECK(script_runtime_evaluate_diagnostic(interactive.page.runtime,
+            "const h3=document.getElementById('h');"
+            "document.body.insertBefore(h3.firstElementChild,"
+            "document.getElementById('probe'));", "<retire-move>",
+            &interactive.page.script_result)
+            && script_runtime_consume_relayout(interactive.page.runtime)
+            && navigation_relayout(&interactive));
+        CHECK(interactive.performance.layout_reuse_full_resets == resets
+              && late_init_text_color(&interactive.page.layout, "four") == 0x222222
+              && late_init_text_color(&interactive.page.layout, "five") == 0x333333);
+        navigation_destroy(&interactive);
+        browser_session_destroy(&browser_session);
         CHECK(budget.current == 0);
     }
 

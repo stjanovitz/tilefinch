@@ -67,6 +67,7 @@ typedef struct {
     uint64_t focus_us;
     uint64_t present_us;
     uint64_t total_us;
+    uint64_t setup_us, tiles_us, overflow_us, sticky_us, fixed_us;
 } InteractionPaintTiming;
 
 static bool loop_render(BrowserEngine *engine, TileCache *cache,
@@ -78,6 +79,11 @@ static bool loop_render(BrowserEngine *engine, TileCache *cache,
     uint64_t started = interaction_now_us();
     uint64_t raster_before = cache == NULL ? 0 : cache->raster_us;
     uint64_t frame_before = cache == NULL ? 0 : cache->frame_us;
+    uint64_t setup_before = cache == NULL ? 0 : cache->frame_setup_us;
+    uint64_t tiles_before = cache == NULL ? 0 : cache->frame_tile_us;
+    uint64_t overflow_before = cache == NULL ? 0 : cache->frame_overflow_us;
+    uint64_t sticky_before = cache == NULL ? 0 : cache->frame_sticky_us;
+    uint64_t fixed_before = cache == NULL ? 0 : cache->frame_fixed_us;
     const NavigationEntry *entry = navigation_current(navigation);
     if (entry == NULL
         || !browser_engine_render_frame(engine, NULL)) {
@@ -119,7 +125,12 @@ static bool loop_render(BrowserEngine *engine, TileCache *cache,
             .frame_us = cache->frame_us - frame_before,
             .focus_us = focus_finished - focus_started,
             .present_us = present_finished - present_started,
-            .total_us = interaction_now_us() - started
+            .total_us = interaction_now_us() - started,
+            .setup_us = cache->frame_setup_us - setup_before,
+            .tiles_us = cache->frame_tile_us - tiles_before,
+            .overflow_us = cache->frame_overflow_us - overflow_before,
+            .sticky_us = cache->frame_sticky_us - sticky_before,
+            .fixed_us = cache->frame_fixed_us - fixed_before
         };
     }
     return ok;
@@ -1305,6 +1316,9 @@ static bool run_command_loop(FILE *commands, bool interactive,
         size_t glyph_misses_before = cache->glyph_cache_misses;
         size_t image_decodes_before = cache->decoded_image_builds;
         size_t image_scales_before = cache->scaled_image_builds;
+#ifndef TILEFINCH_NO_TRACE
+        uint64_t focus_outline_before = controller->focus_outline_us;
+#endif
         if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) break;
         else if (strcmp(line, "help") == 0) { loop_help(); changed = false; }
         else if (strcmp(line, "status") == 0) changed = false;
@@ -2082,7 +2096,7 @@ static bool run_command_loop(FILE *commands, bool interactive,
                    "runtime-us=%llu relayout-us=%llu cache-us=%llu "
                    "paint-us=%llu raster-us=%llu frame-us=%llu "
                    "focus-us=%llu present-us=%llu glyph-misses=%zu "
-                   "image-decodes=%zu image-scales=%zu\n",
+                   "image-decodes=%zu image-scales=%zu",
                    line, (unsigned long long) total_us,
                    (unsigned long long) dispatch_us,
                    (unsigned long long)
@@ -2109,6 +2123,15 @@ static bool run_command_loop(FILE *commands, bool interactive,
                    cache->scaled_image_builds >= image_scales_before
                      ? cache->scaled_image_builds - image_scales_before
                      : cache->scaled_image_builds);
+#ifndef TILEFINCH_NO_TRACE
+            printf(" focus-outline-us=%llu", (unsigned long long)
+                   (controller->focus_outline_us - focus_outline_before));
+#endif
+            printf(" setup-us=%llu tiles-us=%llu overflow-us=%llu sticky-us=%llu fixed-us=%llu",
+                   (unsigned long long) paint.setup_us, (unsigned long long) paint.tiles_us,
+                   (unsigned long long) paint.overflow_us, (unsigned long long) paint.sticky_us,
+                   (unsigned long long) paint.fixed_us);
+            putchar('\n');
             scratch->latency_samples++;
             scratch->latency_total_us += total_us;
             scratch->latency_dispatch_us += dispatch_us;

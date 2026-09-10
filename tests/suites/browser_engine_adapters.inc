@@ -1,5 +1,258 @@
+static bool test_navigation_fragment_visible(BrowserEngine *engine, const char *id)
+{
+    NavigationSession *navigation = browser_engine_navigation(engine);
+    lxb_dom_node_t *target = test_reader_find_id(
+        lxb_dom_interface_node(navigation->page.document.html), id);
+    const LayoutNodeBox *box = target == NULL ? NULL
+        : layout_box_for_node(&navigation->page.layout, target);
+    const NavigationEntry *entry = navigation_current(navigation);
+    return box != NULL && entry != NULL && entry->scroll_y > 0
+        && box->y >= entry->scroll_y
+        && box->y - entry->scroll_y < navigation->viewport.css_height;
+}
+
+static void report_provider_navigation(const char *phase,
+    const BrowserNavigationJobMetrics *metrics)
+{
+    printf("provider-navigation phase=%s elapsed-us=%llu max-transform-us=%llu "
+        "max-unit-us=%llu commit-us=%llu parse-us=%llu style-us=%llu "
+        "resource-us=%llu layout-us=%llu runtime-us=%llu\n", phase,
+        (unsigned long long) metrics->elapsed_us,
+        (unsigned long long) metrics->maximum_transform_slice_us,
+        (unsigned long long) metrics->maximum_irreducible_unit_us,
+        (unsigned long long) metrics->adapter_commit_us,
+        (unsigned long long) metrics->adapter_parse_us,
+        (unsigned long long) metrics->adapter_style_us,
+        (unsigned long long) metrics->adapter_resource_us,
+        (unsigned long long) metrics->adapter_layout_us,
+        (unsigned long long) metrics->adapter_runtime_us);
+}
+
+static int test_watch_reuse_load(Budget *budget, BrowserSession *session,
+    const char *url, bool fail_comments, YoutubeLiteDocument *document,
+    YoutubeLiteLoadMetrics *metrics, const char *label)
+{
+    char error[256] = {0};
+    CHECK(fetch_trace_replay_begin(TILEFINCH_TEST_SOURCE_DIR
+        "/tests/fixtures/http-site-adapter-youtube", error, sizeof(error)));
+    size_t owned_before = budget->current;
+    budget->peak = owned_before;
+    uint64_t started = tilefinch_platform_monotonic_time_us();
+    YoutubeLiteLoadJob *job = youtube_lite_load_begin(budget, session, url,
+        1u * MIB, 2000, error, sizeof(error));
+    CHECK(job != NULL);
+    if (fail_comments) fetch_inject_failure_once(FETCH_INJECT_TIMEOUT);
+    YoutubeLiteLoadStatus status = YOUTUBE_LITE_LOAD_PENDING;
+    for (size_t pump = 0; pump < 4096 && status == YOUTUBE_LITE_LOAD_PENDING; pump++)
+        status = youtube_lite_load_pump(job, NULL);
+    CHECK(status == YOUTUBE_LITE_LOAD_SUCCEEDED
+        && youtube_lite_load_metrics(job, metrics)
+        && youtube_lite_load_take_document(job, document));
+    printf("watch-reuse phase=%s elapsed-us=%llu build-us=%llu requests=%zu bytes=%zu steps=%zu peak-extra=%zu\n",
+        label, (unsigned long long) (tilefinch_platform_monotonic_time_us() - started),
+        (unsigned long long) metrics->build_us, metrics->requests_started,
+        metrics->body_bytes, metrics->build_slices, budget->peak - owned_before);
+    youtube_lite_load_destroy(job);
+    fetch_trace_end();
+    return 0;
+}
+
+static const char *test_watch_reuse_language(void *context)
+{
+    return context;
+}
+
+static int test_watch_metadata_reuse(void)
+{
+    static const char watch[] = "https://www.youtube.com/watch?v=TFTEST00001";
+    static const char *const urls[] = {
+        "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=description#description",
+        "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=comments#comments"
+    };
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    BrowserSession session;
+    CHECK(browser_session_init(&session, &budget, 512u * 1024u));
+    YoutubeLiteDocument cold[2] = {{0}};
+    YoutubeLiteLoadMetrics metrics = {0};
+    YoutubeLiteDocument document = {0};
+    CHECK(test_watch_reuse_load(&budget, &session, watch, false, &document,
+        &metrics, "transport-warmup") == 0);
+    youtube_lite_document_destroy(&document);
+    for (size_t i = 0; i < 2; i++) {
+        browser_session_site_adapter_document_cache_clear(&session);
+        CHECK(test_watch_reuse_load(&budget, &session, urls[i], false, &cold[i],
+            &metrics, i ? "cold-comments" : "cold-description") == 0
+            && metrics.requests_started == i + 1u);
+    }
+    CHECK(test_watch_reuse_load(&budget, &session, watch, false, &document,
+        &metrics, "cold-watch") == 0 && metrics.requests_started == 1);
+    youtube_lite_document_destroy(&document);
+    size_t retained = 0;
+    for (size_t i = 0; i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++)
+        if (session.site_adapter_document_cache[i].valid)
+            retained += session.site_adapter_document_cache[i].length;
+    CHECK(retained > 0 && retained <= 16u * 1024u);
+    printf("watch-reuse retained-bytes=%zu\n", retained);
+    for (size_t i = 0; i < 2; i++) {
+        CHECK(test_watch_reuse_load(&budget, &session, urls[i], false, &document,
+            &metrics, i ? "warm-comments" : "warm-description") == 0
+            && metrics.requests_started == i && metrics.document_cache_hits == 1
+            && metrics.body_bytes == (i ? 345u : 0u)
+            && document.html_length == cold[i].html_length
+            && memcmp(document.html, cold[i].html, document.html_length) == 0);
+        youtube_lite_document_destroy(&document);
+    }
+    /* A stale continuation gets exactly one ordinary watch+comments retry. */
+    CHECK(test_watch_reuse_load(&budget, &session, urls[1], true, &document,
+        &metrics, "rejected-token") == 0 && metrics.requests_started == 3
+        && document.html_length == cold[1].html_length
+        && memcmp(document.html, cold[1].html, document.html_length) == 0);
+    youtube_lite_document_destroy(&document);
+    /* Refusing an optional cached-build allocation must retain the ordinary
+       network path. Cookie replacement allocations precede build admission. */
+    size_t refusals = budget.injected_failure_count;
+    budget_inject_failure_after(&budget, 3);
+    CHECK(test_watch_reuse_load(&budget, &session, urls[0], false, &document,
+        &metrics, "refused-reuse") == 0
+        && budget.injected_failure_count == refusals + 1
+        && metrics.requests_started == 1);
+    budget_clear_failure_injection(&budget);
+    youtube_lite_document_destroy(&document);
+    for (unsigned invalidation = 0; invalidation < 5; invalidation++) {
+        CHECK(test_watch_reuse_load(&budget, &session, watch, false, &document,
+            &metrics, "refresh-watch") == 0);
+        youtube_lite_document_destroy(&document);
+        if (invalidation == 0)
+            CHECK(browser_session_cookie_set(&session, "https://m.youtube.com/",
+                "SESSION=changed; Secure; Path=/"));
+        else if (invalidation == 1) {
+            for (size_t i = 0; i < BROWSER_SITE_ADAPTER_DOCUMENT_CACHE_ENTRIES; i++)
+                session.site_adapter_document_cache[i].stored_at_ns = 1;
+        } else if (invalidation == 2)
+            CHECK(browser_session_clear_site_data(&session, "https://m.youtube.com/"));
+        else if (invalidation == 3)
+            CHECK(browser_session_cache_reclaim(&session, 1) > 0);
+        else {
+            TilefinchPlatformServices services = {
+                .preferred_language = test_watch_reuse_language, .context = "fr"
+            };
+            tilefinch_platform_set_services(&services);
+        }
+        CHECK(test_watch_reuse_load(&budget, &session, urls[0], false, &document,
+            &metrics, "invalidated-description") == 0
+            && metrics.document_cache_hits == 0 && metrics.requests_started == 1);
+        youtube_lite_document_destroy(&document);
+        tilefinch_platform_set_services(NULL);
+    }
+    /* Another video cannot borrow the snapshot; cancellation releases its job. */
+    CHECK(test_watch_reuse_load(&budget, &session, watch, false, &document,
+        &metrics, "refresh-watch") == 0);
+    youtube_lite_document_destroy(&document);
+    size_t baseline = budget.current;
+    char error[256] = {0};
+    for (unsigned same = 0; same < 2; same++) {
+        CHECK(fetch_trace_replay_begin(TILEFINCH_TEST_SOURCE_DIR
+            "/tests/fixtures/http-site-adapter-youtube", error, sizeof(error)));
+        YoutubeLiteLoadJob *job = youtube_lite_load_begin(&budget, &session,
+            same ? urls[1] : "https://www.youtube.com/watch?v=TFTEST00002&tilefinch_view=description",
+            1u * MIB, 2000, error, sizeof(error));
+        CHECK(job != NULL && youtube_lite_load_metrics(job, &metrics)
+            && metrics.document_cache_hits == same);
+        youtube_lite_load_cancel(job, "cancel expansion");
+        youtube_lite_load_destroy(job);
+        fetch_trace_end();
+        CHECK(budget.current == baseline);
+    }
+    for (size_t i = 0; i < 2; i++) youtube_lite_document_destroy(&cold[i]);
+    browser_session_destroy(&session);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static int test_cooperative_site_adapter_navigation(void)
 {
+    CHECK(test_watch_metadata_reuse() == 0);
+    /* A large watch response may put a useful description header before a
+       long recommendation tail. Description does not display that tail. */
+    for (unsigned description = 0; description < 2; description++) {
+        Budget budget;
+        budget_init(&budget, 16u * MIB);
+        BrowserSession session;
+        CHECK(browser_session_init(&session, &budget, 512u * 1024u));
+        char fixture[128], error[256] = {0};
+        size_t source_length = 0;
+        CHECK(write_large_youtube_replay_configured(fixture, &source_length,
+            "https://m.youtube.com/watch?v=TFTEST00001&bpctr=9999999999&has_verified=1", true)
+            && fetch_trace_replay_begin(fixture, error, sizeof(error)));
+        const char *url = description
+            ? "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=description#description"
+            : "https://www.youtube.com/watch?v=TFTEST00001";
+        YoutubeLiteLoadJob *job = youtube_lite_load_begin(&budget, &session, url,
+            1u * MIB, 2000, error, sizeof(error));
+        CHECK(job != NULL);
+        YoutubeLiteLoadStatus status = YOUTUBE_LITE_LOAD_PENDING;
+        for (size_t pump = 0; pump < 4096 && status == YOUTUBE_LITE_LOAD_PENDING; pump++)
+            status = youtube_lite_load_pump(job, NULL);
+        if (status != YOUTUBE_LITE_LOAD_SUCCEEDED)
+            fprintf(stderr, "large watch status=%d error=%s\n", status,
+                youtube_lite_load_error(job));
+        YoutubeLiteLoadMetrics metrics = {0};
+        YoutubeLiteDocument actual = {0}, expected = {0};
+        CHECK(status == YOUTUBE_LITE_LOAD_SUCCEEDED
+            && youtube_lite_load_metrics(job, &metrics)
+            && youtube_lite_load_take_document(job, &actual));
+        char body_path[256];
+        snprintf(body_path, sizeof(body_path), "%s/0000.body", fixture);
+        char *source = read_test_file(body_path, &source_length);
+        CHECK(source != NULL && youtube_lite_build_document(&budget, url, source,
+            source_length, &expected, error, sizeof(error))
+            && actual.html_length == expected.html_length
+            && memcmp(actual.html, expected.html, actual.html_length) == 0
+            && actual.result_count == expected.result_count);
+        printf("provider-large-watch description=%u build-us=%llu slices=%zu bytes=%zu\n",
+            description, (unsigned long long) metrics.build_us,
+            metrics.build_slices, source_length);
+        CHECK(!description || metrics.build_slices < 80u);
+        CHECK(description || metrics.build_slices <= 114u);
+        if (!description) {
+            youtube_lite_load_destroy(job);
+            job = NULL;
+            YoutubeLiteDocument warm = {0}, reference = {0};
+            const char *expanded = "https://www.youtube.com/watch?v=TFTEST00001&tilefinch_view=description#description";
+            uint64_t started = tilefinch_platform_monotonic_time_us();
+            YoutubeLiteLoadJob *reuse = youtube_lite_load_begin(&budget, &session,
+                expanded, 1u * MIB, 2000, error, sizeof(error));
+            CHECK(reuse != NULL);
+            status = YOUTUBE_LITE_LOAD_PENDING;
+            for (size_t pump = 0; pump < 128 && status == YOUTUBE_LITE_LOAD_PENDING; pump++)
+                status = youtube_lite_load_pump(reuse, NULL);
+            CHECK(status == YOUTUBE_LITE_LOAD_SUCCEEDED
+                && youtube_lite_load_metrics(reuse, &metrics)
+                && youtube_lite_load_take_document(reuse, &warm)
+                && metrics.document_cache_hits == 1 && metrics.requests_started == 0
+                && metrics.body_bytes == 0 && metrics.build_slices < 10);
+            printf("watch-reuse phase=large-warm-description elapsed-us=%llu build-us=%llu requests=%zu bytes=%zu steps=%zu\n",
+                (unsigned long long) (tilefinch_platform_monotonic_time_us() - started),
+                (unsigned long long) metrics.build_us, metrics.requests_started,
+                metrics.body_bytes, metrics.build_slices);
+            CHECK(youtube_lite_build_document(&budget, expanded, source, source_length,
+                &reference, error, sizeof(error))
+                && warm.html_length == reference.html_length
+                && memcmp(warm.html, reference.html, warm.html_length) == 0);
+            youtube_lite_document_destroy(&reference);
+            youtube_lite_document_destroy(&warm);
+            youtube_lite_load_destroy(reuse);
+        }
+        free(source);
+        youtube_lite_document_destroy(&expected);
+        youtube_lite_document_destroy(&actual);
+        youtube_lite_load_destroy(job);
+        fetch_trace_end();
+        browser_session_destroy(&session);
+        remove_large_youtube_replay(fixture);
+        CHECK(budget.current == 0);
+    }
     /* Identity facts at the front of a large response must not make Home
        scan irrelevant trailing content. Missing facts still use the bounded
        complete scan. This isolates identity work from result JSON parsing. */
@@ -48,7 +301,7 @@ static int test_cooperative_site_adapter_navigation(void)
     config.memory_limit = 16u * MIB;
     config.session_cache_limit = 512u * 1024u;
     config.maximum_document_bytes = 1u * MIB;
-    config.tile_capacity = 0;
+    config.tile_capacity = 8;
     config.resources.enabled = true;
     config.resources.web_fonts_enabled = false;
     char error[256] = {0};
@@ -58,7 +311,7 @@ static int test_cooperative_site_adapter_navigation(void)
         "<!doctype html><title>Stable incumbent</title><body>old";
     static const char url[] =
         "https://www.youtube.com/watch?v=TFTEST00001"
-        "&tilefinch_view=comments";
+        "&tilefinch_view=comments#comments";
     static const char fixture[] =
         TILEFINCH_TEST_SOURCE_DIR
         "/tests/fixtures/http-site-adapter-youtube";
@@ -142,6 +395,8 @@ static int test_cooperative_site_adapter_navigation(void)
                  "Cooperative fixture video") != NULL);
     fetch_trace_end();
 
+    /* This assertion measures a cold fetch, not reuse from the failure case. */
+    browser_session_site_adapter_document_cache_clear(browser_engine_session(engine));
     CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error))
           && browser_engine_begin_navigation_url(
                  engine, url, 1u * MIB, 1000, true));
@@ -153,6 +408,7 @@ static int test_cooperative_site_adapter_navigation(void)
     }
     BrowserNavigationJobMetrics metrics = {0};
     CHECK(browser_engine_navigation_job_metrics(engine, &metrics));
+    report_provider_navigation("watch", &metrics);
     if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED) {
         fprintf(stderr,
                 "cooperative adapter failed: status=%d error=%s "
@@ -183,6 +439,7 @@ static int test_cooperative_site_adapter_navigation(void)
     CHECK(body_text != NULL
           && strstr(body_text, "Cooperative comment") != NULL
           && strstr(body_text, "Load more comments") == NULL);
+    CHECK(test_navigation_fragment_visible(engine, "comments"));
     fetch_trace_end();
 
     /* Exercise the provider's user-facing watch subroutes through complete
@@ -191,7 +448,7 @@ static int test_cooperative_site_adapter_navigation(void)
        from the prior document. */
     static const char description_url[] =
         "https://www.youtube.com/watch?v=TFTEST00001"
-        "&tilefinch_view=description";
+        "&tilefinch_view=description#description";
     CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error))
           && browser_engine_begin_navigation_url(
                  engine, description_url, 1u * MIB, 1000, true));
@@ -208,6 +465,7 @@ static int test_cooperative_site_adapter_navigation(void)
           && strstr(body_text, "A bounded fixture.") != NULL
           && strstr(body_text, "View full description") == NULL
           && strstr(body_text, "Cooperative comment") == NULL);
+    CHECK(test_navigation_fragment_visible(engine, "description"));
     fetch_trace_end();
 
     static const char watch_url[] =
@@ -242,6 +500,53 @@ static int test_cooperative_site_adapter_navigation(void)
           && watch_play.prefer_native_media
           && strcmp(watch_play.url, watch_url) == 0);
     fetch_trace_end();
+
+    /* Activate the actual rendered links, including their fragments, rather
+       than navigating to a hand-written subroute that omits the scroll target.
+       Back must restore the clicked row, not re-apply the subroute's anchor. */
+    static const char *const expansion_ids[] = { "description", "comments" };
+    for (size_t expansion = 0; expansion < 2; expansion++) {
+        NavigationSession *navigation = browser_engine_navigation(engine);
+        lxb_dom_node_t *link = NULL;
+        for (size_t at = 0; at < navigation->page.layout.link_count; at++) {
+            const LinkRegion *region = &navigation->page.layout.links[at];
+            if (region->url != NULL && strstr(region->url, "tilefinch_view=") != NULL
+                && strstr(region->url, expansion_ids[expansion]) != NULL) {
+                link = region->node;
+                break;
+            }
+        }
+        CHECK(link != NULL && browser_engine_focus_node(engine, link));
+        int clicked_scroll = navigation_current(navigation)->scroll_y;
+        ControllerAction expand = {0};
+        CHECK(browser_engine_activate(engine, &expand)
+            && expand.type == CONTROLLER_ACTION_NAVIGATE
+            && !expand.prefer_native_media && strchr(expand.url, '#') != NULL
+            && fetch_trace_replay_begin(fixture, error, sizeof(error))
+            && browser_engine_begin_navigation_action(engine, &expand,
+                                                      1u * MIB, 1000));
+        status = BROWSER_NAVIGATION_JOB_PENDING;
+        for (size_t pumps = 0; pumps < 128 && status == BROWSER_NAVIGATION_JOB_PENDING; pumps++)
+            status = browser_engine_pump_navigation(engine, &quota);
+        BrowserNavigationJobMetrics expansion_metrics = {0};
+        CHECK(browser_engine_navigation_job_metrics(engine, &expansion_metrics));
+        report_provider_navigation(expansion_ids[expansion], &expansion_metrics);
+        CHECK(expansion_metrics.adapter_document_cache_hits == 1);
+        CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+            && test_navigation_fragment_visible(engine, expansion_ids[expansion])
+            && browser_engine_render_frame(engine, NULL)
+            && browser_engine_refresh_render_shell(engine)
+            && test_navigation_fragment_visible(engine, expansion_ids[expansion]));
+        fetch_trace_end();
+        CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error))
+            && browser_engine_begin_navigation_history(engine, false, 1u * MIB, 1000));
+        status = BROWSER_NAVIGATION_JOB_PENDING;
+        for (size_t pumps = 0; pumps < 128 && status == BROWSER_NAVIGATION_JOB_PENDING; pumps++)
+            status = browser_engine_pump_navigation(engine, &quota);
+        CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+            && navigation_current(navigation)->scroll_y == clicked_scroll);
+        fetch_trace_end();
+    }
 
     /* Same-site repeat navigation should reach the same result with bounded
        logical work and no accumulating page allocations. Wall-clock timing is
@@ -563,6 +868,7 @@ static int test_cooperative_site_adapter_navigation(void)
               browser_engine_navigation(engine)->page.document.title,
               "ratchet") != NULL);
     char focused_provider_url[NAVIGATION_URL_LIMIT] = {0};
+    report_provider_navigation("search", &metrics);
     CHECK(browser_engine_focused_provider_media_url(
               engine, focused_provider_url,
               sizeof(focused_provider_url)));
@@ -601,6 +907,38 @@ static int test_cooperative_site_adapter_navigation(void)
     CHECK(compact_next_activated
           && compact_next_play.prefer_native_media
           && strcmp(compact_next_play.url, compact_play.url) != 0);
+    /* The reported down/up/Cross journey must preserve the exact Play URL
+       across scrolling and a render-shell replacement. No decoder/audio is
+       started here: this pins the browser-to-native-player handoff. */
+    for (unsigned round = 0; round < 12; round++) {
+        CHECK(browser_engine_scroll_by(engine, 240));
+        CHECK(navigation_current(browser_engine_navigation(engine))->scroll_y > 0);
+        CHECK(browser_engine_render_frame(engine, NULL));
+        CHECK(browser_engine_scroll_by(engine, -240));
+        CHECK(browser_engine_render_frame(engine, NULL));
+        size_t result_pixels_count = 0;
+        const uint16_t *result_pixels = browser_engine_framebuffer(engine, &result_pixels_count);
+        uint64_t before_focus_pixels = frame_checksum(result_pixels, result_pixels_count);
+        CHECK(browser_engine_focus_direction(engine, CONTROLLER_FOCUS_UP));
+        CHECK(browser_engine_render_frame(engine, NULL));
+        result_pixels = browser_engine_framebuffer(engine, &result_pixels_count);
+        CHECK(frame_checksum(result_pixels, result_pixels_count) != before_focus_pixels);
+        if (round == 6) CHECK(browser_engine_refresh_render_shell(engine)
+            && browser_engine_render_frame(engine, NULL));
+        ControllerAction selected = {0};
+        CHECK(browser_engine_activate(engine, &selected)
+            && selected.type == CONTROLLER_ACTION_NAVIGATE
+            && selected.prefer_native_media
+            && strcmp(selected.url, compact_play.url) == 0
+            && browser_engine_focused_provider_media_url(engine,
+                focused_provider_url, sizeof(focused_provider_url))
+            && strcmp(selected.url, focused_provider_url) == 0
+            && browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN)
+            && browser_engine_render_frame(engine, NULL));
+        CHECK(browser_engine_activate(engine, &selected)
+            && selected.prefer_native_media
+            && strcmp(selected.url, compact_next_play.url) == 0);
+    }
     fetch_trace_end();
 
     /* The exact repeated search is rebuilt from the two-entry, cookie-bound
@@ -783,6 +1121,41 @@ static int test_cooperative_site_adapter_navigation(void)
         fetch_trace_end();
     }
 
+    /* Ordinary documents use the same fragment rule, including a fragment
+       inherited across a redirect. An autofocus header must not undo it on
+       an idle turn. Exercise both synchronous and cooperative load APIs. */
+    static const char anchored_html[] =
+        "<!doctype html><title>Anchored destination</title>"
+        "<input autofocus><div style='height:600px'>Introduction</div>"
+        "<h2 id=target>Requested section</h2><div style='height:800px'>Body</div>";
+    char anchor_fixture[128];
+    CHECK(write_history_form_replay(anchor_fixture, anchored_html,
+        sizeof(anchored_html) - 1u, "https://history-form.test/destination"));
+    for (unsigned synchronous = 0; synchronous < 2; synchronous++) {
+        CHECK(fetch_trace_replay_begin(anchor_fixture, error, sizeof(error)));
+        const char *anchor_url = "https://history-form.test/search#target";
+        if (synchronous) {
+            CHECK(browser_engine_load_url_with_limits(engine, anchor_url,
+                                                      1u * MIB, 1000, true));
+        } else {
+            CHECK(browser_engine_begin_navigation_url(engine, anchor_url,
+                                                       1u * MIB, 1000, true));
+            status = BROWSER_NAVIGATION_JOB_PENDING;
+            for (size_t pumps = 0; pumps < 128 && status == BROWSER_NAVIGATION_JOB_PENDING; pumps++)
+                status = browser_engine_pump_navigation(engine, &quota);
+            CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED);
+        }
+        CHECK(test_navigation_fragment_visible(engine, "target")
+            && browser_engine_render_frame(engine, NULL));
+        int anchor_scroll = navigation_current(browser_engine_navigation(engine))->scroll_y;
+        for (unsigned idle = 0; idle < 8; idle++) {
+            bool changed = false;
+            (void) browser_engine_run_idle_work(engine, &changed);
+        }
+        CHECK(navigation_current(browser_engine_navigation(engine))->scroll_y == anchor_scroll);
+        fetch_trace_end();
+    }
+    remove_large_youtube_replay(anchor_fixture);
     CHECK(browser_engine_shutdown(engine));
     browser_engine_destroy(engine);
     return 0;

@@ -61,3 +61,15 @@ if ! cmp -s "$output_dir/semantic-1.log" "$output_dir/semantic-2.log"; then
 fi
 
 printf 'Deterministic interactive acceptance passed: %s\n' "$output_dir"
+
+# Match the device's JavaScript-Off policy, not merely an omitted
+# --fetch-scripts flag (which still retains the internal runtime).
+"$lab" --url https://search-journey.test/ --no-javascript \
+  --replay-http-response-keyed tests/fixtures/http-pointer-search \
+  --commands tests/fixtures/no-javascript-search.commands \
+  --no-loop-capture --output "$output_dir/no-javascript.ppm" \
+  --limit-mb 24 > "$output_dir/no-javascript.log" 2>&1
+grep -q '^loop status=PASS ' "$output_dir/no-javascript.log"
+grep -q '^loop-body-contains found=yes text="Search results for psp"' "$output_dir/no-javascript.log"
+grep -q '^javascript-responsiveness .*compile-attempts=0 ' "$output_dir/no-javascript.log"
+grep -q '^interactive teardown=0 active=0 .*status=PASS$' "$output_dir/no-javascript.log"

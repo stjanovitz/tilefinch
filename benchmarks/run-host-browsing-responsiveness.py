@@ -20,14 +20,16 @@ TIMINGS = {"elapsed-us", "max-pump-us", "max-gap-us", "acknowledgement-us",
            "drain-us", "total-response-us", "render-us", "request-to-pixels-us",
            "runtime-us", "max-runtime-us", "idle-us", "max-idle-us",
            "last-dynamic-completion-us", "preceding-idle-us",
-           "font-us", "image-us"}
+           "font-us", "image-us", "request-begin-us", "first-preview-us", "first-frame-us",
+           "max-transform-us", "max-unit-us", "commit-us", "parse-us", "style-us",
+           "resource-us", "layout-us"}
 
 
-def distribution(values):
+def distribution(values, unit="us"):
     ordered = sorted(values)
-    return {"samples": len(ordered), "median_us": statistics.median(ordered),
-            "p95_us": ordered[math.ceil(len(ordered) * .95) - 1],
-            "maximum_us": ordered[-1]}
+    return {"samples": len(ordered), "median_" + unit: statistics.median(ordered),
+            "p95_" + unit: ordered[math.ceil(len(ordered) * .95) - 1],
+            "maximum_" + unit: ordered[-1]}
 
 
 def main():
@@ -37,6 +39,8 @@ def main():
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--wikipedia-home-trace", type=Path)
     parser.add_argument("--wikipedia-article-trace", type=Path)
+    parser.add_argument("--skip-scripted-captures", action="store_true",
+                        help="profile home/article captures only with JavaScript Off")
     parser.add_argument("--search-trace", type=Path)
     parser.add_argument("--search-url", default="https://en.wikipedia.org/")
     parser.add_argument("--startup-trace", type=Path)
@@ -72,7 +76,8 @@ def main():
     engine = build / "tilefinch-browser-engine-tests"
     gates = []
     for mode in ("font-staging", "interaction-journey", "deferred-startup",
-                 "provider-navigation", "pointer-search"):
+                 "provider-navigation", "pointer-search", "script-free-journey",
+                 "background-interruption"):
         run(mode, [engine, "--" + mode + "-only"])
         gates.append(mode)
     for target in ("layout", "psp-ui", "psp-network-supervisor",
@@ -81,24 +86,80 @@ def main():
         gates.append(target)
 
     samples = {}
+    memory = {}
     checksums = {}
+    for sample in range(args.runs):
+        log = run(f"background-interruption-{sample}",
+                  [engine, "--background-interruption-only"])
+        for line in log.splitlines():
+            if not line.startswith("background-interruption "):
+                continue
+            fields = dict(re.findall(r"([\w-]+)=([\w-]+)", line))
+            group = f"background/{fields['work']}/input-{fields['input']}"
+            for key in ("acknowledgement-us", "visible-us", "owner-return-us", "max-gap-us"):
+                samples.setdefault(group + "/" + key, []).append(int(fields[key]))
+
+    # Match the shipping script-free policy as well as the opt-in scripted
+    # stress lane below. Keep dispatch and publication separate; a navigation
+    # duration is not a measure of d-pad feedback latency.
+    def profile_native_interactions(name, trace, url):
+        commands = output / (name + "-native.commands")
+        commands.write_text("focus-next\n" * 8 + "focus-prev\n" * 4
+                            + "page-down\n" * 3 + "page-up\n" * 3 + "quit\n")
+        for sample in range(args.runs + 1):
+            log = run(f"{name}-native-{sample}", [build / "psp-browser-interactive-lab",
+                "--url", url, "--no-javascript", "--psp-profile", "realistic",
+                "--limit-mb", "24", "--low-memory-navigation",
+                "--replay-http-response-keyed", trace,
+                "--commands", commands, "--no-loop-capture",
+                "--output", output / (name + "-native.ppm")])
+            if "loop status=PASS" not in log or "teardown=0 active=0" not in log:
+                raise RuntimeError("native journey did not complete: " + name)
+            if not sample:
+                continue
+            for line in log.splitlines():
+                if not line.startswith("interaction-latency command="):
+                    continue
+                fields = dict(re.findall(r"([\w-]+)=([\w-]+)", line))
+                command = fields.pop("command")
+                for key in ("total-us", "dispatch-us", "paint-us", "focus-outline-us",
+                            "relayout-us", "network-us", "setup-us", "tiles-us",
+                            "overflow-us", "sticky-us", "fixed-us"):
+                    if key in fields:
+                        samples.setdefault(f"{name}/native/{command}/{key}", []).append(int(fields[key]))
 
     def collect(name, log):
         for line in log.splitlines():
             if not line.startswith(("navigation-responsiveness ", "font-publication ",
                                     "font-interruption ", "font-input-feedback ",
                                     "navigation-settle ", "navigation-startup ",
-                                    "navigation-publication ")):
+                                    "navigation-publication ", "navigation-native ",
+                                    "navigation-request ", "navigation-preview ",
+                                    "provider-navigation ")):
                 continue
             prefix = line.split()[0]
-            for key, value in re.findall(r"([\w-]+)=([\w-]+)", line):
+            fields = dict(re.findall(r"([\w-]+)=([\w-]+)", line))
+            if prefix == "provider-navigation":
+                prefix += "/" + fields["phase"]
+            for key, value in fields.items():
                 if key in TIMINGS:
+                    # No preview under pressure is not a zero-latency paint.
+                    if key == "first-preview-us" and fields.get("available") != "1":
+                        continue
                     samples.setdefault(name + "/" + prefix + "/" + key, []).append(int(value))
+                elif prefix == "navigation-native" and key in (
+                        "limit-bytes", "peak-bytes", "retained-bytes"):
+                    memory.setdefault(name + "/" + key, []).append(int(value))
         raster = re.findall(r"font-raster view=(\d+) checksum=(\d+)", log)
         if raster:
             if name in checksums and checksums[name] != raster:
                 raise RuntimeError("non-deterministic raster: " + name)
             checksums[name] = raster
+
+    for sample in range(args.runs + 1):
+        log = run(f"provider-timing-{sample}", [engine, "--provider-navigation-only"])
+        if sample:
+            collect("provider", log)
 
     for name, trace, url in (
         ("home", args.wikipedia_home_trace, "https://en.wikipedia.org/wiki/Main_Page"),
@@ -108,6 +169,16 @@ def main():
         if trace is None:
             continue
         trace = trace.resolve()
+        profile_native_interactions(name, trace, url)
+        for limit, mode in ((16, "--native-navigation-strict-replay"),
+                            (24, "--native-navigation-replay")):
+            for sample in range(args.runs + 1):
+                log = run(f"{name}-navigation-native-{limit}-{sample}",
+                          [engine, mode, trace, url])
+                if sample:
+                    collect(f"{name}/native-{limit}", log)
+        if args.skip_scripted_captures:
+            continue
         for sample in range(args.runs + 1):
             log = run(f"{name}-navigation-{sample}",
                       [engine, "--navigation-staging-replay", trace, url])
@@ -132,7 +203,9 @@ def main():
         gates.append("captured-startup-settle")
     report = {"scope": "host; no physical input, scanout, firmware decoding, or network timing",
               "gates": gates, "timings": {key: distribution(value)
-                  for key, value in samples.items()}, "raster_checksums": checksums}
+                  for key, value in samples.items()},
+              "memory": {key: distribution(value, "bytes") for key, value in memory.items()},
+              "raster_checksums": checksums}
     (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     print(output / "summary.json")
 

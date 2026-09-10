@@ -101,6 +101,11 @@ StyleRetainedMatches *style_retained_matches_create(Budget *budget);
 void style_retained_matches_destroy(StyleRetainedMatches *table);
 void style_retained_matches_clear(StyleRetainedMatches *table);
 /* Drop every entry whose element lies inside `scope` (inclusive). */
+/* Drops the entries of every element in `root`'s subtree (inclusive) by
+   direct probe, for a subtree about to be freed: O(subtree), not a table
+   scan, since retirement can run once per discarded child. */
+void style_retained_matches_forget_subtree(
+    StyleRetainedMatches *table, const lxb_dom_node_t *root);
 void style_retained_matches_invalidate_within(
     StyleRetainedMatches *table, const lxb_dom_node_t *scope);
 /* Drop every entry whose element is an ancestor of `node` (inclusive). */

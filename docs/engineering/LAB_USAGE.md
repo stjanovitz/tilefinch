@@ -263,6 +263,13 @@ failure result.
 
 ## Interactive runtime lab (`psp-browser-interactive-lab`)
 
+`--no-javascript` disables both the page scripts and the runtime, matching
+the device's site JavaScript-Off control. Merely omitting `--fetch-scripts`
+skips downloaded author scripts but leaves the runtime enabled. The native
+search/edit/submit/link-focus/Back regression in
+`tests/fixtures/no-javascript-search.commands` runs in the standard interactive
+acceptance gate without JavaScript.
+
 `psp-browser-interactive-lab` exercises the persistent layers together. It retains JavaScript and session state, can advance the bounded timer clock, load quota-controlled same-origin scripts, repeat navigation to exercise HTTP validators and the script cache, drive controller focus/edit/activation, follow GET/POST form actions, and render the resulting page:
 
 `--forced-dark` enables the same role-aware page-color mapping used by the PSP

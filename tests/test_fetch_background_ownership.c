@@ -489,6 +489,13 @@ static void test_stream_consumer_deadline(void)
 
 int main(void)
 {
+    CHECK(!fetch_background_setup_yield_due(false, 10000, 0));
+    CHECK(fetch_background_setup_yield_due(true, 10000, 0));
+    CHECK(!fetch_background_setup_yield_due(true, 13999, 10000));
+    CHECK(fetch_background_setup_yield_due(true, 14000, 10000));
+    CHECK(!fetch_background_setup_yield_due(true, 9999, 10000));
+    CHECK(!fetch_background_setup_yield_due(true, UINT64_MAX, UINT64_MAX - 3999));
+    CHECK(fetch_background_setup_yield_due(true, UINT64_MAX, UINT64_MAX - 4000));
     CHECK(fetch_background_progress_after_setup(9, 10, 24) == 23);
     CHECK(fetch_background_progress_after_setup(23, 10, 24) == 24);
     CHECK(fetch_background_progress_after_setup(25, 10, 24) == 25);

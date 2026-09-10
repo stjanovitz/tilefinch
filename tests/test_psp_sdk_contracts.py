@@ -119,6 +119,53 @@ def psp_firmware_backend_destroy(source: str):
 
 
 class PspSdkContractTests(unittest.TestCase):
+    def test_setup_cpu_donation_preserves_priority_and_input_ownership(self):
+        transport = without_comments((ROOT / "src/fetch/background_transport.inc").read_text())
+        worker = transport[transport.index("static int fetch_background_worker_main("):
+                           transport.index("bool fetch_background_transport_available(")]
+        self.assertLess(worker.index("&fetch_background.setup_active, true"),
+                        worker.index("sceKernelChangeThreadPriority("))
+        cooperate = transport[transport.index("void fetch_background_transport_cooperate("):
+                              transport.index("bool fetch_background_transport_initialize(")]
+        self.assertIn("sceKernelGetThreadId() != fetch_background.owner_thread", cooperate)
+        self.assertIn("fetch_background.stop_requested", cooperate)
+        self.assertIn("fetch_background_setup_yield_due", cooperate)
+        self.assertIn("(status.status & PSP_THREAD_READY) == 0", cooperate)
+        self.assertIn("&fetch_background.poll_active", cooperate)
+        poll_begin = worker.index("&fetch_background.poll_active, true")
+        poll_call = worker.index("CURLMcode poll_code = curl_multi_poll(")
+        poll_end = worker.index("&fetch_background.poll_active, false")
+        self.assertLess(poll_begin, poll_call)
+        self.assertLess(poll_call, poll_end)
+        self.assertLess(cooperate.index("fetch_background_setup_yield_due"),
+                        cooperate.index("sceKernelReferThreadRunStatus"))
+        self.assertIn("sceKernelDelayThread(FETCH_BACKGROUND_SETUP_YIELD_US)", cooperate)
+        self.assertNotIn("sceKernelChangeThreadPriority", cooperate)
+        runtime = without_comments((ROOT / "src/psp_app/psp_app_runtime.c").read_text())
+        checkpoint = runtime[runtime.index("bool psp_platform_cooperate("):
+                             runtime.index("#define PSP_BOOT_ENTRANCE_SLOW_US")]
+        self.assertLess(checkpoint.index("psp_ui_update("),
+                        checkpoint.index("if (running) fetch_background_transport_cooperate(now_us)"))
+        self.assertIn("bool running = !tilefinch_cancellation_requested", checkpoint)
+
+    def test_transport_attribution_is_validation_only_and_read_only(self):
+        targets = (ROOT / "cmake/TilefinchTargets.cmake").read_text()
+        source = (ROOT / "src/psp_transport_probe.c").read_text()
+        start = targets.index("if(TILEFINCH_PSP_VALIDATION_LOG AND NOT PSP_BROWSER_CURL_STUB)")
+        end = targets.index("endif()", start)
+        self.assertIn("src/psp_transport_probe.c", targets[start:end])
+        self.assertIn("LINKER:--wrap=${_symbol}", targets[start:end])
+        self.assertIn("sceKernelReferThreadRunStatus", source)
+        self.assertIn("__real_curl_multi_perform(multi, running)", source)
+        self.assertIn("getsockopt(fd, SOL_SOCKET, SO_NONBLOCK", source)
+        self.assertNotIn("sceNetInetGetsockopt(", source)
+        self.assertNotIn("setsockopt(", source)
+        self.assertNotIn("sceKernelChangeThreadPriority(", source)
+        self.assertIn("errno = saved_errno;", source)
+        # Snapshot before logging: the logger's semaphore is not transport work.
+        self.assertLess(source.index("memcpy(calls, probe_calls"),
+                        source.index('psp_log_printf("tilefinch-transport-call:'))
+
     def test_navigation_watchdog_is_one_bounded_minute(self):
         header = (ROOT / "src/psp_app/psp_app_internal.h").read_text()
         self.assertRegex(header, r"#define PSP_NAVIGATION_JOB_TIMEOUT_US UINT64_C\(60000000\)")

@@ -23,6 +23,8 @@
 uint64_t frame_checksum(const uint16_t *pixels, size_t pixel_count);
 lxb_dom_node_t *test_reader_find_id(lxb_dom_node_t *root, const char *wanted);
 int test_loading_interaction_journey(void);
+int test_script_free_browsing_journey(void);
+int test_background_interruption_journey(void);
 int test_deferred_startup_journey(void);
 int test_deferred_image_publication_survives_rebuild(void);
 int test_deferred_images_skip_oversized_pages(void);

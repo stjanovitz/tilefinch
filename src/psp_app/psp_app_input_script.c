@@ -382,8 +382,9 @@ void psp_input_script_observe_page(
            page_url == NULL ? "" : page_url);
     printf("tilefinch-input-script-js: mark=%s discovered=%zu attempted=%zu "
            "loaded=%zu failed=%zu bytecode=%zu/%zu/%zu "
-           "dynamic=%zu/%zu/%zu/%zu/%zu/%zu/%zu pending=%zu summary=\"%.96s\" "
-           "error=\"%.160s\"\n",
+           "dynamic=%zu/%zu/%zu/%zu/%zu/%zu/%zu pending=%zu "
+           "compile-us=%llu/%llu/%llu/%llu execute-us=%llu/%llu/%llu/%llu "
+           "summary=\"%.96s\" error=\"%.160s\"\n",
            mark, navigation->script_discovered,
            navigation->script_attempted, navigation->script_loaded,
            navigation->script_failed,
@@ -398,6 +399,14 @@ void psp_input_script_observe_page(
            page->script_result.dynamic_scripts_quota_rejected,
            page->script_result.dynamic_script_bytes,
            page->script_result.pending_tasks,
+           (unsigned long long) page->script_result.compile_us[1],
+           (unsigned long long) page->script_result.compile_us[2],
+           (unsigned long long) page->script_result.compile_us[3],
+           (unsigned long long) page->script_result.compile_us[0],
+           (unsigned long long) page->script_result.execute_us[1],
+           (unsigned long long) page->script_result.execute_us[2],
+           (unsigned long long) page->script_result.execute_us[3],
+           (unsigned long long) page->script_result.execute_us[0],
            page->script_result.summary, page->script_result.error);
     printf("tilefinch-input-script-images: mark=%s cursor=%zu/%zu "
            "job=%d batch=%u attempts=%zu loaded=%zu failed=%zu "

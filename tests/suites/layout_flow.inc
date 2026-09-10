@@ -1275,6 +1275,29 @@ static int test_overflow_index_uses_nearby_bands(Budget *budget)
         CHECK(layout.late_positioned_orders[i] == 2 * i + 1);
     }
     CHECK(layout.layout_work_units < 100000);
+    /* Late-positioned commands retain their ordinary document-y index.
+       Hoisting a large context must not force a whole-document walk on
+       every small viewport repaint. All odd records are now red overlays. */
+    uint32_t *late = budget_realloc(budget, layout.late_positioned_orders,
+        PAIRS * sizeof(*late));
+    CHECK(late != NULL);
+    layout.late_positioned_orders = late;
+    layout.late_positioned_order_count = PAIRS;
+    for (size_t i = 0; i < PAIRS; i++) {
+        size_t index = 2 * i + 1;
+        late[i] = (uint32_t) index;
+        layout.command_flags[index] |= LAYOUT_COMMAND_LATE_POSITIONED;
+        layout.commands[index].color = 0xff0000;
+        layout.commands[index].opacity_scale = 256;
+    }
+    TileCache cache = {0};
+    uint16_t frame[64 * 64];
+    CHECK(tile_cache_init(&cache, budget, &layout, 1)
+        && tile_cache_set_frame(&cache, frame, 64 * 64)
+        && tile_cache_render_frame(&cache, 0, 64, 64, NULL));
+    CHECK(frame[5 * 64 + 5] == 0xf800);
+    CHECK(cache.command_candidates < 128);
+    tile_cache_destroy(&cache);
     budget_free(budget, context);
     layout_destroy(&layout);
     CHECK(budget->current == 0);
@@ -2432,7 +2455,10 @@ static int test_stylesheet_append_matches_rebuild(Budget *budget)
         "p.q{font-weight:bold}";
     static const char rest[] =
         "</style><body><div id=host>"
-        "<style>.y{color:#333333}p.z{--tone:#444444;color:var(--tone)}</style>"
+        "<style>.y{color:#333333}p.z{--tone:#444444;color:var(--tone)}"
+        ".flag:has(.inner) ~ .after{color:#abcdef}</style>"
+        "<div class=flag id=flag><span class=inner></span></div>"
+        "<p class=after>relational</p>"
         "<p class=x>one</p><p class=y>two</p><p class=z>three</p>"
         "<p class=w>four</p><p class=q>five</p><span class=w>six</span></div>";
     size_t length = sizeof(head_css) - 1u;
@@ -2497,6 +2523,9 @@ static int test_stylesheet_append_matches_rebuild(Budget *budget)
     layout_reuse_cache_note_stylesheet_appended(
         reuse, &appended, result.remap, result.old_count, result.appended,
         result.appended_count, true);
+    CHECK(reuse->has_rule_count == 1
+          && strcmp(appended.rules[reuse->has_rules[0]].selector,
+                    ".flag:has(.inner) ~ .after") == 0);
     stylesheet_append_result_release(&appended, &result);
     /* Reference: a sheet built from the final document, no reuse. */
     Stylesheet rebuilt = {0};
@@ -2523,6 +2552,19 @@ static int test_stylesheet_append_matches_rebuild(Budget *budget)
     layout_destroy(&reference);
     layout_destroy(&retained);
     layout_destroy(&fresh);
+    /* The inserted head sheet moves the body's :has() rule ordinal. Losing
+       its match must invalidate the remapped rule, not an unrelated rule. */
+    lxb_dom_node_t *flag = find_id(document_body_node(&document), "flag");
+    CHECK(flag != NULL && flag->first_child != NULL);
+    lxb_dom_node_t *inner = flag->first_child;
+    lxb_dom_node_remove(inner);
+    layout_reuse_cache_invalidate_structure(reuse, flag);
+    CHECK(layout_build_context_reuse(&retained, budget, &document, &appended,
+        NULL, NULL, &viewport, reuse));
+    const DrawCommand *relational = text_command(&retained, "relational");
+    CHECK(relational != NULL && relational->color == 0x111111);
+    layout_destroy(&retained);
+    lxb_dom_node_destroy_deep(inner);
     /* A second append at the very end (after the body style) as well. */
     lxb_dom_node_t *body = document_body_node(&document);
     lxb_dom_node_t *tail = insert_style_element(

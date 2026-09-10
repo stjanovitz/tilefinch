@@ -116,6 +116,128 @@ ordering.
 
 ## TLS policy and performance
 
+### Attributing long worker calls on hardware
+
+Validation EBOOTs and their PSPLink developer PRXs include bounded linker
+probes; ordinary shipping builds do not. `tilefinch-transport-call` reports
+elapsed and worker **run-clock** time for a slow `curl_multi_perform` or
+`curl_multi_poll` (`op=perform|poll`), followed
+by scheduling counts and inclusive DNS/connect/select/recv/send/semaphore/delay
+timings. `release=0` means the worker did not voluntarily block during that
+call. Primitive times can include preemption and nested calls; do not add them
+as disjoint CPU categories. Records are snapshotted before the diagnostic
+logger takes its own semaphore. This logging is a validation-only exception
+to the worker's no-logger contract, not shipping telemetry.
+
+After curl successfully enables nonblocking mode, the probe reads back
+`SO_NONBLOCK` through **libc `getsockopt`**. Curl has a libc descriptor, not a
+firmware socket number. `CURLOPT_SOCKOPTFUNCTION` runs before curl enables
+nonblocking mode, so reading there would produce a misleading failure. The
+probe never changes socket mode, scheduling, or request ownership, and preserves
+the wrapped call's result/errno. It also records zero-timeout `select` separately.
+The `net-select` primitive measures the SDK's underlying `sceNetInetSelect`;
+its final diagnostic argument is the requested timeout in microseconds
+(zero is exactly zero, -1 means no timeout), not a socket descriptor.
+
+September 9 physical-PSP measurements reproduced the reported long wall calls:
+
+| Call | Elapsed | Worker CPU | Relevant evidence |
+| --- | ---: | ---: | --- |
+| Pre-fix diagnostic run | 15,582 ms | 1.18 ms | No DNS/connect/select; recv 26 us, send 377 us |
+| Repeat with wait probes | 8,895 ms | 2,066 ms | Priority 0x21; release=0; semaphore total 758 us; no delay calls |
+| Narrowed setup-classifier experiment | 8,941 ms | 2,037 ms | Same pattern; TLS connection completion dominated actual CPU work |
+
+Observed nonblocking readbacks succeeded. These initial perform samples do
+**not** support changing socket mode or replacing the multi API: their long
+wall time is largely descheduling, with separate genuine TLS CPU cost. A reused
+request's zero DNS/connect/TLS timers cannot identify what another connection
+did inside the shared multi call.
+
+Subsequent poll attribution isolated a second mechanism: a 6,397 ms poll used
+only 318 us of worker CPU and spent 6,396 ms inside select, with two voluntary
+wait releases. Direct firmware-select instrumentation then measured zero-timeout
+calls taking 2,662 and 3,746 ms. A temporary zero-timeout `sceNetInetPoll` before
+the select moved the stall into that extra poll (6,520 ms); it did not fix it.
+The extra call was removed. Do not replace select with poll on this evidence.
+
+Thread dumps showed firmware network service runnable below the browser.
+Raising the two `sceNetInit` service priorities from 42 to 30 was also rejected:
+the priorities were verified on device, but a completed repeat still recorded
+a 3,755 ms poll. Other firmware dependencies remain; adjusting those two
+priorities alone does not resolve the wait. Their original priorities are kept.
+
+Rejected experiment: use `CURLINFO_PRETRANSFER_TIME_T` to stop classifying a
+connected request waiting for headers as setup. Setup-call counts fell, but the
+repeat's worst call was unchanged (8.895 vs 8.941 seconds); the change was removed.
+It does not solve CPU sharing during actual TLS work. Do not retry as a claimed
+stall fix without a fixture isolating header-wait starvation. Raising the worker
+priority wholesale would instead let the roughly two-second TLS CPU burst block
+browser work.
+
+Bounded owner CPU-sharing experiments request a 2 ms sleep with at least 4 ms
+between completed donations, after input/presentation and only without
+cancellation. Setup eligibility is published before lowering worker priority
+and cleared after restoring it. The owner checks whether setup work is runnable
+only at the donation cadence, not at every layout checkpoint. Completed
+setup-only runs reduced worst perform to 1,178–2,309 ms from the 8,895 ms
+baseline. Page loads remained about 34–35 seconds; this is transport progress,
+not a claim of faster navigation. Settled cursor feedback stayed about 7.2 ms
+average / 16.7 ms maximum, 240/240 samples presented and none over 33 ms.
+Requested sleeps can run longer through preemption (observed maximum 7.7 ms).
+
+The retained fix also publishes a lease around the existing worker poll. While
+that lease is active, the owner may donate even if the worker is waiting:
+firmware services below both threads need that CPU window to complete a socket
+probe. No extra poll is issued, no thread priority is changed by the checkpoint,
+and no request deadline or cancellation rule changes. With no active setup/poll,
+the checkpoint returns without a clock read or sleep. The poll lease is used
+only in the existing branch with transport work; an idle worker waits on its
+event flag as before.
+
+Three final physical-PSP runs with the original firmware thread priorities:
+
+| Scenario | Page load | Images loaded | Worst perform | Worst poll | Exit |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Settled cursor, first | 37,110 ms | 17 | 2,688 ms | 88 ms | clean |
+| Settled cursor, repeat | 36,825 ms | 22 | 2,299 ms | 59 ms | clean |
+| Native menu/cursor | 37,242 ms | 17 | 2,671 ms | 127 ms | clean |
+
+The settled tests each presented all 240 cursor samples, average 7.2 ms,
+maximum 16.7 ms, none over 33 ms. The native-menu scenario completed its
+15 action/wait steps and terminal `end`; its 12 cursor samples likewise stayed
+under 16.7 ms. It began after commit with no pending resources, so it does not
+prove interruption during initial resource loading. Across these runs the
+owner donated 3.61–3.74 seconds total; the longest observed individual donation
+including preemption was 13.5 ms. Image completion counts vary, so these live
+loads are not a controlled throughput comparison. Multi-second TLS CPU and
+page style/resource cost remain separate work.
+
+Two earlier diagnostic runs returned to PSPLink before a report completed,
+without user input. Their last persisted record was initial navigation, not
+a recorded HOME request or clean exit; the cause remains unresolved. One used
+the extra poll experiment and one did not, so removing that probe is **not**
+proof of an exit fix. Keep the incomplete logs and do not count either as a
+passing journey. The three final runs above completed, but do not qualify a
+release or the script-enabled dynamic-request case.
+
+All five baseline journeys completed the cursor/menu script and exited. They
+used a script-free article response (`scripts discovered=0`); they reproduce
+shared transport contention but do **not** qualify the dynamic auto-login script
+path. Raw logs belong in private device artifacts, not the public repository.
+
+Baseline gates: 150 host tests passed, external update-root proof skipped, optional
+device-cost test disabled. Ordinary and validation named PSP targets passed;
+ELF `.text` was 4,125,856/4,480,000 and 4,242,608/4,500,000 bytes respectively.
+The ordinary ELF has no probe wrapper symbols. No release or XMB deployment was
+performed for this investigation.
+
+CPU-sharing fix gates: all 150 enabled, available host tests passed (external
+update-root proof skipped, optional device-cost test disabled). Ordinary and
+validation named PSP targets passed at 4,126,324 and 4,243,776 bytes of `.text`,
+respectively, within unchanged ceilings. The new source-contract test failed
+when the owner donation call was removed and passed when restored; bounded
+cadence tests cover inactive work, spacing, clock reversal and integer limits.
+
 Handshake acceleration does not weaken certificate, hostname, protocol, or
 cipher validation.
 

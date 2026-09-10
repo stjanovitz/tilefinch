@@ -1,0 +1,16 @@
+focus-id searchInput
+type psp
+activate
+body-contains Search results for psp
+focus-url https://search-journey.test/wiki/PlayStation_Portable
+activate
+body-contains Portable article
+focus-id history-toggle
+activate
+page-down
+page-up
+back
+body-contains Search results for psp
+back
+body-contains Search
+quit

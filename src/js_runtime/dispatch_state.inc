@@ -609,6 +609,16 @@ void script_runtime_set_synchronous_layout_callback(
         callback == NULL ? NULL : opaque;
 }
 
+void script_runtime_set_node_retirement_callback(
+    ScriptRuntime *runtime, ScriptNodeRetirementCallback callback,
+    void *opaque)
+{
+    if (runtime == NULL) return;
+    runtime->bridge.node_retirement = callback;
+    runtime->bridge.node_retirement_opaque =
+        callback == NULL ? NULL : opaque;
+}
+
 bool script_runtime_set_page_scroll(ScriptRuntime *runtime, int scroll_y)
 {
     if (runtime == NULL) return false;

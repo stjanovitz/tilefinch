@@ -501,6 +501,9 @@ void layout_reuse_cache_reset(LayoutReuseCache *cache)
     cache->images = NULL;
     cache->viewport_width = 0;
     cache->selector_has_has = false;
+    cache->selector_has_has_sibling = false;
+    cache->has_rule_count = 0;
+    cache->has_rules_bounded = false;
     cache->selector_has_focus_within = false;
     cache->selector_focus_has_sibling = false;
     cache->selector_has_structure = false;
@@ -508,7 +511,7 @@ void layout_reuse_cache_reset(LayoutReuseCache *cache)
 }
 
 static void layout_reuse_note_selector_dependencies(
-    LayoutReuseCache *cache, const char *selector);
+    LayoutReuseCache *cache, const char *selector, uint32_t rule_index);
 
 void layout_reuse_cache_enable_retained_matches(LayoutReuseCache *cache)
 {
@@ -542,11 +545,22 @@ void layout_reuse_cache_note_stylesheet_appended(
                 cache->matches, sheet, appended, appended_count);
         }
     }
+    /* Rule ordinals move when a style element is inserted before an old
+       source. Relational invalidation must follow the same remap as matches. */
+    for (size_t i = 0; i < cache->has_rule_count; i++) {
+        uint32_t old = cache->has_rules[i];
+        if (!lists_valid || remap == NULL || old >= old_count
+            || remap[old] == UINT16_MAX) {
+            cache->has_rules_bounded = true;
+            break;
+        }
+        cache->has_rules[i] = remap[old];
+    }
     bool had_has = cache->selector_has_has;
     for (size_t i = 0; i < appended_count; i++) {
         if (appended[i] < sheet->count) {
             layout_reuse_note_selector_dependencies(
-                cache, sheet->rules[appended[i]].selector);
+                cache, sheet->rules[appended[i]].selector, appended[i]);
         }
     }
     if (cache->selector_has_has && !had_has && cache->matches != NULL) {
@@ -794,7 +808,9 @@ void layout_reuse_cache_invalidate_attribute(
 
 void layout_reuse_cache_flush_invalidations(LayoutReuseCache *cache)
 {
-    if (cache == NULL || !cache->pending_active) return;
+    if (cache == NULL) return;
+    cache->structure_pass_done = false;
+    if (!cache->pending_active) return;
     if (cache->matches != NULL) {
         if (cache->pending_overflow || cache->sheet == NULL) {
             style_retained_matches_clear(cache->matches);
@@ -823,6 +839,101 @@ void layout_reuse_cache_detach_matches(const Stylesheet *sheet,
                                        void *previous)
 {
     (void) style_retained_matches_attach(sheet, previous);
+}
+
+void layout_reuse_cache_invalidate_structure(LayoutReuseCache *cache,
+                                             lxb_dom_node_t *node)
+{
+    if (cache == NULL || node == NULL) {
+        layout_reuse_cache_reset(cache);
+        return;
+    }
+    /* A child list changed under `node`. Without :has() the effect is bound
+       to the parent scope (structural pseudo-classes, sibling combinators).
+       With :has() every ancestor may gain or lose a match; their exact
+       lists and computed styles go, and descendants re-key off the changed
+       parent styles. Only :has() with a sibling combinator can reach an
+       ancestor's siblings, which stays a reset. */
+    if (cache->selector_has_has_sibling
+        && (cache->has_rules_bounded || cache->matches == NULL
+            || cache->sheet == NULL)) {
+        layout_reuse_cache_reset(cache);
+        return;
+    }
+    layout_reuse_invalidate_scoped_internal(cache, node, true, true);
+    if (!cache->selector_has_has) return;
+    if (cache->selector_has_has_sibling && !cache->structure_pass_done) {
+        /* A :has() reachable through a sibling combinator can change any
+           element's answer; drop exactly the lists those rules' fast keys
+           can select (all of them for a keyless rule), and every computed
+           style, which those answers feed. The lists of everything else
+           replay. Once per journal: nothing resolves between records. */
+        memset(cache->styles, 0, sizeof(cache->styles));
+        style_retained_matches_invalidate_rules(
+            cache->matches, cache->sheet, cache->has_rules,
+            cache->has_rule_count);
+        cache->structure_pass_done = true;
+    }
+    for (size_t i = 0; i < LAYOUT_REUSE_STYLE_CAPACITY; i++) {
+        LayoutReuseStyleEntry *entry = &cache->styles[i];
+        if (entry->node != NULL
+            && layout_node_is_within(node, entry->node)) {
+            memset(entry, 0, sizeof(*entry));
+        }
+    }
+    style_retained_matches_invalidate_ancestors(cache->matches, node);
+}
+
+void layout_reuse_cache_enable_node_retirement(LayoutReuseCache *cache)
+{
+    if (cache != NULL) cache->node_retirement = true;
+}
+
+bool layout_reuse_cache_node_retirement(const LayoutReuseCache *cache)
+{
+    return cache != NULL && cache->node_retirement;
+}
+
+void layout_reuse_cache_retire_subtree(LayoutReuseCache *cache,
+                                       const lxb_dom_node_t *root)
+{
+    if (cache == NULL || root == NULL) return;
+    /* Only elements own entries; a text or comment root (textContent
+       assignments discard one such child at a time) has nothing cached. */
+    if (root->type != LXB_DOM_NODE_TYPE_ELEMENT) return;
+    lxb_dom_node_t *scope = (lxb_dom_node_t *) root;
+    for (size_t i = 0; i < LAYOUT_REUSE_STYLE_CAPACITY; i++) {
+        LayoutReuseStyleEntry *entry = &cache->styles[i];
+        if (entry->node != NULL
+            && layout_node_is_within(entry->node, scope)) {
+            memset(entry, 0, sizeof(*entry));
+        }
+    }
+    for (size_t i = 0; i < LAYOUT_REUSE_INTRINSIC_CAPACITY; i++) {
+        LayoutIntrinsicCacheEntry *entry = &cache->intrinsic[i];
+        if (entry->node != NULL
+            && layout_node_is_within(entry->node, scope)) {
+            memset(entry, 0, sizeof(*entry));
+        }
+    }
+    for (size_t i = 0; cache->table_rows != NULL
+                       && i < LAYOUT_REUSE_TABLE_ROW_CAPACITY; i++) {
+        LayoutReuseTableRowEntry *entry = &cache->table_rows[i];
+        if (entry->row != NULL
+            && layout_node_is_within(entry->row, scope)) {
+            memset(entry, 0, sizeof(*entry));
+        }
+    }
+    style_retained_matches_forget_subtree(cache->matches, scope);
+    /* A pending token invalidation must not name a node about to die. */
+    size_t kept = 0;
+    for (size_t i = 0; i < cache->pending_node_count; i++) {
+        const lxb_dom_node_t *pending = cache->pending_nodes[i];
+        if (layout_node_is_within((lxb_dom_node_t *) pending, scope)) continue;
+        cache->pending_nodes[kept++] = pending;
+    }
+    cache->pending_node_count = kept;
+    cache->stats.retired_subtrees++;
 }
 
 void layout_reuse_cache_invalidate_node(LayoutReuseCache *cache,
@@ -901,10 +1012,21 @@ bool layout_reuse_cache_can_reuse_mutations(const LayoutReuseCache *cache)
 }
 
 static void layout_reuse_note_selector_dependencies(
-    LayoutReuseCache *cache, const char *selector)
+    LayoutReuseCache *cache, const char *selector, uint32_t rule_index)
 {
     if (cache == NULL || selector == NULL) return;
-    if (strstr(selector, ":has(") != NULL) cache->selector_has_has = true;
+    if (strstr(selector, ":has(") != NULL) {
+        cache->selector_has_has = true;
+        if (strchr(selector, '+') != NULL || strchr(selector, '~') != NULL) {
+            cache->selector_has_has_sibling = true;
+        }
+        if (rule_index == UINT32_MAX
+            || cache->has_rule_count == LAYOUT_REUSE_HAS_RULE_LIMIT) {
+            cache->has_rules_bounded = true;
+        } else {
+            cache->has_rules[cache->has_rule_count++] = rule_index;
+        }
+    }
     if (strstr(selector, ":focus-within") != NULL) {
         cache->selector_has_focus_within = true;
     }
@@ -962,17 +1084,20 @@ void layout_reuse_cache_prepare(LayoutReuseCache *cache,
     cache->images = images;
     cache->viewport_width = viewport_width;
     cache->selector_has_has = false;
+    cache->selector_has_has_sibling = false;
     cache->selector_has_focus_within = false;
     cache->selector_focus_has_sibling = false;
     cache->selector_has_structure = false;
+    cache->has_rule_count = 0;
+    cache->has_rules_bounded = false;
     if (sheet == NULL) return;
     for (size_t i = 0; i < sheet->count; i++) {
         layout_reuse_note_selector_dependencies(
-            cache, sheet->rules[i].selector);
+            cache, sheet->rules[i].selector, (uint32_t) i);
     }
     for (size_t i = 0; i < sheet->custom_rule_count; i++) {
         layout_reuse_note_selector_dependencies(
-            cache, sheet->custom_rules[i].selector);
+            cache, sheet->custom_rules[i].selector, UINT32_MAX);
     }
 }
 

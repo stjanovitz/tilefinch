@@ -2,7 +2,7 @@ static void usage(const char *program)
 {
     fprintf(stderr,
             "usage: %s [--fixture FILE | --url URL] [--fetch-scripts] "
-            "[--ticks N] [--tick-ms N] [--focus-next N] [--type TEXT] "
+            "[--no-javascript] [--ticks N] [--tick-ms N] [--focus-next N] [--type TEXT] "
             "[--media-file MP4 | --media-url URL] "
             "[--pace-real-time] "
             "[--focus-id ID] [--click-selector CSS] [--interaction-ticks N] "

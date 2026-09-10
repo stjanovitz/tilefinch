@@ -153,6 +153,17 @@ static int test_animated_canvas_follows_transactional_page_move(void)
     fetch_trace_end();
 
     NavigationSession *navigation = browser_engine_navigation(engine);
+    CHECK(navigation != NULL && navigation->page.layout_reuse != NULL
+          && layout_reuse_cache_node_retirement(navigation->page.layout_reuse));
+    LayoutReuseStats retirement_before = {0}, retirement_after = {0};
+    layout_reuse_cache_stats(navigation->page.layout_reuse, &retirement_before);
+    CHECK(script_runtime_evaluate_diagnostic(navigation->page.runtime,
+        "var retiredHost=document.createElement('div');"
+        "retiredHost.innerHTML='<span>temporary</span>';"
+        "document.body.appendChild(retiredHost);retiredHost.innerHTML='';",
+        "<promoted-retirement>", &navigation->page.script_result));
+    layout_reuse_cache_stats(navigation->page.layout_reuse, &retirement_after);
+    CHECK(retirement_after.retired_subtrees > retirement_before.retired_subtrees);
     bool visible_changed = false;
     CHECK(navigation != NULL
           && navigation->page.images.count == 0

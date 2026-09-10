@@ -8,6 +8,14 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.18 — 2026-09-09
+
+- More responsive browsing and improved network reliability.
+- Faster video descriptions and comments, with corrected scroll positioning.
+- More reliable Wikipedia browsing.
+- Weekly automatic update checks enabled by default.
+- Additional memory and stability fixes.
+
 ## 0.1.17 — 2026-09-08
 
 - Faster, more responsive page loading and navigation.
