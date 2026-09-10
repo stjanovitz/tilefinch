@@ -247,6 +247,12 @@ When a page cannot open, Tilefinch keeps the last usable page and presents
 recovery choices that fit the failure: retry, Reader mode, Wi-Fi sign-in,
 site-scoped JavaScript disablement, or lower-bandwidth media settings.
 
+Wikipedia opens with page JavaScript off by default for more responsive
+browsing; its search forms, article links, and scrolling work without it.
+To opt in, use **Page tools → Site information → Permissions & controls →
+JavaScript**. This saved choice applies to Wikipedia's language subdomains;
+**Reset permissions** restores the default. Other sites are unchanged.
+
 Basic ad blocking and conservative cosmetic hiding are on by default.
 **Settings → Privacy & security → Content blocker** selects Off, Basic, or Custom;
 **Hide page ads** controls only cosmetic hiding, and **Page tools → Site
@@ -270,7 +276,7 @@ can clear data for that site or reset all of its compatibility exceptions.
 ## Updating
 
 Updates are checked from **Settings → Updates**. An optional
-background check looks for new release metadata at most twice a week and can
+background check looks for new release metadata at most once a week and can
 be turned off in Settings; Tilefinch never downloads or installs an update
 without you asking. Stable and Beta releases are cryptographically signed and
 verified before installation. The explicitly selected Developer channel is
@@ -301,7 +307,7 @@ it is installed into the inactive slot and must pass the same trial boot.
   saving** can disable this
   cross-boot storage without disabling live connection reuse.
 - The device contacts only the sites you visit, plus — if the update check
-  is enabled — the GitHub releases API at most twice a week to compare
+  is enabled — the GitHub releases API at most once a week to compare
   version numbers. That check can be turned off in Settings and sends no
   identifying information beyond an ordinary HTTPS request.
 - **Help & diagnostics → Check Wi-Fi sign-in** makes one cookie-free HTTP

@@ -726,6 +726,10 @@ bool fetch_background_transport_cancel(
 size_t fetch_background_transport_active_operations(void);
 /* Sleeps only the calling PSP thread; transport continues on its worker. */
 void fetch_background_transport_wait(unsigned milliseconds);
+/* Browser-owner checkpoint only. Donate a bounded PSP CPU slice during
+   connection setup or polling (including lower-priority firmware service).
+   No-op on host/inactive; call after input/presentation and cancellation. */
+void fetch_background_transport_cooperate(uint64_t now_us);
 /* Begin cancellation without waiting, then sample whether every worker/curl
    lease has retired.  Supervisors use this pair to keep teardown pumped. */
 void fetch_background_transport_request_quiesce(void);

@@ -3387,6 +3387,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
         }
         psp_log_set_phase(PSP_LOG_PHASE_INTERACTIVE);
         psp_log_heartbeat();
+        psp_log_set_stage("frame");
         /*
          * The navigation boot owed the user. It starts from inside the
          * interactive loop, not in front of it: the surface is already
@@ -3840,6 +3841,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     && !navigation_background_resources_pending(
                            engine_views->navigation);
                 if (supervisor_owns_script) {
+                    psp_log_set_stage("frame-supervised-script");
                     memset(&input, 0, sizeof(input));
                     input.analog_x = 128;
                     input.analog_y = 128;
@@ -4487,7 +4489,7 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
             if (check_found_release
                 || check_phase
                        == TILEFINCH_UPDATE_CLIENT_UP_TO_DATE) {
-                /* Only a completed check advances the twice-a-week
+                /* Only a completed check advances the weekly
                    cadence; failed or cancelled attempts stay silent
                    and retry on a later boot. */
                 update_check_completed++;

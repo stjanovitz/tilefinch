@@ -13,15 +13,17 @@ int test_deferred_startup_journey(void)
     config.resources.web_fonts_enabled = false;
     config.resources.maximum_images = 12;
     char error[256] = {0};
-    for (unsigned mutation = 0; mutation < 7; mutation++) {
+    for (unsigned mutation = 0; mutation < 8; mutation++) {
         BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
-        CHECK(engine != NULL && fetch_trace_replay_begin(mutation >= 4
+        CHECK(engine != NULL && fetch_trace_replay_begin(mutation == 7
+            ? TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-image-failure"
+            : mutation >= 4
             ? TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-image-order"
             : TILEFINCH_TEST_SOURCE_DIR "/tests/fixtures/http-interactive-images", error, sizeof(error)));
         CHECK(browser_engine_load_url(engine, "https://interactive-images.test/page", true));
         NavigationSession *nav = browser_engine_navigation(engine);
         CHECK(nav->page.loaded && nav->page.image_continuation_pending
-            && nav->page.deferred_image_count == (mutation >= 4 ? 5u : 3u)
+            && nav->page.deferred_image_count == (mutation >= 4 && mutation < 7 ? 5u : 3u)
             && nav->page.runtime != NULL);
         lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
         lxb_dom_node_t *hero = test_reader_find_id(root, "hero");
@@ -59,6 +61,20 @@ int test_deferred_startup_journey(void)
             CHECK(script_runtime_evaluate_diagnostic(nav->page.runtime,
                 "clearInterval(startupTimer)", "<startup-idle-finished>",
                 &nav->page.script_result));
+        }
+        if (mutation == 7) {
+            for (unsigned pump = 0; nav->page.image_continuation_pending && pump < 512; pump++) {
+                bool changed = false;
+                (void) browser_engine_run_deferred_image_work(engine, &changed);
+                CHECK(nav->page.loaded && browser_engine_focus_move(engine, true)
+                    && browser_engine_render_frame(engine, NULL));
+            }
+            CHECK(!nav->page.image_continuation_pending
+                && !image_resource_available(images_find_node(&nav->page.images, hero))
+                && image_resource_available(images_find_node(&nav->page.images, tail))
+                && nav->performance.background_image_failures > 0
+                && browser_engine_last_error(engine)[0] == '\0');
+            goto teardown;
         }
         if (mutation >= 5) {
             /* All eager images are outside this viewport. The nearest two
@@ -292,6 +308,221 @@ int test_deferred_images_skip_oversized_pages(void)
     CHECK(browser_engine_metrics(engine, &metrics)
         && metrics.budget_current == 0 && metrics.budget_active_allocations == 0);
     browser_engine_destroy(engine);
+    return 0;
+}
+
+/* Bound pumps, not host wall time: replay delay and owner lifetimes must be
+   deterministic on slow CI too. While loading, the incumbent remains usable. */
+static int journey_finish_navigation(BrowserEngine *engine)
+{
+    BrowserNavigationJobStatus status = browser_engine_navigation_status(engine);
+    for (unsigned pump = 0; pump < 256 && status == BROWSER_NAVIGATION_JOB_PENDING;
+         pump++) {
+        status = browser_engine_pump_navigation(engine, NULL);
+        NavigationSession *nav = browser_engine_navigation(engine);
+        if (nav->page.loaded && status == BROWSER_NAVIGATION_JOB_PENDING)
+            CHECK(browser_engine_render_frame(engine, NULL));
+    }
+    if (status != BROWSER_NAVIGATION_JOB_SUCCEEDED)
+        fprintf(stderr, "journey navigation status=%d error=%s\n", (int) status,
+            browser_engine_last_error(engine));
+    CHECK(status == BROWSER_NAVIGATION_JOB_SUCCEEDED
+        && browser_engine_render_frame(engine, NULL));
+    return 0;
+}
+
+static int script_free_browsing_journey(size_t memory_limit)
+{
+    BrowserDeviceProfile profile;
+    browser_device_profile_psp3000(&profile);
+    BrowserConfig config;
+    browser_config_init(&config, &profile);
+    config.memory_limit = memory_limit;
+    config.javascript.enabled = false;
+    config.javascript.document_scripts_enabled = false;
+    config.resources.web_fonts_enabled = false;
+    char error[256] = {0};
+    BrowserEngine *engine = browser_engine_create(&config, error, sizeof(error));
+    CHECK(engine != NULL && fetch_trace_replay_begin_response_keyed(TILEFINCH_TEST_SOURCE_DIR
+        "/tests/fixtures/http-pointer-search", error, sizeof(error)));
+    CHECK(browser_engine_begin_navigation_url(engine, "https://search-journey.test/",
+        65536, 1000, true) && journey_finish_navigation(engine) == 0);
+    NavigationSession *nav = browser_engine_navigation(engine);
+    lxb_dom_node_t *root = lxb_dom_interface_node(nav->page.document.html);
+    lxb_dom_node_t *search = test_reader_find_id(root, "searchInput");
+    CHECK(nav->page.runtime == NULL && search != NULL
+        && browser_engine_focus_node(engine, search));
+    int x, y, width, height;
+    CHECK(controller_focused_rect(browser_engine_controller(engine),
+        &x, &y, &width, &height));
+    x = viewport_css_to_device(&nav->page.layout.viewport, x + width / 2);
+    y = viewport_css_to_device(&nav->page.layout.viewport,
+        y - navigation_current(nav)->scroll_y + height / 2);
+    bool activate = false, changed = false;
+    CHECK(browser_engine_pointer_event(engine, CONTROLLER_POINTER_DOWN,
+              x, y, &activate, &changed)
+        && browser_engine_pointer_event(engine, CONTROLLER_POINTER_UP,
+              x, y, &activate, &changed)
+        && activate && browser_engine_pointer_commit_click(engine));
+    ControllerTextInputInfo input = {0};
+    CHECK(browser_engine_text_input_info(engine, &input) && input.editable
+        && browser_engine_insert_text(engine, "psp", 3));
+    ControllerAction action = {0};
+    CHECK(browser_engine_activate(engine, &action)
+        && action.type == CONTROLLER_ACTION_FORM_SUBMIT
+        && strstr(action.url, "search=psp") != NULL
+        && browser_engine_begin_navigation_action(engine, &action, 65536, 1000)
+        && journey_finish_navigation(engine) == 0);
+    CHECK(nav->page.runtime == NULL && nav->page.layout.link_count >= 2);
+    lxb_dom_node_t *article = nav->page.layout.links[0].node;
+    CHECK(browser_engine_focus_node(engine, article)
+        && browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN)
+        && browser_engine_render_frame(engine, NULL)
+        && browser_engine_focus_direction(engine, CONTROLLER_FOCUS_UP)
+        && browser_engine_render_frame(engine, NULL)
+        && browser_engine_activate(engine, &action)
+        && strcmp(action.url, "https://search-journey.test/wiki/PlayStation_Portable") == 0
+        && browser_engine_begin_navigation_action(engine, &action, 65536, 1000)
+        && journey_finish_navigation(engine) == 0);
+    root = lxb_dom_interface_node(nav->page.document.html);
+    lxb_dom_node_t *toggle = test_reader_find_id(root, "history-toggle");
+    int collapsed_height = nav->page.layout.height;
+    CHECK(toggle != NULL && browser_engine_focus_node(engine, toggle)
+        && browser_engine_activate(engine, &action)
+        && action.type == CONTROLLER_ACTION_CONTROL
+        && nav->page.layout.height > collapsed_height
+        && browser_engine_render_frame(engine, NULL)
+        && browser_engine_scroll_by(engine, 240)
+        && browser_engine_render_frame(engine, NULL)
+        && browser_engine_scroll_by(engine, -240)
+        && browser_engine_begin_navigation_history(engine, false, 65536, 1000)
+        && journey_finish_navigation(engine) == 0);
+    CHECK(strstr(navigation_current(nav)->url, "/find?") != NULL
+        && browser_engine_controller(engine)->focus_node != NULL
+        && browser_engine_activate(engine, &action)
+        && strcmp(action.url, "https://search-journey.test/wiki/PlayStation_Portable") == 0);
+    CHECK(browser_engine_begin_navigation_history(engine, false, 65536, 1000)
+        && journey_finish_navigation(engine) == 0
+        && strcmp(navigation_current(nav)->url, "https://search-journey.test/") == 0
+        && nav->page.runtime == NULL);
+    /* Repeated restoration, including form values and native disclosures,
+       must not depend on a live script realm or one lucky history traversal. */
+    for (unsigned repeat = 0; repeat < 3; repeat++) {
+        CHECK(browser_engine_begin_navigation_history(engine, true, 65536, 1000)
+            && journey_finish_navigation(engine) == 0
+            && strstr(navigation_current(nav)->url, "/find?") != NULL
+            && browser_engine_begin_navigation_history(engine, true, 65536, 1000)
+            && journey_finish_navigation(engine) == 0
+            && strstr(navigation_current(nav)->url, "/wiki/") != NULL
+            && browser_engine_begin_navigation_history(engine, false, 65536, 1000)
+            && journey_finish_navigation(engine) == 0
+            && browser_engine_begin_navigation_history(engine, false, 65536, 1000)
+            && journey_finish_navigation(engine) == 0);
+        root = lxb_dom_interface_node(nav->page.document.html);
+        CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "searchInput"))
+            && browser_engine_text_input_info(engine, &input)
+            && browser_engine_render_frame(engine, NULL));
+    }
+    /* Timeout and cancellation keep the incumbent interactive. Pump the
+       real asynchronous receiver, changing visible focus while it waits. */
+    for (unsigned cancel = 0; cancel < 2; cancel++) {
+        CHECK(browser_engine_begin_navigation_url(engine,
+            "https://search-journey.test/unavailable", 65536, 1000, true));
+        for (unsigned pump = 0; pump < 128 && browser_engine_navigation_pending(engine); pump++) {
+            CHECK(browser_engine_focus_move(engine, true)
+                && browser_engine_render_frame(engine, NULL));
+            if (cancel && pump == 2) browser_engine_cancel_navigation(engine, "journey cancellation");
+            else (void) browser_engine_pump_navigation(engine, NULL);
+        }
+        CHECK(!browser_engine_navigation_pending(engine) && nav->page.loaded
+            && strcmp(navigation_current(nav)->url, "https://search-journey.test/") == 0
+            && browser_engine_render_frame(engine, NULL));
+    }
+    /* Supersede a waiting request through the normal receiver. Its later
+       timeout must neither replace the new article nor strand its controls. */
+    CHECK(browser_engine_begin_navigation_url(engine,
+        "https://search-journey.test/unavailable", 65536, 1000, true));
+    for (unsigned pump = 0; pump < 2; pump++)
+        CHECK(browser_engine_pump_navigation(engine, NULL) == BROWSER_NAVIGATION_JOB_PENDING
+            && browser_engine_focus_move(engine, true)
+            && browser_engine_render_frame(engine, NULL));
+    /* The frontend cancels its existing owner before beginning a replacement;
+       the engine intentionally refuses two simultaneous navigation owners. */
+    browser_engine_cancel_navigation(engine, "superseded by article selection");
+    CHECK(browser_engine_begin_navigation_url(engine,
+        "https://search-journey.test/wiki/PlayStation_Portable", 65536, 1000, true)
+        && journey_finish_navigation(engine) == 0);
+    uint64_t generation = nav->generation;
+    for (unsigned pump = 0; pump < 32; pump++) {
+        CHECK(browser_engine_pump_navigation(engine, NULL) == BROWSER_NAVIGATION_JOB_SUCCEEDED
+            && nav->generation == generation && nav->page.loaded
+            && strcmp(navigation_current(nav)->url,
+                "https://search-journey.test/wiki/PlayStation_Portable") == 0
+            && browser_engine_last_error(engine)[0] == '\0');
+    }
+    root = lxb_dom_interface_node(nav->page.document.html);
+    CHECK(browser_engine_focus_node(engine, test_reader_find_id(root, "history-toggle"))
+        && browser_engine_activate(engine, &action)
+        && action.type == CONTROLLER_ACTION_CONTROL
+        && browser_engine_render_frame(engine, NULL));
+    fetch_trace_end();
+
+    /* A long article with inherited focus styling and an expensive ancestor
+       selector. Repeated input must reuse existing styles, not rewalk prose. */
+    char html[16384];
+    size_t used = (size_t) snprintf(html, sizeof(html),
+        "<!doctype html><style>body{color:#123456}body:has(.absent){color:red}"
+        "a{display:block;height:40px}a:focus{outline:2px solid currentColor}"
+        "</style><body><main><section><a id=first href='/one'>First</a>"
+        "<a id=second href='/two'>Second</a>");
+    for (unsigned i = 0; i < 300; i++) {
+        int n = snprintf(html + used, sizeof(html) - used, "<p>Article row %u</p>", i);
+        CHECK(n > 0 && (size_t) n < sizeof(html) - used);
+        used += (size_t) n;
+    }
+    CHECK(browser_engine_commit_html(engine, "https://journey.test/article", html, used, true));
+    root = lxb_dom_interface_node(nav->page.document.html);
+    lxb_dom_node_t *first = test_reader_find_id(root, "first");
+    CHECK(nav->page.layout_reuse != NULL && first != NULL
+        && browser_engine_focus_node(engine, first));
+    LayoutReuseStats before = {0}, after = {0};
+    layout_reuse_cache_stats(nav->page.layout_reuse, &before);
+    CHECK(browser_engine_focus_direction(engine, CONTROLLER_FOCUS_DOWN));
+    layout_reuse_cache_stats(nav->page.layout_reuse, &after);
+    CHECK(after.style_hits > before.style_hits);
+    BrowserController *controller = browser_engine_controller(engine);
+    CHECK(controller->has_authored_focus_outline
+        && controller->authored_focus_outline.color == 0x123456
+        && controller->authored_focus_outline.width == 2
+        && browser_engine_render_frame(engine, NULL));
+    size_t count = 0;
+    const uint16_t *pixels = browser_engine_framebuffer(engine, &count);
+    uint64_t cached = frame_checksum(pixels, count);
+    /* Operation without the optional retained cache has the same output. */
+    LayoutReuseCache *reuse = nav->page.layout_reuse;
+    nav->page.layout_reuse = NULL;
+    CHECK(browser_engine_focus_node(engine, controller->focus_node)
+        && browser_engine_render_frame(engine, NULL));
+    pixels = browser_engine_framebuffer(engine, &count);
+    CHECK(frame_checksum(pixels, count) == cached);
+    nav->page.layout_reuse = reuse;
+    static const char css[] = "body{color:#654321!important}";
+    CHECK(browser_engine_apply_user_css(engine, css, sizeof(css) - 1)
+        && browser_engine_focus_node(engine, first)
+        && controller->has_authored_focus_outline
+        && controller->authored_focus_outline.color == 0x654321);
+    CHECK(browser_engine_shutdown(engine));
+    BrowserEngineMetrics final = {0};
+    CHECK(browser_engine_metrics(engine, &final)
+        && final.budget_current == 0 && final.budget_active_allocations == 0);
+    browser_engine_destroy(engine);
+    return 0;
+}
+
+int test_script_free_browsing_journey(void)
+{
+    CHECK(script_free_browsing_journey(16u * MIB) == 0);
+    CHECK(script_free_browsing_journey(24u * MIB) == 0);
     return 0;
 }
 

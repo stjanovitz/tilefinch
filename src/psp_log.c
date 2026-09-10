@@ -32,6 +32,7 @@ bool psp_log_start_watchdog(uint32_t timeout_ms)
 
 void psp_log_stop_watchdog(void) {}
 void psp_log_heartbeat(void) {}
+void psp_log_set_stage(const char *stage) { (void) stage; }
 void psp_log_set_phase(PspLogPhase phase) { (void) phase; }
 PspLogPhase psp_log_phase(void) { return PSP_LOG_PHASE_BOOT; }
 
@@ -94,6 +95,13 @@ static SceUID watchdog_thread = -1;
 static _Atomic uint32_t current_phase = PSP_LOG_PHASE_BOOT;
 static _Atomic uint32_t current_operation;
 static _Atomic uint32_t heartbeat_ms;
+/* Owner-thread stage literal; a checkpoint-less run reports it. */
+static _Atomic(const char *) current_stage;
+static _Atomic uint32_t checkpoint_heartbeat_ms;
+static _Atomic uint32_t last_flush_ms;
+static _Atomic bool quiet_reported;
+#define PSP_LOG_QUIET_MS 30000u
+#define PSP_LOG_FLUSH_INTERVAL_MS 10000u
 static _Atomic uint32_t watchdog_timeout_ms;
 static _Atomic bool watchdog_running;
 static _Atomic bool persistent_healthy;
@@ -183,6 +191,10 @@ static bool crash_record_write(const char *state,
         record, sizeof(record), used, current_operation);
     used = append_literal(record, sizeof(record), used, " heartbeat-ms=0x");
     used = append_hex32(record, sizeof(record), used, heartbeat_ms);
+    used = append_literal(record, sizeof(record), used, " stage=");
+    const char *stage = current_stage;
+    used = append_literal(record, sizeof(record), used,
+                          stage == NULL ? "none" : stage);
     if (used >= sizeof(record)) used = sizeof(record) - 1;
     record[used] = '\n';
     SceOff offset = sceIoLseek(crash_fd, 0, PSP_SEEK_SET);
@@ -220,6 +232,19 @@ static int watchdog_main(SceSize argument_size, void *arguments)
         } else if (watchdog_reported) {
             watchdog_reported = 0;
             crash_record_write("watchdog-recovered", false);
+        }
+        /* A heartbeat that advances without any checkpoint for a long
+           time is a loop that cycles without presenting or flushing; name
+           its stage once per quiet span so the wedge is not silent. */
+        uint32_t checkpoint = checkpoint_heartbeat_ms;
+        if (last != 0 && checkpoint != 0
+            && (uint32_t) (last - checkpoint) >= PSP_LOG_QUIET_MS) {
+            if (!quiet_reported) {
+                quiet_reported = 1;
+                crash_record_write("running-quiet", false);
+            }
+        } else if (quiet_reported) {
+            quiet_reported = 0;
         }
     }
     return 0;
@@ -351,7 +376,22 @@ void psp_log_stop_watchdog(void)
 
 void psp_log_heartbeat(void)
 {
-    heartbeat_ms = now_ms();
+    uint32_t current = now_ms();
+    heartbeat_ms = current;
+    /* Checkpoints are the only ordinary flush. A long interactive stretch
+       without one left everything after the last checkpoint in the 64 KB
+       stream buffer; bound that from the heartbeat the owner thread beats
+       every frame and every cooperate checkpoint. */
+    uint32_t flushed = last_flush_ms;
+    if (flushed != 0 && (uint32_t) (current - flushed)
+                            >= PSP_LOG_FLUSH_INTERVAL_MS) {
+        (void) psp_log_flush(false);
+    }
+}
+
+void psp_log_set_stage(const char *stage)
+{
+    current_stage = stage;
 }
 
 void psp_log_set_phase(PspLogPhase phase)
@@ -415,6 +455,7 @@ bool psp_log_flush(bool synchronize_device)
        downgrade the durable on-card diagnostic artifact. */
     (void) fflush(stdout);
     if (synchronize_device) (void) sync_persistent_storage();
+    last_flush_ms = now_ms();
     if (locked) (void) sceKernelSignalSema(log_semaphore, 1);
     if (!okay) {
         persistent_healthy = 0;
@@ -431,6 +472,8 @@ bool psp_log_healthy(void)
 void psp_log_checkpoint(const char *name)
 {
     psp_log_heartbeat();
+    checkpoint_heartbeat_ms = heartbeat_ms;
+    quiet_reported = 0;
     uint32_t phase = current_phase;
     psp_log_printf(
         "tilefinch-checkpoint: phase=%s name=%s operation=%lu "
@@ -458,6 +501,10 @@ uint32_t psp_log_operation_begin(const char *action)
 {
     uint32_t sequence = ++current_operation;
     psp_log_heartbeat();
+    /* An operation is progress as much as a checkpoint is: a long media
+       soak must not read as a quiet run. */
+    checkpoint_heartbeat_ms = heartbeat_ms;
+    quiet_reported = 0;
     psp_log_printf("tilefinch-operation: sequence=%lu phase=begin "
                    "action=%s\n", sequence,
                    action == NULL ? "unknown" : action);
@@ -469,6 +516,8 @@ void psp_log_operation_end(uint32_t sequence, const char *action,
                            const char *result)
 {
     psp_log_heartbeat();
+    checkpoint_heartbeat_ms = heartbeat_ms;
+    quiet_reported = 0;
     psp_log_printf("tilefinch-operation: sequence=%lu phase=end "
                    "action=%s result=%s\n", sequence,
                    action == NULL ? "unknown" : action,

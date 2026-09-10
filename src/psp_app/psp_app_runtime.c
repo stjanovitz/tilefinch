@@ -3017,6 +3017,7 @@ bool psp_platform_cooperate(
         psp_ui_show_status(cooperate->ui, "CLOSING...", 600);
     }
     psp_log_heartbeat();
+    psp_log_set_stage(phase == NULL ? "cooperate" : phase);
     uint64_t now_us = sceKernelGetSystemTimeWide();
     uint64_t checkpoint_gap_us =
         now_us >= cooperate->last_checkpoint_us
@@ -3156,7 +3157,11 @@ bool psp_platform_cooperate(
                 cooperate->maximum_input_ack_us = elapsed_us;
         }
     }
-    return !tilefinch_cancellation_requested(&cooperate->cancellation);
+    bool running = !tilefinch_cancellation_requested(&cooperate->cancellation);
+    /* Input/presentation above wins first. This never raises transport
+       priority and does nothing unless its setup call is still active. */
+    if (running) fetch_background_transport_cooperate(now_us);
+    return running;
 }
 
 /*

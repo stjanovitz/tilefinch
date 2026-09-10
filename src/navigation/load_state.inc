@@ -1614,6 +1614,8 @@ static void navigation_page_relocate_runtime_storage(
                                       &session->page.stylesheet);
         script_runtime_relocate_messaging_opaque(session->page.runtime,
                                                  session);
+        /* The retirement observer also retains the session address. */
+        navigation_bind_node_retirement(session);
     }
     for (size_t i = 0; i < session->page.frame_count; i++) {
         NavigationFrame *frame = &session->page.frames[i];

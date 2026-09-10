@@ -445,6 +445,8 @@ bool browser_session_site_adapter_document_cache_get(
     BrowserSiteAdapterDocumentCacheView *view);
 void browser_session_site_adapter_document_cache_clear(
     BrowserSession *session);
+void browser_session_site_adapter_document_cache_remove(
+    BrowserSession *session, const char *adapter, const char *key);
 bool browser_session_storage_get(const BrowserSession *session,
                                  const char *url, bool local,
                                  const char *key, const char **value,

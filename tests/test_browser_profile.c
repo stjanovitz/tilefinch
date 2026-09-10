@@ -61,6 +61,66 @@ static bool seal_profile(const char *path)
     return ok;
 }
 
+static int test_javascript_site_defaults(void)
+{
+    Budget budget;
+    budget_init(&budget, 2u * 1024u * 1024u);
+    BrowserProfile *profile = browser_profile_create(&budget);
+    BrowserProfile *loaded = browser_profile_create(&budget);
+    char path[128];
+    snprintf(path, sizeof(path), "/tmp/tilefinch-js-default-%ld.cfg", (long) getpid());
+    CHECK(profile != NULL && loaded != NULL);
+    CHECK(!browser_profile_javascript_allowed_for_url(profile,
+              "https://en.wikipedia.org/wiki/Main_Page")
+          && !browser_profile_site_javascript_enabled(profile,
+              "https://FR.WIKIPEDIA.ORG/wiki/Test")
+          && !browser_profile_site_javascript_enabled(NULL, "https://wikipedia.org/")
+          && browser_profile_site_javascript_enabled(profile, "https://notwikipedia.org/")
+          && browser_profile_site_javascript_enabled(profile, "https://wikipedia.org.evil.test/"));
+    CHECK(browser_profile_set_site_javascript_enabled(profile,
+              "https://en.wikipedia.org/", true)
+          && browser_profile_javascript_allowed_for_url(profile,
+              "https://fr.wikipedia.org/")
+          && !browser_profile_set_site_javascript_enabled(profile,
+              "https://wikipedia.org/", true)
+          && browser_profile_save(profile, path)
+          && browser_profile_load(loaded, path)
+          && browser_profile_javascript_allowed_for_url(loaded,
+              "https://www.wikipedia.org/"));
+    browser_profile_set_javascript_enabled(loaded, false);
+    CHECK(!browser_profile_javascript_allowed_for_url(loaded, "https://wikipedia.org/"));
+    browser_profile_set_javascript_enabled(loaded, true);
+    CHECK(browser_profile_reset_site_permissions(loaded, "https://en.wikipedia.org/")
+          && !browser_profile_site_javascript_enabled(loaded, "https://wikipedia.org/")
+          && browser_profile_set_site_javascript_enabled(loaded, "https://wikipedia.org/", true)
+          && browser_profile_set_site_javascript_enabled(loaded, "https://wikipedia.org/", false)
+          && browser_profile_save(loaded, path)
+          && browser_profile_load(profile, path)
+          && !browser_profile_site_javascript_enabled(profile, "https://wikipedia.org/"));
+    FILE *legacy = fopen(path, "wb");
+    CHECK(legacy != NULL
+          && fputs("TILEFINCH_PROFILE\t1\nJSDEFAULT\t1\nJSD\twikipedia.org\n", legacy) >= 0
+          && fclose(legacy) == 0 && seal_profile(path)
+          && browser_profile_load(profile, path)
+          && !browser_profile_site_javascript_enabled(profile, "https://en.wikipedia.org/")
+          && browser_profile_set_site_javascript_enabled(profile, "https://en.wikipedia.org/", true)
+          && browser_profile_site_javascript_enabled(profile, "https://en.wikipedia.org/"));
+    static const char *invalid[] = {"2", "-1", "1junk", "4294967295"};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        FILE *file = fopen(path, "wb");
+        CHECK(file != NULL
+              && fprintf(file, "TILEFINCH_PROFILE\t1\nJSDEFAULT\t%s\n", invalid[i]) > 0
+              && fclose(file) == 0 && seal_profile(path)
+              && browser_profile_load(profile, path)
+              && !browser_profile_site_javascript_enabled(profile, "https://wikipedia.org/"));
+    }
+    browser_profile_destroy(loaded);
+    browser_profile_destroy(profile);
+    unlink(path);
+    CHECK(budget.current == 0);
+    return 0;
+}
+
 static bool glyph_language_roundtrips(BrowserGlyphLanguage language)
 {
     Budget budget;
@@ -89,6 +149,7 @@ static bool glyph_language_roundtrips(BrowserGlyphLanguage language)
 
 int main(void)
 {
+    CHECK(test_javascript_site_defaults() == 0);
     CHECK(BROWSER_GLYPH_LANGUAGE_EMBEDDED == 0
           && BROWSER_GLYPH_LANGUAGE_JAPANESE == 1
           && BROWSER_GLYPH_LANGUAGE_CHINESE_SIMPLIFIED == 2
@@ -639,6 +700,8 @@ int main(void)
     /* MIXED was durable in older releases. Loading and re-saving an old
        profile must retire that authority while preserving unrelated durable
        compatibility settings such as the third-party-cookie exception. */
+    CHECK(!browser_profile_site_javascript_enabled(legacy_loaded,
+              "https://en.wikipedia.org/"));
     CHECK(browser_profile_save(legacy_loaded, path)
           && !file_contains(path, "MIXED\t")
           && file_contains(path, "TPC\tcookies.example"));
@@ -723,17 +786,20 @@ int main(void)
     browser_profile_destroy(forward_loaded);
 
     /* Background update-check admission: enabled + valid clock + at
-       least 3.5 days since the last completed check; a future-recorded
+       least seven days since the last completed check; a future-recorded
        check resets the cadence instead of blocking it. */
     BrowserProfile *cadence = browser_profile_create(&budget);
     CHECK(cadence != NULL);
+    CHECK(browser_profile_update_check_enabled(cadence));
     CHECK(!browser_profile_update_check_due(cadence, 0));
     CHECK(browser_profile_update_check_due(cadence, UINT64_C(1000)));
     browser_profile_set_update_check_last_unix(
         cadence, UINT64_C(1000000));
     CHECK(!browser_profile_update_check_due(cadence, UINT64_C(1000000)));
     CHECK(!browser_profile_update_check_due(
-        cadence, UINT64_C(1000000) + UINT64_C(302399)));
+        cadence, UINT64_C(1000000) + UINT64_C(302400)));
+    CHECK(!browser_profile_update_check_due(
+        cadence, UINT64_C(1000000) + UINT64_C(604799)));
     CHECK(browser_profile_update_check_due(
         cadence, UINT64_C(1000000)
                      + BROWSER_PROFILE_UPDATE_CHECK_INTERVAL_SECONDS));

@@ -419,8 +419,9 @@ if(PSP_BROWSER_BUILD_TESTS)
 
     tilefinch_add_test_binary(tilefinch-browser-engine-tests
         tests/test_browser_engine.c
-        tests/test_browser_engine_journeys.c)
-    target_link_libraries(tilefinch-browser-engine-tests PRIVATE tilefinch_core)
+        tests/test_browser_engine_journeys.c
+        tests/test_browser_engine_interruptions.c)
+    target_link_libraries(tilefinch-browser-engine-tests PRIVATE tilefinch_core tilefinch_psp_ui)
     target_compile_definitions(tilefinch-browser-engine-tests PRIVATE
         TILEFINCH_TEST_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME tilefinch-browser-engine-tests

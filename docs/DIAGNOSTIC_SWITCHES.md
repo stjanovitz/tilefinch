@@ -101,6 +101,7 @@ the code and its strings ship).
 | `TILEFINCH_DISABLE_FIXED_CACHE` | 1 | `src/render.c` | host | Disable the fixed-position paint cache in the tile renderer. |
 | `TILEFINCH_DISABLE_IMAGE_PREFILTER` | 1 | `src/image.c` | host | Resolve every element's ::before/::after styles during image discovery instead of skipping elements whose pseudo candidates cannot supply an image. |
 | `TILEFINCH_DISABLE_INSERT_SCOPED_REUSE` | 1 | `src/navigation/history_runtime.inc` | host | Reset the layout reuse cache for every child-list insertion instead of scoping detached-subtree insertions to their parent. |
+| `TILEFINCH_DISABLE_NODE_RETIREMENT` | 1 | `src/navigation/history_runtime.inc` | host | Do not bind the runtime's freed-subtree callback to the page reuse cache, so removals, moves and innerHTML replacements reset the cache again. |
 | `TILEFINCH_DISABLE_LAZY_WEBPACK` | 2 | `src/js_fetch_cors.c` | always | Load large webpack bundles eagerly instead of through the lazy factory plan. |
 | `TILEFINCH_DISABLE_RETAINED_MATCHES` | 1 | `src/layout.c` | host | Disable the page layout reuse cache's retained per-element matched-rule lists for timing and equivalence comparison. |
 | `TILEFINCH_DISABLE_SELECTOR_APPEND_REUSE` | 1 | `src/style_sheet.c` | host | Rebuild the selector program on every stylesheet append instead of preserving it. |

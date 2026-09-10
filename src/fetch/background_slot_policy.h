@@ -11,6 +11,19 @@
 #define FETCH_BACKGROUND_RESPONSE_COOKIE_BYTES (16u * 1024u)
 #define FETCH_BACKGROUND_STREAM_PUBLICATION_MAX (48u * 1024u)
 
+/* Setup work and firmware services needed by a socket poll run below the
+   browser. Keep at least 4 ms between completed 2 ms checkpoint donations;
+   this bounds requested caller latency without elevating a long TLS call. */
+#define FETCH_BACKGROUND_SETUP_YIELD_US 2000u
+#define FETCH_BACKGROUND_SETUP_YIELD_GAP_US UINT64_C(4000)
+static inline bool fetch_background_setup_yield_due(
+    bool active, uint64_t now_us, uint64_t last_finished_us)
+{
+    return active && (last_finished_us == 0
+        || (now_us >= last_finished_us
+            && now_us - last_finished_us >= FETCH_BACKGROUND_SETUP_YIELD_GAP_US));
+}
+
 /* Credit only the idle-progress clock while another connection monopolizes
    the shared worker. The absolute request deadline remains unchanged. */
 static inline uint64_t fetch_background_progress_after_setup(

@@ -99,6 +99,9 @@ typedef struct {
     size_t focus_moves;
     size_t activations;
     size_t text_edits;
+#ifndef TILEFINCH_NO_TRACE
+    uint64_t focus_outline_us;
+#endif
     /* Indices are layout-generation local. Retain the DOM identity so a
        relayout between focus and activation cannot silently retarget input. */
     lxb_dom_node_t *focus_node;

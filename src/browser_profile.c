@@ -37,6 +37,7 @@ struct BrowserProfile {
     bool persist_local_storage;
     bool tls_session_persistence;
     bool javascript_enabled;
+    uint32_t javascript_default_allow_mask;
     bool site_data_allowed;
     size_t javascript_disabled_site_count;
     char javascript_disabled_sites[BROWSER_PROFILE_JAVASCRIPT_SITE_LIMIT]
@@ -286,6 +287,14 @@ static bool profile_javascript_site_from_url(
 {
     return content_blocker_site_from_url(url, site)
         && strcmp(site, "tilefinch.local") != 0;
+}
+
+/* Append-only bit assignments for built-in site defaults. Explicit enables
+   live outside the bounded disabled-site list, so turning a default off does
+   not consume a user exception slot. These are preferences, not URL rewrites. */
+static uint32_t profile_javascript_default_bit(const char *site)
+{
+    return strcmp(site, "wikipedia.org") == 0 ? UINT32_C(1) : 0;
 }
 
 static bool recovery_url_supported(const char *url)
@@ -686,6 +695,10 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
             file, "TLSSESS\t%u\n",
             profile->tls_session_persistence ? 1u : 0u) > 0;
     }
+    if (ok) {
+        ok = fprintf(file, "JSDEFAULT\t%u\n",
+                     (unsigned) profile->javascript_default_allow_mask) > 0;
+    }
     for (size_t i = 0;
          ok && i < profile->javascript_disabled_site_count; i++) {
         char encoded[CONTENT_BLOCKER_HOST_LIMIT * 3u];
@@ -1038,6 +1051,11 @@ static bool profile_load_internal(
         } else if (strcmp(line, "TLSSESS") == 0) {
             loaded->tls_session_persistence =
                 strtoul(first, NULL, 10) != 0;
+        } else if (strcmp(line, "JSDEFAULT") == 0) {
+            /* Only the defined bit is admitted; malformed/future records
+               retain the safe default rather than granting an exception. */
+            if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
+                loaded->javascript_default_allow_mask = (uint32_t) (first[0] - '0');
         } else if (strcmp(line, "JSD") == 0
                    && loaded->javascript_disabled_site_count
                           < BROWSER_PROFILE_JAVASCRIPT_SITE_LIMIT) {
@@ -1337,14 +1355,16 @@ bool browser_profile_javascript_enabled(const BrowserProfile *profile)
 bool browser_profile_site_javascript_enabled(
     const BrowserProfile *profile, const char *url)
 {
-    if (profile == NULL) return true;
     char site[CONTENT_BLOCKER_HOST_LIMIT];
     if (!profile_javascript_site_from_url(url, site)) return true;
-    for (size_t i = 0; i < profile->javascript_disabled_site_count; i++) {
+    for (size_t i = 0; profile != NULL
+         && i < profile->javascript_disabled_site_count; i++) {
         if (strcmp(profile->javascript_disabled_sites[i], site) == 0)
             return false;
     }
-    return true;
+    uint32_t bit = profile_javascript_default_bit(site);
+    return bit == 0 || (profile != NULL
+        && (profile->javascript_default_allow_mask & bit) != 0);
 }
 
 bool browser_profile_javascript_allowed_for_url(
@@ -1755,6 +1775,14 @@ bool browser_profile_set_site_javascript_enabled(
     if (profile == NULL) return false;
     char site[CONTENT_BLOCKER_HOST_LIMIT];
     if (!profile_javascript_site_from_url(url, site)) return false;
+    uint32_t bit = profile_javascript_default_bit(site);
+    bool changed = false;
+    if (bit != 0) {
+        uint32_t previous = profile->javascript_default_allow_mask;
+        if (enabled) profile->javascript_default_allow_mask |= bit;
+        else profile->javascript_default_allow_mask &= ~bit;
+        changed = previous != profile->javascript_default_allow_mask;
+    }
     size_t found = profile->javascript_disabled_site_count;
     for (size_t i = 0; i < profile->javascript_disabled_site_count; i++) {
         if (strcmp(profile->javascript_disabled_sites[i], site) == 0) {
@@ -1763,7 +1791,7 @@ bool browser_profile_set_site_javascript_enabled(
         }
     }
     if (enabled) {
-        if (found == profile->javascript_disabled_site_count) return false;
+        if (found == profile->javascript_disabled_site_count) return changed;
         size_t last = --profile->javascript_disabled_site_count;
         if (found != last) {
             memcpy(profile->javascript_disabled_sites[found],
@@ -1774,6 +1802,7 @@ bool browser_profile_set_site_javascript_enabled(
                CONTENT_BLOCKER_HOST_LIMIT);
         return true;
     }
+    if (bit != 0) return changed;
     if (found != profile->javascript_disabled_site_count) return false;
     if (profile->javascript_disabled_site_count
         >= BROWSER_PROFILE_JAVASCRIPT_SITE_LIMIT) return false;
@@ -1804,6 +1833,7 @@ bool browser_profile_reset_site_permissions(
     char site[CONTENT_BLOCKER_HOST_LIMIT];
     if (profile == NULL || !content_blocker_site_from_url(url, site))
         return false;
+    profile->javascript_default_allow_mask &= ~profile_javascript_default_bit(site);
     profile_remove_exact_site(
         profile->javascript_disabled_sites,
         &profile->javascript_disabled_site_count, site);

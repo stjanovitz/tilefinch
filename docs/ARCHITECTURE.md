@@ -595,6 +595,19 @@ participates in ordinary cache reclaim and **Clear HTTP caches**, so a
 generated provider page cannot outlive the user's clear action or crowd out an
 authoritative navigation under pressure.
 
+YouTube detail expansions share this cache for a parsed watch-facts snapshot
+(at most 16 KiB per entry, no raw response). The key is the mapped watch URL;
+the request-cookie fingerprint, language, date format, two-minute age limit,
+and captive-portal exclusion must all match. A normal details navigation still
+fetches fresh data. Description can reuse the parsed description without any
+network job, while Comments fetches only its fresh API response. The comments
+token is discovered in bounded steps alongside the original build; unfinished
+discovery never delays that build and instead makes a subsequent Comments
+request fall back to the ordinary path. Cache/allocation misses also fall back.
+A rejected cached continuation invalidates only its matching facts entry and
+uses the existing single full-watch retry. Jobs copy facts before yielding;
+they never borrow a cache entry across a pump or retain DOM pointers.
+
 On PSP, one shared transport worker owns curl. Up to six ordinary response
 lanes grow lazily with concurrency; media uses two larger fixed range windows,
 and the YouTube HOME preconnect has one bodyless descriptor. Redirects remain singular:

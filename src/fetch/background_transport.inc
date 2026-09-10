@@ -430,6 +430,15 @@ typedef struct {
     SceUID event;
     SceUID thread;
     atomic_int stop_requested;
+    atomic_bool setup_active;
+    atomic_bool poll_active;
+    SceUID owner_thread;
+    uint64_t setup_yield_finished_us;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    unsigned setup_yields;
+    uint64_t setup_yield_total_us;
+    uint64_t setup_yield_max_us;
+#endif
     atomic_uint streaming_started;
     atomic_uint fixed_started;
     atomic_uint peak_streaming_active;
@@ -1339,6 +1348,51 @@ static void fetch_background_finish_easy(
     (void) curl_easy_getinfo(
         slot->easy, CURLINFO_EFFECTIVE_URL, &effective_url);
     slot->header_status = status;
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    {
+        /* Where a slow or failed hop spent its time. The PSP transport
+           resolves and connects synchronously inside curl_multi_perform,
+           so these phase times are the only view of that blind window. */
+        curl_off_t name_us = 0, connect_us = 0, tls_us = 0, pre_us = 0,
+                   first_us = 0, total_us = 0;
+        (void) curl_easy_getinfo(
+            slot->easy, CURLINFO_NAMELOOKUP_TIME_T, &name_us);
+        (void) curl_easy_getinfo(
+            slot->easy, CURLINFO_CONNECT_TIME_T, &connect_us);
+        (void) curl_easy_getinfo(
+            slot->easy, CURLINFO_APPCONNECT_TIME_T, &tls_us);
+        (void) curl_easy_getinfo(
+            slot->easy, CURLINFO_PRETRANSFER_TIME_T, &pre_us);
+        (void) curl_easy_getinfo(
+            slot->easy, CURLINFO_STARTTRANSFER_TIME_T, &first_us);
+        (void) curl_easy_getinfo(
+            slot->easy, CURLINFO_TOTAL_TIME_T, &total_us);
+        /* Failures, and hops slow to their first byte; a long body on a
+           healthy stream (media, a large download) is not a stall. */
+        if (code != CURLE_OK || first_us >= 5000000
+            || (first_us == 0 && total_us >= 5000000)) {
+            const char *host = effective_url == NULL ? slot->url
+                                                     : effective_url;
+            const char *scheme_end = host == NULL ? NULL
+                                                  : strstr(host, "://");
+            if (scheme_end != NULL) host = scheme_end + 3;
+            size_t host_length = host == NULL ? 0 : strcspn(host, "/?");
+            char message[320];
+            snprintf(message, sizeof(message),
+                     "tilefinch-transport-hop: host=%.*s code=%d status=%ld "
+                     "redirects=%u name=%lldus connect=%lldus tls=%lldus "
+                     "pretransfer=%lldus first-byte=%lldus total=%lldus "
+                     "connect-budget=%ldms",
+                     (int) (host_length > 96 ? 96 : host_length),
+                     host == NULL ? "" : host, (int) code, status,
+                     slot->redirects, (long long) name_us,
+                     (long long) connect_us, (long long) tls_us,
+                     (long long) pre_us, (long long) first_us,
+                     (long long) total_us, slot->connect_timeout_ms);
+            tilefinch_platform_log_message(message);
+        }
+    }
+#endif
     if (!slot->single_hop && code == CURLE_OK
         && status >= 300 && status < 400
         && fetch_background_follow_redirect(slot)) return;
@@ -2473,11 +2527,17 @@ static int fetch_background_worker_main(SceSize args, void *argp)
                another connection's synchronous DNS/TCP/TLS setup. */
             setup_started_us = fetch_background_now_us();
             worker_id = sceKernelGetThreadId();
+            /* Publish before demotion: that syscall can immediately hand
+               the CPU to the browser, which must already see the lease. */
+            atomic_store_explicit(&fetch_background.setup_active, true,
+                                  memory_order_release);
             int priority_result = sceKernelChangeThreadPriority(
                 worker_id, TILEFINCH_PSP_THREAD_PRIORITY_TRANSPORT_SETUP);
             if (priority_result >= 0) {
                 setup_priority_active = true;
             } else {
+                atomic_store_explicit(&fetch_background.setup_active, false,
+                                      memory_order_release);
                 (void) atomic_fetch_add_explicit(
                     &fetch_background.worker_priority_failures, 1u,
                     memory_order_relaxed);
@@ -2503,6 +2563,10 @@ static int fetch_background_worker_main(SceSize args, void *argp)
                 &fetch_background.worker_priority_failures, 1u,
                 memory_order_relaxed);
         }
+        /* Restore service priority before closing the setup lease. */
+        if (setup_priority_active)
+            atomic_store_explicit(&fetch_background.setup_active, false,
+                                  memory_order_release);
         if (setup_body_mask != 0) {
             uint64_t setup_finished_us = fetch_background_now_us();
             for (unsigned i = 0; i < FETCH_BACKGROUND_REQUEST_LIMIT; i++) {
@@ -2628,10 +2692,14 @@ static int fetch_background_worker_main(SceSize args, void *argp)
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
             uint64_t poll_started_us = fetch_background_now_us();
 #endif
+            atomic_store_explicit(&fetch_background.poll_active, true,
+                                  memory_order_release);
             CURLMcode poll_code = curl_multi_poll(
                 fetch_background.multi, websocket_fds,
                 websocket_fd_count,
                 FETCH_BACKGROUND_POLL_MS, &descriptors);
+            atomic_store_explicit(&fetch_background.poll_active, false,
+                                  memory_order_release);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
             fetch_background_atomic_max(
                 &fetch_background.worker_poll_max_us,
@@ -2662,6 +2730,39 @@ static int fetch_background_worker_main(SceSize args, void *argp)
 bool fetch_background_transport_available(void)
 {
     return true;
+}
+
+void fetch_background_transport_cooperate(uint64_t now_us)
+{
+    if (!fetch_background.initialized
+        || (!atomic_load_explicit(&fetch_background.setup_active, memory_order_acquire)
+            && !atomic_load_explicit(&fetch_background.poll_active, memory_order_acquire))
+        || sceKernelGetThreadId() != fetch_background.owner_thread
+        || atomic_load_explicit(&fetch_background.stop_requested, memory_order_acquire)
+        || !fetch_background_setup_yield_due(true, now_us,
+                    fetch_background.setup_yield_finished_us)) return;
+    /* A poll may itself wait for lower-priority firmware network service.
+       Donate to that service as well; a READY-only test would starve it. */
+    fetch_background.setup_yield_finished_us = now_us;
+    SceKernelThreadRunStatus status = { .size = sizeof(status) };
+    if (!atomic_load_explicit(&fetch_background.poll_active, memory_order_acquire)
+        && (sceKernelReferThreadRunStatus(fetch_background.thread, &status) < 0
+            || (status.status & PSP_THREAD_READY) == 0)) return;
+    uint64_t started = fetch_background_now_us();
+    int result = sceKernelDelayThread(FETCH_BACKGROUND_SETUP_YIELD_US);
+    fetch_background.setup_yield_finished_us = fetch_background_now_us();
+#ifdef TILEFINCH_PSP_VALIDATION_LOG
+    if (result >= 0) {
+        uint64_t elapsed = fetch_background.setup_yield_finished_us - started;
+        fetch_background.setup_yields++;
+        fetch_background.setup_yield_total_us += elapsed;
+        if (elapsed > fetch_background.setup_yield_max_us)
+            fetch_background.setup_yield_max_us = elapsed;
+    }
+#else
+    (void) result;
+    (void) started;
+#endif
 }
 
 bool fetch_background_transport_initialize(Budget *budget)
@@ -2703,6 +2804,9 @@ bool fetch_background_transport_initialize(Budget *budget)
     fetch_background.event = -1;
     fetch_background.thread = -1;
     atomic_init(&fetch_background.stop_requested, 0);
+    atomic_init(&fetch_background.setup_active, false);
+    atomic_init(&fetch_background.poll_active, false);
+    fetch_background.owner_thread = sceKernelGetThreadId();
     atomic_init(&fetch_background.streaming_started, 0u);
     atomic_init(&fetch_background.fixed_started, 0u);
     atomic_init(&fetch_background.peak_streaming_active, 0u);
@@ -4443,6 +4547,10 @@ bool fetch_background_transport_shutdown(unsigned timeout_ms)
        thread and before deleting the worker; never log from the worker hot
        path itself. */
     FetchBackgroundTransportMetrics final_metrics = {0};
+    psp_log_printf("tilefinch-transport-fairness: yields=%u total=%lluus max=%lluus\n",
+        fetch_background.setup_yields,
+        (unsigned long long) fetch_background.setup_yield_total_us,
+        (unsigned long long) fetch_background.setup_yield_max_us);
     if (fetch_background_transport_metrics(&final_metrics)) {
         psp_log_printf(
             "tilefinch-background-transport-worker-final: "
@@ -4483,6 +4591,7 @@ bool fetch_background_transport_shutdown(unsigned timeout_ms)
 #else
 
 bool fetch_background_transport_available(void) { return false; }
+void fetch_background_transport_cooperate(uint64_t now_us) { (void) now_us; }
 bool fetch_background_transport_initialize(Budget *budget)
 {
     (void) budget;

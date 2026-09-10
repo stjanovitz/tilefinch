@@ -58,13 +58,27 @@ static bool write_large_youtube_replay_configured(
         "\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"fixture-version\","
         "\"VISITOR_DATA\":\"fixture-visitor\"});</script>";
     static const char prefix[] =
-        "<!doctype html><script>var ytInitialData = '"
-        "{\"contents\":[{\"videoRenderer\":{\"title\":{\"runs\":[{\"text\":"
+        "<!doctype html><script>var ytInitialData = '{";
+    static const char contents[] =
+        "\"contents\":[{\"videoRenderer\":{\"title\":{\"runs\":[{\"text\":"
         "\"Ratchet Video\"}]},\"videoId\":\"abc_DEF-123\"}},"
         "{\"videoRenderer\":{\"title\":{\"runs\":[{\"text\":"
         "\"Second Ratchet Video\"}]},\"videoId\":\"def_GHI-456\"}},"
+        "{\"videoRenderer\":{\"title\":{\"runs\":[{\"text\":"
+        "\"Third Ratchet Video\"}]},\"videoId\":\"TFTEST00003\"}},"
+        "{\"videoRenderer\":{\"title\":{\"runs\":[{\"text\":"
+        "\"Fourth Ratchet Video\"}]},\"videoId\":\"TFTEST00004\"}},"
         "{\"padding\":\"";
     static const char suffix[] = "\"}]}'</script>";
+    static const char watch_header[] =
+        "\"videoDescriptionHeaderRenderer\":{\"views\":{\"runs\":[{\"text\":\"23 views\"}]}},";
+    static const char watch_metadata[] =
+        "<script>var ytInitialPlayerResponse={\"videoDetails\":{"
+        "\"videoId\":\"TFTEST00001\",\"title\":\"Watch fixture\","
+        "\"shortDescription\":\"Full description retained unchanged.\","
+        "\"lengthSeconds\":\"19\"},\"microformat\":{"
+        "\"playerMicroformatRenderer\":{\"publishDate\":\"2005-04-23\"}}};</script>";
+    bool watch = strstr(url, "/watch?") != NULL;
     snprintf(directory, 128, "/tmp/tilefinch-youtube-large-XXXXXX");
     if (mkdtemp(directory) == NULL) return false;
     char path[256];
@@ -72,14 +86,19 @@ static bool write_large_youtube_replay_configured(
     FILE *body = fopen(path, "wb");
     size_t target = 768u * 1024u;
     size_t identity_length = include_identity ? sizeof(identity) - 1u : 0;
+    size_t header_length = watch ? sizeof(watch_header) - 1u : 0;
+    size_t metadata_length = watch ? sizeof(watch_metadata) - 1u : 0;
     bool ok = body != NULL
         && fwrite(identity, 1, identity_length, body) == identity_length
         && fwrite(prefix, 1, sizeof(prefix) - 1u, body)
-               == sizeof(prefix) - 1u;
+               == sizeof(prefix) - 1u
+        && fwrite(watch_header, 1, header_length, body) == header_length
+        && fwrite(contents, 1, sizeof(contents) - 1u, body) == sizeof(contents) - 1u;
     char padding[4096];
     memset(padding, 'a', sizeof(padding));
     size_t padding_length =
-        target - identity_length - (sizeof(prefix) - 1u) - (sizeof(suffix) - 1u);
+        target - identity_length - (sizeof(prefix) - 1u) - (sizeof(contents) - 1u)
+        - (sizeof(suffix) - 1u) - header_length - metadata_length;
     for (size_t written = 0; ok && written < padding_length;) {
         size_t amount = padding_length - written;
         if (amount > sizeof(padding)) amount = sizeof(padding);
@@ -88,6 +107,7 @@ static bool write_large_youtube_replay_configured(
     }
     ok = ok && fwrite(suffix, 1, sizeof(suffix) - 1u, body)
                    == sizeof(suffix) - 1u
+        && fwrite(watch_metadata, 1, metadata_length, body) == metadata_length
         && fclose(body) == 0;
     if (!ok) return false;
     *body_length = target;
@@ -265,6 +285,18 @@ static bool backing_node_write(
 
 int main(int argc, char **argv)
 {
+    if ((argc == 4 || argc == 5)
+        && (strcmp(argv[1], "--native-navigation-replay") == 0
+            || strcmp(argv[1], "--native-navigation-strict-replay") == 0)) {
+        char *end = NULL;
+        unsigned long runs = argc == 5 ? strtoul(argv[4], &end, 10) : 1;
+        if (runs < 1 || runs > 30 || (argc == 5 && (end == argv[4] || *end))) return 1;
+        ProfileReplayMode mode = strcmp(argv[1], "--native-navigation-strict-replay") == 0
+            ? PROFILE_REPLAY_NATIVE_STRICT : PROFILE_REPLAY_NATIVE;
+        for (unsigned long run = 0; run < runs; run++)
+            CHECK(profile_staged_font_replay(argv[2], argv[3], 0, mode, NULL, 0) == 0);
+        return 0;
+    }
     if (argc == 4 && strcmp(argv[1], "--font-staging-replay") == 0)
         return profile_staged_font_replay(argv[2], argv[3], 0, false, NULL, false);
     if (argc == 4 && strcmp(argv[1], "--navigation-staging-replay") == 0)
@@ -303,6 +335,10 @@ int main(int argc, char **argv)
         return test_deferred_startup_journey();
     if (argc == 2 && strcmp(argv[1], "--interaction-journey-only") == 0)
         return test_loading_interaction_journey();
+    if (argc == 2 && strcmp(argv[1], "--script-free-journey-only") == 0)
+        return test_script_free_browsing_journey();
+    if (argc == 2 && strcmp(argv[1], "--background-interruption-only") == 0)
+        return test_background_interruption_journey();
     if (argc == 2 && strcmp(argv[1], "--provider-navigation-only") == 0) {
         return test_cooperative_site_adapter_navigation();
     }
@@ -315,6 +351,8 @@ int main(int argc, char **argv)
         "/tests/fixtures/http-pointer-search", "https://search-journey.test/",
         0, true, "psp", false) == 0);
     CHECK(test_loading_interaction_journey() == 0);
+    CHECK(test_script_free_browsing_journey() == 0);
+    CHECK(test_background_interruption_journey() == 0);
     CHECK(test_deferred_startup_journey() == 0);
     CHECK(test_deferred_image_publication_survives_rebuild() == 0);
     CHECK(test_deferred_images_skip_oversized_pages() == 0);
