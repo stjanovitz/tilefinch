@@ -125,6 +125,45 @@ tree; failure to complete the work is itself a rejection.
 | Defer CSS images indiscriminately | Fewer eager loads but multiplied relayout cost; reverted. | Dimension-aware/coalesced publication changes that cost model. |
 | Halve arenas only for the JSObject-sized class (2026-09-08) | New per-class evidence justified this narrower experiment: the 72-byte host class had 306,576 unused bytes across 486 arenas. Halving only that class reduced unused bytes to 265,752, but added 504 live allocations. JS allocation improved by just 8,576 bytes; total Budget worsened by 79,488 bytes and its peak by 46,656 bytes. All work completed and timing was similar, but total memory lost. Reverted. | A change to lifetime clustering or allocator/header ownership removes the measured overhead. Do not try adjacent sizes of this same class as another blind sweep. |
 
+## Accepted: reuse bounded parsed watch facts (2026-09-09)
+
+Against `0c00df01`, Description and Comments each downloaded the watch response
+again. Retain at most 16 KiB of already-parsed facts in the existing two-entry
+adapter cache instead: no raw response, no new cache slots, and no page pointers.
+Cookie authority, language/date preferences, two-minute expiry, cache reclaim,
+site-data clearing and portal isolation remain authoritative. Comments still
+requests fresh API data; a rejected cached token gets one ordinary-path retry.
+Token discovery shares existing bounded build steps and may remain incomplete;
+that case uses the ordinary Comments path, without delaying the initial page.
+
+Fifteen optimized-host synthetic replay runs measured:
+
+| Provider operation (excluding DOM/layout) | Fresh | Reused |
+|---|---:|---:|
+| Description requests / downloaded bytes | 1 / 845 | 0 / 0 |
+| Comments requests / downloaded bytes | 2 / 1,190 | 1 / 345 |
+| Description median load work | 168 us | 14 us |
+| Comments median load work | 235 us | 137 us |
+| Description peak extra Budget ownership | 1,120,737 B | 54,976 B |
+| Comments peak extra Budget ownership | 1,160,240 B | 1,175,425 B |
+
+The tiny Comments fixture's transient peak rises about 15 KiB because its copied
+build state overlaps the API request; no blanket memory saving is claimed there.
+The retained facts payload is 16,112 bytes on this host, charged to SESSION and
+reclaimable. A separate 768 KiB watch fixture verifies identical Description
+HTML with zero repeated downloads and 7 build steps instead of 60. The original
+watch build stays at 114 steps. All owned bytes return at session teardown.
+
+The actual click-to-rendered-page replay medians improved from 845 to 631 us for
+Description and 880 to 735 us for Comments; the control watch route changed from
+880 to 851 us. These are host replay timings, not physical-PSP costs or internet
+latency estimates. The avoided request is the main expected device benefit.
+
+A smaller Comments scheduler reservation with replacement on retry did **not**
+reduce measured peak ownership: the fixed curl reservation dominates this tiny
+fixture. That extra scheduler lifecycle was removed. Revisit only with evidence
+that changing the reservation actually reduces allocation or worker contention.
+
 ## Already done / evidence needed before another experiment
 
 - Sparse bytecode atom mapping and atomic serialization refusal are in

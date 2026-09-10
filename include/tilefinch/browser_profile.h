@@ -24,7 +24,7 @@
 #define BROWSER_PROFILE_HOMEPAGE_URL \
     "https://tilefinch.local/my-home"
 /* At most two background update-metadata checks per week. */
-#define BROWSER_PROFILE_UPDATE_CHECK_INTERVAL_SECONDS UINT64_C(302400)
+#define BROWSER_PROFILE_UPDATE_CHECK_INTERVAL_SECONDS UINT64_C(604800)
 
 typedef struct {
     char url[BROWSER_PROFILE_URL_LIMIT];

@@ -646,6 +646,53 @@ static int test_retained_range_cache_handoff(void)
     return 0;
 }
 
+static int test_retained_retirement_probe_holes(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<style>p{color:red}"
+        "p::before{content:'x'}</style><div id=group><p id=p>Text</p></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *node = find_id(root, "p"), *group = find_id(root, "group");
+    StyleRetainedMatches *retained = style_retained_matches_create(&budget);
+    CHECK(node != NULL && group != NULL && retained != NULL);
+    (void) style_retained_matches_attach(&sheet, retained);
+    const PseudoElement pseudos[] = {PSEUDO_NONE, PSEUDO_BEFORE, PSEUDO_AFTER};
+    for (size_t p = 0; p < sizeof(pseudos) / sizeof(pseudos[0]); p++) {
+        style_retained_matches_clear(retained);
+        ComputedStyle computed = style_for_node(&sheet, node, NULL);
+        if (pseudos[p] != PSEUDO_NONE)
+            (void) style_for_pseudo(&sheet, node, pseudos[p], &computed);
+        size_t home = 0;
+        while (home < STYLE_RETAINED_MATCH_CAPACITY
+               && !(retained->entries[home].node == node
+                    && retained->entries[home].pseudo == (uint8_t) pseudos[p])) home++;
+        CHECK(home < STYLE_RETAINED_MATCH_CAPACITY);
+        StyleRetainedMatchEntry entry = retained->entries[home];
+        style_retained_matches_clear(retained);
+        /* Token invalidation leaves holes; a subsequent insertion can also
+           duplicate a key that survives farther along its bounded probe. */
+        retained->entries[(home + 1u) & (STYLE_RETAINED_MATCH_CAPACITY - 1u)] = entry;
+        retained->entries[(home + 3u) & (STYLE_RETAINED_MATCH_CAPACITY - 1u)] = entry;
+        retained->occupied = 2;
+        style_retained_matches_forget_subtree(retained, group);
+        CHECK(retained->occupied == 0);
+        for (size_t i = 0; i < STYLE_RETAINED_MATCH_CAPACITY; i++)
+            CHECK(retained->entries[i].node == NULL);
+    }
+    (void) style_retained_matches_attach(&sheet, NULL);
+    style_retained_matches_destroy(retained);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_retained_nested_selector_invalidation(void)
 {
     Budget budget;
@@ -725,6 +772,45 @@ static int test_retained_focus_descendants(void)
     return 0;
 }
 
+static int test_retained_keyless_lost_match(void)
+{
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document = {0};
+    Stylesheet sheet = {0};
+    static const char html[] = "<style>p{color:#123456}"
+        ".active > *{color:#654321}</style>"
+        "<div id=group class=active><p id=p>Text</p></div>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html)-1u, 17)
+          && stylesheet_build(&sheet, &budget, &document, 480));
+    lxb_dom_node_t *root = lxb_dom_interface_node(document.html);
+    lxb_dom_node_t *node = find_id(root, "p"), *group = find_id(root, "group");
+    StyleRetainedMatches *retained = style_retained_matches_create(&budget);
+    CHECK(node != NULL && group != NULL && retained != NULL);
+    (void) style_retained_matches_attach(&sheet, retained);
+    CHECK(style_for_node(&sheet, node, NULL).color == 0x654321);
+    CHECK(style_for_node(&sheet, node, NULL).color == 0x654321
+          && retained->hits != 0);
+    BudgetAllocationOwner owner = document_allocation_owner_enter(&document);
+    CHECK(lxb_dom_element_remove_attribute(lxb_dom_interface_element(group),
+        (const lxb_char_t *) "class", 5) == LXB_STATUS_OK);
+    document_allocation_owner_leave(&document, owner);
+    uint32_t rules[2] = {0, 1};
+    /* Only the keyless rule is invalidated: current matching is no longer
+       sufficient to find the previously retained answer. */
+    uint32_t keyless = sheet.rules[0].has_fast_key ? rules[1] : rules[0];
+    CHECK(!sheet.rules[keyless].has_fast_key);
+    style_retained_matches_invalidate_rules(retained, &sheet, &keyless, 1);
+    CHECK(style_for_node(&sheet, node, NULL).color == 0x123456);
+    (void) style_retained_matches_attach(&sheet, NULL);
+    style_retained_matches_destroy(retained);
+    stylesheet_destroy(&sheet);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int test_quoted_pseudo_element_punctuation(void)
 {
     Budget budget;
@@ -756,9 +842,11 @@ int main(int argc, char **argv)
     if (argc == 2 && strcmp(argv[1], "--retained-focus-only") == 0)
         return test_retained_focus_descendants();
     CHECK(test_retained_range_cache_handoff() == 0);
+    CHECK(test_retained_retirement_probe_holes() == 0);
     CHECK(test_retained_nested_selector_invalidation() == 0);
     CHECK(test_quoted_pseudo_element_punctuation() == 0);
     CHECK(test_retained_focus_descendants() == 0);
+    CHECK(test_retained_keyless_lost_match() == 0);
     CHECK(test_ancestor_filter_canonical_tokens() == 0);
     CHECK(test_compiled_attribute_and_pseudo_instructions() == 0);
     CHECK(test_quoted_declaration_boundaries() == 0);

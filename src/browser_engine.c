@@ -2289,6 +2289,23 @@ static void browser_engine_apply_or_defer_autofocus(BrowserEngine *engine)
         engine->navigation.page.document.autofocus_attribute_present;
 }
 
+static void browser_engine_apply_initial_navigation_view(
+    BrowserEngine *engine, bool allow_autofocus)
+{
+    const NavigationEntry *entry = navigation_current(&engine->navigation);
+    if (entry != NULL && strchr(entry->url, '#') != NULL) {
+        /* A cross-document fragment owns the initial viewport just as a
+           same-document fragment does. Do not let deferred autofocus on a
+           header control scroll it back to the top after resources settle.
+           History restoration and explicit preview scrolling are handled
+           by the caller and retain their existing precedence. */
+        engine->autofocus_pending = false;
+        (void) navigation_scroll_to_fragment(&engine->navigation, entry->url);
+    } else if (allow_autofocus) {
+        browser_engine_apply_or_defer_autofocus(engine);
+    }
+}
+
 static bool browser_engine_retry_deferred_autofocus(
     BrowserEngine *engine, bool layout_still_settling)
 {
@@ -2437,7 +2454,7 @@ static BrowserNavigationJobStatus browser_engine_finish_navigation_work(
         browser_engine_census_page_fonts(engine);
         browser_engine_navigation_restore_view(engine, work);
         if (!work->history_move)
-            browser_engine_apply_or_defer_autofocus(engine);
+            browser_engine_apply_initial_navigation_view(engine, true);
         if (had_provisional && provisional_scroll_y > 0) {
             (void) navigation_set_scroll(
                 &engine->navigation, provisional_scroll_y);
@@ -3401,12 +3418,11 @@ bool browser_engine_load_url_with_limits(
             break;
         }
     }
-    /* The cooperative navigation job honors `autofocus` on every fresh
-       document. Do the same here so a synchronous load (host lab, scripted
-       navigation) lands on the page's declared entry control instead of the
-       first focusable node. History restores supply their own focus. */
-    if (loaded && record_history)
-        browser_engine_apply_or_defer_autofocus(engine);
+    /* Match cooperative navigation: an explicit fragment owns the initial
+       viewport; otherwise a fresh history entry honors autofocus. History
+       traversal uses its separate saved-focus/scroll restoration path. */
+    if (loaded)
+        browser_engine_apply_initial_navigation_view(engine, record_history);
     engine->config.maximum_document_bytes = saved_maximum;
     engine->config.navigation_timeout_ms = saved_timeout;
     return loaded;

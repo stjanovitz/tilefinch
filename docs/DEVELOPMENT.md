@@ -90,6 +90,18 @@ Useful narrow host test modes (not replacements for the complete suite):
   cooperative gap inside it, naming both ends of the gap. A long pump can
   still service native controls; it does not make arbitrary DOM edits safe
   while the layout transaction owns its scratch state.
+- `--native-navigation-replay TRACE URL [RUNS]` profiles the default
+  JavaScript-Off path with a 24 MiB Budget, bounded resources and staged
+  baseline fonts. `--native-navigation-strict-replay` uses 16 MiB. `RUNS`
+  defaults to one and is bounded to 30; multiple runs in one process support
+  host sampling without changing the navigation machinery. Each run checks
+  successful navigation, three rendered viewports, and zero teardown ownership.
+  Request-begin time is reported separately from processing checkpoint gaps:
+  captured-body verification and host curl/proxy initialization are not device
+  parser/layout stalls. Preview absence under pressure is recorded as
+  `available=0`, not a zero-latency paint. `first-frame-us` includes the first
+  committed render; the subsequent 128 idle pumps measure currently eligible
+  optional work, not an assertion that every delayed resource has settled.
 - `--pointer-search-only` checks pointer down/up, committed click, native text
   replacement, implicit form submission, sliced navigation and a rendered
   result link using a hostname-neutral fixture. `--search-journey-replay TRACE URL`
@@ -132,6 +144,121 @@ an emulator, plays audio, or contacts a live site. Captures are optional;
 without them the synthetic gates still run. Keep capture bodies and raw
 journey logs outside public source control. Output defaults to the ignored
 build tree and includes raw logs, raster checksums, and `summary.json`.
+
+The script-free journey now submits a native search form, selects a result,
+opens and expands an article, scrolls, and restores both results and the form
+through Back. It checks the selected URL and zero owned memory at shutdown.
+It runs at both 16 and 24 MiB, repeats Back/Forward restoration, keeps focus/rendering usable while
+a delayed navigation times out or is cancelled, and checks a deferred image
+timeout does not strand later images or retire the page.
+Replacing an in-flight request uses the frontend's cancel-then-begin ownership
+sequence; further pumps must retain the replacement generation, destination
+and usable disclosure controls without a stale error.
+The provider journey renders with the ordinary eight-tile cache after down/up
+input, verifies both Play destinations through repeated selections and a shell
+replacement, and stops at the native-player handoff (no audio or decoder).
+`--script-free-journey-only` on `tilefinch-browser-engine-tests` runs the first
+journey and the inherited-focus-style cache/invalidation regression directly.
+
+Optional captured home/article runs also measure JavaScript-Off focus and
+scrolling through the interactive lab, separately from the scripted stress
+lane (`--skip-scripted-captures` selects only this default-policy capture lane).
+`summary.json` reports median/p95/maximum dispatch and paint time per
+command; `focus-outline-us` isolates authored outline style resolution, not
+outline rasterization. Do not combine page loading or deferred-resource drain
+time with these input-to-pixel samples. Timing is observational; the committed
+gates assert bounded completion, cache reuse, correct destinations and pixels
+rather than machine-dependent microsecond thresholds.
+
+On 2026-09-09, five serial optimized-host article replays (30 directional
+focus samples, one warm-up excluded) identified ancestor CSS resolution as
+the dominant dispatch cost. Reusing the existing layout-style cache reduced
+median dispatch from 402 to 130 microseconds; p95 fell from 425 to 257 and
+maximum from 432 to 265. Median input-to-pixels fell from 828 to 577
+microseconds; paint remained 424 microseconds. All 14 frame captures matched
+byte-for-byte. The cache-reuse assertion fails against the old controller;
+uncached output, stylesheet invalidation, and zero teardown ownership are
+also checked. No new retained cache or per-input allocation was added.
+These are host results, not a physical-PSP latency claim. Selector-match reuse
+alone was tested and rejected as within noise; computed ancestor-style reuse
+is the measured improvement.
+
+The follow-up overlay profile on the same date uses the lab's existing
+`setup-us`, `tiles-us`, `overflow-us`, `sticky-us`, and `fixed-us` counters.
+Late-positioned commands already have document-y spatial-index entries;
+merging their complete list again made repaint scan offscreen content.
+Removing that redundant merge preserves paint order and all 14 captured
+frames without another cache or allocation. Five serial before/after runs
+(30 directional actions per variant, excluding warm-up) measured:
+
+| Host duration (microseconds) | Before median / p95 / max | After median / p95 / max |
+| --- | --- | --- |
+| Overlay pass | 395 / 469 / 472 | 227 / 291 / 292 |
+| Entire repaint | 420 / 496 / 499 | 252 / 321 / 321 |
+| Input to pixels | 586 / 733 / 753 | 413 / 555 / 566 |
+
+`--background-interruption-only` exercises the real native UI receiver and
+compositor from font-publication, disclosure-layout, and image-publication
+checkpoints. Input is queued **after** a checkpoint; acknowledgement is
+timed at the next eligible checkpoint, and visible feedback requires changed
+pixels from an immutable incumbent snapshot. Menu navigation, cursor motion,
+and Triangle stay on that snapshot. Scroll is dispatched only after the
+owner returns; its visible timestamp includes the resulting page render.
+Font publication cancels transactionally and must retry successfully with
+unchanged incumbent fonts/layout. This fixture explicitly removes the default
+large-page optional-font policy guard to exercise that transaction.
+
+Five serial runs measured maximum native-chrome request-to-pixels of 65 us,
+maximum queued-scroll request-to-pixels of 1,671 us (disclosure expansion),
+and maximum cooperate/pump-return gap of 287 us. These synthetic host numbers
+do not include the PSP's input-poll cadence, thread scheduling, vblank or
+scanout. No machine-dependent timing threshold is asserted in CTest.
+Functional gates also check that a 400-paragraph native disclosure really
+closes and reopens: native attribute defaults bypass the script journal, so
+their style caches need explicit invalidation. That regression and the
+offscreen-overlay candidate-count regression both fail against pre-fix code.
+
+The extended default-policy capture lane also records first preview, committed
+frame, request opening, maximum processing checkpoint gap, idle-pump cost and
+Budget peak/retained bytes. Provider fixtures report transform and generic
+commit phases separately. Five serial host samples on 2026-09-09 (one warm-up
+excluded; no live network) measured:
+
+| Capture / Budget | Median preview / committed frame | Maximum processing gap | Peak Budget |
+| --- | --- | --- | --- |
+| Main Page / 24 MiB | 45.2 / 54.2 ms | 1.45 ms | 8.92 MiB |
+| Article / 24 MiB | 85.3 / 175.5 ms | 1.57 ms | 15.78 MiB |
+| Article / 16 MiB | no preview / 170.5 ms | 1.71 ms | 15.29 MiB |
+
+The article's largest pump was about 84 ms median, but contained cooperative
+checkpoints; do not equate it with an 84 ms native-input freeze. Host sampling
+attributed most CPU work to flow layout, while request opening's 6–8 ms in
+fresh processes included replay integrity hashing and macOS proxy setup.
+Captured article focus-next input-to-pixels was 379 / 587 / 682 us
+median/p95/max (40 actions). The synthetic provider search completed in
+4.08 ms median, with a 0.93 ms generic commit; this small provider fixture
+does not establish live-network or firmware-playback speed.
+
+Two measured experiments were reverted rather than advertised as improvements:
+
+- Sharing full canonical layout styles with the counter-discovery prewalk
+  reduced selector calls on a 96-label fixture (290 to 193), but article
+  navigation median changed from 160.0 to 161.9 ms and preview was unchanged.
+  Revisit only with evidence that the bounded cache survives into the relevant
+  flow traversal, or a cheaper counter-specific resolution path.
+- Skipping a second declaration-index rehash when its size stayed unchanged
+  left the homepage's largest checkpoint gap essentially unchanged
+  (1.360 versus 1.360 ms median) and did not improve navigation time.
+  Revisit only when profiling identifies that unchanged-table path as material.
+
+These are additional host qualification results, not a new engine speedup or
+physical-PSP acceptance. Keep investigating the remaining flow-layout and
+stylesheet-finalization work before changing cache or publication ownership.
+
+Verification: all enabled optimized-host tests passed (external update-root
+proof skipped for its absent prerequisite; device-cost test disabled), and
+the named PSP targets built at 4,125,856 bytes of `.text` against 4,480,000.
+No hardware, emulator, or audible playback run was made for this batch.
 
 To cover delayed script initialization rather than stopping at the first
 optional font publication, also supply `--startup-trace /private/path/to/capture`
@@ -426,8 +553,16 @@ appends newly inserted `<style>` elements to the page sheet in place
 their document position by renumbering the later rules' `order` and
 re-sorting (selector program and rule index rebuild lazily), and the reuse
 cache receives an old-to-new rule index map so the retained matched-rule
-lists survive, dropping only the lists a new rule's fast key can select
-(`layout_reuse_cache_note_stylesheet_appended`). A `<link>` insertion, a
+lists survive, dropping only the lists a new rule can select
+(`layout_reuse_cache_note_stylesheet_appended`): by fast key for keyed
+rules, exactly (`rule_matches` per retained entry) for up to eight keyless
+rules such as `.panel > *`, `:root` for the document element only, and the
+whole table past that bound. The appended-rule list is budget-owned and
+sized to the append (the article's module sheets insert 67 to 438 rules at
+a time; the earlier 64-entry cap made every append drop every list), and a
+parse-context move (a new custom property) no longer discards the lists,
+since it changes declaration values, which the note already clears, not
+selector answers. A `<link>` insertion, a
 change inside an already ingested `<style>`, an innerHTML replacement that
 carried stylesheet sources, or a source list the sheet could not bound still
 rebuilds. (2) A child-list record whose node was inserted from a
@@ -437,7 +572,27 @@ invalidate nothing; moves, removals, innerHTML and unknown records stay
 destructive because freed elements may still be named by retained lists.
 (3) A class/id change whose tokens no display, visibility or image rule
 depends on (`stylesheet_tokens_may_affect_discovery`) no longer marks
-descendants image-sensitive, so no discovery rescan follows. Host switches:
+descendants image-sensitive, so no discovery rescan follows. (4) Node
+retirement: the reuse cache keys entries by node pointer, and a freed
+address can be reused, so removals, moves and innerHTML replacements used
+to reset the cache. The runtime now reports every detached subtree it is
+about to free (`script_runtime_set_node_retirement_callback`, called from
+the bridge's discard path while the nodes are still valid) and the page
+cache evicts that subtree (`layout_reuse_cache_retire_subtree`); the
+journal records the connected parent a removed or moved child left
+(`ScriptMutationRecord.scope`, cleared if that parent dies too), so those
+records reduce to a structural invalidation of that scope plus the child's
+new parent (`layout_reuse_cache_invalidate_structure`). That invalidation is
+`:has()`-aware: without `:has()` it is the parent scope; with `:has()` the
+ancestor chain's exact lists and computed styles go as well, since any
+ancestor may gain or lose a match; only `:has()` combined with a sibling
+combinator, which can reach an ancestor's siblings, still resets. Before
+this, the reference article's skin sheet (`:has(:target)`,
+`:has([aria-expanded])`) made every child-list change a full reset.
+Navigation binds the callback at the first journal consumption
+(`navigation_bind_node_retirement`); frees before that keep the journal's
+conservative overflow signal. Host switch `TILEFINCH_DISABLE_NODE_RETIREMENT`
+restores the resets. The `retired_subtrees` reuse statistic counts evictions. Host switches:
 `TILEFINCH_DISABLE_STYLE_APPEND`, `TILEFINCH_DISABLE_INSERT_SCOPED_REUSE`,
 `TILEFINCH_DISABLE_DISCOVERY_GATE`; the lab's `layout-reuse ...
 style-appends=` pair and the device `tilefinch-style-append:` line count
@@ -1159,6 +1314,16 @@ physical-PSP timing claims.
 host builds. `tilefinch-browser-engine-tests --provider-navigation-only`
 runs the provider navigation/cancellation regressions in isolation, including
 under sanitizers; it does not replace the full suite.
+
+That lane also reports `watch-reuse` cold/warm Description and Comments loads,
+request/body-byte counts, build steps and peak extra Budget ownership. It uses
+synthetic replay data, not live-network timing. Tests compare cached and fresh
+HTML byte-for-byte and cover actual link activation/scroll targets, cookie and
+language changes, expiry, clear/reclaim, another video, cancellation, allocation
+refusal and a failed-token retry. A 768 KiB fixture pins Description to zero
+downloads and seven build steps after a normal watch load; an uncached expansion
+still takes sixty build steps. Keep the initial watch build at its existing
+114-step ceiling in that fixture: reuse must not add a blocking preflight.
 
 For the provider detail page, use `--script youtube-detail-poster-live` with
 a current YouTube watch URL. Inspect `poster-ready`: the reserved play card

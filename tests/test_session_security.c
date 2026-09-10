@@ -700,6 +700,19 @@ static int test_bounded_site_adapter_document_cache(Budget *budget)
     CHECK(!browser_session_site_adapter_document_cache_get(
               &session, "fixture", "https://fixture.test/clear", 0,
               &authority, 301, 50, &view));
+    CHECK(browser_session_site_adapter_document_cache_put(
+        &session, "facts", "https://fixture.test/one", 0, &authority,
+        first, sizeof(first), 100, 2, 200, "fixture", "", 300)
+        && browser_session_site_adapter_document_cache_put(
+        &session, "pages", "https://fixture.test/one", 0, &authority,
+        second, sizeof(second), 100, 2, 200, "fixture", "", 300));
+    browser_session_site_adapter_document_cache_remove(
+        &session, "facts", "https://fixture.test/one");
+    CHECK(!browser_session_site_adapter_document_cache_get(
+        &session, "facts", "https://fixture.test/one", 0, &authority, 301, 50, &view)
+        && browser_session_site_adapter_document_cache_get(
+        &session, "pages", "https://fixture.test/one", 0, &authority, 301, 50, &view)
+        && view.length == sizeof(second));
     browser_session_destroy(&session);
     return 0;
 }

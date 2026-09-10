@@ -13,6 +13,8 @@
  * setup perform (DNS/TCP/TLS, before response headers) is temporarily
  * demoted below the browser: libcurl may spend hundreds of milliseconds in
  * that irreducible call on PSP, and chrome/video must remain preemptible.
+ * Owner checkpoints donate bounded CPU windows during setup and polling so
+ * browser work cannot starve the worker or firmware network service.
  * The browser outranks best-effort clock changes for the same reason.
  *
  * Module loading and voice share the short real-time service band, but do not

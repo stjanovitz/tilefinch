@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 
-project(psp_browser_tilefinch VERSION 0.1.17 LANGUAGES C)
+project(psp_browser_tilefinch VERSION 0.1.18 LANGUAGES C)
 
 # Build directories inside the source tree must be named in CMakePresets.json
 # or in the short allowlist below. Sixty-one ad hoc trees (12 GB) accumulated

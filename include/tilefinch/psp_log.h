@@ -28,6 +28,10 @@ int psp_log_install_exception_handler(void);
 bool psp_log_start_watchdog(uint32_t timeout_ms);
 void psp_log_stop_watchdog(void);
 void psp_log_heartbeat(void);
+/* Names the owner thread's current stage (a string literal) for the crash
+   record: a run whose heartbeat still advances but never reaches a
+   checkpoint is reported as running-quiet with this stage. */
+void psp_log_set_stage(const char *stage);
 void psp_log_set_phase(PspLogPhase phase);
 PspLogPhase psp_log_phase(void);
 uint32_t psp_log_operation_begin(const char *action);

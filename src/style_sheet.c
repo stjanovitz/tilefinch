@@ -1550,6 +1550,9 @@ void stylesheet_append_result_release(Stylesheet *sheet,
     if (sheet == NULL || result == NULL) return;
     budget_free(sheet->budget, result->remap);
     result->remap = NULL;
+    budget_free(sheet->budget, result->appended);
+    result->appended = NULL;
+    result->appended_count = 0;
 }
 
 static unsigned stylesheet_inserted_rule_order(
@@ -1701,10 +1704,21 @@ bool stylesheet_append_style_elements_tracked(
         old_present[order] = 1;
     }
     if (remap_valid) {
-        for (size_t j = 0; j < sheet->count; j++) {
+        /* Every prior rule mapped, so the new rules are exactly the
+           remainder; the module sheets a page inserts late can carry a
+           few hundred of them. */
+        size_t appended_capacity = sheet->count - old_count;
+        result->appended = appended_capacity == 0 ? NULL
+            : budget_malloc(sheet->budget,
+                            appended_capacity * sizeof(*result->appended));
+        if (appended_capacity != 0 && result->appended == NULL) {
+            result->appended_bounded_out = true;
+        }
+        for (size_t j = 0; !result->appended_bounded_out && j < sheet->count;
+             j++) {
             unsigned order = sheet->rules[j].order;
             if ((size_t) order < order_span && old_present[order]) continue;
-            if (result->appended_count == STYLESHEET_APPEND_RULE_LIMIT) {
+            if (result->appended_count == appended_capacity) {
                 result->appended_bounded_out = true;
                 break;
             }

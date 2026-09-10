@@ -304,6 +304,18 @@ struct LayoutReuseCache {
     size_t counter_count, counter_capacity;
     bool counter_bounded_out;
     bool selector_has_has;
+    /* A :has() argument or its subject uses a sibling combinator, so a
+       structural change can alter :has() answers off the ancestor chain. */
+    bool selector_has_has_sibling;
+    /* Indices of the sheet's :has() rules, so a structural change can drop
+       exactly the retained lists those rules' fast keys can select instead
+       of resetting; bounded-out (or a :has() custom rule) means reset. */
+#define LAYOUT_REUSE_HAS_RULE_LIMIT 64u
+    uint32_t has_rules[LAYOUT_REUSE_HAS_RULE_LIMIT];
+    size_t has_rule_count;
+    bool has_rules_bounded;
+    /* The sibling-:has() table pass already ran for this journal. */
+    bool structure_pass_done;
     bool selector_has_focus_within;
     bool selector_focus_has_sibling;
     bool selector_has_structure;
@@ -311,6 +323,10 @@ struct LayoutReuseCache {
        streaming preview cache never retains matches across parser appends. */
     struct StyleRetainedMatches *matches;
     bool matches_enabled;
+    /* The runtime evicts freed subtrees through
+       layout_reuse_cache_retire_subtree, so removals, moves and innerHTML
+       replacements may invalidate their scope instead of resetting. */
+    bool node_retirement;
     bool matches_attempted;
     /* Class/id changes queued for one token-aware pass over the matched
        lists (layout_reuse_cache_flush_invalidations). */

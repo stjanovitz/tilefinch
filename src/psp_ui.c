@@ -501,7 +501,7 @@ static const char *ui_option_description(UiOptionId option)
             return "Run the controlled video test";
 #endif
         case UI_OPTION_UPDATE_CHECK:
-            return "Look for new releases twice a week";
+            return "Look for new releases once a week";
         case UI_OPTION_UPDATE:
             return "Check and install a signed release";
         case UI_OPTION_SITE_DATA:

@@ -1768,6 +1768,54 @@ static bool style_retained_node_within(const lxb_dom_node_t *node,
     return false;
 }
 
+static size_t style_retained_home(const lxb_dom_node_t *node,
+                                  PseudoElement pseudo);
+
+static void style_retained_forget_node(StyleRetainedMatches *table,
+                                       const lxb_dom_node_t *node)
+{
+    static const PseudoElement pseudos[] = {
+        PSEUDO_NONE, PSEUDO_BEFORE, PSEUDO_AFTER
+    };
+    for (size_t p = 0; p < sizeof(pseudos) / sizeof(pseudos[0]); p++) {
+        size_t home = style_retained_home(node, pseudos[p]);
+        for (size_t probe = 0; probe < STYLE_RETAINED_MATCH_PROBE_LIMIT;
+             probe++) {
+            StyleRetainedMatchEntry *entry = &table->entries[
+                (home + probe) & (STYLE_RETAINED_MATCH_CAPACITY - 1u)];
+            /* Invalidation leaves holes and reinsertion can duplicate a key.
+               Retirement must clear the entire bounded probe, not just the
+               prefix visible to lookup, before the DOM storage is freed. */
+            if (entry->node == node && entry->pseudo == (uint8_t) pseudos[p]) {
+                memset(entry, 0, sizeof(*entry));
+                table->occupied--;
+            }
+        }
+    }
+}
+
+void style_retained_matches_forget_subtree(
+    StyleRetainedMatches *table, const lxb_dom_node_t *root)
+{
+    if (table == NULL || table->entries == NULL || table->occupied == 0
+        || root == NULL) return;
+    const lxb_dom_node_t *node = root;
+    while (node != NULL) {
+        if (node->type == LXB_DOM_NODE_TYPE_ELEMENT) {
+            style_retained_forget_node(table, node);
+            if (table->occupied == 0) return;
+        }
+        if (node->first_child != NULL) {
+            node = node->first_child;
+            continue;
+        }
+        while (node != NULL && node != root && node->next == NULL) {
+            node = node->parent;
+        }
+        node = node == NULL || node == root ? NULL : node->next;
+    }
+}
+
 void style_retained_matches_invalidate_within(
     StyleRetainedMatches *table, const lxb_dom_node_t *scope)
 {
@@ -1909,9 +1957,28 @@ void style_retained_matches_invalidate_rules(
 {
     if (table == NULL || table->entries == NULL || table->occupied == 0
         || sheet == NULL || count == 0) return;
+    /* Keyless rules (`*`, attribute- or pseudo-only rightmost compounds)
+       can select any element by their fast key alone. `:root` can only
+       select the document element, and late module sheets commonly open
+       with it to publish custom properties. A few others (`.panel > *`)
+       are answered exactly below; past that bound the whole table goes. */
+    enum { KEYLESS_EXACT_LIMIT = 8 };
+    bool root_only = false;
+    size_t keyless = 0;
     for (size_t a = 0; a < count; a++) {
-        if (rules[a] >= sheet->count || !sheet->rules[rules[a]].has_fast_key) {
-            /* A universal rule can gain or lose any element. */
+        if (rules[a] >= sheet->count) {
+            table->token_dropped += table->occupied;
+            style_retained_matches_clear(table);
+            return;
+        }
+        const StyleRule *rule = &sheet->rules[rules[a]];
+        if (rule->has_fast_key) continue;
+        if (rule->selector != NULL && rule->selector_length == 5
+            && memcmp(rule->selector, ":root", 5) == 0) {
+            root_only = true;
+            continue;
+        }
+        if (++keyless > KEYLESS_EXACT_LIMIT) {
             table->token_dropped += table->occupied;
             style_retained_matches_clear(table);
             return;
@@ -1922,9 +1989,21 @@ void style_retained_matches_invalidate_rules(
         if (entry->node == NULL) continue;
         StyleMatchSubject subject = {0};
         style_match_subject_prepare((lxb_dom_node_t *) entry->node, &subject);
-        bool drop = false;
+        bool drop = root_only && entry->node->parent != NULL
+            && entry->node->parent->type == LXB_DOM_NODE_TYPE_DOCUMENT;
         for (size_t a = 0; !drop && a < count; a++) {
-            drop = rule_fast_matches(&sheet->rules[rules[a]], &subject);
+            const StyleRule *rule = &sheet->rules[rules[a]];
+            if (rule->has_fast_key) {
+                drop = rule_fast_matches(rule, &subject);
+            } else if (!(rule->selector != NULL && rule->selector_length == 5
+                         && memcmp(rule->selector, ":root", 5) == 0)) {
+                /* Mutation can remove a match as well as create one. The
+                   retained answer is the only evidence of the old DOM. */
+                for (size_t k = 0; !drop && k < entry->count; k++)
+                    drop = entry->rules[k] == rules[a];
+                drop = drop || rule_matches(sheet, rules[a], rule,
+                                    (lxb_dom_node_t *) entry->node, &subject);
+            }
         }
         if (drop) {
             memset(entry, 0, sizeof(*entry));

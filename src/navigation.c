@@ -32,6 +32,7 @@
 
 /* Navigation remains one private translation unit so candidate/page state is
    never exported.  The ordered implementation seams mirror its lifecycle. */
+static void navigation_bind_node_retirement(NavigationSession *session);
 #include "navigation/page_lifecycle.inc"
 #include "navigation/configuration.inc"
 #include "navigation/document_stream.inc"
