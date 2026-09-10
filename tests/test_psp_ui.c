@@ -496,6 +496,18 @@ static bool test_input_mapping_and_menu(void)
           && intent.setting.id == PSP_UI_SETTING_READER_AUTO_MODE
           && intent.setting.value.boolean);
     ui.options_selection = 39;
+    CHECK(!ui.save_playback_positions);
+    ui.options_selection = 40;
+    input.pressed = PSP_UI_BUTTON_RIGHT;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.save_playback_positions
+          && intent.setting.id == PSP_UI_SETTING_SAVE_PLAYBACK_POSITIONS
+          && intent.setting.value.boolean);
+    ui.options_selection = 41;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(intent.setting.id == PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS);
+    ui.options_selection = 39;
     input.pressed = PSP_UI_BUTTON_RIGHT;
     intent = psp_ui_update(&ui, &input);
     CHECK(ui.gamepad_circle_primary

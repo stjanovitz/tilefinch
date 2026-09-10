@@ -537,6 +537,33 @@ static int test_cooperative_site_adapter_navigation(void)
             && browser_engine_render_frame(engine, NULL)
             && browser_engine_refresh_render_shell(engine)
             && test_navigation_fragment_visible(engine, expansion_ids[expansion]));
+        /* Play from the expanded document, not just from the initial watch
+           page. Its backing URL contains view/fragment state, but the native
+           player must receive the canonical video and leave that document
+           available as its rollback surface. */
+        lxb_dom_node_t *expanded_play = NULL;
+        for (size_t at = 0; at < navigation->page.layout.link_count; at++) {
+            const LinkRegion *region = &navigation->page.layout.links[at];
+            if (region->url != NULL && strcmp(region->url, watch_url) == 0
+                && region->node != NULL
+                && lxb_dom_element_has_attribute(
+                       lxb_dom_interface_element(region->node),
+                       (const lxb_char_t *) "data-tilefinch-provider-media",
+                       sizeof("data-tilefinch-provider-media") - 1u)) {
+                expanded_play = region->node;
+                break;
+            }
+        }
+        CHECK(expanded_play != NULL
+            && browser_engine_focus_node(engine, expanded_play));
+        uint64_t play_generation = navigation->generation;
+        ControllerAction expanded_action = {0};
+        CHECK(browser_engine_activate(engine, &expanded_action)
+            && expanded_action.type == CONTROLLER_ACTION_NAVIGATE
+            && expanded_action.prefer_native_media
+            && strcmp(expanded_action.url, watch_url) == 0
+            && navigation->generation == play_generation
+            && !browser_engine_navigation_pending(engine));
         fetch_trace_end();
         CHECK(fetch_trace_replay_begin(fixture, error, sizeof(error))
             && browser_engine_begin_navigation_history(engine, false, 1u * MIB, 1000));

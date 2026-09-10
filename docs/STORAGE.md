@@ -99,6 +99,14 @@ observes the persisted local-storage state from its first instruction. Profile
 settings and bookmarks live in `profile.cfg` and remain part of the pre-HOME
 load because the native UI needs them.
 
+Playback-position saving is opt-in under Settings → Video → Save playback
+position (Off for new and older profiles). While enabled, progress is updated
+in RAM about every ten seconds and persisted on player close/navigation,
+suspend, completion, or clean exit—not on every playback tick. Clear playback
+positions forgets the saved list; switching saving Off also clears it. Continued
+playback can create a new position only while saving is enabled. These are
+separate from the Resume saves option for interrupted offline downloads.
+
 By default, `tls-sessions.bin` is written only during explicit suspend or
 controlled-exit flushes (curl's session cache is dumped there through
 `curl_easy_ssls_export`) and read back once when the transport is first

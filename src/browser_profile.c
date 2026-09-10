@@ -61,6 +61,7 @@ struct BrowserProfile {
     bool youtube_compact_results;
     bool youtube_audio_only;
     bool resume_offline_downloads;
+    bool save_playback_positions;
     /* Two-valued, so it is stored as the bool it is and lands in the padding
        the neighbouring bool already leaves. The public type stays an enum
        because callers should not have to know which way the flag points. */
@@ -752,7 +753,10 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
         ok = profile_write_page(file, 'B', &profile->bookmarks[i]);
     for (size_t i = 0; ok && i < profile->history_count; i++)
         ok = profile_write_page(file, 'H', &profile->history[i]);
-    for (size_t i = 0; ok && i < profile->resume_count; i++)
+    if (ok) ok = fprintf(file, "RESUME\t%u\n",
+        profile->save_playback_positions ? 1u : 0u) > 0;
+    for (size_t i = 0; ok && profile->save_playback_positions
+         && i < profile->resume_count; i++)
         ok = fprintf(
             file, "R\t%s\t%llu\t%llu\n", profile->resumes[i].video_id,
             (unsigned long long) profile->resumes[i].position_us,
@@ -1112,6 +1116,8 @@ static bool profile_load_internal(
                                  "%s", site);
                 }
             }
+        } else if (strcmp(line, "RESUME") == 0) {
+            loaded->save_playback_positions = strcmp(first, "1") == 0;
         } else if (strcmp(line, "UPDCHK") == 0) {
             loaded->update_check_enabled =
                 strtoul(first, NULL, 10) != 0;
@@ -1240,7 +1246,11 @@ static bool profile_load_internal(
     bool read_ok = !ferror(file);
     bool ok = fclose(file) == 0 && header && complete && footer_seen
         && read_ok;
-    if (ok) *profile = *loaded;
+    if (ok) {
+        if (!loaded->save_playback_positions)
+            (void) browser_profile_clear_playback_positions(loaded);
+        *profile = *loaded;
+    }
     budget_free(profile->budget, loaded);
     return ok;
 }
@@ -2560,11 +2570,34 @@ size_t browser_profile_suggest(
     return count;
 }
 
+bool browser_profile_save_playback_positions(const BrowserProfile *profile)
+{
+    return profile != NULL && profile->save_playback_positions;
+}
+
+bool browser_profile_clear_playback_positions(BrowserProfile *profile)
+{
+    if (profile == NULL) return false;
+    bool changed = profile->resume_count != 0;
+    memset(profile->resumes, 0, sizeof(profile->resumes));
+    profile->resume_count = 0;
+    return changed;
+}
+
+void browser_profile_set_save_playback_positions(
+    BrowserProfile *profile, bool enabled)
+{
+    if (profile == NULL) return;
+    profile->save_playback_positions = enabled;
+    if (!enabled) (void) browser_profile_clear_playback_positions(profile);
+}
+
 bool browser_profile_record_resume(
     BrowserProfile *profile, const char *video_id,
     uint64_t position_us, uint64_t duration_us)
 {
-    if (profile == NULL || video_id == NULL || video_id[0] == '\0'
+    if (!browser_profile_save_playback_positions(profile)
+        || video_id == NULL || video_id[0] == '\0'
         || strlen(video_id) >= sizeof(profile->resumes[0].video_id))
         return false;
     size_t found = profile->resume_count;
@@ -2605,7 +2638,8 @@ bool browser_profile_resume(
     const BrowserProfile *profile, const char *video_id,
     BrowserProfileResume *resume)
 {
-    if (profile == NULL || video_id == NULL || resume == NULL) return false;
+    if (!browser_profile_save_playback_positions(profile)
+        || video_id == NULL || resume == NULL) return false;
     for (size_t i = 0; i < profile->resume_count; i++) {
         if (strcmp(profile->resumes[i].video_id, video_id) == 0) {
             *resume = profile->resumes[i];

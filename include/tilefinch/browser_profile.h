@@ -475,6 +475,11 @@ size_t browser_profile_suggest(
     const BrowserProfile *profile, const char *query,
     BrowserProfileSuggestion *suggestions, size_t capacity);
 
+/* Off by default, including profiles written before this preference existed.
+   Disabling also clears retained positions. */
+bool browser_profile_save_playback_positions(const BrowserProfile *profile);
+void browser_profile_set_save_playback_positions(BrowserProfile *profile, bool enabled);
+bool browser_profile_clear_playback_positions(BrowserProfile *profile);
 bool browser_profile_record_resume(
     BrowserProfile *profile, const char *video_id,
     uint64_t position_us, uint64_t duration_us);

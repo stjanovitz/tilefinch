@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Search form visual regression</title>
+<style>
+html,body{margin:0;padding:0;background:#fff;color:#202122;font:16px sans-serif}
+.screen{height:320px;box-sizing:border-box;padding:16px}
+header{background:#eaecf0;height:40px;margin:-16px -16px 20px;padding:0 16px;line-height:40px}
+h1{font-size:22px;line-height:28px;margin:0 0 24px}
+.row{width:100%}
+.entry,.submit{display:table-cell;vertical-align:middle}
+.submit{width:1%;white-space:nowrap}
+.widget{width:100%;box-sizing:border-box}
+input{appearance:none;display:block;box-sizing:border-box;width:100%;height:36px;padding:6px 10px;border:1px solid #a2a9b1;font:16px sans-serif;background:#fff;color:#202122}
+button{appearance:none;display:block;box-sizing:border-box;height:36px;margin-left:-1px;padding:6px 12px;border:1px solid #36c;background:#36c;color:white;font:bold 16px sans-serif}
+.hint{font-size:14px;line-height:20px;color:#54595d;margin-top:12px}
+.result{margin-top:16px;line-height:20px}
+a{color:#36c;text-decoration:none}
+</style>
+<!-- Reduced, authored reproduction of the script-free search form's nested
+     percentage input / anonymous table / 1% button column. No live resources. -->
+<section class="screen">
+  <header>Reference encyclopedia</header>
+  <h1>Search</h1>
+  <form><div class="row"><div class="entry"><div class="widget"><input type="search" name="search" aria-label="Search"></div></div><span class="submit"><button type="submit">Search</button></span></div></form>
+  <p class="hint">Enter a topic to find matching articles.</p>
+</section>
+<section class="screen">
+  <header>Reference encyclopedia</header>
+  <h1>Search results</h1>
+  <form><div class="row"><div class="entry"><div class="widget"><input type="search" name="search" value="psp" aria-label="Search"></div></div><span class="submit"><button type="submit">Search</button></span></div></form>
+  <p class="hint">Results 1 - 2</p>
+  <div class="result"><a href="https://example.test/article">PlayStation Portable</a><br>A portable game console and multimedia system.</div>
+  <div class="result"><a href="https://example.test/other">Other meanings</a><br>More articles matching this search.</div>
+</section>

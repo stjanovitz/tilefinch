@@ -741,7 +741,13 @@ static int intrinsic_text_width_impl(LayoutContext *context,
     }
     int control_width = layout_control_default_width(node);
     if (control_width > 0
-        && (style.appearance & STYLE_APPEARANCE_MASK) != APPEARANCE_NONE) {
+        && ((style.appearance & STYLE_APPEARANCE_MASK) != APPEARANCE_NONE
+            || layout_node_name_is(node, "textarea")
+            || (layout_node_name_is(node, "input")
+                && layout_input_control_type(node) == CONTROL_INPUT))) {
+        /* Removing native chrome does not remove a text field's intrinsic
+           editing area. In a shrink-to-fit table/flex ancestor, percentage
+           widths are cyclic: measuring only its empty DOM collapses it. */
         control_width += style.margin.left + style.margin.right;
         return constrain_intrinsic_outer_width(
             context, node, parent, &style, limit, control_width);
@@ -1129,7 +1135,10 @@ static int intrinsic_min_text_width_impl(LayoutContext *context,
     }
     int control_width = layout_control_default_width(node);
     if (control_width > 0
-        && (style.appearance & STYLE_APPEARANCE_MASK) != APPEARANCE_NONE) {
+        && ((style.appearance & STYLE_APPEARANCE_MASK) != APPEARANCE_NONE
+            || layout_node_name_is(node, "textarea")
+            || (layout_node_name_is(node, "input")
+                && layout_input_control_type(node) == CONTROL_INPUT))) {
         control_width += style.margin.left + style.margin.right;
         return control_width < limit ? control_width : limit;
     }

@@ -1,0 +1,23 @@
+# Live diagnostic, not a golden-gated scenario. Start on a watch URL.
+# Capture the actual focused targets before accepting this as a playback run.
+wait-page 90
+mark-page watch-ready
+tap down
+tap down
+mark-page comments-link
+tap cross
+wait-page 90
+mark-page comments-open
+tap up
+tap up
+tap down
+tap down
+mark-page play-target
+tap cross
+wait-live 900
+mark-live played
+wait-live 300
+mark-live progressed
+tap-live circle
+wait-live 90
+end

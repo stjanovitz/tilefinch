@@ -1520,12 +1520,18 @@ static int test_css_table_implicit_row(Budget *budget)
         ".search{display:table;width:432px}.entry{display:block}"
         ".entry input{display:block;width:100%;height:50px}"
         ".submit{display:table-cell;width:1%}.submit button{display:block;"
-        "width:50px;height:50px}</style>"
+        "width:50px;height:50px}"
+        ".plain-search{width:432px}.plain-entry,.plain-submit{display:table-cell}"
+        ".plain-submit{width:1%;white-space:nowrap}"
+        ".plain-entry input{appearance:none;display:block;width:100%;box-sizing:border-box}"
+        "</style>"
         "<body><div id=action class=action><span id=icon class=icon></span>"
         "<span id=copy class=copy>ACTION LINK</span></div>"
         "<div id=search class=search><div id=entry class=entry>"
         "<input></div><span id=submit class=submit><button></button>"
-        "</span></div></body>";
+        "</span></div><div class=plain-search><div class=plain-entry id=plain-entry>"
+        "<input type=search id=plain-input></div><span class=plain-submit id=plain-submit>"
+        "<button>Search</button></span></div></body>";
     PocDocument document = {0};
     Stylesheet sheet = {0};
     LayoutDocument layout = {0};
@@ -1556,6 +1562,14 @@ static int test_css_table_implicit_row(Budget *budget)
           && submit->x == entry->x + entry->width
           && submit->width == 50 && submit->y == entry->y
           && search->height == 50);
+    const LayoutNodeBox *plain_entry = layout_box_for_node(
+        &layout, find_id(root, "plain-entry"));
+    const LayoutNodeBox *plain_submit = layout_box_for_node(
+        &layout, find_id(root, "plain-submit"));
+    CHECK(plain_entry != NULL && plain_submit != NULL
+          && plain_entry->width >= 300
+          && plain_submit->x == plain_entry->x + plain_entry->width
+          && plain_entry->width + plain_submit->width == 432);
     layout_destroy(&layout);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
