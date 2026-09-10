@@ -12,6 +12,13 @@ redistributing site captures.
 
 ## What is measured
 
+The always-available [search form pixel regression](../tests/visual/search-form/README.md)
+also covers the reduced script-free search form, middle/lower results,
+pagination and a bottom-to-top scroll revisit. It uses
+repository-owned markup and fonts and exact engine-render goldens, so it runs
+without the private live-page corpus. This complements, rather than replaces,
+the Chrome-reference scoreboard below.
+
 Each scenario records checkpoints such as the top of the page, a selector or
 anchor, and the bottom. The comparator normalizes both frames through RGB565
 and reports:

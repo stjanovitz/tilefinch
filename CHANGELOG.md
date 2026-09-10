@@ -8,6 +8,11 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.19 — 2026-09-09
+
+- Improved Wikipedia search forms and results layout.
+- Playback-position saving is now off by default, with options to enable it or clear saved positions.
+
 ## 0.1.18 — 2026-09-09
 
 - More responsive browsing and improved network reliability.

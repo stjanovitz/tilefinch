@@ -1358,6 +1358,7 @@ size_t psp_media_transport_rate_floor(
 bool psp_media_record_resume(PspMediaSession *media, bool persist)
 {
     if (media == NULL || media->profile == NULL
+        || !browser_profile_save_playback_positions(media->profile)
         || media->source[0] == '\0'
         || media->last_resume_saved_us == UINT64_MAX) return false;
     char video_id[YOUTUBE_VIDEO_ID_CAPACITY] = {0};

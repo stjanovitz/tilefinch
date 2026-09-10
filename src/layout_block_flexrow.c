@@ -33,6 +33,7 @@ bool layout_block_flexrow_section(LayoutContext *context,
     int total_basis = 0;
     int total_hypothetical_basis = 0;
     int total_grow = 0;
+    int anonymous_percentage_width = 0;
     long long total_shrink_weight = 0;
     FlexOrderPlan *row_order = &scratch->row_order;
     *row_order = (FlexOrderPlan) {0};
@@ -64,6 +65,22 @@ bool layout_block_flexrow_section(LayoutContext *context,
             }
             if (css_table_row && child_basis < child_minimum) {
                 child_basis = child_minimum;
+            }
+            if (anonymous_cell_row && item->style.has_width
+                && item->style.width_percent) {
+                int percent_width = resolve_declared_length(
+                    context->sheet, item->style.width, true, content_width);
+                if (percent_width > 0) {
+                    /* A percentage column constrains the shrink-to-fit
+                       table, not just the cell. E.g. a 1% submit column
+                       with a nonempty button pushes the table to the
+                       available width; the auto input receives the rest. */
+                    int required = child_basis >= percent_width
+                        ? content_width : tilefinch_mul_div_int(
+                            child_basis, content_width, percent_width);
+                    if (required > anonymous_percentage_width)
+                        anonymous_percentage_width = required;
+                }
             }
             total_basis = layout_add_coordinate(total_basis, child_basis);
             total_hypothetical_basis = layout_add_coordinate(
@@ -109,7 +126,8 @@ bool layout_block_flexrow_section(LayoutContext *context,
             /* The anonymous table wrapper around an otherwise complete run
                of table-cell children shrink-wraps its row. The containing
                block itself still retains its ordinary used width. */
-            remaining = 0;
+            int required_extra = anonymous_percentage_width - total_basis - gaps;
+            remaining = required_extra > 0 ? required_extra : 0;
         }
         int cursor_x = content_x;
         if (table_tracks != NULL && table_tracks->border_collapse) {

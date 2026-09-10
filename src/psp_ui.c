@@ -76,9 +76,9 @@ _Static_assert(BROWSER_CHROME_THEME_COUNT <= 8,
 #define UI_TOAST_DEFAULT_FRAMES 180u
 #define UI_MEDIA_CONTROLS_MS 3000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 42u
+#define UI_OPTIONS_ITEM_COUNT 44u
 #else
-#define UI_OPTIONS_ITEM_COUNT 40u
+#define UI_OPTIONS_ITEM_COUNT 42u
 #endif
 #define UI_DATA_OPTIONS_ITEM_COUNT 7u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -229,7 +229,9 @@ typedef enum {
     UI_OPTION_SITE_DATA,
     UI_OPTION_READER_AUTO_MODE,
     UI_OPTION_VIDEO_LANGUAGE,
-    UI_OPTION_GAMEPAD_FACE_MAPPING
+    UI_OPTION_GAMEPAD_FACE_MAPPING,
+    UI_OPTION_SAVE_PLAYBACK_POSITIONS,
+    UI_OPTION_CLEAR_PLAYBACK_POSITIONS
 } UiOptionId;
 
 _Static_assert(BROWSER_VIDEO_LANGUAGE_COUNT <= 16,
@@ -289,7 +291,9 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
        under its declared category. */
     UI_OPTION_READER_AUTO_MODE,
     UI_OPTION_VIDEO_LANGUAGE,
-    UI_OPTION_GAMEPAD_FACE_MAPPING
+    UI_OPTION_GAMEPAD_FACE_MAPPING,
+    UI_OPTION_SAVE_PLAYBACK_POSITIONS,
+    UI_OPTION_CLEAR_PLAYBACK_POSITIONS
 };
 
 static UiOptionId ui_option_id(size_t selection)
@@ -330,6 +334,8 @@ static const char *ui_option_group(UiOptionId option)
         case UI_OPTION_YOUTUBE_RESULTS:
         case UI_OPTION_VIDEO_STARTUP_BUFFERING:
         case UI_OPTION_RESUME_DOWNLOADS:
+        case UI_OPTION_SAVE_PLAYBACK_POSITIONS:
+        case UI_OPTION_CLEAR_PLAYBACK_POSITIONS:
             return "VIDEO";
         case UI_OPTION_CONTENT_BLOCKER:
         case UI_OPTION_COSMETIC_HIDING:
@@ -472,6 +478,10 @@ static const char *ui_option_description(UiOptionId option)
             return "Wait for a stable source prefix before play";
         case UI_OPTION_RESUME_DOWNLOADS:
             return "Continue queued saves after startup";
+        case UI_OPTION_SAVE_PLAYBACK_POSITIONS:
+            return "Remember video positions; Off clears them";
+        case UI_OPTION_CLEAR_PLAYBACK_POSITIONS:
+            return "Forget all saved video positions";
         case UI_OPTION_CONTENT_BLOCKER:
             return "Block common ad and tracking requests";
         case UI_OPTION_COSMETIC_HIDING:
@@ -3327,6 +3337,15 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                     intent.setting.value.boolean =
                         ui->video_startup_buffering;
                     break;
+                case UI_OPTION_SAVE_PLAYBACK_POSITIONS:
+                    ui->save_playback_positions = !ui->save_playback_positions;
+                    intent.setting.id = PSP_UI_SETTING_SAVE_PLAYBACK_POSITIONS;
+                    intent.setting.value.boolean = ui->save_playback_positions;
+                    break;
+                case UI_OPTION_CLEAR_PLAYBACK_POSITIONS:
+                    if (pressed & PSP_UI_BUTTON_CONFIRM)
+                        intent.setting.id = PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS;
+                    break;
                 case UI_OPTION_RESUME_DOWNLOADS:
                     ui->resume_offline_downloads =
                         !ui->resume_offline_downloads;
@@ -4971,6 +4990,14 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
         case UI_OPTION_RESUME_DOWNLOADS:
             *label = "Resume saves";
             *value = ui->resume_offline_downloads ? "On" : "Off";
+            break;
+        case UI_OPTION_SAVE_PLAYBACK_POSITIONS:
+            *label = "Save playback position";
+            *value = ui->save_playback_positions ? "On" : "Off";
+            break;
+        case UI_OPTION_CLEAR_PLAYBACK_POSITIONS:
+            *label = "Clear playback positions";
+            *value = ">";
             break;
         case UI_OPTION_CONTENT_BLOCKER: {
             *label = "Content blocker";
