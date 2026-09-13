@@ -2812,8 +2812,8 @@ static bool navigation_install_frame_capability_trace(
         "if(target===null||(typeof target!=='object'&&typeof target!=='function'))return target;if(rawByProxy.has(target)||traced.has(target))return rawByProxy.has(target)?target:traced.get(target);const proxy=new Proxy(target,{"
         "get(object,key){let name=label;if(typeof key!=='symbol'){name=label+'.'+String(key);record(name);if(!(key in object))missing.add(name);}const descriptor=Reflect.getOwnPropertyDescriptor(object,key);if(descriptor&&Object.prototype.hasOwnProperty.call(descriptor,'value')&&!descriptor.configurable&&!descriptor.writable)return descriptor.value;const value=Reflect.get(object,key,object);return depth===0&&typeof value!=='function'?value:traceObject(value,name,Math.max(0,depth-1));},"
         "set(object,key,value){if(typeof key!=='symbol'){const name=label+'.'+String(key)+'=';record(name);if(!(key in object))missing.add(name);}return Reflect.set(object,key,raw(value),object);},"
-        "apply(target,thisArg,args){const name='call:'+label;record(name);return traceObject(Reflect.apply(target,raw(thisArg),rawArgs(args)),name,Math.max(0,depth-1));},"
-        "construct(target,args,newTarget){const name='new:'+label;record(name);return traceObject(Reflect.construct(target,rawArgs(args),raw(newTarget)),name,Math.max(0,depth-1));}});traced.set(target,proxy);rawByProxy.set(proxy,target);return proxy;};"
+        "apply(target,thisArg,args){const name='call:'+label;record(name);return Reflect.apply(target,raw(thisArg),rawArgs(args));},"
+        "construct(target,args,newTarget){const name='new:'+label;record(name);return Reflect.construct(target,rawArgs(args),raw(newTarget));}});traced.set(target,proxy);rawByProxy.set(proxy,target);return proxy;};"
         /* Do not proxy document here. DOM bootstrap bookkeeping performs
            thousands of private-property probes while a challenge builds
            its shadow tree; tracing those probes both hides the useful

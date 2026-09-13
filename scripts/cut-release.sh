@@ -198,7 +198,10 @@ grep -q '\*\*\*Skipped' "$floor_log" && fail "the fidelity floor ratchet \
 SKIPPED (exit 77) instead of running; see $floor_log. Its captures and \
 references must be present for a release cut — a skip here is the gate not \
 running at all, which is the one outcome a release must never accept."
-grep -q '0 tests failed out of 1' "$floor_log" \
+# CTest's success summary changed from "0 tests failed out of 1" to
+# "100% tests passed out of 1" in newer releases.  The per-test result is
+# stable across both formats and also proves that the one selected test ran.
+grep -Eq '1/1 Test .*tilefinch-fidelity-floor-tests.*Passed' "$floor_log" \
     || fail "could not confirm from $floor_log that exactly one fidelity \
 floor test ran and passed"
 printf '%s\n' "Fidelity floor ratchet ran and passed."

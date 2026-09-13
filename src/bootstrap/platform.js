@@ -100,6 +100,8 @@
   const trustedCharCodeAt = Function.call.bind(String.prototype.charCodeAt);
   const trustedPromiseResolve = Function.call.bind(Promise.resolve, Promise);
   const trustedPromiseThen = Function.call.bind(Promise.prototype.then);
+  const trustedQueueCheckpointContinuation =
+    globalThis.__tilefinchQueueCheckpointContinuation;
   if (globalThis.queueMicrotask === undefined)
     globalThis.queueMicrotask = (callback) => {
       if (typeof callback !== "function")
@@ -6148,10 +6150,12 @@
         errorObserver,
       );
     };
-    /* A native event is one task and its dispatch is synchronous.  Running a
-       microtask checkpoint between listeners exposes half-updated listener
-       state and disagrees with dispatchEvent(); the host drains jobs after
-       this complete dispatch returns. */
+    /* Web IDL cleans up after each browser-invoked callback. When that leaves
+       the JavaScript stack empty, HTML performs a microtask checkpoint before
+       invoking the next listener. Script-called dispatchEvent() remains
+       synchronous because its caller is still on the stack. Continue native
+       delivery through the host's bounded checkpoint queue so long promise
+       chains can yield without changing either ordering or event lifetime. */
     globalThis.__tilefinchInvokeEventTargetCheckpointed = (
       target,
       event,
@@ -6160,28 +6164,74 @@
       betweenPhases,
       complete,
     ) => {
-      const map = mapFor(target);
-      let completed = false;
+      const map = mapFor(target),
+        live = map.get(String(event.type)) || [],
+        listeners = [...live];
+      let completed = false,
+        listenerPhase = 0,
+        index = 0;
       const finish = () => {
           if (completed) return;
           completed = true;
           if (typeof complete === "function") complete();
+        },
+        queueResume = (resume) => {
+          try {
+            trustedQueueCheckpointContinuation(resume);
+          } catch (error) {
+            finish();
+            throw error;
+          }
+        },
+        resume = () => {
+          if (completed) return;
+          try {
+            if (event.__immediateStopped) {
+              finish();
+              return;
+            }
+            if (listenerPhase === 1) {
+              listenerPhase = 2;
+              index = 0;
+              if (typeof betweenPhases === "function") {
+                betweenPhases();
+                if (event.__immediateStopped) finish();
+                else queueResume(resume);
+                return;
+              }
+            }
+            const capture = listenerPhase === 0;
+            while (index < listeners.length) {
+              const item = listeners[index++];
+              if (!item.active || item.capture !== capture) continue;
+              event.currentTarget = target;
+              event.eventPhase = phase;
+              invokeListenerItem(
+                map, live, target, event, item, errorObserver);
+              if (event.__immediateStopped) finish();
+              else queueResume(resume);
+              return;
+            }
+            if (listenerPhase === 0) {
+              listenerPhase = 1;
+              resume();
+              return;
+            }
+            finish();
+          } catch (error) {
+            finish();
+            throw error;
+          }
         };
       try {
-        event.currentTarget = target;
-        event.eventPhase = phase;
-        globalThis.__tilefinchInvokeListenerList(
-          map, target, event, true, errorObserver);
-        if (!event.__immediateStopped && typeof betweenPhases === "function")
-          betweenPhases();
-        if (!event.__immediateStopped) {
-          event.currentTarget = target;
-          event.eventPhase = phase;
-          globalThis.__tilefinchInvokeListenerList(
-            map, target, event, false, errorObserver);
-        }
-      } finally {
+        if (typeof trustedQueueCheckpointContinuation !== "function")
+          throw new Error("native event checkpoint unavailable");
+        if (listeners.length === 0 && typeof betweenPhases !== "function")
+          finish();
+        else resume();
+      } catch (error) {
         finish();
+        throw error;
       }
     };
     EventTarget.prototype.addEventListener = function (

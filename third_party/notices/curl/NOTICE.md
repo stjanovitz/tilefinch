@@ -1,6 +1,6 @@
 # curl / libcurl notice
 
-The default PSP release build links project-owned libcurl 8.21.0 from the
+The default PSP release build links project-owned libcurl 8.22.0 from the
 official hash-pinned source archive listed in
 `third_party/psp_transport/dependencies.lock`. curl is distributed under the
 curl license; the complete verbatim `COPYING` from that archive is beside this
