@@ -447,7 +447,7 @@
       if (!event.__stopped) {
         globalThis.__tilefinchInvokeEventTarget(
           this, event, true, Event.AT_TARGET, observeError);
-        if (!event.__immediateStopped)
+        if (!event.__stopped)
           globalThis.__tilefinchInvokeEventTarget(
             this, event, false, Event.AT_TARGET, observeError);
       }

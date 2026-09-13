@@ -1903,7 +1903,7 @@
                   true,
                   Event.AT_TARGET,
                 );
-                if (!event.__immediateStopped)
+                if (!event.__stopped)
                   globalThis.__tilefinchInvokeEventTarget(
                     this,
                     event,

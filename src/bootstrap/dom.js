@@ -4728,7 +4728,7 @@
         invoke(path[i], true, 1);
       if (!value.__stopped) {
         invoke(path[0], true, 2);
-        if (!value.__immediateStopped)
+        if (!value.__stopped)
           invoke(path[0], false, 2);
       }
       if (value.bubbles && !value.__stopped)

@@ -2064,7 +2064,7 @@
         "'window-bubble:3','window-capture:1','document-capture:1',"
         "'outer-capture:1','target:2','outer-bubble:3','window-bubble:3'];"
         "globalThis.pocSummary=pathOk&&constructorsOk&&focusOk&&selectionOk&&"
-        "targetAfterStop&&"
+        "!targetAfterStop&&"
         "!ancestorAfterStop&&"
         "order.join('|')===expected.join('|')"
         "?'events:ok':'events:flags='+[pathOk,constructorsOk,focusOk,"

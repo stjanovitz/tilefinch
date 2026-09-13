@@ -590,7 +590,7 @@ globalThis.__tilefinchInstallWorker = (
         if (!event.__stopped) {
           globalThis.__tilefinchInvokeEventTarget(
             owner, event, true, Event.AT_TARGET, state.errorObserver);
-          if (!event.__immediateStopped)
+          if (!event.__stopped)
             globalThis.__tilefinchInvokeEventTarget(
               owner, event, false, Event.AT_TARGET, state.errorObserver);
         }
@@ -618,7 +618,7 @@ globalThis.__tilefinchInstallWorker = (
         if (!event.__stopped) {
           globalThis.__tilefinchInvokeEventTarget(
             target, event, true, Event.AT_TARGET);
-          if (!event.__immediateStopped)
+          if (!event.__stopped)
             globalThis.__tilefinchInvokeEventTarget(
               target, event, false, Event.AT_TARGET);
         }
