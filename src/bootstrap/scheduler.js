@@ -9,6 +9,8 @@
   });
   const trustedWrap = globalThis.__tilefinchWrap,
     pageVisible = globalThis.__tilefinchPageVisible,
+    schedulerNow = globalThis.__tilefinchSchedulerNow,
+    createMessageEvent = globalThis.__tilefinchCreateMessageEvent,
     diagnosticString = String,
     diagnosticOwnDescriptor = Object.getOwnPropertyDescriptor,
     timerApply = Reflect.apply;
@@ -26,8 +28,17 @@
       return descriptor.value;
     },
   });
-  let now = 0,
-    nextId = 1;
+  const initialSchedulerSample = Number(schedulerNow()),
+    usesSampledClock = Number.isFinite(initialSchedulerSample) &&
+      initialSchedulerSample >= 0;
+  let now = usesSampledClock ? initialSchedulerSample : 0,
+    nextId = 1,
+    lastCallbackAt = -1,
+    activeTimer = null,
+    activeCancelAttempts = 0,
+    activeCancelHits = 0,
+    timeoutCallbacks = 0,
+    intervalCallbacks = 0;
   const timers = [];
   const limit = 128;
   /* The frame loop registers an animation-frame timer every presented frame.
@@ -36,25 +47,44 @@
      pace QuickJS's full collections onto gameplay frames. */
   const EMPTY_TIMER_ARGS = Object.freeze([]);
   const timerPool = [];
+  let retryMessageDrains = () => {};
+  /* HTML timer delays use Web IDL `long` conversion before negative values
+     are clamped. JavaScript's ToInt32 operator is the same modulo-2^32,
+     truncate-toward-zero conversion and evaluates an author coercion once. */
+  const normalizeTimerDelay = (value) => {
+    const signed = Number(value) >> 0;
+    return signed > 0 ? signed : 0;
+  };
+  globalThis.__tilefinchNormalizeTimerDelay = normalizeTimerDelay;
+  const currentSchedulerTime = () => {
+    if (usesSampledClock) {
+      const sampled = Number(schedulerNow());
+      if (Number.isFinite(sampled) && sampled >= now) now = sampled;
+    }
+    return now;
+  };
   Object.defineProperty(globalThis.__tilefinchRootCensus, "timers", {
     get: () => timers.length,
   });
   function schedule(callback, delay, repeat, args, kind = "timeout") {
     if (typeof callback !== "function" || timers.length >= limit) return 0;
     const id = nextId++;
-    const span = Math.max(0, Number(delay) || 0);
+    const span = Math.max(repeat ? 1 : 0, normalizeTimerDelay(delay)),
+      registeredAt = currentSchedulerTime();
     const timer = timerPool.pop();
     if (timer) {
       timer.id = id;
       timer.callback = callback;
-      timer.due = now + span;
+      timer.due = registeredAt + span;
       timer.span = span;
       timer.repeat = repeat;
       timer.args = args;
       timer.kind = kind;
       timers.push(timer);
     } else {
-      timers.push({ id, callback, due: now + span, span, repeat, args, kind });
+      timers.push({
+        id, callback, due: registeredAt + span, span, repeat, args, kind,
+      });
     }
     return id;
   }
@@ -64,7 +94,16 @@
     if (timerPool.length < limit) timerPool.push(timer);
   }
   function clear(id) {
-    const at = timers.findIndex((timer) => timer.id === Number(id));
+    const numericId = Number(id);
+    if (activeTimer && activeTimer.id === numericId) {
+      activeCancelAttempts++;
+      if (activeTimer.repeat) {
+        activeTimer.repeat = false;
+        activeCancelHits++;
+      }
+      return;
+    }
+    const at = timers.findIndex((timer) => timer.id === numericId);
     if (at >= 0) releaseTimer(timers.splice(at, 1)[0]);
   }
   const timerPriority = (timer) =>
@@ -82,6 +121,9 @@
        timer record as `this`. */
     const callback = this.callback;
     try {
+      lastCallbackAt = now;
+      if (this.kind === "interval") intervalCallbacks++;
+      else timeoutCallbacks++;
       /* Animation timestamps describe the frame that is actually being
          serviced. A late browser tick therefore skips time instead of
          replaying a backlog of synthetic 16 ms frames. Visual timers
@@ -97,10 +139,19 @@
       __tilefinchReportUncaught(error, "timer callback");
     }
   }
-  globalThis.setTimeout = (callback, delay, ...args) =>
-    schedule(callback, delay, false, args, "timeout");
-  globalThis.setInterval = (callback, delay, ...args) =>
-    schedule(callback, Math.max(1, Number(delay) || 0), true, args, "interval");
+  const scheduleTimeout = (callback, delay, ...args) =>
+      schedule(callback, delay, false, args, "timeout"),
+    scheduleInterval = (callback, delay, ...args) =>
+      schedule(callback, delay, true, args, "interval");
+  /* Lazy platform groups can be installed after page code has replaced the
+     public timer names. Keep the browser-owned scheduler capabilities under
+     hardening-protected names so Worker/FileReader lifetime cleanup cannot be
+     redirected through author code. */
+  globalThis.__tilefinchScheduleTimeout = scheduleTimeout;
+  globalThis.__tilefinchScheduleInterval = scheduleInterval;
+  globalThis.__tilefinchCancelTimer = clear;
+  globalThis.setTimeout = scheduleTimeout;
+  globalThis.setInterval = scheduleInterval;
   globalThis.clearTimeout = clear;
   globalThis.clearInterval = clear;
   globalThis.requestAnimationFrame = (callback) => {
@@ -128,109 +179,135 @@
     };
   {
     const token = {},
-      channelLimit = 8;
+      portBrands = new WeakSet(),
+      channelLimit = 8,
+      messageQueueLimit = 32,
+      blockedDrains = new Set();
     let channelCount = 0;
-    class MessagePort {
-      constructor(key, owner) {
+    const scheduleEndpointDrain = (endpoint) => {
+      if (endpoint.drainPending || endpoint.queue.length === 0) return true;
+      const receiver = endpoint.receiver;
+      if (!receiver || receiver._closed || !receiver._started) {
+        blockedDrains.delete(endpoint);
+        return true;
+      }
+      const id = schedule(() => {
+        endpoint.drainPending = false;
+        const current = endpoint.receiver;
+        if (!current || current._closed || !current._started) return;
+        const item = endpoint.queue.shift();
+        if (item) current._deliver(item.data, item.ports);
+        if (endpoint.queue.length) scheduleEndpointDrain(endpoint);
+      }, 0, false, EMPTY_TIMER_ARGS, "message");
+      if (!id) {
+        blockedDrains.add(endpoint);
+        return false;
+      }
+      endpoint.drainPending = true;
+      blockedDrains.delete(endpoint);
+      return true;
+    };
+    retryMessageDrains = () => {
+      for (const endpoint of blockedDrains) {
+        if (!scheduleEndpointDrain(endpoint)) break;
+      }
+    };
+    class MessagePort extends EventTarget {
+      constructor(key, owner, endpoint = null) {
+        super();
         if (key !== token) throw new TypeError("Illegal constructor");
+        portBrands.add(this);
         this._owner = owner;
+        /* Scheduled tasks belong to the transferable endpoint, not to one
+           JavaScript wrapper. Transfer redirects the endpoint atomically so
+           tasks queued before the move reach the receiving port. */
+        this._endpoint = endpoint || {
+          receiver: this,
+          queue: [],
+          drainPending: false,
+        };
         this._peer = null;
         this._closed = false;
+        this._transferPending = false;
         this._started = false;
-        this._queue = [];
-        this._listeners = new Map();
         this._onmessage = null;
-        this.onmessageerror = null;
+        this._onmessageerror = null;
+        this._onmessageListener = (event) =>
+          this._onmessage?.call(this, event);
+        this._onmessageerrorListener = (event) =>
+          this._onmessageerror?.call(this, event);
       }
       get onmessage() {
         return this._onmessage;
       }
       set onmessage(callback) {
-        this._onmessage = typeof callback === "function" ? callback : null;
+        const next = typeof callback === "function" ? callback : null;
+        if (this._onmessage === null && next !== null)
+          super.addEventListener("message", this._onmessageListener);
+        else if (this._onmessage !== null && next === null)
+          super.removeEventListener("message", this._onmessageListener);
+        this._onmessage = next;
         if (this._onmessage) this.start();
       }
-      addEventListener(type, callback) {
-        if (typeof callback !== "function") return;
-        const key = String(type);
-        if (!this._listeners.has(key)) this._listeners.set(key, []);
-        const list = this._listeners.get(key);
-        if (!list.includes(callback)) list.push(callback);
+      get onmessageerror() {
+        return this._onmessageerror;
       }
-      removeEventListener(type, callback) {
-        const list = this._listeners.get(String(type));
-        if (!list) return;
-        const at = list.indexOf(callback);
-        if (at >= 0) list.splice(at, 1);
+      set onmessageerror(callback) {
+        const next = typeof callback === "function" ? callback : null;
+        if (this._onmessageerror === null && next !== null)
+          super.addEventListener(
+            "messageerror", this._onmessageerrorListener);
+        else if (this._onmessageerror !== null && next === null)
+          super.removeEventListener(
+            "messageerror", this._onmessageerrorListener);
+        this._onmessageerror = next;
       }
       start() {
         if (this._closed || this._started) return;
         this._started = true;
-        const queued = this._queue.splice(0);
-        for (const data of queued) this._enqueue(data);
+        scheduleEndpointDrain(this._endpoint);
       }
       close() {
         if (this._closed) return;
         this._closed = true;
-        this._queue = [];
-        this._listeners.clear();
+        if (this._endpoint.receiver === this) {
+          this._endpoint.receiver = null;
+          this._endpoint.queue.length = 0;
+          blockedDrains.delete(this._endpoint);
+        }
+        if (this._onmessage !== null)
+          super.removeEventListener("message", this._onmessageListener);
+        if (this._onmessageerror !== null)
+          super.removeEventListener(
+            "messageerror", this._onmessageerrorListener);
         this._onmessage = null;
+        this._onmessageerror = null;
         this._owner.closed++;
         if (this._owner.closed === 2) channelCount--;
       }
-      _enqueue(data) {
+      _enqueue(data, ports = []) {
         if (this._closed) return;
-        const id = schedule(() => this._deliver(data), 0, false, [], "message");
-        if (!id) throw new RangeError("message task limit exceeded");
+        const endpoint = this._endpoint;
+        if (endpoint.queue.length >= messageQueueLimit) return;
+        endpoint.queue.push({ data, ports });
+        /* A refused scheduler slot leaves the bounded FIFO intact. The timer
+           pump retries it once capacity becomes available. */
+        scheduleEndpointDrain(endpoint);
       }
-      _deliver(data) {
-        if (this._closed) return;
-        if (!this._started) {
-          if (this._queue.length < 32) this._queue.push(data);
-          return;
-        }
-        const event = new MessageEvent("message", {
-          data,
-          origin: "",
-          source: null,
-          ports: [],
-        });
-        Object.defineProperty(event, "isTrusted", {
-          value: true,
-          configurable: true,
-        });
-        try {
-          if (typeof this._onmessage === "function")
-            globalThis.__tilefinchRunTask(
-              "message-port-handler",
-              this._onmessage,
-              this,
-              [event],
-            );
-          for (const callback of [...(this._listeners.get("message") || [])])
-            globalThis.__tilefinchRunTask(
-              "message-port-listener",
-              callback,
-              this,
-              [event],
-            );
-        } catch (error) {
-          __tilefinchReportUncaught(error, "message port");
-        }
+      _deliver(data, ports = []) {
+        if (this._closed || !this._started) return;
+        const event = trusted(createMessageEvent(
+          "message", data, "", null, ports));
+        this.dispatchEvent(event);
       }
       postMessage(value, transfer = []) {
         if (this._closed) return;
-        if (
-          transfer !== undefined &&
-          transfer !== null &&
-          Array.from(transfer).length
-        )
-          throw new DOMException(
-            "Transferable objects are not supported",
-            "DataCloneError",
-          );
-        const copied = structuredClone(value),
+        const ports = [],
+          copied = globalThis.__tilefinchCloneWorkerValue(
+            value, globalThis.__tilefinchWorkerCloneIntrinsics.owner,
+            transfer, ports),
           target = this._peer;
-        if (target && !target._closed) target._enqueue(copied);
+        if (target && !target._closed) target._enqueue(copied, ports);
       }
     }
     class MessageChannel {
@@ -247,6 +324,54 @@
     }
     globalThis.MessagePort = MessagePort;
     globalThis.MessageChannel = MessageChannel;
+    /* Structured clone prepares a replacement endpoint first and commits the
+       move only after the entire message has cloned successfully. This keeps
+       transfer-list failures transactional. */
+    Object.defineProperty(globalThis, "__tilefinchPrepareMessagePortTransfer", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value(port, targetPrototype) {
+        if (!portBrands.has(port) || port._closed || port._transferPending)
+          return null;
+        const peer = port._peer,
+          endpoint = port._endpoint,
+          copy = new MessagePort(token, port._owner, endpoint);
+        if (targetPrototype && typeof targetPrototype === "object")
+          Object.setPrototypeOf(copy, targetPrototype);
+        let committed = false;
+        return {
+          original: port,
+          peer,
+          copy,
+          canCommit() {
+            return !committed && !port._closed && port._peer === peer;
+          },
+          commit() {
+            if (!this.canCommit()) return false;
+            committed = true;
+            port._transferPending = true;
+            copy._peer = peer;
+            /* Transfer creates a new receiving port whose message queue is
+               disabled until onmessage is assigned or start() is called. */
+            copy._started = false;
+            endpoint.receiver = copy;
+            if (peer && peer._peer === port) peer._peer = copy;
+            port._peer = null;
+            port._closed = true;
+            if (port._onmessage !== null)
+              EventTarget.prototype.removeEventListener.call(
+                port, "message", port._onmessageListener);
+            if (port._onmessageerror !== null)
+              EventTarget.prototype.removeEventListener.call(
+                port, "messageerror", port._onmessageerrorListener);
+            port._onmessage = null;
+            port._onmessageerror = null;
+            return true;
+          },
+        };
+      },
+    });
   }
   {
     const channels = new Map(),
@@ -302,16 +427,9 @@
             !schedule(
               () => {
                 if (target.__closed) return;
-                const event = new MessageEvent("message", {
-                  data,
-                  origin: String(globalThis.location?.origin || ""),
-                  source: null,
-                  ports: [],
-                });
-                Object.defineProperty(event, "isTrusted", {
-                  configurable: true,
-                  value: true,
-                });
+                const event = trusted(createMessageEvent(
+                  "message", data,
+                  String(globalThis.location?.origin || ""), null, []));
                 if (typeof target.onmessage === "function")
                   try {
                     globalThis.__tilefinchRunTask(
@@ -496,7 +614,8 @@
       return true;
     };
     globalThis.scrollTo = (xOrOptions, y) => {
-      const top =
+      const scrollingElement = document.scrollingElement,
+        top =
           typeof xOrOptions === "object" && xOrOptions !== null
             ? Number(xOrOptions.top) || 0
             : Number(y) || 0,
@@ -506,9 +625,9 @@
             : "auto",
         behavior =
           requestedBehavior === "auto" &&
+          scrollingElement &&
           globalThis.getComputedStyle &&
-          getComputedStyle(document.scrollingElement).scrollBehavior ===
-            "smooth"
+          getComputedStyle(scrollingElement).scrollBehavior === "smooth"
             ? "smooth"
             : requestedBehavior,
         generation = ++smoothGeneration;
@@ -542,7 +661,8 @@
     };
   }
   globalThis.__tilefinchPumpTimers = (elapsed, maxCallbacks) => {
-    now += Math.max(0, Number(elapsed) || 0);
+    if (usesSampledClock) currentSchedulerTime();
+    else now += Math.max(0, Number(elapsed) || 0);
     globalThis.__tilefinchNow = now;
     let ran = 0;
     const maximum = Math.max(0, Number(maxCallbacks) || 0),
@@ -567,16 +687,48 @@
           : timer.kind === "render-fixup"
             ? "timer:render-fixup"
             : "timer:" + String(timer.kind) + ":id=" + String(timer.id);
-      globalThis.__tilefinchRunTask(label, invokeTimer, timer);
+      activeTimer = timer;
+      try {
+        globalThis.__tilefinchRunTask(label, invokeTimer, timer);
+      } finally {
+        activeTimer = null;
+      }
       ran++;
       if (timer.repeat) {
-        timer.due = now + timer.span;
+        timer.due = currentSchedulerTime() + timer.span;
         timers.push(timer);
       } else releaseTimer(timer);
+      retryMessageDrains();
     }
     return ran;
   };
   globalThis.__tilefinchPendingTimers = () => timers.length;
+  /* Source-free native/lab liveness snapshot. Keep the returned tuple numeric
+     and bounded so diagnostics never serialize callbacks, arguments, URLs, or
+     challenge payloads. This is called only by the native diagnostic seam. */
+  globalThis.__tilefinchSchedulerSnapshot = () => {
+    let due = 0, oldestOverdue = 0, nearestFuture = Infinity;
+    for (const timer of timers) {
+      const remaining = timer.due - now;
+      if (remaining <= 0) {
+        due++;
+        if (-remaining > oldestOverdue) oldestOverdue = -remaining;
+      } else if (remaining < nearestFuture) nearestFuture = remaining;
+    }
+    return [
+      now,
+      usesSampledClock ? 1 : 0,
+      timers.length,
+      due,
+      oldestOverdue,
+      Number.isFinite(nearestFuture) ? nearestFuture : -1,
+      lastCallbackAt,
+      activeCancelAttempts,
+      activeCancelHits,
+      timeoutCallbacks,
+      intervalCallbacks,
+    ];
+  };
   globalThis.__tilefinchDescribeTimers = () =>
     JSON.stringify({
       now,

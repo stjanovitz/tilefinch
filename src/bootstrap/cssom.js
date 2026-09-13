@@ -1208,30 +1208,31 @@
         globalThis.__tilefinchQueueFocusFixup?.();
         notifyStyle(oldValue);
       },
-      setProperty(name, value) {
+      setProperty(name, value, priority = "") {
         const oldValue = authoredStyle();
         try {
         name = cssName(name);
         if (name === "--") return false;
+        value = String(value);
+        priority = String(priority).trim().toLowerCase();
+        if (value === "") {
+          this.removeProperty(name);
+          return true;
+        }
+        if (priority !== "" && priority !== "important") return false;
+        const prioritized = (canonical) =>
+          canonical + (priority === "important" ? " !important" : "");
         if (name === "flex") {
-          if (String(value).trim() === "") {
-            clearFlex();
-            return true;
-          }
           const parsed = canonicalFlex(value);
           if (parsed === null) return false;
           write("flex", "");
           return (
-            write("flex-grow", parsed.grow) &&
-            write("flex-shrink", parsed.shrink) &&
-            write("flex-basis", parsed.basis)
+            write("flex-grow", prioritized(parsed.grow)) &&
+            write("flex-shrink", prioritized(parsed.shrink)) &&
+            write("flex-basis", prioritized(parsed.basis))
           );
         }
         if (placeLonghands[name]) {
-          if (String(value).trim() === "") {
-            clearPlace(name);
-            return true;
-          }
           const longhands = placeLonghands[name],
             parsed = canonicalAlignmentPair(
               value,
@@ -1241,27 +1242,21 @@
           if (parsed === null) return false;
           write(name, "");
           return (
-            write(longhands[0], parsed[0]) &&
-            write(longhands[1], parsed[1])
+            write(longhands[0], prioritized(parsed[0])) &&
+            write(longhands[1], prioritized(parsed[1]))
           );
         }
         if (scrollBoxLonghands[name]) {
-          if (String(value).trim() === "") {
-            write(name, "");
-            for (const longhand of scrollBoxLonghands[name])
-              write(longhand, "");
-            return true;
-          }
           const parsed = canonicalScrollBox(name, value);
           if (parsed === null) return false;
           const expanded = expandScrollBox(parsed);
           write(name, "");
           return scrollBoxLonghands[name].every((longhand, index) =>
-            write(longhand, expanded[index]),
+            write(longhand, prioritized(expanded[index])),
           );
         }
         const canonical = canonicalValue(name, value);
-        return write(name, canonical === null ? "" : canonical);
+        return canonical === null ? false : write(name, prioritized(canonical));
         } finally {
           notifyStyle(oldValue);
         }
@@ -1295,12 +1290,29 @@
             ),
           );
         const target = authoredTargets.get(effectKey(handle, name));
-        return (
+        const value = (
           target ??
           __tilefinchStyleGet(handle, name) ??
           cssomFallback?.get(name) ??
           ""
         );
+        return String(value).replace(/\s*!\s*important\s*$/i, "");
+      },
+      getPropertyPriority(name) {
+        name = cssName(name);
+        const longhands = name === "flex"
+          ? ["flex-grow", "flex-shrink", "flex-basis"]
+          : placeLonghands[name] || scrollBoxLonghands[name] || null;
+        if (longhands)
+          return longhands.every((longhand) =>
+            this.getPropertyValue(longhand) !== "" &&
+            this.getPropertyPriority(longhand) === "important")
+            ? "important" : "";
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+          match = authoredStyle().match(
+            new RegExp("(?:^|;)\\s*" + escaped +
+              "\\s*:[^;]*!\\s*important\\s*(?:;|$)", "i"));
+        return match ? "important" : "";
       },
       removeProperty(name) {
         const oldStyle = authoredStyle();
@@ -1333,48 +1345,69 @@
     });
   };
   globalThis.__tilefinchMakeDetachedStyle = (node) => {
-    let text = "", values = Object.create(null), count = 0;
+    let text = "", values = Object.create(null), priorities = Object.create(null),
+      count = 0;
     const limit = 128,
       parse = (source) => {
         text = String(source).slice(0, 16 * 1024);
         values = Object.create(null);
+        priorities = Object.create(null);
         count = 0;
         for (const part of text.split(";")) {
           const at = part.indexOf(":"), name = cssName(part.slice(0, at).trim());
           if (at > 0 && name && !(name in values) && count < limit) {
-            values[name] = part.slice(at + 1).trim();
+            let value = part.slice(at + 1).trim();
+            if (/!\s*important\s*$/i.test(value)) {
+              priorities[name] = "important";
+              value = value.replace(/!\s*important\s*$/i, "").trim();
+            }
+            values[name] = value;
             count++;
           }
         }
       },
       publish = () => {
         text = Object.keys(values).slice(0, limit)
-          .map((name) => name + ": " + values[name]).join("; ");
+          .map((name) => name + ": " + values[name] +
+            (priorities[name] ? " !important" : "")).join("; ");
         if (text) node.setAttribute("style", text);
         else node.removeAttribute("style");
       },
       base = {
         get cssText() { return text; },
         set cssText(value) { parse(value); publish(); },
-        setProperty(name, value) {
+        setProperty(name, value, priority = "") {
           name = cssName(name);
+          value = String(value);
+          priority = String(priority).trim().toLowerCase();
           const present = name in values;
           if (!name || (!present && count >= limit)) return;
-          if (String(value) === "") {
+          if (value === "") {
             if (present) count--;
             delete values[name];
+            delete priorities[name];
+          } else if (priority !== "" && priority !== "important") {
+            return;
           } else {
+            const canonical = canonicalValue(name, value);
+            if (canonical === null) return;
             if (!present) count++;
-            values[name] = String(value);
+            values[name] = canonical;
+            if (priority) priorities[name] = priority;
+            else delete priorities[name];
           }
           publish();
         },
         getPropertyValue(name) { return values[cssName(name)] || ""; },
+        getPropertyPriority(name) {
+          return priorities[cssName(name)] || "";
+        },
         removeProperty(name) {
           name = cssName(name);
           const old = values[name] || "";
           if (name in values) {
             delete values[name];
+            delete priorities[name];
             count--;
           }
           publish();

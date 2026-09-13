@@ -581,9 +581,51 @@ static bool navigation_load_web_fonts(NavigationSession *session,
         session->font_timeout_ms, &session->page.external_fonts);
 }
 
+static ScriptNavigationTiming navigation_timing_from_fetch(
+    uint64_t navigation_started_us, uint64_t response_completed_us,
+    uint64_t response_headers_elapsed_us, const FetchResult *fetch)
+{
+    ScriptNavigationTiming timing = {0};
+    if (fetch == NULL || navigation_started_us == 0
+        || response_completed_us < navigation_started_us) return timing;
+    timing.response_complete = true;
+    timing.response_end_us = response_completed_us - navigation_started_us;
+    timing.measured = fetch->transport_timing.measured;
+    timing.encoded_body_bytes_measured =
+        fetch->transport_timing.encoded_body_bytes_measured;
+    timing.name_lookup_us = fetch->transport_timing.name_lookup_us;
+    timing.connect_us = fetch->transport_timing.connect_us;
+    timing.appconnect_us = fetch->transport_timing.appconnect_us;
+    timing.first_byte_us = fetch->transport_timing.first_byte_us;
+    timing.total_us = fetch->transport_timing.total_us;
+    timing.encoded_body_bytes =
+        fetch->transport_timing.encoded_body_bytes;
+    timing.decoded_body_bytes = fetch->length > UINT32_MAX
+        ? UINT32_MAX : (uint32_t) fetch->length;
+    timing.response_status = fetch->status_code > 0
+        && fetch->status_code <= UINT16_MAX
+            ? (uint16_t) fetch->status_code : 0;
+    timing.next_hop_protocol =
+        fetch_http_version_name(fetch->negotiated_http_version);
+    timing.content_type = fetch->content_type;
+    if (response_headers_elapsed_us != 0) {
+        timing.response_start_us = response_headers_elapsed_us;
+    } else if (timing.measured && timing.first_byte_us <= timing.total_us) {
+        uint64_t final_hop_start_us = timing.total_us <= timing.response_end_us
+            ? timing.response_end_us - timing.total_us : 0;
+        timing.response_start_us = final_hop_start_us + timing.first_byte_us;
+    }
+    if (timing.response_start_us > timing.response_end_us) {
+        timing.response_start_us = timing.response_end_us;
+    }
+    return timing;
+}
+
 static ScriptRuntime *navigation_create_runtime(
     NavigationSession *session, PocDocument *document, const char *url,
-    const char *referrer_policy, bool defer_document_scripts,
+    const char *document_referrer, uint64_t navigation_started_us,
+    const char *referrer_policy,
+    bool defer_document_scripts,
     const ViewportContext *viewport, ScriptDocumentScope document_scope,
     bool inherit_remote_document, FetchSchedulerDomain *fetch_domain,
     const Stylesheet *stylesheet, ImageResources *canvas_images,
@@ -612,6 +654,8 @@ static ScriptRuntime *navigation_create_runtime(
         .dynamic_code_disabled = !tilefinch_csp_allows_dynamic_code(
             &document->content_security_policy),
         .document_scope = document_scope,
+        .document_referrer = document_referrer,
+        .navigation_started_us = navigation_started_us,
         .referrer_policy = referrer_policy,
         .remote_element_lookup = bind_remote_document
             ? session->remote_element_lookup : NULL,
@@ -1211,7 +1255,9 @@ static bool navigation_queue_frame_message(void *opaque,
                                            ScriptRuntime *source,
                                            long target_frame_handle,
                                            const char *json,
-                                           const char *target_origin)
+                                           const char *target_origin,
+                                           const char *task_kind,
+                                           uint64_t task_sequence)
 {
     NavigationSession *session = opaque;
     if (session == NULL || source == NULL || json == NULL
@@ -1262,10 +1308,12 @@ static bool navigation_queue_frame_message(void *opaque,
     }
     message->sequence = session->next_frame_message_sequence;
     message->source_frame_handle = 0;
+    const ScriptResult *source_result = &session->page.script_result;
     if (source != session->page.runtime) {
         for (size_t i = 0; i < session->page.frame_count; i++) {
             if (!session->page.frames[i].retired
                 && session->page.frames[i].runtime == source) {
+                source_result = &session->page.frames[i].script_result;
                 message->source_frame_handle =
                     session->page.frames[i].parent_handle;
                 message->source_generation =
@@ -1295,6 +1343,8 @@ static bool navigation_queue_frame_message(void *opaque,
         budget_free(session->budget, message->target_origin);
         memset(message, 0, sizeof(*message));
         return false;
+    } else {
+        message->source_generation = session->generation;
     }
     message->target_frame_handle = target_frame_handle;
     if (target_frame_handle > 0) {
@@ -1361,16 +1411,69 @@ static bool navigation_queue_frame_message(void *opaque,
                 }
                 memcpy(session->last_frame_message_event, event, length);
                 session->last_frame_message_event[length] = '\0';
-                size_t used = strlen(session->frame_message_event_log);
-                if (used + length + 5
-                    < sizeof(session->frame_message_event_log)) {
+                char record[112];
+                int written = snprintf(
+                    record, sizeof(record), "%s:%.*s",
+                    source == session->page.runtime ? "P>C" : "C>P",
+                    (int) length, event);
+                if (written > 0 && (size_t) written < sizeof(record)) {
+                    size_t record_length = (size_t) written;
+                    size_t used = strlen(session->frame_message_event_log);
+                    while (used != 0
+                           && used + 1 + record_length
+                                  >= sizeof(session->frame_message_event_log)) {
+                        char *separator = strchr(
+                            session->frame_message_event_log, ',');
+                        if (separator == NULL) {
+                            session->frame_message_event_log[0] = '\0';
+                            used = 0;
+                            break;
+                        }
+                        size_t removed = (size_t) (
+                            separator + 1 - session->frame_message_event_log);
+                        memmove(session->frame_message_event_log,
+                                separator + 1, used - removed + 1);
+                        used -= removed;
+                    }
                     snprintf(session->frame_message_event_log + used,
                              sizeof(session->frame_message_event_log) - used,
-                             "%s%s:%.*s",
-                             used == 0 ? "" : ",",
-                             source == session->page.runtime ? "P>C" : "C>P",
-                             (int) length, event);
+                             "%s%s", used == 0 ? "" : ",", record);
                 }
+                session->last_frame_message_enqueued_us = navigation_now_us();
+                session->last_frame_message_source_generation =
+                    message->source_generation;
+                session->last_frame_message_target_generation =
+                    message->target_generation;
+                session->last_frame_message_task_sequence = task_sequence;
+                snprintf(session->last_frame_message_task_kind,
+                         sizeof(session->last_frame_message_task_kind), "%.*s",
+                         96, task_kind == NULL ? "unknown" : task_kind);
+                session->last_frame_message_pending_tasks =
+                    source_result->pending_tasks;
+                session->last_frame_message_root_timers =
+                    source_result->root_timers;
+                session->last_frame_message_root_network =
+                    source_result->root_pending_network;
+                session->last_frame_message_root_workers =
+                    source_result->root_workers;
+                session->last_frame_message_async_completed =
+                    source_result->async_network_logical_completed;
+                session->last_frame_message_async_rejected =
+                    source_result->async_network_logical_rejected;
+                session->last_frame_message_async_cancelled =
+                    source_result->async_network_logical_cancelled;
+                session->last_frame_message_async_timed_out =
+                    source_result->async_network_logical_timed_out;
+                session->last_frame_message_xhr_responses =
+                    source_result->xhr_response_count;
+                session->last_frame_message_promise_rejections =
+                    source_result->promise_rejections;
+                session->last_frame_message_callback_errors =
+                    source_result->uncaught_callback_errors;
+                session->last_frame_message_watchdog_polls =
+                    source_result->watchdog_polls;
+                session->last_frame_message_interrupted =
+                    source_result->interrupted;
                 if (length == 6 && memcmp(event, "reject", 6) == 0) {
                     const char *reason = strstr(json, "\"reason\":");
                     if (reason != NULL) {
@@ -1461,8 +1564,12 @@ static void navigation_retire_frame_descendants(
 
 static bool navigation_deliver_frame_messages(NavigationSession *session)
 {
-    enum { NAVIGATION_MESSAGE_TARGET_TOP = -1 };
+    enum {
+        NAVIGATION_MESSAGE_TARGET_TOP = -1,
+        NAVIGATION_MESSAGE_SOURCE_UNAVAILABLE = -2
+    };
     size_t delivered = 0;
+    size_t deferred_run = 0;
     while (session->page.message_count != 0
            && delivered < NAVIGATION_MESSAGE_LIMIT) {
         NavigationMessage message = session->page.messages[0];
@@ -1511,21 +1618,31 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
            creating a ScriptRuntime.  postMessage queues a task against that
            stable browsing-context identity; it must not be mistaken for a
            message to a vanished target merely because frame loading has not
-           reached runtime creation yet.  Preserve FIFO order by returning
-           the head message to the bounded queue and retrying on a later
-           frame-progress turn.  A loaded frame with no runtime is a genuine
-           non-script target and continues through the ordinary drop path. */
-        if (lifecycle_valid && target_frame != NULL && target == NULL
-            && !target_frame->retired && !target_frame->loaded
-            && target_frame->fetch_pending) {
-            memmove(session->page.messages + 1,
-                    session->page.messages,
-                    session->page.message_count
-                        * sizeof(*session->page.messages));
-            session->page.messages[0] = message;
+           reached runtime creation yet. Preserve FIFO order for that target
+           by rotating the message to the tail. This also lets a ready sibling
+           or parent task behind it run; returning it to the head used to make
+           one slow iframe block every other browsing context. Stop after one
+           complete deferred-only rotation so the bounded owner turn cannot
+           spin. A loaded frame with no runtime is a genuine non-script target
+           and continues through the ordinary drop path. */
+        bool target_task_deferred = lifecycle_valid
+            && ((target_frame != NULL && target == NULL
+                 && !target_frame->retired && !target_frame->loaded
+                 && target_frame->fetch_pending)
+                || (target != NULL
+                    && !script_runtime_message_dispatch_ready(target)));
+        if (target_task_deferred) {
+            session->page.messages[session->page.message_count] = message;
             session->page.message_count++;
-            break;
+            session->frame_messages_deferred++;
+            deferred_run++;
+            if (deferred_run > session->frame_message_max_deferred_run) {
+                session->frame_message_max_deferred_run = deferred_run;
+            }
+            if (deferred_run >= session->page.message_count) break;
+            continue;
         }
+        deferred_run = 0;
         bool target_allowed = lifecycle_valid && target != NULL;
         const char *drop_reason = !lifecycle_valid
             ? "lifecycle" : target == NULL ? "target-missing" : NULL;
@@ -1561,7 +1678,9 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
            expose a standards-safe null source rather than aliasing the
            nested parent's unrelated handle in the top document. */
         long dispatch_source_handle = target_frame == NULL
-            ? (nested_top_message ? 0 : source_handle) : 0;
+            ? (nested_top_message ? NAVIGATION_MESSAGE_SOURCE_UNAVAILABLE
+                                  : source_handle)
+            : 0;
 #if defined(TILEFINCH_NO_TRACE)
         (void) drop_reason;
 #endif
@@ -1601,7 +1720,7 @@ static bool navigation_deliver_frame_messages(NavigationSession *session)
                 (void) script_runtime_set_frame_window_state(
                     target_owner_frame->parent_runtime,
                     target_owner_frame->parent_handle, false, false, false,
-                    NULL, navigation_frame_parent_result(
+                    NULL, false, navigation_frame_parent_result(
                               session, target_owner_frame));
             }
             if (getenv("TILEFINCH_TRACE_JS_ROOTS") != NULL
@@ -1720,7 +1839,7 @@ static bool navigation_retire_detached_frames(NavigationSession *session)
             && !script_runtime_set_frame_window_state(
                 frame->parent_runtime, frame->parent_handle, false, false,
                 false,
-                NULL, navigation_frame_parent_result(
+                NULL, false, navigation_frame_parent_result(
                           session, frame))) return false;
         if (getenv("TILEFINCH_TRACE_JS_ROOTS") != NULL
             && frame->runtime != NULL) {
@@ -2003,13 +2122,13 @@ static bool copy_script_context(lxb_dom_node_t *node, size_t offset,
     return false;
 }
 
-static void collect_stack_source_context_into(
-    NavigationFrame *frame, const char *stack, char *output,
+static void collect_document_stack_source_context_into(
+    PocDocument *document, const char *stack, char *output,
     size_t output_size)
 {
     static const char marker[] = "<inline-script>:1:";
     const char *at = stack;
-    if (frame->document.html == NULL || output == NULL
+    if (document == NULL || document->html == NULL || output == NULL
         || output_size == 0) return;
     for (size_t index = 0; index < 5; index++) {
         at = strstr(at, marker);
@@ -2020,7 +2139,7 @@ static void collect_stack_source_context_into(
         if (end == at || offset == 0) break;
         char context[512] = {0};
         if (copy_script_context(
-                lxb_dom_interface_node(frame->document.html),
+                lxb_dom_interface_node(document->html),
                 (size_t) offset, context, sizeof(context))) {
             size_t used = strlen(output);
             if (used < output_size) {
@@ -2031,6 +2150,15 @@ static void collect_stack_source_context_into(
         }
         at = end;
     }
+}
+
+static void collect_stack_source_context_into(
+    NavigationFrame *frame, const char *stack, char *output,
+    size_t output_size)
+{
+    if (frame == NULL) return;
+    collect_document_stack_source_context_into(
+        &frame->document, stack, output, output_size);
 }
 
 static void collect_stack_source_context(NavigationFrame *frame,
@@ -2435,6 +2563,9 @@ static bool navigation_load_frames_for_context(
                 cached_hint_tokens, sizeof(cached_hint_tokens),
                 cached_hint_origin, sizeof(cached_hint_origin));
         }
+        if (frame->fetch_started_us == 0) {
+            frame->fetch_started_us = navigation_now_us();
+        }
         frame->fetch_request_id = navigation_enqueue_frame_fetch(
             session, frame,
             cached_hint_tokens[0] == '\0' ? NULL : cached_hint_tokens,
@@ -2451,6 +2582,7 @@ static bool navigation_load_frames_for_context(
         if (!script_runtime_set_frame_window_state(
                 parent_runtime, frame->parent_handle, true,
                 same_origin, frame->opaque_origin, frame->url,
+                false,
                 navigation_frame_parent_result(session, frame))) return false;
         if (!frame->fetch_pending) {
             session->frames_failed++;
@@ -2562,13 +2694,17 @@ static bool navigation_refresh_frame_presentation(
     fresh->width = width;
     fresh->height = height;
     ViewportContext viewport;
+    int device_width = session->viewport.device_width > 0
+        ? session->viewport.device_width : 480;
+    int device_height = session->viewport.device_height > 0
+        ? session->viewport.device_height : 272;
     /* Nested browsing-context snapshots may be attached after this layout is
        committed. Reserve the complete bounded frame capacity first so the
        ImageResource table cannot relocate underneath retained paint data. */
     bool okay = images_reserve_capacity(
             &frame->images, session->budget, NAVIGATION_FRAME_LIMIT)
         && viewport_context_init(
-        &viewport, width, height, width, height)
+        &viewport, width, height, device_width, device_height)
         && stylesheet_build_context(
             &fresh->stylesheet, session->budget, &frame->document,
             &viewport)
@@ -2632,6 +2768,12 @@ static bool navigation_refresh_frame_presentation(
 
     NavigationFramePresentation *retired = frame->presentation;
     frame->presentation = fresh;
+    /* A child browsing context owns the iframe's CSS viewport while screen
+       continues to describe the physical display. Publish the new realm
+       dimensions only after the replacement snapshot succeeds so a refused
+       refresh cannot pair an old layout with new viewport globals. */
+    script_runtime_set_viewport(
+        frame->runtime, width, height, device_width, device_height);
     script_runtime_set_stylesheet(
         frame->runtime, &frame->presentation->stylesheet);
     script_runtime_set_layout(
@@ -2659,14 +2801,58 @@ bool navigation_test_refresh_frame_presentation(
 }
 #endif
 
+static bool navigation_install_frame_capability_trace(
+    NavigationFrame *frame)
+{
+    if (frame == NULL || frame->runtime == NULL) return false;
+    static const char trace_setup[] =
+        "(()=>{const seen=new Map(),missing=new Set(),traced=new WeakMap(),rawByProxy=new WeakMap();"
+        "globalThis.__tilefinchCapabilityTrace={seen,missing};"
+        "const record=name=>seen.set(name,(seen.get(name)||0)+1),raw=value=>rawByProxy.get(value)||value,rawArgs=args=>args.map(raw),traceObject=(target,label,depth=1)=>{"
+        "if(target===null||(typeof target!=='object'&&typeof target!=='function'))return target;if(rawByProxy.has(target)||traced.has(target))return rawByProxy.has(target)?target:traced.get(target);const proxy=new Proxy(target,{"
+        "get(object,key){let name=label;if(typeof key!=='symbol'){name=label+'.'+String(key);record(name);if(!(key in object))missing.add(name);}const descriptor=Reflect.getOwnPropertyDescriptor(object,key);if(descriptor&&Object.prototype.hasOwnProperty.call(descriptor,'value')&&!descriptor.configurable&&!descriptor.writable)return descriptor.value;const value=Reflect.get(object,key,object);return depth===0&&typeof value!=='function'?value:traceObject(value,name,Math.max(0,depth-1));},"
+        "set(object,key,value){if(typeof key!=='symbol'){const name=label+'.'+String(key)+'=';record(name);if(!(key in object))missing.add(name);}return Reflect.set(object,key,raw(value),object);},"
+        "apply(target,thisArg,args){const name='call:'+label;record(name);return traceObject(Reflect.apply(target,raw(thisArg),rawArgs(args)),name,Math.max(0,depth-1));},"
+        "construct(target,args,newTarget){const name='new:'+label;record(name);return traceObject(Reflect.construct(target,rawArgs(args),raw(newTarget)),name,Math.max(0,depth-1));}});traced.set(target,proxy);rawByProxy.set(proxy,target);return proxy;};"
+        /* Do not proxy document here. DOM bootstrap bookkeeping performs
+           thousands of private-property probes while a challenge builds
+           its shadow tree; tracing those probes both hides the useful
+           browser-capability signal and can make the validation run hit
+           its heap ceiling. The objects below are the standards surfaces
+           this diagnostic is intended to inventory. */
+        "for(const name of ['navigator','performance','screen','history'])if(globalThis[name])globalThis[name]=traceObject(globalThis[name],name);"
+        "for(const name of ['XMLHttpRequest','PerformanceObserver','Blob','URL','Worker','MutationObserver'])if(typeof globalThis[name]==='function')globalThis[name]=traceObject(globalThis[name],name);})();";
+    return script_runtime_evaluate_diagnostic(
+        frame->runtime, trace_setup, "<frame-capability-trace>",
+        &frame->script_result);
+}
+
+#if !defined(__PSP__)
+bool navigation_test_install_frame_capability_trace(
+    NavigationFrame *frame)
+{
+    return navigation_install_frame_capability_trace(frame);
+}
+#endif
+
 static bool navigation_complete_frame(NavigationSession *session,
                                       NavigationFrame *frame,
                                       bool fetched_ok, FetchResult *fetch)
 {
+    uint64_t response_completed_us = navigation_now_us();
+    ScriptNavigationTiming navigation_timing = navigation_timing_from_fetch(
+        frame->fetch_started_us, response_completed_us, 0, fetch);
+    char navigation_content_type[sizeof(fetch->content_type)];
+    snprintf(navigation_content_type, sizeof(navigation_content_type), "%s",
+             fetch->content_type);
+    navigation_timing.content_type = navigation_content_type;
     frame->fetch_pending = false;
     frame->http_status = fetch->status_code;
     snprintf(frame->server, sizeof(frame->server), "%s", fetch->server);
     snprintf(frame->cf_ray, sizeof(frame->cf_ray), "%s", fetch->cf_ray);
+    char request_referrer_policy[sizeof(frame->referrer_policy)];
+    snprintf(request_referrer_policy, sizeof(request_referrer_policy), "%s",
+             frame->referrer_policy);
     char response_referrer_policy[sizeof(frame->referrer_policy)];
     snprintf(response_referrer_policy, sizeof(response_referrer_policy),
              "%s", frame->referrer_policy);
@@ -2690,6 +2876,12 @@ static bool navigation_complete_frame(NavigationSession *session,
     }
     const char *effective = fetch->effective_url[0] == '\0'
         ? frame->url : fetch->effective_url;
+    char document_referrer[NAVIGATION_URL_LIMIT] = {0};
+    if (!fetch_compute_referrer(
+            frame->parent_url, effective, request_referrer_policy,
+            document_referrer, sizeof(document_referrer))) {
+        fetched_ok = false;
+    }
     TilefinchRequestContext top_hint_context = {
         .target_url = effective,
         .initiator_url = session->page.document_url,
@@ -2814,16 +3006,33 @@ static bool navigation_complete_frame(NavigationSession *session,
         ok = script_runtime_set_frame_window_state(
             frame->parent_runtime, frame->parent_handle, true,
             exposed_same_origin, frame->opaque_origin, final_url,
+            true,
             navigation_frame_parent_result(session, frame));
     }
     if (ok && scripts_allowed) {
-        frame->runtime = navigation_create_runtime(
-            session, &frame->document, frame->url,
-            frame->referrer_policy, true, &session->viewport,
-            SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME, false,
-            session->page.fetch_domain,
-            NULL, NULL, session->fonts,
-            &frame->script_result);
+        int frame_width = 0, frame_height = 0;
+        ViewportContext frame_viewport;
+        ok = navigation_frame_presentation_dimensions(
+                session, frame, &frame_width, &frame_height)
+            && viewport_context_init(
+                &frame_viewport, frame_width, frame_height,
+                session->viewport.device_width > 0
+                    ? session->viewport.device_width : 480,
+                session->viewport.device_height > 0
+                    ? session->viewport.device_height : 272);
+        if (!ok) {
+            frame->runtime = NULL;
+        } else {
+            frame->runtime = navigation_create_runtime(
+                session, &frame->document, frame->url,
+                document_referrer, frame->fetch_started_us,
+                frame->referrer_policy, true,
+                &frame_viewport,
+                SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME, false,
+                session->page.fetch_domain,
+                NULL, NULL, session->fonts,
+                &frame->script_result);
+        }
         ok = frame->runtime != NULL
             && script_runtime_configure_messaging(
                 frame->runtime, true, exposed_same_origin,
@@ -2834,25 +3043,11 @@ static bool navigation_complete_frame(NavigationSession *session,
         if (ok) script_runtime_set_images(frame->runtime, &frame->images);
     }
     if (ok && frame->runtime != NULL && session->trace_frame_capabilities) {
-        static const char trace_setup[] =
-            "(()=>{const seen=new Map(),missing=new Set();"
-            "globalThis.__tilefinchCapabilityTrace={seen,missing};"
-            "const traceObject=(target,label)=>new Proxy(target,{"
-            "get(object,key,receiver){if(typeof key!=='symbol'){const name=label+'.'+String(key);seen.set(name,(seen.get(name)||0)+1);if(!(key in object))missing.add(name);}return Reflect.get(object,key,receiver);},"
-            "set(object,key,value,receiver){if(typeof key!=='symbol'){const name=label+'.'+String(key)+'=';seen.set(name,(seen.get(name)||0)+1);if(!(key in object))missing.add(name);}return Reflect.set(object,key,value,receiver);}});"
-            /* Do not proxy document here. DOM bootstrap bookkeeping performs
-               thousands of private-property probes while a challenge builds
-               its shadow tree; tracing those probes both hides the useful
-               browser-capability signal and can make the validation run hit
-               its heap ceiling. The objects below are the standards surfaces
-               this diagnostic is intended to inventory. */
-            "for(const name of ['navigator','performance','crypto','screen','history'])if(globalThis[name])globalThis[name]=traceObject(globalThis[name],name);"
-            "for(const name of ['XMLHttpRequest','PerformanceObserver','Blob','URL','Worker','MutationObserver'])if(typeof globalThis[name]==='function')globalThis[name]=traceObject(globalThis[name],name);})();";
-        ok = script_runtime_evaluate_diagnostic(
-            frame->runtime, trace_setup, "<frame-capability-trace>",
-            &frame->script_result);
+        ok = navigation_install_frame_capability_trace(frame);
     }
     if (ok && frame->runtime != NULL) {
+        (void) script_runtime_record_navigation_timing(
+            frame->runtime, &navigation_timing);
         ExternalScriptMetrics metrics = {0};
         char frame_base_url[NAVIGATION_URL_LIMIT];
         ok = navigation_document_resource_base(
@@ -2878,7 +3073,7 @@ static bool navigation_complete_frame(NavigationSession *session,
         frame->retired = true;
         bool state_ok = script_runtime_set_frame_window_state(
             frame->parent_runtime, frame->parent_handle, false, false, false,
-            NULL, navigation_frame_parent_result(session, frame));
+            NULL, false, navigation_frame_parent_result(session, frame));
         bool event_ok = navigation_dispatch_frame_parent_event(
             session, frame->parent_runtime,
             frame->parent_frame_slot_plus_one,

@@ -269,6 +269,31 @@ typedef struct {
     size_t root_mutation_observers;
     size_t root_pending_network;
     size_t root_frame_windows;
+    size_t root_workers;
+    size_t root_worker_starts;
+    size_t root_worker_start_completions;
+    size_t root_worker_start_failures;
+    size_t root_worker_constructor_option_arguments;
+    size_t root_worker_timer_callbacks;
+    size_t root_worker_pending_timers;
+    size_t root_worker_inbound_queued;
+    size_t root_worker_inbound_delivered;
+    size_t root_worker_inbound_dropped;
+    size_t root_worker_outbound_queued;
+    size_t root_worker_outbound_delivered;
+    size_t root_worker_outbound_dropped;
+    size_t root_worker_outbound_dropped_inactive;
+    size_t root_worker_outbound_dropped_queue;
+    size_t root_worker_inbound_transfer_arguments;
+    size_t root_worker_outbound_transfer_arguments;
+    size_t root_worker_terminations;
+    size_t root_worker_last_id;
+    size_t root_worker_last_termination_reason;
+    double root_worker_last_task_ms;
+    size_t crypto_random_calls;
+    size_t crypto_random_bytes;
+    size_t crypto_digest_calls;
+    size_t crypto_digest_bytes;
     size_t lazy_webpack_candidates;
     size_t lazy_webpack_applied;
     size_t lazy_webpack_fallbacks;
@@ -294,6 +319,23 @@ typedef struct {
     size_t lazy_webpack_syntax_preflight_source_bytes;
     uint64_t lazy_webpack_syntax_preflight_total_us;
 } ScriptResult;
+
+typedef struct {
+    double now_ms;
+    double oldest_overdue_ms;
+    double nearest_future_ms;
+    double last_callback_ms;
+    size_t timers;
+    size_t due_timers;
+    size_t active_cancel_attempts;
+    size_t active_cancel_hits;
+    size_t timeout_callbacks;
+    size_t interval_callbacks;
+    size_t checkpoint_continuations;
+    bool quickjs_jobs_pending;
+    bool classic_script_continuation;
+    bool sampled_clock;
+} ScriptSchedulerSnapshot;
 
 /* Validation census for the bounded PSP WebGL translator. Shipping builds
    expose an empty snapshot without adding timing work to the frame path. */
@@ -642,7 +684,9 @@ typedef bool (*ScriptPostMessageCallback)(void *opaque,
                                           ScriptRuntime *source,
                                           long target_frame_handle,
                                           const char *json,
-                                          const char *target_origin);
+                                          const char *target_origin,
+                                          const char *task_kind,
+                                          uint64_t task_sequence);
 /* CSSOM View and getComputedStyle() are synchronous APIs. Embedders with a
    staged parser/layout pipeline provide this narrowly scoped callback so a
    read after author mutation can flush style and layout without re-entering
@@ -905,6 +949,13 @@ typedef struct {
     /* Applied only after trusted browser bootstrap evaluation. */
     bool dynamic_code_disabled;
     ScriptDocumentScope document_scope;
+    /* Policy-filtered referrer which created this document. This is distinct
+       from referrer_policy, which governs requests the new document emits. */
+    const char *document_referrer;
+    /* Monotonic start of the navigation which created this Window, in the
+       same process clock domain as tilefinch_platform_monotonic_time_us().
+       Zero selects runtime creation for standalone and synthetic realms. */
+    uint64_t navigation_started_us;
     const char *referrer_policy;
     ScriptRemoteElementLookupCallback remote_element_lookup;
     void *remote_element_opaque;
@@ -930,6 +981,10 @@ typedef struct {
    unrelated runtime scheduling cannot alter replay entropy. */
 void script_runtime_configure_deterministic_replay(bool enabled,
                                                    unsigned long long seed);
+/* Selects monotonic registration-time timer deadlines for subsequently
+   created live host runtimes. Device and deterministic runners retain the
+   owner-supplied elapsed clock unless they opt in explicitly. */
+void script_runtime_configure_wall_clock_timers(bool enabled);
 /* Pure, allocation-free reference for the native
    `splitmix64-url-scope-v1` derivation. Exposing the initial state keeps lab
    capture tooling and C/JavaScript conformance vectors pinned to one exact
@@ -948,6 +1003,10 @@ uint64_t script_runtime_deterministic_entropy_state_v1(
 bool script_runtime_deterministic_replay_diagnostics(
     const ScriptRuntime *runtime,
     ScriptDeterministicReplayDiagnostics *diagnostics);
+/* Returns only numeric scheduler liveness state. No timer callbacks,
+   arguments, URLs, or page values cross this diagnostic seam. */
+bool script_runtime_scheduler_snapshot(
+    ScriptRuntime *runtime, ScriptSchedulerSnapshot *snapshot);
 
 ScriptRuntime *script_runtime_create(PocDocument *document, Budget *budget,
                                      size_t js_memory_limit,
@@ -1093,6 +1152,10 @@ bool script_runtime_has_pending_author_work(ScriptRuntime *runtime);
 /* Queued startup script work that should precede optional resource reflows.
    Timers and ordinary in-flight fetches are deliberately excluded. */
 bool script_runtime_has_pending_startup_scripts(ScriptRuntime *runtime);
+/* True when a newly queued message task may enter this realm. A message
+   handler's bounded microtask checkpoint (or a continued classic script)
+   must finish before the next message task for the same realm begins. */
+bool script_runtime_message_dispatch_ready(ScriptRuntime *runtime);
 /* Parser and native DOM owners call this after mutations which bypass the JS
    bridge so the next baseURI/resource preparation observes the live tree. */
 void script_runtime_invalidate_document_base(ScriptRuntime *runtime);
@@ -1155,6 +1218,7 @@ bool script_runtime_set_frame_window_state(ScriptRuntime *runtime,
                                            bool same_origin,
                                            bool opaque_origin,
                                            const char *committed_url,
+                                           bool document_committed,
                                            ScriptResult *result);
 void script_runtime_report_memory(ScriptRuntime *runtime, FILE *output);
 /* Emits one fixed-size phase/realm census without evaluating author code or
@@ -1177,19 +1241,51 @@ bool script_runtime_evaluate_diagnostic(ScriptRuntime *runtime,
 typedef struct {
     bool measured;
     bool cache_hit;
+    bool cache_validated;
+    bool timing_allowed;
+    /* 0 unknown, 1 HTTP/1.0, 2 HTTP/1.1, 3 HTTP/2. */
+    uint8_t next_hop_protocol;
     uint32_t name_lookup_us;
     uint32_t connect_us;
     uint32_t appconnect_us;
     uint32_t first_byte_us;
     uint32_t total_us;
+    uint32_t encoded_body_bytes;
     uint32_t decoded_body_bytes;
+    /* Zero means that the filtered response status is unavailable/opaque. */
+    uint16_t response_status;
+    /* Borrowed for the duration of record_resource_timing_details(). */
+    const char *content_type;
 } ScriptResourceTiming;
+typedef struct {
+    bool measured;
+    bool response_complete;
+    bool encoded_body_bytes_measured;
+    uint64_t response_start_us;
+    uint64_t response_end_us;
+    uint32_t name_lookup_us;
+    uint32_t connect_us;
+    uint32_t appconnect_us;
+    uint32_t first_byte_us;
+    uint32_t total_us;
+    uint32_t encoded_body_bytes;
+    uint32_t decoded_body_bytes;
+    uint16_t response_status;
+    /* Borrowed for the duration of record_navigation_timing(). */
+    const char *next_hop_protocol;
+    const char *content_type;
+} ScriptNavigationTiming;
 bool script_runtime_record_resource_timing(ScriptRuntime *runtime,
                                            const char *url,
                                            const char *initiator_type);
 bool script_runtime_record_resource_timing_details(
     ScriptRuntime *runtime, const char *url, const char *initiator_type,
     const ScriptResourceTiming *timing);
+/* Updates the one retained PerformanceNavigationTiming entry. Values are
+   relative to the creating navigation's monotonic start and unknown fields
+   remain zero; this never appends a second navigation entry. */
+bool script_runtime_record_navigation_timing(
+    ScriptRuntime *runtime, const ScriptNavigationTiming *timing);
 long script_runtime_node_handle(ScriptRuntime *runtime,
                                 lxb_dom_node_t *node);
 /* Weak snapshots are generation-safe but do not retain a detached subtree.

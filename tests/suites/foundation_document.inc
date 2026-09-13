@@ -780,7 +780,10 @@
         "&&closure&&lexical&&frameEval('this===window')"
         "&&frameEval('(function(){return this===window;})()')"
         "&&frameEval('Function(\"return this===window\")()')"
-        "?'FRAME-BINDINGS-OK':'FRAME-BINDINGS-BAD';"
+        "?'FRAME-BINDINGS-OK':'FRAME-BINDINGS-BAD:'+"
+        "[refusedFrames,reflected,preserved,closure,lexical,"
+        "frameEval('this===window'),frameEval('(function(){return this===window;})()'),"
+        "frameEval('Function(\"return this===window\")()')].join(',');"
         "</script></body></html>";
     PocDocument frame_binding_document;
     CHECK(document_parse(&frame_binding_document, &budget, frame_binding_page,
@@ -989,12 +992,16 @@
         "table=new WebAssembly.Table({element:'externref',initial:1,maximum:2}),"
         "global=new WebAssembly.Global({value:'i64',mutable:true},7n);"
         "table.set(0,global);table.grow(1,null);global.value=9n;"
-        "const response=new Response(base,{headers:{'Content-Type':'application/wasm'}});"
+        "const response=new Response(base,{headers:{'Content-Type':'application/wasm'}}),"
+        "protectedResponse=new Response(base,{headers:{'Content-Type':'application/wasm'}});"
+        "protectedResponse.headers={get(){throw Error('poisoned headers')}};"
+        "protectedResponse.ok=false;protectedResponse.arrayBuffer=()=>Promise.reject(Error('poisoned body'));"
         "Promise.all([WebAssembly.compileStreaming(response),"
         "WebAssembly.instantiateStreaming(new Response(base,{headers:{'Content-Type':'application/wasm; charset=binary'}})),"
         "WebAssembly.compileStreaming(new Response(base,{headers:{'Content-Type':'text/plain'}})).then(()=>false,e=>e instanceof TypeError),"
         "WebAssembly.compile(new Uint8Array()).then(()=>false,e=>e instanceof WebAssembly.CompileError),"
-        "WebAssembly.compileStreaming({ok:true,headers:{get(){return 'application/wasm';}},arrayBuffer(){return Promise.resolve(base);}}).then(()=>false,e=>e instanceof TypeError)]).then(values=>{"
+        "WebAssembly.compileStreaming({ok:true,headers:{get(){return 'application/wasm';}},arrayBuffer(){return Promise.resolve(base);}}).then(()=>false,e=>e instanceof TypeError),"
+        "WebAssembly.compileStreaming(protectedResponse)]).then(values=>{"
         "const section=new Uint8Array(sections[0]),"
         "okay=imports.length===0&&exports.length===3"
         "&&exports[0].name==='memory'&&exports[0].kind==='memory'"
@@ -1006,7 +1013,8 @@
         "&&table.length===2&&table.get(0)===global&&global.value===9n"
         "&&values[0] instanceof WebAssembly.Module"
         "&&values[1].instance instanceof WebAssembly.Instance"
-        "&&values[2]&&values[3]&&values[4];"
+        "&&values[2]&&values[3]&&values[4]"
+        "&&values[5] instanceof WebAssembly.Module;"
         "globalThis.pocSummary=okay?'WASM-STANDARD-SURFACE-OK':'WASM-STANDARD-SURFACE-FAILED';"
         "},e=>{globalThis.pocSummary='WASM-STANDARD-SURFACE-ERROR:'+e;});"
         "</script></body></html>";
@@ -1464,18 +1472,20 @@
         "https://worker.test/", NULL, &worker_lifecycle_result);
     CHECK(worker_lifecycle_runtime != NULL);
     CHECK(script_runtime_evaluate_diagnostic(worker_lifecycle_runtime,
-        "globalThis.workerProbeCalls=0;"
-        "globalThis.workerProbe=()=>{workerProbeCalls++;};"
+        "globalThis.workerReadyCalls=0;globalThis.workerLateCalls=0;"
         "const workerSource=URL.createObjectURL(new Blob(["
-        "'globalThis.retireOwner(); Promise.resolve().then(()=>workerProbe());'"
-        "+'queueMicrotask(()=>workerProbe());'"
+        "'postMessage(\"ready\");'"
+        "+'setTimeout(()=>postMessage(\"late\"),10);'"
         "],{type:'text/javascript'}));void Worker;",
         "<worker-lifecycle-setup>", &worker_lifecycle_result));
     tilefinch_test_faults()->refuse_next_worker_realm = true;
     CHECK(script_runtime_evaluate_diagnostic(worker_lifecycle_runtime,
         "let refused=false;try{new Worker(workerSource);}catch(_){refused=true;}"
         "const workerA=new Worker(workerSource),workerB=new Worker(workerSource);"
-        "globalThis.retireOwner=()=>{workerA.terminate();workerB.terminate();};"
+        "const receive=(worker,event)=>{if(event.data==='ready'){workerReadyCalls++;"
+        "worker.terminate()}else workerLateCalls++};"
+        "workerA.onmessage=event=>receive(workerA,event);"
+        "workerB.onmessage=event=>receive(workerB,event);"
         "globalThis.pocSummary=refused?'WORKER-QUOTA-OK':'WORKER-QUOTA-BAD';",
         "<worker-lifecycle-create>", &worker_lifecycle_result));
     CHECK(strcmp(worker_lifecycle_result.summary, "WORKER-QUOTA-OK") == 0);
@@ -1483,22 +1493,24 @@
         CHECK(script_runtime_advance(worker_lifecycle_runtime, turn, 8,
                                      &worker_lifecycle_result));
     CHECK(script_runtime_evaluate_diagnostic(worker_lifecycle_runtime,
-        "globalThis.pocSummary=workerProbeCalls===0?'WORKER-STOP-OK':"
-        "'WORKER-STOP-BAD:'+workerProbeCalls;",
+        "globalThis.pocSummary=workerReadyCalls===2&&workerLateCalls===0?"
+        "'WORKER-STOP-OK':'WORKER-STOP-BAD:'+workerReadyCalls+':'"
+        "+workerLateCalls;",
         "<worker-lifecycle-check>", &worker_lifecycle_result));
     CHECK(strcmp(worker_lifecycle_result.summary, "WORKER-STOP-OK") == 0);
     CHECK(script_runtime_evaluate_diagnostic(worker_lifecycle_runtime,
-        "const originalFetch=globalThis.fetch;"
-        "globalThis.fetch=()=>Promise.resolve('complete');"
+        "const cleanupResourceURL=URL.createObjectURL(new Blob(['complete']));"
         "const cleanupURL=URL.createObjectURL(new Blob(["
-        "'let listeners=0;const signal={aborted:false,'"
-        "+'addEventListener(){listeners++},removeEventListener(){listeners--}};'"
-        "+'fetch(\"https://resource.test/\",{signal}).then(()=>postMessage(listeners));'"
+        "'let listeners=0;const signal=new AbortController().signal,'"
+        "+'add=signal.addEventListener.bind(signal),remove=signal.removeEventListener.bind(signal);'"
+        "+'signal.addEventListener=(...args)=>{listeners++;return add(...args)};'"
+        "+'signal.removeEventListener=(...args)=>{listeners--;return remove(...args)};'"
+        "+'fetch(\"'+cleanupResourceURL+'\",{signal}).then(()=>postMessage(listeners));'"
         "],{type:'text/javascript'}));"
         "const cleanupWorker=new Worker(cleanupURL);"
         "cleanupWorker.onmessage=e=>{globalThis.pocSummary=e.data===0?"
         "'WORKER-FETCH-CLEAN':'WORKER-FETCH-LEAK';cleanupWorker.terminate();"
-        "globalThis.fetch=originalFetch;};",
+        "URL.revokeObjectURL(cleanupResourceURL);};",
         "<worker-fetch-cleanup>", &worker_lifecycle_result));
     for (size_t turn = 0; turn < 12; turn++)
         CHECK(script_runtime_advance(worker_lifecycle_runtime, turn, 8,
@@ -1639,6 +1651,103 @@
                     "DATE-REPLAY-OK") == 0);
     document_destroy(&deterministic_date_document);
     CHECK(budget.current == deterministic_date_baseline);
+
+    puts("test: document referrer and performance origin keep native provenance");
+    size_t document_provenance_baseline = budget.current;
+    static const char document_provenance_page[] =
+        "<!doctype html><html><body></body></html>";
+    PocDocument document_provenance_document;
+    CHECK(document_parse(
+        &document_provenance_document, &budget, document_provenance_page,
+        sizeof(document_provenance_page) - 1, 17));
+    ViewportContext document_provenance_viewport;
+    CHECK(viewport_context_init(
+        &document_provenance_viewport, 480, 272, 480, 272));
+    ScriptRuntimeOptions document_provenance_options = {
+        .viewport = document_provenance_viewport,
+        .defer_document_scripts = true,
+        .document_scope = SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL,
+        .document_referrer = "https://source.test/path?q=1",
+        .navigation_started_us =
+            tilefinch_platform_monotonic_time_us() - UINT64_C(250000)
+    };
+    ScriptResult document_provenance_result = {0};
+    tilefinch_test_faults()->runtime_performance_origin_backdate_ms = 250;
+    ScriptRuntime *document_provenance_runtime =
+        script_runtime_create_configured(
+            &document_provenance_document, &budget, 4u * MIB, 1000,
+            "https://destination.test/", &document_provenance_options,
+            &document_provenance_result);
+    static const char document_provenance_source[] =
+        "(()=>{const referrer=document.referrer,descriptor="
+        "Object.getOwnPropertyDescriptor(Document.prototype,'referrer');"
+        "document.referrer='https://author.test/';const skew=Math.abs("
+        "Date.now()-(performance.timeOrigin+performance.now()));"
+        "pocSummary=referrer==='https://source.test/path?q=1'"
+        "&&document.referrer===referrer&&!Object.hasOwn(document,'referrer')"
+        "&&new Document().referrer===''&&!!descriptor"
+        "&&typeof descriptor.get==='function'&&!('value' in descriptor)"
+        "&&Number.isFinite(performance.timeOrigin)&&performance.now()>=250"
+        "&&skew<50"
+        "?'DOCUMENT-PROVENANCE-OK':'DOCUMENT-PROVENANCE-FAILED:'+skew})()";
+    CHECK(document_provenance_runtime != NULL
+          && tilefinch_test_faults()
+                 ->runtime_performance_origin_backdate_ms == 0
+          && script_runtime_evaluate_diagnostic(
+              document_provenance_runtime, document_provenance_source,
+              "<document-provenance>", &document_provenance_result)
+          && document_provenance_result.success
+          && strcmp(document_provenance_result.summary,
+                    "DOCUMENT-PROVENANCE-OK") == 0);
+    ScriptNavigationTiming document_navigation_timing = {
+        .measured = true,
+        .response_complete = true,
+        .encoded_body_bytes_measured = true,
+        .response_start_us = 180000,
+        .response_end_us = 220000,
+        .name_lookup_us = 5000,
+        .connect_us = 12000,
+        .appconnect_us = 25000,
+        .first_byte_us = 70000,
+        .total_us = 110000,
+        .encoded_body_bytes = 700,
+        .decoded_body_bytes = 1234,
+        .response_status = 200,
+        .next_hop_protocol = "h2",
+        .content_type = "text/html"
+    };
+    static const char document_navigation_source[] =
+        "(()=>{const entries=performance.getEntriesByType('navigation'),"
+        "entry=entries[0],json=entry&&entry.toJSON();"
+        "pocSummary=entries.length===1&&entry.startTime===0"
+        "&&entry.fetchStart===0&&entry.domainLookupStart===110"
+        "&&entry.domainLookupEnd===115&&entry.connectStart===115"
+        "&&entry.secureConnectionStart===122&&entry.connectEnd===135"
+        "&&entry.requestStart===135&&entry.responseStart===180"
+        "&&entry.finalResponseHeadersStart===180&&entry.responseEnd===220"
+        "&&entry.transferSize===1000&&entry.encodedBodySize===700"
+        "&&entry.decodedBodySize===1234&&entry.responseStatus===200"
+        "&&entry.nextHopProtocol==='h2'&&entry.contentType==='text/html'"
+        "&&performance.timing.navigationStart===performance.timeOrigin"
+        "&&performance.timing.domainLookupStart==="
+        "performance.timeOrigin+110"
+        "&&performance.timing.connectEnd===performance.timeOrigin+135"
+        "&&performance.timing.responseStart===performance.timeOrigin+180"
+        "&&performance.timing.responseEnd===performance.timeOrigin+220"
+        "&&json.responseEnd===220&&Object.keys(entry).length===0"
+        "?'NAVIGATION-TIMING-OK':'NAVIGATION-TIMING-FAILED:'"
+        "+JSON.stringify(json)})()";
+    CHECK(script_runtime_record_navigation_timing(
+              document_provenance_runtime, &document_navigation_timing)
+          && script_runtime_evaluate_diagnostic(
+              document_provenance_runtime, document_navigation_source,
+              "<document-navigation-timing>", &document_provenance_result)
+          && document_provenance_result.success
+          && strcmp(document_provenance_result.summary,
+                    "NAVIGATION-TIMING-OK") == 0);
+    script_runtime_destroy(document_provenance_runtime);
+    document_destroy(&document_provenance_document);
+    CHECK(budget.current == document_provenance_baseline);
 
     puts("test: deterministic clock tick, timer, rAF, and timeline vector");
     size_t deterministic_tick_baseline = budget.current;
@@ -1883,6 +1992,59 @@
           && strcmp(deterministic_tick_result.summary,
                     "RAF-LATE-OK") == 0);
     script_runtime_destroy(deterministic_tick_runtime);
+
+    puts("test: timer deadlines use registration-time monotonic clock");
+    size_t registration_clock_baseline = budget.current;
+    ScriptResult registration_clock_result;
+    script_runtime_configure_deterministic_replay(false, 0);
+    script_runtime_configure_wall_clock_timers(true);
+    ScriptRuntime *registration_clock_runtime =
+        script_runtime_create_configured(
+            &deterministic_tick_document, &budget, 4u * MIB, 1000,
+            "https://timer-registration.test/", &deterministic_tick_options,
+            &registration_clock_result);
+    static const char registration_clock_source[] =
+        "globalThis.pocSummary='pending';"
+        "{const until=performance.now()+30;while(performance.now()<until){}}"
+        "setTimeout(()=>globalThis.pocSummary='fired',20)";
+    static const char registration_clock_wait[] =
+        "{const until=performance.now()+25;while(performance.now()<until){}}";
+    CHECK(registration_clock_runtime != NULL
+          && script_runtime_advance(
+              registration_clock_runtime, 1, 4,
+              &registration_clock_result));
+    uint64_t registration_turn_started_ns =
+        tilefinch_platform_monotonic_time_ns();
+    CHECK(script_runtime_evaluate_diagnostic(
+              registration_clock_runtime, registration_clock_source,
+              "<timer-registration>", &registration_clock_result));
+    uint64_t registration_turn_ended_ns =
+        tilefinch_platform_monotonic_time_ns();
+    uint64_t registration_turn_elapsed_ns =
+        registration_turn_ended_ns >= registration_turn_started_ns
+            ? registration_turn_ended_ns - registration_turn_started_ns : 0;
+    unsigned registration_turn_elapsed_ms = (unsigned) (
+        (registration_turn_elapsed_ns + UINT64_C(999999))
+        / UINT64_C(1000000));
+    /* A start-to-start owner clock includes the preceding callback. The
+       sampled timer clock must not add those same milliseconds again and fire
+       a timer only a turn after it was registered. */
+    CHECK(registration_turn_elapsed_ms >= 25
+          && script_runtime_advance(
+              registration_clock_runtime, registration_turn_elapsed_ms, 4,
+              &registration_clock_result)
+          && strcmp(registration_clock_result.summary, "pending") == 0
+          && script_runtime_evaluate_diagnostic(
+              registration_clock_runtime, registration_clock_wait,
+              "<timer-registration-wait>", &registration_clock_result)
+          && script_runtime_advance(
+              registration_clock_runtime, 1, 4,
+              &registration_clock_result)
+          && strcmp(registration_clock_result.summary, "fired") == 0);
+    script_runtime_destroy(registration_clock_runtime);
+    CHECK(budget.current == registration_clock_baseline);
+    script_runtime_configure_wall_clock_timers(false);
+    script_runtime_configure_deterministic_replay(true, 42);
 
     puts("test: motion-free class changes reuse a negative inline hint");
     ScriptResult motion_free_result;

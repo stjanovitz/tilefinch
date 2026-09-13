@@ -15,7 +15,8 @@ def main() -> int:
             continue
         name, expected_file = raw.split("\t")
         pattern = re.compile(
-            rf"globalThis\.{re.escape(name)}\s*="
+            rf"(?:globalThis\.{re.escape(name)}\s*=|"
+            rf"defineTrustedTypesGlobal\([\"']{re.escape(name)}[\"'])"
         )
         hits: list[tuple[str, int]] = []
         for source in bootstrap.glob("*.js"):
@@ -26,7 +27,7 @@ def main() -> int:
             )
         if len(hits) != 1 or hits[0][0] != expected_file:
             failures.append(
-                f"{name}: expected one assignment in {expected_file}, got {hits}"
+                f"{name}: expected one definition in {expected_file}, got {hits}"
             )
     if failures:
         print("\n".join(failures), file=sys.stderr)

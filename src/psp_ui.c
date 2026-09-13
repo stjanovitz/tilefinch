@@ -76,9 +76,9 @@ _Static_assert(BROWSER_CHROME_THEME_COUNT <= 8,
 #define UI_TOAST_DEFAULT_FRAMES 180u
 #define UI_MEDIA_CONTROLS_MS 3000u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
-#define UI_OPTIONS_ITEM_COUNT 44u
+#define UI_OPTIONS_ITEM_COUNT 45u
 #else
-#define UI_OPTIONS_ITEM_COUNT 42u
+#define UI_OPTIONS_ITEM_COUNT 43u
 #endif
 #define UI_DATA_OPTIONS_ITEM_COUNT 7u
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
@@ -231,7 +231,8 @@ typedef enum {
     UI_OPTION_VIDEO_LANGUAGE,
     UI_OPTION_GAMEPAD_FACE_MAPPING,
     UI_OPTION_SAVE_PLAYBACK_POSITIONS,
-    UI_OPTION_CLEAR_PLAYBACK_POSITIONS
+    UI_OPTION_CLEAR_PLAYBACK_POSITIONS,
+    UI_OPTION_SAVE_DIAGNOSTIC_REPORTS
 } UiOptionId;
 
 _Static_assert(BROWSER_VIDEO_LANGUAGE_COUNT <= 16,
@@ -293,7 +294,8 @@ static const UiOptionId ui_option_order[UI_OPTIONS_ITEM_COUNT] = {
     UI_OPTION_VIDEO_LANGUAGE,
     UI_OPTION_GAMEPAD_FACE_MAPPING,
     UI_OPTION_SAVE_PLAYBACK_POSITIONS,
-    UI_OPTION_CLEAR_PLAYBACK_POSITIONS
+    UI_OPTION_CLEAR_PLAYBACK_POSITIONS,
+    UI_OPTION_SAVE_DIAGNOSTIC_REPORTS
 };
 
 static UiOptionId ui_option_id(size_t selection)
@@ -355,6 +357,7 @@ static const char *ui_option_group(UiOptionId option)
 #endif
         case UI_OPTION_NETWORK_PROFILE:
         case UI_OPTION_SITE_DATA:
+        case UI_OPTION_SAVE_DIAGNOSTIC_REPORTS:
             return "DEVICE & STORAGE";
         case UI_OPTION_UPDATE_CHECK:
         case UI_OPTION_UPDATE:
@@ -516,6 +519,8 @@ static const char *ui_option_description(UiOptionId option)
             return "Check and install a signed release";
         case UI_OPTION_SITE_DATA:
             return "Manage cache, cookies, and storage";
+        case UI_OPTION_SAVE_DIAGNOSTIC_REPORTS:
+            return "Write failure details to the Memory Stick";
     }
     return "";
 }
@@ -3443,6 +3448,14 @@ PspUiIntent psp_ui_update(PspUiState *ui, const PspUiInput *input)
                             ui, PSP_UI_SCREEN_DIAGNOSTIC_QR);
                     }
                     break;
+                case UI_OPTION_SAVE_DIAGNOSTIC_REPORTS:
+                    ui->save_diagnostic_reports =
+                        !ui->save_diagnostic_reports;
+                    intent.setting.id =
+                        PSP_UI_SETTING_SAVE_DIAGNOSTIC_REPORTS;
+                    intent.setting.value.boolean =
+                        ui->save_diagnostic_reports;
+                    break;
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
                 case UI_OPTION_POWER_TEST:
                     if (pressed & PSP_UI_BUTTON_CONFIRM) {
@@ -5067,6 +5080,10 @@ static TILEFINCH_OUT_OF_LINE void ui_option_row_presentation(
         case UI_OPTION_DIAGNOSTIC_QR:
             *label = "Diagnostic QR";
             *value = ">";
+            break;
+        case UI_OPTION_SAVE_DIAGNOSTIC_REPORTS:
+            *label = "Save error reports";
+            *value = ui->save_diagnostic_reports ? "On" : "Off";
             break;
 #ifdef TILEFINCH_PSP_POWER_TEST_MENU
         case UI_OPTION_POWER_TEST:

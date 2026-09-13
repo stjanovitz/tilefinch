@@ -377,8 +377,8 @@ static bool test_accepted_critical_client_hints(void)
             "Sec-CH-UA-Arch", accepted, sizeof(accepted))
         || strcmp(accepted, "Sec-CH-UA-Arch") != 0) return false;
 
-    /* Critical-CH is not an opt-in by itself, and unsupported hints remain
-       unavailable even when both response fields name them. */
+    /* Critical-CH is not an opt-in by itself. The bounded device facts cover
+       every high-entropy UA-CH value Tilefinch exposes to JavaScript. */
     if (!fetch_accepted_critical_client_hints(
             "Sec-CH-UA-Model", "Sec-CH-UA-Arch",
             accepted, sizeof(accepted))
@@ -386,7 +386,11 @@ static bool test_accepted_critical_client_hints(void)
         || !fetch_accepted_critical_client_hints(
             "Sec-CH-UA-WoW64", "Sec-CH-UA-WoW64",
             accepted, sizeof(accepted))
-        || accepted[0] != '\0'
+        || strcmp(accepted, "Sec-CH-UA-WoW64") != 0
+        || !fetch_accepted_critical_client_hints(
+            "Sec-CH-UA-Form-Factors", "Sec-CH-UA-Form-Factors",
+            accepted, sizeof(accepted))
+        || strcmp(accepted, "Sec-CH-UA-Form-Factors") != 0
         || !fetch_accepted_critical_client_hints(
             "UA, UA-Arch", "UA, UA-Arch",
             accepted, sizeof(accepted))
@@ -401,7 +405,9 @@ static bool test_accepted_critical_client_hints(void)
             "Sec-CH-UA-Model ",
             accepted, sizeof(accepted))
         || strcmp(accepted,
-                  "Sec-CH-UA-Arch, Sec-CH-UA-Model") != 0) return false;
+                  "Sec-CH-UA-Arch, Sec-CH-UA-Model") != 0) {
+        return false;
+    }
     if (!fetch_client_hint_tokens_cover(
             "Sec-CH-UA-Model, Sec-CH-UA-Arch",
             "sec-ch-ua-arch")

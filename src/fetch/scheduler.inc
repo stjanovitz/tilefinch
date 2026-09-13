@@ -615,6 +615,8 @@ static bool scheduled_fetch_prepare(FetchScheduler *scheduler,
             source != NULL && source->redirect_same_origin_only,
         .redirect_policy = source == NULL
             ? FETCH_REDIRECT_DEFAULT : source->redirect_policy,
+        .page_redirect_mode = source == NULL
+            ? FETCH_PAGE_REDIRECT_FOLLOW : source->page_redirect_mode,
         .redirect_url_validator = source == NULL
             ? NULL : source->redirect_url_validator,
         .cors_cached_response_validated =
@@ -1403,7 +1405,18 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
         }
         if (item->writer.redirect_response) {
             bool redirected = false;
-            if (item->hop->redirects >= FETCH_REDIRECT_LIMIT) {
+            if (item->request.page_redirect_mode
+                    == FETCH_PAGE_REDIRECT_ERROR) {
+                snprintf(item->result.error, sizeof(item->result.error),
+                         "redirect mode forbids redirect");
+            } else if (item->request.page_redirect_mode
+                           == FETCH_PAGE_REDIRECT_MANUAL) {
+                fetch_hop_stage_response_cookies(
+                    item->hop, &item->result,
+                    item->writer.response_cookie_start);
+                item->result.opaque_redirect = true;
+                item->writer.redirect_response = false;
+            } else if (item->hop->redirects >= FETCH_REDIRECT_LIMIT) {
                 snprintf(item->result.error, sizeof(item->result.error),
                          FETCH_REDIRECT_LIMIT_ERROR);
             } else {
@@ -1411,7 +1424,9 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
                     item->hop, &item->result,
                     item->writer.response_cookie_start);
             }
-            if (item->result.error[0] != '\0') {
+            if (item->result.opaque_redirect) {
+                /* Manual mode returns this hop as a filtered response. */
+            } else if (item->result.error[0] != '\0') {
                 /* Preserve an earlier explicit redirect error. */
             } else if (!fetch_hop_advance(item->hop, &item->result)) {
                 snprintf(item->result.error, sizeof(item->result.error),
@@ -1437,6 +1452,7 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
                 snprintf(item->result.error, sizeof(item->result.error),
                          "redirect transport could not be rescheduled");
             } else {
+                item->result.redirected = true;
                 item->writer.redirect_response = false;
                 item->writer.redirect_callback_aborted = false;
                 item->writer.interim_response = false;
@@ -1445,7 +1461,7 @@ static bool scheduled_finish_transport(FetchScheduler *scheduler,
                 redirected = true;
             }
             if (redirected) return false;
-            item->success = false;
+            if (!item->result.opaque_redirect) item->success = false;
         }
         if (item->success && !item->streaming
             && item->result.data == NULL) {
@@ -1644,7 +1660,21 @@ static bool scheduled_background_finish_hop(
     }
     if (item->writer.redirect_response) {
         bool redirected = false;
-        if (item->hop->redirects >= FETCH_REDIRECT_LIMIT) {
+        if (item->request.page_redirect_mode
+                == FETCH_PAGE_REDIRECT_ERROR) {
+            snprintf(item->result.error, sizeof(item->result.error), "%s",
+                     "redirect mode forbids redirect");
+        } else if (item->request.page_redirect_mode
+                       == FETCH_PAGE_REDIRECT_MANUAL) {
+            fetch_hop_stage_response_cookies(
+                item->hop, &item->result,
+                item->writer.response_cookie_start);
+            item->result.opaque_redirect = true;
+            item->writer.redirect_response = false;
+            fetch_result_log_transport(&item->result);
+            scheduled_mark_complete(scheduler, item, true, NULL, false);
+            return true;
+        } else if (item->hop->redirects >= FETCH_REDIRECT_LIMIT) {
             snprintf(item->result.error, sizeof(item->result.error), "%s",
                      FETCH_REDIRECT_LIMIT_ERROR);
         } else {
@@ -1660,6 +1690,7 @@ static bool scheduled_background_finish_hop(
             }
         }
         if (redirected) {
+            item->result.redirected = true;
             item->background_headers_delivered = false;
             item->writer.redirect_response = false;
             item->writer.has_response_location = false;

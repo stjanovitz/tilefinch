@@ -234,6 +234,10 @@ bool browser_profile_persist_local_storage(
    transport concern and is not controlled by this preference. */
 bool browser_profile_tls_session_persistence(
     const BrowserProfile *profile);
+/* Ordinary failure details stay in the live UI unless this explicit storage
+   preference is enabled. Fatal startup failures retain a one-shot fallback. */
+bool browser_profile_save_diagnostic_reports(
+    const BrowserProfile *profile);
 /* Global page policy. Both default to enabled for legacy profiles. */
 bool browser_profile_javascript_enabled(const BrowserProfile *profile);
 /* The site preference is independent of the global switch. The effective
@@ -355,6 +359,8 @@ void browser_profile_set_live_cache_kib(
 void browser_profile_set_persist_local_storage(
     BrowserProfile *profile, bool enabled);
 void browser_profile_set_tls_session_persistence(
+    BrowserProfile *profile, bool enabled);
+void browser_profile_set_save_diagnostic_reports(
     BrowserProfile *profile, bool enabled);
 void browser_profile_set_javascript_enabled(
     BrowserProfile *profile, bool enabled);

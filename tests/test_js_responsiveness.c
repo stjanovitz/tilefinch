@@ -149,6 +149,60 @@ static int test_reduced_dom_event_counter(void)
     return 0;
 }
 
+static int test_job_heap_rejection_is_fatal(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://job-heap.test/", NULL, &result);
+    CHECK(runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.__tilefinchHeapFailure=()=>"
+              "new ArrayBuffer(65536)",
+              "<job-heap-failure-setup>", &result));
+
+    JSValue global = JS_GetGlobalObject(runtime->context);
+    JSValue callback = JS_GetPropertyStr(
+        runtime->context, global, "__tilefinchHeapFailure");
+    CHECK(JS_IsFunction(runtime->context, callback));
+    size_t slot = ((size_t) runtime->checkpoint_continuation_head
+                   + runtime->checkpoint_continuation_count)
+        % SCRIPT_CHECKPOINT_CONTINUATION_LIMIT;
+    runtime->checkpoint_continuations[slot] =
+        JS_DupValue(runtime->context, callback);
+    runtime->checkpoint_continuation_count++;
+
+    size_t live = budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    size_t rejections_before = script_runtime_heap_rejections(runtime);
+    JS_SetMemoryLimit(runtime->runtime, live + 1024u);
+    CHECK(!js_rt_runtime_run_jobs(runtime)
+          && runtime->checkpoint_continuation_count == 0u
+          && script_runtime_heap_rejections(runtime) > rejections_before);
+
+    /* A fatal task result retires the owning page in production. The VM still
+       has to be destructible and testable after the exception was consumed. */
+    JS_SetMemoryLimit(runtime->runtime, 5u * MIB);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "delete globalThis.__tilefinchHeapFailure;"
+              "globalThis.pocSummary='JOB-HEAP-RECOVERED'",
+              "<job-heap-failure-recovery>", &result)
+          && strcmp(result.summary, "JOB-HEAP-RECOVERED") == 0);
+    JS_FreeValue(runtime->context, callback);
+    JS_FreeValue(runtime->context, global);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 static int check_external_compile_cycles(size_t source_bytes,
                                          size_t target_remaining,
                                          bool expect_collection)
@@ -594,6 +648,58 @@ static bool collect_and_drain_finalizers(ScriptRuntime *runtime,
     return true;
 }
 
+static int test_response_body_release_with_retained_wrappers(void)
+{
+    Budget budget;
+    budget_init(&budget, 16u * MIB);
+    CHECK(budget_install_lexbor(&budget));
+    PocDocument document;
+    static const char html[] = "<!doctype html><body>Ready</body>";
+    CHECK(document_parse(&document, &budget, html, sizeof(html) - 1u, 17));
+    ScriptResult result = {0};
+    ScriptRuntime *runtime = script_runtime_create_with_session(
+        &document, &budget, 5u * MIB, 4000,
+        "https://response-retention.test/", NULL, &result);
+    CHECK(runtime != NULL);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.retainedResponses=[];new Response('warm').body.cancel();"
+        "globalThis.pocSummary='RESPONSE-RETENTION-WARM';",
+        "<response-retention-warm>", &result));
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t baseline =
+        budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary='RESPONSE-RETENTION-PENDING';(async()=>{"
+        "for(let at=0;at<8;at++){const response=new Response(new Uint8Array("
+        "128*1024));retainedResponses.push(response);if((at&1)===0)await "
+        "response.body.cancel();else{const reader=response.body.getReader();"
+        "for(;;){const item=await reader.read();if(item.done)break}}}"
+        "globalThis.pocSummary='RESPONSE-RETENTION-OK'})().catch(error=>{"
+        "globalThis.pocSummary='RESPONSE-RETENTION-ERROR:'+String(error&&"
+        "error.stack||error)});",
+        "<response-retention>", &result));
+    for (size_t tick = 0; tick < 32
+         && strcmp(result.summary, "RESPONSE-RETENTION-PENDING") == 0;
+         tick++) {
+        CHECK(script_runtime_advance(runtime, 0, 1024, &result));
+    }
+    CHECK(strcmp(result.summary, "RESPONSE-RETENTION-OK") == 0);
+    CHECK(collect_and_drain_finalizers(runtime, &result));
+    size_t retained =
+        budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
+    printf("response-retention baseline=%zu retained=%zu delta=%zu\n",
+           baseline, retained, retained > baseline ? retained - baseline : 0u);
+    /* Eight live Response wrappers and their exhausted stream state are
+       small. Their eight 128 KiB byte snapshots must no longer be retained. */
+    CHECK(retained <= baseline + 512u * 1024u);
+    script_runtime_destroy(runtime);
+    document_destroy(&document);
+    CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
+    return 0;
+}
+
 typedef struct {
     TilefinchCredentialsMode first_credentials;
     TilefinchCredentialsMode second_credentials;
@@ -811,6 +917,19 @@ static int test_computed_style_native_cooperation(void)
         "globalThis.pocSummary=getComputedStyle(document.getElementById('probe')).color",
         "<style-after-cancel>", &result)
         && strcmp(result.summary, "rgb(255, 0, 0)") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(runtime,
+        "(()=>{const style=getComputedStyle(document.getElementById('probe'));"
+        "let readonly=false;try{style.color='blue'}catch(error){readonly="
+        "error instanceof DOMException&&error.name==='NoModificationAllowedError'}"
+        "const names=[...style],first=style.item(0);globalThis.pocSummary="
+        "style instanceof CSSStyleDeclaration"
+        "&&Object.prototype.toString.call(style)==='[object CSSStyleDeclaration]'"
+        "&&style.length===names.length&&first===style[0]"
+        "&&style.getPropertyPriority('color')===''&&readonly"
+        "&&style.color==='rgb(255, 0, 0)'?'COMPUTED-STYLE-OK':"
+        "'COMPUTED-STYLE-FAILED'})()",
+        "<computed-style-contract>", &result)
+        && strcmp(result.summary, "COMPUTED-STYLE-OK") == 0);
     script_runtime_destroy(runtime);
     stylesheet_destroy(&sheet);
     document_destroy(&document);
@@ -977,14 +1096,18 @@ int main(int argc, char **argv)
             || test_dom_order_without_sibling_wrappers();
     if (argc == 2 && strcmp(argv[1], "--task-time-slice-only") == 0)
         return test_runtime_task_time_slice();
+    if (argc == 2 && strcmp(argv[1], "--job-heap-rejection-only") == 0)
+        return test_job_heap_rejection_is_fatal();
     CHECK(test_external_compile_reclaims_cycles() == 0);
     CHECK(test_gc_pacing_requires_heap_growth() == 0);
     CHECK(test_dom_wrapper_receiver_sharing() == 0);
     CHECK(test_dom_order_without_sibling_wrappers() == 0);
+    CHECK(test_response_body_release_with_retained_wrappers() == 0);
     CHECK(test_runtime_task_time_slice() == 0);
     CHECK(test_computed_style_native_cooperation() == 0);
     CHECK(test_watchdog_elapsed_cooperation() == 0);
     CHECK(test_reduced_dom_event_counter() == 0);
+    CHECK(test_job_heap_rejection_is_fatal() == 0);
     CHECK(test_blank_recovery_author_work_census() == 0);
     CHECK(test_native_dynamic_code_policy() == 0);
     uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES];
@@ -1302,12 +1425,15 @@ int main(int argc, char **argv)
               "globalThis.__gamepadEvents=[];const bridge="
               "Object.getOwnPropertyDescriptor(globalThis,"
               "'__tilefinchUpdateGamepad');"
+              "const first=navigator.getGamepads(),second="
+              "navigator.getGamepads();first.push(null);"
               "addEventListener('gamepadconnected',e=>"
               "__gamepadEvents.push(e.type+':'+e.gamepad.index));"
               "addEventListener('gamepaddisconnected',e=>"
               "__gamepadEvents.push(e.type+':'+e.gamepad.index));"
               "globalThis.pocSummary=bridge&&!bridge.writable&&"
-              "!bridge.configurable&&navigator.getGamepads()[0]===null?"
+              "!bridge.configurable&&first!==second&&first.length===1&&"
+              "second.length===0?"
               "'GAMEPAD-HIDDEN':'GAMEPAD-LEAKED'",
               "<gamepad-install>", &result)
           && strcmp(result.summary, "GAMEPAD-HIDDEN") == 0);
@@ -1322,11 +1448,13 @@ int main(int argc, char **argv)
           && script_runtime_evaluate_diagnostic(
               runtime,
               "(()=>{const first=navigator.getGamepads(),p=first[0],"
-              "second=navigator.getGamepads()[0];"
+              "secondSnapshot=navigator.getGamepads(),second="
+              "secondSnapshot[0];"
               "globalThis.__gamepadRef=p;"
               "globalThis.__gamepadButtonsRef=p.buttons;"
               "globalThis.pocSummary="
-              "first.length===1&&p===second&&p.id==='PSP Built-in Controller'"
+              "first!==secondSnapshot&&first.length===1&&p===second&&"
+              "p.id==='PSP Built-in Controller'"
               "&&p.mapping==='standard'&&p.buttons.length===17"
               "&&p.buttons[0].pressed&&p.buttons[12].value===1"
               "&&!p.buttons[1].pressed&&p.axes.length===4"
@@ -1465,6 +1593,25 @@ int main(int argc, char **argv)
     CHECK(hardening_ok
           && strcmp(result.summary, "REALM-HARDENING-OK") == 0);
 
+    puts("test: native event listeners finish before microtasks run");
+    static const char native_event_order_setup[] =
+        "globalThis.__nativeEventOrder=[];"
+        "addEventListener('message',()=>{"
+        "__nativeEventOrder.push('first');"
+        "Promise.resolve().then(()=>__nativeEventOrder.push('microtask'))});"
+        "addEventListener('message',()=>__nativeEventOrder.push('second'));";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, native_event_order_setup,
+              "<native-event-order-setup>", &result)
+          && script_runtime_dispatch_message(
+              runtime, "{\"probe\":true}", "https://source.test", -2,
+              &result)
+          && script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.pocSummary=__nativeEventOrder.join(',')",
+              "<native-event-order-result>", &result)
+          && strcmp(result.summary, "first,second,microtask") == 0);
+
     puts("test: exception formatting cannot poison the runtime");
     static const char hostile_exception_probe[] =
         "throw {[Symbol.toPrimitive](){throw new Error('secondary')}}";
@@ -1528,7 +1675,16 @@ int main(int argc, char **argv)
         "sharedBuffer),viewB=new Uint8Array(sharedBuffer,2),clonedViews="
         "structuredClone({a:viewA,b:viewB});clonedViews.a[3]=9;"
         "const clonedErr=structuredClone(new RangeError('bounded')),"
-        "cloneOk=graphOk&&mapOk&&cloneErrorName==='DataCloneError'"
+        "arrayPrototype=Object.create(Array.prototype);"
+        "arrayPrototype[1]={inherited:true};const arrayValue=[1,,3];"
+        "Object.setPrototypeOf(arrayValue,arrayPrototype);"
+        "arrayValue.metadata={value:41};"
+        "const clonedArray=structuredClone(arrayValue),arrayPropertiesOk="
+        "clonedArray.length===3&&clonedArray[0]===1&&clonedArray[2]===3"
+        "&&!Object.prototype.hasOwnProperty.call(clonedArray,'1')"
+        "&&clonedArray[1]===undefined&&clonedArray.metadata.value===41;"
+        "cloneOk=graphOk&&mapOk&&arrayPropertiesOk"
+        "&&cloneErrorName==='DataCloneError'"
         "&&clonedViews.b[1]===9&&clonedViews.a.buffer!==sharedBuffer"
         "&&clonedErr instanceof RangeError&&clonedErr.message==='bounded';"
         "const closingURL=URL.createObjectURL(new Blob([\"postMessage('before')"
@@ -1537,11 +1693,23 @@ int main(int argc, char **argv)
         "closing.onmessage=event=>closeMessages.push(event.data);"
         "const libURL=URL.createObjectURL(new Blob([\"function libValue(){return 41}\"])),"
         "isoURL=URL.createObjectURL(new Blob([\"importScripts(\"+JSON.stringify(libURL)+\");"
+        "const uaData=navigator.userAgentData,uaPromise=uaData&&"
+        "uaData.getHighEntropyValues([]),connection=navigator.connection,"
+        "permissionPromise=navigator.permissions.query({name:'geolocation'}),"
+        "storagePromise=navigator.storage.persisted(),"
+        "gpuPromise=navigator.gpu&&navigator.gpu.requestAdapter();"
+        "storagePromise.catch(()=>{});"
         "const bare=(function(){return this})();"
         "postMessage([this===self,self===globalThis,typeof window,bare===self,"
         "typeof document,libValue()+1,typeof console,"
         "Object.getPrototypeOf(self)===DedicatedWorkerGlobalScope.prototype,"
-        "typeof onmessage])\"])),iso=new Worker(isoURL),isoMessages=[];"
+        "typeof onmessage,typeof NavigatorUAData==='function',"
+        "typeof NetworkInformation==='function',"
+        "typeof NavigatorUAData==='function'&&uaData instanceof NavigatorUAData,"
+        "typeof NetworkInformation==='function'&&connection instanceof NetworkInformation,"
+        "uaPromise instanceof Promise,permissionPromise instanceof Promise,"
+        "storagePromise instanceof Promise,gpuPromise instanceof Promise])\"])),"
+        "iso=new Worker(isoURL),isoMessages=[];"
         "iso.onmessage=event=>isoMessages.push(event.data);"
         "const form=document.createElement('form'),"
         "select=document.createElement('select'),"
@@ -1564,7 +1732,9 @@ int main(int argc, char **argv)
         "await new Promise(resolve=>setTimeout(resolve,0));"
         "await new Promise(resolve=>setTimeout(resolve,0));"
         "const closeOk=closeMessages.join(',')==='before,after';"
-        "const isoOk=JSON.stringify(isoMessages[0])===JSON.stringify([true,true,'undefined',true,'undefined',42,'object',true,'object']);"
+        "const isoOk=JSON.stringify(isoMessages[0])===JSON.stringify(["
+        "true,true,'undefined',true,'undefined',42,'object',true,'object',"
+        "true,true,true,true,true,true,true,true]);"
         "iso.terminate();URL.revokeObjectURL(closingURL);URL.revokeObjectURL(isoURL);URL.revokeObjectURL(libURL);"
         "globalThis.pocSummary=dataViewOk&&cloneOk&&closeOk&&isoOk&&selectOk&&flexOk"
         "&&streamOk?'COMPATIBILITY-REGRESSIONS-OK'"
@@ -1587,6 +1757,41 @@ int main(int argc, char **argv)
     }
     CHECK(compatibility_ok
           && strcmp(result.summary, "COMPATIBILITY-REGRESSIONS-OK") == 0);
+
+    puts("test: checkpoint continuation exceptions stay contained");
+    CHECK(runtime->checkpoint_continuation_count == 0u
+          && script_runtime_evaluate_diagnostic(
+              runtime,
+              "globalThis.__tilefinchThrowingContinuation=()=>{"
+              "throw new Error('continuation failure')};",
+              "<checkpoint-continuation-setup>", &result));
+    JSValue continuation_global = JS_GetGlobalObject(runtime->context);
+    JSValue throwing_continuation = JS_GetPropertyStr(
+        runtime->context, continuation_global,
+        "__tilefinchThrowingContinuation");
+    CHECK(JS_IsFunction(runtime->context, throwing_continuation));
+    size_t continuation_slot =
+        ((size_t) runtime->checkpoint_continuation_head
+         + runtime->checkpoint_continuation_count)
+        % SCRIPT_CHECKPOINT_CONTINUATION_LIMIT;
+    runtime->checkpoint_continuations[continuation_slot] =
+        JS_DupValue(runtime->context, throwing_continuation);
+    runtime->checkpoint_continuation_count++;
+    size_t continuation_errors_before =
+        runtime->result.uncaught_callback_errors;
+    CHECK(js_rt_runtime_run_jobs(runtime));
+    js_rt_runtime_update_result(runtime, &result);
+    CHECK(runtime->checkpoint_continuation_count == 0u
+          && result.uncaught_callback_errors
+                 == continuation_errors_before + 1u);
+    JS_FreeValue(runtime->context, throwing_continuation);
+    JS_FreeValue(runtime->context, continuation_global);
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime,
+              "delete globalThis.__tilefinchThrowingContinuation;"
+              "globalThis.pocSummary='CONTINUATION-RECOVERED'",
+              "<checkpoint-continuation-recovery>", &result)
+          && strcmp(result.summary, "CONTINUATION-RECOVERED") == 0);
 
     puts("test: oversized data script fails visibly and remains counted");
     size_t oversized_data_failed_before = result.dynamic_scripts_failed;
@@ -1750,6 +1955,70 @@ int main(int argc, char **argv)
               runtime, observer_lifecycle_probe,
               "<observer-lifecycle-probe>", &result)
           && strcmp(result.summary, "OBSERVER-LIFECYCLE-OK") == 0);
+
+    static const char observer_old_value_probe[] =
+        "(()=>{const parent=document.createElement('div'),child=document."
+        "createElement('span');parent.appendChild(child);document.body.appendChild("
+        "parent);child.setAttribute('data-value','before');let observed=null,"
+        "detachedObserved=false;const "
+        "observer=new MutationObserver(records=>{observed=records[0]?.oldValue}),"
+        "detached=new MutationObserver(records=>{detachedObserved=records.some("
+        "record=>record.type==='attributes'&&record.target===child)});"
+        "observer.observe(parent,{subtree:true,attributes:true});observer.observe("
+        "child,{attributes:true,attributeOldValue:true});detached.observe(parent,"
+        "{subtree:true,attributes:true});parent.removeChild(child);child.setAttribute("
+        "'data-value','after');return Promise.resolve().then(()=>{observer."
+        "disconnect();detached.disconnect();parent.remove();globalThis.pocSummary="
+        "observed==='before'&&detachedObserved?'OBSERVER-OLD-VALUE-OK':"
+        "'OBSERVER-OLD-VALUE-FAILED:'+String(observed)+','+detachedObserved})})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, observer_old_value_probe,
+              "<observer-old-value-probe>", &result)
+          && strcmp(result.summary, "OBSERVER-OLD-VALUE-OK") == 0);
+
+    static const char observer_transient_lifecycle_probe[] =
+        "(async()=>{const parent=document.createElement('div'),child=document."
+        "createElement('div'),grand=document.createElement('span');child.appendChild("
+        "grand);parent.appendChild(child);document.body.appendChild(parent);let first="
+        "[];const propagated=new MutationObserver(records=>first.push(...records));"
+        "propagated.observe(parent,{subtree:true,childList:true,attributes:true});"
+        "parent.removeChild(child);child.removeChild(grand);grand.setAttribute("
+        "'data-probe','yes');await Promise.resolve();await Promise.resolve();const "
+        "propagates=first.filter(record=>record.type==='childList').length===2&&first."
+        "some(record=>record.type==='attributes'&&record.target===grand);propagated."
+        "disconnect();const secondParent=document.createElement('div'),secondChild="
+        "document.createElement('span');secondParent.appendChild(secondChild);document."
+        "body.appendChild(secondParent);let callbacks=0,lateRecords=0;const cleared="
+        "new MutationObserver(records=>{callbacks++;lateRecords+=records.length;if("
+        "callbacks===1)secondChild.setAttribute('data-late','yes')});cleared.observe("
+        "secondParent,{subtree:true,childList:true,attributes:true});secondParent."
+        "removeChild(secondChild);await Promise.resolve();await Promise.resolve();await "
+        "Promise.resolve();const clearsBeforeCallback=callbacks===1&&lateRecords===1;"
+        "cleared.disconnect();const thirdParent=document.createElement('div'),"
+        "thirdChild=document.createElement('span');thirdParent.appendChild(thirdChild);"
+        "document.body.appendChild(thirdParent);let third=[];const replaced=new "
+        "MutationObserver(records=>third.push(...records));replaced.observe(thirdParent,"
+        "{subtree:true,childList:true,attributes:true});thirdParent.removeChild("
+        "thirdChild);replaced.observe(thirdParent,{childList:true});thirdChild."
+        "setAttribute('data-after','yes');await Promise.resolve();await Promise.resolve();"
+        "const reobserveClears=!third.some(record=>record.type==='attributes');replaced."
+        "disconnect();parent.remove();secondParent.remove();thirdParent.remove();"
+        "globalThis.pocSummary=propagates&&clearsBeforeCallback&&reobserveClears?"
+        "'OBSERVER-TRANSIENT-LIFECYCLE-OK':'OBSERVER-TRANSIENT-LIFECYCLE-FAILED:'+"
+        "[propagates,callbacks,lateRecords,reobserveClears].join(',')})().catch(error=>"
+        "{globalThis.pocSummary='OBSERVER-TRANSIENT-LIFECYCLE-ERROR:'+String(error&&"
+        "error.stack||error)});";
+    bool observer_transient_lifecycle_ok = script_runtime_evaluate_diagnostic(
+        runtime, observer_transient_lifecycle_probe,
+        "<observer-transient-lifecycle-probe>", &result);
+    for (size_t tick = 0; observer_transient_lifecycle_ok && tick < 16
+         && strcmp(result.summary, "OBSERVER-TRANSIENT-LIFECYCLE-OK") != 0;
+         tick++) {
+        observer_transient_lifecycle_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    CHECK(observer_transient_lifecycle_ok
+          && strcmp(result.summary, "OBSERVER-TRANSIENT-LIFECYCLE-OK") == 0);
 
     lxb_dom_node_t *script = find_script(
         lxb_dom_interface_node(document.html));
@@ -1930,6 +2199,28 @@ int main(int argc, char **argv)
     static const char visibility_setup[] =
         "globalThis.__visibilityEdges=[];globalThis.__hiddenRaf=0;"
         "globalThis.__visibilityHandlerEdges=[];globalThis.__hiddenTimer=0;"
+        "let illegal=false;"
+        "try{new VisibilityStateEntry()}catch(error){illegal="
+        "error instanceof TypeError}const initialVisibilityEntries="
+        "performance.getEntriesByType('visibility-state');"
+        "globalThis.__visibilityPerformanceInitial=illegal&&"
+        "initialVisibilityEntries.length===1&&"
+        "initialVisibilityEntries[0] instanceof VisibilityStateEntry&&"
+        "initialVisibilityEntries[0] instanceof PerformanceEntry&&"
+        "Object.prototype.toString.call(initialVisibilityEntries[0])==="
+        "'[object VisibilityStateEntry]'&&"
+        "Object.getOwnPropertyNames(initialVisibilityEntries[0]).length===0&&"
+        "initialVisibilityEntries[0].name==='visible'&&"
+        "initialVisibilityEntries[0].entryType==='visibility-state'&&"
+        "initialVisibilityEntries[0].startTime===0&&"
+        "initialVisibilityEntries[0].duration===0&&"
+        "PerformanceObserver.supportedEntryTypes.includes('visibility-state');"
+        "const visibilityObserver=new PerformanceObserver(()=>{});"
+        "visibilityObserver.observe({type:'visibility-state',buffered:true});"
+        "globalThis.__visibilityPerformanceInitial="
+        "__visibilityPerformanceInitial&&"
+        "visibilityObserver.takeRecords().map(entry=>entry.name)"
+        ".join(',')==='visible';visibilityObserver.disconnect();"
         "if(typeof __tilefinchPageVisible!=='undefined'||"
         "typeof __tilefinchApplyPageVisibility!=='undefined')"
         "throw new Error('visibility host bridge leaked');"
@@ -1939,19 +2230,23 @@ int main(int argc, char **argv)
         "document.visibilityState));requestAnimationFrame(()=>__hiddenRaf++);"
         "setTimeout(()=>__hiddenTimer++,0);";
     CHECK(script_runtime_evaluate_diagnostic(
-              runtime, visibility_setup, "<visibility-setup>", &result)
-          && script_runtime_set_page_visibility(runtime, false)
-          && script_runtime_advance(runtime, 16, 16, &result)
-          && script_runtime_evaluate_diagnostic(
-                 runtime,
-                 "globalThis.pocSummary=document.hidden&&"
-                 "document.visibilityState==='hidden'&&"
-                 "__visibilityEdges.join(',')==='hidden'&&"
-                 "__visibilityHandlerEdges.join(',')==='hidden'&&"
-                 "__hiddenTimer===1&&__hiddenRaf===0"
-                 "?'VISIBILITY-HIDDEN-OK':'VISIBILITY-HIDDEN-FAILED'",
-                 "<visibility-hidden>", &result)
-          && strcmp(result.summary, "VISIBILITY-HIDDEN-OK") == 0);
+              runtime, visibility_setup, "<visibility-setup>", &result));
+    CHECK(script_runtime_set_page_visibility(runtime, false));
+    CHECK(script_runtime_advance(runtime, 16, 16, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=[document.hidden,"
+        "document.visibilityState==='hidden',"
+        "__visibilityEdges.join(',')==='hidden',"
+        "__visibilityHandlerEdges.join(',')==='hidden',"
+        "__visibilityPerformanceInitial,"
+        "performance.getEntriesByType('visibility-state').map("
+        "entry=>entry.name).join(',')==='visible,hidden',"
+        "__hiddenTimer===1,__hiddenRaf===0].map(Number).join('')",
+        "<visibility-hidden>", &result));
+    if (strcmp(result.summary, "11111111") != 0)
+        fprintf(stderr, "visibility hidden state: %s\n", result.summary);
+    CHECK(strcmp(result.summary, "11111111") == 0);
     CHECK(script_runtime_set_page_visibility(runtime, true)
           && script_runtime_advance(runtime, 16, 16, &result)
           && script_runtime_evaluate_diagnostic(
@@ -2254,21 +2549,64 @@ int main(int argc, char **argv)
         "document.body.appendChild(picture);const selected=img.currentSrc;"
         "source.media='not all';const fallback=img.currentSrc;"
         "const frame=document.createElement('iframe'),view=frame.contentWindow;"
+        "view.initialMarker='preserved';"
         "frame.srcdoc='<p>first</p>';document.body.appendChild(frame);"
-        "const first=frame.contentDocument.body.textContent;"
+        "const first=frame.contentDocument.body.textContent,"
+        "initialPreserved=view.initialMarker==='preserved';"
+        "view.sameValueStale='stale';frame.srcdoc='<p>first</p>';"
+        "const sameValueFresh=view.sameValueStale===undefined"
+        "&&frame.contentDocument.body.textContent==='first';"
+        "view.oldDocumentValue='stale';view.eval('var staleFrameVar=1');"
         "frame.srcdoc='<p>second</p>';"
         "const second=frame.contentDocument.body.textContent,"
         "stable=view===frame.contentWindow"
-        "&&frame.contentDocument.defaultView===view;"
+        "&&frame.contentDocument.defaultView===view"
+        "&&view.oldDocumentValue===undefined"
+        "&&view.eval('typeof staleFrameVar')==='undefined';"
+        "const srcdocDocument=frame.contentDocument;view.fallbackMarker='kept';"
+        "frame.src='fallback-a.html';const fallbackSetIgnored="
+        "frame.contentDocument===srcdocDocument&&view.fallbackMarker==='kept';"
+        "frame.removeAttribute('src');const fallbackRemoveIgnored="
+        "frame.contentDocument===srcdocDocument&&view.fallbackMarker==='kept';"
         "frame.removeAttribute('srcdoc');"
-        "const cleared=frame.contentDocument.body.textContent;"
+        "const cleared=frame.contentDocument.body.textContent,"
+        "blank=document.createElement('iframe'),blankView=blank.contentWindow;"
+        "blankView.initialBlankMarker='preserved';document.body.appendChild(blank);"
+        "const initialBlankDocument=blank.contentDocument;blank.src='about:blank';"
+        "const explicitBlankFresh=blank.contentDocument!==initialBlankDocument"
+        "&&blankView.initialBlankMarker==='preserved';blankView.removalStale='stale';"
+        "blank.removeAttribute('src');const removalFresh="
+        "blankView.removalStale===undefined,empty=document.createElement('iframe');"
+        "empty.src='';const emptyView=empty.contentWindow;emptyView.firstMarker='kept';"
+        "document.body.appendChild(empty);empty.srcdoc='<p>empty-first</p>';const "
+        "emptyPreserved=emptyView.firstMarker==='kept';emptyView.nextMarker='stale';"
+        "empty.srcdoc='<p>empty-second</p>';const emptyCleared="
+        "emptyView.nextMarker===undefined,about=document.createElement('iframe');"
+        "about.src='about:blank';const aboutView=about.contentWindow;aboutView."
+        "firstMarker='kept';document.body.appendChild(about);about.srcdoc="
+        "'<p>about-first</p>';const aboutPreserved=aboutView.firstMarker==='kept';"
+        "aboutView.nextMarker='stale';about.srcdoc='<p>about-second</p>';const "
+        "aboutCleared=aboutView.nextMarker===undefined;"
         "globalThis.pocSummary=selected==='data:,selected'"
         "&&fallback==='https://example.test/large.png'"
-        "&&first==='first'&&second==='second'&&cleared===''"
-        "&&stable?'RESPONSIVE-EMBEDDING-OK':'RESPONSIVE-EMBEDDING-FAILED';})()";
-    CHECK(script_runtime_evaluate_diagnostic(
-              runtime, responsive_embedding_probe,
-              "<responsive-embedding-probe>", &result)
+        "&&first==='first'&&initialPreserved&&second==='second'&&cleared===''"
+        "&&sameValueFresh&&fallbackSetIgnored&&fallbackRemoveIgnored"
+        "&&explicitBlankFresh&&removalFresh&&emptyPreserved&&emptyCleared"
+        "&&aboutPreserved&&aboutCleared&&stable?"
+        "'RESPONSIVE-EMBEDDING-OK':'RESPONSIVE-EMBEDDING-FAILED:'+"
+        "[first,initialPreserved,sameValueFresh,second,stable,"
+        "fallbackSetIgnored,fallbackRemoveIgnored,cleared,explicitBlankFresh,"
+        "removalFresh,emptyPreserved,emptyCleared,aboutPreserved,aboutCleared]."
+        "join(',');})()";
+    bool responsive_embedding_ok = script_runtime_evaluate_diagnostic(
+        runtime, responsive_embedding_probe,
+        "<responsive-embedding-probe>", &result);
+    if (!responsive_embedding_ok
+        || strcmp(result.summary, "RESPONSIVE-EMBEDDING-OK") != 0) {
+        fprintf(stderr, "responsive embedding: ok=%d summary=%s error=%s\n",
+                responsive_embedding_ok, result.summary, result.error);
+    }
+    CHECK(responsive_embedding_ok
           && strcmp(result.summary, "RESPONSIVE-EMBEDDING-OK") == 0);
 
     static const char media_factory_probe[] =
@@ -2485,6 +2823,17 @@ int main(int argc, char **argv)
         "window.dispatchEvent(new Event(type));"
         "globalThis.pocSummary=window instanceof Window&&"
         "Object.getPrototypeOf(Window.prototype)===EventTarget.prototype&&"
+        "Object.prototype.toString.call(window)==='[object Window]'&&"
+        "screen instanceof Screen&&"
+        "screen instanceof EventTarget&&"
+        "screen.orientation instanceof ScreenOrientation&&"
+        "!('onclick' in EventTarget.prototype)&&"
+        "!('onabort' in screen)&&"
+        "'onclick' in HTMLElement.prototype&&"
+        "'onclick' in window&&"
+        "Object.prototype.toString.call(screen)==='[object Screen]'&&"
+        "Object.prototype.toString.call(screen.orientation)==="
+        "'[object ScreenOrientation]'&&"
         "calls===1?'WINDOW-EVENT-TARGET-OK':"
         "'WINDOW-EVENT-TARGET-FAILED:'+calls;})()";
     CHECK(script_runtime_evaluate_diagnostic(
@@ -3131,13 +3480,27 @@ int main(int argc, char **argv)
         "uploadXhr.addEventListener('loadend',recordUpload('x-loadend'));"
         "uploadXhr.open('POST','https://example.test/upload');"
         "uploadXhr.send('abcde');const uploadNative=nextNative-1;"
-        "__tilefinchDeliverNetwork(uploadNative,true,raw);await Promise.resolve();"
+        "__tilefinchDeliverNetwork(uploadNative,true,raw,true,100,200,300,"
+        "400,500,2,2,true,false,false,true,3,200,'text/plain');"
+        "await Promise.resolve();"
         "const deferredPromise=fetch('https://example.test/native-defer')"
         ".then(value=>value.text());const nativeDeferred="
         "__tilefinchNetworkQueueStats.waiting===1;"
         "__tilefinchPumpTimers(20,16);const deferredNative=nextNative-1;"
-        "__tilefinchDeliverNetwork(deferredNative,true,raw);"
+        "__tilefinchDeliverNetwork(deferredNative,true,raw,true,110,210,310,"
+        "410,510,2,2,true,false,false,true,2,200,'text/plain');"
         "const deferredBody=await deferredPromise;"
+        "const xhrTiming=performance.getEntriesByName("
+        "'https://example.test/upload','resource')[0],fetchTiming="
+        "performance.getEntriesByName("
+        "'https://example.test/native-defer','resource')[0],timingOk="
+        "xhrTiming&&xhrTiming.initiatorType==='xmlhttprequest'&&"
+        "xhrTiming.nextHopProtocol==='h2'&&xhrTiming.responseStatus===200&&"
+        "xhrTiming.contentType==='text/plain'&&xhrTiming.encodedBodySize===2&&"
+        "fetchTiming&&fetchTiming.initiatorType==='fetch'&&"
+        "fetchTiming.nextHopProtocol==='http/1.1'&&"
+        "fetchTiming.responseStatus===200&&fetchTiming.contentType==="
+        "'text/plain'&&fetchTiming.encodedBodySize===2;"
         "const progressShape=new ProgressEvent('shape',{lengthComputable:true,"
         "loaded:3,total:5}),progressShapeOk=Object.getOwnPropertyNames("
         "progressShape).join(',')==='isTrusted'&&Object.getOwnPropertyNames("
@@ -3154,7 +3517,7 @@ int main(int argc, char **argv)
         "&&cancelName==='AbortError'&&countQuota==='RangeError'"
         "&&xhrDeferred&&xhrQuotaError&&!xhrQuotaReentered"
         "&&abortReleased&&byteQuota==='RangeError'&&queuedBeforeTimeout&&timeoutEvent"
-        "&&uploadOk&&progressShapeOk&&nativeDeferred&&deferredBody==='ok'"
+        "&&uploadOk&&progressShapeOk&&timingOk&&nativeDeferred&&deferredBody==='ok'"
         "&&xhr.readyState===4&&xhr.status===0&&stats.peakCount===128"
         "&&stats.rejected===3&&stats.rejectedBytes>=1"
         "&&stats.cancelled===139&&stats.timedOut===1"
@@ -3204,9 +3567,14 @@ int main(int argc, char **argv)
         "globalThis.__tilefinchFetchAsync=()=>777;const pending=fetch("
         "'https://example.test/native-failure').then(()=>'',error=>"
         "error.name+':'+error.message);__tilefinchDeliverNetwork(777,false,"
-        "'Failed to connect to private.example:443');const text=await pending;"
+        "'Failed to connect to private.example:443',true,0,0,0,0,700,0,0,"
+        "true,false,false,false,0,0,'');const text=await pending,entry="
+        "performance.getEntriesByName("
+        "'https://example.test/native-failure','resource')[0];"
         "globalThis.__tilefinchFetchAsync=nativeFetch;globalThis.pocSummary="
-        "text==='TypeError:Failed to fetch'?'FETCH-NETWORK-ERROR-OK':"
+        "text==='TypeError:Failed to fetch'&&entry&&entry.initiatorType==="
+        "'fetch'&&entry.responseStatus===0&&entry.transferSize===0"
+        "?'FETCH-NETWORK-ERROR-OK':"
         "'FETCH-NETWORK-ERROR-FAILED:'+text})().catch(error=>{"
         "globalThis.pocSummary='FETCH-NETWORK-ERROR-FAILED:'+String(error)});";
     bool fetch_network_error_surface_ok = script_runtime_evaluate_diagnostic(
@@ -3219,6 +3587,441 @@ int main(int argc, char **argv)
     }
     CHECK(fetch_network_error_surface_ok
           && strcmp(result.summary, "FETCH-NETWORK-ERROR-OK") == 0);
+
+    static const char abort_algorithm_isolation_probe[] =
+        "(()=>{const controller=new AbortController,signal=controller.signal,"
+        "order=[];"
+        "const combined=AbortSignal.any([signal]),request=new Request('/abort',"
+        "{signal}),target=new EventTarget;let calls=0;target.addEventListener("
+        "'probe',()=>calls++,{signal});signal.addEventListener('abort',()=>{"
+        "order.push('source');if(!combined.aborted||!request.signal.aborted)"
+        "order.push('unsettled');target.dispatchEvent(new Event('probe'))});"
+        "combined.addEventListener('abort',()=>order.push('combined'));"
+        "request.signal.addEventListener('abort',()=>order.push('request'));"
+        "const reason={why:'stop'};"
+        "controller.abort(reason);target.dispatchEvent(new Event('probe'));"
+        "globalThis.pocSummary=combined.aborted&&combined.reason===reason&&"
+        "request.signal.aborted&&request.signal.reason===reason&&calls===0&&"
+        "order.join(',')==='source,combined,request'?"
+        "'ABORT-ALGORITHM-ISOLATION-OK':'ABORT-ALGORITHM-ISOLATION-FAILED:'+"
+        "[combined.aborted,request.signal.aborted,calls,order].join(',')})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, abort_algorithm_isolation_probe,
+              "<abort-algorithm-isolation-probe>", &result)
+          && strcmp(result.summary,
+                    "ABORT-ALGORITHM-ISOLATION-OK") == 0);
+
+    static const char abort_dependency_order_probe[] =
+        "(()=>{const sourceController=new AbortController,source="
+        "sourceController.signal,first=AbortSignal.any([source]),second="
+        "AbortSignal.any([source]),nested=AbortSignal.any([first]),order=[];"
+        "source.addEventListener('abort',()=>order.push('source'));first."
+        "addEventListener('abort',()=>order.push('first'));second.addEventListener("
+        "'abort',()=>order.push('second'));nested.addEventListener('abort',()=>"
+        "order.push('nested'));sourceController.abort('graph');const graph="
+        "order.join(',')==='source,first,second,nested',sourceController2=new "
+        "AbortController,source2=sourceController2.signal,order2=[],first2="
+        "AbortSignal.any([source2]),nested2=AbortSignal.any([first2]),second2="
+        "AbortSignal.any([source2]);source2.addEventListener('abort',()=>order2.push("
+        "'source'));first2.addEventListener('abort',()=>order2.push('first'));"
+        "nested2.addEventListener('abort',()=>order2.push('nested'));second2."
+        "addEventListener('abort',()=>order2.push('second'));sourceController2.abort();"
+        "const flattened=order2.join(',')==='source,first,nested,second',quotaSource="
+        "new AbortController,duplicates=[];let deduplicated=true;try{duplicates.push("
+        "AbortSignal.any(Array(64).fill(quotaSource.signal)));duplicates.push("
+        "AbortSignal.any(Array(64).fill(quotaSource.signal)));duplicates.push("
+        "AbortSignal.any([quotaSource.signal]))}catch(error){deduplicated=false}const "
+        "iterableController=new AbortController,iterable=AbortSignal.any((function*()"
+        "{yield iterableController.signal;iterableController.abort('during-iteration')"
+        "})()),iterableAbort=iterable.aborted&&iterable.reason==='during-iteration',"
+        "reasonFirst=new AbortController,reasonSecond=new AbortController,competing="
+        "AbortSignal.any((function*(){yield reasonFirst.signal;yield reasonSecond.signal;"
+        "reasonSecond.abort('second');reasonFirst.abort('first')})()),firstReason="
+        "competing.aborted&&competing.reason==='first';let trailingInvalid=false;const "
+        "preAborted=new AbortController;preAborted.abort();try{AbortSignal.any(["
+        "preAborted.signal,{}])}catch(error){trailingInvalid=error instanceof TypeError}"
+        "const emptyRoot=new AbortController,empties=[];for(let i=0;i<64;i++)empties."
+        "push(AbortSignal.any([]));const emptyCombined=AbortSignal.any(empties),"
+        "emptyAndRoot=AbortSignal.any([emptyCombined,emptyRoot.signal]);emptyRoot.abort("
+        "'real-root');const emptyRoots=emptyAndRoot.aborted&&emptyAndRoot.reason==="
+        "'real-root',a=new AbortController,"
+        "b=new AbortController,reentrant=[];a.signal.addEventListener('abort',()=>{"
+        "reentrant.push('a-before');b.abort();reentrant.push('a-after')});b.signal."
+        "addEventListener('abort',()=>reentrant.push('b'));a.abort();const sync="
+        "reentrant.join(',')==='a-before,b,a-after';const cleanupSource=new "
+        "AbortController,dependent=AbortSignal.any([cleanupSource.signal]),target="
+        "new EventTarget;let dependentCalls=0;target.addEventListener('probe',()=>"
+        "dependentCalls++,{signal:dependent});cleanupSource.signal.addEventListener("
+        "'abort',()=>target.dispatchEvent(new Event('probe')));cleanupSource.abort();"
+        "target.dispatchEvent(new Event('probe'));globalThis.pocSummary=graph&&flattened"
+        "&&deduplicated&&iterableAbort&&firstReason&&trailingInvalid&&emptyRoots&&sync"
+        "&&dependentCalls===1?'ABORT-DEPENDENCY-ORDER-OK':"
+        "'ABORT-DEPENDENCY-ORDER-FAILED:'+order+'|'+order2+'|'+deduplicated+'|'"
+        "+[iterableAbort,firstReason,trailingInvalid,emptyRoots]+'|'"
+        "+reentrant+'|'+dependentCalls})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, abort_dependency_order_probe,
+              "<abort-dependency-order-probe>", &result)
+          && strcmp(result.summary, "ABORT-DEPENDENCY-ORDER-OK") == 0);
+
+    static const char event_handler_order_probe[] =
+        "(()=>{const node=document.createElement('button'),order=[],first=()=>"
+        "order.push('first'),last=()=>order.push('last');node.addEventListener("
+        "'click',first);node.onclick=()=>order.push('handler');node.addEventListener("
+        "'click',last);node.dispatchEvent(new Event('click',{cancelable:true}));"
+        "const initial=order.join(',')==='first,handler,last';order.length=0;"
+        "node.onclick=()=>order.push('replacement');node.dispatchEvent(new Event("
+        "'click'));const replacement=order.join(',')==='first,replacement,last';"
+        "order.length=0;node.onclick=null;node.onclick=()=>order.push('readded');"
+        "node.dispatchEvent(new Event('click'));const readded=order.join(',')==="
+        "'first,last,readded';const stopped=document.createElement('button');"
+        "let afterStop=0;stopped.onclick=event=>event.stopImmediatePropagation();"
+        "stopped.addEventListener('click',()=>afterStop++);stopped.dispatchEvent("
+        "new Event('click'));const documentEvent=new Event('click',"
+        "{cancelable:true}),windowEvent=new Event('click',"
+        "{cancelable:true});document.onclick=()=>false;"
+        "window.onclick=()=>false;const documentCancelled="
+        "!document.dispatchEvent(documentEvent)&&documentEvent.defaultPrevented,"
+        "windowCancelled=!window.dispatchEvent(windowEvent)&&"
+        "windowEvent.defaultPrevented;document.onclick=null;"
+        "window.onclick=null;const markup=document.createElement('button'),"
+        "markupOrder=[];globalThis.__markupOrder=markupOrder;markup.setAttribute("
+        "'onclick',\"__markupOrder.push('markup')\");markup.addEventListener("
+        "'click',()=>markupOrder.push('listener'));markup.dispatchEvent(new Event("
+        "'click'));const markupFirst=markupOrder.join(',')==='markup,listener';"
+        "markupOrder.length=0;markup.setAttribute('onclick',"
+        "\"__markupOrder.push('changed')\");markup.dispatchEvent(new Event('click'));"
+        "const markupChanged=markupOrder.join(',')==='changed,listener';"
+        "const parsedHost=document.createElement('div');parsedHost.innerHTML="
+        "'<button onclick=\"__markupOrder.push(\\'parsed\\')\"></button>';const "
+        "parsed=parsedHost.firstChild;markupOrder.length=0;parsed.addEventListener("
+        "'click',()=>markupOrder.push('listener'));parsed.dispatchEvent(new Event("
+        "'click'));const parsedFirst=markupOrder.join(',')==='parsed,listener';"
+        "const switched=document.createElement('button'),switchedOrder=[];"
+        "globalThis.__switchedOrder=switchedOrder;switched.onclick=()=>"
+        "switchedOrder.push('property');switched.addEventListener('click',()=>"
+        "switchedOrder.push('listener'));switched.setAttribute('onclick',"
+        "\"__switchedOrder.push('attribute')\");switched.dispatchEvent(new Event("
+        "'click'));const propertyToMarkup=switchedOrder.join(',')==="
+        "'attribute,listener';delete globalThis.__markupOrder;delete globalThis."
+        "__switchedOrder;globalThis.pocSummary=initial&&replacement"
+        "&&readded&&afterStop===0&&documentCancelled&&windowCancelled&&markupFirst"
+        "&&markupChanged&&parsedFirst&&propertyToMarkup?"
+        "'EVENT-HANDLER-ORDER-OK':'EVENT-HANDLER-ORDER-FAILED:'+"
+        "[initial,replacement,readded,afterStop,documentCancelled,windowCancelled,"
+        "markupFirst,markupChanged,parsedFirst,propertyToMarkup]"
+        ".join(',')})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, event_handler_order_probe,
+              "<event-handler-order-probe>", &result)
+          && strcmp(result.summary, "EVENT-HANDLER-ORDER-OK") == 0);
+
+    char raw_text_response_bytes[] = {(char) 0xe9, '\0', 'A'};
+    FetchResult raw_text_response = {0};
+    raw_text_response.data = raw_text_response_bytes;
+    raw_text_response.length = sizeof(raw_text_response_bytes);
+    snprintf(raw_text_response.content_type,
+             sizeof(raw_text_response.content_type), "%s",
+             "text/plain;charset=iso-8859-1");
+    JSValue raw_text_payload = JS_NewObject(runtime->context);
+    CHECK(!JS_IsException(raw_text_payload));
+    js_rt_script_set_response_body(
+        runtime->context, raw_text_payload, &raw_text_response);
+    JSValue raw_text_global = JS_GetGlobalObject(runtime->context);
+    CHECK(JS_SetPropertyStr(runtime->context, raw_text_global,
+                            "__tilefinchTestRawTextPayload",
+                            raw_text_payload) >= 0);
+    JS_FreeValue(runtime->context, raw_text_global);
+
+    static const char request_body_content_type_probe[] =
+        "(async()=>{const nativeFetch=globalThis.__tilefinchFetchAsync,seen=[];"
+        "let nextId=1777;globalThis.__tilefinchFetchAsync=(method,url,body,type,headers,"
+        "...rest)=>{seen.push([String(type),String(headers),String(rest[8])]);"
+        "return nextId++;};"
+        "const stringRequest=new Request('https://example.test/string',{"
+        "method:'POST',body:'probe'}),paramsRequest=new Request("
+        "'https://example.test/params',{method:'POST',body:new URLSearchParams("
+        "[['a','b']])}),blobRequest=new Request('https://example.test/blob',{"
+        "method:'POST',body:new Blob(['x'],{type:'application/x-probe'})}),"
+        "originalBytes=new Uint8Array([1]),"
+        "bytesRequest=new Request('https://example.test/bytes',{method:'POST',"
+        "body:originalBytes}),explicitRequest=new Request("
+        "'https://example.test/explicit',{method:'POST',body:'probe',headers:{"
+        "'content-type':'application/custom'}}),form=new FormData(),"
+        "oldBoundary='----tilefinch-form-boundary';form.append('field',new Blob("
+        "['abc'],{type:'text/plain'}),'report.txt');form.append('line\\r\\nname',"
+        "'hello\\r\\n--'+oldBoundary+'\\r\\nContent-Disposition: form-data; name=\\\"role\\\"\\r\\n\\r\\nadmin');"
+        "const formRequest=new Request('https://example.test/form',{method:'POST',"
+        "body:form}),formType=formRequest.headers.get('content-type'),"
+        "formBoundary=formType.split('boundary=')[1],formText=await formRequest.text(),"
+        "file=form.get('field');originalBytes[0]=9;"
+        "bytesRequest._bodyBytesSnapshot=new Uint8Array([8]);"
+        "const pending=fetch(stringRequest)"
+        ".then(response=>response.text());"
+        "__tilefinchDeliverNetwork(1777,true,{status:200,url:"
+        "'https://example.test/string',contentType:'text/plain',headers:"
+        "'content-type: text/plain\\n',body:'ok'});await pending;"
+        "const headerPending=fetch('https://example.test/headers',{headers:{"
+        "Accept:'application/json','If-None-Match':'\\\"tag\\\"',"
+        "'If-Modified-Since':'Sun, 06 Nov 1994 08:49:37 GMT','X-Custom':'kept'}});"
+        "__tilefinchDeliverNetwork(1778,true,{status:204,url:"
+        "'https://example.test/headers',headers:'content-type: application/json\\n',"
+        "body:''});const headerResponse=await headerPending;"
+        "const rawPending=fetch('https://example.test/raw');"
+        "__tilefinchDeliverNetwork(1779,true,Object.assign("
+        "__tilefinchTestRawTextPayload,{status:200,url:'https://example.test/raw',"
+        "headers:'content-type: text/plain;charset=iso-8859-1\\n'}));"
+        "const rawBytes=new Uint8Array(await (await rawPending).arrayBuffer());"
+        "const snapshotted=await bytesRequest.bytes();"
+        "globalThis.__tilefinchFetchAsync=nativeFetch;const ok="
+        "stringRequest.headers.get('content-type')==="
+        "'text/plain;charset=UTF-8'&&paramsRequest.headers.get('content-type')"
+        "==='application/x-www-form-urlencoded;charset=UTF-8'&&"
+        "blobRequest.headers.get('content-type')==='application/x-probe'&&"
+        "bytesRequest.headers.get('content-type')===null&&"
+        "explicitRequest.headers.get('content-type')==='application/custom'&&"
+        "snapshotted.length===1&&snapshotted[0]===1&&"
+        "file instanceof File&&file.name==='report.txt'&&file.type==='text/plain'&&"
+        "formBoundary&&formBoundary!==oldBoundary&&formText.includes(oldBoundary)&&"
+        "formText.includes('name=\\\"line%0D%0Aname\\\"')&&"
+        "headerResponse.status===204&&headerResponse.body===null&&"
+        "rawBytes.join(',')==='233,0,65'&&seen.length===3&&"
+        "seen[0][0]==='text/plain;charset=UTF-8'&&seen[0][1]===''&&"
+        "seen[0][2]==='*/*'&&seen[1][2]==='application/json'&&"
+        "seen[1][1].includes('if-none-match: \\\"tag\\\"')&&"
+        "seen[1][1].includes('if-modified-since: Sun, 06 Nov 1994 08:49:37 GMT')&&"
+        "seen[1][1].includes('x-custom: kept');"
+        "globalThis.pocSummary=ok?'REQUEST-BODY-CONTENT-TYPE-OK':"
+        "'REQUEST-BODY-CONTENT-TYPE-FAILED:'+JSON.stringify({seen,string:"
+        "stringRequest.headers.get('content-type'),params:paramsRequest.headers"
+        ".get('content-type'),blob:blobRequest.headers.get('content-type'),bytes:"
+        "bytesRequest.headers.get('content-type'),explicit:explicitRequest.headers"
+        ".get('content-type')});})().catch(error=>{globalThis.pocSummary="
+        "'REQUEST-BODY-CONTENT-TYPE-ERROR:'+String(error&&error.stack||error)});";
+    bool request_body_content_type_ok = script_runtime_evaluate_diagnostic(
+        runtime, request_body_content_type_probe,
+        "<request-body-content-type-probe>", &result);
+    for (size_t tick = 0; request_body_content_type_ok && tick < 8
+         && strcmp(result.summary, "REQUEST-BODY-CONTENT-TYPE-OK") != 0;
+         tick++) {
+        request_body_content_type_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    if (!request_body_content_type_ok
+        || strcmp(result.summary, "REQUEST-BODY-CONTENT-TYPE-OK") != 0) {
+        fprintf(stderr, "request body content type probe: ok=%d summary=%s "
+                "error=%s\n", request_body_content_type_ok,
+                result.summary, result.error);
+    }
+    CHECK(request_body_content_type_ok
+          && strcmp(result.summary, "REQUEST-BODY-CONTENT-TYPE-OK") == 0);
+
+    static const char response_body_content_type_probe[] =
+        "(async()=>{const params=new Response(new URLSearchParams([['a','b']])),"
+        "string=new Response('plain'),blob=new Response(new Blob(['blob'],{type:"
+        "'application/x-probe'})),explicit=new Response('override',{headers:{"
+        "'content-type':'application/custom'}}),form=new FormData();form.append("
+        "'field','value');const multipart=new Response(form),multipartType="
+        "multipart.headers.get('content-type'),texts=await Promise.all([params.text(),"
+        "string.text(),blob.text(),explicit.text(),multipart.text()]);"
+        "globalThis.pocSummary=params.headers.get('content-type')==="
+        "'application/x-www-form-urlencoded;charset=UTF-8'&&string.headers.get("
+        "'content-type')==='text/plain;charset=UTF-8'&&blob.headers.get("
+        "'content-type')==='application/x-probe'&&explicit.headers.get("
+        "'content-type')==='application/custom'&&multipartType.startsWith("
+        "'multipart/form-data; boundary=----tilefinch-')&&texts[0]==='a=b'&&"
+        "texts[1]==='plain'&&texts[2]==='blob'&&texts[3]==='override'&&texts[4]."
+        "includes('name=\"field\"')?'RESPONSE-BODY-CONTENT-TYPE-OK':"
+        "'RESPONSE-BODY-CONTENT-TYPE-FAILED'})().catch(error=>{globalThis."
+        "pocSummary='RESPONSE-BODY-CONTENT-TYPE-ERROR:'+String(error&&error.stack"
+        "||error)});";
+    bool response_body_content_type_ok = script_runtime_evaluate_diagnostic(
+        runtime, response_body_content_type_probe,
+        "<response-body-content-type-probe>", &result);
+    for (size_t tick = 0; response_body_content_type_ok && tick < 16
+         && strcmp(result.summary, "RESPONSE-BODY-CONTENT-TYPE-OK") != 0;
+         tick++) {
+        response_body_content_type_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    CHECK(response_body_content_type_ok
+          && strcmp(result.summary, "RESPONSE-BODY-CONTENT-TYPE-OK") == 0);
+
+    static const char request_validation_ownership_probe[] =
+        "(async()=>{const failures=[],check=(init)=>{const source=new Request("
+        "'https://example.test/source',{method:'POST',body:'retained'});let threw="
+        "false;try{new Request(source,init)}catch(error){threw=error instanceof "
+        "TypeError}failures.push(threw&&!source.bodyUsed&&!source.body.locked);return "
+        "source};check({method:'GET'});check({mode:'invalid'});check({credentials:"
+        "'invalid'});check({signal:{}});const inherited=new Request("
+        "'https://example.test/inherit',{method:'POST',body:'retained'}),moved=new "
+        "Request(inherited,{body:null}),text=await moved.text();globalThis.pocSummary="
+        "failures.every(Boolean)&&inherited.bodyUsed&&text==='retained'?"
+        "'REQUEST-VALIDATION-OWNERSHIP-OK':'REQUEST-VALIDATION-OWNERSHIP-FAILED:'+"
+        "failures.join(',')+','+inherited.bodyUsed+','+text})().catch(error=>{"
+        "globalThis.pocSummary='REQUEST-VALIDATION-OWNERSHIP-ERROR:'+String(error&&"
+        "error.stack||error)});";
+    bool request_validation_ownership_ok = script_runtime_evaluate_diagnostic(
+        runtime, request_validation_ownership_probe,
+        "<request-validation-ownership-probe>", &result);
+    for (size_t tick = 0; request_validation_ownership_ok && tick < 16
+         && strcmp(result.summary, "REQUEST-VALIDATION-OWNERSHIP-OK") != 0;
+         tick++) {
+        request_validation_ownership_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    CHECK(request_validation_ownership_ok
+          && strcmp(result.summary, "REQUEST-VALIDATION-OWNERSHIP-OK") == 0);
+
+    static const char request_signal_rollback_probe[] =
+        "(()=>{const controller=new AbortController,bad={toString(){throw new "
+        "Error('body')}};let failures=0;for(let at=0;at<128;at++)try{new Request("
+        "'https://example.test/fail',{method:'POST',body:bad,signal:controller."
+        "signal})}catch(error){if(error.message==='body')failures++}let valid=false;"
+        "try{valid=new Request('https://example.test/valid',{signal:controller."
+        "signal}).signal.aborted===false}catch(error){}globalThis.pocSummary="
+        "failures===128&&valid?'REQUEST-SIGNAL-ROLLBACK-OK':"
+        "'REQUEST-SIGNAL-ROLLBACK-FAILED:'+failures+','+valid})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, request_signal_rollback_probe,
+              "<request-signal-rollback-probe>", &result)
+          && strcmp(result.summary, "REQUEST-SIGNAL-ROLLBACK-OK") == 0);
+
+    static const char body_consumption_probe[] =
+        "(async()=>{const request=new Request('https://example.test/body',{"
+        "method:'POST',body:'request-data'}),requestText=await request.text(),"
+        "requestLocked=request.body.locked,response=new Response("
+        "'response-data'),responseText=await response.text(),responseLocked="
+        "response.body.locked,source=new Request('https://example.test/"
+        "transfer',{method:'POST',body:'transfer'}),moved=new Request(source),"
+        "movedText=await moved.text(),cloneSource=new Request('https://example.test/"
+        "clone',{method:'POST',body:'clone'}),clone=cloneSource.clone(),cloneLeft="
+        "await cloneSource.text(),cloneRight=await clone.text(),streamRequest=new "
+        "Request('https://example.test/stream',{method:'POST',duplex:'half',body:new "
+        "ReadableStream({start(c){c.enqueue(new Uint8Array([111,107]));c.close()}})}),"
+        "streamText=await streamRequest.text(),bom=await new Response('\\uFEFFx').text(),"
+        "surrogate=await new Response('\\ud800').text();let nonByte='';try{await new "
+        "Response(new ReadableStream({start(c){c.enqueue('bad');c.close()}})).text()}"
+        "catch(error){nonByte=error.name}globalThis.pocSummary=requestText==="
+        "'request-data'&&request.bodyUsed&&requestLocked&&responseText==="
+        "'response-data'&&response.bodyUsed&&responseLocked&&source.bodyUsed&&"
+        "movedText==='transfer'&&cloneLeft==='clone'&&cloneRight==='clone'&&"
+        "streamText==='ok'&&bom==='x'&&surrogate.charCodeAt(0)===65533&&"
+        "nonByte==='TypeError'?'BODY-CONSUMPTION-OK':'BODY-CONSUMPTION-FAILED'})()"
+        ".catch(error=>{globalThis.pocSummary='BODY-CONSUMPTION-ERROR:'+String("
+        "error&&error.stack||error)});";
+    bool body_consumption_ok = script_runtime_evaluate_diagnostic(
+        runtime, body_consumption_probe, "<body-consumption-probe>", &result);
+    for (size_t tick = 0; body_consumption_ok && tick < 16
+         && strcmp(result.summary, "BODY-CONSUMPTION-OK") != 0; tick++) {
+        body_consumption_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    if (!body_consumption_ok
+        || strcmp(result.summary, "BODY-CONSUMPTION-OK") != 0) {
+        fprintf(stderr, "body consumption probe: ok=%d summary=%s error=%s\n",
+                body_consumption_ok, result.summary, result.error);
+    }
+    CHECK(body_consumption_ok
+          && strcmp(result.summary, "BODY-CONSUMPTION-OK") == 0);
+
+    static const char response_clone_probe[] =
+        "(async()=>{const run=async size=>{const bytes=new Uint8Array(size);for(let "
+        "i=0;i<size;i++)bytes[i]=i&255;const response=new Response(bytes),clone="
+        "response.clone(),left=new Uint8Array(await response.arrayBuffer()),right="
+        "new Uint8Array(await clone.arrayBuffer());return left.length===size&&"
+        "right.length===size&&left.every((value,index)=>value===(index&255))&&"
+        "right.every((value,index)=>value===(index&255))};globalThis.pocSummary="
+        "await run(1)&&await run(4097)?'RESPONSE-CLONE-OK':"
+        "'RESPONSE-CLONE-FAILED'})().catch(error=>{globalThis.pocSummary="
+        "'RESPONSE-CLONE-ERROR:'+String(error&&error.stack||error)});";
+    bool response_clone_ok = script_runtime_evaluate_diagnostic(
+        runtime, response_clone_probe, "<response-clone-probe>", &result);
+    for (size_t tick = 0; response_clone_ok && tick < 32
+         && strcmp(result.summary, "RESPONSE-CLONE-OK") != 0; tick++) {
+        response_clone_ok = script_runtime_advance(runtime, 0, 2048, &result);
+    }
+    CHECK(response_clone_ok
+          && strcmp(result.summary, "RESPONSE-CLONE-OK") == 0);
+
+    static const char streaming_upload_abort_probe[] =
+        "(async()=>{const nativeFetch=globalThis.__tilefinchFetchAsync,controller="
+        "new AbortController,reason={stop:true};let nativeCalls=0,cancelled=false;"
+        "globalThis.__tilefinchFetchAsync=()=>{nativeCalls++;return 991};const body="
+        "new ReadableStream({pull(){},cancel(value){cancelled=value===reason}}),"
+        "request=new Request('https://example.test/upload',{method:'POST',body,"
+        "duplex:'half',signal:controller.signal}),pending=fetch(request).then(()=>"
+        "null,error=>error);await Promise.resolve();controller.abort(reason);const "
+        "outcome=await pending;globalThis.__tilefinchFetchAsync=nativeFetch;"
+        "globalThis.pocSummary=outcome===reason&&cancelled&&!body.locked&&nativeCalls"
+        "===0?'STREAM-UPLOAD-ABORT-OK':'STREAM-UPLOAD-ABORT-FAILED:'+"
+        "[outcome===reason,cancelled,body.locked,nativeCalls].join(',')})().catch("
+        "error=>{globalThis.pocSummary='STREAM-UPLOAD-ABORT-ERROR:'+String(error&&"
+        "error.stack||error)});";
+    bool streaming_upload_abort_ok = script_runtime_evaluate_diagnostic(
+        runtime, streaming_upload_abort_probe,
+        "<stream-upload-abort-probe>", &result);
+    for (size_t tick = 0; streaming_upload_abort_ok && tick < 16
+         && strcmp(result.summary, "STREAM-UPLOAD-ABORT-OK") != 0; tick++) {
+        streaming_upload_abort_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    if (!streaming_upload_abort_ok
+        || strcmp(result.summary, "STREAM-UPLOAD-ABORT-OK") != 0) {
+        fprintf(stderr, "stream upload abort probe: ok=%d summary=%s error=%s\n",
+                streaming_upload_abort_ok, result.summary, result.error);
+    }
+    CHECK(streaming_upload_abort_ok
+          && strcmp(result.summary, "STREAM-UPLOAD-ABORT-OK") == 0);
+
+    static const char utf8_decoder_probe[] =
+        "(()=>{const codes=value=>Array.from(value,char=>char.charCodeAt(0)),"
+        "first=codes(new TextDecoder().decode(new Uint8Array([0xe2,0x41]))),"
+        "partial=codes(new TextDecoder().decode(new Uint8Array([0xe2,0x82,0x41]))),"
+        "scalar=codes(new TextDecoder().decode(new Uint8Array([0xed,0xa0,0x80]))),"
+        "stream=new TextDecoder(),streamFirst=codes(stream.decode(new Uint8Array("
+        "[0xe2,0x41]),{stream:true})),streamEnd=codes(stream.decode()),url=codes("
+        "new URLSearchParams('a=%E2%82A').get('a')),params=new URLSearchParams("
+        "'a=one'),entry=params.entries().next().value;entry[1]='changed';"
+        "globalThis.pocSummary=first.join(',')==='65533,65'&&partial.join(',')==="
+        "'65533,65'&&scalar.join(',')==='65533,65533,65533'&&streamFirst.join(',')"
+        "==='65533,65'&&streamEnd.length===0&&url.join(',')==='65533,65'&&"
+        "params.get('a')==='one'?'UTF8-DECODER-OK':'UTF8-DECODER-FAILED'})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, utf8_decoder_probe, "<utf8-decoder-probe>", &result)
+          && strcmp(result.summary, "UTF8-DECODER-OK") == 0);
+
+    static const char css_and_message_probe[] =
+        "(()=>{const element=document.createElement('div');document.body.append("
+        "element);element.style.display='none';element.style.display="
+        "'definitely-invalid';const preserved=element.style.display;element.style."
+        "setProperty('display','block','invalid-priority');const invalidPriority="
+        "element.style.display;element.style.setProperty('display','none',"
+        "'important');const priority=element.style.getPropertyPriority('display'),"
+        "value=element.style.getPropertyValue('display');element.style.setProperty("
+        "'flex','1 1 auto','important');const flexPriority=element.style."
+        "getPropertyPriority('flex');element.style.setProperty('flex-grow','2','');"
+        "const mixedFlexPriority=element.style.getPropertyPriority('flex');let "
+        "multiple='',relative='',"
+        "empty='',clone='';try{new CSSStyleSheet().insertRule('a{color:red} b{color:"
+        "blue}')}catch(error){multiple=error.name}try{postMessage('x','/path')}catch("
+        "error){relative=error.name}try{postMessage('x','')}catch(error){empty=error."
+        "name}try{postMessage(()=>{},'https://other.test')}catch(error){clone=error."
+        "name}element.remove();globalThis.pocSummary=preserved==='none'&&"
+        "invalidPriority==='none'&&priority==='important'&&value==='none'&&"
+        "flexPriority==='important'&&mixedFlexPriority===''&&"
+        "multiple==='SyntaxError'&&relative==='SyntaxError'&&empty==='SyntaxError'&&"
+        "clone==='DataCloneError'?'CSS-MESSAGE-OK':'CSS-MESSAGE-FAILED:'+"
+        "[preserved,invalidPriority,priority,value,flexPriority,mixedFlexPriority,"
+        "multiple,relative,empty,clone].join("
+        "',')})()";
+    bool css_and_message_ok = script_runtime_evaluate_diagnostic(
+        runtime, css_and_message_probe, "<css-message-probe>", &result);
+    if (!css_and_message_ok || strcmp(result.summary, "CSS-MESSAGE-OK") != 0)
+        fprintf(stderr, "css/message probe: ok=%d summary=%s error=%s\n",
+                css_and_message_ok, result.summary, result.error);
+    CHECK(css_and_message_ok
+          && strcmp(result.summary, "CSS-MESSAGE-OK") == 0);
 
     static const char local_blob_network_probe[] =
         "(()=>{globalThis.pocSummary='LOCAL-BLOB-PENDING';const stats="
@@ -3280,6 +4083,108 @@ int main(int argc, char **argv)
           && result.async_network_active_native == 0
           && result.async_network_pending_logical == 0);
 
+    static const char xhr_reopen_probe[] =
+        "(()=>{globalThis.pocSummary='XHR-REOPEN-PENDING';const oldURL="
+        "URL.createObjectURL(new Blob(['old-response'])),newURL="
+        "URL.createObjectURL(new Blob(['new-response'])),run=targetState=>"
+        "new Promise(resolve=>{const xhr=new XMLHttpRequest;let reopened=false;"
+        "xhr.onreadystatechange=()=>{if(!reopened&&xhr.readyState==="
+        "targetState){reopened=true;xhr.open('GET',newURL);xhr.send()}};"
+        "xhr.onloadend=()=>{if(reopened)resolve(xhr.readyState===4&&"
+        "xhr.status===200&&xhr.responseText==='new-response')};"
+        "xhr.open('GET',oldURL);xhr.send()});Promise.all([run(2),run(4)])"
+        ".then(values=>{URL.revokeObjectURL(oldURL);URL.revokeObjectURL(newURL);"
+        "globalThis.pocSummary=values.every(Boolean)?'XHR-REOPEN-OK':"
+        "'XHR-REOPEN-FAILED:'+values.join(',')}).catch(error=>{"
+        "globalThis.pocSummary='XHR-REOPEN-ERROR:'+String(error&&error.stack||"
+        "error)})})()";
+    bool xhr_reopen_ok = script_runtime_evaluate_diagnostic(
+        runtime, xhr_reopen_probe, "<xhr-reopen-probe>", &result);
+    for (size_t tick = 0; xhr_reopen_ok && tick < 16
+         && strcmp(result.summary, "XHR-REOPEN-PENDING") == 0; tick++) {
+        xhr_reopen_ok = script_runtime_advance(runtime, 0, 128, &result);
+    }
+    if (!xhr_reopen_ok || strcmp(result.summary, "XHR-REOPEN-OK") != 0) {
+        fprintf(stderr, "xhr reopen probe: ok=%d summary=%s error=%s\n",
+                xhr_reopen_ok, result.summary, result.error);
+    }
+    CHECK(xhr_reopen_ok && strcmp(result.summary, "XHR-REOPEN-OK") == 0);
+
+    static const char xhr_reopen_timeout_probe[] =
+        "(()=>{const nativeFetch=globalThis.__tilefinchFetchAsync,nativeCancel="
+        "globalThis.__tilefinchCancelNetwork;let nextNative=9100;const cancels=[];"
+        "globalThis.__tilefinchFetchAsync=()=>nextNative++;"
+        "globalThis.__tilefinchCancelNetwork=id=>{cancels.push(Number(id));"
+        "return true};const xhr=new XMLHttpRequest;xhr.open('GET',"
+        "'https://example.test/old-timeout');xhr.timeout=5;xhr.send();"
+        "xhr.open('GET','https://example.test/replacement');xhr.timeout=0;"
+        "xhr.send();__tilefinchPumpTimers(10,16);const raw={status:200,url:"
+        "'https://example.test/replacement',contentType:'text/plain',headers:"
+        "'content-type: text/plain\\n',body:'replacement'};"
+        "__tilefinchDeliverNetwork(9101,true,raw);__tilefinchPumpTimers(10,16);"
+        "globalThis.__tilefinchFetchAsync=nativeFetch;"
+        "globalThis.__tilefinchCancelNetwork=nativeCancel;globalThis.pocSummary="
+        "xhr.readyState===4&&xhr.status===200&&xhr.responseText==='replacement'"
+        "&&cancels.join(',')==='9100'?'XHR-REOPEN-TIMEOUT-OK':"
+        "'XHR-REOPEN-TIMEOUT-FAILED:'+xhr.readyState+':'+xhr.status+':' +"
+        "cancels.join(',')})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, xhr_reopen_timeout_probe,
+              "<xhr-reopen-timeout-probe>", &result)
+          && strcmp(result.summary, "XHR-REOPEN-TIMEOUT-OK") == 0);
+
+    static const char worker_network_location_probe[] =
+        "(()=>{globalThis.pocSummary='WORKER-LOCATION-PENDING';const nativeFetch="
+        "globalThis.__tilefinchFetchAsync,workerURL='https://example.test/path/"
+        "script.js?mode=1#part';globalThis.__tilefinchFetchAsync=()=>9700;const "
+        "worker=new Worker(workerURL);worker.onmessage=event=>{globalThis."
+        "pocSummary=event.data;worker.terminate();globalThis.__tilefinchFetchAsync="
+        "nativeFetch};__tilefinchPumpTimers(0,8);__tilefinchDeliverNetwork(9700,"
+        "true,{status:200,url:workerURL,contentType:'text/javascript',headers:"
+        "'content-type: text/javascript\\n',body:\"postMessage([location.href,"
+        "location.origin,location.protocol,location.host,location.hostname,"
+        "location.port,location.pathname,location.search,location.hash,String("
+        "location)].join('|'))\"})})()";
+    bool worker_network_location_ok = script_runtime_evaluate_diagnostic(
+        runtime, worker_network_location_probe,
+        "<worker-network-location-probe>", &result);
+    for (size_t tick = 0; worker_network_location_ok && tick < 16
+         && strcmp(result.summary, "WORKER-LOCATION-PENDING") == 0; tick++) {
+        worker_network_location_ok = script_runtime_advance(
+            runtime, 0, 128, &result);
+    }
+    static const char expected_worker_network_location[] =
+        "https://example.test/path/script.js?mode=1#part|"
+        "https://example.test|https:|example.test|example.test||"
+        "/path/script.js|?mode=1|#part|"
+        "https://example.test/path/script.js?mode=1#part";
+    if (!worker_network_location_ok
+        || strcmp(result.summary, expected_worker_network_location) != 0) {
+        fprintf(stderr, "worker network location probe: ok=%d summary=%s "
+                "error=%s\n", worker_network_location_ok,
+                result.summary, result.error);
+    }
+    CHECK(worker_network_location_ok
+          && strcmp(result.summary, expected_worker_network_location) == 0);
+
+    static const char xhr_event_target_probe[] =
+        "(()=>{const xhr=new XMLHttpRequest,calls=[],controller="
+        "new AbortController,first=()=>calls.push('first');"
+        "xhr.addEventListener('load',first);xhr.onload=()=>calls.push('old');"
+        "xhr.addEventListener('load',{handleEvent(){calls.push('object')}},"
+        "{once:true});xhr.onload=()=>calls.push('handler');"
+        "xhr.addEventListener('load',()=>calls.push('aborted'),{signal:"
+        "controller.signal});xhr.addEventListener('load',()=>calls.push("
+        "'capture'),{capture:true});controller.abort();"
+        "xhr.dispatchEvent(new Event('load'));xhr.dispatchEvent(new Event("
+        "'load'));globalThis.pocSummary=calls.join(',')==="
+        "'capture,first,handler,object,capture,first,handler'"
+        "?'XHR-EVENT-TARGET-OK':'XHR-EVENT-TARGET-FAILED:'+calls.join(',')})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, xhr_event_target_probe,
+              "<xhr-event-target-probe>", &result)
+          && strcmp(result.summary, "XHR-EVENT-TARGET-OK") == 0);
+
     static const char large_base64_probe[] =
         "(()=>{const encoded='A'.repeat(823120),decoded=atob(encoded);"
         "globalThis.pocSummary=decoded.length===617340"
@@ -3302,22 +4207,52 @@ int main(int argc, char **argv)
         "req.addEventListener('error',()=>reject(req.error));}),"
         "finished=tx=>new Promise((resolve,reject)=>{"
         "tx.addEventListener('complete',resolve);"
-        "tx.addEventListener('abort',()=>reject(tx.error));});"
-        "const opening=indexedDB.open('tilefinch-probe',2);let upgraded=false;"
+        "tx.addEventListener('abort',()=>reject(tx.error));}),"
+        "binarySource=new Uint8Array([7,8]),arraySource=[1],binaryRange="
+        "IDBKeyRange.only(binarySource),arrayRange=IDBKeyRange.only(arraySource);"
+        "binarySource[0]=9;arraySource[0]=9;let invalidCmp='',invalidRange='',"
+        "emptyOpenRange='';try{indexedDB.cmp(NaN,0)}catch(error){invalidCmp="
+        "error.name}try{IDBKeyRange.only(undefined)}catch(error){invalidRange="
+        "error.name}try{IDBKeyRange.bound(1,1,true,false)}catch(error){"
+        "emptyOpenRange=error.name}const keyContract=indexedDB.cmp(-Infinity,"
+        "Infinity)<0&&indexedDB.cmp(0,new Date(0))<0&&indexedDB.cmp(new Date(0),"
+        "'0')<0&&indexedDB.cmp('0',new Uint8Array([0]))<0&&indexedDB.cmp("
+        "new Uint8Array([0]),[])<0&&indexedDB.cmp(new Uint8Array([1,2]),"
+        "new Uint8Array([1,3]))<0&&binaryRange.includes(new Uint8Array([7,8]))"
+        "&&!binaryRange.includes(binarySource)&&arrayRange.includes([1])"
+        "&&!arrayRange.includes(arraySource)&&invalidCmp==='DataError'"
+        "&&invalidRange==='DataError'&&emptyOpenRange==='DataError';"
+        "const opening=indexedDB.open('tilefinch-probe',2);let upgraded=false,"
+        "pendingResult='',pendingError='',closeEvents=0;try{void opening.result}"
+        "catch(error){pendingResult=error.name}try{void opening.error}catch(error)"
+        "{pendingError=error.name}"
         "opening.addEventListener('upgradeneeded',event=>{upgraded="
-        "event.oldVersion===0&&event.newVersion===2;const store="
+        "event.oldVersion===0&&event.newVersion===2&&opening.readyState==='done'"
+        "&&opening.result instanceof IDBDatabase&&opening.transaction instanceof "
+        "IDBTransaction;const store="
         "opening.result.createObjectStore('items',{keyPath:'id'});"
         "store.createIndex('tags','tags',{multiEntry:true});});"
-        "const db=await request(opening),write=db.transaction('items',"
+        "const db=await request(opening);db.addEventListener('close',()=>"
+        "closeEvents++);const write=db.transaction('items',"
         "'readwrite'),store=write.objectStore('items'),writeDone="
-        "finished(write);await Promise.all([request(store.put({id:2,"
-        "name:'two',tags:['even','all']})),request(store.put({id:1,"
-        "name:'one',tags:['odd','all']})),writeDone]);"
+        "finished(write);const payload={map:new Map([['k',3]]),set:new Set("
+        "[4]),pattern:/a+/gi,blob:new Blob(['b']),file:new File(['f'],'f.txt'),"
+        "error:new TypeError('x'),boxed:new Number(7),big:BigInt(9)};"
+        "await Promise.all([request(store.put({id:2,"
+        "name:'two',tags:['even','all'],payload})),request(store.put({id:1,"
+        "name:'one',tags:['odd','all']})),request(store.put({id:[new Date(0)],"
+        "name:'date-key'})),request(store.put({id:['1970-01-01T00:00:00.000Z'],"
+        "name:'string-key'})),request(store.put({id:new Uint8Array([7,8]),"
+        "name:'binary-key'})),writeDone]);"
         "const read=db.transaction('items','readonly'),readDone="
         "finished(read),one=await request(read.objectStore('items').get(1)),"
         "all=await request(read.objectStore('items').getAll()),"
         "even=await request(read.objectStore('items').index('tags').getAll("
-        "IDBKeyRange.only('even')));await readDone;const cursorTx="
+        "IDBKeyRange.only('even'))),dateKey=await request(read.objectStore("
+        "'items').get([new Date(0)])),stringKey=await request(read.objectStore("
+        "'items').get(['1970-01-01T00:00:00.000Z'])),binaryKey=await request("
+        "read.objectStore('items').get(new Uint8Array([7,8])));await readDone;"
+        "const cursorTx="
         "db.transaction('items'),cursorDone=finished(cursorTx),cursorRequest="
         "cursorTx.objectStore('items').index('tags').openCursor(),seen=[];"
         "let cursor=await request(cursorRequest);while(cursor){seen.push("
@@ -3328,10 +4263,18 @@ int main(int argc, char **argv)
         "again=await request(againTx.objectStore('items').get(2));"
         "await againDone;reopened.close();await request(indexedDB.deleteDatabase("
         "'tilefinch-probe'));const telemetry=__tilefinchIndexedDBStats;"
-        "globalThis.pocSummary=upgraded&&db instanceof IDBDatabase"
+        "globalThis.pocSummary=keyContract&&upgraded"
+        "&&pendingResult==='InvalidStateError'&&pendingError==='InvalidStateError'"
+        "&&closeEvents===0&&db instanceof IDBDatabase"
         "&&opening instanceof IDBOpenDBRequest&&store instanceof IDBObjectStore"
-        "&&one.name==='one'&&all.length===2&&all[0].id===1&&all[1].id===2"
+        "&&one.name==='one'&&all.length===5&&dateKey.name==='date-key'"
+        "&&stringKey.name==='string-key'&&binaryKey.name==='binary-key'"
         "&&even.length===1&&even[0].id===2&&again.name==='two'"
+        "&&again.payload.map.get('k')===3&&again.payload.set.has(4)"
+        "&&again.payload.pattern.source==='a+'&&again.payload.pattern.flags==="
+        "'gi'&&again.payload.blob.size===1&&again.payload.file.name==='f.txt'"
+        "&&again.payload.error.name==='TypeError'&&again.payload.boxed.valueOf()"
+        "===7&&again.payload.big===BigInt(9)"
         "&&seen.join(',')==='all:1,all:2,even:2,odd:1'"
         "&&telemetry.records===0&&telemetry.bytes===0&&telemetry.opens===2"
         "&&telemetry.deletes===1?'INDEXEDDB-OK':'INDEXEDDB-FAILED:'+"
@@ -3351,7 +4294,7 @@ int main(int argc, char **argv)
           && result.indexed_db_opens == 2
           && result.indexed_db_deletes == 1
           && result.indexed_db_transactions == 5
-          && result.indexed_db_requests == 7
+          && result.indexed_db_requests == 13
           && result.indexed_db_records == 0
           && result.indexed_db_bytes == 0
           && result.indexed_db_peak_bytes > 0
@@ -3363,6 +4306,149 @@ int main(int argc, char **argv)
              probes load the lazy Intl module. */
           && result.bootstrap_lazy_module_loads == 7
           && result.bootstrap_lazy_module_failures == 0);
+
+    static const char indexeddb_generator_probe[] =
+        "(async()=>{const request=req=>new Promise((resolve,reject)=>{"
+        "req.addEventListener('success',()=>resolve(req.result));"
+        "req.addEventListener('error',()=>reject(req.error));}),"
+        "finished=tx=>new Promise((resolve,reject)=>{tx.addEventListener("
+        "'complete',resolve);tx.addEventListener('abort',()=>reject(tx.error));}),"
+        "name='tilefinch-idb-generator',opening=indexedDB.open(name,1);"
+        "opening.addEventListener('upgradeneeded',()=>{opening.result."
+        "createObjectStore('inline',{keyPath:'id',autoIncrement:true});"
+        "opening.result.createObjectStore('external',{autoIncrement:true})});"
+        "const db=await request(opening),write=db.transaction(['inline',"
+        "'external'],'readwrite'),writeDone=finished(write),inline=write."
+        "objectStore('inline'),external=write.objectStore('external'),"
+        "inlineKey=await request(inline.add({name:'first'})),explicitKey="
+        "await request(external.put('explicit',1)),generatedKey=await request("
+        "external.put('automatic'));await writeDone;const read=db.transaction("
+        "['inline','external']),readDone=finished(read),inlineValue=await request("
+        "read.objectStore('inline').get(1)),externalValues=await request(read."
+        "objectStore('external').getAll());await readDone;db.close();await request("
+        "indexedDB.deleteDatabase(name));globalThis.pocSummary=inlineKey===1"
+        "&&inlineValue.id===1&&inlineValue.name==='first'&&explicitKey===1"
+        "&&generatedKey===2&&externalValues.join(',')==='explicit,automatic'"
+        "?'INDEXEDDB-GENERATOR-OK':'INDEXEDDB-GENERATOR-FAILED:'+JSON.stringify("
+        "{inlineKey,inlineValue,explicitKey,generatedKey,externalValues})})()"
+        ".catch(error=>{globalThis.pocSummary='INDEXEDDB-GENERATOR-ERROR:'+"
+        "String(error&&error.stack||error)});";
+    bool indexeddb_generator_ok = script_runtime_evaluate_diagnostic(
+        runtime, indexeddb_generator_probe, "<indexeddb-generator-probe>",
+        &result);
+    for (size_t tick = 0; indexeddb_generator_ok && tick < 32
+         && strncmp(result.summary, "INDEXEDDB-GENERATOR-", 20) != 0; tick++) {
+        indexeddb_generator_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    if (!indexeddb_generator_ok
+        || strcmp(result.summary, "INDEXEDDB-GENERATOR-OK") != 0) {
+        fprintf(stderr, "indexeddb generator probe: ok=%d summary=%s error=%s\n",
+                indexeddb_generator_ok, result.summary, result.error);
+    }
+    CHECK(indexeddb_generator_ok
+          && strcmp(result.summary, "INDEXEDDB-GENERATOR-OK") == 0
+          && result.indexed_db_records == 0
+          && result.indexed_db_bytes == 0);
+
+    static const char indexeddb_success_exception_probe[] =
+        "(async()=>{const request=req=>new Promise((resolve,reject)=>{"
+        "req.addEventListener('success',()=>resolve(req.result));"
+        "req.addEventListener('error',()=>reject(req.error));}),name="
+        "'tilefinch-idb-success-exception',opening=indexedDB.open(name,1);"
+        "opening.addEventListener('upgradeneeded',()=>opening.result."
+        "createObjectStore('records'));const db=await request(opening),"
+        "write=db.transaction('records','readwrite'),outcome=new Promise(resolve"
+        "=>{write.addEventListener('abort',()=>resolve('abort'));write."
+        "addEventListener('complete',()=>resolve('complete'))}),put=write."
+        "objectStore('records').put('must-rollback',1);put.addEventListener("
+        "'success',()=>{throw new Error('success handler failed')});const state="
+        "await outcome,read=db.transaction('records'),readDone=new Promise("
+        "(resolve,reject)=>{read.addEventListener('complete',resolve);read."
+        "addEventListener('abort',()=>reject(read.error))}),saved=await request("
+        "read.objectStore('records').get(1));await readDone;db.close();await request("
+        "indexedDB.deleteDatabase(name));globalThis.pocSummary=state==='abort'"
+        "&&saved===undefined?'INDEXEDDB-SUCCESS-EXCEPTION-OK':"
+        "'INDEXEDDB-SUCCESS-EXCEPTION-FAILED:'+state+':'+String(saved)})()"
+        ".catch(error=>{globalThis.pocSummary='INDEXEDDB-SUCCESS-EXCEPTION-ERROR:'"
+        "+String(error&&error.stack||error)});";
+    bool indexeddb_success_exception_ok = script_runtime_evaluate_diagnostic(
+        runtime, indexeddb_success_exception_probe,
+        "<indexeddb-success-exception-probe>", &result);
+    for (size_t tick = 0; indexeddb_success_exception_ok && tick < 32
+         && strncmp(result.summary, "INDEXEDDB-SUCCESS-EXCEPTION-", 28) != 0;
+         tick++) {
+        indexeddb_success_exception_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    if (!indexeddb_success_exception_ok
+        || strcmp(result.summary, "INDEXEDDB-SUCCESS-EXCEPTION-OK") != 0) {
+        fprintf(stderr,
+                "indexeddb success exception probe: ok=%d summary=%s error=%s\n",
+                indexeddb_success_exception_ok, result.summary, result.error);
+    }
+    CHECK(indexeddb_success_exception_ok
+          && strcmp(result.summary, "INDEXEDDB-SUCCESS-EXCEPTION-OK") == 0
+          && result.indexed_db_records == 0
+          && result.indexed_db_bytes == 0);
+
+    static const char indexeddb_query_upgrade_probe[] =
+        "(async()=>{const request=req=>new Promise((resolve,reject)=>{"
+        "req.addEventListener('success',()=>resolve(req.result));req."
+        "addEventListener('error',()=>reject(req.error));}),finished=tx=>new "
+        "Promise((resolve,reject)=>{tx.addEventListener('complete',resolve);"
+        "tx.addEventListener('abort',()=>reject(tx.error));}),queryName="
+        "'tilefinch-idb-query-snapshot',queryOpen=indexedDB.open(queryName,1);"
+        "queryOpen.addEventListener('upgradeneeded',()=>queryOpen.result."
+        "createObjectStore('records'));const queryDb=await request(queryOpen),"
+        "seed=queryDb.transaction('records','readwrite'),seedDone=finished(seed),"
+        "seedStore=seed.objectStore('records');await Promise.all([request("
+        "seedStore.put('one',new Uint8Array([1]))),request(seedStore.put('two',"
+        "new Uint8Array([2]))),seedDone]);const mutation=queryDb.transaction("
+        "'records','readwrite'),mutationDone=finished(mutation),mutationStore="
+        "mutation.objectStore('records'),getKey=new Uint8Array([1]),getRequest="
+        "request(mutationStore.get(getKey));getKey[0]=2;const deleteKey=new "
+        "Uint8Array([1]),deleteRequest=request(mutationStore.delete(deleteKey));"
+        "deleteKey[0]=2;const original=await getRequest;await deleteRequest;await "
+        "mutationDone;const verify=queryDb.transaction('records'),verifyDone="
+        "finished(verify),remaining=await request(verify.objectStore('records')."
+        "getAll());await verifyDone;queryDb.close();await request(indexedDB."
+        "deleteDatabase(queryName));const upgradeName='tilefinch-idb-blocked-',"
+        "firstOpen=indexedDB.open(upgradeName,1);firstOpen.addEventListener("
+        "'upgradeneeded',()=>firstOpen.result.createObjectStore('records'));"
+        "const firstDb=await request(firstOpen);let versionchange=false,blocked="
+        "false,upgraded=false;firstDb.addEventListener('versionchange',event=>{"
+        "versionchange=event.oldVersion===1&&event.newVersion===2;setTimeout("
+        "()=>firstDb.close(),0)});const secondOpen=indexedDB.open(upgradeName,2);"
+        "secondOpen.addEventListener('blocked',()=>blocked=true);secondOpen."
+        "addEventListener('upgradeneeded',()=>upgraded=true);const secondDb=await "
+        "request(secondOpen);secondDb.close();await request(indexedDB.deleteDatabase("
+        "upgradeName));globalThis.pocSummary=original==='one'&&remaining.length===1"
+        "&&remaining[0]==='two'&&versionchange&&blocked&&upgraded&&secondDb."
+        "version===2?'INDEXEDDB-QUERY-UPGRADE-OK':"
+        "'INDEXEDDB-QUERY-UPGRADE-FAILED:'+JSON.stringify({original,remaining,"
+        "versionchange,blocked,upgraded,version:secondDb.version})})().catch(error"
+        "=>{globalThis.pocSummary='INDEXEDDB-QUERY-UPGRADE-ERROR:'+String(error"
+        "&&error.stack||error)});";
+    bool indexeddb_query_upgrade_ok = script_runtime_evaluate_diagnostic(
+        runtime, indexeddb_query_upgrade_probe,
+        "<indexeddb-query-upgrade-probe>", &result);
+    for (size_t tick = 0; indexeddb_query_upgrade_ok && tick < 48
+         && strncmp(result.summary, "INDEXEDDB-QUERY-UPGRADE-", 24) != 0;
+         tick++) {
+        indexeddb_query_upgrade_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    if (!indexeddb_query_upgrade_ok
+        || strcmp(result.summary, "INDEXEDDB-QUERY-UPGRADE-OK") != 0) {
+        fprintf(stderr,
+                "indexeddb query/upgrade probe: ok=%d summary=%s error=%s\n",
+                indexeddb_query_upgrade_ok, result.summary, result.error);
+    }
+    CHECK(indexeddb_query_upgrade_ok
+          && strcmp(result.summary, "INDEXEDDB-QUERY-UPGRADE-OK") == 0
+          && result.indexed_db_records == 0
+          && result.indexed_db_bytes == 0);
 
     static const char indexeddb_failure_probe[] =
         "(async()=>{const request=req=>new Promise((resolve,reject)=>{"
@@ -3407,8 +4493,11 @@ int main(int argc, char **argv)
         "await queuedDone;Array.prototype.includes=originalIncludes;"
         "const timersBefore=__tilefinchPendingTimers(),timers=[];for(let i=0;"
         "i<160;i++){const id=setTimeout(()=>{},1000);if(!id)break;timers.push(id)}"
-        "const saturated=db.transaction('records'),saturatedDone=finished("
-        "saturated);await saturatedDone;for(const id of timers)clearTimeout(id);"
+        "let saturatedName='';try{db.transaction('records')}catch(error){"
+        "saturatedName=error.name}for(const id of timers)clearTimeout(id);"
+        "const recovered=db.transaction('records'),recoveredDone=finished("
+        "recovered),recoveredValue=await request(recovered.objectStore('records')."
+        "get(1));await recoveredDone;"
         "db.close();const bad=indexedDB.open(name,2);bad.addEventListener("
         "'upgradeneeded',()=>{bad.result.createObjectStore('partial');bad."
         "transaction.objectStore('records').createIndex('temporary','value');"
@@ -3443,6 +4532,7 @@ int main(int argc, char **argv)
         "&&quotaDoneName==='QuotaExceededError'&&kept==='kept'&&count===1"
         "&&lockedResult==='kept'&&queuedBeforeRelease&&queuedResult==='kept'"
         "&&timers.length+timersBefore===128"
+        "&&saturatedName==='QuotaExceededError'&&recoveredValue==='kept'"
         "&&badName==='AbortError'&&retryOld===1&&rolledBack"
         "&&persisted==='kept'&&__tilefinchIndexedDBStats.quotaErrors"
         "===beforeQuota+1&&currentVersion===2&&doomedName==='AbortError'"
@@ -3451,7 +4541,7 @@ int main(int argc, char **argv)
         "?'INDEXEDDB-FAILURES-OK':'INDEXEDDB-FAILURES-FAILED:'"
         "+JSON.stringify({abortResults,restoredKey,quotaName,quotaTrailing,"
         "quotaDoneName,kept,count,lockedResult,queuedBeforeRelease,queuedResult,"
-        "timers:timers.length,timersBefore,badName,"
+        "timers:timers.length,timersBefore,saturatedName,recoveredValue,badName,"
         "retryOld,rolledBack,persisted,currentVersion,doomedName,"
         "stats:__tilefinchIndexedDBStats});})()"
         ".catch(error=>{globalThis.pocSummary='INDEXEDDB-FAILURES-ERROR:'+"
@@ -3472,6 +4562,67 @@ int main(int argc, char **argv)
     CHECK(indexeddb_failures_ok
           && strcmp(result.summary, "INDEXEDDB-FAILURES-OK") == 0
           && result.indexed_db_quota_errors == 1
+          && result.indexed_db_records == 0
+          && result.indexed_db_bytes == 0);
+
+    static const char indexeddb_task_admission_probe[] =
+        "(async()=>{const request=req=>new Promise((resolve,reject)=>{req."
+        "addEventListener('success',()=>resolve(req.result));req.addEventListener("
+        "'error',()=>reject(req.error))}),finished=tx=>new Promise((resolve,reject)"
+        "=>{tx.addEventListener('complete',resolve);tx.addEventListener('abort',"
+        "()=>reject(tx.error))}),name='tilefinch-idb-task-admission',opening="
+        "indexedDB.open(name,1);opening.addEventListener('upgradeneeded',()=>"
+        "opening.result.createObjectStore('records'));const db=await request("
+        "opening),seed=db.transaction('records','readwrite'),seedDone=finished("
+        "seed);await Promise.all([request(seed.objectStore('records').put('kept',"
+        "1)),seedDone]);const blocker=db.transaction('records','readwrite'),"
+        "blockerDone=finished(blocker),blockerRead=request(blocker.objectStore("
+        "'records').get(1)),queued=db.transaction('records','readwrite');let "
+        "aborts=0,pendingAtAbort=-1,lastErrorCheckpoint=false,checkpointAtAbort=false,"
+        "order=[],requests=[];queued.addEventListener("
+        "'abort',()=>{aborts++;pendingAtAbort=0;for(const item of requests)if(item."
+        "readyState==='pending')pendingAtAbort++;checkpointAtAbort=lastErrorCheckpoint;"
+        "order.push('abort')});const queuedDone="
+        "finished(queued).then(()=>'',error=>error.name),settled=[],store=queued."
+        "objectStore('records');for(let i=0;i<140;i++){const item=store.put(i,i+2);"
+        "requests.push(item);"
+        "settled.push(new Promise(resolve=>{item.addEventListener('success',()=>"
+        "resolve('success'));item.addEventListener('error',()=>{order.push(i);if(i===139)"
+        "queueMicrotask(()=>lastErrorCheckpoint=true);resolve(item.error."
+        "name)})}))}await blockerRead;await blockerDone;const outcomes=await Promise."
+        "all(settled),abortName=await queuedDone,verify=db.transaction('records'),"
+        "verifyDone=finished(verify),count=await request(verify.objectStore('records')"
+        ".count());await verifyDone;const reuse=db.transaction('records','readwrite'),"
+        "reuseDone=finished(reuse),reused=await request(reuse.objectStore('records')"
+        ".put('after',2));await reuseDone;db.close();await request(indexedDB."
+        "deleteDatabase(name));globalThis.pocSummary=outcomes.length===140&&"
+        "outcomes.every(value=>value==='AbortError')&&aborts===1&&pendingAtAbort===0&&"
+        "checkpointAtAbort&&"
+        "order.length===141&&order.every((value,index)=>index<140?value===index:value==="
+        "'abort')&&abortName==='QuotaExceededError'&&count===1&&reused===2?"
+        "'INDEXEDDB-ADMISSION-OK':"
+        "'INDEXEDDB-ADMISSION-FAILED:'+JSON.stringify({outcomes:outcomes.length,"
+        "errors:outcomes.filter(value=>value==='AbortError').length,aborts,abortName,"
+        "pendingAtAbort,checkpointAtAbort,orderStart:order.slice(0,4),"
+        "orderEnd:order.slice(-4),count,"
+        "reused})})().catch(error=>{globalThis.pocSummary="
+        "'INDEXEDDB-ADMISSION-ERROR:'+String(error&&error.stack||error)});";
+    bool indexeddb_task_admission_ok = script_runtime_evaluate_diagnostic(
+        runtime, indexeddb_task_admission_probe,
+        "<indexeddb-task-admission-probe>", &result);
+    for (size_t tick = 0; indexeddb_task_admission_ok && tick < 64
+         && strncmp(result.summary, "INDEXEDDB-ADMISSION-", 20) != 0; tick++) {
+        indexeddb_task_admission_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    if (!indexeddb_task_admission_ok
+        || strcmp(result.summary, "INDEXEDDB-ADMISSION-OK") != 0) {
+        fprintf(stderr, "indexeddb task-admission probe: ok=%d summary=%s "
+                "error=%s\n", indexeddb_task_admission_ok,
+                result.summary, result.error);
+    }
+    CHECK(indexeddb_task_admission_ok
+          && strcmp(result.summary, "INDEXEDDB-ADMISSION-OK") == 0
           && result.indexed_db_records == 0
           && result.indexed_db_bytes == 0);
 
@@ -3545,7 +4696,10 @@ int main(int argc, char **argv)
         "const db=await request(opening),first=db.transaction('items','readwrite'),"
         "firstDone=finished(first);await Promise.all([request(first.objectStore("
         "'items').add({id:1,email:'same@example.test'})),firstDone]);"
-        "const duplicate=db.transaction('items','readwrite'),"
+        "const duplicate=db.transaction('items','readwrite');let duplicateBubbled="
+        "false;duplicate.addEventListener('error',{handleEvent(event){if("
+        "event.target instanceof IDBRequest)duplicateBubbled=event.currentTarget"
+        "===duplicate}});const "
         "duplicateDone=finished(duplicate).then(()=>'',error=>error.name),"
         "duplicateRequest=request(duplicate.objectStore('items').add("
         "{id:2,email:'same@example.test'})).then(()=>'',error=>error.name),"
@@ -3566,7 +4720,8 @@ int main(int argc, char **argv)
         "await request(indexedDB.deleteDatabase(name));"
         "globalThis.pocSummary=duplicateNames[0]==='ConstraintError'"
         "&&duplicateNames[1]==='ConstraintError'&&createName==='ConstraintError'"
-        "&&upgradeName==='AbortError'?'INDEXEDDB-UNIQUE-OK':"
+        "&&upgradeName==='AbortError'&&duplicateBubbled?"
+        "'INDEXEDDB-UNIQUE-OK':"
         "'INDEXEDDB-UNIQUE-FAILED:'+JSON.stringify({duplicateNames,createName,"
         "upgradeName});})().catch(error=>{globalThis.pocSummary="
         "'INDEXEDDB-UNIQUE-ERROR:'+String(error&&error.stack||error)});";
@@ -3584,6 +4739,73 @@ int main(int argc, char **argv)
     }
     CHECK(indexeddb_unique_ok
           && strcmp(result.summary, "INDEXEDDB-UNIQUE-OK") == 0
+          && result.indexed_db_records == 0
+          && result.indexed_db_bytes == 0);
+
+    static const char indexeddb_contract_probe[] =
+        "(async()=>{const request=req=>new Promise((resolve,reject)=>{"
+        "req.addEventListener('success',()=>resolve(req.result));"
+        "req.addEventListener('error',()=>reject(req.error));}),finished=tx=>"
+        "new Promise((resolve,reject)=>{tx.addEventListener('complete',resolve);"
+        "tx.addEventListener('abort',()=>reject(tx.error));}),name="
+        "'tilefinch-idb-contract',originalClone=globalThis.structuredClone;"
+        "let poisonCalls=0;globalThis.structuredClone=()=>{poisonCalls++;throw "
+        "new Error('poison')};try{const opening=indexedDB.open(name,1);opening."
+        "addEventListener('upgradeneeded',()=>opening.result.createObjectStore("
+        "'items',{keyPath:'id'}));const db=await request(opening),write=db."
+        "transaction('items','readwrite'),writeDone=finished(write),store=write."
+        "objectStore('items'),source={id:1,value:'before'},cycle={id:2},shared="
+        "{value:3};cycle.self=cycle;const first=request(store.put(source)),"
+        "second=request(store.put(cycle)),third=request(store.put({id:3,a:shared,"
+        "b:shared})),eventRequest=store.put({id:4,value:'event'}),eventCalls=[],"
+        "abortListeners=new AbortController;eventRequest.addEventListener('success',"
+        "()=>eventCalls.push('first'));eventRequest."
+        "addEventListener('success',{handleEvent(event){eventCalls.push(event.target"
+        "===eventRequest&&event.currentTarget===eventRequest?'object':'bad')}},{once:"
+        "true});eventRequest.addEventListener('success',()=>eventCalls.push('abort'),"
+        "{signal:abortListeners.signal});abortListeners.abort();const fourth=request("
+        "eventRequest);source.value='after';let cloneName='',postCommitName='';"
+        "try{store.put(()=>{},4)}catch(error){cloneName=error.name}write.commit();"
+        "try{store.get(1)}catch(error){postCommitName=error.name}await Promise.all("
+        "[first,second,third,fourth,writeDone]);const read=db.transaction('items'),"
+        "readDone=finished(read),readStore=read.objectStore('items');await Promise."
+        "resolve();const values=await Promise.all([request(readStore.get(1)),"
+        "request(readStore.get(2)),request(readStore.get(3))]);await readDone;"
+        "const order=[],ordered=db.transaction('items'),orderedDone=finished("
+        "ordered),orderedRequest=ordered.objectStore('items').get(1);"
+        "orderedRequest.addEventListener('success',()=>order.push('success'));"
+        "queueMicrotask(()=>order.push('microtask'));await request(orderedRequest);"
+        "await orderedDone;"
+        "const late=db.transaction('items'),lateStore=late.objectStore('items'),"
+        "lateDone=finished(late),lateName=await new Promise(resolve=>setTimeout("
+        "()=>{try{lateStore.get(1);resolve('none')}catch(error){resolve(error.name)}}"
+        ",0));await lateDone;db.close();await request(indexedDB.deleteDatabase("
+        "name));globalThis.pocSummary=poisonCalls===0&&cloneName==='DataCloneError'"
+        "&&postCommitName==='TransactionInactiveError'&&values[0].value==="
+        "'before'&&values[1].self===values[1]&&values[2].a===values[2].b&&"
+        "lateName==='TransactionInactiveError'&&eventRequest instanceof EventTarget"
+        "&&eventCalls.join(',')==='first,object'&&order.join(',')==="
+        "'microtask,success'?'INDEXEDDB-CONTRACT-OK':"
+        "'INDEXEDDB-CONTRACT-FAILED:'+JSON.stringify({poisonCalls,cloneName,"
+        "postCommitName,first:values[0].value,cycle:values[1].self===values[1],"
+        "alias:values[2].a===values[2].b,lateName,order})}finally{globalThis."
+        "structuredClone=originalClone}})().catch(error=>{globalThis.pocSummary="
+        "'INDEXEDDB-CONTRACT-ERROR:'+String(error&&error.stack||error)});";
+    bool indexeddb_contract_ok = script_runtime_evaluate_diagnostic(
+        runtime, indexeddb_contract_probe, "<indexeddb-contract-probe>",
+        &result);
+    for (size_t tick = 0; indexeddb_contract_ok && tick < 32
+         && strncmp(result.summary, "INDEXEDDB-CONTRACT-", 19) != 0; tick++) {
+        indexeddb_contract_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    if (!indexeddb_contract_ok
+        || strcmp(result.summary, "INDEXEDDB-CONTRACT-OK") != 0) {
+        fprintf(stderr, "indexeddb contract probe: ok=%d summary=%s error=%s\n",
+                indexeddb_contract_ok, result.summary, result.error);
+    }
+    CHECK(indexeddb_contract_ok
+          && strcmp(result.summary, "INDEXEDDB-CONTRACT-OK") == 0
           && result.indexed_db_records == 0
           && result.indexed_db_bytes == 0);
 
@@ -3657,60 +4879,140 @@ int main(int argc, char **argv)
               "(()=>{const frame=document.createElement('iframe');"
               "document.body.appendChild(frame);globalThis.crossFrame=frame;"
               "globalThis.crossWindow=frame.contentWindow;"
+              "crossWindow.initialMarker='preserved';"
               "globalThis.pocSummary=String(frame.__handle)})()",
               "<cross-frame-setup>", &result));
     long cross_frame_handle = strtol(result.summary, NULL, 10);
-    CHECK(cross_frame_handle > 0
-          && script_runtime_set_frame_window_state(
-              runtime, cross_frame_handle, true, true, false,
-              "https://parent.test/child?entry=enabled", &result)
-          && script_runtime_evaluate_diagnostic(
-              runtime,
-              "globalThis.pocSummary=crossWindow.location.search"
-              "==='?entry=enabled'?'FRAME-LOCATION-OK':"
-              "'FRAME-LOCATION-FAILED'",
-              "<same-origin-frame-location>", &result)
-          && strcmp(result.summary, "FRAME-LOCATION-OK") == 0
-          && script_runtime_set_frame_window_state(
-              runtime, cross_frame_handle, true, false, false, NULL, &result)
-          && result.root_frame_windows == frame_windows_before + 1
-          && script_runtime_evaluate_diagnostic(
-              runtime,
-              "globalThis.pocSummary=crossFrame.contentWindow===crossWindow"
-              "&&crossWindow.closed===false"
-              "&&crossWindow.document===undefined"
-              "&&crossWindow.location===undefined"
-              "&&crossWindow.eval===undefined"
-              "&&crossWindow.pocSummary===undefined"
-              "&&('document' in crossWindow)===false"
-              "&&('pocSummary' in crossWindow)===false"
-              "&&crossWindow.window===crossWindow"
-              "&&crossWindow.opener===null"
-              "&&Reflect.set(crossWindow,'postMessage',()=>{})===false?"
-              "'CROSS-WINDOW-OK':'CROSS-WINDOW-FAILED'",
-              "<cross-frame-check>", &result)
-          && strcmp(result.summary, "CROSS-WINDOW-OK") == 0
-          && script_runtime_set_frame_window_state(
-              runtime, cross_frame_handle, false, false, false, NULL, &result)
-          && script_runtime_evaluate_diagnostic(
-              runtime,
-              "globalThis.pocSummary=crossWindow.closed?"
-              "'CLOSED-WINDOW-OK':'CLOSED-WINDOW-FAILED';crossFrame.remove()",
-              "<closed-frame-check>", &result)
-          && strcmp(result.summary, "CLOSED-WINDOW-OK") == 0);
+    CHECK(cross_frame_handle > 0);
+    CHECK(script_runtime_set_frame_window_state(
+        runtime, cross_frame_handle, true, true, false,
+        "https://parent.test/child?entry=enabled", false, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=crossWindow.initialMarker==='preserved'"
+        "&&crossWindow.location.href==='about:blank'?"
+        "'FRAME-START-PRESERVES-INITIAL-OK':"
+        "'FRAME-START-PRESERVES-INITIAL-FAILED:'+crossWindow.location.href",
+        "<frame-start-preserves-initial>", &result)
+        && strcmp(result.summary, "FRAME-START-PRESERVES-INITIAL-OK") == 0);
+    CHECK(script_runtime_set_frame_window_state(
+        runtime, cross_frame_handle, true, true, false,
+        "https://parent.test/child?entry=enabled", true, &result));
+    bool initial_frame_commit_ok = script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=crossWindow.location.search"
+        "==='?entry=enabled'&&crossWindow.initialMarker==='preserved'?"
+        "'FRAME-LOCATION-OK':'FRAME-LOCATION-FAILED:'+crossWindow.location.search"
+        "+','+String(crossWindow.initialMarker)",
+        "<same-origin-frame-location>", &result);
+    if (!initial_frame_commit_ok
+        || strcmp(result.summary, "FRAME-LOCATION-OK") != 0) {
+        fprintf(stderr, "initial frame commit: ok=%d summary=%s error=%s\n",
+                initial_frame_commit_ok, result.summary, result.error);
+    }
+    CHECK(initial_frame_commit_ok
+          && strcmp(result.summary, "FRAME-LOCATION-OK") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "crossWindow.beforeCrossCommit='visible';"
+        "globalThis.pocSummary='FRAME-CROSS-START-ARMED'",
+        "<cross-frame-start-setup>", &result));
+    CHECK(script_runtime_set_frame_window_state(
+        runtime, cross_frame_handle, true, false, false,
+        "https://other.test/child", false, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=crossWindow.beforeCrossCommit==='visible'"
+        "&&crossWindow.document!==undefined"
+        "&&crossWindow.location.search==='?entry=enabled'?"
+        "'FRAME-CROSS-START-KEEPS-COMMIT-OK':"
+        "'FRAME-CROSS-START-KEEPS-COMMIT-FAILED'",
+        "<cross-frame-start-keeps-commit>", &result)
+        && strcmp(result.summary, "FRAME-CROSS-START-KEEPS-COMMIT-OK") == 0);
+    CHECK(script_runtime_set_frame_window_state(
+        runtime, cross_frame_handle, true, false, false,
+        "https://other.test/child", true,
+        &result));
+    CHECK(result.root_frame_windows == frame_windows_before + 1);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=crossFrame.contentWindow===crossWindow"
+        "&&crossWindow.closed===false"
+        "&&crossWindow.document===undefined"
+        "&&crossWindow.location===undefined"
+        "&&crossWindow.eval===undefined"
+        "&&crossWindow.pocSummary===undefined"
+        "&&('document' in crossWindow)===false"
+        "&&('pocSummary' in crossWindow)===false"
+        "&&crossWindow.window===crossWindow"
+        "&&crossWindow.opener===null"
+        "&&Reflect.set(crossWindow,'postMessage',()=>{})===false?"
+        "'CROSS-WINDOW-OK':'CROSS-WINDOW-FAILED'",
+        "<cross-frame-check>", &result)
+        && strcmp(result.summary, "CROSS-WINDOW-OK") == 0);
+    CHECK(script_runtime_set_frame_window_state(
+        runtime, cross_frame_handle, true, true, false,
+        "https://parent.test/child?return=enabled", false, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=crossWindow.document===undefined"
+        "&&crossWindow.location===undefined?"
+        "'FRAME-RETURN-START-KEEPS-COMMIT-OK':"
+        "'FRAME-RETURN-START-KEEPS-COMMIT-FAILED'",
+        "<frame-return-start-keeps-commit>", &result)
+        && strcmp(result.summary,
+                  "FRAME-RETURN-START-KEEPS-COMMIT-OK") == 0);
+    CHECK(script_runtime_set_frame_window_state(
+        runtime, cross_frame_handle, true, true, false,
+        "https://parent.test/child?return=enabled", true, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=crossFrame.contentWindow===crossWindow"
+        "&&crossWindow.location.search==='?return=enabled'"
+        "&&crossWindow.beforeCrossCommit===undefined?"
+        "'FRAME-RETURN-COMMIT-FRESH-OK':"
+        "'FRAME-RETURN-COMMIT-FRESH-FAILED'",
+        "<frame-return-commit-fresh>", &result)
+        && strcmp(result.summary, "FRAME-RETURN-COMMIT-FRESH-OK") == 0);
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "crossWindow.sameUrlStale=1;crossWindow.eval("
+        "'var sameUrlVar=1');globalThis.pocSummary='FRAME-STALE-ARMED'",
+        "<same-url-frame-stale-setup>", &result));
+    CHECK(script_runtime_set_frame_window_state(
+        runtime, cross_frame_handle, true, true, false,
+        "https://parent.test/child?return=enabled", true, &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=crossWindow.sameUrlStale===undefined"
+        "&&crossWindow.eval('typeof sameUrlVar')==='undefined'?"
+        "'FRAME-SAME-URL-FRESH-OK':'FRAME-SAME-URL-FRESH-FAILED'",
+        "<same-url-frame-fresh-check>", &result)
+        && strcmp(result.summary, "FRAME-SAME-URL-FRESH-OK") == 0);
+    CHECK(script_runtime_set_frame_window_state(
+        runtime, cross_frame_handle, false, false, false, NULL, false,
+        &result));
+    CHECK(script_runtime_evaluate_diagnostic(
+        runtime,
+        "globalThis.pocSummary=crossWindow.closed?"
+        "'CLOSED-WINDOW-OK':'CLOSED-WINDOW-FAILED';crossFrame.remove()",
+        "<closed-frame-check>", &result)
+        && strcmp(result.summary, "CLOSED-WINDOW-OK") == 0);
 
     static const char frame_retention_probe[] =
         "(()=>{const frames=[];for(let i=0;i<24;i++){const frame="
         "document.createElement('iframe');frames.push(frame);void "
-        "frame.contentWindow}let source=null;const receive=event=>{"
-        "source=event.source};addEventListener('message',receive,{once:true});"
-        "postMessage({probe:true},'*');__tilefinchPumpTimers(0,4);"
-        "globalThis.pocSummary=__tilefinchRootCensus.frameWindows<=16"
-        "&&source===window?'FRAME-RETENTION-OK':"
-        "'FRAME-RETENTION-FAILED';})()";
+        "frame.contentWindow}const receive=event=>{globalThis.pocSummary="
+        "__tilefinchRootCensus.frameWindows<=16&&event.source===window?"
+        "'FRAME-RETENTION-OK':'FRAME-RETENTION-FAILED'};"
+        "addEventListener('message',receive,{once:true});"
+        "globalThis.pocSummary='FRAME-RETENTION-PENDING';"
+        "postMessage({probe:true},'*')})()";
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, frame_retention_probe,
               "<frame-retention-probe>", &result)
+          && script_runtime_advance(runtime, 0, 8, &result)
+          && script_runtime_advance(runtime, 0, 8, &result)
           && strcmp(result.summary, "FRAME-RETENTION-OK") == 0);
 
     static const char callback_task_probe[] =
@@ -3729,7 +5031,7 @@ int main(int argc, char **argv)
         && strstr(result.last_uncaught_callback_error, "call (native)") == NULL
         && strstr(result.last_uncaught_callback_task, "realm=top") != NULL
         && strstr(result.last_uncaught_callback_task,
-                  "task=xhr:readystatechange:state=1#") != NULL;
+                  "context=event readystatechange") != NULL;
     if (!callback_task_valid) {
         fprintf(stderr,
                 "callback task probe: ok=%d summary=%s count=%zu error=%s "
@@ -4596,6 +5898,40 @@ int main(int argc, char **argv)
                     TILEFINCH_BROWSER_FULL_VERSION "|"
                     TILEFINCH_BROWSER_BRAND "|"
                     TILEFINCH_BROWSER_FULL_VERSION "|en-US|en-US,en") == 0);
+
+    puts("test: UA client hints preserve Web IDL and bounded values");
+    static const char ua_client_hints_probe[] =
+        "(()=>{const data=navigator.userAgentData,proto="
+        "NavigatorUAData.prototype,accesses=[],hints={"
+        "[Symbol.iterator](){accesses.push('iterator');let at=0;const values="
+        "['architecture','formFactors','wow64'];return{next(){accesses.push("
+        "'next'+at);return at<values.length?{value:{toString(){accesses.push("
+        "'string'+at);return values[at++]}},done:false}:{done:true}}}}};"
+        "let getterIllegal=0,methodIllegal=0;for(const name of ['brands',"
+        "'mobile','platform'])try{Object.getOwnPropertyDescriptor(proto,name)"
+        ".get.call({})}catch(error){if(error instanceof TypeError)getterIllegal++}"
+        "try{proto.getHighEntropyValues.call({},[])}catch(error){methodIllegal="
+        "error instanceof TypeError?1:-1}Promise.all([data.getHighEntropyValues("
+        "hints),data.getHighEntropyValues(['fullVersionList'])]).then(values=>{"
+        "const first=values[0],second=values[1];globalThis.pocSummary="
+        "getterIllegal===3&&methodIllegal===1&&accesses.join(',')==="
+        "'iterator,next0,string0,next1,string1,next2,string2,next3'&&"
+        "first.architecture==='MIPS'&&Array.isArray(first.formFactors)&&"
+        "first.formFactors.length===1&&first.formFactors[0]==='Mobile'&&"
+        "first.wow64===false&&first.brands===data.brands&&"
+        "second.fullVersionList.length===data.brands.length?"
+        "'UA-CLIENT-HINTS-OK':'UA-CLIENT-HINTS-FAILED:'+JSON.stringify({"
+        "getterIllegal,methodIllegal,accesses,first,second})})})()";
+    CHECK(script_runtime_evaluate_diagnostic(
+              runtime, ua_client_hints_probe, "<ua-client-hints-probe>",
+              &result));
+    for (size_t tick = 0; tick < 8
+         && strcmp(result.summary, "UA-CLIENT-HINTS-OK") != 0; tick++)
+        CHECK(script_runtime_advance(runtime, 0, 32, &result));
+    if (strcmp(result.summary, "UA-CLIENT-HINTS-OK") != 0)
+        fprintf(stderr, "UA client hints summary: %s error=%s\n",
+                result.summary, result.error);
+    CHECK(strcmp(result.summary, "UA-CLIENT-HINTS-OK") == 0);
 
     puts("test: speech synthesis degrades through a bounded empty engine");
     static const char speech_synthesis_probe[] =

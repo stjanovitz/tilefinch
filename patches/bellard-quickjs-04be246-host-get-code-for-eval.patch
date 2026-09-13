@@ -1,0 +1,141 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -541,6 +541,8 @@ struct JSContext {
+     JSRuntime *rt;
+     struct list_head link;
+     BOOL dynamic_code_enabled;
++    JSHostGetCodeForEval *host_get_code_for_eval;
++    void *host_get_code_for_eval_opaque;
+     BOOL host_retired;
+ 
+     uint16_t binary_object_count;
+@@ -2770,6 +2772,14 @@ void JS_SetDynamicCodeEnabled(JSContext *ctx, JS_BOOL enabled)
+     ctx->dynamic_code_enabled = enabled != 0;
+ }
+ 
++void JS_SetHostGetCodeForEval(JSContext *ctx,
++                              JSHostGetCodeForEval *callback,
++                              void *opaque)
++{
++    ctx->host_get_code_for_eval = callback;
++    ctx->host_get_code_for_eval_opaque = opaque;
++}
++
+ void JS_RetireContext(JSContext *ctx)
+ {
+     ctx->host_retired = TRUE;
+@@ -19022,10 +19032,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
+                 if (js_same_value(ctx, call_argv[-1], ctx->eval_obj)) {
+-                    if (unlikely(!ctx->dynamic_code_enabled)) {
+-                        JS_ThrowTypeError(ctx, "dynamic code compilation disabled by Content Security Policy");
+-                        goto exception;
+-                    }
+                     if (call_argc >= 1)
+                         obj = call_argv[0];
+                     else
+@@ -19059,11 +19065,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 if (!tab)
+                     goto exception;
+                 if (js_same_value(ctx, sp[-2], ctx->eval_obj)) {
+-                    if (unlikely(!ctx->dynamic_code_enabled)) {
+-                        free_arg_list(ctx, tab, len);
+-                        JS_ThrowTypeError(ctx, "dynamic code compilation disabled by Content Security Policy");
+-                        goto exception;
+-                    }
+                     if (len >= 1)
+                         obj = tab[0];
+                     else
+@@ -38413,32 +38414,56 @@ static JSValue tilefinch_compact_eval_rope(JSContext *ctx,
+ static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
+                              JSValueConst val, int flags, int scope_idx)
+ {
+-    JSValue ret, compact = JS_UNDEFINED;
++    JSValue ret, compact = JS_UNDEFINED, host_code = JS_UNDEFINED;
++    JSValueConst code = val;
+     const char *str;
+     size_t len;
+     uint32_t first_line_column = 0;
+ 
+-    if (!JS_IsString(val))
+-        return JS_DupValue(ctx, val);
+-    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING_ROPE
+-        && JS_VALUE_GET_STRING_ROPE(val)->len
++    if (!JS_IsString(code) && ctx->host_get_code_for_eval != NULL) {
++        int transformed = ctx->host_get_code_for_eval(
++            ctx, code, &host_code, ctx->host_get_code_for_eval_opaque);
++        if (transformed < 0)
++            return JS_EXCEPTION;
++        if (transformed > 0) {
++            if (!JS_IsString(host_code)) {
++                JS_FreeValue(ctx, host_code);
++                return JS_ThrowInternalError(
++                    ctx, "HostGetCodeForEval returned a non-string value");
++            }
++            code = host_code;
++        }
++    }
++    if (!JS_IsString(code))
++        return JS_DupValue(ctx, code);
++    if (unlikely(!ctx->dynamic_code_enabled)) {
++        JS_FreeValue(ctx, host_code);
++        return JS_ThrowTypeError(
++            ctx, "dynamic code compilation disabled by Content Security Policy");
++    }
++    if (JS_VALUE_GET_TAG(code) == JS_TAG_STRING_ROPE
++        && JS_VALUE_GET_STRING_ROPE(code)->len
+                >= JS_STRING_REPEAT_ROPE_THRESHOLD
+         && ctx->eval_internal == __JS_EvalInternal) {
+-        compact = tilefinch_compact_eval_rope(ctx, val,
++        compact = tilefinch_compact_eval_rope(ctx, code,
+                                                &first_line_column);
+-        if (JS_IsException(compact))
++        if (JS_IsException(compact)) {
++            JS_FreeValue(ctx, host_code);
+             return compact;
++        }
+     }
+     str = JS_ToCStringLen(ctx, &len,
+-                          JS_IsUndefined(compact) ? val : compact);
++                          JS_IsUndefined(compact) ? code : compact);
+     if (!str) {
+         JS_FreeValue(ctx, compact);
++        JS_FreeValue(ctx, host_code);
+         return JS_EXCEPTION;
+     }
+     ret = JS_EvalInternalWithColumn(ctx, this_obj, str, len, "<input>",
+                                     flags, scope_idx, first_line_column);
+     JS_FreeCString(ctx, str);
+     JS_FreeValue(ctx, compact);
++    JS_FreeValue(ctx, host_code);
+     return ret;
+ }
+ 
+@@ -41078,8 +41103,6 @@ static JSValue JS_NewCConstructor(JSContext *ctx, int class_id, const char *name
+ static JSValue js_global_eval(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+ {
+-    if (unlikely(!ctx->dynamic_code_enabled))
+-        return JS_ThrowTypeError(ctx, "dynamic code compilation disabled by Content Security Policy");
+     return JS_EvalObject(ctx, js_global_this(ctx), argv[0], JS_EVAL_TYPE_INDIRECT, -1);
+ }
+ 
+diff --git a/quickjs.h b/quickjs.h
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -395,6 +395,13 @@ void *JS_GetContextOpaque(JSContext *ctx);
+ void JS_SetContextOpaque(JSContext *ctx, void *opaque);
+ /* Host policy gate for page-originated eval and Function constructors. */
+ void JS_SetDynamicCodeEnabled(JSContext *ctx, JS_BOOL enabled);
++/* HTML HostGetCodeForEval hook. Return 1 with an owned string in code_out,
++   0 to preserve ordinary non-string eval semantics, or -1 with an exception. */
++typedef int JSHostGetCodeForEval(JSContext *ctx, JSValueConst input,
++                                JSValue *code_out, void *opaque);
++void JS_SetHostGetCodeForEval(JSContext *ctx,
++                              JSHostGetCodeForEval *callback,
++                              void *opaque);
+ /* Stop future jobs/calls without freeing storage under retained functions. */
+ void JS_RetireContext(JSContext *ctx);
+ /* Keep global bindings on their real object, but use this receiver. */

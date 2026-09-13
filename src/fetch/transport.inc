@@ -207,13 +207,27 @@ static bool fetch_hop_configure_cookie(CURL *easy, FetchHopState *hop,
             memcpy(hop->cookie_header, request->cookie, length + 1);
         }
     }
-    if (getenv("TILEFINCH_TRACE_COOKIE") != NULL) {
-        fprintf(stderr,
-                "cookie-send url=%.240s bytes=%zu cf-clearance=%s\n",
-                hop->url == NULL ? "" : hop->url,
-                strlen(hop->cookie_header),
-                strstr(hop->cookie_header, "cf_clearance=") != NULL
-                    ? "yes" : "no");
+    const char *cookie_trace = getenv("TILEFINCH_TRACE_COOKIE");
+    if (cookie_trace != NULL) {
+        bool has_clearance = strstr(
+            hop->cookie_header, "cf_clearance=") != NULL;
+        if (strcmp(cookie_trace, "summary") == 0) {
+            fprintf(stderr,
+                    "cookie-send-summary initial=%s destination=%s "
+                    "client-hints=%s cf-clearance=%s\n",
+                    initial_hop ? "yes" : "no",
+                    request == NULL || request->sec_fetch_dest == NULL
+                        ? "" : request->sec_fetch_dest,
+                    request != NULL && request->send_client_hints
+                        ? "yes" : "no",
+                    has_clearance ? "yes" : "no");
+        } else {
+            fprintf(stderr,
+                    "cookie-send url=%.240s bytes=%zu cf-clearance=%s\n",
+                    hop->url == NULL ? "" : hop->url,
+                    strlen(hop->cookie_header),
+                    has_clearance ? "yes" : "no");
+        }
     }
     /* Never enable libcurl's cookie engine. The owned PSP transport compiles
        it out entirely, so even CURLOPT_COOKIE=NULL is an unsupported option.
@@ -494,8 +508,10 @@ static const FetchHighClientHint fetch_high_client_hints[] = {
         "\", \"Not.A/Brand\";v=\"99.0.0.0\""},
     {"Sec-CH-UA-Arch", "Sec-CH-UA-Arch: \"MIPS\""},
     {"Sec-CH-UA-Bitness", "Sec-CH-UA-Bitness: \"32\""},
+    {"Sec-CH-UA-Form-Factors", "Sec-CH-UA-Form-Factors: \"Mobile\""},
     {"Sec-CH-UA-Model", "Sec-CH-UA-Model: \"PSP-3000\""},
-    {"Sec-CH-UA-Platform-Version", "Sec-CH-UA-Platform-Version: \"6.61\""}
+    {"Sec-CH-UA-Platform-Version", "Sec-CH-UA-Platform-Version: \"6.61\""},
+    {"Sec-CH-UA-WoW64", "Sec-CH-UA-WoW64: ?0"}
 };
 
 static bool client_hint_token_requested(const char *serialized,

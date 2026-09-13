@@ -69,6 +69,70 @@ bool js_rt_bridge_node_slot_for_handle(const DomBridge *bridge,
     return true;
 }
 
+static bool bridge_node_is_shadow_root(const DomBridge *bridge,
+                                       const lxb_dom_node_t *node)
+{
+    if (bridge == NULL || node == NULL) return false;
+    for (size_t i = 0; i < bridge->shadow_root_count; i++) {
+        size_t slot = 0;
+        int64_t handle = (int64_t) bridge->shadow_root_handles[i];
+        if (js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)
+            && bridge->nodes[slot] == node) return true;
+    }
+    return false;
+}
+
+/* The carrier itself is not observable as part of the light tree, nor are
+   its descendants.  A ShadowRoot-scoped query begins at the carrier's first
+   child, so it remains able to inspect its own tree while nested shadow roots
+   are still isolated. */
+static bool bridge_query_node_hidden_by_shadow(
+    const DomBridge *bridge, const lxb_dom_node_t *node,
+    const lxb_dom_node_t *boundary,
+    const DomDocumentOrderTraversal *traversal, size_t *shadow_depth)
+{
+    if (shadow_depth == NULL || traversal == NULL) return false;
+    if (*shadow_depth != SIZE_MAX) {
+        if (traversal->current_depth > *shadow_depth) return true;
+        *shadow_depth = SIZE_MAX;
+    }
+    if (node != boundary && bridge_node_is_shadow_root(bridge, node)) {
+        *shadow_depth = traversal->current_depth;
+        return true;
+    }
+    return false;
+}
+
+JSValue js_dom_register_shadow_root(JSContext *context,
+                                    JSValueConst this_value,
+                                    int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    int64_t handle = 0;
+    size_t slot = 0;
+    if (bridge == NULL || argc < 1
+        || JS_ToInt64(context, &handle, argv[0]) < 0
+        || !js_rt_bridge_node_slot_for_handle(bridge, handle, &slot)
+        || bridge->nodes[slot]->type != LXB_DOM_NODE_TYPE_ELEMENT) {
+        return JS_FALSE;
+    }
+    size_t write = 0;
+    for (size_t read = 0; read < bridge->shadow_root_count; read++) {
+        size_t existing_slot = 0;
+        uint32_t existing = bridge->shadow_root_handles[read];
+        if (!js_rt_bridge_node_slot_for_handle(
+                bridge, (int64_t) existing, &existing_slot)) continue;
+        if (existing == (uint32_t) handle) return JS_TRUE;
+        bridge->shadow_root_handles[write++] = existing;
+    }
+    bridge->shadow_root_count = write;
+    if (write >= DOM_BRIDGE_SHADOW_ROOT_LIMIT) return JS_FALSE;
+    bridge->shadow_root_handles[write] = (uint32_t) handle;
+    bridge->shadow_root_count = write + 1u;
+    return JS_TRUE;
+}
+
 static int64_t bridge_invalidate_node_slot_impl(
     DomBridge *bridge, size_t slot, bool notify)
 {
@@ -1150,8 +1214,11 @@ static lxb_dom_node_t *selector_query(
     DomDocumentOrderTraversal traversal;
     if (!bridge_document_order_traversal_init(
             bridge, &traversal, node, boundary)) return NULL;
+    size_t shadow_depth = SIZE_MAX;
     for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
          at != NULL; at = dom_document_order_next(&traversal)) {
+        if (bridge_query_node_hidden_by_shadow(
+                bridge, at, boundary, &traversal, &shadow_depth)) continue;
         if (selector_list_matches(at, selector, length, boundary)
             && bridge_traversal_node_visible(
                 bridge, at, &traversal)) return at;
@@ -1795,9 +1862,12 @@ static void query_all_nodes(DomBridge *bridge, lxb_dom_node_t *node,
     DomDocumentOrderTraversal traversal;
     if (!bridge_document_order_traversal_init(
             bridge, &traversal, node, boundary)) return;
+    size_t shadow_depth = SIZE_MAX;
     for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
          at != NULL && *count < result_limit;
          at = dom_document_order_next(&traversal)) {
+        if (bridge_query_node_hidden_by_shadow(
+                bridge, at, boundary, &traversal, &shadow_depth)) continue;
         if (selector_list_matches(at, selector, length, boundary)
             && bridge_traversal_node_visible(
                 bridge, at, &traversal)) {
@@ -1854,9 +1924,12 @@ static void query_count_nodes(DomBridge *bridge, lxb_dom_node_t *node,
     DomDocumentOrderTraversal traversal;
     if (!bridge_document_order_traversal_init(
             bridge, &traversal, node, boundary)) return;
+    size_t shadow_depth = SIZE_MAX;
     for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
          at != NULL && *count < limit;
          at = dom_document_order_next(&traversal)) {
+        if (bridge_query_node_hidden_by_shadow(
+                bridge, at, boundary, &traversal, &shadow_depth)) continue;
         if (selector_list_matches(at, selector, length, boundary)
             && bridge_traversal_node_visible(
                 bridge, at, &traversal)) (*count)++;
@@ -1968,15 +2041,19 @@ JSValue js_rt_wrap_dom_handle(JSContext *context, JSValueConst handle)
         context, bridge->trusted_node_wrap, JS_UNDEFINED, 1, &handle);
 }
 
-static lxb_dom_node_t *find_element_id_exact(lxb_dom_node_t *node,
+static lxb_dom_node_t *find_element_id_exact(DomBridge *bridge,
+                                             lxb_dom_node_t *node,
                                              const char *identifier,
                                              size_t length)
 {
     DomDocumentOrderTraversal traversal = {
         .next = node, .boundary = node
     };
+    size_t shadow_depth = SIZE_MAX;
     for (lxb_dom_node_t *at = dom_document_order_next(&traversal);
          at != NULL; at = dom_document_order_next(&traversal)) {
+        if (bridge_query_node_hidden_by_shadow(
+                bridge, at, node, &traversal, &shadow_depth)) continue;
         size_t value_length = 0;
         const char *value = document_attribute(at, "id", &value_length);
         if (value != NULL && value_length == length
@@ -2004,7 +2081,7 @@ int argc, JSValueConst *argv)
     if (identifier == NULL) return JS_EXCEPTION;
     lxb_dom_node_t *root = lxb_dom_interface_node(bridge->document->html);
     lxb_dom_node_t *found = length <= 128
-        ? find_element_id_exact(root, identifier, length) : NULL;
+        ? find_element_id_exact(bridge, root, identifier, length) : NULL;
     if (found != NULL && !bridge_node_visible(bridge, found)) found = NULL;
     size_t section = 0;
     char tag_name[32] = "div";

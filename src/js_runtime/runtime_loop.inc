@@ -101,6 +101,48 @@ static bool runtime_pump_timers(ScriptRuntime *runtime,
     return ok;
 }
 
+bool script_runtime_scheduler_snapshot(
+    ScriptRuntime *runtime, ScriptSchedulerSnapshot *snapshot)
+{
+    if (runtime == NULL || snapshot == NULL) return false;
+    *snapshot = (ScriptSchedulerSnapshot) {0};
+    JSValue values = JS_UNDEFINED;
+    if (!runtime_call_host(runtime, SCRIPT_HOST_SCHEDULER_SNAPSHOT,
+                           0, NULL, &values)
+        || !JS_IsArray(runtime->context, values)) {
+        JS_FreeValue(runtime->context, values);
+        return false;
+    }
+    double numeric[11] = {0};
+    bool ok = true;
+    for (uint32_t i = 0; i < 11; i++) {
+        JSValue value = JS_GetPropertyUint32(runtime->context, values, i);
+        if (JS_ToFloat64(runtime->context, &numeric[i], value) < 0) ok = false;
+        JS_FreeValue(runtime->context, value);
+        if (!ok) break;
+    }
+    JS_FreeValue(runtime->context, values);
+    if (!ok || numeric[1] < 0 || numeric[1] > 1
+        || numeric[2] < 0 || numeric[3] < 0) return false;
+    snapshot->now_ms = numeric[0];
+    snapshot->sampled_clock = numeric[1] != 0;
+    snapshot->timers = (size_t) numeric[2];
+    snapshot->due_timers = (size_t) numeric[3];
+    snapshot->oldest_overdue_ms = numeric[4];
+    snapshot->nearest_future_ms = numeric[5];
+    snapshot->last_callback_ms = numeric[6];
+    snapshot->active_cancel_attempts = (size_t) numeric[7];
+    snapshot->active_cancel_hits = (size_t) numeric[8];
+    snapshot->timeout_callbacks = (size_t) numeric[9];
+    snapshot->interval_callbacks = (size_t) numeric[10];
+    snapshot->checkpoint_continuations =
+        runtime->checkpoint_continuation_count;
+    snapshot->quickjs_jobs_pending = JS_IsJobPending(runtime->runtime);
+    snapshot->classic_script_continuation =
+        js_rt_dynamic_classic_continuation_pending(runtime);
+    return true;
+}
+
 /* Every check costs a full collection, so space them out; the window only
    needs to return once, shortly after the hydration transient dies. */
 #define BOOT_WINDOW_CHECK_INTERVAL 256u
@@ -444,7 +486,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
     }
     size_t remaining = callback_budget;
     if (ok && !classic_continuation
-        && !JS_IsJobPending(runtime->runtime)
+        && !js_rt_runtime_checkpoint_pending(runtime)
         && runtime->page_visibility_queue_count != 0
         && remaining != 0) {
         ok = runtime_dispatch_page_visibility_edge(runtime);
@@ -452,7 +494,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
         if (ok) ok = js_rt_runtime_run_jobs(runtime);
     }
     while (ok && !classic_continuation
-           && !JS_IsJobPending(runtime->runtime) && remaining != 0
+           && !js_rt_runtime_checkpoint_pending(runtime) && remaining != 0
            && runtime_task_slice_available(runtime, task_slice_started_ns,
                                            remaining, callback_budget)) {
         bool dispatched = false;
@@ -466,7 +508,7 @@ bool script_runtime_advance(ScriptRuntime *runtime, unsigned elapsed_ms,
            && runtime_task_slice_available(runtime, task_slice_started_ns,
                                            remaining, callback_budget)
            && (classic_continuation
-               || !JS_IsJobPending(runtime->runtime))) {
+               || !js_rt_runtime_checkpoint_pending(runtime))) {
         size_t network_tasks = 0;
         phase_started = js_rt_monotonic_time_ns();
         ok = runtime_pump_network(runtime, 1, 0, &network_tasks);

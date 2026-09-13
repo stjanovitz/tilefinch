@@ -36,10 +36,11 @@
 #include "media_backend_psp_policy.h"
 #endif
 
-/* Shipping builds do not open or rotate the full validation log. Keep one
-   bounded, overwrite-only failure snapshot instead: no boot I/O and no hot
-   path writes, but a network/page failure on hardware remains actionable. */
+/* Shipping builds do not open or rotate the full validation log. Ordinary
+   failure persistence is also opt-in; fatal startup failures bypass the
+   setting once because the UI may never become usable. */
 static const TilefinchInstallPaths *psp_failure_report_paths;
+static bool psp_failure_report_persistence_enabled;
 
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
 static const PspDisplayBackend *psp_validation_display_inner;
@@ -168,11 +169,13 @@ typedef struct {
 static bool psp_write_failure_report_data(
     const char *stage, const char *detail, const char *url,
     long http_status, int native_result,
-    const PspFailureReportData *diagnostics)
+    const PspFailureReportData *diagnostics, bool force_persistence)
 {
     PspFailureReportData absent = {0};
     if (diagnostics == NULL) diagnostics = &absent;
     if (psp_failure_report_paths == NULL) return false;
+    if (!force_persistence && !psp_failure_report_persistence_enabled)
+        return false;
     char path[TILEFINCH_INSTALL_PATH_LIMIT];
     char temporary[TILEFINCH_INSTALL_PATH_LIMIT];
     if (!tilefinch_install_data_path(
@@ -307,7 +310,28 @@ bool psp_write_failure_report(
     long http_status, int native_result)
 {
     return psp_write_failure_report_data(
-        stage, detail, url, http_status, native_result, NULL);
+        stage, detail, url, http_status, native_result, NULL, false);
+}
+
+bool psp_failure_report_configure(bool enabled, bool clear_existing)
+{
+    psp_failure_report_persistence_enabled = enabled;
+    if (enabled || !clear_existing || psp_failure_report_paths == NULL)
+        return true;
+    static const char *const names[] = {
+        "tilefinch-last-error.txt", "tilefinch-last-error.tmp"
+    };
+    bool okay = true;
+    for (size_t at = 0; at < sizeof(names) / sizeof(names[0]); at++) {
+        char path[TILEFINCH_INSTALL_PATH_LIMIT];
+        if (!tilefinch_install_data_path(
+                psp_failure_report_paths, names[at], path, sizeof(path))) {
+            okay = false;
+            continue;
+        }
+        if (remove(path) != 0 && errno != ENOENT) okay = false;
+    }
+    return okay;
 }
 
 bool psp_write_navigation_failure_report(
@@ -344,7 +368,7 @@ bool psp_write_navigation_failure_report(
              navigation->last_tls_peer_issuer);
     return psp_write_failure_report_data(
         stage, detail, url, navigation->last_http_status, 0,
-        &diagnostics);
+        &diagnostics, false);
 }
 
 #ifdef TILEFINCH_PSP_LIVE_NETWORK
@@ -381,7 +405,7 @@ bool psp_write_network_failure_report(const PspNetwork *network)
     return psp_write_failure_report_data(
         "network-association",
         psp_network_status_name(network->failure_phase), NULL, 0,
-        network->native_result, &diagnostics);
+        network->native_result, &diagnostics, false);
 }
 #endif
 
@@ -4904,9 +4928,6 @@ static TILEFINCH_HOT_BOUNDARY PspInteractiveResult psp_app_run_interactive(
                     process->presentation.ui.total_requests_blocked =
                         total_blocked > UINT32_MAX
                         ? UINT32_MAX : (uint32_t) total_blocked;
-                    if (page_blocked != 0)
-                        psp_profile_store_mark_dirty(
-                            &browser->profile_store, frame.ui_sample_us);
                     psp_apply_reader_after_navigation(&app, &frame);
                     bool tab_restored = true;
                     if (interactive->tab_transition.pending) {
@@ -6526,7 +6547,8 @@ static TILEFINCH_COLD_PATH void psp_report_tls_assets(
 static TILEFINCH_COLD_PATH void psp_report_startup_failure(
     const char *screen, const char *detail, const char *url)
 {
-    (void) psp_write_failure_report("startup", detail, url, 0, 0);
+    (void) psp_write_failure_report_data(
+        "startup", detail, url, 0, 0, NULL, true);
     psp_present_boot_surface(PSP_UI_STARTUP_SPLASH, screen, 0);
     printf("tilefinch-startup-failure: screen=%s detail=%s\n",
            screen, detail);
@@ -7264,6 +7286,8 @@ int main(int argc, char *argv[])
     if (browser_profile_load_without_content_blocker_sites(
             browser.profile, process.storage.profile))
         printf("tilefinch-profile: loaded\n");
+    (void) psp_failure_report_configure(
+        browser_profile_save_diagnostic_reports(browser.profile), false);
 #ifdef TILEFINCH_PSP_VALIDATION_LOG
     /* Automated device runs must never enter Sony's modal OSK: it outlives a
        stopped test process on some firmware and poisons the next PSPLink
@@ -7560,6 +7584,8 @@ int main(int argc, char *argv[])
         browser_profile_persist_local_storage(browser.profile);
     process.presentation.ui.tls_session_persistence =
         tls_session_persistence;
+    process.presentation.ui.save_diagnostic_reports =
+        browser_profile_save_diagnostic_reports(browser.profile);
     process.presentation.ui.network_profile =
         (uint8_t) process.config.network_profile;
     process.presentation.ui.javascript_enabled = javascript_enabled ? 1u : 0u;

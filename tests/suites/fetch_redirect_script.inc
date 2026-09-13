@@ -44,8 +44,8 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
         "blobXhr.open('GET','/binary',false);blobXhr.responseType='blob';"
         "blobXhr.send();const checks=[!own(raw,'body'),"
         "raw.bodyBytes instanceof ArrayBuffer,raw.bodyLength===5,"
-        "bytes.join(',')==='0,65,195,169,66',own(textRaw,'body'),"
-        "!own(textRaw,'bodyBytes'),textRaw.bodyLength===textRaw.body.length,"
+        "bytes.join(',')==='0,65,195,169,66',!own(textRaw,'body'),"
+        "own(textRaw,'bodyBytes'),textRaw.bodyLength===textRaw.bodyBytes.byteLength,"
         "textXhr.responseText.length===4,textXhr.responseText.charCodeAt(0)===0,"
         "textXhr.responseText.charCodeAt(2)===233,textXhr.response==="
         "textXhr.responseText,arrayBytes.join(',')==='0,65,195,169,66',"
@@ -64,21 +64,23 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
 
     static const char asynchronous_probe[] =
         "(()=>{const checks=[];globalThis.pocSummary='pending';"
-        "fetch('/binary').then(response=>{checks.push(response._body===null,"
-        "response._bytes instanceof Uint8Array&&!response.bodyUsed);"
+        "fetch('/binary').then(response=>{checks.push(response.body!==null,"
+        "!response.bodyUsed);response._bytes=new Uint8Array([88]);"
+        "response._body='poison';"
         "const clone=response.clone();return response.arrayBuffer().then("
         "buffer=>{checks.push(new Uint8Array(buffer).join(',')==="
-        "'0,65,195,169,66',response.bodyUsed,response._bytes===null&&"
-        "response._body===null);return clone.text();}).then(text=>checks.push("
+        "'0,65,195,169,66',response.bodyUsed);return clone.text();}).then("
+        "text=>checks.push("
         "text.length===4,text.charCodeAt(0)===0,text.charCodeAt(2)===233,"
-        "clone.bodyUsed,clone._bytes===null,clone._body===null));}).then("
+        "clone.bodyUsed));}).then("
         "()=>fetch('/binary-json'))"
-        ".then(response=>{checks.push(response._body===null);return "
+        ".then(response=>{response._body='poison';return "
         "response.json();}).then(value=>{checks.push(value.ok===true&&"
-        "value.n===7);const response=new Response('A\\u00e9B');return "
+        "value.n===7);const response=new Response('A\\u00e9B');"
+        "response._bytes=new Uint8Array([88]);return "
         "response.arrayBuffer().then(buffer=>checks.push("
         "new Uint8Array(buffer).join(',')==='65,195,169,66',"
-        "response.bodyUsed,response._bytes===null&&response._body===null));})"
+        "response.bodyUsed));})"
         ".then(()=>{globalThis.pocSummary=checks.every(Boolean)?"
         "'binary-fetch-ok':'binary-fetch-failed:'+checks.join(',');})"
         ".catch(error=>globalThis.pocSummary='binary-fetch-error:'+error);})()";
@@ -97,6 +99,52 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
     }
     CHECK(binary_valid);
 
+    static const char policy_probe[] =
+        "(()=>{globalThis.pocSummary='pending';const checks=[];"
+        "Promise.all(["
+        "fetch('/same').then(async r=>{checks.push(r.redirected===true,"
+        "r.type==='basic',r.url.includes('/final'),(await r.text())."
+        "startsWith('method=GET;'))}),"
+        "fetch('/same',{redirect:'error'}).then(()=>checks.push(false),"
+        "e=>checks.push(e instanceof TypeError)),"
+        "fetch('/same',{redirect:'manual'}).then(async r=>{checks.push("
+        "r.status===0,r.type==='opaqueredirect',r.redirected===false,"
+        "r.url==='',r.headers.keys().next().done,r.body===null,"
+        "(await r.text())==='')}),"
+        "fetch('/binary',{integrity:"
+        "'sha256-SQ+rxfSdXaBALAGtKwDHAq792hcFStFDksl71i2H2+Y='})"
+        ".then(r=>r.arrayBuffer()).then(b=>checks.push("
+        "new Uint8Array(b).join(',')==='0,65,195,169,66')),"
+        "fetch('/binary',{integrity:'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAA='}).then(()=>checks.push(false),e=>checks.push("
+        "e instanceof TypeError)),"
+        "fetch('/final',{cache:'only-if-cached',mode:'same-origin'}).then("
+        "r=>checks.push(r.status===504,r.type==='basic',r.body===null)),"
+        "fetch('/final?cache=no-store',{cache:'no-store'}).then(r=>r.text())."
+        "then(t=>checks.push(t.includes('cache-control=no-store'))),"
+        "fetch('/final?cache=no-cache',{cache:'no-cache'}).then(r=>r.text())."
+        "then(t=>checks.push(t.includes('cache-control=no-cache'))),"
+        "fetch('/final?cache=reload',{cache:'reload'}).then(r=>r.text())."
+        "then(t=>checks.push(t.includes('cache-control=no-cache')&&"
+        "t.includes('pragma=no-cache'))),"
+        "(()=>{const stream=new ReadableStream({start(c){c.enqueue("
+        "new Uint8Array([79,75]));c.close()}}),response=new Response(stream);"
+        "return response.text().then(text=>checks.push(text==='OK',"
+        "response.bodyUsed,response.body.locked))})()"
+        "]).then(()=>{globalThis.pocSummary=checks.every(Boolean)?"
+        "'fetch-policy-ok':'fetch-policy-failed:'+checks.join(',')})"
+        ".catch(e=>globalThis.pocSummary='fetch-policy-error:'+e)})()";
+    bool policy_evaluated = script_runtime_evaluate_diagnostic(
+        runtime, policy_probe, "<fetch-policy-probe>", &result);
+    bool policy_pumped = policy_evaluated
+        && pump_script_network(runtime, &result);
+    if (!policy_pumped || strcmp(result.summary, "fetch-policy-ok") != 0) {
+        fprintf(stderr, "fetch-policy evaluated=%d pumped=%d summary=\"%s\" "
+                        "error=\"%s\"\n",
+                policy_evaluated, policy_pumped, result.summary, result.error);
+    }
+    CHECK(policy_pumped && strcmp(result.summary, "fetch-policy-ok") == 0);
+
     static const char local_blob_probe[] =
         "(()=>{globalThis.pocSummary='pending';const stats="
         "__tilefinchNetworkQueueStats,before=[stats.admitted,stats.launched,"
@@ -108,6 +156,12 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
         "fetchURL,response.headers.get('content-type')===type,response.body!=="
         "null);return response.arrayBuffer()}).then(buffer=>checks.push("
         "new Uint8Array(buffer).join(',')==='0,65,255'));"
+        "const integrityJob=fetch(fetchURL,{integrity:"
+        "'sha256-+uEshcsbaspQcMiDfCtyBmXzWvq+Lc1QTWyXDeiA2DQ='})"
+        ".then(response=>response.arrayBuffer()).then(buffer=>checks.push("
+        "new Uint8Array(buffer).join(',')==='0,65,255')),mismatchJob="
+        "fetch(fetchURL,{integrity:'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAA='}).then(()=>false,error=>error instanceof TypeError);"
         "URL.revokeObjectURL(fetchURL);"
         "const order=[],xhrBlob=new Blob(['local-xhr'],{type:'text/plain'}),"
         "xhrURL=URL.createObjectURL(xhrBlob),xhrJob=new Promise(resolve=>{"
@@ -126,10 +180,12 @@ static bool test_javascript_binary_responses(Budget *budget, unsigned port)
         "resolve(false);xhr.open('GET',stressURL);xhr.send()}));"
         "URL.revokeObjectURL(stressURL);const revokedJob=fetch(stressURL)"
         ".then(()=>false,error=>error instanceof TypeError);"
-        "Promise.all([fetchJob,xhrJob,revokedJob,...stress]).then(values=>{"
-        "checks.push(values[2]===true,values.slice(3).every(Boolean),"
+        "Promise.all([fetchJob,integrityJob,mismatchJob,xhrJob,revokedJob,"
+        "...stress]).then(values=>{"
+        "checks.push(values[2]===true,values[4]===true,"
+        "values.slice(5).every(Boolean),"
         "stats.admitted===before[0],stats.launched===before[1],"
-        "stats.currentCount===before[2],stats.localBlobReads-before[3]===10,"
+        "stats.currentCount===before[2],stats.localBlobReads-before[3]===12,"
         "stats.localBlobFailures-before[4]===1);globalThis.pocSummary="
         "checks.every(Boolean)?'local-blob-ok':'local-blob-failed:'+"
         "checks.join(',')+':order='+order.join(',')}).catch(error=>"
@@ -563,10 +619,18 @@ static bool test_javascript_cors(Budget *budget, unsigned document_port,
         ".then(response=>response.text())"
         ".then(text=>globalThis.pocSummary='preflight:'+text)"
         ".catch(error=>globalThis.pocSummary='blocked:'+error)", target);
-    CHECK(written > 0 && (size_t) written < sizeof(source)
-          && script_runtime_evaluate_diagnostic(
-                 runtime, source, "<cors-preflight>", &result)
-          && pump_script_network(runtime, &result)
+    bool preflight_evaluated = written > 0 && (size_t) written < sizeof(source)
+        && script_runtime_evaluate_diagnostic(
+               runtime, source, "<cors-preflight>", &result)
+        && pump_script_network(runtime, &result);
+    if (!preflight_evaluated
+        || strstr(result.summary, "preflight:cors-method=PUT") == NULL
+        || strstr(result.summary, "x-test=yes") == NULL
+        || strstr(result.summary, "body={\"ok\":1}") == NULL) {
+        fprintf(stderr, "cors preflight summary=\"%s\" error=\"%s\"\n",
+                result.summary, result.error);
+    }
+    CHECK(preflight_evaluated
           && strstr(result.summary, "preflight:cors-method=PUT") != NULL
           && strstr(result.summary, "x-test=yes") != NULL
           && strstr(result.summary, "body={\"ok\":1}") != NULL);

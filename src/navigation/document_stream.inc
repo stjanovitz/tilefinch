@@ -1581,11 +1581,20 @@ static bool navigation_stream_prepare_runtime(NavigationDocumentStream *stream,
         session, &stream->parser->document,
         stream->document_url[0] == '\0' ? "about:blank"
                                          : stream->document_url,
-        stream->referrer_policy, true, &stream->viewport,
+        stream->document_referrer, stream->started_us,
+        stream->referrer_policy, true,
+        &stream->viewport,
         SCRIPT_DOCUMENT_SCOPE_TOP_LEVEL, false, stream->fetch_domain,
         NULL, &stream->canvas_images, stream->fonts,
         &stream->script_result);
     if (stream->runtime != NULL) {
+        if (stream->response_headers_elapsed_us != 0) {
+            const ScriptNavigationTiming navigation_timing = {
+                .response_start_us = stream->response_headers_elapsed_us
+            };
+            (void) script_runtime_record_navigation_timing(
+                stream->runtime, &navigation_timing);
+        }
         script_runtime_set_synchronous_layout_callback(
             stream->runtime, navigation_stream_flush_cssom_layout, stream);
     }

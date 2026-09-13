@@ -6,7 +6,7 @@ replace any log file, and it creates no new file on the Memory Stick.
 
 ## User flow
 
-Open **Options → System → Diagnostic QR**, press **X** to build the report,
+Open **Help & diagnostics → Diagnostic QR**, press **X** to build the report,
 then photograph every page. Use D-pad Left/Right or L/R to move between
 pages, and D-pad Up/Down to move between report parts. Photograph every page
 of every part. The report ID, part count, and page count stay visible so
@@ -14,7 +14,10 @@ photographs from different reports are easy to separate. Press Circle when
 done; the current compressed part and QR working memory are released
 immediately.
 
-The release build includes `data/tilefinch-last-error.txt` when it exists. A
+The release build includes `data/tilefinch-last-error.txt` when it exists.
+Ordinary failures create or replace that file only when **Settings → Device &
+storage → Save error reports** is On; the default is Off. A fatal startup
+failure still writes one report because this screen may not become reachable. A
 validation build additionally flushes its buffered validation log once, in
 response to the explicit Build action, and can include the current and prior
 validation/crash logs. Missing files are skipped. The last-error log comes

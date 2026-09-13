@@ -172,6 +172,12 @@ const char *psp_input_script_setting_name(PspUiSettingId setting)
         case PSP_UI_SETTING_UPDATE_CHANNEL: return "update-channel";
         case PSP_UI_SETTING_GAMEPAD_FACE_MAPPING:
             return "gamepad-face-mapping";
+        case PSP_UI_SETTING_SAVE_PLAYBACK_POSITIONS:
+            return "save-playback-positions";
+        case PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS:
+            return "clear-playback-positions";
+        case PSP_UI_SETTING_SAVE_DIAGNOSTIC_REPORTS:
+            return "save-diagnostic-reports";
     }
     return "unknown";
 }

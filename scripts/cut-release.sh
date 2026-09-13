@@ -116,11 +116,15 @@ step "Checking environment"
 [ -n "${PSPDEV:-}" ] || fail "export PSPDEV=/path/to/pspdev first"
 [ -f "$PSPDEV/psp/share/pspdev.cmake" ] \
     || fail "no PSP toolchain file at \$PSPDEV/psp/share/pspdev.cmake"
+PATH="$PSPDEV/bin:$PATH"
+export PATH
 command -v cmake >/dev/null 2>&1 || fail "cmake not found"
 command -v ctest >/dev/null 2>&1 || fail "ctest not found"
 command -v git >/dev/null 2>&1 || fail "git not found"
 command -v python3 >/dev/null 2>&1 \
     || fail "python3 not found (needed for the TFUP packer)"
+command -v psp-build-exports >/dev/null 2>&1 \
+    || fail "psp-build-exports not found under \$PSPDEV/bin"
 decoder_abi=$(sed -n \
     's/^#define TILEFINCH_SWDEC_COMPONENT_ABI_VERSION \([0-9][0-9]*\)u$/\1/p' \
     "$root/include/tilefinch/swdec_component.h")
@@ -136,6 +140,8 @@ dirty=$(git -C "$root" status --porcelain)
     fail "the tree is not clean; commit or stash everything first"
 }
 commit=$(git -C "$root" rev-parse HEAD)
+python3 "$root/tests/test_public_tree_hygiene.py" "$root" \
+    || fail "the public-tree hygiene gate failed"
 
 grep -Fq "project(psp_browser_tilefinch VERSION $version " \
     "$root/CMakeLists.txt" \

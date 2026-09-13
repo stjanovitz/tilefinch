@@ -182,6 +182,7 @@ int main(void)
           && browser_profile_live_cache_kib(profile) == 512
           && !browser_profile_persist_local_storage(profile)
           && browser_profile_tls_session_persistence(profile)
+          && !browser_profile_save_diagnostic_reports(profile)
           && browser_profile_javascript_enabled(profile)
           && browser_profile_site_javascript_enabled(
                  profile, "https://problem.example/page")
@@ -270,6 +271,7 @@ int main(void)
     browser_profile_set_live_cache_kib(profile, 4096);
     browser_profile_set_persist_local_storage(profile, true);
     browser_profile_set_tls_session_persistence(profile, false);
+    browser_profile_set_save_diagnostic_reports(profile, true);
     CHECK(browser_profile_set_site_javascript_enabled(
               profile, "https://problem.example/page", false)
           && !browser_profile_site_javascript_enabled(
@@ -332,6 +334,7 @@ int main(void)
         profile, CONTENT_BLOCKER_CUSTOM);
     browser_profile_set_content_blocker_cosmetic_hiding(profile, false);
     browser_profile_record_content_blocked(profile, 37);
+    CHECK(browser_profile_content_blocker_total_blocked(profile) == 37);
     browser_profile_set_reader_font(profile, BROWSER_READER_FONT_SERIF);
     browser_profile_set_update_check_enabled(profile, false);
     browser_profile_set_update_check_last_unix(
@@ -498,6 +501,8 @@ int main(void)
     snprintf(path, sizeof(path), "/tmp/tilefinch-profile-%ld.cfg",
              (long) getpid());
     CHECK(browser_profile_save(profile, path));
+    CHECK(!file_contains(path, "STATS\t")
+          && file_contains(path, "DIAG\t1\n"));
     BrowserProfile *loaded = browser_profile_create(&budget);
     CHECK(loaded != NULL && browser_profile_load(loaded, path));
     CHECK(browser_profile_save_playback_positions(loaded));
@@ -514,6 +519,7 @@ int main(void)
           && browser_profile_live_cache_kib(loaded) == 4096
           && browser_profile_persist_local_storage(loaded)
           && !browser_profile_tls_session_persistence(loaded)
+          && browser_profile_save_diagnostic_reports(loaded)
           && !browser_profile_javascript_enabled(loaded)
           && !browser_profile_site_javascript_enabled(
                  loaded, "https://problem.example/reloaded")
@@ -557,7 +563,7 @@ int main(void)
           && browser_profile_content_blocker_mode(loaded)
                  == CONTENT_BLOCKER_CUSTOM
           && !browser_profile_content_blocker_cosmetic_hiding(loaded)
-          && browser_profile_content_blocker_total_blocked(loaded) == 37
+          && browser_profile_content_blocker_total_blocked(loaded) == 0
           && browser_profile_reader_font(loaded)
                  == BROWSER_READER_FONT_SERIF
           && !browser_profile_update_check_enabled(loaded)
@@ -655,6 +661,7 @@ int main(void)
           && browser_profile_live_cache_kib(legacy_loaded) == 512
           && !browser_profile_persist_local_storage(legacy_loaded)
           && browser_profile_tls_session_persistence(legacy_loaded)
+          && !browser_profile_save_diagnostic_reports(legacy_loaded)
           && browser_profile_javascript_enabled(legacy_loaded)
           && browser_profile_site_javascript_enabled(
                  legacy_loaded, "https://problem.example/")
@@ -725,6 +732,7 @@ int main(void)
           && !file_contains(path, "R\tTFTEST00001")
           && file_contains(path, "RESUME\t0\n")
           && !file_contains(path, "MIXED\t")
+          && !file_contains(path, "STATS\t")
           && file_contains(path, "TPC\tcookies.example"));
     browser_profile_destroy(legacy_loaded);
 

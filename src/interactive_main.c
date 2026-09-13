@@ -244,6 +244,38 @@ static bool interactive_seed_extracted_recovery(BrowserEngine *engine)
     return reader != BROWSER_BLANK_READER_RECOVERY_NONE;
 }
 
+static void print_runtime_liveness(const char *realm, size_t slot,
+                                   uint64_t generation,
+                                   ScriptRuntime *runtime,
+                                   const ScriptResult *result,
+                                   size_t tick, bool loaded, bool retired)
+{
+    if (runtime == NULL || result == NULL) return;
+    ScriptSchedulerSnapshot snapshot;
+    if (!script_runtime_scheduler_snapshot(runtime, &snapshot)) return;
+    double callback_age = snapshot.last_callback_ms < 0
+        ? -1 : snapshot.now_ms - snapshot.last_callback_ms;
+    printf("runtime-liveness tick=%zu realm=%s slot=%zu generation=%llu "
+           "clock=%s now-ms=%.1f last-callback-age-ms=%.1f timers=%zu "
+           "due=%zu oldest-overdue-ms=%.1f nearest-ms=%.1f pending=%zu "
+           "network=%zu workers=%zu checkpoints=%d/%zu/%d "
+           "active-cancel=%zu/%zu "
+           "callbacks=%zu/%zu loaded=%d retired=%d\n",
+           tick, realm == NULL ? "unknown" : realm, slot,
+           (unsigned long long) generation,
+           snapshot.sampled_clock ? "sampled" : "elapsed",
+           snapshot.now_ms, callback_age, snapshot.timers,
+           snapshot.due_timers, snapshot.oldest_overdue_ms,
+           snapshot.nearest_future_ms, result->pending_tasks,
+           result->root_pending_network, result->root_workers,
+           snapshot.quickjs_jobs_pending ? 1 : 0,
+           snapshot.checkpoint_continuations,
+           snapshot.classic_script_continuation ? 1 : 0,
+           snapshot.active_cancel_hits, snapshot.active_cancel_attempts,
+           snapshot.timeout_callbacks, snapshot.interval_callbacks,
+           loaded ? 1 : 0, retired ? 1 : 0);
+}
+
 int main(int argc, char **argv)
 {
     const char *fixture = NULL;
@@ -926,6 +958,7 @@ int main(int argc, char **argv)
     char trace_error[256] = {0};
     script_runtime_configure_deterministic_replay(
         deterministic_replay_requested, deterministic_replay_seed);
+    script_runtime_configure_wall_clock_timers(pace_real_time);
     if ((capture_http != NULL
          && !fetch_trace_capture_begin(capture_http, trace_error,
                                        sizeof(trace_error)))
@@ -1381,7 +1414,6 @@ int main(int argc, char **argv)
             "globalThis.document=__tilefinchTraceObject(document,'document');"
             "globalThis.navigator=__tilefinchTraceObject(navigator,'navigator');"
             "globalThis.performance=__tilefinchTraceObject(performance,'performance');"
-            "globalThis.crypto=__tilefinchTraceObject(crypto,'crypto');"
             "globalThis.location=__tilefinchTraceObject(location,'location');"
             "for(const name of ['XMLHttpRequest','PerformanceObserver','Blob','URL'])if(typeof globalThis[name]==='function')globalThis[name]=__tilefinchTraceObject(globalThis[name],name);"
             "document.location=location;})();";
@@ -1487,6 +1519,21 @@ int main(int argc, char **argv)
         }
         if (!navigation_run_background_resources(&navigation)) {
             goto cleanup;
+        }
+        if (pace_real_time && tick_ms != 0
+            && (i + 1u) % ((5000u + tick_ms - 1u) / tick_ms) == 0u) {
+            print_runtime_liveness(
+                "top", 0, navigation.generation,
+                navigation.page.runtime, &navigation.page.script_result,
+                i + 1u, navigation.page.loaded, false);
+            for (size_t frame_at = 0;
+                 frame_at < navigation.page.frame_count; frame_at++) {
+                NavigationFrame *frame = &navigation.page.frames[frame_at];
+                print_runtime_liveness(
+                    "child", frame_at, frame->lifecycle_generation,
+                    frame->runtime, &frame->script_result, i + 1u,
+                    frame->loaded, frame->retired);
+            }
         }
         /* WPT reftests are captured from the settled result, including local
            web fonts.  The shared transport worker waits in real time while
@@ -2893,6 +2940,14 @@ int main(int argc, char **argv)
     printf("javascript-callback-errors uncaught=%zu last=\"%s\"\n",
            navigation.page.script_result.uncaught_callback_errors,
            navigation.page.script_result.last_uncaught_callback_error);
+    if (navigation.page.script_result.last_uncaught_callback_task[0] != '\0') {
+        printf("javascript-callback-task=\"%s\"\n",
+               navigation.page.script_result.last_uncaught_callback_task);
+    }
+    if (navigation.last_script_error_context[0] != '\0') {
+        printf("javascript-callback-source-context=\"%s\"\n",
+               navigation.last_script_error_context);
+    }
     printf("javascript-watchdog polls=%zu elapsed-ms=%lu interrupted=%s\n",
            navigation.page.script_result.watchdog_polls,
            navigation.page.script_result.watchdog_elapsed_ms,
@@ -2973,6 +3028,40 @@ int main(int argc, char **argv)
              .lazy_webpack_compiled_factory_evictions,
            navigation.page.script_result
              .lazy_webpack_factory_compile_failures);
+    printf("javascript-worker-progress active=%zu starts=%zu/%zu/%zu "
+           "constructor-options=%zu "
+           "timers=%zu/%zu inbound=%zu/%zu/%zu outbound=%zu/%zu/%zu "
+           "outbound-drop-reason=%zu/%zu transfer-args=%zu/%zu "
+           "terminations=%zu last=%zu/%zu/%.1fms\n",
+           navigation.page.script_result.root_workers,
+           navigation.page.script_result.root_worker_starts,
+           navigation.page.script_result.root_worker_start_completions,
+           navigation.page.script_result.root_worker_start_failures,
+           navigation.page.script_result
+             .root_worker_constructor_option_arguments,
+           navigation.page.script_result.root_worker_timer_callbacks,
+           navigation.page.script_result.root_worker_pending_timers,
+           navigation.page.script_result.root_worker_inbound_queued,
+           navigation.page.script_result.root_worker_inbound_delivered,
+           navigation.page.script_result.root_worker_inbound_dropped,
+           navigation.page.script_result.root_worker_outbound_queued,
+           navigation.page.script_result.root_worker_outbound_delivered,
+           navigation.page.script_result.root_worker_outbound_dropped,
+           navigation.page.script_result.root_worker_outbound_dropped_inactive,
+           navigation.page.script_result.root_worker_outbound_dropped_queue,
+           navigation.page.script_result
+             .root_worker_inbound_transfer_arguments,
+           navigation.page.script_result
+             .root_worker_outbound_transfer_arguments,
+           navigation.page.script_result.root_worker_terminations,
+           navigation.page.script_result.root_worker_last_id,
+           navigation.page.script_result.root_worker_last_termination_reason,
+           navigation.page.script_result.root_worker_last_task_ms);
+    printf("javascript-crypto random=%zu/%zu digest=%zu/%zu\n",
+           navigation.page.script_result.crypto_random_calls,
+           navigation.page.script_result.crypto_random_bytes,
+           navigation.page.script_result.crypto_digest_calls,
+           navigation.page.script_result.crypto_digest_bytes);
     const char *body_text = document_body_text(&navigation.page.document);
     if (body_text == NULL) body_text = "";
     size_t body_text_length = navigation.page.document.body_text == NULL
@@ -3086,12 +3175,15 @@ int main(int argc, char **argv)
            script_metrics.watchdog_classification_miss_flags);
     printf("frames discovered=%zu loaded=%zu failed=%zu detached=%zu "
            "messages-posted=%zu messages-delivered=%zu dropped=%zu "
+           "deferred=%zu max-deferred-run=%zu "
            "to-parent=%zu to-child=%zu last-event=\"%s\"\n",
            navigation.frames_discovered, navigation.frames_loaded,
            navigation.frames_failed, navigation.frames_detached,
            navigation.frame_messages_posted,
            navigation.frame_messages_delivered,
            navigation.frame_messages_dropped,
+           navigation.frame_messages_deferred,
+           navigation.frame_message_max_deferred_run,
            navigation.frame_messages_to_parent,
            navigation.frame_messages_to_child,
            navigation.last_frame_message_event);
@@ -3101,6 +3193,32 @@ int main(int argc, char **argv)
            (unsigned long long) navigation.last_frame_message_sequence,
            navigation.last_frame_message_source,
            navigation.last_frame_message_target);
+    printf("frame-message-cause event=\"%s\" task=\"%s\" task-sequence=%llu "
+           "enqueued-us=%llu source-generation=%llu target-generation=%llu "
+           "pending=%zu roots=%zu/%zu/%zu async=%zu/%zu/%zu/%zu "
+           "xhr=%zu promises=%zu callback-errors=%zu watchdog=%zu "
+           "interrupted=%s\n",
+           navigation.last_frame_message_event,
+           navigation.last_frame_message_task_kind,
+           (unsigned long long) navigation.last_frame_message_task_sequence,
+           (unsigned long long) navigation.last_frame_message_enqueued_us,
+           (unsigned long long)
+               navigation.last_frame_message_source_generation,
+           (unsigned long long)
+               navigation.last_frame_message_target_generation,
+           navigation.last_frame_message_pending_tasks,
+           navigation.last_frame_message_root_timers,
+           navigation.last_frame_message_root_network,
+           navigation.last_frame_message_root_workers,
+           navigation.last_frame_message_async_completed,
+           navigation.last_frame_message_async_rejected,
+           navigation.last_frame_message_async_cancelled,
+           navigation.last_frame_message_async_timed_out,
+           navigation.last_frame_message_xhr_responses,
+           navigation.last_frame_message_promise_rejections,
+           navigation.last_frame_message_callback_errors,
+           navigation.last_frame_message_watchdog_polls,
+           navigation.last_frame_message_interrupted ? "yes" : "no");
     printf("navigation-degradation optional-work-sheds=%zu "
            "zero-body-retries=%zu frame-message-soft-failures=%zu\n",
            navigation.performance.optional_work_sheds,
@@ -3142,6 +3260,38 @@ int main(int argc, char **argv)
                child->script_result.timer_callbacks_run,
                child->script_result.pending_tasks,
                child->script_result.root_timers);
+        printf("frame[%zu] worker-progress active=%zu starts=%zu/%zu/%zu "
+               "constructor-options=%zu "
+               "timers=%zu/%zu inbound=%zu/%zu/%zu outbound=%zu/%zu/%zu "
+               "outbound-drop-reason=%zu/%zu transfer-args=%zu/%zu "
+               "terminations=%zu "
+               "last=%zu/%zu/%.1fms\n", i,
+               child->script_result.root_workers,
+               child->script_result.root_worker_starts,
+               child->script_result.root_worker_start_completions,
+               child->script_result.root_worker_start_failures,
+               child->script_result.root_worker_constructor_option_arguments,
+               child->script_result.root_worker_timer_callbacks,
+               child->script_result.root_worker_pending_timers,
+               child->script_result.root_worker_inbound_queued,
+               child->script_result.root_worker_inbound_delivered,
+               child->script_result.root_worker_inbound_dropped,
+               child->script_result.root_worker_outbound_queued,
+               child->script_result.root_worker_outbound_delivered,
+               child->script_result.root_worker_outbound_dropped,
+               child->script_result.root_worker_outbound_dropped_inactive,
+               child->script_result.root_worker_outbound_dropped_queue,
+               child->script_result.root_worker_inbound_transfer_arguments,
+               child->script_result.root_worker_outbound_transfer_arguments,
+               child->script_result.root_worker_terminations,
+               child->script_result.root_worker_last_id,
+               child->script_result.root_worker_last_termination_reason,
+               child->script_result.root_worker_last_task_ms);
+        printf("frame[%zu] crypto random=%zu/%zu digest=%zu/%zu\n", i,
+               child->script_result.crypto_random_calls,
+               child->script_result.crypto_random_bytes,
+               child->script_result.crypto_digest_calls,
+               child->script_result.crypto_digest_bytes);
         printf("frame[%zu] network requests=%zu failures=%zu status=%ld "
                "async=%zu/%zu/%zu url=\"%s\"\n", i,
                child->script_result.network_requests,

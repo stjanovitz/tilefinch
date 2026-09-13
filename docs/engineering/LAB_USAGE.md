@@ -40,14 +40,15 @@ The current qualification establishes these boundaries:
   errors, posts its verification response with HTTP 200, receives a Secure,
   HttpOnly `cf_clearance` cookie, and automatically navigates again with that
   cookie present.
-- The edge nevertheless returns another managed challenge. A redacted request
-  trace proves the follow-up document request carries the clearance cookie and
-  stable request identity, while the challenge child eventually reports its
-  own `fail` event. A coherent Mobile-Safari diagnostic identity has the same
-  result. This rules out Tilefinch cookie persistence, navigation handoff, the
-  immediate ECMAScript exception, and the hybrid compatibility User-Agent as
-  the remaining cause; it does not prove which server-side risk signal or
-  custom-engine policy declined the session.
+- The edge nevertheless returns another managed challenge. In the September
+  2026 qualification, five consecutive challenge documents—including the
+  second managed challenge—completed their verification requests without a
+  JavaScript or callback error, while the Secure/HttpOnly clearance cookie was
+  retained and resent. Each follow-up still received a fresh challenge rather
+  than the application. This rules out cookie persistence, navigation handoff,
+  and an immediate ECMAScript exception as the remaining cause; it does not
+  prove which server-side risk signal or custom-engine policy declined the
+  session.
 - Chromium controlled through the browser lab reaches the ordinary ChatGPT
   application without being assigned this challenge, so it cannot provide an
   instruction-by-instruction control run. It remains useful for focused Web API
@@ -61,15 +62,27 @@ The current qualification establishes these boundaries:
   than a reservation and is returned after a bounded post-boot collection or
   realm teardown. Physical-device timing and memory remain a separate gate.
 - Removing `Worker` selects the page's unsupported-browser branch, so the
-  constructor and lifecycle still need to be standards-shaped. The observed
-  challenge constructs one Blob worker and immediately terminates it before its
-  queued startup task. Its tiny `"you" === "bot"` body is consequently never
-  evaluated and is not a verdict delivered to Tilefinch. A separate worker
-  realm would be valuable general compatibility work, but cannot change this
-  particular probe. The cooperative Blob-worker shim has asynchronous
-  startup/error delivery, stable Blob-URL lifetime, browser-compatible public
-  names, and no direct `document`/`window` bindings. Its implementation remains
-  a first-use bootstrap so ordinary pages do not compile worker machinery.
+  constructor and lifecycle still need to be standards-shaped. Tilefinch now
+  runs bounded Blob workers in separate QuickJS realms, with isolated
+  ECMAScript intrinsics and globals, a dedicated `WorkerGlobalScope`, truthful
+  navigator/location views, bounded structured-clone mailboxes, asynchronous
+  startup and delivery, and deterministic cancellation of timers, fetches, and
+  the realm on termination or navigation. The implementation remains a
+  first-use bootstrap so ordinary pages do not compile worker machinery.
+  One observed probe constructs a Blob worker and immediately terminates it
+  before the queued startup task. Its tiny `"you" === "bot"` body is
+  consequently never evaluated and is not a verdict delivered to Tilefinch.
+  Later challenge generations do run workers; a missing-capability trace over
+  those runs reported no property absent from Tilefinch's supported Worker
+  surface. Add Worker APIs from their standards contracts and focused tests,
+  not by guessing from obfuscated challenge generations.
+- A differential QuickJS test isolated a separate standards defect exposed by
+  the managed program: shrinking a sparse array could skip indexed properties
+  when property deletion compacted its shape. Compact-character arrays changed
+  which stale indices survived, explaining a pre-fix challenge callback
+  `TypeError`, but disabling that optimization did not make array shrinking
+  correct. The engine now restarts its bounded deletion scan after shape
+  compaction and the minimized sparse-array sequence is a regression test.
 - A normal HTTP fixture loads Cloudflare's public Turnstile API, invokes its
   named global `onload` callback, and exposes `render`, `execute`, `getResponse`,
   `remove`, and `reset` as functions. The verification POST also completes with
@@ -89,20 +102,13 @@ operations immediately before the first callback failure, and `types=` records
 coarse return shapes without serializing page objects. The trace freezes at the
 first failure so later recovery work cannot overwrite the causal window.
 
-If broader site evidence justifies it, a future standards milestone can add a
-bounded `DedicatedWorkerGlobalScope`, not a challenge adapter. Use a separate
-QuickJS context sharing the page's charged runtime, with its own global object
-and intrinsic prototypes, one or two worker slots, asynchronous startup, an
-independent bounded task/microtask queue, and deterministic teardown on
-`terminate()` or navigation. Cross-context messages need the existing bounded
-structured-clone subset carried through a fixed-size, Budget-owned mailbox;
-JavaScript values must never be shared directly between contexts. The worker
-global needs truthful `WorkerNavigator` and `WorkerLocation` views plus bounded
-timers, `fetch`, URL/Blob, encoding, streams, crypto, performance, and classic
-`importScripts`, all using the document's immutable origin/CSP/network policy.
-Module workers can remain a separate later milestone, but an unsupported type
-must fail through the normal asynchronous worker error lifecycle rather than
-silently running as classic.
+The current Worker profile deliberately admits classic retained-Blob workers.
+It provides the bounded subset above plus timers, `fetch`, URL/Blob, encoding,
+streams, crypto, performance, Trusted Types, and classic `importScripts`, all
+under the document's immutable origin/CSP/network policy. Module workers remain
+a separate later milestone; they must not be claimed until module fetch,
+credentials, dependency graphs, and cancellation are implemented within fixed
+PSP bounds.
 
 Qualification for that milestone is generic: curated Worker/Blob Web Platform
 Tests for realm and prototype isolation, constructor/error ordering, immediate

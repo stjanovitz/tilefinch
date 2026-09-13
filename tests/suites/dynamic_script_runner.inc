@@ -62,6 +62,7 @@ int main(void)
             &budget, "static and dynamic scripts share byte quota",
             false)) failures++;
     if (!test_native_script_element_state(&budget)) failures++;
+    if (!test_resource_timing_origin_gate(&budget)) failures++;
     if (!test_external_start_and_async_state(&budget)) failures++;
     if (!test_inline_module_deferred_current_script(&budget)) failures++;
     if (!test_script_state_capacity_is_explicit(&budget)) failures++;

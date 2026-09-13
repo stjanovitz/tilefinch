@@ -408,15 +408,93 @@ static bool page_capability_trace_setup(NavigationSession *session)
     if (!session->trace_page_capabilities) return true;
     static const char setup[] =
         "(()=>{const seen=new Map(),missing=new Set(),events=[],first=[],shapes=new Map(),traced=new WeakMap(),rawByProxy=new WeakMap();"
-        "const state=globalThis.__tilefinchPageTrace={seen,missing,events,first,shapes};const record=name=>{const count=seen.get(name)||0;seen.set(name,count+1);if(count===0&&first.length<512)first.push(name);if(events.length===512)events.shift();events.push(name);},shape=(name,value)=>{if(!shapes.has(name))shapes.set(name,value===null?'null':typeof value);};globalThis.addEventListener('error',()=>{if(state.failureEvents===undefined){state.failureEvents=events.slice(-128);state.failureFirst=first.slice()}},{capture:true});"
-        "const trace=(target,label,depth=0)=>{if(target===null||(typeof target!=='object'&&typeof target!=='function'))return target;if(rawByProxy.has(target))return target;if(typeof target.nodeType==='number'||ArrayBuffer.isView(target)||target instanceof ArrayBuffer)return target;if(traced.has(target))return traced.get(target);const proxy=new Proxy(target,{has(object,key){const present=Reflect.has(object,key);if(typeof key!=='symbol'){const name=label+'.'+String(key);record('has:'+name);if(!present)missing.add(name);}return present;},get(object,key,receiver){let name=label;if(typeof key!=='symbol'){name=label+'.'+String(key);record('get:'+name);if(!(key in object))missing.add(name);}const descriptor=Reflect.getOwnPropertyDescriptor(object,key);if(descriptor&&Object.prototype.hasOwnProperty.call(descriptor,'value')&&!descriptor.configurable&&!descriptor.writable){shape(name,descriptor.value);return descriptor.value;}const value=Reflect.get(object,key,receiver);shape(name,value);return depth===0?value:trace(value,name,depth-1);},set(object,key,value,receiver){if(typeof key!=='symbol'){const name=label+'.'+String(key)+'=';record('set:'+name);if(!(key in object))missing.add(name);}return Reflect.set(object,key,value,receiver);},apply(target,thisArg,args){const name='call:'+label;record(name);const value=Reflect.apply(target,rawByProxy.get(thisArg)||thisArg,args);shape(name,value);return value;},construct(target,args,newTarget){const name='new:'+label;record(name);const value=Reflect.construct(target,args,rawByProxy.get(newTarget)||newTarget);shape(name,value);return value;}});traced.set(target,proxy);rawByProxy.set(proxy,target);return proxy;};"
-        "globalThis.__tilefinchTraceValue=trace;globalThis.__tilefinchGlobalProxy=trace(globalThis,'global',2);"
+        "const state=globalThis.__tilefinchPageTrace={seen,missing,events,first,shapes,observerEntryTypes:[],domQueries:[],domMutations:[]};const record=name=>{const count=seen.get(name)||0;seen.set(name,count+1);if(count===0&&first.length<512)first.push(name);if(events.length===512)events.shift();events.push(name);},shape=(name,value)=>{if(!shapes.has(name))shapes.set(name,value===null?'null':typeof value);};globalThis.addEventListener('error',()=>{if(state.failureEvents===undefined){state.failureEvents=events.slice(-128);state.failureFirst=first.slice()}},{capture:true});"
+        "const trace=(target,label,depth=0)=>{if(target===null||(typeof target!=='object'&&typeof target!=='function'))return target;if(rawByProxy.has(target))return target;if(typeof target.nodeType==='number'||ArrayBuffer.isView(target)||target instanceof ArrayBuffer)return target;if(traced.has(target))return traced.get(target);const raw=value=>rawByProxy.get(value)||value,rawArgs=args=>args.map(raw),proxy=new Proxy(target,{has(object,key){const present=Reflect.has(object,key);if(typeof key!=='symbol'){const name=label+'.'+String(key);record('has:'+name);if(!present)missing.add(name);}return present;},get(object,key){let name=label;if(typeof key!=='symbol'){name=label+'.'+String(key);record('get:'+name);if(!(key in object))missing.add(name);}const descriptor=Reflect.getOwnPropertyDescriptor(object,key);if(descriptor&&Object.prototype.hasOwnProperty.call(descriptor,'value')&&!descriptor.configurable&&!descriptor.writable){shape(name,descriptor.value);return descriptor.value;}const value=Reflect.get(object,key,object);shape(name,value);if(name==='call:new:PerformanceObserver.observe.options.entryTypes'&&Array.isArray(value))state.observerEntryTypes=value.slice(0,8).map(item=>String(item).slice(0,48));return depth===0&&typeof value!=='function'?value:trace(value,name,Math.max(0,depth-1));},set(object,key,value,receiver){if(typeof key!=='symbol'){const name=label+'.'+String(key)+'=';record('set:'+name);if(!(key in object))missing.add(name);}return Reflect.set(object,key,raw(value),raw(receiver));},apply(target,thisArg,args){const name='call:'+label;record(name);const unwrapped=rawArgs(args),callArgs=name==='call:new:PerformanceObserver.observe'&&unwrapped.length!==0?[trace(unwrapped[0],name+'.options',1),...unwrapped.slice(1)]:unwrapped,value=Reflect.apply(target,raw(thisArg),callArgs);shape(name,value);return trace(value,name,name==='call:performance.getEntries'?2:Math.max(0,depth-1));},construct(target,args,newTarget){const name='new:'+label;record(name);const value=Reflect.construct(target,rawArgs(args),raw(newTarget));shape(name,value);return depth===0?value:trace(value,name,depth-1);}});traced.set(target,proxy);rawByProxy.set(proxy,target);return proxy;};"
+        "const install=(name,depth=2)=>{const value=globalThis[name];if(!value)return;const wrapped=trace(value,name,depth),descriptor=Object.getOwnPropertyDescriptor(globalThis,name);if(descriptor&&descriptor.configurable)Object.defineProperty(globalThis,name,{configurable:true,enumerable:descriptor.enumerable,writable:true,value:wrapped});else globalThis[name]=wrapped;};globalThis.__tilefinchTraceValue=trace;globalThis.__tilefinchGlobalProxy=trace(globalThis,'global',2);"
         "const rawDocument=globalThis.document;"
-        "for(const name of ['navigator','performance','crypto','screen','history','Intl'])if(globalThis[name])globalThis[name]=trace(globalThis[name],name,2);"
-        "for(const name of ['XMLHttpRequest','PerformanceObserver','Blob','URL','Worker','ReadableStream','MutationObserver','RTCPeerConnection','RTCSessionDescription','RTCIceCandidate','RTCDataChannel','GPU'])if(typeof globalThis[name]==='function')globalThis[name]=trace(globalThis[name],name,2);"
+        "for(const name of ['navigator','performance','crypto','screen','history','Intl','trustedTypes'])install(name);"
+        "for(const name of ['XMLHttpRequest','PerformanceObserver','Blob','URL','Worker','ReadableStream','MutationObserver','RTCPeerConnection','RTCSessionDescription','RTCIceCandidate','RTCDataChannel','GPU','TrustedHTML','TrustedScript','TrustedScriptURL','TrustedTypePolicy','TrustedTypePolicyFactory'])if(typeof globalThis[name]==='function')install(name);"
         "const xhrGet=XMLHttpRequest.prototype.getResponseHeader;XMLHttpRequest.prototype.getResponseHeader=function(name){const value=xhrGet.call(this,name);globalThis.__tilefinchXHRLastHeaderRead=String(name)+'='+String(value);return value;};})();";
+    if (!script_runtime_evaluate_diagnostic(
+            session->page.runtime, setup, "<page-capability-trace>",
+            &session->page.script_result)) return false;
+    static const char query_setup[] =
+        "(()=>{const state=globalThis.__tilefinchPageTrace,hash=value=>{let h="
+        "2166136261,text=String(value);for(let i=0;i<text.length;i++){h^="
+        "text.charCodeAt(i);h=Math.imul(h,16777619)}return(h>>>0).toString(16)},"
+        "category=value=>{"
+        "if(typeof value!=='string')return'n';const text=value.trim();"
+        "return/^#[A-Za-z_][\\w-]*$/.test(text)?'i':"
+        "/^[A-Za-z][\\w-]*$/.test(text)?'t':"
+        "/^[.][A-Za-z_][\\w-]*$/.test(text)?'c':'x'},"
+        "trace=(prototype,name,kind)=>{const original=prototype&&prototype[name];"
+        "if(typeof original!=='function')return;prototype[name]=function(value){"
+        "const result=original.call(this,value),type=category(value);let extra='';"
+        "if(result===null&&type==='i'){const found=document.getElementById("
+        "value.trim().slice(1)),root=this.getRootNode?.(),rootKind="
+        "root===document?'d':root?.host?'s':'o';extra=':'+(found?'y':'n')+':'"
+        "+(found&&this.contains?.(found)?'y':'n')+':'+rootKind+':'"
+        "+(root?.host?(root.host.isConnected?'c':'d'):'-')}"
+        "if(state.domQueries.length<64)"
+        "state.domQueries.push(kind+':'+(this.localName||this.nodeType||0)+':'"
+        "+(this.isConnected?'c':'d')+':'+type+':'"
+        "+(result===null?'null':name==='querySelectorAll'?String(result.length):"
+        "String(result.localName||'node'))+(type==='i'?':'+hash(value.trim()."
+        "slice(1)):'')+extra);return result}};"
+        "state.rawFragmentQueryAll=DocumentFragment.prototype.querySelectorAll;"
+        "for(const [prototype,kind]of[[Document.prototype,'d'],"
+        "[DocumentFragment.prototype,'f'],[Element.prototype,'e']]){"
+        "trace(prototype,'querySelector',kind+'1');"
+        "trace(prototype,'querySelectorAll',kind+'a')}const setAttribute="
+        "Element.prototype.setAttribute;Element.prototype.setAttribute=function("
+        "name,value){const result=setAttribute.call(this,name,value);if(String(name)."
+        "toLowerCase()==='id'&&state.domMutations.length<64)state.domMutations.push("
+        "'id:'+String(this.localName)+':'+hash(value)+':'"
+        "+(this.isConnected?'c':'d'));return result};const appendChild="
+        "Node.prototype.appendChild;Node.prototype.appendChild=function(child){"
+        "const result=appendChild.call(this,child);if(state.domMutations.length<64)"
+        "state.domMutations.push('append:'+(this.localName||this.nodeType||0)+':'"
+        "+(child?.localName||child?.nodeType||0)+':'"
+        "+(child?.id?hash(child.id):'-')+':'"
+        "+(child?.isConnected?'c':'d'));return result};const inner="
+        "Object.getOwnPropertyDescriptor(Element.prototype,'innerHTML');if(inner?."
+        "set)Object.defineProperty(Element.prototype,'innerHTML',{...inner,set(value)"
+        "{inner.set.call(this,value);if(state.domMutations.length<64)state."
+        "domMutations.push('html:'+String(this.localName)+':'"
+        "+String(value).length+':'+String(this.childNodes.length))}})})();";
+    if (!script_runtime_evaluate_diagnostic(
+        session->page.runtime, query_setup, "<page-query-trace>",
+        &session->page.script_result)) return false;
+    static const char mutation_setup[] =
+        "(()=>{const state=globalThis.__tilefinchPageTrace,hash=value=>{let h="
+        "2166136261,text=String(value);for(let i=0;i<text.length;i++){h^="
+        "text.charCodeAt(i);h=Math.imul(h,16777619)}return(h>>>0).toString(16)},"
+        "push=(kind,node)=>{if(state.domMutations.length>=64||!node)return;"
+        "state.domMutations.push(kind+':'+(node.localName||node.nodeType||0)+':'"
+        "+(node.id?hash(node.id):'-')+':'"
+        "+(node.isConnected?'c':'d')+':'+(node.getRootNode?.()?.host?'s':'d'))};"
+        "const observer=new MutationObserver(records=>{for(const record of records)"
+        "{if(state.domMutations.length>=64)break;if(record.type==='attributes')"
+        "push('id',record.target);else{for(const node of record.addedNodes)push('a',node);"
+        "for(const node of record.removedNodes)push('r',node)}}}),observe=root=>"
+        "observer.observe(root,{subtree:true,childList:true,attributes:true,"
+        "attributeFilter:['id']}),snapshot=(kind,root)=>{if(state.domMutations.length"
+        ">=64)return;const ids=state.rawFragmentQueryAll.call(root,'[id]'),hashes=[];"
+        "for(let i=0;i<ids.length&&i<8;i++)hashes.push(hash(ids[i].id));state."
+        "domMutations.push(kind+':'+root.childNodes.length+':'+hashes.join(','))},"
+        "instrument=root=>{observe(root);const inner=Object.getOwnPropertyDescriptor("
+        "root,'innerHTML');if(inner?.set&&inner.configurable)Object.defineProperty("
+        "root,'innerHTML',{...inner,set(value){inner.set.call(this,value);snapshot("
+        "'shadow-html:'+String(value).length,this)}});for(const name of['appendChild',"
+        "'insertBefore','replaceChild','append','prepend','replaceChildren']){const "
+        "original=root[name];if(typeof original!=='function')continue;try{root[name]="
+        "function(...args){const result=original.apply(this,args);snapshot('shadow-'+"
+        "name,this);return result}}catch(_){}}},attachShadow=Element.prototype.attachShadow;"
+        "Element.prototype.attachShadow=function(init){const root=attachShadow.call("
+        "this,init);instrument(root);push('shadow',this);return root};observe(document);"
+        "state.domMutationObserver=observer})();";
     return script_runtime_evaluate_diagnostic(
-        session->page.runtime, setup, "<page-capability-trace>",
+        session->page.runtime, mutation_setup, "<page-mutation-trace>",
         &session->page.script_result);
 }
 
@@ -425,7 +503,7 @@ static void page_capability_trace_report(NavigationSession *session)
     if (!session->trace_page_capabilities || session->page.runtime == NULL)
         return;
     static const char report[] =
-        "{const t=__tilefinchPageTrace;globalThis.__tilefinchPageSummaryBeforeTrace=globalThis.pocSummary;const missing=[...t.missing].filter(name=>!/^global[.][A-Za-z0-9]{5,}=?$/.test(name)).sort(),events=t.failureEvents||t.events,first=t.failureFirst||t.first,important=first.filter(name=>!name.includes(':global.')||/(Worker|Blob|URL|Stream|Observer|WebAssembly|Intl|crypto|performance|navigator)/.test(name)),types=[...t.shapes].filter(([name])=>/^(?:(?:new|call):)?(?:navigator|performance|crypto|Blob|URL|Worker|ReadableStream)/.test(name)).slice(0,24).map(([name,type])=>name+':'+type);globalThis.pocSummary='missing='+missing.join(',')+'|types='+types.join(',')+'|xhr-header='+(globalThis.__tilefinchXHRLastHeaderRead||'none')+'|first='+important.slice(0,48).join(',')+'|tail='+events.slice(-32).join(',');}";
+        "{const t=__tilefinchPageTrace;globalThis.__tilefinchPageSummaryBeforeTrace=globalThis.pocSummary;const missing=[...t.missing].filter(name=>!/^global[.][A-Za-z0-9]{5,}=?$/.test(name)).sort(),events=t.failureEvents||t.events,first=t.failureFirst||t.first,important=first.filter(name=>!name.includes(':global.')||/(Worker|Blob|URL|Stream|Observer|WebAssembly|Intl|crypto|performance|navigator|trustedTypes|Trusted)/.test(name)),types=[...t.shapes].filter(([name])=>/^(?:(?:new|call):)?(?:navigator|performance|crypto|Blob|URL|Worker|ReadableStream|trustedTypes|Trusted)/.test(name)).slice(0,24).map(([name,type])=>name+':'+type);globalThis.pocSummary='types='+types.join(',')+'|observer-types='+t.observerEntryTypes.join(',')+'|xhr-header='+(globalThis.__tilefinchXHRLastHeaderRead||'none')+'|first='+important.slice(0,48).join(',')+'|tail='+events.slice(-32).join(',')+'|missing='+missing.join(',')+'|dom-queries='+t.domQueries.join(',')+'|dom-mutations='+t.domMutations.join(',');}";
     if (script_runtime_evaluate_diagnostic(
             session->page.runtime, report, "<page-capability-report>",
             &session->page.script_result)) {
@@ -494,9 +572,16 @@ typedef struct {
     PocDocument *document;
     DocumentParser *parser;
     uint64_t started_us;
+    uint64_t response_headers_elapsed_us;
     uint64_t parse_us;
     char document_url[NAVIGATION_URL_LIMIT];
     char resource_base_url[NAVIGATION_URL_LIMIT];
+    /* The request referrer uses the incumbent document's policy. The response
+       policy below governs requests emitted by the new document, so retain
+       both until its realm is created. */
+    char referrer_source_url[NAVIGATION_URL_LIMIT];
+    char initiator_referrer_policy[128];
+    char document_referrer[NAVIGATION_URL_LIMIT];
     char referrer_policy[128];
     ScriptRuntime *runtime;
     /* Complete, visibly useful body prefix observed before an author parser

@@ -66,14 +66,20 @@ void script_runtime_clear_execution_limit(ScriptRuntime *runtime)
 }
 
 static bool runtime_job_exception_is_fatal(const ScriptRuntime *runtime,
-                                           size_t failures_before)
+                                           size_t failures_before,
+                                           size_t heap_rejections_before)
 {
     if (runtime == NULL) return true;
     /* Error text is author-controlled and result.interrupted describes the
        previous completed slice until js_rt_runtime_update_result() runs.  Only a
-       failure observed while executing this job can make it fatal. */
+       failure observed while executing this job can make it fatal. A QuickJS
+       pool refusal is separate from the outer Budget counter. Pair it with the
+       propagated exception here: bounded allocation fallbacks that return
+       successfully remain nonfatal, while an uncaught inner-heap exhaustion
+       cannot be misreported as an ordinary author exception. */
     return runtime->watchdog.interrupted
-        || runtime->budget->failure_count != failures_before;
+        || runtime->budget->failure_count != failures_before
+        || script_runtime_heap_rejections(runtime) != heap_rejections_before;
 }
 
 static void runtime_record_author_job_exception(ScriptRuntime *runtime)
@@ -93,8 +99,76 @@ bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
      * the only thread long enough that its own timeout never gets a turn.
      * Bound each checkpoint; the next runtime tick continues the queue.
      */
-    size_t jobs = 0;
-    while (jobs < 64 && JS_IsJobPending(runtime->runtime)) {
+    size_t work = 0;
+    const bool trace_steps = tilefinch_trace_runtime_steps();
+    size_t promise_jobs = 0, continuations = 0;
+    uint64_t promise_job_us = 0, promise_job_max_us = 0;
+    uint64_t continuation_us = 0, continuation_max_us = 0;
+    uint64_t recovery_us = 0;
+    while (work < 64) {
+        if (!JS_IsJobPending(runtime->runtime)) {
+            if (runtime->checkpoint_continuation_count == 0u) break;
+            size_t slot = runtime->checkpoint_continuation_head;
+            JSValue callback = runtime->checkpoint_continuations[slot];
+            runtime->checkpoint_continuations[slot] = JS_UNDEFINED;
+            runtime->checkpoint_continuation_head = (uint8_t) (
+                (slot + 1u) % SCRIPT_CHECKPOINT_CONTINUATION_LIMIT);
+            runtime->checkpoint_continuation_count--;
+            size_t failures_before = runtime->budget->failure_count;
+            size_t heap_rejections_before =
+                script_runtime_heap_rejections(runtime);
+            BudgetAllocationOwner previous_owner =
+                document_allocation_owner_enter(runtime->document);
+            uint64_t continuation_started_ns = trace_steps
+                ? js_rt_monotonic_time_ns() : 0;
+            JSValue value = JS_Call(
+                runtime->context, callback, JS_UNDEFINED, 0, NULL);
+            if (trace_steps) {
+                uint64_t elapsed_us =
+                    (js_rt_monotonic_time_ns() - continuation_started_ns)
+                    / UINT64_C(1000);
+                continuations++;
+                continuation_us += elapsed_us;
+                if (elapsed_us > continuation_max_us)
+                    continuation_max_us = elapsed_us;
+            }
+            JS_FreeValue(runtime->context, callback);
+            document_allocation_owner_leave(
+                runtime->document, previous_owner);
+            if (JS_IsException(value)) {
+                JS_FreeValue(runtime->context, value);
+                js_rt_record_exception(runtime->context, &runtime->result);
+                bool fatal = runtime_job_exception_is_fatal(
+                    runtime, failures_before, heap_rejections_before);
+                uint64_t recovery_started_ns = trace_steps
+                    ? js_rt_monotonic_time_ns() : 0;
+                js_lazy_webpack_recover_failure(runtime);
+                if (trace_steps) {
+                    recovery_us +=
+                        (js_rt_monotonic_time_ns() - recovery_started_ns)
+                        / UINT64_C(1000);
+                }
+                if (fatal) return false;
+                /* Continuations are the remainder of a browser-dispatched
+                   callback checkpoint.  An ordinary author exception has the
+                   same containment boundary as a rejected promise job: report
+                   it, then keep the realm usable for later tasks. */
+                runtime_record_author_job_exception(runtime);
+                work++;
+                continue;
+            }
+            JS_FreeValue(runtime->context, value);
+            uint64_t recovery_started_ns = trace_steps
+                ? js_rt_monotonic_time_ns() : 0;
+            js_lazy_webpack_recover_failure(runtime);
+            if (trace_steps) {
+                recovery_us +=
+                    (js_rt_monotonic_time_ns() - recovery_started_ns)
+                    / UINT64_C(1000);
+            }
+            work++;
+            continue;
+        }
         /* Short promise jobs may never hit the VM instruction interrupt.
            Keep their bounded drain cooperative too, without a new task or
            resetting the existing execution deadline. */
@@ -103,39 +177,86 @@ bool js_rt_runtime_run_jobs(ScriptRuntime *runtime)
         uint64_t started_ns = js_rt_monotonic_time_ns();
         size_t polls_before = runtime->watchdog.polls;
         size_t failures_before = runtime->budget->failure_count;
+        size_t heap_rejections_before =
+            script_runtime_heap_rejections(runtime);
         BudgetAllocationOwner previous_owner =
             document_allocation_owner_enter(runtime->document);
         int executed = JS_ExecutePendingJob(runtime->runtime, &job_context);
         document_allocation_owner_leave(runtime->document, previous_owner);
         js_rt_runtime_record_host_callback(
             runtime, "<promise-job>", started_ns, polls_before);
+        if (trace_steps) {
+            uint64_t elapsed_us =
+                (js_rt_monotonic_time_ns() - started_ns) / UINT64_C(1000);
+            promise_jobs++;
+            promise_job_us += elapsed_us;
+            if (elapsed_us > promise_job_max_us)
+                promise_job_max_us = elapsed_us;
+        }
         if (executed < 0) {
             js_rt_record_exception(job_context == NULL ? runtime->context
                                                  : job_context,
                              &runtime->result);
             bool fatal = runtime_job_exception_is_fatal(
-                runtime, failures_before);
+                runtime, failures_before, heap_rejections_before);
+            uint64_t recovery_started_ns = trace_steps
+                ? js_rt_monotonic_time_ns() : 0;
             js_lazy_webpack_recover_failure(runtime);
+            if (trace_steps) {
+                recovery_us +=
+                    (js_rt_monotonic_time_ns() - recovery_started_ns)
+                    / UINT64_C(1000);
+            }
             if (fatal) return false;
             /* A browser reports an exception thrown by an author microtask,
                then continues the checkpoint. It does not turn an optional
                resource event into a failed navigation. */
             runtime_record_author_job_exception(runtime);
         }
-        jobs++;
+        work++;
     }
     /* Task boundary: a WebAssembly runtime left idle by this task's
        operations is released here (see wasm_runtime_leave). */
+    uint64_t wasm_release_started_ns = trace_steps
+        ? js_rt_monotonic_time_ns() : 0;
     js_wasm_release_idle_runtime();
+    if (trace_steps && (promise_jobs != 0u || continuations != 0u)) {
+        uint64_t wasm_release_us =
+            (js_rt_monotonic_time_ns() - wasm_release_started_ns)
+            / UINT64_C(1000);
+        fprintf(stderr,
+                "runtime-checkpoint promise=%zu/%llu/%llu "
+                "continuation=%zu/%llu/%llu recovery=%llu wasm-release=%llu\n",
+                promise_jobs, (unsigned long long) promise_job_us,
+                (unsigned long long) promise_job_max_us,
+                continuations, (unsigned long long) continuation_us,
+                (unsigned long long) continuation_max_us,
+                (unsigned long long) recovery_us,
+                (unsigned long long) wasm_release_us);
+    }
     return true;
+}
+
+bool js_rt_runtime_checkpoint_pending(const ScriptRuntime *runtime)
+{
+    return runtime != NULL
+        && (JS_IsJobPending(runtime->runtime)
+            || runtime->checkpoint_continuation_count != 0u);
 }
 
 bool script_runtime_has_pending_startup_scripts(ScriptRuntime *runtime)
 {
     return runtime != NULL
         && (runtime->bridge.dynamic_script_count != 0u
-            || JS_IsJobPending(runtime->runtime)
+            || js_rt_runtime_checkpoint_pending(runtime)
             || js_rt_dynamic_classic_continuation_pending(runtime));
+}
+
+bool script_runtime_message_dispatch_ready(ScriptRuntime *runtime)
+{
+    return runtime != NULL
+        && !js_rt_runtime_checkpoint_pending(runtime)
+        && !js_rt_dynamic_classic_continuation_pending(runtime);
 }
 
 bool script_runtime_has_pending_author_work(ScriptRuntime *runtime)
@@ -170,11 +291,13 @@ static const char *const runtime_host_callback_names[
     "__tilefinchIntersectionRecheck",
     "__tilefinchMediaRecheck",
     "__tilefinchRecordResourceTiming",
+    "__tilefinchRecordNavigationTiming",
     "__tilefinchPendingTimers",
     "__tilefinchPendingNetworkRequests",
     "__tilefinchDeliverNetwork",
     "__tilefinchDetachNetwork",
     "__tilefinchPumpTimers",
+    "__tilefinchSchedulerSnapshot",
     "__tilefinchRebindDocument",
     "__tilefinchCommitSameDocument",
     "__tilefinchRestoreSameDocument",
@@ -377,20 +500,44 @@ bool script_runtime_configure_messaging(
     runtime->document_scope = SCRIPT_DOCUMENT_SCOPE_CHILD_FRAME;
     static const char same_origin_child_setup[] =
         "(()=>{globalThis.__tilefinchTaskRealm='child';const topIsParent=!!globalThis.__tilefinchTopIsParent;delete globalThis.__tilefinchTopIsParent;"
-        "const parentWindow={postMessage(data,targetOrigin='/'){"
+        "const makeAncestor=(send,parentOf,topOf)=>{let windowProxy;const target={};Object.defineProperties(target,{"
+        "postMessage:{enumerable:true,configurable:true,writable:true,value:send},"
+        "window:{enumerable:true,configurable:true,get:()=>windowProxy},self:{enumerable:true,configurable:true,get:()=>windowProxy},"
+        "frames:{enumerable:true,configurable:true,get:()=>windowProxy},parent:{enumerable:true,configurable:true,get:parentOf},"
+        "top:{enumerable:true,configurable:true,get:topOf},closed:{enumerable:true,configurable:true,get:()=>false},"
+        "length:{enumerable:true,configurable:true,get:()=>0},opener:{enumerable:true,configurable:true,get:()=>null},"
+        "focus:{enumerable:true,configurable:true,writable:true,value:function focus(){}},"
+        "blur:{enumerable:true,configurable:true,writable:true,value:function blur(){}},"
+        "close:{enumerable:true,configurable:true,writable:true,value:function close(){}}});"
+        "Object.defineProperty(target,Symbol.toStringTag,{configurable:true,value:'Window'});windowProxy=target;return target};"
+        "const parentSend=function postMessage(data,targetOrigin='/'){"
         "if(data&&data.event==='reject')globalThis.__tilefinchLastRejectStack=String(new Error('Turnstile reject').stack||'');"
-        "__tilefinchPostParentMessage(data,targetOrigin);}};globalThis.parent=parentWindow;"
-        "globalThis.top=topIsParent?parentWindow:{postMessage(data,targetOrigin='/'){__tilefinchPostTopMessage(data,targetOrigin)}};Object.defineProperty(globalThis,'opener',"
+        "__tilefinchPostParentMessage(data,targetOrigin)};let parentWindow,topWindow;"
+        "if(topIsParent){parentWindow=makeAncestor(parentSend,()=>parentWindow,()=>parentWindow);topWindow=parentWindow}"
+        "else{topWindow=makeAncestor(function postMessage(data,targetOrigin='/'){__tilefinchPostTopMessage(data,targetOrigin)},()=>topWindow,()=>topWindow);"
+        "parentWindow=makeAncestor(parentSend,()=>topWindow,()=>topWindow)}globalThis.parent=parentWindow;globalThis.top=topWindow;Object.defineProperty(globalThis,'opener',"
         "{value:null,writable:false,configurable:false});})();";
     static const char cross_origin_child_setup[] =
         "(()=>{globalThis.__tilefinchTaskRealm='child';const topIsParent=!!globalThis.__tilefinchTopIsParent;delete globalThis.__tilefinchTopIsParent;"
+        "const makeAncestor=(send,parentOf,topOf)=>{let windowProxy;const target={};const denied=()=>{throw new DOMException("
+        "'Blocked cross-origin Window access','SecurityError')};Object.defineProperties(target,{"
+        "postMessage:{enumerable:true,configurable:false,get:()=>send,set:denied},"
+        "window:{enumerable:true,configurable:false,get:()=>windowProxy},self:{enumerable:true,configurable:false,get:()=>windowProxy},"
+        "frames:{enumerable:true,configurable:false,get:()=>windowProxy},parent:{enumerable:true,configurable:false,get:parentOf},"
+        "top:{enumerable:true,configurable:false,get:topOf},closed:{enumerable:true,configurable:false,get:()=>false},"
+        "length:{enumerable:true,configurable:false,get:()=>0},opener:{enumerable:true,configurable:false,get:()=>null},"
+        "focus:{enumerable:true,configurable:false,get:()=>function focus(){},set:denied},"
+        "blur:{enumerable:true,configurable:false,get:()=>function blur(){},set:denied},"
+        "close:{enumerable:true,configurable:false,get:()=>function close(){},set:denied}});"
+        "Object.defineProperty(target,Symbol.toStringTag,{configurable:false,value:'Window'});"
+        "windowProxy=new Proxy(target,{get:(object,key,receiver)=>Reflect.has(object,key)?Reflect.get(object,key,receiver):denied(),"
+        "set:(object,key,value,receiver)=>Reflect.has(object,key)?Reflect.set(object,key,value,receiver):denied()});return windowProxy};"
         "const send=function postMessage(data,targetOrigin='/'){"
         "if(data&&data.event==='reject')globalThis.__tilefinchLastRejectStack=String(new Error('Turnstile reject').stack||'');"
-        "__tilefinchPostParentMessage(data,targetOrigin);};const parentWindow={};"
-        "Object.defineProperty(parentWindow,'postMessage',{enumerable:true,"
-        "configurable:false,get(){return send},set(){throw new DOMException("
-        "'Blocked cross-origin Window assignment','SecurityError')}});"
-        "globalThis.parent=parentWindow;globalThis.top=topIsParent?parentWindow:Object.freeze({postMessage(data,targetOrigin='/'){__tilefinchPostTopMessage(data,targetOrigin)}});"
+        "__tilefinchPostParentMessage(data,targetOrigin);};let parentWindow,topWindow;"
+        "if(topIsParent){parentWindow=makeAncestor(send,()=>parentWindow,()=>parentWindow);topWindow=parentWindow}"
+        "else{topWindow=makeAncestor(function postMessage(data,targetOrigin='/'){__tilefinchPostTopMessage(data,targetOrigin)},()=>topWindow,()=>topWindow);"
+        "parentWindow=makeAncestor(send,()=>topWindow,()=>topWindow)}globalThis.parent=parentWindow;globalThis.top=topWindow;"
         "Object.defineProperty(globalThis,'opener',{value:null,writable:false,"
         "configurable:false});})();";
     const char *child_setup = parent_same_origin
@@ -482,20 +629,22 @@ bool script_runtime_set_frame_window_state(ScriptRuntime *runtime,
                                            bool same_origin,
                                            bool opaque_origin,
                                            const char *committed_url,
+                                           bool document_committed,
                                            ScriptResult *result)
 {
     if (runtime == NULL || frame_handle <= 0) return false;
-    JSValue arguments[5] = {
+    JSValue arguments[6] = {
         JS_NewInt64(runtime->context, frame_handle),
         JS_NewBool(runtime->context, active),
         JS_NewBool(runtime->context, same_origin),
         JS_NewBool(runtime->context, opaque_origin),
         committed_url == NULL
-            ? JS_NULL : JS_NewString(runtime->context, committed_url)
+            ? JS_NULL : JS_NewString(runtime->context, committed_url),
+        JS_NewBool(runtime->context, document_committed)
     };
-    bool ok = runtime_call_host(runtime, SCRIPT_HOST_SET_FRAME_WINDOW_STATE, 5,
+    bool ok = runtime_call_host(runtime, SCRIPT_HOST_SET_FRAME_WINDOW_STATE, 6,
                            arguments, NULL);
-    for (size_t i = 0; i < 5; i++) JS_FreeValue(runtime->context, arguments[i]);
+    for (size_t i = 0; i < 6; i++) JS_FreeValue(runtime->context, arguments[i]);
     if (ok) ok = js_rt_runtime_refresh(runtime);
     runtime->result.success = ok;
     js_rt_runtime_update_result(runtime, result);
@@ -667,7 +816,7 @@ bool script_runtime_record_resource_timing_details(
     if (runtime == NULL || url == NULL || initiator_type == NULL) return false;
     const ScriptResourceTiming empty = {0};
     if (timing == NULL) timing = &empty;
-    JSValue arguments[10] = {
+    JSValue arguments[16] = {
         JS_NewString(runtime->context, url),
         JS_NewString(runtime->context, initiator_type),
         JS_NewUint32(runtime->context, timing->name_lookup_us),
@@ -675,13 +824,51 @@ bool script_runtime_record_resource_timing_details(
         JS_NewUint32(runtime->context, timing->appconnect_us),
         JS_NewUint32(runtime->context, timing->first_byte_us),
         JS_NewUint32(runtime->context, timing->total_us),
+        JS_NewUint32(runtime->context, timing->encoded_body_bytes),
         JS_NewUint32(runtime->context, timing->decoded_body_bytes),
         JS_NewBool(runtime->context, timing->measured),
-        JS_NewBool(runtime->context, timing->cache_hit)
+        JS_NewBool(runtime->context, timing->cache_hit),
+        JS_NewBool(runtime->context, timing->cache_validated),
+        JS_NewBool(runtime->context, timing->timing_allowed),
+        JS_NewUint32(runtime->context, timing->next_hop_protocol),
+        JS_NewUint32(runtime->context, timing->response_status),
+        JS_NewString(runtime->context, timing->content_type == NULL
+            ? "" : timing->content_type)
     };
-    bool ok = runtime_call_host(runtime, SCRIPT_HOST_RECORD_RESOURCE_TIMING, 10,
+    bool ok = runtime_call_host(runtime, SCRIPT_HOST_RECORD_RESOURCE_TIMING, 16,
                            arguments, NULL);
-    for (size_t i = 0; i < 10; i++) {
+    for (size_t i = 0; i < 16; i++) {
+        JS_FreeValue(runtime->context, arguments[i]);
+    }
+    return ok;
+}
+
+bool script_runtime_record_navigation_timing(
+    ScriptRuntime *runtime, const ScriptNavigationTiming *timing)
+{
+    if (runtime == NULL || timing == NULL) return false;
+    JSValue arguments[15] = {
+        JS_NewUint32(runtime->context, timing->name_lookup_us),
+        JS_NewUint32(runtime->context, timing->connect_us),
+        JS_NewUint32(runtime->context, timing->appconnect_us),
+        JS_NewUint32(runtime->context, timing->first_byte_us),
+        JS_NewUint32(runtime->context, timing->total_us),
+        JS_NewFloat64(runtime->context, (double) timing->response_start_us),
+        JS_NewFloat64(runtime->context, (double) timing->response_end_us),
+        JS_NewUint32(runtime->context, timing->encoded_body_bytes),
+        JS_NewUint32(runtime->context, timing->decoded_body_bytes),
+        JS_NewBool(runtime->context, timing->measured),
+        JS_NewBool(runtime->context, timing->response_complete),
+        JS_NewBool(runtime->context, timing->encoded_body_bytes_measured),
+        JS_NewUint32(runtime->context, timing->response_status),
+        JS_NewString(runtime->context, timing->next_hop_protocol == NULL
+            ? "" : timing->next_hop_protocol),
+        JS_NewString(runtime->context, timing->content_type == NULL
+            ? "" : timing->content_type)
+    };
+    bool ok = runtime_call_host(
+        runtime, SCRIPT_HOST_RECORD_NAVIGATION_TIMING, 15, arguments, NULL);
+    for (size_t i = 0; i < 15; i++) {
         JS_FreeValue(runtime->context, arguments[i]);
     }
     return ok;
@@ -983,14 +1170,38 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
             i++;
             continue;
         }
+        if (success && !fetched->opaque_redirect
+            && async_fetch.integrity_length != 0u) {
+            TilefinchIntegrityResult integrity =
+                tilefinch_resource_integrity_verify(
+                    async_fetch.integrity, async_fetch.integrity_length,
+                    (const uint8_t *) fetched->data, fetched->length);
+            if (integrity == TILEFINCH_INTEGRITY_MISMATCH
+                || integrity == TILEFINCH_INTEGRITY_INVALID) {
+                success = false;
+                snprintf(fetched->error, sizeof(fetched->error), "%s",
+                         integrity == TILEFINCH_INTEGRITY_MISMATCH
+                             ? "response integrity mismatch"
+                             : "invalid response integrity metadata");
+            }
+        }
         if (success && !js_rt_script_response_origin_allowed(
                 bridge, fetched, async_fetch.target_origin,
-                TILEFINCH_DESTINATION_FETCH, async_fetch.mode,
+                async_fetch.destination, async_fetch.mode,
                 async_fetch.credentials)) {
             success = false;
             snprintf(fetched->error, sizeof(fetched->error), "%s",
                      "CORS or cross-origin redirect response blocked");
         }
+        const char *response_url = fetched->effective_url[0] != '\0'
+            ? fetched->effective_url : async_fetch.target_origin;
+        bool opaque_response = success && !fetched->opaque_redirect
+            && async_fetch.destination == TILEFINCH_DESTINATION_FETCH
+            && async_fetch.mode == TILEFINCH_REQUEST_MODE_NO_CORS
+            && (bridge->opaque_origin || bridge->document_url == NULL
+                || response_url == NULL
+                || !tilefinch_url_same_origin(
+                       bridge->document_url, response_url));
         JSValue payload;
         if (success) {
             /* Large textual responses are commonly followed by an immediate
@@ -1008,25 +1219,44 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
             js_rt_script_store_response_cookies(
                 bridge, fetched, fetched->effective_url,
                 async_fetch.mode, async_fetch.credentials,
-                TILEFINCH_DESTINATION_FETCH);
+                async_fetch.destination);
             char visible_headers[FETCH_RESPONSE_HEADERS_LIMIT];
             size_t visible_headers_length = js_rt_script_visible_response_headers(
                 bridge, fetched, async_fetch.credentials, visible_headers,
                 sizeof(visible_headers));
             payload = JS_NewObject(runtime->context);
             if (!JS_IsException(payload)) {
+                bool filtered = fetched->opaque_redirect || opaque_response;
                 (void) JS_SetPropertyStr(runtime->context, payload, "status",
-                    JS_NewInt64(runtime->context, fetched->status_code));
+                    JS_NewInt64(runtime->context,
+                        filtered ? 0 : fetched->status_code));
                 (void) JS_SetPropertyStr(runtime->context, payload, "url",
-                    JS_NewString(runtime->context, fetched->effective_url));
+                    JS_NewString(runtime->context,
+                        filtered ? "" : fetched->effective_url));
                 (void) JS_SetPropertyStr(runtime->context, payload,
                     "contentType", JS_NewString(runtime->context,
-                                                 fetched->content_type));
+                        filtered ? "" : fetched->content_type));
                 (void) JS_SetPropertyStr(runtime->context, payload,
                     "headers", JS_NewStringLen(
                         runtime->context, visible_headers,
-                        visible_headers_length));
-                js_rt_script_set_response_body(runtime->context, payload, fetched);
+                        filtered ? 0u : visible_headers_length));
+                (void) JS_SetPropertyStr(runtime->context, payload,
+                    "redirected", JS_NewBool(runtime->context,
+                                               fetched->redirected));
+                (void) JS_SetPropertyStr(runtime->context, payload, "type",
+                    JS_NewString(runtime->context,
+                        fetched->opaque_redirect ? "opaqueredirect"
+                            : opaque_response ? "opaque"
+                            : async_fetch.mode == TILEFINCH_REQUEST_MODE_CORS
+                                && (bridge->opaque_origin
+                                    || !tilefinch_url_same_origin(
+                                           bridge->document_url,
+                                           fetched->effective_url))
+                              ? "cors" : "basic"));
+                if (!filtered) {
+                    js_rt_script_set_response_body(
+                        runtime->context, payload, fetched);
+                }
             }
         } else {
             if (bridge->result != NULL) {
@@ -1040,9 +1270,60 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
                                    ? "network request failed"
                                    : fetched->error);
         }
-        JSValue arguments[3] = {
+        char timing_content_type[128] = {0};
+        const char *timing_response_url = fetched->effective_url[0] != '\0'
+            ? fetched->effective_url : NULL;
+        bool timing_body_info_visible = success
+            && timing_response_url != NULL
+            && js_rt_resource_timing_body_info_visible(
+                bridge, async_fetch.mode, timing_response_url,
+                fetched->redirect_origin_tainted);
+        if (timing_body_info_visible && fetched->content_type[0] != '\0') {
+            (void) js_rt_resource_timing_minimize_content_type(
+                fetched->content_type, timing_content_type,
+                sizeof(timing_content_type));
+        }
+        uint32_t timing_encoded_bytes =
+            fetched->transport_timing.encoded_body_bytes_measured
+                ? fetched->transport_timing.encoded_body_bytes
+                : fetched->length > UINT32_MAX
+                    ? UINT32_MAX : (uint32_t) fetched->length;
+        uint32_t timing_decoded_bytes = fetched->length > UINT32_MAX
+            ? UINT32_MAX : (uint32_t) fetched->length;
+        uint16_t timing_response_status = timing_body_info_visible
+            && fetched->status_code > 0
+            && fetched->status_code <= UINT16_MAX
+            && fetched->status_code != 304
+                ? (uint16_t) fetched->status_code : 0;
+        JSValue arguments[18] = {
             JS_NewInt64(runtime->context, (int64_t) id),
-            JS_NewBool(runtime->context, success), payload
+            JS_NewBool(runtime->context, success), payload,
+            JS_NewBool(runtime->context, true),
+            JS_NewUint32(runtime->context,
+                         fetched->transport_timing.name_lookup_us),
+            JS_NewUint32(runtime->context,
+                         fetched->transport_timing.connect_us),
+            JS_NewUint32(runtime->context,
+                         fetched->transport_timing.appconnect_us),
+            JS_NewUint32(runtime->context,
+                         fetched->transport_timing.first_byte_us),
+            JS_NewUint32(runtime->context,
+                         fetched->transport_timing.total_us),
+            JS_NewUint32(runtime->context, timing_encoded_bytes),
+            JS_NewUint32(runtime->context, timing_decoded_bytes),
+            JS_NewBool(runtime->context,
+                       fetched->transport_timing.measured),
+            JS_NewBool(runtime->context, false),
+            JS_NewBool(runtime->context, fetched->status_code == 304),
+            JS_NewBool(runtime->context,
+                       timing_response_url != NULL
+                       && js_rt_script_resource_timing_allowed(
+                              bridge, fetched, timing_response_url)),
+            JS_NewUint32(runtime->context,
+                         js_rt_script_resource_timing_protocol(
+                             fetched->negotiated_http_version)),
+            JS_NewUint32(runtime->context, timing_response_status),
+            JS_NewString(runtime->context, timing_content_type)
         };
         /* Every response field the page can observe now lives in the bounded
            JavaScript payload.  Release the native transport copy before the
@@ -1051,11 +1332,12 @@ static bool runtime_pump_network(ScriptRuntime *runtime,
            exactly when a constrained realm most needs callback headroom. */
         fetch_result_free(fetched);
         fetched = NULL;
-        bool delivered = runtime_call_host(runtime, SCRIPT_HOST_DELIVER_NETWORK, 3,
+        bool delivered = runtime_call_host(runtime, SCRIPT_HOST_DELIVER_NETWORK, 18,
                                       arguments, NULL);
-        for (size_t value = 0; value < 3; value++) {
+        for (size_t value = 0; value < 18; value++) {
             JS_FreeValue(runtime->context, arguments[value]);
         }
+        budget_free(bridge->budget, async_fetch.integrity);
         memmove(bridge->async_fetches + i,
                 bridge->async_fetches + i + 1,
                 (bridge->async_fetch_count - i - 1)

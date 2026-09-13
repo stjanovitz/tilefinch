@@ -30,6 +30,12 @@ void script_runtime_destroy(ScriptRuntime *runtime)
     js_rt_event_sources_destroy(&runtime->bridge);
     js_rt_websockets_destroy(&runtime->bridge);
     js_rt_multiplayer_destroy(&runtime->bridge);
+    for (size_t i = 0; i < runtime->bridge.async_fetch_count; i++) {
+        budget_free(runtime->bridge.budget,
+                    runtime->bridge.async_fetches[i].integrity);
+        runtime->bridge.async_fetches[i].integrity = NULL;
+    }
+    runtime->bridge.async_fetch_count = 0;
     fetch_scheduler_destroy(runtime->bridge.fetch_scheduler);
     runtime->bridge.fetch_scheduler = NULL;
     fetch_scheduler_domain_release(
@@ -53,6 +59,15 @@ void script_runtime_destroy(ScriptRuntime *runtime)
         script_runtime_report_memory(runtime, stderr);
     }
     if (runtime->context != NULL) {
+        while (runtime->checkpoint_continuation_count != 0u) {
+            size_t slot = runtime->checkpoint_continuation_head;
+            JS_FreeValue(runtime->context,
+                         runtime->checkpoint_continuations[slot]);
+            runtime->checkpoint_continuations[slot] = JS_UNDEFINED;
+            runtime->checkpoint_continuation_head = (uint8_t) (
+                (slot + 1u) % SCRIPT_CHECKPOINT_CONTINUATION_LIMIT);
+            runtime->checkpoint_continuation_count--;
+        }
         js_lazy_webpack_bundles_destroy(runtime);
         JS_FreeValue(runtime->context,
                      runtime->bridge.trusted_stable_script_wrap);

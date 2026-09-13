@@ -6,7 +6,95 @@
     tilefinchBlobType = Object.getOwnPropertyDescriptor(
       Blob.prototype,
       "type",
-    ).get;
+    ).get,
+    trustedFunctionApply = Function.call.bind(Function.prototype.apply),
+    TrustedObject = Object,
+    TrustedString = String,
+    TrustedTypeError = TypeError,
+    TrustedRangeError = RangeError,
+    TrustedWeakMap = WeakMap,
+    TrustedWeakRef = WeakRef,
+    TrustedFinalizationRegistry = FinalizationRegistry,
+    trustedWeakMapGet = Function.call.bind(WeakMap.prototype.get),
+    trustedWeakMapSet = Function.call.bind(WeakMap.prototype.set),
+    trustedWeakMapHas = Function.call.bind(WeakMap.prototype.has),
+    trustedWeakSetAdd = Function.call.bind(WeakSet.prototype.add),
+    trustedWeakSetHas = Function.call.bind(WeakSet.prototype.has),
+    trustedWeakRefDeref = Function.call.bind(WeakRef.prototype.deref),
+    trustedFinalizationRegistryRegister = Function.call.bind(
+      FinalizationRegistry.prototype.register,
+    ),
+    trustedFinalizationRegistryUnregister = Function.call.bind(
+      FinalizationRegistry.prototype.unregister,
+    ),
+    trustedMapGet = Function.call.bind(Map.prototype.get),
+    trustedMapSet = Function.call.bind(Map.prototype.set),
+    trustedMapHas = Function.call.bind(Map.prototype.has),
+    trustedMapDelete = Function.call.bind(Map.prototype.delete),
+    trustedMapEntries = Function.call.bind(Map.prototype.entries),
+    trustedMapSize = Function.call.bind(
+      Object.getOwnPropertyDescriptor(Map.prototype, "size").get,
+    ),
+    trustedArraySort = Function.call.bind(Array.prototype.sort),
+    trustedObjectCreate = Object.create,
+    trustedObjectFreeze = Object.freeze,
+    trustedDefineProperty = Object.defineProperty,
+    trustedStringLower = Function.call.bind(String.prototype.toLowerCase),
+    arrayBufferIsView = ArrayBuffer.isView,
+    Uint8ArrayCtor = Uint8Array,
+    trustedArrayBufferByteLength = Function.call.bind(
+      Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get,
+    ),
+    typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype),
+    trustedTypedArrayBuffer = Function.call.bind(
+      Object.getOwnPropertyDescriptor(typedArrayPrototype, "buffer").get,
+    ),
+    trustedTypedArrayByteOffset = Function.call.bind(
+      Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteOffset").get,
+    ),
+    trustedTypedArrayByteLength = Function.call.bind(
+      Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteLength").get,
+    ),
+    trustedDataViewBuffer = Function.call.bind(
+      Object.getOwnPropertyDescriptor(DataView.prototype, "buffer").get,
+    ),
+    trustedDataViewByteOffset = Function.call.bind(
+      Object.getOwnPropertyDescriptor(DataView.prototype, "byteOffset").get,
+    ),
+    trustedDataViewByteLength = Function.call.bind(
+      Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get,
+    ),
+    trustedCryptoRandomFill = globalThis.__tilefinchCryptoRandomFill,
+    trustedUint8ArraySet = Function.call.bind(Uint8Array.prototype.set),
+    isArrayBuffer = (value) => {
+      try {
+        trustedArrayBufferByteLength(value);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    },
+    copyArrayBufferBytes = (buffer, byteOffset = 0, byteLength) => {
+      const bufferLength = trustedArrayBufferByteLength(buffer);
+      if (byteLength === undefined) byteLength = bufferLength - byteOffset;
+      const source = new Uint8ArrayCtor(buffer, byteOffset, byteLength),
+        copy = new Uint8ArrayCtor(byteLength);
+      trustedUint8ArraySet(copy, source, 0);
+      return copy;
+    },
+    copyArrayBufferViewBytes = (view) => {
+      let buffer, byteOffset, byteLength;
+      try {
+        buffer = trustedTypedArrayBuffer(view);
+        byteOffset = trustedTypedArrayByteOffset(view);
+        byteLength = trustedTypedArrayByteLength(view);
+      } catch (_) {
+        buffer = trustedDataViewBuffer(view);
+        byteOffset = trustedDataViewByteOffset(view);
+        byteLength = trustedDataViewByteLength(view);
+      }
+      return copyArrayBufferBytes(buffer, byteOffset, byteLength);
+    };
   /* See dom.js: hardening.js only sees the globals that exist when it runs,
      so anything created on first write is declared here instead. */
   for (const [name, initial] of [
@@ -20,7 +108,12 @@
       value: initial,
     });
   {
-    let pageVisible = true;
+    let pageVisible = true,
+      recordVisibilityState =
+        typeof globalThis.__tilefinchRecordVisibilityPerformance === "function"
+          ? globalThis.__tilefinchRecordVisibilityPerformance
+          : null;
+    delete globalThis.__tilefinchRecordVisibilityPerformance;
     const dispatchVisibility = document.dispatchEvent.bind(document);
     Object.defineProperty(document, "visibilityState", {
       configurable: true,
@@ -41,6 +134,12 @@
       visible = !!visible;
       if (visible === pageVisible) return false;
       pageVisible = visible;
+      /* HTML queues the timeline entry before visibilitychange. Performance
+         telemetry is optional to the lifecycle itself: a refused entry must
+         not suppress the state transition or its event. */
+      try {
+        recordVisibilityState?.(pageVisible ? "visible" : "hidden");
+      } catch (_) {}
       dispatchVisibility(new globalThis.Event("visibilitychange"));
       return true;
     };
@@ -344,7 +443,8 @@
       });
     }
     preventDefault() {
-      if (this.cancelable && !this.__passive) this.defaultPrevented = true;
+      const state = eventState(this);
+      if (state.cancelable && !state.passive) state.defaultPrevented = true;
     }
     stopPropagation() {
       this.__stopped = true;
@@ -365,14 +465,15 @@
     initEvent(type, bubbles = false, cancelable = false) {
       if (arguments.length < 1)
         throw new TypeError("Event type is required");
-      if (this.__dispatching) return;
-      this.type = String(type);
-      this.bubbles = !!bubbles;
-      this.cancelable = !!cancelable;
-      this.defaultPrevented = false;
-      this.__initialized = true;
-      this.__stopped = false;
-      this.__immediateStopped = false;
+      const state = eventState(this);
+      if (state.dispatching) return;
+      state.type = String(type);
+      state.bubbles = !!bubbles;
+      state.cancelable = !!cancelable;
+      state.defaultPrevented = false;
+      state.initialized = true;
+      state.stopped = false;
+      state.immediateStopped = false;
     }
   };
   const eventField = (name, convert, writable = true) => ({
@@ -384,11 +485,11 @@
     } : undefined,
   });
   Object.defineProperties(Event.prototype, {
-    type: eventField("type", String),
-    bubbles: eventField("bubbles", Boolean),
-    cancelable: eventField("cancelable", Boolean),
-    composed: eventField("composed", Boolean),
-    defaultPrevented: eventField("defaultPrevented", Boolean),
+    type: eventField("type", String, false),
+    bubbles: eventField("bubbles", Boolean, false),
+    cancelable: eventField("cancelable", Boolean, false),
+    composed: eventField("composed", Boolean, false),
+    defaultPrevented: eventField("defaultPrevented", Boolean, false),
     eventPhase: eventField("eventPhase", (value) => Number(value) || 0),
     currentTarget: eventField("currentTarget", (value) => value ?? null),
     target: eventField("target", (value) => value ?? null),
@@ -784,6 +885,27 @@
       value: "MessageEvent",
     },
   });
+  /* Native messaging already has a serialized value.  It must not feed that
+     value back through MessageEventInit dictionary defaults: a serialized
+     undefined is observably distinct from the dictionary's omitted-data null
+     default.  Keep this constructor hidden and immutable for trusted bootstrap
+     delivery paths. */
+  Object.defineProperty(globalThis, "__tilefinchCreateMessageEvent", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value(type, data, origin = "", source = null, ports = []) {
+      const event = new MessageEvent(type);
+      messageEventStateSet(event, {
+        data,
+        origin: String(origin),
+        lastEventId: "",
+        source: source ?? null,
+        ports: messageEventPorts(ports),
+      });
+      return event;
+    },
+  });
   Object.defineProperties(MessageEvent.prototype, {
     initMessageEvent: {
       configurable: true,
@@ -910,6 +1032,31 @@
     Object.defineProperty(FileReader, name, { value });
     Object.defineProperty(FileReader.prototype, name, { value });
   }
+  /* Worker teardown must cancel an owner-backed FileReader without emitting
+     abort/loadend into a realm that has already been retired. */
+  Object.defineProperty(globalThis, "__tilefinchAbortFileReaderForWorker", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value(reader) {
+      if (!(reader instanceof FileReader)) return false;
+      if (reader._task) __tilefinchCancelTimer(reader._task);
+      reader._task = 0;
+      reader.readyState = FileReader.DONE;
+      reader.result = null;
+      reader.error = new DOMException("Worker is terminated", "AbortError");
+      return true;
+    },
+  });
+  Object.defineProperty(globalThis, "__tilefinchBlobTextForWorker", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value(blob, encoding = "utf-8") {
+      return new TextDecoder(String(encoding || "utf-8")).decode(
+        tilefinchBlobBytes(blob));
+    },
+  });
   const markFocus = (target, on) => {
     if (!target?.__handle) return;
     if (on) __tilefinchSetAttribute(target.__handle, "data-tilefinch-focus", "");
@@ -1229,8 +1376,7 @@
     const form = target.closest("form"),
       name = target.name,
       peers = name
-        ? document
-            .querySelectorAll("input")
+        ? Array.from(document.querySelectorAll("input"))
             .filter(
               (item) =>
                 item instanceof HTMLInputElement &&
@@ -1773,9 +1919,7 @@
                     false,
                     Event.BUBBLING_PHASE,
                   );
-              event.currentTarget = null;
-              event.eventPhase = Event.NONE;
-              event.__dispatching = false;
+              globalThis.__tilefinchFinishEventDispatch(event);
               return !event.defaultPrevented;
             },
           },
@@ -2196,87 +2340,305 @@
     document.createCDATASection = (data) =>
       detachedLeaf(document, Node.CDATA_SECTION_NODE, "#cdata-section", data);
   }
-  globalThis.AbortSignal = class AbortSignal {
-    constructor() {
-      this.aborted = false;
-      this.reason = undefined;
-      this.onabort = null;
-      this._listeners = [];
-    }
-    addEventListener(type, callback, options = {}) {
-      if (String(type) !== "abort" || typeof callback !== "function") return;
-      if (!this._listeners.some((item) => item.callback === callback))
-        this._listeners.push({ callback, once: !!options?.once });
-    }
-    removeEventListener(type, callback) {
-      if (String(type) !== "abort") return;
-      this._listeners = this._listeners.filter(
-        (item) => item.callback !== callback,
-      );
-    }
-    dispatchEvent(event) {
-      if (String(event?.type) !== "abort") return true;
-      event.target = this;
-      if (typeof this.onabort === "function")
-        globalThis.__tilefinchRunTask(
-          "abort-handler",
-          this.onabort,
-          this,
-          [event],
-        );
-      for (const item of [...this._listeners]) {
-        globalThis.__tilefinchRunTask(
-          "abort-listener",
-          item.callback,
-          this,
-          [event],
-        );
-        if (item.once) this.removeEventListener("abort", item.callback);
-      }
+  const defaultAbortReason = () =>
+    new DOMException("This operation was aborted", "AbortError"),
+    abortSignalToken = Object.freeze({}),
+    abortSignalStates = new TrustedWeakMap(),
+    abortControllerStates = new TrustedWeakMap(),
+    abortSignalState = (signal) => {
+      const state = trustedWeakMapGet(abortSignalStates, signal);
+      if (!state) throw new TrustedTypeError("Illegal invocation");
+      return state;
+    },
+    abortControllerState = (controller) => {
+      const state = trustedWeakMapGet(abortControllerStates, controller);
+      if (!state) throw new TrustedTypeError("Illegal invocation");
+      return state;
+    },
+    addAbortAlgorithm = (signal, algorithm) => {
+      const state = abortSignalState(signal);
+      if (state.aborted) return false;
+      if (state.algorithms.length >= 128)
+        throw new RangeError("Abort algorithm limit exceeded");
+      state.algorithms.push(algorithm);
       return true;
+    },
+    removeAbortAlgorithm = (signal, algorithm) => {
+      const state = abortSignalState(signal),
+        at = state.algorithms.indexOf(algorithm);
+      if (at >= 0) state.algorithms.splice(at, 1);
+    },
+    addAbortDependent = (source, dependent) => {
+      const state = abortSignalState(source),
+        retained = state.dependents;
+      let write = 0;
+      for (let at = 0; at < retained.length; at++)
+        if (trustedWeakRefDeref(retained[at].target))
+          retained[write++] = retained[at];
+      retained.length = write;
+      if (retained.length >= 128)
+        throw new RangeError("Abort dependency limit exceeded");
+      const entry = { target: new TrustedWeakRef(dependent) };
+      retained.push(entry);
+      return entry;
+    },
+    removeAbortDependent = (source, entry) => {
+      const retained = abortSignalState(source).dependents,
+        at = retained.indexOf(entry);
+      if (at >= 0) retained.splice(at, 1);
+    },
+    abortRootSignals = (signals) => {
+      const roots = [];
+      for (const signal of signals) {
+        const state = abortSignalState(signal),
+          candidates = state.sourceSignals === null
+            ? [signal] : state.sourceSignals;
+        for (const candidate of candidates) {
+          if (roots.includes(candidate)) continue;
+          if (roots.length >= 64)
+            throw new RangeError("AbortSignal source limit exceeded");
+          roots.push(candidate);
+        }
+      }
+      return roots;
+    },
+    registerAbortDependencies = (dependent, sources) => {
+      const subscriptions = [];
+      try {
+        for (const source of sources)
+          subscriptions.push({
+            signal: source,
+            entry: addAbortDependent(source, dependent),
+          });
+      } catch (error) {
+        for (const item of subscriptions)
+          removeAbortDependent(item.signal, item.entry);
+        throw error;
+      }
+      abortSignalState(dependent).sourceSignals = sources.slice();
+      return subscriptions;
+    },
+    markAbortSignal = (signal, reason, queue) => {
+      const state = abortSignalState(signal);
+      if (state.aborted) return false;
+      state.aborted = true;
+      state.reason = reason === undefined ? defaultAbortReason() : reason;
+      state.nextAbortEvent = null;
+      if (queue.tail)
+        abortSignalState(queue.tail).nextAbortEvent = signal;
+      else queue.head = signal;
+      queue.tail = signal;
+      return true;
+    },
+    abortSignal = (signal, reason) => {
+      const queue = { head: null, tail: null };
+      if (!markAbortSignal(signal, reason, queue)) return;
+      /* Flatten the dependent graph in source-registration order before
+       * running cleanup. Source listeners therefore observe every dependent
+       * as aborted, while listeners bound to a dependent remain installed
+       * until that dependent's own abort steps run. */
+      for (let current = queue.head; current;
+           current = abortSignalState(current).nextAbortEvent) {
+        const state = abortSignalState(current),
+          dependents = state.dependents.splice(0);
+        for (const entry of dependents) {
+          const dependent = trustedWeakRefDeref(entry.target);
+          if (dependent) markAbortSignal(dependent, state.reason, queue);
+        }
+      }
+      let current = queue.head;
+      while (current) {
+        const state = abortSignalState(current),
+          next = state.nextAbortEvent,
+          algorithms = state.algorithms.splice(0);
+        state.nextAbortEvent = null;
+        for (const algorithm of algorithms)
+          try { algorithm(); } catch (error) {
+            __tilefinchReportUncaught(error, "AbortSignal algorithm");
+          }
+        current.dispatchEvent(new Event("abort"));
+        current = next;
+      }
+    };
+  globalThis.AbortSignal = class AbortSignal extends EventTarget {
+    constructor(token) {
+      if (token !== abortSignalToken)
+        throw new TrustedTypeError("Illegal constructor");
+      super();
+      const state = {
+        aborted: false,
+        reason: undefined,
+        onabort: null,
+        onabortListener: null,
+        algorithms: [],
+        dependents: [],
+        /* null denotes an independent root. A dependent created from an empty
+         * sequence has an empty array and must not become a fictitious root. */
+        sourceSignals: null,
+        nextAbortEvent: null,
+      };
+      state.onabortListener = (event) => state.onabort?.call(this, event);
+      trustedWeakMapSet(abortSignalStates, this, state);
+    }
+    get aborted() {
+      return abortSignalState(this).aborted;
+    }
+    get reason() {
+      return abortSignalState(this).reason;
+    }
+    get onabort() {
+      return abortSignalState(this).onabort;
+    }
+    set onabort(callback) {
+      const state = abortSignalState(this);
+      const next = typeof callback === "function" ? callback : null;
+      if (state.onabort === null && next !== null)
+        super.addEventListener("abort", state.onabortListener);
+      else if (state.onabort !== null && next === null)
+        super.removeEventListener("abort", state.onabortListener);
+      state.onabort = next;
     }
     throwIfAborted() {
-      if (this.aborted) throw this.reason;
+      const state = abortSignalState(this);
+      if (state.aborted) throw state.reason;
     }
     static abort(
-      reason = new DOMException("This operation was aborted", "AbortError"),
+      reason = defaultAbortReason(),
     ) {
-      const signal = new AbortSignal();
-      signal._abort(reason);
+      const signal = new AbortSignal(abortSignalToken);
+      abortSignal(signal, reason);
       return signal;
     }
     static timeout(milliseconds) {
-      const signal = new AbortSignal();
+      milliseconds = Number(milliseconds);
+      if (!Number.isFinite(milliseconds) || milliseconds < 0)
+        throw new RangeError("Invalid abort timeout");
+      milliseconds = Math.min(0xffffffff, Math.trunc(milliseconds));
+      const signal = new AbortSignal(abortSignalToken);
       setTimeout(
         () =>
-          signal._abort(
+          abortSignal(signal,
             new DOMException("The operation timed out", "TimeoutError"),
           ),
-        Math.max(0, Number(milliseconds) || 0),
+        milliseconds,
       );
       return signal;
     }
-    _abort(reason) {
-      if (this.aborted) return;
-      this.aborted = true;
-      this.reason =
-        reason === undefined
-          ? new DOMException("This operation was aborted", "AbortError")
-          : reason;
-      this.dispatchEvent(new Event("abort"));
+    static any(signals) {
+      if (signals === null || signals === undefined
+          || typeof signals[Symbol.iterator] !== "function")
+        throw new TypeError("AbortSignal sequence required");
+      const result = new AbortSignal(abortSignalToken),
+        inputs = [];
+      let subscriptions = [];
+      let count = 0;
+      const cleanup = () => {
+        for (const item of subscriptions)
+          removeAbortDependent(item.signal, item.entry);
+        subscriptions.length = 0;
+      };
+      try {
+        for (const signal of signals) {
+          if (++count > 64)
+            throw new RangeError("AbortSignal sequence limit exceeded");
+          if (!(signal instanceof AbortSignal))
+            throw new TypeError("AbortSignal sequence contains invalid value");
+          inputs.push(signal);
+        }
+        /* Web IDL converts the complete sequence before the DOM algorithm
+         * examines signal state. This also preserves the first aborted input's
+         * reason when iterator side effects abort more than one source. */
+        for (const signal of inputs) {
+          if (signal.aborted) {
+            abortSignal(result, signal.reason);
+            return result;
+          }
+        }
+        subscriptions = registerAbortDependencies(
+          result, abortRootSignals(inputs));
+        addAbortAlgorithm(result, cleanup);
+      } catch (error) {
+        cleanup();
+        throw error;
+      }
+      return result;
     }
   };
   globalThis.AbortController = class AbortController {
     constructor() {
-      this.signal = new AbortSignal();
+      trustedWeakMapSet(abortControllerStates, this, {
+        signal: new AbortSignal(abortSignalToken),
+      });
+    }
+    get signal() {
+      return abortControllerState(this).signal;
     }
     abort(reason) {
-      this.signal._abort(reason);
+      abortSignal(abortControllerState(this).signal, reason);
     }
   };
+  trustedDefineProperty(globalThis, "__tilefinchAddAbortAlgorithm", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: addAbortAlgorithm,
+  });
+  trustedDefineProperty(globalThis, "__tilefinchRemoveAbortAlgorithm", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: removeAbortAlgorithm,
+  });
+  const requestSignalFollowers = new TrustedFinalizationRegistry((held) => {
+      for (const item of held.subscriptions) {
+        const source = trustedWeakRefDeref(item.source);
+        if (source) removeAbortDependent(source, item.entry);
+      }
+    }),
+    followAbortSignal = (source) => {
+      const signal = new AbortSignal(abortSignalToken),
+        sourceState = abortSignalState(source);
+      if (sourceState.aborted) {
+        abortSignal(signal, sourceState.reason);
+        return { signal, dispose() {} };
+      }
+      const subscriptions = registerAbortDependencies(
+        signal, abortRootSignals([source]));
+      let active = true;
+      const dispose = () => {
+        if (!active) return;
+        active = false;
+        for (const item of subscriptions)
+          removeAbortDependent(item.signal, item.entry);
+        subscriptions.length = 0;
+        trustedFinalizationRegistryUnregister(requestSignalFollowers, signal);
+      };
+      addAbortAlgorithm(signal, dispose);
+      trustedFinalizationRegistryRegister(
+        requestSignalFollowers,
+        signal,
+        {
+          subscriptions: subscriptions.map((item) => ({
+            source: new TrustedWeakRef(item.signal),
+            entry: item.entry,
+          })),
+        },
+        signal,
+      );
+      return { signal, dispose };
+    };
+  Object.defineProperty(globalThis, "__tilefinchAbortSignalBrand", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value(signal) {
+      return abortSignalState(signal).aborted;
+    },
+  });
   const httpTokenPattern = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
   const isHttpToken = (value) => httpTokenPattern.test(String(value));
-  const invalidHeaderValue = (value) => /[\x00-\x1f\x7f]/.test(String(value));
+  const invalidHeaderValue = (value) =>
+    /[\x00-\x08\x0a-\x1f\x7f]/.test(String(value));
   const normalizeHeaderName = (name) => {
     name = String(name);
     if (!isHttpToken(name)) throw new TypeError("Invalid HTTP header name");
@@ -2286,7 +2648,7 @@
     value = String(value);
     if (invalidHeaderValue(value))
       throw new TypeError("Invalid HTTP header value");
-    return value.replace(/^ +| +$/g, "");
+    return value.replace(/^[ \t]+|[ \t]+$/g, "");
   };
   const forbiddenMethod = (method) =>
     ["CONNECT", "TRACE", "TRACK"].includes(String(method).toUpperCase());
@@ -2316,11 +2678,26 @@
       return setRequestHeader.call(this, name, value);
     };
   };
+  const headerStorage = new TrustedWeakMap(),
+    headerMap = (headers) => {
+      if (!trustedWeakMapHas(headerStorage, headers))
+        throw new TrustedTypeError("Illegal invocation");
+      return trustedWeakMapGet(headerStorage, headers);
+    },
+    sortedHeaderEntries = (headers) => {
+      const entries = [];
+      for (const pair of trustedMapEntries(headerMap(headers)))
+        entries.push([pair[0], pair[1]]);
+      trustedArraySort(entries, (left, right) =>
+        left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0);
+      return entries;
+    };
   class Headers {
     constructor(init = {}) {
-      this.map = new Map();
+      trustedWeakMapSet(headerStorage, this, new Map());
       if (init instanceof Headers) {
-        init.forEach((v, k) => this.set(k, v));
+        for (const [key, value] of trustedMapEntries(headerMap(init)))
+          this.set(key, value);
       } else if (typeof init === "string") {
         for (const line of init.split("\n")) {
           if (!line) continue;
@@ -2328,54 +2705,275 @@
           if (at <= 0) throw new TypeError("Invalid HTTP header block");
           this.append(line.slice(0, at), line.slice(at + 1));
         }
-      } else if (Array.isArray(init)) {
+      } else if (init !== null
+                 && typeof init?.[Symbol.iterator] === "function") {
+        let count = 0;
         for (const pair of init) {
-          if (!pair || pair.length !== 2)
+          if (++count > 256)
+            throw new RangeError("Header entry limit exceeded");
+          if (pair === null || pair === undefined
+              || typeof pair[Symbol.iterator] !== "function")
             throw new TypeError("Header pair must contain two values");
-          this.append(pair[0], pair[1]);
+          const values = [];
+          for (const value of pair) {
+            if (values.length >= 2)
+              throw new TypeError("Header pair must contain two values");
+            values.push(value);
+          }
+          if (values.length !== 2)
+            throw new TypeError("Header pair must contain two values");
+          this.append(values[0], values[1]);
         }
       } else if (init && typeof init === "object") {
-        for (const key of Object.keys(init)) this.set(key, init[key]);
+        const keys = Object.keys(init);
+        if (keys.length > 256)
+          throw new RangeError("Header entry limit exceeded");
+        for (const key of keys) this.set(key, init[key]);
       }
     }
     append(name, value) {
       name = normalizeHeaderName(name);
       value = normalizeHeaderValue(value);
-      this.map.set(
+      const map = headerMap(this);
+      if (!trustedMapHas(map, name)
+          && trustedMapSize(map) >= 256)
+        throw new RangeError("Header entry limit exceeded");
+      trustedMapSet(
+        map,
         name,
-        this.map.has(name) ? this.map.get(name) + ", " + value : value,
+        trustedMapHas(map, name) ? trustedMapGet(map, name) + ", " + value : value,
       );
     }
     set(name, value) {
-      this.map.set(normalizeHeaderName(name), normalizeHeaderValue(value));
+      name = normalizeHeaderName(name);
+      const map = headerMap(this);
+      if (!trustedMapHas(map, name)
+          && trustedMapSize(map) >= 256)
+        throw new RangeError("Header entry limit exceeded");
+      trustedMapSet(map, name, normalizeHeaderValue(value));
     }
     get(name) {
-      return this.map.get(normalizeHeaderName(name)) ?? null;
+      return trustedMapGet(headerMap(this), normalizeHeaderName(name)) ?? null;
     }
     has(name) {
-      return this.map.has(normalizeHeaderName(name));
+      return trustedMapHas(headerMap(this), normalizeHeaderName(name));
     }
     delete(name) {
-      this.map.delete(normalizeHeaderName(name));
+      trustedMapDelete(headerMap(this), normalizeHeaderName(name));
     }
     forEach(callback, thisArg) {
-      for (const [key, value] of this.map)
-        callback.call(thisArg, value, key, this);
+      if (typeof callback !== "function")
+        throw new TrustedTypeError("Headers callback must be a function");
+      for (const [key, value] of sortedHeaderEntries(this))
+        trustedFunctionApply(callback, thisArg, [value, key, this]);
     }
     entries() {
-      return this.map.entries();
+      return sortedHeaderEntries(this)[Symbol.iterator]();
+    }
+    keys() {
+      const keys = [];
+      for (const [key] of sortedHeaderEntries(this)) keys.push(key);
+      return keys[Symbol.iterator]();
+    }
+    values() {
+      const values = [];
+      for (const [, value] of sortedHeaderEntries(this)) values.push(value);
+      return values[Symbol.iterator]();
     }
     [Symbol.iterator]() {
       return this.entries();
     }
   }
+  const inferredRequestBodyContentType = (source) => {
+    if (source === null || source === undefined) return "";
+    if (source instanceof URLSearchParams)
+      return "application/x-www-form-urlencoded;charset=UTF-8";
+    /* FormData chooses a fresh boundary while its entries are snapshotted so
+       the delimiter can be checked against every retained part. */
+    if (source instanceof FormData) return "";
+    if (source instanceof Blob) return source.type || "";
+    if (isArrayBuffer(source) || arrayBufferIsView(source)) return "";
+    /* Fetch's BodyInit extraction converts every remaining admitted value to
+       a USVString and supplies this MIME type when the caller did not provide
+       one.  Keep the decision on the Request so headers reflect it before the
+       body is consumed, and so Window, Worker, XHR and sendBeacon share the
+       same wire behavior. */
+    return "text/plain;charset=UTF-8";
+  },
+    ensureRequestBodyContentType = (headers, source) => {
+      if (headers.has("content-type")) return;
+      const inferredType = inferredRequestBodyContentType(source);
+      if (inferredType) headers.set("content-type", inferredType);
+    },
+    requestBodyByteLimit = 256 * 1024,
+    requestReferrerPolicies = new Set([
+      "",
+      "no-referrer",
+      "no-referrer-when-downgrade",
+      "origin",
+      "origin-when-cross-origin",
+      "same-origin",
+      "strict-origin",
+      "strict-origin-when-cross-origin",
+      "unsafe-url",
+    ]),
+    normalizeRequestReferrer = (value) => {
+      value = String(value);
+      if (value === "" || value === "about:client") return value;
+      const parsed = new URL(value, location.href);
+      if (parsed.origin !== location.origin)
+        throw new TypeError("Request referrer must be same-origin");
+      const href = parsed.href,
+        fragment = href.indexOf("#");
+      return fragment < 0 ? href : href.slice(0, fragment);
+    },
+    snapshotRequestBody = (source, headers) => {
+      if (source === null || source === undefined) return null;
+      const encoder = new TextEncoder(),
+        admit = (bytes) => {
+          if (bytes.byteLength > requestBodyByteLimit)
+            throw new RangeError("Request body exceeds bounded size");
+          return bytes;
+        };
+      if (source instanceof URLSearchParams) {
+        ensureRequestBodyContentType(headers, source);
+        return admit(encoder.encode(source.toString()));
+      }
+      if (source instanceof FormData) {
+        const entries = [], random = new Uint8ArrayCtor(18);
+        let total = 0;
+        for (const [name, value] of source) {
+          const bytes = value instanceof Blob
+            ? tilefinchBlobBytes(value) : encoder.encode(String(value));
+          if (bytes.byteLength > requestBodyByteLimit - total)
+            throw new RangeError("FormData body exceeds bounded size");
+          entries.push({ name: String(name), value, bytes });
+          total += bytes.byteLength;
+        }
+        const contains = (bytes, text) => {
+          const needle = encoder.encode(text);
+          if (needle.byteLength > bytes.byteLength) return false;
+          outer: for (let at = 0;
+               at <= bytes.byteLength - needle.byteLength; at++) {
+            for (let index = 0; index < needle.byteLength; index++)
+              if (bytes[at + index] !== needle[index]) continue outer;
+            return true;
+          }
+          return false;
+        };
+        let boundary = "";
+        for (let attempt = 0; attempt < 8 && !boundary; attempt++) {
+          trustedCryptoRandomFill(random);
+          let suffix = "";
+          for (let index = 0; index < random.length; index++)
+            suffix += random[index].toString(16).padStart(2, "0");
+          const candidate = "----tilefinch-" + suffix;
+          if (!entries.some((entry) => contains(entry.bytes, candidate)))
+            boundary = candidate;
+        }
+        if (!boundary)
+          throw new RangeError("Unable to choose multipart boundary");
+        if (!headers.has("content-type"))
+          headers.set("content-type", "multipart/form-data; boundary=" + boundary);
+        const chunks = [];
+        total = 0;
+        const append = (bytes) => {
+          if (!(bytes instanceof Uint8Array)) bytes = encoder.encode(String(bytes));
+          if (bytes.byteLength > requestBodyByteLimit - total)
+            throw new RangeError("FormData body exceeds bounded size");
+          chunks.push(bytes);
+          total += bytes.byteLength;
+        },
+          quote = (value) => String(value)
+            .replaceAll("\r", "%0D")
+            .replaceAll("\n", "%0A")
+            .replaceAll('"', "%22"),
+          normalizeLineBreaks = (value) => String(value)
+            .replace(/\r\n|\r|\n/g, "\r\n");
+        for (const entry of entries) {
+          const { name, value } = entry;
+          append("--" + boundary +
+            "\r\nContent-Disposition: form-data; name=\"" + quote(name) + "\"");
+          if (value instanceof File)
+            append('; filename="' + quote(value.name) + '"');
+          append("\r\n");
+          if (value instanceof Blob && value.type)
+            append("Content-Type: " + value.type + "\r\n");
+          append("\r\n");
+          append(value instanceof Blob ? entry.bytes : normalizeLineBreaks(value));
+          append("\r\n");
+        }
+        append("--" + boundary + "--\r\n");
+        const bytes = new Uint8Array(total);
+        let offset = 0;
+        for (const chunk of chunks) {
+          bytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        return bytes;
+      }
+      ensureRequestBodyContentType(headers, source);
+      if (source instanceof Blob)
+        return admit(tilefinchBlobBytes(source).slice());
+      if (isArrayBuffer(source)) return admit(copyArrayBufferBytes(source));
+      if (arrayBufferIsView(source))
+        return admit(copyArrayBufferViewBytes(source));
+      return admit(encoder.encode(String(source)));
+    };
+  const requestBodyStorage = new TrustedWeakMap(),
+    requestBodyState = (request) => {
+      if (!trustedWeakMapHas(requestBodyStorage, request))
+        throw new TrustedTypeError("Illegal invocation");
+      return trustedWeakMapGet(requestBodyStorage, request);
+    },
+    consumeRequestBody = async (request, signal = null, release = false) => {
+      const state = requestBodyState(request);
+      if (state.body === null) return new Uint8Array();
+      const bytes = await __tilefinchConsumeReadableByteStream(
+        state.body, requestBodyByteLimit, signal, release);
+      state.bytes = null;
+      return bytes;
+    },
+    proxyRequestBody = (source) => {
+      const reader = source.getReader();
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        reader.releaseLock();
+      };
+      return new ReadableStream({
+        async pull(controller) {
+          try {
+            const result = await reader.read();
+            if (result.done) {
+              release();
+              controller.close();
+            } else controller.enqueue(result.value);
+          } catch (error) {
+            release();
+            throw error;
+          }
+        },
+        async cancel(reason) {
+          try {
+            return await reader.cancel(reason);
+          } finally {
+            release();
+          }
+        },
+      });
+    };
   let Response;
   class Request {
     constructor(input, init = {}) {
       const prior = input instanceof Request ? input : null;
-      if (prior && prior.bodyUsed && init.body === undefined)
+      const initBody = init.body,
+        inheritsBody = prior && (initBody === undefined || initBody === null),
+        priorBody = prior ? requestBodyState(prior) : null;
+      if (inheritsBody && (prior.bodyUsed || prior.body?.locked))
         throw new TypeError("Body has already been consumed");
-      this.url = prior
+      const url = prior
         ? prior.url
         : new URL(String(input), location.href).href;
       const method = String(
@@ -2387,165 +2985,160 @@
       );
       if (!isHttpToken(method) || forbiddenMethod(method))
         throw new TypeError("Invalid HTTP method");
-      this.method = method.toUpperCase();
-      this.headers = new Headers(
+      const normalizedMethod = method.toUpperCase(),
+        headers = new Headers(
         init.headers === undefined
           ? prior
             ? prior.headers
             : {}
           : init.headers,
-      );
-      this._bodySource =
-        init.body === undefined
-          ? prior
-            ? prior._bodySource
-            : null
-          : init.body;
-      if (
-        (this.method === "GET" || this.method === "HEAD") &&
-        this._bodySource !== null &&
-        this._bodySource !== undefined
-      )
-        throw new TypeError("GET and HEAD requests cannot have a body");
-      this.bodyUsed = false;
-      this._bodyBytes = () => {
-        const body = this._bodySource;
-        if (body === null || body === undefined) return new Uint8Array();
-        if (body instanceof Blob) return tilefinchBlobBytes(body).slice();
-        if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
-        if (ArrayBuffer.isView(body))
-          return new Uint8Array(
-            body.buffer.slice(
-              body.byteOffset,
-              body.byteOffset + body.byteLength,
-            ),
-          );
-        return new TextEncoder().encode(String(body));
-      };
-      this.body =
-        this._bodySource === null || this._bodySource === undefined
-          ? null
-          : new ReadableStream({
-              start: (controller) => {
-                controller.enqueue(this._bodyBytes());
-                controller.close();
-              },
-            });
-      this.mode = String(
-        init.mode === undefined ? (prior ? prior.mode : "cors") : init.mode,
-      );
-      this.credentials = String(
-        init.credentials === undefined
-          ? prior
-            ? prior.credentials
-            : "same-origin"
-          : init.credentials,
-      );
-      if (!["same-origin", "cors", "no-cors"].includes(this.mode))
+        ),
+        mode = String(
+          init.mode === undefined ? (prior ? prior.mode : "cors") : init.mode,
+        ),
+        credentials = String(
+          init.credentials === undefined
+            ? prior ? prior.credentials : "same-origin"
+            : init.credentials,
+        ),
+        cache = String(
+          init.cache === undefined ? (prior ? prior.cache : "default")
+            : init.cache,
+        ),
+        redirect = String(
+          init.redirect === undefined ? (prior ? prior.redirect : "follow")
+            : init.redirect,
+        ),
+        referrer = normalizeRequestReferrer(
+          init.referrer === undefined
+            ? prior ? prior.referrer : "about:client"
+            : init.referrer,
+        ),
+        referrerPolicy = String(
+          init.referrerPolicy === undefined
+            ? prior ? prior.referrerPolicy : ""
+            : init.referrerPolicy,
+        ),
+        integrity = String(
+          init.integrity === undefined ? (prior ? prior.integrity : "")
+            : init.integrity,
+        ),
+        keepalive = init.keepalive === undefined
+          ? prior ? prior.keepalive : false
+          : !!init.keepalive,
+        signal = init.signal === undefined
+          ? (prior ? prior.signal : null)
+          : init.signal;
+      if (!["same-origin", "cors", "no-cors"].includes(mode))
         throw new TypeError("Invalid request mode");
-      if (!["omit", "same-origin", "include"].includes(this.credentials))
+      if (!["omit", "same-origin", "include"].includes(credentials))
         throw new TypeError("Invalid credentials mode");
-      this.cache = String(
-        init.cache === undefined ? (prior ? prior.cache : "default") : init.cache,
-      );
-      if (
-        ![
-          "default",
-          "no-store",
-          "reload",
-          "no-cache",
-          "force-cache",
-          "only-if-cached",
-        ].includes(this.cache)
-      )
+      if (![
+        "default", "no-store", "reload", "no-cache", "force-cache",
+        "only-if-cached",
+      ].includes(cache))
         throw new TypeError("Invalid request cache mode");
-      if (this.cache === "only-if-cached" && this.mode !== "same-origin")
+      if (cache === "only-if-cached" && mode !== "same-origin")
         throw new TypeError("only-if-cached requires same-origin mode");
-      this.redirect = String(
-        init.redirect === undefined
-          ? prior
-            ? prior.redirect
-            : "follow"
-          : init.redirect,
-      );
-      if (!["follow", "error", "manual"].includes(this.redirect))
+      if (!["follow", "error", "manual"].includes(redirect))
         throw new TypeError("Invalid redirect mode");
-      this.referrer = String(
-        init.referrer === undefined
-          ? prior
-            ? prior.referrer
-            : "about:client"
-          : init.referrer,
-      );
-      this.referrerPolicy = String(
-        init.referrerPolicy === undefined
-          ? prior
-            ? prior.referrerPolicy
-            : ""
-          : init.referrerPolicy,
-      );
-      this.integrity = String(
-        init.integrity === undefined
-          ? prior
-            ? prior.integrity
-            : ""
-          : init.integrity,
-      );
-      this.keepalive =
-        init.keepalive === undefined
-          ? prior
-            ? prior.keepalive
-            : false
-          : !!init.keepalive;
-      this.destination = "";
-      this.signal =
-        init.signal ||
-        (prior ? prior.signal : null) ||
-        new AbortController().signal;
+      if (!requestReferrerPolicies.has(referrerPolicy))
+        throw new TypeError("Invalid referrer policy");
+      if (signal !== null && !(signal instanceof AbortSignal))
+        throw new TypeError("Request signal must be an AbortSignal");
+      const bodySource = initBody === undefined ? null : initBody,
+        streamSource = bodySource instanceof ReadableStream
+          ? bodySource : null;
+      if (
+        streamSource &&
+        (streamSource.locked || __tilefinchReadableStreamDisturbed(streamSource))
+      )
+        throw new TypeError("Request body stream is unusable");
+      if (streamSource && init.duplex !== "half")
+        throw new TypeError("Streaming Request body requires duplex: 'half'");
+      const bodyPresent = inheritsBody
+        ? priorBody.body !== null
+        : bodySource !== null && bodySource !== undefined;
+      if ((normalizedMethod === "GET" || normalizedMethod === "HEAD") && bodyPresent)
+        throw new TypeError("GET and HEAD requests cannot have a body");
+      const follower = signal ? followAbortSignal(signal) : null,
+        requestSignal = follower
+          ? follower.signal : new AbortSignal(abortSignalToken);
+      try {
+        let bodyBytesSnapshot = streamSource
+          ? null
+          : snapshotRequestBody(bodySource, headers),
+          body = streamSource;
+        if (inheritsBody) {
+          bodyBytesSnapshot = priorBody.body === null
+            ? null
+            : __tilefinchConsumeBufferedReadableByteStream(
+                priorBody.body, requestBodyByteLimit);
+          priorBody.bytes = null;
+          body = priorBody.body === null
+            ? null
+            : bodyBytesSnapshot === null
+              ? proxyRequestBody(priorBody.body)
+              : null;
+        }
+        if (body === null && bodyBytesSnapshot !== null)
+          body = new ReadableStream({
+            start: (controller) => {
+              controller.enqueue(bodyBytesSnapshot);
+              controller.close();
+            },
+          });
+        const requestState = {
+          bytes: bodyBytesSnapshot,
+          body,
+          signal: requestSignal,
+        };
+        trustedWeakMapSet(requestBodyStorage, this, requestState);
+        this.url = url;
+        this.method = normalizedMethod;
+        this.headers = headers;
+        this.mode = mode;
+        this.credentials = credentials;
+        this.cache = cache;
+        this.redirect = redirect;
+        this.referrer = referrer;
+        this.referrerPolicy = referrerPolicy;
+        this.integrity = integrity;
+        this.keepalive = keepalive;
+        this.destination = "";
+        this.duplex = "half";
+      } catch (error) {
+        follower?.dispose();
+        throw error;
+      }
     }
-    _consume() {
-      if (this.bodyUsed) throw new TypeError("Body has already been consumed");
-      this.bodyUsed = true;
-      const serialized = serializeRequestBody(this);
-      if (serialized === undefined) return new Uint8Array();
-      if (typeof serialized === "string")
-        return new TextEncoder().encode(serialized);
-      return new Uint8Array(serialized);
+    get body() {
+      return requestBodyState(this).body;
+    }
+    get bodyUsed() {
+      return this.body !== null && __tilefinchReadableStreamDisturbed(this.body);
+    }
+    get signal() {
+      return requestBodyState(this).signal;
     }
     arrayBuffer() {
-      try {
-        return Promise.resolve(this._consume().buffer);
-      } catch (error) {
-        return Promise.reject(error);
-      }
+      return consumeRequestBody(this).then((bytes) => bytes.buffer);
     }
     bytes() {
-      try {
-        return Promise.resolve(this._consume());
-      } catch (error) {
-        return Promise.reject(error);
-      }
+      return consumeRequestBody(this);
     }
     text() {
-      try {
-        return Promise.resolve(new TextDecoder().decode(this._consume()));
-      } catch (error) {
-        return Promise.reject(error);
-      }
+      return consumeRequestBody(this).then(
+        (bytes) => new TextDecoder().decode(bytes));
     }
     json() {
       return this.text().then(JSON.parse);
     }
     blob() {
-      try {
-        return Promise.resolve(
-          new Blob([this._consume()], {
+      return consumeRequestBody(this).then(
+        (bytes) => new Blob([bytes], {
             type: this.headers.get("content-type") || "",
-          }),
-        );
-      } catch (error) {
-        return Promise.reject(error);
-      }
+          }));
     }
     formData() {
       return this.text().then((text) => {
@@ -2559,15 +3152,44 @@
       });
     }
     clone() {
-      if (this.bodyUsed) throw new TypeError("Body has already been consumed");
-      return new Request(this);
+      if (this.bodyUsed || this.body?.locked)
+        throw new TypeError("Body has already been consumed");
+      if (this.body === null) return new Request(this);
+      const state = requestBodyState(this),
+        branches = this.body.tee();
+      state.body = branches[0];
+      state.bytes = null;
+      return new Request(this, { body: branches[1], duplex: "half" });
     }
   }
   globalThis.Headers = Headers;
   globalThis.Request = Request;
   {
-    const subtle = {
+    const cryptoToken = {},
+      subtleToken = {},
+      cryptoInstances = new WeakSet(),
+      subtleInstances = new WeakSet(),
+      subtleBufferNormalizers = new WeakMap(),
+      cryptoSubtleInstances = new WeakMap(),
+      integerRandomViews = new Set([
+        "[object Int8Array]",
+        "[object Uint8Array]",
+        "[object Uint8ClampedArray]",
+        "[object Int16Array]",
+        "[object Uint16Array]",
+        "[object Int32Array]",
+        "[object Uint32Array]",
+        "[object BigInt64Array]",
+        "[object BigUint64Array]",
+      ]);
+    class SubtleCrypto {
+      constructor(token) {
+        if (token !== subtleToken) throw new TypeError("Illegal constructor");
+        subtleInstances.add(this);
+      }
       digest(algorithm, data) {
+        if (!subtleInstances.has(this))
+          throw new TypeError("Illegal invocation");
         try {
           const name =
             typeof algorithm === "string"
@@ -2582,39 +3204,48 @@
               "Unsupported digest algorithm",
               "NotSupportedError",
             );
-          let bytes;
-          if (data instanceof ArrayBuffer) bytes = new Uint8Array(data);
-          else if (ArrayBuffer.isView(data)) {
+          const normalizers = subtleBufferNormalizers.get(this);
+          if (normalizers) data = normalizers.input(data);
+          let source = data;
+          if (data instanceof ArrayBuffer)
+            source = new Uint8ArrayCtor(data);
+          else if (arrayBufferIsView(data)) {
             if (
               typeof SharedArrayBuffer !== "undefined" &&
               data.buffer instanceof SharedArrayBuffer
             )
               throw new TypeError("Shared BufferSource is not supported");
-            bytes = new Uint8Array(
-              data.buffer,
-              data.byteOffset,
-              data.byteLength,
-            );
-          } else throw new TypeError("BufferSource required");
-          return Promise.resolve(__tilefinchCryptoDigestSHA256(bytes));
+            source = new Uint8ArrayCtor(
+              data.buffer, data.byteOffset, data.byteLength);
+          }
+          /* Native admission handles a raw ArrayBuffer originating in another
+             bounded same-origin Window realm. Worker-local raw buffers were
+             normalized to a local view above before crossing realms. */
+          const result = Promise.resolve(
+            __tilefinchCryptoDigestSHA256(source));
+          return normalizers ? result.then(normalizers.output) : result;
         } catch (error) {
           return Promise.reject(error);
         }
-      },
-    };
-    const integerRandomViews = new Set([
-      "[object Int8Array]",
-      "[object Uint8Array]",
-      "[object Uint8ClampedArray]",
-      "[object Int16Array]",
-      "[object Uint16Array]",
-      "[object Int32Array]",
-      "[object Uint32Array]",
-      "[object BigInt64Array]",
-      "[object BigUint64Array]",
-    ]);
-    globalThis.crypto = {
+      }
+    }
+    Object.defineProperty(SubtleCrypto.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "SubtleCrypto",
+    });
+    class Crypto {
+      constructor(token) {
+        if (token !== cryptoToken) throw new TypeError("Illegal constructor");
+        cryptoInstances.add(this);
+      }
+      get subtle() {
+        if (!cryptoInstances.has(this))
+          throw new TypeError("Illegal invocation");
+        return cryptoSubtleInstances.get(this);
+      }
       getRandomValues(array) {
+        if (!cryptoInstances.has(this))
+          throw new TypeError("Illegal invocation");
         if (
           !ArrayBuffer.isView(array) ||
           !integerRandomViews.has(Object.prototype.toString.call(array))
@@ -2629,8 +3260,10 @@
             "QuotaExceededError",
           );
         return __tilefinchCryptoRandomFill(array);
-      },
+      }
       randomUUID() {
+        if (!cryptoInstances.has(this))
+          throw new TypeError("Illegal invocation");
         const b = this.getRandomValues(new Uint8Array(16));
         b[6] = (b[6] & 15) | 64;
         b[8] = (b[8] & 63) | 128;
@@ -2646,8 +3279,31 @@
           "-" +
           h.slice(20)
         );
-      },
-      subtle,
+      }
+    }
+    Object.defineProperty(Crypto.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "Crypto",
+    });
+    const createCrypto = () => {
+      const value = new Crypto(cryptoToken);
+      const subtle = new SubtleCrypto(subtleToken);
+      cryptoSubtleInstances.set(value, subtle);
+      return value;
+    };
+    globalThis.Crypto = Crypto;
+    globalThis.SubtleCrypto = SubtleCrypto;
+    globalThis.crypto = createCrypto();
+    /* Dedicated workers get a distinct platform object. Sharing the owner
+       object's mutable own properties would violate realm isolation. */
+    globalThis.__tilefinchCreateWorkerCrypto = createCrypto;
+    globalThis.__tilefinchSetCryptoBufferNormalizer = (
+      crypto, input, output,
+    ) => {
+      const subtle = cryptoSubtleInstances.get(crypto);
+      if (!subtle || typeof input !== "function" || typeof output !== "function")
+        throw new TypeError("invalid Crypto normalizer");
+      subtleBufferNormalizers.set(subtle, { input, output });
     };
   }
   if (globalThis.console === undefined) {
@@ -2699,8 +3355,6 @@
     "dnt",
     "expect",
     "host",
-    "if-modified-since",
-    "if-none-match",
     "keep-alive",
     "origin",
     "permissions-policy",
@@ -2733,80 +3387,50 @@
     nativeManagedHeaders.has(name);
   const nativeHeaderBlock = (headers) => {
     const lines = [];
-    headers.forEach((value, name) => {
+    for (let [name, value] of sortedHeaderEntries(headers)) {
       name = String(name).toLowerCase();
       value = String(value);
       if (!nativeForbiddenHeader(name)) lines.push(name + ": " + value);
-    });
+    }
     return lines.join("\n");
   };
   const serializeRequestBody = (request) => {
-    const source = request._bodySource;
-    if (source === null || source === undefined) return undefined;
-    if (source instanceof URLSearchParams) {
-      if (!request.headers.has("content-type"))
-        request.headers.set(
-          "content-type",
-          "application/x-www-form-urlencoded;charset=UTF-8",
-        );
-      return source.toString();
+    if (request instanceof Request) {
+      const state = requestBodyState(request);
+      if (state.body === null) return undefined;
+      const bytes = __tilefinchConsumeBufferedReadableByteStream(
+        state.body, requestBodyByteLimit);
+      if (bytes === null)
+        throw new TypeError("Streaming body requires asynchronous consumption");
+      state.bytes = null;
+      return bytes === null
+        ? undefined
+        : bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+          ? bytes.buffer
+          : bytes.slice().buffer;
     }
-    if (source instanceof FormData) {
-      const boundary = "----tilefinch-form-boundary",
-        chunks = [],
-        encoder = new TextEncoder();
-      let total = 0;
-      const append = (bytes) => {
-        if (!(bytes instanceof Uint8Array)) bytes = encoder.encode(String(bytes));
-        if (total + bytes.byteLength > 256 * 1024)
-          throw new RangeError("FormData body exceeds bounded size");
-        chunks.push(bytes);
-        total += bytes.byteLength;
-      };
-      const quote = (value) =>
-        String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"');
-      for (const [name, value] of source) {
-        append("--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + quote(name) + "\"");
-        if (value instanceof File) append('; filename="' + quote(value.name) + '"');
-        append("\r\n");
-        if (value instanceof Blob && value.type)
-          append("Content-Type: " + value.type + "\r\n");
-        append("\r\n");
-        append(value instanceof Blob ? tilefinchBlobBytes(value) : String(value));
-        append("\r\n");
-      }
-      append("--" + boundary + "--\r\n");
-      const bytes = new Uint8Array(total);
-      let offset = 0;
-      for (const chunk of chunks) {
-        bytes.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
-      request.headers.set(
-        "content-type",
-        "multipart/form-data; boundary=" + boundary,
-      );
-      return bytes.buffer;
-    }
-    if (source instanceof Blob) {
-      if (source.type && !request.headers.has("content-type"))
-        request.headers.set("content-type", source.type);
-      const sourceBytes = tilefinchBlobBytes(source);
-      return sourceBytes.buffer.slice(
-        sourceBytes.byteOffset,
-        sourceBytes.byteOffset + sourceBytes.byteLength,
-      );
-    }
-    if (source instanceof ArrayBuffer) return source;
-    if (ArrayBuffer.isView(source))
-      return source.buffer.slice(
-        source.byteOffset,
-        source.byteOffset + source.byteLength,
-      );
-    return String(source);
-  };
+    /* XHR and sendBeacon share this serializer through a small internal
+       request-shaped record. Snapshot those one-shot sources here; public
+       Request objects were already snapshotted by their constructor. */
+    const bytes = snapshotRequestBody(request._bodySource, request.headers);
+    return bytes === null
+      ? undefined
+      : bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+        ? bytes.buffer
+        : bytes.slice().buffer;
+  },
+    serializeRequestBodyAsync = async (request) => {
+      if (request.body === null) return undefined;
+      const bytes = await consumeRequestBody(request, request.signal, true);
+      return bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+        ? bytes.buffer
+        : bytes.slice().buffer;
+    };
   const networkQueueLimit = 128,
-    networkQueueByteLimit = 256 * 1024,
+    /* Mirror FETCH_REQUEST_BODY_LIMIT. A Request may be inspected locally up
+       to the broader Body mixin bound, but a network operation must reject
+       before retaining bytes the native scheduler cannot publish. */
+    networkQueueByteLimit = 96 * 1024,
     nativeNetworkLimit = 4;
   let nextNetworkId = 1,
     activeNetwork = 0;
@@ -2918,7 +3542,15 @@
       }
     }
   };
-  const queueNetwork = (start, bytes, resolve, reject) => {
+  const queueNetwork = (
+    start,
+    bytes,
+    resolve,
+    reject,
+    timingName = "",
+    timingInitiator = "",
+    timingRecorder = __tilefinchRecordResourceTiming,
+  ) => {
     bytes = Math.max(128, Math.floor(Number(bytes) || 128));
     if (
       networkQueueStats.currentCount >= networkQueueLimit ||
@@ -2940,6 +3572,9 @@
       start,
       resolve,
       reject,
+      timingName,
+      timingInitiator,
+      timingRecorder,
       bytes,
       state: "waiting",
     };
@@ -3000,7 +3635,26 @@
     }
     return pendingNetwork.size === 0;
   };
-  globalThis.__tilefinchDeliverNetwork = (id, ok, value) => {
+  globalThis.__tilefinchDeliverNetwork = (
+    id,
+    ok,
+    value,
+    timingAvailable = false,
+    nameLookupUs = 0,
+    connectUs = 0,
+    appconnectUs = 0,
+    firstByteUs = 0,
+    totalUs = 0,
+    encodedBodyBytes = 0,
+    decodedBodyBytes = 0,
+    measured = false,
+    cacheHit = false,
+    cacheValidated = false,
+    timingAllowed = false,
+    nextHopProtocol = 0,
+    responseStatus = 0,
+    contentType = "",
+  ) => {
     const entry = nativeNetwork.get(Number(id));
     if (!entry) {
       queueMicrotask(pumpNetworkQueue);
@@ -3014,6 +3668,29 @@
     networkQueueStats.completed++;
     if (!ok && /timeout|timed out/i.test(String(value || "")))
       networkQueueStats.timedOut++;
+    if (
+      timingAvailable && entry.timingName &&
+      typeof entry.timingRecorder === "function"
+    ) {
+      entry.timingRecorder(
+        entry.timingName,
+        entry.timingInitiator,
+        nameLookupUs,
+        connectUs,
+        appconnectUs,
+        firstByteUs,
+        totalUs,
+        encodedBodyBytes,
+        decodedBodyBytes,
+        measured,
+        cacheHit,
+        cacheValidated,
+        timingAllowed,
+        nextHopProtocol,
+        responseStatus,
+        contentType,
+      );
+    }
     if (ok) resolve(value);
     else reject(new TypeError(String(value || "network request failed")));
     queueMicrotask(pumpNetworkQueue);
@@ -3052,214 +3729,122 @@
   };
   globalThis.__tilefinchXHRSendCalls = 0;
   globalThis.__tilefinchXHRLastError = "";
+  const responseBrands = new WeakSet(),
+    responseMetadata = new WeakMap(),
+    responseBodyStorage = new TrustedWeakMap(),
+    responseBodyState = (response) => {
+      if (!trustedWeakMapHas(responseBodyStorage, response))
+        throw new TrustedTypeError("Illegal invocation");
+      return trustedWeakMapGet(responseBodyStorage, response);
+    };
   Response = class Response {
     constructor(body = null, init = {}) {
-      const streamBody = body instanceof ReadableStream ? body : null;
-      let supplied = init.bodyBytes;
-      if (supplied === undefined && body instanceof Blob)
-        supplied = tilefinchBlobBytes(body).slice().buffer;
-      else if (supplied === undefined && body instanceof ArrayBuffer)
-        supplied = body.slice(0);
-      else if (supplied === undefined && ArrayBuffer.isView(body))
-        supplied = body.buffer.slice(
-          body.byteOffset,
-          body.byteOffset + body.byteLength,
-        );
-      this._bytes =
-        supplied instanceof ArrayBuffer ? new Uint8Array(supplied) : null;
-      this._body = this._bytes || streamBody
-        ? null
-        : String(body === undefined || body === null ? "" : body);
-      this._streamBody = !!streamBody;
-      this._bodyText = () => {
-        if (this._streamBody)
-          throw new TypeError("Streaming body requires asynchronous consumption");
-        if (this._body === null) {
-          this._body = new TextDecoder().decode(
-            this._bytes || new Uint8Array(),
-          );
-          this._bytes = null;
-        }
-        return this._body;
-      };
-      this._bodyBytes = () => {
-        if (this._streamBody)
-          throw new TypeError("Streaming body requires asynchronous consumption");
-        /* Direct text()/arrayBuffer()/blob() consumption releases both
-           retained representations. A ReadableStream pull already queued by
-           the runtime may run afterward; it must not recreate an empty
-           retained byte buffer and pin it for the Response lifetime. */
-        if (this.bodyUsed && this._bytes === null && this._body === null)
-          return new Uint8Array();
-        if (!this._bytes) {
-          this._bytes = new TextEncoder().encode(this._body || "");
-          if (this.bodyUsed) this._body = null;
-        }
-        return this._bytes;
-      };
-      this.status = Number(init.status === undefined ? 200 : init.status);
+      const status = Number(init.status === undefined ? 200 : init.status);
       if (
-        this.status !== 0 &&
-        (!Number.isInteger(this.status) ||
-          this.status < 200 ||
-          this.status > 599)
+        status !== 0 &&
+        (!Number.isInteger(status) || status < 200 || status > 599)
       )
         throw new RangeError("Invalid response status");
-      if (
-        body !== null &&
-        body !== undefined &&
-        [101, 204, 205, 304].includes(this.status)
-      )
+      if (body !== null && body !== undefined &&
+          [101, 204, 205, 304].includes(status))
         throw new TypeError("Response status cannot have a body");
+      const headers = init.headers instanceof Headers
+        ? new Headers(init.headers)
+        : new Headers(init.headers);
+      const streamBody = body instanceof ReadableStream ? body : null;
+      if (
+        streamBody &&
+        (streamBody.locked || __tilefinchReadableStreamDisturbed(streamBody))
+      )
+        throw new TypeError("Response body stream is unusable");
+      const supplied = init.bodyBytes,
+        suppliedBodyBytes = supplied !== undefined;
+      let bytes = suppliedBodyBytes
+        ? isArrayBuffer(supplied)
+          ? copyArrayBufferBytes(supplied)
+          : arrayBufferIsView(supplied)
+            ? copyArrayBufferViewBytes(supplied)
+            : null
+        : streamBody ? null : snapshotRequestBody(body, headers);
+      if (suppliedBodyBytes && bytes === null)
+        throw new TypeError("Response bodyBytes must be a BufferSource");
+      const bodyState = { body: null };
+      trustedWeakMapSet(responseBodyStorage, this, bodyState);
+      this.status = status;
       this.statusText = String(
         init.statusText === undefined ? "" : init.statusText,
       );
       this.url = String(init.url === undefined ? "" : init.url);
-      this.headers =
-        init.headers instanceof Headers
-          ? new Headers(init.headers)
-          : new Headers(init.headers);
+      this.headers = headers;
+      trustedWeakSetAdd(responseBrands, this);
+      trustedWeakMapSet(responseMetadata, this, {
+        headers: this.headers,
+        status: this.status,
+      });
       this.ok = this.status >= 200 && this.status < 300;
       this.redirected = !!init.redirected;
       this.type = String(init.type || "default");
-      this.bodyUsed = false;
-      const bytesOf = this._bodyBytes;
+      /* The stream owns this immutable byte snapshot.  Metadata may release
+       * its reference after tee()/consumption, but that must never empty a
+       * pull which has not run yet. */
+      let retainedBytes = bytes;
       let at = 0;
-      this.body =
-        body === null || body === undefined
+      bodyState.body =
+        (body === null || body === undefined) && !suppliedBodyBytes
           ? null
           : streamBody ||
             new ReadableStream({
               pull(controller) {
-                const bytes = bytesOf();
+                const bytes = retainedBytes || new Uint8Array();
                 if (at >= bytes.length) {
+                  retainedBytes = null;
                   controller.close();
                   return;
                 }
                 const end = Math.min(bytes.length, at + 4096);
                 controller.enqueue(bytes.slice(at, end));
                 at = end;
-                if (at >= bytes.length) controller.close();
+                if (at >= bytes.length) {
+                  retainedBytes = null;
+                  controller.close();
+                }
               },
+              cancel() { retainedBytes = null; },
             });
-      if (!this.body) return;
-      const getReader = this.body.getReader.bind(this.body),
-        cancel = this.body.cancel.bind(this.body);
-      this._bodyGetReader = getReader;
-      this.body.getReader = () => {
-        if (this.bodyUsed)
-          throw new TypeError("Body has already been consumed");
-        this.bodyUsed = true;
-        return getReader();
-      };
-      this.body.cancel = (reason) => {
-        if (this.bodyUsed)
-          return Promise.reject(
-            new TypeError("Body has already been consumed"),
-          );
-        this.bodyUsed = true;
-        return cancel(reason);
-      };
+    }
+    get body() {
+      return responseBodyState(this).body;
+    }
+    get bodyUsed() {
+      return this.body !== null && __tilefinchReadableStreamDisturbed(this.body);
     }
   };
   globalThis.Response = Response;
   {
-    const consume = (response) => {
-        if (response.bodyUsed)
-          throw new TypeError("Body has already been consumed");
-        response.bodyUsed = true;
-      },
-      takeText = (response) => {
-        const text = response._bodyText();
-        response._bytes = null;
-        response._body = null;
-        return text;
-      },
-      takeBuffer = (response) => {
-        const view = response._bodyBytes(),
-          buffer =
-            view.byteOffset === 0 && view.byteLength === view.buffer.byteLength
-              ? view.buffer
-              : view.slice().buffer;
-        response._bytes = null;
-        response._body = null;
-        return buffer;
-      },
-      takeBytes = async (response) => {
-        if (!response._streamBody)
-          return new Uint8Array(takeBuffer(response));
-        const reader = response._bodyGetReader(),
-          chunks = [];
-        let total = 0;
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          const bytes =
-            value instanceof Uint8Array
-              ? value
-              : value instanceof ArrayBuffer
-                ? new Uint8Array(value)
-                : new TextEncoder().encode(String(value));
-          if (total + bytes.byteLength > 256 * 1024)
-            throw new RangeError("Response body exceeds bounded size");
-          chunks.push(bytes);
-          total += bytes.byteLength;
-        }
-        const joined = new Uint8Array(total);
-        let offset = 0;
-        for (const chunk of chunks) {
-          joined.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
-        response._streamBody = false;
-        response._bytes = null;
-        response._body = null;
-        return joined;
+    const takeBytes = async (response) => {
+        const state = responseBodyState(response);
+        if (state.body === null) return new Uint8Array();
+        const bytes = await __tilefinchConsumeReadableByteStream(
+          state.body, 256 * 1024);
+        return bytes;
       };
     Response.prototype.text = function () {
-      try {
-        consume(this);
-        if (!this._streamBody) return Promise.resolve(takeText(this));
-        return takeBytes(this).then((bytes) => new TextDecoder().decode(bytes));
-      } catch (error) {
-        return Promise.reject(error);
-      }
+      return takeBytes(this).then((bytes) => new TextDecoder().decode(bytes));
     };
     Response.prototype.json = function () {
       return this.text().then(JSON.parse);
     };
     Response.prototype.arrayBuffer = function () {
-      try {
-        consume(this);
-        if (!this._streamBody) return Promise.resolve(takeBuffer(this));
-        return takeBytes(this).then((bytes) => bytes.buffer);
-      } catch (error) {
-        return Promise.reject(error);
-      }
+      return takeBytes(this).then((bytes) => bytes.buffer);
     };
     Response.prototype.bytes = function () {
       return this.arrayBuffer().then((buffer) => new Uint8Array(buffer));
     };
     Response.prototype.blob = function () {
-      try {
-        consume(this);
-        if (!this._streamBody) {
-          const blob = new Blob([this._bodyBytes()], {
-            type: this.headers.get("content-type") || "",
-          });
-          this._bytes = null;
-          this._body = null;
-          return Promise.resolve(blob);
-        }
-        return takeBytes(this).then(
-          (bytes) =>
-            new Blob([bytes], {
-              type: this.headers.get("content-type") || "",
-            }),
-        );
-      } catch (error) {
-        return Promise.reject(error);
-      }
+      return takeBytes(this).then(
+        (bytes) => new Blob([bytes], {
+          type: this.headers.get("content-type") || "",
+        }));
     };
     Response.prototype.formData = function () {
       const type = this.headers.get("content-type") || "";
@@ -3273,7 +3858,8 @@
       });
     };
     Response.prototype.clone = function () {
-      if (this.bodyUsed) throw new TypeError("Body has already been consumed");
+      if (this.bodyUsed || this.body?.locked)
+        throw new TypeError("Body has already been consumed");
       const init = {
         status: this.status,
         statusText: this.statusText,
@@ -3282,33 +3868,11 @@
         redirected: this.redirected,
         type: this.type,
       };
-      if (this._streamBody) {
-        const [first, second] = this.body.tee();
-        this.body = first;
-        const firstGetReader = first.getReader.bind(first),
-          firstCancel = first.cancel.bind(first);
-        this._bodyGetReader = firstGetReader;
-        first.getReader = () => {
-          if (this.bodyUsed)
-            throw new TypeError("Body has already been consumed");
-          this.bodyUsed = true;
-          return firstGetReader();
-        };
-        first.cancel = (reason) => {
-          if (this.bodyUsed)
-            return Promise.reject(
-              new TypeError("Body has already been consumed"),
-            );
-          this.bodyUsed = true;
-          return firstCancel(reason);
-        };
-        return new Response(second, init);
-      }
-      if (this._bytes) init.bodyBytes = this._bytes.slice().buffer;
-      return new Response(
-        this.body === null ? null : this._bytes ? undefined : this._body,
-        init,
-      );
+      const state = responseBodyState(this);
+      if (this.body === null) return new Response(null, init);
+      const [first, second] = this.body.tee();
+      state.body = first;
+      return new Response(second, init);
     };
     Response.error = () =>
       new Response(null, { status: 0, statusText: "", type: "error" });
@@ -3327,17 +3891,66 @@
         headers.set("content-type", "application/json");
       return new Response(JSON.stringify(data), { ...init, headers });
     };
+    const trustedResponseArrayBuffer = Response.prototype.arrayBuffer,
+      trustedHeadersGet = Headers.prototype.get;
+    trustedDefineProperty(globalThis, "__tilefinchConsumeWasmResponse", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value(response) {
+        if (!trustedWeakSetHas(responseBrands, response))
+          return Promise.reject(
+            new TypeError("WebAssembly streaming source must be a Response"));
+        const metadata = trustedWeakMapGet(responseMetadata, response),
+          contentType = trustedFunctionApply(
+            trustedHeadersGet, metadata.headers, ["content-type"]),
+          essence = typeof contentType === "string"
+            ? contentType.split(";", 1)[0].trim().toLowerCase() : "";
+        if (essence !== "application/wasm")
+          return Promise.reject(new TypeError(
+            "WebAssembly response has an unsupported MIME type"));
+        if (metadata.status < 200 || metadata.status >= 300)
+          return Promise.reject(new TypeError(
+            "WebAssembly response is not successful"));
+        return trustedFunctionApply(trustedResponseArrayBuffer, response, []);
+      },
+    });
   }
-  globalThis.fetch = (input, init = {}) => {
+  const fetchInternal = (
+    input,
+    init = {},
+    timingRecorder = __tilefinchRecordResourceTiming,
+    workerScript = false,
+  ) => {
     try {
       const request =
         input instanceof Request
           ? new Request(input, init)
           : new Request(input, init);
       request.signal.throwIfAborted();
+      if (
+        request.body !== null &&
+        requestBodyState(request).bytes === null
+      )
+        return serializeRequestBodyAsync(request).then((bytes) =>
+          fetchInternal(request, {
+            body: new Uint8Array(bytes),
+            duplex: "half",
+          }));
       const body = serializeRequestBody(request),
         contentType = request.headers.get("content-type") || "",
-        headerBlock = nativeHeaderBlock(request.headers),
+        accept = request.headers.get("accept") || "*/*",
+        authorHeaderBlock = nativeHeaderBlock(request.headers),
+        cacheHeaderBlock = request.cache === "no-store"
+          ? "cache-control: no-store"
+          : request.cache === "reload"
+            ? "cache-control: no-cache\npragma: no-cache"
+            : request.cache === "no-cache"
+              ? "cache-control: no-cache"
+              : "",
+        headerBlock = authorHeaderBlock && cacheHeaderBlock
+          ? authorHeaderBlock + "\n" + cacheHeaderBlock
+          : authorHeaderBlock || cacheHeaderBlock,
         signal = request.signal,
         method = request.method,
         url = request.url,
@@ -3350,25 +3963,33 @@
         return Promise.reject(error);
       }
       if (local) {
+        if (request.integrity) {
+          const integrity = __tilefinchVerifyResourceIntegrity(
+            request.integrity, local.bodyBytes);
+          if (integrity === 2 || integrity === 3)
+            return Promise.reject(new TypeError(
+              integrity === 2
+                ? "Response integrity mismatch"
+                : "Invalid response integrity metadata"));
+        }
         return new Promise((resolve, reject) => {
           let settled = false;
           const abort = () => {
             if (settled) return;
             settled = true;
             reject(
-              signal.reason ||
-                new DOMException("This operation was aborted", "AbortError"),
+              signal.reason === undefined ? defaultAbortReason() : signal.reason,
             );
           };
-          signal.addEventListener("abort", abort, { once: true });
+          addAbortAlgorithm(signal, abort);
           queueMicrotask(() => {
             if (settled) return;
             settled = true;
-            signal.removeEventListener("abort", abort);
+            removeAbortAlgorithm(signal, abort);
             if (signal.aborted) {
               reject(
-                signal.reason ||
-                  new DOMException("This operation was aborted", "AbortError"),
+                signal.reason === undefined
+                  ? defaultAbortReason() : signal.reason,
               );
               return;
             }
@@ -3377,19 +3998,28 @@
                 status: local.status,
                 url: local.url,
                 headers: new Headers(local.headers),
-                bodyBytes: local.bodyBytes,
+                bodyBytes: method === "HEAD" ? undefined : local.bodyBytes,
               }),
             );
           });
         });
       }
+      /* Tilefinch intentionally has no page-owned HTTP cache. Fetch requires
+         only-if-cached to avoid the network and return a 504 on a cache miss;
+         every request is therefore a deterministic miss. */
+      if (request.cache === "only-if-cached")
+        return Promise.resolve(new Response(null, {
+          status: 504,
+          statusText: "Gateway Timeout",
+          url,
+          type: "basic",
+        }));
       return new Promise((resolve, reject) => {
         let id = 0;
         const abort = () =>
           cancelNetwork(
             id,
-            signal.reason ||
-              new DOMException("This operation was aborted", "AbortError"),
+            signal.reason === undefined ? defaultAbortReason() : signal.reason,
           );
         id = queueNetwork(
           () =>
@@ -3401,6 +4031,13 @@
               headerBlock,
               mode,
               credentials,
+              undefined,
+              workerScript,
+              request.referrer,
+              request.referrerPolicy,
+              request.redirect,
+              request.integrity,
+              accept,
             ),
           networkRetainedBytes(
             method,
@@ -3412,17 +4049,27 @@
             credentials,
           ),
           (raw) => {
-            signal.removeEventListener("abort", abort);
+            removeAbortAlgorithm(signal, abort);
             try {
               signal.throwIfAborted();
+              const responseStatus = Number(raw.status),
+                nullBody = method === "HEAD" ||
+                  raw.type === "opaque" || raw.type === "opaqueredirect" ||
+                  [101, 204, 205, 304].includes(responseStatus);
               resolve(
-                new Response(raw.body, {
-                  status: raw.status,
+                new Response(nullBody ? null : raw.body, {
+                  status: responseStatus,
                   url: raw.url,
-                  headers: new Headers(
-                    raw.headers || "content-type: " + raw.contentType + "\n",
-                  ),
-                  bodyBytes: raw.bodyBytes,
+                  headers:
+                    raw.type === "opaqueredirect" || raw.type === "opaque"
+                      ? new Headers()
+                      : new Headers(
+                          raw.headers ||
+                            "content-type: " + raw.contentType + "\n",
+                        ),
+                  bodyBytes: nullBody ? undefined : raw.bodyBytes,
+                  redirected: !!raw.redirected,
+                  type: raw.type || "basic",
                 }),
               );
             } catch (error) {
@@ -3430,7 +4077,7 @@
             }
           },
           (error) => {
-            signal.removeEventListener("abort", abort);
+            removeAbortAlgorithm(signal, abort);
             /* Fetch deliberately does not expose transport diagnostics to
                author code.  Native keeps the detailed curl/TLS/DNS failure
                for Tilefinch's diagnostics, while the web-visible rejection
@@ -3441,15 +4088,41 @@
                 : error,
             );
           },
+          url,
+          "fetch",
+          timingRecorder,
         );
         if (pendingNetwork.has(id)) {
-          signal.addEventListener("abort", abort, { once: true });
+          addAbortAlgorithm(signal, abort);
           if (signal.aborted) abort();
         }
       });
     } catch (error) {
       return Promise.reject(error);
     }
+  };
+  globalThis.fetch = (input, init = {}) =>
+    fetchInternal(input, init, __tilefinchRecordResourceTiming);
+  /* Dedicated workers own a separate performance timeline.  Their wrapper
+     records the filtered Response surface in that timeline, so suppress the
+     Window entry here without exposing native phase timings to a callback
+     supplied by author code. */
+  globalThis.__tilefinchFetchForWorker = (input, init = {}) =>
+    fetchInternal(input, init, null);
+  globalThis.__tilefinchFetchWorkerScript = (input, init = {}) =>
+    fetchInternal(input, init, null, true);
+  globalThis.__tilefinchFetchWorkerScriptSync = (
+    url, mode = "cors", credentials = "same-origin",
+  ) => {
+    const raw = __tilefinchFetchSync(
+      "GET", String(url), undefined, "", "", mode, credentials, 2,
+      undefined, "about:client", "");
+    if (!raw || Number(raw.status) < 200 || Number(raw.status) >= 300)
+      throw new DOMException("Worker script could not be loaded", "NetworkError");
+    if (typeof raw.body === "string") return raw.body;
+    if (raw.bodyBytes instanceof ArrayBuffer)
+      return new TextDecoder().decode(raw.bodyBytes);
+    return "";
   };
   Object.defineProperty(Navigator.prototype, "sendBeacon", {
     configurable: true,
@@ -3873,6 +4546,30 @@
       Object.defineProperty(WebSocket.prototype, name, { value });
     }
     globalThis.WebSocket = WebSocket;
+    Object.defineProperty(globalThis, "__tilefinchCloseWebSocketForWorker", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value(socket) {
+        if (!(socket instanceof WebSocket)) return false;
+        if (socket._nativeId) {
+          webSockets.delete(socket._nativeId);
+          try { __tilefinchWebSocketClose(socket._nativeId, 1000, ""); }
+          catch (_) {}
+        }
+        socket._nativeId = 0;
+        socket.readyState = WebSocket.CLOSED;
+        socket._queue = [];
+        socket._sending = false;
+        socket._closeRequest = null;
+        socket.bufferedAmount = 0;
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+        return true;
+      },
+    });
     globalThis.__tilefinchDeliverWebSocket = (
       id,
       kind,
@@ -4154,50 +4851,31 @@
   class XMLHttpRequestEventTarget extends EventTarget {
     constructor() {
       super();
-      xhrEventTargetStates.set(this, { handlers: new Map(), listeners: new Map() });
+      xhrEventTargetStates.set(this, {
+        handlers: new Map(),
+        handlerListeners: new Map(),
+      });
       xhrPublicStates.set(this, Object.create(null));
     }
-    addEventListener(type, callback) {
-      if (typeof callback !== "function") return;
-      const listeners = xhrEventTargetStates.get(this)?.listeners;
-      if (!listeners) throw new TypeError("Illegal invocation");
-      type = String(type);
-      if (!listeners.has(type)) listeners.set(type, []);
-      const callbacks = listeners.get(type);
-      if (!callbacks.includes(callback)) callbacks.push(callback);
-    }
-    removeEventListener(type, callback) {
-      const listeners = xhrEventTargetStates.get(this)?.listeners;
-      if (!listeners) throw new TypeError("Illegal invocation");
-      const callbacks = listeners.get(String(type));
-      if (!callbacks) return;
-      const at = callbacks.indexOf(callback);
-      if (at >= 0) callbacks.splice(at, 1);
-    }
-    dispatchEvent(event) {
-      if (!(event instanceof Event)) throw new TypeError("Event required");
-      const state = xhrEventTargetStates.get(this);
-      if (!state) throw new TypeError("Illegal invocation");
-      event.target = this;
-      event.currentTarget = this;
-      const invoke = (callback) =>
-        globalThis.__tilefinchRunTask(
-          "xhr:" + String(event.type) + ":state=" + String(this.readyState || 0),
-          () => {
-            try {
-              callback.call(this, event);
-            } catch (error) {
-              __tilefinchReportUncaught(error, "XMLHttpRequest " + event.type);
-            }
-          },
-        );
-      const handler = state.handlers.get(String(event.type));
-      if (typeof handler === "function") invoke(handler);
-      for (const callback of [...(state.listeners.get(String(event.type)) || [])])
-        invoke(callback);
-      return !event.defaultPrevented;
-    }
   }
+  const xhrSetEventHandler = (target, type, value) => {
+    const state = xhrEventTargetStates.get(target);
+    if (!state) throw new TypeError("Illegal invocation");
+    const callback = typeof value === "function" ? value : null,
+      wrapper = state.handlerListeners.get(type);
+    state.handlers.set(type, callback);
+    if (callback && !wrapper) {
+      const listener = (event) => {
+        const active = xhrEventTargetStates.get(target)?.handlers.get(type);
+        if (typeof active === "function") return active.call(target, event);
+      };
+      state.handlerListeners.set(type, listener);
+      EventTarget.prototype.addEventListener.call(target, type, listener);
+    } else if (!callback && wrapper) {
+      EventTarget.prototype.removeEventListener.call(target, type, wrapper);
+      state.handlerListeners.delete(type);
+    }
+  };
   for (const type of xhrEventHandlerTypes)
     Object.defineProperty(XMLHttpRequestEventTarget.prototype, "on" + type, {
       configurable: true,
@@ -4206,9 +4884,7 @@
         return xhrEventTargetStates.get(this)?.handlers.get(type) || null;
       },
       set(value) {
-        const state = xhrEventTargetStates.get(this);
-        if (!state) throw new TypeError("Illegal invocation");
-        state.handlers.set(type, typeof value === "function" ? value : null);
+        xhrSetEventHandler(this, type, value);
       },
     });
   Object.defineProperty(
@@ -4237,6 +4913,7 @@
       xhrPrivateStates.set(this, {
         async: true,
         done: true,
+        generation: 0,
         headers: new Headers(),
         method: "GET",
         mimeType: "",
@@ -4288,6 +4965,9 @@
           new DOMException("Request reopened", "AbortError"),
           false,
         );
+      if (state.timeoutId) clearTimeout(state.timeoutId);
+      state.timeoutId = 0;
+      state.generation += 1;
       state.method = String(method).toUpperCase();
       state.url = String(url);
       state.async = !!async;
@@ -4337,9 +5017,9 @@
       this.readyState = value;
       xhrEmit(this, "readystatechange");
     }
-    _finish(type) {
+    _finish(type, generation) {
       const state = xhrPrivateStates.get(this);
-      if (state.done) return;
+      if (state.done || state.generation !== generation) return false;
       state.done = true;
       if (state.timeoutId) clearTimeout(state.timeoutId);
       state.timeoutId = 0;
@@ -4347,18 +5027,20 @@
       const loaded = state.responseBytes,
         total = state.responseLengthComputable ? loaded : 0;
       xhrEmit(this, type, loaded, total);
+      if (state.generation !== generation) return false;
       xhrEmit(this, "loadend", loaded, total);
+      return state.generation === generation;
     }
-    _apply(raw) {
+    _apply(raw, generation) {
       const state = xhrPrivateStates.get(this);
-      if (state.done) return;
-      xhrUploadFinish(this, "load");
+      if (state.done || state.generation !== generation) return;
+      if (!xhrUploadFinish(this, "load", generation)) return;
       this.status = Number(raw.status) || 0;
       this.responseURL = raw.url || state.url;
       state.responseHeaders = new Headers(
         raw.headers || "content-type: " + raw.contentType + "\n",
       );
-      xhrState(this, 2);
+      if (!xhrState(this, 2, generation)) return;
       const supplied =
           raw.bodyBytes instanceof ArrayBuffer
             ? new Uint8Array(raw.bodyBytes)
@@ -4378,7 +5060,7 @@
           ? String(raw.body)
           : new TextDecoder().decode(supplied || new Uint8Array())
         : "";
-      xhrState(this, 3);
+      if (!xhrState(this, 3, generation)) return;
       const fallbackBody = raw.body === undefined ? "" : String(raw.body),
         byteLength = Number.isFinite(Number(raw.bodyLength))
           ? Math.max(0, Number(raw.bodyLength))
@@ -4388,6 +5070,7 @@
       state.responseBytes = byteLength;
       state.responseLengthComputable = true;
       xhrEmit(this, "progress", byteLength, byteLength);
+      if (state.generation !== generation || state.done) return;
       if (state.responseType === "" || state.responseType === "text")
         this.response = state.responseText;
       else if (state.responseType === "json") {
@@ -4437,21 +5120,21 @@
       } else if (state.responseType === "document") {
         this.responseXML = this.response;
       }
-      xhrState(this, 4);
-      xhrFinish(this, "load");
+      if (!xhrState(this, 4, generation)) return;
+      xhrFinish(this, "load", generation);
     }
-    _fail(error, type = "error") {
+    _fail(error, type = "error", generation) {
       const state = xhrPrivateStates.get(this);
-      if (state.done) return;
-      xhrUploadFinish(this, type);
+      if (state.done || state.generation !== generation) return;
+      if (!xhrUploadFinish(this, type, generation)) return;
       globalThis.__tilefinchXHRLastError = String(
         (error && error.stack) || error || type,
       );
       this.status = 0;
       this.response = null;
       state.responseText = "";
-      xhrState(this, 4);
-      xhrFinish(this, type);
+      if (!xhrState(this, 4, generation)) return;
+      xhrFinish(this, type, generation);
     }
     send(body = null) {
       const state = xhrPrivateStates.get(this);
@@ -4460,30 +5143,34 @@
       globalThis.__tilefinchXHRSendCalls++;
       state.sent = true;
       state.done = false;
+      const generation = state.generation;
       xhrEmit(this, "loadstart");
+      if (state.generation !== generation || state.done || !state.sent) return;
       try {
         const request = { _bodySource: body, headers: state.headers },
           serialized = serializeRequestBody(request),
           method = state.method || "GET",
           url = state.url,
           contentType = state.headers.get("content-type") || "",
+          accept = state.headers.get("accept") || "*/*",
           headerBlock = nativeHeaderBlock(state.headers),
           credentials = this.withCredentials ? "include" : "same-origin",
           timeout = Math.max(0, Number(this.timeout) || 0);
-        xhrUploadStart(this, method, serialized);
+        if (!xhrUploadStart(this, method, serialized, generation)) return;
         let local;
         try {
           local = snapshotLocalBlobRequest(method, url);
         } catch (error) {
           if (state.async) {
-            queueMicrotask(() => xhrFail(this, error));
+            queueMicrotask(() => xhrFail(this, error, "error", generation));
             return;
           }
           throw error;
         }
         if (local) {
-          if (state.async) queueMicrotask(() => xhrApply(this, local));
-          else xhrApply(this, local);
+          if (state.async)
+            queueMicrotask(() => xhrApply(this, local, generation));
+          else xhrApply(this, local, generation);
           return;
         }
         if (state.async) {
@@ -4500,6 +5187,12 @@
                   "cors",
                   credentials,
                   timeout,
+                  undefined,
+                  undefined,
+                  undefined,
+                  undefined,
+                  undefined,
+                  accept,
                 ),
               networkRetainedBytes(
                 method,
@@ -4510,12 +5203,19 @@
                 "cors",
                 credentials,
               ),
-              (raw) => xhrApply(this, raw),
+              (raw) => xhrApply(this, raw, generation),
               (error) => {
                 const timedOut =
                   timeout > 0 && /timeout|timed out/i.test(String(error));
-                xhrFail(this, error, timedOut ? "timeout" : "error");
+                xhrFail(
+                  this,
+                  error,
+                  timedOut ? "timeout" : "error",
+                  generation,
+                );
               },
+              url,
+              "xmlhttprequest",
             );
           } catch (error) {
             /* An async XHR reports transport/admission failure from a later
@@ -4523,13 +5223,22 @@
                handler recurse in one JavaScript turn when the bounded queue
                is full, unlike the browser networking model and without an
                opportunity for completed requests to release pressure. */
-            setTimeout(() => xhrFail(this, error), 0);
+            setTimeout(() => xhrFail(this, error, "error", generation), 0);
+            return;
+          }
+          if (state.generation !== generation || state.done) {
+            if (pendingNetwork.has(id))
+              cancelNetwork(
+                id,
+                new DOMException("Request superseded", "AbortError"),
+                false,
+              );
             return;
           }
           state.requestId = pendingNetwork.has(id) ? Number(id) : 0;
           if (!state.done && timeout > 0)
             state.timeoutId = setTimeout(() => {
-              if (state.done) return;
+              if (state.done || state.generation !== generation) return;
               cancelNetwork(
                 state.requestId,
                 new DOMException("The operation timed out", "TimeoutError"),
@@ -4538,8 +5247,9 @@
               this.status = 0;
               this.readyState = 4;
               xhrEmit(this, "readystatechange");
-              xhrUploadFinish(this, "timeout");
-              xhrFinish(this, "timeout");
+              if (state.generation !== generation || state.done) return;
+              if (!xhrUploadFinish(this, "timeout", generation)) return;
+              xhrFinish(this, "timeout", generation);
             }, timeout);
         } else {
           const raw = __tilefinchFetchSync(
@@ -4551,16 +5261,19 @@
               "cors",
               credentials,
             );
-          xhrUploadFinish(this, "load");
-          xhrApply(this, raw);
+          xhrApply(this, raw, generation);
         }
       } catch (error) {
-        xhrFail(this, error);
+        xhrFail(this, error, "error", generation);
       }
     }
     abort() {
       const state = xhrPrivateStates.get(this);
       if (state.done) return;
+      state.generation += 1;
+      const generation = state.generation;
+      if (state.timeoutId) clearTimeout(state.timeoutId);
+      state.timeoutId = 0;
       if (state.requestId)
         cancelNetwork(
           state.requestId,
@@ -4569,8 +5282,8 @@
         );
       this.status = 0;
       this.readyState = 0;
-      xhrUploadFinish(this, "abort");
-      xhrFinish(this, "abort");
+      if (!xhrUploadFinish(this, "abort", generation)) return;
+      xhrFinish(this, "abort", generation);
     }
     getResponseHeader(name) {
       return this.readyState < 2
@@ -4633,12 +5346,7 @@
           ?.handlers.get("readystatechange") || null;
       },
       set(value) {
-        const state = xhrEventTargetStates.get(this);
-        if (!state) throw new TypeError("Illegal invocation");
-        state.handlers.set(
-          "readystatechange",
-          typeof value === "function" ? value : null,
-        );
+        xhrSetEventHandler(this, "readystatechange", value);
       },
     },
   );
@@ -4666,10 +5374,12 @@
     },
     xhrEmit = (xhr, type, loaded = 0, total = 0) =>
       xhrEmitTarget(xhr, type, loaded, total),
-    xhrUploadStart = (xhr, method, serialized) => {
+    xhrGenerationCurrent = (xhr, generation) =>
+      xhrPrivateStates.get(xhr)?.generation === generation,
+    xhrUploadStart = (xhr, method, serialized, generation) => {
       const state = xhrPrivateStates.get(xhr);
       if (method === "GET" || method === "HEAD" || serialized === undefined)
-        return;
+        return xhrGenerationCurrent(xhr, generation);
       const bytes = typeof serialized === "string"
         ? new TextEncoder().encode(serialized).byteLength
         : serialized.byteLength;
@@ -4677,25 +5387,36 @@
       state.uploadStarted = true;
       state.uploadComplete = false;
       xhrEmitTarget(xhr.upload, "loadstart", 0, bytes, true);
+      return xhrGenerationCurrent(xhr, generation) && !state.done;
     },
-    xhrUploadFinish = (xhr, type) => {
+    xhrUploadFinish = (xhr, type, generation) => {
       const state = xhrPrivateStates.get(xhr);
-      if (!state.uploadStarted || state.uploadComplete) return;
+      if (!xhrGenerationCurrent(xhr, generation)) return false;
+      if (!state.uploadStarted || state.uploadComplete) return !state.done;
       state.uploadComplete = true;
       const bytes = state.uploadBytes;
-      if (type === "load")
+      if (type === "load") {
         xhrEmitTarget(xhr.upload, "progress", bytes, bytes, true);
+        if (!xhrGenerationCurrent(xhr, generation)) return false;
+      }
       xhrEmitTarget(xhr.upload, type, type === "load" ? bytes : 0, bytes, true);
+      if (!xhrGenerationCurrent(xhr, generation)) return false;
       xhrEmitTarget(
         xhr.upload, "loadend", type === "load" ? bytes : 0, bytes, true,
       );
+      return xhrGenerationCurrent(xhr, generation) && !state.done;
     },
-    xhrState = (xhr, value) => {
-      xhrPrivateStates.get(xhr).stateTrace.push(value);
+    xhrState = (xhr, value, generation) => {
+      const state = xhrPrivateStates.get(xhr);
+      if (state.generation !== generation || state.done) return false;
+      state.stateTrace.push(value);
       xhrStateImpl.call(xhr, value);
+      return state.generation === generation && !state.done;
     },
-    xhrFinish = (xhr, type) => xhrFinishImpl.call(xhr, type),
-    xhrApply = (xhr, raw) => {
+    xhrFinish = (xhr, type, generation) =>
+      xhrFinishImpl.call(xhr, type, generation),
+    xhrApply = (xhr, raw, generation) => {
+      if (!xhrGenerationCurrent(xhr, generation)) return;
       const supplied =
           raw.bodyBytes instanceof ArrayBuffer
             ? raw.bodyBytes.byteLength
@@ -4706,8 +5427,9 @@
           : supplied !== null
             ? supplied
             : new TextEncoder().encode(String(raw.body || "")).byteLength;
-      xhrApplyImpl.call(xhr, raw);
-      if (xhr.readyState === 4 && xhr.status !== 0) {
+      xhrApplyImpl.call(xhr, raw, generation);
+      if (xhrGenerationCurrent(xhr, generation)
+          && xhr.readyState === 4 && xhr.status !== 0) {
         const state = xhrPrivateStates.get(xhr);
         globalThis.__tilefinchXHRResponseCount++;
         globalThis.__tilefinchXHRLastStatus = xhr.status;
@@ -4717,11 +5439,42 @@
         globalThis.__tilefinchXHRLastStates = state.stateTrace.join(".");
       }
     },
-    xhrFail = (xhr, error, type = "error") => {
+    xhrFail = (xhr, error, type = "error", generation) => {
+      if (!xhrGenerationCurrent(xhr, generation)) return;
       const previous = globalThis.__tilefinchXHRLastError;
-      xhrFailImpl.call(xhr, error, type);
+      xhrFailImpl.call(xhr, error, type, generation);
       if (type !== "error") globalThis.__tilefinchXHRLastError = previous;
     };
+  /* A dedicated worker may be terminated while one of its owner-backed XHR
+     transports is still pending.  Abort that transport without dispatching
+     callbacks into the retired Worker realm.  The public abort() algorithm is
+     deliberately not used here because it synchronously fires abort/loadend. */
+  Object.defineProperty(globalThis, "__tilefinchAbortXHRForWorker", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: (xhr) => {
+      const state = xhrPrivateStates.get(xhr);
+      if (!state) return false;
+      state.generation += 1;
+      if (state.timeoutId) clearTimeout(state.timeoutId);
+      state.timeoutId = 0;
+      if (state.requestId)
+        cancelNetwork(
+          state.requestId,
+          new DOMException("Worker is terminated", "AbortError"),
+          false,
+        );
+      state.requestId = 0;
+      state.done = true;
+      state.sent = false;
+      state.uploadComplete = true;
+      xhr.status = 0;
+      xhr.readyState = 0;
+      xhr.response = null;
+      return true;
+    },
+  });
   delete TilefinchXMLHttpRequest.prototype.emit;
   delete TilefinchXMLHttpRequest.prototype._state;
   delete TilefinchXMLHttpRequest.prototype._finish;
@@ -4792,7 +5545,14 @@
     ]);
   let networkInformation = null,
     batteryManager = null,
+    batteryPromise = null,
     permissions = null;
+  const batteryStates = new TrustedWeakMap(),
+    batteryState = value => {
+      const state = trustedWeakMapGet(batteryStates, value);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state;
+    };
   class NetworkInformation extends EventTarget {
     constructor() {
       if (arguments[0] !== platformStatusToken)
@@ -4804,6 +5564,11 @@
     set onchange(value) {
       this._onchange = typeof value === "function" ? value : null;
     }
+    /* The PSP's only network interface is 802.11b Wi-Fi. Report the
+       standardized connection kind and the radio's first-hop ceiling rather
+       than leaving two members missing from an interface we already expose. */
+    get type() { return "wifi"; }
+    get downlinkMax() { return 11; }
     get effectiveType() { return "3g"; }
     get rtt() { return 300; }
     get downlink() { return 1.5; }
@@ -4814,19 +5579,41 @@
       if (arguments[0] !== platformStatusToken)
         throw new TypeError("Illegal constructor");
       super();
+      trustedWeakMapSet(batteryStates, this, {
+        onchargingchange: null,
+        onchargingtimechange: null,
+        ondischargingtimechange: null,
+        onlevelchange: null,
+      });
     }
-    get charging() { return true; }
-    get chargingTime() { return 0; }
-    get dischargingTime() { return Infinity; }
-    get level() { return 1; }
-    get onchargingchange() { return null; }
-    set onchargingchange(_) {}
-    get onchargingtimechange() { return null; }
-    set onchargingtimechange(_) {}
-    get ondischargingtimechange() { return null; }
-    set ondischargingtimechange(_) {}
-    get onlevelchange() { return null; }
-    set onlevelchange(_) {}
+    get charging() { batteryState(this); return true; }
+    get chargingTime() { batteryState(this); return 0; }
+    get dischargingTime() { batteryState(this); return Infinity; }
+    get level() { batteryState(this); return 1; }
+    get onchargingchange() { return batteryState(this).onchargingchange; }
+    set onchargingchange(value) {
+      batteryState(this).onchargingchange =
+        typeof value === "function" ? value : null;
+    }
+    get onchargingtimechange() {
+      return batteryState(this).onchargingtimechange;
+    }
+    set onchargingtimechange(value) {
+      batteryState(this).onchargingtimechange =
+        typeof value === "function" ? value : null;
+    }
+    get ondischargingtimechange() {
+      return batteryState(this).ondischargingtimechange;
+    }
+    set ondischargingtimechange(value) {
+      batteryState(this).ondischargingtimechange =
+        typeof value === "function" ? value : null;
+    }
+    get onlevelchange() { return batteryState(this).onlevelchange; }
+    set onlevelchange(value) {
+      batteryState(this).onlevelchange =
+        typeof value === "function" ? value : null;
+    }
   }
   class PermissionStatus extends EventTarget {
     constructor(token, name) {
@@ -4843,7 +5630,6 @@
       this._onchange = typeof value === "function" ? value : null;
     }
   }
-  const permissionStatuses = new Map();
   class Permissions {
     constructor() {
       if (arguments[0] !== platformStatusToken)
@@ -4852,15 +5638,29 @@
     query(descriptor) {
       if (!(this instanceof Permissions))
         throw new TypeError("Illegal invocation");
-      const name = String(descriptor?.name || "");
-      if (!permissionNames.has(name))
-        return Promise.reject(new TypeError("Unsupported permission name"));
-      let status = permissionStatuses.get(name);
-      if (!status) {
-        status = new PermissionStatus(platformStatusToken, name);
-        permissionStatuses.set(name, status);
-      }
-      return Promise.resolve(status);
+      /* Permissions.query() converts its object descriptor and resolves from
+         the permissions task source.  In particular, an author getter must
+         reject the returned promise rather than escape synchronously, and a
+         reaction registered on the result must not overtake microtasks from
+         the calling task.  Keep this bounded by the scheduler's existing
+         timer quota and do not retain one status object per queried name. */
+      return new Promise((resolve, reject) => {
+        const task = setTimeout(() => {
+          try {
+            if (descriptor === null || descriptor === undefined)
+              throw new TypeError("Permission descriptor is required");
+            const name = String(descriptor.name);
+            if (!permissionNames.has(name))
+              throw new TypeError("Unsupported permission name");
+            resolve(new PermissionStatus(platformStatusToken, name));
+          } catch (error) {
+            reject(error);
+          }
+        }, 0);
+        if (task === 0)
+          reject(new DOMException(
+            "Permission query task quota exceeded", "QuotaExceededError"));
+      });
     }
   }
   for (const [constructor, tag] of [
@@ -4906,7 +5706,12 @@
           throw new TypeError("Illegal invocation");
         if (batteryManager === null)
           batteryManager = new BatteryManager(platformStatusToken);
-        return Promise.resolve(batteryManager);
+        /* The Battery Status API stores one promise on each Navigator.  This
+           identity is observable and prevents repeated probes from creating
+           needless reactions and allocations on the PSP. */
+        if (batteryPromise === null)
+          batteryPromise = Promise.resolve(batteryManager);
+        return batteryPromise;
       },
     },
     permissions: {
@@ -4925,4 +5730,211 @@
   globalThis.BatteryManager = BatteryManager;
   globalThis.Permissions = Permissions;
   globalThis.PermissionStatus = PermissionStatus;
+
+  /* Trusted Types is useful even without CSP enforcement: its core API is
+     always exposed and the wrappers stringify at ordinary DOM sinks. Keep
+     each Window/Worker factory independent and cap its policy bookkeeping so
+     author code cannot turn policy names into unbounded PSP heap retention. */
+  const createTrustedTypesRealm = () => {
+    const valueStates = new TrustedWeakMap(), policyStates = new TrustedWeakMap(),
+      factoryStates = new TrustedWeakMap(), constructionToken = {}, policyLimit = 32,
+      valueState = (value, type) => {
+        const state = trustedWeakMapGet(valueStates, value);
+        if (!state || (type && state.type !== type))
+          throw new TrustedTypeError("Illegal invocation");
+        return state;
+      },
+      makeValue = (Type, type, value) => {
+        const result = trustedObjectCreate(Type.prototype);
+        trustedWeakMapSet(valueStates, result, {
+          type, value: TrustedString(value),
+        });
+        return result;
+      };
+    class TrustedHTML {
+      constructor(token) {
+        if (token !== constructionToken) throw new TrustedTypeError("Illegal constructor");
+      }
+      toString() { return valueState(this, "TrustedHTML").value; }
+      toJSON() { return valueState(this, "TrustedHTML").value; }
+    }
+    class TrustedScript {
+      constructor(token) {
+        if (token !== constructionToken) throw new TrustedTypeError("Illegal constructor");
+      }
+      toString() { return valueState(this, "TrustedScript").value; }
+      toJSON() { return valueState(this, "TrustedScript").value; }
+    }
+    class TrustedScriptURL {
+      constructor(token) {
+        if (token !== constructionToken) throw new TrustedTypeError("Illegal constructor");
+      }
+      toString() { return valueState(this, "TrustedScriptURL").value; }
+      toJSON() { return valueState(this, "TrustedScriptURL").value; }
+    }
+    const trustedTypesByName = {
+        createHTML: [TrustedHTML, "TrustedHTML"],
+        createScript: [TrustedScript, "TrustedScript"],
+        createScriptURL: [TrustedScriptURL, "TrustedScriptURL"],
+      },
+      createPolicyValue = (policy, functionName, input, extra) => {
+        const state = trustedWeakMapGet(policyStates, policy);
+        if (!state) throw new TrustedTypeError("Illegal invocation");
+        const callback = state.options[functionName];
+        if (callback === null)
+          throw new TrustedTypeError(functionName + " callback is not configured");
+        const converted = TrustedString(input),
+          output = trustedFunctionApply(callback, undefined, [converted, ...extra]),
+          [Type, type] = trustedTypesByName[functionName];
+        return makeValue(Type, type, output == null ? "" : output);
+      },
+      trustedScriptForEval = value => {
+        const state = trustedWeakMapGet(valueStates, value);
+        return state?.type === "TrustedScript" ? state.value : undefined;
+      };
+    class TrustedTypePolicy {
+      constructor(token) {
+        if (token !== constructionToken) throw new TrustedTypeError("Illegal constructor");
+      }
+      get name() {
+        const state = trustedWeakMapGet(policyStates, this);
+        if (!state) throw new TrustedTypeError("Illegal invocation");
+        return state.name;
+      }
+      createHTML(input, ...args) {
+        return createPolicyValue(this, "createHTML", input, args);
+      }
+      createScript(input, ...args) {
+        return createPolicyValue(this, "createScript", input, args);
+      }
+      createScriptURL(input, ...args) {
+        return createPolicyValue(this, "createScriptURL", input, args);
+      }
+    }
+    class TrustedTypePolicyFactory {
+      constructor(token) {
+        if (token !== constructionToken) throw new TrustedTypeError("Illegal constructor");
+      }
+      createPolicy(name, options = {}) {
+        const state = trustedWeakMapGet(factoryStates, this);
+        if (!state) throw new TrustedTypeError("Illegal invocation");
+        name = TrustedString(name);
+        options = TrustedObject(options);
+        const callbacks = trustedObjectCreate(null);
+        for (const key of ["createHTML", "createScript", "createScriptURL"]) {
+          const callback = options[key];
+          if (callback != null && typeof callback !== "function")
+            throw new TrustedTypeError(key + " must be callable");
+          callbacks[key] = callback == null ? null : callback;
+        }
+        if (name === "default" && state.defaultPolicy !== null)
+          throw new TrustedTypeError("default policy already exists");
+        if (state.policyCount >= policyLimit)
+          throw new TrustedRangeError("trusted type policy quota exceeded");
+        const policy = trustedObjectCreate(TrustedTypePolicy.prototype);
+        trustedWeakMapSet(policyStates, policy, { name, options: callbacks });
+        state.policyCount++;
+        if (name === "default") state.defaultPolicy = policy;
+        return policy;
+      }
+      isHTML(value) {
+        return trustedWeakMapGet(valueStates, value)?.type === "TrustedHTML";
+      }
+      isScript(value) {
+        return trustedWeakMapGet(valueStates, value)?.type === "TrustedScript";
+      }
+      isScriptURL(value) {
+        return trustedWeakMapGet(valueStates, value)?.type === "TrustedScriptURL";
+      }
+      get emptyHTML() {
+        const state = trustedWeakMapGet(factoryStates, this);
+        if (!state) throw new TrustedTypeError("Illegal invocation");
+        return state.emptyHTML;
+      }
+      get emptyScript() {
+        const state = trustedWeakMapGet(factoryStates, this);
+        if (!state) throw new TrustedTypeError("Illegal invocation");
+        return state.emptyScript;
+      }
+      get defaultPolicy() {
+        const state = trustedWeakMapGet(factoryStates, this);
+        if (!state) throw new TrustedTypeError("Illegal invocation");
+        return state.defaultPolicy;
+      }
+      getPropertyType(tagName, property, elementNamespace = "") {
+        if (!trustedWeakMapHas(factoryStates, this))
+          throw new TrustedTypeError("Illegal invocation");
+        const tag = trustedStringLower(TrustedString(tagName)),
+          name = TrustedString(property);
+        void TrustedString(elementNamespace ?? "");
+        if (name === "innerHTML" || name === "outerHTML") return "TrustedHTML";
+        if (tag === "iframe" && name === "srcdoc") return "TrustedHTML";
+        if (tag === "script" && name === "src") return "TrustedScriptURL";
+        if (tag === "script" && (name === "innerText" || name === "text"
+                                 || name === "textContent"))
+          return "TrustedScript";
+        return null;
+      }
+      getAttributeType(tagName, attribute, elementNamespace = "",
+                       attributeNamespace = "") {
+        if (!trustedWeakMapHas(factoryStates, this))
+          throw new TrustedTypeError("Illegal invocation");
+        const tag = trustedStringLower(TrustedString(tagName)),
+          name = trustedStringLower(TrustedString(attribute)),
+          elementNS = TrustedString(elementNamespace ?? ""),
+          attributeNS = TrustedString(attributeNamespace ?? "");
+        if (!attributeNS && /^on[a-z]/.test(name)) return "TrustedScript";
+        if (!attributeNS && tag === "iframe" && name === "srcdoc")
+          return "TrustedHTML";
+        if (!attributeNS && tag === "script" && name === "src")
+          return "TrustedScriptURL";
+        if (tag === "script" && name === "href"
+            && (elementNS === "http://www.w3.org/2000/svg"
+                || attributeNS === "http://www.w3.org/1999/xlink"))
+          return "TrustedScriptURL";
+        return null;
+      }
+    }
+    for (const [Type, tag] of [
+      [TrustedHTML, "TrustedHTML"], [TrustedScript, "TrustedScript"],
+      [TrustedScriptURL, "TrustedScriptURL"],
+      [TrustedTypePolicy, "TrustedTypePolicy"],
+      [TrustedTypePolicyFactory, "TrustedTypePolicyFactory"],
+    ])
+      trustedDefineProperty(Type.prototype, Symbol.toStringTag, {
+        configurable: true, value: tag,
+      });
+    const factory = trustedObjectCreate(TrustedTypePolicyFactory.prototype),
+      state = { defaultPolicy: null, policyCount: 0 };
+    state.emptyHTML = makeValue(TrustedHTML, "TrustedHTML", "");
+    state.emptyScript = makeValue(TrustedScript, "TrustedScript", "");
+    trustedWeakMapSet(factoryStates, factory, state);
+    return trustedObjectFreeze({
+      TrustedHTML, TrustedScript, TrustedScriptURL,
+      TrustedTypePolicy, TrustedTypePolicyFactory, trustedTypes: factory,
+      __tilefinchTrustedScriptForEval: trustedScriptForEval,
+    });
+  };
+  const trustedTypesRealm = createTrustedTypesRealm();
+  const defineTrustedTypesGlobal = (name) =>
+    trustedDefineProperty(globalThis, name, {
+      configurable: true,
+      enumerable: false,
+      writable: false,
+      value: trustedTypesRealm[name],
+    });
+  defineTrustedTypesGlobal("TrustedHTML");
+  defineTrustedTypesGlobal("TrustedScript");
+  defineTrustedTypesGlobal("TrustedScriptURL");
+  defineTrustedTypesGlobal("TrustedTypePolicy");
+  defineTrustedTypesGlobal("TrustedTypePolicyFactory");
+  defineTrustedTypesGlobal("trustedTypes");
+  trustedDefineProperty(globalThis, "__tilefinchTrustedScriptForEval", {
+    configurable: false, enumerable: false, writable: false,
+    value: trustedTypesRealm.__tilefinchTrustedScriptForEval,
+  });
+  trustedDefineProperty(globalThis, "__tilefinchCreateTrustedTypesRealm", {
+    configurable: false, enumerable: false, writable: false,
+    value: createTrustedTypesRealm,
+  });
 })();

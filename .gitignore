@@ -35,6 +35,11 @@ benchmarks/npm-*.log
 __pycache__/
 *.pyc
 
+# Investigation journals and per-release maintenance logs belong in the
+# private work area, not in the public source tree.
+/docs/engineering/BROWSING_JOURNEYS.md
+/docs/engineering/RELEASE_*_CHECKS.md
+
 # Public trust records may be committed under trust/. Private signing
 # material never belongs in this repository.
 /trust/*.pem

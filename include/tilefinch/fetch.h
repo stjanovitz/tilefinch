@@ -85,14 +85,16 @@ bool fetch_response_security_metadata_from_snapshot(
    cannot expose the monotonic microsecond counters leave measured false. */
 typedef struct {
     bool measured;
+    bool encoded_body_bytes_measured;
     uint32_t name_lookup_us;
     uint32_t connect_us;
     uint32_t appconnect_us;
     uint32_t first_byte_us;
     uint32_t total_us;
+    uint32_t encoded_body_bytes;
 } FetchTransportTiming;
 
-_Static_assert(sizeof(FetchTransportTiming) == 24u,
+_Static_assert(sizeof(FetchTransportTiming) == 28u,
                "transport timing must stay compact on PSP");
 
 typedef struct {
@@ -187,6 +189,11 @@ typedef struct {
        even if a later hop returns to the initiator's origin; CORS then uses
        the final wire Origin value "null". */
     bool redirect_origin_tainted;
+    /* Page Fetch redirect state.  These are transport-authored facts: author
+       JavaScript cannot manufacture a followed chain or an opaque redirect
+       response by mutating the Response wrapper. */
+    bool redirected;
+    bool opaque_redirect;
     /* Internal deterministic replay timing; not exposed to page script. */
     size_t trace_delay_pumps;
     bool trace_external_cancel;
@@ -205,6 +212,14 @@ typedef enum {
        subdomain of githubusercontent.com. Page requests never select it. */
     FETCH_REDIRECT_GITHUB_RELEASE
 } FetchRedirectPolicy;
+
+typedef enum {
+    /* Zero preserves the historical browser behavior.  This is deliberately
+       separate from FetchRedirectPolicy, which protects native updater URLs. */
+    FETCH_PAGE_REDIRECT_FOLLOW = 0,
+    FETCH_PAGE_REDIRECT_ERROR,
+    FETCH_PAGE_REDIRECT_MANUAL
+} FetchPageRedirectMode;
 
 typedef bool (*FetchRedirectUrlValidator)(const char *url);
 
@@ -287,6 +302,7 @@ typedef struct {
     bool cors_response_check_deferred;
     bool redirect_same_origin_only;
     FetchRedirectPolicy redirect_policy;
+    FetchPageRedirectMode page_redirect_mode;
     /*
      * Native subsystem trust boundary applied to the initial request and
      * every resolved redirect target before a request is sent. Page fetches

@@ -712,6 +712,7 @@ static void fetch_transport_timing_sample(
     curl_off_t appconnect_us = 0;
     curl_off_t first_byte_us = 0;
     curl_off_t total_us = 0;
+    curl_off_t encoded_body_bytes = 0;
     if (curl_easy_getinfo(
             easy, CURLINFO_NAMELOOKUP_TIME_T, &name_lookup_us) != CURLE_OK
         || curl_easy_getinfo(
@@ -736,6 +737,12 @@ static void fetch_transport_timing_sample(
     timing->appconnect_us = FETCH_TIMING_US(appconnect_us);
     timing->first_byte_us = FETCH_TIMING_US(first_byte_us);
     timing->total_us = FETCH_TIMING_US(total_us);
+    if (curl_easy_getinfo(
+            easy, CURLINFO_SIZE_DOWNLOAD_T, &encoded_body_bytes) == CURLE_OK
+        && encoded_body_bytes >= 0) {
+        timing->encoded_body_bytes_measured = true;
+        timing->encoded_body_bytes = FETCH_TIMING_US(encoded_body_bytes);
+    }
 #undef FETCH_TIMING_US
 #else
     (void) easy;

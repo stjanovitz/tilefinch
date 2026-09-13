@@ -350,6 +350,8 @@ bool tilefinch_csp_allows_request(
             directive = TILEFINCH_CSP_FRAME_SRC; break;
         case TILEFINCH_DESTINATION_MEDIA:
             directive = TILEFINCH_CSP_MEDIA_SRC; break;
+        case TILEFINCH_DESTINATION_WORKER:
+            return tilefinch_csp_allows_worker(csp, target_url);
         case TILEFINCH_DESTINATION_OTHER:
             directive = TILEFINCH_CSP_OBJECT_SRC; break;
         case TILEFINCH_DESTINATION_DOCUMENT:

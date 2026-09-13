@@ -6,6 +6,11 @@
     ancestorSetHas = Set.prototype.has,
     ancestorSetAdd = Set.prototype.add,
     ancestorApply = Reflect.apply,
+    numberFrom = Number,
+    numberIsFinite = Number.isFinite,
+    mathFloor = Math.floor,
+    mathMin = Math.min,
+    emptyTaskArguments = Object.freeze([]),
     /* DOM mutation/event paths are iterative and may safely exceed the
        renderer's 64-level recursive fast path. Keep a separate finite cap
        so authored deep trees remain usable without making cycles unbounded. */
@@ -76,6 +81,18 @@
   let activeTaskKind = "bootstrap",
     activeTaskSequence = 0,
     nextTaskSequence = 1;
+  Object.defineProperties(globalThis, {
+    __tilefinchActiveTaskKind: {
+      configurable: false,
+      enumerable: false,
+      get: () => activeTaskKind,
+    },
+    __tilefinchActiveTaskSequence: {
+      configurable: false,
+      enumerable: false,
+      get: () => activeTaskSequence,
+    },
+  });
   globalThis.__tilefinchRunTask = (kind, callback, thisArg, args) => {
     const previousKind = activeTaskKind,
       previousSequence = activeTaskSequence;
@@ -84,8 +101,14 @@
     activeTaskSequence = nextTaskSequence++;
     try {
       __tilefinchCallbackCheckpoint(activeTaskKind);
-      return args === undefined
-        ? callback.call(thisArg) : callback.apply(thisArg, args);
+      /* Listener functions are author objects: their own `call` and `apply`
+         properties are observable and may be poisoned. Web callbacks invoke
+         the function itself, so use the captured intrinsic directly. */
+      return ancestorApply(
+        callback,
+        thisArg,
+        args === undefined ? emptyTaskArguments : args,
+      );
     } finally {
       activeTaskKind = previousKind;
       activeTaskSequence = previousSequence;
@@ -357,7 +380,8 @@
       )
     );
   };
-  const eventHandlerMap = (node, create = false) => {
+  const propertyHandlerRecordToken = {},
+    eventHandlerMap = (node, create = false) => {
     const key = String(node?.__tilefinchStableKey || "");
     if (
       key &&
@@ -387,12 +411,46 @@
     }
     return map || null;
   },
+    installEventHandler = (
+      node, type, callback, token = propertyHandlerRecordToken,
+    ) => {
+      const map = eventHandlerMap(node, true);
+      if (!map) return null;
+      let record = map.get(type);
+      if (!record || record.token !== propertyHandlerRecordToken) {
+        record = {
+          token: propertyHandlerRecordToken,
+          sourceToken: token,
+          callback: null,
+          wrapper: null,
+        };
+        map.set(type, record);
+      }
+      record.sourceToken = token;
+      record.callback = typeof callback === "function" ? callback : null;
+      const wantsWrapper = record.callback !== null ||
+        token === inlineHandlerRecordToken;
+      if (wantsWrapper && record.wrapper === null) {
+        record.wrapper = function (event) {
+          const current = record.callback;
+          if (typeof current !== "function") return;
+          const returned = ancestorApply(current, this, [event]);
+          if (returned === false) event.preventDefault();
+        };
+        node.addEventListener(type, record.wrapper, false);
+      } else if (!wantsWrapper && record.wrapper !== null) {
+        node.removeEventListener(type, record.wrapper, false);
+        record.wrapper = null;
+      }
+      return record.callback;
+    },
     inlineEventHandler = (node, type, name) => {
       const retained = eventHandlerMap(node, false);
       if (retained?.has(type)) {
         const value = retained.get(type);
-        return value?.token === inlineHandlerRecordToken
-          ? value.callback : value;
+        if (value?.token !== propertyHandlerRecordToken) return value;
+        if (value.sourceToken !== inlineHandlerRecordToken || value.callback)
+          return value.callback;
       }
       if (
         globalThis.__tilefinchCspAllowsInlineEventHandlers === false ||
@@ -409,12 +467,7 @@
       }
       const map = eventHandlerMap(node, true);
       if (!map) return null;
-      map.set(type, {
-        token: inlineHandlerRecordToken,
-        callback: typeof callable === "function" ? callable : null,
-      });
-      if (typeof callable === "function")
-        globalThis.__tilefinchEventObserverDelta?.(type, 1);
+      installEventHandler(node, type, callable, inlineHandlerRecordToken);
       return typeof callable === "function" ? callable : null;
     },
     invalidateInlineEventHandler = (node, attributeName) => {
@@ -422,13 +475,17 @@
       if (name.length <= 2 || !name.startsWith("on")) return;
       const type = name.slice(2),
         map = eventHandlerMap(node, false),
-        value = map?.get(type);
-      if (
-        value?.token === inlineHandlerRecordToken &&
-        typeof value.callback === "function"
-      )
-        globalThis.__tilefinchEventObserverDelta?.(type, -1);
-      map?.delete(type);
+        value = map?.get(type),
+        attributePresent = typeof node?.getAttribute === "function" &&
+          node.getAttribute(name) !== null;
+      if (attributePresent) {
+        /* Reserve (or retain) the handler listener's current position now;
+         * compile the changed source lazily immediately before dispatch. */
+        installEventHandler(node, type, null, inlineHandlerRecordToken);
+      } else if (value?.token === propertyHandlerRecordToken) {
+        installEventHandler(node, type, null);
+        map.delete(type);
+      }
       if (type.startsWith("mouse") || type.startsWith("pointer"))
         globalThis.__tilefinchPointerMarkupChanged?.();
     };
@@ -946,6 +1003,8 @@
       return globalThis.document?.createDocumentFragment?.() || this;
     }
   }
+  const registerNativeShadowRoot = globalThis.__tilefinchRegisterShadowRoot;
+  delete globalThis.__tilefinchRegisterShadowRoot;
   const shadowConstructionToken = {},
     shadowRootByHost = new WeakMap(),
     shadowRootByHostHandle = new Map(),
@@ -999,9 +1058,46 @@
   }
   class HTMLDocument extends Document {}
   class XMLDocument extends Document {}
-  class NodeList extends Array {
+  const nodeListIterator = (list, kind) => {
+    let index = 0;
+    return {
+      next() {
+        if (index >= list.length) return { done: true, value: undefined };
+        const at = index++;
+        return {
+          done: false,
+          value: kind === 0 ? at : kind === 1 ? list[at] : [at, list[at]],
+        };
+      },
+      [Symbol.iterator]() {
+        return this;
+      },
+    };
+  };
+  class NodeList {
+    constructor() {
+      throw new TypeError("Illegal constructor");
+    }
     item(index) {
-      return this[Number(index)] ?? null;
+      return this[Number(index) >>> 0] ?? null;
+    }
+    entries() {
+      return nodeListIterator(this, 2);
+    }
+    forEach(callback, thisArg) {
+      if (typeof callback !== "function")
+        throw new TypeError("callback must be a function");
+      for (let index = 0; index < this.length; index++)
+        callback.call(thisArg, this[index], index, this);
+    }
+    keys() {
+      return nodeListIterator(this, 0);
+    }
+    values() {
+      return nodeListIterator(this, 1);
+    }
+    [Symbol.iterator]() {
+      return nodeListIterator(this, 1);
     }
   }
   class HTMLCollection {}
@@ -1078,6 +1174,15 @@
   });
   if (!(globalThis instanceof Window))
     Object.setPrototypeOf(globalThis, Window.prototype);
+  /* QuickJS gives its global object an internal `global` class tag which
+     wins over the inherited Window prototype tag. Browsing-context globals
+     must nevertheless stringify as Window, like their WindowProxy surface.
+     Keep an own, immutable brand so deleting an author-visible property
+     cannot reveal the engine's internal global class name. */
+  Object.defineProperty(globalThis, Symbol.toStringTag, {
+    configurable: false,
+    value: "Window",
+  });
   globalThis.__tilefinchLiveHTMLCollection = (read) => {
     const target = new HTMLCollection();
     return new Proxy(target, {
@@ -1424,6 +1529,13 @@
       __tilefinchSetAttribute(root.__handle, "style", "display:contents");
       if (!__tilefinchAppend(this.__handle, root.__handle))
         throw new Error("ShadowRoot connection failed");
+      if (!registerNativeShadowRoot(root.__handle)) {
+        __tilefinchRemove(root.__handle);
+        throw new DOMException(
+          "Shadow root limit exceeded",
+          "QuotaExceededError",
+        );
+      }
     }
     shadowRootByHost.set(this, root);
     shadowRootCreated = true;
@@ -1734,13 +1846,19 @@
           Node.DOCUMENT_POSITION_FOLLOWING | Node.DOCUMENT_POSITION_CONTAINED_BY
         );
       const siblings = left[at - 1].childNodes,
-        leftIndex = siblings.indexOf(left[at]),
-        rightIndex = siblings.indexOf(right[at]);
+        leftIndex = Array.prototype.indexOf.call(siblings, left[at]),
+        rightIndex = Array.prototype.indexOf.call(siblings, right[at]);
       return rightIndex >= 0 && rightIndex < leftIndex
         ? Node.DOCUMENT_POSITION_PRECEDING
         : Node.DOCUMENT_POSITION_FOLLOWING;
     };
   }
+  const globalEventHandlerPrototypes = [
+    Window.prototype,
+    Document.prototype,
+    HTMLElement.prototype,
+    SVGElement.prototype,
+  ];
   for (const type of [
     "abort",
     "animationcancel",
@@ -1824,13 +1942,13 @@
     "transitionend",
     "transitionrun",
     "transitionstart",
+    "visibilitychange",
     "volumechange",
     "waiting",
     "wheel",
   ]) {
     const name = "on" + type;
-    if (!(name in EventTarget.prototype))
-      Object.defineProperty(EventTarget.prototype, name, {
+    const descriptor = {
         configurable: true,
         enumerable: true,
         get() {
@@ -1839,28 +1957,43 @@
         set(value) {
           const callable = typeof value === "function" ? value : null,
             retained = eventHandlerMap(this, false),
-            retainedValue = retained?.get(type),
-            existing = retainedValue?.token === inlineHandlerRecordToken
-              ? retainedValue.callback
-              : retainedValue || null,
-            hasMarkup = this?.getAttribute?.(name) !== null,
+            hasMarkup = typeof this?.getAttribute === "function" &&
+              this.getAttribute(name) !== null,
             map = eventHandlerMap(
               this,
               callable !== null || hasMarkup || !!retained,
             );
           if (!map) return;
-          map.set(type, callable);
-          if ((existing === null) !== (callable === null))
-            globalThis.__tilefinchEventObserverDelta?.(
-              type,
-              callable === null ? -1 : 1,
-            );
+          installEventHandler(this, type, callable);
         },
-      });
+      };
+    for (const prototype of globalEventHandlerPrototypes)
+      if (!(name in prototype))
+        Object.defineProperty(prototype, name, descriptor);
   }
+  Object.defineProperty(NodeList.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "NodeList",
+  });
   const nodeList = (values) => {
-    Object.setPrototypeOf(values, NodeList.prototype);
-    return values;
+    const numericLength = numberFrom(values?.length),
+      length = numberIsFinite(numericLength) && numericLength > 0
+        ? mathMin(mathFloor(numericLength), 0xffffffff)
+        : 0;
+    if (length > 16384)
+      throw new RangeError("NodeList limit exceeded");
+    const result = Object.create(NodeList.prototype);
+    for (let index = 0; index < length; index++)
+      Object.defineProperty(result, index, {
+        configurable: true,
+        enumerable: true,
+        value: values[index],
+      });
+    Object.defineProperty(result, "length", {
+      configurable: true,
+      value: length,
+    });
+    return result;
   };
   const containingShadowRoot = (node) => {
       for (
@@ -2268,7 +2401,9 @@
       configurable: true,
     },
     querySelectorAll: {
-      value: __tilefinchDocumentQuerySelectorAll,
+      value: function querySelectorAll(selector) {
+        return nodeList(__tilefinchDocumentQuerySelectorAll.call(this, selector));
+      },
       writable: true,
       configurable: true,
     },
@@ -2311,7 +2446,11 @@
       configurable: true,
     },
     querySelectorAll: {
-      value: __tilefinchDocumentFragmentQuerySelectorAll,
+      value: function querySelectorAll(selector) {
+        return nodeList(
+          __tilefinchDocumentFragmentQuerySelectorAll.call(this, selector),
+        );
+      },
       writable: true,
       configurable: true,
     },
@@ -2323,7 +2462,9 @@
       configurable: true,
     },
     querySelectorAll: {
-      value: __tilefinchElementQuerySelectorAll,
+      value: function querySelectorAll(selector) {
+        return nodeList(__tilefinchElementQuerySelectorAll.call(this, selector));
+      },
       writable: true,
       configurable: true,
     },
@@ -2821,6 +2962,11 @@
     configurable: true,
     enumerable: true,
     get() {
+      /* Live wrappers normally install an own accessor so the common lookup
+         stays cheap. The property is configurable, as the platform requires;
+         deleting it must reveal the prototype CSSStyleDeclaration rather than
+         make style disappear from a still-live Element. */
+      if (Number(this.__handle) > 0) return nativeStyleFor(this);
       if (!this.__detachedOwner) return undefined;
       let value = detachedStyles.get(this);
       if (!value) {
@@ -3412,11 +3558,6 @@
     },
     set src(value) {
       this.setAttribute("src", value);
-      if (
-        String(this.tagName).toLowerCase() === "iframe" &&
-        this.isConnected
-      )
-        globalThis.__tilefinchLoadLocalFrame?.(this);
     },
     get href() {
       const value = this.getAttribute("href") || "";
@@ -4593,9 +4734,7 @@
       if (value.bubbles && !value.__stopped)
         for (let i = 1; i < path.length && !value.__stopped; i++)
           invoke(path[i], false, 3);
-      value.currentTarget = null;
-      value.eventPhase = 0;
-      value.__dispatching = false;
+      globalThis.__tilefinchFinishEventDispatch(value);
       value.target = retargetShadowEvent(
         this,
         path[path.length - 1] || this,
@@ -5262,10 +5401,11 @@
       globalThis.__tilefinchCanvasAttributeChanged?.(this, lowerName);
       if (
         this instanceof HTMLIFrameElement &&
-        (lowerName === "src" || lowerName === "srcdoc") &&
+        (lowerName === "srcdoc" ||
+          (lowerName === "src" && !this.hasAttribute("srcdoc"))) &&
         this.isConnected
       )
-        globalThis.__tilefinchLoadLocalFrame?.(this);
+        globalThis.__tilefinchLoadLocalFrame?.(this, true);
       globalThis.__tilefinchNotifyMutation?.(
         this,
         "attributes",
@@ -5452,10 +5592,11 @@
         globalThis.__tilefinchCanvasAttributeChanged?.(this, lowerName);
         if (
           this instanceof HTMLIFrameElement &&
-          (lowerName === "src" || lowerName === "srcdoc") &&
+          (lowerName === "srcdoc" ||
+            (lowerName === "src" && !this.hasAttribute("srcdoc"))) &&
           this.isConnected
         )
-          globalThis.__tilefinchLoadLocalFrame?.(this);
+          globalThis.__tilefinchLoadLocalFrame?.(this, true);
         globalThis.__tilefinchCustomElementAttributeChanged?.(
           this,
           lowerName,
@@ -5979,6 +6120,11 @@
   const wrapperListeners = Symbol("wrapper listeners");
   const nativeNodeEventDescriptors = Object.getOwnPropertyDescriptors({
     addEventListener(type, callback, options = false) {
+      type = String(type);
+      /* Parsed markup predates JavaScript registration. Materialize its event
+       * handler slot before appending an author listener so first-dispatch
+       * ordering matches a handler installed while parsing. */
+      inlineEventHandler(this, type, "on" + type);
       const retained = listenerMap(this, true);
       const listeners = retained || this[wrapperListeners] || new Map();
       this[wrapperListeners] = listeners;
@@ -5996,22 +6142,7 @@
     __invokeEvent(value, capture) {
       value.currentTarget = this;
       value.eventPhase = this === value.target ? 2 : capture ? 1 : 3;
-      if (!capture) {
-        const propertyName = "on" + value.type,
-          handler = propertyName in this
-            ? this[propertyName]
-            : inlineEventHandler(this, value.type, propertyName);
-        if (typeof handler === "function")
-          try {
-            globalThis.__tilefinchRecordEventHandler();
-            const returned = globalThis.__tilefinchRunTask(
-              "element-handler:" + String(value.type), handler, this, [value],
-            );
-            if (returned === false) value.preventDefault();
-          } catch (error) {
-            __tilefinchReportUncaught(error, "event " + value.type);
-          }
-      }
+      if (!capture) inlineEventHandler(this, value.type, "on" + value.type);
       const listeners = this[wrapperListeners];
       if (listeners)
         globalThis.__tilefinchInvokeListenerList?.(
@@ -6079,9 +6210,10 @@
           const handlers = eventHandlerMap(this, false);
           if (handlers)
             for (const [type, value] of handlers)
-              if (value?.token === inlineHandlerRecordToken) {
-                if (typeof value.callback === "function")
-                  globalThis.__tilefinchEventObserverDelta?.(type, -1);
+              if (value?.token === propertyHandlerRecordToken &&
+                  value.sourceToken === inlineHandlerRecordToken) {
+                if (value.wrapper)
+                  this.removeEventListener(type, value.wrapper, false);
                 handlers.delete(type);
               }
         }
@@ -6591,7 +6723,13 @@
         options: normalized,
       };
       const at = state.targets.findIndex((item) => item.target === target);
-      if (at >= 0) state.targets[at] = registration;
+      if (at >= 0) {
+        const previous = state.targets[at];
+        state.targets[at] = registration;
+        state.transientRoots = state.transientRoots.filter(
+          (item) => item.registration !== previous,
+        );
+      }
       else state.targets.push(registration);
       if (!mutationObservers.includes(this)) {
         /* Observer registrations retain callback closures and target
@@ -7336,7 +7474,8 @@
       const observerState = mutationObserverStates.get(observer);
       if (!observerState) continue;
       let matched = false;
-      let matchedRegistration = null;
+      let attributeOldValue = false,
+        characterDataOldValue = false;
       for (const watched of observerState.targets) {
         const sameStable =
           watched.targetKey &&
@@ -7361,6 +7500,23 @@
               break;
             }
         }
+        /* Removing a subtree creates transient registrations for every
+         * applicable subtree observation, even when that observation did
+         * not request childList records.  Keep registrations distinct so
+         * overlapping oldValue/filter requirements are merged at mutation
+         * time rather than lost behind the first match. */
+        if (type === "childList" && removedNodes.length && within &&
+            watched.options.subtree) {
+          for (const root of removedNodes) {
+            if (observerState.transientRoots.length >= 64) break;
+            if (!observerState.transientRoots.some((item) =>
+              item.root === root && item.registration === watched))
+              observerState.transientRoots.push({
+                root,
+                registration: watched,
+              });
+          }
+        }
         if (
           within &&
           ((type === "attributes" && watched.options.attributes) ||
@@ -7374,13 +7530,11 @@
           )
             continue;
           matched = true;
-          var matchedOptions = watched.options;
-          matchedRegistration = watched;
-          break;
+          attributeOldValue ||= watched.options.attributeOldValue;
+          characterDataOldValue ||= watched.options.characterDataOldValue;
         }
       }
-      if (!matched) {
-        for (const transient of observerState.transientRoots) {
+      for (const transient of observerState.transientRoots) {
           let within = target === transient.root;
           if (!within) {
             for (
@@ -7393,7 +7547,20 @@
                 break;
               }
           }
-          const options = transient.options;
+          const options = transient.registration.options;
+          if (type === "childList" && removedNodes.length && within &&
+              options.subtree) {
+            for (const root of removedNodes) {
+              if (observerState.transientRoots.length >= 64) break;
+              if (!observerState.transientRoots.some((item) =>
+                item.root === root &&
+                item.registration === transient.registration))
+                observerState.transientRoots.push({
+                  root,
+                  registration: transient.registration,
+                });
+            }
+          }
           if (
             within &&
             ((type === "attributes" && options.attributes) ||
@@ -7406,28 +7573,11 @@
             )
           ) {
             matched = true;
-            matchedOptions = options;
-            break;
+            attributeOldValue ||= options.attributeOldValue;
+            characterDataOldValue ||= options.characterDataOldValue;
           }
-        }
       }
       if (!matched) continue;
-      if (
-        type === "childList" &&
-        removedNodes.length &&
-        matchedRegistration?.options.subtree
-      ) {
-        for (const root of removedNodes) {
-          if (
-            observerState.transientRoots.length < 64 &&
-            !observerState.transientRoots.some((item) => item.root === root)
-          )
-            observerState.transientRoots.push({
-              root,
-              options: matchedRegistration.options,
-            });
-        }
-      }
       if (observerState.records.length >= 64) {
         retentionStats.recordDrops++;
         continue;
@@ -7443,11 +7593,11 @@
         attributeNamespace,
         oldValue:
           type === "attributes"
-            ? matchedOptions.attributeOldValue
+            ? attributeOldValue
               ? oldValue
               : null
             : type === "characterData"
-              ? matchedOptions.characterDataOldValue
+              ? characterDataOldValue
                 ? oldValue
                 : null
               : null,
@@ -7468,6 +7618,7 @@
             if (!itemState) continue;
             itemState.pending = false;
             const records = item.takeRecords();
+            itemState.transientRoots = [];
             if (records.length)
               try {
                 globalThis.__tilefinchRunTask(
@@ -7479,7 +7630,6 @@
               } catch (error) {
                 __tilefinchReportUncaught(error, "MutationObserver");
               }
-            itemState.transientRoots = [];
           }
           mutationDeliveryActive = false;
           if (pendingSlotRoots.size)

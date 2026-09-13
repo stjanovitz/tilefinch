@@ -20,6 +20,10 @@ typedef struct {
     bool refuse_next_wasm_alias;
     /* Refuse the next dedicated-worker realm creation once. */
     bool refuse_next_worker_realm;
+    /* Backdate both halves of the Window performance origin by this many
+       milliseconds. Tests use it to expose epoch/monotonic skew without a
+       real sleep inside runtime startup. Consumed once. */
+    unsigned runtime_performance_origin_backdate_ms;
     /* Fail the next document refresh after a DOM mutation once. */
     bool refuse_next_document_refresh;
     /* Refuse the next streaming resource scheduler creation once. */

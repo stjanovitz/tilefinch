@@ -332,6 +332,30 @@ static void promise_rejection_tracker(JSContext *context,
                                       void *opaque)
 {
     if (opaque == NULL) return;
+    /* Worker promise rejection events belong to the WorkerGlobalScope, not
+       the owner Window.  The immutable realm hook only queues a bounded task;
+       it never invokes author handlers from inside QuickJS's rejection
+       tracker.  A failure in this browser-owned notification path must not
+       replace the promise's own rejection. */
+    JSValue worker_global = JS_GetGlobalObject(context);
+    JSValue worker_notify = JS_GetPropertyStr(
+        context, worker_global, "__tilefinchQueuePromiseRejection");
+    if (JS_IsFunction(context, worker_notify)) {
+        JSValue args[3] = {
+            JS_DupValue(context, promise),
+            JS_DupValue(context, reason),
+            JS_NewBool(context, is_handled),
+        };
+        JSValue notified = JS_Call(
+            context, worker_notify, worker_global, 3, args);
+        for (size_t i = 0; i < 3; i++) JS_FreeValue(context, args[i]);
+        if (JS_IsException(notified)) js_rt_clear_formatting_exception(context);
+        JS_FreeValue(context, notified);
+    } else if (JS_IsException(worker_notify)) {
+        js_rt_clear_formatting_exception(context);
+    }
+    JS_FreeValue(context, worker_notify);
+    JS_FreeValue(context, worker_global);
     PromiseRejectionState *state = opaque;
     ScriptResult *result = state->result;
     if (result == NULL) return;
@@ -848,6 +872,14 @@ bool js_rt_evaluate_source_type_at(JSContext *context, const char *source,
     BudgetAllocationOwner previous_owner =
         bridge_document_owner_enter(bridge);
     uint64_t execute_started_us = tilefinch_platform_monotonic_time_us();
+#if defined(CONFIG_PROPERTY_FAULT_TRACE)
+    /* Reset the bounded diagnostic budget after compilation and browser-side
+       currentScript setup, immediately before author bytecode executes. */
+    if (!JS_IsException(value)
+        && source_kind != SCRIPT_COMPILE_SOURCE_INTERNAL) {
+        runtime_configure_property_fault_trace(JS_GetRuntime(context));
+    }
+#endif
     if (!JS_IsException(value)) value = JS_EvalFunction(context, value);
     if (result != NULL && (unsigned) source_kind < 6u) {
         result->execute_us[source_kind] +=

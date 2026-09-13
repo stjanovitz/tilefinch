@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>property miss trace</title>
+<script>
+const featureHost = {};
+void featureHost.optionalStandardFeature;
+void ("missingViaIn" in featureHost);
+globalThis.pocSummary = "ordinary-property-miss";
+</script>

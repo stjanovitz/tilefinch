@@ -36,6 +36,7 @@ struct BrowserProfile {
     unsigned live_cache_kib;
     bool persist_local_storage;
     bool tls_session_persistence;
+    bool save_diagnostic_reports;
     bool javascript_enabled;
     uint32_t javascript_default_allow_mask;
     bool site_data_allowed;
@@ -645,12 +646,6 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
     }
     if (ok) {
         ok = fprintf(
-            file, "STATS\t%llu\n",
-            (unsigned long long)
-                profile->content_blocker_total_blocked) > 0;
-    }
-    if (ok) {
-        ok = fprintf(
             file, "TABS\t%u\n",
             profile->tab_hibernation_enabled ? 1u : 0u) > 0;
     }
@@ -695,6 +690,12 @@ bool browser_profile_save(const BrowserProfile *profile, const char *path)
         ok = fprintf(
             file, "TLSSESS\t%u\n",
             profile->tls_session_persistence ? 1u : 0u) > 0;
+    }
+    if (ok) {
+        /* Append-only and default-off for profiles written by older slots. */
+        ok = fprintf(
+            file, "DIAG\t%u\n",
+            profile->save_diagnostic_reports ? 1u : 0u) > 0;
     }
     if (ok) {
         ok = fprintf(file, "JSDEFAULT\t%u\n",
@@ -1042,8 +1043,9 @@ static bool profile_load_internal(
                 loaded->content_blocker_cosmetic_hiding =
                     strtoul(second, NULL, 10) != 0;
         } else if (strcmp(line, "STATS") == 0) {
-            loaded->content_blocker_total_blocked =
-                strtoull(first, NULL, 10);
+            /* Older profiles persisted this cosmetic lifetime counter. It is
+               now session-only so blocking a request never dirties the card. */
+            continue;
         } else if (strcmp(line, "TABS") == 0) {
             loaded->tab_hibernation_enabled =
                 strtoul(first, NULL, 10) != 0;
@@ -1055,6 +1057,9 @@ static bool profile_load_internal(
         } else if (strcmp(line, "TLSSESS") == 0) {
             loaded->tls_session_persistence =
                 strtoul(first, NULL, 10) != 0;
+        } else if (strcmp(line, "DIAG") == 0) {
+            if (strcmp(first, "0") == 0 || strcmp(first, "1") == 0)
+                loaded->save_diagnostic_reports = first[0] == '1';
         } else if (strcmp(line, "JSDEFAULT") == 0) {
             /* Only the defined bit is admitted; malformed/future records
                retain the safe default rather than granting an exception. */
@@ -1355,6 +1360,12 @@ bool browser_profile_tls_session_persistence(
     const BrowserProfile *profile)
 {
     return profile == NULL || profile->tls_session_persistence;
+}
+
+bool browser_profile_save_diagnostic_reports(
+    const BrowserProfile *profile)
+{
+    return profile != NULL && profile->save_diagnostic_reports;
 }
 
 bool browser_profile_javascript_enabled(const BrowserProfile *profile)
@@ -1771,6 +1782,12 @@ void browser_profile_set_tls_session_persistence(
     BrowserProfile *profile, bool enabled)
 {
     if (profile != NULL) profile->tls_session_persistence = enabled;
+}
+
+void browser_profile_set_save_diagnostic_reports(
+    BrowserProfile *profile, bool enabled)
+{
+    if (profile != NULL) profile->save_diagnostic_reports = enabled;
 }
 
 void browser_profile_set_javascript_enabled(

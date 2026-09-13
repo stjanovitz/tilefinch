@@ -8,6 +8,7 @@
 #include "tilefinch/content_blocker.h"
 #include "tilefinch/multiplayer.h"
 #include "tilefinch/platform.h"
+#include "tilefinch/resource_integrity.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -109,37 +110,10 @@ void js_rt_record_network_response(ScriptResult *result,
     result->last_network_body_prefix[at] = '\0';
 }
 
-static bool response_content_is_textual(const char *content_type)
-{
-    if (content_type == NULL) return false;
-    size_t length = strcspn(content_type, ";");
-    while (length > 0
-           && isspace((unsigned char) content_type[length - 1])) length--;
-    if (length >= 5 && strncasecmp(content_type, "text/", 5) == 0) {
-        return true;
-    }
-    static const char *const textual_types[] = {
-        "application/json", "application/xml",
-        "application/javascript", "application/ecmascript",
-        "application/x-javascript", "application/x-www-form-urlencoded"
-    };
-    for (size_t i = 0;
-         i < sizeof(textual_types) / sizeof(textual_types[0]); i++) {
-        if (strlen(textual_types[i]) == length
-            && strncasecmp(content_type, textual_types[i], length) == 0) {
-            return true;
-        }
-    }
-    return (length >= 5
-            && strncasecmp(content_type + length - 5, "+json", 5) == 0)
-        || (length >= 4
-            && strncasecmp(content_type + length - 4, "+xml", 4) == 0);
-}
-
 /* Keep exactly one eager JavaScript representation of a native response.
-   Textual payloads enter QuickJS as a string; all other payloads enter as an
-   ArrayBuffer and are decoded only when Response.text/json or textual XHR
-   semantics actually require it. */
+   Fetch bodies are byte sequences regardless of MIME type.  Decoding here
+   would irreversibly replace invalid UTF-8 before arrayBuffer()/bytes()/Blob
+   consumers can observe the transport payload. */
 void js_rt_script_set_response_body(JSContext *context, JSValue response,
                               const FetchResult *fetched)
 {
@@ -148,15 +122,10 @@ void js_rt_script_set_response_body(JSContext *context, JSValue response,
     }
     (void) JS_SetPropertyStr(context, response, "bodyLength",
                             JS_NewInt64(context, (int64_t) fetched->length));
-    if (response_content_is_textual(fetched->content_type)) {
-        (void) JS_SetPropertyStr(context, response, "body",
-            JS_NewStringLen(context, fetched->data, fetched->length));
-    } else {
-        (void) JS_SetPropertyStr(context, response, "bodyBytes",
-            JS_NewArrayBufferCopy(context,
-                                  (const uint8_t *) fetched->data,
-                                  fetched->length));
-    }
+    (void) JS_SetPropertyStr(context, response, "bodyBytes",
+        JS_NewArrayBufferCopy(context,
+                              (const uint8_t *) fetched->data,
+                              fetched->length));
 }
 
 /* Modern SPA API payloads such as custom emoji inventories and trending
@@ -174,10 +143,12 @@ static size_t js_fetch_response_limit(const DomBridge *bridge)
     return limit;
 }
 #define JS_FETCH_MAXIMUM_HEADERS (8u * 1024u)
+#define JS_FETCH_MAXIMUM_ACCEPT_BYTES 511u
 
 typedef struct {
     TilefinchRequestContext context;
     const TilefinchContentSecurityPolicy *content_security_policy;
+    const char *referrer_source;
     const char *referrer_policy;
 } ScriptRequestPolicy;
 
@@ -207,6 +178,7 @@ static bool script_request_policy_prepare(
                == TILEFINCH_CREDENTIALS_SAME_ORIGIN) {
         policy->context.credentials = TILEFINCH_CREDENTIALS_OMIT;
     }
+    policy->referrer_source = bridge->document_url;
     policy->referrer_policy = bridge->referrer_policy;
     policy->content_security_policy =
         &bridge->document->content_security_policy;
@@ -224,11 +196,78 @@ static const FetchRequest *script_request_policy_apply(
 {
     if (policy == NULL || prepared == NULL
         || !fetch_prepare_page_request_context(
-            &policy->context, policy->context.initiator_url,
+            &policy->context, policy->referrer_source,
             policy->referrer_policy, session,
             policy->content_security_policy, NULL, transport,
             prepared, NULL)) return NULL;
     return fetch_prepared_page_request(prepared);
+}
+
+static bool script_referrer_policy_name_valid(const char *policy)
+{
+    static const char *const names[] = {
+        "", "no-referrer", "no-referrer-when-downgrade", "origin",
+        "origin-when-cross-origin", "same-origin", "strict-origin",
+        "strict-origin-when-cross-origin", "unsafe-url"
+    };
+    if (policy == NULL) return false;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strcmp(policy, names[i]) == 0) return true;
+    }
+    return false;
+}
+
+/* Read the author-controlled Request referrer knobs only after the ordinary
+   request shape has passed its cheap validation.  The prepared-page builder
+   remains authoritative for the actual Referer field and redirect updates;
+   this helper merely selects its immutable source and policy inputs. */
+static bool script_request_policy_read_referrer(
+    JSContext *context, DomBridge *bridge, int argc, JSValueConst *argv,
+    int referrer_index, int policy_index, ScriptRequestPolicy *policy,
+    const char **referrer_text_out, const char **policy_text_out)
+{
+    if (context == NULL || bridge == NULL || policy == NULL
+        || referrer_text_out == NULL || policy_text_out == NULL) return false;
+    *referrer_text_out = NULL;
+    *policy_text_out = NULL;
+    if (argc > referrer_index && !JS_IsUndefined(argv[referrer_index])) {
+        size_t length = 0;
+        const char *value = JS_ToCStringLen(
+            context, &length, argv[referrer_index]);
+        if (value == NULL) return false;
+        *referrer_text_out = value;
+        if (strlen(value) != length) return false;
+        if (value[0] == '\0') {
+            policy->referrer_source = NULL;
+        } else if (strcmp(value, "about:client") == 0) {
+            policy->referrer_source = bridge->document_url;
+        } else {
+            TilefinchUrl parsed;
+            if (!tilefinch_url_parse(value, &parsed)
+                || bridge->document_url == NULL
+                || !tilefinch_url_same_origin(
+                       bridge->document_url, value)) return false;
+            policy->referrer_source = value;
+        }
+    }
+    if (argc > policy_index && !JS_IsUndefined(argv[policy_index])) {
+        size_t length = 0;
+        const char *value = JS_ToCStringLen(
+            context, &length, argv[policy_index]);
+        if (value == NULL) return false;
+        *policy_text_out = value;
+        if (strlen(value) != length
+            || !script_referrer_policy_name_valid(value)) return false;
+        if (value[0] != '\0') policy->referrer_policy = value;
+    }
+    return true;
+}
+
+static void script_request_policy_free_referrer(
+    JSContext *context, const char *referrer_text, const char *policy_text)
+{
+    if (referrer_text != NULL) JS_FreeCString(context, referrer_text);
+    if (policy_text != NULL) JS_FreeCString(context, policy_text);
 }
 
 void js_rt_script_store_response_cookies(
@@ -485,6 +524,148 @@ static bool script_response_header_token_contains(
     return false;
 }
 
+/* Resource Timing exposes only start/end for cross-origin responses unless
+   the response explicitly opts the initiator origin in.  CORS admission is
+   deliberately not a substitute for Timing-Allow-Origin: the latter guards
+   connection phase and transfer-size information. */
+bool js_rt_script_resource_timing_allowed(
+    const DomBridge *bridge, const FetchResult *fetched,
+    const char *response_url)
+{
+    if (bridge == NULL || fetched == NULL || response_url == NULL
+        || bridge->document_url == NULL) return false;
+    /* Fetch's TAO check covers every redirect response.  FetchResult retains
+       only the final header block, so a cross-origin redirect chain cannot be
+       proven to have opted in at every hop and must fail closed. */
+    if (fetched->redirect_origin_tainted) return false;
+    if (!bridge->opaque_origin
+        && tilefinch_url_same_origin(bridge->document_url, response_url)) {
+        return true;
+    }
+    char initiator_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
+    if (bridge->opaque_origin) {
+        memcpy(initiator_origin, "null", sizeof("null"));
+    } else if (!tilefinch_url_origin(
+                   bridge->document_url, initiator_origin,
+                   sizeof(initiator_origin))) {
+        return false;
+    }
+    bool wildcard = false;
+    return script_response_header_token_contains(
+               fetched, "timing-allow-origin", initiator_origin, false,
+               &wildcard)
+        || wildcard;
+}
+
+uint8_t js_rt_script_resource_timing_protocol(long version)
+{
+    const char *name = fetch_http_version_name(version);
+    if (strcmp(name, "1.0") == 0) return 1;
+    if (strcmp(name, "1.1") == 0) return 2;
+    if (strcmp(name, "2") == 0) return 3;
+    return 0;
+}
+
+static bool resource_timing_mime_token_byte(unsigned char value)
+{
+    return (value >= '0' && value <= '9')
+        || (value >= 'A' && value <= 'Z')
+        || (value >= 'a' && value <= 'z')
+        || value == '!' || value == '#' || value == '$' || value == '%'
+        || value == '&' || value == '\'' || value == '*' || value == '+'
+        || value == '-' || value == '.' || value == '^' || value == '_'
+        || value == '`' || value == '|' || value == '~';
+}
+
+/* Resource Timing exposes a minimized MIME type rather than the complete
+   Content-Type field. Keep this parser bounded by FetchResult::content_type. */
+bool js_rt_resource_timing_minimize_content_type(
+    const char *source, char *output, size_t capacity)
+{
+    if (output == NULL || capacity == 0) return false;
+    output[0] = '\0';
+    if (source == NULL) return true;
+    const char *start = source;
+    while (*start == ' ' || *start == '\t' || *start == '\r'
+           || *start == '\n') start++;
+    const char *end = strchr(start, ';');
+    if (end == NULL) end = start + strlen(start);
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t'
+                           || end[-1] == '\r' || end[-1] == '\n')) end--;
+    const char *slash = memchr(start, '/', (size_t) (end - start));
+    if (slash == NULL || slash == start || slash + 1 == end) return true;
+    for (const char *at = start; at < end; at++) {
+        if (at == slash) continue;
+        if (!resource_timing_mime_token_byte((unsigned char) *at)) return true;
+    }
+    size_t length = (size_t) (end - start);
+    if (length >= capacity) return true;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char value = (unsigned char) start[i];
+        output[i] = value >= 'A' && value <= 'Z'
+            ? (char) (value + ('a' - 'A')) : (char) value;
+    }
+    output[length] = '\0';
+    if (script_module_mime_type_allowed(output)) {
+        memcpy(output, "text/javascript", sizeof("text/javascript"));
+    } else {
+        const char *subtype = output + (slash - start) + 1;
+        size_t subtype_length = strlen(subtype);
+        if (strcmp(output, "application/json") == 0
+            || strcmp(output, "text/json") == 0
+            || (subtype_length > 5
+                && strcmp(subtype + subtype_length - 5, "+json") == 0)) {
+            memcpy(output, "application/json", sizeof("application/json"));
+        } else if (strcmp(output, "image/svg+xml") != 0
+                   && (strcmp(output, "text/xml") == 0
+                       || strcmp(output, "application/xml") == 0
+                       || (subtype_length > 4
+                           && strcmp(subtype + subtype_length - 4,
+                                     "+xml") == 0))) {
+            memcpy(output, "application/xml", sizeof("application/xml"));
+        }
+    }
+    return true;
+}
+
+bool js_rt_resource_timing_body_info_visible(
+    const DomBridge *bridge, TilefinchRequestMode mode,
+    const char *response_url, bool redirect_origin_tainted)
+{
+    if (bridge == NULL || response_url == NULL
+        || bridge->opaque_origin || bridge->document_url == NULL) return false;
+    if (tilefinch_url_same_origin(bridge->document_url, response_url)) {
+        return mode != TILEFINCH_REQUEST_MODE_NO_CORS
+            || !redirect_origin_tainted;
+    }
+    return mode == TILEFINCH_REQUEST_MODE_CORS;
+}
+
+static bool dynamic_resource_timing_body_info_visible(
+    const DomBridge *bridge, const ScriptDynamicTask *task,
+    const char *response_url, bool redirect_origin_tainted)
+{
+    return task != NULL && js_rt_resource_timing_body_info_visible(
+        bridge, task->mode, response_url, redirect_origin_tainted);
+}
+
+static void dynamic_resource_timing_set_content_type(
+    DomBridge *bridge, ScriptDynamicTask *task, const char *content_type)
+{
+    if (bridge == NULL || task == NULL) return;
+    budget_free(bridge->budget, task->resource_timing_content_type);
+    task->resource_timing_content_type = NULL;
+    task->resource_timing.content_type = NULL;
+    char minimized[128];
+    if (!js_rt_resource_timing_minimize_content_type(
+            content_type, minimized, sizeof(minimized))
+        || minimized[0] == '\0') return;
+    task->resource_timing_content_type =
+        js_rt_dynamic_copy_text(bridge->budget, minimized);
+    task->resource_timing.content_type =
+        task->resource_timing_content_type;
+}
+
 static bool script_cors_preflight_request(
     DomBridge *bridge, const char *url, const char *method,
     TilefinchCredentialsMode credentials,
@@ -563,7 +744,8 @@ TilefinchRequestDestination destination, TilefinchRequestMode mode,
 TilefinchCredentialsMode credentials)
 {
     if (destination != TILEFINCH_DESTINATION_FETCH
-        && destination != TILEFINCH_DESTINATION_SCRIPT) return true;
+        && destination != TILEFINCH_DESTINATION_SCRIPT
+        && destination != TILEFINCH_DESTINATION_WORKER) return true;
     if (bridge == NULL || bridge->document_url == NULL || fetched == NULL) {
         return false;
     }
@@ -579,6 +761,13 @@ TilefinchCredentialsMode credentials)
         || strcmp(target_origin, response_origin) != 0) return false;
     if (!bridge->opaque_origin
         && tilefinch_url_same_origin(bridge->document_url, response_url)) {
+        return true;
+    }
+    if (destination == TILEFINCH_DESTINATION_FETCH
+        && mode == TILEFINCH_REQUEST_MODE_NO_CORS) {
+        /* Fetch exposes this completion only through an opaque filtered
+           response.  The native delivery path below removes status, URL,
+           headers, and body before author JavaScript can observe it. */
         return true;
     }
     if (mode != TILEFINCH_REQUEST_MODE_CORS) return false;
@@ -790,6 +979,17 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
     TilefinchCredentialsMode credentials;
     bool valid_policy = script_parse_request_policy(
         context, argc, argv, 5, 6, &request_mode, &credentials);
+    int32_t special_destination = 0;
+    bool destination_valid = argc <= 7
+        || JS_IsUndefined(argv[7])
+        || JS_ToInt32(context, &special_destination, argv[7]) == 0;
+    if (!destination_valid) {
+        JS_FreeCString(context, method); JS_FreeCString(context, reference);
+        if (body_is_cstring && body != NULL) JS_FreeCString(context, body);
+        if (content_type != NULL) JS_FreeCString(context, content_type);
+        if (extra_headers != NULL) JS_FreeCString(context, extra_headers);
+        return JS_EXCEPTION;
+    }
     bool method_exact = strlen(method) == method_length;
     bool reference_exact = strlen(reference) == reference_length;
     bool content_type_exact = content_type == NULL
@@ -815,15 +1015,21 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
         request_valid = fetch_request_validate(&request, &validation);
     }
     char url[TILEFINCH_URL_SERIALIZED_LIMIT] = {0};
-    bool valid = valid_policy && request_valid && reference_exact
+    bool valid = valid_policy && destination_valid
+                 && special_destination >= 0 && special_destination <= 2
+                 && request_valid && reference_exact
                  && body_length <= FETCH_REQUEST_BODY_LIMIT
                  && extra_headers_length <= JS_FETCH_MAXIMUM_HEADERS
                  && tilefinch_url_resolve(bridge->document_url, reference, url,
                                        sizeof(url));
     ScriptRequestPolicy policy;
+    TilefinchRequestDestination destination = special_destination == 1
+        ? TILEFINCH_DESTINATION_WORKER
+        : special_destination == 2
+            ? TILEFINCH_DESTINATION_SCRIPT : TILEFINCH_DESTINATION_FETCH;
     valid = valid && script_request_policy_prepare(
         bridge, url, method, request_mode, credentials,
-        TILEFINCH_DESTINATION_FETCH,
+        destination,
         request_mode == TILEFINCH_REQUEST_MODE_CORS, &policy);
     if (!valid) {
         JS_FreeCString(context, method); JS_FreeCString(context, reference);
@@ -840,11 +1046,20 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
             context, "request rejected by origin, context, or quota policy");
     }
     FetchPreparedPageRequest prepared;
+    const char *author_referrer = NULL;
+    const char *author_referrer_policy = NULL;
+    bool referrer_valid = script_request_policy_read_referrer(
+        context, bridge, argc, argv, 9, 10, &policy,
+        &author_referrer, &author_referrer_policy);
     const FetchRequest *authorized = script_request_policy_apply(
-        &policy, bridge->session, &request, &prepared);
+        referrer_valid ? &policy : NULL, bridge->session, &request, &prepared);
     if (authorized != NULL) request = *authorized;
     request.redirect_same_origin_only = true;
-    if (authorized == NULL || !fetch_request_validate(&request, &validation)) {
+    bool authorized_valid = authorized != NULL
+        && fetch_request_validate(&request, &validation);
+    if (!authorized_valid) {
+        script_request_policy_free_referrer(
+            context, author_referrer, author_referrer_policy);
         JS_FreeCString(context, method); JS_FreeCString(context, reference);
         if (body_is_cstring && body != NULL) JS_FreeCString(context, body);
         if (content_type != NULL) JS_FreeCString(context, content_type);
@@ -859,6 +1074,8 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
             && script_cors_preflight_request(
                 bridge, url, method, credentials, &preflight);
         if (!preflight_ok) {
+            script_request_policy_free_referrer(
+                context, author_referrer, author_referrer_policy);
             JS_FreeCString(context, method);
             JS_FreeCString(context, reference);
             if (body_is_cstring && body != NULL) {
@@ -876,6 +1093,8 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
     }
     FetchResult *fetched = fetch_result_create(bridge->document->budget);
     if (fetched == NULL) {
+        script_request_policy_free_referrer(
+            context, author_referrer, author_referrer_policy);
         JS_FreeCString(context, method); JS_FreeCString(context, reference);
         if (body_is_cstring && body != NULL) JS_FreeCString(context, body);
         if (content_type != NULL) JS_FreeCString(context, content_type);
@@ -891,6 +1110,8 @@ static JSValue js_fetch_sync(JSContext *context, JSValueConst this_value,
                                            ? 5000
                                            : (long) bridge->fetch_timeout_ms,
                                        NULL, NULL, fetched);
+    script_request_policy_free_referrer(
+        context, author_referrer, author_referrer_policy);
     JS_FreeCString(context, method); JS_FreeCString(context, reference);
     if (body_is_cstring && body != NULL) JS_FreeCString(context, body);
     if (content_type != NULL) JS_FreeCString(context, content_type);
@@ -980,16 +1201,62 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
         || JS_IsUndefined(argv[timeout_index])
         || JS_ToInt64(context, &requested_timeout_ms,
                       argv[timeout_index]) == 0;
+    int worker_destination_value = argc > 8 ? JS_ToBool(context, argv[8]) : 0;
+    bool worker_destination = worker_destination_value > 0;
+    FetchPageRedirectMode page_redirect_mode = FETCH_PAGE_REDIRECT_FOLLOW;
+    bool redirect_mode_valid = true;
+    bool redirect_conversion_failed = false;
+    if (argc > 11 && !JS_IsUndefined(argv[11])) {
+        size_t length = 0;
+        const char *value = JS_ToCStringLen(context, &length, argv[11]);
+        if (value == NULL) {
+            redirect_mode_valid = false;
+            redirect_conversion_failed = true;
+        } else if (length == 6u && memcmp(value, "follow", 6u) == 0) {
+            page_redirect_mode = FETCH_PAGE_REDIRECT_FOLLOW;
+        } else if (length == 5u && memcmp(value, "error", 5u) == 0) {
+            page_redirect_mode = FETCH_PAGE_REDIRECT_ERROR;
+        } else if (length == 6u && memcmp(value, "manual", 6u) == 0) {
+            page_redirect_mode = FETCH_PAGE_REDIRECT_MANUAL;
+        } else {
+            redirect_mode_valid = false;
+        }
+        JS_FreeCString(context, value);
+    }
+    size_t integrity_length = 0;
+    const char *integrity = argc > 12 && !JS_IsUndefined(argv[12])
+        ? JS_ToCStringLen(context, &integrity_length, argv[12]) : NULL;
+    bool integrity_valid = argc <= 12 || JS_IsUndefined(argv[12])
+        || (integrity != NULL
+            && strlen(integrity) == integrity_length
+            && integrity_length <= TILEFINCH_INTEGRITY_METADATA_LIMIT);
+    size_t accept_length = 3u;
+    const char *accept = argc > 13 && !JS_IsUndefined(argv[13])
+        ? JS_ToCStringLen(context, &accept_length, argv[13]) : "*/*";
+    bool accept_valid = accept != NULL && strlen(accept) == accept_length
+        && accept_length <= JS_FETCH_MAXIMUM_ACCEPT_BYTES;
     if (method == NULL || reference == NULL
         || (argc > 2 && !JS_IsUndefined(argv[2]) && body == NULL)
         || (argc > 3 && !JS_IsUndefined(argv[3]) && content_type == NULL)
         || (argc > 4 && !JS_IsUndefined(argv[4])
-            && extra_headers == NULL) || !valid_policy || !valid_timeout) {
+            && extra_headers == NULL) || !valid_policy || !valid_timeout
+        || worker_destination_value < 0 || !redirect_mode_valid
+        || !integrity_valid || !accept_valid) {
         if (method != NULL) JS_FreeCString(context, method);
         if (reference != NULL) JS_FreeCString(context, reference);
         if (body_is_cstring && body != NULL) JS_FreeCString(context, body);
         if (content_type != NULL) JS_FreeCString(context, content_type);
         if (extra_headers != NULL) JS_FreeCString(context, extra_headers);
+        if (integrity != NULL) JS_FreeCString(context, integrity);
+        if (argc > 13 && !JS_IsUndefined(argv[13]) && accept != NULL) {
+            JS_FreeCString(context, accept);
+        }
+        if (!redirect_mode_valid && !redirect_conversion_failed) {
+            return JS_ThrowTypeError(context, "Invalid redirect mode");
+        }
+        if (!integrity_valid && integrity != NULL) {
+            return JS_ThrowTypeError(context, "Invalid integrity metadata");
+        }
         return JS_EXCEPTION;
     }
     bool method_exact = strlen(method) == method_length;
@@ -1004,7 +1271,8 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
         .content_type = content_type, .extra_headers = extra_headers,
         .allow_http_errors = true,
         .send_low_client_hints = true,
-        .accept = "*/*"
+        .accept = accept,
+        .page_redirect_mode = page_redirect_mode
     };
     FetchRequestValidationError validation = FETCH_REQUEST_VALIDATION_OK;
     bool request_valid = method_exact && content_type_exact
@@ -1025,14 +1293,22 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
                                        sizeof(url))
                  && bridge->async_fetch_count < 8;
     ScriptRequestPolicy policy;
+    TilefinchRequestDestination destination = worker_destination
+        ? TILEFINCH_DESTINATION_WORKER : TILEFINCH_DESTINATION_FETCH;
     valid = valid && script_request_policy_prepare(
         bridge, url, method, request_mode, credentials,
-        TILEFINCH_DESTINATION_FETCH,
+        destination,
         request_mode == TILEFINCH_REQUEST_MODE_CORS, &policy);
     FetchPreparedPageRequest prepared;
+    const char *author_referrer = NULL;
+    const char *author_referrer_policy = NULL;
     if (valid) {
+        bool referrer_valid = script_request_policy_read_referrer(
+            context, bridge, argc, argv, 9, 10, &policy,
+            &author_referrer, &author_referrer_policy);
         const FetchRequest *authorized = script_request_policy_apply(
-            &policy, bridge->session, &request, &prepared);
+            referrer_valid ? &policy : NULL,
+            bridge->session, &request, &prepared);
         if (authorized != NULL) request = *authorized;
         request.redirect_same_origin_only = true;
         request_valid = authorized != NULL
@@ -1053,6 +1329,8 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
             && script_cors_preflight_request(
                 bridge, url, method, credentials, &preflight);
         if (!preflight_ok) {
+            script_request_policy_free_referrer(
+                context, author_referrer, author_referrer_policy);
             JS_FreeCString(context, method);
             JS_FreeCString(context, reference);
             if (body_is_cstring && body != NULL) {
@@ -1060,6 +1338,10 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
             }
             if (content_type != NULL) JS_FreeCString(context, content_type);
             if (extra_headers != NULL) JS_FreeCString(context, extra_headers);
+            if (integrity != NULL) JS_FreeCString(context, integrity);
+            if (argc > 13 && !JS_IsUndefined(argv[13])) {
+                JS_FreeCString(context, accept);
+            }
             return JS_ThrowTypeError(context, "CORS preflight failed");
         }
     }
@@ -1073,6 +1355,17 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
         scheduler_timeout_ms = (long) requested_timeout_ms;
     }
     size_t response_limit = js_fetch_response_limit(bridge);
+    char *integrity_copy = NULL;
+    bool integrity_copy_failed = false;
+    if (valid && integrity_length != 0u) {
+        integrity_copy = budget_malloc(bridge->budget, integrity_length + 1u);
+        integrity_copy_failed = integrity_copy == NULL;
+        if (!integrity_copy_failed) {
+            memcpy(integrity_copy, integrity, integrity_length);
+            integrity_copy[integrity_length] = '\0';
+        }
+    }
+    if (integrity_copy_failed) valid = false;
     uint64_t id = valid && bridge->fetch_scheduler != NULL
         ? fetch_scheduler_enqueue(
             bridge->fetch_scheduler, url, &request,
@@ -1086,6 +1379,8 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
     bool scheduler_deferred = id == 0 && valid
         && fetch_scheduler_enqueue_would_block(
                bridge->fetch_scheduler, response_limit);
+    script_request_policy_free_referrer(
+        context, author_referrer, author_referrer_policy);
 #ifndef TILEFINCH_NO_TRACE
     if (getenv("TILEFINCH_TRACE_NETWORK_RESPONSES") != NULL) {
         fprintf(stderr,
@@ -1101,8 +1396,17 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
     if (body_is_cstring && body != NULL) JS_FreeCString(context, body);
     if (content_type != NULL) JS_FreeCString(context, content_type);
     if (extra_headers != NULL) JS_FreeCString(context, extra_headers);
+    if (integrity != NULL) JS_FreeCString(context, integrity);
+    if (argc > 13 && !JS_IsUndefined(argv[13])) {
+        JS_FreeCString(context, accept);
+    }
     if (id == 0) {
+        budget_free(bridge->budget, integrity_copy);
         if (scheduler_deferred) return JS_NewInt32(context, 0);
+        if (integrity_copy_failed) {
+            return JS_ThrowRangeError(
+                context, "integrity metadata exceeded memory budget");
+        }
         if (!request_valid) {
             return script_throw_request_validation(context, validation);
         }
@@ -1118,7 +1422,10 @@ static JSValue js_fetch_async(JSContext *context, JSValueConst this_value,
     ScriptAsyncFetch *async_fetch =
         &bridge->async_fetches[bridge->async_fetch_count++];
     *async_fetch = (ScriptAsyncFetch) {
-        .id = id, .mode = request_mode, .credentials = credentials
+        .id = id, .mode = request_mode, .credentials = credentials,
+        .destination = destination,
+        .integrity = integrity_copy,
+        .integrity_length = integrity_length
     };
     snprintf(async_fetch->target_origin, sizeof(async_fetch->target_origin),
              "%s", target_origin);
@@ -1988,6 +2295,8 @@ static JSValue js_fetch_cancel(JSContext *context, JSValueConst this_value,
             bridge->fetch_scheduler, (uint64_t) request_id);
     bool cancelled = marked_cancelled || discarded;
     if (discarded) {
+        budget_free(bridge->budget,
+                    bridge->async_fetches[tracked_index].integrity);
         memmove(bridge->async_fetches + tracked_index,
                 bridge->async_fetches + tracked_index + 1,
                 (bridge->async_fetch_count - tracked_index - 1)
@@ -2203,6 +2512,7 @@ void js_rt_dynamic_task_clear(DomBridge *bridge, ScriptDynamicTask *task,
     budget_free(bridge->budget, task->resource_loader_source);
     budget_free(bridge->budget, task->request_url);
     budget_free(bridge->budget, task->response_url);
+    budget_free(bridge->budget, task->resource_timing_content_type);
     bridge_release_native_node_pin(bridge, task->node_handle);
     if (bridge->dynamic_script_count != 0) {
         bridge->dynamic_script_count--;
@@ -2375,10 +2685,27 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
         task->state = SCRIPT_DYNAMIC_READY;
         task->success = accepted;
         if (accepted) {
+            const char *cached_response_url = task->response_url == NULL
+                ? task->request_url : task->response_url;
+            bool body_info_visible = dynamic_resource_timing_body_info_visible(
+                bridge, task, cached_response_url,
+                task->module && cached != NULL
+                    ? cached->module_cors_redirect_origin_tainted : false);
             task->resource_timing.cache_hit = true;
+            task->resource_timing.timing_allowed = !bridge->opaque_origin
+                && bridge->document_url != NULL
+                && tilefinch_url_same_origin(
+                       bridge->document_url, task->request_url);
+            task->resource_timing.encoded_body_bytes =
+                cached->length > UINT32_MAX
+                    ? UINT32_MAX : (uint32_t) cached->length;
             task->resource_timing.decoded_body_bytes =
                 cached->length > UINT32_MAX
                     ? UINT32_MAX : (uint32_t) cached->length;
+            if (body_info_visible) {
+                dynamic_resource_timing_set_content_type(
+                    bridge, task, cached->content_type);
+            }
         }
         if (accepted && bridge->result != NULL) {
             js_rt_saturating_add_size(
@@ -2388,6 +2715,15 @@ bool js_rt_dynamic_start_task(ScriptRuntime *runtime,
     }
     if (cache_status == BROWSER_CACHE_STALE && cached != NULL
         && cached->length <= bridge->maximum_script_file_bytes) {
+        const char *cached_response_url = task->response_url == NULL
+            ? task->request_url : task->response_url;
+        if (dynamic_resource_timing_body_info_visible(
+                bridge, task, cached_response_url,
+                task->module
+                    ? cached->module_cors_redirect_origin_tainted : false)) {
+            dynamic_resource_timing_set_content_type(
+                bridge, task, cached->content_type);
+        }
         task->stale_body = browser_shared_body_retain(cached->body);
         if (!dynamic_source_body_usable(
                 task->stale_body, cached->length)) {
@@ -2635,7 +2971,13 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
             task->credentials, TILEFINCH_DESTINATION_SCRIPT);
         task->resource_timing.measured =
             fetched->transport_timing.measured;
-        task->resource_timing.cache_hit = fetched->status_code == 304;
+        task->resource_timing.cache_validated = fetched->status_code == 304;
+        task->resource_timing.timing_allowed =
+            js_rt_script_resource_timing_allowed(
+                bridge, fetched, response_url);
+        task->resource_timing.next_hop_protocol =
+            js_rt_script_resource_timing_protocol(
+                fetched->negotiated_http_version);
         task->resource_timing.name_lookup_us =
             fetched->transport_timing.name_lookup_us;
         task->resource_timing.connect_us =
@@ -2646,6 +2988,23 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
             fetched->transport_timing.first_byte_us;
         task->resource_timing.total_us =
             fetched->transport_timing.total_us;
+        bool body_info_visible = dynamic_resource_timing_body_info_visible(
+            bridge, task, response_url, fetched->redirect_origin_tainted);
+        if (body_info_visible) {
+            if (fetched->status_code > 0 && fetched->status_code <= UINT16_MAX
+                && fetched->status_code != 304) {
+                task->resource_timing.response_status =
+                    (uint16_t) fetched->status_code;
+            }
+            if (fetched->content_type[0] != '\0') {
+                dynamic_resource_timing_set_content_type(
+                    bridge, task, fetched->content_type);
+            }
+        }
+        if (fetched->transport_timing.encoded_body_bytes_measured) {
+            task->resource_timing.encoded_body_bytes =
+                fetched->transport_timing.encoded_body_bytes;
+        }
     }
     if (success && fetched->status_code != 304) {
         if (task->module) {
@@ -2689,6 +3048,10 @@ bool js_rt_dynamic_take_completion(ScriptRuntime *runtime,
         success = dynamic_task_take_source(bridge, task, body, length);
         body = NULL;
         if (success) {
+            if (!fetched->transport_timing.encoded_body_bytes_measured) {
+                task->resource_timing.encoded_body_bytes =
+                    length > UINT32_MAX ? UINT32_MAX : (uint32_t) length;
+            }
             task->resource_timing.decoded_body_bytes =
                 length > UINT32_MAX ? UINT32_MAX : (uint32_t) length;
         }
@@ -2926,6 +3289,8 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
                 ? selected->request_url : selected->response_url;
             if (!selected->resource_timing_recorded) {
                 selected->resource_timing_recorded = true;
+                selected->resource_timing.content_type =
+                    selected->resource_timing_content_type;
                 (void) script_runtime_record_resource_timing_details(
                     runtime, source_url, "script",
                     &selected->resource_timing);
@@ -3114,9 +3479,9 @@ bool js_rt_dynamic_execute_ready(ScriptRuntime *runtime,
 bool js_fetch_cors_install(JSContext *context, JSValue global)
 {
     return js_rt_install_function(context, global, "__tilefinchFetchSync",
-                                  js_fetch_sync, 7)
+                                  js_fetch_sync, 11)
         && js_rt_install_function(context, global, "__tilefinchFetchAsync",
-                                  js_fetch_async, 8)
+                                  js_fetch_async, 14)
         && js_rt_install_function(context, global, "__tilefinchCancelNetwork",
                                   js_fetch_cancel, 2)
         && js_rt_install_function(context, global,

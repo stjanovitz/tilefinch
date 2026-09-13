@@ -8,6 +8,13 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.20 — 2026-09-12
+
+- Improved compatibility and reliability for Workers, Fetch, IndexedDB,
+  embedded frames, and other dynamic Web APIs.
+- Reduced routine Memory Stick writes and fixed additional lifecycle, memory,
+  and stability issues.
+
 ## 0.1.19 — 2026-09-09
 
 - Improved Wikipedia search forms and results layout.

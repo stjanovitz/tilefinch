@@ -116,6 +116,8 @@ class RedirectHandler(BaseHTTPRequestHandler):
         authorization = self.headers.get("Authorization", "<none>")
         public = self.headers.get("X-Public", "<none>")
         content_type = self.headers.get("Content-Type", "<none>")
+        cache_control = self.headers.get("Cache-Control", "<none>")
+        pragma = self.headers.get("Pragma", "<none>")
         fetch_dest = self.headers.get("Sec-Fetch-Dest", "<none>")
         fetch_mode = self.headers.get("Sec-Fetch-Mode", "<none>")
         fetch_site = self.headers.get("Sec-Fetch-Site", "<none>")
@@ -123,6 +125,7 @@ class RedirectHandler(BaseHTTPRequestHandler):
             f"method={method};cookie={cookie};origin={origin};"
             f"referer={referer};authorization={authorization};"
             f"x-public={public};content-type={content_type};"
+            f"cache-control={cache_control};pragma={pragma};"
             f"fetch-dest={fetch_dest};"
             f"fetch-mode={fetch_mode};fetch-site={fetch_site};"
             f"query={query};wire-fragment={int('#' in self.path)};body="

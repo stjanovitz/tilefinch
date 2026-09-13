@@ -44,11 +44,21 @@ longer depend on them.
    host's decoders.
 10. `repeat-rope-eval` — large `String.prototype.repeat` results and
     rope-aware eval prefix compaction.
-11. `single-char-string-buffer` — single-code-unit `StringBuffer` results
+11. `repeat-rope-eval-scan` — memoized horizontal-prefix scanning and direct
+    suffix seeking keep repeated-rope eval proportional to rope depth while
+    retaining the logical scan and interrupt bounds.
+12. `single-char-string-buffer` — single-code-unit `StringBuffer` results
     share the immutable one-character cache.
-12. `compact-char-array` and `compact-char-array-cow` — pack dense arrays
+13. `compact-char-array` and `compact-char-array-cow` — pack dense arrays
     of one-character Latin-1 strings, with copy-on-write (option
     `PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY`, default ON).
+14. `array-length-shrink` — keep examining the current property-table slot
+    when deletion compacts a sparse Array's shape, so reducing `length`
+    cannot leave configurable indexed properties behind.
+
+The embedder also exposes a trap-free `JS_IsProxy` brand query. HTML
+structured clone uses it to reject Proxy values before reflecting over their
+prototype or keys; it is not exposed to page JavaScript.
 
 Nested function compilation also shares immutable, overlapping UTF-8 source
 spans. A separate refcounted backing (not a parent-function reference) keeps
@@ -103,7 +113,7 @@ so its difference from malloc usage must not be described as reclaimable memory.
 Turning `PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH` or
 `PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY` off, or turning
 `PSP_BROWSER_JS_PROPERTY_FAULT_TRACE` on, copies `quickjs.c` and
-`quickjs.h` into the binary directory, reverses layers 4 to 12 down to the
+`quickjs.h` into the binary directory, reverses the optional/default layers down to the
 shared bounded baseline (fingerprint checked), re-applies them with the
 chosen options, and checks the result against a fingerprint pinned for that
 combination. The vendored tree is never modified. The experimental VM patch
