@@ -15,12 +15,11 @@ globalThis.__tilefinchInstallFrames = (support) => {
     reflectDelete = Reflect.deleteProperty,
     reflectPrototype = Reflect.getPrototypeOf,
     reflectSetPrototype = Reflect.setPrototypeOf,
-    reflectPreventExtensions = Reflect.preventExtensions,
     FrameTypeError = TypeError;
   const {
     wrap,
-    trustedJSONParse,
-    trustedJSONStringify,
+    encodeFrameMessage,
+    decodeFrameMessage,
     trustedStringLower,
     trustedCharCodeAt,
     trustedStringSlice,
@@ -76,140 +75,30 @@ globalThis.__tilefinchInstallFrames = (support) => {
       candidate[1].scope.location = null;
       frameScope(candidate[1].scope);
       frameWindows.delete(candidate[0]);
-    };
-  globalThis.__tilefinchFrameWindow = (handle) => {
-    handle = Number(handle);
-    let state = frameWindows.get(handle);
-    const element = wrap(handle);
-    if (!state) {
-      if (frameWindows.size >= frameWindowLimit) evictFrameWindow();
+    },
+    initializeFrameRealm = (
+      state,
+      handle,
+      proxy,
+      frameDocument = null,
+      frameLocation = null,
+    ) => {
       const scope = frameScope();
-      try {
+      /* Publish ownership before any author-replaceable intrinsic runs so the
+       * caller can retire a partially initialized realm on failure. */
+      state.scope = scope;
       Object.setPrototypeOf(scope, new Proxy(Object.create(null), {
         get: (_target, key) => globalThis[key],
         has: (_target, key) => key in globalThis,
       }));
-      state = {
-        active: !!element?.isConnected,
-        sameOrigin: true,
-        opaqueOrigin: false,
-        managed: false,
-        loadGeneration: 0,
-        localSource: null,
-        localSrcdoc: null,
-        localSandboxScripts: false,
-        localSandboxSameOrigin: false,
-        proxy: null,
-        scope,
-      };
-      scope.document = globalThis.__tilefinchCreateFrameDocument(true);
-      scope.location = {
+      scope.document = frameDocument ||
+        globalThis.__tilefinchCreateFrameDocument(true);
+      scope.location = frameLocation || {
         href: "about:blank",
         protocol: "about:",
         origin: location.origin,
       };
-      let proxy;
-      proxy = new Proxy(scope, {
-        has(target, key) {
-          if (key === "source" || key === "execute") return false;
-          if (state.sameOrigin) return true;
-          return (
-            key === "closed" ||
-            key === "window" ||
-            key === "self" ||
-            key === "frames" ||
-            key === "postMessage" ||
-            key === "parent" ||
-            key === "top" ||
-            key === "opener" ||
-            key === "length"
-          );
-        },
-        get(target, key) {
-          if (key === "closed") return !state.active;
-          if (key === "document" || key === "location")
-            return state.sameOrigin
-              ? key in target
-                ? target[key]
-                : globalThis[key]
-              : undefined;
-          if (key === "eval")
-            /* The sandboxed-scripts flag suppresses scripts owned by the
-               child document; it does not hide Window.eval from a
-               same-origin parent. Chromium exposes and permits this call
-               for sandbox="allow-same-origin". Opaque-origin frames remain
-               inaccessible through the same-origin gate below. */
-            return state.sameOrigin ? target.eval : undefined;
-          if (!state.sameOrigin) {
-            if (key === "window" || key === "self" || key === "frames")
-              return proxy;
-            if (
-              key === "postMessage" ||
-              key === "parent" ||
-              key === "top" ||
-              key === "opener" ||
-              key === "length"
-            )
-              return target[key];
-            return undefined;
-          }
-          // Window/document identity and messaging do not require a full
-          // set of ECMAScript intrinsics. Everything else, including identity,
-          // observes the fully initialized original global before reading it.
-          if (key !== "window" && key !== "self" && key !== "globalThis" &&
-              key !== "parent" && key !== "top" && key !== "opener" &&
-              key !== "frames" && key !== "length" && key !== "postMessage" &&
-              key !== Symbol.toStringTag)
-            frameScope(scope, true);
-          if (key in target) return target[key];
-          return state.sameOrigin ? globalThis[key] : undefined;
-        },
-        set(target, key, value) {
-          if (!state.sameOrigin) return false;
-          // The document adapter installs these host bindings without running
-          // child script. Neither collides with a deferred ECMAScript global.
-          if (key !== "getComputedStyle" && key !== "customElements")
-            frameScope(scope, true);
-          target[key] = value;
-          return true;
-        },
-        getOwnPropertyDescriptor(target, key) {
-          if (!state.sameOrigin) throw new FrameTypeError("cross-origin frame");
-          frameScope(scope, true);
-          return reflectDescriptor(target, key);
-        },
-        ownKeys(target) {
-          if (!state.sameOrigin) throw new FrameTypeError("cross-origin frame");
-          frameScope(scope, true);
-          return reflectKeys(target);
-        },
-        defineProperty(target, key, descriptor) {
-          if (!state.sameOrigin) return false;
-          frameScope(scope, true);
-          return reflectDefine(target, key, descriptor);
-        },
-        deleteProperty(target, key) {
-          if (!state.sameOrigin) return false;
-          frameScope(scope, true);
-          return reflectDelete(target, key);
-        },
-        getPrototypeOf(target) {
-          if (!state.sameOrigin) throw new FrameTypeError("cross-origin frame");
-          frameScope(scope, true);
-          return reflectPrototype(target);
-        },
-        setPrototypeOf(target, prototype) {
-          if (!state.sameOrigin) return false;
-          frameScope(scope, true);
-          return reflectSetPrototype(target, prototype);
-        },
-        preventExtensions(target) {
-          if (!state.sameOrigin) return false;
-          frameScope(scope, true);
-          return reflectPreventExtensions(target);
-        },
-      });
-      state.proxy = proxy;
+      scope.document.location = scope.location;
       Object.defineProperty(scope.document, "defaultView", {
         configurable: true,
         value: proxy,
@@ -231,6 +120,16 @@ globalThis.__tilefinchInstallFrames = (support) => {
       });
       scope.frames = proxy;
       scope.length = 0;
+      Object.defineProperty(scope, "frameElement", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          const current = wrap(handle);
+          return state.active && state.sameOrigin && current?.isConnected
+            ? current
+            : null;
+        },
+      });
       scope.eval = __tilefinchCreateFrameEval(scope, proxy);
       scope.postMessage = function (data, targetOrigin = "/") {
         const current = wrap(handle);
@@ -239,7 +138,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
           targetOrigin,
           location.origin,
         );
-        const json = trustedJSONStringify(data),
+        const wire = encodeFrameMessage(data),
           ancestors = [];
         for (
           let at = current;
@@ -260,26 +159,182 @@ globalThis.__tilefinchInstallFrames = (support) => {
         };
         __tilefinchPostMessage(
           handle,
-          json === undefined ? "null" : json,
+          wire,
           normalizedTarget,
+          globalThis.__tilefinchActiveTaskKind,
+          globalThis.__tilefinchActiveTaskSequence,
         );
       };
+      return scope;
+    },
+    replaceFrameRealm = (state, handle, proxy, documentValue, locationValue) => {
+      const previous = state.scope;
+      if (previous) {
+        frameScope(previous);
+        state.scope = null;
+      }
+      return initializeFrameRealm(
+        state, handle, proxy, documentValue, locationValue);
+    },
+    adoptInitialFrameDocument = (state, proxy, documentValue, locationValue) => {
+      state.scope.document = documentValue;
+      state.scope.location = locationValue;
+      documentValue.location = locationValue;
+      Object.defineProperty(documentValue, "defaultView", {
+        configurable: true,
+        value: proxy,
+      });
+    };
+  globalThis.__tilefinchFrameWindow = (handle) => {
+    handle = Number(handle);
+    let state = frameWindows.get(handle);
+    const element = wrap(handle);
+    if (!state) {
+      if (frameWindows.size >= frameWindowLimit) evictFrameWindow();
+      try {
+      state = {
+        active: !!element?.isConnected,
+        sameOrigin: true,
+        opaqueOrigin: false,
+        managed: false,
+        initialAboutBlank: true,
+        loadGeneration: 0,
+        localSource: null,
+        localSrcdoc: null,
+        localSandboxScripts: false,
+        localSandboxSameOrigin: false,
+        proxy: null,
+        scope: null,
+      };
+      let proxy;
+      proxy = new Proxy(Object.create(null), {
+        has(target, key) {
+          if (key === "source" || key === "execute") return false;
+          if (state.sameOrigin) return true;
+          return (
+            key === "closed" ||
+            key === "window" ||
+            key === "self" ||
+            key === "frames" ||
+            key === "frameElement" ||
+            key === "postMessage" ||
+            key === "parent" ||
+            key === "top" ||
+            key === "opener" ||
+            key === "length"
+          );
+        },
+        get(target, key) {
+          if (key === "closed") return !state.active;
+          if (key === "frameElement") {
+            const current = wrap(handle);
+            return state.active && state.sameOrigin && current?.isConnected
+              ? current
+              : null;
+          }
+          if (key === "document" || key === "location")
+            return state.sameOrigin
+              ? key in state.scope
+                ? state.scope[key]
+                : globalThis[key]
+              : undefined;
+          if (key === "eval")
+            /* The sandboxed-scripts flag suppresses scripts owned by the
+               child document; it does not hide Window.eval from a
+               same-origin parent. Chromium exposes and permits this call
+               for sandbox="allow-same-origin". Opaque-origin frames remain
+               inaccessible through the same-origin gate below. */
+            return state.sameOrigin ? state.scope.eval : undefined;
+          if (!state.sameOrigin) {
+            if (key === "window" || key === "self" || key === "frames")
+              return proxy;
+            if (
+              key === "postMessage" ||
+              key === "parent" ||
+              key === "top" ||
+              key === "opener" ||
+              key === "length"
+            )
+              return state.scope[key];
+            return undefined;
+          }
+          // Window/document identity and messaging do not require a full
+          // set of ECMAScript intrinsics. Everything else, including identity,
+          // observes the fully initialized original global before reading it.
+          if (key !== "window" && key !== "self" && key !== "globalThis" &&
+              key !== "parent" && key !== "top" && key !== "opener" &&
+              key !== "frames" && key !== "length" && key !== "postMessage" &&
+              key !== Symbol.toStringTag)
+            frameScope(state.scope, true);
+          if (key in state.scope) return state.scope[key];
+          return state.sameOrigin ? globalThis[key] : undefined;
+        },
+        set(target, key, value) {
+          if (!state.sameOrigin) return false;
+          // The document adapter installs these host bindings without running
+          // child script. Neither collides with a deferred ECMAScript global.
+          if (key !== "getComputedStyle" && key !== "customElements")
+            frameScope(state.scope, true);
+          state.scope[key] = value;
+          return true;
+        },
+        getOwnPropertyDescriptor(target, key) {
+          if (!state.sameOrigin) throw new FrameTypeError("cross-origin frame");
+          frameScope(state.scope, true);
+          const descriptor = reflectDescriptor(state.scope, key);
+          return descriptor ? { ...descriptor, configurable: true } : undefined;
+        },
+        ownKeys(target) {
+          if (!state.sameOrigin) throw new FrameTypeError("cross-origin frame");
+          frameScope(state.scope, true);
+          return reflectKeys(state.scope);
+        },
+        defineProperty(target, key, descriptor) {
+          if (!state.sameOrigin) return false;
+          frameScope(state.scope, true);
+          return reflectDefine(state.scope, key, {
+            ...descriptor,
+            configurable: true,
+          });
+        },
+        deleteProperty(target, key) {
+          if (!state.sameOrigin) return false;
+          frameScope(state.scope, true);
+          return reflectDelete(state.scope, key);
+        },
+        getPrototypeOf(target) {
+          if (!state.sameOrigin) throw new FrameTypeError("cross-origin frame");
+          frameScope(state.scope, true);
+          return reflectPrototype(state.scope);
+        },
+        setPrototypeOf(target, prototype) {
+          if (!state.sameOrigin) return false;
+          frameScope(state.scope, true);
+          return reflectSetPrototype(state.scope, prototype);
+        },
+        preventExtensions(target) {
+          return false;
+        },
+      });
+      state.proxy = proxy;
+      initializeFrameRealm(state, handle, proxy);
       frameWindows.set(handle, state);
       } catch (error) {
-        frameScope(scope);
+        if (state?.scope) frameScope(state.scope);
         throw error;
       }
     } else if (!state.managed) state.active = !!element?.isConnected;
     return state.proxy;
   };
-  globalThis.__tilefinchLoadLocalFrame = (element) => {
+  globalThis.__tilefinchLoadLocalFrame = (element, explicitNavigation = false) => {
     if (
       !(element instanceof HTMLIFrameElement) ||
       !element.isConnected
     )
       return;
     const srcdoc = element.getAttribute("srcdoc"),
-      source = String(element.src || ""),
+      fallbackSource = String(element.src || ""),
+      source = srcdoc === null ? fallbackSource : "",
       blob = blobForURL(source),
       local =
         srcdoc !== null ||
@@ -298,7 +353,7 @@ globalThis.__tilefinchInstallFrames = (support) => {
     }
     const sandboxPolicy = frameSandboxPolicy(element),
       normalizedSrcdoc = srcdoc === null ? null : String(srcdoc);
-    if (
+    if (!explicitNavigation &&
       state.localSource === source &&
       state.localSrcdoc === normalizedSrcdoc &&
       state.localSandboxScripts === sandboxPolicy.scripts &&
@@ -319,20 +374,27 @@ globalThis.__tilefinchInstallFrames = (support) => {
         ? new DOMParser().parseFromString(text, "text/html")
         : globalThis.__tilefinchCreateFrameDocument(standards),
       generation = ++state.loadGeneration;
-    state.scope.document = frameDocument;
     const frameHref =
         srcdoc !== null ? "about:srcdoc" : source || "about:blank",
       protocolMatch = frameHref.match(/^([A-Za-z][A-Za-z0-9+.-]*:)/);
-    state.scope.location = {
+    const frameLocation = {
       href: frameHref,
       protocol: protocolMatch ? protocolMatch[1].toLowerCase() : "",
       origin: state.opaqueOrigin ? "null" : location.origin,
     };
-    frameDocument.location = state.scope.location;
-    Object.defineProperty(frameDocument, "defaultView", {
-      configurable: true,
-      value: proxy,
-    });
+    if (state.initialAboutBlank && state.sameOrigin)
+      adoptInitialFrameDocument(state, proxy, frameDocument, frameLocation);
+    else
+      replaceFrameRealm(state, Number(element.__handle), proxy,
+        frameDocument, frameLocation);
+    /* Connecting an iframe without a src merely materializes its initial
+     * about:blank Document; it does not consume the first navigation which
+     * is required to retain the initial Window global. */
+    const initialMaterialization = !explicitNavigation &&
+      normalizedSrcdoc === null &&
+      (source === "" || source === "about:blank");
+    if (!initialMaterialization)
+      state.initialAboutBlank = false;
     queueMicrotask(() => {
       if (element.isConnected && state.loadGeneration === generation)
         element.dispatchEvent(__tilefinchTrustedEvent(new Event("load")));
@@ -344,13 +406,12 @@ globalThis.__tilefinchInstallFrames = (support) => {
     sameOrigin,
     opaqueOrigin,
     committedURL = null,
+    documentCommitted = false,
   ) => {
     handle = Number(handle);
     const proxy = globalThis.__tilefinchFrameWindow(handle),
       state = frameWindows.get(handle);
     state.active = !!active;
-    state.sameOrigin = !!sameOrigin;
-    state.opaqueOrigin = !!opaqueOrigin;
     state.managed = true;
     if (!state.active) {
       state.scope.document = null;
@@ -360,10 +421,14 @@ globalThis.__tilefinchInstallFrames = (support) => {
       state.loadGeneration++;
       return proxy;
     }
-    if (state.active && state.sameOrigin && committedURL !== null) {
+    if (state.active && documentCommitted) {
+      state.sameOrigin = !!sameOrigin;
+      state.opaqueOrigin = !!opaqueOrigin;
+    }
+    if (state.active && documentCommitted && committedURL !== null) {
       try {
         const parsed = new URL(String(committedURL), location.href);
-        state.scope.location = {
+        const frameLocation = {
           href: parsed.href,
           protocol: parsed.protocol,
           origin: state.opaqueOrigin ? "null" : parsed.origin,
@@ -374,48 +439,56 @@ globalThis.__tilefinchInstallFrames = (support) => {
           search: parsed.search,
           hash: parsed.hash,
         };
-        if (state.scope.document)
-          state.scope.document.location = state.scope.location;
+        if (state.sameOrigin) {
+          const frameDocument =
+            globalThis.__tilefinchCreateFrameDocument(true);
+          if (state.initialAboutBlank)
+            adoptInitialFrameDocument(
+              state, proxy, frameDocument, frameLocation);
+          else
+            replaceFrameRealm(
+              state, handle, proxy, frameDocument, frameLocation);
+        }
+        state.initialAboutBlank = false;
       } catch (_) {}
     }
     return proxy;
   };
-  globalThis.__tilefinchReceiveMessage = (json, origin, sourceHandle) =>
+  globalThis.__tilefinchReceiveMessage = (wire, origin, sourceHandle) =>
     globalThis.__tilefinchRunTask(
       "window-message:source=" + String(sourceHandle),
       () => {
         const source =
           Number(sourceHandle) === -1
             ? globalThis
+            : Number(sourceHandle) === -2
+            ? null
             : Number(sourceHandle) === 0
             ? globalThis.parent
             : __tilefinchFrameWindow(Number(sourceHandle));
+        /* compat.js installs this private factory after frames.js has been
+           initialized, but before any author task can deliver a message. */
         const event = globalThis.__tilefinchTrustedEvent(
-          new MessageEvent("message", {
-          data: trustedJSONParse(String(json)),
-          origin: String(origin),
-          source,
-          ports: [],
-          }),
-        );
-        globalThis.dispatchEvent(event);
+          globalThis.__tilefinchCreateMessageEvent(
+          "message", decodeFrameMessage(wire), String(origin), source, []));
+        globalThis.__tilefinchDispatchWindowEventCheckpointed(event);
       },
     );
   globalThis.postMessage = (data, targetOrigin = "/") => {
     const normalizedTarget = normalizePostMessageTarget(
       targetOrigin,
       location.origin,
-    );
+    ),
+      wire = encodeFrameMessage(data);
     if (
       normalizedTarget !== "*" &&
       normalizedTarget !== String(location.origin)
     )
       return;
-    const json = trustedJSONStringify(data);
     setTimeout(
       () =>
         __tilefinchReceiveMessage(
-          json === undefined ? "null" : json,
+          wire,
           location.origin,
           -1,
         ),

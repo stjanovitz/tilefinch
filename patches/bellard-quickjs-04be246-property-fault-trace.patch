@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 61c64bde..d59e37ce 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -342,6 +342,11 @@ struct JSRuntime {
+@@ -343,6 +343,11 @@ struct JSRuntime {
         keeps upstream 1.5x growth for controlled comparisons. */
      size_t fast_array_growth_byte_limit;
  
@@ -13,7 +14,7 @@ diff --git a/quickjs.c b/quickjs.c
      int class_count;    /* size of class_array */
      JSClass *class_array;
  
-@@ -2247,6 +2252,16 @@ JSRuntime *JS_NewRuntime(void)
+@@ -2292,6 +2297,16 @@ JSRuntime *JS_NewRuntime(void)
      return JS_NewRuntime2(&def_malloc_funcs, NULL);
  }
  
@@ -30,7 +31,7 @@ diff --git a/quickjs.c b/quickjs.c
  void JS_SetMemoryLimit(JSRuntime *rt, size_t limit)
  {
      rt->malloc_ctx.malloc_state.malloc_limit = limit;
-@@ -7560,6 +7576,173 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
+@@ -7760,6 +7775,192 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
      return 0;
  }
  
@@ -54,7 +55,8 @@ diff --git a/quickjs.c b/quickjs.c
 +    }
 +}
 +
-+static void trace_property_fault(JSContext *ctx, JSFunctionBytecode *b,
++static void trace_property_fault(JSContext *ctx, int kind,
++                                 JSFunctionBytecode *b,
 +                                 const uint8_t *pc, int opcode,
 +                                 JSValueConst base, JSValueConst key,
 +                                 JSAtom atom, const JSValue *stack_base,
@@ -70,14 +72,28 @@ diff --git a/quickjs.c b/quickjs.c
 +    uint32_t pc_offset = (uint32_t)(pc - b->byte_code_buf);
 +    int col = 0, line = find_line_num(ctx, b, pc_offset, &col);
 +    int i, depth = (int)(sp - stack_base);
++    const char *trace_mode = getenv("TILEFINCH_TRACE_JS_PROPERTY_FAULTS");
++
++    if (trace_mode != NULL) {
++        if (strcmp(trace_mode, "absent") == 0 && kind != 2)
++            return;
++        if (strcmp(trace_mode, "fault") == 0 && kind != 0)
++            return;
++    }
 +
 +    if (rt->property_fault_trace_limit == 0
-+        || rt->property_fault_trace_count >= rt->property_fault_trace_limit)
++        || rt->property_fault_trace_count >= rt->property_fault_trace_limit
++        || !b->has_debug || b->debug.filename == JS_ATOM_NULL)
++        return;
++    filename = JS_AtomGetStr(ctx, filename_buf, sizeof(filename_buf),
++                             b->debug.filename);
++    /* Embedded bootstrap bytecode deliberately strips source metadata. Its
++       optional internal property probes otherwise consume the complete
++       diagnostic budget before author code executes. */
++    if (strcmp(filename, "<stripped>") == 0
++        || strcmp(filename, "<worker-platform>") == 0)
 +        return;
 +    rt->property_fault_trace_count++;
-+    if (b->has_debug && b->debug.filename != JS_ATOM_NULL)
-+        filename = JS_AtomGetStr(ctx, filename_buf, sizeof(filename_buf),
-+                                 b->debug.filename);
 +    if (b->func_name != JS_ATOM_NULL)
 +        function = JS_AtomGetStr(ctx, function_buf, sizeof(function_buf),
 +                                 b->func_name);
@@ -101,9 +117,10 @@ diff --git a/quickjs.c b/quickjs.c
 +        property = atom_buf;
 +    }
 +    fprintf(stderr,
-+            "quickjs-property-fault seq=%u source=\"%.*s\" line=%d col=%d "
++            "quickjs-property-%s seq=%u source=\"%.*s\" line=%d col=%d "
 +            "function=\"%.*s\" pc=%u opcode=%d base=%s key=%s property=\"%.*s\" depth=%d\n",
-+            rt->property_fault_trace_count, 180, filename, line, col,
++            kind == 2 ? "absent" : kind == 1 ? "miss" : "fault", rt->property_fault_trace_count,
++            180, filename, line, col,
 +            84, function, pc_offset, opcode,
 +            property_fault_tag_name(JS_VALUE_GET_TAG(base)),
 +            property_fault_tag_name(JS_VALUE_GET_TAG(key)), 84, property,
@@ -158,12 +175,15 @@ diff --git a/quickjs.c b/quickjs.c
 +    int i, depth = (int)(sp - stack_base);
 +
 +    if (rt->property_fault_trace_limit == 0
-+        || rt->property_fault_trace_count >= rt->property_fault_trace_limit)
++        || rt->property_fault_trace_count >= rt->property_fault_trace_limit
++        || !b->has_debug || b->debug.filename == JS_ATOM_NULL)
++        return;
++    filename = JS_AtomGetStr(ctx, filename_buf, sizeof(filename_buf),
++                             b->debug.filename);
++    if (strcmp(filename, "<stripped>") == 0
++        || strcmp(filename, "<worker-platform>") == 0)
 +        return;
 +    rt->property_fault_trace_count++;
-+    if (b->has_debug && b->debug.filename != JS_ATOM_NULL)
-+        filename = JS_AtomGetStr(ctx, filename_buf, sizeof(filename_buf),
-+                                 b->debug.filename);
 +    if (b->func_name != JS_ATOM_NULL)
 +        function = JS_AtomGetStr(ctx, function_buf, sizeof(function_buf),
 +                                 b->func_name);
@@ -203,8 +223,9 @@ diff --git a/quickjs.c b/quickjs.c
 +
  /* return a string property without executing arbitrary JS code (used
     when dumping the stack trace or in debug print). */
- static const char *get_prop_string(JSContext *ctx, JSValueConst obj,
-@@ -18296,3 +18466,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+ static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop)
+@@ -18510,6 +18694,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             has_call_argc:
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
 +#ifdef CONFIG_PROPERTY_FAULT_TRACE
@@ -213,7 +234,10 @@ diff --git a/quickjs.c b/quickjs.c
 +                                     JS_UNDEFINED, call_argc, stack_buf, sp);
 +#endif
                  ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
-@@ -18335,3 +18511,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                           JS_UNDEFINED, call_argc, call_argv, 0);
+                 if (unlikely(JS_IsException(ret_val)))
+@@ -18546,6 +18735,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 pc += 2;
                  call_argv = sp - call_argc;
                  sf->cur_pc = pc;
 +#ifdef CONFIG_PROPERTY_FAULT_TRACE
@@ -222,12 +246,14 @@ diff --git a/quickjs.c b/quickjs.c
 +                                     call_argv[-2], call_argc, stack_buf, sp);
 +#endif
                  ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
-@@ -19235,6 +19360,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                           JS_UNDEFINED, call_argc, call_argv, 0);
+                 if (unlikely(JS_IsException(ret_val)))
+@@ -19469,10 +19663,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                  } else {                                                \
                  name ## _slow_path:                                     \
                      sf->cur_pc = pc;                                    \
 +                    if (unlikely(JS_IsNull(obj) || JS_IsUndefined(obj))) { \
-+                        trace_property_fault(ctx, b, pc, opcode, obj,    \
++                        trace_property_fault(ctx, 0, b, pc, opcode, obj, \
 +                                             JS_UNDEFINED, atom,        \
 +                                             stack_buf, sp, arg_buf,    \
 +                                             sf->arg_count, var_buf,    \
@@ -236,24 +262,74 @@ diff --git a/quickjs.c b/quickjs.c
                      val = JS_GetPropertyInternal(ctx, obj, atom, sp[-1], 0); \
                      if (unlikely(JS_IsException(val)))                  \
                          goto exception;                                 \
-@@ -19501,6 +19633,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 }                                                       \
++                if (unlikely(JS_IsUndefined(val) && JS_IsObject(sp[-1]))) \
++                    trace_property_fault(ctx, 1, b, pc, opcode, sp[-1], \
++                                         JS_UNDEFINED, atom,            \
++                                         stack_buf, sp, arg_buf,       \
++                                         sf->arg_count, var_buf,       \
++                                         b->var_count);                 \
+                 if (keep) {                                             \
+                     *sp++ = val;                                        \
+                 } else {                                                \
+@@ -19531,7 +19738,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     sp -= 2;
+                 } else {
+                 put_field_slow_path:
+                     sf->cur_pc = pc;
++#ifdef CONFIG_PROPERTY_FAULT_TRACE
++                    if (unlikely(JS_IsNull(obj) || JS_IsUndefined(obj)))
++                        trace_property_fault(ctx, 0, b, pc, opcode, obj,
++                                             JS_UNDEFINED, atom, stack_buf, sp,
++                                             arg_buf, sf->arg_count, var_buf,
++                                             b->var_count);
++#endif
+                     ret = JS_SetPropertyInternal(ctx, obj, atom, sp[-1], obj,
+                                                  JS_PROP_THROW_STRICT);
+                     JS_FreeValue(ctx, obj);
+@@ -19719,5 +19926,5 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+ #define GET_ARRAY_EL_INLINE(name, keep)                                 \
+             {                                                           \
+-                JSValue val, obj, prop;                                 \
++                JSValue val, obj, prop, trace_prop;                     \
+                 JSObject *p;                                            \
+                 uint32_t idx;                                           \
+@@ -19734,15 +19941,30 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     val = JS_DupValue(ctx, p->u.array.u.values[idx]);   \
                  } else {                                                \
                      name ## _slow_path:                                 \
++                    trace_prop = JS_DupValue(ctx, prop);                \
                      sf->cur_pc = pc;                                    \
 +                    if (unlikely(JS_IsNull(obj) || JS_IsUndefined(obj))) { \
-+                        trace_property_fault(ctx, b, pc, opcode, obj, prop, \
++                        trace_property_fault(ctx, 0, b, pc, opcode, obj, prop, \
 +                                             JS_ATOM_NULL, stack_buf, sp, \
 +                                             arg_buf, sf->arg_count,     \
 +                                             var_buf, b->var_count);    \
 +                    }                                                   \
                      val = JS_GetPropertyValue(ctx, obj, prop);          \
                      if (unlikely(JS_IsException(val))) {                \
++                        JS_FreeValue(ctx, trace_prop);                   \
                          if (keep)                                       \
-@@ -19549,6 +19687,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                             sp[-1] = JS_UNDEFINED;                      \
+                         else                                            \
+                             sp--;                                       \
+                         goto exception;                                 \
+                     }                                                   \
++                    if (unlikely(JS_IsUndefined(val) && JS_IsObject(obj))) \
++                        trace_property_fault(ctx, 1, b, pc, opcode, obj, \
++                                             trace_prop, JS_ATOM_NULL,  \
++                                             stack_buf, sp, arg_buf,   \
++                                             sf->arg_count, var_buf,   \
++                                             b->var_count);             \
++                    JS_FreeValue(ctx, trace_prop);                      \
+                 }                                                       \
+                 if (keep) {                                             \
+                     sp[-1] = val;                                       \
+@@ -19787,6 +20009,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                      default:
                          /* must be tested before JS_ToPropertyKey */
                          if (unlikely(JS_IsUndefined(sp[-2]) || JS_IsNull(sp[-2]))) {
-+                            trace_property_fault(ctx, b, pc, opcode, sp[-2],
++                            trace_property_fault(ctx, 0, b, pc, opcode, sp[-2],
 +                                                 sp[-1], JS_ATOM_NULL,
 +                                                 stack_buf, sp, arg_buf,
 +                                                 sf->arg_count, var_buf,
@@ -261,12 +337,12 @@ diff --git a/quickjs.c b/quickjs.c
                              JS_ThrowTypeError(ctx, "value has no property");
                              goto exception;
                          }
-@@ -19565,6 +19708,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -19798,11 +20025,24 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                          sp[-1] = ret_val;
                          break;
                      }
 +                    if (unlikely(JS_IsNull(sp[-2]) || JS_IsUndefined(sp[-2]))) {
-+                        trace_property_fault(ctx, b, pc, opcode, sp[-2],
++                        trace_property_fault(ctx, 0, b, pc, opcode, sp[-2],
 +                                             sp[-1], JS_ATOM_NULL,
 +                                             stack_buf, sp, arg_buf,
 +                                             sf->arg_count, var_buf,
@@ -275,3 +351,60 @@ diff --git a/quickjs.c b/quickjs.c
                      sf->cur_pc = pc;
                      val = JS_GetPropertyValue(ctx, sp[-2], JS_DupValue(ctx, sp[-1]));
                      if (unlikely(JS_IsException(val)))
+                         goto exception;
+                 }
++                if (unlikely(JS_IsUndefined(val) && JS_IsObject(sp[-2])))
++                    trace_property_fault(ctx, 1, b, pc, opcode, sp[-2],
++                                         sp[-1], JS_ATOM_NULL,
++                                         stack_buf, sp, arg_buf,
++                                         sf->arg_count, var_buf,
++                                         b->var_count);
+                 *sp++ = val;
+             }
+             BREAK;
+@@ -19911,6 +20162,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 } else {
+                 put_array_el_slow_path:
+                     sf->cur_pc = pc;
++#ifdef CONFIG_PROPERTY_FAULT_TRACE
++                    if (unlikely(JS_IsNull(sp[-3]) || JS_IsUndefined(sp[-3])))
++                        trace_property_fault(ctx, 0, b, pc, opcode, sp[-3],
++                                             sp[-2], JS_ATOM_NULL, stack_buf, sp,
++                                             arg_buf, sf->arg_count, var_buf,
++                                             b->var_count);
++#endif
+                     ret = JS_SetPropertyValue(ctx, sp[-3], sp[-2], sp[-1], JS_PROP_THROW_STRICT);
+                     JS_FreeValue(ctx, sp[-3]);
+                     sp -= 3;
+@@ -20642,8 +20865,31 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+         CASE(OP_in):
++#ifdef CONFIG_PROPERTY_FAULT_TRACE
++            {
++                JSValue trace_key = JS_DupValue(ctx, sp[-2]);
++                JSValue trace_base = JS_DupValue(ctx, sp[-1]);
++                int in_result;
++                sf->cur_pc = pc;
++                in_result = js_operator_in(ctx, sp);
++                if (in_result) {
++                    JS_FreeValue(ctx, trace_key);
++                    JS_FreeValue(ctx, trace_base);
++                    goto exception;
++                }
++                if (!JS_ToBool(ctx, sp[-2]))
++                    trace_property_fault(ctx, 2, b, pc, opcode, trace_base,
++                                         trace_key, JS_ATOM_NULL, stack_buf,
++                                         sp, arg_buf, sf->arg_count, var_buf,
++                                         b->var_count);
++                JS_FreeValue(ctx, trace_key);
++                JS_FreeValue(ctx, trace_base);
++                sp--;
++            }
++#else
+             sf->cur_pc = pc;
+             if (js_operator_in(ctx, sp))
+                 goto exception;
+             sp--;
++#endif
+             BREAK;
+         CASE(OP_private_in):
+             sf->cur_pc = pc;

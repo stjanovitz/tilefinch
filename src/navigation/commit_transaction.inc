@@ -1423,6 +1423,8 @@ static bool navigation_commit_document(
         if (session->page.runtime == NULL) {
             session->page.runtime = navigation_create_runtime(
                 session, &session->page.document, url,
+                streaming == NULL ? "" : streaming->document_referrer,
+                streaming == NULL ? 0 : streaming->started_us,
                 session->page.referrer_policy,
                 session->document_scripts_enabled
                     || session->defer_document_script_pipeline,

@@ -1,11 +1,20 @@
 # Standards-visible global	authoritative source
 AbortController	compat.js
 Blob	platform.js
+CSSStyleDeclaration	platform.js
+DOMImplementation	platform.js
 EventSource	compat.js
 FormData	platform.js
 Headers	compat.js
 Request	compat.js
 Response	compat.js
+TrustedHTML	compat.js
+TrustedScript	compat.js
+TrustedScriptURL	compat.js
+TrustedTypePolicy	compat.js
+TrustedTypePolicyFactory	compat.js
+trustedTypes	compat.js
 URLSearchParams	platform.js
+VisibilityStateEntry	platform.js
 WebSocket	compat.js
 XMLHttpRequest	compat.js

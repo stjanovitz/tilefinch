@@ -82,6 +82,9 @@ typedef struct {
     char reject_source_context[3072];
     char callback_error_source_context[3072];
     uint64_t fetch_request_id;
+    /* Stable across redirects and Critical-CH retries: this is the time
+       origin of the child browsing context, not merely its final hop. */
+    uint64_t fetch_started_us;
     uint32_t sandbox_flags;
     uint64_t lifecycle_generation;
     bool fetch_pending;
@@ -683,6 +686,11 @@ struct NavigationSession {
     size_t frame_messages_to_parent;
     size_t frame_messages_to_child;
     size_t frame_messages_dropped;
+    /* Messages deferred because their target browsing context is still
+       fetching. They remain ordered per target, but may no longer block a
+       ready, unrelated context behind them in the shared bounded queue. */
+    size_t frame_messages_deferred;
+    size_t frame_message_max_deferred_run;
     size_t frames_detached;
     uint64_t next_frame_message_sequence;
     uint64_t next_frame_lifecycle_generation;
@@ -691,6 +699,28 @@ struct NavigationSession {
     long last_frame_message_target;
     char last_frame_message_event[96];
     char frame_message_event_log[512];
+    /* Source-free causal snapshot taken when the most recent event-shaped
+       frame message was queued. It survives child-frame teardown so a late
+       challenge failure can still be attributed to the browser task and
+       bounded async state that immediately preceded it. */
+    uint64_t last_frame_message_enqueued_us;
+    uint64_t last_frame_message_source_generation;
+    uint64_t last_frame_message_target_generation;
+    uint64_t last_frame_message_task_sequence;
+    char last_frame_message_task_kind[97];
+    size_t last_frame_message_pending_tasks;
+    size_t last_frame_message_root_timers;
+    size_t last_frame_message_root_network;
+    size_t last_frame_message_root_workers;
+    size_t last_frame_message_async_completed;
+    size_t last_frame_message_async_rejected;
+    size_t last_frame_message_async_cancelled;
+    size_t last_frame_message_async_timed_out;
+    size_t last_frame_message_xhr_responses;
+    size_t last_frame_message_promise_rejections;
+    size_t last_frame_message_callback_errors;
+    size_t last_frame_message_watchdog_polls;
+    bool last_frame_message_interrupted;
     char last_frame_reject_reason[128];
     bool trace_frame_capabilities;
     bool trace_page_capabilities;
@@ -1053,6 +1083,8 @@ bool navigation_test_refresh_frame_presentation(
     NavigationSession *session, NavigationFrame *frame);
 bool navigation_test_configure_frame_messaging(
     NavigationSession *session, NavigationFrame *frame);
+bool navigation_test_install_frame_capability_trace(
+    NavigationFrame *frame);
 #endif
 /* Pump exactly one deferred document-image continuation unit without also
    advancing webfonts, scripts, or other idle work. Frontends may use this

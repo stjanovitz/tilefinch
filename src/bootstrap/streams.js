@@ -37,9 +37,17 @@
     },
     requestReadableStreamPull = (stream) => {
       const state = readableState(stream);
+      if (state.pulling) {
+        if (
+          state.status === "readable" &&
+          typeof state.source.pull === "function" &&
+          (state.reads.length || !state.queue.length)
+        )
+          state.pullAgain = true;
+        return;
+      }
       if (
         state.status !== "readable" ||
-        state.pulling ||
         typeof state.source.pull !== "function" ||
         (!state.reads.length && state.queue.length)
       )
@@ -49,19 +57,28 @@
         Promise.resolve(state.source.pull(state.controller)).then(
           () => {
             state.pulling = false;
+            if (state.pullAgain) {
+              state.pullAgain = false;
+              requestReadableStreamPull(stream);
+            }
           },
           (reason) => {
             state.pulling = false;
+            state.pullAgain = false;
             failReadableStream(stream, reason);
           },
         );
       } catch (reason) {
         state.pulling = false;
+        state.pullAgain = false;
         failReadableStream(stream, reason);
       }
     },
     readReadableStream = (stream) => {
       const state = readableState(stream);
+      /* A body becomes disturbed when a read is attempted, not merely when a
+         reader locks it. Fetch exposes that distinction through bodyUsed. */
+      state.disturbed = true;
       if (state.queue.length) {
         const entry = state.queue.shift();
         state.queueBytes -= entry.bytes;
@@ -81,6 +98,7 @@
     },
     cancelReadableStream = (stream, reason) => {
       const state = readableState(stream);
+      state.disturbed = true;
       if (state.status === "closed") return Promise.resolve();
       if (state.status === "errored") return Promise.reject(state.error);
       state.queue.length = 0;
@@ -140,8 +158,10 @@
           closeResolve,
           closedPromise,
           controller: null,
+          disturbed: false,
           error: null,
           locked: false,
+          pullAgain: false,
           pulling: false,
           queue: [],
           queueBytes: 0,
@@ -212,14 +232,26 @@
     pipeTo(destination, options = {}) {
       if (!destination || typeof destination.getWriter !== "function")
         return Promise.reject(new TypeError("invalid destination"));
+      const signal = options.signal;
+      if (signal !== undefined && !(signal instanceof AbortSignal))
+        return Promise.reject(new TypeError("invalid abort signal"));
       const writer = destination.getWriter(),
-        reader = this.getReader(),
-        signal = options.signal;
+        reader = this.getReader();
+      let abortListener = null,
+        abortPromise = null;
+      if (signal) {
+        abortPromise = new Promise((_, reject) => {
+          abortListener = () => reject(signal.reason);
+        });
+        globalThis.__tilefinchAddAbortAlgorithm(signal, abortListener);
+      }
       return (async () => {
         try {
           for (;;) {
             if (signal?.aborted) throw signal.reason;
-            const { done, value } = await reader.read();
+            const { done, value } = await (abortPromise
+              ? Promise.race([reader.read(), abortPromise])
+              : reader.read());
             if (done) break;
             await writer.write(value);
           }
@@ -229,6 +261,8 @@
           if (!options.preventCancel) await reader.cancel(error);
           throw error;
         } finally {
+          if (abortListener)
+            globalThis.__tilefinchRemoveAbortAlgorithm(signal, abortListener);
           try {
             reader.releaseLock();
           } catch (_) {}
@@ -249,29 +283,112 @@
     tee() {
       if (this.locked) throw new TypeError("stream is locked");
       const reader = this.getReader();
-      let left, right;
-      const pump = async () => {
-        const result = await reader.read();
-        if (result.done) {
-          left.close();
-          right.close();
-        } else {
-          left.enqueue(result.value);
-          right.enqueue(result.value);
-        }
-      };
+      let left,
+        right,
+        leftCanceled = false,
+        rightCanceled = false,
+        leftReason,
+        rightReason,
+        reading = null,
+        finished = false,
+        cancelPromise = null,
+        cancelResolve = null,
+        cancelReject = null;
+      const cancellation = () => {
+          if (!cancelPromise)
+            cancelPromise = new Promise((resolve, reject) => {
+              cancelResolve = resolve;
+              cancelReject = reject;
+            });
+          return cancelPromise;
+        },
+        release = () => {
+          if (finished) return;
+          finished = true;
+          try {
+            reader.releaseLock();
+          } catch (_) {}
+        },
+        settleCancellation = (reason, rejected = false) => {
+          if (!cancelPromise) return;
+          if (rejected) cancelReject(reason);
+          else cancelResolve(reason);
+          cancelPromise = null;
+          cancelResolve = null;
+          cancelReject = null;
+        },
+        cancelSource = () => {
+          const pending = cancellation();
+          Promise.resolve(reader.cancel([leftReason, rightReason])).then(
+            (value) => {
+              release();
+              settleCancellation(value);
+            },
+            (reason) => {
+              release();
+              settleCancellation(reason, true);
+            },
+          );
+          return pending;
+        },
+        pump = () => {
+          if (finished || (leftCanceled && rightCanceled))
+            return Promise.resolve();
+          if (reading) return reading;
+          const operation = reader.read().then(
+            (result) => {
+              if (result.done) {
+                if (!leftCanceled) left.close();
+                if (!rightCanceled) right.close();
+                release();
+                settleCancellation(undefined);
+              } else {
+                if (!leftCanceled) left.enqueue(result.value);
+                if (!rightCanceled) right.enqueue(result.value);
+              }
+            },
+            (reason) => {
+              if (!leftCanceled) left.error(reason);
+              if (!rightCanceled) right.error(reason);
+              release();
+              settleCancellation(undefined);
+              throw reason;
+            },
+          );
+          reading = operation.then(
+            (value) => {
+              reading = null;
+              return value;
+            },
+            (reason) => {
+              reading = null;
+              throw reason;
+            },
+          );
+          return reading;
+        };
       return [
         new ReadableStream({
           start(controller) {
             left = controller;
           },
           pull: pump,
+          cancel(reason) {
+            leftCanceled = true;
+            leftReason = reason;
+            return rightCanceled ? cancelSource() : cancellation();
+          },
         }),
         new ReadableStream({
           start(controller) {
             right = controller;
           },
           pull: pump,
+          cancel(reason) {
+            rightCanceled = true;
+            rightReason = reason;
+            return leftCanceled ? cancelSource() : cancellation();
+          },
         }),
       ];
     }
@@ -446,16 +563,39 @@
         },
       }, sink = {
         write(value) {
-          if (typeof transformer.transform === "function")
-            return transformer.transform(value, readableController);
-          readableController.enqueue(value);
+          let transformed;
+          try {
+            if (typeof transformer.transform !== "function") {
+              readableController.enqueue(value);
+              return;
+            }
+            transformed = transformer.transform(value, readableController);
+          } catch (reason) {
+            readableController.error(reason);
+            throw reason;
+          }
+          return Promise.resolve(transformed).catch((reason) => {
+            readableController.error(reason);
+            throw reason;
+          });
         },
         close() {
-          return Promise.resolve(
-            typeof transformer.flush === "function"
+          let flushed;
+          try {
+            flushed = typeof transformer.flush === "function"
               ? transformer.flush(readableController)
-              : undefined,
-          ).then(() => readableController.close());
+              : undefined;
+          } catch (reason) {
+            readableController.error(reason);
+            return Promise.reject(reason);
+          }
+          return Promise.resolve(flushed).then(
+            () => readableController.close(),
+            (reason) => {
+              readableController.error(reason);
+              throw reason;
+            },
+          );
         },
         abort(reason) {
           readableController.error(reason);
@@ -475,6 +615,96 @@
   });
   globalThis.ReadableStream = ReadableStream;
   globalThis.ReadableStreamDefaultReader = ReadableStreamDefaultReader;
+  const consumeReadableByteStream = async (
+    stream, limit = streamByteLimit, signal = null, release = false,
+  ) => {
+    if (!(stream instanceof ReadableStream))
+      throw new TypeError("ReadableStream required");
+    if (stream.locked || readableState(stream).disturbed)
+      throw new TypeError("Body has already been consumed");
+    if (signal) signal.throwIfAborted();
+    const reader = stream.getReader(),
+      chunks = [];
+    let total = 0,
+      aborted = false,
+      abortAlgorithm = null;
+    try {
+      if (signal) {
+        abortAlgorithm = () => {
+          aborted = true;
+          try { reader.cancel(signal.reason); } catch (_) {}
+        };
+        globalThis.__tilefinchAddAbortAlgorithm(signal, abortAlgorithm);
+      }
+      for (;;) {
+        const result = await reader.read();
+        if (aborted) throw signal.reason;
+        if (result.done) break;
+        if (!(result.value instanceof Uint8Array))
+          throw new TypeError("Body stream chunk must be a Uint8Array");
+        if (result.value.byteLength > limit - total)
+          throw new RangeError("Body exceeds bounded size");
+        /* Append a byte-sequence snapshot; producers retain and may mutate
+         * their Uint8Array after enqueueing it. */
+        chunks.push(result.value.slice());
+        total += result.value.byteLength;
+      }
+    } finally {
+      if (abortAlgorithm)
+        globalThis.__tilefinchRemoveAbortAlgorithm(signal, abortAlgorithm);
+      if (release) reader.releaseLock();
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
+  },
+    consumeBufferedReadableByteStream = (stream, limit = streamByteLimit) => {
+      const state = readableState(stream);
+      if (state.locked || state.disturbed)
+        throw new TypeError("Body has already been consumed");
+      if (state.status === "errored") throw state.error;
+      if (state.status !== "closed") return null;
+      let total = 0;
+      for (const entry of state.queue) {
+        if (!(entry.value instanceof Uint8Array))
+          throw new TypeError("Body stream chunk must be a Uint8Array");
+        if (entry.value.byteLength > limit - total)
+          throw new RangeError("Body exceeds bounded size");
+        total += entry.value.byteLength;
+      }
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const entry of state.queue) {
+        bytes.set(entry.value, offset);
+        offset += entry.value.byteLength;
+      }
+      state.queue.length = 0;
+      state.queueBytes = 0;
+      state.disturbed = true;
+      return bytes;
+    };
+  for (const [name, value] of [
+    ["__tilefinchReadableStreamDisturbed", (stream) =>
+      readableState(stream).disturbed],
+    ["__tilefinchMarkReadableStreamDisturbed", (stream) => {
+      readableState(stream).disturbed = true;
+      return true;
+    }],
+    ["__tilefinchConsumeReadableByteStream", consumeReadableByteStream],
+    ["__tilefinchConsumeBufferedReadableByteStream",
+      consumeBufferedReadableByteStream],
+  ]) {
+    Object.defineProperty(globalThis, name, {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value,
+    });
+  }
   globalThis.WritableStream = WritableStream;
   globalThis.WritableStreamDefaultWriter = WritableStreamDefaultWriter;
   globalThis.TransformStream = TransformStream;

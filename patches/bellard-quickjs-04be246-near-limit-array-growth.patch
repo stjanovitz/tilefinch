@@ -1,0 +1,133 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -351,6 +351,7 @@ struct JSRuntime {
+     size_t fast_array_growth_byte_limit;
+ #ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+     uint64_t last_eval_rope_physical_work;
++    uint64_t gc_run_count;
+ #endif
+ 
+     int class_count;    /* size of class_array */
+@@ -2317,5 +2318,25 @@ uint64_t JS_GetEvalRopePhysicalWork(JSRuntime *rt)
+ {
+     return rt->last_eval_rope_physical_work;
+ }
++
++uint64_t JS_GetGCRunCount(JSRuntime *rt)
++{
++    return rt->gc_run_count;
++}
++
++uint32_t JS_GetFastArrayCapacityForTest(JSValueConst value)
++{
++    if (!JS_IsObject(value))
++        return 0;
++    JSObject *object = JS_VALUE_GET_OBJ(value);
++    if (object->class_id != JS_CLASS_ARRAY || !object->fast_array) {
++        return 0;
++    }
++#ifdef CONFIG_TILEFINCH_COMPACT_CHAR_ARRAY
++    if (object->compact_char_array)
++        return 0;
++#endif
++    return object->u.array.u1.size;
++}
+ #endif
+ 
+@@ -7138,6 +7156,9 @@ static void gc_free_cycles(JSRuntime *rt)
+ 
+ static void JS_RunGCInternal(JSRuntime *rt, BOOL remove_weak_objects)
+ {
++#ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
++    rt->gc_run_count++;
++#endif
+     if (remove_weak_objects) {
+         /* free the weakly referenced object or symbol structures, delete
+            the associated Map/Set entries and queue the finalization
+@@ -10070,6 +10091,7 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
+     uint64_t minimum_bytes, requested_bytes, headroom;
+     size_t slack;
+     JSValue *new_array_prop;
++    BOOL headroom_limited = FALSE;
+     if (unlikely(ctx->rt->fast_array_byte_limit != 0)
+         && sizeof(JSValue) * (uint64_t) new_len
+                > ctx->rt->fast_array_byte_limit) {
+@@ -10097,12 +10119,15 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
+                <= ctx->rt->malloc_ctx.malloc_state.malloc_limit) {
+         headroom = ctx->rt->malloc_ctx.malloc_state.malloc_limit
+             - ctx->rt->malloc_ctx.malloc_state.malloc_size;
+-        if (requested_bytes - current_bytes > headroom) {
++        if (minimum_bytes >= current_bytes
++            && minimum_bytes - current_bytes > headroom) {
+             /* Cyclic garbage is normally collected when a new object is
+                allocated, but a realloc-only append can reach the limit
+-               without passing that trigger.  Collect once before dropping
+-               optional array slack.  The array and pushed value remain
+-               rooted by the active interpreter frame. */
++               without passing that trigger. Collect only when the required
++               element does not fit; collecting merely to recover optional
++               capacity turns near-limit growth into an avoidable full-heap
++               pause. The array and pushed value remain rooted by the active
++               interpreter frame. */
+             JS_RunGC(ctx->rt);
+             headroom = ctx->rt->malloc_ctx.malloc_state.malloc_size
+                     <= ctx->rt->malloc_ctx.malloc_state.malloc_limit
+@@ -10113,12 +10138,45 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
+         if (requested_bytes - current_bytes > headroom
+             && minimum_bytes >= current_bytes
+             && minimum_bytes - current_bytes <= headroom) {
+-            /* Lack of room for speculative capacity is not an OOM when the
+-               requested element itself still fits. */
++            /* Lack of room for the normal speculative capacity is not an OOM
++               when the required element fits. Retain a bounded fraction of
++               the remaining headroom so a push loop does not immediately
++               realloc again, while leaving most of the heap for other live
++               objects. */
++            uint64_t bounded_growth = headroom / 8u;
++            uint64_t minimum_growth = minimum_bytes - current_bytes;
++            if (bounded_growth < minimum_growth)
++                bounded_growth = minimum_growth;
++            if (bounded_growth > requested_bytes - current_bytes)
++                bounded_growth = requested_bytes - current_bytes;
++            bounded_growth -= bounded_growth % sizeof(JSValue);
++            if (bounded_growth < minimum_growth)
++                bounded_growth = minimum_growth;
++            new_size = (uint32_t)((current_bytes + bounded_growth)
++                                  / sizeof(JSValue));
++            headroom_limited = TRUE;
++        }
++    }
++    if (headroom_limited && new_size > new_len) {
++        /* The allocator may need metadata or a different arena even though
++           the payload fits the logical heap headroom. An optional-capacity
++           refusal must not reject an element that still fits on its own. */
++        new_array_prop = js_realloc_rt(
++            ctx->rt, p->u.array.u.values, sizeof(JSValue) * new_size);
++        if (new_array_prop != NULL) {
++            size_t actual = js_malloc_usable_size_rt(ctx->rt, new_array_prop);
++            size_t requested = sizeof(JSValue) * (size_t)new_size;
++            slack = actual > requested ? actual - requested : 0;
++        } else {
+             new_size = new_len;
++            new_array_prop = js_realloc2(
++                ctx, p->u.array.u.values, sizeof(JSValue) * new_size,
++                &slack);
+         }
++    } else {
++        new_array_prop = js_realloc2(
++            ctx, p->u.array.u.values, sizeof(JSValue) * new_size, &slack);
+     }
+-    new_array_prop = js_realloc2(ctx, p->u.array.u.values, sizeof(JSValue) * new_size, &slack);
+     if (!new_array_prop)
+         return -1;
+     new_size += slack / sizeof(*new_array_prop);
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -372,6 +372,8 @@ void JS_SetMemoryLimit(JSRuntime *rt, size_t limit);
+ #ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+ uint64_t JS_GetEvalRopePhysicalWork(JSRuntime *rt);
++uint64_t JS_GetGCRunCount(JSRuntime *rt);
++uint32_t JS_GetFastArrayCapacityForTest(JSValueConst value);
+ #endif
+ void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold);
+ /* use 0 to disable maximum stack size check */

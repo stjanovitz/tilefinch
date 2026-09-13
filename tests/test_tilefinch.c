@@ -1106,8 +1106,24 @@ static bool test_response_keyed_visual_replay(Budget *budget)
         && failure_stats.occurrence_exhausted_count == 0;
     fetch_result_destroy(&result);
     fetch_trace_end();
+
+    memset(error, 0, sizeof(error));
+    bool corp_ready = fetch_trace_replay_begin_response_keyed(
+        TILEFINCH_TEST_SOURCE_DIR "/fixtures/http-corp-cross-origin",
+        error, sizeof(error));
+    result = (FetchResult) {.budget = budget};
+    bool cross_origin_corp = corp_ready
+        && fetch_request_cancelable(
+               budget, "https://corp.test/resource", NULL,
+               4096, 1000, NULL, NULL, &result)
+        && result.status_code == 200
+        && result.length == sizeof("cross-origin replay\n") - 1
+        && result.security.corp_state == FETCH_SECURITY_FIELD_VALID
+        && result.security.corp == TILEFINCH_CORP_CROSS_ORIGIN;
+    fetch_result_destroy(&result);
+    fetch_trace_end();
     return strict_rejected && ledger && ranked_occurrence && retained_failure
-        && budget->current == baseline;
+        && cross_origin_corp && budget->current == baseline;
 }
 
 static bool test_streaming_navigation_lifecycle(Budget *budget)
@@ -3213,10 +3229,13 @@ typedef struct {
 static bool count_test_message(void *opaque, ScriptRuntime *source,
                                long target_frame_handle,
                                const char *json,
-                               const char *target_origin)
+                               const char *target_origin,
+                               const char *task_kind,
+                               uint64_t task_sequence)
 {
     (void) source;
     (void) json; (void) target_origin;
+    (void) task_kind; (void) task_sequence;
     MessageOpaqueProbe *probe = opaque;
     if (probe == NULL) return false;
     probe->calls++;
@@ -3227,9 +3246,12 @@ static bool count_test_message(void *opaque, ScriptRuntime *source,
 static bool forward_test_message(void *opaque, ScriptRuntime *source,
                                  long target_frame_handle,
                                  const char *json,
-                                 const char *target_origin)
+                                 const char *target_origin,
+                                 const char *task_kind,
+                                 uint64_t task_sequence)
 {
     (void) source; (void) target_frame_handle; (void) target_origin;
+    (void) task_kind; (void) task_sequence;
     MessageTestTarget *target = opaque;
     return script_runtime_dispatch_message(target->target, json,
                                            "https://child.test", 7,

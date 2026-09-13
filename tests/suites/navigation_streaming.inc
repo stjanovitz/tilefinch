@@ -856,6 +856,7 @@ static bool test_redirected_critical_ch_retries_final_origin(void)
             &browser, "https://hinted.test/challenge", challenge_cookies,
             sizeof(challenge_cookies))
         && strstr(challenge_cookies, "retry_path=seen") != NULL
+        && strstr(challenge_cookies, "cf_clearance=") == NULL
         && strstr(challenge_cookies, "discarded_redirect_body=") == NULL
         && browser_session_cookie_get(
             &browser, "https://hinted.test/outside", outside_cookies,

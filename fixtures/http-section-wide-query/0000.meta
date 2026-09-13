@@ -16,5 +16,5 @@ request-send-low-client-hints=1
 request-sec-fetch-user=1
 request-upgrade-insecure=1
 status=200
-length=2361
+length=2373
 effective-url=https://section-wide-query.test/page

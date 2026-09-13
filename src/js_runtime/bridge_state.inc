@@ -356,6 +356,7 @@ typedef struct {
 } DeterministicReplayConfig;
 
 static DeterministicReplayConfig deterministic_replay;
+static bool wall_clock_timers_enabled;
 
 bool script_execution_policy_for_profile(
     ScriptExecutionProfile profile, ScriptExecutionPolicy *policy)
@@ -393,6 +394,11 @@ void script_runtime_configure_deterministic_replay(bool enabled,
     deterministic_replay.enabled = enabled;
     /* Zero is an explicit seed in the versioned derivation, not a sentinel. */
     deterministic_replay.seed = (uint64_t) seed;
+}
+
+void script_runtime_configure_wall_clock_timers(bool enabled)
+{
+    wall_clock_timers_enabled = enabled;
 }
 
 static uint64_t replay_random_mix(uint64_t value)

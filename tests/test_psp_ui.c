@@ -507,6 +507,12 @@ static bool test_input_mapping_and_menu(void)
     input.pressed = PSP_UI_BUTTON_CONFIRM;
     intent = psp_ui_update(&ui, &input);
     CHECK(intent.setting.id == PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS);
+    ui.options_selection = 42;
+    input.pressed = PSP_UI_BUTTON_CONFIRM;
+    intent = psp_ui_update(&ui, &input);
+    CHECK(ui.save_diagnostic_reports
+          && intent.setting.id == PSP_UI_SETTING_SAVE_DIAGNOSTIC_REPORTS
+          && intent.setting.value.boolean);
     ui.options_selection = 39;
     input.pressed = PSP_UI_BUTTON_RIGHT;
     intent = psp_ui_update(&ui, &input);

@@ -3452,6 +3452,16 @@ bool navigation_advance_runtime(NavigationSession *session,
                    : session->page.script_result.error);
         return false;
     }
+    if (tilefinch_trace_callback_source()
+        && session->last_script_error_context[0] == '\0'
+        && session->page.script_result.last_uncaught_callback_error[0]
+            != '\0') {
+        collect_document_stack_source_context_into(
+            &session->page.document,
+            session->page.script_result.last_uncaught_callback_error,
+            session->last_script_error_context,
+            sizeof(session->last_script_error_context));
+    }
     const char *current_url = navigation_active_document_url(session);
     if (session->document_scripts_enabled && current_url != NULL
         && !navigation_load_frames(session, current_url)) {

@@ -102,7 +102,14 @@ static bool navigation_stream_headers(void *opaque,
     if (stream != NULL && stream->session != NULL
         && stream->session->performance.response_headers_us == 0
         && stream->started_us != 0) {
+        uint64_t headers_now_us = navigation_now_us();
         stream->session->performance.response_headers_us =
+            headers_now_us - stream->started_us;
+        stream->response_headers_elapsed_us =
+            stream->session->performance.response_headers_us;
+    } else if (stream != NULL && stream->started_us != 0
+               && stream->response_headers_elapsed_us == 0) {
+        stream->response_headers_elapsed_us =
             navigation_now_us() - stream->started_us;
     }
     if (metadata->effective_url[0] != '\0') {
@@ -115,6 +122,15 @@ static bool navigation_stream_headers(void *opaque,
     const char *security_document_url =
         metadata->effective_url[0] == '\0'
             ? stream->document_url : metadata->effective_url;
+    stream->document_referrer[0] = '\0';
+    if (stream->referrer_source_url[0] != '\0'
+        && !fetch_compute_referrer(
+               stream->referrer_source_url, security_document_url,
+               stream->initiator_referrer_policy,
+               stream->document_referrer,
+               sizeof(stream->document_referrer))) {
+        return false;
+    }
     bool security_snapshot_truncated =
         metadata->security.version
                 == FETCH_RESPONSE_SECURITY_METADATA_VERSION
@@ -163,6 +179,7 @@ struct NavigationLoad {
     NavigationSession *session;
     uint64_t generation;
     uint64_t started_us;
+    uint64_t response_completed_us;
     FetchScheduler *scheduler;
     uint64_t request_id;
     FetchResult response;
@@ -504,6 +521,11 @@ static bool navigation_load_initialize_document_stream(
              load->request_url);
     snprintf(stream->resource_base_url,
              sizeof(stream->resource_base_url), "%s", load->request_url);
+    snprintf(stream->referrer_source_url,
+             sizeof(stream->referrer_source_url), "%s", load->source_url);
+    snprintf(stream->initiator_referrer_policy,
+             sizeof(stream->initiator_referrer_policy), "%s",
+             load->session->page.referrer_policy);
     if (!viewport_context_init(
             &stream->viewport, load->viewport_width, 272,
             load->viewport_width, 272)) return false;
@@ -1195,6 +1217,7 @@ NavigationLoadStatus navigation_load_pump(
             load->scheduler, load->request_id, &success, &stream_metrics,
             &load->response)) return load->status;
     load->request_id = 0;
+    load->response_completed_us = navigation_now_us();
     load->metrics.stream = stream_metrics;
     session->last_stream = stream_metrics;
     session->last_http_status = load->response.status_code;
@@ -1450,12 +1473,31 @@ static void navigation_load_close_stream_after_build(NavigationLoad *load)
     load->staged_stall = false;
 }
 
+static void navigation_load_record_timing_for_runtime(
+    NavigationLoad *load, ScriptRuntime *runtime)
+{
+    if (load == NULL || runtime == NULL) return;
+    uint64_t headers_elapsed_us = load->document_stream == NULL
+        ? 0 : load->document_stream->response_headers_elapsed_us;
+    ScriptNavigationTiming timing = navigation_timing_from_fetch(
+        load->started_us, load->response_completed_us,
+        headers_elapsed_us, &load->response);
+    (void) script_runtime_record_navigation_timing(runtime, &timing);
+}
+
 static bool navigation_load_finalize_build(NavigationLoad *load)
 {
     NavigationSession *session = load->session;
     NavigationSession *candidate = load->candidate_session;
     bool built = true;
     if (candidate == NULL) {
+        /* The network response is complete before final parser scripts run.
+           Update the retained navigation entry on the streaming realm now,
+           so author code observes the same responseEnd a browser would. */
+        if (load->document_stream != NULL) {
+            navigation_load_record_timing_for_runtime(
+                load, load->document_stream->runtime);
+        }
         candidate = budget_malloc(session->budget, sizeof(*candidate));
         if (candidate == NULL && !load->sectioned
             && load->document_stream != NULL
@@ -1535,6 +1577,8 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
             candidate->page.images.stats.discovery_prefilter_checks);
         tilefinch_platform_log_message(phase_message);
 #endif
+        if (built) navigation_load_record_timing_for_runtime(
+            load, candidate->page.runtime);
         if (built && load->layout_job != NULL) return true;
     } else if (load->layout_job != NULL) {
         LayoutBuildStatus layout_status =
@@ -1588,6 +1632,8 @@ static bool navigation_load_finalize_build(NavigationLoad *load)
         navigation_load_release_candidate(load);
         return false;
     }
+    navigation_load_record_timing_for_runtime(
+        load, candidate->page.runtime);
     navigation_load_close_stream_after_build(load);
     load->finalize_phase = NAVIGATION_FINALIZE_COMMIT;
     return true;

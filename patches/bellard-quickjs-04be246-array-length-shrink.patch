@@ -1,0 +1,46 @@
+diff --git a/quickjs.c b/quickjs.c
+index 355b55d8..ed85d61c 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -10061,18 +10061,30 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
+                     }
+                 }
+ 
+-                for(i = 0, pr = get_shape_prop(sh); i < sh->prop_count;
+-                    i++, pr++) {
+-                    if (pr->atom != JS_ATOM_NULL &&
+-                        JS_AtomIsArrayIndex(ctx, &idx, pr->atom)) {
+-                        if (idx >= cur_len) {
+-                            /* remove the property */
+-                            delete_property(ctx, p, pr->atom);
+-                            /* WARNING: the shape may have been modified */
+-                            sh = p->shape;
+-                            pr = get_shape_prop(sh) + i;
+-                        }
++                i = 0;
++                while (i < p->shape->prop_count) {
++                    uint32_t previous_prop_count;
++
++                    sh = p->shape;
++                    pr = get_shape_prop(sh) + i;
++                    if (pr->atom == JS_ATOM_NULL ||
++                        !JS_AtomIsArrayIndex(ctx, &idx, pr->atom) ||
++                        idx < cur_len) {
++                        i++;
++                        continue;
+                     }
++                    previous_prop_count = sh->prop_count;
++                    /* delete_property() can compact the shape after enough
++                       tombstones accumulate. Compaction may move a surviving
++                       entry to any earlier hole, so restart the bounded scan;
++                       otherwise reducing length can skip array elements. */
++                    ret = delete_property(ctx, p, pr->atom);
++                    if (unlikely(ret < 0))
++                        return -1;
++                    if (p->shape->prop_count < previous_prop_count)
++                        i = 0;
++                    else
++                        i++;
+                 }
+             }
+         } else {

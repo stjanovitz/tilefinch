@@ -1586,4 +1586,18 @@ void psp_app_apply_setting(
                 240);
         }
     }
+    if (intent->setting.id
+        == PSP_UI_SETTING_SAVE_DIAGNOSTIC_REPORTS) {
+        bool enabled = intent->setting.value.boolean;
+        browser_profile_set_save_diagnostic_reports(profile, enabled);
+        bool storage_ok = psp_failure_report_configure(enabled, !enabled);
+        psp_profile_store_mark_dirty(
+            &app->browser->profile_store, frame->ui_sample_us);
+        psp_ui_show_status(
+            &app->process->presentation.ui,
+            enabled ? "ERROR REPORT SAVING ON"
+                    : (storage_ok ? "ERROR REPORT SAVING OFF"
+                                  : "OFF - OLD REPORT NOT REMOVED"),
+            240);
+    }
 }

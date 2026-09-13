@@ -349,6 +349,10 @@ struct JSRuntime {
     /* Cap geometric over-allocation for already-large dense arrays.  Zero
        keeps upstream 1.5x growth for controlled comparisons. */
     size_t fast_array_growth_byte_limit;
+#ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+    uint64_t last_eval_rope_physical_work;
+    uint64_t gc_run_count;
+#endif
 
     int class_count;    /* size of class_array */
     JSClass *class_array;
@@ -538,6 +542,8 @@ struct JSContext {
     JSRuntime *rt;
     struct list_head link;
     BOOL dynamic_code_enabled;
+    JSHostGetCodeForEval *host_get_code_for_eval;
+    void *host_get_code_for_eval_opaque;
     BOOL host_retired;
 
     uint16_t binary_object_count;
@@ -2308,6 +2314,33 @@ void JS_SetMemoryLimit(JSRuntime *rt, size_t limit)
     rt->malloc_ctx.malloc_state.malloc_limit = limit;
 }
 
+#ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+uint64_t JS_GetEvalRopePhysicalWork(JSRuntime *rt)
+{
+    return rt->last_eval_rope_physical_work;
+}
+
+uint64_t JS_GetGCRunCount(JSRuntime *rt)
+{
+    return rt->gc_run_count;
+}
+
+uint32_t JS_GetFastArrayCapacityForTest(JSValueConst value)
+{
+    if (!JS_IsObject(value))
+        return 0;
+    JSObject *object = JS_VALUE_GET_OBJ(value);
+    if (object->class_id != JS_CLASS_ARRAY || !object->fast_array) {
+        return 0;
+    }
+#ifdef CONFIG_TILEFINCH_COMPACT_CHAR_ARRAY
+    if (object->compact_char_array)
+        return 0;
+#endif
+    return object->u.array.u1.size;
+}
+#endif
+
 /* use -1 to disable automatic GC */
 void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold)
 {
@@ -2758,6 +2791,14 @@ void JS_SetContextOpaque(JSContext *ctx, void *opaque)
 void JS_SetDynamicCodeEnabled(JSContext *ctx, JS_BOOL enabled)
 {
     ctx->dynamic_code_enabled = enabled != 0;
+}
+
+void JS_SetHostGetCodeForEval(JSContext *ctx,
+                              JSHostGetCodeForEval *callback,
+                              void *opaque)
+{
+    ctx->host_get_code_for_eval = callback;
+    ctx->host_get_code_for_eval_opaque = opaque;
 }
 
 void JS_RetireContext(JSContext *ctx)
@@ -4063,7 +4104,7 @@ static JSValue js_new_string8_len(JSContext *ctx, const char *buf, int len)
         if (!str)
             return JS_EXCEPTION;
         str->u.str8[0] = c;
-        str->u.str8[1] = ' ';
+        str->u.str8[1] = '\0';
         js_rc(str)->ref_count++;
         rt->char_strings[c] = str;
         return JS_MKPTR(JS_TAG_STRING, str);
@@ -7118,6 +7159,9 @@ static void gc_free_cycles(JSRuntime *rt)
 
 static void JS_RunGCInternal(JSRuntime *rt, BOOL remove_weak_objects)
 {
+#ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+    rt->gc_run_count++;
+#endif
     if (remove_weak_objects) {
         /* free the weakly referenced object or symbol structures, delete
            the associated Map/Set entries and queue the finalization
@@ -7151,6 +7195,13 @@ BOOL JS_IsLiveObject(JSRuntime *rt, JSValueConst obj)
         return FALSE;
     p = JS_VALUE_GET_OBJ(obj);
     return !p->free_mark;
+}
+
+BOOL JS_IsProxy(JSValueConst obj)
+{
+    if (!JS_IsObject(obj))
+        return FALSE;
+    return JS_VALUE_GET_OBJ(obj)->class_id == JS_CLASS_PROXY;
 }
 
 /* Compute memory used by various object types */
@@ -10017,18 +10068,30 @@ static int set_array_length(JSContext *ctx, JSObject *p, JSValue val,
                     }
                 }
 
-                for(i = 0, pr = get_shape_prop(sh); i < sh->prop_count;
-                    i++, pr++) {
-                    if (pr->atom != JS_ATOM_NULL &&
-                        JS_AtomIsArrayIndex(ctx, &idx, pr->atom)) {
-                        if (idx >= cur_len) {
-                            /* remove the property */
-                            delete_property(ctx, p, pr->atom);
-                            /* WARNING: the shape may have been modified */
-                            sh = p->shape;
-                            pr = get_shape_prop(sh) + i;
-                        }
+                i = 0;
+                while (i < p->shape->prop_count) {
+                    uint32_t previous_prop_count;
+
+                    sh = p->shape;
+                    pr = get_shape_prop(sh) + i;
+                    if (pr->atom == JS_ATOM_NULL ||
+                        !JS_AtomIsArrayIndex(ctx, &idx, pr->atom) ||
+                        idx < cur_len) {
+                        i++;
+                        continue;
                     }
+                    previous_prop_count = sh->prop_count;
+                    /* delete_property() can compact the shape after enough
+                       tombstones accumulate. Compaction may move a surviving
+                       entry to any earlier hole, so restart the bounded scan;
+                       otherwise reducing length can skip array elements. */
+                    ret = delete_property(ctx, p, pr->atom);
+                    if (unlikely(ret < 0))
+                        return -1;
+                    if (p->shape->prop_count < previous_prop_count)
+                        i = 0;
+                    else
+                        i++;
                 }
             }
         } else {
@@ -10050,6 +10113,7 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
     uint64_t minimum_bytes, requested_bytes, headroom;
     size_t slack;
     JSValue *new_array_prop;
+    BOOL headroom_limited = FALSE;
     if (unlikely(ctx->rt->fast_array_byte_limit != 0)
         && sizeof(JSValue) * (uint64_t) new_len
                > ctx->rt->fast_array_byte_limit) {
@@ -10077,12 +10141,15 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
                <= ctx->rt->malloc_ctx.malloc_state.malloc_limit) {
         headroom = ctx->rt->malloc_ctx.malloc_state.malloc_limit
             - ctx->rt->malloc_ctx.malloc_state.malloc_size;
-        if (requested_bytes - current_bytes > headroom) {
+        if (minimum_bytes >= current_bytes
+            && minimum_bytes - current_bytes > headroom) {
             /* Cyclic garbage is normally collected when a new object is
                allocated, but a realloc-only append can reach the limit
-               without passing that trigger.  Collect once before dropping
-               optional array slack.  The array and pushed value remain
-               rooted by the active interpreter frame. */
+               without passing that trigger. Collect only when the required
+               element does not fit; collecting merely to recover optional
+               capacity turns near-limit growth into an avoidable full-heap
+               pause. The array and pushed value remain rooted by the active
+               interpreter frame. */
             JS_RunGC(ctx->rt);
             headroom = ctx->rt->malloc_ctx.malloc_state.malloc_size
                     <= ctx->rt->malloc_ctx.malloc_state.malloc_limit
@@ -10093,12 +10160,45 @@ static int expand_fast_array(JSContext *ctx, JSObject *p, uint32_t new_len)
         if (requested_bytes - current_bytes > headroom
             && minimum_bytes >= current_bytes
             && minimum_bytes - current_bytes <= headroom) {
-            /* Lack of room for speculative capacity is not an OOM when the
-               requested element itself still fits. */
-            new_size = new_len;
+            /* Lack of room for the normal speculative capacity is not an OOM
+               when the required element fits. Retain a bounded fraction of
+               the remaining headroom so a push loop does not immediately
+               realloc again, while leaving most of the heap for other live
+               objects. */
+            uint64_t bounded_growth = headroom / 8u;
+            uint64_t minimum_growth = minimum_bytes - current_bytes;
+            if (bounded_growth < minimum_growth)
+                bounded_growth = minimum_growth;
+            if (bounded_growth > requested_bytes - current_bytes)
+                bounded_growth = requested_bytes - current_bytes;
+            bounded_growth -= bounded_growth % sizeof(JSValue);
+            if (bounded_growth < minimum_growth)
+                bounded_growth = minimum_growth;
+            new_size = (uint32_t)((current_bytes + bounded_growth)
+                                  / sizeof(JSValue));
+            headroom_limited = TRUE;
         }
     }
-    new_array_prop = js_realloc2(ctx, p->u.array.u.values, sizeof(JSValue) * new_size, &slack);
+    if (headroom_limited && new_size > new_len) {
+        /* The allocator may need metadata or a different arena even though
+           the payload fits the logical heap headroom. An optional-capacity
+           refusal must not reject an element that still fits on its own. */
+        new_array_prop = js_realloc_rt(
+            ctx->rt, p->u.array.u.values, sizeof(JSValue) * new_size);
+        if (new_array_prop != NULL) {
+            size_t actual = js_malloc_usable_size_rt(ctx->rt, new_array_prop);
+            size_t requested = sizeof(JSValue) * (size_t)new_size;
+            slack = actual > requested ? actual - requested : 0;
+        } else {
+            new_size = new_len;
+            new_array_prop = js_realloc2(
+                ctx, p->u.array.u.values, sizeof(JSValue) * new_size,
+                &slack);
+        }
+    } else {
+        new_array_prop = js_realloc2(
+            ctx, p->u.array.u.values, sizeof(JSValue) * new_size, &slack);
+    }
     if (!new_array_prop)
         return -1;
     new_size += slack / sizeof(*new_array_prop);
@@ -19012,10 +19112,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 if (js_same_value(ctx, call_argv[-1], ctx->eval_obj)) {
-                    if (unlikely(!ctx->dynamic_code_enabled)) {
-                        JS_ThrowTypeError(ctx, "dynamic code compilation disabled by Content Security Policy");
-                        goto exception;
-                    }
                     if (call_argc >= 1)
                         obj = call_argv[0];
                     else
@@ -19049,11 +19145,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 if (!tab)
                     goto exception;
                 if (js_same_value(ctx, sp[-2], ctx->eval_obj)) {
-                    if (unlikely(!ctx->dynamic_code_enabled)) {
-                        free_arg_list(ctx, tab, len);
-                        JS_ThrowTypeError(ctx, "dynamic code compilation disabled by Content Security Policy");
-                        goto exception;
-                    }
                     if (len >= 1)
                         obj = tab[0];
                     else
@@ -38143,63 +38234,232 @@ static JSValue JS_EvalInternalWithColumn(
    normal path; an exception means allocation failed. Only horizontal trivia
    is elided, so line numbering is unchanged, and the parser receives the
    original first-line column separately. */
+typedef struct {
+    const void *horizontal[JS_STRING_ROPE_MAX_DEPTH];
+    int8_t horizontal_tag[JS_STRING_ROPE_MAX_DEPTH];
+    uint8_t horizontal_count;
+    uint32_t skipped;
+    uint32_t work_since_poll;
+#ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+    uint64_t physical_work;
+#endif
+} TilefinchEvalPrefixScan;
+
+#ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+#define TILEFINCH_EVAL_PHYSICAL_WORK(scan, amount) \
+    ((scan)->physical_work += (amount))
+#else
+#define TILEFINCH_EVAL_PHYSICAL_WORK(scan, amount) ((void) 0)
+#endif
+
+static BOOL tilefinch_eval_prefix_memo_contains(
+    const TilefinchEvalPrefixScan *scan, JSValueConst value)
+{
+    int tag = JS_VALUE_GET_TAG(value);
+    const void *pointer = JS_VALUE_GET_PTR(value);
+    uint8_t i;
+
+    for (i = 0; i < scan->horizontal_count; i++) {
+        if (scan->horizontal_tag[i] == tag
+            && scan->horizontal[i] == pointer)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void tilefinch_eval_prefix_memo_add(TilefinchEvalPrefixScan *scan,
+                                           JSValueConst value)
+{
+    if (scan->horizontal_count < countof(scan->horizontal)) {
+        uint8_t at = scan->horizontal_count++;
+        scan->horizontal_tag[at] = JS_VALUE_GET_TAG(value);
+        scan->horizontal[at] = JS_VALUE_GET_PTR(value);
+    }
+}
+
+static int tilefinch_eval_prefix_account(JSContext *ctx,
+                                         TilefinchEvalPrefixScan *scan,
+                                         uint32_t count)
+{
+    while (count != 0) {
+        uint32_t until_poll = JS_STRING_REPEAT_EVAL_POLL_INTERVAL
+            - scan->work_since_poll;
+        uint32_t step = min_uint32(count, until_poll);
+        scan->skipped += step;
+        scan->work_since_poll += step;
+        count -= step;
+        if (scan->work_since_poll == JS_STRING_REPEAT_EVAL_POLL_INTERVAL) {
+            scan->work_since_poll = 0;
+            if (__js_poll_interrupts(ctx))
+                return -1;
+        }
+    }
+    return 0;
+}
+
+/* Return one when the complete value is horizontal trivia, zero at the first
+   other code unit, and minus one on an interrupt or bounded-scan exception.
+   A repeated string is a shared rope DAG, so memoizing only proven-horizontal
+   immutable nodes lets a virtual prefix be checked in O(depth + polls) rather
+   than visiting the same leaf once per repetition. */
+static int tilefinch_eval_scan_horizontal(JSContext *ctx,
+                                          JSValueConst value,
+                                          TilefinchEvalPrefixScan *scan)
+{
+    uint32_t length = string_rope_get_len(value);
+    int tag = JS_VALUE_GET_TAG(value);
+
+    TILEFINCH_EVAL_PHYSICAL_WORK(scan, 1);
+    if (js_check_stack_overflow(ctx->rt, 0)) {
+        JS_ThrowStackOverflow(ctx);
+        return -1;
+    }
+    if (length <= JS_STRING_REPEAT_EVAL_SCAN_MAX - scan->skipped
+        && tilefinch_eval_prefix_memo_contains(scan, value)) {
+        return tilefinch_eval_prefix_account(ctx, scan, length) < 0 ? -1 : 1;
+    }
+    if (tag == JS_TAG_STRING
+        || (tag == JS_TAG_STRING_ROPE
+            && JS_VALUE_GET_TAG(JS_VALUE_GET_STRING_ROPE(value)->right)
+                   == JS_TAG_INT)) {
+        JSString *part;
+        uint32_t start, end;
+        if (tag == JS_TAG_STRING) {
+            part = JS_VALUE_GET_STRING(value);
+            start = 0;
+            end = part->len;
+        } else {
+            JSStringRope *rope = JS_VALUE_GET_STRING_ROPE(value);
+            part = JS_VALUE_GET_STRING(rope->left);
+            start = JS_VALUE_GET_INT(rope->right);
+            end = start + rope->len;
+        }
+        while (start < end) {
+            int c;
+            if (scan->skipped == JS_STRING_REPEAT_EVAL_SCAN_MAX)
+                return JS_ThrowRangeError(
+                    ctx,
+                    "eval source exceeds bounded repeated-string scan limit"),
+                    -1;
+            TILEFINCH_EVAL_PHYSICAL_WORK(scan, 1);
+            c = string_get(part, start);
+            if (c != ' ' && c != '\t')
+                return 0;
+            start++;
+            scan->skipped++;
+            if (++scan->work_since_poll
+                    == JS_STRING_REPEAT_EVAL_POLL_INTERVAL) {
+                scan->work_since_poll = 0;
+                if (__js_poll_interrupts(ctx))
+                    return -1;
+            }
+        }
+    } else {
+        JSStringRope *rope = JS_VALUE_GET_STRING_ROPE(value);
+        int result = tilefinch_eval_scan_horizontal(ctx, rope->left, scan);
+        if (result <= 0)
+            return result;
+        result = tilefinch_eval_scan_horizontal(ctx, rope->right, scan);
+        if (result <= 0)
+            return result;
+    }
+    tilefinch_eval_prefix_memo_add(scan, value);
+    return 1;
+}
+
+/* Position an iterator at a logical code-unit offset without expanding every
+   leaf before it. The returned part begins at iterator.start. */
+static JSString *tilefinch_string_rope_seek(JSStringRopeIter *iterator,
+                                            JSValueConst value,
+                                            uint32_t offset,
+                                            TilefinchEvalPrefixScan *scan)
+{
+    JSValueConst current;
+    string_rope_iter_init(iterator, value);
+    while (iterator->stack_len != 0) {
+        current = iterator->stack[--iterator->stack_len];
+        for (;;) {
+            TILEFINCH_EVAL_PHYSICAL_WORK(scan, 1);
+            if (JS_VALUE_GET_TAG(current) == JS_TAG_STRING) {
+                JSString *part = JS_VALUE_GET_STRING(current);
+                if (offset < part->len) {
+                    iterator->start = offset;
+                    iterator->end = part->len;
+                    return part;
+                }
+                offset -= part->len;
+                break;
+            } else {
+                JSStringRope *rope = JS_VALUE_GET_STRING_ROPE(current);
+                if (JS_VALUE_GET_TAG(rope->right) == JS_TAG_INT) {
+                    if (offset < rope->len) {
+                        iterator->start = JS_VALUE_GET_INT(rope->right)
+                            + offset;
+                        iterator->end = JS_VALUE_GET_INT(rope->right)
+                            + rope->len;
+                        return JS_VALUE_GET_STRING(rope->left);
+                    }
+                    offset -= rope->len;
+                    break;
+                } else {
+                    uint32_t left_length = string_rope_get_len(rope->left);
+                    if (offset < left_length) {
+                        assert(iterator->stack_len < JS_STRING_ROPE_MAX_DEPTH);
+                        iterator->stack[iterator->stack_len++] = rope->right;
+                        current = rope->left;
+                    } else {
+                        offset -= left_length;
+                        current = rope->right;
+                    }
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
 static JSValue tilefinch_compact_eval_rope(JSContext *ctx,
                                            JSValueConst value,
                                            uint32_t *first_line_column)
 {
     JSStringRopeIter iterator;
     JSString *part;
-    uint32_t skipped = 0;
-    uint32_t work_since_poll = 0;
-    BOOL prefix_only = TRUE;
+    TilefinchEvalPrefixScan scan = { 0 };
+    int prefix_result;
     JSStringRope *rope = JS_VALUE_GET_STRING_ROPE(value);
 
     *first_line_column = 0;
-    string_rope_iter_init(&iterator, value);
-    while ((part = string_rope_iter_next(&iterator)) != NULL) {
-        uint32_t at = 0, length = iterator.end - iterator.start;
-        while (at < length) {
-            if (skipped + at == JS_STRING_REPEAT_EVAL_SCAN_MAX)
-                return JS_ThrowRangeError(
-                    ctx,
-                    "eval source exceeds bounded repeated-string scan limit");
-            int c = string_get(part, iterator.start + at);
-            if (c != ' ' && c != '\t') {
-                prefix_only = FALSE;
-                break;
-            }
-            at++;
-            if (++work_since_poll == JS_STRING_REPEAT_EVAL_POLL_INTERVAL) {
-                work_since_poll = 0;
-                if (__js_poll_interrupts(ctx))
-                    return JS_EXCEPTION;
-            }
-        }
-        skipped += at;
-        if (!prefix_only)
-            break;
-    }
-    if (skipped < JS_STRING_REPEAT_ROPE_THRESHOLD)
+#ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+    ctx->rt->last_eval_rope_physical_work = 0;
+#endif
+    prefix_result = tilefinch_eval_scan_horizontal(ctx, value, &scan);
+    if (prefix_result < 0)
+        return JS_EXCEPTION;
+    if (scan.skipped < JS_STRING_REPEAT_ROPE_THRESHOLD)
         return JS_UNDEFINED;
-    *first_line_column = skipped;
-    if (skipped == rope->len)
+    *first_line_column = scan.skipped;
+    if (scan.skipped == rope->len) {
+#ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+        ctx->rt->last_eval_rope_physical_work = scan.physical_work;
+#endif
         return JS_AtomToString(ctx, JS_ATOM_empty_string);
+    }
     {
         StringBuffer storage, *buffer = &storage;
-        uint32_t discard = skipped;
-        uint32_t remaining = rope->len - skipped;
+        uint32_t remaining = rope->len - scan.skipped;
         if (string_buffer_init2(ctx, buffer, remaining,
                                 rope->is_wide_char))
             return JS_EXCEPTION;
-        string_rope_iter_init(&iterator, value);
-        while ((part = string_rope_iter_next(&iterator)) != NULL) {
-            uint32_t start = min_uint32(discard, iterator.end - iterator.start);
-            discard -= start;
-            start += iterator.start;
+        part = tilefinch_string_rope_seek(&iterator, value, scan.skipped,
+                                          &scan);
+        while (part != NULL) {
+            TILEFINCH_EVAL_PHYSICAL_WORK(&scan, 1);
+            uint32_t start = iterator.start;
             while (start < iterator.end) {
                 uint32_t available = iterator.end - start;
                 uint32_t until_poll =
-                    JS_STRING_REPEAT_EVAL_POLL_INTERVAL - work_since_poll;
+                    JS_STRING_REPEAT_EVAL_POLL_INTERVAL
+                    - scan.work_since_poll;
                 uint32_t count = min_uint32(available, until_poll);
                 if (string_buffer_concat(buffer, part, start,
                                          start + count)) {
@@ -38207,50 +38467,83 @@ static JSValue tilefinch_compact_eval_rope(JSContext *ctx,
                     return JS_EXCEPTION;
                 }
                 start += count;
-                work_since_poll += count;
-                if (work_since_poll ==
+                scan.work_since_poll += count;
+                if (scan.work_since_poll ==
                         JS_STRING_REPEAT_EVAL_POLL_INTERVAL) {
-                    work_since_poll = 0;
+                    scan.work_since_poll = 0;
                     if (__js_poll_interrupts(ctx)) {
                         string_buffer_free(buffer);
                         return JS_EXCEPTION;
                     }
                 }
             }
+            part = string_rope_iter_next(&iterator);
         }
-        return string_buffer_end(buffer);
+        {
+            JSValue result = string_buffer_end(buffer);
+#ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+            ctx->rt->last_eval_rope_physical_work = scan.physical_work;
+#endif
+            return result;
+        }
     }
 }
+
+#undef TILEFINCH_EVAL_PHYSICAL_WORK
 
 static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
                              JSValueConst val, int flags, int scope_idx)
 {
-    JSValue ret, compact = JS_UNDEFINED;
+    JSValue ret, compact = JS_UNDEFINED, host_code = JS_UNDEFINED;
+    JSValueConst code = val;
     const char *str;
     size_t len;
     uint32_t first_line_column = 0;
 
-    if (!JS_IsString(val))
-        return JS_DupValue(ctx, val);
-    if (JS_VALUE_GET_TAG(val) == JS_TAG_STRING_ROPE
-        && JS_VALUE_GET_STRING_ROPE(val)->len
+    if (!JS_IsString(code) && ctx->host_get_code_for_eval != NULL) {
+        int transformed = ctx->host_get_code_for_eval(
+            ctx, code, &host_code, ctx->host_get_code_for_eval_opaque);
+        if (transformed < 0)
+            return JS_EXCEPTION;
+        if (transformed > 0) {
+            if (!JS_IsString(host_code)) {
+                JS_FreeValue(ctx, host_code);
+                return JS_ThrowInternalError(
+                    ctx, "HostGetCodeForEval returned a non-string value");
+            }
+            code = host_code;
+        }
+    }
+    if (!JS_IsString(code))
+        return JS_DupValue(ctx, code);
+    if (unlikely(!ctx->dynamic_code_enabled)) {
+        JS_FreeValue(ctx, host_code);
+        return JS_ThrowTypeError(
+            ctx, "dynamic code compilation disabled by Content Security Policy");
+    }
+    if (JS_VALUE_GET_TAG(code) == JS_TAG_STRING_ROPE
+        && JS_VALUE_GET_STRING_ROPE(code)->len
                >= JS_STRING_REPEAT_ROPE_THRESHOLD
         && ctx->eval_internal == __JS_EvalInternal) {
-        compact = tilefinch_compact_eval_rope(ctx, val,
+        compact = tilefinch_compact_eval_rope(ctx, code,
                                                &first_line_column);
-        if (JS_IsException(compact))
+        if (JS_IsException(compact)) {
+            JS_FreeValue(ctx, host_code);
             return compact;
+        }
     }
     str = JS_ToCStringLen(ctx, &len,
-                          JS_IsUndefined(compact) ? val : compact);
+                          JS_IsUndefined(compact) ? code : compact);
     if (!str) {
         JS_FreeValue(ctx, compact);
+        JS_FreeValue(ctx, host_code);
         return JS_EXCEPTION;
     }
     ret = JS_EvalInternalWithColumn(ctx, this_obj, str, len, "<input>",
                                     flags, scope_idx, first_line_column);
     JS_FreeCString(ctx, str);
     JS_FreeValue(ctx, compact);
+    JS_FreeValue(ctx, host_code);
     return ret;
 }
 
@@ -40890,8 +41183,6 @@ static JSValue JS_NewCConstructor(JSContext *ctx, int class_id, const char *name
 static JSValue js_global_eval(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
-    if (unlikely(!ctx->dynamic_code_enabled))
-        return JS_ThrowTypeError(ctx, "dynamic code compilation disabled by Content Security Policy");
     return JS_EvalObject(ctx, js_global_this(ctx), argv[0], JS_EVAL_TYPE_INDIRECT, -1);
 }
 

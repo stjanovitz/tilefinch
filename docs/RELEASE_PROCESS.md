@@ -69,12 +69,15 @@ decoder add-on is user-managed and is not a release asset.
 ## Public source preparation
 
 Before the next public squash/push, preserve the complete development history
-in the private backup. Exclude `docs/engineering/BROWSING_JOURNEYS.md` from
-the public release tree: it is a private investigation log, not public
-documentation. Remove or replace public documentation links to that log, and
-verify it is absent from the prospective public commit and source archive
-before publishing. Keep the log in the private backup for future development.
-This requirement does not authorize rewriting already-published history.
+in the private backup. Keep raw browsing journeys and per-release development
+or maintenance journals in the private work area, not under `docs/engineering/`
+in the public tree. In particular, public commits must not contain
+`BROWSING_JOURNEYS.md` or any `RELEASE_*_CHECKS.md` file. The ignore rules
+prevent ordinary staging, and the cut script rejects a prospective release if
+one was force-added.
+Remove or replace public documentation links to private logs before publishing,
+while retaining the logs in the private backup for future development. This
+requirement does not authorize rewriting already-published history.
 
 ## Step 1 — finalize the changelog
 

@@ -547,12 +547,18 @@
             (label.contains(element) || (id && label.htmlFor === id))
           )
             labels.push(label);
-        Object.defineProperty(labels, "item", {
+        const result = Object.create(NodeList.prototype);
+        for (let index = 0; index < labels.length; index++)
+          Object.defineProperty(result, index, {
+            configurable: true,
+            enumerable: true,
+            value: labels[index],
+          });
+        Object.defineProperty(result, "length", {
           configurable: true,
-          value: (index) => labels[Number(index)] ?? null,
+          value: labels.length,
         });
-        Object.setPrototypeOf(labels, NodeList.prototype);
-        return labels;
+        return result;
       },
       shadowIncludingDescendant = (candidate, target) => {
         for (
@@ -994,6 +1000,13 @@
           "@import is not allowed in constructed stylesheets",
           "SyntaxError",
         );
+      const parsed = new CSSStyleSheet();
+      parsed.replaceSync(rule);
+      if (parsed.__rules.length !== 1)
+        throw new DOMException(
+          "insertRule requires exactly one rule",
+          "SyntaxError",
+        );
       if (this.__rules.length >= 1024)
         throw new DOMException(
           "Stylesheet rule limit reached",
@@ -1004,7 +1017,7 @@
           "Stylesheet exceeds bounded size",
           "QuotaExceededError",
         );
-      this.__rules.splice(index, 0, rule.trim());
+      this.__rules.splice(index, 0, parsed.__rules[0]);
       this.__sync();
       return index;
     }

@@ -2,6 +2,7 @@
 #include "tilefinch/budget_quickjs.h"
 #include "tilefinch/fetch.h"
 #include "tilefinch/request_context.h"
+#include "tilefinch/resource_integrity.h"
 #include "tilefinch/script_lazy.h"
 #include "tilefinch/style.h"
 #include "tilefinch/platform.h"
@@ -37,6 +38,10 @@
 #include <lexbor/html/interfaces/template_element.h>
 #include <lexbor/html/interfaces/element.h>
 #include <lexbor/html/serialize.h>
+
+#if defined(CONFIG_PROPERTY_FAULT_TRACE)
+static void runtime_configure_property_fault_trace(JSRuntime *runtime);
+#endif
 
 /* The runtime remains one translation unit: these ordered private seams keep
    QuickJS/DOM state static while separating responsibilities for review. */

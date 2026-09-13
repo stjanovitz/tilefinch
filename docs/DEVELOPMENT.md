@@ -994,6 +994,12 @@ the source position, function, bytecode position/opcode, base and key types,
 property preview, arguments, locals, and nearby bytecode. The diagnostic is
 for reducing a failure to the first invalid value; it must not be used to
 rewrite third-party source or manufacture browser capabilities.
+Set the value to `absent` to suppress reads of missing properties and record
+only failed JavaScript `in` checks. This keeps feature-detection traces useful
+when ordinary optional-property reads would otherwise consume the record cap.
+Set it to `fault` to record only accesses whose base is `null` or `undefined`;
+this isolates the operation that throws after long-running third-party code
+without spending the bounded record budget on ordinary feature detection.
 
 `TILEFINCH_TRACE_FRAME_MESSAGES=2048` independently records bounded frame
 `postMessage` JSON (256--65,536 characters). It is available in trace-enabled
