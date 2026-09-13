@@ -3992,7 +3992,7 @@
                 true,
                 Event.AT_TARGET,
               );
-              if (!event.__immediateStopped)
+              if (!event.__stopped)
                 globalThis.__tilefinchInvokeEventTarget(
                   this,
                   event,
@@ -5999,6 +5999,7 @@
     event,
     item,
     errorObserver,
+    deferException = false,
   ) => {
     /* DOM removes a once listener before calling it. This matters when the
        callback dispatches recursively or registers itself again: the new
@@ -6037,12 +6038,21 @@
         );
       }
     } catch (error) {
+      if (deferException) return { error, item, list };
       if (typeof errorObserver === "function")
         try { errorObserver(error, item, list); } catch (_) {}
       __tilefinchReportUncaught(error, "event " + event.type);
     } finally {
       event.__passive = false;
     }
+    return null;
+  };
+  const reportListenerException = (pending, event, errorObserver) => {
+    if (typeof errorObserver === "function")
+      try {
+        errorObserver(pending.error, pending.item, pending.list);
+      } catch (_) {}
+    __tilefinchReportUncaught(pending.error, "event " + event.type);
   };
   globalThis.__tilefinchInvokeListenerList = (
     map,
@@ -6114,7 +6124,7 @@
       globalThis.__tilefinchInvokeWindowEvent?.(value, true);
     if (!value.__stopped) {
       globalThis.__tilefinchInvokeDocumentEvent(value, true);
-      if (!value.__immediateStopped)
+      if (!value.__stopped)
         globalThis.__tilefinchInvokeDocumentEvent(value, false);
     }
     if (value.bubbles && !value.__stopped)
@@ -6164,9 +6174,11 @@
       betweenPhases,
       complete,
     ) => {
-      const map = mapFor(target),
-        live = map.get(String(event.type)) || [],
-        listeners = [...live];
+      const map = mapFor(target);
+      let live = map.get(String(event.type)) || [],
+        listeners = [...live],
+        refreshBubbleListeners = false,
+        pendingException = null;
       let completed = false,
         listenerPhase = 0,
         index = 0;
@@ -6186,6 +6198,13 @@
         resume = () => {
           if (completed) return;
           try {
+            if (pendingException) {
+              const pending = pendingException;
+              pendingException = null;
+              reportListenerException(pending, event, errorObserver);
+              queueResume(resume);
+              return;
+            }
             if (event.__immediateStopped) {
               finish();
               return;
@@ -6193,12 +6212,25 @@
             if (listenerPhase === 1) {
               listenerPhase = 2;
               index = 0;
+              refreshBubbleListeners = true;
               if (typeof betweenPhases === "function") {
                 betweenPhases();
-                if (event.__immediateStopped) finish();
-                else queueResume(resume);
+                queueResume(resume);
                 return;
               }
+            }
+            if (listenerPhase === 2 && event.__stopped) {
+              finish();
+              return;
+            }
+            /* DOM invokes target capture and target bubble as separate
+               listener-list invocations. A bubble listener installed by a
+               capture listener therefore joins this dispatch, while a new
+               capture listener waits for the next one. */
+            if (refreshBubbleListeners) {
+              live = map.get(String(event.type)) || [];
+              listeners = [...live];
+              refreshBubbleListeners = false;
             }
             const capture = listenerPhase === 0;
             while (index < listeners.length) {
@@ -6206,13 +6238,19 @@
               if (!item.active || item.capture !== capture) continue;
               event.currentTarget = target;
               event.eventPhase = phase;
-              invokeListenerItem(
-                map, live, target, event, item, errorObserver);
-              if (event.__immediateStopped) finish();
-              else queueResume(resume);
+              pendingException = invokeListenerItem(
+                map, live, target, event, item, errorObserver, true);
+              /* The continuation is also the HTML cleanup-after-script
+                 checkpoint. Even a stopped event or a thrown listener keeps
+                 its dispatch state until that checkpoint has completed. */
+              queueResume(resume);
               return;
             }
             if (listenerPhase === 0) {
+              if (event.__stopped) {
+                finish();
+                return;
+              }
               listenerPhase = 1;
               resume();
               return;
@@ -6266,7 +6304,7 @@
         value.currentTarget = this;
         value.eventPhase = 2;
         globalThis.__tilefinchInvokeListenerList(map, this, value, true);
-        if (!value.__immediateStopped)
+        if (!value.__stopped)
           globalThis.__tilefinchInvokeListenerList(map, this, value, false);
       }
       globalThis.__tilefinchFinishEventDispatch(value);
@@ -6296,7 +6334,7 @@
           true,
           Event.AT_TARGET,
         );
-        if (!event.__immediateStopped)
+        if (!event.__stopped)
           globalThis.__tilefinchInvokeEventTarget(
             this,
             event,
@@ -7275,7 +7313,7 @@
     globalThis.__tilefinchPrepareEvent(value, globalThis, path);
     if (!value.__stopped) {
       globalThis.__tilefinchInvokeWindowEvent(value, true);
-      if (!value.__immediateStopped)
+      if (!value.__stopped)
         globalThis.__tilefinchInvokeWindowEvent(value, false);
     }
     globalThis.__tilefinchFinishEventDispatch(value);
