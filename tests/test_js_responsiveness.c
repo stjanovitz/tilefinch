@@ -1595,7 +1595,7 @@ int main(int argc, char **argv)
     CHECK(hardening_ok
           && strcmp(result.summary, "REALM-HARDENING-OK") == 0);
 
-    puts("test: native event listeners finish before microtasks run");
+    puts("test: native event listeners checkpoint microtasks between callbacks");
     static const char native_event_order_setup[] =
         "globalThis.__nativeEventOrder=[];"
         "addEventListener('message',()=>{"
@@ -1612,7 +1612,7 @@ int main(int argc, char **argv)
               runtime,
               "globalThis.pocSummary=__nativeEventOrder.join(',')",
               "<native-event-order-result>", &result)
-          && strcmp(result.summary, "first,second,microtask") == 0);
+          && strcmp(result.summary, "first,microtask,second") == 0);
 
     puts("test: exception formatting cannot poison the runtime");
     static const char hostile_exception_probe[] =
