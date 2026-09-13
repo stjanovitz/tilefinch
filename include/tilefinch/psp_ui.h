@@ -317,7 +317,8 @@ typedef enum {
     PSP_UI_SETTING_UPDATE_CHANNEL,
     PSP_UI_SETTING_GAMEPAD_FACE_MAPPING,
     PSP_UI_SETTING_SAVE_PLAYBACK_POSITIONS,
-    PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS
+    PSP_UI_SETTING_CLEAR_PLAYBACK_POSITIONS,
+    PSP_UI_SETTING_SAVE_DIAGNOSTIC_REPORTS
 } PspUiSettingId;
 
 typedef union {
@@ -610,6 +611,9 @@ typedef struct {
     uint16_t loading_phase : 10;
     /* Uses a spare bit in the bounded phase counter, not another UI byte. */
     uint16_t page_activation_busy : 1;
+    /* Opt-in storage policy; packed beside the bounded loading phase so an
+       uncommon setting does not enlarge every composed UI snapshot. */
+    uint16_t save_diagnostic_reports : 1;
     uint8_t overlay_animation_frames;
     uint8_t toast_entry_frames;
     /* Focus-settle budget from the theme sheet; drives the focus ring only. */

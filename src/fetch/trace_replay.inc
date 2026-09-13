@@ -30,7 +30,7 @@ static bool trace_parse_security_metadata(
         || allow_credentials > FETCH_SECURITY_FIELD_TRUNCATED
         || credentials_value > 1u
         || corp_state > FETCH_SECURITY_FIELD_TRUNCATED
-        || corp > TILEFINCH_CORP_SAME_SITE
+        || corp > TILEFINCH_CORP_CROSS_ORIGIN
         || nosniff_state > FETCH_SECURITY_FIELD_TRUNCATED
         || nosniff > 1u || hsts_state > FETCH_SECURITY_FIELD_TRUNCATED
         || hsts_include > 1u || referrer > FETCH_SECURITY_FIELD_TRUNCATED
@@ -949,6 +949,31 @@ static bool trace_replay_response_with_scratch(
         && (recorded_header_count == SIZE_MAX
             || parsed_header_count == recorded_header_count);
     if (!record_integrity) {
+        if (trace_replay_diagnostics_enabled()) {
+            fprintf(
+                stderr,
+                "HTTP replay integrity record=%zu meta=%d version=%u "
+                "complete=%d/%d/%d/%d/%d/%d/%d success-state=%d "
+                "cors-taint=%d length=%d cookies=%zu/%zu/%d/%d "
+                "delay=%zu headers=%zu/%zu\n",
+                sequence, (int) meta_ok, trace_version,
+                (int) v6_complete, (int) v7_complete,
+                (int) v8_complete, (int) v9_complete,
+                (int) v10_complete, (int) v11_complete,
+                (int) v12_complete,
+                (int) !(recorded_success
+                        && (result->status_code == 0
+                            || result->trace_external_cancel
+                            || result->timed_out)),
+                (int) (request == NULL || !request->enforce_cors
+                       || redirect_origin_tainted_seen),
+                (int) (recorded_length != SIZE_MAX),
+                result->set_cookie_count, cookie_count,
+                (int) cookie_values_complete,
+                (int) (trace_version < 4 || cookie_urls_complete),
+                result->trace_delay_pumps, parsed_header_count,
+                recorded_header_count);
+        }
         snprintf(result->error, sizeof(result->error),
                  "HTTP replay record %zu metadata is corrupt", sequence);
         return false;

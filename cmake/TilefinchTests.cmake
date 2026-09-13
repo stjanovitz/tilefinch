@@ -45,6 +45,12 @@ if(PSP_BROWSER_BUILD_TESTS)
                 ${CMAKE_CURRENT_SOURCE_DIR})
         set_tests_properties(tilefinch-diagnostic-switch-registry-tests
             PROPERTIES LABELS "tilefinch;unit;architecture" TIMEOUT 20)
+        add_test(NAME tilefinch-public-tree-hygiene-tests
+            COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_public_tree_hygiene.py
+                ${CMAKE_CURRENT_SOURCE_DIR})
+        set_tests_properties(tilefinch-public-tree-hygiene-tests PROPERTIES
+            LABELS "tilefinch;unit;release;tooling" TIMEOUT 10)
         add_test(NAME tilefinch-psp-sdk-contract-tests
             COMMAND ${Python3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_psp_sdk_contracts.py
@@ -769,6 +775,34 @@ if(PSP_BROWSER_BUILD_TESTS)
         TIMEOUT 15)
 
     if(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE)
+        add_test(NAME tilefinch-property-miss-trace-tests
+            COMMAND psp-browser-interactive-lab
+                --fixture
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/property_miss_trace.html
+                --no-external-resources
+                --ticks 1
+                --no-loop-capture)
+        set_tests_properties(tilefinch-property-miss-trace-tests PROPERTIES
+            ENVIRONMENT "TILEFINCH_TRACE_JS_PROPERTY_FAULTS=16"
+            PASS_REGULAR_EXPRESSION
+                "quickjs-property-miss.*base=object.*property=\\\"optionalStandardFeature\\\""
+            LABELS "tilefinch;unit;javascript;diagnostic"
+            TIMEOUT 10)
+
+        add_test(NAME tilefinch-property-absent-trace-tests
+            COMMAND psp-browser-interactive-lab
+                --fixture
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/property_miss_trace.html
+                --no-external-resources
+                --ticks 1
+                --no-loop-capture)
+        set_tests_properties(tilefinch-property-absent-trace-tests PROPERTIES
+            ENVIRONMENT "TILEFINCH_TRACE_JS_PROPERTY_FAULTS=absent"
+            PASS_REGULAR_EXPRESSION
+                "quickjs-property-absent.*base=object.*property=\\\"<string:12:missingViaIn>\\\""
+            LABELS "tilefinch;unit;javascript;diagnostic"
+            TIMEOUT 10)
+
         add_test(NAME tilefinch-property-fault-trace-tests
             COMMAND psp-browser-interactive-lab
                 --fixture
@@ -777,9 +811,38 @@ if(PSP_BROWSER_BUILD_TESTS)
                 --ticks 1
                 --no-loop-capture)
         set_tests_properties(tilefinch-property-fault-trace-tests PROPERTIES
-            ENVIRONMENT "TILEFINCH_TRACE_JS_PROPERTY_FAULTS=2"
+            ENVIRONMENT "TILEFINCH_TRACE_JS_PROPERTY_FAULTS=16"
             PASS_REGULAR_EXPRESSION
-                "quickjs-property-fault seq=1.*base=undefined.*property=\\\"<string:12:computed-key>\\\""
+                "quickjs-property-fault.*base=undefined.*property=\\\"<string:12:computed-key>\\\""
+            LABELS "tilefinch;unit;javascript;diagnostic"
+            TIMEOUT 10)
+
+        add_test(NAME tilefinch-property-fault-only-trace-tests
+            COMMAND psp-browser-interactive-lab
+                --fixture
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/property_fault_trace.html
+                --no-external-resources
+                --ticks 1
+                --no-loop-capture)
+        set_tests_properties(tilefinch-property-fault-only-trace-tests PROPERTIES
+            ENVIRONMENT "TILEFINCH_TRACE_JS_PROPERTY_FAULTS=fault"
+            PASS_REGULAR_EXPRESSION
+                "quickjs-property-fault.*base=undefined.*property=\\\"<string:12:computed-key>\\\""
+            FAIL_REGULAR_EXPRESSION "quickjs-property-miss"
+            LABELS "tilefinch;unit;javascript;diagnostic"
+            TIMEOUT 10)
+
+        add_test(NAME tilefinch-property-write-fault-trace-tests
+            COMMAND psp-browser-interactive-lab
+                --fixture
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/property_fault_trace.html
+                --no-external-resources
+                --ticks 1
+                --no-loop-capture)
+        set_tests_properties(tilefinch-property-write-fault-trace-tests PROPERTIES
+            ENVIRONMENT "TILEFINCH_TRACE_JS_PROPERTY_FAULTS=16"
+            PASS_REGULAR_EXPRESSION
+                "quickjs-property-fault.*base=undefined.*property=\\\"<string:12:write-target>\\\""
             LABELS "tilefinch;unit;javascript;diagnostic"
             TIMEOUT 10)
     endif()

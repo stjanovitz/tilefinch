@@ -1,3 +1,42 @@
+/* HTML's HostGetCodeForEval operation unwraps only authentic TrustedScript
+   instances.  The bootstrap helper is non-configurable and validates its
+   private WeakMap brand; ordinary objects therefore retain ECMAScript's
+   non-string eval behavior without invoking author coercion hooks. */
+#if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
+static int js_runtime_host_get_code_for_eval(
+    JSContext *context, JSValueConst input, JSValue *code_out, void *opaque)
+{
+    (void) opaque;
+    if (code_out == NULL) return -1;
+    *code_out = JS_UNDEFINED;
+    JSValue global = JS_GetGlobalObject(context);
+    if (JS_IsException(global)) return -1;
+    JSValue unwrap = JS_GetPropertyStr(
+        context, global, "__tilefinchTrustedScriptForEval");
+    JS_FreeValue(context, global);
+    if (JS_IsException(unwrap)) return -1;
+    if (!JS_IsFunction(context, unwrap)) {
+        JS_FreeValue(context, unwrap);
+        return 0;
+    }
+    JSValue result = JS_Call(context, unwrap, JS_UNDEFINED, 1, &input);
+    JS_FreeValue(context, unwrap);
+    if (JS_IsException(result)) return -1;
+    if (JS_IsUndefined(result)) {
+        JS_FreeValue(context, result);
+        return 0;
+    }
+    if (!JS_IsString(result)) {
+        JS_FreeValue(context, result);
+        JS_ThrowInternalError(
+            context, "TrustedScript eval hook returned a non-string value");
+        return -1;
+    }
+    *code_out = result;
+    return 1;
+}
+#endif
+
 static bool clock_source_argument(
     JSContext *context, int argc, JSValueConst *argv,
     ScriptDeterministicClockSource first,
@@ -142,6 +181,29 @@ static JSValue js_performance_sample(JSContext *context,
         context, performance_clock_value(bridge, false, source));
 }
 
+/* A negative value selects scheduler.js's caller-driven deterministic clock.
+   Otherwise the timer wheel uses this side-effect-free monotonic sample as its
+   sole clock. Keeping the domains disjoint prevents owner-supplied elapsed time
+   from charging callback wall time a second time. */
+static JSValue js_scheduler_now(JSContext *context,
+                                JSValueConst this_value,
+                                int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    (void) argc;
+    (void) argv;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->deterministic_clock
+        || !bridge->wall_clock_timers)
+        return JS_NewInt32(context, -1);
+    uint64_t current = js_rt_monotonic_time_ns();
+    double elapsed = current >= bridge->performance_origin_ns
+        ? (double) (current - bridge->performance_origin_ns)
+              / 1000000.0
+        : 0.0;
+    return JS_NewFloat64(context, elapsed);
+}
+
 static JSValue js_date_now(JSContext *context, JSValueConst this_value,
                            int argc, JSValueConst *argv)
 {
@@ -241,12 +303,21 @@ static JSValue js_post_message(JSContext *context,
     }
     int64_t target = 0;
     if (JS_ToInt64(context, &target, argv[0]) < 0) return JS_EXCEPTION;
-    size_t json_length = 0, origin_length = 0;
+    size_t json_length = 0, origin_length = 0, task_kind_length = 0;
     const char *json = JS_ToCStringLen(context, &json_length, argv[1]);
     const char *origin = JS_ToCStringLen(context, &origin_length, argv[2]);
-    if (json == NULL || origin == NULL) {
+    const char *task_kind = argc >= 4
+        ? JS_ToCStringLen(context, &task_kind_length, argv[3]) : NULL;
+    int64_t task_sequence = 0;
+    bool task_valid = argc < 4
+        || (task_kind != NULL && task_kind_length <= 96
+            && (argc < 5
+                || JS_ToInt64(context, &task_sequence, argv[4]) == 0)
+            && task_sequence >= 0);
+    if (json == NULL || origin == NULL || !task_valid) {
         if (json != NULL) JS_FreeCString(context, json);
         if (origin != NULL) JS_FreeCString(context, origin);
+        if (task_kind != NULL) JS_FreeCString(context, task_kind);
         return JS_EXCEPTION;
     }
     bool valid = json_length <= 65536 && origin_length <= 2048;
@@ -257,7 +328,9 @@ static JSValue js_post_message(JSContext *context,
     bool queued = valid && (bridge->post_message == NULL
         || bridge->post_message(
             bridge->post_message_opaque, bridge->host, (long) target,
-            json, origin));
+            json, origin, task_kind == NULL ? "unknown" : task_kind,
+            (uint64_t) task_sequence));
+    if (task_kind != NULL) JS_FreeCString(context, task_kind);
     JS_FreeCString(context, origin);
     JS_FreeCString(context, json);
     if (!queued) return JS_ThrowInternalError(context,
@@ -714,6 +787,8 @@ static JSValue js_frame_scope(JSContext *context, JSValueConst this_value,
         JS_SetContextOpaque(realm, bridge);
 #if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
         JS_SetDynamicCodeEnabled(realm, bridge->dynamic_code_allowed);
+        JS_SetHostGetCodeForEval(
+            realm, js_runtime_host_get_code_for_eval, NULL);
 #endif
         JSValue global = JS_GetGlobalObject(realm);
         host->frame_realms[i].context = realm;
@@ -1293,7 +1368,52 @@ static JSValue js_crypto_random_fill(JSContext *context,
         return JS_ThrowInternalError(context,
                                      "secure random source unavailable");
     }
+    if (bridge != NULL && bridge->result != NULL) {
+        js_rt_saturating_add_size(&bridge->result->crypto_random_calls, 1u);
+        js_rt_saturating_add_size(&bridge->result->crypto_random_bytes,
+                                  length);
+    }
     return JS_DupValue(context, argv[0]);
+}
+
+/* Private structured-clone primitive. JavaScript validates the transferable
+   with the captured ArrayBuffer byteLength getter before calling this sink;
+   repeat the native class check so a poisoned bootstrap cannot detach an
+   unrelated object. */
+static JSValue js_detach_array_buffer(JSContext *context,
+                                      JSValueConst this_value,
+                                      int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 1) {
+        return JS_ThrowTypeError(context, "ArrayBuffer transfer required");
+    }
+    size_t length = 0u;
+    uint8_t *bytes = JS_GetArrayBuffer(context, &length, argv[0]);
+    if (bytes == NULL && length != 0u) return JS_EXCEPTION;
+    if (bytes == NULL) {
+        /* A valid zero-length ArrayBuffer returns NULL without an exception.
+           Calling byteLength through the platform's captured intrinsic has
+           already established the brand; clear only a native class error. */
+        JSValue exception = JS_GetException(context);
+        if (!JS_IsUndefined(exception) && !JS_IsNull(exception)) {
+            JS_FreeValue(context, exception);
+            return JS_ThrowTypeError(context, "ArrayBuffer transfer required");
+        }
+        JS_FreeValue(context, exception);
+    }
+    JS_DetachArrayBuffer(context, argv[0]);
+    return JS_UNDEFINED;
+}
+
+/* Structured clone must reject Proxy objects without executing any of their
+   traps. JavaScript reflection cannot perform that brand check safely. */
+static JSValue js_is_proxy(JSContext *context, JSValueConst this_value,
+                           int argc, JSValueConst *argv)
+{
+    (void) context;
+    (void) this_value;
+    return JS_NewBool(context, argc > 0 && JS_IsProxy(argv[0]));
 }
 
 static JSValue js_crypto_digest_sha256(JSContext *context,
@@ -1304,29 +1424,78 @@ static JSValue js_crypto_digest_sha256(JSContext *context,
     if (argc < 1) {
         return JS_ThrowTypeError(context, "SHA-256 digest requires a byte view");
     }
-    size_t offset = 0, length = 0, bytes_per_element = 0;
-    JSValue buffer = JS_GetTypedArrayBuffer(context, argv[0], &offset,
-                                            &length, &bytes_per_element);
-    if (JS_IsException(buffer)) return buffer;
-    size_t buffer_length = 0;
-    const uint8_t *bytes = JS_GetArrayBuffer(context, &buffer_length, buffer);
-    bool valid = (bytes != NULL || buffer_length == 0)
-        && offset <= buffer_length && length <= buffer_length - offset;
-    if (!valid) {
-        JS_FreeValue(context, buffer);
-        return JS_ThrowTypeError(context, "invalid digest byte view");
+    size_t length = 0;
+    const uint8_t *bytes = NULL;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    ScriptRuntime *host = bridge == NULL ? NULL : bridge->host;
+    JSContext *candidates[1u + SCRIPT_FRAME_REALM_LIMIT
+                             + SCRIPT_WORKER_REALM_LIMIT];
+    size_t candidate_count = 0u;
+    candidates[candidate_count++] = context;
+    if (host != NULL) {
+        for (size_t i = 0; i < SCRIPT_FRAME_REALM_LIMIT; i++) {
+            JSContext *candidate = host->frame_realms[i].context;
+            if (candidate != NULL && candidate != context)
+                candidates[candidate_count++] = candidate;
+        }
+        for (size_t i = 0; i < SCRIPT_WORKER_REALM_LIMIT; i++) {
+            JSContext *candidate = host->worker_realms[i].context;
+            if (candidate != NULL && candidate != context)
+                candidates[candidate_count++] = candidate;
+        }
     }
+    for (size_t i = 0; i < candidate_count && bytes == NULL; i++) {
+        JSContext *candidate = candidates[i];
+        size_t raw_length = 0;
+        bytes = JS_GetArrayBuffer(candidate, &raw_length, argv[0]);
+        if (bytes != NULL) {
+            length = raw_length;
+            break;
+        }
+        JSValue exception = JS_GetException(candidate);
+        JS_FreeValue(candidate, exception);
+        size_t offset = 0, view_length = 0, bytes_per_element = 0;
+        JSValue buffer = JS_GetTypedArrayBuffer(
+            candidate, argv[0], &offset, &view_length, &bytes_per_element);
+        (void) bytes_per_element;
+        if (JS_IsException(buffer)) {
+            exception = JS_GetException(candidate);
+            JS_FreeValue(candidate, exception);
+            continue;
+        }
+        size_t buffer_length = 0;
+        const uint8_t *buffer_bytes = JS_GetArrayBuffer(
+            candidate, &buffer_length, buffer);
+        bool valid = (buffer_bytes != NULL || buffer_length == 0)
+            && offset <= buffer_length
+            && view_length <= buffer_length - offset;
+        if (valid) {
+            bytes = buffer_bytes;
+            if (offset != 0u) bytes += offset;
+            length = view_length;
+        }
+        JS_FreeValue(candidate, buffer);
+        if (!valid) {
+            exception = JS_GetException(candidate);
+            JS_FreeValue(candidate, exception);
+        }
+    }
+    if (bytes == NULL && length == 0u)
+        return JS_ThrowTypeError(context, "BufferSource required");
     if (length > SCRIPT_CRYPTO_DIGEST_INPUT_LIMIT) {
-        JS_FreeValue(context, buffer);
         return JS_ThrowRangeError(context,
                                   "digest input exceeds bounded size");
     }
     uint8_t digest[TILEFINCH_SHA256_DIGEST_BYTES];
-    const uint8_t *input = length == 0 ? NULL : bytes + offset;
+    const uint8_t *input = length == 0 ? NULL : bytes;
     bool digested = tilefinch_sha256_digest(input, length, digest);
-    JS_FreeValue(context, buffer);
     if (!digested) {
         return JS_ThrowInternalError(context, "SHA-256 digest failed");
+    }
+    if (bridge != NULL && bridge->result != NULL) {
+        js_rt_saturating_add_size(&bridge->result->crypto_digest_calls, 1u);
+        js_rt_saturating_add_size(&bridge->result->crypto_digest_bytes,
+                                  length);
     }
     return JS_NewArrayBufferCopy(context, digest, sizeof(digest));
 }
@@ -1375,6 +1544,42 @@ static bool js_compression_buffer_source(
     *length = view_length;
     *owner = buffer;
     return true;
+}
+
+/* Blob-URL Fetch bypasses the network scheduler, so it cannot use the
+   completion-time SRI check in event_loop.inc. Keep that local fast path
+   fail-closed through the same bounded native verifier instead of silently
+   accepting integrity metadata it advertised. */
+static JSValue js_resource_integrity_verify(
+    JSContext *context, JSValueConst this_value,
+    int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 2) {
+        return JS_ThrowTypeError(
+            context, "integrity metadata and BufferSource required");
+    }
+    size_t metadata_length = 0;
+    const char *metadata = JS_ToCStringLen(
+        context, &metadata_length, argv[0]);
+    if (metadata == NULL) return JS_EXCEPTION;
+    const uint8_t *bytes = NULL;
+    size_t length = 0;
+    JSValue owner = JS_UNDEFINED;
+    bool valid = metadata_length <= TILEFINCH_INTEGRITY_METADATA_LIMIT
+        && strlen(metadata) == metadata_length
+        && js_compression_buffer_source(
+            context, argv[1], &bytes, &length, &owner);
+    TilefinchIntegrityResult result = TILEFINCH_INTEGRITY_INVALID;
+    if (valid) {
+        result = tilefinch_resource_integrity_verify(
+            metadata, metadata_length, bytes, length);
+    }
+    bool threw = JS_HasException(context);
+    JS_FreeValue(context, owner);
+    JS_FreeCString(context, metadata);
+    if (threw) return JS_EXCEPTION;
+    return JS_NewInt32(context, (int32_t) result);
 }
 
 static int js_compression_window_bits(const char *format, size_t length)
@@ -1752,6 +1957,31 @@ static JSValue js_callback_checkpoint(JSContext *context,
     return js_rt_throw_task_interruption(context, message);
 }
 
+static JSValue js_queue_checkpoint_continuation(
+    JSContext *context, JSValueConst this_value, int argc,
+    JSValueConst *argv)
+{
+    (void) this_value;
+    DomBridge *bridge = JS_GetContextOpaque(context);
+    if (bridge == NULL || bridge->host == NULL)
+        return JS_ThrowInternalError(context, "script runtime is unavailable");
+    if (argc != 1 || !JS_IsFunction(context, argv[0]))
+        return JS_ThrowTypeError(context, "callback required");
+    ScriptRuntime *runtime = bridge->host;
+    if (runtime->checkpoint_continuation_count
+            >= SCRIPT_CHECKPOINT_CONTINUATION_LIMIT) {
+        return JS_ThrowRangeError(
+            context, "checkpoint continuation limit reached");
+    }
+    size_t tail = ((size_t) runtime->checkpoint_continuation_head
+                   + runtime->checkpoint_continuation_count)
+                % SCRIPT_CHECKPOINT_CONTINUATION_LIMIT;
+    runtime->checkpoint_continuations[tail] =
+        JS_DupValue(context, argv[0]);
+    runtime->checkpoint_continuation_count++;
+    return JS_UNDEFINED;
+}
+
 /* Event-handler attributes are script, but they are not eval().  Compile the
    exact attribute body through this host-only path so CSP's unsafe-eval gate
    can remain closed while script-src's unsafe-inline decision is still
@@ -1832,8 +2062,11 @@ bool js_rt_install_function(JSContext *context, JSValue global,
             || strcmp(name, "__tilefinchMultiplayerAccept") == 0
             || strcmp(name, "__tilefinchMultiplayerAddRemoteCode") == 0
             || strcmp(name, "__tilefinchMultiplayerClose") == 0);
+    bool transient_bootstrap_bridge =
+        strcmp(name, "__tilefinchQueueCheckpointContinuation") == 0;
     int flags = test_network_override
-        ? JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE : 0;
+        ? JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE
+        : transient_bootstrap_bridge ? JS_PROP_CONFIGURABLE : 0;
     return JS_DefinePropertyValueStr(
                context, global, name, value, flags) >= 0;
 }

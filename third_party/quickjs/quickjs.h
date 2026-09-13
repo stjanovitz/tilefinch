@@ -370,6 +370,11 @@ JSRuntime *JS_NewRuntime(void);
 /* info lifetime must exceed that of rt */
 void JS_SetRuntimeInfo(JSRuntime *rt, const char *info);
 void JS_SetMemoryLimit(JSRuntime *rt, size_t limit);
+#ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+uint64_t JS_GetEvalRopePhysicalWork(JSRuntime *rt);
+uint64_t JS_GetGCRunCount(JSRuntime *rt);
+uint32_t JS_GetFastArrayCapacityForTest(JSValueConst value);
+#endif
 void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold);
 /* use 0 to disable maximum stack size check */
 void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
@@ -384,6 +389,10 @@ typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
 void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 void JS_RunGC(JSRuntime *rt);
 JS_BOOL JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
+/* Proxy is not serializable by the HTML structured-clone algorithm. Expose
+   the engine brand without invoking traps so the embedder can reject it
+   before reflecting over author-controlled keys. */
+JS_BOOL JS_IsProxy(JSValueConst obj);
 
 JSContext *JS_NewContext(JSRuntime *rt);
 void JS_FreeContext(JSContext *s);
@@ -392,6 +401,13 @@ void *JS_GetContextOpaque(JSContext *ctx);
 void JS_SetContextOpaque(JSContext *ctx, void *opaque);
 /* Host policy gate for page-originated eval and Function constructors. */
 void JS_SetDynamicCodeEnabled(JSContext *ctx, JS_BOOL enabled);
+/* HTML HostGetCodeForEval hook. Return 1 with an owned string in code_out,
+   0 to preserve ordinary non-string eval semantics, or -1 with an exception. */
+typedef int JSHostGetCodeForEval(JSContext *ctx, JSValueConst input,
+                                JSValue *code_out, void *opaque);
+void JS_SetHostGetCodeForEval(JSContext *ctx,
+                              JSHostGetCodeForEval *callback,
+                              void *opaque);
 /* Stop future jobs/calls without freeing storage under retained functions. */
 void JS_RetireContext(JSContext *ctx);
 /* Keep global bindings on their real object, but use this receiver. */

@@ -36,7 +36,9 @@ critical-ch=Sec-CH-UA-Arch
 server=fixture
 cf-ray=
 response-header-count=1
-set-cookie-count=1
+set-cookie-count=2
 set-cookie-0=retry_path=seen; Path=/challenge
 set-cookie-url-0=https://hinted.test/challenge
+set-cookie-1=cf_clearance=opaque; Secure; HttpOnly; Path=/challenge
+set-cookie-url-1=https://hinted.test/challenge
 response-header-0=content-type: text/html; charset=utf-8

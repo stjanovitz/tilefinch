@@ -27,12 +27,68 @@
   const trustedMapGet = Function.call.bind(Map.prototype.get),
     trustedMapSet = Function.call.bind(Map.prototype.set),
     trustedMapDelete = Function.call.bind(Map.prototype.delete),
+    trustedMapEntries = Function.call.bind(Map.prototype.entries),
+    trustedSetValues = Function.call.bind(Set.prototype.values),
+    trustedSetAdd = Function.call.bind(Set.prototype.add),
+    trustedDateTime = Function.call.bind(Date.prototype.getTime),
+    trustedRegExpSource = Function.call.bind(
+      Object.getOwnPropertyDescriptor(RegExp.prototype, "source").get,
+    ),
+    trustedRegExpFlags = Function.call.bind(
+      Object.getOwnPropertyDescriptor(RegExp.prototype, "flags").get,
+    ),
+    trustedArrayBufferByteLength = Function.call.bind(
+      Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get,
+    ),
+    trustedDataViewBuffer = Function.call.bind(
+      Object.getOwnPropertyDescriptor(DataView.prototype, "buffer").get,
+    ),
+    trustedDataViewByteOffset = Function.call.bind(
+      Object.getOwnPropertyDescriptor(DataView.prototype, "byteOffset").get,
+    ),
+    trustedDataViewByteLength = Function.call.bind(
+      Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get,
+    ),
+    trustedTypedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype),
+    trustedTypedArrayName = Function.call.bind(
+      Object.getOwnPropertyDescriptor(
+        trustedTypedArrayPrototype, Symbol.toStringTag,
+      ).get,
+    ),
+    trustedTypedArrayBuffer = Function.call.bind(
+      Object.getOwnPropertyDescriptor(trustedTypedArrayPrototype, "buffer").get,
+    ),
+    trustedTypedArrayByteOffset = Function.call.bind(
+      Object.getOwnPropertyDescriptor(
+        trustedTypedArrayPrototype, "byteOffset",
+      ).get,
+    ),
+    trustedTypedArrayLength = Function.call.bind(
+      Object.getOwnPropertyDescriptor(trustedTypedArrayPrototype, "length").get,
+    ),
+    trustedBooleanValue = Function.call.bind(Boolean.prototype.valueOf),
+    trustedNumberValue = Function.call.bind(Number.prototype.valueOf),
+    trustedStringValue = Function.call.bind(String.prototype.valueOf),
     trustedMapSize = Function.call.bind(
       Object.getOwnPropertyDescriptor(Map.prototype, "size").get,
+    ),
+    trustedSetSize = Function.call.bind(
+      Object.getOwnPropertyDescriptor(Set.prototype, "size").get,
     ),
     trustedWeakMapGet = Function.call.bind(WeakMap.prototype.get),
     trustedWeakMapSet = Function.call.bind(WeakMap.prototype.set),
     trustedUint8ArraySet = Function.call.bind(Uint8Array.prototype.set),
+    trustedObjectKeys = Object.keys,
+    trustedObjectPrototype = Object.getPrototypeOf,
+    trustedObjectDescriptor = Object.getOwnPropertyDescriptor,
+    trustedDefineProperty = Object.defineProperty,
+    trustedObjectTag = Function.call.bind(Object.prototype.toString),
+    trustedObjectIs = Object.is,
+    trustedArrayIsArray = Array.isArray,
+    trustedArrayFrom = Array.from,
+    trustedArrayBufferIsView = ArrayBuffer.isView,
+    trustedNumberIsNaN = Number.isNaN,
+    trustedNumberIsInteger = Number.isInteger,
     trustedStringSplit = Function.call.bind(String.prototype.split),
     trustedStringIndexOf = Function.call.bind(String.prototype.indexOf),
     trustedArrayJoin = Function.call.bind(Array.prototype.join),
@@ -40,11 +96,13 @@
   const trustedStringLower = Function.call.bind(String.prototype.toLowerCase);
   const trustedStringSlice = Function.call.bind(String.prototype.slice);
   const trustedCharCodeAt = Function.call.bind(String.prototype.charCodeAt);
+  const trustedPromiseResolve = Function.call.bind(Promise.resolve, Promise);
+  const trustedPromiseThen = Function.call.bind(Promise.prototype.then);
   if (globalThis.queueMicrotask === undefined)
     globalThis.queueMicrotask = (callback) => {
       if (typeof callback !== "function")
         throw new TypeError("callback required");
-      Promise.resolve().then(() => {
+      trustedPromiseThen(trustedPromiseResolve(), () => {
         try {
           globalThis.__tilefinchRunTask(
             "microtask",
@@ -57,6 +115,7 @@
         }
       });
     };
+  delete globalThis.__tilefinchQueueCheckpointContinuation;
   if (globalThis.CSS === undefined)
     globalThis.CSS = {
       escape(value) {
@@ -100,7 +159,30 @@
       },
     };
   {
-    const selectorBalanced = (selector) => {
+    const selectorPseudoClasses = new Set([
+        "active", "any-link", "autofill", "blank", "buffering", "checked",
+        "current", "default", "defined", "dir", "disabled", "empty",
+        "enabled", "first", "first-child", "first-of-type", "focus",
+        "focus-visible", "focus-within", "fullscreen", "future", "has",
+        "heading", "host", "host-context", "hover", "indeterminate",
+        "in-range", "invalid", "is", "lang", "last-child", "last-of-type",
+        "left", "link", "local-link", "modal", "muted", "not",
+        "nth-child", "nth-col", "nth-last-child", "nth-last-col",
+        "nth-last-of-type", "nth-of-type", "only-child", "only-of-type",
+        "open", "optional", "out-of-range", "past", "paused",
+        "picture-in-picture", "placeholder-shown", "playing", "popover-open",
+        "read-only", "read-write", "required", "right", "root", "scope",
+        "seeking", "stalled", "state", "target", "target-current",
+        "user-invalid", "user-valid", "valid", "visited", "volume-locked",
+        "where", "-webkit-any-link", "-webkit-autofill",
+        "-webkit-full-screen",
+      ]),
+      selectorPseudoElements = new Set([
+        "after", "backdrop", "before", "cue", "cue-region",
+        "file-selector-button", "first-letter", "first-line", "marker",
+        "part", "placeholder", "selection", "slotted",
+      ]),
+      selectorBalanced = (selector) => {
         const stack = [];
         let quote = "";
         for (let at = 0; at < selector.length; at++) {
@@ -112,6 +194,10 @@
           }
           if (char === '"' || char === "'") {
             quote = char;
+            continue;
+          }
+          if (char === "\\") {
+            at++;
             continue;
           }
           if (char === "(" || char === "[") stack.push(char);
@@ -126,13 +212,85 @@
         }
         return !quote && stack.length === 0;
       },
+      selectorListSegmentsValid = (selector) => {
+        let quote = "", squareDepth = 0, roundDepth = 0, segmentStart = 0;
+        for (let at = 0; at <= selector.length; at++) {
+          const char = selector[at] || ",";
+          if (quote) {
+            if (char === "\\") at++;
+            else if (char === quote) quote = "";
+            continue;
+          }
+          if (char === '"' || char === "'") {
+            quote = char;
+            continue;
+          }
+          if (char === "\\") {
+            at++;
+            continue;
+          }
+          if (char === "[") squareDepth++;
+          else if (char === "]") squareDepth--;
+          else if (char === "(") roundDepth++;
+          else if (char === ")") roundDepth--;
+          else if (char === "," && squareDepth === 0 && roundDepth === 0) {
+            if (!selector.slice(segmentStart, at).trim()) return false;
+            segmentStart = at + 1;
+          }
+        }
+        return true;
+      },
+      selectorPseudosValid = (selector) => {
+        let quote = "", squareDepth = 0;
+        for (let at = 0; at < selector.length; at++) {
+          const char = selector[at];
+          if (quote) {
+            if (char === "\\") at++;
+            else if (char === quote) quote = "";
+            continue;
+          }
+          if (char === '"' || char === "'") {
+            quote = char;
+            continue;
+          }
+          if (char === "\\") {
+            at++;
+            continue;
+          }
+          if (char === "[") {
+            squareDepth++;
+            continue;
+          }
+          if (char === "]") {
+            squareDepth--;
+            continue;
+          }
+          if (char !== ":" || squareDepth > 0) continue;
+          const pseudoElement = selector[at + 1] === ":";
+          if (pseudoElement) at++;
+          const start = at + 1;
+          if (selector[start] === "\\") continue;
+          let end = start;
+          while (end < selector.length && /[A-Za-z0-9_-]/.test(selector[end]))
+            end++;
+          if (end === start) return false;
+          const name = selector.slice(start, end).toLowerCase(),
+            known = pseudoElement
+              ? selectorPseudoElements.has(name)
+              : selectorPseudoClasses.has(name);
+          if (!known) return false;
+          at = end - 1;
+        }
+        return true;
+      },
       selectorSyntaxValid = (value) => {
         const selector = String(value).trim();
         return (
           !!selector &&
           selectorBalanced(selector) &&
+          selectorListSegmentsValid(selector) &&
+          selectorPseudosValid(selector) &&
           !/#\s/.test(selector) &&
-          !/:unknownpseudo\b/i.test(selector) &&
           !/:not\(\s*\)/i.test(selector) &&
           !/:not\([^)]*::/i.test(selector) &&
           !/:host\(:not\([^)]*\S\s+\S[^)]*\)\)/i.test(selector) &&
@@ -163,11 +321,19 @@
       elementQueryAll = Element.prototype.querySelectorAll,
       elementMatches = Element.prototype.matches,
       selectorList = (values) => {
-        Object.defineProperty(values, "item", {
-          value: (index) => values[Number(index)] ?? null,
+        const result = Object.create(NodeList.prototype),
+          length = Math.min(Number(values?.length) >>> 0, 16384);
+        for (let index = 0; index < length; index++)
+          Object.defineProperty(result, index, {
+            configurable: true,
+            enumerable: true,
+            value: values[index],
+          });
+        Object.defineProperty(result, "length", {
           configurable: true,
+          value: length,
         });
-        return values;
+        return result;
       },
       sameElement = (left, right) =>
         left === right ||
@@ -386,6 +552,13 @@
       if (typeof value === "function") nativeMethodSet.add(value);
       return value;
     };
+    Object.defineProperty(globalThis, "__tilefinchIsNativeFunction", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: (value) =>
+        typeof value === "function" && nativeMethodSet.has(value),
+    });
     Object.defineProperty(Function.prototype, "toString", {
       configurable: true,
       writable: true,
@@ -613,6 +786,145 @@
     globalThis.pocSummary =
       "form-submit solution=" + this.elements.namedItem("solution").value;
   };
+  const urlSearchParamLimit = 8192,
+    tilefinchUSVString = (value) => {
+      const text = String(value);
+      let output = "",
+        start = 0;
+      for (let index = 0; index < text.length; index++) {
+        const unit = text.charCodeAt(index);
+        if (unit >= 0xd800 && unit <= 0xdbff) {
+          const next = index + 1 < text.length
+            ? text.charCodeAt(index + 1) : 0;
+          if (next >= 0xdc00 && next <= 0xdfff) {
+            index++;
+            continue;
+          }
+        } else if (unit < 0xdc00 || unit > 0xdfff) continue;
+        output += text.slice(start, index) + "\ufffd";
+        start = index + 1;
+      }
+      return start ? output + text.slice(start) : text;
+    },
+    appendURLParamUTF8 = (bytes, codePoint) => {
+      if (codePoint <= 0x7f) bytes.push(codePoint);
+      else if (codePoint <= 0x7ff)
+        bytes.push(0xc0 | (codePoint >> 6), 0x80 | (codePoint & 0x3f));
+      else if (codePoint <= 0xffff)
+        bytes.push(
+          0xe0 | (codePoint >> 12),
+          0x80 | ((codePoint >> 6) & 0x3f),
+          0x80 | (codePoint & 0x3f),
+        );
+      else
+        bytes.push(
+          0xf0 | (codePoint >> 18),
+          0x80 | ((codePoint >> 12) & 0x3f),
+          0x80 | ((codePoint >> 6) & 0x3f),
+          0x80 | (codePoint & 0x3f),
+        );
+    },
+    urlParamHex = (unit) =>
+      unit >= 0x30 && unit <= 0x39 ? unit - 0x30
+        : unit >= 0x41 && unit <= 0x46 ? unit - 0x41 + 10
+          : unit >= 0x61 && unit <= 0x66 ? unit - 0x61 + 10 : -1,
+    decodeURLParamBytes = (bytes) => {
+      let output = "";
+      for (let index = 0; index < bytes.length;) {
+        const first = bytes[index];
+        let codePoint, count, firstLower = 0x80, firstUpper = 0xbf;
+        if (first <= 0x7f) {
+          codePoint = first;
+          count = 1;
+        } else if (first >= 0xc2 && first <= 0xdf) {
+          codePoint = first & 0x1f;
+          count = 2;
+        } else if (first >= 0xe0 && first <= 0xef) {
+          codePoint = first & 0x0f;
+          count = 3;
+          if (first === 0xe0) firstLower = 0xa0;
+          else if (first === 0xed) firstUpper = 0x9f;
+        } else if (first >= 0xf0 && first <= 0xf4) {
+          codePoint = first & 0x07;
+          count = 4;
+          if (first === 0xf0) firstLower = 0x90;
+          else if (first === 0xf4) firstUpper = 0x8f;
+        } else {
+          output += "\ufffd";
+          index++;
+          continue;
+        }
+        let invalidAt = 0;
+        for (let offset = 1;
+             offset < count && index + offset < bytes.length; offset++) {
+          const next = bytes[index + offset];
+          if (next < (offset === 1 ? firstLower : 0x80)
+              || next > (offset === 1 ? firstUpper : 0xbf)) {
+            invalidAt = offset;
+            break;
+          }
+          codePoint = (codePoint << 6) | (next & 0x3f);
+        }
+        if (invalidAt) {
+          output += "\ufffd";
+          index += invalidAt;
+          continue;
+        }
+        if (index + count > bytes.length) {
+          output += "\ufffd";
+          index = bytes.length;
+          continue;
+        }
+        output += trustedStringFromCodePoint(null, codePoint);
+        index += count;
+      }
+      return output;
+    },
+    decodeURLParam = (value) => {
+      const text = tilefinchUSVString(value).replace(/\+/g, " "),
+        bytes = [];
+      for (let index = 0; index < text.length;) {
+        const firstHex = text.charCodeAt(index) === 0x25 && index + 2 < text.length
+            ? urlParamHex(text.charCodeAt(index + 1)) : -1,
+          secondHex = firstHex >= 0 ? urlParamHex(text.charCodeAt(index + 2)) : -1;
+        if (secondHex >= 0) {
+          bytes.push((firstHex << 4) | secondHex);
+          index += 3;
+        } else {
+          const first = text.charCodeAt(index);
+          let codePoint = first,
+            units = 1;
+          if (first >= 0xd800 && first <= 0xdbff && index + 1 < text.length) {
+            const second = text.charCodeAt(index + 1);
+            if (second >= 0xdc00 && second <= 0xdfff) {
+              codePoint = 0x10000 + ((first - 0xd800) << 10)
+                + (second - 0xdc00);
+              units = 2;
+            }
+          }
+          appendURLParamUTF8(bytes, codePoint);
+          index += units;
+        }
+        if (bytes.length > 256 * 1024)
+          throw new RangeError("URLSearchParams input exceeds bounded size");
+      }
+      return decodeURLParamBytes(bytes);
+    },
+    urlParamIterator = (owner, kind) => {
+      let index = 0;
+      return {
+        next() {
+          if (index >= owner.items.length) return { done: true, value: undefined };
+          const pair = owner.items[index++];
+          return {
+            done: false,
+            value: kind === 0 ? [pair[0], pair[1]]
+              : kind === 1 ? pair[0] : pair[1],
+          };
+        },
+        [Symbol.iterator]() { return this; },
+      };
+    };
   class TilefinchURLSearchParams {
     constructor(query = "", changed = null) {
       this.items = [];
@@ -624,10 +936,7 @@
           const at = part.indexOf("=");
           const key = at < 0 ? part : part.slice(0, at),
             value = at < 0 ? "" : part.slice(at + 1);
-          this.items.push([
-            decodeURIComponent(key.replace(/\+/g, " ")),
-            decodeURIComponent(value.replace(/\+/g, " ")),
-          ]);
+          this._appendDecoded(key, value);
         }
         return;
       }
@@ -638,13 +947,13 @@
             throw new TypeError(
               "URLSearchParams sequence pair must contain exactly two items",
             );
-          this.items.push([String(values[0]), String(values[1])]);
+          this._append(tilefinchUSVString(values[0]), tilefinchUSVString(values[1]));
         }
         return;
       }
       if (query !== null && typeof query === "object") {
         for (const key of Object.keys(query))
-          this.items.push([String(key), String(query[key])]);
+          this._append(tilefinchUSVString(key), tilefinchUSVString(query[key]));
         return;
       }
       for (const part of String(query).replace(/^\?/, "").split("&")) {
@@ -652,50 +961,75 @@
         const at = part.indexOf("=");
         const key = at < 0 ? part : part.slice(0, at),
           value = at < 0 ? "" : part.slice(at + 1);
-        this.items.push([
-          decodeURIComponent(key.replace(/\+/g, " ")),
-          decodeURIComponent(value.replace(/\+/g, " ")),
-        ]);
+        this._appendDecoded(key, value);
+      }
+    }
+    _append(key, value) {
+      if (this.items.length >= urlSearchParamLimit)
+        throw new RangeError("URLSearchParams entry limit exceeded");
+      this.items.push([key, value]);
+    }
+    _appendDecoded(key, value) {
+      this._append(decodeURLParam(key), decodeURLParam(value));
+    }
+    _replace(query) {
+      this.items.length = 0;
+      for (const part of String(query).replace(/^\?/, "").split("&")) {
+        if (!part) continue;
+        const at = part.indexOf("=");
+        this._appendDecoded(
+          at < 0 ? part : part.slice(0, at),
+          at < 0 ? "" : part.slice(at + 1),
+        );
       }
     }
     append(key, value) {
-      this.items.push([String(key), String(value)]);
+      this._append(tilefinchUSVString(key), tilefinchUSVString(value));
       this.notify();
     }
-    delete(key) {
-      key = String(key);
-      this.items = this.items.filter((pair) => pair[0] !== key);
+    delete(key, value) {
+      key = tilefinchUSVString(key);
+      const matchValue = arguments.length > 1,
+        wanted = matchValue ? tilefinchUSVString(value) : "";
+      for (let index = this.items.length - 1; index >= 0; index--)
+        if (this.items[index][0] === key
+            && (!matchValue || this.items[index][1] === wanted))
+          this.items.splice(index, 1);
       this.notify();
     }
     get(key) {
-      key = String(key);
+      key = tilefinchUSVString(key);
       const pair = this.items.find((item) => item[0] === key);
       return pair ? pair[1] : null;
     }
     getAll(key) {
-      key = String(key);
+      key = tilefinchUSVString(key);
       return this.items
         .filter((item) => item[0] === key)
         .map((item) => item[1]);
     }
-    has(key) {
-      key = String(key);
-      return this.items.some((item) => item[0] === key);
+    has(key, value) {
+      key = tilefinchUSVString(key);
+      const matchValue = arguments.length > 1,
+        wanted = matchValue ? tilefinchUSVString(value) : "";
+      return this.items.some((item) => item[0] === key
+        && (!matchValue || item[1] === wanted));
     }
     set(key, value) {
-      key = String(key);
-      value = String(value);
+      key = tilefinchUSVString(key);
+      value = tilefinchUSVString(value);
       let seen = false;
-      this.items = this.items.filter((pair) => {
-        if (pair[0] !== key) return true;
-        if (!seen) {
+      for (let index = 0; index < this.items.length;) {
+        const pair = this.items[index];
+        if (pair[0] !== key) {
+          index++;
+        } else if (!seen) {
           pair[1] = value;
           seen = true;
-          return true;
-        }
-        return false;
-      });
-      if (!seen) this.items.push([key, value]);
+          index++;
+        } else this.items.splice(index, 1);
+      }
+      if (!seen) this._append(key, value);
       this.notify();
     }
     sort() {
@@ -707,13 +1041,13 @@
         callback.call(thisArg, pair[1], pair[0], this);
     }
     entries() {
-      return this.items[Symbol.iterator]();
+      return urlParamIterator(this, 0);
     }
     keys() {
-      return this.items.map((pair) => pair[0])[Symbol.iterator]();
+      return urlParamIterator(this, 1);
     }
     values() {
-      return this.items.map((pair) => pair[1])[Symbol.iterator]();
+      return urlParamIterator(this, 2);
     }
     [Symbol.iterator]() {
       return this.entries();
@@ -723,7 +1057,7 @@
     }
     toString() {
       const enc = (value) =>
-        encodeURIComponent(value)
+        encodeURIComponent(tilefinchUSVString(value))
           .replace(/%20/g, "+")
           .replace(
             /[!'()~]/g,
@@ -735,7 +1069,28 @@
     }
   }
   const tilefinchURLInput = (value) =>
-    String(value).replace(/[^\x21-\x7e]/gu, (char) => encodeURIComponent(char));
+    tilefinchUSVString(value).replace(
+      /[^\x21-\x7e]/gu, (char) => encodeURIComponent(char));
+  const tilefinchURLPath = (value) => {
+    value = tilefinchUSVString(value);
+    if (!value.startsWith("/")) value = "/" + value;
+    return value.replace(/[^\x21-\x7e]|[?#]/gu,
+      (char) => encodeURIComponent(char));
+  },
+    tilefinchURLHash = (value) => {
+      value = tilefinchUSVString(value);
+      if (!value) return "";
+      if (value[0] === "#") value = value.slice(1);
+      return "#" + value.replace(/[^\x21-\x7e]/gu,
+        (char) => encodeURIComponent(char));
+    };
+  const tilefinchURLSearch = (value) => {
+    value = tilefinchUSVString(value);
+    if (!value) return "";
+    if (value[0] === "?") value = value.slice(1);
+    return "?" + value.replace(
+      /[^\x21-\x7e]|[ #]/gu, (char) => encodeURIComponent(char));
+  };
   class TilefinchURL {
     constructor(input, base) {
       const text = tilefinchURLInput(input);
@@ -754,6 +1109,16 @@
       if (!resolved) throw new TypeError("Invalid URL");
       this._set(resolved);
     }
+    _setSearchParams(search) {
+      if (this._searchParams) this._searchParams._replace(search);
+      else
+        this._searchParams = new TilefinchURLSearchParams(search, (value) => {
+          this.search = value ? "?" + value : "";
+          this._href = this.protocol === "blob:"
+            ? "blob:" + this.pathname + this.search + this.hash
+            : this.origin + this.pathname + this.search + this.hash;
+        });
+    }
     _setBlob(href) {
       const parsed = String(href).match(/^blob:([^?#]+)(\?[^#]*)?(#.*)?$/i);
       if (!parsed) throw new TypeError("Invalid URL");
@@ -767,19 +1132,16 @@
           ? embedded[1].toLowerCase() + "//" + embedded[2] +
             (embedded[3] ? ":" + embedded[3] : "")
           : "null";
-      this.protocol = "blob:";
-      this.hostname = "";
-      this.port = "";
-      this.host = "";
-      this.pathname = pathname;
-      this.search = search;
-      this.hash = hash;
-      this.origin = origin;
+      this._protocol = "blob:";
+      this._hostname = "";
+      this._port = "";
+      this._host = "";
+      this._pathname = pathname;
+      this._search = search;
+      this._hash = hash;
+      this._origin = origin;
       this._href = "blob:" + pathname + search + hash;
-      this.searchParams = new TilefinchURLSearchParams(search, (value) => {
-        this.search = value ? "?" + value : "";
-        this._href = "blob:" + this.pathname + this.search + this.hash;
-      });
+      this._setSearchParams(search);
     }
     _set(href) {
       if (/^blob:/i.test(String(href))) {
@@ -802,19 +1164,25 @@
         search = serialize(parsed[5]),
         hash = serialize(parsed[6]),
         origin = protocol + "//" + host;
-      this.protocol = protocol;
-      this.hostname = hostname;
-      this.port = port;
-      this.host = host;
-      this.pathname = pathname;
-      this.search = search;
-      this.hash = hash;
-      this.origin = origin;
+      this._protocol = protocol;
+      this._hostname = hostname;
+      this._port = port;
+      this._host = host;
+      this._pathname = pathname;
+      this._search = search;
+      this._hash = hash;
+      this._origin = origin;
       this._href = origin + pathname + search + hash;
-      this.searchParams = new TilefinchURLSearchParams(search, (value) => {
-        this.search = value ? "?" + value : "";
-        this._href = this.origin + this.pathname + this.search + this.hash;
-      });
+      this._setSearchParams(search);
+    }
+    _setCandidate(value) {
+      try {
+        const next = new TilefinchURL(value, this._href);
+        this._set(next._href);
+        return true;
+      } catch (_) {
+        return false;
+      }
     }
     get href() {
       return this._href;
@@ -822,6 +1190,74 @@
     set href(value) {
       const next = new TilefinchURL(value, this._href);
       this._set(next._href);
+    }
+    get protocol() { return this._protocol; }
+    set protocol(value) {
+      if (this._protocol === "blob:") return;
+      value = tilefinchUSVString(value);
+      if (!value.endsWith(":")) value += ":";
+      if (!/^[A-Za-z][A-Za-z0-9+.-]*:$/.test(value)) return;
+      this._setCandidate(value + "//" + this.host + this.pathname +
+        this.search + this.hash);
+    }
+    get hostname() { return this._hostname; }
+    set hostname(value) {
+      if (this._protocol === "blob:") return;
+      value = tilefinchUSVString(value);
+      if (!value || /[\s\/?#@]/.test(value)) return;
+      this._setCandidate(this.protocol + "//" + value +
+        (this.port ? ":" + this.port : "") + this.pathname +
+        this.search + this.hash);
+    }
+    get port() { return this._port; }
+    set port(value) {
+      if (this._protocol === "blob:") return;
+      value = tilefinchUSVString(value);
+      if (value && (!/^[0-9]+$/.test(value) || Number(value) > 65535)) return;
+      if ((this.protocol === "http:" && value === "80") ||
+          (this.protocol === "https:" && value === "443")) value = "";
+      this._setCandidate(this.protocol + "//" + this.hostname +
+        (value ? ":" + value : "") + this.pathname +
+        this.search + this.hash);
+    }
+    get host() { return this._host; }
+    set host(value) {
+      if (this._protocol === "blob:") return;
+      value = tilefinchUSVString(value);
+      if (!value || /[\s\/?#@]/.test(value)) return;
+      this._setCandidate(this.protocol + "//" + value + this.pathname +
+        this.search + this.hash);
+    }
+    get pathname() { return this._pathname; }
+    set pathname(value) {
+      if (this._protocol === "blob:") return;
+      this._setCandidate(this.origin + tilefinchURLPath(value) +
+        this.search + this.hash);
+    }
+    get hash() { return this._hash || ""; }
+    set hash(value) {
+      const hash = tilefinchURLHash(value);
+      this._hash = hash;
+      if (this._href)
+        this._href = this.protocol === "blob:"
+          ? "blob:" + this.pathname + this.search + hash
+          : this.origin + this.pathname + this.search + hash;
+    }
+    get origin() { return this._origin; }
+    get searchParams() {
+      return this._searchParams;
+    }
+    get search() {
+      return this._search || "";
+    }
+    set search(value) {
+      const search = tilefinchURLSearch(value);
+      this._search = search;
+      if (this._searchParams) this._searchParams._replace(search);
+      if (this._href)
+        this._href = this.protocol === "blob:"
+          ? "blob:" + this.pathname + search + this.hash
+          : this.origin + this.pathname + search + this.hash;
     }
     assign(value) {
       const next = new TilefinchURL(value, this.href);
@@ -958,55 +1394,60 @@
             a = bytes[i];
           let cp = 0,
             need = 0,
-            minimum = 0;
+            firstLower = 128,
+            firstUpper = 191;
           if (a <= 127) {
             cp = a;
             i++;
           } else if (a >= 194 && a <= 223) {
             cp = a & 31;
             need = 1;
-            minimum = 128;
           } else if (a >= 224 && a <= 239) {
             cp = a & 15;
             need = 2;
-            minimum = 2048;
+            if (a === 224) firstLower = 160;
+            else if (a === 237) firstUpper = 159;
           } else if (a >= 240 && a <= 244) {
             cp = a & 7;
             need = 3;
-            minimum = 65536;
+            if (a === 240) firstLower = 144;
+            else if (a === 244) firstUpper = 143;
           } else {
             invalid();
             i++;
             continue;
           }
           if (need) {
-            if (i + need >= bytes.length) {
-              if (stream) {
-                this._pending = bytes.slice(i);
-                break;
-              }
-              invalid();
-              i = bytes.length;
-              break;
-            }
             let valid = true;
-            for (let j = 1; j <= need; j++) {
+            let invalidAt = 0;
+            for (let j = 1; j <= need && start + j < bytes.length; j++) {
               const b = bytes[i + j];
-              if ((b & 192) !== 128) {
+              if (
+                b < (j === 1 ? firstLower : 128) ||
+                b > (j === 1 ? firstUpper : 191)
+              ) {
                 valid = false;
+                invalidAt = j;
                 break;
               }
               cp = (cp << 6) | (b & 63);
             }
             if (!valid) {
               invalid();
-              i = start + 1;
+              /* Consume the valid prefix of the malformed sequence, then
+                 reconsume the first non-continuation byte as required by
+                 the Encoding Standard's UTF-8 decoder state machine. */
+              i = start + invalidAt;
               continue;
             }
-            if (cp < minimum || cp > 1114111 || (cp >= 55296 && cp <= 57343)) {
+            if (start + need >= bytes.length) {
+              if (stream) {
+                this._pending = bytes.slice(start);
+                break;
+              }
               invalid();
-              i += need + 1;
-              continue;
+              i = bytes.length;
+              break;
             }
             i += need + 1;
           }
@@ -1026,6 +1467,7 @@
     };
   const blobURLs = new Map(),
     blobStates = new WeakMap(),
+    fileStates = new WeakMap(),
     blobBytes = (blob) => {
       const state = trustedWeakMapGet(blobStates, blob);
       if (!state)
@@ -1140,7 +1582,7 @@
   };
   globalThis.Blob = TilefinchBlob;
   globalThis.__tilefinchBlobBytes = blobBytesCopy;
-  globalThis.File = class File extends TilefinchBlob {
+  const TilefinchFile = globalThis.File = class File extends TilefinchBlob {
     constructor(parts, name, options = {}) {
       if (arguments.length < 2)
         throw new TypeError("File requires parts and a name");
@@ -1154,6 +1596,10 @@
         ? Math.trunc(modified)
         : Date.now();
       this.webkitRelativePath = "";
+      trustedWeakMapSet(fileStates, this, {
+        name: this.name,
+        lastModified: this.lastModified,
+      });
     }
   };
   globalThis.FileList = class FileList {
@@ -1869,8 +2315,10 @@
     if (checked && __tilefinchControlType(input) === "radio") {
       const form = input.closest("form"),
         name = input.name;
-      if (name)
-        for (const peer of document.querySelectorAll("input"))
+      if (name) {
+        const peers = document.querySelectorAll("input");
+        for (let index = 0; index < peers.length; index++) {
+          const peer = peers[index];
           if (
             peer !== input &&
             peer instanceof HTMLInputElement &&
@@ -1879,6 +2327,8 @@
             peer.closest("form") === form
           )
             peer.removeAttribute("checked");
+        }
+      }
     }
     input.toggleAttribute("checked", checked);
   };
@@ -1927,17 +2377,23 @@
         if (type === "checkbox") valueMissing = !control.checked;
         else if (type === "radio") {
           const form = control.closest("form"),
-            name = control.name;
-          valueMissing = !document
-            .querySelectorAll("input")
-            .some(
-              (item) =>
-                item instanceof HTMLInputElement &&
-                String(item.type).toLowerCase() === "radio" &&
-                item.name === name &&
-                item.closest("form") === form &&
-                item.checked,
-            );
+            name = control.name,
+            peers = document.querySelectorAll("input");
+          let groupChecked = false;
+          for (let index = 0; index < peers.length; index++) {
+            const item = peers[index];
+            if (
+              item instanceof HTMLInputElement &&
+              String(item.type).toLowerCase() === "radio" &&
+              item.name === name &&
+              item.closest("form") === form &&
+              item.checked
+            ) {
+              groupChecked = true;
+              break;
+            }
+          }
+          valueMissing = !groupChecked;
         } else valueMissing = value === "";
       }
       let patternMismatch = false;
@@ -2561,9 +3017,14 @@
         }
       }
     }
-    append(name, value) {
+    append(name, value, filename) {
       if (this.items.length >= 256)
         throw new RangeError("FormData entry limit exceeded");
+      if (value instanceof Blob && (!(value instanceof File) || filename !== undefined))
+        value = new File([value], filename === undefined ? "blob" : String(filename), {
+          type: value.type,
+          lastModified: value instanceof File ? value.lastModified : Date.now(),
+        });
       this.items.push([
         String(name),
         value instanceof Blob ? value : String(value),
@@ -2588,9 +3049,14 @@
       name = String(name);
       return this.items.some((item) => item[0] === name);
     }
-    set(name, value) {
+    set(name, value, filename) {
       name = String(name);
-      value = value instanceof Blob ? value : String(value);
+      if (value instanceof Blob && (!(value instanceof File) || filename !== undefined))
+        value = new File([value], filename === undefined ? "blob" : String(filename), {
+          type: value.type,
+          lastModified: value instanceof File ? value.lastModified : Date.now(),
+        });
+      else value = value instanceof Blob ? value : String(value);
       let found = false;
       this.items = this.items.filter((pair) => {
         if (pair[0] !== name) return true;
@@ -2763,9 +3229,55 @@
       ? new DOMExceptionType(message, "DataCloneError")
       : new TypeError(message);
   };
-  const cloneErrorTypes = () => ({
-    EvalError, RangeError, ReferenceError, SyntaxError, TypeError, URIError,
+  const workerCloneConstructorNames = Object.freeze([
+      "Object", "Array", "ArrayBuffer", "DataView", "Date", "RegExp",
+      "Blob", "File", "MessagePort",
+      "Map", "Set", "Error", "EvalError", "RangeError", "ReferenceError",
+      "SyntaxError", "TypeError", "URIError", "Boolean", "Number", "String",
+      "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array",
+      "Uint16Array", "Int32Array", "Uint32Array", "Float32Array",
+      "Float64Array", "BigInt64Array", "BigUint64Array",
+    ]),
+    captureWorkerCloneIntrinsics = (realm) => {
+      const intrinsics = Object.create(null);
+      for (const name of workerCloneConstructorNames)
+        if (typeof realm[name] === "function") intrinsics[name] = realm[name];
+      return Object.freeze(intrinsics);
+    },
+    ownerWorkerCloneIntrinsics = captureWorkerCloneIntrinsics(globalThis);
+  Object.defineProperty(globalThis, "__tilefinchWorkerCloneIntrinsics", {
+    configurable: false,
+    enumerable: false,
+    writable: false,
+    value: Object.freeze({
+      capture: captureWorkerCloneIntrinsics,
+      owner: ownerWorkerCloneIntrinsics,
+    }),
   });
+  const cloneErrorTypes = (intrinsics) => ({
+    EvalError: intrinsics.EvalError,
+    RangeError: intrinsics.RangeError,
+    ReferenceError: intrinsics.ReferenceError,
+    SyntaxError: intrinsics.SyntaxError,
+    TypeError: intrinsics.TypeError,
+    URIError: intrinsics.URIError,
+  }),
+    ordinaryClonePrototypeKind = (first) => {
+      let userTag = false;
+      for (let at = first, steps = 0; steps < 32; steps++) {
+        if (at === null) return userTag ? 2 : 1;
+        if (at === EventTarget.prototype) return 0;
+        const tag = trustedObjectDescriptor(at, Symbol.toStringTag);
+        if (tag) {
+          const constructor = trustedObjectDescriptor(at, "constructor");
+          if (globalThis.__tilefinchIsNativeFunction?.(constructor?.value))
+            return 0;
+          userTag = true;
+        }
+        at = trustedObjectPrototype(at);
+      }
+      return 0;
+    };
   const cloneWorkerValueInternal = (value, state, depth) => {
     if (state.remaining-- <= 0)
       throw cloneError("worker message value limit");
@@ -2780,28 +3292,70 @@
       return value;
     if (typeof value === "function" || typeof value === "symbol")
       throw cloneError("value could not be cloned");
+    /* Proxy is never structured-cloneable. Reject by native brand before
+       prototype/key inspection so no getPrototypeOf, ownKeys, get or getter
+       trap can run as a side effect of postMessage/structuredClone. */
+    if (globalThis.__tilefinchIsProxy(value))
+      throw cloneError("Proxy values could not be cloned");
     const memory = state.memory;
     if (memory.has(value)) return memory.get(value);
-    /* Worker realms have their own intrinsics, so classify by the internal
-       tag rather than instanceof against this realm's constructors. */
-    const tag = Object.prototype.toString.call(value);
     if (depth > 64) throw cloneError("worker message nesting limit");
     if (memory.size >= 16384) throw cloneError("worker message object limit");
     const remember = (copy) => {
       memory.set(value, copy);
       return copy;
     };
+    if (state.transferMap?.has(value))
+      return remember(state.transferMap.get(value));
     const clone = (item) => cloneWorkerValueInternal(item, state, depth + 1);
-    if (tag === "[object ArrayBuffer]") return remember(value.slice(0));
-    if (tag === "[object DataView]") {
-      const buffer = clone(value.buffer);
-      return remember(new DataView(buffer, value.byteOffset, value.byteLength));
+    const intrinsics = state.intrinsics;
+    const blobState = trustedWeakMapGet(blobStates, value);
+    if (blobState) {
+      const bytes = new TrustedUint8Array(blobState.length);
+      trustedUint8ArraySet(bytes, blobState.bytes);
+      const fileState = trustedWeakMapGet(fileStates, value);
+      if (fileState && typeof intrinsics.File === "function")
+        return remember(new intrinsics.File([bytes], fileState.name, {
+          type: blobState.type,
+          lastModified: fileState.lastModified,
+        }));
+      if (typeof intrinsics.Blob !== "function")
+        throw cloneError("unsupported worker message blob");
+      return remember(new intrinsics.Blob([bytes], { type: blobState.type }));
     }
-    if (ArrayBuffer.isView(value)) {
+    let arrayBufferLength;
+    try {
+      arrayBufferLength = trustedArrayBufferByteLength(value);
+    } catch (_) {}
+    if (arrayBufferLength !== undefined) {
+      const copy = remember(new intrinsics.ArrayBuffer(arrayBufferLength));
+      trustedUint8ArraySet(
+        new intrinsics.Uint8Array(copy), new TrustedUint8Array(value));
+      return copy;
+    }
+    let dataViewBuffer, dataViewOffset, dataViewLength;
+    try {
+      dataViewBuffer = trustedDataViewBuffer(value);
+      dataViewOffset = trustedDataViewByteOffset(value);
+      dataViewLength = trustedDataViewByteLength(value);
+    } catch (_) {}
+    if (dataViewBuffer !== undefined) {
+      const buffer = clone(dataViewBuffer);
+      return remember(new intrinsics.DataView(
+        buffer, dataViewOffset, dataViewLength));
+    }
+    if (trustedArrayBufferIsView(value)) {
       /* Views over one buffer keep sharing the cloned buffer. */
-      const buffer = clone(value.buffer);
+      const name = trustedTypedArrayName(value),
+        buffer = clone(trustedTypedArrayBuffer(value)),
+        constructor = intrinsics[name];
+      if (typeof constructor !== "function")
+        throw cloneError("unsupported worker message view");
       return remember(
-        new value.constructor(buffer, value.byteOffset, value.length),
+        new constructor(
+          buffer, trustedTypedArrayByteOffset(value),
+          trustedTypedArrayLength(value),
+        ),
       );
     }
     const cloneWasmModule = globalThis.__tilefinchCloneWasmModule;
@@ -2809,67 +3363,177 @@
       const module = cloneWasmModule(value);
       if (module !== null) return remember(module);
     }
-    if (tag === "[object Date]") return remember(new Date(value.getTime()));
-    if (tag === "[object RegExp]")
-      return remember(new RegExp(value.source, value.flags));
-    if (
-      tag === "[object Boolean]" ||
-      tag === "[object Number]" ||
-      tag === "[object String]"
-    )
-      return remember(Object(value.valueOf()));
-    if (tag === "[object Error]") {
-      const ErrorType = cloneErrorTypes()[String(value.name)] || Error;
+    let dateTime;
+    try {
+      dateTime = trustedDateTime(value);
+    } catch (_) {}
+    if (dateTime !== undefined)
+      return remember(new intrinsics.Date(dateTime));
+    let regexpSource, regexpFlags;
+    try {
+      regexpSource = trustedRegExpSource(value);
+      regexpFlags = trustedRegExpFlags(value);
+    } catch (_) {}
+    if (regexpSource !== undefined)
+      return remember(new intrinsics.RegExp(regexpSource, regexpFlags));
+    try {
+      return remember(new intrinsics.Boolean(trustedBooleanValue(value)));
+    } catch (_) {}
+    try {
+      return remember(new intrinsics.Number(trustedNumberValue(value)));
+    } catch (_) {}
+    try {
+      return remember(new intrinsics.String(trustedStringValue(value)));
+    } catch (_) {}
+    let mapSize;
+    try {
+      mapSize = trustedMapSize(value);
+    } catch (_) {}
+    if (mapSize !== undefined) {
+      if (mapSize > 1024) throw cloneError("worker message item limit");
+      const copy = remember(new intrinsics.Map());
+      let count = 0;
+      for (const [key, item] of trustedMapEntries(value)) {
+        if (++count > 1024) throw cloneError("worker message item limit");
+        trustedMapSet(copy, clone(key), clone(item));
+      }
+      return copy;
+    }
+    let setSize;
+    try {
+      setSize = trustedSetSize(value);
+    } catch (_) {}
+    if (setSize !== undefined) {
+      if (setSize > 1024) throw cloneError("worker message item limit");
+      const copy = remember(new intrinsics.Set());
+      let count = 0;
+      for (const item of trustedSetValues(value)) {
+        if (++count > 1024) throw cloneError("worker message item limit");
+        trustedSetAdd(copy, clone(item));
+      }
+      return copy;
+    }
+    if (trustedArrayIsArray(value)) {
+      if (value.length > 1024) throw cloneError("worker message item limit");
+      const copy = remember(new intrinsics.Array(value.length));
+      /* Structured serialization visits enumerable own properties.  Using
+         `index in value` both admitted inherited indexes and discarded named
+         properties carried by framework message arrays. */
+      const keys = trustedObjectKeys(value);
+      if (keys.length > 1152)
+        throw cloneError("worker message item limit");
+      for (const key of keys) {
+        trustedDefineProperty(copy, key, {
+          configurable: true,
+          enumerable: true,
+          writable: true,
+          value: clone(value[key]),
+        });
+      }
+      return copy;
+    }
+    const prototypeKind = ordinaryClonePrototypeKind(
+      trustedObjectPrototype(value),
+    );
+    /* Error has no dedicated public brand getter. Object#toString is safe
+       only when no page-controlled @@toStringTag exists in the chain. */
+    if (prototypeKind === 1 && trustedObjectTag(value) === "[object Error]") {
+      const ErrorType = cloneErrorTypes(intrinsics)[String(value.name)]
+        || intrinsics.Error;
       const copy = new ErrorType(String(value.message));
       try {
         if (typeof value.stack === "string") copy.stack = value.stack;
       } catch (_) {}
       return remember(copy);
     }
-    if (tag === "[object Map]" && typeof value.entries === "function") {
-      const copy = remember(new Map());
-      let count = 0;
-      for (const [key, item] of value) {
-        if (++count > 1024) throw cloneError("worker message item limit");
-        copy.set(clone(key), clone(item));
-      }
-      return copy;
-    }
-    if (tag === "[object Set]" && typeof value.values === "function") {
-      const copy = remember(new Set());
-      let count = 0;
-      for (const item of value) {
-        if (++count > 1024) throw cloneError("worker message item limit");
-        copy.add(clone(item));
-      }
-      return copy;
-    }
-    if (Array.isArray(value)) {
-      if (value.length > 1024) throw cloneError("worker message item limit");
-      const copy = remember(new Array(value.length));
-      for (let index = 0; index < value.length; index++)
-        if (index in value) copy[index] = clone(value[index]);
-      return copy;
-    }
-    const prototype = Object.getPrototypeOf(value);
-    if (
-      tag === "[object Object]" &&
-      (prototype === null || Object.getPrototypeOf(prototype) === null)
-    ) {
-      const copy = remember({});
-      const keys = Object.keys(value);
+    if (prototypeKind !== 0) {
+      const copy = remember(new intrinsics.Object());
+      const keys = trustedObjectKeys(value);
       if (keys.length > 128) throw cloneError("worker message key limit");
-      for (const key of keys) copy[key] = clone(value[key]);
+      /* Structured serialization creates ordinary own data properties. An
+         assignment here would invoke an inherited setter in the receiving
+         realm and gives __proto__ its legacy mutation semantics, allowing a
+         valid Worker message to arrive with fields missing or redirected. */
+      for (const key of keys) {
+        trustedDefineProperty(copy, key, {
+          configurable: true,
+          enumerable: true,
+          writable: true,
+          value: clone(value[key]),
+        });
+      }
       return copy;
     }
     throw cloneError("unsupported worker message value");
   };
-  const cloneWorkerValue = (value) =>
-    cloneWorkerValueInternal(
-      value, { memory: new Map(), remaining: 262144 }, 0);
+  const detachArrayBuffer = globalThis.__tilefinchDetachArrayBuffer,
+    collectWorkerTransferList = (sequence) => {
+      if (sequence === undefined) return [];
+      let values;
+      try {
+        values = trustedArrayFrom(sequence);
+      } catch (_) {
+        throw cloneError("transfer list is not iterable");
+      }
+      if (values.length > 16)
+        throw cloneError("worker transfer list limit");
+      const seen = new Set(), entries = [];
+      for (const value of values) {
+        let kind = 0;
+        try {
+          trustedArrayBufferByteLength(value);
+        } catch (_) {
+          kind = 1;
+        }
+        if (kind === 1 && typeof globalThis
+            .__tilefinchPrepareMessagePortTransfer !== "function")
+          throw cloneError("unsupported transferable object");
+        if (seen.has(value))
+          throw cloneError("duplicate transferable object");
+        seen.add(value);
+        entries.push({ value, kind });
+      }
+      return entries;
+    },
+    cloneWorkerValue = (
+      value, intrinsics = ownerWorkerCloneIntrinsics, transfer, portsOut,
+    ) => {
+      const transferList = collectWorkerTransferList(transfer),
+        transferMap = new Map(),
+        preparedPorts = [];
+      for (const entry of transferList) {
+        if (entry.kind !== 1) continue;
+        const prepared = globalThis.__tilefinchPrepareMessagePortTransfer(
+          entry.value, intrinsics.MessagePort?.prototype);
+        if (!prepared) throw cloneError("unsupported transferable object");
+        if (preparedPorts.some((item) =>
+            item.original === prepared.peer || item.peer === prepared.original))
+          throw cloneError("entangled message ports cannot transfer together");
+        preparedPorts.push(prepared);
+        transferMap.set(entry.value, prepared.copy);
+      }
+      const cloneState = {
+          memory: new Map(), remaining: 262144, intrinsics, transferMap,
+        },
+        copy = cloneWorkerValueInternal(
+          value, cloneState, 0);
+      /* Clone is transactional: detach only after every reachable value has
+         serialized successfully. The native sink repeats the class check. */
+      if (preparedPorts.some((prepared) => !prepared.canCommit()))
+        throw cloneError("message port transfer could not commit");
+      for (const entry of transferList)
+        if (entry.kind === 0) detachArrayBuffer(entry.value);
+      for (const prepared of preparedPorts) {
+        if (!prepared.commit())
+          throw cloneError("message port transfer could not commit");
+        if (portsOut) portsOut.push(prepared.copy);
+      }
+      return copy;
+    };
   globalThis.__tilefinchCloneWorkerValue = cloneWorkerValue;
   if (globalThis.structuredClone === undefined)
-    globalThis.structuredClone = (value) => cloneWorkerValue(value);
+    globalThis.structuredClone = (value, options = undefined) =>
+      cloneWorkerValue(value, ownerWorkerCloneIntrinsics, options?.transfer);
   const tilefinchCurrentDocumentURL =
       globalThis.__tilefinchCurrentDocumentURL,
     tilefinchDocumentURLRevision =
@@ -2877,7 +3541,6 @@
     location = new TilefinchURL(
       String(globalThis.__tilefinchLocationHref || "https://example.invalid/"),
     ),
-    locationParts = Object.create(null),
     locationPartNames = [
       "protocol",
       "hostname",
@@ -2914,16 +3577,21 @@
       }
     };
   for (const name of locationPartNames) {
-    locationParts[name] = location[name];
+    const descriptor = trustedObjectDescriptor(
+      TilefinchURL.prototype, name);
     Object.defineProperty(location, name, {
       configurable: true,
       enumerable: true,
       get() {
         synchronizeLocation();
-        return locationParts[name];
+        return descriptor.get.call(location);
       },
-      set(value) {
-        locationParts[name] = value;
+      set: descriptor.set === undefined ? undefined : function (value) {
+        synchronizeLocation();
+        const previous = location._href;
+        descriptor.set.call(location, value);
+        if (!locationSynchronizing && location._href !== previous)
+          __tilefinchRequestNavigation(location._href, false);
       },
     });
   }
@@ -3327,9 +3995,7 @@
                   false,
                   Event.BUBBLING_PHASE,
                 );
-            event.currentTarget = null;
-            event.eventPhase = Event.NONE;
-            event.__dispatching = false;
+            globalThis.__tilefinchFinishEventDispatch(event);
             return !event.defaultPrevented;
           },
           appendChild(node) {
@@ -3968,24 +4634,49 @@
       );
     globalThis.__tilefinchNewDocument = () =>
       detachedDocument(undefined, false, null, null, "", false);
-    document.implementation = {
-      createHTMLDocument: (title) => detachedDocument(title),
-      createDocument: (namespace, qualifiedName, doctype = null) =>
-        detachedDocument(
+    globalThis.DOMImplementation = class DOMImplementation {
+      constructor(token) {
+        if (token !== implementationToken)
+          throw new TypeError("Illegal constructor");
+      }
+      createHTMLDocument(title) {
+        return detachedDocument(title);
+      }
+      createDocument(namespace, qualifiedName, doctype = null) {
+        return detachedDocument(
           undefined,
           true,
           doctype,
           namespace,
           qualifiedName || "",
-        ),
-      createDocumentType: (name, publicId, systemId) =>
-        detachedDocument(undefined, true).createDocumentType(
+        );
+      }
+      createDocumentType(name, publicId, systemId) {
+        return detachedDocument(undefined, true).createDocumentType(
           name,
           publicId,
           systemId,
-        ),
-      hasFeature: () => true,
+        );
+      }
+      hasFeature() {
+        return true;
+      }
     };
+    const implementationToken = {},
+      implementations = new WeakMap();
+    Object.defineProperty(Document.prototype, "implementation", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        if (!(this instanceof Document)) throw new TypeError("Illegal invocation");
+        let value = implementations.get(this);
+        if (!value) {
+          value = new globalThis.DOMImplementation(implementationToken);
+          implementations.set(this, value);
+        }
+        return value;
+      },
+    });
     globalThis.__tilefinchAdoptNodeOwner = adoptOwner;
     globalThis.__tilefinchDetachNode = detach;
   }
@@ -4318,21 +5009,27 @@
       this.endOffset = boundedOffset(node, offset);
     }
     setStartBefore(node) {
-      this.setStart(node.parentNode, node.parentNode.childNodes.indexOf(node));
+      this.setStart(
+        node.parentNode,
+        Array.prototype.indexOf.call(node.parentNode.childNodes, node),
+      );
     }
     setStartAfter(node) {
       this.setStart(
         node.parentNode,
-        node.parentNode.childNodes.indexOf(node) + 1,
+        Array.prototype.indexOf.call(node.parentNode.childNodes, node) + 1,
       );
     }
     setEndBefore(node) {
-      this.setEnd(node.parentNode, node.parentNode.childNodes.indexOf(node));
+      this.setEnd(
+        node.parentNode,
+        Array.prototype.indexOf.call(node.parentNode.childNodes, node),
+      );
     }
     setEndAfter(node) {
       this.setEnd(
         node.parentNode,
-        node.parentNode.childNodes.indexOf(node) + 1,
+        Array.prototype.indexOf.call(node.parentNode.childNodes, node) + 1,
       );
     }
     collapse(toStart = false) {
@@ -5226,7 +5923,12 @@
       passive = typeof options === "object" && !!options?.passive,
       signal = typeof options === "object" ? options?.signal : null;
     if (!listenerCallable(callback)) return;
-    if (signal?.aborted) return;
+    if (signal !== null && signal !== undefined) {
+      const inspectSignal = globalThis.__tilefinchAbortSignalBrand;
+      if (typeof inspectSignal !== "function")
+        throw new TypeError("AbortSignal required");
+      if (inspectSignal(signal)) return;
+    }
     if (!map.has(key)) map.set(key, []);
     const list = map.get(key);
     if (
@@ -5247,7 +5949,7 @@
     if (signal && typeof signal.addEventListener === "function") {
       item.abort = () =>
         globalThis.__tilefinchRemoveEventListener(map, key, callback, capture);
-      signal.addEventListener("abort", item.abort, { once: true });
+      globalThis.__tilefinchAddAbortAlgorithm(signal, item.abort);
     }
     list.push(item);
     globalThis.__tilefinchEventObserverDelta(key, 1);
@@ -5274,8 +5976,60 @@
     globalThis.__tilefinchEventObserverDelta(type, -1);
     if (item.signal && item.abort)
       try {
-        item.signal.removeEventListener("abort", item.abort);
+        globalThis.__tilefinchRemoveAbortAlgorithm(item.signal, item.abort);
       } catch (_) {}
+  };
+  const invokeListenerItem = (
+    map,
+    list,
+    target,
+    event,
+    item,
+    errorObserver,
+  ) => {
+    /* DOM removes a once listener before calling it. This matters when the
+       callback dispatches recursively or registers itself again: the new
+       registration belongs to the next event and must not be removed by
+       cleanup for the current invocation. */
+    if (item.once)
+      globalThis.__tilefinchRemoveEventListener(
+        map,
+        event.type,
+        item.callback,
+        item.capture,
+      );
+    event.__passive = item.passive;
+    try {
+      if (typeof item.callback === "function") {
+        globalThis.__tilefinchRecordEventHandler();
+        globalThis.__tilefinchRunTask(
+          "event:" + String(event.type),
+          item.callback,
+          target,
+          [event],
+        );
+      } else {
+        /* Web IDL resolves an event-listener object's operation once per
+           invocation. A getter may be stateful; reading it for both the type
+           check and call can invoke a different value or side effect. */
+        const handleEvent = item.callback.handleEvent;
+        if (typeof handleEvent !== "function")
+          throw new TypeError("event listener handleEvent is not callable");
+        globalThis.__tilefinchRecordEventHandler();
+        globalThis.__tilefinchRunTask(
+          "event-object:" + String(event.type),
+          handleEvent,
+          item.callback,
+          [event],
+        );
+      }
+    } catch (error) {
+      if (typeof errorObserver === "function")
+        try { errorObserver(error, item, list); } catch (_) {}
+      __tilefinchReportUncaught(error, "event " + event.type);
+    } finally {
+      event.__passive = false;
+    }
   };
   globalThis.__tilefinchInvokeListenerList = (
     map,
@@ -5287,39 +6041,7 @@
     const list = map.get(String(event.type)) || [];
     for (const item of [...list]) {
       if (!item.active || item.capture !== capture) continue;
-      event.__passive = item.passive;
-      try {
-        if (typeof item.callback === "function") {
-          globalThis.__tilefinchRecordEventHandler();
-          globalThis.__tilefinchRunTask(
-            "event:" + String(event.type),
-            item.callback,
-            target,
-            [event],
-          );
-        } else if (typeof item.callback.handleEvent === "function") {
-          globalThis.__tilefinchRecordEventHandler();
-          globalThis.__tilefinchRunTask(
-            "event-object:" + String(event.type),
-            item.callback.handleEvent,
-            item.callback,
-            [event],
-          );
-        }
-      } catch (error) {
-        if (typeof errorObserver === "function")
-          try { errorObserver(error, item, list); } catch (_) {}
-        __tilefinchReportUncaught(error, "event " + event.type);
-      } finally {
-        event.__passive = false;
-        if (item.once)
-          globalThis.__tilefinchRemoveEventListener(
-            map,
-            event.type,
-            item.callback,
-            item.capture,
-          );
-      }
+      invokeListenerItem(map, list, target, event, item, errorObserver);
       if (event.__immediateStopped) break;
     }
   };
@@ -5334,9 +6056,18 @@
     event.target = target;
     event.currentTarget = null;
     event.eventPhase = 0;
-    event.defaultPrevented = !!event.defaultPrevented;
     event.__passive = false;
     event.__path = path;
+  };
+  globalThis.__tilefinchFinishEventDispatch = (event) => {
+    event.currentTarget = null;
+    event.eventPhase = Event.NONE;
+    event.__dispatching = false;
+    /* Propagation flags belong to one dispatch. Keep defaultPrevented, which
+       remains observable when the same Event is dispatched again. */
+    event.__stopped = false;
+    event.__immediateStopped = false;
+    event.__passive = false;
   };
   document.addEventListener = (type, callback, options = false) =>
     globalThis.__tilefinchAddEventListener(
@@ -5355,21 +6086,6 @@
   globalThis.__tilefinchInvokeDocumentEvent = (event, capture) => {
     event.currentTarget = document;
     event.eventPhase = document === event.target ? 2 : capture ? 1 : 3;
-    if (!capture) {
-      const handler = document["on" + event.type];
-      if (typeof handler === "function")
-        try {
-          globalThis.__tilefinchRecordEventHandler();
-          globalThis.__tilefinchRunTask(
-            "document-handler:" + String(event.type),
-            handler,
-            document,
-            [event],
-          );
-        } catch (error) {
-          __tilefinchReportUncaught(error, "document event " + event.type);
-        }
-    }
     globalThis.__tilefinchInvokeListenerList(
       documentListeners,
       document,
@@ -5390,9 +6106,7 @@
     }
     if (value.bubbles && !value.__stopped)
       globalThis.__tilefinchInvokeWindowEvent?.(value, false);
-    value.currentTarget = null;
-    value.eventPhase = 0;
-    value.__dispatching = false;
+    globalThis.__tilefinchFinishEventDispatch(value);
     __tilefinchRecordEvent();
     return !value.defaultPrevented;
   };
@@ -5411,6 +6125,7 @@
       event,
       capture,
       phase,
+      errorObserver = null,
     ) => {
       event.currentTarget = target;
       event.eventPhase = phase;
@@ -5419,7 +6134,44 @@
         target,
         event,
         capture,
+        errorObserver,
       );
+    };
+    /* A native event is one task and its dispatch is synchronous.  Running a
+       microtask checkpoint between listeners exposes half-updated listener
+       state and disagrees with dispatchEvent(); the host drains jobs after
+       this complete dispatch returns. */
+    globalThis.__tilefinchInvokeEventTargetCheckpointed = (
+      target,
+      event,
+      phase,
+      errorObserver,
+      betweenPhases,
+      complete,
+    ) => {
+      const map = mapFor(target);
+      let completed = false;
+      const finish = () => {
+          if (completed) return;
+          completed = true;
+          if (typeof complete === "function") complete();
+        };
+      try {
+        event.currentTarget = target;
+        event.eventPhase = phase;
+        globalThis.__tilefinchInvokeListenerList(
+          map, target, event, true, errorObserver);
+        if (!event.__immediateStopped && typeof betweenPhases === "function")
+          betweenPhases();
+        if (!event.__immediateStopped) {
+          event.currentTarget = target;
+          event.eventPhase = phase;
+          globalThis.__tilefinchInvokeListenerList(
+            map, target, event, false, errorObserver);
+        }
+      } finally {
+        finish();
+      }
     };
     EventTarget.prototype.addEventListener = function (
       type,
@@ -5456,9 +6208,7 @@
         if (!value.__immediateStopped)
           globalThis.__tilefinchInvokeListenerList(map, this, value, false);
       }
-      value.currentTarget = null;
-      value.eventPhase = 0;
-      value.__dispatching = false;
+      globalThis.__tilefinchFinishEventDispatch(value);
       __tilefinchRecordEvent();
       return !value.defaultPrevented;
     };
@@ -5501,9 +6251,7 @@
             false,
             Event.BUBBLING_PHASE,
           );
-      event.currentTarget = null;
-      event.eventPhase = Event.NONE;
-      event.__dispatching = false;
+      globalThis.__tilefinchFinishEventDispatch(event);
       return !event.defaultPrevented;
     };
   }
@@ -5703,32 +6451,60 @@
     return document.querySelectorAll(tag);
   };
   {
-    let writeBuffer = "",
-      writePending = false;
-    const flush = () => {
-      writePending = false;
-      if (!writeBuffer) return;
-      const source = writeBuffer;
-      writeBuffer = "";
-      const container = document.createElement("div");
-      container.innerHTML = source;
-      const target = document.body || document.documentElement;
-      while (container.firstChild) target.appendChild(container.firstChild);
-    };
-    document.write = (...parts) => {
-      const addition = parts.map(String).join("");
-      if (writeBuffer.length + addition.length > 256 * 1024)
-        throw new RangeError("document.write buffer exceeds bounded size");
-      writeBuffer += addition;
-      if (!writePending) {
-        writePending = true;
-        queueMicrotask(flush);
-      }
-    };
-    document.writeln = (...parts) => document.write(...parts, "\n");
-    document.close = () => {
-      if (writePending) flush();
-    };
+    const documentWriteStates = new WeakMap(),
+      stateFor = (receiver) => {
+        if (!(receiver instanceof Document))
+          throw new TypeError("Illegal invocation");
+        let state = documentWriteStates.get(receiver);
+        if (!state) {
+          state = { buffer: "", pending: false };
+          documentWriteStates.set(receiver, state);
+        }
+        return state;
+      },
+      flush = (receiver, state) => {
+        state.pending = false;
+        if (!state.buffer) return;
+        const source = state.buffer;
+        state.buffer = "";
+        const container = receiver.createElement("div");
+        container.innerHTML = source;
+        const target = receiver.body || receiver.documentElement;
+        if (!target) return;
+        while (container.firstChild) target.appendChild(container.firstChild);
+      };
+    Object.defineProperties(Document.prototype, {
+      write: {
+        configurable: true,
+        writable: true,
+        value: function write(...parts) {
+          const state = stateFor(this),
+            addition = parts.map(String).join("");
+          if (state.buffer.length + addition.length > 256 * 1024)
+            throw new RangeError("document.write buffer exceeds bounded size");
+          state.buffer += addition;
+          if (!state.pending) {
+            state.pending = true;
+            queueMicrotask(() => flush(this, state));
+          }
+        },
+      },
+      writeln: {
+        configurable: true,
+        writable: true,
+        value: function writeln(...parts) {
+          this.write(...parts, "\n");
+        },
+      },
+      close: {
+        configurable: true,
+        writable: true,
+        value: function close() {
+          const state = stateFor(this);
+          if (state.pending) flush(this, state);
+        },
+      },
+    });
   }
   Object.defineProperty(document, "scripts", {
     get() {
@@ -5762,7 +6538,18 @@
       return cachedDocumentStyleSheets;
     },
   });
-  document.referrer = "";
+  const documentReferrer = String(
+    globalThis.__tilefinchDocumentReferrer || "",
+  );
+  delete globalThis.__tilefinchDocumentReferrer;
+  Object.defineProperty(Document.prototype, "referrer", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      if (!(this instanceof Document)) throw new TypeError("Illegal invocation");
+      return this === document ? documentReferrer : "";
+    },
+  });
   globalThis.NodeFilter = {
     SHOW_ALL: 0xffffffff,
     SHOW_ELEMENT: 1,
@@ -5824,6 +6611,13 @@
   globalThis.parent = globalThis;
   globalThis.frames = globalThis;
   globalThis.length = 0;
+  Object.defineProperty(globalThis, "frameElement", {
+    configurable: false,
+    enumerable: true,
+    get() {
+      return null;
+    },
+  });
   Object.defineProperty(globalThis, "opener", {
     configurable: false,
     enumerable: true,
@@ -5859,30 +6653,392 @@
   globalThis.outerWidth = diagnosticMobileSafari ? 390 : tilefinchDeviceWidth;
   globalThis.outerHeight = diagnosticMobileSafari ? 844 : tilefinchDeviceHeight;
   globalThis.devicePixelRatio = diagnosticMobileSafari ? 3 : 1;
-  const orientationLandscape = innerWidth >= innerHeight;
-  globalThis.screen = {
-    width: diagnosticMobileSafari ? innerWidth : tilefinchDeviceWidth,
-    height: diagnosticMobileSafari ? innerHeight : tilefinchDeviceHeight,
-    availWidth: diagnosticMobileSafari ? innerWidth : tilefinchDeviceWidth,
-    availHeight: diagnosticMobileSafari ? innerHeight : tilefinchDeviceHeight,
-    availLeft: 0,
-    availTop: 0,
-    colorDepth: 24,
-    pixelDepth: 24,
-    orientation: {
-      type: orientationLandscape ? "landscape-primary" : "portrait-primary",
-      angle: orientationLandscape ? 90 : 0,
-      addEventListener() {},
-      removeEventListener() {},
+  const orientationLandscape = innerWidth >= innerHeight,
+    screenToken = {},
+    screenOrientationToken = {};
+  let screenHandler = null,
+    screenOrientationHandler = null;
+  class ScreenOrientation extends EventTarget {
+    constructor(token) {
+      super();
+      if (token !== screenOrientationToken)
+        throw new TypeError("Illegal constructor");
+    }
+    get type() {
+      return orientationLandscape ? "landscape-primary" : "portrait-primary";
+    }
+    /* The PSP's natural orientation is landscape, so landscape-primary is
+       unrotated. The diagnostic mobile profile likewise represents its
+       natural portrait orientation rather than a rotated device. */
+    get angle() { return 0; }
+    get onchange() { return screenOrientationHandler; }
+    set onchange(value) {
+      screenOrientationHandler = typeof value === "function" ? value : null;
+    }
+    lock() {
+      return Promise.reject(
+        new DOMException("Screen orientation cannot be changed", "NotSupportedError"),
+      );
+    }
+    unlock() {}
+  }
+  Object.defineProperty(ScreenOrientation.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "ScreenOrientation",
+  });
+  const screenOrientation = new ScreenOrientation(screenOrientationToken);
+  class Screen extends EventTarget {
+    constructor(token) {
+      super();
+      if (token !== screenToken) throw new TypeError("Illegal constructor");
+    }
+    get width() {
+      return diagnosticMobileSafari ? innerWidth : tilefinchDeviceWidth;
+    }
+    get height() {
+      return diagnosticMobileSafari ? innerHeight : tilefinchDeviceHeight;
+    }
+    get availWidth() { return this.width; }
+    get availHeight() { return this.height; }
+    get availLeft() { return 0; }
+    get availTop() { return 0; }
+    get colorDepth() { return 24; }
+    get pixelDepth() { return 24; }
+    get isExtended() { return false; }
+    get onchange() { return screenHandler; }
+    set onchange(value) {
+      screenHandler = typeof value === "function" ? value : null;
+    }
+    get orientation() { return screenOrientation; }
+  }
+  Object.defineProperty(Screen.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "Screen",
+  });
+  for (const constructor of [Screen, ScreenOrientation])
+    for (const key of Reflect.ownKeys(constructor.prototype)) {
+      if (key === "constructor" || key === Symbol.toStringTag) continue;
+      const descriptor = Object.getOwnPropertyDescriptor(
+        constructor.prototype, key);
+      Object.defineProperty(constructor.prototype, key, {
+        ...descriptor,
+        enumerable: true,
+      });
+    }
+  const screenValue = new Screen(screenToken);
+  globalThis.Screen = Screen;
+  globalThis.ScreenOrientation = ScreenOrientation;
+  /* `screen` is a [Replaceable] Window attribute: assigning shadows the
+     getter with an ordinary own data property for that realm. */
+  Object.defineProperty(globalThis, "screen", {
+    configurable: true,
+    enumerable: true,
+    get() { return screenValue; },
+    set(value) {
+      Object.defineProperty(globalThis, "screen", {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value,
+      });
     },
-  };
+  });
   globalThis.scrollX = globalThis.pageXOffset = 0;
   globalThis.scrollY = globalThis.pageYOffset = 0;
   globalThis.__tilefinchFrameEvalTelemetry = "none";
+  /* Cross-document postMessage crosses independent QuickJS runtimes. JSON is
+     not a structured-clone transport: it drops undefined and non-finite
+     numbers, destroys aliases/cycles, and turns typed arrays into records.
+     Keep a small, versioned graph wire instead. The final 64 KiB native queue
+     bound remains authoritative; the limits here stop hostile graphs before
+     serialization creates proportional intermediate state. */
+  const frameCloneMagic = "tilefinch-clone-v1",
+    frameCloneObjectLimit = 512,
+    frameClonePropertyLimit = 4096,
+    frameCloneDepthLimit = 64,
+    frameCloneBinaryLimit = 48 * 1024,
+    frameCloneWireLimit = 64 * 1024,
+    frameCloneViewTypes = Object.freeze({
+      Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array,
+      Int32Array, Uint32Array, Float32Array, Float64Array,
+      BigInt64Array: globalThis.BigInt64Array,
+      BigUint64Array: globalThis.BigUint64Array,
+      DataView,
+    }),
+    frameCloneError = (message) =>
+      new DOMException(String(message), "DataCloneError"),
+    frameCloneBytesToBase64 = (bytes) => {
+      if (bytes.byteLength > frameCloneBinaryLimit)
+        throw frameCloneError("message binary data exceeds bounded size");
+      return __tilefinchBase64EncodeBytes(bytes);
+    },
+    frameCloneBytesFromBase64 = (text) => {
+      const binary = __tilefinchBase64DecodeString(String(text));
+      if (binary.length > frameCloneBinaryLimit)
+        throw frameCloneError("message binary data exceeds bounded size");
+      const bytes = new TrustedUint8Array(binary.length);
+      for (let at = 0; at < binary.length; at++)
+        bytes[at] = trustedCharCodeAt(binary, at);
+      return bytes;
+    },
+    encodeFrameMessage = (value) => {
+      const memory = new Map(),
+        nodes = [];
+      let propertyCount = 0,
+        diagnosticEvent = "";
+      const encode = (item, depth) => {
+        if (depth > frameCloneDepthLimit)
+          throw frameCloneError("message nesting exceeds bounded depth");
+        if (item === null || typeof item === "string" ||
+            typeof item === "boolean") return item;
+        if (item === undefined) return ["u"];
+        if (typeof item === "number") {
+          if (trustedNumberIsNaN(item)) return ["n", "nan"];
+          if (item === Infinity) return ["n", "+inf"];
+          if (item === -Infinity) return ["n", "-inf"];
+          if (trustedObjectIs(item, -0)) return ["n", "-0"];
+          return item;
+        }
+        if (typeof item === "bigint") return ["bi", String(item)];
+        if (typeof item === "function" || typeof item === "symbol")
+          throw frameCloneError("message contains an unsupported value");
+        /* A Proxy is never structured-cloneable. Reject it before tag,
+           prototype, or key inspection so page traps cannot run as a side
+           effect of cross-realm postMessage. */
+        if (globalThis.__tilefinchIsProxy(item))
+          throw frameCloneError("Proxy values could not be cloned");
+        if (memory.has(item)) return ["r", memory.get(item)];
+        if (nodes.length >= frameCloneObjectLimit)
+          throw frameCloneError("message object count exceeds bounded size");
+        const id = nodes.length,
+          tag = trustedObjectTag(item);
+        memory.set(item, id);
+        nodes.push(null);
+        if (tag === "[object ArrayBuffer]") {
+          nodes[id] = {
+            t: "b",
+            v: frameCloneBytesToBase64(new TrustedUint8Array(item)),
+          };
+          return ["r", id];
+        }
+        if (tag === "[object DataView]") {
+          nodes[id] = {
+            t: "v", c: "DataView", b: encode(item.buffer, depth + 1),
+            o: item.byteOffset, l: item.byteLength,
+          };
+          return ["r", id];
+        }
+        if (trustedArrayBufferIsView(item)) {
+          nodes[id] = {
+            t: "v", c: tag.slice(8, -1),
+            b: encode(item.buffer, depth + 1),
+            o: item.byteOffset, l: item.length,
+          };
+          return ["r", id];
+        }
+        if (tag === "[object Date]") {
+          nodes[id] = { t: "d", v: trustedDateTime(item) };
+          return ["r", id];
+        }
+        if (tag === "[object RegExp]") {
+          nodes[id] = {
+            t: "x", s: trustedRegExpSource(item), f: trustedRegExpFlags(item),
+          };
+          return ["r", id];
+        }
+        if (tag === "[object Map]") {
+          const entries = [];
+          for (const pair of trustedMapEntries(item)) {
+            if (++propertyCount > frameClonePropertyLimit)
+              throw frameCloneError("message item count exceeds bounded size");
+            entries.push([
+              encode(pair[0], depth + 1), encode(pair[1], depth + 1),
+            ]);
+          }
+          nodes[id] = { t: "m", e: entries };
+          return ["r", id];
+        }
+        if (tag === "[object Set]") {
+          const entries = [];
+          for (const entry of trustedSetValues(item)) {
+            if (++propertyCount > frameClonePropertyLimit)
+              throw frameCloneError("message item count exceeds bounded size");
+            entries.push(encode(entry, depth + 1));
+          }
+          nodes[id] = { t: "s", e: entries };
+          return ["r", id];
+        }
+        if (tag.endsWith("Error]")) {
+          nodes[id] = {
+            t: "e", n: String(item.name || "Error"),
+            m: String(item.message || ""), s: String(item.stack || ""),
+          };
+          return ["r", id];
+        }
+        const isArray = trustedArrayIsArray(item),
+          prototype = trustedObjectPrototype(item);
+        /* Structured clone serializes ordinary class instances as ordinary
+           objects in the receiving realm. Requiring Object.prototype or a
+           null prototype incorrectly rejected those instances even though
+           their enumerable data is cloneable. Keep platform/native objects
+           outside the bounded profile through the same prototype classifier
+           used by the Worker clone path. */
+        if (!isArray && !(tag === "[object Object]" &&
+                          ordinaryClonePrototypeKind(prototype) !== 0))
+          throw frameCloneError("message contains an unsupported object");
+        if (isArray && item.length > frameClonePropertyLimit)
+          throw frameCloneError("message array length exceeds bounded size");
+        const properties = [],
+          keys = trustedObjectKeys(item);
+        if (propertyCount + keys.length > frameClonePropertyLimit)
+          throw frameCloneError("message property count exceeds bounded size");
+        propertyCount += keys.length;
+        for (const key of keys) {
+          const propertyValue = item[key],
+            encoded = encode(propertyValue, depth + 1);
+          properties.push([key, encoded]);
+          if (depth === 0 && key === "event" &&
+              typeof propertyValue === "string")
+            diagnosticEvent = trustedStringSlice(propertyValue, 0, 64);
+        }
+        nodes[id] = {
+          t: isArray ? "a" : "o",
+          l: isArray ? item.length : 0,
+          p: properties,
+        };
+        return ["r", id];
+      };
+      const root = encode(value, 0),
+        envelope = {
+          tilefinchClone: frameCloneMagic,
+          event: diagnosticEvent,
+          root,
+          nodes,
+        },
+        wire = trustedJSONStringify(envelope);
+      if (wire.length > frameCloneWireLimit)
+        throw frameCloneError("message exceeds bounded wire size");
+      return wire;
+    },
+    decodeFrameMessage = (wire) => {
+      const text = String(wire);
+      if (text.length > frameCloneWireLimit)
+        throw frameCloneError("message exceeds bounded wire size");
+      const envelope = trustedJSONParse(text);
+      if (!envelope || envelope.tilefinchClone !== frameCloneMagic ||
+          !trustedArrayIsArray(envelope.nodes))
+        return envelope;
+      if (envelope.nodes.length > frameCloneObjectLimit)
+        throw frameCloneError("message object count exceeds bounded size");
+      const nodes = new Array(envelope.nodes.length),
+        source = envelope.nodes,
+        errorTypes = {
+          Error, EvalError, RangeError, ReferenceError, SyntaxError, TypeError,
+          URIError,
+        };
+      let decodedItemCount = 0;
+      for (let at = 0; at < source.length; at++) {
+        const node = source[at];
+        if (!node || typeof node.t !== "string")
+          throw frameCloneError("message contains an invalid node");
+        if (node.t === "a") {
+          const length = Number(node.l);
+          if (!trustedNumberIsInteger(length) || length < 0 ||
+              length > frameClonePropertyLimit)
+            throw frameCloneError("message array length exceeds bounded size");
+          nodes[at] = new Array(length);
+        }
+        else if (node.t === "o") nodes[at] = {};
+        else if (node.t === "b")
+          nodes[at] = frameCloneBytesFromBase64(node.v).buffer;
+        else if (node.t === "d") nodes[at] = new Date(Number(node.v));
+        else if (node.t === "x") nodes[at] = new RegExp(node.s, node.f);
+        else if (node.t === "m") nodes[at] = new Map();
+        else if (node.t === "s") nodes[at] = new Set();
+        else if (node.t === "e") {
+          const ErrorType = errorTypes[String(node.n)] || Error;
+          nodes[at] = new ErrorType(String(node.m || ""));
+          try { nodes[at].stack = String(node.s || ""); } catch (_) {}
+        } else if (node.t !== "v")
+          throw frameCloneError("message contains an invalid node type");
+      }
+      const decode = (item) => {
+        if (!trustedArrayIsArray(item)) return item;
+        if (item[0] === "u") return undefined;
+        if (item[0] === "bi") return BigInt(item[1]);
+        if (item[0] === "n") {
+          if (item[1] === "nan") return NaN;
+          if (item[1] === "+inf") return Infinity;
+          if (item[1] === "-inf") return -Infinity;
+          if (item[1] === "-0") return -0;
+        }
+        if (item[0] !== "r" || !trustedNumberIsInteger(item[1]) ||
+            item[1] < 0 || item[1] >= nodes.length)
+          throw frameCloneError("message contains an invalid reference");
+        return nodes[item[1]];
+      };
+      for (let at = 0; at < source.length; at++) {
+        const node = source[at];
+        if (node.t === "v") {
+          const buffer = decode(node.b),
+            constructor = frameCloneViewTypes[node.c];
+          if (!(buffer instanceof ArrayBuffer) || typeof constructor !== "function")
+            throw frameCloneError("message contains an invalid view");
+          nodes[at] = node.c === "DataView"
+            ? new constructor(buffer, Number(node.o), Number(node.l))
+            : new constructor(buffer, Number(node.o), Number(node.l));
+        }
+      }
+      for (let at = 0; at < source.length; at++) {
+        const node = source[at], target = nodes[at];
+        if (node.t === "a" || node.t === "o") {
+          if (!trustedArrayIsArray(node.p) ||
+              node.p.length > frameClonePropertyLimit ||
+              decodedItemCount > frameClonePropertyLimit - node.p.length)
+            throw frameCloneError("message contains invalid properties");
+          decodedItemCount += node.p.length;
+          for (const pair of node.p) {
+            if (!trustedArrayIsArray(pair) || pair.length !== 2)
+              throw frameCloneError("message contains an invalid property");
+            trustedDefineProperty(target, String(pair[0]), {
+              configurable: true, enumerable: true, writable: true,
+              value: decode(pair[1]),
+            });
+          }
+        } else if (node.t === "m") {
+          if (!trustedArrayIsArray(node.e) ||
+              decodedItemCount > frameClonePropertyLimit - node.e.length)
+            throw frameCloneError("message contains invalid map entries");
+          decodedItemCount += node.e.length;
+          for (const pair of node.e) {
+            if (!trustedArrayIsArray(pair) || pair.length !== 2)
+              throw frameCloneError("message contains an invalid map entry");
+            trustedMapSet(target, decode(pair[0]), decode(pair[1]));
+          }
+        } else if (node.t === "s") {
+          if (!trustedArrayIsArray(node.e) ||
+              decodedItemCount > frameClonePropertyLimit - node.e.length)
+            throw frameCloneError("message contains invalid set entries");
+          decodedItemCount += node.e.length;
+          for (const entry of node.e) trustedSetAdd(target, decode(entry));
+        }
+      }
+      return decode(envelope.root);
+    };
   const normalizePostMessageTarget = (value, senderOrigin) => {
+      /* HTML exposes both the legacy postMessage(message, targetOrigin)
+         signature and the options-dictionary overload.  Resolve the overload
+         here so top-level, parent and nested-frame senders all observe the
+         same single targetOrigin getter. Transferables remain outside the
+         bounded frame-message profile; an options object with no transfer
+         list is still fully useful and is the form used by current web apps. */
+      if (value !== null && typeof value === "object")
+        value = value.targetOrigin;
       if (value === undefined || value === "/") return String(senderOrigin);
       const text = String(value);
       if (text === "*") return text;
+      if (!/^[A-Za-z][A-Za-z0-9+.-]*:/.test(text))
+        throw new DOMException("Invalid target origin", "SyntaxError");
       let parsed;
       try {
         parsed = new TilefinchURL(text, location.href);
@@ -5902,11 +7058,13 @@
         targetOrigin,
         location.origin,
       );
-      const json = trustedJSONStringify(data);
+      const wire = encodeFrameMessage(data);
       __tilefinchPostMessage(
         0,
-        json === undefined ? "null" : json,
+        wire,
         normalizedTarget,
+        globalThis.__tilefinchActiveTaskKind,
+        globalThis.__tilefinchActiveTaskSequence,
       );
     },
   });
@@ -5919,11 +7077,13 @@
         targetOrigin,
         location.origin,
       );
-      const json = trustedJSONStringify(data);
+      const wire = encodeFrameMessage(data);
       __tilefinchPostMessage(
         -1,
-        json === undefined ? "null" : json,
+        wire,
         normalizedTarget,
+        globalThis.__tilefinchActiveTaskKind,
+        globalThis.__tilefinchActiveTaskSequence,
       );
     },
   });
@@ -5933,8 +7093,8 @@
      the global object. */
   const frames = globalThis.__tilefinchInstallFrames({
     wrap,
-    trustedJSONParse,
-    trustedJSONStringify,
+    encodeFrameMessage,
+    decodeFrameMessage,
     trustedStringLower,
     trustedCharCodeAt,
     trustedStringSlice,
@@ -5998,45 +7158,49 @@
     event.newURL = location.href;
     globalThis.dispatchEvent(event);
   };
-  const windowListeners = new Map();
   globalThis.addEventListener = (type, callback, options = false) =>
-    globalThis.__tilefinchAddEventListener(
-      windowListeners,
-      type,
-      callback,
-      options,
-    );
+    EventTarget.prototype.addEventListener.call(
+      globalThis, type, callback, options);
   globalThis.removeEventListener = (type, callback, options = false) =>
-    globalThis.__tilefinchRemoveEventListener(
-      windowListeners,
-      type,
-      callback,
-      options,
-    );
+    EventTarget.prototype.removeEventListener.call(
+      globalThis, type, callback, options);
+  const windowMessageHandlers = new Map(),
+    setWindowMessageHandler = (type, value) => {
+      let slot = windowMessageHandlers.get(type);
+      if (!slot) {
+        slot = { value: null, wrapper: null };
+        windowMessageHandlers.set(type, slot);
+      }
+      const callback = typeof value === "function" ? value : null;
+      if (callback === slot.value) return;
+      slot.value = callback;
+      if (callback !== null && slot.wrapper === null) {
+        /* Event-handler attributes occupy one stable position in the shared
+           listener list. Replacing a handler preserves that position; a
+           null/re-add pair registers a new position at the end. */
+        slot.wrapper = function (event) {
+          const current = slot.value;
+          if (typeof current === "function")
+            return trustedFunctionApply(current, this, [event]);
+        };
+        EventTarget.prototype.addEventListener.call(
+          globalThis, type, slot.wrapper, false);
+      } else if (callback === null && slot.wrapper !== null) {
+        EventTarget.prototype.removeEventListener.call(
+          globalThis, type, slot.wrapper, false);
+        slot.wrapper = null;
+      }
+    };
+  for (const type of ["message", "messageerror"])
+    Object.defineProperty(globalThis, "on" + type, {
+      configurable: true,
+      enumerable: true,
+      get() { return windowMessageHandlers.get(type)?.value || null; },
+      set(value) { setWindowMessageHandler(type, value); },
+    });
   globalThis.__tilefinchInvokeWindowEvent = (event, capture) => {
     event.currentTarget = globalThis;
     event.eventPhase = globalThis === event.target ? 2 : capture ? 1 : 3;
-    if (!capture) {
-      const handler = globalThis["on" + event.type];
-      if (typeof handler === "function")
-        try {
-          globalThis.__tilefinchRecordEventHandler();
-          globalThis.__tilefinchRunTask(
-            "window-handler:" + String(event.type),
-            handler,
-            globalThis,
-            [event],
-          );
-        } catch (error) {
-          __tilefinchReportUncaught(error, "window event " + event.type);
-        }
-    }
-    globalThis.__tilefinchInvokeListenerList(
-      windowListeners,
-      globalThis,
-      event,
-      capture,
-    );
     globalThis.__tilefinchInvokeEventTarget(
       globalThis,
       event,
@@ -6053,11 +7217,45 @@
       if (!value.__immediateStopped)
         globalThis.__tilefinchInvokeWindowEvent(value, false);
     }
-    value.currentTarget = null;
-    value.eventPhase = 0;
-    value.__dispatching = false;
+    globalThis.__tilefinchFinishEventDispatch(value);
     __tilefinchRecordEvent();
     return !value.defaultPrevented;
+  };
+  globalThis.__tilefinchDispatchWindowEventCheckpointed = (event) => {
+    const value = event,
+      path = [globalThis];
+    globalThis.__tilefinchPrepareEvent(value, globalThis, path);
+    const finish = () => {
+        globalThis.__tilefinchFinishEventDispatch(value);
+        __tilefinchRecordEvent();
+      },
+      invokeHandler = () => {
+        if (windowMessageHandlers.has(String(value.type))) return;
+        const handler = globalThis["on" + value.type];
+        if (typeof handler !== "function") return;
+        value.currentTarget = globalThis;
+        value.eventPhase = Event.AT_TARGET;
+        try {
+          globalThis.__tilefinchRecordEventHandler();
+          globalThis.__tilefinchRunTask(
+            "window-handler:" + String(value.type),
+            handler,
+            globalThis,
+            [value],
+          );
+        } catch (error) {
+          __tilefinchReportUncaught(error, "window event " + value.type);
+        }
+      };
+    if (value.__stopped) finish();
+    else globalThis.__tilefinchInvokeEventTargetCheckpointed(
+      globalThis,
+      value,
+      Event.AT_TARGET,
+      null,
+      invokeHandler,
+      finish,
+    );
   };
   {
     /* Navigator is a platform object, not a mutable record. Keeping its
@@ -6086,17 +7284,50 @@
         }),
         Object.freeze({ brand: "Not.A/Brand", version: "99.0.0.0" }),
       ]);
+    const queuePlatformTask = (operation, quotaLabel = "Platform") =>
+      new Promise((resolve, reject) => {
+        const task = setTimeout(() => {
+          try { resolve(operation()); }
+          catch (error) { reject(error); }
+        }, 0);
+        if (task === 0)
+          reject(new DOMException(
+            quotaLabel + " task quota exceeded", "QuotaExceededError"));
+      });
     class WGSLLanguageFeatures {
       constructor() {
         if (arguments[0] !== wgslLanguageFeaturesToken)
           throw new TypeError("Illegal constructor");
       }
-      get size() { return 0; }
-      has() { return false; }
-      entries() { return [][Symbol.iterator](); }
-      keys() { return [][Symbol.iterator](); }
-      values() { return [][Symbol.iterator](); }
-      forEach() {}
+      get size() {
+        if (!(this instanceof WGSLLanguageFeatures))
+          throw new TypeError("Illegal invocation");
+        return 0;
+      }
+      has() {
+        if (!(this instanceof WGSLLanguageFeatures))
+          throw new TypeError("Illegal invocation");
+        return false;
+      }
+      entries() {
+        if (!(this instanceof WGSLLanguageFeatures))
+          throw new TypeError("Illegal invocation");
+        return [][Symbol.iterator]();
+      }
+      keys() {
+        if (!(this instanceof WGSLLanguageFeatures))
+          throw new TypeError("Illegal invocation");
+        return [][Symbol.iterator]();
+      }
+      values() {
+        if (!(this instanceof WGSLLanguageFeatures))
+          throw new TypeError("Illegal invocation");
+        return [][Symbol.iterator]();
+      }
+      forEach() {
+        if (!(this instanceof WGSLLanguageFeatures))
+          throw new TypeError("Illegal invocation");
+      }
       [Symbol.iterator]() { return this.values(); }
     }
     Object.defineProperty(
@@ -6109,9 +7340,45 @@
         if (arguments[0] !== gpuToken)
           throw new TypeError("Illegal constructor");
       }
-      get wgslLanguageFeatures() { return wgslLanguageFeatures; }
-      getPreferredCanvasFormat() { return "bgra8unorm"; }
-      requestAdapter() { return Promise.resolve(null); }
+      get wgslLanguageFeatures() {
+        if (!(this instanceof GPU)) throw new TypeError("Illegal invocation");
+        return wgslLanguageFeatures;
+      }
+      getPreferredCanvasFormat() {
+        if (!(this instanceof GPU)) throw new TypeError("Illegal invocation");
+        return "bgra8unorm";
+      }
+      requestAdapter(options = {}) {
+        if (!(this instanceof GPU)) throw new TypeError("Illegal invocation");
+        /* Even without an admitted WebGPU adapter, Web IDL still converts the
+           complete options dictionary. Sites use those ordered conversions
+           to distinguish an implementation from a placeholder. Conversion
+           failures reject this promise; an unavailable adapter resolves to
+           null from the WebGPU task timeline. */
+        try {
+          if (options === null || options === undefined) options = {};
+          const featureValue = options.featureLevel,
+            featureLevel = featureValue === undefined
+              ? "core" : String(featureValue),
+            forceFallbackAdapter = Boolean(options.forceFallbackAdapter),
+            powerValue = options.powerPreference,
+            powerPreference = powerValue === undefined
+              ? undefined : String(powerValue),
+            xrCompatible = Boolean(options.xrCompatible);
+          if (powerPreference !== undefined
+              && powerPreference !== "low-power"
+              && powerPreference !== "high-performance")
+            throw new TypeError("Invalid GPU powerPreference");
+          /* Preserve all observable conversions while making the PSP's lack
+             of a WebGPU adapter explicit. */
+          void featureLevel;
+          void forceFallbackAdapter;
+          void xrCompatible;
+        } catch (error) {
+          return Promise.reject(error);
+        }
+        return queuePlatformTask(() => null, "WebGPU");
+      }
     }
     Object.defineProperty(GPU.prototype, Symbol.toStringTag, {
       configurable: true,
@@ -6171,29 +7438,57 @@
         if (arguments[0] !== uaDataToken)
           throw new TypeError("Illegal constructor");
       }
-      get brands() { return brands; }
-      get mobile() { return true; }
-      get platform() { return "PlayStation Portable"; }
+      get brands() {
+        if (!(this instanceof NavigatorUAData))
+          throw new TypeError("Illegal invocation");
+        return brands;
+      }
+      get mobile() {
+        if (!(this instanceof NavigatorUAData))
+          throw new TypeError("Illegal invocation");
+        return true;
+      }
+      get platform() {
+        if (!(this instanceof NavigatorUAData))
+          throw new TypeError("Illegal invocation");
+        return "PlayStation Portable";
+      }
       getHighEntropyValues(hints) {
-        const all = {
+        if (!(this instanceof NavigatorUAData))
+          throw new TypeError("Illegal invocation");
+        /* Web IDL converts the complete sequence before the operation runs.
+           Keep the observable iterator/string order while bounding hostile
+           iterables independently of the number of hints we recognize. */
+        const requested = [];
+        for (const hint of hints) {
+          if (requested.length >= 64)
+            throw new RangeError("UA client hint quota exceeded");
+          requested.push(String(hint));
+        }
+        const all = Object.assign(Object.create(null), {
             architecture: "MIPS",
             bitness: "32",
+            formFactors: Object.freeze(["Mobile"]),
             model: "PSP-3000",
             platform: "PlayStation Portable",
             platformVersion: "6.61",
             uaFullVersion: String(globalThis.__tilefinchBrowserFullVersion),
             fullVersionList,
-          },
+            wow64: false,
+          }),
           value = {
             brands,
             mobile: true,
             platform: "PlayStation Portable",
           };
-        for (const hint of hints || [])
-          if (hint in all) value[hint] = all[hint];
+        for (const hint of requested)
+          if (Object.prototype.hasOwnProperty.call(all, hint))
+            value[hint] = all[hint];
         return Promise.resolve(value);
       }
       toJSON() {
+        if (!(this instanceof NavigatorUAData))
+          throw new TypeError("Illegal invocation");
         return { brands, mobile: true, platform: "PlayStation Portable" };
       }
     }
@@ -6301,28 +7596,33 @@
       estimate() {
         if (!(this instanceof StorageManager))
           throw new TypeError("Illegal invocation");
-        const values = globalThis.__tilefinchStorageEstimate();
-        if (!values)
-          return Promise.reject(
-            new DOMException(
-              "Storage is unavailable for this origin",
-              "SecurityError",
-            ),
-          );
-        return Promise.resolve({
-          usage: Math.max(0, Number(values[0]) || 0),
-          quota: Math.max(0, Number(values[1]) || 0),
-        });
+        return queuePlatformTask(() => {
+          const values = globalThis.__tilefinchStorageEstimate();
+          if (!values)
+            throw new TypeError("Storage is unavailable for this origin");
+          return {
+            usage: Math.max(0, Number(values[0]) || 0),
+            quota: Math.max(0, Number(values[1]) || 0),
+          };
+        }, "Storage");
       }
       persisted() {
         if (!(this instanceof StorageManager))
           throw new TypeError("Illegal invocation");
-        return Promise.resolve(false);
+        return queuePlatformTask(() => {
+          if (!globalThis.__tilefinchStorageAvailable())
+            throw new TypeError("Storage is unavailable for this origin");
+          return false;
+        }, "Storage");
       }
       persist() {
         if (!(this instanceof StorageManager))
           throw new TypeError("Illegal invocation");
-        return Promise.resolve(false);
+        return queuePlatformTask(() => {
+          if (!globalThis.__tilefinchStorageAvailable())
+            throw new TypeError("Storage is unavailable for this origin");
+          return false;
+        }, "Storage");
       }
     }
     Object.defineProperty(StorageManager.prototype, Symbol.toStringTag, {
@@ -6361,17 +7661,43 @@
         if (arguments[0] !== keyboardLayoutMapToken)
           throw new TypeError("Illegal constructor");
       }
-      get size() { return 0; }
-      entries() { return emptyKeyboardMap.entries(); }
+      get size() {
+        if (!(this instanceof KeyboardLayoutMap))
+          throw new TypeError("Illegal invocation");
+        return 0;
+      }
+      entries() {
+        if (!(this instanceof KeyboardLayoutMap))
+          throw new TypeError("Illegal invocation");
+        return emptyKeyboardMap.entries();
+      }
       forEach(callback, thisArg) {
+        if (!(this instanceof KeyboardLayoutMap))
+          throw new TypeError("Illegal invocation");
         if (typeof callback !== "function")
           throw new TypeError("callback must be a function");
         emptyKeyboardMap.forEach(callback, thisArg);
       }
-      get(key) { return emptyKeyboardMap.get(String(key)); }
-      has(key) { return emptyKeyboardMap.has(String(key)); }
-      keys() { return emptyKeyboardMap.keys(); }
-      values() { return emptyKeyboardMap.values(); }
+      get(key) {
+        if (!(this instanceof KeyboardLayoutMap))
+          throw new TypeError("Illegal invocation");
+        return emptyKeyboardMap.get(String(key));
+      }
+      has(key) {
+        if (!(this instanceof KeyboardLayoutMap))
+          throw new TypeError("Illegal invocation");
+        return emptyKeyboardMap.has(String(key));
+      }
+      keys() {
+        if (!(this instanceof KeyboardLayoutMap))
+          throw new TypeError("Illegal invocation");
+        return emptyKeyboardMap.keys();
+      }
+      values() {
+        if (!(this instanceof KeyboardLayoutMap))
+          throw new TypeError("Illegal invocation");
+        return emptyKeyboardMap.values();
+      }
       [Symbol.iterator]() { return this.entries(); }
     }
     class Keyboard {
@@ -6382,9 +7708,11 @@
       getLayoutMap() {
         if (!(this instanceof Keyboard))
           throw new TypeError("Illegal invocation");
-        if (keyboardLayoutMap === null)
-          keyboardLayoutMap = new KeyboardLayoutMap(keyboardLayoutMapToken);
-        return Promise.resolve(keyboardLayoutMap);
+        return queuePlatformTask(() => {
+          if (keyboardLayoutMap === null)
+            keyboardLayoutMap = new KeyboardLayoutMap(keyboardLayoutMapToken);
+          return keyboardLayoutMap;
+        });
       }
       lock() {
         if (!(this instanceof Keyboard))
@@ -6440,9 +7768,9 @@
   }
   {
     /* One fixed built-in controller is exposed only while the user has
-       explicitly handed page input to the document. Keep every public object
-       stable and mutate bounded closure state so a 30 Hz game loop does not
-       allocate a new Gamepad graph on every poll. */
+       explicitly handed page input to the document. Keep the Gamepad graph
+       stable and mutate bounded closure state; only the sequence snapshot
+       returned by getGamepads() is fresh, as Web IDL requires. */
     const buttonValues = new Array(17).fill(0),
       axisValues = [0, 0, 0, 0],
       buttons = buttonValues.map((_, index) =>
@@ -6469,6 +7797,7 @@
     Object.freeze(axes);
     Object.freeze(buttons);
     let connected = false,
+      hasGamepadGesture = false,
       timestamp = 0,
       currentButtonBits = 0;
     /* PSP analog input can change on every sampled frame. Keep that hot
@@ -6491,9 +7820,7 @@
         buttons,
         vibrationActuator: null,
         [Symbol.toStringTag]: "Gamepad",
-      }),
-      connectedPads = Object.freeze([gamepad]),
-      disconnectedPads = Object.freeze([null]);
+      });
     class GamepadEvent {
       constructor(type, init = {}) {
         /* Event is installed by the later compatibility bootstrap. Controller
@@ -6519,7 +7846,12 @@
       value: function getGamepads() {
         if (!(this instanceof Navigator))
           throw new TypeError("Illegal invocation");
-        return connected ? connectedPads : disconnectedPads;
+        /* Before an explicit page-controls handoff, exposing even a null slot
+           reveals the presence of the built-in controller. Afterwards retain
+           its assigned index across disconnects, but return a new sequence so
+           author mutation cannot poison later snapshots. */
+        if (!hasGamepadGesture) return [];
+        return [connected ? gamepad : null];
       },
     });
     globalThis.__tilefinchUpdateGamepad = (
@@ -6530,6 +7862,7 @@
       nextTimestamp,
     ) => {
       nextConnected = !!nextConnected;
+      if (nextConnected) hasGamepadGesture = true;
       buttonBits = Number(buttonBits) >>> 0;
       if (buttonBits !== currentButtonBits) {
         currentButtonBits = buttonBits;
@@ -6804,10 +8137,9 @@
         },
       );
     };
-  globalThis.getComputedStyle = (node, pseudo = null) => {
-    if (!node || !node.style) return {};
-    const connected = Number.isInteger(node.__handle) && node.__handle > 0;
-    const defaults = {
+  const computedStyleToken = {},
+    computedStyleStates = new WeakMap(),
+    computedStyleDefaults = {
       display: "block",
       visibility: "visible",
       opacity: "1",
@@ -6818,46 +8150,117 @@
       filter: "none",
       contain: "none",
       overflow: "visible",
+    },
+    computedStyleProperties = Array.from(new Set([
+      ...Object.keys(computedStyleDefaults).map(__tilefinchCssName),
+      ...sparseComputedProperties,
+    ])).sort(),
+    computedStylePropertyNames = new Set(computedStyleProperties),
+    computedStyleState = (value) => {
+      const state = computedStyleStates.get(value);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state;
+    },
+    computedStyleRead = (state, name) => {
+      name = __tilefinchCssName(name);
+      const inline = state.node.style.getPropertyValue(name),
+        computed = state.connected
+          ? __tilefinchComputedStyleGet(
+              state.node.__handle, name, state.pseudo)
+          : "";
+      /* The host resolves custom properties across inline declarations,
+         the author cascade, inheritance, and var() substitution. An empty
+         result is meaningful for a guaranteed-invalid custom value. */
+      if (name.startsWith("--")) return computed;
+      return computedSparseValue(
+        state.node, name,
+        computed || inline || computedStyleDefaults[name] || "");
+    },
+    computedStyleReadonly = () => {
+      throw new DOMException(
+        "Computed styles are read-only", "NoModificationAllowedError");
     };
-    return new Proxy(
+  class CSSStyleDeclaration {
+    constructor(token) {
+      if (token !== computedStyleToken)
+        throw new TypeError("Illegal constructor");
+    }
+    get cssText() { return ""; }
+    set cssText(_value) { computedStyleReadonly(); }
+    get length() { computedStyleState(this); return computedStyleProperties.length; }
+    get parentRule() { computedStyleState(this); return null; }
+    item(index) {
+      computedStyleState(this);
+      index = Number(index) >>> 0;
+      return computedStyleProperties[index] || "";
+    }
+    getPropertyValue(name) {
+      return computedStyleRead(computedStyleState(this), name);
+    }
+    getPropertyPriority(_name) { computedStyleState(this); return ""; }
+    [Symbol.iterator]() {
+      computedStyleState(this);
+      return computedStyleProperties[Symbol.iterator]();
+    }
+    setProperty(_name, _value, _priority) { computedStyleReadonly(); }
+    removeProperty(_name) { computedStyleReadonly(); }
+  }
+  Object.defineProperty(CSSStyleDeclaration.prototype, Symbol.toStringTag, {
+    configurable: true,
+    value: "CSSStyleDeclaration",
+  });
+  globalThis.CSSStyleDeclaration = CSSStyleDeclaration;
+  globalThis.getComputedStyle = (node, pseudo = null) => {
+    if (!node || !node.style)
+      throw new TypeError("getComputedStyle requires an Element");
+    const target = new CSSStyleDeclaration(computedStyleToken),
+      state = {
+        node,
+        connected: Number.isInteger(node.__handle) && node.__handle > 0,
+        pseudo: pseudo === null ? "" : String(pseudo),
+      };
+    computedStyleStates.set(target, state);
+    const proxy = new Proxy(
+      target,
       {
-        getPropertyValue(name) {
-          name = __tilefinchCssName(name);
-          const inline = node.style.getPropertyValue(name),
-            computed = connected
-              ? __tilefinchComputedStyleGet(
-                  node.__handle,
-                  name,
-                  pseudo === null ? "" : String(pseudo),
-                )
-              : "";
-          // The host resolves custom properties across inline declarations,
-          // the author cascade, inheritance, and var() substitution.  An
-          // empty result is meaningful here: it is also the computed
-          // serialization of a guaranteed-invalid value, so do not revive
-          // an unresolved token stream through the ordinary inline fallback.
-          if (name.startsWith("--")) return computed;
-          return computedSparseValue(node, name, (
-            computed ||
-            inline ||
-            defaults[name] ||
-            ""
-          ));
+        get(object, name, receiver) {
+          if (typeof name === "string" && /^\d+$/.test(name))
+            return object.item(Number(name));
+          return name in object
+            ? Reflect.get(object, name, receiver)
+            : typeof name === "string"
+              ? object.getPropertyValue(name) : undefined;
         },
-      },
-      {
-        get(target, name) {
-          return name in target ? target[name] : target.getPropertyValue(name);
-        },
-        has(target, name) {
+        set() { computedStyleReadonly(); },
+        deleteProperty() { computedStyleReadonly(); },
+        has(object, name) {
+          if (typeof name === "string" && /^\d+$/.test(name))
+            return Number(name) < computedStyleProperties.length;
           return (
-            name in target ||
+            name in object ||
             (typeof name === "string" &&
-              sparseComputedProperties.has(__tilefinchCssName(name)))
+              computedStylePropertyNames.has(__tilefinchCssName(name)))
           );
+        },
+        ownKeys() {
+          return computedStyleProperties.map((_name, index) => String(index));
+        },
+        getOwnPropertyDescriptor(_object, name) {
+          if (typeof name === "string" && /^\d+$/.test(name)
+              && Number(name) < computedStyleProperties.length) {
+            return {
+              configurable: true,
+              enumerable: true,
+              writable: false,
+              value: computedStyleProperties[Number(name)],
+            };
+          }
+          return undefined;
         },
       },
     );
+    computedStyleStates.set(proxy, state);
+    return proxy;
   };
   {
     const mediaLength = (value) => {
@@ -7215,13 +8618,19 @@
     globalThis.MediaQueryListEvent = MediaQueryListEvent;
     globalThis.matchMedia = (query) => new MediaQueryList(query);
   }
+  const performanceEntryState = new WeakMap(),
+    requirePerformanceEntryState = (value) => {
+      const state = performanceEntryState.get(value);
+      if (!state) throw new TypeError("Illegal invocation");
+      return state;
+    };
   class PerformanceEntry {
     constructor(name, type, startTime = 0, duration = 0) {
-      Object.defineProperties(this, {
-        name: { configurable: true, value: String(name) },
-        entryType: { configurable: true, value: String(type) },
-        startTime: { configurable: true, value: Number(startTime) },
-        duration: { configurable: true, value: Number(duration) },
+      performanceEntryState.set(this, {
+        base: [String(name), String(type), Number(startTime), Number(duration)],
+        resource: null,
+        navigation: null,
+        detail: null,
       });
     }
     toJSON() {
@@ -7233,68 +8642,114 @@
       };
     }
   }
+  const performanceMeasureToken = {};
+  class PerformanceMark extends PerformanceEntry {
+    constructor(name, options = {}) {
+      options = Object(options);
+      const start = options.startTime === undefined
+        ? __tilefinchPerformanceNow(4) : Number(options.startTime);
+      if (!Number.isFinite(start) || start < 0)
+        throw new TypeError("startTime must be a finite nonnegative number");
+      super(String(name), "mark", start, 0);
+      requirePerformanceEntryState(this).detail = cloneWorkerValue(
+        options.detail === undefined ? null : options.detail,
+        ownerWorkerCloneIntrinsics,
+      );
+    }
+    get detail() {
+      return requirePerformanceEntryState(this).detail;
+    }
+    toJSON() {
+      return { ...super.toJSON(), detail: this.detail };
+    }
+  }
+  class PerformanceMeasure extends PerformanceEntry {
+    constructor(token, name, start, duration, detail) {
+      if (token !== performanceMeasureToken)
+        throw new TypeError("Illegal constructor");
+      super(name, "measure", start, duration);
+      requirePerformanceEntryState(this).detail = detail;
+    }
+    get detail() {
+      return requirePerformanceEntryState(this).detail;
+    }
+    toJSON() {
+      return { ...super.toJSON(), detail: this.detail };
+    }
+  }
+  for (const [name, index] of [
+    ["name", 0], ["entryType", 1], ["startTime", 2], ["duration", 3],
+  ])
+    Object.defineProperty(PerformanceEntry.prototype, name, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return requirePerformanceEntryState(this).base[index];
+      },
+    });
+  const visibilityStateEntryToken = {};
+  class VisibilityStateEntry extends PerformanceEntry {
+    constructor(token, state, startTime) {
+      if (token !== visibilityStateEntryToken)
+        throw new TypeError("Illegal constructor");
+      super(state === "hidden" ? "hidden" : "visible",
+        "visibility-state", startTime, 0);
+    }
+  }
+  const performanceFiniteTiming = (value, fallback) => {
+    if (value === undefined) return fallback;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  };
+  const performanceEmptyServerTiming = Object.freeze([]);
   class PerformanceResourceTiming extends PerformanceEntry {
     constructor(name, initiatorType = "other", timing = {}) {
-      const startTime = Number(timing.startTime) || 0,
-        responseEnd = Number(timing.responseEnd) || startTime;
+      const startTime = performanceFiniteTiming(timing.startTime, 0),
+        responseEnd = performanceFiniteTiming(timing.responseEnd, startTime);
       super(name, "resource", startTime, Math.max(0, responseEnd - startTime));
-      Object.defineProperties(this, {
-        initiatorType: {
-          configurable: true,
-          value: String(initiatorType),
-        },
-        nextHopProtocol: { configurable: true, value: "h2" },
-        workerStart: { configurable: true, value: 0 },
-        redirectStart: { configurable: true, value: 0 },
-        redirectEnd: { configurable: true, value: 0 },
-        fetchStart: { configurable: true, value: startTime },
-        domainLookupStart: {
-          configurable: true,
-          value: Number(timing.domainLookupStart) || startTime,
-        },
-        domainLookupEnd: {
-          configurable: true,
-          value: Number(timing.domainLookupEnd) || startTime,
-        },
-        connectStart: {
-          configurable: true,
-          value: Number(timing.connectStart) || startTime,
-        },
-        secureConnectionStart: {
-          configurable: true,
-          value: Number(timing.secureConnectionStart) || 0,
-        },
-        connectEnd: {
-          configurable: true,
-          value: Number(timing.connectEnd) || startTime,
-        },
-        requestStart: {
-          configurable: true,
-          value: Number(timing.requestStart) || startTime,
-        },
-        responseStart: {
-          configurable: true,
-          value: Number(timing.responseStart) || startTime,
-        },
-        responseEnd: { configurable: true, value: responseEnd },
-        transferSize: {
-          configurable: true,
-          value: Number(timing.transferSize) || 0,
-        },
-        encodedBodySize: {
-          configurable: true,
-          value: Number(timing.encodedBodySize) || 0,
-        },
-        decodedBodySize: {
-          configurable: true,
-          value: Number(timing.decodedBodySize) || 0,
-        },
-      });
+      requirePerformanceEntryState(this).resource = {
+        initiatorType: String(initiatorType),
+        deliveryType: String(timing.deliveryType || ""),
+        nextHopProtocol: String(timing.nextHopProtocol || ""),
+        workerStart: 0,
+        redirectStart: 0,
+        redirectEnd: 0,
+        fetchStart: startTime,
+        domainLookupStart:
+          performanceFiniteTiming(timing.domainLookupStart, startTime),
+        domainLookupEnd:
+          performanceFiniteTiming(timing.domainLookupEnd, startTime),
+        connectStart: performanceFiniteTiming(timing.connectStart, startTime),
+        secureConnectionStart:
+          performanceFiniteTiming(timing.secureConnectionStart, 0),
+        connectEnd: performanceFiniteTiming(timing.connectEnd, startTime),
+        requestStart: performanceFiniteTiming(timing.requestStart, startTime),
+        finalResponseHeadersStart:
+          performanceFiniteTiming(timing.finalResponseHeadersStart, 0),
+        firstInterimResponseStart: 0,
+        responseStart: performanceFiniteTiming(timing.responseStart, startTime),
+        responseEnd,
+        workerRouterEvaluationStart: 0,
+        workerCacheLookupStart: 0,
+        workerMatchedRouterSource: "",
+        workerFinalRouterSource: "",
+        transferSize: Number(timing.transferSize) || 0,
+        encodedBodySize: Number(timing.encodedBodySize) || 0,
+        decodedBodySize: Number(timing.decodedBodySize) || 0,
+        responseStatus: Math.max(0, Math.min(65535,
+          Math.trunc(Number(timing.responseStatus) || 0))),
+        renderBlockingStatus: timing.renderBlockingStatus === "blocking"
+          ? "blocking" : "non-blocking",
+        contentType: String(timing.contentType || ""),
+        contentEncoding: "",
+        serverTiming: performanceEmptyServerTiming,
+      };
     }
     toJSON() {
       return {
         ...super.toJSON(),
         initiatorType: this.initiatorType,
+        deliveryType: this.deliveryType,
         nextHopProtocol: this.nextHopProtocol,
         workerStart: this.workerStart,
         redirectStart: this.redirectStart,
@@ -7306,52 +8761,110 @@
         secureConnectionStart: this.secureConnectionStart,
         connectEnd: this.connectEnd,
         requestStart: this.requestStart,
+        finalResponseHeadersStart: this.finalResponseHeadersStart,
+        firstInterimResponseStart: this.firstInterimResponseStart,
         responseStart: this.responseStart,
         responseEnd: this.responseEnd,
+        workerRouterEvaluationStart: this.workerRouterEvaluationStart,
+        workerCacheLookupStart: this.workerCacheLookupStart,
+        workerMatchedRouterSource: this.workerMatchedRouterSource,
+        workerFinalRouterSource: this.workerFinalRouterSource,
         transferSize: this.transferSize,
         encodedBodySize: this.encodedBodySize,
         decodedBodySize: this.decodedBodySize,
+        responseStatus: this.responseStatus,
+        renderBlockingStatus: this.renderBlockingStatus,
+        contentType: this.contentType,
+        contentEncoding: this.contentEncoding,
+        serverTiming: this.serverTiming,
       };
     }
   }
+  for (const name of [
+    "initiatorType", "deliveryType", "nextHopProtocol", "workerStart",
+    "redirectStart", "redirectEnd", "fetchStart", "domainLookupStart",
+    "domainLookupEnd", "connectStart", "secureConnectionStart", "connectEnd",
+    "requestStart", "finalResponseHeadersStart", "firstInterimResponseStart",
+    "responseStart", "responseEnd", "workerRouterEvaluationStart",
+    "workerCacheLookupStart", "workerMatchedRouterSource",
+    "workerFinalRouterSource", "transferSize", "encodedBodySize",
+    "decodedBodySize", "responseStatus", "renderBlockingStatus", "contentType",
+    "contentEncoding", "serverTiming",
+  ])
+    Object.defineProperty(PerformanceResourceTiming.prototype, name, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        const state = requirePerformanceEntryState(this).resource;
+        if (!state) throw new TypeError("Illegal invocation");
+        return state[name];
+      },
+    });
   class PerformanceNavigationTiming extends PerformanceResourceTiming {
     constructor(name) {
       super(name, "navigation");
-      Object.defineProperties(this, {
-        entryType: { configurable: true, value: "navigation" },
-        type: { configurable: true, value: "navigate" },
-        redirectCount: { configurable: true, value: 0 },
-        domInteractive: { configurable: true, value: 0 },
-        domContentLoadedEventStart: { configurable: true, value: 0 },
-        domContentLoadedEventEnd: { configurable: true, value: 0 },
-        loadEventStart: { configurable: true, value: 0 },
-        loadEventEnd: { configurable: true, value: 0 },
-      });
+      const state = requirePerformanceEntryState(this);
+      state.base[1] = "navigation";
+      state.navigation = {
+        type: "navigate",
+        redirectCount: 0,
+        unloadEventStart: 0,
+        unloadEventEnd: 0,
+        domInteractive: 0,
+        domContentLoadedEventStart: 0,
+        domContentLoadedEventEnd: 0,
+        domComplete: 0,
+        loadEventStart: 0,
+        loadEventEnd: 0,
+      };
     }
     toJSON() {
       return {
         ...super.toJSON(),
         type: this.type,
         redirectCount: this.redirectCount,
+        unloadEventStart: this.unloadEventStart,
+        unloadEventEnd: this.unloadEventEnd,
         domInteractive: this.domInteractive,
         domContentLoadedEventStart: this.domContentLoadedEventStart,
         domContentLoadedEventEnd: this.domContentLoadedEventEnd,
+        domComplete: this.domComplete,
         loadEventStart: this.loadEventStart,
         loadEventEnd: this.loadEventEnd,
       };
     }
   }
+  for (const name of [
+    "type", "redirectCount", "unloadEventStart", "unloadEventEnd",
+    "domInteractive", "domContentLoadedEventStart",
+    "domContentLoadedEventEnd", "domComplete", "loadEventStart",
+    "loadEventEnd",
+  ])
+    Object.defineProperty(PerformanceNavigationTiming.prototype, name, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        const state = requirePerformanceEntryState(this).navigation;
+        if (!state) throw new TypeError("Illegal invocation");
+        return state[name];
+      },
+    });
   for (const [constructor, name] of [
     [PerformanceEntry, "PerformanceEntry"],
+    [PerformanceMark, "PerformanceMark"],
+    [PerformanceMeasure, "PerformanceMeasure"],
     [PerformanceResourceTiming, "PerformanceResourceTiming"],
     [PerformanceNavigationTiming, "PerformanceNavigationTiming"],
+    [VisibilityStateEntry, "VisibilityStateEntry"],
   ]) {
     Object.defineProperty(constructor.prototype, Symbol.toStringTag, {
       configurable: true,
       value: name,
     });
   }
-  const performanceObserverEntryListState = new WeakMap();
+  const sortPerformanceEntries = entries => entries.slice().sort(
+      (left, right) => left.startTime - right.startTime),
+    performanceObserverEntryListState = new WeakMap();
   class PerformanceObserverEntryList {
     constructor(entries) {
       performanceObserverEntryListState.set(this, entries.slice());
@@ -7359,32 +8872,34 @@
     getEntries() {
       const entries = performanceObserverEntryListState.get(this);
       if (!entries) throw new TypeError("Illegal invocation");
-      return entries.slice();
+      return sortPerformanceEntries(entries);
     }
     getEntriesByType(type) {
       const entries = performanceObserverEntryListState.get(this);
       if (!entries) throw new TypeError("Illegal invocation");
       type = String(type);
-      return entries.filter((entry) => entry.entryType === type);
+      return sortPerformanceEntries(
+        entries.filter((entry) => entry.entryType === type));
     }
     getEntriesByName(name, type) {
       const entries = performanceObserverEntryListState.get(this);
       if (!entries) throw new TypeError("Illegal invocation");
       name = String(name);
       if (type !== undefined) type = String(type);
-      return entries.filter(
-        (entry) =>
-          entry.name === name &&
-          (type === undefined || entry.entryType === type),
-      );
+      return sortPerformanceEntries(entries.filter(
+        (entry) => entry.name === name &&
+          (type === undefined || entry.entryType === type)));
     }
   }
   Object.assign(globalThis, {
     PerformanceEntry,
+    PerformanceMark,
+    PerformanceMeasure,
     PerformanceResourceTiming,
     PerformanceNavigationTiming,
     PerformanceObserverEntryList,
   });
+  globalThis.VisibilityStateEntry = VisibilityStateEntry;
   if (globalThis.__tilefinchDeterministicDateFacade !== Date)
     Date.now = () => __tilefinchDateNow(0);
   const performanceObserverState = new WeakMap(),
@@ -7397,6 +8912,7 @@
       "resource",
       "navigation",
       "paint",
+      "visibility-state",
     ]),
     schedulePerformanceObserver = (observer, state) => {
       if (state.pending || state.records.length === 0) return;
@@ -7432,8 +8948,26 @@
         schedulePerformanceObserver(observer, state);
       }
     },
-    performanceEntries = [new PerformanceNavigationTiming(location.href)],
+    navigationPerformanceEntry =
+      new PerformanceNavigationTiming(location.href),
+    performanceEntries = [
+      navigationPerformanceEntry,
+      new VisibilityStateEntry(
+        visibilityStateEntryToken, document.visibilityState, 0),
+    ],
     appendPerformanceEntry = (entry) => {
+      if (entry.entryType === "visibility-state") {
+        let visibilityEntries = 0;
+        for (let at = performanceEntries.length - 1; at >= 0; at--) {
+          if (performanceEntries[at].entryType !== "visibility-state")
+            continue;
+          visibilityEntries++;
+          if (visibilityEntries >= 50) {
+            performanceEntries.splice(at, 1);
+            break;
+          }
+        }
+      }
       if (performanceEntries.length >= 128) {
         const at = performanceEntries.findIndex(
           (value) => value.entryType !== "navigation",
@@ -7466,9 +9000,15 @@
     appconnectUs = 0,
     firstByteUs = 0,
     totalUs = 0,
+    encodedBodyBytes = 0,
     decodedBodyBytes = 0,
     measured = false,
     cacheHit = false,
+    cacheValidated = false,
+    timingAllowed = false,
+    nextHopProtocol = 0,
+    responseStatus = 0,
+    contentType = "",
   ) => {
     const end = __tilefinchPerformanceNow(6),
       duration = measured ? Math.max(0, Number(totalUs) / 1000) : 0,
@@ -7477,34 +9017,147 @@
         measured
           ? Math.min(end, start + Math.max(0, Number(microseconds) / 1000))
           : start,
-      bytes = Math.max(0, Number(decodedBodyBytes) || 0);
+      encodedBytes = Math.max(0, Number(encodedBodyBytes) || 0),
+      decodedBytes = Math.max(0, Number(decodedBodyBytes) || 0),
+      exposedEncodedBytes = timingAllowed ? encodedBytes : 0,
+      exposedDecodedBytes = timingAllowed ? decodedBytes : 0;
     return appendPerformanceEntry(
       new PerformanceResourceTiming(
         String(name),
         String(initiatorType || "other"),
         {
           startTime: start,
-          domainLookupStart: start,
-          domainLookupEnd: at(nameLookupUs),
-          connectStart: at(nameLookupUs),
-          secureConnectionStart: at(connectUs),
-          connectEnd: at(appconnectUs || connectUs),
-          requestStart: at(appconnectUs || connectUs),
-          responseStart: at(firstByteUs),
+          nextHopProtocol: timingAllowed
+            ? ["", "http/1.0", "http/1.1", "h2"][nextHopProtocol] || ""
+            : "",
+          deliveryType: timingAllowed && (cacheHit || cacheValidated)
+            ? "cache" : "",
+          domainLookupStart: timingAllowed ? start : 0,
+          domainLookupEnd: timingAllowed ? at(nameLookupUs) : 0,
+          connectStart: timingAllowed ? at(nameLookupUs) : 0,
+          secureConnectionStart: timingAllowed ? at(connectUs) : 0,
+          connectEnd: timingAllowed ? at(appconnectUs || connectUs) : 0,
+          requestStart: timingAllowed ? at(appconnectUs || connectUs) : 0,
+          responseStart: timingAllowed ? at(firstByteUs) : 0,
+          finalResponseHeadersStart: timingAllowed ? at(firstByteUs) : 0,
           responseEnd: end,
-          transferSize: cacheHit ? 0 : bytes,
-          encodedBodySize: bytes,
-          decodedBodySize: bytes,
+          transferSize: !timingAllowed
+            ? 0
+            : cacheHit
+              ? 0
+              : cacheValidated
+                ? 300
+                : exposedEncodedBytes + 300,
+          encodedBodySize: exposedEncodedBytes,
+          decodedBodySize: exposedDecodedBytes,
+          responseStatus,
+          /* The native side has already applied Fetch's filtered-response
+             rules.  TAO masks connection timing independently of status and
+             response body metadata. */
+          contentType,
         },
       ),
     );
   };
-  const performanceTimeOrigin = Date.now();
-  class Performance {
+  globalThis.__tilefinchRecordNavigationTiming = (
+    nameLookupUs = 0,
+    connectUs = 0,
+    appconnectUs = 0,
+    firstByteUs = 0,
+    totalUs = 0,
+    responseStartUs = 0,
+    responseEndUs = 0,
+    encodedBodyBytes = 0,
+    decodedBodyBytes = 0,
+    measured = false,
+    responseComplete = false,
+    encodedBodyBytesMeasured = false,
+    responseStatus = 0,
+    nextHopProtocol = "",
+    contentType = "",
+  ) => {
+    const state = requirePerformanceEntryState(navigationPerformanceEntry),
+      resource = state.resource,
+      responseStart = Math.max(0, Number(responseStartUs) / 1000 || 0),
+      responseEnd = responseComplete
+        ? Math.max(responseStart, Number(responseEndUs) / 1000 || 0)
+        : 0,
+      finalHopStart = measured && responseComplete
+        ? Math.max(0, responseEnd - Math.max(0, Number(totalUs) / 1000))
+        : 0,
+      at = microseconds => measured && responseComplete
+        ? Math.min(responseEnd,
+          finalHopStart + Math.max(0, Number(microseconds) / 1000))
+        : 0;
+    state.base[2] = 0;
+    resource.fetchStart = 0;
+    if (measured && responseComplete) {
+      resource.domainLookupStart = finalHopStart;
+      resource.domainLookupEnd = at(nameLookupUs);
+      resource.connectStart = at(nameLookupUs);
+      resource.secureConnectionStart = appconnectUs > connectUs
+        ? at(connectUs) : 0;
+      resource.connectEnd = at(appconnectUs || connectUs);
+      resource.requestStart = at(appconnectUs || connectUs);
+      resource.responseStart = responseStart || at(firstByteUs);
+    } else if (responseStart > 0) {
+      resource.responseStart = responseStart;
+      resource.finalResponseHeadersStart = responseStart;
+    }
+    if (responseComplete) {
+      resource.responseEnd = responseEnd;
+      resource.finalResponseHeadersStart = resource.responseStart;
+      const encoded = encodedBodyBytesMeasured
+        ? Math.max(0, Number(encodedBodyBytes) || 0) : 0,
+        decoded = Math.max(0, Number(decodedBodyBytes) || 0);
+      resource.encodedBodySize = encoded;
+      resource.decodedBodySize = decoded;
+      resource.transferSize = encodedBodyBytesMeasured ? encoded + 300 : 0;
+      resource.responseStatus = Math.max(0, Math.min(65535,
+        Math.trunc(Number(responseStatus) || 0)));
+      resource.nextHopProtocol = String(nextHopProtocol || "");
+      resource.contentType = String(contentType || "");
+    }
+    const epoch = performanceTimeOrigin;
+    performanceTimingState.fetchStart = epoch;
+    if (measured && responseComplete) {
+      performanceTimingState.domainLookupStart = epoch + finalHopStart;
+      performanceTimingState.domainLookupEnd =
+        epoch + resource.domainLookupEnd;
+      performanceTimingState.connectStart = epoch + resource.connectStart;
+      performanceTimingState.connectEnd = epoch + resource.connectEnd;
+      performanceTimingState.requestStart = epoch + resource.requestStart;
+    }
+    if (resource.responseStart > 0)
+      performanceTimingState.responseStart = epoch + resource.responseStart;
+    if (responseComplete)
+      performanceTimingState.responseEnd = epoch + resource.responseEnd;
+    return navigationPerformanceEntry;
+  };
+  globalThis.__tilefinchRecordVisibilityPerformance = state =>
+    appendPerformanceEntry(
+      new VisibilityStateEntry(
+        visibilityStateEntryToken,
+        state,
+        __tilefinchPerformanceNow(6),
+      ),
+    );
+  const performanceTimeOrigin = Number(
+    globalThis.__tilefinchPerformanceTimeOrigin,
+  );
+  delete globalThis.__tilefinchPerformanceTimeOrigin;
+  const performanceValueState = new WeakMap();
+  class Performance extends EventTarget {
     constructor() {
+      super();
       throw new TypeError("Illegal constructor");
     }
   }
+  const requirePerformanceValue = value => {
+    const state = performanceValueState.get(value);
+    if (!state) throw new TypeError("Illegal invocation");
+    return state;
+  };
   Object.defineProperty(Performance.prototype, Symbol.toStringTag, {
     configurable: true,
     value: "Performance",
@@ -7519,12 +9172,7 @@
     enumerable: true,
     configurable: true,
   });
-  const performanceValue = Object.assign(Object.create(Performance.prototype), {
-    timeOrigin: performanceTimeOrigin,
-    /* Deprecated, but still read by bootstrap/telemetry code on major sites.
-       Keep the bounded navigation-zero surface rather than forcing those
-       scripts down exception paths before their actual UI initialization. */
-    timing: Object.freeze({
+  const performanceTimingState = {
       navigationStart: performanceTimeOrigin,
       fetchStart: performanceTimeOrigin,
       domainLookupStart: performanceTimeOrigin,
@@ -7545,39 +9193,65 @@
       redirectEnd: 0,
       unloadEventStart: 0,
       unloadEventEnd: 0,
-    }),
-    navigation: Object.freeze({ type: 0, redirectCount: 0 }),
-    now: () => __tilefinchPerformanceNow(3),
+    },
+    performanceTiming = {};
+  for (const name of Object.keys(performanceTimingState))
+    Object.defineProperty(performanceTiming, name, {
+      enumerable: true,
+      get: () => performanceTimingState[name],
+    });
+  Object.freeze(performanceTiming);
+  const performanceNavigation = Object.freeze({ type: 0, redirectCount: 0 });
+  Object.defineProperties(Performance.prototype, {
+    timeOrigin: {
+      configurable: true,
+      enumerable: true,
+      get() { return requirePerformanceValue(this).timeOrigin; },
+    },
+    timing: {
+      configurable: true,
+      enumerable: true,
+      get() { requirePerformanceValue(this); return performanceTiming; },
+    },
+    navigation: {
+      configurable: true,
+      enumerable: true,
+      get() { requirePerformanceValue(this); return performanceNavigation; },
+    },
+  });
+  const performanceOperations = {
+    now() {
+      requirePerformanceValue(this);
+      return __tilefinchPerformanceNow(3);
+    },
     mark(name, options = {}) {
-      const start =
-        options.startTime === undefined
-          ? __tilefinchPerformanceNow(4)
-          : Number(options.startTime);
-      if (!Number.isFinite(start) || start < 0)
-        throw new TypeError("startTime must be a finite nonnegative number");
-      const entry = new PerformanceEntry(String(name), "mark", start, 0);
-      entry.detail = options.detail;
-      return appendPerformanceEntry(entry);
+      requirePerformanceValue(this);
+      return appendPerformanceEntry(new PerformanceMark(name, options));
     },
     measure(name, startOrOptions, endMark) {
+      requirePerformanceValue(this);
       let start = 0,
         end,
-        detail;
+        detail = null;
       if (typeof startOrOptions === "object" && startOrOptions !== null) {
         const hasStart = startOrOptions.start !== undefined,
           hasEnd = startOrOptions.end !== undefined,
           hasDuration = startOrOptions.duration !== undefined;
-        if ((hasStart && hasEnd && hasDuration) || (!hasStart && !hasEnd))
+        if ((hasStart && hasEnd && hasDuration)
+            || (hasDuration && !hasStart && !hasEnd))
           throw new TypeError("Invalid measure options");
-        start = hasStart ? performanceTimestamp(startOrOptions.start) : NaN;
-        end = hasEnd ? performanceTimestamp(startOrOptions.end) : NaN;
+        start = hasStart ? performanceTimestamp(startOrOptions.start) : 0;
+        end = hasEnd ? performanceTimestamp(startOrOptions.end) : undefined;
         const duration = hasDuration ? Number(startOrOptions.duration) : NaN;
-        if (hasDuration && !Number.isFinite(duration))
-          throw new TypeError("duration must be finite");
-        if (!hasStart) start = end - duration;
+        if (hasDuration && (!Number.isFinite(duration) || duration < 0))
+          throw new TypeError("duration must be finite and nonnegative");
+        if (!hasStart && hasDuration) start = end - duration;
         else if (!hasEnd)
           end = hasDuration ? start + duration : __tilefinchPerformanceNow(5);
-        detail = startOrOptions.detail;
+        detail = cloneWorkerValue(
+          startOrOptions.detail === undefined ? null : startOrOptions.detail,
+          ownerWorkerCloneIntrinsics,
+        );
       } else {
         if (startOrOptions !== undefined)
           start = performanceTimestamp(startOrOptions);
@@ -7586,33 +9260,34 @@
             ? performanceTimestamp(endMark)
             : __tilefinchPerformanceNow(5);
       }
-      if (!Number.isFinite(start) || !Number.isFinite(end))
-        throw new TypeError("measure timestamps must be finite");
-      const entry = new PerformanceEntry(
-        String(name),
-        "measure",
-        start,
-        Math.max(0, end - start),
+      if (!Number.isFinite(start) || !Number.isFinite(end)
+          || start < 0 || end < start)
+        throw new TypeError("measure timestamps must be ordered and nonnegative");
+      const entry = new PerformanceMeasure(
+        performanceMeasureToken, String(name), start, end - start, detail,
       );
-      entry.detail = detail;
       return appendPerformanceEntry(entry);
     },
     getEntries() {
-      return performanceEntries.slice();
+      requirePerformanceValue(this);
+      return sortPerformanceEntries(performanceEntries);
     },
     getEntriesByType(type) {
-      return performanceEntries.filter(
-        (entry) => entry.entryType === String(type),
-      );
+      requirePerformanceValue(this);
+      type = String(type);
+      return sortPerformanceEntries(
+        performanceEntries.filter((entry) => entry.entryType === type));
     },
     getEntriesByName(name, type) {
-      return performanceEntries.filter(
-        (entry) =>
-          entry.name === String(name) &&
-          (type === undefined || entry.entryType === String(type)),
-      );
+      requirePerformanceValue(this);
+      name = String(name);
+      if (type !== undefined) type = String(type);
+      return sortPerformanceEntries(performanceEntries.filter(
+        (entry) => entry.name === name &&
+          (type === undefined || entry.entryType === type)));
     },
     clearMarks(name) {
+      requirePerformanceValue(this);
       for (let i = performanceEntries.length - 1; i >= 0; i--)
         if (
           performanceEntries[i].entryType === "mark" &&
@@ -7621,6 +9296,7 @@
           performanceEntries.splice(i, 1);
     },
     clearMeasures(name) {
+      requirePerformanceValue(this);
       for (let i = performanceEntries.length - 1; i >= 0; i--)
         if (
           performanceEntries[i].entryType === "measure" &&
@@ -7629,11 +9305,25 @@
           performanceEntries.splice(i, 1);
     },
     clearResourceTimings() {
+      requirePerformanceValue(this);
       for (let i = performanceEntries.length - 1; i >= 0; i--)
         if (performanceEntries[i].entryType === "resource")
           performanceEntries.splice(i, 1);
     },
-    setResourceTimingBufferSize() {},
+    setResourceTimingBufferSize() { requirePerformanceValue(this); },
+      toJSON() {
+        return { timeOrigin: requirePerformanceValue(this).timeOrigin };
+      },
+  };
+  for (const name of Object.keys(performanceOperations))
+    Object.defineProperty(Performance.prototype, name, {
+      configurable: true,
+      writable: true,
+      value: performanceOperations[name],
+    });
+  const performanceValue = Object.create(Performance.prototype);
+  performanceValueState.set(performanceValue, {
+    timeOrigin: performanceTimeOrigin,
   });
   globalThis.Performance = Performance;
   globalThis.performance = performanceValue;
@@ -7642,30 +9332,14 @@
      while rebasing now() for the worker lifetime.  The lazy Worker bootstrap
      wraps this timing source in its own Worker-realm Performance prototype. */
   globalThis.__tilefinchCreateWorkerPerformance = () => {
-    const monotonicOrigin = __tilefinchPerformanceNow(3),
-      value = Object.assign(
-        Object.create(Performance.prototype),
-        performanceValue,
-      );
-    Object.defineProperties(value, {
-      timeOrigin: {
-        configurable: true,
-        enumerable: true,
-        value: Date.now(),
-      },
-      now: {
-        configurable: true,
-        enumerable: true,
-        writable: true,
-        value: () => Math.max(
-          0,
-          __tilefinchPerformanceNow(3) - monotonicOrigin,
-        ),
-      },
-    });
-    delete value.timing;
-    delete value.navigation;
-    return value;
+    const monotonicOrigin = __tilefinchPerformanceNow(3);
+    return {
+      timeOrigin: Date.now(),
+      now: () => Math.max(
+        0,
+        __tilefinchPerformanceNow(3) - monotonicOrigin,
+      ),
+    };
   };
   const memoryInfoState = new WeakMap(),
     memoryInfoPrototype = Object.create(Object.prototype),
@@ -7716,6 +9390,7 @@
       performanceObserverState.set(this, {
         callback,
         types: new Set(),
+        mode: null,
         records: [],
         pending: false,
         dropped: 0,
@@ -7729,6 +9404,13 @@
         hasType = options.type !== undefined;
       if (hasEntryTypes === hasType)
         throw new TypeError("Specify entryTypes or type");
+      const requestedMode = hasType ? "single" : "multiple";
+      if (state.mode !== null && state.mode !== requestedMode)
+        throw new DOMException(
+          "PerformanceObserver registration mode cannot change",
+          "InvalidModificationError",
+        );
+      state.mode = requestedMode;
       const requested = hasType
           ? [String(options.type)]
           : Array.from(options.entryTypes, String),
@@ -7740,7 +9422,9 @@
       if (performanceObservers.size >= performanceObserverLimit &&
           !performanceObservers.has(this))
         throw new RangeError("PerformanceObserver quota exceeded");
-      state.types = types;
+      if (hasType) {
+        for (const type of types) state.types.add(type);
+      } else state.types = types;
       performanceObservers.add(this);
       if (hasType && options.buffered && types.has(requested[0])) {
         for (const entry of performanceEntries) {
@@ -7766,7 +9450,7 @@
     takeRecords() {
       const state = performanceObserverState.get(this);
       if (!state) throw new TypeError("Illegal invocation");
-      return state.records.splice(0);
+      return sortPerformanceEntries(state.records.splice(0));
     }
   };
   Object.defineProperty(
@@ -7797,10 +9481,32 @@
   };
   globalThis.__tilefinchDispatchDOMContentLoaded = () => {
     if (document.readyState === "complete") return;
+    const navigationState =
+      requirePerformanceEntryState(navigationPerformanceEntry),
+      navigationTiming = navigationState.navigation,
+      domInteractive = __tilefinchPerformanceNow(3);
     document.readyState = "interactive";
+    navigationTiming.domInteractive = domInteractive;
+    performanceTimingState.domInteractive =
+      performanceTimeOrigin + domInteractive;
+    navigationTiming.domContentLoadedEventStart =
+      __tilefinchPerformanceNow(3);
+    performanceTimingState.domContentLoadedEventStart =
+      performanceTimeOrigin + navigationTiming.domContentLoadedEventStart;
     document.dispatchEvent(new Event("DOMContentLoaded", { bubbles: true }));
     globalThis.__tilefinchMaybeStartMotion?.();
+    const domContentLoadedEventEnd = __tilefinchPerformanceNow(3);
     document.readyState = "complete";
+    const domComplete = __tilefinchPerformanceNow(3),
+      loadEventStart = __tilefinchPerformanceNow(3);
+    navigationTiming.domContentLoadedEventEnd = domContentLoadedEventEnd;
+    navigationTiming.domComplete = domComplete;
+    navigationTiming.loadEventStart = loadEventStart;
+    performanceTimingState.domContentLoadedEventEnd =
+      performanceTimeOrigin + domContentLoadedEventEnd;
+    performanceTimingState.domComplete = performanceTimeOrigin + domComplete;
+    performanceTimingState.loadEventStart =
+      performanceTimeOrigin + loadEventStart;
     const loadEvent = new Event("load");
     /*
      * HTMLBodyElement's onload handler reflects the Window load handler
@@ -7817,6 +9523,15 @@
         __tilefinchReportUncaught(error, "body onload");
       }
     globalThis.dispatchEvent(loadEvent);
+    const loadEventEnd = __tilefinchPerformanceNow(3);
+    navigationState.base[3] = Math.max(
+      0, loadEventEnd - navigationPerformanceEntry.startTime);
+    navigationTiming.loadEventEnd = loadEventEnd;
+    performanceTimingState.loadEventEnd = performanceTimeOrigin + loadEventEnd;
+    /* Navigation Timing queues the already-buffered navigation entry only
+       after the load lifecycle has completed. Observers registered while the
+       document was loading therefore receive exactly one finalized record. */
+    notifyPerformanceObservers(navigationPerformanceEntry);
   };
   Object.defineProperty(globalThis.__tilefinchRootCensus, "frameWindows", {
     get: () => frames.frameWindowCount(),

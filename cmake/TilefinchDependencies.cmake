@@ -361,9 +361,9 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     # updates the two pins in the same commit.
     set(tilefinch_quickjs_vendor_dir "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
     set(tilefinch_quickjs_vendor_c_sha256
-        "65f39873ac6ffd5327bafdbef0f04530ebce55b23dc30f2e8bb9ed19add22edd")
+        "f5f0a80e01995aeccd3a95acdb210072ff501eab4e3dd8a2cd9c448909549816")
     set(tilefinch_quickjs_vendor_h_sha256
-        "b3b58343ba8eea0a6357fcc310a57c0f2d735fbf51bb3858402cad71cc3eb99a")
+        "225a7d514aa4b380da014588a8181e9e8df82feec752ebb4adde01e16a53605e")
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.c" tilefinch_quickjs_c_sha256)
     file(SHA256 "${tilefinch_quickjs_vendor_dir}/quickjs.h" tilefinch_quickjs_h_sha256)
     if(NOT tilefinch_quickjs_c_sha256 STREQUAL tilefinch_quickjs_vendor_c_sha256
@@ -378,7 +378,11 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     endif()
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         "${tilefinch_quickjs_vendor_dir}/quickjs.c"
-        "${tilefinch_quickjs_vendor_dir}/quickjs.h")
+        "${tilefinch_quickjs_vendor_dir}/quickjs.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-host-get-code-for-eval.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-near-limit-array-growth.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-array-length-shrink.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/patches/bellard-quickjs-04be246-property-fault-trace.patch")
     if(PSP_BROWSER_APPLY_BELLARD_QUICKJS_PATCH)
         message(FATAL_ERROR
             "The experimental Bellard VM patch is no longer applied at "
@@ -403,19 +407,19 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             "${PSP_BROWSER_QUICKJS_CAPTURE_GETTER_FASTPATH}-${PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY}-${PSP_BROWSER_JS_PROPERTY_FAULT_TRACE}")
         # capture-getter, compact-char-array, property-fault-trace -> quickjs.c
         set(tilefinch_quickjs_variant_ON-OFF-OFF
-            "bc54d653e15595dbcf0f8f54eb816572547cbeab35086432ab659ce656ad5939")
+            "441e471fc11169264ec2325ce96ee736f581122a59d31fb92b9cb4ad20c4c321")
         set(tilefinch_quickjs_variant_ON-ON-ON
-            "5b37db343c0941009adf87c6dda80364427037f80100869c191f040042a715be")
+            "67e64f074b492c95d425d42a475b0ee1c928de4b2210a46f7b92f7cc133fafa3")
         set(tilefinch_quickjs_variant_ON-OFF-ON
-            "06bde2dbdd66270e39e308cf1cd21bac6461ab61629f88495d5acb53f9e88d32")
+            "c90bbdfd0df677f33410beccf0adb1d26facdcc87343578a099da2219b55f114")
         set(tilefinch_quickjs_variant_OFF-ON-OFF
-            "771ed62db845144978c8c5215db779237eaff326a95fece937f65a0e65c055f3")
+            "4ccab1fd739f627186404006fa4b49d4766aa7e1d8593f432a79f7a0866a6275")
         set(tilefinch_quickjs_variant_OFF-ON-ON
-            "e31ed2e8f8ff95a9b4a93c781e42ca722f8e1f6efdfbb6f1f7181d7d22addc0b")
+            "03013778f9f735018f47399980e17e0c5c49623434c30630cf8c2d2b276cedee")
         set(tilefinch_quickjs_variant_OFF-OFF-OFF
-            "8d1255c1e389a5b39938712d72b931f3617ca636889625840b16f38b8a6bd245")
+            "09051808ff5c5b7abe0861550ef123f8f2c341d3938db06b24f6f4d50b2e3280")
         set(tilefinch_quickjs_variant_OFF-OFF-ON
-            "6cea44dc9219ff0b2172c208ade105f468971cd5a68bbab43543396e83580302")
+            "0ecfa6bebd05c346d5f89712f0cb3bc97e2a53a1223b26c1685967bb002d22b7")
         if(NOT DEFINED tilefinch_quickjs_variant_${tilefinch_quickjs_variant_key})
             message(FATAL_ERROR
                 "No pinned QuickJS variant for capture-getter/compact/property-fault "
@@ -444,6 +448,10 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             endforeach()
             # Reverse the default stack above the shared bounded baseline.
             foreach(layer
+                    array-length-shrink
+                    near-limit-array-growth
+                    host-get-code-for-eval
+                    repeat-rope-eval-scan
                     compact-char-array-cow compact-char-array
                     single-char-string-buffer repeat-rope-eval latin1-string
                     scope-oom retired-async-state realm-retirement
@@ -456,7 +464,7 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
             file(SHA256 "${tilefinch_quickjs_variant_dir}/quickjs.c"
                  tilefinch_quickjs_variant_baseline)
             if(NOT tilefinch_quickjs_variant_baseline STREQUAL
-                   "31976d65e80febea901c1aabf653fbd4beb1983564d2a291cfbc5d44692b0ad1")
+                   "6242b2751a3c2deac491540a150aba766acd40e2f5e314747df22ab18af7a692")
                 message(FATAL_ERROR
                     "Reversing the QuickJS default stack did not reach the bounded baseline")
             endif()
@@ -474,6 +482,9 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
                 list(APPEND tilefinch_quickjs_forward
                     compact-char-array compact-char-array-cow)
             endif()
+            list(APPEND tilefinch_quickjs_forward repeat-rope-eval-scan
+                host-get-code-for-eval near-limit-array-growth
+                array-length-shrink)
             foreach(layer IN LISTS tilefinch_quickjs_forward)
                 execute_process(COMMAND "${PATCH_EXECUTABLE}" --forward --silent -p1
                     -i "${tilefinch_quickjs_patches}/bellard-quickjs-04be246-${layer}.patch"
@@ -514,6 +525,12 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
         _GNU_SOURCE CONFIG_VERSION="2026-06-04")
     target_compile_definitions(qjs PUBLIC
         TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY=1)
+    if(NOT PSP)
+        # Deterministic host proof that repeated-string eval skips shared rope
+        # nodes while preserving its logical interrupt accounting.
+        target_compile_definitions(qjs PUBLIC
+            CONFIG_TILEFINCH_EVAL_ROPE_TEST=1)
+    endif()
     target_compile_options(qjs PRIVATE -funsigned-char -fwrapv)
     set_target_properties(qjs PROPERTIES C_EXTENSIONS ON)
     if(PSP)
@@ -534,6 +551,10 @@ if(PSP_BROWSER_USE_BELLARD_QUICKJS)
     endif()
     if(PSP_BROWSER_JS_PROPERTY_FAULT_TRACE)
         target_compile_definitions(qjs PUBLIC CONFIG_PROPERTY_FAULT_TRACE=1)
+    endif()
+    if(PSP_BROWSER_QUICKJS_COMPACT_CHAR_ARRAY)
+        target_compile_definitions(qjs PRIVATE
+            CONFIG_TILEFINCH_COMPACT_CHAR_ARRAY=1)
     endif()
     if(NOT PSP_BROWSER_QUICKJS_FUNCTION_RECYCLE)
         target_compile_definitions(qjs PRIVATE

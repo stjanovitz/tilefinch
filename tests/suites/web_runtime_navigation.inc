@@ -48,6 +48,64 @@
     navigation_destroy(&navigation);
     CHECK(budget.current == 0);
 
+    puts("test: repeated fresh documents retain Worker lifecycle invariants");
+    static const char repeated_realm_page[] =
+        "<!doctype html><title>Realm lifecycle</title><body>"
+        "<script>(()=>{pocSummary='pending';const ownerOrigin="
+        "performance.timeOrigin,source=\"onmessage=event=>{const order=[];\"+"
+        "\"addEventListener('probe',()=>{order.push('listener');\"+"
+        "\"queueMicrotask(()=>order.push('micro'))});\"+"
+        "\"dispatchEvent(new Event('probe'));order.push('after');\"+"
+        "\"Promise.resolve().then(()=>postMessage({order:order.join(','),\"+"
+        "\"clone:event.data instanceof Uint16Array&&event.data[0]===513,\"+"
+        "\"realm:Object.getPrototypeOf(XMLHttpRequest)===Function.prototype\"+"
+        "\"&&XMLHttpRequest instanceof Function,origin:performance.timeOrigin,\"+"
+        "\"now:performance.now()}))}\",url=URL.createObjectURL(new Blob([source])),"
+        "worker=new Worker(url);let retiredCallback=false;"
+        "setTimeout(()=>retiredCallback=true,10000);worker.onmessage=event=>{"
+        "const value=event.data,clock=Number.isFinite(value.origin)&&"
+        "Number.isFinite(value.now)&&value.origin>=ownerOrigin&&value.now>=0;"
+        "pocSummary=value.order==='listener,after,micro'&&value.clone&&"
+        "value.realm&&clock&&!retiredCallback?'REALM-LIFECYCLE-OK':"
+        "'REALM-LIFECYCLE-BAD';worker.terminate();URL.revokeObjectURL(url)};"
+        "worker.postMessage(new Uint16Array([513]))})()</script>";
+    static NavigationSession repeated_realm_navigation;
+    CHECK(navigation_init(&repeated_realm_navigation, &budget, 2));
+    navigation_enable_scripts(&repeated_realm_navigation, 4 * MIB, 1000);
+    size_t repeated_realm_baseline = 0;
+    for (size_t realm_generation_index = 0;
+         realm_generation_index < 4; realm_generation_index++) {
+        uint64_t generation = navigation_begin(&repeated_realm_navigation);
+        CHECK(navigation_commit_html(
+            &repeated_realm_navigation, generation,
+            "https://realm-lifecycle.test/challenge",
+            repeated_realm_page, strlen(repeated_realm_page), 480,
+            NULL, NULL, true));
+        for (size_t turn = 0; turn < 8; turn++) {
+            CHECK(navigation_advance_runtime(
+                &repeated_realm_navigation, turn, 8));
+        }
+        if (strcmp(repeated_realm_navigation.page.script_result.summary,
+                   "REALM-LIFECYCLE-OK") != 0) {
+            fprintf(stderr,
+                    "repeated realm generation=%zu summary=%s error=%s\n",
+                    realm_generation_index + 1,
+                    repeated_realm_navigation.page.script_result.summary,
+                    repeated_realm_navigation.page.script_result.error);
+        }
+        CHECK(strcmp(repeated_realm_navigation.page.script_result.summary,
+                     "REALM-LIFECYCLE-OK") == 0
+              && repeated_realm_navigation.page.script_result.root_workers == 0u
+              && repeated_realm_navigation.page.script_result
+                     .root_worker_terminations == 1u);
+        if (realm_generation_index == 1)
+            repeated_realm_baseline = budget.current;
+        if (realm_generation_index > 1)
+            CHECK(budget.current <= repeated_realm_baseline + 1024u);
+    }
+    navigation_destroy(&repeated_realm_navigation);
+    CHECK(budget.current == 0);
+
     puts("test: section document replacement preserves the JavaScript realm");
     static const char realm_a[] =
         "<!doctype html><title>Realm A</title><body><p id=old>OLD</p>"
@@ -376,14 +434,14 @@
           && memcmp(runtime_load, "yes", 3) == 0);
     lxb_dom_node_t *inline_node = find_id(
         lxb_dom_interface_node(interactive.page.document.html), "inline");
-    CHECK(inline_node != NULL
-          && attribute_equals(runtime_status, "data-inline-accepted", "false")
-          && attribute_equals(
-              document_body_node(&interactive.page.document),
-              "data-body-load", "load")
-          && attribute_equals(inline_node, "data-first", "click")
-          && attribute_equals(inline_node, "data-second", "click")
-          && attribute_equals(inline_node, "data-third", "click"));
+    CHECK(inline_node != NULL);
+    CHECK(attribute_equals(runtime_status, "data-inline-accepted", "false"));
+    CHECK(attribute_equals(
+        document_body_node(&interactive.page.document),
+        "data-body-load", "load"));
+    CHECK(attribute_equals(inline_node, "data-first", "click"));
+    CHECK(attribute_equals(inline_node, "data-second", "click"));
+    CHECK(attribute_equals(inline_node, "data-third", "click"));
     CHECK(script_runtime_evaluate_diagnostic(
               interactive.page.runtime,
               "document.getElementById('status').setAttribute("
@@ -632,7 +690,7 @@
                  "xhr-listener:1") == 0);
     CHECK(interactive.page.script_result.uncaught_callback_errors == 2);
     CHECK(strstr(interactive.page.script_result.last_uncaught_callback_error,
-                 "XMLHttpRequest readystatechange") != NULL);
+                 "event readystatechange") != NULL);
     CHECK(script_runtime_evaluate_diagnostic(
               interactive.page.runtime,
               "setTimeout(()=>{throw {toString(){throw Error('format refused')}}},0)",
@@ -992,39 +1050,37 @@
         &interactive.page.layout, nested_scroll_node);
     size_t scroll_compile_attempts =
         interactive.page.script_result.host_compile_attempts;
-    CHECK(nested_scroll_box != NULL && nested_scroll_box->scroll_y == 0
-          && controller_scroll_by(&controller, 64, 272)
-          && controller_scroll_by(&controller, 64, 272)
-          && navigation_current(&interactive)->scroll_y == 128
-          && nested_scroll_box->scroll_y == 0
-          && interactive.page.script_result.host_compile_attempts
-             == scroll_compile_attempts
-          && strcmp(interactive.page.script_result.summary,
-                    "scroll:pending") == 0
-          && navigation_advance_runtime(&interactive, 0, 0)
-          && strcmp(interactive.page.script_result.summary,
-                    "window:128,viewport:128") == 0
-          && nested_scroll_box->scroll_y == 0
-          && interactive.page.script_result.host_compile_attempts
-             == scroll_compile_attempts
-          && controller_scroll_to_bottom(&controller, 272)
-          && navigation_current(&interactive)->scroll_y
-             == interactive.page.layout.height - 272
-          && controller_scroll_by(&controller, -100000, 272)
-          && navigation_current(&interactive)->scroll_y == 0
-          && navigation_dispatch_event(&interactive, "#bottom", "click")
-          && strcmp(interactive.page.script_result.summary,
-                    synchronous_scroll_summary) == 0
-          && navigation_current(&interactive)->scroll_y
-             == scroll_maximum
-          && navigation_advance_runtime(&interactive, 0, 0)
-          && strcmp(interactive.page.script_result.summary,
-                    dispatched_scroll_summary) == 0
-          && interactive.page.script_result.uncaught_callback_errors == 1
-          && strstr(interactive.page.script_result.last_uncaught_callback_error,
-                    "visualViewport scroll") != NULL
-          && strstr(interactive.page.script_result.last_uncaught_callback_error,
-                    "expected viewport listener failure") != NULL);
+    CHECK(nested_scroll_box != NULL && nested_scroll_box->scroll_y == 0);
+    CHECK(controller_scroll_by(&controller, 64, 272));
+    CHECK(controller_scroll_by(&controller, 64, 272));
+    CHECK(navigation_current(&interactive)->scroll_y == 128);
+    CHECK(nested_scroll_box->scroll_y == 0);
+    CHECK(interactive.page.script_result.host_compile_attempts
+          == scroll_compile_attempts);
+    CHECK(strcmp(interactive.page.script_result.summary, "scroll:pending") == 0);
+    CHECK(navigation_advance_runtime(&interactive, 0, 0));
+    CHECK(strcmp(interactive.page.script_result.summary,
+                 "window:128,viewport:128") == 0);
+    CHECK(nested_scroll_box->scroll_y == 0);
+    CHECK(interactive.page.script_result.host_compile_attempts
+          == scroll_compile_attempts);
+    CHECK(controller_scroll_to_bottom(&controller, 272));
+    CHECK(navigation_current(&interactive)->scroll_y
+          == interactive.page.layout.height - 272);
+    CHECK(controller_scroll_by(&controller, -100000, 272));
+    CHECK(navigation_current(&interactive)->scroll_y == 0);
+    CHECK(navigation_dispatch_event(&interactive, "#bottom", "click"));
+    CHECK(strcmp(interactive.page.script_result.summary,
+                 synchronous_scroll_summary) == 0);
+    CHECK(navigation_current(&interactive)->scroll_y == scroll_maximum);
+    CHECK(navigation_advance_runtime(&interactive, 0, 0));
+    CHECK(strcmp(interactive.page.script_result.summary,
+                 dispatched_scroll_summary) == 0);
+    CHECK(interactive.page.script_result.uncaught_callback_errors == 1);
+    CHECK(strstr(interactive.page.script_result.last_uncaught_callback_error,
+                 "visualViewport scroll") != NULL);
+    CHECK(strstr(interactive.page.script_result.last_uncaught_callback_error,
+                 "expected viewport listener failure") != NULL);
     CHECK(controller_scroll_to_top(&controller, 272)
           && controller_scroll_step(&controller, 1, 0, 272)
           && navigation_current(&interactive)->scroll_y == 8
@@ -1829,6 +1885,51 @@
                     "scheduler:ok") == 0
           && command_x(&cooperative_scheduler.page.layout, "SCHEDULED") >= 0);
     navigation_destroy(&cooperative_scheduler);
+    CHECK(budget.current == 0);
+
+    puts("test: messaging APIs preserve undefined separately from null");
+    static const char messaging_undefined_page[] =
+        "<!doctype html><body><script>"
+        "let windowOk=false,portOk=false,broadcastOk=false;"
+        "const defaultNull=new MessageEvent('message').data===null;"
+        "const finish=()=>{if(defaultNull&&windowOk&&portOk&&broadcastOk)"
+        "globalThis.pocSummary='MESSAGE-UNDEFINED-OK'};"
+        "addEventListener('message',event=>{windowOk=event.data===undefined;"
+        "finish()},{once:true});postMessage(undefined,'*');"
+        "const channel=new MessageChannel;"
+        "channel.port1.onmessage=event=>{portOk=event.data===undefined;finish()};"
+        "channel.port2.postMessage(undefined);"
+        "const source=new BroadcastChannel('undefined-probe'),"
+        "target=new BroadcastChannel('undefined-probe');"
+        "target.onmessage=event=>{broadcastOk=event.data===undefined;finish()};"
+        "source.postMessage(undefined);</script>";
+    static NavigationSession messaging_undefined;
+    CHECK(navigation_init(&messaging_undefined, &budget, 2));
+    navigation_enable_scripts(&messaging_undefined, 3 * MIB, 1000);
+    uint64_t messaging_undefined_generation = navigation_begin(
+        &messaging_undefined);
+    CHECK(navigation_commit_html(
+        &messaging_undefined, messaging_undefined_generation,
+        "https://message-undefined.test/", messaging_undefined_page,
+        strlen(messaging_undefined_page), 480, NULL, NULL, true));
+    for (size_t messaging_turn = 0;
+         messaging_turn < 12u
+             && strcmp(messaging_undefined.page.script_result.summary,
+                       "MESSAGE-UNDEFINED-OK") != 0;
+         messaging_turn++) {
+        CHECK(navigation_advance_runtime(
+            &messaging_undefined, (unsigned) messaging_turn + 1u, 8));
+    }
+    if (strcmp(messaging_undefined.page.script_result.summary,
+               "MESSAGE-UNDEFINED-OK") != 0) {
+        fprintf(stderr, "message undefined summary=%s error=%s pending=%zu\n",
+                messaging_undefined.page.script_result.summary,
+                messaging_undefined.page.script_result.error,
+                messaging_undefined.page.script_result.pending_tasks);
+    }
+    CHECK(strcmp(messaging_undefined.page.script_result.summary,
+                 "MESSAGE-UNDEFINED-OK") == 0);
+    navigation_destroy(&messaging_undefined);
     CHECK(budget.current == 0);
 
     puts("test: bounded element internals and broadcast channels");
@@ -2693,10 +2794,18 @@
     CHECK(navigation_init(&choice_navigation, &budget, 2));
     navigation_enable_scripts(&choice_navigation, 3 * MIB, 1000);
     uint64_t choice_generation = navigation_begin(&choice_navigation);
-    CHECK(navigation_commit_html(
-              &choice_navigation, choice_generation,
-              "https://choices.test/", choice_page, strlen(choice_page),
-              480, NULL, NULL, true)
+    bool choice_committed = navigation_commit_html(
+        &choice_navigation, choice_generation,
+        "https://choices.test/", choice_page, strlen(choice_page),
+        480, NULL, NULL, true);
+    if (!choice_committed
+        || strcmp(choice_navigation.page.script_result.summary,
+                  "choices:ok") != 0) {
+        fprintf(stderr, "choice summary=\"%s\" error=\"%s\"\n",
+                choice_navigation.page.script_result.summary,
+                choice_navigation.page.script_result.error);
+    }
+    CHECK(choice_committed
           && strcmp(choice_navigation.page.script_result.summary,
                     "choices:ok") == 0);
     lxb_dom_node_t *choice_root = lxb_dom_interface_node(
@@ -2922,13 +3031,67 @@
     puts("test: page capability tracing preserves behavior and freezes failures");
     static const char capability_trace_page[] =
         "<!doctype html><body><script id=trace-script></script></body>";
+    static const char capability_trace_platform_source[] =
+        "const array=new Array(2),xhr=new XMLHttpRequest();array[0]=7;"
+        "xhr.responseType='text';const workerURL=URL.createObjectURL(new Blob(["
+        "'void 0'],{type:'text/javascript'})),worker=new Worker(workerURL);"
+        "URL.revokeObjectURL(workerURL);worker.terminate();let refused=false;"
+        "try{URL.createObjectURL({})}catch(error){refused=error instanceof "
+        "TypeError}globalThis.pocSummary=array[0]===7&&xhr.responseType==='text'"
+        "&&worker instanceof Worker&&refused?'TRACE-PLATFORM-OK':"
+        "'TRACE-PLATFORM-BAD'";
+    static NavigationSession capability_trace_platform_navigation;
+    CHECK(navigation_init(&capability_trace_platform_navigation, &budget, 2));
+    navigation_enable_scripts(&capability_trace_platform_navigation,
+                              4 * MIB, 1000);
+    navigation_enable_page_capability_trace(
+        &capability_trace_platform_navigation, true);
+    uint64_t capability_trace_platform_generation =
+        navigation_begin(&capability_trace_platform_navigation);
+    bool capability_trace_platform_committed = navigation_commit_html(
+        &capability_trace_platform_navigation,
+        capability_trace_platform_generation, "https://trace.test/",
+        capability_trace_page, strlen(capability_trace_page),
+        480, NULL, NULL, true);
+    lxb_dom_node_t *capability_trace_platform_script =
+        capability_trace_platform_committed
+          ? find_id(lxb_dom_interface_node(
+                        capability_trace_platform_navigation.page.document.html),
+                    "trace-script")
+          : NULL;
+    bool capability_trace_platform_evaluated =
+        capability_trace_platform_script != NULL
+        && script_runtime_evaluate_external_typed(
+            capability_trace_platform_navigation.page.runtime,
+            capability_trace_platform_script,
+            capability_trace_platform_source,
+            strlen(capability_trace_platform_source),
+            "https://trace.test/platform-probe.js", false,
+            &capability_trace_platform_navigation.page.script_result);
+    bool capability_trace_platform_collected =
+        capability_trace_platform_evaluated
+        && navigation_collect_page_capability_trace(
+            &capability_trace_platform_navigation);
+    CHECK(capability_trace_platform_collected
+          && strcmp(capability_trace_platform_navigation.page.script_result.summary,
+                    "TRACE-PLATFORM-OK") == 0
+          && strstr(capability_trace_platform_navigation.last_page_trace,
+                    "call:URL.createObjectURL") != NULL
+          && strstr(capability_trace_platform_navigation.last_page_trace,
+                    "new:Worker") != NULL);
+    navigation_destroy(&capability_trace_platform_navigation);
+    CHECK(budget.current == 0);
+
     static const char capability_trace_source[] =
         "const missing='tilefinchMissingProbe' in navigator,"
+        "map=new Map([['answer',42]]),set=new Set(['present']),"
         "bytes=new Uint8Array(4);crypto.getRandomValues(bytes);"
+        "trustedTypes.createPolicy('trace',{createHTML:value=>value});"
         "Math.max(1,2);"
         "setTimeout(()=>{Math.min(3,4);throw new Error('trace-freeze')},0);"
         "setTimeout(()=>{JSON.stringify({after:true})},0);"
-        "globalThis.pocSummary=!missing&&bytes instanceof Uint8Array"
+        "globalThis.pocSummary=!missing&&map.get('answer')===42"
+        "&&set.has('present')&&bytes instanceof Uint8Array"
         "&&document.documentElement.querySelectorAll('body').length===1"
         "?'TRACE-SEMANTICS-OK':'TRACE-SEMANTICS-BAD'";
     static NavigationSession capability_trace_navigation;
@@ -2965,25 +3128,31 @@
     bool capability_trace_has_failure_call = strstr(
         capability_trace_navigation.last_page_trace,
         "call:global.Math.min") != NULL;
+    bool capability_trace_has_trusted_types = strstr(
+        capability_trace_navigation.last_page_trace,
+        "call:trustedTypes.createPolicy") != NULL;
     bool capability_trace_has_late_call = strstr(
         capability_trace_navigation.last_page_trace,
         "call:global.JSON.stringify") != NULL;
     if (!capability_trace_collected || !capability_trace_has_missing
+        || !capability_trace_has_trusted_types
         || !capability_trace_has_failure_call || capability_trace_has_late_call
         || strcmp(capability_trace_navigation.page.script_result.summary,
                   "TRACE-SEMANTICS-OK") != 0) {
         fprintf(stderr, "capability trace committed=%d advanced=%d "
-                "evaluated=%d collected=%d missing=%d failure=%d late=%d "
+                "evaluated=%d collected=%d missing=%d trusted=%d failure=%d late=%d "
                 "summary=\"%s\" error=\"%s\" trace=\"%s\"\n",
                 capability_trace_committed, capability_trace_advanced,
                 capability_trace_evaluated, capability_trace_collected,
                 capability_trace_has_missing,
+                capability_trace_has_trusted_types,
                 capability_trace_has_failure_call, capability_trace_has_late_call,
                 capability_trace_navigation.page.script_result.summary,
                 capability_trace_navigation.page.script_result.error,
                 capability_trace_navigation.last_page_trace);
     }
     CHECK(capability_trace_collected && capability_trace_has_missing
+          && capability_trace_has_trusted_types
           && capability_trace_has_failure_call && !capability_trace_has_late_call
           && strcmp(capability_trace_navigation.page.script_result.summary,
                     "TRACE-SEMANTICS-OK") == 0);

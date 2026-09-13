@@ -587,22 +587,47 @@ static bool runtime_load_lazy_bootstrap(
         JSValue destroy_realm = JS_NewCFunction(
             runtime->context, js_runtime_destroy_worker_realm,
             "__tilefinchDestroyWorkerRealm", 1);
+        char creator_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT] = "null";
+        if (runtime->bridge.opaque_origin
+            || runtime->bridge.document_url == NULL
+            || !tilefinch_url_origin(
+                runtime->bridge.document_url, creator_origin,
+                sizeof(creator_origin))) {
+            snprintf(creator_origin, sizeof(creator_origin), "null");
+        }
+        JSValue creator_origin_value = JS_NewString(
+            runtime->context, creator_origin);
+        JSValue creator_secure_context = JS_NewBool(
+            runtime->context,
+            runtime->bridge.document_url != NULL
+                && tilefinch_url_potentially_trustworthy(
+                    runtime->bridge.document_url));
+        JSValue creator_url_value = JS_NewString(
+            runtime->context, runtime->bridge.document_url == NULL
+                ? "about:blank" : runtime->bridge.document_url);
         bool installed = hidden
             && JS_IsFunction(runtime->context, installer)
             && !JS_IsException(run_worker)
             && !JS_IsException(trace_worker_message)
             && !JS_IsException(create_realm)
-            && !JS_IsException(destroy_realm);
+            && !JS_IsException(destroy_realm)
+            && !JS_IsException(creator_origin_value)
+            && !JS_IsException(creator_secure_context)
+            && !JS_IsException(creator_url_value);
         if (installed) {
-            JSValue arguments[4] = {
+            JSValue arguments[7] = {
                 run_worker, trace_worker_message, create_realm,
-                destroy_realm};
+                destroy_realm, creator_origin_value,
+                creator_secure_context, creator_url_value};
             JSValue result = JS_Call(
                 runtime->context, installer, JS_UNDEFINED,
-                4, arguments);
+                7, arguments);
             installed = !JS_IsException(result);
             JS_FreeValue(runtime->context, result);
         }
+        JS_FreeValue(runtime->context, creator_url_value);
+        JS_FreeValue(runtime->context, creator_secure_context);
+        JS_FreeValue(runtime->context, creator_origin_value);
         JS_FreeValue(runtime->context, destroy_realm);
         JS_FreeValue(runtime->context, create_realm);
         JS_FreeValue(runtime->context, trace_worker_message);
@@ -880,9 +905,12 @@ static bool js_runtime_copy_scope_properties(
     return ok;
 }
 
-/* createWorkerRealm(scope, prototype): a fresh context whose global object
+/* createWorkerRealm(scope, prototype, internal_init): a fresh context whose global object
    inherits from `prototype` (DedicatedWorkerGlobalScope.prototype) and owns a
-   copy of every scope property plus `self`. Returns that global. */
+   copy of every scope property plus `self`. The optional bounded initializer
+   is authored browser bootstrap, evaluated before the realm is published; it
+   is not a second author-script evaluator and therefore does not bypass the
+   worker-src check in js_runtime_run_worker. Returns that global. */
 static JSValue js_runtime_create_worker_realm(
     JSContext *context, JSValueConst this_value, int argc,
     JSValueConst *argv)
@@ -892,6 +920,19 @@ static JSValue js_runtime_create_worker_realm(
     if (bridge == NULL || bridge->host == NULL || argc < 2
         || !JS_IsObject(argv[0]) || !JS_IsObject(argv[1]))
         return JS_ThrowTypeError(context, "invalid worker realm request");
+    size_t initializer_length = 0;
+    const char *initializer = NULL;
+    if (argc > 2 && !JS_IsUndefined(argv[2])) {
+        initializer = JS_ToCStringLen(
+            context, &initializer_length, argv[2]);
+        if (initializer == NULL) return JS_EXCEPTION;
+        if (initializer_length >
+            SCRIPT_WORKER_REALM_INITIALIZER_MAX_BYTES) {
+            JS_FreeCString(context, initializer);
+            return JS_ThrowRangeError(
+                context, "worker realm initializer exceeds bound");
+        }
+    }
     ScriptRuntime *host = bridge->host;
 #ifndef __PSP__
     if (tilefinch_test_faults()->refuse_next_worker_realm) {
@@ -906,10 +947,15 @@ static JSValue js_runtime_create_worker_realm(
     if (slot == SCRIPT_WORKER_REALM_LIMIT)
         return JS_ThrowRangeError(context, "worker realm quota exceeded");
     JSContext *realm = JS_NewContext(host->runtime);
-    if (realm == NULL) return JS_ThrowOutOfMemory(context);
+    if (realm == NULL) {
+        if (initializer != NULL) JS_FreeCString(context, initializer);
+        return JS_ThrowOutOfMemory(context);
+    }
     JS_SetContextOpaque(realm, bridge);
 #if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
     JS_SetDynamicCodeEnabled(realm, bridge->dynamic_code_allowed);
+    JS_SetHostGetCodeForEval(
+        realm, js_runtime_host_get_code_for_eval, NULL);
 #endif
     JSValue global = JS_GetGlobalObject(realm);
     bool ok = !JS_IsException(global)
@@ -918,11 +964,24 @@ static JSValue js_runtime_create_worker_realm(
         && JS_DefinePropertyValueStr(
                realm, global, "self", JS_DupValue(realm, global),
                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) >= 0;
+    JSValue initializer_result = JS_UNDEFINED;
+    if (ok && initializer != NULL) {
+        initializer_result = JS_Eval(
+            realm, initializer, initializer_length, "<worker-platform>",
+            JS_EVAL_TYPE_GLOBAL);
+        ok = !JS_IsException(initializer_result);
+    }
+    if (initializer != NULL) JS_FreeCString(context, initializer);
     if (!ok) {
+        JSValue exception = JS_IsException(initializer_result)
+            ? JS_GetException(realm) : JS_UNDEFINED;
+        JS_FreeValue(realm, initializer_result);
         JS_FreeValue(realm, global);
         JS_FreeContext(realm);
-        return JS_EXCEPTION;
+        return JS_IsUndefined(exception)
+            ? JS_EXCEPTION : JS_Throw(context, exception);
     }
+    JS_FreeValue(realm, initializer_result);
     host->worker_realms[slot].context = realm;
     host->worker_realms[slot].global = JS_DupValue(realm, global);
     return global;
@@ -969,6 +1028,34 @@ static JSValue js_runtime_run_worker(
     size_t source_length = 0;
     const char *source = JS_ToCStringLen(context, &source_length, argv[1]);
     const char *url = JS_ToCString(context, argv[2]);
+    int32_t operation = 0;
+    if (argc > 3 && JS_ToInt32(context, &operation, argv[3]) < 0) {
+        if (source != NULL) JS_FreeCString(context, source);
+        if (url != NULL) JS_FreeCString(context, url);
+        return JS_EXCEPTION;
+    }
+    TilefinchCredentialsMode module_credentials =
+        TILEFINCH_CREDENTIALS_SAME_ORIGIN;
+    if (operation == 1 && argc > 4 && !JS_IsUndefined(argv[4])) {
+        const char *credentials = JS_ToCString(context, argv[4]);
+        if (credentials == NULL) {
+            if (source != NULL) JS_FreeCString(context, source);
+            if (url != NULL) JS_FreeCString(context, url);
+            return JS_EXCEPTION;
+        }
+        if (strcmp(credentials, "omit") == 0) {
+            module_credentials = TILEFINCH_CREDENTIALS_OMIT;
+        } else if (strcmp(credentials, "include") == 0) {
+            module_credentials = TILEFINCH_CREDENTIALS_INCLUDE;
+        } else if (strcmp(credentials, "same-origin") != 0) {
+            JS_FreeCString(context, credentials);
+            if (source != NULL) JS_FreeCString(context, source);
+            if (url != NULL) JS_FreeCString(context, url);
+            return JS_ThrowTypeError(
+                context, "invalid module Worker credentials mode");
+        }
+        JS_FreeCString(context, credentials);
+    }
     if (source == NULL || url == NULL) {
         if (source != NULL) JS_FreeCString(context, source);
         if (url != NULL) JS_FreeCString(context, url);
@@ -976,13 +1063,23 @@ static JSValue js_runtime_run_worker(
     }
     const TilefinchContentSecurityPolicy *csp =
         &bridge->document->content_security_policy;
-    bool allowed = tilefinch_csp_allows_worker(csp, url);
+    bool allowed = operation == 3
+        || (operation == 4 && bridge->dynamic_code_allowed)
+        || (operation == 2
+            ? tilefinch_csp_allows_request(
+                  csp, TILEFINCH_DESTINATION_SCRIPT, url)
+            : tilefinch_csp_allows_worker(csp, url));
     if (!allowed || source_length > bridge->maximum_script_file_bytes) {
         JS_FreeCString(context, source);
         JS_FreeCString(context, url);
         return allowed
             ? JS_ThrowRangeError(context, "worker source quota exceeded")
-            : JS_ThrowTypeError(context, "worker blocked by Content Security Policy");
+            : JS_ThrowTypeError(
+                  context, operation == 2
+                      ? "worker import blocked by Content Security Policy"
+                      : operation == 4
+                          ? "worker string timer blocked by Content Security Policy"
+                          : "worker blocked by Content Security Policy");
     }
 #ifndef TILEFINCH_NO_TRACE
     if (tilefinch_trace_worker_source()) {
@@ -997,17 +1094,37 @@ static JSValue js_runtime_run_worker(
                 source_length > trace_length ? 1 : 0);
     }
 #endif
-    /* The worker script is a classic global script of its own realm: its
-       top-level this is the worker global, sloppy functions see that
-       global, and importScripts declarations land on it. */
+    /* Classic scripts use the worker global directly. Module workers compile
+       as actual modules: tokens in strings/comments are never rewritten, the
+       top-level this value is undefined, and import.meta comes from QuickJS. */
     JSContext *realm = js_runtime_worker_realm_context(bridge->host, argv[0]);
     if (realm == NULL) {
         JS_FreeCString(context, source);
         JS_FreeCString(context, url);
         return JS_ThrowTypeError(context, "worker realm is not active");
     }
-    JSValue result = JS_Eval(
-        realm, source, source_length, url, JS_EVAL_TYPE_GLOBAL);
+#if defined(CONFIG_PROPERTY_FAULT_TRACE)
+    runtime_configure_property_fault_trace(JS_GetRuntime(realm));
+#endif
+    JSValue result;
+    if (operation == 1) {
+        bool registered = js_rt_runtime_module_root_register(
+            bridge->host, url, url, NULL,
+            module_credentials);
+        result = registered
+            ? JS_Eval(realm, source, source_length, url,
+                      JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY)
+            : JS_ThrowRangeError(realm, "worker module metadata limit exceeded");
+        if (!JS_IsException(result)
+            && !js_rt_module_set_import_meta(realm, result, url, true)) {
+            JS_FreeValue(realm, result);
+            result = JS_EXCEPTION;
+        }
+        if (!JS_IsException(result)) result = JS_EvalFunction(realm, result);
+    } else {
+        result = JS_Eval(
+            realm, source, source_length, url, JS_EVAL_TYPE_GLOBAL);
+    }
     JS_FreeCString(context, source);
     JS_FreeCString(context, url);
     if (JS_IsException(result)) {
@@ -1024,6 +1141,19 @@ static JSValue js_runtime_trace_worker_message(
     (void) this_value;
 #ifndef TILEFINCH_NO_TRACE
     const char *trace_filter = getenv("TILEFINCH_TRACE_WORKER_MESSAGES");
+    if (trace_filter != NULL && argc == 1) {
+        const char *direction = JS_ToCString(context, argv[0]);
+        if (direction == NULL) {
+            JSValue exception = JS_GetException(context);
+            JS_FreeValue(context, exception);
+            return JS_FALSE;
+        }
+        bool selected = trace_filter[0] == '\0'
+            || strcmp(trace_filter, "1") == 0
+            || strcmp(trace_filter, direction) == 0;
+        JS_FreeCString(context, direction);
+        return JS_NewBool(context, selected);
+    }
     if (trace_filter != NULL && argc >= 2) {
         const char *direction = JS_ToCString(context, argv[0]);
         if (direction != NULL) {
@@ -1118,6 +1248,28 @@ static JSValue js_runtime_trace_worker_message(
 #endif
     return JS_UNDEFINED;
 }
+
+#if defined(CONFIG_PROPERTY_FAULT_TRACE)
+static void runtime_configure_property_fault_trace(JSRuntime *runtime)
+{
+    const char *trace_value = getenv("TILEFINCH_TRACE_JS_PROPERTY_FAULTS");
+    uint32_t limit = 0u;
+    if (trace_value != NULL && trace_value[0] != '\0'
+        && strcmp(trace_value, "0") != 0) {
+        char *end = NULL;
+        unsigned long requested = strtoul(trace_value, &end, 10);
+        limit = 32u;
+        if (end != trace_value && *end == '\0') {
+            if (requested < 1u)
+                requested = 1u;
+            if (requested > 128u)
+                requested = 128u;
+            limit = (uint32_t) requested;
+        }
+    }
+    JS_SetPropertyFaultTraceLimit(runtime, limit);
+}
+#endif
 
 static ScriptRuntime *script_runtime_create_internal(
     PocDocument *document, Budget *budget, size_t js_memory_limit,
@@ -1302,25 +1454,6 @@ static ScriptRuntime *script_runtime_create_internal(
         return NULL;
     }
     runtime_ready_ns = js_rt_monotonic_time_ns();
-#if defined(CONFIG_PROPERTY_FAULT_TRACE)
-    {
-        const char *trace_value = getenv("TILEFINCH_TRACE_JS_PROPERTY_FAULTS");
-        if (trace_value != NULL && trace_value[0] != '\0'
-            && strcmp(trace_value, "0") != 0) {
-            char *end = NULL;
-            unsigned long requested = strtoul(trace_value, &end, 10);
-            uint32_t limit = 32u;
-            if (end != trace_value && *end == '\0') {
-                if (requested < 1u)
-                    requested = 1u;
-                if (requested > 128u)
-                    requested = 128u;
-                limit = (uint32_t) requested;
-            }
-            JS_SetPropertyFaultTraceLimit(host->runtime, limit);
-        }
-    }
-#endif
     {
         const char *window_env = getenv("TILEFINCH_JS_BOOT_WINDOW_KB");
         long window_kb = window_env == NULL ? 0 : atol(window_env);
@@ -1463,9 +1596,43 @@ static ScriptRuntime *script_runtime_create_internal(
         script_runtime_destroy(host);
         return NULL;
     }
-    host->bridge.performance_origin_ns = js_rt_monotonic_time_ns();
+    uint64_t performance_created_ns = js_rt_monotonic_time_ns();
+    host->bridge.performance_origin_ns = performance_created_ns;
+    uint64_t performance_time_origin_ms = deterministic
+        ? replay_clock_origin_ms : wall_time_ms();
+    if (!deterministic && options->navigation_started_us != 0
+        && options->navigation_started_us <= performance_created_ns / 1000u) {
+        uint64_t elapsed_us = performance_created_ns / 1000u
+            - options->navigation_started_us;
+        /* Reject nonsensical or stale embedding anchors rather than exposing
+           a clock whose epoch and monotonic halves no longer correspond. */
+        if (elapsed_us <= UINT64_C(3600000000)) {
+            host->bridge.performance_origin_ns =
+                options->navigation_started_us * UINT64_C(1000);
+            uint64_t elapsed_ms = elapsed_us / UINT64_C(1000);
+            performance_time_origin_ms = performance_time_origin_ms >= elapsed_ms
+                ? performance_time_origin_ms - elapsed_ms : 0;
+        }
+    }
+#if !defined(__PSP__)
+    unsigned performance_origin_backdate_ms =
+        tilefinch_test_faults()
+            ->runtime_performance_origin_backdate_ms;
+    tilefinch_test_faults()->runtime_performance_origin_backdate_ms = 0;
+    uint64_t performance_origin_backdate_ns =
+        (uint64_t) performance_origin_backdate_ms * UINT64_C(1000000);
+    if (!deterministic && performance_origin_backdate_ms != 0
+        && host->bridge.performance_origin_ns
+               >= performance_origin_backdate_ns
+        && performance_time_origin_ms >= performance_origin_backdate_ms) {
+        host->bridge.performance_origin_ns -= performance_origin_backdate_ns;
+        performance_time_origin_ms -= performance_origin_backdate_ms;
+    }
+#endif
     host->bridge.deterministic_entropy = deterministic;
     host->bridge.deterministic_clock = deterministic;
+    host->bridge.wall_clock_timers =
+        !deterministic && wall_clock_timers_enabled;
     host->bridge.replay_seed = replay_seed;
     host->bridge.clock_origin_ms = replay_clock_origin_ms;
     host->bridge.entropy_state = host->bridge.deterministic_entropy
@@ -1474,6 +1641,10 @@ static ScriptRuntime *script_runtime_create_internal(
               options->document_scope)
         : 0;
     JS_SetContextOpaque(host->context, &host->bridge);
+#if defined(TILEFINCH_QUICKJS_DYNAMIC_CODE_POLICY)
+    JS_SetHostGetCodeForEval(
+        host->context, js_runtime_host_get_code_for_eval, NULL);
+#endif
 
     JSValue global = JS_GetGlobalObject(host->context);
     JSValue js_document = JS_NewObject(host->context);
@@ -1553,6 +1724,23 @@ static ScriptRuntime *script_runtime_create_internal(
         setup_ok = JS_SetPropertyStr(
             host->context, global, "__tilefinchLocationHref",
             JS_NewString(host->context, host->document_url)) >= 0;
+    }
+    if (setup_ok) {
+        const char *document_referrer = options->document_referrer == NULL
+            ? "" : options->document_referrer;
+        if (strlen(document_referrer) >= TILEFINCH_URL_SERIALIZED_LIMIT) {
+            setup_ok = false;
+        } else {
+            setup_ok = JS_SetPropertyStr(
+                host->context, global, "__tilefinchDocumentReferrer",
+                JS_NewString(host->context, document_referrer)) >= 0;
+        }
+    }
+    if (setup_ok) {
+        setup_ok = JS_SetPropertyStr(
+            host->context, global, "__tilefinchPerformanceTimeOrigin",
+            JS_NewFloat64(
+                host->context, (double) performance_time_origin_ms)) >= 0;
     }
     if (setup_ok) {
         setup_ok = JS_SetPropertyStr(
@@ -1699,6 +1887,9 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchQueryAll",
                                        js_dom_query_all, 2)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchRegisterShadowRoot",
+                                       js_dom_register_shadow_root, 1)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchMatches",
                                        js_dom_matches, 2)
@@ -1965,8 +2156,17 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchCryptoRandomFill",
                                        js_crypto_random_fill, 1)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchDetachArrayBuffer",
+                                       js_detach_array_buffer, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchIsProxy",
+                                       js_is_proxy, 1)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchCryptoDigestSHA256",
                                        js_crypto_digest_sha256, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchVerifyResourceIntegrity",
+                                       js_resource_integrity_verify, 2)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchBase64EncodeBytes",
                                        js_base64_encode_bytes, 1)
@@ -1980,8 +2180,14 @@ static ScriptRuntime *script_runtime_create_internal(
                                        "__tilefinchPerformanceSample",
                                        js_performance_sample, 1)
                    && js_rt_install_function(host->context, global,
+                                       "__tilefinchSchedulerNow",
+                                       js_scheduler_now, 0)
+                   && js_rt_install_function(host->context, global,
                                        "__tilefinchCallbackCheckpoint",
                                        js_callback_checkpoint, 0)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchQueueCheckpointContinuation",
+                                       js_queue_checkpoint_continuation, 1)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchDateNow",
                                        js_date_now, 1)

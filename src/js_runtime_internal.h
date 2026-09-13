@@ -95,6 +95,11 @@ JSValue js_dom_parse_color(JSContext *context,
 #define SCRIPT_CRYPTO_DIGEST_INPUT_LIMIT (1024u * 1024u)
 #define SCRIPT_LAZY_MAX_RETAINED_SOURCE_BYTES (6u * 1024u * 1024u)
 #define SCRIPT_LAZY_RESIDENT_FACTORY_LIMIT 8192u
+/* Browser-authored, non-page-controlled constructor facade installed into a
+   fresh DedicatedWorkerGlobalScope before it is published. Keep it bounded
+   independently of author script admission; the facade includes the local
+   XHR/FileReader/WebSocket/Worker compatibility surface. */
+#define SCRIPT_WORKER_REALM_INITIALIZER_MAX_BYTES 16384u
 #define SCRIPT_LAZY_RESIDENT_BUNDLE_LIMIT 64u
 #define SCRIPT_LAZY_COMPILE_HEAP_MULTIPLIER 4u
 #define SCRIPT_LAZY_COMPILE_FIXED_HEAP_BYTES (256u * 1024u)
@@ -138,6 +143,7 @@ typedef struct {
 } Watchdog;
 
 #define DOM_BRIDGE_NODE_LIMIT SCRIPT_DOM_HANDLE_SLOT_CAPACITY
+#define DOM_BRIDGE_SHADOW_ROOT_LIMIT 64u
 #define BRIDGE_NODE_NATIVE_PIN 0x01u
 #define BRIDGE_NODE_LIVE_WRAPPER 0x02u
 #define BRIDGE_NODE_PENDING_RETIRE_NOTIFY 0x04u
@@ -161,6 +167,9 @@ typedef struct {
     uint64_t id;
     TilefinchRequestMode mode;
     TilefinchCredentialsMode credentials;
+    TilefinchRequestDestination destination;
+    char *integrity;
+    size_t integrity_length;
     char target_origin[TILEFINCH_ORIGIN_SERIALIZED_LIMIT];
 } ScriptAsyncFetch;
 
@@ -234,6 +243,8 @@ typedef struct {
     size_t resource_loader_preflight_statement;
     size_t resource_loader_statement;
     ScriptResourceTiming resource_timing;
+    /* Budget-owned minimized MIME type referenced by resource_timing. */
+    char *resource_timing_content_type;
     TilefinchRequestMode mode;
     TilefinchCredentialsMode credentials;
     uint8_t incoming_referrer_policy;
@@ -293,6 +304,12 @@ typedef struct DomBridge {
        bounded PSP handle table to track detached-node correctness. */
     unsigned char node_retention_flags[DOM_BRIDGE_NODE_LIMIT];
     size_t node_count;
+    /* Shadow carriers are native DOM nodes, but ordinary document/element
+       selectors must not cross their tree boundary.  Store encoded handles,
+       rather than pointers, so slot generation prevents allocator reuse from
+       granting a stale carrier identity. */
+    uint32_t shadow_root_handles[DOM_BRIDGE_SHADOW_ROOT_LIMIT];
+    size_t shadow_root_count;
     ScriptRuntime *host;
     ScriptPostMessageCallback post_message;
     void *post_message_opaque;
@@ -302,6 +319,7 @@ typedef struct DomBridge {
     uint64_t entropy_state;
     uint64_t replay_seed;
     bool deterministic_clock;
+    bool wall_clock_timers;
     uint64_t clock_origin_ms;
     uint64_t clock_host_elapsed_ms;
     uint64_t clock_wall_elapsed_ms;
@@ -433,11 +451,13 @@ typedef enum {
     SCRIPT_HOST_INTERSECTION_RECHECK,
     SCRIPT_HOST_MEDIA_RECHECK,
     SCRIPT_HOST_RECORD_RESOURCE_TIMING,
+    SCRIPT_HOST_RECORD_NAVIGATION_TIMING,
     SCRIPT_HOST_PENDING_TIMERS,
     SCRIPT_HOST_PENDING_NETWORK_REQUESTS,
     SCRIPT_HOST_DELIVER_NETWORK,
     SCRIPT_HOST_DETACH_NETWORK,
     SCRIPT_HOST_PUMP_TIMERS,
+    SCRIPT_HOST_SCHEDULER_SNAPSHOT,
     SCRIPT_HOST_REBIND_DOCUMENT,
     SCRIPT_HOST_COMMIT_SAME_DOCUMENT,
     SCRIPT_HOST_RESTORE_SAME_DOCUMENT,
@@ -449,6 +469,7 @@ typedef enum {
 
 #define SCRIPT_WORKER_REALM_LIMIT 4
 #define SCRIPT_FRAME_REALM_LIMIT 16
+#define SCRIPT_CHECKPOINT_CONTINUATION_LIMIT 8
 
 struct ScriptRuntime {
     Budget *budget;
@@ -556,6 +577,13 @@ struct ScriptRuntime {
        lifecycle never look them up through the mutable Window object. */
     JSValue host_global;
     JSValue host_callbacks[SCRIPT_HOST_CALLBACK_COUNT];
+    /* Browser-delivered callbacks run with no enclosing author script. Resume
+       their bounded listener dispatch only after QuickJS has drained the
+       complete microtask checkpoint, before admitting another task. */
+    JSValue checkpoint_continuations[
+        SCRIPT_CHECKPOINT_CONTINUATION_LIMIT];
+    uint8_t checkpoint_continuation_head;
+    uint8_t checkpoint_continuation_count;
     TilefinchGamepadState gamepad_state;
     bool gamepad_state_valid;
     bool page_visibility_desired;
@@ -623,6 +651,7 @@ bool js_rt_current_script_scope_end(JSContext *context,
                                     ScriptResult *result);
 void js_rt_runtime_arm_watchdog(ScriptRuntime *runtime);
 bool js_rt_runtime_run_jobs(ScriptRuntime *runtime);
+bool js_rt_runtime_checkpoint_pending(const ScriptRuntime *runtime);
 size_t js_rt_prepare_network_response_delivery(ScriptRuntime *runtime,
                                                size_t response_bytes);
 bool js_rt_runtime_refresh(ScriptRuntime *runtime);
@@ -738,6 +767,15 @@ bool js_rt_script_response_origin_allowed(
     const char *request_url_or_origin,
     TilefinchRequestDestination destination, TilefinchRequestMode mode,
     TilefinchCredentialsMode credentials);
+bool js_rt_script_resource_timing_allowed(
+    const DomBridge *bridge, const FetchResult *fetched,
+    const char *response_url);
+uint8_t js_rt_script_resource_timing_protocol(long version);
+bool js_rt_resource_timing_body_info_visible(
+    const DomBridge *bridge, TilefinchRequestMode mode,
+    const char *response_url, bool redirect_origin_tainted);
+bool js_rt_resource_timing_minimize_content_type(
+    const char *source, char *output, size_t capacity);
 size_t js_rt_script_visible_response_headers(
     const DomBridge *bridge, const FetchResult *fetched,
     TilefinchCredentialsMode credentials, char *output, size_t capacity);
@@ -1009,6 +1047,9 @@ JSValue js_dom_query_all(JSContext *context,
 JSValue js_dom_query_count(JSContext *context,
                            JSValueConst this_value,
                            int argc, JSValueConst *argv);
+JSValue js_dom_register_shadow_root(JSContext *context,
+                                    JSValueConst this_value,
+                                    int argc, JSValueConst *argv);
 JSValue js_dom_query_selector_all_method(JSContext *context,
                                          JSValueConst this_value,
                                          int argc,

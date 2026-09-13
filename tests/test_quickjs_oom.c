@@ -23,6 +23,19 @@ static size_t test_stack_limit(void)
     return 256u * 1024u;
 }
 
+typedef struct {
+    unsigned polls;
+    unsigned stop_after;
+} RepeatEvalInterrupt;
+
+static int interrupt_repeat_eval(JSRuntime *runtime, void *opaque)
+{
+    (void) runtime;
+    RepeatEvalInterrupt *interrupt = opaque;
+    interrupt->polls++;
+    return interrupt->polls >= interrupt->stop_after;
+}
+
 static int run_reallocation_peak_census(void)
 {
     Budget budget;
@@ -562,6 +575,9 @@ static int run_large_repeat_eval(void)
     static const char semantic_source[] =
         "(()=>{let local=40;"
         "const direct=eval(' '.repeat(1337331)+'local+2');"
+        "const tabs=eval(' \\t'.repeat(668666)+'40+2');"
+        "const astral=eval(' '.repeat(1337331)+"
+        "\"'\\ud83d\\ude00'.length\");"
         "let column=0;try{eval(' '.repeat(1337331)+'!')}"
         "catch(e){column=e.columnNumber}"
         "const repeated='ab'.repeat(70000);"
@@ -570,7 +586,7 @@ static int run_large_repeat_eval(void)
         "const pollLeaf='/*'.padEnd(5002,'y')+'*/6*7';"
         "const longResult=eval(' '.repeat(1337331)+longLeaf);"
         "const pollResult=eval(' '.repeat(1337331)+pollLeaf);"
-        "return [direct,repeated.length,repeated.charAt(139999),"
+        "return [direct,tabs,astral,repeated.length,repeated.charAt(139999),"
         "newline,column,longResult,pollResult].join(',')})()";
     Budget budget;
     budget_init(&budget, 8u * MIB);
@@ -606,6 +622,16 @@ static int run_large_repeat_eval(void)
         return 1;
     }
     JS_FreeValue(context, value);
+#ifdef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+    {
+        uint64_t physical_work = JS_GetEvalRopePhysicalWork(runtime);
+        if (physical_work == 0 || physical_work >= 10000u) {
+            fprintf(stderr, "repeat eval physical work: %llu\n",
+                    (unsigned long long) physical_work);
+            return 1;
+        }
+    }
+#endif
 
     /* Large repeat remains an ordinary ECMAScript string. The compact eval
        path preserves direct-eval scope, does not discard a newline, and keeps
@@ -625,7 +651,7 @@ static int run_large_repeat_eval(void)
     }
     const char *text = JS_ToCString(context, value);
     int okay = text != NULL
-        && strcmp(text, "42,140000,b,7,1337333,42,42") == 0;
+        && strcmp(text, "42,42,2,140000,b,7,1337333,42,42") == 0;
     if (!okay) fprintf(stderr, "repeat semantics result: %s\n", text ? text : "null");
     JS_FreeCString(context, text);
     JS_FreeValue(context, value);
@@ -635,9 +661,10 @@ static int run_large_repeat_eval(void)
        the one-billion-code-unit string limit. The rope stays virtual, the
        bounded refusal is catchable, and the realm remains usable. */
     static const char bounded_source[] =
-        "(()=>{let bounded=false;try{eval(' '.repeat(4194305))}"
+        "(()=>{const exact=eval(' '.repeat(4194304));"
+        "let bounded=false;try{eval(' '.repeat(4194304)+'0')}"
         "catch(error){bounded=error instanceof RangeError;}"
-        "return bounded&&eval('40+2')===42;})()";
+        "return exact===undefined&&bounded&&eval('40+2')===42;})()";
     value = JS_Eval(context, bounded_source,
                     sizeof(bounded_source) - 1u,
                     "<bounded-repeat-eval-scan>",
@@ -649,6 +676,44 @@ static int run_large_repeat_eval(void)
         } else {
             JS_FreeValue(context, value);
         }
+        return 1;
+    }
+    JS_FreeValue(context, value);
+
+    /* Cached subtree accounting remains a logical scan: it must continue to
+       poll at the ordinary interval even though it no longer revisits every
+       virtual character. An interrupted eval must not poison its runtime. */
+    static const char prepare_interrupt_source[] =
+        "globalThis.__repeatInterrupt="
+        "' '.repeat(1337331)+'40+2'";
+    value = JS_Eval(context, prepare_interrupt_source,
+                    sizeof(prepare_interrupt_source) - 1u,
+                    "<repeat-eval-interrupt-prepare>",
+                    JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(value)) return 1;
+    JS_FreeValue(context, value);
+    RepeatEvalInterrupt interrupt = { .stop_after = 1u };
+    JS_SetInterruptHandler(runtime, interrupt_repeat_eval, &interrupt);
+    static const char interrupt_source[] =
+        "eval(globalThis.__repeatInterrupt)";
+    value = JS_Eval(context, interrupt_source,
+                    sizeof(interrupt_source) - 1u,
+                    "<repeat-eval-interrupt>", JS_EVAL_TYPE_GLOBAL);
+    if (!JS_IsException(value) || interrupt.polls == 0) {
+        JS_FreeValue(context, value);
+        return 1;
+    }
+    JS_FreeValue(context, JS_GetException(context));
+    JS_SetInterruptHandler(runtime, NULL, NULL);
+    static const char after_interrupt_source[] = "40+2";
+    value = JS_Eval(context, after_interrupt_source,
+                    sizeof(after_interrupt_source) - 1u,
+                    "<repeat-eval-after-interrupt>",
+                    JS_EVAL_TYPE_GLOBAL);
+    result = 0;
+    if (JS_IsException(value) || JS_ToInt32(context, &result, value)
+        || result != 42) {
+        JS_FreeValue(context, value);
         return 1;
     }
     JS_FreeValue(context, value);
@@ -684,6 +749,11 @@ static int run_compact_character_array(void)
         "Object.defineProperty(chars,'1',{value:'K',writable:true,"
         "enumerable:true,configurable:true});"
         "chars.push('wide');"
+        "let sparse=[];sparse.unshift('9');sparse.length=70;"
+        "sparse.fill('q',1,45);sparse.splice(23,4,'N');"
+        "sparse.reverse();sparse.reverse();sparse.length=1;"
+        "if(sparse.length!==1||Object.keys(sparse).join(',')!=='0'"
+        "||sparse.join('')!=='9')return 'length-shrink';"
         "const preserved=joined.length===n&&joined.charCodeAt(3)===94;"
         "return [preserved?1:0,copied?1:0,removed[0].charCodeAt(0),"
         "removed[1].charCodeAt(0),applied.length,chars[1],"
@@ -805,10 +875,12 @@ static int run_compact_character_array(void)
         goto cleanup;
     }
     text = JS_ToCString(context, value);
-    okay = text != NULL && strcmp(text, "1:1:1:1:1:1") == 0;
-    if (!okay)
+    bool ownership_ok = text != NULL
+        && strcmp(text, "1:1:1:1:1:1") == 0;
+    if (!ownership_ok)
         fprintf(stderr, "compact character-array ownership result: %s\n",
                 text != NULL ? text : "<unprintable>");
+    okay = okay && ownership_ok;
     JS_FreeCString(context, text);
     JS_FreeValue(context, value);
 
@@ -1173,6 +1245,83 @@ static int run_sparse_bytecode_atoms(void)
     return okay ? 0 : 1;
 }
 
+static int run_near_limit_array_growth(void)
+{
+#ifndef CONFIG_TILEFINCH_EVAL_ROPE_TEST
+    return 0;
+#else
+    Budget budget;
+    budget_init(&budget, 8u * MIB);
+    BudgetQuickJSPool *pool = budget_quickjs_pool_create(&budget);
+    if (pool == NULL) return 1;
+    JSRuntime *runtime = JS_NewRuntime2(
+        budget_quickjs_pool_allocator(), pool);
+    if (runtime == NULL) return 1;
+    JS_SetMemoryLimit(runtime, 4u * MIB);
+    JS_SetMaxStackSize(runtime, test_stack_limit());
+    JSContext *context = JS_NewContext(runtime);
+    if (context == NULL) return 1;
+
+    static const char prepare[] =
+        /* 94215 is an exact fast-array capacity reached after the host's
+           large-array growth cap takes over. */
+        "globalThis.nearLimitArray=Array(94215).fill(0);";
+    JSValue value = JS_Eval(context, prepare, sizeof(prepare) - 1u,
+                            "<near-limit-array-prepare>",
+                            JS_EVAL_TYPE_GLOBAL);
+    int okay = !JS_IsException(value);
+    JS_FreeValue(context, value);
+    JSValue global = JS_GetGlobalObject(context);
+    JSValue array = JS_GetPropertyStr(context, global, "nearLimitArray");
+    uint32_t capacity = JS_GetFastArrayCapacityForTest(array);
+    okay &= capacity >= 94215u
+        && JS_SetPropertyStr(context, global, "nearLimitCapacity",
+                            JS_NewUint32(context, capacity)) >= 0;
+    JS_FreeValue(context, array);
+    JS_FreeValue(context, global);
+    static const char fill_capacity[] =
+        "while(nearLimitArray.length<nearLimitCapacity)"
+        "nearLimitArray.push(0);";
+    value = JS_Eval(context, fill_capacity, sizeof(fill_capacity) - 1u,
+                    "<near-limit-array-fill-capacity>",
+                    JS_EVAL_TYPE_GLOBAL);
+    okay &= !JS_IsException(value);
+    JS_FreeValue(context, value);
+    JS_RunGC(runtime);
+    /* Isolate the explicit array-growth collection from the ordinary
+       allocator threshold. */
+    JS_SetGCThreshold(runtime, SIZE_MAX);
+
+    size_t live = budget_quickjs_pool_js_malloc_current(pool);
+    JS_SetMemoryLimit(runtime, live + 96u * 1024u);
+    uint64_t gc_before = JS_GetGCRunCount(runtime);
+    static const char grow[] =
+        "for(let i=0;i<4096;i++)nearLimitArray.push(i);"
+        "nearLimitArray.length";
+    value = JS_Eval(context, grow, sizeof(grow) - 1u,
+                    "<near-limit-array-grow>", JS_EVAL_TYPE_GLOBAL);
+    int32_t length = 0;
+    okay &= !JS_IsException(value)
+        && JS_ToInt32(context, &length, value) == 0
+        && length == (int32_t)(capacity + 4096u);
+    uint64_t gc_delta = JS_GetGCRunCount(runtime) - gc_before;
+    okay &= gc_delta == 0u;
+    JS_FreeValue(context, value);
+
+    JS_SetMemoryLimit(runtime, 4u * MIB);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    (void)budget_quickjs_pool_trim(pool, 0);
+    okay &= budget_quickjs_pool_destroy(pool) && budget.current == 0;
+    if (!okay) {
+        fprintf(stderr,
+                "near-limit array growth failed length=%d gc-runs=%llu\n",
+                length, (unsigned long long)gc_delta);
+    }
+    return okay ? 0 : 1;
+#endif
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2) {
@@ -1184,6 +1333,7 @@ int main(int argc, char **argv)
     if (argc != 1) return 2;
     if (run_bytecode_refusal_atomicity() != 0) return 1;
     if (run_sparse_bytecode_atoms() != 0) return 1;
+    if (run_near_limit_array_growth() != 0) return 1;
     if (run_cstring_refusal_lifetime() != 0) return 1;
     if (run_source_snapshot_sharing() != 0) return 1;
     if (run_source_span_snapshot() != 0) return 1;

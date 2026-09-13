@@ -164,6 +164,9 @@ typedef enum {
 bool psp_write_failure_report(
     const char *stage, const char *detail, const char *url,
     long http_status, int native_result);
+/* Applies the profile policy without writing. clear_existing is used only by
+   the explicit Off action, never during ordinary boot. */
+bool psp_failure_report_configure(bool enabled, bool clear_existing);
 bool psp_write_navigation_failure_report(
     const char *stage, const char *detail, const char *url,
     const NavigationSession *navigation);

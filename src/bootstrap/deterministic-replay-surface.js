@@ -113,6 +113,7 @@
     },
   });
   globalThis.__tilefinchRecordResourceTiming = () => {};
+  globalThis.__tilefinchRecordNavigationTiming = () => {};
   class ReplayPerformanceObserver {
     constructor(callback) {
       if (typeof callback !== "function")

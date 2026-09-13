@@ -7036,7 +7036,8 @@ class PspSdkContractTests(unittest.TestCase):
             main.index("int main(int argc", main.index(
                 "static TILEFINCH_COLD_PATH void "
                 "psp_report_startup_failure("))]
-        self.assertIn('psp_write_failure_report("startup"', helper)
+        self.assertIn("psp_write_failure_report_data(", helper)
+        self.assertIn('"startup", detail, url, 0, 0, NULL, true', helper)
         self.assertIn("startup_failure_screen", halted)
         self.assertNotIn("STARTUP FAILED - SEE LOG", halted)
 

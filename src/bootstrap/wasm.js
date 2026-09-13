@@ -10,6 +10,7 @@
     globalSetNative = globalThis.__tilefinchWasmGlobalSet,
     detachBufferNative = globalThis.__tilefinchWasmDetachBuffer,
     snapshotSourceNative = globalThis.__tilefinchWasmSnapshotSource,
+    consumeStreamingResponse = globalThis.__tilefinchConsumeWasmResponse,
     createPrivateWeakMap = globalThis.__tilefinchCreatePrivateWeakMap;
   if (
     typeof available !== "function" ||
@@ -22,6 +23,7 @@
     typeof globalSetNative !== "function" ||
     typeof detachBufferNative !== "function" ||
     typeof snapshotSourceNative !== "function" ||
+    typeof consumeStreamingResponse !== "function" ||
     typeof createPrivateWeakMap !== "function" ||
     !available()
   ) return;
@@ -36,7 +38,6 @@
     tableHandles = createPrivateWeakMap(),
     globalHandles = createPrivateWeakMap(),
     wasmFunctions = createPrivateWeakMap(),
-    ResponseCtor = globalThis.Response,
     resolve = Promise.resolve.bind(Promise),
     reject = Promise.reject.bind(Promise),
     validImports = (imports) => imports !== null &&
@@ -455,19 +456,8 @@
       });
     },
     validate = (source) => validateNative(source),
-    streamingBytes = (source) => resolve(source).then((response) => {
-      if (typeof ResponseCtor !== "function" ||
-          !(response instanceof ResponseCtor))
-        throw new TypeError("WebAssembly streaming source must be a Response");
-      const contentType = response.headers.get("Content-Type"),
-        essence = typeof contentType === "string"
-          ? contentType.split(";", 1)[0].trim().toLowerCase() : "";
-      if (essence !== "application/wasm")
-        throw new TypeError("WebAssembly response has an unsupported MIME type");
-      if (response.ok === false)
-        throw new TypeError("WebAssembly response is not successful");
-      return response.arrayBuffer();
-    }),
+    streamingBytes = (source) =>
+      resolve(source).then(consumeStreamingResponse),
     compileStreaming = (source) => streamingBytes(source).then(compile),
     instantiateStreaming = (source, imports = {}) =>
       streamingBytes(source).then((bytes) => instantiate(bytes, imports));

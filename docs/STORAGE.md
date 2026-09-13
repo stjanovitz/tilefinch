@@ -71,6 +71,7 @@ smaller. "Writer" names the owning source file.
 | `local-storage.bin` (+`.bak`) | `session_persistence.c` | ≤ 5 MB per generation | disabling the setting removes it; "clear local storage" removes it | backup rotation, as above |
 | `tls-sessions.bin` (+`.bak`) | `tls_session_store.c` | ≤ 64 KB per generation (≤ 16 hosts × 2 sessions × 4 KB) | "clear HTTP caches" removes it; pruned of expired entries at load and save | backup rotation; a torn primary is removed after `.bak` recovery, and the whole file is a plain miss on any checksum, store-version, or Mbed-TLS-version-pin mismatch |
 | `boot-overrides.cfg` | `psp_boot_config.c` | 4 bounded lines | user-managed | tmp + remove + rename |
+| `tilefinch-last-error.txt` | `psp_script_main.c` | one bounded device-error snapshot (URL ≤ 2047 bytes, detail ≤ 1023 bytes) | disabling **Save error reports** removes it; a newer saved failure replaces it | tmp + remove + rename; ordinary failures write only when opted in, while a fatal startup failure writes once regardless because the diagnostic UI may never become available |
 | `themes/*.tfth` | user-provided (two examples ship with first installs) | ≤ 64 directory entries visited and ≤ 12 valid files retained per chooser scan; each file ≤ 2 KiB, ≤ 24 lines of 95 bytes | user-managed | read-only; the directory is scanned only in the chooser and only the selected file is read at boot |
 | `theme.tfth` | legacy user-provided theme | ≤ 2 KiB, ≤ 24 lines of 95 bytes | user-managed | read-only compatibility path for an older Custom selection |
 | `adblock.txt`, `adblock-allow.txt` | user-provided | read-only | user-managed | n/a |
@@ -106,6 +107,16 @@ suspend, completion, or clean exit—not on every playback tick. Clear playback
 positions forgets the saved list; switching saving Off also clears it. Continued
 playback can create a new position only while saving is enabled. These are
 separate from the Resume saves option for interrupted offline downloads.
+
+The content blocker's cumulative total is session-only. It is shown in the
+current UI but is neither loaded from nor written to `profile.cfg`, so a page
+which blocks requests does not turn a cosmetic statistic into a profile save.
+
+Failure-report saving is opt-in under Settings → Device & storage → Save error
+reports. With it Off, ordinary navigation, network, and media failures remain
+on screen and do not touch the Memory Stick. Turning it Off also removes the
+old snapshot. Fatal startup failures retain a one-shot on-card report because
+the Help surface may not be reachable.
 
 By default, `tls-sessions.bin` is written only during explicit suspend or
 controlled-exit flushes (curl's session cache is dumped there through
@@ -240,7 +251,7 @@ fixed-name `.ppm` frames beside the EBOOT.
 
 ### On-screen diagnostic QR
 
-**Options → System → Diagnostic QR** is a read-only transport for the existing
+**Help & diagnostics → Diagnostic QR** is a read-only transport for the existing
 logs. A release build reads `tilefinch-last-error.txt` if present. A validation
 build can additionally read the current and previous validation/crash logs;
 because the current validation log is normally buffered, the explicit

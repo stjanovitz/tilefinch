@@ -18,7 +18,7 @@ the code and its strings ship).
 | `TILEFINCH_TRACE_CALLBACK_SOURCE` | 1 | `src/diagnostic_trace.h` | host | Capture the source context of the last uncaught frame callback error. |
 | `TILEFINCH_TRACE_CLIP` | 1 | `src/layout.c` | host | Layout clip tracing. |
 | `TILEFINCH_TRACE_CONSOLE` | 1 | `src/js_runtime/host_primitives.inc` | always | Print page console output (first 64 messages). |
-| `TILEFINCH_TRACE_COOKIE` | 3 | `src/fetch/transport.inc` | always | Cookie store decisions. |
+| `TILEFINCH_TRACE_COOKIE` | 3 | `src/fetch/transport.inc` | always | Cookie store decisions; value `summary` omits URLs, byte counts, and cookie contents. |
 | `TILEFINCH_TRACE_CURL_POOL` | 1 | `src/fetch/response_stream.inc` | host | libcurl concurrent pool metrics. |
 | `TILEFINCH_TRACE_DOM` | 1 | `src/interactive_main.c` | always | Dump the DOM after the interactive lab tick loop. |
 | `TILEFINCH_TRACE_DPU` | 2 | `src/diagnostic_trace.h` | always | Evaluate the DPU bootstrap diagnostic module. |
@@ -35,7 +35,7 @@ the code and its strings ship).
 | `TILEFINCH_TRACE_IMAGE_PROFILE` | 1 | `src/image.c` | always | Image decode timing profile. |
 | `TILEFINCH_TRACE_INTERACTION` | 1 | `src/interactive/diagnostics.inc` | always | Interaction state probe in the interactive lab. |
 | `TILEFINCH_TRACE_JS_INTERRUPTS` | 1 | `src/diagnostic_trace.h` | host | QuickJS interrupt and cooperate decisions. |
-| `TILEFINCH_TRACE_JS_PROPERTY_FAULTS` | 1 | `src/js_runtime/runtime_creation.inc` | profile builds | Property-fault tracing (property-fault-trace builds only). |
+| `TILEFINCH_TRACE_JS_PROPERTY_FAULTS` | 1 | `src/js_runtime/runtime_creation.inc` | profile builds | Bounded property tracing; numeric values trace all events, `absent` traces failed `in`, and `fault` traces null/undefined bases (property-fault-trace builds only). |
 | `TILEFINCH_TRACE_JS_REJECT_STACK` | 1 | `src/budget.c` | host | Backtrace at each refused QuickJS pool request. |
 | `TILEFINCH_TRACE_JS_ROOTS` | 4 | `src/interactive_main.c` | always | Script runtime root reports at frame failure and teardown. |
 | `TILEFINCH_TRACE_JS_STARTUP` | 1 | `src/diagnostic_trace.h` | host | Per-bootstrap-module timing and the per-module heap census. |

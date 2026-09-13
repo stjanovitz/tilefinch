@@ -291,6 +291,41 @@ void js_rt_runtime_update_result(ScriptRuntime *runtime,
         READ_ROOT(root_mutation_observers, "mutationObservers");
         READ_ROOT(root_pending_network, "pendingNetwork");
         READ_ROOT(root_frame_windows, "frameWindows");
+        READ_ROOT(root_workers, "workers");
+        READ_ROOT(root_worker_starts, "workerStarts");
+        READ_ROOT(root_worker_start_completions, "workerStartCompletions");
+        READ_ROOT(root_worker_start_failures, "workerStartFailures");
+        READ_ROOT(root_worker_constructor_option_arguments,
+                  "workerConstructorOptionArguments");
+        READ_ROOT(root_worker_timer_callbacks, "workerTimerCallbacks");
+        READ_ROOT(root_worker_pending_timers, "workerPendingTimers");
+        READ_ROOT(root_worker_inbound_queued, "workerInboundQueued");
+        READ_ROOT(root_worker_inbound_delivered, "workerInboundDelivered");
+        READ_ROOT(root_worker_inbound_dropped, "workerInboundDropped");
+        READ_ROOT(root_worker_outbound_queued, "workerOutboundQueued");
+        READ_ROOT(root_worker_outbound_delivered, "workerOutboundDelivered");
+        READ_ROOT(root_worker_outbound_dropped, "workerOutboundDropped");
+        READ_ROOT(root_worker_outbound_dropped_inactive,
+                  "workerOutboundDroppedInactive");
+        READ_ROOT(root_worker_outbound_dropped_queue,
+                  "workerOutboundDroppedQueue");
+        READ_ROOT(root_worker_inbound_transfer_arguments,
+                  "workerInboundTransferArguments");
+        READ_ROOT(root_worker_outbound_transfer_arguments,
+                  "workerOutboundTransferArguments");
+        READ_ROOT(root_worker_terminations, "workerTerminations");
+        READ_ROOT(root_worker_last_id, "workerLastId");
+        READ_ROOT(root_worker_last_termination_reason,
+                  "workerLastTerminationReason");
+        JSValue last_worker_task = JS_GetPropertyStr(
+            runtime->context, roots, "workerLastTaskMs");
+        double last_worker_task_ms = 0;
+        if (JS_ToFloat64(runtime->context, &last_worker_task_ms,
+                         last_worker_task) == 0
+            && last_worker_task_ms >= 0) {
+            runtime->result.root_worker_last_task_ms = last_worker_task_ms;
+        }
+        JS_FreeValue(runtime->context, last_worker_task);
     }
 #undef READ_ROOT
     JS_FreeValue(runtime->context, roots);

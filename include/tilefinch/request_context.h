@@ -26,7 +26,8 @@ typedef enum {
     /* Preserve the established public value while extending the enum. */
     TILEFINCH_DESTINATION_OTHER = 6,
     TILEFINCH_DESTINATION_FONT = 7,
-    TILEFINCH_DESTINATION_MEDIA = 8
+    TILEFINCH_DESTINATION_MEDIA = 8,
+    TILEFINCH_DESTINATION_WORKER = 9
 } TilefinchRequestDestination;
 
 /* All security decisions for a request are derived from this immutable

@@ -1,3 +1,49 @@
+static bool test_resource_timing_origin_gate(Budget *budget)
+{
+    (void) budget;
+    const char *test_name = "resource timing requires TAO cross-origin";
+    bool ok = true;
+    DomBridge bridge = {0};
+    bridge.document_url = (char *) "https://page.test/path";
+    FetchResult fetched = {0};
+
+    REQUIRE(js_rt_script_resource_timing_allowed(
+        &bridge, &fetched, "https://page.test/script.js"));
+    REQUIRE(!js_rt_script_resource_timing_allowed(
+        &bridge, &fetched, "https://cdn.test/script.js"));
+
+    static const char allowed_headers[] =
+        "timing-allow-origin: https://other.test, https://page.test\n";
+    memcpy(fetched.response_headers, allowed_headers,
+           sizeof(allowed_headers) - 1u);
+    fetched.response_headers_length = sizeof(allowed_headers) - 1u;
+    REQUIRE(js_rt_script_resource_timing_allowed(
+        &bridge, &fetched, "https://cdn.test/script.js"));
+
+    static const char wildcard_headers[] = "Timing-Allow-Origin: *\n";
+    memcpy(fetched.response_headers, wildcard_headers,
+           sizeof(wildcard_headers) - 1u);
+    fetched.response_headers_length = sizeof(wildcard_headers) - 1u;
+    REQUIRE(js_rt_script_resource_timing_allowed(
+        &bridge, &fetched, "https://cdn.test/script.js"));
+
+    fetched.redirect_origin_tainted = true;
+    REQUIRE(!js_rt_script_resource_timing_allowed(
+        &bridge, &fetched, "https://page.test/script.js"));
+    fetched.redirect_origin_tainted = false;
+
+    bridge.opaque_origin = true;
+    static const char null_headers[] = "Timing-Allow-Origin: null\n";
+    memcpy(fetched.response_headers, null_headers,
+           sizeof(null_headers) - 1u);
+    fetched.response_headers_length = sizeof(null_headers) - 1u;
+    REQUIRE(js_rt_script_resource_timing_allowed(
+        &bridge, &fetched, "https://cdn.test/script.js"));
+
+cleanup:
+    return ok;
+}
+
 static bool test_native_script_element_state(Budget *budget)
 {
     const char *test_name = "native script-element state and currentScript";
