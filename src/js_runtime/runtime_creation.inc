@@ -510,13 +510,34 @@ static bool runtime_load_lazy_bootstrap(
             "<browser-canvas-lazy>", &browser_bootstrap_canvas_bytecode,
             false, trace, &total_us, &compile_us);
     } else if (feature == LAZY_BOOTSTRAP_INDEXED_DB) {
-        evaluated = runtime_evaluate_bootstrap_profiled(
-            runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
-                         browser_bootstrap_indexeddb,
-                         browser_bootstrap_indexeddb_bytecode),
-            "<browser-indexeddb-lazy>",
-            &browser_bootstrap_indexeddb_bytecode, false, trace,
-            &total_us, &compile_us);
+        JSValue global = JS_GetGlobalObject(runtime->context);
+        JSAtom bridge_atom = JS_NewAtom(
+            runtime->context,
+            "__tilefinchQueueCheckpointContinuation");
+        bool bridge_ready = !JS_IsException(global)
+            && bridge_atom != JS_ATOM_NULL
+            && js_rt_install_function(
+                runtime->context, global,
+                "__tilefinchQueueCheckpointContinuation",
+                js_queue_checkpoint_continuation, 1);
+        if (bridge_ready) {
+            evaluated = runtime_evaluate_bootstrap_profiled(
+                runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
+                             browser_bootstrap_indexeddb,
+                             browser_bootstrap_indexeddb_bytecode),
+                "<browser-indexeddb-lazy>",
+                &browser_bootstrap_indexeddb_bytecode, false, trace,
+                &total_us, &compile_us);
+            /* The lazy module captures this capability synchronously. Keep it
+               unavailable to author code even when module evaluation fails
+               before its own cleanup runs. */
+        }
+        if (bridge_atom != JS_ATOM_NULL) {
+            (void) JS_DeleteProperty(
+                runtime->context, global, bridge_atom, 0);
+            JS_FreeAtom(runtime->context, bridge_atom);
+        }
+        JS_FreeValue(runtime->context, global);
     } else if (feature == LAZY_BOOTSTRAP_MOTION) {
         evaluated = runtime_evaluate_bootstrap_profiled(
             runtime, TILEFINCH_BOOTSTRAP_SOURCE_ARGS(
@@ -2155,6 +2176,9 @@ static ScriptRuntime *script_runtime_create_internal(
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchCryptoRandomFill",
                                        js_crypto_random_fill, 1)
+                   && js_rt_install_function(host->context, global,
+                                       "__tilefinchDecodeUtf8Valid",
+                                       js_utf8_decode_valid, 2)
                    && js_rt_install_function(host->context, global,
                                        "__tilefinchDetachArrayBuffer",
                                        js_detach_array_buffer, 1)
