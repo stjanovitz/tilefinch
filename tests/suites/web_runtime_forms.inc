@@ -282,12 +282,13 @@
         "requestCloneRejected&&responseCloneRejected&&requestReadProbe.bodyUsed&&"
         "responseReadProbe.bodyUsed&&new TextDecoder().decode(values[2].value)==="
         "'request'&&new TextDecoder().decode(values[3].value)==='response');"
-        "let badReferrer=false,badReferrerPolicy=false;try{new Request('/bad',"
-        "{referrer:'https://cross-origin.invalid/'})}catch(error){badReferrer="
-        "error instanceof TypeError}try{new Request('/bad',{referrerPolicy:"
+        "const crossReferrer=new Request('/cross',{referrer:"
+        "'https://cross-origin.invalid/source'});let badReferrerPolicy=false;"
+        "try{new Request('/bad',{referrerPolicy:"
         "'future-policy'})}catch(error){badReferrerPolicy=error instanceof TypeError}"
         "const explicitReferrer=new Request('/ref',{referrer:'/source#secret',"
-        "referrerPolicy:'origin'}),referrerShape=badReferrer&&badReferrerPolicy&&"
+        "referrerPolicy:'origin'}),referrerShape=crossReferrer.referrer==="
+        "'about:client'&&badReferrerPolicy&&"
         "explicitReferrer.referrer.endsWith('/source')&&!explicitReferrer.referrer."
         "includes('#')&&explicitReferrer.referrerPolicy==='origin';"
         "const requestOwnershipResult=request.arrayBuffer().then(buffer=>{"
@@ -2560,7 +2561,7 @@
         "<body><div id=root class=outer>OLD</div><script>"
         "const stream=new ReadableStream({start(controller){controller.close();}});"
         "stream.pipeThrough(new TextEncoderStream());"
-        "const streamNames=Reflect.ownKeys(ReadableStream.prototype).map(String).sort().join(','),streamOk=typeof ReadableStream.prototype.pipeTo==='function'&&streamNames==='Symbol(Symbol.asyncIterator),Symbol(Symbol.toStringTag),cancel,constructor,getReader,locked,pipeThrough,pipeTo,tee,values'&&Object.prototype.toString.call(new ReadableStream({start(c){c.close()}}))==='[object ReadableStream]'&&Function.prototype.toString.call(ReadableStream).includes('[native code]')&&Function.prototype.toString.call(ReadableStream.prototype.getReader).includes('[native code]');"
+        "const streamNames=Reflect.ownKeys(ReadableStream.prototype).map(String).sort().join(','),streamOk=typeof ReadableStream.prototype.pipeTo==='function'&&streamNames==='Symbol(Symbol.asyncIterator),Symbol(Symbol.toStringTag),cancel,constructor,getReader,locked,pipeThrough,pipeTo,tee,values'&&Object.prototype.toString.call(new ReadableStream({start(c){c.close()}}))==='[object ReadableStream]'&&Function.prototype.toString.call(ReadableStream).includes('[native code]')&&Function.prototype.toString.call(ReadableStream.prototype.getReader).includes('[native code]')&&typeof globalThis.__tilefinchCreateBufferedReadableByteStream==='undefined';"
         "const lockStream=new ReadableStream({start(controller){controller.close();}}),lockReader=lockStream.getReader();let secondReaderError='';try{lockStream.getReader();}catch(error){secondReaderError=error.name;}lockReader.releaseLock();const cancelResponse=new Response('cancel');cancelResponse.body.cancel();const streamStateOk=secondReaderError==='TypeError'&&!lockStream.locked&&cancelResponse.bodyUsed;"
         "localStorage.setItem('theme','dark');"
         "localStorage.alpha='one';localStorage.setItem('beta','two');"
@@ -2838,7 +2839,7 @@
               "finish(event.data);terminated.terminate();"
               "URL.revokeObjectURL(terminatedURL);"
               "const behaviorURL=URL.createObjectURL(new Blob(["
-              "\"const sd=Object.getOwnPropertyDescriptor(WorkerGlobalScope.prototype,'self'),nd=Object.getOwnPropertyDescriptor(DedicatedWorkerGlobalScope.prototype,'name'),handlers=['onlanguagechange','onoffline','ononline','onrejectionhandled','onunhandledrejection'].every(key=>key in self&&self[key]===null);postMessage([typeof document,typeof window,'document' in self,'window' in self,typeof __tilefinchRunWorker,typeof navigator,typeof location,typeof navigator.userAgent,location.href.startsWith('blob:'),Object.prototype.toString.call(navigator),Object.prototype.toString.call(location),Object.prototype.toString.call(self),self instanceof DedicatedWorkerGlobalScope,self instanceof WorkerGlobalScope,navigator instanceof WorkerNavigator,location instanceof WorkerLocation,navigator.constructor.name,location.constructor.name,this===self,this===globalThis,typeof speechSynthesis,typeof SpeechSynthesisUtterance,self.origin,self.isSecureContext,location.origin,sd.enumerable,sd.configurable,typeof sd.get,sd.set===undefined,sd.get.call(self)===self,handlers,name,nd.enumerable,nd.configurable,typeof nd.get,typeof nd.set]);\"]));"
+              "\"const sd=Object.getOwnPropertyDescriptor(WorkerGlobalScope.prototype,'self'),nd=Object.getOwnPropertyDescriptor(DedicatedWorkerGlobalScope.prototype,'name'),handlers=['onlanguagechange','onoffline','ononline','onrejectionhandled','onunhandledrejection'].every(key=>key in self&&self[key]===null),hooks=['__tilefinchRegisterWorkerXHR','__tilefinchRegisterWorkerFileReader','__tilefinchRegisterWorkerWebSocket','__tilefinchWorkerScriptURL'].every(key=>typeof self[key]==='undefined');postMessage([typeof document,typeof window,'document' in self,'window' in self,typeof __tilefinchRunWorker,typeof navigator,typeof location,typeof navigator.userAgent,location.href.startsWith('blob:'),Object.prototype.toString.call(navigator),Object.prototype.toString.call(location),Object.prototype.toString.call(self),self instanceof DedicatedWorkerGlobalScope,self instanceof WorkerGlobalScope,navigator instanceof WorkerNavigator,location instanceof WorkerLocation,navigator.constructor.name,location.constructor.name,this===self,this===globalThis,typeof speechSynthesis,typeof SpeechSynthesisUtterance,self.origin,self.isSecureContext,location.origin,sd.enumerable,sd.configurable,typeof sd.get,sd.set===undefined,sd.get.call(self)===self,handlers,name,nd.enumerable,nd.configurable,typeof nd.get,typeof nd.set,hooks]);\"]));"
               "const messageURL=URL.createObjectURL(new Blob(["
               "\"onmessage=e=>postMessage([e instanceof MessageEvent,e.isTrusted,e.origin,e.source===null,e.ports.length,e.data])\"]));"
               "const behavior=new Worker(behaviorURL,{name:'probe'});behavior.onmessage="
@@ -2901,7 +2902,7 @@
               "WorkerNavigator,WorkerLocation,true,true,undefined,undefined,"
               "https://worker-lifecycle.test,true,"
               "https://worker-lifecycle.test,true,true,function,true,true,true,"
-              "probe,true,true,function,function";
+              "probe,true,true,function,function,true";
     bool worker_lifecycle_valid = strcmp(
             worker_lifecycle_result.summary, expected_worker_lifecycle) == 0
         && worker_lifecycle_result.bootstrap_lazy_module_loads == 1
@@ -3068,6 +3069,45 @@
                 worker_local_error_result.error);
     CHECK(strcmp(worker_local_error_result.summary,
                  "unhandled:true:true:boom|handled:true:true:boom") == 0);
+    script_runtime_destroy(worker_local_error_runtime);
+    document_destroy(&worker_local_error_document);
+    CHECK(budget.current == 0);
+
+    puts("test: Worker rejection reporting evicts old reported records");
+    CHECK(document_parse(
+        &worker_local_error_document, &budget, worker_lifecycle_page,
+        strlen(worker_lifecycle_page), 8));
+    memset(&worker_local_error_result, 0, sizeof(worker_local_error_result));
+    worker_local_error_runtime = script_runtime_create_deferred(
+        &worker_local_error_document, &budget, 4 * MIB, 1000,
+        "https://worker-rejection-window.test/", NULL,
+        &worker_local_error_result);
+    CHECK(worker_local_error_runtime != NULL
+          && script_runtime_evaluate_diagnostic(
+              worker_local_error_runtime,
+              "(()=>{pocSummary='pending';const source=`let count=0;"
+              "onunhandledrejection=event=>{event.preventDefault();count++;"
+              "if(count===20)postMessage(count);else setTimeout(()=>"
+              "Promise.reject('boom-'+count),0)};Promise.reject('boom-0')`,"
+              "url=URL.createObjectURL(new Blob([source])),worker=new Worker(url);"
+              "worker.onmessage=event=>{pocSummary=event.data===20?"
+              "'WORKER-REJECTION-WINDOW-OK':'WORKER-REJECTION-WINDOW-FAILED';"
+              "worker.terminate();URL.revokeObjectURL(url)}})()",
+              "<worker-rejection-window>", &worker_local_error_result));
+    for (size_t rejection_turn = 0; rejection_turn < 48; rejection_turn++) {
+        CHECK(script_runtime_advance(
+            worker_local_error_runtime, rejection_turn, 16,
+            &worker_local_error_result));
+        if (strcmp(worker_local_error_result.summary,
+                   "WORKER-REJECTION-WINDOW-OK") == 0) break;
+    }
+    if (strcmp(worker_local_error_result.summary,
+               "WORKER-REJECTION-WINDOW-OK") != 0)
+        fprintf(stderr, "worker rejection window summary=%s error=%s\n",
+                worker_local_error_result.summary,
+                worker_local_error_result.error);
+    CHECK(strcmp(worker_local_error_result.summary,
+                 "WORKER-REJECTION-WINDOW-OK") == 0);
     script_runtime_destroy(worker_local_error_runtime);
     document_destroy(&worker_local_error_document);
     CHECK(budget.current == 0);
@@ -5820,8 +5860,11 @@
                  count_test_message, NULL)
           && script_runtime_evaluate_diagnostic(
                  failed_message_runtime,
-                 "__tilefinchPostMessage(0,'{}','*');"
-                 "globalThis.pocSummary='failed-child-safe'",
+                 "let negative='';try{__tilefinchPostMessage(0,'{}','*',"
+                 "'event:test',-1)}catch(error){negative=error.name}"
+                 "__tilefinchPostMessage(0,'{}','*','event:'+"
+                 "'x'.repeat(160),1);globalThis.pocSummary=negative==="
+                 "'RangeError'?'failed-child-safe':'failed-child-bad'",
                  "<failed-child-post-message>", &failed_message_result)
           && strcmp(failed_message_result.summary,
                     "failed-child-safe") == 0);

@@ -244,10 +244,9 @@ static bool script_request_policy_read_referrer(
         } else {
             TilefinchUrl parsed;
             if (!tilefinch_url_parse(value, &parsed)
-                || bridge->document_url == NULL
-                || !tilefinch_url_same_origin(
-                       bridge->document_url, value)) return false;
-            policy->referrer_source = value;
+                || bridge->document_url == NULL) return false;
+            policy->referrer_source = tilefinch_url_same_origin(
+                bridge->document_url, value) ? value : bridge->document_url;
         }
     }
     if (argc > policy_index && !JS_IsUndefined(argv[policy_index])) {

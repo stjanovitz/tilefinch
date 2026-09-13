@@ -123,14 +123,12 @@ static bool navigation_stream_headers(void *opaque,
         metadata->effective_url[0] == '\0'
             ? stream->document_url : metadata->effective_url;
     stream->document_referrer[0] = '\0';
-    if (stream->referrer_source_url[0] != '\0'
-        && !fetch_compute_referrer(
-               stream->referrer_source_url, security_document_url,
-               stream->initiator_referrer_policy,
-               stream->document_referrer,
-               sizeof(stream->document_referrer))) {
-        return false;
-    }
+    if (stream->referrer_source_url[0] != '\0')
+        (void) fetch_compute_referrer(
+            stream->referrer_source_url, security_document_url,
+            stream->initiator_referrer_policy,
+            stream->document_referrer,
+            sizeof(stream->document_referrer));
     bool security_snapshot_truncated =
         metadata->security.version
                 == FETCH_RESPONSE_SECURITY_METADATA_VERSION

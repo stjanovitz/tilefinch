@@ -672,9 +672,10 @@ static int test_response_body_release_with_retained_wrappers(void)
     CHECK(script_runtime_evaluate_diagnostic(
         runtime,
         "globalThis.pocSummary='RESPONSE-RETENTION-PENDING';(async()=>{"
-        "for(let at=0;at<8;at++){const response=new Response(new Uint8Array("
+        "for(let at=0;at<12;at++){const response=new Response(new Uint8Array("
         "128*1024));retainedResponses.push(response);if((at&1)===0)await "
-        "response.body.cancel();else{const reader=response.body.getReader();"
+        "response.body.cancel();else if((at%3)===0){await Promise.resolve();await "
+        "response.arrayBuffer()}else{const reader=response.body.getReader();"
         "for(;;){const item=await reader.read();if(item.done)break}}}"
         "globalThis.pocSummary='RESPONSE-RETENTION-OK'})().catch(error=>{"
         "globalThis.pocSummary='RESPONSE-RETENTION-ERROR:'+String(error&&"
@@ -691,9 +692,10 @@ static int test_response_body_release_with_retained_wrappers(void)
         budget_quickjs_pool_js_malloc_current(runtime->quickjs_pool);
     printf("response-retention baseline=%zu retained=%zu delta=%zu\n",
            baseline, retained, retained > baseline ? retained - baseline : 0u);
-    /* Eight live Response wrappers and their exhausted stream state are
-       small. Their eight 128 KiB byte snapshots must no longer be retained. */
-    CHECK(retained <= baseline + 512u * 1024u);
+    /* Twelve live Response wrappers and their exhausted stream state are
+       small. Their twelve 128 KiB snapshots and any prefetched 4 KiB copies
+       must no longer be retained after cancel, public drain, or fast drain. */
+    CHECK(retained <= baseline + 128u * 1024u);
     script_runtime_destroy(runtime);
     document_destroy(&document);
     CHECK(budget.current == 0 && budget_uninstall_lexbor(&budget));
@@ -3925,6 +3927,36 @@ int main(int argc, char **argv)
     CHECK(body_consumption_ok
           && strcmp(result.summary, "BODY-CONSUMPTION-OK") == 0);
 
+    static const char buffered_response_stream_probe[] =
+        "(async()=>{const bytes=new Uint8Array(5000),response=new Response(bytes),"
+        "reader=response.body.getReader();let closed=false;reader.closed.then("
+        "()=>closed=true);await Promise.resolve();const openBefore=!closed,first="
+        "await reader.read();await Promise.resolve();const openBetween=!closed,"
+        "second=await reader.read();await reader.closed;const end=await reader."
+        "read(),empty=await new Response(new Uint8Array()).body.getReader().read(),"
+        "cancelReader=new Response('cancel').body.getReader();await cancelReader."
+        "cancel();await cancelReader.closed;globalThis.pocSummary=openBefore&&"
+        "openBetween&&!first.done&&first.value.length===4096&&!second.done&&"
+        "second.value.length===904&&end.done&&empty.done?"
+        "'BUFFERED-RESPONSE-STREAM-OK':'BUFFERED-RESPONSE-STREAM-FAILED'})().catch("
+        "error=>{globalThis.pocSummary='BUFFERED-RESPONSE-STREAM-ERROR:'+String("
+        "error&&error.stack||error)});";
+    bool buffered_response_stream_ok = script_runtime_evaluate_diagnostic(
+        runtime, buffered_response_stream_probe,
+        "<buffered-response-stream-probe>", &result);
+    for (size_t tick = 0; buffered_response_stream_ok && tick < 16
+         && strcmp(result.summary, "BUFFERED-RESPONSE-STREAM-OK") != 0; tick++) {
+        buffered_response_stream_ok = script_runtime_advance(
+            runtime, 0, 1024, &result);
+    }
+    if (!buffered_response_stream_ok
+        || strcmp(result.summary, "BUFFERED-RESPONSE-STREAM-OK") != 0) {
+        fprintf(stderr, "buffered response stream probe: ok=%d summary=%s error=%s\n",
+                buffered_response_stream_ok, result.summary, result.error);
+    }
+    CHECK(buffered_response_stream_ok
+          && strcmp(result.summary, "BUFFERED-RESPONSE-STREAM-OK") == 0);
+
     static const char response_clone_probe[] =
         "(async()=>{const run=async size=>{const bytes=new Uint8Array(size);for(let "
         "i=0;i<size;i++)bytes[i]=i&255;const response=new Response(bytes),clone="
@@ -3980,12 +4012,20 @@ int main(int argc, char **argv)
         "partial=codes(new TextDecoder().decode(new Uint8Array([0xe2,0x82,0x41]))),"
         "scalar=codes(new TextDecoder().decode(new Uint8Array([0xed,0xa0,0x80]))),"
         "stream=new TextDecoder(),streamFirst=codes(stream.decode(new Uint8Array("
-        "[0xe2,0x41]),{stream:true})),streamEnd=codes(stream.decode()),url=codes("
-        "new URLSearchParams('a=%E2%82A').get('a')),params=new URLSearchParams("
+        "[0xe2,0x41]),{stream:true})),streamEnd=codes(stream.decode()),"
+        "bomStream=new TextDecoder(),"
+        "bomPrefix=bomStream.decode(new Uint8Array([65]),{stream:true}),bomFinal="
+        "bomStream.decode(new Uint8Array([239,187,191,66])),url=codes("
+        "new URLSearchParams('a=%E2%82A').get('a')),validBytes=new Uint8Array("
+        "[0,65,226,130,172,240,159,152,128,0]),valid=new TextDecoder().decode("
+        "validBytes.subarray(1,9)),params=new URLSearchParams("
         "'a=one'),entry=params.entries().next().value;entry[1]='changed';"
         "globalThis.pocSummary=first.join(',')==='65533,65'&&partial.join(',')==="
         "'65533,65'&&scalar.join(',')==='65533,65533,65533'&&streamFirst.join(',')"
-        "==='65533,65'&&streamEnd.length===0&&url.join(',')==='65533,65'&&"
+        "==='65533,65'&&streamEnd.length===0&&bomPrefix==='A'&&"
+        "bomFinal.length===2&&bomFinal.charCodeAt(0)===65279&&bomFinal[1]==='B'&&"
+        "url.join(',')==='65533,65'&&"
+        "valid==='A€😀'&&typeof __tilefinchDecodeUtf8Valid==='undefined'&&"
         "params.get('a')==='one'?'UTF8-DECODER-OK':'UTF8-DECODER-FAILED'})()";
     CHECK(script_runtime_evaluate_diagnostic(
               runtime, utf8_decoder_probe, "<utf8-decoder-probe>", &result)
@@ -4493,8 +4533,13 @@ int main(int argc, char **argv)
         "await queuedDone;Array.prototype.includes=originalIncludes;"
         "const timersBefore=__tilefinchPendingTimers(),timers=[];for(let i=0;"
         "i<160;i++){const id=setTimeout(()=>{},1000);if(!id)break;timers.push(id)}"
-        "let saturatedName='';try{db.transaction('records')}catch(error){"
-        "saturatedName=error.name}for(const id of timers)clearTimeout(id);"
+        "let saturatedName='',replacementFinished=false;const saturated="
+        "db.transaction('records'),replacementReady=new Promise((resolve,reject)"
+        "=>saturated.addEventListener('abort',()=>{saturatedName=saturated.error."
+        "name;for(const id of timers)clearTimeout(id);try{const replacement="
+        "db.transaction('records');finished(replacement).then(()=>{"
+        "replacementFinished=true;resolve()},reject)}catch(error){reject(error)}}));"
+        "await replacementReady;"
         "const recovered=db.transaction('records'),recoveredDone=finished("
         "recovered),recoveredValue=await request(recovered.objectStore('records')."
         "get(1));await recoveredDone;"
@@ -4532,7 +4577,8 @@ int main(int argc, char **argv)
         "&&quotaDoneName==='QuotaExceededError'&&kept==='kept'&&count===1"
         "&&lockedResult==='kept'&&queuedBeforeRelease&&queuedResult==='kept'"
         "&&timers.length+timersBefore===128"
-        "&&saturatedName==='QuotaExceededError'&&recoveredValue==='kept'"
+        "&&saturatedName==='QuotaExceededError'&&replacementFinished"
+        "&&recoveredValue==='kept'"
         "&&badName==='AbortError'&&retryOld===1&&rolledBack"
         "&&persisted==='kept'&&__tilefinchIndexedDBStats.quotaErrors"
         "===beforeQuota+1&&currentVersion===2&&doomedName==='AbortError'"
@@ -4541,7 +4587,8 @@ int main(int argc, char **argv)
         "?'INDEXEDDB-FAILURES-OK':'INDEXEDDB-FAILURES-FAILED:'"
         "+JSON.stringify({abortResults,restoredKey,quotaName,quotaTrailing,"
         "quotaDoneName,kept,count,lockedResult,queuedBeforeRelease,queuedResult,"
-        "timers:timers.length,timersBefore,saturatedName,recoveredValue,badName,"
+        "timers:timers.length,timersBefore,saturatedName,replacementFinished,"
+        "recoveredValue,badName,"
         "retryOld,rolledBack,persisted,currentVersion,doomedName,"
         "stats:__tilefinchIndexedDBStats});})()"
         ".catch(error=>{globalThis.pocSummary='INDEXEDDB-FAILURES-ERROR:'+"
@@ -4752,7 +4799,9 @@ int main(int argc, char **argv)
         "let poisonCalls=0;globalThis.structuredClone=()=>{poisonCalls++;throw "
         "new Error('poison')};try{const opening=indexedDB.open(name,1);opening."
         "addEventListener('upgradeneeded',()=>opening.result.createObjectStore("
-        "'items',{keyPath:'id'}));const db=await request(opening),write=db."
+        "'items',{keyPath:'id'}));const db=await request(opening),burst=[];for(let "
+        "i=0;i<9;i++)burst.push(db.transaction('items'));await Promise.all(burst."
+        "map(finished));const write=db."
         "transaction('items','readwrite'),writeDone=finished(write),store=write."
         "objectStore('items'),source={id:1,value:'before'},cycle={id:2},shared="
         "{value:3};cycle.self=cycle;const first=request(store.put(source)),"
@@ -4769,26 +4818,43 @@ int main(int argc, char **argv)
         "try{store.get(1)}catch(error){postCommitName=error.name}await Promise.all("
         "[first,second,third,fourth,writeDone]);const read=db.transaction('items'),"
         "readDone=finished(read),readStore=read.objectStore('items');await Promise."
-        "resolve();const values=await Promise.all([request(readStore.get(1)),"
+        "resolve();await Promise.resolve();await Promise.resolve();const values="
+        "await Promise.all([request(readStore.get(1)),"
         "request(readStore.get(2)),request(readStore.get(3))]);await readDone;"
         "const order=[],ordered=db.transaction('items'),orderedDone=finished("
         "ordered),orderedRequest=ordered.objectStore('items').get(1);"
         "orderedRequest.addEventListener('success',()=>order.push('success'));"
         "queueMicrotask(()=>order.push('microtask'));await request(orderedRequest);"
-        "await orderedDone;"
+        "await orderedDone;const successLate=db.transaction('items'),successLateStore="
+        "successLate.objectStore('items'),successLateDone=finished(successLate),"
+        "successLateName=await new Promise(resolve=>{const first="
+        "successLateStore.get(1);first.addEventListener('success',()=>setTimeout("
+        "()=>{try{successLateStore.get(1);resolve('none')}catch(error){resolve("
+        "error.name)}},0))});await successLateDone;const prequeued="
+        "db.transaction('items'),prequeuedStore=prequeued.objectStore('items'),"
+        "prequeuedDone=finished(prequeued);prequeuedStore.get(1);const "
+        "prequeuedName=await new Promise(resolve=>setTimeout(()=>{try{"
+        "prequeuedStore.get(1);resolve('none')}catch(error){resolve(error.name)}},"
+        "0));await prequeuedDone;"
         "const late=db.transaction('items'),lateStore=late.objectStore('items'),"
         "lateDone=finished(late),lateName=await new Promise(resolve=>setTimeout("
         "()=>{try{lateStore.get(1);resolve('none')}catch(error){resolve(error.name)}}"
         ",0));await lateDone;db.close();await request(indexedDB.deleteDatabase("
-        "name));globalThis.pocSummary=poisonCalls===0&&cloneName==='DataCloneError'"
+        "name));globalThis.pocSummary=burst.length===9&&poisonCalls===0&&"
+        "cloneName==='DataCloneError'"
         "&&postCommitName==='TransactionInactiveError'&&values[0].value==="
         "'before'&&values[1].self===values[1]&&values[2].a===values[2].b&&"
-        "lateName==='TransactionInactiveError'&&eventRequest instanceof EventTarget"
+        "lateName==='TransactionInactiveError'&&successLateName==="
+        "'TransactionInactiveError'&&eventRequest instanceof EventTarget"
+        "&&prequeuedName==='TransactionInactiveError'&&typeof globalThis."
+        "__tilefinchQueueCheckpointContinuation==='undefined'"
         "&&eventCalls.join(',')==='first,object'&&order.join(',')==="
         "'microtask,success'?'INDEXEDDB-CONTRACT-OK':"
         "'INDEXEDDB-CONTRACT-FAILED:'+JSON.stringify({poisonCalls,cloneName,"
         "postCommitName,first:values[0].value,cycle:values[1].self===values[1],"
-        "alias:values[2].a===values[2].b,lateName,order})}finally{globalThis."
+        "alias:values[2].a===values[2].b,lateName,successLateName,prequeuedName,"
+        "order})}finally{"
+        "globalThis."
         "structuredClone=originalClone}})().catch(error=>{globalThis.pocSummary="
         "'INDEXEDDB-CONTRACT-ERROR:'+String(error&&error.stack||error)});";
     bool indexeddb_contract_ok = script_runtime_evaluate_diagnostic(

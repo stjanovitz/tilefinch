@@ -2821,8 +2821,7 @@
       value = String(value);
       if (value === "" || value === "about:client") return value;
       const parsed = new URL(value, location.href);
-      if (parsed.origin !== location.origin)
-        throw new TypeError("Request referrer must be same-origin");
+      if (parsed.origin !== location.origin) return "about:client";
       const href = parsed.href,
         fragment = href.indexOf("#");
       return fragment < 0 ? href : href.slice(0, fragment);
@@ -3732,6 +3731,21 @@
   const responseBrands = new WeakSet(),
     responseMetadata = new WeakMap(),
     responseBodyStorage = new TrustedWeakMap(),
+    responseOwnedBytesToken = {},
+    responseByteStream = (holder) => new ReadableStream({
+      pull(controller) {
+        const bytes = holder.bytes;
+        if (bytes === null || holder.at >= bytes.length) {
+          holder.bytes = null;
+          controller.close();
+          return;
+        }
+        const end = Math.min(bytes.length, holder.at + 4096);
+        controller.enqueue(bytes.slice(holder.at, end));
+        holder.at = end;
+      },
+      cancel() { holder.bytes = null; },
+    }),
     responseBodyState = (response) => {
       if (!trustedWeakMapHas(responseBodyStorage, response))
         throw new TrustedTypeError("Illegal invocation");
@@ -3759,8 +3773,12 @@
         throw new TypeError("Response body stream is unusable");
       const supplied = init.bodyBytes,
         suppliedBodyBytes = supplied !== undefined;
+      const trustedOwnedBytes = init.__tilefinchOwnedBytesToken ===
+        responseOwnedBytesToken;
       let bytes = suppliedBodyBytes
-        ? isArrayBuffer(supplied)
+        ? trustedOwnedBytes && isArrayBuffer(supplied)
+          ? new Uint8ArrayCtor(supplied)
+          : isArrayBuffer(supplied)
           ? copyArrayBufferBytes(supplied)
           : arrayBufferIsView(supplied)
             ? copyArrayBufferViewBytes(supplied)
@@ -3768,7 +3786,7 @@
         : streamBody ? null : snapshotRequestBody(body, headers);
       if (suppliedBodyBytes && bytes === null)
         throw new TypeError("Response bodyBytes must be a BufferSource");
-      const bodyState = { body: null };
+      const bodyState = { body: null, buffered: null };
       trustedWeakMapSet(responseBodyStorage, this, bodyState);
       this.status = status;
       this.statusText = String(
@@ -3787,30 +3805,14 @@
       /* The stream owns this immutable byte snapshot.  Metadata may release
        * its reference after tee()/consumption, but that must never empty a
        * pull which has not run yet. */
-      let retainedBytes = bytes;
-      let at = 0;
-      bodyState.body =
-        (body === null || body === undefined) && !suppliedBodyBytes
-          ? null
-          : streamBody ||
-            new ReadableStream({
-              pull(controller) {
-                const bytes = retainedBytes || new Uint8Array();
-                if (at >= bytes.length) {
-                  retainedBytes = null;
-                  controller.close();
-                  return;
-                }
-                const end = Math.min(bytes.length, at + 4096);
-                controller.enqueue(bytes.slice(at, end));
-                at = end;
-                if (at >= bytes.length) {
-                  retainedBytes = null;
-                  controller.close();
-                }
-              },
-              cancel() { retainedBytes = null; },
-            });
+      if ((body === null || body === undefined) && !suppliedBodyBytes) {
+        bodyState.body = null;
+      } else if (streamBody) {
+        bodyState.body = streamBody;
+      } else {
+        bodyState.buffered = { at: 0, bytes };
+        bodyState.body = responseByteStream(bodyState.buffered);
+      }
     }
     get body() {
       return responseBodyState(this).body;
@@ -3824,6 +3826,25 @@
     const takeBytes = async (response) => {
         const state = responseBodyState(response);
         if (state.body === null) return new Uint8Array();
+        if (state.buffered && state.buffered.bytes !== null) {
+          if (state.body.locked ||
+              __tilefinchReadableStreamDisturbed(state.body))
+            throw new TypeError("Body has already been consumed");
+          const bytes = state.buffered.bytes;
+          if (bytes.byteLength > 256 * 1024)
+            throw new RangeError("Body exceeds bounded size");
+          /* Match the ordinary consumer's persistent reader lock without
+             paying its promise/chunk/copy path. The shared holder also lets
+             a public reader or cancellation release the retained body. */
+          const reader = state.body.getReader();
+          __tilefinchMarkReadableStreamDisturbed(state.body);
+          state.buffered.bytes = null;
+          state.buffered = null;
+          /* The stream may have prefetched one bounded public chunk. Cancel
+             it so that copy is released and the internal close settles. */
+          await reader.cancel();
+          return bytes;
+        }
         const bytes = await __tilefinchConsumeReadableByteStream(
           state.body, 256 * 1024);
         return bytes;
@@ -3872,6 +3893,7 @@
       if (this.body === null) return new Response(null, init);
       const [first, second] = this.body.tee();
       state.body = first;
+      state.buffered = null;
       return new Response(second, init);
     };
     Response.error = () =>
@@ -4068,6 +4090,7 @@
                             "content-type: " + raw.contentType + "\n",
                         ),
                   bodyBytes: nullBody ? undefined : raw.bodyBytes,
+                  __tilefinchOwnedBytesToken: responseOwnedBytesToken,
                   redirected: !!raw.redirected,
                   type: raw.type || "basic",
                 }),
