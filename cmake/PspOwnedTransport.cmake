@@ -64,7 +64,7 @@ set(_transport_mbedtls_consumer_flags
 set(_transport_lock
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/psp_transport/dependencies.lock")
 set(_mbedtls_archive "${TILEFINCH_PSP_TRANSPORT_CACHE}/mbedtls-3.6.7.tar.bz2")
-set(_curl_archive "${TILEFINCH_PSP_TRANSPORT_CACHE}/curl-8.21.0.tar.xz")
+set(_curl_archive "${TILEFINCH_PSP_TRANSPORT_CACHE}/curl-8.22.0.tar.xz")
 set(_nghttp2_archive
     "${TILEFINCH_PSP_TRANSPORT_CACHE}/nghttp2-1.69.0.tar.xz")
 
@@ -73,7 +73,7 @@ if(NOT EXISTS "${_transport_lock}")
 endif()
 file(READ "${_transport_lock}" _transport_lock_contents)
 foreach(_locked_dependency IN ITEMS
-        "curl|8.21.0|curl-8.21.0.tar.xz|aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6|https://curl.se/download/curl-8.21.0.tar.xz"
+        "curl|8.22.0|curl-8.22.0.tar.xz|f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7|https://curl.se/download/curl-8.22.0.tar.xz"
         "mbedtls|3.6.7|mbedtls-3.6.7.tar.bz2|a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6|https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2"
         "nghttp2|1.69.0|nghttp2-1.69.0.tar.xz|1fb324b6ec2c56f6bde0658f4139ffd8209fa9e77ce98fd7a5f63af8d0e508ad|https://github.com/nghttp2/nghttp2/releases/download/v1.69.0/nghttp2-1.69.0.tar.xz")
     string(FIND "${_transport_lock_contents}" "${_locked_dependency}"
@@ -101,7 +101,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${_transport_mbedtls_config}"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/mbedtls-3.6.6-psp.patch"
     "${CMAKE_CURRENT_SOURCE_DIR}/patches/mbedtls-3.6.6-psp-bnmul.patch"
-    "${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.21.0-psp.patch")
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.22.0-psp.patch")
 
 # The bignum patch is applied unconditionally so the extracted tree is the
 # same whichever way the option is set; the block it adds is inert unless
@@ -216,14 +216,14 @@ endif()
 ExternalProject_Add(tilefinch_psp_curl
     URL "${_curl_archive}"
     URL_HASH
-        SHA256=aa1b66a70eace83dc624508745646c08ae561de512ab403adffb93ac87fc72e6
+        SHA256=f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     PREFIX "${CMAKE_CURRENT_BINARY_DIR}/psp-transport/curl"
     DEPENDS ${_curl_dependencies}
     PATCH_COMMAND
         "${CMAKE_COMMAND}"
         "-DPATCH_SOURCE_DIR=<SOURCE_DIR>"
-        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.21.0-psp.patch"
+        "-DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/curl-8.22.0-psp.patch"
         "-DPATCH_EXECUTABLE=${PATCH_EXECUTABLE}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patch.cmake"
     CMAKE_ARGS
@@ -308,7 +308,7 @@ target_compile_definitions(tilefinch_psp_transport INTERFACE
     MBEDTLS_USER_CONFIG_FILE="${_transport_mbedtls_config}"
     TILEFINCH_PSP_OWNED_TRANSPORT=1
     TILEFINCH_PSP_CURL_NO_PROXY=1
-    TILEFINCH_PSP_CURL_VERSION="8.21.0"
+    TILEFINCH_PSP_CURL_VERSION="8.22.0"
     TILEFINCH_PSP_MBEDTLS_VERSION="3.6.7"
     TILEFINCH_PSP_NGHTTP2_VERSION="1.69.0")
 target_link_libraries(tilefinch_psp_transport INTERFACE
@@ -342,4 +342,4 @@ set(TILEFINCH_PSP_TRANSPORT_LIBRARIES tilefinch_psp_transport)
 set(TILEFINCH_PSP_CRYPTO_LIBRARIES tilefinch_psp_crypto)
 set(TILEFINCH_PSP_TRANSPORT_DEPENDENCY tilefinch_psp_curl)
 message(STATUS
-    "PSP transport: project-owned curl 8.21.0 + Mbed TLS 3.6.7, HTTP/2=${TILEFINCH_PSP_HTTP2}")
+    "PSP transport: project-owned curl 8.22.0 + Mbed TLS 3.6.7, HTTP/2=${TILEFINCH_PSP_HTTP2}")

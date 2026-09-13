@@ -2,7 +2,7 @@
 
 Tilefinch owns the complete HTTPS chain used by the PSP release build:
 
-- curl 8.21.0;
+- curl 8.22.0;
 - Mbed TLS 3.6.7 LTS;
 - nghttp2 1.69.0 when HTTP/2 is enabled;
 - PSPDEV zlib 1.3.1.

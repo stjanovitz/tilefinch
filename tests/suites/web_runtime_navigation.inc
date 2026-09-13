@@ -3033,12 +3033,18 @@
         "<!doctype html><body><script id=trace-script></script></body>";
     static const char capability_trace_platform_source[] =
         "const array=new Array(2),xhr=new XMLHttpRequest();array[0]=7;"
+        "const entries=performance.getEntries().map(entry=>({name:entry.name})),"
+        "uaData=navigator.userAgentData.toJSON();let cloneable=true;"
+        "try{postMessage({entries,uaData},'*')}catch(_){cloneable=false}"
+        "let proxyRefused=false;try{postMessage(new Proxy({},{}),'*')}"
+        "catch(error){proxyRefused=error?.name==='DataCloneError'}"
         "xhr.responseType='text';const workerURL=URL.createObjectURL(new Blob(["
         "'void 0'],{type:'text/javascript'})),worker=new Worker(workerURL);"
         "URL.revokeObjectURL(workerURL);worker.terminate();let refused=false;"
         "try{URL.createObjectURL({})}catch(error){refused=error instanceof "
         "TypeError}globalThis.pocSummary=array[0]===7&&xhr.responseType==='text'"
-        "&&worker instanceof Worker&&refused?'TRACE-PLATFORM-OK':"
+        "&&worker instanceof Worker&&refused&&cloneable&&proxyRefused"
+        "?'TRACE-PLATFORM-OK':"
         "'TRACE-PLATFORM-BAD'";
     static NavigationSession capability_trace_platform_navigation;
     CHECK(navigation_init(&capability_trace_platform_navigation, &budget, 2));

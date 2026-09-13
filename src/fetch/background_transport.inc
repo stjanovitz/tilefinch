@@ -2366,7 +2366,7 @@ static void fetch_background_websocket_service_receive(
             socket, 1002u, "Interrupted WebSocket close frame", false);
         return;
     }
-    /* Hash-pinned curl 8.21.0 auto-enqueues a matching PONG unless the
+    /* Hash-pinned curl 8.22.0 auto-enqueues a matching PONG unless the
        unset CURLWS_NOAUTOPONG option disables it. Control frames therefore
        need no page-visible event or second Tilefinch transmit slot. */
     if ((frame->flags & (CURLWS_PING | CURLWS_PONG)) != 0) return;

@@ -8,6 +8,12 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.22 — 2026-09-13
+
+- Improved compatibility and reliability for Workers, embedded frames, and
+  browser events.
+- Updated the PSP network stack with the latest security fixes.
+
 ## 0.1.21 — 2026-09-13
 
 - Faster, more memory-efficient web response handling.

@@ -599,7 +599,7 @@ grants are also defined above; neither should be inferred for other resource
 classes.
 Unsupported directives must not be inferred from the presence of that subset.
 
-The default PSP release cross-builds hash-pinned curl 8.21.0 and Mbed TLS
+The default PSP release cross-builds hash-pinned curl 8.22.0 and Mbed TLS
 3.6.7 LTS; HTTP/2 builds additionally pin nghttp2 1.69.0. Runtime startup
 checks that linked provenance and fails closed on drift. Tilefinch still
 narrows curl to HTTP(S), disables automatic redirects and curl cookie state,

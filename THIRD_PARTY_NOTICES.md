@@ -56,7 +56,7 @@ runtime assets or immutable engine data.
   texts are under `third_party/public_suffix/`; MPL-2.0 §3.2 requires telling
   binary recipients how to obtain the data's source form (the README there
   records the upstream commit and hash).
-- **libcurl 8.21.0**: curl license (MIT-style). The default PSP release
+- **libcurl 8.22.0**: curl license (MIT-style). The default PSP release
   cross-builds this hash-pinned official source archive inside the project;
   `TILEFINCH_PSP_TRANSPORT_MODE=LEGACY` is a non-release escape hatch.
 - **mbed TLS 3.6.7 LTS**: dual Apache-2.0 / GPL-2.0-or-later; Tilefinch

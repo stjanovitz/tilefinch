@@ -2812,10 +2812,10 @@ class PspSdkContractTests(unittest.TestCase):
             ROOT / "src/fetch/background_transport.inc").read_text(
                 encoding="utf-8")
         self.assertIn(
-            "Hash-pinned curl 8.21.0 auto-enqueues", raw_transport_source)
+            "Hash-pinned curl 8.22.0 auto-enqueues", raw_transport_source)
         curl_config = (ROOT / "cmake/PspOwnedTransport.cmake").read_text(
             encoding="utf-8")
-        self.assertIn("curl-8.21.0", curl_config)
+        self.assertIn("curl-8.22.0", curl_config)
         self.assertNotIn("CURLWS_NOAUTOPONG", websocket_config)
         self.assertIn("curl_easy_attach_shared_state(slot->easy)", source)
         self.assertIn("CURLOPT_TIMEOUT_MS, 0L", source)
@@ -7140,7 +7140,7 @@ class PspSdkContractTests(unittest.TestCase):
         self.assertIn("strcmp(fetch_ca_bundle, path) == 0", setter)
 
     def test_psp_curl_patch_retains_and_resets_verify_flags(self):
-        patch = (ROOT / "patches/curl-8.21.0-psp.patch").read_text(
+        patch = (ROOT / "patches/curl-8.22.0-psp.patch").read_text(
             encoding="utf-8")
         callback = patch[
             patch.index("static int mbed_verify_cb("):

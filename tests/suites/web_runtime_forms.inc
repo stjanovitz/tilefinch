@@ -1160,7 +1160,7 @@
               "chain.then(()=>state='ready')});"
               "addEventListener('message',event=>{if(event.data.event!=="
               "'checkpoint-probe')return;globalThis.pocSummary="
-              "state===undefined&&sync==='first,second,after'&&"
+              "state==='ready'&&sync==='first,second,after'&&"
               "synthetic.join(',')==='first,second,after,micro'?"
               "'FRAME-CHECKPOINT-OK':'FRAME-CHECKPOINT-BAD'})})()",
               "https://frame-owner.test/checkpoint-listener.js",
@@ -1291,7 +1291,7 @@
           && navigation_advance_runtime(&frame_owner_navigation, 0, 4)
           && navigation_advance_runtime(&frame_owner_navigation, 0, 4)
           && strcmp(owned_frame->script_result.summary,
-                    "A,B1,C") == 0
+                    "A,micro,B1,C") == 0
           && script_runtime_evaluate_diagnostic(
               owned_frame->runtime, "__replaceWindowMessageHandler()",
               "https://frame-owner.test/handler-order-replace.js",
@@ -1305,7 +1305,7 @@
           && navigation_advance_runtime(&frame_owner_navigation, 0, 4)
           && navigation_advance_runtime(&frame_owner_navigation, 0, 4)
           && strcmp(owned_frame->script_result.summary,
-                    "A,B2,C") == 0
+                    "A,micro,B2,C") == 0
           && script_runtime_evaluate_diagnostic(
               owned_frame->runtime, "__readdWindowMessageHandler()",
               "https://frame-owner.test/handler-order-readd.js",
@@ -1319,7 +1319,7 @@
           && navigation_advance_runtime(&frame_owner_navigation, 0, 4)
           && navigation_advance_runtime(&frame_owner_navigation, 0, 4)
           && strcmp(owned_frame->script_result.summary,
-                    "A,C,B3") == 0
+                    "A,micro,C,B3") == 0
           && script_runtime_evaluate_diagnostic(
               owned_frame->runtime,
               "(()=>{const event=new MessageEvent('message',{data:"
@@ -5181,7 +5181,7 @@
         "w2=new Worker(url2);let observed='',stale=false,crossPhase=false,"
         "samePhase=false,finished=0;"
         "const finish=()=>{if(++finished!==2)return;"
-        "pocSummary=observed==='missing'&&stale&&crossPhase&&!samePhase&&"
+        "pocSummary=observed==='ready'&&!stale&&!crossPhase&&!samePhase&&"
         "syncOrder==='first,second,after'&&"
         "synthetic.join(',')==='first,second,after,micro'"
         "?'worker-checkpoint-ok':'worker-checkpoint-failed:'"
@@ -5196,7 +5196,7 @@
         "w1.addEventListener('message',lateCapture,true);"
         "w1.addEventListener('message',lateBubble)},{capture:true});"
         "w1.addEventListener('message',()=>{},{capture:true});"
-        "w1.addEventListener('message',()=>{observed=state||'missing'});"
+        "w1.addEventListener('message',()=>{observed=state||'missing';finish()});"
         "const removed=()=>stale=true;"
         "w2.addEventListener('message',()=>Promise.resolve().then("
         "()=>w2.removeEventListener('message',removed)));"
