@@ -2877,11 +2877,12 @@ static bool navigation_complete_frame(NavigationSession *session,
     const char *effective = fetch->effective_url[0] == '\0'
         ? frame->url : fetch->effective_url;
     char document_referrer[NAVIGATION_URL_LIMIT] = {0};
-    if (!fetch_compute_referrer(
-            frame->parent_url, effective, request_referrer_policy,
-            document_referrer, sizeof(document_referrer))) {
-        fetched_ok = false;
-    }
+    /* A non-serializable initiator (for example a local about: document)
+       produces an empty Document.referrer; it does not invalidate an
+       otherwise admitted and successfully fetched child response. */
+    (void) fetch_compute_referrer(
+        frame->parent_url, effective, request_referrer_policy,
+        document_referrer, sizeof(document_referrer));
     TilefinchRequestContext top_hint_context = {
         .target_url = effective,
         .initiator_url = session->page.document_url,

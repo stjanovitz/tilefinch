@@ -24,10 +24,49 @@
   const trustedJSONStringify = JSON.stringify;
   const trustedStructuredClone = globalThis.__tilefinchCloneWorkerValue,
     trustedCloneIntrinsics = globalThis.__tilefinchWorkerCloneIntrinsics.owner,
-    trustedScheduleTimeout = globalThis.__tilefinchScheduleTimeout;
+    trustedScheduleTimeout = globalThis.__tilefinchScheduleTimeout,
+    trustedQueueCheckpointContinuation =
+      globalThis.__tilefinchQueueCheckpointContinuation;
+  delete globalThis.__tilefinchQueueCheckpointContinuation;
+  let activityCloses = [];
+  let activityCloseScheduled = false;
   const scheduleDatabaseTask = (callback) => {
     const id = intrinsicApply(trustedScheduleTimeout, globalThis, [callback, 0]);
     return id !== 0;
+  }, closeTransactionActivities = () => {
+    activityCloseScheduled = false;
+    const closing = activityCloses,
+      count = closing.length;
+    /* Detach before invoking transaction code: quota-triggered abort handlers
+       can synchronously create a replacement transaction, which must enter a
+       fresh batch rather than be erased with this one. */
+    activityCloses = [];
+    for (let index = 0; index < count; index++) {
+      const transaction = closing[index];
+      if (transaction._abortSequence) {
+        transaction._drainAbortSequence(transaction._abortSequence, false);
+      } else if (transaction._state !== "finished") {
+        transaction._acceptingRequests = false;
+        transaction._maybeComplete();
+      }
+    }
+    closing.length = 0;
+  }, scheduleActivityClose = (transaction) => {
+    if (!intrinsicApply(arrayIncludes, activityCloses, [transaction])) {
+      if (activityCloses.length >= TRANSACTION_QUEUE_LIMIT) return false;
+      activityCloses[activityCloses.length] = transaction;
+    }
+    if (activityCloseScheduled) return true;
+    try {
+      intrinsicApply(
+        trustedQueueCheckpointContinuation, globalThis,
+        [closeTransactionActivities]);
+      activityCloseScheduled = true;
+      return true;
+    } catch (_) {
+      activityCloses.length = 0;
+      return false;
+    }
   };
   const stats = {
     opens: 0,
@@ -687,15 +726,9 @@
       }
       stats.transactions++;
       /* The creation task remains active through its microtask checkpoint.
-         The first later task closes that window before any queued database
-         operation re-opens it for its own success/error dispatch. */
-      if (!scheduleDatabaseTask(() => {
-        if (this._abortSequence) {
-          this._drainAbortSequence(this._abortSequence, false);
-          return;
-        }
-        if (this._state !== "finished") this._acceptingRequests = false;
-      })) {
+         A checkpoint continuation closes that window before any later task;
+         a timer cannot provide this ordering when it was queued earlier. */
+      if (!scheduleActivityClose(this)) {
         stats.transactions--;
         if (upgrade && state.upgrading === this) state.upgrading = null;
         else {
@@ -718,13 +751,14 @@
           return;
         }
         this._acceptingRequests = true;
-        try {
-          operation();
-        } finally {
-          queueMicrotask(() => {
-            if (this._state !== "finished") this._acceptingRequests = false;
-          });
+        /* Close after all promise jobs spawned by author success/error
+           listeners, but before any previously or newly queued timer task. */
+        if (!scheduleActivityClose(this)) {
+          this._abort(fail(
+            "Database task quota exceeded", "QuotaExceededError"));
+          return;
         }
+        operation();
       });
     }
     _activate() {
@@ -761,7 +795,7 @@
           break;
         }
       }
-      queueMicrotask(() => this._maybeComplete());
+      this._maybeComplete();
     }
     _drainAbortSequence(sequence, continuation) {
       if (!sequence || sequence.finished || !sequence.aborting) return;
@@ -947,26 +981,28 @@
       if (
         (this._state !== "active" && this._state !== "committing") ||
         this._pending !== 0 ||
+        (this._acceptingRequests && !this._commitRequested) ||
         this._completionScheduled
       )
         return;
       this._completionScheduled = true;
-      queueMicrotask(() => {
+      if (!scheduleDatabaseTask(() => {
         this._completionScheduled = false;
         if ((this._state !== "active" && this._state !== "committing")
-            || this._pending !== 0)
+            || this._pending !== 0
+            || (this._acceptingRequests && !this._commitRequested))
           return;
         this._state = "committing";
-        if (!scheduleDatabaseTask(() => {
-          if (this._state !== "committing" || this._pending !== 0) return;
-          this._state = "finished";
-          this._snapshots.clear();
-          this._upgradeSnapshot = null;
-          this._releaseLocks();
-          this._dispatch("complete");
-        })) this._abort(fail(
+        this._state = "finished";
+        this._snapshots.clear();
+        this._upgradeSnapshot = null;
+        this._releaseLocks();
+        this._dispatch("complete");
+      })) {
+        this._completionScheduled = false;
+        this._abort(fail(
           "Database task quota exceeded", "QuotaExceededError"));
-      });
+      }
     }
     _abort(error, sequence = null) {
       if (this._state === "finished") return;

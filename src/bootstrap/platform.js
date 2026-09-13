@@ -21,6 +21,8 @@
     });
   const trustedJSONParse = JSON.parse;
   const trustedJSONStringify = JSON.stringify;
+  const decodeUtf8ValidNative = globalThis.__tilefinchDecodeUtf8Valid;
+  delete globalThis.__tilefinchDecodeUtf8Valid;
   const trustedString = String,
     trustedStringFromCodePoint = Function.call.bind(String.fromCodePoint),
     TrustedUint8Array = Uint8Array;
@@ -1369,7 +1371,8 @@
           );
         else throw new TypeError("BufferSource required");
         const stream = !!options.stream;
-        if (this._pending.length) {
+        const hadPending = this._pending.length !== 0;
+        if (hadPending) {
           if (this._pending.length + bytes.length > 256 * 1024)
             throw new RangeError("decoded input exceeds bounded size");
           const joined = new Uint8Array(this._pending.length + bytes.length);
@@ -1378,6 +1381,14 @@
           bytes = joined;
         }
         this._pending = new Uint8Array();
+        if (!stream && !hadPending && decodeUtf8ValidNative) {
+          const decoded = decodeUtf8ValidNative(
+            bytes, !this.ignoreBOM && !this._bomSeen);
+          if (decoded !== null) {
+            this._bomSeen = false;
+            return decoded;
+          }
+        }
         let out = "",
           i = 0;
         const invalid = () => {

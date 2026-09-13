@@ -213,6 +213,8 @@ globalThis.__tilefinchInstallWorker = (
       const Base=root.XMLHttpRequest,
         register=root.__tilefinchRegisterWorkerXHR,
         workerURL=root.__tilefinchWorkerScriptURL;
+      delete root.__tilefinchRegisterWorkerXHR;
+      delete root.__tilefinchWorkerScriptURL;
       let at=Base.prototype,responseType;
       while(at&&!responseType){
         responseType=Object.getOwnPropertyDescriptor(at,'responseType');
@@ -251,6 +253,7 @@ globalThis.__tilefinchInstallWorker = (
     {
       const Base=root.FileReader,
         register=root.__tilefinchRegisterWorkerFileReader;
+      delete root.__tilefinchRegisterWorkerFileReader;
       function WorkerFileReader(...args){
         if(!new.target)throw new TypeError('constructor requires new');
         const reader=Reflect.construct(Base,args,new.target);
@@ -292,6 +295,7 @@ globalThis.__tilefinchInstallWorker = (
     {
       const Base=root.WebSocket,
         register=root.__tilefinchRegisterWorkerWebSocket;
+      delete root.__tilefinchRegisterWorkerWebSocket;
       function WorkerWebSocket(...args){
         if(!new.target)throw new TypeError('constructor requires new');
         const socket=Reflect.construct(Base,args,new.target);
@@ -380,7 +384,7 @@ globalThis.__tilefinchInstallWorker = (
           });
         }
       }
-      const pending=new Map();
+      const pending=new Map(),reported=[];
       Object.defineProperty(root,'PromiseRejectionEvent',{
         configurable:true,writable:true,value:PromiseRejectionEvent});
       Object.defineProperty(root,'__tilefinchQueuePromiseRejection',{
@@ -390,18 +394,28 @@ globalThis.__tilefinchInstallWorker = (
           if(handled){
             if(!record)return;
             pending.delete(promise);
+            if(record.reported){
+              const at=reported.indexOf(promise);
+              if(at>=0)reported.splice(at,1);
+            }
             if(record.reported)
               root.setTimeout(()=>root.dispatchEvent(
                 new PromiseRejectionEvent('rejectionhandled',{promise,reason})),0);
             else root.clearTimeout(record.timer);
             return;
           }
-          if(record||pending.size>=16)return;
+          if(record)return;
+          while(pending.size>=16&&reported.length){
+            const oldest=reported.shift(),oldRecord=pending.get(oldest);
+            if(oldRecord&&oldRecord.reported)pending.delete(oldest);
+          }
+          if(pending.size>=16)return;
           record={reported:false,timer:0};
           pending.set(promise,record);
           record.timer=root.setTimeout(()=>{
             if(pending.get(promise)!==record)return;
             record.reported=true;
+            reported.push(promise);
             root.dispatchEvent(new PromiseRejectionEvent(
               'unhandledrejection',{promise,reason}));
           },0);

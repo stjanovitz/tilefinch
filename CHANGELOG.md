@@ -8,6 +8,11 @@ mechanics.
 
 ## Unreleased
 
+## 0.1.21 — 2026-09-13
+
+- Faster, more memory-efficient web response handling.
+- Improved reliability for Fetch, Streams, text decoding, and IndexedDB.
+
 ## 0.1.20 — 2026-09-12
 
 - Improved compatibility and reliability for Workers, Fetch, IndexedDB,

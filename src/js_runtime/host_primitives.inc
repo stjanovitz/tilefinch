@@ -309,16 +309,20 @@ static JSValue js_post_message(JSContext *context,
     const char *task_kind = argc >= 4
         ? JS_ToCStringLen(context, &task_kind_length, argv[3]) : NULL;
     int64_t task_sequence = 0;
-    bool task_valid = argc < 4
-        || (task_kind != NULL && task_kind_length <= 96
-            && (argc < 5
-                || JS_ToInt64(context, &task_sequence, argv[4]) == 0)
-            && task_sequence >= 0);
+    bool task_valid = argc < 4 || (task_kind != NULL
+        && (argc < 5 || JS_ToInt64(context, &task_sequence, argv[4]) == 0));
     if (json == NULL || origin == NULL || !task_valid) {
         if (json != NULL) JS_FreeCString(context, json);
         if (origin != NULL) JS_FreeCString(context, origin);
         if (task_kind != NULL) JS_FreeCString(context, task_kind);
         return JS_EXCEPTION;
+    }
+    if (task_sequence < 0) {
+        JS_FreeCString(context, task_kind);
+        JS_FreeCString(context, origin);
+        JS_FreeCString(context, json);
+        return JS_ThrowRangeError(
+            context, "message task sequence must be non-negative");
     }
     bool valid = json_length <= 65536 && origin_length <= 2048;
     /* A WindowProxy may outlive a detached iframe's browsing context.
@@ -1324,6 +1328,78 @@ static bool fill_secure_random(uint8_t *data, size_t length)
     return tilefinch_platform_secure_random(data, length);
 }
 
+/* Complete buffered text bodies should not pay one interpreted iteration per
+   byte. Malformed input stays in the JavaScript decoder because it implements
+   the Encoding Standard's exact replacement behavior; this seam only accepts
+   a wholly valid UTF-8 sequence. */
+static bool js_utf8_valid(const uint8_t *bytes, size_t length)
+{
+    size_t at = 0u;
+    while (at < length) {
+        uint8_t first = bytes[at++];
+        if (first <= 0x7fu) continue;
+        size_t continuation = 0u;
+        uint8_t lower = 0x80u, upper = 0xbfu;
+        if (first >= 0xc2u && first <= 0xdfu) continuation = 1u;
+        else if (first >= 0xe0u && first <= 0xefu) {
+            continuation = 2u;
+            if (first == 0xe0u) lower = 0xa0u;
+            else if (first == 0xedu) upper = 0x9fu;
+        } else if (first >= 0xf0u && first <= 0xf4u) {
+            continuation = 3u;
+            if (first == 0xf0u) lower = 0x90u;
+            else if (first == 0xf4u) upper = 0x8fu;
+        } else return false;
+        if (continuation > length - at) return false;
+        for (size_t index = 0u; index < continuation; index++) {
+            uint8_t value = bytes[at++];
+            if (value < (index == 0u ? lower : 0x80u)
+                || value > (index == 0u ? upper : 0xbfu)) return false;
+        }
+    }
+    return true;
+}
+
+static JSValue js_utf8_decode_valid(JSContext *context,
+                                    JSValueConst this_value,
+                                    int argc, JSValueConst *argv)
+{
+    (void) this_value;
+    if (argc < 1)
+        return JS_ThrowTypeError(context, "UTF-8 byte array required");
+    size_t offset = 0u, length = 0u, bytes_per_element = 0u;
+    JSValue buffer = JS_GetTypedArrayBuffer(
+        context, argv[0], &offset, &length, &bytes_per_element);
+    if (JS_IsException(buffer)) return buffer;
+    size_t buffer_length = 0u;
+    uint8_t *bytes = JS_GetArrayBuffer(context, &buffer_length, buffer);
+    if ((bytes == NULL && buffer_length != 0u) || bytes_per_element != 1u
+        || offset > buffer_length || length > buffer_length - offset) {
+        JS_FreeValue(context, buffer);
+        return JS_ThrowTypeError(context, "UTF-8 byte array required");
+    }
+    if (length > 256u * 1024u) {
+        JS_FreeValue(context, buffer);
+        return JS_NULL;
+    }
+    bytes = bytes == NULL ? NULL : bytes + offset;
+    if (!js_utf8_valid(bytes, length)) {
+        JS_FreeValue(context, buffer);
+        return JS_NULL;
+    }
+    bool strip_bom = argc > 1 && JS_ToBool(context, argv[1]) > 0;
+    if (strip_bom && length >= 3u && bytes[0] == 0xefu
+        && bytes[1] == 0xbbu && bytes[2] == 0xbfu) {
+        bytes += 3u;
+        length -= 3u;
+    }
+    JSValue result = JS_NewStringLen(
+        context, (const char *) (bytes == NULL ? (uint8_t *) "" : bytes),
+        length);
+    JS_FreeValue(context, buffer);
+    return result;
+}
+
 static JSValue js_crypto_random_fill(JSContext *context,
                                      JSValueConst this_value,
                                      int argc, JSValueConst *argv)
@@ -2063,7 +2139,8 @@ bool js_rt_install_function(JSContext *context, JSValue global,
             || strcmp(name, "__tilefinchMultiplayerAddRemoteCode") == 0
             || strcmp(name, "__tilefinchMultiplayerClose") == 0);
     bool transient_bootstrap_bridge =
-        strcmp(name, "__tilefinchQueueCheckpointContinuation") == 0;
+        strcmp(name, "__tilefinchQueueCheckpointContinuation") == 0
+        || strcmp(name, "__tilefinchDecodeUtf8Valid") == 0;
     int flags = test_network_override
         ? JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE
         : transient_bootstrap_bridge ? JS_PROP_CONFIGURABLE : 0;
